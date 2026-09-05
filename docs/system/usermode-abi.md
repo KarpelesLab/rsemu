@@ -280,54 +280,264 @@ Three things are easy to get wrong and are worth stating:
   each segment separately makes the second erase the first, so the map is built
   from the *union* of the segments' page ranges, filled, and only then given
   the *union* of their permissions.
-- **A position-independent executable is a different problem.** `ET_DYN` needs
-  relocation processing, and `PT_INTERP` needs a dynamic loader run first. Both
-  are an operating system's job (§2.1) and both are refused with a message that
-  says so rather than half-loaded.
+- **A position-independent executable is loaded at a base the loader chose**,
+  and every `p_vaddr` in it is an offset from that base rather than an address.
+  That is the whole difference between `ET_EXEC` and `ET_DYN`, and it is worth
+  applying *once*, on the way in, so that the mapping, the fill, the
+  permissions, `AT_PHDR` and the break are all written in guest addresses and
+  cannot forget it. Both additions are checked: a `p_vaddr` near the top of the
+  address space plus a base is a wrap the static case could not produce.
 
-## The host-filesystem policy
+## Dynamic linking
+
+`ET_DYN` and `PT_INTERP` used to be refused with a message saying an
+operating system's loader is an operating system's job. They are supported
+now, and nothing about §2.1's line moved: the operating system is still the
+consumer's, and what follows is that consumer doing three things.
+
+**One.** The executable is placed at a fixed base, and so is the interpreter.
+Linux picks both with ASLR and a level-3 run must not, so they are constants —
+a base that is a function of *nothing at all* is the only kind that replays.
+The interpreter goes below the executable so that the break, which starts
+above the executable and grows up, cannot walk into it.
+
+**Two.** `PT_INTERP` is a *name*, and the named file is loaded **as well**,
+at its own base, and the process is entered at the interpreter's entry point
+rather than the executable's. The interpreter is entered on the executable's
+stack, not one of its own.
+
+**Three.** The auxiliary vector describes each to the other, and the
+asymmetry is the entire mechanism:
+
+| | describes | why the other one cannot supply it |
+| --- | --- | --- |
+| `AT_BASE` | the **interpreter** | it is entered with no relocations applied, so this is the only address it knows about itself |
+| `AT_PHDR`, `AT_PHENT`, `AT_PHNUM` | the **executable** | the loader has to find `DT_DYNAMIC`, and it gets there through the program headers |
+| `AT_ENTRY` | the **executable** | where the interpreter jumps when it has finished |
+
+**What does not happen here is relocation processing**, and that is the point
+rather than an omission. rsemu's consumer does not need a relocation
+processor; it needs the auxiliary vector to be right. A dynamic loader that
+starts and immediately faults is almost always a malformed auxv — which was
+already true of the static case, one layer down.
+
+`AT_BASE` is emitted whether or not there is an interpreter, and is zero when
+there is not, which is what Linux does and what `getauxval(AT_BASE)` therefore
+returns for a static binary.
+
+### The hostile cases multiply, and they are the interesting half
+
+A loader that takes an interpreter is a loader that follows a pointer out of a
+file into another file. Each of these is refused rather than half-done, and
+each has a test:
+
+| | |
+| --- | --- |
+| `PT_INTERP` with `p_filesz` of zero, or above `PATH_MAX` | a loader that reads as much as it is told to is a loader an image can make read anything |
+| `PT_INTERP` with no NUL in its payload | there is no path there |
+| `PT_INTERP` whose payload runs off the end of the file | the ordinary truncation case, one indirection along |
+| two `PT_INTERP` segments | a process has one interpreter |
+| an interpreter with a `PT_INTERP` of its own | that recursion has no end |
+| an interpreter for another architecture, or that is not an ELF file | the same checks the executable gets, because it is a program too |
+| `p_vaddr` plus the load bias wrapping the address space | the new arithmetic, and the new place to get it wrong |
+| an interpreter that was not staged | the *policy* answering, not the loader — see below |
+
+`ET_DYN` was previously in that list and has left it; `ET_CORE` and everything
+else is still refused.
+
+### What it runs
+
+`tests/usermode/dynamic/` is an `ET_DYN` executable with a `PT_INTERP`, one
+`DT_NEEDED`, one data relocation (`R_AARCH64_GLOB_DAT`) and one function
+relocation (`R_AARCH64_JUMP_SLOT`), linked against a shared object built from
+`lib.rs` beside it. Both halves are `#![no_std]` and link no libc, which is
+deliberate: the loader is what is under test, and a libc between it and
+`_start` only adds four hundred instructions to whatever goes wrong. The
+string it prints lives in the *shared object* and the length comes from a
+function there, so nothing appears on standard output unless both relocations
+were resolved by somebody — and that somebody is a real
+`ld-linux-aarch64.so.1`, copied out of a cross sysroot on the host by the
+fetch script.
+
+```console
+usermode/dynamic on aarch64: 22 syscall(s), 1 thread(s), 16733 tick(s); refused []
+usermode/dynamic on aarch64: stdout "hello from a shared obj\n"
+```
+
+The same program built for `x86_64-unknown-linux-gnu` and run under `strace`
+makes 26, and every difference is accounted for:
+
+```text
+host (x86-64 glibc)                    rsemu (aarch64 glibc ld.so)
+  execve                                 —          (no level-3 counterpart)
+  brk                                    brk
+  mmap                                   —
+  access(/etc/ld.so.preload)             faccessat(/etc/ld.so.preload) = -ENOENT
+  openat ×3, newfstatat ×3               —          (the hwcaps search; see below)
+  openat(libgreet.so); read; fstat       openat(libgreet.so); read; fstat
+  mmap ×3                                mmap ×2; munmap ×2; mprotect; mmap ×2
+  close                                  close; mmap
+  arch_prctl                             —          (no level-3 counterpart)
+  set_tid_address; set_robust_list; rseq  set_tid_address; set_robust_list; rseq
+  mprotect ×3                            mprotect ×3
+  write(1, …); exit_group                write(1, …); exit_group
+```
+
+The two extra `mmap`s and the two `munmap`s are the AArch64 objects' `p_align`
+of 64 KiB: glibc over-allocates and trims to the alignment it needs, and an
+x86-64 object aligned to the page size needs no trimming. **The missing hwcaps
+search is a choice**: glibc probes `glibc-hwcaps/` subdirectories only when
+`AT_HWCAP2` and the platform strings give it something to probe *with*, and
+this auxiliary vector supplies neither — RISC-V's Linux does not set
+`AT_HWCAP2` and arm64's does, and one auxv shared by both architectures is
+worth more here than four probe syscalls. There is no vDSO either
+(`AT_SYSINFO_EHDR` is absent), because a vDSO is *guest code* and level 3 has
+no kernel to have supplied it.
+
+### `PROT_EXEC` is bookkeeping, and here is where that would bite
+
+`Perms::EXEC` is carried through `mmap`, `mprotect` and `/proc/self/maps`, and
+**it is not enforced** — an instruction fetch from a page that does not permit
+execution succeeds. That was harmless while every level-3 guest was one static
+image whose text the loader mapped `R-X` and never touched again.
+
+A dynamic loader makes the shape it would catch a real one. `ld.so` maps a
+library's whole span, `MAP_FIXED`es each segment over it at the segment's own
+protection, and `mprotect`s the relocated-read-only region down at the end; a
+`W^X` mistake anywhere in that sequence is exactly what `PROT_EXEC` exists to
+report. Under this consumer such a mistake runs anyway, and a guest that jumped
+into its own `.data` would get away with it where Linux delivers `SIGSEGV`.
+
+Nothing here depends on the gap and nothing works because of it — the loaded
+guests set the right protections and never need them checked. It is written
+down because the population of programs that could notice just grew from "the
+one we wrote" to "anything with a `PT_INTERP`", and because enforcing it is a
+question about `core::space`'s access path rather than about this layer.
+
+### A ledgered stop: a whole glibc
+
+The same experiment with a real C library in it —
+`tests/usermode/hello.rs`, the static milestone guest unchanged, linked
+against the host's cross glibc instead of statically against musl — gets
+further than it sounds and then stops somewhere that is not this layer's
+fault:
+
+```text
+usermode/glibc on aarch64: ledgered — thread 1 faulted at pc 0x7ffeff6ad628
+  in /lib/libc.so.6 + 0x9d628, on aarch64 after 42 syscall(s)
+```
+
+Forty-two syscalls, **refusing nothing**: both libraries opened by path out of
+the stage, every segment mapped from a descriptor, the 64 KiB trimming done,
+every relocation applied, control transferred, and glibc's own startup running
+— until `strlen+0x68`, which is `ADDHN v2.8b, v1.8h, v1.8h`. The
+halving-narrow three-different group is one of the things
+`src/cpu/arm/a64/simd.rs` lists under *"what is deliberately absent"*, so it
+raises `UNDEFINED` rather than being quietly wrong, which is the right
+behaviour and is exactly why this is visible.
+
+`a_whole_glibc_links_and_relocates_and_then_meets_a_missing_instruction` is
+the ledger entry. It asserts the half that is this layer's — the loading
+worked and nothing was refused — and that where it stopped is inside an object
+**the loader placed**. The day the core gains that group it will assert the
+program's output instead, and it says so rather than quietly continuing to
+pass.
+
+## The host-filesystem policy, and the one time it moved
 
 Decided **before** `openat` was written, which is the only time this decision
-can be made honestly.
+can be made honestly:
 
 > **A level-3 guest may be told about itself. It may not be told about the
 > host.**
 
-Concretely, in `src/usermode/proof.rs`:
+Three things landed after that without needing it widened. A second
+architecture reads its own `AT_HWCAP` and its own `uname`, both of which
+describe the emulated core rather than the host. A threaded guest maps its
+stacks anonymously, joins through a futex word in its own memory, and never
+opens anything. A position-independent executable is placed by the loader and
+asks nobody.
 
-- Every path-taking call — `openat`, `faccessat`, `readlinkat`, `newfstatat` —
-  answers `-ENOENT` **without looking at the path**. The guest sees an empty
-  namespace, which is a coherent thing for a filesystem to be, rather than a
-  permission error that invites a retry.
-- The one exception is not an exception to the rule above: `/proc/self/maps` is
-  served from `UserMemory::mappings()`, which is the guest's own address space
-  and consults no host. (`usermode::mem`'s own documentation names
-  `/proc/self/maps` as the first reason that bookkeeping is an ordered list.)
-- Descriptors 0, 1 and 2 exist and are backed by memory the harness owns.
-  `read` from 0 is a clean end of file; `write` to 1 or 2 appends to a buffer;
-  every other descriptor number is `-EBADF`.
-- `mmap` is anonymous-only. A file-backed mapping is `-ENODEV`, which follows
-  from the above rather than being a second rule: there is no descriptor for a
-  host file to map.
-- There is **no flag to widen this**. The moment there is one, the module stops
-  being a proof that the seam works and becomes a sandbox with a policy to get
-  wrong.
+**Dynamic linking is the thing that could not be done under it.** An
+interpreter opens `libc.so.6` *by path*; "there is no such file" is a coherent
+namespace and it is one in which no ordinary program on any real system runs
+at all. So the rule now reads:
 
-Why so strict: the appeal of level 3 (§2, *"run this program somewhere it
-cannot hurt me"*) is gone the instant `openat("/etc/shadow")` can be answered,
-and "which paths are safe" is not a question with a checkable answer.
-"Everything on this answer came from the guest's own memory" is.
+> **A level-3 guest may be told about itself, and about what it was handed. It
+> may not be told about the host.**
 
-A real consumer will need passthrough — `npm install` reads files — and will
-have to design it. §2.1 already says that design is nixvm's, and nothing in
-this repository should pre-empt it with a half-policy.
+### What "what it was handed" means
 
-**Neither of the two things that landed after this policy was written needed it
-widened.** A second architecture reads its own `AT_HWCAP` and its own `uname`,
-both of which describe the emulated core rather than the host. A threaded guest
-maps its stacks anonymously, joins through a futex word in its own memory, and
-never opens anything. The policy has cost nothing so far, which is the argument
-for leaving it where it is.
+A **stage**: a map from guest path to bytes, fixed before the guest executes
+its first instruction and never added to while it runs. It is an argument to
+the run, as reviewable as `argv` is.
+
+- `openat`, `faccessat` and `newfstatat` all resolve through **one map and one
+  function**, so there is a single place in the module where a name becomes
+  content. A miss is `-ENOENT`.
+- There is no prefix, no root, no search rule and no normalisation: a path is
+  a key. `/lib//libgreet.so` and `/lib/../lib/libgreet.so` do not exist, and
+  neither does `/`. A test asserts each of those, because the *absence* of a
+  resolution algorithm is the property, and an algorithm is what would have to
+  be got right.
+- The generated name, `/proc/self/maps`, is unchanged and is the same shape:
+  rendered from `UserMemory::mappings()`, consulting no host.
+- `mmap` of a descriptor is served by copying out of the same bytes `read`
+  would have returned — that is what `MAP_PRIVATE` means, and every mapping
+  here is private, so a copy-on-write nobody shares is a copy. `MAP_SHARED` of
+  a file is `-ENODEV`: a store has to go somewhere.
+- **No descriptor can be written**, so a guest cannot change what the next
+  thing to open a name will see. The stage is immutable from inside.
+- `st_ino` is real, and it is the third instance of the defect shape this
+  document keeps returning to: a field stubbed to zero, harmless until
+  something reads it.
+  A dynamic loader identifies an object by `(st_dev, st_ino)` so that a
+  library reached under two names is loaded once. A `struct stat` full of
+  zeros makes every file in the process the same file: glibc's `ld.so` loaded
+  `libgcc_s.so.1`, decided `libc.so.6` was the object it already had, and
+  reported `undefined symbol: memcpy` with ten lines about version information
+  first. The inode is the path's index in the stage — a function of the stage
+  and of nothing on the host.
+
+### What the widening did *not* cost
+
+The property that made the original rule worth holding was never "the guest
+cannot open files". It was that the answer is **checkable**, and the checkable
+form is now mechanical rather than argued:
+
+> **Nothing that services a syscall links `std`.**
+
+`Kernel` and every function it calls compiles in a build where `std` does not
+exist. There is no `open`, no path type, no filesystem, and therefore no code
+path from a guest pointer to a host path. CI's **feature-combination** job
+builds exactly that on every commit — `cargo test --no-default-features
+--features ...,usermode`, derived from the tree by
+`scripts/feature-matrix.py` rather than from a list somebody maintains — which
+is more than a paragraph can do.
+The two places a host file is read are `guest_binary` and `guest_root`, both
+`#[cfg(feature = "std")]`, both in the harness, and both finished before a
+guest exists — by the time anything is running there is no host path left to
+reach.
+
+**There is still no `--allow` flag**, and that is the same decision as before
+rather than a survivor of it. A flag makes the *guest's* question decide which
+host file is opened, which is precisely the code path this design does not
+have. Staging is the opposite shape: the harness decides, up front, in one
+place, and what it decided is a value you can print.
+
+Three alternatives were weighed and this is why they lost. *A read-only
+directory the harness stages* would put `std::fs` inside the syscall kernel and
+give up the mechanical check for nothing — the harness can walk the directory
+itself, and does. *A preloaded set of libraries mapped before the guest starts*
+would mean rsemu deciding what a `DT_NEEDED` resolves to, which is the
+interpreter's job and the reason there is an interpreter. *A path allow-list*
+is "which paths are safe" wearing a different hat.
+
+A real consumer will still need genuine passthrough — `npm install` writes
+files, and reads directories it was not told about — and §2.1 says that design
+is nixvm's. A stage is not that and does not pretend to be; it is the smallest
+thing that lets a dynamically linked program run without inventing a filesystem
+to get wrong.
 
 ## Determinism: where non-determinism actually enters
 
@@ -343,16 +553,33 @@ that is by construction rather than by luck:
 | `futex` wakes | waiters are queued and released in arrival order, not by hash order |
 | `mmap` placement | `UserMemory`'s top-down search is a pure function of the map |
 | `brk` | the break starts at the image's own end |
+| where a PIE and an interpreter are loaded | two constants; Linux picks them with ASLR and a level-3 run must not |
+| which libraries are opened, and in what order | the interpreter's own logic over a stage that was fixed before it ran |
+| a staged file's `st_ino` | its index in the stage, which is a function of the stage |
+| `AT_SYSINFO_EHDR` | absent, because there is no vDSO — see the dynamic-linking section |
 | `getpid`, `gettid`, `uname`, `getuid` | constants, or the thread id above |
 
-Threading added the middle three rows, and each was a decision rather than a
-discovery: a `BTreeMap` because a hash would iterate in a different order, a
-`Vec` per futex word because "wake some waiter" has to mean the *same* waiter
-every run, and ids that are never reused because a replay that reuses one
-cannot tell two threads apart. All three were checked the cheap way — the
-threaded guest replays with its trace, its tick count and its output all
-identical, on both architectures, with the entropy source replaced by one that
-panics.
+Threading added the `clone`, `futex` and interleaving rows, and each was a
+decision rather than a discovery: a `BTreeMap` because a hash would iterate in
+a different order, a `Vec` per futex word because "wake some waiter" has to
+mean the *same* waiter every run, and ids that are never reused because a
+replay that reuses one cannot tell two threads apart. All three were checked
+the cheap way — the threaded guest replays with its trace, its tick count and
+its output all identical, on both architectures, with the entropy source
+replaced by one that panics.
+
+**Dynamic linking added four rows and no new door.** Each was a place a real
+kernel is non-deterministic on purpose and this one must not be: Linux chooses
+a PIE's base and an interpreter's with ASLR, and its inode numbers come off a
+filesystem. Making each a function of the program rather than recording it is
+the better answer wherever it is available, because a journal entry is a thing
+that can go stale and a constant is not — and it was available for all four.
+The dynamically linked guest replays with the entropy source replaced by one
+that panics, exactly as the static and threaded ones do, and the replay
+consumes its recording exactly — `Journal::remaining() == 0` is asserted for
+every built guest, which is *"the journal is the only door"* stated in the
+other direction: nothing reached the host, and nothing the host said went
+unused.
 
 What is left is **entropy**, and there are exactly two doors:
 
@@ -377,15 +604,30 @@ downloaded ROM does):
 $ rustup target add riscv64gc-unknown-linux-musl aarch64-unknown-linux-musl
 $ scripts/fetch-testdata.sh usermode-guests
 $ cargo test --all-features usermode::proof -- --nocapture
-usermode/hello on riscv64: 25 syscall(s), 1 thread(s), 24326 tick(s); refused []
+usermode/hello on riscv64: 25 syscall(s), 1 thread(s), 24446 tick(s); refused []
 usermode/hello on riscv64: stdout "hello from level 3\nargv = [\"hello\"]\nRSEMU = Some(\"1\")\n"
-usermode/hello on aarch64: 25 syscall(s), 1 thread(s), 16592 tick(s); refused []
+usermode/hello on aarch64: 25 syscall(s), 1 thread(s), 16734 tick(s); refused []
 usermode/hello on aarch64: stdout "hello from level 3\nargv = [\"hello\"]\nRSEMU = Some(\"1\")\n"
-usermode/threads on riscv64: 166 syscall(s), 8 thread(s), 486722 tick(s); refused []
+usermode/threads on riscv64: 166 syscall(s), 8 thread(s), 487136 tick(s); refused []
 usermode/threads on riscv64: stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"
-usermode/threads on aarch64: 166 syscall(s), 8 thread(s), 851156 tick(s); refused []
+usermode/threads on aarch64: 166 syscall(s), 8 thread(s), 851592 tick(s); refused []
 usermode/threads on aarch64: stdout "joined [0, 1, 2, 3]\ncounter = 32038\nrendezvous ok\n"
+usermode/dynamic on aarch64: 22 syscall(s), 1 thread(s), 16733 tick(s); refused []
+usermode/dynamic on aarch64: stdout "hello from a shared obj\n"
 ```
+
+The tick counts moved by a few hundred against the numbers this document used
+to quote, and the reason is the auxiliary vector: it now carries `AT_BASE`,
+`AT_FLAGS` and `AT_EXECFN`, which a Linux kernel emits for every process and
+this one did not. Nothing about the syscall traces changed.
+
+**The dynamic guests need one thing a compiler cannot produce**, which is a
+real dynamic loader. `scripts/fetch-testdata.sh usermode-guests` looks for an
+`ld-linux-<arch>.so.1` in the usual cross sysroots and honours
+`RSEMU_USERMODE_LDSO`; with none it says so, skips the dynamic guests, and
+builds the static ones as before. The loader is copied into the git-ignored
+corpus and run — glibc is LGPL and running a program is ordinary use
+(`CLAUDE.md`, Provenance), while shipping one here would not be.
 
 `RSEMU_USERMODE_TRACE=1` adds the whole `(number, result)` list, which is what
 the comparison above is made from. `RSEMU_USERMODE_GUEST` overrides the path if

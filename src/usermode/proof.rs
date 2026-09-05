@@ -27,49 +27,71 @@
 //! assembled guest does, and every one of which goes through this module's
 //! public surface.
 //!
-//! # The host-filesystem policy, decided before `openat` was written
+//! A **dynamically** linked one does more still, and it is the shape almost
+//! every program on a real system has: an `ET_DYN` image the loader places
+//! wherever it likes, a `PT_INTERP` naming a second program that has to be
+//! loaded *as well* and entered *instead*, and an auxiliary vector that is the
+//! only way either of them can find the other. rsemu's consumer supplies
+//! exactly those three things and processes no relocation at all — the
+//! interpreter does that, which is the whole point of there being one.
 //!
-//! > **A level-3 guest may be told about itself. It may not be told about the
-//! > host.**
+//! # The host-filesystem policy, and what dynamic linking did to it
 //!
-//! A guest asking `openat("/etc/shadow")` is asking the *host*, and the whole
-//! appeal of level 3 (§2, *"run this program somewhere it cannot hurt me"*)
-//! evaporates the moment that question can be answered. The rule above is the
-//! one worth holding because it is the one that is **checkable**: every answer
-//! this module gives comes from [`UserMemory`] or from a `Vec<u8>` the harness
-//! owns, and there is no code path from a guest pointer to a host path.
-//! "Which paths are safe" is not a question with a checkable answer.
+//! > **A level-3 guest may be told about itself, and about what it was handed.
+//! > It may not be told about the host.**
 //!
-//! Concretely:
+//! The first clause is the original rule and it has not moved. The second is
+//! new, and it is what a dynamically linked program needs: an interpreter
+//! opens `libc.so.6` **by path**, and a policy of "there is no such file"
+//! stops every real program on a real system from running at all.
 //!
-//! * `faccessat`, `readlinkat` and `newfstatat` answer `-ENOENT` **without
-//!   looking at the path at all**. The guest sees an empty namespace, which is
-//!   a coherent thing for a filesystem to be, rather than a permission error
-//!   that invites a retry.
-//! * `openat` compares the path against exactly **one** name,
-//!   `/proc/self/maps`, and answers `-ENOENT` for everything else. That one is
-//!   not an exception to the rule: it is rendered from
-//!   [`UserMemory::mappings`] — the guest's own address space, which
-//!   `usermode::mem`'s documentation names `/proc/self/maps` as the reason for
-//!   keeping — and consults nothing outside the machine.
+//! The rule that was worth holding was never "the guest cannot open files".
+//! It was that the guest cannot reach *the host*, and the reason to prefer it
+//! over "which paths are safe" is that it is **checkable**. So the widening
+//! keeps the check rather than the prohibition:
+//!
+//! * Every path a guest names is looked up in a [`Stage`] — a map from guest
+//!   path to bytes, **fixed before the guest executes its first instruction
+//!   and never added to while it runs**. The set of openable names is an
+//!   argument to the run, as reviewable as `argv` is.
+//! * `openat`, `faccessat` and `newfstatat` all resolve through that one map
+//!   and one function, so there is a single place where a name becomes
+//!   content rather than four. A miss is `-ENOENT` — an empty namespace,
+//!   which is a coherent thing for a filesystem to be, rather than a
+//!   permission error that invites a retry.
+//! * The one *generated* name, `/proc/self/maps`, is the same shape: it is
+//!   rendered from [`UserMemory::mappings`], the guest's own address space,
+//!   which `usermode::mem`'s documentation names it as the reason for
+//!   keeping. `readlinkat` still answers `-ENOENT` for everything, because
+//!   nothing in a stage is a symbolic link.
+//! * `mmap` of a descriptor is served by **copying** out of the same bytes
+//!   `read` would have returned. That is what `MAP_PRIVATE` means and there is
+//!   nothing else it could mean here; `MAP_SHARED` of a file is `-ENODEV`,
+//!   because a store to one has to go somewhere.
 //! * Descriptors 0, 1 and 2 are the harness's: `write` to 1 or 2 appends to a
 //!   buffer the test asserts on, and `read` from 0 is a clean end of file.
-//!   Descriptors above 2 exist only as the result of that one `openat`.
-//! * `mmap` is anonymous-only. A file-backed mapping is `-ENODEV`, which
-//!   follows from the above rather than being a second rule: there is no
-//!   descriptor for a host file to map.
+//!   Every descriptor above 2 came from an `openat` of a name that was
+//!   already in the stage, and **no descriptor can be written**, so a guest
+//!   cannot change what the next thing to open a name will see.
 //!
-//! There is no `--allow` flag to add to, because the moment there is one this
-//! module stops being a proof of the seam and starts being a sandbox with a
-//! policy to get wrong. A real consumer will need passthrough — `npm install`
-//! reads files — and will have to design it; §2.1 already says that design is
-//! nixvm's. "Nothing, until someone asks" is the default, and the someone is
-//! not in this repository.
+//! The property this preserves, stated so it can be checked mechanically
+//! rather than argued: **nothing that services a syscall links `std`.**
+//! [`Kernel`] and every function it calls compiles in a build where `std`
+//! does not exist — there is no `open`, no path type, no filesystem for a
+//! guest pointer to reach. CI's **feature-combination** job builds exactly
+//! that on every commit — `cargo test --no-default-features --features
+//! ...,usermode`, which is a `no_std` build of this module and its tests. The two places a host file is read are
+//! [`guest_binary`] and [`guest_root`], both `#[cfg(feature = "std")]`, both
+//! in the harness, and both finished before a guest exists. By the time
+//! anything is running there is no host path left to reach.
 //!
-//! The one place this module does touch the host is
-//! [`guest_binary`], which reads the guest *executable* off the
-//! disk before anything is running, in the harness, under `#[cfg(feature =
-//! "std")]`. That is the test fixture, not a service the guest can reach.
+//! There is still no `--allow` flag, and that is the same decision as before
+//! rather than a survival of it: a flag makes the *guest's* question decide
+//! which host file is opened, and that is precisely the code path this design
+//! does not have. Staging is the opposite shape — the harness decides, up
+//! front, in one place. A real consumer will need genuine passthrough
+//! (`npm install` writes files, and reads directories it was not told about),
+//! and §2.1 already says that design is nixvm's.
 //!
 //! # `AT_RANDOM` and `getrandom` are the determinism seam
 //!
@@ -128,10 +150,30 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
+/// Where a position-independent image goes, and where an interpreter goes.
+///
+/// Constants rather than a search, and that is the determinism argument
+/// rather than laziness: Linux picks these with ASLR and a level-3 run must
+/// not, so a base that is a function of *nothing at all* is the only one that
+/// replays. Three properties and one convenience:
+///
+/// * 64 KiB aligned, because a real AArch64 object's `p_align` is;
+/// * the interpreter below the executable, so the break — which starts above
+///   the executable and grows up — has the whole space above it and cannot
+///   walk into the interpreter;
+/// * both far below [`UserMemory`]'s top-down `mmap` search, which steps over
+///   whatever is already mapped anyway;
+/// * and both nameable by a `lui`/`addi` pair, so the synthetic guests below
+///   can jump to one. There is nothing to prefer about a high base here —
+///   there is no address space layout to randomise — and a low one is
+///   assemblable by hand on both architectures.
+const INTERP_BASE: u64 = 0x1000_0000;
+const PIE_BASE: u64 = 0x2000_0000;
+
 /// Everything the initial process image needs that only the file knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Image {
-    /// `e_entry`, where the first instruction is.
+    /// `e_entry` plus the load bias: where the first instruction is.
     entry: u64,
     /// Where the program header table ended up in guest memory — `AT_PHDR`.
     ///
@@ -144,6 +186,18 @@ struct Image {
     phnum: u64,
     /// The first page above every loaded segment: where `brk` starts.
     brk: u64,
+    /// The bias every `p_vaddr` was loaded at.
+    ///
+    /// Zero for an `ET_EXEC`, which says where it goes; the base the loader
+    /// chose for an `ET_DYN`, which does not. For an interpreter this is
+    /// `AT_BASE`, and it is the only thing a dynamic loader has to find
+    /// itself with before it has relocated a single pointer of its own.
+    base: u64,
+    /// `PT_INTERP`'s path, if the image asked for an interpreter.
+    ///
+    /// The *name* only. Finding a file behind a name is a policy question and
+    /// the loader is not where policy lives — see [`Stage`].
+    interp: Option<String>,
 }
 
 fn at(file: &[u8], off: u64, len: u64) -> LoadResult<&[u8]> {
@@ -191,6 +245,31 @@ struct Phdr {
     memsz: u64,
 }
 
+/// `PT_INTERP`'s payload: the path of the interpreter the image wants.
+///
+/// Bounded and checked rather than trusted, because the segment is the
+/// *file's* and a hostile one can say whatever it likes: a `p_filesz` of four
+/// gigabytes, a string with no terminator, or bytes that are not a path at
+/// all. `PATH_MAX` is the ceiling Linux applies and it is applied here for the
+/// same reason — a loader that reads as much as it is told to is a loader an
+/// image can make read anything.
+fn interp_path(file: &[u8], ph: &Phdr) -> LoadResult<String> {
+    /// `PATH_MAX`.
+    const MAX: u64 = 4096;
+    if ph.filesz == 0 || ph.filesz > MAX {
+        return Err(format!(
+            "ELF: PT_INTERP is {} byte(s), and an interpreter's path is 1..={MAX}",
+            ph.filesz
+        ));
+    }
+    let bytes = at(file, ph.offset, ph.filesz)?;
+    let Some(end) = bytes.iter().position(|b| *b == 0) else {
+        return Err("ELF: PT_INTERP is not NUL terminated".to_string());
+    };
+    String::from_utf8(bytes[..end].to_vec())
+        .map_err(|_| "ELF: PT_INTERP is not a UTF-8 path".to_string())
+}
+
 /// Map every `PT_LOAD` of `file` into `mem` and say where the entry, the
 /// program headers and the break are.
 ///
@@ -201,7 +280,14 @@ struct Phdr {
 /// their page ranges with the *union* of their permissions rather than one
 /// mapping per segment; and **`AT_PHDR` is a guest address**, derived from the
 /// `PT_LOAD` whose file range covers `e_phoff`, not from `e_phoff` itself.
-fn load(mem: &UserMemory, file: &[u8], machine: u16) -> LoadResult<Image> {
+///
+/// `dyn_base` is where an `ET_DYN` image goes, and it is *ignored* for an
+/// `ET_EXEC`. That is not a convenience default: it is the whole difference
+/// between the two types. A `p_vaddr` in an executable is an address, and a
+/// `p_vaddr` in a shared object — which is what a position-independent
+/// executable and a dynamic loader both are — is an offset from wherever the
+/// loader decided to put it.
+fn load(mem: &UserMemory, file: &[u8], machine: u16, dyn_base: u64) -> LoadResult<Image> {
     if at(file, 0, 4)? != b"\x7fELF" {
         return Err("ELF: bad magic — not an ELF file".to_string());
     }
@@ -214,23 +300,24 @@ fn load(mem: &UserMemory, file: &[u8], machine: u16) -> LoadResult<Image> {
         d => return Err(format!("ELF: data encoding {d}, expected little-endian")),
     }
     let etype = u16_at(file, 16)?;
-    if etype != ET_EXEC {
-        return Err(format!(
-            "ELF: e_type {etype}, and this loader takes ET_EXEC ({ET_EXEC}) only{}",
-            if etype == ET_DYN {
-                " — a position-independent executable needs a relocation pass, \
-                  which is an operating system's job (ROADMAP.md §2.1)"
-            } else {
-                ""
-            }
-        ));
-    }
+    let bias = match etype {
+        ET_EXEC => 0,
+        ET_DYN => dyn_base,
+        other => {
+            return Err(format!(
+                "ELF: e_type {other}, and this loader takes ET_EXEC ({ET_EXEC}) \
+                 and ET_DYN ({ET_DYN}) only"
+            ));
+        }
+    };
     let em = u16_at(file, 18)?;
     if em != machine {
         return Err(format!("ELF: e_machine {em}, expected {machine}"));
     }
 
-    let entry = u64_at(file, 24)?;
+    let entry = bias
+        .checked_add(u64_at(file, 24)?)
+        .ok_or_else(|| "ELF: e_entry plus the load bias wraps the address space".to_string())?;
     let phoff = u64_at(file, 32)?;
     let phent = u64::from(u16_at(file, 54)?);
     let phnum = u64::from(u16_at(file, 56)?);
@@ -244,9 +331,10 @@ fn load(mem: &UserMemory, file: &[u8], machine: u16) -> LoadResult<Image> {
     at(file, phoff, phnum * phent)?;
 
     let mut loads: Vec<Phdr> = Vec::new();
+    let mut interp: Option<String> = None;
     for i in 0..phnum {
         let base = phoff + i * phent;
-        let ph = Phdr {
+        let mut ph = Phdr {
             kind: u32_at(file, base)?,
             flags: u32_at(file, base + 4)?,
             offset: u64_at(file, base + 8)?,
@@ -255,11 +343,13 @@ fn load(mem: &UserMemory, file: &[u8], machine: u16) -> LoadResult<Image> {
             memsz: u64_at(file, base + 40)?,
         };
         if ph.kind == PT_INTERP {
-            return Err(
-                "ELF: PT_INTERP — a dynamically linked binary needs an interpreter, \
-                 and loading one is an operating system's job (ROADMAP.md §2.1)"
-                    .to_string(),
-            );
+            if interp.is_some() {
+                return Err(
+                    "ELF: two PT_INTERP segments, and a process has one interpreter".to_string(),
+                );
+            }
+            interp = Some(interp_path(file, &ph)?);
+            continue;
         }
         if ph.kind != PT_LOAD || ph.memsz == 0 {
             continue;
@@ -272,6 +362,15 @@ fn load(mem: &UserMemory, file: &[u8], machine: u16) -> LoadResult<Image> {
         }
         // Read it now so a truncated file is refused before anything is mapped.
         at(file, ph.offset, ph.filesz)?;
+        // The bias is applied here, once, so everything below it — the
+        // mapping, the fill, the permissions, `AT_PHDR` and the break — is
+        // written in guest addresses and cannot forget to. Both additions are
+        // checked: a `p_vaddr` near the top of the space plus a base is
+        // precisely the wrap a hostile image reaches for, and it is a wrap the
+        // static case could not produce.
+        ph.vaddr = bias
+            .checked_add(ph.vaddr)
+            .ok_or_else(|| format!("ELF: segment {i} plus the load bias wraps"))?;
         ph.vaddr
             .checked_add(ph.memsz)
             .ok_or_else(|| format!("ELF: segment {i} wraps the address space"))?;
@@ -384,6 +483,8 @@ fn load(mem: &UserMemory, file: &[u8], machine: u16) -> LoadResult<Image> {
         phent,
         phnum,
         brk,
+        base: bias,
+        interp,
     })
 }
 
@@ -403,6 +504,16 @@ mod auxv {
     pub(super) const PHNUM: u64 = 5;
     /// Page size.
     pub(super) const PAGESZ: u64 = 6;
+    /// Where the program interpreter was loaded — its load bias.
+    ///
+    /// Zero when there is no interpreter, which is what Linux puts there for
+    /// a static binary and what `getauxval(AT_BASE)` therefore returns. A
+    /// dynamic loader has *only* this: it is entered with no relocations
+    /// applied, so every address it knows is `AT_BASE` plus a link-time
+    /// offset, and a wrong one is a fault inside its first few instructions.
+    pub(super) const BASE: u64 = 7;
+    /// Flags. Zero on every Linux architecture.
+    pub(super) const FLAGS: u64 = 8;
     /// The program's entry point.
     pub(super) const ENTRY: u64 = 9;
     /// Real user id.
@@ -421,6 +532,13 @@ mod auxv {
     pub(super) const SECURE: u64 = 23;
     /// Sixteen bytes of entropy.
     pub(super) const RANDOM: u64 = 25;
+    /// The pathname the program was executed with.
+    ///
+    /// A dynamic loader uses it for `$ORIGIN` and for the name in its own
+    /// diagnostics. Level 3 has no `execve` and therefore no such pathname
+    /// except the one the harness put in `argv[0]`, which is what Linux would
+    /// have used too.
+    pub(super) const EXECFN: u64 = 31;
 }
 
 /// One auxiliary-vector value: a number, or bytes that get a stack address.
@@ -448,13 +566,18 @@ enum Aux {
 ///
 /// `sp` is sixteen-byte aligned, which the RISC-V psABI requires of every
 /// stack pointer and which `_start` does not re-establish.
+///
+/// Returns the stack pointer and the auxiliary vector as the guest will read
+/// it — every [`Aux::Bytes`] resolved to the address its bytes landed at — so
+/// a test can assert on what a real run actually handed a guest rather than
+/// on what it meant to.
 fn build_stack(
     mem: &UserMemory,
     top: u64,
     argv: &[&str],
     envp: &[&str],
     aux: &[(u64, Aux)],
-) -> LoadResult<u64> {
+) -> LoadResult<(u64, Vec<(u64, u64)>)> {
     let mut p = top;
     let push = |bytes: &[u8], p: &mut u64| -> LoadResult<u64> {
         *p -= bytes.len() as u64;
@@ -511,7 +634,7 @@ fn build_stack(
     }
     word(auxv::NULL, &mut w)?;
     word(0, &mut w)?;
-    Ok(sp)
+    Ok((sp, aux_pairs))
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +763,9 @@ mod errno {
 
 /// `MAP_*` and `PROT_*`, `asm-generic` values.
 mod mm {
+    /// Writes go back to whatever is behind the mapping. There is nowhere for
+    /// them to go here, so it is refused rather than silently made private.
+    pub(super) const MAP_SHARED: u64 = 0x01;
     /// Put the mapping exactly where asked.
     pub(super) const MAP_FIXED: u64 = 0x10;
     /// The mapping is not backed by a file.
@@ -743,6 +869,12 @@ struct Asm {
     sc: fn(status: u32, src: u32, base: u32) -> u32,
     /// Do nothing. What a program that needs to take up time is made of.
     nop: u32,
+    /// Jump to the address in role register `to`, and do not come back.
+    ///
+    /// One instruction, and it is here because a program interpreter is the
+    /// only thing in a level-3 run that has to transfer control to a *second*
+    /// program. `jalr x0, 0(rs)` and `br xn`.
+    jr: fn(to: u32) -> u32,
     /// The environment call.
     syscall: u32,
 }
@@ -898,6 +1030,12 @@ mod riscv {
             | 0b010_1111
     }
 
+    /// `jalr x0, 0(rs1)` — I-type, opcode `1100111`, and with `rd = x0` the
+    /// return address is discarded, which is what makes it a plain jump.
+    fn jr(to: u32) -> u32 {
+        (reg(to) << 15) | 0b110_0111
+    }
+
     /// `nop`, which is `addi x0, x0, 0`.
     const NOP: u32 = 0x0000_0013;
 
@@ -1007,6 +1145,7 @@ mod riscv {
             lr,
             sc,
             nop: NOP,
+            jr,
             syscall: ECALL,
         },
     };
@@ -1087,6 +1226,11 @@ mod a64 {
     /// the 32-bit register the result lands in: zero if it stored.
     fn sc(status: u32, src: u32, base: u32) -> u32 {
         0xc800_7c00 | (reg(status) << 16) | (reg(base) << 5) | reg(src)
+    }
+
+    /// `br xn` — DDI 0487's unconditional branch to register.
+    fn jr(to: u32) -> u32 {
+        0xd61f_0000 | (reg(to) << 5)
     }
 
     /// `nop`.
@@ -1213,6 +1357,7 @@ mod a64 {
             lr,
             sc,
             nop: NOP,
+            jr,
             syscall: SVC,
         },
     };
@@ -1243,12 +1388,119 @@ fn counting_entropy() -> Entropy {
 
 /// An open descriptor above 2: a fixed byte string and a position in it.
 ///
-/// The contents are produced *once*, at `openat`, from the guest's own state.
-/// There is no host file behind one and no way to make there be.
+/// The bytes are settled before the descriptor exists — either rendered from
+/// the guest's own state, or handed to the run in its [`Stage`] — so a
+/// descriptor is a *view of something that already existed*, never a handle
+/// the guest can steer at the host.
 #[derive(Debug)]
 struct Vfile {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     pos: u64,
+    /// What the guest called it, so `/proc/self/maps` can name a mapping of it.
+    path: String,
+    /// Whether `st_size` is the length of `bytes`.
+    ///
+    /// False for the generated file, where zero is what procfs itself reports
+    /// and what stops stdio sizing one buffer for the whole thing; true for a
+    /// staged one, where a dynamic loader reads the size and believes it.
+    sized: bool,
+    /// `st_ino`, and it has to be real.
+    ///
+    /// **A dynamic loader identifies an object by `(st_dev, st_ino)`**, so
+    /// that a library reached twice under two names is loaded once. Report
+    /// zero for everything, as a `struct stat` filled with zeros does, and
+    /// every library in the process is the same library: glibc's `ld.so`
+    /// loaded `libgcc_s.so.1`, decided `libc.so.6` was the object it already
+    /// had, and failed to find `memcpy` in it — with a message about version
+    /// information that says nothing about the cause. A stat field nobody
+    /// reads is a stat field until somebody does.
+    ino: u64,
+}
+
+/// The files a level-3 process may open, and the whole of them.
+///
+/// A guest path to bytes, **fixed before the guest executes its first
+/// instruction and never added to while it runs**. This is what a dynamic
+/// loader needs and it is the smallest thing that provides it: `openat` is a
+/// lookup in this map, `mmap` of a descriptor copies out of the same bytes,
+/// and a miss is `-ENOENT`.
+///
+/// It is deliberately not a directory, a root, or a path prefix, because the
+/// property worth keeping is not *"the guest cannot open files"* — a dynamic
+/// loader has to — but **"the guest cannot name anything the harness did not
+/// already name"**. A staged map holds that: the set of openable names is an
+/// argument to the run, so it is as reviewable as the argv is, and it is the
+/// same shape `/proc/self/maps` already had — a name whose bytes are a
+/// function of something inside the machine.
+///
+/// The mechanical statement of the same property: **nothing that services a
+/// syscall links `std`.** [`Kernel`] and everything it calls compiles in a
+/// build where `std` does not exist, so there is no `open`, no path type and
+/// no filesystem for a guest pointer to reach; the one place a host file is
+/// read is [`guest_binary`], in the harness, before anything is running.
+/// CI's feature-combination job builds it that way on every commit —
+/// `cargo test --no-default-features --features ...,usermode` — which is more
+/// than a comment saying so could do.
+///
+/// A `BTreeMap` rather than a hash because the *order of the keys* is
+/// guest-visible: `st_ino` is a path's index in this map, a dynamic loader
+/// identifies an object by its inode, and a hash would number the same stage
+/// differently on a different run (CLAUDE.md, "Determinism").
+#[derive(Debug, Default, Clone)]
+struct Stage(BTreeMap<String, Arc<Vec<u8>>>);
+
+impl Stage {
+    /// Nothing staged: the policy the static guests ran under, and still the
+    /// default.
+    fn empty() -> Stage {
+        Stage(BTreeMap::new())
+    }
+
+    /// Stage `bytes` under the guest path `path`.
+    fn with(mut self, path: &str, bytes: Vec<u8>) -> Stage {
+        self.0.insert(path.to_string(), Arc::new(bytes));
+        self
+    }
+
+    /// The bytes staged under `path`, if any.
+    fn get(&self, path: &str) -> Option<&Arc<Vec<u8>>> {
+        self.0.get(path)
+    }
+
+    /// The bytes staged under `path` and the inode number it is known by.
+    ///
+    /// The inode is the path's position in the map, which is a function of
+    /// the stage and of nothing else — no host inode is consulted, and two
+    /// runs of the same stage number the same files the same way. It starts
+    /// at one so that zero can mean "not a staged file".
+    fn get_with_ino(&self, path: &str) -> Option<(&Arc<Vec<u8>>, u64)> {
+        let ino = self.0.keys().position(|k| k == path)? as u64 + 1;
+        Some((self.0.get(path)?, ino))
+    }
+}
+
+/// Everything a level-3 run is handed from outside the guest.
+///
+/// Three things, and the list being this short is the whole of the sandbox
+/// argument: the answers a non-deterministic question gets ([`Journal`]),
+/// where entropy comes from when the journal decides to actually ask, and the
+/// files that exist ([`Stage`]). All three are *data*, all three are fixed
+/// before the first instruction, and nothing else crosses in.
+struct World {
+    journal: Arc<Journal>,
+    entropy: Entropy,
+    stage: Stage,
+}
+
+impl World {
+    /// A world with a journal, an entropy source and no files at all.
+    fn new(journal: Arc<Journal>, entropy: Entropy) -> World {
+        World {
+            journal,
+            entropy,
+            stage: Stage::empty(),
+        }
+    }
 }
 
 /// The one path a level-3 guest may open, and the reason it is not an
@@ -1276,7 +1528,14 @@ const PROC_SELF_MAPS: &str = "/proc/self/maps";
 fn proc_self_maps(mem: &UserMemory) -> Vec<u8> {
     let mut out = String::new();
     for m in mem.mappings() {
-        let name = if m.name.starts_with('[') { &m.name } else { "" };
+        // `[heap]`, `[stack]`, and the path a file mapping was made from.
+        // Everything else — `elf`, `[anon]`'s siblings — is this consumer's
+        // own bookkeeping and procfs would print nothing there.
+        let name = if m.name.starts_with('[') || m.name.starts_with('/') {
+            &m.name
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "{:016x}-{:016x} {}p 00000000 00:00 0 {}\n",
             m.base,
@@ -1386,10 +1645,13 @@ struct Kernel {
     stderr: Vec<u8>,
     brk_base: u64,
     brk: u64,
-    /// Descriptors above 2, each a snapshot of something the *guest* can
-    /// legitimately be told about itself. Never a host file — see the module
-    /// documentation.
+    /// Descriptors above 2, each a view of bytes that existed before the
+    /// descriptor did: the guest's own address space, or something the
+    /// harness staged. Never a host file opened on the guest's say-so — see
+    /// [`Stage`].
     files: Vec<Option<Vfile>>,
+    /// The files this process may open, settled before it ran.
+    stage: Stage,
     /// `(number, return value)` for every call serviced, in order. The
     /// discovery tool: *implement from a trace, not from a list*.
     trace: Vec<(u64, i64)>,
@@ -1406,11 +1668,15 @@ impl Kernel {
         arch: &'static Arch,
         mem: Arc<UserMemory>,
         clock: Arc<GuestClock>,
-        journal: Arc<Journal>,
-        entropy: Entropy,
+        world: World,
         brk_base: u64,
         main: Arc<dyn Thread>,
     ) -> Kernel {
+        let World {
+            journal,
+            entropy,
+            stage,
+        } = world;
         let threads = Arc::new(ThreadSet::new(Arc::clone(&clock)));
         let id = threads.insert(main.core());
         let mut tasks = BTreeMap::new();
@@ -1439,6 +1705,7 @@ impl Kernel {
             brk_base,
             brk: brk_base,
             files: Vec::new(),
+            stage,
             trace: Vec::new(),
             refused: Vec::new(),
             spawned: 1,
@@ -1511,7 +1778,7 @@ impl Kernel {
             nr::LSEEK => self.lseek(a(0), a(1) as i64, a(2)),
             nr::OPENAT => self.openat(a(1)),
             nr::BRK => self.set_brk(a(0)),
-            nr::MMAP => self.mmap(a(0), a(1), a(2), a(3), a(4) as i64),
+            nr::MMAP => self.mmap(a(0), a(1), a(2), a(3), a(4) as i64, a(5)),
             nr::MUNMAP => match self.mem.unmap(page_down(a(0)), page_up(a(1))) {
                 Ok(()) => 0,
                 Err(_) => -errno::INVAL,
@@ -1544,10 +1811,15 @@ impl Kernel {
             nr::GETRANDOM => self.getrandom(a(0), a(1)),
             nr::UNAME => self.uname(a(0)),
             nr::FSTAT => self.fstat(a(0), a(1)),
-            // Every path answers the same way, and none of them is looked at.
-            // See the module documentation: the filesystem policy is "there
-            // isn't one", decided before `openat` was written.
-            nr::FACCESSAT | nr::READLINKAT | nr::NEWFSTATAT => -errno::NOENT,
+            // Every path is answered out of the stage, and a path that is
+            // not in it does not exist. See [`Stage`]: the namespace is
+            // whatever the harness put in it and nothing else, so a miss is
+            // `-ENOENT` rather than a permission error that invites a retry.
+            nr::FACCESSAT => self.faccessat(a(1)),
+            nr::NEWFSTATAT => self.newfstatat(a(1), a(2)),
+            // Nothing staged is a symbolic link, and `/proc/self/exe` is a
+            // question about a host path this process does not have.
+            nr::READLINKAT => -errno::NOENT,
             nr::IOCTL => -errno::NOTTY,
             // The standard descriptors exist and nothing is ready. The caller
             // supplied a zeroed `revents` array and it stays that way.
@@ -1629,10 +1901,20 @@ impl Kernel {
                 .iter()
                 .find(|(_, q)| q.iter().any(|w| w.thread == *id))
                 .map(|(addr, _)| *addr);
+            // Which mapping the thread is in, and how far into it. With a
+            // dynamic loader in the process this is the first question and a
+            // bare program counter cannot answer it: the code came from three
+            // objects somebody else placed. It is one line because
+            // `UserMemory::mapping_at` is already there.
+            let pc = task.thread.pc();
+            let object = self
+                .mem
+                .mapping_at(pc)
+                .map(|m| format!(" in {} + {:#x}", m.name, pc - m.base))
+                .unwrap_or_else(|| " in nothing mapped".to_string());
             out.push_str(&format!(
-                "\n  thread {} at pc {:#x}: {:?}{}",
+                "\n  thread {} at pc {pc:#x}{object}: {:?}{}",
                 id.0,
-                task.thread.pc(),
                 self.threads.state(*id).unwrap_or(ThreadState::Runnable),
                 match waiting {
                     Some(addr) => format!(" on the futex at {addr:#x}"),
@@ -1913,15 +2195,34 @@ impl Kernel {
         None
     }
 
-    fn openat(&mut self, path: u64) -> i64 {
-        // The policy: the path is compared against exactly one name, and that
-        // name is not a host file. Everything else is an empty namespace.
-        if self.path_at(path).as_deref() != Some(PROC_SELF_MAPS) {
-            return -errno::NOENT;
+    /// The bytes behind a path, or nothing.
+    ///
+    /// The single place a name becomes content, so the policy is one function
+    /// rather than a rule repeated at four call sites: the generated file,
+    /// which is the guest's own map; the stage, which the harness fixed before
+    /// the run; and otherwise there is no such file.
+    fn resolve(&self, path: &str) -> Option<(Arc<Vec<u8>>, bool, u64)> {
+        if path == PROC_SELF_MAPS {
+            return Some((Arc::new(proc_self_maps(&self.mem)), false, 0));
         }
+        self.stage
+            .get_with_ino(path)
+            .map(|(b, ino)| (Arc::clone(b), true, ino))
+    }
+
+    fn openat(&mut self, path: u64) -> i64 {
+        let Some(path) = self.path_at(path) else {
+            return -errno::NOENT;
+        };
+        let Some((bytes, sized, ino)) = self.resolve(&path) else {
+            return -errno::NOENT;
+        };
         let file = Vfile {
-            bytes: proc_self_maps(&self.mem),
+            bytes,
             pos: 0,
+            path,
+            sized,
+            ino,
         };
         let slot = match self.files.iter().position(Option::is_none) {
             Some(i) => i,
@@ -1932,6 +2233,36 @@ impl Kernel {
         };
         self.files[slot] = Some(file);
         slot as i64 + 3
+    }
+
+    /// `faccessat(dirfd, path, mode, flags)`: does it exist, and may it be
+    /// read.
+    ///
+    /// Every staged file is readable and none is writable or executable, so
+    /// the only question this can answer differently is existence — which is
+    /// the only one a dynamic loader asks it.
+    fn faccessat(&mut self, path: u64) -> i64 {
+        match self.path_at(path).as_deref().and_then(|p| self.resolve(p)) {
+            Some(_) => 0,
+            None => -errno::NOENT,
+        }
+    }
+
+    /// `newfstatat(dirfd, path, statbuf, flags)`.
+    fn newfstatat(&mut self, path: u64, buf: u64) -> i64 {
+        const S_IFREG: u32 = 0o100_000;
+        let Some((bytes, sized, ino)) = self.path_at(path).as_deref().and_then(|p| self.resolve(p))
+        else {
+            return -errno::NOENT;
+        };
+        let size = if sized { bytes.len() as u64 } else { 0 };
+        match self
+            .mem
+            .write_bytes(buf, &stat_bytes(S_IFREG | 0o444, size, ino))
+        {
+            Ok(()) => 0,
+            Err(_) => -errno::INVAL,
+        }
     }
 
     fn file(&mut self, fd: u64) -> Option<&mut Vfile> {
@@ -2044,28 +2375,83 @@ impl Kernel {
         want as i64
     }
 
-    fn mmap(&mut self, addr: u64, len: u64, prot: u64, flags: u64, fd: i64) -> i64 {
-        // The policy, enforced here rather than in `openat`: a level-3 guest
-        // cannot obtain a descriptor for a host file, so it cannot map one.
-        if flags & mm::MAP_ANONYMOUS == 0 || fd >= 0 {
-            return -errno::NODEV;
-        }
+    /// `mmap(addr, len, prot, flags, fd, offset)`.
+    ///
+    /// A file mapping is served out of the descriptor's own bytes — the same
+    /// bytes `read` would return, which came from the [`Stage`] — by copying
+    /// them into fresh anonymous pages. That is exactly `MAP_PRIVATE`'s
+    /// meaning and there is nothing to be lazy about: every mapping here is
+    /// private, so a copy-on-write that is never shared with anybody is a
+    /// copy. `MAP_SHARED` of a file is refused, because a store to one has to
+    /// go somewhere and there is nowhere for it to go.
+    ///
+    /// This is the syscall a dynamic loader spends its time in: it maps a
+    /// library's whole span, then `MAP_FIXED`es each segment into it at the
+    /// right protection. Both shapes come through here.
+    fn mmap(&mut self, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> i64 {
         let len = page_up(len);
         if len == 0 {
             return -errno::INVAL;
         }
-        let prot = prot_of(prot);
-        if flags & mm::MAP_FIXED != 0 && addr != 0 {
+        let want = prot_of(prot);
+        let backing = if flags & mm::MAP_ANONYMOUS != 0 {
+            None
+        } else if flags & mm::MAP_SHARED != 0 {
+            return -errno::NODEV;
+        } else if fd < 0 {
+            return -errno::BADF;
+        } else if !offset.is_multiple_of(PAGE_SIZE) {
+            // Linux refuses a file mapping whose offset is not page aligned,
+            // and a loader that got one wrong would otherwise be handed a
+            // library shifted by a few bytes and fault somewhere else.
+            return -errno::INVAL;
+        } else {
+            match self.file(fd as u64) {
+                Some(f) => Some((Arc::clone(&f.bytes), f.path.clone())),
+                None => return -errno::BADF,
+            }
+        };
+        // Filling needs the pages writable whatever the guest asked for; the
+        // protection it asked for is applied afterwards. `init_bytes` is the
+        // loader-shaped write for the same reason it is in `load`.
+        let initial = match &backing {
+            Some(_) => want.union(Prot::WRITE),
+            None => want,
+        };
+        let name = match &backing {
+            Some((_, path)) => path.as_str(),
+            None => "[anon]",
+        };
+        let base = if flags & mm::MAP_FIXED != 0 && addr != 0 {
             let base = page_down(addr);
-            return match self.mem.map_at(base, len, prot, "[anon]") {
-                Ok(()) => base as i64,
-                Err(_) => -errno::INVAL,
-            };
+            if self.mem.map_at(base, len, initial, name).is_err() {
+                return -errno::INVAL;
+            }
+            base
+        } else {
+            match self.mem.map(len, initial, name) {
+                Ok(base) => base,
+                Err(_) => return -errno::NOMEM,
+            }
+        };
+        if let Some((bytes, _)) = backing {
+            let from = (offset as usize).min(bytes.len());
+            let take = ((len as usize).min(bytes.len() - from)) as u64;
+            if take > 0
+                && self
+                    .mem
+                    .init_bytes(base, &bytes[from..from + take as usize])
+                    .is_err()
+            {
+                let _ = self.mem.unmap(base, len);
+                return -errno::INVAL;
+            }
+            if initial != want && self.mem.protect(base, len, want).is_err() {
+                let _ = self.mem.unmap(base, len);
+                return -errno::INVAL;
+            }
         }
-        match self.mem.map(len, prot, "[anon]") {
-            Ok(base) => base as i64,
-            Err(_) => -errno::NOMEM,
-        }
+        base as i64
     }
 
     fn clock_gettime(&mut self, ts: u64) -> i64 {
@@ -2123,23 +2509,20 @@ impl Kernel {
     fn fstat(&mut self, fd: u64, buf: u64) -> i64 {
         const S_IFCHR: u32 = 0o020_000;
         const S_IFREG: u32 = 0o100_000;
-        let mode = if fd <= 2 {
-            S_IFCHR | 0o620
-        } else if self.file(fd).is_some() {
-            // Size zero, exactly as procfs reports: a file whose contents are
-            // generated has no length until it is read, and stdio must not
-            // try to allocate one buffer for the whole thing.
-            S_IFREG | 0o444
+        let (mode, size, ino) = if fd <= 2 {
+            (S_IFCHR | 0o620, 0, 0)
+        } else if let Some(f) = self.file(fd) {
+            // Size zero for the generated file, exactly as procfs reports it:
+            // a file whose contents are produced on the way out has no length
+            // until it is read, and stdio must not try to allocate one buffer
+            // for the whole thing. A staged file *does* have a length, and a
+            // dynamic loader reads it and believes it.
+            let size = if f.sized { f.bytes.len() as u64 } else { 0 };
+            (S_IFREG | 0o444, size, f.ino)
         } else {
             return -errno::BADF;
         };
-        // `struct stat` as `asm-generic/stat.h` lays it out: 128 bytes, of
-        // which anything here looks only at `st_mode` and `st_blksize`.
-        let mut out = vec![0u8; 128];
-        out[16..20].copy_from_slice(&mode.to_le_bytes());
-        out[20..24].copy_from_slice(&1u32.to_le_bytes());
-        out[56..60].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        match self.mem.write_bytes(buf, &out) {
+        match self.mem.write_bytes(buf, &stat_bytes(mode, size, ino)) {
             Ok(()) => 0,
             Err(_) => -errno::INVAL,
         }
@@ -2275,6 +2658,24 @@ impl Kernel {
     }
 }
 
+/// `struct stat` as `asm-generic/stat.h` lays it out: 128 bytes, of which
+/// anything in a level-3 run looks at `st_mode`, `st_size` and `st_blksize`.
+fn stat_bytes(mode: u32, size: u64, ino: u64) -> Vec<u8> {
+    /// One device for everything staged. It only has to be the same for two
+    /// files that are the same file and different from nothing else, because
+    /// there is exactly one namespace here.
+    const ST_DEV: u64 = 1;
+    let mut out = vec![0u8; 128];
+    out[..8].copy_from_slice(&ST_DEV.to_le_bytes());
+    out[8..16].copy_from_slice(&ino.to_le_bytes());
+    out[16..20].copy_from_slice(&mode.to_le_bytes());
+    out[20..24].copy_from_slice(&1u32.to_le_bytes());
+    out[48..56].copy_from_slice(&size.to_le_bytes());
+    out[56..60].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    out[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
+    out
+}
+
 fn prot_of(bits: u64) -> Prot {
     let mut p = Prot::NONE;
     if bits & mm::PROT_READ != 0 {
@@ -2316,6 +2717,8 @@ struct Outcome {
     ticks: u64,
     /// Where the auxiliary vector's `AT_RANDOM` pointed, and to what.
     random: Vec<u8>,
+    /// The auxiliary vector the guest was started with, `(AT_*, value)`.
+    auxv: Vec<(u64, u64)>,
     /// How many threads the process ever had, main included.
     threads: u64,
 }
@@ -2326,13 +2729,33 @@ struct Outcome {
 /// The whole consumer, end to end, through rsemu's public surface and nothing
 /// else. `budget` caps virtual ticks so a guest that loops is a test failure
 /// rather than a hung suite.
+///
+/// # Dynamic linking
+///
+/// Three things happen here and nowhere else, and between them they are the
+/// whole of what an operating system owes a dynamically linked program:
+///
+/// * an `ET_DYN` executable is placed at [`PIE_BASE`] and every `p_vaddr` is
+///   read relative to it;
+/// * a `PT_INTERP` image has its interpreter loaded **as well**, at
+///   [`INTERP_BASE`], and the process is entered at the *interpreter's* entry
+///   point rather than the executable's; and
+/// * the auxiliary vector describes the **executable** — `AT_PHDR`,
+///   `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY` — while `AT_BASE` describes the
+///   interpreter, because that is the only way either of them can find the
+///   other.
+///
+/// What does *not* happen here is relocation processing, and that is the
+/// point rather than an omission: the interpreter does that, out of the
+/// `DT_RELA` its own program headers lead it to. A dynamic loader that starts
+/// and immediately faults is almost always a malformed auxiliary vector, and
+/// that was true of the static case too.
 fn run(
     arch: &'static Arch,
     file: &[u8],
     argv: &[&str],
     envp: &[&str],
-    journal: Arc<Journal>,
-    entropy: Entropy,
+    world: World,
     budget: u64,
 ) -> LoadResult<Outcome> {
     let mem = Arc::new(UserMemory::new(48));
@@ -2340,24 +2763,52 @@ fn run(
     // the two cannot collide however much the guest allocates.
     mem.set_placement(PAGE_SIZE, STACK_TOP - STACK_SIZE)
         .map_err(|e| e.to_string())?;
-    let image = load(&mem, file, arch.machine)?;
+    let image = load(&mem, file, arch.machine, PIE_BASE)?;
+    // `PT_INTERP` names a file, and finding a file is the *policy's* job: it
+    // is looked up in what the harness staged and nowhere else, so an image
+    // asking for `/lib/ld-linux-aarch64.so.1` gets it only if this run was
+    // handed one under that name.
+    let interp = match &image.interp {
+        Some(path) => {
+            let bytes = world.stage.get(path).cloned().ok_or_else(|| {
+                format!(
+                    "ELF: PT_INTERP names {path}, which this run did not stage — \
+                     a level-3 process's namespace is exactly what it was given"
+                )
+            })?;
+            let img = load(&mem, &bytes, arch.machine, INTERP_BASE)?;
+            if let Some(deeper) = &img.interp {
+                return Err(format!(
+                    "ELF: the interpreter {path} asks for an interpreter of its \
+                     own ({deeper}), and that recursion has no end"
+                ));
+            }
+            Some(img)
+        }
+        None => None,
+    };
     mem.map_at(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::RW, "[stack]")
         .map_err(|e| e.to_string())?;
 
     let clock = Arc::new(GuestClock::new());
-    let main = (arch.start)(&mem, image.entry, STACK_TOP);
+    // The interpreter runs first when there is one. It is entered with the
+    // executable's stack, not one of its own — the auxiliary vector is how it
+    // is told which program it is there to link.
+    let entry = interp.as_ref().map_or(image.entry, |i| i.entry);
+    let main = (arch.start)(&mem, entry, STACK_TOP);
     let mut kernel = Kernel::new(
         arch,
         Arc::clone(&mem),
         Arc::clone(&clock),
-        journal,
-        entropy,
+        world,
         image.brk,
         main,
     );
 
     let random = kernel.at_random();
-    let sp = build_stack(
+    let mut execfn = argv.first().unwrap_or(&"").as_bytes().to_vec();
+    execfn.push(0);
+    let (sp, auxv) = build_stack(
         &mem,
         STACK_TOP,
         argv,
@@ -2367,6 +2818,8 @@ fn run(
             (auxv::PHENT, Aux::Num(image.phent)),
             (auxv::PHNUM, Aux::Num(image.phnum)),
             (auxv::PAGESZ, Aux::Num(PAGE_SIZE)),
+            (auxv::BASE, Aux::Num(interp.as_ref().map_or(0, |i| i.base))),
+            (auxv::FLAGS, Aux::Num(0)),
             (auxv::ENTRY, Aux::Num(image.entry)),
             (auxv::UID, Aux::Num(0)),
             (auxv::EUID, Aux::Num(0)),
@@ -2376,6 +2829,7 @@ fn run(
             (auxv::CLKTCK, Aux::Num(100)),
             (auxv::SECURE, Aux::Num(0)),
             (auxv::RANDOM, Aux::Bytes(random.clone())),
+            (auxv::EXECFN, Aux::Bytes(execfn)),
         ],
     )?;
     kernel.main_thread().set_sp(sp);
@@ -2404,6 +2858,7 @@ fn run(
                         refused: kernel.refused,
                         ticks: clock.ticks(),
                         random,
+                        auxv,
                         threads: kernel.spawned,
                     });
                 }
@@ -2445,13 +2900,55 @@ struct Seg {
     memsz: u64,
 }
 
+/// How a synthetic image is linked, and where the loader will put it.
+///
+/// The two are the same number for an `ET_EXEC`, which says where it goes,
+/// and different for an `ET_DYN`, which does not: `vaddr` is what `p_vaddr`
+/// says and `at` is where the bytes end up once the loader has applied its
+/// bias. Keeping both is what lets one `assemble` write a program that names
+/// an address inside itself for either type.
+#[derive(Debug, Clone, Copy)]
+struct Link {
+    etype: u16,
+    /// `p_vaddr` of the first segment.
+    vaddr: u64,
+    /// Where that segment is once loaded.
+    at: u64,
+}
+
+impl Link {
+    /// An executable, linked and loaded at [`BASE`].
+    const EXEC: Link = Link {
+        etype: ET_EXEC,
+        vaddr: BASE,
+        at: BASE,
+    };
+    /// A position-independent executable: linked at zero, loaded wherever the
+    /// loader puts one.
+    const PIE: Link = Link {
+        etype: ET_DYN,
+        vaddr: 0,
+        at: PIE_BASE,
+    };
+    /// A program interpreter, which is a shared object like any other.
+    const INTERP: Link = Link {
+        etype: ET_DYN,
+        vaddr: 0,
+        at: INTERP_BASE,
+    };
+}
+
 /// Assemble a real ELF64 file: a header, a program header table inside the
 /// first segment (which is where a real linker puts it, and what makes
 /// `AT_PHDR` derivable), and the segments' bytes at page-congruent offsets.
-fn elf64(entry: u64, machine: u16, etype: u16, segs: &[Seg]) -> Vec<u8> {
+///
+/// `interp` adds a `PT_INTERP` naming it, placed immediately after the
+/// program header table so it lands inside the first segment — which is where
+/// a real linker puts `.interp` and for the same reason.
+fn elf64(entry: u64, machine: u16, etype: u16, segs: &[Seg], interp: Option<&str>) -> Vec<u8> {
     let phoff = 64u64;
     let phent = 56u64;
-    let phnum = segs.len() as u64;
+    let phnum = segs.len() as u64 + u64::from(interp.is_some());
     let mut file = vec![0u8; (phoff + phent * phnum) as usize];
 
     file[..4].copy_from_slice(b"\x7fELF");
@@ -2466,6 +2963,30 @@ fn elf64(entry: u64, machine: u16, etype: u16, segs: &[Seg]) -> Vec<u8> {
     file[52..54].copy_from_slice(&64u16.to_le_bytes());
     file[54..56].copy_from_slice(&(phent as u16).to_le_bytes());
     file[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+
+    if let Some(path) = interp {
+        let off = file.len() as u64;
+        file.extend_from_slice(path.as_bytes());
+        file.push(0);
+        let len = path.len() as u64 + 1;
+        // The code follows, and an instruction is four bytes on both
+        // architectures. A linker aligns `.text` for the same reason; here it
+        // is the difference between running and an unaligned-fetch trap that
+        // says nothing about why.
+        while !file.len().is_multiple_of(4) {
+            file.push(0);
+        }
+        let ph = (phoff + phent * segs.len() as u64) as usize;
+        file[ph..ph + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        file[ph + 4..ph + 8].copy_from_slice(&PF_R.to_le_bytes());
+        file[ph + 8..ph + 16].copy_from_slice(&off.to_le_bytes());
+        let va = segs[0].vaddr + off;
+        file[ph + 16..ph + 24].copy_from_slice(&va.to_le_bytes());
+        file[ph + 24..ph + 32].copy_from_slice(&va.to_le_bytes());
+        file[ph + 32..ph + 40].copy_from_slice(&len.to_le_bytes());
+        file[ph + 40..ph + 48].copy_from_slice(&len.to_le_bytes());
+        file[ph + 48..ph + 56].copy_from_slice(&1u64.to_le_bytes());
+    }
 
     for (i, seg) in segs.iter().enumerate() {
         // The first segment starts at file offset 0 so it carries the ELF
@@ -2518,11 +3039,24 @@ const BASE: u64 = 0x1_0000;
 /// second pass is the same length as the first — and that is asserted rather
 /// than assumed, because the day it stops being true is the day the message
 /// address silently points into the middle of an instruction.
-fn assemble(arch: &Arch, body: impl Fn(u64) -> Vec<u32>, tail: &[u8]) -> Vec<u8> {
-    let header = 64 + 56;
+fn assemble(
+    arch: &Arch,
+    link: Link,
+    interp: Option<&str>,
+    body: impl Fn(u64) -> Vec<u32>,
+    tail: &[u8],
+) -> Vec<u8> {
+    // The ELF header, the program header table — one entry, plus one more if
+    // there is a `PT_INTERP` — and then the interpreter's path.
+    let header =
+        (64 + 56 * (1 + interp.is_some() as u64) + interp.map_or(0, |s| s.len() as u64 + 1))
+            .next_multiple_of(4);
     let first = body(0);
-    let code_at = BASE + header;
-    let code = body(code_at + first.len() as u64 * 4);
+    // `body` is handed the address the code will be at once it is *loaded*,
+    // which for a position-independent image is not the address `p_vaddr`
+    // says. `e_entry` is the link-time one, because that is what the file
+    // records and what the loader adds its bias to.
+    let code = body(link.at + header + first.len() as u64 * 4);
     assert_eq!(
         code.len(),
         first.len(),
@@ -2531,24 +3065,33 @@ fn assemble(arch: &Arch, body: impl Fn(u64) -> Vec<u32>, tail: &[u8]) -> Vec<u8>
     let mut data = words(&code);
     data.extend_from_slice(tail);
     elf64(
-        code_at,
+        link.vaddr + header,
         arch.machine,
-        ET_EXEC,
+        link.etype,
         &[Seg {
-            vaddr: BASE,
+            vaddr: link.vaddr,
             flags: PF_R | PF_X,
             data,
             memsz: 0,
         }],
+        interp,
     )
 }
 
 /// `write(1, msg, len)` then `exit_group(0)`, as a complete ELF64 file.
 fn hello_elf(arch: &Arch, message: &[u8]) -> Vec<u8> {
+    hello_linked(arch, Link::EXEC, None, message)
+}
+
+/// [`hello_elf`], linked however the caller says and optionally asking for an
+/// interpreter.
+fn hello_linked(arch: &Arch, link: Link, interp: Option<&str>, message: &[u8]) -> Vec<u8> {
     let asm = arch.asm;
     let len = message.len() as u64;
     assemble(
         arch,
+        link,
+        interp,
         move |msg_at| {
             let mut c = Vec::new();
             c.extend((asm.li)(0, 1)); // fd 1
@@ -2566,15 +3109,14 @@ fn hello_elf(arch: &Arch, message: &[u8]) -> Vec<u8> {
 }
 
 fn run_synthetic(arch: &'static Arch, file: &[u8]) -> LoadResult<Outcome> {
-    run(
-        arch,
-        file,
-        &["guest"],
-        &[],
-        Arc::new(Journal::new()),
-        counting_entropy(),
-        1_000_000,
-    )
+    run_staged(arch, file, Stage::empty())
+}
+
+/// [`run_synthetic`], with a set of files the guest may open.
+fn run_staged(arch: &'static Arch, file: &[u8], stage: Stage) -> LoadResult<Outcome> {
+    let mut world = World::new(Arc::new(Journal::new()), counting_entropy());
+    world.stage = stage;
+    run(arch, file, &["guest"], &[], world, 1_000_000)
 }
 
 #[test]
@@ -2626,6 +3168,7 @@ fn p_memsz_beyond_p_filesz_is_zeroed() {
                     memsz: 0x1000,
                 },
             ],
+            None,
         );
         let out = run_synthetic(arch, &file).unwrap_or_else(|e| panic!("{}: {e}", arch.name));
         assert_eq!(out.status, 0, "{}: the bss word was not zero", arch.name);
@@ -2633,7 +3176,7 @@ fn p_memsz_beyond_p_filesz_is_zeroed() {
         // And the *initialised* half of the same segment survived: the zeroing
         // covers `p_filesz..p_memsz` and not a byte below it.
         let mem = UserMemory::new(48);
-        let image = load(&mem, &file, arch.machine).unwrap();
+        let image = load(&mem, &file, arch.machine, PIE_BASE).unwrap();
         let mut buf = [0u8; 8];
         mem.read_bytes(bss_base, &mut buf).unwrap();
         assert_eq!(buf, [0x5a; 8]);
@@ -2646,7 +3189,7 @@ fn segments_get_the_permissions_their_flags_asked_for() {
     for arch in ARCHES {
         let mem = UserMemory::new(48);
         let file = hello_elf(arch, b"x");
-        load(&mem, &file, arch.machine).unwrap();
+        load(&mem, &file, arch.machine, PIE_BASE).unwrap();
         let maps = mem.mappings();
         assert_eq!(maps.len(), 1, "one segment, one range: {maps:?}");
         assert_eq!(maps[0].prot, Prot::RX);
@@ -2684,9 +3227,10 @@ fn two_segments_sharing_a_page_get_the_union_of_their_permissions() {
                     memsz: 0,
                 },
             ],
+            None,
         );
         let mem = UserMemory::new(48);
-        load(&mem, &file, arch.machine).unwrap();
+        load(&mem, &file, arch.machine, PIE_BASE).unwrap();
         let maps = mem.mappings();
         assert_eq!(maps[0].base, BASE);
         assert_eq!(
@@ -2712,7 +3256,7 @@ fn at_phdr_points_at_the_program_headers_in_guest_memory() {
     for arch in ARCHES {
         let mem = UserMemory::new(48);
         let file = hello_elf(arch, b"x");
-        let image = load(&mem, &file, arch.machine).unwrap();
+        let image = load(&mem, &file, arch.machine, PIE_BASE).unwrap();
         assert_eq!(image.phdr, BASE + 64);
         assert_eq!(image.phent, 56);
         assert_eq!(image.phnum, 1);
@@ -2721,6 +3265,19 @@ fn at_phdr_points_at_the_program_headers_in_guest_memory() {
         let mut buf = [0u8; 56];
         mem.read_bytes(image.phdr, &mut buf).unwrap();
         assert_eq!(&buf[..], &file[64..64 + 56]);
+
+        // And the same for a position-independent image, where `AT_PHDR` has
+        // to carry the bias too. A dynamic loader reaches its own
+        // `DT_DYNAMIC` through this pointer, so an unbiased one faults inside
+        // somebody else's code rather than the guest's.
+        let mem = UserMemory::new(48);
+        let file = hello_linked(arch, Link::PIE, Some(SYNTHETIC_INTERP), b"x");
+        let image = load(&mem, &file, arch.machine, PIE_BASE).unwrap();
+        assert_eq!(image.phdr, PIE_BASE + 64);
+        assert_eq!(image.phnum, 2, "one PT_LOAD and one PT_INTERP");
+        let mut buf = [0u8; 112];
+        mem.read_bytes(image.phdr, &mut buf).unwrap();
+        assert_eq!(&buf[..], &file[64..64 + 112]);
     }
 }
 
@@ -2747,9 +3304,11 @@ fn a_hostile_or_wrong_image_is_refused_rather_than_mapped() {
                 f[5] = 2;
                 f
             }),
+            // `ET_EXEC` and `ET_DYN` are both loadable now; a core file is
+            // not, and neither is anything else.
             ("e_type", {
                 let mut f = ok.clone();
-                f[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+                f[16..18].copy_from_slice(&4u16.to_le_bytes());
                 f
             }),
             ("e_machine", {
@@ -2787,15 +3346,278 @@ fn a_hostile_or_wrong_image_is_refused_rather_than_mapped() {
                 f[56..58].copy_from_slice(&0u16.to_le_bytes());
                 f
             }),
-            ("PT_INTERP", {
+            // A `PT_INTERP` whose payload is the whole file: no NUL in the
+            // first `p_filesz` bytes, so there is no path there.
+            ("PT_INTERP with no terminator", {
                 let mut f = ok.clone();
                 f[64..68].copy_from_slice(&PT_INTERP.to_le_bytes());
+                f[64 + 8..64 + 16].copy_from_slice(&64u64.to_le_bytes());
+                f[64 + 32..64 + 40].copy_from_slice(&4u64.to_le_bytes());
+                f
+            }),
+            ("PT_INTERP of nothing", {
+                let mut f = ok.clone();
+                f[64..68].copy_from_slice(&PT_INTERP.to_le_bytes());
+                f[64 + 32..64 + 40].copy_from_slice(&0u64.to_le_bytes());
+                f
+            }),
+            // `p_filesz` above `PATH_MAX`, which is a loader being told to
+            // read as much as an image feels like handing it.
+            ("PT_INTERP of a megabyte", {
+                let mut f = ok.clone();
+                f[64..68].copy_from_slice(&PT_INTERP.to_le_bytes());
+                f[64 + 32..64 + 40].copy_from_slice(&(1u64 << 20).to_le_bytes());
+                f
+            }),
+            // A position-independent segment whose `p_vaddr` plus the base
+            // the loader chose leaves the address space. The static case
+            // could not produce this one: there was no base to add.
+            ("p_vaddr plus the load bias wraps", {
+                let mut f = ok.clone();
+                f[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+                f[64 + 16..64 + 24].copy_from_slice(&(u64::MAX - 0xffff).to_le_bytes());
                 f
             }),
         ];
         for (what, bytes) in cases {
             let m = mem();
-            let err = load(&m, bytes, arch.machine)
+            let err = load(&m, bytes, arch.machine, PIE_BASE)
+                .expect_err(&format!("{}: {what} should have been refused", arch.name));
+            assert!(err.starts_with("ELF:"), "{what}: {err}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic linking: a load bias, an interpreter, and the auxv that joins them
+// ---------------------------------------------------------------------------
+//
+// Two synthetic programs and no toolchain, on every architecture in the
+// build. What is being tested is not "a dynamic loader works" — that is the
+// loader's own business and the real-binary test below is where it is
+// measured — but the three things an *operating system* owes one, which are
+// the only three rsemu's consumer has to get right: put the executable
+// somewhere and read its `p_vaddr`s relative to that; load the interpreter as
+// well and enter it instead; and describe each to the other in the auxiliary
+// vector.
+
+/// The path the synthetic executables ask for their interpreter under.
+///
+/// Not a host path and not a plausible one, on purpose: the name is a key in
+/// a [`Stage`] and nothing else, and a name that looked like a real file
+/// would invite the reader to think something on the host was consulted.
+const SYNTHETIC_INTERP: &str = "/lib/ld-rsemu-synthetic.so.1";
+
+/// An interpreter that says so and hands control to the program it was loaded
+/// for.
+///
+/// A real one would relocate first. This one does the *transfer*, which is the
+/// half rsemu's consumer is responsible for: it was entered rather than the
+/// executable, and the executable is where the loader put it.
+fn interp_elf(arch: &Arch, exec_entry: u64) -> Vec<u8> {
+    let asm = arch.asm;
+    let msg = b"interp\n";
+    assemble(
+        arch,
+        Link::INTERP,
+        None,
+        move |msg_at| {
+            let mut c = Vec::new();
+            c.extend((asm.li)(0, 1));
+            c.extend((asm.li)(1, msg_at));
+            c.extend((asm.li)(2, msg.len() as u64));
+            c.extend((asm.li)(Asm::NR, nr::WRITE));
+            c.push(asm.syscall);
+            c.extend((asm.li)(Asm::TMP, exec_entry));
+            c.push((asm.jr)(Asm::TMP));
+            c
+        },
+        msg,
+    )
+}
+
+/// The address `load` will place `file`'s entry point at, without loading it
+/// anywhere that matters.
+fn entry_of(arch: &Arch, file: &[u8]) -> u64 {
+    let scratch = UserMemory::new(48);
+    load(&scratch, file, arch.machine, PIE_BASE)
+        .expect("a well-formed image")
+        .entry
+}
+
+/// A position-independent executable and the interpreter it asks for, staged
+/// under [`SYNTHETIC_INTERP`].
+fn dynamic_pair(arch: &Arch) -> (Vec<u8>, Stage) {
+    let exec = hello_linked(arch, Link::PIE, Some(SYNTHETIC_INTERP), b"exec\n");
+    let interp = interp_elf(arch, entry_of(arch, &exec));
+    let stage = Stage::empty().with(SYNTHETIC_INTERP, interp);
+    (exec, stage)
+}
+
+#[test]
+fn a_position_independent_executable_runs_at_the_base_the_loader_chose() {
+    for arch in ARCHES {
+        let file = hello_linked(arch, Link::PIE, None, b"pie\n");
+        // Every `p_vaddr` in this image is zero-based, so a loader that
+        // ignored the bias would map over the null page and run nothing.
+        let mem = UserMemory::new(48);
+        let image = load(&mem, &file, arch.machine, PIE_BASE).unwrap();
+        assert_eq!(image.base, PIE_BASE, "{}", arch.name);
+        assert_eq!(
+            image.phdr,
+            PIE_BASE + 64,
+            "{}: AT_PHDR is biased too",
+            arch.name
+        );
+        assert_eq!(mem.mappings()[0].base, PIE_BASE, "{}", arch.name);
+
+        let out = run_synthetic(arch, &file).unwrap_or_else(|e| panic!("{}: {e}", arch.name));
+        assert_eq!(out.stdout, b"pie\n", "{}", arch.name);
+        assert_eq!(out.status, 0);
+        assert!(out.refused.is_empty(), "refused {:?}", out.refused);
+    }
+}
+
+#[test]
+fn an_interpreter_is_loaded_too_and_is_what_the_process_enters() {
+    for arch in ARCHES {
+        let (exec, stage) = dynamic_pair(arch);
+        let out = run_staged(arch, &exec, stage).unwrap_or_else(|e| panic!("{}: {e}", arch.name));
+        // The interpreter ran *first* — the process was entered at its entry
+        // point, not the executable's — and then transferred. Either half
+        // missing changes this string.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "interp\nexec\n",
+            "{}",
+            arch.name
+        );
+        assert_eq!(out.status, 0);
+    }
+}
+
+#[test]
+fn the_auxiliary_vector_describes_the_program_and_the_interpreter_apart() {
+    for arch in ARCHES {
+        let (exec, stage) = dynamic_pair(arch);
+        let exec_entry = entry_of(arch, &exec);
+        let out = run_staged(arch, &exec, stage).unwrap_or_else(|e| panic!("{}: {e}", arch.name));
+        let aux = |key: u64| {
+            out.auxv
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("{}: no AT_{key} in {:?}", arch.name, out.auxv))
+        };
+        // `AT_BASE` is the interpreter's. Everything else is the
+        // *executable's*, and that asymmetry is the whole of how the two
+        // find each other: the interpreter is entered with no relocations
+        // applied, so `AT_BASE` is the only address it knows, and `AT_PHDR`
+        // is the only way it can find the program it is there to link.
+        assert_eq!(aux(auxv::BASE), INTERP_BASE, "{}", arch.name);
+        assert_eq!(aux(auxv::ENTRY), exec_entry, "{}", arch.name);
+        assert_eq!(aux(auxv::PHDR), PIE_BASE + 64, "{}", arch.name);
+        assert_eq!(aux(auxv::PHENT), 56, "{}", arch.name);
+        assert_eq!(aux(auxv::PHNUM), 2, "{}: PT_LOAD and PT_INTERP", arch.name);
+        // That the bytes at `AT_PHDR` really are the program header table is
+        // `at_phdr_points_at_the_program_headers_in_guest_memory` above,
+        // which can still reach the map. What is asserted here is that a
+        // *run* handed the guest the same numbers.
+    }
+}
+
+#[test]
+fn a_static_program_is_told_its_interpreter_base_is_zero() {
+    // Linux emits `AT_BASE` whether or not there is an interpreter, and a
+    // static binary's is zero. Saying nothing would be different: an absent
+    // key and a zero one are the same to `getauxval`, but the auxiliary
+    // vector is also walked by things that count entries.
+    for arch in ARCHES {
+        let out = run_synthetic(arch, &hello_elf(arch, b"x")).unwrap();
+        assert_eq!(
+            out.auxv.iter().find(|(k, _)| *k == auxv::BASE).map(|p| p.1),
+            Some(0),
+            "{}",
+            arch.name
+        );
+    }
+}
+
+#[test]
+fn a_hostile_interpreter_is_refused_rather_than_entered() {
+    for arch in ARCHES {
+        let (exec, _) = dynamic_pair(arch);
+
+        // The `PT_INTERP` phdr is the second one, so its fields are at
+        // 64 + 56 + the `Elf64_Phdr` offsets.
+        let ph = 64 + 56;
+        let interp_of = |stage: Stage| run_staged(arch, &exec, stage);
+
+        // Nothing staged under the name the image asked for. This is the
+        // policy answering, not the loader: a level-3 process's namespace is
+        // exactly what it was handed.
+        let err = interp_of(Stage::empty())
+            .expect_err(&format!("{}: an unstaged interpreter", arch.name));
+        assert!(err.contains(SYNTHETIC_INTERP), "{err}");
+
+        // An interpreter that is not an ELF file, one for another
+        // architecture, and one that asks for an interpreter of its own.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("not an ELF", b"#!/bin/sh\n".to_vec()),
+            ("another architecture", {
+                let mut f = interp_elf(arch, 0x1000);
+                f[18..20].copy_from_slice(&3u16.to_le_bytes());
+                f
+            }),
+            ("an interpreter of its own", {
+                // The same interpreter, rebuilt asking for one.
+                let asm = arch.asm;
+                assemble(
+                    arch,
+                    Link::INTERP,
+                    Some(SYNTHETIC_INTERP),
+                    move |_| {
+                        let mut c = (asm.li)(0, 0);
+                        c.extend((asm.li)(Asm::NR, nr::EXIT_GROUP));
+                        c.push(asm.syscall);
+                        c
+                    },
+                    b"",
+                )
+            }),
+        ];
+        for (what, bytes) in cases {
+            let err = interp_of(Stage::empty().with(SYNTHETIC_INTERP, bytes))
+                .expect_err(&format!("{}: {what} should have been refused", arch.name));
+            assert!(err.starts_with("ELF:"), "{what}: {err}");
+        }
+
+        // And the executable's own `PT_INTERP` header, corrupted every way a
+        // header can be. These are refused by `load`, before a name is even
+        // looked up.
+        let broken: Vec<(&str, Vec<u8>)> = vec![
+            ("two of them", {
+                let mut f = exec.clone();
+                // Make the `PT_LOAD` a second `PT_INTERP`, pointing at the
+                // same well-formed string.
+                let (o, sz) = (
+                    u64::from_le_bytes(f[ph + 8..ph + 16].try_into().unwrap()),
+                    u64::from_le_bytes(f[ph + 32..ph + 40].try_into().unwrap()),
+                );
+                f[64..68].copy_from_slice(&PT_INTERP.to_le_bytes());
+                f[64 + 8..64 + 16].copy_from_slice(&o.to_le_bytes());
+                f[64 + 32..64 + 40].copy_from_slice(&sz.to_le_bytes());
+                f
+            }),
+            ("a path that runs off the end", {
+                let mut f = exec.clone();
+                f[ph + 8..ph + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+                f
+            }),
+        ];
+        for (what, bytes) in broken {
+            let m = UserMemory::new(48);
+            let err = load(&m, &bytes, arch.machine, PIE_BASE)
                 .expect_err(&format!("{}: {what} should have been refused", arch.name));
             assert!(err.starts_with("ELF:"), "{what}: {err}");
         }
@@ -2813,7 +3635,7 @@ fn the_initial_stack_is_the_layout_every_start_walks() {
     mem.map_at(top - 0x10000, 0x10000, Prot::RW, "[stack]")
         .unwrap();
     let random: Vec<u8> = (0..16).collect();
-    let sp = build_stack(
+    let (sp, pairs) = build_stack(
         &mem,
         top,
         &["prog", "one"],
@@ -2853,6 +3675,14 @@ fn the_initial_stack_is_the_layout_every_start_walks() {
     mem.read_bytes(word(10), &mut bytes).unwrap();
     assert_eq!(&bytes[..], &random[..], "AT_RANDOM points at the bytes");
     assert_eq!((word(11), word(12)), (auxv::NULL, 0));
+
+    // The pairs reported back are the pairs on the stack, `Aux::Bytes`
+    // resolved to where its bytes went. Everything that asserts on an
+    // auxiliary vector below reads it from here rather than re-deriving it.
+    assert_eq!(
+        pairs,
+        vec![(auxv::PAGESZ, PAGE_SIZE), (auxv::RANDOM, word(10))]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2862,15 +3692,21 @@ fn the_initial_stack_is_the_layout_every_start_walks() {
 /// A kernel over a scratch map with one thread, for the calls that need no
 /// guest executing.
 fn scratch_kernel(arch: &'static Arch) -> (Arc<UserMemory>, Kernel) {
+    scratch_kernel_staged(arch, Stage::empty())
+}
+
+/// [`scratch_kernel`], with a namespace.
+fn scratch_kernel_staged(arch: &'static Arch, stage: Stage) -> (Arc<UserMemory>, Kernel) {
     let mem = Arc::new(UserMemory::new(48));
     mem.map_at(0x1000, 0x1000, Prot::RW, "scratch").unwrap();
     let main = (arch.start)(&mem, 0, 0);
+    let mut world = World::new(Arc::new(Journal::new()), counting_entropy());
+    world.stage = stage;
     let kernel = Kernel::new(
         arch,
         Arc::clone(&mem),
         Arc::new(GuestClock::new()),
-        Arc::new(Journal::new()),
-        counting_entropy(),
+        world,
         0x10_0000,
         main,
     );
@@ -2994,18 +3830,120 @@ fn an_alternate_stack_query_says_there_is_none() {
 }
 
 #[test]
-fn a_file_backed_mapping_is_refused_because_there_are_no_files() {
-    let (_mem, mut kernel) = scratch_kernel(any_arch());
+fn a_mapping_is_anonymous_or_it_is_a_staged_file() {
     const ENODEV: i64 = -19;
-    // MAP_PRIVATE with a descriptor, and MAP_ANONYMOUS with one: both are a
-    // guest trying to map something that is not its own memory.
-    for (flags, fd) in [(0x02u64, 3u64), (0x22, 3)] {
-        assert_eq!(kernel.ask(nr::MMAP, &[0, 0x1000, 3, flags, fd, 0]), ENODEV);
-    }
+    const STAGED: &str = "/lib/libsomething.so";
+    let arch = any_arch();
+    let (mem, mut kernel) = scratch_kernel_staged(
+        arch,
+        Stage::empty().with(STAGED, (0..64u8).cycle().take(0x1800).collect()),
+    );
+
     // Anonymous, with the -1 every libc passes, is granted.
     let base = kernel.ask(nr::MMAP, &[0, 0x2000, 3, 0x22, u64::MAX, 0]);
     assert!(base > 0, "mmap returned {base:#x}");
     assert_eq!(kernel.mem.mapping_at(base as u64).unwrap().prot, Prot::RW);
+
+    // A descriptor that was never opened cannot be mapped, whatever it says.
+    assert_eq!(kernel.ask(nr::MMAP, &[0, 0x1000, 3, 0x02, 3, 0]), EBADF);
+
+    // A staged file can be, privately, and the bytes are the bytes `read`
+    // would have returned. This is the call a dynamic loader lives in.
+    mem.write_bytes(0x1000, STAGED.as_bytes()).unwrap();
+    mem.write_bytes(0x1000 + STAGED.len() as u64, &[0]).unwrap();
+    let fd = kernel.ask(nr::OPENAT, &[0, 0x1000, 0, 0]);
+    assert_eq!(fd, 3, "the staged file opened");
+    let at = kernel.ask(nr::MMAP, &[0, 0x1800, 3, 0x02, fd as u64, 0x1000]);
+    assert!(at > 0, "mmap returned {at:#x}");
+    let mut got = [0u8; 8];
+    mem.read_bytes(at as u64, &mut got).unwrap();
+    // The staged file holds `i % 64` at byte `i`, and the offset asked for is
+    // a multiple of 64, so the mapping starts back at zero.
+    let want: Vec<u8> = (0..64u8).cycle().take(8).collect();
+    assert_eq!(
+        &got[..],
+        &want[..],
+        "the mapping is the file's bytes at 0x1000"
+    );
+    // The mapping is a page multiple and the file ran out at 0x800, so the
+    // rest is zero — not whatever the host had on its next page.
+    let mut tail = [0xffu8; 8];
+    mem.read_bytes(at as u64 + 0x800, &mut tail).unwrap();
+    assert_eq!(tail, [0u8; 8]);
+
+    // `MAP_SHARED` of a file would have to write back somewhere, and there is
+    // nowhere: the stage is fixed and the guest cannot add to it.
+    assert_eq!(
+        kernel.ask(nr::MMAP, &[0, 0x1000, 3, 0x01, fd as u64, 0]),
+        ENODEV
+    );
+    // An offset that is not page aligned is refused rather than rounded, so a
+    // loader that got one wrong is told rather than handed a library shifted
+    // by eight bytes and left to fault somewhere else.
+    assert_eq!(
+        kernel.ask(nr::MMAP, &[0, 0x1000, 3, 0x02, fd as u64, 8]),
+        -22
+    );
+}
+
+#[test]
+fn a_guest_can_open_exactly_what_was_staged_and_nothing_beside_it() {
+    const STAGED: &str = "/lib/libgreet.so";
+    let arch = any_arch();
+    let (mem, mut kernel) =
+        scratch_kernel_staged(arch, Stage::empty().with(STAGED, b"ELF-ish bytes".to_vec()));
+    let ask = |kernel: &mut Kernel, nr: u64, path: &str, extra: &[u64]| -> i64 {
+        mem.write_bytes(0x1000, path.as_bytes()).unwrap();
+        mem.write_bytes(0x1000 + path.len() as u64, &[0]).unwrap();
+        let mut args = alloc::vec![0u64, 0x1000];
+        args.extend_from_slice(extra);
+        kernel.ask(nr, &args)
+    };
+
+    // The staged name resolves, through every call that takes a path.
+    assert_eq!(ask(&mut kernel, nr::OPENAT, STAGED, &[0, 0]), 3);
+    assert_eq!(ask(&mut kernel, nr::FACCESSAT, STAGED, &[4, 0]), 0);
+    assert_eq!(ask(&mut kernel, nr::NEWFSTATAT, STAGED, &[0x1400, 0]), 0);
+
+    // Nothing else does — including names one character away from it, names
+    // that a host would resolve to the same file, and the host paths the
+    // policy exists to refuse. There is no prefix, no root and no lookup
+    // rule: there is a map, and a path is in it or it is not.
+    for missing in [
+        "/lib/libgreet.so.1",
+        "/lib/libgreet.s",
+        "/lib//libgreet.so",
+        "/lib/../lib/libgreet.so",
+        "libgreet.so",
+        "/etc/shadow",
+        "/proc/self/exe",
+        "/",
+    ] {
+        assert_eq!(
+            ask(&mut kernel, nr::OPENAT, missing, &[0, 0]),
+            ENOENT,
+            "{missing}"
+        );
+        assert_eq!(
+            ask(&mut kernel, nr::FACCESSAT, missing, &[4, 0]),
+            ENOENT,
+            "{missing}"
+        );
+        assert_eq!(
+            ask(&mut kernel, nr::NEWFSTATAT, missing, &[0x1400, 0]),
+            ENOENT,
+            "{missing}"
+        );
+    }
+
+    // And the stage is read-only from inside: a descriptor over a staged file
+    // reads, and every write is `-EBADF`, so a guest cannot change what the
+    // next thing to open it will see.
+    let mut buf = [0u8; 13];
+    assert_eq!(kernel.ask(nr::READ, &[3, 0x1000, 13]), 13);
+    mem.read_bytes(0x1000, &mut buf).unwrap();
+    assert_eq!(&buf[..], b"ELF-ish bytes");
+    assert_eq!(kernel.ask(nr::WRITE, &[3, 0x1000, 4]), EBADF);
 }
 
 #[test]
@@ -3239,12 +4177,13 @@ fn reservation_race(arch: &'static Arch) -> (u64, u64, u64) {
                 memsz: 0x1000,
             },
         ],
+        None,
     );
 
     let mem = Arc::new(UserMemory::new(48));
     mem.set_placement(PAGE_SIZE, STACK_TOP - STACK_SIZE)
         .unwrap();
-    load(&mem, &file, arch.machine).unwrap();
+    load(&mem, &file, arch.machine, PIE_BASE).unwrap();
     mem.map_at(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::RW, "[stack]")
         .unwrap();
 
@@ -3384,6 +4323,7 @@ fn at_random_and_getrandom_both_go_through_the_journal() {
                     memsz: 0x1000,
                 },
             ],
+            None,
         );
 
         // Record, with an entropy source that is *not* a function of the
@@ -3395,11 +4335,13 @@ fn at_random_and_getrandom_both_go_through_the_journal() {
             &file,
             &["g"],
             &[],
-            Arc::clone(&recording),
-            alloc::boxed::Box::new(move |len| {
-                counter = counter.wrapping_add(1);
-                vec![counter; len]
-            }),
+            World::new(
+                Arc::clone(&recording),
+                alloc::boxed::Box::new(move |len| {
+                    counter = counter.wrapping_add(1);
+                    vec![counter; len]
+                }),
+            ),
             1_000_000,
         )
         .unwrap_or_else(|e| panic!("{}: {e}", arch.name));
@@ -3415,8 +4357,7 @@ fn at_random_and_getrandom_both_go_through_the_journal() {
             &file,
             &["g"],
             &[],
-            Arc::clone(&recording),
-            Kernel::replay_guard(),
+            World::new(Arc::clone(&recording), Kernel::replay_guard()),
             1_000_000,
         )
         .unwrap();
@@ -3436,8 +4377,7 @@ fn at_random_and_getrandom_both_go_through_the_journal() {
             &file,
             &["g"],
             &[],
-            decoded,
-            Kernel::replay_guard(),
+            World::new(decoded, Kernel::replay_guard()),
             1_000_000,
         )
         .unwrap();
@@ -3479,22 +4419,35 @@ fn run_built_guest(
     budget: u64,
     check: impl Fn(&'static Arch, &Outcome),
 ) {
+    run_built_guest_staged(name, argv, envp, budget, |_| Stage::empty(), check);
+}
+
+/// [`run_built_guest`], with a per-architecture set of staged files.
+///
+/// `stage` is called once per architecture, before anything runs, and what it
+/// returns is the whole namespace that architecture's guest will see. It is a
+/// closure rather than a value because the files a dynamically linked guest
+/// needs are its own architecture's.
+#[cfg(feature = "std")]
+fn run_built_guest_staged(
+    name: &str,
+    argv: &[&str],
+    envp: &[&str],
+    budget: u64,
+    stage: impl Fn(&'static Arch) -> Stage,
+    check: impl Fn(&'static Arch, &Outcome),
+) {
     let mut ran = 0;
     for arch in ARCHES {
         let Some(bytes) = guest_binary(&std::format!("{name}-{}", arch.suffix)) else {
             continue;
         };
         let journal = Arc::new(Journal::with_mode(JournalMode::Record));
-        let out = run(
-            arch,
-            &bytes,
-            argv,
-            envp,
-            Arc::clone(&journal),
-            counting_entropy(),
-            budget,
-        )
-        .unwrap_or_else(|e| panic!("{}: {e}", arch.name));
+        let staged = stage(arch);
+        let mut world = World::new(Arc::clone(&journal), counting_entropy());
+        world.stage = staged.clone();
+        let out = run(arch, &bytes, argv, envp, world, budget)
+            .unwrap_or_else(|e| panic!("{}: {e}", arch.name));
 
         std::eprintln!(
             "usermode/{name} on {}: {} syscall(s), {} thread(s), {} tick(s); refused {:?}",
@@ -3527,19 +4480,20 @@ fn run_built_guest(
 
         // The whole run replays with the host unplugged.
         journal.set_mode(JournalMode::Replay);
-        let replayed = run(
-            arch,
-            &bytes,
-            argv,
-            envp,
-            Arc::clone(&journal),
-            Kernel::replay_guard(),
-            budget,
-        )
-        .expect("the guest replayed");
+        let mut world = World::new(Arc::clone(&journal), Kernel::replay_guard());
+        world.stage = staged;
+        let replayed = run(arch, &bytes, argv, envp, world, budget).expect("the guest replayed");
         assert_eq!(replayed.stdout, out.stdout);
         assert_eq!(replayed.trace, out.trace);
         assert_eq!(replayed.ticks, out.ticks);
+        // The replay consumed the recording exactly. Together with the
+        // entropy source that panics, that is *"the journal is the only
+        // door"* stated in two directions — nothing reached the host, and
+        // nothing the host said went unused. A dynamically linked guest adds
+        // library placements and an open order to the things that have to be
+        // a function of the program, and this is where a recorded one would
+        // have shown up.
+        assert_eq!(journal.remaining(), 0, "{}: {name}", arch.name);
         ran += 1;
     }
     if ran == 0 {
@@ -3641,6 +4595,166 @@ fn a_real_threaded_binary_spawns_joins_and_agrees_on_the_answer() {
             );
         }
     });
+}
+
+/// A dynamically linked program, and a **real** dynamic loader.
+///
+/// `tests/usermode/dynamic/` is an `ET_DYN` executable with a `PT_INTERP`, one
+/// `DT_NEEDED`, a data relocation and a function relocation — which is the
+/// shape of essentially every program on a real system. Nothing here processes
+/// a relocation: the loader the fetch script staged does that, and the string
+/// on standard output lives in the shared object, so it is on screen only if
+/// both relocations were resolved by somebody who is not this module.
+///
+/// What rsemu's consumer supplies is the three things §2.1 says an operating
+/// system supplies and no more: the two images at bases it chose, an
+/// auxiliary vector describing each to the other, and a namespace containing
+/// exactly the files the harness staged.
+#[cfg(feature = "std")]
+#[test]
+fn a_real_dynamically_linked_binary_finds_its_libraries_and_runs() {
+    run_built_guest_staged(
+        "dynamic",
+        &["dynamic"],
+        // The loader is told where to look, so the paths it opens are a
+        // function of this list rather than of a search order compiled into
+        // somebody else's libc. Everything it then asks for has to be in the
+        // stage under the name it asks for, or it does not exist.
+        &["LD_LIBRARY_PATH=/lib"],
+        40_000_000_000,
+        |arch| guest_root(&std::format!("dynamic-{}.root", arch.suffix)),
+        |arch, out| {
+            assert_eq!(out.status, 0, "the guest exited {}", out.status);
+            assert!(out.stderr.is_empty(), "the loader complained");
+            assert!(out.refused.is_empty(), "refused {:?}", out.refused);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "hello from a shared obj\n",
+                "{}: the string lives in the shared object",
+                arch.name
+            );
+            let aux = |key: u64| out.auxv.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+            // Not zero, which is the one-line statement that an interpreter
+            // ran at all: a static binary is told zero there.
+            assert_eq!(aux(auxv::BASE), Some(INTERP_BASE), "{}", arch.name);
+            assert_eq!(aux(auxv::PHDR), Some(PIE_BASE + 64), "{}", arch.name);
+        },
+    );
+}
+
+/// **Ledgered.** The same experiment with a whole C library in it.
+///
+/// `tests/usermode/hello.rs` — the static milestone guest, unchanged — linked
+/// against the host's cross glibc instead of statically against musl. The
+/// loader half works: it opens both libraries by path out of the stage, maps
+/// their segments with a file-backed `mmap`, trims them to their 64 KiB
+/// `p_align` with `munmap`, applies every relocation and transfers control,
+/// **refusing nothing**. The program then stops inside glibc's own `strlen`,
+/// on `ADDHN` — one of the Advanced SIMD instructions `src/cpu/arm/a64/simd.rs`
+/// lists under *"what is deliberately absent"*.
+///
+/// That is a gap in the core rather than in anything here, so this test
+/// asserts the part that is this module's: the loading worked, nothing was
+/// refused, and where it stopped is inside an object **the loader placed**
+/// rather than anywhere the consumer put something. The day the core gains
+/// the halving-narrow group, this test starts asserting the output instead —
+/// and it says so rather than silently continuing to pass.
+#[cfg(feature = "std")]
+#[test]
+fn a_whole_glibc_links_and_relocates_and_then_meets_a_missing_instruction() {
+    for arch in ARCHES {
+        let Some(bytes) = guest_binary(&std::format!("glibc-{}", arch.suffix)) else {
+            continue;
+        };
+        let mut world = World::new(Arc::new(Journal::new()), counting_entropy());
+        world.stage = guest_root(&std::format!("glibc-{}.root", arch.suffix));
+        let outcome = run(
+            arch,
+            &bytes,
+            &["glibc"],
+            &["RSEMU=1", "LD_LIBRARY_PATH=/lib"],
+            world,
+            40_000_000_000,
+        );
+        match outcome {
+            Ok(out) => {
+                std::eprintln!(
+                    "usermode/glibc on {}: {} syscall(s), {} tick(s); refused {:?}",
+                    arch.name,
+                    out.trace.len(),
+                    out.ticks,
+                    out.refused
+                );
+                assert!(out.refused.is_empty(), "refused {:?}", out.refused);
+                // The core grew what it was missing. Promote this test: the
+                // guest is `hello.rs`, so its output is `hello.rs`'s.
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    "hello from level 3\nargv = [\"glibc\"]\nRSEMU = Some(\"1\")\n",
+                    "{}: a whole glibc now runs — fold this into the test above",
+                    arch.name
+                );
+            }
+            Err(why) => {
+                // It has to have got *into* a library the loader placed. A
+                // failure anywhere else — the loader refused, a segment did
+                // not map, the auxiliary vector was wrong — is this module's
+                // and is not ledgered.
+                assert!(
+                    why.contains(" in /lib/"),
+                    "{}: the glibc guest failed outside a loaded object:\n{why}",
+                    arch.name
+                );
+                std::eprintln!("usermode/glibc on {}: ledgered — {why}", arch.name);
+            }
+        }
+    }
+}
+
+/// Every file under `$RSEMU_TESTDATA/usermode/<name>`, staged at the guest
+/// path its position in that directory implies.
+///
+/// The directory is walked **here**, in the harness, before anything is
+/// running — the same place and the same moment [`guest_binary`] reads the
+/// executable. What comes out is a [`Stage`]: a fixed map from guest path to
+/// bytes, which is all the syscall kernel ever sees. A guest cannot reach a
+/// host path through it because by the time a guest exists there is no host
+/// path left to reach.
+#[cfg(feature = "std")]
+fn guest_root(name: &str) -> Stage {
+    fn walk(dir: &std::path::Path, prefix: &str, into: &mut Stage) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        // Sorted, because the stage is guest-visible state and a directory
+        // listing's order is the host's (CLAUDE.md, "Determinism"). It cannot
+        // change what a lookup answers, but it can change which of two
+        // identically named entries won, and that is not a thing to leave to
+        // a filesystem.
+        let mut names: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        for file in names {
+            let path = dir.join(&file);
+            let guest = std::format!("{prefix}/{}", file.to_string_lossy());
+            if path.is_dir() {
+                walk(&path, &guest, into);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                *into = core::mem::take(into).with(&guest, bytes);
+            }
+        }
+    }
+    let root = std::env::var("RSEMU_TESTDATA")
+        .unwrap_or_else(|_| std::format!("{}/testdata", std::env!("CARGO_MANIFEST_DIR")));
+    let mut stage = Stage::empty();
+    walk(
+        std::path::Path::new(&std::format!("{root}/usermode/{name}")),
+        "",
+        &mut stage,
+    );
+    stage
 }
 
 /// Read the named guest binary, or `None` if this checkout has not built one.

@@ -50,8 +50,8 @@
 //!
 //! # What that adds up to, measured
 //!
-//! The four pieces above are enough to run **real statically linked Linux
-//! binaries, on two architectures**.
+//! The four pieces above are enough to run **real Linux binaries, statically
+//! and dynamically linked, on two architectures**.
 //!
 //! An ordinary `std` Rust `hello world` starts through `musl`'s
 //! `__libc_start_main`, finds its own program headers through the auxiliary
@@ -70,8 +70,26 @@
 //! claim that a syscall exit is *"a property of a core"* rather than a
 //! property of RISC-V is now measured.
 //!
+//! A **dynamically linked** program runs too, under a real `ld.so` taken from
+//! the host: an `ET_DYN` executable with a `PT_INTERP`, one `DT_NEEDED`, a
+//! data relocation and a function relocation, in twenty-two syscalls, with the
+//! loader opening the library by path, mapping its segments out of a
+//! descriptor, trimming them to their 64 KiB alignment and resolving both
+//! relocations. Nothing here processes a relocation; the consumer places two
+//! images and builds an auxiliary vector that describes each to the other,
+//! which is the whole of what a kernel does for a dynamically linked process.
+//!
+//! That needed the one policy change level 3 has had. A dynamic loader opens
+//! files, so *"the guest may be told about itself"* became *"the guest may be
+//! told about itself and about what it was handed"* — a set of `(guest path,
+//! bytes)` fixed before the first instruction. What is unchanged is the reason
+//! the rule existed: the syscall kernel still does not link `std`, so there is
+//! no code path from a guest pointer to a host path. `docs/system/usermode-abi.md`
+//! argues it.
+//!
 //! None of the code that does that is in this module, and that is the result.
-//! The ELF loader, the syscall table, the descriptors, the errno values and
+//! The ELF loader, the interpreter, the sandbox policy, the syscall table, the
+//! descriptors, the errno values and
 //! the process model live in `src/usermode/proof.rs`, which is `#[cfg(test)]`
 //! and is the *consumer's* half written out longhand — §2.1's line, held, with
 //! working programs on the far side of it. `docs/system/usermode-abi.md` has
