@@ -2154,7 +2154,141 @@ build_usermode_guests() {
   rustup target add riscv64gc-unknown-linux-musl"
 	[ "$built" -gt 0 ] || die "no guests under ${src}"
 	ok "usermode-guests: ${built} static binaries in ${dest}"
+
+	build_usermode_dynamic "$dest"
+
 	note "    cargo test --all-features usermode::proof -- --nocapture"
+}
+
+# The dynamically linked guests.
+#
+# A static binary needs nothing but a compiler; a dynamic one needs a *dynamic
+# loader*, and there is no way to build one of those out of a Rust toolchain.
+# So this half is conditional in a way the static half is not: it looks for an
+# `ld-linux-<arch>.so.1` on the host, and if there is not one it says so and
+# leaves the corpus without a dynamic guest. `src/usermode/proof.rs` then skips
+# the tests that need it, exactly as it skips an architecture whose standard
+# library is not installed.
+#
+# Nothing is committed and nothing is downloaded here either: the loader is
+# *copied* out of a cross sysroot the host already has, into the git-ignored
+# corpus, and it is run as an emulated guest. glibc is LGPL, and running a
+# program is ordinary use (CLAUDE.md, Provenance); shipping it here would not
+# be, which is why this copies rather than vendors.
+usermode_ldso() {
+	local arch="$1" name="$2" candidate
+	# The override names one file, so it only answers for the architecture
+	# whose loader it is: a checkout with two cross sysroots must not be handed
+	# an AArch64 ld.so when it asked for the RISC-V one.
+	if [ -n "${RSEMU_USERMODE_LDSO:-}" ] &&
+		[ -f "${RSEMU_USERMODE_LDSO}" ] &&
+		[ "$(basename "${RSEMU_USERMODE_LDSO}")" = "$name" ]; then
+		printf '%s\n' "${RSEMU_USERMODE_LDSO}"
+		return 0
+	fi
+	for candidate in \
+		"/usr/${arch}-unknown-linux-gnu/lib64/${name}" \
+		"/usr/${arch}-unknown-linux-gnu/lib/${name}" \
+		"/usr/${arch}-linux-gnu/lib64/${name}" \
+		"/usr/${arch}-linux-gnu/lib/${name}" \
+		"/lib/${name}" \
+		"/lib64/${name}"; do
+		[ -f "$candidate" ] && printf '%s\n' "$candidate" && return 0
+	done
+	return 1
+}
+
+build_usermode_dynamic() {
+	local dest="$1"
+	local src="${REPO_ROOT}/tests/usermode/dynamic"
+	local host ld
+	host="$(rustc -vV | sed -n 's/^host: //p')"
+	ld="$(rustc --print sysroot)/lib/rustlib/${host}/bin/gcc-ld/ld.lld"
+
+	local pair arch suffix target ldso ldso_name root built=0
+	for pair in aarch64:aarch64:ld-linux-aarch64.so.1 \
+		riscv64:riscv64gc:ld-linux-riscv64-lp64d.so.1; do
+		arch="${pair%%:*}"
+		suffix="${arch}"
+		target="$(printf '%s' "$pair" | cut -d: -f2)-unknown-linux-gnu"
+		ldso_name="${pair##*:}"
+		if ! rustc --target "$target" --print target-libdir 2>/dev/null |
+			xargs -r test -d; then
+			note "  no ${target} standard library; skipping the ${suffix} dynamic guest"
+			continue
+		fi
+		if ! ldso="$(usermode_ldso "$arch" "$ldso_name")"; then
+			note "  no ${ldso_name} on this host; skipping the ${suffix} dynamic guest"
+			note "    a cross sysroot supplies one, or set RSEMU_USERMODE_LDSO"
+			continue
+		fi
+		root="${dest}/dynamic-${suffix}.root"
+		mkdir -p "${root}/lib"
+		note "  building dynamic for ${target} against ${ldso} ..."
+		# `-nostdlib`: the guest links no libc, so the loader is the only
+		# thing between the auxiliary vector and `_start`. `-soname` because a
+		# DT_NEEDED is a name and the file's own is not consulted.
+		rustc --edition 2024 --target "$target" \
+			--crate-type cdylib \
+			-C linker="$ld" -C linker-flavor=ld \
+			-C link-arg=-nostdlib -C link-arg="-soname=libgreet.so" \
+			-C panic=abort -C opt-level=1 -C debuginfo=0 -C strip=symbols \
+			--crate-name greet -o "${root}/lib/libgreet.so" "${src}/lib.rs" ||
+			die "could not build the ${suffix} shared object"
+		rustc --edition 2024 --target "$target" \
+			-C linker="$ld" -C linker-flavor=ld \
+			-C link-arg=-nostdlib -C link-arg=-pie \
+			-C link-arg="--dynamic-linker=/lib/${ldso_name}" \
+			-C link-arg="-L${root}/lib" -C link-arg=-lgreet \
+			-C panic=abort -C opt-level=1 -C debuginfo=0 -C strip=symbols \
+			--crate-name dynamic -o "${dest}/dynamic-${suffix}" "${src}/main.rs" ||
+			die "could not build the ${suffix} dynamic executable"
+		cp -f "$ldso" "${root}/lib/${ldso_name}"
+		built=$((built + 1))
+
+		build_usermode_glibc "$dest" "$suffix" "$ldso" "$ldso_name" || true
+	done
+
+	if [ "$built" -gt 0 ]; then
+		ok "usermode-guests: ${built} dynamically linked guest(s) in ${dest}"
+	else
+		note "usermode-guests: no dynamic loader on this host, so no dynamic guest"
+	fi
+}
+
+# The *whole* dynamically linked program: `tests/usermode/hello.rs` again, but
+# linked against the host's cross glibc rather than statically against musl.
+#
+# This one is a ledger entry rather than a gate, and it needs a cross `gcc` as
+# a link driver because a glibc executable pulls in `Scrt1.o`, `crti.o` and
+# `libgcc_s`. Absent either, it is skipped. `src/usermode/proof.rs` says what
+# it measures.
+build_usermode_glibc() {
+	local dest="$1" suffix="$2" ldso="$3" ldso_name="$4"
+	local triple="${suffix}-unknown-linux-gnu" cc root libc libgcc
+	cc="${triple}-gcc"
+	command -v "$cc" >/dev/null 2>&1 || {
+		note "  no ${cc}; skipping the ${suffix} glibc guest"
+		return 1
+	}
+	libc="$("$cc" -print-file-name=libc.so.6)"
+	libgcc="$("$cc" -print-file-name=libgcc_s.so.1)"
+	[ -f "$libc" ] || return 1
+	root="${dest}/glibc-${suffix}.root"
+	mkdir -p "${root}/lib"
+	note "  building glibc for ${triple} ..."
+	rustc --edition 2024 --target "$triple" \
+		-C linker="$cc" -C opt-level=1 -C debuginfo=0 -C strip=symbols \
+		--crate-name glibc -o "${dest}/glibc-${suffix}" \
+		"${REPO_ROOT}/tests/usermode/hello.rs" || return 1
+	cp -f "$ldso" "${root}/lib/${ldso_name}"
+	cp -f "$libc" "${root}/lib/libc.so.6"
+	# `libgcc_s` is a DT_NEEDED of anything rustc links, and it lives in the
+	# compiler's directory rather than the sysroot.
+	if [ -f "$libgcc" ]; then
+		cp -f "$libgcc" "${root}/lib/libgcc_s.so.1"
+	fi
+	return 0
 }
 
 usage() {
@@ -2184,6 +2318,11 @@ Suites:
                  installed (`rustup target add ...`); an absent one is skipped
                  with a note. musl and the linker both come from the Rust
                  toolchain.
+                 It also builds a *dynamically* linked guest where it can,
+                 which needs one thing a compiler cannot produce: a real
+                 ld-linux-<arch>.so.1. That is looked for in the usual cross
+                 sysroots and named by RSEMU_USERMODE_LDSO; without one the
+                 dynamic guests are skipped and the static ones still run.
   riscv-arch-test  the RISC-V architectural certification tests (BSD-3-Clause).
                  Built rather than downloaded: needs clang and a RISC-V linker
                  (lld, or rustup's rust-lld), and fetches the Sail reference
