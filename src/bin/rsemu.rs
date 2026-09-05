@@ -1356,7 +1356,14 @@ fn debug_session(
         // anybody attaches.
         let mut thread = 0u32;
         for entry in machine.devices() {
-            let Some(arch) = rsemu::host::gdb::arch::for_class(entry.class().name) else {
+            // `for_cpu`, not `for_class`: one class can have two register
+            // views — `cpu.x86`'s 32-bit and 64-bit ones — and the banner has
+            // to name the same one the session will serve.
+            let bits = entry
+                .space_index()
+                .and_then(|i| machine.spaces().get(i))
+                .map(|entry| entry.space().bits());
+            let Some(arch) = rsemu::host::gdb::arch::for_cpu(entry.class().name, bits) else {
                 continue;
             };
             thread += 1;
