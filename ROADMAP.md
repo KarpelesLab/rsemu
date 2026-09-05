@@ -21,10 +21,10 @@ This roadmap defines the architecture, the phase order, and the acceptance gate
 for each phase. It is written to be executed top-to-bottom; every phase ships
 something a person can actually run (§2).
 
-> **Status (2026-09-04).** Phases 0-4 are done, phase 5 has landed its IR *and*
+> **Status (2026-09-05).** Phases 0-4 are done, phase 5 has landed its IR *and*
 > a host JIT backend, phase 5b has its gate, phase 6a is met and 6b is close,
-> and phase 7 has a working KVM backend. ~417k lines of Rust across 411 files,
-> **5,012 tests** green under `--all-features`, one crate in `cargo tree`, and
+> and phase 7 has a working KVM backend. ~431k lines of Rust across 414 files,
+> **5,171 tests** green under `--all-features`, one crate in `cargo tree`, and
 > `unsafe` in **five of the seven** sanctioned sites: `core::sync`'s `single`
 > backend, the C and wasm ABIs, the raw-syscall KVM backend, the JIT's code
 > buffer, and the host signal disposition. The RAM host-pointer fast path and
@@ -59,7 +59,7 @@ something a person can actually run (§2).
 > 32-bit instructions with no unexpected exception, stopping only where it waits
 > on a timer no machine has supplied yet.
 >
-> **Thirty-one machine files**: sixteen consoles, computers and
+> **Thirty-three machine files**: eighteen consoles, computers and
 > microcontrollers, and fifteen synthetic boards. `nes-ntsc` and
 > `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run
 > headlessly, with an empty known-failures ledger. Also `gameboy`; `apple1` and `beneater-6502`,
@@ -104,10 +104,14 @@ something a person can actually run (§2).
 > through the kernel's own driver, a `_CRS`-assigned BAR and a level-triggered
 > interrupt through the I/O APIC. `q35` runs a third-party PC firmware to a boot
 > prompt over ECAM with generated ACPI tables. `q35-uefi` puts a real OVMF in two
-> NOR banks below 4 GiB and reaches the **DXE dispatcher** — and no further: it
-> stops on `MOV RAX, CR8`, and since that board has no video and no `0x402`
-> debug port the firmware prints nothing at all, so even that position is
-> inferred from register state rather than read off a console.
+> NOR banks below 4 GiB and reaches an interactive **`UEFI Interactive Shell
+> v2.2`** that executes what is typed at it, on the 16550 at `0x3f8` — the
+> board's only console, since it has no video and no `0x402` debug port — with
+> **variables that survive a reboot**: 5,799 programmed bytes in the store where
+> the shipped image had 127. `MOV RAX, CR8`, an unaligned long-mode `FXSAVE`
+> frame and `RDMSR(IA32_PLATFORM_ID)` were the three x86-core defects in the
+> way, and all three are fixed. It has no storage controller, so the shell finds
+> no boot device and no operating system follows.
 >
 > `pc-at` is in the catalog and **boots FreeDOS 1.3 to its installer prompt on
 > firmware this repository assembles from source** — phase 6a's gate. It sizes
@@ -187,31 +191,54 @@ something a person can actually run (§2).
 >
 > **Phase 5 is no longer a plan.** The IR, its verifier and its passes are in,
 > the portable backend runs everywhere including bare metal, and there is one
-> **host backend — x86-64 Linux**. RISC-V and x86 both have frontends, both
-> cores take `engine = "interp" | "jit" | "jit-host"`, and all three engines
-> reach identical state hashes at ten checkpoints with a snapshot restoring
-> *across* an engine switch. Measured on 240 s of RISC-V guest time and 900 s of
-> x86: `jit-host` at **2.15×** and **2.65×** over the interpreter — the RISC-V
-> figure having *fallen* from 2.28× because the interpreter it is measured
-> against got 1.27× faster — with **87.6%** of the x86 guest's instructions
-> retiring inside a translated block and 99.8%
-> of compiled RISC-V stores writing guest RAM inline. What is *not* done: the
-> aarch64 backend, the **wasm backend** (§11.4), and the tier-2 pipeline — the
-> browser still runs interpreted. Nor is the ≥100 MIPS half of the gate claimed,
-> because §11's reference host (`docs/bench-host.md`) is still unfilled and this
-> project's own rule is that a gate citing an unpopulated table has not been met.
+> **host backend — x86-64 Linux**. **Three architectures have frontends** —
+> RISC-V, x86 and AArch64 — each of those cores takes
+> `engine = "interp" | "jit" | "jit-host"`, and all three engines reach
+> identical state hashes at ten checkpoints with a snapshot restoring *across*
+> an engine switch. `engine` is a `param` on the seven boards that run
+> third-party system software, so `-p engine=jit-host` picks it from the command
+> line; it is still a literal on `pc-at`, `pc-at-smp`, `pc-apic`, `q35` and
+> `a64-mini`. Measured on
+> 240 s of RISC-V guest time, 900 s of x86 and 20 s of AArch64: `jit-host` at
+> **2.15×**, **3.20×** and **5.61×** over the interpreter — the RISC-V figure
+> having *fallen* from 2.28× because the interpreter it is measured against got
+> 1.27× faster — with **97.3%** of the x86 guest's instructions retiring inside
+> a translated block (84.5% one round ago), **97.96%** of the AArch64 guest's,
+> and 99.8% of compiled RISC-V stores writing guest RAM inline. What is *not*
+> done: the aarch64 *host* backend, the **wasm backend** (§11.4), and the
+> tier-2 pipeline — the browser still runs interpreted. Nor is the ≥100 MIPS
+> half of the gate claimed, because §11's reference host (`docs/bench-host.md`)
+> is still unfilled and this project's own rule is that a gate citing an
+> unpopulated table has not been met.
 >
-> **Phase 5b has its gate.** A hand-built static musl Rust binary runs through
-> musl's `_start` on rv64 and exits 0 with no syscall refused, and the run
-> replays identically with the entropy source replaced by a panicking guard.
+> **Phase 5b has its gate, on two architectures.** A hand-built static musl
+> Rust binary runs through musl's `_start` on rv64 *and* aarch64 and exits 0
+> with no syscall refused — the same twenty-five calls in the same order on
+> both — and the run replays identically with the entropy source replaced by a
+> panicking guard. Threaded `std` guests run too (`clone`, `futex`,
+> `set_tid_address`), and that is what found the SMP defect below.
 >
 > **Phase 7 has a KVM backend**, Linux x86-64, raw `ioctl`s, no `libc`.
-> `q35-linux` boots the same stock kernel to a shell in **about ten seconds
-> against 973 interpreted**, 279 of 347 console lines byte-identical to the
-> interpreted run once the printk timestamp is removed, and **99.7-101.2% of
-> native** on a pure-execution workload against a gate of 80%. Not yet:
-> `ThreadingMode::Accel` (so an accelerated board runs `Parallel` and is not
-> reproducible), `engine = "kvm"` as a machine-file value, and HVF/WHPX.
+> `q35-linux` boots the same stock kernel to a shell in **2.4 seconds against
+> 978 interpreted**, on the board's own default command line, 282 of 346
+> console lines byte-identical to the interpreted run once the printk timestamp
+> is removed, and **99.7-101.2% of native** on a pure-execution workload
+> against a gate of 80%. `ThreadingMode::Accel` is implemented — a round's
+> elapsed virtual time comes off the host clock, so the guest stops calibrating
+> a **176,273 MHz** processor and reports 3,992.968 MHz — and that is what
+> unblocked `q35-linux-smp`. Not yet: `engine = "kvm"` as a machine-file value,
+> and HVF/WHPX.
+>
+> **Four boards declare two processors** — `arm64-virt-smp`, `q35-linux-smp`,
+> `pc-at-smp` and the synthetic `pc-apic` — and **none of them has a working
+> global atomic**. The exclusive monitor is core-local, so an `stxr`/`sc.d` the
+> architecture requires to fail succeeds; on x86, `LOCK` is decoded and ignored
+> and `CMPXCHG`/`XADD` are a split read-modify-write, safe under
+> `Deterministic` only because one core runs a whole instruction at a time.
+> They boot because kernel spinlocks are almost never contended, which is luck
+> about timing rather than a property of the model. A **global monitor on the
+> address space** is the deliverable; `docs/README.md` and
+> `src/core/space/attrs.rs` carry the long form.
 ---
 
 ## 0. Non-negotiables

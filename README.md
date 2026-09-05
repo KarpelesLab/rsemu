@@ -24,15 +24,20 @@ one snapshot format, one debugger, shared by every machine ever added.
 ## Design principles
 
 - **Pure Rust, no foreign code.** No C, no FFI, no vendored assembly, no build
-  scripts. The default build has an empty `cargo tree`; dependencies are
-  first-party Karpelès Lab crates only, and every one is feature-gated.
+  scripts. The default build has an empty `cargo tree` — literally just
+  `rsemu`, and CI gates on it — and every dependency is feature-gated. Turning
+  *everything* on costs ten crates, six of them first-party Karpelès Lab; the
+  other four are one transitive chain and the *Built on* section names it
+  rather than rounding it away.
 - **`unsafe` is quarantined.** `unsafe_code = "deny"` crate-wide, and exactly
-  **seven** subsystems opt back in with a scoped allow: the RAM host-pointer
-  fast path, the JIT code buffer, the raw-syscall accel backend, the C and wasm
-  ABIs, `core::sync`'s single-threaded backend, per-CPU execution state, and the
-  host signal disposition. Seven is the ceiling and every block carries a
-  `// SAFETY:` comment. `CLAUDE.md` records why the seventh was granted, as the
-  worked example of how an eighth would have to be argued.
+  **seven** subsystems *may* opt back in with a scoped allow: the RAM
+  host-pointer fast path, the JIT code buffer, the raw-syscall accel backend,
+  the C and wasm ABIs, `core::sync`'s single-threaded backend, per-CPU execution
+  state, and the host signal disposition. **Five of the seven have actually
+  needed it** — the RAM fast path and per-CPU execution state still have not.
+  Seven is the ceiling and every block carries a `// SAFETY:` comment.
+  `CLAUDE.md` records why the seventh was granted, as the worked example of how
+  an eighth would have to be argued.
 - **Determinism is a mode, not an accident.** Deterministic runs are
   bit-reproducible across hosts and across execution engines, which is what
   makes save states, record/replay, rewind, and the regression suite possible.
@@ -93,11 +98,11 @@ quietly leaving the impression of a number.
 Every corpus is fetched by `scripts/fetch-testdata.sh`, never vendored, and
 gated behind an environment variable — a licensing rule as much as a size one.
 
-**Thirty-one machine files**, and `machines/` is where they live: a machine is
+**Thirty-three machine files**, and `machines/` is where they live: a machine is
 described rather than compiled in. Which of them exists in a given binary is a
 feature set, and `rsemu machines` lists what *your* build has.
 
-Sixteen are consoles, computers and microcontrollers; the other fifteen are
+Eighteen are consoles, computers and microcontrollers; the other fifteen are
 synthetic boards that exist so a subsystem has somewhere real to run.
 
 `nes-ntsc` and `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run headlessly, with an
@@ -116,10 +121,13 @@ FF00: D8 A2 FF 9A A9 7F 8D 12
 
 ### The boards that boot software this project did not write
 
-There are seven, on three architectures. [`docs/README.md`](docs/README.md)
-has a table comparing them and a page per board behind it, and those pages
-record **where each one stops** rather than where it gets to. That is the useful
-half: `docs/platforms/q35-linux.md` has driven three rounds of work, and two of
+There are seven, on three architectures — counting a board and its
+two-processor twin as one, which is what they are: an `-smp` file is the same
+board with a second `cpu` object and a table told about it.
+[`docs/README.md`](docs/README.md) has a table comparing them and a page per
+board behind it, and those pages record **where each one stops** rather than
+where it gets to. That is the useful half: `docs/platforms/q35-linux.md` has
+driven three rounds of work, and two of
 the four obstacles it named turned out to be *refuted* rather than fixed — their
 real causes were somewhere else entirely — which is a thing a success report
 cannot tell you.
@@ -159,6 +167,14 @@ through an `SMC` and stops the machine, which is what the test asserts. About
 three minutes of host time for 1.12 seconds of guest time, interpreted, in a
 release build.
 
+It has a **disk** now, too — two `virtio` MMIO windows, the same transport and
+the same device models the RISC-V board uses, moved out from under `dev/riscv/`
+into `src/dev/virtio` so that both boards reach them. Give it a root image and
+the kernel loads its own `virtio_mmio`, `virtio_blk` and `ext4` modules,
+**mounts `/dev/vda` as an ext4 root** and runs the shell out of it — which is
+the difference between a machine that boots and a machine you can put a
+filesystem on.
+
 `arm64-virt-smp` is that board with a **second core**, and the same kernel
 reports `smp: Brought up 1 node, 2 CPUs` on it. Three different problems had to
 be solved for that: the GIC's banked registers now answer per
@@ -170,6 +186,35 @@ everything but the boot processor on a release table. At the shell,
 `/proc/interrupts` shows each processor's own timer count and the
 interprocessor interrupts that went between them; `/proc/stat` shows the second
 one running tasks.
+
+**Read every SMP claim on this page against one caveat.** *The exclusive monitor
+is core-local.* Each core keeps its reservation privately —
+`cpu::arm::a64`'s `State::exclusive`, `cpu::riscv`'s `reservation` — so a
+sibling's store does not break it, and an `stxr` or an `sc.d` that the
+architecture *requires* to fail succeeds instead, losing the sibling's update.
+`core::space::MemAttrs::exclusive` carries the flag and its own documentation
+says the monitor "lives with the CPU, not here"; nothing reads it back, because
+the **global monitor on the address space** that would is not written.
+`usermode::proof`'s
+`a_reservation_is_core_local_so_two_threads_lose_an_update` is a hermetic
+reproducer on both architectures, written to fail when the monitor lands — and
+in the wild an AArch64 `AtomicU32::fetch_add` loop lands **32,038 of 40,000**.
+
+The x86 boards have the same shape of hole from the other end: **`LOCK` is
+decoded and ignored** (`src/cpu/x86/mod.rs` says so, still on the grounds that
+there is "one core, one bus, and nothing to contend with"), and `CMPXCHG`,
+`XADD` and `XCHG` are a read followed by a write rather than one indivisible
+operation. Under `deterministic` threading that is harmless *by accident*,
+because one core runs a whole instruction before the other runs at all; under
+`parallel`, where two CPUs really are on two host threads, it is not; and under
+`--accel kvm` the host's own silicon does the atomic, which is why an
+accelerated SMP boot is not evidence either way.
+
+So **a two-processor board here boots because kernel spinlocks are almost never
+contended and two cores rarely reach the same lock inside one scheduler
+quantum. That is luck about timing, not a property of the model.** Take every
+green SMP boot below as evidence that bring-up, register banking and IPIs work,
+and not as evidence that its atomics do.
 
 `docs/platforms/arm64-virt.md` has the ledger, and it is long: PSCI `CPU_ON` is
 not implemented, so the second core comes up off a spin table and cannot be
@@ -196,7 +241,12 @@ the MP configuration table and the ACPI MADT carry a single local-APIC address,
 because on silicon the register block is on the processor's own die; so
 `0xfee00000` decodes to a *window* that demultiplexes on which processor is
 asking, and each one reaches its own APIC through the one address an operating
-system uses on both.
+system uses on both. What has actually run on it is **rsemu's own boot sector**,
+not an operating system: it walks the MP configuration table for the application
+processor's APIC id, sends the INIT/Start-Up pair the *MultiProcessor
+Specification* §B.4 describes, and the processor that starts enters protected
+mode and reads its own id back as `1`. That is the whole claim, and the SMP
+caveat above applies to it as much as to the others.
 
 **No third-party firmware is shipped and none will be** — but there is now one
 of our own. `rsemu run pc-at --hd0 disk.img` boots with nothing supplied,
@@ -238,19 +288,31 @@ the part worth the sentence, because it used to need three extra words and every
 one of them was hiding a defect here.
 
 `q35-linux-smp` is that board with **two processors** — the same five lines
-`pc-at-smp` adds to `pc-at`, plus a MADT that is told there are two — and the
-same kernel brings the second one up on it in under two seconds under
-`--accel kvm`.
+`pc-at-smp` adds to `pc-at`, plus a MADT that is told there are two — and it is
+the one SMP board here on which a real kernel does real SMP work: the same stock
+Gentoo kernel prints `smp: Brought up 1 node, 2 CPUs` **1.7 seconds** into a
+`--accel kvm` run and `nproc` says `2` at a shell **2.8 seconds** in, on the
+board's own command line. Read it with the SMP caveat above — under KVM the
+atomics are the host's silicon, so that boot says nothing about rsemu's.
 
 `q35-uefi` is the same chipset with the ROM socket replaced by **two banks of
 parallel NOR flash** below 4 GiB, which is the layout every split OVMF build is
 compiled for. A real OVMF runs SEC out of flash, sizes memory in PEI from the
-CMOS, decompresses `FVMAIN`, and reaches the **DXE dispatcher** — and stops
-there, on `MOV RAX, CR8`, an instruction this core raises `#UD` for. It is the
-weakest claim in this section, and `docs/platforms/q35-uefi.md` is the reason
-you should read that rather than this: the board has no video and no `0x402`
-debug port, so the firmware prints *nothing at all*, and "reaches DXE" is
-inferred from register state rather than read off a console.
+CMOS, decompresses `FVMAIN`, dispatches DXE, and **reaches an interactive
+`UEFI Interactive Shell v2.2` — a `Shell>` prompt that executes what is typed at
+it**, in 367.2 seconds of guest time. Three x86-core defects were between it and
+that prompt and all three are fixed: `MOV RAX, CR8` raised `#UD`, a long-mode
+`FXSAVE` frame was mis-aligned, and `RDMSR(IA32_PLATFORM_ID)` raised `#GP`.
+**Variables survive a reboot** — `setvar` in one run reads back in the next, and
+one boot to the shell leaves **5,799 programmed bytes** in the variable bank
+where the shipped `OVMF_VARS.fd` had 127.
+
+Every byte of that is read off the **16550 at `0x3f8`**, which is this board's
+only console: it has no video adapter, because EDK II's `QemuVideoDxe` binds
+three PCI identifications and none of them is ours, and no `0x402` debug port.
+It also has no storage controller, so the shell says `map: No mapping found.`
+and there is **no operating system on this board** —
+`docs/platforms/q35-uefi.md` is the ledger.
 
 `stm32f407` is a microcontroller rather than a computer: an **STM32F407VGT6**,
 the part on ST's own STM32F4 Discovery board — a Cortex-M4 out of flash aliased
@@ -357,14 +419,22 @@ The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
 snapshots, a typed export seam so one device can hand another a handle, and a
 `.machine` description language that goes parse → resolve → validate → realize
-→ run. There is a **gdb stub** (`rsemu debug apple1 --gdb :1234`) — driven end to end
-by a **real `gdb` binary** in `tests/gdb_real_client.rs`, which attaches, reads
-registers, writes a program into guest RAM, sets a breakpoint, hits it and steps
-— and a **browser build** at <https://karpeleslab.github.io/rsemu/>.
+→ run. There is a **gdb stub** (`rsemu debug apple1 --gdb :1234`) — driven end to
+end by a **real `gdb` binary** in `tests/gdb_real_client.rs`, on an x86 guest
+*and* an AArch64 one, which attaches, reads registers, writes a program into
+guest RAM, sets a breakpoint, hits it and steps. An **SMP board's processors are
+threads**: `pc-at-smp` answers `qfThreadInfo` with two, each with its own
+register file, address space and watchpoints. And a **debugger's write into
+guest code invalidates the compiled blocks over it**, so a patch you set through
+gdb is the code that runs — on x86 and RISC-V; `cpu.arm.a64` is the documented
+exception and `docs/system/debug-protocols.md` says so. There is also a
+**browser build** at <https://karpeleslab.github.io/rsemu/>.
 
-That page is not a screenshot. Seven machines are in it, four of which boot on
-an image the 3 MB module carries, so there is something to press before there is
-anything to open: rsemu's own monitors, the public-domain Woz Monitor of 1976,
+That page is not a screenshot. Seven machines are in it — nine catalog entries,
+because the NES and the Master System each ship an NTSC and a PAL file — and
+four of them boot on an image the 3.09 MB module carries, so there is something
+to press before there is anything to open: rsemu's own monitors, the
+public-domain Woz Monitor of 1976,
 an RV32 board painting a gradient through a real SPI display path, and **a
 PC/AT posting on rsemu's own BIOS**. You can type at that PC — one export hands
 a key transition to the same keysym→scan-code table the VNC server uses — and
@@ -406,8 +476,8 @@ device's ring can hold, because a headless run visits the host only once; a
 length. Every float in that path is an amplitude, never a
 duration, so a machine's state hash does not depend on whether anybody is
 listening. There is no native sound-card backend for the same reason there is no
-native window: ALSA is an `ioctl` protocol and the alternative to `libc` is a
-seventh `unsafe` subsystem, which the ceiling of six forbids.
+native window: ALSA is an `ioctl` protocol and the alternative to `libc` is an
+eighth `unsafe` subsystem, which the ceiling of seven forbids.
 
 ### Three ways to execute a guest
 
@@ -420,50 +490,62 @@ The **translation IR** landed first — the architecture-neutral op set, typed S
 blocks, the guest-instruction-boundary markers that make a mid-block fault
 deliverable at the right PC with the right cycle count, a verifier, liveness and
 dead-code elimination, and a portable interpreter backend that needs no `unsafe`
-and runs on every target including bare metal. **RISC-V and x86 both have
-frontends now**, and both cores take an `engine` property with three values:
-`interp`, `jit` (the portable backend), and `jit-host` (native code).
+and runs on every target including bare metal. **Three architectures have
+frontends now** — RISC-V, x86 and AArch64 — and each of those cores takes an
+`engine` property with three values: `interp`, `jit` (the portable backend), and
+`jit-host` (native code).
 
-There is **one host backend and it is x86-64 Linux**. On it, over a 900-second
-Linux boot on `pc64`, medians of three interleaved runs:
+There is still **one host backend and it is x86-64 Linux**; "AArch64 has a
+frontend" means an AArch64 *guest* is lowered to x86-64 host code, not that
+there is an aarch64 code generator. Each row below is the median of interleaved
+runs of a real Linux boot on that board, and every run in a row finished on one
+state hash:
 
-| Engine | RISC-V (`riscv-virt`, 240 s of guest time) | x86 (`pc64`, 900 s) |
-| --- | --- | --- |
-| `interp` | 122.3 s | 279.9 s |
-| `jit` | 103.7 s (1.18×) | 206.6 s (1.35×) |
-| `jit-host` | **56.8 s (2.15×)** | **105.8 s (2.65×)** |
+| Engine | RISC-V (`riscv-virt`, 240 s of guest time) | x86 (`pc64`, 900 s) | AArch64 (`arm64-virt`, 20 s) |
+| --- | --- | --- | --- |
+| `interp` | 122.3 s | 276.5 s | 18.94 s |
+| `jit` | 103.7 s (1.18×) | 184.3 s (1.50×) | 10.42 s (1.82×) |
+| `jit-host` | **56.8 s (2.15×)** | **86.4 s (3.20×)** | **3.37 s (5.61×)** |
 
-All three produce byte-identical guest output — 710 console lines on the x86
-run, with the same `CS:RIP`, `CR2`, `CR3`, `CR4`, `EFER` and flags at the end.
-**87.6% of the x86 guest's instructions retire inside a translated block**
-(1,573,762,719 of 1,797,400,802), and 99.8% of compiled RISC-V stores write
-guest RAM inline rather than through a call. The RISC-V headline *fell* from
-2.28× to 2.15× along the way, because the interpreter it is measured against got
-**1.27× faster** (155.1 s → 122.3 s) and the control moved; the numbers and that
-argument are in
-[`docs/platforms/riscv-virt.md`](docs/platforms/riscv-virt.md) and
-[`docs/platforms/pc64.md`](docs/platforms/pc64.md). No aarch64 backend, and **no
-wasm backend** — the browser runs interpreted.
+All three engines produce byte-identical guest output — 653 console lines on the
+x86 run, ending 900,000 virtual milliseconds in at the same `CS:RIP`, `CR2`,
+`CR3`, `CR4`, `EFER` and flags, having executed the same 358,890,354 blocks from
+the same 228,714 translations. **97.3% of the x86 guest's instructions retire
+inside a translated block** (1,749,569,660 of 1,798,236,276, up from 84.5% one
+round ago), **97.96% of the
+AArch64 guest's** (153,130,249), and 99.8% of compiled RISC-V stores write guest
+RAM inline rather than through a call (1,749,886 of 1,753,140). The RISC-V
+headline *fell* from 2.28× to 2.15× along the way, because the interpreter it is
+measured against got **1.27× faster** (155.1 s → 122.3 s) and the control moved;
+the numbers and that argument are in
+[`docs/platforms/riscv-virt.md`](docs/platforms/riscv-virt.md),
+[`docs/platforms/pc64.md`](docs/platforms/pc64.md) and
+[`docs/platforms/arm64-virt.md`](docs/platforms/arm64-virt.md). No aarch64 host
+backend, and **no wasm backend** — the browser runs interpreted.
 
-Two caveats on all of the above. The machine files still write `engine =
-"interp"` as a literal rather than a `param`, so on the x86 boards the engine is
-not yet selectable from the command line and those figures were taken through a
-test-harness override. And no number in this repository sits on the declared
-reference host, because [`docs/bench-host.md`](docs/bench-host.md) has not been
-filled in — by the project's own rule that makes every one of them informative
-rather than gating.
+Two caveats on all of the above. `engine` is a `param` on the seven boards that
+run third-party system software — `riscv-virt`, `arm64-virt`, `arm64-virt-smp`,
+`pc64`, `q35-linux`, `q35-linux-smp` and `q35-uefi` — so
+`rsemu run -p engine=jit-host` picks it from the command line there. It is
+**still a literal** on `pc-at`, `pc-at-smp`, `pc-apic`, `q35` and `a64-mini`,
+which are therefore still interpreted whatever you pass. And no number in this
+repository sits on the declared reference host, because
+[`docs/bench-host.md`](docs/bench-host.md) has not been filled in — by the
+project's own rule that makes every one of them informative rather than
+gating.
 
 **Hardware acceleration** is real, and it is KVM on Linux x86-64.
 `rsemu run q35-linux --media kernel=bzImage --accel kvm` boots that same stock
-Gentoo 6.6.67 kernel to a busybox shell in **about two and a half seconds of
-wall clock** against **973 s** interpreted, **on the board's own default
-command line** — the `no_timer_check` this paragraph used to carry is gone, and
-so is the defect it was hiding. **282 of the accelerated run's 346 console
-lines are byte-identical** to the interpreted run's, in the same order, once the
-printk timestamp is removed; the 62 that differ are the ones that describe the
-*host* processor, its mitigations, its XSAVE list and its TLB geometry. On a
-pure-execution workload the ratio to native is **99.7%, 99.9% and 101.2%**
-across three runs, against a phase-7 gate of 80%.
+Gentoo 6.6.67 kernel to a busybox shell in **2.4 seconds of wall clock**
+against **978 s** interpreted — 2,826 seconds of guest time either way — **on
+the board's own default command line**: the `no_timer_check` this paragraph
+used to carry is gone, and so is the defect it was hiding. **282 of the
+accelerated run's 346 console lines are byte-identical** to the interpreted
+run's, in the same order, once the printk timestamp is removed; the 62 that
+differ are the ones that describe the *host* processor, its mitigations, its
+XSAVE list and its TLB geometry. On a pure-execution workload the ratio to
+native is **99.7%, 99.9% and 101.2%** across three runs, against a phase-7 gate
+of 80%.
 
 What made the command line honest is `ThreadingMode::Accel`, which is now
 implemented: a scheduler round's elapsed virtual time is **read off the host
@@ -485,14 +567,27 @@ used verbatim either way and what is accelerated is the *run*. It is not
 reproducible: no state hash, no `--record-input`. HVF and WHPX are roadmap
 entries with no code behind them.
 
-**Level 3 — user-mode execution** — has its proof: a static musl Rust binary,
-built by `scripts/fetch-testdata.sh` for `riscv64gc-unknown-linux-musl` and
-never committed, runs through musl's own `_start` and `__libc_start_main` —
+**Level 3 — user-mode execution** — has its proof, on **two architectures**: a
+static musl Rust binary, built by `scripts/fetch-testdata.sh` for
+`riscv64gc-unknown-linux-musl` and `aarch64-unknown-linux-musl` and never
+committed, runs through musl's own `_start` and `__libc_start_main` —
 `AT_PHDR`, thread-local storage, a `brk` heap — reaches `main`, prints, and
-**exits 0**, with no syscall refused. The run is then replayed with the entropy
-source replaced by a panicking guard, and produces identical output and an
-identical tick count. Forty syscalls, and a hard rule: *a level-3 guest may be
-told about itself, and may not be told about the host* — there is no filesystem,
+**exits 0**, with no syscall refused. The same `hello` makes the same
+twenty-five calls in the same order on both. The run is then replayed with the
+entropy source replaced by a panicking guard, and produces identical output and
+an identical tick count.
+
+**Threaded `std` Rust guests run too**: `clone`, `futex` `WAIT`/`WAKE`,
+`set_tid_address` and `CLONE_CHILD_CLEARTID` — which together are the whole of
+`pthread_join` — carry four workers hammering one atomic and three threads on a
+condition variable, written with no knowledge of the emulator. It is also what
+found a real defect: **the exclusive monitor is core-local**, so an AArch64
+`AtomicU32::fetch_add` loop lands 32,038 of 40,000 increments (see the SMP
+caveat above). Forty-seven syscall numbers are dispatched — `hello` makes 25 of
+them on either architecture and the threaded guest 166 — a dynamically linked
+binary is refused with a message rather than half-loaded, and there is a hard
+rule: *a level-3 guest may be told about itself, and may not be told about the
+host* — there is no filesystem,
 `mmap` is anonymous-only, and there is no `--allow` flag and none planned. rsemu
 builds the machine half only; the kernel half is
 [`nixvm`](https://github.com/KarpelesLab/nixvm)'s (`ROADMAP.md` §2.1), which is
@@ -558,12 +653,23 @@ with acceptance gates, and the design invariants.
 
 ## Built on
 
+The default `cargo tree` is exactly `rsemu`. An **`--all-features` build carries
+ten crates besides it, and six of those are Karpelès Lab and MIT**:
 [`pktkit`](https://github.com/KarpelesLab/pktkit-rs) (all networking),
-[`compcol`](https://github.com/KarpelesLab/compcol) (image + snapshot
-compression), [`purecrypto`](https://github.com/KarpelesLab/purecrypto)
-(disk/snapshot encryption, emulated crypto devices),
 [`fstool`](https://github.com/KarpelesLab/fstool) (block devices, qcow2,
-partition tables, and read-write ext/FAT/exFAT/NTFS/XFS/HFS+).
+partition tables, and read-write ext/FAT/exFAT/NTFS/XFS/HFS+),
+[`compcol`](https://github.com/KarpelesLab/compcol) (image + snapshot
+compression), `oxideav-png` (`--screenshot`), and `intl` and `charcode`, which
+`fstool` reaches for. The other four are one chain — `fstool → uuid (v4) →
+getrandom → libc, cfg-if` — so `libc` arrives through *randomness* rather than
+through an `ioctl`, and making `uuid`'s `v4` optional upstream would take all
+four out at once. That list was **33 crates two releases of `fstool` ago, then
+23, and is now 10**; `Cargo.toml` records what each step dropped.
+
+[`purecrypto`](https://github.com/KarpelesLab/purecrypto) is named in the
+dependency policy for disk and snapshot encryption, but **it is a seam and not
+yet a dependency** — nothing in this build links it, and `src/core/state.rs`
+says so where the encrypted-snapshot path would be.
 
 [`noroi`](https://github.com/KarpelesLab/noroi) is *not* among them. It was
 listed here for a monitor TUI that has not been built and is not planned: the
