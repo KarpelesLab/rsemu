@@ -146,9 +146,43 @@
 //!   nothing. `TR6`/`TR7` likewise store and do nothing.
 //! - **No alignment check.** `CR0.AM` and `EFLAGS.AC` have storage; no `#AC`
 //!   is ever raised.
-//! - **`LOCK` is decoded and ignored.** One core, one bus, and nothing to
-//!   contend with; the invalid-opcode exception a `LOCK` on a non-lockable
-//!   instruction should raise is not enforced.
+//! - **`LOCK` is decoded and ignored, and the read-modify-writes it applies to
+//!   are split.** The justification this line used to carry — *one core, one
+//!   bus, and nothing to contend with* — is no longer true and is worth
+//!   correcting rather than leaving: `pc-at-smp`, `q35-linux-smp` and
+//!   `pc-apic` all declare two processors, `ThreadingMode::Parallel` is
+//!   implemented, and `q35-linux-smp` boots a stock kernel that reports two.
+//!
+//!   `CMPXCHG`, `XADD`, `XCHG` with a memory operand — which is locked
+//!   *implicitly*, prefix or not (*Intel SDM* volume 2, `XCHG`) — and
+//!   `CMPXCHG8B`/`CMPXCHG16B` are each an `Exec::read_mem` followed by an
+//!   `Exec::write_mem`, with a window between them. Under
+//!   `ThreadingMode::Deterministic` one core runs a whole instruction at a
+//!   time and the window cannot be entered; under `Parallel` a sibling's
+//!   store lands in it and is lost. **It is an atomic that is not.**
+//!
+//!   The exposure is the *interpreter's* alone: `cpu::x86::lift::classify`
+//!   refuses a `LOCK` prefix outright and none of these four encodings is in
+//!   the lifted subset, so every engine reaches the same code.
+//!
+//!   **The exclusive monitor being built for RISC-V and AArch64 is not the
+//!   answer here**, and the difference is the whole design question. `LR`/`SC`
+//!   and `LDXR`/`STXR` are a *pair* with an architectural failure outcome, so
+//!   a global monitor can break a reservation and the store reports that it
+//!   was broken; the guest's own loop retries. x86 has no pair, no reservation
+//!   and no failure outcome — a locked read-modify-write is simply required
+//!   not to be interleaved with, and there is nothing to report. What closes
+//!   it is an **atomic read-modify-write on guest-physical memory**: a
+//!   compare-exchange and a fetch-and-op the address space performs under
+//!   whatever its backing store can do atomically (`RamStore` is already
+//!   `AtomicU8` underneath), with a defined answer for the MMIO regions where
+//!   it cannot. Failing that, a **bus lock** held across the read and the
+//!   write makes locked-against-locked atomic, which is what every guest
+//!   spinlock, refcount and futex is, and leaves locked-against-plain-store
+//!   open.
+//!
+//!   The invalid-opcode exception a `LOCK` on a non-lockable instruction
+//!   should raise is a second, separate gap and is not enforced either.
 //! - **The accessed bit** is set when a selector is loaded by `MOV Sreg` or by
 //!   a far transfer to a code segment, but not by the segment loads a gate,
 //!   an `IRET` or a task switch performs. Hardware sets it in all of them.

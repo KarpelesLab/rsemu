@@ -1924,6 +1924,16 @@ impl<'a> Exec<'a> {
                 };
                 self.write_arg(f, insn.dst, size, value)?;
             }
+            // The three read-modify-writes, and each is a **read then a
+            // write** with a window between them. That is what the crate
+            // documentation's `LOCK` entry is about: sound while one core runs
+            // a whole instruction at a time, and not sound under
+            // `ThreadingMode::Parallel`, where a sibling's store lands in the
+            // window and is lost. Closing it needs an atomic read-modify-write
+            // on guest-physical memory, which `core::space` has not got — and
+            // *not* the exclusive monitor the other two cores want, because
+            // x86 has no reservation to break and no failure outcome to
+            // report. See `cpu::x86`'s "What is not modelled".
             Op::XCHG => {
                 let a = self.read_arg(f, insn.dst, size)?;
                 let b = self.read_arg(f, insn.src, size)?;
