@@ -662,8 +662,16 @@ const KEYBOARD_PORT: &str = "keyboard";
 /// straight from the factory. `machine::realize` refuses an unbound slot, so
 /// "empty" has to be said explicitly — with no bytes. The same list, and the
 /// same argument, as `src/bin/rsemu.rs`'s.
+///
+/// `nvme0` is here for the reason `hd0` is: a controller with no bytes bound is
+/// a drive whose capacity comes from the board's `disk` parameter and whose
+/// contents are zeroes, which is a blank disk rather than a missing one. It
+/// arrived on the CLI's list when `q35-linux` grew a namespace and was missed
+/// here, so the two lists had quietly parted; `q35-uefi` grew one too, and a
+/// `demo,machine-q35-uefi` module would have refused to assemble the board over
+/// a bay it had been given no way to name.
 const EMPTY_BAYS: &[&str] = &[
-    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios",
+    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0",
 ];
 
 /// Where the media image a boot binds comes from.

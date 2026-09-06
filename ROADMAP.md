@@ -21,10 +21,10 @@ This roadmap defines the architecture, the phase order, and the acceptance gate
 for each phase. It is written to be executed top-to-bottom; every phase ships
 something a person can actually run (§2).
 
-> **Status (2026-09-05).** Phases 0-4 are done, phase 5 has landed its IR *and*
+> **Status (2026-09-07).** Phases 0-4 are done, phase 5 has landed its IR *and*
 > a host JIT backend, phase 5b has its gate, phase 6a is met and 6b is close,
-> and phase 7 has a working KVM backend. ~431k lines of Rust across 414 files,
-> **5,171 tests** green under `--all-features`, one crate in `cargo tree`, and
+> and phase 7 has a working KVM backend. ~444k lines of Rust across 418 files,
+> **5,335 tests** green under `--all-features`, one crate in `cargo tree`, and
 > `unsafe` in **five of the seven** sanctioned sites: `core::sync`'s `single`
 > backend, the C and wasm ABIs, the raw-syscall KVM backend, the JIT's code
 > buffer, and the host signal disposition. The RAM host-pointer fast path and
@@ -59,7 +59,7 @@ something a person can actually run (§2).
 > 32-bit instructions with no unexpected exception, stopping only where it waits
 > on a timer no machine has supplied yet.
 >
-> **Thirty-three machine files**: eighteen consoles, computers and
+> **Thirty-four machine files**: nineteen consoles, computers and
 > microcontrollers, and fifteen synthetic boards. `nes-ntsc` and
 > `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run
 > headlessly, with an empty known-failures ledger. Also `gameboy`; `apple1` and `beneater-6502`,
@@ -99,6 +99,16 @@ something a person can actually run (§2).
 > `secondary = "spin-table"` still selects it; `docs/platforms/arm64-virt.md`
 > has both.
 >
+> **`riscv-virt-smp`** is the third multiprocessor board that runs a real
+> kernel, and it needed the least: RISC-V gives every hart its own *address* for
+> `msip`, `mtimecmp` and its PLIC context, so the CLINT and the PLIC were
+> already per-hart and an IPI is a store to a sibling's `msip` word rather than
+> a mechanism. The second hart starts through **SBI HSM**, the same kernel
+> prints `smp: Brought up 1 node, 2 CPUs`, and userspace then runs on both —
+> `nproc` says 2, `/proc/interrupts` has a column per hart with IPIs going both
+> ways, `/proc/stat` gives hart 1 more system time than hart 0. Read it with the
+> atomics paragraph further down.
+>
 > **The x86 side reached 6b's shape.** `pc64` and `q35-linux` enter a stock
 > `bzImage` directly and reach a shell; `q35-linux` does it **on the board's own
 > default command line**, and busybox reads bytes off an **NVMe** namespace
@@ -111,8 +121,16 @@ something a person can actually run (§2).
 > **variables that survive a reboot**: 5,799 programmed bytes in the store where
 > the shipped image had 127. `MOV RAX, CR8`, an unaligned long-mode `FXSAVE`
 > frame and `RDMSR(IA32_PLATFORM_ID)` were the three x86-core defects in the
-> way, and all three are fixed. It has no storage controller, so the shell finds
-> no boot device and no operating system follows.
+> way, and all three are fixed. It now has an **NVMe controller** as well, so
+> `FS0:` maps a FAT volume on it, `startup.nsh` is read off that volume and
+> executed, and a stock Gentoo 6.6.67 `bzImage` entered through its **EFI stub**
+> comes up on COM1 and answers `uname -srm` — **an operating system booted
+> through UEFI**, with the firmware rather than a loader placing the kernel. And
+> a **`q35.fwcfg`** hands OVMF the ACPI set `src/dev/q35/acpi.rs` generates from
+> the realized machine, packaged as the offset-relative blob and 128-byte loader
+> script `QemuFwCfgAcpi.c` expects: eight tables installed, so the kernel prints
+> `ACPI: Using ACPI (MADT) for SMP configuration information` and `APIC: Switch
+> to symmetric I/O mode setup` where it used to fall back to virtual wire mode.
 >
 > `pc-at` is in the catalog and **boots FreeDOS 1.3 to its installer prompt on
 > firmware this repository assembles from source** — phase 6a's gate. It sizes
@@ -230,8 +248,9 @@ something a person can actually run (§2).
 > unblocked `q35-linux-smp`. Not yet: `engine = "kvm"` as a machine-file value,
 > and HVF/WHPX.
 >
-> **Four boards declare two processors** — `arm64-virt-smp`, `q35-linux-smp`,
-> `pc-at-smp` and the synthetic `pc-apic` — and their guest atomics are now
+> **Five machine files declare two processors** — `riscv-virt-smp`,
+> `arm64-virt-smp`, `q35-linux-smp`, `pc-at-smp` and the synthetic `pc-apic` —
+> and their guest atomics are now
 > kept. `core::space::monitor` is a global exclusive monitor on the address
 > space, so a sibling's store breaks a covering reservation and `stxr`/`sc.d`
 > fail when the architecture requires it. x86 needed a different primitive,
@@ -240,10 +259,17 @@ something a person can actually run (§2).
 > the read and the write. The two compose — a locked write still breaks
 > reservations on its way through the store funnel.
 >
-> **What remains**: locked-against-plain (a sibling's ordinary store inside the
-> window), and *ordering* — fences are still no-ops, so a guest depending on a
-> weak memory model being weak has nothing to disagree with. `src/core/space/
-> monitor.rs` and `src/core/space/buslock.rs` carry the long form.
+> **What remains**: *single-copy atomicity* — `RamStore` is a `Vec<AtomicU8>`
+> and every access is a byte loop, so an aligned load racing an aligned store
+> can return a mixture of two words (locked-against-plain is one case of this,
+> not the whole of it) — and *ordering*, since every data barrier still retires
+> as a no-op, which is not harmless even when guest and host share an
+> architecture. **Both are reachable only under `ThreadingMode::Parallel`**,
+> which is opt-in and which no machine file selects, so they are documented
+> boundaries rather than live defects. `src/core/space/monitor.rs`,
+> `src/core/space/buslock.rs` and `docs/techniques/memory-models.md` carry the
+> long form, the last with `tests/smp_single_copy_atomicity.rs` and
+> `tests/memory_model_costs.rs` putting numbers on both.
 ---
 
 ## 0. Non-negotiables

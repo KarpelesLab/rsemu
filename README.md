@@ -98,11 +98,11 @@ quietly leaving the impression of a number.
 Every corpus is fetched by `scripts/fetch-testdata.sh`, never vendored, and
 gated behind an environment variable — a licensing rule as much as a size one.
 
-**Thirty-three machine files**, and `machines/` is where they live: a machine is
+**Thirty-four machine files**, and `machines/` is where they live: a machine is
 described rather than compiled in. Which of them exists in a given binary is a
 feature set, and `rsemu machines` lists what *your* build has.
 
-Eighteen are consoles, computers and microcontrollers; the other fifteen are
+Nineteen are consoles, computers and microcontrollers; the other fifteen are
 synthetic boards that exist so a subsystem has somewhere real to run.
 
 `nes-ntsc` and `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run headlessly, with an
@@ -123,7 +123,10 @@ FF00: D8 A2 FF 9A A9 7F 8D 12
 
 There are seven, on three architectures — counting a board and its
 two-processor twin as one, which is what they are: an `-smp` file is the same
-board with a second `cpu` object and a table told about it.
+board with a second `cpu` object and a table told about it. **Four of those
+twins exist** — `riscv-virt-smp`, `arm64-virt-smp`, `q35-linux-smp` and
+`pc-at-smp` — and **three of them boot a real kernel onto both processors**; the
+fourth, `pc-at`'s, runs rsemu's own boot sector and no operating system.
 [`docs/README.md`](docs/README.md) has a table comparing them and a page per
 board behind it, and those pages record **where each one stops** rather than
 where it gets to. That is the useful half: `docs/platforms/q35-linux.md` has
@@ -171,10 +174,7 @@ per-hart, the device tree generator already emitted a node per hart, and an
 **IPI is a store to a sibling's `msip` word** rather than a mechanism. The
 second hart is started through **SBI HSM** — the firmware's own hart state
 machine — which is the RISC-V spelling of what `arm64-virt-smp` now does with
-PSCI `CPU_ON`. What
-it shares with both is the caveat: the exclusive monitor is still per core, so
-that boot is evidence about bring-up, interrupt delivery and IPIs and not about
-`lr`/`sc`.
+PSCI `CPU_ON`.
 
 `arm64-virt` is the newest, and the first AArch64 board here. A
 Cortex-A53-class core, a **GICv2**, a **PL011**, a power controller for where
@@ -225,27 +225,37 @@ The evidence is a number that used to come out wrong. An AArch64
 interpreters on two host threads running `lock xadd` land **40,000 of 40,000**,
 against 34,271 with the bus lock removed. Both are hermetic tests.
 
-**One residual, recorded rather than papered over:** locked-against-*plain* is
-still open — a sibling's ordinary store can land inside a locked
-read-modify-write's window — and this fixes *atomicity*, not *ordering*. Fences
-are no-ops, so a guest that depends on a weak memory model being weak has
-nothing here to disagree with.
+**Two residuals, recorded rather than papered over**, and
+[`docs/techniques/memory-models.md`](docs/techniques/memory-models.md) measures
+both rather than asserting them.
 
-The x86 boards have the same shape of hole from the other end: **`LOCK` is
-decoded and ignored** (`src/cpu/x86/mod.rs` says so, still on the grounds that
-there is "one core, one bus, and nothing to contend with"), and `CMPXCHG`,
-`XADD` and `XCHG` are a read followed by a write rather than one indivisible
-operation. Under `deterministic` threading that is harmless *by accident*,
-because one core runs a whole instruction before the other runs at all; under
-`parallel`, where two CPUs really are on two host threads, it is not; and under
+*Single-copy atomicity is not kept.* `RamStore` is a `Vec<AtomicU8>` and every
+access to it is a byte loop, so a naturally aligned four-byte load racing a
+naturally aligned four-byte store can come back a mixture of the old and the new
+word — a value all three architectures forbid (*Intel SDM* vol. 3 §9.1.1, ARM
+DDI 0487 B2.2.1, RISC-V Unprivileged ISA §1.4).
+`tests/smp_single_copy_atomicity.rs` catches it 117–361 times in sixty thousand
+loads, and catches the read half of a `LOCK XADD` torn the same way with the bus
+lock held throughout — so locked-against-*plain* is one case of a wider gap
+rather than the whole of it.
+
+*And this is atomicity, not ordering.* Every data barrier in the tree retires as
+a no-op — `DMB`/`DSB`, `FENCE`, `MFENCE`/`LFENCE`/`SFENCE`. That is **not**
+harmless just because guest and host share an architecture: a barrier is the
+guest asking for something stronger than its own baseline, and an x86 host's
+store buffer performs exactly the store-then-load reordering an x86 guest's
+`MFENCE` paid to remove. `tests/memory_model_costs.rs` produces the outcome
+`MFENCE` forbids tens to hundreds of times in 200 000 rounds, and never once
+when about forty nanoseconds separate the store from the load.
+
+**Both are reachable only under `ThreadingMode::Parallel`** — opt-in via
+`--threading parallel`, selected by **no machine file**, and not the default:
+`Deterministic` runs every guest on one host thread, where the finest
+interleaving there is is one whole instruction and none of this can be observed.
+That is what makes them documented boundaries rather than live defects, and it
+is the sentence every SMP claim above should be read with. Separately, under
 `--accel kvm` the host's own silicon does the atomic, which is why an
-accelerated SMP boot is not evidence either way.
-
-So **a two-processor board here boots because kernel spinlocks are almost never
-contended and two cores rarely reach the same lock inside one scheduler
-quantum. That is luck about timing, not a property of the model.** Take every
-green SMP boot below as evidence that bring-up, register banking and IPIs work,
-and not as evidence that its atomics do.
+accelerated SMP boot is not evidence about this tree either way.
 
 `docs/platforms/arm64-virt.md` has the ledger, and it is long: PSCI
 `CPU_SUSPEND` is refused rather than implemented (`CPU_ON`, `CPU_OFF` and
@@ -337,12 +347,36 @@ that prompt and all three are fixed: `MOV RAX, CR8` raised `#UD`, a long-mode
 one boot to the shell leaves **5,799 programmed bytes** in the variable bank
 where the shipped `OVMF_VARS.fd` had 127.
 
-Every byte of that is read off the **16550 at `0x3f8`**, which is this board's
-only console: it has no video adapter, because EDK II's `QemuVideoDxe` binds
-three PCI identifications and none of them is ours, and no `0x402` debug port.
-It also has no storage controller, so the shell says `map: No mapping found.`
-and there is **no operating system on this board** —
-`docs/platforms/q35-uefi.md` is the ledger.
+And **an operating system now follows it**, which is the newest thing here. The
+board grew an **NVM Express controller at `00:04.0`** — the same part
+`q35-linux` uses, chosen because EDK II's `NvmExpressDxe` binds on a class code
+and polls its completion queues, so a namespace is reachable with nothing on
+this board wired for it. OVMF enumerates it, `FS0:` maps a FAT volume on it,
+`startup.nsh` is read off that volume and executed, and BDS starts
+`\EFI\BOOT\BOOTX64.EFI` from it rather than from the firmware volume. Put a
+stock Gentoo 6.6.67 `bzImage` on that volume — a modern one *is* a PE/COFF EFI
+application — and the **firmware, not a loader**, reads it and its initramfs off
+that namespace, `LoadImage`/`StartImage`s it, hands it a memory map and a system
+table, and the kernel comes up on COM1, runs `/init` and answers `uname -srm`.
+
+It also **describes itself** now, through **`fw_cfg`** at `0x510`. Under UEFI
+nothing scans for an RSDP — the kernel takes it from the EFI configuration
+table, which holds whatever the *firmware* installed, and an OVMF build has
+exactly one source for that. So `q35.fwcfg` hands over the same tables
+`src/dev/q35/acpi.rs` generates from the realized machine, packaged the way
+`QemuFwCfgAcpi.c` expects: a blob whose pointer fields are offsets, an RSDP, and
+a 128-byte-command loader script that allocates, relocates and checksums. Eight
+tables get installed, and the kernel that used to print `ACPI MADT or MP tables
+are not detected` and fall back to virtual wire mode now prints `ACPI: Using
+ACPI (MADT) for SMP configuration information` and `APIC: Switch to symmetric
+I/O mode setup`. Wiring the HPET's `LEG_RT_CNF` multiplexer was the other half
+of that, and the board panicked `IO-APIC + timer doesn't work!` in between.
+
+Every byte of all of it is read off the **16550 at `0x3f8`**, which is this
+board's only console: it has no video adapter, because EDK II's `QemuVideoDxe`
+binds three PCI identifications and none of them is ours, and no `0x402` debug
+port. The whole boot is 2,156,716 ms of guest time — minutes of host time — and
+`docs/platforms/q35-uefi.md` is the ledger of what is still in the way.
 
 `stm32f407` is a microcontroller rather than a computer: an **STM32F407VGT6**,
 the part on ST's own STM32F4 Discovery board — a Cortex-M4 out of flash aliased
@@ -462,7 +496,7 @@ exception and `docs/system/debug-protocols.md` says so. There is also a
 
 That page is not a screenshot. Seven machines are in it — nine catalog entries,
 because the NES and the Master System each ship an NTSC and a PAL file — and
-four of them boot on an image the 3.09 MB module carries, so there is something
+four of them boot on an image the 3.10 MB module carries, so there is something
 to press before there is anything to open: rsemu's own monitors, the
 public-domain Woz Monitor of 1976,
 an RV32 board painting a gradient through a real SPI display path, and **a
@@ -626,12 +660,41 @@ condition variable, written with no knowledge of the emulator. It is also what
 found the tree's largest correctness defect: **the exclusive monitor was
 core-local**, so an AArch64 `AtomicU32::fetch_add` loop landed 32,038 of 40,000
 increments. It lands 40,000 now (see the SMP section above), and the same guest
-is what proves it. Forty-seven syscall numbers are dispatched — `hello` makes 25 of
-them on either architecture and the threaded guest 166 — a dynamically linked
-binary is refused with a message rather than half-loaded, and there is a hard
-rule: *a level-3 guest may be told about itself, and may not be told about the
-host* — there is no filesystem,
-`mmap` is anonymous-only, and there is no `--allow` flag and none planned. rsemu
+is what proves it.
+
+**And a whole C library runs, on both architectures.** The same `hello`, linked
+against **glibc** instead of statically against musl and run under that
+library's own `ld.so`: a `PT_INTERP` is read, the interpreter is mapped and
+entered with no relocations applied, it opens and relocates the objects its
+`DT_NEEDED` names, resolves the ifuncs glibc picks its `memcpy` and `strlen`
+with, and transfers control — 59 syscalls on aarch64 and 62 on riscv64.
+Threaded, it is 205 and 204, and it found something musl never asks for:
+glibc's `pthread_create` tries **`clone3`** first and falls back to the
+five-register `clone` on `-ENOSYS`.
+
+**Software nobody here wrote runs on it too** — three programs picked for what
+they ask of the ABI rather than for fame, all permissive, all cross-built
+unmodified at a pinned version by `scripts/fetch-testdata.sh` and never
+committed: **SQLite 3.45** (public domain), **Lua 5.4.7** (MIT) and **sbase**
+(MIT). SQLite makes the same ninety-three calls in the same order on both
+architectures and prints the same rows; sbase's `sha256sum`, `wc` and `cksum`
+are diffed against the *host's* over the same bytes, which is what makes it
+different in kind from a test that only checks a program did not crash. They
+are what found four holes, every one of them in the consumer's half:
+`mstatus.FS` left Off, and missing `readv`, `pread64` and `fcntl`.
+
+**Fifty-two syscall numbers are dispatched** — `hello` makes 25 of them on
+either architecture and the threaded musl guest 166 — and the hard rule is
+unchanged: *a level-3 guest may be told about itself, and may not be told about
+the host*. What that means has been sharpened rather than relaxed. There is
+still no `--allow` flag and none planned, and the property is now **mechanical**
+rather than argued: *nothing that services a syscall links `std`*, which a CI
+feature-combination job builds on every commit. A guest reaches files through a
+**stage** — a map from guest path to bytes the harness fixes before the guest
+exists — so a program that is *told* a path runs and a program that
+*discovers* paths does not: `ls` fails with `lstat /work: No such file or
+directory`, because there is no `getdents64` and no notion of a directory, and
+that is the answer rather than a gap. rsemu
 builds the machine half only; the kernel half is
 [`nixvm`](https://github.com/KarpelesLab/nixvm)'s (`ROADMAP.md` §2.1), which is
 why all of this lives under `#[cfg(test)]` and none of it is public API.
