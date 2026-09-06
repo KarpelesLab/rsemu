@@ -47,3 +47,61 @@ atomics stress suite.
   monitors, or CAS with an ABA-tolerant scheme) each have documented failure
   cases. Decide deliberately and write the reasoning down.
 - Each frontend gets its own memory-model conformance suite (`ROADMAP.md` §12).
+
+## Where this stands today, measured
+
+Two things are kept and two are not. Both of the ones that are not are reachable
+**only** under `ThreadingMode::Parallel`, which is opt-in (`--threading
+parallel`); no machine file selects it, `Deterministic` is the default, and
+`usermode`'s `ThreadSet` runs every guest thread on one host thread by design.
+Under one host thread the finest interleaving there is is one whole instruction,
+so none of this can be observed — which is why the tree has got this far without
+it mattering.
+
+**Kept.** The load-reserved pair, by `core::space::ExclusiveMonitor`: a store by
+any observer to the reservation granule clears the slot, so a store-conditional
+that raced anything fails and the guest retries. The x86 locked
+read-modify-write, by `core::space::BusLock`, against *another* locked one.
+
+**Not kept: single-copy atomicity.** `RamStore` is a `Vec<AtomicU8>` and every
+access to it is a byte loop, so a naturally aligned four-byte load racing a
+naturally aligned four-byte store can return a mixture of the old and the new
+word — a value all three architectures forbid (*Intel SDM* volume 3 §9.1.1, ARM
+DDI 0487 B2.2.1, RISC-V Unprivileged ISA §1.4).
+`tests/smp_single_copy_atomicity.rs` catches it 117–361 times in sixty thousand
+loads, and catches the read half of a `LOCK XADD` torn the same way 90–138 times
+with the bus lock held throughout. It is also **engine-dependent**: a store the
+JIT inlines is one host instruction of the guest's width and does not tear.
+`core::space::store`'s "What per-byte atomicity is not" has the cost of the two
+ways to remove it and why neither was taken.
+
+**Not kept: barriers.** Every data barrier in the tree retires as a no-op —
+`DMB`/`DSB`, `FENCE`, `MFENCE`/`LFENCE`/`SFENCE`. `core::sync` has the analysis;
+the correction it makes to the table above is worth repeating here, because the
+table as written is what would stop someone looking:
+
+> **"Guest weaker than or equal to the host, nothing to emit" is wrong for a
+> barrier instruction.** It is right for the guest's *baseline* ordering — an
+> x86 guest's ordinary loads and stores need nothing on an x86 host. But a
+> barrier is the guest asking for something stronger than its own baseline, and
+> the host's baseline is not stronger than that. `MFENCE` exists to defeat
+> store-then-load reordering, and an x86 host does exactly that reordering to
+> the emulator's own accesses. Dropping the guest's `MFENCE` therefore hands the
+> guest back the relaxation it just paid to remove.
+
+`tests/memory_model_costs.rs` puts a number on the window: a store-buffer litmus
+over the same relaxed `AtomicU8` primitive `RamStore` uses produces the outcome
+`MFENCE` forbids tens to hundreds of times in 200 000 rounds when nothing
+separates the store from the load, and never once about forty nanoseconds do.
+That is the same order as the interpreter's cost per guest instruction and much
+longer than the JIT's — so the exposure is small for one engine and real for the
+other. On an AArch64 host, store-store and load-load go as well and every
+barrier matters.
+
+The fix is one host fence per guest barrier instruction and costs nothing on any
+other path; `core::sync` re-exports `fence` and `compiler_fence` for exactly
+that, and the IR already carries `Opcode::FENCE` with an `IrHost::fence` hook
+whose default body is empty "on a host with one thread of guest execution". What
+is missing is the three interpreter arms (`a64`, `riscv`, `x86`), that default,
+and `a64::lift` emitting a `FENCE` where it currently emits `Plan::Nop`. All of
+those sites are in `cpu/` and `ir/`.

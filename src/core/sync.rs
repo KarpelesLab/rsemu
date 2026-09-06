@@ -83,6 +83,53 @@
 //! - Under every backend, `try_lock` answers "am I already in here?" without
 //!   blocking, which is how a handler detects its own re-entry portably.
 //!
+//! # The ladder is about deadlock, not about the guest's memory model
+//!
+//! Nothing above orders one *memory access* against another. A guest's
+//! barriers — `DMB`/`DSB`, `FENCE`, `MFENCE` — are a separate mechanism, and
+//! the seam for them is already here: [`fence`] and [`compiler_fence`] are
+//! re-exported below alongside the atomics, for the same reason the atomics
+//! are.
+//!
+//! **No core calls them today**, and every data barrier in the tree retires as
+//! a no-op (`cpu::arm::a64::exec`, `Op::Dsb | Op::Dmb | Op::Isb`, and
+//! `a64::lift` maps the three to `Plan::Nop` to match; `cpu::riscv::exec`,
+//! `Op::Fence | Op::FenceI`; `cpu::x86::fpexec`,
+//! `Op::LFENCE | Op::MFENCE | Op::SFENCE`). `cpu::arm::v7m` is the one that is
+//! unarguably right — a Cortex-M is a uniprocessor, so there is no second
+//! observer for a barrier to order against. Under
+//! [`ThreadingMode::Deterministic`](crate::core::sched::ThreadingMode::Deterministic)
+//! that is exactly right — one host thread has no reordering to prevent — and
+//! it is why the omission has cost nothing so far.
+//!
+//! Under `Parallel` it is not right, and the reason is the *host*, not this
+//! emulator. A guest instruction's accesses do leave in program order: they are
+//! separate calls through `SpaceView::write_span`, and the emulator never
+//! reorders them. But each becomes a relaxed host atomic, so the host's own
+//! model applies underneath. On an x86-64 host that leaves exactly one
+//! reordering visible — store-then-load, the one `MFENCE` exists to defeat —
+//! and it survives long enough to matter. A store-buffer litmus over the same
+//! relaxed `AtomicU8` primitive `RamStore` uses
+//! (`tests/memory_model_costs.rs`) produces the forbidden both-loads-zero
+//! outcome tens to hundreds of times in 200 000 rounds with little or nothing
+//! between the store and the load, and **none at all** once about forty
+//! nanoseconds separate them. That threshold is the same order as the
+//! interpreter's cost per guest instruction and comfortably longer than the
+//! JIT's, so the window is marginal for one engine and real for the other. On a
+//! weakly ordered host — an AArch64 build — store-store and load-load go too,
+//! and every barrier matters rather than one.
+//!
+//! The fix is one host [`fence`] per guest barrier instruction: nothing on any
+//! other path, since a barrier is the only thing that pays. Most of the
+//! plumbing exists — the IR has `Opcode::FENCE` and `IrHost::fence`, whose
+//! default body is empty under the comment *"a no-op on a host with one thread
+//! of guest execution"*, which is the assumption above. What is missing is the
+//! three interpreter arms, that default, and `a64::lift`'s `Plan::Nop` becoming
+//! an emitted `FENCE` (the RISC-V lifter already ends its block at one, and no
+//! core lifts an atomic instruction at all). It is not made here because every
+//! one of those sites is in `cpu/` or `ir/`, and it is written down here
+//! because this is where a core would come looking for the seam.
+//!
 //! # What is deliberately absent
 //!
 //! - **`Condvar`.** `ROADMAP.md` §4.7 lists one, but a condition variable has
