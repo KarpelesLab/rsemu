@@ -79,6 +79,18 @@
 //! images and builds an auxiliary vector that describes each to the other,
 //! which is the whole of what a kernel does for a dynamically linked process.
 //!
+//! And **software nobody here wrote** runs on it. SQLite 3.45 opens a real
+//! database file, takes a lock on it, reads its pages at absolute offsets and
+//! answers a query in ninety-three syscalls — the *same* ninety-three, in the
+//! same order, on both architectures. Lua 5.4 runs a program with a garbage
+//! collector, coroutines and double-precision arithmetic in it. sbase's
+//! `sha256sum`, `wc` and `cksum` produce the byte-identical answers the host's
+//! own do over the same file. None of the three has heard of this emulator,
+//! which is the point: our own guests can only ask for what somebody here
+//! thought to implement, and these found four things nobody had — a
+//! floating-point unit left switched off on RISC-V, and a missing `readv`,
+//! `pread64` and `fcntl`. Every one of them was in the *consumer's* half.
+//!
 //! That needed the one policy change level 3 has had. A dynamic loader opens
 //! files, so *"the guest may be told about itself"* became *"the guest may be
 //! told about itself and about what it was handed"* — a set of `(guest path,
