@@ -724,6 +724,52 @@ fn a_restore_drops_the_global_reservation_too() -> Result<()> {
     Ok(())
 }
 
+/// A reset drops the global half too — the cheaper half of the same rule.
+///
+/// `State::new` drops the architectural reservation and nothing dropped the
+/// broadcast one, so a reset core kept a claim in the space's monitor. Its own
+/// fix is one line and, until this test existed, unguarded: the `load` test
+/// beside it would stay green with the `reset` line deleted.
+#[test]
+fn a_reset_drops_the_global_reservation_too() {
+    let mut cfg = Config::rv64i();
+    cfg.ext.a = true;
+    let ram = Arc::new(RamStore::new(RAM_SIZE));
+    for (n, word) in [
+        lui(11, BASE as u32),
+        addi(11, 11, 0x400),
+        amo(0b00010, 3, 10, 11, 0), // lr.d a0, (a1)
+    ]
+    .iter()
+    .enumerate()
+    {
+        for (k, byte) in word.to_le_bytes().iter().enumerate() {
+            ram.write_u8(n as u64 * 4 + k as u64, *byte).unwrap();
+        }
+    }
+    let space = Arc::new(AddressSpace::new("mem", 64));
+    space
+        .topology()
+        .map(Region::ram("ram", Arc::clone(&ram)), BASE)
+        .unwrap();
+    let hart = Hart::new(cfg.with_reset_vector(BASE));
+    hart.attach_space(Arc::clone(&space));
+    for _ in 0..3 {
+        hart.step();
+    }
+    assert_eq!(
+        space.monitor().outstanding(),
+        1,
+        "precondition: the reservation is live in the space"
+    );
+    hart.reset(ResetKind::Cold);
+    assert_eq!(
+        space.monitor().outstanding(),
+        0,
+        "a reset must drop the broadcast claim, not just the architectural one"
+    );
+}
+
 /// The reservation set is the naturally aligned **word**, not the cache line
 /// it happens to sit on.
 ///

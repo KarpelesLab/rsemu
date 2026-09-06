@@ -712,6 +712,28 @@ fn a_restore_drops_the_global_reservation_too() -> Result<()> {
     Ok(())
 }
 
+/// A reset drops the global half too — the cheaper half of the same rule.
+///
+/// `State::new` drops the architectural reservation and nothing dropped the
+/// broadcast one. Its fix is one line and, until this test existed, unguarded:
+/// the `load` test beside it stays green with the `reset` line deleted.
+#[test]
+fn a_reset_drops_the_global_reservation_too() {
+    let h = Harness::a53(&[movz(1, 0, 0x8000, 0), ldxr_x(1, 0)]);
+    h.steps(2);
+    assert_eq!(
+        h.cpu.space().expect("attached").monitor().outstanding(),
+        1,
+        "precondition: the reservation is live in the space"
+    );
+    h.cpu.reset(ResetKind::Cold);
+    assert_eq!(
+        h.cpu.space().expect("attached").monitor().outstanding(),
+        0,
+        "a reset must drop the broadcast claim, not just the architectural one"
+    );
+}
+
 /// A `STXR` at an address the `LDXR` never reserved must fail, even though the
 /// global monitor is perfectly happy.
 ///
