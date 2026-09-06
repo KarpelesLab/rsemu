@@ -30,6 +30,7 @@ use alloc::sync::Arc;
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot};
+use crate::core::sync;
 use crate::core::value::Width;
 use crate::float::{Env, Flags, Round};
 
@@ -1403,9 +1404,27 @@ impl<'a> Exec<'a> {
             // whose `SEV` would come from a core that does not exist here.
             Op::Wfe => {}
             Op::Wfi => self.st.wfi = true,
-            // Barriers on a core that executes one instruction at a time and
-            // completes every access before the next: nothing to order.
-            Op::Dsb | Op::Dmb | Op::Isb => {}
+            // A barrier is the guest asking for ordering **stronger than its
+            // own baseline**, so "this core completes every access before the
+            // next" does not answer it. It answers the emulator's half: the
+            // accesses do leave in program order. The other half is the host,
+            // which sees each of them as a relaxed atomic and is free to move
+            // them — an x86-64 host hands a store-then-load reordering back to
+            // a guest whose `DMB` just paid to remove it, and an AArch64 host
+            // adds store-store and load-load. So: one host fence, on the one
+            // instruction that asked for it.
+            //
+            // `ISB` is **not** in this arm. Arm DDI 0487 D24.2 (`ISB`) defines
+            // it as context synchronization — it orders this PE's own
+            // instruction *fetch* against what came before it, and orders no
+            // data access against any other observer, which is why the
+            // architecture pairs it with a `DSB` whenever data ordering is
+            // wanted. That split is worth having rather than tidy: `ISB` is
+            // 40% of the barrier stream in an arm64 Linux boot (213 000 to
+            // `DSB`/`DMB`'s 479 000 over 876 million instructions), and only
+            // the ones in this arm leave the lifted subset — see `lift`.
+            Op::Dsb | Op::Dmb => sync::fence(sync::Ordering::SeqCst),
+            Op::Isb => {}
             // `CLREX` clears the local monitor, and the architecture allows
             // it to clear the global one too. Clearing both keeps the two
             // halves from disagreeing, and a guest that executes `CLREX` is

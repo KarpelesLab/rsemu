@@ -30,6 +30,7 @@
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot};
+use crate::core::sync;
 use crate::core::value::Width;
 
 use super::csr::{self, Csrs, Lines, Priv, cause, irq, status};
@@ -1300,16 +1301,31 @@ impl<'a> Exec<'a> {
             }
 
             // -- fences ---------------------------------------------------
-            // This core executes one instruction at a time in program order
-            // and has no store buffer, so both fences are architecturally
-            // complete as no-ops. FENCE.I additionally invalidates any decoded
-            // instruction cache, and the translation cache `cpu::riscv::engine`
-            // keeps is one — but it is invalidated by *the pages this hart
-            // wrote*, not here: Linux issues a FENCE.I on essentially every
-            // executable page it maps, and hooking it costs the whole cache
-            // thousands of times a second. The measurement, and the one case
-            // it leaves uncovered, are in that module's documentation.
-            Op::Fence | Op::FenceI => {}
+            // This core executes one instruction at a time in program order,
+            // which settles the emulator's half of `FENCE` and not the host's:
+            // every guest access became a *relaxed* host atomic, so the host
+            // is still free to reorder them under us. `FENCE` is the guest
+            // saying it must not, and one host fence is what makes that true.
+            // RVWMO (RISC-V Unprivileged ISA, "RVWMO Memory Consistency
+            // Model") defines the predecessor and successor sets this
+            // encoding carries; a sequentially consistent host fence is
+            // stronger than any of them, and the strongest set — `FENCE
+            // rw,rw` — is what the guest usually writes anyway.
+            //
+            // FENCE.I is **not** in that arm. Zifencei orders *this hart's*
+            // instruction fetch against *this hart's own* stores and, in the
+            // specification's own words, orders nothing another hart can
+            // observe — so there is no cross-observer ordering for a host
+            // fence to supply. It additionally invalidates any decoded
+            // instruction cache, and the translation cache
+            // `cpu::riscv::engine` keeps is one — but it is invalidated by
+            // *the pages this hart wrote*, not here: Linux issues a FENCE.I on
+            // essentially every executable page it maps, and hooking it costs
+            // the whole cache thousands of times a second. The measurement,
+            // and the one case it leaves uncovered, are in that module's
+            // documentation.
+            Op::Fence => sync::fence(sync::Ordering::SeqCst),
+            Op::FenceI => {}
 
             // -- A ---------------------------------------------------------
             Op::LrW | Op::LrD => {

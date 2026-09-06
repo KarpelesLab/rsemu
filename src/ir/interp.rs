@@ -117,6 +117,7 @@
 
 use crate::core::error::{BusError, Error, Result};
 use crate::core::space::MemResult;
+use crate::core::sync::Ordering;
 use crate::core::value::Width;
 use crate::ir::block::{Block, InsnStart, Inst, RegSlot};
 use crate::ir::op::{AccessKind, Cond, MemOp, Opcode, Sign, bitfield_parts};
@@ -290,8 +291,35 @@ pub trait IrHost {
         Err(BusError::BadAccess)
     }
 
-    /// A memory fence. A no-op on a host with one thread of guest execution.
-    fn fence(&mut self) {}
+    /// A memory fence: the guest asked for ordering stronger than its own
+    /// baseline, and this is where the host is made to give it.
+    ///
+    /// The default is a real [`SeqCst`](Ordering::SeqCst) fence rather than
+    /// nothing, and the difference is the *host*, not this interpreter. A
+    /// guest instruction's accesses do leave in program order — they are
+    /// separate calls through `SpaceView::write_span` and nothing here
+    /// reorders them — but each one becomes a **relaxed** host atomic, so the
+    /// host's own model applies underneath. On an x86-64 host that leaves
+    /// store-then-load visible, which is exactly the reordering a guest
+    /// `MFENCE`, `DMB` or `FENCE` was executed to defeat; on an AArch64 host
+    /// store-store and load-load go as well. Dropping the guest's barrier
+    /// therefore hands it back the relaxation it just paid to remove.
+    ///
+    /// `SeqCst` because it is the only ordering that also forbids the
+    /// store-load case: an `AcqRel` fence does not. It costs one host fence on
+    /// a path a guest reaches only by executing a barrier, and nothing at all
+    /// anywhere else. `core::sync`'s "The ladder is about deadlock, not about
+    /// the guest's memory model" has the measurement behind the choice, and
+    /// `tests/memory_model_litmus.rs` is the reproducer.
+    ///
+    /// A host with genuinely one thread of guest execution pays for a fence it
+    /// does not need. That is deliberate: the alternative is a per-host
+    /// decision about the machine's threading mode made in the one place that
+    /// cannot see it, and the fence is a handful of nanoseconds on an
+    /// instruction a real guest executes in the low permille of its stream.
+    fn fence(&mut self) {
+        crate::core::sync::fence(Ordering::SeqCst);
+    }
 
     /// Call a helper by id, with the block's arguments, returning its one or
     /// two results.
@@ -2515,6 +2543,45 @@ mod tests {
             .run(&block, host)
             .expect_err("a host with no helpers says so");
         assert_eq!(err, Error::Unimplemented("an IR helper call"));
+    }
+
+    #[test]
+    fn the_defaulted_fence_is_a_real_host_fence_and_not_an_error() {
+        // The default used to be an empty body, on the argument that a host
+        // with one thread of guest execution has nothing to order. It is a
+        // `SeqCst` fence now — see `IrHost::fence` — and what is asserted here
+        // is the shape of that: a host that overrides nothing still runs a
+        // block containing `Opcode::FENCE` to its exit. The fence's *effect*
+        // is not assertable from inside one thread, which is what
+        // `tests/memory_model_litmus.rs` exists for.
+        let mut b = started();
+        b.emit_raw(Opcode::FENCE, Type::I64, None, None, &[], None, None, 0);
+        b.exit_tb();
+
+        struct Bare;
+        impl IrHost for Bare {
+            fn read_slot(&mut self, _: RegSlot) -> u128 {
+                0
+            }
+            fn write_slot(&mut self, _: RegSlot, _: u128) {}
+            fn load(&mut self, _: &MemOp, _: u64) -> MemResult<u64> {
+                Err(BusError::Unassigned)
+            }
+            fn store(&mut self, _: &MemOp, _: u64, _: u64) -> MemResult {
+                Err(BusError::Unassigned)
+            }
+            fn charge(&mut self, _: u64) {}
+            fn insn_start(&mut self, _: &InsnStart) {}
+        }
+
+        let block = b.finish();
+        verify(&block).expect("a bare fence is a well-formed block");
+        let mut bare = Bare;
+        let host: &mut dyn IrHost = &mut bare;
+        let outcome = Interp::new()
+            .run(&block, host)
+            .expect("the defaulted fence is not an error");
+        assert_eq!(outcome, Outcome::Exit);
     }
 
     #[test]

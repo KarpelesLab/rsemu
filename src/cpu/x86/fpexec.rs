@@ -57,6 +57,7 @@
 //! the control-register gating. No copyleft emulator or soft-float library was
 //! consulted (`CLAUDE.md`, provenance).
 
+use crate::core::sync;
 use crate::float::x87::{self as f80, F80, Precision};
 use crate::float::{B32, B64, Category, Env, Flags, Round, binary};
 
@@ -1307,7 +1308,30 @@ impl Exec<'_> {
         let op = f.insn.op;
         self.sse_gate(op)?;
         match op {
-            Op::LFENCE | Op::MFENCE | Op::SFENCE => Ok(()),
+            // One host fence per guest barrier. `MFENCE` is the one that
+            // matters on an x86-64 *host*: store-then-load is the single
+            // reordering x86-TSO permits, the emulator's own accesses are
+            // relaxed host atomics and so get it, and the guest executed
+            // `MFENCE` precisely to forbid it (*Intel SDM* volume 3 §9.2.3,
+            // §9.3). `LFENCE` and `SFENCE` are here too even though a TSO host
+            // already orders load-load and store-store for us, because which
+            // host this is is not something `cpu/` is entitled to assume: on
+            // an AArch64 host both of those reorderings are real, and a rule
+            // of "a barrier emits a fence" is one a reader can check, where
+            // "these two are redundant on the host I had" is the reasoning
+            // that left every barrier a no-op in the first place.
+            //
+            // The frequencies say the same thing from the other side. Booting
+            // Linux 6.6 here, the guest executes `MFENCE` **once** and
+            // `LFENCE` tens of thousands of times: `smp_mb()` on x86-64 is
+            // `lock addl $0,-4(%rsp)`, so the full barrier an x86 guest really
+            // leans on is the `LOCK` prefix and not anything in this arm. An
+            // arm that covered only `MFENCE` would have covered almost nothing
+            // a real guest does.
+            Op::LFENCE | Op::MFENCE | Op::SFENCE => {
+                sync::fence(sync::Ordering::SeqCst);
+                Ok(())
+            }
             Op::FXSAVE => self.fxsave(f),
             Op::FXRSTOR => self.fxrstor(f),
             Op::LDMXCSR => {

@@ -1,11 +1,13 @@
-//! The two numbers behind the memory-model boundaries `core::space::store` and
-//! `core::sync` record: what single-copy atomicity would cost, and how long the
-//! host keeps a store invisible.
+//! The three numbers behind the memory-model boundaries `core::space::store`
+//! and `core::sync` record: what single-copy atomicity would cost, how long the
+//! host keeps a store invisible, and what the fence that covers that window
+//! costs.
 //!
-//! Both are `#[ignore]`d — they are measurements, not gates, and a gate that
-//! depends on a host's store buffer is a flake. They live here rather than in a
-//! scratch file because both are quoted in module documentation as decisions,
-//! and a quoted number nobody can re-derive is a number that rots.
+//! All three are `#[ignore]`d — they are measurements, not gates, and a gate
+//! that depends on a host's store buffer is a flake. They live here rather than
+//! in a scratch file because each is quoted in module documentation as a
+//! decision, and a quoted number nobody can re-derive is a number that rots.
+//! `tests/memory_model_litmus.rs` is the gate these numbers explain.
 //!
 //! Run with `cargo test --release --test memory_model_costs -- --ignored
 //! --nocapture --test-threads=1`. Release matters: the first measurement is a
@@ -179,8 +181,8 @@ fn what_single_copy_atomicity_would_cost() {
 /// Two threads, each storing to its own byte and then loading the other's, with
 /// `pad` units of work in between standing in for the emulator's own cost per
 /// guest instruction. Both loads returning zero is the outcome a guest's
-/// `MFENCE` — or `DMB`, or `FENCE` — exists to forbid, and which no core in the
-/// tree currently emits anything to prevent.
+/// `MFENCE` — or `DMB`, or `FENCE` — exists to forbid, and which every core in
+/// the tree now emits a host fence to prevent.
 fn store_buffer_rounds(pad: u64, rounds: usize) -> usize {
     let x = Arc::new(AtomicU8::new(0));
     let y = Arc::new(AtomicU8::new(0));
@@ -241,4 +243,48 @@ fn how_long_the_host_keeps_a_store_invisible() {
         let n = store_buffer_rounds(pad, ROUNDS);
         println!("pad={pad:>4}: forbidden outcome {n} / {ROUNDS}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the fence itself costs
+// ---------------------------------------------------------------------------
+
+/// What a guest barrier costs now that the three interpreters execute one.
+///
+/// The measurement the decision needed: the exclusive monitor's shape turned on
+/// 1.6 ns per store and the bus lock on ~13 ns per locked instruction, so a
+/// barrier had to be priced in the same currency before it could be argued
+/// about. It is measured against the same store the litmus uses, because a
+/// fence in isolation is not a thing a guest ever executes and because an empty
+/// loop with a fence in it measures the loop.
+///
+/// Recorded on the author's x86-64 host: a relaxed byte store alone, the same
+/// store followed by a `SeqCst` fence, and the same store followed by the
+/// relaxed `fetch_or` that `RamStore::mark_dirty` already does after every
+/// write. The third is the one that matters — a locked read-modify-write is
+/// itself a full barrier on this architecture, which is why
+/// `tests/memory_model_litmus.rs` finds the guest's `MFENCE` changes nothing
+/// *here* and would change everything on a weakly ordered host.
+#[test]
+#[ignore = "a measurement, not a gate"]
+fn what_a_host_fence_costs() {
+    let cell = AtomicU8::new(0);
+    let dirty = AtomicU64::new(0);
+    timed("store", || {
+        for i in 0..REPS {
+            cell.store(black_box(i) as u8, Ordering::Relaxed);
+        }
+    });
+    timed("store + fence(SeqCst)", || {
+        for i in 0..REPS {
+            cell.store(black_box(i) as u8, Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
+    });
+    timed("store + mark_dirty", || {
+        for i in 0..REPS {
+            cell.store(black_box(i) as u8, Ordering::Relaxed);
+            dirty.fetch_or(1, Ordering::Relaxed);
+        }
+    });
 }
