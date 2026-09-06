@@ -481,11 +481,11 @@ pub struct Lifted {
 
 /// How many guest instructions [`lift`] takes by default.
 ///
-/// **Computed, not inherited.** `cpu::x86::lift` records what happens when it
-/// is not: at 64 instructions an x86 cold block bounds at 13 200 ticks, above
-/// `SchedulerConfig::max_ticks_per_quantum`, so no block would ever be
-/// admitted. The same arithmetic here, per guest instruction, in the worst
-/// case the engine's cold bound has to assume:
+/// **It used to have to fit a scheduler quantum, and it does not any more.**
+/// `engine`'s `admit` once refused any block whose worst case did not fit what
+/// was left of the quantum, so this number had to be small enough that a whole
+/// block fitted. The arithmetic, per guest instruction, in the worst case that
+/// guard had to assume:
 ///
 /// | | ticks |
 /// | --- | --- |
@@ -493,25 +493,26 @@ pub struct Lifted {
 /// | a pair access, unaligned, split into bytes | 2 × 8 |
 /// | a four-level walk in front of each of those bytes | 2 × 8 × 4 |
 ///
-/// which is 81, so 64 instructions bound a cold block at **5 188** including
-/// the entry walk — inside two thirds of a quantum, where x86's 13 200 was
-/// outside a whole one. Sixty-four therefore stands here on its own
-/// arithmetic rather than because two other frontends use it, and the engine's
-/// `a_cold_block_fits_inside_a_scheduler_quantum` asserts the bound rather
-/// than leaving it in prose.
+/// which is 81, so 64 instructions bounded a cold block at **5 188** including
+/// the entry walk, against an `arm64-virt` quantum of 10 000 — and
+/// `cpu::x86::lift` records the same sum coming out at 13 200 there, above a
+/// whole quantum, so no x86 block was ever admitted.
 ///
-/// **Two thirds of a quantum was not the safe side of that line, and this is
-/// the correction.** A bound that fits *once* is not a bound that can be paid
-/// repeatedly: `admit` deducts what the quantum has already spent, so the last
-/// 5 188 ticks of every 10 000 could admit nothing, and the PC after each
-/// interpreted instruction is in the middle of a block and so is uncosted too.
-/// A measured boot spent **19.4%** of its guest instructions in that tail —
-/// more than three times everything outside the lifted subset put together.
-/// `engine`'s `Probe` closes it by lifting the cold PC rather than guessing
-/// at it, which is also why this number is no longer the only thing standing
-/// between a short quantum and an interpreted run.
+/// Two thirds of a quantum was never the safe side of that line either,
+/// because a bound that fits *once* is not one that can be paid repeatedly:
+/// the guard deducted what the quantum had already spent, so the last 5 188
+/// ticks of every 10 000 could admit nothing, and the PC after each
+/// interpreted instruction is in the middle of a block and so was uncosted
+/// too. A measured boot spent **19.4%** of its guest instructions in that tail
+/// — more than three times everything outside the lifted subset put together.
 ///
-/// It does a second job under [`Shape::Trace`]: it is the only thing that
+/// [`IrHost::spent`](crate::ir::IrHost::spent) removed the constraint rather
+/// than tuning it: a block now *leaves* at the instruction boundary the
+/// quantum runs out on, so a block longer than a quantum is not a problem to
+/// avoid. Sixty-four stands on the job below and on nothing about the
+/// scheduler.
+///
+/// The job it still does is under [`Shape::Trace`]: it is the only thing that
 /// bounds an unrolled loop, and — because a dispatcher checks its exit flag at
 /// block boundaries and a trace has fewer of them — it is also the bound on
 /// how long a safe point can be delayed (`ROADMAP.md` §4.7).
