@@ -367,7 +367,6 @@ What the mechanisms did over that run:
 | guest instructions retired **inside** a block | 153 130 249 (**97.96%**) |
 | compiled loads served by an inlined TLB probe | 18 712 518 |
 | compiled stores served the same way | 13 350 310 |
-| blocks the scheduler-budget guard lifted to price | 14 506 |
 
 The blocks the code generator refused are the ones holding a `UDIV` or an
 `SDIV`, the only two ops this frontend emits that `jit::x86` does not lower.
@@ -380,34 +379,48 @@ argument for what a plan may cover on this architecture, and the three things
 that looked as though they might forbid one — address tagging, the two `TTBR`s
 and granule selection — none of which does.
 
-### The last row is the interesting one, and it was not in the frontend
+### Where the interpreter is reached, and where it used to be
 
-`jit-host` was **6.06 s and 3.07×** in the same harness a week ago, with 79.2%
-of guest instructions retiring inside a block. The other 20.8% were profiled by
-decoded instruction row over a real boot, and the answer was not the frontend's
-documented exclusions:
+The 97.96% above was measured before `ir::IrHost::spent` landed. Over the boot
+— a different and rather harder window — the same figure was 97.54%, and it is
+now **99.44%**. What closed the gap was not a wider frontend: it was that seam,
+which lets a translated block *leave* at a guest instruction boundary.
 
-| why the interpreter ran it | instructions | share |
+A translated block used to run only if its **worst case** fitted what was left
+of the scheduler quantum, or the two engines would stop on different
+instructions and the state hash they are supposed to share would part. For a PC
+nothing had been lifted at, that worst case was the frontend's own limit — 64
+instructions of an unaligned pair access, each byte walked four levels, **5 188
+ticks** — against a quantum of 10 000. So the last half of every quantum could
+admit nothing, and it could not recover inside the quantum either: the PC after
+an interpreted instruction is in the middle of a block, and only a lift filled
+the cost table, so it was uncosted too. `engine.rs`'s `Probe` closed half of
+that by lifting the cold PC instead of guessing at it. The seam closes the rest
+and deletes both, because a block that can leave never needs to be refused.
+
+Measured over the **boot**, from reset to `/init`'s banner — a guest-side
+window, so both columns run the same 137 984 quanta and the same 1 071 503 716
+guest instructions — median of three interleaved reps:
+
+| | before the seam | with it |
 | --- | --- | --- |
-| the scheduler-budget guard declined a block | 30 292 743 | **94.4%** |
-| outside the lifted subset | 1 795 754 | 5.6% |
+| wall clock | 23.30 s | **19.54 s** (1.19×) |
+| retired **inside** a block | 1 045 147 550 (97.54%) | 1 065 491 373 (**99.44%**) |
+| taken by the interpreter | 26 356 169 | **6 012 343** (−77.2%) |
 
-A translated block may only run if its **worst case** fits what is left of the
-scheduler quantum, or the two engines would stop on different instructions and
-the state hash they are supposed to share would part. For a PC nothing had been
-lifted at, that worst case was the frontend's own limit — 64 instructions of an
-unaligned pair access, each byte walked four levels, **5 188 ticks** — against
-a quantum of 10 000. So the last half of every quantum could admit nothing, and
-it could not recover inside the quantum either: the PC after an interpreted
-instruction is in the middle of a block, and only a lift fills the cost table,
-so it was uncosted too. `engine.rs`'s `Probe` lifts the cold PC instead of
-guessing at it — reading no guest state, charging no ticks, and handing the
-block straight to the dispatcher so nothing is lifted twice.
+and what is left, by the reason `admit` gave:
 
-The exclusions, meanwhile, cost **1.15%** of the guest's instructions between
-them: `MRS` 1 024 738 (of which `SP_EL0` — Linux's `current` — is 645 329), the
-exclusives and acquire/release accesses 339 581, `MSR` 224 806, the
-`DC`/`IC`/`TLBI` maintenance operations 204 552, `RBIT` 1 584. **No SIMD or
+| why the interpreter ran it | instructions | share of interpreted |
+| --- | --- | --- |
+| outside the lifted subset, already known | 6 010 437 | **99.97%** |
+| a lift that produced nothing | 1 614 | 0.03% |
+| a pending interrupt or a stalled `WFI` | 292 | 0.00% |
+| the scheduler-budget guard declined a block | **0** | — |
+
+The exclusions cost **0.56%** of the guest's instructions between them, and
+they are the same ones as before: `MRS` (of which `SP_EL0` — Linux's `current`
+— is the largest single row), the exclusives and acquire/release accesses,
+`MSR`, the `DC`/`IC`/`TLBI` maintenance operations, and `RBIT`. **No SIMD or
 floating-point instruction executed at all**, and no `LDTR`/`STTR` either. The
 largest documented absence in the frontend is worth nothing on the guest the
 board exists to run, which is the sort of thing only a profile says.

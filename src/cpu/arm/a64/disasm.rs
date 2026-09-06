@@ -304,6 +304,8 @@ fn left_shift(op: isa::Op) -> bool {
             | isa::Op::SqshlImmScalar
             | isa::Op::UqshlImmScalar
             | isa::Op::SqshluImmScalar
+            | isa::Op::ShlScalar
+            | isa::Op::SliScalar
     )
 }
 
@@ -451,7 +453,11 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             // The acquire and release bits sit at different places on the two
             // atomic encodings: bits 23:22 on a compare-and-swap, and bit 23
             // with bit 22 on the read-modify-writes.
-            let (acquire, release) = if matches!(insn.op, isa::Op::CasW | isa::Op::CasX) {
+            let cas = matches!(
+                insn.op,
+                isa::Op::CasB | isa::Op::CasH | isa::Op::CasW | isa::Op::CasX
+            );
+            let (acquire, release) = if cas {
                 (isa::bit(word, 22), isa::bit(word, 15))
             } else {
                 (isa::bit(word, 23), isa::bit(word, 22))
@@ -461,6 +467,14 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             }
             if release {
                 text.push('l');
+            }
+            // ...and the width letter *after* those, because the spelling is
+            // `CASALB` and never `CASBAL`. A word or a doubleword adds no
+            // letter at all: the register operands already say which.
+            match isa::ls_size(word) {
+                0 => text.push('b'),
+                1 => text.push('h'),
+                _ => {}
             }
         }
     }
@@ -1525,6 +1539,19 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 "{letter}{d}, {letter}{n}, #{}",
                 immhb.wrapping_sub(8 << esize)
             );
+        }
+        Fmt::SimdScalarShiftD => {
+            // A doubleword by construction — `immh<3>` is pinned in the row,
+            // so there is no width to read — and the only thing left in
+            // `immh`:`immb` is the amount, in whichever direction the
+            // operation shifts.
+            let immhb = isa::simd_immhb(word);
+            let amount = if left_shift(insn.op) {
+                immhb.wrapping_sub(64)
+            } else {
+                128_u32.wrapping_sub(immhb)
+            };
+            let _ = write!(ops, "d{d}, d{n}, #{amount}");
         }
         Fmt::SimdScalarShiftNarrow => {
             let (esize, immhb) = shift_of(word);

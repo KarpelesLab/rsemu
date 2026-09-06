@@ -68,12 +68,12 @@
 //! pairwise long adds (`SADDLP`, `UADALP`), the absolute-difference-long
 //! group (`SABAL`, `UABDL`), the saturating **by-element** forms
 //! (`SQDMULH`/`SQRDMULH`/`SQDMULL` and relatives with a lane index),
-//! `FCVTXN`, the non-saturating scalar shifts *by an immediate*
-//! (`SHL D0, D1, #n` and `USHR`, `SSHR`, `SRI`, `SLI` and relatives — the
-//! vector forms are all here), `LD2`/`LD3`/`LD4` of a *single* structure and
-//! the replicating loads other than `LD1R`, and everything Armv8.1 and later
-//! added. Each is absent from the table, so each raises `UNDEFINED` rather
-//! than being quietly wrong.
+//! `FCVTXN`, the **scalar fixed-point conversions** (`SCVTF S0, S1, #32` and
+//! its three relatives, which share the scalar shift-by-immediate encoding
+//! with the shifts below and are the only thing left in it),
+//! `LD2`/`LD3`/`LD4` of a *single* structure and the replicating loads other
+//! than `LD1R`, and everything Armv8.1 and later added. Each is absent from
+//! the table, so each raises `UNDEFINED` rather than being quietly wrong.
 //!
 //! # What came off that list, and how it was chosen
 //!
@@ -92,6 +92,23 @@
 //!   vector register, which is what a compiler emits when it is, and which is
 //!   where a Lua interpreter's number conversion stopped;
 //! * **`SHLL`/`SHLL2`**, where `sha256sum` stopped.
+//!
+//! A fourth came off it the same way and by counting rather than by running:
+//! the **non-saturating scalar shifts by an immediate** — `SHL D0, D1, #32`,
+//! `USHR`, `SSHR`, `SSRA`, `USRA`, `SRSHR`, `URSHR`, `SRSRA`, `URSRA`, `SRI`
+//! and `SLI`. A static decode of Debian trixie's `libc.so.6` (glibc 2.41,
+//! `arm64`) finds **17** `USHR d` and `libm.so.6` **7** `SHL d`, which sounds
+//! small until it is put beside what the same decode says about the rest of
+//! that library: 300 661 words, 1 382 refused, and every one of the 128
+//! distinct refusals is SVE, SME, MTE or `FEAT_MOPS` — behind a feature bit
+//! this core's ID registers deny, so an `ifunc` resolver never selects it.
+//! `libm.so.6` and `ld-linux-aarch64.so.1` now refuse **nothing at all**.
+//! Twenty-four words were the whole remaining gap in a C library.
+//!
+//! They are a doubleword and nothing else — the architecture makes `immh<3>`
+//! clear UNDEFINED, and every row's *mask* pins it — so they are a format of
+//! their own rather than rows of the saturating group beside them, and they
+//! shift in both directions where that group only shifts left.
 //!
 //! What that population is worth is the point. A previous measurement found
 //! SIMD and floating point executing **zero times** during a Linux *kernel*

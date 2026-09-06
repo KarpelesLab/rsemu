@@ -12,16 +12,20 @@
 //!
 //! Adding an instruction is one line here and no edit anywhere else.
 //!
-//! # Two suffixes the mnemonic column does not carry
+//! # The suffixes the mnemonic column does not carry
 //!
-//! A64 spells two things in bits that a *row* cannot: the condition on
-//! `B.<cond>`, and the acquire/release ordering on the LSE atomics
-//! (`LDADD`/`LDADDA`/`LDADDL`/`LDADDAL`). Writing sixteen rows for `B.cond`
-//! and four for every atomic would be a table describing the encoding rather
-//! than the instruction set. So the rule is stated once and applies to exactly
-//! two formats: **a format may own a suffix**, and [`Fmt::suffix_kind`] says
-//! which. The disassembler asks the format; nothing else in the crate spells a
-//! mnemonic.
+//! A64 spells some things in bits that a *row* cannot: the condition on
+//! `B.<cond>`, and the acquire/release ordering and the width letter on the
+//! LSE atomics (`LDADD`/`LDADDA`/`LDADDALB`/`LDADDLH`). Writing sixteen rows
+//! for `B.cond` and sixteen for every atomic would be a table describing the
+//! encoding rather than the instruction set. So the rule is stated once:
+//! **a format may own a suffix**, and [`Fmt::suffix_kind`] says which. The
+//! disassembler asks the format; nothing else in the crate spells a mnemonic.
+//!
+//! The order within one is part of what the format owns, and it is not
+//! obvious: the width goes *after* the ordering, so `CASALB` and never
+//! `CASBAL`. A table that had put the letter in the mnemonic column would have
+//! had no way to say so.
 //!
 //! # Why loads and stores have one row per mnemonic but few shapes
 //!
@@ -388,7 +392,16 @@ pub enum Suffix {
     None,
     /// `.<cond>`, from bits 3:0 — `B.EQ`.
     Cond,
-    /// `A`, `L` or `AL`, from the acquire and release bits of an LSE atomic.
+    /// `A`, `L` or `AL` from the acquire and release bits of an LSE atomic —
+    /// and the width letter after it, which is the same kind of thing.
+    ///
+    /// `CASB`/`CASH` and `LDADDB`/`LDADDH` spell their operand width in
+    /// `size`, and the letter goes **after** the ordering: `CASALB`, not
+    /// `CASBAL`. So the mnemonic column carries `cas` for all four widths and
+    /// this suffix assembles the rest, exactly as [`Suffix::Wide`] assembles
+    /// the `2`. A format that appended the letter before the ordering, or a
+    /// row whose mnemonic column said `casb`, would print a mnemonic no
+    /// assembler accepts.
     Order,
     /// `2`, from the `Q` bit of a widening or narrowing Advanced SIMD
     /// encoding — `XTN` against `XTN2`, `UMULL` against `UMULL2`.
@@ -688,6 +701,18 @@ pub enum Fmt {
     /// `<V>d, <V>n, #shift` — a scalar shift by an immediate, whose width
     /// comes from `immh`.
     SimdScalarShift,
+    /// `Dd, Dn, #shift` — a scalar shift by an immediate that the
+    /// architecture gives a **doubleword and nothing else**.
+    ///
+    /// Separate from [`Fmt::SimdScalarShift`], which has four widths, for the
+    /// same reason [`Fmt::SimdScalarThree`] is separate from
+    /// [`Fmt::SimdScalarThreeSz`] — and here the width rule is in the *mask*:
+    /// every row of this format pins `immh<3>`, so `SSHR B0, B1, #1` does not
+    /// decode at all rather than decoding and being refused by a rule. The
+    /// other difference is direction: these shift both ways, so the amount is
+    /// `immh:immb - 64` for `SHL` and `SLI` and `128 - immh:immb` for the
+    /// rest, which is what [`super::disasm`]'s `left_shift` decides.
+    SimdScalarShiftD,
     /// `<Vb>d, <Va>n, #shift` — a narrowing scalar shift by an immediate.
     SimdScalarShiftNarrow,
     /// `<V>d, <V>n, #0` / `#0.0` — a scalar SIMD compare against zero.
@@ -1183,6 +1208,43 @@ a64! {
     0xff20fc00 0xf8207000 LduminX "ldumin" Atomic Lse "atomic unsigned minimum on a doubleword";
     0xff20fc00 0xb8208000 SwpW    "swp"    Atomic Lse "atomic swap of a word";
     0xff20fc00 0xf8208000 SwpX    "swp"    Atomic Lse "atomic swap of a doubleword";
+
+    // -- FEAT_LSE: the byte and halfword forms ------------------------------
+    //
+    // The same encodings with `size` naming a byte or a halfword, and they are
+    // here because a compiler emits them: `casb` and `swpb` are what LLVM's
+    // outline-atomics lowering of a `u8` atomic reaches on a part that has
+    // `FEAT_LSE`, so a Rust binary built for `neoverse-n1` stops on the first
+    // one. `FEAT_LSE` is one feature and it is all of these -- there is no ID
+    // field that grants the word forms without the byte -- so a core that
+    // decoded `CAS` and refused `CASB` was reporting
+    // `ID_AA64ISAR0_EL1.Atomic == 0b0010` for a part nobody makes. They carry
+    // `Feat::Lse` like the rest, so `Config::cortex_a53` still refuses all
+    // twenty-two.
+    //
+    // The mnemonic column stays `cas`, `ldadd`, `swp`: the width letter goes
+    // *after* the ordering (`CASALB`), so it is a suffix the format spells --
+    // see `Fmt::suffix_kind` and `Suffix::Order`.
+    0xffa07c00 0x08a07c00 CasB    "cas"    Atomic Lse "compare and swap a byte";
+    0xffa07c00 0x48a07c00 CasH    "cas"    Atomic Lse "compare and swap a halfword";
+    0xff20fc00 0x38200000 LdaddB  "ldadd"  Atomic Lse "atomic add on a byte";
+    0xff20fc00 0x78200000 LdaddH  "ldadd"  Atomic Lse "atomic add on a halfword";
+    0xff20fc00 0x38201000 LdclrB  "ldclr"  Atomic Lse "atomic bit clear on a byte";
+    0xff20fc00 0x78201000 LdclrH  "ldclr"  Atomic Lse "atomic bit clear on a halfword";
+    0xff20fc00 0x38202000 LdeorB  "ldeor"  Atomic Lse "atomic exclusive-OR on a byte";
+    0xff20fc00 0x78202000 LdeorH  "ldeor"  Atomic Lse "atomic exclusive-OR on a halfword";
+    0xff20fc00 0x38203000 LdsetB  "ldset"  Atomic Lse "atomic bit set on a byte";
+    0xff20fc00 0x78203000 LdsetH  "ldset"  Atomic Lse "atomic bit set on a halfword";
+    0xff20fc00 0x38204000 LdsmaxB "ldsmax" Atomic Lse "atomic signed maximum on a byte";
+    0xff20fc00 0x78204000 LdsmaxH "ldsmax" Atomic Lse "atomic signed maximum on a halfword";
+    0xff20fc00 0x38205000 LdsminB "ldsmin" Atomic Lse "atomic signed minimum on a byte";
+    0xff20fc00 0x78205000 LdsminH "ldsmin" Atomic Lse "atomic signed minimum on a halfword";
+    0xff20fc00 0x38206000 LdumaxB "ldumax" Atomic Lse "atomic unsigned maximum on a byte";
+    0xff20fc00 0x78206000 LdumaxH "ldumax" Atomic Lse "atomic unsigned maximum on a halfword";
+    0xff20fc00 0x38207000 LduminB "ldumin" Atomic Lse "atomic unsigned minimum on a byte";
+    0xff20fc00 0x78207000 LduminH "ldumin" Atomic Lse "atomic unsigned minimum on a halfword";
+    0xff20fc00 0x38208000 SwpB    "swp"    Atomic Lse "atomic swap of a byte";
+    0xff20fc00 0x78208000 SwpH    "swp"    Atomic Lse "atomic swap of a halfword";
 
     // -- Data processing (register): logical, shifted -----------------------
     0x7f200000 0x0a000000 AndShift  "and"  ShiftedReg Base "bitwise AND with a shifted register";
@@ -1682,6 +1744,28 @@ a64! {
     0xff80fc00 0x7f009400 UqshrnScalar "uqshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, saturating unsigned";
     0xff80fc00 0x5f009c00 SqrshrnScalar "sqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating signed";
     0xff80fc00 0x7f009c00 UqrshrnScalar "uqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating unsigned";
+
+    // -- Advanced SIMD: the non-saturating scalar shifts by an immediate -----
+    //
+    // The doubleword-only half of the shift-by-immediate group, and the one a
+    // C library reaches: `libc.so.6`'s `strtold` builds a NaN payload with
+    // `SHL D0, D1, #n` and `USHR`, seventeen times, and `libm` seven more.
+    //
+    // `immh<3>` is pinned in every mask, which is the architecture's
+    // `if immh<3> != '1' then UNDEFINED` written where the table can enforce
+    // it -- the same technique the exclusive pairs above use to refuse their
+    // two unallocated `size` values without a rule.
+    0xffc0fc00 0x5f400400 SshrScalar  "sshr"  SimdScalarShiftD AdvSimd "shift a scalar right, signed";
+    0xffc0fc00 0x7f400400 UshrScalar  "ushr"  SimdScalarShiftD AdvSimd "shift a scalar right, unsigned";
+    0xffc0fc00 0x5f401400 SsraScalar  "ssra"  SimdScalarShiftD AdvSimd "shift a scalar right signed and accumulate";
+    0xffc0fc00 0x7f401400 UsraScalar  "usra"  SimdScalarShiftD AdvSimd "shift a scalar right unsigned and accumulate";
+    0xffc0fc00 0x5f402400 SrshrScalar "srshr" SimdScalarShiftD AdvSimd "shift a scalar right, signed and rounding";
+    0xffc0fc00 0x7f402400 UrshrScalar "urshr" SimdScalarShiftD AdvSimd "shift a scalar right, unsigned and rounding";
+    0xffc0fc00 0x5f403400 SrsraScalar "srsra" SimdScalarShiftD AdvSimd "shift a scalar right signed and rounding, and accumulate";
+    0xffc0fc00 0x7f403400 UrsraScalar "ursra" SimdScalarShiftD AdvSimd "shift a scalar right unsigned and rounding, and accumulate";
+    0xffc0fc00 0x7f404400 SriScalar   "sri"   SimdScalarShiftD AdvSimd "shift a scalar right and insert";
+    0xffc0fc00 0x5f405400 ShlScalar   "shl"   SimdScalarShiftD AdvSimd "shift a scalar left";
+    0xffc0fc00 0x7f405400 SliScalar   "sli"   SimdScalarShiftD AdvSimd "shift a scalar left and insert";
 
     // -- Advanced SIMD: the scalar integer conversions ------------------------
     //

@@ -16,18 +16,20 @@
 //! **The quantum** is A64's own, and it exists because the largest number in
 //! this whole subsystem turned out to live there rather than in the ladder. A
 //! real core does not run a dispatcher, it runs `Cpu::run_budget`, and a
-//! translated block may only be admitted if its worst case fits what is left
-//! of the quantum (`cpu::arm::a64::engine`'s `admit`). That guard used to
-//! answer for a PC it knew nothing about with the *cold* worst case — 64
+//! translated block used to be admitted only if its *worst case* fitted what
+//! was left of the quantum (`cpu::arm::a64::engine`'s `admit`). That guard
+//! answered for a PC it knew nothing about with the cold worst case — 64
 //! instructions of a split, walked pair access, 5 188 ticks — against an
-//! `arm64-virt` quantum of 10 000. Over half of every quantum was therefore
-//! interpreted an instruction at a time, and it never recovered inside a
-//! quantum, because the PC after an interpreted instruction is in the middle
-//! of a block and so is cold too.
+//! `arm64-virt` quantum of 10 000, so over half of every quantum was
+//! interpreted an instruction at a time and never recovered, because the PC
+//! after an interpreted instruction is in the middle of a block and so was
+//! cold too.
 //!
-//! The second table sweeps the quantum so that the cliff is visible rather
-//! than described: throughput against budget, per engine. It is the row that
-//! would have caught the defect, which is the argument for it being here.
+//! `ir::IrHost::spent` deleted the guard: a block now leaves at the
+//! instruction boundary the quantum runs out on. The second table is what
+//! makes that visible rather than described — throughput against budget, per
+//! engine — and the flat left-hand end is the result. It is the row that would
+//! have caught the defect, which is the argument for it staying here.
 //!
 //! # The ladder's configurations
 //!
@@ -185,16 +187,18 @@ fn ladder(args: &Args) {
 ///
 /// `machines/arm64-virt.machine` runs on **10 000**, which is the column that
 /// matters; the rest bracket it so that the shape of the curve is visible.
-/// Below `worst_bound`'s 1 088 ticks in bare mode no block could be admitted
-/// at all before the guard learned to lift, and the run collapsed to the
-/// interpreter — which is what this table exists to make visible.
+/// Below the old guard's 1 088-tick cold bound in bare mode no block could be
+/// admitted at all and the run collapsed to the interpreter, which is what
+/// this table was written to make visible; with the seam the left-hand columns
+/// should now cost a chain that ends early rather than a run that is
+/// interpreted.
 const BUDGETS: [u64; 6] = [64, 256, 1_024, 4_096, 10_000, 65_536];
 
 fn quantum(args: &Args) {
     println!("the quantum: throughput against `Cpu::run_budget`'s budget\n");
     println!(
         "Millions of *bus accesses* per second — the currency the scheduler and \
-         the guard\nboth speak, one per instruction plus one per memory access. \
+         the seam\nboth speak, one per instruction plus one per memory access. \
          Read across a row.\n"
     );
     print!("{:<12} {:>10}", "engine", "workload");
@@ -217,16 +221,16 @@ fn quantum(args: &Args) {
         }
     }
     println!(
-        "\nA budget below a block's worst case is interpreted, so the left-hand \
-         columns\nare where `admit`'s guard decides the run rather than the \
-         code generator."
+        "\nA budget below a block's worst case used to be interpreted outright; \
+         with\n`IrHost::spent` the left-hand columns are blocks that leave \
+         early instead."
     );
 }
 
 /// Run one workload through a whole core, in quanta of `budget` ticks.
 ///
 /// Ticks rather than instructions, because that is the currency the scheduler
-/// and the guard both speak; the loop stops on the instruction count so that
+/// and the seam both speak; the loop stops on the instruction count so that
 /// every cell of the table does the same guest work.
 fn run_core(
     w: &Workload,

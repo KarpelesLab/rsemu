@@ -174,11 +174,21 @@ const fn ldxp_w(rt: u32, rt2: u32, rn: u32) -> u32 {
 const fn stxp_w(rs: u32, rt: u32, rt2: u32, rn: u32) -> u32 {
     0x8820_0000 | (rs << 16) | (rt2 << 10) | (rn << 5) | rt
 }
+/// `CAS<size> Ws, Wt, [Xn]`, `size` being the base-2 logarithm of the access
+/// in bytes — so `0` is `CASB` and `3` is `CAS` on a doubleword.
+const fn cas(size: u32, rs: u32, rt: u32, rn: u32) -> u32 {
+    (size << 30) | 0x08a0_7c00 | (rs << 16) | (rn << 5) | rt
+}
 const fn cas_x(rs: u32, rt: u32, rn: u32) -> u32 {
-    0xc8a0_7c00 | (rs << 16) | (rn << 5) | rt
+    cas(3, rs, rt, rn)
+}
+/// `LD<op><size> Ws, Wt, [Xn]`: `opc` names the read-modify-write and `o3`
+/// with a zero `opc` is `SWP`.
+const fn lse(size: u32, o3: u32, opc: u32, rs: u32, rt: u32, rn: u32) -> u32 {
+    (size << 30) | 0x3820_0000 | (rs << 16) | (o3 << 15) | (opc << 12) | (rn << 5) | rt
 }
 const fn ldadd_x(rs: u32, rt: u32, rn: u32) -> u32 {
-    0xf820_0000 | (rs << 16) | (rn << 5) | rt
+    lse(3, 0, 0, rs, rt, rn)
 }
 const fn tlbi_vmalle1() -> u32 {
     0xd508_871f
@@ -983,6 +993,233 @@ fn the_id_registers_agree_with_the_decoder() {
             cfg.features.lse
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `FEAT_LSE` at the byte and the halfword
+// ---------------------------------------------------------------------------
+//
+// The four widths are one feature, and these are the two a compiler reaches
+// for that the word and doubleword forms cannot stand in for: LLVM's
+// outline-atomics lowering of a `u8` atomic emits `casb`/`swpb` outright once
+// `HWCAP_ATOMICS` is set. Every word below is `llvm-mc -triple=aarch64
+// -mattr=+lse`'s encoding of the assembly in its comment, so none of it was
+// derived from the masks in `isa.rs`.
+
+/// `casb w1, w2, [x3]`.
+const CASB: u32 = 0x08a1_7c62;
+/// `casalb w1, w2, [x3]`.
+const CASALB: u32 = 0x08e1_fc62;
+/// `caslh w1, w2, [x3]`.
+const CASLH: u32 = 0x48a1_fc62;
+/// `casah w1, w2, [x3]`.
+const CASAH: u32 = 0x48e1_7c62;
+/// `swpb w1, w2, [x3]`.
+const SWPB: u32 = 0x3821_8062;
+/// `swpalh w1, w2, [x3]`.
+const SWPALH: u32 = 0x78e1_8062;
+/// `ldsmaxb w1, w2, [x3]`.
+const LDSMAXB: u32 = 0x3821_4062;
+/// `lduminh w1, w2, [x3]`.
+const LDUMINH: u32 = 0x7821_7062;
+/// `ldaddb w1, w2, [x3]`.
+const LDADDB: u32 = 0x3821_0062;
+/// `ldclrlh w1, w2, [x3]`.
+const LDCLRLH: u32 = 0x7861_1062;
+
+/// Those ten words must decode to the rows their comments name, and the
+/// encoders above must agree with them — which is what makes every test below
+/// a test of the interpreter rather than of one hand-computed mask.
+#[test]
+fn the_byte_and_halfword_atomic_encodings_decode() {
+    let features = Config::neoverse_n1().features;
+    let cases: &[(u32, u32, &str)] = &[
+        (CASB, cas(0, 1, 2, 3), "casb"),
+        (CASALB, cas(0, 1, 2, 3) | (1 << 22) | (1 << 15), "casalb"),
+        (CASLH, cas(1, 1, 2, 3) | (1 << 15), "caslh"),
+        (CASAH, cas(1, 1, 2, 3) | (1 << 22), "casah"),
+        (SWPB, lse(0, 1, 0, 1, 2, 3), "swpb"),
+        (
+            SWPALH,
+            lse(1, 1, 0, 1, 2, 3) | (1 << 23) | (1 << 22),
+            "swpalh",
+        ),
+        (LDSMAXB, lse(0, 0, 4, 1, 2, 3), "ldsmaxb"),
+        (LDUMINH, lse(1, 0, 7, 1, 2, 3), "lduminh"),
+        (LDADDB, lse(0, 0, 0, 1, 2, 3), "ldaddb"),
+        (LDCLRLH, lse(1, 0, 1, 1, 2, 3) | (1 << 22), "ldclrlh"),
+    ];
+    for (word, built, name) in cases {
+        assert_eq!(*word, *built, "{name}: the encoder disagrees with llvm-mc");
+        assert!(
+            super::isa::decode(*word, features).is_some(),
+            "{name} ({word:08x}) does not decode"
+        );
+        // ...and disassembles back to exactly the text `llvm-mc` printed,
+        // which is where the width letter has to land after the ordering.
+        let text = super::disasm::disassemble(*word, 0, features).text;
+        assert_eq!(text, alloc::format!("{name}\tw1, w2, [x3]"));
+    }
+}
+
+/// All twenty new rows are `FEAT_LSE`, so a Cortex-A53 refuses every one of
+/// them — and a Neoverse N1 takes every one.
+///
+/// The lattice for `CAS` was already tested; this is the half of it that was
+/// wrong, because `ID_AA64ISAR0_EL1.Atomic` is a single field that grants the
+/// whole extension. A part that reported `0b0010` and refused `CASB` was
+/// describing a part nobody makes.
+#[test]
+fn the_byte_and_halfword_atomics_are_the_same_feature_as_the_rest() {
+    let a53 = Config::cortex_a53().features;
+    let n1 = Config::neoverse_n1().features;
+    let mut words = alloc::vec![cas(0, 1, 2, 3), cas(1, 1, 2, 3)];
+    for size in [0, 1] {
+        for opc in 0..8 {
+            words.push(lse(size, 0, opc, 1, 2, 3));
+        }
+        words.push(lse(size, 1, 0, 1, 2, 3));
+    }
+    assert_eq!(words.len(), 20, "one word per new row");
+    for word in words {
+        assert!(
+            super::isa::decode(word, n1).is_some(),
+            "{word:08x} is FEAT_LSE and an N1 has it"
+        );
+        assert!(
+            super::isa::decode(word, a53).is_none(),
+            "{word:08x} decoded on a part without FEAT_LSE"
+        );
+    }
+}
+
+/// `CASB` compares the **byte**, not the register.
+///
+/// `Rs` is a `W` register and only its low eight bits take part; the rest is
+/// ignored on the way in and overwritten on the way out. An implementation
+/// that compared all thirty-two bits would never swap, which is why the
+/// comparand here carries rubbish above the byte — the symmetric input, where
+/// `Rs` holds nothing but the byte, passes either way.
+#[test]
+fn a_byte_compare_and_swap_compares_only_the_byte() {
+    let swapped = |comparand: u64| {
+        let h = Harness::new(
+            Config::neoverse_n1(),
+            &[
+                movz(1, 0, 0x8000, 0),
+                cas(0, 2, 3, 0),
+                ldr_x(4, 0, 0),
+                ldr_x(5, 0, 0),
+            ],
+        );
+        h.write64(0x8000, 0x0000_0000_0000_a5f0);
+        h.cpu.set_x(2, comparand);
+        h.cpu.set_x(3, 0x99);
+        h.steps(3);
+        (h.cpu.x(4), h.cpu.x(2))
+    };
+    let (memory, old) = swapped(0x3456_12f0);
+    assert_eq!(
+        memory, 0x0000_a599,
+        "the byte swapped, its neighbour did not"
+    );
+    assert_eq!(old, 0xf0, "Rs takes the old byte, zero-extended");
+
+    // The control: one bit lower in the byte and nothing swaps, which is what
+    // says the comparison happened at all.
+    let (memory, old) = swapped(0x3456_12f1);
+    assert_eq!(memory, 0x0000_a5f0, "no swap");
+    assert_eq!(old, 0xf0, "and Rs still takes the old byte");
+}
+
+/// `LDSMAXB` takes the maximum of two **signed bytes**.
+///
+/// `0x80` is `-128` at the element width and `+128` at the register's, so the
+/// two widths disagree about the answer — which is exactly why this is the
+/// case worth writing down. `LDUMAXB` is the unsigned mirror, and its
+/// discriminating input is an operand whose high bits would have won.
+#[test]
+fn the_byte_atomics_compare_at_the_element_width() {
+    let run = |word: u32, memory: u64, operand: u64| {
+        let h = Harness::new(
+            Config::neoverse_n1(),
+            &[movz(1, 0, 0x8000, 0), word, ldr_x(4, 0, 0)],
+        );
+        h.write64(0x8000, memory);
+        h.cpu.set_x(2, operand);
+        h.steps(3);
+        (h.cpu.x(4), h.cpu.x(3))
+    };
+    // `LDSMAXB W2, W3, [X0]`: max(-128, 1) is 1.
+    let (memory, old) = run(lse(0, 0, 4, 2, 3, 0), 0xbb80, 1);
+    assert_eq!(memory, 0xbb01, "the signed maximum of -128 and 1 is 1");
+    assert_eq!(old, 0x80, "and Rt takes the old byte");
+    // `LDSMINB W2, W3, [X0]`: min(-128, 1) is -128, so nothing moves.
+    let (memory, _) = run(lse(0, 0, 5, 2, 3, 0), 0xbb80, 1);
+    assert_eq!(memory, 0xbb80, "the signed minimum of -128 and 1 is -128");
+    // `LDUMAXB W2, W3, [X0]`: the operand's ninth bit is not part of it, so
+    // max(0xff, 0x00) is 0xff. Unmasked, `0x100` would have won and stored a
+    // zero byte.
+    let (memory, _) = run(lse(0, 0, 6, 2, 3, 0), 0xbbff, 0x100);
+    assert_eq!(memory, 0xbbff, "the operand contributes its low byte only");
+}
+
+/// The halfword forms move two bytes and leave the next two alone, and
+/// `LDSMINH` compares at sixteen bits for the same reason `LDSMAXB` compares
+/// at eight.
+#[test]
+fn the_halfword_atomics_move_a_halfword() {
+    let h = Harness::new(
+        Config::neoverse_n1(),
+        &[
+            movz(1, 0, 0x8000, 0),
+            lse(1, 1, 0, 2, 3, 0), // SWPH W2, W3, [X0]
+            ldr_x(4, 0, 0),
+        ],
+    );
+    h.write64(0x8000, 0xaaaa_bbbb);
+    h.cpu.set_x(2, 0x1111_2222);
+    h.steps(3);
+    assert_eq!(h.cpu.x(4), 0xaaaa_2222, "one halfword, and only one");
+    assert_eq!(h.cpu.x(3), 0xbbbb, "the old halfword, zero-extended");
+
+    // `LDSMINH W2, W3, [X0]` with `0x8000` in memory: min(-32768, 1) is
+    // -32768. At the register width the loaded halfword would be +32768 and
+    // the minimum would be 1.
+    let h = Harness::new(
+        Config::neoverse_n1(),
+        &[movz(1, 0, 0x8000, 0), lse(1, 0, 5, 2, 3, 0), ldr_x(4, 0, 0)],
+    );
+    h.write64(0x8000, 0xcccc_8000);
+    h.cpu.set_x(2, 1);
+    h.steps(3);
+    assert_eq!(h.cpu.x(4), 0xcccc_8000, "the halfword is negative");
+}
+
+/// A byte atomic still breaks a reservation, because it is a store.
+///
+/// The global monitor is what makes guest atomics work across cores, and an
+/// instruction that wrote memory without going through `Exec::store` would be
+/// invisible to it — so this asserts the plumbing rather than the arithmetic.
+#[test]
+fn a_byte_atomic_breaks_a_reservation_like_any_other_store() {
+    // The control first, because "the store-exclusive failed" is what this
+    // harness reports for half a dozen reasons that have nothing to do with
+    // the atomic — a reservation never taken, an alignment fault, the wrong
+    // granule. With a `NOP` where the atomic goes, the pair must *succeed*.
+    let pair = |middle: u32| {
+        let h = Harness::new(
+            Config::neoverse_n1(),
+            &[movz(1, 0, 0x8000, 0), ldxr_x(1, 0), middle, stxr_x(4, 5, 0)],
+        );
+        h.cpu.set_x(2, 1);
+        h.steps(4);
+        h.cpu.x(4)
+    };
+    assert_eq!(pair(NOP), 0, "the reservation stood over a NOP");
+    // `LDADDB W2, W3, [X0]` into the reserved granule: a store, so it breaks
+    // the monitor exactly as an ordinary one does.
+    assert_eq!(pair(lse(0, 0, 0, 2, 3, 0)), 1, "the store-exclusive failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -2679,6 +2916,141 @@ fn a_shift_by_the_whole_element_width_is_allowed() {
         u128::MAX,
         "a shift by the whole width inserts nothing and keeps everything"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The non-saturating scalar shifts by an immediate
+// ---------------------------------------------------------------------------
+//
+// A doubleword and nothing else — the architecture pins `immh<3>` and so does
+// every row's mask — and both directions, which is what makes them a format of
+// their own rather than rows of the saturating one. `libc.so.6`'s `strtold`
+// builds a NaN payload with seventeen of them and `libm` seven more.
+//
+// Every word below is `llvm-mc -triple=aarch64`'s encoding of the assembly in
+// its comment.
+
+/// `shl d0, d1, #32`.
+const SHL_D: u32 = 0x5f60_5420;
+/// `sshr d0, d1, #64`.
+const SSHR_D64: u32 = 0x5f40_0420;
+/// `ushr d0, d1, #1`.
+const USHR_D1: u32 = 0x7f7f_0420;
+/// `ssra d0, d1, #7`.
+const SSRA_D: u32 = 0x5f79_1420;
+/// `usra d0, d1, #64`.
+const USRA_D64: u32 = 0x7f40_1420;
+/// `srshr d0, d1, #4`.
+const SRSHR_D: u32 = 0x5f7c_2420;
+/// `urshr d0, d1, #64`.
+const URSHR_D64: u32 = 0x7f40_2420;
+/// `srsra d0, d1, #1`.
+const SRSRA_D: u32 = 0x5f7f_3420;
+/// `ursra d0, d1, #3`.
+const URSRA_D: u32 = 0x7f7d_3420;
+/// `sri d0, d1, #64`.
+const SRI_D64: u32 = 0x7f40_4420;
+/// `sli d0, d1, #63`.
+const SLI_D63: u32 = 0x7f7f_5420;
+
+/// Every one of those decodes, and disassembles back to `llvm-mc`'s own text.
+#[test]
+fn the_scalar_shift_immediates_decode_and_print() {
+    let features = Config::neoverse_n1().features;
+    let cases: &[(u32, &str)] = &[
+        (SHL_D, "shl\td0, d1, #32"),
+        (SSHR_D64, "sshr\td0, d1, #64"),
+        (USHR_D1, "ushr\td0, d1, #1"),
+        (SSRA_D, "ssra\td0, d1, #7"),
+        (USRA_D64, "usra\td0, d1, #64"),
+        (SRSHR_D, "srshr\td0, d1, #4"),
+        (URSHR_D64, "urshr\td0, d1, #64"),
+        (SRSRA_D, "srsra\td0, d1, #1"),
+        (URSRA_D, "ursra\td0, d1, #3"),
+        (SRI_D64, "sri\td0, d1, #64"),
+        (SLI_D63, "sli\td0, d1, #63"),
+    ];
+    for (word, text) in cases {
+        assert!(
+            super::isa::decode(*word, features).is_some(),
+            "{word:08x} does not decode"
+        );
+        assert_eq!(super::disasm::disassemble(*word, 0, features).text, *text);
+    }
+}
+
+/// `immh<3>` clear is `UNDEFINED` for all eleven, and the *mask* is what
+/// refuses it: there is no rule in the interpreter to get wrong, because the
+/// table never matches the row.
+///
+/// The control that makes this say anything is the pair — the same opcode with
+/// `immh<3>` set decodes, so what is being tested is the width bit and not the
+/// opcode.
+#[test]
+fn a_scalar_shift_immediate_below_a_doubleword_is_undefined() {
+    let features = Config::neoverse_n1().features;
+    for word in [SHL_D, SSHR_D64, SRI_D64, SLI_D63, SRSHR_D, USRA_D64] {
+        assert!(super::isa::decode(word, features).is_some());
+        // `immh` down from `1xxx` to `0001`, which names a byte everywhere
+        // that a width is allowed and nothing at all here.
+        let narrow = (word & !(0xf << 19)) | (1 << 19);
+        assert!(
+            super::isa::decode(narrow, features).is_none(),
+            "{narrow:08x}: a scalar shift narrower than a doubleword decoded"
+        );
+    }
+}
+
+/// The arithmetic, on the inputs where the two directions and the two
+/// roundings differ from each other.
+///
+/// The **top half of the destination is cleared**, which is what makes these
+/// scalar rather than a one-lane vector operation, and it is asserted by
+/// filling `V0` first: a lanewise implementation over `2D` would leave the
+/// upper doubleword alone and no other assertion here would notice.
+#[test]
+fn the_scalar_shifts_by_an_immediate_do_the_arithmetic() {
+    let cases: &[(u32, u128, u128, u128)] = &[
+        // `SHL D0, D1, #32`: the bits above the doubleword go nowhere.
+        (SHL_D, 0, 0x0000_0001_8000_0000, 0x8000_0000_0000_0000),
+        // `SSHR D0, D1, #64`: a shift by the whole element width, which a
+        // host `>>` has no answer for at all.
+        (SSHR_D64, 0, 0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff),
+        (USHR_D1, 0, u64::MAX as u128, 0x7fff_ffff_ffff_ffff),
+        // `SSRA D0, D1, #7` accumulates into the destination: an arithmetic
+        // shift right of a negative, plus what was already there.
+        (SSRA_D, 100, 0x8000_0000_0000_0000, 0xff00_0000_0000_0064),
+        // `USRA D0, D1, #64` shifts everything away and adds nothing.
+        (USRA_D64, 7, u64::MAX as u128, 7),
+        // `URSHR D0, D1, #64`: the rounding constant is added *before* the
+        // shift, so at the full width it is the only thing left — a
+        // non-rounding shift gives zero here.
+        (URSHR_D64, 0, 0x8000_0000_0000_0000, 1),
+        // ...and one below the full width, where the constant still decides.
+        (SRSHR_D, 0, 0x0000_0000_0000_0008, 1),
+        // `SRSRA D0, D1, #1` rounds and then accumulates: `(-3 + 1) >> 1` is
+        // `-1`, and the two in the destination makes it one. Without the
+        // accumulate it would be `-1`, and without the rounding `-2`.
+        (SRSRA_D, 2, 0xffff_ffff_ffff_fffd, 1),
+        (URSRA_D, 0, 0x0000_0000_0000_0004, 1),
+        // `SRI D0, D1, #64` inserts nothing and keeps everything.
+        (SRI_D64, u64::MAX as u128, 0, u64::MAX as u128),
+        // `SLI D0, D1, #63` moves one bit up and keeps the other sixty-three.
+        (SLI_D63, 0x5555_5555_5555_5555, 1, 0xd555_5555_5555_5555),
+    ];
+    for (word, dest, source, want) in cases {
+        let h = simd(&[*word]);
+        // The upper half of the destination, which every one of these must
+        // clear whatever it held.
+        h.cpu.set_v(0, (0xdead_beef_dead_beef << 64) | *dest);
+        h.cpu.set_v(1, (0xfeed_face_feed_face << 64) | *source);
+        h.steps(1);
+        assert_eq!(
+            h.cpu.v(0),
+            *want,
+            "{word:08x}: on {source:#x} into {dest:#x}"
+        );
+    }
 }
 
 /// `SSHL` shifts left or right depending on the *sign of a byte* in the

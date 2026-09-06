@@ -215,6 +215,41 @@
 //! It reported 1 066 phantom over-acceptances before the discriminator became
 //! "`ESR_EL1` is nonzero *and* its `EC` is zero".
 //!
+//! The **`FEAT_LSE` group** and the **scalar shift-by-immediate encoding**
+//! were swept the same way when the byte and halfword atomics and the
+//! non-saturating scalar shifts landed, and both enumerated rather than
+//! sampled: every `size`, `L` and `o0` of the compare-and-swap encoding and
+//! every `size`, `A`, `R`, `o3` and `opc` of the read-modify-writes over four
+//! register triples (1 088 words); every `U`, `immh`:`immb` and `opcode` of
+//! the scalar shift-by-immediate encoding over two register pairs (16 384),
+//! with the vector encoding beside it as a control (16 384); and every one-
+//! and two-bit flip of all thirty-one new rows' canonical words (12 830
+//! distinct). **Nothing this core accepts is rejected**, and every word both
+//! accept that one of the new rows decodes disassembles to `llvm-mc`'s own
+//! text.
+//!
+//! The words `llvm-mc` decodes and this core does not are, again, deliberate
+//! absences: 768 scalar **fixed-point** conversions (`SCVTF S0, S1, #32` and
+//! its three relatives, which share that encoding and are the only thing left
+//! in it), 32 `CASP`, 46 `FEAT_LOR` accesses (`LDLARB`/`STLLRB` and
+//! relatives), and 32 by-element and `SQDMLAL`-family words that a two-bit
+//! flip wanders into from the rows next door.
+//!
+//! That sweep is also where a defect in the round's *own* work was found,
+//! which is the argument for enumerating rather than spot-checking. The
+//! ordering suffix sits at bits 22 and 15 on a compare-and-swap and at bits 23
+//! and 22 on every other LSE atomic, and the disassembler picks between the
+//! two by matching `CasW | CasX`; adding `CasB` and `CasH` without adding them
+//! to that match printed `casab` where `casb` was meant, for all twenty-four
+//! affected words. No unit test would have been written for the case that was
+//! wrong, because nothing about it looked like a case.
+//!
+//! And a control, because a sweep that reports no over-acceptances cannot tell
+//! success from a harness that answers "accepted" to everything: the whole
+//! atomic sweep was run again on a **Cortex-A53**, where all 640 words a
+//! Neoverse N1 accepts must be refused and the shift sweep must be unchanged.
+//! Both held.
+//!
 //! # Timing
 //!
 //! Arm does not architecturally define instruction timing, so there is no
