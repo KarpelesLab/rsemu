@@ -1071,6 +1071,50 @@ fn a_pending_dmc_fetch_survives_a_round_trip() {
     assert!(restored.dma_complete(request.serial, 0x11));
 }
 
+/// A pending frame interrupt survives a round trip.
+///
+/// `Core::irq_out` is the `/IRQ` level as it stood one CPU cycle ago — what a
+/// 6502 samples — and `save` did not write it. Restoring rebuilt it as `false`
+/// from `Core::new`, `refresh_irq` then drove `apu.irq -> cpu.irq` low, and the
+/// machine's own `/wires` chunk (which *does* carry the level) was overwritten
+/// by the realize sweep on the way in. **A guest lost a pending frame
+/// interrupt across a save state.**
+///
+/// Neither a `save -> load -> save` byte comparison nor a state hash could see
+/// it, because both are functions of the fields `save` writes. The only shape
+/// that catches an omitted field is restoring into a fresh device and asking it
+/// something it has to have kept — which is what this does.
+///
+/// Found by the cross-host snapshot work, which bisected the span: `nes-ntsc`
+/// round-trips at 1, 2, 4, 8, 16 and 16.8 ms and fails at 20, because the NTSC
+/// frame counter's first IRQ is about 16.7 ms in.
+#[test]
+fn a_pending_frame_interrupt_survives_a_round_trip() {
+    let apu = apu();
+    // Four-step mode with the frame interrupt enabled is the power-on state.
+    // 29,832 rather than 29,829: the line the core samples is the level the
+    // previous cycle left, so it follows the flag by one CPU cycle — the very
+    // thing `irq_out` records, and the reason this test exists.
+    apu.advance(29_832);
+    assert_eq!(
+        apu.irq_level(),
+        Level::High,
+        "precondition: the frame counter has asserted its interrupt"
+    );
+
+    let bytes = snapshot(&apu);
+    let restored = self::apu();
+    let reader = StateReader::new(&bytes).unwrap();
+    let (_, _, data) = reader.load_raw("apu").unwrap();
+    restored.load(&mut ChunkReader::new(data)).unwrap();
+
+    assert_eq!(
+        restored.irq_level(),
+        Level::High,
+        "the restored APU released an interrupt the guest had not acknowledged"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Regions
 //

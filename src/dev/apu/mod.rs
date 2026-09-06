@@ -103,7 +103,7 @@ use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
 };
-use crate::core::state::{ChunkReader, ChunkWriter};
+use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
@@ -403,7 +403,15 @@ impl Core {
         self.noise.save(w)?;
         self.dmc.save(w)?;
         w.write_u64(self.ticks)?;
-        w.write_u64(self.phase)
+        w.write_u64(self.phase)?;
+        // The `/IRQ` level as it stood one CPU cycle ago. Architectural, not
+        // derived: it is what the 6502 samples this cycle, and rebuilding it
+        // from `irq_raw()` on restore is a different value — the frame
+        // counter's flag may have been set by the very cycle the snapshot was
+        // taken on. Omitting it lost a pending frame interrupt across a save
+        // state, and neither a byte round-trip nor a state hash could see that,
+        // because both are functions of what `save` writes.
+        w.write_bool(self.irq_out)
     }
 
     fn load<'a>(&mut self, r: &mut dyn crate::core::state::Source<'a>) -> Result<()> {
@@ -415,6 +423,7 @@ impl Core {
         self.dmc.load(r)?;
         self.ticks = r.read_u64()?;
         self.phase = r.read_u64()? & 1;
+        self.irq_out = r.read_bool()?;
         // Samples already handed to the host are not replayed, and the ring is
         // output rather than architectural state (`ROADMAP.md` §4.5).
         self.samples.clear();
@@ -1178,12 +1187,42 @@ static APU_PROPERTIES: &[PropertySpec] = &[
 pub static APU_CLASS: DeviceClass = DeviceClass {
     name: "nes.apu",
     // v2 appended the DMC's enable latch: the cycle a `$4015` write that
-    // started playback lets a fetch halt the CPU from.
-    version: 2,
+    // started playback lets a fetch halt the CPU from. v3 appended `irq_out`,
+    // the `/IRQ` level a 6502 samples; see [`migrations`].
+    version: 3,
     summary: "NES APU (RP2A03 / RP2A07 / UA6527P audio): two pulse, triangle, noise, DMC",
     properties: APU_PROPERTIES,
     construct: |props| Ok(Box::new(Apu::new(props)?) as Box<dyn Device>),
 };
+
+/// Carry a v2 `nes.apu` chunk forward.
+///
+/// v3 appends one byte: `Core::irq_out`, the `/IRQ` level as it stood one CPU
+/// cycle ago. A v2 chunk does not carry it, and the honest value to invent is
+/// **the level the restored state implies** rather than `false` — `false` is
+/// what the old `load` left behind by way of `Core::new`, and that is precisely
+/// the defect: a machine snapshotted with a frame interrupt pending came back
+/// with `/IRQ` released, and the realize sweep then drove the wire low.
+///
+/// A step sees bytes, not a `Core`, so it cannot call `irq_raw()` — and it
+/// writes `false`, which is exactly what the old `load` left behind by way of
+/// `Core::new`. That is deliberate rather than lazy: the level is a function of
+/// the frame counter and DMC state a v2 chunk **does** carry, so one CPU cycle
+/// after the restore `tick` recomputes it correctly. What a v2 chunk cannot
+/// carry is the *edge* that was already pending at the instant it was taken,
+/// and no step can recover that — it is not in the bytes. A migration that
+/// guessed `true` would be inventing state, which is the failure mode
+/// `machine::migrate`'s own docs argue is worse than refusing.
+///
+/// So this step does not fix v2 snapshots; it lets them load, losing the one
+/// edge they never recorded. v3 snapshots lose nothing.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(APU_CLASS.name, 2, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_bool(false)
+    })
+}
 
 /// Add the APU to a registry.
 ///

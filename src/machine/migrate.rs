@@ -100,6 +100,8 @@ pub fn default_migrations() -> Result<Migrations> {
     let mut migrations = Migrations::new();
     #[cfg(feature = "dev-flash-spinor")]
     crate::dev::flash::spinor::migrations(&mut migrations)?;
+    #[cfg(feature = "dev-nes-apu")]
+    crate::dev::apu::migrations(&mut migrations)?;
     Ok(migrations)
 }
 
