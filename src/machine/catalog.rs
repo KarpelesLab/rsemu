@@ -1345,6 +1345,174 @@ mod tests {
         }
     }
 
+    /// Which chunks two snapshots of the same machine disagree about.
+    fn differing_chunks(a: &[u8], b: &[u8]) -> Vec<String> {
+        use crate::core::state::StateReader;
+        let (ra, rb) = (
+            StateReader::new(a).expect("a parses"),
+            StateReader::new(b).expect("b parses"),
+        );
+        let mut out = Vec::new();
+        for info in ra.chunks() {
+            let (_, _, da) = ra.load_raw(info.path).expect("present");
+            let Ok((_, _, db)) = rb.load_raw(info.path) else {
+                out.push(alloc::format!("{} missing", info.path));
+                continue;
+            };
+            if da != db {
+                let at = da
+                    .iter()
+                    .zip(db)
+                    .position(|(x, y)| x != y)
+                    .unwrap_or_else(|| da.len().min(db.len()));
+                out.push(alloc::format!(
+                    "{} [{}] {}/{} bytes, differ from offset {at}",
+                    info.path,
+                    info.class,
+                    da.len(),
+                    db.len()
+                ));
+            }
+        }
+        out
+    }
+
+    /// Boards whose snapshot does not survive a restore, and why.
+    ///
+    /// A known-failures ledger that only ever shrinks (`CLAUDE.md`). An entry
+    /// here is a defect that has been located, not a board that is excused.
+    const RESUME_KNOWN_FAILURES: &[(&str, &str)] = &[(
+        "spi-flash",
+        "`flash.spinor` saves its command decoder and its array and not the \
+         bit-level shifter inside the `SlavePins` it holds — although \
+         `SlavePins::snapshot`/`restore` exist for exactly this and the master \
+         on the same bus, `stm32.spi`, already calls them. A snapshot taken \
+         part way through a word restores a part whose shifter is at power-on, \
+         `Phase` comes back different in the very next byte of the chunk, and \
+         the guest diverges.",
+    )];
+
+    /// A smaller board, where the description offers the knob.
+    ///
+    /// [`Machine::save`](crate::machine::Machine::save) walks every byte of RAM
+    /// and this test takes four snapshots of each board, so `arm64-virt`'s
+    /// default half-gigabyte is two gigabytes of copying for a guest whose
+    /// whole program is four instructions. `tests/workload` sizes `riscv-virt`
+    /// down for the same reason and says the same thing about why.
+    fn small_memory(source: &str) -> Vec<(String, String)> {
+        /// The cap. Big enough for every fixture program in this file and for
+        /// the firmware `machines/pc-at.machine` and `machines/q35*.machine`
+        /// post with; small enough that a snapshot of it is cheap.
+        const CAP: u64 = 16 * 1024 * 1024;
+        ["ram", "extmem"]
+            .iter()
+            .filter(|p| declared_size(source, p).is_some_and(|n| n > CAP))
+            .map(|p| ((*p).to_string(), String::from("16M")))
+            .collect()
+    }
+
+    /// The size a description gives a `param`, in bytes.
+    ///
+    /// Deliberately a *cap* rather than a setting: `machines/apple1.machine`
+    /// says `param ram = 4K` and handing it 16 MiB does not fit in a 16-bit
+    /// bus, so a blanket override turns a memory saving into a build failure.
+    fn declared_size(source: &str, param: &str) -> Option<u64> {
+        let token = source
+            .split(&alloc::format!("param {param} = "))
+            .nth(1)?
+            .split_whitespace()
+            .next()?;
+        let (digits, unit) = match token.as_bytes().last()? {
+            b'K' | b'k' => (&token[..token.len() - 1], 1024),
+            b'M' | b'm' => (&token[..token.len() - 1], 1024 * 1024),
+            b'G' | b'g' => (&token[..token.len() - 1], 1024 * 1024 * 1024),
+            _ => (token, 1),
+        };
+        digits.parse::<u64>().ok().map(|n| n * unit)
+    }
+
+    /// Every board this build ships, snapshotted mid-run and resumed on a board
+    /// that has only ever been reset.
+    ///
+    /// The claim `ROADMAP.md` §4.5 makes and that no other test makes for more
+    /// than a handful of boards: a snapshot is a *complete* description of the
+    /// machine. Restoring and re-saving proves only that `save` is a function
+    /// of the fields `save` writes, which is a tautology — running afterwards
+    /// is what finds a field it never wrote. `tests/frame_hash.rs` has the same
+    /// shape for the five workload boards and `tests/smp_snapshot.rs` for the
+    /// four two-processor ones; this is all of them.
+    #[test]
+    fn every_shipped_machine_resumes_from_its_own_snapshot() {
+        use crate::core::clock::GlobalTime;
+        const SPAN: GlobalTime = GlobalTime::from_nanos(2_000_000);
+        let mut report: Vec<String> = Vec::new();
+        for entry in machines() {
+            let params = small_memory(entry.source);
+            let build = || {
+                let mut options = build_options().expect("this build's classes");
+                for slot in entry.media {
+                    options
+                        .realize
+                        .media
+                        .insert(*slot, fixture(entry.name, slot));
+                }
+                options.resolve.params.extend(params.iter().cloned());
+                let registry = registry().expect("a registry");
+                crate::machine::build(entry.name, entry.source, &registry, &options)
+                    .unwrap_or_else(|e| panic!("{}: {e}", entry.name))
+            };
+            let (mut a, mut b) = (build(), build());
+            a.run_for(SPAN).expect("it runs");
+            let saved = a.save().expect("it snapshots");
+            b.load(&saved).expect("a reset board takes the snapshot");
+            let again = b.save().expect("and snapshots again");
+            if saved != again {
+                report.push(alloc::format!(
+                    "{}: restore does not re-save: {:?}",
+                    entry.name,
+                    differing_chunks(&saved, &again)
+                ));
+            }
+            a.run_for(SPAN).expect("the original runs on");
+            b.run_for(SPAN).expect("the restored one runs on");
+            let (after_a, after_b) = (a.save().expect("a saves"), b.save().expect("b saves"));
+            if after_a != after_b {
+                report.push(alloc::format!(
+                    "{}: diverged after the restore: {:?}",
+                    entry.name,
+                    differing_chunks(&after_a, &after_b)
+                ));
+            }
+        }
+
+        // Split the report against the ledger, both ways: an unexpected failure
+        // is a regression, and an expected one that stopped happening is an
+        // entry somebody forgot to delete.
+        let known: Vec<&str> = RESUME_KNOWN_FAILURES.iter().map(|(n, _)| *n).collect();
+        let failed: Vec<&str> = report
+            .iter()
+            .map(|line| line.split(':').next().unwrap_or(""))
+            .collect();
+        let unexpected: Vec<&String> = report
+            .iter()
+            .filter(|line| !known.contains(&line.split(':').next().unwrap_or("")))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "a board stopped resuming from its own snapshot: {unexpected:#?}"
+        );
+        for (name, why) in RESUME_KNOWN_FAILURES {
+            if !machines().iter().any(|m| m.name == *name) {
+                continue; // not in this build's feature set
+            }
+            assert!(
+                failed.contains(name),
+                "`{name}` is in the known-failures ledger and now resumes \
+                 correctly. Delete its entry — the ledger only shrinks. It said: {why}"
+            );
+        }
+    }
+
     #[test]
     fn an_unknown_machine_lists_what_there_is() {
         let e = build_catalog("megadrive", &[])

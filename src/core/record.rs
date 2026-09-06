@@ -354,6 +354,13 @@
 //! does: the Apple 1 this file's frozen recording replays on is in the second
 //! group, which is why that gate is reachable and this one is not yet.
 //!
+//! The most interesting untested case of the second group is already shipping.
+//! `rsemu_save`/`rsemu_load` give the browser build save states (§11.7), and a
+//! `wasm32` host has a four-byte `usize` — so a save state taken in a tab and
+//! loaded by a native binary is the cross-host *restore* claim in its sharpest
+//! form, and nothing runs it: CI builds all three wasm targets and executes
+//! none of them, exactly as it does for the frozen recording above.
+//!
 //! # Example
 //!
 //! ```

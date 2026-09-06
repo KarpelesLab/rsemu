@@ -78,14 +78,17 @@
 //! the way it did not intend: the *versions* are decoration until somebody
 //! writes the steps between them.
 //!
-//! That is a deliberate position rather than an oversight while snapshots are
-//! not a user-facing artefact — no shipped binary writes one, so no snapshot
-//! from an older build exists to be migrated. It stops being defensible the
-//! moment `rsemu` grows a save-state command, and §4.5 names what the test then
-//! has to be: **a cross-version load from a committed fixture**, not a
-//! round-trip. The fixture test in this file
-//! (`a_v1_fixture_loads_into_a_v2_build`) is that shape for a toy class and is
-//! the template.
+//! It would be a defensible position if snapshots were not a user-facing
+//! artefact, and they are: `rsemu_save`/`rsemu_load` in `crate::wasm` (behind
+//! the `wasm` feature) are §11.7's "take a save state, all client-side with
+//! nothing uploaded", and `web/src/session.js` puts them behind a button.
+//! (The `rsemu` binary has no such command, which is the direction the
+//! asymmetry runs.) So save states written by a browser build already exist,
+//! and the next `cpu.x86` version bump makes every one of them unloadable with
+//! a message about a migration hole. §4.5 names what the test has to be:
+//! **a cross-version load from a committed fixture**, not a round-trip. The
+//! fixture test in this file (`a_v1_fixture_loads_into_a_v2_build`) is that
+//! shape for a toy class and is the template.
 //!
 //! # The shape does not record features or architectures
 //!

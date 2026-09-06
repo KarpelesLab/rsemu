@@ -96,8 +96,11 @@
 //!
 //!   The table used to have three rows, and splitting the last one is not a
 //!   quibble: *reference* is the default for **every** file-backed image, and
-//!   an installer ISO, a `--drive …,ro` disk and a mask ROM are all in the row
-//!   that is fine. What is left in the unsound row is a writable image, which
+//!   `--drive cd0=install.iso,ro` — an installer medium, which is a large share
+//!   of the images anyone attaches — is in the row that is fine, because
+//!   `dev::blk::Image` refuses a guest write outright when it is read-only
+//!   rather than merely declining to persist one. What is left in the unsound
+//!   row is a writable image, which
 //!   is narrower than "the default", and it is worth saying which one a caller
 //!   is in before they reach for *capture*. A caller who does reach for it pays
 //!   the capacity per keyframe **and** accepts that a restore rewrites the host
@@ -155,10 +158,11 @@
 //! * The keyframes are **in memory and unbounded** until
 //!   [`Timeline::forget_before`] is called. [`Timeline::bytes_held`] is the
 //!   number to watch; nothing here caps it.
-//! * Nothing in `src/bin/rsemu.rs` reaches this module. `rsemu run` can record
-//!   and replay an input log (`--record-input`, `--replay-input`) but has no
-//!   subcommand that writes a snapshot, reads one back, or rewinds. Phase 9's
-//!   "rewind demo" is a library call today, not a command.
+//! * **Nothing that ships reaches this module.** `rsemu run` can record and
+//!   replay an input log (`--record-input`, `--replay-input`) but has no
+//!   subcommand that writes a snapshot, reads one back, or rewinds; the browser
+//!   build has save states (`rsemu_save`/`rsemu_load`, §11.7) and no rewind.
+//!   Phase 9's "rewind demo" is a library call today, in neither front end.
 //!
 //! # Example
 //!

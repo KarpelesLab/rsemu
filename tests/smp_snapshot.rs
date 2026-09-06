@@ -1,44 +1,59 @@
 //! Does a machine with **several processors** survive a snapshot — and does the
 //! restored machine still run the same way? (`ROADMAP.md` §4.5, phase 9's gate.)
 //!
-//! Every stateful device has a round-trip test, and one two-processor board
-//! already had a machine-level one (`tests/pc_at_smp.rs`). Neither shape is the
-//! claim phase 9 needs, because **both are blind in exactly the same place**:
+//! # The shape, and why the usual one is not enough
+//!
+//! Most snapshot tests in the tree — every device's, and the machine-level ones
+//! in `tests/pc_at_smp.rs`, `tests/q35_board.rs` and the rest — assert
 //!
 //! ```text
 //!   save() ── bytes ──► load() ── save() ──► the same bytes
 //! ```
 //!
-//! is a tautology over the fields `save` writes. State that `save` *omits*
-//! cannot make that comparison fail, however wrong the restored machine is —
-//! and `Machine::state_hash` is a hash of `save` output, so it inherits the
-//! blindness. The only thing that sees an omission is **running afterwards**:
-//! take a machine that has only ever been reset, hand it the snapshot, run both
-//! it and the original forward over the same span, and compare.
+//! or the state hash, which is a hash of those bytes. Both are tautologies over
+//! the fields `save` writes: state that `save` *omits* cannot make either
+//! comparison fail, however wrong the restored machine is. The only thing that
+//! sees an omission is **running afterwards** — restore into a board that has
+//! only ever been reset, then run it *and* the original forward over the same
+//! span and compare.
 //!
-//! `tests/frame_hash.rs` does that for the five workload boards, all of them
-//! single-processor. This file does it for the four boards in `machines/` that
-//! have two processors — `riscv-virt-smp`, `arm64-virt-smp`, `pc-at-smp`,
-//! `q35-linux-smp` — and for `pc-at` on its own, as the control.
+//! That shape is not new here. `tests/frame_hash.rs` has it for the five
+//! workload boards and all three `tests/*_engines.rs` have it across an engine
+//! change. What none of them had was a **two-processor board**: of the four in
+//! `machines/`, `pc-at-smp` had a round-trip test and no resume, and
+//! `arm64-virt-smp` and `q35-linux-smp` had no snapshot coverage at all.
+//!
+//! `machine::catalog`'s `every_shipped_machine_resumes_from_its_own_snapshot`
+//! now runs the same shape over the whole catalog with fixture media. This file
+//! stays because it is the one that drives the second processor deliberately —
+//! its AArch64 image releases the other core and gives each a counter of its
+//! own — and because it crosses an engine change on a *board*.
 //!
 //! # What it found
 //!
-//! The control is the point. `pc-at` and `pc-at-smp` both restored to a
-//! byte-identical snapshot and then **diverged 200 µs later**, on the VGA
-//! adapter's clock domain, by exactly one tick. The cause was not SMP and not
-//! the VGA: `ClockForest::restore_ticks` anchored a restored domain's tick
-//! counter at the tree position it was restored to, which sets the domain's
-//! *sub-tick phase* to zero. A domain divided by *n* whose tree sat part way
-//! into a tick came back at the start of one, so it ticked late — once, and
-//! then forever, because the anchor stays put. §4.5 names sub-tick phase as the
-//! thing a snapshot must not lose; this was the framework losing it on the
-//! restore side rather than a device losing it on the save side.
+//! `pc-at-smp` restored to a byte-identical snapshot and then **diverged 200 µs
+//! later**, on the VGA adapter's clock domain, by exactly one tick — and so did
+//! `pc-at`, which is why that board is here too as the control. The cause was
+//! neither SMP nor the VGA: `ClockForest::restore_ticks` anchored a restored
+//! domain's tick counter at the tree position it was restored to, which sets
+//! the domain's *sub-tick phase* to zero. A domain divided by *n* whose tree
+//! sat part way into a tick came back at the start of one, so it ticked late —
+//! once, and then for the rest of the run, because the anchor stays put. §4.5
+//! names sub-tick phase as the thing a snapshot must not lose; this was the
+//! framework losing it on the restore side rather than a device losing it on
+//! the save side.
 //!
-//! Nothing in the tree caught it because the workload boards' snapshot instants
-//! happen to be tick-aligned for the domains that matter, and because every
-//! other test compares only the two things that cannot see it.
+//! The resume tests that existed did not catch it because their boards'
+//! snapshot instants happen to be tick-aligned for every domain that matters:
+//! `frame_hash` snapshots after a whole number of frames, and the workload
+//! boards' frames are counted in the very domain being divided.
 
 #![cfg(feature = "std")]
+// Every board below is behind its own feature, so a build with none of them
+// leaves the two shared helpers with no caller. That is an ordinary
+// `--no-default-features` build rather than dead code, and CI compiles tests
+// with `-D warnings`.
+#![allow(dead_code)]
 
 use rsemu::core::clock::GlobalTime;
 use rsemu::machine::Machine;
@@ -173,15 +188,24 @@ mod a64 {
     use super::*;
     use rsemu::dev::arm::boot::asm;
 
-    const KERNEL_ADDR: u64 = 0x4008_0000;
+    /// `machines/arm64-virt-smp.machine`'s `kernel-addr` and `release-addr`,
+    /// and `tests/a64_smp.rs`'s placement of the second core's half.
+    const KERNEL_ADDR: u64 = 0x4020_0000;
     const RELEASE: u64 = 0x4000_1000;
-    const SECOND: u64 = 0x4008_1000;
+    /// The `Image` header is part of the file and the file is loaded whole at
+    /// `kernel-addr`, so the words after it start `HEADER` bytes in. The second
+    /// core's half is [`SECOND_INDEX`] words further on, and this is the
+    /// address that lands at — computed rather than assumed, because getting it
+    /// wrong parks the second core on a word of zeros and looks exactly like a
+    /// second core that was never released.
+    const SECOND: u64 = KERNEL_ADDR + HEADER as u64 + 4 * SECOND_INDEX as u64;
+    const SECOND_INDEX: usize = 128;
+    const HEADER: usize = 0x40;
     const COUNTER_A: u64 = 0x4000_1200;
     const COUNTER_B: u64 = 0x4000_1208;
 
     /// `tests/a64_smp.rs`'s `Image` header, which the board's loader insists on.
     fn image(words: &[u32]) -> Vec<u8> {
-        const HEADER: usize = 0x40;
         let mut out = Vec::with_capacity(HEADER + words.len() * 4);
         out.extend_from_slice(&asm::b((HEADER / 4) as i32).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
@@ -217,9 +241,11 @@ mod a64 {
         words.push(asm::str_base(12, 11));
         words.push(asm::b(spin - words.len() as i32));
 
-        let at = (SECOND - KERNEL_ADDR) as usize / 4;
-        assert!(words.len() <= at, "the first half ran into the second");
-        words.resize(at, 0);
+        assert!(
+            words.len() <= SECOND_INDEX,
+            "the first half ran into the second"
+        );
+        words.resize(SECOND_INDEX, 0);
         words.extend_from_slice(&asm::load64(11, COUNTER_B));
         let spin = words.len() as i32;
         words.push(asm::ldr_base(12, 11));
@@ -244,10 +270,45 @@ mod a64 {
             .expect("the two-core board realizes")
     }
 
+    /// A 64-bit word of guest memory, read the way a debugger would.
+    fn peek(m: &Machine, addr: u64) -> u64 {
+        use rsemu::core::space::MemAttrs;
+        use rsemu::core::value::Width;
+        m.space("mem")
+            .expect("the board's memory space")
+            .read(addr, Width::U64, MemAttrs::DEBUG)
+            .expect("readable RAM")
+    }
+
     #[test]
     fn two_cores_round_trip_and_keep_running_the_same() {
         let k = program();
         round_trip_and_resume("arm64-virt-smp", board(&k, "interp"), board(&k, "interp"));
+    }
+
+    /// "Both processors are executing at the snapshot instant" is the premise
+    /// the test above rests on, and on this board it is checkable rather than
+    /// assumed: each core counts into a word of its own, so two non-zero and
+    /// unequal counters say the second core was released and is running its own
+    /// half of the image. On `pc-at-smp` and `q35-linux-smp` the equivalent
+    /// depends on how far the firmware has got, which is why the constructed
+    /// board is the one that carries this claim.
+    #[test]
+    fn both_cores_are_live_at_the_instant_the_snapshot_is_taken() {
+        let mut m = board(&program(), "interp");
+        m.run_for(SPAN).expect("the board runs");
+        let (a, b) = (peek(&m, COUNTER_A), peek(&m, COUNTER_B));
+        assert!(a > 0, "the boot processor never counted");
+        assert!(b > 0, "the second processor was never released");
+
+        let saved = m.save().expect("it snapshots");
+        let mut restored = board(&program(), "interp");
+        restored.load(&saved).expect("the snapshot restores");
+        assert_eq!(
+            (peek(&restored, COUNTER_A), peek(&restored, COUNTER_B)),
+            (a, b),
+            "the restored board lost one of the two processors' work"
+        );
     }
 
     #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
