@@ -1276,6 +1276,17 @@ impl Device for Octospi {
         if was_open && !state.open {
             self.shared.close();
         }
+        if state.open
+            && let Some(bus) = &self.shared.bus
+        {
+            // The chip select this controller was holding when the snapshot
+            // was taken. Put back silently: a fresh bus has nothing selected,
+            // and going through `select` would deliver a falling edge the part
+            // never saw, which is where a slave *starts a frame* — over the
+            // open transaction this is restoring. See
+            // `bus::spi::SpiBus::restore_select`.
+            bus.restore_select(Some(self.shared.cs));
+        }
         self.shared.publish_irq();
         Ok(())
     }

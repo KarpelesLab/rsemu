@@ -662,6 +662,38 @@ impl SpiBus {
         }
     }
 
+    /// Put the selection back where a snapshot found it, telling nobody.
+    ///
+    /// For [`Device::load`](crate::core::device::Device::load) and nothing
+    /// else. A chip select is a *line a master drives*, so — like every other
+    /// driven level — it is not a chunk of its own: each master saves whether
+    /// it holds the line and re-establishes it here while restoring itself.
+    /// What the bus must not do is treat that as an edge. [`SpiBus::select`]
+    /// only calls into a slave when the line actually moves, and a freshly
+    /// built bus has moved to nothing, so a restoring master calling `select`
+    /// would deliver a falling edge that never happened — and a slave's
+    /// `select` is where it *begins a frame*. That is precisely how the
+    /// `spi-flash` board lost a mid-frame flash on every restore: `stm32.spi`
+    /// re-drove its `NSS`, the bus thought the part had just been selected,
+    /// and `flash.spinor` started a fresh command over the one the snapshot had
+    /// carefully preserved.
+    ///
+    /// A master that does **not** hold the line must not call this with
+    /// [`None`]: that is the state a fresh bus is already in, and clearing
+    /// would undo a sibling master that restored first. Only a claim is
+    /// asserted, never a release. Two masters both claiming the line in one
+    /// snapshot is a bus with two drivers on one wire — a short, which no
+    /// encoding can resolve — and the last one restored wins.
+    pub fn restore_select(&self, cs: Option<ChipSelect>) {
+        // An out-of-range chip select is dropped rather than stored: `attach`
+        // already refuses one, and `active` is a value `selected` hands back as
+        // if it were routable.
+        let want = cs
+            .filter(|c| usize::from(c.0) < MAX_CHIP_SELECTS)
+            .map_or(NO_SELECTION, |c| u32::from(c.0));
+        self.active.store(want, Ordering::Relaxed);
+    }
+
     /// Exchange one word with whichever slave is selected.
     ///
     /// Returns what came back on MISO. With nothing selected — or a chip select

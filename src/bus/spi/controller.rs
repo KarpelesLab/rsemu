@@ -528,6 +528,23 @@ impl Shared {
         }
     }
 
+    /// Put the bus's chip select back where a snapshot found it.
+    ///
+    /// The restore twin of [`Shared::select_transactional`], and the difference
+    /// matters: a fresh bus has nothing selected, so re-pointing it through
+    /// `select` would hand the part a chip select that had this instant fallen
+    /// — and a slave's `select` is where it *begins a frame*, over whatever
+    /// mid-frame state the snapshot had just restored into it. Nothing moved,
+    /// so nobody is told; [`SpiBus::restore_select`] has the whole argument.
+    ///
+    /// A controller that holds no chip select claims nothing: another master on
+    /// the same bus may hold it, and its own load puts that back.
+    fn restore_transactional(&self, selected: Option<ChipSelect>) {
+        if let (Some(bus), Some(cs)) = (&self.bus, selected) {
+            bus.restore_select(Some(cs));
+        }
+    }
+
     /// Start a transfer of `word`, if the controller is in a position to.
     ///
     /// Returns whether one started. Called with the state lock held; the
@@ -985,7 +1002,7 @@ impl Device for SpiController {
             *slot = state;
             self.shared.publish(&slot);
         }
-        self.shared.select_transactional(state.selected());
+        self.shared.restore_transactional(state.selected());
         self.shared.announce_all();
         Ok(())
     }
