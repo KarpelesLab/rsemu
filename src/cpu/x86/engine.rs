@@ -167,42 +167,46 @@
 //! [`admit`] with a fetch-path translation and a world derivation in it — and
 //! that curve is flat past thirty-two.
 //!
-//! So the constant was chosen under callgrind instead, over 120 guest seconds
-//! of the same board — host instructions, which do not care what else is
-//! running on the machine, where the wall clock over those seven runs was
-//! 94-99 s against a load average of 13-16 and said nothing at all:
+//! So the constant was chosen under callgrind instead — host instructions,
+//! which do not care what else is running on the machine. The first choice was
+//! made over 120 guest seconds and landed on sixteen at the bottom of a U whose
+//! upper arm was **temporaries**, and that arm belonged to the seam rather than
+//! to this file: `jit::x86::rt`'s `Engine::run` did `temps.clear();
+//! temps.resize(block.temp_count(), 0)` on *every block execution*, so running a
+//! block had a term proportional to how many temporaries the whole block
+//! declared and none at all to how many instructions of it actually ran —
+//! exactly the wrong shape once a block may leave part-way through. That was 69
+//! host instructions per block execution at sixteen and **310 at thirty-two**.
+//!
+//! The seam no longer does it. `Engine::run` keeps one frame at the high-water
+//! mark of every block it has run and never clears it, which takes the zero-fill
+//! to 0.06 instructions per block execution at *both* values and deletes the
+//! upper arm of the U. Re-measured over 1 200 guest seconds of the same board,
+//! nine runs that each retired 2 051 816 640 guest instructions in a block and
+//! interpreted 19 069 320 — identical to the instruction, so nothing but the
+//! host cost differs:
 //!
 //! | [`MAX_INSNS`] | host instructions | against sixteen |
 //! | ---: | ---: | ---: |
-//! | 8 | 126 883 923 999 | +11.3% |
-//! | 12 | 119 242 292 987 | +4.6% |
-//! | **16** | **113 970 389 647** | — |
-//! | 32 | 127 814 496 905 | +12.2% |
-//! | 64 | 141 983 487 926 | +24.6% |
+//! | 8 | 1 648 143 347 872 | +5.8% |
+//! | 12 | 1 583 825 664 065 | +1.6% |
+//! | 16 | 1 558 317 676 940 | — |
+//! | 24 | 1 546 324 452 654 | −0.8% |
+//! | **32** | **1 531 989 462 623** | **−1.7%** |
+//! | 48 | 1 531 468 039 487 | −1.7% |
+//! | 64 | 1 532 158 352 347 | −1.7% |
 //!
-//! **Sixteen is the minimum of a U**, and both arms of it are worth naming
-//! because neither is the frontend.
+//! What is left is the lower arm on its own: going *down* costs block entries,
+//! at eight the same guest work cut into 438 M of them against 364 M, each one
+//! an [`admit`] with the pins, a world derivation, a fetch-path translation and
+//! a table probe in it. Past thirty-two the curve is flat to within 0.05%.
 //!
-//! Going *down* costs block entries: at eight the same guest work is cut into
-//! 438 M of them against 364 M, and each one is an [`admit`] — the pins, a
-//! world derivation, a fetch-path translation, a table probe.
-//!
-//! Going *up* costs **temporaries**, and that is a property of the seam rather
-//! than of this file. `jit::x86::rt`'s `Engine::run` does
-//! `temps.clear(); temps.resize(block.temp_count(), 0)` on **every block
-//! execution**, so running a block has a term proportional to how many
-//! temporaries the whole block declares and none at all to how many
-//! instructions of it actually run — which is exactly the wrong shape once a
-//! block may leave part-way through. Under callgrind that zeroing is 68 host
-//! instructions per block execution at sixteen and **923 at thirty-two**;
-//! nothing else in the profile moves by anything like that. It is also part of
-//! what [`Flags::Eager`] costs, since eager flags declare more temporaries per
-//! guest instruction than elided ones do.
-//!
-//! That is a `jit` change rather than an `x86` one — the IR verifier already
-//! requires every temporary to be assigned before it is read, so the zeroing
-//! is not load-bearing and a high-water-mark buffer would do — and it is
-//! recorded here because it is what decides this constant today.
+//! **Thirty-two is the constant that follows.** The numerical minimum is at
+//! forty-eight, by 0.034% — 521 M instructions out of 1.53 T, which is real and
+//! deterministic and not worth having: a raised exit flag is honoured within one
+//! block (`jit::dispatch`, "Safe points"), so [`MAX_INSNS`] is also the
+//! safe-point latency, and paying 50% more of it for 0.03% is the wrong trade.
+//! `docs/platforms/pc64.md` carries the measurement in full.
 //!
 //! ## What a mutation sweep says about this
 //!
@@ -321,9 +325,11 @@ const FLAGS: Flags = Flags::Eager;
 
 /// How many guest instructions one block may cover.
 ///
-/// Sixteen rather than `lift::MAX_INSNS`'s sixty-four, and the reason is the
-/// budget guard rather than the frontend — see the module docs.
-const MAX_INSNS: usize = 16;
+/// Thirty-two rather than `lift::MAX_INSNS`'s sixty-four. The budget guard
+/// that once forced sixteen is gone; what decides it now is that this number
+/// is also the safe-point latency, and the throughput curve is flat above
+/// thirty-two — see the module docs.
+const MAX_INSNS: usize = 32;
 
 /// How many blocks one [`advance`] may chain before it hands control back.
 ///
