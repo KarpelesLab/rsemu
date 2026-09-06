@@ -1310,6 +1310,11 @@ impl Device for Hart {
         let cfg = self.effective_config();
         let mut session = self.session.lock();
         session.state = State::new(&cfg);
+        // `State::new` drops the architectural reservation; the global half
+        // lives in the space and has to be dropped with it.
+        if let Some(monitor) = session.monitor.as_ref() {
+            monitor.clear();
+        }
         session.tlb.flush();
         // Translations are derived state and a reset is a topology-free way to
         // change every byte in RAM (`ROADMAP.md` §4.5).
@@ -1453,6 +1458,17 @@ impl Device for Hart {
         let pending = r.read_u64()?;
         let mut session = self.session.lock();
         session.state = s;
+        // The *global* half of the reservation is derived and is not in the
+        // chunk, so it is still whatever this hart last broadcast — a granule
+        // from before the restore. Leaving it would be unsound in the
+        // dangerous direction: an `sc` could succeed against a stale claim
+        // that a foreign store to the restored address no longer breaks.
+        // Dropping it costs one store-conditional failure, which the
+        // unprivileged ISA permits as an implementation-specific cause and
+        // which the eventuality guarantee tolerates because it happens once.
+        if let Some(monitor) = session.monitor.as_ref() {
+            monitor.clear();
+        }
         // The TLB is derived state and is never restored: it comes back empty,
         // which is always correct (`ROADMAP.md` §4.5). So are the
         // translations, which is half of why a snapshot is interchangeable

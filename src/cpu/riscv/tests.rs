@@ -609,6 +609,121 @@ fn a_sibling_harts_store_breaks_this_harts_reservation() {
     );
 }
 
+/// A restore drops the global half of the reservation as well as the local.
+///
+/// `State::reservation` is in the chunk; the slot this hart holds in the
+/// space's `ExclusiveMonitor` is derived and is not. So a rewind can restore a
+/// reservation on **A** while the broadcast claim is still live for a later
+/// granule **B** — and `ExclusiveMonitor::holds` takes no address, by design.
+/// An `sc.d` to A then passes both checks and succeeds, even though a foreign
+/// store to A happened in between. That is the unsound direction: the guest is
+/// told its atomic held when it did not.
+///
+/// Dropping the claim on restore costs one store-conditional failure, which
+/// Volume I permits as an implementation-specific cause and which the
+/// eventuality guarantee tolerates because it happens once per restore.
+#[test]
+fn a_restore_drops_the_global_reservation_too() -> Result<()> {
+    let mut cfg = Config::rv64i();
+    cfg.ext.a = true;
+    /// The granule the snapshot holds a reservation on.
+    const A: u64 = BASE + 0x400;
+
+    let ram = Arc::new(RamStore::new(RAM_SIZE));
+    let put = |at: u64, program: &[u32]| {
+        for (n, word) in program.iter().enumerate() {
+            for (k, byte) in word.to_le_bytes().iter().enumerate() {
+                ram.write_u8(at - BASE + n as u64 * 4 + k as u64, *byte)
+                    .unwrap();
+            }
+        }
+    };
+    let space = Arc::new(AddressSpace::new("mem", 64));
+    space
+        .topology()
+        .map(Region::ram("ram", Arc::clone(&ram)), BASE)
+        .unwrap();
+
+    // lr.d a0, (a1) with a1 = A: reserve A on both halves.
+    put(
+        BASE,
+        &[
+            lui(11, BASE as u32),
+            addi(11, 11, 0x400),
+            amo(0b00010, 3, 10, 11, 0),
+        ],
+    );
+    let hart = Hart::new(cfg.with_reset_vector(BASE));
+    hart.attach_space(Arc::clone(&space));
+    for _ in 0..3 {
+        hart.step();
+    }
+
+    let mut shape = MachineShape::new();
+    shape.add_device("hart", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("hart", CLASS.name, CLASS.version)?;
+        hart.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    // Move the broadcast claim off A by reserving a different granule, which
+    // is what any further execution before a rewind would do.
+    put(
+        BASE,
+        &[
+            lui(11, BASE as u32),
+            addi(11, 11, 0x480),
+            amo(0b00010, 3, 10, 11, 0),
+        ],
+    );
+    hart.reset(ResetKind::Cold);
+    for _ in 0..3 {
+        hart.step();
+    }
+
+    // Rewind: architecturally the hart holds A again.
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("hart", CLASS.name, CLASS.version, &Migrations::new())?;
+    let mut cr = chunk.reader();
+    hart.load(&mut cr)?;
+    cr.end()?;
+
+    // Somebody else writes A. That must break the restored reservation.
+    for (k, byte) in 7u64.to_le_bytes().iter().enumerate() {
+        ram.write_u8(A - BASE + k as u64, *byte).unwrap();
+    }
+
+    // sc.d a3, a2, (a1) with a1 = A must now fail.
+    put(
+        BASE,
+        &[
+            lui(11, BASE as u32),
+            addi(11, 11, 0x400),
+            addi(12, 0, 99),
+            amo(0b00011, 3, 13, 11, 12),
+        ],
+    );
+    hart.set_pc(BASE);
+    for _ in 0..4 {
+        hart.step();
+    }
+
+    assert_eq!(
+        hart.x(13),
+        1,
+        "the store-conditional must fail: A was written after the restore, so a \
+         restore must not leave a stale broadcast claim standing"
+    );
+    assert_eq!(
+        read_u64(&ram, A),
+        7,
+        "the foreign write must still be there"
+    );
+    Ok(())
+}
+
 /// The reservation set is the naturally aligned **word**, not the cache line
 /// it happens to sit on.
 ///
