@@ -925,3 +925,198 @@ fn ports_whose_fabric_is_gone_master_abort() {
         .write(4, &[0x12, 0x34, 0x56, 0x78], MemAttrs::DEFAULT)
         .expect("an unclaimed write is not an error");
 }
+
+// ---------------------------------------------------------------------------
+// the owed retopology
+// ---------------------------------------------------------------------------
+
+/// A function with one memory BAR, which reports and settles what it owes the
+/// way every real one does.
+#[derive(Debug)]
+struct Carded {
+    config: Mutex<ConfigSpace>,
+    bars: Bars,
+}
+
+impl Carded {
+    fn new() -> Arc<Carded> {
+        let mut config = ConfigSpace::new();
+        config.hardwire(config::VENDOR_ID, 0x1af4, 2);
+        config.allow(config::COMMAND, 2);
+        Arc::new(Carded {
+            config: Mutex::with_rank(LockRank::DEVICE, config),
+            bars: Bars::new()
+                .with(
+                    0,
+                    Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
+                )
+                .expect("BAR0 is free"),
+        })
+    }
+
+    fn command(&self) -> u16 {
+        let c = self.config.lock();
+        u16::from(c.byte(config::COMMAND)) | u16::from(c.byte(config::COMMAND + 1)) << 8
+    }
+}
+
+impl PciFunction for Carded {
+    fn config_read(&self, offset: u16, dst: &mut [u8], _attrs: MemAttrs) {
+        self.config.lock().read(offset, dst);
+        self.bars.config_read(offset, dst);
+    }
+
+    fn config_write(&self, offset: u16, src: &[u8], _attrs: MemAttrs) {
+        let moved = self.bars.config_write(offset, src);
+        let changed = self.config.lock().write(offset, src);
+        if moved || changed || self.bars.is_stale() {
+            self.bars.sync(self.command(), false);
+        }
+    }
+
+    fn retopology_owed(&self) -> bool {
+        self.bars.is_stale()
+    }
+
+    fn settle(&self) {
+        self.bars.sync(self.command(), false);
+    }
+}
+
+/// The defect this seam exists for: a configuration cycle that is itself a
+/// *memory* access cannot retopologise the memory space, and no later
+/// configuration cycle of the same kind can either.
+///
+/// The guard held across the writes below stands in for the read guard an ECAM
+/// access holds on the space it is travelling through — the same condition, and
+/// the only way to reach it without a whole q35 in the test.
+#[test]
+fn a_function_that_could_not_place_its_window_says_so_and_the_fabric_settles_it() {
+    let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let bus = Arc::new(PciBus::new());
+    let card = Carded::new();
+    card.bars.install(&space, 0).expect("nothing is there yet");
+    let at = Bdf::new(0, 4, 0).expect("a legal address");
+    bus.attach(at, Arc::clone(&card) as Arc<dyn PciFunction>)
+        .expect("the slot is empty");
+    assert!(!bus.retopology_owed(), "nothing is owed on a fresh fabric");
+
+    {
+        // Everything inside this block is what a BAR write through ECAM does:
+        // the space the window goes in is already held, so the try-lock fails
+        // and every retry fails with it.
+        let _held = space.topology();
+        bus.config_write(
+            at,
+            config::BAR0,
+            &0x8000_0000u32.to_le_bytes(),
+            MemAttrs::DEFAULT,
+        );
+        bus.config_write(
+            at,
+            config::COMMAND,
+            &config::COMMAND_MEMORY.to_le_bytes(),
+            MemAttrs::DEFAULT,
+        );
+        assert!(
+            bus.retopology_owed(),
+            "the fabric knows a function came out of a cycle owing a retopology"
+        );
+    }
+    assert_eq!(
+        space.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "and until something settles it, the card decodes nothing — which is \
+         exactly what a UEFI guest saw: every register all ones"
+    );
+
+    assert!(!bus.settle(), "with the space free, one sweep is enough");
+    assert!(!bus.retopology_owed());
+    assert_eq!(
+        space.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "the window is where the register said all along"
+    );
+}
+
+/// A sweep that cannot get the space leaves the fabric owing, and says so.
+#[test]
+fn a_sweep_that_still_cannot_have_the_space_leaves_the_fabric_owing() {
+    let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let bus = Arc::new(PciBus::new());
+    let card = Carded::new();
+    card.bars.install(&space, 0).expect("nothing is there yet");
+    let at = Bdf::new(0, 4, 0).expect("a legal address");
+    bus.attach(at, Arc::clone(&card) as Arc<dyn PciFunction>)
+        .expect("the slot is empty");
+
+    let held = space.topology();
+    bus.config_write(
+        at,
+        config::BAR0,
+        &0x8000_0000u32.to_le_bytes(),
+        MemAttrs::DEFAULT,
+    );
+    bus.config_write(
+        at,
+        config::COMMAND,
+        &config::COMMAND_MEMORY.to_le_bytes(),
+        MemAttrs::DEFAULT,
+    );
+    assert!(bus.settle(), "the sweep ran and got nowhere");
+    assert!(
+        bus.retopology_owed(),
+        "so the flag survives it and the next round tries again"
+    );
+    drop(held);
+    assert!(!bus.settle());
+    assert_eq!(
+        space.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a)
+    );
+}
+
+/// Sizing a register asks nothing of the address space, so it must not leave
+/// anything owed.
+///
+/// Firmware writes all-ones to a BAR, reads the mask back and writes the base,
+/// all with `COMMAND[1]` still clear. Nothing decodes through any of it, so
+/// there is nothing to place — and a `sync` that opened a topology guard for
+/// that would also be a `sync` that marked the function stale and asked the
+/// scheduler to come back, once per configuration write, for the whole
+/// enumeration.
+#[test]
+fn the_sizing_sweep_asks_nothing_of_the_address_space() {
+    let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let bus = Arc::new(PciBus::new());
+    let card = Carded::new();
+    card.bars.install(&space, 0).expect("nothing is there yet");
+    let at = Bdf::new(0, 4, 0).expect("a legal address");
+    bus.attach(at, Arc::clone(&card) as Arc<dyn PciFunction>)
+        .expect("the slot is empty");
+
+    let _held = space.topology();
+    bus.config_write(
+        at,
+        config::BAR0,
+        &0xffff_ffffu32.to_le_bytes(),
+        MemAttrs::DEFAULT,
+    );
+    let mut mask = [0u8; 4];
+    bus.config_read(at, config::BAR0, &mut mask, MemAttrs::DEFAULT);
+    assert_eq!(
+        u32::from_le_bytes(mask) & 0xffff_fff0,
+        0xffff_f000,
+        "a 4 KiB window sizes to a 4 KiB mask (Rev 2.1 §6.2.5.1)"
+    );
+    bus.config_write(
+        at,
+        config::BAR0,
+        &0x8000_0000u32.to_le_bytes(),
+        MemAttrs::DEFAULT,
+    );
+    assert!(
+        !bus.retopology_owed(),
+        "nothing decoded before or after, so nothing was owed at any point"
+    );
+}

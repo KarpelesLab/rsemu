@@ -128,6 +128,8 @@ neither committed (`scripts/fetch-testdata.sh ovmf`):
 
 ### It reaches the UEFI Shell, and the shell answers what is typed at it
 
+With nothing on the PCI bus — the disk is [further down](#the-disk-and-the-one-thing-between-this-board-and-an-operating-system):
+
 ```text
 BdsDxe: loading Boot0001 "EFI Internal Shell" from Fv(...)/FvFile(...)
 BdsDxe: starting Boot0001 "EFI Internal Shell" from Fv(...)/FvFile(...)
@@ -148,13 +150,15 @@ and the one `PlatformBootManagerLib` puts a terminal on. `ver` is typed by
 path is round trip: guest output drives the keystroke, and the keystroke's reply
 ends the run.
 
-**Every virtual-time figure in this section predates the disk controller.** The
-prompt now arrives at 815,584 ms rather than 367,174, and the 448-second
-difference is `NvmExpressDxe` waiting out timeouts on a window that does not
-decode — ["The disk"](#the-disk-and-the-one-thing-between-this-board-and-an-operating-system)
-has why. The numbers below are still the right ones to compare the three
-engines against each other, because all three pay the same wait; they are the
-wrong ones to quote for how long a boot takes today.
+**The virtual-time figures in this section were measured without a disk
+controller.** With one on the bus the prompt arrives at **372.3 seconds** rather
+than 367.2 — the extra five seconds are `PciBusDxe` and `NvmExpressDxe` doing
+real work — and the shell that comes up is the one on the disk rather than the
+one inside the firmware volume. In between those two numbers there was a run
+that took 815.6 seconds, and the 444-second difference was `NvmExpressDxe`
+waiting out timeouts on a window that never decoded;
+["The disk"](#the-disk-and-the-one-thing-between-this-board-and-an-operating-system)
+has that whole story.
 
 The whole thing was **367.2 seconds of virtual time** — a couple of
 minutes of host time under the interpreter, and under a minute under `jit-host`
@@ -532,63 +536,100 @@ the driver's private structure (found by its `NVME` signature, which the
 register `RDI` was left holding pointed straight at) confirms it: `Cap` is
 sixteen `ff` bytes.
 
-### Why the window is dead, and why looking at it makes it work
+### Why the window was dead, and why looking at it made it work
 
 `src/bus/pci/bar.rs`'s module docs describe the hard case exactly, under
 "Moving a mapping from inside a configuration write". A BAR write arrives
 *inside* an address-space access, so that space's topology lock is already held
 for reading; taking the blocking write guard would invert `core::sync`'s
 ladder. `Bars::sync` therefore uses the order-exempt `try_topology`, and when
-that fails it sets a `stale` flag and re-applies **at the next configuration
-access**. The file states the assumption that makes this safe:
+that fails it sets a `stale` flag. What the flag used to wait for was **the
+next configuration access**, on an assumption the file stated plainly:
 
 > A configuration cycle **travels through the I/O space** […] the retry at the
 > next configuration access fails for the same reason, for ever.
 
-It says that of an *I/O* BAR, and refuses to map one at all. But a q35 has a
+It said that of an *I/O* BAR, and refused to map one at all. But a q35 has a
 second route to configuration space — **ECAM, in the memory space** — and
-through it every BAR is in precisely that position. The write is a memory
-access, so `try_topology` on the memory space cannot succeed; neither can the
-retry, or the one after that. A firmware that never touches `0xcf8` never heals
+through it every BAR was in precisely that position. The write is a memory
+access, so `try_topology` on the memory space cannot succeed; neither could the
+retry, or the one after that. A firmware that never touches `0xcf8` never healed
 it, and a UEFI firmware on a q35 never touches `0xcf8`.
 
-`tests/q35_uefi.rs` reproduces it in sixty milliseconds with no firmware at
-all, and it is committed `#[ignore]`d as a reproduction the way
-`tests/kvm_q35_linux_smp.rs` was:
+`tests/q35_uefi.rs` reproduces it in sixty milliseconds with no firmware at all
+— `the_disk_controllers_window_decodes_when_ecam_placed_it`, which was committed
+`#[ignore]`d as a reproduction the way `tests/kvm_q35_linux_smp.rs` was, and now
+runs on every `cargo test`.
 
-```console
-cargo test --release --features machine-q35-uefi --test q35_uefi -- \
-    --ignored --nocapture ecam
-after ECAM: 0xffffffff, after a conf1 access: 0x010103ff
-```
+Its second half is a control and also a warning about instruments. One
+configuration access through the *port* space does not hold the memory space's
+topology, and through it the window appeared at once. `report_chipset` and
+`report_nvme` reach configuration space that way, so **every register they
+printed looked perfect because looking at it fixed it** — which is why the
+post-mortem above showed a placed BAR and a readable `CAP` while the guest saw
+neither. A probe that paraphrases a defect can repair it before you look.
 
-The second half of that line is the proof and also a warning about
-instruments. One configuration access through the *port* space — mechanism #1,
-which does not hold the memory space's topology — and the window appears at
-once. `report_chipset` and `report_nvme` reach configuration space that way, so
-**every register they print looks perfect because looking at it fixed it**.
-That is why the post-mortem above shows a placed BAR and a readable `CAP` while
-the guest saw neither.
+This was not a UEFI problem and not a q35-uefi problem. Any guest on any board
+in this tree that programmed a BAR through MMCONFIG got a function that answered
+its configuration space and decoded nothing; `q35-linux` escaped it because
+Linux assigns its resources through `0xcf8` before MMCONFIG is up.
 
-This is not a UEFI problem and not a q35-uefi problem. Any guest on any board
-in this tree that programs a BAR through MMCONFIG gets a function that answers
-its configuration space and decodes nothing; `q35-linux` escapes it because
-Linux assigns its resources through `0xcf8` before MMCONFIG is up. Two fixes
-are open and both are outside this page: the `Deferred` action `bar.rs` already
-names, landing a scheduler quantum later, or an "owed retopology" the space
-drains when its last read guard goes.
+### What fixed it: the retry moved off the access path entirely
 
-### What it costs while it is unfixed
+Two routes were open. The `Deferred` action `bar.rs` already named is not
+reachable from here — `PciFunction::config_write` has no deferred queue and
+neither does `MemOps`, so spelling it that way means threading one through every
+device's MMIO path, which is a `core` change and a large one. An "owed
+retopology" the address space drains when its last read guard goes is closer to
+the hardware's ordering, but it puts a callback registry and a try-lock on the
+hottest path in the emulator to serve an event that happens a few dozen times
+per boot — and it would still have to be a *try*-lock, because the CPU's
+`BUS`-ranked lock is held there and `TOPOLOGY` sits above `BUS`. It is not more
+reliable than the alternative, only more expensive.
 
-The shell still comes up and still answers `map: No mapping found.` — the
-`RELEASE` build's `ASSERT` is compiled out, so `NvmExpressDxe` waits out its
-timeouts, fails its `Start`, and BDS carries on. `CAP.TO` reads as ones with
-the rest of the register, which the driver reads as 128 seconds per wait, so
-the prompt now arrives at **815,584 ms** of virtual time rather than 367,174.
-Those 450 seconds are a measurement of the defect and go away with it;
-`DEFAULT_MS` in the test is 900,000 for the same reason.
+The alternative was already in this tree, one file away. `q35.mch` met exactly
+this problem for its own `PCIEXBAR` window — which is also moved by a
+configuration write that arrives through ECAM — and answered it with a **clock
+domain**: `Device::advance_to` runs from the run loop with no access in flight,
+which is the moment a topology guard is actually available. So the same
+mechanism now covers the whole fabric rather than one bridge's own registers:
 
-### The fixture that is waiting for it
+* `PciFunction` gained `retopology_owed` and `settle`, defaulting to "nothing
+  owed"; the four functions in the tree that carry `Bars` answer them.
+* `PciBus` keeps one lock-free flag, raised by any configuration cycle that
+  leaves a function owing, and `PciBus::settle` is the sweep that drains it.
+* `q35.mch` — the one object on the board that both knows every function and
+  holds a clock domain — asks for the next tick while anything is owed and runs
+  the sweep from `advance_to`.
+
+The bound is one scheduler round, and a round on this board is capped at
+`max_ticks_per_quantum` = 10 000 processor cycles rather than at the quantum's
+1 ms. **A window placed through ECAM therefore decodes late** — within a few
+thousand guest instructions of the write, where real firmware programs every BAR
+in `PciBusDxe` and reads the first device register in a different driver
+entirely. That is the honest cost of not having a `Deferred` on the access path,
+and it is written down in `bar.rs` rather than left to be discovered.
+
+One thing that fell out of it: `Bars::sync` now knows what it already placed, so
+the sizing sweep — all-ones, read the mask, write the base, `COMMAND[1]` clear
+throughout — asks nothing of the address space at all. It used to flatten the
+space once per configuration write and mark the function stale each time.
+
+Boards with no q35 bridge are unaffected and need to be: a 440FX has one route
+to configuration space, it is in the I/O space, and `bar.rs`'s original retry
+works there. Every board in this tree that publishes ECAM uses `q35.mch`.
+
+### What it cost while it was unfixed
+
+The shell still came up and still answered `map: No mapping found.` — the
+`RELEASE` build's `ASSERT` is compiled out, so `NvmExpressDxe` waited out its
+timeouts, failed its `Start`, and BDS carried on. `CAP.TO` read as ones with the
+rest of the register, which the driver reads as 128 seconds per wait, so the
+prompt arrived at **815,584 ms** of virtual time rather than 367,174. Those 444
+seconds were a measurement of the defect and went away with it; `DEFAULT_MS` in
+the test is back down, to 480,000.
+
+### And then the firmware boots off it
 
 `scripts/fetch-testdata.sh esp` builds the disk, into the same ignored
 directory as everything else and committed no more than the firmware is: a
@@ -605,13 +646,96 @@ builds either from a TOML spec — `examples/efi-disk.toml` is exactly this
 image — once its CLI is installable here, and that is the better answer the day
 a board wants a realistic disk.
 
+With the window decoding, BDS finds the disk, makes a boot option out of it and
+starts the application on it. Every line of this is a byte the guest wrote to
+COM1:
+
+```text
+BdsDxe: loading Boot0001 "UEFI RSEMU NVME CONTROLLER RSEMU000000000000000 1"
+    from PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,00-00-00-00-00-00-00-00)
+BdsDxe: starting Boot0001 "UEFI RSEMU NVME CONTROLLER RSEMU000000000000000 1"
+    from PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,00-00-00-00-00-00-00-00)
+UEFI Interactive Shell v2.2
+EDK II
+UEFI v2.70 (EDK II, 0x00010000)
+Mapping table
+      FS0: Alias(s):F0:;BLK0:
+          PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,00-00-00-00-00-00-00-00)
+Shell> echo rsemu: startup.nsh ran off %hostname%FS0
+rsemu: startup.nsh ran off FS0
+Shell> map -b
+Mapping table
+      FS0: Alias(s):F0:;BLK0:
+          PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,00-00-00-00-00-00-00-00)
+Shell> ls fs0:
+Directory of: fs0:\
+09/06/2026  11:56 <DIR>           512  EFI
+09/06/2026  11:56                  55  startup.nsh
+          1 File(s)          55 bytes
+          1 Dir(s)
+```
+
+Three separate claims in that, and the third is the one that matters. `FS0:`
+says the **block device** was enumerated; `map -b` and `ls` say a **file
+system** was mounted on it; and `startup.nsh` says a *file was read off it and
+executed*, which is the only one of the three that could not have come from a
+correctly-shaped device that returns nothing. The shell printing the banner is
+itself the fourth: it is `\EFI\BOOT\BOOTX64.EFI` off this volume, not the one
+in the firmware volume, which is what `BdsDxe: starting Boot0001 … NVMe(0x1…)`
+names.
+
+### A kernel entered through its EFI stub
+
 `RSEMU_ESP_KERNEL` and `RSEMU_ESP_INITRD` put a `bzImage` and an initramfs
-beside the application. That is the stretch this board is aimed at and has not
-reached: a modern `bzImage` **is** a PE/COFF EFI application, so the shell can
-launch one with a command line of its own — `fs0:\vmlinuz.efi console=ttyS0
-initrd=\initrd.img` — and a kernel would reach userspace with the firmware,
-not a loader, having placed it. Every part of that is in the tree except a disk
-the firmware can read.
+beside the application. A modern `bzImage` **is** a PE/COFF EFI application, so
+the shell launches one with a command line of its own and the firmware — not a
+loader — is what placed it:
+
+```console
+RSEMU_ESP_KERNEL=/boot/vmlinuz RSEMU_ESP_INITRD=testdata/x86/initramfs-x86.cpio \
+    scripts/fetch-testdata.sh esp --force
+
+RSEMU_OVMF_CODE=testdata/x86/OVMF_CODE.fd \
+RSEMU_OVMF_VARS=testdata/x86/OVMF_VARS.fd \
+RSEMU_OVMF_DISK=testdata/x86/esp.img \
+RSEMU_OVMF_EXTMEM=1G \
+RSEMU_OVMF_MS=4000000 \
+RSEMU_OVMF_INPUT='Shell> =>fs0:\\vmlinuz.efi initrd=\\initrd.img console=ttyS0,115200 nokaslr cryptomgr.notests\r' \
+    cargo test --release --features machine-q35-uefi --test q35_uefi -- \
+        --nocapture a_uefi_firmware
+```
+
+```text
+EFI stub: Loaded initrd from command line option
+[    0.000000] Linux version 6.6.67-gentoo-x86_64 ... #1 SMP PREEMPT_DYNAMIC
+[    0.000000] efi: EFI v2.7 by EDK II
+[    0.000000] printk: console [ttyS0] enabled
+[    0.039999] tsc: Detected 25.779 MHz processor
+[   45.262356] smpboot: Total of 1 processors activated (51.70 BogoMIPS)
+[  482.358601] x86/mm: Checked W+X mappings: passed, no W+X pages found.
+[  482.392389] Run /init as init process
+
+rsemu initramfs on Linux 6.6.67-gentoo-x86_64 x86_64
+rsemu# uname -srm
+Linux 6.6.67-gentoo-x86_64 x86_64
+```
+
+**That is an operating system booted through UEFI**, and every link in it is
+this repository's: the firmware read the `bzImage` and the initramfs off a FAT
+volume on an emulated NVMe namespace, `LoadImage`/`StartImage`'d a PE/COFF
+kernel, handed it a memory map and a system table, and the kernel came up on the
+board's 16550 and ran `/init`. 1,337 seconds of virtual time end to end — 372 of
+them the firmware — and about nine minutes of host time under the interpreter.
+
+Two things about that boot are worth writing down rather than rounding up.
+**There is no MADT**: `APIC: ACPI MADT or MP tables are not detected`, and the
+kernel falls back to virtual wire mode, because this OVMF builds its ACPI tables
+from `fw_cfg` and this board has none. That is a gap in the board, not in the
+kernel, and it is the next thing to close if this path is to be more than a
+demonstration. And the kernel's `ftrace` self-check and `DEBUG_WX` page-table
+walk each trip the soft-lockup watchdog — 45 896 ftrace entries and a whole
+kernel page table walked at 51 BogoMIPS really is thirty seconds of guest
+time — which is the emulator being slow rather than wrong.
 
 ## What is not reached yet
 
@@ -674,21 +798,22 @@ RSEMU_OVMF_VARS=testdata/x86/OVMF_VARS.fd \
         a_variable_written_at_the_shell_is_there_after_a_reboot
 ```
 
-It costs two boots — about seven minutes of host time under `jit-host` on an
-idle machine, and more than twice that under the interpreter — and neither
+It costs two boots — about two minutes of host time under `jit-host` on an idle
+machine, and rather more than twice that under the interpreter — and neither
 image is modified: the bank the second boot starts from is the medium the first
-flushed to, in memory. It used to be two minutes; the difference is the
-450 seconds of virtual time per boot that `NvmExpressDxe` spends timing out,
-and it goes away with the defect above.
+flushed to, in memory. It briefly cost seven; the difference was the 444 seconds
+of virtual time per boot that `NvmExpressDxe` spent timing out on a window that
+never decoded, and it went away with the defect above.
 
-`tests/q35_uefi.rs` has the whole variable table. The three tests that do *not*
+`tests/q35_uefi.rs` has the whole variable table. The tests that do *not*
 need an image run on every `cargo test`: that the two banks are one contiguous
 run up to the reset vector, that the variable bank answers the byte-wide probe
 `QemuFlashDetected` opens with — the whole sequence, not just its first cycle,
 which is the difference between the test that passed while nothing was written
-and the one that is there now — and that a program clears bits while only an
-erase puts them back, asked of the board, through its address space, at the
-width the driver uses.
+and the one that is there now — that a program clears bits while only an erase
+puts them back, asked of the board, through its address space, at the width the
+driver uses, and that a base address register decodes wherever it was
+programmed from, through **both** windows onto configuration space.
 
 ## The ledger
 
@@ -710,13 +835,14 @@ width the driver uses.
 | a variable written in one run present in the next | **works** — `setvar` at the shell in one boot, read back at the shell in the next, across two machines sharing only the bank's bytes |
 | `BootOrder`, `Boot000n`, `Timeout`, `ConIn`/`ConOut` in the store | **works** — 5,799 programmed bytes where the shipped image had 127 |
 | an NVMe controller at `00:04.0`, enumerated and bound | **works** — `PciBusDxe` sizes and places its window and `NvmExpressDxe` enables memory space and bus mastering |
-| the driver reading a register out of that window | **no** — a BAR programmed through ECAM never decodes, so `CAP` reads all-ones; `src/bus/pci/bar.rs`, reproduced hermetically and ledgered above |
-| a file system on that disk, `map` finding an `FS0:` | not reached, and blocked only by the row above |
-| an EFI application started off the disk | not reached; the fixture that would be started is built by `scripts/fetch-testdata.sh esp` |
-| a Linux kernel entered through its EFI stub | not reached; `RSEMU_ESP_KERNEL` puts one on the fixture against the day it is |
+| the driver reading a register out of that window | **works** — and it took the fix above: a BAR programmed through ECAM used to never decode at all |
+| a file system on that disk, `map` finding an `FS0:` | **works** — `FS0:` on `PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,…)`, and `startup.nsh` read off it and executed |
+| an EFI application started off the disk | **works** — `BdsDxe: starting Boot0001 … from …/NVMe(0x1,…)`, which is `\EFI\BOOT\BOOTX64.EFI` on the volume rather than the shell in the firmware volume |
+| a Linux kernel entered through its EFI stub | **works** — a Gentoo 6.6.67 `bzImage` and its initramfs read off the ESP by the firmware, `Run /init as init process`, and `uname -srm` answered at a shell |
+| that kernel finding an APIC | **no** — `APIC: ACPI MADT or MP tables are not detected`: this OVMF builds its ACPI tables from `fw_cfg` and the board has none, so the kernel takes virtual wire mode |
 | SMRAM / SMM | not modelled, **and not what was stopping the variable writes**; a non-`SMM_REQUIRE` OVMF never touches it, and [`q35.md`](q35.md) records the gap |
 | `fw_cfg` | absent, and deliberately: EDK II degrades cleanly when the signature at `0x510` does not read `QEMU`, and everything above happened without it |
-| a boot device | an NVMe controller is on the bus and cannot be read; the four rows above are the ledger of it, and the shell still finds `map: No mapping found.` |
+| a boot device | **works** — an NVMe namespace with a FAT volume on it, found by BDS, mounted by the shell, and booted from |
 
 ## Sources
 

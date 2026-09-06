@@ -271,6 +271,21 @@ impl PciFunction for Function {
             self.bars.sync(command, false);
         }
     }
+
+    fn retopology_owed(&self) -> bool {
+        // What the fabric asks after every configuration cycle, so that a
+        // window this function could not place has somewhere to be placed from.
+        self.bars.is_stale()
+    }
+
+    fn settle(&self) {
+        // Still the order-exempt try-lock. This runs from `Device::advance_to`,
+        // which the run loop calls with no access in flight — but a sibling
+        // thread's access can hold the space, and blocking there would invert
+        // `core::sync`'s ladder. A failure leaves the function owed, and it is
+        // asked again next round.
+        self.bars.sync(self.command(), false);
+    }
 }
 
 // ---------------------------------------------------------------------------

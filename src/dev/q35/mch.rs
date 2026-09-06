@@ -131,6 +131,24 @@
 //! access in flight, which is the moment a topology guard is actually
 //! available. The comment on those methods below carries the argument.
 //!
+//! ## And the same service for every function on the fabric
+//!
+//! That paragraph used to end by saying [`crate::bus::pci::bar`] never met the
+//! problem. It does — the argument above is about *any* mapping moved by a
+//! configuration write, and a base address register is one. A BAR programmed
+//! through ECAM never decoded at all: the function answered its configuration
+//! space perfectly and its registers read as `0xff` for ever, which is what
+//! stood between this board and a UEFI-booted operating system.
+//!
+//! So the bridge drains the whole fabric, not only its own registers.
+//! [`PciBus::settle`](crate::bus::pci::PciBus::settle) is the sweep and
+//! [`PciBus::retopology_owed`](crate::bus::pci::PciBus::retopology_owed) is the
+//! lock-free flag that says whether it is worth running; this device is what
+//! calls them, because it is the one object on the board that both knows every
+//! function and holds a clock domain. A board with no q35 bridge is unaffected
+//! and needs to be: a 440FX has one route to configuration space, it is in the
+//! I/O space, and `bar.rs`'s original retry works there.
+//!
 //! # What is not modelled
 //!
 //! Everything in Table 5-1 that a boot does not read. `MCHBAR`, `PXPEPBAR`,
@@ -947,13 +965,22 @@ impl Device for Mch {
         if self.regs.stale.load(Ordering::Relaxed) {
             self.regs.sync(false);
         }
+        // And the same service for every function on the fabric. A base address
+        // register is moved by a configuration write exactly as `PCIEXBAR` is,
+        // and through ECAM that write is a memory access, so `bar.rs`'s retry
+        // at the next configuration access can never land either. The bridge is
+        // the one object on this board that both knows every function and has a
+        // moment with no access in flight, so the drain is its job.
+        if self.bus.retopology_owed() {
+            self.bus.settle();
+        }
     }
 
     fn next_event_tick(&self) -> Option<u64> {
         // Strictly greater than `current_tick`, or catch-up makes no progress.
-        self.regs
-            .stale
-            .load(Ordering::Relaxed)
+        // Both flags are plain atomic loads, which `LazyDevice::next_event_tick`
+        // requires: the scheduler asks this under its own leaf lock.
+        (self.regs.stale.load(Ordering::Relaxed) || self.bus.retopology_owed())
             .then(|| self.regs.tick.load(Ordering::Relaxed) + 1)
     }
 

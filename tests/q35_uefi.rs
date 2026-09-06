@@ -1,22 +1,23 @@
 //! Does `q35-uefi` assemble, do its two flash banks behave like flash, and does
 //! a real UEFI firmware boot on it and **keep what it writes**?
 //!
-//! Six of the questions need nothing downloaded and run on every
+//! Seven of the questions need nothing downloaded and run on every
 //! `cargo test`: that the code bank ends at the reset vector, that the variable
 //! bank answers the detection probe EDK II's `OvmfPkg` flash driver opens with
 //! — byte by byte, exactly as `QemuFlashDetected` issues it — that a
-//! program clears bits while only an erase puts them back, and three about the
+//! program clears bits while only an erase puts them back, and four about the
 //! **disk**: that `00:04.0` is the class code `NvmExpressDxe` binds on, that
 //! `CAP` survives the single 64-bit read that driver makes of it, and that its
-//! window decodes where a base address register was told to put it.
+//! window decodes where a base address register was told to put it — through
+//! **both** routes to configuration space, because for a while it only did
+//! through one.
 //!
-//! The last of those is `#[ignore]`d, because it **fails**. It is committed as
-//! a reproduction of the one thing standing between this board and an
-//! operating system: a BAR programmed through the ECAM window never decodes,
-//! so a UEFI firmware enumerates the controller, binds a driver to it and then
-//! reads `0xffffffff` out of every register. See
-//! [`the_disk_controllers_window_decodes_when_ecam_placed_it`] for the
-//! mechanism and `docs/platforms/q35-uefi.md` for what it costs.
+//! [`the_disk_controllers_window_decodes_when_ecam_placed_it`] was committed
+//! `#[ignore]`d as a reproduction of the one thing standing between this board
+//! and an operating system: a BAR programmed through the ECAM window never
+//! decoded, so a UEFI firmware enumerated the controller, bound a driver to it
+//! and then read `0xffffffff` out of every register. It passes now, and its
+//! own doc comment has the mechanism.
 //!
 //! The other two need a firmware and are gated on `RSEMU_OVMF_CODE`, exactly as
 //! `tests/q35_linux.rs` is gated on `RSEMU_KERNEL` and for the same reasons: the
@@ -62,7 +63,9 @@
 //!
 //! What it gets to is in [`docs/platforms/q35-uefi.md`](../docs/platforms/q35-uefi.md):
 //! a UEFI Shell prompt that answers what is typed at it, on all three engines,
-//! at the same virtual instant.
+//! at the same virtual instant — and, with `RSEMU_OVMF_DISK` and a kernel on
+//! the fixture, a Linux 6.6 userspace entered through the EFI stub off that
+//! disk.
 
 #![cfg(all(
     feature = "cpu-x86",
@@ -96,21 +99,22 @@ use x86boot::Script;
 /// A ceiling rather than a target: the run stops early when the processor stops
 /// making progress or when the guest prints `RSEMU_OVMF_STOP_AT`.
 ///
-/// Fifteen minutes of virtual time, because the UEFI Shell prompt arrives at
-/// about **816** seconds of it and a ceiling below that is a run that ends in
+/// Eight minutes of virtual time, because the UEFI Shell prompt arrives at
+/// about **372** seconds of it and a ceiling below that is a run that ends in
 /// BDS having printed nothing — which the assertions here read as a failure,
 /// and rightly, since a firmware that never reaches a console is a firmware
 /// nothing can be said about. A shorter ceiling is `RSEMU_OVMF_MS`.
 ///
-/// It used to be 420 000, and the shell used to arrive at 367 000. The
-/// difference is **`NvmExpressDxe` timing out**: the controller at `00:04.0`
-/// is enumerated and bound, and then every register it reads is `0xffffffff`,
-/// because a BAR programmed through the ECAM window does not decode
-/// ([`the_disk_controllers_window_decodes_when_ecam_placed_it`]). `CAP.TO`
-/// reads as ones with the rest, which the driver takes for 128 seconds per
-/// wait. So 450 of these 816 seconds are a measurement of that defect and go
-/// away with it.
-const DEFAULT_MS: u64 = 900_000;
+/// It was 900 000, and the shell used to arrive at 816 000. The difference was
+/// **`NvmExpressDxe` timing out**: the controller at `00:04.0` was enumerated
+/// and bound, and then every register it read was `0xffffffff`, because a BAR
+/// programmed through the ECAM window did not decode
+/// ([`the_disk_controllers_window_decodes_when_ecam_placed_it`]). `CAP.TO` read
+/// as ones with the rest, which the driver takes for 128 seconds per wait. So
+/// 444 of those 816 seconds were a measurement of that defect, and they went
+/// away with it. Booting an operating system off the disk needs far longer than
+/// either number and names its own ceiling.
+const DEFAULT_MS: u64 = 480_000;
 
 /// The top of the address space, which is where the flash ends.
 const TOP: u64 = 0x1_0000_0000;
@@ -555,84 +559,117 @@ fn the_disk_controllers_capabilities_survive_a_single_64_bit_read() {
 
 /// The same window, placed the way a **UEFI** firmware places it: through ECAM.
 ///
-/// **This test fails, and it is committed `#[ignore]`d as a reproduction** —
-/// `tests/kvm_q35_linux_smp.rs` set the precedent. It is the whole of what
-/// stands between this board and an operating system, it takes 60 milliseconds
-/// to demonstrate, and it is not a UEFI problem at all: *any* guest that
-/// programs a base address register through the memory-mapped configuration
-/// window gets a function that answers its configuration space and decodes
-/// nothing.
-///
-/// ```console
-/// cargo test --release --features machine-q35-uefi --test q35_uefi -- \
-///     --ignored --nocapture ecam
-/// after ECAM: 0xffffffff, after a conf1 access: 0x010103ff
-/// ```
+/// **This test was committed `#[ignore]`d as a reproduction and now passes.**
+/// It was the whole of what stood between this board and an operating system,
+/// and it was not a UEFI problem at all: *any* guest that programmed a base
+/// address register through the memory-mapped configuration window got a
+/// function that answered its configuration space and decoded nothing.
 ///
 /// The mechanism is written down in `src/bus/pci/bar.rs`'s own module docs,
 /// under "Moving a mapping from inside a configuration write". A BAR write
 /// arrives inside an address-space access, so the space's topology lock is
-/// already held for reading and the blocking `AddressSpace::topology` would invert
-/// `core::sync`'s ladder. `Bars::sync` therefore takes the order-exempt
-/// `try_topology`, and when that fails it sets a `stale` flag and re-applies
-/// **at the next configuration access**. That resolution rests on an
-/// assumption the file states plainly:
+/// already held for reading and the blocking `AddressSpace::topology` would
+/// invert `core::sync`'s ladder. `Bars::sync` therefore takes the order-exempt
+/// `try_topology`, and when that fails it sets a `stale` flag. What that flag
+/// used to wait for was **the next configuration access**, on an assumption the
+/// file stated plainly:
 ///
 /// > A configuration cycle **travels through the I/O space** […] the retry at
 /// > the next configuration access fails for the same reason, for ever.
 ///
-/// It says that of an *I/O* BAR, and refuses to map one. But a q35 has a
-/// second route to configuration space — ECAM, in the **memory** space — and
-/// through it every BAR is in exactly that position: the write is a memory
-/// access, so `try_topology` on the memory space cannot succeed, and neither
-/// can the retry, or the retry after that. A firmware that never touches
-/// `0xcf8` never heals it.
+/// It said that of an *I/O* BAR, and refused to map one. But a q35 has a second
+/// route to configuration space — ECAM, in the **memory** space — and through
+/// it every BAR was in exactly that position: the write is a memory access, so
+/// `try_topology` on the memory space cannot succeed, and neither can the
+/// retry, or the retry after that. A firmware that never touches `0xcf8` never
+/// healed it.
 ///
-/// The second half of this test is the proof rather than a flourish: one
-/// configuration access through the port space — mechanism #1, which does not
-/// hold the memory space's topology — and the window appears at once, with
-/// `CAP` reading `0x010103ff`. It is also a warning about instruments, because
-/// [`report_nvme`] reaches configuration space that way: every register it
-/// prints looks perfect *because looking at it fixed it*.
+/// The retry now lands somewhere that is not an access at all. `PciBus`
+/// remembers that a function came out of a configuration cycle owing a
+/// retopology, and the host bridge — which already keeps a clock domain because
+/// its own `PCIEXBAR` window moves from inside an ECAM write — drains the
+/// fabric from `Device::advance_to`, which the run loop calls between rounds.
+/// So this test **runs the machine** between programming the register and
+/// looking at it, which is the honest statement of what the fix buys: a window
+/// placed through ECAM decodes within one scheduler round, not within one
+/// instruction.
 ///
-/// Two fixes are open, and neither belongs in this file: the `Deferred` action
-/// `bar.rs` names, landing a scheduler quantum later; or an "owed
-/// retopology" the space drains when
-/// its last read guard goes. The first is what the module docs already say
-/// they would do when something needed it. Something does.
+/// [`a_window_placed_through_the_port_pair_decodes_inside_the_write`] is the
+/// control, and it is a warning about instruments as much as a control:
+/// [`report_nvme`] reaches configuration space that way, so while this was
+/// broken every register it printed looked perfect *because looking at it fixed
+/// it*.
 #[test]
-#[ignore = "reproduces the ECAM-placed BAR defect in src/bus/pci/bar.rs; pass --ignored to run it"]
 fn the_disk_controllers_window_decodes_when_ecam_placed_it() {
     const BAR0: u64 = 0x8_0000_0000;
-    let machine = bare_board();
+    let mut machine = bare_board();
+    {
+        let mem = machine.space("mem").expect("the board declares `mem`");
+        // Bus 0, device 4, function 0 is 4 * 32 KiB into the window `PCIEXBAR`
+        // placed (Intel 3 Series datasheet §5.1.16).
+        let ecam = |offset: u64, value: u32| {
+            mem.write(
+                0xe000_0000 + 4 * 0x8000 + offset,
+                Width::U32,
+                u64::from(value),
+                MemAttrs::DEFAULT,
+            )
+            .expect("the ECAM window takes a dword");
+        };
+        ecam(0x10, BAR0 as u32);
+        ecam(0x14, (BAR0 >> 32) as u32);
+        ecam(0x04, 0x0006);
+    }
+    // One scheduler round. `Machine::run_quantum` is what the run loop does,
+    // and `Scheduler::sync_lazy_devices` at the end of it is where the bridge
+    // gets its moment with no access in flight. There is no firmware in this
+    // board's flash, so the processor spends the round executing erased bytes —
+    // which is fine, and is rather the point: nothing the *guest* does is what
+    // settles the fabric.
+    machine.run_quantum().expect("a quantum runs");
     let mem = machine.space("mem").expect("the board declares `mem`");
-    // Bus 0, device 4, function 0 is 4 * 32 KiB into the window `PCIEXBAR`
-    // placed (Intel 3 Series datasheet §5.1.16).
-    let ecam = |offset: u64, value: u32| {
-        mem.write(
-            0xe000_0000 + 4 * 0x8000 + offset,
-            Width::U32,
-            u64::from(value),
-            MemAttrs::DEFAULT,
-        )
-        .expect("the ECAM window takes a dword");
-    };
-    ecam(0x10, BAR0 as u32);
-    ecam(0x14, (BAR0 >> 32) as u32);
-    ecam(0x04, 0x0006);
     let after_ecam = mem.read(BAR0, Width::U32, MemAttrs::DEFAULT).unwrap_or(!0) as u32;
-    // One configuration access through the *other* window, which travels
-    // through the port space and therefore leaves the memory space's topology
-    // free.
-    let port = machine.space("port").expect("the board declares `port`");
-    port.write(0xcf8, Width::U32, 0x8000_2000, MemAttrs::DEFAULT)
-        .expect("CONFADD");
-    let _ = port.read(0xcfc, Width::U32, MemAttrs::DEFAULT);
-    let after_conf1 = mem.read(BAR0, Width::U32, MemAttrs::DEFAULT).unwrap_or(!0) as u32;
-    println!("after ECAM: {after_ecam:#010x}, after a conf1 access: {after_conf1:#010x}");
+    println!("after ECAM and one round: {after_ecam:#010x}");
     assert_ne!(
         after_ecam, 0xffff_ffff,
         "a BAR programmed through the ECAM window decodes where it was put"
+    );
+    assert_eq!(
+        after_ecam, 0x0101_03ff,
+        "and what decodes there is `CAP`, not something else that answers"
+    );
+}
+
+/// The other route to the same register, which never had the defect.
+///
+/// A configuration cycle through `0xcf8`/`0xcfc` travels through the **I/O**
+/// space, so the memory space's topology is free and the window is placed
+/// inside the write itself — no round, no scheduler. Linux takes this route for
+/// resource assignment, which is why `tests/q35_linux.rs` never saw the bug.
+#[test]
+fn a_window_placed_through_the_port_pair_decodes_inside_the_write() {
+    const BAR0: u64 = 0x8_0000_0000;
+    let machine = bare_board();
+    let mem = machine.space("mem").expect("the board declares `mem`");
+    let port = machine.space("port").expect("the board declares `port`");
+    let cfg = |offset: u32, value: u32| {
+        port.write(
+            0xcf8,
+            Width::U32,
+            u64::from(0x8000_2000 | offset),
+            MemAttrs::DEFAULT,
+        )
+        .expect("CONFADD is a dword register");
+        port.write(0xcfc, Width::U32, u64::from(value), MemAttrs::DEFAULT)
+            .expect("CONFDATA");
+    };
+    cfg(0x10, BAR0 as u32);
+    cfg(0x14, (BAR0 >> 32) as u32);
+    cfg(0x04, 0x0006);
+    assert_eq!(
+        mem.read(BAR0, Width::U32, MemAttrs::DEFAULT).unwrap_or(!0) as u32,
+        0x0101_03ff,
+        "no round needed: the try-lock is against a space this access is not in"
     );
 }
 

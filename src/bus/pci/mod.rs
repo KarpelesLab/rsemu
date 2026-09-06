@@ -205,6 +205,34 @@ pub trait PciFunction: fmt::Debug + Send + Sync {
     /// a fault on a configuration cycle, and firmware writes read-only
     /// registers all the time while sizing them.
     fn config_write(&self, offset: u16, src: &[u8], attrs: MemAttrs);
+
+    /// Whether this function asked its address space for a change it could not
+    /// have at the instant it asked.
+    ///
+    /// A base address register moves a mapping from inside a configuration
+    /// write, and the write arrives inside an address-space access which
+    /// already holds that space's topology lock for reading — so the
+    /// order-exempt try-lock [`Bars::sync`](bar::Bars::sync) uses
+    /// can fail, and on a board whose configuration cycles are *memory*
+    /// accesses (ECAM) it fails every time. `bar.rs`'s module docs carry the
+    /// argument. Saying so here is what lets [`PciBus::settle`] come back for
+    /// it from a moment with no access in flight.
+    ///
+    /// The default is `false`: a function with no BAR to move owes nothing.
+    /// Asked after every configuration cycle and again during a sweep, never
+    /// from the scheduler's own path — [`PciBus::retopology_owed`] is the
+    /// lock-free flag that path reads, and this is what raises it.
+    fn retopology_owed(&self) -> bool {
+        false
+    }
+
+    /// Have another go at whatever [`retopology_owed`](PciFunction::retopology_owed)
+    /// is reporting.
+    ///
+    /// Called with no configuration access in flight, from
+    /// [`PciBus::settle`]. It may still fail — a sibling thread can hold the
+    /// space — in which case the function stays owed and is asked again.
+    fn settle(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +259,18 @@ pub trait PciFunction: fmt::Debug + Send + Sync {
 pub struct PciBus {
     functions: Mutex<BTreeMap<Bdf, Arc<dyn PciFunction>>>,
     intx: Mutex<IntxNets>,
+    /// Whether some function on this fabric owes a retopology.
+    ///
+    /// A hint rather than a truth: set by any configuration access that left a
+    /// function reporting [`PciFunction::retopology_owed`], cleared by
+    /// [`settle`](PciBus::settle) — which then puts it back if a function is
+    /// still owed. Deliberately an atomic and not a lock, because
+    /// `Device::next_event_tick` reads it under the scheduler's own leaf lock
+    /// and may not take one of its own.
+    ///
+    /// Derived state: never serialized. A load re-applies every window with the
+    /// blocking guard, which is what makes the flag meaningless across one.
+    owed: AtomicBool,
 }
 
 impl fmt::Debug for PciBus {
@@ -240,6 +280,7 @@ impl fmt::Debug for PciBus {
             Some(map) => s.field("functions", &map.len()),
             None => s.field("functions", &"<in use>"),
         };
+        s.field("owed", &self.owed.load(Ordering::Relaxed));
         match self.intx.try_lock() {
             Some(nets) => s.field("intx", &nets.asserting.len()),
             None => s.field("intx", &"<in use>"),
@@ -261,6 +302,7 @@ impl PciBus {
         PciBus {
             functions: Mutex::with_rank(LockRank::DEVICE, BTreeMap::new()),
             intx: Mutex::with_rank(INTX_RANK, IntxNets::default()),
+            owed: AtomicBool::new(false),
         }
     }
 
@@ -320,7 +362,10 @@ impl PciBus {
     /// rather than an error path.
     pub fn config_read(&self, at: Bdf, offset: u16, dst: &mut [u8], attrs: MemAttrs) {
         match self.function(at) {
-            Some(f) => f.config_read(offset, dst, attrs),
+            Some(f) => {
+                f.config_read(offset, dst, attrs);
+                self.note(&f);
+            }
             None => dst.fill(0xff),
         }
     }
@@ -329,7 +374,63 @@ impl PciBus {
     pub fn config_write(&self, at: Bdf, offset: u16, src: &[u8], attrs: MemAttrs) {
         if let Some(f) = self.function(at) {
             f.config_write(offset, src, attrs);
+            self.note(&f);
         }
+    }
+
+    /// Remember that `f` came out of an access owing a retopology.
+    ///
+    /// Every route into a function's configuration space is one of the two
+    /// calls above, and those are the only paths on which a window can be left
+    /// stale: reset, bind and a snapshot load all retopologise with the
+    /// blocking guard. So this is the complete set of moments the flag has to
+    /// be raised at.
+    fn note(&self, f: &Arc<dyn PciFunction>) {
+        if f.retopology_owed() {
+            self.owed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether some function on this fabric is waiting for a retopology it
+    /// could not have when it asked.
+    ///
+    /// Lock-free on purpose: this is what a host bridge's
+    /// `Device::next_event_tick` asks, and the scheduler holds a leaf lock
+    /// across that call.
+    #[must_use]
+    pub fn retopology_owed(&self) -> bool {
+        self.owed.load(Ordering::Relaxed)
+    }
+
+    /// Give every function that owes a retopology another go, and report
+    /// whether any still does.
+    ///
+    /// **Call this with no access in flight** — from `Device::advance_to`, a
+    /// safe point, or machine assembly. That is the whole point of it: a BAR
+    /// programmed through ECAM is moved by a *memory* access, so the retry
+    /// cannot be another configuration cycle. `src/bus/pci/bar.rs`'s module
+    /// docs carry the argument, and `crate::dev::q35::mch` is what calls this.
+    ///
+    /// The flag is cleared **before** the sweep rather than after, so a
+    /// configuration access that races this and leaves something owed cannot
+    /// have its flag overwritten by the clear.
+    pub fn settle(&self) -> bool {
+        self.owed.store(false, Ordering::Relaxed);
+        // Cloned out and the lock released before any function is called: a
+        // `settle` retopologises an address space, and `TOPOLOGY` sits above
+        // this table's `DEVICE` rank (`CLAUDE.md`, re-entrancy).
+        let all: Vec<Arc<dyn PciFunction>> = self.functions.lock().values().cloned().collect();
+        let mut still = false;
+        for f in all {
+            if f.retopology_owed() {
+                f.settle();
+                still |= f.retopology_owed();
+            }
+        }
+        if still {
+            self.owed.store(true, Ordering::Relaxed);
+        }
+        still
     }
 }
 

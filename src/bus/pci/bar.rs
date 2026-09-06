@@ -77,33 +77,73 @@
 //! [`super::super::super::dev::pc::pmc`] hit exactly this for the PAM registers
 //! and answered it with [`AddressSpace::try_topology`], which is *order-exempt
 //! by construction* — a try-lock cannot wait, so it cannot be half of a deadlock
-//! cycle — plus a `stale` flag re-applied at the next configuration access. A
-//! BAR is the same shape and takes the same answer, with one difference worth
-//! naming: PAM only ever calls [`reprotect`], while a BAR also calls
-//! [`remap`]. Both are methods on the same guard, so the guard is what the
-//! argument is about and the argument does not change.
+//! cycle — plus a `stale` flag re-applied later. A BAR is the same shape and
+//! takes the same answer, with one difference worth naming: PAM only ever calls
+//! [`reprotect`], while a BAR also calls [`remap`]. Both are methods on the same
+//! guard, so the guard is what the argument is about and the argument does not
+//! change.
 //!
 //! What does change is the *consequence of failing*. A stale PAM window decodes
 //! the ROM for one instant longer than it should; a stale BAR decodes at its old
 //! address, which is where nothing is looking. Neither is silently swallowed:
-//! [`Bars::is_stale`] is set, and the function re-applies at its next
-//! configuration access — of which there is always at least one more, because
-//! firmware writes `COMMAND` *after* it writes the BARs.
+//! [`Bars::is_stale`] is set, and something has to come back for it.
+//!
+//! # Where the retry lands, and why it is not "the next configuration access"
+//!
+//! It used to be. The claim this file made was that a configuration cycle
+//! *travels through the I/O space*, so a BAR write arriving through `0xcfc`
+//! holds the **I/O** space's read guard while it retopologises the **memory**
+//! space — two different locks, and the try succeeds. When it does not, the
+//! next configuration access tries again, and firmware always issues one more
+//! because it writes `COMMAND` after it writes the BARs.
+//!
+//! **That is only true of a board with one route to configuration space.** A
+//! q35 has two, and the one a UEFI firmware actually uses is ECAM — a window of
+//! *memory* in which the address is the configuration address (PCI Firmware
+//! Specification 3.0 §4.1, and [`crate::dev::q35::ecam`]). Through it a BAR
+//! write is a memory access, the read guard it holds is the memory space's own,
+//! the try-lock fails — and so does the retry at the next configuration access,
+//! because that one is another memory access. For ever. The symptom is a
+//! function that answers its configuration space perfectly and decodes nothing:
+//! every one of its registers reads as `0xff`.
+//!
+//! So the retry needs somewhere to land that is **not an access at all**, and
+//! `core::device`'s answer to "act outward once the handler has returned" is the
+//! scheduler. [`super::PciBus`] therefore remembers that some function on it
+//! owes a retopology ([`super::PciBus::retopology_owed`]), and a device with a
+//! clock domain drains it from `Device::advance_to`, which the run loop calls
+//! with no access in flight. On a q35 that device is the host bridge
+//! ([`crate::dev::q35::mch`]), which already keeps a clock domain for exactly
+//! this reason — its own `PCIEXBAR` window moves from inside an ECAM write and
+//! met the problem first. The bound is one scheduler round: `Machine::advance_to`
+//! calls `Scheduler::sync_lazy_devices` after every quantum, and a round on a
+//! PC-shaped board is capped at `SchedulerConfig::max_ticks_per_quantum`
+//! processor cycles, not at the quantum's wall-clock length.
+//!
+//! Two consequences worth writing down rather than discovering:
+//!
+//! * **A window placed through ECAM decodes late** — up to the remainder of the
+//!   round the write happened in. Real firmware programs every BAR in its PCI
+//!   bus driver and reads the first device register in a *different* driver, so
+//!   the gap is orders of magnitude wider than the bound. A guest that wrote a
+//!   BAR and read the window in the next instruction would see the old decode,
+//!   which is the honest cost of not having a `Deferred` on the access path.
+//! * **A snapshot cannot be taken mid-stale.** The flag is derived state, never
+//!   serialized, and a load re-applies with the blocking guard — but the reason
+//!   that is not a divergence is stronger than the reason it is harmless: a
+//!   snapshot is taken between rounds, and the fabric is settled at the end of
+//!   every round.
 //!
 //! # I/O BARs decode nothing here, and cannot yet
 //!
 //! [`Bars`] models an I/O BAR's register completely — the indicator bit, the
 //! sizing read-back, the base — so firmware can size and place one. It refuses
-//! to *map* one, at [`Bars::install`], with an error saying why:
-//!
-//! A configuration cycle **travels through the I/O space**. Retopologising the
-//! space an access is currently travelling through is the one case the
-//! try-lock cannot serve: the read guard is held by this very access, so the
-//! try always fails, and the retry at the next configuration access fails for
-//! the same reason, for ever. The escape is a
-//! [`Deferred`](crate::core::device::Deferred) action, which lands a scheduler
-//! quantum later; nothing in this tree has an I/O BAR yet, so that trade is not
-//! made on a guess. When something does, this is the paragraph to argue with.
+//! to *map* one, at [`Bars::install`], with an error saying why: an I/O BAR
+//! moves a window in the very space a `0xcfc` cycle is travelling through, so
+//! the try-lock cannot serve it, and the scheduler drain above would have to
+//! reach a second space. The drain does not care which space a window is in and
+//! would in fact serve an I/O BAR too, but nothing in this tree has one, so the
+//! refusal stays and this is the paragraph to argue with when something does.
 //!
 //! [`AddressSpace::topology`]: crate::core::space::AddressSpace::topology
 //! [`AddressSpace::try_topology`]: crate::core::space::AddressSpace::try_topology
@@ -311,11 +351,26 @@ const ROM_OFFSET: u16 = 0x30;
 /// hole well above RAM — so this is a tie-break rule rather than a behaviour.
 const BAR_PRIORITY: i32 = 2;
 
-/// Where a window went.
+/// One window that is in the map right now, and on what terms it went in.
+///
+/// The base and the permissions are kept beside the id so [`Bars::sync`] can
+/// answer "is the map already what the registers ask for?" without opening a
+/// topology guard. Firmware rewrites the same base constantly while it sizes,
+/// and on a board where the retry is a scheduler event rather than the next
+/// configuration access, a `sync` that opens a guard it does not need is also a
+/// `sync` that sets the stale flag it does not need.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    id: MappingId,
+    base: u64,
+    perms: Perms,
+}
+
+/// Where the windows went.
 #[derive(Debug, Clone)]
 struct Placed {
     space: Arc<AddressSpace>,
-    ids: BTreeMap<u8, MappingId>,
+    windows: BTreeMap<u8, Window>,
 }
 
 /// The six base address registers, the expansion ROM register, and the windows
@@ -605,7 +660,7 @@ impl Bars {
         }
         *self.placed.lock() = Some(Placed {
             space: Arc::clone(space),
-            ids: BTreeMap::new(),
+            windows: BTreeMap::new(),
         });
         self.sync(command, true);
         Ok(())
@@ -618,7 +673,18 @@ impl Bars {
     /// — bind, reset, a snapshot load — and the order-exempt try-lock from
     /// inside a configuration write, where the blocking one would invert
     /// `core::sync`'s ladder. A failed try sets [`is_stale`](Bars::is_stale)
-    /// rather than being swallowed.
+    /// rather than being swallowed, and the function is asked again from
+    /// [`PciBus::settle`](super::PciBus::settle), which runs with no access in
+    /// flight — see the module docs for why the retry cannot be another
+    /// configuration cycle.
+    ///
+    /// No guard at all is taken when the map already is what the registers ask
+    /// for, which is every write of a sizing sweep: `COMMAND`'s space bit is
+    /// still clear, so nothing decodes before or after and there is nothing to
+    /// place. That is a saving of a whole address-space flatten per
+    /// configuration write, and — since a `blocking: false` call that cannot
+    /// have the guard marks the function stale — of a scheduler wake-up per
+    /// configuration write with it.
     pub fn sync(&self, command: u16, blocking: bool) -> bool {
         // Cloned out and the lock released: nothing of this device's is held
         // while the space is retopologised, which is the re-entrancy contract.
@@ -637,6 +703,23 @@ impl Bars {
                 decoding.then_some((*index, region, base, bar.perms))
             })
             .collect();
+        // Nothing to do is the common case: firmware writes all-ones to size a
+        // register and the real base straight after, and neither write changes
+        // what decodes while `COMMAND` still has the space bit clear. Answering
+        // that without a guard is what keeps the sizing sweep from marking the
+        // function stale once per configuration write and asking the scheduler
+        // to come back each time.
+        if wanted.len() == placed.windows.len()
+            && wanted.iter().all(|(index, _, base, perms)| {
+                placed
+                    .windows
+                    .get(index)
+                    .is_some_and(|w| w.base == *base && w.perms == *perms)
+            })
+        {
+            *self.stale.lock() = false;
+            return true;
+        }
         let guard = if blocking {
             Some(placed.space.topology())
         } else {
@@ -646,49 +729,47 @@ impl Bars {
             *self.stale.lock() = true;
             return false;
         };
-        let mut ids = placed.ids.clone();
+        let mut windows = placed.windows.clone();
         // Whatever no longer decodes leaves the map entirely, before anything
         // that does is placed: a window that moved out of the way has to be
         // gone before the one moving in can claim its address.
-        let gone: Vec<u8> = ids
+        let gone: Vec<u8> = windows
             .keys()
             .copied()
             .filter(|index| !wanted.iter().any(|(i, ..)| i == index))
             .collect();
         for index in gone {
-            if let Some(id) = ids.remove(&index) {
+            if let Some(w) = windows.remove(&index) {
                 // The only error is "not a mapping of this space", which cannot
                 // happen: every id here came from this space.
-                let _ = topo.unmap(id);
+                let _ = topo.unmap(w.id);
             }
         }
         for (index, region, base, perms) in wanted {
-            match ids.get(&index) {
-                // Already in the map: move it, and take it back out if the base
-                // firmware wrote does not fit the space. That is a card
-                // decoding an address the machine cannot drive, which decodes
-                // nothing.
-                Some(id) => {
-                    if topo.remap(*id, base).is_err() {
-                        let _ = topo.unmap(*id);
-                        ids.remove(&index);
-                    }
+            // Already in the map: move it. Out again if the base firmware wrote
+            // does not fit the space — that is a card decoding an address the
+            // machine cannot drive, which decodes nothing — or if the terms
+            // changed, which `remap` cannot express.
+            if let Some(w) = windows.get(&index).copied() {
+                if w.perms == perms && topo.remap(w.id, base).is_ok() {
+                    windows.insert(index, Window { base, ..w });
+                    continue;
                 }
-                None => {
-                    if let Ok(id) = topo.map_with(
-                        Mapping::new(region, base)
-                            .with_priority(BAR_PRIORITY)
-                            .with_perms(perms),
-                    ) {
-                        ids.insert(index, id);
-                    }
-                }
+                let _ = topo.unmap(w.id);
+                windows.remove(&index);
+            }
+            if let Ok(id) = topo.map_with(
+                Mapping::new(region, base)
+                    .with_priority(BAR_PRIORITY)
+                    .with_perms(perms),
+            ) {
+                windows.insert(index, Window { id, base, perms });
             }
         }
         drop(topo);
         *self.placed.lock() = Some(Placed {
             space: Arc::clone(&placed.space),
-            ids,
+            windows,
         });
         *self.stale.lock() = false;
         true
