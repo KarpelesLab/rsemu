@@ -82,17 +82,17 @@ hardware with a guest this repository builds.
 
 | Board | CPU | Boots | How far, and what is in the way |
 | --- | --- | --- | --- |
-| [`riscv-virt`](platforms/riscv-virt.md) | RV64GC | OpenSBI 1.6, Linux 6.12, EDK II | **furthest of any board here.** Linux to a shell that echoes typed input, on a generated DTB, with the console handed over to our own 16550A and a virtio disk mounted; EDK II to an interactive `Shell>` prompt out of two CFI NOR banks, with a variable written in one run read back in the next |
-| [`arm64-virt`](platforms/arm64-virt.md) | AArch64 | Debian's arm64 kernel | a busybox shell, and `poweroff -f` typed at it stopping the machine through PSCI; with a root image it mounts **`/dev/vda` as an ext4 root** off virtio-mmio and runs the shell from it. `arm64-virt-smp` is the same board with a second core, on which the kernel prints `smp: Brought up 1 node, 2 CPUs` and `/proc/stat` shows CPU1 running tasks — **but see the exclusive-monitor caveat below**. Still: PSCI `CPU_ON` unimplemented (the second core comes up off a spin table), no RTC, no `EOImode`, no `AT S1E1R` |
+| [`riscv-virt`](platforms/riscv-virt.md) | RV64GC | OpenSBI 1.6, Linux 6.12, EDK II | **furthest of any board here.** Linux to a shell that echoes typed input, on a generated DTB, with the console handed over to our own 16550A and a virtio disk mounted; EDK II to an interactive `Shell>` prompt out of two CFI NOR banks, with a variable written in one run read back in the next. `riscv-virt-smp` is the same board with a **second hart**, started through **SBI HSM** rather than a spin table, and the same kernel prints `smp: Brought up 1 node, 2 CPUs` and then runs userspace on both — `nproc` says 2, `/proc/interrupts` has a column per hart with IPIs going both ways, `/proc/stat` gives hart 1 more system time than hart 0. It needed the least of the three, because RISC-V gives every hart its own *address* for `msip`, `mtimecmp` and its PLIC context |
+| [`arm64-virt`](platforms/arm64-virt.md) | AArch64 | Debian's arm64 kernel | a busybox shell, and `poweroff -f` typed at it stopping the machine through PSCI; with a root image it mounts **`/dev/vda` as an ext4 root** off virtio-mmio and runs the shell from it. `arm64-virt-smp` is the same board with a second core, on which the kernel prints `smp: Brought up 1 node, 2 CPUs` and `/proc/stat` shows CPU1 running tasks — started by PSCI **`CPU_ON`**, so it can be switched off again, which a spin table has no mechanism for (`secondary = "spin-table"` still selects the generated release table). Still open: `CPU_SUSPEND` refused rather than implemented, no RTC, no `EOImode`, no `AT S1E1R` |
 | [`pc-at`](platforms/pc-at.md) | i386-class | FreeDOS 1.3, on firmware this repo assembles | `COMMAND.COM`'s banner and then the installer's own `Do you want to proceed [Y,N]?`, which is a live prompt: a scan code fed to the 8042 puts an `N` on the line. **But it cannot be driven past that first keystroke** — `pc.kbc` delivers one and then goes silent. `pc-at-smp` adds a second processor, but what runs on it is rsemu's own boot sector reading its APIC id back as `1` — **no operating system has run on two processors here** |
 | [`q35`](platforms/q35.md) | x86-64 | a user-supplied PC firmware; rsemu's own BIOS | a firmware boot prompt, and a guest booted off IDE under our BIOS. **No operating system on the third-party path**; no SMP, no SMM, and S5 does not power off |
 | [`pc64`](platforms/pc64.md) | x86-64 | a stock Linux `bzImage`, entered directly | a shell that echoes typed input, on an initramfs — no PCI, so no other root is possible. Needs `cryptomgr.notests` on the command line |
-| [`q35-linux`](platforms/q35-linux.md) | x86-64 | the same, plus the chipset and a disk | a shell **on the board's own default command line**, reading bytes off an NVMe namespace through the kernel's own driver and a level-triggered interrupt. Its ledger is empty; **two of the four obstacles it named were refuted rather than fixed**, which is why the page is worth reading. `q35-linux-smp` is the same board with a second processor and the only one here on which a real kernel does real SMP work — `smp: Brought up 1 node, 2 CPUs` at 1.7 s and `nproc` saying `2` at a shell at 2.8 s, under KVM (see the caveat below). Also the only board measured **under KVM**: the same boot in **2.4 seconds** of wall clock against **978** interpreted, 282 of 346 console lines byte-identical — and on the same command line either way, because the `no_timer_check` this row used to name is gone along with the defect it hid |
-| [`q35-uefi`](platforms/q35-uefi.md) | x86-64 | a distribution's OVMF, out of NOR flash | an interactive **`UEFI Interactive Shell v2.2`** that runs what is typed at it, read off the 16550 at `0x3f8` — and **variables that survive a reboot**: 5,799 programmed bytes in the store where the shipped image had 127. The board has **no video** and no `0x402` debug port, so serial is the whole console, and **no storage controller**, so the shell says `map: No mapping found.` and no operating system can follow |
+| [`q35-linux`](platforms/q35-linux.md) | x86-64 | the same, plus the chipset and a disk | a shell **on the board's own default command line**, reading bytes off an NVMe namespace through the kernel's own driver and a level-triggered interrupt. Its ledger is empty; **two of the four obstacles it named were refuted rather than fixed**, which is why the page is worth reading. `q35-linux-smp` is the same board with a second processor and one of the three here on which a real kernel does real SMP work — `smp: Brought up 1 node, 2 CPUs` at 1.7 s and `nproc` saying `2` at a shell at 2.8 s, under KVM (see the caveat below). Also the only board measured **under KVM**: the same boot in **2.4 seconds** of wall clock against **978** interpreted, 282 of 346 console lines byte-identical — and on the same command line either way, because the `no_timer_check` this row used to name is gone along with the defect it hid |
+| [`q35-uefi`](platforms/q35-uefi.md) | x86-64 | a distribution's OVMF, out of NOR flash, and then **Linux** | an interactive **`UEFI Interactive Shell v2.2`** that runs what is typed at it, read off the 16550 at `0x3f8`; **variables that survive a reboot** (5,799 programmed bytes in the store where the shipped image had 127); and, since the board grew an **NVMe controller at `00:04.0`**, `FS0:` mapping a FAT volume on it, `startup.nsh` read off that volume and executed, and a Gentoo 6.6.67 `bzImage` entered through its **EFI stub** with an initramfs, reaching `Run /init as init process` and answering `uname -srm`. The board also describes itself now, through **`fw_cfg`**: eight ACPI tables the firmware relocates, checksums and installs, so the kernel logs `ACPI: Using ACPI (MADT) for SMP configuration information` and `APIC: Switch to symmetric I/O mode setup` where it used to fall back to virtual wire mode. Still **no video** and no `0x402` debug port, so serial is the whole console; 2,156,716 ms of guest time end to end, which is minutes of host time |
 
 #### The caveat every SMP row is subject to
 
-Four boards in `machines/` declare two processors — `arm64-virt-smp`,
+Five machine files declare two processors — `riscv-virt-smp`, `arm64-virt-smp`,
 `q35-linux-smp`, `pc-at-smp` and the synthetic `pc-apic` — and **their guest
 atomics are kept**. This was the tree's largest correctness defect until
 recently, and it was closed in two pieces because the two families of
@@ -125,11 +125,33 @@ funnel, so it breaks reservations on the way past.
 interpreters on two host threads running `lock xadd` land 40,000 of 40,000,
 against 34,271 with the bus lock removed.
 
-**Two things remain open and a green SMP row still does not cover them.**
-Locked-against-*plain* — a sibling's ordinary store landing inside a locked
-read-modify-write's window — is not closed. And this is *atomicity*, not
-*ordering*: fences are no-ops, so a guest that depends on a weak memory model
-being weak has nothing here to disagree with. Under `--accel kvm` the host's
+**Two things remain open and a green SMP row still does not cover them**, and
+[`techniques/memory-models.md`](techniques/memory-models.md) is where both are
+measured rather than asserted.
+
+* **Single-copy atomicity is not kept.** `RamStore` is a `Vec<AtomicU8>` and
+  every access to it is a byte loop, so a naturally aligned four-byte load
+  racing a naturally aligned four-byte store can return a mixture of the old
+  and the new word — a value all three architectures forbid (*Intel SDM* vol. 3
+  §9.1.1, ARM DDI 0487 B2.2.1, RISC-V Unprivileged ISA §1.4).
+  `tests/smp_single_copy_atomicity.rs` catches it 117–361 times in sixty
+  thousand loads, and catches the read half of a `LOCK XADD` torn the same way
+  with the bus lock held throughout. So locked-against-*plain* is a special
+  case of a wider gap rather than the whole of it.
+* **This is *atomicity*, not *ordering*.** Every data barrier in the tree
+  retires as a no-op — `DMB`/`DSB`, `FENCE`, `MFENCE`/`LFENCE`/`SFENCE` — and a
+  guest barrier is **not** semantically a no-op even when guest and host share
+  an architecture: an x86 host's store buffer performs exactly the
+  store-then-load reordering an x86 guest's `MFENCE` paid to remove, and
+  `tests/memory_model_costs.rs` produces the forbidden outcome tens to hundreds
+  of times in 200 000 rounds.
+
+**Both are reachable only under `ThreadingMode::Parallel`**, which is opt-in
+(`--threading parallel`), which **no machine file selects**, and which is not
+the default — `Deterministic` runs every guest on one host thread, where the
+finest interleaving there is is one whole instruction. That is what makes these
+documented boundaries rather than live defects, and it is the sentence that
+keeps every SMP row above honest. Separately, under `--accel kvm` the host's
 silicon performs the atomic, so an accelerated SMP boot remains evidence about
 the host rather than about this tree.
 

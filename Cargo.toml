@@ -156,36 +156,48 @@ display-png = ["std", "dep:oxideav-png"]
 # because `src/wasm.rs` now calls them. `web/README.md` has the rest of the
 # numbers and the reasoning at length.
 #
-# Deliberately absent, and each for a reason that would show on the page. The
-# bare boards — z80-mini (+4 578 bytes), mips-mini (+60 648), m68k-mini
-# (+77 182), a64-mini (+165 692), arm926, stm32f407 — want a firmware image and
+# Deliberately absent, and each for a reason that would show on the page. Every
+# figure below was re-measured this round against the current **3 098 724**-byte
+# module, `--release` and unstripped, and web/README.md has the full table.
+# Several of the old ones were wrong in the *cheap* direction: they predated
+# `pc-at` joining this list, and `pc-at` already pays for cpu-x86 and the PCI
+# fabric that some of them were being charged for a second time. No answer
+# changed — nothing here is refused for being expensive, only for having nothing
+# a visitor could press.
+#
+# The bare boards — z80-mini (+7 526 bytes), mips-mini (+62 628), m68k-mini
+# (+77 743), a64-mini (+213 782), arm926, stm32f407 — want a firmware image and
 # have neither a console nor a screen without one; z80-mini is nearly free and
-# still not worth a catalog row that cannot do anything. `riscv-virt` (+261 029)
+# still not worth a catalog row that cannot do anything. `riscv-virt` (+270 386)
 # wants a kernel or an SBI build — it is no longer "the largest thing this list
-# could add", `pc-at` is, by more than three times. `pc64` (+523 702) and
-# `q35-linux` (+280 443) do reach a shell prompt on an uploaded `bzImage`, but only after
-# several hundred *guest* seconds (docs/platforms/pc64.md), and only on a
-# stock kernel the visitor has to find. A second media slot is no longer the
-# obstacle there — `rsemu_stage_media` binds one, for 6 142 bytes of module —
-# but the wall clock still is. `q35` (+190 802 on top of pc-at) would be a
-# second POST screen, and its `bios` slot does not in fact default to rsemu's
-# image the way this file used to claim — neither `builtin_bios` in
+# could add", `pc-at` is. `pc64` (+54 294, not the +523 702 this file used to
+# claim) and `q35-linux` (+322 447) do reach a shell prompt on an uploaded
+# `bzImage`, but only after several hundred *guest* seconds
+# (docs/platforms/pc64.md), and only on a stock kernel the visitor has to find.
+# A second media slot is no longer the obstacle there — `rsemu_stage_media`
+# binds one, for 6 142 bytes of module — and after this round's re-measurement
+# size is not either; the wall clock still is. `q35` (+232 065 on top of pc-at)
+# would be a second POST screen, and its `bios` slot does not in fact default to
+# rsemu's image the way this file used to claim — neither `builtin_bios` in
 # src/bin/rsemu.rs nor `builtin_media` in src/ffi/abi.rs has a q35 arm.
 #
-# Two rows were re-measured against the current 3 089 306-byte module because
-# the boards behind them moved, and neither answer changed. `arm64-virt` went
-# *up*, to +429 956: it now mounts an ext4 root off a virtio disk, which makes
-# the file a visitor must find bigger rather than smaller, it still wants a
-# Debian arm64 `Image` beside it, and it still takes three minutes of *native*
-# host time to reach busybox interpreted. `q35-uefi` (+223 660) is the one whose
-# *reason* changed: it is no longer a black rectangle — it reaches an
-# interactive `UEFI Interactive Shell v2.2` on the 16550 at 0x3f8, which is a
-# console this page can already draw. What still rules it out is an OVMF build
-# the visitor has to find on their own distribution, and 367.2 seconds of guest
-# time before that prompt — minutes of native host time interpreted, and worse
-# in a browser. The storage and USB boards (nvme-mini
-# +358 717, xhci-pci-mini +466 147, ahci-mini, usb-mini, hub-mini, xhci-mini)
-# want a disk image *and* a firmware and have nothing to look at either way.
+# The two largest candidates both moved further away. `arm64-virt` went *up*
+# again, to +452 016: it mounts an ext4 root off a virtio disk, which makes the
+# file a visitor must find bigger rather than smaller, it still wants a Debian
+# arm64 `Image` beside it, and it still takes three minutes of *native* host
+# time to reach busybox interpreted. `q35-uefi` is the one whose numbers and
+# whose reason both changed, and both away from the page: it costs 53% more
+# (+341 248, was +223 660) because it grew an NVMe controller and a `fw_cfg`,
+# and what that bought is that OVMF now finds `FS0:` and boots a Linux kernel
+# through its EFI stub. So the visitor's homework went from one file they
+# probably do not have (OVMF_CODE.fd) to three, and the clock from 367.2 s of
+# guest time to the `Shell>` prompt to 2 156 716 ms to a Linux one. It would
+# answer `rsemu_has_console` with 1 — com1 opens a port named `console` and the
+# only excluded name is `keyboard` — so that half is settled; the image and the
+# clock are what rule it out. The storage and USB boards (nvme-mini +78 198,
+# xhci-pci-mini +142 917 — both a fraction of what this file claimed, for the
+# baseline reason above — plus ahci-mini, usb-mini, hub-mini, xhci-mini) want a
+# disk image *and* a firmware and have nothing to look at either way.
 demo = [
     "wasm",
     "machine-nes",
