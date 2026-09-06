@@ -718,16 +718,36 @@ impl Machine {
         w.to_vec()
     }
 
-    /// Restore what [`Machine::save`] wrote, with no class migrations.
+    /// Restore what [`Machine::save`] wrote, upgrading older chunks.
+    ///
+    /// The migrations are
+    /// [`default_migrations`](crate::machine::default_migrations) — every step
+    /// the classes in this build register — so a save state an earlier build
+    /// wrote loads here with nothing for the caller to arrange. That is the
+    /// point: the load path with users on it is `rsemu_load` in `crate::wasm`,
+    /// behind a button in `web/src/session.js`, and it calls this.
+    ///
+    /// A chunk already at this build's version costs nothing;
+    /// [`Migrations::upgrade`] returns the borrowed bytes untouched when the
+    /// versions agree, which is every chunk of a snapshot this build wrote and
+    /// so every rewind keyframe.
     ///
     /// # Errors
     ///
-    /// As [`Machine::load_with`].
+    /// As [`Machine::load_with`], plus [`Error::State`] if the migration table
+    /// itself is malformed — two classes claiming one step, which is a bug in
+    /// `machine::migrate` and not in the snapshot.
     pub fn load(&mut self, bytes: &[u8]) -> Result<()> {
-        self.load_with(bytes, &Migrations::new())
+        self.load_with(bytes, &crate::machine::default_migrations()?)
     }
 
     /// Restore a snapshot, migrating device chunks through `migrations`.
+    ///
+    /// The table is used **as given**: a caller that wants this build's own
+    /// steps as well must start from
+    /// [`default_migrations`](crate::machine::default_migrations) and add to
+    /// it, or an old chunk of a class that *does* have a step will be refused.
+    /// [`Machine::load`] is that call, and is what almost everything wants.
     ///
     /// The machine's shape is checked first, so a snapshot taken from a
     /// differently-shaped machine fails with a diff naming what moved rather

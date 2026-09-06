@@ -737,6 +737,28 @@ impl Shared {
         }
     }
 
+    /// Re-drive `NSS` from a snapshot, without pretending the line just moved.
+    ///
+    /// The restore twin of [`Shared::drive_nss`], and the difference is the
+    /// whole point. A fresh bus has nothing selected, so re-driving a `low`
+    /// `NSS` through `SpiBus::select` would look to the part like a chip select
+    /// that had this instant fallen — and a slave's `select` is where it starts
+    /// a frame, so the mid-frame state the snapshot just restored would be
+    /// thrown away. [`SpiBus::restore_select`] puts the line back where it was
+    /// and tells nobody, which is right because nothing moved.
+    ///
+    /// A deselected peripheral claims nothing: the other master on the bus may
+    /// hold the line, and its own load restores that.
+    fn restore_nss(&self, low: bool) {
+        self.emit(Emit::Nss(Level::from_bool(!low)));
+        if low
+            && self.link == Link::Transactional
+            && let Some(bus) = &self.bus
+        {
+            bus.restore_select(Some(self.cs));
+        }
+    }
+
     /// Start a frame, if the peripheral is in a position to.
     ///
     /// Called with the state lock held. Returns whether one started.
@@ -1454,7 +1476,7 @@ impl Device for Stm32Spi {
             self.shared.publish(&slot);
         }
         self.pins.restore(pins);
-        self.shared.drive_nss(state.nss_low);
+        self.shared.restore_nss(state.nss_low);
         self.shared.announce_all();
         Ok(())
     }

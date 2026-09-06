@@ -658,6 +658,208 @@ fn a_snapshot_taken_between_an_erase_and_its_chip_select_carries_it() {
     assert_eq!(read(&other, 0x2000, 1), [0xff], "and now it has");
 }
 
+/// Clock bits `first .. first + count` of `byte` in through the pins.
+///
+/// Mode 0, MSB first, exactly as [`wired_frame`] does it — this is that
+/// function taken a few bits at a time, so a snapshot can be caught between
+/// two of them.
+fn clock_bits(part: &SpiNor, byte: u8, first: u32, count: u32) {
+    let pins = part.pins();
+    for i in first..first + count {
+        let bit = 7 - i;
+        pins.drive(spi_pin::MOSI, Level::from_bool(byte >> bit & 1 != 0));
+        pins.drive(spi_pin::SCK, Level::High);
+        pins.drive(spi_pin::SCK, Level::Low);
+    }
+}
+
+/// Clock `count` more whole bytes out of a frame already in progress.
+fn wired_tail(part: &SpiNor, count: usize) -> Vec<u8> {
+    let pins = part.pins();
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let mut got = 0u8;
+        for _ in 0..8 {
+            pins.drive(spi_pin::MOSI, Level::Low);
+            got = (got << 1) | u8::from(pins.miso_level().is_high());
+            pins.drive(spi_pin::SCK, Level::High);
+            pins.drive(spi_pin::SCK, Level::Low);
+        }
+        out.push(got);
+    }
+    out
+}
+
+/// The third `9Fh` byte for a [`SIZE`]-byte part: log2 of the capacity.
+fn capacity_byte() -> u8 {
+    SIZE.trailing_zeros() as u8
+}
+
+#[test]
+fn a_snapshot_taken_mid_word_carries_the_bits_already_clocked_in() {
+    // The defect this chunk's v2 exists for. `flash.spinor` saved its *byte*
+    // decoder and left the bit-level shifter inside its `SlavePins` at
+    // power-on, so a snapshot taken between two SCK edges came back having
+    // forgotten the bits already on the wire — and the next byte the part
+    // decoded was a different byte.
+    //
+    // The check is the only one that can see a field `save` omits: restore
+    // into a part that has only ever been reset, then **run both forward** and
+    // compare. Re-saving and diffing the bytes cannot fail here however wrong
+    // the restore is, because both sides of that comparison are functions of
+    // what `save` writes.
+    let part = new_part();
+    let pins = part.pins();
+    pins.drive(spi_pin::CS, Level::Low);
+    // Five bits of `9Fh`. The decoder has seen nothing at all yet; every bit
+    // of this frame so far lives in the shifter.
+    clock_bits(&part, CMD_JEDEC_ID, 0, 5);
+
+    let bytes = snapshot(&part);
+    let other = new_part();
+    restore(&other, &bytes);
+
+    // Both parts finish the same opcode and read the same identifier back.
+    let mut answers = Vec::new();
+    for one in [&part, &other] {
+        clock_bits(one, CMD_JEDEC_ID, 5, 3);
+        answers.push(wired_tail(one, 3));
+    }
+    assert_eq!(
+        answers[1], answers[0],
+        "the restored part answered a different frame"
+    );
+    assert_eq!(
+        answers[0],
+        alloc::vec![WINBOND, TYPE_W25Q, capacity_byte()],
+        "and neither of them answered the identifier"
+    );
+    assert_eq!(
+        snapshot(&other),
+        snapshot(&part),
+        "and they end up agreeing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// migration
+// ---------------------------------------------------------------------------
+
+/// Rewrite a v2 snapshot as the v1 one an older build would have written.
+///
+/// v1 ended at the page-program latch's coverage map and v2 appends the seven
+/// shifter fields, so the v1 encoding is a byte-for-byte *prefix* of the v2 one
+/// and truncating is not an approximation of an old build's output — it is
+/// that output, as long as the snapshot was taken with the shifter at rest,
+/// which is the only state v1 could describe. The caller arranges that.
+fn as_v1(bytes: &[u8]) -> Vec<u8> {
+    /// u32 + u32 + u8 + four bools.
+    const SHIFTER_BYTES: usize = 4 + 4 + 1 + 4;
+    let reader = StateReader::new(bytes).expect("a snapshot");
+    let (class, version, data) = reader.load_raw("nor").expect("the chunk is there");
+    assert_eq!(
+        version, 2,
+        "this helper knows how to undo v2 and nothing else"
+    );
+    let mut w = StateWriter::new(reader.shape().clone());
+    w.raw_chunk("nor", class, 1, &data[..data.len() - SHIFTER_BYTES])
+        .expect("one chunk");
+    w.to_vec().expect("a v1 snapshot")
+}
+
+#[test]
+fn a_v1_chunk_loads_into_this_build_and_the_part_runs_on() {
+    // §4.5 asks for a *cross-version* load, and says in as many words that a
+    // round-trip never exercises one. This is that test at the device: a v1
+    // chunk, the migration table `Machine::load` actually uses, and then both
+    // parts driven forward — because a migration that produced plausible bytes
+    // and a broken part would pass anything weaker.
+    let part = new_part();
+    program(&part, 0x400, b"before");
+    write_enable(&part);
+    let v2 = snapshot(&part);
+    let v1 = as_v1(&v2);
+    assert!(v1.len() < v2.len(), "v1 really is the shorter encoding");
+
+    let other = new_part();
+    let reader = StateReader::new(&v1).expect("a v1 snapshot");
+    let chunk = reader
+        .load(
+            "nor",
+            CLASS.name,
+            CLASS.version,
+            &crate::machine::default_migrations().expect("the shipped table"),
+        )
+        .expect("a v1 chunk upgrades");
+    assert!(chunk.migrated(), "the chain ran");
+    assert_eq!(chunk.stored_version(), 1);
+    other.load(&mut chunk.reader()).expect("and it loads");
+
+    // The array, the latch and the decoder all came across.
+    assert_eq!(other.contents(), part.contents());
+    assert_eq!(other.status(1) & SR1_WEL, SR1_WEL);
+    // And the two parts are the same machine from here on: the same frames get
+    // the same answers, and the states stay equal.
+    for words in [
+        &[CMD_JEDEC_ID, 0, 0, 0][..],
+        &[CMD_PAGE_PROGRAM, 0, 0x04, 0x00, 0x11, 0x22][..],
+        &[CMD_READ, 0, 0x04, 0x00, 0, 0, 0, 0][..],
+    ] {
+        assert_eq!(
+            frame(&other, words),
+            frame(&part, words),
+            "frame {words:02x?}"
+        );
+    }
+    assert_eq!(snapshot(&other), snapshot(&part));
+}
+
+#[test]
+fn a_v1_chunk_with_no_migration_table_is_refused_by_name() {
+    // The other half of the contract: without the table the load fails loudly,
+    // naming the gap, rather than reading the shifter fields off the end of a
+    // shorter chunk.
+    let part = new_part();
+    let v1 = as_v1(&snapshot(&part));
+    let reader = StateReader::new(&v1).expect("a v1 snapshot");
+    let e = reader
+        .load("nor", CLASS.name, CLASS.version, &Migrations::new())
+        .expect_err("no steps registered")
+        .to_string();
+    assert!(e.contains(CLASS_NAME), "{e}");
+    assert!(e.contains("v1"), "{e}");
+}
+
+#[test]
+fn the_migration_survives_a_chunk_that_is_not_a_v1_chunk() {
+    // A migration is a parser on untrusted input like everything else that
+    // reads a snapshot: the step must not panic on bytes that are nothing like
+    // a v1 chunk, and the v2 `load` behind it must reject them.
+    let table = crate::machine::default_migrations().expect("the shipped table");
+    for hostile in [
+        alloc::vec![],
+        alloc::vec![0u8; 1],
+        alloc::vec![0xff; 64],
+        alloc::vec![0x00; 4096],
+    ] {
+        let mut shape = MachineShape::new();
+        shape.add_device("nor", CLASS.name).expect("a fresh shape");
+        let mut w = StateWriter::new(shape);
+        w.raw_chunk("nor", CLASS.name, 1, &hostile)
+            .expect("a chunk");
+        let bytes = w.to_vec().expect("a snapshot");
+        let reader = StateReader::new(&bytes).expect("well framed");
+        let chunk = reader
+            .load("nor", CLASS.name, CLASS.version, &table)
+            .expect("the step copies whatever it is handed");
+        let part = new_part();
+        // The step appends a power-on shifter to arbitrary bytes; it is the
+        // *device's* `load` that must refuse them, and it must do so with an
+        // error rather than a panic.
+        assert!(part.load(&mut chunk.reader()).is_err(), "{hostile:02x?}");
+    }
+}
+
 #[test]
 fn a_snapshot_from_a_differently_sized_part_is_refused() {
     let big = part_with(Props::new().with("size", Value::Size(SIZE)));

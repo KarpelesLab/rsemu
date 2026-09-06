@@ -1381,16 +1381,15 @@ mod tests {
     ///
     /// A known-failures ledger that only ever shrinks (`CLAUDE.md`). An entry
     /// here is a defect that has been located, not a board that is excused.
-    const RESUME_KNOWN_FAILURES: &[(&str, &str)] = &[(
-        "spi-flash",
-        "`flash.spinor` saves its command decoder and its array and not the \
-         bit-level shifter inside the `SlavePins` it holds — although \
-         `SlavePins::snapshot`/`restore` exist for exactly this and the master \
-         on the same bus, `stm32.spi`, already calls them. A snapshot taken \
-         part way through a word restores a part whose shifter is at power-on, \
-         `Phase` comes back different in the very next byte of the chunk, and \
-         the guest diverges.",
-    )];
+    ///
+    /// **Empty, and it got there by shrinking.** Its last entry was
+    /// `spi-flash`: `flash.spinor` saved its command decoder and its array but
+    /// not the bit-level shifter inside the `SlavePins` it holds, so a snapshot
+    /// taken part way through a word restored a part whose shifter was at
+    /// power-on and the guest diverged. The fix is `flash.spinor` v2, which
+    /// appends the seven shifter fields `stm32.spi` on the other end of the bus
+    /// was already saving, plus the v1 -> v2 step in `machine::migrate`.
+    const RESUME_KNOWN_FAILURES: &[(&str, &str)] = &[];
 
     /// A smaller board, where the description offers the knob.
     ///

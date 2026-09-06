@@ -84,6 +84,7 @@ pub mod lexer;
 // module is where a reader looks for it.
 #[allow(clippy::module_inception)]
 pub mod machine;
+pub mod migrate;
 pub mod parser;
 pub mod rational;
 pub mod realize;
@@ -99,6 +100,7 @@ mod tests;
 pub use crate::machine::ast::SourceUnit;
 pub use crate::machine::diag::Diagnostic;
 pub use crate::machine::machine::Machine;
+pub use crate::machine::migrate::default_migrations;
 pub use crate::machine::parser::parse;
 pub use crate::machine::rational::Rational;
 pub use crate::machine::realize::{

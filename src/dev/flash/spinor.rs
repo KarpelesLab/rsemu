@@ -141,7 +141,13 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "flash.spinor";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// v2 appended the [`SlavePins`] shift register (`ROADMAP.md` §4.5). v1 saved
+/// the command decoder and the array and left the bit-level shifter at
+/// power-on, so a snapshot taken part way through a word restored a part that
+/// had forgotten the bits already clocked in. [`migrations`] carries v1 chunks
+/// forward.
+const STATE_VERSION: u32 = 2;
 
 /// Winbond's JEDEC manufacturer identifier (JEP106, bank 1 code `EFh`).
 pub const WINBOND: u8 = 0xef;
@@ -1302,6 +1308,15 @@ impl SpiNor {
         self.shared.jedec
     }
 
+    /// Whether this part's SCK rests high between frames.
+    ///
+    /// The `mode` property picks it: mode 0 idles low, mode 3 idles high. The
+    /// snapshot stores SCK relative to this so that "power-on" has one
+    /// encoding whatever the mode; see `save`.
+    fn idle_sck(&self) -> bool {
+        self.shared.format.mode.idle_level().is_high()
+    }
+
     /// The part's wire pins, for a controller that drives them directly.
     #[must_use]
     pub fn pins(&self) -> &Arc<SlavePins> {
@@ -1399,6 +1414,11 @@ impl Device for SpiNor {
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         w.write_bytes(&self.contents())?;
+        // The shifter first, though it is written last: its lock ranks *above*
+        // a device's own state (`bus::spi::SHIFTER_RANK` against
+        // `LockRank::DEVICE`), so taking it while holding the state lock would
+        // climb the ladder backwards.
+        let (rx, tx, count, selected, sck, mosi, loaded) = self.pins.snapshot();
         let state = self.shared.state.lock();
         w.write_u8(state.phase.tag())?;
         w.write_u8(state.stream.tag())?;
@@ -1443,7 +1463,27 @@ impl Device for SpiNor {
                 touched[i / 8] |= 1 << (i % 8);
             }
         }
-        w.write_bytes(&touched)
+        w.write_bytes(&touched)?;
+        // The bit-level shifter (v2). Everything above is a *byte* machine, and
+        // the bits that have arrived since its last whole word live in the
+        // `SlavePins` this part holds; a snapshot without them restores a
+        // decoder that disagrees with the wire about where the frame is.
+        // `stm32.spi` on the other end of the bus saves the same seven fields.
+        w.write_u32(rx)?;
+        w.write_u32(tx)?;
+        w.write_u8(count)?;
+        w.write_bool(selected)?;
+        // SCK **relative to this part's idle level**, not the absolute level.
+        // The `mode` property decides whether idle is high or low, so an
+        // absolute bit has no power-on value a static function could name —
+        // and `migrations`, which has to write exactly that value for a v1
+        // chunk, is a static function. Encoding the difference makes power-on
+        // `false` for a mode-0 and a mode-3 part alike.
+        w.write_bool(sck != self.idle_sck())?;
+        w.write_bool(mosi)?;
+        w.write_bool(loaded)
+        // MISO is not saved: it is a level *this* part drives, and
+        // `SlavePins::restore` republishes it from the shifter.
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1533,26 +1573,52 @@ impl Device for SpiNor {
             page.touched[i] = touched_bits[i / 8] & (1 << (i % 8)) != 0;
         }
 
-        let mut state = self.shared.state.lock();
-        *state = State {
-            phase,
-            stream,
-            out,
-            addr: addr % self.shared.size,
-            got,
-            dummy,
-            span,
+        let shifter = (
+            r.read_u32()?,
+            r.read_u32()?,
+            r.read_u8()?,
+            r.read_bool()?,
+            r.read_bool()?,
+            r.read_bool()?,
+            r.read_bool()?,
+        );
+
+        {
+            let mut state = self.shared.state.lock();
+            *state = State {
+                phase,
+                stream,
+                out,
+                addr: addr % self.shared.size,
+                got,
+                dummy,
+                span,
+                count,
+                sr1,
+                sr2,
+                sr3,
+                powered_down,
+                reset_armed,
+                staged,
+                sr_in,
+                sr_in_len,
+                page,
+            };
+        }
+        // Outside the state lock, and after it: `SlavePins::restore` takes the
+        // shifter lock, which ranks *above* a device's own state
+        // (`bus::spi::SHIFTER_RANK`), and republishes MISO, which is an
+        // outward call (`CLAUDE.md`, the re-entrancy contract).
+        let (rx, tx, count, selected, sck_rel, mosi, loaded) = shifter;
+        self.pins.restore((
+            rx,
+            tx,
             count,
-            sr1,
-            sr2,
-            sr3,
-            powered_down,
-            reset_armed,
-            staged,
-            sr_in,
-            sr_in_len,
-            page,
-        };
+            selected,
+            sck_rel != self.idle_sck(),
+            mosi,
+            loaded,
+        ));
         Ok(())
     }
 
@@ -1688,6 +1754,56 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 /// [`Error::Config`] if the class is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     bindings.bind(CLASS_NAME, |props| Ok(Arc::new(SpiNor::new(props)?)))
+}
+
+/// Register this class's snapshot upgrade steps.
+///
+/// `crate::machine::default_migrations` calls this, so a save state written by
+/// an older build loads through [`Machine::load`](crate::machine::Machine::load)
+/// with nothing for the caller to arrange.
+///
+/// # v1 -> v2: the shifter that v1 never wrote
+///
+/// v1 ended after the page-program latch's coverage map; v2 appends the seven
+/// [`SlavePins`] shifter fields. The v1 encoding is therefore a *prefix* of the
+/// v2 one, and the step is a verbatim copy followed by the shifter a v1 restore
+/// left behind — the power-on one, because that is what `SpiNor::reset` puts
+/// there and v1 never overwrote it.
+///
+/// That is the honest limit of this migration, and worth saying out loud: a v1
+/// snapshot taken part way through a word does not carry the bits already
+/// clocked in, so no upgrade can produce them. What the step guarantees is what
+/// v1 *meant* — a part between frames restores exactly, and one caught mid-word
+/// restores to the same wrong place v1 restored it to, rather than refusing to
+/// load at all.
+///
+/// The copy is verbatim rather than field-by-field on purpose. Re-decoding
+/// every field only to re-encode it identically would be a second copy of
+/// `load` that nothing forces to stay in step, and it would reject bytes that
+/// the v2 `load` — the real parser, which runs immediately afterwards — is
+/// going to check anyway. Copying bounded by the input cannot itself be made to
+/// panic or over-allocate, which is the property a migration owes an untrusted
+/// snapshot (`fuzz/fuzz_targets/state_decoder.rs`).
+///
+/// # Errors
+///
+/// [`Error::State`] if a step is already registered for this class.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS_NAME, 1, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        // rx, tx, count: nothing shifted.
+        out.write_u32(0)?;
+        out.write_u32(0)?;
+        out.write_u8(0)?;
+        // selected: `SpiNor::reset` deasserts. sck: idle, which is what the
+        // relative encoding calls `false` in either mode — the reason `save`
+        // stores it relative at all. mosi: low. loaded: nothing preloaded.
+        out.write_bool(false)?;
+        out.write_bool(false)?;
+        out.write_bool(false)?;
+        out.write_bool(false)
+    })
 }
 
 /// What the validator should know about `flash.spinor`.

@@ -206,6 +206,49 @@ fn selecting_deasserts_the_previous_slave_before_asserting_the_next() {
 }
 
 #[test]
+fn restoring_the_selection_reaches_the_routing_and_not_the_slave() {
+    // The distinction the `spi-flash` board's snapshot turned on. A chip select
+    // is a level a master drives, so a restoring master has to put it back —
+    // but *nothing moved*, and a slave's `select` is where it begins a frame.
+    // Going through `select` on a freshly built bus would manufacture a falling
+    // edge and throw away whatever mid-frame state the snapshot had just
+    // restored into the part.
+    let bus = SpiBus::new();
+    let slave = Echo::new(Format::DEFAULT, &[0xa5]);
+    bus.attach(ChipSelect(2), Arc::clone(&slave) as Arc<dyn SpiSlave>)
+        .unwrap();
+
+    bus.restore_select(Some(ChipSelect(2)));
+    assert_eq!(bus.selected(), Some(ChipSelect(2)), "the routing moved");
+    assert_eq!(slave.take_log(), vec![], "and the part heard nothing");
+    // And it is a real selection, not a cosmetic one: a transfer routes to the
+    // part. What comes *back* is the pull-up, because `Echo` loads its shift
+    // register from `select` and nothing selected it — which is the mock
+    // saying, correctly, that it was never told a frame began.
+    assert_eq!(bus.transfer(0x11), 0xff, "eight bits of pull-up");
+    assert_eq!(slave.take_log(), vec![Word::Transfer(0x11)]);
+    assert_eq!(bus.transfer(0x22), 0xa5, "and the reply queue moves on");
+    assert_eq!(slave.take_log(), vec![Word::Transfer(0x22)]);
+
+    // Deasserting afterwards is an edge like any other, because this time the
+    // line really did move.
+    bus.select(None);
+    assert_eq!(slave.take_log(), vec![Word::Select(false)]);
+}
+
+#[test]
+fn a_restored_selection_out_of_range_is_dropped_rather_than_stored() {
+    // `attach` refuses a chip select this bus cannot route, and `selected`
+    // hands its answer to callers that will index with it. A snapshot is
+    // untrusted input, so the restore path applies the same rule.
+    let bus = SpiBus::new();
+    bus.restore_select(Some(ChipSelect(MAX_CHIP_SELECTS as u8)));
+    assert_eq!(bus.selected(), None);
+    bus.restore_select(Some(ChipSelect(u8::MAX)));
+    assert_eq!(bus.selected(), None);
+}
+
+#[test]
 fn clocking_a_bus_with_nothing_on_it_reads_the_pull_up() {
     // Probing an empty chip select is ordinary firmware behaviour, not an error.
     let bus = SpiBus::new();
@@ -923,6 +966,77 @@ fn the_controller_round_trips_through_a_snapshot() {
             "register {offset:#04x} differs after a round trip"
         );
     }
+}
+
+#[test]
+fn restoring_a_controller_that_held_a_chip_select_does_not_restart_the_frame() {
+    // The same defect as `restoring_the_selection_reaches_the_routing_and_not_
+    // the_slave`, one level up, where it actually bites: a controller whose
+    // `CS` register says it holds the line has to put the bus back on load, and
+    // the part on the other end must not hear a fresh chip select — because
+    // that is where a part *begins a frame*, discarding whatever the snapshot
+    // just restored into it.
+    let bus = Arc::new(SpiBus::new());
+    let echo = Echo::new(Format::DEFAULT, &[]);
+    bus.attach(ChipSelect(0), Arc::clone(&echo) as Arc<dyn SpiSlave>)
+        .unwrap();
+
+    let ctrl = transactional(&bus);
+    let region = regs(&ctrl);
+    poke(&region, 0x00, ctrl_word(Mode::Mode0, 8, BitOrder::MsbFirst));
+    poke(&region, 0x08, 1); // assert CS0, part way through a conversation
+    assert_eq!(echo.take_log(), vec![Word::Select(true)]);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("spi", SPI_CONTROLLER_CLASS.name).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w
+            .chunk(
+                "spi",
+                SPI_CONTROLLER_CLASS.name,
+                SPI_CONTROLLER_CLASS.version,
+            )
+            .unwrap();
+        ctrl.save(&mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    // A second machine: a bus with nothing selected on it and a controller that
+    // has only ever been reset, which is what a restore actually starts from.
+    let fresh = Arc::new(SpiBus::new());
+    let restored_slave = Echo::new(Format::DEFAULT, &[]);
+    fresh
+        .attach(
+            ChipSelect(0),
+            Arc::clone(&restored_slave) as Arc<dyn SpiSlave>,
+        )
+        .unwrap();
+    let other = transactional(&fresh);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load(
+            "spi",
+            SPI_CONTROLLER_CLASS.name,
+            SPI_CONTROLLER_CLASS.version,
+            &Migrations::new(),
+        )
+        .unwrap();
+    other.load(&mut chunk.reader()).unwrap();
+
+    assert_eq!(
+        restored_slave.take_log(),
+        vec![],
+        "the restored part was told a frame began that never did"
+    );
+    assert_eq!(
+        fresh.selected(),
+        Some(ChipSelect(0)),
+        "and the bus forgot which chip select the controller holds"
+    );
+    // Releasing it afterwards is a real edge, and the part hears that one.
+    poke(&regs(&other), 0x08, 0);
+    assert_eq!(restored_slave.take_log(), vec![Word::Select(false)]);
 }
 
 #[test]
