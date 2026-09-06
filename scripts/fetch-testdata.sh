@@ -200,6 +200,26 @@ readonly LUA_TAR_SHA="9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cf
 readonly SBASE_REPO="https://git.suckless.org/sbase"
 readonly SBASE_COMMIT="c546c3a5724c81cee9a11d816a38ccdf17472129"
 
+# The dynamic loaders, for a host with no cross sysroot to copy one out of.
+#
+# `ld-linux-<arch>.so.1` is the one thing in the level-3 corpus that no
+# compiler can produce, and the RISC-V one is the one a typical Linux host does
+# not happen to have -- which is why dynamic linking on RISC-V went untested
+# for as long as it did. Debian's `libc6-<arch>-cross` packages are the
+# smallest thing that carries one: architecture-independent `.deb`s, about a
+# megabyte, holding a whole runtime sysroot for the target. They are a *last
+# resort*, tried only after RSEMU_USERMODE_LDSO and the host's own sysroots.
+#
+# FETCH-ONLY, and more pointedly so than the rest: glibc is LGPL-2.1. Running
+# one as an emulated guest is ordinary use; committing one here would be
+# redistribution (CLAUDE.md, Provenance). Nothing under testdata/ is committed,
+# and PROVENANCE.txt says which build this was.
+readonly DEBIAN_CROSS_POOL="https://deb.debian.org/debian/pool/main/c/cross-toolchain-base"
+readonly LDSO_DEB_riscv64="libc6-riscv64-cross_2.43-3cross8_all.deb"
+readonly LDSO_DEB_SHA_riscv64="4db8853722995b2f5218d9001811d8e55209038f37ede41ff9c07761704d3230"
+readonly LDSO_DEB_aarch64="libc6-arm64-cross_2.43-3cross8_all.deb"
+readonly LDSO_DEB_SHA_aarch64="1192c1a3de7c48169235ff137c6b6f81ad7af93b0f26b48fbe39b8030388c43a"
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -2440,16 +2460,17 @@ of rsemu and nothing in it is redistributed by rsemu."
 # A static binary needs nothing but a compiler; a dynamic one needs a *dynamic
 # loader*, and there is no way to build one of those out of a Rust toolchain.
 # So this half is conditional in a way the static half is not: it looks for an
-# `ld-linux-<arch>.so.1` on the host, and if there is not one it says so and
-# leaves the corpus without a dynamic guest. `src/usermode/proof.rs` then skips
-# the tests that need it, exactly as it skips an architecture whose standard
-# library is not installed.
+# `ld-linux-<arch>.so.1` on the host, then fetches a pinned one, and only if
+# both fail does it say so and leave the corpus without a dynamic guest for
+# that architecture. `src/usermode/proof.rs` then skips the tests that need it,
+# exactly as it skips an architecture whose standard library is not installed.
 #
-# Nothing is committed and nothing is downloaded here either: the loader is
-# *copied* out of a cross sysroot the host already has, into the git-ignored
-# corpus, and it is run as an emulated guest. glibc is LGPL, and running a
-# program is ordinary use (CLAUDE.md, Provenance); shipping it here would not
-# be, which is why this copies rather than vendors.
+# Nothing is committed: the loader is *copied* into the git-ignored corpus and
+# run as an emulated guest, either out of a cross sysroot the host already has
+# or -- failing that -- out of a pinned Debian cross package fetched into the
+# corpus like every other fixture. glibc is LGPL, and running a program is
+# ordinary use (CLAUDE.md, Provenance); shipping it here would not be, which is
+# why this copies rather than vendors.
 usermode_ldso() {
 	local arch="$1" name="$2" candidate
 	# The override names one file, so it only answers for the architecture
@@ -2470,7 +2491,51 @@ usermode_ldso() {
 		"/lib64/${name}"; do
 		[ -f "$candidate" ] && printf '%s\n' "$candidate" && return 0
 	done
-	return 1
+	usermode_fetch_sysroot "$arch" "$name"
+}
+
+# The last resort: unpack a pinned Debian `libc6-<arch>-cross` into the corpus
+# and answer out of that.
+#
+# Extraction is `ar` plus `tar` rather than `dpkg-deb`, because a `.deb` is an
+# `ar` archive of two tarballs and binutils is already needed by everything
+# else here, while `dpkg` is absent on a non-Debian host -- which is exactly
+# the host that needs this path. Everything is written to stderr: this runs
+# inside a command substitution whose stdout is the answer.
+usermode_fetch_sysroot() {
+	local arch="$1" name="$2"
+	local deb sha root found
+	eval "deb=\${LDSO_DEB_${arch}:-}"
+	eval "sha=\${LDSO_DEB_SHA_${arch}:-}"
+	[ -n "$deb" ] || return 1
+	command -v curl >/dev/null 2>&1 || return 1
+	command -v ar >/dev/null 2>&1 || return 1
+
+	root="${DEST_ROOT}/usermode/.sysroot-${arch}"
+	# The package is a sysroot, so the loader lands under `/usr/<triple>/lib`;
+	# finding it rather than spelling it keeps one pin per architecture instead
+	# of two.
+	found="$(find "$root" -name "$name" -type f 2>/dev/null | head -n 1)"
+	if [ -n "$found" ]; then
+		printf '%s\n' "$found"
+		return 0
+	fi
+
+	note "  no ${name} on this host; fetching ${deb} ..." >&2
+	mkdir -p "$root"
+	fetch_verified "${DEBIAN_CROSS_POOL}/${deb}" "${root}/${deb}" "$sha" fatal >&2 || return 1
+	(cd "$root" && ar x "$deb" && tar xf data.tar.* &&
+		rm -f data.tar.* control.tar.* debian-binary) >&2 || return 1
+	write_notice "$root" "A Debian cross runtime sysroot, fetched and never committed.
+
+  ${DEBIAN_CROSS_POOL}/${deb}
+
+Only ${name} is used, and only as an emulated level-3 guest. glibc is
+LGPL-2.1: running one is ordinary use, redistributing one is not, and nothing
+under testdata/ is part of rsemu."
+	found="$(find "$root" -name "$name" -type f 2>/dev/null | head -n 1)"
+	[ -n "$found" ] || return 1
+	printf '%s\n' "$found"
 }
 
 build_usermode_dynamic() {
@@ -2493,8 +2558,9 @@ build_usermode_dynamic() {
 			continue
 		fi
 		if ! ldso="$(usermode_ldso "$arch" "$ldso_name")"; then
-			note "  no ${ldso_name} on this host; skipping the ${suffix} dynamic guest"
-			note "    a cross sysroot supplies one, or set RSEMU_USERMODE_LDSO"
+			note "  no ${ldso_name} anywhere; skipping the ${suffix} dynamic guest"
+			note "    a cross sysroot supplies one, RSEMU_USERMODE_LDSO names one,"
+			note "    and failing both a pinned Debian cross package is fetched"
 			continue
 		fi
 		root="${dest}/dynamic-${suffix}.root"
@@ -2521,7 +2587,7 @@ build_usermode_dynamic() {
 		cp -f "$ldso" "${root}/lib/${ldso_name}"
 		built=$((built + 1))
 
-		build_usermode_glibc "$dest" "$suffix" "$ldso" "$ldso_name" || true
+		build_usermode_glibc "$dest" "$suffix" "$ldso" "$ldso_name" "$target" || true
 	done
 
 	if [ "$built" -gt 0 ]; then
@@ -2532,38 +2598,95 @@ build_usermode_dynamic() {
 }
 
 # The *whole* dynamically linked program: `tests/usermode/hello.rs` again, but
-# linked against the host's cross glibc rather than statically against musl.
+# linked against a real glibc rather than statically against musl. This is the
+# hardest thing in the level-3 corpus -- a C library's whole startup, its
+# relocations and its ifunc resolvers, under a real `ld.so`.
 #
-# This one is a ledger entry rather than a gate, and it needs a cross `gcc` as
-# a link driver because a glibc executable pulls in `Scrt1.o`, `crti.o` and
-# `libgcc_s`. Absent either, it is skipped. `src/usermode/proof.rs` says what
-# it measures.
+# It needs a **link driver**, because a glibc executable pulls in `Scrt1.o`,
+# `crti.o` and a `libgcc`, and rustc will not assemble those itself. Two things
+# can be one: the host's cross `gcc`, or `zig cc`, which already has to be
+# present for the third-party guests. Absent both, this is skipped.
+#
+# The runtime libraries are copied out of **the same directory the `ld.so` came
+# from**, not out of the compiler's sysroot, because those two need not be the
+# same glibc and a loader will refuse a `libc.so.6` that is older than itself.
 build_usermode_glibc() {
-	local dest="$1" suffix="$2" ldso="$3" ldso_name="$4"
-	local triple="${suffix}-unknown-linux-gnu" cc root libc libgcc
-	cc="${triple}-gcc"
-	command -v "$cc" >/dev/null 2>&1 || {
-		note "  no ${cc}; skipping the ${suffix} glibc guest"
+	# `triple` is the caller's, because a Rust target is not the architecture
+	# with a suffix glued on: RISC-V's is `riscv64gc-unknown-linux-gnu`.
+	local dest="$1" suffix="$2" ldso="$3" ldso_name="$4" triple="$5"
+	local cc root libc libgcc lib sysroot
+	if ! cc="$(usermode_glibc_cc "$suffix" "$dest")"; then
+		note "  no cross gcc for ${suffix} and no zig; skipping its glibc guest"
 		return 1
-	}
-	libc="$("$cc" -print-file-name=libc.so.6)"
-	libgcc="$("$cc" -print-file-name=libgcc_s.so.1)"
+	fi
+	sysroot="$(dirname "$ldso")"
+	libc="${sysroot}/libc.so.6"
+	if [ ! -f "$libc" ]; then
+		libc="$("$cc" -print-file-name=libc.so.6)"
+	fi
 	[ -f "$libc" ] || return 1
 	root="${dest}/glibc-${suffix}.root"
 	mkdir -p "${root}/lib"
-	note "  building glibc for ${triple} ..."
+	note "  building glibc for ${triple} with ${cc} ..."
+	# Both milestone guests, against the same C library and sharing one
+	# namespace: `hello` is the startup and `threads` is what a *threaded*
+	# glibc asks for, which is a different list from what musl asks for and is
+	# the only place `clone`'s glibc-side contract gets exercised.
 	rustc --edition 2024 --target "$triple" \
 		-C linker="$cc" -C opt-level=1 -C debuginfo=0 -C strip=symbols \
 		--crate-name glibc -o "${dest}/glibc-${suffix}" \
 		"${REPO_ROOT}/tests/usermode/hello.rs" || return 1
+	rustc --edition 2024 --target "$triple" \
+		-C linker="$cc" -C opt-level=1 -C debuginfo=0 -C strip=symbols \
+		--crate-name glibc_threads -o "${dest}/glibc-threads-${suffix}" \
+		"${REPO_ROOT}/tests/usermode/threads.rs" || return 1
 	cp -f "$ldso" "${root}/lib/${ldso_name}"
 	cp -f "$libc" "${root}/lib/libc.so.6"
-	# `libgcc_s` is a DT_NEEDED of anything rustc links, and it lives in the
-	# compiler's directory rather than the sysroot.
-	if [ -f "$libgcc" ]; then
+	# Before 2.34 glibc was five objects rather than one, and linking against
+	# an older version is how this guest comes to have four `DT_NEEDED`s
+	# instead of two -- which is a *harder* exercise for the loader and is what
+	# a great deal of shipped software still looks like. Stage whichever of
+	# them the sysroot has; the guest opens only the ones it names.
+	for lib in libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1; do
+		if [ -f "${sysroot}/${lib}" ]; then
+			cp -f "${sysroot}/${lib}" "${root}/lib/${lib}"
+		fi
+	done
+	# `libgcc_s` is a DT_NEEDED of anything a cross gcc links, and it lives in
+	# the compiler's directory rather than the sysroot. `zig cc` links its own
+	# compiler-rt statically, needs none, and does not answer the question --
+	# hence the `|| true` rather than a check on which driver this is.
+	libgcc="$("$cc" -print-file-name=libgcc_s.so.1 2>/dev/null || true)"
+	if [ -n "$libgcc" ] && [ -f "$libgcc" ]; then
 		cp -f "$libgcc" "${root}/lib/libgcc_s.so.1"
 	fi
 	return 0
+}
+
+# The link driver for the glibc guest: a cross `gcc` if the host has one, and
+# otherwise a two-line wrapper round `zig cc`, which carries glibc's headers
+# and stub libraries for every target it knows.
+#
+# `-C linker` takes one program and no arguments, hence the wrapper file. The
+# glibc version it links against is deliberately old: 2.28 predates the 2.34
+# merge, so the executable names `libpthread`, `libdl` and `librt` separately
+# and the loader has four objects to place instead of two. It is also older
+# than any `ld.so` this can be paired with, which is the direction that works.
+usermode_glibc_cc() {
+	local suffix="$1" dest="$2" cc zig wrapper
+	for cc in "${suffix}-unknown-linux-gnu-gcc" "${suffix}-linux-gnu-gcc"; do
+		if command -v "$cc" >/dev/null 2>&1; then
+			command -v "$cc"
+			return 0
+		fi
+	done
+	zig="${RSEMU_ZIG:-zig}"
+	command -v "$zig" >/dev/null 2>&1 || return 1
+	wrapper="${dest}/.cc-${suffix}"
+	printf '#!/bin/sh\nexec %s cc -target %s-linux-gnu.2.28 "$@"\n' \
+		"$(command -v "$zig")" "$suffix" >"$wrapper"
+	chmod +x "$wrapper"
+	printf '%s\n' "$wrapper"
 }
 
 usage() {
@@ -2593,11 +2716,14 @@ Suites:
                  installed (`rustup target add ...`); an absent one is skipped
                  with a note. musl and the linker both come from the Rust
                  toolchain.
-                 It also builds a *dynamically* linked guest where it can,
-                 which needs one thing a compiler cannot produce: a real
-                 ld-linux-<arch>.so.1. That is looked for in the usual cross
-                 sysroots and named by RSEMU_USERMODE_LDSO; without one the
-                 dynamic guests are skipped and the static ones still run.
+                 It also builds *dynamically* linked guests, which need one
+                 thing a compiler cannot produce: a real ld-linux-<arch>.so.1.
+                 That is looked for in the usual cross sysroots, named by
+                 RSEMU_USERMODE_LDSO, and failing both taken from a pinned
+                 Debian libc6-<arch>-cross package fetched into the corpus.
+                 A whole-glibc guest is built beside it wherever there is a
+                 link driver -- a cross gcc, or the same zig the third-party
+                 guests use; without one it is skipped and the rest still run.
                  Finally it fetches and cross-builds three *third-party*
                  programs -- sqlite (public domain), lua (MIT) and sbase (MIT)
                  -- which needs a C cross compiler for <arch>-linux-musl.
