@@ -897,10 +897,10 @@ impl Hart {
     /// instruction, where a block would be wrong — under either JIT engine.
     ///
     /// `remaining` is what is left of the caller's budget, and it is not
-    /// advisory: a block whose worst case does not fit is not run, so that
-    /// a hart stops on the same instruction whichever engine drives it. See
-    /// `engine`'s module documentation for why that matters as far as the
-    /// machine's state hash.
+    /// advisory: a block that spends it leaves at its next guest instruction
+    /// boundary, so a hart stops on the same instruction whichever engine
+    /// drives it. See `engine`'s module documentation for why that matters as
+    /// far as the machine's state hash.
     fn advance(&self, remaining: u64) -> (u64, Option<Exit>) {
         #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
         if self.engine.translates() {

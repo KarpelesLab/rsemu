@@ -40,16 +40,23 @@
 //!   skipped its own translation — so block chaining, `ROADMAP.md` §9's second
 //!   mechanism, never ran. It has one now ([`Frontend::enter`]), [`admit`] is
 //!   what it calls, and a call runs up to [`CHAIN`] blocks.
-//! * **A block never runs unless its worst case fits the budget left.**
-//!   Otherwise the guest's *stopping point* inside a scheduler quantum would
-//!   depend on the engine: an interpreter overruns its budget by one
-//!   instruction and a trace by up to sixty-four, the overrun is carried as
-//!   `State::debt`, and both numbers are in the snapshot a machine's state
-//!   hash is taken over. So the tail of every quantum is interpreted and the
-//!   two engines stop on the same instruction with the same debt. [`Costs`] is
-//!   what keeps the bound tight enough for that tail to be short — and the
-//!   guard is asked once per block of a chain, against what the chain has
-//!   *left*, not once per [`advance`].
+//! * **A block leaves at a guest instruction boundary when the caller's ticks
+//!   run out.** Otherwise the guest's *stopping point* inside a scheduler
+//!   quantum would depend on the engine: an interpreter overruns its budget by
+//!   one instruction and a trace by up to sixty-four, the overrun is carried
+//!   as `State::debt`, and both numbers are in the snapshot a machine's state
+//!   hash is taken over. [`Host::spent`] is the whole of it — `Exec::used`
+//!   against what [`advance`] was handed, asked at every boundary but a
+//!   block's first and an exit, and answered by publishing the boundary's live
+//!   map exactly as a fault does.
+//!
+//!   It replaced a *guard*: a block used to run only where its worst case,
+//!   read off its ops, fitted what was left, so the tail of every quantum was
+//!   interpreted. That was sound and it was expensive — on the x86 core, which
+//!   has the fatter blocks and the bigger measurement, it was 2.02% of the
+//!   whole guest instruction stream, three times everything outside the lifted
+//!   subset put together. Nothing here computes a block's cost any more, and
+//!   [`Unlifted`] is what is left of the table that used to hold one.
 //! * **A pending interrupt is looked for at every block boundary**, chained
 //!   ones included, which is what keeps a sixteen-block chain
 //!   indistinguishable from sixteen one-block calls. A store into the CLINT or
@@ -221,7 +228,7 @@ use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitMask};
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
 use crate::core::value::Width;
-use crate::ir::{Block, InsnStart, IrHost, MemOp, Opcode, RegSlot, verify};
+use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, verify};
 use crate::jit::{
     BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, MemPlan, PAGE_MASK, Stop,
     StoreLog, Translation,
@@ -259,23 +266,18 @@ const SHAPE: Shape = Shape::Trace;
 /// — at most [`lift::MAX_INSNS`] guest instructions. It is now honoured within
 /// at most `CHAIN` blocks, so **1 024 guest instructions**, and still within
 /// what is left of the quantum's tick budget, because every block of the chain
-/// is admitted against that budget by [`admit`] before it runs.
+/// is asked [`Host::spent`] before it runs and every boundary inside one is
+/// asked it too.
 /// `a_chain_is_bounded_by_the_stated_safe_point_number` asserts the block half
-/// of that, and `the_same_agreement_holds_over_budgets_a_block_does_not_fit_in`
-/// the tick half.
+/// of that, and
+/// `the_same_agreement_holds_over_budgets_a_block_leaves_part_way_through` the
+/// tick half.
 ///
 /// Sixteen rather than sixty-four because the curve is flat past it — the
 /// per-block cost being amortized is a fixed overhead, so the second block of
 /// a chain removes half of it and the sixteenth removes a fifteenth — and a
 /// safe point is worth more than the last percent.
 const CHAIN: usize = 16;
-
-/// The most bus accesses one Sv39 walk can make: three levels of descriptor
-/// reads and at most one accessed/dirty write-back.
-///
-/// Used only to bound a block's worst case, so a walk that makes fewer makes
-/// the bound conservative rather than wrong.
-const WALK_ACCESSES: u64 = 4;
 
 /// How many blocks this hart's cache holds before it evicts.
 ///
@@ -291,12 +293,12 @@ const WALK_ACCESSES: u64 = 4;
 /// working set never fills it.
 const BLOCKS: usize = 65536;
 
-/// How many `(pc, key) -> worst-case ticks` answers are remembered.
+/// How many *"there is no block at this PC"* answers are remembered.
 ///
 /// Direct-mapped and keyed by the guest PC, exactly as the block cache is, and
-/// sized with it so a resident block usually has a resident cost. A miss is a
-/// conservative answer, never a wrong one.
-const COST_SLOTS: usize = 65536;
+/// sized with it so a resident block usually has a resident answer. A miss
+/// costs one wasted lift, never a wrong decision.
+const UNLIFTED_SLOTS: usize = 65536;
 
 /// How big a host code buffer this hart asks for: 256 MiB.
 ///
@@ -327,7 +329,8 @@ const CODE_BUFFER: u64 = 256 << 20;
 // What a hart keeps between blocks
 // ---------------------------------------------------------------------------
 
-/// This hart's translation state: the dispatcher, and the costs beside it.
+/// This hart's translation state: the dispatcher, and the PCs there is no
+/// block at beside it.
 ///
 /// **Derived state in the strict sense** (`ROADMAP.md` §4.5): never
 /// serialized, and thrown away by a reset, by a snapshot restore and by a
@@ -337,7 +340,7 @@ const CODE_BUFFER: u64 = 256 << 20;
 #[derive(Debug)]
 pub(super) struct Jit {
     disp: Dispatcher,
-    costs: Costs,
+    unlifted: Unlifted,
 }
 
 impl Jit {
@@ -359,14 +362,14 @@ impl Jit {
         let _ = host_code;
         Jit {
             disp,
-            costs: Costs::new(),
+            unlifted: Unlifted::new(),
         }
     }
 
     /// Throw every translation away.
     pub(super) fn flush(&mut self) {
         self.disp.cache_mut().flush();
-        self.costs.clear();
+        self.unlifted.clear();
     }
 
     /// Blocks executed, and how many of those ran as host code.
@@ -395,31 +398,28 @@ impl Jit {
     }
 }
 
-/// A direct-mapped table of `(pc, key) -> the most ticks that block can spend`,
-/// with zero meaning *there is no block here*.
+/// A direct-mapped table of the `(pc, key)` pairs there is **no block** at.
 ///
-/// Two jobs, both about not paying for the same answer twice.
+/// One job, and it is about not paying for the same answer twice: the
+/// instruction at that PC is outside the lifted subset, so there is nothing to
+/// translate and the interpreter should be reached directly. Without it every
+/// `amoadd`, every `csrrw` and every `ecall` costs a dispatcher round trip and
+/// a fresh [`lift::lift`] that fails at its first instruction — measured at
+/// **42 million wasted lifts** in four minutes of guest time on a Linux boot,
+/// against 1.1 million real ones, because RISC-V atomics are not in the subset
+/// and a kernel is full of them.
 ///
-/// The budget guard needs an upper bound *before* a block runs, and computing
-/// one means walking the block's ops — which costs more than running the
-/// compiled block does. So it is computed once, where the block is lifted, and
-/// remembered here. A collision loses an answer and costs a conservative
-/// bound.
+/// It used to hold a *number* as well — the most ticks the block at that PC
+/// could charge, computed once where the block was lifted because walking a
+/// block's ops costs more than running the compiled block does. [`Host::spent`]
+/// retired the guard that number was for, so the only answer left is the
+/// negative one, and recording only negatives means a positive answer can no
+/// longer evict a negative one from the slot they share.
 ///
-/// A recorded **zero** is the other job: the instruction at that PC is outside
-/// the lifted subset, so there is nothing to translate and the interpreter
-/// should be reached directly. Without it every `amoadd`, every `csrrw` and
-/// every `ecall` costs a dispatcher round trip and a fresh [`lift::lift`] that
-/// fails at its first instruction — measured at **42 million wasted lifts** in
-/// four minutes of guest time on a Linux boot, against 1.1 million real ones,
-/// because RISC-V atomics are not in the subset and a kernel is full of them.
-/// Zero is a safe sentinel because a block that exists charges at least one
-/// tick for its own fetch.
-///
-/// The negative half is discarded whenever a guest write invalidates a
-/// translation, because the bytes it was an answer about may be different now.
+/// It is discarded whenever a guest write invalidates a translation, because
+/// the bytes it was an answer about may be different now.
 #[derive(Debug)]
-struct Costs {
+struct Unlifted {
     slots: Box<[Slot]>,
 }
 
@@ -427,35 +427,34 @@ struct Costs {
 struct Slot {
     pc: u64,
     key: u64,
-    ticks: u64,
     live: bool,
 }
 
-impl Costs {
-    fn new() -> Costs {
-        Costs {
-            slots: vec![Slot::default(); COST_SLOTS].into_boxed_slice(),
+impl Unlifted {
+    fn new() -> Unlifted {
+        Unlifted {
+            slots: vec![Slot::default(); UNLIFTED_SLOTS].into_boxed_slice(),
         }
     }
 
     /// The low bit of a guest PC is always zero, so it carries nothing.
     #[inline]
     fn index(pc: u64) -> usize {
-        ((pc >> 1) as usize) & (COST_SLOTS - 1)
+        ((pc >> 1) as usize) & (UNLIFTED_SLOTS - 1)
+    }
+
+    /// Whether the last lift at this `(pc, key)` produced nothing.
+    #[inline]
+    fn holds(&self, pc: u64, key: u64) -> bool {
+        let slot = &self.slots[Unlifted::index(pc)];
+        slot.live && slot.pc == pc && slot.key == key
     }
 
     #[inline]
-    fn get(&self, pc: u64, key: u64) -> Option<u64> {
-        let slot = &self.slots[Costs::index(pc)];
-        (slot.live && slot.pc == pc && slot.key == key).then_some(slot.ticks)
-    }
-
-    #[inline]
-    fn put(&mut self, pc: u64, key: u64, ticks: u64) {
-        self.slots[Costs::index(pc)] = Slot {
+    fn note(&mut self, pc: u64, key: u64) {
+        self.slots[Unlifted::index(pc)] = Slot {
             pc,
             key,
-            ticks,
             live: true,
         };
     }
@@ -463,44 +462,6 @@ impl Costs {
     fn clear(&mut self) {
         self.slots.fill(Slot::default());
     }
-}
-
-/// What one guest access can cost this hart, at worst.
-///
-/// One bus cycle when aligned; one per byte when it splits, which a hart that
-/// performs misaligned accesses may do; and a page-table walk in front of each
-/// of those when translation is on, because each byte of a split access is
-/// translated on its own and may miss.
-const fn per_access(cfg: &Config, translating: bool) -> u64 {
-    let split = if cfg.misaligned { 8 } else { 1 };
-    let walk = if translating { WALK_ACCESSES } else { 0 };
-    split * (1 + walk)
-}
-
-/// The most ticks `block` can charge, read off its ops.
-///
-/// Every [`Opcode::CHARGE`] is counted even though a run takes one path
-/// through a trace, and every access is charged its worst case, so this
-/// over-estimates by construction — the only direction that is safe.
-fn block_bound(block: &Block, access: u64, entry: u64) -> u64 {
-    let mut ticks = entry;
-    for inst in block.insts() {
-        match inst.op {
-            Opcode::CHARGE => {
-                ticks = ticks.saturating_add(inst.imm.map_or(0, |c| c.bits() as u64));
-            }
-            Opcode::LD | Opcode::ST => ticks = ticks.saturating_add(access),
-            _ => {}
-        }
-    }
-    ticks
-}
-
-/// The bound for a block nothing is known about: the frontend's whole
-/// instruction limit, every instruction an uncompressed access.
-const fn worst_bound(cfg: &Config, translating: bool) -> u64 {
-    let entry = if translating { WALK_ACCESSES } else { 0 };
-    lift::MAX_INSNS as u64 * (2 + per_access(cfg, translating)) + entry
 }
 
 /// What names a block besides its guest PC: the world it was lifted in.
@@ -563,19 +524,16 @@ struct Admitted {
     /// byte the lifter may read.
     page: u64,
     base: u64,
-    /// What one guest access costs at worst, and what the entry fetch costs.
-    access: u64,
-    entry: u64,
 }
 
-/// Whether a block may run at `pc`, and what it costs to find out.
+/// Whether a block may run at `pc`.
 #[derive(Debug)]
 enum Admit {
     /// It may.
     Ready(Admitted),
     /// It may not, and the reason is one the interpreter answers: a pending
-    /// interrupt, a stalled `WFI`, an instruction outside the lifted subset,
-    /// or a worst case that does not fit what is left of the budget.
+    /// interrupt, a stalled `WFI`, or an instruction outside the lifted
+    /// subset.
     Interpret,
     /// The entry fetch itself faulted.
     Trap(Trap),
@@ -585,7 +543,7 @@ enum Admit {
 /// for every chained successor alike, which is the whole point of it being one
 /// function.
 ///
-/// Three things happen here and the order is load-bearing.
+/// Two things happen here and the order is load-bearing.
 ///
 /// **The interrupt check first.** A pending interrupt, a stalled `WFI` and an
 /// instruction outside the lifted subset are all the interpreter's, and
@@ -600,14 +558,14 @@ enum Admit {
 /// first fetch charges it, and performed on every execution rather than at
 /// lift time, because a cached block must cost what an uncached one cost. Two
 /// bytes is the low halfword's width: `exec::fetch` translates for that first,
-/// and translates again for the high half, which then hits.
+/// and translates again for the high half, which then hits. It is also what
+/// *names* the block, which is why the lookup below comes after it.
 ///
-/// **Then the budget guard**, and it is after the translation because the
-/// translation is also what *names* the block. A guard that declined
-/// afterwards has not wasted the walk: the interpreter's own fetch then finds
-/// the entry this translation just filled, and charges exactly what it would
-/// have charged anyway.
-fn admit(cfg: &Config, costs: &Costs, exec: &mut Exec<'_>, pc: u64, remaining: u64) -> Admit {
+/// There used to be a third — the budget guard — and [`Host::spent`] is what
+/// removed it: a block no longer has to prove that its worst case fits what is
+/// left of the caller's ticks, because a block that overruns leaves at a guest
+/// instruction boundary instead.
+fn admit(cfg: &Config, unlifted: &Unlifted, exec: &mut Exec<'_>, pc: u64) -> Admit {
     if exec.pending_interrupt().is_some() || exec.st.wfi {
         return Admit::Interpret;
     }
@@ -620,16 +578,10 @@ fn admit(cfg: &Config, costs: &Costs, exec: &mut Exec<'_>, pc: u64, remaining: u
     let origin = key_origin(translating, phys);
     let key = lift::key(cfg, origin, SHAPE);
 
-    // Known unliftable, or too big for what is left of the budget: either way
-    // the interpreter takes this instruction, and reaching it without a lift
-    // that fails at its first instruction is the whole point of remembering
-    // the first.
-    let bound = match costs.get(pc, key) {
-        Some(0) => return Admit::Interpret,
-        Some(bound) => bound,
-        None => worst_bound(cfg, translating),
-    };
-    if bound > remaining.saturating_sub(exec.used) {
+    // Known unliftable: the interpreter takes this instruction, and reaching
+    // it without a lift that fails at its first instruction is the whole point
+    // of remembering it.
+    if unlifted.holds(pc, key) {
         return Admit::Interpret;
     }
 
@@ -638,8 +590,6 @@ fn admit(cfg: &Config, costs: &Costs, exec: &mut Exec<'_>, pc: u64, remaining: u
         key,
         page: pc & !PAGE_MASK,
         base: phys & !PAGE_MASK,
-        access: per_access(cfg, translating),
-        entry: if translating { WALK_ACCESSES } else { 0 },
     })
 }
 
@@ -654,11 +604,11 @@ fn admit(cfg: &Config, costs: &Costs, exec: &mut Exec<'_>, pc: u64, remaining: u
 /// same currency and with the same meaning as `Hart::step_to_exit`, so a run
 /// loop cannot tell which engine it is driving.
 ///
-/// `remaining` is what is left of the caller's budget. A block whose worst
-/// case does not fit is not run and the instruction is interpreted instead, so
-/// that the hart stops where an interpreted hart would stop — and that holds
-/// for every block of a chain, not only the first, because [`admit`] is asked
-/// again at each boundary with what the chain has spent so far deducted.
+/// `remaining` is what is left of the caller's budget, and it is the hart's
+/// tick allowance rather than advice: [`Host::spent`] compares it against
+/// `Exec::used` at every guest instruction boundary but a block's first and an
+/// exit, and a block that has spent it leaves there — at the same instruction
+/// an interpreted hart would have stopped at, with the same `State::debt`.
 ///
 /// # Panics
 ///
@@ -679,7 +629,7 @@ pub(super) fn advance(
     monitor: Option<&MonitorSlot>,
     remaining: u64,
 ) -> (u64, Option<Exit>) {
-    let Jit { disp, costs } = jit;
+    let Jit { disp, unlifted } = jit;
     let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor);
     let pc = exec.st.pc;
 
@@ -689,10 +639,10 @@ pub(super) fn advance(
     // forty-two million of them in four minutes — and reaching the interpreter
     // for one should not cost a frontend, a host and a dispatcher round trip.
     // The dispatcher's first `enter` is then a no-op; see `Lifter::admitted`.
-    let at = match admit(cfg, costs, &mut exec, pc, remaining) {
+    let at = match admit(cfg, unlifted, &mut exec, pc) {
         Admit::Ready(at) => at,
-        Admit::Interpret => return interpret(disp, costs, exec),
-        Admit::Trap(trap) => return deliver(disp, costs, exec, trap, pc, pc),
+        Admit::Interpret => return interpret(disp, unlifted, exec),
+        Admit::Trap(trap) => return deliver(disp, unlifted, exec, trap, pc, pc),
     };
 
     let mut front = Lifter {
@@ -708,14 +658,13 @@ pub(super) fn advance(
         // that happened above, through the fetch path, with its walk and its
         // accessed bit.
         attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
-        costs,
-        remaining,
+        unlifted,
         admitted: true,
         entry_trap: None,
         rejected: None,
     };
 
-    let mut host = Host::new(&mut exec, pc);
+    let mut host = Host::new(&mut exec, pc, remaining);
     let run = match disp.run(&mut front, &mut host, pc, CHAIN) {
         Ok(run) => run,
         // The only refusal this frontend has is an RV32 configuration, which
@@ -723,15 +672,15 @@ pub(super) fn advance(
         // than fail the machine (`ROADMAP.md` §9).
         Err(_) => {
             drop(host);
-            let Lifter { costs, .. } = front;
-            return interpret(disp, costs, exec);
+            let Lifter { unlifted, .. } = front;
+            return interpret(disp, unlifted, exec);
         }
     };
     let Host {
         slots, trap, mark, ..
     } = host;
     let Lifter {
-        costs,
+        unlifted,
         entry_trap,
         rejected,
         ..
@@ -748,7 +697,7 @@ pub(super) fn advance(
         // fetch translation now hits the TLB the translation above filled — so
         // what it charges is what a purely interpreted hart would have
         // charged.
-        return interpret(disp, costs, exec);
+        return interpret(disp, unlifted, exec);
     }
 
     // Every retired instruction, back into the architectural register file.
@@ -772,7 +721,7 @@ pub(super) fn advance(
                 tval: fault.pc,
             });
             let next = mark.map_or(fault.pc, |m| m.1);
-            deliver(disp, costs, exec, trap, fault.pc, next)
+            deliver(disp, unlifted, exec, trap, fault.pc, next)
         }
         Stop::Unsupported { op, at } => panic!(
             "the RISC-V frontend emitted {op} at index {at}, which the IR backend cannot execute"
@@ -783,26 +732,35 @@ pub(super) fn advance(
         // above passes, and the same one `Exec::step`'s fetch would produce.
         Stop::Declined if entry_trap.is_some() => {
             let trap = entry_trap.expect("just tested");
-            deliver(disp, costs, exec, trap, run.pc, run.pc)
+            deliver(disp, unlifted, exec, trap, run.pc, run.pc)
         }
-        // `Budget` ends a full chain, `Declined` a short one, and both leave
-        // the guest at `run.pc` for the run loop to pick up. `Exit` cannot
-        // happen: no safe-point flag is given to the dispatcher, because the
-        // run loop above checks it between calls.
+        // `Budget` ends a full chain, `Declined` a short one, `Spent` a block
+        // that left part-way through because the hart's ticks ran out, and all
+        // three leave the guest at `run.pc` for the run loop to pick up.
+        // `Spent` needs no arm of its own for exactly that reason: the state
+        // is published from the boundary's live map and `run.pc` is the guest
+        // instruction that has not started, which is what this arm already
+        // does with every other stop. `Exit` cannot happen: no safe-point flag
+        // is given to the dispatcher, because the run loop above checks it
+        // between calls.
         _ => {
             exec.st.pc = cfg.xlen.trunc(run.pc);
             let used = exec.used;
-            drain(disp, costs, &mut exec);
+            drain(disp, unlifted, &mut exec);
             (used.max(1), None)
         }
     }
 }
 
 /// Interpret one instruction, and tell the block cache what it wrote.
-fn interpret(disp: &mut Dispatcher, costs: &mut Costs, mut exec: Exec<'_>) -> (u64, Option<Exit>) {
+fn interpret(
+    disp: &mut Dispatcher,
+    unlifted: &mut Unlifted,
+    mut exec: Exec<'_>,
+) -> (u64, Option<Exit>) {
     let used = exec.step();
     let exit = exec.take_exit();
-    drain(disp, costs, &mut exec);
+    drain(disp, unlifted, &mut exec);
     (used, exit)
 }
 
@@ -811,7 +769,7 @@ fn interpret(disp: &mut Dispatcher, costs: &mut Costs, mut exec: Exec<'_>) -> (u
 /// otherwise.
 fn deliver(
     disp: &mut Dispatcher,
-    costs: &mut Costs,
+    unlifted: &mut Unlifted,
     mut exec: Exec<'_>,
     trap: Trap,
     at: u64,
@@ -831,7 +789,7 @@ fn deliver(
         }
     };
     let used = exec.used;
-    drain(disp, costs, &mut exec);
+    drain(disp, unlifted, &mut exec);
     (used.max(1), out)
 }
 
@@ -841,20 +799,20 @@ fn deliver(
 /// drains those itself; this is the other half, for every instruction outside
 /// the lifted subset — an `AMO`, an `SC`, a byte written by a trap handler
 /// running through the interpreter.
-fn drain(disp: &mut Dispatcher, costs: &mut Costs, exec: &mut Exec<'_>) {
+fn drain(disp: &mut Dispatcher, unlifted: &mut Unlifted, exec: &mut Exec<'_>) {
     let mut hit = 0usize;
     for i in 0..exec.wrote_n as usize {
         hit += disp.cache_mut().note_write(exec.wrote[i], 1);
     }
     exec.wrote_n = 0;
     if hit > 0 {
-        // A page a translation came from has changed, so every *negative*
-        // answer in the cost table may have changed with it — an instruction
-        // that was outside the subset can have been overwritten by one that is
-        // not. Clearing the lot is a blunt answer to a rare event: eight
-        // thousand of these in four minutes of guest time, against three
-        // hundred million blocks.
-        costs.clear();
+        // A page a translation came from has changed, so every answer in
+        // [`Unlifted`] may have changed with it — an instruction that was
+        // outside the subset can have been overwritten by one that is not.
+        // Clearing the lot is a blunt answer to a rare event: eight thousand
+        // of these in four minutes of guest time, against three hundred
+        // million blocks.
+        unlifted.clear();
     }
 }
 
@@ -871,10 +829,7 @@ struct Lifter<'a> {
     at: Admitted,
     space: &'a AddressSpace,
     attrs: MemAttrs,
-    costs: &'a mut Costs,
-    /// What [`advance`] was given, so a chained boundary can guard the next
-    /// block against what the chain has *left* rather than against the whole.
-    remaining: u64,
+    unlifted: &'a mut Unlifted,
     /// Whether [`advance`]'s prologue has already admitted the entry PC, so
     /// the dispatcher's first `enter` neither translates nor charges twice.
     /// Consumed by the first call and false ever after.
@@ -917,7 +872,7 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         // one of them — it reads the CSR file, the hart's TLB and the tick
         // counter — so a chained boundary sees the same world a fresh
         // `advance` would have seen.
-        let entry = match admit(self.cfg, self.costs, host.exec, pc, self.remaining) {
+        let entry = match admit(self.cfg, self.unlifted, host.exec, pc) {
             Admit::Ready(at) => {
                 self.at = at;
                 Entry::Ready
@@ -970,14 +925,11 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         {
             self.rejected = Some(alloc::format!("{e}"));
         }
-        // Zero when nothing could be lifted, which is what sends the next
-        // pass straight to the interpreter instead of back through here.
-        let bound = if lifted.insns > 0 {
-            block_bound(&lifted.block, self.at.access, self.at.entry)
-        } else {
-            0
-        };
-        self.costs.put(pc, self.at.key, bound);
+        // A lift that produced nothing is remembered, which is what sends the
+        // next pass straight to the interpreter instead of back through here.
+        if lifted.insns == 0 {
+            self.unlifted.note(pc, self.at.key);
+        }
         Ok(Translation {
             page: base,
             insns: lifted.insns,
@@ -994,6 +946,13 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
 /// path.
 struct Host<'a, 'e> {
     exec: &'a mut Exec<'e>,
+    /// What [`advance`] was given: the ticks this run may charge before a
+    /// block has to stop at its next guest instruction boundary.
+    ///
+    /// The whole of what this hart owes [`IrHost::spent`]. It is a function of
+    /// ticks already charged and it is monotone, because `Exec::used` only
+    /// ever grows within one [`advance`].
+    allowance: u64,
     slots: [u64; lift::SLOT_COUNT as usize],
     /// The trap the memory path raised, kept because [`IrHost::load`] can only
     /// report a [`BusError`] and a RISC-V trap is a cause *and* an `mtval`.
@@ -1006,12 +965,13 @@ struct Host<'a, 'e> {
 }
 
 impl<'a, 'e> Host<'a, 'e> {
-    fn new(exec: &'a mut Exec<'e>, pc: u64) -> Host<'a, 'e> {
+    fn new(exec: &'a mut Exec<'e>, pc: u64, allowance: u64) -> Host<'a, 'e> {
         let mut slots = [0u64; lift::SLOT_COUNT as usize];
         slots[..32].copy_from_slice(&exec.st.x);
         slots[PC.0 as usize] = pc;
         Host {
             exec,
+            allowance,
             slots,
             trap: None,
             mark: None,
@@ -1067,6 +1027,19 @@ impl IrHost for Host<'_, '_> {
         for _ in 0..ticks {
             self.exec.charge();
         }
+    }
+
+    /// One load and one compare, at every guest instruction boundary but a
+    /// block's first and an exit.
+    ///
+    /// `>=` rather than `>`: `Hart::run_budget` loops while `used < allowance`,
+    /// so an interpreted hart stops at the first instruction that takes the
+    /// count to the budget or past it, and a block that stopped one
+    /// instruction later would leave the two engines on different instructions
+    /// with different `State::debt` for the rest of the run.
+    #[inline]
+    fn spent(&self) -> bool {
+        self.exec.used >= self.allowance
     }
 
     fn insn_start(&mut self, mark: &InsnStart) {
@@ -1264,18 +1237,19 @@ mod tests {
         // The columns `agree` compares are the ones a chain could move: the
         // cycle counter, because a chained successor still owes its entry
         // translation; the retired count, because it is now summed over
-        // several blocks; and the carried debt, because the budget guard is
-        // now asked once per block rather than once per `advance`.
+        // several blocks; and the carried debt, because the tick allowance is
+        // asked at every boundary of every block of a chain.
         let (interp, jit) = agree(&FAR_LOOP, 1000, 64);
         assert!(interp.cycles() > 1000, "the run was too short to mean much");
         assert_eq!(interp.x(28), jit.x(28), "the value reloaded from memory");
     }
 
     #[test]
-    fn the_same_agreement_holds_over_budgets_a_block_does_not_fit_in() {
-        // Twelve ticks is under the worst case of every block here, so the
-        // budget guard interprets almost everything — which must give the same
-        // answer as interpreting everything, and as blocks.
+    fn the_same_agreement_holds_over_budgets_a_block_leaves_part_way_through() {
+        // Twelve ticks is under what most blocks here charge end to end, so
+        // nearly every block leaves at a guest instruction boundary rather
+        // than at its terminator — which must give the same answer as
+        // interpreting everything, and as blocks that run to the end.
         agree(&LOOP, 12, 400);
     }
 
@@ -1561,7 +1535,7 @@ mod tests {
         }
 
         /// Ask [`admit`] what it would do at the current PC.
-        fn admit(&mut self, remaining: u64) -> Admit {
+        fn admit(&mut self) -> Admit {
             let Bench {
                 space,
                 cfg,
@@ -1572,7 +1546,7 @@ mod tests {
             } = self;
             let mut exec = Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE, None);
             let pc = exec.st.pc;
-            admit(cfg, &jit.costs, &mut exec, pc, remaining)
+            admit(cfg, &jit.unlifted, &mut exec, pc)
         }
 
         /// One [`advance`], reporting what it consumed.
@@ -1635,14 +1609,14 @@ mod tests {
         use crate::cpu::riscv::csr::{irq, status};
         let mut b = Bench::new(&FAR_LOOP);
         assert!(
-            matches!(b.admit(u64::MAX), Admit::Ready(_)),
+            matches!(b.admit(), Admit::Ready(_)),
             "the fixture has to be liftable, or this proves nothing"
         );
         b.state.csrs.mie |= irq::MTI;
         b.state.csrs.mstatus |= status::MIE;
         b.lines.set_pending(irq::MTI, true);
         assert!(
-            matches!(b.admit(u64::MAX), Admit::Interpret),
+            matches!(b.admit(), Admit::Interpret),
             "a hart with a pending machine timer interrupt must reach the \
              interpreter, whatever is liftable at its PC"
         );
@@ -1653,51 +1627,35 @@ mod tests {
         // The other half of the same guard. A `WFI` that has not been woken is
         // not an instruction a block can retire past.
         let mut b = Bench::new(&FAR_LOOP);
-        assert!(matches!(b.admit(u64::MAX), Admit::Ready(_)));
+        assert!(matches!(b.admit(), Admit::Ready(_)));
         b.state.wfi = true;
-        assert!(matches!(b.admit(u64::MAX), Admit::Interpret));
+        assert!(matches!(b.admit(), Admit::Interpret));
     }
 
     #[test]
-    fn a_block_nothing_is_known_about_is_guarded_by_the_whole_worst_case() {
-        // The `None` arm of the cost lookup, which is every block's *first*
-        // execution. Guarding it with anything less than `worst_bound` lets a
-        // block spend more than the quantum had left, and the two engines then
-        // stop on different instructions with different debt — the divergence
-        // `ROADMAP.md` §0 forbids.
-        let worst = worst_bound(&Config::rv64gc(), false);
+    fn a_budget_no_whole_block_fits_in_still_retires_inside_one() {
+        // What adopting [`IrHost::spent`] is *for*, asserted rather than left
+        // to a boot log. Sixteen ticks is far under what a full-length block
+        // of this fixture charges — a `lift::MAX_INSNS` trace of uncompressed
+        // instructions with accesses spends hundreds — so under the guard this
+        // replaced every one of these calls interpreted a single instruction
+        // and no block ever ran. Now the block runs and leaves at the first
+        // boundary past the allowance.
         let mut b = Bench::new(&FAR_LOOP);
-        assert!(
-            matches!(b.admit(worst - 1), Admit::Interpret),
-            "a budget one short of the worst case must decline"
-        );
-        assert!(
-            matches!(b.admit(worst), Admit::Ready(_)),
-            "and exactly enough must be enough"
-        );
-    }
-
-    #[test]
-    fn a_remembered_cost_lets_a_block_run_in_a_budget_its_worst_case_would_not_fit() {
-        // What [`Costs`] is *for*: after one lift the guard knows this block
-        // spends a handful of ticks rather than the frontend's whole
-        // instruction limit, and a budget between the two admits it. A cost
-        // filed under the wrong key is a table that never answers, and the
-        // engine silently falls back to interpreting almost everything.
-        let worst = worst_bound(&Config::rv64gc(), false);
-        let mut b = Bench::new(&FAR_LOOP);
-        // Warm the table: one generous call, which lifts and files the cost.
+        // Warm the cache at a budget everything fits, so the measurement is
+        // about admission rather than about a first lift.
         b.advance(u64::MAX / 2);
         let before = b.jit.disp.stats().blocks;
-        assert!(before > 0, "nothing ran, so nothing was costed");
-        // Now a budget the *worst* case does not fit but the real one does.
-        for _ in 0..8 {
-            b.advance(worst / 4);
+        assert!(before > 0, "nothing ran, so nothing was warmed");
+        for _ in 0..64 {
+            b.advance(16);
         }
         assert!(
-            b.jit.disp.stats().blocks > before,
-            "no block ran under a budget its remembered cost fits: the cost \
-             table is not answering ({:?})",
+            b.jit.disp.stats().blocks > before + 32,
+            "a budget smaller than a whole block ran {} blocks in 64 calls: a \
+             block is being refused for ticks it could have left part-way \
+             through ({:?})",
+            b.jit.disp.stats().blocks - before,
             b.jit.disp.stats()
         );
     }
@@ -1725,34 +1683,23 @@ mod tests {
     }
 
     #[test]
-    fn a_misaligned_access_is_costed_at_what_it_can_really_spend() {
-        // `per_access` says a misaligned access on this core is one bus cycle
-        // *per byte*, and the budget guard has to believe it: a block costed
-        // as though every access were aligned is admitted into a budget it
-        // then overruns. Every column of `agree` — cycles, debt, the stopping
-        // instruction — moves when that happens.
+    fn a_misaligned_access_costs_a_block_what_it_costs_the_interpreter() {
+        // A misaligned access on this core is one bus cycle *per byte*, so
+        // this fixture's hot block spends eight ticks of fetch and sixteen of
+        // access rather than the two an aligned block would — and a budget
+        // inside that window is one where a block that miscounted its own
+        // charges, or asked [`Host::spent`] at the wrong boundary, stops
+        // somewhere the interpreter does not. Every column below — cycles,
+        // debt, `instret`, the register file — moves when it does.
         //
-        // Two things have to be true at once for the mis-costing to show, and
-        // getting either wrong lets the mutant walk out — both did, in turn:
+        // The budget has to be one where the *interpreter* would stop
+        // somewhere else: at sixteen it runs the same four instructions and
+        // overruns to twenty-four exactly as the block does, because the last
+        // instruction is the expensive one. So the budget is swept rather than
+        // picked; two picked by eye let a mutant of the cost model this
+        // replaced walk out.
         //
-        // * the budget must sit **between** the wrong bound and the right one,
-        //   and those are *measured*, not guessed: this fixture's hot block is
-        //   four instructions with two accesses, so eight ticks of fetch plus
-        //   either two (an access costed as aligned) or sixteen. Ten and
-        //   twenty-four. Two budgets picked by eye fell outside that window
-        //   and the mutant walked out of both;
-        // * and the cost table must already **know** this block, because a
-        //   cold table answers `worst_bound` — 640 ticks — which no small
-        //   budget admits, so nothing is ever lifted and both engines
-        //   interpret everything in perfect agreement.
-        //
-        // And even inside the window the budget has to be one where the
-        // *interpreter* would stop somewhere else: at sixteen it runs the same
-        // four instructions and overruns to twenty-four exactly as the block
-        // does, because the last instruction is the expensive one. So the
-        // budget is swept rather than picked.
-        //
-        // So: warm at a budget everything fits, then squeeze.
+        // Warm at a budget everything fits, then squeeze.
         for (engine, squeeze) in [Engine::Jit, Engine::JitHost]
             .into_iter()
             .flat_map(|e| [10, 12, 14, 18, 20, 22].map(|b| (e, b)))
@@ -1825,7 +1772,7 @@ mod tests {
         // the entry translation just produced, it is exact — and until this
         // fixture existed nothing but that Linux boot ever took the branch.
         let mut b = Bench::paged(&FAR_LOOP);
-        let Admit::Ready(at) = b.admit(u64::MAX) else {
+        let Admit::Ready(at) = b.admit() else {
             panic!("the mapped page must be liftable");
         };
         assert_eq!(at.base, 0x4000, "the bytes come from the mapped page");
@@ -1835,8 +1782,6 @@ mod tests {
             lift::key(&b.cfg, Origin::Bare, SHAPE),
             "a paged block must not key identically to a bare one at the same PC"
         );
-        assert_eq!(at.entry, WALK_ACCESSES, "and the walk is charged for");
-        assert_eq!(at.access, per_access(&b.cfg, true));
 
         // The same virtual page, a different physical one. The bytes have
         // changed, so the key must: a stale block must be unreachable rather
@@ -1847,7 +1792,7 @@ mod tests {
             ((0x5000 >> 12) << 10) | pte::V | pte::R | pte::X | pte::A,
         );
         b.tlb.flush();
-        let Admit::Ready(moved) = b.admit(u64::MAX) else {
+        let Admit::Ready(moved) = b.admit() else {
             panic!("still liftable");
         };
         assert_ne!(moved.key, at.key, "a remapped page is a different block");
@@ -1993,13 +1938,23 @@ mod tests {
     #[test]
     fn a_chain_never_spends_more_than_the_budget_it_was_given() {
         // The other half of the bound, and the one that keeps the two engines
-        // on the same instruction: every block of a chain is admitted against
-        // what the chain has *left*, not against what it started with. A
-        // budget one block cannot fit means no block runs at all.
+        // on the same instruction: [`Host::spent`] is asked at every boundary
+        // of every block of a chain against what the chain has *left*, so a
+        // run overruns by **one guest instruction**, exactly as an interpreted
+        // hart does. The bound asserted here is therefore the worst any single
+        // instruction in this fixture can charge and not a block's worth of
+        // them — a guard reinstated in any form would still pass the loose
+        // version of this and a chain that ignored the allowance would not
+        // pass this one.
+        //
+        // Twelve ticks: an uncompressed instruction charges two for its fetch
+        // and this fixture's widest access is an aligned doubleword, which is
+        // one more; twelve is comfortably over that and far under the 128 a
+        // full `lift::MAX_INSNS` block of them would spend.
         for budget in [1, 4, 12, 64, 512] {
             let (stats, used) = drive(&FAR_LOOP, budget, 1);
             assert!(
-                used <= budget.max(1) + worst_bound(&Config::rv64gc(), false),
+                used <= budget.max(1) + 12,
                 "a run given {budget} spent {used} over {} blocks",
                 stats.blocks
             );
@@ -2069,28 +2024,14 @@ mod tests {
     }
 
     #[test]
-    fn the_worst_case_bound_is_never_below_what_a_block_can_spend() {
-        // The guard is only sound if the bound is an over-estimate, so this
-        // asserts the direction rather than the value: the fallback bound must
-        // cover the exact one for a full-length block of accesses.
-        let cfg = Config::rv64gc();
-        for translating in [false, true] {
-            let exact = lift::MAX_INSNS as u64 * (2 + per_access(&cfg, translating))
-                + if translating { WALK_ACCESSES } else { 0 };
-            assert_eq!(worst_bound(&cfg, translating), exact);
-            assert!(worst_bound(&cfg, translating) >= worst_bound(&cfg, false));
-        }
-    }
-
-    #[test]
-    fn a_cost_table_answers_only_for_the_block_it_recorded() {
-        let mut costs = Costs::new();
-        costs.put(0x1000, 7, 42);
-        assert_eq!(costs.get(0x1000, 7), Some(42));
-        assert_eq!(costs.get(0x1000, 8), None, "a different world");
-        assert_eq!(costs.get(0x1002, 7), None, "a different pc");
-        costs.clear();
-        assert_eq!(costs.get(0x1000, 7), None);
+    fn the_unliftable_table_answers_only_for_the_block_it_recorded() {
+        let mut unlifted = Unlifted::new();
+        unlifted.note(0x1000, 7);
+        assert!(unlifted.holds(0x1000, 7));
+        assert!(!unlifted.holds(0x1000, 8), "a different world");
+        assert!(!unlifted.holds(0x1002, 7), "a different pc");
+        unlifted.clear();
+        assert!(!unlifted.holds(0x1000, 7));
     }
 
     // -----------------------------------------------------------------
