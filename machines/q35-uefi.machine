@@ -57,7 +57,10 @@
 #     offering a legacy scan a second, different description of itself — the
 #     exact ambiguity `machines/q35.machine` warns about for the MP table, with
 #     the roles reversed. One machine, one set of tables, and here they are the
-#     firmware's.
+#     firmware's — which is not the same as saying the board is silent about
+#     itself. It says the same things through `q35.fwcfg` below, which is where
+#     an OVMF build gets the bytes it installs; the difference is *who
+#     publishes*, not who knows.
 #   * **The video adapter and its option ROM.** EDK II's `QemuVideoDxe` binds
 #     three PCI identifications and none of them is ours, so a display adapter
 #     on this board would be a card nothing drives. The console is the 16550,
@@ -68,16 +71,16 @@
 #     be a second thing under test. The controller it does reach them through is
 #     the `nvme.controller` at `00:04.0` below.
 #
-# # The disk is on the bus and is not yet reachable
+# # The disk is on the bus and is reachable
 #
 # `nvme0` is enumerated by the firmware, bound by EDK II's `NvmExpressDxe`, and
-# then answers `0xffffffff` at every register — because a base address register
-# programmed through the **ECAM** window never decodes. That is a defect in
-# `src/bus/pci/bar.rs` rather than anything about this board:
-# `tests/q35_uefi.rs` reproduces it in sixty milliseconds with no firmware, and
-# `docs/platforms/q35-uefi.md` has the mechanism. Until it is fixed the shell
-# still comes up and still answers `map: No mapping found.`, about 450 seconds
-# of virtual time later than it used to, which is the driver timing out.
+# for a while answered `0xffffffff` at every register, because a base address
+# register programmed through the **ECAM** window never decoded. That was a
+# defect in `src/bus/pci/bar.rs` rather than anything about this board and it is
+# fixed; `tests/q35_uefi.rs` reproduces it in sixty milliseconds with no
+# firmware and `docs/platforms/q35-uefi.md` has the mechanism. With it fixed,
+# BDS finds a FAT volume on the namespace, starts `\EFI\BOOT\BOOTX64.EFI` off
+# it, and a Linux kernel entered through its EFI stub comes up on COM1.
 #
 # # A20 is deliberately unwired
 #
@@ -116,9 +119,13 @@ machine "q35-uefi" {
   #
   # It is also the number the firmware *reads*: `pc.rtc` publishes it in CMOS
   # `0x34`/`0x35` as 64 KiB blocks above 16 MiB, which is the pair EDK II's
-  # `PlatformInitLib` sizes memory from and the only route to it on a board with
-  # no `fw_cfg`. `extmem = 128M` puts the top of low memory at `0x8100000`, and
-  # the firmware computes exactly that.
+  # `PlatformInitLib` sizes memory from. It stays the route even now that this
+  # board has a `fw_cfg`: `PlatformGetSystemMemorySizeBelow4gb` reaches for an
+  # `etc/e820` file first and falls back to CMOS when there is none, and the
+  # `q35.fwcfg` object below deliberately serves no such file — one description
+  # of how much memory the board has, in the place that already had it.
+  # `extmem = 128M` puts the top of low memory at `0x8100000`, and the firmware
+  # computes exactly that.
   param extmem = 128M
 
   # How much flash the board has in total, and how much of it is the variable
@@ -277,6 +284,45 @@ machine "q35-uefi" {
     route2 = 18
   }
 
+  # -- the legacy replacement route -------------------------------------------
+  #
+  # The board-level multiplexer `LEG_RT_CNF` is (*IA-PC HPET Specification*
+  # §2.3.5): while the bit is set, the HPET's comparators 0 and 1 take over
+  # IRQ0 and IRQ8 from the 8254 and the RTC, and stop driving the inputs their
+  # own route fields name. `machines/q35-linux.machine` has the long form of
+  # why it is five gates rather than three; this board needs exactly the same
+  # thing for exactly the same reason, and it needed it the moment this machine
+  # file gained a `fw_cfg`.
+  #
+  # **That order is the whole story.** With no ACPI at all, a UEFI-booted kernel
+  # never learned this board had an HPET, so `hpet_enable()` failed, Linux
+  # programmed the 8254 and took its tick from counter 0 — and a board with the
+  # 8254 hard-wired to I/O APIC input 2 was telling the truth. With the HPET
+  # table in the set the firmware installs, `hpet_time_init()` succeeds, sets
+  # `LEG_RT_CNF`, stops loading counter 0 and waits for comparator 0 on IRQ0 —
+  # which on a board without these gates arrives nowhere:
+  #
+  #   ..MP-BIOS bug: 8254 timer not connected to IO-APIC
+  #   Kernel panic - not syncing: IO-APIC + timer doesn't work!
+  #
+  # measured on this board, between describing it to the firmware and wiring
+  # the multiplexer that description implies.
+  object legoff "wire.not" {}
+
+  # The two chips the HPET displaces, each held on its line only while the bit
+  # is clear.
+  object pitgate "wire.and" { inputs = 2 }
+  object rtcgate "wire.and" { inputs = 2 }
+
+  # The two comparators that take those lines over while it is set.
+  object hpetir0 "wire.and" { inputs = 2 }
+  object hpetir8 "wire.and" { inputs = 2 }
+
+  # And comparators 0 and 1 on their own routes, which they abandon while it is
+  # set. Comparator 2 keeps its route unconditionally and needs no gate.
+  object hpetr0 "wire.and" { inputs = 2 }
+  object hpetr1 "wire.and" { inputs = 2 }
+
   # -- the real-time clock and CMOS -------------------------------------------
 
   object cmos "pc.rtc" {
@@ -300,6 +346,39 @@ machine "q35-uefi" {
     clock     = uart / 16
     port      = console
     frequency = 1843200
+  }
+
+  # -- what the board tells the firmware about itself -------------------------
+  #
+  # `fw_cfg`: a selector at 0x510 and a data port at 0x511, and behind them the
+  # **ACPI tables**, generated from this realized machine by the same code
+  # `machines/q35.machine` hands an operating system directly (`src/dev/q35`).
+  #
+  # This is the one thing a UEFI board cannot do the way `q35` does. There, a
+  # `q35.acpi` device stages an RSDP at 0xe0000 and an operating system finds it
+  # by searching (ACPI §5.2.5.1). Under UEFI nothing searches: the kernel takes
+  # its RSDP from the EFI configuration table (UEFI 2.10 §4.6), which holds
+  # whatever the *firmware* installed — and an OVMF build has exactly one source
+  # for that, which is this register pair. A board that stays silent here is a
+  # board whose kernel prints `ACPI MADT or MP tables are not detected` and
+  # falls back to virtual wire mode, which is what this one used to do.
+  #
+  # `space = mem` and `iospace = "port"` are how it reads the machine rather
+  # than restating it: the local APIC's page, the I/O APIC's, the HPET's, the
+  # ECAM window and the ACPI register block are all found by walking those two
+  # address spaces, and `bus = "pci0"` is the fabric whose interrupt routing
+  # becomes `_PRT`. Nothing here is written down twice.
+  #
+  # The set it hands over is deliberately small — the tables, the RSDP and the
+  # loader script that places them, and no `etc/e820`, no `etc/system-states`,
+  # no SMBIOS. Each of those is a lookup EDK II is written to survive, and the
+  # one that matters is memory sizing: with no `etc/e820` the firmware keeps
+  # reading CMOS 0x34/0x35, which is what `extmem` above already publishes and
+  # what every measurement on this board was taken through.
+  object fwcfg "q35.fwcfg" {
+    space   = mem
+    iospace = "port"
+    bus     = "pci0"
   }
 
   # -- the disk ---------------------------------------------------------------
@@ -418,6 +497,7 @@ machine "q35-uefi" {
   map port 0x03f8 size 0x0008 = com1.regs
   map port 0x04d0 size 0x0001 = pic1.elcr
   map port 0x04d1 size 0x0001 = pic2.elcr
+  map port 0x0510 size 0x0002 = fwcfg.regs   # selector and data; no DMA at 0x514
   map port 0x0cf8 size 0x0008 = mch.config
 
   # -- the wires --------------------------------------------------------------
@@ -429,21 +509,59 @@ machine "q35-uefi" {
   wire lapic0.intr -> cpu0.intr
   wire lapic0.nmi  -> cpu0.nmi
 
-  wire pit0.out0   -> pic1.ir0
-  wire pit0.out0   -> ioapic.irq2
   wire kbc.irq1    -> pic1.ir1
   wire kbc.irq1    -> ioapic.irq1
-  wire cmos.irq    -> pic2.ir0
-  wire cmos.irq    -> ioapic.irq8
   wire kbc.irq12   -> pic2.ir4
   wire kbc.irq12   -> ioapic.irq12
 
   wire com1.irq    -> pic1.ir4
   wire com1.irq    -> ioapic.irq4
 
-  wire hpet0.t0    -> ioapic.irq16
-  wire hpet0.t1    -> ioapic.irq17
-  wire hpet0.t2    -> ioapic.irq18
+  # IRQ0 and IRQ8, through the multiplexer the HPET's `LEG_RT_CNF` is — see the
+  # object block above. `legoff` inverts the bit, so its output is high exactly
+  # while the 8254 and the RTC own the two lines.
+  #
+  # IRQ0 is the one line whose two halves do not carry the same number: it
+  # reaches I/O APIC input **2** rather than 0, whichever chip is driving it,
+  # and the MADT's interrupt source override — which `fwcfg` above hands the
+  # firmware — is the other half of that.
+  wire hpet0.legacy -> legoff.in
+
+  wire legoff.out   -> pitgate.in0
+  wire pit0.out0    -> pitgate.in1
+  wire pitgate.out  -> pic1.ir0
+  wire pitgate.out  -> ioapic.irq2
+
+  wire legoff.out   -> rtcgate.in0
+  wire cmos.irq     -> rtcgate.in1
+  wire rtcgate.out  -> pic2.ir0
+  wire rtcgate.out  -> ioapic.irq8
+
+  # The other half of each multiplexer: two sources on one net is the
+  # wired-OR `ROADMAP.md` §4.3 describes, and it is the right shape here — at
+  # most one side is ever enabled, so the resolve never has to arbitrate.
+  wire hpet0.legacy -> hpetir0.in0
+  wire hpet0.t0     -> hpetir0.in1
+  wire hpetir0.out  -> pic1.ir0
+  wire hpetir0.out  -> ioapic.irq2
+
+  wire hpet0.legacy -> hpetir8.in0
+  wire hpet0.t1     -> hpetir8.in1
+  wire hpetir8.out  -> pic2.ir0
+  wire hpetir8.out  -> ioapic.irq8
+
+  # Comparators 0 and 1 on the inputs their route fields name, which they hold
+  # only while the legacy replacement route is off. Comparator 2 is never
+  # displaced, so it is wired straight through.
+  wire legoff.out   -> hpetr0.in0
+  wire hpet0.t0     -> hpetr0.in1
+  wire hpetr0.out   -> ioapic.irq16
+
+  wire legoff.out   -> hpetr1.in0
+  wire hpet0.t1     -> hpetr1.in1
+  wire hpetr1.out   -> ioapic.irq17
+
+  wire hpet0.t2     -> ioapic.irq18
 
   wire lpc.sci9    -> pic2.ir1
   wire lpc.sci9    -> ioapic.irq9
