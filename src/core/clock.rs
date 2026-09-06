@@ -1327,6 +1327,32 @@ impl ClockForest {
 
     /// Overwrites a domain's tick counter. For snapshot restore only.
     ///
+    /// # The anchor is aligned down, and that is the whole point
+    ///
+    /// A tick count does not say where in the *current* tick the tree is, and
+    /// that phase is architectural: a domain divided by 4 whose tree sits two
+    /// units into a tick fires its next tick two units from now, not four.
+    /// Anchoring `base_unit` at the restored tree position — which this used to
+    /// do — sets that phase to zero, so every divided domain on a restored
+    /// machine ticks up to one tick late *and stays late*. It is invisible to a
+    /// round-trip hash, because [`ClockForest::ticks`] reads back exactly what
+    /// was written either way; it shows up as a machine that diverges from the
+    /// one it was restored from a few microseconds later. `pc-at`'s VGA domain
+    /// was one tick behind after 200 µs.
+    ///
+    /// Aligning the anchor down to a whole tick reproduces the phase the saved
+    /// machine had, exactly, because a domain's anchor only ever moves through
+    /// here: [`ClockForest::set_rating`], [`ClockForest::reparent`] and
+    /// [`ClockForest::set_gated`] are the other three writers and nothing in
+    /// the tree calls them, so a live domain has `base_unit == 0` and its phase
+    /// is `units % units_per_tick`. Should one of those three ever be used, the
+    /// phase becomes independent of the tree position and has to be *written*
+    /// into the chunk; there is a test that pins what this does today.
+    ///
+    /// The tick count itself is unchanged — `(units % units_per_tick) /
+    /// units_per_tick` is zero — so a snapshot re-saved immediately after a
+    /// restore is still byte-identical.
+    ///
     /// # Errors
     ///
     /// [`ClockError::UnknownDomain`] if the handle is not from this forest.
@@ -1335,7 +1361,7 @@ impl ClockForest {
         let units = self.oscillators[self.domains[id.index()].root.index()].units;
         let d = &mut self.domains[id.index()];
         d.base_ticks = ticks;
-        d.base_unit = units;
+        d.base_unit = units - units % d.units_per_tick;
         Ok(())
     }
 
@@ -1897,6 +1923,44 @@ mod tests {
         g.advance_domain(cpu2, 99_991).unwrap();
         assert_eq!(g.global_time(osc2).unwrap(), f.global_time(osc).unwrap());
         assert_eq!(g.ticks(ppu2).unwrap(), f.ticks(ppu).unwrap());
+    }
+
+    /// A restore keeps the *phase* inside a tick, not only the tick count.
+    ///
+    /// The test the one above is not.
+    /// [`a_restored_forest_is_identical_not_merely_close`] advances the CPU
+    /// domain, so the tree lands on a multiple of 12 and every domain is
+    /// exactly on a tick boundary — the one arrangement in which throwing the
+    /// phase away is invisible. Advancing the *PPU* instead leaves the CPU four
+    /// units into a twelve-unit tick, and a restore that anchored the counter
+    /// at the restored tree position made the next CPU tick arrive twelve units
+    /// later rather than eight. On `pc-at` that was the VGA adapter one tick
+    /// behind 200 µs after a snapshot, for the rest of the run.
+    #[test]
+    fn a_restore_keeps_the_phase_inside_a_tick() {
+        let (mut f, _m, cpu, ppu) = nes();
+        f.advance_domain(ppu, 1).unwrap();
+        let osc = f.root_of(cpu).unwrap();
+        assert_eq!(f.unit_position(osc).unwrap() % 12, 4, "mid-tick, by design");
+
+        let (mut g, _m2, cpu2, ppu2) = nes();
+        let osc2 = g.root_of(cpu2).unwrap();
+        g.restore_unit_position(osc2, f.unit_position(osc).unwrap())
+            .unwrap();
+        g.restore_ticks(cpu2, f.ticks(cpu).unwrap()).unwrap();
+        g.restore_ticks(ppu2, f.ticks(ppu).unwrap()).unwrap();
+        assert_eq!(g.ticks(cpu2).unwrap(), f.ticks(cpu).unwrap());
+
+        // Eight more units carries the CPU over its first tick. The restored
+        // forest has to agree, and used not to.
+        f.advance_domain(ppu, 2).unwrap();
+        g.advance_domain(ppu2, 2).unwrap();
+        assert_eq!(f.ticks(cpu).unwrap(), 1, "the original crossed a tick");
+        assert_eq!(
+            g.ticks(cpu2).unwrap(),
+            f.ticks(cpu).unwrap(),
+            "the restored forest lost the phase it was part way through"
+        );
     }
 
     #[test]

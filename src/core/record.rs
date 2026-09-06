@@ -31,7 +31,7 @@
 //! | The real-time clock | already deterministic: the MC146818 takes its epoch from a `time` property and advances from its own clock domain, never the host's |
 //! | The host wall clock | not guest-visible: `HostClock` is injected into the scheduler from above the `std` line and only feeds `Pace::Wait` |
 //! | Host file I/O **completion** | nothing to timestamp — every block backend completes inside the guest access that issued it. When one becomes asynchronous, its completion is a channel |
-//! | Host file I/O **content** | **not covered, and this is not a timing question.** A drive's bytes are host state outside the recording: a replay against an image the host has since edited diverges, and nothing checks that it is the same image. A medium snapshotted by *reference* compares an identity string, never contents (`machine::Timeline` has the rewind half of this) |
+//! | Host file I/O **content** | **not covered, and this is not a timing question.** A drive's bytes are host state outside the recording: a replay against an image the host has since edited diverges, and nothing checks that it is the same image. A medium snapshotted by *reference* compares an identity string, never contents — and the string is `dev::blk::Image`'s `format canonical-path capacity`, so it detects a *substituted* image and not an *edited* one (`machine::Timeline` has the rewind half of this) |
 //! | A debugger writing guest state | **not covered** — `host::gdb` lets a TCP peer set registers and memory mid-run. It is a deliberate power rather than an oversight, but a session debugged and recorded at once is not replayable and nothing says so. `rsemu run --gdb` also pumps the console straight into the port between the debugger's turns, so those keystrokes miss the seam even though the board was sealed |
 //! | Constructor interception | **not covered** — `Bindings::replace` swaps a class for another at build time, which is how `accel` substitutes a KVM core. A build-time door parallel to the host-object table, and the reason an accelerated board is out of scope for replay twice over |
 //! | A frontend pressing a *captured* device | **covered sideways.** `host::input::MouseSink` reaches a concrete `HidMouse` out of a [`Captured`](crate::core::hosts::Captured) table and pushes reports into it. What it pushes is recorded — on `input:vnc`, the frontend's channel — but the capture table itself is a `HostKind::rendezvous` and the seal does not check it, so a *different* host doing the same thing without posting first would not be caught |
@@ -333,6 +333,33 @@
 //! integers, a `u128` of raw 2⁻⁶⁴-second units rather than a rounded
 //! nanosecond count, `BTreeMap` rather than a hash map, lengths as `u64` rather
 //! than `usize`, and no float anywhere near the time path.
+//!
+//! ## A recording migrates; a snapshot may not
+//!
+//! Worth separating, because "cross-host replay" and "cross-host restore" sound
+//! like one property and are two. A recording carries a
+//! [`MachineShape`] and byte payloads and nothing else, so it is host-neutral
+//! by construction. A **snapshot** inherits the same encoding discipline —
+//! `core::state` is the same writer, and a 32-bit host refuses a length it
+//! cannot address rather than truncating it — but its *chunks* are written by
+//! devices, and one of them is not host-neutral: a drive whose medium
+//! snapshots by *reference* writes the medium's identity into its chunk, and
+//! that identity contains the image's **canonical host path**. Restoring on
+//! another host, or in another directory, fails with "the snapshot references a
+//! different medium".
+//!
+//! It fails loudly, which is the right failure, and there is no way to say
+//! "same image, moved" — so a machine with a file-backed drive does not migrate
+//! today. A machine whose drives all *capture*, or which has no drive at all,
+//! does: the Apple 1 this file's frozen recording replays on is in the second
+//! group, which is why that gate is reachable and this one is not yet.
+//!
+//! The most interesting untested case of the second group is already shipping.
+//! `rsemu_save`/`rsemu_load` give the browser build save states (§11.7), and a
+//! `wasm32` host has a four-byte `usize` — so a save state taken in a tab and
+//! loaded by a native binary is the cross-host *restore* claim in its sharpest
+//! form, and nothing runs it: CI builds all three wasm targets and executes
+//! none of them, exactly as it does for the frozen recording above.
 //!
 //! # Example
 //!
