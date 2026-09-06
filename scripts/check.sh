@@ -216,31 +216,99 @@ stage_sweep() {
 }
 
 # Phase 9's gate is "a recorded session replayed bit-identically on a *different
-# host*", and every other stage here runs on this one. `tests/record_replay.rs`
-# pins the recording and the resulting state hash as constants, so replaying
-# them under a second target is the whole test: same source, same constants,
-# different `usize`, different ABI, different code generator.
+# host*", and every other stage here runs on this one. Two artefacts have to
+# cross that boundary and they cross it differently.
 #
-# i686 rather than aarch64 because it is the one installed target this machine
-# can also *run* -- a cross-compiled aarch64 binary needs an emulator that is
-# not assumed here. Skipped, not failed, when the target or its 32-bit runtime
-# is absent: a developer without them has lost nothing the CI matrix
-# (ubuntu/macos/windows) does not already check.
+# A **recording** crosses as a constant: `tests/record_replay.rs` pins the bytes
+# and the resulting state hash in the source, so replaying them under a second
+# target is the whole test -- same source, same constants, different `usize`,
+# different ABI, different code generator.
+#
+# A **save state** cannot: it is the machine's whole RAM, and a constant that
+# large would be unreadable and rewritten by every unrelated change to a board.
+# So `tests/crosshost_snapshot.rs` sends it through a file. The foreign target
+# writes each board's snapshot and the snapshot of the same machine after it has
+# run on; this host loads the first into a board that has only ever been reset,
+# runs it the same span, and must produce the second byte for byte. Running both
+# machines forward is the part that can see a field `save` never wrote.
+#
+# Two second hosts, for two different reasons:
+#
+#   i686        a 32-bit `usize` on the same ISA family. The one installed
+#               target this machine can also *run* -- a cross-compiled aarch64
+#               binary needs an emulator that is not assumed here.
+#   wasm32      a 32-bit address space, a different code generator, and no
+#               native ABI at all, under Node's WASI (`scripts/wasi-run.mjs`).
+#               CI built this target every commit and ran it never; the
+#               `machine::` and `core::state::` unit tests run here too, which
+#               is how `every_shipped_machine_resumes_from_its_own_snapshot`
+#               reaches wasm.
+#
+# Each leg is skipped rather than failed when its target or runtime is absent: a
+# developer without them has lost nothing the CI matrix (ubuntu/macos/windows)
+# does not already check.
+#
+# The feature set is every board `tests/crosshost_snapshot.rs` knows how to
+# build without a corpus -- eight guest architectures, no drive on any of them,
+# which is deliberate: a drive whose medium snapshots by *reference* writes a
+# canonical host path into its chunk and cannot cross a host boundary at all.
+CROSSHOST_FEATURES="std,machine-apple1,machine-nes,machine-beneater,machine-z80-mini,machine-m68k-mini,machine-mips-mini,machine-a64-mini,machine-arm926,machine-stm32f407,machine-spi-flash,machine-spi-panel"
+
+# Load the save states in `$1` into this host and run them on.
+crosshost_read() {
+  RSEMU_SNAPSHOT_READ_DIR="$1" \
+    cargo test --no-default-features --features "$CROSSHOST_FEATURES" \
+    --test crosshost_snapshot
+}
+
 stage_crosshost() {
   local t=i686-unknown-linux-gnu
+  local out
+  out="$(pwd)/target/crosshost"
+
   if ! rustc --print target-libdir --target "$t" >/dev/null 2>&1; then
-    record "skip  crosshost (target not installed: rustup target add $t)"
+    record "skip  crosshost i686 (target not installed: rustup target add $t)"
+  elif ! cargo build --target "$t" --no-default-features \
+         --features "$CROSSHOST_FEATURES" >/dev/null 2>&1; then
+    record "skip  crosshost i686 ($t does not link here: 32-bit runtime missing?)"
+  else
+    run "crosshost replay ($t)" \
+      cargo test --target "$t" --no-default-features \
+      --features "$CROSSHOST_FEATURES" --test record_replay
+    rm -rf "$out/i686"
+    run "crosshost snapshot written by $t" \
+      env RSEMU_SNAPSHOT_WRITE_DIR="$out/i686" \
+      cargo test --target "$t" --no-default-features \
+      --features "$CROSSHOST_FEATURES" --test crosshost_snapshot
+    run "crosshost snapshot from $t loaded here" crosshost_read "$out/i686"
+  fi
+
+  local w=wasm32-wasip1
+  if ! rustc --print target-libdir --target "$w" >/dev/null 2>&1; then
+    record "skip  crosshost wasm (target not installed: rustup target add $w)"
     return 0
   fi
-  local feats="std,machine-apple1"
-  if ! cargo build --target "$t" --no-default-features --features "$feats" \
-       >/dev/null 2>&1; then
-    record "skip  crosshost ($t does not link here: 32-bit runtime missing?)"
+  if ! command -v node >/dev/null 2>&1; then
+    record "skip  crosshost wasm (no node; scripts/wasi-run.mjs needs one)"
     return 0
   fi
-  run "crosshost replay ($t)" \
-    cargo test --target "$t" --no-default-features --features "$feats" \
-    --test record_replay
+  # `wasm32-wasip1` has no `std::thread`, so libtest's default of a thread per
+  # test aborts before the first one runs.
+  export CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings=ExperimentalWarning $(pwd)/scripts/wasi-run.mjs"
+  run "crosshost replay ($w)" \
+    cargo test --target "$w" --no-default-features \
+    --features "$CROSSHOST_FEATURES" --test record_replay -- --test-threads=1
+  run "crosshost unit tests ($w)" \
+    cargo test --target "$w" --no-default-features \
+    --features "$CROSSHOST_FEATURES" --lib -- --test-threads=1 \
+    core::state:: machine::
+  rm -rf "$out/wasm"
+  run "crosshost snapshot written by $w" \
+    env RSEMU_SNAPSHOT_WRITE_DIR="$out/wasm" \
+    cargo test --target "$w" --no-default-features \
+    --features "$CROSSHOST_FEATURES" --test crosshost_snapshot -- --test-threads=1
+  unset CARGO_TARGET_WASM32_WASIP1_RUNNER
+  run "crosshost snapshot from $w loaded here" crosshost_read "$out/wasm"
 }
 
 stage_fuzz() {

@@ -1440,6 +1440,21 @@ mod tests {
     /// is what finds a field it never wrote. `tests/frame_hash.rs` has the same
     /// shape for the five workload boards and `tests/smp_snapshot.rs` for the
     /// four two-processor ones; this is all of them.
+    ///
+    /// # The span is two milliseconds and that cuts both ways
+    ///
+    /// Breadth is bought with brevity: every board, four snapshots each, in a
+    /// unit test. But a snapshot only catches state that is *interesting at the
+    /// instant it is taken*, and 2 ms is early. `tests/crosshost_snapshot.rs`
+    /// runs this same shape over eleven of these boards at 20 ms and found a
+    /// defect this misses — `apu.nes` does not save `Core::irq_out`, so a
+    /// pending frame interrupt is lost across a restore, and the NTSC frame
+    /// counter's first IRQ is about 16.7 ms in, which is 15 ms after this test
+    /// has stopped looking. Widening the span here would be a fair change and
+    /// it is not free: it lengthens every board's run, and the ledger below
+    /// would stop being empty. Read the empty ledger as "nothing fails in the
+    /// first two milliseconds", which is a real statement and a smaller one
+    /// than it looks.
     #[test]
     fn every_shipped_machine_resumes_from_its_own_snapshot() {
         use crate::core::clock::GlobalTime;
