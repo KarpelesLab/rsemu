@@ -1300,6 +1300,32 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             };
             let _ = write!(ops, "{}, {}, #{amount}", varr(d, arr), varr(n, arr));
         }
+        Fmt::VecShiftLongFixed => {
+            // The amount is not in the encoding: `SHLL` shifts by the source
+            // element's own width and the architecture allocates no other
+            // value, so the disassembler prints what `size` implies.
+            let esize = isa::simd_size(word);
+            let lanes = 64 / (8 << esize);
+            let _ = write!(
+                ops,
+                "{}, {}, #{}",
+                varr(
+                    d,
+                    Some(simd::Arrangement {
+                        esize: esize + 1,
+                        lanes
+                    })
+                ),
+                varr(
+                    n,
+                    Some(simd::Arrangement {
+                        esize,
+                        lanes: lanes * (1 + u32::from(isa::q(word)))
+                    })
+                ),
+                8u32 << esize
+            );
+        }
         Fmt::VecShiftLong => {
             let (esize, immhb) = shift_of(word);
             let lanes = 64 / (8 << esize);
@@ -1464,6 +1490,13 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             } else {
                 let _ = write!(ops, "{letter}{d}, {letter}{n}");
             }
+        }
+        Fmt::SimdScalarCvtFp => {
+            // `sz` names the width, the same way it does for every other
+            // scalar floating-point row: `S` or `D`, and never `H`, because
+            // `FEAT_FP16` is not here.
+            let letter = simd::elem_letter(2 + u32::from(isa::simd_sz(word)));
+            let _ = write!(ops, "{letter}{d}, {letter}{n}");
         }
         Fmt::SimdScalarNarrow => {
             let dst = isa::simd_size(word);

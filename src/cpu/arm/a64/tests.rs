@@ -4862,3 +4862,297 @@ fn cpu_on_reaches_a_sibling_running_the_translated_engine() {
     assert_eq!(second.x(9), 0x2a, "it ran the code CPU_ON pointed it at");
     assert_eq!(second.x(0), 0x5a, "with the context id in X0");
 }
+
+// ---------------------------------------------------------------------------
+// The scalar integer conversions, and `SHLL`
+// ---------------------------------------------------------------------------
+//
+// Two more groups chosen the way the halving narrows were: by what real
+// software executes. A Lua interpreter's number conversion stops on
+// `SCVTF D0, D0` — an integer already in a *vector* register, converted
+// without a trip through a general one, which is a different encoding from the
+// `SCVTF Dd, Xn` this core has always had — and `sha256sum` out of suckless
+// `sbase` stops on `SHLL v18.4s, v4.4h, #16`.
+//
+// Every word below is `llvm-mc -triple=aarch64`'s encoding of the assembly in
+// its doc comment.
+
+/// `scvtf d0, d1`.
+const SCVTF_D: u32 = 0x5e61_d820;
+/// `scvtf s0, s1`.
+const SCVTF_S: u32 = 0x5e21_d820;
+/// `ucvtf d0, d1`.
+const UCVTF_D: u32 = 0x7e61_d820;
+/// `ucvtf s0, s1`.
+const UCVTF_S: u32 = 0x7e21_d820;
+/// `fcvtzs d0, d1`.
+const FCVTZS_D: u32 = 0x5ee1_b820;
+/// `fcvtzs s0, s1`.
+const FCVTZS_S: u32 = 0x5ea1_b820;
+/// `fcvtzu s0, s1`.
+const FCVTZU_S: u32 = 0x7ea1_b820;
+/// `fcvtns s0, s1`.
+const FCVTNS_S: u32 = 0x5e21_a820;
+/// `fcvtnu d0, d1`.
+const FCVTNU_D: u32 = 0x7e61_a820;
+/// `fcvtms s0, s1`.
+const FCVTMS_S: u32 = 0x5e21_b820;
+/// `fcvtmu d0, d1`.
+const FCVTMU_D: u32 = 0x7e61_b820;
+/// `fcvtps s0, s1`.
+const FCVTPS_S: u32 = 0x5ea1_a820;
+/// `fcvtpu d0, d1`.
+const FCVTPU_D: u32 = 0x7ee1_a820;
+/// `fcvtas s0, s1`.
+const FCVTAS_S: u32 = 0x5e21_c820;
+/// `fcvtau d0, d1`.
+const FCVTAU_D: u32 = 0x7e61_c820;
+/// `scvtf d0, d0` — the word a Lua interpreter stopped on.
+const SCVTF_LUA: u32 = 0x5e61_d800;
+
+/// `shll v0.8h, v1.8b, #8`.
+const SHLL_8H: u32 = 0x2e21_3820;
+/// `shll2 v0.8h, v1.16b, #8`.
+const SHLL2_8H: u32 = 0x6e21_3820;
+/// `shll v0.4s, v1.4h, #16`.
+const SHLL_4S: u32 = 0x2e61_3820;
+/// `shll2 v0.4s, v1.8h, #16`.
+const SHLL2_4S: u32 = 0x6e61_3820;
+/// `shll v0.2d, v1.2s, #32`.
+const SHLL_2D: u32 = 0x2ea1_3820;
+/// `shll2 v0.2d, v1.4s, #32`.
+const SHLL2_2D: u32 = 0x6ea1_3820;
+/// `shll v18.4s, v4.4h, #16` — the word `sha256sum` stopped on.
+const SHLL_SHA256: u32 = 0x2e61_3892;
+
+/// Every word decodes, and to an Advanced SIMD row.
+#[test]
+fn the_scalar_conversion_and_shll_encodings_decode() {
+    let words = [
+        SCVTF_D,
+        SCVTF_S,
+        UCVTF_D,
+        UCVTF_S,
+        FCVTZS_D,
+        FCVTZS_S,
+        FCVTZU_S,
+        FCVTNS_S,
+        FCVTNU_D,
+        FCVTMS_S,
+        FCVTMU_D,
+        FCVTPS_S,
+        FCVTPU_D,
+        FCVTAS_S,
+        FCVTAU_D,
+        SCVTF_LUA,
+        SHLL_8H,
+        SHLL2_8H,
+        SHLL_4S,
+        SHLL2_4S,
+        SHLL_2D,
+        SHLL2_2D,
+        SHLL_SHA256,
+    ];
+    for word in words {
+        let insn = super::isa::decode(word, Features::ALL)
+            .unwrap_or_else(|| panic!("{word:08x} did not decode"));
+        assert_eq!(insn.feat, super::isa::Feat::AdvSimd, "{word:08x}");
+    }
+}
+
+/// ...and disassembles back to exactly the text `llvm-mc` printed.
+///
+/// `SHLL`'s amount is the interesting column: it is not in the encoding at
+/// all — the architecture allocates only "the source element's own width" —
+/// so the disassembler prints what `size` implies, and a core that read an
+/// immediate field would print whatever happened to be in `Rm`.
+#[test]
+fn the_disassembler_spells_the_scalar_conversions_and_shll() {
+    let cases: &[(u32, &str)] = &[
+        (SCVTF_D, "scvtf\td0, d1"),
+        (SCVTF_S, "scvtf\ts0, s1"),
+        (UCVTF_D, "ucvtf\td0, d1"),
+        (UCVTF_S, "ucvtf\ts0, s1"),
+        (FCVTZS_D, "fcvtzs\td0, d1"),
+        (FCVTZS_S, "fcvtzs\ts0, s1"),
+        (FCVTZU_S, "fcvtzu\ts0, s1"),
+        (FCVTNS_S, "fcvtns\ts0, s1"),
+        (FCVTNU_D, "fcvtnu\td0, d1"),
+        (FCVTMS_S, "fcvtms\ts0, s1"),
+        (FCVTMU_D, "fcvtmu\td0, d1"),
+        (FCVTPS_S, "fcvtps\ts0, s1"),
+        (FCVTPU_D, "fcvtpu\td0, d1"),
+        (FCVTAS_S, "fcvtas\ts0, s1"),
+        (FCVTAU_D, "fcvtau\td0, d1"),
+        (SCVTF_LUA, "scvtf\td0, d0"),
+        (SHLL_8H, "shll\tv0.8h, v1.8b, #8"),
+        (SHLL2_8H, "shll2\tv0.8h, v1.16b, #8"),
+        (SHLL_4S, "shll\tv0.4s, v1.4h, #16"),
+        (SHLL2_4S, "shll2\tv0.4s, v1.8h, #16"),
+        (SHLL_2D, "shll\tv0.2d, v1.2s, #32"),
+        (SHLL2_2D, "shll2\tv0.2d, v1.4s, #32"),
+        (SHLL_SHA256, "shll\tv18.4s, v4.4h, #16"),
+    ];
+    for (word, want) in cases {
+        let text = super::disasm::disassemble(*word, 0, Features::ALL).text;
+        assert_eq!(&text, want, "{word:08x}");
+    }
+}
+
+/// The conversion itself, at both widths and both signednesses.
+///
+/// The `S` cases are where a core that read the wrong width goes wrong
+/// quietly: `SCVTF S0, S1` converts the **32-bit** integer in `S1`, so
+/// `0xffffffff` is -1 and not 4294967295 — and `UCVTF` on the same bits is
+/// 4294967295, which is the pair that pins both the width and the sign.
+#[test]
+fn a_scalar_conversion_reads_the_width_its_encoding_names() {
+    let h = simd(&[SCVTF_D, SCVTF_S, UCVTF_S, UCVTF_D]);
+    h.cpu.set_v(1, 5);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from(d(5.0)), "the doubleword integer 5");
+
+    h.cpu.set_v(1, 0xffff_ffff);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from((-1.0f32).to_bits()), "-1 as a word");
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        u128::from(4_294_967_295.0f32.to_bits()),
+        "and 4294967295 unsigned"
+    );
+
+    // The doubleword unsigned form, on a value whose top bit is set.
+    h.cpu.set_v(1, 1u128 << 63);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from(d(9_223_372_036_854_775_808.0)));
+}
+
+/// Every rounding mode the group spells, on the one input that tells them
+/// apart, plus the tie that separates `FCVTNS` from `FCVTAS`.
+#[test]
+fn the_rounding_modes_of_the_scalar_conversions_differ_where_they_should() {
+    let h = simd(&[FCVTZS_S, FCVTNS_S, FCVTMS_S, FCVTPS_S, FCVTAS_S]);
+    // 2.5: toward zero 2, ties-to-even 2, toward -inf 2, toward +inf 3,
+    // ties-away 3. A single mode used for all five would agree on four of
+    // them and be wrong on one, whichever it was.
+    let want = [2u128, 2, 2, 3, 3];
+    for (n, expect) in want.iter().enumerate() {
+        h.cpu.set_v(1, u128::from(2.5f32.to_bits()));
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), *expect, "instruction {n}");
+    }
+    // And -2.5, where toward -inf and toward zero part company.
+    let h = simd(&[FCVTZS_S, FCVTNS_S, FCVTMS_S, FCVTPS_S, FCVTAS_S]);
+    let want: [i32; 5] = [-2, -2, -3, -2, -3];
+    for (n, expect) in want.iter().enumerate() {
+        h.cpu.set_v(1, u128::from((-2.5f32).to_bits()));
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), u128::from(*expect as u32), "instruction {n}");
+    }
+    // 3.5 is the input that separates **toward zero** from ties-to-even,
+    // which 2.5 cannot: an even tie rounds down either way there, so a
+    // `FCVTZS` implemented with the wrong mode agrees on every case above.
+    let h = simd(&[FCVTZS_S, FCVTNS_S, FCVTMS_S, FCVTPS_S, FCVTAS_S]);
+    let want = [3u128, 4, 3, 4, 4];
+    for (n, expect) in want.iter().enumerate() {
+        h.cpu.set_v(1, u128::from(3.5f32.to_bits()));
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), *expect, "instruction {n}");
+    }
+    // The unsigned halves are separate rows with separate modes, and 3.5
+    // separates them too: a `FCVTZU` that rounded to nearest would agree with
+    // `FCVTNU` everywhere the signed cases above look.
+    let h = simd(&[FCVTZU_S, FCVTNU_D]);
+    h.cpu.set_v(1, u128::from(3.5f32.to_bits()));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 3, "FCVTZU truncates");
+    h.cpu.set_v(1, u128::from(d(3.5)));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 4, "and FCVTNU rounds to even");
+}
+
+/// A scalar destination is written at its own width and **zeroes the rest of
+/// the register**, which is the rule for every scalar SIMD result and the one
+/// a `write` that merged would break silently.
+#[test]
+fn a_scalar_conversion_zeroes_the_rest_of_its_destination() {
+    let h = simd(&[SCVTF_S, FCVTZU_S]);
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 1);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from(1.0f32.to_bits()));
+    // ...and the unsigned convert-to-integer of a negative number clamps at
+    // zero and raises `Invalid`, which is `fp::to_int`'s rule rather than
+    // this group's — asserted here because this is the first encoding that
+    // reaches it with a scalar operand.
+    h.cpu.set_v(1, u128::from((-1.0f32).to_bits()));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0);
+    assert_ne!(h.cpu.sysregs().fpsr & 1, 0, "FPSR.IOC");
+}
+
+/// `SHLL` puts each source element into the **top** half of a destination
+/// element twice as wide, which is what shifting left by the source's own
+/// width means.
+#[test]
+fn shll_moves_each_lane_into_the_top_half_of_a_wider_one() {
+    let h = simd(&[SHLL_8H, SHLL_4S, SHLL_2D]);
+    h.cpu.set_v(1, 0x0102_0304_0506_0708);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0100_0200_0300_0400_0500_0600_0700_0800);
+
+    h.cpu.set_v(1, 0x0001_0002_0003_0004);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0001_0000_0002_0000_0003_0000_0004_0000);
+
+    h.cpu.set_v(1, 0x0000_0001_ffff_ffff);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0000_0001_0000_0000_ffff_ffff_0000_0000,
+        "unsigned: the top word is not sign-extended"
+    );
+}
+
+/// `Q` selects the half of the **source** — the `UMULL2` rule, not the
+/// `XTN2` one — and the destination is written whole either way.
+#[test]
+fn shll2_reads_the_top_half_of_its_source() {
+    let h = simd(&[SHLL_8H, SHLL2_8H, SHLL2_4S, SHLL2_2D]);
+    let source = 0x1112_1314_1516_1718_0102_0304_0506_0708u128;
+    h.cpu.set_v(1, source);
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0100_0200_0300_0400_0500_0600_0700_0800,
+        "the low eight bytes"
+    );
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x1100_1200_1300_1400_1500_1600_1700_1800,
+        "and the top eight"
+    );
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x1112_0000_1314_0000_1516_0000_1718_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x1112_1314_0000_0000_1516_1718_0000_0000);
+}
+
+/// `size == 0b11` would make the destination a 128-bit element, which does
+/// not exist. `llvm-mc` rejects these words too.
+#[test]
+fn a_quadword_destination_has_no_shll() {
+    for word in [SHLL_8H, SHLL2_8H] {
+        let reserved = word | (3 << 22);
+        let h = simd(&[reserved]);
+        h.steps(1);
+        assert_eq!(
+            h.cpu.sysregs().esr_el1 >> 26,
+            ec::UNKNOWN,
+            "{reserved:08x} should be UNDEFINED"
+        );
+    }
+}

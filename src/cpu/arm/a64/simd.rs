@@ -64,30 +64,46 @@
 //! # What is deliberately absent
 //!
 //! Polynomial multiply, the reciprocal-estimate family (`FRECPE`, `FRSQRTE`,
-//! `FRECPS`, `FRSQRTS`, `FMULX`), `FEAT_FP16` arithmetic, the pairwise
-//! long adds (`SADDLP`, `UADALP`), `SHLL`, the absolute-difference-long
+//! `FRECPS`, `FRSQRTS`, `FMULX`, `FRECPX`), `FEAT_FP16` arithmetic, the
+//! pairwise long adds (`SADDLP`, `UADALP`), the absolute-difference-long
 //! group (`SABAL`, `UABDL`), the saturating **by-element** forms
 //! (`SQDMULH`/`SQRDMULH`/`SQDMULL` and relatives with a lane index),
-//! the non-saturating scalar shifts *by an immediate* (`SHL D0, D1, #n` and
-//! `USHR`, `SSHR`, `SRI`, `SLI` and relatives — the vector forms are all
-//! here), the scalar two-misc conversions (`SCVTF S0, S1`, `FCVTZS`,
-//! `UCVTF`), `LD2`/`LD3`/`LD4` of a *single* structure and the replicating
-//! loads other than `LD1R`, and everything Armv8.1 and later added. Each is
-//! absent from the table, so each raises `UNDEFINED` rather than being
-//! quietly wrong.
+//! `FCVTXN`, the non-saturating scalar shifts *by an immediate*
+//! (`SHL D0, D1, #n` and `USHR`, `SSHR`, `SRI`, `SLI` and relatives — the
+//! vector forms are all here), `LD2`/`LD3`/`LD4` of a *single* structure and
+//! the replicating loads other than `LD1R`, and everything Armv8.1 and later
+//! added. Each is absent from the table, so each raises `UNDEFINED` rather
+//! than being quietly wrong.
 //!
-//! The **halving-narrow three-different family** — `ADDHN`, `RADDHN`,
-//! `SUBHN`, `RSUBHN` — used to head that list and does not any more, because
-//! it turned out to be the one entry on it that every dynamically linked
-//! program on this architecture executes. glibc's `strlen` compares sixteen
-//! bytes with `CMEQ` and folds the mask to eight with `ADDHN v2.8b, v1.8h,
-//! v1.8h`, so a whole C library stopped there before it reached `main`. What
-//! the rest of the list costs is written down in `arm64-virt.md`; what this
-//! one cost was measured: of the 329 272 instruction words in a Debian
-//! `libc.so.6` and its `ld.so`, this core refused 329, and every one of them
-//! but four `ADDHN`s was behind a feature bit — SVE, SME, MTE or `FEAT_MOPS`
-//! — that this core's ID registers deny, so an `ifunc` resolver never selects
-//! it. Four words in a third of a million were the whole gap.
+//! # What came off that list, and how it was chosen
+//!
+//! Three groups, and none of them by guessing. Somebody ran real third-party
+//! software — a whole glibc, a Lua interpreter, `sha256sum` out of suckless
+//! `sbase` — under the user-mode consumer and wrote down where each stopped:
+//!
+//! * the **halving-narrow three-different family** (`ADDHN`, `RADDHN`,
+//!   `SUBHN`, `RSUBHN`), because glibc's `strlen` compares sixteen bytes with
+//!   `CMEQ` and folds the mask to eight with `ADDHN v2.8b, v1.8h, v1.8h` — so
+//!   a whole C library stopped there before it reached `main`, and so does
+//!   every dynamically linked program on this architecture;
+//! * the **scalar two-register-misc integer conversions** (`SCVTF D0, D0` and
+//!   its eleven relatives), which are *not* the `SCVTF Dd, Xn` in the scalar
+//!   floating-point encoding: they convert an integer that is already in a
+//!   vector register, which is what a compiler emits when it is, and which is
+//!   where a Lua interpreter's number conversion stopped;
+//! * **`SHLL`/`SHLL2`**, where `sha256sum` stopped.
+//!
+//! What that population is worth is the point. A previous measurement found
+//! SIMD and floating point executing **zero times** during a Linux *kernel*
+//! boot, so a kernel says nothing about which of these matter; a userspace
+//! `strlen` and a Lua number conversion are a different population entirely.
+//!
+//! The static count agrees. Of the 329 272 instruction words in a Debian
+//! `libc.so.6` and its `ld.so`, this core refused 329 before any of this, and
+//! every one of them but four `ADDHN`s was behind a feature bit — SVE, SME,
+//! MTE or `FEAT_MOPS` — that this core's ID registers deny, so an `ifunc`
+//! resolver never selects it. Four words in a third of a million were that
+//! library's whole gap.
 //!
 //! # Sources
 //!

@@ -2946,7 +2946,7 @@ impl<'a> Exec<'a> {
             Fmt::VecExt => self.simd_ext(word),
             Fmt::VecTable => self.simd_table(word, op),
             Fmt::VecShiftImm => self.simd_shift_imm(word, op),
-            Fmt::VecShiftLong => self.simd_shift_long(word, op),
+            Fmt::VecShiftLong | Fmt::VecShiftLongFixed => self.simd_shift_long(word, op),
             Fmt::VecShiftNarrow => self.simd_shift_narrow(word, op),
             Fmt::VecThreeDiff | Fmt::VecThreeWide => self.simd_three_diff(word, op, fmt),
             Fmt::VecThreeNarrow => self.simd_three_narrow(word, op),
@@ -2955,6 +2955,7 @@ impl<'a> Exec<'a> {
             | Fmt::SimdScalarTwo
             | Fmt::SimdScalarCmpZero
             | Fmt::SimdScalarPair => self.simd_scalar(word, op, fmt),
+            Fmt::SimdScalarCvtFp => self.simd_scalar_cvt(word, op),
             Fmt::SimdScalarThreeSz
             | Fmt::SimdScalarTwoSz
             | Fmt::SimdScalarNarrow
@@ -3820,19 +3821,36 @@ impl<'a> Exec<'a> {
     /// `SSHLL`/`USHLL`: a shift left into elements twice as wide, reading the
     /// half of the source `Q` selects.
     fn simd_shift_long(&mut self, word: u32, op: Op) -> Result<(), Trap> {
-        let (src, immhb) = Self::shift_width(word)?;
-        if src == 3 {
-            return Err(Trap::undefined());
-        }
+        // `SHLL` reads the element width out of `size` and its shift amount
+        // *is* that width — the architecture allocates no other amount for
+        // it, because shifting a source element left by its own width is
+        // exactly "put it in the top half of the wider one". Everything else
+        // in this family reads `immh`:`immb`.
+        let (src, shift) = if op == Op::ShllVec {
+            let size = isa::simd_size(word);
+            if size == 3 {
+                return Err(Trap::undefined());
+            }
+            (size, 8u32 << size)
+        } else {
+            let (src, immhb) = Self::shift_width(word)?;
+            if src == 3 {
+                return Err(Trap::undefined());
+            }
+            (src, immhb - (8 << src))
+        };
         let dst = src + 1;
         let bits = 8 << src;
-        let shift = immhb - bits;
         let lanes = 64 / bits;
         let whole = self.st.v.q(isa::rn(word));
         let source = if isa::q(word) { whole >> 64 } else { whole };
         let mut out = 0u128;
         for lane in 0..lanes {
             let x = simd::elem(source, src, lane);
+            // `SSHLL` sign-extends before the shift; `USHLL` and `SHLL` do
+            // not. For `SHLL` the distinction cannot show, because the shift
+            // is the whole source width and every bit a sign extension would
+            // have set is shifted straight back out.
             let widened = if op == Op::SshllVec {
                 simd::trunc(simd::sext(x, src) as u64, dst)
             } else {
@@ -4154,6 +4172,47 @@ impl<'a> Exec<'a> {
         };
         self.set_fp_flags(flags);
         self.st.v.write(d, bytes, value);
+        Ok(())
+    }
+
+    /// The scalar two-register-misc **floating-point** conversions: the
+    /// lanewise rule of [`Exec::simd_two_misc_fp`] applied to one lane.
+    ///
+    /// Deliberately not a branch inside that function. The vector form's
+    /// width comes from an arrangement and this one's from `sz` alone, there
+    /// is no lane loop, and the destination is written at the element width
+    /// rather than as a whole register — three differences that would each
+    /// have been an `if` in the hot path of the vector version.
+    ///
+    /// The conversions are the whole of what is here. `FABS`, `FNEG`,
+    /// `FSQRT` and the `FRINT` family have scalar spellings in the *scalar
+    /// floating-point* encoding, which this core already has, so a second row
+    /// here would be a second encoding for one instruction.
+    fn simd_scalar_cvt(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let e = 2 + u32::from(isa::simd_sz(word));
+        let prec = prec_of(e)?;
+        let bits = 8 << e;
+        let bytes = 1u64 << e;
+        let x = self.st.v.read(isa::rn(word), bytes);
+        let env = fp::env(self.st.sys.fpcr, prec);
+        let to_int = |mode: Round, signed| fp::to_int(prec, x, bits, signed, env.round(mode));
+        let (value, flags) = match op {
+            Op::ScvtfScalar => fp::from_int(prec, x, bits, true, env),
+            Op::UcvtfScalar => fp::from_int(prec, x, bits, false, env),
+            Op::FcvtzsScalar => to_int(Round::TowardZero, true),
+            Op::FcvtzuScalar => to_int(Round::TowardZero, false),
+            Op::FcvtnsScalar => to_int(Round::TiesEven, true),
+            Op::FcvtnuScalar => to_int(Round::TiesEven, false),
+            Op::FcvtmsScalar => to_int(Round::TowardNegative, true),
+            Op::FcvtmuScalar => to_int(Round::TowardNegative, false),
+            Op::FcvtpsScalar => to_int(Round::TowardPositive, true),
+            Op::FcvtpuScalar => to_int(Round::TowardPositive, false),
+            Op::FcvtasScalar => to_int(Round::TiesAway, true),
+            Op::FcvtauScalar => to_int(Round::TiesAway, false),
+            _ => return Err(Trap::undefined()),
+        };
+        self.set_fp_flags(flags);
+        self.st.v.write(isa::rd(word), bytes, value);
         Ok(())
     }
 

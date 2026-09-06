@@ -122,9 +122,9 @@
 //! # What is deliberately absent
 //!
 //! The reciprocal-estimate family, polynomial multiply, the pairwise long
-//! adds, the absolute-difference-long group, and the by-element multiplies
-//! other than the four already here — including the saturating by-element
-//! forms. `FEAT_FP16` arithmetic (half precision exists
+//! adds, the absolute-difference-long group, `FCVTXN`, and the by-element
+//! multiplies other than the four already here — including the saturating
+//! by-element forms. `FEAT_FP16` arithmetic (half precision exists
 //! here only as a conversion format, which is Armv8.0-A), EL2 and EL3 (so
 //! `HVC` and `SMC` are `UNDEFINED`, and so `CNTVOFF_EL2` does not exist and
 //! the virtual count equals the physical one), AArch32 at any level, the
@@ -197,6 +197,16 @@
 //! not are that group's remaining deliberate absences: `SABAL`, `SABDL`,
 //! `UABAL`, `UABDL`, `PMULL`, `SADALP`/`UADALP` and the by-element
 //! `SMLSL`/`UMLSL`.
+//!
+//! The **two-register-misc** encodings, vector and scalar, were swept the
+//! same way when `SHLL` and the scalar integer conversions landed: every `Q`,
+//! `U`, `size` and `opcode` of both over four register pairs, plus every one-
+//! and two-bit flip of five canonical words — 5 388 words, nothing this core
+//! accepts that `llvm-mc` rejects, and all 719 words `llvm-mc` calls `SHLL`
+//! or one of the twelve conversions disassembling to its own text. The 248
+//! it decodes and this core does not are that group's remaining deliberate
+//! absences: the reciprocal estimates, the pairwise long adds, `FMULX`,
+//! `FCVTXN` and the `SQDMULL` family's by-element forms.
 //!
 //! That sweep is also where this round's harness trap was, and it is a third
 //! one worth writing beside the other two: `ESR_EL1.EC` is **zero for an
