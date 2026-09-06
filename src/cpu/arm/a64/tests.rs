@@ -652,6 +652,66 @@ fn an_intervening_store_breaks_the_reservation() {
     assert_eq!(h.cpu.x(2), 1);
 }
 
+/// A restore drops the global half of the reservation as well as the local.
+///
+/// `State::exclusive` is in the chunk; the slot this core holds in the space's
+/// `ExclusiveMonitor` is derived and is not. So a rewind can restore a
+/// reservation on **A** while the broadcast claim is still live for a later
+/// granule — and `ExclusiveMonitor::holds` takes no address, by design. A
+/// `STXR` to A then passes both checks and succeeds, even though a foreign
+/// store to A happened in between: the guest is told its atomic held when it
+/// did not.
+///
+/// DDI 0487 B2.9 permits a monitor to be cleared spuriously, which is exactly
+/// what dropping it on restore is, and it costs one `STXR` failure per
+/// restore.
+#[test]
+fn a_restore_drops_the_global_reservation_too() -> Result<()> {
+    // Reserve A, then stop.
+    let h = Harness::a53(&[movz(1, 0, 0x8000, 0), ldxr_x(1, 0)]);
+    h.steps(2);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version)?;
+        h.cpu.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    // Move the broadcast claim onto a different granule, which is what any
+    // further execution before a rewind would do.
+    h.write_program(0, &[movz(1, 0, 0x8100, 0), ldxr_x(1, 0)]);
+    h.cpu.set_pc(0);
+    h.steps(2);
+
+    // Rewind: architecturally the core holds A again.
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
+    let mut cr = chunk.reader();
+    h.cpu.load(&mut cr)?;
+    cr.end()?;
+
+    // A foreign write into A. It goes straight at the RAM rather than through
+    // a guest `STR`, deliberately: a guest store would break this core's own
+    // *local* reservation, and then the `STXR` would fail for that reason
+    // whether or not the global claim were stale — a test that cannot fail.
+    // Written this way, only the global half can refuse.
+    h.write64(0x8000, 7);
+
+    h.write_program(0, &[movz(1, 0, 0x8000, 0), stxr_x(2, 1, 0)]);
+    h.cpu.set_pc(0);
+    h.steps(2);
+
+    assert_eq!(
+        h.cpu.x(2),
+        1,
+        "a restore must not leave a stale broadcast claim standing"
+    );
+    Ok(())
+}
+
 /// A `STXR` at an address the `LDXR` never reserved must fail, even though the
 /// global monitor is perfectly happy.
 ///

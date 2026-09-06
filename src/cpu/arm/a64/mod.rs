@@ -1983,6 +1983,11 @@ impl Device for Cpu {
         let cfg = self.effective_config();
         let mut session = self.session.lock();
         session.state = State::new(&cfg);
+        // `State::new` drops the architectural reservation; the global half
+        // lives in the space and has to be dropped with it.
+        if let Some(monitor) = session.monitor.as_ref() {
+            monitor.clear();
+        }
         session.tlb.flush();
         // Both caches, and for the same reason: a reset can be accompanied by
         // a reload of the memory a translation was lifted from, and a block
@@ -2124,6 +2129,16 @@ impl Device for Cpu {
         };
         let mut session = self.session.lock();
         session.state = s;
+        // `State::exclusive` is in the chunk; the slot this core holds in the
+        // space's monitor is derived and is not, so it still carries whatever
+        // granule this core last broadcast. Left standing, an `STXR` to the
+        // *restored* address passes the global check against a stale claim
+        // that a foreign store no longer breaks — the guest would be told its
+        // atomic held when it did not. DDI 0487 B2.9 permits a monitor to be
+        // cleared spuriously, which is what this is, once per restore.
+        if let Some(monitor) = session.monitor.as_ref() {
+            monitor.clear();
+        }
         // The TLB is derived state and is never restored: it comes back empty,
         // which is always correct (`ROADMAP.md` §4.5).
         session.tlb.flush();
