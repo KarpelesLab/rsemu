@@ -77,11 +77,24 @@ memory model is "there is no page table" and the map `UserMemory` builds is the
 address space the guest sees, so there is nothing for an MMU to translate.
 
 Nothing else moved. **The ELF loader, the initial stack, the auxiliary vector,
-every syscall, the errno values, the host-filesystem policy and the journal are
-byte-identical between the two**, and the first AArch64 run of the same
-`hello` binary made the same twenty-five calls in the same order as the RISC-V
-one and refused none of them. The claim that the seam is not RISC-V-shaped is
-now measured rather than asserted.
+the errno values, the host-filesystem policy and the journal are byte-identical
+between the two**, and the first AArch64 run of the same `hello` binary made
+the same twenty-five calls in the same order as the RISC-V one and refused none
+of them. The claim that the seam is not RISC-V-shaped is now measured rather
+than asserted.
+
+**One thing that was on that list has come off it, and it took a real C library
+to find:** the syscall *numbers* are not entirely shared. `asm-generic`'s header
+reserves 244..259 "for architecture specific syscalls", and RISC-V spends two of
+them where AArch64 spends none — `__NR_riscv_hwprobe` is 258. glibc's RISC-V
+`ld.so` calls it before it picks an ifunc for `memcpy`, so a consumer that
+implements "the `asm-generic` table" and stops has a hole on exactly one of its
+two architectures. It is answered `-ENOSYS`, which is what a kernel older than
+6.4 says, and glibc falls back to `AT_HWCAP` — the description this consumer
+already gives honestly, so the fallback is the *accurate* path rather than a
+degraded one. The number is matched with a guard on `e_machine` rather than
+unconditionally, because on AArch64 258 is unassigned and a program asking for
+it should be told so.
 
 `AT_HWCAP` is worth one more line, because it is a promise rather than a
 description. `HWCAP_ATOMICS` is deliberately **absent**: `Config::cortex_a53`
@@ -372,14 +385,29 @@ deliberate: the loader is what is under test, and a libc between it and
 `_start` only adds four hundred instructions to whatever goes wrong. The
 string it prints lives in the *shared object* and the length comes from a
 function there, so nothing appears on standard output unless both relocations
-were resolved by somebody — and that somebody is a real
-`ld-linux-aarch64.so.1`, copied out of a cross sysroot on the host by the
-fetch script.
+were resolved by somebody — and that somebody is a real `ld-linux-*.so.1`,
+copied into the git-ignored corpus by the fetch script.
+
+It runs on **both** architectures:
 
 ```console
 usermode/dynamic on aarch64: 22 syscall(s), 1 thread(s), 16733 tick(s); refused []
 usermode/dynamic on aarch64: stdout "hello from a shared obj\n"
+usermode/dynamic on riscv64: 18 syscall(s), 1 thread(s), 24150 tick(s); refused []
+usermode/dynamic on riscv64: stdout "hello from a shared obj\n"
 ```
+
+RISC-V went untested for a while for a reason that had nothing to do with the
+loader: **no compiler can produce an `ld.so`**, and while a Linux host usually
+has an `aarch64` cross sysroot lying about, it rarely has a RISC-V one. The
+fetch script now falls back to a pinned Debian `libc6-riscv64-cross` package
+— about a megabyte, architecture-independent, fetched into the corpus with a
+checksum and never committed — so the answer to "is the loader AArch64-shaped?"
+stopped depending on what the host happened to have installed. It is not: the
+same code placed both, and **the RISC-V run makes four fewer calls**, which is
+the one difference and is `p_align`. AArch64 objects align to 64 KiB, so glibc
+over-allocates the span and trims it with two `munmap`s; RISC-V's align to the
+page size and there is nothing to trim.
 
 The same program built for `x86_64-unknown-linux-gnu` and run under `strace`
 makes 26, and every difference is accounted for:
@@ -437,34 +465,117 @@ of their own — every `mmap` they make is data or anonymous heap, and none of
 them calls `mprotect` at all. A dynamic loader is still the only thing here
 that builds an executable mapping after the loader has run.
 
-### A ledgered stop: a whole glibc
+The whole-glibc guests in the next section **do** make it more acute, and they
+are the reason this is written up rather than left as a note. There are four of
+them now, on two architectures, and each is a real `ld.so` doing exactly the
+sequence described above — half a dozen `mprotect`s per run, over spans it just
+mapped from a descriptor. Nothing has gone wrong; the point is that if
+something did, nothing here would say so.
 
-The same experiment with a real C library in it —
-`tests/usermode/hello.rs`, the static milestone guest unchanged, linked
-against the host's cross glibc instead of statically against musl — gets
-further than it sounds and then stops somewhere that is not this layer's
-fault:
+### A whole C library, on both architectures
 
-```text
-usermode/glibc on aarch64: ledgered — thread 1 faulted at pc 0x7ffeff6ad628
-  in /lib/libc.so.6 + 0x9d628, on aarch64 after 42 syscall(s)
+The same experiment with a real glibc in it. `tests/usermode/hello.rs` — the
+static milestone guest, unchanged — linked against a C library instead of
+statically against musl, and run under that library's own `ld.so`. Everything
+the shared-object guest above does happens here too and then keeps going: the
+loader opens each library by path out of the stage, maps its segments from a
+descriptor, trims them to their alignment, applies every relocation, resolves
+the ifuncs glibc picks its `memcpy` and `strlen` with, transfers control, and
+runs a C library's entire startup — TLS, the stack guard, the standard streams
+— before the program's own first line.
+
+```console
+usermode/glibc ["glibc"] on riscv64: 62 syscall(s), 506038 tick(s); refused []
+usermode/glibc on riscv64: stdout "hello from level 3\nargv = [\"glibc\"]\nRSEMU = Some(\"1\")\n"
+usermode/glibc ["glibc"] on aarch64: 59 syscall(s), 286409 tick(s); refused []
+usermode/glibc on aarch64: stdout "hello from level 3\nargv = [\"glibc\"]\nRSEMU = Some(\"1\")\n"
 ```
 
-Forty-two syscalls, **refusing nothing**: both libraries opened by path out of
-the stage, every segment mapped from a descriptor, the 64 KiB trimming done,
-every relocation applied, control transferred, and glibc's own startup running
-— until `strlen+0x68`, which is `ADDHN v2.8b, v1.8h, v1.8h`. The
-halving-narrow three-different group is one of the things
-`src/cpu/arm/a64/simd.rs` lists under *"what is deliberately absent"*, so it
-raises `UNDEFINED` rather than being quietly wrong, which is the right
-behaviour and is exactly why this is visible.
+The two runs are not the same shape, which is why both are run:
 
-`a_whole_glibc_links_and_relocates_and_then_meets_a_missing_instruction` is
-the ledger entry. It asserts the half that is this layer's — the loading
-worked and nothing was refused — and that where it stopped is inside an object
-**the loader placed**. The day the core gains that group it will assert the
-program's output instead, and it says so rather than quietly continuing to
-pass.
+| | AArch64 | RISC-V |
+| --- | --- | --- |
+| objects the loader places | 2 | 4 |
+| syscalls | 59 | 62 |
+| segment trimming (`p_align`) | 64 KiB, so `munmap` ×4 | page-sized, so none |
+
+The RISC-V guest is linked against a **pre-2.34** glibc, so `libpthread`,
+`libdl` and `librt` are still `DT_NEEDED`s of their own rather than having been
+merged into `libc.so.6`. Four images to open, place, relocate and order instead
+of two — a harder exercise for the loader, and what a great deal of shipped
+software still looks like.
+
+**This section used to describe a stop**, and the history is worth keeping
+because it is what the arrangement is for. Until the A64 core grew the
+halving-narrow three-different group, this guest got forty-two syscalls in —
+refusing nothing, every library opened, every segment mapped, every relocation
+applied — and then stopped at `strlen+0x68` on `ADDHN v2.8b, v1.8h, v1.8h`,
+which `src/cpu/arm/a64/simd.rs` listed under *"what is deliberately absent"*.
+The test asserted the half that was this layer's and ledgered the half that was
+not, and said in as many words that the day the core gained the group it would
+start asserting the program's output instead. It does.
+
+That ledger has **not** been removed, only emptied, and the reason is the one
+thing that makes this guest different from every other one here: nobody chose
+its contents. It is whichever glibc the host had. So a stop inside an object
+the loader placed, on an instruction `src/cpu/` does not implement, is still
+reported and skipped rather than failed — through the same runner the
+third-party corpus uses, for the same reason. Every other failure is this
+module's and fails.
+
+#### With four threads in it
+
+`tests/usermode/threads.rs` against the same C library, in the same namespace,
+because a libc's threading is the part of it least like any other libc's:
+
+```console
+usermode/glibc-threads ["glibc-threads"] on riscv64: 204 syscall(s), 1005849 tick(s); refused []
+usermode/glibc-threads on riscv64: stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"
+usermode/glibc-threads ["glibc-threads"] on aarch64: 205 syscall(s), 1150910 tick(s); refused []
+usermode/glibc-threads on aarch64: stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"
+```
+
+Against the same program built for `x86_64-unknown-linux-gnu` and run under
+`strace`, **every thread-related count is equal**:
+
+| | host | rsemu |
+| --- | --- | --- |
+| `clone3` | 7 | 7 |
+| `exit` | 7 | 7 |
+| `set_robust_list` | 8 | 8 |
+| `sched_getaffinity` | 8 | 8 |
+| `gettid` | 8 | 8 |
+| `futex` | 8 | 8 |
+| `rt_sigprocmask` | 29 | 29 |
+| `sigaltstack` | 24 | 24 |
+| `rt_sigaction` | 6 | 6 |
+
+That is a stronger result than the musl guest's 166-against-168, and the
+difference is the point: musl's threads contend a lock the host contends more
+often because it really is parallel, and this program's do not. Everything left
+over is in the loader — the host consults `/etc/ld.so.cache` and this run does
+not, because `LD_LIBRARY_PATH` finds the library first — plus `execve` and
+`arch_prctl`, which have no level-3 counterpart.
+
+#### `clone3`, which the trace found and the output did not
+
+The first threaded glibc run printed `counter = 40000` and refused syscall
+**435**. glibc's `pthread_create` asks for `clone3` *first* and falls back to
+the five-register `clone` on `-ENOSYS`; musl never asks at all. So the answer
+was already right, every thread ran, and the only thing that said anything was
+the refusal list — the same shape as `sigaltstack` and `st_ino` before it,
+one layer up.
+
+It is implemented rather than answered `-ENOSYS`, which is a choice worth
+stating. A fallback that always fires is a path never tested, and `clone3` is
+the only call in this table whose **arguments are in guest memory** rather than
+in registers: a level-3 kernel has to read a `struct clone_args` out of the
+address space it is servicing before it can act. Two things move in that
+translation and both are places to be wrong — `clone` is handed the stack's
+*top* and `clone3` its bottom plus a length, and `CLONE_ARGS_SIZE_VER0` is a
+version rather than a length, so a shorter struct is `-EINVAL` and a longer one
+is read as far as is understood. The legacy form stays exercised by every musl
+guest, so implementing this covers a path rather than replacing one.
 
 ## Third-party software, which is the only witness that counts
 
@@ -486,12 +597,12 @@ permissive, all fetched at a pinned version, cross-built unmodified by
 | **sbase** | MIT | coreutils, so the answers can be diffed against the host's own |
 
 ```console
-usermode/sqlite ["sqlite3", "/work/demo.db", ".read /work/query.sql"] on riscv64: 93 syscall(s), 749472 tick(s); refused []
+usermode/sqlite ["sqlite3", "/work/demo.db", ".read /work/query.sql"] on riscv64: 93 syscall(s), 755325 tick(s); refused []
 usermode/sqlite on riscv64: stdout "osaka\nkyoto\nnara\n4509538\n2870\n"
-usermode/sqlite ["sqlite3", "/work/demo.db", ".read /work/query.sql"] on aarch64: 93 syscall(s), 472403 tick(s); refused []
-usermode/lua ["lua", "/work/bench.lua"] on riscv64: 71 syscall(s), 17556330 tick(s); refused []
+usermode/sqlite ["sqlite3", "/work/demo.db", ".read /work/query.sql"] on aarch64: 93 syscall(s), 491827 tick(s); refused []
+usermode/lua ["lua", "/work/bench.lua"] on riscv64: 71 syscall(s), 22964816 tick(s); refused []
 usermode/lua on riscv64: stdout "primes below 20000: 2262\nsquares: 1,4,9,16,25\n…\nfloat: 4.442883\nversion: Lua 5.4\n"
-usermode/sbase ["sha256sum", "/work/poem.txt"] on riscv64: 10 syscall(s), 75629 tick(s); refused []
+usermode/sbase ["sha256sum", "/work/poem.txt"] on riscv64: 10 syscall(s), 76918 tick(s); refused []
 usermode/sbase on riscv64: stdout "5247febdfa80a88b0bbad97e0b370c8e97d954f8faa0eb75459e25cfad0febbb  /work/poem.txt\n"
 ```
 
@@ -513,6 +624,11 @@ rsemu and none needed the sandbox widened.
 | **no `pread64`** | SQLite reads the hundred-byte database header at offset zero while a `read` cursor is elsewhere in the same descriptor. Implementing it as a seek and a read would pass every test but corrupt the other cursor |
 | **no `fcntl`** | SQLite takes a shared lock before reading and turns `-ENOSYS` there into `disk I/O error`. The locks are *granted*, and that is honest rather than lax: one process, no host file underneath, so nothing can conflict and `F_GETLK` genuinely has `F_UNLCK` to report |
 
+Two more came from the C library above rather than from these three, and both
+are written up there: **`riscv_hwprobe`**, which is the one syscall number the
+two architectures do not share, and **`clone3`**, which glibc's
+`pthread_create` reaches for before it falls back to `clone`.
+
 And one that the differential trace found rather than a crash — the same shape
 this document keeps returning to, a field nobody was reading until somebody
 did. `openat` **ignored its flags**. A guest asking for `O_RDWR | O_CREAT` got a read-only
@@ -523,25 +639,32 @@ falls back to read-only; the emulated one did not, because it was never
 refused. It is `-EROFS` now — the namespace describing itself — and the
 emulated trace has the same `open`-refused-`open` pair the host's does.
 
-### The aarch64 ledger got longer, and it is one list
+### The aarch64 ledger, which is now empty
 
-Three third-party programs, three different Advanced SIMD groups that
-`src/cpu/arm/a64/simd.rs` lists under *"what is deliberately absent"*, each
-stopping a program that runs to completion on RISC-V:
+For a while this section was a list that grew. Three third-party programs
+reached three different Advanced SIMD groups that `src/cpu/arm/a64/simd.rs`
+listed under *"what is deliberately absent"*, each stopping a program that ran
+to completion on RISC-V:
 
-| | stops at | encoding |
-| --- | --- | --- |
-| glibc's `strlen` | `ADDHN v2.8b, v1.8h, v1.8h` | `0x0e214022` |
-| Lua's number conversion | `SCVTF d0, d0` (the scalar **SIMD** form, not `SCVTF Dd, Xn`) | `0x5e61d800` |
-| sbase's `sha256sum` | `SHLL v18.4s, v4.4h, #16` | `0x2e613892` |
+| | stopped at | encoding | closed |
+| --- | --- | --- | --- |
+| glibc's `strlen` | `ADDHN v2.8b, v1.8h, v1.8h` | `0x0e214022` | yes |
+| Lua's number conversion | `SCVTF d0, d0` (the scalar **SIMD** form, not `SCVTF Dd, Xn`) | `0x5e61d800` | yes |
+| sbase's `sha256sum` | `SHLL v18.4s, v4.4h, #16` | `0x2e613892` | yes |
 
-Every other applet of the same sbase binary — `wc`, `cksum`, `sort`, `grep` —
-runs on aarch64, and so does the whole of SQLite. So this is not "aarch64 does
-not work"; it is that a compiler auto-vectorising an ordinary loop reaches one
-of these groups often enough that the third program to be tried hit a third
-one. `SCVTF` is the interesting entry, because it is not on that list: the
-scalar-SIMD register-to-register conversion is a different encoding from the
-scalar floating-point one the core has.
+**All three are implemented and every guest here runs on both architectures.**
+No run in this document is ledgered any more; the ledger branches are still in
+the tests because the next program to be tried is the one that finds the fourth
+group, not because any of them fires today.
+
+The shape is worth keeping even so. This was never "aarch64 does not work" —
+every other applet of the same sbase binary ran, and so did the whole of
+SQLite. It is that a compiler auto-vectorising an ordinary loop reaches one of
+these groups often enough that the third program tried hit a third one, and
+that a program nobody here wrote is the only thing that samples the instruction
+set the way real code does. `SCVTF` remains the instructive entry: it was not
+on that list at all, because the scalar-SIMD register-to-register conversion is
+a different encoding from the scalar floating-point one the core already had.
 
 `Kernel::encoding_at` is why those words are in this table. A `FAULT` whose
 `Access` is `None` is not a memory fault — the core reached an instruction and
@@ -748,10 +871,15 @@ usermode/threads on aarch64: 166 syscall(s), 8 thread(s), 851702 tick(s); refuse
 usermode/threads on aarch64: stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"
 usermode/dynamic on aarch64: 22 syscall(s), 1 thread(s), 16733 tick(s); refused []
 usermode/dynamic on aarch64: stdout "hello from a shared obj\n"
-usermode/sqlite [...] on riscv64: 93 syscall(s), 749472 tick(s); refused []
+usermode/dynamic on riscv64: 18 syscall(s), 1 thread(s), 24150 tick(s); refused []
+usermode/glibc ["glibc"] on aarch64: 59 syscall(s), 286409 tick(s); refused []
+usermode/glibc ["glibc"] on riscv64: 62 syscall(s), 506038 tick(s); refused []
+usermode/glibc-threads ["glibc-threads"] on aarch64: 205 syscall(s), 1150910 tick(s); refused []
+usermode/glibc-threads on aarch64: stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"
+usermode/sqlite [...] on riscv64: 93 syscall(s), 755325 tick(s); refused []
 usermode/sqlite on riscv64: stdout "osaka\nkyoto\nnara\n4509538\n2870\n"
-usermode/lua ["lua", "/work/bench.lua"] on riscv64: 71 syscall(s), 17556330 tick(s); refused []
-usermode/sbase ["wc", "/work/poem.txt"] on aarch64: 15 syscall(s), 36589 tick(s); refused []
+usermode/lua ["lua", "/work/bench.lua"] on riscv64: 71 syscall(s), 22964816 tick(s); refused []
+usermode/sbase ["wc", "/work/poem.txt"] on aarch64: 15 syscall(s), 36723 tick(s); refused []
 ```
 
 The tick counts moved by a few hundred against the numbers this document used
@@ -761,11 +889,26 @@ this one did not. Nothing about the syscall traces changed.
 
 **The dynamic guests need one thing a compiler cannot produce**, which is a
 real dynamic loader. `scripts/fetch-testdata.sh usermode-guests` looks for an
-`ld-linux-<arch>.so.1` in the usual cross sysroots and honours
-`RSEMU_USERMODE_LDSO`; with none it says so, skips the dynamic guests, and
-builds the static ones as before. The loader is copied into the git-ignored
-corpus and run — glibc is LGPL and running a program is ordinary use
-(`CLAUDE.md`, Provenance), while shipping one here would not be.
+`ld-linux-<arch>.so.1` in the usual cross sysroots, honours
+`RSEMU_USERMODE_LDSO`, and failing both fetches a pinned Debian
+`libc6-<arch>-cross` package — about a megabyte, architecture-independent,
+checksummed — and takes the loader out of that. That fallback is what makes
+the RISC-V half reproducible: an `aarch64` cross sysroot is common on a Linux
+host and a RISC-V one is not, which is the whole reason dynamic linking went
+untested on one of the two architectures rather than both.
+
+The loader, and the `libc.so.6` beside it, are copied into the git-ignored
+corpus and run. glibc is LGPL-2.1: running a program is ordinary use
+(`CLAUDE.md`, Provenance), shipping one here would not be, and
+`PROVENANCE.txt` beside the corpus says which build it was.
+
+**The whole-glibc guests need a link driver** on top of that, because a glibc
+executable pulls in `Scrt1.o`, `crti.o` and a `libgcc` and rustc will not
+assemble those itself. A cross `gcc` is one; `zig cc` — which the third-party
+guests already need — is the other, and it deliberately links against glibc
+**2.28**, which predates the 2.34 merge, so the executable names `libpthread`,
+`libdl` and `librt` separately and the loader has four objects to place instead
+of two. With neither driver they are skipped and everything else still builds.
 
 **The third-party guests need one thing a Rust toolchain cannot produce**: a
 **C** cross compiler for `<arch>-linux-musl`. rustc ships musl's `libc.a` for
