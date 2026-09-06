@@ -279,12 +279,12 @@ fn nrom_cartridge() -> Vec<u8> {
 /// class-version bump and migration step that go with it, which belongs to
 /// whoever owns that device.
 const KNOWN_FAILURES: &[(&str, &str)] = &[
-    #[cfg(feature = "machine-nes")]
-    (
-        "nes-ntsc",
-        "`apu.nes` does not save `Core::irq_out`, so a pending frame IRQ is \
-         lost across a restore",
-    ),
+    // Empty, and it has already earned its keep once. `nes-ntsc` was here
+    // because `apu.nes` did not save `Core::irq_out`, so a pending frame
+    // interrupt was lost across a restore; the entry was written in one
+    // worktree while the fix landed in another, and the "now passes: delete the
+    // entry" arm below is what noticed. Keep that arm: an entry nobody removes
+    // is a defect the tree has stopped looking for.
 ];
 
 /// Split failures into the ones a ledger entry accounts for and the ones it
