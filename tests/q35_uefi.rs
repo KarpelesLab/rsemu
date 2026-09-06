@@ -1,16 +1,20 @@
 //! Does `q35-uefi` assemble, do its two flash banks behave like flash, and does
 //! a real UEFI firmware boot on it and **keep what it writes**?
 //!
-//! Seven of the questions need nothing downloaded and run on every
+//! Nine of the questions need nothing downloaded and run on every
 //! `cargo test`: that the code bank ends at the reset vector, that the variable
 //! bank answers the detection probe EDK II's `OvmfPkg` flash driver opens with
 //! — byte by byte, exactly as `QemuFlashDetected` issues it — that a
-//! program clears bits while only an erase puts them back, and four about the
+//! program clears bits while only an erase puts them back, four about the
 //! **disk**: that `00:04.0` is the class code `NvmExpressDxe` binds on, that
 //! `CAP` survives the single 64-bit read that driver makes of it, and that its
 //! window decodes where a base address register was told to put it — through
 //! **both** routes to configuration space, because for a while it only did
-//! through one.
+//! through one — and two about what the board **tells the firmware**:
+//! [`the_loader_script_the_board_hands_over_builds_a_madt`], which runs EDK II's
+//! own loader procedure against this board's `fw_cfg` and follows the result to
+//! a MADT that names the machine's own interrupt controllers, and
+//! [`a_debug_read_of_the_data_port_does_not_advance_the_cursor`].
 //!
 //! [`the_disk_controllers_window_decodes_when_ecam_placed_it`] was committed
 //! `#[ignore]`d as a reproduction of the one thing standing between this board
@@ -58,14 +62,20 @@
 //! | `RSEMU_OVMF_PROBE` | replay the boot and report the first exception the firmware takes, with the frame the processor pushed. Costs a second boot. |
 //! | `RSEMU_OVMF_PROBE_MS` | how far back that replay switches to one-instruction stepping (default 150). |
 //!
-//! **Everything printed as evidence is a byte the guest itself wrote to COM1.**
-//! The firmware is run, never read (`ROADMAP.md` §1).
+//! **Everything printed as evidence is a byte the guest itself wrote to COM1**,
+//! with one exception, and it is one the board cannot be asked for any other
+//! way: [`report_fwcfg`] prints the selectors the firmware wrote to `fw_cfg`,
+//! read out of the device the bindings kept a handle to. A selector write
+//! leaves nothing behind in any address space, so "which files did OVMF ask
+//! for" is otherwise answerable only from a `DEBUG()` log this board has no
+//! port for. The firmware is still run, never read (`ROADMAP.md` §1).
 //!
 //! What it gets to is in [`docs/platforms/q35-uefi.md`](../docs/platforms/q35-uefi.md):
 //! a UEFI Shell prompt that answers what is typed at it, on all three engines,
 //! at the same virtual instant — and, with `RSEMU_OVMF_DISK` and a kernel on
 //! the fixture, a Linux 6.6 userspace entered through the EFI stub off that
-//! disk.
+//! disk, in symmetric I/O mode off a MADT the firmware built from what this
+//! board told it.
 
 #![cfg(all(
     feature = "cpu-x86",
@@ -87,6 +97,7 @@ use rsemu::core::space::{AddressSpace, MemAttrs, RamStore};
 use rsemu::core::value::Width;
 use rsemu::cpu::x86::{Variant, X86};
 use rsemu::dev::medium::Medium;
+use rsemu::dev::q35::fwcfg::FwCfg;
 use rsemu::host::chardev::CharPort;
 use rsemu::machine::Machine;
 use rsemu::machine::build;
@@ -125,8 +136,18 @@ const TOP: u64 = 0x1_0000_0000;
 /// The same shape `tests/q35_linux.rs` uses, and for the same reason: `Device`
 /// keeps `Any` out of its supertrait chain, so construction is the one moment
 /// the concrete type exists.
-fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
+fn bindings(cpus: &Arc<Captured<X86>>, fwcfg: &Arc<Captured<FwCfg>>) -> Bindings {
     let mut b = rsemu::machine::catalog::bindings().expect("this build's bindings");
+    // The same capture, for the same reason, applied to the one device whose
+    // *diagnostics* are not reachable through an address space: what a firmware
+    // asked fw_cfg for is a list inside the device, and `Device` deliberately
+    // keeps `Any` out of its supertrait chain.
+    let kept_fwcfg = Arc::clone(fwcfg);
+    b.replace(rsemu::dev::q35::fwcfg::CLASS_NAME, move |props| {
+        let dev = Arc::new(FwCfg::new(props)?);
+        kept_fwcfg.push(&dev);
+        Ok(dev)
+    });
     let kept = Arc::clone(cpus);
     b.replace("cpu.x86", move |props| {
         // `RSEMU_ENGINE` overrides the machine file's `engine = "interp"`, the
@@ -144,6 +165,12 @@ fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
     b
 }
 
+/// What building this board hands back: the machine, the processor the
+/// bindings captured, the console the 16550 opened, and the `fw_cfg` device —
+/// the two objects whose *internals* a test needs and no address space can be
+/// asked for.
+type Board = (Machine, Arc<X86>, Arc<CharPort>, Arc<FwCfg>);
+
 /// Build the board from its own machine file, with `code` and `vars` in the two
 /// banks.
 fn board(
@@ -151,7 +178,7 @@ fn board(
     vars: Vec<u8>,
     disk: Vec<u8>,
     params: &[(&str, String)],
-) -> Result<(Machine, Arc<X86>, Arc<CharPort>), String> {
+) -> Result<Board, String> {
     board_on_a_medium(code, vars, disk, None, params)
 }
 
@@ -169,11 +196,12 @@ fn board_on_a_medium(
     disk: Vec<u8>,
     store: Option<Arc<RamStore>>,
     params: &[(&str, String)],
-) -> Result<(Machine, Arc<X86>, Arc<CharPort>), String> {
+) -> Result<Board, String> {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
+    let fwcfgs: Arc<Captured<FwCfg>> = Arc::new(Captured::new());
     let mut options = rsemu::machine::BuildOptions::new()
         .with_classes(rsemu::machine::catalog::classes())
-        .with_bindings(bindings(&cpus));
+        .with_bindings(bindings(&cpus, &fwcfgs));
     for (name, value) in params {
         options = options.with_param(*name, value.as_str());
     }
@@ -207,13 +235,14 @@ fn board_on_a_medium(
     let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
         .expect("the 16550 opened the board's console port");
     let cpu = cpus.take().expect("the constructor kept a handle");
-    Ok((machine, cpu, console))
+    let fwcfg = fwcfgs.take().expect("the board declares one fw_cfg");
+    Ok((machine, cpu, console, fwcfg))
 }
 
 /// The board with both sockets stuffed and nothing programmed into them.
 fn bare_board() -> Machine {
     match board(Vec::new(), Vec::new(), Vec::new(), &[]) {
-        Ok((machine, _cpu, _console)) => machine,
+        Ok((machine, ..)) => machine,
         Err(e) => panic!("the board does not realize: {e}"),
     }
 }
@@ -674,6 +703,361 @@ fn a_window_placed_through_the_port_pair_decodes_inside_the_write() {
 }
 
 // ---------------------------------------------------------------------------
+// what the board tells the firmware about itself
+// ---------------------------------------------------------------------------
+
+/// Select an item, the way `QemuFwCfgSelectItem` does: one 16-bit write.
+fn fwcfg_select(port: &AddressSpace, key: u16) {
+    port.write(0x510, Width::U16, u64::from(key), MemAttrs::DEFAULT)
+        .expect("the selector takes a word");
+}
+
+/// Read `n` bytes of the selected item, the way `IoReadFifo8` does.
+fn fwcfg_read(port: &AddressSpace, n: usize) -> Vec<u8> {
+    (0..n).map(|_| read8(port, 0x511)).collect()
+}
+
+/// The file directory, as `QemuFwCfgFindFile` walks it: a big-endian count,
+/// then a big-endian size, key and reserved word per file, then 56 bytes of
+/// NUL-terminated name.
+fn fwcfg_dir(port: &AddressSpace) -> Vec<(String, u16, u32)> {
+    fwcfg_select(port, 0x0019);
+    let count = u32::from_be_bytes(fwcfg_read(port, 4).try_into().expect("four bytes"));
+    (0..count)
+        .map(|_| {
+            let size = u32::from_be_bytes(fwcfg_read(port, 4).try_into().expect("four bytes"));
+            let key = u16::from_be_bytes(fwcfg_read(port, 2).try_into().expect("two bytes"));
+            let _reserved = fwcfg_read(port, 2);
+            let name = fwcfg_read(port, 56);
+            let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+            (
+                String::from_utf8_lossy(&name[..end]).into_owned(),
+                key,
+                size,
+            )
+        })
+        .collect()
+}
+
+/// Look a file up by name and read the whole thing.
+fn fwcfg_file(port: &AddressSpace, name: &str) -> Option<Vec<u8>> {
+    let (_, key, size) = fwcfg_dir(port).into_iter().find(|(n, _, _)| n == name)?;
+    fwcfg_select(port, key);
+    Some(fwcfg_read(port, size as usize))
+}
+
+/// The board hands a firmware a table set, and following the firmware's own
+/// procedure produces a MADT that describes this board's interrupt controllers.
+///
+/// **This is the milestone in hermetic form.** A UEFI-booted kernel finds its
+/// APIC because OVMF installed a MADT, and OVMF installed a MADT because it
+/// executed `etc/table-loader` against `etc/acpi/tables`. So what is asserted
+/// here is not "the device answers" — it is that *running the loader script the
+/// way EDK II runs it* yields tables that check out. The procedure is
+/// `OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c` (BSD-2-Clause-Patent):
+///
+/// 1. `Allocate`: download the named file into memory, at the alignment asked.
+/// 2. `AddPointer`: the field at `PointerOffset` in one file holds an *offset*
+///    into another; add that file's base to it.
+/// 3. `AddChecksum`: store `0x100 - sum(range)` at `ResultOffset` — which only
+///    brings the range to zero because the byte it lands on started at zero.
+/// 4. Walk the `AddPointer` commands again: whatever each one now points at is
+///    an ACPI table if it carries a plausible length and sums to zero.
+///
+/// Step 3 is the one that makes this a test rather than a paraphrase: a blob
+/// whose checksums were already filled in would pass every "does the device
+/// answer" assertion and produce tables the firmware silently declines to
+/// install.
+#[test]
+fn the_loader_script_the_board_hands_over_builds_a_madt() {
+    let machine = bare_board();
+    let port = machine.space("port").expect("the board declares `port`");
+
+    // The probe `QemuFwCfgInitialize` opens with. A firmware that reads
+    // anything else here takes no tables at all and says nothing about it.
+    fwcfg_select(port, 0x0000);
+    assert_eq!(&fwcfg_read(port, 4), b"QEMU", "the interface signature");
+    fwcfg_select(port, 0x0001);
+    let revision = u32::from_le_bytes(fwcfg_read(port, 4).try_into().expect("four bytes"));
+    assert!(revision >= 1, "revision {revision} is not the interface");
+    assert_eq!(
+        revision & 2,
+        0,
+        "FW_CFG_F_DMA is deliberately clear: this device serves the port path only"
+    );
+    // And the processor count, which is what keeps `MpInitLib` from waiting out
+    // its timeout counting application processors that are not there.
+    fwcfg_select(port, 0x0005);
+    assert_eq!(
+        u16::from_le_bytes(fwcfg_read(port, 2).try_into().expect("two bytes")),
+        1,
+        "one boot processor, little-endian as the pre-directory keys are"
+    );
+
+    let files = fwcfg_dir(port);
+    let names: Vec<&str> = files.iter().map(|(n, _, _)| n.as_str()).collect();
+    for want in ["etc/acpi/rsdp", "etc/acpi/tables", "etc/table-loader"] {
+        assert!(
+            names.contains(&want),
+            "the directory has no {want:?}: {names:?}"
+        );
+    }
+
+    // -- run the script -----------------------------------------------------
+    //
+    // Two bases picked out of the air, exactly as a firmware's allocator picks
+    // them: what matters is that nothing in the blob knew them.
+    let mut blobs: Vec<(String, u64, Vec<u8>)> = Vec::new();
+    let base_for = |name: &str| -> u64 {
+        match name {
+            "etc/acpi/tables" => 0x7000_0040,
+            _ => 0x000e_1000,
+        }
+    };
+    let loader = fwcfg_file(port, "etc/table-loader").expect("the script is served");
+    assert_eq!(loader.len() % 128, 0, "a loader is whole commands");
+    let name_at = |cmd: &[u8], at: usize| -> String {
+        let field = &cmd[at..at + 56];
+        assert_eq!(field[55], 0, "a file name field is NUL-terminated");
+        let end = field.iter().position(|b| *b == 0).unwrap_or(0);
+        String::from_utf8_lossy(&field[..end]).into_owned()
+    };
+    for cmd in loader.chunks(128) {
+        match u32::from_le_bytes(cmd[..4].try_into().expect("four bytes")) {
+            // Allocate.
+            1 => {
+                let name = name_at(cmd, 4);
+                let align = u64::from(u32::from_le_bytes(
+                    cmd[60..64].try_into().expect("four bytes"),
+                ));
+                assert!(
+                    align.is_power_of_two() && align <= 4096,
+                    "EDK II refuses an alignment above a page: {align}"
+                );
+                let bytes = fwcfg_file(port, &name)
+                    .unwrap_or_else(|| panic!("{name} is allocated but not served"));
+                let base = base_for(&name);
+                assert_eq!(base % align, 0, "the rig honours the alignment asked for");
+                blobs.push((name, base, bytes));
+            }
+            // AddPointer.
+            2 => {
+                let (pointer, pointee) = (name_at(cmd, 4), name_at(cmd, 60));
+                let offset =
+                    u32::from_le_bytes(cmd[116..120].try_into().expect("four bytes")) as usize;
+                let size = cmd[120] as usize;
+                assert!(matches!(size, 1 | 2 | 4 | 8), "pointer size {size}");
+                let target = blobs
+                    .iter()
+                    .find(|(n, _, _)| *n == pointee)
+                    .map(|(_, base, bytes)| (*base, bytes.len()))
+                    .unwrap_or_else(|| panic!("{pointee} is pointed at before it is allocated"));
+                let blob = blobs
+                    .iter_mut()
+                    .find(|(n, _, _)| *n == pointer)
+                    .unwrap_or_else(|| panic!("{pointer} is patched before it is allocated"));
+                let mut value = [0u8; 8];
+                value[..size].copy_from_slice(&blob.2[offset..offset + size]);
+                let value = u64::from_le_bytes(value);
+                assert!(
+                    (value as usize) < target.1,
+                    "a pointer's value is an offset into {pointee}, and {value:#x} is past its end"
+                );
+                let patched = (value + target.0).to_le_bytes();
+                if size < 8 {
+                    assert_eq!(
+                        u64::from_le_bytes(patched) >> (size * 8),
+                        0,
+                        "a {size}-byte field cannot hold the address it was given"
+                    );
+                }
+                blob.2[offset..offset + size].copy_from_slice(&patched[..size]);
+            }
+            // AddChecksum.
+            3 => {
+                let name = name_at(cmd, 4);
+                let result =
+                    u32::from_le_bytes(cmd[60..64].try_into().expect("four bytes")) as usize;
+                let start =
+                    u32::from_le_bytes(cmd[64..68].try_into().expect("four bytes")) as usize;
+                let length =
+                    u32::from_le_bytes(cmd[68..72].try_into().expect("four bytes")) as usize;
+                let blob = blobs
+                    .iter_mut()
+                    .find(|(n, _, _)| *n == name)
+                    .unwrap_or_else(|| panic!("{name} is checksummed before it is allocated"));
+                assert_eq!(
+                    blob.2[result], 0,
+                    "the byte a checksum lands on has to start at zero, or the range sums to \
+                     minus what was already there"
+                );
+                let sum = blob.2[start..start + length]
+                    .iter()
+                    .fold(0u8, |acc, b| acc.wrapping_add(*b));
+                blob.2[result] = sum.wrapping_neg();
+            }
+            other => panic!("unknown loader command {other}"),
+        }
+    }
+
+    // -- and look at what it built ------------------------------------------
+    let (_, tables_base, tables) = blobs
+        .iter()
+        .find(|(n, _, _)| n == "etc/acpi/tables")
+        .expect("the tables were allocated");
+    let table_at = |address: u64| -> &[u8] {
+        let at = (address - tables_base) as usize;
+        let length =
+            u32::from_le_bytes(tables[at + 4..at + 8].try_into().expect("four bytes")) as usize;
+        &tables[at..at + length]
+    };
+    let sums_to_zero = |bytes: &[u8]| bytes.iter().fold(0u8, |acc, b| acc.wrapping_add(*b)) == 0;
+
+    // The RSDP names the XSDT, and the XSDT names everything else — every one
+    // of those addresses having been an offset until the script ran.
+    let (_, _, rsdp) = blobs
+        .iter()
+        .find(|(n, _, _)| n == "etc/acpi/rsdp")
+        .expect("the RSDP was allocated");
+    assert_eq!(
+        &rsdp[..8],
+        b"RSD PTR ",
+        "the RSDP's signature, blank and all"
+    );
+    assert!(sums_to_zero(&rsdp[..20]), "the RSDP's first checksum");
+    assert!(sums_to_zero(&rsdp[..36]), "and its extended one");
+    let xsdt_at = u64::from_le_bytes(rsdp[24..32].try_into().expect("eight bytes"));
+    let xsdt = table_at(xsdt_at);
+    assert_eq!(&xsdt[..4], b"XSDT");
+    assert!(sums_to_zero(xsdt), "the XSDT checksums");
+
+    let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in xsdt[36..].chunks(8) {
+        let table = table_at(u64::from_le_bytes(entry.try_into().expect("eight bytes")));
+        assert!(
+            sums_to_zero(table),
+            "a table the XSDT lists does not checksum; the firmware would not install it"
+        );
+        found.push((
+            String::from_utf8_lossy(&table[..4]).into_owned(),
+            table.to_vec(),
+        ));
+    }
+    let signatures: Vec<&str> = found.iter().map(|(s, _)| s.as_str()).collect();
+    assert!(
+        signatures.contains(&"APIC"),
+        "no MADT: this is the whole point, and the kernel's fallback without one is virtual \
+         wire mode. The XSDT listed {signatures:?}"
+    );
+    assert!(signatures.contains(&"FACP"), "no FADT: {signatures:?}");
+    assert!(signatures.contains(&"MCFG"), "no MCFG: {signatures:?}");
+    assert!(
+        signatures.contains(&"HPET"),
+        "no HPET table: {signatures:?}"
+    );
+
+    // The MADT describes *this* board: the local APIC page and the I/O APIC
+    // page the machine file maps, read back out of the table rather than
+    // restated. (ACPI §5.2.12, Tables 5.19, 5.22 and 5.24.)
+    let madt = &found
+        .iter()
+        .find(|(s, _)| s == "APIC")
+        .expect("checked above")
+        .1;
+    assert_eq!(
+        u32::from_le_bytes(madt[36..40].try_into().expect("four bytes")),
+        0xfee0_0000,
+        "the local APIC address the board maps"
+    );
+    let mut processors = 0;
+    let mut ioapic = None;
+    let mut at = 44;
+    while at + 2 <= madt.len() {
+        let (kind, length) = (madt[at], madt[at + 1] as usize);
+        assert!(length >= 2, "a MADT structure with no length");
+        match kind {
+            0 => processors += 1,
+            1 => {
+                ioapic = Some(u32::from_le_bytes(
+                    madt[at + 4..at + 8].try_into().expect("four bytes"),
+                ))
+            }
+            _ => {}
+        }
+        at += length;
+    }
+    assert_eq!(at, madt.len(), "the structures fill the table exactly");
+    assert_eq!(processors, 1, "one enabled processor");
+    assert_eq!(ioapic, Some(0xfec0_0000), "the I/O APIC the board maps");
+
+    // The FADT's own two pointers, which are the reason the FACS and the DSDT
+    // are in the blob at all: neither is listed in the XSDT (§5.2.8).
+    let fadt = &found
+        .iter()
+        .find(|(s, _)| s == "FACP")
+        .expect("checked above")
+        .1;
+    let facs_at = u64::from_le_bytes(fadt[132..140].try_into().expect("eight bytes"));
+    let dsdt_at = u64::from_le_bytes(fadt[140..148].try_into().expect("eight bytes"));
+    assert_eq!(
+        &tables[(facs_at - tables_base) as usize..][..4],
+        b"FACS",
+        "X_FIRMWARE_CTRL points at the FACS"
+    );
+    assert_eq!(
+        &tables[(dsdt_at - tables_base) as usize..][..4],
+        b"DSDT",
+        "X_DSDT points at the DSDT"
+    );
+    assert_eq!(
+        u64::from(u32::from_le_bytes(
+            fadt[36..40].try_into().expect("four bytes")
+        )),
+        facs_at,
+        "and the 32-bit FIRMWARE_CTRL agrees with the 64-bit one"
+    );
+    assert_eq!(
+        u64::from(u32::from_le_bytes(
+            fadt[40..44].try_into().expect("four bytes")
+        )),
+        dsdt_at,
+        "as do the two DSDT fields"
+    );
+    assert!(
+        sums_to_zero(table_at(dsdt_at)),
+        "the DSDT checksums, which is what makes the firmware install it"
+    );
+}
+
+/// A debug read of the data port hands back the byte under the cursor and does
+/// not move it.
+///
+/// `CLAUDE.md`: a debugger read must not pop a FIFO, clear a status bit or
+/// advance a pointer — and a `fw_cfg` data port is precisely a pointer being
+/// advanced. A monitor dumping the I/O space would otherwise leave a firmware
+/// reading a table from the wrong offset, which is a corrupted ACPI set and no
+/// evidence of why.
+#[test]
+fn a_debug_read_of_the_data_port_does_not_advance_the_cursor() {
+    let machine = bare_board();
+    let port = machine.space("port").expect("the board declares `port`");
+    fwcfg_select(port, 0x0000);
+    for _ in 0..4 {
+        assert_eq!(
+            port.read(0x511, Width::U8, MemAttrs::DEBUG)
+                .expect("the data port answers a debug read") as u8,
+            b'Q',
+            "every debug read is the same byte: the cursor has not moved"
+        );
+    }
+    assert_eq!(
+        &fwcfg_read(port, 4),
+        b"QEMU",
+        "and an ordinary read still is"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // and the firmware
 // ---------------------------------------------------------------------------
 
@@ -719,7 +1103,7 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
         TOP - (code.len() + vars.len()) as u64
     );
 
-    let (mut m, cpu, console) = match board(code.clone(), vars.clone(), disk, &params) {
+    let (mut m, cpu, console, fwcfg) = match board(code.clone(), vars.clone(), disk, &params) {
         Ok(built) => built,
         Err(e) => panic!("the board does not realize: {e}"),
     };
@@ -738,6 +1122,7 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
         &script,
     );
     x86boot::report("q35-uefi", &m, &cpu, &run, &script);
+    report_fwcfg(&fwcfg);
     report_chipset(&m);
     report_nvme(&m, &cpu);
     report_disassembly(&m, &cpu);
@@ -894,7 +1279,7 @@ fn run_the_shell(
     // leave a firmware that boots once and never again.
     let store = Arc::new(RamStore::new(vars.len() as u64));
     Medium::write_at(&*store, 0, vars).expect("a fresh store takes the image");
-    let (mut m, cpu, console) = match board_on_a_medium(
+    let (mut m, cpu, console, _fwcfg) = match board_on_a_medium(
         code.to_vec(),
         Vec::new(),
         disk.to_vec(),
@@ -1041,6 +1426,34 @@ fn write_back_the_variable_store(m: &Machine) {
         Ok(()) => println!("q35-uefi: wrote {} bytes back to {path}", out.len()),
         Err(e) => println!("q35-uefi: could not write {path}: {e}"),
     }
+}
+
+/// What the firmware asked the board about itself, in order.
+///
+/// The one thing about this board that no address space can be asked: a
+/// selector write leaves nothing behind, so "which files did OVMF read" is
+/// otherwise answerable only from a `DEBUG()` log on a debug port this board
+/// does not have. `q35.fwcfg` keeps the last sixty-four selectors, and the test
+/// holds a handle to the device because the binding that built it kept one.
+///
+/// It is worth printing on every boot: a firmware that takes no tables looks
+/// exactly like one that was never asked, and this says which.
+fn report_fwcfg(fwcfg: &FwCfg) {
+    println!("q35-uefi: what the firmware asked fw_cfg for:");
+    for (key, name) in fwcfg.trace() {
+        let what = match (key, name) {
+            (_, Some(file)) => file,
+            (0x0000, _) => String::from("<signature>"),
+            (0x0001, _) => String::from("<interface version>"),
+            (0x0005, _) => String::from("<boot cpu count>"),
+            (0x000f, _) => String::from("<max cpu count>"),
+            (0x0019, _) => String::from("<the file directory>"),
+            _ => String::from("<not served: reads as zeroes>"),
+        };
+        println!("q35-uefi:   {key:#06x}  {what}");
+    }
+    let (selector, offset) = fwcfg.cursor();
+    println!("q35-uefi:   it stopped {offset} byte(s) into item {selector:#06x}");
 }
 
 /// What the firmware left the chipset and the flash holding.
@@ -1266,7 +1679,7 @@ fn probe_first_exception(params: &[(&str, String)], stopped: GlobalTime) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(150);
-    let Ok((mut m, cpu, _console)) = board(code, vars, disk_from_env(), params) else {
+    let Ok((mut m, cpu, _console, _fwcfg)) = board(code, vars, disk_from_env(), params) else {
         return;
     };
     let fine_from = stopped.as_nanos().saturating_sub(window * 1_000_000);

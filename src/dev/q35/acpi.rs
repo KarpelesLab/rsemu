@@ -75,6 +75,17 @@
 //! away. The seam is [`generate`] plus [`MachineFacts`]; nothing else here is
 //! public API anyone should build on.
 //!
+//! That seam now has a second consumer, and it is the one this module's tables
+//! reach a UEFI guest through. [`super::fwcfg`] takes the same table *bodies* —
+//! [`madt`], [`mcfg`], [`hpet`], [`fadt`], [`dsdt`], [`facs`], [`xsdt`] — built
+//! from the same [`survey`] of the same realized machine, and lays them out
+//! with **offsets where a pointer would be**, because the firmware allocates
+//! them itself and no address is knowable here. Nothing about a MADT changes
+//! because a firmware rather than an operating system will read it; only the
+//! packaging does, which is why that file holds no table layout of its own and
+//! this one gained [`xsdt`], [`rsdt`] and [`CHECKSUM_OFFSET`] rather than a
+//! copy appearing next door.
+//!
 //! Note what this means today: a *third-party* firmware that programs the PAM
 //! registers to shadow `0xe0000` will hide these tables behind its own DRAM,
 //! and it should — it would be publishing its own. rsemu's own BIOS does not
@@ -109,7 +120,7 @@ use alloc::vec::Vec;
 
 use crate::bus::pci::{Bdf, INTX_LINES, IntxPin, MAX_DEVICE, PciBus, buses, config, swizzle};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
-use crate::core::props::{Props, ValueKind};
+use crate::core::props::{Props, Reader, ValueKind};
 use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region, RegionKind, RegionRef};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::Width;
@@ -432,6 +443,59 @@ pub struct TableConfig {
     /// Which interrupt the SCI appears on — `ACPI_CNTL[2:0]`'s choice, made by
     /// firmware after this table is written.
     pub sci_irq: u16,
+}
+
+impl TableConfig {
+    /// Read the declared half of the tables out of a property reader.
+    ///
+    /// Shared with [`super::fwcfg`], which hands the same description to a
+    /// *firmware* rather than staging it for an operating system: the two
+    /// devices differ in how the bytes reach the guest and in nothing else, so
+    /// a board that declared a different processor count to each would be
+    /// describing two machines.
+    ///
+    /// The reader is borrowed rather than consumed — a caller with properties
+    /// of its own reads those first and calls
+    /// [`Reader::finish`](crate::core::props::Reader::finish) itself.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Property`] for a value outside its range; [`Error::Config`] for
+    /// an OEM identifier that does not fit its field (§5.2.6).
+    pub fn read(r: &mut Reader<'_>) -> Result<TableConfig> {
+        let oem_id = r.or_str("oem-id", "RSEMU")?.to_string();
+        let oem_table_id = r.or_str("oem-table-id", "RSEMUQ35")?.to_string();
+        let cpus = r.or_range("cpus", 1u64, 1..=255)?;
+        let ioapic_id = r.or_range("ioapic-id", 1u64, 0..=255)?;
+        let gsi_base = r.or_range("gsi-base", 0u64, 0..=u64::from(u32::MAX))?;
+        let sci_irq = r.or_range("sci-irq", 9u64, 0..=255)?;
+        let fit = |text: &str, width: usize, name: &str| -> Result<Vec<u8>> {
+            if text.len() > width {
+                return Err(Error::Config {
+                    at: CLASS_NAME.to_string(),
+                    message: alloc::format!(
+                        "`{name}` is {width} characters in an ACPI description header \
+                         (§5.2.6) and `{text}` is {}",
+                        text.len()
+                    ),
+                });
+            }
+            let mut out = text.as_bytes().to_vec();
+            out.resize(width, b' ');
+            Ok(out)
+        };
+        let mut cfg = TableConfig {
+            cpus: cpus as u8,
+            ioapic_id: ioapic_id as u8,
+            gsi_base: gsi_base as u32,
+            sci_irq: sci_irq as u16,
+            ..TableConfig::default()
+        };
+        cfg.oem_id.copy_from_slice(&fit(&oem_id, 6, "oem-id")?);
+        cfg.oem_table_id
+            .copy_from_slice(&fit(&oem_table_id, 8, "oem-table-id")?);
+        Ok(cfg)
+    }
 }
 
 impl Default for TableConfig {
@@ -1019,6 +1083,39 @@ pub fn fadt(facts: &MachineFacts, cfg: &TableConfig, facs_at: u64, dsdt_at: u64)
     t.finish()
 }
 
+/// Build the XSDT: a description header and a 64-bit address per table
+/// (§5.2.8).
+///
+/// The addresses are whatever the caller is laying out against — absolute
+/// guest-physical for [`generate`], and *offsets into the containing blob* for
+/// [`super::fwcfg`], which hands the blob to a firmware along with a script
+/// saying how to turn each offset into an address. That is the whole reason
+/// this is a function taking a list rather than three lines inside `generate`.
+#[must_use]
+pub fn xsdt(cfg: &TableConfig, entries: &[u64]) -> Vec<u8> {
+    let mut table = Table::new(b"XSDT", 1, cfg);
+    for entry in entries {
+        table.u64(*entry);
+    }
+    table.finish()
+}
+
+/// Build the RSDT: the same list, 32 bits wide (§5.2.7).
+#[must_use]
+pub fn rsdt(cfg: &TableConfig, entries: &[u64]) -> Vec<u8> {
+    let mut table = Table::new(b"RSDT", 1, cfg);
+    for entry in entries {
+        table.u32(*entry as u32);
+    }
+    table.finish()
+}
+
+/// Where the `Checksum` field sits in a description header (§5.2.6).
+///
+/// Named because a firmware that computes the checksums itself has to be told
+/// where to put each one — see [`super::fwcfg`].
+pub const CHECKSUM_OFFSET: usize = 9;
+
 /// Build the RSDP (§5.2.5.3, Table 5.3).
 #[must_use]
 pub fn rsdp(cfg: &TableConfig, rsdt_at: u64, xsdt_at: u64) -> Vec<u8> {
@@ -1130,16 +1227,11 @@ pub fn generate(base: u64, facts: &MachineFacts, cfg: &TableConfig) -> Result<Ta
 
     // The XSDT and the RSDT list the same tables; the DSDT and the FACS are
     // *not* among them, because the FADT points at those two directly (§5.2.8).
-    let mut xsdt = Table::new(b"XSDT", 1, cfg);
-    let mut rsdt = Table::new(b"RSDT", 1, cfg);
-    xsdt.u64(fadt_at);
-    rsdt.u32(fadt_at as u32);
-    for (address, _) in &others {
-        xsdt.u64(*address);
-        rsdt.u32(*address as u32);
-    }
-    let xsdt_bytes = xsdt.finish();
-    let rsdt_bytes = rsdt.finish();
+    let mut listed_at: Vec<u64> = Vec::with_capacity(listed);
+    listed_at.push(fadt_at);
+    listed_at.extend(others.iter().map(|(address, _)| *address));
+    let xsdt_bytes = xsdt(cfg, &listed_at);
+    let rsdt_bytes = rsdt(cfg, &listed_at);
     debug_assert_eq!(xsdt_bytes.len(), HEADER_LEN + listed * 8);
     debug_assert_eq!(rsdt_bytes.len(), HEADER_LEN + listed * 4);
 
@@ -1200,38 +1292,8 @@ impl AcpiTables {
         let len = r.or_size("size", DEFAULT_LEN)?;
         let iospace = r.or_str("iospace", "port")?.to_string();
         let bus_name = r.or_str("bus", "pci0")?.to_string();
-        let oem_id = r.or_str("oem-id", "RSEMU")?.to_string();
-        let oem_table_id = r.or_str("oem-table-id", "RSEMUQ35")?.to_string();
-        let cpus = r.or_range("cpus", 1u64, 1..=255)?;
-        let ioapic_id = r.or_range("ioapic-id", 1u64, 0..=255)?;
-        let gsi_base = r.or_range("gsi-base", 0u64, 0..=u64::from(u32::MAX))?;
-        let sci_irq = r.or_range("sci-irq", 9u64, 0..=255)?;
+        let cfg = TableConfig::read(&mut r)?;
         r.finish()?;
-        let fit = |text: &str, width: usize, name: &str| -> Result<Vec<u8>> {
-            if text.len() > width {
-                return Err(Error::Config {
-                    at: CLASS_NAME.to_string(),
-                    message: alloc::format!(
-                        "`{name}` is {width} characters in an ACPI description header \
-                         (§5.2.6) and `{text}` is {}",
-                        text.len()
-                    ),
-                });
-            }
-            let mut out = text.as_bytes().to_vec();
-            out.resize(width, b' ');
-            Ok(out)
-        };
-        let mut cfg = TableConfig {
-            cpus: cpus as u8,
-            ioapic_id: ioapic_id as u8,
-            gsi_base: gsi_base as u32,
-            sci_irq: sci_irq as u16,
-            ..TableConfig::default()
-        };
-        cfg.oem_id.copy_from_slice(&fit(&oem_id, 6, "oem-id")?);
-        cfg.oem_table_id
-            .copy_from_slice(&fit(&oem_table_id, 8, "oem-table-id")?);
         // Acquiring a host object *is* allocation (`core::hosts`), so it
         // belongs in `new` beside the rest of it; nothing is announced.
         let bus = buses::attach(props, &bus_name)?;

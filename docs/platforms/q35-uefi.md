@@ -30,7 +30,10 @@ absence is load bearing rather than tidying:
   operating system an RSDP through the EFI configuration table (UEFI 2.10 §4.6).
   A board that *also* staged a generated RSDP at `0xe0000` would be offering a
   legacy scan a second, different description of itself — the ambiguity
-  [`q35.md`](q35.md) warns about for the MP table, with the roles reversed.
+  [`q35.md`](q35.md) warns about for the MP table, with the roles reversed. The
+  board still says all of it, through `q35.fwcfg` instead:
+  ["The tables"](#the-tables-and-the-one-channel-a-uefi-board-has-to-hand-them-over)
+  is what changes and what does not.
 * **No video adapter.** EDK II's `QemuVideoDxe` binds three PCI identifications
   and none of them is this board's, so a display adapter here would be a card
   nothing drives. The console is the 16550 at `0x3f8`, which is what
@@ -160,6 +163,16 @@ waiting out timeouts on a window that never decoded;
 ["The disk"](#the-disk-and-the-one-thing-between-this-board-and-an-operating-system)
 has that whole story.
 
+They also predate the board having anything to say about itself. Since
+["The tables"](#the-tables-and-the-one-channel-a-uefi-board-has-to-hand-them-over),
+a run that types `map -b` at the prompt and stops on its output ends at
+**373 169 ms** — so `AcpiPlatformDxe` reading three files a byte at a time
+through a port, relocating them and installing eight tables costs on the order
+of a second of guest time, paid once per boot. That number is the same to the
+millisecond under `interp` and under `jit-host`, which is the property this
+board exists to keep honest: the engines are a speed knob and never a semantic
+one.
+
 The whole thing was **367.2 seconds of virtual time** — a couple of
 minutes of host time under the interpreter, and under a minute under `jit-host`
 on an idle machine.
@@ -169,8 +182,10 @@ Each phase, as an observation rather than an inference:
 * **SEC.** The reset vector at `0xfffffff0` executes out of the code bank, the
   processor is in 32-bit protected mode and then in **long mode** with paging on
   (`cr0=80000023 cr4=0x660 efer=0x500 cr3=0x800000`).
-* **PEI.** It sizes memory from CMOS `0x34`/`0x35` — the only route to it on a
-  board with no `fw_cfg` — and decompresses the main firmware volume into RAM.
+* **PEI.** It sizes memory from CMOS `0x34`/`0x35` — still the route now that
+  the board has a `fw_cfg`, because that device deliberately serves no
+  `etc/e820` and `PlatformGetSystemMemorySizeBelow4gb` falls back to the CMOS
+  pair — and decompresses the main firmware volume into RAM.
 * **DXE.** Drivers dispatched near the top of the 128 MiB of RAM, `CpuDxe`
   software-enabling the local APIC, and the first exception delivered and
   *returned from*.
@@ -452,8 +467,9 @@ regression doing its job, and it is the only golden this change touches.
 
 ### A variable written in one boot is there in the next
 
-With the probe answered, the same run programs **5,799** bytes of the store
-where it programmed nothing before, and the names in it are the ones a BDS
+With the probe answered, the same run programs **6,206** bytes of the store
+where it programmed nothing before (it was 5,799 before the board grew a
+`fw_cfg`; the firmware now has a little more to remember), and the names in it are the ones a BDS
 writes: `BootOrder`, `Boot0000` (`UiApp`), `Boot0001` (`EFI Internal Shell`),
 `Boot0002`, `Timeout`, `PlatformLang`, `ConIn`/`ConOut`/`ErrOut`,
 `MemoryTypeInformation`.
@@ -727,15 +743,241 @@ kernel, handed it a memory map and a system table, and the kernel came up on the
 board's 16550 and ran `/init`. 1,337 seconds of virtual time end to end — 372 of
 them the firmware — and about nine minutes of host time under the interpreter.
 
-Two things about that boot are worth writing down rather than rounding up.
-**There is no MADT**: `APIC: ACPI MADT or MP tables are not detected`, and the
-kernel falls back to virtual wire mode, because this OVMF builds its ACPI tables
-from `fw_cfg` and this board has none. That is a gap in the board, not in the
-kernel, and it is the next thing to close if this path is to be more than a
-demonstration. And the kernel's `ftrace` self-check and `DEBUG_WX` page-table
-walk each trip the soft-lockup watchdog — 45 896 ftrace entries and a whole
-kernel page table walked at 51 BogoMIPS really is thirty seconds of guest
-time — which is the emulator being slow rather than wrong.
+That boot had **no MADT** — `APIC: ACPI MADT or MP tables are not detected`, and
+the kernel fell back to virtual wire mode, because this OVMF builds its ACPI
+tables from `fw_cfg` and this board had none. It has one now, and the same run
+comes up in symmetric I/O mode:
+
+```text
+[    0.000000] ACPI: RSDP 0x000000003FD7E014 000024 (v02 RSEMU )
+[    0.000000] ACPI: XSDT 0x000000003FD7D0E8 000044 (v01 RSEMU  RSEMUQ35 …)
+[    0.000000] ACPI: FACP 0x000000003FD79000 0000F4 (v03 RSEMU  RSEMUQ35 …)
+[    0.000000] ACPI: DSDT 0x000000003FD78000 000772 (v02 RSEMU  RSEMUQ35 …)
+[    0.000000] ACPI: FACS 0x000000003FDFC000 000040
+[    0.000000] ACPI: APIC 0x000000003FD7C000 00005A (v06 RSEMU  RSEMUQ35 …)
+[    0.000000] ACPI: MCFG 0x000000003FD7B000 00003C (v01 RSEMU  RSEMUQ35 …)
+[    0.000000] ACPI: HPET 0x000000003FD7A000 000038 (v01 RSEMU  RSEMUQ35 …)
+[    0.000000] IOAPIC[0]: apic_id 1, version 17, address 0xfec00000, GSI 0-23
+[    0.000000] ACPI: INT_SRC_OVR (bus 0 bus_irq 0 global_irq 2 dfl dfl)
+[    0.000000] ACPI: INT_SRC_OVR (bus 0 bus_irq 9 global_irq 9 high level)
+[    0.000000] ACPI: Using ACPI (MADT) for SMP configuration information
+[    0.000000] APIC: Switch to symmetric I/O mode setup
+[    0.029999] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1
+[  149.284209] ACPI: Using IOAPIC for interrupt routing
+[  160.371066] hpet0: at MMIO 0xfed00000, IRQs 2, 8, 0
+[  160.522105] clocksource: Switched to clocksource hpet
+[ 1289.297467] Run /init as init process
+
+rsemu initramfs on Linux 6.6.67-gentoo-x86_64 x86_64
+rsemu# uname -srm
+Linux 6.6.67-gentoo-x86_64 x86_64
+```
+
+Every one of those addresses is where **the firmware** put the table, out of its
+own pool, after relocating a blob whose pointers were offsets; every OEM field
+is this board's; and every address *inside* the tables — `0xfec00000`, the
+override that puts ISA IRQ0 on global interrupt 2, the ECAM window the MCFG
+names — was read out of the realized machine by
+[`src/dev/q35/acpi.rs`](../../src/dev/q35/acpi.rs) rather than written down.
+2,156,716 ms of virtual time end to end, and 334 s of host time under
+`jit-host`; 2,720,192,460 of 2,795,479,885 guest instructions retired in blocks
+(97.3%).
+
+The `ftrace` self-check and the `DEBUG_WX` page-table walk still each trip the
+soft-lockup watchdog — 45 896 ftrace entries and a whole kernel page table
+walked at 51 BogoMIPS really is tens of seconds of guest time — which is the
+emulator being slow rather than wrong; there are rather more of them than there
+were, which is what a watchdog does when the clock it measures against is
+running properly.
+
+## The tables, and the one channel a UEFI board has to hand them over
+
+A board describes itself to an operating system; this one could not, and the
+reason is worth stating precisely because it is not "ACPI was unimplemented".
+[`q35`](q35.md) has a `q35.acpi` device that **generates the whole set from the
+realized machine** — a MADT read out of the APICs' own mappings, an MCFG for the
+window `PCIEXBAR` placed, a `_PRT` read out of the bridge's routing registers —
+and stages it at `0xe0000`, where ACPI §5.2.5.1's search finds it. Under UEFI
+nothing searches. A kernel started by the EFI stub takes its RSDP from the EFI
+configuration table (UEFI 2.10 §4.6), which holds what the **firmware**
+installed, and an OVMF build has exactly one source for that: `fw_cfg`.
+
+So the tables were never the missing part. The *channel* was.
+
+### What `fw_cfg` is
+
+A selector register and a data register — `0x510` and `0x511` on an I/O-mapped
+platform — and behind them numbered items, one of which (`0x19`) is a directory
+naming the rest. A firmware writes a selector, then reads bytes; a file lookup
+is a walk of the directory followed by a second select. Everything about it that
+this board implements is established from EDK II's own consumption of it
+(`OvmfPkg/Include/IndustryStandard/QemuFwCfg.h`, `OvmfPkg/Library/QemuFwCfgLib`,
+`OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c`) — BSD-2-Clause-Patent, and
+the permissive source for what the firmware we serve expects. The interface
+originated in QEMU, whose source is off limits to this repository and was not
+opened.
+
+Two decisions in `src/dev/q35/fwcfg.rs` are worth defending rather than
+recording:
+
+* **The signature reads `QEMU`.** `QemuFwCfgInitialize` refuses the interface
+  unless key `0x0000` does, so those four bytes are the identifier that means
+  "this register pair is that register pair" — the same kind of fact as the
+  `010802h` class code that makes `NvmExpressDxe` bind to this board's disk.
+  Answering anything else is answering nothing at all, which is what this board
+  did before.
+* **The DMA path is deliberately absent.** Key `0x0001` reports revision 1
+  without `FW_CFG_F_DMA`, and `0x514` is not decoded. The DMA interface would
+  make this device a bus master fetching a descriptor the guest wrote and
+  copying into a buffer the guest chose, from inside an I/O write, with the
+  processor's `BUS`-ranked lock held — the hazard class the virtio work found
+  live. It buys nothing here: EDK II's `InternalQemuFwCfgReadBytes` falls back
+  to `IoReadFifo8`, one `rep insb`, and the whole table set is tens of
+  kilobytes. A guest that genuinely needs DMA — Linux's `fw_cfg` sysfs driver,
+  or an MMIO transport, which has no port path at all — is the reason to add it,
+  and the termination argument then has to be made rather than assumed.
+
+### The blob and the linker script, which is the part with content
+
+ACPI tables hold *addresses*, and a board cannot know them: the firmware
+allocates the tables itself, from its own pool, long after this device has
+answered. The arrangement EDK II implements is a blob whose pointers are
+**offsets**, plus a script saying how to turn each offset into an address:
+
+| file | what it is |
+| --- | --- |
+| `etc/acpi/tables` | FACS, DSDT, MADT, MCFG, HPET, FADT and XSDT back to back, every pointer field holding the offset of its target *in this same blob*, and every `Checksum` byte zero |
+| `etc/acpi/rsdp` | a revision 2 RSDP whose `XsdtAddress` is likewise an offset |
+| `etc/table-loader` | 128-byte commands: `Allocate`, `AddPointer`, `AddChecksum` |
+
+The firmware allocates each named file, adds the containing blob's base to every
+pointer field the script names, and then computes each checksum. Two rules fall
+out of reading `QemuFwCfgAcpi.c` rather than out of taste, and both are
+load bearing:
+
+* **The checksum bytes have to start at zero.** `ProcessCmdAddChecksum` stores
+  `CalculateCheckSum8(range)` — `0x100 - sum` — at `ResultOffset`, over a range
+  that *includes* that byte. A table shipped with its checksum already correct
+  comes back summing to minus that byte instead of to zero, and a table that
+  does not sum to zero is one the second pass declines to install, silently.
+* **A table is identified by being pointed at.** The second pass walks the
+  `AddPointer` commands and asks whether what each one now points at carries a
+  plausible length and a zero sum; if so it installs it, skipping only RSDT and
+  XSDT (`EFI_ACPI_TABLE_PROTOCOL` builds its own). So the XSDT's entries are
+  what get the MADT, MCFG and HPET installed, and the FADT's `FIRMWARE_CTRL` and
+  `DSDT` fields are what get the FACS and the DSDT installed — which is why
+  those two are in the blob at all, given that §5.2.8 keeps them out of the
+  XSDT.
+
+`tests/q35_uefi.rs`'s `the_loader_script_the_board_hands_over_builds_a_madt`
+**runs that procedure** against the board — allocating at two addresses of its
+own choosing, relocating, checksumming, and then following the RSDP to the XSDT
+to the MADT and reading the local APIC and I/O APIC addresses back out of it. It
+needs no firmware and it takes milliseconds. It is written that way on purpose:
+a test that only asked "does the device answer" would pass on a blob whose
+checksums were pre-filled, which is precisely the blob a firmware throws away
+without a word.
+
+### An existing generator was reused, and the other one still cannot be
+
+`src/dev/q35/acpi.rs` builds every byte of every table here. Nothing about a
+MADT changes because a firmware rather than an operating system will read it,
+and the input is the same `survey` of the same realized machine — so `fwcfg`
+takes the table *bodies* from that module and adds only the packaging: a layout
+at base zero, the list of fields that are pointers, and the script. The one
+change inside `acpi.rs` was to lift the XSDT and RSDT builders out of `generate`
+into functions taking a list of addresses, because "address" there is now
+sometimes an offset. `TableConfig` is shared too, so a board cannot declare one
+processor count to a firmware and another to an operating system.
+
+`src/fw/pcbios/tables.rs` is the third generator and stays separate, for the
+three reasons its own module docs already give: it is behind `fw-pcbios`, which
+must not imply a chipset; its input is a *description* rather than a realized
+machine, and there is no address space to survey when a ROM image is assembled;
+and its FADT describes a board with no ACPI register block at all.
+
+### What OVMF actually asked for
+
+Measured, not assumed — `q35.fwcfg` keeps the last sixty-four selectors the
+guest wrote and `tests/q35_uefi.rs` prints them with the file each names:
+
+```text
+q35-uefi: what the firmware asked fw_cfg for:
+q35-uefi:   0x0000  <signature>
+q35-uefi:   0x0001  <interface version>
+q35-uefi:   0x0019  <the file directory>
+q35-uefi:   0x0005  <boot cpu count>
+…
+q35-uefi:   0x0017  <not served: reads as zeroes>
+q35-uefi:   0x0008  <not served: reads as zeroes>
+q35-uefi:   0x000b  <not served: reads as zeroes>
+q35-uefi:   0x0014  <not served: reads as zeroes>
+q35-uefi:   0x0019  <the file directory>
+q35-uefi:   0x0022  etc/table-loader
+q35-uefi:   0x0019  <the file directory>
+q35-uefi:   0x0020  etc/acpi/rsdp
+q35-uefi:   0x0019  <the file directory>
+q35-uefi:   0x0021  etc/acpi/tables
+q35-uefi:   0x000e  <not served: reads as zeroes>
+q35-uefi:   it stopped 196 byte(s) into item 0x0019
+```
+
+Read from the bottom, that is the whole hand-off. `AcpiPlatformDxe` looks up
+**`etc/table-loader`**, reads it, and executes it; its two `Allocate` commands
+are the two lookups that follow — `etc/acpi/rsdp` and `etc/acpi/tables` — each
+preceded by the directory walk `QemuFwCfgFindFile` makes *every time*, since the
+interface has no notion of a cached handle and a lookup by name really is a
+re-read of the directory. Above them, `0x0017`, `0x0008`, `0x000b` and `0x0014`
+are `QemuKernelLoaderFsDxe` asking whether a kernel was passed on a command line
+this board has no way of passing one on; all four read as zeroes and it
+concludes there is none. `0x000e` is the boot menu. The pairs of
+`<signature>`/`<interface version>` scattered through the middle are
+`QemuFwCfgInitialize`, once per module that links the library.
+
+The trace keeps the last sixty-four selectors, so the start of the boot has
+rolled off the one above; `0x0005` — the processor count
+`PlatformMaxCpuCountInitialization` reads in PEI — is visible in a run that
+stops earlier. Answering it matters: zero there means "the platform does not
+know", and `MpInitLib` then counts application processors by *timeout* rather
+than by number.
+
+Every other lookup a firmware makes is a name that is not in the directory, and
+each one is a fall-back EDK II is written to take: no `etc/e820`, so memory
+sizing stays on CMOS `0x34`/`0x35`; no `etc/system-states`, so `QemuFwCfgS3Enabled`
+is false and S3 stays off; no `etc/smbios/*`, so SMBIOS comes from the firmware
+volume's own tables; no `bootorder`, so the boot order is the variable store's.
+Serving fewer files than QEMU does is not a shortfall to be closed — each one
+would be a second place this board describes itself, and the first place already
+works.
+
+### And then the board had to grow the wire the description implies
+
+With the tables installed the kernel found its APICs, took symmetric I/O
+mode — and panicked:
+
+```text
+[    0.000000] APIC: Switch to symmetric I/O mode setup
+[    0.000000] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1
+[    0.000000] ..MP-BIOS bug: 8254 timer not connected to IO-APIC
+[    0.000000] Kernel panic - not syncing: IO-APIC + timer doesn't work!
+```
+
+which is, word for word, the panic
+[`q35-linux`](q35-linux.md)'s machine file warns about — and for the same
+reason. The set the firmware now installs includes an **HPET table**, so
+`hpet_time_init()` succeeds where it used to fail, sets `LEG_RT_CNF`, stops
+loading the 8254's counter 0 and waits for the HPET's comparator 0 on IRQ0.
+`LEG_RT_CNF` is not a register inside one chip: it is a board-level multiplexer
+between three of them (*IA-PC HPET Specification* §2.3.5), and
+`machines/q35-uefi.machine` did not have it. `machines/q35-linux.machine` has
+had those five gates all along; this board never needed them, because a guest
+that has never been told the machine has an HPET does not use it.
+
+That is the shape of this whole change in one sentence: **describing a board
+truthfully makes a guest exercise parts of it that were never reached**, and the
+gap was in the wiring rather than in the description. The board now carries the
+same `wire.not`/`wire.and` multiplexer, and with it the timer check passes
+without comment.
 
 ## What is not reached yet
 
@@ -753,6 +995,21 @@ It would also have turned the variable-store hunt above into a one-line answer:
 `QemuFlashDetected => No` — the whole finding — before anything had to be
 inferred from four bus cycles. Worth remembering the next time this board goes
 quiet.
+
+**The `fw_cfg` DMA interface** is the other one, and it is a design review
+rather than an omission — ["What `fw_cfg` is"](#what-fw_cfg-is) has the
+argument. Nothing this board runs needs it: the firmware falls back to the port
+path by construction, and a Linux guest's `fw_cfg` sysfs driver is the first
+consumer that would not. Adding it means a device that walks guest structures
+from inside an I/O write, and the case for that has to be made on the day, with
+a termination argument for whatever the guest handed over.
+
+**No `etc/e820` and no SMBIOS through `fw_cfg`.** Both are deliberate: the
+memory map already reaches the firmware through CMOS `0x34`/`0x35` and SMBIOS
+already comes out of the firmware volume, and a second description of either
+would be a second thing to keep in step. A board that wanted more than 4 GiB of
+guest memory would need the e820 file, because CMOS `0x5b`-`0x5d` is the only
+other route and it is three bytes wide.
 
 ## Running it
 
@@ -821,7 +1078,7 @@ programmed from, through **both** windows onto configuration space.
 | --- | --- |
 | reset vector out of flash at `0xfffffff0` | **works** |
 | long mode, paging, the SEC page tables | **works** |
-| PEI, memory sized from CMOS `0x34`/`0x35` with no `fw_cfg` | **works** |
+| PEI, memory sized from CMOS `0x34`/`0x35` | **works** — and still the route with a `fw_cfg` on the board, which deliberately serves no `etc/e820` |
 | `FVMAIN` decompressed into RAM, DXE core entered | **works** |
 | DXE drivers dispatched, local APIC software-enabled | **works** |
 | an exception delivered, handled and returned from | **works** — and it took `CR8`, the sixteen-byte frame alignment and `IA32_PLATFORM_ID` |
@@ -833,15 +1090,17 @@ programmed from, through **both** windows onto configuration space.
 | the flash probe, program and erase the variable driver needs | **works** (asserted without a firmware) |
 | the variable driver binding the flash rather than falling back to RAM | **works** — and it took the status register reading `0x00` after a Clear Status Register |
 | a variable written in one run present in the next | **works** — `setvar` at the shell in one boot, read back at the shell in the next, across two machines sharing only the bank's bytes |
-| `BootOrder`, `Boot000n`, `Timeout`, `ConIn`/`ConOut` in the store | **works** — 5,799 programmed bytes where the shipped image had 127 |
+| `BootOrder`, `Boot000n`, `Timeout`, `ConIn`/`ConOut` in the store | **works** — 6,206 programmed bytes where the shipped image had 127 |
 | an NVMe controller at `00:04.0`, enumerated and bound | **works** — `PciBusDxe` sizes and places its window and `NvmExpressDxe` enables memory space and bus mastering |
 | the driver reading a register out of that window | **works** — and it took the fix above: a BAR programmed through ECAM used to never decode at all |
 | a file system on that disk, `map` finding an `FS0:` | **works** — `FS0:` on `PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,…)`, and `startup.nsh` read off it and executed |
 | an EFI application started off the disk | **works** — `BdsDxe: starting Boot0001 … from …/NVMe(0x1,…)`, which is `\EFI\BOOT\BOOTX64.EFI` on the volume rather than the shell in the firmware volume |
 | a Linux kernel entered through its EFI stub | **works** — a Gentoo 6.6.67 `bzImage` and its initramfs read off the ESP by the firmware, `Run /init as init process`, and `uname -srm` answered at a shell |
-| that kernel finding an APIC | **no** — `APIC: ACPI MADT or MP tables are not detected`: this OVMF builds its ACPI tables from `fw_cfg` and the board has none, so the kernel takes virtual wire mode |
+| that kernel finding an APIC | **works** — `ACPI: Using ACPI (MADT) for SMP configuration information` and `APIC: Switch to symmetric I/O mode setup`, where it used to read `ACPI MADT or MP tables are not detected` and fall back to virtual wire mode |
+| the timer that mode needs | **works** — and it took the HPET legacy replacement route: a kernel that learns the board has an HPET sets `LEG_RT_CNF` and stops loading the 8254, so a board without the multiplexer panics with `IO-APIC + timer doesn'''t work!` |
+| the ACPI set the firmware installs | **works** — RSDP, XSDT, FADT, DSDT, FACS, MADT, MCFG and HPET, all generated from the realized machine and all placed by the firmware itself |
 | SMRAM / SMM | not modelled, **and not what was stopping the variable writes**; a non-`SMM_REQUIRE` OVMF never touches it, and [`q35.md`](q35.md) records the gap |
-| `fw_cfg` | absent, and deliberately: EDK II degrades cleanly when the signature at `0x510` does not read `QEMU`, and everything above happened without it |
+| `fw_cfg` | **works** — the selector/data pair at `0x510`, serving `etc/acpi/tables`, `etc/acpi/rsdp` and `etc/table-loader`. The DMA interface at `0x514` is deliberately absent and the feature bit says so, so the firmware takes the `rep insb` path |
 | a boot device | **works** — an NVMe namespace with a FAT volume on it, found by BDS, mounted by the shell, and booted from |
 
 ## Sources
@@ -877,6 +1136,33 @@ ECAM window a function's configuration space is. EDK II's
 `MdeModulePkg/Bus/Pci/NvmExpressDxe` named its own assertion and is quoted
 above; `MdePkg`'s `BaseDebugLibSerialPort` is why that assertion was formatted
 and not printed.
+
+For the tables and the channel they travel down: the **ACPI Specification**
+revision 6.5 for every table (§5.2.5.3 the RSDP, §5.2.6 the description header
+and its checksum, §5.2.8 the XSDT and what it does *not* list, §5.2.9 the FADT,
+§5.2.10 the FACS and its 64-byte alignment, §5.2.12 the MADT, §6.2.13 `_PRT`);
+the **IA-PC HPET Specification** revision 1.0a **§2.3.5** for the legacy
+replacement route, which is the multiplexer this board grew in the same commit;
+and EDK II for the interface itself —
+`OvmfPkg/Include/IndustryStandard/QemuFwCfg.h` for the register addresses, the
+numbered keys and the directory's big-endian encoding;
+`OvmfPkg/Include/IndustryStandard/QemuLoader.h` for the three loader commands
+and their 128-byte envelope;
+`OvmfPkg/Library/AcpiPlatformLib/QemuFwCfgAcpi.c` for what the firmware
+validates, in what order, and for `CalculateCheckSum8`'s consequence that a
+checksum byte starts at zero; `OvmfPkg/Library/QemuFwCfgLib/QemuFwCfgLib.c` and
+`QemuFwCfgDxe.c` for the directory walk, the signature probe and the DMA feature
+bit; `OvmfPkg/Library/PlatformInitLib` for what each *missing* file falls back
+to; and `OvmfPkg/OvmfPkgX64.fdf`, which is where the answer to "does the
+firmware program the 8254?" is written down — it does not, it dispatches
+`LocalApicTimerDxe`.
+
+**`fw_cfg` is a QEMU-originated interface and QEMU's source is off limits under
+`CLAUDE.md`; none of it was opened.** What is implemented is what the firmware
+this board serves is written to consume, established entirely from EDK II, which
+is permissively licensed and is the consumer whose expectations actually matter
+here. One consequence is visible in the code: the four bytes at key `0x0000` are
+`QEMU` because that is the identifier the driver binds on.
 
 **No emulator source of any licence was consulted.** The firmware images were
 run and never read; every number above is either a register this repository's

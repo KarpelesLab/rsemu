@@ -18,6 +18,7 @@
 //! | [`lpc`] | the south bridge: PCI interrupt routing, and `PMBASE`, which places the ACPI register block |
 //! | [`pm`] | that register block: `PM1_STS`/`PM1_EN`/`PM1_CNT` and the 3.579545 MHz power-management timer |
 //! | [`acpi`] | the tables, **generated from the realized machine** |
+//! | [`fwcfg`] | the same tables, handed to a *firmware* through the fw_cfg register pair |
 //! | [`aml`] | the byte encoder the DSDT is built with |
 //!
 //! # How much PCI Express this is
@@ -66,6 +67,7 @@
 pub mod acpi;
 pub mod aml;
 pub mod ecam;
+pub mod fwcfg;
 pub mod lpc;
 pub mod mch;
 pub mod pm;
@@ -86,6 +88,7 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     mch::register(reg)?;
     lpc::register(reg)?;
     acpi::register(reg)?;
+    fwcfg::register(reg)?;
     Ok(())
 }
 
@@ -98,13 +101,19 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
     mch::bind(b)?;
     lpc::bind(b)?;
     acpi::bind(b)?;
+    fwcfg::bind(b)?;
     Ok(())
 }
 
 /// What the validator should know about every class in this module.
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
-    alloc::vec![mch::schema(), lpc::schema(), acpi::schema()]
+    alloc::vec![
+        mch::schema(),
+        lpc::schema(),
+        acpi::schema(),
+        fwcfg::schema()
+    ]
 }
 
 /// The machine description this chipset was written for, compiled in so that a
