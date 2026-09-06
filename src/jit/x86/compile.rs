@@ -82,6 +82,46 @@
 //! `fast_hits` and `fast_writes`. That is the whole of a guest instruction's
 //! per-instruction cost now: nothing.
 //!
+//! ### The flush answers, and generated code has to listen
+//!
+//! One thing has been added back, and it is per *region* rather than per guest
+//! instruction: a flush returns whether
+//! [`IrHost::spent`](crate::ir::IrHost::spent) stopped the replay at a
+//! boundary, and `Compiler::flush` follows the call with a `test` and a
+//! `jcc` to a pad that leaves with `status::SPENT`. That is what lets a caller
+//! hand a block a tick budget it might not fit instead of refusing it one it
+//! probably would have — `jit::dispatch`'s "Two budgets, in two currencies" —
+//! and the whole of what it costs is **0.24%** of host instructions, measured
+//! by callgrind over 120 guest seconds of `pc64`. It is emitted only after a
+//! flush that could answer non-zero; see `Plan::can_stop`.
+//!
+//! ### What `benches/x86_dispatch.rs` says about it, and why it is not that
+//!
+//! `load-heavy` — a flush at nearly every guest instruction — loses **15%**
+//! of its `+allocated` column to this, reproducibly, across three interleaved
+//! reps. It is worth writing down what that is *not*, because the obvious
+//! reading is wrong twice over.
+//!
+//! Callgrind puts the whole benchmark at 136 711 887 302 instructions before
+//! this change and 136 699 086 843 after — **flat**. And the earlier version
+//! of this code, which emitted the check after *every* flush and therefore
+//! executes strictly more instructions than what shipped, benches `load-heavy`
+//! at 92 Mi/s where what shipped gets 83. Fewer instructions, slower row.
+//!
+//! So the row is measuring where its loop's bytes landed, not what they do:
+//! this backend emits no alignment padding, so nine bytes added to one block
+//! move every later block in the buffer, and a small hot loop that crosses a
+//! fetch-window or uop-cache boundary loses far more than the bytes cost. The
+//! number that answers "what does this cost" is the one taken on a real guest
+//! where compiled execution dominates, and that number is 0.24%.
+//!
+//! What the replay may throw away when it stops is the rest of its region, and
+//! that is sound for the reason the region exists: no call site lies inside
+//! one, so the instructions between the boundary it stopped at and the flush
+//! point wrote nothing but temporaries the block is now abandoning. The
+//! pending boundary's own live temporaries are not among them — a temporary is
+//! defined once — which is the same fact the fault path already rests on.
+//!
 //! ### What it costs, which is in the allocator
 //!
 //! A flush is a call in the *gap* ahead of an instruction, so a value whose
@@ -486,6 +526,28 @@ struct Plan {
     at: Vec<Option<(u32, u32)>>,
 }
 
+impl Plan {
+    /// Whether replaying `lo .. hi` can end the block.
+    ///
+    /// It can only where the range holds a boundary a run may *leave* at, and
+    /// [`rt`](super::rt)'s `flush_thunk` leaves at no other kind of event and
+    /// at no exit boundary. A flush over a range of nothing but charges is
+    /// therefore known to answer zero, and the `test` and `jcc` after it are
+    /// dead code in a block that is mostly this call.
+    ///
+    /// Both mutations of this predicate that make it *less* selective survive
+    /// every test, and that is the shape of the thing rather than a hole:
+    /// emitting a check that can never fire is correct and only slower, so
+    /// nothing observable distinguishes it. What is not survivable is dropping
+    /// a check that can — `a_compiled_block_leaves_at_exactly_the_boundary_the_interpreter_leaves_at`
+    /// catches that immediately.
+    fn can_stop(&self, lo: u32, hi: u32) -> bool {
+        self.events[lo as usize..hi as usize]
+            .iter()
+            .any(|e| matches!(e, Event::Boundary { exit: false, .. }))
+    }
+}
+
 /// Collect a block's bookkeeping and decide where to replay it.
 ///
 /// See the module docs for why a static range is exactly what ran. The rule is
@@ -539,7 +601,13 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
                     .marks()
                     .get(inst.aux as usize)
                     .ok_or(Refusal::Shape("the boundary marker points at no record"))?;
-                events.push(Event::Boundary(inst.aux));
+                events.push(Event::Boundary {
+                    mark: inst.aux,
+                    // Read here because the replay cannot: it is handed a
+                    // range of events and never sees an instruction index.
+                    // `ir::Interp` asks the same question of `insts[at + 1]`.
+                    exit: insts.get(i + 1).is_some_and(|next| next.op.is_terminator()),
+                });
             }
             _ => {}
         }
@@ -581,6 +649,8 @@ struct Compiler<'a> {
     branches: Vec<(Fixup, usize)>,
     /// Jumps to the epilogue.
     exits: Vec<Fixup>,
+    /// Jumps to the pad that leaves with [`status::SPENT`], one per flush.
+    spent: Vec<Fixup>,
 }
 
 /// The stack this backend reserves below its saved registers.
@@ -647,6 +717,7 @@ impl<'a> Compiler<'a> {
             plan,
             branches: Vec::new(),
             exits: Vec::new(),
+            spent: Vec::new(),
         })
     }
 
@@ -695,6 +766,17 @@ impl<'a> Compiler<'a> {
     }
 
     fn epilogue(&mut self) {
+        // The pad every flush's "the allowance is spent" edge lands on. One
+        // per block rather than one per flush, and it falls straight through
+        // into the epilogue below, so what a taken edge costs is the `jcc`
+        // that took it. Emitted only where something jumps here, so a block
+        // with no flush in it is byte-for-byte what it was.
+        if !self.spent.is_empty() {
+            for f in core::mem::take(&mut self.spent) {
+                self.asm.bind(f);
+            }
+            self.asm.mov_ri(Reg::Rax, status::SPENT);
+        }
         for f in core::mem::take(&mut self.exits) {
             self.asm.bind(f);
         }
@@ -945,6 +1027,29 @@ impl<'a> Compiler<'a> {
         self.asm.mov_ri32(Reg::Rsi, lo);
         self.asm.mov_ri32(Reg::Rdx, hi);
         self.call(vt::FLUSH);
+        // A non-zero answer means the replay stopped at a boundary because
+        // `IrHost::spent` said the tick allowance was gone, so the block
+        // leaves at that boundary rather than running on to its terminator.
+        // Two instructions and a never-taken branch, paid once per *region*
+        // rather than once per guest instruction -- which is what makes a
+        // budget a block can leave at cheap enough to have at all. The
+        // alternative was the caller refusing to start any block whose worst
+        // case did not fit, and on a real x86 guest that refusal was 2.02% of
+        // every instruction executed.
+        //
+        // Emitted only where the answer can be non-zero. `flush_thunk` stops
+        // at a boundary and nowhere else, and never at an exit boundary, so a
+        // region holding no other kind cannot end the block however spent the
+        // allowance is. That is most of a block's last region and every region
+        // that is only charges, and it is nine bytes of a hot loop each time:
+        // the cost of this mechanism is code size rather than branches, and
+        // `benches/x86_dispatch.rs`'s `load-heavy` -- a flush at nearly every
+        // guest instruction -- is where that shows.
+        if self.plan.can_stop(lo, hi) {
+            self.asm.test_rr(Reg::Rax, Reg::Rax);
+            let f = self.asm.jcc(Cc::Ne);
+            self.spent.push(f);
+        }
     }
 
     /// The sequence a faulting access jumps to: record where and why, and

@@ -73,6 +73,9 @@ pub mod status {
     pub const LOOKUP: u64 = 2;
     /// A guest access faulted; the fault fields carry where and why.
     pub const FAULT: u64 = 3;
+    /// The host's tick allowance was spent at a boundary, and the block left
+    /// there. The context's `boundary_pc` is where the guest is standing.
+    pub const SPENT: u64 = 4;
 }
 
 /// The bus errors, as generated code passes them back.
@@ -119,7 +122,17 @@ pub enum Event {
     /// [`IrHost::charge`], with the tick count [`Opcode::CHARGE`] carried.
     Charge(u64),
     /// [`IrHost::insn_start`], by index into [`Block::marks`].
-    Boundary(u32),
+    Boundary {
+        /// The index into [`Block::marks`].
+        mark: u32,
+        /// Whether a terminator follows this boundary, which is what makes it
+        /// an **exit** boundary: the block may not be left there, because
+        /// [`InsnStart::pc`] is then a static placeholder and the real
+        /// successor is in the slot the map publishes. `plan` reads it off the
+        /// block, once, at compile time — the replay cannot see instruction
+        /// indices and must be told.
+        exit: bool,
+    },
 }
 
 /// The execution context a compiled block runs against.
@@ -240,7 +253,11 @@ pub mod off {
 #[derive(Debug, Clone, Copy)]
 pub struct Vtable {
     /// Replay a range of the block's charges and boundaries.
-    pub flush: unsafe extern "sysv64" fn(*mut c_void, u64, u64),
+    ///
+    /// Returns non-zero when [`IrHost::spent`] stopped the replay at a
+    /// boundary, which generated code answers by leaving the block with
+    /// [`status::SPENT`].
+    pub flush: unsafe extern "sysv64" fn(*mut c_void, u64, u64) -> u64,
     /// [`IrHost::read_slot`], publishing first if the slot is shadowed.
     pub get_slot: unsafe extern "sysv64" fn(*mut c_void, u64) -> u64,
     /// [`IrHost::load`]. Returns an error code; the value goes to `out`.
@@ -364,7 +381,11 @@ fn shadowed(c: &Ctx, block: &Block, slot: RegSlot) -> bool {
 /// code touches only the temporary frame and this context, and every other
 /// thunk — a load, a store, a slot read, an inlined access's tick — has a
 /// flush emitted ahead of it.
-unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo: u64, hi: u64) {
+unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(
+    raw: *mut c_void,
+    lo: u64,
+    hi: u64,
+) -> u64 {
     // SAFETY: `raw` is the context `Engine::run` entered generated code with,
     // `c.host` is the `&mut H` it was called with, `c.block` is the `&Block`
     // it holds for the whole call, and `c.events` points at the `Box<[Event]>`
@@ -403,7 +424,7 @@ unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo:
                     c.committed = 1;
                     host_of::<H>(c).charge(ticks);
                 }
-                Event::Boundary(index) => {
+                Event::Boundary { mark: index, exit } => {
                     // `compile` refuses a marker pointing at no record, so the
                     // skip is unreachable rather than a boundary lost.
                     let Some(mark) = block.marks().get(index as usize) else {
@@ -422,9 +443,28 @@ unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo:
                     // previous one's commits stop blocking a retry here.
                     c.committed = 0;
                     host_of::<H>(c).insn_start(mark);
+                    // The tick allowance, asked exactly where `Interp` asks
+                    // it and under exactly the same two guards: never at the
+                    // block's first boundary, and never at an exit boundary,
+                    // whose `pc` is a placeholder when the successor is
+                    // computed. Replaying stops here, so the
+                    // charges of the events after it are never made -- which
+                    // is right, because the instructions they belong to are
+                    // being *unwound*. Everything between this boundary and
+                    // the flush point is a region, and a region contains no
+                    // call site by construction (`compile`'s "Deferred
+                    // bookkeeping"), so all it did was write temporaries the
+                    // block is about to abandon. The pending boundary's own
+                    // live temporaries are untouched by them -- a temporary
+                    // is defined once -- which is the same fact the fault
+                    // path already rests on.
+                    if c.boundaries > 1 && !exit && host_of::<H>(c).spent() {
+                        return 1;
+                    }
                 }
             }
         }
+        0
     }
 }
 
@@ -819,6 +859,11 @@ impl Engine {
             status::EXIT => Ok(Outcome::Exit),
             status::GOTO => Ok(Outcome::Goto { pc: ctx.out_pc }),
             status::LOOKUP => Ok(Outcome::Lookup { pc: ctx.out_pc }),
+            // The boundary the flush stopped at, which is the one the context
+            // still names: the guest instruction that has not started.
+            status::SPENT => Ok(Outcome::Spent {
+                pc: ctx.boundary_pc,
+            }),
             _ => {
                 let error = error_of(ctx.fault_error);
                 if error == BusError::Retry && ctx.committed != 0 {

@@ -97,6 +97,12 @@ struct Scratch {
     /// reported eight bytes for one would mark the wrong granules dirty and
     /// log the wrong page, and both are invisible in a state comparison.
     inlined_stores: Vec<(u64, u64)>,
+    /// The tick allowance, or `None` for a host that never stops a block.
+    ///
+    /// The seam `ir::interp`'s "Leaving a block part-way through" describes,
+    /// under differential test: with one set the two engines must leave at the
+    /// *same* boundary and not merely produce the same answer at the end.
+    allowance: Option<u64>,
 }
 
 impl Scratch {
@@ -129,6 +135,15 @@ impl Scratch {
             ticks: 0,
             log: Vec::new(),
             inlined_stores: Vec::new(),
+            allowance: None,
+        }
+    }
+
+    /// The same host, leaving a block at the first boundary past `ticks`.
+    fn within(inline: bool, ticks: u64) -> Scratch {
+        Scratch {
+            allowance: Some(ticks),
+            ..Scratch::new(inline)
         }
     }
 
@@ -196,6 +211,10 @@ impl IrHost for Scratch {
     fn insn_start(&mut self, mark: &InsnStart) {
         self.log.push(Event::Boundary(mark.pc));
     }
+
+    fn spent(&self) -> bool {
+        self.allowance.is_some_and(|a| self.ticks >= a)
+    }
 }
 
 impl FastMem for Scratch {
@@ -244,8 +263,21 @@ impl FastMem for Scratch {
 /// the frame, every operand a load — and it is what says whether a divergence
 /// is the allocation or the lowering.
 fn agree(block: &Block, inline: bool) -> bool {
-    let frame = agree_under(block, inline, Regs::Frame);
-    let scan = agree_under(block, inline, Regs::Scan);
+    let frame = agree_under(block, inline, Regs::Frame, None);
+    let scan = agree_under(block, inline, Regs::Scan, None);
+    assert_eq!(
+        frame, scan,
+        "one policy compiled and the other did not\n{block}"
+    );
+    scan
+}
+
+/// Both policies again, with a tick allowance the block may not fit.
+///
+/// Returns whether anything compiled, as [`agree`] does.
+fn agree_within(block: &Block, inline: bool, allowance: u64) -> bool {
+    let frame = agree_under(block, inline, Regs::Frame, Some(allowance));
+    let scan = agree_under(block, inline, Regs::Scan, Some(allowance));
     assert_eq!(
         frame, scan,
         "one policy compiled and the other did not\n{block}"
@@ -254,10 +286,14 @@ fn agree(block: &Block, inline: bool) -> bool {
 }
 
 /// One policy's run against the interpreter.
-fn agree_under(block: &Block, inline: bool, regs: Regs) -> bool {
+fn agree_under(block: &Block, inline: bool, regs: Regs, allowance: Option<u64>) -> bool {
     verify(block).expect("the generator produces well-formed blocks");
 
-    let mut oracle_host = Scratch::new(inline);
+    let scratch = |inline| match allowance {
+        Some(ticks) => Scratch::within(inline, ticks),
+        None => Scratch::new(inline),
+    };
+    let mut oracle_host = scratch(inline);
     let mut interp = Interp::new();
     let oracle = interp.run(block, &mut oracle_host);
 
@@ -267,7 +303,7 @@ fn agree_under(block: &Block, inline: bool, regs: Regs) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let mut host = Scratch::new(inline);
+    let mut host = scratch(inline);
     let subject = engine
         .run(block, code, &mut host)
         .expect("the code was compiled in this generation");
@@ -287,22 +323,55 @@ fn agree_under(block: &Block, inline: bool, regs: Regs) -> bool {
     // so rather than handing back the frame's zero — see its documentation.
     // Under `Regs::Frame` nothing is register-allocated, so this is still the
     // whole comparison it used to be on every block the corpus generates.
+    //
+    // **Not on a run that left part-way through**, and the exception is the
+    // mechanism rather than a weakening of the test. A block that leaves at a
+    // boundary abandons whatever its region had computed past that boundary:
+    // generated code ran those instructions and the interpreter never reached
+    // them, so their temporaries hold different values *by construction* and
+    // comparing them would assert that the backend does not do the one thing
+    // it is allowed to do. What must agree is what the guest can see, which is
+    // the stopping boundary's own live mapping — asserted below, along with
+    // the slots it publishes into.
     let mut compared = 0;
-    for t in 0..block.temp_count() {
-        let temp = Temp(t as u32);
-        let want = interp.temp_value(temp).expect("allocated");
-        if let Some(got) = engine.temp_value(temp) {
-            assert_eq!(want, u128::from(got), "temporary {temp} differs\n{block}");
+    if allowance.is_none() {
+        for t in 0..block.temp_count() {
+            let temp = Temp(t as u32);
+            let want = interp.temp_value(temp).expect("allocated");
+            if let Some(got) = engine.temp_value(temp) {
+                assert_eq!(want, u128::from(got), "temporary {temp} differs\n{block}");
+                compared += 1;
+            }
+        }
+        if regs == Regs::Frame {
+            assert_eq!(
+                compared,
+                block.temp_count(),
+                "the control policy must keep every temporary\n{block}"
+            );
+        }
+    } else {
+        let stopped = interp
+            .mark()
+            .and_then(|m| block.marks().get(m as usize))
+            .map(|m| m.live.as_slice())
+            .unwrap_or_default();
+        for &(slot, temp) in stopped {
+            let want = interp.temp_value(temp).expect("allocated");
+            let got = engine
+                .temp_value(temp)
+                .expect("a boundary's live temporary is frame-backed");
+            assert_eq!(
+                want,
+                u128::from(got),
+                "temporary {temp}, live for slot {} at the boundary the run left \
+                 at, differs\n{block}",
+                slot.0
+            );
             compared += 1;
         }
     }
-    if regs == Regs::Frame {
-        assert_eq!(
-            compared,
-            block.temp_count(),
-            "the control policy must keep every temporary\n{block}"
-        );
-    }
+    let _ = compared;
     // `ROADMAP.md` §9's precise-exception contract, asserted on every block
     // rather than only on the ones that fault: the exception path materializes
     // architectural state out of the frame, so every temporary a boundary
@@ -1345,6 +1414,48 @@ fn a_thousand_random_blocks_agree_with_the_interpreter() {
     assert_eq!(
         compiled, 1000,
         "every generated block is within the backend"
+    );
+}
+
+#[test]
+fn a_thousand_random_blocks_leave_at_the_same_boundary_under_an_allowance() {
+    // The corpus again, with a tick allowance the blocks mostly do not fit.
+    // A block that leaves part-way through leaves at a guest instruction
+    // boundary, and the two engines have to pick the **same** one — same
+    // ticks, same guest state, same call sequence to the host, same retired
+    // count — or `ROADMAP.md` §0's identical state hash across engines stops
+    // holding for every core that admits a block it is not sure fits.
+    //
+    // The allowances are small on purpose: these blocks charge a handful of
+    // ticks each, so one to twelve straddles every case there is — spent
+    // before the first boundary, spent in the middle of a region, spent at a
+    // region's flush, and never spent at all.
+    let mut compiled = 0;
+    let mut left_early = 0;
+    for seed in 0..1000u64 {
+        let block = random_block(seed, 6 + (seed % 11) as usize);
+        let allowance = seed % 13;
+        if agree_within(&block, true, allowance) {
+            compiled += 1;
+        }
+        // Non-vacuity: the run really does stop part-way rather than always
+        // reaching a terminator first.
+        let mut host = Scratch::within(true, allowance);
+        if matches!(
+            Interp::new().run(&block, &mut host),
+            Ok(crate::ir::Outcome::Spent { .. })
+        ) {
+            left_early += 1;
+        }
+    }
+    assert_eq!(
+        compiled, 1000,
+        "every generated block is within the backend"
+    );
+    assert!(
+        left_early > 500,
+        "only {left_early} of 1000 blocks left part-way through, so this \
+         measures the ordinary path rather than the new one"
     );
 }
 
