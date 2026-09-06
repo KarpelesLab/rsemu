@@ -1841,8 +1841,10 @@ path              = "src/bin/rsemu.rs"
 required-features = ["cli"]
 
 [lints.rust]
-# Six subsystems may opt back in with a scoped #[allow(unsafe_code)] and a
-# SAFETY comment; see ROADMAP.md §0. Six is the ceiling.
+# Seven subsystems may opt back in with a scoped #[allow(unsafe_code)] and a
+# SAFETY comment; see ROADMAP.md §0 and CLAUDE.md. Seven is the ceiling — the
+# seventh (the host signal disposition) was added by design review, and this
+# comment said "six" for a while after it was.
 unsafe_code       = "deny"
 missing_docs      = "warn"
 unreachable_pub   = "warn"

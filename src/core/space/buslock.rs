@@ -134,10 +134,18 @@
 //!
 //! Note what that measurement does *not* say. The tearing is
 //! [`RamStore`](super::RamStore)'s byte loop, not this lock's doing, and
-//! `space::store`'s "What per-byte atomicity is not" has the cost of the two
-//! ways to remove it. Removing it would leave the residual in its lost-update
-//! form, which is what this section originally described and what would still
-//! be here.
+//! `space::store`'s "What per-byte atomicity is not" has the cost of the ways
+//! to remove it — three shapes, all re-derivable from
+//! `tests/memory_model_costs.rs`, none of them taken. Removing it would leave
+//! the residual in its lost-update form, which is what this section originally
+//! described and what would still be here.
+//!
+//! It also does not say the tearing belongs to `LOCK`, or to x86. Every
+//! naturally aligned load of two bytes or more, on every architecture in the
+//! tree, can come back torn against a racing store through this path. What is
+//! x86's alone is that the torn read is the read half of an instruction the
+//! architecture requires to be indivisible, which is what makes it *visible*
+//! here rather than merely present.
 //!
 //! ## The cheap approximation, and why it is refused
 //!

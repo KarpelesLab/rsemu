@@ -114,14 +114,25 @@
 //! `LR` racing a wide store can read a value that was never in memory
 //! (`space::store`, "What per-byte atomicity is not") — but the store broke the
 //! reservation on its way past, so the `SC` cannot commit anything derived from
-//! that value and the guest's retry loop takes it again. The torn read is
-//! discarded before it is architecturally visible.
+//! that value and the guest's retry loop takes it again.
 //!
-//! So the gap `tests/smp_single_copy_atomicity.rs` measures is **x86's alone**
-//! for the read-modify-write case, which is precisely why it shows up against
-//! the bus lock and not here. A plain wide *load* on AArch64 or RISC-V has no
-//! such backstop and tears exactly as it does on x86; that is the store's
-//! property, not this one's.
+//! **The commit is protected; the value is not**, and an earlier draft of this
+//! paragraph said "the torn read is discarded before it is architecturally
+//! visible", which overstates it. The `LR`'s result lands in the destination
+//! register and the guest may act on it before it reaches the `SC` — compare
+//! it, branch on it, in principle dereference it. What the reservation
+//! guarantees is that nothing *derived* from it is committed. For the loop
+//! shapes that exist that is enough, because both architectures' idiom is
+//! register arithmetic between the pair and the failing `SC` sends the guest
+//! round again; a sequence that faulted on a pointer it had just torn would
+//! be inside its rights to complain, and no such sequence is in the tree.
+//!
+//! So the gap `tests/smp_single_copy_atomicity.rs` measures is x86's alone
+//! **in its read-modify-write form**, which is precisely why it shows up
+//! against the bus lock and not here. The gap itself is nobody's alone: a plain
+//! wide *load* on AArch64 or RISC-V has no backstop at all and tears exactly as
+//! it does on x86. That is the store's property, not this one's, and calling it
+//! "x86's" is a mis-reading this paragraph exists to prevent.
 //!
 //! # It is derived state and it is not serialized
 //!

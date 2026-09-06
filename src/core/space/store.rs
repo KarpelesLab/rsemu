@@ -44,17 +44,46 @@
 //! `usermode`'s `ThreadSet` runs every guest thread on one host thread by
 //! design).
 //!
-//! **It is also engine-dependent, which is the part that would surprise
-//! someone.** The path measured above is the interpreter's. A store the JIT
+//! ## Who has it and who does not, which is not what this said before
+//!
+//! This section used to say the gap was "engine-dependent … a store the JIT
 //! *inlines* never comes through here at all: `jit::x86` emits one host store
-//! of the guest's width through [`RamStore::host_ptr`], so on an x86-64 host an
-//! inlined aligned access **is** single-copy atomic. Two engines running the
-//! same guest therefore differ in what a sibling core can observe.
+//! of the guest's width, so on an x86-64 host an inlined aligned access **is**
+//! single-copy atomic". Every clause of that is true and the conclusion a
+//! reader draws from it is wrong twice.
+//!
+//! **First: tearing is a property of the *store*, not of the access.** A store
+//! made in four pieces can be seen in halves by any observer, and no care on
+//! the loading side un-tears it — an inlined four-byte host `mov` reading a
+//! word another core is part-way through writing byte by byte returns exactly
+//! the mixture the byte loop left there. So an inlined *store* cannot be seen
+//! in halves by anybody (`jit::x86::compile`'s `store` emits one `store_trunc`
+//! of the guest's width and its `probe` refuses anything not naturally aligned,
+//! so the host instruction is atomic by *Intel SDM* volume 3 §9.1.1), while an
+//! inlined *load* is no defence at all. The guarantee follows whoever is
+//! storing.
+//!
+//! **Second: `jit::x86` is the host backend, not the guest.** Inlining exists
+//! only where a core publishes `FastMem::load_plan` and `FastMem::store_plan`,
+//! and the two that do are **AArch64 and RISC-V**. Nothing under `cpu::x86`
+//! mentions `MemPlan` at all — an **x86 guest inlines no memory access
+//! whatever**, so every x86 guest store goes through this byte loop in *both*
+//! engines. `tests/smp_single_copy_atomicity.rs` runs two 486s, so what it
+//! measures is not "the interpreter's residual"; it is that guest's residual,
+//! full stop.
+//!
+//! So the shape is: an aligned store by an AArch64 or RISC-V core, from inside
+//! a compiled block, through a filled fast-store entry, is single-copy atomic.
+//! Every other store in the tree is not — including that same core's store one
+//! instruction later if the block ended, the entry missed, or the instruction
+//! did not lift. Two engines therefore disagree about the same word, and so do
+//! two guest architectures. That is the shape a differential test between
+//! engines is least likely to catch, because each engine is self-consistent.
 //!
 //! ## What removing it would cost, measured
 //!
-//! Two shapes were built and timed on this host (release, best of five, four
-//! million operations, nanoseconds per access):
+//! Three shapes are built and timed by `tests/memory_model_costs.rs` (release,
+//! best of five, four million operations, nanoseconds per access):
 //!
 //! | | store 1 B | 2 B | 4 B | 8 B | load 1 B | 2 B | 4 B | 8 B |
 //! | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -62,29 +91,144 @@
 //! | `Vec<AtomicU64>`, sub-word writes by CAS | 3.86 | 4.05 | 4.24 | 1.55 | 0.65 | 0.72 | 1.03 | 1.53 |
 //! | `Vec<AtomicU8>` + a wide aligned atomic through a cast pointer | 1.34 | 1.34 | 1.40 | 1.40 | 1.22 | 1.27 | 1.31 | 1.35 |
 //!
-//! The safe one costs **+3 ns on every sub-word store** — against the ~25 ns a
-//! whole store through `SpaceView::write_span` measures, that is +12% on the
-//! hottest path in the emulator, paid by every board on every store to buy
-//! something only an opt-in mode can observe. The monitor's shape was decided
-//! by 1.6 ns; this is not close.
+//! Read the third row **per width**, not as an average. "Roughly cost-neutral"
+//! was the wrong summary: it is one instruction whatever the width, so it is
+//! dearer than today at one and two bytes and *cheaper* at four and eight —
+//! and at eight bytes it is cheaper by a third on a store and by 40% on a load.
+//! For a 64-bit guest, whose stores are mostly four and eight bytes wide, the
+//! wide shape is a **speed-up** that happens to also be correct.
 //!
-//! The cheap one is roughly cost-neutral (+0.6 ns on a byte access, −0.6 ns on
-//! an eight-byte one) and is the one that would actually be worth having — but
-//! it needs `unsafe` in this file, which is a design review rather than a
-//! commit (`CLAUDE.md`). Whether it is an **eighth** subsystem or the *first*
-//! one moving inside its own seam is a fair question: `ROADMAP.md` §0 sanctions
-//! "the RAM host-pointer fast path", [`RamStore::host_ptr`] is that seam, and
-//! today the dereference happens in generated code rather than in Rust. The
-//! harder half is soundness, not bookkeeping: mixed-size atomic access to one
-//! address is what the hardware does and what `host_ptr`'s consumers already
-//! rely on, but it is *outside* the Rust and C++ memory models rather than
-//! merely unchecked by them, and doing it from Rust puts both widths in front
-//! of the optimiser. Whoever takes it up should weigh that, not the
-//! nanoseconds.
+//! ### And the denominator, which was quoted rather than measured
 //!
-//! Neither is taken here. What changed is that the boundary is written down
-//! with a reproducer and a price on it instead of being an unexamined
-//! consequence of a type choice.
+//! "+3 ns is +12% of the hottest path in the emulator" divides by the wrong
+//! thing. `SpaceView::write_span` is not a path a guest executes; it is a piece
+//! of one, and the same test file now measures both:
+//!
+//! | | ns |
+//! | --- | --- |
+//! | the byte loop, four bytes | 1.3 |
+//! | one whole `AddressSpace::write`, four bytes | 24.8 |
+//! | one interpreted `mov [bx], eax` | 117 |
+//! | one interpreted `mov [bx], al` | 101 |
+//! | one interpreted `nop`, for scale | 56 |
+//!
+//! Against the instruction, the byte loop is ~1% and the CAS shape's +3 ns is
+//! **+2 to +3%** — not +12% of anything a guest runs. Both candidate fixes are
+//! affordable here, which was the thing in doubt.
+//!
+//! One case is *not* measured and should be before anyone spends the money: a
+//! compiled block whose store takes the **slow** path. An AArch64 or RISC-V
+//! block that inlines its stores never reaches this file and pays nothing; an
+//! x86 block reaches it for every store, and a compiled instruction is several
+//! times cheaper than an interpreted one, so the same three nanoseconds are a
+//! larger fraction there. That measurement needs the JIT and a lifted block,
+//! and it belongs with whoever implements a fix rather than with the file that
+//! prices one.
+//!
+//! ## Why the safe-looking shape is not the safe one
+//!
+//! `Vec<AtomicU64>` with sub-word writes by compare-exchange reads as the
+//! option with no `unsafe` in it, and inside this file it is. Two things are
+//! wrong with that reading.
+//!
+//! **It charges the most to the access that needed the fix least.** A one-byte
+//! store is already single-copy atomic and always was; under word cells it
+//! becomes a `lock cmpxchg` costing five times today's, spent entirely on not
+//! disturbing seven neighbours the byte representation kept apart for free.
+//!
+//! **It does not remove the mixed-size assumption, it hides it.** The JIT's
+//! inlined store writes one to eight bytes straight into the allocation
+//! through [`RamStore::host_ptr`]. Make the cells `AtomicU64` and that becomes
+//! a *narrow* machine store landing inside a cell the interpreter is
+//! read-modify-writing whole — mixed size, exactly as before, but now stated
+//! nowhere and reviewed by nobody, because one of the two accesses is machine
+//! code the compiler never sees. `jit::x86::rt`'s own `// SAFETY:` says "those
+//! bytes are `AtomicU8` … the emitted `mov` is the instruction a relaxed
+//! atomic byte store compiles to", and that sentence stops being true. Whoever
+//! takes this route owes `jit/` a re-review in the same change; it is not a
+//! `core/`-local edit.
+//!
+//! (The word CAS is at least not *lost-update* prone against that narrow
+//! store: a compare-exchange compares the whole word, so a neighbouring byte
+//! written between its load and its swap fails the compare and it retries.
+//! That was worth checking and it holds.)
+//!
+//! ## The `unsafe` question, stated for the design review
+//!
+//! The wide shape needs one `unsafe` block in this file: take
+//! `cells.as_ptr()`, offset it, cast to `AtomicU16`/`U32`/`U64`, and do one
+//! relaxed access. `CLAUDE.md` says an eighth sanctioned subsystem is a design
+//! review rather than a commit, so here is the case both ways.
+//!
+//! **For it being the first subsystem rather than an eighth.** `ROADMAP.md` §0
+//! sanctions "the RAM host-pointer fast path"; [`RamStore::host_ptr`] is that
+//! seam and it is *in this file*. The operation is the one the sanction names,
+//! on the bytes the sanction is about, under the three obligations `host_ptr`
+//! already writes down — and they are easier to discharge here than in the
+//! backend, because the store owns the allocation and can see the bounds. The
+//! tree already performs this exact access: `jit::x86` stores an aligned host
+//! word of the guest's width to these same bytes on every inlined store.
+//! Subsystems are counted by seam and not by file — `accel/sys.rs` and
+//! `accel/kvm.rs` are one subsystem across two files and seventeen sites — so
+//! this would be one seam across two.
+//!
+//! Two details make it sound and neither is obvious. **The alignment comes free
+//! from the KVM slack**: a `Vec<AtomicU8>` has layout alignment 1, so a
+//! naturally aligned *guest offset* would ordinarily say nothing at all about
+//! the host address — it is the [`HOST_PAGE`]` - 1` bytes of padding added so a
+//! store can be a memory slot that makes guest byte zero 4 KiB aligned, and
+//! therefore makes an aligned offset an aligned host address. And **the pointer
+//! has to come from `cells.as_ptr()`**, which carries whole-allocation
+//! provenance, rather than from `&cells[i]`, which carries one byte's; reading
+//! eight bytes through the latter is what would make the cast wrong rather than
+//! merely unusual.
+//!
+//! **Against, and this is what actually decides it.** The seven sanctioned
+//! sites are all "this pointer, lifetime or thread invariant is upheld by
+//! construction". This one is different in kind: *the language does not define
+//! it*. Eight `AtomicU8`s and one `AtomicU64` covering the same bytes are
+//! different memory locations that overlap, and the Rust and C++ models state
+//! the data-race rule per location; the hardware defines mixed-size access and
+//! the models decline to. Today the tree gets away with it because the two
+//! widths are in different translation units *by construction* — one of them is
+//! machine code LLVM never sees — so no optimiser can act on the overlap.
+//! Writing it in Rust puts both widths in front of the same optimiser for the
+//! first time. What that optimiser does today is checkable and was checked: one
+//! machine access per atomic access, no splitting, no merging, no forwarding
+//! across them, and `memory_model_costs`'s mixed-size litmus finds no illegal
+//! value in five million rounds. "What it does today" is the whole guarantee on
+//! offer, and it is not the same thing as a guarantee.
+//!
+//! And the sanctioned #1 lives in `jit/`, which is `std`, x86-64-only and
+//! feature-gated. This file is `core/`: never feature-gated, compiled for every
+//! target in the matrix including both wasm profiles, and on the path of every
+//! store of every board. That is a different blast radius for the same seam,
+//! and the ceiling `CLAUDE.md` sets is a ceiling on risk rather than on grep
+//! hits.
+//!
+//! ## What is not taken, and what would change the answer
+//!
+//! Neither shape is taken. `CLAUDE.md`'s test for an eighth subsystem is "what
+//! exactly is lost by refusing it?", and the seventh met that test because
+//! refusing it meant shipping a data-loss defect. Refusing here leaves a
+//! specification violation that **no shipped configuration can observe**:
+//! `Deterministic` is the default and structurally cannot tear, no machine file
+//! selects `Parallel`, `usermode` runs every guest thread on one host thread,
+//! and `Accel` performs the guest's accesses in silicon. Spending the project's
+//! eighth exemption on that is not the same trade the seventh was.
+//!
+//! The trigger that changes it is a configuration that runs guest cores on host
+//! threads *by default* — a board that selects `Parallel`, or `usermode`'s
+//! `ThreadSet` moving off one thread. At that moment "nothing shipped can
+//! observe it" stops being true, and the table above should be read again. When
+//! it is, prefer the **wide** shape: it makes every store in the tree perform
+//! the access an inlined AArch64 or RISC-V store already performs, which is one
+//! fewer way for two engines — and two guest architectures — to disagree rather
+//! than one more.
+//!
+//! What changed here is that the boundary has a reproducer, three re-derivable
+//! rows, the denominator they should be divided by, and an argument that does
+//! not depend on anyone's recollection of a number.
 //!
 //! # Why the allocation is host-page aligned
 //!
@@ -419,8 +563,17 @@ impl RamStore {
     /// same API without touching a single caller"*. Nothing in this crate
     /// dereferences the result from Rust — the one consumer is the x86-64 JIT
     /// backend, which bakes the address into generated machine code so that a
-    /// guest load becomes a mask, a compare, an add and a `mov`
+    /// guest access becomes a mask, a compare, an add and a `mov`
     /// (`ROADMAP.md` §9.1's first mechanism, *"inlined into generated code"*).
+    ///
+    /// That is a `mov` in **both** directions now: `jit::x86::compile`'s
+    /// `store` writes through the address and pays the dirty bit afterwards
+    /// through `FastMem::note_fast_store`. "Read-only" below is a rule about
+    /// this Rust API, not a description of what the generated code does — and
+    /// the inlined store being one aligned host instruction of the guest's
+    /// width is exactly why an inlined store, unlike an interpreted one, cannot
+    /// be seen in halves (see the module documentation's "It is the *store*
+    /// side that decides").
     ///
     /// Returning a raw pointer is itself safe; every obligation is on whoever
     /// reads through it, and there are three:

@@ -70,10 +70,29 @@ word — a value all three architectures forbid (*Intel SDM* volume 3 §9.1.1, A
 DDI 0487 B2.2.1, RISC-V Unprivileged ISA §1.4).
 `tests/smp_single_copy_atomicity.rs` catches it 117–361 times in sixty thousand
 loads, and catches the read half of a `LOCK XADD` torn the same way 90–138 times
-with the bus lock held throughout. It is also **engine-dependent**: a store the
-JIT inlines is one host instruction of the guest's width and does not tear.
-`core::space::store`'s "What per-byte atomicity is not" has the cost of the two
-ways to remove it and why neither was taken.
+with the bus lock held throughout. That second form is x86's; the tearing itself
+belongs to every architecture here, because an ordinary aligned load has no
+backstop on any of them.
+
+It follows the **store**, and it is narrower than "engine-dependent". An earlier
+version of this paragraph said "a store the JIT inlines is one host instruction
+of the guest's width and does not tear", which is true and misleads twice. A
+*load* the JIT inlines still comes back torn if the racing store went through
+the byte loop, because no reader can un-tear a store made in four pieces — so
+the guarantee follows whichever core is storing. And `jit::x86` is the *host*
+backend: inlining happens only where a core publishes `FastMem::store_plan`,
+which AArch64 and RISC-V do and **x86 does not**. An x86 guest inlines no memory
+access at all, so its stores tear in both engines, which is precisely the
+configuration `tests/smp_single_copy_atomicity.rs` measures.
+
+`core::space::store`'s "What per-byte atomicity is not" has three candidate
+shapes, all re-derivable from `tests/memory_model_costs.rs`, and why none was
+taken. The one correction worth repeating here is the price: "+12% of the store
+path" divided by `SpaceView::write_span` (≈25 ns), which is a fifth of an
+interpreted store instruction (≈117 ns) rather than a path a guest executes. The
+byte loop is ~1% of that instruction and full conformance costs +2–3% of it.
+Both fixes are affordable at that denominator; the question is the memory model,
+not the nanoseconds.
 
 **Not kept: barriers.** Every data barrier in the tree retires as a no-op —
 `DMB`/`DSB`, `FENCE`, `MFENCE`/`LFENCE`/`SFENCE`. `core::sync` has the analysis;
