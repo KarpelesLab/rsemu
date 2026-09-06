@@ -623,6 +623,15 @@ pub enum Fmt {
     VecShiftImm,
     /// `Vd.<Ta>, Vn.<Tb>, #shift` — a widening shift (`SSHLL`, `USHLL`).
     VecShiftLong,
+    /// The same shape with the shift **implied**: `SHLL`/`SHLL2`, whose only
+    /// legal amount is the source element's own width and which therefore
+    /// reads it out of `size` rather than out of an immediate field.
+    ///
+    /// A format of its own rather than a row of [`Fmt::VecShiftLong`] because
+    /// the two read different fields for the same operand: `SSHLL` takes the
+    /// element width from `immh` and the amount from `immh`:`immb`, and this
+    /// takes both from `size`.
+    VecShiftLongFixed,
     /// `Vd.<Tb>, Vn.<Ta>, #shift` — a narrowing shift (`SHRN`).
     VecShiftNarrow,
     /// `Vd.<Ta>, Vn.<Tb>, Vm.<Tb>` — a widening three-register operation
@@ -631,6 +640,16 @@ pub enum Fmt {
     /// `Vd.<Ta>, Vn.<Ta>, Vm.<Tb>` — the same with a wide first source
     /// (`UADDW`, `SSUBW`).
     VecThreeWide,
+    /// `Vd.<Tb>, Vn.<Ta>, Vm.<Ta>` — a **narrowing** three-register operation
+    /// (`ADDHN`, `RADDHN`, `SUBHN`, `RSUBHN`): both sources are twice the
+    /// destination's width, and `Q` picks the half of the *destination* that
+    /// is written, exactly as it does for [`Fmt::VecNarrow`].
+    ///
+    /// It shares an encoding group with [`Fmt::VecThreeDiff`] and reads the
+    /// same `size` field, and it is a separate format because that field
+    /// means the opposite thing: for `SADDL` it is the source width and for
+    /// `ADDHN` the destination's.
+    VecThreeNarrow,
     /// `Vd.<T>, Vn.<T>, Vm.<Ts>[index]` — an operation by a scalar element.
     VecByElem,
     /// `<V>d, <V>n, <V>m` — a scalar SIMD three-register operation, which is
@@ -649,6 +668,17 @@ pub enum Fmt {
     SimdScalarThreeSz,
     /// `<V>d, <V>n` with the width from `size`.
     SimdScalarTwoSz,
+    /// `<V>d, <V>n` where `<V>` is `S` or `D` from `sz` — the scalar
+    /// two-register-misc **floating-point** operations, of which this core
+    /// has the integer conversions.
+    ///
+    /// Not the same thing as the `SCVTF Dd, Xn` in the scalar floating-point
+    /// encoding, and that is the point: `SCVTF D0, D0` converts an integer
+    /// held in a *vector* register and never touches a general one, which is
+    /// what a compiler emits when the integer is already in `V0` — and is
+    /// where a Lua interpreter's number conversion stops on a core that has
+    /// only the general-register form.
+    SimdScalarCvtFp,
     /// `<Vb>d, <Va>n` — a narrowing scalar, whose destination width is `size`
     /// and whose source is one width wider (`SQXTN B0, H1`).
     SimdScalarNarrow,
@@ -736,8 +766,10 @@ impl Fmt {
             | Fmt::VecWiden
             | Fmt::VecShiftLong
             | Fmt::VecShiftNarrow
+            | Fmt::VecShiftLongFixed
             | Fmt::VecThreeDiff
-            | Fmt::VecThreeWide => Suffix::Wide,
+            | Fmt::VecThreeWide
+            | Fmt::VecThreeNarrow => Suffix::Wide,
             _ => Suffix::None,
         }
     }
@@ -1529,6 +1561,14 @@ a64! {
     0xbf20fc00 0x0e209000 SqdmlalVec "sqdmlal" VecThreeDiff AdvSimd "doubled signed multiply-accumulate into wider lanes, saturating";
     0xbf20fc00 0x0e20b000 SqdmlslVec "sqdmlsl" VecThreeDiff AdvSimd "doubled signed multiply-subtract from wider lanes, saturating";
     0xbf20fc00 0x0e20d000 SqdmullVec "sqdmull" VecThreeDiff AdvSimd "doubled signed multiply into wider lanes, saturating";
+    // The halving narrows. `U` is the *rounding* bit here rather than a
+    // signedness one, which is why there is no `UADDHN`: the top half of a
+    // two's-complement sum is the same bits whichever way the operands are
+    // read, so signedness has nothing left to select.
+    0xbf20fc00 0x0e204000 AddhnVec "addhn" VecThreeNarrow AdvSimd "add wide lanes and keep the top half of each";
+    0xbf20fc00 0x2e204000 RaddhnVec "raddhn" VecThreeNarrow AdvSimd "add wide lanes and keep the top half of each, rounding";
+    0xbf20fc00 0x0e206000 SubhnVec "subhn" VecThreeNarrow AdvSimd "subtract wide lanes and keep the top half of each";
+    0xbf20fc00 0x2e206000 RsubhnVec "rsubhn" VecThreeNarrow AdvSimd "subtract wide lanes and keep the top half of each, rounding";
 
     // -- Advanced SIMD: shift by an immediate --------------------------------
     0xbf80fc00 0x0f000400 SshrVec "sshr" VecShiftImm AdvSimd "shift lanes right, signed";
@@ -1553,6 +1593,7 @@ a64! {
     0xbf80fc00 0x2f009400 UqshrnVec "uqshrn" VecShiftNarrow AdvSimd "shift lanes right and narrow, saturating unsigned";
     0xbf80fc00 0x0f009c00 SqrshrnVec "sqrshrn" VecShiftNarrow AdvSimd "shift lanes right and narrow, rounding and saturating signed";
     0xbf80fc00 0x2f009c00 UqrshrnVec "uqrshrn" VecShiftNarrow AdvSimd "shift lanes right and narrow, rounding and saturating unsigned";
+    0xbf3ffc00 0x2e213800 ShllVec "shll" VecShiftLongFixed AdvSimd "shift lanes left into wider ones by the source's own width";
     0xbf80fc00 0x0f00a400 SshllVec "sshll" VecShiftLong AdvSimd "shift left signed into wider lanes";
     0xbf80fc00 0x2f00a400 UshllVec "ushll" VecShiftLong AdvSimd "shift left unsigned into wider lanes";
     0xbf80fc00 0x0f00e400 ScvtfFixVec "scvtf" VecShiftImm AdvSimd "convert signed fixed-point lanes to floating point";
@@ -1641,6 +1682,25 @@ a64! {
     0xff80fc00 0x7f009400 UqshrnScalar "uqshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, saturating unsigned";
     0xff80fc00 0x5f009c00 SqrshrnScalar "sqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating signed";
     0xff80fc00 0x7f009c00 UqrshrnScalar "uqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating unsigned";
+
+    // -- Advanced SIMD: the scalar integer conversions ------------------------
+    //
+    // The lanewise rows above applied to one lane, and every one of them is
+    // its vector encoding with `0Q` replaced by `01`. `SCVTF D0, D0` is the
+    // one a compiler reaches for most: an integer already in a vector
+    // register, converted without a trip through a general one.
+    0xffbffc00 0x5e21d800 ScvtfScalar "scvtf" SimdScalarCvtFp AdvSimd "convert a signed integer scalar to floating point";
+    0xffbffc00 0x7e21d800 UcvtfScalar "ucvtf" SimdScalarCvtFp AdvSimd "convert an unsigned integer scalar to floating point";
+    0xffbffc00 0x5ea1b800 FcvtzsScalar "fcvtzs" SimdScalarCvtFp AdvSimd "convert a scalar to a signed integer, toward zero";
+    0xffbffc00 0x7ea1b800 FcvtzuScalar "fcvtzu" SimdScalarCvtFp AdvSimd "convert a scalar to an unsigned integer, toward zero";
+    0xffbffc00 0x5e21a800 FcvtnsScalar "fcvtns" SimdScalarCvtFp AdvSimd "convert a scalar to a signed integer, ties to even";
+    0xffbffc00 0x7e21a800 FcvtnuScalar "fcvtnu" SimdScalarCvtFp AdvSimd "convert a scalar to an unsigned integer, ties to even";
+    0xffbffc00 0x5e21b800 FcvtmsScalar "fcvtms" SimdScalarCvtFp AdvSimd "convert a scalar to a signed integer, toward -infinity";
+    0xffbffc00 0x7e21b800 FcvtmuScalar "fcvtmu" SimdScalarCvtFp AdvSimd "convert a scalar to an unsigned integer, toward -infinity";
+    0xffbffc00 0x5ea1a800 FcvtpsScalar "fcvtps" SimdScalarCvtFp AdvSimd "convert a scalar to a signed integer, toward +infinity";
+    0xffbffc00 0x7ea1a800 FcvtpuScalar "fcvtpu" SimdScalarCvtFp AdvSimd "convert a scalar to an unsigned integer, toward +infinity";
+    0xffbffc00 0x5e21c800 FcvtasScalar "fcvtas" SimdScalarCvtFp AdvSimd "convert a scalar to a signed integer, ties away";
+    0xffbffc00 0x7e21c800 FcvtauScalar "fcvtau" SimdScalarCvtFp AdvSimd "convert a scalar to an unsigned integer, ties away";
 
     // -- Advanced SIMD: structure loads and stores ---------------------------
     0xbffff000 0x0c000000 St4Multi "st4" LdStStruct AdvSimd "store four-register structure";

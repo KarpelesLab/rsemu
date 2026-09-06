@@ -170,8 +170,8 @@ shares one page between processors, so both had to be taught to demultiplex on
 per-hart, the device tree generator already emitted a node per hart, and an
 **IPI is a store to a sibling's `msip` word** rather than a mechanism. The
 second hart is started through **SBI HSM** — the firmware's own hart state
-machine — rather than off a spin table this repository invents, which is what
-`arm64-virt-smp` has to do because PSCI `CPU_ON` is not implemented there. What
+machine — which is the RISC-V spelling of what `arm64-virt-smp` now does with
+PSCI `CPU_ON`. What
 it shares with both is the caveat: the exclusive monitor is still per core, so
 that boot is evidence about bring-up, interrupt delivery and IPIs and not about
 `lr`/`sc`.
@@ -247,11 +247,10 @@ quantum. That is luck about timing, not a property of the model.** Take every
 green SMP boot below as evidence that bring-up, register banking and IPIs work,
 and not as evidence that its atomics do.
 
-`docs/platforms/arm64-virt.md` has the ledger, and it is long: PSCI `CPU_ON` is
-not implemented, so the second core comes up off a spin table and cannot be
-turned off again — servicing one means reaching a *sibling* core from inside
-the one executing the `SMC`, and that page says exactly what the core would
-need; no RTC, so `date` starts at the epoch; `GICC_CTLR.EOImode` unimplemented;
+`docs/platforms/arm64-virt.md` has the ledger, and it is long: PSCI
+`CPU_SUSPEND` is refused rather than implemented (`CPU_ON`, `CPU_OFF` and
+`AFFINITY_INFO` are real, and are how the second core comes up); no RTC, so
+`date` starts at the epoch; `GICC_CTLR.EOImode` unimplemented;
 the `AT S1E1R` family unimplemented; `CLIDR_EL1` zero, so the guest sees no
 caches. And one honest lie: the board asserts `psci = "smc"` on a core with no
 EL3, which is the single place it tells a guest something its own

@@ -4223,3 +4223,936 @@ fn the_reserved_widths_of_the_saturating_group_are_undefined() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The halving narrows: `ADDHN`, `RADDHN`, `SUBHN`, `RSUBHN`
+// ---------------------------------------------------------------------------
+//
+// The group a real glibc stops on. Its `strlen` compares sixteen bytes with
+// `CMEQ`, folds the sixteen-byte mask down to eight with `ADDHN v2.8b, v1.8h,
+// v1.8h`, and moves the result to a general register — so every dynamically
+// linked program on this architecture executes it before it reaches `main`.
+//
+// Every word below is `llvm-mc -triple=aarch64`'s encoding of the assembly in
+// its doc comment.
+
+/// `addhn v0.8b, v1.8h, v2.8h`.
+const ADDHN_8B: u32 = 0x0e22_4020;
+/// `addhn2 v0.16b, v1.8h, v2.8h`.
+const ADDHN2_16B: u32 = 0x4e22_4020;
+/// `addhn v0.4h, v1.4s, v2.4s`.
+const ADDHN_4H: u32 = 0x0e62_4020;
+/// `addhn v0.2s, v1.2d, v2.2d`.
+const ADDHN_2S: u32 = 0x0ea2_4020;
+/// `addhn2 v0.4s, v1.2d, v2.2d`.
+const ADDHN2_4S: u32 = 0x4ea2_4020;
+/// `raddhn v0.8b, v1.8h, v2.8h`.
+const RADDHN_8B: u32 = 0x2e22_4020;
+/// `raddhn2 v0.16b, v1.8h, v2.8h`.
+const RADDHN2_16B: u32 = 0x6e22_4020;
+/// `raddhn v0.4h, v1.4s, v2.4s`.
+const RADDHN_4H: u32 = 0x2e62_4020;
+/// `subhn v0.8b, v1.8h, v2.8h`.
+const SUBHN_8B: u32 = 0x0e22_6020;
+/// `subhn2 v0.16b, v1.8h, v2.8h`.
+const SUBHN2_16B: u32 = 0x4e22_6020;
+/// `subhn v0.2s, v1.2d, v2.2d`.
+const SUBHN_2S: u32 = 0x0ea2_6020;
+/// `rsubhn v0.8b, v1.8h, v2.8h`.
+const RSUBHN_8B: u32 = 0x2e22_6020;
+/// `rsubhn2 v0.16b, v1.8h, v2.8h`.
+const RSUBHN2_16B: u32 = 0x6e22_6020;
+/// `rsubhn v0.2s, v1.2d, v2.2d`.
+const RSUBHN_2S: u32 = 0x2ea2_6020;
+/// `addhn v2.8b, v1.8h, v1.8h` — the word glibc's `strlen` stopped on.
+const ADDHN_STRLEN: u32 = 0x0e21_4022;
+
+/// Every halving-narrow word decodes, and to an Advanced SIMD row.
+#[test]
+fn the_halving_narrow_encodings_decode() {
+    let words = [
+        ADDHN_8B,
+        ADDHN2_16B,
+        ADDHN_4H,
+        ADDHN_2S,
+        ADDHN2_4S,
+        RADDHN_8B,
+        RADDHN2_16B,
+        RADDHN_4H,
+        SUBHN_8B,
+        SUBHN2_16B,
+        SUBHN_2S,
+        RSUBHN_8B,
+        RSUBHN2_16B,
+        RSUBHN_2S,
+        ADDHN_STRLEN,
+    ];
+    for word in words {
+        let insn = super::isa::decode(word, Features::ALL)
+            .unwrap_or_else(|| panic!("{word:08x} did not decode"));
+        assert_eq!(insn.feat, super::isa::Feat::AdvSimd, "{word:08x}");
+    }
+}
+
+/// ...and disassembles back to exactly the text `llvm-mc` printed.
+///
+/// The operand shapes are the point: `size` names the **destination** here and
+/// the sources are one width wider, which is the reverse of what the same
+/// field means for `SADDL` three rows above it in the same encoding group. A
+/// core that shared a helper between the two would print
+/// `addhn v0.8h, v1.8b, v2.8b` and be consistently wrong in both readers.
+#[test]
+fn the_disassembler_spells_the_halving_narrows() {
+    let cases: &[(u32, &str)] = &[
+        (ADDHN_8B, "addhn\tv0.8b, v1.8h, v2.8h"),
+        (ADDHN2_16B, "addhn2\tv0.16b, v1.8h, v2.8h"),
+        (ADDHN_4H, "addhn\tv0.4h, v1.4s, v2.4s"),
+        (ADDHN_2S, "addhn\tv0.2s, v1.2d, v2.2d"),
+        (ADDHN2_4S, "addhn2\tv0.4s, v1.2d, v2.2d"),
+        (RADDHN_8B, "raddhn\tv0.8b, v1.8h, v2.8h"),
+        (RADDHN2_16B, "raddhn2\tv0.16b, v1.8h, v2.8h"),
+        (RADDHN_4H, "raddhn\tv0.4h, v1.4s, v2.4s"),
+        (SUBHN_8B, "subhn\tv0.8b, v1.8h, v2.8h"),
+        (SUBHN2_16B, "subhn2\tv0.16b, v1.8h, v2.8h"),
+        (SUBHN_2S, "subhn\tv0.2s, v1.2d, v2.2d"),
+        (RSUBHN_8B, "rsubhn\tv0.8b, v1.8h, v2.8h"),
+        (RSUBHN2_16B, "rsubhn2\tv0.16b, v1.8h, v2.8h"),
+        (RSUBHN_2S, "rsubhn\tv0.2s, v1.2d, v2.2d"),
+        (ADDHN_STRLEN, "addhn\tv2.8b, v1.8h, v1.8h"),
+    ];
+    for (word, want) in cases {
+        let text = super::disasm::disassemble(*word, 0, Features::ALL).text;
+        assert_eq!(&text, want, "{word:08x}");
+    }
+}
+
+/// What the instruction computes: the **top** half of a sum of elements twice
+/// the destination's width.
+#[test]
+fn a_halving_narrow_keeps_the_top_half_of_the_sum() {
+    let h = simd(&[ADDHN_8B, ADDHN_4H, ADDHN_2S, SUBHN_8B]);
+    // 0x0180 + 0x0180 is 0x0300, whose top byte is 3. Keeping the *low* half
+    // would give 0, and shifting by the wrong amount would take the answer
+    // out of the wrong place — so the low half is deliberately non-zero.
+    h.cpu.set_v(1, 0x0180_0180_0180_0180_0180_0180_0180_0180);
+    h.cpu.set_v(2, 0x0180_0180_0180_0180_0180_0180_0180_0180);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0303_0303_0303_0303, "top half, and Q clear");
+
+    // The same rule one width up: 0x0001_8000 doubled is 0x0003_0000.
+    h.cpu.set_v(1, 0x0001_8000_0001_8000_0001_8000_0001_8000);
+    h.cpu.set_v(2, 0x0001_8000_0001_8000_0001_8000_0001_8000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0003_0003_0003_0003);
+
+    // And at the widest the group has: doubleword sources, word results.
+    h.cpu.set_v(1, 0x0000_0001_8000_0000_0000_0001_8000_0000);
+    h.cpu.set_v(2, 0x0000_0001_8000_0000_0000_0001_8000_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_0003_0000_0003);
+
+    // `SUBHN` is the same shape with the other operation: 0x0300 - 0x0180 is
+    // 0x0180, whose top byte is 1.
+    h.cpu.set_v(1, 0x0300_0300_0300_0300_0300_0300_0300_0300);
+    h.cpu.set_v(2, 0x0180_0180_0180_0180_0180_0180_0180_0180);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0101_0101_0101_0101);
+}
+
+/// The `R` forms add half a destination-element before taking the top half,
+/// and the `U` bit that selects that is **not** a signedness bit.
+///
+/// Both cases here distinguish the two: an implementation that read `U` the
+/// way every one of its neighbours in this encoding group reads it would
+/// compute `ADDHN` for `RADDHN` and be wrong by one on exactly these inputs.
+#[test]
+fn the_rounding_forms_round_and_the_rounding_constant_wraps() {
+    let h = simd(&[
+        ADDHN_8B, RADDHN_8B, ADDHN_8B, RADDHN_8B, SUBHN_8B, RSUBHN_8B,
+    ]);
+    // 0x0080 + 0x0100 is 0x0180: exactly half way, so truncation gives 1 and
+    // rounding gives 2.
+    h.cpu.set_v(1, 0x0080_0080_0080_0080_0080_0080_0080_0080);
+    h.cpu.set_v(2, 0x0100_0100_0100_0100_0100_0100_0100_0100);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0101_0101_0101_0101, "truncated");
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0202_0202_0202_0202, "rounded up");
+
+    // The rounding constant is added at the *wide* width and is allowed to
+    // wrap there. 0xffff + 0xffff is 0xfffe, whose top byte is 0xff; adding
+    // 0x80 wraps it to 0x007e, whose top byte is 0. A core that widened the
+    // sum to avoid the wrap would answer 0xff for both.
+    h.cpu.set_v(1, u128::MAX);
+    h.cpu.set_v(2, u128::MAX);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xffff_ffff_ffff_ffff, "wrapped, top byte 0xff");
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0,
+        "the rounding constant carried out of the top"
+    );
+
+    // `RSUBHN` rounds the same way: 0x0180 - 0x0100 is 0x0080, the half.
+    h.cpu.set_v(1, 0x0180_0180_0180_0180_0180_0180_0180_0180);
+    h.cpu.set_v(2, 0x0100_0100_0100_0100_0100_0100_0100_0100);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0, "truncated");
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0101_0101_0101_0101, "rounded up");
+}
+
+/// `Q` selects the half of the **destination** that is written and leaves the
+/// other alone — the `XTN2` rule, not the `UMULL2` one.
+#[test]
+fn the_two_forms_merge_into_the_top_half_and_keep_the_low_one() {
+    let h = simd(&[ADDHN_8B, ADDHN2_16B, RADDHN2_16B, SUBHN2_16B, RSUBHN2_16B]);
+    h.cpu.set_v(1, 0x0180_0180_0180_0180_0180_0180_0180_0180);
+    h.cpu.set_v(2, 0x0180_0180_0180_0180_0180_0180_0180_0180);
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0303_0303_0303_0303, "the top half is zeroed");
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0303_0303_0303_0303_0303_0303_0303_0303,
+        "the low half survives"
+    );
+    // The sources are read from the same place either way: `Q` is not an
+    // operand selector here, which is what separates this from `UMULL2`.
+    h.cpu.set_v(0, 0);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0) >> 64, 0x0303_0303_0303_0303);
+    assert_eq!(h.cpu.v(0) as u64, 0, "the low half is still what it was");
+    // And the two subtracting forms, of two equal operands, write zeros over
+    // the top half without disturbing the low one.
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(2);
+    assert_eq!(h.cpu.v(0), 0xffff_ffff_ffff_ffff);
+}
+
+/// None of the four saturates, so none of them may touch `FPSR.QC` — the same
+/// property the halving adds have and for the same reason: the top half of a
+/// sum cannot leave the destination's range.
+#[test]
+fn a_halving_narrow_never_raises_the_cumulative_flag() {
+    let h = simd(&[ADDHN_8B, RADDHN_8B, SUBHN_8B, RSUBHN_8B]);
+    h.cpu.set_v(1, u128::MAX);
+    h.cpu.set_v(2, u128::MAX);
+    h.steps(4);
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0, "no halving narrow sets QC");
+}
+
+/// `size == 0b11` would make the sources 128-bit elements, which the register
+/// file does not have. `llvm-mc` rejects these four words too.
+#[test]
+fn a_doubleword_destination_has_no_halving_narrow() {
+    for word in [ADDHN_8B, RADDHN_8B, SUBHN_8B, RSUBHN_8B] {
+        let reserved = word | (3 << 22);
+        let h = simd(&[reserved]);
+        h.steps(1);
+        assert_eq!(
+            h.cpu.sysregs().esr_el1 >> 26,
+            ec::UNKNOWN,
+            "{reserved:08x} should be UNDEFINED"
+        );
+    }
+}
+
+/// The idiom a real `strlen` uses, run as the library runs it: `CMEQ` over
+/// sixteen bytes, `ADDHN` to fold the mask to eight, and an `FMOV` out to a
+/// general register.
+///
+/// This is the whole reason the group is here, so the test is the sequence
+/// rather than the instruction: a nonzero answer means "one of these sixteen
+/// bytes was zero", and *which* byte it was has to survive the fold.
+#[test]
+fn the_strlen_idiom_folds_a_sixteen_byte_mask_to_eight() {
+    // `cmeq v1.16b, v0.16b, #0`, then the fold, then `fmov x2, d2`.
+    const CMEQ_ZERO_16B: u32 = 0x4e20_9801;
+    const FMOV_X2_D2: u32 = 0x9e66_0042;
+    // Twice, because the sequence is run twice below and this harness has no
+    // loop: the program is the tape and stepping past its end is not a rerun.
+    let h = simd(&[
+        CMEQ_ZERO_16B,
+        ADDHN_STRLEN,
+        FMOV_X2_D2,
+        CMEQ_ZERO_16B,
+        ADDHN_STRLEN,
+        FMOV_X2_D2,
+    ]);
+
+    // No zero byte anywhere: the mask is all clear and the fold is zero, which
+    // is what lets the loop take the next sixteen bytes.
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(3);
+    assert_eq!(h.cpu.v(1), 0, "nothing matched");
+    assert_eq!(h.cpu.v(2), 0);
+    assert_eq!(h.cpu.x(2), 0, "the loop continues");
+
+    // One zero byte, at index 5. `CMEQ` sets that byte to 0xff, and byte 5 is
+    // the *high* byte of halfword 2, so that halfword reads 0xff00; doubling
+    // it wraps to 0xfe00, whose top byte is 0xfe. The odd byte of a pair
+    // therefore folds to 0xfe and the even one to 0x01 — which is why the
+    // library's `rbit`/`clz` afterwards counts in *half*-byte steps, and why
+    // this assertion is on the exact value rather than on "nonzero".
+    h.cpu.set_v(0, !(0xffu128 << (5 * 8)));
+    h.steps(3);
+    assert_eq!(h.cpu.v(1), 0xffu128 << (5 * 8), "byte 5 matched");
+    let fold = h.cpu.x(2);
+    assert_ne!(fold, 0, "the loop stops");
+    assert_eq!(fold, 0xfe << (2 * 8), "and byte 2 of the fold says where");
+    assert_eq!(h.cpu.v(2), u128::from(fold), "the top half was zeroed");
+}
+
+// ---------------------------------------------------------------------------
+// PSCI `CPU_ON`: one core starting another
+// ---------------------------------------------------------------------------
+
+/// `smc #0`.
+const SMC0: u32 = 0xd400_0003;
+
+/// Two processors in one cluster, sharing one address space, the way a board
+/// builds them: identical but for `mpidr`, and only the first one `start`ed.
+fn cluster_pair(program: &[u32]) -> (Cpu, Cpu, Arc<RamStore>) {
+    cluster_pair_on("interp", program)
+}
+
+/// The same, on a named engine.
+///
+/// `CPU_ON` is applied at an instruction boundary in **two** places — the
+/// interpreter's `step` and the run loop's `advance` — and the translated
+/// engine reaches only the second. A mutation that removed it from `advance`
+/// survived every interpreter test there is, which is what this exists for.
+fn cluster_pair_on(engine: &str, program: &[u32]) -> (Cpu, Cpu, Arc<RamStore>) {
+    let hosts = Arc::new(crate::core::hosts::HostObjects::new());
+    let make = |mpidr: u64, start: bool| {
+        let props = Props::new()
+            .with("psci", "smc")
+            .with("cpus", 2u64)
+            .with("mpidr", mpidr)
+            .with("start", start)
+            .with("engine", engine)
+            .with_hosts(Arc::clone(&hosts));
+        Cpu::from_props(&props).expect("a core this board can build")
+    };
+    let ram = Arc::new(RamStore::new(RAM));
+    let space = AddressSpace::new("mem", 64);
+    space
+        .topology()
+        .map(Region::ram("ram", Arc::clone(&ram)), 0)
+        .expect("the map fits");
+    let space = Arc::new(space);
+    let boot = make(0x8000_0000, true);
+    let second = make(0x8000_0001, false);
+    boot.attach_space(Arc::clone(&space));
+    second.attach_space(space);
+    for (i, word) in program.iter().enumerate() {
+        for (b, byte) in word.to_le_bytes().iter().enumerate() {
+            ram.write_u8(4 * i as u64 + b as u64, *byte)
+                .expect("in range");
+        }
+    }
+    (boot, second, ram)
+}
+
+/// The whole of what `CPU_ON` buys, end to end: a processor that was not
+/// running is running, at the address the caller named, with the caller's
+/// context id in `X0`.
+///
+/// A spin table can do this much. What it cannot do is the state the started
+/// processor arrives in — the architectural reset state, `MMU` off, whatever
+/// the secondary was doing before discarded — and it cannot do `CPU_OFF` at
+/// all.
+#[test]
+fn cpu_on_starts_a_sibling_at_the_address_the_caller_named() {
+    // `SMC` everywhere the boot processor steps, and a `NOP` at 0x100 for the
+    // secondary to land on.
+    let mut program = [SMC0; 0x41];
+    program[0x40] = NOP;
+    let (boot, second, _ram) = cluster_pair(&program);
+
+    // A processor that has not been started retires nothing and charges
+    // nothing — it is not stalled, there is simply nothing running on it.
+    assert_eq!(second.step(), 0);
+    assert_eq!(second.pc(), 0, "still at its reset vector");
+
+    // `CPU_ON(0xc4000003, target = 1, entry = 0x100, context = 0xfeedface)`.
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, 0x100);
+    boot.set_x(3, 0xfeed_face);
+    boot.step();
+    assert_eq!(boot.x(0), 0, "PSCI_SUCCESS");
+    assert_eq!(boot.pc(), 4, "and the caller carries on");
+
+    // The target applies it at its *own* next instruction boundary, which is
+    // the whole point of the four atomics: nothing reached into it.
+    second.step();
+    assert_eq!(second.pc(), 0x104, "it ran the NOP at the entry point");
+    assert_eq!(second.x(0), 0xfeed_face, "with the context id in X0");
+    assert_eq!(second.el(), El::El1, "and in the architectural reset state");
+
+    // A second `CPU_ON` for a processor that is running.
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.step();
+    assert_eq!(boot.x(0) as i64, -4, "PSCI_ALREADY_ON");
+}
+
+/// `AFFINITY_INFO` used to be a constant `ON`. A kernel reads it in a loop
+/// after `CPU_ON` and after `CPU_OFF`, so a constant makes an offline
+/// processor look hung — and this is the sequence that shows both halves.
+#[test]
+fn affinity_info_follows_the_processor_it_is_asked_about() {
+    let (boot, second, _ram) = cluster_pair(&[SMC0, SMC0, SMC0, SMC0]);
+    let ask = |x1: u64| {
+        boot.set_x(0, 0xc400_0004);
+        boot.set_x(1, x1);
+        boot.step();
+        boot.x(0)
+    };
+    assert_eq!(ask(0), 0, "the boot processor is ON");
+    assert_eq!(ask(1), 1, "and the secondary is OFF");
+    let _ = &second;
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, 0x100);
+    boot.set_x(3, 0);
+    boot.step();
+    assert_eq!(ask(1), 0, "and ON once it has been started");
+}
+
+/// A `CPU_OFF` from the secondary stops it, and the boot processor sees it go
+/// — the half a spin table has no mechanism for at all.
+#[test]
+fn cpu_off_stops_a_secondary_and_the_boot_processor_may_not_stop_itself() {
+    let (boot, second, _ram) = cluster_pair(&[SMC0, SMC0, SMC0, SMC0]);
+    // Start the secondary at the `SMC` in the second word, with `CPU_OFF`'s
+    // own function id as the context — so the very first thing it does is
+    // switch itself off, which is also the tersest possible check that the
+    // context id really does arrive in `X0`.
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, 4);
+    boot.set_x(3, 0x8400_0002);
+    boot.step();
+    second.step();
+    assert_eq!(second.pc(), 8, "it started at 4 and retired the SMC there");
+    // ...and then nothing, ever again, until someone calls `CPU_ON`.
+    assert_eq!(second.step(), 0);
+    assert_eq!(second.pc(), 8);
+
+    // The boot processor is the last one running, so it is refused.
+    boot.set_x(0, 0x8400_0002);
+    boot.step();
+    assert_eq!(boot.x(0) as i64, -3, "PSCI_DENIED");
+
+    // And `CPU_ON` brings the secondary back, which is what a kernel's
+    // hotplug path does next.
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, 8);
+    boot.set_x(3, 7);
+    boot.step();
+    second.step();
+    // Running again, from the address the second `CPU_ON` named. `X0` is not
+    // checked here because the instruction it landed on is itself an `SMC`,
+    // which overwrote the context id with its own result — the context's
+    // arrival is asserted above, where the instruction it lands on is a
+    // `NOP`.
+    assert_eq!(second.pc(), 12);
+}
+
+/// A processor that is switched off consumes its scheduler budget and retires
+/// nothing.
+///
+/// Returning zero instead would look like a core that cannot make progress,
+/// and the machine's run loop would stop advancing the domain's clock — so a
+/// board with one parked secondary would run at whatever rate the *scheduler*
+/// felt like rather than at the rate the board declared.
+#[test]
+fn an_unpowered_core_consumes_its_budget_and_executes_nothing() {
+    let (_boot, second, _ram) = cluster_pair(&[NOP, NOP, NOP, NOP]);
+    assert_eq!(second.run_budget(1000), 1000, "the whole quantum");
+    assert_eq!(second.pc(), 0, "and not one instruction");
+    // The counter runs anyway: it is in the always-on domain, and a processor
+    // whose `CNTPCT_EL0` stood still while it was off would hand a kernel a
+    // timestamp behind every one of its siblings' the moment it started.
+    assert_eq!(second.cycles(), 1000, "but the counter advanced");
+    assert_eq!(second.run(1000), 1000);
+    assert_eq!(second.pc(), 0);
+    assert_eq!(second.cycles(), 2000);
+}
+
+/// The power state is architectural, so it round-trips through a snapshot: a
+/// machine saved before the kernel called `CPU_ON` restores with one
+/// processor running, not two.
+#[test]
+fn the_power_state_survives_a_snapshot() -> Result<()> {
+    let (boot, second, _ram) = cluster_pair(&[SMC0, NOP, NOP, NOP]);
+    // A `CPU_ON` that has been *asked for* and not yet applied is the state
+    // most easily lost: it lives in two atomics and a flag and in nothing the
+    // register file can see.
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, 4);
+    boot.set_x(3, 0x1234);
+    boot.step();
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version)?;
+        second.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    let restored = {
+        let hosts = Arc::new(crate::core::hosts::HostObjects::new());
+        let props = Props::new()
+            .with("psci", "smc")
+            .with("cpus", 2u64)
+            .with("mpidr", 0x8000_0001u64)
+            .with("start", false)
+            .with_hosts(hosts);
+        Cpu::from_props(&props)?
+    };
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
+    let mut cr = chunk.reader();
+    restored.load(&mut cr)?;
+    cr.end()?;
+    // The request survived: the restored core applies it at its next step,
+    // exactly as the original would have.
+    restored.attach_space(second.space().expect("a space"));
+    restored.step();
+    assert_eq!(restored.pc(), 8);
+    assert_eq!(restored.x(0), 0x1234);
+    Ok(())
+}
+
+/// Two processors with one `MPIDR_EL1` is a board that cannot mean anything.
+#[test]
+fn a_cluster_refuses_two_processors_with_one_affinity() {
+    let hosts = Arc::new(crate::core::hosts::HostObjects::new());
+    let props = || {
+        Props::new()
+            .with("mpidr", 0x8000_0001u64)
+            .with_hosts(Arc::clone(&hosts))
+    };
+    // Kept alive: the roster holds a `Weak`, so a core that has been dropped
+    // is not a core that occupies an affinity.
+    let _first = Cpu::from_props(&props()).expect("the first one joins");
+    let err = Cpu::from_props(&props()).expect_err("the affinity is taken");
+    assert!(alloc::format!("{err}").contains("already has"), "{err}");
+    // A different cluster is a different board, and the affinity is free
+    // there — which is what makes `cluster` a property rather than a global.
+    let other = Props::new()
+        .with("mpidr", 0x8000_0001u64)
+        .with("cluster", "other")
+        .with_hosts(hosts);
+    assert!(Cpu::from_props(&other).is_ok());
+}
+
+/// A restarted processor comes back in the **architectural reset state** — and
+/// its counter does not come back with it.
+///
+/// Two rules that pull in opposite directions and are both DDI 0487's. A warm
+/// boot is a reset as far as the register file, `PSTATE` and the translation
+/// registers are concerned, because the kernel's secondary entry point does
+/// its own setup and is entitled to assume nothing. But the system counter is
+/// in the **always-on power domain** (D11.1.2): it does not stop when a
+/// processor is switched off and it does not restart when one is switched on,
+/// so `CNTPCT_EL0` must not go backwards across a `CPU_OFF`/`CPU_ON` pair.
+///
+/// A mutation that dropped the reset survived the first version of these
+/// tests, because a secondary that has never run is already in the reset
+/// state — so this one dirties it first.
+#[test]
+fn a_restarted_processor_is_reset_but_its_counter_is_not() {
+    // `movz x1, #0x1234`, `msr tpidr_el0, x1`, then `SMC`s to switch off with.
+    let dirty = movz(1, 1, 0x1234, 0);
+    let stash = msr(key(SysReg::TpidrEl0), 1);
+    // The boot processor steps through the four `SMC`s at the bottom; the
+    // secondary's half starts at byte 16 and is what it is started into.
+    let (boot, second, _ram) = cluster_pair(&[SMC0, SMC0, SMC0, SMC0, dirty, stash, SMC0, SMC0]);
+
+    // Start it at byte 16 and let it dirty a general and a system register.
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, 16);
+    boot.set_x(3, 0);
+    boot.step();
+    second.step();
+    second.step();
+    assert_eq!(second.x(1), 0x1234);
+    assert_eq!(second.sysregs().tpidr_el0, 0x1234);
+    let counter = second.counter();
+
+    // Off, then on again somewhere else.
+    second.set_x(0, 0x8400_0002);
+    second.step();
+    assert_eq!(second.step(), 0, "off");
+    // While it is off the machine keeps running, and so does the counter.
+    second.run_budget(10_000);
+    assert!(
+        second.counter() >= counter,
+        "a switched-off processor's counter went backwards"
+    );
+    let counter = second.counter();
+
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, 28);
+    boot.set_x(3, 0);
+    boot.step();
+    second.step();
+    assert_eq!(second.x(1), 0, "the register file is back to reset");
+    assert_eq!(
+        second.sysregs().tpidr_el0,
+        0,
+        "and so are the system registers"
+    );
+    assert!(
+        second.counter() >= counter,
+        "but not the counter, which is in the always-on domain"
+    );
+}
+
+/// `CPU_ON` on the **translated** engine, which takes the other of the two
+/// routes into the core.
+///
+/// `Cpu::step` applies a pending start and so does `Cpu::advance`, and only
+/// the second is reachable when blocks are being translated: a run loop on
+/// that engine never calls `step` at all. Removing the call from `advance`
+/// passes every other test in this file.
+#[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+#[test]
+fn cpu_on_reaches_a_sibling_running_the_translated_engine() {
+    // `movz x9, #0x2a` at the entry point, then a branch to itself: enough for
+    // the engine to lift a block, and something the register file can show.
+    let entry = 0x100u64;
+    let mut program = [SMC0; 0x42];
+    program[0x40] = movz(1, 9, 0x2a, 0);
+    program[0x41] = b(0);
+    let (boot, second, _ram) = cluster_pair_on("jit", &program);
+    assert_eq!(second.engine(), super::Engine::Jit);
+
+    assert_eq!(
+        second.run_budget(1000),
+        1000,
+        "off, and consuming its budget"
+    );
+    assert_eq!(second.pc(), 0);
+
+    boot.set_x(0, 0xc400_0003);
+    boot.set_x(1, 1);
+    boot.set_x(2, entry);
+    boot.set_x(3, 0x5a);
+    // One instruction on the boot processor: a budget would run several
+    // `SMC`s and the last one's result is what `X0` would hold.
+    boot.step();
+    assert_eq!(boot.x(0), 0, "PSCI_SUCCESS");
+
+    // The run loop, not `step`: this is the path the mutation removed.
+    second.run_budget(4000);
+    assert_eq!(second.x(9), 0x2a, "it ran the code CPU_ON pointed it at");
+    assert_eq!(second.x(0), 0x5a, "with the context id in X0");
+}
+
+// ---------------------------------------------------------------------------
+// The scalar integer conversions, and `SHLL`
+// ---------------------------------------------------------------------------
+//
+// Two more groups chosen the way the halving narrows were: by what real
+// software executes. A Lua interpreter's number conversion stops on
+// `SCVTF D0, D0` — an integer already in a *vector* register, converted
+// without a trip through a general one, which is a different encoding from the
+// `SCVTF Dd, Xn` this core has always had — and `sha256sum` out of suckless
+// `sbase` stops on `SHLL v18.4s, v4.4h, #16`.
+//
+// Every word below is `llvm-mc -triple=aarch64`'s encoding of the assembly in
+// its doc comment.
+
+/// `scvtf d0, d1`.
+const SCVTF_D: u32 = 0x5e61_d820;
+/// `scvtf s0, s1`.
+const SCVTF_S: u32 = 0x5e21_d820;
+/// `ucvtf d0, d1`.
+const UCVTF_D: u32 = 0x7e61_d820;
+/// `ucvtf s0, s1`.
+const UCVTF_S: u32 = 0x7e21_d820;
+/// `fcvtzs d0, d1`.
+const FCVTZS_D: u32 = 0x5ee1_b820;
+/// `fcvtzs s0, s1`.
+const FCVTZS_S: u32 = 0x5ea1_b820;
+/// `fcvtzu s0, s1`.
+const FCVTZU_S: u32 = 0x7ea1_b820;
+/// `fcvtns s0, s1`.
+const FCVTNS_S: u32 = 0x5e21_a820;
+/// `fcvtnu d0, d1`.
+const FCVTNU_D: u32 = 0x7e61_a820;
+/// `fcvtms s0, s1`.
+const FCVTMS_S: u32 = 0x5e21_b820;
+/// `fcvtmu d0, d1`.
+const FCVTMU_D: u32 = 0x7e61_b820;
+/// `fcvtps s0, s1`.
+const FCVTPS_S: u32 = 0x5ea1_a820;
+/// `fcvtpu d0, d1`.
+const FCVTPU_D: u32 = 0x7ee1_a820;
+/// `fcvtas s0, s1`.
+const FCVTAS_S: u32 = 0x5e21_c820;
+/// `fcvtau d0, d1`.
+const FCVTAU_D: u32 = 0x7e61_c820;
+/// `scvtf d0, d0` — the word a Lua interpreter stopped on.
+const SCVTF_LUA: u32 = 0x5e61_d800;
+
+/// `shll v0.8h, v1.8b, #8`.
+const SHLL_8H: u32 = 0x2e21_3820;
+/// `shll2 v0.8h, v1.16b, #8`.
+const SHLL2_8H: u32 = 0x6e21_3820;
+/// `shll v0.4s, v1.4h, #16`.
+const SHLL_4S: u32 = 0x2e61_3820;
+/// `shll2 v0.4s, v1.8h, #16`.
+const SHLL2_4S: u32 = 0x6e61_3820;
+/// `shll v0.2d, v1.2s, #32`.
+const SHLL_2D: u32 = 0x2ea1_3820;
+/// `shll2 v0.2d, v1.4s, #32`.
+const SHLL2_2D: u32 = 0x6ea1_3820;
+/// `shll v18.4s, v4.4h, #16` — the word `sha256sum` stopped on.
+const SHLL_SHA256: u32 = 0x2e61_3892;
+
+/// Every word decodes, and to an Advanced SIMD row.
+#[test]
+fn the_scalar_conversion_and_shll_encodings_decode() {
+    let words = [
+        SCVTF_D,
+        SCVTF_S,
+        UCVTF_D,
+        UCVTF_S,
+        FCVTZS_D,
+        FCVTZS_S,
+        FCVTZU_S,
+        FCVTNS_S,
+        FCVTNU_D,
+        FCVTMS_S,
+        FCVTMU_D,
+        FCVTPS_S,
+        FCVTPU_D,
+        FCVTAS_S,
+        FCVTAU_D,
+        SCVTF_LUA,
+        SHLL_8H,
+        SHLL2_8H,
+        SHLL_4S,
+        SHLL2_4S,
+        SHLL_2D,
+        SHLL2_2D,
+        SHLL_SHA256,
+    ];
+    for word in words {
+        let insn = super::isa::decode(word, Features::ALL)
+            .unwrap_or_else(|| panic!("{word:08x} did not decode"));
+        assert_eq!(insn.feat, super::isa::Feat::AdvSimd, "{word:08x}");
+    }
+}
+
+/// ...and disassembles back to exactly the text `llvm-mc` printed.
+///
+/// `SHLL`'s amount is the interesting column: it is not in the encoding at
+/// all — the architecture allocates only "the source element's own width" —
+/// so the disassembler prints what `size` implies, and a core that read an
+/// immediate field would print whatever happened to be in `Rm`.
+#[test]
+fn the_disassembler_spells_the_scalar_conversions_and_shll() {
+    let cases: &[(u32, &str)] = &[
+        (SCVTF_D, "scvtf\td0, d1"),
+        (SCVTF_S, "scvtf\ts0, s1"),
+        (UCVTF_D, "ucvtf\td0, d1"),
+        (UCVTF_S, "ucvtf\ts0, s1"),
+        (FCVTZS_D, "fcvtzs\td0, d1"),
+        (FCVTZS_S, "fcvtzs\ts0, s1"),
+        (FCVTZU_S, "fcvtzu\ts0, s1"),
+        (FCVTNS_S, "fcvtns\ts0, s1"),
+        (FCVTNU_D, "fcvtnu\td0, d1"),
+        (FCVTMS_S, "fcvtms\ts0, s1"),
+        (FCVTMU_D, "fcvtmu\td0, d1"),
+        (FCVTPS_S, "fcvtps\ts0, s1"),
+        (FCVTPU_D, "fcvtpu\td0, d1"),
+        (FCVTAS_S, "fcvtas\ts0, s1"),
+        (FCVTAU_D, "fcvtau\td0, d1"),
+        (SCVTF_LUA, "scvtf\td0, d0"),
+        (SHLL_8H, "shll\tv0.8h, v1.8b, #8"),
+        (SHLL2_8H, "shll2\tv0.8h, v1.16b, #8"),
+        (SHLL_4S, "shll\tv0.4s, v1.4h, #16"),
+        (SHLL2_4S, "shll2\tv0.4s, v1.8h, #16"),
+        (SHLL_2D, "shll\tv0.2d, v1.2s, #32"),
+        (SHLL2_2D, "shll2\tv0.2d, v1.4s, #32"),
+        (SHLL_SHA256, "shll\tv18.4s, v4.4h, #16"),
+    ];
+    for (word, want) in cases {
+        let text = super::disasm::disassemble(*word, 0, Features::ALL).text;
+        assert_eq!(&text, want, "{word:08x}");
+    }
+}
+
+/// The conversion itself, at both widths and both signednesses.
+///
+/// The `S` cases are where a core that read the wrong width goes wrong
+/// quietly: `SCVTF S0, S1` converts the **32-bit** integer in `S1`, so
+/// `0xffffffff` is -1 and not 4294967295 — and `UCVTF` on the same bits is
+/// 4294967295, which is the pair that pins both the width and the sign.
+#[test]
+fn a_scalar_conversion_reads_the_width_its_encoding_names() {
+    let h = simd(&[SCVTF_D, SCVTF_S, UCVTF_S, UCVTF_D]);
+    h.cpu.set_v(1, 5);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from(d(5.0)), "the doubleword integer 5");
+
+    h.cpu.set_v(1, 0xffff_ffff);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from((-1.0f32).to_bits()), "-1 as a word");
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        u128::from(4_294_967_295.0f32.to_bits()),
+        "and 4294967295 unsigned"
+    );
+
+    // The doubleword unsigned form, on a value whose top bit is set.
+    h.cpu.set_v(1, 1u128 << 63);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from(d(9_223_372_036_854_775_808.0)));
+}
+
+/// Every rounding mode the group spells, on the one input that tells them
+/// apart, plus the tie that separates `FCVTNS` from `FCVTAS`.
+#[test]
+fn the_rounding_modes_of_the_scalar_conversions_differ_where_they_should() {
+    let h = simd(&[FCVTZS_S, FCVTNS_S, FCVTMS_S, FCVTPS_S, FCVTAS_S]);
+    // 2.5: toward zero 2, ties-to-even 2, toward -inf 2, toward +inf 3,
+    // ties-away 3. A single mode used for all five would agree on four of
+    // them and be wrong on one, whichever it was.
+    let want = [2u128, 2, 2, 3, 3];
+    for (n, expect) in want.iter().enumerate() {
+        h.cpu.set_v(1, u128::from(2.5f32.to_bits()));
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), *expect, "instruction {n}");
+    }
+    // And -2.5, where toward -inf and toward zero part company.
+    let h = simd(&[FCVTZS_S, FCVTNS_S, FCVTMS_S, FCVTPS_S, FCVTAS_S]);
+    let want: [i32; 5] = [-2, -2, -3, -2, -3];
+    for (n, expect) in want.iter().enumerate() {
+        h.cpu.set_v(1, u128::from((-2.5f32).to_bits()));
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), u128::from(*expect as u32), "instruction {n}");
+    }
+    // 3.5 is the input that separates **toward zero** from ties-to-even,
+    // which 2.5 cannot: an even tie rounds down either way there, so a
+    // `FCVTZS` implemented with the wrong mode agrees on every case above.
+    let h = simd(&[FCVTZS_S, FCVTNS_S, FCVTMS_S, FCVTPS_S, FCVTAS_S]);
+    let want = [3u128, 4, 3, 4, 4];
+    for (n, expect) in want.iter().enumerate() {
+        h.cpu.set_v(1, u128::from(3.5f32.to_bits()));
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), *expect, "instruction {n}");
+    }
+    // The unsigned halves are separate rows with separate modes, and 3.5
+    // separates them too: a `FCVTZU` that rounded to nearest would agree with
+    // `FCVTNU` everywhere the signed cases above look.
+    let h = simd(&[FCVTZU_S, FCVTNU_D]);
+    h.cpu.set_v(1, u128::from(3.5f32.to_bits()));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 3, "FCVTZU truncates");
+    h.cpu.set_v(1, u128::from(d(3.5)));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 4, "and FCVTNU rounds to even");
+}
+
+/// A scalar destination is written at its own width and **zeroes the rest of
+/// the register**, which is the rule for every scalar SIMD result and the one
+/// a `write` that merged would break silently.
+#[test]
+fn a_scalar_conversion_zeroes_the_rest_of_its_destination() {
+    let h = simd(&[SCVTF_S, FCVTZU_S]);
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 1);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from(1.0f32.to_bits()));
+    // ...and the unsigned convert-to-integer of a negative number clamps at
+    // zero and raises `Invalid`, which is `fp::to_int`'s rule rather than
+    // this group's — asserted here because this is the first encoding that
+    // reaches it with a scalar operand.
+    h.cpu.set_v(1, u128::from((-1.0f32).to_bits()));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0);
+    assert_ne!(h.cpu.sysregs().fpsr & 1, 0, "FPSR.IOC");
+}
+
+/// `SHLL` puts each source element into the **top** half of a destination
+/// element twice as wide, which is what shifting left by the source's own
+/// width means.
+#[test]
+fn shll_moves_each_lane_into_the_top_half_of_a_wider_one() {
+    let h = simd(&[SHLL_8H, SHLL_4S, SHLL_2D]);
+    h.cpu.set_v(1, 0x0102_0304_0506_0708);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0100_0200_0300_0400_0500_0600_0700_0800);
+
+    h.cpu.set_v(1, 0x0001_0002_0003_0004);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0001_0000_0002_0000_0003_0000_0004_0000);
+
+    h.cpu.set_v(1, 0x0000_0001_ffff_ffff);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0000_0001_0000_0000_ffff_ffff_0000_0000,
+        "unsigned: the top word is not sign-extended"
+    );
+}
+
+/// `Q` selects the half of the **source** — the `UMULL2` rule, not the
+/// `XTN2` one — and the destination is written whole either way.
+#[test]
+fn shll2_reads_the_top_half_of_its_source() {
+    let h = simd(&[SHLL_8H, SHLL2_8H, SHLL2_4S, SHLL2_2D]);
+    let source = 0x1112_1314_1516_1718_0102_0304_0506_0708u128;
+    h.cpu.set_v(1, source);
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0100_0200_0300_0400_0500_0600_0700_0800,
+        "the low eight bytes"
+    );
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x1100_1200_1300_1400_1500_1600_1700_1800,
+        "and the top eight"
+    );
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x1112_0000_1314_0000_1516_0000_1718_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x1112_1314_0000_0000_1516_1718_0000_0000);
+}
+
+/// `size == 0b11` would make the destination a 128-bit element, which does
+/// not exist. `llvm-mc` rejects these words too.
+#[test]
+fn a_quadword_destination_has_no_shll() {
+    for word in [SHLL_8H, SHLL2_8H] {
+        let reserved = word | (3 << 22);
+        let h = simd(&[reserved]);
+        h.steps(1);
+        assert_eq!(
+            h.cpu.sysregs().esr_el1 >> 26,
+            ec::UNKNOWN,
+            "{reserved:08x} should be UNDEFINED"
+        );
+    }
+}

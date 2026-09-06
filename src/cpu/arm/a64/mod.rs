@@ -122,9 +122,9 @@
 //! # What is deliberately absent
 //!
 //! The reciprocal-estimate family, polynomial multiply, the pairwise long
-//! adds, the halving-narrow three-different group (`ADDHN` and relatives), and
-//! the by-element multiplies other than the four already here — including the
-//! saturating by-element forms. `FEAT_FP16` arithmetic (half precision exists
+//! adds, the absolute-difference-long group, `FCVTXN`, and the by-element
+//! multiplies other than the four already here — including the saturating
+//! by-element forms. `FEAT_FP16` arithmetic (half precision exists
 //! here only as a conversion format, which is Armv8.0-A), EL2 and EL3 (so
 //! `HVC` and `SMC` are `UNDEFINED`, and so `CNTVOFF_EL2` does not exist and
 //! the virtual count equals the physical one), AArch32 at any level, the
@@ -187,6 +187,33 @@
 //! predate the group (this core prints a modified immediate in hex, and spells
 //! `MVN` as the `NOT` the encoding names). The sweep is also what named the
 //! four scalar shifts `SSHL`/`USHL`/`SRSHL`/`URSHL`, which were missing.
+//!
+//! The **three-different** group was swept the same way when the halving
+//! narrows landed: every `Q`, `U`, `size` and `opcode` of it over four
+//! register triples, plus every one- and two-bit flip of the four new rows'
+//! canonical words — 2 800 words, **nothing this core accepts that `llvm-mc`
+//! rejects**, and all 756 words in the halving-narrow family disassembling to
+//! `llvm-mc`'s own text. The 185 words `llvm-mc` decodes and this core does
+//! not are that group's remaining deliberate absences: `SABAL`, `SABDL`,
+//! `UABAL`, `UABDL`, `PMULL`, `SADALP`/`UADALP` and the by-element
+//! `SMLSL`/`UMLSL`.
+//!
+//! The **two-register-misc** encodings, vector and scalar, were swept the
+//! same way when `SHLL` and the scalar integer conversions landed: every `Q`,
+//! `U`, `size` and `opcode` of both over four register pairs, plus every one-
+//! and two-bit flip of five canonical words — 5 388 words, nothing this core
+//! accepts that `llvm-mc` rejects, and all 719 words `llvm-mc` calls `SHLL`
+//! or one of the twelve conversions disassembling to its own text. The 248
+//! it decodes and this core does not are that group's remaining deliberate
+//! absences: the reciprocal estimates, the pairwise long adds, `FMULX`,
+//! `FCVTXN` and the `SQDMULL` family's by-element forms.
+//!
+//! That sweep is also where this round's harness trap was, and it is a third
+//! one worth writing beside the other two: `ESR_EL1.EC` is **zero for an
+//! UNDEFINED instruction and zero for a core that never took an exception at
+//! all**, so a sweep that reads `EC` alone calls every refusal an acceptance.
+//! It reported 1 066 phantom over-acceptances before the discriminator became
+//! "`ESR_EL1` is nonzero *and* its `EC` is zero".
 //!
 //! # Timing
 //!
@@ -372,13 +399,24 @@ pub struct Config {
     /// that it has firmware behind that instruction; [`psci`] argues the case
     /// and says what the honest alternative would have cost.
     pub psci: psci::Conduit,
-    /// How many processors the machine has, for `CPU_ON` and `AFFINITY_INFO`.
+    /// How many processors the machine has, for `CPU_ON` and `AFFINITY_INFO`
+    /// on a board whose processors are **not** on a [`psci::Cluster`].
     ///
-    /// A core cannot see its siblings, so this is the board telling it how
-    /// many there are — which is the same fact `arm.boot` puts in the device
-    /// tree, and the only thing that makes `CPU_ON` for processor 1 an honest
-    /// answer rather than a guess.
+    /// A core on no roster cannot see its siblings, so this is the board
+    /// telling it how many there are — which is the same fact `arm.boot` puts
+    /// in the device tree, and the only thing that makes `CPU_ON` for
+    /// processor 1 an honest answer rather than a guess. A board that gives
+    /// its cores a `cluster` gets the real answer and this is unused.
     pub cpus: u64,
+    /// Whether this processor comes out of reset **running**.
+    ///
+    /// True for a boot processor, and false for every secondary on a board
+    /// that brings them up with PSCI `CPU_ON`: that is what "off" means, and
+    /// a core that is not running consumes its scheduler budget and retires
+    /// nothing. A board that boots its secondaries off a spin table leaves
+    /// this true, because on such a board they really are running — in a
+    /// parking loop in the boot ROM.
+    pub start: bool,
 }
 
 impl Config {
@@ -439,6 +477,7 @@ impl Config {
             requester: RequesterId::ANONYMOUS,
             psci: psci::Conduit::None,
             cpus: 1,
+            start: true,
         }
     }
 
@@ -598,12 +637,19 @@ impl Default for Config {
     }
 }
 
-/// The interrupt inputs and the reset request, outside the execution lock.
+/// The interrupt inputs, the reset request, and the power state, outside the
+/// execution lock.
 ///
 /// Atomics rather than fields of the session, for the same reason the RISC-V
 /// core keeps its lines outside: a device raising `IRQ` from inside a write
 /// the core itself issued must not re-enter the core's own critical section.
-#[derive(Debug, Default)]
+///
+/// **A sibling processor is the second sender.** PSCI `CPU_ON` is a core
+/// changing *another* core's state while holding its own `BUS`-ranked
+/// execution lock, which is exactly the requirement this type already existed
+/// for — so the four cells it needs are here, and nothing takes the target's
+/// lock at all. See [`psci::Cluster`].
+#[derive(Debug)]
 pub struct Lines {
     pending: AtomicU64,
     reset: AtomicBool,
@@ -624,6 +670,55 @@ pub struct Lines {
     /// The level each of those two outputs is currently at, sampled at the end
     /// of every step so the wire can be driven with no lock held.
     timer_level: AtomicU64,
+    /// Whether this processor is running at all.
+    ///
+    /// True out of reset for a boot processor and false for one a machine
+    /// file declared `start = false`; `CPU_ON` sets it and `CPU_OFF` clears
+    /// it. A core that is not powered consumes its scheduler budget and
+    /// retires nothing.
+    powered: AtomicBool,
+    /// Where a pending `CPU_ON` says to start, and what to put in `X0`.
+    start_entry: AtomicU64,
+    /// The context id a pending `CPU_ON` passes in `X0` (DEN 0022 §5.1.3).
+    start_context: AtomicU64,
+    /// Whether [`start_entry`](Lines::start_entry) is waiting to be applied.
+    ///
+    /// Separate from `powered` because the two are set by the sender in one
+    /// order and read by the target in another: `powered` is what a sibling's
+    /// `AFFINITY_INFO` sees immediately, and this is what the target itself
+    /// consumes once, at an instruction boundary.
+    start_pending: AtomicBool,
+    /// The cluster this core's siblings are on, if the board gave it one.
+    ///
+    /// Held here rather than on [`Cpu`] because this is the object the
+    /// interpreter already has a reference to when it services an `SMC`, and
+    /// threading a second one through `Exec` would have cost every caller of
+    /// `Exec::new` an argument for the sake of one instruction. The roster
+    /// holds `Weak<Lines>` back, so there is no cycle.
+    cluster: Option<Arc<psci::Cluster>>,
+}
+
+impl Default for Lines {
+    /// A processor that is **running**, which is what every board that does
+    /// not say otherwise means.
+    ///
+    /// Written out rather than derived because `AtomicBool::default()` is
+    /// false, and a derived `Default` would have silently switched every
+    /// existing board off.
+    fn default() -> Lines {
+        Lines {
+            pending: AtomicU64::new(0),
+            reset: AtomicBool::new(false),
+            power: AtomicU32::new(0),
+            timer_routed: AtomicU64::new(0),
+            timer_level: AtomicU64::new(0),
+            powered: AtomicBool::new(true),
+            start_entry: AtomicU64::new(0),
+            start_context: AtomicU64::new(0),
+            start_pending: AtomicBool::new(false),
+            cluster: None,
+        }
+    }
 }
 
 impl Lines {
@@ -710,6 +805,86 @@ impl Lines {
     #[must_use]
     pub fn timer_level(&self) -> u64 {
         self.timer_level.load(Ordering::Relaxed)
+    }
+
+    /// Whether this processor is running.
+    #[must_use]
+    pub fn powered(&self) -> bool {
+        self.powered.load(Ordering::Acquire)
+    }
+
+    /// Switch this processor on or off directly, which is what a reset and a
+    /// snapshot restore do.
+    pub fn set_powered(&self, on: bool) {
+        self.powered.store(on, Ordering::Release);
+    }
+
+    /// `CPU_OFF`: stop this processor. It notices at its next instruction
+    /// boundary and retires nothing after that.
+    pub fn power_off(&self) {
+        self.powered.store(false, Ordering::Release);
+    }
+
+    /// `CPU_ON`: start this processor at `entry` with `context` in `X0`.
+    ///
+    /// The order matters and is `Release`-ordered for it: the entry point and
+    /// the context are stored **before** `start_pending`, which is stored
+    /// before `powered`. A target that saw `powered` first and `start_pending`
+    /// later would run one instruction from wherever it happened to be
+    /// pointing — which, out of reset, is the boot processor's own reset
+    /// vector.
+    pub fn request_start(&self, entry: u64, context: u64) {
+        self.start_entry.store(entry, Ordering::Relaxed);
+        self.start_context.store(context, Ordering::Relaxed);
+        self.start_pending.store(true, Ordering::Release);
+        self.powered.store(true, Ordering::Release);
+    }
+
+    /// Take a pending start, clearing it: the entry point and the context id.
+    ///
+    /// A relaxed **load** before the read-modify-write, because this is asked
+    /// once per interpreted instruction and an uncontended `swap` is still a
+    /// locked operation on the hosts that have one. The load can only be
+    /// stale in the direction that costs nothing: a start that arrived a
+    /// nanosecond ago is applied one instruction later.
+    pub fn take_start(&self) -> Option<(u64, u64)> {
+        if !self.start_pending.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !self.start_pending.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        Some((
+            self.start_entry.load(Ordering::Relaxed),
+            self.start_context.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// The whole power state, for a snapshot: powered, pending, entry,
+    /// context.
+    #[must_use]
+    pub fn power_state(&self) -> (bool, bool, u64, u64) {
+        (
+            self.powered.load(Ordering::Relaxed),
+            self.start_pending.load(Ordering::Relaxed),
+            self.start_entry.load(Ordering::Relaxed),
+            self.start_context.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Put it back, which is what a restore does.
+    pub fn set_power_state(&self, state: (bool, bool, u64, u64)) {
+        let (powered, pending, entry, context) = state;
+        self.start_entry.store(entry, Ordering::Relaxed);
+        self.start_context.store(context, Ordering::Relaxed);
+        self.start_pending.store(pending, Ordering::Release);
+        self.powered.store(powered, Ordering::Release);
+    }
+
+    /// The roster this core's siblings are on, if the board gave it one.
+    #[must_use]
+    pub fn cluster(&self) -> Option<&Arc<psci::Cluster>> {
+        self.cluster.as_ref()
     }
 }
 
@@ -857,9 +1032,29 @@ impl Cpu {
     /// until [`attach_space`](Cpu::attach_space) and [`Device::realize`].
     #[must_use]
     pub fn new(cfg: Config) -> Cpu {
+        Cpu::new_in_cluster(cfg, None)
+    }
+
+    /// The same, on a board whose processors can see each other.
+    ///
+    /// The roster is handed in at construction rather than attached later
+    /// because it lives on [`Lines`], which is behind an `Arc` from the first
+    /// line of this function — and because a core that joined its cluster
+    /// after the machine started running would be a processor `CPU_ON` could
+    /// miss.
+    ///
+    /// It registers **nothing**: joining the roster is the caller's, because
+    /// only the caller knows whether the affinity it would register under is
+    /// already taken. See [`Cpu::from_props`].
+    #[must_use]
+    pub fn new_in_cluster(cfg: Config, cluster: Option<Arc<psci::Cluster>>) -> Cpu {
         Cpu {
             engine: Engine::Interp,
-            lines: Arc::new(Lines::default()),
+            lines: Arc::new(Lines {
+                powered: AtomicBool::new(cfg.start),
+                cluster,
+                ..Lines::default()
+            }),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -900,6 +1095,12 @@ impl Cpu {
         // for it, and `a64-mini` never has.
         let conduit = r.or_enum("psci", "none", psci::Conduit::NAMES)?;
         let cpus = r.or_range("cpus", 1u64, 1..=256)?;
+        // The roster `CPU_ON` reaches its siblings through, and whether this
+        // core comes out of reset running. Both default to what a
+        // single-processor board means, so an ordinary machine file writes
+        // neither.
+        let cluster = r.or_str("cluster", psci::DEFAULT_CLUSTER)?;
+        let start = r.or("start", true)?;
         // Every value is named in every build, so a machine file validates the
         // same everywhere and a build that cannot run one says *why* rather
         // than "expected one of `interp`".
@@ -948,16 +1149,32 @@ impl Cpu {
         })?;
         let psci = psci::Conduit::by_name(conduit)
             .ok_or_else(|| Error::Property(alloc::format!("`psci` names `{conduit}`")))?;
-        Ok(Cpu::new(Config {
+        let cfg = Config {
             reset_vector,
             mpidr,
             cntfrq,
             cntdiv,
             psci,
             cpus,
+            start,
             ..cfg
-        })
-        .with_engine(engine))
+        };
+        // A `Props` that belongs to no build gets a private cluster, so a core
+        // a test builds by hand still works and simply meets nobody.
+        let roster = psci::Cluster::attach(props, cluster)?;
+        let cpu = Cpu::new_in_cluster(cfg, Some(Arc::clone(&roster))).with_engine(engine);
+        // Registered *after* construction, because the roster holds a `Weak`
+        // to the very `Lines` construction allocates. A refusal here is two
+        // processors with one `MPIDR_EL1`, which is a board that cannot mean
+        // anything: `CPU_ON` would start whichever the roster happened to
+        // find and `AFFINITY_INFO` would report on the other one.
+        if !roster.join(psci::affinity_of(mpidr), Arc::downgrade(&cpu.lines)) {
+            return Err(Error::Property(alloc::format!(
+                "`mpidr` {mpidr:#x} names affinity {:#x}, which another processor in cluster                  `{cluster}` already has: PSCI addresses a processor by its affinity, so two                  with the same one cannot both be started",
+                psci::affinity_of(mpidr)
+            )));
+        }
+        Ok(cpu)
     }
 
     /// The same core, running on `engine`.
@@ -1174,6 +1391,14 @@ impl Cpu {
     pub fn step_to_exit(&self) -> (u64, Option<Exit>) {
         let cfg = self.effective_config();
         let exits = self.exit_mask();
+        self.apply_pending_start();
+        if !self.lines.powered() {
+            // A processor waiting for `CPU_ON`, or one `CPU_OFF` stopped. It
+            // is not stalled and it is not faulted; there is simply nothing
+            // running on it, so a single step does nothing and charges
+            // nothing.
+            return (0, None);
+        }
         let mut session = self.session.lock();
         if self.lines.take_reset_request() {
             session.state = State::new(&cfg);
@@ -1263,6 +1488,51 @@ impl Cpu {
         }
     }
 
+    /// Apply a `CPU_ON` a sibling asked for, at this core's own instruction
+    /// boundary.
+    ///
+    /// The **architectural reset state**, and then the two things DEN 0022
+    /// §5.1.3 says a started processor enters with: `PC` at the entry point
+    /// and `X0` holding the context id. Everything else — `SCTLR_EL1`,
+    /// `PSTATE`, the translation registers — is what a processor coming out
+    /// of reset has, because that is what a warm boot is: the kernel's
+    /// secondary entry point does its own MMU setup and would be entitled to
+    /// assume nothing else.
+    ///
+    /// The same route `pc.lapic`'s INIT and Start-Up take into `cpu.x86`, and
+    /// for the same reason: the state change belongs to the target, so the
+    /// target makes it.
+    fn apply_pending_start(&self) {
+        let Some((entry, context)) = self.lines.take_start() else {
+            return;
+        };
+        let cfg = self.effective_config();
+        let mut session = self.session.lock();
+        // **Except the counter.** DDI 0487 D11.1.2 puts the system counter in
+        // the always-on power domain: it does not stop when a processor is
+        // switched off and it does not restart when one is switched on. A
+        // `CPU_ON` that zeroed `cycles` would hand the started processor a
+        // `CNTPCT_EL0` behind every one of its siblings', and a kernel that
+        // subtracts two processors' timestamps gets a negative interval out
+        // of an unsigned register. `debt` travels with it, because it is the
+        // unspent remainder of the same count.
+        let (cycles, debt) = (session.state.cycles, session.state.debt);
+        session.state = State::new(&cfg);
+        session.state.cycles = cycles;
+        session.state.debt = debt;
+        session.state.pc = entry;
+        session.state.x[0] = context;
+        session.tlb.flush();
+        // Derived state, invalidated for the same reason a reset invalidates
+        // it: the blocks in the cache were lifted from whatever this core was
+        // running before, and a warm-booted processor is running something
+        // else (`ROADMAP.md` §4.5).
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
+    }
+
     /// One step of the run loop, on whichever engine this core runs.
     ///
     /// `remaining` is what is left of the caller's budget, and it is binding
@@ -1273,6 +1543,24 @@ impl Cpu {
     /// machine's state hash is taken over.
     #[allow(unused_variables)]
     fn advance(&self, remaining: u64) -> (u64, Option<Exit>) {
+        self.apply_pending_start();
+        if !self.lines.powered() {
+            // The whole quantum, consumed and unused. Returning zero instead
+            // would look like a core that cannot make progress, and the run
+            // loops above break on that — which would spin the scheduler on a
+            // processor that is merely switched off, and would stop the
+            // *machine's* clock from advancing past it.
+            let used = remaining.max(1);
+            // And the counter runs anyway, for the reason
+            // `apply_pending_start` gives: the system counter is in the
+            // always-on domain and a switched-off processor is not a stopped
+            // clock. This is the only place it can be charged, because the
+            // interpreter — which is what charges it otherwise — is not
+            // running.
+            let mut session = self.session.lock();
+            session.state.cycles = session.state.cycles.wrapping_add(used);
+            return (used, None);
+        }
         #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
         if self.engine.translates() {
             let cfg = self.effective_config();
@@ -1552,7 +1840,19 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "cpus",
             kind: ValueKind::Uint,
             required: false,
-            summary: "how many processors the machine has, for PSCI CPU_ON (default 1)",
+            summary: "how many processors the machine has, for PSCI CPU_ON on a board                       whose cores are not on one cluster (default 1)",
+        },
+        PropertySpec {
+            name: "cluster",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which processor cluster this core joins, so that PSCI CPU_ON can                       reach its siblings (default `cluster`)",
+        },
+        PropertySpec {
+            name: "start",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "whether this processor comes out of reset running; `false` is a                       secondary waiting for PSCI CPU_ON (default true)",
         },
     ],
     construct: |props| Ok(Box::new(Cpu::from_props(props)?)),
@@ -1697,6 +1997,11 @@ impl Device for Cpu {
             // one does, and clearing them would make the reset lie about the
             // machine.
             self.lines.set_all(0);
+            // And a cold start is a machine coming up, so a secondary is off
+            // again and whatever `CPU_ON` had asked for is void. A *warm*
+            // reset deliberately leaves both alone: `pwr.reset` reaching a
+            // running secondary should restart it, not switch it off.
+            self.lines.set_power_state((self.cfg.start, false, 0, 0));
         }
     }
 
@@ -1738,6 +2043,16 @@ impl Device for Cpu {
         // The interrupt lines are architectural: a restored machine whose
         // timer was already firing must still see it.
         w.write_u64(self.lines.pending())?;
+        // And so is the power state: a snapshot of a two-processor machine
+        // taken before the kernel called `CPU_ON` must restore as a machine
+        // with one processor running, not two.
+        //
+        // **Appended, and read back only if present** — see `load`.
+        let (powered, pending, entry, context) = self.lines.power_state();
+        w.write_bool(powered)?;
+        w.write_bool(pending)?;
+        w.write_u64(entry)?;
+        w.write_u64(context)?;
         Ok(())
     }
 
@@ -1781,6 +2096,32 @@ impl Device for Cpu {
         }
         Cpu::restore_sysreg_words(&mut s.sys, &words);
         let pending = r.read_u64()?;
+        // The power state, if this snapshot has one.
+        //
+        // # Why this is not a chunk-version bump
+        //
+        // Because the state a version-2 chunk is missing has exactly one
+        // correct value, and it is the one version 2 *meant*: on a machine
+        // whose cores had no roster, every processor was running and none had
+        // a start pending. So the fallback is a migration rather than a
+        // guess, which is the test `CLASS`'s own comment applies to the timer
+        // registers and gets the opposite answer for — a version-1 chunk had
+        // no comparator value that could be recovered, and restoring zero
+        // would have armed an interrupt the guest never asked for.
+        //
+        // It also keeps `src/host/gdb/arch.rs`'s AArch64 register map where
+        // it is: every offset that map reads is *before* these four fields,
+        // and its `verified_version` test asserts the chunk version it was
+        // checked against.
+        let power = if r.remaining() >= 18 {
+            let powered = r.read_bool()?;
+            let start_pending = r.read_bool()?;
+            let entry = r.read_u64()?;
+            let context = r.read_u64()?;
+            (powered, start_pending, entry, context)
+        } else {
+            (true, false, 0, 0)
+        };
         let mut session = self.session.lock();
         session.state = s;
         // The TLB is derived state and is never restored: it comes back empty,
@@ -1802,6 +2143,7 @@ impl Device for Cpu {
         }
         drop(session);
         self.lines.set_all(pending);
+        self.lines.set_power_state(power);
         Ok(())
     }
 }
@@ -1979,6 +2321,8 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("engine", ValueKind::Str).values(ENGINES))
         .prop(PropSchema::new("psci", ValueKind::Str).values(psci::Conduit::NAMES))
         .prop(PropSchema::new("cpus", ValueKind::Uint).range(1, 256))
+        .prop(PropSchema::new("cluster", ValueKind::Str))
+        .prop(PropSchema::new("start", ValueKind::Bool))
         .port("irq", PortDir::In)
         .port("fiq", PortDir::In)
         .port("reset", PortDir::In)

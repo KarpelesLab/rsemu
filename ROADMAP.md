@@ -92,11 +92,12 @@ something a person can actually run (§2).
 > `smp: Brought up 1 node, 2 CPUs` on it: the GIC's banked registers now answer
 > per `MemAttrs::requester` — resolved from the machine file's `processors =
 > [cpu0, cpu1]` through `BindCtx::peer`, the seam the local APIC's architectural
-> page uses — and the boot ROM's reset vector parks everything but affinity 0 on
-> a release table. What is still missing is PSCI `CPU_ON`, which needs a route
-> from the core executing the `SMC` to a *sibling* core; the second core comes up
-> off a spin table instead, and `docs/platforms/arm64-virt.md` says precisely
-> what the core would need.
+> page uses — and the second core is started by PSCI **`CPU_ON`**, through a
+> `HostKind::rendezvous` roster of siblings and four atomics on the target's own
+> `Lines` — so it can also be switched off again, which a spin table has no
+> mechanism for. The boot ROM's release table is still generated and
+> `secondary = "spin-table"` still selects it; `docs/platforms/arm64-virt.md`
+> has both.
 >
 > **The x86 side reached 6b's shape.** `pc64` and `q35-linux` enter a stock
 > `bzImage` directly and reach a shell; `q35-linux` does it **on the board's own

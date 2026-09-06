@@ -515,9 +515,12 @@ That table is the board's warm-boot entry point, and it is deliberately the
   releases a secondary CPU from its spin loop"). The generated tree also
   carries a **memory reservation** over the page, because a table the kernel's
   own allocator can hand out is a table that gets overwritten before it is
-  read. This is what `arm64-virt-smp` ships.
-* `secondary = "psci"` says `enable-method = "psci"`, and the processors park
-  on the same table. Nothing releases them yet, and the next section is why.
+  read.
+* `secondary = "psci"` says `enable-method = "psci"`, and the secondaries do
+  not park at all: they are declared `start = false` and are genuinely off
+  until a `CPU_ON` names them. **This is what `arm64-virt-smp` ships now**;
+  the section after next is what it took, and the machine file's own header is
+  why the two properties travel together.
 
 **What could not be established from a permissive source.** DTSpec §3.8.1
 defines `enable-method` and `cpu-release-addr` and is where both come from
@@ -581,53 +584,130 @@ command, and carries a hermetic test beside it — a dozen hand-assembled
 instructions, no download — in which the boot processor writes the other one's
 word of the release table and waits for it to answer.
 
-### What PSCI `CPU_ON` needs from `cpu.arm.a64`
+### What PSCI `CPU_ON` cost, and what it bought
 
 The board would rather say `enable-method = "psci"`, because that is what a
 `virt` board conventionally is and because a spin table cannot power a
-processor *off* again. It cannot, and the missing piece is entirely in the
-core. `psci::call` is a pure function returning an `Outcome { x0, effect }`,
-`Effect` is `None | Poweroff | Reboot`, and `CPU_ON` answers `ALREADY_ON` for a
-declared processor — honest on a board where every processor is running, and
-wrong the moment one is not.
+processor *off* again. It says it now. Six things were needed and all six are
+in `cpu.arm.a64`; what follows is what each turned out to be, because the
+prediction and the implementation differ in two places and the differences are
+the interesting part.
 
-What it needs, precisely:
-
-1. **A roster of siblings.** The `apic.bus` shape: a
+1. **A roster of siblings**, as predicted: [`psci::Cluster`] is a
    `HostKind::rendezvous("arm-cluster")` host object that every `cpu.arm.a64`
    on a board opens by name (a `cluster` property, defaulted, so an ordinary
-   board writes nothing), registering `(MPIDR affinity, Weak<Lines>)` at
-   construction. Not a new export mechanism — `core::hosts` already is one, and
-   `ROADMAP.md` §4.4 makes a fourth a design review.
-2. **`Lines` grows four cells**: `powered: AtomicBool`, `start_entry: AtomicU64`,
-   `start_context: AtomicU64`, `start_pending: AtomicBool`. `Lines` exists
-   because "a device raising `IRQ` from inside a write the core itself issued
-   must not re-enter the core's own critical section", and this is the same
-   requirement with a different sender: **atomics on the sibling's `Lines`, no
-   lock taken across the call, the `BUS` rank untouched.**
-3. **A `start` construction property**, default true. A machine file writes
-   `start = false` on every processor that is not the boot processor; a core
-   that is not powered consumes its budget and executes nothing.
-4. **`Cpu::run_budget` applies a pending start** at its next instruction
-   boundary: `PC = start_entry`, `X0 = start_context`, the architectural reset
-   state otherwise, `wfi` cleared. Which is the same route `pc.lapic`'s INIT
-   and Start-Up take into `cpu.x86`, and for the same reason — the sibling
-   changes its own state.
-5. **`psci::call` takes the roster.** `CPU_ON(target, entry, context)` is DEN
-   0022 §5.1.3: the target's affinity in `x1`, the entry point in `x2`, the
-   context id in `x3`, and the started processor enters with `X0 = context_id`.
-   `INVALID_PARAMETERS` for an affinity no processor has, `ALREADY_ON` for one
-   that is powered, otherwise store, set `start_pending`, set `powered`, return
-   `SUCCESS`.
-6. **`AFFINITY_INFO` stops being a constant.** It must answer `1` (OFF) for a
-   processor that has not been started and `0` (ON) for one that has — today's
-   unconditional `0` is only honest because every processor is running. And
-   `CPU_OFF` on a secondary should clear `powered` rather than returning
-   `DENIED`, which is the half a spin table cannot do at all.
+   board writes nothing), holding `(affinity, Weak<Lines>)` per processor.
+   `core::hosts` needed no change.
 
-Nothing in `core::` changes, and nothing in `dev/arm/` changes except one word
-in the machine file: `secondary = "psci"`, whose parking loop is already there
-and already correct.
+   Two things the prediction did not say. The roster is keyed on the
+   **affinity** and not on `MPIDR_EL1`: bit 31 is RES1 and is set on every
+   real `MPIDR`, so a kernel's `CPU_ON(1, …)` would find nothing on a board
+   whose `mpidr` is `0x80000001` if the raw value were the key. And joining
+   it **refuses a duplicate**, because two processors with one `MPIDR_EL1` is
+   a board where `CPU_ON` starts whichever the roster happened to find and
+   `AFFINITY_INFO` reports on the other one.
+
+2. **`Lines` grew four cells** — `powered`, `start_entry`, `start_context`,
+   `start_pending` — exactly as predicted, and for exactly the stated reason:
+   atomics on the sibling's `Lines`, no lock taken across the call, the `BUS`
+   rank untouched. It also grew a fifth field the prediction did not have: the
+   `Arc<Cluster>` itself. It lives there rather than on `Cpu` because `Lines`
+   is what the interpreter already holds when it services an `SMC`, and
+   threading a second reference through `Exec::new` would have cost every
+   caller an argument for the sake of one instruction. The roster holds `Weak`
+   back, so there is no cycle.
+
+   `Lines` also stopped deriving `Default`. `AtomicBool::default()` is false,
+   and a derived `Default` would have switched every existing board off.
+
+3. **A `start` construction property**, default true, as predicted. A core
+   that is not powered consumes its budget and executes nothing — and
+   *consuming* it is the part that matters: returning zero instead looks like
+   a core that cannot make progress, the run loops break on that, and the
+   machine's clock would stop advancing past a processor that is merely
+   switched off.
+
+4. **The pending start is applied at an instruction boundary**, in both
+   `run_budget`'s path and `step`'s: the architectural reset state, then `PC =
+   start_entry` and `X0 = start_context`, TLB and block cache flushed. The
+   same route `pc.lapic`'s INIT and Start-Up take into `cpu.x86`.
+
+5. **`psci::call` takes the roster**, through a `Siblings { cluster, cpus, me }`
+   argument. `CPU_ON` is DEN 0022 §5.1.3 — target affinity in `x1`, entry in
+   `x2`, context in `x3`, and the started processor enters with `X0 =
+   context_id` — with `INVALID_PARAMETERS` for an affinity no processor has,
+   `ALREADY_ON` for one that is powered, and `SUCCESS` otherwise.
+
+   The prediction called `call` a pure function and it is not one any more:
+   `CPU_ON` writes the target's atomics and `CPU_OFF` clears the caller's own
+   `powered`. Everything a **board** must do is still returned in
+   `Outcome::effect` rather than done inside; what changed is that a sibling
+   processor is not a board.
+
+6. **`AFFINITY_INFO` and `CPU_OFF` stopped being constants.** `AFFINITY_INFO`
+   answers `1` (OFF) for a processor nothing has started and `0` (ON) for one
+   that is running; `CPU_OFF` on a secondary clears `powered` and the
+   processor retires nothing afterwards, while `CPU_OFF` on the **last powered
+   processor** is still `DENIED`, because a machine with every processor off
+   is a machine nothing can start again.
+
+A board with no cluster keeps every answer it had, which is what
+`machines/a64-mini.machine` and a spin-table `arm64-virt-smp` rely on.
+
+**Nothing in `core::` changed**, as predicted, and nothing in `dev/arm/`
+changed at all: `arm.boot` already accepted `secondary = "psci"` and already
+emitted the parking loop. What the board writes is two words rather than one —
+`secondary = "psci"` and `start = false` on the secondary — and they travel
+together because a processor `AFFINITY_INFO` reports as `ON` before anything
+started it is a processor `CPU_ON` refuses with `ALREADY_ON`.
+
+**What is not here.** `CPU_SUSPEND` is still refused rather than answered.
+`MIGRATE` and the `SYSTEM_SUSPEND` family are not implemented and
+`PSCI_FEATURES` says so. And the snapshot chunk carries the power state
+appended after the interrupt lines, read back only when it is present, rather
+than as a version-3 chunk: a version-2 chunk's missing power state has exactly
+one correct value — running, nothing pending — which is what version 2 meant,
+so the fallback is a migration rather than a guess. That also keeps
+`src/host/gdb/arch.rs`'s AArch64 register map where it is; every offset it
+reads is before those four fields.
+
+### The one thing `start = false` broke, and it was already broken
+
+A processor that is switched off executes nothing, so its cycle counter stops
+— and `CNTPCT_EL0` on this core is that counter divided by `cntdiv`. The
+first PSCI boot printed `[ 8795.876863] Detected PIPT I-cache on CPU1` where
+the spin-table boot had printed `[ 0.022568]`: the secondary's view of time
+was nothing like its sibling's, and a kernel that subtracts two processors'
+timestamps was getting an unsigned register's idea of a negative number.
+
+The spin table had hidden it. A parked processor is *executing* — a two-
+instruction loop, but executing — so its counter advanced at roughly the same
+rate as the boot processor's and the two never drifted far enough to notice.
+Switching it genuinely off is what made a modelling choice visible that had
+been wrong since the second core landed.
+
+The architecture is unambiguous: the system counter is in the **always-on
+power domain** (DDI 0487 D11.1.2) and provides one view of time to every PE.
+So two things changed, and neither is about PSCI. A core that is not powered
+charges its scheduler budget to its cycle count and retires nothing, and
+`CPU_ON` preserves `cycles` and `debt` across the reset it applies. Both are
+in `Cpu`, both are one line, and both would have been needed by any mechanism
+that stops a core — `CPU_SUSPEND`, or a debugger that halts one.
+
+What is still *not* modelled is a counter that is genuinely shared. Each core
+still derives `CNTPCT_EL0` from its own tick count, which agrees with its
+siblings' only because the scheduler hands every core on a domain the same
+budget. That is true of every board here and it is not a guarantee.
+
+### What it looks like from the guest
+
+`tests/a64_smp.rs`'s `psci_cpu_on_starts_the_second_processor_and_cpu_off_stops_it`
+is hermetic — two dozen hand-assembled instructions, nothing downloaded — and
+the two things it asserts are the two a spin table cannot do. The word the
+boot processor waits on is the **context id** the `CPU_ON` passed, so a start
+that did not deliver `X3` into the target's `X0` hangs rather than passes. And
+the loop after it waits for `AFFINITY_INFO` to report `OFF`, which happens
+only because the secondary called `CPU_OFF`.
 
 ## The exclusive monitor is global now, and this board is why
 
@@ -676,13 +756,15 @@ It did not stop, so this section is a list of what the board *has not got*
 rather than of what defeated it. In rough order of what the next person will
 want:
 
-### PSCI `CPU_ON` is not implemented, and that is why there are two board files
+### `CPU_SUSPEND` is refused rather than implemented
 
-See [Two processors](#two-processors) above. A second core boots off a **spin
-table**, because `CPU_ON` needs something the core has not got: a route from
-the processor executing the `SMC` to a *sibling* processor. What exactly it
-needs is written out at the end of that section, in enough detail to be
-implemented without rediscovering it.
+`CPU_ON`, `CPU_OFF` and `AFFINITY_INFO` are real now — see [Two
+processors](#two-processors) — and `CPU_SUSPEND` is the one bring-up call that
+is not. A kernel told `SUCCESS` would expect to have been suspended and
+resumed and this core does neither, so `PSCI_FEATURES` reports it absent and a
+kernel discovers the gap rather than falling into it. Implementing it means
+deciding what a suspended core does about its generic timer, which is a
+scheduler question rather than a PSCI one.
 
 ### `GICC_CTLR.EOImode` is not implemented
 
