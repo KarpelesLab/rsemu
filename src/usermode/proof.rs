@@ -698,6 +698,19 @@ mod nr {
     pub(super) const GETRANDOM: u64 = 278;
     pub(super) const MEMBARRIER: u64 = 283;
     pub(super) const RSEQ: u64 = 293;
+    pub(super) const CLONE3: u64 = 435;
+
+    /// `__NR_riscv_hwprobe`, and the one number in this table that is **not**
+    /// architecture-neutral.
+    ///
+    /// `asm-generic/unistd.h` reserves 244..259 "for architecture specific
+    /// syscalls" and RISC-V spends two of them
+    /// (`arch/riscv/include/uapi/asm/unistd.h`:
+    /// `__NR_arch_specific_syscall + 14`). On AArch64 the same number is
+    /// unassigned, so the dispatch has to know which architecture it is on
+    /// before it can answer — which is why every other constant here can be
+    /// shared and this one is matched with a guard.
+    pub(super) const RISCV_HWPROBE: u64 = 258;
 }
 
 /// `CLONE_*`, from the same header.
@@ -752,6 +765,9 @@ mod errno {
     pub(super) const AGAIN: i64 = 11;
     /// Out of memory.
     pub(super) const NOMEM: i64 = 12;
+    /// Bad address — a pointer argument that does not resolve. Distinct from
+    /// `EINVAL`, because a caller retries one and not the other.
+    pub(super) const FAULT: i64 = 14;
     /// No such device — what a file-backed `mmap` gets.
     pub(super) const NODEV: i64 = 19;
     /// Invalid argument.
@@ -986,6 +1002,13 @@ const ARCHES: &[&Arch] = &[
     &a64::ARCH,
 ];
 
+/// `EM_RISCV`.
+///
+/// Named rather than spelled inline because two things need to agree on it:
+/// the ELF loader's machine check, and the one place the syscall table is not
+/// architecture-neutral — see [`nr::RISCV_HWPROBE`].
+const EM_RISCV: u16 = 243;
+
 /// RISC-V: `a7` carries the number, `a0`..`a5` the arguments, `a0` the result,
 /// and `tp` is the thread pointer. Volume I's register-usage table plus the
 /// `asm-generic` convention every architecture added since 2012 shares.
@@ -1209,8 +1232,7 @@ mod riscv {
 
     pub(super) const ARCH: Arch = Arch {
         name: "riscv64",
-        // `EM_RISCV`.
-        machine: 243,
+        machine: super::EM_RISCV,
         hwcap: HWCAP,
         uname: "riscv64",
         #[cfg(feature = "std")]
@@ -1903,6 +1925,7 @@ impl Kernel {
             }
             nr::SET_ROBUST_LIST => 0,
             nr::CLONE => self.clone_thread(&t, a(0), a(1), a(2), a(3), a(4)),
+            nr::CLONE3 => self.clone3(&t, a(0), a(1)),
             nr::FUTEX => self.futex(a(0), a(1), a(2), a(3)),
             // The quantum already ended somewhere; giving up the rest of it is
             // this scheduler's `run_next` coming round again.
@@ -1942,6 +1965,15 @@ impl Kernel {
             nr::GETPPID => 0,
             nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => 0,
             nr::RSEQ => -errno::NOSYS,
+            // glibc's RISC-V `ld.so` asks the kernel which extensions the hart
+            // has before it picks an ifunc for `memcpy` and its neighbours
+            // (`Documentation/arch/riscv/hwprobe.rst`). `-ENOSYS` is what a
+            // kernel older than 6.4 says and glibc falls back to `AT_HWCAP`,
+            // which this consumer already answers honestly — so the fallback
+            // is the *accurate* path here rather than a degraded one, and
+            // implementing the call would mean inventing a second, richer
+            // description of a core that already describes itself once.
+            nr::RISCV_HWPROBE if self.arch.machine == EM_RISCV => -errno::NOSYS,
             other => {
                 if !self.refused.contains(&other) {
                     self.refused.push(other);
@@ -2144,6 +2176,55 @@ impl Kernel {
         );
         self.spawned += 1;
         i64::from(tid)
+    }
+
+    /// `clone3(&clone_args, size)` — the same thread, described by a struct.
+    ///
+    /// glibc's `pthread_create` asks for this **first** and falls back to
+    /// `clone` on `-ENOSYS`; musl never asks at all. That fallback is why a
+    /// threaded glibc guest produced the right answer while this was refused,
+    /// and why the refusal is the only thing that said so — the output was
+    /// already correct. Implementing it keeps a glibc guest on the path it
+    /// was built for instead of on its compatibility path, and leaves the
+    /// legacy five-register form exercised by every musl guest.
+    ///
+    /// It is also the only call in this table whose **arguments are in guest
+    /// memory** rather than in registers, so it is the only one where a
+    /// level-3 kernel has to read a structure out of the address space it is
+    /// servicing before it can act.
+    ///
+    /// `include/uapi/linux/sched.h`. `CLONE_ARGS_SIZE_VER0` is 64 bytes, the
+    /// prefix through `tls`, and later kernels appended `set_tid`,
+    /// `set_tid_size` and `cgroup` behind larger sizes. A shorter struct is
+    /// `-EINVAL`; a longer one is read up to what is understood, which is what
+    /// makes the field a version number rather than a length check.
+    fn clone3(&mut self, parent: &Arc<dyn Thread>, uargs: u64, size: u64) -> i64 {
+        /// `CLONE_ARGS_SIZE_VER0`, which is every field a *thread* needs.
+        const VER0: usize = 64;
+        if size < VER0 as u64 {
+            return -errno::INVAL;
+        }
+        let mut buf = [0u8; VER0];
+        if self.mem.read_bytes(uargs, &mut buf).is_err() {
+            return -errno::FAULT;
+        }
+        let field = |i: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[i * 8..i * 8 + 8]);
+            u64::from_le_bytes(b)
+        };
+        let (flags, child_tid, parent_tid) = (field(0), field(2), field(3));
+        let (stack, stack_size, tls) = (field(5), field(6), field(7));
+        // `clone` is handed the stack's *top*; `clone3` is handed its bottom
+        // and a length, because a struct can carry both and five registers
+        // cannot. A sum that wraps is a caller error rather than a stack.
+        let Some(top) = stack.checked_add(stack_size) else {
+            return -errno::INVAL;
+        };
+        // `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` share one field here
+        // exactly as they share one register there, so the flag test inside
+        // `clone_thread` is the same test.
+        self.clone_thread(parent, flags, top, parent_tid, tls, child_tid)
     }
 
     /// `futex(uaddr, op, val, timeout)`, the two operations a threaded libc
@@ -4443,6 +4524,58 @@ fn a_clone_that_is_not_a_thread_is_refused_rather_than_half_done() {
 }
 
 #[test]
+fn clone3_reads_its_arguments_out_of_guest_memory() {
+    // The only call in this table whose arguments are a *struct* rather than
+    // registers, which gives it two failure modes `clone` does not have: the
+    // field order, and the fact that it carries the stack's bottom and a
+    // length where `clone` carries the top. Both are checked here rather than
+    // only through a glibc guest, because the corpus is optional and this is
+    // not.
+    let (mem, mut kernel) = scratch_kernel(any_arch());
+    const EINVAL: i64 = -22;
+    const EFAULT: i64 = -14;
+    let at = 0x1000u64;
+    let thread = cl::VM | cl::THREAD | cl::SIGHAND;
+    // `struct clone_args` through `tls`, which is `CLONE_ARGS_SIZE_VER0`.
+    let args = |flags: u64, ptid: u64, stack: u64, len: u64| {
+        let mut buf = [0u8; 64];
+        for (i, v) in [flags, 0, 0, ptid, 0, stack, len, 0].iter().enumerate() {
+            buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        buf
+    };
+
+    // Shorter than VER0 is not a `clone_args`, whatever it points at.
+    mem.write_bytes(at, &args(thread, 0, 0, 0x4000)).unwrap();
+    assert_eq!(kernel.ask(nr::CLONE3, &[at, 56]), EINVAL);
+    // A pointer that does not resolve is `EFAULT` rather than `EINVAL`: a
+    // caller can act on the difference.
+    assert_eq!(kernel.ask(nr::CLONE3, &[0xdead_0000, 64]), EFAULT);
+    // No stack at all is the same `fork`-shaped refusal `clone` gives.
+    mem.write_bytes(at, &args(thread, 0, 0, 0)).unwrap();
+    assert_eq!(kernel.ask(nr::CLONE3, &[at, 64]), EINVAL);
+    assert_eq!(kernel.threads.len(), 1);
+
+    // The *length* is what makes the top, so a base of zero and a length of
+    // 16 KiB is a stack where the same base alone was not. A size larger than
+    // VER0 is read as far as is understood — 88 is what glibc actually
+    // passes, and refusing it would refuse every real caller.
+    let ptid = 0x1800u64;
+    mem.write_bytes(at, &args(thread | cl::PARENT_SETTID, ptid, 0, 0x4000))
+        .unwrap();
+    let tid = kernel.ask(nr::CLONE3, &[at, 88]);
+    assert!(tid > 1, "a new thread rather than the caller: {tid}");
+    assert_eq!(kernel.threads.len(), 2);
+    let mut wrote = [0u8; 4];
+    mem.read_bytes(ptid, &mut wrote).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(wrote),
+        tid as u32,
+        "CLONE_PARENT_SETTID writes the child's id where the struct said"
+    );
+}
+
+#[test]
 fn a_futex_wait_blocks_and_a_wake_releases_exactly_who_it_said() {
     // The scheduler contract, driven directly: three threads park on one word
     // and a wake of two releases the first two, in arrival order. Arrival
@@ -5051,73 +5184,96 @@ fn a_real_dynamically_linked_binary_finds_its_libraries_and_runs() {
     );
 }
 
-/// **Ledgered.** The same experiment with a whole C library in it.
+/// The same experiment with a **whole C library** in it, which is the hardest
+/// thing this module runs.
 ///
 /// `tests/usermode/hello.rs` — the static milestone guest, unchanged — linked
-/// against the host's cross glibc instead of statically against musl. The
-/// loader half works: it opens both libraries by path out of the stage, maps
-/// their segments with a file-backed `mmap`, trims them to their 64 KiB
-/// `p_align` with `munmap`, applies every relocation and transfers control,
-/// **refusing nothing**. The program then stops inside glibc's own `strlen`,
-/// on `ADDHN` — one of the Advanced SIMD instructions `src/cpu/arm/a64/simd.rs`
-/// lists under *"what is deliberately absent"*.
+/// against a real glibc instead of statically against musl, and run under that
+/// glibc's own `ld.so`. Everything the shared-object test does happens here
+/// too and then keeps going: the loader opens each library by path out of the
+/// stage, maps its segments with a file-backed `mmap`, trims them to their
+/// alignment with `munmap`, applies every relocation, resolves the ifuncs
+/// glibc picks its `memcpy` and `strlen` with, transfers control, and runs a C
+/// library's entire startup — `__libc_early_init`, TLS, the stack guard, the
+/// standard streams — before the program's own first line.
 ///
-/// That is a gap in the core rather than in anything here, so this test
-/// asserts the part that is this module's: the loading worked, nothing was
-/// refused, and where it stopped is inside an object **the loader placed**
-/// rather than anywhere the consumer put something. The day the core gains
-/// the halving-narrow group, this test starts asserting the output instead —
-/// and it says so rather than silently continuing to pass.
+/// It runs to completion on **both** architectures, and the two are not the
+/// same shape, which is the point of running both:
+///
+/// | | AArch64 | RISC-V |
+/// | --- | --- | --- |
+/// | objects the loader places | 2 | 4 |
+/// | syscalls | 59 | 62 |
+///
+/// The RISC-V guest is linked against a pre-2.34 glibc, so `libpthread`,
+/// `libdl` and `librt` are still `DT_NEEDED`s of their own rather than having
+/// been merged into `libc.so.6` — four images to place, relocate and order
+/// instead of two, which is what a great deal of shipped software still looks
+/// like.
+///
+/// **Ledgered on an instruction gap only.** This is the one guest whose
+/// contents nobody here chose: it is whichever glibc the host had, so a
+/// missing instruction in `src/cpu/` is reported and skipped rather than
+/// failed — exactly as it is for the third-party corpus, and through the same
+/// runner. That is not hypothetical history. Until the A64 core grew the
+/// halving-narrow three-different group, this guest stopped at `strlen+0x68`
+/// on `ADDHN v2.8b, v1.8h, v1.8h` after forty-two syscalls having refused
+/// nothing, and the ledger entry said so. Every other failure — a refused
+/// syscall, a segment that did not map, a wrong auxiliary vector — is this
+/// module's and fails.
 #[cfg(feature = "std")]
 #[test]
-fn a_whole_glibc_links_and_relocates_and_then_meets_a_missing_instruction() {
-    for arch in ARCHES {
-        let Some(bytes) = guest_binary(&std::format!("glibc-{}", arch.suffix)) else {
-            continue;
-        };
-        let mut world = World::new(Arc::new(Journal::new()), counting_entropy());
-        world.stage = guest_root(&std::format!("glibc-{}.root", arch.suffix));
-        let outcome = run(
-            arch,
-            &bytes,
-            &["glibc"],
-            &["RSEMU=1", "LD_LIBRARY_PATH=/lib"],
-            world,
-            40_000_000_000,
-        );
-        match outcome {
-            Ok(out) => {
-                std::eprintln!(
-                    "usermode/glibc on {}: {} syscall(s), {} tick(s); refused {:?}",
-                    arch.name,
-                    out.trace.len(),
-                    out.ticks,
-                    out.refused
-                );
-                assert!(out.refused.is_empty(), "refused {:?}", out.refused);
-                // The core grew what it was missing. Promote this test: the
-                // guest is `hello.rs`, so its output is `hello.rs`'s.
-                assert_eq!(
-                    String::from_utf8_lossy(&out.stdout),
-                    "hello from level 3\nargv = [\"glibc\"]\nRSEMU = Some(\"1\")\n",
-                    "{}: a whole glibc now runs — fold this into the test above",
-                    arch.name
-                );
-            }
-            Err(why) => {
-                // It has to have got *into* a library the loader placed. A
-                // failure anywhere else — the loader refused, a segment did
-                // not map, the auxiliary vector was wrong — is this module's
-                // and is not ledgered.
-                assert!(
-                    why.contains(" in /lib/"),
-                    "{}: the glibc guest failed outside a loaded object:\n{why}",
-                    arch.name
-                );
-                std::eprintln!("usermode/glibc on {}: ledgered — {why}", arch.name);
-            }
-        }
-    }
+fn a_whole_glibc_links_relocates_and_runs_to_completion() {
+    run_third_party_staged(
+        "glibc",
+        &["glibc"],
+        &["RSEMU=1", "LD_LIBRARY_PATH=/lib"],
+        |arch| guest_root(&std::format!("glibc-{}.root", arch.suffix)),
+        |arch, out| {
+            // The guest *is* `hello.rs`, so its output is `hello.rs`'s. A C
+            // library between the two changes the trace and nothing else,
+            // which is the whole claim.
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "hello from level 3\nargv = [\"glibc\"]\nRSEMU = Some(\"1\")\n",
+                "{}",
+                arch.name
+            );
+        },
+    );
+}
+
+/// The same C library with **four guest threads** in it.
+///
+/// `tests/usermode/threads.rs`, the threaded milestone guest, linked against
+/// the same glibc and run in the same namespace as the guest above. Worth its
+/// own entry because a libc's threading is the part of it least like any other
+/// libc's: musl's `pthread_create` is one `clone` and a futex, and glibc's
+/// registers a robust-list head and an `rseq` area per thread, sets the
+/// guard page with an `mprotect` of its own, and unregisters both on the way
+/// out. None of that is reachable from the static musl guest, and all of it
+/// lands on [`ThreadSet`](crate::usermode::ThreadSet).
+///
+/// It agrees with the musl guest on the answer, which is the assertion that
+/// matters: forty thousand increments contended between four threads, joined,
+/// and then three more threads released off a condition variable.
+#[cfg(feature = "std")]
+#[test]
+fn a_whole_glibc_spawns_threads_that_agree_on_the_answer() {
+    run_third_party_staged(
+        "glibc-threads",
+        &["glibc-threads"],
+        &["LD_LIBRARY_PATH=/lib"],
+        |arch| guest_root(&std::format!("glibc-{}.root", arch.suffix)),
+        |arch, out| {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n",
+                "{}",
+                arch.name
+            );
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5145,9 +5301,14 @@ fn a_whole_glibc_links_and_relocates_and_then_meets_a_missing_instruction() {
 // | no `readv` | musl's `__stdio_read` fills the `FILE` buffer and the caller's in one call, so **every** C program that reads a file through stdio needs it, and no Rust guest did |
 // | no `pread64` | SQLite reads a database page at an absolute offset while a `read` cursor is elsewhere in the same descriptor |
 // | no `fcntl` | SQLite takes a shared lock before reading, and turns `-ENOSYS` there into "disk I/O error" |
+// | no `riscv_hwprobe` | glibc's RISC-V `ld.so` asks the kernel what the hart has before it picks an ifunc. It is the one number in `nr` that is **not** architecture-neutral: `asm-generic` reserves 244..259 for architecture-private calls and RISC-V spends two, so "implement the shared table" leaves a hole on exactly one of two architectures |
+// | no `clone3` | glibc's `pthread_create` asks for it first and falls back to `clone` on `-ENOSYS`, so the *output was already right* and only the refusal list said anything. The arguments are a struct in guest memory rather than five registers, which is the only call here shaped that way |
 //
 // Each is a hole in *this* module, which is the consumer's half — none needed
-// anything from rsemu and none needed the sandbox widened.
+// anything from rsemu and none needed the sandbox widened. The last two came
+// from a real C library rather than from the three programs below; a glibc is
+// third-party software too, and it is the one guest here whose contents nobody
+// chose, because it is whatever the host had.
 
 /// The namespace the third-party guests run in: the fixture database, the
 /// script that queries it, a Lua program and a text file.
@@ -5156,7 +5317,19 @@ fn third_party_stage(arch: &'static Arch) -> Stage {
     guest_root(&std::format!("thirdparty-{}.root", arch.suffix))
 }
 
-/// Run a third-party guest on every architecture the corpus has one for.
+/// Run a third-party guest on every architecture the corpus has one for, in
+/// the shared fixture namespace.
+#[cfg(feature = "std")]
+fn run_third_party(
+    name: &str,
+    argv: &[&str],
+    envp: &[&str],
+    check: impl Fn(&'static Arch, &Outcome),
+) {
+    run_third_party_staged(name, argv, envp, third_party_stage, check);
+}
+
+/// [`run_third_party`], with a per-architecture namespace of its own.
 ///
 /// Like [`run_built_guest_staged`] with one difference, and it is a ledger
 /// rather than a loosening: a run that stops because **the core does not
@@ -5167,11 +5340,15 @@ fn third_party_stage(arch: &'static Arch) -> Stage {
 /// That distinction is the reason the fault message says which of the two it
 /// was, and prints the encoding: an instruction gap belongs to `src/cpu/`,
 /// and a report that names the word is a report somebody there can act on.
+/// It matters more here than anywhere else in this file, because these are
+/// the guests **nobody here chose the contents of** — the third-party corpus
+/// is pinned but a host's own `glibc` is whatever that host installed.
 #[cfg(feature = "std")]
-fn run_third_party(
+fn run_third_party_staged(
     name: &str,
     argv: &[&str],
     envp: &[&str],
+    stage_of: impl Fn(&'static Arch) -> Stage,
     check: impl Fn(&'static Arch, &Outcome),
 ) {
     /// Generous: `lua` runs a sieve to a hundred thousand, which is eighty
@@ -5184,7 +5361,7 @@ fn run_third_party(
         let Some(bytes) = guest_binary(&std::format!("{name}-{}", arch.suffix)) else {
             continue;
         };
-        let stage = third_party_stage(arch);
+        let stage = stage_of(arch);
         let journal = Arc::new(Journal::with_mode(JournalMode::Record));
         let mut world = World::new(Arc::clone(&journal), counting_entropy());
         world.stage = stage.clone();

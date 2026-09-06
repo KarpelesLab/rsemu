@@ -70,14 +70,24 @@
 //! claim that a syscall exit is *"a property of a core"* rather than a
 //! property of RISC-V is now measured.
 //!
-//! A **dynamically linked** program runs too, under a real `ld.so` taken from
-//! the host: an `ET_DYN` executable with a `PT_INTERP`, one `DT_NEEDED`, a
-//! data relocation and a function relocation, in twenty-two syscalls, with the
-//! loader opening the library by path, mapping its segments out of a
-//! descriptor, trimming them to their 64 KiB alignment and resolving both
+//! A **dynamically linked** program runs too, on both architectures, under a
+//! real `ld.so`: an `ET_DYN` executable with a `PT_INTERP`, one `DT_NEEDED`, a
+//! data relocation and a function relocation, in twenty-two syscalls on
+//! AArch64 and eighteen on RISC-V — the difference being the 64 KiB `p_align`
+//! the first trims and the second has nothing to trim. The loader opens the
+//! library by path, maps its segments out of a descriptor and resolves both
 //! relocations. Nothing here processes a relocation; the consumer places two
 //! images and builds an auxiliary vector that describes each to the other,
 //! which is the whole of what a kernel does for a dynamically linked process.
+//!
+//! And a **whole C library** runs, on both architectures: `hello` and
+//! `threads` linked against a real glibc rather than statically against musl,
+//! under that glibc's own loader — two objects and fifty-nine syscalls on
+//! AArch64, four objects and sixty-two on RISC-V, and two hundred and five
+//! with four guest threads in it. Against the same threaded program's `strace`
+//! on the host, every thread-related count is *equal*: seven `clone3`, seven
+//! `exit`, eight each of `set_robust_list`, `sched_getaffinity`, `gettid` and
+//! `futex`, twenty-nine `rt_sigprocmask`, twenty-four `sigaltstack`.
 //!
 //! And **software nobody here wrote** runs on it. SQLite 3.45 opens a real
 //! database file, takes a lock on it, reads its pages at absolute offsets and
@@ -89,7 +99,10 @@
 //! which is the point: our own guests can only ask for what somebody here
 //! thought to implement, and these found four things nobody had — a
 //! floating-point unit left switched off on RISC-V, and a missing `readv`,
-//! `pread64` and `fcntl`. Every one of them was in the *consumer's* half.
+//! `pread64` and `fcntl`. glibc then found two more: `riscv_hwprobe`, which is
+//! the one syscall number the two architectures do **not** share, and
+//! `clone3`, which `pthread_create` asks for before falling back to `clone`.
+//! Every one of them was in the *consumer's* half.
 //!
 //! That needed the one policy change level 3 has had. A dynamic loader opens
 //! files, so *"the guest may be told about itself"* became *"the guest may be
