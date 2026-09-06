@@ -30,6 +30,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `machine_parser`  | `machine::lexer` → `machine::parser` → `Diagnostic::render`, plus constant folding | never panics |
 | `state_decoder`   | `core::state::StateReader` over arbitrary bytes     | never panics; canonical encoding |
 | `state_roundtrip` | `StateWriter` → `StateReader`, structured input     | writer/reader are inverses |
+| `state_migration` | `machine::default_migrations` — the upgrade steps this build ships, then the device `load` behind them | a step never panics on an old chunk; what it produces is loadable or refused, never half-applied |
 | `flash_cfi`       | `dev::flash::cfi` — the NOR flash MMIO surface and its snapshot chunk | a program only ever clears bits |
 | `ir_verify`       | `ir::verify` over arbitrary blocks, then `ir::eliminate_dead_code` and `ir::Liveness` | never panics; a block the verifier accepts survives elimination and still verifies |
 | `riscv_lift`      | `cpu::riscv::lift` → `ir::verify` → `ir::Interp`, against `cpu::riscv`'s interpreter | the lifted block and the interpreter agree on registers, PC, ticks, memory and faults |

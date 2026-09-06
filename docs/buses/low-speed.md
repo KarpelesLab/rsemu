@@ -64,6 +64,34 @@ no bit handling of its own.
 A machine file names which style it uses and why; `machines/spi-panel.machine`
 is the worked example.
 
+## What a snapshot has to carry, and what it must not re-announce
+
+A frame is not atomic with respect to a save. `Machine::save` can land between
+two SCK edges, so **both endpoints have bit-level state** — the partly assembled
+word in a `SlavePins` shifter, or in the controller's own — and both must be in
+the chunk. `stm32.spi` and `flash.spinor` each write the seven fields
+`Shifter::snapshot` returns; a part that saves only its byte-level decoder comes
+back one byte out of step with the wire.
+
+The chip select is the other half, and it is the one that is easy to get
+backwards. It is a **level a master drives**, so it is not a chunk of its own:
+each master saves whether it holds the line and puts it back on load. What the
+bus must not do is treat that as an edge — a slave's `select` is where it
+*begins a frame*, and a fresh bus has nothing selected, so a restoring master
+calling `SpiBus::select` hands the part a falling edge that never happened and
+throws away the mid-frame state the snapshot has just restored into it.
+`SpiBus::restore_select` is the silent form, for `Device::load` and nowhere
+else, and a master that holds no chip select claims nothing — the other master
+on the bus may hold it. In `link = "wired"` the same rule falls out for free:
+the level arrives through the wire graph, and `SlavePins::drive` already ignores
+a level that did not move.
+
+The `spi-flash` board is the worked example of getting it wrong. It was the
+only entry in the catalog's resume ledger: `stm32.spi` re-drove `NSS` on load,
+`flash.spinor` heard a fresh chip select, and a flash caught part way through an
+OCTOSPI indirect write restarted its command decoder — visible in the very next
+byte of its chunk, and in a guest that then diverged.
+
 ## Lock order
 
 A fabric here cannot use `LockRank::BUS`, despite the name. A CPU core holds its

@@ -66,29 +66,37 @@
 //! steps that *are* registered. A newer-than-supported chunk is refused —
 //! snapshots move forwards only.
 //!
-//! **The mechanism is here and the table is empty.** As of this writing
-//! [`Migrations::register`] is called nowhere outside this module's own tests;
-//! [`Machine::load`](crate::machine::Machine::load) passes
-//! `Migrations::new()`, and no caller in the tree reaches for
-//! [`Machine::load_with`](crate::machine::Machine::load_with). Meanwhile class
-//! versions have moved: `cpu.x86` is at 8, `cpu.arm` at 3, `nes.ppu` at 4,
-//! `cpu.mos6502` at 4. Every one of those bumps orphaned every snapshot an
-//! earlier build had written — cleanly, with a message naming the gap, but
-//! orphaned. So the sentence §4.5 opens with is currently true of this tree in
-//! the way it did not intend: the *versions* are decoration until somebody
-//! writes the steps between them.
+//! The table this build ships is
+//! [`machine::default_migrations`](crate::machine::default_migrations), and
+//! [`Machine::load`](crate::machine::Machine::load) reaches for it without
+//! being asked — which is what makes the mechanism load-bearing rather than
+//! merely available. It matters because snapshots are a user-facing artefact:
+//! `rsemu_save`/`rsemu_load` in `crate::wasm` (behind the `wasm` feature) are
+//! §11.7's "take a save state, all client-side with nothing uploaded", and
+//! `web/src/session.js` puts them behind a button. (The `rsemu` binary has no
+//! such command, which is the direction the asymmetry runs.)
 //!
-//! It would be a defensible position if snapshots were not a user-facing
-//! artefact, and they are: `rsemu_save`/`rsemu_load` in `crate::wasm` (behind
-//! the `wasm` feature) are §11.7's "take a save state, all client-side with
-//! nothing uploaded", and `web/src/session.js` puts them behind a button.
-//! (The `rsemu` binary has no such command, which is the direction the
-//! asymmetry runs.) So save states written by a browser build already exist,
-//! and the next `cpu.x86` version bump makes every one of them unloadable with
-//! a message about a migration hole. §4.5 names what the test has to be:
-//! **a cross-version load from a committed fixture**, not a round-trip. The
-//! fixture test in this file (`a_v1_fixture_loads_into_a_v2_build`) is that
-//! shape for a toy class and is the template.
+//! For a long time the mechanism was here and the table was empty:
+//! [`Migrations::register`] was called nowhere outside this module's own tests,
+//! `Machine::load` passed `Migrations::new()`, and nothing reached
+//! [`Machine::load_with`](crate::machine::Machine::load_with) — while class
+//! versions moved anyway (`cpu.x86` to 8, `cpu.arm` to 3, `nes.ppu` to 4,
+//! `cpu.mos6502` to 4, and fourteen more above v1). Each of those bumps
+//! orphaned every snapshot an earlier build had written, cleanly and with a
+//! message naming the gap. They stay orphaned: a retroactive step is written
+//! from a diff rather than from the encoding, and §4.5's test for it — a
+//! cross-version load from a fixture — is not available for a build nobody can
+//! run any more. `crate::machine::migrate` argues that in full, and states the
+//! rule that replaces it: bump the version and register the step in the same
+//! commit.
+//!
+//! §4.5 names what the test has to be: **a cross-version load from a fixture**,
+//! not a round-trip. `a_v1_fixture_loads_into_a_v2_build` in this file is that
+//! shape for a toy class; `tests/snapshot_migration.rs` is it for a whole
+//! shipped board, and adds the part a byte comparison cannot reach — it runs
+//! both machines forward, because `save -> load -> save` equality and
+//! [`Machine::state_hash`](crate::machine::Machine::state_hash) are functions
+//! of the fields `save` *writes*, and a field it omits cannot make either fail.
 //!
 //! # The shape does not record features or architectures
 //!
