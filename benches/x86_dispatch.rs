@@ -41,6 +41,13 @@
 //!   alone cannot collect it, because a temporary any boundary names is live
 //!   by definition; the elision is what makes the boundaries stop naming the
 //!   dead ones. This column is the difference.
+//!
+//!   **`cpu::x86::engine` does not ship this**, and the row is here to say
+//!   what refusing it costs rather than what choosing it buys. A boundary that
+//!   omits flags is a boundary the guest cannot be *resumed* from, and
+//!   `IrHost::spent` resumes a guest from one — see the `FLAGS` constant in
+//!   that file. The elision is still sound for every configuration here,
+//!   because nothing in this harness hands a block a tick allowance.
 //! * **`+guard`** is `lift::Smc::Guard`. x86 makes a coherent instruction
 //!   cache architectural, so a store into a running block's own page has to be
 //!   honoured before the next instruction. `Smc::EndBlock` is RISC-V's answer
@@ -106,7 +113,8 @@
 //! forever by people who do not know they have already been explained. These
 //! are one machine's figures, not a claim; re-run them.
 //!
-//! * **`+elide` is the whole story.** `alu-loop` went 10.8 → 26.4 Mi/s and
+//! * **`+elide` is the whole story** — and it is the thing the engine gave up.
+//!   `alu-loop` went 10.8 → 26.4 Mi/s and
 //!   `memcpy` 12.7 → 27.5, both about 2.2x, from one change: the boundaries
 //!   stopped naming flags nothing could observe, so dead-code elimination
 //!   could finally take the popcount, the two comparisons and the mask behind

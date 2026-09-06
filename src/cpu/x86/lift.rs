@@ -555,19 +555,24 @@
 //!   say is an `i8` or an `i16`, which is why `RCL`/`RCR` and the atomics have
 //!   no type to name.
 //!
-//! # The fourth mutation survivor, and why the shape test is the answer
+//! # A mutation survivor that stopped existing, and what killed it
 //!
-//! [`TRANSFER`] makes no bus cycle, so [`Opcode::LD`] in that space must not be
-//! counted as a data access when a block's worst case is bounded
-//! (`cpu::x86::engine`'s `block_bound`). Counting it bounds every computed
-//! near transfer one whole access high — forty-eight ticks under a four-level
-//! walk — which refuses, in the tail of a quantum, a block that fits in it.
+//! [`TRANSFER`] makes no bus cycle, so [`Opcode::LD`] in that space had to be
+//! left out when a block's worst case was bounded before the block could run.
+//! Counting it bounded every computed near transfer one whole access high —
+//! forty-eight ticks under a four-level walk — which refused, in the tail of a
+//! quantum, a block that fitted in it. Conservative rather than wrong, so
+//! nothing differential could see it: both engines still agreed about every
+//! register, every flag and every tick, and a shape test in
+//! `cpu::x86::engine` was what asserted it.
 //!
-//! That is **conservative rather than wrong**, and it is why nothing
-//! differential can see it: a bound that is too large costs coverage and never
-//! correctness, so both engines still agree about every register, every flag
-//! and every tick. It is asserted by shape instead, in
-//! `the_transfer_check_costs_nothing_in_a_blocks_bound`.
+//! **There is no bound any more.** `IrHost::spent` lets a block leave at a
+//! guest instruction boundary, so `cpu::x86::engine` never asks what a block
+//! costs, the mis-costing has nowhere to happen, and the shape test went with
+//! the arithmetic it was about. The paragraph is kept because the *reason* it
+//! was a survivor generalises: a mechanism that can only be too conservative
+//! cannot be caught by a differential harness, and needs either a shape
+//! assertion or removing.
 //!
 //! # How this is known to be right
 //!
