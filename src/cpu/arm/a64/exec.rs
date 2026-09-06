@@ -2314,9 +2314,35 @@ impl<'a> Exec<'a> {
     }
 
     /// The `FEAT_LSE` atomics.
+    ///
+    /// # Two widths, not one, and the byte forms are where they differ
+    ///
+    /// `LDSMAXB W0, W1, [X2]` names `W` registers, so `Rs` and `Rt` are read
+    /// and written 32 bits wide — but the maximum is taken between two
+    /// **bytes**, because DDI 0487's pseudocode writes every value here at
+    /// `datasize`, which is `8 << size`. At the word and doubleword forms the
+    /// two widths coincide and one variable was enough; at the byte and the
+    /// halfword they do not. `esize` is the value's and `width` is the
+    /// register's.
+    ///
+    /// Where that shows is narrower than it looks, which is why it is worth
+    /// naming: `Exec::store` truncates to `bytes`, so `LDADDB`'s carry out of
+    /// the byte is thrown away either way and the bug would be invisible
+    /// there. It shows in the three places the *value* of the wide bits
+    /// decides something — the signed `LDSMAX`/`LDSMIN` comparison, where
+    /// `0x80` is `-128` at the element and `+128` at the register; the
+    /// unsigned `LDUMAX`/`LDUMIN` comparison, where an operand with a bit
+    /// above the element wins a maximum it should have lost; and `CAS`, which
+    /// would compare all thirty-two bits of `Rs` against a loaded byte and
+    /// never swap.
     fn atomic(&mut self, word: u32, op: Op) -> Result<(), Trap> {
         let bytes = 1u64 << isa::ls_size(word);
+        let esize = 8 * bytes as u32;
         let width = if bytes == 8 { 64 } else { 32 };
+        // What a register operand contributes: its low `esize` bits. The
+        // *loaded* value is already this narrow, so only the register side
+        // needs it.
+        let elem = |value: u64| value & isa::ones(esize);
         let s = isa::rm(word);
         let t = isa::rd(word);
         let n = isa::rn(word);
@@ -2325,20 +2351,21 @@ impl<'a> Exec<'a> {
         // reports a write.
         self.check_align(addr, bytes, Access::Store, true)?;
 
-        if matches!(op, Op::CasW | Op::CasX) {
-            let compare = self.read_reg(s, width, false);
+        if matches!(op, Op::CasB | Op::CasH | Op::CasW | Op::CasX) {
+            let compare = elem(self.read_reg(s, width, false));
             let old = self.load(addr, bytes)?;
             if old == compare {
                 let new = self.read_reg(t, width, false);
                 self.store(addr, bytes, new)?;
             }
             // `Rs` is both the comparand and the destination, and it is
-            // written with the old value whether or not the swap happened.
+            // written with the old value whether or not the swap happened —
+            // zero-extended from the element to the register.
             self.write_reg(s, width, false, old);
             return Ok(());
         }
 
-        let operand = self.read_reg(s, width, false);
+        let operand = elem(self.read_reg(s, width, false));
         let old = self.load(addr, bytes)?;
         // `o3` (bit 15) with `opc == 0` is `SWP`; otherwise `opc` (bits 14:12)
         // names the read-modify-write.
@@ -2352,11 +2379,11 @@ impl<'a> Exec<'a> {
                 2 => old ^ operand,
                 3 => old | operand,
                 4 => {
-                    let (a, b) = (isa::sext(old, width), isa::sext(operand, width));
+                    let (a, b) = (isa::sext(old, esize), isa::sext(operand, esize));
                     a.max(b) as u64
                 }
                 5 => {
-                    let (a, b) = (isa::sext(old, width), isa::sext(operand, width));
+                    let (a, b) = (isa::sext(old, esize), isa::sext(operand, esize));
                     a.min(b) as u64
                 }
                 6 => old.max(operand),

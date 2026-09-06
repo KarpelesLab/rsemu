@@ -451,7 +451,11 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             // The acquire and release bits sit at different places on the two
             // atomic encodings: bits 23:22 on a compare-and-swap, and bit 23
             // with bit 22 on the read-modify-writes.
-            let (acquire, release) = if matches!(insn.op, isa::Op::CasW | isa::Op::CasX) {
+            let cas = matches!(
+                insn.op,
+                isa::Op::CasB | isa::Op::CasH | isa::Op::CasW | isa::Op::CasX
+            );
+            let (acquire, release) = if cas {
                 (isa::bit(word, 22), isa::bit(word, 15))
             } else {
                 (isa::bit(word, 23), isa::bit(word, 22))
@@ -461,6 +465,14 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             }
             if release {
                 text.push('l');
+            }
+            // ...and the width letter *after* those, because the spelling is
+            // `CASALB` and never `CASBAL`. A word or a doubleword adds no
+            // letter at all: the register operands already say which.
+            match isa::ls_size(word) {
+                0 => text.push('b'),
+                1 => text.push('h'),
+                _ => {}
             }
         }
     }
