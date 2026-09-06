@@ -62,6 +62,38 @@
 //! The saving is the point: a 64-instruction trace with fifteen live registers
 //! wrote roughly nine hundred slots eagerly and writes fifteen now.
 //!
+//! # Leaving a block part-way through
+//!
+//! [`IrHost::spent`] is asked at every boundary but the block's first, and a
+//! `true` stops the block with [`Outcome::Spent`]. That is the answer to the
+//! oldest complaint against this design: a caller with a tick budget used to
+//! have to prove a block's **worst case** fitted before the block could start,
+//! because once started it ran to a terminator — and on a real x86 guest that
+//! guard, not the unlifted encodings, was the dominant reason the interpreter
+//! ran at all.
+//!
+//! Nothing new has to be reconstructed to stop here, which is why the boundary
+//! is the boundary rather than "wherever the count runs out". Everything a
+//! mid-block stop needs is what a mid-block **fault** already needed:
+//!
+//! * the live mapping publishes the architectural registers;
+//! * [`InsnStart::pc`] is the guest PC of an instruction that has not started;
+//! * the ticks charged are the ticks its predecessors spent, because
+//!   [`Opcode::CHARGE`] charges where it is written.
+//!
+//! So the two engines stop at the same guest instruction with the same state,
+//! and a caller can hand a block a budget it might not fit instead of refusing
+//! it one it probably would have.
+//!
+//! What it is *not* is free of a precondition, and the precondition is not the
+//! one [`InsnStart::live`] states. That invariant is about monotonicity — once
+//! a boundary names a slot every later boundary names it too — and a frontend
+//! can keep it while leaving a boundary from which the guest cannot be
+//! resumed, because a slot **no** boundary has named yet may still be stale in
+//! the host. `cpu::x86::lift` under `Flags::Elide` does exactly that with the
+//! arithmetic flags. [`IrHost::spent`] states it in full; a frontend whose
+//! guest stops booting when a core adopts this should read it first.
+//!
 //! # Where this backend has to *choose*
 //!
 //! Two things the IR deliberately leaves open, decided here and only here:
@@ -163,6 +195,67 @@ pub trait IrHost {
     /// boundary is delivered at the architecturally correct place.
     fn insn_start(&mut self, mark: &InsnStart);
 
+    /// Whether this host's tick allowance is spent, asked at a guest
+    /// instruction boundary.
+    ///
+    /// **The seam that lets a block leave part-way through.** A backend asks
+    /// it immediately after [`IrHost::insn_start`], at every boundary but the
+    /// block's first, and stops the block with [`Outcome::Spent`] when the
+    /// answer is `true` — architectural state materialized from that
+    /// boundary's mapping, the guest standing at [`InsnStart::pc`], and the
+    /// ticks charged being exactly the ones that instruction's predecessors
+    /// spent.
+    ///
+    /// The default is `false`: a host with no allowance of its own never
+    /// stops a block part-way, which is the behaviour every host had before
+    /// this method existed. It is `&self` — alone in this trait — because it
+    /// is an observation and not an action: a boundary is not a place where a
+    /// host may do anything, and the two backends ask it a different number of
+    /// times on paths that must stay indistinguishable.
+    ///
+    /// # What a host that overrides it owes
+    ///
+    /// The answer must be a function of ticks this host has already charged,
+    /// and monotone: once `true`, `true` until the run ends. A host that
+    /// answered `true` and then `false` again would stop a block at a boundary
+    /// its own interpreter would have run through, and the two engines would
+    /// part company about where the quantum ended — which is the whole thing
+    /// the mechanism exists to keep exact.
+    ///
+    /// It is asked at a boundary and nowhere else, so it costs a host nothing
+    /// to make it a comparison of two fields; a host that has to compute
+    /// something here is on the hot path and will feel it.
+    ///
+    /// # And what its *frontend* owes, which is the trap
+    ///
+    /// **Every boundary's live mapping must be architecturally complete**, not
+    /// merely monotone. [`InsnStart::live`]'s stated invariant — once a
+    /// boundary names a slot, every later boundary reachable from it names it
+    /// too — is weaker than that, and a frontend can satisfy it while leaving
+    /// a boundary unresumable.
+    ///
+    /// `cpu::x86::lift` is the worked example and it cost a Linux guest a boot
+    /// to find. Under `Flags::Elide` a boundary **omits** the flags the
+    /// instruction it begins is about to write, on the grounds that nothing
+    /// between here and the overwrite can observe them — and the dead-code
+    /// pass then deletes the arithmetic that would have produced them. That is
+    /// sound for a block that runs to its terminator, and sound for a fault
+    /// (elision is refused for any instruction that can take one). It is
+    /// **not** sound for a block that leaves: the guest resumes with an
+    /// interrupt able to push a stale `EFLAGS`, and the interpreter and the
+    /// JIT end the quantum with different flags. Measured, the elision is
+    /// worth 2.8% of host instructions and this seam is worth 9.4%, so the
+    /// frontend goes eager — but the choice is the frontend's and it has to be
+    /// made deliberately, because nothing here can check it.
+    ///
+    /// The one incompleteness the backends handle themselves is the **exit**
+    /// boundary, whose [`InsnStart::pc`] is a placeholder when the successor
+    /// is computed. Neither backend leaves at one.
+    #[inline]
+    fn spent(&self) -> bool {
+        false
+    }
+
     /// Perform an atomic read-modify-write, returning the value the location
     /// held before it.
     ///
@@ -232,6 +325,19 @@ pub enum Outcome {
     /// [`Opcode::LOOKUP_AND_GOTO`]: the successor is named by a computed PC.
     Lookup {
         /// The computed guest PC to look up.
+        pc: u64,
+    },
+    /// [`IrHost::spent`] said so at a boundary: the block left part-way
+    /// through, at a guest instruction boundary, having retired everything
+    /// before it and nothing after.
+    ///
+    /// Not a fault and not an error — the guest is mid-flight and every
+    /// engine's answer here is the same one, which is the point. The
+    /// architectural state is materialized from that boundary's mapping,
+    /// exactly as at a fault, and `pc` is the boundary's own
+    /// [`InsnStart::pc`]: the guest instruction that has **not** started.
+    Spent {
+        /// The guest PC to resume at — the boundary the block left at.
         pc: u64,
     },
     /// A guest access faulted, and the block stopped where it faulted.
@@ -993,6 +1099,35 @@ impl Interp {
                 // one's commits stop blocking a retry here.
                 self.committed = false;
                 host.insn_start(mark);
+                // The tick allowance, asked here and nowhere else. Two
+                // boundaries are never asked at, and both exclusions are
+                // load-bearing rather than tidy.
+                //
+                // **The block's first**, because a run that retired nothing
+                // would leave the guest exactly where it found it, and the
+                // interpreter this must agree with always retires one guest
+                // instruction before it looks at a budget again.
+                //
+                // **An exit boundary** — one a terminator follows — because
+                // [`InsnStart::pc`] is *static* and a block whose successor is
+                // computed does not know it at lift time: `cpu::x86::lift`
+                // closes a `RET` with a boundary carrying the program-order
+                // EIP and the real target in the [`RegSlot`] the map names, so
+                // leaving there and believing `mark.pc` resumes the guest one
+                // instruction past the end of the block. Nothing is lost by
+                // skipping it: the terminator is the next instruction, the
+                // block ends of its own accord with the PC its map published,
+                // and the caller stops the chain at the block boundary
+                // instead. See [`IrHost::spent`].
+                if self.boundaries > 1
+                    && host.spent()
+                    && !block
+                        .insts()
+                        .get(at + 1)
+                        .is_some_and(|next| next.op.is_terminator())
+                {
+                    return Ok(Step::Done(Outcome::Spent { pc: mark.pc }));
+                }
             }
 
             _ => return Ok(Step::Done(Outcome::Unsupported { op, at })),

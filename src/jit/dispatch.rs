@@ -48,6 +48,49 @@
 //! need a finer hook than this one; that is recorded here rather than
 //! discovered later.
 //!
+//! # Two budgets, in two currencies
+//!
+//! [`Dispatcher::run`] takes a budget in **blocks**, which is the dispatcher's
+//! own and bounds the loop. It is not the budget a CPU core has: a core is
+//! handed a quantum in *ticks*, and until this paragraph existed the only way
+//! to spend one safely was for a frontend to prove, at every boundary, that
+//! the block it was about to enter could not overrun what was left — a block
+//! runs to a terminator once started, so its **worst case** had to fit.
+//!
+//! Measured on `pc64` — nine hundred guest seconds of a 6.6 kernel — that
+//! guard was 2.02% of all guest instructions, three times everything outside
+//! the lifted subset put together, and it could not be tightened: admitted
+//! blocks were bounded at a mean of 185 ticks and refused ones at 1 636
+//! against a mean 827 left, so it is a small population of fat blocks and not
+//! ordinary blocks caught in a tail.
+//!
+//! The second currency is therefore the host's.
+//! [`IrHost::spent`](crate::ir::IrHost::spent) is asked here at each block
+//! boundary and by the backends at each guest instruction boundary, and a
+//! `true` stops the run with [`Stop::Spent`] — at an instruction boundary,
+//! with the guest's state published, exactly where a core's own interpreter
+//! would have stopped. A frontend can then admit a block it is not sure fits,
+//! which is the whole of it: the guard stops refusing, and a block that
+//! overruns leaves instead.
+//!
+//! The default answer is `false`, so a host that says nothing gets the
+//! behaviour it had: a run bounded only by blocks — and that default costs
+//! **0.29%** of host instructions, measured by callgrind over the same 120
+//! guest seconds of `pc64`, which is the `test`/`jcc` `jit::x86` now emits
+//! after each region's flush.
+//!
+//! What it buys, on the same board and the same nine hundred guest seconds the
+//! table above profiled: **95.4% of guest instructions retiring inside a block
+//! becomes 97.3%**, the interpreted remainder falls from 83.5 M to 49.1 M, and
+//! the run goes from a median 89.4 s of wall clock to 76.3 s over three
+//! interleaved reps. Under callgrind, on a 120-second window where the guard
+//! is the only thing still refusing blocks, adopting it is **−9.4%** of host
+//! instructions.
+//!
+//! Two things a host must get right before it may say `true`, both of which
+//! were found by a guest that stopped booting rather than by a test:
+//! [`IrHost::spent`](crate::ir::IrHost::spent) states them.
+//!
 //! # Safe points
 //!
 //! A [`Dispatcher`] carrying an [`ExitFlag`] tests it at each block boundary
@@ -242,6 +285,15 @@ impl StoreLog for DirtyPages {
 pub enum Stop {
     /// The block budget ran out. The guest is mid-flight and the PC is live.
     Budget,
+    /// The **tick** budget ran out: [`IrHost::spent`](crate::ir::IrHost::spent)
+    /// answered `true`, either at a block boundary or inside a block.
+    ///
+    /// A different currency from [`Stop::Budget`], and a different owner: the
+    /// count of blocks is the dispatcher's, and the ticks are the host's, so
+    /// only the host can say when they are gone. The guest is left at
+    /// [`Run::pc`], which is a guest instruction boundary that has not
+    /// started, and everything before it has retired.
+    Spent,
     /// The safe-point flag was raised (`ROADMAP.md` §4.7).
     Exit,
     /// A guest access faulted. The guest's own fault path takes it from here.
@@ -404,6 +456,14 @@ impl Dispatcher {
 
     /// Run at most `budget` blocks from `pc`.
     ///
+    /// And at most as many ticks as the host says it has:
+    /// [`IrHost::spent`](crate::ir::IrHost::spent) ends the run with
+    /// [`Stop::Spent`], at a block boundary here or at a guest instruction
+    /// boundary inside a block. A run always executes at least one block and a
+    /// block always retires at least one guest instruction, whatever that
+    /// method says — see the module docs for why that is not a rounding error
+    /// but the property a core's two engines agree through.
+    ///
     /// # Errors
     ///
     /// Whatever [`Frontend::translate`] or
@@ -437,6 +497,17 @@ impl Dispatcher {
             }
             if self.exit.as_ref().is_some_and(ExitFlag::raised) {
                 break Stop::Exit;
+            }
+            // The tick budget, at a block boundary. Skipped for the first
+            // block of a run, and that is the same rule
+            // [`Interp`](crate::ir::Interp) applies to the first boundary of a
+            // block: a caller whose own interpreter always retires one guest
+            // instruction per call must not be handed a run that retired none,
+            // or the two stop agreeing about how far a quantum got. So a run
+            // executes at least one block, a block retires at least one
+            // instruction, and after that the host decides.
+            if blocks > 0 && host.spent() {
+                break Stop::Spent;
             }
             // Per block, not per run. A guest store can remap an address
             // space, a store ends its block, and a chained successor would
@@ -511,6 +582,26 @@ impl Dispatcher {
             match outcome {
                 Outcome::Exit => pc = host.read_slot(pc_slot) as u64,
                 Outcome::Goto { pc: next } | Outcome::Lookup { pc: next } => pc = next,
+                // The block left part-way through, at a guest instruction
+                // boundary it published its state at. The chain ends here
+                // whatever the block budget still allows: the ticks are gone,
+                // and the next block would spend ticks the caller does not
+                // have.
+                //
+                // **The one mutation survivor of this change**, and it is
+                // stated rather than tested away. Deleting the `break` leaves
+                // every test passing, because the loop then goes round once,
+                // reads the epoch, and stops at the top with the same
+                // `Stop::Spent` at the same PC — `Frontend::enter` is never
+                // reached, so nothing is charged and nothing is translated.
+                // The two are equivalent *exactly while*
+                // [`IrHost::spent`](crate::ir::IrHost::spent)'s monotonicity
+                // holds, which is the contract that method states and cannot
+                // check. This break is what makes the equivalence not matter.
+                Outcome::Spent { pc: at } => {
+                    pc = at;
+                    break Stop::Spent;
+                }
                 Outcome::Fault(f) => break Stop::Fault(f),
                 Outcome::Unsupported { op, at } => break Stop::Unsupported { op, at },
             }
@@ -622,6 +713,63 @@ mod tests {
         b.finish()
     }
 
+    /// A block whose successor is **computed**: the exit boundary carries a
+    /// placeholder PC and the real one in the slot its map publishes.
+    ///
+    /// The shape `cpu::x86::lift` closes a `RET` with — `InsnStart::pc` is
+    /// static, so a block that does not know its successor at lift time puts
+    /// the program-order address there and the truth in [`RegSlot`] — and the
+    /// reason a run may not leave at an exit boundary.
+    fn computed(pc: u64, next: u64, placeholder: u64) -> Block {
+        let mut b = BlockBuilder::new(pc, 0);
+        b.insn_start(InsnStart {
+            pc,
+            next_pc: next,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(1);
+        let t = b.imm(Type::I64, Const::Int(u128::from(next)));
+        b.insn_start(InsnStart {
+            pc: placeholder,
+            next_pc: placeholder,
+            ticks: 1,
+            live: vec![(PC, t)],
+        });
+        b.exit_tb();
+        b.finish()
+    }
+
+    /// A frontend serving [`computed`] blocks, all lying about their exit PC.
+    struct Computed {
+        step: u64,
+        limit: u64,
+    }
+
+    impl<H: ?Sized> Frontend<H> for Computed {
+        fn epoch(&mut self) -> Epoch {
+            Epoch::default()
+        }
+        fn key(&mut self) -> u64 {
+            0
+        }
+        fn pc_slot(&self) -> RegSlot {
+            PC
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            let next = if pc + self.step >= self.limit {
+                0x1000
+            } else {
+                pc + self.step
+            };
+            Ok(Translation {
+                block: computed(pc, next, 0xdead_0000 | pc),
+                page: pc & !PAGE_MASK,
+                insns: 1,
+            })
+        }
+    }
+
     /// A frontend over a fixed straight-line chain of blocks.
     struct Chain {
         /// `pc -> next pc`, for as many blocks as the test wants.
@@ -662,6 +810,19 @@ mod tests {
         slots: [u64; 4],
         ticks: u64,
         dirty: DirtyPages,
+        /// The tick allowance, or `None` for a host that never stops a block —
+        /// which is every host that existed before [`IrHost::spent`] did.
+        allowance: Option<u64>,
+    }
+
+    impl Host {
+        /// A host that must leave at the first boundary past `ticks`.
+        fn within(ticks: u64) -> Host {
+            Host {
+                allowance: Some(ticks),
+                ..Host::default()
+            }
+        }
     }
 
     impl IrHost for Host {
@@ -682,6 +843,9 @@ mod tests {
             self.ticks += ticks;
         }
         fn insn_start(&mut self, _mark: &InsnStart) {}
+        fn spent(&self) -> bool {
+            self.allowance.is_some_and(|a| self.ticks >= a)
+        }
     }
 
     impl StoreLog for Host {
@@ -892,6 +1056,246 @@ mod tests {
         let run = d.run(&mut f, &mut h, 0x1000, 10).expect("runs");
         assert_eq!(run.insns, 160);
         assert_eq!(h.ticks, 160);
+    }
+
+    // ---- the tick allowance ------------------------------------------
+
+    #[test]
+    fn a_block_leaves_at_the_first_instruction_boundary_past_its_allowance() {
+        // The whole mechanism in one assertion: a sixteen-instruction trace,
+        // an allowance of five, and the run stops *inside* it having retired
+        // exactly five — where the block used to be refused outright because
+        // its worst case did not fit.
+        let mut d = Dispatcher::new();
+        let mut f = Traces {
+            insns: 16,
+            leave_at: None,
+            epoch: Epoch::default(),
+        };
+        let mut h = Host::within(5);
+        let run = d.run(&mut f, &mut h, 0x1000, 10).expect("runs");
+        assert_eq!(run.stop, Stop::Spent);
+        assert_eq!(run.blocks, 1, "one block was entered");
+        assert_eq!(run.insns, 5, "and five of its sixteen instructions retired");
+        assert_eq!(h.ticks, 5, "charging exactly what retired, and no more");
+        assert_eq!(
+            run.pc,
+            0x1000 + 5 * 4,
+            "the guest stands at the instruction that did not start"
+        );
+    }
+
+    #[test]
+    fn an_allowance_that_is_already_spent_still_retires_one_instruction() {
+        // The floor, and it is not a rounding error. A caller's own
+        // interpreter always retires one guest instruction per call — that is
+        // what `while used < allowance { advance() }` means — so a run that
+        // retired none would leave the guest exactly where it found it and the
+        // two engines would part company about how far the quantum got. So the
+        // first block of a run always starts, and the first boundary of a
+        // block never stops it.
+        let mut d = Dispatcher::new();
+        let mut f = Traces {
+            insns: 16,
+            leave_at: None,
+            epoch: Epoch::default(),
+        };
+        let mut h = Host::within(0);
+        let run = d.run(&mut f, &mut h, 0x1000, 10).expect("runs");
+        assert_eq!(run.stop, Stop::Spent);
+        assert_eq!(run.blocks, 1);
+        assert_eq!(run.insns, 1);
+        assert_eq!(h.ticks, 1);
+        assert_eq!(run.pc, 0x1004);
+    }
+
+    #[test]
+    fn a_spent_allowance_ends_the_chain_at_a_block_boundary_too() {
+        // The other half of the check: one-instruction blocks, so the
+        // allowance runs out between them rather than inside one. The chain
+        // stops, and the block budget of forty never comes into it.
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut f = chain(4, 0x1010);
+        let mut h = Host::within(3);
+        let run = d.run(&mut f, &mut h, 0x1000, 40).expect("runs");
+        assert_eq!(run.stop, Stop::Spent);
+        assert_eq!(run.insns, 3);
+        assert_eq!(h.ticks, 3);
+        assert_eq!(run.pc, 0x100c);
+    }
+
+    #[test]
+    fn a_run_never_leaves_at_an_exit_boundary_because_its_pc_may_be_a_placeholder() {
+        // The bug this pins cost a Linux guest a jump into the middle of
+        // nowhere. `InsnStart::pc` is a **static** column, and a block whose
+        // successor is computed — every `RET`, every indirect jump — cannot
+        // know it at lift time, so it writes the program-order address there
+        // and publishes the real one through the slot. A run that leaves at
+        // such a boundary and believes `mark.pc` resumes the guest one
+        // instruction past the end of the block.
+        //
+        // The answer is not to special-case it but to never stop there: the
+        // terminator is the very next IR instruction, it charges nothing, and
+        // the block ends of its own accord with the PC its map published. So
+        // the allowance is spent exactly at the exit boundary here, and the
+        // guest still comes out at the successor.
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut f = Computed {
+            step: 4,
+            limit: 0x1010,
+        };
+        let mut h = Host::within(1);
+        let run = d.run(&mut f, &mut h, 0x1000, 40).expect("runs");
+        assert_eq!(run.stop, Stop::Spent);
+        assert_eq!(run.insns, 1);
+        assert_eq!(
+            run.pc, 0x1004,
+            "the run resumed at the exit boundary's placeholder"
+        );
+        assert_eq!(h.slots[PC.0 as usize], 0x1004);
+    }
+
+    /// The same, compiled.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_compiled_run_never_leaves_at_an_exit_boundary_either() {
+        // The backend is told which boundaries are exit boundaries at compile
+        // time, because its replay is handed a range of events and never sees
+        // an instruction index. A backend that was told wrong would resume the
+        // guest at the placeholder while the interpreter resumed it correctly,
+        // which is a divergence no state comparison of a *finished* block can
+        // reach.
+        for allowance in [0u64, 1, 2, 5] {
+            let mut interpreted = Dispatcher::with_cache(BlockCache::with_capacity(64));
+            let mut hi = Host::within(allowance);
+            let a = interpreted
+                .run(
+                    &mut Computed {
+                        step: 4,
+                        limit: 0x1010,
+                    },
+                    &mut hi,
+                    0x1000,
+                    40,
+                )
+                .expect("runs");
+
+            let mut compiled = Dispatcher::with_cache(BlockCache::with_capacity(64))
+                .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+            let mut hc = Host::within(allowance);
+            let b = compiled
+                .run(
+                    &mut Computed {
+                        step: 4,
+                        limit: 0x1010,
+                    },
+                    &mut hc,
+                    0x1000,
+                    40,
+                )
+                .expect("runs");
+
+            assert!(compiled.stats().compiled > 0, "nothing was compiled");
+            assert_eq!(a.pc, b.pc, "at an allowance of {allowance}");
+            assert_eq!(a.stop, b.stop, "at an allowance of {allowance}");
+            assert_eq!(a.insns, b.insns, "at an allowance of {allowance}");
+            assert_eq!(hi.slots, hc.slots, "at an allowance of {allowance}");
+            assert_eq!(
+                a.pc & 0xdead_0000,
+                0,
+                "the run resumed at a placeholder: {:#x}",
+                a.pc
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_that_says_nothing_is_bounded_by_blocks_exactly_as_before() {
+        // The default, asserted rather than assumed: every host in the tree
+        // that predates `IrHost::spent` must run identically.
+        let mut d = Dispatcher::new();
+        let mut f = Traces {
+            insns: 16,
+            leave_at: None,
+            epoch: Epoch::default(),
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 10).expect("runs");
+        assert_eq!(run.stop, Stop::Budget);
+        assert_eq!(run.insns, 160);
+    }
+
+    /// The allowance, with the blocks executed as host code.
+    ///
+    /// `ROADMAP.md` §0's claim applied to the newest way a block can end: the
+    /// two engines must leave at the **same** boundary, with the same ticks
+    /// charged and the same guest state, or a core that admits a block it is
+    /// not sure fits produces a different state hash depending on which engine
+    /// ran it. Compared rather than asserted — both runs, same programs.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_compiled_block_leaves_at_exactly_the_boundary_the_interpreter_leaves_at() {
+        for allowance in [0u64, 1, 5, 15, 16, 31, 100] {
+            let traces = || Traces {
+                insns: 16,
+                leave_at: None,
+                epoch: Epoch::default(),
+            };
+            let mut interpreted = Dispatcher::new();
+            let mut hi = Host::within(allowance);
+            let a = interpreted
+                .run(&mut traces(), &mut hi, 0x1000, 10)
+                .expect("runs");
+
+            let mut compiled = Dispatcher::new()
+                .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+            let mut hc = Host::within(allowance);
+            let b = compiled
+                .run(&mut traces(), &mut hc, 0x1000, 10)
+                .expect("runs");
+
+            assert!(
+                compiled.stats().compiled > 0,
+                "nothing was compiled at {allowance}"
+            );
+            assert_eq!(a.stop, b.stop, "at an allowance of {allowance}");
+            assert_eq!(a.pc, b.pc, "at an allowance of {allowance}");
+            assert_eq!(a.insns, b.insns, "at an allowance of {allowance}");
+            assert_eq!(a.blocks, b.blocks, "at an allowance of {allowance}");
+            assert_eq!(hi.ticks, hc.ticks, "at an allowance of {allowance}");
+            assert_eq!(hi.slots, hc.slots, "at an allowance of {allowance}");
+        }
+    }
+
+    /// The same, over a chain of one-instruction blocks.
+    ///
+    /// A different shape on purpose: here the allowance runs out between
+    /// blocks as often as inside one, so the dispatcher's own boundary check
+    /// and the backend's have to agree with the interpreter's *together*.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_compiled_chain_leaves_where_an_interpreted_chain_leaves() {
+        for allowance in [0u64, 1, 2, 3, 7, 40] {
+            let mut interpreted = Dispatcher::with_cache(BlockCache::with_capacity(64));
+            let mut hi = Host::within(allowance);
+            let a = interpreted
+                .run(&mut chain(4, 0x1010), &mut hi, 0x1000, 40)
+                .expect("runs");
+
+            let mut compiled = Dispatcher::with_cache(BlockCache::with_capacity(64))
+                .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+            let mut hc = Host::within(allowance);
+            let b = compiled
+                .run(&mut chain(4, 0x1010), &mut hc, 0x1000, 40)
+                .expect("runs");
+
+            assert!(compiled.stats().compiled > 0, "nothing was compiled");
+            assert_eq!(a.stop, b.stop, "at an allowance of {allowance}");
+            assert_eq!(a.pc, b.pc, "at an allowance of {allowance}");
+            assert_eq!(a.insns, b.insns, "at an allowance of {allowance}");
+            assert_eq!(hi.ticks, hc.ticks, "at an allowance of {allowance}");
+            assert_eq!(hi.slots, hc.slots, "at an allowance of {allowance}");
+        }
     }
 
     #[test]
