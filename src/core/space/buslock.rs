@@ -79,11 +79,91 @@
 //! side effects of an MMIO operand, which is a worse failure than the one it
 //! fixes.
 //!
+//! ## Which threading mode can see it
+//!
+//! Not [`ThreadingMode::Deterministic`], and the argument is structural rather
+//! than statistical. That mode runs every runnable on one host thread, so the
+//! finest grain it can interleave at is one whole instruction: between a locked
+//! instruction's read and its write, *nothing executes*. `Parallel` is where
+//! the residual lives, and it is opt-in — no machine file in the tree selects
+//! it; `--threading parallel` on the command line does. Under `Accel` the
+//! question does not arise, because the host's silicon performs the guest's
+//! read-modify-write and this object is never reached.
+//!
+//! The JIT does not widen any of this, and it is worth checking rather than
+//! assuming, because `IrHost::spent` can leave a block part-way at an
+//! instruction boundary. **No core lifts an atomic instruction into a block at
+//! all**: the x86 frontend refuses a `LOCK` prefix and `XCHG` with a memory
+//! operand outright (`cpu::x86::lift`), the AArch64 one excludes the exclusives
+//! and the LSE atomics, and the RISC-V one excludes the whole `A` extension. So
+//! there is no block for a budget to leave in the middle of an atomic, and
+//! every locked read-modify-write in the tree runs through the interpreter with
+//! this lock held.
+//!
+//! There is exactly one way the deterministic claim can fail, and it is worth
+//! writing down because it is not obvious: a **lazily advanced device** is
+//! caught up from inside the access that dispatches to it (`ROADMAP.md` §4.2)
+//! and `LazyDevice::advance_to` is free to touch its own bus. So a locked
+//! read-modify-write whose operand is *MMIO* can have another master's write
+//! land inside it even on one thread. One whose operand is **RAM** cannot: a
+//! RAM access dispatches to no device, so there is nowhere for a catch-up to
+//! happen. No device in the tree writes the word a locked instruction is
+//! addressing while serving that instruction's own access, so this is a shape
+//! to keep in mind rather than a defect that has been observed.
+//!
+//! ## The sharper form, with a number
+//!
+//! Stated as a lost update the residual is nearly impossible to catch: the
+//! value left behind is one some legal ordering could also have produced. It
+//! has a second form that is unmistakable. [`RamStore`](super::RamStore) is a
+//! `Vec<AtomicU8>` and every access to it is a **byte loop**, so a plain
+//! four-byte store is four independent stores — and a locked instruction's read
+//! that overlaps one comes back holding a *mixture of the old and the new
+//! word*, a value that was never in memory. All three architectures forbid that
+//! outright for a naturally aligned access (*Intel SDM* volume 3 §9.1.1; ARM
+//! DDI 0487 B2.2.1; RISC-V Unprivileged ISA §1.4).
+//!
+//! `tests/smp_single_copy_atomicity.rs` is the instrument. Sixty thousand
+//! `LOCK XADD`s racing sixty thousand alternating plain stores, two host
+//! threads, debug: **90 to 138 torn reads**, with the bus taken all sixty
+//! thousand times. The lock was working; the plain store went through it
+//! anyway, because a plain store does not ask. The same file runs the same two
+//! programs on one host thread with a randomised instruction-by-instruction
+//! schedule — finer than any quantum the scheduler hands out — and tears zero
+//! times while demonstrably seeing the writer's other value thousands of times.
+//!
+//! Note what that measurement does *not* say. The tearing is
+//! [`RamStore`](super::RamStore)'s byte loop, not this lock's doing, and
+//! `space::store`'s "What per-byte atomicity is not" has the cost of the two
+//! ways to remove it. Removing it would leave the residual in its lost-update
+//! form, which is what this section originally described and what would still
+//! be here.
+//!
+//! ## The cheap approximation, and why it is refused
+//!
+//! The obvious way to have it both ways is to put [`BusLock::held`] on the
+//! store path — one relaxed load, the same shape as the monitor's fast path —
+//! and take the lock only when it says somebody has the bus. It looks free and
+//! it is not correct: a store that read the flag as false while the locked
+//! instruction was in the act of claiming the bus proceeds anyway, so its bytes
+//! can still land between the read and the write. Making the check and the
+//! store one indivisible act means the store taking the lock, which is the cost
+//! the design exists to avoid, or a shared/exclusive pair whose reader side is
+//! a read-modify-write and measures like one (`tests/memory_model_costs.rs`:
+//! ~4 ns, against ~1 ns for the store it would be guarding).
+//!
+//! So the choice is not "cheap fix or no fix". It is between a documented
+//! boundary and a change that makes the same defect several orders of magnitude
+//! rarer without removing it — which is strictly worse, because what is left is
+//! a bug nobody can reproduce.
+//!
 //! # It is not state
 //!
 //! A bus lock is never held across an instruction boundary, so a snapshot
 //! taken at a safe point can never observe one held. There is nothing to
 //! serialize and no chunk version moves.
+//!
+//! [`ThreadingMode::Deterministic`]: crate::core::sched::ThreadingMode::Deterministic
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};

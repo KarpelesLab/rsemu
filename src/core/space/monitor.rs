@@ -99,6 +99,30 @@
 //! claim is pinned by `BusLock`'s own
 //! `a_locked_write_still_breaks_a_sibling_reservation` instead.
 //!
+//! # Why the pair needs no protection against a *plain* store
+//!
+//! [`BusLock`](super::BusLock) has a residual it states in its own
+//! documentation: a plain store by another observer can land inside a locked
+//! read-modify-write's window. The load-reserved pair has no such residual, and
+//! the reason is worth stating because it is not obvious — it is the same
+//! optimism that makes this object cheap.
+//!
+//! A plain store that lands between the `LR` and the `SC` has, by definition,
+//! written the reservation granule, so it has cleared the slot and the `SC`
+//! fails. That covers the case where the store lands *inside the `LR`'s own
+//! bytes* as well: [`RamStore`](super::RamStore) accesses byte by byte, so an
+//! `LR` racing a wide store can read a value that was never in memory
+//! (`space::store`, "What per-byte atomicity is not") — but the store broke the
+//! reservation on its way past, so the `SC` cannot commit anything derived from
+//! that value and the guest's retry loop takes it again. The torn read is
+//! discarded before it is architecturally visible.
+//!
+//! So the gap `tests/smp_single_copy_atomicity.rs` measures is **x86's alone**
+//! for the read-modify-write case, which is precisely why it shows up against
+//! the bus lock and not here. A plain wide *load* on AArch64 or RISC-V has no
+//! such backstop and tears exactly as it does on x86; that is the store's
+//! property, not this one's.
+//!
 //! # It is derived state and it is not serialized
 //!
 //! The architectural reservation stays where it always was: the core's own

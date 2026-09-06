@@ -21,6 +21,71 @@
 //! the IR lifter's job (§4.7): the store provides per-byte atomicity so that a
 //! racing access is never undefined behaviour, and nothing more.
 //!
+//! # What per-byte atomicity is not
+//!
+//! "Per-byte, and nothing more" is a stronger claim than it looks, so it is
+//! spelled out rather than left to be discovered. A four-byte guest store is
+//! **four independent byte stores**, and a four-byte guest load that overlaps
+//! one comes back holding a mixture of the old and the new word — a value that
+//! was never in memory. Every architecture in the tree forbids that for a
+//! naturally aligned access up to its register width: *Intel SDM* volume 3
+//! §9.1.1, ARM DDI 0487 B2.2.1 ("single-copy atomicity"), RISC-V Unprivileged
+//! ISA §1.4. A guest that publishes a pointer with an ordinary store and reads
+//! it with an ordinary load — which is every `WRITE_ONCE`/`READ_ONCE` pair in a
+//! Linux kernel — is relying on exactly that guarantee.
+//!
+//! It is reachable, and `tests/smp_single_copy_atomicity.rs` reaches it: sixty
+//! thousand aligned four-byte loads racing sixty thousand aligned four-byte
+//! stores tear **117 to 361 times** on two host threads. On **one** host thread
+//! it tears zero times however finely the two programs are interleaved, because
+//! nothing runs between the bytes of a store — so this is a
+//! `ThreadingMode::Parallel` property, and `Parallel` is opt-in
+//! (`--threading parallel`; no machine file in the tree asks for it, and
+//! `usermode`'s `ThreadSet` runs every guest thread on one host thread by
+//! design).
+//!
+//! **It is also engine-dependent, which is the part that would surprise
+//! someone.** The path measured above is the interpreter's. A store the JIT
+//! *inlines* never comes through here at all: `jit::x86` emits one host store
+//! of the guest's width through [`RamStore::host_ptr`], so on an x86-64 host an
+//! inlined aligned access **is** single-copy atomic. Two engines running the
+//! same guest therefore differ in what a sibling core can observe.
+//!
+//! ## What removing it would cost, measured
+//!
+//! Two shapes were built and timed on this host (release, best of five, four
+//! million operations, nanoseconds per access):
+//!
+//! | | store 1 B | 2 B | 4 B | 8 B | load 1 B | 2 B | 4 B | 8 B |
+//! | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+//! | `Vec<AtomicU8>` — today | 0.74 | 0.89 | 1.25 | 1.99 | 0.67 | 0.90 | 1.30 | 2.12 |
+//! | `Vec<AtomicU64>`, sub-word writes by CAS | 3.86 | 4.05 | 4.24 | 1.55 | 0.65 | 0.72 | 1.03 | 1.53 |
+//! | `Vec<AtomicU8>` + a wide aligned atomic through a cast pointer | 1.34 | 1.34 | 1.40 | 1.40 | 1.22 | 1.27 | 1.31 | 1.35 |
+//!
+//! The safe one costs **+3 ns on every sub-word store** — against the ~25 ns a
+//! whole store through `SpaceView::write_span` measures, that is +12% on the
+//! hottest path in the emulator, paid by every board on every store to buy
+//! something only an opt-in mode can observe. The monitor's shape was decided
+//! by 1.6 ns; this is not close.
+//!
+//! The cheap one is roughly cost-neutral (+0.6 ns on a byte access, −0.6 ns on
+//! an eight-byte one) and is the one that would actually be worth having — but
+//! it needs `unsafe` in this file, which is a design review rather than a
+//! commit (`CLAUDE.md`). Whether it is an **eighth** subsystem or the *first*
+//! one moving inside its own seam is a fair question: `ROADMAP.md` §0 sanctions
+//! "the RAM host-pointer fast path", [`RamStore::host_ptr`] is that seam, and
+//! today the dereference happens in generated code rather than in Rust. The
+//! harder half is soundness, not bookkeeping: mixed-size atomic access to one
+//! address is what the hardware does and what `host_ptr`'s consumers already
+//! rely on, but it is *outside* the Rust and C++ memory models rather than
+//! merely unchecked by them, and doing it from Rust puts both widths in front
+//! of the optimiser. Whoever takes it up should weigh that, not the
+//! nanoseconds.
+//!
+//! Neither is taken here. What changed is that the boundary is written down
+//! with a reproducer and a price on it instead of being an unexamined
+//! consequence of a type choice.
+//!
 //! # Why the allocation is host-page aligned
 //!
 //! A hypervisor is handed guest RAM as a *host address*, and both KVM's
