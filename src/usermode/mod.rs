@@ -104,6 +104,17 @@
 //! `clone3`, which `pthread_create` asks for before falling back to `clone`.
 //! Every one of them was in the *consumer's* half.
 //!
+//! And a guest can now be told something that changes **what it executes**
+//! rather than what it prints. `AT_HWCAP` was a number a test asserted until
+//! there were two AArch64 *parts* to assert it against: the same
+//! `threads-aarch64` binary on a Cortex-A53 takes an `ldxr`/`stxr` loop for
+//! each of its forty thousand increments and needs 851702 ticks, and on a
+//! Neoverse N1 that says `HWCAP_ATOMICS` it takes compiler-rt's `LDADD` path
+//! instead and needs 690851 — one file, one answer, two instruction streams.
+//! A second guest compiled `-C target-feature=+lse` has the atomics inline and
+//! runs only on the part that has the feature; the Armv8.0 part refuses its
+//! first `LDADD`, which is exactly how a guest probes for one.
+//!
 //! That needed the one policy change level 3 has had. A dynamic loader opens
 //! files, so *"the guest may be told about itself"* became *"the guest may be
 //! told about itself and about what it was handed"* — a set of `(guest path,
@@ -119,9 +130,14 @@
 //! and is the *consumer's* half written out longhand — §2.1's line, held, with
 //! working programs on the far side of it. `docs/system/usermode-abi.md` has
 //! the ABI sources, the host-filesystem policy, the trace comparisons and the
-//! one thing this exercise found that is **not** on the consumer's side: the
-//! exclusive monitor is per core, so two guest threads' `lr`/`sc` pairs are
-//! not coherent with each other.
+//! two things this exercise has found that are **not** on the consumer's side.
+//! The first is closed: the exclusive monitor used to be per core, so two
+//! guest threads' `lr`/`sc` pairs were not coherent with each other. The
+//! second is open and is not this module's to close either —
+//! [`Perms::EXEC`](crate::core::space::Perms::EXEC) is carried and not
+//! enforced, because a guest's instruction fetch reaches the address space
+//! indistinguishable from a load. `mem`'s header and the ABI document say
+//! where that belongs and what it would cost.
 //!
 //! # Driving it
 //!

@@ -1289,6 +1289,17 @@ mod a64 {
     /// atomic a threaded guest executes.
     const HWCAP: u64 = (1 << 0) | (1 << 1);
 
+    /// `HWCAP_ATOMICS`, bit 8 of the same bitmap: this part implements
+    /// `FEAT_LSE`.
+    ///
+    /// Set only for [`ARCH_LSE`], whose core is a [`Config::neoverse_n1`].
+    /// Under-claiming a feature is always safe — the guest takes the older
+    /// path — and over-claiming is the failure the comment on [`HWCAP`]
+    /// describes, so the bit travels with the `Config` that earns it and not
+    /// with the architecture.
+    #[cfg(feature = "std")]
+    const HWCAP_ATOMICS: u64 = 1 << 8;
+
     /// `svc #0`.
     const SVC: u32 = 0xd400_0001;
 
@@ -1355,6 +1366,11 @@ mod a64 {
     struct A64 {
         cpu: Arc<Cpu>,
         space: Arc<AddressSpace>,
+        /// The part every thread of this process is. Carried rather than
+        /// re-derived because [`Thread::spawn`] builds a *second* core, and a
+        /// process whose threads were different parts is not a thing a machine
+        /// can be.
+        config: Config,
     }
 
     /// A core in the state a level-3 guest runs in.
@@ -1371,8 +1387,13 @@ mod a64 {
     /// * **`SCTLR_EL1.M = 0`**: no MMU, so the map [`UserMemory`] builds is
     ///   the address space the guest sees. Level 3's whole memory model is
     ///   "there is no page table", and turning the MMU on would need one.
-    fn cpu(space: &Arc<AddressSpace>) -> Arc<Cpu> {
-        let cpu = Arc::new(Cpu::new(Config::cortex_a53()));
+    ///
+    /// The *part* is a parameter because a level-3 process is entitled to be
+    /// run on more than one: [`ARCH`] is a [`Config::cortex_a53`] and
+    /// [`ARCH_LSE`] a [`Config::neoverse_n1`], and the pair is what turns
+    /// `AT_HWCAP` from a number a test asserts into a number a guest acts on.
+    fn cpu(space: &Arc<AddressSpace>, config: Config) -> Arc<Cpu> {
+        let cpu = Arc::new(Cpu::new(config));
         cpu.attach_space(Arc::clone(space));
         let mut regs = cpu.sysregs();
         regs.el = El::El0;
@@ -1423,7 +1444,7 @@ mod a64 {
         }
 
         fn spawn(&self, sp: u64) -> Arc<dyn Thread> {
-            let child = cpu(&self.space);
+            let child = cpu(&self.space, self.config);
             // `x31` is the zero register or the stack pointer depending on the
             // instruction, and is not part of the general file.
             for i in 0..31 {
@@ -1441,17 +1462,45 @@ mod a64 {
             Arc::new(A64 {
                 cpu: child,
                 space: Arc::clone(&self.space),
+                config: self.config,
             })
         }
     }
 
-    fn start(mem: &Arc<UserMemory>, entry: u64, sp: u64) -> Arc<dyn Thread> {
+    /// The first thread of a process, on `config`.
+    fn start_on(mem: &Arc<UserMemory>, entry: u64, sp: u64, config: Config) -> Arc<dyn Thread> {
         let space = Arc::clone(mem.space());
-        let cpu = cpu(&space);
+        let cpu = cpu(&space, config);
         cpu.set_pc(entry);
         cpu.set_sp(sp);
-        Arc::new(A64 { cpu, space })
+        Arc::new(A64 { cpu, space, config })
     }
+
+    fn start(mem: &Arc<UserMemory>, entry: u64, sp: u64) -> Arc<dyn Thread> {
+        start_on(mem, entry, sp, Config::cortex_a53())
+    }
+
+    /// The same, on a part that has `FEAT_LSE`. Only a `std` build can read
+    /// the guest that needs one off a disk, so only a `std` build has a use
+    /// for the part.
+    #[cfg(feature = "std")]
+    fn start_lse(mem: &Arc<UserMemory>, entry: u64, sp: u64) -> Arc<dyn Thread> {
+        start_on(mem, entry, sp, Config::neoverse_n1())
+    }
+
+    /// The instruction encodings every synthetic AArch64 guest is made of.
+    /// Base Armv8.0-A, so they assemble the same for either part.
+    const ASM: Asm = Asm {
+        li,
+        ld,
+        st,
+        lr,
+        sc,
+        nop: NOP,
+        fpu,
+        jr,
+        syscall: SVC,
+    };
 
     pub(super) const ARCH: Arch = Arch {
         name: "aarch64",
@@ -1462,17 +1511,29 @@ mod a64 {
         #[cfg(feature = "std")]
         suffix: "aarch64",
         start,
-        asm: Asm {
-            li,
-            ld,
-            st,
-            lr,
-            sc,
-            nop: NOP,
-            fpu,
-            jr,
-            syscall: SVC,
-        },
+        asm: ASM,
+    };
+
+    /// The same architecture on a part that has `FEAT_LSE`, told so.
+    ///
+    /// Not in [`ARCHES`](super::ARCHES): it is the *same* architecture and the
+    /// *same* guests, so putting it there would double every test above for no
+    /// new statement. It is reached by name, by the three tests that are about
+    /// the difference.
+    ///
+    /// `suffix` is `aarch64` for the same reason — a guest built for AArch64
+    /// runs on both parts, which is the entire point. Only the guest that is
+    /// compiled `-C target-feature=+lse` needs a file of its own, and it gets
+    /// one by being a different `name`.
+    #[cfg(feature = "std")]
+    pub(super) const ARCH_LSE: Arch = Arch {
+        name: "aarch64+lse",
+        machine: 183,
+        hwcap: HWCAP | HWCAP_ATOMICS,
+        uname: "aarch64",
+        suffix: "aarch64",
+        start: start_lse,
+        asm: ASM,
     };
 }
 
@@ -3666,6 +3727,113 @@ fn two_segments_sharing_a_page_get_the_union_of_their_permissions() {
     }
 }
 
+/// **A ledger line, and the only one this module has: [`Prot::EXEC`] is
+/// carried and not enforced.**
+///
+/// Two shapes, both of which a real Linux kills the process for, and both of
+/// which run here. The first is an image that never asked to be executable —
+/// the same `hello` file as every test above with one flag word changed. The
+/// second is the one a dynamic loader actually builds: a page that *was*
+/// executable and is `mprotect`ed down, which is the last step of `ld.so`'s
+/// RELRO sequence pointed at the wrong range.
+///
+/// What the test asserts positively is that the **bookkeeping is right** —
+/// `mappings()` says `rw-`, the write permission is enforced on the same
+/// mapping in the same breath, and a consumer building `/proc/self/maps` out
+/// of this gets the truth. Only the fetch is unchecked, and it is unchecked
+/// because no rsemu core marks an instruction fetch as one: by the time an
+/// access reaches the address space it is a read like any other. That makes it
+/// a question about `core::space`'s access path and about every core's fetch,
+/// not about this layer — `docs/system/usermode-abi.md` writes out the change.
+///
+/// This test is a characterisation of a gap, so it fails when the gap closes.
+/// That is deliberate: the day a core marks its fetches, the two `expect`s
+/// here become the two places that say what the new behaviour must be, and a
+/// grep for this name finds them.
+#[test]
+fn a_fetch_from_a_mapping_that_forbids_execution_is_not_refused_yet() {
+    for arch in ARCHES {
+        // 1. An image whose only `PT_LOAD` is `rw-`.
+        let message = b"ran out of a mapping that never asked to be executable";
+        let mut file = hello_elf(arch, message);
+        // `p_flags` is at offset 4 of the first program header, and the
+        // program header table starts at 64. One word: the whole difference
+        // between this file and the one every test above runs.
+        file[68..72].copy_from_slice(&(PF_R | PF_W).to_le_bytes());
+
+        let mem = UserMemory::new(48);
+        load(&mem, &file, arch.machine, PIE_BASE).unwrap();
+        let maps = mem.mappings();
+        assert_eq!(
+            maps[0].prot,
+            Prot::RW,
+            "{}: the map records what the flags asked for: {maps:?}",
+            arch.name
+        );
+        // And the half of it that *is* enforced, on the same mapping, so the
+        // asymmetry is visible in one place rather than inferred.
+        assert!(
+            mem.read_bytes(maps[0].base, &mut [0u8; 4]).is_ok(),
+            "{}: it permits reads",
+            arch.name
+        );
+        let out = run_synthetic(arch, &file).expect(
+            "TODAY: a fetch out of a non-executable mapping succeeds. When a core \
+             marks its fetches this becomes a fault at the entry point, which is \
+             what Linux does — a `SIGSEGV` before the first instruction retires.",
+        );
+        assert_eq!(out.status, 0, "{}", arch.name);
+        assert_eq!(&out.stdout[..], &message[..], "{}", arch.name);
+
+        // 2. A page that was executable and is not any more: the guest drops
+        //    `PROT_EXEC` from the page it is being fetched out of, and carries
+        //    on being fetched out of it.
+        let asm = arch.asm;
+        let len = message.len() as u64;
+        let file = assemble(
+            arch,
+            Link::EXEC,
+            None,
+            move |msg_at| {
+                let mut c = Vec::new();
+                c.extend((asm.li)(0, BASE));
+                c.extend((asm.li)(1, PAGE_SIZE));
+                c.extend((asm.li)(2, mm::PROT_READ));
+                c.extend((asm.li)(Asm::NR, nr::MPROTECT));
+                c.push(asm.syscall);
+                // Everything from here is fetched out of a range that no
+                // longer permits execution.
+                c.extend((asm.li)(0, 1));
+                c.extend((asm.li)(1, msg_at));
+                c.extend((asm.li)(2, len));
+                c.extend((asm.li)(Asm::NR, nr::WRITE));
+                c.push(asm.syscall);
+                c.extend((asm.li)(0, 0));
+                c.extend((asm.li)(Asm::NR, nr::EXIT_GROUP));
+                c.push(asm.syscall);
+                c
+            },
+            message,
+        );
+        let out = run_synthetic(arch, &file).expect(
+            "TODAY: a page can lose `PROT_EXEC` under the program counter and keep \
+             executing. When a core marks its fetches this becomes a fault on the \
+             instruction after the `mprotect` — and note that closing it needs the \
+             block caches dropped too, which the retopology `UserMemory::protect` \
+             performs already does.",
+        );
+        assert!(
+            out.trace.contains(&(nr::MPROTECT, 0)),
+            "{}: the `mprotect` has to have succeeded for this to mean anything: \
+             {:?}",
+            arch.name,
+            out.trace
+        );
+        assert_eq!(out.status, 0, "{}", arch.name);
+        assert_eq!(&out.stdout[..], &message[..], "{}", arch.name);
+    }
+}
+
 #[test]
 fn at_phdr_points_at_the_program_headers_in_guest_memory() {
     for arch in ARCHES {
@@ -4995,11 +5163,39 @@ fn run_built_guest_staged(
 ) {
     let mut ran = 0;
     for arch in ARCHES {
-        let Some(bytes) = guest_binary(&std::format!("{name}-{}", arch.suffix)) else {
-            continue;
-        };
+        if run_built_guest_on(arch, name, argv, envp, budget, stage(arch), &check).is_some() {
+            ran += 1;
+        }
+    }
+    if ran == 0 {
+        std::eprintln!(
+            "usermode: no {name} guest for any architecture in this build. Build one with\n    \
+             scripts/fetch-testdata.sh usermode-guests"
+        );
+    }
+}
+
+/// One built guest on one named architecture, recorded and then replayed with
+/// the host unplugged. `None` if this checkout has not built that guest.
+///
+/// Split out of [`run_built_guest_staged`] because an architecture is not only
+/// an entry in [`ARCHES`]: [`a64::ARCH_LSE`] is the same instruction set on a
+/// *part* with `FEAT_LSE`, and the interesting statement about it is a
+/// comparison against the same guest on the part without — which needs the
+/// outcome back rather than only an assertion over it.
+#[cfg(feature = "std")]
+fn run_built_guest_on(
+    arch: &'static Arch,
+    name: &str,
+    argv: &[&str],
+    envp: &[&str],
+    budget: u64,
+    staged: Stage,
+    check: impl Fn(&'static Arch, &Outcome),
+) -> Option<Outcome> {
+    {
+        let bytes = guest_binary(&std::format!("{name}-{}", arch.suffix))?;
         let journal = Arc::new(Journal::with_mode(JournalMode::Record));
-        let staged = stage(arch);
         let mut world = World::new(Arc::clone(&journal), counting_entropy());
         world.stage = staged.clone();
         let out = run(arch, &bytes, argv, envp, world, budget)
@@ -5050,13 +5246,7 @@ fn run_built_guest_staged(
         // a function of the program, and this is where a recorded one would
         // have shown up.
         assert_eq!(journal.remaining(), 0, "{}: {name}", arch.name);
-        ran += 1;
-    }
-    if ran == 0 {
-        std::eprintln!(
-            "usermode: no {name} guest for any architecture in this build. Build one with\n    \
-             scripts/fetch-testdata.sh usermode-guests"
-        );
+        Some(out)
     }
 }
 
@@ -5137,6 +5327,203 @@ fn a_real_threaded_binary_spawns_joins_and_agrees_on_the_answer() {
             arch.name
         );
     });
+}
+
+/// What `tests/usermode/threads.rs` prints when every increment landed.
+#[cfg(feature = "std")]
+const THREADS_TOTAL: &str = "counter = 40000";
+
+/// The same threaded binary, on a part that has `FEAT_LSE` and says so.
+///
+/// This is `AT_HWCAP` doing what an auxiliary vector is *for*, measured rather
+/// than asserted. `aarch64-unknown-linux-musl`'s baseline is Armv8.0, so
+/// `threads-aarch64` cannot contain an inline `LDADD` — but it does contain
+/// fourteen LSE words, in compiler-rt's out-of-line atomics, behind a runtime
+/// branch on `__aarch64_have_lse_atomics`. That variable is initialised from
+/// bit 8 of `AT_HWCAP`. On [`a64::ARCH`] the bit is clear, the branch goes to
+/// the `ldxr`/`stxr` loop, and those fourteen words are never fetched; on
+/// [`a64::ARCH_LSE`] the bit is set and they are every atomic the program does.
+///
+/// One binary, two parts, two instruction streams, one answer. That last
+/// clause is the load-bearing one: a level-3 guest is *told about itself*, and
+/// this is the first test here where what it was told changes what it runs.
+///
+/// The ticks are the evidence. They cannot be equal — an `LDADD` is one
+/// instruction where the loop is five and retries under contention — so
+/// asserting they differ is asserting the guest actually took the branch,
+/// without this module having to know how to count LSE instructions.
+#[cfg(all(feature = "std", feature = "cpu-arm-a64"))]
+#[test]
+fn an_lse_part_says_so_in_at_hwcap_and_the_guest_changes_what_it_executes() {
+    let base = run_built_guest_on(
+        &a64::ARCH,
+        "threads",
+        &["threads"],
+        &[],
+        20_000_000_000,
+        Stage::empty(),
+        |_, _| {},
+    );
+    let lse = run_built_guest_on(
+        &a64::ARCH_LSE,
+        "threads",
+        &["threads"],
+        &[],
+        20_000_000_000,
+        Stage::empty(),
+        |_, _| {},
+    );
+    let (Some(base), Some(lse)) = (base, lse) else {
+        std::eprintln!(
+            "usermode: no threads-aarch64 guest in this build. Build one with\n    \
+             scripts/fetch-testdata.sh usermode-guests"
+        );
+        return;
+    };
+
+    // The arithmetic is the program's and does not depend on the part.
+    assert_eq!(lse.status, 0, "the guest exited {}", lse.status);
+    assert!(lse.refused.is_empty(), "refused {:?}", lse.refused);
+    assert_eq!(lse.stdout, base.stdout, "the same program, the same answer");
+    assert!(
+        String::from_utf8_lossy(&lse.stdout).contains(THREADS_TOTAL),
+        "every increment landed through `LDADD` too: {:?}",
+        String::from_utf8_lossy(&lse.stdout)
+    );
+    assert_eq!(lse.threads, base.threads, "the same threads either way");
+
+    // And the execution is not the program's.
+    assert_ne!(
+        lse.ticks, base.ticks,
+        "if these are equal the guest ignored `HWCAP_ATOMICS` and this test \
+         is measuring nothing"
+    );
+    std::eprintln!(
+        "usermode/threads: {} ticks without HWCAP_ATOMICS, {} with",
+        base.ticks,
+        lse.ticks
+    );
+}
+
+/// The same, with a **whole glibc** in it rather than compiler-rt.
+///
+/// The point of running this one too is that glibc's AArch64 startup is the
+/// largest piece of third-party code in this corpus that *reads* `AT_HWCAP`:
+/// `init_cpu_features` keys its ifunc resolvers off it, so setting a bit is
+/// not a local change to one dispatch variable but an input to a whole
+/// library's idea of what part it is on. Four of the six defects this module
+/// has found came from giving glibc something it had not been given before,
+/// and this is the cheapest way to give it one more.
+#[cfg(all(feature = "std", feature = "cpu-arm-a64"))]
+#[test]
+fn a_whole_glibc_is_told_about_lse_too_and_still_agrees_on_the_answer() {
+    let stage = |arch: &'static Arch| guest_root(&std::format!("glibc-{}.root", arch.suffix));
+    let base = run_built_guest_on(
+        &a64::ARCH,
+        "glibc-threads",
+        &["glibc-threads"],
+        &["LD_LIBRARY_PATH=/lib"],
+        40_000_000_000,
+        stage(&a64::ARCH),
+        |_, _| {},
+    );
+    let lse = run_built_guest_on(
+        &a64::ARCH_LSE,
+        "glibc-threads",
+        &["glibc-threads"],
+        &["LD_LIBRARY_PATH=/lib"],
+        40_000_000_000,
+        stage(&a64::ARCH_LSE),
+        |_, _| {},
+    );
+    let (Some(base), Some(lse)) = (base, lse) else {
+        std::eprintln!(
+            "usermode: no glibc-threads-aarch64 guest in this build. Build one with\n    \
+             scripts/fetch-testdata.sh usermode-guests"
+        );
+        return;
+    };
+    assert_eq!(lse.status, 0, "the guest exited {}", lse.status);
+    assert!(lse.refused.is_empty(), "refused {:?}", lse.refused);
+    assert_eq!(lse.stdout, base.stdout, "the same program, the same answer");
+    assert!(
+        String::from_utf8_lossy(&lse.stdout).contains(THREADS_TOTAL),
+        "every increment landed: {:?}",
+        String::from_utf8_lossy(&lse.stdout)
+    );
+    std::eprintln!(
+        "usermode/glibc-threads: {} ticks and {} calls without HWCAP_ATOMICS, \
+         {} and {} with",
+        base.ticks,
+        base.trace.len(),
+        lse.ticks,
+        lse.trace.len()
+    );
+}
+
+/// A guest **compiled** for `FEAT_LSE`, and the part that refuses it.
+///
+/// `threads-lse-aarch64` is the same source built `-C target-feature=+lse`, so
+/// the atomics are inline in the guest's own text rather than behind
+/// compiler-rt's dispatch: ninety-eight LSE words including the byte forms
+/// (`casb`, `swpb`) that an Armv8.0 `.text` never contains at all.
+///
+/// Both directions are the test. On a Neoverse N1 it runs and agrees with the
+/// answer every other build of this program gives. On a Cortex-A53 it must
+/// **not** run — `FEAT_LSE`'s encodings are `UNDEFINED` on a part without it,
+/// which is exactly how a guest probes for the feature, and a core that
+/// decoded them anyway would make `Config::cortex_a53` a claim no test above
+/// this one could catch.
+#[cfg(all(feature = "std", feature = "cpu-arm-a64"))]
+#[test]
+fn a_guest_built_for_lse_runs_on_the_part_with_it_and_is_refused_by_the_one_without() {
+    let Some(bytes) = guest_binary("threads-lse-aarch64") else {
+        std::eprintln!(
+            "usermode: no threads-lse-aarch64 guest in this build. Build one with\n    \
+             scripts/fetch-testdata.sh usermode-guests"
+        );
+        return;
+    };
+
+    let out = run_built_guest_on(
+        &a64::ARCH_LSE,
+        "threads-lse",
+        &["threads-lse"],
+        &[],
+        20_000_000_000,
+        Stage::empty(),
+        |_, out| {
+            assert_eq!(out.status, 0, "the guest exited {}", out.status);
+            assert!(out.stderr.is_empty(), "the guest wrote to fd 2");
+            assert!(out.refused.is_empty(), "refused {:?}", out.refused);
+        },
+    )
+    .expect("the guest is right here");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(THREADS_TOTAL),
+        "forty thousand increments through inline LSE atomics: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // And the negative, which is the half that keeps the feature lattice
+    // honest. The diagnostic is the one `run` prints for an encoding the core
+    // declined, and it is matched on so that a future change failing here for
+    // some *other* reason does not quietly pass.
+    let world = World::new(Arc::new(Journal::new()), counting_entropy());
+    let err = run(
+        &a64::ARCH,
+        &bytes,
+        &["threads-lse"],
+        &[],
+        world,
+        20_000_000_000,
+    )
+    .expect_err("a Cortex-A53 has no FEAT_LSE and must refuse its encodings");
+    assert!(
+        err.contains("does not implement"),
+        "the Armv8.0 part refused it for the wrong reason: {err}"
+    );
+    std::eprintln!("usermode/threads-lse on aarch64 without FEAT_LSE: {err}");
 }
 
 /// A dynamically linked program, and a **real** dynamic loader.

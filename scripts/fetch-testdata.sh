@@ -2314,10 +2314,59 @@ build_usermode_guests() {
 	[ "$built" -gt 0 ] || die "no guests under ${src}"
 	ok "usermode-guests: ${built} static binaries in ${dest}"
 
+	build_usermode_lse "$dest" "$ld"
 	build_usermode_dynamic "$dest"
 	build_usermode_thirdparty "$dest"
 
 	note "    cargo test --all-features usermode::proof -- --nocapture"
+}
+
+# The same threaded guest again, built `-C target-feature=+lse`.
+#
+# One extra binary, and it is the cheapest statement of a thing the level-3
+# seam otherwise only asserts. `Config::cortex_a53` is Armv8.0-A and has no
+# `FEAT_LSE`, so `src/usermode/proof.rs` withholds `HWCAP_ATOMICS` and every
+# AArch64 guest so far has taken an `ldaxr`/`stlxr` loop. `Config::neoverse_n1`
+# is Armv8.2-A, where `FEAT_LSE` is mandatory; a guest run on one may be told
+# so, and this is a guest that then executes the atomics.
+#
+# `threads.rs` unchanged is deliberate -- the *program* is not what differs,
+# the encoding of its atomics is. The baseline `threads-aarch64` already
+# carries fourteen LSE words in compiler-rt's out-of-line atomics, reached only
+# when `__aarch64_have_lse_atomics` is set from `AT_HWCAP`; this build has
+# ninety-eight of them inline in the guest's own code, including the byte forms
+# (`casb`, `swpb`) that a `.text` compiled for Armv8.0 never contains.
+#
+# RISC-V has no counterpart: its `A` extension is not optional in RV64GC, so
+# there is no second encoding to select.
+build_usermode_lse() {
+	local dest="$1" ld="$2"
+	local target=aarch64-unknown-linux-musl
+	local out="${dest}/threads-lse-aarch64"
+	local guest="${REPO_ROOT}/tests/usermode/threads.rs"
+
+	if ! rustc --target "$target" --print target-libdir 2>/dev/null |
+		xargs -r test -d; then
+		return 0
+	fi
+	if [ "$FORCE" != 1 ] && [ -f "$out" ] && [ "$out" -nt "$guest" ]; then
+		note "  $(basename "$out") is up to date"
+		return 0
+	fi
+	note "  building threads for ${target} with +lse ..."
+	rustc --edition 2024 \
+		--target "$target" \
+		-C target-feature=+crt-static,+lse \
+		-C link-self-contained=yes \
+		-C linker="$ld" \
+		-C linker-flavor=ld \
+		-C opt-level=1 \
+		-C debuginfo=0 \
+		-C strip=symbols \
+		--crate-name threads_lse \
+		-o "$out" \
+		"$guest" || die "could not build the +lse guest for ${target}"
+	ok "usermode-guests: an LSE guest in ${dest}"
 }
 
 # Real third-party programs, cross-built for the level-3 architectures.
@@ -2716,6 +2765,11 @@ Suites:
                  installed (`rustup target add ...`); an absent one is skipped
                  with a note. musl and the linker both come from the Rust
                  toolchain.
+                 On AArch64 it also builds the threaded guest a second time
+                 with -C target-feature=+lse, which proof.rs runs on a
+                 Neoverse N1 core that advertises HWCAP_ATOMICS -- and which a
+                 Cortex-A53 must refuse. RISC-V needs no counterpart: `A` is
+                 not optional in RV64GC.
                  It also builds *dynamically* linked guests, which need one
                  thing a compiler cannot produce: a real ld-linux-<arch>.so.1.
                  That is looked for in the usual cross sysroots, named by
