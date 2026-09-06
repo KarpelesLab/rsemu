@@ -143,7 +143,13 @@ pub enum Event {
 #[repr(C)]
 #[derive(Debug)]
 pub struct Ctx {
-    /// The temporary frame: one `u64` per [`Temp`](crate::ir::Temp).
+    /// The temporary frame: **at least** one `u64` per
+    /// [`Temp`](crate::ir::Temp) the block declares.
+    ///
+    /// At least, and not exactly, because [`Engine`] keeps one buffer at the
+    /// high-water mark of every block it has run rather than resizing it per
+    /// execution. Generated code indexes it by temporary number and never
+    /// reads its length, so a longer frame is the same frame.
     pub temps: *mut u64,
     /// The thunk table.
     pub vt: *const Vtable,
@@ -324,7 +330,9 @@ unsafe fn host_of<'a, H>(c: &mut Ctx) -> &'a mut H {
 /// # Safety
 ///
 /// `c.temps` must point at `len` initialized `u64`s, which [`Engine::run`]
-/// establishes from a `Vec` sized to the block's temporary count.
+/// establishes from a `Vec` grown to at least the block's temporary count.
+/// *Initialized*, not meaningful: a slot the executed path never assigned
+/// holds whatever an earlier block left there.
 #[inline]
 unsafe fn temps_of<'a>(c: &Ctx, len: usize) -> &'a [u64] {
     // SAFETY: the caller's obligation, stated above.
@@ -591,6 +599,12 @@ pub struct EngineStats {
 pub struct Engine {
     buf: CodeBuf,
     arena: Vec<Compiled>,
+    /// The temporary frame, shared by every block this engine runs.
+    ///
+    /// Grown to fit and never cleared — see [`Engine::run`]. Its length is the
+    /// largest temporary count this engine has been handed, so a small block
+    /// runs against a frame with a large block's leftovers past its own end
+    /// *and inside it*.
     temps: Vec<u64>,
     /// Which block's code last ran, so [`Engine::temp_value`] knows which
     /// temporaries that code wrote into the frame.
@@ -644,6 +658,22 @@ impl Engine {
         self.regs
     }
 
+    /// Fill the temporary frame with `value`, for a differential that needs to
+    /// know what a run does *not* depend on.
+    ///
+    /// The frame is not cleared between blocks ([`Engine::run`] says why), so
+    /// "the executed path assigns every temporary anything reads" stopped
+    /// being enforced by construction and became a property with nothing
+    /// asserting it. Running one block twice under two different fills and
+    /// requiring identical guest-visible output *is* that assertion, and it is
+    /// the only reason this exists — which is why it is not compiled into a
+    /// shipping build.
+    #[cfg(test)]
+    pub(super) fn seed_frame(&mut self, value: u64, temps: usize) {
+        self.temps.clear();
+        self.temps.resize(temps, value);
+    }
+
     /// What this engine has been asked to do.
     #[inline]
     #[must_use]
@@ -690,6 +720,15 @@ impl Engine {
     /// materializes and the backend writes those through to the frame at their
     /// definition. That is the property, and `jit::x86::tests`' `agree_under`
     /// asserts it on every block the differential generates, faulting or not.
+    ///
+    /// `Some` is **not** a claim that the last run assigned the temporary.
+    /// The frame is not cleared between blocks, so a temporary whose
+    /// definition the executed path jumped over — the inline exit sequence a
+    /// `brcond` branches around — reads back as whatever an earlier block left
+    /// in that slot. The IR says nothing about such a temporary's value either,
+    /// which is why nothing that is not a debugging aid may read one:
+    /// `agree_under` proves the frame's prior contents reach no guest-visible
+    /// output by running each block twice against two different fills.
     #[inline]
     #[must_use]
     pub fn temp_value(&self, temp: crate::ir::Temp) -> Option<u64> {
@@ -780,8 +819,24 @@ impl Engine {
         let events = compiled.events();
         let (events, event_count) = (events.as_ptr(), events.len() as u64);
         self.last = Some(code);
-        self.temps.clear();
-        self.temps.resize(block.temp_count(), 0);
+        // A high-water mark, not a fresh frame. `clear()` + `resize(n, 0)`
+        // zeroed one `u64` per temporary the block *declares* on every
+        // execution, so entering a block carried a term proportional to how
+        // much of it there was and none at all to how much of it ran — exactly
+        // the wrong shape now that a block may leave at any guest instruction
+        // boundary on the tick allowance. `docs/platforms/pc64.md` has what it
+        // cost and what removing it moved.
+        //
+        // Nothing needs the zeroes. `compile` writes every frame-homed
+        // temporary at its definition and refuses a block that reads one
+        // before its definition, so every frame slot generated code reads was
+        // written by this execution. What is left over from an earlier block
+        // is reachable only through `Engine::temp_value`, whose contract says
+        // so, and only for a temporary whose definition a `brcond` jumped
+        // over.
+        if self.temps.len() < block.temp_count() {
+            self.temps.resize(block.temp_count(), 0);
+        }
 
         // The inlined fast path's parameters, taken once per block. The
         // pointer is valid until the TLB is flushed, and a flush happens at a

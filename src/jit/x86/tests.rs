@@ -303,6 +303,11 @@ fn agree_under(block: &Block, inline: bool, regs: Regs, allowance: Option<u64>) 
         Ok(c) => c,
         Err(_) => return false,
     };
+    // Zero the frame first. `Engine::run` no longer clears it between blocks,
+    // and starting from zeroes is the frame it used to build fresh on every
+    // entry — so everything asserted below is exactly as strong as it was, and
+    // what the change actually costs is checked separately at the end.
+    engine.seed_frame(0, block.temp_count());
     let mut host = scratch(inline);
     let subject = engine
         .run(block, code, &mut host)
@@ -415,8 +420,83 @@ fn agree_under(block: &Block, inline: bool, regs: Regs, allowance: Option<u64>) 
         engine.mark(),
         "the boundary differs\n{block}"
     );
+
+    // ---- and none of it depended on the frame being zero ------------------
+    //
+    // The engine keeps one temporary frame at the high-water mark of every
+    // block it has run and does not clear it, so a temporary whose definition
+    // the executed path branched over — the inline exit sequence the generator
+    // above puts behind a `brcond` — holds an earlier block's leftovers rather
+    // than a zero. The IR permits that (`ir::verify` requires an assignment
+    // *earlier in the block*, which a taken branch may skip) and nothing
+    // reachable may read one; this is what says so, because a backend that did
+    // read one would still have agreed with the interpreter above, where both
+    // of them saw zeroes.
+    let kept: Vec<Option<u64>> = (0..block.temp_count())
+        .map(|t| engine.temp_value(Temp(t as u32)))
+        .collect();
+    engine.seed_frame(POISON, block.temp_count());
+    let mut other = scratch(inline);
+    let again = engine
+        .run(block, code, &mut other)
+        .expect("the code was compiled in this generation");
+    match (&subject, &again) {
+        (Ok(a), Ok(b)) => assert_eq!(a, b, "the outcome moved with the frame\n{block}"),
+        (Err(a), Err(b)) => assert_eq!(
+            alloc::format!("{a}"),
+            alloc::format!("{b}"),
+            "the error moved with the frame\n{block}"
+        ),
+        _ => panic!("the frame's contents decided whether the block failed\n{block}"),
+    }
+    assert_eq!(
+        host.slots, other.slots,
+        "guest state moved with the frame\n{block}"
+    );
+    assert_eq!(
+        host.ticks, other.ticks,
+        "ticks moved with the frame\n{block}"
+    );
+    assert_eq!(
+        host.log, other.log,
+        "the host was asked to do different things\n{block}"
+    );
+    assert_eq!(
+        host.bytes(),
+        other.bytes(),
+        "guest memory moved with the frame\n{block}"
+    );
+    assert_eq!(
+        host.inlined_stores, other.inlined_stores,
+        "the inlined stores moved with the frame\n{block}"
+    );
+    for (t, was) in kept.iter().enumerate() {
+        let temp = Temp(t as u32);
+        match (was, engine.temp_value(temp)) {
+            // Either the run assigned it, and it is the same value, or it did
+            // not and the slot still holds the fill. There is no third answer
+            // that is not a read of an unassigned temporary.
+            (Some(a), Some(b)) => assert!(
+                b == *a || b == POISON,
+                "temporary {temp} came back {b:#x}, which is neither the value the \
+                 zeroed frame produced ({a:#x}) nor the fill\n{block}"
+            ),
+            (None, None) => {}
+            _ => panic!(
+                "{temp} changed whether the frame holds it between two runs of the \
+                 same code\n{block}"
+            ),
+        }
+    }
     true
 }
+
+/// What a differential run fills the temporary frame with the second time.
+///
+/// Any value no arithmetic in the corpus is likely to produce, so a temporary
+/// that comes back holding it was not assigned rather than coincidentally
+/// equal.
+const POISON: u64 = 0xa5a5_5a5a_dead_beef;
 
 // ---------------------------------------------------------------------------
 // The generator
@@ -1314,11 +1394,15 @@ fn a_block_with_more_live_values_than_registers_still_agrees() {
 }
 
 #[test]
-fn a_value_read_before_it_is_assigned_reads_the_frame_the_interpreter_reads() {
-    // `verify` rejects this block, and `compile` is public and the dispatcher
-    // does not verify — so the backend has to answer, and the only answer that
-    // agrees with the oracle is the frame's zero. A register would hold
-    // whatever the last temporary to own it left there.
+fn a_value_read_before_it_is_assigned_is_refused_rather_than_answered() {
+    // `verify` rejects this block, `compile` is public and `Dispatcher` does
+    // not verify — so the backend has to answer, and it used to answer *the
+    // frame's zero*, which is what the interpreter answers too. It cannot any
+    // more: `rt::Engine::run` keeps one temporary frame across blocks and does
+    // not clear it, so the slot holds whatever the last block to use that
+    // temporary number left in it, and the two engines would end a quantum
+    // with different guest state. `Compiler::new` therefore refuses the shape,
+    // which puts the block on the interpreter and makes them agree again.
     let mut b = BlockBuilder::new(BASE, 0);
     b.insn_start(InsnStart {
         pc: BASE,
@@ -1350,22 +1434,129 @@ fn a_value_read_before_it_is_assigned_reads_the_frame_the_interpreter_reads() {
     });
     b.exit_tb();
     let block = b.finish();
-    verify(&block).expect_err("the verifier is the real answer to this shape");
-
-    let mut oracle = Scratch::new(true);
-    let mut interp = Interp::new();
-    interp
-        .run(&block, &mut oracle)
-        .expect("the interpreter runs it");
+    verify(&block).expect_err("the verifier is the first answer to this shape");
 
     let mut engine = Engine::with_capacity(1 << 16).expect("a code buffer");
-    let code = engine.compile(&block).expect("compiles");
-    let mut host = Scratch::new(true);
-    engine
-        .run(&block, code, &mut host)
-        .expect("live")
-        .expect("ok");
-    assert_eq!(oracle.slots, host.slots, "{block}");
+    assert!(
+        matches!(engine.compile(&block), Err(super::Refusal::Shape(_))),
+        "{block}"
+    );
+}
+
+#[test]
+fn a_temporary_the_block_never_allocated_is_refused_rather_than_indexed() {
+    // The other half of the same check, and the one with teeth: a frame slot
+    // is reached with `temp.index() * 8` off `r12`, and the frame is only as
+    // long as the block's own temporary count — so an operand naming a
+    // temporary the block never allocated is a read past the end of the
+    // engine's buffer. `verify` rejects it; `Dispatcher` does not verify.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let real = b.imm(Type::I64, Const::Int(1));
+    let past_the_end = Temp(9999);
+    let sum = b.binary(Opcode::ADD, Type::I64, real, past_the_end);
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live: vec![(RegSlot(0), sum)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect_err("the verifier is the first answer to this shape");
+
+    let mut engine = Engine::with_capacity(1 << 16).expect("a code buffer");
+    assert!(
+        matches!(engine.compile(&block), Err(super::Refusal::Shape(_))),
+        "{block}"
+    );
+}
+
+#[test]
+fn a_frame_slot_an_earlier_block_wrote_reaches_no_later_one() {
+    // The property the refusal above protects, from the other end. Run a block
+    // that leaves a distinctive value in every frame slot it touches, then run
+    // a second block over the *same* engine, and require it to produce exactly
+    // what a fresh engine produces. Without this, "the frame is not cleared
+    // between blocks" is a claim with nothing behind it; with it, a backend
+    // that read an unassigned slot would be a `jit` run and a `jit-host` run
+    // ending a quantum with different guest state, which is what
+    // `tests/x86_engines.rs` asserts cannot happen.
+    let filler = {
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(1);
+        let seed = b.imm(Type::I64, Const::Int(u128::from(POISON)));
+        let mut last = seed;
+        for _ in 0..64 {
+            last = b.binary(Opcode::XOR, Type::I64, last, seed);
+            last = b.unary(Opcode::NOT, Type::I64, last);
+        }
+        b.insn_start(InsnStart {
+            pc: BASE + 4,
+            next_pc: BASE + 8,
+            ticks: 1,
+            live: vec![(RegSlot(0), last)],
+        });
+        b.exit_tb();
+        b.finish()
+    };
+
+    let mut checked = 0;
+    for seed in 0..40u64 {
+        let subject = random_block(seed, 12);
+
+        let mut dirty = Engine::with_capacity(1 << 18).expect("a code buffer");
+        dirty.set_regs(Regs::Frame);
+        let Ok(code) = dirty.compile(&filler) else {
+            panic!("the filler must compile");
+        };
+        let mut waste = Scratch::new(true);
+        let _ = dirty.run(&filler, code, &mut waste).expect("live");
+        let Ok(code) = dirty.compile(&subject) else {
+            continue;
+        };
+        let mut after = Scratch::new(true);
+        let dirty_outcome = dirty.run(&subject, code, &mut after).expect("live");
+
+        let mut fresh = Engine::with_capacity(1 << 18).expect("a code buffer");
+        fresh.set_regs(Regs::Frame);
+        let code = fresh
+            .compile(&subject)
+            .expect("the same block compiles twice");
+        let mut clean = Scratch::new(true);
+        let fresh_outcome = fresh.run(&subject, code, &mut clean).expect("live");
+
+        match (&dirty_outcome, &fresh_outcome) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "seed {seed}\n{subject}"),
+            (Err(a), Err(b)) => assert_eq!(
+                alloc::format!("{a}"),
+                alloc::format!("{b}"),
+                "seed {seed}\n{subject}"
+            ),
+            _ => panic!("the frame's leftovers decided whether it failed\n{subject}"),
+        }
+        assert_eq!(after.slots, clean.slots, "seed {seed}\n{subject}");
+        assert_eq!(after.ticks, clean.ticks, "seed {seed}\n{subject}");
+        assert_eq!(after.log, clean.log, "seed {seed}\n{subject}");
+        assert_eq!(after.bytes(), clean.bytes(), "seed {seed}\n{subject}");
+        assert_eq!(dirty.ticks(), fresh.ticks(), "seed {seed}");
+        assert_eq!(dirty.boundaries(), fresh.boundaries(), "seed {seed}");
+        assert_eq!(dirty.mark(), fresh.mark(), "seed {seed}");
+        checked += 1;
+    }
+    assert!(checked > 20, "only {checked} blocks of the corpus compiled");
 }
 
 #[test]

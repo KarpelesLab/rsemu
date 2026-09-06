@@ -339,8 +339,9 @@ pub struct Compiled {
     ///
     /// Carried forward because the *runtime* needs it and cannot re-derive it:
     /// after a run, a temporary that lived only in a host register is gone,
-    /// and reading its frame slot would hand back the zero the frame was
-    /// cleared to. Every temporary a boundary names is
+    /// and reading its frame slot would hand back whatever the frame happens
+    /// to hold there — nothing, since the frame is no longer cleared between
+    /// blocks (`rt::Engine::run`). Every temporary a boundary names is
     /// [`frame_backed`](Allocation::frame_backed) by construction — that is
     /// what keeps `ROADMAP.md` §9's precise exceptions exact.
     alloc: Allocation,
@@ -685,6 +686,37 @@ impl<'a> Compiler<'a> {
         // one.
         if i32::try_from(block.insts().len()).is_err() {
             return Err(Refusal::Shape("the block is too long"));
+        }
+        // Straight-line SSA, checked here and not only in `ir::verify`.
+        //
+        // This is the one rule of the verifier's that the *backend* now
+        // depends on rather than merely benefits from: `rt::Engine::run` keeps
+        // one temporary frame across every block it runs and does not clear
+        // it, so a frame slot read before this block wrote it is an earlier
+        // block's value rather than a zero — and the interpreter, which does
+        // clear, would answer zero. `Dispatcher` does not verify, and
+        // `compile` is public, so trusting a frontend to have been verified
+        // would make that divergence reachable from outside this file.
+        //
+        // A refusal rather than an error: the interpreter runs the block
+        // instead, exactly as for an op with no lowering. It costs one
+        // `Vec<bool>` per *translation*, of which a nine-hundred-second `pc64`
+        // boot makes 145 060 against 368 M block executions.
+        let mut defined = vec![false; block.temp_count()];
+        for i in 0..block.insts().len() {
+            if block
+                .srcs(i)
+                .iter()
+                .any(|t| !defined.get(t.index()).copied().unwrap_or(false))
+            {
+                return Err(Refusal::Shape("a temporary is read before it is assigned"));
+            }
+            let inst = &block.insts()[i];
+            for dst in [inst.dst, inst.dst2].into_iter().flatten() {
+                if let Some(slot) = defined.get_mut(dst.index()) {
+                    *slot = true;
+                }
+            }
         }
         let plan = plan(block)?;
         let alloc = match regs {
