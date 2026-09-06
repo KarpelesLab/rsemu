@@ -8,13 +8,20 @@ which is why the rules are fixed in advance.
 ## The problem
 
 When guest CPUs run on parallel host threads, guest memory ordering must be
-preserved on a host whose ordering rules are different. Two cases:
+preserved on a host whose ordering rules are different. Three cases:
 
 - **Guest weaker than host** (e.g. RISC-V or ARM guest on x86 host): nothing to
-  emit. The host is already stricter than the guest requires.
+  emit *for the guest's ordinary loads and stores*. The host is already
+  stricter than the guest's baseline requires.
 - **Guest stronger than host** (e.g. **x86-TSO guest on AArch64 or wasm**): the
   frontend lifter **must** insert barriers. Miss one and the guest sees
   reorderings its ISA promises cannot happen.
+- **A guest barrier instruction is neither case.** It is the guest asking for
+  something stronger than *its own* baseline, so "weaker than or equal to the
+  host" does not answer it: an `MFENCE` on an x86 host still has to be a host
+  fence, because the host's baseline is not stronger than what `MFENCE` asks
+  for. That row used to read "nothing to emit" and it cost the tree a year of
+  no-op barriers; see below.
 
 `ROADMAP.md` §4.7 assigns this responsibility explicitly to the frontend lifter:
 the core provides atomic primitives, the lifter owns the ordering.
@@ -50,13 +57,12 @@ atomics stress suite.
 
 ## Where this stands today, measured
 
-Two things are kept and two are not. Both of the ones that are not are reachable
-**only** under `ThreadingMode::Parallel`, which is opt-in (`--threading
-parallel`); no machine file selects it, `Deterministic` is the default, and
-`usermode`'s `ThreadSet` runs every guest thread on one host thread by design.
-Under one host thread the finest interleaving there is is one whole instruction,
-so none of this can be observed — which is why the tree has got this far without
-it mattering.
+Three things are kept and one is not. Everything below is reachable **only**
+under `ThreadingMode::Parallel`, which is opt-in (`--threading parallel`); no
+machine file selects it, `Deterministic` is the default, and `usermode`'s
+`ThreadSet` runs every guest thread on one host thread by design. Under one host
+thread the finest interleaving there is is one whole instruction, so none of it
+can be observed — which is why the tree has got this far without it mattering.
 
 **Kept.** The load-reserved pair, by `core::space::ExclusiveMonitor`: a store by
 any observer to the reservation granule clears the slot, so a store-conditional
@@ -94,33 +100,67 @@ byte loop is ~1% of that instruction and full conformance costs +2–3% of it.
 Both fixes are affordable at that denominator; the question is the memory model,
 not the nanoseconds.
 
-**Not kept: barriers.** Every data barrier in the tree retires as a no-op —
-`DMB`/`DSB`, `FENCE`, `MFENCE`/`LFENCE`/`SFENCE`. `core::sync` has the analysis;
-the correction it makes to the table above is worth repeating here, because the
-table as written is what would stop someone looking:
+**Kept, as of this round: barriers.** Every data barrier now executes one host
+`fence(SeqCst)` — `DSB`/`DMB` in `cpu::arm::a64::exec`, `FENCE` in
+`cpu::riscv::exec`, `LFENCE`/`MFENCE`/`SFENCE` in `cpu::x86::fpexec`, and
+`IrHost::fence`'s default, which used to be an empty body under the comment
+*"a no-op on a host with one thread of guest execution"*. What stays a no-op
+stays one on an architectural reason rather than a convenient one: A64's `ISB`
+and RISC-V's `FENCE.I` order their own PE's instruction *fetch* and no data
+access another observer can see (Arm DDI 0487, `ISB`; RISC-V Zifencei), and
+`cpu::arm::v7m`'s barriers are on a uniprocessor with no second observer to
+order against.
 
-> **"Guest weaker than or equal to the host, nothing to emit" is wrong for a
-> barrier instruction.** It is right for the guest's *baseline* ordering — an
-> x86 guest's ordinary loads and stores need nothing on an x86 host. But a
-> barrier is the guest asking for something stronger than its own baseline, and
-> the host's baseline is not stronger than that. `MFENCE` exists to defeat
-> store-then-load reordering, and an x86 host does exactly that reordering to
-> the emulator's own accesses. Dropping the guest's `MFENCE` therefore hands the
-> guest back the relaxation it just paid to remove.
+`tests/memory_model_litmus.rs` is the reproducer, and what it found is not what
+the argument above predicted.
 
-`tests/memory_model_costs.rs` puts a number on the window: a store-buffer litmus
-over the same relaxed `AtomicU8` primitive `RamStore` uses produces the outcome
-`MFENCE` forbids tens to hundreds of times in 200 000 rounds when nothing
-separates the store from the load, and never once about forty nanoseconds do.
-That is the same order as the interpreter's cost per guest instruction and much
-longer than the JIT's — so the exposure is small for one engine and real for the
-other. On an AArch64 host, store-store and load-load go as well and every
-barrier matters.
+- Over two bare relaxed `AtomicU8`s — the primitive the previous round measured
+  — the store-buffer outcome appears tens to hundreds of times in 200 000
+  rounds, and a `fence(SeqCst)` removes it. That much held.
+- **Over `RamStore` it was already zero, before any of this.** Every write to
+  the store ends in `mark_dirty`, which sets a bit with
+  `AtomicU64::fetch_or` — a *relaxed* read-modify-write, which on x86-64 is a
+  `lock or`, and a locked instruction is a full barrier (*Intel SDM* volume 3
+  §9.2.5). So every guest store to RAM has been draining the host's store
+  buffer all along, on the interpreter and inside a translated block alike:
+  `jit::Tlb::note_fast_store` marks the same bitmap after an inlined store.
+  `tests/memory_model_costs.rs` prices the two identically — 3.96 ns for a
+  store plus a `SeqCst` fence, 3.97 ns for a store plus the `fetch_or`.
+- Over guest instructions, two `cpu::x86` cores on two host threads: zero
+  either way, for a second and independent reason — a whole interpreted
+  instruction separates the guest's store from the guest's load, and the host's
+  window closes at about forty nanoseconds.
 
-The fix is one host fence per guest barrier instruction and costs nothing on any
-other path; `core::sync` re-exports `fence` and `compiler_fence` for exactly
-that, and the IR already carries `Opcode::FENCE` with an `IrHost::fence` hook
-whose default body is empty "on a host with one thread of guest execution". What
-is missing is the three interpreter arms (`a64`, `riscv`, `x86`), that default,
-and `a64::lift` emitting a `FENCE` where it currently emits `Plan::Nop`. All of
-those sites are in `cpu/` and `ir/`.
+None of that is a reason to leave the barrier a no-op. The accident is x86-only
+(`fetch_or(Relaxed)` on AArch64 orders nothing), it covers only what follows a
+store, it does nothing between two loads, and it would evaporate the day
+somebody batched the dirty bitmap or wrote it with a plain `store`. What it does
+mean is that the *exposure* today was smaller than the previous round's
+measurement implied, and that the honest reason to fence is portability rather
+than a live defect on this host.
+
+**How often a real guest pays.** An arm64 Linux boot executes 479 000 `DSB`/`DMB`
+in 876 million instructions — one in 1 800 — plus another 213 000 `ISB`, which
+is why `ISB` is excluded rather than lumped in. A RISC-V Linux boot executes
+`FENCE` about once in 100 000 instructions. An x86-64 Linux 6.6 guest executes
+**`LFENCE` tens of thousands of times and `MFENCE` once**: `smp_mb()` on x86-64
+is `lock addl $0,-4(%rsp)`, not `MFENCE`, so the barrier an x86 guest really
+leans on is the `LOCK` prefix — which reaches `AddressSpace::bus_lock`, a mutex,
+whose acquire/release does not forbid store-then-load. That is the next gap, and
+it is `core::space`'s rather than `cpu/`'s.
+
+**What the lifters do, and why one of them does not emit `Opcode::FENCE`.** The
+RISC-V and x86 frontends do not lift a fence at all — the block ends at one and
+the interpreter runs it. `a64::lift` could emit `Opcode::FENCE`, and does not,
+because `jit::x86::compiles` does not lower it and `jit::dispatch` does not
+*remember* a refusal — it re-attempts the compilation every time the block is
+reached. Measured over the same 120 s of an arm64 Linux boot on `jit-host`:
+`FENCE` emitted into the trace is **+4.9%**, `FENCE` alone in a block of its own
+is **+2.8%**, and leaving the barrier outside the lifted subset — one dispatcher
+round trip and one interpreted instruction per barrier, 0.05% of the stream — is
+**+1.3%**, inside the run-to-run noise. The cost is the count of refusals rather
+than their size. `a64::lift`'s own
+`nothing_this_frontend_emits_is_an_op_the_host_backend_refuses` is the standing
+invariant that says so. **Teaching `jit::x86` to emit an `mfence` for
+`Opcode::FENCE` is the whole fix**, and the day it lands, `classify`'s
+`Op::Dsb | Op::Dmb` arm becomes an emitted `FENCE` and nothing else changes.

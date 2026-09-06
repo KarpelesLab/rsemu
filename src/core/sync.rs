@@ -91,44 +91,64 @@
 //! re-exported below alongside the atomics, for the same reason the atomics
 //! are.
 //!
-//! **No core calls them today**, and every data barrier in the tree retires as
-//! a no-op (`cpu::arm::a64::exec`, `Op::Dsb | Op::Dmb | Op::Isb`, and
-//! `a64::lift` maps the three to `Plan::Nop` to match; `cpu::riscv::exec`,
-//! `Op::Fence | Op::FenceI`; `cpu::x86::fpexec`,
-//! `Op::LFENCE | Op::MFENCE | Op::SFENCE`). `cpu::arm::v7m` is the one that is
-//! unarguably right — a Cortex-M is a uniprocessor, so there is no second
-//! observer for a barrier to order against. Under
-//! [`ThreadingMode::Deterministic`](crate::core::sched::ThreadingMode::Deterministic)
-//! that is exactly right — one host thread has no reordering to prevent — and
-//! it is why the omission has cost nothing so far.
+//! **Every data barrier in the tree now calls one.** `cpu::arm::a64::exec`
+//! fences on `DSB` and `DMB`, `cpu::riscv::exec` on `FENCE`, and
+//! `cpu::x86::fpexec` on all three of `LFENCE`/`MFENCE`/`SFENCE`;
+//! `IrHost::fence`'s default body is a [`fence`] at [`Ordering::SeqCst`]
+//! rather than the empty block it used to be. What stays a no-op stays one on
+//! an architectural reason: A64's `ISB` and RISC-V's `FENCE.I` order their own
+//! PE's instruction fetch and no data access any other observer can see, and
+//! `cpu::arm::v7m`'s barriers are on a uniprocessor with no second observer at
+//! all.
 //!
-//! Under `Parallel` it is not right, and the reason is the *host*, not this
-//! emulator. A guest instruction's accesses do leave in program order: they are
-//! separate calls through `SpaceView::write_span`, and the emulator never
-//! reorders them. But each becomes a relaxed host atomic, so the host's own
-//! model applies underneath. On an x86-64 host that leaves exactly one
-//! reordering visible — store-then-load, the one `MFENCE` exists to defeat —
-//! and it survives long enough to matter. A store-buffer litmus over the same
-//! relaxed `AtomicU8` primitive `RamStore` uses
-//! (`tests/memory_model_costs.rs`) produces the forbidden both-loads-zero
-//! outcome tens to hundreds of times in 200 000 rounds with little or nothing
-//! between the store and the load, and **none at all** once about forty
-//! nanoseconds separate them. That threshold is the same order as the
-//! interpreter's cost per guest instruction and comfortably longer than the
-//! JIT's, so the window is marginal for one engine and real for the other. On a
-//! weakly ordered host — an AArch64 build — store-store and load-load go too,
-//! and every barrier matters rather than one.
+//! Why it is not a no-op, since "this core completes every access before the
+//! next" sounds like an answer: it answers the *emulator's* half. A guest
+//! instruction's accesses do leave in program order — separate calls through
+//! `SpaceView::write_span`, never reordered here. But each becomes a relaxed
+//! host atomic, so the host's own model applies underneath, and a barrier is
+//! the guest asking for something *stronger than its own baseline*. On an
+//! x86-64 host that is store-then-load, the reordering `MFENCE` exists to
+//! defeat; on an AArch64 host it is store-store and load-load as well.
 //!
-//! The fix is one host [`fence`] per guest barrier instruction: nothing on any
-//! other path, since a barrier is the only thing that pays. Most of the
-//! plumbing exists — the IR has `Opcode::FENCE` and `IrHost::fence`, whose
-//! default body is empty under the comment *"a no-op on a host with one thread
-//! of guest execution"*, which is the assumption above. What is missing is the
-//! three interpreter arms, that default, and `a64::lift`'s `Plan::Nop` becoming
-//! an emitted `FENCE` (the RISC-V lifter already ends its block at one, and no
-//! core lifts an atomic instruction at all). It is not made here because every
-//! one of those sites is in `cpu/` or `ir/`, and it is written down here
-//! because this is where a core would come looking for the seam.
+//! # What the reproducer found, which is not what was expected
+//!
+//! `tests/memory_model_litmus.rs` runs the store-buffer litmus at three levels
+//! under the `Parallel` shape, and `tests/memory_model_costs.rs` prices it.
+//! Over two bare relaxed `AtomicU8`s the host produces the forbidden outcome
+//! tens to hundreds of times in 200 000 rounds; a [`fence`] removes it, as it
+//! must. Over `RamStore` — the object every guest access actually lands in —
+//! **it was already zero before any of this**, and the reason is an accident
+//! worth naming:
+//!
+//! > `RamStore`'s writes all end in `mark_dirty`, which sets a bit with
+//! > `AtomicU64::fetch_or`. That is a *relaxed* read-modify-write, and on
+//! > x86-64 a relaxed read-modify-write is a `lock or` — a full barrier
+//! > (*Intel SDM* volume 3 §9.2.5). So every guest store to RAM has been
+//! > draining the store buffer all along, interpreted or compiled alike:
+//! > `jit::Tlb::note_fast_store` marks the same bitmap after an inlined store.
+//! > Measured, the two cost the same to within noise — 3.96 ns for a store
+//! > plus a `SeqCst` fence, 3.97 ns for a store plus the `fetch_or`.
+//!
+//! An accident is worth what an accident is worth. It is x86-only —
+//! `fetch_or(Relaxed)` on AArch64 orders nothing — it covers only the case
+//! that follows a store, it does nothing for a barrier between two loads, and
+//! it would evaporate the day somebody batched the dirty bitmap. The fence is
+//! what turns it into the guarantee the guest asked for, and it costs about
+//! four nanoseconds on an instruction an arm64 Linux boot executes once in
+//! every 1 800 (479 000 `DSB`/`DMB` in 876 million) and a RISC-V one about once
+//! in 100 000.
+//!
+//! One place still owes a fence and does not have one, and it is written down
+//! here rather than fixed here: an x86 guest's **`LOCK` prefix** is
+//! architecturally a full barrier, and `AddressSpace::bus_lock` is a mutex, so
+//! what it supplies is acquire/release — which does not forbid store-then-load.
+//! Today the dirty bitmap covers it on an x86-64 host for the same accidental
+//! reason as everything else; on a weakly ordered host it would not.
+//! Modern Linux is what makes this the interesting one rather than `MFENCE`:
+//! `smp_mb()` on x86-64 is `lock addl $0,-4(%rsp)`, so a 6.6 kernel booting
+//! here executes `MFENCE` exactly **once** — against tens of thousands of
+//! `LFENCE`, which is why all three of x86's fences take this path and not
+//! only the one the shape of the problem suggests.
 //!
 //! # What is deliberately absent
 //!
