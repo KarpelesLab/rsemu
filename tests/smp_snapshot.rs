@@ -264,6 +264,14 @@ mod a64 {
             .with_media("initrd", Vec::new())
             .with_media("disk", Vec::new())
             .with_param("ram", "16M".to_string())
+            // The image below is a bare pair of counting loops with no PSCI
+            // call in it, so the second core has to arrive by the release
+            // table. The board's own default is `psci` + `secondary-start =
+            // false`, under which a secondary is genuinely powered off and
+            // this test's program would never start it. The two params are
+            // coupled -- see the machine file -- so both move together.
+            .with_param("secondary", "spin-table".to_string())
+            .with_param("secondary-start", "true".to_string())
             .with_param("engine", engine.to_string());
         let registry = catalog::registry().expect("a registry");
         rsemu::machine::build(entry.name, entry.source, &registry, &options)
