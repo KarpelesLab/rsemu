@@ -631,6 +631,16 @@ pub enum Fmt {
     /// `Vd.<Ta>, Vn.<Ta>, Vm.<Tb>` — the same with a wide first source
     /// (`UADDW`, `SSUBW`).
     VecThreeWide,
+    /// `Vd.<Tb>, Vn.<Ta>, Vm.<Ta>` — a **narrowing** three-register operation
+    /// (`ADDHN`, `RADDHN`, `SUBHN`, `RSUBHN`): both sources are twice the
+    /// destination's width, and `Q` picks the half of the *destination* that
+    /// is written, exactly as it does for [`Fmt::VecNarrow`].
+    ///
+    /// It shares an encoding group with [`Fmt::VecThreeDiff`] and reads the
+    /// same `size` field, and it is a separate format because that field
+    /// means the opposite thing: for `SADDL` it is the source width and for
+    /// `ADDHN` the destination's.
+    VecThreeNarrow,
     /// `Vd.<T>, Vn.<T>, Vm.<Ts>[index]` — an operation by a scalar element.
     VecByElem,
     /// `<V>d, <V>n, <V>m` — a scalar SIMD three-register operation, which is
@@ -737,7 +747,8 @@ impl Fmt {
             | Fmt::VecShiftLong
             | Fmt::VecShiftNarrow
             | Fmt::VecThreeDiff
-            | Fmt::VecThreeWide => Suffix::Wide,
+            | Fmt::VecThreeWide
+            | Fmt::VecThreeNarrow => Suffix::Wide,
             _ => Suffix::None,
         }
     }
@@ -1529,6 +1540,14 @@ a64! {
     0xbf20fc00 0x0e209000 SqdmlalVec "sqdmlal" VecThreeDiff AdvSimd "doubled signed multiply-accumulate into wider lanes, saturating";
     0xbf20fc00 0x0e20b000 SqdmlslVec "sqdmlsl" VecThreeDiff AdvSimd "doubled signed multiply-subtract from wider lanes, saturating";
     0xbf20fc00 0x0e20d000 SqdmullVec "sqdmull" VecThreeDiff AdvSimd "doubled signed multiply into wider lanes, saturating";
+    // The halving narrows. `U` is the *rounding* bit here rather than a
+    // signedness one, which is why there is no `UADDHN`: the top half of a
+    // two's-complement sum is the same bits whichever way the operands are
+    // read, so signedness has nothing left to select.
+    0xbf20fc00 0x0e204000 AddhnVec "addhn" VecThreeNarrow AdvSimd "add wide lanes and keep the top half of each";
+    0xbf20fc00 0x2e204000 RaddhnVec "raddhn" VecThreeNarrow AdvSimd "add wide lanes and keep the top half of each, rounding";
+    0xbf20fc00 0x0e206000 SubhnVec "subhn" VecThreeNarrow AdvSimd "subtract wide lanes and keep the top half of each";
+    0xbf20fc00 0x2e206000 RsubhnVec "rsubhn" VecThreeNarrow AdvSimd "subtract wide lanes and keep the top half of each, rounding";
 
     // -- Advanced SIMD: shift by an immediate --------------------------------
     0xbf80fc00 0x0f000400 SshrVec "sshr" VecShiftImm AdvSimd "shift lanes right, signed";

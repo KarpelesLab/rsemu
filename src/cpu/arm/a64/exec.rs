@@ -26,6 +26,8 @@
 //! interrupt-masking rule at a lower exception level, and the divide-by-zero
 //! result. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 
+use alloc::sync::Arc;
+
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot};
 use crate::core::value::Width;
@@ -1370,7 +1372,15 @@ impl<'a> Exec<'a> {
                     return Err(Trap::undefined());
                 }
                 let args = [self.st.x[0], self.st.x[1], self.st.x[2], self.st.x[3]];
-                let outcome = psci::call(self.st.sys.el, self.cfg.cpus, args);
+                let outcome = psci::call(
+                    self.st.sys.el,
+                    psci::Siblings {
+                        cluster: self.lines.cluster().map(Arc::as_ref),
+                        cpus: self.cfg.cpus,
+                        me: self.lines,
+                    },
+                    args,
+                );
                 self.st.x[0] = outcome.x0;
                 match outcome.effect {
                     psci::Effect::None => {}
@@ -2939,6 +2949,7 @@ impl<'a> Exec<'a> {
             Fmt::VecShiftLong => self.simd_shift_long(word, op),
             Fmt::VecShiftNarrow => self.simd_shift_narrow(word, op),
             Fmt::VecThreeDiff | Fmt::VecThreeWide => self.simd_three_diff(word, op, fmt),
+            Fmt::VecThreeNarrow => self.simd_three_narrow(word, op),
             Fmt::VecByElem => self.simd_by_elem(word, op),
             Fmt::SimdScalarThree
             | Fmt::SimdScalarTwo
@@ -3951,6 +3962,38 @@ impl<'a> Exec<'a> {
         }
         self.set_qc(saturated);
         self.st.v.set_q(d, out);
+        Ok(())
+    }
+
+    /// The halving narrows: two sources twice the destination's width, of
+    /// which the top half of each sum or difference is kept.
+    ///
+    /// `size` names the **destination** here, which is the opposite of what it
+    /// names three rows up in the same encoding group — so this reads it as
+    /// `dst` and widens, where [`Exec::simd_three_diff`] reads it as `src` and
+    /// narrows. `Q` selects the half of `Vd` that is written and leaves the
+    /// other alone, exactly as it does for `XTN2`.
+    fn simd_three_narrow(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let dst = isa::simd_size(word);
+        // `size == 0b11` would make the sources 128-bit elements, which the
+        // register file does not have; DDI 0487 leaves it unallocated.
+        if dst > 2 {
+            return Err(Trap::undefined());
+        }
+        let src = dst + 1;
+        let lanes = 64 / (8 << dst);
+        let a = self.st.v.q(isa::rn(word));
+        let b = self.st.v.q(isa::rm(word));
+        let rounding = matches!(op, Op::RaddhnVec | Op::RsubhnVec);
+        let subtract = matches!(op, Op::SubhnVec | Op::RsubhnVec);
+        let mut half = 0u128;
+        for lane in 0..lanes {
+            let x = simd::elem(a, src, lane);
+            let y = simd::elem(b, src, lane);
+            let value = simd::add_narrow(dst, x, y, rounding, subtract);
+            half = simd::set_elem(half, dst, lane, value);
+        }
+        self.write_half(isa::rd(word), isa::q(word), half);
         Ok(())
     }
 

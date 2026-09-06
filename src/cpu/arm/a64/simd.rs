@@ -65,13 +65,29 @@
 //!
 //! Polynomial multiply, the reciprocal-estimate family (`FRECPE`, `FRSQRTE`,
 //! `FRECPS`, `FRSQRTS`, `FMULX`), `FEAT_FP16` arithmetic, the pairwise
-//! long adds (`SADDLP`, `UADALP`), `SHLL`, the halving-narrow three-different
-//! family (`ADDHN`, `RADDHN`, `SUBHN`, `RSUBHN`), the absolute-difference-long
+//! long adds (`SADDLP`, `UADALP`), `SHLL`, the absolute-difference-long
 //! group (`SABAL`, `UABDL`), the saturating **by-element** forms
 //! (`SQDMULH`/`SQRDMULH`/`SQDMULL` and relatives with a lane index),
-//! `LD2`/`LD3`/`LD4` of a *single* structure and the replicating loads other
-//! than `LD1R`, and everything Armv8.1 and later added. Each is absent from
-//! the table, so each raises `UNDEFINED` rather than being quietly wrong.
+//! the non-saturating scalar shifts *by an immediate* (`SHL D0, D1, #n` and
+//! `USHR`, `SSHR`, `SRI`, `SLI` and relatives — the vector forms are all
+//! here), the scalar two-misc conversions (`SCVTF S0, S1`, `FCVTZS`,
+//! `UCVTF`), `LD2`/`LD3`/`LD4` of a *single* structure and the replicating
+//! loads other than `LD1R`, and everything Armv8.1 and later added. Each is
+//! absent from the table, so each raises `UNDEFINED` rather than being
+//! quietly wrong.
+//!
+//! The **halving-narrow three-different family** — `ADDHN`, `RADDHN`,
+//! `SUBHN`, `RSUBHN` — used to head that list and does not any more, because
+//! it turned out to be the one entry on it that every dynamically linked
+//! program on this architecture executes. glibc's `strlen` compares sixteen
+//! bytes with `CMEQ` and folds the mask to eight with `ADDHN v2.8b, v1.8h,
+//! v1.8h`, so a whole C library stopped there before it reached `main`. What
+//! the rest of the list costs is written down in `arm64-virt.md`; what this
+//! one cost was measured: of the 329 272 instruction words in a Debian
+//! `libc.so.6` and its `ld.so`, this core refused 329, and every one of them
+//! but four `ADDHN`s was behind a feature bit — SVE, SME, MTE or `FEAT_MOPS`
+//! — that this core's ID registers deny, so an `ifunc` resolver never selects
+//! it. Four words in a third of a million were the whole gap.
 //!
 //! # Sources
 //!
@@ -848,6 +864,47 @@ pub const fn halve(
         x + y + (rounding as i128)
     };
     trunc((exact >> 1) as u64, esize)
+}
+
+/// `ADDHN`/`RADDHN`/`SUBHN`/`RSUBHN`: a sum or difference of two elements
+/// twice as wide as the result, of which only the **top** half is kept.
+///
+/// `esize` is the **destination** width, so the arithmetic happens at
+/// `esize + 1` and the result is `sum<2N-1:N>` (DDI 0487, `ADDHN`'s operation
+/// pseudocode).
+///
+/// # Why no `signed` parameter
+///
+/// Because there is nothing for one to select. The sum of two `2N`-bit
+/// elements is the same bit pattern whether they are read as signed or
+/// unsigned — two's complement addition is the same operation — and the top
+/// `N` bits of that pattern are therefore the same too. The `U` bit of this
+/// encoding group, which everywhere else in it means *unsigned*, is the
+/// **rounding** bit here, which is the trap: an implementation that read `U`
+/// the way its neighbours do would compute `ADDHN` for `RADDHN` and be wrong
+/// by one half-ulp on exactly the inputs that round up.
+///
+/// It does not saturate — the top half of a sum cannot leave the destination's
+/// range, by construction — so it returns a plain value and never touches
+/// `FPSR.QC`.
+#[must_use]
+pub const fn add_narrow(esize: u32, a: u64, b: u64, rounding: bool, subtract: bool) -> u64 {
+    let wide = esize + 1;
+    let bits = 8u32 << esize;
+    let sum = if subtract {
+        sub(wide, a, b)
+    } else {
+        add(wide, a, b)
+    };
+    // The rounding constant is added at the *wide* width and is allowed to
+    // wrap there, which is what makes `RADDHN` of two maximal elements the
+    // architecture's answer rather than a widened one.
+    let rounded = if rounding {
+        add(wide, sum, 1u64 << (bits - 1))
+    } else {
+        sum
+    };
+    trunc(rounded >> bits, esize)
 }
 
 /// `SQDMULH`/`SQRDMULH`: the top half of a **doubled** signed product.
@@ -1674,5 +1731,62 @@ mod tests {
         assert!(fcompare(Prec::Double, 0, 1 << 63, FpCmp::Eq, env).0);
         assert!(fcompare(Prec::Double, 0, 1 << 63, FpCmp::Ge, env).0);
         assert!(!fcompare(Prec::Double, 0, 1 << 63, FpCmp::Gt, env).0);
+    }
+
+    /// [`add_narrow`] against the arithmetic written out longhand, over every
+    /// pair of byte-destination inputs there is.
+    ///
+    /// Exhaustive at the byte because it can be: 2^32 pairs is too many, but
+    /// the two edges that matter — the exact half, and the rounding constant
+    /// carrying out of the top — are both in the 16-bit source space, and an
+    /// exhaustive sweep of one operand against a set of interesting others
+    /// covers them without asserting a formula twice.
+    #[test]
+    fn a_halving_narrow_is_the_top_half_of_a_wrapping_sum() {
+        let others = [
+            0u64, 1, 0x7f, 0x80, 0xff, 0x100, 0x180, 0x7fff, 0x8000, 0xff00, 0xfffe, 0xffff,
+        ];
+        for a in 0..=0xffffu64 {
+            for b in others {
+                for subtract in [false, true] {
+                    let sum = if subtract {
+                        a.wrapping_sub(b) & 0xffff
+                    } else {
+                        (a + b) & 0xffff
+                    };
+                    assert_eq!(
+                        add_narrow(0, a, b, false, subtract),
+                        sum >> 8,
+                        "{a:#x} {b:#x} subtract={subtract}"
+                    );
+                    // The rounding constant is added at the *wide* width and
+                    // wraps there, which is the whole of what `R` means.
+                    assert_eq!(
+                        add_narrow(0, a, b, true, subtract),
+                        ((sum + 0x80) & 0xffff) >> 8,
+                        "{a:#x} {b:#x} subtract={subtract}, rounding"
+                    );
+                }
+            }
+        }
+        // One case at each of the other two widths, so a byte-shaped constant
+        // that happened to work here cannot pass for the whole function.
+        assert_eq!(add_narrow(1, 0x0001_8000, 0x0001_8000, false, false), 3);
+        assert_eq!(add_narrow(1, 0xffff_ffff, 0xffff_ffff, true, false), 0);
+        assert_eq!(
+            add_narrow(
+                2,
+                0x0000_0001_8000_0000,
+                0x0000_0001_8000_0000,
+                false,
+                false
+            ),
+            3
+        );
+        assert_eq!(
+            add_narrow(2, u64::MAX, u64::MAX, true, false),
+            0,
+            "the wide sum wraps and so does the rounding constant"
+        );
     }
 }

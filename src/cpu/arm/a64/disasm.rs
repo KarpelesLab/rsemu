@@ -1346,6 +1346,28 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 (16u32 << esize).wrapping_sub(immhb)
             );
         }
+        Fmt::VecThreeNarrow => {
+            // `size` is the destination's width here, so the sources are one
+            // wider and the destination is the half `Q` selects — the mirror
+            // image of the widening rows below, out of the same field.
+            let dst = isa::simd_size(word);
+            let lanes = 64 / (8 << dst);
+            let narrow = simd::Arrangement {
+                esize: dst,
+                lanes: lanes * (1 + u32::from(isa::q(word))),
+            };
+            let wide = simd::Arrangement {
+                esize: dst + 1,
+                lanes,
+            };
+            let _ = write!(
+                ops,
+                "{}, {}, {}",
+                varr(d, Some(narrow)),
+                varr(n, Some(wide)),
+                varr(m, Some(wide))
+            );
+        }
         Fmt::VecThreeDiff | Fmt::VecThreeWide => {
             let src = isa::simd_size(word);
             let lanes = 64 / (8 << src);

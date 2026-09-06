@@ -47,15 +47,215 @@
 //!
 //! # What is implemented, and what is refused
 //!
-//! Everything a single-processor kernel calls, and nothing else. The calls
-//! that bring up a second core — `CPU_ON`, `AFFINITY_INFO` — are answered but
-//! not *performed*: this board has one core, so `CPU_ON` for a processor that
-//! does not exist is `INVALID_PARAMETERS`, which is the specification's own
-//! answer and is what a kernel that reads the device tree will never ask.
-//! `PSCI_FEATURES` reports exactly the set below, so a kernel discovers the
-//! gap rather than falling into it.
+//! Everything a kernel calls to bring a machine up and take it down:
+//! `PSCI_VERSION`, `SYSTEM_OFF`, `SYSTEM_RESET`, `MIGRATE_INFO_TYPE`,
+//! `PSCI_FEATURES`, and — on a board that put its processors in a
+//! [`Cluster`] — `CPU_ON`, `CPU_OFF` and `AFFINITY_INFO` for real.
+//! `CPU_SUSPEND` is refused rather than answered, because a kernel told
+//! `SUCCESS` would expect to have been suspended and resumed and this core
+//! does neither. `PSCI_FEATURES` reports exactly the set [`implemented`]
+//! names, so a kernel discovers the gap rather than falling into it.
+//!
+//! # The roster, and why `call` is not a pure function any more
+//!
+//! `CPU_ON` is the one call whose whole point is to reach a **sibling**: the
+//! processor executing the `SMC` must change another processor's state. There
+//! is no route from a core to its siblings through the address space — a
+//! processor is not a memory-mapped device — so the boards's processors meet
+//! by name in a [`Cluster`], a `HostKind::rendezvous` host object in the
+//! build's `HostObjects`, exactly the way every local APIC on a `pc` board
+//! meets on one `apic.bus`.
+//!
+//! What crosses is four atomics on the sibling's [`Lines`], for
+//! the same reason `Lines` exists at all: the sender is holding its own
+//! `BUS`-ranked execution lock when it writes them, and taking the sibling's
+//! would be the deadlock the ranked order exists to prevent. The sibling
+//! notices at its own next instruction boundary. The roster's own lock ranks
+//! under `BUS` and is released before anything is done with what it held.
+//!
+//! A board that names no cluster keeps the old answers, which were honest for
+//! it: every processor it has is running, so `AFFINITY_INFO` is `ON`,
+//! `CPU_ON` is `ALREADY_ON`, and `CPU_OFF` is `DENIED` because the last
+//! processor cannot switch itself off and leave the machine running.
 
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+
+use crate::core::error::Result;
+use crate::core::hosts::{HostKind, HostObjects};
+use crate::core::props::Props;
+use crate::core::sync::{LockRank, Mutex};
+
+use super::Lines;
 use super::sysreg::El;
+
+/// The kind a processor cluster is filed under in a build's `HostObjects`.
+pub const CLUSTER_KIND: HostKind = HostKind::rendezvous("arm-cluster");
+
+/// The cluster name a core gets when a machine description does not say.
+pub const DEFAULT_CLUSTER: &str = "cluster";
+
+/// Where the roster's lock sits in the ranked order.
+///
+/// **Below [`LockRank::BUS`] and above [`LockRank::DEVICE`]**, and forced
+/// rather than chosen for the same reason `apic.bus`'s roster is: a CPU holds
+/// a `BUS`-ranked lock across the instruction it is executing, and this is
+/// reached from inside one. It ranks above `DEVICE` because it is released
+/// before the caller touches what it held — which here is a sibling's
+/// [`Lines`], and those are atomics with no lock of their own at all.
+pub const CLUSTER_RANK: LockRank = LockRank::new(0x4c62);
+
+/// The processors on one board, as `CPU_ON` can see them.
+///
+/// Held **weakly**: the machine owns the cores and a roster merely refers to
+/// them (`ROADMAP.md` §4.3's weak edge). A `Weak` that no longer upgrades is a
+/// processor that has been dropped, which is a processor `CPU_ON` must not
+/// find.
+#[derive(Debug)]
+pub struct Cluster {
+    members: Mutex<Vec<(u64, Weak<Lines>)>>,
+}
+
+impl Default for Cluster {
+    /// Written out rather than derived, because a derived one would build the
+    /// roster's lock at [`LockRank::LEAF`] and a `LEAF` lock nests under
+    /// anything — which is the opposite of what [`CLUSTER_RANK`] says and
+    /// exactly the kind of silent disagreement the ranked order exists to
+    /// catch.
+    fn default() -> Cluster {
+        Cluster::new()
+    }
+}
+
+impl Cluster {
+    /// An empty roster.
+    #[must_use]
+    pub fn new() -> Cluster {
+        Cluster {
+            members: Mutex::with_rank(CLUSTER_RANK, Vec::new()),
+        }
+    }
+
+    /// Put a processor on the roster under the affinity its `MPIDR_EL1` names.
+    ///
+    /// Returns `false` if a live processor already holds that affinity: two
+    /// cores with one `MPIDR_EL1` is a board that cannot mean anything, and
+    /// the caller reports it rather than picking one. (It is also the defect a
+    /// copied-and-pasted `object cpu1` produces, which is why it is checked
+    /// here rather than left to the guest to discover.)
+    pub fn join(&self, affinity: u64, lines: Weak<Lines>) -> bool {
+        let mut members = self.members.lock();
+        // A processor that has been dropped is not one anything can find, so
+        // its entry goes rather than accumulating: a test that builds and
+        // discards machines in a loop shares one `HostObjects` with all of
+        // them, and a roster that only ever grew would be a leak measured in
+        // machines.
+        members.retain(|(_, other)| other.strong_count() > 0);
+        if members.iter().any(|(id, _)| *id == affinity) {
+            return false;
+        }
+        members.push((affinity, lines));
+        true
+    }
+
+    /// The processor at `affinity`, if this board has one.
+    ///
+    /// The lock is released before the answer is handed back, explicitly: the
+    /// caller is about to write another core's interrupt lines.
+    #[must_use]
+    pub fn find(&self, affinity: u64) -> Option<Arc<Lines>> {
+        let members = self.members.lock();
+        let found = members
+            .iter()
+            .find(|(id, _)| *id == affinity)
+            .and_then(|(_, lines)| lines.upgrade());
+        drop(members);
+        found
+    }
+
+    /// How many processors are on the roster.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.members
+            .lock()
+            .iter()
+            .filter(|(_, lines)| lines.strong_count() > 0)
+            .count()
+    }
+
+    /// Whether the roster is empty, which is what a board with no `cluster`
+    /// property has.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many of them are powered on.
+    ///
+    /// What makes `CPU_OFF` on the last one `DENIED`: a machine whose every
+    /// processor is off is a machine nothing can ever start again, and DEN
+    /// 0022 §5.1.2 makes refusing it the implementation's job.
+    #[must_use]
+    pub fn powered(&self) -> usize {
+        let members = self.members.lock();
+        let live: Vec<Arc<Lines>> = members.iter().filter_map(|(_, l)| l.upgrade()).collect();
+        drop(members);
+        live.iter().filter(|lines| lines.powered()).count()
+    }
+
+    /// The cluster `name` refers to in `hosts`, creating it on first mention.
+    ///
+    /// The **host** side of the rendezvous.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object already holds
+    /// that name.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<Cluster>> {
+        hosts.open(CLUSTER_KIND, name, Cluster::new)
+    }
+
+    /// The cluster `name` refers to in the build these properties belong to.
+    ///
+    /// The **device** side, called from `new(props)`. A `Props` that belongs
+    /// to no build gets a private cluster, so a core a unit test constructed
+    /// by hand still works and simply meets nobody.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cluster::open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<Cluster>> {
+        props.host(CLUSTER_KIND, name, Cluster::new)
+    }
+}
+
+/// The affinity an `MPIDR_EL1` value names: `Aff0`, `Aff1`, `Aff2` and
+/// `Aff3`, and nothing else.
+///
+/// Bit 31 is RES1, bit 30 is `U` and bit 24 is `MT` (DDI 0487 D17.2.100).
+/// None of the three is part of a processor's identity, and a `CPU_ON` whose
+/// `target_cpu` carried bit 31 — because whoever wrote the machine file
+/// copied `MPIDR_EL1` verbatim — must still find the processor it names.
+#[must_use]
+pub const fn affinity_of(mpidr: u64) -> u64 {
+    mpidr & 0x0000_00ff_00ff_ffff
+}
+
+/// The affinity a `CPU_ON` or `AFFINITY_INFO` argument names, if it is a
+/// legal one.
+///
+/// DEN 0022 §5.1.3: `target_cpu` is an `MPIDR_EL1`-shaped value in which
+/// every bit outside the four affinity fields is zero. A caller that sets one
+/// is not naming a processor, and `INVALID_PARAMETERS` is the answer — not a
+/// masked-off guess at what it meant.
+#[must_use]
+pub const fn target_affinity(target: u64) -> Option<u64> {
+    if target & !0x0000_00ff_00ff_ffffu64 != 0 {
+        None
+    } else {
+        Some(target)
+    }
+}
 
 /// Which instruction a board's guests call firmware with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -186,15 +386,37 @@ impl Outcome {
     }
 }
 
+/// The processors this call can see: the board's roster, and the caller's own
+/// lines.
+///
+/// A struct rather than three more arguments because the three are one fact —
+/// *who is on this board and which of them is asking* — and because a
+/// `cluster` of `None` and a `cpus` of 2 is the combination whose meaning has
+/// to be stated once: a board that declared two processors and put neither on
+/// a roster, which is what `secondary = "spin-table"` is.
+#[derive(Debug, Clone, Copy)]
+pub struct Siblings<'a> {
+    /// The board's roster, if the machine file gave the processors a cluster.
+    pub cluster: Option<&'a Cluster>,
+    /// How many processors the board says it has, for a board with no roster.
+    pub cpus: u64,
+    /// The calling processor's own interrupt lines, which is what `CPU_OFF`
+    /// switches off.
+    pub me: &'a Lines,
+}
+
 /// Service a call made with `x0`-`x3` as the guest left them.
 ///
 /// `el` is the exception level the call was made from: PSCI is a firmware
 /// interface and EL0 has no business calling it, so an unprivileged call is
-/// refused rather than answered. `cpus` is how many processors this machine
-/// has, which is what makes `CPU_ON` for processor 1 on a single-core board an
-/// honest `INVALID_PARAMETERS`.
-#[must_use]
-pub fn call(el: El, cpus: u64, x: [u64; 4]) -> Outcome {
+/// refused rather than answered.
+///
+/// **Not a pure function.** `CPU_ON` writes the target's start request into
+/// its [`Lines`] and `CPU_OFF` clears the caller's own `powered` flag; both
+/// are atomics, written with no lock held but the caller's own, and both are
+/// read by their owner at its next instruction boundary. Everything a *board*
+/// must do is still returned in [`Outcome::effect`] rather than done here.
+pub fn call(el: El, siblings: Siblings<'_>, x: [u64; 4]) -> Outcome {
     if el != El::El1 {
         // DEN 0022 §5.2.1: a call from an unprivileged level is not a PSCI
         // call at all. `NOT_SUPPORTED` rather than a fault, because the
@@ -205,6 +427,14 @@ pub fn call(el: El, cpus: u64, x: [u64; 4]) -> Outcome {
     // Fold the 64-bit convention onto the 32-bit id: the two forms of one
     // function differ only in bit 30 and do the same thing.
     let fid = raw & !fid::SMC64;
+    // The target of `CPU_ON` and `AFFINITY_INFO`, resolved once: `None` on a
+    // board with no roster, or when `x1` names no processor this board has.
+    let target = || {
+        siblings
+            .cluster
+            .zip(target_affinity(x[1]))
+            .and_then(|(c, a)| c.find(a))
+    };
     match fid {
         fid::VERSION => Outcome::value(u64::from(VERSION)),
         fid::SYSTEM_OFF => Outcome {
@@ -215,28 +445,59 @@ pub fn call(el: El, cpus: u64, x: [u64; 4]) -> Outcome {
             x0: ret::SUCCESS as u64,
             effect: Effect::Reboot,
         },
-        fid::CPU_OFF => {
-            // The last processor cannot switch itself off and leave the
-            // machine running: DEN 0022 makes that DENIED, and a kernel that
-            // gets it prints "CPU_OFF returned -3" and stops trying, which is
-            // the right outcome on a board with one core.
-            Outcome::error(ret::DENIED)
-        }
-        fid::CPU_ON => {
-            let target = x[1];
-            if affinity_index(target, cpus).is_some() {
-                // The processor exists and is already running, because on this
-                // board every processor is.
-                Outcome::error(ret::ALREADY_ON)
-            } else {
-                Outcome::error(ret::INVALID_PARAMETERS)
+        fid::CPU_OFF => match siblings.cluster {
+            // The last powered processor cannot switch itself off and leave
+            // the machine running: DEN 0022 §5.1.2 makes that DENIED, and a
+            // kernel that gets it prints "CPU_OFF returned -3" and stops
+            // trying, which is the right outcome on a board with one core.
+            Some(cluster) if cluster.powered() > 1 => {
+                siblings.me.power_off();
+                // DEN 0022: `CPU_OFF` does not return on success. The value is
+                // written into `X0` anyway and the core stops before it can
+                // read it — which is the honest shape of "does not return"
+                // when the caller is an interpreter that must return
+                // *something* to its own step loop.
+                Outcome::value(ret::SUCCESS as u64)
             }
-        }
-        fid::AFFINITY_INFO => match affinity_index(x[1], cpus) {
-            // 0 is `ON`, which is the only state a processor on this board is
-            // ever in (DEN 0022 §5.1.4).
-            Some(_) => Outcome::value(0),
-            None => Outcome::error(ret::INVALID_PARAMETERS),
+            _ => Outcome::error(ret::DENIED),
+        },
+        fid::CPU_ON => match siblings.cluster {
+            Some(_) => match target() {
+                None => Outcome::error(ret::INVALID_PARAMETERS),
+                Some(lines) if lines.powered() => Outcome::error(ret::ALREADY_ON),
+                Some(lines) => {
+                    // The entry point is `x2` and the context id `x3`, and the
+                    // started processor enters with `X0 = context_id`
+                    // (DEN 0022 §5.1.3). Applied by the target itself, at its
+                    // own next instruction boundary.
+                    lines.request_start(x[2], x[3]);
+                    Outcome::value(ret::SUCCESS as u64)
+                }
+            },
+            // No roster: every processor this board has is running, so the
+            // only two answers are "that one is already on" and "there is no
+            // such processor".
+            None => {
+                if affinity_index(x[1], siblings.cpus).is_some() {
+                    Outcome::error(ret::ALREADY_ON)
+                } else {
+                    Outcome::error(ret::INVALID_PARAMETERS)
+                }
+            }
+        },
+        // 0 is `ON` and 1 is `OFF` (DEN 0022 §5.1.4). This used to be an
+        // unconditional 0, which was only honest because every processor was
+        // running; a kernel reads it in a loop after `CPU_ON` and after
+        // `CPU_OFF`, and a constant `ON` makes an offline processor look hung.
+        fid::AFFINITY_INFO => match siblings.cluster {
+            Some(_) => match target() {
+                Some(lines) => Outcome::value(u64::from(!lines.powered())),
+                None => Outcome::error(ret::INVALID_PARAMETERS),
+            },
+            None => match affinity_index(x[1], siblings.cpus) {
+                Some(_) => Outcome::value(0),
+                None => Outcome::error(ret::INVALID_PARAMETERS),
+            },
         },
         // 2 is `TOS_NOT_PRESENT_MP`: there is no trusted OS to migrate, which
         // is what stops a kernel looking for one.
@@ -292,8 +553,24 @@ pub fn affinity_index(target: u64, cpus: u64) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// A board with no roster: what every one-processor machine is, and what
+    /// `arm64-virt-smp` was until `CPU_ON` landed.
+    fn alone(cpus: u64) -> Lines {
+        let _ = cpus;
+        Lines::default()
+    }
+
     fn at_el1(x0: u64, x1: u64) -> Outcome {
-        call(El::El1, 1, [x0, x1, 0, 0])
+        let me = alone(1);
+        call(
+            El::El1,
+            Siblings {
+                cluster: None,
+                cpus: 1,
+                me: &me,
+            },
+            [x0, x1, 0, 0],
+        )
     }
 
     #[test]
@@ -368,7 +645,19 @@ mod tests {
         // A target naming another cluster is not this board's processor 0.
         assert_eq!(affinity_index(0x100, 2), None);
         assert_eq!(
-            call(El::El1, 2, [u64::from(fid::CPU_ON), 1, 0, 0]).x0 as i64,
+            {
+                let me = alone(2);
+                call(
+                    El::El1,
+                    Siblings {
+                        cluster: None,
+                        cpus: 2,
+                        me: &me,
+                    },
+                    [u64::from(fid::CPU_ON), 1, 0, 0],
+                )
+                .x0 as i64
+            },
             i64::from(ret::ALREADY_ON)
         );
     }
@@ -377,7 +666,18 @@ mod tests {
     fn an_unprivileged_call_is_refused() {
         // PSCI is a firmware interface; a thread has no business calling it.
         assert_eq!(
-            call(El::El0, 1, [u64::from(fid::SYSTEM_OFF), 0, 0, 0]),
+            {
+                let me = alone(1);
+                call(
+                    El::El0,
+                    Siblings {
+                        cluster: None,
+                        cpus: 1,
+                        me: &me,
+                    },
+                    [u64::from(fid::SYSTEM_OFF), 0, 0, 0],
+                )
+            },
             Outcome::error(ret::NOT_SUPPORTED)
         );
     }
@@ -390,5 +690,172 @@ mod tests {
         }
         assert_eq!(Conduit::by_name("psci"), None);
         assert_eq!(Conduit::default(), Conduit::None);
+    }
+
+    /// A board whose processors can see each other, and the four calls that
+    /// only mean anything on one.
+    ///
+    /// `CPU_ON` for a processor that is off starts it; for one that is on it
+    /// is `ALREADY_ON`; for an affinity nobody has it is `INVALID_PARAMETERS`.
+    /// What "starts it" means here is the *request* — the entry point and the
+    /// context id land in the target's own lines, and the target applies them
+    /// itself at its next instruction boundary.
+    #[test]
+    fn cpu_on_reaches_a_sibling_through_the_roster() {
+        let cluster = Cluster::new();
+        let boot = Arc::new(Lines::default());
+        let second = Arc::new(Lines::default());
+        second.set_powered(false);
+        assert!(cluster.join(0, Arc::downgrade(&boot)));
+        assert!(cluster.join(1, Arc::downgrade(&second)));
+        assert_eq!(cluster.len(), 2);
+        assert_eq!(cluster.powered(), 1, "only the boot processor is running");
+
+        let on = |x: [u64; 4]| {
+            call(
+                El::El1,
+                Siblings {
+                    cluster: Some(&cluster),
+                    cpus: 2,
+                    me: &boot,
+                },
+                x,
+            )
+        };
+
+        // Before: affinity 1 is OFF, which is 1 and not the constant 0 this
+        // call used to answer.
+        assert_eq!(on([u64::from(fid::AFFINITY_INFO), 1, 0, 0]).x0, 1);
+        assert_eq!(on([u64::from(fid::AFFINITY_INFO), 0, 0, 0]).x0, 0);
+
+        // `CPU_ON(1, entry, context)`.
+        let out = on([u64::from(fid::CPU_ON), 1, 0x4020_0000, 0xdead_beef]);
+        assert_eq!(out.x0 as i64, i64::from(ret::SUCCESS));
+        assert_eq!(out.effect, Effect::None, "nothing for the board to do");
+        assert!(second.powered(), "and it is on now");
+        assert_eq!(on([u64::from(fid::AFFINITY_INFO), 1, 0, 0]).x0, 0);
+        assert_eq!(second.take_start(), Some((0x4020_0000, 0xdead_beef)));
+        assert_eq!(second.take_start(), None, "taken once and only once");
+
+        // A second `CPU_ON` for a processor that is on.
+        assert_eq!(
+            on([u64::from(fid::CPU_ON), 1, 0x4020_0000, 0]).x0 as i64,
+            i64::from(ret::ALREADY_ON)
+        );
+        // And one for an affinity this board has not got.
+        assert_eq!(
+            on([u64::from(fid::CPU_ON), 2, 0x4020_0000, 0]).x0 as i64,
+            i64::from(ret::INVALID_PARAMETERS)
+        );
+        assert_eq!(
+            on([u64::from(fid::AFFINITY_INFO), 2, 0, 0]).x0 as i64,
+            i64::from(ret::INVALID_PARAMETERS)
+        );
+    }
+
+    /// `CPU_OFF` switches the *caller* off — the half a spin table cannot do
+    /// at all — and the last processor standing is refused.
+    #[test]
+    fn cpu_off_stops_the_caller_and_never_the_last_one() {
+        let cluster = Cluster::new();
+        let boot = Arc::new(Lines::default());
+        let second = Arc::new(Lines::default());
+        cluster.join(0, Arc::downgrade(&boot));
+        cluster.join(1, Arc::downgrade(&second));
+        let off = |me: &Lines| {
+            call(
+                El::El1,
+                Siblings {
+                    cluster: Some(&cluster),
+                    cpus: 2,
+                    me,
+                },
+                [u64::from(fid::CPU_OFF), 0, 0, 0],
+            )
+        };
+        // Two are running, so the second one may stop.
+        assert_eq!(off(&second).x0 as i64, i64::from(ret::SUCCESS));
+        assert!(!second.powered());
+        assert_eq!(cluster.powered(), 1);
+        // The last one may not: a machine with every processor off is a
+        // machine nothing can start again.
+        assert_eq!(off(&boot).x0 as i64, i64::from(ret::DENIED));
+        assert!(boot.powered(), "and it is still running");
+    }
+
+    /// A board with no roster keeps every answer it had, which is the whole
+    /// of what a spin-table board and `a64-mini` rely on.
+    #[test]
+    fn a_board_with_no_roster_answers_the_way_it_always_did() {
+        let me = Lines::default();
+        let ask = |cpus: u64, x: [u64; 4]| {
+            call(
+                El::El1,
+                Siblings {
+                    cluster: None,
+                    cpus,
+                    me: &me,
+                },
+                x,
+            )
+        };
+        assert_eq!(ask(2, [u64::from(fid::AFFINITY_INFO), 1, 0, 0]).x0, 0);
+        assert_eq!(
+            ask(2, [u64::from(fid::CPU_ON), 1, 0, 0]).x0 as i64,
+            i64::from(ret::ALREADY_ON)
+        );
+        assert_eq!(
+            ask(1, [u64::from(fid::CPU_ON), 1, 0, 0]).x0 as i64,
+            i64::from(ret::INVALID_PARAMETERS)
+        );
+        assert_eq!(
+            ask(2, [u64::from(fid::CPU_OFF), 0, 0, 0]).x0 as i64,
+            i64::from(ret::DENIED)
+        );
+        assert!(me.powered(), "and nothing switched it off");
+    }
+
+    /// An `MPIDR_EL1` value is not an affinity: bit 31 is RES1 and is set on
+    /// every real one, and a `CPU_ON` `target_cpu` that carries it is not
+    /// naming a processor.
+    #[test]
+    fn an_affinity_is_the_four_fields_and_nothing_else() {
+        // What a machine file writes for processor 1 of `arm64-virt-smp`.
+        assert_eq!(affinity_of(0x8000_0001), 1);
+        assert_eq!(affinity_of(0x8000_0000), 0);
+        // Aff1 and Aff2 survive; the `U` and `MT` bits do not.
+        assert_eq!(affinity_of(0x8100_0203), 0x0203);
+        assert_eq!(affinity_of(0x0000_00ff_00ff_ffff), 0x0000_00ff_00ff_ffff);
+        // A target with a bit outside the affinity fields names nothing.
+        assert_eq!(target_affinity(0x8000_0001), None);
+        assert_eq!(target_affinity(1), Some(1));
+        assert_eq!(target_affinity(0x0100_0000), None, "bits 31:24 are zero");
+        assert_eq!(target_affinity(0x0000_0100_0000_0000), None, "and 63:40");
+
+        // And the roster is keyed on the affinity, so a core whose `MPIDR` has
+        // bit 31 set is still found by a kernel's `CPU_ON(1, …)`.
+        let cluster = Cluster::new();
+        let lines = Arc::new(Lines::default());
+        cluster.join(affinity_of(0x8000_0001), Arc::downgrade(&lines));
+        assert!(cluster.find(1).is_some());
+        assert!(cluster.find(0x8000_0001).is_none());
+    }
+
+    /// Two processors with one `MPIDR_EL1` is a board that cannot mean
+    /// anything, and the roster says so rather than picking one.
+    #[test]
+    fn one_affinity_belongs_to_one_processor() {
+        let cluster = Cluster::new();
+        let a = Arc::new(Lines::default());
+        let b = Arc::new(Lines::default());
+        assert!(cluster.join(7, Arc::downgrade(&a)));
+        assert!(!cluster.join(7, Arc::downgrade(&b)));
+        // A processor that has been dropped is not one `CPU_ON` can find, and
+        // its affinity is free again — the roster holds a `Weak` precisely so
+        // that a machine torn down and rebuilt does not accumulate ghosts.
+        drop(a);
+        assert!(cluster.find(7).is_none());
+        assert_eq!(cluster.len(), 0);
+        assert!(cluster.join(7, Arc::downgrade(&b)));
     }
 }

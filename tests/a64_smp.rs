@@ -61,6 +61,17 @@ fn env_or(name: &str, fallback: &str) -> String {
 }
 
 fn board(kernel: &[u8], initrd: &[u8], ram: &str) -> Board {
+    board_with(kernel, initrd, ram, "psci")
+}
+
+/// The same board, brought up either way.
+///
+/// `secondary` and the core's `start` property go together — a spin-table
+/// board's secondary really is running, in the ROM's parking loop, and a PSCI
+/// board's really is off — so this sets both from one argument and the two
+/// cannot drift apart in a test the way they could in a hand-written machine
+/// file.
+fn board_with(kernel: &[u8], initrd: &[u8], ram: &str, secondary: &str) -> Board {
     let entry = catalog::machine("arm64-virt-smp").expect("this build ships it");
     let options = catalog::build_options()
         .expect("the catalog agrees with itself")
@@ -68,6 +79,8 @@ fn board(kernel: &[u8], initrd: &[u8], ram: &str) -> Board {
         .with_media("initrd", initrd)
         .with_media("disk", Vec::new())
         .with_param("ram", ram.to_string())
+        .with_param("secondary", secondary.to_string())
+        .with_param("secondary-start", (secondary == "spin-table").to_string())
         .with_param(
             "cmdline",
             env_or(
@@ -163,7 +176,7 @@ fn two_processor_program() -> Vec<u8> {
 
 #[test]
 fn the_second_processor_waits_for_the_first_to_release_it() {
-    let mut b = board(&two_processor_program(), &[], "16M");
+    let mut b = board_with(&two_processor_program(), &[], "16M", "spin-table");
     // Generous: the whole exchange is a few hundred instructions, and the
     // second processor spends most of it in the parking loop.
     for _ in 0..2000 {
@@ -177,6 +190,90 @@ fn the_second_processor_waits_for_the_first_to_release_it() {
         Some(Request::Poweroff),
         "the boot processor never saw the other one answer: either the reset vector did not park \
          it, or writing its word of the release table did not start it"
+    );
+}
+
+/// The same exchange, brought up with PSCI instead — and the half a spin
+/// table has no mechanism for.
+///
+/// ```text
+///   ; the boot processor, entered by the ROM stub
+///   x0 = 0xc4000003            ; CPU_ON, SMC64
+///   x1 = 1                     ; target_cpu: affinity 1
+///   x2 = SECOND                ; entry point
+///   x3 = ANSWERED              ; context id, which arrives in the target's X0
+///   smc #0
+///   x11 = ANSWER
+/// 1: ldr x12, [x11]
+///   cbz x12, 1b                ; wait for the other one to say something
+/// 2: x0 = 0xc4000004           ; AFFINITY_INFO
+///   x1 = 1
+///   smc #0
+///   cbz x0, 2b                 ; wait for it to go OFF again
+///   PSCI_SYSTEM_OFF
+///
+///   ; the second processor, started by CPU_ON at exactly this address
+///   x11 = ANSWER
+///   str x0, [x11]              ; its *context id*, so a zero X0 hangs the test
+///   x0 = 0x84000002            ; CPU_OFF
+///   smc #0
+///   b .
+/// ```
+///
+/// Two things a spin table cannot do are asserted here rather than assumed.
+/// The word the boot processor waits on is the **context id**, so a `CPU_ON`
+/// that started the processor without delivering `X3` into its `X0` hangs
+/// rather than passing. And the loop after it waits for `AFFINITY_INFO` to
+/// report `OFF`, which only happens because the secondary called `CPU_OFF` —
+/// a spin table has no way to turn a processor off at all, and the call used
+/// to be an unconditional `DENIED`.
+fn psci_program() -> Vec<u8> {
+    const ANSWERED: u64 = 0xa5;
+    let mut words: Vec<u32> = Vec::new();
+    words.extend_from_slice(&asm::load64(0, 0xc400_0003));
+    words.extend_from_slice(&asm::load64(1, 1));
+    words.extend_from_slice(&asm::load64(2, SECOND));
+    words.extend_from_slice(&asm::load64(3, ANSWERED));
+    words.push(asm::smc(0));
+    words.extend_from_slice(&asm::load64(11, ANSWER));
+    let spin = words.len() as i32;
+    words.push(asm::ldr_base(12, 11));
+    words.push(asm::cbz(12, spin - words.len() as i32));
+    let poll = words.len() as i32;
+    words.extend_from_slice(&asm::load64(0, 0xc400_0004));
+    words.extend_from_slice(&asm::load64(1, 1));
+    words.push(asm::smc(0));
+    words.push(asm::cbz(0, poll - words.len() as i32));
+    words.extend_from_slice(&asm::load64(0, 0x8400_0008));
+    words.push(asm::smc(0));
+    words.push(asm::b(0));
+
+    let at = (SECOND - KERNEL_ADDR) as usize / 4;
+    assert!(words.len() <= at, "the first half ran into the second");
+    words.resize(at, 0);
+    words.extend_from_slice(&asm::load64(11, ANSWER));
+    words.push(asm::str_base(0, 11));
+    words.extend_from_slice(&asm::load64(0, 0x8400_0002));
+    words.push(asm::smc(0));
+    words.push(asm::b(0));
+    image(&words)
+}
+
+#[test]
+fn psci_cpu_on_starts_the_second_processor_and_cpu_off_stops_it() {
+    let mut b = board(&psci_program(), &[], "16M");
+    for _ in 0..2000 {
+        if b.power.peek().is_some() {
+            break;
+        }
+        b.machine.run_quantum().expect("the machine advances");
+    }
+    assert_eq!(
+        b.power.peek(),
+        Some(Request::Poweroff),
+        "the boot processor never finished the exchange: either CPU_ON did not start the other \
+         processor at the address and with the context it named, or CPU_OFF did not stop it and \
+         AFFINITY_INFO never reported OFF"
     );
 }
 

@@ -189,8 +189,14 @@ fn board(kernel: &[u8]) -> Board {
 /// The same, for one of the board's variants: `arm64-virt-smp` is this file
 /// with a second core.
 fn board_named(name: &'static str, kernel: &[u8]) -> Board {
+    board_params(name, kernel, &[])
+}
+
+/// The same, with extra parameters — which on `arm64-virt-smp` is how the
+/// spin-table boot method is asked for, its default now being PSCI.
+fn board_params(name: &'static str, kernel: &[u8], params: &[(&str, &str)]) -> Board {
     let entry = catalog::machine(name).expect("this build ships it");
-    let options = catalog::build_options()
+    let mut options = catalog::build_options()
         .expect("the catalog agrees with itself")
         .with_media("kernel", kernel)
         .with_media("initrd", &[][..])
@@ -202,6 +208,9 @@ fn board_named(name: &'static str, kernel: &[u8]) -> Board {
         // board's default 16 MiB: nothing here reads a sector, and every one
         // of these tests would otherwise allocate and zero the whole platter.
         .with_param("storage", String::from("64K"));
+    for (name, value) in params {
+        options = options.with_param(*name, (*value).to_string());
+    }
     let registry = catalog::registry().expect("the catalog agrees with itself");
     let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
         Ok(m) => m,
@@ -328,7 +337,22 @@ fn the_trees_addresses_come_out_of_the_map_statements() {
 fn the_smp_board_describes_two_processors_and_where_the_second_one_waits() {
     // `arm64-virt-smp` is the same file with a second core, and everything a
     // guest has to be told about that core is in the generated tree.
-    let b = board_named("arm64-virt-smp", &spin());
+    // The board's own default is PSCI, and a PSCI tree says so and publishes
+    // no release address at all: a `cpu-release-addr` on an `enable-method =
+    // "psci"` node is an invitation to write into memory nothing is reading.
+    let psci = board_named("arm64-virt-smp", &spin());
+    let text = super::dt::describe(&psci.device_tree()).expect("the tree parses");
+    assert!(text.contains("cpu@0 {"), "{text}");
+    assert!(text.contains("cpu@1 {"), "{text}");
+    assert!(text.contains("enable-method"), "{text}");
+    assert!(!text.contains("cpu-release-addr"), "{text}");
+
+    // The same board asked for a spin table instead.
+    let b = board_params(
+        "arm64-virt-smp",
+        &spin(),
+        &[("secondary", "spin-table"), ("secondary-start", "true")],
+    );
     let dtb = b.device_tree();
     let text = super::dt::describe(&dtb).expect("the generator's own tree parses");
     // Two processors, named by `MPIDR_EL1` affinity 0, each with a word of the

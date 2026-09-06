@@ -53,19 +53,30 @@
 # `release-addr`, zero until something writes an address into it, at which
 # point that processor jumps there with `x0`-`x3` clear.
 #
-# `secondary = "spin-table"` is the board telling the guest that table exists
-# and where it is (`cpu-release-addr`, Devicetree Specification v0.4 §3.8.1),
-# which is the boot method that needs nothing behind an `SMC`. The alternative
-# is PSCI `CPU_ON`, and this board cannot offer it yet: servicing one means
-# reaching a *sibling* core from inside the core executing the `SMC`, and
-# `cpu.arm.a64` has no route out for it. When it grows one, the mechanism it
-# will write to is this same table and `secondary = "psci"` becomes the
-# default here — `docs/platforms/arm64-virt.md` records exactly what the core
-# needs.
+# This board's default is now **PSCI `CPU_ON`**, which is what a `virt` board
+# conventionally is: the kernel calls `SMC` with a target affinity, an entry
+# point and a context id, and `cpu.arm.a64` writes them into the target core's
+# own `Lines` for it to apply at its next instruction boundary. So `cpu1` is
+# declared `start = false` — genuinely off, executing nothing and consuming
+# its scheduler budget — rather than spinning in the ROM.
 #
-# The table sits a page above the bottom of DRAM, well below the kernel, and
-# the generated tree carries a memory reservation over that page so the
-# kernel's own allocator never hands it out.
+# The **two properties go together**, and that is why they are two params
+# rather than one: `secondary = "spin-table"` needs `secondary-start = true`,
+# because on such a board the secondary really is running, in the ROM's
+# parking loop, waiting on its word of the release table. `secondary = "psci"`
+# needs `secondary-start = false`, because a processor `AFFINITY_INFO` reports
+# as `ON` before anything started it is a processor `CPU_ON` will refuse with
+# `ALREADY_ON`. `tests/a64_smp.rs` runs the board both ways.
+#
+# The release table is generated either way — the ROM's parking loop is
+# `arm.boot`'s and costs nothing — but only a spin-table tree publishes
+# `cpu-release-addr`. It sits a page above the bottom of DRAM, well below the
+# kernel, and the generated tree carries a memory reservation over that page
+# so the kernel's own allocator never hands it out.
+#
+# What PSCI buys over the spin table is the other direction: a spin table has
+# no way to turn a processor **off**. `CPU_OFF` does, and `echo 0 >
+# /sys/devices/system/cpu/cpu1/online` is a kernel calling it.
 
 machine "arm64-virt-smp" {
   param part = "cortex-a53"
@@ -85,6 +96,11 @@ machine "arm64-virt-smp" {
   param storage = 16M
   param power = "power"
   param psci = "smc"
+
+  # How the secondary is brought up, and whether it is running before that
+  # happens. The two go together — see the note above.
+  param secondary = "psci"
+  param secondary-start = false
   param cpu-hz = 1000000000
   param cntfrq = 62500000
   param engine = "interp"
@@ -123,6 +139,7 @@ machine "arm64-virt-smp" {
     cntdiv = cpu-hz / cntfrq
     psci   = psci
     cpus   = 2
+    start  = secondary-start
   }
 
   object dram "ram" { size = ram }
@@ -164,7 +181,7 @@ machine "arm64-virt-smp" {
     cpus         = 2
     mpidr        = 0x80000000
     psci         = psci
-    secondary    = "spin-table"
+    secondary    = secondary
     release-addr = release-addr
     bootargs     = cmdline
     model        = "rsemu arm64-virt-smp"
