@@ -113,6 +113,101 @@
 //! therefore a change that needs an argument, and it would rewrite every
 //! snapshot's header bytes, hence every state hash, hence `tests/goldens/`.
 //!
+//! # The shape has no migration, and should not
+//!
+//! [`Migrations`] carries a *class* forward. Nothing carries a **shape**
+//! forward, and for a save state in the wild that is the constraint that
+//! actually binds: adding one device to a board, or moving one region, orphans
+//! every snapshot of it however complete the version table is — and boards
+//! change more often than chunk encodings do.
+//! `tests/crosshost_snapshot.rs`'s
+//! `a_board_that_gained_a_device_refuses_its_older_save_states` pins that
+//! behaviour, and the refusal names the device rather than being a bare
+//! `false`, which is the whole reason the identity is a [`ShapeDiff`].
+//!
+//! It should stay a refusal, for three reasons in increasing order of how hard
+//! they are to argue with.
+//!
+//! 1. **A class step transforms bytes that exist; a shape step would have to
+//!    invent state that never did.** A device added to a board has no chunk in
+//!    the old snapshot, so a migration could only give it its reset state — and
+//!    the guest is not reset. Its RAM comes back intact, holding drivers whose
+//!    view of the topology was enumerated from the *old* shape: PCI BARs it
+//!    assigned, MMIO it mapped, ACPI tables it parsed at boot, page tables it
+//!    built over all of it. Materialising a device underneath that is a hardware
+//!    hot-swap performed while the guest was not looking, and no framework can
+//!    repair the guest's belief about it. Refusing is the honest answer.
+//! 2. **A shape step is not keyable.** A class step is keyed by
+//!    `(class, version)`, both of which are on the wire. A shape step would be
+//!    keyed by *which board, at which revision*, and a snapshot header carries
+//!    neither — it has device paths, class names and regions, and no board name
+//!    and no board revision at all. Keyed on nothing, a step becomes a
+//!    heuristic ("if there is a `/pit` and no `/timer`, rename it"), which is
+//!    exactly the "a wrong step is worse than no step" that
+//!    `crate::machine::migrate` refuses for class versions.
+//!    The prerequisite for any shape migration is therefore a board identity
+//!    and a board revision in the header — which rewrites every snapshot's
+//!    header bytes, hence every state hash, hence `tests/goldens/`.
+//! 3. **The thing that does work costs no mechanism at all.** A board that
+//!    changes shape *is* a different machine type. Keeping the old description
+//!    under its own name in `machines/` keeps its save states loading, in a
+//!    build that ships both — which is how machine types have always worked,
+//!    and it says what happened instead of pretending two boards are one.
+//!
+//! The single shape change that could be migrated soundly is a pure **rename**:
+//! the same devices in the same layout under different instance paths, which is
+//! the change this tree makes most often and the one case where nothing is
+//! invented. Even that needs the key from (2) before it can be more than a
+//! guess, so it waits on the same prerequisite.
+//!
+//! # What crosses a host boundary, and what does not
+//!
+//! Everything here is little-endian and fixed-width *by decision*, and
+//! `scripts/check.sh crosshost` is where that decision is checked rather than
+//! asserted. It writes a save state under `i686-unknown-linux-gnu` and under
+//! `wasm32-wasip1`, loads each on the native host, and runs both machines on:
+//! eleven boards and eight guest architectures produce byte-identical snapshots
+//! on all three, and a restored machine reaches the foreign machine's own bytes
+//! twenty milliseconds later. A 32-bit `usize`, a 32-bit address space and a
+//! different code generator change nothing in the file.
+//!
+//! Three things do not cross, and they are three different kinds of thing:
+//! one is fixable, one is untested, one is deliberate.
+//!
+//! - **A referenced medium.** A drive whose medium snapshots by
+//!   `dev::medium::Snapshot::Reference` — the default for any file-backed image
+//!   — writes `format <canonical host path> <capacity>` into its chunk and
+//!   compares it byte for byte on load. A path is not a property of the guest,
+//!   so such a snapshot is bound to the host that took it, and to that host's
+//!   filesystem layout. It is *not* a board property: the same board captures
+//!   or references depending on whether its slot was filled from the media
+//!   table or with `--drive`, so "which machines migrate" is a question about a
+//!   run rather than about a `.machine` file.
+//!   What would authenticate a moved image is worth writing down, because a
+//!   path cannot. A path says *where* bytes were, not *which* bytes, so it
+//!   fails in both directions at once: it refuses the same image under a new
+//!   name, and it accepts a different image of the same size at the old name —
+//!   silently, which is the dangerous half. Content is what authenticates
+//!   content, but a digest cannot be it either, because a reference snapshot's
+//!   whole premise is that the bytes stay outside the file and keep changing:
+//!   the guest writes to the image after the snapshot is taken, so a digest is
+//!   stale by the next sector. The object worth authenticating is therefore not
+//!   the image but an immutable one — `ROADMAP.md` §7.1's copy-on-write
+//!   overlay, created and owned by the emulator, carrying an identity generated
+//!   into its own header. Reference *that*: the identity travels inside the
+//!   file, so a move changes nothing and the path drops to being a hint used
+//!   for the message and for finding the file. Short of an overlay, the cheap
+//!   version of the same idea is to split today's string into an authenticator
+//!   (`format`, capacity, and a digest over a fixed cheap sample) and a hint
+//!   (the path, reported and not compared), which makes a moved image load and
+//!   a substituted one refuse — strictly better in both directions for the cost
+//!   of a few reads, and still not proof, which it should say.
+//! - **A big-endian host.** None is buildable-and-runnable here, so the claim
+//!   rests on the encoding rather than on a test. Big-endian *guests* (`m68k`,
+//!   `mips`) do cross, which exercises [`crate::core::value::Endian`] and says
+//!   nothing about the host side.
+//! - **A shape change**, which is the section above and is deliberate.
+//!
 //! # Seams left open on purpose
 //!
 //! - **Compression** (`compcol`, zstd) and **integrity/encryption**

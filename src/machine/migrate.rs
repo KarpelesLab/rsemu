@@ -66,6 +66,16 @@
 //! orphans every old save state of it however complete the version table is.
 //! Boards change more often than chunk encodings do.
 //!
+//! That is deliberate rather than a second gap to fill, and it should not be
+//! filled: [`core::state`](crate::core::state)'s "The shape has no migration,
+//! and should not" makes the argument — a shape step would have to invent the
+//! state of a device the guest's own drivers were never told about, and it is
+//! not keyable anyway, since a snapshot header carries no board name and no
+//! board revision to key it on.
+//! `tests/crosshost_snapshot.rs`'s
+//! `a_board_that_gained_a_device_refuses_its_older_save_states` pins the
+//! refusal, and pins that it names the device.
+//!
 //! [`DeviceClass`]: crate::core::device::DeviceClass
 
 use crate::core::error::Result;
