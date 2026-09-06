@@ -122,7 +122,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::core::clock::GlobalTime;
-use crate::core::exec::{ExitReason, ExitingCore};
+use crate::core::exec::{Access, ExitReason, ExitingCore};
 
 use super::{
     Answer, GuestClock, Journal, JournalMode, PAGE_SIZE, Prot, Tag, ThreadId, ThreadSet,
@@ -648,6 +648,7 @@ fn build_stack(
 
 /// `include/uapi/asm-generic/unistd.h`.
 mod nr {
+    pub(super) const FCNTL: u64 = 25;
     pub(super) const IOCTL: u64 = 29;
     pub(super) const FACCESSAT: u64 = 48;
     pub(super) const OPENAT: u64 = 56;
@@ -655,7 +656,9 @@ mod nr {
     pub(super) const LSEEK: u64 = 62;
     pub(super) const READ: u64 = 63;
     pub(super) const WRITE: u64 = 64;
+    pub(super) const READV: u64 = 65;
     pub(super) const WRITEV: u64 = 66;
+    pub(super) const PREAD64: u64 = 67;
     pub(super) const PPOLL: u64 = 73;
     pub(super) const READLINKAT: u64 = 78;
     pub(super) const NEWFSTATAT: u64 = 79;
@@ -755,10 +758,55 @@ mod errno {
     pub(super) const INVAL: i64 = 22;
     /// Not a typewriter.
     pub(super) const NOTTY: i64 = 25;
+    /// Read-only file system — what the [`Stage`] is, said at `openat` rather
+    /// than at the first `write`.
+    pub(super) const ROFS: i64 = 30;
     /// Function not implemented.
     pub(super) const NOSYS: i64 = 38;
     /// A timed wait reached its deadline.
     pub(super) const TIMEDOUT: i64 = 110;
+}
+
+/// `O_*`, the bits `openat` actually has to look at.
+///
+/// `asm-generic/fcntl.h`. The access mode is the low two bits and everything
+/// else is a flag, which is why the mask is `3` rather than a bit test.
+mod o {
+    /// The access-mode field: `O_RDONLY`, `O_WRONLY`, `O_RDWR`.
+    pub(super) const ACCMODE: u64 = 3;
+    /// Create the file if it is not there.
+    pub(super) const CREAT: u64 = 0o100;
+    /// Truncate it if it is.
+    pub(super) const TRUNC: u64 = 0o1000;
+    /// Close the descriptor across an `execve`.
+    pub(super) const CLOEXEC: u64 = 0o2_000_000;
+}
+
+/// `F_*`, the `fcntl(2)` commands a program that opens a file actually issues.
+///
+/// `asm-generic/fcntl.h`. The lock commands are here because a **real**
+/// program reached for them: SQLite's unix VFS takes a shared lock on a
+/// database it is about to read, and a `fcntl` that answers `-ENOSYS` makes it
+/// report "disk I/O error" rather than anything about locking.
+mod fc {
+    /// Read the close-on-exec flag.
+    pub(super) const GETFD: u64 = 1;
+    /// Set it.
+    pub(super) const SETFD: u64 = 2;
+    /// Read the access mode and the status flags.
+    pub(super) const GETFL: u64 = 3;
+    /// Set the status flags. Nothing here has one that does anything.
+    pub(super) const SETFL: u64 = 4;
+    /// Ask who holds a conflicting lock.
+    pub(super) const GETLK: u64 = 5;
+    /// Take or release a lock, failing rather than waiting.
+    pub(super) const SETLK: u64 = 6;
+    /// Take or release a lock, waiting for it.
+    pub(super) const SETLKW: u64 = 7;
+    /// `FD_CLOEXEC`, the only bit `F_GETFD` reports.
+    pub(super) const CLOEXEC: u64 = 1;
+    /// `F_UNLCK`, in a `struct flock`'s `l_type`: nobody holds this range.
+    pub(super) const UNLCK: u16 = 2;
 }
 
 /// `MAP_*` and `PROT_*`, `asm-generic` values.
@@ -869,6 +917,17 @@ struct Asm {
     sc: fn(status: u32, src: u32, base: u32) -> u32,
     /// Do nothing. What a program that needs to take up time is made of.
     nop: u32,
+    /// Send role register `r` out to the floating-point unit and back, leaving
+    /// the same integer in it.
+    ///
+    /// Two instructions that are arithmetically a no-op and architecturally
+    /// the whole question: **is the floating-point unit on?** Both
+    /// architectures reset it to trap and both leave turning it on to the
+    /// kernel, so a level-3 consumer that forgets takes an illegal instruction
+    /// the first time a guest saves a callee-saved FP register — which is what
+    /// a third-party C program does about six syscalls in, and none of the
+    /// guests in this repository ever did.
+    fpu: fn(r: u32) -> Vec<u32>,
     /// Jump to the address in role register `to`, and do not come back.
     ///
     /// One instruction, and it is here because a program interpreter is the
@@ -938,7 +997,7 @@ mod riscv {
 
     use crate::core::exec::{ExitMask, ExitingCore};
     use crate::core::space::AddressSpace;
-    use crate::cpu::riscv::csr::Priv;
+    use crate::cpu::riscv::csr::{Priv, status};
     use crate::cpu::riscv::{Config, Hart};
 
     use super::{Arch, Asm, Thread, UserMemory};
@@ -1026,6 +1085,21 @@ mod riscv {
     /// `nop`, which is `addi x0, x0, 0`.
     const NOP: u32 = 0x0000_0013;
 
+    /// `fcvt.d.l f0, rs1` then `fcvt.l.d rd, f0`, both rounding to zero — an
+    /// integer out through the D extension and back unchanged.
+    ///
+    /// Volume I, "Single-Precision Floating-Point Conversion and Move
+    /// Instructions" and its double-precision counterpart: funct7 `1101001`
+    /// is `FCVT.D.*` and `1100001` is `FCVT.*.D`, with `rs2 = 00010`
+    /// selecting the signed 64-bit integer form.
+    fn fpu(role: u32) -> Vec<u32> {
+        let r = reg(role);
+        vec![
+            (0b110_1001 << 25) | (0b00010 << 20) | (r << 15) | 0b101_0011,
+            (0b110_0001 << 25) | (0b00010 << 20) | (0b001 << 12) | (r << 7) | 0b101_0011,
+        ]
+    }
+
     /// One RISC-V guest thread: a hart, and the map it shares with its
     /// siblings.
     #[derive(Debug)]
@@ -1034,9 +1108,27 @@ mod riscv {
         space: Arc<AddressSpace>,
     }
 
+    /// The `mstatus.FS` value meaning *"the unit is on and its registers are
+    /// in their initial state"*.
+    ///
+    /// `csr::status` names `FS_OFF` and `FS_DIRTY` because those are the two a
+    /// core's own logic needs; Initial is the one a *kernel* writes, and it is
+    /// spelled here because writing it is this consumer's job.
+    const FS_INITIAL: u64 = 1;
+
     /// A hart in the state a level-3 guest runs in: unprivileged, over
     /// `space`, with `ecall` and a fault leaving the core instead of
-    /// vectoring.
+    /// vectoring, and with the floating-point unit **on**.
+    ///
+    /// That last one is the exact counterpart of AArch64's
+    /// `CPACR_EL1.FPEN = 0b11` below, and it is here for the same reason: the
+    /// architecture resets `mstatus.FS` to Off, Volume II makes *every* FP
+    /// instruction — including `fsd`, which touches no arithmetic — illegal
+    /// while it is, and level 3 has no guest kernel to take that trap and turn
+    /// it on lazily the way Linux does. A real program found it: `musl`'s
+    /// `hello` and `threads` never execute an FP instruction, and the first
+    /// third-party guest that saved `fs0` across a call took an illegal
+    /// instruction six syscalls in.
     fn hart(space: &Arc<AddressSpace>) -> Arc<Hart> {
         let hart = Arc::new(Hart::new(Config {
             pmp_count: 0,
@@ -1045,6 +1137,7 @@ mod riscv {
         hart.attach_space(Arc::clone(space));
         let mut csrs = hart.csrs();
         csrs.priv_mode = Priv::User;
+        csrs.mstatus = (csrs.mstatus & !status::FS) | (FS_INITIAL << status::FS_SHIFT);
         hart.set_csrs(csrs);
         hart.set_exit_mask(ExitMask::USER);
         hart
@@ -1130,6 +1223,7 @@ mod riscv {
             lr,
             sc,
             nop: NOP,
+            fpu,
             jr,
             syscall: ECALL,
         },
@@ -1143,6 +1237,7 @@ mod riscv {
 #[cfg(feature = "cpu-arm-a64")]
 mod a64 {
     use alloc::sync::Arc;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     use crate::core::exec::{ExitMask, ExitingCore};
@@ -1220,6 +1315,18 @@ mod a64 {
 
     /// `nop`.
     const NOP: u32 = 0xd503_201f;
+
+    /// `scvtf d0, xn` then `fcvtzs xn, d0` — DDI 0487's "Conversion between
+    /// floating-point and integer" scalar forms, `type = 01` (double) with
+    /// `rmode`/`opcode` `00`/`010` and `11`/`000`.
+    ///
+    /// The *scalar* encodings, deliberately: the Advanced SIMD ones that do
+    /// the same arithmetic are a different group and one of them is what a
+    /// real Lua stopped on.
+    fn fpu(role: u32) -> Vec<u32> {
+        let r = reg(role);
+        vec![0x9e62_0000 | (r << 5), 0x9e78_0000 | r]
+    }
 
     /// One AArch64 guest thread.
     #[derive(Debug)]
@@ -1340,6 +1447,7 @@ mod a64 {
             lr,
             sc,
             nop: NOP,
+            fpu,
             jr,
             syscall: SVC,
         },
@@ -1398,6 +1506,15 @@ struct Vfile {
     /// information that says nothing about the cause. A stat field nobody
     /// reads is a stat field until somebody does.
     ino: u64,
+    /// `FD_CLOEXEC`, as the guest last set it.
+    ///
+    /// Level 3 has no `execve`, so nothing here can ever act on it — which is
+    /// exactly the argument for *storing* it rather than returning zero from
+    /// `F_GETFD`. `sigaltstack`, `rt_sigaction`, `rt_sigprocmask` and `st_ino`
+    /// were each a field that "nothing reads" until a program read one back
+    /// and believed the answer; this is the fifth, and `openat`'s flags are
+    /// the sixth.
+    cloexec: bool,
 }
 
 /// The files a level-3 process may open, and the whole of them.
@@ -1756,10 +1873,13 @@ impl Kernel {
             // fd 0 is at end of file, always: there is no host to read from.
             nr::READ if a(0) == 0 => 0,
             nr::READ => self.read(a(0), a(1), a(2)),
+            nr::READV => self.readv(a(0), a(1), a(2)),
+            nr::PREAD64 => self.pread(a(0), a(1), a(2), a(3)),
+            nr::FCNTL => self.fcntl(a(0), a(1), a(2)),
             nr::CLOSE if a(0) <= 2 => 0,
             nr::CLOSE => self.close(a(0)),
             nr::LSEEK => self.lseek(a(0), a(1) as i64, a(2)),
-            nr::OPENAT => self.openat(a(1)),
+            nr::OPENAT => self.openat(a(1), a(2)),
             nr::BRK => self.set_brk(a(0)),
             nr::MMAP => self.mmap(a(0), a(1), a(2), a(3), a(4) as i64, a(5)),
             nr::MUNMAP => match self.mem.unmap(page_down(a(0)), page_up(a(1))) {
@@ -1862,6 +1982,25 @@ impl Kernel {
                 .next()
                 .expect("a process has a thread")
                 .thread,
+        )
+    }
+
+    /// The instruction word at `pc`, and where in the image it is.
+    ///
+    /// Both halves are needed and neither is enough: the encoding is what a
+    /// CPU core's maintainer decodes, and the object plus offset is what a
+    /// `objdump` of the guest is indexed by. RISC-V's compressed encodings are
+    /// sixteen bits, so the halfword is reported too rather than leaving the
+    /// reader to work out which half of the word to look at.
+    fn encoding_at(&self, pc: u64) -> String {
+        let mut word = [0u8; 4];
+        if self.mem.read_bytes(pc, &mut word).is_err() {
+            return "and nothing is mapped there".to_string();
+        }
+        let w = u32::from_le_bytes(word);
+        format!(
+            "encoded {w:#010x} (or {:#06x} compressed)",
+            (w & 0xffff) as u16
         )
     }
 
@@ -2193,19 +2332,34 @@ impl Kernel {
             .map(|(b, ino)| (Arc::clone(b), true, ino))
     }
 
-    fn openat(&mut self, path: u64) -> i64 {
+    /// `openat(dirfd, path, flags, mode)`.
+    ///
+    /// **The flags are read**, and that is the defect shape this module keeps
+    /// finding, one call along. They used to be ignored, so a guest that asked
+    /// for `O_RDWR | O_CREAT` on a staged file was handed a read-only
+    /// descriptor and told nothing — and would find out at its first `write`,
+    /// with an `-EBADF` that says the descriptor is invalid rather than that
+    /// the file cannot be written. SQLite opens a database read-write, falls
+    /// back to read-only when that is refused, and its whole read-only mode
+    /// hangs off which of the two answers it got. A `-EROFS` here is the
+    /// namespace describing itself; a lie followed by `-EBADF` is not.
+    fn openat(&mut self, path: u64, flags: u64) -> i64 {
         let Some(path) = self.path_at(path) else {
             return -errno::NOENT;
         };
         let Some((bytes, sized, ino)) = self.resolve(&path) else {
             return -errno::NOENT;
         };
+        if flags & o::ACCMODE != 0 || flags & (o::CREAT | o::TRUNC) != 0 {
+            return -errno::ROFS;
+        }
         let file = Vfile {
             bytes,
             pos: 0,
             path,
             sized,
             ino,
+            cloexec: flags & o::CLOEXEC != 0,
         };
         let slot = match self.files.iter().position(Option::is_none) {
             Some(i) => i,
@@ -2266,6 +2420,147 @@ impl Kernel {
                 n as i64
             }
             Err(_) => -errno::INVAL,
+        }
+    }
+
+    /// `pread64(fd, buf, len, offset)`: read at an absolute offset and **do
+    /// not move the position**.
+    ///
+    /// That second half is the whole of why it is a separate call, and the
+    /// whole of why implementing it as `lseek`-then-`read` would be wrong:
+    /// SQLite issues a `pread` for a page while a `read`-based cursor is
+    /// elsewhere in the same descriptor, and a `pread` that moved the position
+    /// would corrupt the other one silently.
+    fn pread(&mut self, fd: u64, buf: u64, len: u64, offset: u64) -> i64 {
+        let Some(file) = self.file(fd) else {
+            return -errno::BADF;
+        };
+        let start = offset.min(file.bytes.len() as u64);
+        let n = len.min(file.bytes.len() as u64 - start);
+        let bytes = file.bytes[start as usize..(start + n) as usize].to_vec();
+        match self.mem.write_bytes(buf, &bytes) {
+            Ok(()) => n as i64,
+            Err(_) => -errno::INVAL,
+        }
+    }
+
+    /// `readv(fd, iov, count)`, the mirror of [`writev`](Kernel::writev).
+    ///
+    /// **Every C program that reads a file through stdio needs this**, and no
+    /// Rust guest did — `std::fs::File::read` is a plain `read`, while musl's
+    /// `__stdio_read` fills the `FILE`'s own buffer and the caller's in one
+    /// `readv`. That is why the first third-party C program to open a file
+    /// found it and three Rust ones had not: the gap was in the half of the
+    /// ABI our own guests happened not to use.
+    ///
+    /// A short read ends the scatter rather than continuing into the next
+    /// buffer, because that is what the kernel does and what a caller that
+    /// compares the total against the last `iov_len` is relying on.
+    fn readv(&mut self, fd: u64, iov: u64, count: u64) -> i64 {
+        let mut total = 0i64;
+        for i in 0..count {
+            let base = iov + i * 16;
+            let (Ok(ptr), Ok(len)) = (self.mem.read_u64(base), self.mem.read_u64(base + 8)) else {
+                return -errno::INVAL;
+            };
+            if len == 0 {
+                continue;
+            }
+            // fd 0 is at end of file, always, exactly as `read` of it is.
+            let n = if fd == 0 { 0 } else { self.read(fd, ptr, len) };
+            if n < 0 {
+                return if total > 0 { total } else { n };
+            }
+            total += n;
+            if (n as u64) < len {
+                break;
+            }
+        }
+        total
+    }
+
+    /// `fcntl(fd, cmd, arg)`.
+    ///
+    /// Two groups, and they are here for different reasons.
+    ///
+    /// The **descriptor flags** are the `sigaltstack` lesson again: `F_SETFD`
+    /// of `FD_CLOEXEC` is what every careful `open` does immediately
+    /// afterwards, and a `F_GETFD` that answered zero would tell a caller its
+    /// own `F_SETFD` had not taken. Level 3 has no `execve` for the flag to
+    /// mean anything to, which is the argument for storing it rather than
+    /// against.
+    ///
+    /// The **locks** are granted, and that is honest rather than lax: a
+    /// level-3 process is alone — there is no second opener of a staged file
+    /// and no host file underneath one — so no lock can conflict and
+    /// `F_GETLK` genuinely has `F_UNLCK` to report. Refusing them instead cost
+    /// a real program its whole run: SQLite takes a shared lock on a database
+    /// before reading it and turns an `-ENOSYS` there into "disk I/O error".
+    fn fcntl(&mut self, fd: u64, cmd: u64, arg: u64) -> i64 {
+        /// `struct flock` on every 64-bit `asm-generic` architecture:
+        /// `l_type`, `l_whence`, padding, `l_start`, `l_len`, `l_pid`.
+        const FLOCK: usize = 32;
+        match cmd {
+            fc::GETFD => match fd {
+                0..=2 => 0,
+                _ => match self.file(fd) {
+                    Some(f) => i64::from(f.cloexec) * fc::CLOEXEC as i64,
+                    None => -errno::BADF,
+                },
+            },
+            fc::SETFD => match fd {
+                0..=2 => 0,
+                _ => match self.file(fd) {
+                    Some(f) => {
+                        f.cloexec = arg & fc::CLOEXEC != 0;
+                        0
+                    }
+                    None => -errno::BADF,
+                },
+            },
+            // Everything openable here is read-only, so the access mode is the
+            // one thing this can honestly report.
+            fc::GETFL => match fd {
+                0..=2 => 0,
+                _ if self.file(fd).is_some() => 0,
+                _ => -errno::BADF,
+            },
+            fc::SETFL => match fd {
+                0..=2 => 0,
+                _ if self.file(fd).is_some() => 0,
+                _ => -errno::BADF,
+            },
+            fc::SETLK | fc::SETLKW => match fd {
+                0..=2 => 0,
+                _ if self.file(fd).is_some() => 0,
+                _ => -errno::BADF,
+            },
+            fc::GETLK => {
+                if fd > 2 && self.file(fd).is_none() {
+                    return -errno::BADF;
+                }
+                let mut buf = [0u8; FLOCK];
+                if self.mem.read_bytes(arg, &mut buf).is_err() {
+                    return -errno::INVAL;
+                }
+                buf[..2].copy_from_slice(&fc::UNLCK.to_le_bytes());
+                match self.mem.write_bytes(arg, &buf) {
+                    Ok(()) => 0,
+                    Err(_) => -errno::INVAL,
+                }
+            }
+            // A command this stand-in does not know is *refused*, and it says
+            // which one — the same shape `futex` uses for an operation it does
+            // not have. A multiplexer that answered `-EINVAL` for everything
+            // it had not implemented would hide the next gap behind a number
+            // that is already in the table.
+            other => {
+                let refused = 0x2_0000 | other;
+                if !self.refused.contains(&refused) {
+                    self.refused.push(refused);
+                }
+                -errno::INVAL
+            }
         }
     }
 
@@ -2847,9 +3142,26 @@ fn run(
                 }
             }
             ExitReason::FAULT => {
+                // A fault with no *access* is not a memory fault: the core
+                // reached an instruction and refused it. Saying so, and
+                // printing the encoding, is the difference between a report a
+                // CPU maintainer can act on and a bare address three of us
+                // then disassemble by hand — which is exactly what running
+                // third-party programs turned into until this line existed.
+                let what = if exit.access == Access::None {
+                    format!(
+                        "executed an instruction this core does not implement, {}",
+                        kernel.encoding_at(exit.pc)
+                    )
+                } else {
+                    format!(
+                        "faulted: {:?} of {:#x} (cause {})",
+                        exit.access, exit.address, exit.detail
+                    )
+                };
                 return Err(kernel.diagnose(&format!(
-                    "thread {} faulted at pc {:#x}: {:?} of {:#x} (cause {})",
-                    stop.thread.0, exit.pc, exit.access, exit.address, exit.detail,
+                    "thread {} at pc {:#x} {what}",
+                    stop.thread.0, exit.pc
                 )));
             }
             other => return Err(format!("the guest exited for {other}")),
@@ -3112,6 +3424,45 @@ fn a_real_elf_file_loads_and_runs_with_no_toolchain() {
         assert_eq!(out.status, 0);
         assert!(out.refused.is_empty(), "refused {:?}", out.refused);
         assert_eq!(out.threads, 1, "one program, one thread");
+    }
+}
+
+#[test]
+fn a_guest_may_use_the_floating_point_unit_from_its_first_instruction() {
+    // **The unit is off at reset on both architectures**, and turning it on is
+    // a decision a Linux kernel makes for a process it is about to enter —
+    // `CPACR_EL1.FPEN` on AArch64, `mstatus.FS` on RISC-V. Level 3 has no
+    // guest kernel to take the trap and enable it lazily, so this consumer
+    // establishes it up front, and this is the test that says so.
+    //
+    // It is here because a real program found the RISC-V half missing: the
+    // AArch64 one had been written when that core landed, `hello` and
+    // `threads` never execute a floating-point instruction, and the first
+    // third-party C guest took an illegal instruction on a `fsd` saving a
+    // callee-saved register six syscalls into its startup. A hole that only
+    // opens for software nobody here wrote is exactly the hole this section
+    // of the module exists to find.
+    for arch in ARCHES {
+        let asm = arch.asm;
+        let file = assemble(
+            arch,
+            Link::EXEC,
+            None,
+            move |_| {
+                let mut c = (asm.li)(0, 42);
+                c.extend((asm.fpu)(0));
+                c.extend((asm.li)(Asm::NR, nr::EXIT_GROUP));
+                c.push(asm.syscall);
+                c
+            },
+            b"",
+        );
+        let out = run_synthetic(arch, &file).unwrap_or_else(|e| panic!("{}: {e}", arch.name));
+        assert_eq!(
+            out.status, 42,
+            "{}: the value did not survive a round trip through the FPU",
+            arch.name
+        );
     }
 }
 
@@ -3919,14 +4270,106 @@ fn a_guest_can_open_exactly_what_was_staged_and_nothing_beside_it() {
         );
     }
 
-    // And the stage is read-only from inside: a descriptor over a staged file
-    // reads, and every write is `-EBADF`, so a guest cannot change what the
-    // next thing to open it will see.
+    // And the stage is read-only from inside, said **at the open**: a guest
+    // that asks for write access, or to create or truncate, is told the
+    // namespace is read-only rather than handed a descriptor that will refuse
+    // its first `write`. A real program branches on which of the two it got —
+    // SQLite opens a database read-write and falls back to read-only on
+    // exactly this errno — so the lie is not harmless even though nothing can
+    // be written either way.
+    const EROFS: i64 = -30;
+    assert_eq!(
+        ask(&mut kernel, nr::OPENAT, STAGED, &[2, 0]),
+        EROFS,
+        "O_RDWR"
+    );
+    assert_eq!(
+        ask(&mut kernel, nr::OPENAT, STAGED, &[0o101, 0]),
+        EROFS,
+        "O_WRONLY|O_CREAT"
+    );
+    // The read-only descriptor from the top of the test is still the only one.
     let mut buf = [0u8; 13];
     assert_eq!(kernel.ask(nr::READ, &[3, 0x1000, 13]), 13);
     mem.read_bytes(0x1000, &mut buf).unwrap();
     assert_eq!(&buf[..], b"ELF-ish bytes");
     assert_eq!(kernel.ask(nr::WRITE, &[3, 0x1000, 4]), EBADF);
+}
+
+#[test]
+fn a_descriptor_reads_scattered_at_a_position_and_at_an_offset() {
+    // The three calls a real C program that opens a file needs and three Rust
+    // ones did not: **`readv`**, because musl's `__stdio_read` fills the
+    // `FILE`'s buffer and the caller's in one call; **`pread64`**, because
+    // SQLite reads a page at an absolute offset; and **`fcntl`**, because it
+    // locks the file first and reads `-ENOSYS` as a disk error.
+    const STAGED: &str = "/work/data";
+    let arch = any_arch();
+    let (mem, mut kernel) = scratch_kernel_staged(
+        arch,
+        Stage::empty().with(STAGED, (0..=255u8).collect::<Vec<u8>>()),
+    );
+    mem.write_bytes(0x1000, b"/work/data\0").unwrap();
+    let fd = kernel.ask(nr::OPENAT, &[0, 0x1000, 0, 0]) as u64;
+    assert_eq!(fd, 3);
+
+    // A scatter read into two buffers, and the position moved by the total.
+    let iov = 0x1100u64;
+    mem.write_bytes(iov, &0x1200u64.to_le_bytes()).unwrap();
+    mem.write_bytes(iov + 8, &4u64.to_le_bytes()).unwrap();
+    mem.write_bytes(iov + 16, &0x1300u64.to_le_bytes()).unwrap();
+    mem.write_bytes(iov + 24, &6u64.to_le_bytes()).unwrap();
+    assert_eq!(kernel.ask(nr::READV, &[fd, iov, 2]), 10);
+    let mut first = [0u8; 4];
+    let mut second = [0u8; 6];
+    mem.read_bytes(0x1200, &mut first).unwrap();
+    mem.read_bytes(0x1300, &mut second).unwrap();
+    assert_eq!(first, [0, 1, 2, 3], "the first iovec");
+    assert_eq!(second, [4, 5, 6, 7, 8, 9], "and the second continues it");
+    assert_eq!(kernel.ask(nr::LSEEK, &[fd, 0, 1]), 10, "the position moved");
+
+    // `pread` reads where it was told and **leaves the position alone**. That
+    // second half is the whole reason the call exists, and a `pread` written
+    // as a seek and a read would pass every other assertion here.
+    assert_eq!(kernel.ask(nr::PREAD64, &[fd, 0x1200, 4, 200]), 4);
+    mem.read_bytes(0x1200, &mut first).unwrap();
+    assert_eq!(first, [200, 201, 202, 203]);
+    assert_eq!(
+        kernel.ask(nr::LSEEK, &[fd, 0, 1]),
+        10,
+        "and did not move it"
+    );
+    // Past the end is a short read, not an error.
+    assert_eq!(kernel.ask(nr::PREAD64, &[fd, 0x1200, 16, 250]), 6);
+    assert_eq!(kernel.ask(nr::PREAD64, &[fd, 0x1200, 16, 4096]), 0);
+
+    // `F_SETFD` is remembered, because `F_GETFD` is a query and a query that
+    // answers zero tells a caller its own set did not take.
+    assert_eq!(kernel.ask(nr::FCNTL, &[fd, fc::GETFD, 0]), 0);
+    assert_eq!(kernel.ask(nr::FCNTL, &[fd, fc::SETFD, fc::CLOEXEC]), 0);
+    assert_eq!(kernel.ask(nr::FCNTL, &[fd, fc::GETFD, 0]), 1);
+
+    // A lock is granted — one process, no host file, nothing to conflict —
+    // and `F_GETLK` says so in the guest's own `struct flock`.
+    mem.write_bytes(0x1400, &[0xff; 32]).unwrap();
+    assert_eq!(kernel.ask(nr::FCNTL, &[fd, fc::SETLK, 0x1400]), 0);
+    assert_eq!(kernel.ask(nr::FCNTL, &[fd, fc::GETLK, 0x1400]), 0);
+    let mut flock = [0u8; 2];
+    mem.read_bytes(0x1400, &mut flock).unwrap();
+    assert_eq!(u16::from_le_bytes(flock), fc::UNLCK, "F_UNLCK");
+
+    // A descriptor that is not open is `-EBADF` through all three, and a
+    // command this stand-in does not know is *refused* rather than answered.
+    for nr in [nr::READV, nr::PREAD64] {
+        assert_eq!(kernel.ask(nr, &[9, iov, 1, 0]), EBADF, "{nr}");
+    }
+    assert_eq!(kernel.ask(nr::FCNTL, &[9, fc::GETFD, 0]), EBADF);
+    assert_eq!(kernel.ask(nr::FCNTL, &[fd, 0xbeef, 0]), -22);
+    assert_eq!(
+        kernel.refused,
+        alloc::vec![0x2_0000 | 0xbeef],
+        "an unknown fcntl command is named, not hidden behind -EINVAL"
+    );
 }
 
 #[test]
@@ -4674,6 +5117,248 @@ fn a_whole_glibc_links_and_relocates_and_then_meets_a_missing_instruction() {
                 std::eprintln!("usermode/glibc on {}: ledgered — {why}", arch.name);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Third-party software: programs whose authors never heard of this emulator
+// ---------------------------------------------------------------------------
+//
+// `tests/usermode/*.rs` are ours, and a guest written in the same repository as
+// the harness that runs it is a weak witness however carefully it was written:
+// it can only ask for what somebody here thought to implement. §2.1 says the
+// point of this exercise is to *"find every place that surface is not actually
+// usable"*, and the only reliable way to do that is to run software that was
+// never aimed at it.
+//
+// Three programs, chosen for what they ask of the ABI rather than for fame:
+// **sqlite** opens files, seeks in them, reads pages at absolute offsets and
+// locks them; **lua** is a runtime with floating point, a garbage collector and
+// string pattern matching; **sbase** is coreutils, so the answers can be
+// compared against the host's own `sha256sum` and `wc` byte for byte.
+//
+// What they found, in the order they found it, is the value of this section:
+//
+// | | |
+// | --- | --- |
+// | `mstatus.FS` was Off on RISC-V | a hart entered a level-3 process with the FP unit *disabled*, because `hello` and `threads` never execute an FP instruction and AArch64's counterpart (`CPACR_EL1.FPEN`) had been written years before there was anything to notice with |
+// | no `readv` | musl's `__stdio_read` fills the `FILE` buffer and the caller's in one call, so **every** C program that reads a file through stdio needs it, and no Rust guest did |
+// | no `pread64` | SQLite reads a database page at an absolute offset while a `read` cursor is elsewhere in the same descriptor |
+// | no `fcntl` | SQLite takes a shared lock before reading, and turns `-ENOSYS` there into "disk I/O error" |
+//
+// Each is a hole in *this* module, which is the consumer's half — none needed
+// anything from rsemu and none needed the sandbox widened.
+
+/// The namespace the third-party guests run in: the fixture database, the
+/// script that queries it, a Lua program and a text file.
+#[cfg(feature = "std")]
+fn third_party_stage(arch: &'static Arch) -> Stage {
+    guest_root(&std::format!("thirdparty-{}.root", arch.suffix))
+}
+
+/// Run a third-party guest on every architecture the corpus has one for.
+///
+/// Like [`run_built_guest_staged`] with one difference, and it is a ledger
+/// rather than a loosening: a run that stops because **the core does not
+/// implement an instruction** is reported and skipped rather than failed.
+/// Every other failure — a refused syscall, a memory fault, a deadlock, a
+/// budget overrun — is this module's and fails the test.
+///
+/// That distinction is the reason the fault message says which of the two it
+/// was, and prints the encoding: an instruction gap belongs to `src/cpu/`,
+/// and a report that names the word is a report somebody there can act on.
+#[cfg(feature = "std")]
+fn run_third_party(
+    name: &str,
+    argv: &[&str],
+    envp: &[&str],
+    check: impl Fn(&'static Arch, &Outcome),
+) {
+    /// Generous: `lua` runs a sieve to a hundred thousand, which is eighty
+    /// million ticks, and the point of a budget is to catch a guest that has
+    /// stopped making progress rather than to time one.
+    const BUDGET: u64 = 40_000_000_000;
+
+    let mut ran = 0;
+    for arch in ARCHES {
+        let Some(bytes) = guest_binary(&std::format!("{name}-{}", arch.suffix)) else {
+            continue;
+        };
+        let stage = third_party_stage(arch);
+        let journal = Arc::new(Journal::with_mode(JournalMode::Record));
+        let mut world = World::new(Arc::clone(&journal), counting_entropy());
+        world.stage = stage.clone();
+        let out = match run(arch, &bytes, argv, envp, world, BUDGET) {
+            Ok(out) => out,
+            Err(why) if why.contains("does not implement") => {
+                std::eprintln!("usermode/{name} on {}: ledgered — {why}", arch.name);
+                continue;
+            }
+            Err(why) => panic!("{}: {why}", arch.name),
+        };
+        std::eprintln!(
+            "usermode/{name} {argv:?} on {}: {} syscall(s), {} tick(s); refused {:?}",
+            arch.name,
+            out.trace.len(),
+            out.ticks,
+            out.refused
+        );
+        std::eprintln!(
+            "usermode/{name} on {}: stdout {:?}",
+            arch.name,
+            String::from_utf8_lossy(&out.stdout)
+        );
+        if std::env::var("RSEMU_USERMODE_TRACE").is_ok() {
+            std::eprintln!("usermode/{name} on {}: TRACE {:?}", arch.name, out.trace);
+        }
+        assert!(out.refused.is_empty(), "refused {:?}", out.refused);
+        check(arch, &out);
+
+        // And it replays with the host unplugged, exactly as our own guests
+        // do. A third-party program is where a hidden non-determinism would
+        // actually show up — it is the first thing here that opens files it
+        // was not told about by name, orders them itself, and reads a clock.
+        journal.set_mode(JournalMode::Replay);
+        let mut world = World::new(Arc::clone(&journal), Kernel::replay_guard());
+        world.stage = stage;
+        let replayed = run(arch, &bytes, argv, envp, world, BUDGET).expect("the guest replayed");
+        assert_eq!(replayed.stdout, out.stdout, "{}: {name}", arch.name);
+        assert_eq!(replayed.trace, out.trace, "{}: {name}", arch.name);
+        assert_eq!(replayed.ticks, out.ticks, "{}: {name}", arch.name);
+        assert_eq!(journal.remaining(), 0, "{}: {name}", arch.name);
+        ran += 1;
+    }
+    if ran == 0 {
+        std::eprintln!(
+            "usermode: no {name} guest for any architecture in this build. Build one with\n    \
+             scripts/fetch-testdata.sh usermode-guests"
+        );
+    }
+}
+
+/// SQLite, opening a real database file out of the stage.
+///
+/// The whole shape of a program that uses a filesystem, in one guest:
+/// `faccessat` to see whether the database is there, `openat` it, `fstat` it,
+/// `fcntl` a shared lock over it, `pread64` its header and then its pages,
+/// `newfstatat` the `-wal` and `-journal` names that are *not* there, and
+/// `.read` a second staged file on a second descriptor while the first is
+/// still open. Three of those calls did not exist here before this guest
+/// asked for them.
+///
+/// `HOME` is set because without it SQLite goes looking for the user's home
+/// directory in `/etc/passwd` — which is not staged, so it warns and carries
+/// on. That is the sandbox answering correctly, and it is worth knowing that a
+/// real program's response to the policy is a warning on `stderr` rather than
+/// a failure.
+#[cfg(feature = "std")]
+#[test]
+fn a_third_party_database_engine_opens_a_real_file_and_answers_a_query() {
+    run_third_party(
+        "sqlite",
+        &["sqlite3", "/work/demo.db", ".read /work/query.sql"],
+        &["HOME=/work"],
+        |arch, out| {
+            assert_eq!(out.status, 0, "{}: sqlite exited {}", arch.name, out.status);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "osaka\nkyoto\nnara\n4509538\n2870\n",
+                "{}: the rows come out of a real SQLite file the loader never \
+                 touched, in the order the index gives them",
+                arch.name
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "{}: sqlite complained: {:?}",
+                arch.name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        },
+    );
+}
+
+/// Lua, running a program out of the stage.
+///
+/// The complement of SQLite: almost no syscalls, and everything interesting
+/// happening inside the core. A sieve, a coroutine, `string.gmatch`,
+/// `table.sort` and a `%.6f` of `sqrt(2) * pi` — which between them are the
+/// integer arithmetic, the pointer chasing, the double-precision arithmetic
+/// and the `strtod`/`printf` rounding that no hand-written guest tests.
+#[cfg(feature = "std")]
+#[test]
+fn a_third_party_interpreter_runs_a_staged_program() {
+    run_third_party("lua", &["lua", "/work/bench.lua"], &[], |arch, out| {
+        assert_eq!(out.status, 0, "{}: lua exited {}", arch.name, out.status);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "primes below 20000: 2262\n\
+             squares: 1,4,9,16,25\n\
+             words: BROWN DOG FOX JUMPS LAZY OVER QUICK THE THE\n\
+             float: 4.442883\n\
+             version: Lua 5.4\n",
+            "{}",
+            arch.name
+        );
+    });
+}
+
+/// sbase's coreutils, checked against the host's answers rather than against
+/// this repository's expectations.
+///
+/// That is what makes this test different in kind from the two above: the
+/// digest, the line count and the checksum below were produced by the *host's*
+/// `sha256sum`, `wc` and `cksum` over the same file, so a core that computed
+/// something plausible-looking would still fail. The stage is what makes it
+/// possible — the guest and the host are reading the same bytes.
+#[cfg(feature = "std")]
+#[test]
+fn a_third_party_coreutils_agrees_with_the_host_byte_for_byte() {
+    /// `sha256sum tests/usermode/thirdparty/poem.txt` on the host.
+    const DIGEST: &str = "5247febdfa80a88b0bbad97e0b370c8e97d954f8faa0eb75459e25cfad0febbb";
+
+    let cases: Vec<(&[&str], String)> = vec![
+        (
+            &["sha256sum", "/work/poem.txt"],
+            std::format!("{DIGEST}  /work/poem.txt\n"),
+        ),
+        (
+            &["wc", "/work/poem.txt"],
+            "7 16 78 /work/poem.txt\n".to_string(),
+        ),
+        (
+            &["cksum", "/work/poem.txt"],
+            "155279565 78 /work/poem.txt\n".to_string(),
+        ),
+        (
+            &["sort", "/work/poem.txt"],
+            "alpha\nand does it again\njumps over\nmike\nthe lazy dog\n\
+             the quick brown fox\nzulu\n"
+                .to_string(),
+        ),
+        (
+            &["grep", "the", "/work/poem.txt"],
+            "the quick brown fox\nthe lazy dog\n".to_string(),
+        ),
+    ];
+    for (argv, want) in &cases {
+        run_third_party("sbase", argv, &[], |arch, out| {
+            assert_eq!(
+                out.status, 0,
+                "{}: {argv:?} exited {}",
+                arch.name, out.status
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                *want,
+                "{}: {argv:?}",
+                arch.name
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "{}: {argv:?} wrote to fd 2",
+                arch.name
+            );
+        });
     }
 }
 

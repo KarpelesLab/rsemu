@@ -52,14 +52,29 @@ everything an architecture contributes in one struct:
 | the call | `ecall` | `svc #0` |
 | unprivileged state | `priv = User` | `PSTATE.EL = EL0` |
 | `AT_HWCAP` | one bit per single-letter extension | `HWCAP_FP`, `HWCAP_ASIMD` |
+| the FP unit | `mstatus.FS = Initial` | `CPACR_EL1.FPEN = 0b11` |
 
-Plus two decisions a Linux kernel makes for a process it is about to enter and
-that a level-3 consumer therefore has to make itself, both AArch64-specific:
-**`CPACR_EL1.FPEN = 0b11`**, because the architecture resets it to *trap* and
-the first `stp q0, q1` inside a `memcpy` would otherwise take an `UNDEFINED`
-that no guest kernel is there to handle; and **`SCTLR_EL1.M = 0`**, because
-level 3's memory model is "there is no page table" and the map `UserMemory`
-builds is the address space the guest sees.
+Plus the decisions a Linux kernel makes for a process it is about to enter and
+that a level-3 consumer therefore has to make itself.
+
+**Turning the floating-point unit on** is the first, and it is *not*
+architecture-specific, though this document said it was for a year. Both
+architectures reset the unit to trap and both leave enabling it to the kernel:
+AArch64 spells it `CPACR_EL1.FPEN = 0b11`, RISC-V spells it `mstatus.FS =
+Initial`, and Volume II is explicit that with `FS` off *every* FP instruction
+is illegal — including `fsd`, which does no arithmetic at all. Only the
+AArch64 half was written, because it was needed the day that core landed: the
+first `stp q0, q1` inside a `memcpy` took an `UNDEFINED`. The RISC-V half was
+missing for as long as there was nothing to notice it with. `hello` and
+`threads` never execute a floating-point instruction; the first third-party C
+program did, six syscalls into its startup, saving `fs0` across a call.
+`a_guest_may_use_the_floating_point_unit_from_its_first_instruction` is the
+test, and it is one program text assembled for both architectures precisely so
+that a decision like this one cannot be made for only one of them again.
+
+**`SCTLR_EL1.M = 0`** is the second and is genuinely AArch64's: level 3's
+memory model is "there is no page table" and the map `UserMemory` builds is the
+address space the guest sees, so there is nothing for an MMU to translate.
 
 Nothing else moved. **The ELF loader, the initial stack, the auxiliary vector,
 every syscall, the errno values, the host-filesystem policy and the journal are
@@ -416,6 +431,12 @@ down because the population of programs that could notice just grew from "the
 one we wrote" to "anything with a `PT_INTERP`", and because enforcing it is a
 question about `core::space`'s access path rather than about this layer.
 
+The third-party guests below **do not** make it more acute, and that is worth
+recording rather than leaving to be assumed: SQLite, Lua and sbase map no code
+of their own — every `mmap` they make is data or anonymous heap, and none of
+them calls `mprotect` at all. A dynamic loader is still the only thing here
+that builds an executable mapping after the loader has run.
+
 ### A ledgered stop: a whole glibc
 
 The same experiment with a real C library in it —
@@ -444,6 +465,112 @@ worked and nothing was refused — and that where it stopped is inside an object
 **the loader placed**. The day the core gains that group it will assert the
 program's output instead, and it says so rather than quietly continuing to
 pass.
+
+## Third-party software, which is the only witness that counts
+
+Every guest above is ours. `tests/usermode/hello.rs`, `threads.rs` and
+`dynamic/` were written in the same repository as the harness that runs them,
+and a guest written here can only ask for what somebody here thought to
+implement. §2.1's stated purpose for this exercise is to *"find every place
+that surface is not actually usable"*, and the only reliable way to do that is
+to run software aimed at Linux rather than at rsemu.
+
+Three programs, chosen for what they ask of the ABI rather than for fame, all
+permissive, all fetched at a pinned version, cross-built unmodified by
+`scripts/fetch-testdata.sh usermode-guests` and never committed:
+
+| | | what it asks for |
+| --- | --- | --- |
+| **SQLite 3.45** | public domain | opens files, seeks, locks them, reads pages at absolute offsets |
+| **Lua 5.4.7** | MIT | floating point, a garbage collector, string patterns, coroutines |
+| **sbase** | MIT | coreutils, so the answers can be diffed against the host's own |
+
+```console
+usermode/sqlite ["sqlite3", "/work/demo.db", ".read /work/query.sql"] on riscv64: 93 syscall(s), 749472 tick(s); refused []
+usermode/sqlite on riscv64: stdout "osaka\nkyoto\nnara\n4509538\n2870\n"
+usermode/sqlite ["sqlite3", "/work/demo.db", ".read /work/query.sql"] on aarch64: 93 syscall(s), 472403 tick(s); refused []
+usermode/lua ["lua", "/work/bench.lua"] on riscv64: 71 syscall(s), 17556330 tick(s); refused []
+usermode/lua on riscv64: stdout "primes below 20000: 2262\nsquares: 1,4,9,16,25\n…\nfloat: 4.442883\nversion: Lua 5.4\n"
+usermode/sbase ["sha256sum", "/work/poem.txt"] on riscv64: 10 syscall(s), 75629 tick(s); refused []
+usermode/sbase on riscv64: stdout "5247febdfa80a88b0bbad97e0b370c8e97d954f8faa0eb75459e25cfad0febbb  /work/poem.txt\n"
+```
+
+SQLite's two architectures make the **same ninety-three calls in the same
+order** and print the same rows. sbase's digest, `wc` counts and `cksum` are
+compared against the *host's* `sha256sum`, `wc` and `cksum` over the same
+bytes, which is what makes that test different in kind from the other two: a
+core that computed something plausible would still fail it.
+
+### What they found
+
+Four holes, all of them in the *consumer's* half — none needed anything from
+rsemu and none needed the sandbox widened.
+
+| | how it announced itself |
+| --- | --- |
+| **`mstatus.FS` was Off** | an illegal instruction on a `fsd` six syscalls in. See "what the second architecture cost" above: the decision was made for AArch64 and not for RISC-V, and no guest of ours had ever touched a floating-point register |
+| **no `readv`** | musl's `__stdio_read` fills the `FILE`'s own buffer and the caller's in **one** call, so every C program that reads a file through stdio needs it — and no Rust guest did, because `File::read` is a plain `read`. The native trace and the emulated one now both read `readv(3, [15, 1024], 2) = 1039` |
+| **no `pread64`** | SQLite reads the hundred-byte database header at offset zero while a `read` cursor is elsewhere in the same descriptor. Implementing it as a seek and a read would pass every test but corrupt the other cursor |
+| **no `fcntl`** | SQLite takes a shared lock before reading and turns `-ENOSYS` there into `disk I/O error`. The locks are *granted*, and that is honest rather than lax: one process, no host file underneath, so nothing can conflict and `F_GETLK` genuinely has `F_UNLCK` to report |
+
+And one that the differential trace found rather than a crash — the same shape
+this document keeps returning to, a field nobody was reading until somebody
+did. `openat` **ignored its flags**. A guest asking for `O_RDWR | O_CREAT` got a read-only
+descriptor and was told nothing, and would find out at its first `write`, from
+an `-EBADF` that says the descriptor is invalid rather than that the file
+cannot be written. The native trace opens the database `O_RDWR|O_CREAT` and
+falls back to read-only; the emulated one did not, because it was never
+refused. It is `-EROFS` now — the namespace describing itself — and the
+emulated trace has the same `open`-refused-`open` pair the host's does.
+
+### The aarch64 ledger got longer, and it is one list
+
+Three third-party programs, three different Advanced SIMD groups that
+`src/cpu/arm/a64/simd.rs` lists under *"what is deliberately absent"*, each
+stopping a program that runs to completion on RISC-V:
+
+| | stops at | encoding |
+| --- | --- | --- |
+| glibc's `strlen` | `ADDHN v2.8b, v1.8h, v1.8h` | `0x0e214022` |
+| Lua's number conversion | `SCVTF d0, d0` (the scalar **SIMD** form, not `SCVTF Dd, Xn`) | `0x5e61d800` |
+| sbase's `sha256sum` | `SHLL v18.4s, v4.4h, #16` | `0x2e613892` |
+
+Every other applet of the same sbase binary — `wc`, `cksum`, `sort`, `grep` —
+runs on aarch64, and so does the whole of SQLite. So this is not "aarch64 does
+not work"; it is that a compiler auto-vectorising an ordinary loop reaches one
+of these groups often enough that the third program to be tried hit a third
+one. `SCVTF` is the interesting entry, because it is not on that list: the
+scalar-SIMD register-to-register conversion is a different encoding from the
+scalar floating-point one the core has.
+
+`Kernel::encoding_at` is why those words are in this table. A `FAULT` whose
+`Access` is `None` is not a memory fault — the core reached an instruction and
+refused it — so the diagnostic says which of the two it was and prints the
+word. That is the difference between a report a CPU maintainer can act on and
+an address three people then disassemble by hand, which is what the first two
+of these turned into.
+
+### What a stage cannot do, and why that is the right answer
+
+`ls` does not run. A [stage](#the-host-filesystem-policy-and-the-one-time-it-moved)
+is a map from guest path to bytes, so `/work/poem.txt` exists and `/work` does
+not:
+
+```console
+ls: lstat /work: No such file or directory
+```
+
+Making it run needs two things that are the same thing: `getdents64`, and a
+notion of a directory — which means a prefix relation over the keys, which is
+the *search rule* the policy exists for not having. A program that is **told**
+a path runs here; a program that **discovers** paths does not. That line is
+almost exactly §2.1's, and the discovery half is what genuine passthrough is
+for: `npm install` reads directories nobody told it about, and that design is
+nixvm's.
+
+So this is written down rather than fixed. The stage is not a filesystem and
+gets no closer to being one by growing the two calls that would make it look
+like a small one.
 
 ## The host-filesystem policy, and the one time it moved
 
@@ -489,7 +616,12 @@ the run, as reviewable as `argv` is.
   here is private, so a copy-on-write nobody shares is a copy. `MAP_SHARED` of
   a file is `-ENODEV`: a store has to go somewhere.
 - **No descriptor can be written**, so a guest cannot change what the next
-  thing to open a name will see. The stage is immutable from inside.
+  thing to open a name will see. The stage is immutable from inside, and
+  `openat` **says so**: `O_WRONLY`, `O_RDWR`, `O_CREAT` and `O_TRUNC` are
+  refused with `-EROFS` rather than quietly handed a read-only descriptor. The
+  flags used to be ignored, which was the same defect shape as `sigaltstack`
+  and `st_ino` one layer along — a real program branches on which answer it
+  got, and SQLite's entire read-only mode hangs off exactly this errno.
 - `st_ino` is real, and it is the third instance of the defect shape this
   document keeps returning to: a field stubbed to zero, harmless until
   something reads it.
@@ -612,10 +744,14 @@ usermode/hello on aarch64: 25 syscall(s), 1 thread(s), 16734 tick(s); refused []
 usermode/hello on aarch64: stdout "hello from level 3\nargv = [\"hello\"]\nRSEMU = Some(\"1\")\n"
 usermode/threads on riscv64: 166 syscall(s), 8 thread(s), 487136 tick(s); refused []
 usermode/threads on riscv64: stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"
-usermode/threads on aarch64: 166 syscall(s), 8 thread(s), 851592 tick(s); refused []
-usermode/threads on aarch64: stdout "joined [0, 1, 2, 3]\ncounter = 32038\nrendezvous ok\n"
+usermode/threads on aarch64: 166 syscall(s), 8 thread(s), 851702 tick(s); refused []
+usermode/threads on aarch64: stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"
 usermode/dynamic on aarch64: 22 syscall(s), 1 thread(s), 16733 tick(s); refused []
 usermode/dynamic on aarch64: stdout "hello from a shared obj\n"
+usermode/sqlite [...] on riscv64: 93 syscall(s), 749472 tick(s); refused []
+usermode/sqlite on riscv64: stdout "osaka\nkyoto\nnara\n4509538\n2870\n"
+usermode/lua ["lua", "/work/bench.lua"] on riscv64: 71 syscall(s), 17556330 tick(s); refused []
+usermode/sbase ["wc", "/work/poem.txt"] on aarch64: 15 syscall(s), 36589 tick(s); refused []
 ```
 
 The tick counts moved by a few hundred against the numbers this document used
@@ -630,6 +766,16 @@ real dynamic loader. `scripts/fetch-testdata.sh usermode-guests` looks for an
 builds the static ones as before. The loader is copied into the git-ignored
 corpus and run — glibc is LGPL and running a program is ordinary use
 (`CLAUDE.md`, Provenance), while shipping one here would not be.
+
+**The third-party guests need one thing a Rust toolchain cannot produce**: a
+**C** cross compiler for `<arch>-linux-musl`. rustc ships musl's `libc.a` for
+both targets and none of its headers, and a distribution's
+`aarch64-linux-gnu-gcc` is a glibc toolchain with no static libc at all, so the
+script probes for `zig cc` — one download that carries musl's sources and
+headers for every target it knows — and honours `RSEMU_ZIG`. With none it says
+so and the corpus keeps the guests it already has. Sources are fetched at
+pinned versions with checksums, built unmodified, and left in the git-ignored
+corpus with a `PROVENANCE.txt` beside them.
 
 `RSEMU_USERMODE_TRACE=1` adds the whole `(number, result)` list, which is what
 the comparison above is made from. `RSEMU_USERMODE_GUEST` overrides the path if

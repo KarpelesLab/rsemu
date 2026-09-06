@@ -171,6 +171,35 @@ readonly FREEDOS_ZIP_SHA="75a4e11a7fce6f124e20927b3022b4b715a2a3f7324c5f5bfea42d
 readonly FREEDOS_MEMBER="144m/x86BOOT.img"
 readonly FREEDOS_IMG_SHA="3f7834ea4575ba05d106e4b8f59f886da7bfb1979ee386be2a2deba8df518925"
 
+# The level-3 third-party guests: real programs, written by people who have
+# never heard of this emulator, built for the architectures `src/usermode/`
+# runs with no guest kernel under them.
+#
+# `tests/usermode/*.rs` are ours, and a program written in the same repository
+# as the harness that runs it is a weak witness however carefully it was
+# written. These are the strong one, and the reason for choosing *these* three
+# is coverage of the ABI rather than fame:
+#
+#   sqlite  a C program that opens files, seeks in them, reads pages at
+#           absolute offsets and locks them. Public domain.
+#   lua     a language runtime: floating point, a garbage collector, string
+#           pattern matching, coroutines. MIT.
+#   sbase   coreutils, so the answers can be diffed against the host's own
+#           `sha256sum` and `wc` byte for byte. MIT.
+#
+# All three are permissive and all three are still FETCH-ONLY, for the same
+# reason every other corpus is: a compiler's output does not belong in this
+# repository (CLAUDE.md, Testing).
+readonly SQLITE_ZIP="https://www.sqlite.org/2024/sqlite-amalgamation-3450000.zip"
+readonly SQLITE_ZIP_SHA="bde30d13ebdf84926ddd5e8b6df145be03a577a48fd075a087a5dd815bcdf740"
+readonly LUA_TAR="https://www.lua.org/ftp/lua-5.4.7.tar.gz"
+readonly LUA_TAR_SHA="9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30"
+# sbase publishes no releases, so the pin is a commit. Cloned and checked out
+# rather than snapshotted because the cgit snapshot endpoint answers 404 for a
+# bare commit id.
+readonly SBASE_REPO="https://git.suckless.org/sbase"
+readonly SBASE_COMMIT="c546c3a5724c81cee9a11d816a38ccdf17472129"
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -2266,8 +2295,144 @@ build_usermode_guests() {
 	ok "usermode-guests: ${built} static binaries in ${dest}"
 
 	build_usermode_dynamic "$dest"
+	build_usermode_thirdparty "$dest"
 
 	note "    cargo test --all-features usermode::proof -- --nocapture"
+}
+
+# Real third-party programs, cross-built for the level-3 architectures.
+#
+# This half needs a **C** cross compiler for `<arch>-linux-musl`, which is one
+# thing neither the Rust toolchain nor an ordinary Linux host supplies: rustc
+# ships musl's `libc.a` for both targets but none of its headers, and a
+# distribution's `aarch64-linux-gnu-gcc` is a glibc toolchain with no static
+# libc at all. `zig cc` is one download that carries musl's sources and headers
+# for every target it knows, so that is what is probed for. Absent it this step
+# says so and the corpus keeps the guests it already has, exactly as the
+# dynamic half does when there is no `ld.so`.
+#
+# Nothing here is committed and nothing is patched: the three programs are
+# fetched at their pinned versions, compiled unmodified, and run. SQLite is
+# public domain, Lua and sbase are MIT, and running any of them as an emulated
+# guest would be ordinary use even if they were not (CLAUDE.md, Provenance).
+build_usermode_thirdparty() {
+	local dest="$1"
+	local zig="${RSEMU_ZIG:-zig}"
+	if ! command -v "$zig" >/dev/null 2>&1; then
+		note "usermode-guests: no zig on this host, so no third-party guests"
+		note "    a C cross toolchain for <arch>-linux-musl is what these need;"
+		note "    https://ziglang.org/download/ , or set RSEMU_ZIG to one"
+		return 0
+	fi
+	need unzip
+	need tar
+	need git
+
+	local work="${dest}/.src"
+	mkdir -p "$work"
+	fetch_verified "$SQLITE_ZIP" "${work}/sqlite.zip" "$SQLITE_ZIP_SHA" fatal
+	fetch_verified "$LUA_TAR" "${work}/lua.tar.gz" "$LUA_TAR_SHA" fatal
+	[ -d "${work}/sqlite" ] || {
+		unzip -q -o "${work}/sqlite.zip" -d "${work}/sqlite.d"
+		mv "${work}/sqlite.d/"sqlite-amalgamation-* "${work}/sqlite"
+		rmdir "${work}/sqlite.d"
+	}
+	[ -d "${work}/lua" ] || {
+		mkdir -p "${work}/lua.d"
+		tar xzf "${work}/lua.tar.gz" -C "${work}/lua.d"
+		mv "${work}/lua.d/"lua-* "${work}/lua"
+		rmdir "${work}/lua.d"
+	}
+	if [ ! -d "${work}/sbase" ]; then
+		git clone --quiet "$SBASE_REPO" "${work}/sbase" ||
+			die "could not clone ${SBASE_REPO}"
+	fi
+	git -C "${work}/sbase" checkout --quiet "$SBASE_COMMIT" ||
+		die "sbase has no commit ${SBASE_COMMIT}"
+
+	# The staged namespace, built once and copied per architecture: a real
+	# SQLite database, the script that queries it, a Lua program and a text
+	# file whose checksums the tests compare against the host's own.
+	#
+	# The database has to be *made* by something, and the only thing here that
+	# can write one is a host build of the same sqlite. It is built, used and
+	# left in `.src` — no guest ever writes a file, which is the whole of what
+	# a stage being immutable means.
+	local fixtures="${REPO_ROOT}/tests/usermode/thirdparty"
+	local proto="${work}/root"
+	rm -rf "$proto"
+	mkdir -p "${proto}/work"
+	cp "${fixtures}/poem.txt" "${fixtures}/query.sql" "${proto}/work/"
+	cp "${fixtures}/bench.lua" "${proto}/work/"
+	if [ "$FORCE" = 1 ] || [ ! -x "${work}/sqlite3-host" ]; then
+		note "  building sqlite for this host, to write the fixture database ..."
+		"$zig" cc -O2 -o "${work}/sqlite3-host" \
+			"${work}/sqlite/shell.c" "${work}/sqlite/sqlite3.c" \
+			-DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION >/dev/null 2>&1 ||
+			die "could not build sqlite for this host"
+	fi
+	"${work}/sqlite3-host" "${proto}/work/demo.db" \
+		".read ${fixtures}/schema.sql" || die "could not write the fixture database"
+
+	local pair suffix target sources built=0
+	for pair in aarch64:aarch64-linux-musl riscv64:riscv64-linux-musl; do
+		suffix="${pair%%:*}"
+		target="${pair##*:}"
+
+		if [ "$FORCE" != 1 ] &&
+			[ -f "${dest}/sqlite-${suffix}" ] &&
+			[ "${dest}/sqlite-${suffix}" -nt "${work}/sqlite/sqlite3.c" ] &&
+			[ -f "${dest}/lua-${suffix}" ] && [ -f "${dest}/sbase-${suffix}" ]; then
+			note "  the ${suffix} third-party guests are up to date"
+			rm -rf "${dest}/thirdparty-${suffix}.root"
+			cp -a "$proto" "${dest}/thirdparty-${suffix}.root"
+			built=$((built + 1))
+			continue
+		fi
+
+		note "  building sqlite, lua and sbase for ${target} ..."
+		# -Os throughout: these are corpora, and a smaller image is a shorter
+		# load and a smaller diff when one of them stops working.
+		"$zig" cc -target "$target" -static -Os \
+			-o "${dest}/sqlite-${suffix}" \
+			"${work}/sqlite/shell.c" "${work}/sqlite/sqlite3.c" \
+			-DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION 2>/dev/null ||
+			die "could not build sqlite for ${target}"
+
+		# `luac.c` has a `main` of its own and this build wants one binary.
+		sources="$(find "${work}/lua/src" -name '*.c' ! -name 'luac.c' | sort | tr '\n' ' ')"
+		# shellcheck disable=SC2086
+		"$zig" cc -target "$target" -static -Os -DLUA_USE_LINUX \
+			-I"${work}/lua/src" -o "${dest}/lua-${suffix}" $sources -lm 2>/dev/null ||
+			die "could not build lua for ${target}"
+
+		# sbase builds in its own tree, so each architecture gets a copy of it.
+		rm -rf "${work}/sbase-${suffix}"
+		cp -a "${work}/sbase" "${work}/sbase-${suffix}"
+		make -C "${work}/sbase-${suffix}" -s sbase-box \
+			CC="$zig cc -target $target" \
+			CFLAGS="-Os -std=c99 -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_XOPEN_SOURCE=700 -D_FILE_OFFSET_BITS=64" \
+			LDFLAGS="-static" >/dev/null 2>&1 ||
+			die "could not build sbase for ${target}"
+		cp "${work}/sbase-${suffix}/sbase-box" "${dest}/sbase-${suffix}"
+
+		rm -rf "${dest}/thirdparty-${suffix}.root"
+		cp -a "$proto" "${dest}/thirdparty-${suffix}.root"
+		built=$((built + 1))
+	done
+
+	write_notice "$dest" "Third-party level-3 guests, built here and never committed.
+
+  sqlite  ${SQLITE_ZIP}
+          SQLite is in the public domain.
+  lua     ${LUA_TAR}
+          Lua is MIT, (c) 1994-2024 Lua.org, PUC-Rio.
+  sbase   ${SBASE_REPO} at ${SBASE_COMMIT}
+          sbase is MIT; see LICENSE in the cloned tree.
+
+Sources are under .src/ and are unmodified. Nothing in this directory is part
+of rsemu and nothing in it is redistributed by rsemu."
+	ok "usermode-guests: third-party guests for ${built} architecture(s) in ${dest}"
 }
 
 # The dynamically linked guests.
@@ -2433,6 +2598,12 @@ Suites:
                  ld-linux-<arch>.so.1. That is looked for in the usual cross
                  sysroots and named by RSEMU_USERMODE_LDSO; without one the
                  dynamic guests are skipped and the static ones still run.
+                 Finally it fetches and cross-builds three *third-party*
+                 programs -- sqlite (public domain), lua (MIT) and sbase (MIT)
+                 -- which needs a C cross compiler for <arch>-linux-musl.
+                 `zig cc` is the one download that supplies musl's headers for
+                 every target; set RSEMU_ZIG to point at one, or leave it and
+                 the third-party guests are skipped with a note.
   riscv-arch-test  the RISC-V architectural certification tests (BSD-3-Clause).
                  Built rather than downloaded: needs clang and a RISC-V linker
                  (lld, or rustup's rust-lld), and fetches the Sail reference
