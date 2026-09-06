@@ -66,10 +66,35 @@
 //! into a huge anonymous range it is no better than an eager copy, and only a
 //! page table will make it so.
 //!
-//! **[`Perms::EXEC`] is carried and not enforced**, because no rsemu core marks
-//! an instruction fetch as one yet — so a `Prot::RX` range and a `Prot::READ`
-//! one are indistinguishable to a guest. There is no NX here, and the day a
-//! core marks its fetches there will be.
+//! **[`Perms::EXEC`] is carried and not enforced**, and the reason is not that
+//! nobody has got to it: **this is not the layer that could.**
+//!
+//! A guest's instruction fetch never passes through this type. A core reaches
+//! [`UserMemory::space`] once and issues every access — load, store and fetch —
+//! straight at the [`AddressSpace`], and by the time one arrives there it is a
+//! read of some width at some address with a [`MemAttrs`] beside it. Nothing in
+//! that tuple says *fetch*. `MemAttrs` has a bit for secure, for privileged,
+//! for exclusive and for debug, and none for the one distinction `Perms::EXEC`
+//! is about; both 64-bit cores have an internal `Access::Fetch` and both drop
+//! it at the seam, because until now nothing downstream could use it.
+//!
+//! So the change is three lines in two places that are **not here**: a `fetch`
+//! flag on `MemAttrs`, each core's fetch path setting it, and
+//! `FlatLeaf::read` asking for `READ | EXEC` instead of `READ` when it is set —
+//! beside the `READ` test that is already there, on a value already in a
+//! register, which is why the cost objection does not survive contact with the
+//! code. `docs/system/usermode-abi.md` writes it out, including the two things
+//! that are already in place: a permission change here is a *retopology*, so
+//! every block a JIT lifted out of a page that stops being executable is
+//! already dropped, and a `Protected` error is already the shape a consumer's
+//! fault handler understands.
+//!
+//! What is genuinely this layer's is the bookkeeping, and that is complete: a
+//! `PROT_EXEC` survives `mmap`, `mprotect`, `mappings()` and a snapshot
+//! unchanged. Until the fetch is marked, a `Prot::RX` range and a `Prot::READ`
+//! one are indistinguishable to a guest, and
+//! `usermode::proof::a_fetch_from_a_mapping_that_forbids_execution_is_not_refused_yet`
+//! is the ledger line that fails when that stops being true.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};

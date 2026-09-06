@@ -96,11 +96,75 @@ degraded one. The number is matched with a guard on `e_machine` rather than
 unconditionally, because on AArch64 258 is unassigned and a program asking for
 it should be told so.
 
-`AT_HWCAP` is worth one more line, because it is a promise rather than a
-description. `HWCAP_ATOMICS` is deliberately **absent**: `Config::cortex_a53`
-has no `FEAT_LSE`, compiler-rt's out-of-line atomics read that bit to choose
-between `casal` and an `ldxr`/`stxr` loop, and a part that claimed the bit
-would take an `UNDEFINED` on the first atomic a threaded guest executed.
+### `AT_HWCAP` is a promise, and now a measurable one
+
+`AT_HWCAP` is a promise rather than a description, and until recently that was
+all it was: a number a test asserted. `HWCAP_ATOMICS` was deliberately
+**absent** on AArch64 because `Config::cortex_a53` has no `FEAT_LSE`,
+compiler-rt's out-of-line atomics read that bit to choose between `casal` and
+an `ldxr`/`stxr` loop, and a part that claimed the bit would take an
+`UNDEFINED` on the first atomic a threaded guest executed.
+
+That is still true of `ARCH`. What is new is `ARCH_LSE`, the same architecture
+on a `Config::neoverse_n1` — Armv8.2-A, where `FEAT_LSE` is mandatory — which
+sets bit 8 and is the first place a level-3 guest is told something that
+changes **what it executes** rather than what it prints.
+
+The measurement is one binary on two parts. `threads-aarch64` is built for
+`aarch64-unknown-linux-musl`, whose baseline is Armv8.0, so it cannot contain
+an inline `LDADD` — but it contains fourteen LSE words anyway, in compiler-rt's
+out-of-line atomics, behind a runtime branch on `__aarch64_have_lse_atomics`
+that is initialised from bit 8 of `AT_HWCAP`:
+
+```
+usermode/threads on aarch64:     166 syscall(s), 8 thread(s), 851702 tick(s)
+usermode/threads on aarch64+lse: 166 syscall(s), 8 thread(s), 690851 tick(s)
+    stdout "joined [0, 1, 2, 3]\ncounter = 40000\nrendezvous ok\n"  (both)
+```
+
+Same file, same syscalls, same answer, **19% fewer instructions** — because on
+the second run the branch went the other way and forty thousand `fetch_add`s
+were one `LDADD` each instead of an `ldxr`/`stxr` loop that retries under
+contention. `an_lse_part_says_so_in_at_hwcap_and_the_guest_changes_what_it_executes`
+asserts the outputs are equal and the tick counts are *not*, which is how it
+knows the guest actually read the bit rather than the test measuring nothing.
+
+The second guest is `threads-lse-aarch64`: the same `tests/usermode/threads.rs`
+built `-C target-feature=+lse`, so the atomics are inline in the guest's own
+text rather than behind compiler-rt's dispatch — ninety-eight LSE words
+including `casb` and `swpb`, the byte forms an Armv8.0 `.text` never contains
+at all. It runs on the Neoverse part and gives the same answer in fewer ticks
+still (165 syscalls, 410199 ticks), and on the Cortex-A53 it must **not** run:
+
+```
+usermode/threads-lse on aarch64 without FEAT_LSE: thread 1 at pc 0x228654
+  executed an instruction this core does not implement, encoded 0xf8280008
+```
+
+That negative is the half that keeps the feature lattice honest. `FEAT_LSE`'s
+encodings are `UNDEFINED` on a part without it — that is *how* a guest probes
+for the feature — so a core that decoded them anyway would make
+`Config::cortex_a53` a claim no other test in this file could catch.
+
+A **whole glibc** gets the same bit, which is the version of this experiment
+worth the most: glibc's AArch64 `init_cpu_features` keys its ifunc resolvers
+off `AT_HWCAP`, so setting bit 8 is not a local change to one dispatch variable
+but an input to an entire library's idea of what part it is on. Four of the six
+defects this module has found came from handing glibc something it had not been
+handed before. This one broke nothing:
+
+```
+usermode/glibc-threads on aarch64:     205 syscall(s), 8 thread(s), 1150910 tick(s)
+usermode/glibc-threads on aarch64+lse: 205 syscall(s), 8 thread(s),  988478 tick(s)
+```
+
+The **same 205 calls in the same order**, the same output, 14% fewer
+instructions. That the syscall trace is unchanged is the interesting half: an
+ifunc resolver picking a different `memcpy` is not supposed to be visible to a
+kernel, and here it demonstrably is not.
+
+RISC-V has no counterpart and needs none: `A` is not optional in RV64GC, so
+there is no second encoding for a guest to select between.
 
 ## The differential oracle, which is the point of level 3
 
@@ -472,6 +536,105 @@ sequence described above — half a dozen `mprotect`s per run, over spans it jus
 mapped from a descriptor. Nothing has gone wrong; the point is that if
 something did, nothing here would say so.
 
+#### It is measured now, not asserted
+
+`usermode::proof::a_fetch_from_a_mapping_that_forbids_execution_is_not_refused_yet`
+runs both shapes, on both architectures, and both succeed:
+
+- an ELF image whose only `PT_LOAD` is `rw-` — the same `hello` file every
+  other loader test uses with one `p_flags` word changed — loads, is recorded
+  in `mappings()` as `rw-`, and **runs to completion out of it**. Linux maps
+  that image exactly as asked and kills the process on its first fetch;
+- a guest that calls `mprotect(text, PAGE, PROT_READ)` on the page it is being
+  fetched out of, and keeps going. `mprotect` returns 0, the mapping loses
+  `x`, and the next instruction is fetched anyway. That is `ld.so`'s RELRO step
+  aimed at the wrong range, in eleven instructions.
+
+The same test asserts the half that *is* enforced on the same mapping in the
+same breath, so the asymmetry is visible in one place: the bookkeeping is
+right, `WRITE` is refused, and only the fetch is unchecked. It is written as a
+characterisation, so it **fails when the gap closes** — which is the point of
+writing it down rather than leaving a comment.
+
+#### Where the enforcement goes, and why it is not in `usermode`
+
+`UserMemory` cannot do this, and that is a fact about the data flow rather
+than a preference. A guest's fetch never passes through it: a core takes
+`UserMemory::space()` once at start-up and issues every access — load, store
+and fetch alike — directly at the `AddressSpace`. What arrives there is an
+address, a width, a direction and a `MemAttrs`, and **nothing in that tuple
+says fetch**. `MemAttrs` carries `secure`, `privileged`, `exclusive` and
+`debug`; it has no bit for the one distinction `Perms::EXEC` is about.
+
+Both 64-bit cores already *have* the distinction and already drop it. RISC-V's
+and AArch64's interpreters both thread an internal `Access::Fetch` through
+translation — `src/cpu/riscv/exec.rs` and `src/cpu/arm/a64/exec.rs` — and both
+then call `self.space.read(pa, width, self.attrs)` with a `MemAttrs` that has
+forgotten which kind of access it was. Under a page table the distinction
+survives, because the *MMU* consumes it: `src/cpu/riscv/mmu.rs` checks
+`pte & pte::X` and `src/cpu/arm/a64/mmu.rs` the equivalent, so a level-1 Linux
+guest has had NX all along. Level 3 runs with the MMU off — `SCTLR_EL1.M = 0`,
+RISC-V bare — precisely because it has no page table, so the mapping is the
+only thing left holding a permission, and the mapping's `EXEC` bit is the one
+nobody reads.
+
+So the change is small, it is in `core::space` and `cpu/`, and it is three
+pieces:
+
+1. **A `fetch: bool` on `MemAttrs`**, with a `with_fetch` builder, `false` in
+   `DEFAULT` and `DEBUG`. `MemAttrs` is `#[non_exhaustive]` and built from
+   those constants plus builders, so this is an additive change: no device
+   handler signature moves, and nothing that ignores the field behaves
+   differently.
+2. **Each core's fetch path setting it.** One line where a core already knows:
+   `self.space.read(pa, width, self.attrs.with_fetch(kind == Access::Fetch))`.
+   A core that does not bother keeps the old behaviour exactly, which is what
+   makes this landable one core at a time.
+3. **`FlatLeaf::read` asking for the right permission.** The `READ` test is
+   already there and already documented as *"one `and`-and-compare against a
+   byte already in the leaf's own cache line"*; the change is what it compares
+   against:
+
+   ```rust
+   let need = if attrs.fetch { Perms::RX } else { Perms::READ };
+   if !self.perms.contains(need) {
+       return Err(BusError::Protected);
+   }
+   ```
+
+   That is a select on a bool already in a register feeding a comparison that
+   already happens — not a new branch and not a new indirection. The objection
+   recorded on `Perms::EXEC` ("an unconditional branch on the read path for a
+   bit nothing sets") was written before there was anything to set the bit; it
+   does not describe this shape.
+
+Two things the change would need are already in place, which is the other half
+of why it is cheap:
+
+- **Stale translations are already dropped.** `UserMemory::protect` reaches
+  `AddressSpace::topology().reprotect`, and `core::space`'s own test
+  `reprotect_changes_the_terms_and_bumps_the_generation` asserts a permission
+  change is a retopology. Every cache keyed on the generation — the flat view,
+  a JIT's block cache — is invalidated by an `mprotect` today, so a block
+  lifted out of a page that then stops being executable cannot survive it.
+- **The error is already the right one.** `BusError::Protected` is what a
+  copy-on-write fault raises, and this consumer's fault handler already tells
+  a `Protected` it can resolve from one it cannot
+  (`UserMemory::resolve_write_fault` returning `Ok(false)`). An unresolvable
+  `Protected` on a fetch is exactly the `SIGSEGV` a consumer would deliver.
+
+The one genuinely new decision is the **`W^X` question a shared page raises**:
+a mapping is `rwx` when two segments share a page and one asked for `w` and the
+other for `x` (`two_segments_sharing_a_page_get_the_union_of_their_permissions`
+is that case, and a real linker produces it). A union is the right answer for a
+page-granular map and it stays the right answer here — it is what Linux's own
+`load_elf_binary` does with the same congruent segments — but it means
+enforcement will *not* catch a `W^X` mistake inside a shared page, and the
+change should say so rather than let somebody discover it.
+
+`src/core/space/` and `src/cpu/` are not this module's to edit, so this section
+is the request rather than the patch.
+
 ### A whole C library, on both architectures
 
 The same experiment with a real glibc in it. `tests/usermode/hello.rs` — the
@@ -790,6 +953,15 @@ would mean rsemu deciding what a `DT_NEEDED` resolves to, which is the
 interpreter's job and the reason there is an interpreter. *A path allow-list*
 is "which paths are safe" wearing a different hat.
 
+Two later additions were weighed against that sentence and neither moved it.
+The **`FEAT_LSE` part** is a construction property of a core: `ARCH_LSE`
+differs from `ARCH` by a `Config` and one `AT_HWCAP` bit, and an auxiliary
+vector entry is a number the harness computed before the guest existed, not an
+answer to a question the guest asked. The **`PROT_EXEC` ledger test** adds no
+syscall and no descriptor; both of its guests are images assembled in memory.
+The kernel's list of host-reachable functions is still empty, and the
+feature-combination job still proves it.
+
 A real consumer will still need genuine passthrough — `npm install` writes
 files, and reads directories it was not told about — and §2.1 says that design
 is nixvm's. A stage is not that and does not pretend to be; it is the smallest
@@ -880,6 +1052,9 @@ usermode/sqlite [...] on riscv64: 93 syscall(s), 755325 tick(s); refused []
 usermode/sqlite on riscv64: stdout "osaka\nkyoto\nnara\n4509538\n2870\n"
 usermode/lua ["lua", "/work/bench.lua"] on riscv64: 71 syscall(s), 22964816 tick(s); refused []
 usermode/sbase ["wc", "/work/poem.txt"] on aarch64: 15 syscall(s), 36723 tick(s); refused []
+usermode/threads on aarch64+lse: 166 syscall(s), 8 thread(s), 690851 tick(s); refused []
+usermode/threads-lse on aarch64+lse: 165 syscall(s), 8 thread(s), 410199 tick(s); refused []
+usermode/glibc-threads on aarch64+lse: 205 syscall(s), 8 thread(s), 988478 tick(s); refused []
 ```
 
 The tick counts moved by a few hundred against the numbers this document used
