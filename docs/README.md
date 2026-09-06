@@ -93,32 +93,45 @@ hardware with a guest this repository builds.
 #### The caveat every SMP row is subject to
 
 Four boards in `machines/` declare two processors — `arm64-virt-smp`,
-`q35-linux-smp`, `pc-at-smp` and the synthetic `pc-apic` — and **none of them
-has a working global atomic**.
+`q35-linux-smp`, `pc-at-smp` and the synthetic `pc-apic` — and **their guest
+atomics are kept**. This was the tree's largest correctness defect until
+recently, and it was closed in two pieces because the two families of
+architecture break in different ways.
 
-The exclusive monitor is **core-local**: each core keeps its reservation
-privately (`cpu::arm::a64`'s `State::exclusive`, `cpu::riscv`'s `reservation`),
-so a sibling's store does not break it and an `stxr`/`sc.d` the architecture
-requires to fail succeeds instead. `core::space::MemAttrs::exclusive` carries
-the flag and says the monitor "lives with the CPU, not here"; the global monitor
-on the address space that would read it back does not exist.
-`usermode::proof`'s `a_reservation_is_core_local_so_two_threads_lose_an_update`
-reproduces it hermetically on both architectures, and an AArch64
-`AtomicU32::fetch_add` loop lands 32,038 of 40,000.
+`core::space::monitor` is a **global exclusive monitor** on the address space,
+hooked at the single funnel every guest store, DMA burst and ROM load passes
+through, so an ordinary store by any observer breaks a covering reservation
+without the storing master knowing the monitor exists. Each core keeps its
+architectural reservation as before (`cpu::arm::a64`'s `State::exclusive`,
+`cpu::riscv`'s `reservation`) and a store-conditional now needs both. Granules
+are per architecture: 16 bytes on AArch64 (DDI 0487 B2.9, the smallest that
+holds a 128-bit `LDXP`), 8 on RISC-V (the naturally aligned XLEN word the
+reservation set must contain).
 
-x86 has the same hole from the other end: `LOCK` is decoded and ignored
-(`src/cpu/x86/mod.rs`, on the now-false grounds that there is "one core, one
-bus"), and `CMPXCHG`/`XADD`/`XCHG` are a read followed by a write. Under
-`ThreadingMode::Deterministic` that is safe only *by accident* — one core runs a
-whole instruction before the other runs at all — and under
-`ThreadingMode::Parallel` it is not safe at all. Under `--accel kvm` the host's
-silicon performs the atomic, so an accelerated SMP boot is evidence about the
-host and not about this tree.
+x86 needed a different primitive, and the reasoning is worth keeping: a
+reservation is *optimistic* and architecturally licensed to fail spuriously,
+which is what buys the monitor its lock-free table — but `LOCK CMPXCHG`/`XADD`/
+`XCHG` are *unconditional*, with no status flag and no retry loop in the guest
+to catch a failure, so building them on a spuriously-clearing monitor would
+produce a wrong answer rather than a retry. Instead a **bus lock**
+(`LockRank::BUS_LOCK`, immediately above `BUS` and below every bus fabric) is
+held across the read and the write of one locked instruction. The two compose
+without knowing about each other: a locked write still leaves through the store
+funnel, so it breaks reservations on the way past.
 
-**These boards boot because kernel spinlocks are almost never contended.** That
-is luck about timing, not a property of the model: read a green SMP row as
-evidence that bring-up, register banking and IPIs work, and not as evidence
-that its atomics do.
+**The evidence is numbers that used to come out wrong.** An AArch64
+`AtomicU32::fetch_add` loop over two cores landed 32,038 of 40,000; it lands
+40,000 now, and reverting the one check reproduces 32,038 exactly. Two x86
+interpreters on two host threads running `lock xadd` land 40,000 of 40,000,
+against 34,271 with the bus lock removed.
+
+**Two things remain open and a green SMP row still does not cover them.**
+Locked-against-*plain* — a sibling's ordinary store landing inside a locked
+read-modify-write's window — is not closed. And this is *atomicity*, not
+*ordering*: fences are no-ops, so a guest that depends on a weak memory model
+being weak has nothing here to disagree with. Under `--accel kvm` the host's
+silicon performs the atomic, so an accelerated SMP boot remains evidence about
+the host rather than about this tree.
 
 Boards with no page here — `pc-apic`, `spi-flash`, `spi-panel`, `arm926`,
 `a64-mini`, `mips-mini`, `z80-mini`, `m68k-mini`, `ne2k-mini`, `nvme-mini`,

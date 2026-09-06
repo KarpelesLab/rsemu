@@ -230,15 +230,19 @@ something a person can actually run (§2).
 > and HVF/WHPX.
 >
 > **Four boards declare two processors** — `arm64-virt-smp`, `q35-linux-smp`,
-> `pc-at-smp` and the synthetic `pc-apic` — and **none of them has a working
-> global atomic**. The exclusive monitor is core-local, so an `stxr`/`sc.d` the
-> architecture requires to fail succeeds; on x86, `LOCK` is decoded and ignored
-> and `CMPXCHG`/`XADD` are a split read-modify-write, safe under
-> `Deterministic` only because one core runs a whole instruction at a time.
-> They boot because kernel spinlocks are almost never contended, which is luck
-> about timing rather than a property of the model. A **global monitor on the
-> address space** is the deliverable; `docs/README.md` and
-> `src/core/space/attrs.rs` carry the long form.
+> `pc-at-smp` and the synthetic `pc-apic` — and their guest atomics are now
+> kept. `core::space::monitor` is a global exclusive monitor on the address
+> space, so a sibling's store breaks a covering reservation and `stxr`/`sc.d`
+> fail when the architecture requires it. x86 needed a different primitive,
+> because a `LOCK`ed read-modify-write is unconditional with no status flag to
+> report a failure through: it takes a bus lock (`LockRank::BUS_LOCK`) across
+> the read and the write. The two compose — a locked write still breaks
+> reservations on its way through the store funnel.
+>
+> **What remains**: locked-against-plain (a sibling's ordinary store inside the
+> window), and *ordering* — fences are still no-ops, so a guest depending on a
+> weak memory model being weak has nothing to disagree with. `src/core/space/
+> monitor.rs` and `src/core/space/buslock.rs` carry the long form.
 ---
 
 ## 0. Non-negotiables

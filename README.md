@@ -207,18 +207,29 @@ everything but the boot processor on a release table. At the shell,
 interprocessor interrupts that went between them; `/proc/stat` shows the second
 one running tasks.
 
-**Read every SMP claim on this page against one caveat.** *The exclusive monitor
-is core-local.* Each core keeps its reservation privately —
-`cpu::arm::a64`'s `State::exclusive`, `cpu::riscv`'s `reservation` — so a
-sibling's store does not break it, and an `stxr` or an `sc.d` that the
-architecture *requires* to fail succeeds instead, losing the sibling's update.
-`core::space::MemAttrs::exclusive` carries the flag and its own documentation
-says the monitor "lives with the CPU, not here"; nothing reads it back, because
-the **global monitor on the address space** that would is not written.
-`usermode::proof`'s
-`a_reservation_is_core_local_so_two_threads_lose_an_update` is a hermetic
-reproducer on both architectures, written to fail when the monitor lands — and
-in the wild an AArch64 `AtomicU32::fetch_add` loop lands **32,038 of 40,000**.
+**Guest atomics are kept, on all three architectures.** Each was broken in its
+own way and each is now closed. `core::space::monitor` is a **global exclusive
+monitor** on the address space, hooked at the single funnel every guest store
+passes through, so an ordinary store by any observer breaks a covering
+reservation: `LDXR`/`STXR` and `LR`/`SC` do what the architecture requires.
+x86 has no reservation to break — a `LOCK`ed read-modify-write is
+unconditional and has no status flag to report a failure through — so it takes
+a **bus lock** (`LockRank::BUS_LOCK`, above `BUS` and below every bus fabric)
+held across the read and the write of one instruction. The two compose without
+knowing about each other: a locked write still goes out through the same funnel,
+so it breaks reservations on its way past.
+
+The evidence is a number that used to come out wrong. An AArch64
+`AtomicU32::fetch_add` loop over two cores landed **32,038 of 40,000**; it lands
+40,000 now, and reverting the one check reproduces 32,038 exactly. Two x86
+interpreters on two host threads running `lock xadd` land **40,000 of 40,000**,
+against 34,271 with the bus lock removed. Both are hermetic tests.
+
+**One residual, recorded rather than papered over:** locked-against-*plain* is
+still open — a sibling's ordinary store can land inside a locked
+read-modify-write's window — and this fixes *atomicity*, not *ordering*. Fences
+are no-ops, so a guest that depends on a weak memory model being weak has
+nothing here to disagree with.
 
 The x86 boards have the same shape of hole from the other end: **`LOCK` is
 decoded and ignored** (`src/cpu/x86/mod.rs` says so, still on the grounds that
@@ -601,9 +612,10 @@ an identical tick count.
 `set_tid_address` and `CLONE_CHILD_CLEARTID` — which together are the whole of
 `pthread_join` — carry four workers hammering one atomic and three threads on a
 condition variable, written with no knowledge of the emulator. It is also what
-found a real defect: **the exclusive monitor is core-local**, so an AArch64
-`AtomicU32::fetch_add` loop lands 32,038 of 40,000 increments (see the SMP
-caveat above). Forty-seven syscall numbers are dispatched — `hello` makes 25 of
+found the tree's largest correctness defect: **the exclusive monitor was
+core-local**, so an AArch64 `AtomicU32::fetch_add` loop landed 32,038 of 40,000
+increments. It lands 40,000 now (see the SMP section above), and the same guest
+is what proves it. Forty-seven syscall numbers are dispatched — `hello` makes 25 of
 them on either architecture and the threaded guest 166 — a dynamically linked
 binary is refused with a message rather than half-loaded, and there is a hard
 rule: *a level-3 guest may be told about itself, and may not be told about the
