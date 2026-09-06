@@ -2850,10 +2850,10 @@ impl X86 {
     /// engine.
     ///
     /// `remaining` is what is left of the caller's budget, and it is not
-    /// advisory: a block whose worst case does not fit is not run, so the core
-    /// stops where an interpreted core would stop and carries the same
-    /// `State::debt`. See `engine`'s module documentation for why that matters
-    /// as far as the machine's state hash.
+    /// advisory: a block that spends it leaves at its next guest instruction
+    /// boundary, so the core stops where an interpreted core would stop and
+    /// carries the same `State::debt`. See `engine`'s module documentation for
+    /// why that matters as far as the machine's state hash.
     #[allow(unused_variables)]
     fn advance(&self, remaining: u64) -> u64 {
         #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]

@@ -340,10 +340,10 @@ that belongs.
 
 **Re-measured after `cpu::x86::lift` gained the reserved-NOP space, the
 repeat-prefixed no-operations and the computed near transfers, and
-`cpu::x86::engine` stopped answering an unknown block's cost with
-`worst_bound`** — `docs/platforms/pc64.md` measures what each of those was
-worth. A different OVMF build, so the row above is not the control for the row
-below: this one is Gentoo's `edk2-ovmf` `OVMF_CODE.fd`, which stops at
+`cpu::x86::engine` stopped guessing an unknown block's cost** — it no longer
+costs a block at all, and `docs/platforms/pc64.md` measures what each of those
+was worth. A different OVMF build, so the row above is not the control for the
+row below: this one is Gentoo's `edk2-ovmf` `OVMF_CODE.fd`, which stops at
 **366577 ms** rather than 367540, and it is 560 517 194 guest instructions to
 the shell rather than 561 105 521.
 

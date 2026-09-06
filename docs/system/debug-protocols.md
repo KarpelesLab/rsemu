@@ -259,11 +259,12 @@ both directions through it.
 
 **A breakpoint inside a compiled block fires**, and by construction rather than
 by luck. With a breakpoint or a watchpoint armed, `resume` advances one clock
-tick at a time; a tick is a budget of about one bus access, and a core declines
-to run a block whose worst case does not fit what is left of the budget. An
-armed breakpoint therefore degrades a translating core to one interpreted
-instruction per tick, and the program counter is compared after each. It works
-on a block's entry, in its middle and on its last instruction alike. What it
+tick at a time; a tick is a budget of about one bus access, and a block asked
+for one retires a single guest instruction and then leaves at the next
+boundary, because `IrHost::spent` is consulted at every one of them. An armed
+breakpoint therefore degrades a translating core to one guest instruction per
+tick, and the program counter is compared after each. It works on a block's
+entry, in its middle and on its last instruction alike. What it
 costs is the engine: a checking slice takes about the same wall time on `jit`
 as on `interp`, because while it is checking there is no JIT. That is the price
 of not patching trap instructions into guest memory, and it is the same price
