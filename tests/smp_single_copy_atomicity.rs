@@ -381,10 +381,17 @@ fn concurrent_cores_may_tear_a_plain_aligned_load() {
 /// Two host threads, plain against **locked**: the bus lock's residual, caught.
 ///
 /// The lock was held — `bus` says so — and a plain store landed inside the
-/// window anyway, because a plain store does not ask for it. Closing this would
-/// mean every store in the machine taking the bus lock, which is the cost the
-/// design exists to avoid; `buslock`'s "What it does not make atomic" has the
-/// argument and now has this file's numbers behind it.
+/// window anyway, because a plain store does not ask for it.
+///
+/// Two closures are needed and only one of them is expensive, which is worth
+/// separating because they were run together once. Stopping a plain store from
+/// landing *between the read and the write* of a locked instruction would mean
+/// every store in the machine taking the bus lock, which is the cost the design
+/// exists to avoid (`buslock`, "What it does not make atomic"). Stopping it
+/// from landing *between the bytes of the read* needs nothing of the sort — it
+/// is `RamStore`'s byte loop, it costs one to three nanoseconds a store to
+/// remove, and `space::store`'s "What removing it would cost, measured" prices
+/// all three ways with the denominator to divide them by.
 #[test]
 fn concurrent_cores_may_tear_the_read_half_of_a_locked_instruction() {
     let space = space(true);
