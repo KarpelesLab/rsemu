@@ -146,43 +146,55 @@
 //!   nothing. `TR6`/`TR7` likewise store and do nothing.
 //! - **No alignment check.** `CR0.AM` and `EFLAGS.AC` have storage; no `#AC`
 //!   is ever raised.
-//! - **`LOCK` is decoded and ignored, and the read-modify-writes it applies to
-//!   are split.** The justification this line used to carry — *one core, one
-//!   bus, and nothing to contend with* — is no longer true and is worth
-//!   correcting rather than leaving: `pc-at-smp`, `q35-linux-smp` and
-//!   `pc-apic` all declare two processors, `ThreadingMode::Parallel` is
-//!   implemented, and `q35-linux-smp` boots a stock kernel that reports two.
-//!
-//!   `CMPXCHG`, `XADD`, `XCHG` with a memory operand — which is locked
+//! - **`LOCK` holds a bus lock, and against a *plain* store it still does
+//!   not.** `CMPXCHG`, `XADD`, `XCHG` with a memory operand — locked
 //!   *implicitly*, prefix or not (*Intel SDM* volume 2, `XCHG`) — and
 //!   `CMPXCHG8B`/`CMPXCHG16B` are each an `Exec::read_mem` followed by an
-//!   `Exec::write_mem`, with a window between them. Under
-//!   `ThreadingMode::Deterministic` one core runs a whole instruction at a
-//!   time and the window cannot be entered; under `Parallel` a sibling's
-//!   store lands in it and is lost. **It is an atomic that is not.**
+//!   `Exec::write_mem`, with a window between them. `Exec::instruction` now
+//!   holds [`AddressSpace::bus_lock`] across the whole of one of these
+//!   whenever `LOCK#` is asserted, so the window is closed against another
+//!   master's *locked* access — which is what every guest spinlock, refcount
+//!   and futex is on both sides of the contention. A plain store by a sibling
+//!   can still land in it, where hardware would have held it off.
 //!
-//!   The exposure is the *interpreter's* alone: `cpu::x86::lift::classify`
-//!   refuses a `LOCK` prefix outright and none of these four encodings is in
-//!   the lifted subset, so every engine reaches the same code.
+//!   Where the line is drawn and why is
+//!   [`core::space::BusLock`](crate::core::space::BusLock)'s "What it does not
+//!   make atomic"; the short form is that closing the plain-store half means
+//!   every store in the machine taking that lock, and a plain store racing a
+//!   locked read-modify-write is already a data race in the guest's own terms.
 //!
-//!   **The exclusive monitor being built for RISC-V and AArch64 is not the
-//!   answer here**, and the difference is the whole design question. `LR`/`SC`
-//!   and `LDXR`/`STXR` are a *pair* with an architectural failure outcome, so
-//!   a global monitor can break a reservation and the store reports that it
-//!   was broken; the guest's own loop retries. x86 has no pair, no reservation
-//!   and no failure outcome — a locked read-modify-write is simply required
-//!   not to be interleaved with, and there is nothing to report. What closes
-//!   it is an **atomic read-modify-write on guest-physical memory**: a
-//!   compare-exchange and a fetch-and-op the address space performs under
-//!   whatever its backing store can do atomically (`RamStore` is already
-//!   `AtomicU8` underneath), with a defined answer for the MMIO regions where
-//!   it cannot. Failing that, a **bus lock** held across the read and the
-//!   write makes locked-against-locked atomic, which is what every guest
-//!   spinlock, refcount and futex is, and leaves locked-against-plain-store
-//!   open.
+//!   The justification the ignored `LOCK` used to carry — *one core, one bus,
+//!   and nothing to contend with* — was false and is worth recording as such:
+//!   `pc-at-smp`, `q35-linux-smp` and `pc-apic` all declare two processors,
+//!   `ThreadingMode::Parallel` is implemented, and `q35-linux-smp` boots a
+//!   stock kernel that reports two. Two cores adding one to a shared word
+//!   twenty thousand times each returned about 35 000 of 40 000; see
+//!   `tests/x86_bus_lock.rs`, which is that measurement.
+//!
+//!   One lock serves every engine, because the exposure was the
+//!   *interpreter's* alone: `cpu::x86::lift::classify` refuses a `LOCK` prefix
+//!   outright and none of these four encodings is in the lifted subset, so a
+//!   translated build reaches the same code.
+//!
+//!   **The exclusive monitor RISC-V and AArch64 use is not the answer here**,
+//!   and the difference is the whole design question. `LR`/`SC` and
+//!   `LDXR`/`STXR` are a *pair* with an architectural failure outcome, so a
+//!   global monitor can break a reservation and the store reports that it was
+//!   broken; the guest's own loop retries. x86 has no pair, no reservation and
+//!   no failure outcome, so a monitor that is licensed to clear spuriously
+//!   would turn `LOCK XADD` into a wrong answer rather than into a retry. The
+//!   two objects compose without knowing about each other all the same: a
+//!   locked write still leaves through `SpaceView::write_span`, so it breaks a
+//!   sibling's reservation on the way past.
 //!
 //!   The invalid-opcode exception a `LOCK` on a non-lockable instruction
-//!   should raise is a second, separate gap and is not enforced either.
+//!   should raise is a second, separate gap and is not enforced. It is not the
+//!   same defect — it is an exception this core fails to *raise*, not an
+//!   atomic it fails to keep — and it needs the architecture's per-opcode
+//!   lockable list plus the destination-must-be-memory rule, on a core that
+//!   also has to be an 8086, where `#UD` does not exist at all.
+//!
+//! [`AddressSpace::bus_lock`]: crate::core::space::AddressSpace::bus_lock
 //! - **The accessed bit** is set when a selector is loaded by `MOV Sreg` or by
 //!   a far transfer to a code segment, but not by the segment loads a gate,
 //!   an `IRET` or a task switch performs. Hardware sets it in all of them.

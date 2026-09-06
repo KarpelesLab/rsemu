@@ -190,11 +190,13 @@ pub const BACKEND: Backend = if cfg!(all(feature = "std", not(target_family = "w
 /// The ladder, outermost first, follows the direction calls travel:
 ///
 /// ```text
-/// MACHINE -> TOPOLOGY -> SCHED -> BUS -> DEVICE -> WIRE -> POOL -> LEAF
+/// MACHINE -> TOPOLOGY -> SCHED -> BUS -> BUS_LOCK -> DEVICE -> WIRE -> POOL -> LEAF
 /// ```
 ///
 /// The scheduler dispatches an access into a bus, which routes it to a device,
-/// which drives a wire. [`LockRank::WIRE`] sits *below* [`LockRank::DEVICE`]
+/// which drives a wire. [`LockRank::BUS_LOCK`] sits between the second and the
+/// third because a core asserts it while already driving the bus and before it
+/// reaches any device. [`LockRank::WIRE`] sits *below* [`LockRank::DEVICE`]
 /// even though a wire also delivers back into devices, because the re-entrancy
 /// contract requires the wire's own lock to be released before its observers
 /// are called — so the reverse edge never exists while a lock is held.
@@ -223,6 +225,40 @@ impl LockRank {
 
     /// A bus fabric's routing state.
     pub const BUS: LockRank = LockRank(0x4000);
+
+    /// The **bus lock** of one coherence domain: exclusion held across the
+    /// read *and* the write of one indivisible read-modify-write.
+    ///
+    /// Between [`LockRank::BUS`] and [`LockRank::DEVICE`] because that is
+    /// where the call graph puts it, and both bounds are tight:
+    ///
+    /// * **Above `BUS`**, because a CPU core takes it while already holding
+    ///   its own `BUS`-ranked execution lock — it is a bus master asserting a
+    ///   signal on the fabric it is already driving, not a second fabric.
+    /// * **Below `DEVICE`**, because a locked access to an MMIO region reaches
+    ///   a device handler while it is held, and that handler takes its own
+    ///   `DEVICE`-ranked lock.
+    ///
+    /// The reverse edge — a device reaching back for a bus lock — never
+    /// exists: only a CPU takes one, and only at an instruction boundary,
+    /// before it has issued any access. That is the invariant that makes this
+    /// a rank rather than a cycle, and
+    /// [`AddressSpace::bus_lock`](crate::core::space::AddressSpace::bus_lock)
+    /// states it where it is upheld.
+    ///
+    /// The access path's own topology guard is *below* this and is taken
+    /// underneath it, which is legal only because it is a try-lock and
+    /// [`LockRank::enter_nonblocking`] does not check the order.
+    ///
+    /// The number is `0x4100` and not the round `0x4800` the spacing
+    /// convention would suggest, because the band between `BUS` and `DEVICE`
+    /// is where every bus fabric already lives — SPI's at `0x4400`, I²C's at
+    /// `0x4500`, USB's at `0x4b00`, and half a dozen more. A locked access
+    /// reaches those fabrics *while this is held*, so this has to be below all
+    /// of them, which means immediately above `BUS`. `0x4800` was the first
+    /// choice and would have collided outright with `spi::SHIFTER_RANK` and
+    /// two PPU engine locks.
+    pub const BUS_LOCK: LockRank = LockRank(0x4100);
 
     /// A device model's own state — the common case for a device author.
     pub const DEVICE: LockRank = LockRank(0x5000);
@@ -258,6 +294,7 @@ impl LockRank {
             LockRank::TOPOLOGY => "TOPOLOGY",
             LockRank::SCHED => "SCHED",
             LockRank::BUS => "BUS",
+            LockRank::BUS_LOCK => "BUS_LOCK",
             LockRank::DEVICE => "DEVICE",
             LockRank::WIRE => "WIRE",
             LockRank::POOL => "POOL",
@@ -2150,6 +2187,7 @@ mod tests {
             LockRank::TOPOLOGY,
             LockRank::SCHED,
             LockRank::BUS,
+            LockRank::BUS_LOCK,
             LockRank::DEVICE,
             LockRank::WIRE,
             LockRank::POOL,
@@ -2166,6 +2204,15 @@ mod tests {
         assert!(LockRank::UNCHECKED < LockRank::MACHINE);
         assert!(ladder.iter().all(|rank| rank.name().is_some()));
         assert!(LockRank::new(0x1234).name().is_none());
+        // A name is how a violation panic identifies the rung it caught, so
+        // two rungs answering to one name is a diagnostic that misleads —
+        // which is easy to write by accident when a rung is inserted between
+        // two existing ones by copying the line above it.
+        for (i, a) in ladder.iter().enumerate() {
+            for b in &ladder[i + 1..] {
+                assert_ne!(a.name(), b.name(), "{a:?} and {b:?} share a name");
+            }
+        }
     }
 
     #[cfg(debug_assertions)]

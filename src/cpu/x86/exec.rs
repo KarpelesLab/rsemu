@@ -1541,7 +1541,45 @@ impl<'a> Exec<'a> {
         }
         self.prepare_ea(&fields);
         self.charge(fields.insn.op.clocks());
+        // `LOCK#` asserted: hold the space's bus lock across the whole
+        // instruction, so that its read and its write are one indivisible
+        // transaction to every other master on the space. Here rather than
+        // around either access, because *both* halves have to be inside it —
+        // and before the instruction has issued anything, which is the
+        // invariant `LockRank::BUS_LOCK` rests on. It is released on every way
+        // out, a fault included, which is why the guard has no name: a locked
+        // instruction that faults gives the bus back before the exception
+        // frame is pushed, exactly as hardware does.
+        //
+        // `self.mem` is copied out first. It is a `&'a AddressSpace`, so the
+        // copy borrows the *space* for `'a` rather than borrowing `self`, and
+        // `execute` can still take `&mut self` underneath the guard.
+        if Self::locks_the_bus(&fields) {
+            let mem = self.mem;
+            let _bus = mem.bus_lock().acquire();
+            return self.execute(&fields);
+        }
         self.execute(&fields)
+    }
+
+    /// Whether this instruction asserts `LOCK#`.
+    ///
+    /// Two sources, both *Intel SDM* volume 2:
+    ///
+    /// * an explicit `F0` prefix — or `F1`, which drives the same pin because
+    ///   bit 0 is not decoded; and
+    /// * `XCHG` with a memory operand, which is locked **implicitly**, prefix
+    ///   or not. It is the only instruction that is.
+    ///
+    /// A memory operand in both cases: without one there is no bus
+    /// transaction to make indivisible. The rule is deliberately coarser than
+    /// the architecture's list of lockable opcodes — `LOCK MOV [m], r` takes
+    /// the bus here where hardware raises `#UD` — because over-approximating
+    /// costs a mutex on an instruction a real guest does not emit, while the
+    /// exact table would have to be maintained against the `#UD` this core
+    /// does not raise anyway (see `cpu::x86`'s "What is not modelled").
+    fn locks_the_bus(f: &Fields) -> bool {
+        f.modrm.is_some_and(|m| !m.is_register()) && (f.lock || f.insn.op == Op::XCHG)
     }
 
     /// Compute the memory operand's address once, before execution.
@@ -1924,16 +1962,15 @@ impl<'a> Exec<'a> {
                 };
                 self.write_arg(f, insn.dst, size, value)?;
             }
-            // The three read-modify-writes, and each is a **read then a
-            // write** with a window between them. That is what the crate
-            // documentation's `LOCK` entry is about: sound while one core runs
-            // a whole instruction at a time, and not sound under
-            // `ThreadingMode::Parallel`, where a sibling's store lands in the
-            // window and is lost. Closing it needs an atomic read-modify-write
-            // on guest-physical memory, which `core::space` has not got — and
-            // *not* the exclusive monitor the other two cores want, because
-            // x86 has no reservation to break and no failure outcome to
-            // report. See `cpu::x86`'s "What is not modelled".
+            // The three read-modify-writes, and each is still a **read then a
+            // write** with a window between them — but the window is now
+            // closed against another master's locked access, because
+            // `instruction` holds the space's `BusLock` across the whole of
+            // one of these whenever `LOCK#` is asserted (and `XCHG` with a
+            // memory operand asserts it with no prefix at all). A *plain*
+            // store by a sibling can still land in the window; see
+            // `core::space::BusLock`'s "What it does not make atomic" for why
+            // that is where the line is drawn.
             Op::XCHG => {
                 let a = self.read_arg(f, insn.dst, size)?;
                 let b = self.read_arg(f, insn.src, size)?;

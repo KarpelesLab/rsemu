@@ -2830,6 +2830,113 @@ fn xadd_and_cmpxchg_are_the_486_atomics_the_manual_describes() {
     assert_eq!(regs.rax, 5, "and the accumulator takes its value");
 }
 
+// ---------------------------------------------------------------------------
+// The bus lock
+// ---------------------------------------------------------------------------
+//
+// `tests/x86_bus_lock.rs` is the guest-level instrument — two cores on two host
+// threads, and a counter that used to come out short. These pin the decisions
+// that instrument cannot see: *which* instructions assert `LOCK#`, that an
+// ordinary one asserts nothing, and that a fault gives the bus back.
+
+/// `LOCK` on a memory read-modify-write takes the space's bus lock, and an
+/// ordinary store does not.
+///
+/// The second half is the cost claim: the lock is affordable precisely because
+/// nothing but a locked access ever reaches it.
+#[test]
+fn a_lock_prefix_takes_the_bus_and_an_ordinary_store_does_not() {
+    let pc = pc386();
+    pc.start_protected();
+    let space = pc.cpu.space().expect("attached");
+    pc.write(
+        at::CODE0,
+        &[
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xa3, 0x00, 0x70, 0x00, 0x00, // mov [MARK], eax
+            0xf0, 0x0f, 0xc1, 0x05, 0x00, 0x70, 0x00, 0x00, // lock xadd [MARK], eax
+            0xf4,
+        ],
+    );
+    pc.cpu.step();
+    pc.cpu.step();
+    assert_eq!(
+        space.bus_lock().taken(),
+        0,
+        "a `mov` to memory is not a locked transaction"
+    );
+    pc.cpu.step();
+    assert_eq!(space.bus_lock().taken(), 1, "and `lock xadd` is");
+    assert!(
+        !space.bus_lock().held(),
+        "released when the instruction ended"
+    );
+    assert_eq!(pc.read32(at::MARK), 2, "the increment still lands");
+    assert_eq!(pc.regs().rax, 1, "and the old value comes back");
+}
+
+/// `XCHG` with a memory operand is locked **implicitly** — prefix or not.
+///
+/// *Intel SDM* volume 2, `XCHG`: if a memory operand is referenced, the
+/// processor's locking protocol is implemented automatically for the duration
+/// of the exchange, whether or not a `LOCK` prefix is present. It is the only
+/// instruction with that property, and a guest that spins on
+/// `xchg [lock], eax` — which is what a hand-written spinlock does — depends
+/// on it.
+#[test]
+fn xchg_with_memory_is_locked_without_a_prefix_and_between_registers_is_not() {
+    let pc = pc386();
+    pc.start_protected();
+    let space = pc.cpu.space().expect("attached");
+    pc.write32(at::MARK, 0x1234);
+    pc.write(
+        at::CODE0,
+        &[
+            0xb8, 0x99, 0x00, 0x00, 0x00, // mov eax, 0x99
+            0x87, 0x05, 0x00, 0x70, 0x00, 0x00, // xchg [MARK], eax
+            0x87, 0xd8, // xchg eax, ebx
+            0xf4,
+        ],
+    );
+    pc.cpu.step();
+    pc.cpu.step();
+    assert_eq!(space.bus_lock().taken(), 1, "the memory form asserts LOCK#");
+    assert_eq!(pc.read32(at::MARK), 0x99);
+    assert_eq!(pc.regs().rax, 0x1234);
+    pc.cpu.step();
+    assert_eq!(
+        space.bus_lock().taken(),
+        1,
+        "the register form touches no bus and must not take one"
+    );
+}
+
+/// A locked instruction that faults gives the bus back before the exception is
+/// delivered.
+///
+/// Hardware deasserts `LOCK#` when the operation is aborted, and here it
+/// matters more than for accuracy: the guard is dropped on the way out of
+/// `Exec::instruction`, so if it were not, one `#GP` would wedge every other
+/// master on the space forever. The fault is a segment-limit violation, which
+/// is raised inside `execute` — after the bus was taken.
+#[test]
+fn a_locked_instruction_that_faults_releases_the_bus() {
+    let pc = pc386();
+    pc.start_protected();
+    let space = pc.cpu.space().expect("attached");
+    let mut sys = pc.cpu.sys();
+    sys.segs[usize::from(isa::seg::DS)].limit = 0x100;
+    pc.cpu.set_sys(sys);
+    pc.write(
+        at::CODE0,
+        &[0xf0, 0x0f, 0xc1, 0x05, 0x00, 0x70, 0x00, 0x00], // lock xadd [MARK], eax
+    );
+    pc.cpu.step();
+    assert_eq!(space.bus_lock().taken(), 1, "the bus was taken");
+    assert!(!space.bus_lock().held(), "and given back through the fault");
+    assert_eq!(pc.read32(at::MARK), 0, "the store never happened");
+}
+
 #[test]
 fn the_shift_group_gained_an_immediate_count_on_the_80186() {
     let pc = pc386();
