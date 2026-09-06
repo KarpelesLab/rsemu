@@ -77,21 +77,27 @@
 //! cheap — a monitor that may be cleared spuriously would turn `LOCK XADD` into
 //! a wrong answer rather than into a retry.
 //!
-//! The primitive that fits is a **bus lock**: exclusion held across the read
-//! *and* the write of one locked instruction, taken by the core before it
-//! issues either. It belongs on the [`AddressSpace`] too, because a space is
-//! the coherence domain and that is the only thing the two mechanisms have to
-//! agree about — but it is a different object, and its cost lands only on
-//! locked accesses rather than on every store. Ranked, it would sit between
-//! `LockRank::BUS` and `LockRank::DEVICE`: above `BUS` because the core takes
-//! it while holding its own execution lock, and below `DEVICE` because a
-//! `LOCK`ed access to an MMIO region reaches a device handler while it is held.
+//! The primitive that fits is a **bus lock**, and it is
+//! [`BusLock`](super::BusLock), next door: exclusion held across the read *and*
+//! the write of one locked instruction, taken by the core before it issues
+//! either. It is on the [`AddressSpace`] too, because a space is the coherence
+//! domain and that is the only thing the two mechanisms have to agree about —
+//! but it is a different object, and its cost lands only on locked accesses
+//! rather than on every store. It is ranked
+//! [`LockRank::BUS_LOCK`](crate::core::sync::LockRank::BUS_LOCK), between
+//! `BUS` and `DEVICE`: above `BUS` because the core takes it while holding its
+//! own execution lock, and below `DEVICE` because a `LOCK`ed access to an MMIO
+//! region reaches a device handler while it is held.
 //!
 //! The two compose without knowing about each other, which is the argument for
 //! one owner rather than two subsystems: a locked write still goes out through
 //! `SpaceView::write_span`, so it breaks reservations on its way past, and an
-//! x86 core sharing a space with an AArch64 one — `machines/tests/heterogeneous.machine`
-//! is that board — gets that for free without ever registering a slot here.
+//! x86 core sharing a space with a core that has reservations gets that for
+//! free without ever registering a slot here. No board in the tree is that
+//! board yet — `machines/tests/heterogeneous.machine` is a RISC-V hart and a
+//! 6502, and an earlier draft of this paragraph named it wrongly — so the
+//! claim is pinned by `BusLock`'s own
+//! `a_locked_write_still_breaks_a_sibling_reservation` instead.
 //!
 //! # It is derived state and it is not serialized
 //!

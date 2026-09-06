@@ -195,6 +195,7 @@
 //! [`LockRank::DEVICE`]: crate::core::sync::LockRank::DEVICE
 
 mod attrs;
+mod buslock;
 mod dispatch;
 mod flat;
 mod monitor;
@@ -205,6 +206,7 @@ mod store;
 mod tests;
 
 pub use attrs::{AccessConstraints, MemAttrs, MemOps, MemResult, Perms, RequesterId};
+pub use buslock::{BusLock, BusLockGuard};
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
 pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView};
 pub use monitor::{
@@ -376,6 +378,13 @@ pub struct AddressSpace {
     unassigned_count: AtomicU64,
     unassigned_last: AtomicU64,
     unassigned_last_write: AtomicU64,
+    /// The bus lock every master on this space contends for.
+    ///
+    /// **Last, deliberately.** Nothing on the read or write path reads it, so
+    /// its only possible cost to an ordinary access is having moved a field
+    /// that *is* on that path — `monitor`'s summary word above all — onto a
+    /// different cache line. At the end of the struct it moves nothing.
+    bus_lock: BusLock,
 }
 
 impl AddressSpace {
@@ -410,6 +419,7 @@ impl AddressSpace {
             unassigned_count: AtomicU64::new(0),
             unassigned_last: AtomicU64::new(0),
             unassigned_last_write: AtomicU64::new(0),
+            bus_lock: BusLock::new(),
         }
     }
 
@@ -474,6 +484,29 @@ impl AddressSpace {
     #[must_use]
     pub fn monitor(&self) -> &ExclusiveMonitor {
         &self.monitor
+    }
+
+    /// The **bus lock**: exclusion across the read *and* the write of one
+    /// indivisible read-modify-write, for the masters of this space.
+    ///
+    /// A space is one coherence domain, so it owns this for the same reason it
+    /// owns [`monitor`](AddressSpace::monitor) — and it is a different object
+    /// for the reason [`BusLock`] opens with:
+    /// x86's `LOCK` is pessimistic and unconditional, and cannot be served by
+    /// a reservation that is licensed to fail spuriously.
+    ///
+    /// `space.bus_lock().acquire()` at an instruction boundary, before the
+    /// instruction has issued any access; hold the guard until it ends. That
+    /// ordering is not advice — it is the invariant that keeps
+    /// [`LockRank::BUS_LOCK`] a rank rather than a cycle, because it means no
+    /// finer-ranked lock is ever held by a master waiting for the bus.
+    ///
+    /// Nothing on the access path consults it, so an unlocked store pays
+    /// nothing.
+    #[inline]
+    #[must_use]
+    pub fn bus_lock(&self) -> &BusLock {
+        &self.bus_lock
     }
 
     /// Address width in bits.
