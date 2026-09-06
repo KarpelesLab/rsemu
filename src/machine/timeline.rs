@@ -89,18 +89,32 @@
 //!
 //!   | policy | a rewind is |
 //!   | --- | --- |
-//!   | *capture* | **sound** — the bytes are inside the keyframe, and the restore writes them back over the medium |
+//!   | *capture* | **sound**, and it writes — the bytes are inside the keyframe, and the restore puts them back over the medium, host file included |
 //!   | *refuse* | **impossible, loudly** — the first [`Timeline::snapshot`] fails, before any history exists to rewind through |
-//!   | *reference* | **unsound, silently** — the image is outside the snapshot, and the restore checks an identity string rather than the contents |
+//!   | *reference*, medium read-only | **sound** — the guest could not have changed the image, because every write to it was `BusError::Protected` |
+//!   | *reference*, medium writable | **unsound, silently** — the image is outside the snapshot, and the restore checks an identity string rather than the contents |
 //!
-//!   So the remaining hazard is one row wide, and it is the row a file-backed
-//!   writable image defaults to. A caller that wants rewind over a real disk
-//!   asks for *capture* and pays the capacity per keyframe; a caller that
-//!   cannot afford that gets *reference* and a rewind that restores the
-//!   machine's idea of the disk without restoring the disk. Closing that row
-//!   needs copy-on-write overlays — an image snapshot taken with the machine
-//!   snapshot — which §7.1 still lists as outstanding and which is `fstool`
-//!   work rather than rsemu-on-top work.
+//!   The table used to have three rows, and splitting the last one is not a
+//!   quibble: *reference* is the default for **every** file-backed image, and
+//!   an installer ISO, a `--drive …,ro` disk and a mask ROM are all in the row
+//!   that is fine. What is left in the unsound row is a writable image, which
+//!   is narrower than "the default", and it is worth saying which one a caller
+//!   is in before they reach for *capture*. A caller who does reach for it pays
+//!   the capacity per keyframe **and** accepts that a restore rewrites the host
+//!   file — `ata.disk`'s load is a `write_at(0, …)` over the whole medium, so
+//!   *capture* is sound for the machine at the price of being destructive to
+//!   the file. Closing the writable row properly needs copy-on-write overlays —
+//!   an image snapshot taken with the machine snapshot — which §7.1 still lists
+//!   as outstanding and which is `fstool` work rather than rsemu-on-top work.
+//!
+//!   The unsound row is one row wide but not one *shape* wide, and the
+//!   difference matters to anyone debugging a rewind. For `ata.disk` and
+//!   `dev-nvme` the file **is** the storage, so a rewind simply does not move
+//!   it: the guest reads the disk of the future. For `dev-flash-cfi` the array
+//!   is a RAM copy of the file, and a referencing load calls
+//!   `reload_from_medium` — so the rewind actively refills the bank from the
+//!   file as it stands *now*, which reaches the same wrong answer by writing
+//!   rather than by omitting.
 //!
 //!   [`Timeline`] cannot check which row a machine is in, and that is
 //!   deliberate rather than missing: a `Snapshot` lives behind the
@@ -111,6 +125,40 @@
 //!   *does* reach here is the loud case: a `refuse` medium makes
 //!   [`Machine::save`](crate::machine::Machine::save) fail, so the first
 //!   snapshot refuses and no history is silently unrewindable.
+//!
+//! # Which machines can be rewound at all
+//!
+//! Narrower than it looks, and the narrowing is structural rather than a gap.
+//! A [`Timeline`] holds a [`Recorder`] and refuses a machine driven by a
+//! different one ([`Timeline::run_until`]), so rewind is available exactly
+//! where [`Machine::set_recorder`](crate::machine::Machine::set_recorder) is —
+//! and that refuses any machine whose threading mode is not
+//! [`ThreadingMode::Deterministic`](crate::core::sched::ThreadingMode::Deterministic).
+//! So:
+//!
+//! * **`deterministic`** — rewindable, whatever the processor count. A
+//!   two-processor board is no harder than a one-processor one here, because
+//!   the whole machine is one snapshot and one log.
+//! * **`parallel`** — not rewindable, and it cannot be: two CPU threads
+//!   interleave inside a round in an order no input log records
+//!   ([`core::record`](crate::core::record)). `Machine::save` still works —
+//!   `tests/parallel_threading.rs` snapshots under `stop_the_world` — so a
+//!   *snapshot* of a parallel machine is a real thing and a *rewind* of one is
+//!   not.
+//! * **`accel`** — likewise not rewindable, by the same refusal. A KVM board's
+//!   chunk is the interpreter's own, byte for byte
+//!   (`tests/kvm_smp.rs`), so an accelerated machine snapshots and migrates to
+//!   an interpreted one; what it cannot have is a timeline over it.
+//!
+//! Two further limits worth stating where the reader is:
+//!
+//! * The keyframes are **in memory and unbounded** until
+//!   [`Timeline::forget_before`] is called. [`Timeline::bytes_held`] is the
+//!   number to watch; nothing here caps it.
+//! * Nothing in `src/bin/rsemu.rs` reaches this module. `rsemu run` can record
+//!   and replay an input log (`--record-input`, `--replay-input`) but has no
+//!   subcommand that writes a snapshot, reads one back, or rewinds. Phase 9's
+//!   "rewind demo" is a library call today, not a command.
 //!
 //! # Example
 //!

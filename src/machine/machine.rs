@@ -993,6 +993,16 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Both sequences come from the forest's own enumeration, in creation order, so
 /// the writer and the reader agree without either of them having to have kept a
 /// list of handles.
+///
+/// A domain's **sub-tick phase** is not written here and does not need to be:
+/// it is `unit_position % units_per_tick`, so the oscillator positions above
+/// determine it, and [`ClockForest::restore_ticks`] reconstructs it rather than
+/// zeroing it. That holds because nothing in the tree calls `set_rating`,
+/// `reparent` or `set_gated`, which are the only three things that would make a
+/// domain's phase independent of its tree's position. The first caller of one
+/// of those has to add the phase to this chunk — and bump
+/// [`MACHINE_STATE_VERSION`] and write the migration, which is why the
+/// condition is recorded here rather than left to be rediscovered.
 fn save_clocks(forest: &ClockForest, sink: &mut impl Sink) -> Result<()> {
     let oscillators: Vec<_> = forest.oscillators().collect();
     sink.write_seq_len(oscillators.len() as u64)?;

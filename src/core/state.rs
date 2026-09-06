@@ -66,6 +66,42 @@
 //! steps that *are* registered. A newer-than-supported chunk is refused —
 //! snapshots move forwards only.
 //!
+//! **The mechanism is here and the table is empty.** As of this writing
+//! [`Migrations::register`] is called nowhere outside this module's own tests;
+//! [`Machine::load`](crate::machine::Machine::load) passes
+//! `Migrations::new()`, and no caller in the tree reaches for
+//! [`Machine::load_with`](crate::machine::Machine::load_with). Meanwhile class
+//! versions have moved: `cpu.x86` is at 8, `cpu.arm` at 3, `nes.ppu` at 4,
+//! `cpu.mos6502` at 4. Every one of those bumps orphaned every snapshot an
+//! earlier build had written — cleanly, with a message naming the gap, but
+//! orphaned. So the sentence §4.5 opens with is currently true of this tree in
+//! the way it did not intend: the *versions* are decoration until somebody
+//! writes the steps between them.
+//!
+//! That is a deliberate position rather than an oversight while snapshots are
+//! not a user-facing artefact — no shipped binary writes one, so no snapshot
+//! from an older build exists to be migrated. It stops being defensible the
+//! moment `rsemu` grows a save-state command, and §4.5 names what the test then
+//! has to be: **a cross-version load from a committed fixture**, not a
+//! round-trip. The fixture test in this file
+//! (`a_v1_fixture_loads_into_a_v2_build`) is that shape for a toy class and is
+//! the template.
+//!
+//! # The shape does not record features or architectures
+//!
+//! [`MachineShape`] can carry a feature set and a guest-architecture list —
+//! §4.5's machine header names both — and nothing populates them:
+//! [`MachineShape::add_feature`] and [`MachineShape::add_arch`] are called only
+//! from tests. A shape in this tree is device classes at instance paths plus
+//! region layout, and that is the right identity rather than a missing half:
+//! the execution engine is a *property* of a CPU instance and not part of its
+//! class, so a snapshot must cross between an `interp` build and a `jit` build
+//! — `tests/{riscv_virt,x86,a64}_engines.rs` assert exactly that — and a
+//! feature set in the fingerprint would refuse it. The guest architectures are
+//! implied by the CPU classes already present. Populating either field is
+//! therefore a change that needs an argument, and it would rewrite every
+//! snapshot's header bytes, hence every state hash, hence `tests/goldens/`.
+//!
 //! # Seams left open on purpose
 //!
 //! - **Compression** (`compcol`, zstd) and **integrity/encryption**
