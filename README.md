@@ -539,12 +539,24 @@ state hash:
 
 All three engines produce byte-identical guest output — 653 console lines on the
 x86 run, ending 900,000 virtual milliseconds in at the same `CS:RIP`, `CR2`,
-`CR3`, `CR4`, `EFER` and flags, having executed the same 358,890,354 blocks from
-the same 228,714 translations. **97.3% of the x86 guest's instructions retire
-inside a translated block** (1,749,569,660 of 1,798,236,276, up from 84.5% one
-round ago), **97.96% of the
-AArch64 guest's** (153,130,249), and 99.8% of compiled RISC-V stores write guest
-RAM inline rather than through a call (1,749,886 of 1,753,140). The RISC-V
+`CR3`, `CR4`, `EFER` and flags, having executed the same blocks from the same translations.
+
+**A block now leaves on its tick allowance instead of being refused for a bound
+it might have exceeded.** A block used to have to prove its *worst case* fitted
+what remained of the scheduler quantum, so the last part of every quantum
+admitted nothing — and two independent profiles found that guard, not the
+unlifted encodings, was the dominant cost of interpretation. With
+`IrHost::spent` asked at each instruction boundary, the guard's share is zero:
+
+| | before | after |
+|---|---|---|
+| x86 retired in blocks | 97.3% | **99.3%** (12,248,632 interpreted, was 48,592,900) |
+| AArch64 retired in blocks | 97.5% | **99.4%** (6,012,343 interpreted, was 26,356,169) |
+
+What is left on x86 is the exclusion list plus 0.35 M interrupt shadows and
+pins. On AArch64 it is 6.0 M outside the lifted subset, 1,614 first-sighting
+lifts and 292 interrupts. 99.8% of compiled RISC-V stores still write guest RAM
+inline rather than through a call (1,749,886 of 1,753,140). The RISC-V
 headline *fell* from 2.28× to 2.15× along the way, because the interpreter it is
 measured against got **1.27× faster** (155.1 s → 122.3 s) and the control moved;
 the numbers and that argument are in
