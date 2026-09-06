@@ -2918,6 +2918,141 @@ fn a_shift_by_the_whole_element_width_is_allowed() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The non-saturating scalar shifts by an immediate
+// ---------------------------------------------------------------------------
+//
+// A doubleword and nothing else — the architecture pins `immh<3>` and so does
+// every row's mask — and both directions, which is what makes them a format of
+// their own rather than rows of the saturating one. `libc.so.6`'s `strtold`
+// builds a NaN payload with seventeen of them and `libm` seven more.
+//
+// Every word below is `llvm-mc -triple=aarch64`'s encoding of the assembly in
+// its comment.
+
+/// `shl d0, d1, #32`.
+const SHL_D: u32 = 0x5f60_5420;
+/// `sshr d0, d1, #64`.
+const SSHR_D64: u32 = 0x5f40_0420;
+/// `ushr d0, d1, #1`.
+const USHR_D1: u32 = 0x7f7f_0420;
+/// `ssra d0, d1, #7`.
+const SSRA_D: u32 = 0x5f79_1420;
+/// `usra d0, d1, #64`.
+const USRA_D64: u32 = 0x7f40_1420;
+/// `srshr d0, d1, #4`.
+const SRSHR_D: u32 = 0x5f7c_2420;
+/// `urshr d0, d1, #64`.
+const URSHR_D64: u32 = 0x7f40_2420;
+/// `srsra d0, d1, #1`.
+const SRSRA_D: u32 = 0x5f7f_3420;
+/// `ursra d0, d1, #3`.
+const URSRA_D: u32 = 0x7f7d_3420;
+/// `sri d0, d1, #64`.
+const SRI_D64: u32 = 0x7f40_4420;
+/// `sli d0, d1, #63`.
+const SLI_D63: u32 = 0x7f7f_5420;
+
+/// Every one of those decodes, and disassembles back to `llvm-mc`'s own text.
+#[test]
+fn the_scalar_shift_immediates_decode_and_print() {
+    let features = Config::neoverse_n1().features;
+    let cases: &[(u32, &str)] = &[
+        (SHL_D, "shl\td0, d1, #32"),
+        (SSHR_D64, "sshr\td0, d1, #64"),
+        (USHR_D1, "ushr\td0, d1, #1"),
+        (SSRA_D, "ssra\td0, d1, #7"),
+        (USRA_D64, "usra\td0, d1, #64"),
+        (SRSHR_D, "srshr\td0, d1, #4"),
+        (URSHR_D64, "urshr\td0, d1, #64"),
+        (SRSRA_D, "srsra\td0, d1, #1"),
+        (URSRA_D, "ursra\td0, d1, #3"),
+        (SRI_D64, "sri\td0, d1, #64"),
+        (SLI_D63, "sli\td0, d1, #63"),
+    ];
+    for (word, text) in cases {
+        assert!(
+            super::isa::decode(*word, features).is_some(),
+            "{word:08x} does not decode"
+        );
+        assert_eq!(super::disasm::disassemble(*word, 0, features).text, *text);
+    }
+}
+
+/// `immh<3>` clear is `UNDEFINED` for all eleven, and the *mask* is what
+/// refuses it: there is no rule in the interpreter to get wrong, because the
+/// table never matches the row.
+///
+/// The control that makes this say anything is the pair — the same opcode with
+/// `immh<3>` set decodes, so what is being tested is the width bit and not the
+/// opcode.
+#[test]
+fn a_scalar_shift_immediate_below_a_doubleword_is_undefined() {
+    let features = Config::neoverse_n1().features;
+    for word in [SHL_D, SSHR_D64, SRI_D64, SLI_D63, SRSHR_D, USRA_D64] {
+        assert!(super::isa::decode(word, features).is_some());
+        // `immh` down from `1xxx` to `0001`, which names a byte everywhere
+        // that a width is allowed and nothing at all here.
+        let narrow = (word & !(0xf << 19)) | (1 << 19);
+        assert!(
+            super::isa::decode(narrow, features).is_none(),
+            "{narrow:08x}: a scalar shift narrower than a doubleword decoded"
+        );
+    }
+}
+
+/// The arithmetic, on the inputs where the two directions and the two
+/// roundings differ from each other.
+///
+/// The **top half of the destination is cleared**, which is what makes these
+/// scalar rather than a one-lane vector operation, and it is asserted by
+/// filling `V0` first: a lanewise implementation over `2D` would leave the
+/// upper doubleword alone and no other assertion here would notice.
+#[test]
+fn the_scalar_shifts_by_an_immediate_do_the_arithmetic() {
+    let cases: &[(u32, u128, u128, u128)] = &[
+        // `SHL D0, D1, #32`: the bits above the doubleword go nowhere.
+        (SHL_D, 0, 0x0000_0001_8000_0000, 0x8000_0000_0000_0000),
+        // `SSHR D0, D1, #64`: a shift by the whole element width, which a
+        // host `>>` has no answer for at all.
+        (SSHR_D64, 0, 0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff),
+        (USHR_D1, 0, u64::MAX as u128, 0x7fff_ffff_ffff_ffff),
+        // `SSRA D0, D1, #7` accumulates into the destination: an arithmetic
+        // shift right of a negative, plus what was already there.
+        (SSRA_D, 100, 0x8000_0000_0000_0000, 0xff00_0000_0000_0064),
+        // `USRA D0, D1, #64` shifts everything away and adds nothing.
+        (USRA_D64, 7, u64::MAX as u128, 7),
+        // `URSHR D0, D1, #64`: the rounding constant is added *before* the
+        // shift, so at the full width it is the only thing left — a
+        // non-rounding shift gives zero here.
+        (URSHR_D64, 0, 0x8000_0000_0000_0000, 1),
+        // ...and one below the full width, where the constant still decides.
+        (SRSHR_D, 0, 0x0000_0000_0000_0008, 1),
+        // `SRSRA D0, D1, #1` rounds and then accumulates: `(-3 + 1) >> 1` is
+        // `-1`, and the two in the destination makes it one. Without the
+        // accumulate it would be `-1`, and without the rounding `-2`.
+        (SRSRA_D, 2, 0xffff_ffff_ffff_fffd, 1),
+        (URSRA_D, 0, 0x0000_0000_0000_0004, 1),
+        // `SRI D0, D1, #64` inserts nothing and keeps everything.
+        (SRI_D64, u64::MAX as u128, 0, u64::MAX as u128),
+        // `SLI D0, D1, #63` moves one bit up and keeps the other sixty-three.
+        (SLI_D63, 0x5555_5555_5555_5555, 1, 0xd555_5555_5555_5555),
+    ];
+    for (word, dest, source, want) in cases {
+        let h = simd(&[*word]);
+        // The upper half of the destination, which every one of these must
+        // clear whatever it held.
+        h.cpu.set_v(0, (0xdead_beef_dead_beef << 64) | *dest);
+        h.cpu.set_v(1, (0xfeed_face_feed_face << 64) | *source);
+        h.steps(1);
+        assert_eq!(
+            h.cpu.v(0),
+            *want,
+            "{word:08x}: on {source:#x} into {dest:#x}"
+        );
+    }
+}
+
 /// `SSHL` shifts left or right depending on the *sign of a byte* in the
 /// second operand, which is why A64 has no vector shift-right-by-register.
 #[test]

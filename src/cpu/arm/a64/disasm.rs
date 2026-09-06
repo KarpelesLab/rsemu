@@ -304,6 +304,8 @@ fn left_shift(op: isa::Op) -> bool {
             | isa::Op::SqshlImmScalar
             | isa::Op::UqshlImmScalar
             | isa::Op::SqshluImmScalar
+            | isa::Op::ShlScalar
+            | isa::Op::SliScalar
     )
 }
 
@@ -1537,6 +1539,19 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 "{letter}{d}, {letter}{n}, #{}",
                 immhb.wrapping_sub(8 << esize)
             );
+        }
+        Fmt::SimdScalarShiftD => {
+            // A doubleword by construction — `immh<3>` is pinned in the row,
+            // so there is no width to read — and the only thing left in
+            // `immh`:`immb` is the amount, in whichever direction the
+            // operation shifts.
+            let immhb = isa::simd_immhb(word);
+            let amount = if left_shift(insn.op) {
+                immhb.wrapping_sub(64)
+            } else {
+                128_u32.wrapping_sub(immhb)
+            };
+            let _ = write!(ops, "d{d}, d{n}, #{amount}");
         }
         Fmt::SimdScalarShiftNarrow => {
             let (esize, immhb) = shift_of(word);

@@ -701,6 +701,18 @@ pub enum Fmt {
     /// `<V>d, <V>n, #shift` — a scalar shift by an immediate, whose width
     /// comes from `immh`.
     SimdScalarShift,
+    /// `Dd, Dn, #shift` — a scalar shift by an immediate that the
+    /// architecture gives a **doubleword and nothing else**.
+    ///
+    /// Separate from [`Fmt::SimdScalarShift`], which has four widths, for the
+    /// same reason [`Fmt::SimdScalarThree`] is separate from
+    /// [`Fmt::SimdScalarThreeSz`] — and here the width rule is in the *mask*:
+    /// every row of this format pins `immh<3>`, so `SSHR B0, B1, #1` does not
+    /// decode at all rather than decoding and being refused by a rule. The
+    /// other difference is direction: these shift both ways, so the amount is
+    /// `immh:immb - 64` for `SHL` and `SLI` and `128 - immh:immb` for the
+    /// rest, which is what [`super::disasm`]'s `left_shift` decides.
+    SimdScalarShiftD,
     /// `<Vb>d, <Va>n, #shift` — a narrowing scalar shift by an immediate.
     SimdScalarShiftNarrow,
     /// `<V>d, <V>n, #0` / `#0.0` — a scalar SIMD compare against zero.
@@ -1732,6 +1744,28 @@ a64! {
     0xff80fc00 0x7f009400 UqshrnScalar "uqshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, saturating unsigned";
     0xff80fc00 0x5f009c00 SqrshrnScalar "sqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating signed";
     0xff80fc00 0x7f009c00 UqrshrnScalar "uqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating unsigned";
+
+    // -- Advanced SIMD: the non-saturating scalar shifts by an immediate -----
+    //
+    // The doubleword-only half of the shift-by-immediate group, and the one a
+    // C library reaches: `libc.so.6`'s `strtold` builds a NaN payload with
+    // `SHL D0, D1, #n` and `USHR`, seventeen times, and `libm` seven more.
+    //
+    // `immh<3>` is pinned in every mask, which is the architecture's
+    // `if immh<3> != '1' then UNDEFINED` written where the table can enforce
+    // it -- the same technique the exclusive pairs above use to refuse their
+    // two unallocated `size` values without a rule.
+    0xffc0fc00 0x5f400400 SshrScalar  "sshr"  SimdScalarShiftD AdvSimd "shift a scalar right, signed";
+    0xffc0fc00 0x7f400400 UshrScalar  "ushr"  SimdScalarShiftD AdvSimd "shift a scalar right, unsigned";
+    0xffc0fc00 0x5f401400 SsraScalar  "ssra"  SimdScalarShiftD AdvSimd "shift a scalar right signed and accumulate";
+    0xffc0fc00 0x7f401400 UsraScalar  "usra"  SimdScalarShiftD AdvSimd "shift a scalar right unsigned and accumulate";
+    0xffc0fc00 0x5f402400 SrshrScalar "srshr" SimdScalarShiftD AdvSimd "shift a scalar right, signed and rounding";
+    0xffc0fc00 0x7f402400 UrshrScalar "urshr" SimdScalarShiftD AdvSimd "shift a scalar right, unsigned and rounding";
+    0xffc0fc00 0x5f403400 SrsraScalar "srsra" SimdScalarShiftD AdvSimd "shift a scalar right signed and rounding, and accumulate";
+    0xffc0fc00 0x7f403400 UrsraScalar "ursra" SimdScalarShiftD AdvSimd "shift a scalar right unsigned and rounding, and accumulate";
+    0xffc0fc00 0x7f404400 SriScalar   "sri"   SimdScalarShiftD AdvSimd "shift a scalar right and insert";
+    0xffc0fc00 0x5f405400 ShlScalar   "shl"   SimdScalarShiftD AdvSimd "shift a scalar left";
+    0xffc0fc00 0x7f405400 SliScalar   "sli"   SimdScalarShiftD AdvSimd "shift a scalar left and insert";
 
     // -- Advanced SIMD: the scalar integer conversions ------------------------
     //
