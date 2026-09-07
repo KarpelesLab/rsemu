@@ -29,7 +29,7 @@
 use alloc::sync::Arc;
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs, MonitorSlot};
+use crate::core::space::{AccessPurpose, AddressSpace, BusLockGuard, MemAttrs, MonitorSlot};
 use crate::core::sync;
 use crate::core::value::Width;
 use crate::float::{Env, Flags, Round};
@@ -959,22 +959,29 @@ impl<'a> Exec<'a> {
 
     /// One read that does not cross a page boundary.
     fn read_once(&mut self, va: u64, width: Width, kind: Access) -> Result<u64, Trap> {
-        self.read_once_at(va, width, kind).map(|(value, _)| value)
+        let pa = self.translate_for(va, kind)?;
+        self.read_at(va, pa, width, kind)
     }
 
-    /// [`Exec::read_once`], also reporting where the access landed.
+    /// Translate for a data or fetch access, reporting the right kind of
+    /// abort.
     ///
-    /// The load-exclusives are the only callers that need the physical
-    /// address: the global monitor is keyed on it, because two cores
+    /// Apart from [`Exec::read_once`] the callers are the load-exclusives,
+    /// which need the physical address *before* the read issues rather than
+    /// alongside its result — [`Exec::reserve_then_read`] is why, and the
+    /// global monitor is keyed on the physical address because two cores
     /// contending for one lock reach it through their own translation regimes
-    /// and a virtual key would not collide. Surfaced from here rather than
-    /// translated a second time, which would charge a second walk on a TLB
-    /// miss.
-    fn read_once_at(&mut self, va: u64, width: Width, kind: Access) -> Result<(u64, u64), Trap> {
-        let pa = self.translate(va, kind).map_err(|f| match kind {
+    /// and a virtual key would not collide. Doing it here rather than
+    /// translating a second time is what stops a TLB miss being charged twice.
+    fn translate_for(&mut self, va: u64, kind: Access) -> Result<u64, Trap> {
+        self.translate(va, kind).map_err(|f| match kind {
             Access::Fetch => self.insn_abort(va, f),
             _ => self.data_abort(va, f, kind),
-        })?;
+        })
+    }
+
+    /// The other half: one read of an already translated address.
+    fn read_at(&mut self, va: u64, pa: u64, width: Width, kind: Access) -> Result<u64, Trap> {
         self.charge();
         // The bus is told which of the two reasons for reading this is, so a
         // mapping without `Perms::EXEC` refuses a fetch and answers a load.
@@ -983,7 +990,7 @@ impl<'a> Exec<'a> {
             _ => self.attrs,
         };
         match self.space.read(pa, width, attrs) {
-            Ok(v) => Ok((v, pa)),
+            Ok(v) => Ok(v),
             Err(_) => {
                 self.st.faults = self.st.faults.wrapping_add(1);
                 Err(match kind {
@@ -1092,6 +1099,61 @@ impl<'a> Exec<'a> {
         self.st.exclusive = Some(va >> 4);
         if let Some(monitor) = self.monitor {
             monitor.reserve(pa);
+        }
+    }
+
+    /// The load half of a load-exclusive: claim the granule, **then** read it.
+    ///
+    /// # Why that order, which is not the one this used to be in
+    ///
+    /// DDI 0487 B2.9 makes the reservation part of the load — one access takes
+    /// the granule and returns its contents. Reserving *after* the read leaves
+    /// a window one access wide in which another observer's store is invisible
+    /// to the monitor, because this core's slot is not live yet and
+    /// `ExclusiveMonitor::note_store` walks live slots only:
+    ///
+    /// ```text
+    /// core 0                      core 1
+    /// ldxr: read [x0] -> 5
+    ///                             stadd [x0]: 5 -> 6   (breaks no slot)
+    /// ldxr: reserve
+    /// ...
+    /// stxr: reservation holds, so it writes 6 — core 1's update is gone
+    /// ```
+    ///
+    /// That is not a lock's problem and no lock fixes it: core 1's store is
+    /// architecturally allowed to be there, and the monitor is exactly the
+    /// object that is supposed to notice it. `tests/a64_lse_atomicity.rs`
+    /// measured this at **46 lost updates of 120 000** with the bus lock
+    /// already closing the other window, and at zero once the order was
+    /// reversed. Reversing it costs nothing — the same translation, the same
+    /// read — which is also why the bus lock is *not* taken across a
+    /// single-register `LDXR`. What a lock would still buy there is an untorn
+    /// *value*, not a correct commit: the reservation now covers the read, so
+    /// anything that raced it fails the `STXR` and the guest goes round again.
+    /// That is `core::space::ExclusiveMonitor`'s own "the commit is protected;
+    /// the value is not", and the tearing underneath it belongs to
+    /// [`RamStore`](crate::core::space::RamStore)'s byte loop rather than to
+    /// this.
+    ///
+    /// # What it changes on a fault
+    ///
+    /// A load-exclusive that translates and then takes an external abort now
+    /// leaves the monitor **cleared** rather than holding what it held before.
+    /// The architecture licenses that directly — B2.9 permits a monitor to be
+    /// cleared spuriously, and a guest's retry loop absorbs it — while the
+    /// alternative it replaces does not exist: leaving the *new* reservation
+    /// standing after a read that never happened would let a later `STXR`
+    /// commit against a granule this core never loaded.
+    fn reserve_then_read(&mut self, va: u64, width: Width) -> Result<u64, Trap> {
+        let pa = self.translate_for(va, Access::Load)?;
+        self.take_reservation(va, pa);
+        match self.read_at(va, pa, width, Access::Load) {
+            Ok(value) => Ok(value),
+            Err(trap) => {
+                self.drop_reservation();
+                Err(trap)
+            }
         }
     }
 
@@ -2316,15 +2378,16 @@ impl<'a> Exec<'a> {
         if fmt == Fmt::LdStExclusive {
             // Aligned by `check_align` above, so the access never splits and
             // the physical address of the whole of it is this one — which is
-            // what the global monitor is keyed on.
+            // what the global monitor is keyed on. The reservation is taken
+            // before the read issues: `Exec::reserve_then_read` has the
+            // interleaving that made the other order lose updates.
             let elem = Width::from_bytes(bytes).ok_or_else(Trap::undefined)?;
-            let (value, pa) = self.read_once_at(addr, elem, Access::Load)?;
+            let value = self.reserve_then_read(addr, elem)?;
             // `LDAXR`, not `LDXR`: the exclusive load carries the same
             // acquire the plain one does when `o0` is set.
             if ordered {
                 self.host_fence();
             }
-            self.take_reservation(addr, pa);
             self.write_reg(t, width, false, value);
             return Ok(());
         }
@@ -2335,22 +2398,35 @@ impl<'a> Exec<'a> {
         // reserved; the global one says whether any observer — this core, a
         // sibling, a DMA engine — has written it since. A `STXR` that ignored
         // the second is the lost update `usermode::proof` reproduces.
+        //
+        // Consulting them and storing are two acts, and the bus lock is what
+        // makes them one. Without it two cores reserve the same granule, both
+        // read their monitors as still holding, and only then does either
+        // store — so both report success and one increment is lost, which is
+        // the same defect the global monitor was built to close, one level
+        // down. The store *does* break the sibling's reservation on its way
+        // out through `SpaceView::write_span`; it is simply too late for a
+        // sibling that has already asked. `tests/a64_lse_atomicity.rs` measured
+        // a few hundred lost of 120 000 before this line existed — rarer than
+        // the `FEAT_LSE` case because the window is one check and one store
+        // rather than a whole read-modify-write, and just as forbidden.
+        //
+        // Only this path takes it. `LDXR` is one naturally aligned load and
+        // `LDAR`/`STLR` are plain accesses; none of them is a read-modify-write
+        // and a lock across one would buy nothing a plain store does not walk
+        // straight past anyway.
+        let _bus = self.lock_bus();
         let status_reg = isa::rm(word);
         let matched = self.reservation_holds(addr);
-        // `STLXR`, not `STXR`: the store carries the same release the plain
-        // one does when `o0` is set, and it carries it whether or not the
-        // reservation held — a release that only fenced on the successful path
-        // would order the guest's earlier accesses on some iterations of a
+        // No fence for `STLXR`'s `o0` here, and no *un*fenced path either: the
+        // guard brackets everything below with a `SeqCst` fence at each end,
+        // whether or not the reservation held. That last part was the point of
+        // the fences it replaces — a release that fenced only on the successful
+        // path would order the guest's earlier accesses on some iterations of a
         // retry loop and not on others.
-        if ordered {
-            self.host_fence();
-        }
         if matched {
             let value = self.read_reg(t, 64, false);
             self.store(addr, bytes, value)?;
-        }
-        if ordered {
-            self.host_fence();
         }
         // The monitor is cleared by the attempt, successful or not.
         self.drop_reservation();
@@ -2400,6 +2476,90 @@ impl<'a> Exec<'a> {
         sync::fence(sync::Ordering::SeqCst);
     }
 
+    /// Take this space's bus lock, to be held until the instruction ends.
+    ///
+    /// # What is broken without it
+    ///
+    /// An atomic instruction here is a **load and then a store** through
+    /// [`AddressSpace`], and the only lock held across the pair is this core's
+    /// own `BUS`-ranked session mutex — which is *per core*, so it excludes
+    /// nothing on a sibling. Two cores incrementing one word with `STADD`:
+    ///
+    /// ```text
+    /// core 0                        core 1
+    /// ldadd: read  [x0] -> 5
+    ///                               ldadd: read  [x0] -> 5
+    /// ldadd: write [x0] <- 6
+    ///                               ldadd: write [x0] <- 6
+    /// ```
+    ///
+    /// One increment is lost, and DDI 0487 B2.2.1 and B2.9 forbid it outright:
+    /// an atomic instruction's read and write are one indivisible access, and
+    /// being indivisible is the whole reason a guest reaches for `FEAT_LSE`
+    /// instead of an `LDXR`/`STXR` loop. `tests/a64_lse_atomicity.rs` measured
+    /// it before this existed — **around 3 000 to 9 000 updates lost of
+    /// 120 000**, two cores on two host threads.
+    ///
+    /// It needs `ThreadingMode::Parallel`, and that is a statement about
+    /// reachability rather than an excuse: `Deterministic` runs every runnable
+    /// on one host thread, so its finest interleaving is one whole instruction
+    /// and nothing at all executes between the two halves. No machine file in
+    /// the tree selects `parallel`; `--threading parallel` does.
+    ///
+    /// # Why the bus lock and not the monitor
+    ///
+    /// The choice is the one [`BusLock`](crate::core::space::BusLock) opens
+    /// with, and `FEAT_LSE` lands on x86's side of it. The
+    /// [`ExclusiveMonitor`](crate::core::space::ExclusiveMonitor) is
+    /// *optimistic*: it is licensed to fail spuriously, and that licence is
+    /// paid for by the guest's own retry loop. An LSE atomic has no status
+    /// register and no retry loop — `LDADD` must simply return the right
+    /// answer — so a monitor that cleared spuriously would turn it into a
+    /// wrong one, exactly as it would `LOCK XADD`. The pessimistic primitive
+    /// is the lock, the space already owns one because a space is one
+    /// coherence domain, and a third mechanism would be a second answer to a
+    /// question that already has one.
+    ///
+    /// # The span
+    ///
+    /// Taken before the instruction issues any access and released when it
+    /// ends, which is what `cpu::x86::exec`'s `instruction` does for a `LOCK`
+    /// prefix and for the same two reasons: both halves have to be inside the
+    /// window, and [`BusLock`](crate::core::space::BusLock) fences at each end,
+    /// so the guard has to open before the first access and close after the
+    /// last one or the barrier lands inside the instruction it brackets. It is
+    /// also the invariant [`LockRank::BUS_LOCK`](crate::core::sync::LockRank)
+    /// rests on — a master waiting for the bus holds no finer-ranked lock —
+    /// and it is why every path out of a locked instruction, a trap included,
+    /// gives the bus back before anything else happens.
+    ///
+    /// # What it still does not close
+    ///
+    /// A **plain** store by a sibling landing between the read and the write,
+    /// which is `BusLock`'s own documented residual: closing it would mean
+    /// every store in the machine taking this lock. A guest that races a plain
+    /// store against an atomic on the same word has a data race in its own
+    /// terms — DDI 0487 B2.9's atomicity is between atomic accesses and the
+    /// architecture's ordering rules, not a defence against unsynchronised
+    /// traffic.
+    ///
+    /// # Cost
+    ///
+    /// One uncontended mutex and the two fences the guard carries, on the
+    /// atomics alone. Nothing on the ordinary load and store path reads it, so
+    /// a board that never executes an atomic pays nothing —
+    /// `docs/platforms/arm64-virt.md` has the number.
+    ///
+    /// The return type is `BusLockGuard<'a>` rather than one borrowed from
+    /// `&self`: [`Exec::space`](Exec) is a `&'a AddressSpace`, so copying it
+    /// out borrows the *space* for `'a` and leaves `self` free to be borrowed
+    /// mutably underneath the guard. `cpu::x86::exec` does the same and says
+    /// so.
+    fn lock_bus(&self) -> BusLockGuard<'a> {
+        let space: &'a AddressSpace = self.space;
+        space.bus_lock().acquire()
+    }
+
     /// `LDXP`, `LDAXP`, `STXP` and `STLXP`: the exclusive **pair**.
     ///
     /// # What the pair form is for
@@ -2419,16 +2579,40 @@ impl<'a> Exec<'a> {
     /// 16-byte reservation granule, which is in turn what lets one monitor
     /// entry cover it.
     ///
-    /// # Single-copy atomicity, honestly
+    /// # Single-copy atomicity, and how far the bus lock carries it
     ///
     /// The architecture requires the 16-byte access to be single-copy atomic,
     /// and this issues it as two eight-byte bus accesses because that is what
-    /// [`AddressSpace`] offers. Nothing can observe the difference here — one
-    /// core, one thread inside the execution lock, and the lock is held across
-    /// both halves — but a second core sharing this address space would be a
-    /// real weakening, and it is written down rather than left to be
-    /// discovered.
+    /// [`AddressSpace`] offers. [`Exec::lock_bus`] is held across both halves,
+    /// which closes the case that matters and leaves one that does not:
+    ///
+    /// * **Against another 16-byte atomic — closed.** The only ways a guest
+    ///   reaches sixteen indivisible bytes are this pair and `CASP`, both of
+    ///   which now hold the bus lock across the whole access, so neither can
+    ///   see the other's halves separately. That is the case the pair exists
+    ///   for: `AtomicU128::compare_exchange` on an Armv8.0 part is an
+    ///   `LDAXP`/`STLXP` loop and nothing else.
+    /// * **Against a plain store — open**, and it is
+    ///   [`BusLock`](crate::core::space::BusLock)'s documented residual rather
+    ///   than something new here. Note there is no plain 16-byte store to race
+    ///   with: `STP` of two `X` registers is *not* single-copy atomic across
+    ///   its sixteen bytes (DDI 0487 B2.2.1 gives it per-register atomicity
+    ///   only), so a guest racing one against a pair has no architectural
+    ///   claim to begin with. What is left is a plain 8-byte `STR` overlapping
+    ///   half the pair, which the architecture does order and this does not —
+    ///   the same line the bus lock draws everywhere else, for the same
+    ///   reason: closing it means every store in the machine taking the lock.
+    ///
+    /// The `STXP` half needed the lock for a second reason, which
+    /// [`Exec::exclusive`] states where it applies to `STXR` too: the
+    /// reservation check and the store are separate acts, and two cores that
+    /// both checked before either stored would both succeed.
     fn exclusive_pair(&mut self, word: u32, fmt: Fmt) -> Result<(), Trap> {
+        // Held across both halves and both directions, before either issues an
+        // access: the load's two reads are one 16-byte access to any other
+        // master that takes the bus, and the store's check and writes are one
+        // transaction. `Exec::lock_bus` has the argument and the span.
+        let _bus = self.lock_bus();
         // `size` is 0b10 or 0b11 here; the table admits no other value.
         let elem = 1u64 << isa::ls_size(word);
         let total = elem * 2;
@@ -2438,27 +2622,34 @@ impl<'a> Exec<'a> {
         let n = isa::rn(word);
         let addr = self.read_reg(n, 64, true);
         let load = fmt == Fmt::LoadExclusivePair;
-        // `o0`, as in `Exec::exclusive`: `LDAXP` and `STLXP` against `LDXP`
-        // and `STXP`.
-        let ordered = isa::bit(word, 15);
+        // `o0` (bit 15) is not read: it separates `LDAXP`/`STLXP` from
+        // `LDXP`/`STXP`, and the guard's fences already bracket the whole
+        // instruction more strongly than either suffix asks for. `Exec::atomic`
+        // has the same note at length.
         let kind = if load { Access::Load } else { Access::Store };
         self.check_align(addr, total, kind, true)?;
 
         if load {
             // Aligned to the *whole* access by `check_align` above, so neither
-            // half splits and both lie in the one granule `pa` names.
+            // half splits and both lie in the one granule the reservation
+            // below is taken on.
             let each = Width::from_bytes(elem).ok_or_else(Trap::undefined)?;
-            let (first, pa) = self.read_once_at(addr, each, Access::Load)?;
-            let second = self
-                .read_once_at(addr.wrapping_add(elem), each, Access::Load)?
-                .0;
-            if ordered {
-                self.host_fence();
-            }
-            // The reservation is taken only once both halves arrived: a fault
-            // on the second must leave the monitor exactly as it was, not
-            // watching a granule the guest never successfully read.
-            self.take_reservation(addr, pa);
+            // Claimed before either half is read, for the reason
+            // `Exec::reserve_then_read` gives — and here it covers the gap
+            // *between* the halves as well, which is the one place a plain
+            // store can still reach a pair the bus lock is holding.
+            let first = self.reserve_then_read(addr, each)?;
+            let second = match self.read_once(addr.wrapping_add(elem), each, Access::Load) {
+                Ok(value) => value,
+                // A fault on the second half leaves the monitor cleared rather
+                // than watching a granule only half of which was read: the
+                // spurious-clear licence again, and the same choice the single
+                // register form makes.
+                Err(trap) => {
+                    self.drop_reservation();
+                    return Err(trap);
+                }
+            };
             self.write_reg(t, width, false, first);
             self.write_reg(t2, width, false, second);
             return Ok(());
@@ -2466,17 +2657,11 @@ impl<'a> Exec<'a> {
 
         let status_reg = isa::rm(word);
         let matched = self.reservation_holds(addr);
-        if ordered {
-            self.host_fence();
-        }
         if matched {
             let first = self.read_reg(t, 64, false);
             let second = self.read_reg(t2, 64, false);
             self.store(addr, elem, first)?;
             self.store(addr.wrapping_add(elem), elem, second)?;
-        }
-        if ordered {
-            self.host_fence();
         }
         self.drop_reservation();
         self.write_reg(status_reg, 32, false, u64::from(!matched));
@@ -2506,6 +2691,12 @@ impl<'a> Exec<'a> {
     /// would compare all thirty-two bits of `Rs` against a loaded byte and
     /// never swap.
     fn atomic(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        // Before anything else, and held to the end of the instruction:
+        // `Exec::lock_bus` has why the read and the write have to be one
+        // indivisible transaction and what a sibling core saw while they were
+        // not. Above the alignment check as well, so the one exit that takes
+        // no access at all still gives the bus back the same way.
+        let _bus = self.lock_bus();
         let bytes = 1u64 << isa::ls_size(word);
         let esize = 8 * bytes as u32;
         let width = if bytes == 8 { 64 } else { 32 };
@@ -2521,23 +2712,26 @@ impl<'a> Exec<'a> {
         // reports a write.
         self.check_align(addr, bytes, Access::Store, true)?;
 
-        // The ordering bits, which [`isa`] deliberately leaves out of every
-        // mask: one row decodes `LDADD`, `LDADDA`, `LDADDL` and `LDADDAL`, so
-        // the *semantics* of the suffix have to be read here. They are not in
-        // the same place in the two encodings — `LD<op>` and `SWP` carry `A`
-        // at bit 23 and `R` at bit 22, while `CAS<A><L>` carries `L` (the
-        // acquire) at bit 22 and `o0` (the release) at bit 15, because bit 23
-        // is fixed in its encoding. `Exec::host_fence` says what the fences
-        // are and why they are `SeqCst`.
+        // There is no `host_fence` in this function and the ordering suffix is
+        // not read, because the guard above already brackets the whole
+        // instruction with a `SeqCst` fence at each end (`BusLock`, "A bus
+        // lock is a barrier"). Those two subsume every fence the suffix could
+        // ask for: the entry fence sits ahead of the read, which is earlier
+        // than a release needs, and the exit fence sits after the write, which
+        // is later than an acquire needs. What it costs is that a *relaxed*
+        // `LDADD` now gets ordering it did not order — the same
+        // over-approximation x86 makes for every `LOCK`-prefixed instruction,
+        // and the price of using one mechanism for indivisibility rather than
+        // two.
+        //
+        // The ordering bits, written down because reinstating a fence would
+        // need them and they are unobvious: [`isa`] deliberately leaves them
+        // out of every mask — one row decodes `LDADD`, `LDADDA`, `LDADDL` and
+        // `LDADDAL` — and they are not in the same place in the two encodings.
+        // `LD<op>` and `SWP` carry `A` at bit 23 and `R` at bit 22, while
+        // `CAS<A><L>` carries `L` (the acquire) at bit 22 and `o0` (the
+        // release) at bit 15, because bit 23 is fixed in its encoding.
         let cas = matches!(op, Op::CasB | Op::CasH | Op::CasW | Op::CasX);
-        let (acquire, release) = if cas {
-            (isa::bit(word, 22), isa::bit(word, 15))
-        } else {
-            (isa::bit(word, 23), isa::bit(word, 22))
-        };
-        if release {
-            self.host_fence();
-        }
 
         if cas {
             let compare = elem(self.read_reg(s, width, false));
@@ -2545,9 +2739,6 @@ impl<'a> Exec<'a> {
             if old == compare {
                 let new = self.read_reg(t, width, false);
                 self.store(addr, bytes, new)?;
-            }
-            if acquire || release {
-                self.host_fence();
             }
             // `Rs` is both the comparand and the destination, and it is
             // written with the old value whether or not the swap happened —
@@ -2582,9 +2773,6 @@ impl<'a> Exec<'a> {
             }
         };
         self.store(addr, bytes, new)?;
-        if acquire || release {
-            self.host_fence();
-        }
         // `Rt == 31` is the `ST<op>` spelling, which discards the old value —
         // and `XZR` discarding it is exactly what `write_reg` already does.
         self.write_reg(t, width, false, old);

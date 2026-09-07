@@ -69,6 +69,29 @@ any observer to the reservation granule clears the slot, so a store-conditional
 that raced anything fails and the guest retries. The x86 locked
 read-modify-write, by `core::space::BusLock`, against *another* locked one.
 
+**Kept, as of this round: the A64 atomics, against each other.** The paragraph
+above was true of the *interval* between a load-reserved and its
+store-conditional and not of the instructions themselves, and the difference
+cost updates. `cpu::arm::a64` issued a `FEAT_LSE` atomic as a separate load and
+store with nothing held across them, checked a `STXR`'s monitor and then stored
+as two acts, and claimed a `LDXR`'s reservation *after* the read had already
+returned — so a sibling's store in any of those three windows went unnoticed.
+Two cores, two host threads, 120 000 increments of one word:
+`tests/a64_lse_atomicity.rs` lost 3 410–8 850 through the first window, 318
+through the second and 46 through the third, and loses none now. The first two
+are closed by `AddressSpace::bus_lock`, held across the whole instruction as
+x86's `LOCK` already was — a `FEAT_LSE` atomic is pessimistic and
+unconditional, which is exactly the case `core::space::BusLock` exists for and
+the case the optimistic monitor cannot serve. The third is closed by taking the
+reservation before the read rather than after it, which costs nothing.
+`docs/platforms/arm64-virt.md` has the interleavings, the reasoning and the
+price (+9 ns an atomic; nothing on the ordinary load and store path).
+
+This is the one thing in this section a test on an x86-64 host can gate, and
+the reason is worth keeping: a lost update is not a reordering. It is a value
+no interleaving could have produced, so no amount of host strength hides it and
+the assertion can be an equality rather than a printed count.
+
 **Not kept: single-copy atomicity.** `RamStore` is a `Vec<AtomicU8>` and every
 access to it is a byte loop, so a naturally aligned four-byte load racing a
 naturally aligned four-byte store can return a mixture of the old and the new
