@@ -574,6 +574,12 @@ impl<'a> Exec<'a> {
     /// deadline the counter can only reach by wrapping — a distance of at
     /// least 2^63 counts, which is beyond any run — and is reported as
     /// [`u64::MAX`].
+    ///
+    /// Gated with `mod engine`, its only caller: the interpreter reaches the
+    /// comparator through `Exec::step`'s own per-instruction check and has no
+    /// use for a precomputed edge, so an interpreter-only build would carry
+    /// this as dead code.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
     pub(super) fn timer_edge(&self) -> u64 {
         let sys = &self.st.sys;
         let count = self.counter();
