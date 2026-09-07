@@ -46,6 +46,8 @@
 #   crosshost  the replay gate on a second architecture (32-bit)
 #   sweep    every feature on its own — long; CI runs it on its own job
 #   fuzz     `cargo fuzz build` (needs a nightly and cargo-fuzz)
+#   long     the engine-divergence long run (needs a fetched arm64 kernel for
+#            its real leg; nightly in CI, not in --all)
 #
 # `combos` is the one that is not a copy of an existing CI step. Cargo features
 # are additive, so `--all-features` compiles every conjunction of them — but it
@@ -66,7 +68,7 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 
-STAGES=(fast test wasm combos crosshost sweep fuzz)
+STAGES=(fast test wasm combos crosshost sweep fuzz long)
 DEFAULT_STAGES=(fast test wasm combos)
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -337,6 +339,56 @@ stage_crosshost() {
   run "crosshost snapshot from $w loaded here" crosshost_read "$out/wasm"
 }
 
+# The long engine-divergence run: the interpreter against each translated
+# engine, quantum by quantum, over a real guest.
+#
+# Not in the default set and not in --all, because the honest version of it
+# needs a fetched Linux kernel and minutes of wall time. Two defects lived past
+# `tests/a64_engines.rs`'s forty quanta *and* past twenty seconds of that boot
+# (docs/testing/long-run.md); the shortest thing that would have caught either
+# is this, and nothing was running it. `.github/workflows/long-run.yml` runs
+# this stage nightly, which is the answer to "an opt-in nobody opts into".
+#
+# With no kernel the run still does something — the synthetic workloads are in
+# the ordinary test suite and this stage just makes them longer — but the real
+# gate skips, and `RSEMU_LONGRUN_REQUIRED` turns that skip into a failure the
+# way `RSEMU_CROSSHOST_REQUIRED` does. CI sets it.
+LONGRUN_FEATURES="machine-arm64-virt,cpu-arm-a64-lift,machine-riscv-virt,cpu-riscv-lift,jit,jit-x86"
+stage_long() {
+  local secs kernel initrd
+  secs="${RSEMU_LONGRUN_SECONDS:-120}"
+  kernel="${RSEMU_ARM64_KERNEL:-testdata/arm64/linux}"
+  initrd="${RSEMU_ARM64_INITRD:-testdata/arm64/initramfs.cpio}"
+
+  # The synthetic workloads, lengthened. No fixture, so this leg always runs.
+  #
+  # Its own budget rather than `$secs`: the synthetic guests are *designed*
+  # around the mechanisms that broke and reach every one of them inside a
+  # second, so a hundred and twenty of them would be a hundred and twenty
+  # seconds of the same thing. What wants the long budget is the kernel, which
+  # is the only leg that can find something nobody designed for.
+  local syn="${RSEMU_LONGRUN_SYNTHETIC_SECONDS:-30}"
+  run "long synthetic (${syn}s of guest time)" \
+    env RSEMU_LONGRUN_SECONDS="$syn" \
+    cargo test --release --features "$LONGRUN_FEATURES" --test engine_longrun
+
+  if [ ! -s "$kernel" ]; then
+    if [ -n "${RSEMU_LONGRUN_REQUIRED:-}" ]; then
+      record "FAIL  long kernel boot -- RSEMU_LONGRUN_REQUIRED is set, so this had to run"
+      FAILED=$((FAILED + 1))
+    else
+      record "skip  long kernel boot (no $kernel: scripts/fetch-testdata.sh arm64-linux arm64-initramfs)"
+    fi
+    return 0
+  fi
+  run "long kernel boot (${secs}s of guest time)" \
+    env RSEMU_ARM64_KERNEL="$kernel" RSEMU_ARM64_INITRD="$initrd" \
+        RSEMU_LONGRUN_SECONDS="$secs" \
+    cargo test --release --features "$LONGRUN_FEATURES" \
+      --test engine_longrun -- --ignored --nocapture --test-threads=1 \
+      a_real_arm64_linux_boot_agrees_across_the_engines
+}
+
 stage_fuzz() {
   if ! cargo +nightly fuzz --version >/dev/null 2>&1; then
     record "skip  fuzz (needs a nightly toolchain and cargo-fuzz)"
@@ -351,7 +403,9 @@ stage_fuzz() {
 want=()
 case "${1:-}" in
   --list) printf '%s\n' "${STAGES[@]}"; exit 0 ;;
-  --all)  want=("${STAGES[@]}") ;;
+  # Deliberately not `long`: it wants a fetched kernel and minutes of wall
+  # time, and `--all` is what somebody runs before a commit.
+  --all)  want=(fast test wasm combos crosshost sweep fuzz) ;;
   "")     want=("${DEFAULT_STAGES[@]}") ;;
   -*)     echo "unknown option $1" >&2; exit 2 ;;
   *)      want=("$@") ;;

@@ -1,0 +1,608 @@
+//! Running the interpreter and a translated engine side by side for a long
+//! time, and naming the **first** quantum they stop agreeing on.
+//!
+//! # Why this exists
+//!
+//! `CLAUDE.md`, *CPU cores*: "the interpreter is the oracle". `ROADMAP.md` §0
+//! asks for a bit-identical state hash across the interpreter and the JIT for
+//! the same guest. `tests/a64_engines.rs`, `tests/riscv_virt_engines.rs` and
+//! `tests/x86_engines.rs` all assert that — over forty quanta of a
+//! six-instruction loop, which is what a test that runs on every commit can
+//! afford.
+//!
+//! Two real defects in the A64 translating engine were found in September 2026
+//! (`docs/platforms/arm64-virt.md`, "Twenty seconds was not far enough"). One
+//! first appeared at **15.04 s** of guest time and the other at **23.46 s**;
+//! both moved *where a quantum ends* rather than what an instruction computes,
+//! so `State::debt` was the column that parted. Neither is reachable in forty
+//! quanta of anything, and both were found by hand, by bisecting a 120-second
+//! Linux boot. Nothing automated it. This module is the automation.
+//!
+//! # The shape, and why it is not a final-hash comparison
+//!
+//! Two machines are built from one description, differing only in `engine`,
+//! and advanced **one quantum at a time in lockstep**. After every quantum:
+//!
+//! * their virtual clocks must read the same instant — a scheduling divergence
+//!   is a different diagnosis from a state one and is reported as itself;
+//! * every device whose snapshot chunk is small enough to save every quantum
+//!   (the CPU, the interrupt controller, the UART, the virtio transports —
+//!   everything except RAM and a framebuffer) must serialise to identical
+//!   bytes;
+//! * every `hash_every` quanta, the machines' full [`Machine::state_hash`]
+//!   must agree, which is what covers RAM.
+//!
+//! Comparing at the end only would have caught the second defect and missed
+//! the first, which self-corrects at the next quantum: the run would have ended
+//! on one hash and the window would have closed unseen. And a final-hash
+//! failure says "something differs somewhere in 120 seconds", which is the
+//! report the last round had and spent a day bisecting by hand. This one says
+//! *quantum 3 418 227, at 15.043 s, `cpu`: `debt` 5 against 11* — a bisect
+//! already done.
+//!
+//! # Cost
+//!
+//! The per-quantum fingerprint is one `save` of each cheap device on each side.
+//! On `arm64-virt` that is about 900 bytes a side, against a quantum of
+//! emulation that costs orders of magnitude more: 120 guest seconds of an
+//! arm64 Linux boot, interpreter against `jit`, is 179 s of wall time, and the
+//! interpreter alone is most of it. The full state hash walks all of RAM, so
+//! `hash_every` is coarse by default and the caller sizes it —
+//! `docs/testing/long-run.md` has the measured table.
+
+// Two test binaries include this file and neither uses all of it.
+#![allow(dead_code)]
+
+use std::fmt;
+use std::time::{Duration, Instant};
+
+use rsemu::core::clock::GlobalTime;
+use rsemu::core::state::{MachineShape, Migrations, Source, StateReader, StateWriter};
+use rsemu::machine::Machine;
+
+/// The largest chunk this harness will re-serialise every quantum.
+///
+/// A probe saves each device once at the start and keeps the ones under this;
+/// RAM and framebuffers fall out by their size rather than by a hard-coded list
+/// of class names, so a board this file has never seen gets the right answer.
+const CHEAP_CHUNK: usize = 64 * 1024;
+
+/// One device the per-quantum fingerprint covers.
+#[derive(Debug, Clone)]
+struct Cheap {
+    path: String,
+    class: &'static str,
+    version: u32,
+}
+
+/// How far to run and how often to take the expensive check.
+#[derive(Debug, Clone)]
+pub(crate) struct Options {
+    /// Stop when the oracle's virtual clock reaches this.
+    pub(crate) deadline: GlobalTime,
+    /// Take a full [`Machine::state_hash`] every this many quanta. Zero never
+    /// does, which is right only when RAM is covered some other way.
+    pub(crate) hash_every: u64,
+    /// Give up after this many quanta whatever the clock says — a machine that
+    /// has wedged should fail the run rather than spin it out.
+    pub(crate) max_quanta: u64,
+    /// Print a progress line every this many quanta. Zero is silent.
+    pub(crate) progress_every: u64,
+}
+
+impl Options {
+    /// Run to `seconds` of guest time with sensible defaults for the rest.
+    pub(crate) fn to_guest_seconds(seconds: u64) -> Options {
+        Options {
+            deadline: GlobalTime::from_nanos(seconds.saturating_mul(1_000_000_000)),
+            // Coarse: a full hash walks RAM, and the per-quantum fingerprint is
+            // what actually finds a divergence first.
+            hash_every: 100_000,
+            max_quanta: u64::MAX,
+            progress_every: 0,
+        }
+    }
+
+    /// How often the full hash is taken.
+    pub(crate) fn hashing_every(mut self, quanta: u64) -> Options {
+        self.hash_every = quanta;
+        self
+    }
+
+    /// Print progress every `quanta` quanta.
+    pub(crate) fn reporting_every(mut self, quanta: u64) -> Options {
+        self.progress_every = quanta;
+        self
+    }
+
+    /// Cap the number of quanta.
+    pub(crate) fn at_most(mut self, quanta: u64) -> Options {
+        self.max_quanta = quanta;
+        self
+    }
+}
+
+/// What a completed run did, for the log.
+#[derive(Debug, Clone)]
+pub(crate) struct Summary {
+    /// Quanta advanced on each side.
+    pub(crate) quanta: u64,
+    /// Where the oracle's clock finished.
+    pub(crate) guest: GlobalTime,
+    /// Wall time the whole lockstep took, both machines and the comparison.
+    pub(crate) wall: Duration,
+    /// How many full state hashes were compared.
+    pub(crate) hashes: u64,
+    /// The devices the per-quantum fingerprint covered.
+    pub(crate) watched: Vec<String>,
+    /// The devices it did not, because their chunks are too large.
+    pub(crate) unwatched: Vec<String>,
+}
+
+impl fmt::Display for Summary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} quanta, {} of guest time in {:?}, {} full state hashes; \
+             watched every quantum: {}",
+            self.quanta,
+            seconds(self.guest),
+            self.wall,
+            self.hashes,
+            self.watched.join(", "),
+        )?;
+        if !self.unwatched.is_empty() {
+            write!(
+                f,
+                "; too large to watch per quantum (covered by the full hash \
+                 only): {}",
+                self.unwatched.join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// What parted.
+#[derive(Debug, Clone)]
+pub(crate) enum What {
+    /// The two schedulers are no longer on the same instant.
+    Clock { oracle: u64, engine: u64 },
+    /// One device's chunk differs.
+    Device {
+        path: String,
+        class: String,
+        detail: String,
+    },
+    /// The full state hashes differ but every watched device agreed, so what
+    /// differs is RAM or a device too large to watch.
+    Hash { oracle: u64, engine: u64 },
+}
+
+/// The first quantum on which the two engines stopped being the same machine.
+#[derive(Debug, Clone)]
+pub(crate) struct Divergence {
+    /// The board this ran on.
+    pub(crate) label: String,
+    /// The engine under test, against the interpreter.
+    pub(crate) engine: String,
+    /// Which quantum, counting from one.
+    pub(crate) quantum: u64,
+    /// The oracle's virtual clock at the end of it.
+    pub(crate) guest: GlobalTime,
+    /// What parted.
+    pub(crate) what: What,
+}
+
+impl fmt::Display for Divergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "\n{}: engine={} left the interpreter at quantum {}, {} of guest \
+             time.",
+            self.label,
+            self.engine,
+            self.quantum,
+            seconds(self.guest)
+        )?;
+        match &self.what {
+            What::Clock { oracle, engine } => writeln!(
+                f,
+                "    The two schedulers are on different instants: {oracle} ns \
+                 interpreted, {engine} ns translated. That is a scheduling \
+                 divergence, not a state one — the engines disagree about how \
+                 much time a quantum was worth."
+            ),
+            What::Device {
+                path,
+                class,
+                detail,
+            } => writeln!(f, "    Device `{path}` ({class}):\n{detail}"),
+            What::Hash { oracle, engine } => writeln!(
+                f,
+                "    The full state hashes differ — {oracle:#018x} interpreted, \
+                 {engine:#018x} translated — while every device watched every \
+                 quantum agreed. What parted is RAM, or a device whose chunk is \
+                 too large to watch per quantum."
+            ),
+        }?;
+        write!(
+            f,
+            "    ROADMAP.md §0 requires a bit-identical state hash across the \
+             interpreter and the JIT for the same guest, and CLAUDE.md makes \
+             the interpreter the oracle: the column on the left is the one to \
+             believe."
+        )
+    }
+}
+
+/// A virtual instant, as seconds and microseconds.
+///
+/// Integer arithmetic on purpose (`CLAUDE.md`, *Determinism*): this is a
+/// report, but a float here would be the only float in the file and the habit
+/// is worth more than the convenience.
+pub(crate) fn seconds(t: GlobalTime) -> String {
+    let ns = t.as_nanos();
+    format!(
+        "{}.{:06} s",
+        ns / 1_000_000_000,
+        (ns % 1_000_000_000) / 1_000
+    )
+}
+
+/// Advance `oracle` and `under_test` together, one quantum at a time, until
+/// `opts.deadline` — or until they disagree.
+///
+/// # Errors
+///
+/// The first quantum on which anything watched differs. Boxed because a
+/// `Divergence` carries a rendered diff and a `Result` that large in the happy
+/// path is what `clippy::result_large_err` is about.
+pub(crate) fn lockstep(
+    label: &str,
+    oracle: &mut Machine,
+    engine: &str,
+    under_test: &mut Machine,
+    opts: &Options,
+) -> Result<Summary, Box<Divergence>> {
+    let (shape, cheap, unwatched) = cheap_devices(oracle);
+    let started = Instant::now();
+    let mut quantum = 0u64;
+    let mut hashes = 0u64;
+
+    while oracle.now() < opts.deadline && quantum < opts.max_quanta {
+        oracle.run_quantum().expect("the oracle runs");
+        under_test
+            .run_quantum()
+            .expect("the machine under test runs");
+        quantum += 1;
+
+        // The clock first: two machines on different instants are not
+        // comparable at all, and every later report would be noise.
+        if oracle.now() != under_test.now() {
+            return Err(Box::new(Divergence {
+                label: label.to_string(),
+                engine: engine.to_string(),
+                quantum,
+                guest: oracle.now(),
+                what: What::Clock {
+                    oracle: oracle.now().as_nanos(),
+                    engine: under_test.now().as_nanos(),
+                },
+            }));
+        }
+
+        let a = fingerprint(oracle, &shape, &cheap);
+        let b = fingerprint(under_test, &shape, &cheap);
+        if a != b {
+            return Err(Box::new(Divergence {
+                label: label.to_string(),
+                engine: engine.to_string(),
+                quantum,
+                guest: oracle.now(),
+                what: locate(&a, &b, &cheap),
+            }));
+        }
+
+        if opts.hash_every != 0 && quantum.is_multiple_of(opts.hash_every) {
+            hashes += 1;
+            let ha = oracle.state_hash().expect("the oracle hashes");
+            let hb = under_test.state_hash().expect("the machine hashes");
+            if ha != hb {
+                return Err(Box::new(Divergence {
+                    label: label.to_string(),
+                    engine: engine.to_string(),
+                    quantum,
+                    guest: oracle.now(),
+                    what: What::Hash {
+                        oracle: ha,
+                        engine: hb,
+                    },
+                }));
+            }
+        }
+
+        if opts.progress_every != 0 && quantum.is_multiple_of(opts.progress_every) {
+            eprintln!(
+                "    {label} engine={engine}: quantum {quantum}, {} of guest \
+                 time, {:?} of wall time",
+                seconds(oracle.now()),
+                started.elapsed()
+            );
+        }
+    }
+
+    // One at the end, always — otherwise a run shorter than `hash_every`
+    // silently loses the tier that covers RAM, and "0 full state hashes" in the
+    // summary is a line nobody reads. It is also the check most like the one
+    // the other engine tests make, so a run that agreed all the way through
+    // finishes by agreeing the way they do.
+    if opts.hash_every != 0 && quantum > 0 {
+        hashes += 1;
+        let ha = oracle.state_hash().expect("the oracle hashes");
+        let hb = under_test.state_hash().expect("the machine hashes");
+        if ha != hb {
+            return Err(Box::new(Divergence {
+                label: label.to_string(),
+                engine: engine.to_string(),
+                quantum,
+                guest: oracle.now(),
+                what: What::Hash {
+                    oracle: ha,
+                    engine: hb,
+                },
+            }));
+        }
+    }
+
+    Ok(Summary {
+        quanta: quantum,
+        guest: oracle.now(),
+        wall: started.elapsed(),
+        hashes,
+        watched: cheap.iter().map(|c| c.path.clone()).collect(),
+        unwatched,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// the fingerprint
+// ---------------------------------------------------------------------------
+
+/// Probe every device once and keep the ones cheap enough to watch.
+fn cheap_devices(m: &Machine) -> (MachineShape, Vec<Cheap>, Vec<String>) {
+    let mut shape = MachineShape::new();
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for entry in m.devices() {
+        let class = entry.class().name;
+        let version = entry.class().version;
+        let path = entry.path().to_string();
+        match one_chunk(m, &path, class, version) {
+            Some(bytes) if bytes.len() <= CHEAP_CHUNK => {
+                shape
+                    .add_device(&path, class)
+                    .expect("a machine's own instance paths are unique");
+                kept.push(Cheap {
+                    path,
+                    class,
+                    version,
+                });
+            }
+            // Either too large to save every quantum, or a device that declines
+            // to save at all. Both are covered by the full state hash and
+            // neither should stop the run.
+            _ => dropped.push(path),
+        }
+    }
+    (shape, kept, dropped)
+}
+
+/// One device's snapshot, as a whole container.
+fn one_chunk(m: &Machine, path: &str, class: &str, version: u32) -> Option<Vec<u8>> {
+    let entry = m.device(path)?;
+    let mut shape = MachineShape::new();
+    shape.add_device(path, class).ok()?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk(path, class, version).ok()?;
+        entry.device().save(&mut chunk).ok()?;
+    }
+    w.to_vec().ok()
+}
+
+/// Every cheap device's state, in one container, in canonical path order.
+fn fingerprint(m: &Machine, shape: &MachineShape, cheap: &[Cheap]) -> Vec<u8> {
+    let mut w = StateWriter::new(shape.clone());
+    for c in cheap {
+        let entry = m
+            .device(&c.path)
+            .expect("the device is still in the machine");
+        let mut chunk = w
+            .chunk(&c.path, c.class, c.version)
+            .expect("one chunk per path");
+        entry
+            .device()
+            .save(&mut chunk)
+            .expect("a device that saved during the probe saves now");
+    }
+    w.to_vec().expect("the writer serialises what it was given")
+}
+
+/// Which device in the fingerprint differs, and how.
+fn locate(a: &[u8], b: &[u8], cheap: &[Cheap]) -> What {
+    let (ra, rb) = match (StateReader::new(a), StateReader::new(b)) {
+        (Ok(ra), Ok(rb)) => (ra, rb),
+        _ => {
+            return What::Device {
+                path: "?".to_string(),
+                class: "?".to_string(),
+                detail: "        the fingerprint does not parse back, which is a \
+                         harness bug rather than a divergence"
+                    .to_string(),
+            };
+        }
+    };
+    let migrations = Migrations::new();
+    for c in cheap {
+        let la = ra.load(&c.path, c.class, c.version, &migrations);
+        let lb = rb.load(&c.path, c.class, c.version, &migrations);
+        let (la, lb) = match (la, lb) {
+            (Ok(la), Ok(lb)) => (la, lb),
+            _ => continue,
+        };
+        if la.data() == lb.data() {
+            continue;
+        }
+        return What::Device {
+            path: c.path.clone(),
+            class: c.class.to_string(),
+            detail: describe(c.class, la.data(), lb.data()),
+        };
+    }
+    What::Device {
+        path: "?".to_string(),
+        class: "?".to_string(),
+        detail: "        the fingerprints differ but no single device's chunk \
+                 does, which is a harness bug"
+            .to_string(),
+    }
+}
+
+/// The field-level diff of one device's chunk.
+///
+/// A named decoder where there is one, and a byte-offset report where there is
+/// not: the point is that the failure message says *which column* moved, so
+/// the next person does not repeat the bisect this file exists to end.
+fn describe(class: &str, a: &[u8], b: &[u8]) -> String {
+    if let (Some(fa), Some(fb)) = (decode(class, a), decode(class, b)) {
+        let mut out = String::new();
+        for ((name, x), (_, y)) in fa.iter().zip(&fb) {
+            if x != y {
+                out.push_str(&format!(
+                    "        {name:<14} {x:#018x} interpreted   {y:#018x} translated\n"
+                ));
+            }
+        }
+        if !out.is_empty() {
+            return out.trim_end().to_string();
+        }
+    }
+    bytewise(a, b)
+}
+
+/// The fallback: where the bytes first part, and what the eight bytes there
+/// read as.
+fn bytewise(a: &[u8], b: &[u8]) -> String {
+    let at = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(0);
+    let word = |s: &[u8], at: usize| -> String {
+        if at + 8 <= s.len() {
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&s[at..at + 8]);
+            format!("{:#018x}", u64::from_be_bytes(v))
+        } else {
+            "(short)".to_string()
+        }
+    };
+    format!(
+        "        chunk is {} bytes interpreted and {} translated; first \
+         difference at byte {at}\n        \
+         as a big-endian word there: {} interpreted, {} translated",
+        a.len(),
+        b.len(),
+        word(a, at),
+        word(b, at)
+    )
+}
+
+/// A class-specific field decoder, where this file has one.
+fn decode(class: &str, data: &[u8]) -> Option<Vec<(String, u64)>> {
+    match class {
+        "cpu.arm.a64" => decode_a64(data),
+        _ => None,
+    }
+}
+
+/// `cpu.arm.a64`'s chunk, field by field.
+///
+/// The order is `Cpu::save`'s: X0-X30, the 32 SIMD&FP registers as two words
+/// each, `PC`, three counters, two flags, `PSTATE`, then the thirty system
+/// registers `Cpu::sysreg_words` writes, then the interrupt lines and the power
+/// state. Read with a `ChunkReader` rather than at fixed offsets, because the
+/// exclusive monitor is an `Option` and moves everything after it.
+///
+/// Returns `None` on anything unexpected, and the caller falls back to a byte
+/// diff — a decoder that has drifted from `save` must not turn a real
+/// divergence into a confident lie.
+fn decode_a64(data: &[u8]) -> Option<Vec<(String, u64)>> {
+    use rsemu::core::state::ChunkReader;
+
+    const SYSREGS: [&str; 30] = [
+        "sp_el0",
+        "sp_el1",
+        "sctlr",
+        "actlr",
+        "cpacr",
+        "ttbr0",
+        "ttbr1",
+        "tcr",
+        "mair",
+        "amair",
+        "contextidr",
+        "spsr_el1",
+        "elr_el1",
+        "esr_el1",
+        "far_el1",
+        "vbar_el1",
+        "afsr0",
+        "afsr1",
+        "tpidr_el1",
+        "tpidr_el0",
+        "tpidrro_el0",
+        "mdscr",
+        "fpcr",
+        "fpsr",
+        "cntfrq",
+        "cntkctl",
+        "cntp_ctl",
+        "cntp_cval",
+        "cntv_ctl",
+        "cntv_cval",
+    ];
+
+    let mut r = ChunkReader::new(data);
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for n in 0..31 {
+        out.push((format!("x{n}"), r.read_u64().ok()?));
+    }
+    for n in 0..32 {
+        out.push((format!("v{n}.lo"), r.read_u64().ok()?));
+        out.push((format!("v{n}.hi"), r.read_u64().ok()?));
+    }
+    out.push(("pc".to_string(), r.read_u64().ok()?));
+    out.push(("cycles".to_string(), r.read_u64().ok()?));
+    out.push(("debt".to_string(), r.read_u64().ok()?));
+    out.push(("faults".to_string(), r.read_u64().ok()?));
+    out.push(("wfi".to_string(), u64::from(r.read_bool().ok()?)));
+    let held = r.read_bool().ok()?;
+    out.push(("exclusive?".to_string(), u64::from(held)));
+    if held {
+        out.push(("exclusive".to_string(), r.read_u64().ok()?));
+    }
+    out.push(("nzcv".to_string(), u64::from(r.read_u32().ok()?)));
+    out.push(("daif".to_string(), r.read_u64().ok()?));
+    out.push(("el".to_string(), u64::from(r.read_u8().ok()?)));
+    out.push(("spsel".to_string(), u64::from(r.read_bool().ok()?)));
+    for name in SYSREGS {
+        out.push((name.to_string(), r.read_u64().ok()?));
+    }
+    out.push(("irq lines".to_string(), r.read_u64().ok()?));
+    out.push(("powered".to_string(), u64::from(r.read_bool().ok()?)));
+    out.push(("power pending".to_string(), u64::from(r.read_bool().ok()?)));
+    out.push(("power entry".to_string(), r.read_u64().ok()?));
+    out.push(("power context".to_string(), r.read_u64().ok()?));
+    // A decoder that stopped early has drifted from `save`, and a partial field
+    // list would name the wrong column. Say so by declining.
+    r.end().ok()?;
+    Some(out)
+}

@@ -1,0 +1,93 @@
+name: Long run
+
+# The interpreter against each translated engine, quantum by quantum, over a
+# real AArch64 Linux boot.
+#
+# # Why this is not in ci.yml
+#
+# It needs a 36 MiB kernel that cannot be committed (GPL-2.0 — running it as an
+# emulated guest is ordinary use, shipping it here is redistribution) and it
+# spends minutes of wall time on one board. Neither belongs on a pull request.
+#
+# # Why it is not merely an opt-in test either
+#
+# It already was one, in effect: `tests/a64_engines.rs` runs forty quanta and
+# the honest gate was "somebody boots a kernel by hand and compares hashes".
+# Two engine defects survived that — one first parted from the interpreter at
+# 15.04 s of guest time and the other at 23.46 s, where it desynchronised the
+# guest permanently (docs/platforms/arm64-virt.md). Both were found by hand,
+# once, because somebody happened to look. An opt-in nobody opts into is not a
+# gate, so this schedule is where the gate lives.
+#
+# `docs/testing/long-run.md` is the operating manual, and
+# `scripts/check.sh long` is the same thing locally.
+on:
+  schedule:
+    # 05:23 UTC daily, after the fuzz job and off the hour for the reason
+    # fuzz.yml gives.
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Guest seconds to compare (default 120)'
+        required: false
+        default: '120'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: long-run
+  cancel-in-progress: true
+
+jobs:
+  long-run:
+    name: engine divergence (arm64 Linux)
+    runs-on: ubuntu-latest
+    # A boot is minutes, two engines is twice that, and the runner's default
+    # would kill it silently part-way.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: long-run
+      # The same script every other corpus comes through, and the same ignored
+      # directory. Nothing is vendored (CLAUDE.md, Testing).
+      - name: fetch the arm64 kernel and ramdisk
+        run: ./scripts/fetch-testdata.sh arm64-linux arm64-initramfs
+      # RSEMU_LONGRUN_REQUIRED turns the stage's "no kernel, skipping" into a
+      # failure. On a developer's machine skipping is right; here it would mean
+      # a held gate that nothing was holding, which is exactly the shape the
+      # crosshost job already had to fix.
+      - name: interpreter against jit and jit-host
+        env:
+          RSEMU_LONGRUN_REQUIRED: 1
+          RSEMU_LONGRUN_SECONDS: ${{ github.event.inputs.seconds || '120' }}
+        run: |
+          set -uo pipefail
+          rc=0
+          ./scripts/check.sh long 2>&1 | tee long-run.log || rc=$?
+          # The script's own summary lines, not parsed test output.
+          if [ "$rc" -ne 0 ]; then
+            grep -E '^(FAIL|skip) ' long-run.log | while IFS= read -r line; do
+              echo "::error title=long run::$line"
+            done
+            # The harness prints the first divergent quantum and the fields
+            # that parted; that is the whole diagnosis and it should be in the
+            # checks list rather than three screens up a log.
+            grep -E 'left the interpreter at quantum' long-run.log | while IFS= read -r line; do
+              echo "::error title=divergence::$line"
+            done
+          fi
+          exit "$rc"
+      - name: keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-run-log
+          path: long-run.log
+          if-no-files-found: warn
