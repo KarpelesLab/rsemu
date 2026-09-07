@@ -239,20 +239,40 @@ stage_sweep() {
 #               binary needs an emulator that is not assumed here.
 #   wasm32      a 32-bit address space, a different code generator, and no
 #               native ABI at all, under Node's WASI (`scripts/wasi-run.mjs`).
-#               CI built this target every commit and ran it never; the
+#               CI built this target every commit and ran it never until the
+#               `crosshost` job, which runs this stage as written; the
 #               `machine::` and `core::state::` unit tests run here too, which
 #               is how `every_shipped_machine_resumes_from_its_own_snapshot`
 #               reaches wasm.
 #
 # Each leg is skipped rather than failed when its target or runtime is absent: a
 # developer without them has lost nothing the CI matrix (ubuntu/macos/windows)
-# does not already check.
+# does not already check. `RSEMU_CROSSHOST_REQUIRED` turns those skips into
+# failures, and CI sets it — see `crosshost_absent` below.
 #
 # The feature set is every board `tests/crosshost_snapshot.rs` knows how to
 # build without a corpus -- eight guest architectures, no drive on any of them,
 # which is deliberate: a drive whose medium snapshots by *reference* writes a
 # canonical host path into its chunk and cannot cross a host boundary at all.
 CROSSHOST_FEATURES="std,machine-apple1,machine-nes,machine-beneater,machine-z80-mini,machine-m68k-mini,machine-mips-mini,machine-a64-mini,machine-arm926,machine-stm32f407,machine-spi-flash,machine-spi-panel"
+
+# On a developer's machine a missing target or runtime is a skip, and that is
+# right: the rest of the CI matrix still checks everything they can check here.
+# On a runner it is a failure. The workflow installs every prerequisite itself
+# (`.github/workflows/ci.yml`, job `crosshost`), so a leg that skips there means
+# the provisioning broke — and a job that is green because it ran nothing is
+# worse than no job at all, because it reports a gate as held that nobody is
+# holding. CI sets RSEMU_CROSSHOST_REQUIRED=1; nothing else does, so the local
+# gate is exactly as strong, and as skippable, as it was.
+CROSSHOST_REQUIRED="${RSEMU_CROSSHOST_REQUIRED:-}"
+crosshost_absent() {
+  if [ -n "$CROSSHOST_REQUIRED" ]; then
+    record "FAIL  $1 -- RSEMU_CROSSHOST_REQUIRED is set, so this had to run"
+    FAILED=$((FAILED + 1))
+  else
+    record "skip  $1"
+  fi
+}
 
 # Load the save states in `$1` into this host and run them on.
 crosshost_read() {
@@ -263,14 +283,20 @@ crosshost_read() {
 
 stage_crosshost() {
   local t=i686-unknown-linux-gnu
-  local out
+  local out probe
   out="$(pwd)/target/crosshost"
+  # The link probe's output is discarded locally, where "i686 does not link
+  # here" is the whole answer a developer needs; it is kept when the leg is
+  # required, where the linker's own error is the only thing that says which
+  # package the runner is missing.
+  probe=/dev/null
+  [ -n "$CROSSHOST_REQUIRED" ] && probe=/dev/stderr
 
   if ! rustc --print target-libdir --target "$t" >/dev/null 2>&1; then
-    record "skip  crosshost i686 (target not installed: rustup target add $t)"
+    crosshost_absent "crosshost i686 (target not installed: rustup target add $t)"
   elif ! cargo build --target "$t" --no-default-features \
-         --features "$CROSSHOST_FEATURES" >/dev/null 2>&1; then
-    record "skip  crosshost i686 ($t does not link here: 32-bit runtime missing?)"
+         --features "$CROSSHOST_FEATURES" >"$probe" 2>&1; then
+    crosshost_absent "crosshost i686 ($t does not link here: 32-bit runtime missing?)"
   else
     run "crosshost replay ($t)" \
       cargo test --target "$t" --no-default-features \
@@ -285,11 +311,11 @@ stage_crosshost() {
 
   local w=wasm32-wasip1
   if ! rustc --print target-libdir --target "$w" >/dev/null 2>&1; then
-    record "skip  crosshost wasm (target not installed: rustup target add $w)"
+    crosshost_absent "crosshost wasm (target not installed: rustup target add $w)"
     return 0
   fi
   if ! command -v node >/dev/null 2>&1; then
-    record "skip  crosshost wasm (no node; scripts/wasi-run.mjs needs one)"
+    crosshost_absent "crosshost wasm (no node; scripts/wasi-run.mjs needs one)"
     return 0
   fi
   # `wasm32-wasip1` has no `std::thread`, so libtest's default of a thread per

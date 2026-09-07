@@ -350,6 +350,106 @@ jobs:
           path: target/wasm32-unknown-unknown/release/rsemu.wasm
           if-no-files-found: error
 
+  crosshost:
+    name: crosshost (i686, wasm32-wasip1)
+    runs-on: ubuntu-latest
+    # Phase 9's gate is "a recorded session replayed bit-identically on a
+    # *different host*", and until this job nothing in this workflow ever left
+    # x86-64. Every other job here — including the three-OS `test` matrix — is
+    # 64-bit little-endian with the same `usize`, the same ABI and the same code
+    # generator, so a snapshot or a recording that silently depends on any of
+    # those passes all of them. `scripts/check.sh crosshost` is the stage that
+    # asks the question, and it ran only when somebody ran the full local gate
+    # by hand.
+    #
+    # Two second hosts, for two different reasons (the long form is the comment
+    # above `stage_crosshost` in the script):
+    #
+    #   i686-unknown-linux-gnu   a 32-bit `usize` on an ISA this runner can also
+    #                            *execute*, so `cargo test --target` runs the
+    #                            binaries rather than just linking them.
+    #   wasm32-wasip1            a 32-bit address space, a different code
+    #                            generator and no native ABI at all, under
+    #                            Node's WASI via `scripts/wasi-run.mjs`. CI has
+    #                            built this target every commit since the first
+    #                            one and, until now, ran it never.
+    #
+    # Its own job rather than steps bolted onto `wasm` or `test`: a failure here
+    # is a portability defect in the state or replay seam, which is a different
+    # diagnosis from "wasm does not build", and it should say so in the checks
+    # list without anyone opening a log.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-toolchain.toml already fetches the three wasm targets, so
+          # wasm32-wasip1 is belt and braces; i686 is not in that file because
+          # no other job wants it, and this is where it is added.
+          targets: i686-unknown-linux-gnu, wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Three target directories nobody else in this workflow writes.
+          key: crosshost
+      # `node:wasi` is the whole wasm runtime — no wasmtime, no wasmer. `web/`
+      # already assumes node, and the version is pinned here for the same
+      # reason it is pinned in the `wasm` job: a runner's default node is not
+      # part of this repository's contract.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # rustc drives the linker through `cc` for i686-unknown-linux-gnu, and
+      # links against a 32-bit libc: without the multilib packages the target
+      # installs fine and every link fails at `crt1.o`. `gcc-multilib` pulls
+      # `libc6-dev-i386`, which pulls `libc6-i386` — the second is what lets the
+      # runner *run* the test binary (`/lib/ld-linux.so.2`), not just build it.
+      - name: 32-bit toolchain and runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-multilib
+      # Both prerequisites, asserted before a ten-minute build rather than
+      # inside one. Neither failure is self-explanatory in a linker's output or
+      # in cargo's runner error, and each has one obvious cause named above.
+      - name: preflight
+        run: |
+          set -euo pipefail
+          printf 'int main(void){return 0;}\n' > /tmp/m32.c
+          cc -m32 /tmp/m32.c -o /tmp/m32
+          /tmp/m32
+          echo "cc -m32 links and the result runs"
+          node --no-warnings=ExperimentalWarning \
+            -e "import('node:wasi').then(m => {
+                  if (!m.WASI) { console.error('node:wasi has no WASI export'); process.exit(1); }
+                  console.log('node:wasi ok on ' + process.version);
+                })"
+      # The same stage `scripts/check.sh crosshost` runs locally, invoked as
+      # itself so the two cannot drift: the feature set, the environment
+      # variables that move a save state between the two processes, and
+      # `--test-threads=1` (wasip1 has no `std::thread`) all live in one place.
+      #
+      # RSEMU_CROSSHOST_REQUIRED turns the script's skips into failures. Each
+      # leg skips itself when its target or runtime is missing, which is right
+      # on a developer's machine and useless here — a runner whose provisioning
+      # broke would report a held gate that nothing was holding.
+      - name: crosshost replay and snapshot portability
+        env:
+          RSEMU_CROSSHOST_REQUIRED: 1
+        run: |
+          # `|| rc=$?` rather than a bare pipeline: the step's shell is `bash -e`
+          # and errexit would end it before the annotations below are written.
+          # pipefail is what makes `$?` the script's status and not tee's.
+          set -uo pipefail
+          rc=0
+          ./scripts/check.sh crosshost 2>&1 | tee crosshost.log || rc=$?
+          # The script's own summary, not parsed test output: `record` writes
+          # these lines and nothing else does. One annotation per failed leg,
+          # because the verdict is otherwise the last screen of a long log.
+          if [ "$rc" -ne 0 ]; then
+            grep -E '^(FAIL|skip) ' crosshost.log | while IFS= read -r line; do
+              echo "::error title=crosshost::$line"
+            done
+          fi
+          exit "$rc"
+
   wasm-threads-browser:
     name: wasm threads, browser (nightly, advisory)
     runs-on: ubuntu-latest
