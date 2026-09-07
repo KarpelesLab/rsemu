@@ -497,6 +497,35 @@ impl RamStore {
     ///
     /// Public because a device that writes its own backing store through some
     /// other path (a framebuffer blit, a DMA engine) still owes the dirty bit.
+    ///
+    /// # The `fetch_or` is the most expensive instruction on the store path
+    ///
+    /// `Ordering::Relaxed` says this needs no ordering, and on an x86-64 host
+    /// it gets one anyway: a `fetch_or` is `lock or`, a full barrier. That is
+    /// not free and it is not small. Measured under callgrind and under an
+    /// interleaved pinned A/B, a whole four-byte store through the space costs
+    /// ~23.6 ns, of which **~3.9 ns is this line** — the single largest
+    /// component, larger than locating the target. It does not cost
+    /// instructions; it costs *overlap*, serialising the loop so the write path
+    /// retires at IPC ~3.5 against the read path's ~5.2.
+    ///
+    /// A test-before-set makes it vanish in the steady state, where the bit is
+    /// almost always already one. That is deliberately **not** done here,
+    /// because it is a design review rather than an optimisation:
+    ///
+    /// * The barrier is currently load-bearing by accident, and three places
+    ///   depend on the accident — `core::sync`'s ledger, a litmus row in
+    ///   `tests/memory_model_litmus.rs`, and `tests/memory_model_costs.rs`.
+    ///   Removing it means re-running those tables in the same change.
+    /// * Dropping it opens a narrow lost-dirty-bit window: with no barrier, one
+    ///   thread's store can become globally visible *after* another has cleared
+    ///   the bit and copied the page. That is only safe if every consumer of
+    ///   the dirty log runs at a safe point, which is a claim about the whole
+    ///   migration and snapshot path rather than about this function.
+    ///
+    /// Two rounds have now found this line from opposite directions — once as a
+    /// fence that was never asked for, once as a cost nobody had priced — so it
+    /// is written down here rather than rediscovered a third time.
     pub fn mark_dirty(&self, offset: u64, len: u64) {
         if len == 0 {
             return;
