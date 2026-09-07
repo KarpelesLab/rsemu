@@ -530,6 +530,28 @@ impl Asm {
         self.byte(0xc8 + r.low());
     }
 
+    // ---- barriers -------------------------------------------------------
+
+    /// `mfence` — every load and store ahead of it is globally visible before
+    /// any after it.
+    ///
+    /// `0F AE F0`, from *Intel SDM* volume 2B's `MFENCE` page: the opcode is
+    /// `0F AE /6` with the ModRM restricted to the register form, so the
+    /// third byte is the fixed `F0` the manual prints rather than an encoded
+    /// operand. There is nothing to parameterize and no REX to emit.
+    ///
+    /// The full barrier and not `sfence` or `lfence`, because the case a
+    /// guest barrier exists to forbid is **store-then-load**: x86-TSO already
+    /// keeps store-store and load-load in order, and `MFENCE` is the only one
+    /// of the three that drains the store buffer against a later load. See
+    /// `compile`'s `Opcode::FENCE` lowering for why that is the ordering the
+    /// IR's fence has to give.
+    pub fn mfence(&mut self) {
+        self.byte(0x0f);
+        self.byte(0xae);
+        self.byte(0xf0);
+    }
+
     // ---- shifts ---------------------------------------------------------
 
     /// `op r64, imm8`.
@@ -686,6 +708,14 @@ mod tests {
         let mut a = Asm::new();
         a.bswap64(Reg::Rax);
         assert_eq!(a.code(), &[0x48, 0x0f, 0xc8]);
+
+        // `mfence`, from the manual's own page: three bytes, no REX, no
+        // operand. `0f ae f8` would be `sfence` and `0f ae e8` `lfence`, and
+        // neither orders a store against a later load — which is the whole
+        // reason a guest barrier reaches this instruction.
+        let mut a = Asm::new();
+        a.mfence();
+        assert_eq!(a.code(), &[0x0f, 0xae, 0xf0]);
 
         // The forced REX on `setcc`: `sil`, not `dh`.
         let mut a = Asm::new();

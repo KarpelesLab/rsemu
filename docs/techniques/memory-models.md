@@ -149,18 +149,46 @@ leans on is the `LOCK` prefix — which reaches `AddressSpace::bus_lock`, a mute
 whose acquire/release does not forbid store-then-load. That is the next gap, and
 it is `core::space`'s rather than `cpu/`'s.
 
-**What the lifters do, and why one of them does not emit `Opcode::FENCE`.** The
-RISC-V and x86 frontends do not lift a fence at all — the block ends at one and
-the interpreter runs it. `a64::lift` could emit `Opcode::FENCE`, and does not,
-because `jit::x86::compiles` does not lower it and `jit::dispatch` does not
-*remember* a refusal — it re-attempts the compilation every time the block is
-reached. Measured over the same 120 s of an arm64 Linux boot on `jit-host`:
-`FENCE` emitted into the trace is **+4.9%**, `FENCE` alone in a block of its own
-is **+2.8%**, and leaving the barrier outside the lifted subset — one dispatcher
-round trip and one interpreted instruction per barrier, 0.05% of the stream — is
-**+1.3%**, inside the run-to-run noise. The cost is the count of refusals rather
-than their size. `a64::lift`'s own
-`nothing_this_frontend_emits_is_an_op_the_host_backend_refuses` is the standing
-invariant that says so. **Teaching `jit::x86` to emit an `mfence` for
-`Opcode::FENCE` is the whole fix**, and the day it lands, `classify`'s
-`Op::Dsb | Op::Dmb` arm becomes an emitted `FENCE` and nothing else changes.
+**What the lifters do.** The RISC-V and x86 frontends do not lift a fence at
+all — the block ends at one and the interpreter runs it. `a64::lift` does:
+`classify`'s `Op::Dsb | Op::Dmb` arm produces one `Opcode::FENCE`, and
+`jit::x86` lowers that to an `MFENCE` (*Intel SDM* volume 2B; `0F AE F0`).
+
+That arm was `return None` until the lowering existed, and the reason was the
+backend rather than the frontend: `jit::x86::compiles` refused `FENCE`, and
+`jit::dispatch` does not *remember* a refusal — it re-attempts the compilation
+every time the block is reached. Measured over the same 120 s of an arm64 Linux
+boot on `jit-host`, `FENCE` emitted into the trace was **+4.9%**, `FENCE` alone
+in a block of its own **+2.8%**, and leaving the barrier outside the lifted
+subset — one dispatcher round trip and one interpreted instruction per barrier,
+0.05% of the stream — **+1.3%**, inside the run-to-run noise. Every one of those
+numbers is a *refusal* cost; none of them survives the backend accepting the op.
+`a64::lift`'s `nothing_this_frontend_emits_is_an_op_the_host_backend_refuses` is
+the standing invariant that made the order of the two changes matter.
+
+**Why `MFENCE` and not nothing.** x86-TSO already gives store-store and
+load-load ordering, so a guest barrier needing only those two would compile to
+no instruction. `IrHost::fence`'s contract is a `SeqCst` host fence precisely
+because that is the one ordering that also forbids **store-then-load**, which is
+the reordering x86 does perform and the one the litmus test above measures.
+`MFENCE` is the only one of the three x86 fence instructions that drains the
+store buffer against a later load; `SFENCE` and `LFENCE` would be the no-op the
+weakening amounts to. A64's `DSB`/`DMB` scope and type fields are not read: one
+full fence is never weaker than the barrier the guest asked for, and narrowing
+it is an optimisation whose soundness argument would have to be diffed against
+the interpreter.
+
+**What the compiled path does not do** is call `IrHost::fence`. Generated code
+performs the barrier itself, the way an inlined load performs an access
+`IrHost::load` would otherwise have made. The default body is a `SeqCst` host
+fence, which on an x86-64 host *is* that instruction, and every `IrHost` in the
+tree takes the default — so nothing observable differs today — but a host that wanted a guest barrier to *do*
+something (count it, record it, replay it) would need a seam that does not exist
+yet, and would have to be given one before it could rely on the call.
+
+`jit::x86::compile`'s `plan` makes a fence a **region boundary**, which is the
+one entry in that predicate that is not a call site. Without it the fence's
+write to `Ctx::committed` would be overwritten by the replay of an `insn_start`
+that architecturally precedes it — reporting a later `Retry` fault restartable
+where `Interp` reports it not — and a barrier could be performed on behalf of a
+guest instruction a spent tick allowance then unwound.

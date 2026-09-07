@@ -930,6 +930,15 @@ fn emit_one(b: &mut BlockBuilder, r: &mut Rng, pool: &[(Temp, Type)]) -> Vec<(Te
             );
             vec![(dst, Type::I32)]
         }
+        20 => {
+            // A barrier, in among the loads, the stores and the faults. It
+            // defines nothing, so what it exercises is the *shape* it makes:
+            // a region boundary with no call on it, an extra flush the
+            // allocator has to have been told about, and `Ctx::committed`
+            // written between two replays.
+            b.emit_raw(Opcode::FENCE, Type::I64, None, None, &[], None, None, 0);
+            Vec::new()
+        }
         _ => {
             let ty = r.pick(&[Type::I32, Type::I64]);
             vec![(b.imm(ty, Const::Int(u128::from(r.next()))), ty)]
@@ -981,6 +990,9 @@ fn the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit() {
     // One load and one store, each of which the backend inlines — so each
     // carries two calls, the fast path's own and the slow path's.
     let value = b.load(Type::I64, addr, MemOp::load(Width::U64));
+    // A barrier between them: no call of its own, but a region boundary, so
+    // it moves a flush and the count below has to follow.
+    b.emit_raw(Opcode::FENCE, Type::I64, None, None, &[], None, None, 0);
     b.store(Type::I64, addr, value, MemOp::store(Width::U64));
     b.insn_start(InsnStart {
         pc: BASE + 4,
@@ -1006,7 +1018,8 @@ fn the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit() {
             // `note_fast_store` for a store — on top of it.
             Opcode::LD | Opcode::ST => 2,
             // A charge and a boundary emit nothing at all: their work is the
-            // region's flush, counted below.
+            // region's flush, counted below. A fence emits three bytes and no
+            // call at all.
             _ => 0,
         };
     }
@@ -1049,9 +1062,13 @@ fn a_flush_before(block: &Block) -> Vec<bool> {
             is_target[inst.aux as usize] = true;
         }
     }
+    // `Opcode::FENCE` starts a region without being a call site — the one
+    // place the two arrays `CallSites` carries come apart for a reason other
+    // than a call. See `compile::plan`.
     let boundary = |i: usize| {
         is_target[i]
             || a_call_site(insts[i].op)
+            || insts[i].op == Opcode::FENCE
             || insts[i].op == Opcode::BRCOND
             || insts[i].op.is_terminator()
     };
@@ -1593,11 +1610,163 @@ fn the_allocator_actually_places_values_in_registers() {
     }
 }
 
+/// `call [r14 + disp32]`, the only call this backend emits.
+const CALL_VT: [u8; 3] = [0x41, 0xff, 0x96];
+
+/// `mfence`, as *Intel SDM* volume 2B encodes it.
+const MFENCE: [u8; 3] = [0x0f, 0xae, 0xf0];
+
+/// How many `mfence`s `code` contains.
+///
+/// A window scan, which is what every other byte-level assertion in this file
+/// does. The three bytes cannot appear inside another instruction the blocks
+/// below produce: the only immediates in them are the addresses and constants
+/// written here, and none of them spells `0f ae f0`.
+fn fences(code: &[u8]) -> usize {
+    code.windows(3).filter(|w| *w == MFENCE).count()
+}
+
+/// A block whose only unusual member is `fence`, with a store before it and a
+/// load after it — the store-buffer shape, which is the one a barrier exists
+/// to constrain.
+fn a_block_with_a_barrier(fence: bool) -> Block {
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let mine = b.imm(Type::I64, Const::Int(u128::from(BASE + 0x40)));
+    let theirs = b.imm(Type::I64, Const::Int(u128::from(BASE + 0x1040)));
+    let one = b.imm(Type::I64, Const::Int(1));
+    b.store(Type::I64, mine, one, MemOp::store(Width::U32));
+    if fence {
+        b.emit_raw(Opcode::FENCE, Type::I64, None, None, &[], None, None, 0);
+    }
+    let seen = b.load(Type::I64, theirs, MemOp::load(Width::U32));
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live: vec![(RegSlot(0), seen)],
+    });
+    b.exit_tb();
+    b.finish()
+}
+
+#[test]
+fn a_guest_barrier_is_compiled_rather_than_refused() {
+    // The regression this test exists for is a *refusal*: `Opcode::FENCE` was
+    // outside the compiled subset, so a block containing one went back to the
+    // interpreter whole — and `cpu::arm::a64::lift` refused to emit one at all
+    // rather than produce a block that could never be compiled.
+    let with = a_block_with_a_barrier(true);
+    verify(&with).expect("a block with a fence is well formed");
+    assert!(
+        super::compile::compiles(Opcode::FENCE),
+        "the backend still refuses a fence"
+    );
+    // Both inline policies: a fence has nothing to do with the TLB, and a
+    // lowering that only worked when every access took the call would be a
+    // lowering that had not met the register allocator.
+    for inline in [false, true] {
+        assert!(
+            agree(&with, inline),
+            "a block with a fence did not compile (inline: {inline})"
+        );
+    }
+
+    // And it is an `mfence` — exactly one, where the fence is.
+    for regs in [Regs::Frame, Regs::Scan] {
+        let code = super::compile::compile_with(&with, regs).expect("compiles");
+        assert_eq!(
+            fences(code.code()),
+            1,
+            "one guest fence is one mfence under {regs:?}"
+        );
+        // The control. Without it, a backend that emitted a barrier for every
+        // *store* would pass the line above and be indistinguishable from one
+        // that lowered the fence.
+        let without =
+            super::compile::compile_with(&a_block_with_a_barrier(false), regs).expect("compiles");
+        assert_eq!(
+            fences(without.code()),
+            0,
+            "nothing but a guest fence emits an mfence under {regs:?}"
+        );
+    }
+}
+
+#[test]
+fn a_barrier_is_ordered_against_the_bookkeeping_it_follows() {
+    // What a fence being a *region* boundary buys, asserted on the bytes.
+    //
+    // `Ctx::committed` is written by the fence's own lowering and rewritten by
+    // the replay of every `insn_start` a flush carries. `Interp` runs the
+    // boundary first and the fence second, so a backend that emitted the fence
+    // ahead of the flush would leave the flag clear where the interpreter
+    // leaves it set — and a `Retry` fault later in the same guest instruction
+    // would then be reported restartable when the oracle says it is not.
+    //
+    // The block is the shape that shows it: a boundary, *no* charge (a charge
+    // would set the flag too and hide the question), a fence, then an access
+    // that faults.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    let addr = b.imm(Type::I64, Const::Int(u128::from(BASE + RAM + 8)));
+    b.emit_raw(Opcode::FENCE, Type::I64, None, None, &[], None, None, 0);
+    let bad = b.load(Type::I64, addr, MemOp::load(Width::U32));
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 0,
+        live: vec![(RegSlot(0), bad)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect("well formed");
+
+    // The load is off the end of RAM, so both engines fault — and the fault
+    // carries `restartable`, which is `committed` seen from the outside.
+    // `agree` compares the outcome whole, this one included.
+    for inline in [false, true] {
+        assert!(agree(&block, inline), "the faulting block did not compile");
+    }
+
+    // And the ordering that makes it so: the flush call comes first, the
+    // `mfence` after it. The call is the only one the backend emits.
+    let code = super::compile::compile_with(&block, Regs::Scan).expect("compiles");
+    let bytes = code.code();
+    let first_call = bytes
+        .windows(3)
+        .position(|w| w == CALL_VT)
+        .expect("the boundary is replayed by a flush");
+    let fence_at = bytes
+        .windows(3)
+        .position(|w| w == MFENCE)
+        .expect("the barrier is an mfence");
+    assert!(
+        first_call < fence_at,
+        "the fence was emitted ahead of the flush that replays the boundary before it"
+    );
+}
+
 #[test]
 fn a_thousand_random_blocks_agree_with_the_interpreter() {
     let mut compiled = 0;
+    let mut fenced = 0;
     for seed in 0..1000u64 {
         let block = random_block(seed, 6 + (seed % 11) as usize);
+        if block.insts().iter().any(|i| i.op == Opcode::FENCE) {
+            fenced += 1;
+        }
         if agree(&block, true) {
             compiled += 1;
         }
@@ -1606,6 +1775,11 @@ fn a_thousand_random_blocks_agree_with_the_interpreter() {
         compiled, 1000,
         "every generated block is within the backend"
     );
+    // The generator's coverage of the ops it is *supposed* to reach, asserted
+    // for the one whose whole contribution is a shape rather than a value: a
+    // fence defines no temporary, so nothing downstream would notice if the
+    // arm that emits it stopped being picked.
+    assert!(fenced > 100, "only {fenced} of 1000 blocks held a barrier");
 }
 
 #[test]

@@ -58,7 +58,7 @@
 //! What makes a static range the right answer is a property of the block
 //! rather than an assumption about it. A flush is emitted ahead of every
 //! instruction whose lowering can let the host observe anything — a load, a
-//! store, a slot read — ahead of every terminator, ahead of every
+//! store, a slot read, a fence — ahead of every terminator, ahead of every
 //! [`Opcode::BRCOND`], and ahead of every instruction a `brcond` targets. Each
 //! of those also **starts** a region. So no branch and no branch target lies
 //! strictly inside a region, every path that reaches a flush entered its
@@ -251,13 +251,17 @@ impl core::fmt::Display for Refusal {
 
 /// Whether this backend lowers `op`.
 ///
-/// The union of what the RISC-V and x86 frontends emit, plus the neighbours
-/// that cost nothing once their family is in. What is *not* here, and why:
+/// The union of what the RISC-V, x86 and A64 frontends emit, plus the
+/// neighbours that cost nothing once their family is in. What is *not* here,
+/// and why:
 ///
-/// * **The atomics and `fence`** — a guest atomic has to reach the host's
-///   atomic, and `IrHost::rmw` is the seam that does it. Inlining one means
-///   deciding the host memory model in generated code, which is
-///   `ROADMAP.md` §9.1's sixth mechanism and not this one.
+/// * **The atomics** — a guest atomic has to reach the host's atomic, and
+///   `IrHost::rmw` is the seam that does it. Inlining one means deciding the
+///   host memory model in generated code, which is `ROADMAP.md` §9.1's sixth
+///   mechanism and not this one. [`Opcode::FENCE`] used to sit here with
+///   them and no longer does: a fence carries no address, no value and no
+///   result, so there is nothing about it for a seam to decide — see its
+///   lowering.
 /// * **`call_helper`** — arbitrary Rust, and a barrier for the register
 ///   mapping (`ir`'s decision 4). Cheap to add later; nothing emits one yet.
 /// * **`phi`** — cannot be executed as defined, in this backend or the
@@ -304,6 +308,7 @@ pub fn compiles(op: Opcode) -> bool {
             | Opcode::BRCOND
             | Opcode::LD
             | Opcode::ST
+            | Opcode::FENCE
             | Opcode::GOTO_TB
             | Opcode::EXIT_TB
             | Opcode::LOOKUP_AND_GOTO
@@ -503,6 +508,11 @@ const fn reg_of(n: u8) -> Reg {
 /// omission: neither emits an instruction. Their call is the region's flush,
 /// which is [`CallSites::before`] instead, because it runs ahead of the
 /// instruction it is attached to rather than inside it.
+///
+/// [`Opcode::FENCE`] is not here either, and for the opposite reason: it
+/// emits an instruction but not a *call*. It still starts a region — see
+/// [`plan`] — so the allocator hears about it through the same
+/// [`CallSites::before`] array.
 const fn calls_inside(op: Opcode) -> bool {
     matches!(
         op,
@@ -553,12 +563,26 @@ impl Plan {
 ///
 /// See the module docs for why a static range is exactly what ran. The rule is
 /// one pass: an instruction is a **region boundary** when it can let the host
-/// observe something ([`calls_inside`]), when it is a terminator, when it is a
-/// `brcond`, or when a `brcond` targets it. At a boundary the pending range is
-/// flushed if it holds anything, and a new region starts at that instruction
-/// whether or not anything was flushed — dropping an empty range loses
-/// nothing, and it is what keeps the two sides of a branch agreeing about
-/// where their region began.
+/// observe something ([`calls_inside`] or [`Opcode::FENCE`]), when it is a
+/// terminator, when it is a `brcond`, or when a `brcond` targets it. At a
+/// boundary the pending range is flushed if it holds anything, and a new
+/// region starts at that instruction whether or not anything was flushed —
+/// dropping an empty range loses nothing, and it is what keeps the two sides
+/// of a branch agreeing about where their region began.
+///
+/// [`Opcode::FENCE`] is the one entry that is a region boundary without being
+/// a *call* site, and it is [`calls_inside`]'s two arrays' worth of
+/// difference: it emits no call, so the allocator hears about it only through
+/// [`CallSites::before`], which is derived from [`Plan::at`] and therefore
+/// picks it up for free. Two things go wrong without it, and both are the
+/// same mistake — a fence executing out of order against the bookkeeping that
+/// architecturally precedes it. `Ctx::committed` is written by the fence and
+/// then *overwritten* by the replay of an [`Opcode::INSN_START`] that came
+/// before it, so a `Retry` fault later in the same guest instruction would be
+/// reported restartable when `Interp` reports it not; and the flush is where
+/// a spent tick allowance unwinds a guest instruction, so a fence emitted
+/// ahead of it would have been performed on behalf of an instruction that
+/// never started.
 ///
 /// # Errors
 ///
@@ -582,7 +606,12 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
     let mut region = 0u32;
     for (i, inst) in insts.iter().enumerate() {
         let op = inst.op;
-        if target[i] || calls_inside(op) || op == Opcode::BRCOND || op.is_terminator() {
+        if target[i]
+            || calls_inside(op)
+            || op == Opcode::FENCE
+            || op == Opcode::BRCOND
+            || op.is_terminator()
+        {
             let here = events.len() as u32;
             if here > region {
                 at[i] = Some((region, here));
@@ -1324,6 +1353,41 @@ impl<'a> Compiler<'a> {
             Opcode::BRCOND => self.brcond(at, inst, w)?,
             Opcode::LD => self.load(at, inst)?,
             Opcode::ST => self.store(at, inst)?,
+            // A guest barrier, inline: three bytes and no call.
+            //
+            // **`mfence`, not nothing.** x86-TSO gives store-store and
+            // load-load ordering for free, so a guest barrier that only
+            // needed those two would compile to no instruction at all — and
+            // that is not what the IR's fence means. `IrHost::fence`'s
+            // contract is a `SeqCst` host fence, chosen there because it is
+            // the only ordering that also forbids **store-then-load**, which
+            // is precisely the reordering x86 *does* perform and precisely
+            // what a guest executed a barrier to defeat. `MFENCE` is the one
+            // instruction of the three that drains the store buffer against a
+            // later load — *Intel SDM* volume 3 §9.2.3.4 is that reordering
+            // spelled out (*Loads May Be Reordered with Older Stores to
+            // Different Locations*), and volume 2B's `MFENCE` page is the
+            // encoding. `SFENCE` and `LFENCE` are the no-ops this would be if
+            // the weakening were taken.
+            //
+            // The store to `committed` is `Interp`'s, in `Interp`'s order: a
+            // fence is an outward act other observers may already have seen,
+            // so a `Retry` after it has nothing left to restart from. `plan`
+            // makes this a region boundary so that the store lands *after*
+            // the bookkeeping it follows has been replayed.
+            //
+            // What this does not do is call `IrHost::fence`. Generated code
+            // performs the fence itself, the same way an inlined load
+            // performs an access `IrHost::load` would otherwise have made,
+            // and for the same reason: the default body is a `SeqCst` host
+            // fence, which on this host *is* this instruction, and a host
+            // that wanted more from it would have to say so through a seam
+            // that does not exist yet. Every `IrHost` in the tree takes the
+            // default.
+            Opcode::FENCE => {
+                self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 1);
+                self.asm.mfence();
+            }
             // Both of these emit **nothing**. Everything they do is an
             // [`Event`] in the region's flush — see the module docs — and
             // [`plan`] is where a malformed one is refused.
