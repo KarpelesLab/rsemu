@@ -1480,7 +1480,7 @@ impl<'a> Exec<'a> {
             // data access against any other observer, which is why the
             // architecture pairs it with a `DSB` whenever data ordering is
             // wanted. That split is worth having rather than tidy: `ISB` is
-            // 40% of the barrier stream in an arm64 Linux boot (213 000 to
+            // 31% of the barrier stream in an arm64 Linux boot (213 000 against
             // `DSB`/`DMB`'s 479 000 over 876 million instructions), and only
             // the ones in this arm leave the lifted subset — see `lift`.
             Op::Dsb | Op::Dmb => sync::fence(sync::Ordering::SeqCst),

@@ -1089,8 +1089,9 @@ fn classify(world: &World, op: Op, fmt: Fmt, word: u32, pc: u64) -> Option<Plan>
         // `ISB` is a hint here for the reason `exec` gives: it orders this
         // PE's instruction fetch and no data access against any other observer
         // (Arm DDI 0487, `ISB`), so a host fence would buy nothing. It is also
-        // 40% of the barriers an arm64 Linux boot executes, which is why the
-        // split below is worth having at all.
+        // 31% of the barriers an arm64 Linux boot executes — 213 000 against
+        // `DSB`/`DMB`'s 479 000 — which is why the split below is worth having
+        // at all.
         Op::Isb => Plan::Nop,
         // A data barrier lifts to [`Opcode::FENCE`], which is what `exec`
         // does for it: `DSB` and `DMB` are not no-ops, because a barrier is
