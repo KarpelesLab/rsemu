@@ -987,14 +987,14 @@ commentary the whole time, and this board was throwing it away.
 
 EDK II's `PlatformDebugLibIoPort` sends every `DEBUG()` and every `ASSERT()` to
 **one byte-wide I/O port**, and it asks first. The whole protocol is two
-expressions, both of them in `OvmfPkg/Library/PlatformDebugLibIoPort`
+expressions and one build-time token, all of them in `OvmfPkg`
 (BSD-2-Clause-Patent, so readable):
 
 | | |
 | --- | --- |
 | `DebugIoPortQemu.c` | `return IoRead8 (PcdGet16 (PcdDebugIoPort)) == BOCHS_DEBUG_PORT_MAGIC;` — one byte read, compared against `0xE9` |
 | `DebugLib.c` | `IoWriteFifo8 (PcdGet16 (PcdDebugIoPort), Length, Buffer)` in `DebugPrintMarker` and again in `DebugAssert`, each guarded by `PlatformDebugLibIoPortFound ()` |
-| `OvmfPkg.dec` | `PcdDebugIoPort|0x402|UINT16|4` — where `0x402` comes from, and that it is the *firmware's* build-time choice rather than a chipset's |
+| `OvmfPkg.dec` | `PcdDebugIoPort\|0x402\|UINT16\|4` — where `0x402` comes from, and that it is the *firmware's* build-time choice rather than a chipset's |
 
 `IoWriteFifo8` is `rep outsb`: byte writes, in order, to one address, with
 nothing read back between them. So there is no status register, no busy bit and
@@ -1066,10 +1066,16 @@ firmware as it happens.
 
 Four hundred seconds of virtual time gets 1,272 lines of it, through PEI, into
 the DXE core and down its driver dispatch (`NvmExpressDxe.efi`, `Fat.efi`,
-`Ps2KeyboardDxe.efi`). A `--console debug` run is held to real time by the
-console loop, so that is also about seven minutes of wall clock; the run is the
-same one either way, and `--headless` does not print it because nothing drains
-the port.
+`Ps2KeyboardDxe.efi`); 1,400 seconds gets 1,648 and ends with `Shell.efi` being
+loaded. A debug-strings build is a good deal slower than the `RELEASE` image the
+timings further up were taken with — every `DEBUG()` is a `AsciiVSPrint` and a
+few hundred `outsb` — so those numbers are not comparable with the 367-second
+one, and are not meant to be.
+
+A `--console debug` run is held to real time by the console loop, so 1,400
+seconds of virtual time is also about twenty-three minutes of wall clock. The
+run is the same one either way; `--headless` simply does not print it, because
+nothing drains the port.
 
 ### The line that would have ended the variable-store hunt
 
@@ -1091,6 +1097,35 @@ address that section works out from the firmware volume's GUID — and
 `=> Yes` is the answer that used to be `No`. It is the same finding, arrived at
 by reading rather than by inferring, and it is the argument for this device in
 one screen.
+
+### And it keeps going, all the way to the shell
+
+Given enough virtual time the same stream reaches BDS and describes the boot
+this page spent three sections establishing from the outside:
+
+```text
+[Bds]=============Begin Load Options Dumping ...=============
+  Boot Options:
+    Boot0000: UiApp 		 0x0109
+    Boot0001: UEFI RSEMU NVME CONTROLLER RSEMU000000000000000 1 		 0x0001
+    Boot0002: EFI Internal Shell 		 0x0001
+…
+VirtHstiQemuFirmwareFlashCheck: FFC84010 behaves as FLASH, write-protected
+[Bds]Booting UEFI RSEMU NVME CONTROLLER RSEMU000000000000000 1
+ BlockSize : 512 
+ LastBlock : 7FFF 
+[Bds] Expand PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,00-00-00-00-00-00-00-00) -> <null string>
+[Bds]Booting EFI Internal Shell
+Loading driver at 0x00006639000 EntryPoint=0x00006658BE0 Shell.efi
+```
+
+`FFC84010` is the *code* bank, and `write-protected` is `readonly = true` in the
+machine file being enforced and observed — the second bank of the pair, checked
+by a different driver, agreeing with the first. `LastBlock : 7FFF` is the 16 MiB
+namespace `nvme.controller` reports when no image is bound, and the `<null
+string>` expansion is the boot manager finding no file system on it and moving
+on to `Boot0002` — which is `map: No mapping found.` said from the firmware's
+side rather than the shell's.
 
 ## What is not reached yet
 
@@ -1123,16 +1158,17 @@ RSEMU_OVMF_INPUT='Shell> =>map -b\r' \
         --test q35_uefi -- --nocapture a_uefi_firmware
 ```
 
-The firmware's own log, which needs an image with debug strings in it (the 4 MiB
-`edk2-x86_64-code.fd` has them; the 2 MiB `edk2-ovmf` `OVMF_CODE.fd` is a
-`RELEASE` build and has none):
+The firmware's own log, which needs an image with debug strings in it — the
+4 MiB pair out of the local qemu firmware package has them, and the 2 MiB
+`edk2-ovmf` `OVMF_CODE.fd` `fetch-testdata.sh` copies is a `RELEASE` build and
+has none:
 
 ```console
 rsemu run q35-uefi \
-    --flash0 testdata/x86/edk2-x86_64-code.fd \
-    --flash1 testdata/x86/edk2-i386-vars.fd \
+    --flash0 /usr/share/qemu/edk2-x86_64-code.fd \
+    --flash1 /usr/share/qemu/edk2-i386-vars.fd \
     -p flash=4M -p vars=528K -p engine=jit-host \
-    --console debug --for 400s >boot.log
+    --console debug --for 1400s >boot.log
 ```
 
 `--console debug` picks the debug port's character stream rather than COM1's;
@@ -1140,7 +1176,7 @@ rsemu run q35-uefi \
 named is drained, which is why the debug console drops rather than blocks when
 nobody is listening to it.
 
-and when a boot goes quiet, the three instruments that make a silent firmware
+And when a boot goes quiet, the three instruments that make a silent firmware
 talk — the driver an address belongs to, out of the loaded image's own PE/COFF
 debug directory; the string a stack pointer is pointing at; and a hex dump
 through the guest's page tables:
