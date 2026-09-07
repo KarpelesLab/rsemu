@@ -139,4 +139,5 @@ pub use dispatch::{
 pub use fast::{FastMem, MemPlan};
 pub use tlb::{
     Context, DEFAULT_ENTRIES, Epoch, FastSet, PAGE_MASK, PAGE_SIZE, STAMP_BITS, Tlb, TlbStats,
+    executable_run,
 };

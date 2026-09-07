@@ -657,6 +657,11 @@ pub(super) fn advance(
         // is exactly the device. Nothing about the *translation* is relaxed:
         // that happened above, through the fetch path, with its walk and its
         // accessed bit.
+        //
+        // What a debug read does relax is the **mapping's** `Perms::EXEC`, and
+        // deliberately — `MemAttrs::read_perm` will not ask for it when
+        // `MemAttrs::debug` is set. `Lifter::translate` therefore asks for it
+        // separately rather than through these attributes.
         attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
         unlifted,
         admitted: true,
@@ -894,11 +899,41 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         PC
     }
 
+    /// Lift at `pc`, reading only what the entry translation covers **and what
+    /// the bus would let this hart fetch**.
+    ///
+    /// The second half is the one that is not obvious. [`admit`] has already
+    /// run the *MMU* fetch path, so `satp`'s page tables and PMP have had their
+    /// say; what it has not consulted is the mapping's
+    /// [`Perms::EXEC`](crate::core::space::Perms::EXEC), because that is
+    /// enforced against a read carrying `AccessPurpose::FETCH` and the reads
+    /// below deliberately carry [`MemAttrs::DEBUG`] instead — a lift must not
+    /// put a NOR bank into its command state. So the permission is asked for
+    /// separately, by [`jit::executable_run`](crate::jit::executable_run), and
+    /// the bytes still come out with no side effects.
+    ///
+    /// Per *halfword* rather than per page, because a flat entry is not a page:
+    /// a 4 KiB page can hold an executable mapping and a non-executable one,
+    /// and the interpreter would fetch its way to the boundary and take an
+    /// instruction access fault there. A lift that stops at the same halfword
+    /// leaves the interpreter standing on the same instruction, which is what
+    /// makes the two engines report the same cause at the same `mepc`. The
+    /// probe is memoised over the run the entry covers, so the ordinary
+    /// whole-page-one-mapping case pays for one.
+    ///
+    /// **Nothing here is on the block-entry path.** This runs once per
+    /// translation; a cached block re-enters through [`admit`] and touches none
+    /// of it. That is sound because a permission change is a retopology, and
+    /// [`Frontend::epoch`] already drops every block lifted before it.
     fn translate(&mut self, pc: u64) -> Result<Translation> {
         let space = self.space;
         let attrs = self.attrs;
         let base = self.at.base;
         let page = self.at.page;
+        // Empty: `run.0 > run.1`, so nothing is inside it and the first
+        // halfword probes.
+        let mut run = (1u64, 0u64);
+        let mut refused = false;
         let mut src = |addr: u64| {
             // Outside the entry page there is no translation to read through,
             // so the lifter is told the bytes are unreadable and ends the
@@ -907,10 +942,23 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
             if addr & !PAGE_MASK != page {
                 return None;
             }
-            space
-                .read(base | (addr & PAGE_MASK), Width::U16, attrs)
-                .ok()
-                .map(|v| v as u16)
+            let phys = base | (addr & PAGE_MASK);
+            let end = phys.wrapping_add(2);
+            if phys < run.0 || end > run.1 {
+                match crate::jit::executable_run(space, phys) {
+                    // The whole halfword has to be inside one permitting run.
+                    // One straddling two of them is refused rather than
+                    // stitched: the interpreter would ask the bus twice and
+                    // this would have to model both answers, and handing the
+                    // instruction to the interpreter is always right.
+                    Some(r) if phys >= r.0 && end <= r.1 => run = r,
+                    _ => {
+                        refused = true;
+                        return None;
+                    }
+                }
+            }
+            space.read(phys, Width::U16, attrs).ok().map(|v| v as u16)
         };
         let lifted = lift::lift(
             self.cfg,
@@ -927,7 +975,14 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         }
         // A lift that produced nothing is remembered, which is what sends the
         // next pass straight to the interpreter instead of back through here.
-        if lifted.insns == 0 {
+        //
+        // Except a lift the **bus** refused outright. That is the same outcome
+        // and a different fact: [`Unlifted`]'s only cleaner is a store into a
+        // lifted page, so an entry written here would outlive the retopology
+        // that granted `Perms::EXEC` and pin the PC to the interpreter for the
+        // rest of the run. Never a wrong answer — the interpreter is the
+        // oracle — just a permanent one.
+        if lifted.insns == 0 && !refused {
             self.unlifted.note(pc, self.at.key);
         }
         Ok(Translation {
@@ -1115,7 +1170,7 @@ impl FastMem for Host<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::space::{Mapping, MonitorSlot, RamStore, Region};
+    use crate::core::space::{Mapping, MonitorSlot, Perms, RamStore, Region};
     use crate::cpu::riscv::{Engine, Hart};
 
     /// How much RAM a test hart gets, at address zero.
@@ -1155,20 +1210,32 @@ mod tests {
 
     /// A hart with `program` at zero and [`RAM`] bytes of RAM under it.
     fn hart(engine: Engine, program: &[u32]) -> Hart {
+        hart_mapped(engine, program, Perms::RWX)
+    }
+
+    /// [`hart`], with the RAM mapped on `perms` rather than on everything.
+    fn hart_mapped(engine: Engine, program: &[u32], perms: Perms) -> Hart {
         let ram = Arc::new(RamStore::new(RAM));
-        for (i, word) in program.iter().enumerate() {
-            for (j, byte) in word.to_le_bytes().iter().enumerate() {
-                ram.write_u8((i * 4 + j) as u64, *byte).expect("in range");
-            }
-        }
+        write_words(&ram, 0, program);
         let space = AddressSpace::new("mem", 64);
         space
             .topology()
-            .map(Region::ram("ram", ram), 0)
+            .map_with_perms(Region::ram("ram", ram), 0, perms)
             .expect("nothing else is mapped");
         let hart = Hart::new(Config::rv64gc().with_reset_vector(0)).with_engine(engine);
         hart.attach_space(Arc::new(space));
         hart
+    }
+
+    /// `words` into `store`, little-endian, starting at `at`.
+    fn write_words(store: &RamStore, at: u64, words: &[u32]) {
+        for (i, word) in words.iter().enumerate() {
+            for (j, byte) in word.to_le_bytes().iter().enumerate() {
+                store
+                    .write_u8(at + (i * 4 + j) as u64, *byte)
+                    .expect("in range");
+            }
+        }
     }
 
     /// Run both harts on the same budgets and compare everything a guest, a
@@ -1184,8 +1251,23 @@ mod tests {
     }
 
     fn agree_on(engine: Engine, program: &[u32], budget: u64, quanta: usize) -> (Hart, Hart) {
-        let interp = hart(Engine::Interp, program);
-        let jit = hart(engine, program);
+        agree_built(engine, |e| hart(e, program), budget, quanta)
+    }
+
+    /// [`agree_on`], over a fixture that builds its own address space.
+    ///
+    /// The permission cases need two mappings with different [`Perms`] rather
+    /// than one flat RAM, and every column [`agree_on`] compares is exactly the
+    /// set they care about — an instruction access fault is `mcause`, `mepc`,
+    /// `mtval` and a PC.
+    fn agree_built(
+        engine: Engine,
+        build: impl Fn(Engine) -> Hart,
+        budget: u64,
+        quanta: usize,
+    ) -> (Hart, Hart) {
+        let interp = build(Engine::Interp);
+        let jit = build(engine);
         for n in 0..quanta {
             let a = interp.run_budget(budget);
             let b = jit.run_budget(budget);
@@ -1222,6 +1304,115 @@ mod tests {
         assert_eq!(interp.csrs().mepc, jit.csrs().mepc, "mepc");
         assert_eq!(interp.csrs().mtval, jit.csrs().mtval, "mtval");
         (interp, jit)
+    }
+
+    /// Two instructions on an executable page, the second a jump into the
+    /// *next* page — which is mapped without [`Perms::EXEC`].
+    ///
+    /// The jump leaves the page, so the block ends and the refusal lands at a
+    /// **chained** boundary, through `Frontend::enter` and
+    /// `Frontend::translate` rather than through [`advance`]'s prologue.
+    const INTO_NX: [u32; 2] = [
+        0x0010_0313, // addi x6, x0, 1
+        0x7fd0_006f, // jal  x0, 0xffc     ; from 0x4 to 0x1000
+    ];
+
+    /// What sits on the page that may not be fetched.
+    ///
+    /// Both instructions are inside the lifted subset and neither traps, so a
+    /// lifter that never asks about execute permission produces a real block
+    /// out of it and runs it — which is exactly the divergence.
+    const NX_PAGE: [u32; 2] = [
+        0x0070_0293, // addi x5, x0, 7
+        0x0000_006f, // jal  x0, 0
+    ];
+
+    /// A hart whose first page may be fetched and whose second may not.
+    ///
+    /// Two stores and two mappings rather than one store and two permissions,
+    /// because permission is a property of the mapping — and this is the shape
+    /// a board with a data-only aperture beside its ROM actually has.
+    fn split_hart(engine: Engine) -> Hart {
+        let code = Arc::new(RamStore::new(0x1000));
+        write_words(&code, 0, &INTO_NX);
+        let data = Arc::new(RamStore::new(0x1000));
+        write_words(&data, 0, &NX_PAGE);
+        let space = AddressSpace::new("mem", 64);
+        {
+            let mut topo = space.topology();
+            topo.map_with_perms(Region::ram("code", code), 0, Perms::RX)
+                .expect("nothing else is mapped");
+            topo.map_with_perms(Region::ram("nx", data), 0x1000, Perms::RW)
+                .expect("it does not overlap the code");
+        }
+        let hart = Hart::new(Config::rv64gc().with_reset_vector(0)).with_engine(engine);
+        hart.attach_space(Arc::new(space));
+        hart
+    }
+
+    /// [`Perms::EXEC`] is enforced against a *translated* block, not only
+    /// against an interpreted fetch.
+    ///
+    /// `MemAttrs::purpose` makes a fetch a fetch and `FlatLeaf::read` refuses
+    /// one on a mapping without [`Perms::EXEC`] — but only the interpreter's
+    /// fetch *is* that read. A lift reads ahead of the guest and therefore
+    /// reads with [`MemAttrs::DEBUG`], which by design never asks for `EXEC`,
+    /// and [`admit`] consults the *MMU* and PMP rather than the mapping. Before
+    /// `jit::executable_run` this fixture ran the whole loop under the JIT
+    /// while the interpreter took an instruction access fault on its first
+    /// instruction.
+    ///
+    /// The reset vector itself is on the refusing mapping here, so the refusal
+    /// is in [`advance`]'s prologue: the very first lift.
+    #[test]
+    fn a_mapping_without_exec_refuses_a_translated_block_too() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let (interp, jit) = agree_built(engine, |e| hart_mapped(e, &LOOP, Perms::RW), 1000, 4);
+            assert_eq!(
+                interp.csrs().mcause,
+                cause::INSN_ACCESS,
+                "the interpreter took some other trap, so this fixture is not \
+                 about execute permission under {engine:?}"
+            );
+            assert_eq!(
+                interp.x(5),
+                0,
+                "the loop body ran on a mapping that refuses a fetch"
+            );
+            assert_eq!(
+                jit.jit_stats().expect("a jit hart").0,
+                0,
+                "a block ran out of a mapping whose fetch the interpreter \
+                 refuses, under {engine:?}"
+            );
+        }
+    }
+
+    /// The same claim at a **chained** boundary, which is the only way to reach
+    /// `Frontend::enter` and the one path [`advance`]'s prologue does not
+    /// cover.
+    #[test]
+    fn a_chain_into_a_non_executable_page_faults_where_the_interpreter_does() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let (interp, jit) = agree_built(engine, split_hart, 1000, 4);
+            assert_eq!(
+                interp.csrs().mcause,
+                cause::INSN_ACCESS,
+                "the interpreter took some other trap under {engine:?}"
+            );
+            assert_eq!(
+                interp.x(5),
+                0,
+                "the non-executable page ran under the interpreter, so the \
+                 fixture is not testing what it says it is"
+            );
+            let blocks = jit.jit_stats().expect("a jit hart").0;
+            assert!(
+                blocks > 0,
+                "the executable page never produced a block, so nothing was \
+                 chained *from* and the boundary is untested"
+            );
+        }
     }
 
     #[test]
