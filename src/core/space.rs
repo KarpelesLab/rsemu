@@ -1011,12 +1011,48 @@ impl SpaceView<'_> {
     /// As [`SpaceView::read`].
     #[inline]
     pub fn write(&self, addr: u64, width: Width, value: u64, attrs: MemAttrs) -> MemResult {
-        let n = width.bytes() as usize;
+        let total = width.bytes();
+        let n = usize_of(total);
         let mut buf = [0u8; 8];
-        // Byte order has to be known before the bytes exist, so the target is
-        // located twice for a write. The second lookup is a dispatch-table
-        // index or a binary search, not a tree walk — and both happen under
-        // this one guard, so they cannot disagree.
+        // Byte order has to be known before the bytes exist, and the target has
+        // to be known to put them anywhere; both answers come from one entry,
+        // so it is found **once**. The general path below finds it twice —
+        // `endian_at`, then again inside `write_span` — and that second lookup
+        // plus the span loop's scaffolding is **85 host instructions of 389**
+        // for a four-byte store (callgrind, `AddressSpace::write` against a
+        // `Region::ram`: 389 → 304, with the read path unmoved at 327 as the
+        // control). The write path was 19% above the read path's instruction
+        // count for the same access and is now below it.
+        //
+        // The wall-clock win is a fifth of that — ~1.1 ns of 24.7, best of five
+        // in `tests/memory_model_costs.rs` — and why the two disagree is worth
+        // writing down, because it says where the rest of this path's cost
+        // actually is. `RamStore::mark_dirty` ends every store with a locked
+        // read-modify-write, which on x86-64 drains the store buffer
+        // (`tests/memory_model_litmus.rs` names that accident and what now
+        // depends on it). Consecutive stores therefore cannot overlap, so what
+        // is left runs at an IPC no instruction count predicts, and removing
+        // whole instructions buys less than shortening the *dependency chain*
+        // would.
+        //
+        // The fast path is the whole access landing in one entry, which is
+        // every ordinary store: a value-typed access crosses a region boundary
+        // only on a bus that permits one, and then it takes the loop below.
+        if let Some(i) = self.locate(addr) {
+            let e = self.topo.flat.entry(i).expect("index came from locate");
+            let rel = addr - e.start();
+            if e.write_run_len(rel) >= total {
+                e.endian().store(&mut buf[..n], width, value)?;
+                // Before the transfer and never for a debug access, for the
+                // reasons `write_span` states at length.
+                if !attrs.debug {
+                    self.space.monitor.note_store(addr, total);
+                }
+                return e.write(rel, &buf[..n], attrs, Some(width));
+            }
+        }
+        // Nothing mapped here, or the access straddles two entries: the
+        // general path, which has to locate per run in any case.
         self.endian_at(addr).store(&mut buf[..n], width, value)?;
         self.write_span(addr, &buf[..n], attrs, Some(width))
     }

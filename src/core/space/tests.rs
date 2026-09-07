@@ -865,6 +865,77 @@ fn retry_is_returned_before_a_commit_and_refused_after_one() {
         space.write_bytes(0, &[0; 8], MemAttrs::DEFAULT),
         Err(BusError::BadAccess)
     );
+
+    // A value-typed write reaches the busy region through `SpaceView::write`'s
+    // single-entry fast path rather than the span loop, and `Retry` is still
+    // the right answer there: one region, nothing transferred, nothing to
+    // re-run twice.
+    assert_eq!(
+        space.write(4, Width::U32, 0, MemAttrs::DEFAULT),
+        Err(BusError::Retry)
+    );
+}
+
+/// A value-typed write that does not fit in one flat entry.
+///
+/// [`SpaceView::write`] resolves the target once and transfers inline when the
+/// whole access lands in one entry, which is every ordinary store. This is the
+/// case that fast path has to decline, in the two shapes that produce it: a
+/// mirror, where one entry cannot carry a run across its own wrap, and two
+/// adjacent regions. Both must behave exactly as the span loop always did —
+/// the byte order is the entry the access *starts* in, and the bytes are split
+/// in ascending address order.
+#[test]
+fn a_value_write_across_two_entries_splits_and_keeps_the_first_entrys_order() {
+    // A mirror: one flat entry, but a run that stops at the wrap.
+    let space = AddressSpace::new("mem", 16);
+    let (store, region) = ram("ram", 0x800);
+    let mirrored = Region::mirror("ram-mirror", region, 0x2000).unwrap();
+    space.topology().map(mirrored, 0).unwrap();
+    space
+        .write(0x07fe, Width::U32, 0x1234_5678, MemAttrs::DEFAULT)
+        .unwrap();
+    let mut buf = [0u8; 2];
+    store.read_at(0x7fe, &mut buf).unwrap();
+    assert_eq!(buf, [0x78, 0x56], "the low half lands before the wrap");
+    store.read_at(0x000, &mut buf).unwrap();
+    assert_eq!(buf, [0x34, 0x12], "and the high half after it");
+    assert_eq!(
+        space.read(0x07fe, Width::U32, MemAttrs::DEFAULT).unwrap(),
+        0x1234_5678,
+        "and it reads back as the value that was written"
+    );
+
+    // Two regions, the first big-endian. Which order the value is laid out in
+    // is decided by the entry at `addr`, and that is unchanged by locating it
+    // once instead of twice.
+    let space = AddressSpace::new("mem", 16);
+    let be_store = Arc::new(RamStore::new(2));
+    space
+        .topology()
+        .map(
+            Region::ram("be", be_store.clone())
+                .with_constraints(AccessConstraints::ANY.with_endian(Endian::Big)),
+            0x100,
+        )
+        .unwrap();
+    let (le_store, le) = ram("le", 2);
+    space.topology().map(le, 0x102).unwrap();
+    space
+        .write(0x100, Width::U32, 0x1122_3344, MemAttrs::DEFAULT)
+        .unwrap();
+    be_store.read_at(0, &mut buf).unwrap();
+    assert_eq!(
+        buf,
+        [0x11, 0x22],
+        "big-endian, from the entry the write started in"
+    );
+    le_store.read_at(0, &mut buf).unwrap();
+    assert_eq!(
+        buf,
+        [0x33, 0x44],
+        "and the second region takes the rest of that same wire order"
+    );
 }
 
 // ---------------------------------------------------------------------------
