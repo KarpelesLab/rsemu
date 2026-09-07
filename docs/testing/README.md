@@ -7,6 +7,13 @@ is the catalogue and the licence table; this is the operating manual.
 The harness lives in [`tests/conformance/`](../../tests/conformance) and is one
 Cargo test target, `conformance`.
 
+One measurement here is **not** a conformance suite and has its own page:
+[`long-run.md`](long-run.md) runs the interpreter against each translated engine
+quantum by quantum over a real guest, which is what `ROADMAP.md` §0's
+"bit-identical state hash across the interpreter and the JIT" needs to mean
+something past the first millisecond. It follows the same fixture rules as
+everything below — fetched, never committed, and it skips loudly without one.
+
 ## Two commands
 
 ```sh

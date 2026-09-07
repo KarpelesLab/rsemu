@@ -205,6 +205,7 @@ would answer that the machine file does not.
 | [`testing/conformance-suites.md`](testing/conformance-suites.md) | Every suite, **with its licence** and whether it may be vendored |
 | [`testing/cpu-interface.md`](testing/cpu-interface.md) | The four methods a 6502 core must expose for the harness to drive it |
 | [`testing/accuracycoin.md`](testing/accuracycoin.md) | Reading AccuracyCoin's 141 results out of RAM with no screen and no controller |
+| [`testing/long-run.md`](testing/long-run.md) | The interpreter against each translated engine, quantum by quantum, over a real guest — the gate two engine defects went through |
 
 ## Deliberately excluded
 

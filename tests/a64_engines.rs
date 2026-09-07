@@ -19,12 +19,30 @@
 //!   to the same hash, which is a property of the snapshot rather than of the
 //!   engines: nothing engine-specific is in one.
 //!
+//! # What forty quanta cannot see, and where that lives now
+//!
+//! Two engine defects went through every test in this file. One first parted
+//! from the interpreter at **15.04 s** of guest time and the other at
+//! **23.46 s** (`docs/platforms/arm64-virt.md`); both moved *where a quantum
+//! ends* rather than what an instruction computes, and forty quanta of the loop
+//! below is about four hundred microseconds of guest time. Re-introducing
+//! either one leaves this file green — that was measured, not assumed
+//! (`docs/testing/long-run.md`).
+//!
+//! So this file is the cheap per-commit check that the engines are the same
+//! machine at all, and [`tests/engine_longrun.rs`](../engine_longrun.rs) is the
+//! gate: the same comparison, one quantum at a time, over minutes of a real
+//! kernel boot, naming the first quantum anything parts. Keep both. This one
+//! costs 80 ms and catches a broken engine immediately; that one costs minutes
+//! and a fetched kernel and catches the rest.
+//!
 //! # Why the board is built here rather than taken from `machines/`
 //!
-//! `machines/arm64-virt.machine` writes `engine = "interp"` as a literal
-//! rather than as a `param`, so there is nothing for a test to override, and
-//! it wants a kernel image besides. `machines/a64-mini.machine` wants a
-//! firmware. So this file builds the smallest machine that is entirely inside
+//! `machines/arm64-virt.machine` wants a kernel image, which cannot be
+//! committed here, and `machines/a64-mini.machine` wants a firmware. (Its
+//! `engine` *is* a `param` — that is what `tests/engine_longrun.rs` overrides
+//! for the kernel gate — but a board with no guest to run compares nothing.)
+//! So this file builds the smallest machine that is entirely inside
 //! the lifted subset: a clock, RAM and a core — which is also what makes the
 //! comparison about the engines and nothing else.
 //!
