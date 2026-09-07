@@ -51,13 +51,18 @@ impl Perms {
     pub const WRITE: Perms = Perms(2);
     /// Instructions may be fetched from the mapping.
     ///
-    /// **Carried, not enforced.** Telling a fetch from a load is the master's
-    /// job and no rsemu core marks one yet, so nothing here can distinguish
-    /// them; enforcing it would put an unconditional branch on the read path
-    /// for a bit nothing sets. The bit exists so a consumer's `PROT_EXEC`
-    /// survives a round trip through a mapping and a snapshot, and so that the
-    /// day a core marks its fetches this becomes a one-line change rather than
-    /// a schema change.
+    /// **Enforced against a read that says it is a fetch**, and only that: a
+    /// master marks one by carrying [`AccessPurpose::FETCH`] in
+    /// [`MemAttrs::purpose`], and a read that does not is checked for
+    /// [`Perms::READ`] exactly as before. A fetch is checked for `EXEC`
+    /// *instead of* `READ`, not as well as it — an execute-only mapping is a
+    /// real thing (AArch64 permits `--x` at EL0, and `mprotect(PROT_EXEC)`
+    /// asks for it), so requiring [`Perms::RX`] would refuse a mapping the
+    /// hardware allows.
+    ///
+    /// Which cores mark their fetches is written down in the module header of
+    /// [`space`](super); the ones that do not are the ones with nowhere to
+    /// deliver the fault, and they read exactly as they always did.
     pub const EXEC: Perms = Perms(4);
     /// Readable and writable — ordinary memory.
     pub const RW: Perms = Perms(3);
@@ -147,6 +152,65 @@ impl fmt::Display for RequesterId {
     }
 }
 
+/// What an access is *for*, as opposed to which direction it goes.
+///
+/// Direction is not here, and deliberately: an access reaches a region through
+/// [`MemOps::read`] or [`MemOps::write`], so a `DataRead`/`DataWrite`/`Fetch`
+/// enumeration would state the direction a second time and create a value — a
+/// write carrying `DataRead` — that means nothing and that some region would
+/// eventually believe. What is *not* already implied by the method is what the
+/// master wanted the bytes for, and that is what this says.
+///
+/// A `#[repr(transparent)]` newtype with `pub const` variants rather than the
+/// `fetch: bool` the first sketch of this asked for, for the reason the crate
+/// prefers that shape generally: it grows. The purposes after `FETCH` are already visible — a
+/// hardware page-table walk (which both AArch64's `ESR` and x86's `PFEC`
+/// report separately from the access that provoked it), a cache-maintenance
+/// operation, a speculative prefetch — and each of those is a *different value
+/// of one field* rather than another bool, which would make `fetch && walk`
+/// expressible and meaningless.
+///
+/// Only `FETCH` is enforced. The rest is room, not a promise.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AccessPurpose(pub u8);
+
+impl AccessPurpose {
+    /// An ordinary load or store, and the default. A master that has never
+    /// heard of this type behaves exactly as it did before it existed.
+    pub const DATA: AccessPurpose = AccessPurpose(0);
+    /// An instruction fetch: the bytes are going to a decoder.
+    ///
+    /// Checked against [`Perms::EXEC`] rather than [`Perms::READ`] on the way
+    /// through a mapping. A master sets it only if it can turn the resulting
+    /// [`BusError::Protected`] into something the guest can see.
+    pub const FETCH: AccessPurpose = AccessPurpose(1);
+
+    /// Whether this is [`AccessPurpose::FETCH`].
+    #[inline]
+    #[must_use]
+    pub const fn is_fetch(self) -> bool {
+        self.0 == AccessPurpose::FETCH.0
+    }
+}
+
+impl Default for AccessPurpose {
+    /// [`AccessPurpose::DATA`].
+    fn default() -> Self {
+        AccessPurpose::DATA
+    }
+}
+
+impl fmt::Display for AccessPurpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            AccessPurpose::DATA => f.write_str("data"),
+            AccessPurpose::FETCH => f.write_str("fetch"),
+            AccessPurpose(n) => write!(f, "purpose#{n}"),
+        }
+    }
+}
+
 /// Everything about an access that is not its address, width, or direction.
 ///
 /// Carried on every access because retrofitting it is a rewrite of every
@@ -187,6 +251,12 @@ pub struct MemAttrs {
     /// per core, which [`RequesterId`] cannot supply (two `usermode` threads
     /// over one map are two cores with one requester id).
     pub exclusive: bool,
+    /// What the master wants the bytes for.
+    ///
+    /// [`AccessPurpose::FETCH`] on a read is the one thing that makes
+    /// [`Perms::EXEC`] mean anything: the permission check asks for `EXEC`
+    /// instead of `READ`. Ignored on a write — nothing fetches a store.
+    pub purpose: AccessPurpose,
     /// The access comes from a debugger, a monitor, or a snapshot, and **must
     /// have no side effects** — no FIFO pop, no status-bit clear, no pointer
     /// advance (`ROADMAP.md` §15, invariant 5).
@@ -230,6 +300,7 @@ impl MemAttrs {
         secure: false,
         privileged: false,
         exclusive: false,
+        purpose: AccessPurpose::DATA,
         debug: false,
         bus: 0,
         core_bus: 0,
@@ -244,6 +315,10 @@ impl MemAttrs {
         secure: true,
         privileged: true,
         exclusive: false,
+        // A debugger disassembling a page reads it; it does not execute it.
+        // `MemAttrs::read_perm` refuses to ask for `EXEC` on a debug access
+        // whatever this field says, and this field says the same thing anyway.
+        purpose: AccessPurpose::DATA,
         debug: true,
         bus: 0,
         core_bus: 0,
@@ -296,6 +371,45 @@ impl MemAttrs {
     pub const fn with_debug(mut self, debug: bool) -> Self {
         self.debug = debug;
         self
+    }
+
+    /// Same attributes, made for `purpose`.
+    ///
+    /// The one call a CPU core's fetch path makes that its load path does not.
+    #[must_use]
+    pub const fn with_purpose(mut self, purpose: AccessPurpose) -> Self {
+        self.purpose = purpose;
+        self
+    }
+
+    /// Whether this access is an instruction fetch.
+    #[inline]
+    #[must_use]
+    pub const fn is_fetch(self) -> bool {
+        self.purpose.is_fetch()
+    }
+
+    /// The permission a **read** carrying these attributes has to find in the
+    /// mapping it lands on.
+    ///
+    /// One place, because two would drift: the flat view's leaf check and the
+    /// JIT's software TLB both ask this question, and an answer that differed
+    /// would make a page executable exactly when it got hot.
+    ///
+    /// A debug access is a data read whatever its purpose says. A monitor
+    /// disassembling a range that does not permit execution is doing the one
+    /// thing a debugger exists for, and refusing it would buy nothing —
+    /// unlike a refused *write*, which prevents a real side effect and is
+    /// therefore enforced against a debugger too (`ROADMAP.md` §15,
+    /// invariant 5).
+    #[inline]
+    #[must_use]
+    pub const fn read_perm(self) -> Perms {
+        if self.purpose.is_fetch() && !self.debug {
+            Perms::EXEC
+        } else {
+            Perms::READ
+        }
     }
 }
 

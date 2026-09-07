@@ -81,6 +81,68 @@
 //! permission — both directions resolve to the same winner, and every entry is
 //! the shape it always was.
 //!
+//! # A fetch is not a load, and [`Perms::EXEC`] is where that matters
+//!
+//! [`Perms::EXEC`] was carried and unenforced for a long time, and the reason
+//! was never cost: by the time an access arrived here it was *a read of some
+//! width at some address*, and nothing in that tuple said which of the guest's
+//! two reasons for reading had produced it. So the master says.
+//! [`MemAttrs::purpose`] carries an [`AccessPurpose`], a read marked
+//! [`AccessPurpose::FETCH`] is checked for [`Perms::EXEC`] instead of
+//! [`Perms::READ`], and everything else is unchanged.
+//!
+//! Three decisions are worth stating rather than reading back out of the code.
+//!
+//! * **A purpose, not a `fetch: bool`.** The distinction the permission check
+//!   needs today is fetch-or-not, but the field's neighbours are already
+//!   architectural: a hardware page-table walk and a cache-maintenance
+//!   operation are separate rows in AArch64's `ESR` and x86's page-fault error
+//!   code, and both are reads that a region may legitimately answer
+//!   differently. Those are values of one field. Two bools would make
+//!   `fetch && walk` a thing you could write.
+//! * **`EXEC`, not `RX`.** An execute-only mapping is real — AArch64 permits
+//!   `--x` at EL0 and `mprotect(PROT_EXEC)` asks for exactly it — so a fetch
+//!   asks for `EXEC` alone. A text segment is [`Perms::RX`], which contains
+//!   it, so the ordinary case is unaffected either way.
+//! * **A debug access is always a data read.** A monitor disassembling a range
+//!   that does not permit execution is a debugger doing its job, and
+//!   [`MemAttrs::read_perm`] will not ask for `EXEC` when [`MemAttrs::debug`]
+//!   is set. That is the opposite of the write side, where a refused write
+//!   *prevents* a side effect and is therefore enforced against a debugger too.
+//!
+//! **Which masters mark a fetch** — the honest boundary, because a refusal is
+//! only worth raising by a core that can deliver it to the guest:
+//!
+//! | Core | Marks a fetch | Where a refusal lands |
+//! | --- | --- | --- |
+//! | `cpu-arm-a64` | yes | instruction abort, `ESR_ELx.EC = 0x20/0x21` |
+//! | `cpu-arm` (A-profile) | yes | prefetch abort, external fault |
+//! | `cpu-arm-v7m` | yes | `BusFault`, escalating to `HardFault` |
+//! | `cpu-mips` | yes | `IBE` — bus error (instruction fetch) |
+//! | `cpu-riscv` | yes | instruction access fault, cause 1 |
+//! | `cpu-x86` | **no** | nowhere: an x86 has no bus-error input, so a refused fetch would silently become open bus rather than a fault. Execute permission on x86 is `NX` in the page tables, which `cpu::x86::paging` already enforces, and adding a bus-level refusal it could not report would trade a missing check for a wrong instruction stream. |
+//! | 6502, Z80, SM83, m68k | **no** | nowhere, and nothing asks: no MMU, no execute permission, and a refused access on those buses is open bus. Their boards use [`Perms`] for ROM write protection only. |
+//!
+//! Two limitations, recorded rather than papered over.
+//!
+//! * The flattener resolves a read winner with [`Perms::READ`], so an
+//!   *execute-only* mapping stacked under a higher-priority readable one loses
+//!   the fetch to the readable one and the fetch then fails. That needs a third
+//!   winner scan and a third leaf per entry, which the note on
+//!   [`FlatEntry::write_to`] measures at 4% of a frame for a shape no board
+//!   has. A board that wants both must not overlap them.
+//! * **The interpreters enforce this; the translating engines do not.** A
+//!   `jit` build admits a block on its MMU translation alone (`Exec::
+//!   translate_fetch` on a64, the shadow TLB's plan on RISC-V) and lifts it
+//!   through a [`MemAttrs::DEBUG`] read, so a mapping without [`Perms::EXEC`]
+//!   refuses the interpreter's fetch and does not refuse a translated block's.
+//!   Latent rather than live — no board in the catalogue maps a fetched region
+//!   without `EXEC`, and `usermode`, which does, runs the interpreter — but it
+//!   is a real interpreter/engine divergence and the interpreter is the oracle.
+//!   Closing it belongs with whoever owns the admission path: the cheap place
+//!   is the lift, because a permission change is a retopology and the
+//!   generation bump already drops every block lifted under the old terms.
+//!
 //! **The fault does not resolve itself.** It cannot: the access holds the
 //! space's read guard and resolving means a retopology, which is the lock
 //! inversion this module's ladder exists to forbid. So a permission fault
@@ -205,7 +267,9 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-pub use attrs::{AccessConstraints, MemAttrs, MemOps, MemResult, Perms, RequesterId};
+pub use attrs::{
+    AccessConstraints, AccessPurpose, MemAttrs, MemOps, MemResult, Perms, RequesterId,
+};
 pub use buslock::{BusLock, BusLockGuard};
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
 pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView};

@@ -503,137 +503,134 @@ worth more here than four probe syscalls. There is no vDSO either
 (`AT_SYSINFO_EHDR` is absent), because a vDSO is *guest code* and level 3 has
 no kernel to have supplied it.
 
-### `PROT_EXEC` is bookkeeping, and here is where that would bite
+### `PROT_EXEC` is enforced, and here is where that lands
 
 `Perms::EXEC` is carried through `mmap`, `mprotect` and `/proc/self/maps`, and
-**it is not enforced** — an instruction fetch from a page that does not permit
-execution succeeds. That was harmless while every level-3 guest was one static
-image whose text the loader mapped `R-X` and never touched again.
+**it is now enforced**: an instruction fetch from a page that does not permit
+execution is refused by the mapping, and the guest takes an architectural
+fault at the instruction that could not be fetched.
 
-A dynamic loader makes the shape it would catch a real one. `ld.so` maps a
-library's whole span, `MAP_FIXED`es each segment over it at the segment's own
-protection, and `mprotect`s the relocated-read-only region down at the end; a
-`W^X` mistake anywhere in that sequence is exactly what `PROT_EXEC` exists to
-report. Under this consumer such a mistake runs anyway, and a guest that jumped
-into its own `.data` would get away with it where Linux delivers `SIGSEGV`.
+This section used to be a request rather than a description — it recorded a
+gap, argued that closing it belonged in `core::space` and `cpu/` rather than
+here, and wrote out the shape of the change. The change landed close to that
+shape, with one deliberate difference, and the record of what it cost is worth
+more than the request was.
 
-Nothing here depends on the gap and nothing works because of it — the loaded
-guests set the right protections and never need them checked. It is written
-down because the population of programs that could notice just grew from "the
-one we wrote" to "anything with a `PT_INTERP`", and because enforcing it is a
-question about `core::space`'s access path rather than about this layer.
+#### The mechanism
 
-The third-party guests below **do not** make it more acute, and that is worth
-recording rather than leaving to be assumed: SQLite, Lua and sbase map no code
-of their own — every `mmap` they make is data or anonymous heap, and none of
-them calls `mprotect` at all. A dynamic loader is still the only thing here
-that builds an executable mapping after the loader has run.
+Three pieces, and only the first is new machinery:
 
-The whole-glibc guests in the next section **do** make it more acute, and they
-are the reason this is written up rather than left as a note. There are four of
-them now, on two architectures, and each is a real `ld.so` doing exactly the
-sequence described above — half a dozen `mprotect`s per run, over spans it just
-mapped from a descriptor. Nothing has gone wrong; the point is that if
-something did, nothing here would say so.
+1. **`MemAttrs::purpose`**, an `AccessPurpose` — a `#[repr(transparent)]`
+   newtype with `DATA` and `FETCH` constants, not the `fetch: bool` this
+   section originally asked for. Direction is not in it: an access reaches a
+   region through `read` or `write`, so a `DataRead`/`DataWrite`/`Fetch`
+   enumeration would restate the direction and make a write carrying
+   `DataRead` expressible. A purpose grows where a bool cannot — a hardware
+   page-table walk and a cache-maintenance operation are separate rows in
+   AArch64's `ESR` and x86's page-fault error code, and both are reads a
+   region may legitimately answer differently. `DATA` is zero, so
+   `MemAttrs::DEFAULT` and `MemAttrs::DEBUG` mean what they always did.
+2. **Each core's fetch path setting it**, in the one place a core already
+   knows which it is doing.
+3. **`FlatLeaf::read` asking for the right permission**, through
+   `MemAttrs::read_perm`: `Perms::EXEC` for a fetch, `Perms::READ` otherwise.
 
-#### It is measured now, not asserted
+Two departures from the sketch above, both deliberate:
 
-`usermode::proof::a_fetch_from_a_mapping_that_forbids_execution_is_not_refused_yet`
-runs both shapes, on both architectures, and both succeed:
+- **`EXEC`, not `RX`.** An execute-only mapping is a real thing — AArch64
+  permits `--x` at EL0, and `mprotect(PROT_EXEC)` asks for exactly it — so a
+  fetch is checked for `EXEC` *instead of* `READ` rather than for both. A text
+  segment is `r-x`, which contains `EXEC`, so the ordinary case is identical
+  either way and only the exotic one differs.
+- **A debug access is always a data read.** `read_perm` will not ask for
+  `EXEC` when `MemAttrs::debug` is set, so a monitor disassembling a
+  non-executable range still gets the bytes. That is the opposite of the write
+  side, where a refused write *prevents* a side effect and is enforced against
+  a debugger too (`ROADMAP.md` §15, invariant 5).
+
+#### Which cores mark a fetch
+
+A refusal is only worth raising by a master that can deliver it to the guest,
+so the boundary is drawn at the fault path rather than at convenience:
+
+| Core | Marks a fetch | Where a refusal lands |
+| --- | --- | --- |
+| `cpu-arm-a64` | yes | instruction abort |
+| `cpu-arm` (A-profile) | yes | prefetch abort, external fault |
+| `cpu-arm-v7m` | yes | `BusFault`, escalating to `HardFault` |
+| `cpu-mips` | yes | `IBE`, bus error on an instruction fetch |
+| `cpu-riscv` | yes | instruction access fault, cause 1 |
+| `cpu-x86` | **no** | nowhere. An x86 has no bus-error input, so `Exec::phys_read` turns a refused access into open bus and a counter; a refused fetch would become `0xff` bytes in the instruction stream rather than a fault. Execute permission on x86 is `NX` in the page tables, which `src/cpu/x86/paging.rs` already consults on a fetch and only on a fetch. |
+| 6502, Z80, SM83, m68k | **no** | nowhere, and nothing asks. No MMU, no execute permission, open bus on a refusal, and boards that use `Perms` for ROM write protection only. |
+
+Both architectures this consumer runs are in the first group, which is why the
+level-3 story is complete even though the table is not.
+
+#### What it is measured by
+
+`usermode::proof::a_fetch_from_a_mapping_that_forbids_execution_is_refused`
+runs both shapes, on both architectures, and both are now refused:
 
 - an ELF image whose only `PT_LOAD` is `rw-` — the same `hello` file every
   other loader test uses with one `p_flags` word changed — loads, is recorded
-  in `mappings()` as `rw-`, and **runs to completion out of it**. Linux maps
-  that image exactly as asked and kills the process on its first fetch;
+  in `mappings()` as `rw-`, and faults on its **first fetch**, before a single
+  syscall retires. That is what Linux does with that image;
 - a guest that calls `mprotect(text, PAGE, PROT_READ)` on the page it is being
-  fetched out of, and keeps going. `mprotect` returns 0, the mapping loses
-  `x`, and the next instruction is fetched anyway. That is `ld.so`'s RELRO step
-  aimed at the wrong range, in eleven instructions.
+  fetched out of faults on the **next instruction**, with the `mprotect`
+  itself having returned 0. That is `ld.so`'s RELRO step aimed at the wrong
+  range, caught in eleven instructions.
 
-The same test asserts the half that *is* enforced on the same mapping in the
-same breath, so the asymmetry is visible in one place: the bookkeeping is
-right, `WRITE` is refused, and only the fetch is unchecked. It is written as a
-characterisation, so it **fails when the gap closes** — which is the point of
-writing it down rather than leaving a comment.
+The test asserts the syscall count at the fault in both halves, so "it stopped"
+and "it stopped in the right place" are separate claims.
 
-#### Where the enforcement goes, and why it is not in `usermode`
+`core::space`'s own
+`a_fetch_from_a_mapping_that_forbids_execution_is_refused_and_a_load_is_not`
+is the other half, and the second clause in its name is the load-bearing one: a
+check on the read path is one line away from refusing *every* read, so a test
+that a plain load of the same bytes still succeeds is what distinguishes
+enforced from broken.
 
-`UserMemory` cannot do this, and that is a fact about the data flow rather
-than a preference. A guest's fetch never passes through it: a core takes
-`UserMemory::space()` once at start-up and issues every access — load, store
-and fetch alike — directly at the `AddressSpace`. What arrives there is an
-address, a width, a direction and a `MemAttrs`, and **nothing in that tuple
-says fetch**. `MemAttrs` carries `secure`, `privileged`, `exclusive` and
-`debug`; it has no bit for the one distinction `Perms::EXEC` is about.
+#### Two things that were already in place
 
-Both 64-bit cores already *have* the distinction and already drop it. RISC-V's
-and AArch64's interpreters both thread an internal `Access::Fetch` through
-translation — `src/cpu/riscv/exec.rs` and `src/cpu/arm/a64/exec.rs` — and both
-then call `self.space.read(pa, width, self.attrs)` with a `MemAttrs` that has
-forgotten which kind of access it was. Under a page table the distinction
-survives, because the *MMU* consumes it: `src/cpu/riscv/mmu.rs` checks
-`pte & pte::X` and `src/cpu/arm/a64/mmu.rs` the equivalent, so a level-1 Linux
-guest has had NX all along. Level 3 runs with the MMU off — `SCTLR_EL1.M = 0`,
-RISC-V bare — precisely because it has no page table, so the mapping is the
-only thing left holding a permission, and the mapping's `EXEC` bit is the one
-nobody reads.
-
-So the change is small, it is in `core::space` and `cpu/`, and it is three
-pieces:
-
-1. **A `fetch: bool` on `MemAttrs`**, with a `with_fetch` builder, `false` in
-   `DEFAULT` and `DEBUG`. `MemAttrs` is `#[non_exhaustive]` and built from
-   those constants plus builders, so this is an additive change: no device
-   handler signature moves, and nothing that ignores the field behaves
-   differently.
-2. **Each core's fetch path setting it.** One line where a core already knows:
-   `self.space.read(pa, width, self.attrs.with_fetch(kind == Access::Fetch))`.
-   A core that does not bother keeps the old behaviour exactly, which is what
-   makes this landable one core at a time.
-3. **`FlatLeaf::read` asking for the right permission.** The `READ` test is
-   already there and already documented as *"one `and`-and-compare against a
-   byte already in the leaf's own cache line"*; the change is what it compares
-   against:
-
-   ```rust
-   let need = if attrs.fetch { Perms::RX } else { Perms::READ };
-   if !self.perms.contains(need) {
-       return Err(BusError::Protected);
-   }
-   ```
-
-   That is a select on a bool already in a register feeding a comparison that
-   already happens — not a new branch and not a new indirection. The objection
-   recorded on `Perms::EXEC` ("an unconditional branch on the read path for a
-   bit nothing sets") was written before there was anything to set the bit; it
-   does not describe this shape.
-
-Two things the change would need are already in place, which is the other half
-of why it is cheap:
+Neither had to be built, which is most of why the change was small:
 
 - **Stale translations are already dropped.** `UserMemory::protect` reaches
-  `AddressSpace::topology().reprotect`, and `core::space`'s own test
+  `AddressSpace::topology().reprotect`, and `core::space`'s
   `reprotect_changes_the_terms_and_bumps_the_generation` asserts a permission
   change is a retopology. Every cache keyed on the generation — the flat view,
-  a JIT's block cache — is invalidated by an `mprotect` today, so a block
-  lifted out of a page that then stops being executable cannot survive it.
+  a JIT's block cache — is invalidated by an `mprotect`, so a block lifted out
+  of a page that then stops being executable cannot survive it. The JIT's
+  software TLB was updated in the same change to ask for `EXEC` on a fetch
+  fill, so its fast path cannot disagree with the slow one.
 - **The error is already the right one.** `BusError::Protected` is what a
   copy-on-write fault raises, and this consumer's fault handler already tells
   a `Protected` it can resolve from one it cannot
-  (`UserMemory::resolve_write_fault` returning `Ok(false)`). An unresolvable
-  `Protected` on a fetch is exactly the `SIGSEGV` a consumer would deliver.
+  (`UserMemory::resolve_write_fault` returning `Ok(false)`).
 
-The one genuinely new decision is the **`W^X` question a shared page raises**:
-a mapping is `rwx` when two segments share a page and one asked for `w` and the
-other for `x` (`two_segments_sharing_a_page_get_the_union_of_their_permissions`
-is that case, and a real linker produces it). A union is the right answer for a
-page-granular map and it stays the right answer here — it is what Linux's own
-`load_elf_binary` does with the same congruent segments — but it means
-enforcement will *not* catch a `W^X` mistake inside a shared page, and the
-change should say so rather than let somebody discover it.
+#### Three limitations, recorded rather than discovered later
 
-`src/core/space/` and `src/cpu/` are not this module's to edit, so this section
-is the request rather than the patch.
+- **A shared page is the union of its segments' permissions.** A mapping is
+  `rwx` when two segments share a page and one asked for `w` and the other for
+  `x` (`two_segments_sharing_a_page_get_the_union_of_their_permissions` is that
+  case, and a real linker produces it). A union is the right answer for a
+  page-granular map — it is what Linux's own `load_elf_binary` does with the
+  same congruent segments — but it means enforcement does **not** catch a
+  `W^X` mistake inside a shared page.
+- **An execute-only mapping under a readable one loses.** The flattener picks
+  a read winner with `Perms::READ`, so an `--x` mapping stacked beneath a
+  higher-priority readable mapping does not answer the fetch, and the fetch
+  then fails on the readable one. Resolving fetches separately would need a
+  third winner scan and a third leaf per flat entry, which the note on
+  `FlatEntry::write_to` measures at 4% of a frame for a shape no board has.
+- **The interpreters enforce it and the translating engines do not.** A `jit`
+  build admits a block on its MMU translation alone and lifts it through a
+  `MemAttrs::DEBUG` read, so a translated block executes out of a mapping the
+  interpreter's fetch would be refused. This consumer is unaffected — level 3
+  runs `Cpu`, the interpreter — but it is an interpreter/engine divergence, and
+  the interpreter is the oracle. The cheap place to close it is the lift: a
+  permission change is a retopology, so the generation bump already drops every
+  block lifted under the old terms.
+
 
 ### A whole C library, on both architectures
 

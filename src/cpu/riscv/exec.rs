@@ -29,7 +29,7 @@
 //! double-precision registers.
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot};
+use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs, MonitorSlot};
 use crate::core::sync;
 use crate::core::value::Width;
 
@@ -701,7 +701,13 @@ impl<'a> Exec<'a> {
     fn read_once_at(&mut self, vaddr: u64, width: Width, kind: Access) -> Result<(u64, u64), Trap> {
         let phys = self.translate(vaddr, kind, width.bytes())?;
         self.charge();
-        match self.space.read(phys, width, self.attrs) {
+        // The bus is told which of the two reasons for reading this is, so a
+        // mapping without `Perms::EXEC` refuses a fetch and answers a load.
+        let attrs = match kind {
+            Access::Fetch => self.attrs.with_purpose(AccessPurpose::FETCH),
+            _ => self.attrs,
+        };
+        match self.space.read(phys, width, attrs) {
             Ok(v) => Ok((v, phys)),
             Err(_) => {
                 // A refused access is a bus fault, which RISC-V *does* have a

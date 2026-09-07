@@ -3727,31 +3727,39 @@ fn two_segments_sharing_a_page_get_the_union_of_their_permissions() {
     }
 }
 
-/// **A ledger line, and the only one this module has: [`Prot::EXEC`] is
-/// carried and not enforced.**
+/// **The ledger line this module used to carry, closed.** [`Prot::EXEC`] is
+/// carried *and enforced*.
 ///
 /// Two shapes, both of which a real Linux kills the process for, and both of
-/// which run here. The first is an image that never asked to be executable —
-/// the same `hello` file as every test above with one flag word changed. The
-/// second is the one a dynamic loader actually builds: a page that *was*
-/// executable and is `mprotect`ed down, which is the last step of `ld.so`'s
-/// RELRO sequence pointed at the wrong range.
+/// which are now refused here. The first is an image that never asked to be
+/// executable — the same `hello` file as every test above with one flag word
+/// changed. The second is the one a dynamic loader actually builds: a page
+/// that *was* executable and is `mprotect`ed down, which is the last step of
+/// `ld.so`'s RELRO sequence pointed at the wrong range.
 ///
-/// What the test asserts positively is that the **bookkeeping is right** —
-/// `mappings()` says `rw-`, the write permission is enforced on the same
-/// mapping in the same breath, and a consumer building `/proc/self/maps` out
-/// of this gets the truth. Only the fetch is unchecked, and it is unchecked
-/// because no rsemu core marks an instruction fetch as one: by the time an
-/// access reaches the address space it is a read like any other. That makes it
-/// a question about `core::space`'s access path and about every core's fetch,
-/// not about this layer — `docs/system/usermode-abi.md` writes out the change.
+/// This was a characterisation test of a gap, written to fail the day the gap
+/// closed and to be the place that then says what the new behaviour is. What
+/// closed it is not in this module: [`MemAttrs::purpose`] carries an
+/// [`AccessPurpose`], each core's fetch path sets [`AccessPurpose::FETCH`],
+/// and `FlatLeaf::read` asks for [`Perms::EXEC`] instead of [`Perms::READ`]
+/// when it is set. This layer's half — that a `PROT_EXEC` survives `mmap`,
+/// `mprotect`, `mappings()` and a snapshot — was already complete, and the
+/// assertions on `mappings()` below are what keeps it that way.
 ///
-/// This test is a characterisation of a gap, so it fails when the gap closes.
-/// That is deliberate: the day a core marks its fetches, the two `expect`s
-/// here become the two places that say what the new behaviour must be, and a
-/// grep for this name finds them.
+/// The fault the guest takes is architectural, not an rsemu-shaped refusal: a
+/// RISC-V instruction access fault, an AArch64 instruction abort. Level 3 has
+/// no kernel to deliver a `SIGSEGV`, so the consumer sees the thread stop with
+/// [`ExitReason::FAULT`] and reports it — which is what a `SIGSEGV` *is* one
+/// layer up.
+///
+/// [`MemAttrs::purpose`]: crate::core::space::MemAttrs::purpose
+/// [`AccessPurpose`]: crate::core::space::AccessPurpose
+/// [`AccessPurpose::FETCH`]: crate::core::space::AccessPurpose::FETCH
+/// [`Perms::EXEC`]: crate::core::space::Perms::EXEC
+/// [`Perms::READ`]: crate::core::space::Perms::READ
+/// [`ExitReason::FAULT`]: crate::core::exec::ExitReason::FAULT
 #[test]
-fn a_fetch_from_a_mapping_that_forbids_execution_is_not_refused_yet() {
+fn a_fetch_from_a_mapping_that_forbids_execution_is_refused() {
     for arch in ARCHES {
         // 1. An image whose only `PT_LOAD` is `rw-`.
         let message = b"ran out of a mapping that never asked to be executable";
@@ -3777,13 +3785,20 @@ fn a_fetch_from_a_mapping_that_forbids_execution_is_not_refused_yet() {
             "{}: it permits reads",
             arch.name
         );
-        let out = run_synthetic(arch, &file).expect(
-            "TODAY: a fetch out of a non-executable mapping succeeds. When a core \
-             marks its fetches this becomes a fault at the entry point, which is \
-             what Linux does — a `SIGSEGV` before the first instruction retires.",
+        let err = run_synthetic(arch, &file)
+            .expect_err("a fetch out of a non-executable mapping must be refused");
+        assert!(
+            err.contains("Execute of"),
+            "{}: the fault has to be an *execute* fault at the entry point, not \
+             something that merely went wrong: {err}",
+            arch.name
         );
-        assert_eq!(out.status, 0, "{}", arch.name);
-        assert_eq!(&out.stdout[..], &message[..], "{}", arch.name);
+        assert!(
+            err.contains("0 syscall(s)"),
+            "{}: and it has to happen before the first instruction retires — a \
+             `SIGSEGV` on entry, which is what Linux gives this image: {err}",
+            arch.name
+        );
 
         // 2. A page that was executable and is not any more: the guest drops
         //    `PROT_EXEC` from the page it is being fetched out of, and carries
@@ -3815,22 +3830,26 @@ fn a_fetch_from_a_mapping_that_forbids_execution_is_not_refused_yet() {
             },
             message,
         );
-        let out = run_synthetic(arch, &file).expect(
-            "TODAY: a page can lose `PROT_EXEC` under the program counter and keep \
-             executing. When a core marks its fetches this becomes a fault on the \
-             instruction after the `mprotect` — and note that closing it needs the \
-             block caches dropped too, which the retopology `UserMemory::protect` \
-             performs already does.",
+        let err = run_synthetic(arch, &file).expect_err(
+            "a page that loses `PROT_EXEC` under the program counter must stop \
+             executing on the next instruction",
         );
         assert!(
-            out.trace.contains(&(nr::MPROTECT, 0)),
-            "{}: the `mprotect` has to have succeeded for this to mean anything: \
-             {:?}",
-            arch.name,
-            out.trace
+            err.contains("Execute of"),
+            "{}: an execute fault, on the instruction after the `mprotect`: {err}",
+            arch.name
         );
-        assert_eq!(out.status, 0, "{}", arch.name);
-        assert_eq!(&out.stdout[..], &message[..], "{}", arch.name);
+        assert!(
+            err.contains("1 syscall(s)"),
+            "{}: the `mprotect` has to have succeeded for this to mean anything — \
+             one syscall retired, then the fetch out of the range it narrowed: \
+             {err}",
+            arch.name
+        );
+        // And the counterpart to the `core::space` test that proves this is a
+        // *fetch* check and not a read check: the retopology `protect` performs
+        // is what drops any block a JIT lifted out of the page, so the fault
+        // arrives whether the instruction was interpreted or translated.
     }
 }
 

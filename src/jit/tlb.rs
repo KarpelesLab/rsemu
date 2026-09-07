@@ -556,11 +556,11 @@ impl Tlb {
     ///   invisibly. This is the condition the whole design turns on.
     /// * The leaf must not **repeat**: a mirrored window wraps its offset
     ///   partway through, and an addend cannot express that.
-    /// * The mapping must permit the direction. Note that a fetch is checked
-    ///   for `READ`, not `EXEC`, because
-    ///   [`Perms::EXEC`](crate::core::space::Perms::EXEC) is carried and not
-    ///   enforced — matching the slow path exactly is the requirement, not
-    ///   improving on it.
+    /// * The mapping must permit the direction, and a fetch is checked for
+    ///   [`Perms::EXEC`](crate::core::space::Perms::EXEC) rather than `READ` —
+    ///   matching the slow path exactly is the requirement, and the slow path
+    ///   enforces execute permission against a read carrying
+    ///   [`AccessPurpose::FETCH`](crate::core::space::AccessPurpose::FETCH).
     /// * The constraints must be permissive, so no width, alignment,
     ///   secure-only or privileged-only rule survives to be skipped.
     ///
@@ -639,9 +639,12 @@ impl Tlb {
             return None;
         }
         let need = match kind {
-            // EXEC is carried, not enforced: `FlatLeaf::read` checks READ for
-            // a fetch too, and this path exists to agree with it.
-            AccessKind::Fetch | AccessKind::Load => Perms::READ,
+            // `FlatLeaf::read` checks EXEC rather than READ for a read the
+            // master marked as a fetch, and this path exists to agree with it:
+            // an entry cached here is one the slow path never sees again, so a
+            // page that disagreed would be executable exactly when it got hot.
+            AccessKind::Fetch => Perms::EXEC,
+            AccessKind::Load => Perms::READ,
             AccessKind::Store => Perms::WRITE,
         };
         if !leaf.perms().contains(need) || !permissive(leaf.constraints()) {

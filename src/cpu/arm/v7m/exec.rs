@@ -42,7 +42,7 @@
 //! timing tables. No emulator source of any licence was consulted
 //! (`ROADMAP.md` §1).
 
-use crate::core::space::{AddressSpace, MemAttrs};
+use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs};
 use crate::core::value::{Endian, Width};
 
 use super::isa::{
@@ -731,7 +731,13 @@ impl<'a> Exec<'a> {
         // Instructions are always little-endian in ARMv7-M, whatever the data
         // endianness (DDI 0403 A3.3).
         self.check_mpu(addr, 2, Access::Fetch, self.state.privileged())?;
-        match self.space.read(u64::from(addr), Width::U16, self.attrs) {
+        // The bus is told this is a fetch, so a mapping without `Perms::EXEC`
+        // refuses it and still answers a load of the same bytes. This is the
+        // *bus* decode, one layer out from the MPU check above — an M-profile
+        // XN region and a board that does not sell instructions on that
+        // aperture are two different refusals, and both are `BusFault`.
+        let attrs = self.attrs.with_purpose(AccessPurpose::FETCH);
+        match self.space.read(u64::from(addr), Width::U16, attrs) {
             Ok(v) => Ok(v as u16),
             Err(_) => Err(self.bus_fault(addr, Access::Fetch)),
         }

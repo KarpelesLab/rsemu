@@ -177,7 +177,12 @@ impl FlatLeaf {
         // line, on a value that is `RWX` for every mapping that never mentioned
         // permission. A branch, not an indirection — which is the budget
         // `ROADMAP.md` §4.1's dispatch section allows.
-        if !self.perms.contains(Perms::READ) {
+        //
+        // `read_perm` picks `EXEC` over `READ` for a read the master marked as
+        // an instruction fetch, and never for a debug access. Both inputs are
+        // bytes of an `attrs` already in registers, so what this adds to the
+        // load path is a compare and a conditional move, not a second lookup.
+        if !self.perms.contains(attrs.read_perm()) {
             return Err(BusError::Protected);
         }
         let off = self.offset_of(rel);
