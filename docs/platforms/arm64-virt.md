@@ -798,9 +798,99 @@ would cost forward progress.
 So `arm64-virt-smp`'s green boot is now evidence about its atomics as well as
 about bring-up, banking and IPIs. What it is still not evidence about is
 *ordering*: this core executes one instruction at a time and completes every
-access before the next, so `DMB`, `DSB` and the acquire/release forms remain
-no-ops, and a guest that depends on a weak memory model being weak has nothing
-here to disagree with.
+access before the next, so a guest that depends on a weak memory model being
+weak has nothing here to disagree with. (`DMB`, `DSB` and the acquire/release
+forms are no longer no-ops — each one executes a host `fence(SeqCst)`,
+`docs/techniques/memory-models.md` has that round — but a fence on a host that
+was already ordering the accesses changes no outcome this board can produce.)
+
+## The monitor was necessary and not sufficient: three windows inside one instruction
+
+The section above closes the window *between* a `LDXR` and its `STXR`. It says
+nothing about the windows *inside* each of those instructions, and there were
+three of them. All three are the same shape — this core issues a guest atomic
+as several separate accesses through `AddressSpace`, and the only lock held
+across them is the core's own `BUS`-ranked session mutex, which is per core and
+excludes nothing on a sibling.
+
+`tests/a64_lse_atomicity.rs` is the instrument: two cores, two host threads,
+each incrementing one word 60 000 times, once with `STADD` and once with an
+`LDXR`/`STXR` loop, beside a second word incremented with a plain load, add and
+store as the witness that the two really overlapped. A lost update is not a
+reordering — it is a value no interleaving of the two programs could have
+produced — so unlike almost everything else in this area it can be *asserted*
+on an x86-64 host rather than printed.
+
+| window | lost of 120 000 |
+| --- | --- |
+| a `FEAT_LSE` atomic's read and write, with nothing between them | 3 410, 8 497, 8 850 |
+| a `STXR`'s monitor check and its store | 318 |
+| a `LDXR`'s read and the moment it claims the granule | 46 |
+| all three, as the tree stands | 0 |
+
+The first two are closed by `AddressSpace::bus_lock`, taken by
+`Exec::lock_bus` before the instruction issues an access and held until it
+ends — the span `cpu::x86::exec` already uses for a `LOCK` prefix, and for the
+same second reason: a bus lock fences at both ends, so a guard that opened
+after the first access would put the barrier inside the instruction it is meant
+to bracket. It is the bus lock rather than the monitor because `FEAT_LSE` lands
+on x86's side of the line `core::space::BusLock` opens with — a monitor is
+licensed to fail spuriously and is paid for by the guest's retry loop, and
+`LDADD` has no status register and no retry loop, so a spurious clear would
+make it return a wrong answer rather than go round again.
+
+The third is not a lock's problem and no lock fixes it. `ExclusiveMonitor`
+walks *live* slots, so a sibling's store that lands after a `LDXR`'s read but
+before it registers its reservation clears nothing, and the `STXR` that follows
+then commits a value that was already stale. The fix is to claim the granule
+before the read issues rather than after it returns
+(`Exec::reserve_then_read`), which costs nothing at all: the same translation,
+the same read, in the other order. What it changes is that a load-exclusive
+which faults leaves the monitor cleared instead of holding what it held before
+— DDI 0487 B2.9 licenses a spurious clear explicitly, and the alternative would
+be a reservation on a granule the core never loaded.
+
+`LDXP`/`STXP` gets the same treatment and one more claim. The 16-byte access is
+still two eight-byte bus accesses, because that is what `AddressSpace` offers,
+but with the bus lock held across both halves it is indivisible against every
+other 16-byte atomic in the machine — the only ones are `CASP` and another
+pair, and both now take the lock. What is left is a plain `STR` overlapping half
+of it, which is `BusLock`'s documented residual everywhere else as well. There
+is no plain 16-byte store to worry about: `STP` of two `X` registers is not
+single-copy atomic across its sixteen bytes (DDI 0487 B2.2.1 gives it
+per-register atomicity only), so a guest racing one against a pair has no
+architectural claim to begin with.
+
+### Which mode, and what it costs
+
+Reachable only under `ThreadingMode::Parallel`, which is opt-in
+(`--threading parallel`) and which no machine file in this tree selects. The
+argument that `Deterministic` is safe is structural rather than statistical:
+one host thread cannot interleave inside an instruction, and the test's
+one-instruction-quantum run — finer than any quantum the scheduler hands out —
+loses nothing before the fix or after it. That is why this was worth fixing
+carefully rather than urgently.
+
+Measured on one core with nothing contending, release build, as nanoseconds per
+instruction above the two-instruction loop that drives it (mean of four runs;
+run-to-run drift on this host is ±5%, so the two unchanged rows are the control
+rather than a result):
+
+| | before | after |
+| --- | --- | --- |
+| `STADD` (`LDADD` with `Rt == XZR`) | 123 ns | 132 ns |
+| `LDXR` + `STXR`, uncontended | 186 ns | 196 ns |
+| `LDAXR` + `STLXR`, uncontended | 194 ns | 201 ns |
+| plain `LDR` | 71 ns | 70 ns |
+| plain `STR` | 77 ns | 71 ns |
+
+About +9 ns an atomic instruction, or +7%, which is one uncontended mutex
+acquire (`core::space::BusLock` prices its own at ~13 ns) less the two
+`SeqCst` fences the guard makes redundant — the acquire/release suffix no
+longer emits its own, because a guard that fences at both ends of the
+instruction is strictly stronger than any suffix in these encodings asks for.
+The load and store paths are untouched: nothing outside the atomics reads the
+bus lock, so a board that executes none pays nothing.
 
 ## Where it stops, and what is still in the way
 
