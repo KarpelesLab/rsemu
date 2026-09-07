@@ -756,6 +756,7 @@ pub(super) fn advance(
         subset,
         admitted: true,
         entry_trap: None,
+        refused: false,
         rejected: None,
     };
 
@@ -963,6 +964,12 @@ struct Lifter<'a> {
     /// is exactly the hazard. Nothing about the *translation* is relaxed: that
     /// happens in [`admit`], through the fetch path, with its walk and its
     /// permission check.
+    ///
+    /// What a debug read does relax is the **mapping's** `Perms::EXEC`, and
+    /// deliberately — `MemAttrs::read_perm` will not ask for it when
+    /// `MemAttrs::debug` is set, because a monitor disassembling a page is a
+    /// debugger doing its job. So [`Lifter::lift`] asks for it separately
+    /// rather than through these attributes.
     attrs: MemAttrs,
     subset: &'a mut Subset,
     /// Whether [`advance`]'s prologue has already admitted the entry PC, so
@@ -971,6 +978,16 @@ struct Lifter<'a> {
     /// A trap raised by a *chained* boundary's entry fetch. The prologue's own
     /// trap never lands here — it is delivered before a dispatcher exists.
     entry_trap: Option<Trap>,
+    /// Whether the last lift stopped because the **bus** refused a fetch of
+    /// those bytes rather than because the instruction is outside the subset.
+    ///
+    /// The two are the same outcome — the interpreter takes it — and a
+    /// different fact, which is why [`Subset`] is not told about this one.
+    /// That table's only cleaner is a store into a lifted page, so an entry
+    /// written here would outlive the retopology that granted `Perms::EXEC`
+    /// and pin the PC to the interpreter for the rest of the run. Never a
+    /// wrong answer, since the interpreter is the oracle; just a permanent one.
+    refused: bool,
     /// The first block the verifier rejected, if any. A frontend bug rather
     /// than a guest one, so it is asserted on in a debug build and ignored in
     /// a release one — the block still runs, and the differential harness is
@@ -1036,8 +1053,12 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
             self.rejected = Some(alloc::format!("{e}"));
         }
         // False when nothing could be lifted, which is what sends the next
-        // pass straight to the interpreter instead of back through here.
-        self.subset.put(pc, self.at.key, lifted.insns > 0);
+        // pass straight to the interpreter instead of back through here. A
+        // lift the bus refused outright is *not* recorded — see
+        // [`Lifter::refused`].
+        if !(self.refused && lifted.insns == 0) {
+            self.subset.put(pc, self.at.key, lifted.insns > 0);
+        }
         Ok(Translation {
             page: self.at.base,
             insns: lifted.insns,
@@ -1047,12 +1068,39 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
 }
 
 impl Lifter<'_> {
-    /// Lift at `pc`, reading only what the entry translation covers.
+    /// Lift at `pc`, reading only what the entry translation covers **and what
+    /// the bus would let this core fetch**.
+    ///
+    /// The second half is the one that is not obvious. `admit` has already run
+    /// the *MMU* fetch path, so the guest's own page tables have had their say;
+    /// what it has not consulted is the mapping's [`Perms::EXEC`], because that
+    /// is enforced against a read carrying `AccessPurpose::FETCH` and the reads
+    /// below deliberately carry [`MemAttrs::DEBUG`] instead — a lift must not
+    /// pop a FIFO. So the permission is asked for separately, by
+    /// [`jit::executable_run`](crate::jit::executable_run), and the bytes still
+    /// come out with no side effects.
+    ///
+    /// Per *word* rather than per page, because a flat entry is not a page: a
+    /// 4 KiB page can hold an executable mapping and a non-executable one, and
+    /// the interpreter would fetch its way to the boundary and abort there. A
+    /// lift that stops at the same word leaves the interpreter standing on the
+    /// same instruction, which is what makes the two engines report the same
+    /// abort at the same PC. The probe is memoised over the run the entry
+    /// covers, so the ordinary whole-page-one-mapping case pays for one.
+    ///
+    /// **Nothing here is on the block-entry path.** This runs once per
+    /// translation; a cached block re-enters through `admit` and touches none
+    /// of it. That is sound because a permission change is a retopology, and
+    /// `Frontend::epoch` already drops every block lifted before it.
     fn lift(&mut self, pc: u64) -> Result<lift::Lifted> {
         let space = self.space;
         let attrs = self.attrs;
         let base = self.at.base;
         let page = self.at.page;
+        // Empty: `run.0 > run.1`, so nothing is inside it and the first
+        // word probes.
+        let mut run = (1u64, 0u64);
+        let mut refused = false;
         let mut src = |addr: u64| {
             // Outside the entry page there is no translation to read through,
             // so the lifter is told the bytes are unreadable and ends the
@@ -1061,12 +1109,27 @@ impl Lifter<'_> {
             if addr & !PAGE_MASK != page {
                 return None;
             }
-            space
-                .read(base | (addr & PAGE_MASK), Width::U32, attrs)
-                .ok()
-                .map(|v| v as u32)
+            let phys = base | (addr & PAGE_MASK);
+            let end = phys.wrapping_add(4);
+            if phys < run.0 || end > run.1 {
+                match crate::jit::executable_run(space, phys) {
+                    // The whole word has to be inside one permitting run. A
+                    // word straddling two of them is refused rather than
+                    // stitched: the interpreter would ask the bus twice and
+                    // this would have to model both answers, and handing the
+                    // instruction to the interpreter is always right.
+                    Some(r) if phys >= r.0 && end <= r.1 => run = r,
+                    _ => {
+                        refused = true;
+                        return None;
+                    }
+                }
+            }
+            space.read(phys, Width::U32, attrs).ok().map(|v| v as u32)
         };
-        lift::lift(&self.at.world, pc, &mut src, lift::MAX_INSNS, SHAPE)
+        let out = lift::lift(&self.at.world, pc, &mut src, lift::MAX_INSNS, SHAPE);
+        self.refused = refused;
+        out
     }
 }
 
@@ -1290,7 +1353,7 @@ impl FastMem for Host<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::space::{MonitorSlot, RamStore, Region};
+    use crate::core::space::{MonitorSlot, Perms, RamStore, Region};
     use crate::cpu::arm::a64::mmu::desc;
     use crate::cpu::arm::a64::{Cpu, Engine};
 
@@ -1356,27 +1419,54 @@ mod tests {
 
     /// A core with `program` at zero and [`RAM`] bytes of RAM under it.
     fn core(engine: Engine, program: &[u32]) -> Cpu {
+        core_mapped(engine, program, Perms::RWX)
+    }
+
+    /// [`core`], with the RAM mapped on `perms` rather than on everything.
+    fn core_mapped(engine: Engine, program: &[u32], perms: Perms) -> Cpu {
         let ram = Arc::new(RamStore::new(RAM));
-        for (i, word) in program.iter().enumerate() {
-            for (j, byte) in word.to_le_bytes().iter().enumerate() {
-                ram.write_u8((i * 4 + j) as u64, *byte).expect("in range");
-            }
-        }
+        write_words(&ram, 0, program);
         let space = AddressSpace::new("mem", 64);
         space
             .topology()
-            .map(Region::ram("ram", ram), 0)
+            .map_with_perms(Region::ram("ram", ram), 0, perms)
             .expect("nothing else is mapped");
         let cpu = Cpu::new(Config::cortex_a53().with_reset_vector(0)).with_engine(engine);
         cpu.attach_space(Arc::new(space));
         cpu
     }
 
+    /// `words` into `store`, little-endian, starting at `at`.
+    fn write_words(store: &RamStore, at: u64, words: &[u32]) {
+        for (i, word) in words.iter().enumerate() {
+            for (j, byte) in word.to_le_bytes().iter().enumerate() {
+                store
+                    .write_u8(at + (i * 4 + j) as u64, *byte)
+                    .expect("in range");
+            }
+        }
+    }
+
     /// Run both cores on the same budgets and compare everything a guest, a
     /// snapshot or a state hash can see.
     fn agree_on(engine: Engine, program: &[u32], budget: u64, quanta: usize) -> (Cpu, Cpu) {
-        let interp = core(Engine::Interp, program);
-        let jit = core(engine, program);
+        agree_built(engine, |e| core(e, program), budget, quanta)
+    }
+
+    /// [`agree_on`], over a fixture that builds its own address space.
+    ///
+    /// The permission cases need two mappings with different [`Perms`] rather
+    /// than one flat RAM, and every column [`agree_on`] compares is exactly the
+    /// set they care about — an instruction abort is `ESR_EL1`, `ELR_EL1`,
+    /// `FAR_EL1` and a PC.
+    fn agree_built(
+        engine: Engine,
+        build: impl Fn(Engine) -> Cpu,
+        budget: u64,
+        quanta: usize,
+    ) -> (Cpu, Cpu) {
+        let interp = build(Engine::Interp);
+        let jit = build(engine);
         for n in 0..quanta {
             let a = interp.run_budget(budget);
             let b = jit.run_budget(budget);
@@ -1427,6 +1517,115 @@ mod tests {
         let out = agree_on(Engine::Jit, program, budget, quanta);
         agree_on(Engine::JitHost, program, budget, quanta);
         out
+    }
+
+    /// Two instructions on an executable page, ending in a branch into the
+    /// *next* page — which is mapped without [`Perms::EXEC`].
+    ///
+    /// The branch leaves the page, so the block ends and the refusal lands at a
+    /// **chained** boundary, through `Frontend::enter` and
+    /// `Frontend::translate` rather than through [`advance`]'s prologue.
+    const INTO_NX: [u32; 2] = [
+        0xd282_0007, // movz x7, #0x1000
+        0x1400_03ff, // b    .+0xffc          ; from 0x4 to 0x1000
+    ];
+
+    /// What sits on the page that may not be fetched.
+    ///
+    /// Every word is inside the lifted subset and none of it traps, so a lifter
+    /// that never asks about execute permission produces a real block out of it
+    /// and runs it — which is exactly the divergence.
+    const NX_PAGE: [u32; 3] = [
+        0x9100_04a5, // add x5, x5, #1
+        0x9100_04a5, // add x5, x5, #1
+        0x1400_0000, // b   .
+    ];
+
+    /// A core whose first page may be fetched and whose second may not.
+    ///
+    /// Two stores and two mappings rather than one store and two permissions,
+    /// because permission is a property of the mapping — and this is the shape
+    /// a board with a data-only aperture beside its ROM actually has.
+    fn split_core(engine: Engine) -> Cpu {
+        let code = Arc::new(RamStore::new(0x1000));
+        write_words(&code, 0, &INTO_NX);
+        let data = Arc::new(RamStore::new(0x1000));
+        write_words(&data, 0, &NX_PAGE);
+        let space = AddressSpace::new("mem", 64);
+        {
+            let mut topo = space.topology();
+            topo.map_with_perms(Region::ram("code", code), 0, Perms::RX)
+                .expect("nothing else is mapped");
+            topo.map_with_perms(Region::ram("nx", data), 0x1000, Perms::RW)
+                .expect("it does not overlap the code");
+        }
+        let cpu = Cpu::new(Config::cortex_a53().with_reset_vector(0)).with_engine(engine);
+        cpu.attach_space(Arc::new(space));
+        cpu
+    }
+
+    /// [`Perms::EXEC`] is enforced against a *translated* block, not only
+    /// against an interpreted fetch.
+    ///
+    /// `MemAttrs::purpose` makes a fetch a fetch and `FlatLeaf::read` refuses
+    /// one on a mapping without [`Perms::EXEC`] — but only the interpreter's
+    /// fetch *is* that read. A lift reads ahead of the guest and therefore
+    /// reads with `MemAttrs::DEBUG`, which by design never asks for `EXEC`, and
+    /// [`admit`] consults the *MMU* rather than the mapping. Before
+    /// `jit::executable_run` this fixture ran the whole loop under the JIT
+    /// while the interpreter aborted on its first instruction.
+    ///
+    /// The reset vector itself is on the refusing mapping here, so the refusal
+    /// is in [`advance`]'s prologue: the very first lift.
+    #[test]
+    fn a_mapping_without_exec_refuses_a_translated_block_too() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let (interp, jit) = agree_built(engine, |e| core_mapped(e, &LOOP, Perms::RW), 4096, 4);
+            assert_ne!(
+                interp.sysregs().esr_el1,
+                0,
+                "the interpreter never aborted, so this compared two working \
+                 cores under {engine:?}"
+            );
+            assert_eq!(
+                interp.x(5),
+                0,
+                "the loop body ran on a mapping that refuses a fetch"
+            );
+            assert_eq!(
+                jit.jit_stats().expect("a jit core").blocks,
+                0,
+                "a block ran out of a mapping whose fetch the interpreter \
+                 refuses, under {engine:?}"
+            );
+        }
+    }
+
+    /// The same claim at a **chained** boundary, which is the only way to reach
+    /// `Frontend::enter` and the one path [`advance`]'s prologue does not
+    /// cover.
+    #[test]
+    fn a_chain_into_a_non_executable_page_aborts_where_the_interpreter_does() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let (interp, jit) = agree_built(engine, split_core, 4096, 4);
+            assert_ne!(
+                interp.sysregs().esr_el1,
+                0,
+                "the interpreter never aborted under {engine:?}"
+            );
+            assert_eq!(
+                interp.x(5),
+                0,
+                "the non-executable page ran under the interpreter, so the \
+                 fixture is not testing what it says it is"
+            );
+            let stats = jit.jit_stats().expect("a jit core");
+            assert!(
+                stats.blocks > 0,
+                "the executable page never produced a block, so nothing was \
+                 chained *from* and the boundary is untested: {stats:?}"
+            );
+        }
     }
 
     #[test]

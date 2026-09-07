@@ -70,7 +70,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::core::space::{
-    AccessConstraints, AddressSpace, FlatTarget, MemAttrs, MemResult, Perms, RamStore,
+    AccessConstraints, AddressSpace, EntryKind, FlatTarget, MemAttrs, MemResult, Perms, RamStore,
 };
 use crate::core::value::{Endian, Width};
 use crate::ir::AccessKind;
@@ -900,6 +900,60 @@ const fn within_page(addr: u64, width: Width) -> bool {
     (addr & PAGE_MASK) + width.bytes() <= PAGE_SIZE
 }
 
+/// The run of guest-physical addresses around `phys` over which the bus would
+/// answer an instruction fetch, or `None` if it would refuse one there.
+///
+/// # Why a translating engine needs this at all
+///
+/// [`Perms::EXEC`] is enforced in exactly one place — `FlatLeaf::read`, against
+/// a read whose [`MemAttrs::purpose`](crate::core::space::MemAttrs::purpose) is
+/// [`AccessPurpose::FETCH`](crate::core::space::AccessPurpose::FETCH) — and an
+/// interpreter reaches it because its fetch *is* that read. A lifter's is not:
+/// it reads ahead of the guest, up to a whole block of instructions the guest
+/// has not asked for, so it reads with
+/// [`MemAttrs::DEBUG`](crate::core::space::MemAttrs::DEBUG) to be sure of
+/// having no side effects — and a debug read is a data read by design, so it
+/// never asks for `EXEC`. Without something like this, a mapping whose fetch
+/// the interpreter refuses would run as a translated block.
+///
+/// So the two questions are asked separately: the bytes come out with `DEBUG`,
+/// and *may these bytes be fetched* comes out of here. Neither touches the
+/// other's answer, and the side-effect freedom the lifter depends on is
+/// untouched.
+///
+/// # Why it returns a run
+///
+/// A flat entry is contiguous and carries one set of permissions, so the answer
+/// is uniform over `[start, end)` and a lifter reading sixty-four instructions
+/// out of one entry pays for one probe. The bounds are the caller's memo, not a
+/// promise about anything outside them: permissions change by retopology, which
+/// bumps [`AddressSpace::generation`] and drops every block lifted under the old
+/// terms, so a run outlives nothing it should not.
+///
+/// A combined entry permits a fetch if **any** member does, which is what
+/// `FlatEntry::read` does with a wired bus: a member that refuses contributes
+/// nothing and the read still succeeds if another answered. The match is
+/// exhaustive rather than wildcarded — [`EntryKind`] is `#[non_exhaustive]`
+/// only to outside crates, so a new kind is a build break here, which is what
+/// a permission rule that has to be stated per kind should be.
+///
+/// `None` also covers an unmapped address and a topology lock held by a writer.
+/// Both leave a lifter with nothing to read, which ends the block and hands the
+/// instruction to the interpreter — the oracle, and the thing that raises the
+/// architectural fault.
+#[must_use]
+pub fn executable_run(space: &AddressSpace, phys: u64) -> Option<(u64, u64)> {
+    let view = space.try_view()?;
+    let entry = view.flat_view().entry(view.locate(phys)?)?;
+    let permitted = match entry.kind() {
+        EntryKind::Single(leaf) => leaf.perms().contains(Perms::EXEC),
+        EntryKind::Combine { members, .. } => {
+            members.iter().any(|m| m.perms().contains(Perms::EXEC))
+        }
+    };
+    permitted.then(|| (entry.start(), entry.end()))
+}
+
 /// Whether a region's constraints leave nothing for the fast path to check.
 ///
 /// Deliberately conservative: a region that accepts every width at every
@@ -918,7 +972,7 @@ fn permissive(c: AccessConstraints) -> bool {
 mod tests {
     use super::*;
     use crate::core::error::BusError;
-    use crate::core::space::{Region, RomStore, UnassignedPolicy};
+    use crate::core::space::{AccessPurpose, Region, RomStore, UnassignedPolicy};
     use alloc::sync::Arc;
 
     const BASE: u64 = 0x2000_0000;
@@ -955,6 +1009,101 @@ mod tests {
         level: 3,
         translating: false,
     };
+
+    /// One page that may be fetched from and one that may not, so the three
+    /// paths that decide that can be asked the same question about the same
+    /// bytes.
+    fn split_space() -> Arc<AddressSpace> {
+        let x = Arc::new(RamStore::new(PAGE_SIZE));
+        let nx = Arc::new(RamStore::new(PAGE_SIZE));
+        let space = AddressSpace::new("mem", 64).with_unassigned(UnassignedPolicy::FAULT);
+        {
+            let mut topo = space.topology();
+            topo.map_with_perms(Region::ram("x", x), BASE, Perms::RX)
+                .expect("one region maps");
+            topo.map_with_perms(Region::ram("nx", nx), BASE + PAGE_SIZE, Perms::RW)
+                .expect("it does not overlap the first");
+        }
+        Arc::new(space)
+    }
+
+    /// Three consumers ask whether a fetch is permitted, and none of them may
+    /// answer differently from the others.
+    ///
+    /// * `AddressSpace::read` carrying `AccessPurpose::FETCH` — the
+    ///   interpreter's fetch, and the only one of the three that is a real
+    ///   access. It is the oracle.
+    /// * [`Tlb::fill`] for [`AccessKind::Fetch`] — the fast path. An entry
+    ///   cached here is one the slow path never sees again, so a page it
+    ///   accepted and the slow path refuses would be executable exactly when it
+    ///   got hot.
+    /// * [`executable_run`] — what a translating engine's lifter asks, because
+    ///   its own reads carry `MemAttrs::DEBUG` and a debug read never asks for
+    ///   `Perms::EXEC`.
+    ///
+    /// The three are separately written and there is no type that forces them
+    /// to agree, which is why the agreement is a test rather than an argument.
+    #[test]
+    fn the_three_paths_that_gate_a_fetch_agree_page_for_page() {
+        let space = split_space();
+        let fetch = MemAttrs::DEFAULT.with_purpose(AccessPurpose::FETCH);
+        for (addr, permitted) in [(BASE, true), (BASE + PAGE_SIZE, false)] {
+            let slow = space.read(addr, Width::U32, fetch);
+            assert_eq!(
+                slow.is_ok(),
+                permitted,
+                "the slow path disagrees with the fixture at {addr:#x}"
+            );
+            if !permitted {
+                assert_eq!(
+                    slow,
+                    Err(BusError::Protected),
+                    "a refused fetch is a protection fault, not a bad access"
+                );
+            }
+
+            let mut tlb = Tlb::with_entries(Arc::clone(&space), 64);
+            tlb.fill(AccessKind::Fetch, addr, addr, BARE);
+            assert_eq!(
+                tlb.stats().refused == 0,
+                permitted,
+                "the fast path cached a fetch page the slow path refuses, or \
+                 refused one it permits, at {addr:#x}"
+            );
+
+            let run = executable_run(&space, addr);
+            assert_eq!(
+                run.is_some(),
+                permitted,
+                "a lifter would have read ahead through {addr:#x} against the \
+                 slow path's answer"
+            );
+            if permitted {
+                assert_eq!(
+                    run,
+                    Some((BASE, BASE + PAGE_SIZE)),
+                    "the memoised run is the flat entry, so a lifter that \
+                     trusts it can leave the entry without probing again"
+                );
+            }
+        }
+    }
+
+    /// An address nothing maps has no run, so a lifter stops there.
+    ///
+    /// It would have stopped anyway — the read that follows fails — but the
+    /// answer has to be the conservative one rather than an empty `Some`, which
+    /// would memoise a range no entry backs.
+    #[test]
+    fn an_unmapped_address_permits_no_fetch() {
+        let (space, _ram) = space();
+        assert_eq!(executable_run(&space, BASE - PAGE_SIZE), None);
+        assert_eq!(
+            executable_run(&space, BASE),
+            Some((BASE, BASE + SIZE)),
+            "a mapping that never mentioned permission is `Perms::RWX`"
+        );
+    }
 
     #[test]
     fn an_inlined_store_marks_the_bytes_it_wrote_and_names_where_they_landed() {

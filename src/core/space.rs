@@ -123,25 +123,51 @@
 //! | `cpu-x86` | **no** | nowhere: an x86 has no bus-error input, so a refused fetch would silently become open bus rather than a fault. Execute permission on x86 is `NX` in the page tables, which `cpu::x86::paging` already enforces, and adding a bus-level refusal it could not report would trade a missing check for a wrong instruction stream. |
 //! | 6502, Z80, SM83, m68k | **no** | nowhere, and nothing asks: no MMU, no execute permission, and a refused access on those buses is open bus. Their boards use [`Perms`] for ROM write protection only. |
 //!
-//! Two limitations, recorded rather than papered over.
+//! One limitation, recorded rather than papered over: the flattener resolves a
+//! read winner with [`Perms::READ`], so an *execute-only* mapping stacked under
+//! a higher-priority readable one loses the fetch to the readable one and the
+//! fetch then fails. That needs a third winner scan and a third leaf per entry,
+//! which the note on [`FlatEntry::write_to`] measures at 4% of a frame for a
+//! shape no board has. A board that wants both must not overlap them.
 //!
-//! * The flattener resolves a read winner with [`Perms::READ`], so an
-//!   *execute-only* mapping stacked under a higher-priority readable one loses
-//!   the fetch to the readable one and the fetch then fails. That needs a third
-//!   winner scan and a third leaf per entry, which the note on
-//!   [`FlatEntry::write_to`] measures at 4% of a frame for a shape no board
-//!   has. A board that wants both must not overlap them.
-//! * **The interpreters enforce this; the translating engines do not.** A
-//!   `jit` build admits a block on its MMU translation alone (`Exec::
-//!   translate_fetch` on a64, the shadow TLB's plan on RISC-V) and lifts it
-//!   through a [`MemAttrs::DEBUG`] read, so a mapping without [`Perms::EXEC`]
-//!   refuses the interpreter's fetch and does not refuse a translated block's.
-//!   Latent rather than live — no board in the catalogue maps a fetched region
-//!   without `EXEC`, and `usermode`, which does, runs the interpreter — but it
-//!   is a real interpreter/engine divergence and the interpreter is the oracle.
-//!   Closing it belongs with whoever owns the admission path: the cheap place
-//!   is the lift, because a permission change is a retopology and the
-//!   generation bump already drops every block lifted under the old terms.
+//! # Three paths ask this question, and they are held together by a test
+//!
+//! A fetch reaches the permission check three different ways, and only the
+//! first of them is an actual access:
+//!
+//! * **The interpreter's fetch.** A read carrying [`AccessPurpose::FETCH`],
+//!   straight through `FlatLeaf::read`. It is the oracle.
+//! * **The JIT's software TLB.** `jit::Tlb::fill` caches a page's resolution
+//!   and the slow path then never sees it again, so its fetch set is filled
+//!   only for a leaf that carries [`Perms::EXEC`]. (Nothing fills that set
+//!   today — neither `Exec::refresh_shadow` caches a fetch, because no backend
+//!   inlines one — so the arm is there to be correct when one does.)
+//! * **A translating engine's lifter.** This is the one that is not obvious. An
+//!   engine admits a block on the *MMU* translation — `Exec::translate_fetch`
+//!   on a64, `Exec::translate(.., Access::Fetch, ..)` on RISC-V — and then
+//!   reads the instruction words with [`MemAttrs::DEBUG`], because a lift reads
+//!   up to sixty-four instructions ahead of the guest and must not pop a FIFO
+//!   on the way. A debug read is a data read by design ([`MemAttrs::read_perm`]
+//!   ignores the purpose when [`MemAttrs::debug`] is set), so neither half of
+//!   that asks about [`Perms::EXEC`], and a block once ran out of a mapping
+//!   whose fetch the interpreter refused. The two questions are now asked
+//!   separately: `jit::executable_run` says whether the bytes may be fetched
+//!   and the read still says nothing about it. A refusal ends the lift at that
+//!   word, which leaves the interpreter standing on the instruction it would
+//!   have aborted on — so the abort, the PC and the syndrome are the
+//!   interpreter's rather than a second implementation of them.
+//!
+//!   It costs nothing per block *entry*: the probe happens once per
+//!   translation, memoised over the flat entry, and a cached block re-enters
+//!   without touching it. That is sound because a permission change is a
+//!   retopology, and `Frontend::epoch` already drops every block lifted before
+//!   it.
+//!
+//! Nothing in the type system makes the three agree, so
+//! `jit::tlb`'s `the_three_paths_that_gate_a_fetch_agree_page_for_page` asks
+//! all three about one fixture, and each engine has a differential fixture
+//! that runs a non-executable mapping under the interpreter and under both
+//! translating engines and compares every architectural column.
 //!
 //! **The fault does not resolve itself.** It cannot: the access holds the
 //! space's read guard and resolving means a retopology, which is the lock
