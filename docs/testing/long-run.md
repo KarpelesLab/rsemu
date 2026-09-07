@@ -60,7 +60,7 @@ window closed unseen.
 | `the_harness_names_the_quantum_a_planted_divergence_appears_on` | none | ~0.1 s | every `cargo test` |
 | `a_synthetic_a64_workload_agrees_across_the_engines` | none | ~1.7 s | every `cargo test` |
 | `a_synthetic_riscv_workload_agrees_across_the_engines` | none | ~1.3 s | every `cargo test` |
-| `a_tlbi_in_the_loop_agrees_across_the_engines` | none | ~0.4 s | `--ignored` — **a known defect**, see below |
+| `a_tlbi_in_the_loop_agrees_across_the_engines` | none | ~0.4 s | every `cargo test` — see below for what it found |
 | `a_real_arm64_linux_boot_agrees_across_the_engines` | a kernel | minutes | `--ignored`; nightly in CI |
 
 ```sh
@@ -138,20 +138,24 @@ scratch tree:
 | --- | --- | --- | --- |
 | the block that did not notice its own timer (`IrHost::spent`) | **passed** | **failed at quantum 17 — 0.017 s**, naming `elr_el1` `0x100c` against `0x4` | **failed at quantum 23119 — 23.119 s**, naming `elr_el1` and `spsr_el1` |
 | the declined chained boundary (`advance`'s `Stop::Declined` arm) | **passed** | passed | **failed at quantum 14097 — 14.097 s**, naming `debt` 3 against 2, `pc` and `cycles` |
+| the edge computed across an entry walk (`engine::leave_at`) | **passed** | passed | not reached in 40 s — but the synthetic **with** the `TLBI` **failed at quantum 417 — 0.417 s**, naming `elr_el1` `0x1014` against `0x4`, `pc` and `cycles` |
 
-The old test passes in both rows, which is the claim the last round made and it
-is correct. The second row is why the kernel run cannot be replaced: a declined
+The old test passes in all three rows, which is the claim the last round made
+and it is correct. The second row is why the kernel run cannot be replaced: a declined
 chained boundary needs a **cold instruction-fetch translation**, and
 `mmu::Tlb` keeps fetch, load and store entries in three separate 256-entry sets
 — so no amount of data-side pressure evicts a code page's fetch entry, and the
 only ways to get one are a `TLBI` or a guest that executes from 257 pages.
 
-## Known defect: the generic timer across a `TLBI`
+## What it found on its first run: the generic timer across a `TLBI`
 
-`a_tlbi_in_the_loop_agrees_across_the_engines` is `#[ignore]`d because it fails
-today, on unmodified `master`. This harness found it the first time it was
-pointed at anything, and it is a third instance of the class the two September
-defects belong to.
+`a_tlbi_in_the_loop_agrees_across_the_engines` was committed `#[ignore]`d,
+because it failed on the `master` it was committed to. It is now un-`#[ignore]`d
+and it is the regression test: the ledger has shrunk by one. This is the third
+instance of the class the two September defects belong to, and the first one
+that a machine rather than a person found.
+
+What it reported:
 
 * At quantum 417 (0.417 s of guest time, the 52nd timer interrupt) the
   interpreter has `ELR_EL1 = 0x1014` and both translated engines have `0x4`:
@@ -169,8 +173,28 @@ defects belong to.
   constantly, but a timer edge has to land on one, and a loop that flushes on
   half its passes gets there in half a second.
 
-Un-`#[ignore]` that test the day it is fixed; it is then the regression test,
-and the ledger has shrunk by one.
+Every one of those five lines survived being checked, and together they name
+the defect almost exactly. `engine::admit` asks `Exec::pending_interrupt` and
+*then* charges the entry translation, which on a TLB miss is a walk; the generic
+timer's count is this core's own tick counter divided down, so the walk can
+cross a comparator the check a moment before found un-crossed. `Exec::timer_edge`
+reports `u64::MAX` for a comparator already crossed — correct for its own
+question, since an asserting output cannot rise again, and the wrong edge for a
+run, which had to leave at its next boundary rather than never. It takes a cold
+*instruction-fetch* translation to open the window, and `mmu::Tlb`'s three
+separate sets mean a `TLBI` is the only thing on this core that produces one:
+the same fact the table above gives for the declined-boundary defect, arrived at
+from the other direction. `engine::leave_at` is the fix.
+[`docs/platforms/arm64-virt.md`](../platforms/arm64-virt.md) has the long form.
+
+The instructive part is the bisect, not the fix. Five properties, each cheap to
+test by re-running the same harness with one thing changed, took a
+`0x03b29d3a…`-against-`0x7d0edfc4…` hash mismatch down to a named function
+before anybody read a line of `engine.rs` — and the one that mattered most was
+the negative: `DSB`, `ISB` and both together are *fine*. That is what says the
+instruction is doing something to the translation regime rather than to the
+ordering, and it is the difference between reading `timer_edge` and reading
+`admit`.
 
 ## Cost, measured
 

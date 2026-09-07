@@ -390,7 +390,9 @@ own hash, unchanged by either fix, which is what says which side was wrong.
 `cpu::arm::a64::engine`'s
 `a_declined_chained_boundary_charges_its_walk_with_the_instruction_it_belongs_to`
 and `the_generic_timer_is_taken_at_the_same_instruction_by_both_engines` are
-the regressions, and both fail on the code before them. The fixes are also
+the regressions, and both fail on the code before them. A third defect of the
+same class was found later, by the long-run harness rather than by hand, and it
+has its own section below. The fixes are also
 slightly *faster* — 20 s of this boot went from 11.19 s to 10.91 s on `jit` and
 from 5.11 s to 4.94 s on `jit-host`, because interpreting a declined
 instruction in place saves a dispatcher round trip.
@@ -417,6 +419,72 @@ step of that ratio on their own: before `cpu::arm::a64::mmu`'s `Tlb` had a
 argument for what a plan may cover on this architecture, and the three things
 that looked as though they might forbid one — address tagging, the two `TTBR`s
 and granule selection — none of which does.
+
+### And a third one, which needed a `TLBI` on the same instruction
+
+Defect 2's fix carried a claim, written down in `Exec::timer_edge`: the
+registers that decide the comparator are `MSR`-only, no `MSR` is inside the
+lifted subset, so a block ends at one and the edge can be computed **once per
+`advance`**. That claim is sound. What it did not cover is *where in `advance`*
+the edge is computed, and there is a window.
+
+`engine::admit` asks `Exec::pending_interrupt` and **then** calls
+`Exec::translate_fetch`, which on a TLB miss walks the guest's tables and
+charges three or four accesses. `Host::new` computes the edge after both. The
+generic timer's count is this core's own tick counter divided by `cntdiv`
+(`Exec::counter`), so those charged ticks can carry it across a comparator that
+the check a moment earlier found un-crossed — and `Exec::timer_edge` answers
+`u64::MAX` for a comparator already crossed, because its question is when the
+outputs next *change* and an asserting output cannot rise again. That is the
+right answer to its own question and the wrong edge for a run: `IrHost::spent`
+wanted "leave at the first boundary", and got "never leave". The interrupt then
+waited for the next *chained* boundary's `admit`, which does look.
+
+Opening it takes a **cold instruction-fetch translation on the instruction a
+timer fires on**, and on this core only a `TLBI` produces one:
+`cpu::arm::a64::mmu`'s `Tlb` keeps fetch, load and store entries in three
+separate 256-entry sets, so no amount of data-side pressure evicts a code page
+and the alternative is a guest that executes from 257 of them. Which is why a
+**forty-second boot of this board never reached it** — Linux issues `TLBI`
+constantly, but a timer edge has to land on one — and why the synthetic
+workload in `tests/engine_longrun.rs`, which flushes on half its passes round a
+loop the timer fires inside, reaches it in **0.417 s of guest time**. The
+harness found it on its first run, at quantum 417: `ELR_EL1` `0x1014`
+interpreted against `0x4` translated, two guest instructions and one cycle
+apart, with `jit` and `jit-host` giving the same wrong answer because the edge
+is computed above both code generators.
+
+`engine::leave_at` is the fix and it is four lines: when the run's own
+`Exec::pending_interrupt` is already `Some` — after the walk, which is the only
+thing that can have changed since `admit` looked — the edge is the current tick
+count, so `IrHost::spent` is true at the first boundary it is asked at. Which,
+because `ir::Interp` never asks at a block's first boundary and `jit::dispatch`
+never asks at a run's first block, is the boundary *after one retired
+instruction* — exactly what `Exec::step_once` does, charging the fetch, running
+the instruction, and taking the interrupt on its next call.
+
+Asking `pending_interrupt` rather than the timer condition alone is what keeps
+that from being a throughput cliff, and it is the reason the fix is at the call
+site rather than inside `Exec::timer_edge`. A comparator stays crossed until the
+guest re-arms it; on this board the timer is routed out to the GIC and a kernel
+holds `PSTATE.I` across critical sections, so "the condition is met" describes
+long stretches of code with no interrupt to take. Through all of them
+`pending_interrupt` is `None` and blocks run to their natural ends. Measured on
+`benches/a64_dispatch.rs`, every row of both tables moved by less than the
+interpreter column — a path the change does not touch — moved between sittings
+on identical code, which on this host is about 2.5%.
+
+`a_tlbi_in_the_loop_agrees_across_the_engines` in `tests/engine_longrun.rs` was
+committed `#[ignore]`d as the reproduction and is now un-`#[ignore]`d as the
+regression: it fails on the code before this at quantum 417 and passes for
+30 000 quanta after it, on both translated engines.
+
+Neither RISC-V nor x86 can have this shape. Both reach their timers as devices
+on the bus — `dev::riscv::clint` on its own clock domain, the APIC — so
+`riscv::engine::Host::spent` and `x86::engine::Host::spent` are
+`used >= allowance` and nothing else, and `riscv::exec::Exec::pending_interrupt`
+reads only a wire. `SFENCE.VMA` opens the identical *window*; there is nothing
+inside it that a hart's own charged ticks can change.
 
 ### Where the interpreter is reached, and where it used to be
 
