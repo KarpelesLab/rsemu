@@ -167,6 +167,17 @@
 //! `Exec::publish_timer_levels` is then called once per [`advance`] for the
 //! same reason it is called once per `Exec::step`.
 //!
+//! [`leave_at`] is the other half, and it took a third divergence to find:
+//! that edge is asked for **after** [`admit`] has looked for a pending
+//! interrupt and then charged the entry translation, so a walk between the two
+//! can cross the comparator with nobody left to notice. `Exec::timer_edge`
+//! answers [`u64::MAX`] for an already-crossed comparator, which is the right
+//! answer to its own question and the wrong edge for a run: the run has to
+//! leave at its first boundary, not never. It needs a cold instruction fetch —
+//! a `TLBI` — on the same instruction a timer fires on, which the synthetic
+//! workload in `tests/engine_longrun.rs` reaches in 0.417 s of guest time and
+//! a forty-second arm64 Linux boot does not reach at all.
+//!
 //! # Self-modifying code, and the one case that is not covered
 //!
 //! A store from a **translated block** is reported through [`StoreLog`] and
@@ -1148,9 +1159,9 @@ struct Host<'a, 'e> {
     /// what the seam costs: it is read once per boundary on the hot path, so
     /// anything computed here would be felt.
     allowance: u64,
-    /// The cycle count at which this core's own generic timer would change
-    /// what it is driving — `Exec::timer_edge`, asked once per run because a
-    /// block cannot write the registers it is computed from.
+    /// The cycle count at which this run must leave — [`leave_at`], asked
+    /// once per run because a block cannot write the registers it is computed
+    /// from.
     ///
     /// The second half of [`IrHost::spent`], and it is here for the same
     /// reason `allowance` is: a field read at every guest instruction
@@ -1167,6 +1178,59 @@ struct Host<'a, 'e> {
     dirty: DirtyPages,
 }
 
+/// The cycle count at which this run must hand the boundary back — what
+/// [`Host`]'s `timer_edge` field holds.
+///
+/// Ordinarily this is `Exec::timer_edge`: the cycle the generic timer's
+/// comparator is crossed on, which is the boundary an interpreted core would
+/// have taken the interrupt after.
+///
+/// # The case `Exec::timer_edge` cannot answer
+///
+/// That function reports [`u64::MAX`] when the comparator has **already** been
+/// crossed, and it is right to: its question is when the timer's outputs next
+/// *change*, and an output that is asserting cannot rise again. But the
+/// question [`IrHost::spent`] asks is when this run must **leave**, and for an
+/// interrupt that is already pending the answer is "at the first boundary",
+/// not "never".
+///
+/// The two only ever part inside one window, and it takes a `TLBI` to open it.
+/// [`admit`] asks `Exec::pending_interrupt` **before** `Exec::translate_fetch`,
+/// so the entry translation's own ticks are charged after the last look — and
+/// on a TLB miss that is a walk, three or four accesses, which is enough to
+/// cross a comparator that the check a moment earlier found un-crossed. Only a
+/// cold instruction-fetch translation charges them, and `mmu::Tlb` keeps fetch,
+/// load and store entries in three separate sets, so no amount of data-side
+/// pressure evicts a code page: a `TLBI` or a guest executing from more pages
+/// than the fetch set holds are the only ways in (`docs/testing/long-run.md`).
+///
+/// With `Exec::timer_edge` alone the run then took [`u64::MAX`] for its edge
+/// and no boundary inside it ever left, so the interrupt waited for the next
+/// *chained* boundary's `admit` — two guest instructions further on in the
+/// workload that found this, with `ELR_EL1` naming the wrong one. Returning the
+/// current count instead makes [`IrHost::spent`] true at the first boundary it
+/// is asked at, which — because `ir::Interp` never asks at a block's first
+/// boundary and `jit::dispatch` never asks at a run's first block — is the
+/// boundary *after* one retired instruction. That is exactly what the
+/// interpreter does: `Exec::step_once` charges the fetch, runs the
+/// instruction, and takes the interrupt on its next call.
+///
+/// Asking `Exec::pending_interrupt` rather than the timer condition alone is
+/// what keeps this from being a throughput cliff. A comparator stays crossed
+/// until the guest re-arms it, and on a board that routes the timer out to a
+/// GIC, or under a `PSTATE.I` the guest has set for a critical section, that
+/// can be a long stretch of code with no interrupt to take — and through all
+/// of it `pending_interrupt` is `None` and blocks run to their natural ends.
+/// Every input it reads is constant for the length of a run for the reason
+/// `Exec::timer_edge` gives: `DAIF` and the timer registers are written by
+/// `MSR`, no `MSR` is inside the lifted subset, and the routing is topology.
+fn leave_at(exec: &Exec<'_>) -> u64 {
+    match exec.timer_edge() {
+        u64::MAX if exec.pending_interrupt().is_some() => exec.st.cycles,
+        edge => edge,
+    }
+}
+
 impl<'a, 'e> Host<'a, 'e> {
     fn new(exec: &'a mut Exec<'e>, pc: u64, allowance: u64) -> Host<'a, 'e> {
         let mut slots = [0u64; lift::SLOT_COUNT as usize];
@@ -1178,11 +1242,10 @@ impl<'a, 'e> Host<'a, 'e> {
         slots[lift::C.0 as usize] = u64::from(flags.c());
         slots[lift::V.0 as usize] = u64::from(flags.v());
         slots[PC.0 as usize] = pc;
-        let timer_edge = exec.timer_edge();
         Host {
+            timer_edge: leave_at(exec),
             exec,
             allowance,
-            timer_edge,
             slots,
             trap: None,
             mark: None,
@@ -2847,6 +2910,132 @@ mod tests {
             }
             let stats = jit.jit_stats().expect("a jit core");
             assert!(stats.blocks > 0, "no block ran under {engine:?}");
+        }
+    }
+
+    /// A loop that flushes its own translations, so the entry fetch after the
+    /// `TLBI` is a **cold walk** — the window [`leave_at`] closes.
+    ///
+    /// The `TLBI` is outside the lifted subset, so `advance` interprets it and
+    /// returns; the next call starts at `0x0c` with nothing in the fetch set,
+    /// walks, and charges for it. Everything after it is one chain of lifted
+    /// ALU, which is where the timer has to be able to fire.
+    const TLBI_LOOP: [u32; 8] = [
+        0x9100_0400, // add  x0, x0, #1
+        0x8b00_0021, // add  x1, x1, x0
+        0xd508_871f, // tlbi vmalle1        ; every pass makes this page cold
+        0x8b01_0042, // add  x2, x2, x1
+        0x8b02_0063, // add  x3, x3, x2
+        0x8b03_0084, // add  x4, x4, x3
+        0x8b04_00a5, // add  x5, x5, x4
+        0x17ff_fff9, // b    .-28
+    ];
+
+    #[test]
+    fn the_generic_timer_is_taken_at_the_same_instruction_across_a_tlbi() {
+        // The defect [`leave_at`] exists for, and it is not the one the test
+        // above covers. There the comparator is crossed by a tick a *block*
+        // charged, and `IrHost::spent` sees it. Here it is crossed by the
+        // entry translation `admit` charges **after** it has looked for a
+        // pending interrupt and **before** `Host::new` computes the edge — and
+        // `Exec::timer_edge` answers `u64::MAX` for a comparator already
+        // crossed, so the run took that for its edge and no boundary inside it
+        // ever left. The interrupt waited for the next chained boundary's
+        // `admit`, two guest instructions further on.
+        //
+        // It takes a cold *instruction-fetch* translation to open, which on
+        // this core only a `TLBI` produces — `mmu::Tlb` keeps fetch, load and
+        // store entries in three separate sets, so no amount of data-side
+        // pressure evicts a code page. `tests/engine_longrun.rs` reaches it
+        // from a synthetic guest in 0.417 s and a forty-second arm64 Linux
+        // boot does not reach it at all, which is why this sweeps the arming
+        // offset instead of naming one: `Config::cortex_a53` divides the
+        // counter by one, so every tick is a comparator and the walk is two or
+        // three of them wide. Somewhere in the sweep the edge lands inside it.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let mut taken = 0usize;
+            for delta in 0..48u64 {
+                let interp = core(Engine::Interp, &TLBI_LOOP);
+                let jit = core(engine, &TLBI_LOOP);
+                for cpu in [&interp, &jit] {
+                    let space = cpu.space().expect("the core has its space");
+                    // The same handler the test above installs: mask the
+                    // source, then stop, so `ELR_EL1` records where the
+                    // interrupt was taken rather than converging on the
+                    // handler's own address.
+                    for (n, word) in [0xd503_42dfu64, 0x1400_0000].iter().enumerate() {
+                        space
+                            .write(
+                                VBAR + IRQ_VECTOR + 4 * n as u64,
+                                Width::U32,
+                                *word,
+                                MemAttrs::DEFAULT,
+                            )
+                            .expect("inside RAM");
+                    }
+                    enable_mmu(cpu);
+                    let mut sys = cpu.sysregs();
+                    sys.daif = 0;
+                    sys.vbar_el1 = VBAR;
+                    cpu.set_sysregs(sys);
+                }
+                // Warm both, so the translated core is running a chain rather
+                // than lifting one when the comparator is reached.
+                for _ in 0..3 {
+                    interp.run_budget(4096);
+                    jit.run_budget(4096);
+                }
+                assert_eq!(
+                    interp.cycles(),
+                    jit.cycles(),
+                    "delta {delta} under {engine:?}: the two engines parted \
+                     while warming, before the timer was ever armed"
+                );
+                let cfg = Config::cortex_a53();
+                for cpu in [&interp, &jit] {
+                    let mut sys = cpu.sysregs();
+                    sys.cntp_ctl = 1;
+                    sys.cntp_cval = cfg.counter_at(cpu.cycles()) + delta;
+                    cpu.set_sysregs(sys);
+                }
+                for n in 0..3 {
+                    assert_eq!(
+                        interp.run_budget(4096),
+                        jit.run_budget(4096),
+                        "delta {delta}, quantum {n} under {engine:?}"
+                    );
+                }
+                assert_eq!(
+                    interp.sysregs().elr_el1,
+                    jit.sysregs().elr_el1,
+                    "ELR_EL1 at delta {delta} under {engine:?}: the two engines \
+                     took the generic timer's interrupt at different \
+                     instructions"
+                );
+                assert_eq!(interp.pc(), jit.pc(), "the pc at delta {delta}");
+                assert_eq!(
+                    interp.cycles(),
+                    jit.cycles(),
+                    "the cycle counter at delta {delta}"
+                );
+                assert_eq!(
+                    interp.cycle_debt(),
+                    jit.cycle_debt(),
+                    "the carried overrun at delta {delta}"
+                );
+                for n in 0..31 {
+                    assert_eq!(interp.x(n), jit.x(n), "x{n} at delta {delta}");
+                }
+                if interp.sysregs().elr_el1 != 0 {
+                    taken += 1;
+                }
+                let stats = jit.jit_stats().expect("a jit core");
+                assert!(stats.blocks > 0, "no block ran at delta {delta}");
+            }
+            assert!(
+                taken > 0,
+                "the timer never fired under {engine:?}, so this proves nothing"
+            );
         }
     }
 

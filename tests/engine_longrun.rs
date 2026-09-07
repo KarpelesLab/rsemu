@@ -19,7 +19,7 @@
 //! | [`the_harness_names_the_quantum_a_planted_divergence_appears_on`] | none | milliseconds | every `cargo test` |
 //! | [`a_synthetic_a64_workload_agrees_across_the_engines`] | none | a few seconds | every `cargo test` |
 //! | [`a_synthetic_riscv_workload_agrees_across_the_engines`] | none | a few seconds | every `cargo test` |
-//! | `a_tlbi_in_the_loop_agrees_across_the_engines` | none | under a second | `--ignored` — **a known defect**, see its doc comment |
+//! | [`a_tlbi_in_the_loop_agrees_across_the_engines`] | none | under a second | every `cargo test` |
 //! | `a_real_arm64_linux_boot_agrees_across_the_engines` | a kernel | minutes | `--ignored`, nightly |
 //!
 //! `RSEMU_LONGRUN_SECONDS` lengthens the synthetic runs; the default is sized
@@ -384,32 +384,33 @@ mod a64_tests {
         run("a64-longrun", Tlbi::Never, seconds());
     }
 
-    /// The same workload with `TLBI VMALLE1` in the loop — **a known defect**,
-    /// which is why it is `#[ignore]`d rather than deleted.
+    /// The same workload with `TLBI VMALLE1` in the loop — **the regression
+    /// test for the third defect of the class**, and it ran `#[ignore]`d for
+    /// exactly as long as that defect was open.
     ///
-    /// This is not a hypothetical: it is what this harness found the first time
-    /// it was pointed at anything, and it is a third instance of the class the
-    /// two September defects belong to. `docs/testing/long-run.md` has the
-    /// bisect. The short form:
+    /// This is what the harness found the first time it was pointed at
+    /// anything. It failed at **quantum 417** (0.417 s of guest time, the 52nd
+    /// timer interrupt) with the interpreter on `ELR_EL1 = 0x1014` and both
+    /// translated engines on `0x4`: the translated core ran two more guest
+    /// instructions before noticing a timer the interpreter took immediately,
+    /// and carried one extra cycle for it.
     ///
-    /// * it needs the generic timer **and** the `TLBI` — the workload with
-    ///   either one alone agrees for six thousand quanta;
-    /// * `DSB`, `ISB` and `DSB; ISB` in the same slots are all fine, so the
-    ///   instruction is `TLBI` and not the barriers around it;
-    /// * `jit` and `jit-host` produce the *same* wrong answer and only the
-    ///   interpreter is on the other side, which is the signature of a
-    ///   frontend defect rather than a code-generator one;
-    /// * at quantum 417 (0.417 s of guest time, the 52nd interrupt) the
-    ///   interpreter has `ELR_EL1 = 0x1014` and both translated engines have
-    ///   `0x4` — the translated core ran two more guest instructions before
-    ///   noticing a timer the interpreter took immediately, and carried one
-    ///   extra cycle for it.
+    /// The cause was `engine::leave_at`'s absence. `engine::admit` looks for a
+    /// pending interrupt and *then* charges the entry translation, so a cold
+    /// walk between the two can cross the comparator; `Exec::timer_edge`
+    /// reports `u64::MAX` for a comparator already crossed, so the run took
+    /// that for its edge and no boundary inside it left. It needs a cold
+    /// instruction-fetch translation, which on this core only a `TLBI`
+    /// produces — `mmu::Tlb` keeps fetch, load and store entries in separate
+    /// sets — which is why `DSB`, `ISB` and `DSB; ISB` in the same slots were
+    /// all fine and why the workload with either the timer or the `TLBI` alone
+    /// agreed for six thousand quanta. `jit` and `jit-host` gave the *same*
+    /// wrong answer because the edge is computed in the frontend's host, above
+    /// both code generators.
     ///
-    /// Un-`#[ignore]` this the day that is fixed; it is then the regression
-    /// test, and the ledger has shrunk by one.
+    /// `docs/testing/long-run.md` and `docs/platforms/arm64-virt.md` have the
+    /// long form.
     #[test]
-    #[ignore = "known defect: a translated core takes the generic timer two instructions \
-                late across a TLBI. See the doc comment and docs/testing/long-run.md"]
     fn a_tlbi_in_the_loop_agrees_across_the_engines() {
         run("a64-longrun-tlbi", Tlbi::Every256, seconds());
     }
