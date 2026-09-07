@@ -541,6 +541,60 @@ impl<'a> Exec<'a> {
         self.st.sys.timer_levels(self.counter()) & !self.lines.routed_timers() != 0
     }
 
+    /// The cycle count at which this core's timer outputs would next change,
+    /// or [`u64::MAX`] when nothing this run can do will change them.
+    ///
+    /// # What it is for
+    ///
+    /// The interpreter asks [`Exec::pending_interrupt`] — and publishes the
+    /// timer's outward level — once per instruction, so a comparator reached
+    /// by an instruction's own accesses is acted on at the very next
+    /// instruction boundary. A translated block asks neither: a chain runs to
+    /// its end and only then publishes. That is the difference the engines
+    /// cannot have (`ROADMAP.md` §0), because an interrupt taken tens of ticks
+    /// late is a different `ELR_EL1`, and on a real guest a different
+    /// scheduling decision after it. So the block leaves *here*, at the
+    /// instruction boundary the interpreter would have taken the interrupt
+    /// after — which is what `engine::Host::spent` compares this against.
+    ///
+    /// # Why one comparison is enough
+    ///
+    /// `CNT{P,V}_CTL_EL0` and `CNT{P,V}_CVAL_EL0` are written by `MSR` and by
+    /// nothing else, and no `MSR` is inside the lifted subset, so a block ends
+    /// at one: both registers are **constant for the length of a run**. The
+    /// count only ever rises, so an output that is already asserting cannot
+    /// fall and one that is disabled or masked cannot rise. The single case
+    /// left is an enabled, unmasked timer whose condition is not met yet, and
+    /// that condition first holds at `count == cval` (DDI 0487 D11.2.4 states
+    /// it as `Count - CompareValue >= 0` in signed 64-bit arithmetic, and the
+    /// count reaches every value on its way up), so `cval * cntdiv` is the
+    /// cycle it changes on.
+    ///
+    /// A product that overflows, or one already behind the count, is a
+    /// deadline the counter can only reach by wrapping — a distance of at
+    /// least 2^63 counts, which is beyond any run — and is reported as
+    /// [`u64::MAX`].
+    pub(super) fn timer_edge(&self) -> u64 {
+        let sys = &self.st.sys;
+        let count = self.counter();
+        let cycles = self.st.cycles;
+        let div = self.cfg.cntdiv;
+        let rise = |ctl: u64, cval: u64| -> u64 {
+            let stored = ctl & cntctl::WRITABLE;
+            if stored & cntctl::ENABLE == 0 || stored & cntctl::IMASK != 0 {
+                return u64::MAX;
+            }
+            if sysreg::timer_condition_met(cval, count) {
+                return u64::MAX;
+            }
+            match cval.checked_mul(div) {
+                Some(at) if at > cycles => at,
+                _ => u64::MAX,
+            }
+        };
+        rise(sys.cntp_ctl, sys.cntp_cval).min(rise(sys.cntv_ctl, sys.cntv_cval))
+    }
+
     /// Record what both timer outputs are doing, for the wires the board took
     /// them out on.
     ///
