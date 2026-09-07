@@ -821,14 +821,16 @@ reordering — it is a value no interleaving of the two programs could have
 produced — so unlike almost everything else in this area it can be *asserted*
 on an x86-64 host rather than printed.
 
-| window | lost of 120 000 |
-| --- | --- |
-| a `FEAT_LSE` atomic's read and write, with nothing between them | 3 410, 8 497, 8 850 |
-| a `STXR`'s monitor check and its store | 318 |
-| a `LDXR`'s read and the moment it claims the granule | 46 |
-| all three, as the tree stands | 0 |
+| window | lost of 120 000 | runs that lost any |
+| --- | --- | --- |
+| a `FEAT_LSE` atomic's read and write, with nothing between them | 3 410, 8 497, 8 850 | every one |
+| a `STXR`'s monitor check and its store | 318 | most |
+| a `LDXR`'s read and the moment it claims the granule | 46 | most |
+| a sibling `STXR`'s own `note_store`-to-transfer gap | 1 to 3 | 33 of 60 |
+| all four, as the tree stands | 0 | 0 of 126 |
 
-The first two are closed by `AddressSpace::bus_lock`, taken by
+The first two — and, as the fourth showed, the load-exclusive as well — are
+closed by `AddressSpace::bus_lock`, taken by
 `Exec::lock_bus` before the instruction issues an access and held until it
 ends — the span `cpu::x86::exec` already uses for a `LOCK` prefix, and for the
 same second reason: a bus lock fences at both ends, so a guard that opened
@@ -839,16 +841,62 @@ licensed to fail spuriously and is paid for by the guest's retry loop, and
 `LDADD` has no status register and no retry loop, so a spurious clear would
 make it return a wrong answer rather than go round again.
 
-The third is not a lock's problem and no lock fixes it. `ExclusiveMonitor`
-walks *live* slots, so a sibling's store that lands after a `LDXR`'s read but
-before it registers its reservation clears nothing, and the `STXR` that follows
-then commits a value that was already stale. The fix is to claim the granule
-before the read issues rather than after it returns
-(`Exec::reserve_then_read`), which costs nothing at all: the same translation,
-the same read, in the other order. What it changes is that a load-exclusive
-which faults leaves the monitor cleared instead of holding what it held before
-— DDI 0487 B2.9 licenses a spurious clear explicitly, and the alternative would
-be a reservation on a granule the core never loaded.
+The third is not a lock's problem. `ExclusiveMonitor` walks *live* slots, so a
+sibling's store that lands after a `LDXR`'s read but before it registers its
+reservation clears nothing, and the `STXR` that follows then commits a value
+that was already stale. The fix is to claim the granule before the read issues
+rather than after it returns (`Exec::reserve_then_read`), which costs nothing at
+all: the same translation, the same read, in the other order. What it changes is
+that a load-exclusive which faults leaves the monitor cleared instead of holding
+what it held before — DDI 0487 B2.9 licenses a spurious clear explicitly, and
+the alternative would be a reservation on a granule the core never loaded.
+
+The fourth is the one that survived the first three fixes, and it is worth the
+space because it says something about the whole shape of this. `SpaceView::`
+`write_span` breaks reservations **before** it transfers rather than after, on
+purpose: a store that then faults has still broken them, which is a licensed
+spurious clear, and clearing afterwards would mean threading a split transfer's
+outcome back out of its loop. The consequence is that a committing `STXR` has a
+window *inside itself*, between telling the monitor and writing the bytes:
+
+```text
+core 0: stxr [bus held]              core 1: ldxr [no lock]
+  reservation holds
+  note_store: walks the live slots,
+    and core 1 has none yet
+                                       reserve: the slot goes live
+                                       read [x0] -> 5, not written yet
+  write [x0] <- 6
+[bus released]
+                                     stxr: nothing broke the reservation,
+                                     so it commits 6 — core 0's update is gone
+```
+
+Claiming the granule first does not help: the claim lands *after* the sibling
+looked. The `STXR` holding the bus does not help either, because the `LDXR` on
+the other side was holding nothing. What closes it is the load-exclusive taking
+the bus lock too — not to make a write indivisible, since it has none, but so
+that claiming the granule and reading it are one transaction against a sibling
+in the act of storing. That is what hardware gives for free: the reservation is
+taken by the same coherent access that returns the data.
+
+Two lessons rather than one. **A per-instruction fix is not a fix if the other
+instruction of the pair is unlocked** — an earlier round of this work argued
+that a `LDXR` had nothing to gain from the bus and was wrong, and the failure
+rate says how wrong: **33 of 60 runs** lost between one and three updates, on a
+loaded host, and none at all on an idle one. And a lost update of *one* in
+120 000 is exactly the shape a green run hides, which is why the number that
+matters here is a failure rate over dozens of runs rather than a verdict from
+one.
+
+There is a second way to close it, in `core::space` rather than here: move
+`note_store` after the transfer. It would also close a residual this does not —
+a *plain* store racing a `LDXR` can still have its `note_store` run before the
+`LDXR` claims the granule and its bytes land after the `LDXR` has read, leaving
+a reservation that should have been broken. That is `BusLock`'s plain-store
+residual reaching the monitor, it is narrower than the case above (a plain store
+racing an exclusive on one granule is a data race in the guest's own terms), and
+the fault trade-off is real, so it is written down rather than taken.
 
 `LDXP`/`STXP` gets the same treatment and one more claim. The 16-byte access is
 still two eight-byte bus accesses, because that is what `AddressSpace` offers,
@@ -868,29 +916,35 @@ Reachable only under `ThreadingMode::Parallel`, which is opt-in
 argument that `Deterministic` is safe is structural rather than statistical:
 one host thread cannot interleave inside an instruction, and the test's
 one-instruction-quantum run — finer than any quantum the scheduler hands out —
-loses nothing before the fix or after it. That is why this was worth fixing
-carefully rather than urgently.
+loses nothing before any of the fixes or after them. That is why this was worth
+fixing carefully rather than urgently.
 
 Measured on one core with nothing contending, release build, as nanoseconds per
-instruction above the two-instruction loop that drives it (mean of four runs;
-run-to-run drift on this host is ±5%, so the two unchanged rows are the control
-rather than a result):
+loop iteration — the instruction under test plus the `subs` and `b.ne` that
+drive it, which is the ~105 ns bottom row. Mean of four runs on an idle host:
 
-| | before | after |
-| --- | --- | --- |
-| `STADD` (`LDADD` with `Rt == XZR`) | 123 ns | 132 ns |
-| `LDXR` + `STXR`, uncontended | 186 ns | 196 ns |
-| `LDAXR` + `STLXR`, uncontended | 194 ns | 201 ns |
-| plain `LDR` | 71 ns | 70 ns |
-| plain `STR` | 77 ns | 71 ns |
+| | before | after | delta |
+| --- | --- | --- | --- |
+| `STADD` (`LDADD` with `Rt == XZR`) | 218 ns | 232 ns | +14 |
+| `LDXR` + `STXR`, uncontended | 277 ns | 313 ns | +36 |
+| `LDAXR` + `STLXR`, uncontended | 287 ns | 314 ns | +27 |
+| plain `LDR` | 172 ns | 172 ns | 0 |
+| plain `STR` | 173 ns | 174 ns | +1 |
+| the loop alone, as the control | 106 ns | 104 ns | −2 |
 
-About +9 ns an atomic instruction, or +7%, which is one uncontended mutex
-acquire (`core::space::BusLock` prices its own at ~13 ns) less the two
-`SeqCst` fences the guard makes redundant — the acquire/release suffix no
-longer emits its own, because a guard that fences at both ends of the
-instruction is strictly stronger than any suffix in these encodings asks for.
-The load and store paths are untouched: nothing outside the atomics reads the
-bus lock, so a board that executes none pays nothing.
+So about +14 ns for each instruction that now takes the bus, which is one
+uncontended mutex with its two fences (`core::space::BusLock` prices its own
+acquire at ~13 ns). The `LDXR`/`STXR` row pays it twice, and the acquire/release
+row pays less than twice because the suffix no longer emits fences of its own —
+a guard that fences at both ends of the instruction is strictly stronger than
+any suffix in these encodings asks for.
+
+The ordinary load and store paths are untouched, which is the point of the two
+control rows: nothing outside the atomics reads the bus lock, so a board that
+executes none pays nothing. What a real guest pays depends entirely on whether
+it has `FEAT_LSE` — an Armv8.0 kernel is `LDXR`/`STXR` in every lock, an 8.1
+one is `LDADD` and `CASAL` — and in both cases it is one mutex on an
+instruction the guest executes thousands of times a second, not millions.
 
 ## Where it stops, and what is still in the way
 

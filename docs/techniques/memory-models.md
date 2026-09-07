@@ -76,16 +76,34 @@ cost updates. `cpu::arm::a64` issued a `FEAT_LSE` atomic as a separate load and
 store with nothing held across them, checked a `STXR`'s monitor and then stored
 as two acts, and claimed a `LDXR`'s reservation *after* the read had already
 returned — so a sibling's store in any of those three windows went unnoticed.
-Two cores, two host threads, 120 000 increments of one word:
-`tests/a64_lse_atomicity.rs` lost 3 410–8 850 through the first window, 318
-through the second and 46 through the third, and loses none now. The first two
-are closed by `AddressSpace::bus_lock`, held across the whole instruction as
-x86's `LOCK` already was — a `FEAT_LSE` atomic is pessimistic and
-unconditional, which is exactly the case `core::space::BusLock` exists for and
-the case the optimistic monitor cannot serve. The third is closed by taking the
-reservation before the read rather than after it, which costs nothing.
+There was a fourth, and it is the one worth remembering: because
+`SpaceView::write_span` breaks reservations *before* it transfers, a committing
+`STXR` has a window inside itself in which a sibling's `LDXR` — holding no lock
+— could claim the granule and read the pre-store value. Two cores, two host
+threads, 120 000 increments of one word: `tests/a64_lse_atomicity.rs` lost
+3 410–8 850 through the first window, 318 through the second, 46 through the
+third, 1–3 through the fourth in **33 of 60 runs on a loaded host**, and loses
+none now over 126.
+
+The first, second and fourth are closed by `AddressSpace::bus_lock`, held across
+the whole instruction as x86's `LOCK` already was — a `FEAT_LSE` atomic is
+pessimistic and unconditional, which is exactly the case `core::space::BusLock`
+exists for and the case the optimistic monitor cannot serve; and a
+load-exclusive takes it not to make a write indivisible, having none, but so
+that claiming the granule and reading it are one transaction against a sibling
+in the act of storing. The third is closed by taking the reservation before the
+read rather than after it, which costs nothing.
 `docs/platforms/arm64-virt.md` has the interleavings, the reasoning and the
-price (+9 ns an atomic; nothing on the ordinary load and store path).
+price (+14 ns an instruction that takes the bus; nothing on the ordinary load
+and store path).
+
+Two things generalise from it. **`note_store`-before-transfer is a window in
+every core that has a monitor** — the RISC-V core reaches it the same way — and
+moving it after the transfer in `core::space` would close a residual the lock
+does not: a *plain* store racing a load-reserved. And **fixing one instruction
+of a pair is not fixing the pair**: the `STXR` half was locked a round before
+the `LDXR` half, and the defect that survived cost one update in 120 000, which
+is exactly the size a single green run hides.
 
 This is the one thing in this section a test on an x86-64 host can gate, and
 the reason is worth keeping: a lost update is not a reordering. It is a value

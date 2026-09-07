@@ -43,20 +43,31 @@
 //!
 //! # Measured, debug build, two host threads
 //!
-//! | | lost of 120 000 |
-//! | --- | --- |
-//! | `STADD`, before `Exec::lock_bus` | 3 410, 8 497, 8 850 |
-//! | `LDXR`/`STXR`, before it | 318 |
-//! | `LDXR`/`STXR`, with the bus lock but the reservation taken after the read | 46 |
-//! | either, as the tree stands | 0 |
+//! | | lost of 120 000 | runs that lost any |
+//! | --- | --- | --- |
+//! | `STADD`, before `Exec::lock_bus` | 3 410, 8 497, 8 850 | every one |
+//! | `LDXR`/`STXR`, before it | 318 | most |
+//! | `LDXR`/`STXR`, with the bus lock on `STXR` but the reservation taken after the read | 46 | most |
+//! | `LDXR`/`STXR`, with both of those and the load-exclusive still unlocked | 1 to 3 | **33 of 60** |
+//! | any of them, as the tree stands | 0 | 0 of 126 |
 //!
-//! Three separate windows, and the counts are worth keeping apart because they
+//! Four separate windows, and the counts are worth keeping apart because they
 //! measure how wide each one is. The `FEAT_LSE` window is a whole
 //! read-modify-write. The `STXR` window is one monitor check and one store —
 //! narrower, and two orders of magnitude rarer. The third is narrower still: a
 //! sibling's store landing between a load-exclusive's *read* and the moment it
 //! claims the granule, where the monitor cannot see it because the slot is not
-//! live yet.
+//! live yet. The fourth is a few host instructions wide — the gap inside a
+//! committing `STXR` between telling the monitor and writing the bytes, which
+//! `Exec::exclusive`'s load arm draws — and it is the one this file exists to
+//! keep closed.
+//!
+//! **Read that last row as a failure *rate*, not a count.** One lost update in
+//! 120 000 is invisible to a single run and to three; it took twenty-four to
+//! see it and sixty to price it, and it appeared only while the host was busy,
+//! because what widens the window is a preemption inside it. A green run of
+//! this file proves nothing on its own. If it ever fails again, the number to
+//! report is how many runs of how many, not that it failed.
 //!
 //! # Which threading mode
 //!
@@ -378,17 +389,21 @@ fn instruction_boundary_interleaving_never_loses_an_exclusive_update() {
     assert_eq!(out.atomic, 2 * N, "an update was lost on one host thread");
 }
 
-/// The second gate, and it is two claims at once: a `STXR`'s monitor check and
-/// its store are one transaction (the bus lock), and a `LDXR` claims its
-/// granule before it reads rather than after (`Exec::reserve_then_read`).
-/// Removing either one puts lost updates back.
+/// The second gate, and it is three claims at once: a `STXR`'s monitor check
+/// and its store are one transaction, a `LDXR`'s claim and its read are one
+/// transaction (both the bus lock), and the claim comes before the read rather
+/// than after it (`Exec::reserve_then_read`). Removing any one of the three
+/// puts lost updates back, in descending order of how often — see the table at
+/// the top, and note that the last one costs a single update in 120 000 and
+/// needs dozens of runs to see.
 #[test]
 fn concurrent_cores_never_lose_an_exclusive_update() {
     let out = concurrent(&llsc_program());
     report("concurrent ll/sc", &out);
     assert!(
-        out.bus > 2 * N,
-        "every `STXR` takes the bus, and a contended run retries some of them"
+        out.bus > 4 * N,
+        "both halves of every pair take the bus, and a contended run retries \
+         some of the store-conditionals on top"
     );
     assert_eq!(
         out.atomic,

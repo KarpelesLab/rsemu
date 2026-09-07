@@ -1127,14 +1127,19 @@ impl<'a> Exec<'a> {
     /// measured this at **46 lost updates of 120 000** with the bus lock
     /// already closing the other window, and at zero once the order was
     /// reversed. Reversing it costs nothing — the same translation, the same
-    /// read — which is also why the bus lock is *not* taken across a
-    /// single-register `LDXR`. What a lock would still buy there is an untorn
-    /// *value*, not a correct commit: the reservation now covers the read, so
-    /// anything that raced it fails the `STXR` and the guest goes round again.
-    /// That is `core::space::ExclusiveMonitor`'s own "the commit is protected;
-    /// the value is not", and the tearing underneath it belongs to
-    /// [`RamStore`](crate::core::space::RamStore)'s byte loop rather than to
-    /// this.
+    /// read.
+    ///
+    /// # It is necessary and it is not sufficient
+    ///
+    /// Both callers hold the bus lock across this, and an earlier round of
+    /// this file argued they did not need to. They do: `write_span` breaks
+    /// reservations *before* it transfers, so a sibling's committing store has
+    /// a window inside it in which this reservation can be claimed and this
+    /// read can return the pre-store value. [`Exec::exclusive`]'s
+    /// load-exclusive arm draws that interleaving. Claiming first is what
+    /// makes the *monitor* see a store it would otherwise miss; the lock is
+    /// what makes the claim and the read one transaction against a sibling in
+    /// the act of storing. Neither replaces the other.
     ///
     /// # What it changes on a fault
     ///
@@ -2347,7 +2352,12 @@ impl<'a> Exec<'a> {
         let bytes = 1u64 << isa::ls_size(word);
         let plain = isa::bit(word, 23);
         let load = isa::bit(word, 22);
-        let ordered = isa::bit(word, 15);
+        // `o0` (bit 15) separates `LDAXR`/`STLXR` from `LDXR`/`STXR` and is
+        // not read: both of those paths hold the bus lock, whose guard fences
+        // at each end of the instruction and so orders strictly more than
+        // either suffix asks for. The `plain` path below is the one that
+        // fences for itself, because it takes no lock. `Exec::atomic` has the
+        // long form of this note and where the bits live in the encodings.
         let t = isa::rd(word);
         let n = isa::rn(word);
         let addr = self.read_reg(n, 64, true);
@@ -2376,18 +2386,55 @@ impl<'a> Exec<'a> {
         }
 
         if fmt == Fmt::LdStExclusive {
+            // The load-exclusive takes the bus too, and the reason is not the
+            // one a lock is usually taken for — there is no write here to make
+            // indivisible. It is that *claiming the granule and reading it*
+            // have to be one transaction against a sibling that is committing,
+            // which is what hardware gives by construction: the reservation is
+            // taken by the same coherent access that returns the data.
+            //
+            // Split apart, they lose updates even with the reservation taken
+            // first and the sibling's `STXR` holding the bus, because
+            // `SpaceView::write_span` breaks reservations **before** it
+            // transfers (`core::space`, and deliberately: a store that then
+            // faults has still broken them, which is a licensed spurious
+            // clear). That leaves a window inside the sibling's store:
+            //
+            // ```text
+            // core 0: stxr [bus held]        core 1: ldxr [no lock]
+            //   reservation holds
+            //   note_store: walks live
+            //     slots — core 1 has none
+            //                                  reserve: slot goes live
+            //                                  read [x0] -> 5 (not written yet)
+            //   write [x0] <- 6
+            // [bus released]
+            //                                stxr: nothing broke the
+            //                                reservation, so it commits 6 and
+            //                                core 0's update is gone
+            // ```
+            //
+            // Measured at 1 to 3 lost of 120 000 by
+            // `tests/a64_lse_atomicity.rs`, on 14 runs of 24 on a loaded host
+            // and none on an idle one — a window a few host instructions wide,
+            // which a preemption between the two widens without limit. An
+            // earlier round of this file asserted there was "nothing left for
+            // the lock to buy" here. There was.
+            //
+            // `Exec::exclusive_pair` has held it across both directions from
+            // the start, which is why the pair never showed this.
+            let _bus = self.lock_bus();
             // Aligned by `check_align` above, so the access never splits and
             // the physical address of the whole of it is this one — which is
             // what the global monitor is keyed on. The reservation is taken
-            // before the read issues: `Exec::reserve_then_read` has the
-            // interleaving that made the other order lose updates.
+            // before the read issues: `Exec::reserve_then_read` has the other
+            // half of the argument.
             let elem = Width::from_bytes(bytes).ok_or_else(Trap::undefined)?;
             let value = self.reserve_then_read(addr, elem)?;
-            // `LDAXR`, not `LDXR`: the exclusive load carries the same
-            // acquire the plain one does when `o0` is set.
-            if ordered {
-                self.host_fence();
-            }
+            // No fence for `LDAXR`'s `o0`, for the reason the rest of this
+            // family gives: the guard closes after the read with a `SeqCst`
+            // fence of its own, which is where an acquire's would have gone
+            // and orders strictly more.
             self.write_reg(t, width, false, value);
             return Ok(());
         }
@@ -2411,10 +2458,10 @@ impl<'a> Exec<'a> {
         // the `FEAT_LSE` case because the window is one check and one store
         // rather than a whole read-modify-write, and just as forbidden.
         //
-        // Only this path takes it. `LDXR` is one naturally aligned load and
-        // `LDAR`/`STLR` are plain accesses; none of them is a read-modify-write
-        // and a lock across one would buy nothing a plain store does not walk
-        // straight past anyway.
+        // The load-exclusive above takes it as well, for a different reason
+        // that is written out there. `LDAR`/`STLR` do not: they are plain
+        // accesses with no reservation and no read-modify-write, so a lock
+        // would buy nothing a plain store does not walk straight past anyway.
         let _bus = self.lock_bus();
         let status_reg = isa::rm(word);
         let matched = self.reservation_holds(addr);
