@@ -2510,14 +2510,21 @@ impl<'a> Exec<'a> {
     /// # What this cannot be tested with here
     ///
     /// Nothing on an x86-64 host. A `fence(SeqCst)` there is an `mfence`, and
-    /// the only reordering x86-TSO permits is store-then-load — which
-    /// `RamStore::mark_dirty`'s relaxed `fetch_or` already forbids by accident
-    /// (`tests/memory_model_litmus.rs`, third row). So the store-buffer litmus
-    /// that shows hundreds of forbidden outcomes over two bare relaxed atomics
-    /// shows none either way once the accesses go through guest RAM, and a
-    /// test written here would pass before this change as well as after it.
-    /// The row belongs in that file's table, taken on a host whose model is
-    /// weak enough to show it.
+    /// the only reordering x86-TSO permits is store-then-load. That used to be
+    /// masked twice over — `RamStore::mark_dirty`'s relaxed `fetch_or` was a
+    /// `lock or` and forbade it by accident; a later round replaced it with a
+    /// test-before-set, so guest RAM now shows the outcome. What still hides it
+    /// at *this* level is the interpreter itself: roughly forty nanoseconds of
+    /// decode between the store and the load closes the window on its own
+    /// (`tests/memory_model_costs.rs`), so the guest-instruction rows print
+    /// zero here whatever these fences do, and a test written against them on
+    /// this machine would pass before this change as well as after it.
+    ///
+    /// The rows exist and are taken on a host whose model is weak enough to
+    /// show them: `tests/memory_model_litmus.rs`'s `guest_a64` module runs two
+    /// cores through `STLR`/`LDAR` and through `STR`/`DMB ISH`/`LDR`, with a
+    /// plain `STR`/`LDR` control beside them, in the `aarch64 (weak memory)`
+    /// CI job.
     #[inline]
     fn host_fence(&self) {
         sync::fence(sync::Ordering::SeqCst);

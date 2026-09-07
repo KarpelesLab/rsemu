@@ -451,11 +451,16 @@ impl Drop for BusLockGuard<'_> {
 /// instrument is sensitive; it is the subject that is immune.
 ///
 /// So the fences are gated by the *architecture* rather than by a test on this
-/// machine, and the regression net for them is a weakly ordered host. The row
-/// to add on the day CI grows an AArch64 leg belongs in
-/// `tests/memory_model_litmus.rs`, next to the three it already runs, and it
-/// is the only place it will ever mean anything. Adding it here now would
-/// record a green tick for a property this host cannot check.
+/// machine, and the regression net for them is a weakly ordered host. CI has
+/// one: the `aarch64 (weak memory)` job on `ubuntu-24.04-arm` runs
+/// `tests/memory_model_litmus.rs`, which carries the row — a whole [`BusLock`]
+/// transaction between the store and the load, beside an `Unfenced` control
+/// that is this code with the two fences deleted and nothing else changed.
+/// The fenced arm asserting zero is sound everywhere and therefore proves
+/// nothing on its own; only the pair, on a host that shows the control
+/// tearing, says the fences are what forbids it. Nothing is asserted here,
+/// because a green tick on this machine would still be for a property this
+/// machine cannot check.
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
