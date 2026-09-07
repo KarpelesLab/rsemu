@@ -1300,6 +1300,21 @@ dev-pc-apic = ["dev-pc"]
 # `dev-pc`.
 dev-pc-hpet = ["dev-pc"]
 
+# The hypervisor debug console (src/dev/pc/debugcon): one byte-wide I/O port,
+# conventionally 0x402, that answers 0xe9 to a read and takes a character on
+# every write. That is the whole protocol, and it is what EDK II's
+# `PlatformDebugLibIoPort` needs before it will emit a single `DEBUG()` byte:
+# `PlatformDebugLibIoPortDetect` reads the port, compares it against
+# `BOCHS_DEBUG_PORT_MAGIC`, and on a board that answers anything else -- ones,
+# on a `read-as-ones` I/O space -- the firmware's entire log is dropped. With
+# it, a UEFI boot is narrated from the reset vector rather than from the last
+# few lines of BDS, which is the difference between an inference and a printed
+# answer when a firmware goes quiet (docs/platforms/q35-uefi.md). The log goes
+# to a named character port, so `--console debug` or a `CharPort` in a test
+# catches it. Established from EDK II (BSD-2-Clause-Patent, a permitted
+# reference), not from any emulator source. Needs `dev-pc`.
+dev-pc-debugcon = ["dev-pc"]
+
 # The PC's display side (src/dev/pc/video): an MC6845-derived CRTC, the
 # attribute-plus-character text buffer at 0xb8000, and the character generator
 # that turns the two into pixels on the `host::display` scanout seam — so a
@@ -1694,18 +1709,21 @@ machine-q35-linux-smp = ["machine-q35-linux"]
 #
 # No video adapter, no IDE, no 8237As and no generated ACPI tables: a UEFI
 # firmware publishes its own tables and reaches its disks through PCI, and the
-# console is the 16550 EDK II puts a terminal on. What it gets you over
-# `machine-q35` is `dev-flash-cfi` and `dev-nvme` -- the second because a
-# firmware with nowhere to look for an operating system is a firmware that
-# stops at its own shell, and EDK II's `NvmExpressDxe` is the storage driver
-# that binds on a class code and polls, so a namespace is reachable with
-# nothing on the board wired for it. Adds no dependency either way.
+# console is the 16550 EDK II puts a terminal on -- plus, on a character port of
+# its own, the `dev-pc-debugcon` at 0x402 that the firmware writes its whole
+# `DEBUG()` log to. What it gets you over `machine-q35` is `dev-flash-cfi`,
+# `dev-pc-debugcon` and `dev-nvme` -- the last because a firmware with nowhere
+# to look for an operating system is a firmware that stops at its own shell,
+# and EDK II's `NvmExpressDxe` is the storage driver that binds on a class code
+# and polls, so a namespace is reachable with nothing on the board wired for
+# it. Adds no dependency either way.
 machine-q35-uefi = [
   "cpu-x86",
   "dev-q35",
   "dev-uart-ns16550",
   "dev-pc-apic",
   "dev-pc-hpet",
+  "dev-pc-debugcon",
   "dev-flash-cfi",
   "dev-nvme",
 ]

@@ -3,9 +3,11 @@
 //! Everything here is a part somebody could buy: two 8259A interrupt
 //! controllers, an 8254 timer, an 8042 keyboard controller, an MC146818 RTC,
 //! two 8237A DMA controllers, a 6845-derived CRTC with a character generator in
-//! front of it, and a µPD765 floppy controller — plus one thing that is not a
-//! part at all: [`ide`], which is address decode and a cable, because an IDE
-//! drive's controller is on the drive. None of it is PC-specific in itself —
+//! front of it, and a µPD765 floppy controller — plus two things that are not
+//! parts at all: [`ide`], which is address decode and a cable, because an IDE
+//! drive's controller is on the drive, and [`debugcon`], which is a port a
+//! virtual machine answers so a firmware can find somewhere to put its log.
+//! None of it is PC-specific in itself —
 //! the PC is the *wiring*, and that lives in `machines/pc-at.machine`, not in
 //! Rust.
 //!
@@ -90,6 +92,10 @@ pub mod ioapic;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-apic")))]
 pub mod imcr;
 
+#[cfg(feature = "dev-pc-debugcon")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-debugcon")))]
+pub mod debugcon;
+
 #[cfg(feature = "dev-pc-hpet")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-hpet")))]
 pub mod hpet;
@@ -172,6 +178,8 @@ pub fn register(reg: &mut Registry) -> Result<()> {
         ioapic::register(reg)?;
         imcr::register(reg)?;
     }
+    #[cfg(feature = "dev-pc-debugcon")]
+    debugcon::register(reg)?;
     #[cfg(feature = "dev-pc-hpet")]
     hpet::register(reg)?;
     #[cfg(feature = "dev-pc-pci")]
@@ -206,6 +214,8 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
         ioapic::bind(b)?;
         imcr::bind(b)?;
     }
+    #[cfg(feature = "dev-pc-debugcon")]
+    debugcon::bind(b)?;
     #[cfg(feature = "dev-pc-hpet")]
     hpet::bind(b)?;
     #[cfg(feature = "dev-pc-pci")]
@@ -240,6 +250,8 @@ pub fn schemas() -> Vec<ClassSchema> {
         out.push(ioapic::schema());
         out.push(imcr::schema());
     }
+    #[cfg(feature = "dev-pc-debugcon")]
+    out.push(debugcon::schema());
     #[cfg(feature = "dev-pc-hpet")]
     out.push(hpet::schema());
     #[cfg(feature = "dev-pc-pci")]
