@@ -2260,12 +2260,20 @@ impl<'a> Exec<'a> {
     /// The exclusives and the acquire/release ordinary accesses.
     ///
     /// One function because they share an encoding group: `o2` (bit 23)
-    /// chooses between the exclusive pair and the plain `LDAR`/`STLR`, and
-    /// `L` (bit 22) chooses the direction.
+    /// chooses between the exclusive pair and the plain `LDAR`/`STLR`, `L`
+    /// (bit 22) chooses the direction, and `o0` (bit 15) is the **ordering**
+    /// bit that separates `LDXR` from `LDAXR` and `STXR` from `STLXR` —
+    /// [`Exec::host_fence`] is what it buys.
+    ///
+    /// The `plain` half is `LDAR`/`STLR` only: `LDLAR` and `STLLR`, the
+    /// limited-ordering-region forms with `o0` clear, need `FEAT_LOR`, which
+    /// this core does not report and [`isa`] therefore does not decode — so
+    /// the ordering there is unconditional rather than read off the bit.
     fn exclusive(&mut self, word: u32, fmt: Fmt) -> Result<(), Trap> {
         let bytes = 1u64 << isa::ls_size(word);
         let plain = isa::bit(word, 23);
         let load = isa::bit(word, 22);
+        let ordered = isa::bit(word, 15);
         let t = isa::rd(word);
         let n = isa::rn(word);
         let addr = self.read_reg(n, 64, true);
@@ -2277,11 +2285,18 @@ impl<'a> Exec<'a> {
 
         if plain {
             if load {
+                // Load-Acquire. The fence after it is the whole of what
+                // acquire means to a host: nothing the guest does later may
+                // be performed ahead of this load.
                 let value = self.load(addr, bytes)?;
+                self.host_fence();
                 self.write_reg(t, width, false, value);
             } else {
+                // Store-Release, fenced on both sides — see `host_fence`.
                 let value = self.read_reg(t, 64, false);
+                self.host_fence();
                 self.store(addr, bytes, value)?;
+                self.host_fence();
             }
             return Ok(());
         }
@@ -2292,6 +2307,11 @@ impl<'a> Exec<'a> {
             // what the global monitor is keyed on.
             let elem = Width::from_bytes(bytes).ok_or_else(Trap::undefined)?;
             let (value, pa) = self.read_once_at(addr, elem, Access::Load)?;
+            // `LDAXR`, not `LDXR`: the exclusive load carries the same
+            // acquire the plain one does when `o0` is set.
+            if ordered {
+                self.host_fence();
+            }
             self.take_reservation(addr, pa);
             self.write_reg(t, width, false, value);
             return Ok(());
@@ -2305,14 +2325,67 @@ impl<'a> Exec<'a> {
         // the second is the lost update `usermode::proof` reproduces.
         let status_reg = isa::rm(word);
         let matched = self.reservation_holds(addr);
+        // `STLXR`, not `STXR`: the store carries the same release the plain
+        // one does when `o0` is set, and it carries it whether or not the
+        // reservation held — a release that only fenced on the successful path
+        // would order the guest's earlier accesses on some iterations of a
+        // retry loop and not on others.
+        if ordered {
+            self.host_fence();
+        }
         if matched {
             let value = self.read_reg(t, 64, false);
             self.store(addr, bytes, value)?;
+        }
+        if ordered {
+            self.host_fence();
         }
         // The monitor is cleared by the attempt, successful or not.
         self.drop_reservation();
         self.write_reg(status_reg, 32, false, u64::from(!matched));
         Ok(())
+    }
+
+    /// The host fence a Load-Acquire, a Store-Release or a barrier owes.
+    ///
+    /// # Why an acquire/release access needs one at all
+    ///
+    /// The same reason `Op::Dsb`/`Op::Dmb` do, and the argument is written out
+    /// there: this core issues the guest's accesses in program order, but each
+    /// of them becomes a **relaxed** host operation, so the host's own memory
+    /// model applies underneath. `LDAR` and `STLR` are the guest asking for
+    /// ordering its own baseline does not give it, and until this existed they
+    /// were compiled to an ordinary load and an ordinary store — the ordering
+    /// the instruction is *for* was simply absent, and a second `cpu.arm.a64`
+    /// on another host thread could observe it missing.
+    ///
+    /// # Why `SeqCst` rather than `Acquire` and `Release`
+    ///
+    /// A64's acquire/release is **RCsc**, not RCpc: DDI 0487 B2.3 orders a
+    /// Store-Release before a Load-Acquire that follows it in program order,
+    /// which is precisely what a release fence and an acquire fence do *not*
+    /// give — neither forbids a store being reordered past a later load.
+    /// (`FEAT_LRCPC`'s `LDAPR` is the RCpc form, and this core does not have
+    /// it.) The `SeqCst` fences below sit where the published Armv8 mapping of
+    /// a sequentially consistent access puts its `DMB ISH`: after an acquiring
+    /// load, and on **both** sides of a releasing store. The store's trailing
+    /// fence is the one that costs nothing to add and is the whole of the RCsc
+    /// property.
+    ///
+    /// # What this cannot be tested with here
+    ///
+    /// Nothing on an x86-64 host. A `fence(SeqCst)` there is an `mfence`, and
+    /// the only reordering x86-TSO permits is store-then-load — which
+    /// `RamStore::mark_dirty`'s relaxed `fetch_or` already forbids by accident
+    /// (`tests/memory_model_litmus.rs`, third row). So the store-buffer litmus
+    /// that shows hundreds of forbidden outcomes over two bare relaxed atomics
+    /// shows none either way once the accesses go through guest RAM, and a
+    /// test written here would pass before this change as well as after it.
+    /// The row belongs in that file's table, taken on a host whose model is
+    /// weak enough to show it.
+    #[inline]
+    fn host_fence(&self) {
+        sync::fence(sync::Ordering::SeqCst);
     }
 
     /// `LDXP`, `LDAXP`, `STXP` and `STLXP`: the exclusive **pair**.
@@ -2353,6 +2426,9 @@ impl<'a> Exec<'a> {
         let n = isa::rn(word);
         let addr = self.read_reg(n, 64, true);
         let load = fmt == Fmt::LoadExclusivePair;
+        // `o0`, as in `Exec::exclusive`: `LDAXP` and `STLXP` against `LDXP`
+        // and `STXP`.
+        let ordered = isa::bit(word, 15);
         let kind = if load { Access::Load } else { Access::Store };
         self.check_align(addr, total, kind, true)?;
 
@@ -2364,6 +2440,9 @@ impl<'a> Exec<'a> {
             let second = self
                 .read_once_at(addr.wrapping_add(elem), each, Access::Load)?
                 .0;
+            if ordered {
+                self.host_fence();
+            }
             // The reservation is taken only once both halves arrived: a fault
             // on the second must leave the monitor exactly as it was, not
             // watching a granule the guest never successfully read.
@@ -2375,11 +2454,17 @@ impl<'a> Exec<'a> {
 
         let status_reg = isa::rm(word);
         let matched = self.reservation_holds(addr);
+        if ordered {
+            self.host_fence();
+        }
         if matched {
             let first = self.read_reg(t, 64, false);
             let second = self.read_reg(t2, 64, false);
             self.store(addr, elem, first)?;
             self.store(addr.wrapping_add(elem), elem, second)?;
+        }
+        if ordered {
+            self.host_fence();
         }
         self.drop_reservation();
         self.write_reg(status_reg, 32, false, u64::from(!matched));
@@ -2424,12 +2509,33 @@ impl<'a> Exec<'a> {
         // reports a write.
         self.check_align(addr, bytes, Access::Store, true)?;
 
-        if matches!(op, Op::CasB | Op::CasH | Op::CasW | Op::CasX) {
+        // The ordering bits, which [`isa`] deliberately leaves out of every
+        // mask: one row decodes `LDADD`, `LDADDA`, `LDADDL` and `LDADDAL`, so
+        // the *semantics* of the suffix have to be read here. They are not in
+        // the same place in the two encodings — `LD<op>` and `SWP` carry `A`
+        // at bit 23 and `R` at bit 22, while `CAS<A><L>` carries `L` (the
+        // acquire) at bit 22 and `o0` (the release) at bit 15, because bit 23
+        // is fixed in its encoding. `Exec::host_fence` says what the fences
+        // are and why they are `SeqCst`.
+        let cas = matches!(op, Op::CasB | Op::CasH | Op::CasW | Op::CasX);
+        let (acquire, release) = if cas {
+            (isa::bit(word, 22), isa::bit(word, 15))
+        } else {
+            (isa::bit(word, 23), isa::bit(word, 22))
+        };
+        if release {
+            self.host_fence();
+        }
+
+        if cas {
             let compare = elem(self.read_reg(s, width, false));
             let old = self.load(addr, bytes)?;
             if old == compare {
                 let new = self.read_reg(t, width, false);
                 self.store(addr, bytes, new)?;
+            }
+            if acquire || release {
+                self.host_fence();
             }
             // `Rs` is both the comparand and the destination, and it is
             // written with the old value whether or not the swap happened —
@@ -2464,6 +2570,9 @@ impl<'a> Exec<'a> {
             }
         };
         self.store(addr, bytes, new)?;
+        if acquire || release {
+            self.host_fence();
+        }
         // `Rt == 31` is the `ST<op>` spelling, which discards the old value —
         // and `XZR` discarding it is exactly what `write_reg` already does.
         self.write_reg(t, width, false, old);
