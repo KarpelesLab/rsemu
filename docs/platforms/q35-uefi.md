@@ -979,24 +979,157 @@ gap was in the wiring rather than in the description. The board now carries the
 same `wire.not`/`wire.and` multiplexer, and with it the timer check passes
 without comment.
 
+## The firmware narrates its own boot
+
+Everything above was read out of the machine — a register the guest left behind,
+a string on its stack, four cycles on a bus. The firmware was writing a running
+commentary the whole time, and this board was throwing it away.
+
+EDK II's `PlatformDebugLibIoPort` sends every `DEBUG()` and every `ASSERT()` to
+**one byte-wide I/O port**, and it asks first. The whole protocol is two
+expressions and one build-time token, all of them in `OvmfPkg`
+(BSD-2-Clause-Patent, so readable):
+
+| | |
+| --- | --- |
+| `DebugIoPortQemu.c` | `return IoRead8 (PcdGet16 (PcdDebugIoPort)) == BOCHS_DEBUG_PORT_MAGIC;` — one byte read, compared against `0xE9` |
+| `DebugLib.c` | `IoWriteFifo8 (PcdGet16 (PcdDebugIoPort), Length, Buffer)` in `DebugPrintMarker` and again in `DebugAssert`, each guarded by `PlatformDebugLibIoPortFound ()` |
+| `OvmfPkg.dec` | `PcdDebugIoPort\|0x402\|UINT16\|4` — where `0x402` comes from, and that it is the *firmware's* build-time choice rather than a chipset's |
+
+`IoWriteFifo8` is `rep outsb`: byte writes, in order, to one address, with
+nothing read back between them. So there is no status register, no busy bit and
+no handshake — a read is a constant and a write is a character, and that is the
+device in its entirety. It is `src/dev/pc/debugcon.rs`, behind
+`dev-pc-debugcon`, mapped by `machines/q35-uefi.machine` at `0x402`.
+
+Two consequences worth stating, because both are the reason it is written the
+way it is:
+
+* **`0xff` is not `0xe9`.** This board's I/O space is `read-as-ones`, so before
+  the port was mapped the detect read `0xff`, `PlatformDebugLibIoPortFound`
+  answered false for the rest of the boot, and every `DEBUG()` in the firmware
+  went nowhere. Nothing was broken and nothing said so — which is exactly the
+  failure mode this whole page keeps running into.
+* **A byte the host will not take is dropped, not retried.** `rep outsb` has
+  nowhere to put back pressure, so a device that stalled would stall a guest
+  with no way of learning it. The count of dropped bytes is kept, so a truncated
+  log looks truncated rather than short.
+
+The log goes to its own character port — `debug`, beside COM1's `console` —
+rather than into the serial stream, because the firmware writes both at once and
+a `DEBUG()` line spliced into the UEFI shell's line editor would ruin both.
+
+`MemAttrs::debug` is honoured in the narrow way the port allows: a monitor's
+read answers the same `0xe9` and does not count as a detect, and a monitor's
+*write* is refused outright, because it would put a line into the guest's own
+log that the guest never wrote.
+
+What comes out is the boot, from the first instruction. `rsemu run q35-uefi
+--console debug` with the 4 MiB `edk2-x86_64-code.fd`, which has debug strings
+in it:
+
+```text
+SecCoreStartupWithStack(0xFFFCC000, 0x820000)
+Register PPI Notify: DCD0BE23-9586-40F4-B643-06522CED4EDE
+The 0th FV start address is 0x00000820000, size is 0x000E0000, handle is 0x820000
+DiscoverPeimsAndOrderWithApriori(): Found 0xD PEI FFS files in the 0th FV
+Loading PEIM at 0x0000082B980 EntryPoint=0x0000082EA27 PcdPeim.efi
+…
+Loading PEIM at 0x00000834840 EntryPoint=0x0000083C488 PlatformPei.efi
+Platform PEIM Loaded
+CMOS:
+00: 36 00 05 00 00 00 05 01 01 26 26 02 50 80 00 00
+10: 40 00 00 00 2D 80 02 00 3C 00 00 00 00 00 00 00
+20: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 2B
+30: 00 3C 20 00 10 07 00 00 00 00 00 00 00 00 00 00
+…
+QemuFwCfgProbe: Supported 1, DMA 0
+Select Item: 0x19
+…
+PlatformAddressWidthFromCpuid: Signature: '', PhysBits: 40, GuestPhysBits: 0, QemuQuirk: On, la57: Off, Valid: No
+AddressWidthInitialization: Pci64Base=0x800000000 Pci64Size=0x800000000
+```
+
+Every line of that is the firmware describing this repository's own devices
+back to it, and three of them are worth pointing at. `CMOS:` is `pc.rtc`'s
+register file, dumped by `PlatformPei` — `0x34`/`0x35` reading `10 07`, which is
+`0x710` blocks of 64 KiB above 16 MiB, and puts the top of low memory at
+`0x8100000`: exactly the 128 MiB of extended memory
+`machines/q35-uefi.machine` declares, read back through the route that has
+always carried it.
+`QemuFwCfgProbe: Supported 1, DMA 0` is `q35.fwcfg` answering the signature and
+*declining* the DMA feature bit, which is the decision
+["What `fw_cfg` is"](#what-fw_cfg-is) argues for, confirmed from the consumer's
+side rather than from ours. And `Select Item: 0x19` is the directory walk the
+same section reconstructed from a ring of selectors — now printed by the
+firmware as it happens.
+
+Four hundred seconds of virtual time gets 1,272 lines of it, through PEI, into
+the DXE core and down its driver dispatch (`NvmExpressDxe.efi`, `Fat.efi`,
+`Ps2KeyboardDxe.efi`); 1,400 seconds gets 1,648 and ends with `Shell.efi` being
+loaded. A debug-strings build is a good deal slower than the `RELEASE` image the
+timings further up were taken with — every `DEBUG()` is a `AsciiVSPrint` and a
+few hundred `outsb` — so those numbers are not comparable with the 367-second
+one, and are not meant to be.
+
+A `--console debug` run is held to real time by the console loop, so 1,400
+seconds of virtual time is also about twenty-three minutes of wall clock. The
+run is the same one either way; `--headless` simply does not print it, because
+nothing drains the port.
+
+### The line that would have ended the variable-store hunt
+
+["Why nothing wrote the store"](#why-nothing-wrote-the-store-one-bit-in-a-status-register)
+took four bus cycles and a datasheet paragraph to establish that
+`QemuFlashDetected` was answering *no*. The firmware says so itself, on this
+port, and names the address it probed while it is at it:
+
+```text
+Loading driver at 0x00007AE4000 EntryPoint=0x00007AE7054 FvbServicesRuntimeDxe.efi
+QEMU Flash: Attempting flash detection at FFC00010
+QemuFlashDetected => FD behaves as FLASH, writable
+QemuFlashDetected => Yes
+Installing QEMU flash FVB
+```
+
+`FFC00010` is offset `0x10` of the variable bank on a 4 MiB build — the probe
+address that section works out from the firmware volume's GUID — and
+`=> Yes` is the answer that used to be `No`. It is the same finding, arrived at
+by reading rather than by inferring, and it is the argument for this device in
+one screen.
+
+### And it keeps going, all the way to the shell
+
+Given enough virtual time the same stream reaches BDS and describes the boot
+this page spent three sections establishing from the outside:
+
+```text
+[Bds]=============Begin Load Options Dumping ...=============
+  Boot Options:
+    Boot0000: UiApp 		 0x0109
+    Boot0001: UEFI RSEMU NVME CONTROLLER RSEMU000000000000000 1 		 0x0001
+    Boot0002: EFI Internal Shell 		 0x0001
+…
+VirtHstiQemuFirmwareFlashCheck: FFC84010 behaves as FLASH, write-protected
+[Bds]Booting UEFI RSEMU NVME CONTROLLER RSEMU000000000000000 1
+ BlockSize : 512 
+ LastBlock : 7FFF 
+[Bds] Expand PciRoot(0x0)/Pci(0x4,0x0)/NVMe(0x1,00-00-00-00-00-00-00-00) -> <null string>
+[Bds]Booting EFI Internal Shell
+Loading driver at 0x00006639000 EntryPoint=0x00006658BE0 Shell.efi
+```
+
+`FFC84010` is the *code* bank, and `write-protected` is `readonly = true` in the
+machine file being enforced and observed — the second bank of the pair, checked
+by a different driver, agreeing with the first. `LastBlock : 7FFF` is the 16 MiB
+namespace `nvme.controller` reports when no image is bound, and the `<null
+string>` expansion is the boot manager finding no file system on it and moving
+on to `Boot0002` — which is `map: No mapping found.` said from the firmware's
+side rather than the shell's.
+
 ## What is not reached yet
 
-**A debug console at I/O port `0x402`** would still be worth having.
-`PlatformDebugLibIoPort` writes EDK II's whole `DEBUG()` log there once
-`PlatformDebugPortDetect` reads back the magic byte `0xe9`; this board's I/O
-space is `read-as-ones`, so the detect fails and the log is dropped. It is much
-less urgent now that the firmware reaches a real console, but it is the
-difference between the last few lines of BDS and the whole boot. That is a
-`src/dev/pc` addition.
-
-It would also have turned the variable-store hunt above into a one-line answer:
-`QemuFlashDetected` ends with `DEBUG ((DEBUG_INFO, "QemuFlashDetected => %a\n",
-…))` on exactly that port, so a build with debug strings would have printed
-`QemuFlashDetected => No` — the whole finding — before anything had to be
-inferred from four bus cycles. Worth remembering the next time this board goes
-quiet.
-
-**The `fw_cfg` DMA interface** is the other one, and it is a design review
+**The `fw_cfg` DMA interface** is one of two, and it is a design review
 rather than an omission — ["What `fw_cfg` is"](#what-fw_cfg-is) has the
 argument. Nothing this board runs needs it: the firmware falls back to the port
 path by construction, and a Linux guest's `fw_cfg` sysfs driver is the first
@@ -1025,7 +1158,25 @@ RSEMU_OVMF_INPUT='Shell> =>map -b\r' \
         --test q35_uefi -- --nocapture a_uefi_firmware
 ```
 
-and when a boot goes quiet, the three instruments that make a silent firmware
+The firmware's own log, which needs an image with debug strings in it — the
+4 MiB pair out of the local qemu firmware package has them, and the 2 MiB
+`edk2-ovmf` `OVMF_CODE.fd` `fetch-testdata.sh` copies is a `RELEASE` build and
+has none:
+
+```console
+rsemu run q35-uefi \
+    --flash0 /usr/share/qemu/edk2-x86_64-code.fd \
+    --flash1 /usr/share/qemu/edk2-i386-vars.fd \
+    -p flash=4M -p vars=528K -p engine=jit-host \
+    --console debug --for 1400s >boot.log
+```
+
+`--console debug` picks the debug port's character stream rather than COM1's;
+`--console console` picks COM1. Both exist for the whole run and only the one
+named is drained, which is why the debug console drops rather than blocks when
+nobody is listening to it.
+
+And when a boot goes quiet, the three instruments that make a silent firmware
 talk — the driver an address belongs to, out of the loaded image's own PE/COFF
 debug directory; the string a stack pointer is pointing at; and a hex dump
 through the guest's page tables:
@@ -1099,6 +1250,7 @@ programmed from, through **both** windows onto configuration space.
 | that kernel finding an APIC | **works** — `ACPI: Using ACPI (MADT) for SMP configuration information` and `APIC: Switch to symmetric I/O mode setup`, where it used to read `ACPI MADT or MP tables are not detected` and fall back to virtual wire mode |
 | the timer that mode needs | **works** — and it took the HPET legacy replacement route: a kernel that learns the board has an HPET sets `LEG_RT_CNF` and stops loading the 8254, so a board without the multiplexer panics with `IO-APIC + timer doesn'''t work!` |
 | the ACPI set the firmware installs | **works** — RSDP, XSDT, FADT, DSDT, FACS, MADT, MCFG and HPET, all generated from the realized machine and all placed by the firmware itself |
+| the firmware's own `DEBUG()` log | **works** — `pc.debugcon` at `0x402` answers `PlatformDebugLibIoPortDetect` with `0xe9` and takes the log on its own character port, so a build with debug strings narrates the boot from the reset vector: SEC, every PEIM, the CMOS dump, `QemuFwCfgProbe`, the DXE dispatch, and `QemuFlashDetected => Yes`. A `RELEASE` image writes nothing there, and that is the image rather than the board |
 | SMRAM / SMM | not modelled, **and not what was stopping the variable writes**; a non-`SMM_REQUIRE` OVMF never touches it, and [`q35.md`](q35.md) records the gap |
 | `fw_cfg` | **works** — the selector/data pair at `0x510`, serving `etc/acpi/tables`, `etc/acpi/rsdp` and `etc/table-loader`. The DMA interface at `0x514` is deliberately absent and the feature bit says so, so the firmware takes the `rep insb` path |
 | a boot device | **works** — an NVMe namespace with a FAT volume on it, found by BDS, mounted by the shell, and booted from |
@@ -1122,7 +1274,14 @@ command sequence, `PlatformInitLib`'s chipset detection, and
 decide whether the variable store is used at all, `VirtNorFlashDeviceLib` for
 the status polling the RISC-V board's driver does with the same part, and
 `VarCheckUefiLib` for why a variable under the global GUID has to be one the
-specification names.
+specification names. For the debug console:
+`OvmfPkg/Library/PlatformDebugLibIoPort/DebugIoPortQemu.c` for the detect and
+its magic byte, `DebugLib.c` for the `IoWriteFifo8` that is the whole output
+path, `DebugLibDetect.c` and `DebugLibDetectRom.c` for who caches the answer and
+who cannot, and `OvmfPkg/OvmfPkg.dec` for `PcdDebugIoPort`'s default of `0x402`.
+**That port is a QEMU-originated convention (and a Bochs one before it), and
+neither source was opened**; what the device implements is what EDK II is
+written to do to it.
 
 For the disk: the **UEFI Specification 2.10** §3.5.1.1 for the default file
 name a boot manager looks for on a device it has no `Boot####` for, §13.3 for

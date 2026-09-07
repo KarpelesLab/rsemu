@@ -6,7 +6,13 @@
 #   rsemu run q35-uefi --flash0 OVMF_CODE.fd --drive flash1=OVMF_VARS.fd \
 #       --drive nvme0=esp.img -p disk=64M
 #   rsemu run q35-uefi --flash0 edk2-x86_64-code.fd --flash1 edk2-i386-vars.fd \
-#       -p flash=4M -p vars=528K
+#       -p flash=4M -p vars=528K --console debug
+#
+# The last one is the interesting one when a boot goes wrong: this board has
+# three character ports — `keyboard`, COM1's `console`, and `debug`, which is
+# where EDK II's `PlatformDebugLibIoPort` puts its whole `DEBUG()` log — so a
+# terminal has to be told which. An image with debug strings in it narrates the
+# boot from the reset vector on that third one.
 #
 # The second form is the one that makes a variable outlive the run: `--flash1`
 # copies bytes in and nothing takes them out again, while `--drive` binds the
@@ -176,6 +182,12 @@ machine "q35-uefi" {
 
   # And which one COM1 is, which is this board's only console.
   param console = "console"
+
+  # And which one the firmware's own `DEBUG()` log arrives on. A **second**
+  # stream rather than the console's, deliberately: the firmware writes both at
+  # once, and a debug log spliced into a UEFI shell's line editor would ruin
+  # both. Watch it with `rsemu run q35-uefi --console debug`, or redirect it.
+  param debugport = "debug"
 
   # The date and time the RTC starts at. A device may never read the host clock
   # (CLAUDE.md, determinism), so it is declared.
@@ -348,6 +360,26 @@ machine "q35-uefi" {
     frequency = 1843200
   }
 
+  # -- somewhere for the firmware to talk -------------------------------------
+  #
+  # The hypervisor debug console at 0x402: one byte-wide port that answers 0xe9
+  # to a read and takes a character on every write. EDK II's
+  # `PlatformDebugLibIoPort` reads it once (`PlatformDebugLibIoPortDetect`),
+  # compares the byte against `BOCHS_DEBUG_PORT_MAGIC`, and writes its whole
+  # `DEBUG()` log there for the rest of the boot if it matched — and drops every
+  # byte of it if it did not. This board's I/O space is `read-as-ones`, so
+  # before this object it did not match, and `docs/platforms/q35-uefi.md`
+  # records what that cost: a variable-store defect that had to be inferred from
+  # four bus cycles when `QemuFlashDetected` prints its own answer on this port.
+  #
+  # 0x402 rather than anything else because that is `PcdDebugIoPort`'s default
+  # in `OvmfPkg/OvmfPkg.dec` — a build-time token, so it is the firmware's
+  # choice and belongs here rather than in the device.
+  #
+  # A `RELEASE` firmware writes nothing here at all: `DEBUG()` is compiled out.
+  # The port still answers, and the board is still telling the truth.
+  object debugcon "pc.debugcon" { port = debugport }
+
   # -- what the board tells the firmware about itself -------------------------
   #
   # `fw_cfg`: a selector at 0x510 and a data port at 0x511, and behind them the
@@ -495,6 +527,7 @@ machine "q35-uefi" {
   map port 0x0092 size 0x0001 = sysctl.porta
   map port 0x00a0 size 0x0002 = pic2.regs
   map port 0x03f8 size 0x0008 = com1.regs
+  map port 0x0402 size 0x0001 = debugcon.regs # OvmfPkg.dec: PcdDebugIoPort
   map port 0x04d0 size 0x0001 = pic1.elcr
   map port 0x04d1 size 0x0001 = pic2.elcr
   map port 0x0510 size 0x0002 = fwcfg.regs   # selector and data; no DMA at 0x514
