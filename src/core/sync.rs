@@ -117,26 +117,43 @@
 //! Over two bare relaxed `AtomicU8`s the host produces the forbidden outcome
 //! tens to hundreds of times in 200 000 rounds; a [`fence`] removes it, as it
 //! must. Over `RamStore` — the object every guest access actually lands in —
-//! **it was already zero before any of this**, and the reason is an accident
+//! **it was already zero before any of this**, and the reason was an accident
 //! worth naming:
 //!
-//! > `RamStore`'s writes all end in `mark_dirty`, which sets a bit with
-//! > `AtomicU64::fetch_or`. That is a *relaxed* read-modify-write, and on
-//! > x86-64 a relaxed read-modify-write is a `lock or` — a full barrier
-//! > (*Intel SDM* volume 3 §9.2.5). So every guest store to RAM has been
-//! > draining the store buffer all along, interpreted or compiled alike:
-//! > `jit::Tlb::note_fast_store` marks the same bitmap after an inlined store.
-//! > Measured, the two cost the same to within noise — 3.96 ns for a store
-//! > plus a `SeqCst` fence, 3.97 ns for a store plus the `fetch_or`.
+//! > `RamStore`'s writes all end in `mark_dirty`, which sets a bit in an
+//! > `AtomicU64`. It used to set that bit with an unconditional `fetch_or`:
+//! > a *relaxed* read-modify-write, and on x86-64 a relaxed read-modify-write
+//! > is a `lock or` — a full barrier (*Intel SDM* volume 3 §9.2.5). So every
+//! > guest store to RAM was draining the store buffer, interpreted or compiled
+//! > alike: `jit::Tlb::note_fast_store` marks the same bitmap after an inlined
+//! > store. Measured, the two cost the same to within noise — 3.96 ns for a
+//! > store plus a `SeqCst` fence, 3.97 ns for a store plus the `fetch_or`.
 //!
-//! An accident is worth what an accident is worth. It is x86-only —
-//! `fetch_or(Relaxed)` on AArch64 orders nothing — it covers only the case
-//! that follows a store, it does nothing for a barrier between two loads, and
-//! it would evaporate the day somebody batched the dirty bitmap. The fence is
-//! what turns it into the guarantee the guest asked for, and it costs about
-//! four nanoseconds on an instruction an arm64 Linux boot executes once in
-//! every 1 800 (479 000 `DSB`/`DMB` in 876 million) and a RISC-V one about once
-//! in 100 000.
+//! An accident is worth what an accident is worth, and this one was paid for
+//! at 3.6 ns of a 25.4 ns store — the largest single component of the write
+//! path. `mark_dirty` **tests the bit before it sets it** now, so in the steady
+//! state there is no locked instruction and no barrier, and
+//! `tests/memory_model_litmus.rs`'s `RamStore` row has moved from zero to the
+//! same tens-per-200 000 as the unfenced control. Nothing that was a guarantee
+//! changed: the accident was x86-only (`fetch_or(Relaxed)` on AArch64 orders
+//! nothing), it covered only the case that follows a store, and it did nothing
+//! for a barrier between two loads.
+//!
+//! What it *was* silently propping up is the dirty log's own soundness against
+//! a consumer running while a vCPU does, and the answer there is the
+//! safe-point protocol rather than an ordering nobody can afford on the store
+//! path: `RamStore::mark_dirty` argues that in full, and
+//! `RamStore::for_each_dirty_page` states the contract. `Pool::quiesce` is
+//! where the happens-before edge a dirty-log consumer needs actually comes
+//! from — a worker releases the pool mutex when its job ends and
+//! [`Pool::quiesce`] acquires it, which orders every guest store before the
+//! consumer's first read on **every** architecture, which the `lock or` never
+//! did.
+//!
+//! The fence is what turns the guest's barrier into the guarantee it asked
+//! for, and it costs about four nanoseconds on an instruction an arm64 Linux
+//! boot executes once in every 1 800 (479 000 `DSB`/`DMB` in 876 million) and a
+//! RISC-V one about once in 100 000.
 //!
 //! The last place that owed a fence was not a fence instruction at all, and it
 //! now has two. An x86 guest's **`LOCK` prefix** is architecturally a full

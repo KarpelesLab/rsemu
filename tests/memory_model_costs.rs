@@ -330,10 +330,12 @@ fn what_single_copy_atomicity_would_cost() {
 /// the width constraint check, `ExclusiveMonitor::note_store` and the dirty
 /// bitmap as well as the bytes.
 ///
-/// Recorded on the author's host: ~25 ns. Compare a candidate's *delta* against
-/// this, not against the bare access — the byte loop is a few per cent of what
-/// a guest store actually costs, which is the number that decides whether the
-/// price is affordable.
+/// Recorded on the author's host: ~20 ns for four bytes, down from ~25 ns
+/// before `mark_dirty` stopped paying for a locked instruction on every store
+/// and `SpaceView::write` started carrying the value into the leaf instead of
+/// a stack buffer. Compare a candidate's *delta* against this, not against the
+/// bare access — the byte loop is a few per cent of what a guest store actually
+/// costs, which is the number that decides whether the price is affordable.
 #[test]
 #[ignore = "a measurement, not a gate"]
 fn what_a_whole_store_through_the_space_costs() {
@@ -735,12 +737,26 @@ fn how_long_the_host_keeps_a_store_invisible() {
 /// loop with a fence in it measures the loop.
 ///
 /// Recorded on the author's x86-64 host: a relaxed byte store alone, the same
-/// store followed by a `SeqCst` fence, and the same store followed by the
-/// relaxed `fetch_or` that `RamStore::mark_dirty` already does after every
-/// write. The third is the one that matters — a locked read-modify-write is
-/// itself a full barrier on this architecture, which is why
-/// `tests/memory_model_litmus.rs` finds the guest's `MFENCE` changes nothing
-/// *here* and would change everything on a weakly ordered host.
+/// store followed by a `SeqCst` fence, the same store followed by the
+/// unconditional relaxed `fetch_or` `RamStore::mark_dirty` used to do after
+/// every write, and the same store followed by the test-before-set it does
+/// now.
+///
+/// | | ns |
+/// | --- | --- |
+/// | store | 0.20 |
+/// | store + `fence(SeqCst)` | 3.96 |
+/// | store + unconditional `fetch_or` | 3.97 |
+/// | store + test-before-set | 0.20 |
+///
+/// The third row was the one that mattered and the fourth is why it does not
+/// any more. A locked read-modify-write is itself a full barrier on this
+/// architecture and costs what the fence costs, to within noise — which is why
+/// `tests/memory_model_litmus.rs` used to find the guest's `MFENCE` changing
+/// nothing *here* while it would change everything on a weakly ordered host.
+/// Testing the bit first removes the locked instruction in the steady state
+/// and the cost goes with it, back to the price of the bare store; that file's
+/// table is the same statement in forbidden outcomes rather than nanoseconds.
 #[test]
 #[ignore = "a measurement, not a gate"]
 fn what_a_host_fence_costs() {
@@ -757,10 +773,21 @@ fn what_a_host_fence_costs() {
             std::sync::atomic::fence(Ordering::SeqCst);
         }
     });
-    timed("store + mark_dirty", || {
+    timed("store + unconditional fetch_or", || {
         for i in 0..REPS {
             cell.store(black_box(i) as u8, Ordering::Relaxed);
             dirty.fetch_or(1, Ordering::Relaxed);
+        }
+    });
+    // What `mark_dirty` does now. The bit is set by the first iteration and
+    // the branch is not taken again, which is the steady state a guest store
+    // path is in for every page after its first write.
+    timed("store + mark_dirty (test-before-set)", || {
+        for i in 0..REPS {
+            cell.store(black_box(i) as u8, Ordering::Relaxed);
+            if dirty.load(Ordering::Relaxed) & 1 == 0 {
+                dirty.fetch_or(1, Ordering::Relaxed);
+            }
         }
     });
 }

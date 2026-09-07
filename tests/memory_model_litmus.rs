@@ -34,37 +34,52 @@
 //!
 //! | what sits between the store and the load | forbidden outcome |
 //! | --- | --- |
-//! | nothing — two bare relaxed `AtomicU8`s | 7 to 751, run to run |
+//! | nothing — two bare relaxed `AtomicU8`s | 2 to 751, run to run |
 //! | `core::sync::fence(SeqCst)` — what `IrHost::fence` now emits | **0** |
 //! | a relaxed `fetch_or` on an unrelated word | **0** |
-//! | `RamStore::write_at` then `read_at` — the emulator's own guest RAM | **0** |
+//! | the same word, tested before it is set — `mark_dirty` today | 27 to 166 |
+//! | `RamStore::write_at` then `read_at` — the emulator's own guest RAM | 16 to 61 |
 //! | two `cpu::x86` cores, `mov [X],1` then `mov eax,[Y]` | **0** |
 //!
-//! The third row is the finding, and it corrects the premise the other rows
-//! were written to test. **`RamStore` already contains a barrier on this host,
-//! by accident.** Every one of its writes ends in
-//! [`mark_dirty`](rsemu::core::space::RamStore::mark_dirty), which sets a bit
-//! with `AtomicU64::fetch_or` — a *relaxed* atomic read-modify-write, which on
-//! x86-64 is a `lock or`, and a locked instruction is a full barrier (*Intel
-//! SDM* volume 3 §9.2.5). So a guest store to RAM is followed by a store-buffer
-//! drain whether anybody wanted one or not, on the interpreter and in a
-//! translated block alike — `jit::Tlb::note_fast_store` marks the same bitmap
-//! after an inlined store.
+//! The fourth and fifth rows are the finding, and between them they record a
+//! premise that was true when this file was written and is not true now.
 //!
-//! That accident is worth exactly as much as an accident: it is x86-only
-//! (`fetch_or(Relaxed)` on AArch64 is `ldsetr`, which orders nothing), it
-//! covers only the store-then-load case, it does nothing for a barrier between
-//! two *loads* or between two *loads and a store*, and it would disappear the
-//! day somebody batched the dirty bitmap or wrote it with a plain `store`. The
-//! fence is what makes the guarantee the guest asked for a guarantee.
+//! **`RamStore` used to contain a barrier on this host, by accident.** Every
+//! one of its writes ends in
+//! [`mark_dirty`](rsemu::core::space::RamStore::mark_dirty), which used to set
+//! its bit with an unconditional `AtomicU64::fetch_or` — a *relaxed* atomic
+//! read-modify-write, which on x86-64 is a `lock or`, and a locked instruction
+//! is a full barrier (*Intel SDM* volume 3 §9.2.5). So a guest store to RAM was
+//! followed by a store-buffer drain whether anybody wanted one or not, on the
+//! interpreter and in a translated block alike — `jit::Tlb::note_fast_store`
+//! marks the same bitmap after an inlined store.
 //!
-//! The fifth row is the same statement about the emulator's *cost*: a guest
+//! An accident is worth exactly as much as an accident, and this one was
+//! bought at 3.6 ns of a 25.4 ns store. `mark_dirty` now tests the bit before
+//! it sets it, which in the steady state is a plain relaxed load and no locked
+//! instruction at all — so the fifth row has moved from **0** to the same order
+//! of magnitude as the unfenced control, and the fourth row is the attribution:
+//! the same word, the same access, only the branch added, and the barrier is
+//! gone. What that gave up, and the safe-point condition that makes giving it
+//! up sound, is argued in full on `mark_dirty` itself.
+//!
+//! Nothing that was a guarantee changed, because none of this ever was one: it
+//! is x86-only (`fetch_or(Relaxed)` on AArch64 is `ldsetr`, which orders
+//! nothing), it covered only the store-then-load case, and it did nothing for a
+//! barrier between two *loads* or between two *loads and a store*. The second
+//! row is the guarantee, and the three interpreters and the x86 backend all
+//! emit it: `IrHost::fence`, `A64::host_fence`, and `jit::x86::compile`'s
+//! `mfence`.
+//!
+//! The last row is the same statement about the emulator's *cost*, and it is
+//! still **0** even now that the dirty bit no longer drains anything: a guest
 //! store and the guest load after it are separated by a whole interpreted
 //! instruction, and `tests/memory_model_costs.rs` puts the host's window at
-//! about forty nanoseconds. So even without the dirty bit the interpreter's
-//! own overhead would close it. Neither of those is a reason to keep the guest
-//! barrier a no-op — they are reasons the omission has cost nothing *so far*,
-//! on *one* host.
+//! about forty nanoseconds. So the interpreter's own overhead closes it
+//! without help. That is not a reason to keep the guest barrier a no-op — it
+//! is a reason the omission cost nothing *so far*, on *one* host, and it is
+//! why the row that shows the change had to be built out of bare atomics
+//! rather than out of guest instructions.
 //!
 //! # What is asserted and what is printed
 //!
@@ -116,9 +131,21 @@ enum Between {
     /// and the three interpreters now execute for a guest barrier.
     Fence,
     /// A relaxed `fetch_or` on an unrelated word: what
-    /// [`RamStore::mark_dirty`] does after every write, reproduced on its own
-    /// so that the level below can be attributed to it rather than to luck.
+    /// [`RamStore::mark_dirty`] did after every write until the round that
+    /// priced it, reproduced on its own so that the level below can be
+    /// attributed to it rather than to luck.
+    ///
+    /// Kept although `mark_dirty` no longer does this, because it is the
+    /// control that explains the row under it. Without it, "through `RamStore`"
+    /// changing from zero to hundreds is a number with no cause attached.
     DirtyBit,
+    /// A relaxed *load* of the same word, and the `fetch_or` only if the bit
+    /// is clear: what [`RamStore::mark_dirty`] does now.
+    ///
+    /// The bit is set on the first round and every round after it takes the
+    /// branch, so this is the steady state — a plain load, no locked
+    /// instruction, no barrier.
+    DirtyBitTested,
     /// Nothing — but the store and the load go through [`RamStore`] rather
     /// than through a bare atomic, so the dirty bit is really in the path.
     ThroughRamStore,
@@ -174,6 +201,11 @@ fn store_buffer(between: Between) -> Outcome {
                             Between::Fence => rsync::fence(rsync::Ordering::SeqCst),
                             Between::DirtyBit => {
                                 dirty[who].fetch_or(1, Ordering::Relaxed);
+                            }
+                            Between::DirtyBitTested => {
+                                if dirty[who].load(Ordering::Relaxed) & 1 == 0 {
+                                    dirty[who].fetch_or(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         u32::from(flag[them].load(Ordering::Relaxed))
@@ -250,33 +282,44 @@ fn a_host_fence_forbids_it() {
     );
 }
 
-/// **The finding.** `RamStore`'s dirty bitmap is already a barrier on a host
-/// whose relaxed read-modify-write is a locked instruction.
+/// **The finding, and the round that ended it.** `RamStore`'s dirty bitmap was
+/// a barrier on a host whose relaxed read-modify-write is a locked
+/// instruction; it is not one any more, and this is where that shows.
 ///
-/// Two arms, because attributing the second to the first is the whole point:
-/// a relaxed `fetch_or` on a word nothing else touches, and then the real
-/// `RamStore` write and read that contain one.
+/// Three arms, because attributing the third to the first two is the whole
+/// point: a relaxed `fetch_or` on a word nothing else touches, the same word
+/// with the test-before-set [`RamStore::mark_dirty`] now does, and then the
+/// real `RamStore` write and read that used to contain the first and now
+/// contain the second.
 ///
-/// Printed, not asserted. Nothing in the language promises this — it is a
-/// property of how x86-64 implements a `lock or`, and on AArch64 the same
-/// `fetch_or(Relaxed)` orders nothing at all. A test that asserted zero here
-/// would be asserting the accident, which is the opposite of what this file is
-/// for.
+/// Printed, not asserted, in every arm. Nothing in the language promised the
+/// old zero — it was a property of how x86-64 implements a `lock or`, and on
+/// AArch64 the same `fetch_or(Relaxed)` orders nothing at all — so a test that
+/// asserted zero would have been asserting the accident, which is the opposite
+/// of what this file is for. The same reasoning forbids asserting a *non*-zero
+/// now: how often an unfenced store-buffer test reorders is the host's
+/// business, and a machine that ran the two threads consecutively would print
+/// zero for a reason that has nothing to do with the change.
 #[test]
-fn the_dirty_bitmap_is_already_a_barrier_on_a_locked_host() {
+fn the_dirty_bitmap_is_no_longer_a_barrier_on_a_locked_host() {
     let bit = store_buffer(Between::DirtyBit);
+    let tested = store_buffer(Between::DirtyBitTested);
     let store = store_buffer(Between::ThroughRamStore);
     println!(
         "a relaxed fetch_or between:  forbidden outcome {} / {ROUNDS} ({} overlapped)",
         bit.both_zero, bit.witnessed
     );
     println!(
+        "test-before-set between:     forbidden outcome {} / {ROUNDS} ({} overlapped)",
+        tested.both_zero, tested.witnessed
+    );
+    println!(
         "through RamStore:            forbidden outcome {} / {ROUNDS} ({} overlapped)",
         store.both_zero, store.witnessed
     );
     assert!(
-        bit.witnessed > 0 && store.witnessed > 0,
-        "both runs must overlap or neither says anything"
+        bit.witnessed > 0 && tested.witnessed > 0 && store.witnessed > 0,
+        "every run must overlap or none of them says anything"
     );
 }
 
@@ -482,10 +525,13 @@ mod guest {
     /// read against something.
     ///
     /// On an x86-64 host this is **also** zero, and that is the measurement
-    /// rather than the fix: the module documentation has why — the guest store
-    /// ends in `RamStore::mark_dirty`, whose `fetch_or` is a locked
-    /// instruction, and a whole interpreted instruction separates the store
-    /// from the load in any case. So the count is printed, not asserted.
+    /// rather than the fix: a whole interpreted instruction separates the store
+    /// from the load, and `tests/memory_model_costs.rs` puts the host's
+    /// store-buffer window at about forty nanoseconds — well inside it. It used
+    /// to be zero for a second reason as well, the locked `fetch_or` in
+    /// `RamStore::mark_dirty`; that one is gone and this row did not move,
+    /// which is the cleanest evidence that the interpreter's own overhead was
+    /// always doing the work here. So the count is printed, not asserted.
     #[test]
     fn the_same_programs_without_one() {
         let out = run(false);

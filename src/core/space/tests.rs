@@ -876,6 +876,62 @@ fn retry_is_returned_before_a_commit_and_refused_after_one() {
     );
 }
 
+/// The byte order a value-typed write lays a value out in, on the fast path,
+/// at every width.
+///
+/// `SpaceView::write` carries the *value* into the leaf now and converts it
+/// there, so the byte order comes from the leaf's own `AccessConstraints`
+/// rather than from a `FlatEntry::endian` read before the leaf was resolved.
+/// Those agree for a single-leaf entry, which is what this asserts — and
+/// asserts at all four widths, because the conversion is now a shift whose
+/// amount depends on the width and the direction together, which is exactly
+/// the shape that is wrong at one width and right at the others.
+#[test]
+fn a_value_write_lays_the_bytes_out_in_the_leafs_own_order() {
+    const V: u64 = 0x1122_3344_5566_7788;
+    for (endian, want) in [
+        (
+            Endian::Little,
+            [0x88u8, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
+        ),
+        (
+            Endian::Big,
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        ),
+    ] {
+        for (width, n) in [
+            (Width::U8, 1usize),
+            (Width::U16, 2),
+            (Width::U32, 4),
+            (Width::U64, 8),
+        ] {
+            let space = AddressSpace::new("mem", 16);
+            let store = Arc::new(RamStore::new(8));
+            space
+                .topology()
+                .map(
+                    Region::ram("ram", store.clone())
+                        .with_constraints(AccessConstraints::ANY.with_endian(endian)),
+                    0,
+                )
+                .unwrap();
+            space.write(0, width, V, MemAttrs::DEFAULT).unwrap();
+            let mut buf = [0u8; 8];
+            store.read_at(0, &mut buf).unwrap();
+            // The low `n` bytes of `V`, in `endian` order — so the big-endian
+            // arm starts from the *low* half, not from the top of the value.
+            let expect = &want[if endian == Endian::Big { 8 - n } else { 0 }..][..n];
+            assert_eq!(&buf[..n], expect, "{endian:?} {width:?}");
+            assert_eq!(
+                space.read(0, width, MemAttrs::DEFAULT).unwrap(),
+                V & (u64::MAX >> (64 - 8 * n as u32)),
+                "and it reads back, {endian:?} {width:?}"
+            );
+            assert!(store.is_page_dirty(0), "and it marked the page");
+        }
+    }
+}
+
 /// A value-typed write that does not fit in one flat entry.
 ///
 /// [`SpaceView::write`] resolves the target once and transfers inline when the
@@ -985,6 +1041,66 @@ fn writes_mark_pages_dirty_and_reads_do_not() {
         .write(0x3000, Width::U8, 0xff, MemAttrs::DEBUG)
         .unwrap();
     assert!(store.is_page_dirty(3));
+}
+
+/// The invariant `RamStore::mark_dirty`'s test-before-set rests on: between two
+/// clears the bitmap only ever gains bits, and a clear is always seen by the
+/// next mark.
+///
+/// `mark_dirty` skips the `fetch_or` when the bit is already set, which is
+/// sound *because* nothing clears a bit except a consumer at a safe point. Two
+/// ways to get that wrong would both pass the neighbouring test: caching the
+/// bitmap word across marks, and testing a bit other than the one about to be
+/// set. This walks a page repeatedly to drive the skip path, then clears
+/// underneath and writes again to prove the skip did not become permanent.
+#[test]
+fn dirty_bits_are_monotone_between_clears() {
+    let space = AddressSpace::new("mem", 32);
+    let store = Arc::new(RamStore::with_page_bits(0x4000, 12));
+    space
+        .topology()
+        .map(Region::ram("ram", store.clone()), 0)
+        .unwrap();
+
+    // Every page, several times over, in an order that revisits an
+    // already-dirty page and then a fresh one — so a mark that skipped must
+    // still set the *next* page's bit.
+    for round in 0..4u64 {
+        for page in 0..4u64 {
+            let addr = page * 0x1000 + round * 8;
+            space
+                .write(addr, Width::U32, round, MemAttrs::DEFAULT)
+                .unwrap();
+            // Monotone: nothing written so far has lost its bit.
+            for seen in 0..=page {
+                assert!(
+                    store.is_page_dirty(seen),
+                    "page {seen} lost its bit in round {round}"
+                );
+            }
+        }
+    }
+    assert_eq!(store.dirty_page_count(), 4);
+
+    // The clear a consumer performs at a safe point. Every page must dirty
+    // again afterwards, which is the half a cached or stale test would break.
+    store.clear_dirty();
+    assert_eq!(store.dirty_page_count(), 0);
+    for page in 0..4u64 {
+        space
+            .write(page * 0x1000, Width::U8, 0xa5, MemAttrs::DEFAULT)
+            .unwrap();
+        assert!(store.is_page_dirty(page), "page {page} did not re-dirty");
+    }
+
+    // And the same through the single-page clear, which is the shape a
+    // page-at-a-time snapshot uses.
+    assert!(store.take_page_dirty(1));
+    assert!(!store.is_page_dirty(1));
+    space
+        .write(0x1000, Width::U8, 0x5a, MemAttrs::DEFAULT)
+        .unwrap();
+    assert!(store.is_page_dirty(1), "a taken page did not re-dirty");
 }
 
 // ---------------------------------------------------------------------------

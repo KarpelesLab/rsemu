@@ -94,8 +94,9 @@ configuration `tests/smp_single_copy_atomicity.rs` measures.
 `core::space::store`'s "What per-byte atomicity is not" has three candidate
 shapes, all re-derivable from `tests/memory_model_costs.rs`, and why none was
 taken. The one correction worth repeating here is the price: "+12% of the store
-path" divided by `SpaceView::write_span` (≈25 ns), which is a fifth of an
-interpreted store instruction (≈117 ns) rather than a path a guest executes. The
+path" divided by `SpaceView::write_span` (≈20 ns since this round, ≈25 before
+it), which is a sixth of an interpreted store instruction (≈117 ns) rather than
+a path a guest executes. The
 byte loop is ~1% of that instruction and full conformance costs +2–3% of it.
 Both fixes are affordable at that denominator; the question is the memory model,
 not the nanoseconds.
@@ -118,26 +119,39 @@ the argument above predicted.
   — the store-buffer outcome appears tens to hundreds of times in 200 000
   rounds, and a `fence(SeqCst)` removes it. That much held.
 - **Over `RamStore` it was already zero, before any of this.** Every write to
-  the store ends in `mark_dirty`, which sets a bit with
-  `AtomicU64::fetch_or` — a *relaxed* read-modify-write, which on x86-64 is a
-  `lock or`, and a locked instruction is a full barrier (*Intel SDM* volume 3
-  §9.2.5). So every guest store to RAM has been draining the host's store
-  buffer all along, on the interpreter and inside a translated block alike:
-  `jit::Tlb::note_fast_store` marks the same bitmap after an inlined store.
-  `tests/memory_model_costs.rs` prices the two identically — 3.96 ns for a
-  store plus a `SeqCst` fence, 3.97 ns for a store plus the `fetch_or`.
+  the store ends in `mark_dirty`, which sets a bit in an `AtomicU64` — and it
+  used to set that bit with an unconditional `fetch_or`, a *relaxed*
+  read-modify-write, which on x86-64 is a `lock or`, and a locked instruction is
+  a full barrier (*Intel SDM* volume 3 §9.2.5). So every guest store to RAM was
+  draining the host's store buffer, on the interpreter and inside a translated
+  block alike: `jit::Tlb::note_fast_store` marks the same bitmap after an
+  inlined store. `tests/memory_model_costs.rs` prices the two identically —
+  3.96 ns for a store plus a `SeqCst` fence, 3.97 ns for a store plus the
+  `fetch_or`.
 - Over guest instructions, two `cpu::x86` cores on two host threads: zero
   either way, for a second and independent reason — a whole interpreted
   instruction separates the guest's store from the guest's load, and the host's
   window closes at about forty nanoseconds.
 
-None of that is a reason to leave the barrier a no-op. The accident is x86-only
-(`fetch_or(Relaxed)` on AArch64 orders nothing), it covers only what follows a
-store, it does nothing between two loads, and it would evaporate the day
-somebody batched the dirty bitmap or wrote it with a plain `store`. What it does
-mean is that the *exposure* today was smaller than the previous round's
-measurement implied, and that the honest reason to fence is portability rather
-than a live defect on this host.
+None of that was a reason to leave the barrier a no-op. The accident was
+x86-only (`fetch_or(Relaxed)` on AArch64 orders nothing), it covered only what
+follows a store, and it did nothing between two loads. What it meant is that the
+*exposure* was smaller than the previous round's measurement implied, and that
+the honest reason to fence is portability rather than a live defect on this
+host.
+
+**And it is gone now, which is the cleanest possible demonstration of the
+point.** That `lock or` was the largest single component of a guest store —
+3.6 ns of 25.4 — bought for an ordering nobody had asked it for. `mark_dirty`
+tests the bit before setting it, so in the steady state there is no locked
+instruction; the litmus file's `RamStore` row has moved from **0** to tens per
+200 000, level with the unfenced control, while the guest-instruction row stayed
+at zero because the interpreter's own overhead was always what closed *that*
+window. The guarantee is unaffected because the guarantee was never here: it is
+`IrHost::fence`, `A64::host_fence` and `jit::x86::compile`'s `mfence`. The one
+thing the accident really was propping up — a dirty log read while a vCPU runs —
+is answered by the safe-point protocol instead, argued in full on
+`RamStore::mark_dirty`.
 
 **How often a real guest pays.** An arm64 Linux boot executes 479 000 `DSB`/`DMB`
 in 876 million instructions — one in 1 800 — plus another 213 000 `ISB`, which
