@@ -138,13 +138,17 @@
 //! every 1 800 (479 000 `DSB`/`DMB` in 876 million) and a RISC-V one about once
 //! in 100 000.
 //!
-//! One place still owes a fence and does not have one, and it is written down
-//! here rather than fixed here: an x86 guest's **`LOCK` prefix** is
-//! architecturally a full barrier, and `AddressSpace::bus_lock` is a mutex, so
-//! what it supplies is acquire/release — which does not forbid store-then-load.
-//! Today the dirty bitmap covers it on an x86-64 host for the same accidental
-//! reason as everything else; on a weakly ordered host it would not.
-//! Modern Linux is what makes this the interesting one rather than `MFENCE`:
+//! The last place that owed a fence was not a fence instruction at all, and it
+//! now has two. An x86 guest's **`LOCK` prefix** is architecturally a full
+//! barrier, and `AddressSpace::bus_lock` is a mutex, so what it supplied was
+//! acquire/release — which is one-way at each end and therefore does not
+//! forbid store-then-load *through* the critical section. It emits a
+//! [`fence`] at [`Ordering::SeqCst`] once the bus is held and another before
+//! giving it back; `core::space::BusLock`'s "a bus lock is a barrier" has the
+//! interleaving that was permitted and why one fence would not have been
+//! enough. On an x86-64 host the mutex's own `lock cmpxchg` was already
+//! covering it, which is why it took a second look to find.
+//! Modern Linux is what made this the interesting one rather than `MFENCE`:
 //! `smp_mb()` on x86-64 is `lock addl $0,-4(%rsp)`, so a 6.6 kernel booting
 //! here executes `MFENCE` exactly **once** — against tens of thousands of
 //! `LFENCE`, which is why all three of x86's fences take this path and not

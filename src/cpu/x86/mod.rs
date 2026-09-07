@@ -157,6 +157,13 @@
 //!   and futex is on both sides of the contention. A plain store by a sibling
 //!   can still land in it, where hardware would have held it off.
 //!
+//!   The *barrier* half is not a gap and is worth saying so, because a mutex
+//!   does not supply it and for a while this one did not: `BusLock` fences at
+//!   `SeqCst` on the way in and on the way out, so a locked instruction is
+//!   ordered against this core's own earlier and later accesses the way
+//!   *Intel SDM* volume 3 §9.1.2 requires. That is the property `smp_mb()`
+//!   uses, `lock addl $0, -4(%rsp)` being what an x86-64 Linux emits for it.
+//!
 //!   Where the line is drawn and why is
 //!   [`core::space::BusLock`](crate::core::space::BusLock)'s "What it does not
 //!   make atomic"; the short form is that closing the plain-store half means

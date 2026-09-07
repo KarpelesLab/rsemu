@@ -146,8 +146,14 @@ is why `ISB` is excluded rather than lumped in. A RISC-V Linux boot executes
 **`LFENCE` tens of thousands of times and `MFENCE` once**: `smp_mb()` on x86-64
 is `lock addl $0,-4(%rsp)`, not `MFENCE`, so the barrier an x86 guest really
 leans on is the `LOCK` prefix — which reaches `AddressSpace::bus_lock`, a mutex,
-whose acquire/release does not forbid store-then-load. That is the next gap, and
-it is `core::space`'s rather than `cpu/`'s.
+whose acquire/release did not forbid store-then-load *through* the critical
+section, because acquire and release are each one-way. That gap was
+`core::space`'s rather than `cpu/`'s and it is closed: the bus lock emits a
+`SeqCst` fence once it is held and another before it is given back, which is
+what makes a locked instruction the full barrier the SDM says it is. It could
+not be gated by a test on an x86-64 host — the mutex's own `lock cmpxchg` masks
+the difference — so it is gated by the architecture, and `core::space::BusLock`
+carries the argument.
 
 **What the lifters do, and why one of them does not emit `Opcode::FENCE`.** The
 RISC-V and x86 frontends do not lift a fence at all — the block ends at one and

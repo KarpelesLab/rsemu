@@ -1551,6 +1551,17 @@ impl<'a> Exec<'a> {
         // instruction that faults gives the bus back before the exception
         // frame is pushed, exactly as hardware does.
         //
+        // Spanning the whole instruction is also what puts the barrier in the
+        // right place. `BusLock` fences at both ends, because a locked
+        // instruction is architecturally a full barrier and not merely an
+        // exclusion (*Intel SDM* volume 3 §9.1.2) — so the guard has to open
+        // before the first access and close after the last one, or the fences
+        // land inside the instruction they are supposed to bracket. That
+        // matters most for the locked instruction that touches nothing shared:
+        // `smp_mb()` on x86-64 is `lock addl $0, -4(%rsp)`, whose operand is
+        // the core's own stack, so the exclusion is vacuous and the barrier is
+        // the entire point.
+        //
         // `self.mem` is copied out first. It is a `&'a AddressSpace`, so the
         // copy borrows the *space* for `'a` rather than borrowing `self`, and
         // `execute` can still take `&mut self` underneath the guard.
