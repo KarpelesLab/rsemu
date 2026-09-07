@@ -185,6 +185,64 @@ fn a_long_program_lifts_up_to_the_block_limit_and_still_agrees() {
     }
 }
 
+/// A program with a data barrier in the middle of it, twice over.
+///
+/// `X2` points into the data window (`Case::seeded`), so both loads land and
+/// nothing here faults. Six instructions, and the count is what the assertions
+/// below are about: a barrier the frontend refuses ends the block *at* it, so
+/// a lifter that had gone back to refusing one would agree with the
+/// interpreter about a two-instruction block and report exactly that.
+///
+/// No store, because a store ends an A64 block whatever else is going on
+/// (`lift`'s "A store ends the block"), which would put the barrier in a block
+/// of its own and hide the question.
+fn a_program_with_barriers() -> Vec<u32> {
+    vec![
+        0xd280_0025, // movz x5, #1
+        0xf940_0046, // ldr  x6, [x2]
+        0xd503_3bbf, // dmb  ish
+        0xf940_0447, // ldr  x7, [x2, #8]
+        0xd503_3b9f, // dsb  ish
+        0x9100_04e8, // add  x8, x7, #1
+    ]
+}
+
+#[test]
+fn a_barrier_no_longer_cuts_a_block_short() {
+    // `DSB` and `DMB` were outside the lifted subset until `jit::x86` could
+    // lower `Opcode::FENCE`, so a block ended at the first one. What the two
+    // engines *agree* about is unchanged either way — the interpreter is the
+    // oracle for the instructions that ran — so what says the barrier is
+    // inside the subset is how many instructions ran at all.
+    let case = Case::seeded(a_program_with_barriers());
+    match compare(&case) {
+        Ok(Verdict::Agreed { insns, .. }) => assert_eq!(
+            insns, 6,
+            "the block stopped at a barrier instead of lifting one"
+        ),
+        other => panic!("expected six agreed instructions, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_barrier_agrees_under_every_shape() {
+    // A basic block ends at the first *access*, so the barrier is reached only
+    // under the two shapes that swallow one — which is the coverage claim
+    // rather than an aside.
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        let case = Case::seeded(a_program_with_barriers()).with_shape(shape);
+        match compare(&case) {
+            Ok(Verdict::Agreed { insns, .. }) => {
+                assert!(insns >= 2, "{shape:?}: only {insns} instructions ran");
+                if shape != Shape::BasicBlock {
+                    assert_eq!(insns, 6, "{shape:?}");
+                }
+            }
+            other => panic!("{shape:?}: {other:?}"),
+        }
+    }
+}
+
 #[cfg(feature = "jit")]
 mod cached {
     use super::*;
@@ -277,5 +335,27 @@ mod compiled {
                 "{shape:?}: {compiled} of {blocks} blocks were compiled"
             );
         }
+    }
+
+    #[test]
+    fn a_block_with_a_barrier_in_it_runs_as_host_code() {
+        // The end of the chain this change is about: the frontend emits
+        // `Opcode::FENCE`, `jit::x86` lowers it to an `mfence`, and the block
+        // therefore *compiles* instead of going back to the interpreter with
+        // a translation thrown away. All three claims are one assertion here —
+        // six instructions retired, in at least one compiled block, agreeing
+        // with the oracle.
+        let case = Case::seeded(a_program_with_barriers());
+        let run = measure_compiled(&case, 4).expect("no divergence");
+        assert!(
+            matches!(run.verdict, Verdict::Agreed { insns: 6, .. }),
+            "{:?}",
+            run.verdict
+        );
+        assert_eq!(run.insns_retired, 6, "{run:?}");
+        assert!(
+            run.compiled > 0,
+            "a block with a barrier was never compiled: {run:?}"
+        );
     }
 }

@@ -944,9 +944,13 @@ impl Engine {
 /// The ops this backend compiles, for a caller that wants to know before it
 /// tries.
 ///
-/// The union of what the RISC-V and x86 frontends emit, plus the handful of
-/// neighbours that cost nothing extra once their family is in. Everything else
-/// is a [`Refusal`] and runs on the interpreter.
+/// The union of what the RISC-V, x86 and A64 frontends emit, plus the handful
+/// of neighbours that cost nothing extra once their family is in. Everything
+/// else is a [`Refusal`] and runs on the interpreter.
+///
+/// One list, not two: this is `compile::compiles` re-exported, so a caller
+/// asking the runtime and the code generator the same question cannot get two
+/// answers.
 #[must_use]
 pub fn compiles(op: Opcode) -> bool {
     super::compile::compiles(op)

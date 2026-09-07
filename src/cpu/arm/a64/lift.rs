@@ -25,8 +25,9 @@
 //!   pre-indexed, post-indexed and register-offset addressing modes; both pair
 //!   forms and their write-back variants; the three literal loads; every
 //!   `PRFM`, which is architecturally a hint this core makes no access for.
-//! * `B`, `BL`, `B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`, `BLR`, `RET`, and
-//!   the hint and barrier instructions the interpreter retires as no-ops.
+//! * `B`, `BL`, `B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`, `BLR`, `RET`, the
+//!   hints the interpreter retires as no-ops, and the data barriers `DSB` and
+//!   `DMB`, which lift to one [`Opcode::FENCE`] each — `ISB` stays a hint.
 //!
 //! Deliberately **not** lifted, each ending the block with a terminator that
 //! hands the PC back to the interpreter:
@@ -703,6 +704,8 @@ enum Bf {
 enum Plan {
     /// Retires with no architectural effect: a hint, an `ISB`, a `PRFM`.
     Nop,
+    /// A data barrier — `DSB`, `DMB` — as one [`Opcode::FENCE`].
+    Fence,
     /// `Rd = <constant>` at 64 bits — `ADR` and `ADRP`.
     Konst(u64),
     /// `Rd|SP = Rn|SP +/- <immediate>`.
@@ -1089,39 +1092,43 @@ fn classify(world: &World, op: Op, fmt: Fmt, word: u32, pc: u64) -> Option<Plan>
         // 40% of the barriers an arm64 Linux boot executes, which is why the
         // split below is worth having at all.
         Op::Isb => Plan::Nop,
-        // **A data barrier is outside the lifted subset**, and it is the one
-        // exclusion here that is about the *backend* rather than the frontend.
+        // A data barrier lifts to [`Opcode::FENCE`], which is what `exec`
+        // does for it: `DSB` and `DMB` are not no-ops, because a barrier is
+        // the guest asking for ordering stronger than its own baseline and the
+        // host does not supply that on its own (Arm DDI 0487, `DMB`; the
+        // reasoning is `IrHost::fence`'s).
         //
+        // This arm was `return None` until `jit::x86` grew an `mfence`, and
+        // the reason was the backend rather than the frontend:
         // `nothing_this_frontend_emits_is_an_op_the_host_backend_refuses` is
-        // the invariant, and it is older than this: emitting an op `jit::x86`
-        // will not lower produces blocks that can never be compiled.
-        //
-        // `DSB` and `DMB` are no longer no-ops — `exec` executes a host fence
-        // for each, because a barrier is the guest asking for ordering
-        // stronger than its own baseline and the host does not supply that on
-        // its own. The IR has [`Opcode::FENCE`] and `IrHost::fence` for
-        // exactly this, and emitting one here is the shape this ought to have.
-        // It is not the shape it has, because `jit::x86::compiles` does not
-        // lower `FENCE` and `jit::dispatch` does not *remember* a refusal — it
-        // re-attempts the compilation every time the block is reached. Three
-        // arrangements, measured over the same 120 s of an arm64 Linux boot on
-        // `jit-host` (479 000 barriers in 876 million guest instructions):
+        // the invariant, and emitting an op `jit::x86` will not lower produces
+        // blocks that can never be compiled — which cost real time, because
+        // `jit::dispatch` does not *remember* a refusal and re-attempts the
+        // compilation every time the block is reached. Measured over 120 s of
+        // an arm64 Linux boot on `jit-host` (479 000 barriers in 876 million
+        // guest instructions):
         //
         // | | boot time |
         // | --- | --- |
-        // | `FENCE` emitted into the trace | **+4.9%** |
-        // | `FENCE` alone in a block of its own | **+2.8%** |
-        // | outside the subset, as here | **+1.3%**, inside the run-to-run noise |
+        // | `FENCE` in the trace, refused by the backend | **+4.9%** |
+        // | `FENCE` alone in a block of its own, refused | **+2.8%** |
+        // | outside the subset entirely | **+1.3%**, inside the run-to-run noise |
         //
-        // The cost is the *count* of refusals rather than their size, so
-        // shrinking the refused block barely helps. Leaving the barrier to the
-        // interpreter costs one dispatcher round trip and one interpreted
-        // instruction per barrier, which is 0.05% of the stream, and it puts
-        // `DSB`/`DMB` beside every other ordering-related instruction this
-        // frontend already excludes — the exclusives, the LSE atomics and the
-        // acquire/release accesses. **Emit `Opcode::FENCE` here the day
-        // `jit::x86` emits an `mfence` for it**; nothing else has to change.
-        Op::Dsb | Op::Dmb => return None,
+        // Every row of that table is a *refusal* cost, and the backend no
+        // longer refuses: a barrier is three bytes and a region flush inside a
+        // block that keeps running, instead of a translation thrown away and a
+        // dispatcher round trip. `DSB` and `DMB` are the only members of this
+        // frontend's ordering-related exclusions — the exclusives, the LSE
+        // atomics, the acquire/release accesses — that leave it, and they can
+        // because a fence has no address, no value and no reservation.
+        //
+        // The barrier's *scope* and *type* fields are deliberately ignored:
+        // `DMB ISHLD` and `DSB SY` both become one `Opcode::FENCE`, which is
+        // the interpreter's answer too. Narrowing a barrier is an optimisation
+        // whose soundness argument belongs where the oracle can be diffed
+        // against it, and one full fence is never weaker than the barrier the
+        // guest asked for.
+        Op::Dsb | Op::Dmb => Plan::Fence,
 
         // -- literal loads ---------------------------------------------
         Op::LdrLitW | Op::LdrLitX | Op::LdrswLit => {
@@ -1894,6 +1901,12 @@ impl<'a> Lifter<'a> {
 
         match plan {
             Plan::Nop => {}
+
+            // No operands, no result, no `MemOp`: the whole instruction is the
+            // ordering it imposes. `Type::I64` because every op carries a type
+            // and a fence's is unread — `ir::verify` asks nothing of it and
+            // `jit::x86` only checks that a host register could hold one.
+            Plan::Fence => self.b.emit_void(Opcode::FENCE, Type::I64, &[]),
 
             Plan::Konst(value) => {
                 let t = self.konst(64, value);
@@ -2890,16 +2903,23 @@ mod tests {
     }
 
     #[test]
-    fn a_data_barrier_is_left_to_the_interpreter_and_an_isb_is_not() {
-        // `dsb ish` and `dmb ish` execute a host fence in `exec`, so they are
-        // outside this subset until `jit::x86` lowers `Opcode::FENCE` — see
-        // `classify`. `isb` orders no data access and stays a hint, which is
-        // what keeps 40% of a boot's barriers inside a block.
+    fn a_data_barrier_is_a_fence_and_an_isb_is_not() {
+        // `dsb ish` and `dmb ish` execute a host fence in `exec`, and the
+        // lifted block says the same thing with one `Opcode::FENCE` — which
+        // `jit::x86` lowers to an `mfence`. This arm was `return None` while
+        // that lowering did not exist; `classify` has the measurement.
         for word in [0xd5033b9fu32, 0xd5033bbf] {
             let out = lifted(&[word]);
-            assert_eq!(out.insns, 0, "{word:#x} lifted something");
-            assert_eq!(out.stop, Stop::Unsupported, "{word:#x}");
+            assert_eq!(out.insns, 1, "{word:#x} lifted nothing");
+            assert_eq!(count(&out.block, Opcode::FENCE), 1, "{word:#x}");
         }
+        // The `CRm` scope field is deliberately not read: a load-load barrier
+        // is the same full fence, which is never weaker than what was asked
+        // for.
+        let ishld = lifted(&[0xd50339bf]); // dmb ishld
+        assert_eq!(count(&ishld.block, Opcode::FENCE), 1);
+        // `isb` orders no data access and stays a hint, which is what keeps
+        // the 213 000 of them an arm64 Linux boot executes free.
         let out = lifted(&[0xd5033fdf]); // isb sy
         assert_eq!(out.insns, 1);
         assert_eq!(count(&out.block, Opcode::FENCE), 0);
