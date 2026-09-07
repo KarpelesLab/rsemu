@@ -138,13 +138,16 @@ measured rather than asserted.
   thousand loads, and catches the read half of a `LOCK XADD` torn the same way
   with the bus lock held throughout. So locked-against-*plain* is a special
   case of a wider gap rather than the whole of it.
-* **This is *atomicity*, not *ordering*.** Every data barrier in the tree
-  retires as a no-op — `DMB`/`DSB`, `FENCE`, `MFENCE`/`LFENCE`/`SFENCE` — and a
-  guest barrier is **not** semantically a no-op even when guest and host share
-  an architecture: an x86 host's store buffer performs exactly the
-  store-then-load reordering an x86 guest's `MFENCE` paid to remove, and
+* **This is *atomicity*, not *ordering*.** Ordering was the other half and is
+  now covered: `DMB`/`DSB`, RISC-V `FENCE` and `MFENCE`/`LFENCE`/`SFENCE` each
+  retire as a host `SeqCst` fence, `jit::x86` compiles `Opcode::FENCE` to an
+  `MFENCE`, and the bus lock behind an x86 `LOCK` prefix fences at both ends.
+  Omitting them was never harmless just because guest and host share an
+  architecture: an x86 host's store buffer performs exactly the store-then-load
+  reordering an x86 guest's `MFENCE` paid to remove, and
   `tests/memory_model_costs.rs` produces the forbidden outcome tens to hundreds
-  of times in 200 000 rounds.
+  of times in 200 000 rounds. `LDAR`/`STLR` on a64 are the one barrier pair
+  still issuing an ordinary access.
 
 **Both are reachable only under `ThreadingMode::Parallel`**, which is opt-in
 (`--threading parallel`), which **no machine file selects**, and which is not

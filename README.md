@@ -239,14 +239,22 @@ loads, and catches the read half of a `LOCK XADD` torn the same way with the bus
 lock held throughout — so locked-against-*plain* is one case of a wider gap
 rather than the whole of it.
 
-*And this is atomicity, not ordering.* Every data barrier in the tree retires as
-a no-op — `DMB`/`DSB`, `FENCE`, `MFENCE`/`LFENCE`/`SFENCE`. That is **not**
-harmless just because guest and host share an architecture: a barrier is the
-guest asking for something stronger than its own baseline, and an x86 host's
-store buffer performs exactly the store-then-load reordering an x86 guest's
-`MFENCE` paid to remove. `tests/memory_model_costs.rs` produces the outcome
-`MFENCE` forbids tens to hundreds of times in 200 000 rounds, and never once
-when about forty nanoseconds separate the store from the load.
+*And this is atomicity, not ordering.* Ordering used to be the other half of
+the gap and is now covered: `DMB`/`DSB`, RISC-V `FENCE` and
+`MFENCE`/`LFENCE`/`SFENCE` each retire as a host `SeqCst` fence, `jit::x86`
+compiles `Opcode::FENCE` to an `MFENCE`, and the bus lock an x86 `LOCK` prefix
+takes fences at both ends — which is the one that matters most, because
+`smp_mb()` on x86-64 is `lock addl $0,-4(%rsp)` rather than `MFENCE`, so a
+Linux guest leans on the prefix and executes `MFENCE` exactly once in a boot.
+None of that was harmless to omit merely because guest and host share an
+architecture: a barrier is the guest asking for something stronger than its own
+baseline, and an x86 host's store buffer performs exactly the store-then-load
+reordering an x86 guest's `MFENCE` paid to remove. `tests/memory_model_costs.rs`
+produces the outcome `MFENCE` forbids tens to hundreds of times in 200 000
+rounds, and never once when about forty nanoseconds separate the store from the
+load. What is *not* covered is `LDAR`/`STLR` on a64, which still issue an
+ordinary load and store; `core::space::BusLock` carries the argument for the
+shape of the fix.
 
 **Both are reachable only under `ThreadingMode::Parallel`** — opt-in via
 `--threading parallel`, selected by **no machine file**, and not the default:
