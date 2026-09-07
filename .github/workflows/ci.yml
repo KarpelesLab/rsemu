@@ -450,6 +450,156 @@ jobs:
           fi
           exit "$rc"
 
+  aarch64:
+    name: aarch64 (weak memory)
+    # `ubuntu-24.04-arm`, and the label is not a guess. GitHub's hosted-runner
+    # table lists exactly three Arm64 Linux labels — `ubuntu-24.04-arm`,
+    # `ubuntu-22.04-arm` and `ubuntu-26.04-arm` — and Arm64 standard runners
+    # went generally available for public repositories on 2025-08-07 and
+    # reached private ones on 2026-01-29. This repository is public, so the
+    # runner is free, unmetered and needs no opt-in, no organisation setting
+    # and no larger-runner configuration: 4 vCPU and 16 GB, which is what the
+    # litmus below needs two of.
+    #
+    # The other three candidates were rejected for reasons worth writing down,
+    # because the failure mode of picking wrong is not a red build:
+    #
+    #   ubuntu-latest-arm   does not exist. An unmatched `runs-on` label does
+    #                       not fail the job — it queues until something
+    #                       cancels it, so a typo here is a workflow that
+    #                       silently never runs.
+    #   ubuntu-22.04-arm    deprecation begins 2026-09-17 with brownout windows
+    #                       in March and April 2027 that fail jobs on purpose.
+    #   ubuntu-26.04-arm    public preview, explicitly marked unstable and
+    #                       subject to queueing. Not something a gate sits on.
+    #
+    # ## Why this job exists at all
+    #
+    # Three fixes shipped with no test that can fail on an x86-64 host, and
+    # each says so in its own doc comment: the bus lock's two `SeqCst` fences
+    # (`core::space::buslock`), the a64 core's acquire/release and barrier
+    # fences (`cpu::arm::a64::Exec::host_fence`), and the JIT's `mfence`
+    # lowering (`jit::x86`). Every one of them names
+    # `tests/memory_model_litmus.rs` as where its row belongs "taken on a
+    # weakly ordered host", and until this job there was no such host under a
+    # run that could fail. The cause is specific rather than general: on x86-64
+    # a relaxed read-modify-write is a `lock`-prefixed instruction and
+    # therefore a full barrier, so `RamStore::mark_dirty`'s `fetch_or` and a
+    # mutex's `cmpxchg` each supply by accident the ordering the fences supply
+    # on purpose, and the two arms of every litmus read the same. On AArch64
+    # that `fetch_or` is `ldsetr` and orders nothing.
+    #
+    # ## Why it is not enough that `macos-latest` is already Apple silicon
+    #
+    # It is, and the `test` matrix above therefore already compiles and runs
+    # this crate on an aarch64 host. What it does not do is run the litmus in a
+    # release build (`ROUNDS` is a tenth as large without one), run it in
+    # required mode, or run it on **Linux** — and the host seam is where the
+    # target actually shows: `host/signal.rs` is x86-64 Linux only and every
+    # other target keeps `Arming::Unavailable`, and `accel/` does not exist off
+    # it at all. This job is the Linux aarch64 leg; `macos-latest` remains the
+    # Darwin one.
+    #
+    # ## What a green run here proves, and what it does not
+    #
+    # A weak-memory bug is probabilistic. The fenced rows assert **zero**
+    # forbidden outcomes, and zero is sound on every host by the language's own
+    # model — so a green tick on those rows, taken alone, proves nothing about
+    # the fences. What this runner adds is the *unfenced* half of each pair:
+    # the same critical section with the fences deleted, and the same guest
+    # programs without the barrier, printed beside them. Where the unfenced arm
+    # tears and the fenced arm does not, the fences are load-bearing; that
+    # comparison is impossible on x86-64, where both arms are zero.
+    #
+    # And a litmus that finds nothing has failed to find something — it has not
+    # shown there is nothing to find. 200 000 rounds per arm in a release build
+    # is a search, not a proof. It found 13 forbidden outcomes per 200 000 in
+    # the bare-relaxed control on the author's x86-64 host, and 0 through every
+    # `lock`-prefixed path; what a weakly ordered runner is expected to add is
+    # a non-zero count on the paths that are only ordered by accident there.
+    # The number to read is never "the gate passed", it is the printed count
+    # next to it, which is why `--nocapture` is not optional.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A target directory no other job in this workflow writes, and it
+          # holds both profiles: this job builds release *and* debug.
+          key: aarch64
+      # The prerequisites, asserted before a ten-minute build rather than
+      # inside one, in the shape the `crosshost` job established. Neither
+      # failure is self-explanatory afterwards: a job that ran on the wrong
+      # architecture reports green litmus rows that mean nothing, and a job
+      # with one core reports "the two threads never overlapped", which reads
+      # like a defect and is not one.
+      - name: preflight
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          echo "uname -m: $arch"
+          rustc -vV
+          nproc
+          if [ "$arch" != aarch64 ]; then
+            echo "::error title=aarch64::runner reports $arch; the litmus below would prove nothing"
+            exit 1
+          fi
+          rustc -vV | grep -qx 'host: aarch64-unknown-linux-gnu' || {
+            echo "::error title=aarch64::rustc is not native aarch64-unknown-linux-gnu"
+            exit 1
+          }
+          # Two litmus threads have to run at the same instant or the
+          # store-buffer test degenerates into two sequential programs, which
+          # can never produce the outcome. The referee is blocked at the
+          # barrier while they run, so two cores is the real floor.
+          [ "$(nproc)" -ge 2 ] || {
+            echo "::error title=aarch64::$(nproc) core(s); two litmus threads cannot overlap"
+            exit 1
+          }
+          echo "native aarch64 with $(nproc) cores"
+      # First, not last: this is the job's reason to exist, and a suite failure
+      # for an unrelated reason must not be what stops the memory model from
+      # being asked about.
+      #
+      # `--release` because `ROUNDS` is 200 000 there and 20 000 otherwise, and
+      # the whole file takes about ten seconds once built.
+      # `--test-threads=1` because three of these tests run three threads
+      # apiece and a second test competing for the same cores moves every count
+      # in the file — the same reason `tests/memory_model_costs.rs` gives.
+      #
+      # RSEMU_WEAK_MEMORY_REQUIRED turns two printed counts into assertions:
+      # the bare-relaxed control must reorder something, and so must the
+      # relaxed `fetch_or` that is a barrier on x86-64 and not here. Without
+      # them a runner that quietly became x86-64 would report a held gate that
+      # nothing was holding — the argument `RSEMU_CROSSHOST_REQUIRED` makes in
+      # the job above. Both are searches, so both retry (`ATTEMPTS` in the test
+      # file) before failing; that is the deliberate answer to "a litmus row
+      # would be flaky in CI", and it is a gate rather than an advisory step
+      # because a job that cannot detect anything must not report green. A red
+      # here says "this runner did not reorder anything", not "the emulator is
+      # broken", and the printed counts are what tells the two apart.
+      - name: memory-model litmus, required
+        env:
+          RSEMU_WEAK_MEMORY_REQUIRED: 1
+        run: |
+          set -uo pipefail
+          rc=0
+          cargo test --release --all-features --test memory_model_litmus \
+            -- --nocapture --test-threads=1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=weak memory::the litmus failed on aarch64 - read the printed counts above before assuming a regression"
+          fi
+          exit "$rc"
+      # The rest of the value of an arm64 runner, and it is not small: a
+      # genuinely different code generator, a different `usize`-sized world's
+      # worth of alignment and atomics lowering, and the Linux host seam on a
+      # target where `accel/` and `host/signal.rs` compile themselves out.
+      - run: cargo build --all-features
+      - run: cargo test --all-features
+      # The default build is what users get; it must stand on its own here too.
+      - run: cargo test
+
   wasm-threads-browser:
     name: wasm threads, browser (nightly, advisory)
     runs-on: ubuntu-latest

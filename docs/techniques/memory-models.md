@@ -155,6 +155,24 @@ not be gated by a test on an x86-64 host — the mutex's own `lock cmpxchg` mask
 the difference — so it is gated by the architecture, and `core::space::BusLock`
 carries the argument.
 
+**And now it is gated by a test, on a host that can fail it.** CI grew an
+`ubuntu-24.04-arm` job (`.github/workflows/ci.yml`, `aarch64`), and
+`tests/memory_model_litmus.rs` grew the rows the three doc comments above said
+belonged there: a whole `BusLock` transaction between the store and the load,
+the *same transaction with the two fences deleted* beside it, and two
+`cpu.arm.a64` cores running the litmus as guest code with `STLR`/`LDAR`, with
+`DMB ISH`, and with neither. The fenced rows assert zero, which is sound
+everywhere and therefore proves nothing on its own; what the weakly ordered
+runner supplies is the unfenced half of each pair, which on x86-64 is also zero
+and there says nothing at all. `RSEMU_WEAK_MEMORY_REQUIRED=1` is what stops the
+job passing vacuously: it asserts that the bare-relaxed control reorders
+something *and* that the relaxed `fetch_or` does too, the second being exactly
+the accident this section is about — so a runner that quietly became x86-64
+fails rather than reporting green. One row still has no test and cannot get one
+on any runner: `jit::x86`'s `MFENCE` lowering is gated on
+`target_arch = "x86_64"`, so on the only host where the row would mean anything
+the backend does not exist.
+
 **What the lifters do.** The RISC-V and x86 frontends do not lift a fence at
 all — the block ends at one and the interpreter runs it. `a64::lift` does:
 `classify`'s `Op::Dsb | Op::Dmb` arm produces one `Opcode::FENCE`, and
