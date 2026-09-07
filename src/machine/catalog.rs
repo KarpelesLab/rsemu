@@ -414,8 +414,19 @@ pub static Q35_LINUX_SMP: CatalogEntry = CatalogEntry {
 /// An **NVM Express controller** at `00:04.0` is the third slot: what a UEFI
 /// boot manager searches for a FAT file system and the default file name
 /// `\EFI\BOOT\BOOTX64.EFI` (UEFI 2.10 §3.5.1.1). The firmware enumerates it and
-/// binds a driver to it, and cannot yet read it — `docs/platforms/q35-uefi.md`
-/// has the defect that stops it, in `src/bus/pci/bar.rs` rather than here.
+/// binds a driver to it, reads the FAT volume on it and launches the
+/// application — and a `bzImage` placed there is entered through its own EFI
+/// stub, by the firmware rather than by a loader.
+///
+/// It did not always. A BAR programmed through ECAM is programmed by a *memory*
+/// access, so `Bars::sync`'s order-exempt `try_topology` could never succeed and
+/// the retry it scheduled for the next configuration cycle could never succeed
+/// either — a UEFI firmware on a q35 never touches `0xcf8`. The window decoded
+/// nothing while answering its configuration space perfectly. The retry now runs
+/// off the access path entirely, from `PciBus::settle` driven by `q35.mch`'s
+/// clock domain, so it happens where a topology guard is actually available;
+/// `docs/platforms/q35-uefi.md` has the hunt and `src/bus/pci/bar.rs` the
+/// resulting one-scheduler-round bound.
 ///
 /// **No firmware is shipped and none can be.** `--flash0` and `--flash1` bind
 /// the two banks and `--drive nvme0=disk.img` the disk;
