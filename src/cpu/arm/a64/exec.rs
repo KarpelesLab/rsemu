@@ -29,7 +29,7 @@
 use alloc::sync::Arc;
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot};
+use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs, MonitorSlot};
 use crate::core::sync;
 use crate::core::value::Width;
 use crate::float::{Env, Flags, Round};
@@ -916,7 +916,13 @@ impl<'a> Exec<'a> {
             _ => self.data_abort(va, f, kind),
         })?;
         self.charge();
-        match self.space.read(pa, width, self.attrs) {
+        // The bus is told which of the two reasons for reading this is, so a
+        // mapping without `Perms::EXEC` refuses a fetch and answers a load.
+        let attrs = match kind {
+            Access::Fetch => self.attrs.with_purpose(AccessPurpose::FETCH),
+            _ => self.attrs,
+        };
+        match self.space.read(pa, width, attrs) {
             Ok(v) => Ok((v, pa)),
             Err(_) => {
                 self.st.faults = self.st.faults.wrapping_add(1);

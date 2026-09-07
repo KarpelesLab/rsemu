@@ -60,7 +60,7 @@
 use alloc::sync::Arc;
 use core::cell::Cell;
 
-use crate::core::space::{AddressSpace, MemAttrs};
+use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs};
 use crate::core::value::{Endian, Width};
 
 use super::cp::{
@@ -773,7 +773,10 @@ impl<'a> Exec<'a> {
         let va = va & !(width.bytes() as u32 - 1);
         let pa = self.translate(va, AccessKind::Fetch, self.privileged())?;
         self.cycle(1);
-        match self.space.read(u64::from(pa), width, self.attrs) {
+        // The bus is told this is a fetch, so a mapping without `Perms::EXEC`
+        // refuses it and still answers a load of the same bytes.
+        let attrs = self.attrs.with_purpose(AccessPurpose::FETCH);
+        match self.space.read(u64::from(pa), width, attrs) {
             Ok(v) => Ok(self.to_cpu_order(pa, width, v as u32)),
             Err(_) => {
                 self.state.faults = self.state.faults.wrapping_add(1);

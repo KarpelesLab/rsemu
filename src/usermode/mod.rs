@@ -131,13 +131,15 @@
 //! working programs on the far side of it. `docs/system/usermode-abi.md` has
 //! the ABI sources, the host-filesystem policy, the trace comparisons and the
 //! two things this exercise has found that are **not** on the consumer's side.
-//! The first is closed: the exclusive monitor used to be per core, so two
-//! guest threads' `lr`/`sc` pairs were not coherent with each other. The
-//! second is open and is not this module's to close either —
-//! [`Perms::EXEC`](crate::core::space::Perms::EXEC) is carried and not
-//! enforced, because a guest's instruction fetch reaches the address space
-//! indistinguishable from a load. `mem`'s header and the ABI document say
-//! where that belongs and what it would cost.
+//! Both are closed. The first: the exclusive monitor used to be per core, so
+//! two guest threads' `lr`/`sc` pairs were not coherent with each other. The
+//! second was never this module's to close either —
+//! [`Perms::EXEC`](crate::core::space::Perms::EXEC) was carried and not
+//! enforced, because a guest's instruction fetch reached the address space
+//! indistinguishable from a load. It no longer is: a core marks a fetch with
+//! [`AccessPurpose::FETCH`](crate::core::space::AccessPurpose::FETCH) and the
+//! mapping is checked for execute permission. `mem`'s header says which half
+//! of that belongs here.
 //!
 //! # Driving it
 //!

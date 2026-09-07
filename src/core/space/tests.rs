@@ -1726,6 +1726,137 @@ fn reads_and_writes_resolve_to_different_mappings_when_the_terms_differ() {
     assert!(!entry.is_direct_ram(), "and not the dispatch fast path");
 }
 
+/// The pair that says what enforcing [`Perms::EXEC`] means: the fetch is
+/// refused and the data read of the *same bytes* is not.
+///
+/// The second half is the load-bearing one. Checking `EXEC` on the read path
+/// is one line away from checking it on every read, which would break every
+/// board in the catalogue at once, so the assertion that a plain load still
+/// works is what distinguishes "enforced" from "broken".
+#[test]
+fn a_fetch_from_a_mapping_that_forbids_execution_is_refused_and_a_load_is_not() {
+    let (store, region) = ram("ram", 0x100);
+    store.write_u8(0x10, 0x5a).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map_with_perms(region, 0, Perms::RW)
+        .unwrap();
+
+    let fetch = MemAttrs::DEFAULT.with_purpose(AccessPurpose::FETCH);
+    assert_eq!(
+        space.read(0x10, Width::U8, fetch),
+        Err(BusError::Protected),
+        "rw- does not permit execution, and a refusal is a bus fault — not a \
+         silent 0xff and not a panic"
+    );
+    assert_eq!(
+        space.read(0x10, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "and the same bytes are still readable as data"
+    );
+    assert!(
+        space
+            .write(0x10, Width::U8, 0xaa, MemAttrs::DEFAULT)
+            .is_ok(),
+        "and still writable: only the fetch changed"
+    );
+
+    // A debugger disassembling the range still gets the bytes, even if it says
+    // it is looking at instructions (`ROADMAP.md` §15, invariant 5).
+    assert_eq!(
+        space.read(0x10, Width::U8, MemAttrs::DEBUG),
+        Ok(0xaa),
+        "a debug read is a data read"
+    );
+    assert_eq!(
+        space.read(
+            0x10,
+            Width::U8,
+            MemAttrs::DEBUG.with_purpose(AccessPurpose::FETCH)
+        ),
+        Ok(0xaa),
+        "and stays one even when it is a disassembler asking"
+    );
+}
+
+#[test]
+fn an_execute_only_mapping_answers_a_fetch_and_refuses_a_load() {
+    // AArch64 permits `--x` at EL0 and `mprotect(PROT_EXEC)` asks for exactly
+    // it, so a fetch is checked for `EXEC` *instead of* `READ` rather than for
+    // `RX`. Getting this wrong is invisible on a text segment, which is `RX`
+    // either way, and breaks the one mapping the distinction exists for.
+    let (store, region) = ram("text", 0x100);
+    store.write_u8(0, 0x77).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map_with_perms(region, 0, Perms::EXEC)
+        .unwrap();
+
+    assert_eq!(
+        space.read(
+            0,
+            Width::U8,
+            MemAttrs::DEFAULT.with_purpose(AccessPurpose::FETCH)
+        ),
+        Ok(0x77)
+    );
+    assert_eq!(
+        space.read(0, Width::U8, MemAttrs::DEFAULT),
+        Err(BusError::Protected),
+        "and a load of an execute-only mapping is the one that faults"
+    );
+}
+
+#[test]
+fn a_text_segment_permits_both_and_a_fetch_costs_it_nothing() {
+    // `Perms::RX` contains `EXEC`, so the ordinary shape — every ROM and every
+    // loaded text segment — is unaffected by the distinction existing.
+    let rom_store = Arc::new(RomStore::new(vec![0xea; 0x100]));
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map_with_perms(
+            Region::rom("bios", rom_store, RomWrite::Ignore),
+            0,
+            Perms::RX,
+        )
+        .unwrap();
+
+    for attrs in [
+        MemAttrs::DEFAULT,
+        MemAttrs::DEFAULT.with_purpose(AccessPurpose::FETCH),
+        MemAttrs::DEBUG,
+    ] {
+        assert_eq!(space.read(0, Width::U8, attrs), Ok(0xea), "{attrs:?}");
+    }
+}
+
+#[test]
+fn the_default_attributes_are_a_data_access() {
+    // A master that has never heard of `AccessPurpose` reads exactly as it
+    // did before the field existed — which is the whole reason `DATA` is zero.
+    assert_eq!(MemAttrs::DEFAULT.purpose, AccessPurpose::DATA);
+    assert_eq!(MemAttrs::default().purpose, AccessPurpose::DATA);
+    assert_eq!(MemAttrs::DEBUG.purpose, AccessPurpose::DATA);
+    assert!(!MemAttrs::DEFAULT.is_fetch());
+    assert_eq!(MemAttrs::DEFAULT.read_perm(), Perms::READ);
+    assert_eq!(
+        MemAttrs::DEFAULT
+            .with_purpose(AccessPurpose::FETCH)
+            .read_perm(),
+        Perms::EXEC
+    );
+    assert_eq!(
+        MemAttrs::DEBUG
+            .with_purpose(AccessPurpose::FETCH)
+            .read_perm(),
+        Perms::READ,
+        "debug outranks purpose on the read path"
+    );
+}
+
 #[test]
 fn nothing_changes_for_a_machine_that_never_mentions_permission() {
     // The direction-resolving flattener has to be invisible when every mapping

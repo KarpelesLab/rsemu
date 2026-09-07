@@ -66,7 +66,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::space::{AddressSpace, MemAttrs};
+use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
 use super::cp0::{
@@ -625,7 +625,13 @@ impl<'a> Exec<'a> {
             return Ok(self.cache_read(phys, width, swapped, endian));
         }
         self.charge();
-        match self.space.read(u64::from(phys), width, self.attrs) {
+        // The bus is told which of the two reasons for reading this is, so a
+        // mapping without `Perms::EXEC` refuses a fetch and answers a load.
+        let attrs = match kind {
+            Access::Fetch => self.attrs.with_purpose(AccessPurpose::FETCH),
+            _ => self.attrs,
+        };
+        match self.space.read(u64::from(phys), width, attrs) {
             Ok(v) => Ok(self.reversed(v as u32, width, kind)),
             Err(_) => {
                 self.st.faults = self.st.faults.wrapping_add(1);
