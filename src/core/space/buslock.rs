@@ -77,9 +77,11 @@
 //! `single` claims with `compare_exchange(Acquire, Relaxed)`, `native_std`
 //! hands off to `std` — and a compare-and-swap on x86-64 is `lock cmpxchg`,
 //! which is a full barrier by the same §9.2.5 the guest's own `LOCK` relies
-//! on. `RamStore::mark_dirty`'s `fetch_or` is a second one, for the reason
-//! `core::sync` records. Both are properties of the *host's* instruction set
-//! rather than of anything written here: lower that same `compare_exchange`
+//! on. `RamStore::mark_dirty`'s `fetch_or` was a second one, for the reason
+//! `core::sync` records — until it stopped being unconditional and that half
+//! of the cover went away, which changes nothing here because the fences below
+//! were never relying on it. Both were properties of the *host's* instruction
+//! set rather than of anything written here: lower that same `compare_exchange`
 //! for AArch64 and it is `ldaxr`/`stxr`, an acquire and nothing more, which
 //! orders a prior store against a later load not at all.
 //!

@@ -216,6 +216,41 @@ impl FlatLeaf {
             FlatTarget::Io(ops) => ops.write(off, src, attrs),
         }
     }
+
+    /// [`write`](FlatLeaf::write) for a width-typed access, carrying the value
+    /// rather than bytes.
+    ///
+    /// The byte order is this leaf's own, taken from the [`AccessConstraints`]
+    /// this call reads anyway — so the conversion happens *after* the leaf is
+    /// resolved rather than before it, which is the whole point. See
+    /// [`FlatEntry::write_value`] for what that saves and where it does not
+    /// apply.
+    #[inline]
+    pub fn write_value(&self, rel: u64, width: Width, value: u64, attrs: MemAttrs) -> MemResult {
+        // Identical to `write` up to the transfer, including enforcing the
+        // permission for a debug access.
+        if !self.perms.contains(Perms::WRITE) {
+            return Err(BusError::Protected);
+        }
+        let off = self.offset_of(rel);
+        self.constraints.check(off, width, attrs)?;
+        match &self.target {
+            FlatTarget::Ram(s) => s.write_value(off, width, value, self.constraints.endian),
+            FlatTarget::Rom { on_write, .. } => match on_write {
+                RomWrite::Ignore => Ok(()),
+                RomWrite::Fault => Err(BusError::BadAccess),
+            },
+            // A device takes bytes: `MemOps` is a slice interface because a
+            // device access is not width-bounded. Materialise them here, where
+            // the call that follows dwarfs the buffer.
+            FlatTarget::Io(ops) => {
+                let n = width.bytes() as usize;
+                let mut buf = [0u8; 8];
+                self.constraints.endian.store(&mut buf[..n], width, value)?;
+                ops.write(off, &buf[..n], attrs)
+            }
+        }
+    }
 }
 
 /// What a flat entry dispatches to: one leaf, or several that combine.
@@ -492,6 +527,40 @@ impl FlatEntry {
                 Ok(())
             }
         }
+    }
+
+    /// Write the low `width` bytes of `value` starting `rel` bytes into this
+    /// entry, in the entry's byte order.
+    ///
+    /// [`FlatEntry::write`] with the value carried instead of a byte slice, so
+    /// that the caller does not have to know the byte order before it knows
+    /// the target. On the fast path — one leaf, no separate write side, which
+    /// is every ordinary store — that removes a lookup and a stack round trip
+    /// from between the two: `SpaceView::write` used to load
+    /// [`endian`](FlatEntry::endian) out of the entry, materialise four bytes
+    /// into a buffer, and hand the buffer back to this entry to walk again.
+    ///
+    /// The two shapes that keep the byte path are deliberate:
+    ///
+    /// * **A combined entry** broadcasts the *same bytes* to every member, and
+    ///   members may disagree about byte order. [`FlatEntry::endian`] answers
+    ///   for the highest-priority one and that is what the write must use, so
+    ///   the conversion has to happen here rather than per leaf.
+    /// * **An entry with a distinct write side** likewise takes its byte order
+    ///   from [`FlatEntry::endian`], which reads the *read* side. That is
+    ///   arguably wrong, but it is what every path in the crate has always
+    ///   done and correcting it is not this function's business; going through
+    ///   the byte path keeps this change to a change of shape.
+    pub fn write_value(&self, rel: u64, width: Width, value: u64, attrs: MemAttrs) -> MemResult {
+        if self.write_to.is_none()
+            && let EntryKind::Single(l) = &self.kind
+        {
+            return l.write_value(rel, width, value, attrs);
+        }
+        let n = width.bytes() as usize;
+        let mut buf = [0u8; 8];
+        self.endian().store(&mut buf[..n], width, value)?;
+        self.write(rel, &buf[..n], attrs, Some(width))
     }
 
     fn for_each_leaf(&self, mut f: impl FnMut(usize, &FlatLeaf)) {

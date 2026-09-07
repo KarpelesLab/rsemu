@@ -107,7 +107,7 @@
 //! | | ns |
 //! | --- | --- |
 //! | the byte loop, four bytes | 1.3 |
-//! | one whole `AddressSpace::write`, four bytes | 24.8 |
+//! | one whole `AddressSpace::write`, four bytes | 20.4 |
 //! | one interpreted `mov [bx], eax` | 117 |
 //! | one interpreted `mov [bx], al` | 101 |
 //! | one interpreted `nop`, for scale | 56 |
@@ -115,6 +115,15 @@
 //! Against the instruction, the byte loop is ~1% and the CAS shape's +3 ns is
 //! **+2 to +3%** — not +12% of anything a guest runs. Both candidate fixes are
 //! affordable here, which was the thing in doubt.
+//!
+//! The second row read 24.8 until the round that priced
+//! [`mark_dirty`](RamStore::mark_dirty)'s locked instruction and gave
+//! `SpaceView::write` a value-typed path into the leaf; the other rows did not
+//! move, and the ratios above survive the change unaltered. The denominator
+//! shrinking is not an argument against either candidate — a store that no
+//! longer serialises on a `lock or` is a store the byte loop can overlap with,
+//! which is the direction that makes a wide aligned atomic *more* attractive
+//! rather than less.
 //!
 //! One case is *not* measured and should be before anyone spends the money: a
 //! compiled block whose store takes the **slow** path. An AArch64 or RISC-V
@@ -271,6 +280,7 @@
 
 use super::attrs::MemResult;
 use crate::core::error::BusError;
+use crate::core::value::{Endian, Width};
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -482,6 +492,34 @@ impl RamStore {
         Ok(())
     }
 
+    /// Write the low `width` bytes of `value` at `offset` in `endian` order,
+    /// marking the pages they touch dirty.
+    ///
+    /// The value-typed store, and the reason it exists rather than being
+    /// spelled `write_at(off, &buf)` at every call site: the bytes are shifted
+    /// out of the register that already holds them. The byte-slice form makes a
+    /// caller stage the value in a stack buffer and this loop read it straight
+    /// back, which is a store-to-load round trip on the hottest path in the
+    /// emulator and buys nothing — nobody wanted the buffer, it was only ever
+    /// the shape the API had.
+    #[inline]
+    pub fn write_value(&self, offset: u64, width: Width, value: u64, endian: Endian) -> MemResult {
+        let bytes = width.bytes();
+        let base = self.range(offset, bytes)?;
+        // At most eight, by `Width`.
+        let n = bytes as usize;
+        for (i, cell) in self.cells[base..base + n].iter().enumerate() {
+            let byte = if endian == Endian::Little {
+                i
+            } else {
+                n - 1 - i
+            };
+            cell.store((value >> (8 * byte)) as u8, Ordering::Relaxed);
+        }
+        self.mark_dirty(offset, bytes);
+        Ok(())
+    }
+
     /// Set `len` bytes at `offset` to `value`, marking them dirty.
     pub fn fill(&self, offset: u64, len: u64, value: u8) -> MemResult {
         let base = self.range(offset, len)?;
@@ -498,34 +536,84 @@ impl RamStore {
     /// Public because a device that writes its own backing store through some
     /// other path (a framebuffer blit, a DMA engine) still owes the dirty bit.
     ///
-    /// # The `fetch_or` is the most expensive instruction on the store path
+    /// # Why this tests before it sets
     ///
-    /// `Ordering::Relaxed` says this needs no ordering, and on an x86-64 host
-    /// it gets one anyway: a `fetch_or` is `lock or`, a full barrier. That is
-    /// not free and it is not small. Measured under callgrind and under an
-    /// interleaved pinned A/B, a whole four-byte store through the space costs
-    /// ~23.6 ns, of which **~3.9 ns is this line** — the single largest
-    /// component, larger than locating the target. It does not cost
-    /// instructions; it costs *overlap*, serialising the loop so the write path
-    /// retires at IPC ~3.5 against the read path's ~5.2.
+    /// An unconditional `fetch_or(Relaxed)` was the most expensive instruction
+    /// on the store path. `Relaxed` says it needs no ordering and on an x86-64
+    /// host it got one anyway — a `fetch_or` is `lock or`, a full barrier —
+    /// and it was not free and not small. Measured under an interleaved pinned
+    /// A/B, a whole four-byte store through the space cost 25.4 ns and
+    /// **3.6 ns of that was this line**: the largest single component, larger
+    /// than locating the target. It cost no *instructions* — callgrind puts the
+    /// test-before-set two host instructions **above** the unconditional form,
+    /// 320 against 318 for a four-byte `AddressSpace::write` — it cost
+    /// *overlap*, serialising a loop that otherwise retires several stores
+    /// deep. In the steady state, which is every store after the first to a
+    /// page, the bit is already one and the branch is not taken.
     ///
-    /// A test-before-set makes it vanish in the steady state, where the bit is
-    /// almost always already one. That is deliberately **not** done here,
-    /// because it is a design review rather than an optimisation:
+    /// So this is a change no instruction count can see and only a clock can,
+    /// which is worth saying out loud: anyone who re-derives the 318 and
+    /// concludes the branch made things worse has measured the wrong thing.
     ///
-    /// * The barrier is currently load-bearing by accident, and three places
-    ///   depend on the accident — `core::sync`'s ledger, a litmus row in
-    ///   `tests/memory_model_litmus.rs`, and `tests/memory_model_costs.rs`.
-    ///   Removing it means re-running those tables in the same change.
-    /// * Dropping it opens a narrow lost-dirty-bit window: with no barrier, one
-    ///   thread's store can become globally visible *after* another has cleared
-    ///   the bit and copied the page. That is only safe if every consumer of
-    ///   the dirty log runs at a safe point, which is a claim about the whole
-    ///   migration and snapshot path rather than about this function.
+    /// # What that gave up, which is less than it looks
     ///
-    /// Two rounds have now found this line from opposite directions — once as a
-    /// fence that was never asked for, once as a cost nobody had priced — so it
-    /// is written down here rather than rediscovered a third time.
+    /// The locked instruction ordered a guest store against a *concurrent*
+    /// reader of the dirty log: the byte stores above drained before the bit
+    /// appeared, so a consumer that saw the bit clear had already seen the
+    /// bytes. Testing first drops that, and a producer can now write bytes
+    /// after another thread has read the bit clear and copied the page — a lost
+    /// dirty bit.
+    ///
+    /// That ordering was **x86-only and accidental**. `fetch_or(Relaxed)` on
+    /// AArch64 is `ldsetr`, which orders nothing; nothing in the language model
+    /// promised it; and the consumer side has no acquire anywhere and never
+    /// did. So a concurrent consumer was already unsound on any host with a
+    /// weak model, and keeping the `lock or` would not have bought a guarantee,
+    /// only the appearance of one on the author's laptop — the worst outcome,
+    /// because the first consumer to need the ordering would have been written
+    /// against a host that hid its absence.
+    ///
+    /// # The condition, which is the safe-point protocol and nothing weaker
+    ///
+    /// **Every consumer of the dirty log must run at a safe point**
+    /// (`ROADMAP.md` §4.7), which is where the roadmap already puts snapshot.
+    /// Under that condition the test-before-set is not merely as correct as the
+    /// unconditional set, it is *exactly equivalent*, on every architecture:
+    ///
+    /// * Bits are only ever cleared at a safe point, so between two safe points
+    ///   the bitmap is **monotone**. A producer that finds its bit set is
+    ///   looking at a bit nobody can clear before the window ends, so skipping
+    ///   the set loses nothing. `dirty_bits_are_monotone_between_clears` in
+    ///   `tests.rs` pins that.
+    /// * The happens-before edge comes from the protocol rather than from this
+    ///   line. `Scheduler::stop_the_world` ends in `Pool::quiesce`, which waits
+    ///   on the pool mutex a worker released after finishing; every store a
+    ///   vCPU made is ordered before the consumer's first read by that
+    ///   release/acquire pair. That argument is architecture-independent, which
+    ///   the `lock or` never was.
+    ///
+    /// The consumers say so in their own documentation, because that is where
+    /// the next person looks: see [`for_each_dirty_page`](RamStore::for_each_dirty_page).
+    /// A consumer that reads the log while a vCPU runs — a display refresh
+    /// polled from a host thread is the tempting one — is a defect on every
+    /// host, and no ordering that can be afforded here would fix it.
+    ///
+    /// # What the audit found, so the next round does not repeat it
+    ///
+    /// There are **no** production consumers of this log today: `is_page_dirty`,
+    /// `take_page_dirty`, `clear_dirty`, `for_each_dirty_page` and
+    /// `dirty_page_count` are called only from tests. `Machine::save` copies
+    /// whole stores, `VideoScanout::capture` re-renders every cell, and VNC
+    /// computes damage by comparing frames (`docs/system/remote-display.md`).
+    /// The roadmap's three promised consumers — framebuffer refresh,
+    /// self-modifying-code detection, live snapshot — either do not exist yet
+    /// or, in the JIT's case, use its own `DirtyPages` list and not this
+    /// bitmap. So the condition above is what a future consumer must satisfy,
+    /// not a description of one that does.
+    ///
+    /// Three rounds have now found this line — as a fence nobody asked for, as
+    /// a cost nobody had priced, and as a guarantee nobody had checked — so the
+    /// whole argument is written here rather than rediscovered a fourth time.
     pub fn mark_dirty(&self, offset: u64, len: u64) {
         if len == 0 {
             return;
@@ -535,12 +623,18 @@ impl RamStore {
         for page in first..=last.min(self.page_count().saturating_sub(1)) {
             let (word, bit) = (page / 64, page % 64);
             if let Some(w) = self.dirty.get(word as usize) {
-                w.fetch_or(1u64 << bit, Ordering::Relaxed);
+                let mask = 1u64 << bit;
+                if w.load(Ordering::Relaxed) & mask == 0 {
+                    w.fetch_or(mask, Ordering::Relaxed);
+                }
             }
         }
     }
 
     /// Whether `page` has been written since the last clear.
+    ///
+    /// Read [`for_each_dirty_page`](RamStore::for_each_dirty_page)'s safe-point
+    /// requirement first; it governs every reader of this log.
     #[must_use]
     pub fn is_page_dirty(&self, page: u64) -> bool {
         let (word, bit) = (page / 64, page % 64);
@@ -550,6 +644,10 @@ impl RamStore {
     }
 
     /// Test and clear one page's dirty bit.
+    ///
+    /// Read [`for_each_dirty_page`](RamStore::for_each_dirty_page)'s safe-point
+    /// requirement first. This is the *clearing* half, and it is the half that
+    /// makes a concurrent call unsound rather than merely stale.
     pub fn take_page_dirty(&self, page: u64) -> bool {
         let (word, bit) = (page / 64, page % 64);
         match self.dirty.get(word as usize) {
@@ -559,6 +657,10 @@ impl RamStore {
     }
 
     /// Clear every dirty bit.
+    ///
+    /// Read [`for_each_dirty_page`](RamStore::for_each_dirty_page)'s safe-point
+    /// requirement first. As with [`take_page_dirty`](RamStore::take_page_dirty),
+    /// clearing is the operation that must not race a running vCPU.
     pub fn clear_dirty(&self) {
         for w in &self.dirty {
             w.store(0, Ordering::Relaxed);
@@ -570,6 +672,24 @@ impl RamStore {
     /// Ascending order is a determinism requirement, not a convenience: a
     /// framebuffer refresh or a live snapshot that visited pages in a
     /// hash-ordered sequence would produce run-dependent output.
+    ///
+    /// # Call this at a safe point
+    ///
+    /// Not advice — the contract every reader of this log is written against,
+    /// and the one [`mark_dirty`](RamStore::mark_dirty) buys its speed from.
+    /// Stop the world (`ROADMAP.md` §4.7: `Scheduler::stop_the_world`, or
+    /// `Machine::stop_the_world`, which is what a snapshot already has to hold)
+    /// and read the log inside the guard.
+    ///
+    /// Off a safe point the log is **unsound, on every host**. A producer skips
+    /// the bit it finds already set, so a store can land after a concurrent
+    /// reader has taken the bit and copied the page, and there is no ordering
+    /// anywhere on either side that would prevent it — the producer's stores
+    /// are relaxed and this loop's loads are relaxed. That is not a regression
+    /// a stronger ordering here could fix: the missing edge is on the *store*
+    /// side, one guest access away, and paying for it there is the cost the
+    /// safe-point protocol exists to avoid. Poll this from a display thread and
+    /// the display will miss writes.
     pub fn for_each_dirty_page(&self, mut f: impl FnMut(u64)) {
         for (i, w) in self.dirty.iter().enumerate() {
             let mut bits = w.load(Ordering::Relaxed);

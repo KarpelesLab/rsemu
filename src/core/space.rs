@@ -1082,22 +1082,32 @@ impl SpaceView<'_> {
         // to be known to put them anywhere; both answers come from one entry,
         // so it is found **once**. The general path below finds it twice —
         // `endian_at`, then again inside `write_span` — and that second lookup
-        // plus the span loop's scaffolding is **85 host instructions of 389**
-        // for a four-byte store (callgrind, `AddressSpace::write` against a
-        // `Region::ram`: 389 → 304, with the read path unmoved at 327 as the
-        // control). The write path was 19% above the read path's instruction
-        // count for the same access and is now below it.
+        // plus the span loop's scaffolding was 85 host instructions of 389 for
+        // a four-byte store.
         //
-        // The wall-clock win is a fifth of that — ~1.1 ns of 24.7, best of five
-        // in `tests/memory_model_costs.rs` — and why the two disagree is worth
-        // writing down, because it says where the rest of this path's cost
-        // actually is. `RamStore::mark_dirty` ends every store with a locked
-        // read-modify-write, which on x86-64 drains the store buffer
-        // (`tests/memory_model_litmus.rs` names that accident and what now
-        // depends on it). Consecutive stores therefore cannot overlap, so what
-        // is left runs at an IPC no instruction count predicts, and removing
-        // whole instructions buys less than shortening the *dependency chain*
-        // would.
+        // Finding it once left the entry being *walked* twice: `endian()` read
+        // the byte order out of it, the bytes were materialised into `buf`, and
+        // the entry was then handed that buffer to resolve its leaf and read
+        // the bytes straight back. `FlatEntry::write_value` carries the value
+        // down instead and converts at the leaf, from the constraints the leaf
+        // reads anyway. Under callgrind, four-byte `AddressSpace::write`
+        // against a `Region::ram`: **318 → 262 host instructions**, a sixth of
+        // the path. In wall clock, interleaved against the same binary without
+        // the change, pinned, best of seven: 25.40 → 24.55 ns, with the read
+        // path unmoved at 14.87 either way as the control.
+        //
+        // The saving scales with the access width, which is the signature of
+        // the thing it removes — a stack buffer written whole and read back a
+        // byte at a time. On a separate build of the same four arms: 0.24 ns at
+        // one byte, 1.18 at four, 1.96 at eight.
+        //
+        // Why instruction count and wall clock disagree by so much used to be
+        // the interesting half of this comment: `RamStore::mark_dirty` ended
+        // every store with a locked read-modify-write, consecutive stores could
+        // not overlap, and shortening the *dependency chain* bought more than
+        // deleting instructions did. `mark_dirty` tests before it sets now, so
+        // that is no longer true and this path's instruction count means
+        // roughly what it says again.
         //
         // The fast path is the whole access landing in one entry, which is
         // every ordinary store: a value-typed access crosses a region boundary
@@ -1106,13 +1116,12 @@ impl SpaceView<'_> {
             let e = self.topo.flat.entry(i).expect("index came from locate");
             let rel = addr - e.start();
             if e.write_run_len(rel) >= total {
-                e.endian().store(&mut buf[..n], width, value)?;
                 // Before the transfer and never for a debug access, for the
                 // reasons `write_span` states at length.
                 if !attrs.debug {
                     self.space.monitor.note_store(addr, total);
                 }
-                return e.write(rel, &buf[..n], attrs, Some(width));
+                return e.write_value(rel, width, value, attrs);
             }
         }
         // Nothing mapped here, or the access straddles two entries: the
