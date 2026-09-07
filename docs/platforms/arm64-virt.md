@@ -356,6 +356,45 @@ state hash. Trust the ratios ahead of the seconds: the host was building other
 things throughout, and the interpreter column moved by 2% between sittings on
 identical code, which is exactly why the reps are interleaved.
 
+### Twenty seconds was not far enough, and two defects were hiding past it
+
+That table is where the claim stopped, and stopping there cost it. Run the same
+board out to **120 s** of guest time and the engines parted:
+`0x7d0edfc4879cda23` interpreted against `0x03b29d3abf721c43` translated, with
+`jit` and `jit-host` agreeing with each other and only the interpreter — the
+oracle — on the other side. Bisecting the window in guest time found two
+independent defects in `cpu::arm::a64::engine`, both of which move *when* a
+quantum ends rather than what an instruction computes, which is why twenty
+seconds of the same boot never showed either:
+
+1. **A chained boundary the frontend declined charged that instruction's page
+   walk and then returned**, leaving `Cpu::run_budget`'s budget test standing
+   between an instruction's translation and its fetch — where an interpreted
+   core has it in front of both. The two engines then stopped on different
+   instructions and carried a different `State::debt`. It self-corrects at the
+   next quantum; it came round about twenty times in twenty-five seconds of
+   boot, always in front of an `MRS` on a page the TLB had just lost.
+   `advance` now interprets that instruction in the same call.
+2. **A translated block did not notice its own generic timer.** The comparator
+   is reached by ticks the block itself charges, and the block only looked at
+   the end of a chain, so a timer that fired while the guest was inside lifted
+   code was taken up to a chain late — a different `ELR_EL1`, and after it a
+   different scheduling decision. This is what actually broke the hash, at
+   **23.46 s**: the first timer to fire while the guest was busy rather than
+   parked in `WFI`. `IrHost::spent` now compares the tick counter against
+   `Exec::timer_edge` at every guest instruction boundary, so the block leaves
+   on the boundary the interpreter would have taken the interrupt after.
+
+All three engines now finish 120 s on `0x7d0edfc4879cda23` — the interpreter's
+own hash, unchanged by either fix, which is what says which side was wrong.
+`cpu::arm::a64::engine`'s
+`a_declined_chained_boundary_charges_its_walk_with_the_instruction_it_belongs_to`
+and `the_generic_timer_is_taken_at_the_same_instruction_by_both_engines` are
+the regressions, and both fail on the code before them. The fixes are also
+slightly *faster* — 20 s of this boot went from 11.19 s to 10.91 s on `jit` and
+from 5.11 s to 4.94 s on `jit-host`, because interpreting a declined
+instruction in place saves a dispatcher round trip.
+
 What the mechanisms did over that run:
 
 | | |

@@ -140,21 +140,32 @@
 //!
 //! # What is checked at a block boundary rather than at an instruction
 //!
-//! **Pending interrupts, the `WFI` stall and the generic timer**, and it is
-//! worth being exact about why that is sound. Within a block nothing this core
-//! does can raise one: `MSR`, `MRS`, `ERET`, `WFI`, `SVC` and every system
-//! operation are outside the lifted subset and end the block, a **store** ends
-//! the block by construction, and the timer's comparator is reached by ticks
-//! the block charges — which are read at the next boundary, at most
-//! [`lift::MAX_INSNS`] instructions later.
+//! **Pending interrupts and the `WFI` stall**, and within a block nothing this
+//! core does can raise either: `MSR`, `MRS`, `ERET`, `WFI`, `SVC` and every
+//! system operation are outside the lifted subset and end the block, a
+//! **store** ends the block by construction, and a line asserted from outside
+//! changes between quanta, where both engines meet it at the same boundary.
 //!
-//! That last one is a real, bounded imprecision and it is stated rather than
-//! implied: an interpreted core samples `CNTPCT_EL0` against the comparator
-//! once per instruction, and a translated one samples it once per block. The
-//! two therefore raise the timer interrupt at the same *tick* — the counter is
-//! the core's own tick count either way — but a translated core can be up to a
-//! block late in *noticing*. `Exec::publish_timer_levels` is called once per
-//! [`advance`] for the same reason it is called once per `Exec::step`.
+//! **The generic timer is not in that list, and used to be.** Its comparator
+//! is reached by ticks the block itself charges, so nothing outside the run
+//! decides when — an interpreted core samples `CNTPCT_EL0` once per
+//! instruction and acts at the next boundary, and a chain that ran on to its
+//! natural end took the same interrupt up to [`lift::MAX_INSNS`] instructions
+//! later. That was written down here as "a real, bounded imprecision", and
+//! bounded is not the property that matters: `ROADMAP.md` §0 asks for one
+//! state hash across the engines, and an interrupt taken tens of ticks late is
+//! a different `ELR_EL1` and, on a real guest, a different scheduling decision
+//! after it. It cost an arm64 Linux boot its agreement at **23.46 seconds** of
+//! guest time — the first timer to fire while the guest was inside lifted code
+//! rather than parked in `WFI` — and nothing before that saw it.
+//!
+//! `Exec::timer_edge` closes it: the cycle the comparator is crossed on is
+//! computed once per [`advance`] (the registers that decide it are written by
+//! `MSR` and a block ends at one), and [`IrHost::spent`] compares the tick
+//! counter against it at every guest instruction boundary, so the block leaves
+//! on the boundary the interpreter would have taken the interrupt after.
+//! `Exec::publish_timer_levels` is then called once per [`advance`] for the
+//! same reason it is called once per `Exec::step`.
 //!
 //! # Self-modifying code, and the one case that is not covered
 //!
@@ -816,16 +827,47 @@ pub(super) fn advance(
             let trap = entry_trap.expect("just tested");
             deliver(smc, disp, subset, exec, trap, run.pc, run.pc)
         }
-        // `Budget` ends a full chain, `Declined` a short one, `Untranslatable`
-        // one that reached an instruction outside the subset, `Spent` one that
-        // left part-way through a block because the caller's tick allowance
-        // ran out — and all four leave the guest at `run.pc` for the run loop
-        // to pick up. **`Spent` needs no arm of its own, and that is the
-        // point**: a block that leaves at a boundary has published the
-        // architectural state of that boundary through its live mapping, so
-        // there is nothing to reconstruct that the other three do not already
-        // need. `Exit` cannot happen: no safe-point flag is given to the
-        // dispatcher, because the run loop above checks it between calls.
+        // A chained boundary the frontend declined, and a block whose lift
+        // produced nothing: both mean the instruction at `run.pc` is one the
+        // **interpreter** has to take, and it is taken here rather than after
+        // a return to the run loop.
+        //
+        // # Why it cannot wait for the next call
+        //
+        // `Frontend::enter` has already charged that instruction's entry
+        // translation — the walk, on a TLB miss, which is three or four
+        // accesses on a real guest — through [`admit`]. Returning here leaves
+        // those ticks charged with *nothing of that instruction executed*, and
+        // `Cpu::run_budget` then tests `used < allowance` in exactly that
+        // window. The interpreter has no such window: it charges the walk and
+        // the fetch inside one `Exec::step`, so its budget test stands in
+        // front of both. A quantum whose last few ticks land there therefore
+        // stops the two engines on **different instructions** — the
+        // interpreter runs the instruction, the translated core stops in front
+        // of it — and `State::debt`, which the machine's state hash covers,
+        // parts with them. It self-corrects at the next quantum, so a small
+        // run never sees it; over an arm64 Linux boot it is the whole
+        // divergence, because the quantum this lands on eventually is one that
+        // ends with an interrupt pending and the two cores take it at
+        // different PCs.
+        //
+        // Interpreting here puts the walk and the instruction it was for on
+        // the same side of that test, which is where the interpreter has them.
+        // It costs nothing else: this is the same `interpret` the prologue
+        // reaches for an entry PC outside the subset, one dispatcher round
+        // trip earlier than before.
+        Stop::Declined | Stop::Untranslatable { .. } => {
+            exec.st.pc = run.pc;
+            interpret(interpreted, smc, disp, subset, exec)
+        }
+        // `Budget` ends a full chain and `Spent` one that left part-way
+        // through a block because the caller's tick allowance ran out — both
+        // leave the guest at `run.pc` for the run loop to pick up. **`Spent`
+        // needs no arm of its own, and that is the point**: a block that
+        // leaves at a boundary has published the architectural state of that
+        // boundary through its live mapping, so there is nothing to
+        // reconstruct. `Exit` cannot happen: no safe-point flag is given to
+        // the dispatcher, because the run loop above checks it between calls.
         _ => {
             exec.st.pc = run.pc;
             // Once per call, whatever the call did — the same rule
@@ -1043,6 +1085,14 @@ struct Host<'a, 'e> {
     /// what the seam costs: it is read once per boundary on the hot path, so
     /// anything computed here would be felt.
     allowance: u64,
+    /// The cycle count at which this core's own generic timer would change
+    /// what it is driving — `Exec::timer_edge`, asked once per run because a
+    /// block cannot write the registers it is computed from.
+    ///
+    /// The second half of [`IrHost::spent`], and it is here for the same
+    /// reason `allowance` is: a field read at every guest instruction
+    /// boundary, so the work that produced it happens once.
+    timer_edge: u64,
     slots: [u64; lift::SLOT_COUNT as usize],
     /// The trap the memory path raised, kept because [`IrHost::load`] can only
     /// report a [`BusError`] and an A64 trap is a syndrome, a faulting address
@@ -1065,9 +1115,11 @@ impl<'a, 'e> Host<'a, 'e> {
         slots[lift::C.0 as usize] = u64::from(flags.c());
         slots[lift::V.0 as usize] = u64::from(flags.v());
         slots[PC.0 as usize] = pc;
+        let timer_edge = exec.timer_edge();
         Host {
             exec,
             allowance,
+            timer_edge,
             slots,
             trap: None,
             mark: None,
@@ -1129,7 +1181,24 @@ impl IrHost for Host<'_, '_> {
         self.mark = Some((mark.pc, mark.next_pc));
     }
 
-    /// Whether this call's tick allowance is gone.
+    /// Whether this call's tick allowance is gone, **or this core's own timer
+    /// has reached its comparator**.
+    ///
+    /// The second condition is not a budget and is not an optimisation: it is
+    /// what keeps the two engines on one instruction. The interpreter samples
+    /// its generic timer once per instruction — `Exec::step` publishes the
+    /// outward level and `Exec::pending_interrupt` reads the internal one — so
+    /// a comparator reached by an instruction's own accesses is acted on at
+    /// the next instruction boundary. A chain that ran on to its natural end
+    /// would take the same interrupt tens of ticks later, at a different
+    /// `ELR_EL1`; over an arm64 Linux boot that is the divergence, and it
+    /// arrives the first time a timer fires while the guest is inside lifted
+    /// code rather than parked in `WFI`. Leaving here hands the boundary back
+    /// to [`advance`], which publishes, and to `admit`, which takes the
+    /// interrupt through the interpreter exactly as an interpreted core does.
+    ///
+    /// `Exec::timer_edge` states why one comparison against a number computed
+    /// at the start of the run is the whole test.
     ///
     /// Monotone because `Exec::used` only grows within one [`advance`], which
     /// is what [`IrHost::spent`] requires and cannot check. Equal to
@@ -1148,7 +1217,7 @@ impl IrHost for Host<'_, '_> {
     /// resumable and no lifter change was needed.
     #[inline]
     fn spent(&self) -> bool {
-        self.exec.used >= self.allowance
+        self.exec.used >= self.allowance || self.exec.st.cycles >= self.timer_edge
     }
 }
 
@@ -2406,6 +2475,177 @@ mod tests {
                 hits + misses > 0,
                 "the MMU was never asked under {engine:?}"
             );
+            let stats = jit.jit_stats().expect("a jit core");
+            assert!(stats.blocks > 0, "no block ran under {engine:?}");
+        }
+    }
+
+    /// A loop that leaves its own page for an instruction outside the subset,
+    /// which is the shape a real guest reaches an `MRS` in: a `BL` into
+    /// another function, and the first thing that function does is read
+    /// `SP_EL0`.
+    ///
+    /// The page matters. `mmu::Tlb` is indexed by 4 KiB virtual page whatever
+    /// the mapping's granule, so a branch to `PAGE_TWO` is a **TLB miss** and
+    /// the entry translation of the instruction there costs a walk — which is
+    /// the whole of what this fixture is for. A loop that stayed on one page
+    /// charges nothing at that boundary and cannot show the defect.
+    const OFF_PAGE: [u32; 3] = [
+        0x9100_0421, // add x1, x1, #1
+        0x9100_0442, // add x2, x2, #1
+        0x1400_03fe, // b   0x1000            ; +0xff8, onto the next page
+    ];
+
+    /// Where [`OFF_PAGE`] branches to, and back from.
+    const PAGE_TWO: u64 = 0x1000;
+
+    /// What sits there: an `MRS` the frontend does not lift, then the way back.
+    const PAGE_TWO_CODE: [u32; 2] = [
+        0xd538_0000, // mrs x0, midr_el1      ; outside the subset
+        0x17ff_fbff, // b   -0x1004           ; back to the top
+    ];
+
+    #[test]
+    fn a_declined_chained_boundary_charges_its_walk_with_the_instruction_it_belongs_to() {
+        // `Frontend::enter` charges the entry translation of a chained
+        // successor **before** the frontend has said whether it will run one,
+        // and for an instruction outside the lifted subset it never does. The
+        // walk is charged, nothing executes, and `advance` used to return
+        // there — putting `Cpu::run_budget`'s `used < allowance` test between
+        // an instruction's translation and its fetch. The interpreter has no
+        // such point: `Exec::step` charges the walk and the fetch together, so
+        // its budget test stands in front of both.
+        //
+        // So for the budgets whose quantum ends in that window the two engines
+        // stop on different instructions and carry a different `State::debt` —
+        // both of which the machine's state hash covers. It self-corrects at
+        // the next quantum, which is why a small run never sees it and why the
+        // sweep below is over *every* budget rather than a chosen one: budget
+        // 6 is the first that lands there, and on an arm64 Linux boot the same
+        // window is met about twenty times in twenty-five seconds.
+        for budget in 1..=64u64 {
+            let interp = core(Engine::Interp, &OFF_PAGE);
+            let jit = core(Engine::Jit, &OFF_PAGE);
+            for cpu in [&interp, &jit] {
+                let space = cpu.space().expect("the core has its space");
+                for (n, word) in PAGE_TWO_CODE.iter().enumerate() {
+                    space
+                        .write(
+                            PAGE_TWO + 4 * n as u64,
+                            Width::U32,
+                            u64::from(*word),
+                            MemAttrs::DEFAULT,
+                        )
+                        .expect("inside RAM");
+                }
+                enable_mmu(cpu);
+            }
+            for n in 0..8 {
+                assert_eq!(
+                    (
+                        interp.run_budget(budget),
+                        interp.pc(),
+                        interp.cycles(),
+                        interp.cycle_debt()
+                    ),
+                    (
+                        jit.run_budget(budget),
+                        jit.pc(),
+                        jit.cycles(),
+                        jit.cycle_debt()
+                    ),
+                    "budget {budget}, quantum {n}: the two engines stopped in \
+                     different places. A chained boundary the frontend declined \
+                     charged that instruction's walk and then handed the run \
+                     loop a budget test the interpreter takes on the other side \
+                     of it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_generic_timer_is_taken_at_the_same_instruction_by_both_engines() {
+        // The interrupt below is raised by **this core's own tick counting**,
+        // which is the case the test after this one cannot cover: a line
+        // asserted from outside changes between quanta and both engines see it
+        // at the same boundary by construction, while the generic timer's
+        // comparator is reached *inside* a run. An interpreted core samples it
+        // once per instruction; a chain that ran on to its natural end takes
+        // the same interrupt tens of ticks later, at a different `ELR_EL1`,
+        // and everything the guest does with that return address follows it.
+        //
+        // `ALU_LOOP` touches no memory, so a warm quantum is one long chain
+        // with no store to end it — which is exactly the window in which a
+        // real guest's timer fires while it is doing work rather than parked
+        // in `WFI`. That is why an arm64 Linux boot agrees for twenty-three
+        // seconds and then does not.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = core(Engine::Interp, &ALU_LOOP);
+            let jit = core(engine, &ALU_LOOP);
+            for cpu in [&interp, &jit] {
+                let mut sys = cpu.sysregs();
+                sys.daif = 0;
+                sys.vbar_el1 = VBAR;
+                cpu.set_sysregs(sys);
+                // The same handler `an_interrupt_is_taken_at_the_same_instruction`
+                // installs, and for the same three reasons: mask the source,
+                // then stop, so `ELR_EL1` records where the interrupt was
+                // taken instead of converging on the handler's own address.
+                let space = cpu.space().expect("the core has its space");
+                for (n, word) in [0xd503_42dfu64, 0x1400_0000].iter().enumerate() {
+                    space
+                        .write(
+                            VBAR + IRQ_VECTOR + 4 * n as u64,
+                            Width::U32,
+                            *word,
+                            MemAttrs::DEFAULT,
+                        )
+                        .expect("inside RAM");
+                }
+            }
+            // Warm both, so the translated core is running a chain rather than
+            // lifting one when the comparator is reached.
+            for _ in 0..2 {
+                interp.run_budget(4096);
+                jit.run_budget(4096);
+            }
+            let cfg = Config::cortex_a53();
+            for cpu in [&interp, &jit] {
+                let mut sys = cpu.sysregs();
+                // Enabled and unmasked, with a deadline well inside the next
+                // quantum's chain rather than at its edge.
+                sys.cntp_ctl = 1;
+                sys.cntp_cval = cfg.counter_at(cpu.cycles()) + 37;
+                cpu.set_sysregs(sys);
+            }
+            for n in 0..4 {
+                assert_eq!(
+                    interp.run_budget(4096),
+                    jit.run_budget(4096),
+                    "quantum {n} after the timer was armed, under {engine:?}"
+                );
+            }
+            assert_eq!(
+                interp.sysregs().elr_el1,
+                jit.sysregs().elr_el1,
+                "ELR_EL1 under {engine:?}: the two engines took the generic \
+                 timer's interrupt at different instructions"
+            );
+            assert_ne!(
+                interp.sysregs().elr_el1,
+                0,
+                "the interrupt was never taken, so this proves nothing"
+            );
+            assert_eq!(interp.pc(), jit.pc(), "the pc under {engine:?}");
+            assert_eq!(
+                interp.cycles(),
+                jit.cycles(),
+                "the cycle counter under {engine:?}"
+            );
+            for n in 0..31 {
+                assert_eq!(interp.x(n), jit.x(n), "x{n} under {engine:?}");
+            }
             let stats = jit.jit_stats().expect("a jit core");
             assert!(stats.blocks > 0, "no block ran under {engine:?}");
         }
