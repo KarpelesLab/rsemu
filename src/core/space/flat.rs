@@ -14,6 +14,76 @@
 //! *one atomic store per affected flat entry* and touches nothing else: not
 //! the entry list, not its ordering, not the dispatch table, not the
 //! generation counter.
+//!
+//! # Two winners, and why there is no third
+//!
+//! `resolve_overlaps` scans the active candidates twice: once for
+//! [`Perms::READ`] and once for [`Perms::WRITE`]. It does **not** scan for
+//! [`Perms::EXEC`], so an execute-only mapping stacked under a higher-priority
+//! readable one loses the fetch to the readable one and the fetch is then
+//! refused. That is deliberate, it was re-opened and measured, and this is the
+//! record — because "we did not get to it" and "we decided against it" are
+//! different sentences and only one of them should survive.
+//!
+//! **There is no `/FETCH` pin.** The read/write split exists because `/RD` and
+//! `/WR` are separate signals and real chipsets route them to different
+//! targets: Intel's PAM registers map a shadow window *write-only* over the
+//! ROM so that a POST can copy a ROM into the DRAM behind it
+//! (`dev::pc::pmc`, `dev::q35::mch`), and a Master System's slot 2 reads a
+//! ROM bank while writing the cartridge RAM. No bus this crate models
+//! qualifies a *decode* by fetch-versus-data. [`Perms::EXEC`] is a property of
+//! a **translation** — a page table, an MPU region, `mprotect(PROT_EXEC)` —
+//! and a translation resolves to exactly one entry; it never stacks by
+//! priority. A third winner scan would be inventing a decode rule that no
+//! hardware implements.
+//!
+//! **Nothing produces the shape.** No shipped machine file overlaps two
+//! mappings with complementary permissions (`spi-flash` and `stm32f407` are
+//! the only two that mention `perms` at all, both `r-x`, neither overlapping);
+//! the PAM windows and the PCI BAR windows are each a single mapping whose
+//! permissions change; and `usermode` unmaps a range before it maps over it,
+//! so two VMAs never overlap and a `PROT_EXEC` range is one leaf.
+//!
+//! **Where the shape does occur by accident, falling through would be wrong.**
+//! A PCI memory BAR decodes with [`Perms::RW`] at priority 2. A guest that
+//! programs one over RAM gets [`BusError::Protected`] on a fetch today, which on
+//! `arm64-virt` is the right answer — that window is Device memory and XN by
+//! architecture. A fetch that fell through to the next mapping down would
+//! silently execute the RAM *underneath* the BAR instead, turning a
+//! diagnosable refusal into the wrong instruction stream.
+//!
+//! **And it is not free.** Measured on this tree, not inherited. The cheapest
+//! shape that works is an `exec_to: Option<Box<FlatLeaf>>` beside
+//! [`FlatEntry::write_to`], restricted to a single leaf with no repeat period
+//! so that [`FlatEntry::read_run_len`] need not consult it, selected in
+//! [`FlatEntry::read`] before the call so the tail call survives:
+//!
+//! | | baseline | with a fetch winner |
+//! | --- | --- | --- |
+//! | `AddressSpace::read`, four bytes from a `Region::ram`, host instructions under callgrind | 312 | 319 (**+2.2%**) |
+//! | the same, wall clock, interleaved and pinned, best of 21 | 13.785 ns | 13.972 ns (**+1.4%**) |
+//! | `nes-ntsc`, 60 frames, total host instructions under callgrind | 14,224,685,694 | 14,312,414,939 (**+0.62%**) |
+//! | `riscv-virt`, 30 frames, the same | 9,699,559,667 | 9,859,873,440 (**+1.65%**) |
+//! | `size_of::<FlatEntry>()` | 120 B | 128 B |
+//!
+//! The obvious cheaper-looking shape is worse: resolving the fetch winner
+//! *lazily*, only when the read winner has already refused, costs **+18**
+//! instructions per read rather than +7 (312 → 330, **+5.8%**), because
+//! matching on the result of `FlatLeaf::read` to retry it is what stops that
+//! call being a tail call. The read path pays either way, for a shape it never
+//! has.
+//!
+//! Even then it would not be complete. [`FlatEntry::endian`],
+//! [`FlatEntry::drives_data_bus`] and [`FlatEntry::read_run_len`] all answer
+//! from the read winner, so a fetch routed to a third side would take its byte
+//! order and its bus-drive answer from a different chip — the exact asymmetry
+//! [`FlatEntry::write_endian`] exists to keep off the write side. Making those
+//! three answer per direction is a third arm on each, which is where the +4%
+//! in [`FlatEntry::write_to`]'s note came from.
+//!
+//! A board that genuinely wants split instruction and data decodes should say
+//! so the way the hardware does: **two address spaces**, which is what a
+//! Harvard machine is.
 
 use super::attrs::{AccessConstraints, MemAttrs, MemOps, MemResult, Perms};
 use super::region::{AliasId, CombinePolicy, Mapping, RegionKind, RegionRef, RomWrite};
@@ -296,10 +366,15 @@ pub struct FlatEntry {
     /// A field beside `kind` rather than a third [`EntryKind`] variant, and
     /// that is a measurement rather than a preference. Every read consults
     /// `kind` four times — the target, the run length, the byte order, whether
-    /// the data bus was driven — and a third arm on each of those cost 4% of a
-    /// whole emulated frame, on every machine, for a shape almost none of them
-    /// contains. Here the read path is exactly what it was and only the write
-    /// path tests an `Option`.
+    /// the data bus was driven — and a third **variant**, putting an arm on
+    /// each of those four matches, cost 4% of a whole emulated frame, on every
+    /// machine, for a shape almost none of them contains. Here the read path is
+    /// exactly what it was and only the write path tests an `Option`.
+    ///
+    /// The 4% prices *that* shape and nothing else, which is worth saying
+    /// because it has been quoted since as the price of "a third leaf per
+    /// entry" — a different design, priced separately in this module's header
+    /// under *Two winners, and why there is no third*, and much cheaper.
     ///
     /// Boxed for the same reason: `EntryKind` is stored inline in every entry,
     /// and a second leaf's worth of padding in each would make the flat view a
@@ -367,6 +442,29 @@ impl FlatEntry {
             EntryKind::Combine { members, .. } => members
                 .first()
                 .map_or(Endian::Little, |m| m.constraints.endian),
+        }
+    }
+
+    /// Byte order for a width-typed *write* here.
+    ///
+    /// [`FlatEntry::endian`] answers for the read side, and for every entry but
+    /// one that is the same answer. An entry with a distinct
+    /// [`write_to`](FlatEntry::write_to) side is two decodes onto two chips,
+    /// and nothing makes them agree about byte order: a big-endian aperture
+    /// that reads a ROM bank and a little-endian one that writes the cartridge
+    /// RAM behind it is the same board that motivated the split in the first
+    /// place, one attribute further on. So the write side answers for itself.
+    ///
+    /// A combined entry still answers with its highest-priority member, and
+    /// deliberately: a write to a wired-or broadcasts *identical bytes* to
+    /// members that may disagree, so there is one order and it has to be
+    /// picked. That is a property of the wire, not an oversight.
+    #[inline]
+    #[must_use]
+    pub fn write_endian(&self) -> Endian {
+        match &self.write_to {
+            Some(l) => l.constraints.endian,
+            None => self.endian(),
         }
     }
 
@@ -540,21 +638,40 @@ impl FlatEntry {
     /// [`endian`](FlatEntry::endian) out of the entry, materialise four bytes
     /// into a buffer, and hand the buffer back to this entry to walk again.
     ///
-    /// The two shapes that keep the byte path are deliberate:
+    /// One shape keeps the byte path, and it is the only one that should: a
+    /// **combined entry** broadcasts the *same bytes* to every member, and
+    /// members may disagree about byte order. [`FlatEntry::endian`] answers for
+    /// the highest-priority one and that is what the write must use, so the
+    /// conversion has to happen here rather than per leaf. That is a property
+    /// of a wired bus — one set of wires, one order — not an approximation.
     ///
-    /// * **A combined entry** broadcasts the *same bytes* to every member, and
-    ///   members may disagree about byte order. [`FlatEntry::endian`] answers
-    ///   for the highest-priority one and that is what the write must use, so
-    ///   the conversion has to happen here rather than per leaf.
-    /// * **An entry with a distinct write side** likewise takes its byte order
-    ///   from [`FlatEntry::endian`], which reads the *read* side. That is
-    ///   arguably wrong, but it is what every path in the crate has always
-    ///   done and correcting it is not this function's business; going through
-    ///   the byte path keeps this change to a change of shape.
+    /// An entry with a distinct [`write_to`](FlatEntry::write_to) side used to
+    /// keep it too, and took its byte order from [`FlatEntry::endian`] — the
+    /// *read* side. That was a defect, not a wire: the two sides are two
+    /// decodes onto two chips and every other property of the write already
+    /// came from the write leaf. It now goes straight to that leaf, which
+    /// converts from its own [`AccessConstraints`], and
+    /// [`FlatEntry::write_endian`] is what a caller that has to know the order
+    /// before it has the bytes should ask.
     pub fn write_value(&self, rel: u64, width: Width, value: u64, attrs: MemAttrs) -> MemResult {
-        if self.write_to.is_none()
-            && let EntryKind::Single(l) = &self.kind
-        {
+        // Both single-destination shapes take the value straight to the leaf,
+        // and the leaf converts from the constraints it reads anyway.
+        //
+        // Resolved to one leaf and then called **once**. Two `return`s — one
+        // per shape — reads better and costs five host instructions per store,
+        // because the second call site stops `FlatLeaf::write_value` being
+        // inlined into either: 231.9 to 236.9 million for a million four-byte
+        // stores under callgrind, on a path last round took from 25.4 to
+        // 21.0 ns. In this shape it is 231.9 million, which is what it was
+        // before the write side answered for its own byte order.
+        let single = match &self.write_to {
+            Some(l) => Some(&**l),
+            None => match &self.kind {
+                EntryKind::Single(l) => Some(l),
+                EntryKind::Combine { .. } => None,
+            },
+        };
+        if let Some(l) = single {
             return l.write_value(rel, width, value, attrs);
         }
         let n = width.bytes() as usize;

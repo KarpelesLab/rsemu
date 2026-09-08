@@ -2236,3 +2236,122 @@ fn a_zero_length_store_allocates_no_slack() {
     assert!(rom.is_empty());
     assert!(rom.as_bytes().is_empty());
 }
+
+/// A directed entry's *write* takes its byte order from the write side.
+///
+/// The read side and the write side are two different windows onto two
+/// different chips, and nothing says they agree about byte order — the whole
+/// point of the shape is that they are separate decodes. Every other property
+/// of a directed write already comes from the write leaf: its permissions, its
+/// width constraints, its offset, its run length. Byte order used to be the one
+/// exception, because [`FlatEntry::write_value`] reached for
+/// [`FlatEntry::endian`], which answers for the read side.
+#[test]
+fn a_directed_writes_byte_order_is_the_write_sides_and_not_the_reads() {
+    let rom_store = Arc::new(RomStore::new(vec![0; 0x100]));
+    // The read side is a big-endian aperture; the write side is little-endian.
+    let rom = Region::rom("be-bank", rom_store, RomWrite::Ignore).with_endian(Endian::Big);
+    let (ram_store, ram_region) = ram("le-cart-ram", 0x100);
+
+    let space = AddressSpace::new("mem", 16);
+    {
+        let mut topo = space.topology();
+        topo.map_with_perms(rom, 0x8000, Perms::READ).unwrap();
+        topo.map_with(
+            Mapping::new(Arc::new(ram_region), 0x8000)
+                .with_priority(1)
+                .with_perms(Perms::WRITE),
+        )
+        .unwrap();
+    }
+
+    let view = space.view();
+    let entry = view
+        .flat_view()
+        .entry(view.locate(0x8000).unwrap())
+        .unwrap();
+    assert!(entry.write_to().is_some(), "the shape under test");
+    assert_eq!(entry.endian(), Endian::Big, "the read side is big-endian");
+    assert_eq!(
+        entry.write_endian(),
+        Endian::Little,
+        "and the write side is not"
+    );
+    drop(view);
+
+    // The whole access lands in one entry, so this takes the value-typed fast
+    // path.
+    space
+        .write(0x8000, Width::U32, 0x1122_3344, MemAttrs::DEFAULT)
+        .unwrap();
+    let mut wire = [0u8; 4];
+    ram_store.read_at(0, &mut wire).unwrap();
+    assert_eq!(
+        wire,
+        [0x44, 0x33, 0x22, 0x11],
+        "little-endian, because that is what the RAM the write reached says"
+    );
+
+    // The same value through `write_bytes`, which is a byte path: the caller
+    // supplies the order, and these bytes are already in the write side's.
+    ram_store.write_at(0, &[0; 4]).unwrap();
+    space
+        .write_bytes(0x8000, &[0x44, 0x33, 0x22, 0x11], MemAttrs::DEFAULT)
+        .unwrap();
+    ram_store.read_at(0, &mut wire).unwrap();
+    assert_eq!(wire, [0x44, 0x33, 0x22, 0x11]);
+}
+
+/// The flattener has two winners and no third, and this is what that costs the
+/// one shape that would want one.
+///
+/// `flat`'s module header has the argument and the measurement; this is the
+/// assertion, because a limitation nothing pins is a limitation that changes by
+/// accident. An execute-only mapping under a higher-priority readable one loses
+/// the fetch to the readable one, and the readable one refuses it.
+///
+/// The second half is the part that makes the first half a decision rather than
+/// a defect: falling through to the mapping underneath is *not* the right
+/// answer either. A PCI memory BAR decodes with [`Perms::RW`] at a priority
+/// above RAM, and a guest that lands one on RAM must not have its fetches
+/// silently served by the RAM the BAR is covering.
+#[test]
+fn an_execute_only_mapping_under_a_readable_one_loses_the_fetch_and_does_not_fall_through() {
+    let (under, under_region) = ram("execute-only", 0x100);
+    let (over, over_region) = ram("readable", 0x100);
+    under.write_u8(0, 0x5a).unwrap();
+    over.write_u8(0, 0xaa).unwrap();
+
+    let space = AddressSpace::new("mem", 16);
+    {
+        let mut topo = space.topology();
+        topo.map_with_perms(under_region, 0, Perms::EXEC).unwrap();
+        topo.map_with(
+            Mapping::new(Arc::new(over_region), 0)
+                .with_priority(1)
+                .with_perms(Perms::RW),
+        )
+        .unwrap();
+    }
+
+    let fetch = MemAttrs::DEFAULT.with_purpose(AccessPurpose::FETCH);
+    assert_eq!(
+        space.read(0, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xaa),
+        "the read winner is the higher-priority readable mapping"
+    );
+    assert_eq!(
+        space.read(0, Width::U8, fetch),
+        Err(BusError::Protected),
+        "and it answers the fetch too, which it cannot permit — in particular \
+         the fetch does not fall through to the `0x5a` below, because a decode \
+         a fetch resolves differently from a read is not a bus any board in \
+         this crate has"
+    );
+
+    // One entry, one read destination. Nothing was added beside `write_to`.
+    let view = space.view();
+    let entry = view.flat_view().entry(view.locate(0).unwrap()).unwrap();
+    assert!(entry.write_to().is_none());
+    assert!(matches!(entry.kind(), EntryKind::Single(_)));
+}
