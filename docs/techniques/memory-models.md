@@ -97,13 +97,21 @@ read rather than after it, which costs nothing.
 price (+14 ns an instruction that takes the bus; nothing on the ordinary load
 and store path).
 
-Two things generalise from it. **`note_store`-before-transfer is a window in
+Two things generalise from it. **`note_store`-before-transfer was a window in
 every core that has a monitor** — the RISC-V core reaches it the same way — and
-moving it after the transfer in `core::space` would close a residual the lock
-does not: a *plain* store racing a load-reserved. And **fixing one instruction
-of a pair is not fixing the pair**: the `STXR` half was locked a round before
-the `LDXR` half, and the defect that survived cost one update in 120 000, which
-is exactly the size a single green run hides.
+it has since been closed in `core::space` rather than in any core, by telling
+the monitor on **both** sides of the transfer. That was not the trade the
+paragraph above expected it to be: clearing on a store that *completed* is
+required by both manuals ("The `sc` **must** fail if a store to the reservation
+set from another hart can be observed to occur between the `lr` and `sc`";
+"Any successful write to the marked block by any other observer … is
+**guaranteed** to clear the marking"), while clearing on a store that *faulted*
+is only ever permitted, so the first call keeps the licence and the second call
+keeps the requirement. `core::space::monitor`, "The transfer is the window",
+has the interleaving, the citations and what is left. And **fixing one
+instruction of a pair is not fixing the pair**: the `STXR` half was locked a
+round before the `LDXR` half, and the defect that survived cost one update in
+120 000, which is exactly the size a single green run hides.
 
 This is the one thing in this section a test on an x86-64 host can gate, and
 the reason is worth keeping: a lost update is not a reordering. It is a value
@@ -135,9 +143,10 @@ configuration `tests/smp_single_copy_atomicity.rs` measures.
 `core::space::store`'s "What per-byte atomicity is not" has three candidate
 shapes, all re-derivable from `tests/memory_model_costs.rs`, and why none was
 taken. The one correction worth repeating here is the price: "+12% of the store
-path" divided by `SpaceView::write_span` (≈20 ns since this round, ≈25 before
-it), which is a sixth of an interpreted store instruction (≈117 ns) rather than
-a path a guest executes. The
+path" divided by `SpaceView::write_span` (≈19 ns when that was written, ≈25
+before it, and ≈12 since the span loop stopped being inlined into every value
+store), which is a sixth of an interpreted store instruction (≈117 ns) rather
+than a path a guest executes. The
 byte loop is ~1% of that instruction and full conformance costs +2–3% of it.
 Both fixes are affordable at that denominator; the question is the memory model,
 not the nanoseconds.

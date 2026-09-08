@@ -1142,12 +1142,15 @@ impl SpaceView<'_> {
             let e = self.topo.flat.entry(i).expect("index came from locate");
             let rel = addr - e.start();
             if e.write_run_len(rel) >= total {
-                // Before the transfer and never for a debug access, for the
-                // reasons `write_span` states at length.
-                if !attrs.debug {
-                    self.space.monitor.note_store(addr, total);
+                // Both sides of the transfer, and never for a debug access,
+                // for the reasons `write_span` states at length.
+                if attrs.debug {
+                    return e.write_value(rel, width, value, attrs);
                 }
-                return e.write_value(rel, width, value, attrs);
+                self.space.monitor.note_store(addr, total);
+                let res = e.write_value(rel, width, value, attrs);
+                self.space.monitor.note_store(addr, total);
+                return res;
             }
         }
         // Nothing mapped here, or the access straddles two entries: the
@@ -1267,21 +1270,47 @@ impl SpaceView<'_> {
         // Every store in the machine funnels through here, so this is where an
         // ordinary store by any observer breaks a reservation covering the
         // bytes it touches — AArch64's global monitor rule, RISC-V's write to
-        // the reservation set. One relaxed load with nothing outstanding; see
-        // `monitor` for the shape and the cost.
-        //
-        // Before the transfer rather than after: a store that then faults has
-        // still broken the reservation, which is a *spurious* clear and is
-        // exactly what both architectures permit. Clearing afterwards would
-        // mean threading the outcome of a split transfer back out of the loop
-        // to buy nothing.
+        // the reservation set. One acquire load with nothing outstanding; see
+        // `monitor` for the shape, the cost, and why it is told **twice**.
         //
         // Not for a debug access. `MemAttrs::debug` promises no side effects,
         // and a reservation a debugger silently dropped is one
         // (`ROADMAP.md` §15, invariant 5).
-        if !attrs.debug {
-            self.space.monitor.note_store(addr, total);
+        if attrs.debug {
+            return self.transfer(addr, src, attrs, width);
         }
+        self.space.monitor.note_store(addr, total);
+        let res = self.transfer(addr, src, attrs, width);
+        // And again, whatever the transfer returned. The first call is what
+        // makes a store that *faults* break the reservation anyway — a
+        // licensed spurious clear, and the reason the call was there alone.
+        // The second is what makes a store that *completes* break one taken
+        // while it was in flight, which is not spurious and not optional.
+        // `monitor`'s "the transfer is the window" has the interleaving and
+        // what is left after this.
+        self.space.monitor.note_store(addr, total);
+        res
+    }
+
+    /// [`SpaceView::write_span`] without the monitor: the bytes, run by run.
+    ///
+    /// A separate function because [`SpaceView::write_span`] has to bracket it,
+    /// and then **because it is faster**. `write` and `write_span` are both
+    /// `#[inline]`, so this loop used to be inlined into every caller of a
+    /// value store — where it is dead code, since a value store that fits one
+    /// entry never reaches it — and the caller paid for it in code size and
+    /// register pressure. Interleaved, pinned, best of five: `AddressSpace::`
+    /// `write` of one, two, four and eight bytes into RAM went from
+    /// 19.2/19.2/19.2/19.3 ns to 11.9/11.9/11.9/12.3, with the read path
+    /// unmoved at 13.4/13.8/14.3/15.4 either way as the control. Callgrind sees
+    /// none of it — 277 → 278 host instructions for the four-byte store, the
+    /// one extra being the second monitor consult — which is the signature of a
+    /// front-end effect rather than of work removed.
+    ///
+    /// The caller has already rejected a zero-length span and an address range
+    /// that wraps, so neither is checked again.
+    fn transfer(&self, addr: u64, src: &[u8], attrs: MemAttrs, width: Option<Width>) -> MemResult {
+        let total = src.len() as u64;
         let mut done = 0u64;
         let mut committed = false;
         while done < total {

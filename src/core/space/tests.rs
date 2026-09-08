@@ -2236,3 +2236,212 @@ fn a_zero_length_store_allocates_no_slack() {
     assert!(rom.is_empty());
     assert!(rom.as_bytes().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// A reservation taken inside a store's own transfer
+// ---------------------------------------------------------------------------
+
+/// A device that stands in for **another core taking a reservation while this
+/// store is in flight**.
+///
+/// The window `SpaceView::write_span` closes cannot be reached from one
+/// thread by luck and cannot be reached reliably from two, because it is a
+/// handful of host instructions wide. So it is reached on purpose: this sits
+/// at the head of the span a burst covers, and its `write` handler claims the
+/// granule that the *rest* of that same burst is about to overwrite. Every
+/// ordering the race needs is then fixed by construction — the claim is after
+/// the store told the monitor and before the store wrote the bytes — and the
+/// question the test asks is the architectural one:
+///
+/// > once this store has completed, may that reservation still stand?
+///
+/// It may not. DDI 0487 B2.9.2: "Any successful write to the marked block by
+/// any other observer in the shareability domain of the memory location is
+/// guaranteed to clear the marking." RISC-V Unprivileged ISA, `zalrsc`: "The
+/// `sc` must fail if a store to the reservation set from another hart can be
+/// observed to occur between the `lr` and the `sc`."
+#[derive(Debug)]
+struct Sibling {
+    /// Filled in once the mapping exists; `Weak` so the region does not keep
+    /// the space alive.
+    link: sync::Mutex<Option<(Weak<AddressSpace>, MonitorId)>>,
+    /// The guest-physical granule base the stand-in core claims.
+    granule: u64,
+    /// How many bursts have reached it.
+    hits: AtomicU64,
+}
+
+impl Sibling {
+    fn new(granule: u64) -> Sibling {
+        Sibling {
+            link: sync::Mutex::new(None),
+            granule,
+            hits: AtomicU64::new(0),
+        }
+    }
+
+    fn attach(&self, space: &Arc<AddressSpace>, id: MonitorId) {
+        *self.link.lock() = Some((Arc::downgrade(space), id));
+    }
+}
+
+impl MemOps for Sibling {
+    fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+        dst.fill(0);
+        Ok(())
+    }
+
+    fn write(&self, _offset: u64, _src: &[u8], attrs: MemAttrs) -> MemResult {
+        // A debug write must not make the machine do anything, this included.
+        if attrs.debug {
+            return Ok(());
+        }
+        // Copied out before anything outward happens, per the re-entrancy
+        // contract — `Bar` above has the long form of why.
+        let link = self.link.lock().clone();
+        if let Some((space, id)) = link
+            && let Some(space) = space.upgrade()
+        {
+            space.monitor().reserve(id, self.granule);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        AccessConstraints::ANY
+    }
+}
+
+/// Head region: the stand-in core. Tail region: the RAM whose first granule it
+/// claims. One burst across both is one store whose transfer contains a
+/// sibling's `LR`.
+fn sibling_machine(ram_len: u64, granule: u64) -> (Arc<AddressSpace>, Arc<Sibling>, MonitorId) {
+    const HEAD: u64 = 0x100;
+    let space = Arc::new(AddressSpace::new("race", 32));
+    let sibling = Arc::new(Sibling::new(granule));
+    let (_store, ram_region) = ram("ram", ram_len);
+    {
+        let mut topo = space.topology();
+        topo.map(Region::io("sibling", HEAD, sibling.clone()), 0)
+            .unwrap();
+        topo.map(ram_region, HEAD).unwrap();
+    }
+    // The RAM store is dropped here on purpose: the region holds it.
+    let id = space.monitor().register(3).expect("a free slot");
+    sibling.attach(&space, id);
+    (space, sibling, id)
+}
+
+#[test]
+fn a_reservation_taken_inside_a_store_does_not_survive_it() {
+    let (space, sibling, id) = sibling_machine(0x1000, 0x100);
+    let buf = vec![0xa5u8; 0x1100];
+
+    space.write_bytes(0, &buf, MemAttrs::DEFAULT).unwrap();
+
+    assert_eq!(sibling.hits.load(Ordering::Relaxed), 1, "the hook ran");
+    assert!(
+        !space.monitor().holds(id),
+        "the burst overwrote the granule after the reservation was claimed, so \
+         the reservation is not allowed to stand — a store-conditional against \
+         it would commit a value read before this store landed"
+    );
+    assert_eq!(space.monitor().outstanding(), 0);
+}
+
+#[test]
+fn a_reservation_taken_inside_a_store_that_then_faults_does_not_survive_it() {
+    // Same burst, run off the end of the mapping. The bytes that landed before
+    // the fault include the granule, so the same rule applies — and this is
+    // the path that would be missed by clearing only on the way out of a
+    // transfer that succeeded.
+    let (space, sibling, id) = sibling_machine(0x1000, 0x100);
+    let buf = vec![0xa5u8; 0x1800];
+
+    assert!(space.write_bytes(0, &buf, MemAttrs::DEFAULT).is_err());
+
+    assert_eq!(sibling.hits.load(Ordering::Relaxed), 1, "the hook ran");
+    assert!(!space.monitor().holds(id), "a partial store still stores");
+}
+
+#[test]
+fn a_store_that_faults_before_it_transfers_still_breaks_a_reservation() {
+    // The other half of the trade, and the reason the monitor is told on the
+    // way *in* as well: this store writes nothing at all, and the reservation
+    // is dropped anyway. Both architectures permit that — DDI 0487 B2.9.5,
+    // "The Exclusives monitor can be cleared at any time without an
+    // application-related cause"; RISC-V's `sc` "may fail ... occasionally for
+    // any reason" — and neither requires it, so it is a choice, made because a
+    // store that faults halfway is indistinguishable from here.
+    let (space, _sibling, id) = sibling_machine(0x1000, 0x100);
+    // Nothing is mapped at 0x2000, so this store writes no byte anywhere.
+    space.monitor().reserve(id, 0x2000);
+    assert!(space.monitor().holds(id));
+
+    assert!(
+        space
+            .write(0x2000, Width::U32, 0xdead_beef, MemAttrs::DEFAULT)
+            .is_err()
+    );
+    assert!(!space.monitor().holds(id));
+}
+
+#[test]
+fn a_debug_store_breaks_nothing_on_either_side_of_its_transfer() {
+    // `MemAttrs::debug` promises no side effects and a dropped reservation is
+    // one, so neither call may happen — including the one after the bytes.
+    let (space, sibling, id) = sibling_machine(0x1000, 0x100);
+    space.monitor().reserve(id, 0x100);
+    assert!(space.monitor().holds(id));
+
+    let buf = vec![0x5au8; 0x1100];
+    space.write_bytes(0, &buf, MemAttrs::DEBUG).unwrap();
+
+    assert_eq!(sibling.hits.load(Ordering::Relaxed), 0);
+    assert!(space.monitor().holds(id), "a debugger is not an observer");
+    // And the value form of the same access, which has its own fast path.
+    space
+        .write(0x100, Width::U32, 0x1234_5678, MemAttrs::DEBUG)
+        .unwrap();
+    assert!(space.monitor().holds(id));
+}
+
+#[test]
+fn a_store_that_misses_the_granule_leaves_it_alone_both_times() {
+    // The eventuality guarantee is what stops this being implemented by
+    // clearing everything on every store, and telling the monitor twice must
+    // not widen what one store breaks.
+    let (space, _sibling, id) = sibling_machine(0x1000, 0x100);
+    space.monitor().reserve(id, 0x800);
+
+    let buf = vec![0u8; 0x400];
+    space.write_bytes(0x200, &buf, MemAttrs::DEFAULT).unwrap();
+    assert!(space.monitor().holds(id), "0x200..0x600 misses 0x800");
+    space.write_bytes(0x808, &buf, MemAttrs::DEFAULT).unwrap();
+    assert!(space.monitor().holds(id), "0x808 is the next granule up");
+    space
+        .write(0x804, Width::U32, 0, MemAttrs::DEFAULT)
+        .unwrap();
+    assert!(!space.monitor().holds(id), "0x804 is inside it");
+}
+
+#[test]
+fn the_value_fast_path_closes_the_same_window() {
+    // `SpaceView::write` does not go through `write_span` when the whole
+    // access lands in one entry, which is every ordinary guest store — so it
+    // carries its own copy of the rule and needs its own evidence. The
+    // stand-in core claims the granule this store is *in*, from inside the
+    // handler the store is calling.
+    let (space, sibling, id) = sibling_machine(0x1000, 0);
+
+    space
+        .write(0, Width::U32, 0xdead_beef, MemAttrs::DEFAULT)
+        .unwrap();
+
+    assert_eq!(sibling.hits.load(Ordering::Relaxed), 1, "the hook ran");
+    assert!(
+        !space.monitor().holds(id),
+        "the store wrote the granule after the reservation was claimed"
+    );
+}
