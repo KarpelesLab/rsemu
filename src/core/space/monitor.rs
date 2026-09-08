@@ -179,39 +179,51 @@
 //!
 //! The store's bytes and the clear that follows them are still two events, so
 //! a store-conditional that consults the monitor between them commits against
-//! a granule that has just been written. That window is the tail of one
-//! transfer rather than the whole of it, and closing it needs the store and
-//! the clear to be one indivisible act — a bus lock on every store, which
-//! would serialise the machine, or a reentrancy story for the one every
-//! `STXR`, `LOCK` prefix and `LDADD` is already holding. It is the same
-//! residual [`BusLock`](super::BusLock) states for a plain store racing a
-//! locked read-modify-write, reached from the other end.
+//! a granule that has just been written. That is one of the two faces of a
+//! single residual — **a plain store takes no lock and asks no question** —
+//! and it is written down once, with the interleaving, the manuals' position
+//! on whether such a guest is well defined, the measured rate and the measured
+//! price of closing it, in `docs/techniques/memory-models.md`, "Not kept: a
+//! plain store against another master's atomic".
 //!
-//! `core::space::tests` pins the part that is closed rather than the part that
-//! is not, because that part is deterministic: a device at the head of a
-//! burst's span claims the granule the rest of the same burst overwrites, so
-//! every ordering the race needs is fixed by construction instead of raced
-//! for. `a_reservation_taken_inside_a_store_does_not_survive_it` and its
-//! faulting and value-store variants fail on the single-call order every time
-//! and pass on this one.
+//! The short of it: this face is a couple of nanoseconds wide for a value
+//! store and as wide as the rest of the burst for a span transfer, the other
+//! face — a plain store landing between a store-conditional's decision and its
+//! write, which is [`BusLock`](super::BusLock)'s — is an order of magnitude
+//! commoner, and closing either means every store in the machine taking the
+//! bus lock, measured at +144% on the store path and a ninefold collapse of
+//! aggregate store throughput at eight masters.
 //!
-//! # Why the pair needs no protection against a *plain* store
+//! `core::space::tests` pins both halves deterministically rather than racing
+//! for them, because a device at the head of a burst's span can be made to
+//! claim the granule the rest of the same burst overwrites, which fixes every
+//! ordering by construction. The closed part is
+//! `a_reservation_taken_inside_a_store_does_not_survive_it` and its faulting
+//! and value-store variants; the part that is not is
+//! `a_store_conditional_inside_a_burst_can_still_see_a_written_granule`.
 //!
-//! [`BusLock`](super::BusLock) has a residual it states in its own
-//! documentation: a plain store by another observer can land inside a locked
-//! read-modify-write's window. The load-reserved pair has no such residual, and
-//! the reason is worth stating because it is not obvious — it is the same
-//! optimism that makes this object cheap.
+//! # What the pair *is* protected from against a plain store, and what it is not
 //!
-//! A plain store that lands between the `LR` and the `SC` has, by definition,
-//! written the reservation granule, so by the time it returns it has cleared
-//! the slot — that is "The transfer is the window" above, and its residual is
-//! the residual here too — and the `SC` fails. That covers the case where the store lands *inside the `LR`'s own
-//! bytes* as well: [`RamStore`](super::RamStore) accesses byte by byte, so an
-//! `LR` racing a wide store can read a value that was never in memory
-//! (`space::store`, "What per-byte atomicity is not") — but the store broke the
-//! reservation on its way past, so the `SC` cannot commit anything derived from
-//! that value and the guest's retry loop takes it again.
+//! This section used to be headed "why the pair needs no protection against a
+//! plain store" and it claimed that [`BusLock`](super::BusLock)'s residual — a
+//! plain store landing inside a locked read-modify-write — had no counterpart
+//! here. That claim was wrong, and the reproducer in
+//! `docs/techniques/memory-models.md` loses **112 to 2 416 updates of 814 to
+//! 4 786 committed store-conditionals**, in every one of twenty sequential and
+//! six parallel runs, to exactly the counterpart. What follows is the half that
+//! *is* true, which is worth keeping because it is not obvious, and then the
+//! half that is not.
+//!
+//! **True: a plain store that lands between the `LR` and the `SC`'s decision
+//! cannot be committed over.** It has, by definition, written the reservation
+//! granule, so by the time it returns it has cleared the slot — that is "The
+//! transfer is the window" above — and the `SC` fails. That covers the case
+//! where the store lands *inside the `LR`'s own bytes* as well:
+//! [`RamStore`](super::RamStore) accesses byte by byte, so an `LR` racing a
+//! wide store can read a value that was never in memory (`space::store`, "What
+//! per-byte atomicity is not") — but the store broke the reservation on its way
+//! past, so the `SC` cannot commit anything derived from that value and the
+//! guest's retry loop takes it again.
 //!
 //! **The commit is protected; the value is not**, and an earlier draft of this
 //! paragraph said "the torn read is discarded before it is architecturally
@@ -224,12 +236,22 @@
 //! round again; a sequence that faulted on a pointer it had just torn would
 //! be inside its rights to complain, and no such sequence is in the tree.
 //!
-//! So the gap `tests/smp_single_copy_atomicity.rs` measures is x86's alone
-//! **in its read-modify-write form**, which is precisely why it shows up
-//! against the bus lock and not here. The gap itself is nobody's alone: a plain
-//! wide *load* on AArch64 or RISC-V has no backstop at all and tears exactly as
-//! it does on x86. That is the store's property, not this one's, and calling it
-//! "x86's" is a mis-reading this paragraph exists to prevent.
+//! **Not true: that the protection extends past the decision.** The `SC`'s
+//! consultation of the monitor and the `SC`'s write are two acts, and a plain
+//! store landing between them is committed over — the slot clear arrives after
+//! the answer has been given and changes nothing. That is the *same* residual
+//! [`BusLock`](super::BusLock) states, not a counterpart to it: both are "a
+//! plain store takes no lock and asks no question", and both are written down
+//! once in `docs/techniques/memory-models.md`, "Not kept: a plain store against
+//! another master's atomic", with the interleaving, the manuals, the rate and
+//! the price.
+//!
+//! What *is* x86's alone is the shape `tests/smp_single_copy_atomicity.rs`
+//! measures — a torn read that is the read half of an instruction the
+//! architecture requires to be indivisible. The tearing itself is nobody's
+//! alone: a plain wide *load* on AArch64 or RISC-V has no backstop and tears
+//! exactly as it does on x86. That is the store's property, not this one's, and
+//! calling it "x86's" is a mis-reading this paragraph exists to prevent.
 //!
 //! # It is derived state and it is not serialized
 //!

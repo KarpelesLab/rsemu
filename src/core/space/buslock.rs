@@ -167,20 +167,46 @@
 //!
 //! Locked against locked, and that is the honest claim. A **plain** store by
 //! another observer can still land between the read and the write of a locked
-//! read-modify-write, where hardware would have held it off. Closing that
-//! would mean every store in the machine taking this lock — serialising the
-//! whole fabric to buy something no real guest asks for, because a plain store
-//! racing a locked read-modify-write on the same word is a data race in the
-//! *guest's* own terms: every spinlock, refcount and futex has `LOCK` on both
-//! sides of the contention. Devices and DMA are the same case, left the same
-//! way.
+//! read-modify-write, where hardware would have held it off — and between a
+//! store-conditional's consultation of the exclusive monitor and its own write,
+//! which is the same window reached through the other object. Devices and DMA
+//! are the same case, left the same way.
 //!
-//! The shape that would close it without a cost on the store path is to
-//! compose the two objects — reserve the granule in the monitor before the
-//! read, check it still holds before the write, reissue when it does not — and
-//! it is written down here rather than built because a reissue re-runs the
-//! side effects of an MMIO operand, which is a worse failure than the one it
-//! fixes.
+//! One residual, then, not two, and it is written down once — the interleaving,
+//! what the manuals say about whether an affected guest is well defined, the
+//! measured rate and the measured price of closing it — in
+//! `docs/techniques/memory-models.md`, "Not kept: a plain store against another
+//! master's atomic". [`ExclusiveMonitor`](super::ExclusiveMonitor)'s "What is
+//! left" is the same pointer from the other end.
+//!
+//! **Two claims this section used to make are withdrawn**, because a later
+//! round measured them and they were false.
+//!
+//! * "No real guest asks for it, because a plain store racing a locked
+//!   read-modify-write on the same word is a data race in the guest's own
+//!   terms." It is not a data race in anyone's terms. *Intel SDM* volume 3
+//!   §9.1.2.2 gives the `LOCK#` signal "exclusive use of any shared memory
+//!   while the signal is asserted" — against every other access, not only
+//!   against another locked one — and RISC-V's atomicity axiom and Arm's
+//!   global-monitor guarantee say the same for the pair. At the source level
+//!   `AtomicU64::store(v, Relaxed)` lowers to a plain `mov`/`str`/`sd` and
+//!   `compare_exchange_weak` lowers to a locked instruction or an `LR`/`SC`
+//!   loop, and racing the two on one atomic is well-defined C++ and Rust that
+//!   the model requires to work.
+//! * That the residual was rare. In the reproducer the doc records it costs
+//!   **112 to 2 416 updates of 814 to 4 786 committed store-conditionals**, in
+//!   twenty of twenty sequential and six of six parallel runs.
+//!
+//! What survives unchanged is the *decision*: closing it means every store in
+//! the machine taking this lock, which measures at +144% on the store path and
+//! a ninefold collapse of aggregate store throughput at eight masters, and that
+//! is not a price the emulator pays for a mode nothing selects by default.
+//!
+//! The shape that would close it without a cost on the store path is to compose
+//! the two objects — reserve the granule in the monitor before the read, check
+//! it still holds before the write, reissue when it does not — and it is
+//! written down here rather than built because a reissue re-runs the side
+//! effects of an MMIO operand, which is a worse failure than the one it fixes.
 //!
 //! ## Which threading mode can see it
 //!
@@ -216,9 +242,12 @@
 //!
 //! ## The sharper form, with a number
 //!
-//! Stated as a lost update the residual is nearly impossible to catch: the
-//! value left behind is one some legal ordering could also have produced. It
-//! has a second form that is unmistakable. [`RamStore`](super::RamStore) is a
+//! Stated as a lost update the residual takes a detector to catch — the value
+//! left behind looks like one a legal ordering could have produced, and it
+//! takes a writer publishing each value only after its store has *returned*,
+//! plus a read-back, to prove otherwise. The doc named above builds that
+//! detector. There is also a second form that needs none of it.
+//! [`RamStore`](super::RamStore) is a
 //! `Vec<AtomicU8>` and every access to it is a **byte loop**, so a plain
 //! four-byte store is four independent stores — and a locked instruction's read
 //! that overlaps one comes back holding a *mixture of the old and the new

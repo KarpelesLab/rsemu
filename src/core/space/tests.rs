@@ -2619,3 +2619,161 @@ fn the_value_fast_path_closes_the_same_window() {
         "the store wrote the granule after the reservation was claimed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The residual, reached on purpose
+// ---------------------------------------------------------------------------
+
+/// A device that stands in for **another core consulting the monitor while
+/// this store is still in flight** — the `SC` half, where [`Sibling`] is the
+/// `LR` half.
+///
+/// It records the answer rather than asserting it, because the answer is the
+/// thing under test.
+#[derive(Debug)]
+struct LateObserver {
+    /// Filled in once the mapping exists; `Weak` so the region does not keep
+    /// the space alive.
+    link: sync::Mutex<Option<(Weak<AddressSpace>, MonitorId)>>,
+    /// Whether the reservation still stood the last time this was written.
+    stood: AtomicU64,
+    /// How many bursts have reached it.
+    hits: AtomicU64,
+}
+
+impl LateObserver {
+    fn new() -> LateObserver {
+        LateObserver {
+            link: sync::Mutex::new(None),
+            stood: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+        }
+    }
+
+    fn attach(&self, space: &Arc<AddressSpace>, id: MonitorId) {
+        *self.link.lock() = Some((Arc::downgrade(space), id));
+    }
+}
+
+impl MemOps for LateObserver {
+    fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+        dst.fill(0);
+        Ok(())
+    }
+
+    fn write(&self, _offset: u64, _src: &[u8], attrs: MemAttrs) -> MemResult {
+        // A debug write must not make the machine do anything, this included.
+        if attrs.debug {
+            return Ok(());
+        }
+        // Copied out before anything outward happens, per the re-entrancy
+        // contract.
+        let link = self.link.lock().clone();
+        if let Some((space, id)) = link
+            && let Some(space) = space.upgrade()
+        {
+            self.stood
+                .store(u64::from(space.monitor().holds(id)), Ordering::Relaxed);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        AccessConstraints::ANY
+    }
+}
+
+#[test]
+fn a_store_conditional_inside_a_burst_can_still_see_a_written_granule() {
+    // **This test asserts a residual, not a guarantee**, and it is the only
+    // one in the file that does. `docs/techniques/memory-models.md`, "Not kept:
+    // a plain store against another master's atomic", is the authoritative
+    // account: a plain store takes no lock and asks no question, so its bytes
+    // and the `note_store` that follows them are two events, and an `SC` that
+    // consults the monitor between them commits against a granule that has
+    // just been written.
+    //
+    // Racing for that window is hopeless — for a value store it is a couple of
+    // nanoseconds wide — so it is fixed by construction instead, in the same
+    // way `Sibling` fixes the window that *is* closed. One burst crosses three
+    // regions: a stand-in core that claims a granule in the RAM behind it
+    // (after the leading `note_store`, so the claim survives it), the RAM
+    // itself (whose bytes overwrite that granule), and a second stand-in that
+    // asks whether the reservation still stands — which is what an `SC` on
+    // another host thread would be doing at that instant, and it is before the
+    // trailing `note_store` has run.
+    //
+    // If this ever starts failing, the residual is closed: delete the test and
+    // the ledger entry it names, do not weaken the assertion.
+    const HEAD: u64 = 0x100;
+    const RAM: u64 = 0x1000;
+    let space = Arc::new(AddressSpace::new("residual", 32));
+    let sibling = Arc::new(Sibling::new(HEAD));
+    let observer = Arc::new(LateObserver::new());
+    let (_store, ram_region) = ram("ram", RAM);
+    {
+        let mut topo = space.topology();
+        topo.map(Region::io("sibling", HEAD, sibling.clone()), 0)
+            .unwrap();
+        topo.map(ram_region, HEAD).unwrap();
+        topo.map(Region::io("observer", 0x100, observer.clone()), HEAD + RAM)
+            .unwrap();
+    }
+    // The RAM store is dropped here on purpose: the region holds it.
+    let id = space.monitor().register(3).expect("a free slot");
+    sibling.attach(&space, id);
+    observer.attach(&space, id);
+
+    let buf = vec![0xa5u8; (HEAD + RAM + 0x100) as usize];
+    space.write_bytes(0, &buf, MemAttrs::DEFAULT).unwrap();
+
+    assert_eq!(sibling.hits.load(Ordering::Relaxed), 1, "the `LR` hook ran");
+    assert_eq!(
+        observer.hits.load(Ordering::Relaxed),
+        1,
+        "the `SC` hook ran"
+    );
+    assert_eq!(
+        observer.stood.load(Ordering::Relaxed),
+        1,
+        "the reservation still stood when the store-conditional consulted it, \
+         after this same store had already written the granule — the residual"
+    );
+    // And it is gone by the time the store returns, which is the half that is
+    // closed and the reason the window is the tail of a transfer rather than
+    // the whole of a machine's execution.
+    assert!(!space.monitor().holds(id));
+}
+
+#[test]
+fn a_debug_burst_reaches_no_hook_on_either_side() {
+    // The `MemAttrs::debug` promise has to survive the pair of hooks above as
+    // well: a debugger's burst may not claim, break, or even *observe* through
+    // a device handler, because the handler is what would have side effects.
+    const HEAD: u64 = 0x100;
+    const RAM: u64 = 0x1000;
+    let space = Arc::new(AddressSpace::new("residual", 32));
+    let sibling = Arc::new(Sibling::new(HEAD));
+    let observer = Arc::new(LateObserver::new());
+    let (_store, ram_region) = ram("ram", RAM);
+    {
+        let mut topo = space.topology();
+        topo.map(Region::io("sibling", HEAD, sibling.clone()), 0)
+            .unwrap();
+        topo.map(ram_region, HEAD).unwrap();
+        topo.map(Region::io("observer", 0x100, observer.clone()), HEAD + RAM)
+            .unwrap();
+    }
+    let id = space.monitor().register(3).expect("a free slot");
+    sibling.attach(&space, id);
+    observer.attach(&space, id);
+    space.monitor().reserve(id, HEAD);
+
+    let buf = vec![0xa5u8; (HEAD + RAM + 0x100) as usize];
+    space.write_bytes(0, &buf, MemAttrs::DEBUG).unwrap();
+
+    assert_eq!(sibling.hits.load(Ordering::Relaxed), 0);
+    assert_eq!(observer.hits.load(Ordering::Relaxed), 0);
+    assert!(space.monitor().holds(id), "a debugger is not an observer");
+}
