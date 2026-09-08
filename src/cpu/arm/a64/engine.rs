@@ -167,8 +167,8 @@
 //! `Exec::publish_timer_levels` is then called once per [`advance`] for the
 //! same reason it is called once per `Exec::step`.
 //!
-//! [`leave_at`] is the other half, and it took a third divergence to find:
-//! that edge is asked for **after** [`admit`] has looked for a pending
+//! [`Admitted::leave`] is the other half, and it took a third divergence to
+//! find: that edge is computed **after** [`admit`] has looked for a pending
 //! interrupt and then charged the entry translation, so a walk between the two
 //! can cross the comparator with nobody left to notice. `Exec::timer_edge`
 //! answers [`u64::MAX`] for an already-crossed comparator, which is the right
@@ -177,6 +177,13 @@
 //! a `TLBI` — on the same instruction a timer fires on, which the synthetic
 //! workload in `tests/engine_longrun.rs` reaches in 0.417 s of guest time and
 //! a forty-second arm64 Linux boot does not reach at all.
+//!
+//! That started life as a four-line `leave_at` beside [`Host::new`], which
+//! could only see the *first* block of a run and could only see the *timer*.
+//! It is now the same question [`admit`] asks for the other two cores, at
+//! every block boundary and about every interrupt: a walk's reads are as
+//! capable of raising one as a walk's ticks, and a translation table over a
+//! device is where that happens. See [`admit`].
 //!
 //! # Self-modifying code, and the one case that is not covered
 //!
@@ -611,6 +618,14 @@ struct Admitted {
     /// byte the lifter may read.
     page: u64,
     base: u64,
+    /// Whether the **entry translation itself** raised an interrupt, so this
+    /// block must leave at its first guest instruction boundary.
+    ///
+    /// [`admit`]'s two halves are asked in this order and cannot be swapped:
+    /// the interrupt question decides whether a block runs at all, and the
+    /// translation is what names it. So there is a window between them, and a
+    /// translation-table walk lives in it — see [`admit`]'s own docs.
+    leave: bool,
 }
 
 /// Whether a block may run at `pc`, and what it costs to find out.
@@ -663,16 +678,78 @@ enum Admit {
 /// would have stopped on, because `Cpu::run_budget` runs an instruction
 /// exactly while `used < allowance`. The stopping point is now equal by
 /// construction rather than by a bound being conservative enough.
+///
+/// # The window between the two, and [`Admitted::leave`]
+///
+/// The order above means the interrupt inputs are looked at and *then* the
+/// entry translation runs, so anything the translation does to those inputs
+/// happens after the last look. A translation that hits the TLB does nothing
+/// at all — but a **miss walks the translation tables**, and that walk can
+/// move the answer in two separate ways.
+///
+/// * **Its ticks.** They are charged to this core's own cycle counter, which
+///   is what the generic timer is counted off, so three or four of them can
+///   cross a comparator the check a moment earlier found un-crossed. That is
+///   the defect this file found first, and
+///   `the_generic_timer_is_taken_at_the_same_instruction_across_a_tlbi` is it:
+///   only a cold *instruction-fetch* translation charges them, and `mmu::Tlb`
+///   keeps fetch, load and store entries in three separate sets, so a `TLBI`
+///   or a guest executing from more pages than the fetch set holds are the
+///   only ways in (`docs/testing/long-run.md`).
+/// * **Its reads.** A descriptor read is an ordinary physical access that the
+///   address space answers however the board decided, so a translation table
+///   over a lazily-advanced device is a device read — the same thing
+///   `cpu::riscv::engine`'s and `cpu::x86::engine`'s `IrHost::load` had to
+///   start asking about. Neither `arm.gic` nor anything else on `arm64-virt`
+///   accepts the `Width::U64` a descriptor read carries, so this half is
+///   unreachable *on those boards*; nothing about the core or the address
+///   space enforces it, `TTBR0_EL1` is a guest-written register with no range
+///   check, and the other two cores' boards are not so lucky.
+///
+/// Both are one question — *"is an interrupt pending that was not pending a
+/// moment ago"* — and the cost of asking it is one comparison of `Exec::used`
+/// against itself, because **only a walk charges**: on a hit, with the MMU
+/// off, and on every warm block the count is unchanged and
+/// `Exec::pending_interrupt` is never asked a second time. That gate is also
+/// what keeps a `true` answer from being a throughput cliff, and it is
+/// stricter than the one `leave_at` used: a comparator stays crossed until the
+/// guest re-arms it, so *"an interrupt is pending"* on its own describes long
+/// stretches of ordinary code, while *"a walk just happened and now one is"*
+/// describes the boundary the interpreter would have stopped at.
+///
+/// [`Host::hand_back`] is what a `true` answer does, and it leaves the run at
+/// the boundary **after one retired instruction** — because `ir::Interp` never
+/// asks [`IrHost::spent`] at a block's first boundary and `jit::dispatch` never
+/// asks at a run's first block. That is exactly `Exec::step_once`: charge the
+/// fetch, run the instruction, take the interrupt on the next call.
+///
+/// # The one exit that is still not covered
+///
+/// [`Admitted::leave`] answers for a block that runs. It cannot answer for the
+/// third way out of this function: a **known-unliftable PC on a cold page**,
+/// where the walk happens, raises, and then `subset.get` sends the instruction
+/// to `Exec::step_once` — whose own first act is to take the pending
+/// interrupt, so the instruction never runs and `ELR_EL1` names it rather than
+/// its successor. An interpreted core would have run it: its step looked at
+/// the wire *before* its fetch charged the walk. Reachable by the timer here,
+/// not only by a device.
+///
+/// It is the same window, and closing it needs something this file does not
+/// have: a way to ask `Exec` for one step with the interrupt check already
+/// discharged.
 fn admit(cfg: &Config, subset: &mut Subset, exec: &mut Exec<'_>, pc: u64) -> Admit {
     if exec.pending_interrupt().is_some() || exec.st.wfi {
         return Admit::Interpret;
     }
     let translating = exec.st.sys.mmu_enabled();
     let strict_align = exec.st.sys.sctlr & sctlr::A != 0;
+    let charged = exec.used;
     let phys = match exec.translate_fetch(pc) {
         Ok(phys) => phys,
         Err(trap) => return Admit::Trap(trap),
     };
+    // A walk, and only a walk, can have moved the answer above.
+    let leave = exec.used != charged && exec.pending_interrupt().is_some();
     let world = World {
         features: cfg.features,
         origin: key_origin(translating, phys),
@@ -692,6 +769,7 @@ fn admit(cfg: &Config, subset: &mut Subset, exec: &mut Exec<'_>, pc: u64) -> Adm
         key,
         page: pc & !PAGE_MASK,
         base: phys & !PAGE_MASK,
+        leave,
     })
 }
 
@@ -772,6 +850,13 @@ pub(super) fn advance(
     };
 
     let mut host = Host::new(&mut exec, pc, remaining);
+    if front.at.leave {
+        // The entry translation walked, and the walk raised the interrupt.
+        // One instruction retires and the run hands the boundary back, which
+        // is what `Exec::step_once` does: it charges the fetch, runs the
+        // instruction, and takes the interrupt on its next call.
+        host.hand_back();
+    }
     let run = match disp.run(&mut front, &mut host, pc, CHAIN) {
         Ok(run) => run,
         // This frontend refuses no world, so this is unreachable; degrade
@@ -1036,6 +1121,16 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         // `advance` would have seen.
         let entry = match admit(self.cfg, self.subset, host.exec, pc) {
             Admit::Ready(at) => {
+                if at.leave {
+                    // The same window as the prologue's, at a chained
+                    // boundary: `Dispatcher::run` asked [`IrHost::spent`]
+                    // before this call and the walk below it raised the
+                    // interrupt, so the answer has changed since. `timer_edge`
+                    // does not need the same treatment — it is an absolute
+                    // cycle count, so a walk that pushes the counter past it
+                    // is caught by the very next boundary's comparison.
+                    host.hand_back();
+                }
                 self.at = at;
                 Entry::Ready
             }
@@ -1159,13 +1254,21 @@ struct Host<'a, 'e> {
     /// what the seam costs: it is read once per boundary on the hot path, so
     /// anything computed here would be felt.
     allowance: u64,
-    /// The cycle count at which this run must leave — [`leave_at`], asked
-    /// once per run because a block cannot write the registers it is computed
-    /// from.
+    /// The cycle count at which this core's own generic timer reaches its
+    /// comparator — `Exec::timer_edge`, asked once per run because a block
+    /// cannot write the registers it is computed from.
     ///
     /// The second half of [`IrHost::spent`], and it is here for the same
     /// reason `allowance` is: a field read at every guest instruction
     /// boundary, so the work that produced it happens once.
+    ///
+    /// It answers *"when do the timer's outputs next change"*, which is not
+    /// *"when must this run leave"* — the two part for a comparator that is
+    /// **already** crossed, where the first is [`u64::MAX`] and the second is
+    /// "at the first boundary". That case belongs to [`admit`] rather than to
+    /// this field: nothing but the entry translation can have crossed the
+    /// comparator since `admit` last looked, and [`Admitted::leave`] is what
+    /// `admit` says so with.
     timer_edge: u64,
     slots: [u64; lift::SLOT_COUNT as usize],
     /// The trap the memory path raised, kept because [`IrHost::load`] can only
@@ -1178,60 +1281,29 @@ struct Host<'a, 'e> {
     dirty: DirtyPages,
 }
 
-/// The cycle count at which this run must hand the boundary back — what
-/// [`Host`]'s `timer_edge` field holds.
-///
-/// Ordinarily this is `Exec::timer_edge`: the cycle the generic timer's
-/// comparator is crossed on, which is the boundary an interpreted core would
-/// have taken the interrupt after.
-///
-/// # The case `Exec::timer_edge` cannot answer
-///
-/// That function reports [`u64::MAX`] when the comparator has **already** been
-/// crossed, and it is right to: its question is when the timer's outputs next
-/// *change*, and an output that is asserting cannot rise again. But the
-/// question [`IrHost::spent`] asks is when this run must **leave**, and for an
-/// interrupt that is already pending the answer is "at the first boundary",
-/// not "never".
-///
-/// The two only ever part inside one window, and it takes a `TLBI` to open it.
-/// [`admit`] asks `Exec::pending_interrupt` **before** `Exec::translate_fetch`,
-/// so the entry translation's own ticks are charged after the last look — and
-/// on a TLB miss that is a walk, three or four accesses, which is enough to
-/// cross a comparator that the check a moment earlier found un-crossed. Only a
-/// cold instruction-fetch translation charges them, and `mmu::Tlb` keeps fetch,
-/// load and store entries in three separate sets, so no amount of data-side
-/// pressure evicts a code page: a `TLBI` or a guest executing from more pages
-/// than the fetch set holds are the only ways in (`docs/testing/long-run.md`).
-///
-/// With `Exec::timer_edge` alone the run then took [`u64::MAX`] for its edge
-/// and no boundary inside it ever left, so the interrupt waited for the next
-/// *chained* boundary's `admit` — two guest instructions further on in the
-/// workload that found this, with `ELR_EL1` naming the wrong one. Returning the
-/// current count instead makes [`IrHost::spent`] true at the first boundary it
-/// is asked at, which — because `ir::Interp` never asks at a block's first
-/// boundary and `jit::dispatch` never asks at a run's first block — is the
-/// boundary *after* one retired instruction. That is exactly what the
-/// interpreter does: `Exec::step_once` charges the fetch, runs the
-/// instruction, and takes the interrupt on its next call.
-///
-/// Asking `Exec::pending_interrupt` rather than the timer condition alone is
-/// what keeps this from being a throughput cliff. A comparator stays crossed
-/// until the guest re-arms it, and on a board that routes the timer out to a
-/// GIC, or under a `PSTATE.I` the guest has set for a critical section, that
-/// can be a long stretch of code with no interrupt to take — and through all
-/// of it `pending_interrupt` is `None` and blocks run to their natural ends.
-/// Every input it reads is constant for the length of a run for the reason
-/// `Exec::timer_edge` gives: `DAIF` and the timer registers are written by
-/// `MSR`, no `MSR` is inside the lifted subset, and the routing is topology.
-fn leave_at(exec: &Exec<'_>) -> u64 {
-    match exec.timer_edge() {
-        u64::MAX if exec.pending_interrupt().is_some() => exec.st.cycles,
-        edge => edge,
-    }
-}
-
 impl<'a, 'e> Host<'a, 'e> {
+    /// Retire what is left of this run's `allowance`, so the block leaves at
+    /// its next guest instruction boundary.
+    ///
+    /// How an interrupt raised by the **entry translation** reaches
+    /// [`IrHost::spent`], and it costs that function nothing: a boundary
+    /// already compares `Exec::used` against `allowance`, and zero is the
+    /// value that comparison is always true for. The RISC-V and x86 engines
+    /// carry the identical two lines for the identical window; this core is
+    /// the one that found it, from the other side.
+    ///
+    /// The ticks are not lost. [`advance`] reports `Exec::used` and
+    /// `Cpu::run_budget` loops until *its* allowance is spent, so what this
+    /// gives up is the rest of the **run**, not the rest of the quantum —
+    /// which is right, because the rest of the quantum belongs to the
+    /// interpreter and to the interrupt it is about to take.
+    ///
+    /// [`Cpu::run_budget`]: super::Cpu::run_budget
+    #[inline]
+    fn hand_back(&mut self) {
+        self.allowance = 0;
+    }
+
     fn new(exec: &'a mut Exec<'e>, pc: u64, allowance: u64) -> Host<'a, 'e> {
         let mut slots = [0u64; lift::SLOT_COUNT as usize];
         slots[..31].copy_from_slice(&exec.st.x);
@@ -1243,7 +1315,7 @@ impl<'a, 'e> Host<'a, 'e> {
         slots[lift::V.0 as usize] = u64::from(flags.v());
         slots[PC.0 as usize] = pc;
         Host {
-            timer_edge: leave_at(exec),
+            timer_edge: exec.timer_edge(),
             exec,
             allowance,
             slots,
@@ -2914,7 +2986,7 @@ mod tests {
     }
 
     /// A loop that flushes its own translations, so the entry fetch after the
-    /// `TLBI` is a **cold walk** — the window [`leave_at`] closes.
+    /// `TLBI` is a **cold walk** — the window [`Admitted::leave`] closes.
     ///
     /// The `TLBI` is outside the lifted subset, so `advance` interprets it and
     /// returns; the next call starts at `0x0c` with nothing in the fetch set,
@@ -2931,34 +3003,33 @@ mod tests {
         0x17ff_fff9, // b    .-28
     ];
 
-    #[test]
-    fn the_generic_timer_is_taken_at_the_same_instruction_across_a_tlbi() {
-        // The defect [`leave_at`] exists for, and it is not the one the test
-        // above covers. There the comparator is crossed by a tick a *block*
-        // charged, and `IrHost::spent` sees it. Here it is crossed by the
-        // entry translation `admit` charges **after** it has looked for a
-        // pending interrupt and **before** `Host::new` computes the edge — and
-        // `Exec::timer_edge` answers `u64::MAX` for a comparator already
-        // crossed, so the run took that for its edge and no boundary inside it
-        // ever left. The interrupt waited for the next chained boundary's
-        // `admit`, two guest instructions further on.
-        //
-        // It takes a cold *instruction-fetch* translation to open, which on
-        // this core only a `TLBI` produces — `mmu::Tlb` keeps fetch, load and
-        // store entries in three separate sets, so no amount of data-side
-        // pressure evicts a code page. `tests/engine_longrun.rs` reaches it
-        // from a synthetic guest in 0.417 s and a forty-second arm64 Linux
-        // boot does not reach it at all, which is why this sweeps the arming
-        // offset instead of naming one: `Config::cortex_a53` divides the
-        // counter by one, so every tick is a comparator and the walk is two or
-        // three of them wide. Somewhere in the sweep the edge lands inside it.
+    /// The body of the two tests below: arm the comparator at every offset
+    /// in a sweep, and require the two engines to take the interrupt at the
+    /// same instruction whichever cold walk the edge lands inside.
+    ///
+    /// `Config::cortex_a53` divides the counter by one, so every tick is a
+    /// comparator and a walk is two or three of them wide. Somewhere in the
+    /// sweep the edge lands inside one — which is why this sweeps rather
+    /// than naming an offset.
+    fn timer_across_a_cold_walk(program: &[u32], tail: &[u32]) {
         for engine in [Engine::Jit, Engine::JitHost] {
             let mut taken = 0usize;
             for delta in 0..48u64 {
-                let interp = core(Engine::Interp, &TLBI_LOOP);
-                let jit = core(engine, &TLBI_LOOP);
+                let interp = core(Engine::Interp, program);
+                let jit = core(engine, program);
                 for cpu in [&interp, &jit] {
                     let space = cpu.space().expect("the core has its space");
+                    // The second page, where there is one.
+                    for (n, word) in tail.iter().enumerate() {
+                        space
+                            .write(
+                                0x1000 + 4 * n as u64,
+                                Width::U32,
+                                u64::from(*word),
+                                MemAttrs::DEFAULT,
+                            )
+                            .expect("inside RAM");
+                    }
                     // The same handler the test above installs: mask the
                     // source, then stop, so `ELR_EL1` records where the
                     // interrupt was taken rather than converging on the
@@ -3035,6 +3106,240 @@ mod tests {
             assert!(
                 taken > 0,
                 "the timer never fired under {engine:?}, so this proves nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generic_timer_is_taken_at_the_same_instruction_across_a_tlbi() {
+        // The defect [`Admitted::leave`] exists for, and it is not the one the test
+        // above covers. There the comparator is crossed by a tick a *block*
+        // charged, and `IrHost::spent` sees it. Here it is crossed by the
+        // entry translation `admit` charges **after** it has looked for a
+        // pending interrupt and **before** `Host::new` computes the edge — and
+        // `Exec::timer_edge` answers `u64::MAX` for a comparator already
+        // crossed, so the run took that for its edge and no boundary inside it
+        // ever left. The interrupt waited for the next chained boundary's
+        // `admit`, two guest instructions further on.
+        //
+        // It takes a cold *instruction-fetch* translation to open, which on
+        // this core only a `TLBI` produces — `mmu::Tlb` keeps fetch, load and
+        // store entries in three separate sets, so no amount of data-side
+        // pressure evicts a code page. `tests/engine_longrun.rs` reaches it
+        // from a synthetic guest in 0.417 s and a forty-second arm64 Linux
+        // boot does not reach it at all, which is why this sweeps the arming
+        // offset instead of naming one: `Config::cortex_a53` divides the
+        // counter by one, so every tick is a comparator and the walk is two or
+        // three of them wide. Somewhere in the sweep the edge lands inside it.
+        timer_across_a_cold_walk(&TLBI_LOOP, &[]);
+    }
+
+    /// [`TLBI_LOOP`] with its tail on the **next page**, so the walk the
+    /// timer has to be able to fire inside is a *chained* boundary's.
+    ///
+    /// `TLBI_LOOP` reaches `admit` through [`advance`]'s prologue and
+    /// nothing else: one page, one entry translation per run. The `b` here
+    /// leaves the page mid-chain, so the successor's entry translation
+    /// happens inside `Frontend::enter` instead — the same window at the
+    /// other call site, and the one a single-page loop cannot reach.
+    const TLBI_PAGE_LOOP: [u32; 5] = [
+        0x9100_0400, // add  x0, x0, #1
+        0x8b00_0021, // add  x1, x1, x0
+        0xd508_871f, // tlbi vmalle1        ; every pass makes both pages cold
+        0x8b01_0042, // add  x2, x2, x1
+        0x1400_03fc, // b    .+0xff0        ; to 0x1000, the next page
+    ];
+
+    /// The other page of [`TLBI_PAGE_LOOP`], at `0x1000`.
+    const TLBI_PAGE_LOOP_TAIL: [u32; 4] = [
+        0x8b02_0063, // add  x3, x3, x2
+        0x8b03_0084, // add  x4, x4, x3
+        0x8b04_00a5, // add  x5, x5, x4
+        0x17ff_fbfd, // b    .-0x100c       ; back to 0
+    ];
+
+    #[test]
+    fn the_generic_timer_is_taken_at_the_same_instruction_across_a_chained_page() {
+        // The other call site, and — for the *timer* — the one that needs no
+        // fix. `admit` runs from `advance`'s prologue and from
+        // `Frontend::enter`, and only the first is on a single-page loop: a
+        // chain that never leaves its page re-enters through a translation
+        // that hits. Here it does not, so the walk happens inside `enter`,
+        // after `Dispatcher::run` has already asked `IrHost::spent` for this
+        // block. `Host::timer_edge` covers it anyway, and that is the point
+        // worth pinning: it is an absolute cycle count, so a walk that pushes
+        // the counter past it is caught by the very next boundary's
+        // comparison rather than needing to be noticed when it happens.
+        // `Admitted::leave` is what the same call site needs for a line a
+        // walk's *reads* raise, which has no second chance — see
+        // `a_walk_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it`.
+        timer_across_a_cold_walk(&TLBI_PAGE_LOOP, &TLBI_PAGE_LOOP_TAIL);
+    }
+
+    /// A level-1 translation table that lives **in a device** rather than in
+    /// DRAM, and asserts this core's `IRQ` line on the `at`-th walk that reads
+    /// it.
+    ///
+    /// The other half of the window [`Admitted::leave`] closes, and the half
+    /// the timer cannot reach. `TTBR0_EL1` is a guest-written register and
+    /// `mmu`'s walker masks it rather than range-checking it, and the
+    /// descriptors come back through the ordinary [`AddressSpace`] with
+    /// `MemAttrs::debug` clear, so whatever is mapped there answers.
+    ///
+    /// Nothing on `arm64-virt` can *be* that thing today, and it is worth
+    /// being exact about why: a descriptor read is always [`Width::U64`], and
+    /// `arm.gic`'s distributor accepts `U8`..`U32` and its CPU interface only
+    /// `U32`, so a walk over `GICC_IAR` takes an external abort instead of
+    /// acknowledging an interrupt. That is a width constraint on one device on
+    /// one board, not a property of this core — `riscv.clint` and `pc.hpet`
+    /// both take the width their architecture's walk uses — so the engine
+    /// closes the window rather than leaning on it.
+    #[derive(Debug)]
+    struct TableThatRaises {
+        cpu: crate::core::sync::Mutex<alloc::sync::Weak<Cpu>>,
+        /// How many walks have read it, and which one raises.
+        seen: crate::core::sync::AtomicU64,
+        at: u64,
+    }
+
+    impl crate::core::space::MemOps for TableThatRaises {
+        fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+            // Only index 0 is ever asked for: a level-1 entry covers 1 GiB and
+            // every virtual address this fixture uses is in the first of them.
+            let word = if offset == 0 {
+                DEVICE_L2 | desc::VALID | desc::TABLE
+            } else {
+                0
+            };
+            for (i, byte) in dst.iter_mut().enumerate() {
+                *byte = (word >> (8 * i)) as u8;
+            }
+            if attrs.debug {
+                return Ok(());
+            }
+            if self.seen.fetch_add(1, crate::core::sync::Ordering::Relaxed) == self.at
+                && let Some(cpu) = self.cpu.lock().upgrade()
+            {
+                cpu.set_interrupt(Lines::IRQ, true);
+            }
+            Ok(())
+        }
+
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            Ok(())
+        }
+    }
+
+    /// Where [`TableThatRaises`] is mapped, and therefore what `TTBR0_EL1`
+    /// points at: just past the RAM, so nothing overlaps.
+    const DEVICE_L1: u64 = RAM;
+
+    /// The level-2 table [`TableThatRaises`]'s one descriptor points at, in
+    /// RAM. Its entry 0 is a 2 MiB identity block, which covers every page
+    /// this fixture uses.
+    const DEVICE_L2: u64 = 0x3_0000;
+
+    /// A core running [`TLBI_PAGE_LOOP`] whose level-1 table is a device.
+    fn walking_core(engine: Engine, at: u64) -> Arc<Cpu> {
+        let ram = Arc::new(RamStore::new(RAM));
+        write_words(&ram, 0, &TLBI_PAGE_LOOP);
+        write_words(&ram, 0x1000, &TLBI_PAGE_LOOP_TAIL);
+        // The handler `timer_across_a_cold_walk` installs: mask the source,
+        // then stop, so `ELR_EL1` records where the interrupt was taken.
+        write_words(&ram, VBAR + IRQ_VECTOR, &[0xd503_42df, 0x1400_0000]);
+        // Level 2, entry 0: a 2 MiB identity block.
+        write_words(&ram, DEVICE_L2, &[(desc::VALID | desc::AF) as u32, 0]);
+        let table = Arc::new(TableThatRaises {
+            cpu: crate::core::sync::Mutex::with_rank(
+                crate::core::sync::LockRank::LEAF,
+                alloc::sync::Weak::new(),
+            ),
+            seen: crate::core::sync::AtomicU64::new(0),
+            at,
+        });
+        let space = AddressSpace::new("mem", 64);
+        {
+            let mut topo = space.topology();
+            topo.map_with_perms(Region::ram("ram", ram), 0, Perms::RWX)
+                .expect("nothing else is mapped");
+            topo.map(
+                Region::io(
+                    "table",
+                    0x1000,
+                    Arc::clone(&table) as Arc<dyn crate::core::space::MemOps>,
+                ),
+                DEVICE_L1,
+            )
+            .expect("it does not overlap the RAM");
+        }
+        let cpu = Arc::new(Cpu::new(Config::cortex_a53().with_reset_vector(0)).with_engine(engine));
+        cpu.attach_space(Arc::new(space));
+        let mut sys = cpu.sysregs();
+        sys.ttbr0 = DEVICE_L1;
+        // T0SZ = T1SZ = 25 (39-bit halves), TG1 = 0b10 (the 4 KiB granule) —
+        // `enable_mmu`'s, so the walk starts at level 1 and the device's one
+        // descriptor is the top of it.
+        sys.tcr = 25 | (25 << 16) | (0b10 << 30);
+        sys.sctlr |= sctlr::M;
+        sys.daif = 0;
+        sys.vbar_el1 = VBAR;
+        cpu.set_sysregs(sys);
+        *table.cpu.lock() = Arc::downgrade(&cpu);
+        cpu
+    }
+
+    #[test]
+    fn a_walk_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it() {
+        // The half of the entry-translation window the generic timer cannot
+        // demonstrate. A walk whose *ticks* cross the comparator is caught at
+        // a chained boundary anyway, because `Host::timer_edge` is an absolute
+        // cycle count and the very next comparison sees it; a walk whose
+        // *reads* raise a line has no such second chance, and before
+        // `Admitted::leave` nothing looked between `Exec::pending_interrupt`
+        // and the block's first instruction. Sweeping which walk raises puts
+        // the line on `advance`'s prologue translation and on a chained
+        // boundary's in turn.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let mut taken = 0usize;
+            for at in 0..8u64 {
+                let interp = walking_core(Engine::Interp, at);
+                let jit = walking_core(engine, at);
+                for n in 0..6 {
+                    assert_eq!(
+                        interp.run_budget(4096),
+                        jit.run_budget(4096),
+                        "walk {at}, quantum {n} under {engine:?}"
+                    );
+                }
+                assert_eq!(
+                    interp.sysregs().elr_el1,
+                    jit.sysregs().elr_el1,
+                    "ELR_EL1 at walk {at} under {engine:?}: the two engines took \
+                     the interrupt at different instructions"
+                );
+                assert_eq!(interp.pc(), jit.pc(), "the pc at walk {at}");
+                assert_eq!(
+                    interp.cycles(),
+                    jit.cycles(),
+                    "the cycle counter at walk {at}"
+                );
+                assert_eq!(
+                    interp.cycle_debt(),
+                    jit.cycle_debt(),
+                    "the carried overrun at walk {at}"
+                );
+                for n in 0..31 {
+                    assert_eq!(interp.x(n), jit.x(n), "x{n} at walk {at}");
+                }
+                if interp.sysregs().elr_el1 != 0 {
+                    taken += 1;
+                }
+                let stats = jit.jit_stats().expect("a jit core");
+                assert!(stats.blocks > 0, "no block ran at walk {at}");
+            }
+            assert!(
+                taken > 0,
+                "the line never came up under {engine:?}, so this proves nothing"
             );
         }
     }

@@ -276,12 +276,27 @@
 //! it, the interpreter took the interrupt with `EAX` at zero and a translated
 //! core with `EAX` at nineteen.
 //!
-//! What is **not** covered, stated rather than discovered later: [`admit`]
-//! asks the pins before it charges the entry translation, so a page-table walk
-//! between the two is unwatched. On a PC that is empty — page tables live in
-//! DRAM — and it is the window `cpu::arm::a64::engine::leave_at` exists for on
-//! a core whose timer is counted off its own cycle counter. Neither is this
-//! core's shape: nothing here is driven off `Exec::used`.
+//! The third way in is the **entry translation itself**, and it is now closed
+//! rather than stated as not covered. [`admit`] asks the pins and *then*
+//! charges the entry translation, so a page-table walk between the two used to
+//! be unwatched — and a walk is not arithmetic, it is a physical read that the
+//! address space answers however the board decided. This paragraph used to end
+//! "on a PC that is empty — page tables live in DRAM", which is a statement
+//! about what a *guest* does: `CR3` is a guest-written register, `paging::walk`
+//! masks it and range-checks nothing, and the entries come back through
+//! `Exec::phys_read`. `machines/pc64.machine` is genuinely the empty case — it
+//! maps no MMIO at all — but every `pc-at` and `q35` board maps `pc.hpet` at
+//! `0xfed0_0000` on `U32` and `U64`, which are exactly the widths a legacy and
+//! an IA-32e descriptor read use, and `pc.lapic` at `0xfee0_0000` on `U32`,
+//! which a non-PAE walk uses. Both are lazily advanced, so answering catches
+//! the chip up and can drive a line.
+//!
+//! It is also the window `cpu::arm::a64::engine`'s `admit` closes from the
+//! other side — a walk whose own **ticks** cross a comparator, which is a
+//! shape this core does not have because nothing here is driven off
+//! `Exec::used`. [`Admitted::leave`] carries the answer: [`admit`] re-asks
+//! [`pins_pending`] when — and only when — the translation charged, and
+//! [`Host::hand_back`] does the rest.
 //!
 //! # Self-modifying code, and the gap that is left
 //!
@@ -692,6 +707,14 @@ struct Admitted {
     /// entry translation resolved it to. Equal with `CR0.PG` clear.
     linear_page: u64,
     frame: u64,
+    /// Whether the **entry translation itself** brought an interrupt pin up,
+    /// so this block must leave at its first guest instruction boundary.
+    ///
+    /// [`admit`]'s halves are asked in an order that cannot be swapped — the
+    /// pins decide whether a block runs at all and the translation is what
+    /// names it — so there is a window between them, and a page-table walk
+    /// lives in it. See [`admit`]'s own docs.
+    leave: bool,
 }
 
 /// Whether a block may run at `pc`.
@@ -745,6 +768,37 @@ fn pins_pending(lines: &Lines, iflag: bool) -> bool {
 /// interpreter's own fetch is about to walk those same tables. A successful
 /// one is different in exactly the way that matters: it filled the buffer, so
 /// the interpreter's fetch finds the entry and charges nothing.
+///
+/// # The window between the two, and [`Admitted::leave`]
+///
+/// The order means the pins are looked at and *then* the entry translation
+/// runs, so anything the translation does to them happens after the last look.
+/// A translation that hits the buffer does nothing at all — but a **miss walks
+/// the page tables**, and a descriptor read is an ordinary physical access
+/// that the address space answers however the board decided. Put a page table
+/// over `pc.hpet` or `pc.lapic`, both of which take the width a walk reads at
+/// and both of which are lazily advanced, and the walk brings `INTR` up
+/// between [`pins_pending`] and the block's first instruction — with nobody
+/// left to look, so the block runs to its natural end.
+///
+/// The cost of closing it is one comparison of `Exec::used` against a value
+/// this function already had for the roll-back path, because **only a walk
+/// charges**: a buffer hit returns before `Exec::phys_read` and an unpaged
+/// core never gets here at all.
+///
+/// # The one exit that is still not covered
+///
+/// [`Admitted::leave`] answers for a block that runs. It cannot answer for the
+/// third way out of this function: a **known-unliftable PC on a cold page**,
+/// where the walk happens, brings a pin up, and then `at.unlifted.holds` sends
+/// the instruction to `Exec::step` — whose own first act is to take the
+/// interrupt, so the instruction never runs and `RIP` names it rather than its
+/// successor. An interpreted core would have run it: its `step` looked at the
+/// pins *before* its fetch charged the walk.
+///
+/// It is the same window with the same reachability — the walk still has to
+/// read a device — and closing it needs something this file does not have: a
+/// way to ask `Exec` for one step with the pin check already discharged.
 fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
     // Everything `Exec::step` decides before it decodes, asked without taking
     // any of them: each is the interpreter's to take, and a block run first
@@ -790,12 +844,18 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
         return Admit::Interpret;
     }
 
+    let mut leave = false;
     let frame = if paged {
         let user = exec.cpl() == 3;
         let before = exec.state.cycles;
         let spent_before = exec.used;
         match exec.translate_access(linear, Access::fetch(user)) {
             Ok(phys) => {
+                // A walk, and only a walk, can have moved the answer the pins
+                // gave above: a buffer hit returns before `phys_read` and
+                // charges nothing, so the comparison is exact and free.
+                leave = exec.used != spent_before
+                    && pins_pending(lines, exec.state.regs.eflags & flags::IF != 0);
                 world.origin = Origin::Paged { phys };
                 phys & !PAGE_MASK
             }
@@ -829,6 +889,7 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
         smc,
         linear_page: linear & !PAGE_MASK,
         frame,
+        leave,
     }))
 }
 
@@ -892,6 +953,13 @@ pub(super) fn advance(
         rejected: None,
     };
     let mut host = Host::new(&mut exec, pc, &admitted, remaining);
+    if admitted.leave {
+        // The entry translation walked, and the walk brought a pin up. One
+        // instruction retires and the run hands the boundary back, which is
+        // what `Exec::step` does: it charges the fetch, runs the instruction,
+        // and takes the interrupt on its next call.
+        host.hand_back();
+    }
     let run = match disp.run(&mut front, &mut host, pc, CHAIN) {
         Ok(run) => run,
         // Nothing this frontend refuses is reachable from a world `World::of`
@@ -1136,6 +1204,13 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         match admit(self.bound, host.exec, pc) {
             Admit::Ready(at) => {
                 self.at = *at;
+                if self.at.leave {
+                    // The same window as the prologue's, at a chained
+                    // boundary: `Dispatcher::run` asked [`IrHost::spent`]
+                    // before this call and the walk below it raised a pin, so
+                    // the answer has changed since.
+                    host.hand_back();
+                }
                 // The host follows the block across a page: [`close_bus`] reads
                 // the last retired instruction's last byte back through the
                 // frame of whichever block retired it.
@@ -1487,6 +1562,7 @@ mod tests {
     use super::*;
     use crate::core::space::{RamStore, Region};
     use crate::cpu::x86::differential::{self, Case};
+    use crate::cpu::x86::paging::pte;
     use crate::cpu::x86::{Engine, X86};
 
     /// A core on `space`, in the world `case` describes, running on `engine`.
@@ -1631,6 +1707,234 @@ mod tests {
             );
             assert_eq!(interp.regs().rip, jit.regs().rip, "RIP under {engine:?}");
             assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+        }
+    }
+
+    /// A legacy page **directory** that lives in a device rather than in DRAM,
+    /// and asserts `INTR` on the `at`-th walk that reads it.
+    ///
+    /// Not a hypothetical shape. `CR3` is a guest-written register and
+    /// `paging::walk` masks it rather than range-checking it, and the entries
+    /// come back through `Exec::phys_read` — the ordinary address space, with
+    /// `MemAttrs::debug` clear — so whatever is mapped there answers and gets
+    /// to do what it likes. Every `pc-at` and `q35` board maps `pc.hpet` at
+    /// `0xfed0_0000` with constraints of `U32` and `U64`, which is exactly the
+    /// width of a legacy or an IA-32e descriptor read; the HPET is lazily
+    /// advanced, so answering catches it up to this core and requests a vector
+    /// for any comparator that expired. That is this device, with the
+    /// incidental parts removed.
+    #[derive(Debug)]
+    struct DirectoryThatRaises {
+        cpu: crate::core::sync::Mutex<alloc::sync::Weak<X86>>,
+        /// How many walks have read it, and which one raises.
+        seen: crate::core::sync::AtomicU64,
+        at: u64,
+    }
+
+    impl crate::core::space::MemOps for DirectoryThatRaises {
+        fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+            // Only index 0 is ever asked for: every linear address this
+            // fixture uses is below 4 MiB, so `linear >> 22` is zero.
+            let word = if offset == 0 {
+                differential::PTAB | pte::PRESENT | pte::WRITABLE
+            } else {
+                0
+            };
+            for (i, byte) in dst.iter_mut().enumerate() {
+                *byte = (word >> (8 * i)) as u8;
+            }
+            if attrs.debug {
+                return Ok(());
+            }
+            if self.seen.fetch_add(1, crate::core::sync::Ordering::Relaxed) == self.at
+                && let Some(cpu) = self.cpu.lock().upgrade()
+            {
+                cpu.set_intr_vector(0x20);
+                cpu.set_intr(true);
+            }
+            Ok(())
+        }
+
+        /// The walk's accessed-bit write-back lands here and is dropped, so
+        /// the bit never sticks and every walk writes it again. Deterministic,
+        /// identical under both engines, and deliberately silent: this fixture
+        /// is about what a *read* can do.
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            Ok(())
+        }
+    }
+
+    /// Where [`DirectoryThatRaises`] is mapped, and therefore what `CR3`
+    /// points at: just past the eight physical pages a paged case uses, so
+    /// nothing overlaps.
+    const PDIR_DEV: u64 = differential::BASE + differential::PAGED_RAM_SIZE;
+
+    /// A paged core whose page directory is [`DirectoryThatRaises`].
+    ///
+    /// The physical layout is `differential::machine`'s for a paged case —
+    /// the page table at [`differential::PTAB`], the four guest pages at
+    /// [`differential::PAGED_PROGRAM`] — with the *directory* moved out of
+    /// RAM and into the device. `map_pages`' own directory entry is the one
+    /// thing this does not write, because the device is it.
+    fn walking_core(engine: Engine, at: u64) -> Arc<X86> {
+        let case = Case::new(alloc::vec![])
+            .paged()
+            .with_eflags(flags::ALWAYS_SET | flags::IF);
+        let ram = Arc::new(RamStore::new(differential::PAGED_RAM_SIZE));
+        let put = |at: u64, bytes: &[u8]| {
+            for (n, byte) in bytes.iter().enumerate() {
+                ram.write_u8(at - differential::BASE + n as u64, *byte)
+                    .expect("inside the physical RAM");
+            }
+        };
+        put(differential::PAGED_PROGRAM, &INVLPG_LOOP);
+        put(differential::PAGED_PROGRAM + 0x1000, &INVLPG_LOOP_TAIL);
+        // The page table the device's one directory entry points at: the four
+        // guest pages, identity in the sense that matters — linear `BASE + k`
+        // pages onto physical `PAGED_PROGRAM + k` pages, which is what
+        // `differential::map_pages` writes.
+        let first = (differential::BASE >> 12) & 0x3ff;
+        for k in 0..differential::RAM_SIZE / 4096 {
+            let entry = (differential::PAGED_PROGRAM + k * 4096) | pte::PRESENT | pte::WRITABLE;
+            put(
+                differential::PTAB + 4 * (first + k),
+                &(entry as u32).to_le_bytes(),
+            );
+        }
+        let dir = Arc::new(DirectoryThatRaises {
+            cpu: crate::core::sync::Mutex::with_rank(
+                crate::core::sync::LockRank::LEAF,
+                alloc::sync::Weak::new(),
+            ),
+            seen: crate::core::sync::AtomicU64::new(0),
+            at,
+        });
+        let space = AddressSpace::new("mem", 32);
+        {
+            let mut topo = space.topology();
+            topo.map(Region::ram("ram", ram), differential::BASE)
+                .expect("one region maps");
+            topo.map(
+                Region::io(
+                    "directory",
+                    0x1000,
+                    Arc::clone(&dir) as Arc<dyn crate::core::space::MemOps>,
+                ),
+                PDIR_DEV,
+            )
+            .expect("it does not overlap the RAM");
+        }
+        let cpu = Arc::new(core(&case, Arc::new(space), engine));
+        let mut sys = cpu.sys();
+        sys.cr3 = PDIR_DEV;
+        cpu.set_sys(sys);
+        *dir.cpu.lock() = Arc::downgrade(&cpu);
+        cpu
+    }
+
+    /// A loop that flushes its own translations and then runs **across a page
+    /// boundary**, so both of the two places a cold walk can happen are on it.
+    ///
+    /// `INVLPG` is outside the lifted subset, so `advance` interprets it and
+    /// returns; the next call starts at `BASE + 0x0f` with nothing in the
+    /// translation buffer for this page and walks in [`admit`]'s **prologue**.
+    /// The `jmp` then leaves the page, and the successor's entry translation
+    /// is a second cold walk — this one inside `Frontend::enter`, at a
+    /// *chained* boundary, which is a different call site with the same
+    /// window.
+    ///
+    /// ```text
+    ///   top:                            ; linear BASE
+    ///     40                inc eax
+    ///     0f 01 3d 00100000 invlpg [0x1000]   ; the next page
+    ///     0f 01 3d 00000000 invlpg [0]        ; this one, from on top of it
+    ///     43                inc ebx
+    ///     43                inc ebx
+    ///     e9 ea0f0000       jmp  far          ; to BASE + 0x1000
+    /// ```
+    const INVLPG_LOOP: [u8; 22] = [
+        0x40, // inc eax
+        0x0f, 0x01, 0x3d, 0x00, 0x10, 0x00, 0x00, // invlpg [ds:0x1000]
+        0x0f, 0x01, 0x3d, 0x00, 0x00, 0x00, 0x00, // invlpg [ds:0]
+        0x43, // inc ebx
+        0x43, // inc ebx
+        0xe9, 0xea, 0x0f, 0x00, 0x00, // jmp BASE + 0x1000
+    ];
+
+    /// The other page of [`INVLPG_LOOP`], at linear `BASE + 0x1000`.
+    ///
+    /// ```text
+    ///   far:
+    ///     41 41 41          inc ecx  (three times)
+    ///     e9 f8efffff       jmp top
+    /// ```
+    const INVLPG_LOOP_TAIL: [u8; 8] = [
+        0x41, 0x41, 0x41, // inc ecx
+        0xe9, 0xf8, 0xef, 0xff, 0xff, // jmp BASE
+    ];
+
+    #[test]
+    fn a_walk_that_raises_intr_is_taken_where_the_interpreter_takes_it() {
+        // The window `admit` closes with `Admitted::leave`, and the one the
+        // module docs used to argue away with "on a PC that is empty — page
+        // tables live in DRAM". Where a *board* puts them is not the question:
+        // `CR3` is the guest's, and nothing between it and the bus says a
+        // descriptor has to come out of RAM.
+        //
+        // `admit` asks the pins and *then* charges the entry fetch
+        // translation, so the walk in between used to be unwatched: `INTR`
+        // came up, nothing looked again, and the block ran on to its natural
+        // end with `RIP` naming an instruction the interpreter had already
+        // passed. Sweeping which walk raises puts the interrupt on the
+        // prologue's translation and on a chained boundary's in turn.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let mut taken = 0usize;
+            for at in 0..8u64 {
+                let interp = walking_core(Engine::Interp, at);
+                let jit = walking_core(engine, at);
+                for n in 0..6 {
+                    let a = interp.run_budget(4_000);
+                    let b = jit.run_budget(4_000);
+                    assert_eq!(
+                        a, b,
+                        "walk {at}, quantum {n}: different budgets under {engine:?}"
+                    );
+                }
+                if interp.is_halted() {
+                    taken += 1;
+                }
+                assert_eq!(
+                    interp.regs().rip,
+                    jit.regs().rip,
+                    "walk {at} under {engine:?}: RIP {:#x} against {:#x}",
+                    interp.regs().rip,
+                    jit.regs().rip,
+                );
+                for r in 0..4u8 {
+                    assert_eq!(
+                        interp.regs().qword(r),
+                        jit.regs().qword(r),
+                        "walk {at}, register {r} under {engine:?}"
+                    );
+                }
+                assert_eq!(
+                    interp.cycles(),
+                    jit.cycles(),
+                    "walk {at}: cycles under {engine:?}"
+                );
+                assert_eq!(
+                    interp.is_halted(),
+                    jit.is_halted(),
+                    "walk {at}: whether the core stopped, under {engine:?}"
+                );
+                let stats = jit.jit_stats().expect("a JIT core keeps statistics");
+                assert!(stats.blocks > 0, "walk {at}: no block ran under {engine:?}");
+            }
+            assert!(
+                taken > 0,
+                "the fixture never took the interrupt under {engine:?}, so it \
+                 proves nothing"
+            );
         }
     }
 
