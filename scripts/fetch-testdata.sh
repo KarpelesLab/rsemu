@@ -919,6 +919,96 @@ ovmf_hint() {
 	note "              --test q35_uefi -- --nocapture"
 }
 
+# The *other* OVMF build: one with debug strings in it, for the port at 0x402.
+#
+# `fetch_ovmf` above copies whatever the distribution calls OVMF_CODE.fd, and on
+# every distribution checked that is a **RELEASE** build: `DEBUG()` is compiled
+# out of it, so it never touches `PcdDebugIoPort` and the board's `pc.debugcon`
+# has nothing to take. That is the image speaking rather than the board, and
+# `tests/q35_uefi.rs` reports it and passes — but it means the fetchable
+# firmware cannot exercise the debug console at all.
+#
+# What can is the 4 MiB pair that ships with the *qemu* firmware package —
+# `edk2-x86_64-code.fd` and `edk2-i386-vars.fd`, which are built with debug
+# strings and narrate the boot from the reset vector. Same licence, same
+# argument for copying rather than downloading, different file names, and 528 KiB
+# of variable store instead of 128.
+#
+# The pair is *verified* rather than assumed: an image with no `%a`-style format
+# strings in its uncompressed SEC volume is a RELEASE build under another name,
+# and copying it as a debug one would be a lie in a file name.
+fetch_ovmf_debug() {
+	local dest="${DEST_ROOT}/x86"
+	local dir code="" vars=""
+	mkdir -p "$dest"
+
+	for dir in ${RSEMU_OVMF_DEBUG_DIR:-} /usr/share/qemu /usr/share/edk2/OvmfX64 \
+		/usr/share/edk2-ovmf /usr/share/OVMF; do
+		[ -n "$dir" ] || continue
+		if [ -r "${dir}/edk2-x86_64-code.fd" ] && [ -r "${dir}/edk2-i386-vars.fd" ]; then
+			code="${dir}/edk2-x86_64-code.fd"
+			vars="${dir}/edk2-i386-vars.fd"
+			break
+		fi
+		if [ -r "${dir}/OVMF_CODE_4M.fd" ] && [ -r "${dir}/OVMF_VARS_4M.fd" ]; then
+			code="${dir}/OVMF_CODE_4M.fd"
+			vars="${dir}/OVMF_VARS_4M.fd"
+			break
+		fi
+	done
+
+	if [ -z "$code" ]; then
+		note "  no 4 MiB edk2 x86_64 code/vars pair under any of the usual places"
+		note "  install your distribution's qemu firmware package (it ships"
+		note "  edk2-x86_64-code.fd and edk2-i386-vars.fd), or set"
+		note "  RSEMU_OVMF_DEBUG_DIR to wherever the pair is."
+		return 0
+	fi
+
+	# `grep -c` rather than `grep -q`, deliberately: `-q` exits on the first
+	# match, `strings` takes a SIGPIPE for it, and `set -o pipefail` at the top
+	# of this script then reports the whole pipeline as a failure -- so the
+	# check said "RELEASE build" about every image, including the debug one.
+	local marks=0
+	if command -v strings >/dev/null 2>&1; then
+		marks=$(strings -a "$code" 2>/dev/null | grep -c 'SecCoreStartupWithStack' || true)
+	else
+		note "  no strings(1) here, so the image is taken at its file name's word"
+		marks=1
+	fi
+	if [ "${marks:-0}" -eq 0 ]; then
+		note "  ${code} has no DEBUG() format strings in its SEC volume, so it is a"
+		note "  RELEASE build and writes nothing to the debug port at 0x402."
+		note "  Copying it anyway would put a false name on it; skipped."
+		return 0
+	fi
+
+	cp -f "$code" "${dest}/OVMF_CODE_DEBUG.fd"
+	cp -f "$vars" "${dest}/OVMF_VARS_DEBUG.fd"
+	chmod u+w "${dest}/OVMF_VARS_DEBUG.fd"
+
+	ok "OVMF_CODE_DEBUG.fd ($(wc -c <"${dest}/OVMF_CODE_DEBUG.fd" | tr -d ' ') bytes)"
+	ok "OVMF_VARS_DEBUG.fd ($(wc -c <"${dest}/OVMF_VARS_DEBUG.fd" | tr -d ' ') bytes)"
+	ovmf_notice "$dest" "$(dirname "$code")"
+	mv -f "${dest}/PROVENANCE-ovmf.txt" "${dest}/PROVENANCE-ovmf-debug.txt"
+	ovmf_debug_hint "$dest"
+}
+
+ovmf_debug_hint() {
+	local dest="$1"
+	note ""
+	note "  capture its DEBUG() log with:"
+	note "      RSEMU_OVMF_CODE=${dest}/OVMF_CODE_DEBUG.fd \\"
+	note "      RSEMU_OVMF_VARS=${dest}/OVMF_VARS_DEBUG.fd \\"
+	note "      RSEMU_OVMF_DEBUG=${dest}/boot.log \\"
+	note "          cargo test --release --features machine-q35-uefi \\"
+	note "              --test q35_uefi -- --nocapture the_firmwares_debug_log"
+	note "  or, straight off the command line and unpaced:"
+	note "      rsemu run q35-uefi --flash0 ${dest}/OVMF_CODE_DEBUG.fd \\"
+	note "          --flash1 ${dest}/OVMF_VARS_DEBUG.fd -p flash=4M -p vars=528K \\"
+	note "          --capture debug=boot.log --for 1400s"
+}
+
 # The disk `q35-uefi` boots from: a FAT volume with an EFI application at the
 # one path a UEFI boot manager looks for without being told.
 #
@@ -2793,7 +2883,14 @@ Suites:
                  package (BSD-2-Clause-Patent; nothing to download)
   ovmf           UEFI for q35-uefi: a split OVMF _CODE.fd / _VARS.fd pair,
                  copied from the local edk2/ovmf package the same way
-                 (BSD-2-Clause-Patent; nothing to download)
+                 (BSD-2-Clause-Patent; nothing to download). Every distribution
+                 checked ships a RELEASE build here, which writes nothing to the
+                 debug port at 0x402
+  ovmf-debug     the same board's firmware, in a build that has debug strings in
+                 it: the 4 MiB edk2-x86_64-code.fd / edk2-i386-vars.fd pair from
+                 the local qemu firmware package, copied only if it really does
+                 carry DEBUG() format strings. This is the one that narrates a
+                 boot on 0x402
   esp            the disk q35-uefi boots from: a FAT volume with an EFI
                  application at \EFI\BOOT\BOOTX64.EFI, built here with mtools
                  around the local package's Shell.efi (BSD-2-Clause-Patent).
@@ -2908,6 +3005,7 @@ for suite in "${SUITES[@]}"; do
 		riscv-arch-test|arch-test|act) fetch_arch_test ;;
 		edk2|uefi) fetch_edk2 ;;
 		ovmf|x86-uefi) fetch_ovmf ;;
+		ovmf-debug|ovmf-dbg) fetch_ovmf_debug ;;
 		esp|efi-disk) fetch_esp ;;
 		linux|kernel) fetch_linux ;;
 		arm64-linux|arm64) fetch_arm64_linux ;;

@@ -23,15 +23,29 @@
 //! and then read `0xffffffff` out of every register. It passes now, and its
 //! own doc comment has the mechanism.
 //!
-//! The other two need a firmware and are gated on `RSEMU_OVMF_CODE`, exactly as
-//! `tests/q35_linux.rs` is gated on `RSEMU_KERNEL` and for the same reasons: the
-//! image is several megabytes, it is not ours, and `CLAUDE.md` forbids
+//! The other three need a firmware and are gated on `RSEMU_OVMF_CODE`, exactly
+//! as `tests/q35_linux.rs` is gated on `RSEMU_KERNEL` and for the same reasons:
+//! the image is several megabytes, it is not ours, and `CLAUDE.md` forbids
 //! vendoring a fixture. Nothing here is committed and nothing is required for
 //! `cargo test`. They are
 //! [`a_uefi_firmware_from_the_environment_reaches_its_console`], which boots one
-//! and reports where it got to, and
+//! and reports where it got to,
 //! [`a_variable_written_at_the_shell_is_there_after_a_reboot`], which boots it
-//! **twice** and carries nothing between the two but the variable bank.
+//! **twice** and carries nothing between the two but the variable bank, and
+//! [`the_firmwares_debug_log_reaches_the_port_at_0x402`], which drains the
+//! *other* character port — EDK II's `DEBUG()` log, which no committed test
+//! had ever asserted a byte of.
+//!
+//! **What a fetchable firmware can and cannot show.** The 2 MiB `edk2-ovmf`
+//! pair `scripts/fetch-testdata.sh ovmf` copies is a `RELEASE` build: `DEBUG()`
+//! is compiled out of it, so it never probes `0x402` and never writes a byte
+//! there, and the debug-log test says so and passes. A build with debug strings
+//! in it — the 4 MiB pair in a distribution's own qemu firmware package,
+//! `edk2-x86_64-code.fd` and `edk2-i386-vars.fd`, at `-p flash=4M -p vars=528K`
+//! — narrates the boot from the reset vector, and against one of those the same
+//! test asserts the log is there and starts where SEC starts. Which kind
+//! arrived is decided by the image rather than by a flag, so the test is honest
+//! either way; `scripts/fetch-testdata.sh ovmf-debug` copies the second pair.
 //!
 //! ```console
 //! scripts/fetch-testdata.sh ovmf
@@ -47,6 +61,7 @@
 //! | `RSEMU_OVMF_CODE` | the firmware bank's image. Unset, the boot test skips. |
 //! | `RSEMU_OVMF_VARS` | the variable bank's. Unset, the store comes up erased. |
 //! | `RSEMU_OVMF_VARS_OUT` | writes the variable bank back out when the run ends; pointing it at the file `RSEMU_OVMF_VARS` read makes the next run a reboot. |
+//! | `RSEMU_OVMF_DEBUG` | writes the `DEBUG()` log the firmware put on `0x402` to this file. The log is captured whether or not it is set; this is how it leaves a `cargo test` run. |
 //! | `RSEMU_OVMF_DISK` | a raw disk image for the NVMe namespace. `scripts/fetch-testdata.sh esp` builds one with an EFI application at `\EFI\BOOT\BOOTX64.EFI`. |
 //! | `RSEMU_OVMF_MS` | virtual milliseconds to run for (default 420000, which is past the shell prompt at ~367000). |
 //! | `RSEMU_OVMF_EXTMEM` | how much memory above 1 MiB the board has. |
@@ -62,13 +77,15 @@
 //! | `RSEMU_OVMF_PROBE` | replay the boot and report the first exception the firmware takes, with the frame the processor pushed. Costs a second boot. |
 //! | `RSEMU_OVMF_PROBE_MS` | how far back that replay switches to one-instruction stepping (default 150). |
 //!
-//! **Everything printed as evidence is a byte the guest itself wrote to COM1**,
-//! with one exception, and it is one the board cannot be asked for any other
+//! **Everything printed as evidence is a byte the guest itself wrote**, to COM1
+//! or — in the debug-log test — to the port at `0x402`, with one exception, and
+//! it is one the board cannot be asked for any other
 //! way: [`report_fwcfg`] prints the selectors the firmware wrote to `fw_cfg`,
 //! read out of the device the bindings kept a handle to. A selector write
 //! leaves nothing behind in any address space, so "which files did OVMF ask
-//! for" is otherwise answerable only from a `DEBUG()` log this board has no
-//! port for. The firmware is still run, never read (`ROADMAP.md` §1).
+//! for" is otherwise answerable only from the `DEBUG()` log — which this board
+//! does have a port for now, and which the third test reads. The firmware is
+//! still run, never read (`ROADMAP.md` §1).
 //!
 //! What it gets to is in [`docs/platforms/q35-uefi.md`](../docs/platforms/q35-uefi.md):
 //! a UEFI Shell prompt that answers what is typed at it, on all three engines,
@@ -97,6 +114,7 @@ use rsemu::core::space::{AddressSpace, MemAttrs, RamStore};
 use rsemu::core::value::Width;
 use rsemu::cpu::x86::{Variant, X86};
 use rsemu::dev::medium::Medium;
+use rsemu::dev::pc::debugcon::DebugConsole;
 use rsemu::dev::q35::fwcfg::FwCfg;
 use rsemu::host::chardev::CharPort;
 use rsemu::machine::Machine;
@@ -136,8 +154,24 @@ const TOP: u64 = 0x1_0000_0000;
 /// The same shape `tests/q35_linux.rs` uses, and for the same reason: `Device`
 /// keeps `Any` out of its supertrait chain, so construction is the one moment
 /// the concrete type exists.
-fn bindings(cpus: &Arc<Captured<X86>>, fwcfg: &Arc<Captured<FwCfg>>) -> Bindings {
+fn bindings(
+    cpus: &Arc<Captured<X86>>,
+    fwcfg: &Arc<Captured<FwCfg>>,
+    debugcon: &Arc<Captured<DebugConsole>>,
+) -> Bindings {
     let mut b = rsemu::machine::catalog::bindings().expect("this build's bindings");
+    // And to the debug console, for the third time and the third reason: its
+    // counters are what separate "the firmware never asked whether a debug port
+    // was fitted" from "it asked, and then said nothing" from "it said
+    // something and the host lost some of it". None of those three is visible
+    // in an address space, and they are the whole of what
+    // [`the_firmwares_debug_log_reaches_the_port_at_0x402`] has to tell apart.
+    let kept_debugcon = Arc::clone(debugcon);
+    b.replace(rsemu::dev::pc::debugcon::CLASS_NAME, move |props| {
+        let dev = Arc::new(DebugConsole::new(props)?);
+        kept_debugcon.push(&dev);
+        Ok(dev)
+    });
     // The same capture, for the same reason, applied to the one device whose
     // *diagnostics* are not reachable through an address space: what a firmware
     // asked fw_cfg for is a list inside the device, and `Device` deliberately
@@ -166,10 +200,20 @@ fn bindings(cpus: &Arc<Captured<X86>>, fwcfg: &Arc<Captured<FwCfg>>) -> Bindings
 }
 
 /// What building this board hands back: the machine, the processor the
-/// bindings captured, the console the 16550 opened, and the `fw_cfg` device —
-/// the two objects whose *internals* a test needs and no address space can be
-/// asked for.
-type Board = (Machine, Arc<X86>, Arc<CharPort>, Arc<FwCfg>);
+/// bindings captured, the two character ports the board opens for the firmware
+/// to talk on, and the `fw_cfg` and `pc.debugcon` devices — the objects whose
+/// *internals* a test needs and no address space can be asked for.
+struct Board {
+    machine: Machine,
+    cpu: Arc<X86>,
+    /// COM1's port: the UEFI console, and what every script here is typed at.
+    console: Arc<CharPort>,
+    /// The `0x402` port's: EDK II's whole `DEBUG()` log, on a stream of its
+    /// own so that it does not interleave into the shell's line editor.
+    debug: Arc<CharPort>,
+    fwcfg: Arc<FwCfg>,
+    debugcon: Arc<DebugConsole>,
+}
 
 /// Build the board from its own machine file, with `code` and `vars` in the two
 /// banks.
@@ -199,9 +243,10 @@ fn board_on_a_medium(
 ) -> Result<Board, String> {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let fwcfgs: Arc<Captured<FwCfg>> = Arc::new(Captured::new());
+    let debugcons: Arc<Captured<DebugConsole>> = Arc::new(Captured::new());
     let mut options = rsemu::machine::BuildOptions::new()
         .with_classes(rsemu::machine::catalog::classes())
-        .with_bindings(bindings(&cpus, &fwcfgs));
+        .with_bindings(bindings(&cpus, &fwcfgs, &debugcons));
     for (name, value) in params {
         options = options.with_param(*name, value.as_str());
     }
@@ -234,15 +279,32 @@ fn board_on_a_medium(
     machine.sweep();
     let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
         .expect("the 16550 opened the board's console port");
+    // The `debug` port is opened here whether or not a test reads it, and that
+    // is deliberate: `pc.debugcon` names it in `new(props)`, so it exists from
+    // the build, and a caller that never drains it is exactly the caller whose
+    // firmware log gets truncated at 64 KiB with `DebugConsole::dropped`
+    // counting what went missing.
+    let debug = rsemu::host::chardev::ports::open(&options.realize.hosts, "debug")
+        .expect("the debug console opened the board's `debug` port");
     let cpu = cpus.take().expect("the constructor kept a handle");
     let fwcfg = fwcfgs.take().expect("the board declares one fw_cfg");
-    Ok((machine, cpu, console, fwcfg))
+    let debugcon = debugcons
+        .take()
+        .expect("the board declares one debug console");
+    Ok(Board {
+        machine,
+        cpu,
+        console,
+        debug,
+        fwcfg,
+        debugcon,
+    })
 }
 
 /// The board with both sockets stuffed and nothing programmed into them.
 fn bare_board() -> Machine {
     match board(Vec::new(), Vec::new(), Vec::new(), &[]) {
-        Ok((machine, ..)) => machine,
+        Ok(built) => built.machine,
         Err(e) => panic!("the board does not realize: {e}"),
     }
 }
@@ -1103,7 +1165,14 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
         TOP - (code.len() + vars.len()) as u64
     );
 
-    let (mut m, cpu, console, fwcfg) = match board(code.clone(), vars.clone(), disk, &params) {
+    let Board {
+        machine: mut m,
+        cpu,
+        console,
+        debug,
+        fwcfg,
+        debugcon,
+    } = match board(code.clone(), vars.clone(), disk, &params) {
         Ok(built) => built,
         Err(e) => panic!("the board does not realize: {e}"),
     };
@@ -1122,6 +1191,7 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
         &script,
     );
     x86boot::report("q35-uefi", &m, &cpu, &run, &script);
+    report_debugcon(&debugcon, &debug);
     report_fwcfg(&fwcfg);
     report_chipset(&m);
     report_nvme(&m, &cpu);
@@ -1132,6 +1202,336 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
     probe_first_exception(&params, run.at);
     write_back_the_variable_store(&m);
     assert_reached_uefi(&run, &script);
+}
+
+/// What this run left on the `0x402` port, said in one line.
+///
+/// This loop does not drain that port — it is `x86boot::run`, and COM1 is what
+/// a script is typed at — so a firmware with debug strings in it fills the
+/// 64 KiB the port holds and `pc.debugcon` drops the rest. That is the device
+/// behaving as designed (a `rep outsb` has nowhere to put back pressure), and
+/// it is worth saying out loud rather than leaving a reader to wonder why the
+/// log is short: the test that keeps the whole thing is
+/// [`the_firmwares_debug_log_reaches_the_port_at_0x402`], and the command-line
+/// equivalent is `rsemu run … --capture debug=boot.log`.
+fn report_debugcon(debugcon: &DebugConsole, port: &CharPort) {
+    let held = port.pending_output() as u64;
+    println!(
+        "q35-uefi: the firmware probed 0x402 {} time(s) and wrote {} byte(s) of DEBUG() log to \
+         it; this run kept {held} of them and dropped {} — see \
+         `the_firmwares_debug_log_reaches_the_port_at_0x402`, which drains the port instead",
+        debugcon.probes(),
+        debugcon.written(),
+        debugcon.dropped(),
+    );
+}
+
+/// The firmware's own `DEBUG()` log, off the port at `0x402`, whole.
+///
+/// The gap this fills: every other piece of firmware evidence in this file is a
+/// byte the guest wrote to **COM1**, because that is the port `x86boot::run`
+/// drains. EDK II's `PlatformDebugLibIoPort` writes somewhere else entirely,
+/// and until now nothing committed asserted a single byte of it — the device
+/// had unit tests driving it by hand, and the board had a `map port 0x0402`,
+/// and the only thing that had ever put the two together was a person running
+/// `rsemu run --console debug` and reading the result.
+///
+/// # What is asserted, and why each holds for *any* image
+///
+/// A firmware image cannot be committed (`CLAUDE.md`, testing), and the one
+/// `scripts/fetch-testdata.sh ovmf` copies — a distribution's 2 MiB split
+/// `edk2-ovmf` pair — is a **`RELEASE`** build, which compiles `DEBUG()` out
+/// entirely and therefore writes nothing here at all. So the assertions are
+/// written to be true of both kinds of build, and to say which kind arrived:
+///
+/// * **A read of `0x402` answers `0xe9`**, asked of the board through its own
+///   I/O space, with `MemAttrs::debug` — which the device answers without
+///   counting, so asking does not disturb the count the rest of the test reads.
+/// * **The accounting closes**: what the device says the guest wrote is what
+///   this loop captured plus what it dropped, and it dropped nothing, because
+///   the port is drained every slice. A firmware log outgrows the 64 KiB a
+///   `CharPort` holds — the 4 MiB debug build has written 95,726 bytes of it by
+///   the time the shell prompt arrives — so a run that does *not* drain it
+///   keeps the first 64 KiB and the device counts the rest away.
+/// * **A firmware that asked, talked.** `probes` counts
+///   `PlatformDebugLibIoPortDetect`, and EDK II calls it from `DebugPrintMarker`
+///   immediately before the `IoWriteFifo8` that is the log itself
+///   (`src/dev/pc/debugcon.rs` has both, quoted). So `probes > 0` with an empty
+///   log is a real failure — the port answered the detect and then swallowed
+///   the output — and `probes == 0` is a `RELEASE` image, which is reported
+///   rather than failed.
+/// * **The string the image carries is the string that came out**, when the
+///   image carries it: `SecCoreStartupWithStack(0x%x, 0x%x)` lives uncompressed
+///   in the SEC firmware volume of a debug build, because SEC is executed in
+///   place out of flash. An image with that format string in it must produce
+///   that line on this port, which is end to end from the reset vector: the
+///   first `DEBUG()` a UEFI machine ever executes, through the detect, through
+///   the device, onto a host stream.
+///
+/// `RSEMU_OVMF_DEBUG` names a file to write the captured log to. Nothing here
+/// needs it; it is how a person gets the log out of a `cargo test` run, the way
+/// `RSEMU_OVMF_VARS_OUT` gets the variable store out.
+///
+/// `scripts/fetch-testdata.sh ovmf-debug` copies a pair that has debug strings
+/// in it — verifying that it really does before putting the name on it — or
+/// point the two variables straight at the package:
+///
+/// ```console
+/// RSEMU_OVMF_CODE=/usr/share/qemu/edk2-x86_64-code.fd \
+/// RSEMU_OVMF_VARS=/usr/share/qemu/edk2-i386-vars.fd \
+/// RSEMU_OVMF_DEBUG=boot.log \
+///     cargo test --release --features machine-q35-uefi --test q35_uefi -- \
+///         --nocapture the_firmwares_debug_log
+/// ```
+#[test]
+fn the_firmwares_debug_log_reaches_the_port_at_0x402() {
+    let Ok(path) = std::env::var("RSEMU_OVMF_CODE") else {
+        println!(
+            "q35-uefi: set RSEMU_OVMF_CODE to a split UEFI firmware image to capture its \
+             DEBUG() log off the port at 0x402; an image with debug strings in it narrates the \
+             whole boot there, and a RELEASE image writes nothing. See the module docs"
+        );
+        return;
+    };
+    let code = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let vars = std::env::var("RSEMU_OVMF_VARS")
+        .ok()
+        .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}")))
+        .unwrap_or_default();
+    let mut params: Vec<(&str, String)> = vec![
+        ("flash", format!("{}", code.len() + vars.len())),
+        ("vars", format!("{}", vars.len().max(0x1000))),
+    ];
+    if let Ok(extmem) = std::env::var("RSEMU_OVMF_EXTMEM") {
+        params.push(("extmem", extmem));
+    }
+    let disk = disk_from_env();
+    if !disk.is_empty() {
+        params.push(("disk", format!("{}", disk.len())));
+    }
+
+    let Board {
+        machine: mut m,
+        cpu,
+        console,
+        debug,
+        debugcon,
+        ..
+    } = match board(code.clone(), vars.clone(), disk, &params) {
+        Ok(built) => built,
+        Err(e) => panic!("the board does not realize: {e}"),
+    };
+
+    // The detect, before the firmware gets to it, and through the board rather
+    // than through the device: `MemAttrs::DEBUG` because a monitor's peek must
+    // not look like a firmware's question, which is the whole of what the
+    // device's `debug` handling is for.
+    let port = m.space("port").expect("the board declares `port`");
+    assert_eq!(
+        port.read(0x402, Width::U8, MemAttrs::DEBUG)
+            .expect("the debug console answers a byte read") as u8,
+        0xe9,
+        "the board maps a debug console at 0x402 and it answers EDK II's \
+         BOCHS_DEBUG_PORT_MAGIC; anything else and PlatformDebugLibIoPortDetect fails and the \
+         whole log is dropped"
+    );
+    assert_eq!(
+        debugcon.probes(),
+        0,
+        "a debug read is not a detect: the guest has not asked yet"
+    );
+
+    let ms: u64 = std::env::var("RSEMU_OVMF_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MS);
+    let stop_at = std::env::var("RSEMU_OVMF_STOP_AT").unwrap_or_else(|_| String::from("Shell>"));
+    println!("q35-uefi: what the guest wrote to the debug port at 0x402:");
+    let run = capture_the_debug_log(
+        &mut m,
+        &cpu,
+        &console,
+        &debug,
+        GlobalTime::from_nanos(ms * 1_000_000),
+        &stop_at,
+    );
+    println!(
+        "q35-uefi: {} byte(s) of DEBUG() log in {} ms of virtual time, and {} byte(s) on COM1{}",
+        run.log.len(),
+        run.at.as_nanos() / 1_000_000,
+        run.text.len(),
+        if run.reached {
+            format!(" (stopped at {stop_at:?})")
+        } else {
+            String::new()
+        }
+    );
+    if let Ok(out) = std::env::var("RSEMU_OVMF_DEBUG") {
+        std::fs::write(&out, &run.log).unwrap_or_else(|e| panic!("{out}: {e}"));
+        println!("q35-uefi: wrote the log to {out}");
+    }
+
+    // The accounting, which is the assertion the *host* side has to pass: a
+    // port nobody drains holds 64 KiB and the device drops the rest.
+    assert_eq!(
+        debugcon.dropped(),
+        0,
+        "the loop drains the port every slice and the device still had to drop {} byte(s): the \
+         log in hand is a truncated one",
+        debugcon.dropped()
+    );
+    assert_eq!(
+        debugcon.written(),
+        run.log.len() as u64,
+        "the device counted {} byte(s) written by the guest and dropped none, and this loop \
+         captured {}",
+        debugcon.written(),
+        run.log.len()
+    );
+
+    if debugcon.probes() == 0 {
+        // Not a failure. `DEBUG()` is compiled out of a RELEASE build, so
+        // nothing ever calls the detect and the port is never touched — which
+        // is the image speaking, not the board, and the board has already
+        // answered 0xe9 above.
+        println!(
+            "q35-uefi: this image never ran PlatformDebugLibIoPortDetect, so it is a RELEASE \
+             build with DEBUG() compiled out and there is no log to capture. The 2 MiB \
+             edk2-ovmf pair `scripts/fetch-testdata.sh ovmf` copies is one of those; a build \
+             with debug strings in it — the 4 MiB pair in a distribution's qemu firmware \
+             package — narrates the boot from the reset vector"
+        );
+        assert_eq!(
+            run.log.len(),
+            0,
+            "the firmware never asked whether a debug console was fitted and wrote to it anyway"
+        );
+        return;
+    }
+
+    println!(
+        "q35-uefi: the firmware ran the detect {} time(s) — the SEC instance of the library \
+         re-reads the port before every DEBUG(), because it has no writable globals to cache \
+         the answer in",
+        debugcon.probes()
+    );
+    assert!(
+        !run.log.is_empty(),
+        "the firmware read 0x402, got 0xe9 back — which is the only answer that makes it use \
+         the port at all — and then wrote nothing to it. EDK II's DebugPrintMarker calls \
+         PlatformDebugLibIoPortDetect immediately before the IoWriteFifo8 that is the log"
+    );
+
+    // And the end-to-end one: the format string that is in the image is the
+    // line that came out of the port.
+    const SEC: &[u8] = b"SecCoreStartupWithStack(";
+    if contains(&code, SEC) {
+        assert!(
+            contains(&run.log, SEC),
+            "the image carries SEC's own DEBUG() format string, so it is a build with debug \
+             strings in it, and the very first thing it prints did not reach the port. What did \
+             is:\n{}",
+            String::from_utf8_lossy(&run.log[..run.log.len().min(2048)])
+        );
+        println!(
+            "q35-uefi: and the first DEBUG() a UEFI machine executes — SEC's own, out of the \
+             uncompressed SEC volume — is in it"
+        );
+    }
+}
+
+/// What a captured boot came back with.
+struct DebugLog {
+    /// Every byte the guest wrote to `0x402`.
+    log: Vec<u8>,
+    /// Every byte it wrote to COM1, which is what `stop_at` is matched against.
+    text: String,
+    /// Where the run stopped, in virtual time.
+    at: GlobalTime,
+    /// Whether the marker arrived.
+    reached: bool,
+}
+
+/// Run the board, draining **both** character ports every slice, until the
+/// guest prints `stop_at` on COM1 or `limit` runs out.
+///
+/// Not `x86boot::run`: that loop drains the console because the console is
+/// where a script is typed, and this test is about the other port. The two
+/// differences are the whole reason this exists — the debug port is drained
+/// too, and it is drained *every slice*, which is what keeps a log larger than
+/// a `CharPort` from being cut down to its first 64 KiB.
+///
+/// Nothing is typed at the console here. What a firmware puts on its debug port
+/// is decided long before a shell prompt exists, and a run that types nothing
+/// is one less thing between an assertion and the log.
+fn capture_the_debug_log(
+    m: &mut Machine,
+    cpu: &X86,
+    console: &CharPort,
+    debug: &CharPort,
+    limit: GlobalTime,
+    stop_at: &str,
+) -> DebugLog {
+    /// One slice of virtual time, as `x86boot::run` cuts it.
+    const SLICE_NS: u64 = 1_000_000;
+
+    let mut log: Vec<u8> = Vec::new();
+    let mut text: Vec<u8> = Vec::new();
+    let mut printed = 0usize;
+    let mut reached = false;
+    let mut idle = 0u32;
+    let mut last = (0u16, 0u64, 0u64, 0u64, 0u64, 0u64);
+    while m.now() < limit {
+        if let Err(e) = m.run_for(GlobalTime::from_nanos(SLICE_NS)) {
+            log.extend_from_slice(format!("\n[rsemu: the machine stopped: {e}]\n").as_bytes());
+            break;
+        }
+        debug.drain_into(&mut log);
+        console.drain_into(&mut text);
+        // A line at a time as it arrives: a firmware log is the one instrument
+        // that says where a boot went, and a boot that takes minutes should not
+        // be silent while it does it.
+        while let Some(nl) = log[printed..].iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(&log[printed..printed + nl]).into_owned();
+            println!("  # {}", line.trim_end_matches('\r'));
+            printed += nl + 1;
+        }
+        if !stop_at.is_empty() && contains(&text, stop_at.as_bytes()) {
+            println!("  > the guest printed {stop_at:?} on COM1; stopping");
+            reached = true;
+            break;
+        }
+        // The same progress check `x86boot::run` makes, in all three of its
+        // parts, because leaving any one out ends a boot early. The register
+        // tuple rather than `RIP` alone: a `REP MOVSQ` of a megabyte holds one
+        // instruction pointer for thousands of slices. And `cycle_debt`,
+        // because a core that owes clocks is not stopped, it is paying — the
+        // decompressor charges more than a slice's worth in one instruction and
+        // the scheduler holds it off until virtual time catches up. Written
+        // without that half, this loop called `FVMAIN` being decompressed a
+        // hang, ended the run at 335 s of virtual time and captured one line.
+        let regs = cpu.regs();
+        let here = (regs.cs, regs.rip, regs.rcx, regs.rsi, regs.rdi, regs.rsp);
+        if here == last && cpu.cycle_debt() == 0 {
+            idle += 1;
+            if idle >= 100 {
+                println!(
+                    "  > the processor stopped making progress at {:#x}",
+                    regs.rip
+                );
+                break;
+            }
+        } else {
+            idle = 0;
+            last = here;
+        }
+    }
+    DebugLog {
+        log,
+        text: String::from_utf8_lossy(&text).into_owned(),
+        at: m.now(),
+        reached,
+    }
 }
 
 /// The whole point of a variable store: what one boot writes, the next boot
@@ -1279,7 +1679,12 @@ fn run_the_shell(
     // leave a firmware that boots once and never again.
     let store = Arc::new(RamStore::new(vars.len() as u64));
     Medium::write_at(&*store, 0, vars).expect("a fresh store takes the image");
-    let (mut m, cpu, console, _fwcfg) = match board_on_a_medium(
+    let Board {
+        machine: mut m,
+        cpu,
+        console,
+        ..
+    } = match board_on_a_medium(
         code.to_vec(),
         Vec::new(),
         disk.to_vec(),
@@ -1679,7 +2084,12 @@ fn probe_first_exception(params: &[(&str, String)], stopped: GlobalTime) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(150);
-    let Ok((mut m, cpu, _console, _fwcfg)) = board(code, vars, disk_from_env(), params) else {
+    let Ok(Board {
+        machine: mut m,
+        cpu,
+        ..
+    }) = board(code, vars, disk_from_env(), params)
+    else {
         return;
     };
     let fine_from = stopped.as_nanos().saturating_sub(window * 1_000_000);

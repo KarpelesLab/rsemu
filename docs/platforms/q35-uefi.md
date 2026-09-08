@@ -1025,8 +1025,8 @@ read answers the same `0xe9` and does not count as a detect, and a monitor's
 log that the guest never wrote.
 
 What comes out is the boot, from the first instruction. `rsemu run q35-uefi
---console debug` with the 4 MiB `edk2-x86_64-code.fd`, which has debug strings
-in it:
+--capture debug=boot.log` with the 4 MiB `edk2-x86_64-code.fd`, which has debug
+strings in it:
 
 ```text
 SecCoreStartupWithStack(0xFFFCC000, 0x820000)
@@ -1072,10 +1072,21 @@ timings further up were taken with — every `DEBUG()` is a `AsciiVSPrint` and a
 few hundred `outsb` — so those numbers are not comparable with the 367-second
 one, and are not meant to be.
 
-A `--console debug` run is held to real time by the console loop, so 1,400
-seconds of virtual time is also about twenty-three minutes of wall clock. The
-run is the same one either way; `--headless` simply does not print it, because
-nothing drains the port.
+`--capture debug=boot.log` runs the machine **unpaced**, so those 1,400 seconds
+of virtual time cost 1 m 48 s of wall clock under `jit-host`. It used to be
+twenty-three minutes: `--console debug` attaches a terminal, and a terminal
+session sleeps off whatever each slice did not use, because a machine somebody
+is typing at should run at the speed the machine ran at. `--headless` was
+already unpaced and printed no character port at all, so before `--capture`
+there was no fast way to get this log out of the CLI at all. The run is the same
+one either way — the same 1,648 lines, the same 95,726 bytes, the same state
+hash.
+
+`tests/q35_uefi.rs` asserts the same log from the other side, in
+`the_firmwares_debug_log_reaches_the_port_at_0x402`: it drains the port every
+slice, checks that `pc.debugcon` dropped nothing, and — because the counters
+tell the two cases apart — reports a `RELEASE` image as one rather than failing
+on it.
 
 ### The line that would have ended the variable-store hunt
 
@@ -1168,13 +1179,27 @@ rsemu run q35-uefi \
     --flash0 /usr/share/qemu/edk2-x86_64-code.fd \
     --flash1 /usr/share/qemu/edk2-i386-vars.fd \
     -p flash=4M -p vars=528K -p engine=jit-host \
-    --console debug --for 1400s >boot.log
+    --capture debug=boot.log --for 1400s
 ```
 
-`--console debug` picks the debug port's character stream rather than COM1's;
-`--console console` picks COM1. Both exist for the whole run and only the one
-named is drained, which is why the debug console drops rather than blocks when
-nobody is listening to it.
+**`--capture` rather than `--console`, and the difference is twenty minutes.**
+`--console debug` attaches a *terminal* to that port, and a terminal session is
+paced to wall clock — a second of guest time per second of yours, so the 1 400
+seconds this log takes cost 1 400 of them. `--capture` drains the port to a file
+while the machine runs unpaced, at whatever rate the host manages: the same
+1 648 lines, the same 95 726 bytes, in **1 m 48 s** under `jit-host` on the
+machine this paragraph was written on. `--for` still says how far to run, and
+`-q` leaves stdout to the guest if the capture goes there rather than to a file.
+
+`--capture debug` picks the debug port's stream, `--capture console` COM1's, and
+naming both twice captures both — one to a file each, since two streams
+interleaved on stdout cannot be told apart afterwards. Every character port the
+machine opened that nothing is watching is **drained and thrown away**, in this
+loop and in the console, `--gdb` and `--vnc` ones: an unattached port is a cable
+nobody plugged in, and a port left to fill stops at 64 KiB and holds a 16550's
+`THRE` clear, which stalls the guest for as long as nobody looks at it. The
+summary says how many bytes went that way — 1 503 of them on COM1 in the run
+above, which is the shell banner nobody asked to see.
 
 And when a boot goes quiet, the three instruments that make a silent firmware
 talk — the driver an address belongs to, out of the loaded image's own PE/COFF
