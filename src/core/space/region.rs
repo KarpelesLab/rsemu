@@ -368,6 +368,27 @@ impl Region {
                 ),
             });
         }
+        // A split is *one* region with one declared byte order — the `Split`
+        // below keeps a single `constraints`, taken from the read side, and
+        // every caller that asks a region its order gets that one. Two sides
+        // that disagree would therefore have the write side silently answer in
+        // the read side's order, which is the defect `FlatEntry::write_value`
+        // was fixed for one layer down. Widths are already validated here for
+        // the same reason; endianness had been left out.
+        if constraints.endian != writes.constraints.endian {
+            return Err(Error::Config {
+                at: name,
+                message: alloc::format!(
+                    "a split's two sides must agree on byte order: `{}` is {:?} and `{}` is {:?}. \
+                     A split is one region with one declared order; model two orders as two \
+                     regions",
+                    reads.name(),
+                    constraints.endian,
+                    writes.name(),
+                    writes.constraints.endian
+                ),
+            });
+        }
         let len = reads.len();
         Ok(Region {
             name,
@@ -651,5 +672,55 @@ impl Region {
             RegionKind::Alias(a) => a.rebasable && !a.repeat,
             RegionKind::Container(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::space::{MemAttrs, MemResult};
+    use alloc::sync::Arc;
+
+    #[derive(Debug, Default)]
+    struct Nothing;
+
+    impl MemOps for Nothing {
+        fn read(&self, _offset: u64, _dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+            Ok(())
+        }
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            Ok(())
+        }
+    }
+
+    /// A split keeps **one** `AccessConstraints`, taken from the read side, so
+    /// two sides that disagree about byte order would leave the write side
+    /// answering in the read side's — silently, and only for writes. That is
+    /// the same defect `FlatEntry::write_value` carried one layer down, where a
+    /// directed entry took its order from the read leaf.
+    ///
+    /// Widths were already rejected here for exactly this reason. This asserts
+    /// byte order is too, and that the message says how to model two orders.
+    #[test]
+    fn a_split_whose_sides_disagree_about_byte_order_is_a_config_error() {
+        let ops = || Arc::new(Nothing) as Arc<dyn MemOps>;
+        let err = Region::split(
+            "port",
+            Arc::new(Region::io("reads", 4, ops()).with_endian(Endian::Big)),
+            Arc::new(Region::io("writes", 4, ops()).with_endian(Endian::Little)),
+        )
+        .expect_err("the two sides disagree about byte order")
+        .to_string();
+        assert!(err.contains("byte order"), "{err}");
+        assert!(err.contains("two regions"), "{err}");
+
+        // The control: the same pair agreeing is accepted, so the check rejects
+        // the disagreement rather than the shape.
+        Region::split(
+            "port",
+            Arc::new(Region::io("reads", 4, ops()).with_endian(Endian::Big)),
+            Arc::new(Region::io("writes", 4, ops()).with_endian(Endian::Big)),
+        )
+        .expect("two big-endian sides are one declared order");
     }
 }
