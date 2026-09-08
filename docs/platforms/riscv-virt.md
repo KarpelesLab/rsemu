@@ -154,6 +154,78 @@ blocks from the same cache on the portable backend. The first is a configuration
 error and the second is a portability property, so they are treated differently
 on purpose.
 
+### The CLINT can raise `mtip` in the middle of a block
+
+A fourth instance of the class `docs/testing/long-run.md` records for A64 —
+*where a quantum ends*, not what an instruction computes — and the first one
+found on this board. It was fixed in `IrHost::load`.
+
+`cpu::riscv::engine`'s module docs used to say that within a block nothing can
+raise an interrupt, and enumerated why: every CSR write, `MRET`, `WFI` and
+`SFENCE.VMA` is outside the lifted subset and ends the block; a store ends the
+block by construction; and *"what is left is a load from a device that raises
+an interrupt as a side effect of being read, which nothing on a `virt` board
+does"*. The enumeration was right and the last clause was wrong. The CLINT is
+**lazily advanced** (`ROADMAP.md` §4.2): `MemOps::read` catches it up to the
+reading hart's live position before answering, and `Registers::republish`
+drives `mtip` for every comparator that catch-up crossed.
+
+Most of the time that is invisible, and for a good reason:
+`Scheduler::natural_target` ends a round on the soonest event a lazily-advanced
+device has of its own, so an expiring comparator *is* a quantum boundary and
+both engines see it in the same place. The window is a comparator the guest
+moves **into the round that is already running** — which is precisely what a
+timer handler does, `mtimecmp = mtime + interval`. The round's target was
+chosen when the round began and does not move, so the next `mtime` read crosses
+the new comparator, `mtip` rises between two instructions of a lifted trace,
+and the block runs on to its natural end: up to `lift::MAX_INSNS` instructions
+past where `Exec::step` would have taken the trap, with `mepc` naming the wrong
+instruction and the two engines on different cycle counts thereafter.
+
+`a_load_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it` in
+`src/cpu/riscv/engine.rs` is the regression test. It puts a one-register device
+that asserts `mtip` when read four instructions from the end of a merged trace;
+before the fix the interpreter had `x5 = 0` and both translated engines `x5 =
+39`.
+
+**What was looked for and is not reachable.** The hypothesis this was opened on
+was a *sibling hart's IPI* — a store into another hart's `MSIP` landing inside
+this hart's quantum on an SMP board. Under `ThreadingMode::Deterministic`,
+which is the only mode with a state hash, it cannot happen: the sibling runs in
+its own quantum, so the write lands while this hart is between quanta and both
+engines see it at the next `admit`. Under `ThreadingMode::Parallel` it can, and
+there is no oracle to diverge from — that mode gives up reproducibility by
+construction and `Machine::state_hash` refuses in it. The fix covers the `MSIP`
+case incidentally, because a hart reading anywhere in the CLINT window asks the
+same question.
+
+**What would reopen the walk window.** `admit` asks `Exec::pending_interrupt`
+and *then* charges the entry fetch translation, which on a TLB miss is a walk —
+the gap A64's `engine::leave_at` exists for. It is empty here because a walk
+reads page-table entries and this board puts page tables in DRAM. A board that
+mapped a page table over a lazily-advanced device would reopen it.
+
+**What it cost.** Nothing in `IrHost::spent`, which is the function asked at
+every guest instruction boundary of every block: `Host::hand_back` retires the
+run's tick allowance instead of adding a second field to that comparison, so
+`spent` is textually unchanged. What is left to pay is one call to the
+interpreter's own `Exec::pending_interrupt` per load that reaches
+`IrHost::load` — 2.7% of compiled loads on `jit-host`, all of them on `jit`.
+Measured under callgrind, because the host was carrying a load average of
+thirty and the wall-clock spread between two runs of the *unmodified* binary
+was larger than the effect: `Hart::advance` taken inclusively over the whole of
+`benches/jit_dispatch --smoke` went from 1 038 017 036 host instructions to
+1 039 145 936, **+0.11%**. A variant carrying a separate `bool` measured
+1 037 957 044, *below* the baseline, so the two bracket it and the honest
+reading is that the cost is under the instrument's resolution on this mix.
+
+That measurement needed a new table. `benches/jit_dispatch`'s original table
+drives `Dispatcher` from a host of its own, so it cannot see
+`cpu::riscv::engine::Host` at all — neither the budget seam nor this one — and
+a number taken from it would have measured nothing. It now has a second table
+in the shape `benches/a64_dispatch` already had: `Hart::run_budget` across six
+quanta, with the `interp` row as a control that shares no code with the change.
+
 ## Booting something real
 
 Everything below is fetched, never committed

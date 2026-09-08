@@ -248,12 +248,40 @@
 //! is what *takes* each one, and asking a block to run first would take it up
 //! to sixteen instructions late.
 //!
-//! Nothing in the lifted subset can raise one from inside a block: `STI`,
+//! Nothing this core *computes* can raise one from inside a block: `STI`,
 //! `CLI`, `POPF`, `HLT`, `INT`, `IRET`, every segment load and every `MOV` to
-//! a control register are outside it and end the block. A **store** into an
-//! interrupt controller is the one thing that can, and it is seen at the very
-//! next boundary — which under paging is the next instruction, because
+//! a control register are outside the lifted subset and end the block. A
+//! **store** into an interrupt controller can, and it is seen at the very next
+//! boundary — which under paging is the next instruction, because
 //! [`Smc::EndBlock`] ends the block there.
+//!
+//! **A load can too, and so can a store with paging off**, and that was missed
+//! until a workload was written for it. The store half is the easier of the
+//! two to miss twice: `admit` picks [`Smc::EndBlock`] only *under* paging, and
+//! with paging off the policy is [`Smc::Guard`], where a store is an ordinary
+//! instruction and the block runs on past it. The local APIC and the HPET are lazily-advanced devices
+//! (`ROADMAP.md` §4.2): `MemOps::read` catches the chip up to this core's
+//! *live* position before answering, so a timer that expires inside that
+//! catch-up requests its vector there and then and `INTR` rises **between two
+//! instructions of a lifted block**. Ordinarily it cannot, because
+//! `Scheduler::natural_target` ends the round on the soonest event a
+//! lazily-advanced device has of its own — so the expiry is a quantum
+//! boundary and both engines see it in the same place. The window is a timer
+//! the guest **reprograms into the round that is already running**: the target
+//! was chosen when the round began and does not move, so the next read of the
+//! APIC's current-count register, or of the HPET's main counter, crosses it.
+//! [`IrHost::load`] and [`IrHost::store`] are where that is now noticed and
+//! [`Host::hand_back`] is how it reaches the boundary. The regression test is
+//! `a_load_that_raises_intr_is_taken_where_the_interpreter_takes_it`; before
+//! it, the interpreter took the interrupt with `EAX` at zero and a translated
+//! core with `EAX` at nineteen.
+//!
+//! What is **not** covered, stated rather than discovered later: [`admit`]
+//! asks the pins before it charges the entry translation, so a page-table walk
+//! between the two is unwatched. On a PC that is empty — page tables live in
+//! DRAM — and it is the window `cpu::arm::a64::engine::leave_at` exists for on
+//! a core whose timer is counted off its own cycle counter. Neither is this
+//! core's shape: nothing here is driven off `Exec::used`.
 //!
 //! # Self-modifying code, and the gap that is left
 //!
@@ -675,6 +703,28 @@ enum Admit {
     Interpret,
 }
 
+/// The **pins** `Exec::step` decides on before it decodes, asked without
+/// taking any of them.
+///
+/// Split out of [`admit`] because it is asked from two places and the two must
+/// be the same question: once before a block runs, and once from
+/// [`IrHost::load`] and [`IrHost::store`] for the two things a running block
+/// does that can change the answer. `iflag` is passed rather than read because a block holds `EFLAGS`
+/// in its own slots, not in `State::regs`.
+///
+/// The state half of the test stays in [`admit`]: a shutdown, a halt, a `HLT`
+/// waiting for a `SIPI`, an interrupt shadow and the trap flag are all
+/// `State` this core writes with instructions the frontend does not lift, so
+/// none of them can change inside a block.
+#[inline]
+fn pins_pending(lines: &Lines, iflag: bool) -> bool {
+    lines.init_latched()
+        || lines.init_held()
+        || lines.startup_pending().is_some()
+        || lines.nmi_pending()
+        || (iflag && lines.intr_pending())
+}
+
 /// Everything a block owes before it runs — for the first block of a run and
 /// for every chained successor alike.
 ///
@@ -710,12 +760,7 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
         return Admit::Interpret;
     }
     let lines = exec.lines;
-    if lines.init_latched()
-        || lines.init_held()
-        || lines.startup_pending().is_some()
-        || lines.nmi_pending()
-        || (st.regs.eflags & flags::IF != 0 && lines.intr_pending())
-    {
+    if pins_pending(lines, st.regs.eflags & flags::IF != 0) {
         return Admit::Interpret;
     }
 
@@ -1226,6 +1271,45 @@ impl<'a, 'e> Host<'a, 'e> {
         }
     }
 
+    /// Whether an interrupt pin has come up since this run started.
+    ///
+    /// `EFLAGS` comes out of the slots rather than out of `State::regs`,
+    /// because inside a block the slots are where it lives — `IF` is in
+    /// [`EFLAGS_REST`], the half [`ARITH_MASK`] leaves alone.
+    #[inline]
+    fn pins(&self) -> bool {
+        let iflag = self.slots[EFLAGS_REST.0 as usize] & u64::from(flags::IF) != 0;
+        pins_pending(self.exec.lines, iflag)
+    }
+
+    /// Retire what is left of this run's `allowance`, so the block leaves at
+    /// its next guest instruction boundary.
+    ///
+    /// The whole of how an interrupt reaches [`IrHost::spent`], and it costs
+    /// that function *nothing*, in the strong sense that its body is
+    /// unchanged: a boundary already loads `allowance` and compares
+    /// `Exec::used` against it, and zero is the value that comparison is
+    /// always true for. A second field would have been a second load on the
+    /// hottest path in the file to carry one bit this one already has room
+    /// for.
+    ///
+    /// What is left to pay for is the question in [`IrHost::load`] and
+    /// [`IrHost::store`], and this core pays it on **every** access rather than
+    /// on the few a plan does not cover, because x86 publishes no inlined
+    /// memory path (see [`FastMem`]). Measured under callgrind — a clock was
+    /// useless on the host this was written on, which was carrying a load
+    /// average of thirty — `X86::run_budget` taken inclusively over the whole
+    /// of `benches/x86_dispatch --smoke` went from **1 219 379 096 host
+    /// instructions to 1 221 612 704, +0.18%**.
+    ///
+    /// The ticks are not lost. [`advance`] reports `Exec::used`, and
+    /// `X86::run_budget` loops until *its* allowance is spent, so what this
+    /// gives up is the rest of the **run**, not the rest of the quantum.
+    #[inline]
+    fn hand_back(&mut self) {
+        self.allowance = 0;
+    }
+
     /// Whether the access that just returned put anything on the bus, read off
     /// the clock rather than off the call.
     ///
@@ -1291,6 +1375,27 @@ impl IrHost for Host<'_, '_> {
         let before = self.exec.used;
         let done = self.exec.read_mem(sr, addr, mem.size.bytes() as u8);
         self.spent_a_cycle(before);
+        // One of the two calls a block makes that can bring an interrupt pin
+        // up, and the one that is easy to miss.
+        //
+        // Nothing else in a block touches them: `Exec::charge` counts clocks
+        // and nothing on this core is driven off that count, and `HLT`, `CLI`,
+        // `STI`, `IRET` and every `MOV` to a control register are outside the
+        // lifted subset. A **load** is not a hypothetical: the local APIC and
+        // the HPET are lazily-advanced devices (`ROADMAP.md` §4.2), so
+        // `MemOps::read` catches the chip up to this core's live position
+        // before it answers. An APIC timer whose initial count the guest wrote
+        // *into the current round*, after `Scheduler::natural_target` had
+        // already chosen where the round ends, expires inside that catch-up —
+        // so `INTR` rises between two instructions of a lifted block, where
+        // `Exec::step` would have taken it at the next one.
+        //
+        // Asked here rather than at every guest instruction boundary because
+        // this is where the answer can change, and [`Host::hand_back`] is what
+        // carries it to the boundary for free.
+        if self.pins() {
+            self.hand_back();
+        }
         match done {
             Ok(v) => Ok(v),
             Err(fault) => Err(self.raise(fault)),
@@ -1303,6 +1408,15 @@ impl IrHost for Host<'_, '_> {
         let done = self.exec.write_mem(sr, addr, mem.size.bytes() as u8, value);
         self.spent_a_cycle(before);
         self.note_writes();
+        // The other one, and unlike the RISC-V engine this core cannot lean on
+        // "a store ends the block": that is true under [`Smc::EndBlock`], which
+        // `admit` picks only when paging is on. With paging off the policy is
+        // [`Smc::Guard`], a store is an ordinary instruction, and a store into
+        // an interrupt controller — an APIC `ICR` write, an 8259A command — is
+        // then exactly as mid-block as the load above.
+        if self.pins() {
+            self.hand_back();
+        }
         match done {
             Ok(()) => Ok(()),
             Err(fault) => Err(self.raise(fault)),
@@ -1323,6 +1437,14 @@ impl IrHost for Host<'_, '_> {
     /// count to the budget or past it, and a block that stopped one
     /// instruction later would leave the two engines on different instructions
     /// with different `State::debt` for the rest of the run.
+    ///
+    /// It answers a **second** question with the same compare — *"has an
+    /// interrupt pin come up since this run started"*. [`Host::hand_back`]
+    /// retires the allowance when [`IrHost::load`] finds one, which puts the
+    /// interrupt on the instruction `Exec::step` would have put it on: the
+    /// block leaves at the boundary after the load, [`advance`] returns, and
+    /// the next call's [`admit`] hands the instruction to the interpreter,
+    /// which is where the vector is fetched and the frame pushed.
     #[inline]
     fn spent(&self) -> bool {
         self.exec.used >= self.allowance
@@ -1363,7 +1485,7 @@ impl FastMem for Host<'_, '_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::space::RamStore;
+    use crate::core::space::{RamStore, Region};
     use crate::cpu::x86::differential::{self, Case};
     use crate::cpu::x86::{Engine, X86};
 
@@ -1377,6 +1499,149 @@ mod tests {
     /// a translated block gets wrong for free because it makes no fetches.
     fn open_bus(cpu: &X86) -> u8 {
         cpu.session.lock().state.open_bus
+    }
+
+    /// A one-register block that asserts this core's `INTR` pin when it is
+    /// read, and does nothing else.
+    #[derive(Debug)]
+    struct RaiseOnRead {
+        cpu: crate::core::sync::Mutex<alloc::sync::Weak<X86>>,
+    }
+
+    impl crate::core::space::MemOps for RaiseOnRead {
+        fn read(&self, _offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+            dst.fill(0);
+            if attrs.debug {
+                return Ok(());
+            }
+            if let Some(cpu) = self.cpu.lock().upgrade() {
+                cpu.set_intr_vector(0x20);
+                cpu.set_intr(true);
+            }
+            Ok(())
+        }
+
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            if let Some(cpu) = self.cpu.lock().upgrade() {
+                cpu.set_intr_vector(0x20);
+                cpu.set_intr(true);
+            }
+            Ok(())
+        }
+    }
+
+    /// `program` at [`differential::BASE`], with [`RaiseOnRead`] on the last
+    /// page of the data segment.
+    fn raising_core(engine: Engine, program: &[u8]) -> Arc<X86> {
+        let case = Case::new(program.to_vec()).with_eflags(flags::ALWAYS_SET | flags::IF);
+        let ram = Arc::new(RamStore::new(RAISER_RAM));
+        for (n, byte) in program.iter().enumerate() {
+            ram.write_u8(n as u64, *byte).expect("the program fits");
+        }
+        let dev = Arc::new(RaiseOnRead {
+            cpu: crate::core::sync::Mutex::with_rank(
+                crate::core::sync::LockRank::LEAF,
+                alloc::sync::Weak::new(),
+            ),
+        });
+        let space = AddressSpace::new("mem", 32);
+        {
+            let mut topo = space.topology();
+            topo.map(Region::ram("ram", ram), differential::BASE)
+                .expect("one region maps");
+            topo.map(
+                Region::io(
+                    "raiser",
+                    0x1000,
+                    Arc::clone(&dev) as Arc<dyn crate::core::space::MemOps>,
+                ),
+                differential::BASE + RAISER_RAM,
+            )
+            .expect("it does not overlap the RAM");
+        }
+        let cpu = Arc::new(core(&case, Arc::new(space), engine));
+        *dev.cpu.lock() = Arc::downgrade(&cpu);
+        cpu
+    }
+
+    /// How much plain RAM [`raising_core`] maps before the device page.
+    const RAISER_RAM: u64 = 3 * 4096;
+
+    /// A load from a device that raises `INTR`, three instructions from the
+    /// end of a lifted trace.
+    ///
+    /// ```text
+    ///   top:
+    ///     8b 1d 00 30 00 00   mov ebx, [0x3000]   ; the device: raises INTR
+    ///     40                  inc eax
+    ///     40                  inc eax
+    ///     40                  inc eax
+    ///     eb f5               jmp top
+    /// ```
+    const RAISER: [u8; 11] = [
+        0x8b, 0x1d, 0x00, 0x30, 0x00, 0x00, // mov ebx, [0x3000]
+        0x40, // inc eax
+        0x40, // inc eax
+        0x40, // inc eax
+        0xeb, 0xf5, // jmp top
+    ];
+
+    /// The same, with a **store**. A store is only the last instruction of its
+    /// block under [`Smc::EndBlock`], which `admit` picks under paging; this
+    /// case is unpaged, so the policy is [`Smc::Guard`] and the three `inc`s
+    /// below are in the same block as the write that raises `INTR`.
+    ///
+    /// ```text
+    ///   top:
+    ///     89 05 00 30 00 00   mov [0x3000], eax   ; the device: raises INTR
+    ///     40                  inc eax
+    ///     40                  inc eax
+    ///     40                  inc eax
+    ///     eb f5               jmp top
+    /// ```
+    const RAISER_STORE: [u8; 11] = [
+        0x89, 0x05, 0x00, 0x30, 0x00, 0x00, // mov [0x3000], eax
+        0x40, // inc eax
+        0x40, // inc eax
+        0x40, // inc eax
+        0xeb, 0xf5, // jmp top
+    ];
+
+    /// Both engines against the interpreter on `program`, which raises `INTR`
+    /// from inside a block.
+    fn agree_on_a_raiser(program: &[u8]) {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = raising_core(Engine::Interp, program);
+            let jit = raising_core(engine, program);
+            for n in 0..4 {
+                let a = interp.run_budget(4_000);
+                let b = jit.run_budget(4_000);
+                assert_eq!(a, b, "quantum {n}: different budgets under {engine:?}");
+            }
+            assert!(
+                interp.is_halted(),
+                "the fixture never took the interrupt, so it tested nothing"
+            );
+            assert_eq!(
+                interp.regs().qword(0),
+                jit.regs().qword(0),
+                "EAX under {engine:?}: the interpreter says {:#x}, the JIT says {:#x}",
+                interp.regs().qword(0),
+                jit.regs().qword(0),
+            );
+            assert_eq!(interp.regs().rip, jit.regs().rip, "RIP under {engine:?}");
+            assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_load_that_raises_intr_is_taken_where_the_interpreter_takes_it() {
+        agree_on_a_raiser(&RAISER);
+    }
+
+    #[test]
+    fn a_store_that_raises_intr_is_taken_where_the_interpreter_takes_it() {
+        agree_on_a_raiser(&RAISER_STORE);
     }
 
     /// Every column a guest, a snapshot or a state hash can see, compared

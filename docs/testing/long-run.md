@@ -290,11 +290,26 @@ teeth, and the x86 leg is what that claim now looks like paid in full:
   both: a divergence in the upper half of a register shows as `rax` with no
   `eax` beside it, which is exactly what `engine::narrow_state_is_clean` exists
   to prevent.
-* **a workload designed around the engine's seams.** `tests/engine_longrun.rs`'s
-  RISC-V leg is still the plain RV64I loop the other tests use, and it still
-  says so. The x86 one is not: it is written seam by seam against what
-  `cpu::x86::engine` does, and each row of the table below is a paragraph of
-  that file's own documentation turned into guest code.
+* **a workload designed around the engine's seams.** RISC-V and x86 share the
+  first of A64's seams — a boundary the frontend declines — and **not** the
+  second: neither core has a timer of its own counted off its own cycle
+  counter, so nothing on either can cross a comparator inside `admit`'s entry
+  walk the way A64's generic timer can. What they have instead is a *device* on
+  the other side of a load. The CLINT, the local APIC and the HPET are all
+  lazily advanced, so a guest load catches the chip up to the core's live
+  position and a comparator crossed there raises the wire **between two
+  instructions of a lifted block** — where the interpreter would have taken the
+  trap at the next one. Both cores had that divergence and both are fixed in
+  `IrHost::load`; `docs/platforms/riscv-virt.md` and `docs/platforms/pc64.md`
+  have the diagnosis, and the regression tests live beside the engines rather
+  than here because each needs a device that raises on read.
+
+  `tests/engine_longrun.rs`'s RISC-V leg is still the plain RV64I loop the
+  other tests use, and it says so: a synthetic guest that provoked the seam
+  above would need a CLINT and a timer handler, which is a board rather than a
+  loop. The x86 leg is not a plain loop — it is written seam by seam against
+  what `cpu::x86::engine` does, and each row below is a paragraph of that
+  file's own documentation turned into guest code.
 
 | seam in `cpu::x86::engine` | what the x86 workload does about it |
 | --- | --- |
