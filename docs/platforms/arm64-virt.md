@@ -921,11 +921,11 @@ the alternative would be a reservation on a granule the core never loaded.
 
 The fourth is the one that survived the first three fixes, and it is worth the
 space because it says something about the whole shape of this. `SpaceView::`
-`write_span` breaks reservations **before** it transfers rather than after, on
+`write_span` broke reservations **before** it transferred and not after, on
 purpose: a store that then faults has still broken them, which is a licensed
-spurious clear, and clearing afterwards would mean threading a split transfer's
-outcome back out of its loop. The consequence is that a committing `STXR` has a
-window *inside itself*, between telling the monitor and writing the bytes:
+spurious clear, and clearing afterwards looked like it would only move the
+problem. The consequence is that a committing `STXR` had a window *inside
+itself*, between telling the monitor and writing the bytes:
 
 ```text
 core 0: stxr [bus held]              core 1: ldxr [no lock]
@@ -957,14 +957,23 @@ loaded host, and none at all on an idle one. And a lost update of *one* in
 matters here is a failure rate over dozens of runs rather than a verdict from
 one.
 
-There is a second way to close it, in `core::space` rather than here: move
-`note_store` after the transfer. It would also close a residual this does not —
-a *plain* store racing a `LDXR` can still have its `note_store` run before the
-`LDXR` claims the granule and its bytes land after the `LDXR` has read, leaving
-a reservation that should have been broken. That is `BusLock`'s plain-store
-residual reaching the monitor, it is narrower than the case above (a plain store
-racing an exclusive on one granule is a data race in the guest's own terms), and
-the fault trade-off is real, so it is written down rather than taken.
+There is a second way to close it, in `core::space` rather than here, and it
+has since been taken: `SpaceView::write_span` now tells the monitor on **both**
+sides of the transfer. That also closes a residual this does not — a *plain*
+store racing a `LDXR` had its `note_store` run before the `LDXR` claimed the
+granule and its bytes land after the `LDXR` had read, leaving a reservation that
+should have been broken and an `STXR` free to commit against it.
+
+The fault trade-off this paragraph declined turned out not to be one. Clearing
+on a store that *completes* is required — RISC-V `zalrsc`: "The `sc` must fail
+if a store to the reservation set from another hart can be observed to occur
+between the `lr` and `sc`"; DDI 0487 B2.9.2: a successful write to the marked
+block by another observer "is guaranteed to clear the marking" — while clearing
+on a store that *faults* is only permitted (B2.9.5, "cleared at any time without
+an application-related cause"). Keeping both calls keeps both properties, and
+the second one measured inside the run-to-run spread on the store path: one
+extra host instruction per store under callgrind. `core::space::monitor`, "The
+transfer is the window", has the rest.
 
 `LDXP`/`STXP` gets the same treatment and one more claim. The 16-byte access is
 still two eight-byte bus accesses, because that is what `AddressSpace` offers,

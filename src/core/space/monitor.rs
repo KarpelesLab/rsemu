@@ -18,16 +18,32 @@
 //!   *local monitor* and a *global monitor* as separate state and requires a
 //!   store-exclusive to pass both. The core's own `State::exclusive` is the
 //!   local monitor; a slot here is its entry in the global one. Among the
-//!   events that clear the global monitor is "a store by another observer to
-//!   the same reservation granule", and the architecture also permits a
-//!   monitor to be cleared **spuriously** — a licence this module uses exactly
-//!   twice, and says so both times.
-//! * **RISC-V** (Unprivileged ISA, "Load-Reserved/Store-Conditional
+//!   events that clear the global monitor is a store by another observer to
+//!   the marked block: B2.9.2 states it as a guarantee — "Any successful write
+//!   to the marked block by any other observer in the shareability domain of
+//!   the memory location is guaranteed to clear the marking." The architecture
+//!   also permits a monitor to be cleared **spuriously** (B2.9.5: "The
+//!   Exclusives monitor can be cleared at any time without an
+//!   application-related cause, provided that such clearing is not
+//!   systematically repeated so as to prevent the forward progress in finite
+//!   time of at least one of the threads") — a licence this module uses three
+//!   times, and says so each time.
+//! * **RISC-V** (Unprivileged ISA, `zalrsc`, "Load-Reserved/Store-Conditional
 //!   Instructions") has a single *reservation set* rather than two monitors,
-//!   but the same requirement: an `SC` must fail if another hart wrote the set
-//!   since the `LR`. It also imposes an **eventuality guarantee** — a
-//!   constrained LR/SC sequence must eventually succeed — which is what stops
-//!   this being implementable by clearing everything on every store.
+//!   but the same requirement, and it is a **must**: "The `sc` must fail if a
+//!   store to the reservation set from another hart can be observed to occur
+//!   between the `lr` and `sc`." Failing for no reason is permitted instead of
+//!   required — "these definitions permit an implementation to fail an `sc`
+//!   instruction occasionally for any reason, provided the aforementioned
+//!   guarantee is not violated" — and that guarantee is the **eventuality**
+//!   one: a constrained LR/SC loop must eventually see one of its four listed
+//!   events, which is what stops this being implementable by clearing
+//!   everything on every store.
+//!
+//! The asymmetry between those two — clearing on a *completed* store is
+//! required, clearing for any other reason is merely permitted — is the whole
+//! argument for the shape [`ExclusiveMonitor::note_store`] is called in, and
+//! "The transfer is the window" below spends it.
 //!
 //! # The granule is architectural, and it differs
 //!
@@ -49,15 +65,25 @@
 //!
 //! # What it costs on the store path
 //!
-//! [`ExclusiveMonitor::note_store`] is called from `SpaceView::write_span`,
-//! which every guest store, every DMA burst and every ROM load funnels
-//! through, so its cost is paid by every board whether or not that board has
-//! ever executed an exclusive. It is **one acquire load of one `u64`** in the
-//! case that matters — no reservation outstanding anywhere in the space, which
-//! is the state a machine is in for all but a few instructions around each
-//! acquire/release pair. Only when that count is non-zero does it look at the
-//! slots, and then it walks the *set bits*, so the work is proportional to the
-//! number of outstanding reservations rather than to the size of the table.
+//! [`ExclusiveMonitor::note_store`] is called from `SpaceView::write_span` and
+//! from `SpaceView::write`'s single-entry fast path, which between them every
+//! guest store, every DMA burst and every ROM load funnels through, so its
+//! cost is paid by every board whether or not that board has ever executed an
+//! exclusive. It is **one acquire load of one `u64`** in the case that matters
+//! — no reservation outstanding anywhere in the space, which is the state a
+//! machine is in for all but a few instructions around each acquire/release
+//! pair. Only when that count is non-zero does it look at the slots, and then
+//! it walks the *set bits*, so the work is proportional to the number of
+//! outstanding reservations rather than to the size of the table.
+//!
+//! It is called **twice per store**, once on each side of the transfer, for
+//! the reason the next section gives, so the bill is two of those loads. That
+//! is not a figure of speech about how cheap it is: interleaved, pinned, best
+//! of five on an idle host, `AddressSpace::write` of one, two, four and eight
+//! bytes into RAM measured 11.9/11.9/11.9/12.3 ns with the second call and
+//! 12.0/12.1/12.1/12.5 ns without it — a difference inside the run-to-run
+//! spread. Under callgrind, where nothing is inside any spread, a four-byte
+//! store is **277 → 278** host instructions.
 //!
 //! No lock, at any rank. The store path is reached with the core's own
 //! `BUS`-ranked execution lock held and the space's topology lock taken for
@@ -99,6 +125,76 @@
 //! claim is pinned by `BusLock`'s own
 //! `a_locked_write_still_breaks_a_sibling_reservation` instead.
 //!
+//! # The transfer is the window
+//!
+//! A store is not one event here. It tells this object, and it moves bytes,
+//! and those are two acts with a gap between them — the gap is a few host
+//! instructions for a four-byte guest store and a whole burst for a DMA
+//! engine. Which side of the transfer the monitor is told on decides which
+//! architectural rule the gap can break, and the two rules are not
+//! interchangeable.
+//!
+//! **Before the transfer only**, which is what this was until it was measured:
+//!
+//! ```text
+//! core 0: plain STR [no lock]      core 1: ldxr / stxr
+//!   note_store: walks the live
+//!     slots — core 1 has none yet
+//!                                    ldxr: reserve, the slot goes live
+//!                                    ldxr: read [x0] -> 5, not written yet
+//!   write [x0] <- 6
+//!                                    stxr: nothing broke the reservation, so
+//!                                    it commits a value derived from 5 and
+//!                                    core 0's store is gone
+//! ```
+//!
+//! Core 1's `SC` succeeds after a store by another observer completed to its
+//! granule. RISC-V: "The `sc` **must** fail if a store to the reservation set
+//! from another hart can be observed to occur between the `lr` and `sc`."
+//! AArch64: a successful write to the marked block by another observer "is
+//! **guaranteed** to clear the marking". Neither is a permission; this is the
+//! required direction, and it was open.
+//!
+//! What the early call bought instead was the *other* direction — a store that
+//! faults has still broken the reservation. That one is only ever permitted:
+//! RISC-V lets an `sc` fail "occasionally for any reason", and DDI 0487 B2.9.5
+//! lets the monitor be cleared "at any time without an application-related
+//! cause". So the old order paid for a licence with a requirement, and no
+//! reading of either manual makes that trade a good one.
+//!
+//! **After the transfer only** closes the interleaving above and re-opens the
+//! fault case, which is the trade the previous round of this file wrote down
+//! and declined. It did not have to be a trade. The monitor is told **on both
+//! sides**, and the fault case survives because the first call is still there
+//! and still unconditional — including on the error path out of a split
+//! transfer, where bytes may already have landed.
+//!
+//! The second call clears reservations taken *during* the transfer, which is a
+//! spurious clear for one taken after the granule's own bytes went past and
+//! the required clear for one taken before them. Telling the two apart would
+//! cost a comparison per live slot to buy a reservation the guest's retry loop
+//! takes again, so it does not.
+//!
+//! ## What is left
+//!
+//! The store's bytes and the clear that follows them are still two events, so
+//! a store-conditional that consults the monitor between them commits against
+//! a granule that has just been written. That window is the tail of one
+//! transfer rather than the whole of it, and closing it needs the store and
+//! the clear to be one indivisible act — a bus lock on every store, which
+//! would serialise the machine, or a reentrancy story for the one every
+//! `STXR`, `LOCK` prefix and `LDADD` is already holding. It is the same
+//! residual [`BusLock`](super::BusLock) states for a plain store racing a
+//! locked read-modify-write, reached from the other end.
+//!
+//! `core::space::tests` pins the part that is closed rather than the part that
+//! is not, because that part is deterministic: a device at the head of a
+//! burst's span claims the granule the rest of the same burst overwrites, so
+//! every ordering the race needs is fixed by construction instead of raced
+//! for. `a_reservation_taken_inside_a_store_does_not_survive_it` and its
+//! faulting and value-store variants fail on the single-call order every time
+//! and pass on this one.
+//!
 //! # Why the pair needs no protection against a *plain* store
 //!
 //! [`BusLock`](super::BusLock) has a residual it states in its own
@@ -108,8 +204,9 @@
 //! optimism that makes this object cheap.
 //!
 //! A plain store that lands between the `LR` and the `SC` has, by definition,
-//! written the reservation granule, so it has cleared the slot and the `SC`
-//! fails. That covers the case where the store lands *inside the `LR`'s own
+//! written the reservation granule, so by the time it returns it has cleared
+//! the slot — that is "The transfer is the window" above, and its residual is
+//! the residual here too — and the `SC` fails. That covers the case where the store lands *inside the `LR`'s own
 //! bytes* as well: [`RamStore`](super::RamStore) accesses byte by byte, so an
 //! `LR` racing a wide store can read a value that was never in memory
 //! (`space::store`, "What per-byte atomicity is not") — but the store broke the
@@ -368,6 +465,12 @@ impl ExclusiveMonitor {
     /// write to the reservation set. A store by the reserving core *itself* is
     /// included, which is what both architectures require and is also why the
     /// caller does not have to say who it is.
+    ///
+    /// Called **twice** per store, on each side of the transfer: the module
+    /// documentation's "The transfer is the window" says which architectural
+    /// rule each call keeps and why one of them cannot do both jobs. Clearing
+    /// twice is idempotent, so a caller that can only manage one call is
+    /// correct in the direction that matters least.
     ///
     /// Addresses are **guest-physical**. Two harts with different page tables
     /// contending for one lock is the ordinary case, and a virtual key would

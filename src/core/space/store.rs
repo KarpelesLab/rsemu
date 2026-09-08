@@ -107,7 +107,7 @@
 //! | | ns |
 //! | --- | --- |
 //! | the byte loop, four bytes | 1.3 |
-//! | one whole `AddressSpace::write`, four bytes | 20.4 |
+//! | one whole `AddressSpace::write`, four bytes | 11.9 |
 //! | one interpreted `mov [bx], eax` | 117 |
 //! | one interpreted `mov [bx], al` | 101 |
 //! | one interpreted `nop`, for scale | 56 |
@@ -118,8 +118,10 @@
 //!
 //! The second row read 24.8 until the round that priced
 //! [`mark_dirty`](RamStore::mark_dirty)'s locked instruction and gave
-//! `SpaceView::write` a value-typed path into the leaf; the other rows did not
-//! move, and the ratios above survive the change unaltered. The denominator
+//! `SpaceView::write` a value-typed path into the leaf, and 20.4 until the
+//! round that moved `write_span`'s run loop out of line so that a value store
+//! stopped carrying an inlined copy of it (`SpaceView::transfer`); the other
+//! rows did not move, and the ratios above survive both changes unaltered. The denominator
 //! shrinking is not an argument against either candidate — a store that no
 //! longer serialises on a `lock or` is a store the byte loop can overlap with,
 //! which is the direction that makes a wide aligned atomic *more* attractive
