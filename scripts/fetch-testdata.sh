@@ -111,6 +111,20 @@ readonly BUSYBOX_MEMBER="./usr/bin/busybox"
 # an EFI zboot image -- which is exactly what `arm.loader` wants; the busybox
 # is the same package built for arm64. Both are GPL-2.0: FETCH-ONLY.
 readonly ARM64_LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux"
+
+# And the x86-64 half, for machines/pc64.machine and the x86 leg of the engine
+# long run. Debian's installer kernel is an ordinary `bzImage` -- a setup header
+# with `HdrS` at offset 0x202 -- which is exactly what `dev::linuxboot` wants,
+# and it boots on `pc64` to `Run /init as init process` with the busybox
+# initramfs below. GPL-2.0: FETCH-ONLY, on the same terms as every other kernel
+# here.
+#
+# `tests/pc64_linux.rs` deliberately fetches nothing and takes whatever
+# `RSEMU_KERNEL` names, because a person running it has a kernel of their own.
+# `tests/engine_longrun.rs`'s `pc64` leg is the nightly gate, so it needs a
+# kernel that is the *same* one tomorrow, and that is what this entry is for.
+readonly X86_LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images/netboot/debian-installer/amd64/linux"
+
 readonly BUSYBOX_ARM64_DEB="https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b8_arm64.deb"
 readonly BUSYBOX_ARM64_SHA="6d144e5012d47ec3a6f2102ba6fac644ad34c989373fed30c1bb7264f5cd3616"
 readonly DEBIAN_PACKAGES_ARM64="https://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.gz"
@@ -1216,6 +1230,65 @@ arm64_hint() {
 	note "      RSEMU_ARM64_INITRD=${dest}/initramfs.cpio \\"
 	note "          cargo test --release --features machine-arm64-virt \\"
 	note "              --test a64_linux -- --nocapture"
+}
+
+fetch_x86_linux() {
+	need curl
+	local dest="${DEST_ROOT}/x86"
+	local target="${dest}/bzImage"
+	mkdir -p "$dest"
+
+	if [ "$FORCE" = 0 ] && [ -s "$target" ]; then
+		ok "x86 bzImage already present ($(wc -c <"$target" | tr -d ' ') bytes)"
+	else
+		note "  downloading the amd64 linux bzImage (about 12 MiB) ..."
+		download "$X86_LINUX_IMAGE_URL" "$target"
+	fi
+
+	# No checksum, for the reason fetch_arm64_linux gives: Debian rebuilds the
+	# installer kernel and a pin would fail on every point release. The setup
+	# header is the check that matters -- a bzImage carries "HdrS" at offset
+	# 0x202, which an HTML error page does not.
+	local magic
+	magic="$(dd if="$target" bs=1 skip=514 count=4 2>/dev/null || true)"
+	if [ "$magic" != "HdrS" ]; then
+		rm -f "$target"
+		die "that is not a Linux/x86 bzImage: no HdrS magic at offset 0x202"
+	fi
+	ok "x86 bzImage ($(wc -c <"$target" | tr -d ' ') bytes)"
+	printf '%s\n' "Debian installer amd64 kernel
+${X86_LINUX_IMAGE_URL}
+
+Licence: GPL-2.0. FETCH-ONLY -- running it as an emulated guest is ordinary
+use; committing it to this repository would be redistribution under its terms
+(ROADMAP.md section 1).
+
+A Linux/x86 bzImage: a setup header at offset 0x1f1 with \`HdrS\` at 0x202,
+then the compressed kernel. rsemu's \`x86.linuxboot\` reads that header,
+refuses anything that is not one, writes the image into memory and enters it at
+its own 32-bit entry point -- there is no firmware on \`pc64\` to do it.
+
+Consumed by RSEMU_X86_KERNEL in tests/engine_longrun.rs, which runs the
+interpreter and a translated engine over it in lockstep." \
+		>"${dest}/PROVENANCE-bzImage.txt"
+	x86_linux_hint "$dest"
+}
+
+x86_linux_hint() {
+	local dest="$1"
+	note ""
+	note "  Compare the engines over a real x86-64 boot, quantum by quantum:"
+	note "      RSEMU_X86_KERNEL=${dest}/bzImage \\"
+	note "      RSEMU_X86_INITRD=${dest}/initramfs-x86.cpio \\"
+	note "      RSEMU_LONGRUN_SECONDS=120 \\"
+	note "          cargo test --release --features machine-pc64,cpu-x86-lift,jit,jit-x86 \\"
+	note "              --test engine_longrun -- --ignored --nocapture"
+	note ""
+	note "  Or just boot it and watch:"
+	note "      RSEMU_KERNEL=${dest}/bzImage \\"
+	note "      RSEMU_INITRD=${dest}/initramfs-x86.cpio \\"
+	note "      RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests' \\"
+	note "          cargo test --release --features machine-pc64 --test pc64_linux -- --nocapture"
 }
 
 arm64_rootfs_hint() {
@@ -2911,10 +2984,12 @@ Suites:
                  initramfs that insmods virtio_mmio, virtio_blk and ext4,
                  mounts /dev/vda and switch_roots into it (GPL-2.0,
                  FETCH-ONLY)
+  x86-linux      a Linux/x86 bzImage to boot on pc64 (GPL-2.0, FETCH-ONLY).
+                 Debian's installer kernel, which is what the nightly engine
+                 long run compares the two engines over.
   initramfs-x86  the same archive built around busybox.net's own x86-64
                  static build, for the pc64 and q35-linux boards (GPL-2.0,
-                 FETCH-ONLY). The kernel it boots under is yours: no bzImage
-                 is fetched.
+                 FETCH-ONLY). It is the only root pc64 can be given.
 
 Options:
   --all               fetch every suite (the default when none is named).
@@ -3009,6 +3084,7 @@ for suite in "${SUITES[@]}"; do
 		esp|efi-disk) fetch_esp ;;
 		linux|kernel) fetch_linux ;;
 		arm64-linux|arm64) fetch_arm64_linux ;;
+		x86-linux|bzimage) fetch_x86_linux ;;
 		arm64-initramfs) fetch_arm64_initramfs ;;
 		arm64-rootfs|arm64-disk) fetch_arm64_rootfs ;;
 		initramfs|rootfs) fetch_initramfs ;;

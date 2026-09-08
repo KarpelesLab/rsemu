@@ -518,11 +518,14 @@ stage_wasm_threads() {
 # gate skips, and `RSEMU_LONGRUN_REQUIRED` turns that skip into a failure the
 # way `RSEMU_CROSSHOST_REQUIRED` does. CI sets it.
 #
-# `cpu-x86-lift` and `dev-pc` are the x86 leg: the frontend, and the 8254 and
-# 8259A its workload needs to be interrupted by. It builds its own board rather
-# than naming a `machine-*` feature, because every shipped x86 board starts in
-# real mode and real mode is outside the lifted subset — see the file.
-LONGRUN_FEATURES="machine-arm64-virt,cpu-arm-a64-lift,machine-riscv-virt,cpu-riscv-lift,cpu-x86-lift,dev-pc,jit,jit-x86"
+# `cpu-x86-lift` and `dev-pc` are the synthetic x86 leg: the frontend, and the
+# 8254 and 8259A its workload needs to be interrupted by. It builds its own
+# board rather than naming a `machine-*` feature, because every shipped x86
+# board starts in real mode and real mode is outside the lifted subset — see
+# the file. `machine-pc64` is the *kernel* leg on the same core, which does
+# want a shipped board, because the whole point of it is a guest nobody
+# designed for this.
+LONGRUN_FEATURES="machine-arm64-virt,cpu-arm-a64-lift,machine-riscv-virt,cpu-riscv-lift,cpu-x86-lift,dev-pc,machine-pc64,jit,jit-x86"
 stage_long() {
   local secs kernel initrd
   secs="${RSEMU_LONGRUN_SECONDS:-120}"
@@ -552,14 +555,69 @@ stage_long() {
     else
       record "skip  long kernel boot (no $kernel: scripts/fetch-testdata.sh arm64-linux arm64-initramfs)"
     fi
+  else
+    run "long kernel boot (${secs}s of guest time)" \
+      env RSEMU_ARM64_KERNEL="$kernel" RSEMU_ARM64_INITRD="$initrd" \
+          RSEMU_LONGRUN_SECONDS="$secs" \
+      cargo test --release --features "$LONGRUN_FEATURES" \
+        --test engine_longrun -- --ignored --nocapture --test-threads=1 \
+        a_real_arm64_linux_boot_agrees_across_the_engines
+  fi
+
+  # A missing AArch64 kernel used to end the stage, which would now silently
+  # take the x86 gate with it.
+  stage_long_x86
+}
+
+# The same gate on the x86 core: `pc64`, a stock bzImage, both engines, quantum
+# by quantum.
+#
+# Its own function and its own budget, because `pc64` measures time differently
+# from `arm64-virt`. That board runs a 100 MHz processor and has no firmware, so
+# the bzImage decompresses itself from the reset vector: at 120 guest seconds
+# the last thing the guest has printed is "KASLR disabled" and it is still in
+# the decompressor, where 120 of `arm64-virt` is well past both defects that
+# gate exists for. So RSEMU_X86_LONGRUN_SECONDS is the knob.
+#
+# 900 rather than something smaller is measured rather than chosen. The
+# calibration run re-introduced `admit`'s interrupt-shadow refusal and this leg
+# caught it at **quantum 1 280 242, 635.04 s of guest time** — the first `STI`
+# the kernel executes is that far in, because everything up to
+# `local_irq_enable` runs with interrupts off. The same run at 600 guest seconds
+# passes with that defect planted. docs/testing/long-run.md has the table.
+#
+# It costs about sixteen minutes for the two engines together, which is what the
+# nightly's ninety-minute budget is sized for.
+#
+# RSEMU_LONGRUN_SECONDS deliberately does not drive it. The two boards' guest
+# seconds are not comparable budgets, and one variable driving both would make
+# whichever is the shorter of them meaningless.
+stage_long_x86() {
+  local kernel initrd secs
+  kernel="${RSEMU_X86_KERNEL:-testdata/x86/bzImage}"
+  initrd="${RSEMU_X86_INITRD:-testdata/x86/initramfs-x86.cpio}"
+  secs="${RSEMU_X86_LONGRUN_SECONDS:-900}"
+
+  if [ ! -s "$kernel" ]; then
+    if [ -n "${RSEMU_LONGRUN_REQUIRED:-}" ]; then
+      record "FAIL  long x86 kernel boot -- RSEMU_LONGRUN_REQUIRED is set, so this had to run"
+      FAILED=$((FAILED + 1))
+    else
+      record "skip  long x86 kernel boot (no $kernel: scripts/fetch-testdata.sh x86-linux initramfs-x86)"
+    fi
     return 0
   fi
-  run "long kernel boot (${secs}s of guest time)" \
-    env RSEMU_ARM64_KERNEL="$kernel" RSEMU_ARM64_INITRD="$initrd" \
+  # An absent initramfs is not fatal: with no root the kernel panics, which is
+  # still a complete boot and still hundreds of guest seconds of varied x86-64
+  # to compare. `machines/pc64.machine` says why an initramfs is the only root
+  # this board can be given at all.
+  [ -s "$initrd" ] || initrd=""
+  run "long x86 kernel boot (${secs}s of guest time)" \
+    env RSEMU_X86_KERNEL="$kernel" RSEMU_X86_INITRD="$initrd" \
         RSEMU_LONGRUN_SECONDS="$secs" \
     cargo test --release --features "$LONGRUN_FEATURES" \
       --test engine_longrun -- --ignored --nocapture --test-threads=1 \
-      a_real_arm64_linux_boot_agrees_across_the_engines
+      a_real_x86_linux_boot_agrees_across_the_engines
 }
 
 stage_fuzz() {

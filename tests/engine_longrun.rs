@@ -18,10 +18,12 @@
 //! | --- | --- | --- | --- |
 //! | [`the_harness_names_the_quantum_a_planted_divergence_appears_on`] | none | milliseconds | every `cargo test` |
 //! | [`a_synthetic_a64_workload_agrees_across_the_engines`] | none | a few seconds | every `cargo test` |
-//! | [`a_synthetic_riscv_workload_agrees_across_the_engines`] | none | a few seconds | every `cargo test` |
+//! | `a_synthetic_riscv_workload_agrees_across_the_engines` | none | ~3 s | every `cargo test` |
 //! | [`a_tlbi_in_the_loop_agrees_across_the_engines`] | none | under a second | every `cargo test` |
 //! | `a_synthetic_x86_workload_agrees_across_the_engines` | none | ~1.4 s | every `cargo test` |
-//! | `a_real_arm64_linux_boot_agrees_across_the_engines` | a kernel | minutes | `--ignored`, nightly |
+//! | `a_real_arm64_linux_boot_agrees_across_the_engines` | an `Image` | minutes | `--ignored`, nightly |
+//! | `a_real_x86_linux_boot_agrees_across_the_engines` | a `bzImage` | minutes | `--ignored`, nightly |
+//! | `the_clint_advances_while_the_hart_is_running` | none | milliseconds | `--ignored`; **it fails on `master`** — see its doc comment |
 //!
 //! `RSEMU_LONGRUN_SECONDS` lengthens the synthetic runs; the default is sized
 //! so an ordinary `cargo test` does not notice them. `RSEMU_LONGRUN_ENGINES`
@@ -37,12 +39,15 @@
 //! fixture:
 //!
 //! ```text
-//!   scripts/fetch-testdata.sh arm64-linux arm64-initramfs
+//!   scripts/fetch-testdata.sh arm64-linux arm64-initramfs x86-linux initramfs-x86
 //!
 //!   RSEMU_ARM64_KERNEL=testdata/arm64/linux \
 //!   RSEMU_ARM64_INITRD=testdata/arm64/initramfs.cpio \
+//!   RSEMU_X86_KERNEL=testdata/x86/bzImage \
+//!   RSEMU_X86_INITRD=testdata/x86/initramfs-x86.cpio \
 //!   RSEMU_LONGRUN_SECONDS=120 \
-//!       cargo test --release --features machine-arm64-virt,cpu-arm-a64-lift,jit,jit-x86 \
+//!       cargo test --release \
+//!           --features machine-arm64-virt,cpu-arm-a64-lift,machine-pc64,cpu-x86-lift,jit,jit-x86 \
 //!           --test engine_longrun -- --ignored --nocapture
 //! ```
 //!
@@ -78,10 +83,23 @@
 //! calibration table, and one of the four defects re-introduced there is
 //! invisible to `tests/x86_engines.rs`.
 //!
-//! There is no x86 leg of the kernel gate. `pc64` boots Linux on either engine
-//! and `docs/platforms/pc64.md` records nine hundred guest seconds of it, but
-//! nothing runs that **in lockstep**; pointing this harness at `pc64` is the
-//! obvious next thing and it is not done.
+//! There is an x86 leg of the kernel gate now, and it is the last module in
+//! this file: `pc64` with a stock `bzImage` in its slot, both engines, quantum
+//! by quantum. `docs/platforms/pc64.md` had already recorded nine hundred
+//! guest seconds of that board booting on either engine — what was missing was
+//! anybody comparing the two anywhere but at the end. Measured on the Debian
+//! installer kernel `scripts/fetch-testdata.sh x86-linux` fetches: 900 guest
+//! seconds, 1 946 548 quanta, 292 million translated blocks, 1.52 billion
+//! instructions retired inside them against 6.5 million interpreted — and
+//! agreement on every one of those quanta.
+//!
+//! The RISC-V leg is no longer a plain loop either. It is a **board**: Sv39
+//! paging, a machine-mode trap handler, and the CLINT arming its own
+//! comparator — written seam by seam off `cpu::riscv::engine` the way the x86
+//! synthetic is written off `cpu::x86::engine`. Writing it turned up something
+//! the engine's documentation assumes and this board does not provide, which
+//! is `riscv::the_clint_advances_while_the_hart_is_running` and is filed
+//! `#[ignore]`d rather than fixed.
 
 #![cfg(all(feature = "jit", feature = "std"))]
 
@@ -625,44 +643,623 @@ mod arm64_virt {
 
 #[cfg(all(feature = "machine-riscv-virt", feature = "cpu-riscv-lift"))]
 mod riscv {
-    use super::longrun::{self, Options};
+    use std::sync::Arc;
+
+    use rsemu::core::Captured;
+    use rsemu::cpu::riscv::Hart;
     use rsemu::machine::{Machine, catalog};
 
-    /// The RV64I loop `tests/riscv_virt_engines.rs` and `tests/workload` both
-    /// use: add, store, load and two shifts per iteration, closed by a `jalr`
-    /// through a register the first two instructions compute. Source: *The
-    /// RISC-V Instruction Set Manual, Volume I*, chapter 2.
+    /// One `addi x0, x0, 0`, which is what a seam this build turns off is
+    /// replaced by.
     ///
-    /// It is a plain loop rather than anything shaped like [`super::a64`]'s
-    /// workload, and that is the honest state of this core: the two defects
-    /// were A64's, the mechanisms that produced them (a declined chained
-    /// boundary, a per-core timer reached from inside a block) exist here too,
-    /// and nobody has yet written the guest that provokes them. What this
-    /// gives is the harness pointed at a second core at the cost of forty
-    /// lines, which is the point of the harness being core-agnostic.
-    const PROGRAM: [u32; 12] = [
-        0x0000_0f17, // auipc t5, 0        t5 = 0x80000000
-        0x014f_0f13, // addi  t5, t5, 20   t5 = loop
-        0x0000_1397, // auipc t2, 1        t2 = 0x80001008, a scratch word in DRAM
-        0x0000_0293, // addi  t0, x0, 0
-        0x0010_0313, // addi  t1, x0, 1
-        0x0062_82b3, // loop: add t0, t0, t1
-        0x0053_b023, // sd    t0, 0(t2)
-        0x0003_be03, // ld    t3, 0(t2)
-        0x003e_1e93, // slli  t4, t3, 3
-        0x003e_de93, // srli  t4, t4, 3
-        0x01d2_82b3, // add   t0, t0, t4
-        0x000f_0067, // jalr  x0, 0(t5)
+    /// The canonical RISC-V `NOP` (*The RISC-V Instruction Set Manual, Volume
+    /// I*, §2.4), and the point of it is that it is **four bytes**, like every
+    /// instruction it stands in for: every branch displacement in the loop
+    /// below is left exactly as it was, so a bisect changes one property and
+    /// nothing else.
+    const NOP: u32 = 0x0000_0013;
+
+    /// The CLINT's `mtime`, and the hart's comparator beside it.
+    ///
+    /// `machines/riscv-virt.machine` maps the chip at 0x02000000, and the
+    /// offsets are the SiFive CLINT layout every `virt`-shaped board uses:
+    /// `msip` at 0, `mtimecmp` at 0x4000, `mtime` at 0xbff8.
+    const CLINT_MTIME: u64 = 0x0200_bff8;
+    const CLINT_MTIMECMP: u64 = 0x0200_4000;
+    /// Where DRAM starts, which is where the boot ROM at 0x1000 jumps.
+    const DRAM: u64 = 0x8000_0000;
+    /// The Sv39 tables, in the first two mebibytes so the level-0 table below
+    /// describes them.
+    const PT_ROOT: u64 = 0x8000_2000;
+    const PT_L1: u64 = 0x8000_3000;
+    const PT_L0: u64 = 0x8000_4000;
+    /// The word the atomic every thirty-second pass adds into.
+    const SCRATCH: u64 = 0x8000_5000;
+    /// The base of the sixty-four-page data window the loop walks.
+    const DATA: u64 = 0x8010_0000;
+    /// Ticks of the CLINT's 10 MHz counter between timer interrupts: 4 µs.
+    ///
+    /// It has to be **short against a quantum** and that is the whole design.
+    /// `cpu::riscv::engine` states the seam exactly: the window is *"a
+    /// comparator the guest moves into the round that is already running"* —
+    /// `Scheduler::natural_target` was computed when the round began and does
+    /// not move, so a comparator written inside the round is crossed by the
+    /// next read of `mtime` rather than at a quantum boundary, and `mtip`
+    /// rises between two instructions of a lifted block. A period longer than
+    /// a quantum would put every edge on a boundary, where both engines see it
+    /// in the same place and the run says nothing.
+    const PERIOD: u64 = 40;
+
+    /// The machine-mode half, at [`DRAM`]: physical-memory protection, the
+    /// Sv39 tables, the timer, the trap handler, and the drop into supervisor
+    /// mode.
+    ///
+    /// Assembled from source with `llvm-mc -triple=riscv64 -mattr=+m,+a,+f,+d`
+    /// and disassembled back; the listing is in the third column. Encodings and
+    /// semantics: *The RISC-V Instruction Set Manual, Volume I: Unprivileged
+    /// ISA* and *Volume II: Privileged Architecture* — §3.7 for physical-memory
+    /// protection, §4.4 for Sv39, §3.1.9 for `mie`, and §3.3.2 for what `MRET`
+    /// does with `mstatus.MPP`.
+    ///
+    /// ```text
+    ///         # PMP entry 0, TOR from zero. Without it every supervisor
+    ///         # access fails: a hart that implements PMP and has no entry
+    ///         # matching refuses anything below machine mode.
+    ///         li t0, 0x1fffffffffffffff / csrw pmpaddr0, t0
+    ///         li t0, 0x0f              / csrw pmpcfg0, t0     # TOR, X|W|R
+    ///
+    ///         # The level-0 table: 512 four-kibibyte identity pages over the
+    ///         # first two mebibytes of DRAM. Four kibibytes rather than one
+    ///         # megapage because SFENCE.VMA has to be able to cool this code
+    ///         # page's fetch translation and the walk that replaces it must
+    ///         # be a real three-level one. A and D are left clear, so the
+    ///         # first access to a page after each flush takes the walk's
+    ///         # accessed/dirty update as well.
+    ///         li t0, PT_L0 / li t1, 0x80000000 / li t2, 512
+    /// 0:      srli t3, t1, 12 / slli t3, t3, 10 / ori t3, t3, 0x0f
+    ///         sd t3, 0(t0) / addi t0, t0, 8
+    ///         li t4, 4096 / add t1, t1, t4 / addi t2, t2, -1 / bnez t2, 0b
+    ///
+    ///         # Level 1 entry 0 -> that table; root entry 2 -> level 1; and
+    ///         # root entry 0 is a one-gibibyte leaf over 0-1 GiB, R|W and no
+    ///         # X, which is how the supervisor loop reaches the CLINT.
+    ///         ...
+    ///         la t0, mtrap / csrw mtvec, t0
+    ///
+    ///         # The first comparator. Every later one is the handler's.
+    ///         li t0, CLINT_MTIME / ld t1, 0(t0)
+    ///         li t2, PERIOD / add t1, t1, t2
+    ///         li t0, CLINT_MTIMECMP / sd t1, 0(t0)
+    ///
+    ///         # mie.MTIE. mstatus.MIE is irrelevant: a machine-mode interrupt
+    ///         # is always enabled while the hart runs in a lower privilege.
+    ///         li t0, 0x80 / csrw mie, t0              # <- TIMER_BODY
+    ///
+    ///         li t0, PT_ROOT / srli t0, t0, 12
+    ///         li t1, 8 / slli t1, t1, 60 / or t0, t0, t1
+    ///         csrw satp, t0 / sfence.vma
+    ///
+    ///         li t0, 0x1800 / csrc mstatus, t0        # MPP = 01, supervisor
+    ///         li t0, 0x0800 / csrs mstatus, t0
+    ///         la t0, smain / csrw mepc, t0 / mret
+    ///
+    /// # s5, s6, s7 and s8 belong to the handler and the supervisor loop never
+    /// # touches them, so nothing is spilled: a handler that pushed a frame
+    /// # would put a store — and therefore a block boundary — in the middle of
+    /// # the one thing this workload exists to reach.
+    /// mtrap:  csrr s5, mcause
+    ///         bltz s5, mtimer                 # bit 63 set: an interrupt
+    ///         li s6, 9 / beq s5, s6, mecall   # ECALL from supervisor mode
+    ///         addi s0, s0, 1                  # anything else, counted
+    /// mecall: csrr s6, mepc / addi s6, s6, 4 / csrw mepc, s6 / mret
+    /// mtimer: li s6, CLINT_MTIME / ld s7, 0(s6)
+    ///         li s5, PERIOD / add s7, s7, s5
+    ///         li s6, CLINT_MTIMECMP / sd s7, 0(s6)
+    ///         addi s8, s8, 1                  # how many fired
+    ///         mret
+    /// ```
+    const MACHINE: [u32; 87] = [
+        0xfff0_0293, //   0  0x80000000  li t0, -0x1
+        0x0032_d293, //   1  0x80000004  srli t0, t0, 0x3
+        0x3b02_9073, //   2  0x80000008  csrw pmpaddr0, t0
+        0x00f0_0293, //   3  0x8000000c  li t0, 0xf
+        0x3a02_9073, //   4  0x80000010  csrw pmpcfg0, t0
+        0x2000_12b7, //   5  0x80000014  lui t0, 0x20001
+        0x0022_9293, //   6  0x80000018  slli t0, t0, 0x2
+        0x0010_0313, //   7  0x8000001c  li t1, 0x1
+        0x01f3_1313, //   8  0x80000020  slli t1, t1, 0x1f
+        0x2000_0393, //   9  0x80000024  li t2, 0x200
+        0x00c3_5e13, //  10  0x80000028  srli t3, t1, 0xc
+        0x00ae_1e13, //  11  0x8000002c  slli t3, t3, 0xa
+        0x00fe_6e13, //  12  0x80000030  ori t3, t3, 0xf
+        0x01c2_b023, //  13  0x80000034  sd t3, 0x0(t0)
+        0x0082_8293, //  14  0x80000038  addi t0, t0, 0x8
+        0x0000_1eb7, //  15  0x8000003c  lui t4, 0x1
+        0x01d3_0333, //  16  0x80000040  add t1, t1, t4
+        0xfff3_8393, //  17  0x80000044  addi t2, t2, -0x1
+        0xfe03_90e3, //  18  0x80000048  bnez t2, 0x28 <_start+0x28>
+        0x0008_02b7, //  19  0x8000004c  lui t0, 0x80
+        0x0032_8293, //  20  0x80000050  addi t0, t0, 0x3
+        0x00c2_9293, //  21  0x80000054  slli t0, t0, 0xc
+        0x2000_1337, //  22  0x80000058  lui t1, 0x20001
+        0x0023_1313, //  23  0x8000005c  slli t1, t1, 0x2
+        0x00c3_5313, //  24  0x80000060  srli t1, t1, 0xc
+        0x00a3_1313, //  25  0x80000064  slli t1, t1, 0xa
+        0x0013_6313, //  26  0x80000068  ori t1, t1, 0x1
+        0x0062_b023, //  27  0x8000006c  sd t1, 0x0(t0)
+        0x4000_12b7, //  28  0x80000070  lui t0, 0x40001
+        0x0012_9293, //  29  0x80000074  slli t0, t0, 0x1
+        0x0008_0337, //  30  0x80000078  lui t1, 0x80
+        0x0033_0313, //  31  0x8000007c  addi t1, t1, 0x3
+        0x00c3_1313, //  32  0x80000080  slli t1, t1, 0xc
+        0x00c3_5313, //  33  0x80000084  srli t1, t1, 0xc
+        0x00a3_1313, //  34  0x80000088  slli t1, t1, 0xa
+        0x0013_6313, //  35  0x8000008c  ori t1, t1, 0x1
+        0x0062_b823, //  36  0x80000090  sd t1, 0x10(t0)
+        0x0c70_0313, //  37  0x80000094  li t1, 0xc7
+        0x0062_b023, //  38  0x80000098  sd t1, 0x0(t0)
+        0x0000_0297, //  39  0x8000009c  auipc t0, 0x0
+        0x0782_8293, //  40  0x800000a0  addi t0, t0, 0x78
+        0x3052_9073, //  41  0x800000a4  csrw mtvec, t0
+        0x0200_c2b7, //  42  0x800000a8  lui t0, 0x200c
+        0xff82_8293, //  43  0x800000ac  addi t0, t0, -0x8
+        0x0002_b303, //  44  0x800000b0  ld t1, 0x0(t0)
+        0x0280_0393, //  45  0x800000b4  li t2, 0x28
+        0x0073_0333, //  46  0x800000b8  add t1, t1, t2
+        0x0200_42b7, //  47  0x800000bc  lui t0, 0x2004
+        0x0062_b023, //  48  0x800000c0  sd t1, 0x0(t0)
+        0x0800_0293, //  49  0x800000c4  li t0, 0x80
+        0x3042_9073, //  50  0x800000c8  csrw mie, t0
+        0x4000_12b7, //  51  0x800000cc  lui t0, 0x40001
+        0x0012_9293, //  52  0x800000d0  slli t0, t0, 0x1
+        0x00c2_d293, //  53  0x800000d4  srli t0, t0, 0xc
+        0x0080_0313, //  54  0x800000d8  li t1, 0x8
+        0x03c3_1313, //  55  0x800000dc  slli t1, t1, 0x3c
+        0x0062_e2b3, //  56  0x800000e0  or t0, t0, t1
+        0x1802_9073, //  57  0x800000e4  csrw satp, t0
+        0x1200_0073, //  58  0x800000e8  sfence.vma
+        0x0030_0293, //  59  0x800000ec  li t0, 0x3
+        0x00b2_9293, //  60  0x800000f0  slli t0, t0, 0xb
+        0x3002_b073, //  61  0x800000f4  csrc mstatus, t0
+        0x0010_0293, //  62  0x800000f8  li t0, 0x1
+        0x00b2_9293, //  63  0x800000fc  slli t0, t0, 0xb
+        0x3002_a073, //  64  0x80000100  csrs mstatus, t0
+        0x0000_1297, //  65  0x80000104  auipc t0, 0x1
+        0xefc2_8293, //  66  0x80000108  addi t0, t0, -0x104
+        0x3412_9073, //  67  0x8000010c  csrw mepc, t0
+        0x3020_0073, //  68  0x80000110  mret
+        0x3420_2af3, //  69  0x80000114  csrr s5, mcause
+        0x020a_c063, //  70  0x80000118  bltz s5, 0x138 <mtimer>
+        0x0090_0b13, //  71  0x8000011c  li s6, 0x9
+        0x016a_8463, //  72  0x80000120  beq s5, s6, 0x128 <mecall>
+        0x0014_0413, //  73  0x80000124  addi s0, s0, 0x1
+        0x3410_2b73, //  74  0x80000128  csrr s6, mepc
+        0x004b_0b13, //  75  0x8000012c  addi s6, s6, 0x4
+        0x341b_1073, //  76  0x80000130  csrw mepc, s6
+        0x3020_0073, //  77  0x80000134  mret
+        0x0200_cb37, //  78  0x80000138  lui s6, 0x200c
+        0xff8b_0b13, //  79  0x8000013c  addi s6, s6, -0x8
+        0x000b_3b83, //  80  0x80000140  ld s7, 0x0(s6)
+        0x0280_0a93, //  81  0x80000144  li s5, 0x28
+        0x015b_8bb3, //  82  0x80000148  add s7, s7, s5
+        0x0200_4b37, //  83  0x8000014c  lui s6, 0x2004
+        0x017b_3023, //  84  0x80000150  sd s7, 0x0(s6)
+        0x001c_0c13, //  85  0x80000154  addi s8, s8, 0x1
+        0x3020_0073, //  86  0x80000158  mret
     ];
 
-    fn board(engine: &str, tag: &str) -> Machine {
-        let firmware: Vec<u8> = PROGRAM.iter().flat_map(|w| w.to_le_bytes()).collect();
+    /// The supervisor half, one page above the machine-mode half — its own
+    /// 4 KiB page on purpose, so `SFENCE.VMA` cools *this* translation and the
+    /// handler's page is untouched.
+    ///
+    /// Everything below runs translated, and every line of it is a paragraph
+    /// of `cpu::riscv::engine`'s own documentation turned into guest code:
+    ///
+    /// | seam in `cpu::riscv::engine` | what the loop does about it |
+    /// | --- | --- |
+    /// | `lift::MAX_INSNS` = 64, `CHAIN` = 16 | sixty-four consecutive lifted ALU instructions, so one `advance` is a chain rather than a block |
+    /// | *"a store still ends the block"* | a store and a load to a different 4 KiB page every pass, sixty-four of them |
+    /// | `IrHost::load` and a **lazily-advanced device** | `ld` of the CLINT's `mtime` **from inside a lifted block**, every pass — the load that catches the chip up to the hart's live position and can raise `mtip` between two instructions |
+    /// | `admit`'s exclusion list | `SFENCE.VMA` every sixteenth pass, a supervisor CSR round trip every eighth, an `amoadd.d` every thirty-second, an `ECALL` every two hundred and fifty-sixth — every one of them outside the lifted subset and therefore a declined boundary |
+    /// | the entry translation in `admit` | that same `SFENCE.VMA`, which throws away this page's *fetch* translation: the RISC-V analogue of the `TLBI` that found the third A64 defect, and the only thing on this hart that cools a fetch entry |
+    /// | the data-side walk and its accessed and dirty bits | the tables leave `A` and `D` clear, so the first touch of each page after each flush takes the update |
+    ///
+    /// `mtime` is folded into the **first** of the sixty-four ALU
+    /// instructions, and that is deliberate: a divergence about *when* a block
+    /// noticed the timer becomes an arithmetic difference in a named register
+    /// on the very next pass, rather than something only `debt` and `pc` carry.
+    ///
+    /// ```text
+    /// smain:  li s1, DATA / li s3, CLINT_MTIME / li s4, SCRATCH
+    ///         li s2, 0
+    ///         li a0..a7, s9, s10, s11, t4, t5, t6, 0
+    /// sloop:  addi s2, s2, 1
+    ///         andi t0, s2, 63 / slli t0, t0, 12 / add t0, t0, s1
+    ///         sd s2, 0(t0)                    ; a store ends its block
+    ///         ld t1, 0(t0)
+    ///         ld t2, 0(s3)                    ; <- CLINT_BODY: mtime
+    ///         .rept 4                         ; sixty-four ALU instructions
+    ///         add a0,a0,t2 / xor a1,a1,a0 / sub a2,a2,a1 / add a3,a3,a2
+    ///         slli a4,a3,1 / xor a5,a5,a4 / add a6,a6,a5 / srli a7,a6,3
+    ///         add s9,s9,a7 / xor s10,s10,s9 / sub s11,s11,s10 / add t4,t4,s11
+    ///         xor t5,t5,t4 / addw t6,t6,t5 / sllw t4,t6,2 / add a0,a0,t4
+    ///         .endr
+    ///         andi t3, s2, 15  / bnez t3, 1f
+    ///         sfence.vma                      ; <- SFENCE_BODY
+    /// 1:      andi t3, s2, 7   / bnez t3, 2f
+    ///         csrr t3, sscratch / csrw sscratch, s2   ; <- CSR_BODY
+    /// 2:      andi t3, s2, 31  / bnez t3, 3f
+    ///         amoadd.d t3, s2, (s4)           ; <- AMO_BODY
+    /// 3:      andi t3, s2, 255 / bnez t3, 4f
+    ///         ecall                           ; <- ECALL_BODY
+    /// 4:      j sloop
+    /// ```
+    const SUPERVISOR: [u32; 107] = [
+        0x0080_14b7, //   0  0x80001000  lui s1, 0x801
+        0x0084_9493, //   1  0x80001004  slli s1, s1, 0x8
+        0x0200_c9b7, //   2  0x80001008  lui s3, 0x200c
+        0xff89_8993, //   3  0x8000100c  addi s3, s3, -0x8
+        0x0008_0a37, //   4  0x80001010  lui s4, 0x80
+        0x005a_0a13, //   5  0x80001014  addi s4, s4, 0x5
+        0x00ca_1a13, //   6  0x80001018  slli s4, s4, 0xc
+        0x0000_0913, //   7  0x8000101c  li s2, 0x0
+        0x0000_0513, //   8  0x80001020  li a0, 0x0
+        0x0000_0593, //   9  0x80001024  li a1, 0x0
+        0x0000_0613, //  10  0x80001028  li a2, 0x0
+        0x0000_0693, //  11  0x8000102c  li a3, 0x0
+        0x0000_0713, //  12  0x80001030  li a4, 0x0
+        0x0000_0793, //  13  0x80001034  li a5, 0x0
+        0x0000_0813, //  14  0x80001038  li a6, 0x0
+        0x0000_0893, //  15  0x8000103c  li a7, 0x0
+        0x0000_0c93, //  16  0x80001040  li s9, 0x0
+        0x0000_0d13, //  17  0x80001044  li s10, 0x0
+        0x0000_0d93, //  18  0x80001048  li s11, 0x0
+        0x0000_0e93, //  19  0x8000104c  li t4, 0x0
+        0x0000_0f13, //  20  0x80001050  li t5, 0x0
+        0x0000_0f93, //  21  0x80001054  li t6, 0x0
+        0x0019_0913, //  22  0x80001058  addi s2, s2, 0x1
+        0x03f9_7293, //  23  0x8000105c  andi t0, s2, 0x3f
+        0x00c2_9293, //  24  0x80001060  slli t0, t0, 0xc
+        0x0092_82b3, //  25  0x80001064  add t0, t0, s1
+        0x0122_b023, //  26  0x80001068  sd s2, 0x0(t0)
+        0x0002_b303, //  27  0x8000106c  ld t1, 0x0(t0)
+        0x0009_b383, //  28  0x80001070  ld t2, 0x0(s3)
+        0x0075_0533, //  29  0x80001074  add a0, a0, t2
+        0x00a5_c5b3, //  30  0x80001078  xor a1, a1, a0
+        0x40b6_0633, //  31  0x8000107c  sub a2, a2, a1
+        0x00c6_86b3, //  32  0x80001080  add a3, a3, a2
+        0x0016_9713, //  33  0x80001084  slli a4, a3, 0x1
+        0x00e7_c7b3, //  34  0x80001088  xor a5, a5, a4
+        0x00f8_0833, //  35  0x8000108c  add a6, a6, a5
+        0x0038_5893, //  36  0x80001090  srli a7, a6, 0x3
+        0x011c_8cb3, //  37  0x80001094  add s9, s9, a7
+        0x019d_4d33, //  38  0x80001098  xor s10, s10, s9
+        0x41ad_8db3, //  39  0x8000109c  sub s11, s11, s10
+        0x01be_8eb3, //  40  0x800010a0  add t4, t4, s11
+        0x01df_4f33, //  41  0x800010a4  xor t5, t5, t4
+        0x01ef_8fbb, //  42  0x800010a8  addw t6, t6, t5
+        0x002f_9e9b, //  43  0x800010ac  slliw t4, t6, 0x2
+        0x01d5_0533, //  44  0x800010b0  add a0, a0, t4
+        0x0075_0533, //  45  0x800010b4  add a0, a0, t2
+        0x00a5_c5b3, //  46  0x800010b8  xor a1, a1, a0
+        0x40b6_0633, //  47  0x800010bc  sub a2, a2, a1
+        0x00c6_86b3, //  48  0x800010c0  add a3, a3, a2
+        0x0016_9713, //  49  0x800010c4  slli a4, a3, 0x1
+        0x00e7_c7b3, //  50  0x800010c8  xor a5, a5, a4
+        0x00f8_0833, //  51  0x800010cc  add a6, a6, a5
+        0x0038_5893, //  52  0x800010d0  srli a7, a6, 0x3
+        0x011c_8cb3, //  53  0x800010d4  add s9, s9, a7
+        0x019d_4d33, //  54  0x800010d8  xor s10, s10, s9
+        0x41ad_8db3, //  55  0x800010dc  sub s11, s11, s10
+        0x01be_8eb3, //  56  0x800010e0  add t4, t4, s11
+        0x01df_4f33, //  57  0x800010e4  xor t5, t5, t4
+        0x01ef_8fbb, //  58  0x800010e8  addw t6, t6, t5
+        0x002f_9e9b, //  59  0x800010ec  slliw t4, t6, 0x2
+        0x01d5_0533, //  60  0x800010f0  add a0, a0, t4
+        0x0075_0533, //  61  0x800010f4  add a0, a0, t2
+        0x00a5_c5b3, //  62  0x800010f8  xor a1, a1, a0
+        0x40b6_0633, //  63  0x800010fc  sub a2, a2, a1
+        0x00c6_86b3, //  64  0x80001100  add a3, a3, a2
+        0x0016_9713, //  65  0x80001104  slli a4, a3, 0x1
+        0x00e7_c7b3, //  66  0x80001108  xor a5, a5, a4
+        0x00f8_0833, //  67  0x8000110c  add a6, a6, a5
+        0x0038_5893, //  68  0x80001110  srli a7, a6, 0x3
+        0x011c_8cb3, //  69  0x80001114  add s9, s9, a7
+        0x019d_4d33, //  70  0x80001118  xor s10, s10, s9
+        0x41ad_8db3, //  71  0x8000111c  sub s11, s11, s10
+        0x01be_8eb3, //  72  0x80001120  add t4, t4, s11
+        0x01df_4f33, //  73  0x80001124  xor t5, t5, t4
+        0x01ef_8fbb, //  74  0x80001128  addw t6, t6, t5
+        0x002f_9e9b, //  75  0x8000112c  slliw t4, t6, 0x2
+        0x01d5_0533, //  76  0x80001130  add a0, a0, t4
+        0x0075_0533, //  77  0x80001134  add a0, a0, t2
+        0x00a5_c5b3, //  78  0x80001138  xor a1, a1, a0
+        0x40b6_0633, //  79  0x8000113c  sub a2, a2, a1
+        0x00c6_86b3, //  80  0x80001140  add a3, a3, a2
+        0x0016_9713, //  81  0x80001144  slli a4, a3, 0x1
+        0x00e7_c7b3, //  82  0x80001148  xor a5, a5, a4
+        0x00f8_0833, //  83  0x8000114c  add a6, a6, a5
+        0x0038_5893, //  84  0x80001150  srli a7, a6, 0x3
+        0x011c_8cb3, //  85  0x80001154  add s9, s9, a7
+        0x019d_4d33, //  86  0x80001158  xor s10, s10, s9
+        0x41ad_8db3, //  87  0x8000115c  sub s11, s11, s10
+        0x01be_8eb3, //  88  0x80001160  add t4, t4, s11
+        0x01df_4f33, //  89  0x80001164  xor t5, t5, t4
+        0x01ef_8fbb, //  90  0x80001168  addw t6, t6, t5
+        0x002f_9e9b, //  91  0x8000116c  slliw t4, t6, 0x2
+        0x01d5_0533, //  92  0x80001170  add a0, a0, t4
+        0x00f9_7e13, //  93  0x80001174  andi t3, s2, 0xf
+        0x000e_1463, //  94  0x80001178  bnez t3, 0x1180 <sfence_end>
+        0x1200_0073, //  95  0x8000117c  sfence.vma
+        0x0079_7e13, //  96  0x80001180  andi t3, s2, 0x7
+        0x000e_1663, //  97  0x80001184  bnez t3, 0x1190 <csr_end>
+        0x1400_2e73, //  98  0x80001188  csrr t3, sscratch
+        0x1409_1073, //  99  0x8000118c  csrw sscratch, s2
+        0x01f9_7e13, // 100  0x80001190  andi t3, s2, 0x1f
+        0x000e_1463, // 101  0x80001194  bnez t3, 0x119c <amo_end>
+        0x012a_3e2f, // 102  0x80001198  <unknown>
+        0x0ff9_7e13, // 103  0x8000119c  zext.b t3, s2
+        0x000e_1463, // 104  0x800011a0  bnez t3, 0x11a8 <ecall_end>
+        0x0000_0073, // 105  0x800011a4  ecall
+        0xeb1f_f06f, // 106  0x800011a8  j 0x1058 <sloop>
+    ];
+
+    /// Where the supervisor half sits, relative to [`DRAM`]: its own page.
+    const SUPERVISOR_AT: usize = 0x1000;
+
+    /// The word index of `sloop` in [`SUPERVISOR`], for the self-check below.
+    const SLOOP: usize = 22;
+    /// The two instructions that arm `mie.MTIE`, in [`MACHINE`].
+    const TIMER_BODY: (usize, usize) = (49, 51);
+    /// `ld t2, 0(s3)` — the CLINT read, in [`SUPERVISOR`].
+    const CLINT_BODY: (usize, usize) = (28, 29);
+    /// `sfence.vma`.
+    const SFENCE_BODY: (usize, usize) = (95, 96);
+    /// `csrr t3, sscratch` and `csrw sscratch, s2`.
+    const CSR_BODY: (usize, usize) = (98, 100);
+    /// `amoadd.d t3, s2, (s4)`.
+    const AMO_BODY: (usize, usize) = (102, 103);
+    /// `ecall`.
+    const ECALL_BODY: (usize, usize) = (105, 106);
+
+    /// Which of the workload's seams this build of the guest reaches.
+    ///
+    /// Every field off is still a valid guest — each window is replaced by
+    /// [`NOP`]s in place and every branch around it keeps its displacement —
+    /// so a bisect changes one property at a time and nothing else.
+    /// [`Seams::ALL`] is what the committed test runs.
+    ///
+    /// This is the x86 leg's `Stress` on a second core, and it is here for the
+    /// same reason: *"the same workload with either one alone agrees for six
+    /// thousand quanta"* is the sentence that took the third A64 defect from a
+    /// hash mismatch to a named function, and producing it should not need an
+    /// edit.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Seams {
+        /// Arm `mie.MTIE`, so the CLINT can interrupt the hart at all. With it
+        /// off the chip still counts and `mtip` still rises on the wire; the
+        /// hart simply never traps, and nothing re-arms the comparator.
+        pub(crate) timer: bool,
+        /// Keep the `ld` of `mtime` from inside the lifted loop — the load
+        /// that catches a lazily-advanced device up to the hart's live
+        /// position.
+        pub(crate) clint: bool,
+        /// Keep `SFENCE.VMA`, which cools this code page's fetch translation.
+        pub(crate) sfence: bool,
+        /// Keep the supervisor CSR round trip.
+        pub(crate) csr: bool,
+        /// Keep `amoadd.d`, which is outside the lifted subset and reports its
+        /// store through the interpreter's own log.
+        pub(crate) amo: bool,
+        /// Keep `ECALL`.
+        pub(crate) ecall: bool,
+    }
+
+    impl Seams {
+        /// Everything on: the committed workload.
+        pub(crate) const ALL: Seams = Seams {
+            timer: true,
+            clint: true,
+            sfence: true,
+            csr: true,
+            amo: true,
+            ecall: true,
+        };
+
+        /// The seams named in `keep`, and nothing else.
+        pub(crate) fn keeping(keep: &str) -> Seams {
+            let has = |name: &str| keep.split(',').any(|s| s.trim() == name);
+            Seams {
+                timer: has("timer"),
+                clint: has("clint"),
+                sfence: has("sfence"),
+                csr: has("csr"),
+                amo: has("amo"),
+                ecall: has("ecall"),
+            }
+        }
+    }
+
+    /// The firmware image: [`MACHINE`] at [`DRAM`], [`SUPERVISOR`] one page
+    /// above it, and the seams `seams` turns off replaced by [`NOP`]s.
+    ///
+    /// One image rather than two writes into RAM after the build, because
+    /// `riscv-virt` already has a loader for exactly this and a cold reset
+    /// zeroes DRAM *before* the loaders run — so anything written by hand
+    /// afterwards would be a second mechanism to keep in step with the first.
+    fn program(seams: Seams) -> Vec<u8> {
+        let mut machine = MACHINE;
+        if !seams.timer {
+            for word in &mut machine[TIMER_BODY.0..TIMER_BODY.1] {
+                *word = NOP;
+            }
+        }
+        let mut supervisor = SUPERVISOR;
+        for (keep, (from, to)) in [
+            (seams.clint, CLINT_BODY),
+            (seams.sfence, SFENCE_BODY),
+            (seams.csr, CSR_BODY),
+            (seams.amo, AMO_BODY),
+            (seams.ecall, ECALL_BODY),
+        ] {
+            if !keep {
+                for word in &mut supervisor[from..to] {
+                    *word = NOP;
+                }
+            }
+        }
+        let mut image: Vec<u8> = machine.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // The gap between the two halves is never executed and never read; it
+        // is there so the supervisor loop gets a page of its own.
+        image.resize(SUPERVISOR_AT, 0);
+        image.extend(supervisor.iter().flat_map(|w| w.to_le_bytes()));
+        image
+    }
+
+    /// The addresses and windows this module names are the ones the assembled
+    /// words carry.
+    ///
+    /// A named constant nothing checks drifts from the bytes it describes, and
+    /// hand-placed offsets into an assembled blob are exactly where that goes
+    /// unnoticed: `SFENCE_BODY` off by one would blank the `bnez` in front of
+    /// it and the loop would fall into the next test with a different
+    /// displacement, so a bisect would blame the wrong seam and the guest
+    /// would still look like it ran.
+    #[test]
+    fn the_guest_carries_the_windows_and_the_addresses_this_file_names() {
+        // The immediates the two halves were assembled with, read back out of
+        // the encodings. `lui`'s immediate is bits 31:12 of the instruction,
+        // already in place; `addi`'s is a signed twelve-bit field at bit 20;
+        // `slli`'s shift amount is the low six bits of the same field
+        // (*Volume I*, §2.4 and §4.2).
+        let lui = |word: u32| u64::from(word & 0xffff_f000);
+        let imm12 = |word: u32| i64::from((word as i32) >> 20);
+        let shamt = |word: u32| (word >> 20) & 0x3f;
+        // Every address this module names, out of the instruction that
+        // materialises it. A constant nothing reads back is a comment.
+        assert_eq!(
+            (imm12(MACHINE[7]) as u64) << shamt(MACHINE[8]),
+            DRAM,
+            "`li t1, 0x80000000`, the base of the identity map"
+        );
+        assert_eq!(
+            lui(MACHINE[5]) << shamt(MACHINE[6]),
+            PT_L0,
+            "`li t0, PT_L0`"
+        );
+        assert_eq!(
+            lui(MACHINE[19]).wrapping_add(imm12(MACHINE[20]) as u64) << shamt(MACHINE[21]),
+            PT_L1,
+            "`li t0, PT_L1`"
+        );
+        assert_eq!(
+            lui(MACHINE[28]) << shamt(MACHINE[29]),
+            PT_ROOT,
+            "`li t0, PT_ROOT`"
+        );
+        assert_eq!(
+            lui(MACHINE[42]).wrapping_add(imm12(MACHINE[43]) as u64),
+            CLINT_MTIME,
+            "`li t0, CLINT_MTIME`, in the machine-mode half"
+        );
+        assert_eq!(
+            lui(MACHINE[47]),
+            CLINT_MTIMECMP,
+            "`li t0, CLINT_MTIMECMP`, in the machine-mode half"
+        );
+        assert_eq!(
+            imm12(MACHINE[45]) as u64,
+            PERIOD,
+            "the first comparator's `li t2, PERIOD`"
+        );
+        assert_eq!(
+            imm12(MACHINE[81]) as u64,
+            PERIOD,
+            "the handler re-arms with the same period it started with"
+        );
+        assert_eq!(
+            lui(SUPERVISOR[2]).wrapping_add(imm12(SUPERVISOR[3]) as u64),
+            CLINT_MTIME,
+            "smain's `li s3, CLINT_MTIME`"
+        );
+        assert_eq!(
+            lui(SUPERVISOR[0]) << shamt(SUPERVISOR[1]),
+            DATA,
+            "smain's `li s1, DATA`"
+        );
+        assert_eq!(
+            lui(SUPERVISOR[4]).wrapping_add(imm12(SUPERVISOR[5]) as u64) << shamt(SUPERVISOR[6]),
+            SCRATCH,
+            "smain's `li s4, SCRATCH`"
+        );
+        for (name, (from, to), want) in [
+            ("the CLINT read", CLINT_BODY, &[0x0009_b383u32][..]),
+            ("sfence.vma", SFENCE_BODY, &[0x1200_0073]),
+            ("the CSR round trip", CSR_BODY, &[0x1400_2e73, 0x1409_1073]),
+            ("amoadd.d", AMO_BODY, &[0x012a_3e2f]),
+            ("ecall", ECALL_BODY, &[0x0000_0073]),
+        ] {
+            assert_eq!(&SUPERVISOR[from..to], want, "the window for {name} moved");
+        }
+        assert_eq!(
+            &MACHINE[TIMER_BODY.0..TIMER_BODY.1],
+            &[0x0800_0293, 0x3042_9073],
+            "the window for `li t0, 0x80; csrw mie, t0` moved"
+        );
+        assert_eq!(
+            SUPERVISOR[SLOOP], 0x0019_0913,
+            "`sloop` no longer starts with `addi s2, s2, 1`"
+        );
+        // The back edge really does close the loop: `j sloop` is a JAL with
+        // rd = x0 and a twenty-bit displacement in the J immediate's scrambled
+        // order (*Volume I*, §2.3).
+        let jal = SUPERVISOR[ECALL_BODY.1];
+        let disp = (((jal >> 31) & 1) << 20)
+            | (((jal >> 12) & 0xff) << 12)
+            | (((jal >> 20) & 1) << 11)
+            | (((jal >> 21) & 0x3ff) << 1);
+        let disp = ((disp as i32) << 11) >> 11;
+        assert_eq!(
+            (ECALL_BODY.1 as i32) * 4 + disp,
+            SLOOP as i32 * 4,
+            "the back edge does not land on `sloop`"
+        );
+        // Every seam off is still a guest of exactly the same length with the
+        // same branches in the same places.
+        assert_eq!(program(Seams::ALL).len(), program(Seams::keeping("")).len());
+    }
+
+    /// Build `riscv-virt` on `engine` with this workload in its firmware slot.
+    ///
+    /// The catalog's board rather than one written here, because the seam this
+    /// leg exists for **is a device**: `cpu::riscv::engine` says so in as many
+    /// words — nothing on this hart is driven off its own tick count the way
+    /// A64's generic timer is, and the raiser is the CLINT on the other side
+    /// of a load. A hand-written board would have to grow one anyway, and this
+    /// one has it wired the way a real guest meets it.
+    ///
+    /// Sixteen mebibytes of DRAM: the full state hash walks all of it, and the
+    /// guest's top address is `DATA` plus sixty-four pages.
+    pub(crate) fn board(engine: &str, tag: &str, seams: Seams) -> (Machine, Arc<Hart>) {
+        board_with(engine, tag, &program(seams))
+    }
+
+    /// [`board`], with any firmware image at all — the reproduction at the
+    /// bottom of this module wants a different guest on the same board.
+    fn board_with(engine: &str, tag: &str, firmware: &[u8]) -> (Machine, Arc<Hart>) {
+        let harts: Arc<Captured<Hart>> = Arc::new(Captured::new());
+        let kept = Arc::clone(&harts);
+        let mut bindings = catalog::bindings().expect("this build's bindings");
+        bindings.replace("cpu.riscv", move |props| {
+            let hart = Arc::new(Hart::from_props(props)?);
+            kept.push(&hart);
+            Ok(hart)
+        });
         let entry = catalog::machine("riscv-virt").expect("this build ships riscv-virt");
-        let mut options = catalog::build_options().expect("the catalog agrees with itself");
-        options
-            .realize
-            .media
-            .insert("firmware", firmware.as_slice());
+        let mut options = catalog::build_options()
+            .expect("the catalog agrees with itself")
+            .with_bindings(bindings);
+        options.realize.media.insert("firmware", firmware);
         for slot in ["flash0", "flash1", "disk", "initrd"] {
             options.realize.media.insert(slot, &[][..]);
         }
@@ -675,8 +1272,193 @@ mod riscv {
             options.resolve.params.push((String::from(name), value));
         }
         let registry = catalog::registry().expect("a registry");
-        rsemu::machine::build(entry.name, entry.source, &registry, &options)
-            .unwrap_or_else(|e| panic!("riscv-virt does not build with engine={engine}: {e}"))
+        let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+            .unwrap_or_else(|e| panic!("riscv-virt does not build with engine={engine}: {e}"));
+        let hart = harts.take().expect("the binding captured the hart");
+        (machine, hart)
+    }
+
+    /// **A defect this leg found and did not fix**: on `riscv-virt` the CLINT's
+    /// `mtime` does not move while the hart is running, so a guest reads the
+    /// same value for a whole quantum.
+    ///
+    /// # What the guest does
+    ///
+    /// [`TICK_PROBE`] reads `mtime` in a tight loop and counts how many
+    /// **distinct** values it sees. It is run for eight quanta and asked how
+    /// many it found.
+    ///
+    /// # What it should find
+    ///
+    /// `riscv.clint` is a lazily-advanced device (`ROADMAP.md` §4.2) and its
+    /// `Registers::read` calls `sync` before answering, precisely so that *"a
+    /// guest load catches the chip up to the core's live position"* — the
+    /// sentence is `cpu::riscv::engine`'s own. A hart on this board is given
+    /// `SchedulerConfig::max_ticks_per_quantum` — ten thousand — of a 1 GHz
+    /// domain per round, which is 10 µs, and `mtime` counts at 10 MHz, so a
+    /// round's worth of execution spans about **a hundred** distinct `mtime`
+    /// values. Eight quanta should therefore find several hundred.
+    ///
+    /// # What it does find: eight. One per quantum.
+    ///
+    /// `Scheduler::arm_live_cursors` builds each lazy device's live view on
+    /// the running runnable's [`TickCursor`], and a catch-up reads the
+    /// runnable's own tick counter out of it. `Hart::attach_cursor` keeps only
+    /// the cursor's **exit flag** and drops the position half, saying so in as
+    /// many words: *"this hart does not publish its own position — nothing on
+    /// a RISC-V board here is sampled inside an instruction the way a PPU
+    /// is"*. So the counter never moves while the hart runs, every `sync`
+    /// during a round catches the CLINT up to where the round **began**, and
+    /// `mtime` advances only in `close_round`.
+    ///
+    /// # Why it matters here rather than only as a clock-resolution nit
+    ///
+    /// It closes, at the board level, the one seam this whole leg was asked to
+    /// stress. `cpu::riscv::engine` documents the window exactly — *"`mtip`
+    /// then rises between two instructions of a lifted block, where
+    /// `Exec::step` would have taken the trap at the next one"* — and
+    /// `IrHost::load` is the fix for it. But a rise can only happen where the
+    /// comparator is crossed, and on this board it is never crossed anywhere
+    /// but `close_round`, which is a quantum boundary and where both engines
+    /// agree by construction. Measured: the workload above takes **1 999 timer
+    /// interrupts in 2 000 quanta** — exactly one each — with the seam knob
+    /// `clint` on and with it off alike, which is the same statement from the
+    /// other side.
+    ///
+    /// So `engine::tests::a_load_that_raises_an_interrupt_is_taken_where_the_
+    /// interpreter_takes_it`, which builds a device that raises
+    /// unconditionally, is the **only** coverage that seam has, and no guest
+    /// on a shipped RISC-V board can reach it. That is worth knowing before
+    /// somebody deletes `IrHost::load`'s hand-back as dead code.
+    ///
+    /// The fix is not in this file's territory and is not obviously small: it
+    /// means giving the hart a live position to publish, which is a change to
+    /// how `Hart::run_budget` and `engine::advance` account ticks, and it has
+    /// a cost on the hot path. Filed rather than attempted.
+    #[test]
+    #[ignore = "fails on master: riscv-virt's CLINT does not advance within a quantum — see the doc comment"]
+    fn the_clint_advances_while_the_hart_is_running() {
+        /// `mtime` in a tight loop, counting distinct values into `t2`.
+        ///
+        /// ```text
+        ///         li   t3, CLINT_MTIME
+        ///         ld   t1, 0(t3)
+        ///         li   t2, 0
+        /// loop:   ld   t0, 0(t3)
+        ///         beq  t0, t1, loop       ; the same instant: go round again
+        ///         addi t2, t2, 1          ; a new one: count it
+        ///         mv   t1, t0
+        ///         j    loop
+        /// ```
+        const TICK_PROBE: [u32; 9] = [
+            0x0200_ce37, // lui  t3, 0x200c
+            0xff8e_0e13, // addi t3, t3, -0x8
+            0x000e_3303, // ld   t1, 0x0(t3)
+            0x0000_0393, // li   t2, 0x0
+            0x000e_3283, // loop: ld t0, 0x0(t3)
+            0xfe62_8ee3, // beq  t0, t1, loop
+            0x0013_8393, // addi t2, t2, 0x1
+            0x0002_8313, // mv   t1, t0
+            0xff1f_f06f, // j    loop
+        ];
+
+        const QUANTA: u64 = 8;
+        let image: Vec<u8> = TICK_PROBE.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let (mut machine, hart) = board_with("interp", "clint-probe", &image);
+        for _ in 0..QUANTA {
+            machine.run_quantum().expect("the machine runs");
+        }
+        // x7 is t2.
+        let seen = hart.x(7);
+        assert!(
+            seen > QUANTA,
+            "the guest read `mtime` for {QUANTA} quanta and saw {seen} distinct \
+             value(s) — one per quantum, so the CLINT is not being caught up to \
+             the hart's live position and `mtip` can never rise inside a block. \
+             See this test's doc comment for the diagnosis."
+        );
+    }
+
+    /// Assert the guest actually did what it was written to do.
+    ///
+    /// Without this the run could be green because the hart faulted on its
+    /// first instruction: a comparison of two stopped machines agrees at every
+    /// checkpoint. Each of these is a property the workload exists for, and
+    /// the first of them — `s0`, the machine-mode handler's count of traps
+    /// that were neither the timer nor the `ECALL` — has caught a wrong page
+    /// table twice while this file was being written.
+    pub(crate) fn assert_the_workload_ran(hart: &Hart, engine: &str, seams: Seams) {
+        // x8 is s0: anything the machine-mode handler could not account for.
+        assert_eq!(
+            hart.x(8),
+            0,
+            "engine={engine}: the machine-mode handler took {} trap(s) that \
+             were neither the timer nor the guest's own ECALL — a page fault \
+             out of the Sv39 tables, most likely, in which case the supervisor \
+             loop is not running and this run compared two stopped harts",
+            hart.x(8)
+        );
+        // x18 is s2, the pass counter.
+        assert!(
+            hart.x(18) > 1_000,
+            "engine={engine}: the loop went round {} times, so the guest is \
+             not running the workload at all",
+            hart.x(18)
+        );
+        if seams.timer {
+            // x24 is s8, incremented once per timer interrupt taken.
+            assert!(
+                hart.x(24) > 0,
+                "engine={engine}: the CLINT never interrupted, so the run says \
+                 nothing about where a translated block notices one"
+            );
+        }
+        // `RSEMU_LONGRUN_ENGINES=interp` is the control leg — an interpreter
+        // against itself — and an interpreted hart has no statistics.
+        if let Some((blocks, host)) = hart.jit_stats() {
+            assert!(
+                blocks > 0,
+                "engine={engine} executed no translated block, so the run \
+                 compared two interpreters"
+            );
+            eprintln!(
+                "riscv-virt engine={engine}: {} pass(es), {} timer interrupt(s), \
+                 {blocks} block(s) of which {host} as host code",
+                hart.x(18),
+                hart.x(24)
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "machine-riscv-virt", feature = "cpu-riscv-lift"))]
+mod riscv_tests {
+    use super::longrun::{self, Options};
+    use super::riscv::{self, Seams};
+
+    fn engines() -> Vec<String> {
+        std::env::var("RSEMU_LONGRUN_ENGINES")
+            .unwrap_or_else(|_| "jit,jit-host".to_string())
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Which seams this run keeps.
+    ///
+    /// Everything, unless `RSEMU_RISCV_LONGRUN_SEAMS` names a subset —
+    /// `timer,clint,sfence,csr,amo,ecall` — which is what a bisect turns off
+    /// one at a time once this test has failed. See [`Seams::keeping`].
+    fn seams() -> Seams {
+        match std::env::var("RSEMU_RISCV_LONGRUN_SEAMS") {
+            Ok(keep) => {
+                let seams = Seams::keeping(&keep);
+                eprintln!("riscv-virt: RSEMU_RISCV_LONGRUN_SEAMS={keep} -> {seams:?}");
+                seams
+            }
+            Err(_) => Seams::ALL,
+        }
     }
 
     #[test]
@@ -685,18 +1467,16 @@ mod riscv {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
-        // The same variable the A64 legs read, so `RSEMU_LONGRUN_ENGINES=interp`
-        // is the control on every board rather than on one of them.
-        let engines =
-            std::env::var("RSEMU_LONGRUN_ENGINES").unwrap_or_else(|_| "jit,jit-host".to_string());
-        for engine in engines.split(',').filter(|s| !s.is_empty()) {
-            let mut oracle = board("interp", &format!("oracle.{engine}"));
-            let mut under_test = board(engine, engine);
+        let seams = seams();
+        for engine in engines() {
+            let (mut oracle, _) = riscv::board("interp", &format!("oracle.{engine}"), seams);
+            let (mut under_test, hart) = riscv::board(&engine, &engine, seams);
             let opts = Options::to_guest_seconds(secs).hashing_every(2_000);
-            match longrun::lockstep("riscv-virt", &mut oracle, engine, &mut under_test, &opts) {
+            match longrun::lockstep("riscv-virt", &mut oracle, &engine, &mut under_test, &opts) {
                 Ok(summary) => eprintln!("riscv-virt engine={engine}: {summary}"),
                 Err(d) => panic!("{d}"),
             }
+            riscv::assert_the_workload_ran(&hart, &engine, seams);
         }
     }
 }
@@ -1502,5 +2282,304 @@ mod x86_tests {
     #[test]
     fn a_synthetic_x86_workload_agrees_across_the_engines() {
         run("x86-longrun", stress(), &budget());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the gate on a third core: a real x86-64 kernel
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "machine-pc64", feature = "cpu-x86-lift"))]
+mod pc64 {
+    use std::sync::Arc;
+
+    use super::longrun::{self, Options};
+    use rsemu::core::Captured;
+    use rsemu::cpu::x86::{Variant, X86};
+    use rsemu::host::chardev::CharPort;
+    use rsemu::machine::{Machine, catalog};
+
+    /// Build `pc64` on `engine` with `kernel` and `initrd` in its slots, and
+    /// hand back its processor and the host end of its console.
+    ///
+    /// `console` is per-machine, because two of these run in one process and
+    /// must not type at each other. There is no `power` parameter on this
+    /// board — it has no system-control device — so there is nothing else to
+    /// keep apart.
+    ///
+    /// `nokaslr` is not optional and `machines/pc64.machine` says why at
+    /// length: this board has no firmware, so nothing has ever loaded a count
+    /// into the 8254, and a kernel that draws randomisation entropy from the
+    /// read-back command's null-count bit spins in the decompressor forever.
+    /// `cryptomgr.notests` is what keeps a boot to a few hundred guest seconds
+    /// rather than a few thousand.
+    fn board(
+        engine: &str,
+        tag: &str,
+        kernel: &[u8],
+        initrd: &[u8],
+    ) -> (Machine, Arc<X86>, Arc<CharPort>) {
+        let port = format!("longrun.{tag}");
+        let entry = catalog::machine("pc64").expect("this build ships it");
+        // The catalog's own binding, with a hand kept on what it builds: a
+        // translated run has to be able to say how many blocks it executed,
+        // and `Machine` deliberately hands out a `dyn Device`.
+        let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
+        let kept = Arc::clone(&cpus);
+        let mut bindings = catalog::bindings().expect("this build's bindings");
+        bindings.replace("cpu.x86", move |props| {
+            let cpu = Arc::new(X86::from_props_defaulting(props, Variant::X86_64)?);
+            kept.push(&cpu);
+            Ok(cpu)
+        });
+        let options = catalog::build_options()
+            .expect("the catalog agrees with itself")
+            .with_bindings(bindings)
+            .with_media("kernel", kernel)
+            .with_media("initrd", initrd)
+            .with_param("engine", engine)
+            .with_param(
+                "extmem",
+                std::env::var("RSEMU_X86_RAM").unwrap_or_else(|_| "256M".to_string()),
+            )
+            .with_param(
+                "cmdline",
+                std::env::var("RSEMU_X86_CMDLINE").unwrap_or_else(|_| {
+                    "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr cryptomgr.notests"
+                        .to_string()
+                }),
+            )
+            .with_param("console", port.clone());
+        let registry = catalog::registry().expect("a registry");
+        let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+            .unwrap_or_else(|e| panic!("pc64 does not build with engine={engine}: {e}"));
+        let console = rsemu::host::chardev::ports::open(&options.realize.hosts, &port)
+            .expect("the 16550 opened this port under the same name");
+        let cpu = cpus.take().expect("the binding captured the core");
+        (machine, cpu, console)
+    }
+
+    /// The x86 half of the kernel gate: a stock `bzImage`, both engines,
+    /// quantum by quantum.
+    ///
+    /// # Why this exists rather than the synthetic x86 leg alone
+    ///
+    /// The synthetic leg above is written seam by seam off `cpu::x86::engine`,
+    /// and the honest limit of that is written down beside it: **it exercises
+    /// what its author read off `engine.rs`.** The two A64 defects this whole
+    /// file exists for were found because a real kernel does things nobody
+    /// designed for, and they first appeared at 15.04 s and 23.46 s of boot.
+    /// The A64 leg's calibration table has the exact shape of the argument:
+    /// the declined-boundary defect needs a **cold instruction-fetch
+    /// translation**, and no amount of data-side pressure produces one because
+    /// `mmu::Tlb` keeps fetch, load and store entries in separate sets.
+    ///
+    /// The x86 analogue is the same fact from the other side. The synthetic
+    /// guest reaches a cold fetch translation by executing `INVLPG` on its own
+    /// code page — a thing its author wrote *because* he had read `admit`, on
+    /// a guest whose whole text is one 221-byte page. A kernel gets there
+    /// without anybody thinking of it: it maps and unmaps executable pages,
+    /// reloads `CR3` on every context switch (which discards the whole
+    /// non-global half of the translation caches at once, where `INVLPG`
+    /// discards one page), and executes out of several thousand pages rather
+    /// than one. It also reaches real mode's exit, the decompressor's
+    /// `REP MOVS`, four-level walks over tables it builds itself, `SYSCALL`
+    /// and `IRETQ`, and the packed-integer half of SSE2 — none of which the
+    /// synthetic guest contains a single instruction of.
+    ///
+    /// # What it costs
+    ///
+    /// `docs/testing/long-run.md` has the measured table. `pc64` runs a
+    /// 100 MHz processor and a quantum is at most 10 000 of its ticks, so a
+    /// guest second is on the order of 10 000 quanta — far fewer than the
+    /// synthetic x86 board's 24 818, because that guest leaves a block on
+    /// nearly every pass and this one does not.
+    ///
+    /// # When the fixture is absent
+    ///
+    /// It skips loudly, printing the two commands that would make it run, the
+    /// way the A64 leg does. `RSEMU_LONGRUN_REQUIRED` in `scripts/check.sh`
+    /// turns that skip into a failure.
+    #[test]
+    #[ignore = "needs a fetched kernel (scripts/fetch-testdata.sh x86-linux initramfs-x86) and minutes of wall time"]
+    fn a_real_x86_linux_boot_agrees_across_the_engines() {
+        let Ok(path) = std::env::var("RSEMU_X86_KERNEL") else {
+            eprintln!(
+                "\n  SKIPPED: RSEMU_X86_KERNEL is not set, so there is no kernel to boot.\n\
+                 \n      scripts/fetch-testdata.sh x86-linux initramfs-x86\n\
+                 \n      RSEMU_X86_KERNEL=testdata/x86/bzImage \\\n\
+                 \x20     RSEMU_X86_INITRD=testdata/x86/initramfs-x86.cpio \\\n\
+                 \x20     RSEMU_LONGRUN_SECONDS=120 \\\n\
+                 \x20         cargo test --release --test engine_longrun -- --ignored --nocapture\n\
+                 \n  The synthetic x86 leg exercises the seams its author read off\n\
+                 engine.rs. This one is the leg that can find something nobody\n\
+                 designed for, which is how both A64 defects were found.\n"
+            );
+            return;
+        };
+        let kernel = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("RSEMU_X86_KERNEL names `{path}`, which will not read: {e}")
+        });
+        // An empty value counts as unset, because `scripts/check.sh` passes one
+        // when it has no ramdisk to offer — `env VAR=` sets the variable rather
+        // than leaving it out, and this board boots without a root anyway (it
+        // panics for want of one, which is still a complete boot).
+        let initrd = match std::env::var("RSEMU_X86_INITRD") {
+            Ok(p) if !p.is_empty() => {
+                std::fs::read(&p).unwrap_or_else(|e| panic!("RSEMU_X86_INITRD names `{p}`: {e}"))
+            }
+            _ => Vec::new(),
+        };
+        eprintln!(
+            "pc64: {} bytes of kernel, {} bytes of initramfs",
+            kernel.len(),
+            initrd.len()
+        );
+
+        let secs: u64 = std::env::var("RSEMU_LONGRUN_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let engines: Vec<String> = std::env::var("RSEMU_LONGRUN_ENGINES")
+            .unwrap_or_else(|_| "jit,jit-host".to_string())
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        for engine in engines {
+            let (mut oracle, _, left) =
+                board("interp", &format!("oracle.{engine}"), &kernel, &initrd);
+            let (mut under_test, cpu, right) = board(&engine, &engine, &kernel, &initrd);
+            // The full hash walks the board's whole extended memory, so it is
+            // taken rarely; the per-quantum device fingerprint is what finds a
+            // divergence first and costs nothing beside a quantum.
+            let opts = Options::to_guest_seconds(secs)
+                .hashing_every(20_000)
+                .reporting_every(10_000);
+            let (mut said, mut heard) = (Vec::new(), Vec::new());
+            let outcome = {
+                let mut pump = || {
+                    left.drain_into(&mut said);
+                    right.drain_into(&mut heard);
+                };
+                longrun::lockstep_pumping(
+                    "pc64",
+                    &mut oracle,
+                    &engine,
+                    &mut under_test,
+                    &opts,
+                    &mut pump,
+                )
+            };
+            match outcome {
+                Ok(summary) => eprintln!("pc64 engine={engine}: {summary}"),
+                Err(d) => panic!("{d}\n{}", console_report(&said, &heard)),
+            }
+            assert_the_kernel_ran(&cpu, &engine, &said, &heard);
+        }
+    }
+
+    /// A boot that agreed at every checkpoint still says nothing if the guest
+    /// did not run, and this is the one board in this file where that is a
+    /// real possibility rather than a theoretical one: a `bzImage` the loader
+    /// mis-parses, a command line without `nokaslr`, or an extended memory too
+    /// small all end with a processor stopped early — and two processors
+    /// stopped in the same place agree on every hash they are asked for.
+    ///
+    /// Three claims, and none of them is "the boot got as far as X". How far a
+    /// kernel gets is a function of `RSEMU_LONGRUN_SECONDS` and of which
+    /// `bzImage` somebody pointed at this, and a test that asserted a
+    /// milestone would be asserting the budget:
+    ///
+    /// * the guest **said something**, so the processor reached the
+    ///   decompressor's `earlyprintk` at the very least;
+    /// * both machines said the **same bytes** — a fourth tier of comparison
+    ///   the lockstep loop cannot make, because a drained console is a host
+    ///   object rather than device state and only a byte still sitting in the
+    ///   transmitter is in the per-quantum fingerprint;
+    /// * and the engine under test **executed translated blocks**, and retired
+    ///   more instructions inside them than outside, so what was compared is a
+    ///   translated core rather than two interpreters. That one is
+    ///   `x86::assert_the_workload_ran`'s first two assertions, and it is the
+    ///   one that does not depend on the budget at all.
+    fn assert_the_kernel_ran(cpu: &X86, engine: &str, said: &[u8], heard: &[u8]) {
+        assert_eq!(
+            said,
+            heard,
+            "engine={engine}: the two machines printed different bytes, which \
+             the per-quantum fingerprint cannot see because a drained console \
+             is a host object rather than device state\n{}",
+            console_report(said, heard)
+        );
+        assert!(
+            !said.is_empty(),
+            "engine={engine}: the guest printed nothing at all, so it never \
+             reached its own console and this run compared two kernels stopped \
+             in the same place"
+        );
+        // `RSEMU_LONGRUN_ENGINES=interp` is the control leg — an interpreter
+        // against itself — and an interpreted core has no statistics.
+        if let Some(stats) = cpu.jit_stats() {
+            assert!(
+                stats.blocks > 0,
+                "engine={engine} executed no translated block, so the run \
+                 compared two interpreters"
+            );
+            assert!(
+                stats.retired > stats.interpreted,
+                "engine={engine} retired {} instructions inside blocks against \
+                 {} interpreted, which is not a translated run",
+                stats.retired,
+                stats.interpreted
+            );
+            eprintln!(
+                "pc64 engine={engine}: {} blocks, {} instructions retired in \
+                 them against {} interpreted, {} translations thrown away",
+                stats.blocks, stats.retired, stats.interpreted, stats.invalidated
+            );
+        }
+        let text = String::from_utf8_lossy(said);
+        eprintln!(
+            "pc64 engine={engine}: {} bytes on the console, identical on both \
+             machines{}. The last of it:\n{}",
+            said.len(),
+            if text.contains("Linux version") {
+                ", past `Linux version`"
+            } else {
+                ", still in the decompressor"
+            },
+            tail(&text)
+        );
+    }
+
+    /// What each side printed, for a failure message.
+    fn console_report(said: &[u8], heard: &[u8]) -> String {
+        let (a, b) = (
+            String::from_utf8_lossy(said),
+            String::from_utf8_lossy(heard),
+        );
+        let mut out = format!("    the interpreter's console ({} bytes):\n", said.len());
+        out.push_str(&tail(&a));
+        if said != heard {
+            out.push_str(&format!(
+                "\n    the translated engine's console ({} bytes):\n",
+                heard.len()
+            ));
+            out.push_str(&tail(&b));
+        }
+        out
+    }
+
+    /// The last few lines of a console log, indented.
+    fn tail(text: &str) -> String {
+        text.lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|line| format!("        {line}\n"))
+            .collect()
     }
 }
