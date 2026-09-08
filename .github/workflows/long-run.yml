@@ -1,7 +1,8 @@
 name: Long run
 
-# The interpreter against each translated engine, quantum by quantum, over a
-# real AArch64 Linux boot.
+# The interpreter against each translated engine, quantum by quantum: over the
+# three synthetic workloads at thirty guest seconds each, and over a real
+# AArch64 Linux boot.
 #
 # # Why this is not in ci.yml
 #
@@ -18,6 +19,12 @@ name: Long run
 # guest permanently (docs/platforms/arm64-virt.md). Both were found by hand,
 # once, because somebody happened to look. An opt-in nobody opts into is not a
 # gate, so this schedule is where the gate lives.
+#
+# The synthetic half needs no fixture and would run on a pull request happily
+# enough — but it is thirty guest seconds of three boards here rather than the
+# fraction of a second `cargo test` pays for, and the x86 leg alone is about
+# three minutes of that. It rides with the kernel run because the two answer the
+# same question at different budgets.
 #
 # `docs/testing/long-run.md` is the operating manual, and
 # `scripts/check.sh long` is the same thing locally.
@@ -44,10 +51,11 @@ concurrency:
 
 jobs:
   long-run:
-    name: engine divergence (arm64 Linux)
+    name: engine divergence (a64, RISC-V, x86; arm64 Linux)
     runs-on: ubuntu-latest
-    # A boot is minutes, two engines is twice that, and the runner's default
-    # would kill it silently part-way.
+    # A boot is minutes, two engines is twice that, the three synthetic legs
+    # are several more, and the runner's default would kill it silently
+    # part-way.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5

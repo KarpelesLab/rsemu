@@ -353,7 +353,12 @@ stage_crosshost() {
 # the ordinary test suite and this stage just makes them longer — but the real
 # gate skips, and `RSEMU_LONGRUN_REQUIRED` turns that skip into a failure the
 # way `RSEMU_CROSSHOST_REQUIRED` does. CI sets it.
-LONGRUN_FEATURES="machine-arm64-virt,cpu-arm-a64-lift,machine-riscv-virt,cpu-riscv-lift,jit,jit-x86"
+#
+# `cpu-x86-lift` and `dev-pc` are the x86 leg: the frontend, and the 8254 and
+# 8259A its workload needs to be interrupted by. It builds its own board rather
+# than naming a `machine-*` feature, because every shipped x86 board starts in
+# real mode and real mode is outside the lifted subset — see the file.
+LONGRUN_FEATURES="machine-arm64-virt,cpu-arm-a64-lift,machine-riscv-virt,cpu-riscv-lift,cpu-x86-lift,dev-pc,jit,jit-x86"
 stage_long() {
   local secs kernel initrd
   secs="${RSEMU_LONGRUN_SECONDS:-120}"
@@ -367,6 +372,10 @@ stage_long() {
   # second, so a hundred and twenty of them would be a hundred and twenty
   # seconds of the same thing. What wants the long budget is the kernel, which
   # is the only leg that can find something nobody designed for.
+  #
+  # It is 30 rather than 120 for the A64 and RISC-V legs and for the x86 one
+  # alike: at 30 guest seconds the x86 workload alone is about three minutes,
+  # which is where the whole stage's synthetic half sits.
   local syn="${RSEMU_LONGRUN_SYNTHETIC_SECONDS:-30}"
   run "long synthetic (${syn}s of guest time)" \
     env RSEMU_LONGRUN_SECONDS="$syn" \

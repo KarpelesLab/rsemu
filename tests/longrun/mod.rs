@@ -519,6 +519,7 @@ fn bytewise(a: &[u8], b: &[u8]) -> String {
 fn decode(class: &str, data: &[u8]) -> Option<Vec<(String, u64)>> {
     match class {
         "cpu.arm.a64" => decode_a64(data),
+        "cpu.x86" => decode_x86(data),
         _ => None,
     }
 }
@@ -603,6 +604,162 @@ fn decode_a64(data: &[u8]) -> Option<Vec<(String, u64)>> {
     out.push(("power context".to_string(), r.read_u64().ok()?));
     // A decoder that stopped early has drifted from `save`, and a partial field
     // list would name the wrong column. Say so by declining.
+    r.end().ok()?;
+    Some(out)
+}
+
+/// `cpu.x86`'s chunk, field by field.
+///
+/// The order is `X86::save`'s, and that chunk has grown five times, so the
+/// layout is a prefix followed by four appended blocks rather than anything
+/// tidy: the gdb i386 core block (eight general registers as doublewords,
+/// `EIP`, `EFLAGS`, the six selectors), the cycle counter, the six segment
+/// descriptor caches with `LDTR` and the task register, the two table
+/// registers, the control, debug and test registers, the run-state flags, the
+/// open bus, the fault counters, the **variable-length** prefetch queue, the
+/// debt, the interrupt pins and the A20 gate — then the long-mode block, the
+/// floating-point block, the multiprocessor block, `IA32_MISC_ENABLE` and the
+/// memory-type range registers.
+///
+/// Read with a `ChunkReader` rather than at fixed offsets, because the
+/// prefetch queue is length-prefixed and moves everything after it — the same
+/// reason `decode_a64` cannot index either.
+///
+/// The 32-bit views and the 64-bit ones are **both** named, because `save`
+/// writes both: a divergence in `RAX` is reported as `eax` and `rax` together,
+/// and one that lives only in the upper half shows as `rax` alone. That is
+/// worth keeping rather than deduplicating — a stale upper half is exactly
+/// what `cpu::x86::engine::narrow_state_is_clean` exists for.
+///
+/// Returns `None` on anything unexpected, and the caller falls back to a byte
+/// diff — a decoder that has drifted from `save` must not turn a real
+/// divergence into a confident lie.
+fn decode_x86(data: &[u8]) -> Option<Vec<(String, u64)>> {
+    use rsemu::core::state::ChunkReader;
+
+    /// `Reg::ALL`, which is gdb's i386 core ordering and the order the chunk
+    /// opens with.
+    const CORE32: [&str; 16] = [
+        "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "eip", "eflags", "cs", "ss", "ds",
+        "es", "fs", "gs",
+    ];
+    /// `isa::seg`'s index order — **not** the selector order above.
+    const SEGS: [&str; 6] = ["es", "cs", "ss", "ds", "fs", "gs"];
+    /// `Reg::WIDE`, in ModRM number order with `RIP` last.
+    const WIDE: [&str; 17] = [
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15", "rip",
+    ];
+    /// The long-mode block, after the seventeen wide registers.
+    const LONG: [&str; 9] = [
+        "cr4",
+        "efer",
+        "fs_base",
+        "gs_base",
+        "kernel_gs_base",
+        "star",
+        "lstar",
+        "cstar",
+        "sfmask",
+    ];
+
+    let mut r = ChunkReader::new(data);
+    let mut out: Vec<(String, u64)> = Vec::new();
+
+    for name in CORE32 {
+        out.push((name.to_string(), u64::from(r.read_u32().ok()?)));
+    }
+    out.push(("cycles".to_string(), r.read_u64().ok()?));
+    for name in SEGS {
+        out.push((format!("{name}.sel"), u64::from(r.read_u16().ok()?)));
+        out.push((format!("{name}.base"), r.read_u64().ok()?));
+        out.push((format!("{name}.limit"), u64::from(r.read_u32().ok()?)));
+        out.push((format!("{name}.ar"), u64::from(r.read_u32().ok()?)));
+    }
+    for name in ["ldtr", "tr"] {
+        out.push((format!("{name}.sel"), u64::from(r.read_u16().ok()?)));
+        out.push((format!("{name}.base"), r.read_u64().ok()?));
+        out.push((format!("{name}.limit"), u64::from(r.read_u32().ok()?)));
+        out.push((format!("{name}.ar"), u64::from(r.read_u32().ok()?)));
+    }
+    for name in ["gdtr", "idtr"] {
+        out.push((format!("{name}.base"), r.read_u64().ok()?));
+        out.push((format!("{name}.limit"), u64::from(r.read_u32().ok()?)));
+    }
+    out.push(("cr0".to_string(), u64::from(r.read_u32().ok()?)));
+    out.push(("cr2".to_string(), r.read_u64().ok()?));
+    out.push(("cr3".to_string(), r.read_u64().ok()?));
+    for n in 0..8 {
+        out.push((format!("dr{n}"), r.read_u64().ok()?));
+    }
+    for n in 0..8 {
+        out.push((format!("test{n}"), u64::from(r.read_u32().ok()?)));
+    }
+    for name in ["halted", "shutdown", "reset pending", "int shadow"] {
+        out.push((name.to_string(), u64::from(r.read_bool().ok()?)));
+    }
+    out.push(("open bus".to_string(), u64::from(r.read_u8().ok()?)));
+    out.push(("faults".to_string(), r.read_u64().ok()?));
+    out.push(("last fault".to_string(), r.read_u64().ok()?));
+    // The prefetch queue is length-prefixed, which is why nothing after it can
+    // be read at a fixed offset. Its bytes are folded into one value rather
+    // than named one at a time: what a report needs to say is *the queue
+    // differs*, and by how much is the next question rather than this one.
+    let queued = r.read_u8().ok()?;
+    out.push(("queue len".to_string(), u64::from(queued)));
+    let mut queue = 0u64;
+    for _ in 0..queued {
+        queue = queue.rotate_left(8) ^ u64::from(r.read_u8().ok()?);
+    }
+    out.push(("queue".to_string(), queue));
+    out.push(("debt".to_string(), r.read_u64().ok()?));
+    out.push(("intr".to_string(), u64::from(r.read_bool().ok()?)));
+    out.push(("nmi level".to_string(), u64::from(r.read_bool().ok()?)));
+    out.push(("nmi latch".to_string(), u64::from(r.read_bool().ok()?)));
+    out.push(("intr vector".to_string(), u64::from(r.read_u8().ok()?)));
+    out.push(("a20".to_string(), u64::from(r.read_bool().ok()?)));
+    for name in WIDE {
+        out.push((name.to_string(), r.read_u64().ok()?));
+    }
+    for name in LONG {
+        out.push((name.to_string(), r.read_u64().ok()?));
+    }
+    for n in 0..8 {
+        out.push((format!("st{n}.sig"), r.read_u64().ok()?));
+        out.push((format!("st{n}.exp"), u64::from(r.read_u16().ok()?)));
+    }
+    for name in ["x87 control", "x87 status", "x87 tag", "x87 op"] {
+        out.push((name.to_string(), u64::from(r.read_u16().ok()?)));
+    }
+    out.push(("x87 ip".to_string(), r.read_u64().ok()?));
+    out.push(("x87 dp".to_string(), r.read_u64().ok()?));
+    out.push(("x87 cs".to_string(), u64::from(r.read_u16().ok()?)));
+    out.push(("x87 ds".to_string(), u64::from(r.read_u16().ok()?)));
+    for n in 0..16 {
+        out.push((format!("xmm{n}.lo"), r.read_u64().ok()?));
+        out.push((format!("xmm{n}.hi"), r.read_u64().ok()?));
+    }
+    out.push(("mxcsr".to_string(), u64::from(r.read_u32().ok()?)));
+    for name in [
+        "wait for sipi",
+        "init pin",
+        "init peer",
+        "init latched",
+        "startup?",
+    ] {
+        out.push((name.to_string(), u64::from(r.read_bool().ok()?)));
+    }
+    out.push(("startup page".to_string(), u64::from(r.read_u8().ok()?)));
+    out.push(("misc_enable".to_string(), r.read_u64().ok()?));
+    out.push(("mtrr_def_type".to_string(), r.read_u64().ok()?));
+    for n in 0..16 {
+        out.push((format!("mtrr_var{n}"), r.read_u64().ok()?));
+    }
+    for n in 0..11 {
+        out.push((format!("mtrr_fix{n}"), r.read_u64().ok()?));
+    }
+    // A decoder that stopped early has drifted from `save`, and a partial
+    // field list would name the wrong column. Say so by declining.
     r.end().ok()?;
     Some(out)
 }
