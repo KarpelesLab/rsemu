@@ -29,7 +29,7 @@
 //! double-precision registers.
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs, MonitorSlot};
+use crate::core::space::{AccessPurpose, AddressSpace, BusLockGuard, MemAttrs, MonitorSlot};
 use crate::core::sync;
 use crate::core::value::Width;
 
@@ -687,19 +687,20 @@ impl<'a> Exec<'a> {
 
     /// One read that does not cross a page boundary.
     fn read_once(&mut self, vaddr: u64, width: Width, kind: Access) -> Result<u64, Trap> {
-        self.read_once_at(vaddr, width, kind)
-            .map(|(value, _)| value)
+        let phys = self.translate(vaddr, kind, width.bytes())?;
+        self.read_at(vaddr, phys, width, kind)
     }
 
-    /// [`Exec::read_once`], also reporting where the access landed.
+    /// The second half of [`Exec::read_once`], with the translation already in
+    /// hand.
     ///
-    /// `LR` is the only caller that needs the physical address: the global
-    /// monitor is keyed on it, because two harts contending for one lock reach
-    /// it through their own page tables and a virtual key would not collide.
-    /// Surfaced from here rather than translated a second time, which would
-    /// charge a second walk on a TLB miss.
-    fn read_once_at(&mut self, vaddr: u64, width: Width, kind: Access) -> Result<(u64, u64), Trap> {
-        let phys = self.translate(vaddr, kind, width.bytes())?;
+    /// Split out for [`Exec::reserve_then_read`], which has to claim the
+    /// granule *between* the translation and the read — the global monitor is
+    /// keyed on the physical address, because two harts contending for one
+    /// lock reach it through their own page tables and a virtual key would not
+    /// collide. Translating a second time instead would charge a second walk
+    /// on a TLB miss.
+    fn read_at(&mut self, vaddr: u64, phys: u64, width: Width, kind: Access) -> Result<u64, Trap> {
         self.charge();
         // The bus is told which of the two reasons for reading this is, so a
         // mapping without `Perms::EXEC` refuses a fetch and answers a load.
@@ -708,7 +709,7 @@ impl<'a> Exec<'a> {
             _ => self.attrs,
         };
         match self.space.read(phys, width, attrs) {
-            Ok(v) => Ok((v, phys)),
+            Ok(v) => Ok(v),
             Err(_) => {
                 // A refused access is a bus fault, which RISC-V *does* have a
                 // way to report — unlike the 6502, where it can only be open
@@ -754,6 +755,122 @@ impl<'a> Exec<'a> {
         if let Some(monitor) = self.monitor {
             monitor.reserve(phys);
         }
+    }
+
+    /// An `LR`'s read, with the granule claimed **before** the bytes are
+    /// fetched rather than after they come back.
+    ///
+    /// # Why the order matters
+    ///
+    /// The reservation set exists to answer "has anything written this word
+    /// since I loaded it", and the word the `LR` loads is inside that set. A
+    /// claim taken after the read cannot answer it for the load's own bytes: a
+    /// sibling that stores in between clears no slot, because this hart's slot
+    /// is not live yet, and the `SC` that follows commits against a value that
+    /// is already stale. Claiming first makes
+    /// [`ExclusiveMonitor`](crate::core::space::ExclusiveMonitor)'s own promise
+    /// true of the load itself.
+    ///
+    /// This is necessary and it is not sufficient — the claim still lands after
+    /// a sibling *already inside* its own committing `SC` has looked, which is
+    /// why the caller holds [`Exec::lock_bus`] across both. Neither replaces
+    /// the other.
+    ///
+    /// # What it changes on a fault
+    ///
+    /// An `LR` that translates and then takes a bus fault now leaves the
+    /// reservation **cleared** rather than whatever stood before. Volume I
+    /// licenses that outright: an `SC` may fail for reasons other than a
+    /// store to the reservation set, and a guest's retry loop absorbs it. The
+    /// alternative does not exist — leaving the *new* reservation standing
+    /// after a read that never happened would let a later `SC` commit against
+    /// a word this hart never loaded.
+    fn reserve_then_read(&mut self, vaddr: u64, width: Width) -> Result<u64, Trap> {
+        let phys = self.translate(vaddr, Access::Load, width.bytes())?;
+        self.take_reservation(vaddr, phys);
+        match self.read_at(vaddr, phys, width, Access::Load) {
+            Ok(value) => Ok(value),
+            Err(trap) => {
+                self.drop_reservation();
+                Err(trap)
+            }
+        }
+    }
+
+    /// Take the address space's bus lock for the rest of this instruction.
+    ///
+    /// # Which instructions take it, and why the monitor is not enough
+    ///
+    /// The `A` extension's two shapes need different things and both end up
+    /// here.
+    ///
+    /// An **AMO** is pessimistic and unconditional. Volume I: the instruction
+    /// "atomically" loads, applies the operator and stores the result — there
+    /// is no status register with which to report a failure and no retry loop
+    /// in the guest to catch one. Built on a reservation, which Volume I
+    /// licenses to fail spuriously, an `amoadd.w` would not go round again; it
+    /// would return and store a wrong answer. So the primitive has to be an
+    /// exclusion held across the read and the write, which is what
+    /// [`BusLock`](crate::core::space::BusLock) is and what the monitor
+    /// deliberately is not.
+    ///
+    /// **`LR`/`SC`** is optimistic and does have a retry loop, so the monitor
+    /// answers the architectural question. What it cannot answer is a question
+    /// about this emulator: consulting the monitor and storing are two acts
+    /// here, and so are claiming the granule and reading it. RVWMO's atomicity
+    /// axiom forbids a store from another hart between an `LR`'s load and its
+    /// paired `SC`'s store; two harts that both *ask* before either *stores*
+    /// both see their reservation holding and both commit, which is that
+    /// forbidden store. The bus lock is what makes each half one act.
+    ///
+    /// # The span is the whole instruction
+    ///
+    /// Taken before the instruction issues any data access and released when
+    /// it ends, which is the invariant `BusLock`'s rank argument rests on —
+    /// nothing below `LockRank::BUS_LOCK` is held at the moment it is taken,
+    /// so the inversion the ladder exists to forbid has no second half. It is
+    /// also why the guard is not opened around the read and the write
+    /// separately: a bus lock fences at *both* ends, so a narrower guard would
+    /// put the barrier inside the instruction it is meant to bracket.
+    ///
+    /// # What it does not cost: the eventuality guarantee
+    ///
+    /// Volume I promises a *constrained* `LR`/`SC` sequence eventual success,
+    /// which is the one place a lock on the pair could do architectural harm.
+    /// It does not, because nothing here changes when an `SC` fails: it fails
+    /// exactly when something wrote the reservation set, as before. What the
+    /// lock adds is exclusion between the two accesses of one instruction, and
+    /// it is released before the instruction ends, so no hart can hold it
+    /// across another hart's retry. The failure mode the guarantee is written
+    /// against is a reservation set too *large* — unrelated traffic on the same
+    /// cache line failing the sequence forever — which is why
+    /// `RESERVATION_SHIFT` reserves exactly the word and says so.
+    ///
+    /// # `aq` and `rl`
+    ///
+    /// Nothing in this file reads them, and the two fences the guard carries
+    /// are why: a `SeqCst` fence ahead of the read is earlier than `rl` asks
+    /// for and one after the write is later than `aq` asks for, so both are
+    /// subsumed. The cost is that a *relaxed* AMO gets ordering it did not
+    /// order — the same over-approximation `cpu::x86::exec` makes for every
+    /// `LOCK`-prefixed instruction, and the price of using one mechanism for
+    /// indivisibility rather than two.
+    ///
+    /// # Cost
+    ///
+    /// One uncontended mutex and two fences, on the `A` extension alone.
+    /// Nothing on the ordinary load and store path reads it, so a board that
+    /// never executes an atomic pays nothing —
+    /// `docs/platforms/riscv-virt.md` has the number.
+    ///
+    /// The return type is `BusLockGuard<'a>` rather than one borrowed from
+    /// `&self`: [`Exec::space`](Exec) is a `&'a AddressSpace`, so copying it
+    /// out borrows the *space* for `'a` and leaves `self` free to be borrowed
+    /// mutably underneath the guard. `cpu::x86::exec` and `cpu::arm::a64::exec`
+    /// do the same and say so.
+    fn lock_bus(&self) -> BusLockGuard<'a> {
+        let space: &'a AddressSpace = self.space;
+        space.bus_lock().acquire()
     }
 
     /// Whether the reservation on `vaddr` still stands in **both** monitors.
@@ -1335,6 +1452,41 @@ impl<'a> Exec<'a> {
 
             // -- A ---------------------------------------------------------
             Op::LrW | Op::LrD => {
+                // The load-reserved takes the bus, and the reason is not the
+                // one a lock is usually taken for — there is no write here to
+                // make indivisible. It is that *claiming the granule and
+                // reading it* have to be one transaction against a sibling
+                // that is committing, which is what hardware gives by
+                // construction: the reservation is registered by the same
+                // coherent access that returns the data.
+                //
+                // Split apart, they lose updates even with the reservation
+                // taken first and the sibling's `SC` holding the bus, because
+                // `SpaceView::write_span` breaks reservations **before** it
+                // transfers (`core::space`, and deliberately: a store that
+                // then faults has still broken them, which Volume I licenses
+                // as a spurious `SC` failure). That leaves a window inside the
+                // sibling's store:
+                //
+                // ```text
+                // hart 0: sc.w [bus held]        hart 1: lr.w [no lock]
+                //   reservation holds
+                //   note_store: walks live
+                //     slots — hart 1 has none
+                //                                  reserve: slot goes live
+                //                                  read [a0] -> 5 (not written
+                //                                    yet)
+                //   write [a0] <- 6
+                // [bus released]
+                //                                sc.w: nothing broke the
+                //                                reservation, so it commits 6
+                //                                and hart 0's update is gone
+                // ```
+                //
+                // The AArch64 twin of this window was measured at one to three
+                // lost of 120 000, on 33 runs of 60, and only on a loaded host.
+                // `tests/riscv_amo_atomicity.rs` is the instrument here.
+                let _bus = self.lock_bus();
                 let bytes = if insn.op == Op::LrW { 4 } else { 8 };
                 let a = self.cfg.xlen.trunc(a);
                 if !a.is_multiple_of(bytes) {
@@ -1344,11 +1496,23 @@ impl<'a> Exec<'a> {
                     });
                 }
                 let width = Width::from_bytes(bytes).expect("4 or 8");
-                let (v, phys) = self.read_once_at(a, width, Access::Load)?;
-                self.take_reservation(a, phys);
+                // The reservation is claimed before the read issues:
+                // `Exec::reserve_then_read` has the other half of the
+                // argument, and neither half is enough on its own.
+                let v = self.reserve_then_read(a, width)?;
                 self.set_x(rd, sign_extend(v, bytes * 8));
             }
             Op::ScW | Op::ScD => {
+                // Consulting the reservation and storing are two acts, and the
+                // bus lock is what makes them one. Without it two harts reserve
+                // the same word, both read their monitors as still holding, and
+                // only then does either store — so both report success and one
+                // increment is lost, which is exactly the store RVWMO's
+                // atomicity axiom forbids between a paired `LR` and `SC`. The
+                // store *does* break the sibling's reservation on its way out
+                // through `SpaceView::write_span`; it is simply too late for a
+                // sibling that has already asked.
+                let _bus = self.lock_bus();
                 let bytes = if insn.op == Op::ScW { 4 } else { 8 };
                 let a = self.cfg.xlen.trunc(a);
                 if !a.is_multiple_of(bytes) {
@@ -1517,11 +1681,16 @@ impl<'a> Exec<'a> {
 
     /// One read-modify-write atomic.
     ///
-    /// The `aq` and `rl` bits are decoded but have no effect: this core
-    /// executes one instruction at a time in program order, so every access is
-    /// already sequentially consistent and there is nothing for an ordering
-    /// bit to constrain. They will matter to the JIT, not here.
+    /// The `aq` and `rl` bits are decoded and not read here, and
+    /// [`Exec::lock_bus`] says why: the guard taken below brackets the whole
+    /// instruction with a `SeqCst` fence at each end, which subsumes both.
     fn amo(&mut self, op: Op, rd: u32, addr: u64, operand: u64) -> Result<(), Trap> {
+        // Before anything else, and held to the end of the instruction:
+        // `Exec::lock_bus` has why the read and the write have to be one
+        // indivisible transaction and what a sibling hart saw while they were
+        // not. Above the alignment check as well, so the one exit that takes
+        // no access at all still gives the bus back the same way.
+        let _bus = self.lock_bus();
         let bytes: u64 = if matches!(
             op,
             Op::AmoswapW

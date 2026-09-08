@@ -416,29 +416,209 @@ hardware does.
 Nothing in `riscv.boot` therefore grew a `secondary` property, and nothing in
 `src/cpu/riscv/` was asked for.
 
-### The exclusive monitor is per hart, and Linux's spinlocks are built on it
+### The reservation set is global now, and Linux's spinlocks are built on it
 
-**Read this before quoting the boot below as evidence that anything atomic
-works.** `cpu::riscv`'s `reservation` is private per-hart state in
-`src/cpu/riscv/exec.rs`: it is broken by *this* hart's stores, its AMOs and its
-traps, and by nothing a sibling does. So an `sc.d` the architecture requires to
-fail can succeed, and the sibling's update is lost. It is the identical defect
-`docs/platforms/arm64-virt.md` records for `arm64-virt-smp`, from the same
-cause — `MemAttrs::exclusive` carries the flag to the leaf and nothing reads it
-back, because the **global monitor on the address space** that would is not
-built.
+**Was**: `cpu::riscv`'s `reservation` was private per-hart state — broken by
+*this* hart's stores, its AMOs and its traps, and by nothing a sibling did. So
+an `sc.d` the architecture requires to fail could succeed and the sibling's
+update was lost, which is the identical defect `docs/platforms/arm64-virt.md`
+records for `arm64-virt-smp` from the identical cause. The board still booted
+to a shell, because a kernel's spinlocks are uncontended almost always and two
+harts rarely reach the same lock inside one scheduler quantum — luck about
+timing rather than a property of the model.
 
-Why this board still boots to a shell: a kernel's spinlocks are uncontended
-almost always, and two harts rarely reach the same lock inside one scheduler
-quantum. That is luck about timing rather than a property of the model. Linux
-on RISC-V also gets some of it for free — LLVM emits a single `amoadd.d` for an
-atomic add where AArch64 needs an `ldxr`/`stxr` pair, and an AMO here is one
-instruction that reads and writes without yielding, so it is atomic by
-construction under a scheduler that runs one hart at a time. `cmpxchg` is
-`lr`/`sc` and is not.
+**Is**: `core::space::ExclusiveMonitor` is Volume I's reservation set, living
+on the `AddressSpace` because a space is one coherence domain. Each hart claims
+a slot when it is given the space; `State::reservation` stays as the *local*
+half, holding the virtual address the `SC` compares, and an `SC` commits only
+if both agree. Every store that reaches `SpaceView::write_span` — a guest
+store, a DMA burst, a `LOCK`ed x86 access on a heterogeneous board — breaks any
+reservation covering the bytes it touches, keyed on the **physical** address,
+because two harts contending for one lock reach it through their own `satp`.
+The compiled fast path does not go through the space at all, so
+`Exec::note_fast_store` tells the monitor itself.
 
-So: treat the boot below as evidence that bring-up, per-hart timer and external
-interrupt delivery, and IPIs work. It is not evidence about `lr`/`sc`.
+The granule is eight bytes (`RESERVATION_SHIFT`). Volume I requires the
+reservation set to contain at least the naturally aligned `XLEN`-bit word the
+`LR` read; larger would be legal and would cost forward progress.
+
+`usermode::proof`'s `a_siblings_store_breaks_this_cores_reservation` is the
+regression, on both architectures at once, and it is worth knowing why RISC-V
+did not find this on its own: LLVM emits a single `amoadd.d` for an atomic add
+where AArch64 without `FEAT_LSE` needs an `lr`/`sc` pair, so the threaded guest
+that lost 32 038 of 40 000 increments on AArch64 landed all 40 000 here. Same
+source, same defect, different compiler output. `cmpxchg` is `lr`/`sc` on both.
+
+### The reservation set was necessary and not sufficient: three windows inside one instruction
+
+The section above closes the window *between* an `lr` and its `sc`. It says
+nothing about the windows *inside* each of those instructions, and inside an
+AMO, and there were three. All three are the same shape — this hart issues a
+guest atomic as several separate accesses through `AddressSpace`, and the only
+lock held across them is the hart's own `BUS`-ranked session mutex, which is
+per hart and excludes nothing on a sibling. Every one of them is the AArch64
+defect verbatim; that architecture found them first and the argument below is
+the same argument checked against a different manual.
+
+What the manual asks for, and the two shapes ask for different things:
+
+* **AMOs.** *Volume I*, "Atomic Memory Operations": the instruction
+  "atomically" loads the value at `rs1`, places it in `rd`, applies the
+  operator and stores the result back. There is no status register with which
+  to report a failure and no retry loop in the guest to catch one.
+* **`LR`/`SC`.** RVWMO's **atomicity axiom**: if `r` and `w` are the paired
+  load and store of an aligned `LR`/`SC` in hart *h*, and `s` is the store to
+  byte *x* whose value `r` returns, then `s` precedes `w` in the global memory
+  order and there is **no store from a hart other than *h* to byte *x*** in
+  between. Two harts whose `sc`s both succeed against one word is exactly that
+  forbidden store.
+
+`tests/riscv_amo_atomicity.rs` is the instrument: two harts, two host threads,
+each incrementing one word 60 000 times, once with `amoadd.w` and once with an
+`lr.w`/`sc.w` loop, beside a second word in the same reservation granule
+incremented with a plain `lw`, `addi` and `sw` as the witness that the two
+really overlapped. A lost update is not a reordering — it is a value no
+interleaving of the two programs could have produced — so unlike almost
+everything else in this area it can be *asserted* on an x86-64 host rather than
+printed.
+
+Each row below is a *configuration*, not an isolated window: the fixes are
+peeled off one at a time from the bottom up, so a row measures everything the
+rows beneath it still leave open. 20 runs sequential plus 36 six-way parallel
+for the first two rows, 36 six-way parallel for the rest — a loaded host, which
+is what widens these windows; an idle one misses the narrow ones entirely.
+
+| configuration | lost of 120 000 | runs that lost any |
+| --- | --- | --- |
+| `amoadd.w`, no bus lock anywhere | 3 911 – 13 616 | 56 of 56 |
+| `lr`/`sc`, no bus lock anywhere and the granule claimed after the read | 38 – 4 343 | 56 of 56 |
+| `lr`/`sc`, the bus lock on the `sc` alone, granule still claimed after the read | 7 – 493 | 36 of 36 |
+| `lr`/`sc`, the bus lock on the `sc` alone, granule claimed **before** the read | 1 – 4 | 23 of 36 |
+| everything, as the tree stands | 0 | 0 of 172 |
+
+An AMO's read-to-write window and an `sc`'s check-to-store window — and, as the
+last row showed, the load-reserved as well — are closed by
+`AddressSpace::bus_lock`, taken by `Exec::lock_bus` before the
+instruction issues a data access and held until it ends: the span
+`cpu::x86::exec` already uses for a `LOCK` prefix, and for the same second
+reason, because a bus lock fences at *both* ends and a guard that opened after
+the first access would put the barrier inside the instruction it is meant to
+bracket. It is the bus lock rather than the reservation because an AMO lands on
+x86's side of the line `core::space::BusLock` opens with — a reservation is
+licensed to fail spuriously and is paid for by the guest's retry loop, and
+`amoadd.w` has no status register and no retry loop, so a spurious clear would
+make it return a wrong answer rather than go round again.
+
+The `lr`'s own claim-after-read is not a lock's problem. `ExclusiveMonitor`
+walks *live* slots, so a sibling's store landing after an `lr`'s read but
+before it registers its reservation clears nothing, and the `sc` that follows commits a value that was
+already stale. The fix is to claim the granule before the read issues rather
+than after it returns (`Exec::reserve_then_read`), which costs nothing at all:
+the same translation, the same read, in the other order. What it changes is that
+an `lr` which faults leaves the reservation cleared instead of holding what it
+held before — Volume I licenses an `SC` to fail for reasons other than a store
+to the reservation set, and the alternative would be a reservation on a word the
+hart never loaded.
+
+The last window is the one that survives all three of those fixes, and it is
+why the load-reserved takes the bus lock at all. `SpaceView::write_span` breaks
+reservations **before** it transfers rather than after, on purpose: a store that
+then faults has still broken them, which is a licensed spurious clear, and
+clearing afterwards would mean threading a split transfer's outcome back out of
+its loop. The consequence is that a committing `sc` has a window *inside
+itself*, between telling the monitor and writing the bytes:
+
+```text
+hart 0: sc.w [bus held]              hart 1: lr.w [no lock]
+  reservation holds
+  note_store: walks the live slots,
+    and hart 1 has none yet
+                                       reserve: the slot goes live
+                                       read [a0] -> 5, not written yet
+  write [a0] <- 6
+[bus released]
+                                     sc.w: nothing broke the reservation,
+                                     so it commits 6 — hart 0's update is gone
+```
+
+Claiming the granule first does not help: the claim lands *after* the sibling
+looked. The `sc` holding the bus does not help either, because the `lr` on the
+other side was holding nothing. What closes it is the load-reserved taking the
+bus lock too — not to make a write indivisible, since it has none, but so that
+claiming the granule and reading it are one transaction against a sibling in
+the act of storing. That is what hardware gives for free: the reservation is
+registered by the same coherent access that returns the data.
+
+The measurement is the point of the last two rows together. Claiming the
+granule before the read cuts the loss from 7–493 per run to 1–4 and the
+rate from 36 of 36 to 23 of 36 — two orders of magnitude, and **not** a fix.
+An earlier round of the AArch64 work argued that a load with no write had
+nothing to gain from a bus lock and was wrong; this port did not repeat the
+argument, and the 23-of-36 row is what it would have cost. Read those rows as
+failure *rates*: a defect worth one update in 120 000 is exactly the shape a
+green run hides.
+
+There is a second way to close the fourth, in `core::space` rather than here:
+move `note_store` after the transfer. It would also close a residual this does
+not — a *plain* `sw` racing an `lr` can still have its `note_store` run before
+the `lr` claims the granule and its bytes land after the `lr` has read, leaving
+a reservation that should have been broken. That is `BusLock`'s plain-store
+residual reaching the monitor, it is narrower than the case above (a plain store
+racing a reserved word is a data race in the guest's own terms), and the fault
+trade-off is real, so it is written down rather than taken. It is also somebody
+else's file.
+
+#### Which mode, and what it costs
+
+Reachable only under `ThreadingMode::Parallel`, which is opt-in
+(`--threading parallel`) and which no machine file in this tree selects. The
+argument that `Deterministic` is safe is structural rather than statistical:
+one host thread cannot interleave inside an instruction, and the test's
+one-instruction-quantum run — finer than any quantum the scheduler hands out —
+loses nothing before any of the fixes or after them. The JIT does not widen it
+either: `cpu::riscv::lift` excludes the whole `A` extension, so no atomic is
+ever inside a block a budget could leave part-way.
+
+Measured on one hart with nothing contending, release build, as nanoseconds per
+loop iteration — the instruction under test plus the `addi` and `bne` that
+drive it, which is the ~166 ns bottom row. Best of four runs on an idle host:
+
+| | before | after | delta |
+| --- | --- | --- | --- |
+| `amoadd.w x0, a1, (a0)` | 199 ns | 219 ns | +20 |
+| `amoadd.w.aqrl`, the same encoding with both ordering bits | 199 ns | 219 ns | +20 |
+| `lr.w` + `sc.w`, uncontended | 330 ns | 371 ns | +41 |
+| plain `lw` | 184 ns | 186 ns | +2 |
+| plain `sw` | 181 ns | 183 ns | +2 |
+| the loop alone, as the control | 165 ns | 167 ns | +2 |
+
+So about +19 ns for each instruction that now takes the bus, which is one
+uncontended mutex with its two fences (`core::space::BusLock` prices its own
+acquire at ~13 ns); the pair pays it twice. The three control rows move by 2 ns,
+which is this harness's noise and the honest floor on reading the others.
+
+`aqrl` costs the same as the relaxed encoding in *both* columns, for two
+different reasons. Before, the ordering bits were decoded and ignored. After,
+the guard's two `SeqCst` fences bracket the whole instruction, which is
+strictly stronger than either bit asks for — the same over-approximation
+`cpu::x86::exec` makes for every `LOCK`-prefixed instruction, and the price of
+using one mechanism for indivisibility rather than two.
+
+The ordinary load and store paths are untouched, which is the point of the
+control rows: nothing outside the `A` extension reads the bus lock, so a board
+that executes no atomic pays nothing. What a real guest pays is one mutex on an
+instruction it executes thousands of times a second, not millions — and RISC-V
+leans on the cheaper of the two shapes, since LLVM spells an atomic add as one
+`amoadd` where an Armv8.0 part needs a pair.
+
+So: the boot below is evidence about bring-up, per-hart timer and external
+interrupt delivery, IPIs, and now the atomics too. What it is still not
+evidence about is *ordering*. This core executes one instruction at a time and
+completes every access before the next, so a guest that depends on a weak
+memory model being weak has nothing here to disagree with — `FENCE` executes a
+host `fence(SeqCst)` (`docs/techniques/memory-models.md`), but a fence on a
+host that was already ordering the accesses changes no outcome this board can
+produce.
 
 ### What a kernel does with it
 

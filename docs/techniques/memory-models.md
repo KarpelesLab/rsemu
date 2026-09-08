@@ -98,12 +98,31 @@ price (+14 ns an instruction that takes the bus; nothing on the ordinary load
 and store path).
 
 Two things generalise from it. **`note_store`-before-transfer is a window in
-every core that has a monitor** — the RISC-V core reaches it the same way — and
-moving it after the transfer in `core::space` would close a residual the lock
-does not: a *plain* store racing a load-reserved. And **fixing one instruction
-of a pair is not fixing the pair**: the `STXR` half was locked a round before
-the `LDXR` half, and the defect that survived cost one update in 120 000, which
-is exactly the size a single green run hides.
+every core that has a monitor**, and moving it after the transfer in
+`core::space` would close a residual the lock does not: a *plain* store racing a
+load-reserved. And **fixing one instruction of a pair is not fixing the pair**:
+the `STXR` half was locked a round before the `LDXR` half, and the defect that
+survived cost one update in 120 000, which is exactly the size a single green
+run hides.
+
+**Kept, as of this round: the RISC-V `A` extension, against itself.** All four
+windows were in `cpu::riscv::exec` verbatim, and the port is line for line:
+`Exec::lock_bus` across an AMO, across an `SC` and across an `LR`, and
+`Exec::reserve_then_read` claiming the granule before the read issues. What
+differs is the manual rather than the mechanism. An AMO is Volume I's
+"atomically load … apply … store the result back", with no status register and
+no retry loop, so it is on x86's side of `BusLock`'s opening distinction for the
+same reason `FEAT_LSE` is; the pair is governed by RVWMO's **atomicity axiom**,
+which forbids any store from another hart between a paired `LR`'s load and its
+`SC`'s store — and two harts that both *check* before either *stores* commit
+exactly that. `tests/riscv_amo_atomicity.rs` is the twin instrument: 3 911–13 616
+lost of 120 000 through the AMO window, 38–4 343 through the pair's, in 56 of 56
+runs, and none over 172 after. It also prices the trap: claiming the granule
+before the read, with the `LR` still unlocked, cuts the pair from 7–493 lost per
+run to 1–4 and the rate from 36 of 36 to 23 of 36 — necessary, two orders of
+magnitude, and **not** a fix. `docs/platforms/riscv-virt.md` has the table and
+the cost (+19 ns an instruction that takes the bus; +2 ns, which is the
+harness's noise, on the ordinary load and store path).
 
 This is the one thing in this section a test on an x86-64 host can gate, and
 the reason is worth keeping: a lost update is not a reordering. It is a value
