@@ -1310,8 +1310,14 @@ impl SpaceView<'_> {
         // licensed spurious clear, and the reason the call was there alone.
         // The second is what makes a store that *completes* break one taken
         // while it was in flight, which is not spurious and not optional.
-        // `monitor`'s "the transfer is the window" has the interleaving and
-        // what is left after this.
+        // `monitor`'s "the transfer is the window" has the interleaving.
+        //
+        // What is left after this is one residual with two faces — a plain
+        // store takes no lock and asks no question, so it can land inside
+        // another master's atomic — and it is written down once, with the
+        // manuals, the measured rate and the measured price of closing it, in
+        // `docs/techniques/memory-models.md`, "Not kept: a plain store against
+        // another master's atomic".
         self.space.monitor.note_store(addr, total);
         res
     }
