@@ -265,6 +265,36 @@ pub(crate) fn lockstep(
     under_test: &mut Machine,
     opts: &Options,
 ) -> Result<Summary, Box<Divergence>> {
+    lockstep_pumping(label, oracle, engine, under_test, opts, &mut || {})
+}
+
+/// [`lockstep`], with a hook the caller runs after every quantum.
+///
+/// The hook is what a **host** does between quanta, and a synthetic guest has
+/// no need of one: it is here for the console. A 16550 whose host never takes
+/// a byte fills its port and starts refusing bytes
+/// ([`CharPort::write`](rsemu::host::chardev::CharPort) is short when the
+/// queue is full), so a kernel that prints its way through a boot would spend
+/// the run waiting on a transmitter that never drains. That is the same on
+/// both sides, so nothing *diverges* — and two machines wedged the same way
+/// agree at every checkpoint, which is precisely the vacuous green
+/// `assert_the_workload_ran` exists to catch on the synthetic legs.
+///
+/// It runs on both machines at once rather than once per machine, because the
+/// two are meant to be indistinguishable and a hook that touched one of them
+/// would be the harness introducing the asymmetry it is looking for.
+///
+/// # Errors
+///
+/// As [`lockstep`].
+pub(crate) fn lockstep_pumping(
+    label: &str,
+    oracle: &mut Machine,
+    engine: &str,
+    under_test: &mut Machine,
+    opts: &Options,
+    pump: &mut dyn FnMut(),
+) -> Result<Summary, Box<Divergence>> {
     let (shape, cheap, unwatched) = cheap_devices(oracle);
     let started = Instant::now();
     let mut quantum = 0u64;
@@ -276,6 +306,7 @@ pub(crate) fn lockstep(
             .run_quantum()
             .expect("the machine under test runs");
         quantum += 1;
+        pump();
 
         // The clock first: two machines on different instants are not
         // comparable at all, and every later report would be noise.
@@ -519,6 +550,7 @@ fn bytewise(a: &[u8], b: &[u8]) -> String {
 fn decode(class: &str, data: &[u8]) -> Option<Vec<(String, u64)>> {
     match class {
         "cpu.arm.a64" => decode_a64(data),
+        "cpu.riscv" => decode_riscv(data),
         "cpu.x86" => decode_x86(data),
         _ => None,
     }
@@ -760,6 +792,108 @@ fn decode_x86(data: &[u8]) -> Option<Vec<(String, u64)>> {
     }
     // A decoder that stopped early has drifted from `save`, and a partial
     // field list would name the wrong column. Say so by declining.
+    r.end().ok()?;
+    Some(out)
+}
+
+/// `cpu.riscv`'s chunk, field by field.
+///
+/// The order is `Hart::save`'s: the thirty-two integer registers, the
+/// thirty-two floating-point ones, `PC`, three counters, the `WFI` flag, the
+/// **optional** reservation, the privilege mode, the twenty-four control and
+/// status registers it writes as a list, the physical-memory-protection
+/// configuration, and the interrupt lines.
+///
+/// Read with a `ChunkReader` rather than at fixed offsets, because the
+/// reservation is an `Option` and moves everything after it — the same reason
+/// `decode_a64` cannot index either.
+///
+/// The integer registers are named the way the guest's own assembly names
+/// them. `x18` and `s2` are the same register and only one of the two ever
+/// appears in a listing, so a report that says `x18` sends the reader back to
+/// the manual; `s2 (x18)` does not. *The RISC-V Instruction Set Manual, Volume
+/// I*, chapter 25 is the table.
+///
+/// This is the third decoder and it was written because the RISC-V leg's
+/// calibration run reported *"first difference at byte 512, as a big-endian
+/// word 0x8411008000000000 against 0x8811008000000000"*. That is the program
+/// counter, one instruction apart, in the wrong byte order — correct, useless,
+/// and exactly the weakness `describe`'s fallback is documented to have.
+///
+/// Returns `None` on anything unexpected, and the caller falls back to a byte
+/// diff — a decoder that has drifted from `save` must not turn a real
+/// divergence into a confident lie.
+fn decode_riscv(data: &[u8]) -> Option<Vec<(String, u64)>> {
+    use rsemu::core::state::ChunkReader;
+
+    /// The ABI names, in register-number order.
+    const ABI: [&str; 32] = [
+        "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
+        "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
+        "t5", "t6",
+    ];
+    /// The control and status registers `save` writes as one list.
+    const CSRS: [&str; 24] = [
+        "mstatus",
+        "medeleg",
+        "mideleg",
+        "mie",
+        "mtvec",
+        "mcounteren",
+        "mcountinhibit",
+        "mscratch",
+        "mepc",
+        "mcause",
+        "mtval",
+        "menvcfg",
+        "stvec",
+        "scounteren",
+        "sscratch",
+        "sepc",
+        "scause",
+        "stval",
+        "satp",
+        "senvcfg",
+        "fcsr",
+        "minstret",
+        "mcycle",
+        "mtime",
+    ];
+    /// `csr::PMP_ENTRIES`.
+    const PMP: usize = 16;
+
+    let mut r = ChunkReader::new(data);
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for (n, name) in ABI.iter().enumerate() {
+        out.push((format!("{name} (x{n})"), r.read_u64().ok()?));
+    }
+    for n in 0..32 {
+        out.push((format!("f{n}"), r.read_u64().ok()?));
+    }
+    out.push(("pc".to_string(), r.read_u64().ok()?));
+    out.push(("cycles".to_string(), r.read_u64().ok()?));
+    out.push(("debt".to_string(), r.read_u64().ok()?));
+    out.push(("faults".to_string(), r.read_u64().ok()?));
+    out.push(("wfi".to_string(), u64::from(r.read_bool().ok()?)));
+    let held = r.read_bool().ok()?;
+    out.push(("reserved?".to_string(), u64::from(held)));
+    if held {
+        out.push(("reservation".to_string(), r.read_u64().ok()?));
+    }
+    out.push(("priv".to_string(), u64::from(r.read_u8().ok()?)));
+    for name in CSRS {
+        out.push((name.to_string(), r.read_u64().ok()?));
+    }
+    out.push(("pmp count".to_string(), r.read_u64().ok()?));
+    for n in 0..PMP {
+        out.push((format!("pmpcfg{n}"), u64::from(r.read_u8().ok()?)));
+    }
+    for n in 0..PMP {
+        out.push((format!("pmpaddr{n}"), r.read_u64().ok()?));
+    }
+    out.push(("irq lines".to_string(), r.read_u64().ok()?));
+    // A decoder that stopped early has drifted from `save`, and a partial field
+    // list would name the wrong column. Say so by declining.
     r.end().ok()?;
     Some(out)
 }

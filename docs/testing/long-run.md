@@ -35,8 +35,8 @@ start and kept if its chunk is under 64 KiB, so RAM and framebuffers fall out by
 their size and a board the file has never seen gets the right answer.
 
 Failure names the first quantum on which anything parts, the guest time it
-happened at, and — for `cpu.arm.a64` and `cpu.x86`, which have field decoders —
-the register that moved:
+happened at, and — for `cpu.arm.a64`, `cpu.riscv` and `cpu.x86`, which have
+field decoders — the register that moved:
 
 ```text
 arm64-virt: engine=jit-host left the interpreter at quantum 23119, 23.118999 s of guest time.
@@ -59,11 +59,14 @@ window closed unseen.
 | --- | --- | --- | --- |
 | `the_harness_names_the_quantum_a_planted_divergence_appears_on` | none | ~0.1 s | every `cargo test` |
 | `a_synthetic_a64_workload_agrees_across_the_engines` | none | ~1.7 s | every `cargo test` |
-| `a_synthetic_riscv_workload_agrees_across_the_engines` | none | ~1.3 s | every `cargo test` |
+| `a_synthetic_riscv_workload_agrees_across_the_engines` | none | ~3.1 s | every `cargo test` |
 | `a_tlbi_in_the_loop_agrees_across_the_engines` | none | ~0.4 s | every `cargo test` — see below for what it found |
 | `a_synthetic_x86_workload_agrees_across_the_engines` | none | ~1.4 s | every `cargo test` |
 | `the_guest_carries_the_addresses_and_the_windows_this_file_names` | none | ~0 s | every `cargo test` — the x86 guest's hand-assembled bytes against the constants that describe them |
-| `a_real_arm64_linux_boot_agrees_across_the_engines` | a kernel | minutes | `--ignored`; nightly in CI |
+| `the_guest_carries_the_windows_and_the_addresses_this_file_names` | none | ~0 s | every `cargo test` — the same, for the RISC-V guest |
+| `a_real_arm64_linux_boot_agrees_across_the_engines` | an `Image` | minutes | `--ignored`; nightly in CI |
+| `a_real_x86_linux_boot_agrees_across_the_engines` | a `bzImage` | minutes | `--ignored`; nightly in CI |
+| `the_clint_advances_while_the_hart_is_running` | none | ~0 s | `--ignored`, and **it fails** — a defect this file found and did not fix |
 
 ```sh
 # the whole target, as CI runs it on every commit
@@ -72,8 +75,8 @@ cargo test --release --test engine_longrun
 # longer, locally
 RSEMU_LONGRUN_SECONDS=30 cargo test --release --test engine_longrun
 
-# the real gate
-scripts/fetch-testdata.sh arm64-linux arm64-initramfs
+# the real gate — two kernels now, one per core
+scripts/fetch-testdata.sh arm64-linux arm64-initramfs x86-linux initramfs-x86
 scripts/check.sh long
 ```
 
@@ -85,20 +88,25 @@ somebody runs before a commit, and this wants a download and minutes of wall
 time.
 
 Nightly rather than per-pull-request is a judgement, and it is the one the fuzz
-job already made for the same reason: a 36 MiB fetch and five minutes on one
-board is not worth thirty times a day, and what this catches is a property of
-the tree rather than of an individual commit. Per-commit coverage is the four
-synthetic runs, which cost about five seconds of CPU and 3.7 s of wall time
-together.
+job already made for the same reason: a 48 MiB fetch and a quarter of an hour
+across two boards is not worth thirty times a day, and what this catches is a
+property of the tree rather than of an individual commit. Per-commit coverage is
+the four synthetic runs, which cost 3.4 s of wall time together because they run
+beside one another.
 
 | Variable | Effect |
 | --- | --- |
-| `RSEMU_LONGRUN_SECONDS` | guest seconds to compare (2 for the A64 and RISC-V synthetics, 30 for the kernel, 120 in CI). The x86 leg is capped at 6 000 quanta instead when this is unset — see below — and setting it lifts the cap |
+| `RSEMU_LONGRUN_SECONDS` | guest seconds to compare (2 for the A64 and RISC-V synthetics, 30 for either kernel leg, 120 in CI). The x86 *synthetic* leg is capped at 6 000 quanta instead when this is unset — see below — and setting it lifts the cap |
 | `RSEMU_LONGRUN_ENGINES` | comma-separated; default `jit,jit-host`. `interp` is the control — an interpreter against itself must always agree |
-| `RSEMU_ARM64_KERNEL`, `RSEMU_ARM64_INITRD` | the fixture, as in `tests/a64_linux.rs` |
-| `RSEMU_ARM64_RAM` | the board's DRAM; default 512M |
+| `RSEMU_ARM64_KERNEL`, `RSEMU_ARM64_INITRD` | the AArch64 fixture, as in `tests/a64_linux.rs` |
+| `RSEMU_ARM64_RAM` | that board's DRAM; default 512M |
+| `RSEMU_X86_KERNEL`, `RSEMU_X86_INITRD` | the x86-64 fixture: a `bzImage` and an initramfs, as in `tests/pc64_linux.rs` |
+| `RSEMU_X86_RAM` | `pc64`'s extended memory; default 256M |
+| `RSEMU_X86_CMDLINE` | the kernel command line, replacing the one below. `nokaslr` is not optional on this board |
+| `RSEMU_X86_LONGRUN_SECONDS` | (`check.sh`) the x86 kernel leg's own budget; default 900. **Not** `RSEMU_LONGRUN_SECONDS`, for the reason under "Two kernels, two budgets" |
 | `RSEMU_LONGRUN_REQUIRED` | (`check.sh`) a missing kernel is a failure rather than a skip |
-| `RSEMU_X86_LONGRUN_SEAMS` | the x86 leg's bisecting knob: a comma-separated subset of `timer,invlpg,smc,shadow,flags,int` to keep. Absent, everything |
+| `RSEMU_X86_LONGRUN_SEAMS` | the x86 synthetic leg's bisecting knob: a comma-separated subset of `timer,invlpg,smc,shadow,flags,int` to keep. Absent, everything |
+| `RSEMU_RISCV_LONGRUN_SEAMS` | the same for the RISC-V leg: `timer,clint,sfence,csr,amo,ecall` |
 
 ## When the fixture is absent
 
@@ -125,13 +133,35 @@ because they are different claims.
 
 The x86 guest is designed the same way and against a longer list, because
 `cpu::x86::engine` documents more seams than the A64 one does — "Generalising
-past A64" below has the table, seam by seam. The same caveat applies to it in
-the same words: it exercises what its author read off `engine.rs`, and there is
-no x86 leg of the kernel gate. `pc64` boots a Linux kernel on either engine and
-`docs/platforms/pc64.md` records nine hundred guest seconds of it, but nothing
-runs that *in lockstep*, so a divergence there is still found by comparing final
-hashes. Pointing this harness at `pc64` is the obvious next thing and it is not
-done.
+past A64" below has the table, seam by seam. The RISC-V guest is now the same
+kind of thing on a third core. The same caveat applies to all three in the same
+words: each exercises what its author read off `engine.rs`.
+
+**There is an x86 leg of the kernel gate now**, and it is the answer to the
+paragraph that used to stand here. `pc64` with a stock `bzImage` in its slot,
+both engines, quantum by quantum — the section after next has what it costs and
+what it caught.
+
+## Two kernels, two budgets
+
+`RSEMU_LONGRUN_SECONDS` drives the AArch64 gate and `RSEMU_X86_LONGRUN_SECONDS`
+drives the x86 one, and that is deliberate rather than untidy. A guest second
+does not mean the same thing on the two boards:
+
+* `arm64-virt` runs a 1 GHz core and reaches a shell inside twenty guest
+  seconds. 120 is well past both defects the gate exists for.
+* `pc64` runs a **100 MHz** processor and has no firmware, so the `bzImage`
+  decompresses itself from the reset vector. Measured on the Debian installer
+  kernel: at 120 guest seconds the last thing the guest has printed is
+  `KASLR disabled: 'nokaslr' on cmdline` and it is still in the decompressor;
+  `Linux version` does not appear until somewhere between 400 and 600.
+
+So `RSEMU_LONGRUN_SECONDS=120` on both would have made the x86 leg a test of
+`REP MOVS` and nothing else. **900** is the default in `scripts/check.sh`, and
+that number is measured rather than chosen: the calibration below re-introduced
+a defect that needs an `STI`, and the first `STI` a Linux kernel executes on
+this board is at 635 guest seconds. The nightly's `workflow_dispatch` can raise
+either budget independently.
 
 ## The instrument is calibrated
 
@@ -188,6 +218,71 @@ The last row is the shape both September A64 defects had — nothing computes a
 different answer, a quantum ends one instruction later — and the columns it
 names are the same ones: the program counter, the cycle count and `State::debt`.
 
+### And on a real x86-64 kernel
+
+The `pc64` leg was calibrated against the synthetic one above, which is the test
+*it* has to be worth more than. The defect re-introduced is the first row of
+that table — `admit` stops refusing on `State::int_shadow` — because it is the
+one the synthetic leg exists for and the one `tests/x86_engines.rs` cannot see
+at all.
+
+| | verdict |
+| --- | --- |
+| `tests/x86_engines.rs` | **passed** — 5 tests, all green, 0.43 s |
+| `a_synthetic_x86_workload…` | **failed at quantum 2**, 0.001005 s, naming `int shadow` `0` interpreted against `1` translated |
+| `pc64`, 30 guest seconds | passed — the decompressor runs with interrupts off and never executes an `STI` |
+| `pc64`, 400 guest seconds | passed — still in the decompressor |
+| `pc64`, 600 guest seconds | passed — the kernel is only at `[    0.000000] NR_IRQS`, and everything up to `local_irq_enable` runs with interrupts off, so it has still not executed an `STI` |
+| **`pc64`, 900 guest seconds** | **failed at quantum 1 280 242 — 635.040039 s of guest time**, naming `int shadow` `0` interpreted against `1` translated |
+
+That table is the honest shape of the trade and it is worth reading in both
+directions. The synthetic leg finds this defect in a millisecond of guest time
+and the kernel needs minutes of wall clock to reach the first `STI` — so for a
+mechanism somebody has already thought of, the designed workload wins by three
+orders of magnitude, exactly as the A64 table says. What the kernel leg buys is
+the other half: it is running instructions, and reaching states, that nobody
+wrote down.
+
+That 635-second figure is why `scripts/check.sh`'s default for this leg is
+**900** and not the 600 it was first written with. The budget is not a taste;
+it is the measured distance to the first `STI` a Linux kernel executes on a
+board with no firmware, and a gate set below it would have been green on a core
+that enters blocks inside an interrupt shadow.
+
+**On `master` it has found nothing.** Nine hundred guest seconds of that kernel
+— 1 946 548 quanta — agree quantum for quantum against `jit-host`, and six
+hundred agree against `jit` and `jit-host` both. The two machines also printed
+byte-identical console output, which the lockstep loop cannot see for itself: a
+drained console is a host object rather than device state, so only a byte still
+sitting in the 16550's transmitter is in the per-quantum fingerprint. The test
+compares the drained text as a fourth tier and asserts the engine under test
+retired more instructions inside blocks than outside — 1.52 billion against 6.5
+million at 900 seconds — because a boot that agreed at every checkpoint says
+nothing if the guest stopped early, and two processors stopped in the same place
+agree on every hash they are asked for.
+
+### And on the RISC-V board
+
+Same method, against `tests/riscv_virt_engines.rs`:
+
+| defect re-introduced | `tests/riscv_virt_engines.rs` | `a_synthetic_riscv_workload…` |
+| --- | --- | --- |
+| `IrHost::spent` compares `>` rather than `>=`, so a block leaves one instruction late | **passed** — 3 tests, all green | **failed at quantum 4 — 0.003999 s**, naming `pc` `0x80001184` against `0x80001188`, `cycles`, **`debt` 0 against 2**, `minstret` and `mcycle` |
+
+It is the same row as the last of the x86 table and the same shape as both
+September A64 defects — nothing computes a different answer, a quantum ends one
+instruction later — and it names the same columns: the program counter, the
+cycle count and `State::debt`.
+
+That run is also why `tests/longrun/mod.rs` has a **third** field decoder now.
+The first time it was made to fail it said *"first difference at byte 512, as a
+big-endian word 0x8411008000000000 against 0x8811008000000000"* — the program
+counter, one instruction apart, in the wrong byte order. Correct, useless, and
+exactly the weakness the fallback is documented to have. `decode_riscv` reads
+`Hart::save`'s chunk field by field and names the integer registers the way the
+guest's own assembly names them, so a report says `s2 (x18)` rather than sending
+the reader to chapter 25 of the manual.
+
 ## What it found on its first run: the generic timer across a `TLBI`
 
 `a_tlbi_in_the_loop_agrees_across_the_engines` was committed `#[ignore]`d,
@@ -240,17 +335,31 @@ ordering, and it is the difference between reading `timer_edge` and reading
 ## Cost, measured
 
 On a 64-core Zen host, `--release`, `arm64-virt` with 512 MiB and a Debian
-arm64 kernel:
+arm64 kernel, `pc64` with 256 MiB and a Debian amd64 one:
 
 | run | wall time |
 | --- | --- |
-| the whole `engine_longrun` target, default settings | 3.7 s (3.4 s of it without the x86 leg, which runs beside the others) |
-| the x86 leg on its own, default settings | 1.4 s |
-| the x86 leg, one guest second, each engine | 2.9 s |
-| the x86 leg, twenty guest seconds, both engines | 117 s |
-| 40 guest seconds, interpreter against `jit-host` | 43.2 s |
-| 40 guest seconds, interpreter against `jit` | 60.4 s |
-| **120 guest seconds, both engines — what the nightly runs** | **319 s** (179 s `jit`, 138 s `jit-host`) |
+| the whole `engine_longrun` target, default settings | 3.4 s (the four synthetic legs run beside each other) |
+| the synthetic x86 leg on its own, default settings | 1.4 s |
+| the synthetic x86 leg, one guest second, each engine | 2.9 s |
+| the synthetic x86 leg, twenty guest seconds, both engines | 117 s |
+| the synthetic RISC-V leg on its own, default settings (2 guest seconds) | 3.7 s (1.9 s `jit`, 1.5 s `jit-host`) |
+| `arm64-virt`, 40 guest seconds, interpreter against `jit-host` | 43.2 s |
+| `arm64-virt`, 40 guest seconds, interpreter against `jit` | 60.4 s |
+| **`arm64-virt`, 120 guest seconds, both engines — what the nightly runs** | **319 s** (179 s `jit`, 138 s `jit-host`) |
+| `pc64`, 300 guest seconds, interpreter against `jit-host` | 131.6 s |
+| `pc64`, 900 guest seconds, interpreter against `jit-host` | 413.0 s |
+| `pc64`, 600 guest seconds, both engines | 567 s (323 s `jit`, 244 s `jit-host`) |
+| **`pc64`, 900 guest seconds, both engines — what the nightly runs** | **about 16 minutes** |
+| `scripts/check.sh long`'s synthetic half, 30 guest seconds each | 165 s — unchanged by the new RISC-V board, which runs beside the x86 leg that is the critical path |
+
+`pc64` is about 2 016 quanta per guest second against `arm64-virt`'s 1 000 and
+the synthetic x86 board's 24 818, and 900 guest seconds of it is 1 946 548
+quanta, 292 million translated block entries and 1.52 **billion** instructions
+retired inside them against 6.5 million interpreted — 99.6% of the stream. That
+is the number that says what a lockstep kernel run is worth: it is not a test of
+the interpreter with a JIT beside it, it is 1.5 billion instructions of compiled
+code checked one quantum at a time against the oracle.
 
 The x86 leg is the one that is **capped in quanta rather than in guest
 seconds**, and the reason is in the second row of that table: one guest second
@@ -276,7 +385,8 @@ The harness is core-agnostic already: it talks to `Machine`, `DeviceEntry` and
 `riscv-virt` cost forty lines and pointing it at x86 cost about the same.
 
 What does **not** generalise for free is the two things that give a run its
-teeth, and the x86 leg is what that claim now looks like paid in full:
+teeth. The x86 and RISC-V legs are what that claim looks like paid in full,
+twice:
 
 * **a field decoder.** `decode_a64` turns a chunk into named registers, which is
   what makes a failure say `debt 3 against 2` instead of `first difference at
@@ -289,7 +399,11 @@ teeth, and the x86 leg is what that claim now looks like paid in full:
   It names the 32-bit views and the 64-bit ones both, because `save` writes
   both: a divergence in the upper half of a register shows as `rax` with no
   `eax` beside it, which is exactly what `engine::narrow_state_is_clean` exists
-  to prevent.
+  to prevent. `decode_riscv` is the third, and its own chunk moves for a
+  different reason again — the exclusive reservation is an `Option`. It names
+  the integer registers by their ABI names with the number beside them, `s2
+  (x18)`, because that is how the guest's own assembly names them and a report
+  that says only `x18` sends the reader to chapter 25 of the manual.
 * **a workload designed around the engine's seams.** RISC-V and x86 share the
   first of A64's seams — a boundary the frontend declines — and **not** the
   second: neither core has a timer of its own counted off its own cycle
@@ -304,12 +418,11 @@ teeth, and the x86 leg is what that claim now looks like paid in full:
   have the diagnosis, and the regression tests live beside the engines rather
   than here because each needs a device that raises on read.
 
-  `tests/engine_longrun.rs`'s RISC-V leg is still the plain RV64I loop the
-  other tests use, and it says so: a synthetic guest that provoked the seam
-  above would need a CLINT and a timer handler, which is a board rather than a
-  loop. The x86 leg is not a plain loop — it is written seam by seam against
-  what `cpu::x86::engine` does, and each row below is a paragraph of that
-  file's own documentation turned into guest code.
+  The RISC-V leg **is** that board now — "The RISC-V board" below — and
+  building it turned up why the seam above cannot be reached from a guest on
+  `riscv-virt` at all. Neither leg is a plain loop any more: each is written
+  seam by seam against what its `engine.rs` does, and each row below is a
+  paragraph of that file's own documentation turned into guest code.
 
 | seam in `cpu::x86::engine` | what the x86 workload does about it |
 | --- | --- |
@@ -345,6 +458,101 @@ source**, because the seam under test is a timer edge arriving in the middle of
 a chain and a machine with nothing that interrupts cannot reach it. The chips
 are `pc64`'s own, at `pc64`'s own clock rates, so a count means the same thing
 on both.
+
+## The RISC-V board
+
+The old leg was `tests/riscv_virt_engines.rs`'s twelve-instruction RV64I loop
+pointed at this harness, and both previous rounds said so in its own doc
+comment. It is now a board: **Sv39 paging over four-kibibyte identity pages**, a
+machine-mode trap handler, the CLINT arming its own comparator, and a
+supervisor-mode loop on a page of its own. Machine-mode setup and the handler
+are at `0x80000000`; the loop is one page above it, so `SFENCE.VMA` cools
+*its* fetch translation and leaves the handler's alone.
+
+| seam in `cpu::riscv::engine` | what the RISC-V workload does about it |
+| --- | --- |
+| `lift::MAX_INSNS` = 64, `CHAIN` = 16 | sixty-four consecutive lifted ALU instructions, so one `advance` is a chain: 6.07 block entries per pass |
+| *"a store still ends the block"* | a store and a load to a different 4 KiB page every pass, sixty-four of them |
+| `IrHost::load` and a **lazily-advanced device** | `ld` of the CLINT's `mtime` from inside a lifted block, every pass |
+| `admit`'s exclusion list | `SFENCE.VMA` every sixteenth pass, a supervisor CSR round trip every eighth, `amoadd.d` every thirty-second, `ECALL` every two hundred and fifty-sixth — every one outside the lifted subset, so every one a declined boundary |
+| the entry translation in `admit` | that same `SFENCE.VMA`, the only thing on this hart that cools a **fetch** translation |
+| the data-side walk, its accessed and dirty bits | the Sv39 tables leave `A` and `D` clear, so the first touch of each page after each flush takes the walk's update |
+
+`mtime` is folded into the first of the sixty-four ALU instructions on purpose:
+a divergence about *when* a block noticed the timer becomes an arithmetic
+difference in a named register on the next pass, rather than something only
+`debt` and `pc` carry.
+
+Measured over two guest seconds: 117 053 passes round the loop and 710 140 block
+entries, so 7 315 `SFENCE.VMA`s, 14 631 CSR round trips, 3 657 atomics and 457
+`ECALL`s, plus 1 999 timer interrupts — identical counts under `jit` and
+`jit-host`, and under the interpreter that is the oracle for both.
+
+**It has found nothing on `master`** — under `jit` and `jit-host` alike, quantum
+for quantum. What it *did* find is a floor under the seam it was written for,
+and that is the next section.
+
+### What the RISC-V board found: `mtime` does not move while the hart runs
+
+`the_clint_advances_while_the_hart_is_running` is committed `#[ignore]`d because
+it **fails on the `master` it was committed to**, the way
+`a_tlbi_in_the_loop_agrees_across_the_engines` did. It is not an engine
+divergence — both engines agree — which is why it is filed rather than fixed
+here.
+
+A guest reads `mtime` in a tight loop and counts distinct values. Over eight
+quanta it should see several hundred: a hart on this board gets
+`SchedulerConfig::max_ticks_per_quantum` — ten thousand — of a 1 GHz domain per
+round, which is 10 µs, and `mtime` counts at 10 MHz. **It sees seven. One per
+quantum.**
+
+`riscv.clint` is a lazily-advanced device and its `Registers::read` calls `sync`
+before answering, precisely so a guest load catches the chip up to the core's
+live position. But `Scheduler::arm_live_cursors` builds each lazy device's live
+view on the running runnable's `TickCursor`, and `Hart::attach_cursor` keeps
+only that cursor's **exit flag** and drops the position half — saying so in as
+many words: *"this hart does not publish its own position — nothing on a RISC-V
+board here is sampled inside an instruction the way a PPU is"*. So the tick
+counter never moves while the hart runs, every `sync` during a round catches the
+CLINT up to where the round **began**, and `mtime` advances only in
+`close_round`.
+
+Two consequences, and the second is the one that matters here:
+
+* `rdtime` and `mtime` are quantised to the scheduler's grid — a millisecond —
+  on every RISC-V board in this tree.
+* The seam `cpu::riscv::engine` documents at length is **unreachable from a
+  guest**. Its window is a comparator crossed inside a running round, and on
+  this board a comparator is only ever crossed in `close_round`, which is a
+  quantum boundary and where both engines agree by construction. The workload
+  above takes **1 999 timer interrupts in 2 000 quanta** — exactly one each,
+  with the `clint` seam on and with it off alike, which is the same statement
+  from the other side.
+
+So `engine::tests::a_load_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it`,
+which builds a device that raises unconditionally, is the **only** coverage that
+seam has, and no guest on a shipped RISC-V board can reach it. Worth knowing
+before somebody deletes `IrHost::load`'s hand-back as dead code.
+
+The fix is not small and was not attempted: it means giving the hart a live
+position to publish, which is a change to how `Hart::run_budget` and
+`engine::advance` account ticks, and it has a cost on the hot path.
+
+### Bisecting a RISC-V failure
+
+`RSEMU_RISCV_LONGRUN_SEAMS` is the x86 knob on the second core, and it works the
+same way — the seams named are kept and the rest are replaced by `addi x0, x0,
+0` **in place**, so every branch displacement in the loop is untouched and a
+bisect changes one property at a time.
+
+```sh
+# everything but the SFENCE.VMA
+RSEMU_RISCV_LONGRUN_SEAMS=timer,clint,csr,amo,ecall \
+    cargo test --release --test engine_longrun -- riscv
+
+# the timer alone, with no CLINT read and nothing outside the lifted subset
+RSEMU_RISCV_LONGRUN_SEAMS=timer cargo test --release --test engine_longrun -- riscv
+```
 
 ### Bisecting an x86 failure
 

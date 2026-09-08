@@ -1,14 +1,15 @@
 name: Long run
 
 # The interpreter against each translated engine, quantum by quantum: over the
-# three synthetic workloads at thirty guest seconds each, and over a real
-# AArch64 Linux boot.
+# three synthetic workloads at thirty guest seconds each, and over **two** real
+# Linux boots — an AArch64 one on `arm64-virt` and an x86-64 one on `pc64`.
 #
 # # Why this is not in ci.yml
 #
-# It needs a 36 MiB kernel that cannot be committed (GPL-2.0 — running it as an
-# emulated guest is ordinary use, shipping it here is redistribution) and it
-# spends minutes of wall time on one board. Neither belongs on a pull request.
+# It needs two kernels that cannot be committed (both GPL-2.0 — running one as
+# an emulated guest is ordinary use, shipping it here is redistribution), 48 MiB
+# of download between them, and minutes of wall time on each board. None of
+# that belongs on a pull request.
 #
 # # Why it is not merely an opt-in test either
 #
@@ -36,9 +37,13 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: 'Guest seconds to compare (default 120)'
+        description: 'Guest seconds to compare on arm64-virt (default 120)'
         required: false
         default: '120'
+      x86_seconds:
+        description: 'Guest seconds to compare on pc64 (default 900)'
+        required: false
+        default: '900'
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,12 +56,15 @@ concurrency:
 
 jobs:
   long-run:
-    name: engine divergence (a64, RISC-V, x86; arm64 Linux)
+    name: engine divergence (a64, RISC-V, x86; arm64 and x86-64 Linux)
     runs-on: ubuntu-latest
-    # A boot is minutes, two engines is twice that, the three synthetic legs
-    # are several more, and the runner's default would kill it silently
-    # part-way.
-    timeout-minutes: 60
+    # A boot is minutes, two engines is twice that, there are two boots now,
+    # the three synthetic legs are several more, and the runner's default would
+    # kill it silently part-way. Measured on a 64-core host: 319 s for the
+    # arm64 boot at 120 guest seconds, about 960 s for the x86 one at 900, and
+    # the synthetic half beside them — so the budget is roughly twice what it
+    # takes, which is what a nightly wants.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -67,6 +75,11 @@ jobs:
       # directory. Nothing is vendored (CLAUDE.md, Testing).
       - name: fetch the arm64 kernel and ramdisk
         run: ./scripts/fetch-testdata.sh arm64-linux arm64-initramfs
+      # The x86-64 half. `initramfs-x86` is what lets the kernel reach
+      # userspace rather than panicking for want of a root; the run is still a
+      # complete boot without it, so this step does not gate the job.
+      - name: fetch the x86-64 kernel and ramdisk
+        run: ./scripts/fetch-testdata.sh x86-linux initramfs-x86
       # RSEMU_LONGRUN_REQUIRED turns the stage's "no kernel, skipping" into a
       # failure. On a developer's machine skipping is right; here it would mean
       # a held gate that nothing was holding, which is exactly the shape the
@@ -75,6 +88,9 @@ jobs:
         env:
           RSEMU_LONGRUN_REQUIRED: 1
           RSEMU_LONGRUN_SECONDS: ${{ github.event.inputs.seconds || '120' }}
+          # `pc64`'s own budget: 120 guest seconds of that board is still
+          # inside the kernel's decompressor. scripts/check.sh says why.
+          RSEMU_X86_LONGRUN_SECONDS: ${{ github.event.inputs.x86_seconds || '900' }}
         run: |
           set -uo pipefail
           rc=0
