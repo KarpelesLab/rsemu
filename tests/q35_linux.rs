@@ -138,6 +138,7 @@ use std::sync::Arc;
 use rsemu::core::Captured;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
+use rsemu::core::hosts::HostObjects;
 use rsemu::core::space::{AddressSpace, MemAttrs};
 use rsemu::core::value::Width;
 use rsemu::cpu::x86::{Variant, X86};
@@ -146,7 +147,7 @@ use rsemu::machine::Machine;
 use rsemu::machine::build;
 use rsemu::machine::realize::Bindings;
 
-use x86boot::Script;
+use x86boot::{Drains, Script};
 
 /// How long to let the board run, in virtual milliseconds.
 ///
@@ -186,6 +187,13 @@ fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
     b
 }
 
+/// A built board and the handles a run needs.
+///
+/// The host-object table is one of them: the console is a port the board
+/// opened, and `x86boot::Drains` has to be handed the others so that none of
+/// them fills and stalls the guest.
+type Built = (Machine, Arc<X86>, Arc<CharPort>, Arc<HostObjects>);
+
 /// Build the board from its own machine file.
 ///
 /// `disk` is the namespace's contents; the `disk` parameter is set from its
@@ -196,7 +204,7 @@ fn board(
     initrd: Vec<u8>,
     disk: Vec<u8>,
     params: &[(&str, String)],
-) -> Result<(Machine, Arc<X86>, Arc<CharPort>), String> {
+) -> Result<Built, String> {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let mut options = rsemu::machine::BuildOptions::new()
         .with_classes(rsemu::machine::catalog::classes())
@@ -222,13 +230,13 @@ fn board(
     let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
         .expect("the 16550 opened the board's console port");
     let cpu = cpus.take().expect("the constructor kept a handle");
-    Ok((machine, cpu, console))
+    Ok((machine, cpu, console, options.realize.hosts))
 }
 
 /// The board with nothing in any slot, which is what the hermetic tests want.
 fn bare_board() -> Machine {
     match board(Vec::new(), Vec::new(), Vec::new(), &[]) {
-        Ok((machine, _cpu, _console)) => machine,
+        Ok((machine, _cpu, _console, _hosts)) => machine,
         Err(e) => panic!("the board does not realize: {e}"),
     }
 }
@@ -858,7 +866,7 @@ fn a_linux_kernel_boots_and_finds_the_disk_on_the_q35_linux_board() {
     if let Ok(extmem) = std::env::var("RSEMU_KERNEL_EXTMEM") {
         params.push(("extmem", extmem));
     }
-    let (mut m, cpu, console) = match board(kernel, initrd, disk, &params) {
+    let (mut m, cpu, console, hosts) = match board(kernel, initrd, disk, &params) {
         Ok(built) => built,
         Err(e) => panic!("the board does not realize: {e}"),
     };
@@ -873,6 +881,7 @@ fn a_linux_kernel_boots_and_finds_the_disk_on_the_q35_linux_board() {
         &mut m,
         &cpu,
         &console,
+        Drains::open(&hosts, &console),
         GlobalTime::from_nanos(ms * 1_000_000),
         &script,
     );

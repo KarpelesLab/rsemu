@@ -1083,10 +1083,38 @@ one either way — the same 1,648 lines, the same 95,726 bytes, the same state
 hash.
 
 `tests/q35_uefi.rs` asserts the same log from the other side, in
-`the_firmwares_debug_log_reaches_the_port_at_0x402`: it drains the port every
-slice, checks that `pc.debugcon` dropped nothing, and — because the counters
-tell the two cases apart — reports a `RELEASE` image as one rather than failing
-on it.
+`the_firmwares_debug_log_reaches_the_port_at_0x402`: it asks the harness to
+**keep** that port's bytes rather than throw them away
+(`x86boot::Drains::keeping("debug")`), checks that `pc.debugcon` dropped
+nothing, and — because the counters tell the two cases apart — reports a
+`RELEASE` image as one rather than failing on it.
+
+### Which layer is allowed to throw bytes away
+
+This board opens three character ports — `console`, `debug` and the 8042's
+`keyboard` — and for a while every test on it read one and left the other two to
+fill. That is what made the boot log a person went looking for the *first
+64 KiB* of one: the port stops at 64 KiB, `pc.debugcon` has nowhere to put the
+overflow, and `DebugConsole::dropped` counted the rest away. The fix is not in
+either of those two places, and saying why is worth a paragraph, because the
+same question comes back for every device with a host on the other end:
+
+* **The device stays faithful.** `uart.ns16550` holding a byte with `THRE` clear
+  is what the part does when its line will not take one, and it is what a guest
+  polling that bit depends on. A "drop it when nobody is watching" mode inside
+  the device would model a UART that cannot be flow-controlled at all.
+* **The port stays bounded.** `CharPort`'s 64 KiB and then back pressure is the
+  honest queue; one that buffered forever would tell the device model a lie
+  about the hardware and grow the heap for as long as a guest kept printing.
+* **The host decides whether a cable is plugged in.** It is the only layer that
+  knows, so it is the only one entitled to discard — and it counts what it
+  discarded, so a truncated stream is a line in the report rather than a short
+  log nobody can explain.
+
+`pc.debugcon` is the same argument seen from the other side: EDK II writes its
+log with `rep outsb`, which cannot be held, so the device drops and counts. Both
+`rsemu run` and `tests/x86boot/mod.rs` now drain every port every slice, which
+is why that counter should read zero on any run of this board.
 
 ### The line that would have ended the variable-store hunt
 
@@ -1200,6 +1228,14 @@ nobody plugged in, and a port left to fill stops at 64 KiB and holds a 16550's
 `THRE` clear, which stalls the guest for as long as nobody looks at it. The
 summary says how many bytes went that way — 1 503 of them on COM1 in the run
 above, which is the shell banner nobody asked to see.
+
+That behaviour has a board of its own to be tested on, because this one needs a
+firmware image and the tree cannot ship one:
+`machines/tests/two-uarts.machine` is an 8086 with COM1 and COM2 and nothing
+else, and `tests/cli_capture.rs` boots a hand-assembled ROM on it that writes
+128 KiB — twice a `CharPort`'s capacity — to whichever port the `--capture` did
+not name, then says one more line on the port it did. That last line cannot
+appear unless the unwatched port was drained, which is the whole assertion.
 
 And when a boot goes quiet, the three instruments that make a silent firmware
 talk — the driver an address belongs to, out of the loaded image's own PE/COFF
