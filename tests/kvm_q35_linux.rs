@@ -184,12 +184,13 @@ use rsemu::accel::cpu::{AccelCpu, AccelCpus};
 use rsemu::accel::kvm::Kvm;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
+use rsemu::core::hosts::HostObjects;
 use rsemu::core::sched::ThreadingMode;
 use rsemu::host::chardev::CharPort;
 use rsemu::machine::Machine;
 use rsemu::machine::build;
 
-use x86boot::Script;
+use x86boot::{Drains, Script};
 
 /// How long to let the board run, in virtual milliseconds.
 ///
@@ -218,7 +219,17 @@ const SIGNATURE: &[u8] = b"rsemu q35-linux nvme namespace, LBA 0\n\0\0";
 const DEFAULT_DISK: u64 = 16 * 1024 * 1024;
 
 /// A built board and the handles a run needs.
-type Built = (Machine, Arc<AccelCpus>, Arc<AccelCpu>, Arc<CharPort>);
+///
+/// The host-object table is one of them: the console is a port the board
+/// opened, and `x86boot::Drains` has to be handed the others so that none of
+/// them fills and stalls the guest.
+type Built = (
+    Machine,
+    Arc<AccelCpus>,
+    Arc<AccelCpu>,
+    Arc<CharPort>,
+    Arc<HostObjects>,
+);
 
 /// Build `q35-linux` from its own machine file with every `cpu.x86` on KVM.
 ///
@@ -266,7 +277,7 @@ fn board(
     let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
         .expect("the 16550 opened the board's console port");
     let cpu = accel.cpus().pop().expect("the board's processor");
-    Ok((machine, accel, cpu, console))
+    Ok((machine, accel, cpu, console, options.realize.hosts))
 }
 
 /// The board with nothing in any slot, which is what the hermetic tests want.
@@ -296,7 +307,7 @@ fn bare_board() -> Option<Built> {
 /// That last row is why [`AccelCpu`] has an interpreter in it.
 #[test]
 fn the_boards_ram_can_be_a_memory_slot_and_its_reset_vector_cannot() {
-    let Some((m, _accel, _cpu, _console)) = bare_board() else {
+    let Some((m, _accel, _cpu, _console, _hosts)) = bare_board() else {
         return;
     };
     let space = m.space("mem").expect("the memory space");
@@ -334,7 +345,7 @@ fn the_boards_ram_can_be_a_memory_slot_and_its_reset_vector_cannot() {
 /// jump, and the shell's own reset sequence), and guest entries after them.
 #[test]
 fn the_reset_vector_is_interpreted_and_everything_after_it_is_not() {
-    let Some((mut m, _accel, cpu, _console)) = bare_board() else {
+    let Some((mut m, _accel, cpu, _console, _hosts)) = bare_board() else {
         return;
     };
     for _ in 0..8 {
@@ -406,7 +417,7 @@ fn a_linux_kernel_boots_on_host_silicon_and_reads_the_disk() {
     if let Ok(extmem) = std::env::var("RSEMU_KERNEL_EXTMEM") {
         params.push(("extmem", extmem));
     }
-    let (mut m, accel, cpu, console) = match board(kernel, initrd, disk, &params) {
+    let (mut m, accel, cpu, console, hosts) = match board(kernel, initrd, disk, &params) {
         Ok(built) => built,
         Err(e) => panic!("the board does not realize under acceleration: {e}"),
     };
@@ -428,6 +439,7 @@ fn a_linux_kernel_boots_on_host_silicon_and_reads_the_disk() {
         &mut m,
         cpu.shell(),
         &console,
+        Drains::open(&hosts, &console),
         GlobalTime::from_nanos(ms * 1_000_000),
         &script,
     );

@@ -1,0 +1,129 @@
+# two-uarts - the smallest board with two character ports.
+#
+# It models no product, and it is deliberately not in the catalog.
+# `machines/tests/` is where a board that exists for one test lives, beside
+# `x86-mini.machine` (a debugger needs somewhere to attach) and
+# `heterogeneous.machine` (two CPU classes in one machine): `rsemu machines`
+# does not list these, `every_shipped_machine_realizes` does not build them, and
+# nothing here is offered to a person as a machine to run. `tests/cli_capture.rs`
+# runs this one **by path**, which is what `rsemu run` does with any argument
+# that names a file rather than a catalog entry.
+#
+# ---------------------------------------------------------------------------
+# Why it exists
+# ---------------------------------------------------------------------------
+#
+# `rsemu run` drains **every** character port the machine opened and throws away
+# what nothing is listening to. It has to: a `CharPort` holds 64 KiB and then
+# pushes back, and a `uart.ns16550` whose port will not take a byte holds it in
+# the transmit register with `THRE` clear, which is what the real part does and
+# which stops the guest dead. Draining an unwatched port is the host saying that
+# nothing is plugged into that socket — a serial line with no cable on it does
+# not stall the transmitter, the bytes go on the floor.
+#
+# That behaviour had no hermetic test, because there was no board to write one
+# on. Every shipped machine with two character ports — `q35`, `q35-uefi` — needs
+# a firmware image the repository cannot ship, and every board that boots from
+# bytes already in the tree (`apple1`, `beneater-6502`) has exactly one port. So
+# the choice was to invent a board or to put a second port on one that models
+# real hardware, and neither of those is free: a fake board in `machines/` is a
+# machine nobody could run, and a second ACIA on Ben Eater's breadboard is a lie
+# about a board people have actually built. A fixture that says what it is, in
+# the directory for fixtures, is the honest third answer.
+#
+# ---------------------------------------------------------------------------
+# What the board is
+# ---------------------------------------------------------------------------
+#
+# `x86-mini`'s core, RAM and ROM socket, with COM1 and COM2 on it: 0x3F8 and
+# 0x2F8, the two addresses every PC has had since the IBM PC's Asynchronous
+# Communications Adapter, and the arrangement a two-port serial card puts on one
+# 1.8432 MHz baud-rate can. Nothing else. The processor is an 8086 for the same
+# reason `x86-mini`'s is — it is the smallest core that can execute a program a
+# test hand-assembles in twenty lines — and the program comes from the
+# `firmware` media slot, so whoever runs the machine binds the bytes and nothing
+# below host/ opens a file.
+#
+# The two UART interrupt outputs are left **unwired**, and that is a statement
+# about the board rather than an omission: there is no interrupt controller here
+# to route them to, and a boot ROM that polls `THRE` is what a machine with no
+# PIC has to do anyway. A board that wants interrupts adds an `i8259` and two
+# `wire` lines.
+
+machine "two-uarts" {
+  # Low memory. One megabyte is everything an 8086 can address, and the top
+  # 64 KiB of it is the ROM, so the RAM stops below that.
+  param ram = 0xf0000
+
+  # What the two ports are called on the host side, so that two of these can run
+  # in one process without shouting into each other (`-p first=a -p second=b`).
+  # These names are what `--console`, `--capture` and `x86boot::Drains` all
+  # spell, and they come out of this file and nowhere else. They are not spelled
+  # `com1` and `com2` because the objects below already are, and a parameter and
+  # an object cannot share a name.
+  param first  = "com1"
+  param second = "com2"
+
+  # -- the crystals ----------------------------------------------------------
+  #
+  # 4.77 MHz for the core: the IBM PC's 14.31818 MHz colour-burst crystal
+  # divided by three, which is where every 8086-era board's CPU clock came from.
+  osc xtal = 14318180 Hz
+
+  # And 1.8432 MHz for the serial section, which is the standard baud-rate can
+  # and is genuinely a second oscillator: a serial card brings its own, and no
+  # correct program can depend on its phase against the CPU's (ROADMAP.md 4.2).
+  # One can feeds both ports, as it does on a two-port card.
+  osc baud = 1843200 Hz
+
+  # -- the two buses ---------------------------------------------------------
+  #
+  # `read-as-ones` on both, matching `pc-at` and `x86-mini`: an 8086 has no
+  # bus-error input, so an unclaimed read is the pull-ups on the data bus and
+  # not a fault.
+  space mem  { width = 20, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.x86" {
+    clock   = xtal / 3
+    space   = mem
+    iospace = "port"
+    model   = "8086"
+    engine  = "interp"
+  }
+
+  # -- memory ----------------------------------------------------------------
+  object dram "ram" { size = ram }
+
+  # The boot ROM. `image` names a media slot, so whoever runs the machine binds
+  # the bytes: `rsemu run machines/tests/two-uarts.machine --media firmware=x.bin`.
+  object boot "rom" { size = 64K, image = "firmware" }
+
+  # -- the two serial ports --------------------------------------------------
+  #
+  # `clock = baud / 16` is the chip's own arithmetic: a 16550 divides its input
+  # by sixteen times the divisor latch to get the bit rate, and the object's
+  # clock is what the receiver is serviced on. `frequency` is the same can said
+  # again in hertz, which is what the model converts a guest's divisor against.
+  object com1 "uart.ns16550" {
+    clock     = baud / 16
+    port      = first
+    frequency = 1843200
+  }
+
+  object com2 "uart.ns16550" {
+    clock     = baud / 16
+    port      = second
+    frequency = 1843200
+  }
+
+  # -- the map ---------------------------------------------------------------
+  map mem 0x00000 size ram  = dram
+  map mem 0xf0000 size 64K  = boot
+
+  # Eight registers each, at the two conventional addresses. The chip decodes
+  # three address lines and ignores the rest, so eight bytes is the whole of it.
+  map port 0x3f8 size 8 = com1
+  map port 0x2f8 size 8 = com2
+}

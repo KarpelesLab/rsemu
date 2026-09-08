@@ -116,12 +116,13 @@ use rsemu::accel::cpu::AccelCpus;
 use rsemu::accel::kvm::Kvm;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
+use rsemu::core::hosts::HostObjects;
 use rsemu::core::sched::ThreadingMode;
 use rsemu::host::chardev::CharPort;
 use rsemu::machine::Machine;
 use rsemu::machine::build;
 
-use x86boot::Script;
+use x86boot::{Drains, Script};
 
 /// The command line, which is the board's own with nothing added to it — no
 /// `nosmp`, and no `no_timer_check` either. That second word is the one
@@ -160,8 +161,10 @@ fn board_text() -> String {
     )
 }
 
-/// A built board, its accelerator, and the console the 16550 opened.
-type Built = (Machine, Arc<AccelCpus>, Arc<CharPort>);
+/// A built board, its accelerator, the console the 16550 opened, and the table
+/// holding every port it opened — `x86boot::Drains` needs the ones this run is
+/// not reading, so that none of them fills and stalls the guest.
+type Built = (Machine, Arc<AccelCpus>, Arc<CharPort>, Arc<HostObjects>);
 
 /// Build the board with `mode`, and with the two `cpu.x86` objects it declares
 /// running on the host's own silicon.
@@ -199,7 +202,7 @@ fn built(
     m.sweep();
     let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
         .expect("the 16550 opened the board's console port");
-    Ok((m, accel, console))
+    Ok((m, accel, console, options.realize.hosts))
 }
 
 /// The shipped board is `q35-linux` plus exactly the six things it claims.
@@ -256,10 +259,11 @@ fn the_two_processor_q35_realizes() {
         println!("q35-linux-smp: no usable /dev/kvm on this host; skipping");
         return;
     }
-    let (mut m, accel, _console) = match built(ThreadingMode::Accel, Vec::new(), Vec::new(), &[]) {
-        Ok(built) => built,
-        Err(e) => panic!("the two-processor q35 does not realize: {e}"),
-    };
+    let (mut m, accel, _console, _hosts) =
+        match built(ThreadingMode::Accel, Vec::new(), Vec::new(), &[]) {
+            Ok(built) => built,
+            Err(e) => panic!("the two-processor q35 does not realize: {e}"),
+        };
     assert_eq!(accel.cpus().len(), 2, "the board declares two processors");
     assert_eq!(
         accel.cpus()[1].entries(),
@@ -297,7 +301,8 @@ fn a_linux_kernel_brings_up_a_second_processor_on_host_silicon() {
     let cmdline = std::env::var("RSEMU_KERNEL_CMDLINE").unwrap_or_else(|_| CMDLINE.to_string());
     println!("q35-linux-smp/kvm: command line {cmdline:?}");
     let params = [("cmdline", cmdline)];
-    let (mut m, accel, console) = match built(ThreadingMode::Accel, kernel, initrd, &params) {
+    let (mut m, accel, console, hosts) = match built(ThreadingMode::Accel, kernel, initrd, &params)
+    {
         Ok(built) => built,
         Err(e) if e.contains("/dev/kvm") => {
             println!("q35-linux-smp/kvm: {e}; skipping");
@@ -324,6 +329,7 @@ fn a_linux_kernel_brings_up_a_second_processor_on_host_silicon() {
         &mut m,
         cpus[0].shell(),
         &console,
+        Drains::open(&hosts, &console),
         GlobalTime::from_nanos(ms * 1_000_000),
         &script,
     );

@@ -8,9 +8,14 @@
 //! here rather than twice.
 //!
 //! Nothing in this file knows which board it is driving. It takes a built
-//! machine, the processor in it and the host end of the console, runs until the
-//! guest stops making progress, and prints what the guest said and where it
-//! was when it stopped.
+//! machine, the processor in it, the host end of the console and a [`Drains`]
+//! holding every *other* character port the board opened, runs until the guest
+//! stops making progress, and prints what the guest said and where it was when
+//! it stopped.
+//!
+//! Every port is drained every slice, not just the console. [`Drains`] says why
+//! that is the harness's job rather than the device's, and why it is the same
+//! answer `rsemu run` reaches.
 //!
 //! **Everything printed as evidence is a byte the guest itself wrote to its own
 //! serial port.** That is reading what a program printed, which is the most
@@ -25,10 +30,13 @@
 // that binary and `-D warnings` makes it a build failure.
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use rsemu::core::clock::GlobalTime;
+use rsemu::core::hosts::HostObjects;
 use rsemu::core::space::MemAttrs;
 use rsemu::cpu::x86::X86;
-use rsemu::host::chardev::CharPort;
+use rsemu::host::chardev::{CharPort, ports};
 use rsemu::machine::Machine;
 
 /// The execution engine `RSEMU_ENGINE` asks for, applied to a core the board
@@ -67,6 +75,202 @@ pub(crate) fn with_engine_from_env(cpu: X86) -> X86 {
     cpu
 }
 
+/// What happens to the character ports this loop is **not** reading.
+///
+/// # Why a run has to touch ports nobody asked about
+///
+/// A [`CharPort`] holds [`PORT_CAPACITY`](rsemu::host::chardev::PORT_CAPACITY)
+/// bytes and then pushes back, and pushing back is not a formality: a
+/// `uart.ns16550` whose host will not take a byte holds it in the transmit
+/// register with `THRE` clear, which is what the real part does and which stops
+/// a guest that waits for the bit. This loop used to drain the one port a
+/// script is typed at and nothing else, so `q35-uefi` — which opens three —
+/// spent every run with its `debug` port filling, and the boot log a person
+/// went looking for was the first 64 KiB of one.
+///
+/// So an unwatched port is **drained and discarded**, exactly as
+/// `src/bin/rsemu.rs` does it for `rsemu run`: a serial line with nothing
+/// plugged into it does not stall the transmitter, the bytes go on the floor.
+/// The two have to agree, or a board behaves differently under `cargo test`
+/// than under the binary, which is the one difference a test harness must never
+/// introduce.
+///
+/// # Which layer compensates, and which stays faithful
+///
+/// Three layers, and only the last of them is entitled to decide that nobody is
+/// listening:
+///
+/// * **The device stays faithful.** `uart.ns16550` holding `THRE` clear is the
+///   part's own behaviour, and it is what a guest polling that bit depends on.
+///   A "drop it when nobody is watching" mode inside the device would model a
+///   UART that cannot be flow-controlled at all, and every guest whose output
+///   timing depends on the transmitter would diverge from the real machine.
+/// * **The port stays bounded.** 64 KiB and then back pressure is the honest
+///   queue: one that buffered forever would tell the device model a lie about
+///   the hardware and grow the heap for as long as a guest kept printing.
+/// * **The host decides whether a cable is plugged in.** That is this struct,
+///   and `Drains` in the CLI. It is the only layer that knows whether anybody
+///   is on the other end, so it is the only one that may throw bytes away — and
+///   it counts what it threw, so a truncation appears in [`report`]'s output
+///   rather than being a short log nobody can explain.
+///
+/// `pc.debugcon` is the same argument from the other side: it has nowhere to
+/// put back pressure — EDK II writes its log with `rep outsb`, which cannot be
+/// held — so it drops and counts, and `DebugConsole::dropped` is what makes
+/// that visible. A run that drains its port every slice leaves that counter at
+/// zero, which is what
+/// `tests/q35_uefi.rs::the_firmwares_debug_log_reaches_the_port_at_0x402`
+/// asserts.
+pub(crate) struct Drains {
+    /// Every port except the one the run loop reads, in the order the machine
+    /// opened them.
+    ports: Vec<Drain>,
+    /// Scratch, so a pump that runs a thousand times a virtual second
+    /// allocates nothing.
+    buf: Vec<u8>,
+}
+
+/// One port this loop is not reading.
+struct Drain {
+    /// The host-object name, which is what the machine file wrote and what
+    /// `rsemu run --capture` would name.
+    name: String,
+    port: Arc<CharPort>,
+    /// `Some` for a port whose bytes are being kept — the harness's equivalent
+    /// of `--capture` — and `None` for one that is thrown away.
+    kept: Option<Vec<u8>>,
+    /// How many bytes came off it, kept or not.
+    bytes: u64,
+    /// How much of `kept` has already been echoed, so a long boot is not silent
+    /// while it happens.
+    printed: usize,
+}
+
+impl Drains {
+    /// Every character port this build opened except `reading`, all of them
+    /// discarded.
+    ///
+    /// `reading` is the port the run loop drains itself — the console a script
+    /// is typed at — and it is excluded **by identity rather than by name**. A
+    /// board whose console port is a parameter (`-p console=b`, which `apple1`
+    /// and `beneater-6502` both offer) would otherwise be opened here under its
+    /// real name, drained twice, and half the guest's output would land in a
+    /// counter instead of in the transcript. Two `Arc`s to one `CharPort` is
+    /// exactly the question being asked, and `Arc::ptr_eq` answers it without
+    /// the caller having to know what the machine file called anything.
+    pub(crate) fn open(hosts: &HostObjects, reading: &Arc<CharPort>) -> Drains {
+        let mut ports = Vec::new();
+        for name in ports::names(hosts) {
+            if let Ok(Some(port)) = ports::get(hosts, &name) {
+                if Arc::ptr_eq(&port, reading) {
+                    continue;
+                }
+                ports.push(Drain {
+                    name,
+                    port,
+                    kept: None,
+                    bytes: 0,
+                    printed: 0,
+                });
+            }
+        }
+        Drains {
+            ports,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Keep `name`'s bytes rather than discarding them, echoing them under a
+    /// `#` prefix as they arrive.
+    ///
+    /// The harness's `--capture`: a second stream a test wants to *read* rather
+    /// than merely keep from filling. Draining it every slice is what keeps a
+    /// log larger than a `CharPort` whole.
+    ///
+    /// Panics if the board opened no such port, which is a test naming a port
+    /// its machine file does not have.
+    pub(crate) fn keeping(mut self, name: &str) -> Drains {
+        let names: Vec<String> = self.ports.iter().map(|d| d.name.clone()).collect();
+        let found = self
+            .ports
+            .iter_mut()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| {
+                panic!("no character port named `{name}` to keep; this run drains {names:?}")
+            });
+        found.kept = Some(Vec::new());
+        self
+    }
+
+    /// Move whatever the guest has written to each of them since the last
+    /// visit. Called once a slice by [`run`].
+    fn pump(&mut self) {
+        for drain in &mut self.ports {
+            self.buf.clear();
+            drain.port.drain_into(&mut self.buf);
+            drain.bytes += self.buf.len() as u64;
+            let Some(kept) = drain.kept.as_mut() else {
+                continue;
+            };
+            kept.extend_from_slice(&self.buf);
+            // A line at a time as it arrives: a firmware log is the one
+            // instrument that says where a boot went, and a boot that takes
+            // minutes should not be silent while it does it.
+            while let Some(nl) = kept[drain.printed..].iter().position(|b| *b == b'\n') {
+                let line =
+                    String::from_utf8_lossy(&kept[drain.printed..drain.printed + nl]).into_owned();
+                println!("  # {}", line.trim_end_matches('\r'));
+                drain.printed += nl + 1;
+            }
+        }
+    }
+
+    /// Everything a kept port said, whole.
+    ///
+    /// Empty for a port that was never named to [`keeping`](Drains::keeping),
+    /// which is the same answer a run where the guest said nothing gives — so a
+    /// caller that means to read a log has to have asked for it.
+    pub(crate) fn kept(&self, name: &str) -> &[u8] {
+        self.ports
+            .iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.kept.as_deref())
+            .unwrap_or(&[])
+    }
+
+    /// How many bytes came off `name`, kept or discarded.
+    pub(crate) fn bytes(&self, name: &str) -> u64 {
+        self.ports
+            .iter()
+            .find(|d| d.name == name)
+            .map_or(0, |d| d.bytes)
+    }
+
+    /// What was kept and what was thrown away, under `tag`.
+    ///
+    /// Only ports that actually said something: most boards have a keyboard
+    /// port that never speaks and nothing to report about it.
+    fn report(&self, tag: &str) {
+        for drain in &self.ports {
+            if drain.bytes == 0 {
+                continue;
+            }
+            match drain.kept {
+                Some(_) => println!(
+                    "{tag}: kept {} byte(s) the guest wrote to `{}`",
+                    drain.bytes, drain.name
+                ),
+                None => println!(
+                    "{tag}: drained and discarded {} byte(s) the guest wrote to `{}`, which \
+                     nothing in this run was reading — `Drains::keeping` keeps one, and \
+                     `rsemu run … --capture {}=log` is the command-line equivalent",
+                    drain.bytes, drain.name, drain.name
+                ),
+            }
+        }
+    }
+}
+
 /// Where a run stopped, and what the guest had said by then.
 pub(crate) struct Run {
     /// Everything the guest wrote to its serial port.
@@ -83,6 +287,11 @@ pub(crate) struct Run {
     pub(crate) typed: usize,
     /// Whether the run ended because the guest printed `RSEMU_KERNEL_STOP_AT`.
     pub(crate) reached: bool,
+    /// Every other character port the board opened, and what came off it.
+    ///
+    /// Handed back rather than borrowed so that no caller can forget to say
+    /// what its run threw away: [`report`] prints the accounting out of here.
+    pub(crate) drains: Drains,
 }
 
 /// What to type at the guest, and what ends the run.
@@ -165,13 +374,16 @@ fn unescape(text: &str) -> String {
 
 /// Run the board until the processor stops making progress or time runs out.
 ///
-/// The console is drained every slice. It has to be: a 16550 whose host will
-/// not take a byte holds it in the transmit register with `THRE` clear, which
-/// is real back pressure and would stop the guest dead.
+/// **Every** character port is drained every slice — the console into `text`,
+/// and each of `drains` into its own count. It has to be: a 16550 whose host
+/// will not take a byte holds it in the transmit register with `THRE` clear,
+/// which is real back pressure and would stop the guest dead. [`Drains`] has
+/// the long form and says which layer is entitled to compensate.
 pub(crate) fn run(
     m: &mut Machine,
     cpu: &X86,
     console: &CharPort,
+    mut drains: Drains,
     limit: GlobalTime,
     script: &Script,
 ) -> Run {
@@ -209,6 +421,10 @@ pub(crate) fn run(
             break;
         }
         console.drain_into(&mut text);
+        // And every port this loop is not reading, in the same slice: one that
+        // fills stops the guest that is writing to it, whether or not this test
+        // cared what it said.
+        drains.pump();
         // Print as it goes: a run that takes minutes should not be silent, and
         // a hang is much easier to place when the last line before it is
         // visible.
@@ -319,6 +535,7 @@ pub(crate) fn run(
                     protected,
                     typed: step,
                     reached,
+                    drains,
                 };
             }
         } else {
@@ -327,6 +544,7 @@ pub(crate) fn run(
         }
     }
     console.drain_into(&mut text);
+    drains.pump();
     Run {
         text: String::from_utf8_lossy(&text).into_owned(),
         at: m.now(),
@@ -335,6 +553,7 @@ pub(crate) fn run(
         protected,
         typed: step,
         reached,
+        drains,
     }
 }
 
@@ -355,6 +574,10 @@ pub(crate) fn report(tag: &str, m: &Machine, cpu: &X86, run: &Run, script: &Scri
         run.protected,
         run.long
     );
+    // What the *other* ports said, before anything else about the processor: a
+    // run whose second port was throwing bytes away is a run whose evidence is
+    // incomplete, and that has to be visible without being looked for.
+    run.drains.report(tag);
     if !script.steps.is_empty() || !script.stop_at.is_empty() {
         println!(
             "{tag}: typed {} of {} scripted step(s); the stop marker was {}",
