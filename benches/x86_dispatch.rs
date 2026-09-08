@@ -234,6 +234,75 @@ fn main() {
         "\nEvery row was checked against the interpreter's final register file \
          and flags before it was timed."
     );
+    println!();
+    quantum(args.reps, args.insns);
+}
+
+// ---------------------------------------------------------------------------
+// Table two: the quantum
+// ---------------------------------------------------------------------------
+
+/// The scheduler budgets swept, in bus accesses.
+///
+/// `machines/pc64.machine` runs on **10 000**, which is the column that
+/// matters; the rest bracket it so the shape of the curve is visible.
+const BUDGETS: [u64; 6] = [64, 256, 1_024, 4_096, 10_000, 65_536];
+
+/// Throughput through a whole [`X86`](rsemu::cpu::x86::X86), in quanta.
+///
+/// The table above drives [`Dispatcher`] from a host of its own, so it cannot
+/// see `cpu::x86::engine::Host` at all — and that host is where the budget
+/// seam and the interrupt seam both live. This one runs the real core, which
+/// makes `IrHost::spent` measurable: it is asked at every guest instruction
+/// boundary of every block, so anything added to it is felt here and nowhere
+/// else in this file. The `interp` row shares no code with it and is the
+/// control that says what the noise floor is.
+fn quantum(reps: usize, insns: u64) {
+    println!("the quantum: throughput against `X86::run_budget`'s budget\n");
+    println!(
+        "Millions of *bus accesses* per second — the currency the scheduler and \
+         the seam\nboth speak, one per instruction plus one per memory access. \
+         Read across a row.\n"
+    );
+    print!("{:<12} {:>10}", "engine", "workload");
+    for budget in BUDGETS {
+        print!(" {budget:>11}");
+    }
+    println!();
+    for (name, engine) in [
+        ("interp", rsemu::cpu::x86::Engine::Interp),
+        ("jit", rsemu::cpu::x86::Engine::Jit),
+        ("jit-host", rsemu::cpu::x86::Engine::JitHost),
+    ] {
+        for w in workloads() {
+            print!("{name:<12} {:>10}", w.name);
+            for budget in BUDGETS {
+                let took = best(reps, || run_core(&w, insns, engine, budget));
+                print!(" {:>11}", mips(insns, took));
+            }
+            println!();
+        }
+    }
+}
+
+/// Run one workload through a whole core, in quanta of `budget` ticks.
+fn run_core(w: &Workload, insns: u64, engine: rsemu::cpu::x86::Engine, budget: u64) -> Duration {
+    let (space, _ram) = differential::machine(&w.case);
+    let cpu = differential::oracle(&w.case, space).with_engine(engine);
+    let start = Instant::now();
+    let mut left = insns;
+    while left > 0 {
+        let ticks = budget.min(left);
+        cpu.run_budget(ticks);
+        left -= ticks;
+    }
+    let took = start.elapsed();
+    assert!(
+        !cpu.is_halted(),
+        "{}: the guest trapped under {engine:?}",
+        w.name
+    );
+    took
 }
 
 /// Millions of guest instructions per second, as a string.

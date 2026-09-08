@@ -180,8 +180,33 @@
 //! ([`lift`](super::lift), "A store still ends the block"), and the platform
 //! timer is a value another runnable publishes between quanta. What is left is
 //! a **load** from a device that raises an interrupt as a side effect of being
-//! read, which nothing on a `virt` board does — a PLIC claim and a 16550 `RBR`
-//! read both *lower* a line. Recorded here rather than discovered later.
+//! read.
+//!
+//! **That last sentence used to end "which nothing on a `virt` board does",
+//! and it was wrong.** The CLINT does exactly that, and by design: it is a
+//! lazily-advanced device (`ROADMAP.md` §4.2), so `MemOps::read` catches it up
+//! to this hart's *live* position before it answers, and a comparator crossed
+//! inside that catch-up drives `mtip` there and then. Ordinarily the
+//! comparator is also where the round ends —
+//! `Scheduler::natural_target` takes the soonest event a lazily-advanced
+//! device has of its own — so the rise lands on a quantum boundary and both
+//! engines see it in the same place. The window is a comparator the guest
+//! moves **into the round that is already running**: `natural_target` was
+//! computed when the round began and does not move, so the next read of
+//! `mtime` crosses it. `mtip` then rises between two instructions of a lifted
+//! block, where `Exec::step` would have taken the trap at the next one — and
+//! the block ran on to its natural end, up to [`lift::MAX_INSNS`] instructions
+//! later, with `mepc` naming the wrong instruction and the two engines on
+//! different cycle counts for the rest of the run.
+//!
+//! [`IrHost::load`] closes it, and [`Host::hand_back`] is how the answer
+//! reaches the boundary without [`IrHost::spent`] growing a second load. It is
+//! the same *class* as the three A64 defects `docs/testing/long-run.md`
+//! records — where a quantum ends, not what an instruction computes — and a
+//! different mechanism: A64's generic timer is counted off the core's own
+//! cycle counter, so the walk in [`admit`] could cross it; nothing on this
+//! hart is driven off its tick count, and the raiser is a device on the other
+//! side of a load.
 //!
 //! The interrupt check is asked **per block**, and that is unchanged by
 //! chaining: [`admit`] runs it at every boundary, so a chain is as prompt as
@@ -189,6 +214,27 @@
 //! is the price of chaining, stated rather than implied: `Hart::run_budget`
 //! tests it between calls to [`advance`], so it used to be honoured within one
 //! block and is now honoured within [`CHAIN`] of them. See that constant.
+//!
+//! # What is still not covered, and what would make it reachable
+//!
+//! **A sibling hart's IPI** — a store into another hart's `MSIP` — was the
+//! hypothesis this was looked into for, and under
+//! `ThreadingMode::Deterministic` it cannot be reached: the sibling only runs
+//! in its own quantum, so the write lands while this hart is between quanta
+//! and both engines see it at the next [`admit`]. Under
+//! `ThreadingMode::Parallel` two harts really are inside the same round at
+//! once and the wire really can move mid-block — but that mode gives up
+//! reproducibility by construction and `Machine::state_hash` refuses in it, so
+//! there is no oracle to diverge from. [`IrHost::load`] happens to cover the
+//! `MSIP` case anyway, because a hart that *reads* anything in the CLINT
+//! window asks the same question; a hart that reads nothing does not.
+//!
+//! **A page table in a device.** [`admit`] asks `Exec::pending_interrupt`
+//! before it charges the entry translation, so a walk between the two is
+//! unwatched — the window A64's `engine::leave_at` exists for. On this hart it
+//! is empty for a different reason: the walk reads page-table entries, and a
+//! `virt` board puts page tables in DRAM. A board that mapped them over a
+//! lazily-advanced device would reopen it.
 //!
 //! # Self-modifying code, and the one case that is not covered
 //!
@@ -1034,6 +1080,39 @@ impl<'a, 'e> Host<'a, 'e> {
         }
     }
 
+    /// Retire what is left of this run's `allowance`, so the block leaves at
+    /// its next guest instruction boundary.
+    ///
+    /// The whole of how an interrupt reaches [`IrHost::spent`], and it costs
+    /// that function *nothing*, in the strong sense that its body is
+    /// unchanged: a boundary already loads `allowance` and compares
+    /// `Exec::used` against it, and zero is the value that comparison is
+    /// always true for. A second field would have been a second load on the
+    /// hottest path in the file — asked at every guest instruction boundary of
+    /// every block — to carry one bit that this one already has room for.
+    ///
+    /// What is left to pay for is the question in [`IrHost::load`], and it was
+    /// measured under callgrind rather than on a clock, because the host this
+    /// was written on was carrying a load average of thirty and the wall-clock
+    /// spread between two runs of the *unmodified* binary was larger than the
+    /// effect. `Hart::advance` taken inclusively over the whole of
+    /// `benches/jit_dispatch --smoke` — three engines, four workloads, six
+    /// quanta — went from **1 038 017 036 host instructions to 1 039 145 936,
+    /// +0.11%**. The variant that carried a separate `bool` measured
+    /// 1 037 957 044, *below* the baseline: the two bracket it, so the honest
+    /// reading is that both are under this instrument's resolution on this mix
+    /// and the fold is worth having for the shape rather than for the number.
+    ///
+    /// The ticks are not lost. `advance` reports `Exec::used`, and
+    /// `Hart::run_budget` loops until *its* allowance is spent, so what this
+    /// gives up is the rest of the **run**, not the rest of the quantum —
+    /// which is exactly right, because the rest of the quantum now belongs to
+    /// the interpreter and to the trap it is about to take.
+    #[inline]
+    fn hand_back(&mut self) {
+        self.allowance = 0;
+    }
+
     /// Report a trap as the bus error the IR speaks, keeping the cause.
     fn fault(&mut self, trap: Trap) -> BusError {
         self.trap = Some(trap);
@@ -1062,8 +1141,41 @@ impl IrHost for Host<'_, '_> {
         self.slots[slot.0 as usize] = value as u64;
     }
 
+    /// The interpreter's own load, and then the interpreter's own interrupt
+    /// question — because this is the one call a block makes that can change
+    /// the answer to it.
+    ///
+    /// Everything else inside a block leaves the interrupt inputs alone.
+    /// `Exec::charge` counts ticks and nothing on this hart is driven off that
+    /// count; a **store** ends the block by construction
+    /// ([`lift`](super::lift), "A store still ends the block"), so whatever it
+    /// raises is seen by the next boundary's [`admit`]; and every CSR write,
+    /// `MRET`, `WFI` and `SFENCE.VMA` is outside the lifted subset, so the
+    /// enables and the delegation this hart decides with are constant for the
+    /// length of a run. A **load** is what is left, and the module docs used
+    /// to dismiss it: *"a load from a device that raises an interrupt as a
+    /// side effect of being read, which nothing on a `virt` board does"*. The
+    /// CLINT does. It is a lazily-advanced device
+    /// (`ROADMAP.md` §4.2), so `MemOps::read` catches it up to this hart's
+    /// live position before answering — and a comparator the guest moved into
+    /// the current round, after `Scheduler::natural_target` had already chosen
+    /// where the round ends, is crossed by that catch-up rather than by the
+    /// round. `mtip` then rises **between two instructions of a lifted
+    /// block**, where `Exec::step` would have taken the trap at the next one
+    /// and a block would run on to its natural end.
+    ///
+    /// So the answer is asked here rather than at every boundary: one call on
+    /// a path that already crosses the whole memory path, against a load and a
+    /// compare per boundary in [`IrHost::spent`]. `Exec::pending_interrupt` is
+    /// the interpreter's predicate rather than a second copy of it, and its
+    /// own first act is one atomic read masked with `mie`, so a load that
+    /// raises nothing pays for that and stops.
     fn load(&mut self, mem: &MemOp, addr: u64) -> MemResult<u64> {
-        match self.exec.load(addr, mem.size.bytes()) {
+        let done = self.exec.load(addr, mem.size.bytes());
+        if self.exec.pending_interrupt().is_some() {
+            self.hand_back();
+        }
+        match done {
             Ok(v) => Ok(v),
             Err(trap) => Err(self.fault(trap)),
         }
@@ -1092,6 +1204,14 @@ impl IrHost for Host<'_, '_> {
     /// count to the budget or past it, and a block that stopped one
     /// instruction later would leave the two engines on different instructions
     /// with different `State::debt` for the rest of the run.
+    ///
+    /// It answers a **second** question with the same compare: an interrupt
+    /// that arrived inside this run. [`Host::hand_back`] retires the allowance
+    /// when [`IrHost::load`] finds one, so the block leaves at the boundary
+    /// after the load, [`advance`] returns, and the next call's [`admit`]
+    /// finds the interrupt pending and hands the instruction to the
+    /// interpreter — which is exactly the sequence an interpreted hart runs,
+    /// one `step` charging the load and the next taking the trap.
     #[inline]
     fn spent(&self) -> bool {
         self.exec.used >= self.allowance
@@ -1175,6 +1295,102 @@ mod tests {
 
     /// How much RAM a test hart gets, at address zero.
     const RAM: u64 = 0x1_0000;
+
+    /// A one-register block that asserts this hart's machine timer line when
+    /// it is read, and does nothing else.
+    #[derive(Debug)]
+    struct RaiseOnRead {
+        hart: crate::core::sync::Mutex<alloc::sync::Weak<Hart>>,
+    }
+
+    impl crate::core::space::MemOps for RaiseOnRead {
+        fn read(&self, _offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+            dst.fill(0);
+            if attrs.debug {
+                return Ok(());
+            }
+            if let Some(hart) = self.hart.lock().upgrade() {
+                hart.set_interrupt(crate::cpu::riscv::irq::MTI, true);
+            }
+            Ok(())
+        }
+
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            Ok(())
+        }
+    }
+
+    /// `RAISER` at zero with [`RaiseOnRead`] mapped just past the RAM.
+    fn raising_hart(engine: Engine) -> Arc<Hart> {
+        let ram = Arc::new(RamStore::new(RAM));
+        write_words(&ram, 0, &RAISER);
+        let dev = Arc::new(RaiseOnRead {
+            hart: crate::core::sync::Mutex::with_rank(
+                crate::core::sync::LockRank::LEAF,
+                alloc::sync::Weak::new(),
+            ),
+        });
+        let space = AddressSpace::new("mem", 64);
+        {
+            let mut topo = space.topology();
+            topo.map_with_perms(Region::ram("ram", ram), 0, Perms::RWX)
+                .expect("nothing else is mapped");
+            topo.map(
+                Region::io(
+                    "raiser",
+                    0x1000,
+                    Arc::clone(&dev) as Arc<dyn crate::core::space::MemOps>,
+                ),
+                RAM,
+            )
+            .expect("it does not overlap the RAM");
+        }
+        let hart = Arc::new(Hart::new(Config::rv64gc().with_reset_vector(0)).with_engine(engine));
+        hart.attach_space(Arc::new(space));
+        *dev.hart.lock() = Arc::downgrade(&hart);
+        hart
+    }
+
+    /// A load from a device that raises an interrupt, four instructions from
+    /// the end of a lifted trace.
+    const RAISER: [u32; 9] = [
+        0x0001_03b7, // lui    x7, 0x10        ; the device, just past the RAM
+        0x3004_6073, // csrrsi x0, mstatus, 8  ; MIE
+        0x0800_0313, // addi   x6, x0, 0x80    ; MTI
+        0x3043_2073, // csrrs  x0, mie, x6
+        0x0003_be03, // ld     x28, 0(x7)      ; raises MTI   <- 0x10
+        0x0012_8293, // addi   x5, x5, 1
+        0x0012_8293, // addi   x5, x5, 1
+        0x0012_8293, // addi   x5, x5, 1
+        0xff1f_f06f, // jal    x0, -16
+    ];
+
+    #[test]
+    fn a_load_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = raising_hart(Engine::Interp);
+            let jit = raising_hart(engine);
+            for n in 0..8 {
+                let a = interp.run_budget(1000);
+                let b = jit.run_budget(1000);
+                assert_eq!(a, b, "quantum {n}: different budgets under {engine:?}");
+            }
+            assert_eq!(
+                interp.csrs().mcause,
+                (1u64 << 63) | 7,
+                "the fixture never took a machine timer interrupt"
+            );
+            assert_eq!(
+                interp.csrs().mepc,
+                jit.csrs().mepc,
+                "mepc under {engine:?}: interpreter {:#x}, translated {:#x}",
+                interp.csrs().mepc,
+                jit.csrs().mepc,
+            );
+            assert_eq!(interp.x(5), jit.x(5), "x5 under {engine:?}");
+            assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+        }
+    }
 
     /// x5 counts up, storing and reloading through x7, closed by a backward
     /// `jal`. Every instruction is in the lifted subset, the loop's back edge

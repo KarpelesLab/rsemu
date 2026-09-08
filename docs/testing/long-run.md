@@ -229,11 +229,23 @@ its teeth:
   what makes a failure say `debt 3 against 2` instead of `first difference at
   byte 812`. Each core needs its own, matched to its `save`; the fallback is a
   byte offset and is much weaker.
-* **a workload designed around the engine's seams.** RISC-V and x86 have the
-  same two seams — a boundary the frontend declines, and a per-core timer
-  reached from inside a block — and nobody has yet written the guest that
-  provokes them. `tests/engine_longrun.rs`'s RISC-V leg is the plain RV64I loop
-  the other tests use, and it says so.
+* **a workload designed around the engine's seams.** RISC-V and x86 share the
+  first of A64's seams — a boundary the frontend declines — and **not** the
+  second: neither core has a timer of its own counted off its own cycle
+  counter, so nothing on either can cross a comparator inside `admit`'s entry
+  walk the way A64's generic timer can. What they have instead is a *device* on
+  the other side of a load. The CLINT, the local APIC and the HPET are all
+  lazily advanced, so a guest load catches the chip up to the core's live
+  position and a comparator crossed there raises the wire **between two
+  instructions of a lifted block** — where the interpreter would have taken the
+  trap at the next one. Both cores had that divergence and both are fixed in
+  `IrHost::load`; `docs/platforms/riscv-virt.md` and `docs/platforms/pc64.md`
+  have the diagnosis, and the regression tests live beside the engines rather
+  than here because each needs a device that raises on read.
+  `tests/engine_longrun.rs`'s RISC-V leg is still the plain RV64I loop the
+  other tests use, and it says so: a synthetic guest that provoked the seam
+  above would need a CLINT and a timer handler, which is a board rather than a
+  loop.
 
 [`tests/a64_engines.rs`]: ../../tests/a64_engines.rs
 [`tests/riscv_virt_engines.rs`]: ../../tests/riscv_virt_engines.rs
