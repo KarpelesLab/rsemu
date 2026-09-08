@@ -93,32 +93,43 @@ today, a threaded rsemu in a `SharedArrayBuffer` cannot save a machine with
 argument, and a `SharedArrayBuffer` cannot be grown past the module's declared
 maximum after instantiation.
 
-### `core::sync` selects `single` on wasm, threads or no threads
+### The threaded wasm build declares itself, because stable cannot detect it
 
-The backend selection in `src/core/sync.rs` is
-`cfg(all(feature = "std", not(target_family = "wasm")))`. `wasm32-wasip1-threads`
-has a working `std::thread` and a shared memory, and still gets the zero-worker,
-non-blocking `single` backend — the `wasm-atomics` backend that file names as an
-EXTENSION POINT and that ROADMAP.md §11's target matrix lists does not exist
-yet. Running the suite is what turned that from a to-do into two observed
-failures:
+Until this was run, `core::sync`'s backend selection was `cfg(all(feature =
+"std", not(target_family = "wasm")))`, so `wasm32-wasip1-threads` — a working
+`std::thread` and a shared linear memory — got the zero-worker, non-blocking
+`single` backend. Running the suite turned a to-do into two observed failures:
 
-- `Pool` reports **zero workers**, so `tests/parallel_threading.rs`'s first
-  assertion fails with "this host refused a worker thread". The rest of that
-  file passes — `parallel` mode *runs* on this target, it just runs every
-  runnable on the calling thread.
+- `Pool` reported **zero workers**, so `tests/parallel_threading.rs`'s
+  `every_runnable_is_inside_its_run_call_on_a_thread_of_its_own` failed with
+  "this host refused a worker thread". The other eleven tests in that file
+  passed only because `parallel` mode degenerated to running every runnable on
+  the calling thread.
 - `single::Mutex::lock` treats a contended acquisition as the deadlock it would
   be under one thread and panics. `core::space::buslock::BusLock` is such a
-  `Mutex`, and two guest cores on two real host threads contend for it, so
-  `tests/a64_lse_atomicity.rs`, `tests/riscv_amo_atomicity.rs` and
-  `tests/x86_bus_lock.rs` abort inside `BusLock::acquire`. In a threaded browser
-  build that is two emulated cores taking a bus lock and killing the page.
+  `Mutex`, so two guest cores on two real host threads aborted inside
+  `BusLock::acquire` — five tests across `a64_lse_atomicity`,
+  `riscv_amo_atomicity`, `x86_bus_lock` and `parallel_threading`. **In a
+  threaded browser build that is two emulated cores killing the page.**
 
-### The extension point cannot be a `cfg` on stable
+All five pass now, and the stage's skip list went from ten rows to four.
 
-`src/core/sync.rs`'s EXTENSION POINT comment proposes that the `wasm-atomics`
-backend claim `target_family = "wasm"` with `target_feature = "atomics"`. That
-cfg does not exist on stable. Measured, not assumed:
+#### There is no `wasm-atomics` module and there does not need to be
+
+`src/core/sync.rs` named one as an EXTENSION POINT and `ROADMAP.md` §4.7's table
+still lists the name. What the name describes is real; a separate module was
+not. On a threaded wasm target `std::sync::Mutex` **is** `memory.atomic.wait32`
+and `std::thread::spawn` **is** `wasi:thread-spawn`, so `core::sync`'s
+`native_std` backend compiled for that target already was the wasm-atomics
+backend. Writing a second one would have reimplemented std's futex to arrive at
+the same two instructions. What was missing was never the code; it was a `cfg`
+that could reach it.
+
+#### The `cfg` cannot exist on stable
+
+The old extension-point comment proposed keying on `target_family = "wasm"` plus
+`target_feature = "atomics"`. That cfg does not exist on stable. Measured, not
+assumed:
 
 ```console
 $ rustc --print cfg --target wasm32-wasip1        | sort > a
@@ -135,16 +146,71 @@ nightly sets `target_feature="atomics"`, which is the toolchain the
 threads, because it describes how atomics *lower*, not whether the host has more
 than one thread.
 
-What does distinguish them is asking. `std::thread::Builder::spawn` returns a
-plain error on the non-threaded target and succeeds on the threaded one — no
-panic either way, so a pool can probe once at construction:
+#### So the build says so: the `wasm-threads` feature
+
+`core::sync` selects its threaded backend on `all(feature = "std",
+any(not(target_family = "wasm"), feature = "wasm-threads"))`. Off wasm the first
+disjunct is already true, so the feature is inert there and native is
+untouched — the same object code, and the feature sweep gains one build that
+changes nothing.
+
+**Why a feature and not the runtime probe.** A probe answers the question
+perfectly:
 
 | Target | `std::thread::Builder::new().spawn(..)` |
 | --- | --- |
-| `wasm32-wasip1` (Node's WASI) | `Err(Os { code: 58, kind: Unsupported, message: "Not supported" })` |
+| `wasm32-wasip1` (Node's WASI, and wasmer) | `Err(Os { code: 58, kind: Unsupported, message: "Not supported" })` |
 | `wasm32-wasip1-threads` (wasmer) | `Ok(..)`, and the join returns the value |
 
-A Cargo feature would work too and is more explicit, at the cost of a build that
-can be configured wrong. Either way the choice belongs in `core::sync`, and it
-is a `src/` change with a review attached — the point of writing it down here is
-that "just key on `target_feature`" is not available.
+— but it answers it too late to be the selector. `Mutex`, `RwLock`, `Once`,
+`Pool` and `Handle` are *types*, chosen when the crate is compiled, and the two
+candidates differ in more than a policy bit: one blocks and the other panics,
+one owns `std::thread` workers and the other is `no_std` and has no threads to
+own. Selecting between them at run time means an enum around every primitive and
+a branch on every acquisition — including `BusLock`, which is on the guest's
+memory path. A feature costs nothing and moves the decision to where the
+information already is.
+
+**Why a build script is not the automatic version of it, either.** `TARGET` in a
+build script would separate `wasm32-wasip1` from `wasm32-wasip1-threads` with no
+chance of misconfiguration. It would not separate the threaded browser build
+from the non-threaded one: both are `wasm32-unknown-unknown`, differing only in
+`-Z build-std -C target-feature=+atomics`. Half the problem solved, the feature
+still needed, and two mechanisms answering one question.
+
+#### The probe survives as a tripwire
+
+A wrong feature setting is not symmetric, and the harmless direction is harmless
+by construction. Claim threads on a host that has none and `Pool::new` spawns,
+gets `Err`, keeps zero workers and runs jobs inline — which is what `single`
+does. Measured rather than reasoned: `--features std,wasm-threads` builds for
+`wasm32-wasip1` and `wasm32-unknown-unknown`, and on `wasm32-wasip1` under Node
+every `core::sync` test passes except the `threaded` module, whose whole job is
+to assert that `Pool::new(4).workers() == 4`. So the emulator degrades and
+`cargo test` still says the build was configured wrong.
+
+The other direction is the defect that shipped: a host that really does hand
+back a thread, running the backend that panics on contention. So
+`core::sync`'s `a_threaded_wasm_host_must_not_be_running_single` spawns one
+thread, and if the spawn succeeds it asserts the build is not on `single`.
+`Builder::spawn` returns an error rather than panicking on every target, so the
+probe is safe to run anywhere; it lives in a test rather than in `Pool` because
+CI is the enforcement and a shipped build should not spend a thread proving a
+`cfg`.
+
+Note that this is a probe *at pool construction time*, which is the one moment
+`ROADMAP.md` §4.7 and `CLAUDE.md` already sanction: the embedder builds the pool
+up front with a worker count from the machine configuration, precisely because a
+Web Worker cannot be created synchronously from arbitrary code. Spawning there
+is not a device model quietly making a thread — it is the sanctioned
+construction point doing the thing it exists to do, and its refusal is data
+(`Pool::workers() == 0`) rather than an error a caller has to handle.
+
+#### One test left the ledger a different way
+
+`core::sync`'s `a_panicking_job_is_reported_at_join_and_the_pool_survives` is
+now gated `#[cfg(panic = "unwind")]` rather than skipped. Its module never
+compiled for a wasm target before, and `catch_unwind` catches nothing under
+`panic = "abort"`: the test is inapplicable there, not failing. That is a
+different thing from the three conformance-harness skips, which are `quietly(..)`
+wrappers inside code that must keep compiling for every target.
