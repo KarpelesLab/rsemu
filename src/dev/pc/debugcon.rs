@@ -100,10 +100,15 @@
 //! its own name, and
 //!
 //! ```console
-//! rsemu run q35-uefi --console debug --flash0 … >boot.log
+//! rsemu run q35-uefi --capture debug=boot.log --flash0 … --for 1400s
 //! ```
 //!
-//! is how a headless run keeps it.
+//! is how a run keeps it. `--capture` rather than `--console debug`, because a
+//! terminal session is paced to wall clock and a capture is not: the same log
+//! costs 1 400 seconds of somebody's afternoon through a terminal and under two
+//! minutes drained to a file. Every other port the board opened is drained and
+//! discarded by that same loop, which is what keeps a 16550 nobody is watching
+//! from filling its 64 KiB and holding `THRE` clear.
 
 use alloc::boxed::Box;
 use alloc::string::String;

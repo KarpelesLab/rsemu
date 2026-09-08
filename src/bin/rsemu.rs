@@ -116,6 +116,23 @@ RUN OPTIONS:
                         machine that opens exactly one is picked up on its own,
                         so `rsemu run apple1` is interactive already
     --headless          Do not attach a terminal, whatever the machine opened
+    --capture <name>[=<file>]
+                        Drain the character port <name> to <file>, or to stdout
+                        when no file is given, while the machine runs UNPACED --
+                        as fast as the host can rather than at wall-clock speed,
+                        which is what an attached console runs at. Repeat it to
+                        capture several ports at once; how long to run is --for,
+                        as it is for every other loop. Without --console it
+                        implies no terminal, so
+                        `--capture debug=boot.log --for 1400s` takes a
+                        firmware's whole debug log in the time it takes to
+                        simulate rather than in 1400 seconds of yours.
+                        Every character port this machine opened that nothing
+                        is watching is drained and DISCARDED, here and in every
+                        other loop: an unattached port is a cable nobody plugged
+                        in, and leaving it to fill would hold a 16550's THRE
+                        clear at 64 KiB and stall the guest. The summary says
+                        how many bytes went that way
     --screenshot <file> Write the machine's display to a PNG when the run ends,
                         however the run was driven -- headless, with a console
                         attached, under a debugger, or serving VNC. Needs a
@@ -308,6 +325,15 @@ struct RunArgs {
     console: Option<String>,
     /// Whether the user asked for no terminal at all.
     headless: bool,
+    /// `--capture <name>[=<file>]`: character ports whose output is drained to
+    /// a file, or to stdout where the path is `None`, in the order they were
+    /// given.
+    ///
+    /// Deliberately *only* a destination. How long to run is `--for` and what
+    /// crosses **into** the machine is the record/replay seam's business
+    /// (`--record-input`); a flag that also carried a duration or a stop
+    /// condition would be a second way to say something the CLI already says.
+    capture: Vec<(String, Option<String>)>,
     /// Where to write a PNG of the display when the run ends, if `--screenshot`
     /// was given.
     screenshot: Option<String>,
@@ -590,24 +616,61 @@ fn run(args: &[String]) -> ExitCode {
         return finish(&machine, ExitCode::from(2));
     }
 
+    // Which character port a terminal gets, if any. Resolved **once**, before
+    // the four loops rather than inside each of them, because the answer is
+    // half of what `Drains` needs: a port a terminal is already draining must
+    // not also be drained here.
+    //
+    // Not asked at all when a VNC session is about to start, and that is not an
+    // optimisation: `--vnc` on a board with three character ports must not fail
+    // with "pick one with --console", because that session attaches a terminal
+    // to none of them. It wires a keyboard, a pad and a pointer; a board's
+    // *serial* console is nobody's in that loop, so it is drained and discarded
+    // like any other unwatched port rather than left to fill.
+    let console = if serving_vnc(&parsed) {
+        None
+    } else {
+        match console_port(&parsed, &options.realize.hosts) {
+            Ok(console) => console,
+            Err(e) => {
+                eprintln!("rsemu: {e}");
+                return finish(&machine, ExitCode::from(2));
+            }
+        }
+    };
+
+    // And what happens to every other one. Also before the loops: a `--capture`
+    // naming a port this machine never opened, or a path that cannot be
+    // written, is a refusal now rather than a discovery ten minutes into a
+    // firmware boot.
+    let attached = console.as_ref().map(|c| c.name.as_str());
+    let mut drains = match Drains::open(&parsed, &options.realize.hosts, attached) {
+        Ok(drains) => drains,
+        Err(e) => {
+            eprintln!("rsemu: {e}");
+            return finish(&machine, ExitCode::from(2));
+        }
+    };
+
     // A debugger, if one was asked for, owns when the machine advances — so it
     // is checked before the console loop, which would otherwise own that.
     #[cfg(feature = "gdb")]
     if let Some(addr) = parsed.gdb.clone() {
-        let console = match console_port(&parsed, &options.realize.hosts) {
-            Ok(console) => console,
-            Err(e) => {
-                eprintln!("rsemu: {e}");
-                return ExitCode::from(2);
-            }
-        };
         let port = console.as_ref().map(|c| &c.port);
-        let status = debug_session(&mut machine, &addr, port, &parsed, audio.as_mut());
+        let status = debug_session(
+            &mut machine,
+            &addr,
+            port,
+            &parsed,
+            audio.as_mut(),
+            &mut drains,
+        );
         return deliver(
             &machine,
             &parsed,
             scanout.as_deref(),
             audio.as_ref(),
+            &mut drains,
             status,
         );
     }
@@ -624,31 +687,26 @@ fn run(args: &[String]) -> ExitCode {
             &options.realize.hosts,
             scanout.take(),
             audio.take(),
+            &mut drains,
         );
         return finish(&machine, status);
     }
 
     // A machine that opened a character port has a console; attach this
     // terminal to it and hand the keyboard over.
-    match console_port(&parsed, &options.realize.hosts) {
-        Err(e) => {
-            eprintln!("rsemu: {e}");
-            return ExitCode::from(2);
-        }
-        Ok(Some(console)) => {
-            let status = interact(&mut machine, &console, &parsed, audio.as_mut());
-            return deliver(
-                &machine,
-                &parsed,
-                scanout.as_deref(),
-                audio.as_ref(),
-                status,
-            );
-        }
-        Ok(None) => {}
+    if let Some(console) = &console {
+        let status = interact(&mut machine, console, &parsed, audio.as_mut(), &mut drains);
+        return deliver(
+            &machine,
+            &parsed,
+            scanout.as_deref(),
+            audio.as_ref(),
+            &mut drains,
+            status,
+        );
     }
 
-    if let Err(e) = run_headless(&mut machine, parsed.span, audio.as_mut()) {
+    if let Err(e) = run_headless(&mut machine, parsed.span, audio.as_mut(), &mut drains) {
         eprintln!("rsemu: {e}");
         summarise(&machine);
         return deliver(
@@ -656,6 +714,7 @@ fn run(args: &[String]) -> ExitCode {
             &parsed,
             scanout.as_deref(),
             audio.as_ref(),
+            &mut drains,
             ExitCode::FAILURE,
         );
     }
@@ -665,6 +724,7 @@ fn run(args: &[String]) -> ExitCode {
         &parsed,
         scanout.as_deref(),
         audio.as_ref(),
+        &mut drains,
         ExitCode::SUCCESS,
     )
 }
@@ -679,12 +739,16 @@ fn deliver(
     args: &RunArgs,
     scanout: Option<&dyn rsemu::host::display::Scanout>,
     audio: Option<&rsemu::host::audio::AudioStream>,
+    drains: &mut Drains,
     status: ExitCode,
 ) -> ExitCode {
+    // First, because it is the one that has a machine's own tail in it: a
+    // slice's worth of output is still sitting in a port when the loop breaks.
+    let captured = drains.finish(args.quiet);
     let drew = write_screenshot(args, scanout);
     let played = write_recording(args, audio);
     let logged = write_input_log(args, machine.recorder());
-    let status = if drew && played && logged {
+    let status = if drew && played && logged && captured {
         status
     } else {
         ExitCode::FAILURE
@@ -1226,6 +1290,7 @@ fn run_headless(
     machine: &mut Machine,
     span: GlobalTime,
     mut audio: Option<&mut rsemu::host::audio::AudioStream>,
+    drains: &mut Drains,
 ) -> rsemu::Result<()> {
     let end = machine.now().saturating_add(span);
     while machine.now() < end {
@@ -1237,6 +1302,13 @@ fn run_headless(
         if let Some(stream) = audio.as_mut() {
             stream.pull();
         }
+        // The character ports, on the same cadence and for a sharper reason
+        // than the sound: a ring that overflows loses samples, while a port
+        // that fills stops the guest (`Drains`). This loop is also the one
+        // `--capture` runs in, and it is **unpaced** — there is no sleep in it
+        // — which is the whole difference between capturing a firmware's log
+        // in the time it takes to simulate and capturing it in real time.
+        drains.pump();
     }
     // Whatever the last slice left in the ring.
     if let Some(stream) = audio.as_mut() {
@@ -1322,6 +1394,7 @@ fn debug_session(
     port: Option<&Arc<CharPort>>,
     args: &RunArgs,
     mut audio: Option<&mut rsemu::host::audio::AudioStream>,
+    drains: &mut Drains,
 ) -> ExitCode {
     use rsemu::host::gdb::{ExitReason, GdbServer};
 
@@ -1402,6 +1475,7 @@ fn debug_session(
         if let Some(stream) = audio.as_mut() {
             stream.pull();
         }
+        drains.pump();
         if let (Some(term), Some(port)) = (terminal.as_ref(), port) {
             term.pump(port);
             if term.interrupted() {
@@ -1432,8 +1506,14 @@ fn debug_session(
 /// open in `hosts` — the table that build used, and nobody else's. One is
 /// unambiguous; several need `--console` to choose between them, because
 /// guessing would put the keyboard on the wrong device.
+///
+/// `--capture` with no `--console` is a run with **no terminal**: the point of
+/// a capture is that the machine is not paced to wall clock, and a terminal is
+/// what paces it. Naming both is allowed and means exactly what it says — type
+/// at one port, capture another — and the run is paced again, because a person
+/// is watching it.
 fn console_port(args: &RunArgs, hosts: &HostObjects) -> Result<Option<Console>, String> {
-    if args.headless {
+    if args.headless || (args.console.is_none() && !args.capture.is_empty()) {
         return Ok(None);
     }
     let opened = |name: &str| {
@@ -1472,6 +1552,225 @@ fn console_port(args: &RunArgs, hosts: &HostObjects) -> Result<Option<Console>, 
 struct Console {
     name: String,
     port: Arc<CharPort>,
+}
+
+/// Whether this run serves a remote frontend rather than attaching a terminal.
+///
+/// A build without `vnc` cannot, and says so at compile time rather than
+/// carrying a flag it would never set.
+fn serving_vnc(args: &RunArgs) -> bool {
+    #[cfg(feature = "vnc")]
+    {
+        args.vnc.is_some()
+    }
+    #[cfg(not(feature = "vnc"))]
+    {
+        let _ = args;
+        false
+    }
+}
+
+/// What happens to every character port the machine opened.
+///
+/// # Why a run has to touch ports nobody asked about
+///
+/// A `CharPort` holds [`PORT_CAPACITY`](rsemu::host::chardev::PORT_CAPACITY)
+/// bytes and then pushes back, and pushing back is not a formality: a
+/// `uart.ns16550` whose port will not take a byte holds it in the transmit
+/// register with `THRE` clear, which is what the real part does and which stops
+/// a guest that waits for the bit. Every loop here used to drain the one port a
+/// terminal was attached to and nothing else, so `--console debug` on a board
+/// with three of them left COM1 filling — the guest stalling after 64 KiB of a
+/// stream *nobody had asked to see*, at whatever point in the boot that fell.
+///
+/// So an unwatched port is **drained and discarded**, which is the honest model
+/// as well as the safe one: a serial line with nothing plugged into it does not
+/// stall the transmitter, the bytes go on the floor. Refusing to run would make
+/// a three-port board unusable, and copying every port to stdout would
+/// interleave two streams into one that neither describes. The bytes are
+/// counted so a discarded stream is visible in the summary rather than silent —
+/// the same argument `pc.debugcon`'s `dropped` counter is there for.
+struct Drains {
+    /// `--capture`'s ports, in the order they were named.
+    captures: Vec<Capture>,
+    /// Every other open port: drained, counted, thrown away.
+    discards: Vec<Discard>,
+    /// Scratch, so a pump that runs a hundred times a virtual second allocates
+    /// nothing.
+    buf: Vec<u8>,
+    /// Whether a capture failed to write. The run still finishes — the machine
+    /// is mid-flight and what it has produced is worth more than a prompt
+    /// return — but it finishes non-zero, as `--screenshot` and
+    /// `--record-audio` do.
+    failed: bool,
+}
+
+/// One `--capture`: a port, somewhere to put what it says, and how much has
+/// gone there.
+struct Capture {
+    name: String,
+    port: Arc<CharPort>,
+    /// Where the bytes are going, for the summary line. `None` is stdout.
+    path: Option<String>,
+    sink: Box<dyn std::io::Write>,
+    bytes: u64,
+}
+
+/// One port nothing is listening to.
+struct Discard {
+    name: String,
+    port: Arc<CharPort>,
+    bytes: u64,
+}
+
+impl Drains {
+    /// Resolve `--capture` against the ports this machine actually opened, and
+    /// file every other one under "discard".
+    ///
+    /// `attached` is the port a terminal has, if a console session is about to
+    /// start: it is neither captured nor discarded, because the terminal is
+    /// already draining it.
+    ///
+    /// Errors here happen **before** the run: a mistyped port name or an
+    /// unwritable path must not be discovered after a person has watched a
+    /// firmware boot for ten minutes.
+    fn open(args: &RunArgs, hosts: &HostObjects, attached: Option<&str>) -> Result<Drains, String> {
+        let mut captures = Vec::new();
+        for (name, path) in &args.capture {
+            let Some(port) = ports::get(hosts, name).ok().flatten() else {
+                return Err(format!(
+                    "--capture {name}: no character port named `{name}`; this machine opened {}",
+                    list(&ports::names(hosts))
+                ));
+            };
+            let sink: Box<dyn std::io::Write> = match path {
+                Some(path) => {
+                    let file = std::fs::File::create(path)
+                        .map_err(|e| format!("--capture {name}={path}: {e}"))?;
+                    Box::new(std::io::BufWriter::new(file))
+                }
+                None => Box::new(std::io::stdout()),
+            };
+            captures.push(Capture {
+                name: name.clone(),
+                port,
+                path: path.clone(),
+                sink,
+                bytes: 0,
+            });
+        }
+        let watched =
+            |name: &str| Some(name) == attached || args.capture.iter().any(|(had, _)| had == name);
+        let mut discards = Vec::new();
+        for name in ports::names(hosts) {
+            if watched(&name) {
+                continue;
+            }
+            if let Ok(Some(port)) = ports::get(hosts, &name) {
+                discards.push(Discard {
+                    name,
+                    port,
+                    bytes: 0,
+                });
+            }
+        }
+        let drains = Drains {
+            captures,
+            discards,
+            buf: Vec::new(),
+            failed: false,
+        };
+        if !args.quiet {
+            drains.announce();
+        }
+        Ok(drains)
+    }
+
+    /// Say what is being watched and what is being thrown away, before the run
+    /// rather than after it.
+    fn announce(&self) {
+        if self.captures.is_empty() {
+            return;
+        }
+        for capture in &self.captures {
+            match &capture.path {
+                Some(path) => eprintln!("  capturing `{}` to {path}", capture.name),
+                None => eprintln!("  capturing `{}` to stdout", capture.name),
+            }
+        }
+        if self.discards.is_empty() {
+            eprintln!();
+        } else {
+            let names: Vec<String> = self.discards.iter().map(|d| d.name.clone()).collect();
+            eprintln!(
+                "  {} drained and discarded, so nothing fills and stalls the guest\n",
+                list(&names)
+            );
+        }
+    }
+
+    /// Move whatever the guest has written since the last visit.
+    ///
+    /// Called once a slice by every loop — ten milliseconds of virtual time,
+    /// the bound [`DRAIN_SLICE`] is already chosen for — which is far inside
+    /// the 64 KiB a port holds for any device in this tree.
+    fn pump(&mut self) {
+        for capture in &mut self.captures {
+            self.buf.clear();
+            capture.port.drain_into(&mut self.buf);
+            if self.buf.is_empty() {
+                continue;
+            }
+            capture.bytes += self.buf.len() as u64;
+            if let Err(e) = capture.sink.write_all(&self.buf) {
+                // Once, not once a slice: a full disk would otherwise print a
+                // line per ten milliseconds of guest time for the rest of the
+                // run.
+                if !self.failed {
+                    eprintln!("rsemu: --capture {}: {e}", capture.name);
+                }
+                self.failed = true;
+            }
+        }
+        for discard in &mut self.discards {
+            self.buf.clear();
+            discard.port.drain_into(&mut self.buf);
+            discard.bytes += self.buf.len() as u64;
+        }
+    }
+
+    /// The last pump, the flush, and the report — reporting whether the run
+    /// should still count as a success.
+    fn finish(&mut self, quiet: bool) -> bool {
+        self.pump();
+        for capture in &mut self.captures {
+            if let Err(e) = capture.sink.flush() {
+                eprintln!("rsemu: --capture {}: {e}", capture.name);
+                self.failed = true;
+            }
+            if !quiet {
+                let where_to = capture.path.as_deref().unwrap_or("stdout");
+                println!(
+                    "capture     {where_to} (`{}`, {} bytes)",
+                    capture.name, capture.bytes
+                );
+            }
+        }
+        // Only when something was actually thrown away: a board whose other
+        // ports stayed silent has nothing to report, and most do.
+        if !quiet {
+            for discard in &self.discards {
+                if discard.bytes > 0 {
+                    println!(
+                        "discarded   {} bytes the guest wrote to `{}`, which nothing was \
+                         listening to",
+                        discard.bytes, discard.name
+                    );
+                }
+            }
+        }
+        !self.failed
+    }
 }
 
 /// `a`, `b` and `c`, or "none".
@@ -1514,6 +1813,7 @@ fn interact(
     console: &Console,
     args: &RunArgs,
     mut audio: Option<&mut rsemu::host::audio::AudioStream>,
+    drains: &mut Drains,
 ) -> ExitCode {
     let port = &console.port;
     // How a keystroke reaches the guest, and the one place a console session
@@ -1579,6 +1879,11 @@ fn interact(
         if let Some(stream) = audio.as_mut() {
             stream.pull();
         }
+        // Every port this terminal is *not* on. Without this, `--console debug`
+        // on a three-port board left COM1 filling until the 16550 held `THRE`
+        // clear and the guest stopped — a stall caused by watching the wrong
+        // stream (`Drains`).
+        drains.pump();
 
         // A script on stdin has an end; a person does not. Once the input is
         // exhausted *and* the machine has gone quiet, there is nobody left to
@@ -1630,6 +1935,7 @@ fn vnc_session(
     hosts: &HostObjects,
     scanout: Option<Box<dyn rsemu::host::display::Scanout>>,
     audio: Option<rsemu::host::audio::AudioStream>,
+    drains: &mut Drains,
 ) -> ExitCode {
     use rsemu::host::vnc::{VncServer, VncSession};
 
@@ -1714,6 +2020,9 @@ fn vnc_session(
         .span_given
         .then(|| machine.now().saturating_add(args.span));
     let status = session.run(machine, |m| {
+        // A VNC session's keyboard is a port too, and a board that also has a
+        // serial console has one nobody here is reading (`Drains`).
+        drains.pump();
         !term.interrupted() && !interrupted(m) && !deadline.is_some_and(|d| m.now() >= d)
     });
     drop(term);
@@ -1723,6 +2032,7 @@ fn vnc_session(
         return ExitCode::FAILURE;
     }
     let logged = write_input_log(args, machine.recorder());
+    let captured = drains.finish(args.quiet);
     if !args.quiet {
         summarise(machine);
     }
@@ -1731,7 +2041,7 @@ fn vnc_session(
     // from the host table, which it emptied on the way in.
     let drew = write_screenshot(args, Some(session.scanout()));
     let played = write_recording(args, session.audio());
-    if drew && played && logged {
+    if drew && played && logged && captured {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -1872,6 +2182,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         span_given: false,
         console: None,
         headless: false,
+        capture: Vec::new(),
         quiet: false,
         // Deterministic unless asked otherwise: reproducibility is the default
         // a person gets, and giving it up has to be a thing they typed.
@@ -1942,6 +2253,29 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--replay-input" => out.replay_input = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
             "--headless" => out.headless = true,
+            "--capture" => {
+                let spec = value(arg)?;
+                let (name, path) = match spec.split_once('=') {
+                    Some((name, path)) => (name, Some(path.to_string())),
+                    None => (spec.as_str(), None),
+                };
+                if name.is_empty() {
+                    return Err(format!("--capture wants <port>[=<file>], got `{spec}`"));
+                }
+                if out.capture.iter().any(|(had, _)| had == name) {
+                    return Err(format!("--capture {name}: named twice"));
+                }
+                // Two ports interleaved on one stream cannot be told apart
+                // afterwards, and the fix is one character long.
+                if path.is_none()
+                    && let Some((other, _)) = out.capture.iter().find(|(_, to)| to.is_none())
+                {
+                    return Err(format!(
+                        "--capture {name} and --capture {other} both go to stdout; give one of                          them a file"
+                    ));
+                }
+                out.capture.push((name.to_string(), path));
+            }
             "--screenshot" => out.screenshot = Some(value(arg)?),
             "--record-audio" => out.record_audio = Some(value(arg)?),
             "--audio-rate" => {
@@ -1992,6 +2326,16 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     // A `--threading` that was actually typed is therefore refused rather than
     // overruled: a person who asked for `parallel` and got `accel` would have
     // no way to tell.
+    // Two listeners on one port is not a shared view of it: a `CharPort` hands
+    // each byte to whoever asks first, so a terminal and a capture on the same
+    // name would each get half the log.
+    if let Some(console) = &out.console
+        && out.capture.iter().any(|(name, _)| name == console)
+    {
+        return Err(format!(
+            "--console {console} and --capture {console} are two listeners on one port, and a              port gives each byte to whichever asks first; capture a different port, or drop              --console"
+        ));
+    }
     if out.accel.is_some() {
         if out.threading_given && out.threading.0 != ThreadingMode::Accel {
             return Err(format!(
