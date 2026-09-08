@@ -15,6 +15,12 @@
 // is twelve lines around `node:wasi`, and the stage skips itself when Node is
 // absent.
 //
+// This file is for `wasm32-wasip1` *only*. `node:wasi` implements preview 1 and
+// nothing else, so a `wasm32-wasip1-threads` module — which imports
+// `wasi.thread-spawn` and a shared memory — will not instantiate under it. That
+// target has its own runner, `scripts/wasi-threads-run.sh`, and its own runtime
+// for the reasons written there.
+//
 // Usage — cargo calls it, nothing else needs to:
 //
 //   CARGO_TARGET_WASM32_WASIP1_RUNNER="node scripts/wasi-run.mjs" \

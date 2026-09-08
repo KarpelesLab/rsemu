@@ -44,6 +44,7 @@
 #   wasm     all three wasm targets, plus the browser cdylib
 #   combos   the derived no_std feature-*combination* builds (see below)
 #   crosshost  the replay gate on a second architecture (32-bit)
+#   wasm-threads  the suite *executed* on wasm32-wasip1-threads (needs wasmer)
 #   sweep    every feature on its own — long; CI runs it on its own job
 #   fuzz     `cargo fuzz build` (needs a nightly and cargo-fuzz)
 #   long     the engine-divergence long run (needs a fetched arm64 kernel for
@@ -68,7 +69,7 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 
-STAGES=(fast test wasm combos crosshost sweep fuzz long)
+STAGES=(fast test wasm combos crosshost wasm-threads sweep fuzz long)
 DEFAULT_STAGES=(fast test wasm combos)
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -339,6 +340,169 @@ stage_crosshost() {
   run "crosshost snapshot from $w loaded here" crosshost_read "$out/wasm"
 }
 
+# The suite *executed* on `wasm32-wasip1-threads`.
+#
+# ROADMAP.md §11 calls this "the primary threaded wasm target" and says it is
+# "what CI gates on"; CLAUDE.md's Targets section says the same. What CI gated
+# on was `cargo build`. Every wasm target has been compiled on every commit
+# since the first one, `crosshost` added *execution* for `wasm32-wasip1` — and
+# the threaded one, the only target where the project's whole concurrency story
+# (`core::sync`, the task pool, "submit jobs, never spawn threads", guest RAM in
+# a `SharedArrayBuffer`) can be observed at all, ran nothing. Every threading
+# defect this project has found was found by running something.
+#
+# `scripts/wasi-threads-run.sh` is the runner and its header explains the
+# runtime choice — wasmer, because wasmtime deleted wasi-threads in 47.0.0 and
+# `node:wasi` never had it. `--test-threads=1` is explained there too: the
+# target is `panic = "abort"`, so a higher count only moves the panic message
+# onto a libtest thread whose stderr the runtime drops, and buys no wall time.
+# The threading this stage exercises is the threads the *tests* spawn.
+#
+# ## The known-failure list, and why each one is on it
+#
+# Ten tests are skipped, in three groups. Nothing here is a test made weaker —
+# each is named, each has a reason, and the first group is a defect report.
+#
+# **`core::sync` selects the `single` backend on wasm even where the host has
+# real threads (5 tests).** `src/core/sync.rs`'s backend selection is
+# `cfg(all(feature = "std", not(target_family = "wasm")))`, so this target —
+# which has a working `std::thread` and a shared linear memory — gets the
+# zero-worker, non-blocking backend. Two consequences, both observed here:
+#
+#   * `Pool` reports zero workers, so `parallel_threading`'s first assertion
+#     fails with "this host refused a worker thread". The rest of that file
+#     passes, which is worth reading carefully: `parallel` mode *runs* here, it
+#     just runs everything on the calling thread.
+#   * `single::Mutex::lock` treats a contended acquisition as the deadlock it
+#     would be under one thread and panics. `core::space::buslock::BusLock` is
+#     such a `Mutex`, and two guest cores on two real host threads contend for
+#     it — so `a64_lse_atomicity`, `riscv_amo_atomicity` and `x86_bus_lock`
+#     abort inside `BusLock::acquire`. On a threaded browser build that is two
+#     emulated cores taking a bus lock and killing the page.
+#
+# This is the `wasm-atomics` backend that `src/core/sync.rs` names as an
+# EXTENSION POINT and ROADMAP.md §11 lists in its target matrix. It does not
+# exist yet; until it does these five rows stay here, and they are the ledger
+# that shrinks when it lands.
+#
+# **`catch_unwind` cannot work under `panic = "abort"` (3 tests).** Every wasm
+# target is abort-only, so `tests/conformance/harness.rs`'s `quietly(...)`
+# wrapper never catches anything and the process dies instead. Not a defect and
+# not fixable here: it is what the target is.
+#
+# **WASI preview 1 has no sockets (1 test).** `TcpListener::bind` is
+# `Unsupported`, so `host::listen`'s ephemeral-port test aborts. The other two
+# tests in that module pass, because they only parse an address.
+#
+# **One test needs a link flag, not a skip.** `--max-memory` below is why
+# `every_shipped_machine_resumes_from_its_own_snapshot` is *not* on the list:
+# see the comment on WASM_THREADS_RUSTFLAGS.
+WASM_THREADS_SKIPS=(
+  # core::sync picks `single` on wasm; these five are the defect above.
+  every_runnable_is_inside_its_run_call_on_a_thread_of_its_own
+  concurrent_cores_never_lose_an_exclusive_update
+  concurrent_cores_never_lose_an_lse_update
+  concurrent_harts_never_lose_a_reserved_update
+  concurrent_harts_never_lose_an_amo_update
+  two_cores_do_not_lose_a_locked_increment
+  # catch_unwind under panic=abort.
+  a_core_that_dies_mid_trace_still_produces_a_report
+  a_panicking_core_is_reported_not_fatal
+  a_runaway_core_is_reported_not_hung
+  # WASI preview 1 has no socket syscalls.
+  an_ephemeral_port_lands_somewhere_and_says_where
+)
+
+# `CROSSHOST_FEATURES` plus `cpu-x86`. The eight guest architectures are the
+# same set for the same reason (no corpus, no drive), and the x86 core is added
+# because it carries two more suites that spawn host threads —
+# `tests/x86_bus_lock.rs` and `tests/smp_single_copy_atomicity.rs`. The second
+# passes in full here and is the only place single-copy atomicity is checked
+# under wasm atomics; the first is one more sighting of the `single`-backend
+# defect above. Its own constant rather than a reference to CROSSHOST_FEATURES,
+# because the two stages ask different questions and should be free to drift.
+WASM_THREADS_FEATURES="std,cpu-x86,machine-apple1,machine-nes,machine-beneater,machine-z80-mini,machine-m68k-mini,machine-mips-mini,machine-a64-mini,machine-arm926,machine-stm32f407,machine-spi-flash,machine-spi-panel"
+
+# `wasm32-wasip1-threads` links a **shared** memory, and a shared memory must
+# declare a maximum: rustc's default is `--max-memory=1073741824`, 16384 pages.
+# The non-threaded `wasm32-wasip1` memory has no maximum at all and can grow to
+# the full 32-bit space, which is why this only bites here.
+#
+# One gigabyte is not enough for `machine::catalog`'s
+# `every_shipped_machine_resumes_from_its_own_snapshot`: `machine-a64-mini` has
+# 128 MiB of RAM, `Machine::save` materialises the whole state into a `Vec<u8>`,
+# and the `Vec`'s doubling asks for 268 438 836 bytes on top of the machine and
+# the previous snapshot. It aborts on `handle_alloc_error`. Raising the cap to
+# the wasm32 ceiling — 65536 pages, 4 GiB — makes it pass in 18.6 s.
+#
+# Worth knowing rather than hiding, because the default is what a browser build
+# gets: as linked today, a threaded rsemu in a `SharedArrayBuffer` cannot save a
+# machine with 128 MiB of guest RAM. That is a real ceiling and it belongs in
+# `docs/techniques/webassembly.md`, not in a skip list.
+WASM_THREADS_RUSTFLAGS="$RUSTFLAGS -C link-arg=--max-memory=4294967296"
+
+# Same contract as `crosshost_absent`: a developer without the target or the
+# runtime skips, a runner that is missing either fails. The workflow installs
+# both itself, so a skip there means the provisioning broke, and a job that is
+# green because it ran nothing is worse than no job.
+WASM_THREADS_REQUIRED="${RSEMU_WASM_THREADS_REQUIRED:-}"
+wasm_threads_absent() {
+  if [ -n "$WASM_THREADS_REQUIRED" ]; then
+    record "FAIL  $1 -- RSEMU_WASM_THREADS_REQUIRED is set, so this had to run"
+    FAILED=$((FAILED + 1))
+  else
+    record "skip  $1"
+  fi
+}
+
+# `cargo test` for this target, with the skip list appended to whatever libtest
+# arguments the caller wants. `--skip` is a substring filter and applies to
+# every binary in the run; the ten names above are distinctive enough that none
+# of them matches a second test.
+wasm_threads_test() {
+  local args=("$@")
+  local s
+  for s in "${WASM_THREADS_SKIPS[@]}"; do args+=(--skip "$s"); done
+  env RUSTFLAGS="$WASM_THREADS_RUSTFLAGS" \
+    cargo test --target wasm32-wasip1-threads --no-default-features \
+    --features "$WASM_THREADS_FEATURES" "${args[@]}"
+}
+
+stage_wasm_threads() {
+  local t=wasm32-wasip1-threads
+  if ! rustc --print target-libdir --target "$t" >/dev/null 2>&1; then
+    wasm_threads_absent "wasm-threads (target not installed: rustup target add $t)"
+    return 0
+  fi
+  if [ -z "${RSEMU_WASI_THREADS_RUNTIME:-}" ] && ! command -v wasmer >/dev/null 2>&1; then
+    wasm_threads_absent "wasm-threads (no wasmer; see scripts/wasi-threads-run.sh)"
+    return 0
+  fi
+  export CARGO_TARGET_WASM32_WASIP1_THREADS_RUNNER="$(pwd)/scripts/wasi-threads-run.sh"
+
+  # First, and on its own, for the reason the aarch64 job runs its litmus
+  # first: these six files are why the stage exists, and a failure anywhere
+  # else must not be what stops them from being asked. Two of them —
+  # `memory_model_litmus` and `smp_single_copy_atomicity` — pass in full and are
+  # the only places the wasm memory model is exercised by anything but a build.
+  run "wasm-threads concurrency suites" \
+    wasm_threads_test \
+    --test parallel_threading --test a64_lse_atomicity --test riscv_amo_atomicity \
+    --test x86_bus_lock --test smp_single_copy_atomicity --test memory_model_litmus \
+    -- --test-threads=1
+
+  # Then everything, the six above included: 2344 unit tests and every
+  # integration file this feature set builds. `--no-fail-fast` because the
+  # useful output of a portability run is the list of what is broken, not the
+  # first thing that is — and because `panic = "abort"` already truncates each
+  # binary at its first failure, so cargo stopping as well would hide whole
+  # files.
+  run "wasm-threads whole suite" \
+    wasm_threads_test --tests --no-fail-fast -- --test-threads=1
+
+  unset CARGO_TARGET_WASM32_WASIP1_THREADS_RUNNER
+}
+
 # The long engine-divergence run: the interpreter against each translated
 # engine, quantum by quantum, over a real guest.
 #
@@ -414,7 +578,7 @@ case "${1:-}" in
   --list) printf '%s\n' "${STAGES[@]}"; exit 0 ;;
   # Deliberately not `long`: it wants a fetched kernel and minutes of wall
   # time, and `--all` is what somebody runs before a commit.
-  --all)  want=(fast test wasm combos crosshost sweep fuzz) ;;
+  --all)  want=(fast test wasm combos crosshost wasm-threads sweep fuzz) ;;
   "")     want=("${DEFAULT_STAGES[@]}") ;;
   -*)     echo "unknown option $1" >&2; exit 2 ;;
   *)      want=("$@") ;;
@@ -426,7 +590,9 @@ echo
 
 for s in "${want[@]}"; do
   case " ${STAGES[*]} " in
-    *" $s "*) "stage_$s" ;;
+    # A stage name may contain a hyphen (`wasm-threads`, which is also the CI
+    # job's name and half its target's); a function name may not.
+    *" $s "*) "stage_${s//-/_}" ;;
     *) echo "unknown stage $s (try --list)" >&2; exit 2 ;;
   esac
 done
