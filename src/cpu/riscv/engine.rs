@@ -229,12 +229,24 @@
 //! `MSIP` case anyway, because a hart that *reads* anything in the CLINT
 //! window asks the same question; a hart that reads nothing does not.
 //!
-//! **A page table in a device.** [`admit`] asks `Exec::pending_interrupt`
-//! before it charges the entry translation, so a walk between the two is
-//! unwatched — the window A64's `engine::leave_at` exists for. On this hart it
-//! is empty for a different reason: the walk reads page-table entries, and a
-//! `virt` board puts page tables in DRAM. A board that mapped them over a
-//! lazily-advanced device would reopen it.
+//! **A page table in a device** was the other half of this, and it is closed
+//! rather than argued away. [`admit`] asks `Exec::pending_interrupt` and
+//! *then* charges the entry translation, so a walk between the two used to be
+//! unwatched — the window A64's `admit` closes from the other side: there the
+//! walk's own **ticks** cross a comparator, here the walk's own **reads**
+//! reach a device. This paragraph used to end "a `virt` board puts page tables
+//! in DRAM", which is a statement about what a *guest* does: `satp` is a
+//! guest-written register, `mmu::root` masks its `PPN` and range-checks
+//! nothing, and a descriptor read leaves through `AddressSpace::read` with
+//! `MemAttrs::debug` clear. Point `satp` at `0x0200_0000` on
+//! `machines/riscv-virt.machine` and the walk reads the **CLINT**, whose
+//! constraints are `U32`..`U64` on natural alignment — the width of an Sv39
+//! descriptor exactly — and which is lazily advanced, so answering drives
+//! `mtip`. [`Admitted::leave`] carries the answer: [`admit`] re-asks the
+//! predicate when — and only when — the translation charged, and
+//! [`Host::hand_back`] retires the run's allowance so one instruction retires
+//! and the boundary comes back, which is what `Exec::step` does with the same
+//! fetch.
 //!
 //! # Self-modifying code, and the one case that is not covered
 //!
@@ -570,6 +582,15 @@ struct Admitted {
     /// byte the lifter may read.
     page: u64,
     base: u64,
+    /// Whether the **entry translation itself** raised an interrupt, so this
+    /// block must leave at its first guest instruction boundary.
+    ///
+    /// [`admit`]'s two halves are asked in this order and cannot be swapped:
+    /// the interrupt question decides whether a block runs at all, and the
+    /// translation is what names it. So there is a window between them, and a
+    /// page-table walk lives in it — see [`admit`]'s own docs for why this
+    /// answer is only ever computed when a walk actually happened.
+    leave: bool,
 }
 
 /// Whether a block may run at `pc`.
@@ -611,16 +632,59 @@ enum Admit {
 /// removed it: a block no longer has to prove that its worst case fits what is
 /// left of the caller's ticks, because a block that overruns leaves at a guest
 /// instruction boundary instead.
+///
+/// # The window between the two, and [`Admitted::leave`]
+///
+/// The order above means the interrupt inputs are looked at and *then* the
+/// entry translation runs, so anything the translation does to those inputs
+/// happens after the last look. A translation that hits the TLB does nothing
+/// at all — but a **miss walks the page tables**, and a page-table read is an
+/// ordinary physical access that the address space answers however the board
+/// decided: put a page table over a lazily-advanced device and the walk is a
+/// device read, which is exactly the thing [`IrHost::load`] had to start
+/// asking about. `mtip` would then rise between `Exec::pending_interrupt` and
+/// the first instruction of the block, and the block would run to its natural
+/// end with nobody having looked again.
+///
+/// `riscv.clint` is that device on the shipped board: it takes an eight-byte
+/// naturally-aligned read, which is what an Sv39 descriptor read is, and
+/// `satp` is the guest's. A64 reached the same window from the other side,
+/// where the walk's own *ticks* cross the generic timer's comparator, and its
+/// `admit` now carries the identical flag.
+///
+/// Closing it costs one comparison of `Exec::used` against itself, because
+/// **only a walk charges**: on a hit, on a bare-mode hart and on every block
+/// whose page is already in the fetch set, the count is unchanged and the
+/// interpreter's predicate is never asked a second time.
+///
+/// # The one exit that is still not covered
+///
+/// [`Admitted::leave`] answers for a block that runs. It cannot answer for the
+/// third way out of this function: a **known-unliftable PC on a cold page**,
+/// where the walk happens, raises, and then `unlifted.holds` sends the
+/// instruction to `Exec::step` — whose own first act is to take the pending
+/// interrupt, so the instruction never runs and `mepc` names it rather than
+/// its successor. An interpreted hart would have run it: its `step` looked at
+/// the wire *before* its fetch charged the walk.
+///
+/// It is the same window with the same reachability — the walk still has to
+/// read a device — and closing it needs something this file does not have:
+/// a way to ask `Exec` for one step with the interrupt check already
+/// discharged. `Exec::step` cannot simply stop asking, because it is also the
+/// whole of the interpreted engine.
 fn admit(cfg: &Config, unlifted: &Unlifted, exec: &mut Exec<'_>, pc: u64) -> Admit {
     if exec.pending_interrupt().is_some() || exec.st.wfi {
         return Admit::Interpret;
     }
     let mode = exec.st.csrs.priv_mode;
     let translating = mmu::translation_active(&exec.st.csrs, mode);
+    let charged = exec.used;
     let phys = match exec.translate(pc, Access::Fetch, 2) {
         Ok(phys) => phys,
         Err(trap) => return Admit::Trap(trap),
     };
+    // A walk, and only a walk, can have moved the answer above.
+    let leave = exec.used != charged && exec.pending_interrupt().is_some();
     let origin = key_origin(translating, phys);
     let key = lift::key(cfg, origin, SHAPE);
 
@@ -636,6 +700,7 @@ fn admit(cfg: &Config, unlifted: &Unlifted, exec: &mut Exec<'_>, pc: u64) -> Adm
         key,
         page: pc & !PAGE_MASK,
         base: phys & !PAGE_MASK,
+        leave,
     })
 }
 
@@ -716,6 +781,13 @@ pub(super) fn advance(
     };
 
     let mut host = Host::new(&mut exec, pc, remaining);
+    if front.at.leave {
+        // The entry translation walked, and the walk raised the wire. One
+        // instruction retires and the run hands the boundary back, which is
+        // what `Exec::step` does: it charges the fetch, runs the instruction,
+        // and takes the trap on its next call.
+        host.hand_back();
+    }
     let run = match disp.run(&mut front, &mut host, pc, CHAIN) {
         Ok(run) => run,
         // The only refusal this frontend has is an RV32 configuration, which
@@ -925,6 +997,14 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         // `advance` would have seen.
         let entry = match admit(self.cfg, self.unlifted, host.exec, pc) {
             Admit::Ready(at) => {
+                if at.leave {
+                    // The same window as the prologue's, at a chained
+                    // boundary: `Dispatcher::run` asked [`Host::spent`] before
+                    // this call and the walk below it raised the wire, so the
+                    // answer has changed since. One instruction of this block
+                    // retires and the run ends.
+                    host.hand_back();
+                }
                 self.at = at;
                 Entry::Ready
             }
@@ -1389,6 +1469,203 @@ mod tests {
             );
             assert_eq!(interp.x(5), jit.x(5), "x5 under {engine:?}");
             assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+        }
+    }
+
+    /// An Sv39 root page table that lives **in a device** rather than in DRAM,
+    /// and asserts this hart's machine timer line on the `at`-th walk that
+    /// reads it.
+    ///
+    /// Not a hypothetical shape. `satp` is a guest-written register with no
+    /// range check on either side of it — `mmu::root` is a field mask —
+    /// and a walk reads its entries through the ordinary
+    /// [`AddressSpace`], with `MemAttrs::debug` clear, so whatever is mapped
+    /// there answers and gets to do what it likes. `machines/riscv-virt.machine`
+    /// maps `riscv.clint` at `0x0200_0000` with constraints of `U32`..`U64` on
+    /// natural alignment, which is exactly what an eight-byte Sv39 descriptor
+    /// read is; the CLINT is lazily advanced, so answering catches it up to
+    /// this hart and drives `mtip` for every comparator that crossed. That is
+    /// this device, with the incidental parts removed.
+    #[derive(Debug)]
+    struct TableThatRaises {
+        hart: crate::core::sync::Mutex<alloc::sync::Weak<Hart>>,
+        /// How many walks have read it, and which one raises.
+        seen: crate::core::sync::AtomicU64,
+        at: u64,
+    }
+
+    /// The one descriptor [`TableThatRaises`] holds: a **level-2 leaf**, so
+    /// virtual `0` to 1 GiB identity-maps onto physical `0` to 1 GiB in one
+    /// access.
+    ///
+    /// `V | R | W | X | A | D`, with a zero `PPN`. `A` and `D` are set so that
+    /// `mmu::translate` owes no write-back — a walk that updated the bits would
+    /// be a *store* into the device, which is a second question and not this
+    /// one.
+    const GIGAPAGE: u64 = 0xcf;
+
+    impl crate::core::space::MemOps for TableThatRaises {
+        fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+            // Only index 0 is ever asked for: every virtual address this
+            // fixture uses is below 1 GiB, so `VPN[2]` is zero.
+            let word = if offset == 0 { GIGAPAGE } else { 0 };
+            for (i, byte) in dst.iter_mut().enumerate() {
+                *byte = (word >> (8 * i)) as u8;
+            }
+            if attrs.debug {
+                return Ok(());
+            }
+            if self.seen.fetch_add(1, crate::core::sync::Ordering::Relaxed) == self.at
+                && let Some(hart) = self.hart.lock().upgrade()
+            {
+                hart.set_interrupt(crate::cpu::riscv::irq::MTI, true);
+            }
+            Ok(())
+        }
+
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            Ok(())
+        }
+    }
+
+    /// Where [`TableThatRaises`] is mapped, and therefore what `satp` points
+    /// at.
+    const TABLE: u64 = RAM;
+
+    /// A hart in supervisor mode whose page table is [`TableThatRaises`].
+    ///
+    /// `pmp_count` is zero because PMP is a *protection* on the physical
+    /// accesses a walk makes, and with entries present and none programmed an
+    /// S-mode walk is refused before the device is ever reached. A `virt`
+    /// board's firmware programs one covering entry and gets the same effect;
+    /// this is the shorter road to it.
+    fn walking_hart(engine: Engine, at: u64) -> Arc<Hart> {
+        let ram = Arc::new(RamStore::new(RAM));
+        write_words(&ram, 0, &SFENCE_LOOP);
+        write_words(&ram, 0x1000, &SFENCE_LOOP_TAIL);
+        let table = Arc::new(TableThatRaises {
+            hart: crate::core::sync::Mutex::with_rank(
+                crate::core::sync::LockRank::LEAF,
+                alloc::sync::Weak::new(),
+            ),
+            seen: crate::core::sync::AtomicU64::new(0),
+            at,
+        });
+        let space = AddressSpace::new("mem", 64);
+        {
+            let mut topo = space.topology();
+            topo.map_with_perms(Region::ram("ram", ram), 0, Perms::RWX)
+                .expect("nothing else is mapped");
+            topo.map(
+                Region::io(
+                    "table",
+                    0x1000,
+                    Arc::clone(&table) as Arc<dyn crate::core::space::MemOps>,
+                ),
+                TABLE,
+            )
+            .expect("it does not overlap the RAM");
+        }
+        let cfg = Config {
+            pmp_count: 0,
+            ..Config::rv64gc()
+        }
+        .with_reset_vector(0);
+        let hart = Arc::new(Hart::new(cfg).with_engine(engine));
+        hart.attach_space(Arc::new(space));
+        let mut csrs = hart.csrs();
+        csrs.priv_mode = crate::cpu::riscv::Priv::Supervisor;
+        // Sv39, rooted at the device.
+        csrs.satp = (8 << 60) | (TABLE >> 12);
+        // A machine timer interrupt taken from supervisor mode needs no
+        // `mstatus` bit: the current mode is below the target, so it is enabled
+        // unconditionally (`Exec::pending_interrupt`).
+        csrs.mie = crate::cpu::riscv::irq::MTI;
+        hart.set_csrs(csrs);
+        *table.hart.lock() = Arc::downgrade(&hart);
+        hart
+    }
+
+    /// A loop that flushes its own translations and then runs **across a page
+    /// boundary**, so both of the two places a cold walk can happen are on it.
+    ///
+    /// `sfence.vma` is outside the lifted subset, so `advance` interprets it
+    /// and returns; the next call starts at `0x08` with nothing in the fetch
+    /// set and walks in [`admit`]'s **prologue**. The `jal` at `0x10` then
+    /// leaves the page, and the successor's entry translation is a second cold
+    /// walk — this one inside `Frontend::enter`, at a *chained* boundary,
+    /// which is a different call site with the same window. Sweeping which
+    /// walk raises puts the interrupt on each of them in turn.
+    const SFENCE_LOOP: [u32; 5] = [
+        0x0012_8293, // addi      x5, x5, 1
+        0x1200_0073, // sfence.vma            ; every pass makes both pages cold
+        0x0013_0313, // addi      x6, x6, 1
+        0x0013_0313, // addi      x6, x6, 1
+        0x7f10_006f, // jal       x0, +0xff0  ; to 0x1000, the next page
+    ];
+
+    /// The other page of [`SFENCE_LOOP`], at `0x1000`.
+    const SFENCE_LOOP_TAIL: [u32; 4] = [
+        0x0013_8393, // addi      x7, x7, 1
+        0x0013_8393, // addi      x7, x7, 1
+        0x0013_8393, // addi      x7, x7, 1
+        0xff5f_e06f, // jal       x0, -0x100c ; back to 0
+    ];
+
+    #[test]
+    fn a_walk_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it() {
+        // The window `admit` closes with `Admitted::leave`, and the one the
+        // module docs used to argue away with "a `virt` board puts page tables
+        // in DRAM". Where a *board* puts them is not the question — `satp` is
+        // the guest's, and nothing between it and the bus says a descriptor
+        // has to come out of RAM.
+        //
+        // `admit` asks `Exec::pending_interrupt` and *then* charges the entry
+        // fetch translation, so the walk in between used to be unwatched: the
+        // wire came up, nothing looked again, and the block ran on to its
+        // natural end with `mepc` naming an instruction the interpreter had
+        // already passed. Sweeping which walk raises is what puts one of them
+        // on the entry fetch rather than on a chained boundary the next
+        // `admit` would have caught anyway.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let mut taken = 0usize;
+            for at in 0..10u64 {
+                let interp = walking_hart(Engine::Interp, at);
+                let jit = walking_hart(engine, at);
+                for n in 0..6 {
+                    let a = interp.run_budget(1000);
+                    let b = jit.run_budget(1000);
+                    assert_eq!(
+                        a, b,
+                        "walk {at}, quantum {n}: different budgets under {engine:?}"
+                    );
+                }
+                if interp.csrs().mcause == (1u64 << 63) | 7 {
+                    taken += 1;
+                }
+                assert_eq!(
+                    interp.csrs().mepc,
+                    jit.csrs().mepc,
+                    "walk {at} under {engine:?}: mepc {:#x} against {:#x}",
+                    interp.csrs().mepc,
+                    jit.csrs().mepc,
+                );
+                assert_eq!(interp.x(5), jit.x(5), "walk {at}: x5 under {engine:?}");
+                assert_eq!(interp.x(6), jit.x(6), "walk {at}: x6 under {engine:?}");
+                assert_eq!(interp.x(7), jit.x(7), "walk {at}: x7 under {engine:?}");
+                assert_eq!(
+                    interp.cycles(),
+                    jit.cycles(),
+                    "walk {at}: cycles under {engine:?}"
+                );
+                let stats = jit.jit_stats().expect("a jit hart keeps statistics");
+                assert!(stats.0 > 0, "walk {at}: no block ran under {engine:?}");
+            }
+            assert!(
+                taken > 0,
+                "the fixture never took a machine timer interrupt under \
+                 {engine:?}, so it proves nothing"
+            );
         }
     }
 

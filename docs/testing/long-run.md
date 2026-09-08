@@ -152,7 +152,7 @@ scratch tree:
 | --- | --- | --- | --- |
 | the block that did not notice its own timer (`IrHost::spent`) | **passed** | **failed at quantum 17 — 0.017 s**, naming `elr_el1` `0x100c` against `0x4` | **failed at quantum 23119 — 23.119 s**, naming `elr_el1` and `spsr_el1` |
 | the declined chained boundary (`advance`'s `Stop::Declined` arm) | **passed** | passed | **failed at quantum 14097 — 14.097 s**, naming `debt` 3 against 2, `pc` and `cycles` |
-| the edge computed across an entry walk (`engine::leave_at`) | **passed** | passed | not reached in 40 s — but the synthetic **with** the `TLBI` **failed at quantum 417 — 0.417 s**, naming `elr_el1` `0x1014` against `0x4`, `pc` and `cycles` |
+| the edge computed across an entry walk (then `engine::leave_at`, now `Admitted::leave`) | **passed** | passed | not reached in 40 s — but the synthetic **with** the `TLBI` **failed at quantum 417 — 0.417 s**, naming `elr_el1` `0x1014` against `0x4`, `pc` and `cycles` |
 
 The old test passes in all three rows, which is the claim the last round made
 and it is correct. The second row is why the kernel run cannot be replaced: a declined
@@ -225,8 +225,11 @@ run, which had to leave at its next boundary rather than never. It takes a cold
 *instruction-fetch* translation to open the window, and `mmu::Tlb`'s three
 separate sets mean a `TLBI` is the only thing on this core that produces one:
 the same fact the table above gives for the declined-boundary defect, arrived at
-from the other direction. `engine::leave_at` is the fix.
-[`docs/platforms/arm64-virt.md`](../platforms/arm64-virt.md) has the long form.
+from the other direction. `engine::leave_at` was the fix; the question has
+since moved into `admit` as `Admitted::leave`, which also covers a *chained*
+block's entry translation and a line a walk's **reads** raise rather than its
+ticks. [`docs/platforms/arm64-virt.md`](../platforms/arm64-virt.md) has the
+long form.
 
 The instructive part is the bisect, not the fix. Five properties, each cheap to
 test by re-running the same harness with one thing changed, took a

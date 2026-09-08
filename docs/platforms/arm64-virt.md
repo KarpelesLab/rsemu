@@ -454,7 +454,7 @@ interpreted against `0x4` translated, two guest instructions and one cycle
 apart, with `jit` and `jit-host` giving the same wrong answer because the edge
 is computed above both code generators.
 
-`engine::leave_at` is the fix and it is four lines: when the run's own
+`engine::leave_at` was the fix and it was four lines: when the run's own
 `Exec::pending_interrupt` is already `Some` — after the walk, which is the only
 thing that can have changed since `admit` looked — the edge is the current tick
 count, so `IrHost::spent` is true at the first boundary it is asked at. Which,
@@ -478,6 +478,50 @@ on identical code, which on this host is about 2.5%.
 committed `#[ignore]`d as the reproduction and is now un-`#[ignore]`d as the
 regression: it fails on the code before this at quantum 417 and passes for
 30 000 quanta after it, on both translated engines.
+
+**`leave_at` has since been replaced by `Admitted::leave`, and the reason is
+the half it could not see.** A walk moves the interrupt inputs in two ways: by
+its *ticks*, which is the generic timer above, and by its *reads*, because a
+descriptor read is an ordinary physical access that the address space answers
+however the board decided. A translation table over a lazily-advanced device
+raises a line the timer edge knows nothing about, and `leave_at` — computed
+once in `Host::new`, from the timer — saw neither that nor a chained block's
+entry translation, which happens inside `Frontend::enter` after
+`Dispatcher::run` has already asked `IrHost::spent`. So the question moved to
+`admit`, where the window is, and is now the same three lines the RISC-V and
+x86 engines carry: re-ask `Exec::pending_interrupt` when the translation
+charged, and `Host::hand_back` at both call sites.
+
+This board cannot reach the reads half today, and the reason is worth writing
+down because it is not a design: an A64 descriptor read is always `Width::U64`,
+and `arm.gic`'s distributor accepts `U8`..`U32` while its CPU interface accepts
+only `U32`, so a walk over `GICC_IAR` takes an external abort instead of
+acknowledging an interrupt. `uart.pl011` and the two `virtio.mmio` transports
+are not lazily advanced at all. `riscv-virt`'s CLINT and `pc-at`'s HPET both
+take the width their architecture's walk uses, so the two sibling cores are
+reachable and this one is protected by an accident. `TTBR0_EL1` is a
+guest-written register either way. The regression test is
+`a_walk_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it` in
+`src/cpu/arm/a64/engine.rs`: a level-1 table mapped over a device that asserts
+`IRQ` on the *n*-th walk that reads it, over the two-page `TLBI` loop, swept
+over *n* so the line comes up on the prologue's translation and on a chained
+boundary's in turn. It fails with either check removed.
+
+The move was free and slightly better than free: callgrind over
+`benches/a64_dispatch --smoke`, with `Exec::step` as the control row, has
+`Cpu::advance` inclusive going **3 163 841 599 -> 3 162 906 823, -0.030%**,
+against an `Exec::step` that moved by nothing at all — 7 949 792 616 on both
+sides, to the instruction. `leave_at` called `Exec::timer_edge` and sometimes
+`Exec::pending_interrupt` on every run; `admit` now asks the second only when
+the entry translation charged, which on a warm block is never.
+
+`admit` has one exit this does not cover, and on this core the *timer* reaches
+it: a known-unliftable PC on a cold page, where the walk crosses the comparator
+and `Subset::get` then hands the instruction to `Exec::step_once`, whose own
+first act is to take the interrupt — so the instruction never runs, where an
+interpreted core would have run it. Closing it needs `Exec` to offer one step
+with the interrupt check already discharged, which is a change to the oracle
+rather than to the engine.
 
 Neither RISC-V nor x86 can have this shape. Both reach their timers as devices
 on the bus — `dev::riscv::clint` on its own clock domain, the APIC — so

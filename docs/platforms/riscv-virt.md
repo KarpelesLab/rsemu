@@ -199,11 +199,51 @@ construction and `Machine::state_hash` refuses in it. The fix covers the `MSIP`
 case incidentally, because a hart reading anywhere in the CLINT window asks the
 same question.
 
-**What would reopen the walk window.** `admit` asks `Exec::pending_interrupt`
-and *then* charges the entry fetch translation, which on a TLB miss is a walk —
-the gap A64's `engine::leave_at` exists for. It is empty here because a walk
-reads page-table entries and this board puts page tables in DRAM. A board that
-mapped a page table over a lazily-advanced device would reopen it.
+**The walk window, which was argued away and then closed.** `admit` asks
+`Exec::pending_interrupt` and *then* charges the entry fetch translation, which
+on a TLB miss is a walk — the gap A64's `admit` closes from the other side,
+where the walk's own *ticks* cross a comparator. This paragraph used to say the
+gap was empty here "because a walk reads page-table entries and this board puts
+page tables in DRAM", and that is a statement about what a *guest* does, not
+about what the board or the core permits. `satp` is a guest-written register;
+`mmu::root` masks its `PPN` field and range-checks nothing; a descriptor read
+goes out through `AddressSpace::read` with `MemAttrs::debug` clear. Point
+`satp` at `0x0200_0000` and the walk reads the **CLINT**, whose
+`AccessConstraints` are `U32`..`U64` on natural alignment — exactly the width
+of an Sv39 descriptor — and which is lazily advanced, so answering catches it
+up to this hart and drives `mtip` for every comparator that crossed.
+
+So it is closed rather than argued about. `admit` re-asks
+`Exec::pending_interrupt` after the translation, gated on `Exec::used` having
+changed, which is true only when a walk actually happened; `Admitted::leave`
+carries the answer to both of `admit`'s call sites — `advance`'s prologue and
+`Frontend::enter`, which is a chained block's entry translation and just as
+unwatched — and `Host::hand_back` retires the allowance there too. The
+regression test is
+`a_walk_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it`: an
+Sv39 root table mapped over a device, a loop whose `sfence.vma` makes both of
+its pages cold on every pass, and a sweep over which walk raises. Before it,
+`mepc` read `0x4` where the interpreter read `0xc`.
+
+**What it cost.** Callgrind, over `benches/jit_dispatch --smoke`, with
+`Exec::step` as the control row — the interpreter shares no code with any of
+this, and callgrind counts instructions rather than time, so a control row that
+does not move says the instrument is exact rather than merely quiet.
+`Hart::advance` inclusive **2 083 019 034 -> 2 084 481 466, +0.070%**;
+`Exec::step` inclusive 12 655 697 632 both sides, to the instruction. Two
+orders of magnitude under the ~2.5% wall-clock noise floor this host was
+measured at last round.
+
+**One exit of `admit` is still open**, and it is the same window at a third
+door: a known-unliftable PC on a cold page. The walk happens, raises, and then
+`Unlifted::holds` hands the instruction to `Exec::step`, whose own first act is
+to take the pending interrupt — so the instruction never runs and `mepc` names
+it rather than its successor, where an interpreted hart would have run it
+because its `step` looked at the wire *before* its fetch charged the walk. Same
+reachability: the walk still has to read a device. Closing it needs `Exec` to
+offer one step with the interrupt check already discharged, which is a change
+to the interpreter rather than to the engine, and the interpreter is the
+oracle.
 
 **What it cost.** Nothing in `IrHost::spent`, which is the function asked at
 every guest instruction boundary of every block: `Host::hand_back` retires the
