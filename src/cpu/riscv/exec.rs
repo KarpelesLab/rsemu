@@ -1775,6 +1775,23 @@ impl<'a> Exec<'a> {
     /// skipped when the source is `x0` or a zero immediate — which is what
     /// makes `csrr` and `csrw` safe on registers with read or write side
     /// effects.
+    ///
+    /// # `time` is read out of a per-step sample, and that is load-bearing
+    ///
+    /// `Csrs::mtime` is not a counter this hart owns. It is a copy of the cell
+    /// the CLINT publishes, taken once per [`Hart::step`](super::Hart::step)
+    /// — never inside this function, which has no route to a device. The
+    /// freshness of `time` is therefore exactly the freshness of that sample,
+    /// and the sample is per *instruction* only because `Op::Csrrs` is outside
+    /// the lifted subset (`super::lift` admits no CSR instruction, so a block
+    /// always ends before one and `engine::advance` resamples on re-entry).
+    ///
+    /// Lift a CSR read one day and `time` silently freezes for the length of a
+    /// block, which a guest can observe by storing to the memory-mapped
+    /// `mtime` and reading `time` in the next instruction. That is what
+    /// `dev::riscv::tests::a_guest_write_to_mtime_is_visible_to_the_very_next_rdtime`
+    /// asserts, on every engine the build has, so the day it changes is the
+    /// day the suite says so.
     fn csr_access(&mut self, op: Op, word: u32, encoding: u64) -> Result<(), Trap> {
         let num = isa::csr(word);
         let rd = isa::rd(word);

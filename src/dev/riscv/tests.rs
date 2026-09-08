@@ -62,6 +62,12 @@ mod asm {
     pub(super) const A1: u32 = 11;
     /// `x28`.
     pub(super) const T3: u32 = 28;
+    /// `x29`.
+    pub(super) const T4: u32 = 29;
+    /// `x30`.
+    pub(super) const T5: u32 = 30;
+    /// `x31`.
+    pub(super) const T6: u32 = 31;
     /// `x0`.
     pub(super) const ZERO: u32 = 0;
 
@@ -111,6 +117,16 @@ mod asm {
     /// `lw rd, imm(rs1)`.
     pub(super) fn lw(rd: u32, rs1: u32, imm: i32) -> u32 {
         i_type(0b0000011, 0b010, rd, rs1, imm)
+    }
+
+    /// `ld rd, imm(rs1)` — RV64 only (Volume I §5.2).
+    pub(super) fn ld(rd: u32, rs1: u32, imm: i32) -> u32 {
+        i_type(0b0000011, 0b011, rd, rs1, imm)
+    }
+
+    /// `sub rd, rs1, rs2` — R-type (§2.4).
+    pub(super) fn sub(rd: u32, rs1: u32, rs2: u32) -> u32 {
+        (0b0100000 << 25) | (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0b0110011
     }
 
     /// `sb rs2, imm(rs1)`.
@@ -171,6 +187,11 @@ mod asm {
     /// `bne rs1, rs2, imm`.
     pub(super) fn bne(rs1: u32, rs2: u32, imm: i32) -> u32 {
         b_type(0b001, rs1, rs2, imm)
+    }
+
+    /// `bgeu rs1, rs2, imm`.
+    pub(super) fn bgeu(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        b_type(0b111, rs1, rs2, imm)
     }
 
     /// `jal x0, imm` — a plain jump. J-type (§2.5).
@@ -307,10 +328,18 @@ fn board(tag: &str, firmware: &[u8]) -> Board {
 /// with a second hart, and everything a program here does works on both.
 fn board_named(machine: &str, tag: &str, firmware: &[u8]) -> Board {
     let _ = tag;
+    board_built(machine, firmware, None)
+}
+
+/// The same on a named execution engine, so a test can run on each of them.
+///
+/// `engine` is a `param` of `machines/riscv-virt.machine`; leaving it `None`
+/// takes whatever the file defaults to.
+fn board_built(machine: &str, firmware: &[u8], engine: Option<&str>) -> Board {
     let console_name = String::from("console");
     let power_name = String::from("power");
     let entry = catalog::machine(machine).expect("this build ships it");
-    let options = catalog::build_options()
+    let mut options = catalog::build_options()
         .expect("the catalog agrees with itself")
         .with_media("firmware", firmware)
         .with_media("flash0", &[][..])
@@ -322,6 +351,9 @@ fn board_named(machine: &str, tag: &str, firmware: &[u8]) -> Board {
         // Enough for the programs here, and small enough that the cold reset
         // that clears it is not the slowest part of the test.
         .with_param("ram", String::from("8M"));
+    if let Some(engine) = engine {
+        options = options.with_param("engine", String::from(engine));
+    }
     let registry = catalog::registry().expect("the catalog agrees with itself");
     let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
         Ok(m) => m,
@@ -665,6 +697,149 @@ fn rdtime_reads_the_clints_counter() {
         seen <= mtime,
         "the guest saw {seen}, ahead of the CLINT's own {mtime}"
     );
+}
+
+/// Where the two-path comparison below publishes what it saw.
+const AGREE_SCRATCH: u64 = DRAM + 0x2000;
+
+/// A program that reads the platform timer both ways, back to back, forever.
+///
+/// `csrr t0, time` and `ld t1, (mtime)` are adjacent instructions, so the two
+/// answers are separated by one guest instruction and nothing else. It keeps
+/// the running maximum of `mtime - time` and counts every occasion on which
+/// `time` went *backwards*, which is the failure that would matter.
+///
+/// The scratch layout, all 64-bit:
+///
+/// | offset | meaning |
+/// |-------:|---------|
+/// | `+0`   | the last value `time` returned |
+/// | `+8`   | the last value the `mtime` load returned |
+/// | `+16`  | the largest `mtime - time` seen |
+/// | `+24`  | how many times `time` went backwards |
+/// | `+32`  | how many round trips the loop made |
+fn both_paths_loop() -> Program {
+    let mut p = Program::new(DRAM);
+    p.la(asm::T2, AGREE_SCRATCH);
+    p.li(asm::T3, MTIME as u32);
+    p.push(asm::addi(asm::T4, asm::ZERO, 0)); // the largest gap so far
+    p.push(asm::addi(asm::T5, asm::ZERO, 0)); // what `time` said last time
+    p.push(asm::addi(asm::A0, asm::ZERO, 0)); // backwards count
+    p.push(asm::addi(asm::A1, asm::ZERO, 0)); // iterations
+    let top = p.here();
+    p.push(asm::csrr(asm::T0, asm::CSR_TIME));
+    p.push(asm::ld(asm::T1, asm::T3, 0));
+    p.push(asm::sd(asm::T2, asm::T0, 0));
+    p.push(asm::sd(asm::T2, asm::T1, 8));
+    // t6 = mtime - time, wrapping. A negative gap becomes enormous, so it is
+    // caught by the maximum rather than hidden by it.
+    p.push(asm::sub(asm::T6, asm::T1, asm::T0));
+    p.push(asm::bgeu(asm::T4, asm::T6, 8));
+    p.push(asm::addi(asm::T4, asm::T6, 0));
+    p.push(asm::bgeu(asm::T0, asm::T5, 8));
+    p.push(asm::addi(asm::A0, asm::A0, 1));
+    p.push(asm::addi(asm::T5, asm::T0, 0));
+    p.push(asm::addi(asm::A1, asm::A1, 1));
+    p.push(asm::sd(asm::T2, asm::T4, 16));
+    p.push(asm::sd(asm::T2, asm::A0, 24));
+    p.push(asm::sd(asm::T2, asm::A1, 32));
+    let back = top as i64 - p.here() as i64;
+    p.push(asm::j(back as i32));
+    p
+}
+
+#[test]
+fn rdtime_and_a_memory_mapped_mtime_read_agree() {
+    // Volume II makes `time` a read-only *shadow* of the memory-mapped `mtime`,
+    // not a counter of the hart's own, so the two answers to the same question
+    // have to be the same answer. The suspicion this test exists to settle was
+    // that they would not be: a load goes through `MemOps::read`, which calls
+    // `Registers::sync` and catches the block up, while a CSR read goes nowhere
+    // near the bus and reads `Registers::mtime_cell` as `republish` last left
+    // it.
+    //
+    // They agree, and the reason is that within one quantum there is nothing
+    // for `sync` to catch up *to*: the RISC-V hart does not publish a
+    // `TickCursor` (`Hart::attach_cursor` keeps only the exit flag), and the
+    // CLINT hangs off its own oscillator, so `LazySlot::arm` skips it anyway.
+    // Both paths therefore read the value `Machine::run_quantum`'s
+    // `sync_lazy_devices` published at the last quantum boundary.
+    let mut b = board("both-paths", &both_paths_loop().bytes());
+    b.run(400);
+    let laps = b.peek(AGREE_SCRATCH + 32, Width::U64);
+    assert!(laps > 100, "the loop only went round {laps} times");
+    let time = b.peek(AGREE_SCRATCH, Width::U64);
+    assert!(time > 0, "`time` never moved off zero in {laps} laps");
+    assert_eq!(
+        b.peek(AGREE_SCRATCH + 24, Width::U64),
+        0,
+        "`time` went backwards, which no amount of lag would excuse"
+    );
+    assert_eq!(
+        b.peek(AGREE_SCRATCH + 16, Width::U64),
+        0,
+        "`time` and a load of `mtime` one instruction apart disagreed by {} \
+         (last time {time}, last mtime {})",
+        b.peek(AGREE_SCRATCH + 16, Width::U64),
+        b.peek(AGREE_SCRATCH + 8, Width::U64)
+    );
+}
+
+/// The execution engines this build has, so a test can run on each of them.
+const ENGINES: &[&str] = &[
+    "interp",
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    "jit",
+];
+
+/// Write `mtime` through the register block, then read it back both ways.
+///
+/// Scratch: `+0` is what `time` said afterwards, `+8` what a load said.
+fn write_then_read_both_ways() -> Program {
+    let mut p = Program::new(DRAM);
+    p.la(asm::T2, AGREE_SCRATCH);
+    p.li(asm::T3, MTIME as u32);
+    p.li(asm::T1, 0x4000_0000);
+    p.push(asm::sd(asm::T3, asm::T1, 0));
+    p.push(asm::csrr(asm::T0, asm::CSR_TIME));
+    p.push(asm::ld(asm::T1, asm::T3, 0));
+    p.push(asm::sd(asm::T2, asm::T0, 0));
+    p.push(asm::sd(asm::T2, asm::T1, 8));
+    p.poweroff();
+    p
+}
+
+#[test]
+fn a_guest_write_to_mtime_is_visible_to_the_very_next_rdtime() {
+    // The one place the two paths could still part company: a store to `mtime`
+    // moves the CLINT's origin and republishes the cell, and the CSR read has
+    // to see that. It is not hypothetical — firmware zeroes `mtime` on some
+    // boards — and it is the case a *per-block* sample of the cell would get
+    // wrong while a per-instruction sample gets it right, so it runs on every
+    // engine this build has.
+    for engine in ENGINES {
+        let mut b = board_built(
+            "riscv-virt",
+            &write_then_read_both_ways().bytes(),
+            Some(engine),
+        );
+        assert_eq!(
+            b.run(50),
+            Some(Request::Poweroff),
+            "the program never finished on `{engine}`"
+        );
+        let by_csr = b.peek(AGREE_SCRATCH, Width::U64);
+        let by_load = b.peek(AGREE_SCRATCH + 8, Width::U64);
+        assert_eq!(
+            by_csr, by_load,
+            "on `{engine}`, `time` said {by_csr} where a load of `mtime` two \
+             instructions later said {by_load}"
+        );
+        assert!(
+            by_csr >= 0x4000_0000,
+            "on `{engine}`, `time` is {by_csr}, behind the value just written"
+        );
+    }
 }
 
 #[test]

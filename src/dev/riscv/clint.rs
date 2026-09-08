@@ -34,6 +34,11 @@
 //! its next comparator fires on so the run loop stops the harts there rather
 //! than thousands of cycles past it.
 //!
+//! The second half of that is what does the work on `riscv-virt`. The first
+//! half is inert there and the resolution comes from the round boundary
+//! instead — see *`rdtime` and a load of `mtime` return the same number*
+//! below, which is where the measurement is.
+//!
 //! # The hart's `time` CSR reads this counter
 //!
 //! `time` (`0xc01`, what `rdtime` returns) is architecturally a read-only view
@@ -54,6 +59,53 @@
 //! and for tests. [`Hart::set_time`](crate::cpu::riscv::Hart::set_time) remains
 //! for a board with no CLINT at all; a hart with a timer attached overwrites it
 //! on the next step, which is the right precedence.
+//!
+//! # `rdtime` and a load of `mtime` return the same number
+//!
+//! The two answers reach the guest by completely different routes and the
+//! obvious worry is that they part company. A load enters [`MemOps::read`],
+//! which calls `Registers::sync` and catches this block up first. A CSR read
+//! goes nowhere near the bus: the hart samples `Registers::mtime_cell` once
+//! per [`Hart::step`](crate::cpu::riscv::Hart::step), and that cell is written
+//! only by `Registers::republish` — on an advance or on a guest write.
+//!
+//! They agree exactly, and the reason is that on this board there is nothing
+//! for `sync` to catch up *to*:
+//!
+//! * the hart publishes no [`TickCursor`](crate::core::sched::TickCursor)
+//!   position — `Hart::attach_cursor` keeps the exit flag and drops the other
+//!   half, because nothing on a RISC-V board is sampled inside an instruction
+//!   the way a PPU is; and
+//! * `machines/riscv-virt.machine` hangs `mtime` off its own `rtc` crystal,
+//!   a separate oscillator tree from the core clock, and the scheduler arms a
+//!   live view only across slots that share a root. There is no exact integer
+//!   ratio between two trees, and `ROADMAP.md` §4.2 forbids reaching for
+//!   absolute time to invent one.
+//!
+//! So within a round both routes read the value
+//! `Scheduler::sync_lazy_devices` published when the previous round closed.
+//! `mtime` is a staircase to the guest, one step per scheduler round: 10 000
+//! `rtc` ticks — one millisecond — when nothing else shortens the round, and
+//! as fine as the next armed comparator when a guest has programmed one, since
+//! `Scheduler::natural_target` ends a round on it.
+//!
+//! That is licensed rather than tolerated. Volume II: *"When `mtime` changes,
+//! it is guaranteed to be reflected in `time` and `timeh` eventually, but not
+//! necessarily immediately."* And the `Zicntr` note in Volume I says the same
+//! about the staircase itself — an implementation may "only update the
+//! real-time clock at, say, a frequency of 100 MHz with increments of 10
+//! ticks", and stays compliant "as long as software cannot observe this
+//! seeming violation … and software always observes time across harts to be
+//! monotonically nondecreasing".
+//!
+//! Monotonicity is therefore the property that matters, and it is the one
+//! that holds by construction: both routes read one cell, `republish` only
+//! ever stores `tick + offset` for a `tick` the scheduler refuses to move
+//! backwards, and the cell is published at round close, so every hart in a
+//! round reads the same number rather than one within a tick of it.
+//! `rdtime_and_a_memory_mapped_mtime_read_agree` in `super::tests` is the
+//! regression test; it compares the two routes 125 000 times and checks that
+//! `time` never goes backwards.
 
 use alloc::boxed::Box;
 use alloc::format;

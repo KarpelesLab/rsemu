@@ -226,6 +226,96 @@ a number taken from it would have measured nothing. It now has a second table
 in the shape `benches/a64_dispatch` already had: `Hart::run_budget` across six
 quanta, with the `interp` row as a control that shares no code with the change.
 
+### `rdtime` and a load of `mtime` return the same number
+
+A suspicion raised while the section above was being written, and settled by
+measurement rather than by reading: the two ways a guest can ask for the
+platform timer look like they should disagree.
+
+* A load of `0x0200_bff8` enters `Registers::read`, which calls
+  `Registers::sync` and catches the block up before answering.
+* `csrr t0, time` never touches the bus. The hart holds a copy of
+  `Registers::mtime_cell`, sampled once per `Hart::step`, and that cell is
+  written only by `Registers::republish` — on an advance or on a guest write.
+
+`rdtime_and_a_memory_mapped_mtime_read_agree` in `src/dev/riscv/tests.rs` runs
+a loop that reads both back to back, 125 000 times, and keeps the largest
+difference and a count of every occasion `time` went backwards. **Both are
+zero.** The two routes are not merely close; they are the same number on every
+read.
+
+**Why.** Within a round there is nothing for `sync` to catch up to. The hart
+publishes no `TickCursor` position — `Hart::attach_cursor` keeps the exit flag
+and drops the other half — and `mtime` counts on the `rtc` crystal, a separate
+oscillator tree from `core`, so `Scheduler::arm_live_cursors` skips its slot
+outright: it arms only across slots that share a root, because no exact integer
+ratio exists between two trees and `ROADMAP.md` §4.2 forbids reaching for
+absolute time to invent one. Both routes therefore read what
+`Scheduler::sync_lazy_devices` published when the previous round closed.
+
+This qualifies one clause of the section above. Measured on this board, a
+*read* of the CLINT advances it by nothing: the loop above takes about 312
+`mtime` loads per round and every one of them returns the identical value. So
+the window that section describes is opened here by the `mtimecmp` **write**'s
+own `republish` — `Registers::write` syncs and republishes unconditionally,
+and republishing raises `mtip` for any comparator the current `mtime` is
+already past — rather than by a later read catching the block up across the new
+comparator. The fix and its regression test are unaffected either way; the test
+uses a device of its own that raises a line when read, which is a shape a board
+is free to have even though the CLINT on this one does not.
+
+**The bound.** `mtime` is a staircase to the guest, one step per scheduler
+round. With no comparator armed a round runs to
+`SchedulerConfig::max_ticks_per_quantum`, and the step measured on this board
+is exactly 10 000 `rtc` ticks — one millisecond — every round, for as long as
+the machine runs.
+With a comparator armed the step is as fine as the comparator, because
+`Scheduler::natural_target` ends the round on it. Both routes lag by the same
+amount, so no guest can tell.
+
+**The architecture allows exactly this.** *Volume II: Privileged Architecture*,
+"Machine Timer Registers": "When `mtime` changes, it is guaranteed to be
+reflected in `time` and `timeh` eventually, but not necessarily immediately."
+And *Volume I*'s `Zicntr` chapter licenses the staircase from the other side,
+in the note under "the real-time clocks of all harts must be synchronized to
+within one tick": it is "acceptable for this example implementation to only
+update the real-time clock at, say, a frequency of 100 MHz with increments of
+10 ticks. As long as software cannot observe this seeming violation of the
+above synchronization requirement, and software always observes time across
+harts to be monotonically nondecreasing, then this implementation is
+compliant." What the spec does *not* forgive is time going backwards, and that
+is the assertion the test is built around.
+
+Cross-hart agreement comes free on `riscv-virt-smp`:
+`Scheduler::publish_lazy_positions` runs at round close and nowhere else, so
+both harts in a round read one cell holding one value — identical rather than
+merely within a tick.
+
+**Nothing was changed in the CSR path, deliberately.** The obvious repair —
+have the CSR read sync the device the way a load does — would put a device
+catch-up on the instruction Linux runs most often, since `rdtime` is the
+userspace clocksource through the vDSO. It would also buy nothing: the sync it
+would perform is the one that already runs on every CLINT load and already
+advances nothing. The cost was not measured because there is no candidate
+change to measure.
+
+**The one latent hazard.** `Csrs::mtime` is sampled once per `Hart::advance`,
+which is once per *block* under a translating engine. It is fresh today only
+because `cpu::riscv::lift` admits no CSR instruction, so a block always ends
+before one. Lift a CSR read and `time` freezes for the length of a block.
+`a_guest_write_to_mtime_is_visible_to_the_very_next_rdtime` stores to the
+memory-mapped `mtime` and reads `time` two instructions later, on every engine
+the build has, so that day is caught.
+
+**The neighbours.** `cycle` and `instret` are read-only shadows of `mcycle` and
+`minstret` (Volume II, `mcounteren`), which are hart-local and have no
+memory-mapped alias at all — there is no second route for them to disagree
+with, and the two engines were checked to report identical values for the same
+program. The x86 `RDTSC` path has the same shape and the same immunity:
+`prot.rs::rdtsc` reads `state.cycles`, the core's own counter, and
+`IA32_TIME_STAMP_COUNTER` reads that same field, so the two cannot part
+company either.
+
 ## Booting something real
 
 Everything below is fetched, never committed
