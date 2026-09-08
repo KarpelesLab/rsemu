@@ -6,7 +6,7 @@
 #   rsemu run q35-uefi --flash0 OVMF_CODE.fd --drive flash1=OVMF_VARS.fd \
 #       --drive nvme0=esp.img -p disk=64M
 #   rsemu run q35-uefi --flash0 edk2-x86_64-code.fd --flash1 edk2-i386-vars.fd \
-#       -p flash=4M -p vars=528K --console debug
+#       -p flash=4M -p vars=528K --capture debug=boot.log
 #
 # The last one is the interesting one when a boot goes wrong: this board has
 # three character ports — `keyboard`, COM1's `console`, and `debug`, which is
@@ -186,7 +186,8 @@ machine "q35-uefi" {
   # And which one the firmware's own `DEBUG()` log arrives on. A **second**
   # stream rather than the console's, deliberately: the firmware writes both at
   # once, and a debug log spliced into a UEFI shell's line editor would ruin
-  # both. Watch it with `rsemu run q35-uefi --console debug`, or redirect it.
+  # both. Capture it with `rsemu run q35-uefi --capture debug=boot.log`, which
+  # runs unpaced; `--console debug` also works but paces to the wall clock.
   param debugport = "debug"
 
   # The date and time the RTC starts at. A device may never read the host clock

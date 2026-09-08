@@ -40,7 +40,10 @@ attribute controller, CRTC timing) is needed for DOS-era software.
   clock is a domain like any other; resampling to the host rate happens in the
   host layer, anchored to virtual time. Never let the host audio callback drive
   guest timing.
-- Video output is a scanout surface plus dirty tracking — the region-level dirty
-  bitmap (§4.1) exists partly for this.
+- Video output is a scanout surface plus dirty tracking. Note that the
+  region-level dirty bitmap (§4.1) is **not** what drives it and never has
+  been: `VideoScanout::capture` re-renders every character cell each frame and
+  the VNC server does a `memcmp` per row (`docs/system/remote-display.md`).
+  An audit found the bitmap has no production consumer at all.
 - Both are natural fits for the frame-hash regression method: render N frames
   deterministically, hash them, compare.
