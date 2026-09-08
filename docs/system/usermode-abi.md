@@ -620,12 +620,20 @@ Neither had to be built, which is most of why the change was small:
   a read winner with `Perms::READ`, so an `--x` mapping stacked beneath a
   higher-priority readable mapping does not answer the fetch, and the fetch
   then fails on the readable one. Resolving fetches separately would need a
-  third winner scan and a third leaf per flat entry, which the note on
-  `FlatEntry::write_to` measures at 4% of a frame for a shape no board has.
-- **The interpreters enforce it and the translating engines do not.** A `jit`
-  build admits a block on its MMU translation alone and lifts it through a
-  `MemAttrs::DEBUG` read, so a translated block executes out of a mapping the
-  interpreter's fetch would be refused. This consumer is unaffected — level 3
+  third winner scan and a third leaf per flat entry. Measured rather than
+  inherited: +2.2% of a four-byte read, +0.62% of an `nes-ntsc` run, +1.65% of
+  a `riscv-virt` one, and +5.8% if resolved lazily after a refusal. It was
+  declined on the modelling rather than the number — there is no `/FETCH` pin,
+  and a fetch that fell past a PCI BAR landed over RAM would execute the RAM
+  underneath. `core::space::flat`'s *Two winners, and why there is no third*
+  has the argument, pinned by a test.
+- **Both the interpreters and the translating engines enforce it.** A `jit`
+  build once admitted a block on its MMU translation alone and lifted it
+  through a `MemAttrs::DEBUG` read, so a translated block executed out of a
+  mapping the interpreter's fetch would refuse. `jit::executable_run` closes
+  that at the lift, per instruction word rather than per page — a flat entry is
+  not a page, and the interpreter aborts at the boundary between an executable
+  mapping and a non-executable one. This consumer is unaffected — level 3
   runs `Cpu`, the interpreter — but it is an interpreter/engine divergence, and
   the interpreter is the oracle. The cheap place to close it is the lift: a
   permission change is a retopology, so the generation bump already drops every

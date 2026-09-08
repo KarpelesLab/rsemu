@@ -126,9 +126,21 @@
 //! One limitation, recorded rather than papered over: the flattener resolves a
 //! read winner with [`Perms::READ`], so an *execute-only* mapping stacked under
 //! a higher-priority readable one loses the fetch to the readable one and the
-//! fetch then fails. That needs a third winner scan and a third leaf per entry,
-//! which the note on [`FlatEntry::write_to`] measures at 4% of a frame for a
-//! shape no board has. A board that wants both must not overlap them.
+//! fetch then fails. `flat`'s *Two winners, and why there is no third* has the
+//! decision, which was measured rather than inherited: a fetch winner costs
+//! +2.2% of a four-byte read, +0.62% of an `nes-ntsc` run and +1.65% of a
+//! `riscv-virt` one, and resolving it lazily after a refusal is worse at +5.8%
+//! because it stops the read being a tail call. The 4% quoted here before
+//! belonged to a different design — a third `EntryKind` variant, not a third
+//! leaf.
+//!
+//! The cost is not why it was declined. There is no `/FETCH` pin: the read and
+//! write winners exist because `/RD` and `/WR` are separate signals that real
+//! chipsets route separately, while `Perms::EXEC` is a *translation* attribute
+//! and a translation resolves to one entry. Falling through would be actively
+//! wrong where the shape arises by accident — a PCI memory BAR landed over RAM
+//! decodes `Perms::RW`, and a fetch that fell past it would execute the RAM
+//! underneath. A board that wants split I/D wants two address spaces.
 //!
 //! # Three paths ask this question, and they are held together by a test
 //!
@@ -1155,7 +1167,19 @@ impl SpaceView<'_> {
         }
         // Nothing mapped here, or the access straddles two entries: the
         // general path, which has to locate per run in any case.
-        self.endian_at(addr).store(&mut buf[..n], width, value)?;
+        //
+        // The byte order is the **write** side's, which is not what
+        // `endian_at` answers. A directed entry decodes reads and writes
+        // separately and nothing says the two chips agree: `FlatEntry::endian`
+        // is the read leaf's, and using it here laid a big-endian write out
+        // little-endian whenever the pair disagreed. `endian_at` itself stays
+        // read-side — it is public API, `cpu::arm::aprofile::exec` and
+        // `cpu::arm::v7m::exec` ask it about loads, and it is right for those.
+        let endian = self
+            .locate(addr)
+            .and_then(|i| self.topo.flat.entry(i))
+            .map_or(self.space.endian, |e| e.write_endian());
+        endian.store(&mut buf[..n], width, value)?;
         self.write_span(addr, &buf[..n], attrs, Some(width))
     }
 

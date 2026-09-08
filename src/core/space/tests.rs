@@ -2302,6 +2302,61 @@ fn a_directed_writes_byte_order_is_the_write_sides_and_not_the_reads() {
     assert_eq!(wire, [0x44, 0x33, 0x22, 0x11]);
 }
 
+/// The same rule on the **straddling** path, which is a different line of code.
+///
+/// `SpaceView::write`'s fast path handles an access that lands in one entry;
+/// anything crossing an entry boundary falls through to a general path that
+/// materialises the bytes itself and hands them to `write_span`. That
+/// materialisation used `endian_at`, which answers for the *read* side, so a
+/// directed pair whose two chips disagreed laid a straddling write out in the
+/// wrong order while the fast path next to it got it right.
+///
+/// Four bytes at `0x8000` with a two-byte directed pair there and RAM after it:
+/// a little-endian write side must put `0x11223344` down as `44 33` in the pair
+/// and `22 11` in the RAM behind it.
+#[test]
+fn a_straddling_writes_byte_order_is_also_the_write_sides() {
+    let rom_store = Arc::new(RomStore::new(vec![0; 2]));
+    let rom = Region::rom("be-bank", rom_store, RomWrite::Ignore).with_endian(Endian::Big);
+    let (pair_store, pair_region) = ram("le-write-side", 2);
+    let (tail_store, tail_region) = ram("tail", 2);
+
+    let space = AddressSpace::new("mem", 16);
+    {
+        let mut topo = space.topology();
+        topo.map_with_perms(rom, 0x8000, Perms::READ).unwrap();
+        topo.map_with(
+            Mapping::new(Arc::new(pair_region), 0x8000)
+                .with_priority(1)
+                .with_perms(Perms::WRITE),
+        )
+        .unwrap();
+        topo.map(Arc::new(tail_region), 0x8002).unwrap();
+    }
+
+    let view = space.view();
+    let entry = view
+        .flat_view()
+        .entry(view.locate(0x8000).unwrap())
+        .unwrap();
+    assert!(entry.write_to().is_some(), "the shape under test");
+    assert_eq!(entry.endian(), Endian::Big);
+    assert_eq!(entry.write_endian(), Endian::Little);
+
+    view.write(0x8000, Width::U32, 0x1122_3344, MemAttrs::DEFAULT)
+        .expect("the write lands across the boundary");
+
+    let mut got = [0u8; 2];
+    pair_store.read_at(0, &mut got).unwrap();
+    assert_eq!(
+        got,
+        [0x44, 0x33],
+        "the write side is little-endian, so the low bytes go first"
+    );
+    tail_store.read_at(0, &mut got).unwrap();
+    assert_eq!(got, [0x22, 0x11], "and the rest continues in that order");
+}
+
 /// The flattener has two winners and no third, and this is what that costs the
 /// one shape that would want one.
 ///
