@@ -20,6 +20,7 @@
 //! | [`a_synthetic_a64_workload_agrees_across_the_engines`] | none | a few seconds | every `cargo test` |
 //! | [`a_synthetic_riscv_workload_agrees_across_the_engines`] | none | a few seconds | every `cargo test` |
 //! | [`a_tlbi_in_the_loop_agrees_across_the_engines`] | none | under a second | every `cargo test` |
+//! | `a_synthetic_x86_workload_agrees_across_the_engines` | none | ~1.4 s | every `cargo test` |
 //! | `a_real_arm64_linux_boot_agrees_across_the_engines` | a kernel | minutes | `--ignored`, nightly |
 //!
 //! `RSEMU_LONGRUN_SECONDS` lengthens the synthetic runs; the default is sized
@@ -66,6 +67,21 @@
 //! So both exist, and they are different claims: the synthetic runs everywhere
 //! and holds the ground already taken, and the kernel run is the gate that can
 //! still find something new.
+//!
+//! The x86 leg at the bottom of this file is written to the same brief and
+//! against a longer list, because `cpu::x86::engine` documents more seams than
+//! the A64 one does — the tick allowance, `Flags::Eager`, `admit`'s exclusion
+//! list, `Smc::EndBlock`, block chaining and the entry translation are each
+//! reached by something the guest deliberately does. It found nothing on the
+//! `master` it was written against, over twenty guest seconds, and that is the
+//! honest result: what it *does* catch is in `docs/testing/long-run.md`'s
+//! calibration table, and one of the four defects re-introduced there is
+//! invisible to `tests/x86_engines.rs`.
+//!
+//! There is no x86 leg of the kernel gate. `pc64` boots Linux on either engine
+//! and `docs/platforms/pc64.md` records nine hundred guest seconds of it, but
+//! nothing runs that **in lockstep**; pointing this harness at `pc64` is the
+//! obvious next thing and it is not done.
 
 #![cfg(all(feature = "jit", feature = "std"))]
 
@@ -682,5 +698,809 @@ mod riscv {
                 Err(d) => panic!("{d}"),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the same shape on a third core, with a workload built for its seams
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "cpu-x86-lift", feature = "dev-pc"))]
+mod x86 {
+    use std::sync::Arc;
+
+    use rsemu::core::Captured;
+    use rsemu::core::space::{AddressSpace, MemAttrs};
+    use rsemu::core::value::Width;
+    use rsemu::cpu::x86::prot::{SegReg, Sys, ar, cr0, cr4, efer, sys_type};
+    use rsemu::cpu::x86::{Reg, Regs, Variant, X86, flags, isa::seg};
+    use rsemu::machine::{Machine, build};
+
+    /// A board built for the engine comparison rather than taken from
+    /// `machines/`.
+    ///
+    /// Every shipped x86 board is a board for software this repository does not
+    /// contain — `pc-at` and `q35` want a firmware, `pc64` and `q35-linux` want
+    /// a `bzImage` — and all four start in **real mode**, which
+    /// `cpu::x86::lift::World::of` refuses by construction. A board that spent
+    /// its first hundred thousand instructions there would compare two
+    /// interpreters and pass, which is the argument `tests/x86_engines.rs`
+    /// already makes for building its own machine.
+    ///
+    /// This is that machine plus the one thing it deliberately has not got: an
+    /// **asynchronous interrupt source**. `pc64`'s own, so the path is the one
+    /// a kernel takes — an 8254 counter 0 into a master 8259A into `INTR` —
+    /// because the seam under test is a timer edge arriving in the middle of a
+    /// chain of translated blocks, and a `Machine` with no device that
+    /// interrupts cannot reach it. Nothing else is here: no console, no RTC, no
+    /// slave controller, because each would be a second thing being tested and
+    /// a bigger chunk to fingerprint every quantum.
+    ///
+    /// 100 MHz is `pc64`'s processor clock and 105000000/88 Hz is the 8254's
+    /// real input (14.31818 MHz / 12), so a count in [`TIMER_COUNT`] means on
+    /// this board what it would mean on that one.
+    ///
+    /// Four mebibytes of RAM, which is the smallest power of two above the
+    /// guest's top address (`PT0` ends at 0x304000): the full state hash walks
+    /// all of it and this harness takes one every two thousand quanta.
+    pub(crate) const SOURCE: &str = r#"
+machine "x86-longrun" {
+  param engine = "interp"
+  param ram = 4M
+
+  osc cpu = 100000000 Hz
+  osc pit = 105000000/88 Hz
+
+  space mem  { width = 64, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  object cpu0 "cpu.x86" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    variant = "x86-64"
+    engine  = engine
+  }
+
+  object dram "ram" { size = ram }
+
+  object pic1 "pc.pic" { mode = "master" }
+  object pit0 "pc.pit" { clock = pit }
+
+  map mem  0x00000000 size ram    = dram
+  map port 0x0020 size 0x0002 = pic1.regs
+  map port 0x0040 size 0x0004 = pit0.regs
+
+  wire pit0.out0 -> pic1.ir0
+  wire pic1.int  -> cpu0.intr
+}
+"#;
+
+    /// The global descriptor table. Three entries: null, a 64-bit code segment
+    /// at `0x08` and a data segment at `0x10`.
+    ///
+    /// It has to be real, unlike `tests/x86_engines.rs`'s, because an interrupt
+    /// in long mode **loads `CS` from the gate's selector** — the one thing on
+    /// this board that reads a descriptor out of memory.
+    const GDT: u64 = 0x0800;
+    /// The interrupt descriptor table: 256 sixteen-byte gates.
+    const IDT: u64 = 0x1000;
+    /// The top of the stack the interrupt frame is pushed on. Its page is
+    /// distinct from the code page, so the frame never dirties a translation.
+    const STACK_TOP: u64 = 0x8000;
+    /// Where [`SOFT`] counts itself. Read back by
+    /// [`assert_the_workload_ran`], because a software interrupt that never
+    /// happened would otherwise be invisible.
+    const MARK: u64 = 0x9000;
+    /// The main loop's page — also the page [`MAIN`] hands to `INVLPG` and the
+    /// page it writes into.
+    const CODE: u64 = 0xa000;
+    /// The IRQ 0 handler.
+    const IRQ_HANDLER: u64 = 0xb000;
+    /// The `INT 0x30` handler.
+    const SOFT_HANDLER: u64 = 0xb100;
+    /// The base of the 64-page data window the loop walks.
+    const DATA: u64 = 0x10_0000;
+
+    /// The four levels of the identity map. They sit in the 2-4 MiB range,
+    /// which [`PD`] entry 1 covers with a single large page, so the tables that
+    /// describe the first two mebibytes are not themselves described by
+    /// [`PT0`].
+    const PML4: u64 = 0x30_0000;
+    const PDPT: u64 = 0x30_1000;
+    const PD: u64 = 0x30_2000;
+    /// The one page table, mapping 0-2 MiB in **4 KiB pages**.
+    ///
+    /// Deliberately not a large page like the rest: `INVLPG` has to be able to
+    /// throw away the code page's translation on its own, and a walk that
+    /// re-establishes it must be a real four-level one. `tests/x86_engines.rs`
+    /// maps everything with two 2 MiB pages because nothing there invalidates.
+    const PT0: u64 = 0x30_3000;
+
+    /// The 8259A vector IRQ 0 is remapped to. Not the reset default of 8,
+    /// which collides with `#DF`.
+    const IRQ0_VECTOR: u64 = 0x20;
+    /// The vector [`MAIN`]'s `INT` immediate names.
+    const SOFT_VECTOR: u64 = 0x30;
+
+    const CODE_SEL: u16 = 0x08;
+    const DATA_SEL: u16 = 0x10;
+
+    /// The 8254 count [`MAIN`] programs counter 0 with.
+    ///
+    /// 100 ticks of a 1.193 MHz input is 83.8 µs, against a quantum of at most
+    /// 10 000 ticks of a 100 MHz processor — 100 µs. So the timer edge lands
+    /// **inside** a quantum rather than on its boundary, on nearly every
+    /// quantum, which is the whole point: a boundary edge would be taken at the
+    /// same instruction by any engine.
+    const TIMER_COUNT: u16 = 100;
+
+    /// The main loop, at [`CODE`].
+    ///
+    /// Hand-assembled with `nasm -f bin`; the listing is in the comments, and
+    /// the source it was assembled from is reproduced here so the bytes can be
+    /// regenerated. Encodings and semantics: *Intel 64 and IA-32 Architectures
+    /// Software Developer's Manual*, volume 2 (the instruction set) and volume
+    /// 3A §6.14 (long-mode interrupt delivery) and §4.5 (IA-32e paging).
+    ///
+    /// It is written around what `cpu::x86::engine` actually does, seam by
+    /// seam, because the honest finding of the last round is that a plain loop
+    /// is a regression test and not a discovery instrument:
+    ///
+    /// | seam | what reaches it |
+    /// | --- | --- |
+    /// | `MAX_INSNS` = 32 and `CHAIN` = 16 | twenty-four consecutive lifted instructions in the middle of the loop, so one `advance` is a chain rather than a block |
+    /// | `FLAGS = Flags::Eager` | every one of those writes flags and five read them back (`ADC`, `SBB`, `SETB`, `CMOVZ`, and the `Jcc` chain below), so a quantum that ends mid-block ends where a flag is live |
+    /// | `IrHost::spent` | the same run of instructions has no store in it, so nothing but the allowance can end a quantum inside it |
+    /// | `admit`'s exclusion list | `PUSHFQ`/`POPFQ` every eighth pass and `CLI`/`STI` every thirty-second — `STI` leaves the interrupt shadow `admit` refuses on, and `PUSHFQ` observes the packed `EFLAGS` a block never assembles |
+    /// | `Smc::EndBlock` | every sixteenth pass the loop **rewrites its own immediate**, from a `MOV` two hundred bytes further down the same page |
+    /// | the entry translation in `admit` | every sixty-fourth pass, `INVLPG` on this very page, so the next `admit` charges a cold four-level walk — the x86 analogue of the `TLBI` that found the A64 defect |
+    /// | interrupt delivery from inside a chain | the 8254 above, firing roughly once a quantum |
+    /// | a synchronous entry from inside a chain | `INT 0x30` every two hundred and fifty-sixth pass |
+    /// | the data-side walk, its accessed and dirty bits | a store and a load to a different 4 KiB page every pass, sixty-four of them |
+    ///
+    /// ```text
+    ///         mov     ebx, 0x100000           ; the data window, 64 pages
+    ///         mov     ebp, 0xa000             ; this code page, for INVLPG
+    ///         mov     edi, patch              ; the immediate the loop rewrites
+    ///         mov     esp, 0x8000
+    ///         xor     ecx, ecx
+    ///         xor     esi, esi
+    ///         ; master 8259A: ICW1-ICW4, then a mask leaving only IR0 open
+    ///         mov al,0x11 / out 0x20,al
+    ///         mov al,0x20 / out 0x21,al       ; IRQ0 -> vector 0x20
+    ///         mov al,0x04 / out 0x21,al
+    ///         mov al,0x01 / out 0x21,al
+    ///         mov al,0xfe / out 0x21,al
+    ///         ; 8254 counter 0: mode 2, lobyte/hibyte, binary
+    ///         mov al,0x34 / out 0x43,al
+    ///         mov al,100  / out 0x40,al
+    ///         mov al,0    / out 0x40,al
+    ///         sti
+    /// top:    inc     rsi
+    ///         mov     edx, esi
+    ///         and     edx, 0x3f
+    ///         shl     edx, 12
+    ///         add     rdx, rbx
+    ///         mov     [rdx], rcx              ; a different page every pass
+    ///         mov     r8, [rdx]
+    /// patched:add     ecx, 1                  ; the immediate the guest rewrites
+    ///         add r8,rcx / adc r9,r8 / sbb r10,r9 / xor r11,r10 / add r12,r11
+    ///         rol r12,1 / add r13,1 / xor r14,r13 / rol r14,1 / add r8,r14
+    ///         sar r9,3 / shl r10,2 / setb al / movzx eax,al / add rcx,rax
+    ///         cmp rcx,r11 / cmovz rcx,r12 / imul rdx,r13,3 / add rcx,rdx
+    ///         neg r11 / not r10 / dec r12 / sub rcx,r8 / inc r13
+    ///         test    esi, 7
+    ///         jnz     .no_flags
+    ///         pushfq / popfq                  ; outside the lifted subset
+    /// .no_flags:
+    ///         test    esi, 0xf
+    ///         jnz     .no_smc
+    ///         mov al,[rdi] / xor al,3 / mov [rdi],al   ; self-modifying
+    /// .no_smc:
+    ///         test    esi, 0x1f
+    ///         jnz     .no_cli
+    ///         cli / inc rcx / sti             ; STI leaves an interrupt shadow
+    /// .no_cli:
+    ///         test    esi, 0x3f
+    ///         jnz     .no_invlpg
+    ///         invlpg  [rbp]                   ; this page's own translation
+    /// .no_invlpg:
+    ///         test    esi, 0xff
+    ///         jnz     .no_int
+    ///         int     0x30
+    /// .no_int:
+    ///         jmp     top
+    /// patch   equ     patched + 2
+    /// ```
+    const MAIN: [u8; 221] = [
+        0xbb, 0x00, 0x00, 0x10, 0x00, // mov ebx, 0x100000
+        0xbd, 0x00, 0xa0, 0x00, 0x00, // mov ebp, 0xa000
+        0xbf, 0x4f, 0xa0, 0x00, 0x00, // mov edi, patch    (0xa04f)
+        0xbc, 0x00, 0x80, 0x00, 0x00, // mov esp, 0x8000
+        0x31, 0xc9, // xor ecx, ecx
+        0x31, 0xf6, // xor esi, esi
+        0xb0, 0x11, // mov al, 0x11
+        0xe6, 0x20, // out 0x20, al
+        0xb0, 0x20, // mov al, 0x20
+        0xe6, 0x21, // out 0x21, al
+        0xb0, 0x04, // mov al, 0x04
+        0xe6, 0x21, // out 0x21, al
+        0xb0, 0x01, // mov al, 0x01
+        0xe6, 0x21, // out 0x21, al
+        0xb0, 0xfe, // mov al, 0xfe      <- MASK_IMM
+        0xe6, 0x21, // out 0x21, al
+        0xb0, 0x34, // mov al, 0x34
+        0xe6, 0x43, // out 0x43, al
+        0xb0, 0x64, // mov al, 100
+        0xe6, 0x40, // out 0x40, al
+        0xb0, 0x00, // mov al, 0
+        0xe6, 0x40, // out 0x40, al
+        0xfb, // sti
+        // top:  (CODE + 0x39)
+        0x48, 0xff, 0xc6, // inc rsi
+        0x89, 0xf2, // mov edx, esi
+        0x83, 0xe2, 0x3f, // and edx, 0x3f
+        0xc1, 0xe2, 0x0c, // shl edx, 12
+        0x48, 0x01, 0xda, // add rdx, rbx
+        0x48, 0x89, 0x0a, // mov [rdx], rcx
+        0x4c, 0x8b, 0x02, // mov r8, [rdx]
+        0x83, 0xc1, 0x01, // add ecx, 1        <- the patched immediate
+        0x49, 0x01, 0xc8, // add r8, rcx
+        0x4d, 0x11, 0xc1, // adc r9, r8
+        0x4d, 0x19, 0xca, // sbb r10, r9
+        0x4d, 0x31, 0xd3, // xor r11, r10
+        0x4d, 0x01, 0xdc, // add r12, r11
+        0x49, 0xd1, 0xc4, // rol r12, 1
+        0x49, 0x83, 0xc5, 0x01, // add r13, 1
+        0x4d, 0x31, 0xee, // xor r14, r13
+        0x49, 0xd1, 0xc6, // rol r14, 1
+        0x4d, 0x01, 0xf0, // add r8, r14
+        0x49, 0xc1, 0xf9, 0x03, // sar r9, 3
+        0x49, 0xc1, 0xe2, 0x02, // shl r10, 2
+        0x0f, 0x92, 0xc0, // setb al
+        0x0f, 0xb6, 0xc0, // movzx eax, al
+        0x48, 0x01, 0xc1, // add rcx, rax
+        0x4c, 0x39, 0xd9, // cmp rcx, r11
+        0x49, 0x0f, 0x44, 0xcc, // cmovz rcx, r12
+        0x49, 0x6b, 0xd5, 0x03, // imul rdx, r13, 3
+        0x48, 0x01, 0xd1, // add rcx, rdx
+        0x49, 0xf7, 0xdb, // neg r11
+        0x49, 0xf7, 0xd2, // not r10
+        0x49, 0xff, 0xcc, // dec r12
+        0x4c, 0x29, 0xc1, // sub rcx, r8
+        0x49, 0xff, 0xc5, // inc r13
+        0xf7, 0xc6, 0x07, 0x00, 0x00, 0x00, // test esi, 7
+        0x75, 0x02, // jnz .no_flags
+        0x9c, // pushfq            <- FLAGS_BODY
+        0x9d, // popfq
+        0xf7, 0xc6, 0x0f, 0x00, 0x00, 0x00, // test esi, 0xf
+        0x75, 0x06, // jnz .no_smc
+        0x8a, 0x07, // mov al, [rdi]     <- SMC_BODY
+        0x34, 0x03, // xor al, 3
+        0x88, 0x07, // mov [rdi], al
+        0xf7, 0xc6, 0x1f, 0x00, 0x00, 0x00, // test esi, 0x1f
+        0x75, 0x05, // jnz .no_cli
+        0xfa, // cli               <- SHADOW_BODY
+        0x48, 0xff, 0xc1, // inc rcx
+        0xfb, // sti
+        0xf7, 0xc6, 0x3f, 0x00, 0x00, 0x00, // test esi, 0x3f
+        0x75, 0x04, // jnz .no_invlpg
+        0x0f, 0x01, 0x7d, 0x00, // invlpg [rbp]      <- INVLPG_BODY
+        0xf7, 0xc6, 0xff, 0x00, 0x00, 0x00, // test esi, 0xff
+        0x75, 0x02, // jnz .no_int
+        0xcd, 0x30, // int 0x30          <- SOFTINT_BODY
+        0xe9, 0x5c, 0xff, 0xff, 0xff, // jmp top
+    ];
+
+    /// The IRQ 0 handler, at [`IRQ_HANDLER`].
+    ///
+    /// `OUT` and `IRETQ` are both outside the lifted subset, so the handler is
+    /// a second source of declined boundaries in its own right. `RAX` is saved
+    /// and restored so a divergence in the main loop's arithmetic is the main
+    /// loop's, rather than an interrupt landing one instruction later leaving a
+    /// different `AL` behind.
+    ///
+    /// ```text
+    ///         push    rax
+    ///         mov     al, 0x20
+    ///         out     0x20, al        ; EOI to the master 8259A
+    ///         pop     rax
+    ///         inc     r15             ; how many fired, for the assertion
+    ///         iretq
+    /// ```
+    const IRQ: [u8; 11] = [
+        0x50, // push rax
+        0xb0, 0x20, // mov al, 0x20
+        0xe6, 0x20, // out 0x20, al
+        0x58, // pop rax
+        0x49, 0xff, 0xc7, // inc r15
+        0x48, 0xcf, // iretq
+    ];
+
+    /// The `INT 0x30` handler, at [`SOFT_HANDLER`].
+    ///
+    /// It counts into [`MARK`] rather than into a register because every
+    /// register is already carrying something the main loop reads back, and
+    /// because a counter in RAM is covered by the tier the periodic full hash
+    /// checks rather than by the per-quantum fingerprint.
+    ///
+    /// ```text
+    ///         inc     qword [0x9000]
+    ///         iretq
+    /// ```
+    const SOFT: [u8; 10] = [
+        0x48, 0xff, 0x04, 0x25, 0x00, 0x90, 0x00, 0x00, // inc qword [0x9000]
+        0x48, 0xcf, // iretq
+    ];
+
+    /// Offsets into [`MAIN`] the bisecting variants blank out.
+    ///
+    /// A divergence found by the whole workload is a divergence found by
+    /// *something* in it, and the first question is always which. The A64 leg
+    /// answered that by keeping two hand-written copies of its second page;
+    /// one array with a mask byte and five named windows is the same thing
+    /// with no second copy to drift.
+    const MASK_IMM: usize = 0x29;
+    const FLAGS_BODY: (usize, usize) = (0xa5, 0xa7);
+    const SMC_BODY: (usize, usize) = (0xaf, 0xb5);
+    const SHADOW_BODY: (usize, usize) = (0xbd, 0xc2);
+    const INVLPG_BODY: (usize, usize) = (0xca, 0xce);
+    const SOFTINT_BODY: (usize, usize) = (0xd6, 0xd8);
+
+    /// Which of the workload's seams this build of the guest reaches.
+    ///
+    /// Every field off is still a valid guest — the conditional bodies are
+    /// replaced by `NOP`s and the branches around them keep their
+    /// displacements — so a bisect changes one property at a time and nothing
+    /// else. [`Stress::ALL`] is what the committed test runs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Stress {
+        /// Unmask IR0 on the 8259A, so the 8254 can interrupt at all.
+        pub(crate) timer: bool,
+        /// Keep `INVLPG [rbp]`, which makes this code page's next fetch a cold
+        /// four-level walk.
+        pub(crate) invlpg: bool,
+        /// Keep the three instructions that rewrite the loop's own immediate.
+        pub(crate) smc: bool,
+        /// Keep `CLI`/`STI`, and with it the interrupt shadow `admit` refuses.
+        pub(crate) shadow: bool,
+        /// Keep `PUSHFQ`/`POPFQ`, which are outside the lifted subset.
+        pub(crate) packed_flags: bool,
+        /// Keep `INT 0x30`.
+        pub(crate) soft_int: bool,
+    }
+
+    impl Stress {
+        /// Everything on: the committed workload.
+        pub(crate) const ALL: Stress = Stress {
+            timer: true,
+            invlpg: true,
+            smc: true,
+            shadow: true,
+            packed_flags: true,
+            soft_int: true,
+        };
+
+        /// The seams named in `keep`, and nothing else.
+        ///
+        /// This is the bisecting knob, and it is the reason the workload is one
+        /// array with named windows rather than the two hand-written copies of
+        /// a page the A64 leg keeps: *"the same workload with either one alone
+        /// agrees for six thousand quanta"* is the sentence that took that
+        /// defect from a hash mismatch to a named function, and producing it
+        /// should not need an edit.
+        pub(crate) fn keeping(keep: &str) -> Stress {
+            let has = |name: &str| keep.split(',').any(|s| s.trim() == name);
+            Stress {
+                timer: has("timer"),
+                invlpg: has("invlpg"),
+                smc: has("smc"),
+                shadow: has("shadow"),
+                packed_flags: has("flags"),
+                soft_int: has("int"),
+            }
+        }
+    }
+
+    /// [`MAIN`] with the seams `stress` turns off replaced by `NOP`s.
+    fn program(stress: Stress) -> [u8; MAIN.len()] {
+        let mut code = MAIN;
+        if !stress.timer {
+            // OCW1 = 0xff: every line masked, so the 8254 still counts and
+            // still toggles `out0` and the processor never sees it.
+            code[MASK_IMM] = 0xff;
+        }
+        for (keep, (from, to)) in [
+            (stress.packed_flags, FLAGS_BODY),
+            (stress.smc, SMC_BODY),
+            (stress.shadow, SHADOW_BODY),
+            (stress.invlpg, INVLPG_BODY),
+            (stress.soft_int, SOFTINT_BODY),
+        ] {
+            if !keep {
+                for byte in &mut code[from..to] {
+                    *byte = 0x90;
+                }
+            }
+        }
+        code
+    }
+
+    /// The immediates hand-assembled into [`MAIN`] are the constants this
+    /// module names, and the windows [`program`] blanks are the instructions it
+    /// says they are.
+    ///
+    /// A named constant nothing checks drifts from the bytes it describes, and
+    /// hand-assembled code is exactly where that goes unnoticed: `MASK_IMM` off
+    /// by one would blank the `OUT` rather than the mask and the timer would
+    /// still fire, so a bisect would blame the wrong seam. Every number below
+    /// is read back out of the encoding.
+    #[test]
+    fn the_guest_carries_the_addresses_and_the_windows_this_file_names() {
+        let imm32 = |at: usize| {
+            u64::from(u32::from_le_bytes(
+                MAIN[at..at + 4].try_into().expect("four bytes"),
+            ))
+        };
+        assert_eq!(imm32(1), DATA, "mov ebx, <the data window>");
+        assert_eq!(imm32(6), CODE, "mov ebp, <this code page>");
+        assert_eq!(imm32(11), CODE + 0x4f, "mov edi, <the patched immediate>");
+        assert_eq!(imm32(16), STACK_TOP, "mov esp, <the top of the stack>");
+        assert_eq!(u64::from(MAIN[0x1d]), IRQ0_VECTOR, "ICW2, the vector base");
+        assert_eq!(
+            u16::from(MAIN[0x31]) | (u16::from(MAIN[0x35]) << 8),
+            TIMER_COUNT,
+            "the 8254 count, low byte then high"
+        );
+        assert_eq!(MAIN[0x4f], 1, "the rewritten immediate starts at one");
+        assert_eq!(u64::from(MAIN[0xd7]), SOFT_VECTOR, "the INT immediate");
+        assert_eq!(MAIN[MASK_IMM], 0xfe, "OCW1, with IR0 the only line open");
+        for (name, (from, to), want) in [
+            ("pushfq/popfq", FLAGS_BODY, &[0x9c, 0x9d][..]),
+            (
+                "the code rewrite",
+                SMC_BODY,
+                &[0x8a, 0x07, 0x34, 0x03, 0x88, 0x07],
+            ),
+            ("cli/inc/sti", SHADOW_BODY, &[0xfa, 0x48, 0xff, 0xc1, 0xfb]),
+            ("invlpg [rbp]", INVLPG_BODY, &[0x0f, 0x01, 0x7d, 0x00]),
+            ("int 0x30", SOFTINT_BODY, &[0xcd, 0x30]),
+        ] {
+            assert_eq!(&MAIN[from..to], want, "the window for {name} moved");
+        }
+        // The two handlers, likewise: `SOFT` carries `MARK` as an absolute
+        // address, and nothing else in this file would notice if it did not.
+        assert_eq!(
+            imm32_of(&SOFT, 4),
+            MARK,
+            "inc qword [<the software-interrupt counter>]"
+        );
+    }
+
+    /// A little-endian doubleword out of a hand-assembled blob.
+    fn imm32_of(bytes: &[u8], at: usize) -> u64 {
+        u64::from(u32::from_le_bytes(
+            bytes[at..at + 4].try_into().expect("four bytes"),
+        ))
+    }
+
+    /// One descriptor, as the two doublewords a table holds, packed into the
+    /// quadword they are written as.
+    ///
+    /// A limit above 1 MiB is expressed in pages and the architecture rounds up
+    /// to the page containing it, which is why `0xffff_ffff` and `0xffff_f000`
+    /// produce the same descriptor. *SDM* volume 3A §3.4.5.
+    fn descriptor(base: u64, limit: u32, rights: u32) -> u64 {
+        let (limit, rights) = if limit > 0xf_ffff {
+            (limit >> 12, rights | ar::GRANULAR)
+        } else {
+            (limit, rights)
+        };
+        let base = base as u32;
+        let low = (limit & 0xffff) | (base << 16);
+        let high = ((base >> 16) & 0xff) | rights | (limit & 0x000f_0000) | (base & 0xff00_0000);
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    /// Build the board on `engine`, place the core in long mode over a
+    /// four-level identity map, and load the guest.
+    ///
+    /// `build` realizes and resets, and a cold reset zeroes RAM, so everything
+    /// written into memory happens afterwards — the order
+    /// `tests/x86_engines.rs` documents and for the same reason.
+    pub(crate) fn board(engine: &str, tag: &str, stress: Stress) -> (Machine, Arc<X86>) {
+        let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
+        let kept = Arc::clone(&cpus);
+        let mut bindings = rsemu::machine::catalog::bindings().expect("this build's bindings");
+        bindings.replace("cpu.x86", move |props| {
+            let cpu = Arc::new(X86::from_props_defaulting(props, Variant::X86_64)?);
+            kept.push(&cpu);
+            Ok(cpu)
+        });
+        let options = rsemu::machine::BuildOptions::new()
+            .with_classes(rsemu::machine::catalog::classes())
+            .with_bindings(bindings)
+            .with_param("engine", engine);
+        let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+        let machine = build(&format!("x86-longrun.{tag}"), SOURCE, &registry, &options)
+            .unwrap_or_else(|e| panic!("the board does not build with engine={engine}: {e}"));
+        let cpu = cpus.take().expect("the binding captured the core");
+
+        // One step discharges the reset sequence, which is what clears
+        // `reset_pending`; without it the first quantum would run the sequence
+        // and throw away the `CS:RIP` written below.
+        cpu.step();
+        assert!(!cpu.reset_requested(), "the reset sequence did not run");
+
+        let space = cpu.space().expect("the core has its space");
+        let put = |addr: u64, width: Width, value: u64| {
+            space
+                .write(addr, width, value, MemAttrs::DEFAULT)
+                .expect("inside RAM");
+        };
+        for (at, bytes) in [
+            (CODE, &program(stress)[..]),
+            (IRQ_HANDLER, &IRQ[..]),
+            (SOFT_HANDLER, &SOFT[..]),
+        ] {
+            for (n, byte) in bytes.iter().enumerate() {
+                put(at + n as u64, Width::U8, u64::from(*byte));
+            }
+        }
+
+        // The descriptor table. Entry 1 is the 64-bit code segment every gate
+        // in the table below names; entry 2 is what `DS`, `ES`, `SS`, `FS` and
+        // `GS` are loaded with. Long mode ignores their bases and limits, but
+        // `SS` has to be a writable data segment for `IRETQ` to accept it back.
+        put(GDT, Width::U64, 0);
+        put(
+            GDT + 8,
+            Width::U64,
+            descriptor(
+                0,
+                0xffff_ffff,
+                ar::PRESENT | ar::S | ar::CODE | ar::RW | ar::ACCESSED | ar::L,
+            ),
+        );
+        put(
+            GDT + 16,
+            Width::U64,
+            descriptor(
+                0,
+                0xffff_ffff,
+                ar::PRESENT | ar::S | ar::RW | ar::ACCESSED | ar::DB,
+            ),
+        );
+
+        // Two sixteen-byte interrupt gates. Bytes 0-1 and 6-7 are the offset's
+        // low thirty-two bits split around the selector and the access byte,
+        // exactly as a 32-bit gate does it; bytes 8-11 are the offset's top
+        // half and 12-15 are reserved. *SDM* volume 3A §6.14.1.
+        for (vector, target) in [(IRQ0_VECTOR, IRQ_HANDLER), (SOFT_VECTOR, SOFT_HANDLER)] {
+            let at = IDT + vector * 16;
+            let low = (target as u32 & 0xffff) | (u32::from(CODE_SEL) << 16);
+            let high = (target as u32 & 0xffff_0000)
+                | ar::PRESENT
+                | (u32::from(sys_type::INT_GATE32) << 8);
+            put(at, Width::U32, u64::from(low));
+            put(at + 4, Width::U32, u64::from(high));
+            put(at + 8, Width::U32, target >> 32);
+            put(at + 12, Width::U32, 0);
+        }
+
+        map_identity(&space);
+        cpu.set_sys(system());
+
+        let mut regs = Regs::new();
+        regs.cs = CODE_SEL;
+        for sr in [seg::SS, seg::DS, seg::ES, seg::FS, seg::GS] {
+            regs.set_segment(sr, DATA_SEL);
+        }
+        regs.rip = CODE;
+        // `IF` clear: the guest sets it itself, after it has programmed the
+        // two chips. An interrupt before that would vector through a gate the
+        // 8259A had not been told about.
+        regs.eflags = flags::ALWAYS_SET;
+        cpu.set_regs(regs);
+
+        (machine, cpu)
+    }
+
+    /// The system registers for a long-mode guest over a four-level map.
+    ///
+    /// The *SDM*'s bring-up order minus the instructions that would perform it
+    /// — `CR4.PAE`, `CR3`, `EFER.LME`, `CR0.PG`, at which point the processor
+    /// sets `EFER.LMA` — because this builds the state rather than reaching it.
+    /// `cpu::x86::tests` is where the transition is executed as real
+    /// instructions.
+    fn system() -> Sys {
+        let mut sys = Sys::reset();
+        sys.cr0 |= cr0::PE;
+        sys.gdtr.base = GDT;
+        sys.gdtr.limit = 0x17;
+        sys.idtr.base = IDT;
+        sys.idtr.limit = 0xfff;
+        sys.segs[usize::from(seg::CS)] = SegReg {
+            selector: CODE_SEL,
+            base: 0,
+            limit: 0xffff_ffff,
+            ar: ar::PRESENT | ar::S | ar::CODE | ar::RW | ar::ACCESSED | ar::L | ar::GRANULAR,
+        };
+        for index in [seg::DS, seg::ES, seg::SS, seg::FS, seg::GS] {
+            sys.segs[usize::from(index)] = SegReg {
+                selector: DATA_SEL,
+                base: 0,
+                limit: 0xffff_ffff,
+                ar: ar::PRESENT | ar::S | ar::RW | ar::ACCESSED | ar::DB | ar::GRANULAR,
+            };
+        }
+        sys.cr4 |= cr4::PAE;
+        sys.cr3 = PML4;
+        sys.efer |= efer::LME | efer::LMA;
+        sys.cr0 |= cr0::PG;
+        sys
+    }
+
+    /// Identity-map the first four mebibytes: 0-2 MiB in **4 KiB** pages, and
+    /// 2-4 MiB as one large page.
+    ///
+    /// The split is the point. Everything the guest executes, stores to and
+    /// pushes on is in the 4 KiB half, so `INVLPG` on the code page discards
+    /// exactly one translation and the walk that replaces it reads four levels;
+    /// the tables themselves are in the large half, where nothing invalidates
+    /// them. *SDM* volume 3A §4.5.
+    fn map_identity(space: &Arc<AddressSpace>) {
+        /// Present and writable. No `U/S`: this guest never leaves ring 0.
+        const PRESENT_RW: u64 = 0b11;
+        /// `PS`, which makes a directory entry a 2 MiB page.
+        const LARGE: u64 = 1 << 7;
+        let put = |at: u64, value: u64| {
+            space
+                .write(at, Width::U64, value, MemAttrs::DEFAULT)
+                .expect("the tables fit in RAM");
+        };
+        put(PML4, PDPT | PRESENT_RW);
+        put(PDPT, PD | PRESENT_RW);
+        put(PD, PT0 | PRESENT_RW);
+        put(PD + 8, 0x20_0000 | LARGE | PRESENT_RW);
+        for page in 0..512u64 {
+            put(PT0 + 8 * page, (page << 12) | PRESENT_RW);
+        }
+    }
+
+    /// Assert the guest actually did what it was written to do.
+    ///
+    /// Without this the run could be green because the core wedged on the
+    /// first instruction: a comparison of two stopped machines agrees at every
+    /// checkpoint. Each of these is a property the workload exists for, and
+    /// each of them has failed at least once while this file was being written.
+    pub(crate) fn assert_the_workload_ran(cpu: &X86, engine: &str, stress: Stress) {
+        let space = cpu.space().expect("the core has its space");
+        // `RSEMU_LONGRUN_ENGINES=interp` is the control leg — an interpreter
+        // against itself — and an interpreted core has no translation
+        // statistics to assert. Everything below still applies to that run.
+        if let Some(stats) = cpu.jit_stats() {
+            assert!(
+                stats.blocks > 0,
+                "engine={engine} executed no translated block, so the run \
+                 compared two interpreters"
+            );
+            assert!(
+                stats.retired > stats.interpreted,
+                "engine={engine} retired {} instructions inside blocks against \
+                 {} interpreted, which is not a translated run",
+                stats.retired,
+                stats.interpreted
+            );
+            if stress.smc {
+                assert!(
+                    stats.invalidated > 0,
+                    "engine={engine}: the guest rewrote its own code and not \
+                     one translation was thrown away, so the self-modifying \
+                     path is not being exercised"
+                );
+            }
+        }
+        assert!(
+            cpu.reg(Reg::Rsi) > 1_000,
+            "engine={engine}: the loop went round {} times, so the guest is \
+             not running the workload at all",
+            cpu.reg(Reg::Rsi)
+        );
+        if stress.timer {
+            assert!(
+                cpu.reg(Reg::R15) > 0,
+                "engine={engine}: the 8254 never interrupted, so the run says \
+                 nothing about where a translated block notices one"
+            );
+        }
+        if stress.soft_int {
+            let marks = space
+                .read(MARK, Width::U64, MemAttrs::DEFAULT)
+                .expect("inside RAM");
+            assert!(
+                marks > 0,
+                "engine={engine}: `INT 0x30` never vectored, so the gate is \
+                 wrong and a whole seam is unexercised"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cpu-x86-lift", feature = "dev-pc"))]
+mod x86_tests {
+    use super::longrun::{self, Options};
+    use super::x86::{self, Stress};
+
+    /// What the per-commit run costs, and why it is a count of quanta rather
+    /// than the guest seconds the other legs use.
+    ///
+    /// One guest second of this board is 24 818 quanta, 192 618 passes round
+    /// the loop and about three seconds of wall time **per engine** — twice
+    /// what the rest of this file costs put together — and effectively all of
+    /// it is repetition: the workload reaches every seam it was written for
+    /// inside the first two hundred quanta. Six thousand is 0.24 s of guest
+    /// time and roughly 46 000 passes, which is still 2 900 code rewrites, 700
+    /// `INVLPG`s, 2 800 timer interrupts and 180 software ones.
+    ///
+    /// `RSEMU_LONGRUN_SECONDS` removes the cap and asks for guest seconds
+    /// instead, which is what `scripts/check.sh long` and the nightly do.
+    const DEFAULT_QUANTA: u64 = 6_000;
+
+    /// How far to run, and how often to take the full hash.
+    fn budget() -> Options {
+        match std::env::var("RSEMU_LONGRUN_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(secs) => Options::to_guest_seconds(secs),
+            None => Options::to_guest_seconds(u64::MAX).at_most(DEFAULT_QUANTA),
+        }
+        .hashing_every(2_000)
+    }
+
+    fn engines() -> Vec<String> {
+        std::env::var("RSEMU_LONGRUN_ENGINES")
+            .unwrap_or_else(|_| "jit,jit-host".to_string())
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Run the workload under every engine and compare, failing on the first
+    /// quantum anything parts.
+    pub(crate) fn run(tag: &str, stress: Stress, opts: &Options) {
+        for engine in engines() {
+            let (mut oracle, _) = x86::board("interp", &format!("{tag}.oracle.{engine}"), stress);
+            let (mut under_test, cpu) = x86::board(&engine, &format!("{tag}.{engine}"), stress);
+            match longrun::lockstep(tag, &mut oracle, &engine, &mut under_test, opts) {
+                Ok(summary) => eprintln!("{tag} engine={engine}: {summary}"),
+                Err(d) => panic!("{d}"),
+            }
+            x86::assert_the_workload_ran(&cpu, &engine, stress);
+        }
+    }
+
+    /// Which seams this run keeps.
+    ///
+    /// Everything, unless `RSEMU_X86_LONGRUN_SEAMS` names a subset —
+    /// `timer,invlpg,smc,shadow,flags,int` — which is what a bisect turns off
+    /// one at a time once this test has failed. See [`Stress::keeping`].
+    fn stress() -> Stress {
+        match std::env::var("RSEMU_X86_LONGRUN_SEAMS") {
+            Ok(keep) => {
+                let stress = Stress::keeping(&keep);
+                eprintln!("x86-longrun: RSEMU_X86_LONGRUN_SEAMS={keep} -> {stress:?}");
+                stress
+            }
+            Err(_) => Stress::ALL,
+        }
+    }
+
+    #[test]
+    fn a_synthetic_x86_workload_agrees_across_the_engines() {
+        run("x86-longrun", stress(), &budget());
     }
 }
