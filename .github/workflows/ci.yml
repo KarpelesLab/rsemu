@@ -487,14 +487,19 @@ jobs:
     #
     # ## What is not green, and why that is the point
     #
-    # Ten tests are skipped and `scripts/check.sh` names every one of them with
-    # its reason beside it. Five are a real defect — `core::sync` selects the
-    # `single` backend for `target_family = "wasm"` whatever the host's thread
-    # support, so the pool has no workers and `single::Mutex` panics the moment
-    # two guest cores contend for a bus lock on two real host threads. Three are
-    # `catch_unwind` under `panic = "abort"`, which no wasm target can do. One
-    # is `TcpListener::bind`, which WASI preview 1 does not have. The remaining
-    # ~2400 run.
+    # Four tests are skipped and `scripts/check.sh` names every one of them with
+    # its reason beside it: three are `catch_unwind` under `panic = "abort"`,
+    # which no wasm target can do, and one is `TcpListener::bind`, which WASI
+    # preview 1 does not have. The remaining ~2400 run.
+    #
+    # It was ten when this job landed, and the other six were a defect this job
+    # existed to find: `core::sync` selected the `single` backend for
+    # `target_family = "wasm"` whatever the host's thread support, so the pool
+    # had no workers and `single::Mutex` panicked the moment two guest cores
+    # contended for a bus lock on two real host threads — two emulated cores
+    # killing a browser page. The fix is the `wasm-threads` feature in
+    # `WASM_THREADS_FEATURES`, which is why this job is the only place that
+    # feature is exercised.
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

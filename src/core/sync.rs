@@ -11,10 +11,31 @@
 //!
 //! | Backend | Primitives | Selected when |
 //! | --- | --- | --- |
-//! | [`native_std`] | `std::sync` + `std::thread` | `std`, non-wasm |
+//! | [`native_std`] | `std::sync` + `std::thread` | `std`, and either non-wasm or `wasm-threads` |
 //! | `single` | atomic cells, jobs run inline, waiting is a panic | everything else |
 //! | `native-raw` | futex / `WaitOnAddress` by raw syscall | *not implemented* |
-//! | `wasm-atomics` | shared memory + `Atomics.wait` | *not implemented* |
+//!
+//! There is no separate `wasm-atomics` module and there does not need to be.
+//! On a threaded wasm target `std::sync::Mutex` **is** `memory.atomic.wait32`
+//! and `std::thread` **is** `wasi:thread-spawn`, so [`native_std`] compiled for
+//! that target is the wasm-atomics backend; what was missing was never the code
+//! but the `cfg` that reaches it. The name in `ROADMAP.md` §4.7's table
+//! survives as a description of what the primitives lower to, not as a module
+//! somebody still has to write.
+//!
+//! ## Why the threaded wasm build has to *say* it is threaded
+//!
+//! `wasm32-wasip1` and `wasm32-wasip1-threads` are `cfg`-identical on stable —
+//! `rustc --print cfg` for the two differs in nothing, `target_feature =
+//! "atomics"` is unstable and never emitted, and `target_has_atomic = "ptr"` is
+//! set on every wasm32 target because it describes how atomics lower rather
+//! than whether the host has a second thread. So the threaded configuration is
+//! declared by the `wasm-threads` Cargo feature, whose manifest comment carries
+//! the measurements. Declaring it wrong degrades rather than breaks: a pool
+//! probes by spawning and a target that refuses yields zero workers and inline
+//! jobs, which is what `single` does; the opposite mistake — a genuinely
+//! threaded host built without the feature — is what
+//! `a_threaded_wasm_host_must_not_be_running_single` fails on.
 //!
 //! `single` is not a degraded mode to be tolerated: it is the **reference
 //! semantics**. It is the only backend that can *detect* the mistakes the other
@@ -39,10 +60,10 @@
 //! `static`, it is a `Global`** — enforced by a test in this file that reads
 //! the crate's own source.
 //!
-//! The two unimplemented backends are extension points, not omissions. Both
-//! plug in at the same place: add a module beside `single` exporting the same
-//! items, then extend the `cfg` on the re-export block at the end of this file.
-//! Each is marked `EXTENSION POINT` where it will attach.
+//! The one unimplemented backend is an extension point, not an omission. It
+//! plugs in where the others do: add a module beside `single` exporting the
+//! same items, then extend the `cfg` on the re-export block at the end of this
+//! file. It is marked `EXTENSION POINT` where it will attach.
 //!
 //! # Jobs, not threads
 //!
@@ -222,11 +243,15 @@ pub enum Backend {
     /// so rather than waiting.
     Single,
     /// `std::sync` primitives and a pool of `std::thread` workers.
+    ///
+    /// The name says what the primitives *are*, not what host they run on. A
+    /// `wasm-threads` build reports this too, and there its `Mutex` is
+    /// `memory.atomic.wait32` and its pool is `wasi:thread-spawn` — which is
+    /// what `ROADMAP.md` §4.7 calls `wasm-atomics`. There is one backend
+    /// because there is one implementation.
     NativeStd,
     /// Futex / `WaitOnAddress` by raw syscall. Not implemented yet.
     NativeRaw,
-    /// Shared linear memory and `Atomics.wait`. Not implemented yet.
-    WasmAtomics,
 }
 
 impl Backend {
@@ -236,7 +261,6 @@ impl Backend {
             Backend::Single => "single",
             Backend::NativeStd => "native-std",
             Backend::NativeRaw => "native-raw",
-            Backend::WasmAtomics => "wasm-atomics",
         }
     }
 
@@ -255,7 +279,16 @@ impl fmt::Display for Backend {
 }
 
 /// The backend this build selected.
-pub const BACKEND: Backend = if cfg!(all(feature = "std", not(target_family = "wasm"))) {
+///
+/// A compile-time answer, and on wasm it is what the build *claimed*: nothing
+/// stable tells the compiler whether a wasm target has threads, so the
+/// `wasm-threads` feature says so and this follows it. The runtime answer to
+/// "did the host actually provide them" is [`Pool::workers`], which is zero on
+/// a host that refused.
+pub const BACKEND: Backend = if cfg!(all(
+    feature = "std",
+    any(not(target_family = "wasm"), feature = "wasm-threads")
+)) {
     Backend::NativeStd
 } else {
     Backend::Single
@@ -518,6 +551,13 @@ pub fn violates_lock_order(rank: LockRank) -> bool {
 ///  2. **Process globals**, where the target cannot create a thread at all:
 ///     bare metal (`target_os = "none"`) and wasm without the threads proposal.
 ///     A shared stack is exact there because there is only ever one stack.
+///     "Without the threads proposal" is spelled `not(feature =
+///     "wasm-threads")` and used to be spelled `not(target_feature =
+///     "atomics")`, which is a cfg stable rustc never sets — so *every* wasm
+///     build took this branch, threaded ones included, and case 3's whole
+///     argument was being routed around. Same reason the backend selection
+///     needed a feature; the manifest comment on `wasm-threads` has the
+///     measurements.
 ///  3. **Nothing at all**, for what is left: a hosted `no_std` build, and
 ///     threaded wasm. Both have threads and no TLS to separate them, and a
 ///     shared stack would have one thread inventing violations in another —
@@ -598,7 +638,7 @@ mod rank_track {
     not(any(feature = "std", test)),
     any(
         target_os = "none",
-        all(target_family = "wasm", not(target_feature = "atomics"))
+        all(target_family = "wasm", not(feature = "wasm-threads"))
     )
 ))]
 mod rank_track {
@@ -653,7 +693,7 @@ mod rank_track {
     not(any(feature = "std", test)),
     not(any(
         target_os = "none",
-        all(target_family = "wasm", not(target_feature = "atomics"))
+        all(target_family = "wasm", not(feature = "wasm-threads"))
     ))
 ))]
 mod rank_track {
@@ -1386,7 +1426,10 @@ pub(crate) mod single {
 ///
 /// This is the only module under `core/` permitted to name `std::sync` or
 /// `std::thread`; that is what being the seam means.
-#[cfg(all(feature = "std", not(target_family = "wasm")))]
+#[cfg(all(
+    feature = "std",
+    any(not(target_family = "wasm"), feature = "wasm-threads")
+))]
 pub mod native_std {
     use super::{LockRank, RankGuard};
     use ::core::fmt;
@@ -2023,22 +2066,44 @@ pub mod native_std {
 // Backend selection
 // ---------------------------------------------------------------------------
 //
-// EXTENSION POINT: both remaining backends attach here.
+// The threaded wasm case used to be listed here as a future `wasm-atomics`
+// module claiming `target_family = "wasm"` with `target_feature = "atomics"`.
+// That was wrong twice over and running the target is what proved it.
 //
-//   * `wasm-atomics` claims `target_family = "wasm"` with the threads proposal
-//     (`target_feature = "atomics"`), which today falls through to `single`.
-//   * `native-raw` claims hosted builds without `std`, which today also fall
+// Wrong about the `cfg`: `atomics` is an unstable target feature, so stable
+// rustc never emits it — not for `wasm32-wasip1-threads`, and not for
+// `wasm32-unknown-unknown` under `-C target-feature=+atomics` either, where it
+// warns and omits the cfg. `rustc --print cfg` for `wasm32-wasip1` and
+// `wasm32-wasip1-threads` is byte-identical, and `target_has_atomic = "ptr"`
+// holds on every wasm32 target. Nothing the compiler knows separates them, so
+// the build has to say: `feature = "wasm-threads"`, in the `any(..)` below.
+//
+// Wrong about the module: on a threaded wasm target `std::sync` lowers to
+// `memory.atomic.wait32`/`notify` and `std::thread` to `wasi:thread-spawn`, so
+// `native_std` *is* the wasm-atomics backend once the `cfg` lets it through.
+// Writing a second module would have duplicated std's futex to reach the same
+// instructions.
+//
+// EXTENSION POINT: one backend still attaches here.
+//
+//   * `native-raw` claims hosted builds without `std`, which today fall
 //     through to `single` — correct, but serial. It must not be selected before
 //     the rank tracker above has thread-local storage on that target.
 //
-// Adding one is a `cfg` change here plus a module beside `single`; nothing else
+// Adding it is a `cfg` change here plus a module beside `single`; nothing else
 // in the crate moves, which is the entire point of the seam.
 
-#[cfg(all(feature = "std", not(target_family = "wasm")))]
+#[cfg(all(
+    feature = "std",
+    any(not(target_family = "wasm"), feature = "wasm-threads")
+))]
 pub use native_std::{
     Handle, Mutex, MutexGuard, Once, Pool, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
-#[cfg(not(all(feature = "std", not(target_family = "wasm"))))]
+#[cfg(not(all(
+    feature = "std",
+    any(not(target_family = "wasm"), feature = "wasm-threads")
+)))]
 pub use single::{
     Handle, Mutex, MutexGuard, Once, Pool, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
@@ -2146,7 +2211,10 @@ impl<T: ?Sized> Global<T> {
     }
 
     /// The wait itself, which is the only part that differs by backend.
-    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    #[cfg(all(
+        feature = "std",
+        any(not(target_family = "wasm"), feature = "wasm-threads")
+    ))]
     fn wait(&self) -> MutexGuard<'_, T> {
         self.inner.lock()
     }
@@ -2156,7 +2224,10 @@ impl<T: ?Sized> Global<T> {
     /// once. Where a second thread does exist — the test harness, threaded
     /// wasm — it holds this for a table lookup and an `Arc` clone, so spinning
     /// costs less than the machinery to avoid it would.
-    #[cfg(not(all(feature = "std", not(target_family = "wasm"))))]
+    #[cfg(not(all(
+        feature = "std",
+        any(not(target_family = "wasm"), feature = "wasm-threads")
+    )))]
     fn wait(&self) -> MutexGuard<'_, T> {
         loop {
             if let Some(guard) = self.inner.try_lock() {
@@ -2227,7 +2298,10 @@ mod tests {
     #[cfg(not(feature = "std"))]
     extern crate std;
 
-    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    #[cfg(all(
+        feature = "std",
+        any(not(target_family = "wasm"), feature = "wasm-threads")
+    ))]
     use ::core::sync::atomic::{AtomicUsize, Ordering};
 
     /// Every core type is `Send + Sync` from phase 1 (`ROADMAP.md` §0). This is
@@ -2242,7 +2316,10 @@ mod tests {
         assert_send_sync::<single::Once>();
         assert_send_sync::<single::Pool>();
         assert_send_sync::<single::Handle<u64>>();
-        #[cfg(all(feature = "std", not(target_family = "wasm")))]
+        #[cfg(all(
+            feature = "std",
+            any(not(target_family = "wasm"), feature = "wasm-threads")
+        ))]
         {
             assert_send_sync::<native_std::Mutex<u64>>();
             assert_send_sync::<native_std::RwLock<u64>>();
@@ -2257,10 +2334,50 @@ mod tests {
         // A build that cannot say which backend it is cannot report a
         // determinism divergence usefully.
         assert_eq!(BACKEND.is_threaded(), BACKEND != Backend::Single);
-        #[cfg(all(feature = "std", not(target_family = "wasm")))]
+        #[cfg(all(
+            feature = "std",
+            any(not(target_family = "wasm"), feature = "wasm-threads")
+        ))]
         assert_eq!(BACKEND, Backend::NativeStd);
-        #[cfg(not(all(feature = "std", not(target_family = "wasm"))))]
+        #[cfg(not(all(
+            feature = "std",
+            any(not(target_family = "wasm"), feature = "wasm-threads")
+        )))]
         assert_eq!(BACKEND, Backend::Single);
+    }
+
+    /// The runtime probe, as a tripwire rather than as the selector.
+    ///
+    /// Nothing stable tells the compiler whether a wasm target has threads, so
+    /// `wasm-threads` is a claim the build makes and a claim can be wrong in
+    /// two directions. One direction is harmless: claim threads on a host that
+    /// has none and the pool spawns nothing, reports zero workers and runs jobs
+    /// inline, which is `single` by another name. The other direction is the
+    /// defect this test exists for — a host that really does hand back a
+    /// thread, running the backend that treats a contended lock as a deadlock
+    /// and panics inside `BusLock::acquire` the moment two guest cores meet.
+    /// That went unnoticed for the whole life of the target because nothing
+    /// ever ran on it.
+    ///
+    /// Asking is the only way to know, and asking is cheap and total:
+    /// `Builder::spawn` returns `Err(Unsupported)` on `wasm32-wasip1` and
+    /// `Ok` on `wasm32-wasip1-threads`. It never panics, so the probe is safe
+    /// to run anywhere — and it runs *here*, in a test, rather than in `Pool`,
+    /// because CI is the enforcement and a shipped build should not spend a
+    /// thread proving a `cfg`.
+    #[cfg(all(feature = "std", target_family = "wasm"))]
+    #[test]
+    fn a_threaded_wasm_host_must_not_be_running_single() {
+        let spawned = std::thread::Builder::new().spawn(|| ()).map(|h| h.join());
+        if spawned.is_ok() {
+            assert!(
+                BACKEND.is_threaded(),
+                "this host spawned a thread and this build selected `{BACKEND}`: \
+                 build it with the `wasm-threads` feature, or two guest cores \
+                 will panic in `single::Mutex::lock` the first time they \
+                 contend for a bus lock"
+            );
+        }
     }
 
     // -- Lock ranks ---------------------------------------------------------
@@ -2604,12 +2721,18 @@ mod tests {
     }
 
     backend_suite!(single_backend, crate::core::sync::single);
-    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    #[cfg(all(
+        feature = "std",
+        any(not(target_family = "wasm"), feature = "wasm-threads")
+    ))]
     backend_suite!(native_std_backend, crate::core::sync::native_std);
 
     /// The §4.7 requirement, in miniature: the same workload, the same answer,
     /// under both backends in the same binary.
-    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    #[cfg(all(
+        feature = "std",
+        any(not(target_family = "wasm"), feature = "wasm-threads")
+    ))]
     #[test]
     fn single_and_native_std_agree_on_the_state_hash() {
         for workers in [0, 1, 4] {
@@ -2672,10 +2795,12 @@ mod tests {
 
     // -- `native-std`-specific threading ------------------------------------
 
-    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    #[cfg(all(
+        feature = "std",
+        any(not(target_family = "wasm"), feature = "wasm-threads")
+    ))]
     mod threaded {
         use super::*;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
         use std::thread;
 
         #[test]
@@ -2711,8 +2836,19 @@ mod tests {
             assert_eq!(inline.submit(move || thread::current().id()).join(), here);
         }
 
+        // `catch_unwind` catches nothing where there is no unwinding, and the
+        // process aborts instead of the assertion failing. Every wasm target is
+        // `panic = "abort"`, and until `wasm-threads` this module never
+        // compiled for one, so this gate is new rather than newly needed. It is
+        // a `cfg` rather than a row in `check.sh`'s skip list because the test
+        // is *inapplicable* there, not failing: `Pool` still delivers a
+        // panicking job's fate at `join`, there is simply no fate to deliver
+        // when the panic took the process with it.
+        #[cfg(panic = "unwind")]
         #[test]
         fn a_panicking_job_is_reported_at_join_and_the_pool_survives() {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+
             let pool = native_std::Pool::new(1);
             let handle = pool.submit(|| panic!("job exploded"));
             let caught = catch_unwind(AssertUnwindSafe(move || handle.join()));
@@ -2818,6 +2954,22 @@ mod tests {
 
         const THREADS: u64 = 8;
         const KEYS: u64 = 250;
+
+        // A host that refuses a thread has no pressure to apply and nothing
+        // here to find. Ask before assuming, because `thread::scope`'s `spawn`
+        // *panics* on a refusal rather than reporting it, and on
+        // `wasm32-wasip1` — std present, `wasi:thread-spawn` absent — the
+        // refusal is certain. Nothing ran `core::sync`'s unit tests on that
+        // target until the `wasm-threads` work, so this aborted latently for as
+        // long as the test has existed; `scripts/check.sh crosshost` runs
+        // `--lib` filtered to `core::state::` and `machine::`.
+        if std::thread::Builder::new()
+            .spawn(|| ())
+            .map(|joining| joining.join())
+            .is_err()
+        {
+            return;
+        }
 
         std::thread::scope(|scope| {
             for _ in 0..THREADS {

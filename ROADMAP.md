@@ -1241,17 +1241,19 @@ semantics; the other three must be invisible.
 `core::sync` is a portability seam. **No code under `core/`, `cpu/`, `dev/`,
 `machine/` or `ir/` ever names `std::thread` or `std::sync` directly.** The seam
 exports `Mutex`, `RwLock`, `Condvar`, `Atomic*`, `Once`, and a task pool, with
-four compile-time backends selected by target and feature:
+four named backends selected at compile time by target and feature — three
+modules, because `wasm-atomics` is `native-std` compiled for a threaded wasm
+target rather than a fourth implementation:
 
 | Backend | Primitives | Where |
 | --- | --- | --- |
 | `native-std` | `std::sync` + `std::thread` | ordinary hosted builds |
 | `native-raw` | futex / `WaitOnAddress` by raw syscall | libc-free (`fullrust`) and `no_std` hosted builds |
-| `wasm-atomics` | shared linear memory + `Atomics.wait`/`notify` in Web Workers | `wasm32-*` with the threads proposal |
+| `wasm-atomics` | shared linear memory + `Atomics.wait`/`notify` in Web Workers | `wasm32-*` with the threads proposal — **and this is `native-std` compiled for it**, not a fourth module: `std::sync` lowers to `memory.atomic.wait32` there. Selected by the `wasm-threads` feature, because stable rustc cannot see the difference (§11.1) |
 | `single` | locks exclude atomically but report waiting as the deadlock it is; the pool runs jobs inline | no-threads wasm, bare metal, and the deterministic test runner |
 
-Because the API is identical across all four, a device is written once and works
-on every target. `single` is not a degraded mode to be tolerated — it is the
+Because the API is identical across all four names, a device is written once and
+works on every target. `single` is not a degraded mode to be tolerated — it is the
 **reference semantics**, and CI asserts that a machine produces the same state
 hash under `single` and under `native-std`.
 
@@ -1950,10 +1952,10 @@ every commit is a target that does not work; wasm rots faster than anything else
 | --- | --- | --- | --- | --- |
 | `x86_64` / `aarch64` / `riscv64` Linux, macOS, Windows | `native-std` or `native-raw` | native JIT + KVM/HVF/WHPX | monotonic clock | host files |
 | `*-linux-fullrust` (libc-free) | `native-raw` | native JIT, KVM | raw `clock_gettime` | raw syscalls |
-| `wasm32-wasip1-threads` | `wasm-atomics` | wasm JIT or IR interpreter | WASI clock | WASI fs |
-| `wasm32-unknown-unknown` **+ threads** ⚠️ **nightly** | `wasm-atomics` (Web Workers) | **wasm JIT** or IR interpreter | `performance.now()` import | in-memory / IndexedDB / File System Access |
+| `wasm32-wasip1-threads` | `wasm-atomics`, with `--features wasm-threads` | wasm JIT or IR interpreter | WASI clock | WASI fs |
+| `wasm32-unknown-unknown` **+ threads** ⚠️ **nightly** | `wasm-atomics` (Web Workers), with `--features wasm-threads` | **wasm JIT** or IR interpreter | `performance.now()` import | in-memory / IndexedDB / File System Access |
 | `wasm32-unknown-unknown`, no threads | `single` | wasm JIT or IR interpreter | `performance.now()` import | same |
-| `wasm32-wasip1` | `single` (threads when the host offers them) | wasm JIT or IR interpreter | WASI `clock_time_get` | WASI preview-1 fs |
+| `wasm32-wasip1` | `single` — the target has no `wasi:thread-spawn`, and `std::thread::spawn` returns `Unsupported` rather than panicking, which is what the `wasm-threads` tripwire asks | wasm JIT or IR interpreter | WASI `clock_time_get` | WASI preview-1 fs |
 | bare metal `no_std` | `single` | IR interpreter | board timer | none |
 
 ### 11.1 The one nightly job, and why
@@ -1973,8 +1975,25 @@ toolchain" and "threaded browser from phase 0" cannot both hold unqualified, and
 the resolution is explicit rather than discovered on day one:
 
 - **`wasm32-wasip1-threads` is the primary threaded wasm target.** It ships a
-  precompiled atomics-enabled std, builds on stable, and exercises every line of
-  the `wasm-atomics` sync backend. This is what CI gates on.
+  precompiled atomics-enabled std and builds on stable, so this is what CI gates
+  on — `scripts/check.sh wasm-threads`, under wasmer, about 2400 tests.
+- **The threaded wasm build has to declare itself, because stable cannot tell.**
+  This line used to say the target "exercises every line of the `wasm-atomics`
+  sync backend", and both halves were wrong until the stage above actually ran.
+  There is no `wasm-atomics` module: on a threaded wasm target `std::sync`
+  lowers to `memory.atomic.wait32`/`notify` and `std::thread` to
+  `wasi:thread-spawn`, so `core::sync`'s `native-std` backend *is* what the
+  table calls `wasm-atomics`, and a second module would have reimplemented
+  std's futex to reach the same instructions. And nothing was exercised,
+  because `core::sync` selected `single` for every `target_family = "wasm"`
+  build: the pool had no workers and a contended `Mutex` panicked rather than
+  waiting, which is two emulated cores killing a browser page. `wasm32-wasip1`
+  and `wasm32-wasip1-threads` are `cfg`-identical on stable (`target_feature =
+  "atomics"` is unstable and never emitted; `target_has_atomic = "ptr"` holds on
+  every wasm32 target), so the threaded configuration is declared by the
+  `wasm-threads` Cargo feature — the same feature the nightly browser job
+  below needs, since the threaded and non-threaded browser builds share a
+  target triple and no build script could separate them either.
 - **The threaded browser job is pinned to a dated nightly**, uses `-Z
   build-std`, and is the *only* nightly in the project. It is allowed to be the
   one job that can break on a toolchain bump.

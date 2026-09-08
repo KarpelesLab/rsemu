@@ -174,6 +174,17 @@ stage_wasm() {
     fi
     run "wasm $t" cargo build --target "$t" --no-default-features --features wasm
   done
+  # The threaded wasm configuration is a *feature*, not a target: `wasm32-wasip1`
+  # and `wasm32-wasip1-threads` are `cfg`-identical on stable, so `core::sync`
+  # cannot detect threads and the build declares them (see `wasm-threads` in
+  # Cargo.toml). That means the loop above compiles the non-threaded backend for
+  # all three targets and would never compile the threaded one for any of them.
+  # Cheap to add, and it is the build the `wasm-threads` stage and the browser
+  # `SharedArrayBuffer` page actually ship.
+  if rustc --print target-libdir --target wasm32-wasip1-threads >/dev/null 2>&1; then
+    run "wasm wasm32-wasip1-threads +wasm-threads" cargo build \
+      --target wasm32-wasip1-threads --no-default-features --features wasm,wasm-threads
+  fi
   if rustc --print target-libdir --target wasm32-unknown-unknown >/dev/null 2>&1; then
     # The non-threaded browser build is a supported target, not a fallback
     # (ROADMAP.md §11), and `demo` is the only feature set the page loads.
@@ -360,30 +371,24 @@ stage_crosshost() {
 #
 # ## The known-failure list, and why each one is on it
 #
-# Ten tests are skipped, in three groups. Nothing here is a test made weaker —
-# each is named, each has a reason, and the first group is a defect report.
+# Four tests are skipped, in two groups. Nothing here is a test made weaker —
+# each is named and each has a reason, and neither group is fixable in this
+# repository.
 #
-# **`core::sync` selects the `single` backend on wasm even where the host has
-# real threads (5 tests).** `src/core/sync.rs`'s backend selection is
-# `cfg(all(feature = "std", not(target_family = "wasm")))`, so this target —
-# which has a working `std::thread` and a shared linear memory — gets the
-# zero-worker, non-blocking backend. Two consequences, both observed here:
-#
-#   * `Pool` reports zero workers, so `parallel_threading`'s first assertion
-#     fails with "this host refused a worker thread". The rest of that file
-#     passes, which is worth reading carefully: `parallel` mode *runs* here, it
-#     just runs everything on the calling thread.
-#   * `single::Mutex::lock` treats a contended acquisition as the deadlock it
-#     would be under one thread and panics. `core::space::buslock::BusLock` is
-#     such a `Mutex`, and two guest cores on two real host threads contend for
-#     it — so `a64_lse_atomicity`, `riscv_amo_atomicity` and `x86_bus_lock`
-#     abort inside `BusLock::acquire`. On a threaded browser build that is two
-#     emulated cores taking a bus lock and killing the page.
-#
-# This is the `wasm-atomics` backend that `src/core/sync.rs` names as an
-# EXTENSION POINT and ROADMAP.md §11 lists in its target matrix. It does not
-# exist yet; until it does these five rows stay here, and they are the ledger
-# that shrinks when it lands.
+# It was ten in three groups when this stage landed, and the first group of
+# five was a defect report: `src/core/sync.rs` selected the `single` backend
+# for `cfg(target_family = "wasm")` whatever the host's thread support, so
+# `Pool` had no workers and `single::Mutex::lock` — which treats a contended
+# acquisition as the deadlock it would be under one thread — panicked inside
+# `core::space::buslock::BusLock` the moment two guest cores met on two real
+# host threads. Running this stage is what turned that from a to-do into five
+# aborts. The fix is the `wasm-threads` feature in `WASM_THREADS_FEATURES`
+# below: on a threaded wasm target `std::sync` lowers to `memory.atomic.wait32`
+# and `std::thread` to `wasi:thread-spawn`, so `core::sync`'s `native_std`
+# backend already *was* the `wasm-atomics` backend and what was missing was the
+# `cfg` that reaches it. It has to be a feature because `wasm32-wasip1` and
+# `wasm32-wasip1-threads` are `cfg`-identical on stable; the manifest comment
+# on the feature carries the measurement.
 #
 # **`catch_unwind` cannot work under `panic = "abort"` (3 tests).** Every wasm
 # target is abort-only, so `tests/conformance/harness.rs`'s `quietly(...)`
@@ -398,13 +403,6 @@ stage_crosshost() {
 # `every_shipped_machine_resumes_from_its_own_snapshot` is *not* on the list:
 # see the comment on WASM_THREADS_RUSTFLAGS.
 WASM_THREADS_SKIPS=(
-  # core::sync picks `single` on wasm; these five are the defect above.
-  every_runnable_is_inside_its_run_call_on_a_thread_of_its_own
-  concurrent_cores_never_lose_an_exclusive_update
-  concurrent_cores_never_lose_an_lse_update
-  concurrent_harts_never_lose_a_reserved_update
-  concurrent_harts_never_lose_an_amo_update
-  two_cores_do_not_lose_a_locked_increment
   # catch_unwind under panic=abort.
   a_core_that_dies_mid_trace_still_produces_a_report
   a_panicking_core_is_reported_not_fatal
@@ -413,15 +411,24 @@ WASM_THREADS_SKIPS=(
   an_ephemeral_port_lands_somewhere_and_says_where
 )
 
-# `CROSSHOST_FEATURES` plus `cpu-x86`. The eight guest architectures are the
-# same set for the same reason (no corpus, no drive), and the x86 core is added
-# because it carries two more suites that spawn host threads —
-# `tests/x86_bus_lock.rs` and `tests/smp_single_copy_atomicity.rs`. The second
-# passes in full here and is the only place single-copy atomicity is checked
-# under wasm atomics; the first is one more sighting of the `single`-backend
-# defect above. Its own constant rather than a reference to CROSSHOST_FEATURES,
-# because the two stages ask different questions and should be free to drift.
-WASM_THREADS_FEATURES="std,cpu-x86,machine-apple1,machine-nes,machine-beneater,machine-z80-mini,machine-m68k-mini,machine-mips-mini,machine-a64-mini,machine-arm926,machine-stm32f407,machine-spi-flash,machine-spi-panel"
+# `CROSSHOST_FEATURES`, plus `cpu-x86`, plus `wasm-threads`. The eight guest
+# architectures are the same set for the same reason (no corpus, no drive), and
+# the x86 core is added because it carries two more suites that spawn host
+# threads — `tests/x86_bus_lock.rs` and `tests/smp_single_copy_atomicity.rs` —
+# which together with `parallel_threading`, `a64_lse_atomicity` and
+# `riscv_amo_atomicity` are what this stage is for.
+#
+# **`wasm-threads` is the one feature no other stage passes, and dropping it
+# reverts the defect above rather than skipping a test.** Without it this
+# target builds the `single` backend and the five suites named there abort in
+# `BusLock::acquire`; `core::sync`'s
+# `a_threaded_wasm_host_must_not_be_running_single` is the assertion that says
+# so, and it runs in this stage and nowhere else, because it needs a wasm
+# target that really hands back a thread.
+#
+# Its own constant rather than a reference to CROSSHOST_FEATURES, because the
+# two stages ask different questions and should be free to drift.
+WASM_THREADS_FEATURES="std,wasm-threads,cpu-x86,machine-apple1,machine-nes,machine-beneater,machine-z80-mini,machine-m68k-mini,machine-mips-mini,machine-a64-mini,machine-arm926,machine-stm32f407,machine-spi-flash,machine-spi-panel"
 
 # `wasm32-wasip1-threads` links a **shared** memory, and a shared memory must
 # declare a maximum: rustc's default is `--max-memory=1073741824`, 16384 pages.
@@ -457,7 +464,7 @@ wasm_threads_absent() {
 
 # `cargo test` for this target, with the skip list appended to whatever libtest
 # arguments the caller wants. `--skip` is a substring filter and applies to
-# every binary in the run; the ten names above are distinctive enough that none
+# every binary in the run; the four names above are distinctive enough that none
 # of them matches a second test.
 wasm_threads_test() {
   local args=("$@")

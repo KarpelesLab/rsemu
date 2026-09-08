@@ -242,6 +242,38 @@ dev-nes-apu = []
 #       --no-default-features --features wasm --release
 wasm = ["std"]
 
+# Declares that this wasm build has threads, so `core::sync` selects its
+# threaded backend (`native_std`) instead of `single`. Inert off wasm: on every
+# other target the threaded backend is selected already, so enabling this
+# changes nothing there and the feature sweep is unaffected.
+#
+# **It has to be declared, because stable rustc cannot detect it.**
+# `wasm32-wasip1` and `wasm32-wasip1-threads` are `cfg`-identical — verified,
+# not assumed:
+#
+#   $ rustc --print cfg --target wasm32-wasip1         | sort > a
+#   $ rustc --print cfg --target wasm32-wasip1-threads | sort > b
+#   $ diff a b        # no output
+#
+# `target_feature = "atomics"` is unstable, so stable never emits that cfg (it
+# warns and omits it even for `-C target-feature=+atomics`), and
+# `target_has_atomic = "ptr"` is set on every wasm32 target because it describes
+# how atomics lower, not whether the host has a second thread. A build script
+# reading `TARGET` would separate the two WASI triples and would *not* separate
+# the threaded browser build from the non-threaded one — same triple,
+# `wasm32-unknown-unknown` — so it would solve half the problem and leave this
+# feature needed anyway. One mechanism, both configurations.
+#
+# Getting it wrong is degradation, not breakage, and that is deliberate:
+# `native_std::Pool::new` probes by spawning, and a target that refuses hands
+# back a pool with zero workers that runs jobs inline — exactly what `single`
+# does. `core::sync`'s `a_threaded_wasm_host_must_not_be_running_single` catches
+# the other direction, a threaded host built without this feature, in CI.
+#
+#   cargo test --target wasm32-wasip1-threads --no-default-features \
+#       --features std,wasm-threads
+wasm-threads = ["std"]
+
 # The NES console's own I/O (src/dev/nes): the two controller ports at
 # $4016/$4017 with the OUT0 latch and their 8-bit shift registers, and the OAM
 # DMA unit at $4014. Neither belongs to the CPU, the PPU, the APU or the
