@@ -311,7 +311,13 @@ fn interning_an_aperture_is_idempotent() {
     //
     // Not the address of anything: `mmio_intern` treats the key as an opaque
     // identity token, and the flattener is what guarantees a live one.
-    let key = 0x1_0000_0000_usize;
+    //
+    // The top of the address space rather than a round number, because the
+    // table is process-wide and a key that collided with a real `MemOps`
+    // address would make this test depend on what else has flattened. `4 GiB`
+    // said that on a 64-bit host and did not compile on a 32-bit one — `usize`
+    // is 32 bits under `wasm32-wasip1`, where the literal is out of range.
+    let key = usize::MAX - 0x1000;
     let first = super::mmio_intern(key, "test.aperture");
     let again = super::mmio_intern(key, "test.aperture");
     assert_eq!(first, again, "one device, one id");
