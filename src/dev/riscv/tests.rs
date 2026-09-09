@@ -758,12 +758,18 @@ fn rdtime_and_a_memory_mapped_mtime_read_agree() {
     // near the bus and reads `Registers::mtime_cell` as `republish` last left
     // it.
     //
-    // They agree, and the reason is that within one quantum there is nothing
-    // for `sync` to catch up *to*: the RISC-V hart does not publish a
-    // `TickCursor` (`Hart::attach_cursor` keeps only the exit flag), and the
-    // CLINT hangs off its own oscillator, so `LazySlot::arm` skips it anyway.
-    // Both paths therefore read the value `Machine::run_quantum`'s
-    // `sync_lazy_devices` published at the last quantum boundary.
+    // What they may *not* be is bit-identical on every board for ever, and the
+    // assertion below is written for that. `sync` catches the CLINT up to the
+    // hart's live position, the hart publishes one now, and a `csrr time`
+    // followed one instruction later by a load of `mtime` is then separated by
+    // real ticks of a 10 MHz counter — so the load can legitimately answer
+    // with the next one. On *this* board the gap is still zero, because the
+    // CLINT hangs off its own oscillator and `Scheduler::arm_live_cursors`
+    // arms no live view across two trees; with that arming applied locally the
+    // largest gap over these 125 000 round trips is exactly one `rtc` tick.
+    // One tick is the bound the architecture licenses (`dev::riscv::clint`
+    // quotes both chapters) and going backwards is the thing it does not, so
+    // the two assertions are pitched at exactly those two claims.
     let mut b = board("both-paths", &both_paths_loop().bytes());
     b.run(400);
     let laps = b.peek(AGREE_SCRATCH + 32, Width::U64);
@@ -775,12 +781,12 @@ fn rdtime_and_a_memory_mapped_mtime_read_agree() {
         0,
         "`time` went backwards, which no amount of lag would excuse"
     );
-    assert_eq!(
-        b.peek(AGREE_SCRATCH + 16, Width::U64),
-        0,
-        "`time` and a load of `mtime` one instruction apart disagreed by {} \
-         (last time {time}, last mtime {})",
-        b.peek(AGREE_SCRATCH + 16, Width::U64),
+    let gap = b.peek(AGREE_SCRATCH + 16, Width::U64);
+    assert!(
+        gap <= 1,
+        "`time` and a load of `mtime` one instruction apart disagreed by {gap} \
+         ticks, and one is the whole of what a live catch-up between the two \
+         instructions can produce (last time {time}, last mtime {})",
         b.peek(AGREE_SCRATCH + 8, Width::U64)
     );
 }

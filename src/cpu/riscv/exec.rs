@@ -29,6 +29,7 @@
 //! double-precision registers.
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
+use crate::core::sched::TickCursor;
 use crate::core::space::{AccessPurpose, AddressSpace, BusLockGuard, MemAttrs, MonitorSlot};
 use crate::core::sync;
 use crate::core::value::Width;
@@ -173,6 +174,14 @@ pub(super) struct Exec<'a> {
     /// the value the *next* instruction reads. Without this the counter is
     /// always one ahead of what software asked for.
     wrote_instret: bool,
+    /// Where the scheduler learns how far into its quantum this hart has got
+    /// (`core::sched::TickCursor`), or `None` on a hart nothing scheduled.
+    ///
+    /// Published from [`Exec::publish_position`], which [`Exec::read_at`] and
+    /// [`Exec::write_once`] call and nothing else does — see that method for
+    /// why that is the only place it may be published from if the three
+    /// engines are to stay indistinguishable.
+    cursor: Option<&'a TickCursor>,
 }
 
 /// Physical memory as the page-table walker sees it.
@@ -255,6 +264,49 @@ impl<'a> Exec<'a> {
             wrote: [0; 2],
             wrote_n: 0,
             wrote_instret: false,
+            cursor: None,
+        }
+    }
+
+    /// Publish this hart's bus-access counter to `cursor` as it runs.
+    ///
+    /// The scheduler converts what is published here into every lazily
+    /// advanced device's own domain, so a guest load of a timer is answered
+    /// at the instant the load happens rather than at the instant the quantum
+    /// began (`ROADMAP.md` §4.2, `core::sched::TickCursor`).
+    pub(super) fn with_cursor(mut self, cursor: Option<&'a TickCursor>) -> Exec<'a> {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Tell the cursor where this hart has got to, immediately before an
+    /// access leaves for the address space.
+    ///
+    /// # Why here, and not in `Exec::charge`
+    ///
+    /// The three engines must be indistinguishable to the guest, cycle counts
+    /// included (`ROADMAP.md` §0), so a *published position a device can read*
+    /// has to be published at points every engine reaches. The interpreter
+    /// steps an instruction at a time and a translated block runs up to
+    /// `lift::MAX_INSNS` of them, so publishing per step or per block would
+    /// hand a mid-block load of `mtime` a different answer under `interp` than
+    /// under `jit` — a divergence in guest-visible state, not a resolution
+    /// nit.
+    ///
+    /// This point is engine-independent by construction: every access that
+    /// reaches a *device* goes through [`Exec::read_at`] or
+    /// [`Exec::write_once`] under every engine, because the compiled fast path
+    /// covers plain RAM and nothing else (`engine::FastMem`). The value
+    /// published is `State::cycles`, which the differential tests already
+    /// assert is identical across engines at every instruction boundary — so
+    /// the *value* a device reads at a given access is identical too.
+    ///
+    /// The inlined RAM accesses that skip this publish nothing, which costs
+    /// nothing: no lazily advanced device sits behind them.
+    #[inline]
+    fn publish_position(&self) {
+        if let Some(cursor) = self.cursor {
+            cursor.set(self.st.cycles);
         }
     }
 
@@ -702,6 +754,7 @@ impl<'a> Exec<'a> {
     /// on a TLB miss.
     fn read_at(&mut self, vaddr: u64, phys: u64, width: Width, kind: Access) -> Result<u64, Trap> {
         self.charge();
+        self.publish_position();
         // The bus is told which of the two reasons for reading this is, so a
         // mapping without `Perms::EXEC` refuses a fetch and answers a load.
         let attrs = match kind {
@@ -728,6 +781,7 @@ impl<'a> Exec<'a> {
     fn write_once(&mut self, vaddr: u64, width: Width, value: u64) -> Result<(), Trap> {
         let phys = self.translate(vaddr, Access::Store, width.bytes())?;
         self.charge();
+        self.publish_position();
         match self.space.write(phys, width, value, self.attrs) {
             Ok(()) => {
                 self.note_write(phys);

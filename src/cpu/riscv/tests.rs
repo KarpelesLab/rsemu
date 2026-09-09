@@ -18,9 +18,10 @@ use alloc::vec::Vec;
 use crate::core::device::{Device, ResetKind};
 use crate::core::error::Result;
 use crate::core::props::Props;
-use crate::core::space::{AddressSpace, RamStore, Region};
+use crate::core::sched::TickCursor;
+use crate::core::space::{AddressSpace, MemAttrs, MemOps, MemResult, RamStore, Region};
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
-use crate::core::sync::{AtomicU64, Ordering};
+use crate::core::sync::{self, AtomicU64, Ordering};
 
 use super::csr::{Extensions, Priv, cause, irq, num, status};
 use super::isa::Xlen;
@@ -1823,4 +1824,89 @@ fn the_stack_pointer_is_on_the_seam_because_starting_a_thread_needs_it() {
     ExitingCore::set_sp(&h.hart, 0x1234);
     assert_eq!(ExitingCore::sp(&h.hart), 0x1234);
     assert_eq!(h.hart.x(2), 0x1234, "which is `sp` and nothing else");
+}
+
+// ---------------------------------------------------------------------------
+// The live position a lazily-advanced device is caught up to
+// ---------------------------------------------------------------------------
+
+/// A device that records the hart's published position on every read.
+///
+/// It stands in for the CLINT: what a lazily-advanced device does on the
+/// access path is ask the scheduler where the running runnable has got to, and
+/// the scheduler reads exactly this number out of the cursor
+/// ([`TickCursor`]).
+#[derive(Debug)]
+struct CursorProbe {
+    cursor: TickCursor,
+    seen: sync::Mutex<Vec<u64>>,
+}
+
+impl MemOps for CursorProbe {
+    fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+        self.seen.lock().push(self.cursor.get());
+        dst.fill(0);
+        Ok(())
+    }
+
+    fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_running_hart_publishes_its_position_to_the_devices_it_reads() {
+    // `ROADMAP.md` §4.2's *sampled* behaviour, on this core. A lazily-advanced
+    // device is caught up to the instant of the access before it answers, and
+    // that instant comes out of the runnable's `TickCursor`. A hart that
+    // publishes nothing leaves every such device on the position the round
+    // opened with, which on `machines/riscv-virt.machine` quantises `mtime` to
+    // the scheduler's millisecond grid and makes `cpu::riscv::engine`'s
+    // `mtip`-inside-a-block seam unreachable from any guest.
+    // `tests/engine_longrun.rs` has the board-level reproduction.
+    // Outside the harness's RAM window, so it is a region of its own.
+    const PROBE: u64 = BASE + RAM_SIZE;
+
+    let cursor = TickCursor::new();
+    let probe = Arc::new(CursorProbe {
+        cursor: cursor.clone(),
+        seen: sync::Mutex::new(Vec::new()),
+    });
+
+    // `ld t0, 0(t3)` from the probe, round and round. A lap is three bus
+    // accesses — two fetches and the load — so the published position has to
+    // move between one read and the next.
+    let program = [
+        lui(28, (PROBE as u32) & 0xffff_f000),
+        i(0x03, 3, 5, 28, 0),
+        j(0, -4),
+    ];
+    let h = Harness::rv64i(&program);
+    let space = h.hart.space().expect("the harness attached one");
+    space
+        .topology()
+        .map(
+            Region::io("probe", 8, Arc::clone(&probe) as Arc<dyn MemOps>),
+            PROBE,
+        )
+        .unwrap();
+    h.hart.attach_cursor(&cursor);
+
+    h.hart.run_budget(300);
+
+    let seen = probe.seen.lock().clone();
+    assert!(
+        seen.len() > 20,
+        "the probe was read {} time(s); the guest is not running the loop",
+        seen.len()
+    );
+    assert!(
+        seen.windows(2).all(|w| w[1] > w[0]),
+        "the published position did not move between two reads: {seen:?}"
+    );
+    assert_eq!(
+        cursor.get(),
+        h.hart.cycles(),
+        "what was published last is not where the hart actually is"
+    );
 }
