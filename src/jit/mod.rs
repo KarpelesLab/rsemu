@@ -132,6 +132,57 @@ mod tlb;
 #[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
 pub mod x86;
 
+/// The aarch64 host backend.
+///
+/// Gated on the **feature alone**, not on the host architecture, and that is
+/// not an oversight: three of its five files — the encoder, the code generator
+/// and the ABI layout — are arithmetic on integers rather than anything that
+/// runs, so they compile and are tested on every host. Only `jit::arm64::buf` and
+/// `jit::arm64::rt`, which map memory and enter it, carry a `target_arch` gate of
+/// their own. `jit::x86` is gated whole because its encoder was written when
+/// there was one backend and nothing else could exercise it.
+#[cfg(feature = "jit-arm64")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-arm64")))]
+pub mod arm64;
+
+/// Whichever host code generator this build actually has, under one name.
+///
+/// There are two backends now — [`x86`] and [`arm64`] — and at most one of
+/// them can be present, because each is gated on a `target_arch` no other
+/// target satisfies. So a caller that wants *a* backend rather than a
+/// particular one writes `jit::host::Engine`, and gets the x86-64 one on an
+/// x86-64 Linux host with `jit-x86`, the aarch64 one on an aarch64 Linux host
+/// with `jit-arm64`, and a compile error anywhere else — which is what the
+/// `cfg` around the use site is for.
+///
+/// The two modules offer the same names deliberately: `Engine`, `EngineStats`,
+/// `Regs`, `Refusal`, `Compiled`, `compile`, `compile_with`, `compiles`,
+/// `CodeBuf`, `Ctx`, `Vtable`, `Event`. Nothing here is a trait and nothing is
+/// dynamically dispatched; this is a *name*, resolved at compile time, so a
+/// call through it costs exactly what a call through the concrete module
+/// costs.
+///
+/// # What still names the concrete module, and why that is a defect
+///
+/// [`Dispatcher`] does. `dispatch.rs` holds `Option<x86::Engine>` behind
+/// `cfg(all(feature = "jit-x86", target_os = "linux", target_arch =
+/// "x86_64"))` in a dozen places, and every CPU engine that attaches a backend
+/// repeats that `cfg` — so on an aarch64 host [`Dispatcher::with_backend`]
+/// does not exist and `engine = "jit-host"` still runs the interpreter, even
+/// in a build with [`arm64`] compiled and tested. Replacing those `cfg`s with
+/// this alias is the change that connects the second backend to a guest; it
+/// touches `jit::dispatch` and three `cpu::*::engine` files and was
+/// deliberately left out of the round that added [`arm64`], so that a new
+/// backend and a change to the seam every existing guest runs through would
+/// not land together.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+pub use x86 as host;
+
+#[cfg(all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-arm64")))]
+#[doc = "Whichever host code generator this build actually has, under one name."]
+pub use arm64 as host;
+
 pub use cache::{BlockCache, BlockId, CacheStats, CodeRef, DEFAULT_CAPACITY, EXITS};
 pub use dispatch::{
     DirtyPages, DispatchStats, Dispatcher, Entry, Frontend, Run, Stop, StoreLog, Translation,

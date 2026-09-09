@@ -713,6 +713,41 @@ jit = ["ir"]
 # wasm or macOS build is harmless.
 jit-x86 = ["jit", "std"]
 
+# The aarch64 host code generator (src/jit/arm64): ROADMAP.md §9's second
+# backend, and the reason `engine = "jit-host"` stops being a synonym for the
+# IR interpreter on Apple silicon, on an Arm server, and in this repository's
+# own `aarch64 (weak memory)` CI job. An IR block is lowered to A64 — every
+# encoding derived from the Arm Architecture Reference Manual, DDI 0487 — into
+# a W^X buffer mapped by raw `mmap` and flipped by raw `mprotect`, never both
+# at once, no libc; and the software TLB's fast path is inlined into it, which
+# is §9.1's "mask, compare, add, load" on a second host.
+#
+# What A64 needs and x86-64 does not is **cache maintenance**: the instruction
+# cache is not architecturally coherent with the data cache, so
+# `src/jit/arm64/buf.rs` runs DDI 0487's `DC CVAU` / `DSB ISH` / `IC IVAU` /
+# `DSB ISH` / `ISB` sequence over what it wrote before sealing the window.
+# `Opcode::FENCE` is `DMB ISH` here where it is `MFENCE` there, for the reason
+# `docs/techniques/memory-models.md` gives.
+#
+# A block carrying an op this backend does not lower is **refused** and runs on
+# `ir::Interp`, exactly as with `jit-x86`, so the interpreter stays the oracle
+# and a partial backend is a correct one.
+#
+# No new `unsafe` subsystem: this is the same JIT code buffer CLAUDE.md already
+# sanctions, implemented for a second host, confined to `src/jit/arm64/buf.rs`,
+# `rt.rs` and `abi.rs`. Adds no dependencies. Needs `jit`, and implies `std` to
+# match `jit-x86`.
+#
+# Unlike `jit-x86`, the module is gated on the **feature alone** and only its
+# two host-touching files carry a `target_arch` gate: an instruction encoder
+# and a code generator are integer arithmetic, so turning this on for an
+# x86-64 build compiles and *tests* both of them — which is most of what stands
+# between this backend and a silent regression, since its functional tests can
+# only run on an aarch64 runner. macOS is deliberately not attempted; Apple
+# silicon's `MAP_JIT` plus `pthread_jit_write_protect_np` is a different model
+# and its own piece of work.
+jit-arm64 = ["jit", "std"]
+
 # Level-3 execution (src/usermode): running a program with no guest kernel
 # under it, `qemu-user`/gVisor-shaped (ROADMAP.md §2, phase 5b). The four
 # things a syscall kernel cannot build for itself and rsemu owns because they
