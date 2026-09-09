@@ -22,6 +22,29 @@
 //! hold. So each test asserts a floor on how many cases *agreed* and — where
 //! the fault path is what is being exercised — that at least one **trapped**,
 //! which is what keeps the precise-state column live.
+//!
+//! # Coverage floors are a property of the host backend
+//!
+//! The compiled corpora below assert a *fraction* — more than half a run's
+//! blocks executed as host code — wherever the host code generator lowers
+//! everything a frontend emits. `jit::x86` does, and there the fraction is the
+//! right floor: a backend that quietly stopped taking blocks would still agree
+//! with the interpreter about the ones it refused, and only the fraction
+//! catches that.
+//!
+//! `jit::arm64` has a documented refusal set — `POPCOUNT`, `MULU2`/`MULS2`, the
+//! rotates with carry, the divides, the exclusives and atomics, `call_helper`,
+//! `phi`, `i128` and floats — and a guest corpus reaches several of them often,
+//! so the same corpora report 20-27% there while diverging on nothing. That is
+//! a fact about the refusal list, not about coverage, and the floor that still
+//! means something is liveness: a backend that compiled *nothing* cannot
+//! disagree with anyone. Shrinking that list is `jit::arm64`'s job, and it is
+//! what will make these tests demand the fraction again.
+//!
+//! The distinction is spelled `cfg!(all(feature = "jit-x86", target_arch =
+//! "x86_64"))` inline at each site rather than as a `const`, because a `const`
+//! is dead code in every build whose backend module is gated out — which is
+//! most of the feature sweep, and every macOS and Windows job.
 
 #![cfg(feature = "cpu-arm-a64-lift")]
 
@@ -351,21 +374,6 @@ mod cached {
 mod compiled {
     use super::*;
 
-    /// Whether the host code generator lowers everything a frontend emits.
-    ///
-    /// `jit::x86` does, so a coverage *fraction* is the right floor there: a
-    /// backend that quietly stopped taking blocks would still agree with the
-    /// interpreter about the ones it refused, and only the fraction catches that.
-    ///
-    /// `jit::arm64` has a documented refusal set — `POPCOUNT`, `MULU2`/`MULS2`,
-    /// the rotates with carry, the divides, the exclusives and atomics,
-    /// `call_helper`, `phi`, `i128` and floats — and a guest corpus reaches
-    /// several of them often, so the same fraction is a fact about the refusal
-    /// list rather than about coverage. There the floor is liveness: a backend
-    /// that compiled *nothing* cannot disagree with anyone, and that is the
-    /// failure still worth catching. Shrinking the refusal set is `jit::arm64`'s
-    /// job, and this constant is what will start demanding the fraction again.
-    const HOST_LOWERS_EVERYTHING: bool = cfg!(all(feature = "jit-x86", target_arch = "x86_64"));
     use rsemu::cpu::arm::a64::differential::measure_compiled;
 
     #[test]
@@ -397,7 +405,8 @@ mod compiled {
             // Without this a backend that had silently stopped compiling would
             // pass this file forever.
             assert!(
-                !HOST_LOWERS_EVERYTHING || compiled * 2 > blocks as u64,
+                !cfg!(all(feature = "jit-x86", target_arch = "x86_64"))
+                    || compiled * 2 > blocks as u64,
                 "{shape:?}: {compiled} of {blocks} blocks were compiled"
             );
             assert!(

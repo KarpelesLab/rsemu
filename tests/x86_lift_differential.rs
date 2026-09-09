@@ -39,6 +39,29 @@
 //! modes have no spelling outside it. So the long-mode sweeps generate from
 //! [`synthesize64`] rather than from [`synthesize`]; a sweep that reused the
 //! 32-bit encodings would run and would be measuring the wrong instruction set.
+//!
+//! # Coverage floors are a property of the host backend
+//!
+//! The compiled corpora below assert a *fraction* — more than half a run's
+//! blocks executed as host code — wherever the host code generator lowers
+//! everything a frontend emits. `jit::x86` does, and there the fraction is the
+//! right floor: a backend that quietly stopped taking blocks would still agree
+//! with the interpreter about the ones it refused, and only the fraction
+//! catches that.
+//!
+//! `jit::arm64` has a documented refusal set — `POPCOUNT`, `MULU2`/`MULS2`, the
+//! rotates with carry, the divides, the exclusives and atomics, `call_helper`,
+//! `phi`, `i128` and floats — and a guest corpus reaches several of them often,
+//! so the same corpora report 20-27% there while diverging on nothing. That is
+//! a fact about the refusal list, not about coverage, and the floor that still
+//! means something is liveness: a backend that compiled *nothing* cannot
+//! disagree with anyone. Shrinking that list is `jit::arm64`'s job, and it is
+//! what will make these tests demand the fraction again.
+//!
+//! The distinction is spelled `cfg!(all(feature = "jit-x86", target_arch =
+//! "x86_64"))` inline at each site rather than as a `const`, because a `const`
+//! is dead code in every build whose backend module is gated out — which is
+//! most of the feature sweep, and every macOS and Windows job.
 
 #![cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
 
@@ -688,22 +711,6 @@ fn a_paged_store_into_a_running_blocks_own_page_is_honoured() {
     all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
     all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
 ))]
-/// Whether the host code generator lowers everything a frontend emits.
-///
-/// `jit::x86` does, so a coverage *fraction* is the right floor there: a
-/// backend that quietly stopped taking blocks would still agree with the
-/// interpreter about the ones it refused, and only the fraction catches that.
-///
-/// `jit::arm64` has a documented refusal set — `POPCOUNT`, `MULU2`/`MULS2`,
-/// the rotates with carry, the divides, the exclusives and atomics,
-/// `call_helper`, `phi`, `i128` and floats — and a guest corpus reaches
-/// several of them often, so the same fraction is a fact about the refusal
-/// list rather than about coverage. There the floor is liveness: a backend
-/// that compiled *nothing* cannot disagree with anyone, and that is the
-/// failure still worth catching. Shrinking the refusal set is `jit::arm64`'s
-/// job, and this constant is what will start demanding the fraction again.
-const HOST_LOWERS_EVERYTHING: bool = cfg!(all(feature = "jit-x86", target_arch = "x86_64"));
-
 #[cfg(any(
     all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
     all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
@@ -742,7 +749,7 @@ fn the_same_corpus_agrees_when_it_is_compiled_to_host_code() {
     // rather than a count, because the interesting number is coverage: a
     // refused block is correct and slow, and the two engines are mixed inside
     // one run.
-    if HOST_LOWERS_EVERYTHING {
+    if cfg!(all(feature = "jit-x86", target_arch = "x86_64")) {
         assert!(
             compiled * 2 > blocks,
             "only {compiled} of {blocks} blocks were executed as host code"
@@ -848,7 +855,7 @@ fn the_long_mode_corpus_agrees_when_it_is_compiled_to_host_code() {
          {nothing} lifted nothing)"
     );
     assert!(trapped > 0, "no compiled long case reached a fault");
-    if HOST_LOWERS_EVERYTHING {
+    if cfg!(all(feature = "jit-x86", target_arch = "x86_64")) {
         assert!(
             compiled * 2 > blocks,
             "only {compiled} of {blocks} long-mode blocks were executed as host code"
