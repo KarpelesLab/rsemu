@@ -181,7 +181,8 @@
 //!   the trace branches over.
 //! * A branch target is an instruction *index*, so
 //!   [`eliminate_dead_code`] repoints every branch when it drops
-//!   instructions ahead of one. That was a latent bug for as long as no
+//!   instructions ahead of one, and [`hoist_slot_reads`] repoints every branch
+//!   when it moves one. That was a latent bug for as long as no
 //!   frontend emitted a branch.
 //!
 //! # What is deliberately not here yet
@@ -193,7 +194,12 @@
 //! here, because §11's bare-metal row runs on it and it is the oracle the host
 //! backends are differentially tested against; **liveness and dead-code
 //! elimination are here**, in [`Liveness`] and [`eliminate_dead_code`],
-//! because decision 1 is a debt until they exist rather than after; and
+//! because decision 1 is a debt until they exist rather than after;
+//! [`hoist_slot_reads`] is here because a slot read is where a backend that
+//! defers its bookkeeping has to stop deferring, and a frontend that emits one
+//! per guest instruction turns "per region" back into "per instruction" — a
+//! Linux boot on `arm64-virt` spent 19.4% of its host instructions replaying
+//! that bookkeeping against 7.7% in the code the JIT generated; and
 //! **so is the register allocator**, in [`linear_scan`], because everything it
 //! decides — which intervals overlap, which definitions a forward branch can
 //! jump over, which values outlive a call — is a property of the block rather
@@ -218,7 +224,7 @@ pub use op::{
     AccessKind, Align, Cond, Endian, MemOp, MemSpace, Opcode, SegId, Sign, bitfield_aux,
     bitfield_parts,
 };
-pub use pass::{Liveness, TempLife, eliminate_dead_code};
+pub use pass::{Liveness, TempLife, eliminate_dead_code, hoist_slot_reads};
 pub use regalloc::{Allocation, CallSites, Home, MAX_REGS, RegBanks, linear_scan};
 pub use types::{Const, Temp, Type};
 pub use verify::verify;

@@ -56,7 +56,7 @@
 //! branch in it would need the fixpoint, and no frontend can build one today —
 //! the IR has no label-defining op.
 
-use crate::ir::block::{Block, InsnStart};
+use crate::ir::block::{Block, InsnStart, RegSlot};
 use crate::ir::op::{MemOp, Opcode};
 use crate::ir::types::Temp;
 use alloc::vec;
@@ -293,6 +293,213 @@ fn seed_boundary(mark: &InsnStart, needed: &mut [bool]) {
             *slot = true;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hoisting slot reads
+// ---------------------------------------------------------------------------
+
+/// Move every [`Opcode::GET_SLOT`] as early in the block as it may legally go.
+///
+/// # What this is for, and the measurement that asked for it
+///
+/// A backend that defers [`Opcode::CHARGE`] and [`Opcode::INSN_START`] — which
+/// is what `jit::x86` does, and what the portable interpreter's own laziness
+/// amounts to — has to **replay** the deferred bookkeeping before anything the
+/// host can observe. A slot read is one of those things: `IrHost::read_slot`
+/// is a call into the guest's register file, so every charge and every
+/// boundary since the last replay has to have happened first.
+///
+/// The frontends in this tree emit, per guest instruction, an `insn_start`,
+/// then a `charge`, then a `get_slot` for each guest register the instruction
+/// reads for the first time in this block, then the arithmetic. That ordering
+/// puts a replay point one or two instructions after every boundary, so the
+/// deferral buys almost nothing: the replay happens per *guest instruction*
+/// rather than per region, which is the cost it exists to avoid.
+///
+/// Measured on `machines/arm64-virt.machine` booting Linux 6.12.94 `arm64`
+/// under `engine = "jit-host"`, twenty guest seconds, host instructions by
+/// callgrind: **4.64 replays per block against 3.38 slot reads per block**, on
+/// blocks that retire 6.44 guest instructions each. The replay was 19.3% of
+/// the whole profile and the slot-read thunk another 7.8%; the code the JIT
+/// generated was 7.7%. `benches/a64_linux_boot.rs` is where those numbers come
+/// from, and its docs say how to take them again.
+///
+/// A `get_slot` moved above its own instruction's boundary joins the region
+/// its predecessors are already in, and a run of them collapses to one replay
+/// point — or to none, where the whole run reaches the top of the block and
+/// there is nothing before it to replay.
+///
+/// # What it bought, and the half of it that was not predicted
+///
+/// The same twenty seconds, the same binary but for this pass, the same
+/// 154 233 793 guest instructions retired in the same 23 935 619 blocks and
+/// the same state hash — so the two columns are the same guest work, and every
+/// number below is host cost alone.
+///
+/// | | before | after |
+/// | --- | --- | --- |
+/// | **host instructions** | **53 930 067 136** | **51 375 584 369** (−4.74%) |
+/// | replays (`flush_thunk`) | 111 176 345 calls, 10.42 G | 73 205 074 calls, 9.89 G |
+/// | slot reads (`get_slot_thunk`) | 80 988 884 calls, 4.21 G | 81 018 450 calls, **1.90 G** |
+/// | the generated code itself | 4.13 G | 3.89 G |
+/// | this pass | — | 0.33 G |
+/// | `Cpu::advance` | 12 646 625 187 | 12 646 625 221 |
+///
+/// **The replay is the smaller half of the saving.** A third of the calls went
+/// away and only 0.53 G with them, because what a replay costs is mostly the
+/// events in it and hoisting moves events between regions rather than removing
+/// them; the calls it saves are worth about 14 host instructions each.
+///
+/// **The slot read is the larger half, and it is not what was aimed at.** Its
+/// thunk got 55% cheaper *per call* — 52.0 host instructions to 23.4 — because
+/// a read has to ask whether the pending boundary's mapping binds the slot it
+/// is about to read, and a read hoisted above every boundary in its region
+/// finds no pending boundary and answers in three instructions. That is 2.31 G
+/// of the 2.55 G. It is recorded here because the reasoning that produced this
+/// pass would not have predicted it, and the next person estimating a change
+/// like this one should know that the estimate was right about the direction
+/// and wrong about the mechanism.
+///
+/// The extra 29 566 slot reads are the cost side, and they are the reason
+/// rule 2 exists: a read hoisted above a side exit runs on a path that was
+/// leaving the block. Bounding it to *within* the region — never above a
+/// `brcond` — held it to 0.04% of the reads rather than to whatever a
+/// superblock's exit rate happens to be.
+///
+/// # Why it is safe, stated as five rules
+///
+/// A slot read is *pure*: it writes a temporary and touches nothing else. So
+/// the only questions are what it reads and when it is reached, and each rule
+/// below answers one of them.
+///
+/// 1. **Never above an instruction a branch targets.** A block is
+///    straight-line SSA with forward branches, so an instruction after a
+///    branch target is reachable without executing what precedes that target.
+///    Moving a definition above one leaves the taken path reading a temporary
+///    nothing assigned.
+/// 2. **Never above a [`Opcode::BRCOND`] or a terminator.** Not for the value
+///    — the value is the same — but for the *count*: a superblock's side exit
+///    is an inline sequence the trace branches over, so an instruction moved
+///    above one runs on a path that was about to leave the block, and the
+///    saved replay is paid back as a call the guest did not need.
+/// 3. **Never above a [`Opcode::CALL_HELPER`].** A helper is arbitrary Rust
+///    that may write the guest's registers (`ir`'s decision 4), so the slot's
+///    value is not the same on both sides of one.
+/// 4. **Never at all when an earlier boundary binds the same slot.** Reading a
+///    slot some boundary's [`InsnStart::live`] mapping names is what makes a
+///    backend *publish*, and a publish at an earlier boundary writes an
+///    earlier mapping. That is a different sequence of writes to guest state
+///    even where it ends in the same place, so the read stays where the
+///    frontend put it. A frontend that keeps the mapping invariant never emits
+///    such a read anyway — it has the temporary — which is why this rule costs
+///    nothing and is checked rather than assumed.
+/// 5. **Everything else is crossable, and crossing it is the point.** A
+///    boundary that binds other slots, a charge, and every arithmetic
+///    instruction: none of them can be observed by a slot read and none of them
+///    reads its result.
+///
+/// The relative order of two hoisted reads is their original one, and every
+/// choice is made from instruction indices, so the same block always produces
+/// the same block (`ROADMAP.md` §0).
+///
+/// Returns a new block; the input is untouched. Temporary numbering and the
+/// boundary records survive unchanged, and the result passes
+/// [`verify`](crate::ir::verify) whenever the input did.
+#[must_use]
+pub fn hoist_slot_reads(block: &Block) -> Block {
+    let insts = block.insts();
+    let n = insts.len();
+
+    // Which instructions a branch can land on. Rule 1.
+    let mut targeted = vec![false; n];
+    for inst in insts {
+        if inst.op == Opcode::BRCOND
+            && let Some(slot) = targeted.get_mut(inst.aux as usize)
+        {
+            *slot = true;
+        }
+    }
+
+    // The slots some boundary has already bound, in first-bound order. Rule 4.
+    // A flat `Vec` rather than a set: a block binds a handful of slots, and a
+    // linear scan over a handful beats a hash nobody may iterate anyway
+    // (`ROADMAP.md` §0 — no hashed order in anything that decides guest-visible
+    // state, and where a slot read happens decides it).
+    let mut bound: Vec<RegSlot> = Vec::new();
+
+    // `(where it lands, where it came from)` for every read that moves.
+    //
+    // One flat vector rather than a bucket per instruction, and it needs no
+    // sort: the floor only ever moves forward and the scan only ever moves
+    // forward, so the pairs come out already ordered by `(lands, came from)`,
+    // which is exactly the order they have to be emitted in. It is also *not*
+    // expressible as a sort key over the instructions, because the answer has
+    // to be stable under a second run — a read already sitting at its landing
+    // point must be left there, and a key that cannot tell "at the floor" from
+    // "hoisted to the floor" swaps two of them every time the pass runs again.
+    let mut hoists: Vec<(u32, u32)> = Vec::new();
+    let mut hoisted = vec![false; n];
+    // The lowest index nothing may move above: one past the last barrier.
+    let mut floor = 0usize;
+    let mut moved = false;
+
+    for (i, inst) in insts.iter().enumerate() {
+        if targeted[i]
+            || inst.op == Opcode::BRCOND
+            || inst.op == Opcode::CALL_HELPER
+            || inst.op.is_terminator()
+        {
+            floor = i + 1;
+        }
+        if inst.op == Opcode::INSN_START {
+            if let Some(mark) = block.marks().get(inst.aux as usize) {
+                for (slot, _) in &mark.live {
+                    if !bound.contains(slot) {
+                        bound.push(*slot);
+                    }
+                }
+            }
+            continue;
+        }
+        if inst.op != Opcode::GET_SLOT {
+            continue;
+        }
+        // `aux` is the slot, and a verified block takes it from nowhere else.
+        let slot = RegSlot(inst.aux as u16);
+        if targeted[i] || bound.contains(&slot) {
+            continue;
+        }
+        if i <= floor {
+            // Already where it would be moved to. Nothing to do, and the next
+            // read to arrive belongs *after* it rather than in front of it —
+            // which is the whole of what makes a second pass a no-op.
+            floor = i + 1;
+            continue;
+        }
+        hoists.push((floor as u32, i as u32));
+        hoisted[i] = true;
+        moved = true;
+    }
+
+    if !moved {
+        return block.clone();
+    }
+
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut next = 0usize;
+    for (i, &moved_here) in hoisted.iter().enumerate() {
+        while let Some(&(lands, from)) = hoists.get(next)
+            && lands as usize == i
+        {
+            order.push(from as usize);
+            next += 1;
+        }
+        if !moved_here {
+            order.push(i);
+        }
+    }
+    block.reorder(&order)
 }
 
 #[cfg(test)]
@@ -570,5 +777,330 @@ mod tests {
                 "{temp} is still assigned and still dead:\n{out}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hoisting slot reads
+    // -----------------------------------------------------------------------
+
+    const X0: RegSlot = RegSlot(0);
+    const X1: RegSlot = RegSlot(1);
+    const X2: RegSlot = RegSlot(2);
+
+    /// Where the slot reads ended up, as `(instruction index, slot)`.
+    fn slot_reads(block: &Block) -> Vec<(usize, u32)> {
+        block
+            .insts()
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.op == Opcode::GET_SLOT)
+            .map(|(n, i)| (n, i.aux))
+            .collect()
+    }
+
+    /// Everything a block can be observed to do, in order.
+    ///
+    /// The oracle a reordering has to leave alone: the outcome, the guest
+    /// state, the ticks, and the exact sequence of host calls. Anything a
+    /// backend can see is in here; anything else is not observable.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Trace {
+        state: Vec<(RegSlot, u128)>,
+        ticks: u64,
+        log: Vec<alloc::string::String>,
+    }
+
+    impl Trace {
+        fn new(slots: &[(RegSlot, u64)]) -> Trace {
+            Trace {
+                state: slots.iter().map(|&(s, v)| (s, u128::from(v))).collect(),
+                ticks: 0,
+                log: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::ir::IrHost for Trace {
+        fn read_slot(&mut self, slot: RegSlot) -> u128 {
+            let v = self
+                .state
+                .iter()
+                .find(|(s, _)| *s == slot)
+                .map_or(0, |(_, v)| *v);
+            self.log.push(alloc::format!("read {} = {v}", slot.0));
+            v
+        }
+        fn write_slot(&mut self, slot: RegSlot, value: u128) {
+            self.log.push(alloc::format!("write {} = {value}", slot.0));
+            match self.state.iter_mut().find(|(s, _)| *s == slot) {
+                Some(entry) => entry.1 = value,
+                None => self.state.push((slot, value)),
+            }
+        }
+        fn charge(&mut self, ticks: u64) {
+            self.log.push(alloc::format!("charge {ticks}"));
+            self.ticks += ticks;
+        }
+        fn insn_start(&mut self, mark: &InsnStart) {
+            self.log.push(alloc::format!("boundary {:#x}", mark.pc));
+        }
+        // No block here touches memory: the pass moves slot reads, and a slot
+        // read is not an access. A block that did would be a different test.
+        fn load(&mut self, _mem: &MemOp, _addr: u64) -> crate::core::space::MemResult<u64> {
+            crate::core::space::MemResult::Ok(0)
+        }
+        fn store(
+            &mut self,
+            _mem: &MemOp,
+            _addr: u64,
+            _value: u64,
+        ) -> crate::core::space::MemResult {
+            crate::core::space::MemResult::Ok(())
+        }
+    }
+
+    /// The log with the slot reads taken out: everything the guest can tell
+    /// apart, in order.
+    fn effects(t: &Trace) -> Vec<&str> {
+        t.log
+            .iter()
+            .map(alloc::string::String::as_str)
+            .filter(|line| !line.starts_with("read "))
+            .collect()
+    }
+
+    /// The slot reads and what they returned, in order.
+    fn reads(t: &Trace) -> Vec<&str> {
+        t.log
+            .iter()
+            .map(alloc::string::String::as_str)
+            .filter(|line| line.starts_with("read "))
+            .collect()
+    }
+
+    fn observe(block: &Block, slots: &[(RegSlot, u64)]) -> (crate::ir::Outcome, Trace) {
+        let mut host = Trace::new(slots);
+        let out = crate::ir::Interp::new()
+            .run(block, &mut host)
+            .expect("the block runs");
+        (out, host)
+    }
+
+    /// Two guest instructions, each reading a register for the first time.
+    ///
+    /// The shape every frontend in this tree emits and the one the pass exists
+    /// for: `insn_start`, `charge`, `get_slot`, arithmetic, repeat. Neither
+    /// slot is bound by an earlier boundary, so both reads may travel.
+    fn two_reads() -> Block {
+        let mut b = BlockBuilder::new(0x1000, 0);
+        b.insn_start(mark(0x1000, 0, &[]));
+        b.charge(1);
+        let x0 = b.get_slot(Type::I64, X0);
+        let one = b.imm(Type::I64, Const::Int(1));
+        let sum = b.binary(Opcode::ADD, Type::I64, x0, one);
+
+        b.insn_start(mark(0x1002, 1, &[(X2, sum)]));
+        b.charge(1);
+        let x1 = b.get_slot(Type::I64, X1);
+        let both = b.binary(Opcode::ADD, Type::I64, sum, x1);
+
+        b.insn_start(mark(0x1004, 2, &[(X2, both)]));
+        b.exit_tb();
+        b.finish()
+    }
+
+    #[test]
+    fn a_slot_read_travels_to_the_top_of_the_block() {
+        let block = two_reads();
+        verify(&block).expect("the input block is well formed");
+        assert_eq!(slot_reads(&block), vec![(2, 0), (7, 1)]);
+
+        let out = hoist_slot_reads(&block);
+        verify(&out).expect("hoisting must not break the block");
+
+        // Both reads are now ahead of the block's first boundary, so a backend
+        // that defers its bookkeeping has nothing at all to replay before
+        // either of them — which is the whole saving.
+        assert_eq!(slot_reads(&out), vec![(0, 0), (1, 1)], "{out}");
+        assert_eq!(out.insts().len(), block.insts().len());
+    }
+
+    #[test]
+    fn hoisting_changes_nothing_the_interpreter_can_see() {
+        let slots = [(X0, 7), (X1, 30)];
+        let (want_out, want) = observe(&two_reads(), &slots);
+        let (got_out, got) = observe(&hoist_slot_reads(&two_reads()), &slots);
+        assert_eq!(want_out, got_out);
+        assert_eq!(want.state, got.state, "the guest's registers differ");
+        assert_eq!(want.ticks, got.ticks, "the tick count differs");
+        // Not merely the same end state: the same sequence of everything the
+        // guest can tell apart, which is the claim `ROADMAP.md` §0 makes about
+        // two engines and the one a reordering is most likely to break. The
+        // slot *reads* are what moved and are therefore filtered out of the
+        // sequence — and checked separately, because moving one that returned
+        // a different value is exactly the defect this pass could have.
+        assert_eq!(
+            effects(&want),
+            effects(&got),
+            "the host saw a different sequence"
+        );
+        assert_eq!(
+            reads(&want),
+            reads(&got),
+            "a moved read returned something else"
+        );
+    }
+
+    #[test]
+    fn a_read_of_a_slot_an_earlier_boundary_binds_stays_put() {
+        // Rule 4. `X0` is bound by the first boundary, so reading it is what
+        // makes a backend publish, and a read moved above that boundary would
+        // publish a different mapping.
+        let mut b = BlockBuilder::new(0x1000, 0);
+        let seed = b.imm(Type::I64, Const::Int(9));
+        b.insn_start(mark(0x1000, 0, &[(X0, seed)]));
+        b.charge(1);
+        let again = b.get_slot(Type::I64, X0);
+        b.insn_start(mark(0x1002, 1, &[(X0, again)]));
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+
+        let out = hoist_slot_reads(&block);
+        assert_eq!(slot_reads(&out), slot_reads(&block), "{out}");
+    }
+
+    #[test]
+    fn a_read_below_a_branch_stays_below_it() {
+        // Rules 1 and 2 together, in the shape a superblock's side exit has: a
+        // `brcond` that jumps over an inline exit sequence, and a read after
+        // the target. Above the branch it would run on a path that was leaving
+        // the block; above the target it would leave the taken path reading a
+        // temporary nothing assigned.
+        let mut b = BlockBuilder::new(0x1000, 0);
+        b.insn_start(mark(0x1000, 0, &[]));
+        b.charge(1);
+        let cond = b.imm(Type::I1, Const::Int(1));
+        let branch = b.emit_raw(
+            Opcode::BRCOND,
+            Type::I64,
+            None,
+            None,
+            &[cond],
+            None,
+            None,
+            0,
+        );
+        b.exit_tb();
+        let target = b.next_index();
+        b.patch_aux(branch, target as u32);
+        let x1 = b.get_slot(Type::I64, X1);
+        b.insn_start(mark(0x1002, 1, &[(X2, x1)]));
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+
+        let out = hoist_slot_reads(&block);
+        verify(&out).expect("hoisting must not break the block");
+        assert_eq!(slot_reads(&out), slot_reads(&block), "{out}");
+    }
+
+    #[test]
+    fn a_read_after_a_branch_target_hoists_only_as_far_as_the_target() {
+        // The same block with a guest instruction after the target, so there
+        // *is* somewhere legal to go: the read may join the region the target
+        // opened, and no further.
+        let mut b = BlockBuilder::new(0x1000, 0);
+        b.insn_start(mark(0x1000, 0, &[]));
+        b.charge(1);
+        let cond = b.imm(Type::I1, Const::Int(1));
+        let branch = b.emit_raw(
+            Opcode::BRCOND,
+            Type::I64,
+            None,
+            None,
+            &[cond],
+            None,
+            None,
+            0,
+        );
+        b.exit_tb();
+        let target = b.next_index();
+        b.patch_aux(branch, target as u32);
+        b.insn_start(mark(0x1002, 1, &[]));
+        b.charge(1);
+        let x1 = b.get_slot(Type::I64, X1);
+        b.insn_start(mark(0x1004, 2, &[(X2, x1)]));
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+
+        let out = hoist_slot_reads(&block);
+        verify(&out).expect("hoisting must not break the block");
+        // One past the target: the target instruction is a landing site
+        // nothing may move above (rule 1), so the read joins the region it
+        // opened rather than displacing it, and the charge below it is what
+        // the read no longer has to wait for.
+        assert_eq!(slot_reads(&out), vec![(target + 1, 1)], "{out}");
+        // And the branch still names the instruction it used to.
+        let landed = out.insts()[branch].aux as usize;
+        assert_eq!(landed, target, "the branch was repointed wrongly:\n{out}");
+        assert_eq!(out.insts()[landed].op, Opcode::INSN_START, "{out}");
+    }
+
+    #[test]
+    fn a_read_below_a_helper_call_stays_below_it() {
+        // Rule 3: a helper may write the guest's registers, so the value on
+        // the two sides of one is not the same value.
+        let mut b = BlockBuilder::new(0x1000, 0);
+        b.insn_start(mark(0x1000, 0, &[]));
+        b.charge(1);
+        b.emit_raw(
+            Opcode::CALL_HELPER,
+            Type::I64,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            0,
+        );
+        let x1 = b.get_slot(Type::I64, X1);
+        b.insn_start(mark(0x1002, 1, &[(X2, x1)]));
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+
+        let out = hoist_slot_reads(&block);
+        assert_eq!(slot_reads(&out), slot_reads(&block), "{out}");
+    }
+
+    #[test]
+    fn a_block_with_nothing_to_hoist_is_returned_unchanged() {
+        let block = parity_block(false);
+        assert_eq!(hoist_slot_reads(&block), block);
+    }
+
+    #[test]
+    fn hoisting_is_idempotent_and_deterministic() {
+        let once = hoist_slot_reads(&two_reads());
+        let twice = hoist_slot_reads(&once);
+        assert_eq!(once, twice, "a second pass moved something");
+        assert_eq!(once, hoist_slot_reads(&two_reads()), "not deterministic");
+    }
+
+    #[test]
+    fn hoisting_composes_with_dead_code_elimination_either_way_round() {
+        // The two passes are independent — one drops instructions and repoints
+        // branches, the other moves them and repoints branches — and a
+        // frontend may run them in either order. They must agree, or the block
+        // a backend sees depends on a pipeline order nothing writes down.
+        let block = two_reads();
+        let a = eliminate_dead_code(&hoist_slot_reads(&block));
+        let b = hoist_slot_reads(&eliminate_dead_code(&block));
+        verify(&a).expect("well formed");
+        verify(&b).expect("well formed");
+        let slots = [(X0, 7), (X1, 30)];
+        assert_eq!(observe(&a, &slots).1, observe(&b, &slots).1);
     }
 }

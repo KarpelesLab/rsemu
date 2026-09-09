@@ -1817,7 +1817,13 @@ impl<'a> Lifter<'a> {
             live,
         });
         self.b.exit_tb();
-        self.b.finish()
+        // The one pass this frontend runs, and it is here rather than in the
+        // dispatcher because a block is a frontend's output and the shape it
+        // fixes is this frontend's own: `insn_start`, `charge`, `get_slot`,
+        // arithmetic, once per guest instruction, which puts a bookkeeping
+        // replay point one instruction after every boundary. `ir::pass`'s
+        // `hoist_slot_reads` documents what it costs and what it may not do.
+        crate::ir::hoist_slot_reads(&self.b.finish())
     }
 
     /// The misalignment policy a memory op carries.
