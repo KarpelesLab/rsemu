@@ -23,7 +23,7 @@
 //! | `a_synthetic_x86_workload_agrees_across_the_engines` | none | ~1.4 s | every `cargo test` |
 //! | `a_real_arm64_linux_boot_agrees_across_the_engines` | an `Image` | minutes | `--ignored`, nightly |
 //! | `a_real_x86_linux_boot_agrees_across_the_engines` | a `bzImage` | minutes | `--ignored`, nightly |
-//! | `the_clint_advances_while_the_hart_is_running` | none | milliseconds | `--ignored`; **it fails on `master`** — see its doc comment |
+//! | `the_clint_advances_while_the_hart_is_running` | none | milliseconds | `--ignored`; **half fixed** — see its doc comment |
 //!
 //! `RSEMU_LONGRUN_SECONDS` lengthens the synthetic runs; the default is sized
 //! so an ordinary `cargo test` does not notice them. `RSEMU_LONGRUN_ENGINES`
@@ -98,8 +98,11 @@
 //! comparator — written seam by seam off `cpu::riscv::engine` the way the x86
 //! synthetic is written off `cpu::x86::engine`. Writing it turned up something
 //! the engine's documentation assumes and this board does not provide, which
-//! is `riscv::the_clint_advances_while_the_hart_is_running` and is filed
-//! `#[ignore]`d rather than fixed.
+//! is `riscv::the_clint_advances_while_the_hart_is_running`. It had two
+//! causes; the hart now publishes its position, which is one of them, and the
+//! test stays `#[ignore]`d on the other — the CLINT sits on a second crystal
+//! and `Scheduler::arm_live_cursors` arms nothing across two oscillator
+//! trees. Its doc comment carries both and what closing the second takes.
 
 #![cfg(all(feature = "jit", feature = "std"))]
 
@@ -1299,17 +1302,44 @@ mod riscv {
     /// round's worth of execution spans about **a hundred** distinct `mtime`
     /// values. Eight quanta should therefore find several hundred.
     ///
-    /// # What it does find: eight. One per quantum.
+    /// # What it does find: seven. One per quantum.
     ///
+    /// There are **two** causes and the fix needs both. One is fixed; the
+    /// other is a change to `src/core/sched.rs`.
+    ///
+    /// **Cause 1 — the hart published nothing. Fixed.**
     /// `Scheduler::arm_live_cursors` builds each lazy device's live view on
     /// the running runnable's [`TickCursor`], and a catch-up reads the
-    /// runnable's own tick counter out of it. `Hart::attach_cursor` keeps only
-    /// the cursor's **exit flag** and drops the position half, saying so in as
-    /// many words: *"this hart does not publish its own position — nothing on
-    /// a RISC-V board here is sampled inside an instruction the way a PPU
-    /// is"*. So the counter never moves while the hart runs, every `sync`
-    /// during a round catches the CLINT up to where the round **began**, and
-    /// `mtime` advances only in `close_round`.
+    /// runnable's own tick counter out of it. `Hart::attach_cursor` used to
+    /// keep the cursor's **exit flag** and drop the position half, saying so
+    /// in as many words. It keeps both now, and `Exec::publish_position`
+    /// publishes `State::cycles` immediately before every access that leaves
+    /// for the address space — which is the one publication point every
+    /// engine reaches identically, since the compiled fast path covers plain
+    /// RAM and nothing else. `cpu::riscv::tests::
+    /// a_running_hart_publishes_its_position_to_the_devices_it_reads` is that
+    /// half's own gate and does not need a board.
+    ///
+    /// **Cause 2 — the CLINT is on another crystal. Not fixed here.**
+    /// `machines/riscv-virt.machine` hangs `mtime` off `osc rtc`, a separate
+    /// oscillator tree from `osc core`, and `arm_live_cursors` arms a live
+    /// view only across slots that share a root — so the CLINT's slot is
+    /// skipped whatever the hart publishes. Instrumented on this very test:
+    /// one lazy slot, on `OscillatorId(1)`, skipped in all sixteen arm calls
+    /// of an eight-quantum run, once for the hart on `OscillatorId(0)` and
+    /// once for the 16550 on `OscillatorId(2)`.
+    ///
+    /// Closing it means giving `Live` a **cross-tree** ratio, which is what
+    /// `ROADMAP.md` §4.2 already prescribes for two independent crystals —
+    /// "reciprocal multiply + a per-root residual accumulator", error bounded
+    /// below one tick and non-accumulating because the base is re-anchored
+    /// from the forest every round. It is emphatically *not* "routing an
+    /// intra-tree relationship through absolute time": the intra-tree path
+    /// stays exactly as exact as it is. With that change applied locally this
+    /// test passes and reports **800** distinct values over eight quanta —
+    /// exactly the hundred a round predicts — and
+    /// `riscv_virt_engines::every_engine_hashes_to_the_same_machine_at_every_checkpoint`
+    /// stays green.
     ///
     /// # Why it matters here rather than only as a clock-resolution nit
     ///
@@ -1331,12 +1361,13 @@ mod riscv {
     /// on a shipped RISC-V board can reach it. That is worth knowing before
     /// somebody deletes `IrHost::load`'s hand-back as dead code.
     ///
-    /// The fix is not in this file's territory and is not obviously small: it
-    /// means giving the hart a live position to publish, which is a change to
-    /// how `Hart::run_budget` and `engine::advance` account ticks, and it has
-    /// a cost on the hot path. Filed rather than attempted.
+    /// Still `#[ignore]`d, because half the fix is in a file this round did
+    /// not own. Cause 1 is committed and cause 2 is specified; the assertion
+    /// below is written against the fixed behaviour rather than against the
+    /// bug, so it turns green on the commit that lands the other half and
+    /// needs no edit here.
     #[test]
-    #[ignore = "fails on master: riscv-virt's CLINT does not advance within a quantum — see the doc comment"]
+    #[ignore = "cause 2 is unfixed: riscv-virt's CLINT is on another oscillator tree, so `Scheduler::arm_live_cursors` never arms it — see the doc comment"]
     fn the_clint_advances_while_the_hart_is_running() {
         /// `mtime` in a tight loop, counting distinct values into `t2`.
         ///
@@ -1370,12 +1401,19 @@ mod riscv {
         }
         // x7 is t2.
         let seen = hart.x(7);
+        // A round is 10 000 ticks of a 1 GHz domain and `mtime` counts at
+        // 10 MHz, so a hundred `mtime` values fall inside one — and the probe
+        // loop is four instructions, far finer than the hundred core ticks
+        // between two of them, so it sees essentially all of them. Half that
+        // is the floor: it is an order of magnitude above the one-per-quantum
+        // the bug produces, and well below what a correct catch-up gives.
+        let want = QUANTA * 50;
         assert!(
-            seen > QUANTA,
+            seen >= want,
             "the guest read `mtime` for {QUANTA} quanta and saw {seen} distinct \
-             value(s) — one per quantum, so the CLINT is not being caught up to \
-             the hart's live position and `mtip` can never rise inside a block. \
-             See this test's doc comment for the diagnosis."
+             value(s), wanted at least {want} — so the CLINT is not being \
+             caught up to the hart's live position and `mtip` can never rise \
+             inside a block. See this test's doc comment for the diagnosis."
         );
     }
 

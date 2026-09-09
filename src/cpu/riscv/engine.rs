@@ -284,6 +284,7 @@ use alloc::vec;
 
 use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitMask};
+use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
 use crate::core::value::Width;
 use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, verify};
@@ -738,10 +739,11 @@ pub(super) fn advance(
     lines: &Lines,
     exits: ExitMask,
     monitor: Option<&MonitorSlot>,
+    cursor: Option<&TickCursor>,
     remaining: u64,
 ) -> (u64, Option<Exit>) {
     let Jit { disp, unlifted } = jit;
-    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor);
+    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor).with_cursor(cursor);
     let pc = exec.st.pc;
 
     // The entry work for the *first* block, done here rather than through
@@ -2251,6 +2253,7 @@ mod tests {
                 cfg,
                 lines,
                 ExitMask::NONE,
+                None,
                 None,
                 budget,
             )

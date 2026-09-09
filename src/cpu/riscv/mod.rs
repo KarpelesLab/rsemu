@@ -390,6 +390,15 @@ struct Session {
     /// state, so it lives here beside `space` instead of in `state`: `reset`
     /// replaces `state`, and a reset must not unplug the clock.
     time_src: Option<Arc<AtomicU64>>,
+    /// Where this hart publishes how far into its quantum it has got, so that
+    /// a lazily advanced device reached from an access sees the instant the
+    /// access happens rather than the instant the round began.
+    ///
+    /// Wiring, like `time_src` and for the same reason. Held inside the
+    /// session rather than beside it so that reaching it costs no second lock
+    /// on the step path: every route that builds an [`Exec`] already holds
+    /// this one. See [`Hart::attach_cursor`].
+    cursor: Option<TickCursor>,
     /// The translation runtime, on a hart configured for it.
     ///
     /// Built on the first run rather than in `new`, because `new` performs no
@@ -483,6 +492,7 @@ impl Hart {
                     space: None,
                     monitor: None,
                     time_src: None,
+                    cursor: None,
                     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
                     jit: None,
                 },
@@ -869,6 +879,7 @@ impl Hart {
             space,
             monitor,
             time_src,
+            cursor,
             ..
         } = &mut *session;
         if let Some(timer) = time_src {
@@ -887,7 +898,8 @@ impl Hart {
             &self.lines,
             exits,
             monitor.as_ref(),
-        );
+        )
+        .with_cursor(cursor.as_ref());
         let used = exec.step();
         (used, exec.take_exit())
     }
@@ -935,6 +947,7 @@ impl Hart {
                 space,
                 monitor,
                 time_src,
+                cursor,
                 jit,
             } = &mut *session;
             if let Some(timer) = time_src {
@@ -953,6 +966,7 @@ impl Hart {
                 &self.lines,
                 exits,
                 monitor.as_ref(),
+                cursor.as_ref(),
                 remaining,
             );
         }
@@ -989,6 +1003,30 @@ impl Hart {
     /// budget — which keeps the hart's access count and the domain's tick
     /// count in step over any number of quanta while never letting a single
     /// one overrun.
+    ///
+    /// # It also re-samples the platform timer as it returns
+    ///
+    /// `csrs.mtime` is a cache of the CLINT's `mtime` cell, refreshed at the
+    /// start of every `Hart::advance` so that a `rdtime` reads a
+    /// current value. That much is engine-independent on its own: a CSR access
+    /// is outside the lifted subset, so it gets an `advance` of its own under
+    /// every engine.
+    ///
+    /// It is not enough for the *snapshot*, and it stops being enough the
+    /// moment `mtime` can move inside a scheduler round. The cache would then
+    /// hold the cell as of the last instruction under `interp` and as of the
+    /// start of the last **block** under either JIT — one guest state, two
+    /// hashes, which `ROADMAP.md` §0 forbids. So the budget takes one more
+    /// sample as it returns. All three engines finish a budget on the same
+    /// guest instruction, which is what `engine`'s `Host::spent` exists for,
+    /// so that sample is the same number on all three — and it is taken once
+    /// per round rather than once per instruction, which is why it is here
+    /// rather than beside the other one.
+    ///
+    /// It is a no-op on every board in this tree today, where `mtime` moves
+    /// only at round close and both ends of a budget read the same number. It
+    /// is written now because the change that lets `mtime` move inside a round
+    /// would otherwise land as a state-hash divergence with no obvious cause.
     pub fn run_budget(&self, ticks: u64) -> u64 {
         let owed = self.session.lock().state.debt;
         if owed >= ticks {
@@ -1013,23 +1051,48 @@ impl Hart {
                 break;
             }
         }
+        let mut session = self.session.lock();
+        if let Some(timer) = &session.time_src {
+            // The platform-timer cache, brought level one last time — see this
+            // method's documentation for why the per-`advance` sample is not
+            // enough for the snapshot.
+            let now = timer.load(Ordering::Relaxed);
+            session.state.csrs.mtime = now;
+        }
         if used >= allowance {
-            self.session.lock().state.debt = used - allowance;
+            session.state.debt = used - allowance;
             ticks
         } else {
-            self.session.lock().state.debt = 0;
+            session.state.debt = 0;
             owed + used
         }
     }
 
-    /// Take the safe point's exit flag out of the cursor the machine layer
-    /// hands every runnable device.
+    /// Keep the cursor the machine layer hands every runnable device: **both**
+    /// halves of it.
     ///
-    /// This hart does not publish its own position — nothing on a RISC-V board
-    /// here is sampled inside an instruction the way a PPU is — so the cursor's
-    /// *other* half is dropped and only the flag is kept.
+    /// The safe point's exit flag is cached beside the session so
+    /// [`run_budget`](Hart::run_budget) can test it between blocks without
+    /// taking a lock. The *position* half goes into the session, where
+    /// `exec::Exec::publish_position` publishes this hart's bus-access counter
+    /// to it as the hart runs.
+    ///
+    /// # Why the position half is not optional
+    ///
+    /// It used to be dropped, on the argument that "nothing on a RISC-V board
+    /// is sampled inside an instruction the way a PPU is". The CLINT is: it is
+    /// a lazily advanced device, `Registers::read` catches it up before
+    /// answering, and what it catches up *to* is whatever the running
+    /// runnable last published. With nothing published, every `mtime` a guest
+    /// reads inside a round is the value the round opened with — `mtime`
+    /// quantised to the scheduler's grid — and a comparator can only be
+    /// crossed at a round boundary, which makes `engine`'s `mtip`-inside-a-
+    /// block seam unreachable from any guest.
+    /// `engine_longrun`'s `the_clint_advances_while_the_hart_is_running` is
+    /// the reproduction.
     pub fn attach_cursor(&self, cursor: &TickCursor) {
         *self.exit.lock() = Some(cursor.exit_flag());
+        self.session.lock().cursor = Some(cursor.clone());
     }
 
     /// Accesses owed to the next budget — see [`run_budget`](Hart::run_budget).
