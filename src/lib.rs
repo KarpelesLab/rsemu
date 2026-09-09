@@ -234,6 +234,9 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "jit-x86") {
         features.push("jit-x86");
     }
+    if cfg!(feature = "jit-arm64") {
+        features.push("jit-arm64");
+    }
     if cfg!(feature = "ir") {
         features.push("ir");
     }

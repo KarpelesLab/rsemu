@@ -1,0 +1,1240 @@
+//! A small A64 assembler: the instructions this backend actually emits.
+//!
+//! Safe Rust that appends 32-bit little-endian words to a `Vec<u8>`. Nothing
+//! here maps, protects or executes anything — that is `jit::arm64::buf` — so
+//! a mistake in this file is a wrong instruction rather than an unsound one,
+//! which is why the two are separate. It is also why this file is **not**
+//! `cfg`-gated to an aarch64 host: an encoder is arithmetic on integers, it
+//! runs and is tested anywhere, and the whole of what needs a real A64 machine
+//! is executing what it produced.
+//!
+//! # Scope
+//!
+//! Deliberately not a general assembler. The encodings below are the ones this
+//! backend emits — `compile`'s lowerings and
+//! `buf`'s cache maintenance — and no others, and each is derived
+//! from the *Arm Architecture Reference Manual for A-profile architecture*,
+//! **DDI 0487**, section C6.2's alphabetical instruction descriptions plus
+//! C4.1's encoding tables — the manual that describes the hardware rather than
+//! anybody's implementation of it (CLAUDE.md, "Provenance"). Each method names
+//! its instruction; the field layout in the comment is the manual's.
+//!
+//! Nothing outside the mandatory A64 base is used: no FEAT_LSE atomics, no
+//! SIMD (so no `CNT` for population count — that op is refused rather than
+//! open-coded), no pointer authentication. A code generator that faulted with
+//! `SIGILL` on someone's board would be worse than one that emits four more
+//! instructions or refuses four more opcodes.
+//!
+//! # Why this is so much smaller than `jit::x86::emit`
+//!
+//! A64 is fixed-width: every instruction is exactly four bytes, little-endian
+//! whatever the data endianness, and there is no prefix, no ModRM, no SIB and
+//! no variable-length immediate (DDI 0487 §A1.3, *Instruction set overview*).
+//! An encoder is therefore a base word OR-ed with shifted register numbers,
+//! and a branch fixup is a bitfield rather than a four-byte hole. What A64
+//! spends instead is *instructions*: a 64-bit constant is up to four `MOVZ`/
+//! `MOVK` (one, where `MOVN` covers it), and a load's offset must be a scaled
+//! 12-bit immediate rather than any displacement at all. Both costs are visible in
+//! `compile`, and neither is hidden here.
+//!
+//! # Addressing
+//!
+//! One memory form: `[base, #offset]` with the unsigned scaled 12-bit
+//! immediate (DDI 0487 C6.2, *LDR (immediate)*, unsigned offset variant). The
+//! offset must be a multiple of the access size and at most `4095 * size`, so
+//! every caller passes a byte offset and this checks the scaling. Every
+//! operand this backend touches is a field of the execution context, a slot in
+//! the temporary frame or the base of a TLB entry, and all three are naturally
+//! aligned.
+
+use alloc::vec::Vec;
+
+/// A general-purpose register, by its architectural number.
+///
+/// The number *is* the encoding: `Reg(n).0` goes straight into an `Rd`, `Rn`,
+/// `Rm` or `Rt` field. Register 31 is the special case A64 leaves to the
+/// instruction — the zero register in most encodings and the stack pointer in
+/// a few — so it has both names and the caller picks the one the instruction
+/// means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reg(pub u8);
+
+#[allow(dead_code)]
+impl Reg {
+    /// First argument and result register (AAPCS64).
+    pub const X0: Reg = Reg(0);
+    /// Second argument register.
+    pub const X1: Reg = Reg(1);
+    /// Third argument register.
+    pub const X2: Reg = Reg(2);
+    /// Fourth argument register.
+    pub const X3: Reg = Reg(3);
+    /// Volatile; allocatable.
+    pub const X4: Reg = Reg(4);
+    /// Volatile; allocatable.
+    pub const X5: Reg = Reg(5);
+    /// Volatile; allocatable.
+    pub const X6: Reg = Reg(6);
+    /// Volatile; allocatable.
+    pub const X7: Reg = Reg(7);
+    /// First fixed scratch — this backend's accumulator.
+    pub const X9: Reg = Reg(9);
+    /// Second fixed scratch.
+    pub const X10: Reg = Reg(10);
+    /// Third fixed scratch.
+    pub const X11: Reg = Reg(11);
+    /// Fourth fixed scratch.
+    pub const X12: Reg = Reg(12);
+    /// Volatile; allocatable.
+    pub const X13: Reg = Reg(13);
+    /// Volatile; allocatable.
+    pub const X14: Reg = Reg(14);
+    /// Volatile; allocatable.
+    pub const X15: Reg = Reg(15);
+    /// IP0, the intra-procedure-call scratch a `BLR` target is loaded into.
+    pub const X16: Reg = Reg(16);
+    /// The execution context pointer, callee-saved.
+    pub const X19: Reg = Reg(19);
+    /// The temporary frame's base, callee-saved.
+    pub const X20: Reg = Reg(20);
+    /// The thunk table's base, callee-saved.
+    pub const X21: Reg = Reg(21);
+    /// Callee-saved; allocatable.
+    pub const X22: Reg = Reg(22);
+    /// Callee-saved; allocatable.
+    pub const X23: Reg = Reg(23);
+    /// Callee-saved; allocatable.
+    pub const X24: Reg = Reg(24);
+    /// Callee-saved; allocatable.
+    pub const X25: Reg = Reg(25);
+    /// Callee-saved; allocatable.
+    pub const X26: Reg = Reg(26);
+    /// Callee-saved; allocatable.
+    pub const X27: Reg = Reg(27);
+    /// Callee-saved; allocatable.
+    pub const X28: Reg = Reg(28);
+    /// The frame pointer, saved and restored but not otherwise used.
+    pub const X29: Reg = Reg(29);
+    /// The link register, which every `BLR` destroys.
+    pub const X30: Reg = Reg(30);
+    /// The zero register, in the encodings that read 31 that way.
+    pub const ZR: Reg = Reg(31);
+    /// The stack pointer, in the encodings that read 31 that way.
+    pub const SP: Reg = Reg(31);
+}
+
+/// A condition, by its four-bit encoding.
+///
+/// DDI 0487 §C1.2.4, *Condition code*: the table of `{EQ, NE, CS, CC, …}`
+/// against `NZCV`. The low bit inverts the condition, which is what
+/// [`Cond::invert`] uses and what `CSET`'s "increment on the inverse" needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(dead_code)]
+pub enum Cond {
+    /// Equal — `Z == 1`.
+    Eq = 0,
+    /// Not equal.
+    Ne = 1,
+    /// Carry set, i.e. unsigned greater than or equal (`HS`).
+    Hs = 2,
+    /// Carry clear, i.e. unsigned less than (`LO`).
+    Lo = 3,
+    /// Unsigned greater than.
+    Hi = 8,
+    /// Unsigned less than or equal.
+    Ls = 9,
+    /// Signed greater than or equal.
+    Ge = 10,
+    /// Signed less than.
+    Lt = 11,
+    /// Signed greater than.
+    Gt = 12,
+    /// Signed less than or equal.
+    Le = 13,
+}
+
+impl Cond {
+    /// The condition that holds exactly when this one does not.
+    ///
+    /// Flipping bit 0 of the encoding, which is what §C1.2.4's table means by
+    /// listing the conditions in inverting pairs. Written as a `match` anyway,
+    /// because a `Cond` is an enum and inventing a discriminant it does not
+    /// have would be undefined behaviour rather than a wrong branch.
+    #[must_use]
+    pub const fn invert(self) -> Cond {
+        match self {
+            Cond::Eq => Cond::Ne,
+            Cond::Ne => Cond::Eq,
+            Cond::Hs => Cond::Lo,
+            Cond::Lo => Cond::Hs,
+            Cond::Hi => Cond::Ls,
+            Cond::Ls => Cond::Hi,
+            Cond::Ge => Cond::Lt,
+            Cond::Lt => Cond::Ge,
+            Cond::Gt => Cond::Le,
+            Cond::Le => Cond::Gt,
+        }
+    }
+}
+
+/// Which shift or rotate a variable-amount instruction performs.
+///
+/// DDI 0487 C6.2, *LSLV*, *LSRV*, *ASRV*, *RORV*: one encoding with a two-bit
+/// `op2` field selecting between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShiftOp {
+    /// Logical left.
+    Lsl = 0,
+    /// Logical right.
+    Lsr = 1,
+    /// Arithmetic right.
+    Asr = 2,
+    /// Rotate right.
+    Ror = 3,
+}
+
+/// Which of the three-operand logical operations to encode.
+///
+/// DDI 0487 C4.1.6, *Logical (shifted register)*: `opc` selects the operation
+/// and `N` inverts the second operand, so the six this backend uses are three
+/// values of `opc` crossed with two of `N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Logic {
+    /// `AND`.
+    And,
+    /// `ORR`.
+    Orr,
+    /// `EOR`.
+    Eor,
+    /// `BIC` — `Rn AND NOT Rm`, which is the IR's `andc` in one instruction.
+    Bic,
+    /// `ORN` — `Rn OR NOT Rm`; with `Rn` the zero register this is `MVN`.
+    Orn,
+}
+
+impl Logic {
+    /// `(opc, N)` for this operation.
+    const fn parts(self) -> (u32, u32) {
+        match self {
+            Logic::And => (0, 0),
+            Logic::Bic => (0, 1),
+            Logic::Orr => (1, 0),
+            Logic::Orn => (1, 1),
+            Logic::Eor => (2, 0),
+        }
+    }
+}
+
+/// Which kind of branch a [`Fixup`] patches.
+///
+/// A64 has no one branch displacement: the four forms below carry 26, 19 and
+/// 14 bits, all measured in *instructions* from the branch itself (DDI 0487
+/// C6.2, *B*, *B.cond*, *CBZ*, *TBZ*). A fixup therefore has to remember which
+/// field it is going to fill in, which is the whole difference from x86's
+/// `rel32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// `B` — `imm26` at bit 0.
+    B26,
+    /// `B.cond`, `CBZ`, `CBNZ` — `imm19` at bit 5.
+    Imm19,
+    /// `TBZ`, `TBNZ` — `imm14` at bit 5.
+    Imm14,
+}
+
+/// Where a branch displacement was left, to be filled in later.
+///
+/// A forward branch names a place the assembler has not reached; this is the
+/// word it left behind and the field to patch. [`Asm::bind`] fills one in with
+/// the current position and [`Asm::bind_to`] with a recorded one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fixup {
+    at: usize,
+    form: Form,
+}
+
+/// The assembler.
+#[derive(Debug, Default)]
+pub struct Asm {
+    code: Vec<u8>,
+    /// Set when a displacement did not fit its field. Checked once, at
+    /// [`Asm::finish`], rather than panicking in the middle of a block:
+    /// a block too long to branch across is a `Refusal`,
+    /// and the interpreter runs it.
+    overflow: bool,
+}
+
+impl Asm {
+    /// An empty assembler.
+    #[must_use]
+    pub fn new() -> Asm {
+        Asm::default()
+    }
+
+    /// The bytes emitted so far.
+    #[inline]
+    #[must_use]
+    pub fn code(&self) -> &[u8] {
+        &self.code
+    }
+
+    /// Whether any branch displacement failed to fit its field.
+    #[inline]
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// Take the bytes.
+    #[must_use]
+    pub fn finish(self) -> Vec<u8> {
+        self.code
+    }
+
+    /// The current position in bytes, which is where the next word lands.
+    #[inline]
+    #[must_use]
+    pub fn here(&self) -> usize {
+        self.code.len()
+    }
+
+    // ---- primitives ----------------------------------------------------
+
+    /// Append one instruction word, little-endian.
+    ///
+    /// A64 instructions are little-endian in memory whatever the data
+    /// endianness the guest — or the host — is running in (DDI 0487 §A1.3).
+    #[inline]
+    fn word(&mut self, w: u32) {
+        self.code.extend_from_slice(&w.to_le_bytes());
+    }
+
+    #[inline]
+    const fn sf(bits: u32) -> u32 {
+        if bits == 64 { 1 << 31 } else { 0 }
+    }
+
+    // ---- moves ----------------------------------------------------------
+
+    /// `MOVZ Rd, #imm16, LSL #(16 * shift)` — DDI 0487 C6.2, *MOVZ*.
+    ///
+    /// `sf 10 100101 hw(2) imm16(16) Rd(5)`.
+    pub fn movz(&mut self, dst: Reg, imm: u16, shift: u32) {
+        self.word(0xd280_0000 | ((shift & 3) << 21) | (u32::from(imm) << 5) | u32::from(dst.0));
+    }
+
+    /// `MOVK Rd, #imm16, LSL #(16 * shift)` — DDI 0487 C6.2, *MOVK*.
+    ///
+    /// The same encoding with `opc = 11`: keep the other halfwords.
+    pub fn movk(&mut self, dst: Reg, imm: u16, shift: u32) {
+        self.word(0xf280_0000 | ((shift & 3) << 21) | (u32::from(imm) << 5) | u32::from(dst.0));
+    }
+
+    /// `MOVN Rd, #imm16, LSL #(16 * shift)` — DDI 0487 C6.2, *MOVN*.
+    ///
+    /// `opc = 00`: move the bitwise inverse, which is how a constant whose
+    /// high halfwords are all ones is built in one instruction instead of
+    /// four.
+    pub fn movn(&mut self, dst: Reg, imm: u16, shift: u32) {
+        self.word(0x9280_0000 | ((shift & 3) << 21) | (u32::from(imm) << 5) | u32::from(dst.0));
+    }
+
+    /// Materialize a 64-bit constant, in as few instructions as it takes.
+    ///
+    /// A64 has no load-immediate: a constant is built a halfword at a time
+    /// (DDI 0487 C6.2, *MOVZ*/*MOVK*/*MOVN*), so this emits between one and
+    /// four instructions. Halfwords equal to the fill value are skipped, which
+    /// is what makes a small constant one instruction and `!PAGE_MASK` two
+    /// rather than four.
+    ///
+    /// The `MOVN` form is chosen when it would take fewer instructions —
+    /// `MOVN` writes the inverse of its immediate and ones elsewhere, so a
+    /// constant with more `0xffff` halfwords than zero ones is cheaper that
+    /// way. Every sign-extended negative immediate a lowering emits is that
+    /// shape.
+    pub fn mov_imm(&mut self, dst: Reg, value: u64) {
+        let halves = [
+            value as u16,
+            (value >> 16) as u16,
+            (value >> 32) as u16,
+            (value >> 48) as u16,
+        ];
+        let zeros = halves.iter().filter(|h| **h == 0).count();
+        let ones = halves.iter().filter(|h| **h == 0xffff).count();
+        if ones > zeros {
+            // `MOVN` first, then `MOVK` for every halfword that is not all
+            // ones. The inverted halfword is what `MOVN` writes.
+            let mut first = true;
+            for (i, h) in halves.iter().enumerate() {
+                if *h == 0xffff {
+                    continue;
+                }
+                if first {
+                    self.movn(dst, !*h, i as u32);
+                    first = false;
+                } else {
+                    self.movk(dst, *h, i as u32);
+                }
+            }
+            if first {
+                // Every halfword was `0xffff`.
+                self.movn(dst, 0, 0);
+            }
+            return;
+        }
+        let mut first = true;
+        for (i, h) in halves.iter().enumerate() {
+            if *h == 0 {
+                continue;
+            }
+            if first {
+                self.movz(dst, *h, i as u32);
+                first = false;
+            } else {
+                self.movk(dst, *h, i as u32);
+            }
+        }
+        if first {
+            self.movz(dst, 0, 0);
+        }
+    }
+
+    /// `MOV Rd, Rn`, which is `ORR Rd, ZR, Rn` — DDI 0487 C6.2, *MOV
+    /// (register)*, whose "assembler alias" note names exactly that.
+    ///
+    /// At 32 bits it is also the canonical mask to 32 bits, because every
+    /// 32-bit A64 data-processing instruction zeroes the upper half of its
+    /// destination (§C1.2.5, *Register names*: `Wn` is the bottom 32 bits and
+    /// a write to it clears the top).
+    pub fn mov(&mut self, bits: u32, dst: Reg, src: Reg) {
+        self.logic(bits, Logic::Orr, dst, Reg::ZR, src);
+    }
+
+    // ---- arithmetic ------------------------------------------------------
+
+    /// `ADD`/`SUB`/`SUBS Rd, Rn, Rm` — DDI 0487 C4.1.5, *Add/subtract
+    /// (shifted register)*, with the shift amount zero.
+    ///
+    /// `sf op S 01011 shift(2) 0 Rm(5) imm6(6) Rn(5) Rd(5)`.
+    fn addsub(&mut self, bits: u32, op: u32, s: u32, dst: Reg, a: Reg, b: Reg) {
+        self.word(
+            Self::sf(bits)
+                | (op << 30)
+                | (s << 29)
+                | 0x0b00_0000
+                | (u32::from(b.0) << 16)
+                | (u32::from(a.0) << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// `ADD Rd, Rn, Rm`.
+    pub fn add(&mut self, bits: u32, dst: Reg, a: Reg, b: Reg) {
+        self.addsub(bits, 0, 0, dst, a, b);
+    }
+
+    /// `SUB Rd, Rn, Rm`.
+    pub fn sub(&mut self, bits: u32, dst: Reg, a: Reg, b: Reg) {
+        self.addsub(bits, 1, 0, dst, a, b);
+    }
+
+    /// `NEG Rd, Rm`, which is `SUB Rd, ZR, Rm`.
+    pub fn neg(&mut self, bits: u32, dst: Reg, src: Reg) {
+        self.addsub(bits, 1, 0, dst, Reg::ZR, src);
+    }
+
+    /// `CMP Rn, Rm`, which is `SUBS ZR, Rn, Rm` — DDI 0487 C6.2, *CMP
+    /// (shifted register)*.
+    pub fn cmp(&mut self, bits: u32, a: Reg, b: Reg) {
+        self.addsub(bits, 1, 1, Reg::ZR, a, b);
+    }
+
+    /// `ADD`/`SUB Rd, Rn, #imm12` — DDI 0487 C4.1.4, *Add/subtract
+    /// (immediate)*.
+    ///
+    /// `sf op S 100010 sh(1) imm12(12) Rn(5) Rd(5)`. `sh` shifts the immediate
+    /// left by 12, which is not used here. Register 31 is the **stack
+    /// pointer** in this encoding, which is what makes it the instruction that
+    /// opens and closes the frame.
+    ///
+    /// # Panics
+    ///
+    /// On an immediate that does not fit in twelve bits, which is a code
+    /// generator bug rather than a guest one — every caller passes a frame
+    /// size or a small constant it computed itself.
+    fn addsub_imm(&mut self, bits: u32, op: u32, s: u32, dst: Reg, a: Reg, imm: u32) {
+        assert!(imm < 4096, "an add/sub immediate is twelve bits");
+        self.word(
+            Self::sf(bits)
+                | (op << 30)
+                | (s << 29)
+                | 0x1100_0000
+                | (imm << 10)
+                | (u32::from(a.0) << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// `ADD Rd, Rn, #imm`.
+    pub fn add_imm(&mut self, bits: u32, dst: Reg, a: Reg, imm: u32) {
+        self.addsub_imm(bits, 0, 0, dst, a, imm);
+    }
+
+    /// `SUB Rd, Rn, #imm`.
+    pub fn sub_imm(&mut self, bits: u32, dst: Reg, a: Reg, imm: u32) {
+        self.addsub_imm(bits, 1, 0, dst, a, imm);
+    }
+
+    /// `CMP Rn, #imm`, which is `SUBS ZR, Rn, #imm`.
+    pub fn cmp_imm(&mut self, bits: u32, a: Reg, imm: u32) {
+        self.addsub_imm(bits, 1, 1, Reg::ZR, a, imm);
+    }
+
+    /// `MUL Rd, Rn, Rm`, which is `MADD Rd, Rn, Rm, ZR` — DDI 0487 C6.2,
+    /// *MUL*, whose alias note names exactly that.
+    ///
+    /// `sf 00 11011 000 Rm(5) 0 Ra(5) Rn(5) Rd(5)`.
+    pub fn mul(&mut self, bits: u32, dst: Reg, a: Reg, b: Reg) {
+        self.word(
+            Self::sf(bits)
+                | 0x1b00_0000
+                | (u32::from(b.0) << 16)
+                | (31 << 10)
+                | (u32::from(a.0) << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// One of the six logical operations — DDI 0487 C4.1.6, *Logical (shifted
+    /// register)*.
+    ///
+    /// `sf opc(2) 01010 shift(2) N(1) Rm(5) imm6(6) Rn(5) Rd(5)`, with the
+    /// shift amount zero.
+    pub fn logic(&mut self, bits: u32, op: Logic, dst: Reg, a: Reg, b: Reg) {
+        let (opc, n) = op.parts();
+        self.word(
+            Self::sf(bits)
+                | (opc << 29)
+                | 0x0a00_0000
+                | (n << 21)
+                | (u32::from(b.0) << 16)
+                | (u32::from(a.0) << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// `MVN Rd, Rm`, which is `ORN Rd, ZR, Rm`.
+    pub fn not(&mut self, bits: u32, dst: Reg, src: Reg) {
+        self.logic(bits, Logic::Orn, dst, Reg::ZR, src);
+    }
+
+    /// A variable shift or rotate — DDI 0487 C4.1.  *Data-processing (2
+    /// source)*: `LSLV`, `LSRV`, `ASRV`, `RORV`.
+    ///
+    /// `sf 0 0 11010110 Rm(5) 0010 op2(2) Rn(5) Rd(5)`.
+    ///
+    /// The amount is taken **modulo the datasize** by the hardware — six bits
+    /// at 64 and five at 32 (each instruction's *Operation* pseudocode does
+    /// `MOD datasize`). That is exactly the IR's rotate; it is *not* the IR's
+    /// shift, which is undefined at or past the width and whose oracle takes
+    /// the mathematical answer, so [`compile`](mod@super::compile) selects the
+    /// out-of-range result explicitly rather than accepting this for free.
+    pub fn shift(&mut self, bits: u32, op: ShiftOp, dst: Reg, a: Reg, amount: Reg) {
+        self.word(
+            Self::sf(bits)
+                | 0x1ac0_2000
+                | (u32::from(amount.0) << 16)
+                | ((op as u32) << 10)
+                | (u32::from(a.0) << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// `CLZ Rd, Rn` — DDI 0487 C6.2, *CLZ*. Counts within the register width,
+    /// so the 32-bit form answers 32 for zero and the 64-bit form 64.
+    ///
+    /// `sf 1 0 11010110 00000 00010 0 Rn(5) Rd(5)`.
+    pub fn clz(&mut self, bits: u32, dst: Reg, src: Reg) {
+        self.word(Self::sf(bits) | 0x5ac0_1000 | (u32::from(src.0) << 5) | u32::from(dst.0));
+    }
+
+    /// `RBIT Rd, Rn` — DDI 0487 C6.2, *RBIT*: reverse the bit order, which
+    /// turns a trailing-zero count into a leading-zero count.
+    pub fn rbit(&mut self, bits: u32, dst: Reg, src: Reg) {
+        self.word(Self::sf(bits) | 0x5ac0_0000 | (u32::from(src.0) << 5) | u32::from(dst.0));
+    }
+
+    /// A byte reversal — DDI 0487 C6.2, *REV*, *REV16*, *REV32*.
+    ///
+    /// `lane` is the width of the container whose bytes are reversed, in bits:
+    /// 16 is `REV16`, 32 is `REV32` at 64 bits and `REV` at 32, and 64 is
+    /// `REV`. The encodings share `sf 1 0 11010110 00000 0000 opc(2) Rn Rd`
+    /// with `opc` selecting the lane, which is why one method serves all
+    /// three — and why the IR's lane-width `bswap` needs no cascade on this
+    /// host.
+    ///
+    /// # Panics
+    ///
+    /// On a lane that is not 16, 32 or 64, or a 64-bit lane in a 32-bit
+    /// operation. `compile` checks both before calling.
+    pub fn rev(&mut self, bits: u32, lane: u32, dst: Reg, src: Reg) {
+        let opc = match (bits, lane) {
+            (_, 16) => 1,
+            (64, 32) | (32, 32) => 2,
+            (64, 64) => 3,
+            _ => panic!("a byte reversal reverses 16, 32 or 64 bits inside the register"),
+        };
+        self.word(
+            Self::sf(bits) | 0x5ac0_0000 | (opc << 10) | (u32::from(src.0) << 5) | u32::from(dst.0),
+        );
+    }
+
+    /// `CSEL Rd, Rn, Rm, cond` — DDI 0487 C6.2, *CSEL*: `Rd = cond ? Rn : Rm`.
+    ///
+    /// `sf 0 0 11010100 Rm(5) cond(4) 00 Rn(5) Rd(5)`.
+    pub fn csel(&mut self, bits: u32, dst: Reg, on_true: Reg, on_false: Reg, cond: Cond) {
+        self.word(
+            Self::sf(bits)
+                | 0x1a80_0000
+                | (u32::from(on_false.0) << 16)
+                | ((cond as u32) << 12)
+                | (u32::from(on_true.0) << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// `CSET Rd, cond`, which is `CSINC Rd, ZR, ZR, invert(cond)` — DDI 0487
+    /// C6.2, *CSET*, whose alias note names exactly that.
+    ///
+    /// The inversion is the encoding's, not a caller's mistake: `CSINC`
+    /// increments when its condition is **false**, so writing one for a true
+    /// condition means encoding the opposite.
+    pub fn cset(&mut self, bits: u32, dst: Reg, cond: Cond) {
+        self.word(
+            Self::sf(bits)
+                | 0x1a80_0400
+                | (31 << 16)
+                | ((cond.invert() as u32) << 12)
+                | (31 << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// A bitfield move — DDI 0487 C4.1.4, *Bitfield*: `SBFM`, `BFM`, `UBFM`.
+    ///
+    /// `sf opc(2) 100110 N(1) immr(6) imms(6) Rn(5) Rd(5)`, where `N` is 1 for
+    /// a 64-bit operation and 0 for a 32-bit one. `opc` is 0 for `SBFM`, 1 for
+    /// `BFM` and 2 for `UBFM`.
+    ///
+    /// Every field extraction, field insertion, zero extension and sign
+    /// extension this backend emits is one of these, which is most of why the
+    /// lowerings below are shorter than the x86 backend's.
+    fn bfm(&mut self, bits: u32, opc: u32, dst: Reg, src: Reg, immr: u32, imms: u32) {
+        let n = u32::from(bits == 64);
+        self.word(
+            Self::sf(bits)
+                | (opc << 29)
+                | 0x1300_0000
+                | (n << 22)
+                | ((immr & 63) << 16)
+                | ((imms & 63) << 10)
+                | (u32::from(src.0) << 5)
+                | u32::from(dst.0),
+        );
+    }
+
+    /// `UBFX Rd, Rn, #pos, #len` — the `UBFM` alias that extracts a field and
+    /// zero-extends it (DDI 0487 C6.2, *UBFX*).
+    pub fn ubfx(&mut self, bits: u32, dst: Reg, src: Reg, pos: u32, len: u32) {
+        self.bfm(bits, 2, dst, src, pos, pos + len - 1);
+    }
+
+    /// `SBFX Rd, Rn, #pos, #len` — the `SBFM` alias that extracts a field and
+    /// **sign**-extends it, which is how a value held zero-extended gets its
+    /// sign bit where the host expects it.
+    pub fn sbfx(&mut self, bits: u32, dst: Reg, src: Reg, pos: u32, len: u32) {
+        self.bfm(bits, 0, dst, src, pos, pos + len - 1);
+    }
+
+    /// `BFI Rd, Rn, #pos, #len` — the `BFM` alias that inserts a field and
+    /// **leaves the rest of the destination alone** (DDI 0487 C6.2, *BFI*),
+    /// which is the IR's `deposit` in one instruction.
+    pub fn bfi(&mut self, bits: u32, dst: Reg, src: Reg, pos: u32, len: u32) {
+        self.bfm(bits, 1, dst, src, (bits - pos) & (bits - 1), len - 1);
+    }
+
+    /// `LSL Rd, Rn, #amount` — the `UBFM` alias (DDI 0487 C6.2, *LSL
+    /// (immediate)*).
+    pub fn lsl_imm(&mut self, bits: u32, dst: Reg, src: Reg, amount: u32) {
+        self.bfm(
+            bits,
+            2,
+            dst,
+            src,
+            (bits - amount) & (bits - 1),
+            bits - 1 - amount,
+        );
+    }
+
+    /// `LSR Rd, Rn, #amount` — the `UBFM` alias.
+    pub fn lsr_imm(&mut self, bits: u32, dst: Reg, src: Reg, amount: u32) {
+        self.bfm(bits, 2, dst, src, amount, bits - 1);
+    }
+
+    /// `ASR Rd, Rn, #amount` — the `SBFM` alias.
+    pub fn asr_imm(&mut self, bits: u32, dst: Reg, src: Reg, amount: u32) {
+        self.bfm(bits, 0, dst, src, amount, bits - 1);
+    }
+
+    // ---- memory ---------------------------------------------------------
+
+    /// A load or store with the unsigned scaled 12-bit offset — DDI 0487
+    /// C4.1.  *Load/store register (unsigned immediate)*.
+    ///
+    /// `size(2) 111 0 01 opc(2) imm12(12) Rn(5) Rt(5)`. The immediate is
+    /// scaled by the access size, so `offset` here is a **byte** offset and
+    /// this is where the scaling is checked.
+    ///
+    /// Returns `false` when the offset is not representable — not aligned to
+    /// the access size, or past `4095 * size` — which a caller answers with a
+    /// refusal rather than a wrong address.
+    #[must_use]
+    fn ldst(&mut self, size: u32, opc: u32, rt: Reg, base: Reg, offset: u64) -> bool {
+        let scale = 1u64 << size;
+        if !offset.is_multiple_of(scale) || offset / scale > 4095 {
+            return false;
+        }
+        let imm = (offset / scale) as u32;
+        self.word(
+            (size << 30)
+                | 0x3900_0000
+                | (opc << 22)
+                | (imm << 10)
+                | (u32::from(base.0) << 5)
+                | u32::from(rt.0),
+        );
+        true
+    }
+
+    /// `LDR Rt, [Rn, #offset]`, 64-bit.
+    #[must_use]
+    pub fn ldr(&mut self, dst: Reg, base: Reg, offset: u64) -> bool {
+        self.ldst(3, 1, dst, base, offset)
+    }
+
+    /// `STR Rt, [Rn, #offset]`, 64-bit.
+    #[must_use]
+    pub fn str(&mut self, src: Reg, base: Reg, offset: u64) -> bool {
+        self.ldst(3, 0, src, base, offset)
+    }
+
+    /// A zero-extending load of `bytes` bytes.
+    ///
+    /// `LDRB`, `LDRH`, 32-bit `LDR` and 64-bit `LDR`. The first three write a
+    /// `Wt`, and every write to a `W` register clears the upper 32 bits
+    /// (DDI 0487 §C1.2.5), so all four leave the register canonically
+    /// zero-extended with no masking instruction at all.
+    ///
+    /// # Panics
+    ///
+    /// On a width that is not 1, 2, 4 or 8 — a caller that has not checked is
+    /// a code-generator bug rather than a guest one.
+    #[must_use]
+    pub fn load_zx(&mut self, dst: Reg, base: Reg, offset: u64, bytes: u64) -> bool {
+        let size = match bytes {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => panic!("a guest access is 1, 2, 4 or 8 bytes wide"),
+        };
+        self.ldst(size, 1, dst, base, offset)
+    }
+
+    /// A truncating store of the low `bytes` bytes.
+    ///
+    /// `STRB`, `STRH`, 32-bit `STR` and 64-bit `STR`: only the named bytes are
+    /// written, so a store never disturbs a neighbouring guest byte — which
+    /// matters because the destination is guest RAM another device may be
+    /// reading.
+    ///
+    /// # Panics
+    ///
+    /// On a width that is not 1, 2, 4 or 8.
+    #[must_use]
+    pub fn store_trunc(&mut self, src: Reg, base: Reg, offset: u64, bytes: u64) -> bool {
+        let size = match bytes {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => panic!("a guest access is 1, 2, 4 or 8 bytes wide"),
+        };
+        self.ldst(size, 0, src, base, offset)
+    }
+
+    /// `STP Rt, Rt2, [SP, #offset]` — DDI 0487 C6.2, *STP*, signed-offset
+    /// variant: `opc(2)=10 101 0 010 0 imm7(7) Rt2(5) Rn(5) Rt(5)`, with the
+    /// immediate scaled by eight.
+    ///
+    /// # Panics
+    ///
+    /// On an offset that is not a multiple of eight or does not fit the signed
+    /// seven-bit field — the frame layout is this backend's own and fixed.
+    pub fn stp(&mut self, a: Reg, b: Reg, base: Reg, offset: u64) {
+        assert!(
+            offset.is_multiple_of(8) && offset / 8 < 64,
+            "the saved-register area is inside one STP's reach"
+        );
+        let imm = ((offset / 8) as u32) & 0x7f;
+        self.word(
+            0xa900_0000
+                | (imm << 15)
+                | (u32::from(b.0) << 10)
+                | (u32::from(base.0) << 5)
+                | u32::from(a.0),
+        );
+    }
+
+    /// `LDP Rt, Rt2, [SP, #offset]` — the mirror of [`Asm::stp`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Asm::stp`].
+    pub fn ldp(&mut self, a: Reg, b: Reg, base: Reg, offset: u64) {
+        assert!(
+            offset.is_multiple_of(8) && offset / 8 < 64,
+            "the saved-register area is inside one LDP's reach"
+        );
+        let imm = ((offset / 8) as u32) & 0x7f;
+        self.word(
+            0xa940_0000
+                | (imm << 15)
+                | (u32::from(b.0) << 10)
+                | (u32::from(base.0) << 5)
+                | u32::from(a.0),
+        );
+    }
+
+    // ---- barriers -------------------------------------------------------
+
+    /// `DMB ISH` — DDI 0487 C6.2, *DMB*, with `CRm = 0b1011` (inner shareable,
+    /// full system access ordering).
+    ///
+    /// The **full** barrier of the inner-shareable domain, not `DMB ISHST` and
+    /// not `DMB ISHLD`, because the reordering a guest barrier exists to
+    /// forbid is store-then-load and only the full form orders that pair
+    /// (§B2.3.  *Memory barriers*: a `DMB` with `LD` ordering constrains
+    /// loads against later accesses, and one with `ST` ordering constrains
+    /// stores against later stores; neither orders an earlier store against a
+    /// later load).
+    ///
+    /// This is what `IrHost::fence`'s contract — a `SeqCst` host fence —
+    /// compiles to on this architecture, which is why generated code may
+    /// perform it rather than calling out.
+    pub fn dmb_ish(&mut self) {
+        self.word(0xd503_3bbf);
+    }
+
+    /// `DSB ISH` — the same domain, but *completion* rather than ordering.
+    ///
+    /// Not used for a guest fence, where it would be strictly slower for
+    /// nothing (§B2.3.  a `DSB` waits for the accesses to complete, a `DMB`
+    /// only orders them). It is used by `jit::arm64::buf`, where completion
+    /// really is the requirement: cache maintenance must have finished before
+    /// the instruction fetch that depends on it.
+    pub fn dsb_ish(&mut self) {
+        self.word(0xd503_3b9f);
+    }
+
+    /// `ISB` — DDI 0487 C6.2, *ISB*: flush the pipeline so instructions after
+    /// it are fetched afresh.
+    pub fn isb(&mut self) {
+        self.word(0xd503_3fdf);
+    }
+
+    // ---- calls and branches ---------------------------------------------
+
+    /// `BLR Rn` — DDI 0487 C6.2, *BLR*: an indirect call, leaving the return
+    /// address in `X30`.
+    ///
+    /// `1101011 0 0 01 11111 0000 00 Rn(5) 00000`.
+    pub fn blr(&mut self, target: Reg) {
+        self.word(0xd63f_0000 | (u32::from(target.0) << 5));
+    }
+
+    /// `RET` — DDI 0487 C6.2, *RET*: branch to `X30`.
+    pub fn ret(&mut self) {
+        self.word(0xd65f_03c0);
+    }
+
+    /// `B` to a label filled in later — DDI 0487 C6.2, *B*: `000101 imm26`,
+    /// the displacement in **instructions**, so ±128 MiB.
+    #[must_use]
+    pub fn b(&mut self) -> Fixup {
+        let at = self.here();
+        self.word(0x1400_0000);
+        Fixup {
+            at,
+            form: Form::B26,
+        }
+    }
+
+    /// `B.cond` to a label filled in later — DDI 0487 C6.2, *B.cond*:
+    /// `0101010 0 imm19 0 cond`, so ±1 MiB.
+    #[must_use]
+    pub fn b_cond(&mut self, cond: Cond) -> Fixup {
+        let at = self.here();
+        self.word(0x5400_0000 | (cond as u32));
+        Fixup {
+            at,
+            form: Form::Imm19,
+        }
+    }
+
+    /// `CBZ`/`CBNZ Rt` to a label filled in later — DDI 0487 C6.2, *CBZ*:
+    /// `sf 011010 op imm19 Rt`. Compare against zero and branch, with no flag
+    /// register involved, which is why the TLB probe below is shorter than the
+    /// x86 one.
+    #[must_use]
+    pub fn cbz(&mut self, bits: u32, src: Reg, zero: bool) -> Fixup {
+        let at = self.here();
+        let op = u32::from(!zero);
+        self.word(Self::sf(bits) | 0x3400_0000 | (op << 24) | u32::from(src.0));
+        Fixup {
+            at,
+            form: Form::Imm19,
+        }
+    }
+
+    /// `TBZ`/`TBNZ Rt, #bit` to a label filled in later — DDI 0487 C6.2,
+    /// *TBZ*: `b5 011011 op b40(5) imm14 Rt`, so ±32 KiB.
+    ///
+    /// Tests one bit and branches on it in a single instruction with no flags,
+    /// which is how a `brcond` on an `i1` selector is lowered.
+    #[must_use]
+    pub fn tbz(&mut self, src: Reg, bit: u32, zero: bool) -> Fixup {
+        let at = self.here();
+        let op = u32::from(!zero);
+        let b5 = (bit >> 5) & 1;
+        let b40 = bit & 31;
+        self.word(0x3600_0000 | (b5 << 31) | (op << 24) | (b40 << 19) | u32::from(src.0));
+        Fixup {
+            at,
+            form: Form::Imm14,
+        }
+    }
+
+    /// Point a fixup at the current position.
+    pub fn bind(&mut self, f: Fixup) {
+        let here = self.here();
+        self.bind_to(f, here);
+    }
+
+    /// Point a fixup at `target`.
+    ///
+    /// A displacement that does not fit its field sets [`Asm::overflowed`]
+    /// rather than panicking: a block whose branches do not reach is a block
+    /// this backend refuses, and the interpreter runs it. The instruction is
+    /// left as the assembler emitted it — a branch to itself — which is
+    /// unreachable, because a refused block is never pushed into the code
+    /// buffer.
+    pub fn bind_to(&mut self, f: Fixup, target: usize) {
+        let from = f.at as i64;
+        let delta = (target as i64 - from) / 4;
+        let (bits, shift) = match f.form {
+            Form::B26 => (26, 0),
+            Form::Imm19 => (19, 5),
+            Form::Imm14 => (14, 5),
+        };
+        let lo = -(1i64 << (bits - 1));
+        let hi = (1i64 << (bits - 1)) - 1;
+        if delta < lo || delta > hi {
+            self.overflow = true;
+            return;
+        }
+        let field = ((delta as u64) & ((1u64 << bits) - 1)) as u32;
+        let mut word = u32::from_le_bytes([
+            self.code[f.at],
+            self.code[f.at + 1],
+            self.code[f.at + 2],
+            self.code[f.at + 3],
+        ]);
+        word |= field << shift;
+        self.code[f.at..f.at + 4].copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// One instruction's worth of bytes, as a word.
+    fn one(f: impl FnOnce(&mut Asm)) -> u32 {
+        let mut a = Asm::new();
+        f(&mut a);
+        let code = a.finish();
+        assert_eq!(code.len(), 4, "one instruction is one word");
+        u32::from_le_bytes([code[0], code[1], code[2], code[3]])
+    }
+
+    fn words(f: impl FnOnce(&mut Asm)) -> Vec<u32> {
+        let mut a = Asm::new();
+        f(&mut a);
+        a.finish()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect()
+    }
+
+    /// The encodings, against the words DDI 0487 C6.2 specifies for the same
+    /// mnemonics.
+    ///
+    /// Worth having as words rather than left to a functional test for the
+    /// same reason the x86 backend asserts its bytes: a wrong bit in an `Rm`
+    /// field is a wrong *register*, which a functional test finds only if that
+    /// register happens to be live — and this backend's functional tests can
+    /// only run on an aarch64 host, so on every other host these assertions
+    /// are the only thing standing between a typo and a silent regression.
+    #[test]
+    fn the_encodings_are_the_manuals() {
+        // `mov x0, #0` — MOVZ with every field zero.
+        assert_eq!(one(|a| a.movz(Reg::X0, 0, 0)), 0xd280_0000);
+        assert_eq!(one(|a| a.movk(Reg::X0, 0, 0)), 0xf280_0000);
+        assert_eq!(one(|a| a.movn(Reg::X0, 0, 0)), 0x9280_0000);
+        // `movz x9, #0x1234, lsl #32`.
+        assert_eq!(one(|a| a.movz(Reg::X9, 0x1234, 2)), 0xd2c2_4689);
+
+        assert_eq!(one(|a| a.add(64, Reg::X0, Reg::X0, Reg::X0)), 0x8b00_0000);
+        assert_eq!(one(|a| a.sub(64, Reg::X0, Reg::X0, Reg::X0)), 0xcb00_0000);
+        assert_eq!(one(|a| a.cmp(64, Reg::X0, Reg::X0)), 0xeb00_001f);
+        // `add x9, x10, x11` — the register fields, which is where an
+        // off-by-one is a wrong answer rather than a wrong instruction.
+        assert_eq!(one(|a| a.add(64, Reg::X9, Reg::X10, Reg::X11)), 0x8b0b_0149);
+        // The same at 32 bits: `sf` clear.
+        assert_eq!(one(|a| a.add(32, Reg::X9, Reg::X10, Reg::X11)), 0x0b0b_0149);
+
+        assert_eq!(
+            one(|a| a.logic(64, Logic::And, Reg::X0, Reg::X0, Reg::X0)),
+            0x8a00_0000
+        );
+        assert_eq!(
+            one(|a| a.logic(64, Logic::Orr, Reg::X0, Reg::X0, Reg::X0)),
+            0xaa00_0000
+        );
+        assert_eq!(
+            one(|a| a.logic(64, Logic::Eor, Reg::X0, Reg::X0, Reg::X0)),
+            0xca00_0000
+        );
+        // `BIC` — `N` set, which is the whole of the IR's `andc`.
+        assert_eq!(
+            one(|a| a.logic(64, Logic::Bic, Reg::X0, Reg::X0, Reg::X0)),
+            0x8a20_0000
+        );
+        assert_eq!(one(|a| a.not(64, Reg::X0, Reg::X0)), 0xaa20_03e0);
+        assert_eq!(one(|a| a.neg(64, Reg::X0, Reg::X0)), 0xcb00_03e0);
+        assert_eq!(one(|a| a.mov(64, Reg::X9, Reg::X10)), 0xaa0a_03e9);
+        // `mov w9, w10`, which is also the mask to 32 bits.
+        assert_eq!(one(|a| a.mov(32, Reg::X9, Reg::X10)), 0x2a0a_03e9);
+
+        assert_eq!(one(|a| a.mul(64, Reg::X0, Reg::X0, Reg::X0)), 0x9b00_7c00);
+        assert_eq!(one(|a| a.add_imm(64, Reg::SP, Reg::SP, 0)), 0x9100_03ff);
+        assert_eq!(one(|a| a.cmp_imm(64, Reg::X9, 64)), 0xf101_013f);
+
+        assert_eq!(
+            one(|a| a.shift(64, ShiftOp::Lsl, Reg::X0, Reg::X0, Reg::X0)),
+            0x9ac0_2000
+        );
+        assert_eq!(
+            one(|a| a.shift(64, ShiftOp::Lsr, Reg::X0, Reg::X0, Reg::X0)),
+            0x9ac0_2400
+        );
+        assert_eq!(
+            one(|a| a.shift(64, ShiftOp::Asr, Reg::X0, Reg::X0, Reg::X0)),
+            0x9ac0_2800
+        );
+        assert_eq!(
+            one(|a| a.shift(64, ShiftOp::Ror, Reg::X0, Reg::X0, Reg::X0)),
+            0x9ac0_2c00
+        );
+        // `ror w0, w0, w0` — the 32-bit form, whose amount is masked to five
+        // bits, which is a rotate within 32 bits.
+        assert_eq!(
+            one(|a| a.shift(32, ShiftOp::Ror, Reg::X0, Reg::X0, Reg::X0)),
+            0x1ac0_2c00
+        );
+
+        assert_eq!(one(|a| a.clz(64, Reg::X0, Reg::X0)), 0xdac0_1000);
+        assert_eq!(one(|a| a.clz(32, Reg::X0, Reg::X0)), 0x5ac0_1000);
+        assert_eq!(one(|a| a.rbit(64, Reg::X0, Reg::X0)), 0xdac0_0000);
+        assert_eq!(one(|a| a.rev(64, 16, Reg::X0, Reg::X0)), 0xdac0_0400);
+        assert_eq!(one(|a| a.rev(64, 32, Reg::X0, Reg::X0)), 0xdac0_0800);
+        assert_eq!(one(|a| a.rev(64, 64, Reg::X0, Reg::X0)), 0xdac0_0c00);
+        // `rev w0, w0` is `opc = 10` with `sf` clear — the case where the
+        // lane and the register are the same width at 32 bits.
+        assert_eq!(one(|a| a.rev(32, 32, Reg::X0, Reg::X0)), 0x5ac0_0800);
+
+        assert_eq!(
+            one(|a| a.csel(64, Reg::X0, Reg::X0, Reg::X0, Cond::Eq)),
+            0x9a80_0000
+        );
+        // `cset x0, eq` is `csinc x0, xzr, xzr, ne`.
+        assert_eq!(one(|a| a.cset(64, Reg::X0, Cond::Eq)), 0x9a9f_17e0);
+
+        // `ubfx x0, x0, #0, #1`, `sbfx`, and `bfxil`'s underlying `BFM`.
+        assert_eq!(one(|a| a.ubfx(64, Reg::X0, Reg::X0, 0, 1)), 0xd340_0000);
+        assert_eq!(one(|a| a.sbfx(64, Reg::X0, Reg::X0, 0, 1)), 0x9340_0000);
+        assert_eq!(one(|a| a.ubfx(32, Reg::X0, Reg::X0, 0, 1)), 0x5300_0000);
+        // `sxtw x9, w9` is `sbfx x9, x9, #0, #32`, and the manual gives
+        // `SXTW` as exactly that alias.
+        assert_eq!(one(|a| a.sbfx(64, Reg::X9, Reg::X9, 0, 32)), 0x9340_7d29);
+        // `lsl x9, x9, #1` is `ubfm x9, x9, #63, #62`.
+        assert_eq!(one(|a| a.lsl_imm(64, Reg::X9, Reg::X9, 1)), 0xd37f_f929);
+        // `lsr x9, x9, #12`.
+        assert_eq!(one(|a| a.lsr_imm(64, Reg::X9, Reg::X9, 12)), 0xd34c_fd29);
+        // `asr x9, x9, #63`.
+        assert_eq!(one(|a| a.asr_imm(64, Reg::X9, Reg::X9, 63)), 0x937f_fd29);
+        // `bfi x9, x10, #8, #4`: immr = 64 - 8, imms = 3.
+        assert_eq!(one(|a| a.bfi(64, Reg::X9, Reg::X10, 8, 4)), 0xb378_0d49);
+
+        assert_eq!(one(|a| assert!(a.ldr(Reg::X0, Reg::X0, 0))), 0xf940_0000);
+        assert_eq!(one(|a| assert!(a.str(Reg::X0, Reg::X0, 0))), 0xf900_0000);
+        // `ldr x9, [x19, #32]` — offset 32 scales to an immediate of 4.
+        assert_eq!(one(|a| assert!(a.ldr(Reg::X9, Reg::X19, 32))), 0xf940_1269);
+        assert_eq!(
+            one(|a| assert!(a.load_zx(Reg::X0, Reg::X0, 0, 1))),
+            0x3940_0000
+        );
+        assert_eq!(
+            one(|a| assert!(a.load_zx(Reg::X0, Reg::X0, 0, 2))),
+            0x7940_0000
+        );
+        assert_eq!(
+            one(|a| assert!(a.load_zx(Reg::X0, Reg::X0, 0, 4))),
+            0xb940_0000
+        );
+        assert_eq!(
+            one(|a| assert!(a.store_trunc(Reg::X0, Reg::X0, 0, 1))),
+            0x3900_0000
+        );
+        assert_eq!(
+            one(|a| assert!(a.store_trunc(Reg::X0, Reg::X0, 0, 2))),
+            0x7900_0000
+        );
+        assert_eq!(
+            one(|a| assert!(a.store_trunc(Reg::X0, Reg::X0, 0, 8))),
+            0xf900_0000
+        );
+
+        assert_eq!(one(|a| a.stp(Reg::X0, Reg::X0, Reg::SP, 0)), 0xa900_03e0);
+        assert_eq!(one(|a| a.ldp(Reg::X0, Reg::X0, Reg::SP, 0)), 0xa940_03e0);
+        // `stp x19, x20, [sp, #32]` — the immediate is scaled by eight.
+        assert_eq!(one(|a| a.stp(Reg::X19, Reg::X20, Reg::SP, 32)), 0xa902_53f3);
+
+        assert_eq!(one(|a| a.blr(Reg::X16)), 0xd63f_0200);
+        assert_eq!(one(Asm::ret), 0xd65f_03c0);
+        assert_eq!(one(Asm::dmb_ish), 0xd503_3bbf);
+        assert_eq!(one(Asm::dsb_ish), 0xd503_3b9f);
+        assert_eq!(one(Asm::isb), 0xd503_3fdf);
+    }
+
+    /// The barrier, on its own, because it is the encoding this backend is
+    /// most likely to get quietly wrong.
+    ///
+    /// `DMB ISH` is `CRm = 0b1011`; `DMB ISHST` is `0b1010` and `DMB ISHLD`
+    /// `0b1001`, and both of those are weaker in exactly the direction that
+    /// would let a guest barrier stop forbidding store-then-load without any
+    /// test noticing on a host that does not reorder. One word, asserted.
+    #[test]
+    fn the_barrier_is_the_full_inner_shareable_one() {
+        let w = one(Asm::dmb_ish);
+        assert_eq!(w, 0xd503_3bbf);
+        // CRm sits at bits 11..8 of the word.
+        assert_eq!((w >> 8) & 0xf, 0b1011, "ISH, not ISHST and not ISHLD");
+    }
+
+    #[test]
+    fn a_constant_is_built_from_as_few_halfwords_as_it_needs() {
+        // One instruction for a halfword.
+        assert_eq!(words(|a| a.mov_imm(Reg::X9, 0)).len(), 1);
+        assert_eq!(words(|a| a.mov_imm(Reg::X9, 0xffff)).len(), 1);
+        // Four for a full-width constant, and two for one with a zero
+        // halfword in the middle.
+        assert_eq!(
+            words(|a| a.mov_imm(Reg::X9, 0x1234_5678_9abc_def0)).len(),
+            4
+        );
+        assert_eq!(
+            words(|a| a.mov_imm(Reg::X9, 0x1234_0000_0000_5678)).len(),
+            2
+        );
+        // `MOVN` where it is shorter, which is every mask with high ones: a
+        // page mask's complement, an all-ones word and a small negative are
+        // one instruction each rather than four.
+        assert_eq!(words(|a| a.mov_imm(Reg::X9, !0xfff)).len(), 1);
+        assert_eq!(words(|a| a.mov_imm(Reg::X9, u64::MAX)).len(), 1);
+        assert_eq!(words(|a| a.mov_imm(Reg::X9, u64::MAX - 3)).len(), 1);
+        // `movn x9, #0xfff` is `!0xfff`, which is the one worth pinning as a
+        // word: it is the constant a TLB probe would need if it masked the
+        // page offset with a register instead of shifting twice.
+        assert_eq!(one(|a| a.mov_imm(Reg::X9, !0xfff)), 0x9281_ffe9);
+    }
+
+    #[test]
+    fn a_forward_branch_is_patched_to_where_it_lands() {
+        let mut a = Asm::new();
+        let f = a.b_cond(Cond::Eq);
+        a.ret();
+        a.bind(f);
+        a.ret();
+        let code = a.finish();
+        let branch = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        // Two instructions ahead: imm19 = 2, at bit 5.
+        assert_eq!(branch, 0x5400_0040);
+    }
+
+    #[test]
+    fn a_backward_branch_is_a_negative_displacement() {
+        let mut a = Asm::new();
+        let target = a.here();
+        a.ret();
+        let f = a.b();
+        a.bind_to(f, target);
+        let code = a.finish();
+        let branch = u32::from_le_bytes([code[4], code[5], code[6], code[7]]);
+        // One instruction back: imm26 = -1, so every one of the 26 bits is
+        // set.
+        assert_eq!(branch, 0x17ff_ffff);
+    }
+
+    #[test]
+    fn a_branch_that_does_not_reach_is_recorded_rather_than_emitted_wrong() {
+        // A `TBZ` reaches ±32 KiB. Bind one past that and the assembler must
+        // say so, because the alternative is a branch into the middle of
+        // somebody else's block.
+        let mut a = Asm::new();
+        let f = a.tbz(Reg::X9, 0, true);
+        assert!(!a.overflowed());
+        a.bind_to(f, 1 << 20);
+        assert!(
+            a.overflowed(),
+            "a displacement that does not fit is a refusal"
+        );
+    }
+
+    #[test]
+    fn an_offset_a_scaled_immediate_cannot_reach_is_refused() {
+        let mut a = Asm::new();
+        // 4095 * 8 is the last representable 64-bit offset.
+        assert!(a.ldr(Reg::X9, Reg::X20, 4095 * 8));
+        assert!(!a.ldr(Reg::X9, Reg::X20, 4096 * 8));
+        // And an unaligned one has no encoding at all.
+        assert!(!a.ldr(Reg::X9, Reg::X20, 4));
+    }
+}
