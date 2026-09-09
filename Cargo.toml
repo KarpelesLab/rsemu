@@ -1991,3 +1991,18 @@ required-features = ["jit", "cpu-arm-a64-lift"]
 name             = "jit_dispatch"
 harness          = false
 required-features = ["jit", "cpu-riscv-lift"]
+
+[[bench]]
+# A real AArch64 Linux boot, measured, with the census a profile has to be
+# divided by: blocks executed, guest instructions retired inside them, how many
+# were reached by a patched exit, how many accesses the inlined TLB probe
+# served. The other three benchmarks time a hand-written loop through the
+# mechanism ladder, which is the right shape for attributing a mechanism and
+# the wrong one for deciding what to optimise next -- a seven-instruction loop
+# that fits one block has no block-boundary cost, no cold translations and no
+# MMU, and ROADMAP.md 8's gate is wall-clock on a real guest. Skips loudly
+# without a kernel, which is fetched and never committed. `harness = false` for
+# the reason the other three give.
+name             = "a64_linux_boot"
+harness          = false
+required-features = ["machine-arm64-virt", "cpu-arm-a64-lift", "jit"]

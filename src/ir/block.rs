@@ -3,6 +3,7 @@
 
 use crate::ir::op::{Cond, MemOp, Opcode};
 use crate::ir::types::{Const, Temp, Type};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -229,6 +230,73 @@ impl Block {
             out.operands.extend_from_slice(self.srcs(i));
             let aux = if inst.op == Opcode::BRCOND {
                 moved.get(inst.aux as usize).copied().unwrap_or(kept)
+            } else {
+                inst.aux
+            };
+            out.insts.push(Inst {
+                src_start,
+                aux,
+                ..inst.clone()
+            });
+        }
+        out
+    }
+
+    /// A copy of this block whose instructions are `order`, an old index each.
+    ///
+    /// The seam a *reordering* pass goes through, beside [`Block::retain`]'s
+    /// for a removing one, and here for the same reason: the operand array is
+    /// flat and private, so moving an instruction means re-packing every
+    /// window into it, which only this module knows the layout of.
+    ///
+    /// `order` is a permutation of `0 .. insts().len()`. It is **not checked**
+    /// — a caller that repeats or omits an index gets a block that repeats or
+    /// omits an instruction, and [`verify`](crate::ir::verify) is what says so
+    /// — but a [`Opcode::BRCOND`]'s `aux` is repointed at wherever its target
+    /// went, exactly as `retain` repoints one at wherever its target slid to.
+    /// A target the order drops leaves the branch pointing past the end, which
+    /// the verifier rejects rather than a backend miscompiling.
+    ///
+    /// Temporary numbering and the boundary records are carried over
+    /// unchanged, for the reasons `retain` gives: an [`InsnStart`] names
+    /// temporaries by number and an `INSN_START` instruction names its record
+    /// by index in `aux`, so renumbering either would repoint a fault's view
+    /// of architectural state at the wrong value.
+    ///
+    /// What this method does **not** do is decide whether a reordering is
+    /// legal. Straight-line SSA makes "a definition precedes its uses" a
+    /// property of the order, and it is the caller's to keep; the verifier
+    /// checks it afterwards, which is why every pass in this module runs
+    /// against it in its own tests.
+    pub(crate) fn reorder(&self, order: &[usize]) -> Block {
+        // `at[old]` is where `old` ended up. Sized for the whole block so an
+        // index the order omits stays past the end and is caught by the
+        // verifier rather than aliasing instruction zero.
+        let mut at = vec![self.insts.len(); self.insts.len()];
+        for (new, &old) in order.iter().enumerate() {
+            if let Some(slot) = at.get_mut(old) {
+                *slot = new;
+            }
+        }
+
+        let mut out = Block {
+            entry_pc: self.entry_pc,
+            key: self.key,
+            insts: Vec::with_capacity(order.len()),
+            operands: Vec::with_capacity(self.operands.len()),
+            marks: self.marks.clone(),
+            types: self.types.clone(),
+        };
+        for &old in order {
+            let Some(inst) = self.insts.get(old) else {
+                continue;
+            };
+            let src_start = out.operands.len() as u32;
+            out.operands.extend_from_slice(self.srcs(old));
+            let aux = if inst.op == Opcode::BRCOND {
+                at.get(inst.aux as usize)
+                    .copied()
+                    .unwrap_or(self.insts.len()) as u32
             } else {
                 inst.aux
             };
