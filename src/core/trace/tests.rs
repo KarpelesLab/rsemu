@@ -80,6 +80,33 @@ fn every_named_counter_is_inside_the_array_and_clear_of_the_histogram() {
 }
 
 #[test]
+fn every_end_reason_has_a_slot_and_the_two_names_agree() {
+    use crate::core::sched::Ended;
+
+    // The window is eight wide and five are used, so a sixth reason costs no
+    // slot arithmetic anywhere. `quantum_report` drops a reason past the eighth
+    // rather than letting it land on the histogram.
+    const { assert!(Ended::COUNT <= Counter::SPAN_LOG2.0 - Counter::ENDED.0) };
+    for n in 0..Ended::COUNT {
+        let slot = (Counter::ENDED.0 + n) as usize;
+        let name = Counter::NAMES[slot];
+        assert!(!name.is_empty(), "reason {n} has no name in slot {slot}");
+        // `sched.ended.event` is `Ended::EVENT` and nothing else: the rendering
+        // side reads `NAMES`, the counting side reads `Ended`, and a trace is
+        // only readable if the two say the same thing.
+        assert_eq!(
+            name,
+            alloc::format!("sched.ended.{}", Ended(n).name()),
+            "slot {slot} and Ended({n}) disagree"
+        );
+    }
+    assert!(
+        Counter::NAMES[(Counter::ENDED.0 + Ended::COUNT) as usize].is_empty(),
+        "an unused reason slot must stay unnamed, or it reaches a file as a zero row"
+    );
+}
+
+#[test]
 fn a_disabled_channel_counts_nothing() {
     let _serial = SERIAL.lock();
     super::reset();

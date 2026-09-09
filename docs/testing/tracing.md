@@ -56,6 +56,11 @@ mmio.virtio.mmio.write                0
 mmio.write                            0
 sched.budgets                       200
 sched.events                          0
+sched.ended.allowance                100
+sched.ended.declined                  4
+sched.ended.event                     0
+sched.ended.exit                      0
+sched.ended.lazy                      0
 sched.quanta                        104
 sched.quanta.empty                    4
 sched.quanta.idle                     4
@@ -66,11 +71,12 @@ sched.ticks                     1011520
 ```
 
 Half a million guest instructions in 7 902 blocks, every one of them compiled to
-host code; a hundred scheduler rounds of a millisecond each plus four the
-headless loop declined at its slice boundaries; and the whole board's MMIO in
-fifteen accesses, all of them the boot stub being fetched, with every device
-aperture named and sitting at zero because this guest is a two-instruction loop
-that talks to nothing. None of that was printable before.
+host code; a hundred scheduler rounds of a millisecond each — `ended.allowance`,
+the grid point, so nothing interrupted them — plus four the headless loop
+declined at its slice boundaries; and the whole board's MMIO in fifteen
+accesses, all of them the boot stub being fetched, with every device aperture
+named and sitting at zero because this guest is a two-instruction loop that
+talks to nothing. None of that was printable before.
 
 ## Why this exists
 
@@ -134,13 +140,25 @@ the `cpu` channel costs the block-entry path nothing at all.
 | Row | Meaning |
 | --- | --- |
 | `sched.quanta` | rounds run |
-| `sched.quanta.idle` | rounds in which no runnable was given a budget: a boundary `run_until` **declined** because the deadline fell inside the round, or a machine with nothing runnable |
+| `sched.quanta.idle` | rounds in which no runnable was given a budget: a boundary `run_until` **declined** because the deadline fell inside the round, or a machine with nothing runnable. `sched.ended.declined` is what tells those two apart; this row is kept as the plain count it always was, so an old trace still compares |
 | `sched.quanta.empty` | rounds that advanced virtual time by nothing |
+| `sched.ended.allowance` | rounds that reached the quantum grid point: the allowance was spent and nothing interrupted them. Also every `accel` round, where the quantum *is* the allowance |
+| `sched.ended.event` | rounds a queued event came due in, before the grid point |
+| `sched.ended.lazy` | rounds a lazily advanced device's own deadline ended — a PPU reaching the dot it raises vblank on. Not visible at all before this row |
+| `sched.ended.declined` | boundaries `run_until` declined because the caller's deadline fell inside the round |
+| `sched.ended.exit` | rounds a runnable was asked to unwind out of: a stop-the-world, a debugger, a host `SIGINT` |
 | `sched.budgets` | runnable budgets issued — `budgets / quanta` is the machine's runnable count |
 | `sched.ticks` | ticks consumed by runnables, summed across domains (a volume of work, deliberately not converted to a time) |
 | `sched.events` | events dispatched out of rounds |
 | `sched.span-ns` | virtual nanoseconds the rounds covered — equal to the run, which is a useful self-check |
 | `sched.span-ns.log2.NN` | how many rounds needed *NN* bits of nanoseconds. Bucket 20 is about a millisecond; bucket 10 about a microsecond |
+
+The five `sched.ended.*` rows are a **partition**: every round ends for exactly
+one reason, so they sum to `sched.quanta`, and `tests/cli_trace.rs` asserts it.
+That is what makes a row going missing visible rather than quietly absorbed by
+its neighbour. `exit` displaces whichever of the other four the round would
+otherwise have named, because a four-tick round is explained by the flag and not
+by the grid point it never reached.
 
 `cpu`, under `cpu.<instance path>.` and again as a machine-wide total under
 `cpu.`:
@@ -189,14 +207,18 @@ is interned rather than a convention — see *The identity is the device* below.
 * **A per-block-entry event stream.** See above: the cost and the volume both
   rule it out, and every question anybody actually asked was a total.
 * **A wall-clock figure.** Deliberately absent — see *Determinism* below.
-* **A reason for each quantum boundary** (allowance spent, timer edge, exit
-  flag, declined boundary). Wanted, specified below: the scheduler has
-  no "why did this round end" type, and `sched.quanta.idle` is the part that
-  *is* observable from a `QuantumReport`.
 * **MMIO by *address* rather than by region.** A histogram of which offsets
   inside an aperture the guest touches is a different tool — it wants a stream
   or a per-offset array, and the register a guest polls is usually obvious once
   you know which chip it is polling.
+
+Two things that were listed here as wanted are now applied, and the sections
+below say how. **MMIO by region** needed an identity at the dispatch site and
+got one. **A reason for each quantum boundary** is `core::sched::Ended`, which
+names the choice `natural_target` was already making; `QuantumReport` carries
+it, the five `sched.ended.*` rows are the result, and it cost the scheduler one
+`u16` per round plus a handful of relaxed loads to see whether an exit flag was
+raised.
 
 ### The identity is the device
 
@@ -491,45 +513,20 @@ Two consequences, both real:
 Each of these needs a change inside a file this subsystem does not own. They are
 written out precisely enough to apply as-is.
 
-### 1. A reason for each quantum boundary — `src/core/sched.rs`
+### 1. Both of the original two are now applied
 
-`sched.quanta.idle` conflates a *declined boundary* with *a machine with nothing
-runnable*, because a `QuantumReport` cannot tell them apart, and neither
-"allowance spent" nor "a timer edge" is visible at all. The scheduler already
-chooses between exactly three candidate end-instants in `Scheduler::natural_target`
-and takes a fourth path in `Scheduler::decline_round`. Give that choice a name:
+This section held specifications for a quantum-end reason and for MMIO by
+region. Both landed, in the same round, and their reasoning moved to where the
+code is: `core::sched::Ended` and *The identity is the device* above. The
+numbering is kept so the remaining entries keep their names.
 
-```rust
-/// Why a scheduler round ended.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ended(pub u16);
-
-impl Ended {
-    /// The round reached the quantum grid point: the allowance was spent.
-    pub const ALLOWANCE: Ended = Ended(0);
-    /// A queued event came due before the grid point.
-    pub const EVENT: Ended = Ended(1);
-    /// A lazily advanced device's own deadline came first.
-    pub const LAZY: Ended = Ended(2);
-    /// `run_until` declined a boundary the deadline fell inside.
-    pub const DECLINED: Ended = Ended(3);
-    /// A runnable raised its exit flag (stop-the-world, a debugger, `SIGINT`).
-    pub const EXIT: Ended = Ended(4);
-}
-```
-
-* `natural_target` returns `(GlobalTime, Ended)` instead of `GlobalTime` — the
-  three arms already exist, one per candidate, and each names its own constant.
-* `QuantumReport` grows `pub ended: Ended`.
-* `decline_round` sets `Ended::DECLINED`; `close_round` takes the value
-  `natural_target` returned, except that a round cut short by a raised exit flag
-  reports `Ended::EXIT`.
-
-Then `core::trace::quantum_report` counts `Counter(8 + report.ended.0)` — the
-slots are already reserved — and the rows appear as `sched.ended.allowance`,
-`sched.ended.event`, `sched.ended.lazy`, `sched.ended.declined`,
-`sched.ended.exit`. No other file changes.
+The MMIO one is worth a sentence here because it was specified rather than
+applied for a stated reason — it was the only hook touching a per-access path,
+and it wanted a callgrind number first. It got one: threading the region id
+costs **zero** instructions on the RAM read and store paths and leaves
+`FlatTarget` at 24 bytes, because the `u16` rides in padding the `Io` variant
+already had. Counting costs about seven instructions per MMIO access. The
+tables are below.
 
 ### 2. RISC-V's retired-versus-interpreted split — `src/cpu/riscv/engine.rs`
 

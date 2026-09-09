@@ -758,15 +758,15 @@ fn rdtime_and_a_memory_mapped_mtime_read_agree() {
     // near the bus and reads `Registers::mtime_cell` as `republish` last left
     // it.
     //
-    // What they may *not* be is bit-identical on every board for ever, and the
-    // assertion below is written for that. `sync` catches the CLINT up to the
-    // hart's live position, the hart publishes one now, and a `csrr time`
-    // followed one instruction later by a load of `mtime` is then separated by
-    // real ticks of a 10 MHz counter — so the load can legitimately answer
-    // with the next one. On *this* board the gap is still zero, because the
-    // CLINT hangs off its own oscillator and `Scheduler::arm_live_cursors`
-    // arms no live view across two trees; with that arming applied locally the
-    // largest gap over these 125 000 round trips is exactly one `rtc` tick.
+    // What they are *not* is bit-identical, and the assertion below is written
+    // for that. `sync` catches the CLINT up to the hart's live position, the
+    // hart publishes one, and `Scheduler::arm_live_cursors` converts it across
+    // the two oscillators the board really has — so a `csrr time` followed one
+    // instruction later by a load of `mtime` is separated by real ticks of a
+    // 10 MHz counter and the load legitimately answers with the next one.
+    // Measured over these 125 000 round trips the largest gap is exactly one
+    // `rtc` tick; it was zero while the CLINT was stranded on its own crystal,
+    // which looked like agreement and was really a counter standing still.
     // One tick is the bound the architecture licenses (`dev::riscv::clint`
     // quotes both chapters) and going backwards is the thing it does not, so
     // the two assertions are pitched at exactly those two claims.

@@ -66,7 +66,7 @@ window closed unseen.
 | `the_guest_carries_the_windows_and_the_addresses_this_file_names` | none | ~0 s | every `cargo test` — the same, for the RISC-V guest |
 | `a_real_arm64_linux_boot_agrees_across_the_engines` | an `Image` | minutes | `--ignored`; nightly in CI |
 | `a_real_x86_linux_boot_agrees_across_the_engines` | a `bzImage` | minutes | `--ignored`; nightly in CI |
-| `the_clint_advances_while_the_hart_is_running` | none | ~0 s | `--ignored`, and **it fails** — a defect this file found and did not fix |
+| `the_clint_advances_while_the_hart_is_running` | none | ~0 s | every `cargo test` — a defect this file found, fixed in two halves; see below |
 
 ```sh
 # the whole target, as CI runs it on every commit
@@ -495,51 +495,71 @@ entries, so 7 315 `SFENCE.VMA`s, 14 631 CSR round trips, 3 657 atomics and 457
 for quantum. What it *did* find is a floor under the seam it was written for,
 and that is the next section.
 
-### What the RISC-V board found: `mtime` does not move while the hart runs
+### What the RISC-V board found: `mtime` did not move while the hart ran
 
-`the_clint_advances_while_the_hart_is_running` is committed `#[ignore]`d because
-it **fails on the `master` it was committed to**, the way
+`the_clint_advances_while_the_hart_is_running` was committed `#[ignore]`d
+because it **failed on the `master` it was committed to**, the way
 `a_tlbi_in_the_loop_agrees_across_the_engines` did. It is not an engine
-divergence — both engines agree — which is why it is filed rather than fixed
-here.
+divergence — both engines agreed — which is why it was filed rather than fixed
+where it was found. It is green now, and both halves of the fix are worth
+recording because the shape recurs.
 
 A guest reads `mtime` in a tight loop and counts distinct values. Over eight
 quanta it should see several hundred: a hart on this board gets
 `SchedulerConfig::max_ticks_per_quantum` — ten thousand — of a 1 GHz domain per
-round, which is 10 µs, and `mtime` counts at 10 MHz. **It sees seven. One per
-quantum.**
+round, which is 10 µs, and `mtime` counts at 10 MHz. **It saw seven. One per
+quantum.** It sees **800** now, which is the hundred a round predicts.
 
 `riscv.clint` is a lazily-advanced device and its `Registers::read` calls `sync`
 before answering, precisely so a guest load catches the chip up to the core's
-live position. But `Scheduler::arm_live_cursors` builds each lazy device's live
-view on the running runnable's `TickCursor`, and `Hart::attach_cursor` keeps
-only that cursor's **exit flag** and drops the position half — saying so in as
-many words: *"this hart does not publish its own position — nothing on a RISC-V
-board here is sampled inside an instruction the way a PPU is"*. So the tick
-counter never moves while the hart runs, every `sync` during a round catches the
-CLINT up to where the round **began**, and `mtime` advances only in
-`close_round`.
+live position. Two separate things stopped that from happening, and the fix
+needed both:
 
-Two consequences, and the second is the one that matters here:
+* **The hart published nothing.** `Scheduler::arm_live_cursors` builds each
+  lazy device's live view on the running runnable's `TickCursor`, and
+  `Hart::attach_cursor` used to keep only that cursor's **exit flag** and drop
+  the position half — saying so in as many words: *"this hart does not publish
+  its own position — nothing on a RISC-V board here is sampled inside an
+  instruction the way a PPU is"*. It keeps both now, and
+  `Exec::publish_position` publishes `State::cycles` before every access that
+  leaves for the address space.
+* **The CLINT is on a second crystal.** `machines/riscv-virt.machine` hangs
+  `mtime` off `osc rtc`, and `arm_live_cursors` used to arm a live view only
+  across slots sharing a root — so the CLINT's slot was skipped whatever the
+  hart published. `Live` now carries a ratio built from the two domains'
+  declared rational frequencies where the two trees differ, which is what
+  `ROADMAP.md` §4.2 prescribes for independent crystals: reciprocal multiply
+  plus a per-root residual, error below one tick and non-accumulating because
+  the base is re-anchored from the forest every round. The intra-tree path is
+  untouched, and
+  `core::sched::tests::an_intra_tree_ratio_is_still_exact_with_another_crystal_present`
+  is that claim's own gate.
 
-* `rdtime` and `mtime` are quantised to the scheduler's grid — a millisecond —
+Two consequences followed from the defect, and the second is why it mattered
+here rather than only as a clock-resolution nit:
+
+* `rdtime` and `mtime` were quantised to the scheduler's grid — a millisecond —
   on every RISC-V board in this tree.
-* The seam `cpu::riscv::engine` documents at length is **unreachable from a
+* The seam `cpu::riscv::engine` documents at length was **unreachable from a
   guest**. Its window is a comparator crossed inside a running round, and on
-  this board a comparator is only ever crossed in `close_round`, which is a
+  that board a comparator was only ever crossed in `close_round`, which is a
   quantum boundary and where both engines agree by construction. The workload
-  above takes **1 999 timer interrupts in 2 000 quanta** — exactly one each,
+  above took **1 999 timer interrupts in 2 000 quanta** — exactly one each,
   with the `clint` seam on and with it off alike, which is the same statement
   from the other side.
 
 So `engine::tests::a_load_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it`,
-which builds a device that raises unconditionally, is the **only** coverage that
-seam has, and no guest on a shipped RISC-V board can reach it. Worth knowing
-before somebody deletes `IrHost::load`'s hand-back as dead code.
+which builds a device that raises unconditionally, was the **only** coverage
+that seam had, and no guest on a shipped RISC-V board could reach it. Worth
+knowing before somebody reads `IrHost::load`'s hand-back as dead code — and
+worth re-measuring now that a comparator can be crossed mid-round.
 
-The fix is not small and was not attempted: it means giving the hart a live
-position to publish, which is a change to how `Hart::run_budget` and
-`engine::advance` account ticks, and it has a cost on the hot path.
+**The lesson worth keeping is about the test, not the defect.** Its assertion
+was written against the fixed behaviour rather than against the bug, so it
+turned green on the commit that landed the second half and needed no edit. An
+`#[ignore]`d test that asserts the *current wrong* number has to be rewritten by
+the person who fixes it, which is exactly when nobody wants to be arguing about
+what the right number was.
 
 ### Bisecting a RISC-V failure
 
