@@ -332,9 +332,9 @@ fn a_board_with_no_translated_core_says_so_rather_than_printing_zeroes() {
 fn a_flag_that_cannot_be_honoured_is_refused_rather_than_ignored() {
     // A channel this build has never heard of, with the list of the ones it
     // has.
-    let (ok, _, err) = run(&["run", "apple1", "--for", "10ms", "--trace", "mmio"]);
+    let (ok, _, err) = run(&["run", "apple1", "--for", "10ms", "--trace", "wires"]);
     assert!(!ok, "a misspelt channel must not run the machine");
-    assert!(err.contains("--trace mmio"), "{err}");
+    assert!(err.contains("--trace wires"), "{err}");
     assert!(
         err.contains("`sched`") && err.contains("`cpu`") && err.contains("`all`"),
         "{err}"
