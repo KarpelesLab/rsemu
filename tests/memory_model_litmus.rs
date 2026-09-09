@@ -17,7 +17,8 @@
 //! Everything concurrent here is the shape
 //! [`ThreadingMode::Parallel`](rsemu::core::sched::ThreadingMode::Parallel)
 //! gives a machine: one host thread per guest core, running at the same time.
-//! It is opt-in (`--threading parallel`) and no machine file selects it.
+//! It is opt-in (`--threading parallel`, or a `threading` statement in a
+//! machine file) and no board in `machines/` selects it.
 //! [`Deterministic`](rsemu::core::sched::ThreadingMode::Deterministic) — the
 //! default, and the mode every golden state hash comes from — runs both cores
 //! on one host thread, and [`sequential_interleaving_cannot_produce_it`] is

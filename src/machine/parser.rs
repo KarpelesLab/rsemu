@@ -12,7 +12,7 @@
 //! ```text
 //! unit      := stmt* EOF
 //! stmt      := machine | param | osc | space | object | map | wire
-//!            | include | template | instance | for
+//!            | threading | include | template | instance | for
 //! machine   := "machine" STRING block
 //! param     := "param" name ("=" expr)?
 //! osc       := "osc" name "=" expr freq-unit
@@ -20,6 +20,7 @@
 //! object    := "object" name STRING props?
 //! map       := "map" name expr "size" expr "=" expr props?
 //! wire      := "wire" path "->" path
+//! threading := "threading" ("deterministic" | "parallel")
 //! include   := "include" STRING
 //! template  := "template" name ("(" param-list ")")? block
 //! instance  := "instance" name "=" name ("(" arg-list ")")?
@@ -65,7 +66,7 @@ use alloc::vec::Vec;
 use crate::machine::ast::{
     Arg, BinOp, Expr, ForStmt, FreqUnit, IncludeStmt, InstanceStmt, MachineDecl, MapStmt, Name,
     NamePart, ObjectDecl, OscDecl, ParamDecl, Path, Property, SourceUnit, SpaceDecl, Stmt,
-    TemplateDecl, TemplateParam, UnOp, WireStmt,
+    TemplateDecl, TemplateParam, ThreadingStmt, UnOp, WireStmt,
 };
 use crate::machine::diag::Diagnostic;
 use crate::machine::lexer::{Token, TokenKind, tokenize};
@@ -81,7 +82,17 @@ pub const MAX_DEPTH: u32 = 64;
 /// Every word that starts a statement, in the order the error message lists
 /// them.
 const STATEMENT_KEYWORDS: &[&str] = &[
-    "machine", "param", "osc", "space", "object", "map", "wire", "include", "template", "instance",
+    "machine",
+    "param",
+    "osc",
+    "space",
+    "object",
+    "map",
+    "wire",
+    "threading",
+    "include",
+    "template",
+    "instance",
     "for",
 ];
 
@@ -275,6 +286,7 @@ impl Parser {
             "object" => self.object_stmt(start),
             "map" => self.map_stmt(start),
             "wire" => self.wire_stmt(start),
+            "threading" => self.threading_stmt(start),
             "include" => self.include_stmt(start),
             "template" => self.template_stmt(start),
             "instance" => self.instance_stmt(start),
@@ -404,6 +416,26 @@ impl Parser {
         Ok(Stmt::Wire(WireStmt {
             from,
             to,
+            span: start.join(self.prev_span()),
+        }))
+    }
+
+    /// `threading parallel` — a bare word, deliberately not an expression.
+    ///
+    /// No worker count and no arithmetic: how many host threads to spend on a
+    /// board is a property of the *run* and stays on the command line. What a
+    /// board may say is which of §4.2's modes its own hardware is, and that is
+    /// a closed set of words the resolver checks.
+    fn threading_stmt(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.advance();
+        let span = self.span();
+        let Some(mode) = self.ident_text() else {
+            return Err(self.expected("`deterministic` or `parallel`"));
+        };
+        let mode = Spanned::new(mode.to_string(), span);
+        self.advance();
+        Ok(Stmt::Threading(ThreadingStmt {
+            mode,
             span: start.join(self.prev_span()),
         }))
     }

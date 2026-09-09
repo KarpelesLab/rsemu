@@ -1,0 +1,97 @@
+# smp-parallel - two harts on one crystal, sharing one RAM, running at once.
+#
+# The fixture for `ThreadingMode::Parallel` on a board shaped like the ones
+# that ship. `machines/tests/heterogeneous.machine` is the *other* parallel
+# fixture and answers a different question: two cores of different
+# architectures on two separate crystals, which is the configuration the clock
+# model was designed for. This one is the configuration real SMP hardware has
+# and every shipped `-smp` board in `machines/` uses - **one oscillator, two
+# processors** - and it exists because that is the case the parallel round has
+# to get right and the one nothing was testing.
+#
+# `docs/techniques/parallel-execution.md` is the argument this file is the
+# instrument for. Two things about it are worth stating here.
+#
+# ## It declares its own threading mode
+#
+# `threading parallel` is the whole reason this file is not just another
+# two-hart board. It is a statement about the *hardware*: these two harts
+# execute at the same instant, the way an SMP board's processors do and the way
+# a NES's CPU and PPU do not. It is a **default**, not a demand - `rsemu run
+# ... --threading deterministic` still wins, and the regression suite relies on
+# exactly that - and the worker count is deliberately not sayable here, because
+# how many host threads to spend is a property of the run.
+#
+# **No board in `machines/` proper says this**, and that is deliberate rather
+# than an oversight: a state hash is refused outside a deterministic mode, so a
+# shipped board that declared `parallel` would take itself out of the
+# regression suite for everybody. A user who wants their own copy of
+# `riscv-virt-smp` to run its harts concurrently adds one line to it.
+#
+# ## One crystal and two runnables is a degenerate configuration
+#
+# A tree has one unit counter and every domain on it is a divider of that
+# counter, so advancing either hart's domain advances both.
+# `Scheduler::ticks_until_after` says at length why that is outside the clock
+# model in *both* threading modes: one counter cannot express one processor
+# halted while the other runs. What makes the board work anyway is
+# `SchedulerConfig::max_ticks_per_quantum`, which caps what the first runnable
+# may take and leaves the rest of the round's span for the second.
+#
+# It is written here because it is a real limitation of a board every shipped
+# `-smp` file has, not a property of this fixture: with a quantum short enough
+# that one hart's cap covers the whole round, the second hart gets a budget of
+# zero and does not run at all. `docs/techniques/parallel-execution.md` has the
+# arithmetic and the test that pins it.
+#
+# ## Sources
+#
+# *The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA* for the
+# harts; volume II for `mhartid`, which is the only thing that distinguishes
+# them. No board vendor's manual is involved - this is a test fixture, not a
+# model of anything anyone built.
+
+machine "smp-parallel" {
+  # A board whose processors are concurrent, and says so.
+  threading parallel
+
+  # How much RAM the two harts share. Everything interesting a litmus test does
+  # happens in the first few words of it.
+  param shared = 64K
+
+  # One crystal for both harts, exactly as `riscv-virt-smp` has it.
+  osc core = 100 MHz
+
+  space mem { width = 64, unassigned = open-bus, endian = "little" }
+
+  # Identical but for `hartid`, which is what `mhartid` reports and what a
+  # guest program uses to decide which half of the fixture it is.
+  object cpu0 "cpu.riscv" {
+    clock  = core
+    space  = mem
+    engine = "interp"
+    xlen   = "rv64"
+    isa    = "imac"
+    hartid = 0
+    reset  = 0x1000
+  }
+
+  object cpu1 "cpu.riscv" {
+    clock  = core
+    space  = mem
+    engine = "interp"
+    xlen   = "rv64"
+    isa    = "imac"
+    hartid = 1
+    reset  = 0x1000
+  }
+
+  # `image` names a media slot: whoever runs the machine binds the bytes, and
+  # nothing below host/ opens a file. Both harts come out of reset in the same
+  # ROM and branch on `mhartid`.
+  object rom "rom" { size = 4K, image = "code" }
+  object ram "ram" { size = shared }
+
+  map mem 0x00001000 size 4K     = rom
+  map mem 0x00100000 size shared = ram
+}

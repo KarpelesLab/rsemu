@@ -40,9 +40,9 @@
 //! it tears zero times however finely the two programs are interleaved, because
 //! nothing runs between the bytes of a store — so this is a
 //! `ThreadingMode::Parallel` property, and `Parallel` is opt-in
-//! (`--threading parallel`; no machine file in the tree asks for it, and
-//! `usermode`'s `ThreadSet` runs every guest thread on one host thread by
-//! design).
+//! (`--threading parallel`, or a `threading` statement in a machine file; no
+//! board in `machines/` asks for it, and `usermode`'s `ThreadSet` runs every
+//! guest thread on one host thread by design).
 //!
 //! ## Who has it and who does not, which is not what this said before
 //!
@@ -223,10 +223,19 @@
 //! exactly is lost by refusing it?", and the seventh met that test because
 //! refusing it meant shipping a data-loss defect. Refusing here leaves a
 //! specification violation that **no shipped configuration can observe**:
-//! `Deterministic` is the default and structurally cannot tear, no machine file
-//! selects `Parallel`, `usermode` runs every guest thread on one host thread,
-//! and `Accel` performs the guest's accesses in silicon. Spending the project's
-//! eighth exemption on that is not the same trade the seventh was.
+//! `Deterministic` is the default and structurally cannot tear, no board in
+//! `machines/` selects `Parallel`, `usermode` runs every guest thread on one
+//! host thread, and `Accel` performs the guest's accesses in silicon. Spending
+//! the project's eighth exemption on that is not the same trade the seventh
+//! was.
+//!
+//! "No shipped board selects `Parallel`" is now a decision rather than a
+//! consequence of the grammar: a machine file *can* declare a threading mode,
+//! and `machines/tests/smp-parallel.machine` does. Nothing in `machines/`
+//! proper does, because a state hash is refused outside a deterministic mode
+//! and a shipped board that declared `parallel` would take itself out of the
+//! regression suite; `docs/techniques/parallel-execution.md` records that and
+//! keeps this violation observable only on purpose.
 //!
 //! The trigger that changes it is a configuration that runs guest cores on host
 //! threads *by default* — a board that selects `Parallel`, or `usermode`'s

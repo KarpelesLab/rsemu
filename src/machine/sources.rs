@@ -415,6 +415,10 @@ fn shift_stmt(stmt: &mut Stmt, base: u32) {
             shift_path(&mut s.to, base);
             s.span = shift(s.span, base);
         }
+        Stmt::Threading(s) => {
+            s.mode.span = shift(s.mode.span, base);
+            s.span = shift(s.span, base);
+        }
         Stmt::Include(s) => {
             s.path.span = shift(s.path.span, base);
             s.span = shift(s.span, base);

@@ -618,14 +618,41 @@ pub struct RealizeOptions {
     /// How the scheduler is configured: threading mode, worker count, quantum,
     /// rate control.
     ///
-    /// This is where a machine's threading mode is selected — `rsemu run …
-    /// --threading parallel` sets it, and so does a caller assembling a machine
-    /// in Rust. It is deliberately *not* in the `.machine` grammar: a machine
-    /// file is portable data describing a board, and how many host threads to
-    /// spend on it is a property of the run rather than of the hardware. The
-    /// mode a board *needs* — `accel`, once §10 exists — would be a different
-    /// question and would belong in the file.
+    /// [`SchedulerConfig::mode`] here is the **fallback**, not the last word:
+    /// a machine file's own `threading` statement overrides it, and
+    /// [`threading`](RealizeOptions::threading) overrides them both. A caller
+    /// that means "this run is deterministic whatever the board asked for"
+    /// must say so in `threading`; setting `scheduler.mode` alone is a default
+    /// for a file that declares nothing.
+    ///
+    /// The worker count, the quantum and the rate control are *only* here,
+    /// because those are properties of the run and never of the board.
     pub scheduler: SchedulerConfig,
+    /// The threading mode this **run** insists on, whatever the machine file
+    /// declares.
+    ///
+    /// `--threading parallel` on the command line sets it, and so does a
+    /// caller assembling a machine in Rust that has a reason of its own — the
+    /// regression suite, which must stay deterministic even if the board it is
+    /// running would rather not be.
+    ///
+    /// `None`, the default, is "let the board decide": a file with a
+    /// `threading` statement gets what it asked for, and a file without one
+    /// gets [`SchedulerConfig::mode`].
+    ///
+    /// # Why the split exists at all
+    ///
+    /// It was once written here that threading is *deliberately* not in the
+    /// `.machine` grammar, because a machine file is portable data describing
+    /// a board and how many host threads to spend on it is a property of the
+    /// run. Half of that survives and is the reason the worker count is still
+    /// not in the grammar. The other half was wrong, and
+    /// `docs/techniques/parallel-execution.md` has the argument: whether a
+    /// board's processors are **genuinely concurrent** is a fact about the
+    /// board. An SMP machine's cores execute at the same instant; a NES's CPU
+    /// and PPU do not, because one drives the oscillator tree and the other is
+    /// computed from it. A board is entitled to say which of those it is.
+    pub threading: Option<crate::core::sched::ThreadingMode>,
     /// The bytes bound to the machine's media slots. See [`MediaTable`].
     pub media: MediaTable,
     /// The host objects this build's devices open by name: character ports,
@@ -697,6 +724,16 @@ impl RealizeOptions {
     #[must_use]
     pub fn with_recorder(mut self, recorder: Arc<Recorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// Insist on `mode` whatever the machine file declares.
+    ///
+    /// See [`threading`](RealizeOptions::threading). Use it when the run has a
+    /// reason of its own; leave it alone to let the board choose.
+    #[must_use]
+    pub fn with_threading(mut self, mode: crate::core::sched::ThreadingMode) -> Self {
+        self.threading = Some(mode);
         self
     }
 }
@@ -833,10 +870,14 @@ impl<'a> Realizer<'a> {
         self.bind_devices(&shared)?;
         let (nets, sweep) = self.build_wires()?;
 
-        let mut sched = Scheduler::new(
-            core::mem::take(&mut self.forest),
-            self.options.scheduler.clone(),
-        );
+        // The run wins over the board, the board wins over the caller's
+        // fallback. `RealizeOptions::threading` argues why a board gets a say
+        // at all and why it only gets this one.
+        let mut config = self.options.scheduler.clone();
+        if let Some(mode) = self.options.threading.or(self.machine.threading) {
+            config.mode = mode;
+        }
+        let mut sched = Scheduler::new(core::mem::take(&mut self.forest), config);
         // `ThreadingMode::Accel` reads a round's elapsed virtual time off an
         // injected `core::sched::HostClock` and has **no other source of
         // it**: a machine realized in that mode with no clock fails
@@ -853,7 +894,7 @@ impl<'a> Realizer<'a> {
         // acceleration backends are. A front end that wants a different clock
         // still overrides this with `Machine::set_host_clock` after the build.
         #[cfg(feature = "std")]
-        if self.options.scheduler.mode == crate::core::sched::ThreadingMode::Accel {
+        if sched.config().mode == crate::core::sched::ThreadingMode::Accel {
             sched.set_host_clock(Box::new(crate::host::clock::MonotonicClock::new()));
         }
         let devices = self.register_with_scheduler(&mut sched)?;

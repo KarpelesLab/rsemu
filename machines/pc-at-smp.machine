@@ -26,6 +26,19 @@
 # application processor's APIC ID out of the firmware's own table rather than
 # knowing it.
 #
+# # These two processors take turns unless you ask otherwise
+#
+# There is no `threading` statement below, and that is deliberate. The default
+# mode is `deterministic`: one host thread, round-robin, the two processors
+# alternating whole scheduler rounds. It is what keeps this board in the
+# regression suite, because `Machine::state_hash` is refused outside a
+# deterministic mode and a board that declared `parallel` would take itself out
+# of that suite for everybody who builds it. `--threading parallel` runs them at
+# the same instant on host threads of their own, and a copy of this file with
+# `threading parallel` in it does the same with no flag;
+# `docs/techniques/parallel-execution.md` has what that buys, what it gives up,
+# and the atomicity gaps it makes reachable.
+#
 # **rsemu ships no *third-party* BIOS and never will.** A PC's firmware is
 # somebody's copyrighted binary, and vendoring one would be redistribution; so
 # the machine takes it through a media slot, exactly as `riscv-virt` takes its

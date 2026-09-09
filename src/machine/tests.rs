@@ -261,7 +261,7 @@ fn golden_unknown_keyword() {
     assert_eq!(
         render_error("machine \"nes\" {\n  objekt ram \"wram\" { size = 2K }\n}\n"),
         "\
-error: unknown statement `objekt`; expected one of `machine`, `param`, `osc`, `space`, `object`, `map`, `wire`, `include`, `template`, `instance`, `for`
+error: unknown statement `objekt`; expected one of `machine`, `param`, `osc`, `space`, `object`, `map`, `wire`, `threading`, `include`, `template`, `instance`, `for`
  --> nes.machine:2:3
   |
 2 |   objekt ram \"wram\" { size = 2K }
@@ -604,6 +604,109 @@ fn a_lazily_advanced_device_without_a_clock_is_refused() {
 }"#;
     let err = build_text("unclocked.machine", TEXT).expect_err("catch-up needs a domain");
     assert!(err.contains("advanced on access"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// `threading` — the one scheduler fact a board is entitled to state
+// ---------------------------------------------------------------------------
+
+/// A minimal board that declares the mode it wants.
+///
+/// One oscillator, one space, no objects: everything here is about the
+/// statement, and a board with devices would only add ways for the test to
+/// fail for another reason.
+const DECLARED: &str = r#"machine "declared" {
+  threading parallel
+  osc master = 1 MHz
+  space bus { width = 16 }
+}
+"#;
+
+#[test]
+fn a_machine_file_can_declare_its_threading_mode() {
+    let m = resolve_file("declared.machine", DECLARED, &ResolveOptions::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        m.threading,
+        Some(crate::core::sched::ThreadingMode::Parallel)
+    );
+    assert!(
+        m.threading_span.is_some(),
+        "the span is kept so a diagnostic can point at it"
+    );
+}
+
+#[test]
+fn a_file_that_says_nothing_leaves_the_mode_to_the_caller() {
+    let text = DECLARED.replace("  threading parallel\n", "");
+    let m = resolve_file("declared.machine", &text, &ResolveOptions::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(m.threading, None);
+}
+
+#[test]
+fn threading_deterministic_is_a_thing_a_board_may_say() {
+    let text = DECLARED.replace("parallel", "deterministic");
+    let m = resolve_file("declared.machine", &text, &ResolveOptions::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        m.threading,
+        Some(crate::core::sched::ThreadingMode::Deterministic)
+    );
+}
+
+#[test]
+fn threading_accel_is_not_a_property_of_a_board() {
+    let text = DECLARED.replace("parallel", "accel");
+    let err = resolve_file("declared.machine", &text, &ResolveOptions::new())
+        .expect_err("`accel` says the host is executing the guest, not what the board is");
+    let text = err.to_string();
+    assert!(text.contains("--accel"), "{text}");
+}
+
+#[test]
+fn an_unknown_threading_word_is_a_diagnostic_and_not_a_silent_default() {
+    let text = DECLARED.replace("parallel", "fast");
+    let err = resolve_file("declared.machine", &text, &ResolveOptions::new())
+        .expect_err("`fast` is not a mode");
+    let text = err.to_string();
+    assert!(text.contains("`threading fast` is not a mode"), "{text}");
+}
+
+#[test]
+fn two_threading_statements_that_disagree_are_refused() {
+    let text = DECLARED.replace(
+        "  threading parallel\n",
+        "  threading parallel\n  threading deterministic\n",
+    );
+    let err = resolve_file("declared.machine", &text, &ResolveOptions::new())
+        .expect_err("there is no defensible way to pick one");
+    let text = err.to_string();
+    assert!(text.contains("contradicts"), "{text}");
+}
+
+#[test]
+fn two_threading_statements_that_agree_are_fine() {
+    // A template or a `for` body can legitimately emit the same declaration
+    // twice, and refusing that would make the statement unusable inside one.
+    let text = DECLARED.replace(
+        "  threading parallel\n",
+        "  threading parallel\n  threading parallel\n",
+    );
+    let m = resolve_file("declared.machine", &text, &ResolveOptions::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        m.threading,
+        Some(crate::core::sched::ThreadingMode::Parallel)
+    );
+}
+
+#[test]
+fn a_threading_statement_survives_a_round_trip_through_the_printer() {
+    let once = dump("declared.machine", DECLARED);
+    assert!(once.contains("threading parallel"), "{once}");
+    let twice = dump("declared.machine", &once);
+    assert_eq!(once, twice, "printing is idempotent");
 }
 
 /// Build `text` with this build's registry, bindings and class table.

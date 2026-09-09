@@ -41,10 +41,20 @@
 //! Which of §4.2's threading modes runs is a `core::sched` concern and the
 //! loop above is the same either way:
 //! [`Deterministic`](crate::core::sched::ThreadingMode::Deterministic) is the
-//! mode §4.2 requires for record/replay and for the regression suite, and
+//! mode §4.2 requires for record/replay and for the regression suite,
 //! [`Parallel`](crate::core::sched::ThreadingMode::Parallel) runs one job per
-//! runnable on the task pool and joins them at the round's boundary. `accel`
-//! reports itself unimplemented.
+//! runnable on the task pool and joins them at the round's boundary, and
+//! [`Accel`](crate::core::sched::ThreadingMode::Accel) is that same round with
+//! its elapsed time read off the host clock instead.
+//!
+//! *Which* one a machine gets is settled in `realize`, and there are three
+//! voices: the run (`--threading`, `RealizeOptions::threading`) outranks the
+//! board (a `threading` statement in the machine file), which outranks the
+//! caller's fallback (`SchedulerConfig::mode`). A board is entitled to say
+//! whether its processors are genuinely concurrent, because that is a fact
+//! about the hardware; how many host threads to spend on it is not, and stays
+//! out of the grammar. `docs/techniques/parallel-execution.md` has the whole
+//! argument.
 //!
 //! What differs above this line is one thing: [`Machine::state_hash`] refuses
 //! outside a deterministic mode, because a number a parallel run produces is a

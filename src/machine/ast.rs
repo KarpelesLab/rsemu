@@ -69,6 +69,8 @@ pub enum Stmt {
     Map(MapStmt),
     /// `wire ppu.nmi -> cpu.nmi`
     Wire(WireStmt),
+    /// `threading parallel`
+    Threading(ThreadingStmt),
     /// `include "pci-common.machine"`
     Include(IncludeStmt),
     /// `template cpu_complex(id, freq = 1 MHz) { … }`
@@ -90,6 +92,7 @@ impl Stmt {
             Stmt::Object(s) => s.span,
             Stmt::Map(s) => s.span,
             Stmt::Wire(s) => s.span,
+            Stmt::Threading(s) => s.span,
             Stmt::Include(s) => s.span,
             Stmt::Template(s) => s.span,
             Stmt::Instance(s) => s.span,
@@ -268,6 +271,20 @@ pub struct WireStmt {
     /// The destination pin. Several sources may name one destination; that is
     /// a wired-OR, and §5 says it is declared once per source.
     pub to: Path,
+    /// The whole statement.
+    pub span: Span,
+}
+
+/// `threading parallel` — the threading mode this board wants by default.
+///
+/// Syntactic, like everything else here: the word is stored as written and the
+/// resolver is what decides whether it names a mode. See
+/// [`Resolved::threading`](crate::machine::resolver::Resolved::threading) for
+/// what a board is allowed to say and why the *run* still overrides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadingStmt {
+    /// The mode, as the bare word was spelled.
+    pub mode: Spanned<String>,
     /// The whole statement.
     pub span: Span,
 }
@@ -662,6 +679,9 @@ fn dump_stmt(stmt: &Stmt, depth: usize, out: &mut String) {
                 dump_path(&s.from),
                 dump_path(&s.to)
             ));
+        }
+        Stmt::Threading(s) => {
+            out.push_str(&format!("threading {}\n", s.mode.node));
         }
         Stmt::Include(s) => {
             out.push_str(&format!("include {}\n", quote(&s.path.node)));

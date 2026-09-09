@@ -214,10 +214,11 @@
 //! than statistical. That mode runs every runnable on one host thread, so the
 //! finest grain it can interleave at is one whole instruction: between a locked
 //! instruction's read and its write, *nothing executes*. `Parallel` is where
-//! the residual lives, and it is opt-in — no machine file in the tree selects
-//! it; `--threading parallel` on the command line does. Under `Accel` the
-//! question does not arise, because the host's silicon performs the guest's
-//! read-modify-write and this object is never reached.
+//! the residual lives, and it is opt-in — no board in `machines/` selects it;
+//! `--threading parallel` on the command line does, and so does a `threading`
+//! statement in a machine file. Under `Accel` the question does not arise,
+//! because the host's silicon performs the guest's read-modify-write and this
+//! object is never reached.
 //!
 //! The JIT does not widen any of this, and it is worth checking rather than
 //! assuming, because `IrHost::spent` can leave a block part-way at an

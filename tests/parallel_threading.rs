@@ -23,6 +23,14 @@
 //! * and [`Machine::state_hash`] **refuses** outside a deterministic mode, so a
 //!   golden cannot be blessed against a parallel run by accident.
 //!
+//! Everything here selects the mode from Rust, on a board with **two
+//! crystals** — the configuration the clock model was designed for.
+//! `tests/parallel_smp_boards.rs` is the other half and asks the two questions
+//! this file does not: a machine file selecting the mode *itself*, and two
+//! processors on **one** crystal, which is what every shipped `-smp` board has.
+//! `docs/techniques/parallel-execution.md` is the argument both instruments
+//! serve.
+//!
 //! [`LockRank::BUS`]: rsemu::core::sync::LockRank::BUS
 //! [`Machine::state_hash`]: rsemu::machine::Machine::state_hash
 

@@ -150,13 +150,25 @@ measured rather than asserted.
   still issuing an ordinary access.
 
 **Both are reachable only under `ThreadingMode::Parallel`**, which is opt-in
-(`--threading parallel`), which **no machine file selects**, and which is not
-the default — `Deterministic` runs every guest on one host thread, where the
-finest interleaving there is is one whole instruction. That is what makes these
-documented boundaries rather than live defects, and it is the sentence that
-keeps every SMP row above honest. Separately, under `--accel kvm` the host's
-silicon performs the atomic, so an accelerated SMP boot remains evidence about
-the host rather than about this tree.
+and not the default — `Deterministic` runs every guest on one host thread,
+where the finest interleaving there is is one whole instruction. That is what
+makes these documented boundaries rather than live defects, and it is the
+sentence that keeps every SMP row above honest. Separately, under `--accel kvm`
+the host's silicon performs the atomic, so an accelerated SMP boot remains
+evidence about the host rather than about this tree.
+
+That mode is now reachable two ways: `--threading parallel` on any board, and a
+`threading parallel` statement **in a machine file**, which is a claim about the
+hardware rather than about the run. No board in `machines/` declares one, and
+that is a decision — a state hash is refused outside a deterministic mode, so a
+shipped board that declared `parallel` would take itself out of the regression
+suite for everybody. `machines/tests/smp-parallel.machine` is the in-tree board
+that does, and `tests/parallel_smp_boards.rs` is what runs it: two RV64 harts,
+20 000 atomic increments each, no update lost, with a plain counter beside it
+losing 7 700–10 800 of 40 000 to prove the two really collided.
+[`techniques/parallel-execution.md`](techniques/parallel-execution.md) has the
+whole argument, including what a parallel run is checked by when a state hash
+is not available.
 
 Boards with no page here — `pc-apic`, `spi-flash`, `spi-panel`, `arm926`,
 `a64-mini`, `mips-mini`, `z80-mini`, `m68k-mini`, `ne2k-mini`, `nvme-mini`,
@@ -195,6 +207,7 @@ would answer that the machine file does not.
 | --- | --- |
 | [`techniques/binary-translation.md`](techniques/binary-translation.md) | DBT, JIT, register allocation |
 | [`techniques/memory-models.md`](techniques/memory-models.md) | x86-TSO, ARM/POWER relaxed models, barrier lowering |
+| [`techniques/parallel-execution.md`](techniques/parallel-execution.md) | What `ThreadingMode::Parallel` promises, what a machine file may say, and how a run with no state hash is checked |
 | [`techniques/virtualization.md`](techniques/virtualization.md) | KVM, Hypervisor.framework, WHPX |
 | [`techniques/webassembly.md`](techniques/webassembly.md) | Wasm core, threads, browser APIs |
 
