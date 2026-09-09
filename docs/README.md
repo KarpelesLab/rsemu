@@ -189,6 +189,7 @@ would answer that the machine file does not.
 | [`system/usermode-abi.md`](system/usermode-abi.md) | Level 3: ELF loading, the auxiliary vector, the syscall ABI, and the sandbox policy |
 | [`system/debug-protocols.md`](system/debug-protocols.md) | GDB remote serial protocol, DWARF |
 | [`system/remote-display.md`](system/remote-display.md) | RFB/VNC, SPICE |
+| [`system/cpu-state-model.md`](system/cpu-state-model.md) | The engine-independent architectural CPU state: what crosses between an interpreter, a JIT and a vCPU, and what a TSC is when the two engines count at different rates |
 
 ### Techniques
 | | |

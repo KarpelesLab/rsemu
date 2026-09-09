@@ -2598,6 +2598,27 @@ impl X86 {
         self.session.lock().state.cycles
     }
 
+    /// Overwrite the counter — which is to say, overwrite `IA32_TSC`.
+    ///
+    /// **This is a time-stamp counter setter, not a performance counter's.**
+    /// [`cycles`](X86::cycles) is what `RDTSC` reads on this core
+    /// (`prot::Exec::rdmsr`, [`msr::TSC`](prot::msr::TSC)), so it is the one
+    /// piece of architectural state that a second engine can hand over: what a
+    /// hypervisor reports for `IA32_TSC` and what this core reports for it are
+    /// the same *quantity* even though they advance at different *rates*.
+    /// `accel::state` is the caller, and
+    /// [`crate::accel::state::restore_into_vcpu`] is the other direction.
+    ///
+    /// Nothing else in this core reads the absolute value: [`step`](X86::step)
+    /// and [`run`](X86::run) report the cycles they charged as a delta, so the
+    /// scheduler's accounting is untouched by a jump here. A guest's own
+    /// timekeeping is not — see the module documentation of
+    /// [`accel::state`](crate::accel::state) for what an engine switch does to
+    /// a calibrated TSC.
+    pub fn set_cycles(&self, cycles: u64) {
+        self.session.lock().state.cycles = cycles;
+    }
+
     /// Whether a `HLT` has stopped the core.
     ///
     /// A halted 8086 restarts on any interrupt, so this is not the terminal

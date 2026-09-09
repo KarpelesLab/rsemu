@@ -22,56 +22,151 @@
 //! | `LDTR`, `TR`, with their caches | [`Sys::ldtr`], [`Sys::task`] | `kvm_sregs.ldt/tr` | **yes** |
 //! | `CR0`, `CR2`, `CR3`, `CR4`, `EFER` | [`Sys`] | `kvm_sregs` | **yes** |
 //! | `STAR`, `LSTAR`, `CSTAR`, `SFMASK`, `KERNEL_GS_BASE` | [`Sys`] | `KVM_GET_MSRS` | **yes** |
+//! | `IA32_MISC_ENABLE` | [`Sys::misc_enable`] | `KVM_GET_MSRS` | **the writable bits** |
+//! | `IA32_MTRR_DEF_TYPE`, eleven fixed and eight variable ranges | [`Sys::mtrr_var`], [`Sys::mtrr_fix`] | `KVM_GET_MSRS` | **yes** |
+//! | `IA32_TSC` | [`X86::cycles`] | `KVM_GET_MSRS` | **yes, as a value** |
 //! | `DR0`–`DR3`, `DR6`, `DR7` | [`Sys::dr`] | `KVM_GET_DEBUGREGS` | **yes** |
 //! | the x87 file, control, status and tag words | [`X87`] | `KVM_GET_FPU` | **yes** |
 //! | `XMM0`–`XMM15` | [`Sse`] | `KVM_GET_FPU` | **yes** |
 //! | `MXCSR` | [`Sse::mxcsr`] | `KVM_GET_FPU` | **out of hardware only** |
-//! | `IA32_TSC` and the counter's rate | — | `KVM_GET_MSRS`, `KVM_GET_TSC_KHZ` | **carried, not applied** |
-//! | `CR8`, `apic_base` | — | `kvm_sregs` | **carried, not applied** |
+//! | the local APIC, `CR8`'s storage included | `dev::pc::apic` | *not the kernel's* | **by construction** |
+//! | `apic_base` | `core::wire::LocalController` | `kvm_sregs` | **carried, not applied** |
 //!
-//! # What does not, and why — the honest list
+//! # The local APIC is not on the honest list, and that is worth explaining
 //!
-//! * **`CR8`.** It is the local APIC's task-priority register seen through the
-//!   processor, and in this crate the local APIC is a *device*
-//!   (`dev::pc::apic`), not part of the core's register file. [`ArchState`]
-//!   therefore **carries** the value rather than dropping it, and
-//!   [`tpr_through_space`] is the one honest route into the device: the APIC's
-//!   register page is mapped by the machine file, so writing `CR8 << 4` to
-//!   offset `0x80` of that page is a driver doing what a driver does. That is
-//!   deliberately not automatic — this module does not know where a board put
-//!   its APIC.
+//! `ROADMAP.md` phase 7 names "LAPIC/x2APIC state" as part of this deliverable,
+//! and there is no `KVM_GET_LAPIC` anywhere in [`kvm`](super::kvm). That is not
+//! an omission. This backend **never issues `KVM_CREATE_IRQCHIP`**, so a vCPU
+//! here has no in-kernel local APIC to read out; the board's local APIC is
+//! `dev::pc::apic`, an ordinary rsemu device with an ordinary chunk, and *both*
+//! engines reach it the same way — through a store to its register page in the
+//! address space the machine file mapped it into. There is consequently nothing
+//! to translate: the same object, saved by the same `save`, restored by the same
+//! `load`, whichever engine was running the processor beside it. `CR8` is the
+//! same story told about one register, and [`tpr_through_space`] is the route.
+//!
+//! An in-kernel irqchip would make the APIC's state a *third* representation to
+//! keep in step and would need a `KVM_GET_LAPIC`/`KVM_SET_LAPIC` translation of
+//! its own. It would also move interrupt delivery out of the board, where
+//! `machines/pc-apic.machine` puts it. Not doing it is the design.
+//!
+//! # The time-stamp counter: a value, never an offset
+//!
+//! The counter is the subtle one, and the shape of the answer is fixed by
+//! `CLAUDE.md`'s rule that derived state is never serialized.
+//!
+//! A hypervisor implements `RDTSC` as the host's own counter plus a per-vCPU
+//! **offset**. That offset is derived — from the value the guest should see and
+//! from the host counter at the instant of the write — so it is meaningless on
+//! any host but the one that computed it, and putting one in a snapshot would
+//! produce a save state that could only be restored on the machine that took
+//! it. What is architectural is the **value**: what a `RDTSC` in the guest
+//! returns. Both engines have exactly that — `KVM_GET_MSRS` of `IA32_TSC` on
+//! one side, [`X86::cycles`] on the other, because that is where this core's
+//! `RDMSR` of `msr::TSC` reads from — so the value is what crosses, and the
+//! destination engine recomputes whatever offset it needs. On KVM that
+//! recomputation is a `KVM_SET_MSRS` of `IA32_TSC` and nothing else.
+//!
+//! **When** it is written matters as much as what. [`store_from_vcpu`] reads it
+//! after every hardware slice, because otherwise a `save` between rounds would
+//! write a counter belonging to whatever the interpreter last did.
+//! [`load_into_vcpu`] deliberately does **not** write it, because that call runs
+//! at the top of every slice whose shell is ahead — after a reset sequence,
+//! after an instruction hardware could not fetch — and writing the counter there
+//! would rewind the guest's clock by the userspace time between the store and
+//! the load, on every slice. [`restore_into_vcpu`] is the call that does write
+//! it, and `accel::cpu` selects it at the two moments where the offset genuinely
+//! has to be recomputed: a snapshot load, and a reset.
+//!
+//! **What is not continuous is the rate.** An accelerated guest's counter
+//! advances at `KVM_GET_TSC_KHZ`, roughly the host's; the interpreter's advances
+//! at four ticks per bus cycle plus the manual's execution figures. A guest that
+//! has calibrated its counter against a periodic timer — Linux does, against the
+//! PIT or the HPET — and is then restored under the other engine will find its
+//! calibration wrong, and will recalibrate or mark the clocksource unstable. The
+//! rate is a property of the machine rather than of the guest, so no snapshot
+//! field can fix it; a board that wants an engine switch to be invisible has to
+//! pin the two rates together, which is a machine-configuration deliverable and
+//! not this module's.
+//!
+//! # What does not cross, and why — the honest list
+//!
+//! Five things, and each says what closing it would take.
+//!
+//! * **`CR8`, when a 64-bit guest writes it on hardware.** `CR8` is the local
+//!   APIC's task-priority register seen through the processor, and in this
+//!   crate that APIC is a *device*. The interpreter therefore has no `cr8`
+//!   field at all: `prot::Exec::write_task_priority` stores to the APIC's
+//!   register page, so the device — and hence the snapshot — always has the
+//!   truth. A vCPU does not: `MOV CR8` on hardware lands in the vCPU's own
+//!   `cr8` without an exit, and nothing here syncs it back to the device, so
+//!   [`overlay_sys`] preserves the accelerator's copy and the device keeps a
+//!   stale one. **What closing it takes:** [`tpr_through_space`] is already the
+//!   route and [`ArchState::cr8`] already carries the value; what is missing is
+//!   a caller with both, which `accel::cpu` is — it holds the memory space and
+//!   can reach `IA32_APIC_BASE` through its [`LocalController`] link. One store
+//!   per hardware slice, on a path that already does five ioctls. It is not done
+//!   here because it is a change to how often a device is written from inside a
+//!   run loop, and that is a re-entrancy question rather than a translation one.
 //! * **`apic_base`.** Also the device's, and here the crate *does* have a seam:
 //!   [`LocalController::base_register`](crate::core::wire::LocalController::base_register)
 //!   is exactly a route from a core to the sibling that owns `IA32_APIC_BASE`,
 //!   and `X86` already forwards `RDMSR`/`WRMSR` of it through that link. What
-//!   is missing is not the route but a *holder*: `store_from_vcpu` is handed a
+//!   is missing is not the route but a *holder*: [`store_from_vcpu`] is handed a
 //!   core and a vCPU and has no third party to ask. [`ArchState`] carries the
 //!   value so that a caller who has the link can apply it.
-//! * **The TSC.** [`ArchState::tsc`] carries `IA32_TSC` and
-//!   [`Vm::tsc_khz`](super::kvm::Vm::tsc_khz) the rate, but the interpreter's
-//!   counter is its own retired-cycle count — a different quantity in a
-//!   different unit — and there is no public setter for it. Writing one is a
-//!   change to `cpu::x86`, so what is here is the carrying half.
 //! * **`MXCSR`, in the *into*-hardware direction.** `KVM_GET_FPU` reports it
 //!   and `KVM_SET_FPU` does not write it — the kernel's set path fills the
 //!   `fxsave` legacy area field by field and that one field is not among them.
 //!   Measured, not assumed: `the_syscall_msrs_the_debug_registers_and_the_fpu_survive_hardware`
 //!   sets it, reads it back, and finds it unchanged, which is why
 //!   [`differs`] excludes it. A guest restored *onto* an accelerator therefore
-//!   keeps whatever rounding mode and exception masks the vCPU already had.
-//!   `KVM_SET_XSAVE` would carry it and is a larger transcription — a
-//!   deliverable, named here rather than discovered later.
+//!   keeps whatever rounding mode and exception masks the vCPU already had, so
+//!   a restored `DIVPS` can round the wrong way once. **What closing it takes:**
+//!   `KVM_GET_XSAVE`/`KVM_SET_XSAVE` in place of `KVM_GET_FPU`, which is the
+//!   next bullet, because the `XSAVE` legacy area *does* carry `MXCSR` and the
+//!   kernel's set path writes it wholesale.
 //! * **`XSAVE` beyond x87 and SSE.** `KVM_GET_FPU` is used rather than
 //!   `KVM_GET_XSAVE` because the interpreter models exactly the state
-//!   `kvm_fpu` holds: there is no AVX file in `cpu::x86` for a `YMM` half to
-//!   land in. When there is one, the ioctl changes and this note goes with it.
+//!   `kvm_fpu` holds: [`Sse`] is sixteen 128-bit lanes and there is no `YMM`
+//!   upper half or `ZMM` file in `cpu::x86` for a wider component to land in.
+//!   **What closing it takes**, in the order it would have to happen: (1) an
+//!   AVX register file in `cpu::x86::fpu` and the instructions that use it,
+//!   which is an ISA deliverable rather than a snapshot one; (2) `XCR0` — which
+//!   is `KVM_GET_XCRS`, a separate ioctl — because the `XSAVE` area's layout is
+//!   a function of it and a component's offset is not fixed; (3) the *standard*
+//!   `XSAVE` format's component walk, since `KVM_GET_XSAVE`'s 4096-byte buffer
+//!   holds a header plus components at `CPUID.(EAX=0Dh)` offsets, so a
+//!   translation cannot be a struct-to-struct copy the way `kvm_fpu` is; (4) the
+//!   chunk grows, and *that* is the change that would need a `cpu.x86` class
+//!   version bump and a migration. Until (1) exists there is nothing to carry
+//!   and the ioctl would move bytes into a file no instruction reads.
 //! * **The x87 last-instruction selectors.** `kvm_fpu` carries `last_ip` and
 //!   `last_dp` but not the `CS` and `DS` that went with them, so
 //!   [`X87::last_cs`] and [`X87::last_ds`] are preserved from the destination
 //!   rather than transferred. Only `FNSTENV` in a 16- or 32-bit form can
-//!   observe the difference.
+//!   observe the difference. **What closing it takes:** `KVM_GET_XSAVE` again —
+//!   the legacy area has the two selector fields that `kvm_fpu` dropped.
+//!
+//! There is a sixth that belongs to `accel::cpu` rather than to this module and
+//! is recorded here because this is the file a reader comes to: **the
+//! interruptibility state**. `kvm_vcpu_events` carries the pending exception,
+//! the pending `NMI`, the `NMI`-blocked flag and the interrupt shadow, and no
+//! `KVM_GET_VCPU_EVENTS` is issued anywhere in this backend. The interpreter's
+//! chunk *has* `int_shadow`, so the field exists at both ends and is simply
+//! never filled from hardware. A snapshot taken between a `STI` and the
+//! instruction after it therefore restores with the shadow lost, and the guest
+//! can take an interrupt one instruction early. **What closing it takes:** the
+//! `kvm_vcpu_events` transcription and two more ioctls in the pair below; no
+//! chunk change, since `int_shadow` is already written.
 //!
 //! [`X87`]: crate::cpu::x86::fpu::X87
+//! [`Sys::misc_enable`]: crate::cpu::x86::prot::Sys::misc_enable
+//! [`Sys::mtrr_var`]: crate::cpu::x86::prot::Sys::mtrr_var
+//! [`Sys::mtrr_fix`]: crate::cpu::x86::prot::Sys::mtrr_fix
+//! [`Sys::dr`]: crate::cpu::x86::prot::Sys::dr
+//! [`X86::cycles`]: crate::cpu::x86::X86::cycles
+//! [`LocalController`]: crate::core::wire::LocalController
 //! [`Sse`]: crate::cpu::x86::fpu::Sse
 //! [`Sse::mxcsr`]: crate::cpu::x86::fpu::Sse::mxcsr
 //! [`X87::last_cs`]: crate::cpu::x86::fpu::X87::last_cs
@@ -79,7 +174,7 @@
 
 use crate::cpu::x86::fpu::{Sse, Tag, X87};
 use crate::cpu::x86::isa::seg;
-use crate::cpu::x86::prot::{SegReg, Sys, TableReg, ar, msr};
+use crate::cpu::x86::prot::{SegReg, Sys, TableReg, ar, misc_enable, msr, mtrr};
 use crate::cpu::x86::{Regs, X86};
 use crate::float::x87::F80;
 
@@ -295,40 +390,162 @@ pub fn sregs_to_sys(kvm: &KvmSregs, base: &Sys) -> Sys {
 // model-specific registers
 // ---------------------------------------------------------------------------
 
-/// The model-specific registers rsemu keeps in [`Sys`] that `kvm_sregs` does
-/// not carry, in the order the two functions below use.
+/// How many model-specific registers [`CARRIED_MSRS`] holds.
+///
+/// The five `SYSCALL` registers, `IA32_MISC_ENABLE`, `IA32_MTRR_DEF_TYPE`, the
+/// eleven fixed memory-type ranges and the sixteen halves of the eight variable
+/// ones. Thirty-four, and the arithmetic is written out rather than typed as a
+/// literal so that a part configured with a different [`mtrr::VCNT`] moves the
+/// array rather than silently truncating it.
+pub const MSR_COUNT: usize = SYSCALL_MSRS + 2 + mtrr::FIXED_COUNT + 2 * mtrr::VCNT as usize;
+
+/// The `SYSCALL` group's length, and the index of `IA32_MISC_ENABLE`.
+const SYSCALL_MSRS: usize = 5;
+/// Where `IA32_MISC_ENABLE` sits in [`CARRIED_MSRS`].
+const MISC_AT: usize = SYSCALL_MSRS;
+/// Where `IA32_MTRR_DEF_TYPE` sits.
+const DEF_TYPE_AT: usize = MISC_AT + 1;
+/// Where the eleven fixed memory-type ranges start.
+const FIXED_AT: usize = DEF_TYPE_AT + 1;
+/// Where the sixteen variable-range halves start.
+const VAR_AT: usize = FIXED_AT + mtrr::FIXED_COUNT;
+
+/// The model-specific registers **both engines model** and `kvm_sregs` does not
+/// carry, in the order the two functions below use.
 ///
 /// `EFER` is not here because it *is* in `kvm_sregs`, and `FS_BASE`/`GS_BASE`
 /// are not because KVM reports them as the `fs` and `gs` segment bases — which
 /// is where the hardware actually keeps them, and carrying them twice would
 /// let the two copies disagree.
-pub const CARRIED_MSRS: [u32; 5] = [
-    msr::STAR,
-    msr::LSTAR,
-    msr::CSTAR,
-    msr::SFMASK,
-    msr::KERNEL_GS_BASE,
-];
+///
+/// **The memory-type ranges and `IA32_MISC_ENABLE` are here because leaving
+/// them out was a measured defect rather than a theoretical one.** A vCPU whose
+/// guest had programmed `IA32_MTRR_DEF_TYPE` to `0xc06` and
+/// `IA32_MTRR_FIX64K_00000` to all-write-back handed the interpreter two zeros,
+/// because nothing read them out — and zero in `MTRR_DEF_TYPE` is not "the
+/// default", it is `E = 0`, which the *Intel SDM* volume 3A §12.11.2.1 defines
+/// as **every physical address uncacheable**. So a snapshot taken on hardware
+/// restored an interpreter describing a machine whose memory types the guest
+/// had never asked for, and the reverse restored a vCPU with the ranges its
+/// firmware had set wiped back to reset. Both engines already keep every one of
+/// these fields and already write them to their chunk; the gap was the bridge.
+pub const CARRIED_MSRS: [u32; MSR_COUNT] = carried_msrs();
+
+/// [`CARRIED_MSRS`] built from the *Intel SDM* volume 4 Table 2-2 addresses
+/// rather than typed out.
+///
+/// Thirty-four hand-written hexadecimal constants is thirty-four chances to
+/// transpose one, and a transposed memory-type range is invisible in any test
+/// that uses a uniform state. The fixed-range order is
+/// [`Sys::mtrr_fix`]'s — the one 64 KiB register, the two 16 KiB, the eight
+/// 4 KiB — and the variable-range order is `RDMSR`'s, base then mask.
+const fn carried_msrs() -> [u32; MSR_COUNT] {
+    let mut out = [0u32; MSR_COUNT];
+    out[0] = msr::STAR;
+    out[1] = msr::LSTAR;
+    out[2] = msr::CSTAR;
+    out[3] = msr::SFMASK;
+    out[4] = msr::KERNEL_GS_BASE;
+    out[MISC_AT] = msr::MISC_ENABLE;
+    out[DEF_TYPE_AT] = msr::MTRR_DEF_TYPE;
+    out[FIXED_AT] = msr::MTRR_FIX64K;
+    out[FIXED_AT + 1] = msr::MTRR_FIX16K;
+    out[FIXED_AT + 2] = msr::MTRR_FIX16K + 1;
+    let mut i = 0;
+    while i < mtrr::FIXED_COUNT - 3 {
+        out[FIXED_AT + 3 + i] = msr::MTRR_FIX4K + i as u32;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 2 * mtrr::VCNT as usize {
+        out[VAR_AT + i] = msr::MTRR_PHYSBASE0 + i as u32;
+        i += 1;
+    }
+    out
+}
+
+/// [`CARRIED_MSRS`] plus `IA32_TSC`, which is **read** on every transfer and
+/// **written** only on a restore.
+///
+/// The asymmetry is the whole of the time-stamp counter design and it is
+/// argued in the module documentation. One array rather than two calls because
+/// `KVM_GET_MSRS` takes a list, and asking for the counter in the same ioctl
+/// as the other thirty-four costs nothing.
+pub const READ_MSRS: [u32; MSR_COUNT + 1] = read_msrs();
+
+const fn read_msrs() -> [u32; MSR_COUNT + 1] {
+    let mut out = [msr::TSC; MSR_COUNT + 1];
+    let mut i = 0;
+    while i < MSR_COUNT {
+        out[i] = CARRIED_MSRS[i];
+        i += 1;
+    }
+    out
+}
+
+/// Where `IA32_TSC` sits in a [`READ_MSRS`] result.
+pub const TSC_AT: usize = MSR_COUNT;
 
 /// The values of [`CARRIED_MSRS`], read out of the interpreter.
+///
+/// `IA32_MISC_ENABLE` goes across **whole**, not masked: the accelerator is
+/// being told what part it is impersonating, and the bits outside
+/// [`misc_enable::WRITABLE`] are the part's own capability statement rather
+/// than anything the guest could have written. The reverse direction masks,
+/// for exactly the mirrored reason — see [`msrs_from_kvm`].
 #[must_use]
-pub fn msrs_to_kvm(sys: &Sys) -> [(u32, u64); 5] {
-    [
-        (msr::STAR, sys.star),
-        (msr::LSTAR, sys.lstar),
-        (msr::CSTAR, sys.cstar),
-        (msr::SFMASK, sys.sfmask),
-        (msr::KERNEL_GS_BASE, sys.kernel_gs_base),
-    ]
+pub fn msrs_to_kvm(sys: &Sys) -> [(u32, u64); MSR_COUNT] {
+    core::array::from_fn(|i| (CARRIED_MSRS[i], msr_value(sys, i)))
+}
+
+/// One carried register's value, by its index in [`CARRIED_MSRS`].
+fn msr_value(sys: &Sys, i: usize) -> u64 {
+    match i {
+        0 => sys.star,
+        1 => sys.lstar,
+        2 => sys.cstar,
+        3 => sys.sfmask,
+        4 => sys.kernel_gs_base,
+        MISC_AT => sys.misc_enable,
+        DEF_TYPE_AT => sys.mtrr_def_type,
+        _ if i < VAR_AT => sys.mtrr_fix[i - FIXED_AT],
+        _ => sys.mtrr_var[i - VAR_AT],
+    }
 }
 
 /// The same, in reverse: put the values of [`CARRIED_MSRS`] into `sys`.
-pub fn msrs_from_kvm(values: &[u64; 5], sys: &mut Sys) {
+///
+/// `IA32_MISC_ENABLE` is the one field that is **merged rather than
+/// replaced**, and the reason is that not every bit of it is guest state. Bits
+/// 11 and 12 say *this part has no branch-trace store and no precise
+/// event-based sampling*; a host kernel reports `0x1800` there out of reset
+/// and rsemu's core reports `0x1` (`misc_enable::RESET`), because they are
+/// describing two different processors. Copying the host's answer in would
+/// change what the emulated part claims about itself for no reason the guest
+/// asked for. What the guest *can* have changed is exactly
+/// [`misc_enable::WRITABLE`] — a `WRMSR` to any other bit raises `#GP(0)` on
+/// this core — so those bits transfer and the rest stay the part's.
+pub fn msrs_from_kvm(values: &[u64; MSR_COUNT], sys: &mut Sys) {
     sys.star = values[0];
     sys.lstar = values[1];
     sys.cstar = values[2];
     sys.sfmask = values[3];
     sys.kernel_gs_base = values[4];
+    sys.misc_enable =
+        (sys.misc_enable & !misc_enable::WRITABLE) | (values[MISC_AT] & misc_enable::WRITABLE);
+    sys.mtrr_def_type = values[DEF_TYPE_AT];
+    for (i, slot) in sys.mtrr_fix.iter_mut().enumerate() {
+        *slot = values[FIXED_AT + i];
+    }
+    for (i, slot) in sys.mtrr_var.iter_mut().enumerate() {
+        *slot = values[VAR_AT + i];
+    }
+}
+
+/// The first [`MSR_COUNT`] of a [`READ_MSRS`] result.
+#[must_use]
+pub fn carried_of(values: &[u64; MSR_COUNT + 1]) -> [u64; MSR_COUNT] {
+    core::array::from_fn(|i| values[i])
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +798,32 @@ pub fn load_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
     Ok(())
 }
 
+/// [`load_into_vcpu`], and **also** hand the vCPU the time-stamp counter.
+///
+/// The one call that writes `IA32_TSC`, and it is separate from
+/// [`load_into_vcpu`] on purpose. That function runs at the top of every
+/// hardware slice whose shell is ahead — after a reset sequence, after an
+/// instruction hardware could not fetch — and a `KVM_SET_MSRS` of the counter
+/// there would rewind the guest's clock by however long this process spent in
+/// userspace between the store and the load, on every slice. A guest that
+/// timed anything would see its counter stutter, which is a worse lie than the
+/// rate change a restore already admits to.
+///
+/// A restore is the moment when writing it is right: the counter is being
+/// handed a value that came from a snapshot, and the alternative is the vCPU's
+/// own — which, for a freshly created vCPU, is a counter that started when this
+/// process did. See the module documentation for what is and is not continuous
+/// across the switch.
+///
+/// # Errors
+///
+/// As [`load_into_vcpu`], plus [`AccelError::Unsupported`](super::AccelError::Unsupported)
+/// if this host refuses `IA32_TSC`.
+pub fn restore_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
+    load_into_vcpu(cpu, vcpu)?;
+    vcpu.set_msrs([(msr::TSC, cpu.cycles())])
+}
+
 /// Copy a vCPU's architectural state into the interpreter.
 ///
 /// What phase 7's gate calls *"a snapshot taken under KVM restores under the
@@ -592,7 +835,7 @@ pub fn load_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
 pub fn store_from_vcpu(vcpu: &Vcpu, cpu: &X86) -> AccelResult<()> {
     let regs = vcpu.regs()?;
     let sregs = vcpu.sregs()?;
-    let msrs = vcpu.msrs(CARRIED_MSRS)?;
+    let msrs = vcpu.msrs(READ_MSRS)?;
     let dregs = vcpu.debugregs()?;
     let fpu = vcpu.fpu()?;
     // Registers first, system state second, and the order is load-bearing:
@@ -604,12 +847,19 @@ pub fn store_from_vcpu(vcpu: &Vcpu, cpu: &X86) -> AccelResult<()> {
     // authoritative copy.
     cpu.set_regs(regs_from_kvm(&regs, &sregs));
     let mut sys = sregs_to_sys(&sregs, &cpu.sys());
-    msrs_from_kvm(&msrs, &mut sys);
+    msrs_from_kvm(&carried_of(&msrs), &mut sys);
     dregs_from_kvm(&dregs, &mut sys);
     cpu.set_sys(sys);
     let (x87, sse) = fpu_from_kvm(&fpu, &cpu.x87());
     cpu.set_x87(x87);
     cpu.set_sse(sse);
+    // The counter, unconditionally and in this direction only. What the
+    // hypervisor reports for `IA32_TSC` is what a `RDTSC` in the guest would
+    // have returned, and `X86::cycles` is where this core's `RDTSC` reads
+    // from, so the shell being *current after every slice* has to include it —
+    // otherwise `save` writes a counter belonging to whatever the interpreter
+    // last did rather than to the guest.
+    cpu.set_cycles(msrs[TSC_AT]);
     Ok(())
 }
 
@@ -649,8 +899,32 @@ pub fn differs(vcpu: &Vcpu, cpu: &X86) -> AccelResult<Option<&'static str>> {
         return Ok(Some("a descriptor table register"));
     }
     let sys = cpu.sys();
-    if vcpu.msrs(CARRIED_MSRS)? != msrs_to_kvm(&sys).map(|(_, data)| data) {
-        return Ok(Some("a model-specific register"));
+    let mut theirs = vcpu.msrs(CARRIED_MSRS)?;
+    let mut ours = msrs_to_kvm(&sys).map(|(_, data)| data);
+    // `IA32_MISC_ENABLE` is compared only over the bits a guest can write, for
+    // the reason [`msrs_from_kvm`] merges rather than replaces: the rest of it
+    // is each processor's statement about itself, the two processors are not
+    // the same one, and reporting that as a disagreement would make this
+    // function cry wolf on every call the way an unfiltered `MXCSR` would.
+    theirs[MISC_AT] &= misc_enable::WRITABLE;
+    ours[MISC_AT] &= misc_enable::WRITABLE;
+    if theirs != ours {
+        // Name the register rather than the group: with thirty-four of them a
+        // bare "a model-specific register" sends the reader to a diff.
+        let at = (0..MSR_COUNT)
+            .find(|&i| theirs[i] != ours[i])
+            .unwrap_or_default();
+        return Ok(Some(match at {
+            0 => "IA32_STAR",
+            1 => "IA32_LSTAR",
+            2 => "IA32_CSTAR",
+            3 => "IA32_FMASK",
+            4 => "IA32_KERNEL_GS_BASE",
+            MISC_AT => "IA32_MISC_ENABLE",
+            DEF_TYPE_AT => "IA32_MTRR_DEF_TYPE",
+            i if i < VAR_AT => "a fixed memory-type range",
+            _ => "a variable memory-type range",
+        }));
     }
     if vcpu.debugregs()? != dregs_to_kvm(&sys) {
         return Ok(Some("a debug register"));
@@ -685,25 +959,29 @@ pub struct ArchState {
     /// Segments, descriptor tables and control registers.
     pub sregs: KvmSregs,
     /// The values of [`CARRIED_MSRS`], in that order.
-    pub msrs: [u64; 5],
+    pub msrs: [u64; MSR_COUNT],
     /// `DR0`-`DR3`, `DR6`, `DR7`.
     pub dregs: KvmDebugregs,
     /// The x87 and SSE files.
     pub fpu: KvmFpu,
-    /// `IA32_TSC` as the accelerator reported it, and the rate it advances at
-    /// in kHz.
+    /// `IA32_TSC`: the value a `RDTSC` in the guest would return at the instant
+    /// this state was taken.
     ///
-    /// **Carried, not applied.** The interpreter's `RDTSC` reads its own
-    /// retired-cycle count, which is a different quantity in a different unit
-    /// and has no public setter. Dropping the value would be worse than
-    /// holding it: a caller that later gains somewhere to put it needs the
-    /// number to have survived the trip.
-    pub tsc: Option<(u64, u64)>,
+    /// **Architectural, and applied in both directions.** Both engines have
+    /// this register — a hypervisor reports it through `KVM_GET_MSRS`, and this
+    /// core's `RDTSC` reads [`X86::cycles`](crate::cpu::x86::X86::cycles) — so
+    /// the *value* crosses. What does not cross is the **rate**, which is a
+    /// property of the machine rather than of the guest; the module
+    /// documentation says what that costs.
+    ///
+    /// Never an *offset*. A hypervisor implements the counter as host silicon
+    /// plus a per-vCPU offset, and that offset is derived from this value and
+    /// the host's own counter at the moment of the write. `CLAUDE.md` says
+    /// derived state is never serialized, and this is the case it was written
+    /// for: an offset would make a snapshot meaningless on every host but the
+    /// one that took it, while the value is meaningful on all of them.
+    pub tsc: u64,
 }
-
-/// `IA32_TSC`, read separately from [`CARRIED_MSRS`] because it is the one
-/// value in this module that no engine can *apply* to the other.
-const TSC_MSR: [u32; 1] = [msr::TSC];
 
 impl ArchState {
     /// Read it out of a vCPU.
@@ -712,22 +990,25 @@ impl ArchState {
     ///
     /// [`AccelError::Sys`](super::AccelError::Sys) if either `ioctl` fails.
     pub fn from_vcpu(vcpu: &Vcpu) -> AccelResult<ArchState> {
+        let msrs = vcpu.msrs(READ_MSRS)?;
         Ok(ArchState {
             regs: vcpu.regs()?,
             sregs: vcpu.sregs()?,
-            msrs: vcpu.msrs(CARRIED_MSRS)?,
+            msrs: carried_of(&msrs),
             dregs: vcpu.debugregs()?,
             fpu: vcpu.fpu()?,
-            tsc: vcpu.msrs(TSC_MSR).ok().map(|v| (v[0], 0)),
+            tsc: msrs[TSC_AT],
         })
     }
 
     /// Read it out of the interpreter.
     ///
-    /// [`tsc`](ArchState::tsc) comes back `None`: the interpreter's counter is
-    /// its retired-cycle count, not a time-stamp counter with an offset, and
-    /// reporting one as the other is exactly the kind of quiet lie this module
-    /// exists to avoid.
+    /// [`tsc`](ArchState::tsc) is [`X86::cycles`](crate::cpu::x86::X86::cycles),
+    /// because that is where this core's `RDTSC` reads from. It used to come
+    /// back `None`, on the argument that a retired-cycle count is not a
+    /// time-stamp counter — which confused the *rate* with the *quantity*. The
+    /// quantity is the same one in both engines: what `RDTSC` returns. Only the
+    /// rate differs, and a rate belongs to the machine rather than to the guest.
     #[must_use]
     pub fn from_interpreter(cpu: &X86) -> ArchState {
         let sys = cpu.sys();
@@ -737,7 +1018,7 @@ impl ArchState {
             msrs: msrs_to_kvm(&sys).map(|(_, data)| data),
             dregs: dregs_to_kvm(&sys),
             fpu: fpu_to_kvm(&cpu.x87(), &cpu.sse()),
-            tsc: None,
+            tsc: cpu.cycles(),
         }
     }
 
@@ -783,10 +1064,17 @@ impl ArchState {
         sregs.tr = usable_task_register(sregs.tr, keep.3);
         vcpu.set_sregs(&sregs)?;
         vcpu.set_regs(&self.regs)?;
-        let values: [(u32, u64); 5] = core::array::from_fn(|i| (CARRIED_MSRS[i], self.msrs[i]));
+        let values: [(u32, u64); MSR_COUNT] =
+            core::array::from_fn(|i| (CARRIED_MSRS[i], self.msrs[i]));
         vcpu.set_msrs(values)?;
         vcpu.set_debugregs(&self.dregs)?;
-        vcpu.set_fpu(&self.fpu)
+        vcpu.set_fpu(&self.fpu)?;
+        // The counter last, and unlike [`load_into_vcpu`] this **does** write
+        // it: an `ArchState` is a state held outside both engines, so putting
+        // one into a vCPU is a restore by definition rather than the resumption
+        // of a slice. [`restore_into_vcpu`] makes the same call for the same
+        // reason.
+        vcpu.set_msrs([(msr::TSC, self.tsc)])
     }
 
     /// Write it into the interpreter.
@@ -802,6 +1090,7 @@ impl ArchState {
         let (x87, sse) = fpu_from_kvm(&self.fpu, &cpu.x87());
         cpu.set_x87(x87);
         cpu.set_sse(sse);
+        cpu.set_cycles(self.tsc);
     }
 }
 
@@ -967,13 +1256,24 @@ mod tests {
     fn the_carried_msrs_round_trip() {
         // The four `SYSCALL` registers plus `KERNEL_GS_BASE`: the set a 64-bit
         // guest loses across an engine switch if this does not work, with the
-        // symptom being a kernel entry that jumps to zero.
+        // symptom being a kernel entry that jumps to zero. And, since the set
+        // widened, every memory-type range too.
         let mut sys = Sys::reset();
         sys.star = 0x0023_0010_0000_0000;
         sys.lstar = 0xffff_8000_0010_0000;
         sys.cstar = 0xffff_8000_0010_1000;
         sys.sfmask = 0x0000_0000_0004_7700;
         sys.kernel_gs_base = 0xffff_8880_0000_0000;
+        sys.mtrr_def_type = mtrr::DEF_E | mtrr::DEF_FE | 6;
+        // Every register distinguishable from every other, so a transposition
+        // in the address arithmetic shows up as a wrong value rather than
+        // hiding behind a uniform state.
+        for (i, slot) in sys.mtrr_fix.iter_mut().enumerate() {
+            *slot = 0x0f00_0000_0000_0000 | i as u64;
+        }
+        for (i, slot) in sys.mtrr_var.iter_mut().enumerate() {
+            *slot = 0x0e00_0000_0000_0000 | i as u64;
+        }
 
         let pairs = msrs_to_kvm(&sys);
         assert_eq!(
@@ -988,6 +1288,105 @@ mod tests {
         assert_eq!(back.cstar, sys.cstar);
         assert_eq!(back.sfmask, sys.sfmask);
         assert_eq!(back.kernel_gs_base, sys.kernel_gs_base);
+        assert_eq!(back.mtrr_def_type, sys.mtrr_def_type);
+        assert_eq!(back.mtrr_fix, sys.mtrr_fix);
+        assert_eq!(back.mtrr_var, sys.mtrr_var);
+    }
+
+    #[test]
+    fn the_carried_msr_addresses_are_the_ones_the_sdm_names() {
+        // The table is generated rather than typed, so what a test can add is
+        // that the generator agrees with *Intel SDM* volume 4 Table 2-2. A
+        // wrong address here is a `#GP` from the kernel at best and a silently
+        // transferred neighbour at worst.
+        assert_eq!(MSR_COUNT, 34, "5 syscall + 2 + 11 fixed + 16 variable");
+        assert_eq!(
+            &CARRIED_MSRS[..7],
+            &[
+                0xc000_0081,
+                0xc000_0082,
+                0xc000_0083,
+                0xc000_0084,
+                0xc000_0102,
+                0x1a0,
+                0x2ff
+            ]
+        );
+        // The eleven fixed ranges: one 64 KiB, two 16 KiB, eight 4 KiB.
+        assert_eq!(
+            &CARRIED_MSRS[FIXED_AT..VAR_AT],
+            &[
+                0x250, 0x258, 0x259, 0x268, 0x269, 0x26a, 0x26b, 0x26c, 0x26d, 0x26e, 0x26f
+            ]
+        );
+        // The eight variable ranges as base/mask pairs at consecutive
+        // addresses, which is why `Sys::mtrr_var` is one flat array.
+        assert_eq!(CARRIED_MSRS[VAR_AT], 0x200);
+        assert_eq!(CARRIED_MSRS[MSR_COUNT - 1], 0x20f);
+        // And the read list is the write list plus the counter, in that order,
+        // so `carried_of` can take a prefix.
+        assert_eq!(&READ_MSRS[..MSR_COUNT], &CARRIED_MSRS);
+        assert_eq!(READ_MSRS[TSC_AT], msr::TSC);
+    }
+
+    #[test]
+    fn misc_enable_carries_what_a_guest_wrote_and_not_what_the_part_is() {
+        // The asymmetry `msrs_from_kvm` argues for. A host kernel reports
+        // `0x1800` out of reset — bits 11 and 12, *no branch-trace store, no
+        // precise event-based sampling* — and this core reports `0x1`. Those
+        // describe two different processors, so copying the host's answer in
+        // would change what the emulated part claims about itself.
+        let mut sys = Sys::reset();
+        assert_eq!(sys.misc_enable, misc_enable::RESET);
+
+        // What a hypervisor might hand back: the host's capability bits, plus
+        // the one bit a guest really did write (Linux clears the execute-disable
+        // lock before it looks for `NX`, and firmware sets it).
+        let mut from_hardware = [0u64; MSR_COUNT];
+        from_hardware[MISC_AT] = 0x1800 | misc_enable::XD_DISABLE;
+        msrs_from_kvm(&from_hardware, &mut sys);
+        assert_eq!(
+            sys.misc_enable & misc_enable::XD_DISABLE,
+            misc_enable::XD_DISABLE,
+            "the guest's write crossed"
+        );
+        assert_eq!(
+            sys.misc_enable & 0x1800,
+            0,
+            "and the host's statement about its own silicon did not"
+        );
+        assert_eq!(
+            sys.misc_enable & misc_enable::FAST_STRINGS,
+            0,
+            "a writable bit the hypervisor reported clear is cleared here too"
+        );
+
+        // The other direction is *not* masked: the accelerator is being told
+        // what part it is impersonating.
+        let mut ours = Sys::reset();
+        ours.misc_enable = misc_enable::RESET | misc_enable::XD_DISABLE;
+        assert_eq!(msrs_to_kvm(&ours)[MISC_AT].1, ours.misc_enable);
+    }
+
+    #[test]
+    fn an_arch_state_carries_the_counter_as_a_value() {
+        // `CLAUDE.md`: derived state is never serialized. A hypervisor's TSC
+        // *offset* is derived from the value and the host's own counter, so it
+        // is meaningless anywhere else; the value is meaningful everywhere.
+        // This asserts the type stores the second one — a `u64`, unconditional,
+        // rather than an `Option` that says "the other engine cannot use this".
+        let cpu = X86::new(crate::cpu::x86::Config::X86_64);
+        cpu.set_cycles(0x0000_4200_0000_0000);
+        let state = ArchState::from_interpreter(&cpu);
+        assert_eq!(state.tsc, 0x0000_4200_0000_0000);
+
+        let far = X86::new(crate::cpu::x86::Config::X86_64);
+        state.into_interpreter(&far);
+        assert_eq!(
+            far.cycles(),
+            0x0000_4200_0000_0000,
+            "and it lands where this core's RDTSC reads from"
+        );
     }
 
     #[test]

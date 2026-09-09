@@ -851,12 +851,20 @@ fn the_syscall_msrs_the_debug_registers_and_the_fpu_survive_hardware() {
     );
 }
 
-/// The counter is *carried* even though neither engine can hand it to the
-/// other, and the type says which of those two things is true.
+/// The counter crosses in **both** directions, and is a value rather than an
+/// offset.
+///
+/// This test used to assert the opposite — that the interpreter's counter was
+/// "a retired-cycle count, not a TSC" and so could not be handed over. That
+/// confused the *rate* with the *quantity*. `RDTSC` on this core reads
+/// [`X86::cycles`](crate::cpu::x86::X86::cycles) (`prot::Exec::rdmsr`,
+/// `msr::TSC`), so both engines have the same architectural register; only the
+/// rate at which it advances differs, and a rate belongs to the machine rather
+/// than to the guest. What that costs is asserted below rather than glossed.
 #[cfg(feature = "cpu-x86")]
 #[test]
-fn the_time_stamp_counter_is_carried_and_admits_it_cannot_be_applied() {
-    use crate::accel::state::ArchState;
+fn the_time_stamp_counter_crosses_in_both_directions() {
+    use crate::accel::state::{self, ArchState};
     use crate::cpu::x86::{Config, X86};
 
     let Some(kvm) = kvm() else { return };
@@ -865,19 +873,47 @@ fn the_time_stamp_counter_is_carried_and_admits_it_cannot_be_applied() {
 
     let from_hardware = ArchState::from_vcpu(&vcpu).expect("read the vCPU");
     assert!(
-        from_hardware.tsc.is_some(),
+        from_hardware.tsc > 0,
         "the accelerator knows what RDTSC would read"
     );
     assert!(
         guest.vm.tsc_khz().is_ok(),
-        "and at what rate it advances, which is the other half"
+        "and at what rate it advances, which is the machine's half"
     );
 
-    let cpu = X86::new(Config::I80486);
+    // Hardware to the interpreter: a `store_from_vcpu` leaves the shell's
+    // `RDTSC` reading what the guest's would have.
+    let cpu = X86::new(Config::X86_64);
+    cpu.attach_space(Arc::clone(&guest.mem));
+    cpu.attach_io_space(Arc::clone(&guest.io));
+    state::store_from_vcpu(&vcpu, &cpu).expect("hardware to the interpreter");
     assert!(
-        ArchState::from_interpreter(&cpu).tsc.is_none(),
-        "the interpreter's counter is a retired-cycle count, not a TSC, and \
-         saying otherwise would be the quiet lie this module exists to avoid"
+        cpu.cycles() >= from_hardware.tsc,
+        "the shell's counter is the guest's, not its own retired-cycle count"
+    );
+
+    // The interpreter to hardware, which is the direction that has to
+    // recompute the hypervisor's offset. A value far from anything this host
+    // could be counting, so that "it stuck" cannot be a coincidence.
+    const MARK: u64 = 0x0000_4200_0000_0000;
+    cpu.set_cycles(MARK);
+    state::restore_into_vcpu(&cpu, &vcpu).expect("the interpreter to hardware");
+    let after = vcpu.msrs([crate::cpu::x86::prot::msr::TSC]).expect("RDTSC")[0];
+    assert!(
+        after >= MARK && after - MARK < 1_000_000_000,
+        "the vCPU's counter was set to the shell's and kept running: {after:#x}"
+    );
+
+    // And the ordinary slice-boundary push does **not** write it: doing so on
+    // every slice would rewind the guest's clock by the userspace time between
+    // the store and the load. `accel::state::load_into_vcpu` is that call.
+    let before = vcpu.msrs([crate::cpu::x86::prot::msr::TSC]).expect("RDTSC")[0];
+    cpu.set_cycles(1);
+    state::load_into_vcpu(&cpu, &vcpu).expect("a slice-boundary push");
+    let unchanged = vcpu.msrs([crate::cpu::x86::prot::msr::TSC]).expect("RDTSC")[0];
+    assert!(
+        unchanged >= before,
+        "a slice-boundary push must not move the counter: {before:#x} -> {unchanged:#x}"
     );
 }
 

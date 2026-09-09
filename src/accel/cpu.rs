@@ -360,6 +360,7 @@ impl AccelCpus {
             nmi: Arc::new(NmiLatch::default()),
             pins: Mutex::new(Vec::new()),
             dirty: AtomicBool::new(true),
+            tsc_dirty: AtomicBool::new(true),
             halted: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             resume: AtomicBool::new(false),
@@ -570,6 +571,21 @@ pub struct AccelCpu {
     /// direction needs no flag, because every hardware slice ends by writing
     /// the shell.
     dirty: AtomicBool,
+    /// Whether the shell's time-stamp counter is one the vCPU has not been
+    /// given, so that the next push writes `IA32_TSC` as well.
+    ///
+    /// **A second flag rather than a wider [`dirty`](AccelCpu::dirty), and the
+    /// distinction is the whole of the counter's design.** `dirty` says *the
+    /// shell ran an instruction hardware could not*, which happens routinely —
+    /// once per reset vector on `q35-linux`, and at every restart sequence —
+    /// and a `KVM_SET_MSRS` of `IA32_TSC` on each of those would rewind the
+    /// guest's clock by the userspace time between the store and the load. This
+    /// one says *the shell's counter came from somewhere other than this vCPU*:
+    /// a snapshot, or a reset, which are exactly the two moments at which the
+    /// hypervisor's offset has to be recomputed. `accel::state`'s
+    /// [`restore_into_vcpu`](crate::accel::state::restore_into_vcpu) is the
+    /// call it selects.
+    tsc_dirty: AtomicBool,
     /// Whether the guest is waiting for an interrupt at a `HLT`.
     halted: AtomicBool,
     /// Whether the processor has stopped for good: a triple fault, or a
@@ -865,7 +881,11 @@ impl AccelCpu {
             return Ok(());
         }
         if self.dirty.swap(false, Ordering::AcqRel) {
-            state::load_into_vcpu(&self.shell, &vcpu)?;
+            if self.tsc_dirty.swap(false, Ordering::AcqRel) {
+                state::restore_into_vcpu(&self.shell, &vcpu)?;
+            } else {
+                state::load_into_vcpu(&self.shell, &vcpu)?;
+            }
         }
         // An edge, taken once. It also ends a `HLT`, which is the whole point
         // of a non-maskable interrupt.
@@ -1064,20 +1084,36 @@ impl Device for AccelCpu {
         self.resume.store(false, Ordering::Release);
         *self.failure.lock() = None;
         self.dirty.store(true, Ordering::Release);
+        // *Intel SDM* volume 3A Table 9-1: the time-stamp counter is zero after
+        // `RESET`. `X86::reset` has already done that to the shell; this is what
+        // makes the vCPU agree, and without it a reset guest would `RDTSC` a
+        // counter that had been running since this process opened `/dev/kvm`.
+        self.tsc_dirty.store(true, Ordering::Release);
     }
 
     fn flush(&self) -> Result<()> {
         self.shell.flush()
     }
 
-    /// The interpreter's chunk, verbatim — version 7, byte for byte.
+    /// The interpreter's chunk, verbatim — [`CLASS`]'s version, byte for byte.
     ///
     /// That is the cross-engine half of phase 7's gate and it is achieved by
     /// *not having a second format*: the shell is current after every slice,
-    /// so what is written here is what the guest has. The three fields this
-    /// engine keeps outside the shell — a pending `NMI`, the `NMI` level and
-    /// `halted` — are named in the module documentation rather than smuggled
-    /// into a chunk the interpreter could not read.
+    /// so what is written here is what the guest has. **"Current" is a claim
+    /// about a list of fields**, and the list is
+    /// [`accel::state`](crate::accel::state)'s — the register file, the system
+    /// state, thirty-four model-specific registers, the debug registers, the
+    /// x87 and SSE files, and the time-stamp counter. A field missing from that
+    /// list is not written here either, however complete the chunk looks, which
+    /// is exactly how the memory-type ranges came to be saved as zeros off a
+    /// vCPU that had them programmed. The module documentation's honest list is
+    /// what is left.
+    ///
+    /// The three fields this engine keeps outside the shell — a pending `NMI`,
+    /// the `NMI` level and `halted` — are named in the module documentation
+    /// rather than smuggled into a chunk the interpreter could not read.
+    ///
+    /// [`CLASS`]: crate::cpu::x86::CLASS
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         self.shell.save(w)
     }
@@ -1089,6 +1125,11 @@ impl Device for AccelCpu {
         self.stopped.store(false, Ordering::Release);
         self.resume.store(false, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
+        // Including the counter: the shell's is the snapshot's, and the vCPU's
+        // is whatever it happened to be running at. This is the moment the
+        // hypervisor's TSC offset is recomputed, and the only one on this path
+        // besides a reset.
+        self.tsc_dirty.store(true, Ordering::Release);
         Ok(())
     }
 }
