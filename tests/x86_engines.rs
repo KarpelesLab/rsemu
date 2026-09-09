@@ -402,10 +402,17 @@ fn the_engine_property_is_read_rather_than_accepted_and_ignored() {
     let plain_compiled = plain.jit_stats().expect("statistics").compiled;
     let host_compiled = host.jit_stats().expect("statistics").compiled;
     assert_eq!(plain_compiled, 0, "the portable backend compiles nothing");
-    if cfg!(all(
-        feature = "jit-x86",
-        target_os = "linux",
-        target_arch = "x86_64"
+    if cfg!(any(
+        all(
+            feature = "jit-x86",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ),
+        all(
+            feature = "jit-arm64",
+            target_os = "linux",
+            target_arch = "aarch64"
+        )
     )) {
         assert!(
             host_compiled > 0,

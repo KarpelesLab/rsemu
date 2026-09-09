@@ -579,18 +579,24 @@ fn run_translated(
 /// `ROADMAP.md` §9's x86-64 backend is behind `jit-x86` and `cfg`-gated to an
 /// x86-64 Linux host, so this file builds and runs everywhere and the compiled
 /// column simply repeats the `+superblock` one where there is no backend.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 fn with_backend(disp: Dispatcher, allocate: bool) -> Dispatcher {
-    let mut engine = rsemu::jit::x86::Engine::new().expect("a W^X code buffer");
+    let mut engine = rsemu::jit::host::Engine::new().expect("a W^X code buffer");
     engine.set_regs(if allocate {
-        rsemu::jit::x86::Regs::Scan
+        rsemu::jit::host::Regs::Scan
     } else {
-        rsemu::jit::x86::Regs::Frame
+        rsemu::jit::host::Regs::Frame
     });
     disp.with_backend(engine)
 }
 
-#[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+)))]
 fn with_backend(disp: Dispatcher, _allocate: bool) -> Dispatcher {
     disp
 }

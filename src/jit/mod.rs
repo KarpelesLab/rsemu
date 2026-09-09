@@ -13,12 +13,12 @@
 //!
 //! Those three are this module, and all three are reachable with
 //! [`ir::Interp`](crate::ir::Interp) as the executor. **The fourth is now
-//! here too**: [`x86`] is a host code generator, and it slots in under
-//! [`Dispatcher`] as a different way to execute a
-//! [`Block`](crate::ir::Block) — which is exactly the shape this module was
-//! left in for it. A block it refuses runs on the interpreter, so the two
-//! engines are alternatives rather than a switch, and the interpreter stays
-//! the oracle either way.
+//! here too**: [`x86`] and [`arm64`] are host code generators, and whichever
+//! of them a build has slots in under [`Dispatcher`] — as `jit::host` — as a
+//! different way to execute a [`Block`](crate::ir::Block), which is exactly
+//! the shape this module was left in for it. A block one of them refuses runs
+//! on the interpreter, so the two engines are alternatives rather than a
+//! switch, and the interpreter stays the oracle either way.
 //!
 //! The first mechanism's *"inlined into generated code"* clause is
 //! [`MemPlan`]'s job — what a host offers and what [`x86`] reads — and it is
@@ -47,14 +47,18 @@
 //! cache and the dispatcher need neither**, so they are `no_std + alloc` like
 //! the IR they serve, and §11's bare-metal row — whose engine is the IR
 //! interpreter — gets them too rather than being the one target that runs
-//! everything cold. The `std` line moves in the file that needs it, and the
-//! file that needs it is [`x86`], which is behind its own feature and
-//! `cfg`-gated to an x86-64 Linux host.
+//! everything cold. The `std` line moves in the files that need it, and those
+//! are the two host backends — [`x86`] and [`arm64`], each behind its own
+//! feature and `cfg`-gated to the one host it emits for. `jit::host` is the name
+//! the dispatcher and the CPU engines reach whichever of them a build has by.
 //!
 //! The same split holds for `unsafe`. There is **none** in this module or in
 //! its three `no_std` files; the one sanctioned opt-in in this subsystem is
 //! the JIT *code buffer* (CLAUDE.md, "`unsafe`"), and it is confined to
-//! [`x86::buf`] and [`x86::rt`] — mapping the memory, and crossing into it.
+//! [`x86::buf`], [`x86::rt`] and their `arm64` counterparts — mapping the
+//! memory, and crossing into it. A second backend is the same sanctioned site
+//! implemented for a second host, not an eighth one.
+//!
 //! Guest RAM is still reached by byte offset through
 //! [`RamStore`](crate::core::space::RamStore) — never as a `&mut [u8]` — so
 //! the TLB's "host addend" is an addend into a store, which is what keeps it
@@ -162,19 +166,27 @@ pub mod arm64;
 /// call through it costs exactly what a call through the concrete module
 /// costs.
 ///
-/// # What still names the concrete module, and why that is a defect
+/// # Who names it, and why it is not a trait
 ///
-/// [`Dispatcher`] does. `dispatch.rs` holds `Option<x86::Engine>` behind
-/// `cfg(all(feature = "jit-x86", target_os = "linux", target_arch =
-/// "x86_64"))` in a dozen places, and every CPU engine that attaches a backend
-/// repeats that `cfg` — so on an aarch64 host [`Dispatcher::with_backend`]
-/// does not exist and `engine = "jit-host"` still runs the interpreter, even
-/// in a build with [`arm64`] compiled and tested. Replacing those `cfg`s with
-/// this alias is the change that connects the second backend to a guest; it
-/// touches `jit::dispatch` and three `cpu::*::engine` files and was
-/// deliberately left out of the round that added [`arm64`], so that a new
-/// backend and a change to the seam every existing guest runs through would
-/// not land together.
+/// [`Dispatcher`] holds `Option<host::Engine>`, and every `cpu::*::engine`
+/// that attaches a backend builds one through this name. The `cfg` around
+/// each of those sites is the same two-armed predicate — *"an x86-64 Linux
+/// host with `jit-x86`, or an aarch64 Linux host with `jit-arm64`"* — which is
+/// exactly the condition under which this alias resolves, and it is written
+/// out at every site rather than hidden behind a build script so that a reader
+/// of any one of them can see what it says.
+///
+/// A trait was the obvious alternative and is the wrong tool twice over.
+/// `x86::Engine::run` and `arm64::Engine::run` are generic in the host
+/// (`run<H: IrHost + FastMem>`), because the thunk table a block calls into is
+/// `Vtable::of::<H>()` — monomorphised per host type, resolved at compile
+/// time. A generic method is not object-safe, so `dyn Backend` cannot express
+/// it; a `Backend<H>` would make [`Dispatcher`] generic in `H`, and a
+/// dispatcher is stored in a CPU's `Jit` where `H` is not nameable. And the
+/// cost would land in the worst possible place: block entry is ~490 host
+/// instructions, and `Dispatcher::execute` is on the path of every one of
+/// them. Two implementations that no build can hold at once do not need
+/// dynamic dispatch — they need a name, and this is it.
 #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
 pub use x86 as host;
 

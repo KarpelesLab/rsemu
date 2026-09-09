@@ -743,8 +743,11 @@ pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergenc
 /// # Errors
 ///
 /// A [`Divergence`], as [`compare`].
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
 pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
     Ok(cached(case, blocks, true)?.verdict)
 }
@@ -754,8 +757,11 @@ pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergenc
 /// # Errors
 ///
 /// A [`Divergence`], as [`compare`].
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
 pub fn measure_compiled(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
     cached(case, blocks, true)
 }
@@ -813,8 +819,11 @@ impl<H: ?Sized> Frontend<H> for Lifter<'_> {
 #[cfg(feature = "jit")]
 fn dispatcher(compiled: bool) -> Dispatcher {
     let disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-    if compiled && let Some(engine) = crate::jit::x86::Engine::new() {
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    if compiled && let Some(engine) = crate::jit::host::Engine::new() {
         return disp.with_backend(engine);
     }
     let _ = compiled;

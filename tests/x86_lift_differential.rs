@@ -684,7 +684,10 @@ fn a_paged_store_into_a_running_blocks_own_page_is_honoured() {
 /// x86 is the frontend that exercises the lowerings RISC-V never reaches:
 /// `popcount` on the parity flag, `extract` on the auxiliary carry, both
 /// widening multiplies, the rotates through carry, `bswap`, `clz` and `ctz`.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 #[test]
 fn the_same_corpus_agrees_when_it_is_compiled_to_host_code() {
     use rsemu::cpu::x86::differential::measure_compiled;
@@ -785,7 +788,10 @@ fn a_store_through_the_other_mapping_of_the_code_page_is_honoured() {
 /// the extract behind `AF`, both rotates through carry, `bswap`, `clz`, `ctz`
 /// and the shifts, at the width where an off-by-one in a mask is invisible in
 /// the narrower case.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 #[test]
 fn the_long_mode_corpus_agrees_when_it_is_compiled_to_host_code() {
     use rsemu::cpu::x86::differential::measure_compiled;
@@ -1087,7 +1093,10 @@ fn a_computed_near_transfer_is_judged_the_same_through_the_runtime() {
             rejects,
             "{what} through the cached runtime: {verdict:?}"
         );
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             let verdict = rsemu::cpu::x86::differential::compare_compiled(&case, 8)
                 .expect("the host code generator agrees");

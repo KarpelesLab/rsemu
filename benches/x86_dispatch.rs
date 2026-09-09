@@ -377,17 +377,23 @@ enum Regs {
 /// The backend is behind `jit-x86` and `cfg`-gated to an x86-64 Linux host, so
 /// this file builds and runs everywhere; where there is no backend the compiled
 /// column simply repeats the one beside it.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 fn with_backend(disp: Dispatcher, regs: Regs) -> Dispatcher {
-    let mut engine = rsemu::jit::x86::Engine::new().expect("a W^X code buffer");
+    let mut engine = rsemu::jit::host::Engine::new().expect("a W^X code buffer");
     engine.set_regs(match regs {
-        Regs::Frame => rsemu::jit::x86::Regs::Frame,
-        Regs::Scan => rsemu::jit::x86::Regs::Scan,
+        Regs::Frame => rsemu::jit::host::Regs::Frame,
+        Regs::Scan => rsemu::jit::host::Regs::Scan,
     });
     disp.with_backend(engine)
 }
 
-#[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+)))]
 fn with_backend(disp: Dispatcher, _regs: Regs) -> Dispatcher {
     disp
 }

@@ -114,8 +114,11 @@ use crate::jit::cache::{BlockCache, BlockId, CacheStats};
 use crate::jit::fast::FastMem;
 use crate::jit::tlb::{Epoch, PAGE_MASK, PAGE_SIZE};
 
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-use crate::jit::x86::Engine;
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+use crate::jit::host::Engine;
 
 /// One freshly lifted block, and what the cache needs to know about it.
 #[derive(Debug)]
@@ -370,7 +373,10 @@ pub struct Dispatcher {
     ///
     /// `None` is the whole of the portable path: every block is interpreted,
     /// which is what `no_std`, wasm and any host without a backend do.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     backend: Option<Engine>,
     exit: Option<ExitFlag>,
     stats: DispatchStats,
@@ -389,7 +395,10 @@ impl Dispatcher {
         Dispatcher {
             cache,
             interp: Interp::new(),
-            #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(any(
+                all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+                all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+            ))]
             backend: None,
             exit: None,
             stats: DispatchStats::default(),
@@ -403,8 +412,11 @@ impl Dispatcher {
     /// memory, same faults, same ticks, in the same order — which is the claim
     /// both differential harnesses check. So this is a speed knob and never a
     /// semantic one.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
     #[must_use]
     pub fn with_backend(mut self, engine: Engine) -> Dispatcher {
         self.backend = Some(engine);
@@ -412,8 +424,11 @@ impl Dispatcher {
     }
 
     /// The host code generator, if this dispatcher has one.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
     #[inline]
     #[must_use]
     pub fn backend(&self) -> Option<&Engine> {
@@ -631,7 +646,10 @@ impl Dispatcher {
     where
         H: IrHost + FastMem,
     {
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             // Destructured, because compiling reads the block out of the cache
             // while the engine is borrowed mutably, and the two are different
@@ -912,7 +930,10 @@ mod tests {
     /// points, whichever ran the block — and the run is done twice, once each
     /// way, on the same programs, so the numbers are compared rather than
     /// merely asserted.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     #[test]
     fn a_compiled_block_charges_exactly_what_an_interpreted_one_charges() {
         let mut interpreted = Dispatcher::new();
@@ -922,7 +943,7 @@ mod tests {
             .expect("runs");
 
         let mut compiled = Dispatcher::new()
-            .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+            .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
         let mut hc = Host::default();
         let b = compiled
             .run(&mut chain(4, 0x1010), &mut hc, 0x1000, 97)
@@ -1156,7 +1177,10 @@ mod tests {
     }
 
     /// The same, compiled.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     #[test]
     fn a_compiled_run_never_leaves_at_an_exit_boundary_either() {
         // The backend is told which boundaries are exit boundaries at compile
@@ -1181,7 +1205,7 @@ mod tests {
                 .expect("runs");
 
             let mut compiled = Dispatcher::with_cache(BlockCache::with_capacity(64))
-                .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+                .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
             let mut hc = Host::within(allowance);
             let b = compiled
                 .run(
@@ -1232,7 +1256,10 @@ mod tests {
     /// charged and the same guest state, or a core that admits a block it is
     /// not sure fits produces a different state hash depending on which engine
     /// ran it. Compared rather than asserted — both runs, same programs.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     #[test]
     fn a_compiled_block_leaves_at_exactly_the_boundary_the_interpreter_leaves_at() {
         for allowance in [0u64, 1, 5, 15, 16, 31, 100] {
@@ -1248,7 +1275,7 @@ mod tests {
                 .expect("runs");
 
             let mut compiled = Dispatcher::new()
-                .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+                .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
             let mut hc = Host::within(allowance);
             let b = compiled
                 .run(&mut traces(), &mut hc, 0x1000, 10)
@@ -1272,7 +1299,10 @@ mod tests {
     /// A different shape on purpose: here the allowance runs out between
     /// blocks as often as inside one, so the dispatcher's own boundary check
     /// and the backend's have to agree with the interpreter's *together*.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     #[test]
     fn a_compiled_chain_leaves_where_an_interpreted_chain_leaves() {
         for allowance in [0u64, 1, 2, 3, 7, 40] {
@@ -1283,7 +1313,7 @@ mod tests {
                 .expect("runs");
 
             let mut compiled = Dispatcher::with_cache(BlockCache::with_capacity(64))
-                .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+                .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
             let mut hc = Host::within(allowance);
             let b = compiled
                 .run(&mut chain(4, 0x1010), &mut hc, 0x1000, 40)
@@ -1328,13 +1358,16 @@ mod tests {
     /// flag is honoured is still bounded by a frontend's own instruction limit.
     /// That is asserted rather than argued, because "the backend did not change
     /// it" is the kind of claim that stops being true quietly.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     #[test]
     fn a_raised_exit_flag_stops_a_compiled_run_within_one_block_too() {
         let flag = ExitFlag::default();
         let mut d = Dispatcher::new()
             .with_exit_flag(flag.clone())
-            .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+            .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
         let mut f = Traces {
             insns: 64,
             leave_at: None,

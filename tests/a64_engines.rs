@@ -201,10 +201,17 @@ fn the_host_code_generator_actually_compiles_where_the_build_has_one() {
     let stats = cpu.jit_stats().expect("a translated core has statistics");
     assert!(stats.blocks > 0, "no block ran");
     let compiled = stats.compiled;
-    if cfg!(all(
-        feature = "jit-x86",
-        target_os = "linux",
-        target_arch = "x86_64"
+    if cfg!(any(
+        all(
+            feature = "jit-x86",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ),
+        all(
+            feature = "jit-arm64",
+            target_os = "linux",
+            target_arch = "aarch64"
+        )
     )) {
         assert!(
             compiled > 0,

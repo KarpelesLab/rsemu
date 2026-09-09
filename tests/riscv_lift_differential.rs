@@ -303,7 +303,10 @@ fn the_cached_path_agrees_on_a_core_with_compressed_instructions() {
 /// interpreter, so this is a superset of the cached sweep above and a mixture
 /// of the two engines is the normal case — which is why the last assertion is
 /// that compilation actually happened.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 #[test]
 fn the_generated_corpus_agrees_when_it_is_compiled_to_host_code() {
     use rsemu::cpu::riscv::differential::measure_compiled;

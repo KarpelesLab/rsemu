@@ -199,19 +199,34 @@ Apple-silicon build gets what it has always had: the IR interpreter.
 on an aarch64 host. This backend was written on an x86-64 machine, which cannot
 execute a single instruction it emits.
 
-What would answer it, in order:
+What would answer it, in order. **The first two are done**; the third needs a
+machine.
 
-1. Make the backend reachable from a guest. `jit::dispatch` holds
-   `Option<jit::x86::Engine>` behind a `cfg` naming the concrete module, and
-   every `cpu::*::engine` that attaches a backend repeats that `cfg` — so on an
-   aarch64 host `engine = "jit-host"` still runs the interpreter even in a
-   build with this backend compiled. `jit::host` is the alias those `cfg`s
-   should be rewritten against; the modules already offer identical names, so
-   the change is mechanical and touches no code generation.
-2. Widen `benches/jit_dispatch.rs`, `benches/a64_dispatch.rs` and
-   `benches/x86_dispatch.rs`'s `with_backend` to that alias. Their `+compiled`
-   and `+allocated` columns are then the measurement, unchanged, on a second
-   host.
+1. ~~Make the backend reachable from a guest.~~ Done. `jit::dispatch` holds
+   `Option<jit::host::Engine>`, and the `cfg` at every one of the seam's sites
+   — the dispatcher, `cpu::riscv::engine`, `cpu::arm::a64::engine`,
+   `cpu::x86::engine` and the three CPU differentials — is now the two-armed
+   predicate `any(all(feature = "jit-x86", target_os = "linux", target_arch =
+   "x86_64"), all(feature = "jit-arm64", target_os = "linux", target_arch =
+   "aarch64"))`. On an aarch64 Linux host with `jit-arm64`, `jit::host`
+   resolves to this backend and `engine = "jit-host"` reaches it.
+
+   It stayed a compile-time alias rather than becoming a trait, and that was
+   not laziness: `Engine::run<H: IrHost + FastMem>` is generic in the host
+   because the thunk table a block calls into is `Vtable::of::<H>()`, so a
+   generic method cannot be object-safe and `dyn Backend` cannot express it;
+   `Backend<H>` would make `Dispatcher` generic in a type its owning `Jit`
+   cannot name. Two implementations no build can hold at once need a name, not
+   dynamic dispatch — and the seam sits on the block-entry path, which is
+   ~490 host instructions and 24.3% of a compiled run.
+
+   The rewrite was verified to cost nothing on x86-64 in the strongest way
+   available: the `.text` sections of `jit_dispatch`, `x86_dispatch` and
+   `a64_dispatch` are **byte-identical** before and after, and callgrind's
+   per-function counts match to the digit.
+2. ~~Widen the benchmarks' `with_backend` to that alias.~~ Done, in all three.
+   Their `+compiled` and `+allocated` columns are the measurement, unchanged,
+   on a second host.
 3. Run them. The interesting rows are the ones where the two hosts should
    *differ*: `alu-loop` (does the extra callee-saved register keep more guest
    registers live?), `load-heavy` (the inlined probe is shorter here — three
@@ -220,3 +235,58 @@ What would answer it, in order:
 
 Until then the honest claim is the one the module makes: it emits the
 instructions the manual says it does, and whether that is fast is unmeasured.
+
+## The CI step this needs, and why `cargo test` is not it
+
+The `aarch64 (weak memory)` job already runs `cargo test --all-features`, and
+that is **not** enough to catch a lost host gate. Every test that needs a code
+generator is `cfg`-gated on there being one, so a build in which `jit::host`
+stopped resolving to this backend would not fail those tests — it would
+*delete* them, and report green with a smaller suite. A count is the only thing
+that can tell the two apart, which is why this step exists and why it is a
+count rather than an assertion inside a test.
+
+```yaml
+      # `cargo test --all-features` above passes whether or not this backend is
+      # wired to a guest: the tests that need a host code generator are
+      # `cfg`-gated on having one, so losing the gate deletes them rather than
+      # failing them, and a smaller green suite is indistinguishable from a
+      # correct one. Count them.
+      #
+      #   jit::arm64::tests::executed::*   the differential against `ir::Interp`,
+      #                                    compiled only on aarch64 Linux — five
+      #                                    tests, each over a corpus.
+      #   jit::dispatch::tests::a_compiled_* and the exit-flag case
+      #                                    exist only where `jit::host::Engine`
+      #                                    resolves, which on this runner means
+      #                                    the aarch64 backend, not the x86 one.
+      #
+      # Floors, not equalities: a test added later must not turn this red.
+      - name: the aarch64 backend is reachable, not merely compiled
+        run: |
+          set -euo pipefail
+          list=$(cargo test --all-features --lib -- --list)
+          executed=$(printf '%s\n' "$list" | grep -c '^jit::arm64::tests::executed::' || true)
+          seam=$(printf '%s\n' "$list" | grep -cE '^jit::dispatch::tests::a_(compiled_|raised_exit_flag_stops_a_compiled_)' || true)
+          printf '%s\n' "$list" | grep -E '^(jit::arm64::tests::executed::|jit::dispatch::tests::a_compiled_)' || true
+          echo "executed differential: $executed; dispatcher seam: $seam"
+          if [ "$executed" -lt 5 ]; then
+            echo "::error title=aarch64 backend::jit::arm64::tests::executed has $executed tests, expected at least 5 - the differential is not being compiled"
+            exit 1
+          fi
+          if [ "$seam" -lt 5 ]; then
+            echo "::error title=aarch64 backend::$seam host-backend seam tests, expected at least 5 - jit::host is not resolving to the aarch64 engine"
+            exit 1
+          fi
+```
+
+Place it after `cargo test --all-features` in the `aarch64` job, before
+`cargo test`. It costs one `--list` against an already-built test binary.
+
+Two things it deliberately does not do. It does not assert an exact count,
+because adding a test must not turn a gate red for the wrong reason. And it
+does not replace the functional check: `tests/a64_engines.rs` and
+`tests/x86_engines.rs` assert `compiled > 0` under the same predicate, so on
+this runner `cargo test --all-features` really does run guest code through
+generated A64 — this step only guarantees that those assertions were compiled
+in the first place.

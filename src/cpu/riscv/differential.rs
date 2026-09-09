@@ -919,8 +919,11 @@ pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence>
 /// # Panics
 ///
 /// As [`compare_cached`], plus a code buffer the kernel would not give.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
 #[allow(clippy::missing_panics_doc)]
 pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
     cached(case, blocks, true)
@@ -936,10 +939,13 @@ pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergenc
 #[cfg(feature = "jit")]
 fn dispatcher(compiled: bool) -> Dispatcher {
     let disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     if compiled {
         return disp.with_backend(
-            crate::jit::x86::Engine::new().expect("the kernel gave a W^X code buffer"),
+            crate::jit::host::Engine::new().expect("the kernel gave a W^X code buffer"),
         );
     }
     let _ = compiled;
@@ -1154,8 +1160,11 @@ pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergenc
 /// # Panics
 ///
 /// As [`compare_compiled`].
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
 #[allow(clippy::missing_panics_doc)]
 pub fn measure_compiled(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
     measure(case, blocks, true)
@@ -1189,14 +1198,20 @@ fn measure(case: &Case, blocks: usize, compiled: bool) -> Result<CachedRun, Dive
 }
 
 /// How many loads a dispatcher's backend served inline.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 fn fast_loads(disp: &Dispatcher) -> u64 {
     disp.backend().map_or(0, |e| e.stats().fast_loads)
 }
 
 #[cfg(all(
     feature = "jit",
-    not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))
+    not(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))
 ))]
 fn fast_loads(_disp: &Dispatcher) -> u64 {
     0
@@ -1960,7 +1975,10 @@ mod tests {
     /// claims made by a different engine. What is new is the assertion that the
     /// engine was actually used — `run.compiled` — because a backend that
     /// quietly stopped taking any block would pass every column here forever.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     mod compiled {
         use super::*;
 

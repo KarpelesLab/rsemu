@@ -406,7 +406,10 @@ const UNLIFTED_SLOTS: usize = 65536;
 /// than less, and `jit::x86::buf` flips a page-sized window rather than the
 /// whole mapping so a larger buffer costs address space and nothing per
 /// compile.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 const CODE_BUFFER: u64 = 256 << 20;
 
 // ---------------------------------------------------------------------------
@@ -489,9 +492,12 @@ impl Jit {
     /// different guest (`ROADMAP.md` §9, "Backends").
     pub(super) fn new(host_code: bool) -> Jit {
         let disp = Dispatcher::with_cache(BlockCache::with_capacity(BLOCKS));
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         let disp = match host_code
-            .then(|| crate::jit::x86::Engine::with_capacity(CODE_BUFFER))
+            .then(|| crate::jit::host::Engine::with_capacity(CODE_BUFFER))
             .flatten()
         {
             Some(engine) => disp.with_backend(engine),

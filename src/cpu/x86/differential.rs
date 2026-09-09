@@ -1778,8 +1778,11 @@ pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence>
 /// # Panics
 ///
 /// As [`compare_cached`], plus a code buffer the kernel would not give.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
 #[allow(clippy::missing_panics_doc)]
 pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
     cached(case, blocks, true)
@@ -1790,10 +1793,13 @@ pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergenc
 #[cfg(feature = "jit")]
 fn dispatcher(compiled: bool) -> Dispatcher {
     let disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     if compiled {
         return disp.with_backend(
-            crate::jit::x86::Engine::new().expect("the kernel gave a W^X code buffer"),
+            crate::jit::host::Engine::new().expect("the kernel gave a W^X code buffer"),
         );
     }
     let _ = compiled;
@@ -1981,8 +1987,11 @@ pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergenc
 /// # Panics
 ///
 /// As [`compare_compiled`].
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "jit-x86", feature = "jit-arm64"))))]
 #[allow(clippy::missing_panics_doc)]
 pub fn measure_compiled(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
     measure(case, blocks, true)
@@ -3606,7 +3615,10 @@ mod tests {
     /// code generator is best at. It is also the only frontend in the tree that
     /// emits `rotlc`, `mulu2`, `bswap`, `clz` and `ctz` at all, so this is the
     /// only harness that covers those lowerings against a real guest.
-    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     mod compiled {
         use super::*;
 

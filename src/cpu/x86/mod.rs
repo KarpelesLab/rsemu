@@ -2135,10 +2135,10 @@ pub enum Engine {
     /// `jit::x86`, which emits x86-64 machine code for a block.
     ///
     /// A separate value rather than what `jit` does where it can, for the
-    /// reason `cpu::riscv::Engine` gives: a build without `jit-x86`, or a host
-    /// that is not x86-64 Linux, runs the same guest on the portable backend,
-    /// and a benchmark that could not tell which it got would be measuring
-    /// whichever it happened to have.
+    /// reason `cpu::riscv::Engine` gives: a build with no `jit::host` backend
+    /// for this target runs the same guest on the portable backend, and a
+    /// benchmark that could not tell which it got would be measuring whichever
+    /// it happened to have.
     #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-x86-lift", feature = "jit"))))]
     JitHost,

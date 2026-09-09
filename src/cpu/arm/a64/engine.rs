@@ -326,7 +326,10 @@ const SUBSET_SLOTS: usize = 65536;
 /// address space and nothing per compile — which is what lets the number stand
 /// where the RISC-V engine measured a 32 MiB buffer resetting 111 times in
 /// four minutes of guest time.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 const CODE_BUFFER: u64 = 256 << 20;
 
 // ---------------------------------------------------------------------------
@@ -405,9 +408,12 @@ impl Jit {
     /// different guest (`ROADMAP.md` §9, "Backends").
     pub(super) fn new(host_code: bool) -> Jit {
         let disp = Dispatcher::with_cache(BlockCache::with_capacity(BLOCKS));
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         let disp = match host_code
-            .then(|| crate::jit::x86::Engine::with_capacity(CODE_BUFFER))
+            .then(|| crate::jit::host::Engine::with_capacity(CODE_BUFFER))
             .flatten()
         {
             Some(engine) => disp.with_backend(engine),
@@ -448,14 +454,20 @@ impl Jit {
 
     /// What the host code generator's inlined probes served, if there is one.
     fn fast(&self) -> (u64, u64) {
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             self.disp
                 .backend()
-                .map(crate::jit::x86::Engine::stats)
+                .map(crate::jit::host::Engine::stats)
                 .map_or((0, 0), |s| (s.fast_loads, s.fast_stores))
         }
-        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
         {
             (0, 0)
         }
@@ -468,13 +480,20 @@ impl Jit {
     /// attached for it would be filled and never read. The shadow is not free
     /// — a fill probes the address space's flat view — so it is asked for by
     /// the one engine that reads it, and a `jit-host` that fell back to the
-    /// portable backend because the host is not x86-64 Linux does not ask.
+    /// portable backend — no `jit::host` backend for this target — does not
+    /// ask.
     pub(super) fn wants_shadow(&self) -> bool {
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             self.disp.backend().is_some()
         }
-        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
         {
             false
         }
@@ -2418,10 +2437,17 @@ mod tests {
 
     /// Whether this build has a host code generator, which is the only thing
     /// that inlines an access.
-    const HOST_BACKEND: bool = cfg!(all(
-        feature = "jit-x86",
-        target_os = "linux",
-        target_arch = "x86_64"
+    const HOST_BACKEND: bool = cfg!(any(
+        all(
+            feature = "jit-x86",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ),
+        all(
+            feature = "jit-arm64",
+            target_os = "linux",
+            target_arch = "aarch64"
+        )
     ));
 
     /// The virtual page `enable_mmu` maps read-only.

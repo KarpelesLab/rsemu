@@ -381,7 +381,10 @@ const UNLIFTED_SLOTS: usize = 65536;
 /// than the whole mapping, so a bigger buffer no longer makes every `mprotect`
 /// slower. It did, and the two together were the largest single cost in the
 /// compiled engine.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 const CODE_BUFFER: u64 = 256 << 20;
 
 // ---------------------------------------------------------------------------
@@ -410,9 +413,12 @@ impl Jit {
     /// different guest (`ROADMAP.md` §9, "Backends").
     pub(super) fn new(host_code: bool) -> Jit {
         let disp = Dispatcher::with_cache(BlockCache::with_capacity(BLOCKS));
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         let disp = match host_code
-            .then(|| crate::jit::x86::Engine::with_capacity(CODE_BUFFER))
+            .then(|| crate::jit::host::Engine::with_capacity(CODE_BUFFER))
             .flatten()
         {
             Some(engine) => disp.with_backend(engine),
@@ -443,14 +449,20 @@ impl Jit {
     /// backend calls [`IrHost::load`] for every access, so a shadow attached
     /// for it would be filled and never read. The shadow is not free — a fill
     /// probes the flat view — so it is asked for by the one engine that reads
-    /// it, and a `jit-host` that fell back to the portable backend because the
-    /// host is not x86-64 Linux does not ask.
+    /// it, and a `jit-host` that fell back to the portable backend — no
+    /// `jit::host` backend for this target — does not ask.
     pub(super) fn wants_shadow(&self) -> bool {
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             self.disp.backend().is_some()
         }
-        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
         {
             false
         }
@@ -2159,14 +2171,20 @@ mod tests {
         /// asserts a *positive* count is gated on having one: a fixture that
         /// silently reaches nothing is worse than no fixture.
         fn fast_loads(&self) -> u64 {
-            #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(any(
+                all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+                all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+            ))]
             {
                 self.jit
                     .disp
                     .backend()
                     .map_or(0, |engine| engine.stats().fast_loads)
             }
-            #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+            #[cfg(not(any(
+                all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+                all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+            )))]
             {
                 0
             }
@@ -2178,14 +2196,20 @@ mod tests {
         /// Zero on a host with no code generator, exactly as
         /// [`Bench::fast_loads`] is, and for the same reason.
         fn fast_stores(&self) -> u64 {
-            #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(any(
+                all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+                all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+            ))]
             {
                 self.jit
                     .disp
                     .backend()
                     .map_or(0, |engine| engine.stats().fast_stores)
             }
-            #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+            #[cfg(not(any(
+                all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+                all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+            )))]
             {
                 0
             }
@@ -2551,7 +2575,10 @@ mod tests {
             b.state.x[28], 0x1111_1111_1111_1111,
             "the fixture never read the region it is about to replace"
         );
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(b.fast_loads() > 0, "the shadow was never warm");
         // Put different bytes behind the very page the shadow has cached.
         let replacement = Arc::new(RamStore::new(0x1000));
@@ -2672,12 +2699,18 @@ mod tests {
         assert_eq!(compiled, 0, "`jit` must not reach for a code generator");
         let (blocks, compiled) = host.jit_stats().expect("statistics");
         assert!(blocks > 0);
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             compiled > 0,
             "`jit-host` on a host with a code generator must compile something"
         );
-        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
         assert_eq!(compiled, 0, "no backend on this host, so nothing compiles");
     }
 
@@ -2859,7 +2892,10 @@ mod tests {
             jit.advance(10_000);
         }
         assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_loads() > 0,
             "a bare hart never served a load inline"
@@ -2880,7 +2916,10 @@ mod tests {
         // generator attaches none, and a table nothing reads is a cost with no
         // benefit (`Jit::wants_shadow`).
         let stats = jit.shadow_stats();
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             assert!(stats.fills > 0, "nothing was ever cached");
             assert!(
@@ -2951,7 +2990,10 @@ mod tests {
             u64::from(PAGED_LOAD[0]),
             "the load did not go through the page table"
         );
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_loads() > 0,
             "the fixture never reached the inlined path"
@@ -2989,7 +3031,10 @@ mod tests {
             jit.advance(10_000);
         }
         assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_stores() > 0,
             "a bare hart never served a store inline"
@@ -3058,7 +3103,10 @@ mod tests {
             jit.advance(10_000);
         }
         assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_stores() > 0,
             "the self-modifying store was never inlined, so this tests nothing"
@@ -3190,7 +3238,10 @@ mod tests {
         assert!(sibling.holds(), "the reservation was taken");
         jit.advance(10_000);
 
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_stores() > before,
             "no store was inlined in the budget under test"
@@ -3212,7 +3263,10 @@ mod tests {
             jit.advance(10_000);
         }
         assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_stores() > 0,
             "the store between the pair was never inlined"
@@ -3259,7 +3313,10 @@ mod tests {
         for _ in 0..8 {
             jit.advance(10_000);
         }
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(jit.fast_stores() > 0, "the byte store was never inlined");
         for i in 1..8u64 {
             assert_eq!(
@@ -3297,7 +3354,10 @@ mod tests {
     #[test]
     fn a_paged_store_is_served_inline_and_costs_what_the_interpreter_charged() {
         let jit = paged_engines_agree(paged_store, 8);
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_stores() > 0,
             "the fixture never reached the path it exists to test"
@@ -3318,7 +3378,10 @@ mod tests {
         for _ in 0..8 {
             jit.advance(10_000);
         }
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(jit.fast_stores() > 0, "no store was ever inlined");
         assert_ne!(
             leaf(&jit) & pte::D,
@@ -3378,7 +3441,10 @@ mod tests {
     #[test]
     fn a_paged_load_is_served_inline_and_costs_what_the_interpreter_charged() {
         let jit = paged_engines_agree(paged_load, 8);
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(
             jit.fast_loads() > 0,
             "the fixture never reached the path it exists to test"
@@ -3482,7 +3548,10 @@ mod tests {
         // and said no every time. A fill that asked the load question would
         // have said yes, and the counters are the only place that shows.
         let stats = jit.shadow_stats();
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             assert!(stats.fills > 0, "the shadow was never asked about the page");
             assert_eq!(
@@ -3509,7 +3578,10 @@ mod tests {
         // cached, some page was refused — because a refusal that never
         // happened cannot fail to evict.
         let stats = jit.shadow_stats();
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             assert!(stats.refused > 0, "no page was ever refused");
             assert!(
@@ -3558,9 +3630,15 @@ mod tests {
         for _ in 0..8 {
             host.run_budget(1000);
         }
-        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
         assert!(host.has_shadow(), "`jit-host` did not ask for one");
-        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
         assert!(
             !host.has_shadow(),
             "no backend on this host, so nothing reads a shadow"

@@ -510,15 +510,21 @@ fn run_translated(
 }
 
 /// Attach the host code generator, where this build has one.
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 fn with_backend(disp: Dispatcher) -> Dispatcher {
-    match rsemu::jit::x86::Engine::new() {
+    match rsemu::jit::host::Engine::new() {
         Some(engine) => disp.with_backend(engine),
         None => disp,
     }
 }
 
-#[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+)))]
 fn with_backend(disp: Dispatcher) -> Dispatcher {
     disp
 }

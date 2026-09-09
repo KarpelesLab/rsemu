@@ -339,14 +339,15 @@ pub enum Engine {
     #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-riscv-lift", feature = "jit"))))]
     Jit,
     /// [`Jit`](Engine::Jit), with the **host code generator** attached: the
-    /// same blocks from the same cache, lowered to machine code by
-    /// [`jit::x86`](crate::jit::x86).
+    /// same blocks from the same cache, lowered to machine code by whichever
+    /// backend `jit::host` names — `jit::x86` on x86-64 Linux with `jit-x86`,
+    /// `jit::arm64` on aarch64 Linux with `jit-arm64`.
     ///
     /// Falls back rather than refusing, unlike the features above: a build
-    /// without `jit-x86`, or a host that is not x86-64 Linux, runs the same
-    /// blocks on the portable backend and gets the same answers. That is the
-    /// difference between a configuration error and a portability property,
-    /// and they are treated differently on purpose.
+    /// with neither feature, or a host neither backend emits for, runs the
+    /// same blocks on the portable backend and gets the same answers. That is
+    /// the difference between a configuration error and a portability
+    /// property, and they are treated differently on purpose.
     ///
     /// It is a **separate value rather than what `jit` does where it can**
     /// because on this guest today it is the slower of the two, by a factor of

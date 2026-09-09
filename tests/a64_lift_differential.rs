@@ -297,7 +297,10 @@ mod cached {
     }
 }
 
-#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
 mod compiled {
     use super::*;
     use rsemu::cpu::arm::a64::differential::measure_compiled;
