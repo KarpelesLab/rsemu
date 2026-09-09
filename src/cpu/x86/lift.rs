@@ -603,7 +603,7 @@ use crate::core::error::{Error, Result};
 use crate::core::value::Width;
 use crate::ir::{
     AccessKind, Align, Block, BlockBuilder, Cond, Const, Endian, InsnStart, MemOp, MemSpace,
-    Opcode, RegSlot, SegId, Sign, Temp, Type, bitfield_aux, eliminate_dead_code,
+    Opcode, RegSlot, SegId, Sign, Temp, Type, bitfield_aux, eliminate_dead_code, hoist_slot_reads,
 };
 
 use super::isa::{self, Arg, Bits, Fields, Op, seg};
@@ -1389,6 +1389,13 @@ pub fn lift<S: InsnSource>(
     // on nearly every ALU instruction is removable exactly when no boundary
     // names it, and this is what removes it.
     let block = eliminate_dead_code(&block);
+    // And then the reads this frontend emits per guest instruction are moved
+    // to the top of their region, because a backend that defers boundaries and
+    // charges has to replay them before a slot read and this frontend puts one
+    // one or two instructions after every boundary. `hoist_slot_reads`
+    // documents what it costs and what it may not do; the pass is frontend
+    // agnostic and this is the second of the three to call it.
+    let block = hoist_slot_reads(&block);
     Ok(Lifted {
         block,
         stop,

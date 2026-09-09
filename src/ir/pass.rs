@@ -367,6 +367,36 @@ fn seed_boundary(mark: &InsnStart, needed: &mut [bool]) {
 /// `brcond` — held it to 0.04% of the reads rather than to whatever a
 /// superblock's exit rate happens to be.
 ///
+/// # What it is worth on the other two frontends
+///
+/// The pass is frontend-agnostic and all three of them call it. It landed on
+/// A64 alone, and the other two were **measured separately rather than assumed
+/// to follow** — the frontends differ in how many slot reads they emit and
+/// where, and it shows:
+///
+/// | frontend | workload | host instructions | | insns/block then |
+/// | --- | --- | --- | --- | --- |
+/// | `cpu::arm::a64::lift` | `arm64-virt`, a Debian arm64 `Image` | 53 930 067 136 → 51 375 584 369 | **−4.74%** | 6.44 |
+/// | `cpu::x86::lift` | `pc64`, a stock `bzImage` | 28 567 216 644 → 27 832 228 449 | **−2.57%** | 4.79 |
+/// | `cpu::riscv::lift` | `riscv-virt`, OpenSBI `fw_jump` | 66 624 299 149 → 66 138 469 427 | **−0.73%** | 3.18 |
+///
+/// Twenty guest seconds each, `engine = "jit-host"`, under callgrind with
+/// `--cache-sim=no`. The first row is `benches/a64_linux_boot.rs` and the
+/// other two are `rsemu run … --for 20s --trace cpu`, which prints the block
+/// count the last column is derived from. Every pair reached the same
+/// `Machine::state_hash`, so the two host-instruction columns are the same
+/// guest work and the difference is host cost alone.
+///
+/// **The spread is block length**, and that is worth writing down because it
+/// is what a fourth frontend should estimate from. What this removes is a
+/// replay point per *guest instruction*, and how much of that it can remove is
+/// bounded by how many boundaries a read is able to move above — which is
+/// bounded by how many boundaries a block has at all. The three workloads
+/// order by instructions per block and the saving orders with them. A frontend
+/// whose blocks are two instructions long has almost nothing here — and a
+/// frontend whose blocks get *longer* has more, which is why the last column
+/// says what a block was at the time rather than what it is now.
+///
 /// # Why it is safe, stated as five rules
 ///
 /// A slot read is *pure*: it writes a temporary and touches nothing else. So

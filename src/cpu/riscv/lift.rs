@@ -629,7 +629,15 @@ pub fn lift<S: InsnSource>(
     };
 
     Ok(Lifted {
-        block: lf.finish(pc),
+        // The one pass this frontend runs over its own output. There is no
+        // dead code to eliminate — RISC-V has no flags, so `cpu::x86::lift`'s
+        // reason for running that pass does not exist here — but every
+        // frontend in the tree emits its slot reads one or two instructions
+        // after a boundary, and a backend that defers boundaries and charges
+        // has to replay them before each one. `hoist_slot_reads` moves them to
+        // the top of their region; it is frontend agnostic and states its own
+        // five rules.
+        block: crate::ir::hoist_slot_reads(&lf.finish(pc)),
         stop,
         insns,
         origin,

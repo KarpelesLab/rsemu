@@ -154,6 +154,36 @@ blocks from the same cache on the portable backend. The first is a configuration
 error and the second is a portability property, so they are treated differently
 on purpose.
 
+### The slot-read hoist, wired in and then measured rather than assumed
+
+`ir::hoist_slot_reads` landed with the **A64** frontend and was wired into that
+one alone, though nothing in it is A64-specific. All three frontends emit a
+guest register's first read one or two instructions after that instruction's
+boundary, and that is exactly what turns `jit::x86`'s per-*region* replay of
+deferred charges and boundaries back into a per-*instruction* one; the pass
+moves each read to the top of its region, where a run of them collapses to one
+replay point or to none.
+
+`cpu::riscv::lift` now calls it — the only pass this frontend runs over its own
+output, because RISC-V has no flags and so no dead code of the kind
+`cpu::x86::lift` eliminates. Twenty guest seconds of OpenSBI's `fw_jump` on
+this board under `engine = "jit-host"`, callgrind with `--cache-sim=no`:
+
+| | before | after |
+| --- | --- | --- |
+| host instructions | 66 624 299 149 | **66 138 469 427** (−0.73%) |
+
+Both runs end on the same `Machine::state_hash`, so the two columns are the
+same guest work. **It is the smallest of the three and that is the expected
+shape rather than a disappointment**: what the pass can remove is bounded by
+how many boundaries a read is able to move above, which is bounded by how long
+a block is, and that workload's blocks retire 3.18 guest instructions against
+`pc64`'s 4.79 and `arm64-virt`'s 6.44 — the same ordering as the savings,
+−0.73%, −2.57% and −4.74%. A workload with longer blocks would be worth more
+here, and what bounds them on this core is named in
+[`src/cpu/riscv/lift.rs`](../../src/cpu/riscv/lift.rs): a store still ends
+every block.
+
 ### The CLINT can raise `mtip` in the middle of a block
 
 > **Reachability, stated up front.** The mechanism below is fixed and tested,
