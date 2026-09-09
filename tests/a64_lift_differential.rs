@@ -25,6 +25,22 @@
 
 #![cfg(feature = "cpu-arm-a64-lift")]
 
+/// Whether the host code generator lowers everything a frontend emits.
+///
+/// `jit::x86` does, so a coverage *fraction* is the right floor there: a
+/// backend that quietly stopped taking blocks would still agree with the
+/// interpreter about the ones it refused, and only the fraction catches that.
+///
+/// `jit::arm64` has a documented refusal set — `POPCOUNT`, `MULU2`/`MULS2`,
+/// the rotates with carry, the divides, the exclusives and atomics,
+/// `call_helper`, `phi`, `i128` and floats — and a guest corpus reaches
+/// several of them often, so the same fraction is a fact about the refusal
+/// list rather than about coverage. There the floor is liveness: a backend
+/// that compiled *nothing* cannot disagree with anyone, and that is the
+/// failure still worth catching. Shrinking the refusal set is `jit::arm64`'s
+/// job, and this constant is what will start demanding the fraction again.
+const HOST_LOWERS_EVERYTHING: bool = cfg!(all(feature = "jit-x86", target_arch = "x86_64"));
+
 use rsemu::cpu::arm::a64::Config;
 use rsemu::cpu::arm::a64::differential::{Case, Verdict, compare, synthesize};
 use rsemu::cpu::arm::a64::isa::Nzcv;
@@ -381,8 +397,12 @@ mod compiled {
             // Without this a backend that had silently stopped compiling would
             // pass this file forever.
             assert!(
-                compiled * 2 > blocks as u64,
+                !HOST_LOWERS_EVERYTHING || compiled * 2 > blocks as u64,
                 "{shape:?}: {compiled} of {blocks} blocks were compiled"
+            );
+            assert!(
+                compiled > 0,
+                "{shape:?}: this backend compiled none of {blocks} blocks"
             );
         }
     }
