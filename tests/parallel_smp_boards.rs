@@ -48,6 +48,13 @@
 //! fix, so nothing here can gate ordering, and `tests/memory_model_litmus.rs`
 //! remains where that is measured.
 //!
+//! That file's `machine` module now runs on this same fixture, and on
+//! `machines/tests/smp-parallel-a64.machine` beside it — the store-buffer and
+//! message-passing litmus tests as guest programs on a board in `parallel`,
+//! which is the ordering half of the move this file made for atomicity. What
+//! it found, and how much less sensitive a machine is than two threads in a
+//! tight loop, is in `docs/techniques/parallel-execution.md`.
+//!
 //! [`Machine::state_hash`]: rsemu::machine::Machine::state_hash
 //! [`SchedulerConfig::max_ticks_per_quantum`]: rsemu::core::sched::SchedulerConfig::max_ticks_per_quantum
 

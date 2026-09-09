@@ -164,6 +164,29 @@
 //! `std::thread` rather than `core::sync::Pool`, for the reason
 //! `tests/smp_single_copy_atomicity.rs` gives: a test whose whole purpose is to
 //! make two cores collide has to be able to say what a thread is.
+//!
+//! # …and the same litmus against a whole machine
+//!
+//! Everything above spawns its own threads. That is not what `ROADMAP.md` §8's
+//! gate asks for — it asks about **SMP emulation** — so the `machine` module at
+//! the bottom of this file runs the store-buffer test, and a message-passing
+//! test beside it, as guest programs on two boards that declare `threading
+//! parallel` in their own machine files. Its own documentation is the argument;
+//! two things about it belong up here.
+//!
+//! **It is a blunter instrument, measurably.** An interpreted guest instruction
+//! plus the scheduler's per-access accounting separate the store from the load,
+//! which is about as wide as the host's whole store-buffer window, so the
+//! machine-level store-buffer rows read zero in *every* arm — fenced and
+//! unfenced alike, on a strongly and a weakly ordered host. They check that a
+//! board still executes the barrier; the pair up here is what discriminates.
+//!
+//! **The message-passing shape is the one that found something**, because its
+//! reader is already spinning when its writer stores and so needs no
+//! rendezvous at all. What it found was a torn load rather than a reordering —
+//! `RamStore` has no single-copy atomicity — and
+//! `machine::rv::a_torn_flag_load_is_visible_through_a_whole_machine` is that,
+//! reproduced and `#[ignore]`d.
 
 #![cfg(feature = "std")]
 
@@ -1167,5 +1190,1519 @@ mod guest_a64 {
         );
         assert_eq!(out.never_ran, 0, "a round did not run to completion");
         assert!(out.witnessed > 0, "the two cores must overlap");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The same litmus, driven by a whole machine in `parallel`
+// ---------------------------------------------------------------------------
+
+/// The litmus tests run against a **machine** rather than against two host
+/// threads this file spawned, which is what `ROADMAP.md` §8's gate asks for.
+///
+/// Everything above builds its own concurrency: `std::thread::scope`, an
+/// `AddressSpace` two `Exec`s share, and a referee that resets the flags
+/// between rounds. That is a sharp instrument and it stays — it pins both
+/// threads in a tight loop and maximises collisions — but it exercises no
+/// scheduler, no round rendezvous, no safe point, no realizer and no machine
+/// file. The gate is about *SMP emulation*, so the litmus has to be able to
+/// say something about a board.
+///
+/// This module says it. Two fixtures, one per guest architecture —
+/// `machines/tests/smp-parallel.machine` (two RV64 harts) and
+/// `machines/tests/smp-parallel-a64.machine` (two Neoverse-N1-class cores) —
+/// each declaring `threading parallel` in the file, each built with nothing
+/// passed in but a worker count, each running a litmus program written in
+/// guest instructions.
+///
+/// # What the mode costs, and what replaces it
+///
+/// **There is no golden.** `Machine::state_hash` is refused outside a
+/// deterministic mode, so nothing here can be compared against a recorded
+/// number. What replaces it is `docs/techniques/parallel-execution.md`'s
+/// ranked list: an outcome a barrier forbids, and underneath it a witness that
+/// the two processors collided at all.
+///
+/// **There is no referee between rounds.** A host-thread litmus stops both
+/// threads after every round and resets the flags; a machine cannot be stopped
+/// that finely without spending a whole quantum per litmus round. So the
+/// harness is *in the guest*: both processors run a self-refereeing program
+/// that paces itself against the other with monotone counters, records its own
+/// observation per round into RAM, and parks. Rust reads the record once, at
+/// the end, after the machine has stopped. That is how a real litmus runner
+/// works too, and it means the machine runs freely — a round begins and ends
+/// in the middle of the litmus loop rather than around it, which is the part
+/// that tests the scheduler.
+///
+/// **Nothing may assume the ordering under test.** Each processor writes only
+/// its own record and Rust joins the two afterwards, so no processor ever has
+/// to observe the other's store to decide an outcome. That matters more than
+/// it sounds: a guest-side tally would have had to read a word the other
+/// processor had just written, and a stale read there would have manufactured
+/// exactly the violation this file exists to look for.
+///
+/// # The two shapes
+///
+/// **SB**, the store-buffer test the rest of this file is about: each
+/// processor stores to its own flag and then loads the other's, and *both*
+/// loads returning a stale value is the outcome `FENCE` and `DMB` exist to
+/// forbid. It needs the two processors inside the window at the same instant,
+/// so each round is gated on a monotone `ready` counter the other publishes —
+/// the tightest rendezvous available without an atomic, and deliberately
+/// without one, because an atomic in the harness would order the very thing
+/// under test.
+///
+/// **MP**, message passing: the writer stores `data` then `flag`; the reader
+/// spins until `flag` moves and then reads `data`. A stale `data` behind a
+/// fresh `flag` is the violation. It is here because it does **not** need a
+/// tight rendezvous — the reader is already spinning when the writer stores —
+/// so where SB's sensitivity depends on two interpreted instructions landing
+/// within nanoseconds of each other, MP's does not. On a machine that
+/// difference is the whole ballgame, and the measurements in
+/// `docs/techniques/parallel-execution.md` say by how much.
+///
+/// # What a green run here does and does not prove
+///
+/// Not a proof of absence. The fenced rows assert zero and that assertion is
+/// sound on every host by the language's model, exactly as the host-thread
+/// rows above are; what a weakly ordered runner adds is the **unfenced** arm
+/// printed beside them. Read the counts, never the tick.
+///
+/// And read [`Litmus::plain_lost`] before any of them. Every number in this
+/// module is worthless in a run where the two processors never overlapped, and
+/// that one — plain, non-atomic increments lost to the other processor landing
+/// inside them — is how a run says whether it did.
+#[cfg(any(feature = "cpu-riscv", feature = "cpu-arm-a64"))]
+mod machine {
+    use rsemu::core::device::ResetKind;
+    use rsemu::core::sched::ThreadingMode;
+    use rsemu::core::space::MemAttrs;
+    use rsemu::core::value::Width;
+    use rsemu::machine::{Machine, catalog};
+
+    /// Litmus rounds one machine run performs.
+    ///
+    /// Two orders of magnitude below [`super::ROUNDS`], and the instrument is
+    /// the reason rather than impatience: a round here is a dozen
+    /// *interpreted* guest instructions per processor plus whatever spinning
+    /// the two do to stay in step, where a round up there is two host
+    /// instructions and a barrier. What that costs in wall time is measured in
+    /// `docs/techniques/parallel-execution.md`.
+    ///
+    /// A tenth again under `debug_assertions`, for the reason
+    /// [`super::ROUNDS`] gives: an unoptimised interpreter turns this file
+    /// into minutes of `cargo test`.
+    pub(crate) const ROUNDS: u32 = if cfg!(debug_assertions) {
+        2_000
+    } else {
+        20_000
+    };
+
+    /// Where both fixtures map their shared RAM.
+    pub(crate) const RAM: u64 = 0x0010_0000;
+
+    /// The litmus scratch, as offsets into that RAM.
+    ///
+    /// The scalars are sixty-four bytes apart so no two of them share a cache
+    /// line on any host this runs on, and all of them are inside 2 KiB so a
+    /// RISC-V `lw`/`sw` twelve-bit signed offset reaches every one from a
+    /// single base register.
+    pub(crate) mod at {
+        /// The two SB flags, one per processor.
+        pub(crate) const FLAG: [u64; 2] = [0x000, 0x040];
+        /// The monotone round counter each processor publishes so the other
+        /// can wait for it.
+        pub(crate) const READY: [u64; 2] = [0x100, 0x140];
+        /// The collision witness: one word both processors increment with a
+        /// plain load, add and store.
+        pub(crate) const PLAIN: u64 = 0x200;
+        /// Where each processor writes its round count before parking.
+        pub(crate) const DONE: [u64; 2] = [0x240, 0x280];
+        /// MP's payload, written before the flag.
+        pub(crate) const MP_DATA: u64 = 0x2c0;
+        /// MP's flag, written after the payload and waited on by the reader.
+        pub(crate) const MP_FLAG: u64 = 0x300;
+        /// The reader's acknowledgement, which paces the writer.
+        pub(crate) const MP_ACK: u64 = 0x340;
+        /// MP violations the reader counted: a stale payload behind a fresh
+        /// flag. Only the reader writes it.
+        pub(crate) const MP_BAD: u64 = 0x380;
+        /// The flag value and the payload value of the last MP violation the
+        /// reader saw.
+        ///
+        /// Not decoration: the ping-pong makes the flag value the reader
+        /// observes provably equal to its own round number, so a recorded flag
+        /// that is *not* that number is a torn load and nothing else. See
+        /// `a_torn_flag_load_is_visible_through_a_whole_machine`.
+        pub(crate) const MP_SAW_FLAG: u64 = 0x3c0;
+        /// The payload that went with it.
+        pub(crate) const MP_SAW_DATA: u64 = 0x400;
+        /// One byte per round per processor: non-zero if that processor's SB
+        /// load was stale.
+        ///
+        /// A byte rather than a word so that both arrays fit in the fixture's
+        /// 64 KiB with room to spare, and an *array* rather than a counter so
+        /// that the two processors' observations can be joined **after** the
+        /// machine has stopped. Joining them in the guest would mean one
+        /// processor reading a word the other had just written, which is the
+        /// one thing a memory-model test may not do.
+        pub(crate) const RESULT: [u64; 2] = [0x1000, 0x6000];
+    }
+
+    /// What sits between the guest's store and the guest's load.
+    ///
+    /// Named once for both architectures; each backend maps them onto its own
+    /// instructions and says which in its own module.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Barrier {
+        /// Nothing at all: the control, and the negative control for the
+        /// others.
+        None,
+        /// The architecture's explicit data barrier — `FENCE` on RISC-V,
+        /// `DMB ISH` on A64.
+        Fence,
+        /// Acquire/release accesses instead of a barrier: `STLR`/`LDAR`.
+        ///
+        /// A64 only. RISC-V has no acquire/release form of an ordinary load or
+        /// store — `Zalasr` is not ratified and this core does not implement
+        /// it — so the RISC-V backend does not offer this arm rather than
+        /// silently assembling something else.
+        AcquireRelease,
+    }
+
+    /// What one machine run of one arm produced.
+    #[derive(Debug)]
+    pub(crate) struct Litmus {
+        /// Whether both processors reached their round count and parked.
+        ///
+        /// This module's `guest::Guest::never_ran`: a run that did
+        /// not finish counted a prefix of the rounds it claims, and every
+        /// number beside this one has to be read that way.
+        pub(crate) finished: bool,
+        /// How far each processor got.
+        pub(crate) done: [u64; 2],
+        /// SB: rounds in which **both** loads were stale — the forbidden
+        /// outcome.
+        pub(crate) both_stale: u64,
+        /// SB: rounds in which at least one was, which is how an SB run says
+        /// the two processors were ever inside the window together.
+        pub(crate) witness: u64,
+        /// MP: rounds in which the reader saw a fresh flag and a stale
+        /// payload — the forbidden outcome.
+        pub(crate) mp_bad: u64,
+        /// The flag and payload values the last MP violation was made of.
+        ///
+        /// `(flag, payload)`. Both zero when there was none. The flag half is
+        /// the diagnosis: the ping-pong pins it to the reader's own round
+        /// number, so anything else is a torn load.
+        pub(crate) mp_saw: (u64, u64),
+        /// Plain, non-atomic increments lost to the other processor.
+        ///
+        /// The collision witness ranked fourth in
+        /// `docs/techniques/parallel-execution.md`, and the number to read
+        /// before any of the others: nothing lost is a run in which nothing
+        /// here is evidence.
+        pub(crate) plain_lost: u64,
+        /// How many machine rounds the run took.
+        pub(crate) quanta: usize,
+    }
+
+    /// A two-pass assembler over fixed-width instruction words.
+    ///
+    /// Both guest architectures encode every instruction in exactly four
+    /// bytes, so a label lands at the same index on both passes whatever the
+    /// branch displacements turn out to be: the first pass records where the
+    /// labels are and the second emits against them. That is the whole
+    /// mechanism, and it exists because the programs below have eight branches
+    /// apiece and counting instructions by hand is how a litmus test acquires
+    /// a bug that reads as a memory-model finding.
+    pub(crate) struct Asm {
+        code: Vec<u32>,
+        labels: Vec<(&'static str, usize)>,
+        second: bool,
+    }
+
+    impl Asm {
+        /// Mark the current position.
+        pub(crate) fn label(&mut self, name: &'static str) {
+            if !self.second {
+                self.labels.push((name, self.code.len()));
+            }
+        }
+
+        /// Emit one instruction word.
+        pub(crate) fn push(&mut self, word: u32) {
+            self.code.push(word);
+        }
+
+        /// The byte displacement from the instruction about to be emitted to
+        /// `name`.
+        ///
+        /// Zero on the first pass, where the label may not have been reached
+        /// yet. Nothing reads the first pass's code.
+        #[must_use]
+        pub(crate) fn disp(&self, name: &str) -> i32 {
+            let to = self
+                .labels
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(0, |(_, i)| *i);
+            (to as i32 - self.code.len() as i32) * 4
+        }
+    }
+
+    /// Run `emit` twice and keep the second pass's words.
+    pub(crate) fn assemble(emit: impl Fn(&mut Asm)) -> Vec<u32> {
+        let mut first = Asm {
+            code: Vec::new(),
+            labels: Vec::new(),
+            second: false,
+        };
+        emit(&mut first);
+        let mut second = Asm {
+            code: Vec::new(),
+            labels: first.labels,
+            second: true,
+        };
+        emit(&mut second);
+        second.code
+    }
+
+    /// Little-endian bytes for a ROM image.
+    #[must_use]
+    pub(crate) fn rom(words: &[u32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    /// Build the board, saying **nothing** about threading.
+    ///
+    /// The mode comes from the file, exactly as `tests/parallel_smp_boards.rs`
+    /// asserts it does. `workers` is a property of the run and is the only
+    /// thing set here — two of them, because a `parallel` machine whose run
+    /// gave it no workers runs its jobs inline and is parallel in name only.
+    fn board(name: &str, source: &str, image: Vec<u8>) -> Machine {
+        let mut options = catalog::build_options().expect("the catalog agrees with itself");
+        options.realize.scheduler.workers = 2;
+        options.realize.media.insert("code", image);
+        let registry = catalog::registry().expect("a registry");
+        match rsemu::machine::build(name, source, &registry, &options) {
+            Ok(m) => m,
+            Err(e) => panic!("{name} does not realize: {e}"),
+        }
+    }
+
+    fn word(m: &Machine, off: u64) -> u64 {
+        m.space("mem")
+            .expect("the fixture's one space")
+            .read(RAM + off, Width::U32, MemAttrs::DEFAULT)
+            .expect("a mapped word")
+    }
+
+    fn byte(m: &Machine, off: u64) -> u64 {
+        m.space("mem")
+            .expect("the fixture's one space")
+            .read(RAM + off, Width::U8, MemAttrs::DEFAULT)
+            .expect("a mapped byte")
+    }
+
+    /// Build the board, run it until both processors park, and read the
+    /// record out of guest RAM.
+    ///
+    /// Both stopping conditions are bounds rather than timeouts: a test that
+    /// hangs is worse than one that fails, and a run that does not finish is
+    /// reported through [`Litmus::finished`] rather than by never returning.
+    /// Five hundred machine rounds in which not one litmus round completed is
+    /// the "this is not making progress" line; two hundred thousand rounds is
+    /// the backstop. A healthy run on the author's host takes fifty to
+    /// ninety.
+    pub(crate) fn run(name: &str, source: &str, image: Vec<u8>, rounds: u32) -> Litmus {
+        let mut m = board(name, source, image);
+        assert_eq!(
+            m.threading_mode(),
+            ThreadingMode::Parallel,
+            "{name} must select `parallel` in the file; nothing here passes a mode"
+        );
+        // And the consequence of that, restated where it bites: there is no
+        // golden for anything below.
+        assert!(
+            m.state_hash().is_err(),
+            "a parallel state hash is a sample, not a baseline"
+        );
+        m.reset(ResetKind::Cold);
+        let want = u64::from(rounds);
+        let mut quanta = 0usize;
+        let (mut seen, mut idle) = (0u64, 0usize);
+        for _ in 0..200_000 {
+            if word(&m, at::DONE[0]) >= want && word(&m, at::DONE[1]) >= want {
+                break;
+            }
+            // Progress, not a round count, is what the give-up is on. How many
+            // litmus rounds fit in a machine round is a property of the pool:
+            // with two workers both processors run inside every round and it
+            // is hundreds, while a pool that runs its jobs inline gets one or
+            // two, because each processor spins out its budget waiting at a
+            // gate the other cannot pass until it is dispatched. Both are
+            // supported configurations and the second is three orders of
+            // magnitude slower, so a fixed bound would either fail it or stop
+            // being a hang guard. `at::PLAIN` moves once per processor per
+            // round in every program here, which makes it the one universal
+            // progress signal.
+            let now = word(&m, at::PLAIN);
+            idle = if now == seen { idle + 1 } else { 0 };
+            seen = now;
+            if idle >= 500 {
+                break;
+            }
+            m.run_quantum().expect("the machine advances");
+            quanta += 1;
+        }
+        // Two more rounds so the join at each round's end publishes everything
+        // both processors wrote. They are parked by now, so nothing read after
+        // this can still move.
+        m.run_quantum().expect("a round");
+        m.run_quantum().expect("a round");
+        let done = [word(&m, at::DONE[0]), word(&m, at::DONE[1])];
+        let plain = word(&m, at::PLAIN);
+        // The join: one byte per round per processor, read after the machine
+        // has stopped, so no ordering the guest did not have is assumed.
+        let (mut both_stale, mut witness) = (0u64, 0u64);
+        for i in 0..u64::from(rounds) {
+            let stale = [
+                byte(&m, at::RESULT[0] + i) != 0,
+                byte(&m, at::RESULT[1] + i) != 0,
+            ];
+            if stale[0] && stale[1] {
+                both_stale += 1;
+            }
+            if stale[0] || stale[1] {
+                witness += 1;
+            }
+        }
+        Litmus {
+            finished: done[0] >= want && done[1] >= want,
+            done,
+            both_stale,
+            witness,
+            mp_bad: word(&m, at::MP_BAD),
+            mp_saw: (word(&m, at::MP_SAW_FLAG), word(&m, at::MP_SAW_DATA)),
+            plain_lost: (2 * want).saturating_sub(plain),
+            quanta,
+        }
+    }
+
+    /// The checks every arm of every architecture makes, so no backend can
+    /// quietly skip one.
+    ///
+    /// `finished` first, because a run that stopped short counted a prefix.
+    /// Then the collision witness, printed rather than asserted — how often
+    /// two processors collide is the host scheduler's business — but shouted
+    /// about when it is zero, since that is a run whose zeros mean nothing.
+    pub(crate) fn common(label: &str, out: &Litmus) {
+        println!(
+            "{label}: {} of {} plain increments lost, {} machine rounds",
+            out.plain_lost,
+            2 * u64::from(ROUNDS),
+            out.quanta,
+        );
+        assert!(
+            out.finished,
+            "{label}: the run did not finish — processor 0 reached {}, processor 1 reached {}, \
+             of {ROUNDS}. Every count beside this one is a prefix.",
+            out.done[0], out.done[1]
+        );
+        if out.plain_lost == 0 {
+            println!(
+                "warning: {label} lost no plain increments, so the two processors never \
+                 collided in this run and nothing it reports is evidence about ordering. \
+                 That is a property of this host, not a failure — but a run that never \
+                 collides can never observe a reordering either."
+            );
+        }
+        if super::weak_memory_required() {
+            // The machine-level analogue of the two required checks at the top
+            // of this file, and the only one this module can honestly make.
+            //
+            // What it is *not* is a requirement that the unfenced arm produce
+            // the forbidden outcome. Up there that requirement is sound: two
+            // host instructions separate the store from the load, and a host
+            // that never reorders across that window is a host whose zeros are
+            // vacuous. Down here a whole interpreted guest instruction and the
+            // scheduler's per-access accounting sit in the same gap, and the
+            // measurements in `docs/techniques/parallel-execution.md` say the
+            // window closes on both hosts: zero is the expected reading, so
+            // requiring otherwise would gate on how slowly a runner interprets.
+            // What can be required is that the two processors collided at all,
+            // which is the premise every count here rests on.
+            assert!(
+                out.plain_lost > 0,
+                "RSEMU_WEAK_MEMORY_REQUIRED is set and {label} lost none of its {} \
+                 plain increments, so the board's two processors never landed inside \
+                 each other. This is not a defect in the emulator: it says this runner \
+                 did not overlap them, so nothing this module reports is evidence.",
+                2 * u64::from(ROUNDS)
+            );
+        }
+    }
+
+    /// Two RV64 harts of `machines/tests/smp-parallel.machine`, running SB and
+    /// MP as guest code.
+    ///
+    /// The barrier under test is `FENCE`, which `cpu::riscv::exec` retires as
+    /// `core::sync::fence(SeqCst)` — the ordering sets are decoded and then
+    /// ignored, so `fence rw,rw` and `fence w,w` are the same host instruction
+    /// and the programs below still use the architecturally correct one.
+    ///
+    /// There is no `STLR`/`LDAR` arm. RV has no acquire/release form of an
+    /// ordinary load or store — `Zalasr` is not ratified and this core does
+    /// not implement it — and an arm that quietly assembled an `AMO` with
+    /// `aq`/`rl` set would be testing an atomic rather than an access.
+    ///
+    /// # Encodings
+    ///
+    /// *The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA*, RV32I
+    /// base for the loads, stores and branches; §2.7 for `FENCE`, whose
+    /// predecessor and successor sets are the four bits `PI PO PR PW`, so
+    /// `rw,rw` is `0x0330_000F` and `w,w` is `0x0110_000F`; volume II for
+    /// `mhartid`. The helpers deliberately mirror
+    /// `tests/parallel_smp_boards.rs`'s, which assert a different property on
+    /// the same board — the two programs should be legibly the same shape.
+    #[cfg(feature = "cpu-riscv")]
+    mod rv {
+        use super::{Asm, Barrier, Litmus, RAM, ROUNDS, assemble, at, common, rom, run};
+
+        /// The board: two RV64 harts, one crystal, `threading parallel` in the
+        /// file.
+        const BOARD: &str = include_str!("../machines/tests/smp-parallel.machine");
+
+        const ZERO: u32 = 0;
+        const T0: u32 = 5;
+        const T1: u32 = 6;
+        const T2: u32 = 7;
+        const S0: u32 = 8;
+        const A0: u32 = 10;
+        const A1: u32 = 11;
+        const A2: u32 = 12;
+        const A3: u32 = 13;
+        const A5: u32 = 15;
+        const A6: u32 = 16;
+        const A7: u32 = 17;
+
+        /// `mhartid`, the machine-mode CSR that says which processor this is.
+        const MHARTID: u32 = 0xf14;
+
+        const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+            (((imm as u32) & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+        }
+
+        const fn lui(rd: u32, imm: u32) -> u32 {
+            ((imm & 0xf_ffff) << 12) | (rd << 7) | 0x37
+        }
+
+        const fn load(rd: u32, rs1: u32, off: i32, funct3: u32) -> u32 {
+            (((off as u32) & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x03
+        }
+
+        const fn lw(rd: u32, rs1: u32, off: i32) -> u32 {
+            load(rd, rs1, off, 0b010)
+        }
+
+        const fn store(rs2: u32, rs1: u32, off: i32, funct3: u32) -> u32 {
+            let imm = (off as u32) & 0xfff;
+            ((imm >> 5) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (funct3 << 12)
+                | ((imm & 0x1f) << 7)
+                | 0x23
+        }
+
+        const fn sw(rs2: u32, rs1: u32, off: i32) -> u32 {
+            store(rs2, rs1, off, 0b010)
+        }
+
+        const fn sb(rs2: u32, rs1: u32, off: i32) -> u32 {
+            store(rs2, rs1, off, 0b000)
+        }
+
+        const fn branch(rs1: u32, rs2: u32, off: i32, funct3: u32) -> u32 {
+            let imm = (off as u32) & 0x1fff;
+            (((imm >> 12) & 1) << 31)
+                | (((imm >> 5) & 0x3f) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (funct3 << 12)
+                | (((imm >> 1) & 0xf) << 8)
+                | (((imm >> 11) & 1) << 7)
+                | 0x63
+        }
+
+        const fn bne(rs1: u32, rs2: u32, off: i32) -> u32 {
+            branch(rs1, rs2, off, 0b001)
+        }
+
+        const fn blt(rs1: u32, rs2: u32, off: i32) -> u32 {
+            branch(rs1, rs2, off, 0b100)
+        }
+
+        const fn bge(rs1: u32, rs2: u32, off: i32) -> u32 {
+            branch(rs1, rs2, off, 0b101)
+        }
+
+        /// `jal x0, off` — an unconditional jump that keeps no return address.
+        const fn j(off: i32) -> u32 {
+            let imm = (off as u32) & 0x1f_ffff;
+            (((imm >> 20) & 1) << 31)
+                | (((imm >> 1) & 0x3ff) << 21)
+                | (((imm >> 11) & 1) << 20)
+                | (((imm >> 12) & 0xff) << 12)
+                | 0x6f
+        }
+
+        /// `slt rd, rs1, rs2` — one if `rs1 < rs2` signed, zero otherwise.
+        ///
+        /// The whole of "was that load stale", branch-free, so both harts
+        /// execute the identical instruction sequence whatever they observed.
+        /// A branch here would make one hart's round a cycle longer than the
+        /// other's exactly when they disagreed, which is a feedback loop
+        /// between the outcome and the pacing.
+        const fn slt(rd: u32, rs1: u32, rs2: u32) -> u32 {
+            (rs2 << 20) | (rs1 << 15) | (0b010 << 12) | (rd << 7) | 0x33
+        }
+
+        /// `csrr rd, csr`, which is `csrrs rd, csr, x0`.
+        const fn csrr(rd: u32, csr: u32) -> u32 {
+            (csr << 20) | (0b010 << 12) | (rd << 7) | 0x73
+        }
+
+        /// `fence pred, succ`, with the sets in *Unprivileged ISA* §2.7's bit
+        /// order.
+        const fn fence(pred: u32, succ: u32) -> u32 {
+            (pred << 24) | (succ << 20) | 0x0f
+        }
+
+        /// The read and write bits of a `FENCE` ordering set.
+        const R: u32 = 0b0010;
+        const W: u32 = 0b0001;
+
+        /// `jal x0, 0` — where a finished hart parks.
+        const PARK: u32 = 0x0000_006f;
+
+        fn li(a: &mut Asm, rd: u32, value: i32) {
+            let hi = ((value as u32).wrapping_add(0x800) >> 12) & 0xf_ffff;
+            let lo = value.wrapping_sub((hi << 12) as i32);
+            if hi == 0 {
+                a.push(addi(rd, ZERO, lo));
+                return;
+            }
+            a.push(lui(rd, hi));
+            a.push(addi(rd, rd, lo));
+        }
+
+        /// The store-buffer litmus, in RV64 instructions, for both harts out of
+        /// one ROM.
+        ///
+        /// ```text
+        ///   csrr a7, mhartid
+        ///   li   s0, RAM ; li a5, 0 ; li a6, rounds
+        ///   bne  a7, x0, hart1
+        ///   ...            ; a0=flag[me] a1=flag[them] a2=result[me]
+        ///   ...            ; a3=ready[me] t0=ready[them] (per hart)
+        /// top:
+        ///   addi a5, a5, 1
+        ///   sw   a5, 0(a3)         ; ready[me] = i
+        /// spin:
+        ///   lw   t1, 0(t0)
+        ///   blt  t1, a5, spin      ; until ready[them] >= i
+        ///   sw   a5, 0(a0)         ; ---- flag[me] = i
+        ///   fence rw,rw            ;      the arm under test
+        ///   lw   t1, 0(a1)         ; ---- v = flag[them]
+        ///   slt  t2, t1, a5        ; stale = v < i
+        ///   sb   t2, 0(a2)         ; record[me][i] = stale
+        ///   addi a2, a2, 1
+        ///   lw   t2, PLAIN(s0)     ; the collision witness, plainly
+        ///   addi t2, t2, 1
+        ///   sw   t2, PLAIN(s0)
+        ///   blt  a5, a6, top
+        ///   sw   a5, DONE[me](s0)
+        ///   jal  x0, 0
+        /// ```
+        ///
+        /// The gate is `>=` rather than `==` and that is load-bearing twice
+        /// over. It cannot deadlock when the two harts are dispatched one
+        /// after the other rather than at once — the inline-pool case, which
+        /// is every `no_std` host and the no-threads browser build — and it
+        /// makes "stale" mean *strictly behind*, so a hart that has raced a
+        /// round ahead reads as fresh rather than as a violation.
+        fn store_buffer(barrier: Barrier, rounds: u32) -> Vec<u32> {
+            assert_ne!(
+                barrier,
+                Barrier::AcquireRelease,
+                "RV has no acquire/release ordinary access; see the module documentation"
+            );
+            assemble(move |a| {
+                a.push(csrr(A7, MHARTID));
+                li(a, S0, RAM as i32);
+                li(a, A5, 0);
+                li(a, A6, rounds as i32);
+                let d = a.disp("hart1");
+                a.push(bne(A7, ZERO, d));
+                for (me, them) in [(0usize, 1usize), (1, 0)] {
+                    a.push(addi(A0, S0, at::FLAG[me] as i32));
+                    a.push(addi(A1, S0, at::FLAG[them] as i32));
+                    li(a, A2, (RAM + at::RESULT[me]) as i32);
+                    a.push(addi(A3, S0, at::READY[me] as i32));
+                    a.push(addi(T0, S0, at::READY[them] as i32));
+                    a.push(addi(A7, S0, at::DONE[me] as i32));
+                    if me == 0 {
+                        let d = a.disp("top");
+                        a.push(j(d));
+                        a.label("hart1");
+                    }
+                }
+                a.label("top");
+                a.push(addi(A5, A5, 1));
+                a.push(sw(A5, A3, 0));
+                a.label("spin");
+                a.push(lw(T1, T0, 0));
+                let d = a.disp("spin");
+                a.push(blt(T1, A5, d));
+                // ---- the window ----
+                a.push(sw(A5, A0, 0));
+                if barrier == Barrier::Fence {
+                    a.push(fence(R | W, R | W));
+                }
+                a.push(lw(T1, A1, 0));
+                // --------------------
+                a.push(slt(T2, T1, A5));
+                a.push(sb(T2, A2, 0));
+                a.push(addi(A2, A2, 1));
+                a.push(lw(T2, S0, at::PLAIN as i32));
+                a.push(addi(T2, T2, 1));
+                a.push(sw(T2, S0, at::PLAIN as i32));
+                let d = a.disp("top");
+                a.push(blt(A5, A6, d));
+                a.push(sw(A5, A7, 0));
+                a.push(PARK);
+            })
+        }
+
+        /// The message-passing litmus, in RV64 instructions.
+        ///
+        /// ```text
+        ///   hart 0, the writer            hart 1, the reader
+        /// wtop:                         rtop:
+        ///   addi a5, a5, 1                addi a5, a5, 1
+        ///   sw   a5, 0(a0)  ; data=i    rspin:
+        ///   fence w,w                     lw   t1, 0(a1)   ; f = flag
+        ///   sw   a5, 0(a1)  ; flag=i      blt  t1, a5, rspin
+        /// wack:                           fence r,r
+        ///   lw   t1, 0(a2)                lw   t2, 0(a0)   ; d = data
+        ///   blt  t1, a5, wack             bge  t2, a5, rok ; d >= i is fine
+        ///   <plain increment>             <bad++>
+        ///   blt  a5, a6, wtop           rok:
+        ///   sw   a5, DONE0(s0)            sw   a5, 0(a2)   ; ack = i
+        ///   jal  x0, 0                    <plain increment>
+        ///                                 blt  a5, a6, rtop
+        ///                                 sw   a5, DONE1(s0)
+        ///                                 jal  x0, 0
+        /// ```
+        ///
+        /// # Which value the reader compares against, and why it matters
+        ///
+        /// `sensitive` picks it. The obvious choice is the flag value the
+        /// reader **observed** — call it `f` — because `data >= f` is what the
+        /// architecture actually promises. The ping-pong makes that choice
+        /// equivalent to comparing against the reader's own round number `i`:
+        /// the writer cannot reach round `i+1` until the reader has
+        /// acknowledged round `i`, so when the spin exits, `f == i`.
+        ///
+        /// Equivalent, that is, **unless the load of the flag tore**. The
+        /// reader spins on `flag` while the writer stores it, `RamStore` has
+        /// no single-copy atomicity (see
+        /// `docs/techniques/parallel-execution.md`, "what does not work yet"),
+        /// and a four-byte load mixing the old word with the new can return a
+        /// value *larger* than either — `0x0ff` under `0x100` yields `0x1ff`.
+        /// Compared against `f` that reads as a message-passing violation;
+        /// compared against `i` it does not.
+        ///
+        /// So the rows that gate use `i`, which cannot manufacture a violation
+        /// out of a torn load and loses nothing by the argument above, and
+        /// `a_torn_flag_load_is_visible_through_a_whole_machine` uses `f` and
+        /// exists to report the tear rather than to gate on it.
+        ///
+        /// `fence w,w` on the writer and `fence r,r` on the reader are the
+        /// architecturally correct sets. This core retires both as a full host
+        /// fence, so the distinction is documentation today and a regression
+        /// net when it stops being one.
+        fn message_passing(barrier: Barrier, rounds: u32, sensitive: bool) -> Vec<u32> {
+            assert_ne!(
+                barrier,
+                Barrier::AcquireRelease,
+                "RV has no acquire/release ordinary access; see the module documentation"
+            );
+            assemble(move |a| {
+                a.push(csrr(A7, MHARTID));
+                li(a, S0, RAM as i32);
+                li(a, A5, 0);
+                li(a, A6, rounds as i32);
+                let d = a.disp("reader");
+                a.push(bne(A7, ZERO, d));
+
+                // ---- the writer ----
+                a.push(addi(A0, S0, at::MP_DATA as i32));
+                a.push(addi(A1, S0, at::MP_FLAG as i32));
+                a.push(addi(A2, S0, at::MP_ACK as i32));
+                a.push(addi(A7, S0, at::DONE[0] as i32));
+                a.label("wtop");
+                a.push(addi(A5, A5, 1));
+                a.push(sw(A5, A0, 0));
+                if barrier == Barrier::Fence {
+                    a.push(fence(W, W));
+                }
+                a.push(sw(A5, A1, 0));
+                a.label("wack");
+                a.push(lw(T1, A2, 0));
+                let d = a.disp("wack");
+                a.push(blt(T1, A5, d));
+                a.push(lw(T2, S0, at::PLAIN as i32));
+                a.push(addi(T2, T2, 1));
+                a.push(sw(T2, S0, at::PLAIN as i32));
+                let d = a.disp("wtop");
+                a.push(blt(A5, A6, d));
+                a.push(sw(A5, A7, 0));
+                a.push(PARK);
+
+                // ---- the reader ----
+                a.label("reader");
+                a.push(addi(A0, S0, at::MP_DATA as i32));
+                a.push(addi(A1, S0, at::MP_FLAG as i32));
+                a.push(addi(A2, S0, at::MP_ACK as i32));
+                a.push(addi(A3, S0, at::MP_BAD as i32));
+                a.push(addi(A7, S0, at::DONE[1] as i32));
+                a.label("rtop");
+                a.push(addi(A5, A5, 1));
+                a.label("rspin");
+                a.push(lw(T1, A1, 0));
+                let d = a.disp("rspin");
+                a.push(blt(T1, A5, d));
+                if barrier == Barrier::Fence {
+                    a.push(fence(R, R));
+                }
+                a.push(lw(T2, A0, 0));
+                let d = a.disp("rok");
+                a.push(bge(T2, if sensitive { T1 } else { A5 }, d));
+                // The violation path, which also records what it was made of.
+                // Two stores nothing else reads, off the measured path.
+                a.push(sw(T1, S0, at::MP_SAW_FLAG as i32));
+                a.push(sw(T2, S0, at::MP_SAW_DATA as i32));
+                a.push(lw(T2, A3, 0));
+                a.push(addi(T2, T2, 1));
+                a.push(sw(T2, A3, 0));
+                a.label("rok");
+                a.push(sw(A5, A2, 0));
+                a.push(lw(T2, S0, at::PLAIN as i32));
+                a.push(addi(T2, T2, 1));
+                a.push(sw(T2, S0, at::PLAIN as i32));
+                let d = a.disp("rtop");
+                a.push(blt(A5, A6, d));
+                a.push(sw(A5, A7, 0));
+                a.push(PARK);
+            })
+        }
+
+        fn sb_run(barrier: Barrier) -> Litmus {
+            run(
+                "smp-parallel.machine",
+                BOARD,
+                rom(&store_buffer(barrier, ROUNDS)),
+                ROUNDS,
+            )
+        }
+
+        fn mp_run(barrier: Barrier) -> Litmus {
+            run(
+                "smp-parallel.machine",
+                BOARD,
+                rom(&message_passing(barrier, ROUNDS, false)),
+                ROUNDS,
+            )
+        }
+
+        /// **SB with `FENCE`, on a machine.** Zero is asserted.
+        ///
+        /// Sound on every host and therefore not, on its own, evidence about
+        /// the fence: `the_same_sb_without_one` is the arm that gives it
+        /// something to be read against.
+        #[test]
+        fn a_guest_fence_between_the_store_and_the_load_on_a_machine() {
+            let out = sb_run(Barrier::Fence);
+            common("machine rv, SB, FENCE   ", &out);
+            println!(
+                "machine rv, SB, FENCE   : forbidden outcome {} / {ROUNDS} ({} rounds overlapped)",
+                out.both_stale, out.witness
+            );
+            assert_eq!(
+                out.both_stale, 0,
+                "a full fence on both harts cannot permit this"
+            );
+        }
+
+        /// The same board and program with the `FENCE` deleted, so the row
+        /// above is read against something.
+        ///
+        /// Printed, never asserted, on every host including a weakly ordered
+        /// one — for the reason `guest_a64` gives about its own
+        /// unfenced arm and one more that is specific to a machine: between the
+        /// store and the load sits a whole *interpreted* guest instruction plus
+        /// the scheduler's per-access cycle accounting, which is a far wider
+        /// separation than the two host instructions the top of this file uses.
+        /// A zero here is the expected reading, not a held gate.
+        #[test]
+        fn the_same_sb_without_one() {
+            let out = sb_run(Barrier::None);
+            common("machine rv, SB, neither ", &out);
+            println!(
+                "machine rv, SB, neither : forbidden outcome {} / {ROUNDS} ({} rounds overlapped)",
+                out.both_stale, out.witness
+            );
+        }
+
+        /// **MP with `FENCE`, on a machine.** Zero is asserted.
+        ///
+        /// The row SB cannot be on a machine. The reader is already spinning
+        /// when the writer stores, so the window is the writer's own two
+        /// stores rather than a rendezvous between two interpreters — nothing
+        /// in the harness has to land two guest instructions within
+        /// nanoseconds of each other for this to be able to fail.
+        #[test]
+        fn a_guest_fence_between_the_payload_and_the_flag() {
+            let out = mp_run(Barrier::Fence);
+            common("machine rv, MP, FENCE   ", &out);
+            println!(
+                "machine rv, MP, FENCE   : forbidden outcome {} / {ROUNDS}",
+                out.mp_bad
+            );
+            assert_eq!(
+                out.mp_bad, 0,
+                "the writer fenced between the payload and the flag, and the reader \
+                 between the flag and the payload; a stale payload behind a fresh flag \
+                 is what that pair forbids"
+            );
+        }
+
+        /// The same, with both fences deleted: the negative control for the
+        /// row above.
+        #[test]
+        fn the_same_mp_without_one() {
+            let out = mp_run(Barrier::None);
+            common("machine rv, MP, neither ", &out);
+            println!(
+                "machine rv, MP, neither : forbidden outcome {} / {ROUNDS}",
+                out.mp_bad
+            );
+        }
+
+        /// **A defect, reproduced through a whole machine and not fixed here.**
+        /// `RamStore` has no single-copy atomicity, and a guest spinning on a
+        /// word another processor is storing can load a value that was never
+        /// in memory.
+        ///
+        /// Not a new defect: `docs/techniques/parallel-execution.md` lists it
+        /// first under "what does not work yet" and
+        /// `tests/smp_single_copy_atomicity.rs` measures it — a `Vec<AtomicU8>`
+        /// accessed by a byte loop, so a four-byte load racing a four-byte
+        /// store returns a mixture of the two words, which *Intel SDM* vol. 3
+        /// §9.1.1, ARM DDI 0487 B2.2.1 and *RISC-V Unprivileged ISA* §1.4 each
+        /// forbid outright. What is new is the level: that file spawns two host
+        /// threads over one `AddressSpace`, and this one is a board, in
+        /// `parallel`, running a guest program a kernel would recognise.
+        ///
+        /// It is worth having at this level because a torn load here is not a
+        /// curiosity. It is indistinguishable, to the guest, from the
+        /// message-passing violation a missing barrier would cause — and it
+        /// found this file first: the `FENCE` row asserted zero, saw one
+        /// violation in twenty thousand rounds on an x86-64 host where store
+        /// ordering cannot be the cause, and the recorded pair below was what
+        /// said which of the two it was.
+        ///
+        /// `#[ignore]` because it is a search for a rare event rather than a
+        /// gate, and because reporting a known defect must not turn the suite
+        /// red. Run it with `--ignored`; it fails only if the run did not
+        /// complete, or if the pair it recorded was an ordering violation
+        /// rather than a tear.
+        ///
+        /// **Measured**, x86-64 Linux, release: 11 tears in two million RISC-V
+        /// rounds and 13 in two million A64 ones — twenty-five invocations of
+        /// each, four runs of twenty thousand apiece. Every single recorded
+        /// pair was a byte-carry boundary, which is what makes the diagnosis
+        /// certain rather than plausible: `flag=8959 payload=8704` is `0x22ff`
+        /// under `0x2200`, `flag=4095 payload=3840` is `0x0fff` under
+        /// `0x0f00`, `flag=19967 payload=19712` is `0x4dff` under `0x4d00`.
+        /// Each is the low byte of the *previous* round's value wearing the
+        /// high bytes of this one — a value that was never in memory. Only one
+        /// round in 256 crosses such a boundary, so the rate among rounds that
+        /// could possibly tear is about 1 500 per million.
+        ///
+        /// ```text
+        /// cargo test --release --all-features --test memory_model_litmus \
+        ///     -- --ignored --nocapture a_torn_flag_load
+        /// ```
+        #[test]
+        #[ignore = "a search for a rare known defect, not a gate; see the doc comment"]
+        fn a_torn_flag_load_is_visible_through_a_whole_machine() {
+            // Fenced, so that ordering cannot be an explanation for anything
+            // seen: on x86-64 a store-store reordering is forbidden outright,
+            // and the guest asked for one anyway.
+            let mut tears = 0u64;
+            for attempt in 1..=super::super::ATTEMPTS {
+                let out = run(
+                    "smp-parallel.machine",
+                    BOARD,
+                    rom(&message_passing(Barrier::Fence, ROUNDS, true)),
+                    ROUNDS,
+                );
+                common("machine rv, MP, torn    ", &out);
+                let (flag, data) = out.mp_saw;
+                println!(
+                    "machine rv, MP, torn    : {} apparent violations / {ROUNDS} \
+                     (attempt {attempt}/{}); last was flag={flag} payload={data}",
+                    out.mp_bad,
+                    super::super::ATTEMPTS,
+                );
+                if out.mp_bad > 0 {
+                    // The ping-pong pins the observed flag to the reader's own
+                    // round number, and the payload is written before the flag
+                    // with a fence between: `payload + 1 == flag` would be an
+                    // ordering violation, and anything else is a torn load.
+                    assert_ne!(
+                        flag,
+                        data + 1,
+                        "the flag was exactly one ahead of the payload, which is a \
+                         genuine store-store reordering rather than a torn load. On \
+                         an x86-64 host that cannot happen; on a weakly ordered one it \
+                         would be a defect in `Op::Fence`, not in `RamStore`."
+                    );
+                    tears += out.mp_bad;
+                }
+            }
+            println!(
+                "machine rv: {tears} torn flag loads over {} runs of {ROUNDS} rounds",
+                super::super::ATTEMPTS
+            );
+        }
+    }
+
+    /// Two Neoverse-N1-class cores of `machines/tests/smp-parallel-a64.machine`,
+    /// running SB and MP as guest code.
+    ///
+    /// The A64 leg of the gate, and the one the `aarch64 (weak memory)` CI job
+    /// exists for. Three arms, the same three
+    /// `guest_a64` has: `DMB ISH`, `STLR`/`LDAR`, and neither.
+    /// What is different is what they run on — a board, in `parallel`, with
+    /// the scheduler dispatching both cores into every round.
+    ///
+    /// # Encodings
+    ///
+    /// *Arm Architecture Reference Manual for A-profile*, DDI 0487: C6.2 for
+    /// `MOVZ`, `MOVK`, `ADD` (immediate), `SUBS` (the `CMP` alias), `CSINC`
+    /// (the `CSET` alias), `LDR`/`STR`/`STRB` (unsigned offset),
+    /// `LDAR`/`STLR`, `B`, `B.cond` and `CBNZ`; C6.2.79 for `DMB`, whose `CRm`
+    /// of `0b1011` is the inner-shareable domain, full system — B2.3.7's
+    /// mapping for a sequentially consistent access on this architecture.
+    /// D17.2.90 for `MPIDR_EL1`, whose Aff0 is the low byte and is the only
+    /// thing the fixture varies between the two cores.
+    #[cfg(feature = "cpu-arm-a64")]
+    mod a64 {
+        use super::{Asm, Barrier, Litmus, RAM, ROUNDS, assemble, at, common, rom, run};
+
+        /// The board: two A64 cores, one crystal, `threading parallel` in the
+        /// file.
+        const BOARD: &str = include_str!("../machines/tests/smp-parallel-a64.machine");
+
+        /// The zero register, in the position an encoding's `Rt`/`Rd` field
+        /// takes it.
+        const ZR: u32 = 31;
+
+        // Condition codes, DDI 0487 C1.2.4.
+        const GE: u32 = 0b1010;
+        const LT: u32 = 0b1011;
+
+        /// `MOVZ Wd, #imm16` — and, with `hw` set, `MOVZ Xd, #imm16, LSL #16`.
+        const fn movz(rd: u32, imm: u32, hw: u32, sf: u32) -> u32 {
+            (sf << 31) | 0x5280_0000 | (hw << 21) | ((imm & 0xffff) << 5) | rd
+        }
+
+        /// `MOVK Wd, #imm16, LSL #16`.
+        const fn movk16(rd: u32, imm: u32) -> u32 {
+            0x7280_0000 | (1 << 21) | ((imm & 0xffff) << 5) | rd
+        }
+
+        /// `ADD Xd, Xn, #imm12` and, with `sh`, `#imm12, LSL #12`.
+        ///
+        /// The shifted form is what reaches the two result arrays: they are at
+        /// 0x1000 and 0x6000 from the base, and an unshifted `imm12` stops at
+        /// 0xfff.
+        const fn add_imm64(rd: u32, rn: u32, imm: u32, sh: u32) -> u32 {
+            0x9100_0000 | (sh << 22) | ((imm & 0xfff) << 10) | (rn << 5) | rd
+        }
+
+        /// `ADD Wd, Wn, #imm12`.
+        const fn add_imm32(rd: u32, rn: u32, imm: u32) -> u32 {
+            0x1100_0000 | ((imm & 0xfff) << 10) | (rn << 5) | rd
+        }
+
+        /// `AND Xd, Xn, Xm`.
+        const fn and64(rd: u32, rn: u32, rm: u32) -> u32 {
+            0x8a00_0000 | (rm << 16) | (rn << 5) | rd
+        }
+
+        /// `CMP Wn, Wm`, which is `SUBS WZR, Wn, Wm`.
+        const fn cmp32(rn: u32, rm: u32) -> u32 {
+            0x6b00_0000 | (rm << 16) | (rn << 5) | ZR
+        }
+
+        /// `CSET Wd, cond`, which is `CSINC Wd, WZR, WZR, invert(cond)`.
+        ///
+        /// `inverted` is what goes in the encoding's `cond` field, so a caller
+        /// asking for "one if less-than" passes [`GE`]. Written that way round
+        /// deliberately: the alias inverts and a helper that inverted again
+        /// would be a silent off-by-one-condition.
+        const fn cset32(rd: u32, inverted: u32) -> u32 {
+            0x1a80_0400 | (ZR << 16) | (inverted << 12) | (ZR << 5) | rd
+        }
+
+        /// `MRS Xt, MPIDR_EL1` — op0 3, op1 0, CRn 0, CRm 0, op2 5.
+        const fn mrs_mpidr(rt: u32) -> u32 {
+            0xd538_00a0 | rt
+        }
+
+        /// `STR Wt, [Xn]` and `LDR Wt, [Xn]`, unsigned offset zero.
+        const fn str32(rt: u32, rn: u32) -> u32 {
+            0xb900_0000 | (rn << 5) | rt
+        }
+        const fn ldr32(rt: u32, rn: u32) -> u32 {
+            0xb940_0000 | (rn << 5) | rt
+        }
+        /// `STRB Wt, [Xn]`.
+        const fn strb(rt: u32, rn: u32) -> u32 {
+            0x3900_0000 | (rn << 5) | rt
+        }
+        /// `STLR Wt, [Xn]` and `LDAR Wt, [Xn]`.
+        const fn stlr32(rt: u32, rn: u32) -> u32 {
+            0x889f_fc00 | (rn << 5) | rt
+        }
+        const fn ldar32(rt: u32, rn: u32) -> u32 {
+            0x88df_fc00 | (rn << 5) | rt
+        }
+
+        /// `B label`.
+        const fn b(off: i32) -> u32 {
+            0x1400_0000 | (((off >> 2) as u32) & 0x03ff_ffff)
+        }
+        /// `B.cond label`.
+        const fn bcond(cond: u32, off: i32) -> u32 {
+            0x5400_0000 | ((((off >> 2) as u32) & 0x7ffff) << 5) | cond
+        }
+        /// `CBNZ Xt, label`.
+        const fn cbnz64(rt: u32, off: i32) -> u32 {
+            0xb500_0000 | ((((off >> 2) as u32) & 0x7ffff) << 5) | rt
+        }
+
+        /// `DMB ISH`.
+        const DMB_ISH: u32 = 0xd503_3bbf;
+        /// `B .` — where a finished core parks.
+        const PARK: u32 = 0x1400_0000;
+
+        /// Load a 32-bit constant into `Wd`.
+        fn li32(a: &mut Asm, rd: u32, value: u32) {
+            a.push(movz(rd, value & 0xffff, 0, 0));
+            if value >> 16 != 0 {
+                a.push(movk16(rd, value >> 16));
+            }
+        }
+
+        /// `ADD Xd, X28, #off`, choosing the shifted form when it is needed.
+        ///
+        /// Every offset in [`at`] is either below 0x1000 or an exact multiple
+        /// of 0x1000, which is what makes this total rather than a hazard.
+        fn base_plus(a: &mut Asm, rd: u32, off: u64) {
+            assert!(
+                off < 0x1000 || off.is_multiple_of(0x1000),
+                "offset {off:#x} is not reachable"
+            );
+            if off < 0x1000 {
+                a.push(add_imm64(rd, BASE, off as u32, 0));
+            } else {
+                a.push(add_imm64(rd, BASE, (off >> 12) as u32, 1));
+            }
+        }
+
+        // Registers. X28 holds the RAM base; X8 the collision-witness word;
+        // W15 the round number and W16 the round count; W5, W6 and W17 are
+        // scratch. Everything else is a pointer set up once per core.
+        const BASE: u32 = 28;
+        const PLAIN_P: u32 = 8;
+        const I: u32 = 15;
+        const N: u32 = 16;
+        const V: u32 = 5;
+        const TMP: u32 = 6;
+        const ACC: u32 = 17;
+        const ID: u32 = 9;
+        const ONE: u32 = 10;
+
+        /// The setup both programs share: which core am I, where is RAM.
+        fn preamble(a: &mut Asm, rounds: u32, other: &'static str) {
+            a.push(mrs_mpidr(ID));
+            a.push(movz(ONE, 1, 0, 1));
+            a.push(and64(ID, ID, ONE));
+            a.push(movz(BASE, (RAM >> 16) as u32, 1, 1));
+            base_plus(a, PLAIN_P, at::PLAIN);
+            a.push(movz(I, 0, 0, 0));
+            li32(a, N, rounds);
+            let d = a.disp(other);
+            a.push(cbnz64(ID, d));
+        }
+
+        /// The collision witness: three instructions on a word the
+        /// architecture promises nothing about.
+        fn plain_increment(a: &mut Asm) {
+            a.push(ldr32(ACC, PLAIN_P));
+            a.push(add_imm32(ACC, ACC, 1));
+            a.push(str32(ACC, PLAIN_P));
+        }
+
+        /// The store-buffer litmus, in A64 instructions, for both cores out of
+        /// one ROM.
+        ///
+        /// ```text
+        ///   mrs  x9, mpidr_el1 ; and x9, x9, #1 ; movz x28, #0x10, lsl #16
+        ///   cbnz x9, core1
+        ///   ...                    ; x0=flag[me] x1=flag[them] x2=record[me]
+        ///   ...                    ; x3=ready[me] x4=ready[them] x7=done[me]
+        /// top:
+        ///   add   w15, w15, #1
+        ///   str   w15, [x3]        ; ready[me] = i
+        /// spin:
+        ///   ldr   w5, [x4]
+        ///   cmp   w5, w15
+        ///   b.lt  spin             ; until ready[them] >= i
+        ///   stlr? w15, [x0]        ; ---- flag[me] = i
+        ///   dmb   ish?             ;      the arm under test
+        ///   ldar? w5, [x1]         ; ---- v = flag[them]
+        ///   cmp   w5, w15
+        ///   cset  w6, lt           ; stale = v < i, branch-free
+        ///   strb  w6, [x2]
+        ///   add   x2, x2, #1
+        ///   <plain increment>
+        ///   cmp   w15, w16
+        ///   b.lt  top
+        ///   str   w15, [x7]
+        ///   b     .
+        /// ```
+        ///
+        /// `CSET` rather than a branch so both cores execute the identical
+        /// sequence whatever they observed: a branch would make one core's
+        /// round a cycle longer than the other's exactly when they disagreed,
+        /// which is a feedback loop between the outcome and the pacing.
+        fn store_buffer(barrier: Barrier, rounds: u32) -> Vec<u32> {
+            assemble(move |a| {
+                preamble(a, rounds, "core1");
+                for me in 0..2usize {
+                    let them = 1 - me;
+                    base_plus(a, 0, at::FLAG[me]);
+                    base_plus(a, 1, at::FLAG[them]);
+                    base_plus(a, 2, at::RESULT[me]);
+                    base_plus(a, 3, at::READY[me]);
+                    base_plus(a, 4, at::READY[them]);
+                    base_plus(a, 7, at::DONE[me]);
+                    if me == 0 {
+                        let d = a.disp("top");
+                        a.push(b(d));
+                        a.label("core1");
+                    }
+                }
+                a.label("top");
+                a.push(add_imm32(I, I, 1));
+                a.push(str32(I, 3));
+                a.label("spin");
+                a.push(ldr32(V, 4));
+                a.push(cmp32(V, I));
+                let d = a.disp("spin");
+                a.push(bcond(LT, d));
+                // ---- the window ----
+                a.push(if barrier == Barrier::AcquireRelease {
+                    stlr32(I, 0)
+                } else {
+                    str32(I, 0)
+                });
+                if barrier == Barrier::Fence {
+                    a.push(DMB_ISH);
+                }
+                a.push(if barrier == Barrier::AcquireRelease {
+                    ldar32(V, 1)
+                } else {
+                    ldr32(V, 1)
+                });
+                // --------------------
+                a.push(cmp32(V, I));
+                a.push(cset32(TMP, GE));
+                a.push(strb(TMP, 2));
+                a.push(add_imm64(2, 2, 1, 0));
+                plain_increment(a);
+                a.push(cmp32(I, N));
+                let d = a.disp("top");
+                a.push(bcond(LT, d));
+                a.push(str32(I, 7));
+                a.push(PARK);
+            })
+        }
+
+        /// The message-passing litmus, in A64 instructions.
+        ///
+        /// The writer stores the payload, then the flag; the reader spins on
+        /// the flag and then reads the payload, and a payload behind the flag
+        /// value it observed is the violation. `STLR` on the flag store and
+        /// `LDAR` on the flag load is the canonical release/acquire form of
+        /// it; `DMB ISH` on both sides is the barrier form.
+        ///
+        /// `sensitive` picks what the reader compares the payload against —
+        /// the flag value it observed, or its own round number. The RISC-V
+        /// module's `message_passing` argues at length why those are the same
+        /// thing except when the flag load tore, and why the rows that gate
+        /// use the round number.
+        fn message_passing(barrier: Barrier, rounds: u32, sensitive: bool) -> Vec<u32> {
+            assemble(move |a| {
+                preamble(a, rounds, "reader");
+
+                // ---- the writer ----
+                base_plus(a, 0, at::MP_DATA);
+                base_plus(a, 1, at::MP_FLAG);
+                base_plus(a, 2, at::MP_ACK);
+                base_plus(a, 7, at::DONE[0]);
+                a.label("wtop");
+                a.push(add_imm32(I, I, 1));
+                a.push(str32(I, 0));
+                if barrier == Barrier::Fence {
+                    a.push(DMB_ISH);
+                }
+                a.push(if barrier == Barrier::AcquireRelease {
+                    stlr32(I, 1)
+                } else {
+                    str32(I, 1)
+                });
+                a.label("wack");
+                a.push(ldr32(V, 2));
+                a.push(cmp32(V, I));
+                let d = a.disp("wack");
+                a.push(bcond(LT, d));
+                plain_increment(a);
+                a.push(cmp32(I, N));
+                let d = a.disp("wtop");
+                a.push(bcond(LT, d));
+                a.push(str32(I, 7));
+                a.push(PARK);
+
+                // ---- the reader ----
+                a.label("reader");
+                base_plus(a, 0, at::MP_DATA);
+                base_plus(a, 1, at::MP_FLAG);
+                base_plus(a, 2, at::MP_ACK);
+                base_plus(a, 3, at::MP_BAD);
+                base_plus(a, 11, at::MP_SAW_FLAG);
+                base_plus(a, 12, at::MP_SAW_DATA);
+                base_plus(a, 7, at::DONE[1]);
+                a.label("rtop");
+                a.push(add_imm32(I, I, 1));
+                a.label("rspin");
+                a.push(if barrier == Barrier::AcquireRelease {
+                    ldar32(V, 1)
+                } else {
+                    ldr32(V, 1)
+                });
+                a.push(cmp32(V, I));
+                let d = a.disp("rspin");
+                a.push(bcond(LT, d));
+                if barrier == Barrier::Fence {
+                    a.push(DMB_ISH);
+                }
+                a.push(ldr32(TMP, 0));
+                a.push(cmp32(TMP, if sensitive { V } else { I }));
+                let d = a.disp("rok");
+                a.push(bcond(GE, d));
+                // The violation path, which also records what it was made of.
+                a.push(str32(V, 11));
+                a.push(str32(TMP, 12));
+                a.push(ldr32(ACC, 3));
+                a.push(add_imm32(ACC, ACC, 1));
+                a.push(str32(ACC, 3));
+                a.label("rok");
+                a.push(str32(I, 2));
+                plain_increment(a);
+                a.push(cmp32(I, N));
+                let d = a.disp("rtop");
+                a.push(bcond(LT, d));
+                a.push(str32(I, 7));
+                a.push(PARK);
+            })
+        }
+
+        fn sb_run(barrier: Barrier) -> Litmus {
+            run(
+                "smp-parallel-a64.machine",
+                BOARD,
+                rom(&store_buffer(barrier, ROUNDS)),
+                ROUNDS,
+            )
+        }
+
+        fn mp_run(barrier: Barrier) -> Litmus {
+            run(
+                "smp-parallel-a64.machine",
+                BOARD,
+                rom(&message_passing(barrier, ROUNDS, false)),
+                ROUNDS,
+            )
+        }
+
+        /// **SB with `DMB ISH`, on a machine.** Zero is asserted.
+        #[test]
+        fn a_guest_dmb_between_the_store_and_the_load_on_a_machine() {
+            let out = sb_run(Barrier::Fence);
+            common("machine a64, SB, DMB    ", &out);
+            println!(
+                "machine a64, SB, DMB    : forbidden outcome {} / {ROUNDS} ({} rounds overlapped)",
+                out.both_stale, out.witness
+            );
+            assert_eq!(
+                out.both_stale, 0,
+                "the guest executed the instruction that forbids this"
+            );
+        }
+
+        /// **SB with `STLR`/`LDAR`, on a machine.** Zero is asserted.
+        ///
+        /// A64 acquire/release is RCsc (DDI 0487 B2.3), so a Store-Release
+        /// before a Load-Acquire in program order is ordered — which is
+        /// precisely this outcome.
+        #[test]
+        fn a_guest_store_release_and_load_acquire_on_a_machine() {
+            let out = sb_run(Barrier::AcquireRelease);
+            common("machine a64, SB, STLR   ", &out);
+            println!(
+                "machine a64, SB, STLR   : forbidden outcome {} / {ROUNDS} ({} rounds overlapped)",
+                out.both_stale, out.witness
+            );
+            assert_eq!(
+                out.both_stale, 0,
+                "A64 acquire/release is RCsc: a Store-Release before a Load-Acquire in \
+                 program order is ordered, and this is the outcome that orders"
+            );
+        }
+
+        /// The same programs with neither, so the two rows above are read
+        /// against something. Printed on every host.
+        #[test]
+        fn the_same_sb_with_neither() {
+            let out = sb_run(Barrier::None);
+            common("machine a64, SB, neither", &out);
+            println!(
+                "machine a64, SB, neither: forbidden outcome {} / {ROUNDS} ({} rounds overlapped)",
+                out.both_stale, out.witness
+            );
+        }
+
+        /// **MP with `DMB ISH`, on a machine.** Zero is asserted.
+        #[test]
+        fn a_guest_dmb_between_the_payload_and_the_flag() {
+            let out = mp_run(Barrier::Fence);
+            common("machine a64, MP, DMB    ", &out);
+            println!(
+                "machine a64, MP, DMB    : forbidden outcome {} / {ROUNDS}",
+                out.mp_bad
+            );
+            assert_eq!(
+                out.mp_bad, 0,
+                "a stale payload behind a fresh flag is what DMB forbids"
+            );
+        }
+
+        /// **MP with `STLR`/`LDAR`, on a machine.** Zero is asserted.
+        ///
+        /// The canonical release/acquire message pass, and the row that most
+        /// nearly resembles what a real SMP guest kernel does when it publishes
+        /// a structure and then a pointer to it.
+        #[test]
+        fn a_guest_store_release_publishes_the_payload() {
+            let out = mp_run(Barrier::AcquireRelease);
+            common("machine a64, MP, STLR   ", &out);
+            println!(
+                "machine a64, MP, STLR   : forbidden outcome {} / {ROUNDS}",
+                out.mp_bad
+            );
+            assert_eq!(
+                out.mp_bad, 0,
+                "a Load-Acquire that observes a Store-Release observes everything \
+                 sequenced before it"
+            );
+        }
+
+        /// The same with neither: the negative control for both MP rows.
+        #[test]
+        fn the_same_mp_with_neither() {
+            let out = mp_run(Barrier::None);
+            common("machine a64, MP, neither", &out);
+            println!(
+                "machine a64, MP, neither: forbidden outcome {} / {ROUNDS}",
+                out.mp_bad
+            );
+        }
+
+        /// The A64 half of the RISC-V module's
+        /// `a_torn_flag_load_is_visible_through_a_whole_machine`, and it is
+        /// the same defect: `RamStore` is architecture-independent, so a guest
+        /// spinning on a word another processor is storing can load a value
+        /// that was never in memory whichever core is doing the spinning.
+        ///
+        /// `#[ignore]` for the same two reasons — it is a search for a rare
+        /// event, and reporting a known defect must not turn the suite red.
+        #[test]
+        #[ignore = "a search for a rare known defect, not a gate; see the doc comment"]
+        fn a_torn_flag_load_is_visible_through_a_whole_machine() {
+            let mut tears = 0u64;
+            for attempt in 1..=super::super::ATTEMPTS {
+                let out = run(
+                    "smp-parallel-a64.machine",
+                    BOARD,
+                    rom(&message_passing(Barrier::Fence, ROUNDS, true)),
+                    ROUNDS,
+                );
+                common("machine a64, MP, torn   ", &out);
+                let (flag, data) = out.mp_saw;
+                println!(
+                    "machine a64, MP, torn   : {} apparent violations / {ROUNDS} \
+                     (attempt {attempt}/{}); last was flag={flag} payload={data}",
+                    out.mp_bad,
+                    super::super::ATTEMPTS,
+                );
+                if out.mp_bad > 0 {
+                    assert_ne!(
+                        flag,
+                        data + 1,
+                        "the flag was exactly one ahead of the payload, which is a \
+                         genuine store-store reordering rather than a torn load — a \
+                         defect in `Op::Dmb`, not in `RamStore`"
+                    );
+                    tears += out.mp_bad;
+                }
+            }
+            println!(
+                "machine a64: {tears} torn flag loads over {} runs of {ROUNDS} rounds",
+                super::super::ATTEMPTS
+            );
+        }
     }
 }
