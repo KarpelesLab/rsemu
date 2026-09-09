@@ -182,7 +182,7 @@ pub fn plan_space(space: &AddressSpace, readonly_mem: bool) -> Windows {
             FlatTarget::Rom { store, .. } => Backing::rom(store),
             // Left as MMIO on purpose — this is a device, and the whole design
             // is that its accesses come back out to the model.
-            FlatTarget::Io(_) => continue,
+            FlatTarget::Io(..) => continue,
         };
 
         if leaf.period().is_some() {

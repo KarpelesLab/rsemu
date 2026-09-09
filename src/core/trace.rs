@@ -101,8 +101,9 @@ impl Channel {
     /// The scheduler: how many rounds a run took, how long they were, and what
     /// came due in them.
     ///
-    /// The only channel with a *live* hook — everything else is read off the
-    /// machine once the run has ended.
+    /// One of the two channels with a *live* hook — [`Channel::MMIO`] is the
+    /// other, and everything else is read off the machine once the run has
+    /// ended.
     pub const SCHED: Channel = Channel(0);
 
     /// Per-processor execution statistics: blocks entered, how many by
@@ -118,8 +119,20 @@ impl Channel {
     /// clocked device was advanced.
     pub const CLOCK: Channel = Channel(2);
 
+    /// Per-region MMIO accesses: how many reads and how many writes each
+    /// device aperture answered.
+    ///
+    /// The **second** channel with a live hook, and the only one on a path a
+    /// guest access takes — three lines in `core::space::flat`, one per
+    /// dispatch arm that ends in a `MemOps` call. It costs the RAM path nothing
+    /// at all, because the RAM path is a different arm of the same `match`;
+    /// `docs/testing/tracing.md` has the callgrind and wall-clock measurements
+    /// that decided it was safe to place.
+    pub const MMIO: Channel = Channel(3);
+
     /// Every channel this build knows, in the order `--trace all` reports them.
-    pub const ALL: &'static [Channel] = &[Channel::SCHED, Channel::CPU, Channel::CLOCK];
+    pub const ALL: &'static [Channel] =
+        &[Channel::SCHED, Channel::CPU, Channel::CLOCK, Channel::MMIO];
 
     /// The name `--trace` spells this channel with.
     #[must_use]
@@ -128,6 +141,7 @@ impl Channel {
             Channel::SCHED => "sched",
             Channel::CPU => "cpu",
             Channel::CLOCK => "clock",
+            Channel::MMIO => "mmio",
             _ => "unknown",
         }
     }
@@ -146,6 +160,7 @@ impl Channel {
             Channel::SCHED => "scheduler rounds: how many, how long, what came due in them",
             Channel::CPU => "per-processor: blocks, chaining, translations, retired vs interpreted",
             Channel::CLOCK => "per-clock-domain tick totals",
+            Channel::MMIO => "per-region MMIO: reads and writes each device aperture answered",
             _ => "",
         }
     }
@@ -314,11 +329,18 @@ pub fn enable(ch: Channel) {
 /// atomic as a whole — a counter another thread increments while this runs may
 /// survive — which is honest for a facility whose entire cost model is
 /// "relaxed and unsynchronised".
+///
+/// The MMIO *names* are deliberately kept: a flat view built before this call
+/// still holds the ids they were interned under, and forgetting them would
+/// leave those leaves counting into rows nothing could name.
 pub fn reset() {
     #[cfg(feature = "trace")]
     {
         ENABLED.store(0, Ordering::Relaxed);
         for slot in &COUNTERS {
+            slot.store(0, Ordering::Relaxed);
+        }
+        for slot in &MMIO_COUNTERS {
             slot.store(0, Ordering::Relaxed);
         }
     }
@@ -397,6 +419,175 @@ pub fn get(c: Counter) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Per-region MMIO
+// ---------------------------------------------------------------------------
+
+/// How many MMIO regions the [`Channel::MMIO`] counters cover.
+///
+/// A second array rather than more slots in the named-counter one: this is
+/// indexed by a *region*, so its size is a property of the machine rather than
+/// of the counter set, and a board with a hundred apertures would otherwise
+/// push [`SLOTS`] past anything [`Counter::NAMES`] can describe. Two counters
+/// per region — reads and writes — so this is `2 × 256` of zero-initialised
+/// static data, four kilobytes that a build without the `trace` feature does
+/// not have at all.
+///
+/// A process with more MMIO regions than this counts its first `MMIO_REGIONS`
+/// and reports the rest as one overflow header line rather than silently
+/// folding them into region zero; [`crate::host::trace`] is what writes that
+/// line. The largest board in the tree interns a few dozen.
+pub const MMIO_REGIONS: usize = 256;
+
+/// The per-region MMIO counters, indexed `region * 2 + write`.
+#[cfg(feature = "trace")]
+#[allow(clippy::declare_interior_mutable_const)]
+static MMIO_COUNTERS: [AtomicU64; MMIO_REGIONS * 2] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; MMIO_REGIONS * 2]
+};
+
+/// The names behind the ids, and the identity each id was handed out for.
+///
+/// [`Global`](crate::core::sync::Global) rather than a `Mutex`, per
+/// `core::sync`'s rule for a table that lives in a `static`, at
+/// [`LockRank::LEAF`](crate::core::sync::LockRank::LEAF): it is taken at
+/// *flatten* time, underneath the topology write that is rebuilding the view,
+/// and never on an access path.
+#[cfg(feature = "trace")]
+static MMIO_NAMES: crate::core::sync::Global<MmioNames> =
+    crate::core::sync::Global::new(MmioNames {
+        names: Vec::new(),
+        by_key: BTreeMap::new(),
+        dropped: 0,
+    });
+
+/// The interning table [`mmio_intern`] keeps.
+#[cfg(feature = "trace")]
+#[derive(Debug)]
+struct MmioNames {
+    names: Vec<String>,
+    by_key: BTreeMap<usize, u16>,
+    dropped: u32,
+}
+
+/// Give an MMIO aperture a dense id, or return the one it already has.
+///
+/// `key` is an identity token the caller owns — `core::space::flat` passes the
+/// address of the `MemOps` the aperture dispatches to — and `name` is what the
+/// region is called. The identity is
+/// **not** the mapping: one device mapped into two address spaces, or
+/// re-flattened after a BAR moved, keeps its id and therefore its running
+/// total. That is the property a per-view index could not have, and it is why
+/// this table is here rather than in the flat view: a view is derived state
+/// that a retopology throws away, and a count that a `mov` to a BAR resets is
+/// worse than no count.
+///
+/// Returns [`u16::MAX`] once the table is full, which is out of range of the
+/// counter array, so an aperture past the cap is uncounted rather than
+/// misattributed. Costs a lock and a map lookup, once per aperture per
+/// flatten, and nothing at all without the `trace` feature — in which case it
+/// interns nothing and every aperture gets `u16::MAX`.
+pub fn mmio_intern(key: usize, name: &str) -> u16 {
+    #[cfg(feature = "trace")]
+    {
+        let mut table = MMIO_NAMES.lock();
+        if let Some(id) = table.by_key.get(&key) {
+            return *id;
+        }
+        let Ok(id) = u16::try_from(table.names.len()) else {
+            table.dropped = table.dropped.saturating_add(1);
+            return u16::MAX;
+        };
+        if usize::from(id) >= MMIO_REGIONS {
+            table.dropped = table.dropped.saturating_add(1);
+            return u16::MAX;
+        }
+        // Region names are *class* names much of the time — two PL011s are
+        // both `arm.pl011` — so a repeat is suffixed rather than allowed to
+        // collide, which would merge two devices into one row of the trace.
+        let mut unique = String::from(name);
+        let mut seq = 1u32;
+        while table.names.contains(&unique) {
+            unique = alloc::format!("{name}#{seq}");
+            seq += 1;
+        }
+        table.names.push(unique);
+        table.by_key.insert(key, id);
+        id
+    }
+    #[cfg(not(feature = "trace"))]
+    {
+        let _ = (key, name);
+        u16::MAX
+    }
+}
+
+/// Every interned aperture's name, by id, plus how many did not fit.
+///
+/// A snapshot the collector renders from; empty without the `trace` feature.
+#[must_use]
+pub fn mmio_regions() -> (Vec<String>, u32) {
+    #[cfg(feature = "trace")]
+    {
+        let table = MMIO_NAMES.lock();
+        (table.names.clone(), table.dropped)
+    }
+    #[cfg(not(feature = "trace"))]
+    {
+        (Vec::new(), 0)
+    }
+}
+
+/// One MMIO access to region `id` happened; `write` says which direction.
+///
+/// **The hook on a per-access path**, and the only one in this module: three
+/// call sites, all of them the `FlatTarget::Io` arm of a `match` whose other
+/// arms are RAM and ROM. Those arms are what a guest's ordinary loads and
+/// stores take, and they are untouched — which is the measurement
+/// `docs/testing/tracing.md` records, and the reason this was safe to place at
+/// all.
+///
+/// The identity is the dense index [`mmio_intern`] handed out when the view was
+/// flattened — `core::space::RegionId` — so this is an array subscript and not
+/// a lookup: a name would need a map, and a map on a dispatch path is exactly
+/// the cost this module exists to avoid.
+#[inline]
+pub fn mmio(id: u16, write: bool) {
+    #[cfg(feature = "trace")]
+    {
+        if on(Channel::MMIO)
+            && let Some(slot) = MMIO_COUNTERS.get(usize::from(id) * 2 + usize::from(write))
+        {
+            slot.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "trace"))]
+    {
+        let _ = (id, write);
+    }
+}
+
+/// Read one per-region MMIO counter, for the collector and for a test.
+///
+/// Zero for a region index this build has no slot for, which is the same
+/// answer a region nothing touched gives — [`mmio_regions`] is what tells the
+/// two apart, because it knows how many apertures were interned.
+#[must_use]
+pub fn mmio_get(id: u16, write: bool) -> u64 {
+    #[cfg(feature = "trace")]
+    {
+        MMIO_COUNTERS
+            .get(usize::from(id) * 2 + usize::from(write))
+            .map_or(0, |s| s.load(Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "trace"))]
+    {
+        let _ = (id, write);
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The one live hook
 // ---------------------------------------------------------------------------
 
@@ -404,10 +595,11 @@ pub fn get(c: Counter) -> u64 {
 /// `budgets` runnable budgets that consumed `ticks` between them, and
 /// dispatched `events`.
 ///
-/// **The only hook this module asks another file to place**, and it is one line
-/// at the end of `Machine::advance_to`. Everything else a trace reports is read
-/// off the machine when the run ends, which is why this subsystem costs the
-/// block-entry path nothing at all.
+/// One of the **two** hooks this module asks another file to place, and it is
+/// one line at the end of `Machine::advance_to`; [`mmio`] is the other. Nothing
+/// else a trace reports needs a hook at all — it is read off the machine when
+/// the run ends, which is why this subsystem costs the block-entry path nothing
+/// whatever.
 ///
 /// It takes the span rather than reading a clock, which is what makes the
 /// determinism rule structural: there is no time source in here to perturb.
@@ -438,7 +630,8 @@ pub fn quantum(span_ns: u64, budgets: u64, ticks: u64, events: u64) {
 
 /// One scheduler round happened, as the scheduler itself described it.
 ///
-/// **This is the whole hook**, and the one line another file is asked to add:
+/// **This is the whole of the scheduler hook**, and the one line another file
+/// is asked to add:
 /// `crate::core::trace::quantum_report(&report);` immediately after a round's
 /// events have been dispatched. It is written against
 /// [`QuantumReport`](crate::core::sched::QuantumReport) rather than against

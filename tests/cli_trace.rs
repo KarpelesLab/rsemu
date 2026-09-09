@@ -208,6 +208,48 @@ fn the_sched_channel_reports_the_rounds_and_the_declined_boundaries() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The `mmio` channel counts each device aperture, and only device apertures.
+///
+/// The apple1's monitor sits in a keyboard poll, so the PIA is read tens of
+/// thousands of times a guest second and written a handful — and the RAM and
+/// ROM the same loop is fetching from produce **no rows at all**, which is the
+/// visible half of the cost argument: the hook is inside the `FlatTarget::Io`
+/// arm, so an ordinary load or store never reaches it.
+#[test]
+fn the_mmio_channel_counts_device_apertures_and_nothing_else() {
+    let path = scratch("mmio.trace");
+    let _ = std::fs::remove_file(&path);
+    let (ok, _, err) = run(&[
+        "run",
+        "apple1",
+        "--for",
+        "1s",
+        "--headless",
+        "--trace",
+        &format!("mmio={}", path.display()),
+    ]);
+    assert!(ok, "{err}");
+    let text = std::fs::read_to_string(&path).expect("the trace");
+
+    let reads = row(&text, "mmio.pia.read");
+    let writes = row(&text, "mmio.pia.write");
+    assert!(
+        reads > 1_000,
+        "the monitor polls the PIA far more often than this:\n{text}"
+    );
+    assert_eq!(
+        (reads, writes),
+        (row(&text, "mmio.read"), row(&text, "mmio.write")),
+        "one aperture on this board, so the totals are its rows:\n{text}"
+    );
+    // The ROM the same loop fetches from and the RAM it writes are regions
+    // too, and neither is counted: this channel is MMIO, which is what makes
+    // it free for everything else.
+    assert!(!text.contains("mmio.ram"), "{text}");
+    assert!(!text.contains("mmio.rom"), "{text}");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Two columns, sorted, `#` for anything that is not a count.
 #[test]
 fn the_format_is_a_plain_two_column_table_a_script_can_read() {
@@ -332,9 +374,9 @@ fn a_board_with_no_translated_core_says_so_rather_than_printing_zeroes() {
 fn a_flag_that_cannot_be_honoured_is_refused_rather_than_ignored() {
     // A channel this build has never heard of, with the list of the ones it
     // has.
-    let (ok, _, err) = run(&["run", "apple1", "--for", "10ms", "--trace", "mmio"]);
+    let (ok, _, err) = run(&["run", "apple1", "--for", "10ms", "--trace", "wires"]);
     assert!(!ok, "a misspelt channel must not run the machine");
-    assert!(err.contains("--trace mmio"), "{err}");
+    assert!(err.contains("--trace wires"), "{err}");
     assert!(
         err.contains("`sched`") && err.contains("`cpu`") && err.contains("`all`"),
         "{err}"

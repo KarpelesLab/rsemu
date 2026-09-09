@@ -42,11 +42,18 @@
 //!
 //! # What is not here
 //!
-//! Per-region MMIO counts and a reason for each quantum boundary are both
-//! wanted and both need a change inside a file this module cannot reach — a
-//! name threaded into `core::space::flat::FlatLeaf`, and a "why did this round
-//! end" type in `core::sched`. `docs/testing/tracing.md` specifies both,
+//! A reason for each quantum boundary, which needs a "why did this round end"
+//! type `core::sched` has not grown. `docs/testing/tracing.md` specifies it
 //! precisely enough to apply.
+//!
+//! Per-region MMIO counts *are* here, and they are the exception to everything
+//! above: the only channel whose numbers are pushed from a hook rather than
+//! read off the machine, because an MMIO access leaves no trace on any object
+//! this module can reach afterwards. `core::space::flat` interns each aperture
+//! when it flattens and counts into `core::trace`'s per-region array from the
+//! three dispatch arms that end in a `MemOps` call. What that costs — nothing
+//! at all on the RAM path, in instructions or in bytes of `FlatEntry` — is
+//! measured in `docs/testing/tracing.md`.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -195,10 +202,58 @@ pub fn collect(machine: &Machine, hosts: &HostObjects, channels: &[Channel]) -> 
             Channel::SCHED => table.collect(Channel::SCHED),
             Channel::CLOCK => clocks(machine, &mut table),
             Channel::CPU => cpus(machine, hosts, &mut table),
+            Channel::MMIO => mmio(&mut table),
             _ => {}
         }
     }
     table
+}
+
+/// Per-region MMIO reads and writes, out of the counters
+/// `core::space::flat`'s dispatch arms fed while the run was going.
+///
+/// The only channel here whose numbers were *pushed* rather than read off the
+/// machine, so it is also the only one that needs no handle on anything: the
+/// identity is interned process-wide, and the names come back with it.
+///
+/// A region with no accesses at all still gets its two rows. The set is small
+/// and bounded by the board's apertures, and "the guest never touched the
+/// RTC" is exactly the kind of answer this channel exists to give — unlike a
+/// per-core zero, which cannot be told apart from a core that does not count.
+fn mmio(table: &mut Table) {
+    let (names, dropped) = crate::core::trace::mmio_regions();
+    if names.is_empty() {
+        table.note("mmio", "no MMIO aperture was flattened in this process");
+        return;
+    }
+    let (mut reads, mut writes) = (0u64, 0u64);
+    for (id, name) in names.iter().enumerate() {
+        let Ok(id) = u16::try_from(id) else { break };
+        let r = crate::core::trace::mmio_get(id, false);
+        let w = crate::core::trace::mmio_get(id, true);
+        // A row is two whitespace-separated fields and there is no quoting, so
+        // a region whose name has a space in it would break the format for
+        // every reader. Nothing in the tree names one that way; this is what
+        // keeps that from being a promise the next device has to remember.
+        let name: String = name
+            .chars()
+            .map(|c| if c.is_whitespace() { '_' } else { c })
+            .collect();
+        table.set(&format!("mmio.{name}.read"), r);
+        table.set(&format!("mmio.{name}.write"), w);
+        reads = reads.saturating_add(r);
+        writes = writes.saturating_add(w);
+    }
+    table.set("mmio.read", reads);
+    table.set("mmio.write", writes);
+    if dropped != 0 {
+        // Named rather than counted into some other region: a dense index has
+        // to say when it ran out, or its totals quietly stop adding up.
+        table.note(
+            "mmio",
+            &format!("{dropped} apertures past the counter array are not counted"),
+        );
+    }
 }
 
 /// Per-clock-domain tick totals.

@@ -16,6 +16,11 @@
 //! whatever it is given) or uses a channel no hook feeds, so it is exact and it
 //! is isolated.
 //!
+//! `mmio` has a hook too, and the same rule applies twice over: its counters
+//! are keyed by an *interning table* every machine in the process adds to, so
+//! the only thing asserted here is that interning is idempotent, which is true
+//! whatever else is running.
+//!
 //! [`SERIAL`] is still held, because these tests would otherwise collide with
 //! *each other* over the same slots.
 
@@ -45,7 +50,7 @@ fn a_channel_round_trips_through_its_name() {
         assert!(!ch.summary().is_empty(), "{} has no summary", ch.name());
     }
     assert_eq!(
-        Channel::from_name("mmio"),
+        Channel::from_name("wires"),
         None,
         "not a channel this build has"
     );
@@ -257,5 +262,58 @@ fn collect_writes_a_named_counter_even_at_zero() {
 fn itoa_agrees_with_the_formatter_it_replaces() {
     for value in [0u64, 1, 9, 10, 99, 100, 4_294_967_296, u64::MAX] {
         assert_eq!(super::itoa(value), alloc::format!("{value}"));
+    }
+}
+
+/// Interning an aperture twice hands back the same id and names it once.
+///
+/// The property the per-region counters stand on: a flat view rebuilt after a
+/// retopology, and a second address space that maps the same device, must both
+/// resolve to the row the first flatten created — otherwise a BAR write would
+/// reset a count and two spaces would each write into region zero.
+///
+/// Exact whatever else is running, because it asserts a relation between two
+/// calls rather than a value of the shared table.
+#[test]
+fn interning_an_aperture_is_idempotent() {
+    // No `SERIAL` here, and it would be a lock-order violation if there were:
+    // the interning table is a `Global` of its own at `LockRank::LEAF`. It is
+    // also unnecessary — ids are handed out once and names only ever appended,
+    // so what this asserts holds however many machines other threads are
+    // flattening at the time.
+    //
+    // Not the address of anything: `mmio_intern` treats the key as an opaque
+    // identity token, and the flattener is what guarantees a live one.
+    let key = 0x1_0000_0000_usize;
+    let first = super::mmio_intern(key, "test.aperture");
+    let again = super::mmio_intern(key, "test.aperture");
+    assert_eq!(first, again, "one device, one id");
+
+    let (names, _dropped) = super::mmio_regions();
+    #[cfg(feature = "trace")]
+    {
+        assert_eq!(
+            names
+                .get(usize::from(first))
+                .map(alloc::string::String::as_str),
+            Some("test.aperture"),
+            "the id indexes the name it was interned under"
+        );
+        // A second device under the same *name* is a second row, suffixed
+        // rather than merged: region names are class names much of the time.
+        let other = super::mmio_intern(key + 8, "test.aperture");
+        assert_ne!(other, first);
+        let (names, _) = super::mmio_regions();
+        assert_eq!(
+            names
+                .get(usize::from(other))
+                .map(alloc::string::String::as_str),
+            Some("test.aperture#1")
+        );
+    }
+    #[cfg(not(feature = "trace"))]
+    {
+        assert_eq!(first, u16::MAX, "a build with no counters interns nothing");
+        assert!(names.is_empty());
     }
 }

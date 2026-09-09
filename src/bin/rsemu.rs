@@ -147,9 +147,10 @@ RUN OPTIONS:
                         patched exit, translations made and thrown away, guest
                         instructions retired inside a block against interpreted
                         one at a time), `clock` (per-clock-domain tick totals),
-                        or `all`. Repeat it to send channels to different
-                        files; channels naming the same destination share one
-                        table.
+                        `mmio` (per device aperture: how many reads and how
+                        many writes it answered), or `all`. Repeat it to send
+                        channels to different files; channels naming the same
+                        destination share one table.
                         The output is two whitespace-separated columns, sorted
                         by name, under a `#` header — a person reads it as a
                         table and a script pulls a row out of it with one awk

@@ -211,6 +211,7 @@ would answer that the machine file does not.
 | [`techniques/parallel-execution.md`](techniques/parallel-execution.md) | What `ThreadingMode::Parallel` promises, what a machine file may say, and how a run with no state hash is checked |
 | [`techniques/virtualization.md`](techniques/virtualization.md) | KVM, Hypervisor.framework, WHPX |
 | [`techniques/webassembly.md`](techniques/webassembly.md) | Wasm core, threads, browser APIs |
+| [`testing/tracing.md`](testing/tracing.md) | Measuring a run from inside it: counters rather than an event stream, and what it costs to put one on a path a guest access takes (listed again under *Testing*, where the file lives) |
 
 ### Testing
 | | |

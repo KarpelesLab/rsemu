@@ -575,6 +575,28 @@ listening. There is no native sound-card backend for the same reason there is no
 native window: ALSA is an `ioctl` protocol and the alternative to `libc` is an
 eighth `unsafe` subsystem, which the ceiling of seven forbids.
 
+**A run can say what it did**, in numbers rather than prose. `rsemu run pc64
+--media kernel=bzImage --for 900s --headless --trace all=boot.trace` writes a
+plain two-column table — `cpu.retired.permille 987`, `sched.quanta 24818`,
+`mmio.pia.read 1461001` — that `awk` reads with one pattern and `diff` compares
+between two runs. **Counters, not an event stream**: every measurement this
+project has improvised was a count, and a record per block entry would be
+hundreds of millions of records the hot path cannot carry. Four channels —
+`sched`, `cpu`, `clock`, and `mmio` per device aperture — and there is no
+timestamp and no wall-clock figure anywhere in the output, deliberately, so two
+traces of one deterministic run are byte-identical and a diff between them is a
+real regression test. `tests/cli_trace.rs` asserts that, and asserts the
+property the whole facility stands on: a traced run reaches the **same state
+hash** as an untraced one. A flag that cannot be honoured is refused rather than
+ignored — `--trace cpu` with `--accel` says why an accelerated processor keeps
+none of those counters, while `--trace all` drops `cpu` from the wildcard and
+says so on stderr, because `all` means "every channel this run can report".
+Without the `trace` feature every hook has an empty body and the whole thing
+costs zero; with it compiled in, the numbers — including the callgrind and
+wall-clock pair that decided the MMIO hook was safe to put on a guest access
+path at all — are in
+[`docs/testing/tracing.md`](docs/testing/tracing.md).
+
 ### Three ways to execute a guest
 
 **The interpreter is the oracle**, always: every other engine is differentially
