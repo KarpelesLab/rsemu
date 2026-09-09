@@ -138,6 +138,14 @@ fn visit_stmt(stmt: &Stmt) {
             visit_path(&w.from);
             visit_path(&w.to);
         }
+        // The mode is a bare word the parser has already validated; there is
+        // no expression under it to evaluate, so touching the span is the
+        // whole visit. Named rather than folded into the wildcard below so
+        // that a future statement carrying an expression is a compile error
+        // here — which is how this arm came to exist.
+        Stmt::Threading(t) => {
+            let _ = t.mode.span;
+        }
         Stmt::Include(_) => {}
         Stmt::Template(t) => {
             visit_name(&t.name);
