@@ -44,11 +44,16 @@
 //!   `VBAR_EL1` sends the guest is the interpreter's, and the harness arms
 //!   [`ExitReason::FAULT`] so the oracle stops *at* the faulting instruction
 //!   instead of vectoring into whatever RAM holds.
-//! * **Code a running trace overwrites.** A64 requires cache maintenance
-//!   between writing instruction memory and executing it, so the architecture
-//!   permits a disagreement there — which is exactly why
-//!   [`lift`] ends a block at a store, and why the cached path
-//!   below asserts that a store into a block's own page invalidates it.
+//! * **Code a running trace overwrites**, in the sense of *which* bytes run:
+//!   A64 requires cache maintenance between writing instruction memory and
+//!   executing it, so the architecture permits a disagreement there. What is
+//!   covered is that the disagreement never happens — this harness's own host
+//!   implements [`Smc::HostGuard`]'s obligation, leaving the block after
+//!   a store into the code page exactly as `cpu::arm::a64::engine`'s host
+//!   does, and the cached path below asserts that such a store invalidates
+//!   the translation. A case that stores into its own code therefore compares
+//!   a *shorter* run against the same number of interpreted instructions
+//!   rather than comparing stale bytes against fresh ones.
 //! * **Anything outside the lifted subset**, which ends the block and is
 //!   reported as [`Verdict::Nothing`] when it is the first instruction.
 
@@ -64,7 +69,8 @@ use crate::core::value::Width;
 use crate::ir::{Align, InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot, verify};
 
 use super::isa::{self, Nzcv};
-use super::lift::{self, Origin, PC, SP, Shape, World, x_slot};
+use super::lift::{self, Origin, PC, SP, Shape, Smc, World, x_slot};
+use super::mmu::PAGE_MASK as MMU_PAGE_MASK;
 use super::sysreg::sctlr;
 use super::{Config, Cpu};
 
@@ -132,6 +138,8 @@ pub struct Case {
     pub strict_align: bool,
     /// How much the lifter may swallow.
     pub shape: Shape,
+    /// What a store does to the block it is in.
+    pub smc: Smc,
 }
 
 impl Case {
@@ -146,6 +154,7 @@ impl Case {
             nzcv: 0,
             strict_align: false,
             shape: Shape::default(),
+            smc: Smc::default(),
         }
     }
 
@@ -167,6 +176,19 @@ impl Case {
     #[must_use]
     pub fn with_shape(mut self, shape: Shape) -> Case {
         self.shape = shape;
+        self
+    }
+
+    /// The same case under a different store policy.
+    ///
+    /// Both are correct and both must agree with the interpreter, which is why
+    /// the corpus runs the pair rather than only the default:
+    /// [`Smc::EndBlock`] is the control the speed of [`Smc::HostGuard`] is
+    /// measured against, and a policy that got faster by getting wrong should
+    /// fail a test rather than win a column.
+    #[must_use]
+    pub fn with_smc(mut self, smc: Smc) -> Case {
+        self.smc = smc;
         self
     }
 
@@ -464,8 +486,15 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
         let off = addr.checked_sub(BASE)? / 4;
         program.get(off as usize).copied()
     };
-    let lifted = lift::lift(&world, BASE, &mut src, lift::MAX_INSNS, case.shape)
-        .map_err(|e| diverged(case, format!("the frontend refused this world: {e}")))?;
+    let lifted = lift::lift(
+        &world,
+        BASE,
+        &mut src,
+        lift::MAX_INSNS,
+        case.shape,
+        case.smc,
+    )
+    .map_err(|e| diverged(case, format!("the frontend refused this world: {e}")))?;
     if lifted.insns == 0 {
         return Ok(Verdict::Nothing);
     }
@@ -482,9 +511,22 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     // ones it reached, and the static number would step the oracle the wrong
     // number of times.
     let retired = interp.boundaries().saturating_sub(1) as usize;
+    // Where the guest stands afterwards. At an exit the block published `PC`
+    // itself; at a guard exit it did not — this frontend binds `PC` at the
+    // exit boundary and nowhere else — so the boundary's own PC is the one
+    // [`Outcome::Spent`] carries, which is what a dispatcher uses too.
+    let mut left_at = None;
     let fault = match outcome {
         Outcome::Exit => None,
         Outcome::Fault(f) => Some(f),
+        // The store guard fired: the store retired, the block stopped in
+        // front of the next instruction, and the oracle is stepped exactly
+        // that far. What the two are then compared on is the same state at the
+        // same PC — which is the whole claim the guard makes.
+        Outcome::Spent { pc } => {
+            left_at = Some(pc);
+            None
+        }
         other => {
             return Err(diverged(
                 case,
@@ -529,8 +571,13 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
             Ok(Verdict::Trapped { insns: retired })
         }
         None => {
-            let pc = host.slots[PC.0 as usize];
-            state(case, &cpu, &host.slots, pc, host.ticks, "at the block exit")?;
+            let pc = left_at.unwrap_or(host.slots[PC.0 as usize]);
+            let what = if left_at.is_some() {
+                "where the store guard left the block"
+            } else {
+                "at the block exit"
+            };
+            state(case, &cpu, &host.slots, pc, host.ticks, what)?;
             // The static column plus what the accesses spent is the whole
             // count. That identity is what says the frontend's own accounting
             // is right rather than merely consistent.
@@ -580,6 +627,16 @@ struct Host {
     /// physical one, which is what makes this a one-liner here.
     #[cfg(feature = "jit")]
     dirty: DirtyPages,
+    /// Whether a store has landed in the page the program was loaded on.
+    ///
+    /// [`Smc::HostGuard`]'s obligation, restated here for the same reason
+    /// [`Host::access`] restates the memory rule: what is under test is the
+    /// *frontend*, and a harness that let a block run past a store into its
+    /// own code would be comparing bytes the interpreter has already replaced
+    /// against bytes it has not. `cpu::arm::a64::engine` answers it by
+    /// retiring the run's allowance; there is no allowance here, so the flag
+    /// **is** the answer — monotone, as [`IrHost::spent`] requires.
+    smc: bool,
 }
 
 impl Host {
@@ -602,6 +659,7 @@ impl Host {
             access_ticks: 0,
             #[cfg(feature = "jit")]
             dirty: DirtyPages::new(),
+            smc: false,
         }
     }
 
@@ -617,6 +675,14 @@ impl Host {
                 // those bytes is stale either way.
                 #[cfg(feature = "jit")]
                 self.dirty.note(addr, width.bytes());
+                // The program is loaded at [`BASE`] and a block never leaves
+                // the page it started on, so one comparison covers every block
+                // this harness can lift. Bare mode, so the address written is
+                // the physical one — which is the comparison the engine makes
+                // with the two ends it has to translate first.
+                if addr & !MMU_PAGE_MASK == BASE & !MMU_PAGE_MASK {
+                    self.smc = true;
+                }
                 self.space.write(addr, width, v, self.attrs).map(|()| 0)
             }
             None => self.space.read(addr, width, self.attrs),
@@ -675,6 +741,18 @@ impl IrHost for Host {
     }
 
     fn insn_start(&mut self, _mark: &InsnStart) {}
+
+    /// [`Smc::HostGuard`]'s obligation: leave the block at the first boundary
+    /// after a store into the page the code came from.
+    ///
+    /// Monotone, because [`Host::smc`] is only ever set. Under
+    /// [`Smc::EndBlock`] it can still fire — a store is the last instruction
+    /// of its block there, so the only boundary left is the exit one, which no
+    /// backend leaves at — which is why the flag is unconditional rather than
+    /// switched on `Case::smc`: one implementation, exercised by both legs.
+    fn spent(&self) -> bool {
+        self.smc
+    }
 }
 
 // No software TLB here, so no fast path to publish: this host's accesses all
@@ -789,7 +867,7 @@ impl<H: ?Sized> Frontend<H> for Lifter<'_> {
     }
 
     fn key(&mut self) -> u64 {
-        lift::key(&self.world, self.case.shape)
+        lift::key(&self.world, self.case.shape, self.case.smc)
     }
 
     fn pc_slot(&self) -> RegSlot {
@@ -802,7 +880,14 @@ impl<H: ?Sized> Frontend<H> for Lifter<'_> {
         // Read the *bytes in guest memory*, not the case's program, so a store
         // that rewrites the code page is visible to the next translation.
         let mut src = |addr: u64| space.read(addr, Width::U32, attrs).ok().map(|v| v as u32);
-        let lifted = lift::lift(&self.world, pc, &mut src, lift::MAX_INSNS, self.case.shape)?;
+        let lifted = lift::lift(
+            &self.world,
+            pc,
+            &mut src,
+            lift::MAX_INSNS,
+            self.case.shape,
+            self.case.smc,
+        )?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
         {
@@ -1303,8 +1388,15 @@ mod tests {
             let off = addr.checked_sub(BASE)? / 4;
             program.get(off as usize).copied()
         };
-        let lifted = lift::lift(&world, BASE, &mut src, lift::MAX_INSNS, case.shape)
-            .expect("this world lifts");
+        let lifted = lift::lift(
+            &world,
+            BASE,
+            &mut src,
+            lift::MAX_INSNS,
+            case.shape,
+            case.smc,
+        )
+        .expect("this world lifts");
         let mut host = Host::new(&case, space);
         let mut interp = Interp::new();
         interp
@@ -1546,19 +1638,72 @@ mod tests {
 
         #[test]
         fn a_loop_chains_rather_than_looking_every_block_up() {
-            // `add x5, x5, #1`, `str x5, [x4]`, `b .-8`: the store ends each
-            // block, so the loop is a chain of short blocks.
+            // `add x5, x5, #1`, `str x5, [x4]`, `b .-8`: a three-instruction
+            // loop whose scratch word is in the data window, so the store
+            // never lands in the code page.
             let case = Case::seeded(vec![0x9100_04a5, 0xf900_0085, 0x17ff_fffe]);
             let run = measure_cached(&case, 32).expect("agreement");
             assert!(run.blocks > 8, "{run:?}");
             assert!(run.chained > 0, "the exit was never patched: {run:?}");
-            // **Two** translations, not one, and the reason is the store rule
-            // rather than a cache that is not working: the store ends its
-            // block, so the loop has two entry PCs — the top, and the `b` the
-            // first block exits to — and the `b` is merged into the second,
-            // which brings it back to the top. Both are then served from the
-            // cache for the rest of the run, which is what `chained` says.
-            assert_eq!(run.translated, 2, "two entries, served over and over");
+            // Three translations, and the three are the whole loop entered at
+            // each of its instructions: the store no longer cuts the block, so
+            // a trace unrolls the three-instruction body to the sixty-four
+            // instruction limit and 64 is not a multiple of 3, so where one
+            // block ends is where the next one starts. All three are then
+            // served from the cache for the rest of the run, which is what
+            // `chained` says.
+            assert_eq!(run.translated, 3, "three entries, served over and over");
+            // The control, so what the policy bought is a difference rather
+            // than a number: the same loop, the same block budget, under the
+            // policy this replaced. Two translations there and a block per
+            // store — which is the 6.44 guest instructions per block a real
+            // boot measured, in miniature.
+            let ended =
+                measure_cached(&case.clone().with_smc(Smc::EndBlock), 32).expect("agreement");
+            assert_eq!(ended.translated, 2, "the policy this replaced cut the loop");
+            assert!(
+                run.insns_retired > 8 * ended.insns_retired,
+                "the same block budget has to retire far more guest work under \
+                 the guard: {run:?} against {ended:?}"
+            );
+        }
+
+        #[test]
+        fn a_store_into_the_code_page_leaves_the_block_where_the_interpreter_is() {
+            // `str x5, [x2]` over the two instructions that follow it, then
+            // those instructions. The eight bytes the store lands on are words
+            // 2 and 3 of this very program, so a block that ran on would
+            // execute the `add`s it lifted while the interpreter fetched the
+            // `2` the store left and took an `UNDEFINED` exception. Under
+            // `Smc::EndBlock` the block ended at the store and the question
+            // never arose; under the default it is `Host::spent` that has to
+            // stop the block, and `compare` steps the oracle exactly as far as
+            // the block got. A block that ran on would execute the *old*
+            // words and this would report a divergence.
+            let case = Case::seeded(vec![
+                0xd280_0045, // movz x5, #2
+                0xf900_0045, // str  x5, [x2]   ; x2 points into the code page
+                0x9100_04a5, // add  x5, x5, #1
+                0x9100_04a5, // add  x5, x5, #1
+                SVC,
+            ])
+            .with_reg(2, BASE + 8);
+            let verdict = compare(&case).expect("the guard keeps the two together");
+            let Verdict::Agreed { insns, .. } = verdict else {
+                panic!("expected agreement, got {verdict:?}");
+            };
+            assert_eq!(
+                insns, 2,
+                "the block has to stop at the boundary after the store, not run on"
+            );
+            // The control: the policy this replaced ends the block at the
+            // store on its own, and reaches the same place.
+            let ended = compare(&case.clone().with_smc(Smc::EndBlock))
+                .expect("the policy this replaced also agrees");
+            assert!(
+                matches!(ended, Verdict::Agreed { insns: 2, .. }),
+                "{ended:?}"
+            );
         }
 
         #[test]

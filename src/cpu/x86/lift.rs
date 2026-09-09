@@ -476,6 +476,36 @@
 //! the physical address there, so two different linear pages alias one physical
 //! page and a linear comparison would miss one of them.
 //!
+//! ## A64 found somewhere better to make the comparison
+//!
+//! Everything above is about a guard **in the IR**, and the IR only has the
+//! address the guest computed, which is why the guard is linear and why it is
+//! therefore refused under paging — leaving [`Smc::EndBlock`] as the policy
+//! for every guest that pages, which is every guest worth measuring.
+//!
+//! `cpu::arm::a64::lift::Smc` makes the same check somewhere else:
+//! `cpu::arm::a64::engine`'s host already sees the guest-**physical** page of
+//! every store, because that is what feeds `jit::DirtyPages` and invalidates a
+//! *cached* translation, and comparing it against the physical page the
+//! running block's own bytes came from is one compare on a path that has just
+//! done a bus access. It emits no IR at all, it has no aliasing hole, and it
+//! leaves the block through [`IrHost::spent`](crate::ir::IrHost::spent), which
+//! already exists for the quantum. Measured on an arm64 Linux boot that took a
+//! block from 6.44 guest instructions to 10.80 and 14.6% off the host
+//! instruction count.
+//!
+//! **It would work here, and nobody has done it.** `engine`'s `Host` has the
+//! same `note_writes` over the same `DirtyPages`, `Lifted::page` is already
+//! the physical page a store is matched against, and `Host::pins` already
+//! shows the shape of an answer given at the store rather than at a boundary.
+//! What it would replace is not [`Smc::Guard`] — that is the *unpaged*
+//! policy, and it is already cheaper than a block — but `admit`'s fallback to
+//! [`Smc::EndBlock`] under paging, which is where a real x86 guest spends all
+//! of its time and where a store is still a whole block. It is a measurement
+//! nobody has taken; it is recorded here so that the next person does not
+//! start from "x86 will need a finer hook than this one", which is what
+//! `jit::dispatch` still says and which A64 has since shown to be false.
+//!
 //! # Precise state at a fault
 //!
 //! `ROADMAP.md` §9: *"when a load faults halfway through a translated block,
@@ -603,7 +633,7 @@ use crate::core::error::{Error, Result};
 use crate::core::value::Width;
 use crate::ir::{
     AccessKind, Align, Block, BlockBuilder, Cond, Const, Endian, InsnStart, MemOp, MemSpace,
-    Opcode, RegSlot, SegId, Sign, Temp, Type, bitfield_aux, eliminate_dead_code,
+    Opcode, RegSlot, SegId, Sign, Temp, Type, bitfield_aux, eliminate_dead_code, hoist_slot_reads,
 };
 
 use super::isa::{self, Arg, Bits, Fields, Op, seg};
@@ -1389,6 +1419,13 @@ pub fn lift<S: InsnSource>(
     // on nearly every ALU instruction is removable exactly when no boundary
     // names it, and this is what removes it.
     let block = eliminate_dead_code(&block);
+    // And then the reads this frontend emits per guest instruction are moved
+    // to the top of their region, because a backend that defers boundaries and
+    // charges has to replay them before a slot read and this frontend puts one
+    // one or two instructions after every boundary. `hoist_slot_reads`
+    // documents what it costs and what it may not do; the pass is frontend
+    // agnostic and this is the second of the three to call it.
+    let block = hoist_slot_reads(&block);
     Ok(Lifted {
         block,
         stop,

@@ -109,10 +109,28 @@
 //! exactly there. It costs a store-heavy loop one extra block per store and
 //! costs a load-heavy one nothing at all, which is the shape of the trade.
 //!
-//! The way out, when someone wants it, is the same hook `jit::dispatch`
-//! already records that an **x86** frontend will need — a check *within* a
-//! block, because x86 makes coherent instruction caches architectural. With
-//! that in place this rule becomes a policy rather than a necessity.
+//! **The way out exists and this frontend has not taken it.** `jit::dispatch`
+//! records that an **x86** frontend would need a check *within* a block, and
+//! guesses that it needs "a finer hook than this one". It turned out not to:
+//! `cpu::arm::a64::lift::Smc` is the same rule made a policy, and the hook is
+//! [`IrHost::spent`](crate::ir::IrHost::spent), which already exists. A64's
+//! host compares the guest-**physical** page of every store — which it sees
+//! anyway, on the way into `jit::DirtyPages` — against the physical page the
+//! block's own bytes came from, and retires the run's tick allowance on a
+//! match, so the block leaves at the boundary after the store instead of
+//! before it. Nothing is emitted; a block simply stops ending at a store that
+//! did not matter. On an arm64 Linux boot that took a block from 6.44 guest
+//! instructions to 10.80 and 14.6% off the host instruction count.
+//!
+//! Every piece of it is already here: `cpu::riscv::engine`'s `Admitted::base`
+//! is the physical page the entry translation resolved to, its `Host` has the
+//! same `note_writes` on the same `DirtyPages`, and its `spent` is the same
+//! comparison against the same allowance. What that engine would also have to
+//! answer is the pair A64 found underneath the rule — an interrupt a store
+//! *raises* on a device, and a store that **remaps** and so retires the host
+//! pointers the backend took out of the shadow TLB at block entry — because
+//! today both are answered by the block boundary a store creates. Until
+//! someone does that and measures it on a real guest, this rule stays.
 //!
 //! # Superblocks: merging across direct branches
 //!
@@ -629,7 +647,15 @@ pub fn lift<S: InsnSource>(
     };
 
     Ok(Lifted {
-        block: lf.finish(pc),
+        // The one pass this frontend runs over its own output. There is no
+        // dead code to eliminate — RISC-V has no flags, so `cpu::x86::lift`'s
+        // reason for running that pass does not exist here — but every
+        // frontend in the tree emits its slot reads one or two instructions
+        // after a boundary, and a backend that defers boundaries and charges
+        // has to replay them before each one. `hoist_slot_reads` moves them to
+        // the top of their region; it is frontend agnostic and states its own
+        // five rules.
+        block: crate::ir::hoist_slot_reads(&lf.finish(pc)),
         stop,
         insns,
         origin,

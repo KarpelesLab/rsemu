@@ -33,15 +33,27 @@
 //!
 //! # The ladder's configurations
 //!
-//! | | translation | block shape | memory | engine |
-//! | --- | --- | --- | --- | --- |
-//! | `interpreter` | none — `Cpu::step`, the oracle | — | `AddressSpace` | — |
-//! | `lift-each` | re-lift every block, no cache | basic block | `AddressSpace` | `ir::Interp` |
-//! | `cached` | block cache, exits chained | basic block | `AddressSpace` | `ir::Interp` |
-//! | `cached+tlb` | block cache, exits chained | basic block | `jit::Tlb` | `ir::Interp` |
-//! | `+extended` | " | a load no longer ends a block | `jit::Tlb` | `ir::Interp` |
-//! | `+superblock` | " | direct branches merged, with side exits | `jit::Tlb` | `ir::Interp` |
-//! | `+compiled` | " | " | `jit::Tlb`, **inlined** | `jit::x86` |
+//! | | translation | block shape | stores | memory | engine |
+//! | --- | --- | --- | --- | --- | --- |
+//! | `interpreter` | none — `Cpu::step`, the oracle | — | — | `AddressSpace` | — |
+//! | `lift-each` | re-lift every block, no cache | basic block | end the block | `AddressSpace` | `ir::Interp` |
+//! | `cached` | block cache, exits chained | basic block | end the block | `AddressSpace` | `ir::Interp` |
+//! | `cached+tlb` | block cache, exits chained | basic block | end the block | `jit::Tlb` | `ir::Interp` |
+//! | `+extended` | " | a load no longer ends a block | end the block | `jit::Tlb` | `ir::Interp` |
+//! | `+superblock` | " | direct branches merged, with side exits | end the block | `jit::Tlb` | `ir::Interp` |
+//! | `+guard` | " | " | **the host watches the code page** | `jit::Tlb` | `ir::Interp` |
+//! | `+compiled` | " | " | " | `jit::Tlb`, **inlined** | `jit::x86` |
+//!
+//! `+guard` is [`lift::Smc`], and it is the column this file was extended for.
+//! Every row before it ends a block at every store, which on a real arm64
+//! Linux boot bounded a block at 6.44 guest instructions against a frontend
+//! limit of 64 and made every per-block cost in the profile a cost per 6.44
+//! guest instructions. `Smc::HostGuard` moves the check to the host, which
+//! sees the guest-*physical* page of every store and compares it against the
+//! one the running block came from — the comparison `cpu::x86::lift`'s
+//! in-block guard cannot make, which is why that one is refused under paging
+//! and this one is not. It emits no IR at all, so the column is the block
+//! shape and nothing else.
 //!
 //! `lift-each` is the honest starting point rather than the interpreter: a
 //! translator that re-lifts every block is *slower* than the interpreter it
@@ -63,9 +75,12 @@
 //!   block, chained to itself, touching no memory: the block cache's best case
 //!   and a case the TLB never sees. The back edge is direct, so a trace
 //!   unrolls it to the instruction limit.
-//! * **`memcpy`** — a byte-at-a-time copy. Two accesses per iteration, and the
-//!   **store ends the block under every shape** (`cpu::arm::a64::lift`, "A
-//!   store ends the block"), so this is the workload that prices that rule.
+//! * **`memcpy`** — a byte-at-a-time copy. Two accesses per iteration, and one
+//!   of them is a **store**, so this is the workload that prices the store
+//!   rule (`cpu::arm::a64::lift`, "What a store does to the block it is in")
+//!   and the one `+guard` was added for. Its buffers are in the data window,
+//!   pages away from the code, so the guard never fires and the column
+//!   measures the block shape rather than the invalidation path.
 //! * **`load-heavy`** — four loads and a branch, the pointers in four
 //!   different pages. Under the basic-block shape that is one guest
 //!   instruction per block: the TLB's best case and the cache's worst, which
@@ -85,7 +100,7 @@ use std::time::{Duration, Instant};
 use rsemu::core::error::Result;
 use rsemu::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region, UnassignedPolicy};
 use rsemu::core::value::Width;
-use rsemu::cpu::arm::a64::lift::{self, Origin, PC, SLOT_COUNT, Shape, World, x_slot};
+use rsemu::cpu::arm::a64::lift::{self, Origin, PC, SLOT_COUNT, Shape, Smc, World, x_slot};
 use rsemu::cpu::arm::a64::{Config, Cpu};
 use rsemu::ir::{AccessKind, Align, InsnStart, IrHost, MemOp, RegSlot};
 use rsemu::jit::{
@@ -119,7 +134,7 @@ fn main() {
 
 fn ladder(args: &Args) {
     println!(
-        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
         "workload",
         "interpreter",
         "lift-each",
@@ -127,31 +142,37 @@ fn ladder(args: &Args) {
         "cached+tlb",
         "+extended",
         "+superblock",
+        "+guard",
         "+compiled",
     );
     for w in workloads() {
         let basic = Shape::BasicBlock;
+        let ends = Smc::EndBlock;
+        let guarded = Smc::HostGuard;
         let interp = best(args.reps, || run_interpreter(&w, args.insns));
         let cold = best(args.reps, || {
-            run_translated(&w, args.insns, false, false, basic, false)
+            run_translated(&w, args.insns, false, false, basic, ends, false)
         });
         let cached = best(args.reps, || {
-            run_translated(&w, args.insns, true, false, basic, false)
+            run_translated(&w, args.insns, true, false, basic, ends, false)
         });
         let tlb = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, basic, false)
+            run_translated(&w, args.insns, true, true, basic, ends, false)
         });
         let extended = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Extended, false)
+            run_translated(&w, args.insns, true, true, Shape::Extended, ends, false)
         });
         let trace = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Trace, false)
+            run_translated(&w, args.insns, true, true, Shape::Trace, ends, false)
+        });
+        let guard = best(args.reps, || {
+            run_translated(&w, args.insns, true, true, Shape::Trace, guarded, false)
         });
         let compiled = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Trace, true)
+            run_translated(&w, args.insns, true, true, Shape::Trace, guarded, true)
         });
         println!(
-            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             w.name,
             mips(args.insns, interp),
             mips(args.insns, cold),
@@ -159,10 +180,11 @@ fn ladder(args: &Args) {
             mips(args.insns, tlb),
             mips(args.insns, extended),
             mips(args.insns, trace),
+            mips(args.insns, guard),
             mips(args.insns, compiled),
         );
         println!(
-            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "",
             "1.00x",
             ratio(interp, cold),
@@ -170,6 +192,7 @@ fn ladder(args: &Args) {
             ratio(interp, tlb),
             ratio(interp, extended),
             ratio(interp, trace),
+            ratio(interp, guard),
             ratio(interp, compiled),
         );
     }
@@ -443,10 +466,11 @@ fn run_translated(
     cache: bool,
     tlb: bool,
     shape: Shape,
+    smc: Smc,
     compiled: bool,
 ) -> Duration {
     let (space, _ram) = machine(w);
-    let mut front = Lifter::new(Arc::clone(&space), shape);
+    let mut front = Lifter::new(Arc::clone(&space), shape, smc);
     let mut host = BenchHost::new(w, space, tlb);
     // "No cache" is one block per call plus a flush between, which also
     // removes chaining — a translator that re-lifts has no predecessor to
@@ -486,7 +510,11 @@ fn run_translated(
     }
     let took = start.elapsed();
     if std::env::var("RSEMU_BENCH_STATS").is_ok() {
-        eprintln!("{} {shape:?}: {done} insns, {:?}", w.name, disp.stats());
+        eprintln!(
+            "{} {shape:?}/{smc:?}: {done} insns, {:?}",
+            w.name,
+            disp.stats()
+        );
     }
 
     // The check. `done` is at least `insns`, so the oracle runs the same
@@ -500,7 +528,7 @@ fn run_translated(
         assert_eq!(
             cpu.x(n),
             host.slots[x_slot(n).0 as usize],
-            "{}: x{n} disagrees after {done} instructions under {shape:?}",
+            "{}: x{n} disagrees after {done} instructions under {shape:?}/{smc:?}",
             w.name
         );
     }
@@ -539,11 +567,12 @@ const BLOCK_BUDGET: usize = 4096;
 struct Lifter {
     world: World,
     shape: Shape,
+    smc: Smc,
     space: Arc<AddressSpace>,
 }
 
 impl Lifter {
-    fn new(space: Arc<AddressSpace>, shape: Shape) -> Lifter {
+    fn new(space: Arc<AddressSpace>, shape: Shape, smc: Smc) -> Lifter {
         Lifter {
             world: World {
                 features: config().features,
@@ -551,6 +580,7 @@ impl Lifter {
                 strict_align: false,
             },
             shape,
+            smc,
             space,
         }
     }
@@ -564,7 +594,7 @@ impl<H: ?Sized> Frontend<H> for Lifter {
         }
     }
     fn key(&mut self) -> u64 {
-        lift::key(&self.world, self.shape)
+        lift::key(&self.world, self.shape, self.smc)
     }
     fn pc_slot(&self) -> RegSlot {
         PC
@@ -577,7 +607,14 @@ impl<H: ?Sized> Frontend<H> for Lifter {
                 .ok()
                 .map(|v| v as u32)
         };
-        let lifted = lift::lift(&self.world, pc, &mut src, lift::MAX_INSNS, self.shape)?;
+        let lifted = lift::lift(
+            &self.world,
+            pc,
+            &mut src,
+            lift::MAX_INSNS,
+            self.shape,
+            self.smc,
+        )?;
         Ok(Translation {
             page: pc & !rsemu::jit::PAGE_MASK,
             insns: lifted.insns,

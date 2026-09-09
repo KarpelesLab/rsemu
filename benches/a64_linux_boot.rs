@@ -77,6 +77,45 @@
 //! computed branch. So the roadmap's phase-8 list — superblocks, cross-block
 //! register allocation, memory-op fusion — is aimed at the 7.7%, and the
 //! measurement says the block length is aimed at the 56%.
+//!
+//! # What was done about it: the store no longer ends a block
+//!
+//! `cpu::arm::a64::lift::Smc` is that measurement acted on. A store into the
+//! page a block was lifted from is now noticed by the **host**, which sees the
+//! guest-physical page of every store the block makes and compares it against
+//! the one the block's own bytes came from; a match retires the run's tick
+//! allowance and the block leaves at its next guest instruction boundary. The
+//! frontend emits nothing for it, so what changed is only where a block ends.
+//! `cpu::arm::a64::lift`'s module docs have the argument, including why
+//! `cpu::x86::lift`'s in-block guard — which compares *linear* pages and is
+//! therefore refused under paging — could not simply be adopted.
+//!
+//! The same twenty seconds, the same binary but for `engine.rs`'s `SMC`
+//! constant, the same 154 233 958 guest instructions retired and the same
+//! `Machine::state_hash`:
+//!
+//! | | ends the block | the host guard |
+//! | --- | --- | --- |
+//! | **host instructions** | 51 758 768 516 | **44 220 119 264** (−14.56%) |
+//! | blocks executed | 23 935 454 | **14 283 856** (−40.3%) |
+//! | **guest instructions per block** | **6.44** | **10.80** |
+//! | distinct blocks lifted | 17 256 | 12 173 |
+//! | *and then, as a share of each run:* | | |
+//! | the dispatch loop (`Cpu::advance`) | 24.80% | 18.60% |
+//! | replaying deferred bookkeeping (`flush_thunk`) | 19.11% | 21.66% |
+//! | `admit` | 5.23% | 3.81% |
+//! | the entry translation (`Exec::translate`) | 4.15% | 3.42% |
+//! | reading a guest register (`get_slot_thunk`) | 3.67% | 3.44% |
+//! | the per-block TLB resync (`jit::Tlb::sync`) | 2.01% | 1.44% |
+//!
+//! Every per-block row fell by a third to two fifths, which is what a block
+//! length that went up by 1.68× buys. The replay is the exception and it is
+//! the informative one: it fell by 3.2% in absolute terms and *rose* as a
+//! share, because what a replay costs is mostly the events in it — the same
+//! thing `ir::hoist_slot_reads` found when it removed a third of the calls and
+//! only a twentieth of the cost. **What is left to aim at has moved**: the
+//! replay is now the largest row in this profile, and the next thing that
+//! shortens it is fewer events rather than fewer blocks.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -85,7 +85,7 @@
 //! and can fault, both guest-visible, so dead-code elimination may not remove
 //! one whose value is discarded — `ldr xzr, [x0]` really does read the bus.
 //!
-//! ## A store ends the block
+//! ## What a store does to the block it is in
 //!
 //! A **load** cannot change what the rest of the block means. A store can: if
 //! it lands in the page the block was lifted from, every instruction after it
@@ -99,11 +99,83 @@
 //! for the architecture and a broken promise for rsemu, and — just as bad — a
 //! differential harness cannot tell that divergence apart from a lifter bug.
 //!
-//! The invalidation mechanism's granularity forces the answer: a guest store
-//! is matched against cached translations at the **block boundary**
-//! (`jit::dispatch`), so a block boundary is where a store's effect on code
-//! can first be honoured. Ending the block after a store puts the boundary
-//! exactly there.
+//! So the store has to be **noticed**, and [`Smc`] is the two ways of doing
+//! it. This used to have one answer, [`Smc::EndBlock`], and the cost of that
+//! answer was the largest single number in the profile of a real boot: a store
+//! is not rare, so a block ended every 6.44 guest instructions against a limit
+//! of 64, and every per-block cost in `benches/a64_linux_boot.rs`'s census —
+//! the dispatch loop, the deferred-charge replay, the entry translation and
+//! the interrupt check `admit` does per block — was divided by that number.
+//!
+//! ### Why x86's answer is not this one, and why this one is better
+//!
+//! `cpu::x86::lift` faced the same cost first and solved it with an **in-block
+//! guard**: after each store, three IR instructions compare the store's
+//! address page against the block's own and leave through a precise exit when
+//! they match. x86 has to express it in the IR because x86 makes coherent
+//! instruction caches architectural, and it has to express it over *linear*
+//! addresses because that is the only address the IR has. That is exactly why
+//! x86 **refuses** the guard under paging: two linear pages may alias one
+//! physical page, so a store through the other mapping walks past a linear
+//! comparison, and `Smc::EndBlock` is the only policy `cpu::x86::engine`'s
+//! `admit` will pick for a paged guest — which is every guest that matters.
+//! The mechanism whose adoption was proposed here is one x86 cannot itself use
+//! on the workload that motivated it.
+//!
+//! **The argument transfers; the mechanism does not have to.** What the guard
+//! is *for* is a comparison against the physical page a block's bytes came
+//! from, and on this core there is somewhere better to make it than the IR:
+//! `cpu::arm::a64::engine`'s `Host` sees the **guest-physical** address of
+//! every store there is. It already collects them — `Exec::wrote` feeds
+//! `jit::DirtyPages`, which is what invalidates a *cached* translation of a
+//! page the guest rewrote, and it is by physical page at both ends because
+//! `Admitted::base` is the physical page the entry translation resolved to.
+//! [`Smc::HostGuard`] is that same comparison made one step earlier: when a
+//! store's physical page is the running block's own, the host retires the
+//! run's tick allowance and the block leaves at its next guest instruction
+//! boundary, which is the boundary the store's own instruction ends at.
+//!
+//! That is strictly stronger than the x86 guard rather than a weaker
+//! substitute for it:
+//!
+//! * **It has no aliasing hole.** The comparison is physical at both ends, so
+//!   a store through a second mapping of the code page is caught. This is the
+//!   case that forces x86 back to `Smc::EndBlock` under paging, and it is not
+//!   a hypothetical on this architecture: patching kernel text through the
+//!   linear map while it is mapped executable elsewhere is how arm64 Linux
+//!   does modules, `ftrace` and jump labels.
+//! * **It costs no IR at all.** x86 pays three IR instructions per store in
+//!   the common case; this pays one comparison per store on a path that has
+//!   just done a translation and a bus access, and nothing whatsoever in
+//!   generated code.
+//! * **It is the same code for a compiled store and an interpreted one.** The
+//!   backend's inlined store path reaches `FastMem::note_fast_store`, which
+//!   goes through the same `Host::note_writes` as `IrHost::store`, so there is
+//!   one implementation rather than a guard the code generator also has to
+//!   emit.
+//!
+//! What it gives up is precision: the exit is per **page**, so a store to a
+//! datum that merely shares a page with the code leaves the block too. That is
+//! the same granularity the block cache's own invalidation has always had, and
+//! `benches/a64_linux_boot.rs` measured what it costs on a real boot — 6 874
+//! translations killed by a block's store in twenty guest seconds, against
+//! 154 233 958 guest instructions retired. It is not a rate.
+//!
+//! ### What else a store used to be the boundary for
+//!
+//! "A store ends the block" was load-bearing for three things and not one, and
+//! the other two are `cpu::arm::a64::engine`'s to pay:
+//!
+//! * an interrupt a store *raises* — a write to the GIC, or to a device that
+//!   answers by pulling a wire — which `admit` would have seen at the block
+//!   boundary that no longer exists;
+//! * a store that **remaps the address space**, which invalidates the host
+//!   pointers the backend took out of the shadow TLB once at block entry.
+//!
+//! Both are answered where the store happens, in `IrHost::store`, and neither
+//! can arrive through the backend's inlined path: a plan covers plain RAM
+//! only. `cpu::x86::engine` pays the first of the two for the same reason and
+//! says so in the same words.
 //!
 //! # Superblocks: merging across direct branches
 //!
@@ -322,8 +394,8 @@ pub enum Stop {
     /// An encoding outside the subset. It was not lifted; the block's exit PC
     /// is its address, so the interpreter executes it next.
     Unsupported,
-    /// A memory access that ended the block: a store always, and a load under
-    /// [`Shape::BasicBlock`].
+    /// A memory access that ended the block: a store under
+    /// [`Smc::EndBlock`], and a load under [`Shape::BasicBlock`].
     Access,
     /// A transfer of control this block cannot follow: `BR`/`BLR`/`RET`
     /// always, and a branch under a [`Shape`] that does not merge.
@@ -352,7 +424,8 @@ pub enum Shape {
     /// transfer of control. The baseline a speed claim is measured against.
     BasicBlock,
     /// An extended basic block: a **load** is an ordinary instruction, and
-    /// only a store or a transfer of control ends the block.
+    /// only a transfer of control — or, under [`Smc::EndBlock`], a store —
+    /// ends the block.
     Extended,
     /// A trace: direct branches are merged in, with a precise side exit for
     /// each path not taken. One entry, several exits. The default.
@@ -361,7 +434,8 @@ pub enum Shape {
 }
 
 impl Shape {
-    /// Whether a **load** ends the block. A store always does.
+    /// Whether a **load** ends the block. Whether a *store* does is
+    /// [`Smc`]'s question, not this one's.
     #[inline]
     #[must_use]
     pub const fn access_ends_block(self) -> bool {
@@ -425,13 +499,69 @@ pub enum Origin {
 impl Origin {
     /// This origin's contribution to [`Block::key`].
     ///
-    /// Bit 7 separates the two worlds, so a physical lift and a virtual lift
+    /// Bit 8 separates the two worlds, so a physical lift and a virtual lift
     /// of the same number never collide; above it sits the generation, exact
-    /// until it passes 2^56.
+    /// until it passes 2^55. It was bit 7 until [`Smc`] needed one below it,
+    /// and moving the whole field up is what keeps the key a partition rather
+    /// than a set of overlapping claims on the same bits.
     const fn key_bits(self) -> u64 {
         match self {
             Origin::Bare => 0,
-            Origin::Paged { generation } => (1 << 7) | generation.wrapping_shl(8),
+            Origin::Paged { generation } => (1 << 8) | generation.wrapping_shl(9),
+        }
+    }
+}
+
+/// What a store does to the block it is in.
+///
+/// A64 does not make coherent instruction caches architectural — a guest owes
+/// `DC CVAU`, `IC IVAU` and the barriers around them — but `ROADMAP.md` §0's
+/// bit-identical state hash across the two engines does, because the
+/// interpreter re-fetches every instruction. See the module docs, "What a
+/// store does to the block it is in", for the two answers and why
+/// [`Smc::HostGuard`] is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Smc {
+    /// A store is the last guest instruction in its block.
+    ///
+    /// Correct, and what this frontend did until the cost was measured: it
+    /// bounded a block at 6.44 guest instructions on a real arm64 Linux boot,
+    /// against a [`MAX_INSNS`] of 64. It stays as the control a speed claim is
+    /// measured against, and as the answer for a caller with no host-side
+    /// store log.
+    EndBlock,
+    /// A store is an ordinary instruction, and the **host** compares its
+    /// guest-physical page against the running block's own.
+    ///
+    /// The default. It emits nothing — the check is
+    /// `cpu::arm::a64::engine`'s `Host::note_writes`, which every store
+    /// already passes through on its way to `jit::DirtyPages`, compiled and
+    /// interpreted alike — and it is exact where `cpu::x86::lift`'s in-block
+    /// guard is not, because both ends of the comparison are physical.
+    ///
+    /// # What a caller owes for it
+    ///
+    /// **A store into the running block's own physical page must leave the
+    /// block at the next guest instruction boundary.** A backend reaches that
+    /// boundary through [`IrHost::spent`](crate::ir::IrHost::spent); the
+    /// engine answers it by retiring the run's allowance. A caller that lifts
+    /// under this policy and does not implement that check gets a block that
+    /// executes bytes the guest has already overwritten, which the
+    /// architecture permits and this project does not.
+    #[default]
+    HostGuard,
+}
+
+impl Smc {
+    /// This policy's contribution to [`Block::key`].
+    ///
+    /// In the key for the reason [`Shape`] is: both are *correct*, and a cache
+    /// that mixed them would make a measurement of one a measurement of
+    /// whichever happened to be resident.
+    const fn key_bits(self) -> u64 {
+        match self {
+            Smc::EndBlock => 0,
+            Smc::HostGuard => 1 << 7,
         }
     }
 }
@@ -553,8 +683,9 @@ pub fn lift<S: InsnSource>(
     src: &mut S,
     max_insns: usize,
     shape: Shape,
+    smc: Smc,
 ) -> Result<Lifted> {
-    let mut lf = Lifter::new(world, entry_pc, shape);
+    let mut lf = Lifter::new(world, entry_pc, shape, smc);
     let page = lf.page;
     let mut pc = entry_pc;
     let mut insns = 0usize;
@@ -582,7 +713,7 @@ pub fn lift<S: InsnSource>(
             Flow::Access { next, store } => {
                 insns += 1;
                 pc = next;
-                if store || shape.access_ends_block() {
+                if shape.access_ends_block() || (store && matches!(smc, Smc::EndBlock)) {
                     break Stop::Access;
                 }
             }
@@ -625,7 +756,7 @@ pub fn lift<S: InsnSource>(
 /// dispatcher that derived the key itself would be a second copy of the
 /// answer, and the two would drift.
 #[must_use]
-pub fn key(world: &World, shape: Shape) -> u64 {
+pub fn key(world: &World, shape: Shape, smc: Smc) -> u64 {
     let mut key = 0u64;
     if world.features.lse {
         key |= 1;
@@ -642,7 +773,7 @@ pub fn key(world: &World, shape: Shape) -> u64 {
     if world.strict_align {
         key |= 16;
     }
-    key | shape.key_bits() | world.origin.key_bits()
+    key | shape.key_bits() | smc.key_bits() | world.origin.key_bits()
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,11 +1491,12 @@ enum Flow {
     /// block.
     Continue(u64),
     /// Lifted a memory access; carry on unless the [`Shape`] ends the block at
-    /// one, or unless it was a store.
+    /// one, or unless it was a store and [`Smc::EndBlock`] is the policy.
     Access {
         /// Where lifting carries on.
         next: u64,
-        /// Whether it was a store, which ends the block whatever the shape.
+        /// Whether it was a store, which ends the block under
+        /// [`Smc::EndBlock`] whatever the shape.
         store: bool,
     },
     /// Lifted, and it transferred control somewhere this block cannot follow.
@@ -1406,12 +1538,12 @@ const fn ty_of(width: u32) -> Type {
 }
 
 impl<'a> Lifter<'a> {
-    fn new(world: &'a World, entry_pc: u64, shape: Shape) -> Lifter<'a> {
+    fn new(world: &'a World, entry_pc: u64, shape: Shape, smc: Smc) -> Lifter<'a> {
         Lifter {
             world,
             shape,
             page: entry_pc & !PAGE_MASK,
-            b: BlockBuilder::new(entry_pc, key(world, shape)),
+            b: BlockBuilder::new(entry_pc, key(world, shape, smc)),
             x: [None; 31],
             sp: None,
             flags: [None; 4],
@@ -2574,13 +2706,17 @@ mod tests {
     /// Every test goes through here, which is how "the verifier accepts every
     /// block this frontend produces" is asserted everywhere rather than once.
     fn lift_at(world: &World, at: u64, program: &[u32], shape: Shape) -> Lifted {
+        lift_policy(world, at, program, shape, Smc::default())
+    }
+
+    fn lift_policy(world: &World, at: u64, program: &[u32], shape: Shape, smc: Smc) -> Lifted {
         let base = at;
         let words = program.to_vec();
         let mut src = |addr: u64| {
             let off = addr.checked_sub(base)? / 4;
             words.get(off as usize).copied()
         };
-        let lifted = lift(world, at, &mut src, MAX_INSNS, shape).expect("this world lifts");
+        let lifted = lift(world, at, &mut src, MAX_INSNS, shape, smc).expect("this world lifts");
         verify(&lifted.block).expect("the frontend emits a well-formed block");
         lifted
     }
@@ -2629,11 +2765,30 @@ mod tests {
     }
 
     #[test]
-    fn a_store_ends_its_block_and_a_load_does_not() {
+    fn a_store_ends_its_block_only_under_the_policy_that_says_so() {
         // `str x1, [x0]` then `nop`.
-        let store = lifted(&[0xf900_0001, 0xd503_201f]);
-        assert_eq!(store.insns, 1);
-        assert_eq!(store.stop, Stop::Access);
+        let program = [0xf900_0001, 0xd503_201f];
+        let ended = lift_policy(&world(), AT, &program, Shape::Trace, Smc::EndBlock);
+        assert_eq!(ended.insns, 1);
+        assert_eq!(ended.stop, Stop::Access);
+        // Under the default the store is an ordinary instruction and the host
+        // is what notices one that landed in this block's own page.
+        let guarded = lift_policy(&world(), AT, &program, Shape::Trace, Smc::HostGuard);
+        assert_eq!(guarded.insns, 2);
+        assert_eq!(guarded.stop, Stop::Unreadable);
+        assert_eq!(lifted(&program).insns, 2, "the default is the guard");
+        // and nothing is emitted for it: the whole difference between the two
+        // policies is where the block ends.
+        assert_eq!(
+            guarded
+                .block
+                .insts()
+                .iter()
+                .filter(|i| i.op == Opcode::BRCOND)
+                .count(),
+            0,
+            "unlike x86's, this guard costs no IR"
+        );
         // `ldr x1, [x0]` then `nop`: the trace runs on.
         let load = lifted(&[0xf940_0001, 0xd503_201f]);
         assert_eq!(load.insns, 2);
@@ -2641,6 +2796,11 @@ mod tests {
         let basic = lift_at(&world(), AT, &[0xf940_0001, 0xd503_201f], Shape::BasicBlock);
         assert_eq!(basic.insns, 1);
         assert_eq!(basic.stop, Stop::Access);
+        // A basic block still stops at a store, because a basic block stops at
+        // every access whatever the store policy is.
+        let basic_store = lift_policy(&world(), AT, &program, Shape::BasicBlock, Smc::HostGuard);
+        assert_eq!(basic_store.insns, 1);
+        assert_eq!(basic_store.stop, Stop::Access);
     }
 
     #[test]
@@ -2856,17 +3016,35 @@ mod tests {
         let bare = world();
         let mut paged = world();
         paged.origin = Origin::Paged { generation: 7 };
-        assert_ne!(key(&bare, Shape::Trace), key(&paged, Shape::Trace));
-        assert_ne!(key(&bare, Shape::Trace), key(&bare, Shape::BasicBlock));
-        assert_ne!(key(&bare, Shape::Extended), key(&bare, Shape::BasicBlock));
+        let k = |w: &World, shape: Shape| key(w, shape, Smc::default());
+        assert_ne!(k(&bare, Shape::Trace), k(&paged, Shape::Trace));
+        assert_ne!(k(&bare, Shape::Trace), k(&bare, Shape::BasicBlock));
+        assert_ne!(k(&bare, Shape::Extended), k(&bare, Shape::BasicBlock));
         let mut other = paged;
         other.origin = Origin::Paged { generation: 8 };
-        assert_ne!(key(&paged, Shape::Trace), key(&other, Shape::Trace));
+        assert_ne!(k(&paged, Shape::Trace), k(&other, Shape::Trace));
         // and a part without the atomics is a different world from one with,
         // because the same bytes end the block in different places.
         let mut plain = world();
         plain.features.lse = false;
-        assert_ne!(key(&bare, Shape::Trace), key(&plain, Shape::Trace));
+        assert_ne!(k(&bare, Shape::Trace), k(&plain, Shape::Trace));
+        // The store policy is in the key for the same reason the shape is: a
+        // cache that mixed them would serve a block lifted under one to a
+        // dispatcher running the other, and the two disagree about whether a
+        // block may contain anything after a store.
+        for w in [bare, paged] {
+            assert_ne!(
+                key(&w, Shape::Trace, Smc::EndBlock),
+                key(&w, Shape::Trace, Smc::HostGuard),
+                "the store policy has to separate two otherwise identical keys"
+            );
+        }
+        // and the generation still separates two mappings once the policy bit
+        // sits below it, which is what moving the field up has to preserve.
+        assert_ne!(
+            key(&paged, Shape::Trace, Smc::EndBlock),
+            key(&other, Shape::Trace, Smc::EndBlock)
+        );
     }
 
     #[test]
