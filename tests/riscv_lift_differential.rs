@@ -20,22 +20,6 @@
 
 #![cfg(feature = "cpu-riscv-lift")]
 
-/// Whether the host code generator lowers everything a frontend emits.
-///
-/// `jit::x86` does, so a coverage *fraction* is the right floor there: a
-/// backend that quietly stopped taking blocks would still agree with the
-/// interpreter about the ones it refused, and only the fraction catches that.
-///
-/// `jit::arm64` has a documented refusal set — `POPCOUNT`, `MULU2`/`MULS2`,
-/// the rotates with carry, the divides, the exclusives and atomics,
-/// `call_helper`, `phi`, `i128` and floats — and a guest corpus reaches
-/// several of them often, so the same fraction is a fact about the refusal
-/// list rather than about coverage. There the floor is liveness: a backend
-/// that compiled *nothing* cannot disagree with anyone, and that is the
-/// failure still worth catching. Shrinking the refusal set is `jit::arm64`'s
-/// job, and this constant is what will start demanding the fraction again.
-const HOST_LOWERS_EVERYTHING: bool = cfg!(all(feature = "jit-x86", target_arch = "x86_64"));
-
 use rsemu::cpu::riscv::Config;
 use rsemu::cpu::riscv::csr::Extensions;
 use rsemu::cpu::riscv::differential::{Case, Verdict, compare, synthesize};
@@ -296,6 +280,23 @@ fn the_cached_path_agrees_on_a_hart_that_traps_misaligned_accesses_too() {
     );
     assert!(trapped > 0, "the fault column was never tested");
 }
+
+#[cfg(feature = "jit")]
+/// Whether the host code generator lowers everything a frontend emits.
+///
+/// `jit::x86` does, so a coverage *fraction* is the right floor there: a
+/// backend that quietly stopped taking blocks would still agree with the
+/// interpreter about the ones it refused, and only the fraction catches that.
+///
+/// `jit::arm64` has a documented refusal set — `POPCOUNT`, `MULU2`/`MULS2`,
+/// the rotates with carry, the divides, the exclusives and atomics,
+/// `call_helper`, `phi`, `i128` and floats — and a guest corpus reaches
+/// several of them often, so the same fraction is a fact about the refusal
+/// list rather than about coverage. There the floor is liveness: a backend
+/// that compiled *nothing* cannot disagree with anyone, and that is the
+/// failure still worth catching. Shrinking the refusal set is `jit::arm64`'s
+/// job, and this constant is what will start demanding the fraction again.
+const HOST_LOWERS_EVERYTHING: bool = cfg!(all(feature = "jit-x86", target_arch = "x86_64"));
 
 #[cfg(feature = "jit")]
 #[test]

@@ -396,7 +396,40 @@ mod on_disk {
     #[test]
     fn a_second_interrupt_kills_the_process_rather_than_being_ignored() {
         let (mut run, image) = run_until_the_guest_has_written("second-int");
-        run.signal_times("INT", 2);
+
+        // One signal, then more — spaced, and repeated until the process is
+        // gone. Two `kill`s microseconds apart from one shell is what this used
+        // to do, and it has now failed twice for two different reasons.
+        //
+        // Standard signals do not queue. Two SIGINTs delivered to a process
+        // that has not been scheduled between them coalesce into **one**
+        // delivery, so the handler runs once and the default disposition is
+        // never reached — likely on a loaded runner and rare on an idle
+        // developer's machine, which is exactly the split that was observed.
+        // Spacing them defeats that. Repeating defeats the other half: the
+        // clean stop has a qcow2's metadata to write, but how long that takes
+        // is the host's business, not this test's.
+        //
+        // `SA_RESETHAND` restores the default before the handler runs, so every
+        // signal after the first reaches it. A process that survives all of
+        // them and exits 0 has not reset its disposition, which is the defect
+        // this is here to catch.
+        run.signal("INT");
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(10));
+            if run
+                .0
+                .as_mut()
+                .expect("still held")
+                .try_wait()
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                break;
+            }
+            run.signal("INT");
+        }
         let status = run.finish(SHUTDOWN);
         assert!(
             status.code().is_none(),
