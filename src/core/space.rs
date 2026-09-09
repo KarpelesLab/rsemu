@@ -310,7 +310,7 @@ pub use attrs::{
 };
 pub use buslock::{BusLock, BusLockGuard};
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
-pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView};
+pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView, RegionId};
 pub use monitor::{
     ExclusiveMonitor, MAX_GRANULE_SHIFT, MIN_GRANULE_SHIFT, MONITOR_SLOTS, MonitorId, MonitorSlot,
 };

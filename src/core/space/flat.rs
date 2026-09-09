@@ -103,6 +103,42 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// stack.
 pub(super) const MAX_DEPTH: u32 = 64;
 
+/// Which MMIO aperture a flat leaf dispatches to, as a dense index into the
+/// per-region counters of [`crate::core::trace`].
+///
+/// The identity the dispatch site never had. [`MemOps`] is a trait object and
+/// the human-readable name lives on a [`Region`](super::Region) one layer up,
+/// so an MMIO access could be counted per *machine* and never per device; a
+/// dense index assigned once, when the view is flattened, is what makes that a
+/// counter-array subscript rather than a map lookup on a guest access.
+///
+/// It is a number and not a name deliberately, and it costs nothing: it rides
+/// in padding [`FlatTarget`] already had, so `size_of::<FlatTarget>()`,
+/// `FlatLeaf` and `FlatEntry` are all exactly the size they were —
+/// `docs/testing/tracing.md` has the measurement, including the callgrind
+/// numbers showing the RAM read and store paths unmoved to the instruction.
+///
+/// Ids are handed out by [`crate::core::trace::mmio_intern`] in the order a
+/// flatten meets apertures, which is mapping order in the description, so two
+/// flattenings of one tree agree and a trace of a deterministic run is
+/// reproducible. Two mappings of the same [`MemOps`] — a mirror, an aperture
+/// windowed twice, the same device in a second address space — share an id,
+/// because they are one device answering.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionId(pub u16);
+
+impl RegionId {
+    /// The id an MMIO leaf gets when the process has interned more apertures
+    /// than [`crate::core::trace::MMIO_REGIONS`] — and the id every leaf has in
+    /// a build without the `trace` feature, which interns nothing.
+    ///
+    /// It is out of range of the counter array by construction, so a hook on
+    /// it counts nothing rather than adding to some other region's total —
+    /// which is the failure a dense index has to get right.
+    pub const NONE: RegionId = RegionId(u16::MAX);
+}
+
 /// Where a flat entry ultimately sends an access.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -116,8 +152,8 @@ pub enum FlatTarget {
         /// What a write does.
         on_write: RomWrite,
     },
-    /// MMIO: a call, every time.
-    Io(Arc<dyn MemOps>),
+    /// MMIO: a call, every time — and the aperture that answers it.
+    Io(Arc<dyn MemOps>, RegionId),
 }
 
 /// One resolved leaf: a backing store plus the offset the entry starts at.
@@ -260,7 +296,27 @@ impl FlatLeaf {
         match &self.target {
             FlatTarget::Ram(s) => s.read_at(off, dst),
             FlatTarget::Rom { store, .. } => store.read_at(off, dst),
-            FlatTarget::Io(ops) => ops.read(off, dst, attrs),
+            FlatTarget::Io(ops, id) => {
+                // The one counting hook on a per-access path (`core::trace`).
+                // It is inside this arm rather than around the whole `match`
+                // because that is what keeps it off the RAM and ROM arms,
+                // which is the entire cost argument: a store into guest memory
+                // does not execute a single instruction of it. Without the
+                // `trace` feature the call has an empty body and vanishes.
+                //
+                // **A debug access is counted like any other**, which is a
+                // measured decision rather than an oversight. Skipping one
+                // wants `attrs.debug` here, and asking for it costs this arm
+                // nine host instructions per access however it is spelled —
+                // a test at the call site, a parameter to the hook, and a
+                // branchless `RegionId::NONE` all measured the same 16 against
+                // 7, tripling what a `trace` build pays when it is not even
+                // tracing. `docs/testing/tracing.md` records the numbers and
+                // what it means for a row: a monitor that polls a device
+                // aperture is in the count with the guest.
+                crate::core::trace::mmio(id.0, false);
+                ops.read(off, dst, attrs)
+            }
         }
     }
 
@@ -283,7 +339,10 @@ impl FlatLeaf {
                 RomWrite::Ignore => Ok(()),
                 RomWrite::Fault => Err(BusError::BadAccess),
             },
-            FlatTarget::Io(ops) => ops.write(off, src, attrs),
+            FlatTarget::Io(ops, id) => {
+                crate::core::trace::mmio(id.0, true);
+                ops.write(off, src, attrs)
+            }
         }
     }
 
@@ -313,7 +372,8 @@ impl FlatLeaf {
             // A device takes bytes: `MemOps` is a slice interface because a
             // device access is not width-bounded. Materialise them here, where
             // the call that follows dwarfs the buffer.
-            FlatTarget::Io(ops) => {
+            FlatTarget::Io(ops, id) => {
+                crate::core::trace::mmio(id.0, true);
                 let n = width.bytes() as usize;
                 let mut buf = [0u8; 8];
                 self.constraints.endian.store(&mut buf[..n], width, value)?;
@@ -712,22 +772,22 @@ const WRITE_SIDE: usize = u32::MAX as usize;
 
 impl FlatEntry {
     /// Turn a resolved piece into the entry the dispatcher uses.
-    fn from_piece(p: Piece) -> FlatEntry {
+    fn from_piece(p: Piece, ids: &IoIds) -> FlatEntry {
         let mut leaves = p.leaves.into_iter();
         let (kind, write_to) = match (p.directed, leaves.len()) {
             (true, 2) => {
-                let read = leaves.next().expect("len 2").into_leaf();
-                let write = leaves.next().expect("len 2").into_leaf();
+                let read = leaves.next().expect("len 2").into_leaf(ids);
+                let write = leaves.next().expect("len 2").into_leaf(ids);
                 (EntryKind::Single(read), Some(alloc::boxed::Box::new(write)))
             }
             (_, 1) => (
-                EntryKind::Single(leaves.next().expect("len 1").into_leaf()),
+                EntryKind::Single(leaves.next().expect("len 1").into_leaf(ids)),
                 None,
             ),
             _ => (
                 EntryKind::Combine {
                     policy: p.combine,
-                    members: leaves.map(LeafSpec::into_leaf).collect(),
+                    members: leaves.map(|leaf| leaf.into_leaf(ids)).collect(),
                 },
                 None,
             ),
@@ -780,7 +840,18 @@ impl FlatView {
             &mut pieces,
         )?;
 
-        let entries: Vec<FlatEntry> = pieces.into_iter().map(FlatEntry::from_piece).collect();
+        // The dense id each aperture answers under comes from a walk of the
+        // *tree*: that is the only place a `MemOps` still has a name attached.
+        // Skipped entirely without the `trace` feature, where there is nothing
+        // to name it for and every leaf keeps `RegionId::NONE`.
+        let mut ids = IoIds::default();
+        if cfg!(feature = "trace") {
+            ids.collect(children, 0);
+        }
+        let entries: Vec<FlatEntry> = pieces
+            .into_iter()
+            .map(|piece| FlatEntry::from_piece(piece, &ids))
+            .collect();
 
         let mut index: RebaseIndex = BTreeMap::new();
         for (e, entry) in entries.iter().enumerate() {
@@ -863,6 +934,76 @@ impl FlatView {
 // Flattening
 // ---------------------------------------------------------------------------
 
+/// The MMIO apertures a region tree contains, and the [`RegionId`] each
+/// answers under.
+///
+/// Identity is the [`MemOps`] the aperture dispatches to, by address, because
+/// that is what a flat leaf still holds — a region's *name* is gone by the time
+/// leaves exist. Two mappings of one device therefore share an id, which is
+/// what a reader wants: a mirrored aperture is not a second chip.
+///
+/// The ids themselves come from [`crate::core::trace::mmio_intern`], which is
+/// process-wide rather than per-view, and deliberately: a flat view is derived
+/// state that a retopology throws away, so a count kept per view would be reset
+/// by a guest storing to a BAR, and two address spaces on one machine — an x86
+/// board has a memory space *and* an I/O space, both full of apertures — would
+/// each hand out an id 0 to a different device. Interning by device fixes both.
+///
+/// This map is keyed by an address but **nothing is ordered by one**; it exists
+/// only so that the leaves of one flatten resolve their ids without taking the
+/// interner's lock once per leaf.
+#[derive(Debug, Default)]
+struct IoIds {
+    by_ops: BTreeMap<usize, RegionId>,
+}
+
+impl IoIds {
+    /// Walk `children` and every region under them, interning each aperture.
+    fn collect(&mut self, children: &[Mapping], depth: u32) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        for mapping in children {
+            self.collect_region(&mapping.region, depth);
+        }
+    }
+
+    fn collect_region(&mut self, region: &RegionRef, depth: u32) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        match region.kind() {
+            RegionKind::Io(ops) => {
+                let key = Self::key(ops);
+                if let alloc::collections::btree_map::Entry::Vacant(slot) = self.by_ops.entry(key) {
+                    slot.insert(RegionId(crate::core::trace::mmio_intern(
+                        key,
+                        region.name(),
+                    )));
+                }
+            }
+            RegionKind::Alias(alias) => self.collect_region(alias.target(), depth + 1),
+            RegionKind::Container(c) => self.collect(c.children(), depth + 1),
+            RegionKind::Ram(_) | RegionKind::Rom { .. } => {}
+        }
+    }
+
+    /// The identity token an aperture is interned under: the address of the
+    /// `MemOps` behind the trait object, which is what both the tree walk and
+    /// the finished leaf can still name.
+    fn key(ops: &Arc<dyn MemOps>) -> usize {
+        Arc::as_ptr(ops).cast::<()>() as usize
+    }
+
+    /// The id `ops` was interned under.
+    fn of(&self, ops: &Arc<dyn MemOps>) -> RegionId {
+        self.by_ops
+            .get(&Self::key(ops))
+            .copied()
+            .unwrap_or(RegionId::NONE)
+    }
+}
+
 /// A leaf under construction, before its atomic offset cell exists.
 #[derive(Debug, Clone)]
 struct LeafSpec {
@@ -883,10 +1024,20 @@ impl LeafSpec {
         v
     }
 
-    fn into_leaf(self) -> FlatLeaf {
+    fn into_leaf(self, ids: &IoIds) -> FlatLeaf {
         let offset = AtomicU64::new(self.offset());
+        // The one place an id is attached: the spec carried `RegionId::NONE`
+        // from `resolve_region`, which has no allocator in hand and no reason
+        // to grow one.
+        let target = match self.target {
+            FlatTarget::Io(ops, _) => {
+                let id = ids.of(&ops);
+                FlatTarget::Io(ops, id)
+            }
+            other => other,
+        };
         FlatLeaf {
-            target: self.target,
+            target,
             offset,
             fixed: self.fixed,
             terms: self.terms,
@@ -916,7 +1067,7 @@ impl LeafSpec {
                     on_write: wb,
                 },
             ) => Arc::ptr_eq(a, b) && wa == wb,
-            (FlatTarget::Io(a), FlatTarget::Io(b)) => Arc::ptr_eq(a, b),
+            (FlatTarget::Io(a, ia), FlatTarget::Io(b, ib)) => Arc::ptr_eq(a, b) && ia == ib,
             _ => false,
         };
         same_target
@@ -1001,7 +1152,7 @@ fn leaf_target(region: &RegionRef) -> Option<FlatTarget> {
             store: store.clone(),
             on_write: *on_write,
         }),
-        RegionKind::Io(ops) => Some(FlatTarget::Io(ops.clone())),
+        RegionKind::Io(ops) => Some(FlatTarget::Io(ops.clone(), RegionId::NONE)),
         RegionKind::Alias(_) | RegionKind::Container(_) => None,
     }
 }
@@ -1064,7 +1215,7 @@ fn resolve_region(
             start: 0,
             len,
             leaves: alloc::vec![LeafSpec {
-                target: FlatTarget::Io(ops.clone()),
+                target: FlatTarget::Io(ops.clone(), RegionId::NONE),
                 fixed: off,
                 terms: Vec::new(),
                 period: 0,
