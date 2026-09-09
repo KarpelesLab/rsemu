@@ -132,7 +132,7 @@ use alloc::vec::Vec;
 use core::cmp::{Ordering, Reverse};
 use core::fmt;
 
-use crate::core::clock::{ClockError, ClockForest, DomainId, GlobalTime, OscillatorId};
+use crate::core::clock::{ClockError, ClockForest, DomainId, GlobalTime, OscillatorId, Rational};
 use crate::core::sync::{AtomicBool, AtomicU64, Handle, Mutex, Ordering as AtomicOrdering, Pool};
 
 // ---------------------------------------------------------------------------
@@ -1149,9 +1149,9 @@ impl TickCursor {
 /// A lazy slot's view of the runnable that is executing right now.
 ///
 /// Armed by the scheduler immediately before a `run` call and disarmed after
-/// it, so it exists only while there is a live position to convert. The ratio
-/// is in oscillator units of the tree both domains hang off -- an intra-tree
-/// relationship, which is exact.
+/// it, so it exists only while there is a live position to convert. How the
+/// conversion is done depends on the two domains' topology and on nothing else,
+/// which is `ROADMAP.md` §4.2's whole point -- see [`Ratio`].
 #[derive(Debug, Clone)]
 struct Live {
     cursor: TickCursor,
@@ -1159,22 +1159,120 @@ struct Live {
     base_cursor: u64,
     /// This slot's domain position at that same instant.
     base_tick: u64,
-    /// Tree units per tick of the *runnable's* domain.
-    mul: u64,
-    /// Tree units per tick of *this slot's* domain.
-    div: u64,
+    /// How the runnable's ticks convert into this slot's.
+    ratio: Ratio,
+}
+
+/// How a runnable's ticks convert into a lazily-advanced slot's ticks:
+/// `num` of this slot's per `den` of the runnable's, reduced.
+///
+/// **One shape for both of `ROADMAP.md` §4.2's two physical situations**, and
+/// that is a claim about the arithmetic rather than about the physics. The
+/// situations stay different — which one applies is decided by the machine's
+/// topology and never by a preference — but they differ in *where the two
+/// numbers come from and what error they carry*, not in what is done with them:
+///
+/// * **Within one oscillator's tree** the pair is the two domains'
+///   units-per-tick, so `12/4` on a NES becomes `3/1` and the PPU advances
+///   exactly three dots per 6502 cycle, forever. Exact by construction and
+///   guest-visible; games depend on it absolutely.
+/// * **Across two crystals** the pair is built from the domains' declared
+///   rational frequencies. §4.2's cross-tree rule, stated there as *reciprocal
+///   multiply plus a per-root residual*: the error is bounded below one of this
+///   slot's ticks and does not accumulate, because [`Live::base_tick`] is
+///   re-anchored from the forest — which carries the residual — at the top of
+///   every round, and the conversion is recomputed from that anchor rather than
+///   carried forward.
+///
+/// [`Scheduler::ratio_for`] is where the distinction lives, and it is the only
+/// place that needs it. Keeping it in *this* type as a tagged enum cost the
+/// NES 0.9% of a frame in a branch inside `LazySlot::sync`, which runs on every
+/// bus access — for a discriminant nothing downstream reads.
+///
+/// Declining the cross-tree conversion altogether is not the conservative
+/// choice it looks like. A `mtime` that only moves at a quantum boundary is a
+/// whole quantum of error — ten thousand ticks on `riscv-virt` — where this is
+/// less than one, and unlike this one it is not physically justified: no
+/// crystal's tolerance makes a counter stand still for a millisecond and then
+/// jump. Exactness is meaningless across cans; resolution is not.
+#[derive(Debug, Clone, Copy)]
+struct Ratio {
+    /// Slot ticks per `den` runnable ticks.
+    num: u64,
+    /// Runnable ticks per `num` slot ticks. Never zero.
+    den: u64,
+}
+
+impl Ratio {
+    /// `elapsed` runnable ticks as this slot's, rounded down.
+    ///
+    /// `u64` and saturating, which is what this arithmetic has always been.
+    /// Two reasons rather than one, because the second is what makes the first
+    /// safe:
+    ///
+    /// * It runs on the **bus access path** — `LazySlot::sync` is 14% of a NES
+    ///   frame, called nine and a half million times in twenty of them. A
+    ///   `checked_mul` with an outlined cold arm measured *nine instructions a
+    ///   call* worse than this, presumably in spills around the call it can no
+    ///   longer prove is never made: +0.9% of a frame for an arm that never
+    ///   runs.
+    /// * The product **cannot overflow on a real machine**: `elapsed` is what
+    ///   the runnable has published since the round began, so it is bounded by
+    ///   the round's budget and therefore by
+    ///   [`SchedulerConfig::max_ticks_per_quantum`], and `num` is reduced. A
+    ///   machine that arranged otherwise gets a clamped tick rather than a
+    ///   wrapped one, which is the same last resort the intra-tree conversion
+    ///   has always had.
+    #[inline]
+    fn forward(self, elapsed: u64) -> u64 {
+        elapsed.saturating_mul(self.num) / self.den
+    }
+
+    /// `ahead` slot ticks as the runnable's, rounded **up**: the runnable tick
+    /// that *reaches* the slot's is the first one whose converted position is
+    /// at or past it.
+    fn backward(self, ahead: u64) -> u64 {
+        match ahead.checked_mul(self.den) {
+            Some(scaled) => scaled.div_ceil(self.num),
+            None => {
+                let scaled =
+                    (u128::from(ahead) * u128::from(self.den)).div_ceil(u128::from(self.num));
+                u64::try_from(scaled).unwrap_or(u64::MAX)
+            }
+        }
+    }
 }
 
 impl Live {
     /// Where this slot's domain stands, given what the runnable has published.
+    #[inline]
     fn present(&self) -> u64 {
         let elapsed = self.cursor.get().saturating_sub(self.base_cursor);
-        // `elapsed * mul` converts ticks to tree units; dividing by this
-        // domain's units-per-tick lands in its ticks. Both factors come from
-        // one oscillator, so there is no rounding to accumulate.
-        let units = elapsed.saturating_mul(self.mul);
-        self.base_tick.saturating_add(units / self.div)
+        self.base_tick.saturating_add(self.ratio.forward(elapsed))
     }
+}
+
+/// `a/b` reduced by its greatest common divisor.
+///
+/// Runs once per `(runnable, slot)` pair per *topology change* — see
+/// [`Scheduler::build_ratios`] — never per round and never per access.
+/// Reducing does two things: it keeps the cross-tree products, which are up to
+/// 128 bits wide, inside the two `u64`s [`Ratio`] has room for, and it keeps
+/// `num` small enough that `Ratio::forward` stays on its `u64` path. It never
+/// changes an answer: integer division is the floor of an exact rational, and
+/// reducing does not move the rational.
+fn reduce(a: u128, b: u128) -> (u128, u128) {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        let t = x % y;
+        x = y;
+        y = t;
+    }
+    // `x` is the greatest common divisor, and it is zero only when both inputs
+    // were — a pair `ratio_for` has already refused. `checked_div` rather than
+    // a branch so that the impossible case is written as *no reduction* rather
+    // than as a fault waiting for someone to reach it.
+    a.checked_div(x).zip(b.checked_div(x)).unwrap_or((a, b))
 }
 
 /// Something the scheduler gives execution budgets to: a CPU, a DMA engine, a
@@ -1802,10 +1900,7 @@ impl LazySlot {
         }
         let event = device.next_event_tick()?;
         let ahead = event.saturating_sub(live.base_tick);
-        // Round up: the runnable tick that *reaches* the event is the first one
-        // whose converted position is at or past it.
-        let units = ahead.saturating_mul(live.div);
-        Some(live.base_cursor + units.div_ceil(live.mul))
+        Some(live.base_cursor.saturating_add(live.ratio.backward(ahead)))
     }
 
     /// Drop it again, so a sync between quanta uses the published position.
@@ -2164,6 +2259,28 @@ pub struct Scheduler {
     /// allocate. Rebuilt when a device is registered, which happens at realize
     /// and nowhere else.
     lazy_snapshot: Option<Arc<[Arc<LazySlot>]>>,
+    /// Per `(runnable, lazy slot)` in row-major order, how the two domains
+    /// convert. Derived state, rebuilt when `clock_epoch` moves.
+    ///
+    /// Cached because arming happens once per runnable per slot per *round*,
+    /// and a round on a Game Boy is a few hundred dots: the reduction that
+    /// builds a [`Ratio::Nominal`] is a 128-bit gcd and was 2.6% of a frame
+    /// when it ran every time. Nothing in it depends on where the clocks have
+    /// got to — only on the topology and the rates — so it is exactly the
+    /// "derived state, invalidated by a generation counter" `CLAUDE.md` asks
+    /// for.
+    ratios: Vec<Option<Ratio>>,
+    /// The `clock_epoch` `ratios` was built under, or `None` for never.
+    ratios_epoch: Option<u64>,
+    /// Bumped by anything that can change a domain's rate or its parent.
+    ///
+    /// The complete set of routes, which is what makes this a counter rather
+    /// than a hope: a rate changes only through a `&mut ClockForest`, and
+    /// [`Scheduler::forest_mut`] is the only one that leaves this module — so a
+    /// guest write that reprograms a PLL, a snapshot restore and a test all
+    /// arrive through it. Registration bumps it too, since it resizes the
+    /// table.
+    clock_epoch: u64,
     /// Per runnable, the lazy slots on its *own* oscillator tree — what
     /// [`ThreadingMode::Parallel`] arms, since two runnables cannot share one
     /// slot's live view. `None` until the first parallel round builds it, and
@@ -2227,6 +2344,9 @@ impl Scheduler {
             cursor: 0,
             quantum_nanos,
             lazy_snapshot: None,
+            ratios: Vec::new(),
+            ratios_epoch: None,
+            clock_epoch: 0,
             tree_slots: None,
             pool,
             safe: SafePoint::new(),
@@ -2341,6 +2461,13 @@ impl Scheduler {
     /// writes that re-rate a domain.
     #[inline]
     pub fn forest_mut(&mut self) -> &mut ClockForest {
+        // Pessimistic on purpose: the caller may re-rate, reparent or gate, and
+        // this module cannot see which. Handing out the `&mut` is the cold
+        // path — building a machine, a guest reprogramming a divider, a restore
+        // — so recomputing a handful of ratios afterwards costs nothing, and
+        // *not* invalidating would leave a device converting against a rate it
+        // no longer has.
+        self.clock_epoch = self.clock_epoch.wrapping_add(1);
         &mut self.forest
     }
 
@@ -2371,6 +2498,7 @@ impl Scheduler {
             cursor: TickCursor::with_exit(self.safe.flag()),
         });
         self.tree_slots = None;
+        self.clock_epoch = self.clock_epoch.wrapping_add(1);
         id
     }
 
@@ -2394,6 +2522,7 @@ impl Scheduler {
         }));
         self.lazy_snapshot = None;
         self.tree_slots = None;
+        self.clock_epoch = self.clock_epoch.wrapping_add(1);
         id
     }
 
@@ -2859,7 +2988,7 @@ impl Scheduler {
             // Everything sampled while this runnable executes must see where it
             // has got to, not where the quantum began (see [`TickCursor`]).
             let cursor = self.runnables[index].cursor.clone();
-            self.arm_live_cursors(domain, &cursor);
+            self.arm_live_cursors(index, &cursor);
             let used = runnable.run(budget);
             self.disarm_live_cursors(&cursor);
             self.runnables[index].inner = Some(runnable);
@@ -3355,26 +3484,42 @@ impl Scheduler {
         })
     }
 
-    /// Arm each runnable's cursor over the lazily-advanced devices on *its own*
-    /// oscillator tree, for a round in which every runnable executes at once.
+    /// Arm each runnable's cursor over the lazily-advanced devices it can
+    /// honestly speak for, for a round in which every runnable executes at
+    /// once.
     ///
-    /// Two differences from [`Scheduler::arm_live_cursors`], both forced:
+    /// The difference from [`Scheduler::arm_live_cursors`] is forced, and it is
+    /// one thing rather than two: **a slot holds one live view, and this round
+    /// has several runnables in flight at the same instant.** The deterministic
+    /// round never has to choose, because exactly one runnable is inside its
+    /// `run` call at a time. Here the choice has to be made before anything
+    /// starts, and it can only be made where it is unambiguous:
     ///
-    /// * A slot holds **one** live view, so a tree with two runnables on it has
-    ///   no honest answer to "where has the executing runnable got to". Such a
-    ///   tree is left unarmed and its devices are caught up to the position the
-    ///   scheduler last published — which is what every device had before
-    ///   [`TickCursor`] existed, and is bounded by the round rather than wrong.
-    /// * A cursor watches only the slots on its own tree. In the deterministic
-    ///   round one cursor watches every slot, which costs a cross-tree
-    ///   catch-up to a published position and nothing else; here it would put
-    ///   two threads into one slot for no benefit at all, since a slot on
-    ///   another tree has no live view to convert against anyway.
+    /// * A tree driven by more than one runnable has no single live position at
+    ///   all, so no runnable on it arms anything — not even a device on its own
+    ///   tree. Arming from whichever of two CPUs was registered first would
+    ///   make a device's dot depend on registration order.
+    /// * A device on its own runnable's tree gets [`Ratio::Exact`], as always.
+    /// * A device with **no** runnable on its tree — an RTC crystal, a timer
+    ///   can — can be converted from any tree at all through
+    ///   [`Ratio::Nominal`], so it is armed only when exactly one runnable in
+    ///   the machine is entitled to speak: otherwise two cursors would race for
+    ///   one slot and the winner would be a scheduling accident. That covers
+    ///   the uniprocessor board, which is the configuration where a parallel
+    ///   round has any business matching a deterministic one tick for tick.
+    ///
+    /// Whatever is left unarmed is caught up to the position the scheduler last
+    /// published — what every device had before [`TickCursor`] existed, and
+    /// bounded by the round rather than wrong.
     fn arm_parallel_cursors(&mut self) {
         self.build_tree_slots();
+        self.build_ratios();
         let Some(trees) = self.tree_slots.clone() else {
             return;
         };
+        if self.lazy_snapshot.is_none() {
+            self.lazy_snapshot = Some(self.lazy.iter().cloned().collect());
+        }
         // A tree driven by more than one runnable has no single live position.
         let mut runnables_on: Vec<(OscillatorId, usize)> = Vec::new();
         for slot in &self.runnables {
@@ -3385,14 +3530,29 @@ impl Scheduler {
                 }
             }
         }
+        // Who, if anyone, may speak for a tree no runnable drives. `Some(i)`
+        // only when `i` is the one and only candidate in the whole machine.
+        let mut sole: Option<usize> = None;
+        let mut candidates = 0usize;
+        for (index, slot) in self.runnables.iter().enumerate() {
+            if self
+                .forest
+                .root_of(slot.domain)
+                .is_ok_and(|osc| runnables_on.iter().any(|(o, n)| *o == osc && *n == 1))
+            {
+                candidates += 1;
+                sole = Some(index);
+            }
+        }
+        if candidates != 1 {
+            sole = None;
+        }
         for (index, slots) in trees.iter().enumerate() {
             let domain = self.runnables[index].domain;
             let cursor = self.runnables[index].cursor.clone();
-            let (Ok(osc), Ok(mul), Ok(base_cursor)) = (
-                self.forest.root_of(domain),
-                self.forest.domain(domain).map(|d| d.units_per_tick()),
-                self.forest.ticks(domain),
-            ) else {
+            let (Ok(osc), Ok(base_cursor)) =
+                (self.forest.root_of(domain), self.forest.ticks(domain))
+            else {
                 cursor.watch(None);
                 continue;
             };
@@ -3400,25 +3560,33 @@ impl Scheduler {
                 cursor.watch(None);
                 continue;
             }
-            for slot in slots.iter() {
-                let (Ok(div), Ok(base_tick)) = (
-                    self.forest.domain(slot.domain).map(|d| d.units_per_tick()),
+            // Its own tree always; every other slot too when nobody else could
+            // have armed it. Walking the whole slot list either way and
+            // skipping what is not this runnable's keeps one loop and one
+            // indexing rule rather than two.
+            let all = sole == Some(index);
+            for (j, slot) in self.lazy.iter().enumerate() {
+                if !all && !slots.iter().any(|s| Arc::ptr_eq(s, slot)) {
+                    continue;
+                }
+                let (Some(ratio), Ok(base_tick)) = (
+                    self.ratios_of(index).get(j).copied().flatten(),
                     self.forest.ticks(slot.domain),
                 ) else {
                     continue;
                 };
-                if div == 0 {
-                    continue;
-                }
                 slot.arm(Live {
                     cursor: cursor.clone(),
                     base_cursor,
                     base_tick,
-                    mul,
-                    div,
+                    ratio,
                 });
             }
-            cursor.watch(Some(Arc::clone(slots)));
+            if sole == Some(index) {
+                cursor.watch(self.lazy_snapshot.clone());
+            } else {
+                cursor.watch(Some(Arc::clone(slots)));
+            }
         }
     }
 
@@ -3454,24 +3622,121 @@ impl Scheduler {
         self.tree_slots = Some(trees);
     }
 
-    /// Point every lazily-advanced device on `domain`'s own oscillator tree at
-    /// the cursor of the runnable that is about to execute.
+    /// Rebuild the `(runnable, slot)` ratio table if the clocks have moved
+    /// under it.
     ///
-    /// Only devices on the same tree: a ratio between two trees is not exact,
-    /// and routing an intra-quantum position through absolute time would throw
-    /// away the exactness the oscillator forest exists to preserve
-    /// (`ROADMAP.md` 4.2). A device on another tree keeps the published
-    /// position, which is what it had before this existed.
-    fn arm_live_cursors(&mut self, domain: DomainId, cursor: &TickCursor) {
+    /// One pass over a table that is runnables × lazy devices — single digits
+    /// by single digits on every board in the tree — and it runs when the
+    /// topology changes rather than when time passes.
+    fn build_ratios(&mut self) {
+        if self.ratios_epoch == Some(self.clock_epoch) {
+            return;
+        }
+        let lazy = self.lazy.len();
+        self.ratios.clear();
+        self.ratios.reserve(self.runnables.len() * lazy);
+        for index in 0..self.runnables.len() {
+            let domain = self.runnables[index].domain;
+            let looked_up = (
+                self.forest.root_of(domain),
+                self.forest.domain(domain).map(|d| d.units_per_tick()),
+            );
+            let (Ok(osc), Ok(mul)) = looked_up else {
+                self.ratios.extend(core::iter::repeat_n(None, lazy));
+                continue;
+            };
+            let run_freq = self.forest.domain_frequency(domain).ok();
+            for j in 0..lazy {
+                let to = self.lazy[j].domain;
+                self.ratios.push(self.ratio_for(to, osc, mul, run_freq));
+            }
+        }
+        self.ratios_epoch = Some(self.clock_epoch);
+    }
+
+    /// This runnable's row of the ratio table.
+    ///
+    /// Empty when the runnable's own domain is not one the forest can answer
+    /// for, which leaves every slot unarmed — the position the scheduler last
+    /// published, which is what a device had before any of this existed.
+    fn ratios_of(&self, index: usize) -> &[Option<Ratio>] {
+        let lazy = self.lazy.len();
+        self.ratios
+            .get(index * lazy..(index + 1) * lazy)
+            .unwrap_or(&[])
+    }
+
+    /// How a lazily-advanced device on `slot` converts against the runnable
+    /// that is about to execute, given what the caller has already looked up
+    /// about that runnable: its oscillator `osc`, its `mul` tree units per
+    /// tick, and its rational frequency.
+    ///
+    /// `ROADMAP.md` §4.2's *topology decides which situation applies* rule,
+    /// written once so the deterministic round and the parallel one cannot
+    /// answer it differently. `None` means the forest cannot express the
+    /// conversion at all — a gated or unknown domain, a zero divisor, a
+    /// reduced ratio too wide for two `u64`s — and the slot is then left on the
+    /// position the scheduler last published rather than on a rounded guess.
+    fn ratio_for(
+        &self,
+        slot: DomainId,
+        osc: OscillatorId,
+        mul: u64,
+        run_freq: Option<Rational>,
+    ) -> Option<Ratio> {
+        // Within one tree: the two domains' units-per-tick. Small integers off
+        // the divisors, and exact regardless of what the crystal's frequency is
+        // believed to be — which is the property §4.2 says games depend on and
+        // absolute frequency is not.
+        let (num, den) = if self.forest.root_of(slot) == Ok(osc) {
+            let div = self.forest.domain(slot).map(|d| d.units_per_tick()).ok()?;
+            if div == 0 || mul == 0 {
+                return None;
+            }
+            (u128::from(mul), u128::from(div))
+        } else {
+            // Across two: the declared rational frequencies. `fs/fr` is slot
+            // ticks per runnable tick.
+            let fr = run_freq?;
+            let fs = self.forest.domain_frequency(slot).ok()?;
+            // Both products are two `u64`s wide and cannot overflow a `u128`.
+            (
+                u128::from(fs.num()) * u128::from(fr.den()),
+                u128::from(fs.den()) * u128::from(fr.num()),
+            )
+        };
+        if num == 0 || den == 0 {
+            return None;
+        }
+        let (num, den) = reduce(num, den);
+        Some(Ratio {
+            num: u64::try_from(num).ok()?,
+            den: u64::try_from(den).ok()?,
+        })
+    }
+
+    /// Point every lazily-advanced device at the cursor of the runnable that is
+    /// about to execute, each through the ratio its own topology dictates.
+    ///
+    /// A device on `domain`'s tree gets [`Ratio::Exact`] — the intra-tree
+    /// relationship, exact by construction and the one games depend on. A
+    /// device on another crystal gets [`Ratio::Nominal`], built from the two
+    /// domains' declared rational frequencies.
+    ///
+    /// Note what the second arm is *not*. It does not route the intra-tree
+    /// relationship through absolute time — that path is untouched, and it is
+    /// the thing `ROADMAP.md` §4.2 forbids. It is §4.2's own prescription for
+    /// the cross-tree case, one line up in the same table: reciprocal multiply
+    /// plus a residual, bounded below one unit and non-accumulating. An earlier
+    /// revision skipped the cross-tree slot entirely and left it on the
+    /// quantum-boundary position, which is not a smaller error than a
+    /// sub-tick ratio but a much larger one.
+    fn arm_live_cursors(&mut self, index: usize, cursor: &TickCursor) {
         if self.lazy_snapshot.is_none() {
             self.lazy_snapshot = Some(self.lazy.iter().cloned().collect());
         }
-        let (Ok(osc), Ok(mul)) = (
-            self.forest.root_of(domain),
-            self.forest.domain(domain).map(|d| d.units_per_tick()),
-        ) else {
-            return;
-        };
+        self.build_ratios();
+        let domain = self.runnables[index].domain;
         // The forest's position for the runnable's own domain, **not** what the
         // cursor currently reads. A core that overran its last budget has
         // already executed cycles the forest has not been told about and
@@ -3482,25 +3747,15 @@ impl Scheduler {
         let Ok(base_cursor) = self.forest.ticks(domain) else {
             return;
         };
-        for slot in &self.lazy {
-            if self.forest.root_of(slot.domain) != Ok(osc) {
-                continue;
-            }
-            let (Ok(div), Ok(base_tick)) = (
-                self.forest.domain(slot.domain).map(|d| d.units_per_tick()),
-                self.forest.ticks(slot.domain),
-            ) else {
+        for (slot, ratio) in self.lazy.iter().zip(self.ratios_of(index)) {
+            let (Some(ratio), Ok(base_tick)) = (*ratio, self.forest.ticks(slot.domain)) else {
                 continue;
             };
-            if div == 0 {
-                continue;
-            }
             slot.arm(Live {
                 cursor: cursor.clone(),
                 base_cursor,
                 base_tick,
-                mul,
-                div,
+                ratio,
             });
         }
         // Armed, so every slot can now say where its next event falls in the
@@ -4760,6 +5015,311 @@ mod tests {
             assert_eq!(sched.sync_for_access(dev, AccessKind::Debug).unwrap(), 0);
         }
         assert!(sched.sync_for_access(dev, AccessKind::Guest).unwrap() > 0);
+    }
+
+    // -- catch-up across two crystals ---------------------------------------
+
+    /// The `riscv-virt` shape: a 1 GHz core and a 10 MHz timer can, with no
+    /// relationship between them but their declared rates. `mtime` is the
+    /// motivating device — architecturally a free-running counter the guest
+    /// samples at an arbitrary instruction, so a quantum-boundary answer is
+    /// wrong at every instruction but one.
+    fn two_crystal_scheduler() -> (Scheduler, DomainId, DomainId) {
+        two_crystal_scheduler_with(SchedulerConfig::default())
+    }
+
+    /// As [`two_crystal_scheduler`], with the config spelled out.
+    fn two_crystal_scheduler_with(config: SchedulerConfig) -> (Scheduler, DomainId, DomainId) {
+        let mut forest = ClockForest::new();
+        let core = forest
+            .add_oscillator("core", Rational::integer(1_000_000_000))
+            .unwrap();
+        let can = forest
+            .add_oscillator("rtc", Rational::integer(10_000_000))
+            .unwrap();
+        let hart = forest.add_domain("hart", core, 1, 1).unwrap();
+        let mtime = forest.add_domain("mtime", can, 1, 1).unwrap();
+        (Scheduler::new(forest, config), hart, mtime)
+    }
+
+    #[test]
+    fn a_device_on_another_crystal_is_caught_up_inside_the_quantum() {
+        let (mut sched, hart, mtime) = two_crystal_scheduler();
+        let dev = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+        let saw = sampling_cpu(&mut sched, hart, dev, 4_000);
+
+        sched.run_quantum().unwrap();
+        // A hundred hart ticks per `mtime` tick, sampled on hart tick 4 000.
+        // Not 0, which is where the quantum began and where a slot left unarmed
+        // answers from — a whole quantum of staleness on the one register whose
+        // entire job is to say what time it is.
+        assert_eq!(saw.load(AtomicOrdering::Relaxed), 40);
+    }
+
+    #[test]
+    fn the_cross_tree_ratio_comes_out_of_the_declared_rates() {
+        // The Game Boy: a 4.194304 MHz console divided by four, and an MBC3
+        // cartridge's own 32.768 kHz watch can. 32 machine cycles per RTC tick
+        // — the console's divider is part of the answer, which is why this is
+        // built from the two *domains'* frequencies and not the crystals'.
+        let mut forest = ClockForest::new();
+        let master = forest
+            .add_oscillator("master", Rational::integer(4_194_304))
+            .unwrap();
+        let can = forest
+            .add_oscillator("rtc", Rational::integer(32_768))
+            .unwrap();
+        let cpu = forest.add_domain("cpu", master, 1, 4).unwrap();
+        let rtc = forest.add_domain("rtc", can, 1, 1).unwrap();
+        let mut sched = Scheduler::new(forest, SchedulerConfig::default());
+        let dev = sched.add_lazy_device(rtc, Box::new(Ppu::default()));
+        let saw = sampling_cpu(&mut sched, cpu, dev, 320);
+        sched.run_quantum().unwrap();
+        assert_eq!(saw.load(AtomicOrdering::Relaxed), 10);
+    }
+
+    /// A core that samples a lazy device once per round, halfway through
+    /// whatever budget it was handed, and records its own tick alongside the
+    /// device's — so a test can compute the ideal conversion for exactly the
+    /// instant the sample was taken.
+    #[derive(Debug)]
+    struct TrackingCpu {
+        cursor: Arc<Mutex<Option<TickCursor>>>,
+        slot: Arc<LazySlot>,
+        /// `(runnable tick, device tick)` of the most recent sample.
+        saw: Arc<(AtomicU64, AtomicU64)>,
+        ticks: u64,
+    }
+
+    impl Runnable for TrackingCpu {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            let cursor = self.cursor.lock().clone();
+            let at = self.ticks + budget.ticks / 2;
+            for _ in 0..budget.ticks {
+                self.ticks += 1;
+                if let Some(cursor) = &cursor {
+                    cursor.set(self.ticks);
+                }
+                if self.ticks == at {
+                    let dev = self
+                        .slot
+                        .sync(LazyId(0), None, AccessKind::Guest)
+                        .expect("the device is registered");
+                    self.saw.0.store(self.ticks, AtomicOrdering::Relaxed);
+                    self.saw.1.store(dev, AtomicOrdering::Relaxed);
+                }
+            }
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    #[test]
+    fn the_cross_tree_error_is_under_one_tick_and_does_not_accumulate() {
+        // The property `ROADMAP.md` §4.2 asks of the cross-tree path, asserted
+        // rather than argued: bounded below one unit, and *non-accumulating*.
+        // `base_tick` is re-anchored from the forest at the top of every round
+        // and the forest carries the per-root residual, so 200 rounds in the
+        // live conversion is no further from the ideal than it was after one.
+        // A quantum the hart's tick cap can fill exactly — 10 µs of a 1 GHz
+        // core is the default 10 000 ticks — so its counter and virtual time
+        // stay in step. With the default 1 ms quantum the cap starves the hart
+        // to a hundredth of virtual time while `advance_undriven_trees` drags
+        // the other crystal to the full instant, and the test would then be
+        // measuring that starvation rather than this conversion.
+        let (mut sched, hart, mtime) = two_crystal_scheduler_with(SchedulerConfig {
+            quantum: GlobalTime::from_nanos(10_000),
+            ..SchedulerConfig::default()
+        });
+        // An awkward rate on purpose: 100:1 divides evenly and would hide a
+        // drift. 4 285 714.28… Hz against 1 GHz — three ticks per seven hundred
+        // — does not.
+        sched.forest_mut().set_rating(mtime, 3, 7).unwrap();
+        let dev = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+        let saw = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let cursor = Arc::new(Mutex::new(None));
+        let id = sched.add_runnable(
+            hart,
+            Box::new(TrackingCpu {
+                cursor: Arc::clone(&cursor),
+                slot: Arc::clone(&sched.lazy[dev.index()]),
+                saw: Arc::clone(&saw),
+                ticks: 0,
+            }),
+        );
+        *cursor.lock() = Some(sched.runnable_cursor(id).expect("just registered"));
+
+        let mut last = 0;
+        for round in 0..200u64 {
+            sched.run_quantum().unwrap();
+            let (at, live) = (
+                saw.0.load(AtomicOrdering::Relaxed),
+                saw.1.load(AtomicOrdering::Relaxed),
+            );
+            assert!(live >= last, "a live position never goes backwards");
+            last = live;
+            // Where the ideal real-valued conversion puts that same instant.
+            let ideal = at * 3 / 700;
+            assert!(
+                live.abs_diff(ideal) <= 1,
+                "round {round}: hart {at} converted to {live}, ideal {ideal}"
+            );
+        }
+        assert!(last > 4_000, "the device actually moved ({last})");
+    }
+
+    #[test]
+    fn a_cross_tree_event_lands_on_the_right_runnable_tick() {
+        // `cursor_deadline`'s `Nominal` arm: the device's own event, expressed
+        // in the runnable's ticks and rounded up, so the tick that *reaches*
+        // the event is the first one at or past it.
+        let (mut sched, hart, mtime) = two_crystal_scheduler();
+        let dev = sched.add_lazy_device(
+            mtime,
+            Box::new(Ppu {
+                next_event: Some(60),
+                ..Ppu::default()
+            }),
+        );
+        let saw = sampling_cpu(&mut sched, hart, dev, 5_000);
+        sched.run_quantum().unwrap();
+        // The sample on hart tick 5 000 sees `mtime` 50 — a hundred hart ticks
+        // per tick, converted live.
+        assert_eq!(saw.load(AtomicOrdering::Relaxed), 50);
+        // And tick 60 of a domain running at a hundredth of the hart's is hart
+        // tick 6 000, where the cursor's own deadline put the device *inside*
+        // the run. A debug access advances nothing, so seeing 60 here can only
+        // mean the cursor got it there: `close_round` publishes a position but
+        // never advances a device.
+        assert_eq!(sched.sync_for_access(dev, AccessKind::Debug).unwrap(), 60);
+    }
+
+    #[test]
+    fn re_rating_a_domain_mid_run_moves_the_conversion_with_it() {
+        // The ratio table is derived state and the epoch is what invalidates
+        // it. A guest that reprograms a divider reaches the forest through
+        // `forest_mut`, which is the only route there is — so this is the whole
+        // invalidation contract, tested rather than asserted in a comment.
+        let (mut sched, hart, mtime) = two_crystal_scheduler();
+        let dev = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+        let saw = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let cursor = Arc::new(Mutex::new(None));
+        let id = sched.add_runnable(
+            hart,
+            Box::new(TrackingCpu {
+                cursor: Arc::clone(&cursor),
+                slot: Arc::clone(&sched.lazy[dev.index()]),
+                saw: Arc::clone(&saw),
+                ticks: 0,
+            }),
+        );
+        *cursor.lock() = Some(sched.runnable_cursor(id).expect("just registered"));
+
+        // A hundred hart ticks per `mtime` tick, to start with.
+        let base = sched.forest().ticks(hart).unwrap();
+        sched.run_quantum().unwrap();
+        let (at, live) = (
+            saw.0.load(AtomicOrdering::Relaxed),
+            saw.1.load(AtomicOrdering::Relaxed),
+        );
+        assert_eq!(live, (at - base) / 100);
+
+        // Halve the can's domain and the same span is worth half as many ticks.
+        sched.forest_mut().set_rating(mtime, 1, 2).unwrap();
+        let base_tick = sched.forest().ticks(mtime).unwrap();
+        let base_cursor = sched.forest().ticks(hart).unwrap();
+        sched.run_quantum().unwrap();
+        let (at, live) = (
+            saw.0.load(AtomicOrdering::Relaxed),
+            saw.1.load(AtomicOrdering::Relaxed),
+        );
+        assert_eq!(
+            live,
+            base_tick + (at - base_cursor) / 200,
+            "a stale ratio would still be converting at a hundred to one"
+        );
+    }
+
+    #[test]
+    fn a_lone_runnable_converts_across_crystals_in_a_parallel_round_too() {
+        // A uniprocessor board is the one configuration where a parallel round
+        // has any business matching a deterministic one tick for tick: there is
+        // no second runnable to interleave with, so §4.2's "what differs is
+        // only the order in which two runnables' memory effects interleave"
+        // gives up nothing at all. It must therefore see the same `mtime` the
+        // deterministic round sees.
+        let mut saw = Vec::new();
+        for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+            let (mut sched, hart, mtime) = two_crystal_scheduler_with(SchedulerConfig {
+                mode,
+                ..SchedulerConfig::default()
+            });
+            let dev = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+            let at = sampling_cpu(&mut sched, hart, dev, 4_000);
+            sched.run_quantum().unwrap();
+            saw.push(at.load(AtomicOrdering::Relaxed));
+        }
+        assert_eq!(saw, alloc::vec![40, 40], "{saw:?}");
+    }
+
+    #[test]
+    fn two_runnables_leave_a_foreign_crystal_on_its_published_position() {
+        // And the case that cannot be answered: two runnables on two trees,
+        // both entitled to convert a slot on a third. A slot holds one live
+        // view, so arming it would make the device's position a function of
+        // which cursor got there first. It stays on the published position,
+        // which is bounded by the round and is what it always had.
+        let mut forest = ClockForest::new();
+        let a = forest
+            .add_oscillator("a", Rational::integer(1_000_000_000))
+            .unwrap();
+        let b = forest
+            .add_oscillator("b", Rational::integer(500_000_000))
+            .unwrap();
+        let can = forest
+            .add_oscillator("rtc", Rational::integer(10_000_000))
+            .unwrap();
+        let one = forest.add_domain("one", a, 1, 1).unwrap();
+        let two = forest.add_domain("two", b, 1, 1).unwrap();
+        let mtime = forest.add_domain("mtime", can, 1, 1).unwrap();
+        let mut sched = Scheduler::new(
+            forest,
+            SchedulerConfig {
+                mode: ThreadingMode::Parallel,
+                ..SchedulerConfig::default()
+            },
+        );
+        let dev = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+        let saw = sampling_cpu(&mut sched, one, dev, 4_000);
+        sched.add_runnable(two, Box::new(Cpu::default()));
+        sched.run_quantum().unwrap();
+        assert_eq!(
+            saw.load(AtomicOrdering::Relaxed),
+            0,
+            "an ambiguous slot is not armed by whichever runnable came first"
+        );
+    }
+
+    #[test]
+    fn an_intra_tree_ratio_is_still_exact_with_another_crystal_present() {
+        // The regression that matters most. Adding the cross-tree arm must not
+        // have moved the NES's PPU onto it: three dots per cycle, forever, and
+        // a second crystal in the forest changes nothing about that.
+        let mut forest = ClockForest::new();
+        let master = forest
+            .add_oscillator("master", Rational::new(236_250_000, 11).unwrap())
+            .unwrap();
+        let can = forest
+            .add_oscillator("rtc", Rational::integer(32_768))
+            .unwrap();
+        let cpu = forest.add_domain("cpu", master, 1, 12).unwrap();
+        let ppu = forest.add_domain("ppu", master, 1, 4).unwrap();
+        let rtc = forest.add_domain("rtc", can, 1, 1).unwrap();
+        let mut sched = Scheduler::new(forest, SchedulerConfig::default());
+        let dots = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        sched.add_lazy_device(rtc, Box::new(Ppu::default()));
+        let saw = sampling_cpu(&mut sched, cpu, dots, 40);
+        sched.run_quantum().unwrap();
+        assert_eq!(saw.load(AtomicOrdering::Relaxed), 120);
     }
 
     #[test]

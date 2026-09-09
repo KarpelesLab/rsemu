@@ -23,7 +23,7 @@
 //! | `a_synthetic_x86_workload_agrees_across_the_engines` | none | ~1.4 s | every `cargo test` |
 //! | `a_real_arm64_linux_boot_agrees_across_the_engines` | an `Image` | minutes | `--ignored`, nightly |
 //! | `a_real_x86_linux_boot_agrees_across_the_engines` | a `bzImage` | minutes | `--ignored`, nightly |
-//! | `the_clint_advances_while_the_hart_is_running` | none | milliseconds | `--ignored`; **half fixed** — see its doc comment |
+//! | `the_clint_advances_while_the_hart_is_running` | none | milliseconds | every `cargo test` |
 //!
 //! `RSEMU_LONGRUN_SECONDS` lengthens the synthetic runs; the default is sized
 //! so an ordinary `cargo test` does not notice them. `RSEMU_LONGRUN_ENGINES`
@@ -97,12 +97,12 @@
 //! paging, a machine-mode trap handler, and the CLINT arming its own
 //! comparator — written seam by seam off `cpu::riscv::engine` the way the x86
 //! synthetic is written off `cpu::x86::engine`. Writing it turned up something
-//! the engine's documentation assumes and this board does not provide, which
-//! is `riscv::the_clint_advances_while_the_hart_is_running`. It had two
-//! causes; the hart now publishes its position, which is one of them, and the
-//! test stays `#[ignore]`d on the other — the CLINT sits on a second crystal
-//! and `Scheduler::arm_live_cursors` arms nothing across two oscillator
-//! trees. Its doc comment carries both and what closing the second takes.
+//! the engine's documentation assumed and this board did not provide, which is
+//! `riscv::the_clint_advances_while_the_hart_is_running`. It had two causes,
+//! landed a round apart: the hart publishes its position, and
+//! `Scheduler::arm_live_cursors` now converts across two crystals as well as
+//! within one. It runs on every `cargo test` and its doc comment is the record
+//! of both.
 
 #![cfg(all(feature = "jit", feature = "std"))]
 
@@ -1281,9 +1281,9 @@ mod riscv {
         (machine, hart)
     }
 
-    /// **A defect this leg found and did not fix**: on `riscv-virt` the CLINT's
-    /// `mtime` does not move while the hart is running, so a guest reads the
-    /// same value for a whole quantum.
+    /// **A defect this leg found**, fixed in two halves a round apart: on
+    /// `riscv-virt` the CLINT's `mtime` did not move while the hart was
+    /// running, so a guest read the same value for a whole quantum.
     ///
     /// # What the guest does
     ///
@@ -1302,10 +1302,9 @@ mod riscv {
     /// round's worth of execution spans about **a hundred** distinct `mtime`
     /// values. Eight quanta should therefore find several hundred.
     ///
-    /// # What it does find: seven. One per quantum.
+    /// # What it used to find: seven. One per quantum.
     ///
-    /// There are **two** causes and the fix needs both. One is fixed; the
-    /// other is a change to `src/core/sched.rs`.
+    /// It finds **800** now. There were two causes and the fix needed both.
     ///
     /// **Cause 1 — the hart published nothing. Fixed.**
     /// `Scheduler::arm_live_cursors` builds each lazy device's live view on
@@ -1320,26 +1319,27 @@ mod riscv {
     /// a_running_hart_publishes_its_position_to_the_devices_it_reads` is that
     /// half's own gate and does not need a board.
     ///
-    /// **Cause 2 — the CLINT is on another crystal. Not fixed here.**
+    /// **Cause 2 — the CLINT is on another crystal. Fixed.**
     /// `machines/riscv-virt.machine` hangs `mtime` off `osc rtc`, a separate
-    /// oscillator tree from `osc core`, and `arm_live_cursors` arms a live
-    /// view only across slots that share a root — so the CLINT's slot is
-    /// skipped whatever the hart publishes. Instrumented on this very test:
-    /// one lazy slot, on `OscillatorId(1)`, skipped in all sixteen arm calls
-    /// of an eight-quantum run, once for the hart on `OscillatorId(0)` and
-    /// once for the 16550 on `OscillatorId(2)`.
+    /// oscillator tree from `osc core`, and `arm_live_cursors` used to arm a
+    /// live view only across slots that share a root — so the CLINT's slot was
+    /// skipped whatever the hart published. Instrumented on this very test at
+    /// the time: one lazy slot, on `OscillatorId(1)`, skipped in all sixteen
+    /// arm calls of an eight-quantum run, once for the hart on
+    /// `OscillatorId(0)` and once for the 16550 on `OscillatorId(2)`.
     ///
-    /// Closing it means giving `Live` a **cross-tree** ratio, which is what
+    /// Closing it meant giving `Live` a **cross-tree** ratio, which is what
     /// `ROADMAP.md` §4.2 already prescribes for two independent crystals —
     /// "reciprocal multiply + a per-root residual accumulator", error bounded
     /// below one tick and non-accumulating because the base is re-anchored
     /// from the forest every round. It is emphatically *not* "routing an
-    /// intra-tree relationship through absolute time": the intra-tree path
-    /// stays exactly as exact as it is. With that change applied locally this
-    /// test passes and reports **800** distinct values over eight quanta —
-    /// exactly the hundred a round predicts — and
+    /// intra-tree relationship through absolute time": the intra-tree path is
+    /// exactly as exact as it was, and
+    /// `core::sched::tests::an_intra_tree_ratio_is_still_exact_with_another_crystal_present`
+    /// is that claim's own gate. This test now reports 800 distinct values
+    /// over eight quanta — exactly the hundred a round predicts — and
     /// `riscv_virt_engines::every_engine_hashes_to_the_same_machine_at_every_checkpoint`
-    /// stays green.
+    /// stayed green.
     ///
     /// # Why it matters here rather than only as a clock-resolution nit
     ///
@@ -1361,13 +1361,11 @@ mod riscv {
     /// on a shipped RISC-V board can reach it. That is worth knowing before
     /// somebody deletes `IrHost::load`'s hand-back as dead code.
     ///
-    /// Still `#[ignore]`d, because half the fix is in a file this round did
-    /// not own. Cause 1 is committed and cause 2 is specified; the assertion
-    /// below is written against the fixed behaviour rather than against the
-    /// bug, so it turns green on the commit that lands the other half and
-    /// needs no edit here.
+    /// The assertion below was written against the fixed behaviour rather than
+    /// against the bug while the bug was still there, so landing the second
+    /// half turned it green without an edit — which is the whole reason to
+    /// write an `#[ignore]`d test that way.
     #[test]
-    #[ignore = "cause 2 is unfixed: riscv-virt's CLINT is on another oscillator tree, so `Scheduler::arm_live_cursors` never arms it — see the doc comment"]
     fn the_clint_advances_while_the_hart_is_running() {
         /// `mtime` in a tight loop, counting distinct values into `t2`.
         ///

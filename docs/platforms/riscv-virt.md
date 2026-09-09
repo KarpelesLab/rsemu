@@ -156,17 +156,22 @@ on purpose.
 
 ### The CLINT can raise `mtip` in the middle of a block
 
-> **Reachability, stated up front.** The mechanism below is fixed and tested,
-> but a *guest on this board* cannot yet reach it: a comparator is only crossed
-> where the CLINT is caught up, and until `Scheduler::arm_live_cursors` arms
-> across two oscillator trees (see *`rdtime` and a load of `mtime` return the
-> same number*) the only catch-up inside a round is the `mtimecmp` write's own
-> `republish`. Measured on the synthetic board in `tests/engine_longrun.rs`:
-> **1 999 timer interrupts in 2 000 quanta**, exactly one each, with the seam
-> knob on and off alike. So `a_load_that_raises_an_interrupt_is_taken_where_
+> **Reachability, and what changed.** The mechanism below is fixed and tested,
+> and for two rounds a *guest on this board* could not reach it: a comparator is
+> only crossed where the CLINT is caught up, and while
+> `Scheduler::arm_live_cursors` armed nothing across two oscillator trees (see
+> *`rdtime` and a load of `mtime` return the same number*) the only catch-up
+> inside a round was the `mtimecmp` write's own `republish`. Measured on the
+> synthetic board in `tests/engine_longrun.rs` at the time: **1 999 timer
+> interrupts in 2 000 quanta**, exactly one each, with the seam knob on and off
+> alike. So `a_load_that_raises_an_interrupt_is_taken_where_
 > the_interpreter_takes_it`, which builds a device that raises
-> unconditionally, is the only coverage this seam has — worth knowing before
+> unconditionally, was the only coverage this seam had — worth knowing before
 > anybody reads `IrHost::load`'s hand-back as dead code.
+>
+> The cross-tree arming has landed, so a comparator can now be crossed inside a
+> round and the count above is the thing to re-measure. Nobody has: the number
+> quoted is the old one and is labelled as such rather than quietly refreshed.
 
 A fourth instance of the class `docs/testing/long-run.md` records for A64 —
 *where a quantum ends*, not what an instruction computes — and the first one
@@ -292,22 +297,31 @@ platform timer look like they should disagree.
 
 `rdtime_and_a_memory_mapped_mtime_read_agree` in `src/dev/riscv/tests.rs` runs
 a loop that reads both back to back, 125 000 times, and keeps the largest
-difference and a count of every occasion `time` went backwards. On this board
-**both are zero**, and the assertion is that the gap never exceeds one tick and
-that `time` never goes backwards — which is what the architecture licenses and
-what stays true once the catch-up below is live.
+difference and a count of every occasion `time` went backwards. The assertion is
+that the gap never exceeds one tick and that `time` never goes backwards —
+which is what the architecture licenses.
 
-**Why they are identical here, and what is left.** Within a round there is
-nothing for `sync` to catch up to, and that used to have two causes. One is
-gone: the hart publishes a `TickCursor` position now — `Hart::attach_cursor`
-keeps both halves and `Exec::publish_position` publishes `State::cycles` before
-every access that leaves for the address space, which is the one publication
-point `interp`, `jit` and `jit-host` all reach identically. The other stands:
-`mtime` counts on the `rtc` crystal, a separate oscillator tree from `core`, and
-`Scheduler::arm_live_cursors` arms a live view only across slots that share a
-root, so the CLINT's slot is skipped whatever the hart publishes. Both routes
-therefore still read what `Scheduler::sync_lazy_devices` published when the
-previous round closed.
+**They now differ by one tick, and that is the fix working.** The largest gap
+over those 125 000 round trips is exactly **1**, and the backwards count is
+zero. It used to be zero and zero, which looked like agreement and was really a
+counter standing still: within a round there was nothing for `sync` to catch up
+to, for two separate reasons that landed a round apart.
+
+* The hart published nothing. It publishes a `TickCursor` position now —
+  `Hart::attach_cursor` keeps both halves and `Exec::publish_position`
+  publishes `State::cycles` before every access that leaves for the address
+  space, which is the one publication point `interp`, `jit` and `jit-host` all
+  reach identically.
+* `mtime` counts on the `rtc` crystal, a separate oscillator tree from `core`,
+  and `Scheduler::arm_live_cursors` armed a live view only across slots sharing
+  a root — so the CLINT's slot was skipped whatever the hart published. It is
+  armed now, through a ratio built from the two domains' declared rational
+  frequencies. See *The remaining half* below for why that is not the thing
+  §4.2 forbids.
+
+A `csrr time` and a load of `mtime` one instruction apart are therefore
+separated by real ticks of a 10 MHz counter, and the load answers with the next
+one. One tick is the bound; nothing here can produce two.
 
 **What publishing the position cost.** Callgrind, whole process, this board
 with a hand-written RV64 loop in its firmware slot — thirteen instructions of
@@ -351,18 +365,31 @@ was calibrated at. Its `interp` rows do agree with the table above, at −2.3% t
 both sittings, against a callgrind delta of +0.074% for that engine, which is
 code layout rather than work.
 
-**The remaining half is a scheduler change and it is specified, not vague.**
+**The remaining half was a scheduler change, and it has landed.**
 `ROADMAP.md` §4.2 does not forbid relating two trees; it says how — "reciprocal
 multiply + a per-root residual accumulator", with the error bounded below one
 unit and non-accumulating. What it forbids is routing an *intra*-tree
-relationship that way, and that path is untouched. `Live` needs a second ratio
-form, computed once per arm from the two domains' rational frequencies and
-reduced, and `arm_live_cursors` needs to build it instead of skipping the slot.
-With that applied locally, `engine_longrun`'s
-`the_clint_advances_while_the_hart_is_running` reports **800** distinct `mtime`
-values over eight quanta instead of seven — the hundred per round the numbers
-below predict — the largest `time`/`mtime` gap becomes one `rtc` tick, and
-`riscv_virt_engines`'s cross-engine hashes stay identical.
+relationship that way, and that path is untouched:
+`core::sched::tests::an_intra_tree_ratio_is_still_exact_with_another_crystal_present`
+puts a second crystal in a NES forest and asserts the PPU is still exactly three
+dots a cycle. `core::sched::Ratio` carries one pair of numbers for both cases,
+built from the domains' units-per-tick within a tree and from their declared
+rational frequencies across two, reduced once per topology change rather than
+once per round.
+
+`engine_longrun`'s `the_clint_advances_while_the_hart_is_running` reports
+**800** distinct `mtime` values over eight quanta instead of seven — the hundred
+per round the numbers below predict — the largest `time`/`mtime` gap is one
+`rtc` tick, and `riscv_virt_engines`'s cross-engine hashes are identical. The
+test is no longer `#[ignore]`d; its assertion was written against the fixed
+behaviour while the bug was still there, so it turned green without an edit.
+
+**What it cost.** Callgrind, whole process, `benches/frame_time --only
+riscv-virt --frames 6`: 7 640 656 394 → 7 640 862 542, **+0.0027%**. The
+conversion itself is one `u64` multiply and one divide on the access path, the
+same two instructions the intra-tree path always ran; the reduction and the
+frequency lookups happen in `Scheduler::build_ratios`, which is keyed on a
+topology epoch and does not run per round at all.
 
 **What the board should not do instead.** Putting `mtime` on the core's tree —
 `clock = core / 100`, which is exact — would make the intra-tree path do the
@@ -376,25 +403,27 @@ an integer: a board with a real 32.768 kHz can could not express it at all.
 on real hardware that rate comes from a different crystal — which is exactly
 what the `osc rtc` line says.
 
-This qualifies one clause of the section above. Measured on this board, a
-*read* of the CLINT advances it by nothing: the loop above takes about 312
-`mtime` loads per round and every one of them returns the identical value. So
-the window that section describes is opened here by the `mtimecmp` **write**'s
-own `republish` — `Registers::write` syncs and republishes unconditionally,
-and republishing raises `mtip` for any comparator the current `mtime` is
-already past — rather than by a later read catching the block up across the new
-comparator. The fix and its regression test are unaffected either way; the test
-uses a device of its own that raises a line when read, which is a shape a board
-is free to have even though the CLINT on this one does not.
+This used to qualify one clause of the section above, and no longer does.
+Before the cross-tree arming a *read* of the CLINT advanced it by nothing: the
+loop above took about 312 `mtime` loads per round and every one of them returned
+the identical value, so the window that section describes was opened here only
+by the `mtimecmp` **write**'s own `republish` — `Registers::write` syncs and
+republishes unconditionally, and republishing raises `mtip` for any comparator
+the current `mtime` is already past — rather than by a later read catching the
+block up across the new comparator. A read now advances the chip to the hart's
+live position, so the read route is open too. The fix and its regression test
+were unaffected either way; the test uses a device of its own that raises a line
+when read, which is a shape a board is free to have.
 
-**The bound.** `mtime` is a staircase to the guest, one step per scheduler
-round. With no comparator armed a round runs to
+**The bound.** `mtime` *was* a staircase to the guest, one step per scheduler
+round: with no comparator armed a round runs to
 `SchedulerConfig::max_ticks_per_quantum`, and the step measured on this board
-is exactly 10 000 `rtc` ticks — one millisecond — every round, for as long as
-the machine runs.
-With a comparator armed the step is as fine as the comparator, because
-`Scheduler::natural_target` ends the round on it. Both routes lag by the same
-amount, so no guest can tell.
+was exactly 10 000 `rtc` ticks — one millisecond — every round, for as long as
+the machine ran. That is what the cross-tree arming removed. A guest that loads
+`mtime` now sees it advance inside the round, and the residual step is the one
+`rtc` tick a single 100-core-tick interval is worth. `csrr time` still lags by
+up to that one tick, because it reads `Registers::mtime_cell` as `republish`
+last left it rather than syncing — see *Nothing was changed in the CSR path*.
 
 **The architecture allows exactly this.** *Volume II: Privileged Architecture*,
 "Machine Timer Registers": "When `mtime` changes, it is guaranteed to be
@@ -417,11 +446,14 @@ merely within a tick.
 **Nothing was changed in the CSR path, deliberately.** The obvious repair —
 have the CSR read sync the device the way a load does — would put a device
 catch-up on the instruction Linux runs most often, since `rdtime` is the
-userspace clocksource through the vDSO. Today it would also buy nothing: the
-sync it would perform is the one that already runs on every CLINT load and
-already advances nothing. Once the cross-tree arming lands it would buy exactly
-one tick of freshness, at the price of a lazy-device catch-up per `rdtime`, and
-that is the trade to argue then rather than now.
+userspace clocksource through the vDSO. While the CLINT was stranded on its own crystal it also bought nothing, the sync
+it would perform being one that advanced nothing. Now that the cross-tree
+arming has landed it would buy exactly **one tick** of freshness — the gap
+`rdtime_and_a_memory_mapped_mtime_read_agree` measures — at the price of a
+lazy-device catch-up on the instruction Linux runs most often. That is the
+trade, and it is still not worth taking: one tick of a 10 MHz counter is 100 ns,
+below anything the vDSO's callers can act on, and the architecture licenses
+exactly this lag.
 
 **The one latent hazard, and the second one it turned into.** `Csrs::mtime` is
 sampled once per `Hart::advance`, which is once per *block* under a translating
@@ -439,11 +471,12 @@ instruction under `interp` and as of the start of the last **block** under a
 JIT, which is one guest state hashing two ways. `cpu::riscv::resample_timer` takes a
 second sample after each run unit, which both engines reach on the same guest
 instruction because both finish a budget there. It was written for the
-cross-tree change above, verified against it — without it
+cross-tree change above and verified against it — without it
 `every_engine_hashes_to_the_same_machine_at_every_checkpoint` fails at the first
-quantum with `mtime 0x63` interpreted against `0x62` translated — and it is a
-no-op until that change lands, since a cell that only moves at round close is
-the same value at both ends of a run unit.
+quantum with `mtime 0x63` interpreted against `0x62` translated. It was a no-op
+until that change landed, since a cell that only moves at round close is the
+same value at both ends of a run unit; it is load-bearing now, and that test is
+what says so.
 
 **The neighbours.** `cycle` and `instret` are read-only shadows of `mcycle` and
 `minstret` (Volume II, `mcounteren`), which are hart-local and have no
