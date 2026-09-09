@@ -2736,6 +2736,24 @@ impl X86 {
         self.session.lock().state.int_shadow
     }
 
+    /// Put the core into — or out of — that shadow.
+    ///
+    /// **The setter exists for one caller and it is worth naming.** A
+    /// hypervisor holds this bit too, in the VMCS's *interruptibility state*
+    /// or the VMCB's `INT_STATE`, and `KVM_GET_VCPU_EVENTS` is the only
+    /// request that reports it — no register does, because it is not a
+    /// register. Without a way to write it back, a processor whose state
+    /// crossed from silicon to the interpreter arrived with the shadow gone
+    /// and took an interrupt one instruction early, on the half-loaded
+    /// `SS:SP` the shadow exists to protect.
+    /// [`accel::state`](crate::accel::state) is that caller.
+    ///
+    /// Not something a guest instruction should reach: `STI`, `MOV SS` and
+    /// `POP SS` set it for themselves, and `step` clears it.
+    pub fn set_interrupt_shadow(&self, shadowed: bool) {
+        self.session.lock().state.int_shadow = shadowed;
+    }
+
     /// Request a reset sequence without changing any register.
     ///
     /// The sequence runs on the next [`step`](X86::step): a reset is a

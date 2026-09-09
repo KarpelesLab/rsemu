@@ -130,6 +130,23 @@
 //! in `deterministic` threading, and `Machine::state_hash` on it refuses for
 //! its own reasons without this module arranging anything.
 //!
+//! # `CR8` lives here, and nowhere else could have it
+//!
+//! One piece of a processor's state is reconciled by this module rather than
+//! translated by [`state`]: the task-priority class. `CR8` is the top nibble of
+//! the local APIC's task-priority register seen through the processor (*Intel
+//! SDM* volume 3A §11.8.6.1), and in this crate that APIC is a **device**, so
+//! `cpu::x86` has no `cr8` field at all — both of the guest's routes to it end
+//! at the same register page. On hardware they do not: `MOV CR8` lands in the
+//! vCPU without an exit, a store to the APIC's page leaves hardware as MMIO and
+//! lands in the device, and neither sees the other.
+//!
+//! What that needs is not a field in the transfer but for the two copies to
+//! agree, and the only party that can make them agree is the one holding both
+//! the memory space and the [`LocalController`] link — which is this type.
+//! `AccelCpu::sync_task_priority` is the reconciliation and its documentation
+//! is the argument, including the re-entrancy one.
+//!
 //! # What does not reach hardware yet, named rather than discovered
 //!
 //! * **The A20 gate.** It is an input pin on the shell and a mask on the
@@ -181,11 +198,12 @@ use crate::core::props::Props;
 use crate::core::sched::{Budget, Consumed, ThreadingMode};
 use crate::core::space::{AddressSpace, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicBool, AtomicU8, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::wire::{
     DmaPeripheral, FanIn, IntAck, Level, LocalController, Resolve, WireId, WireSink, WireSource,
 };
 use crate::cpu::x86::isa::seg;
+use crate::cpu::x86::prot::apic_base;
 use crate::cpu::x86::{Variant, X86};
 use crate::machine::{BindCtx, Bindings, Instance};
 
@@ -367,6 +385,7 @@ impl AccelCpus {
             entries: AtomicU64::new(0),
             interpreted: AtomicU64::new(0),
             failure: Mutex::new(None),
+            tpr: AtomicU8::new(0),
         });
         built.push(Arc::downgrade(&cpu));
         Ok(cpu)
@@ -610,6 +629,17 @@ pub struct AccelCpu {
     /// The last backend failure, for a test or a monitor that wants to know
     /// why a processor stopped.
     failure: Mutex<Option<String>>,
+    /// The task-priority class this processor and its local APIC last agreed
+    /// on — the shadow that makes
+    /// [`sync_task_priority`](AccelCpu::sync_task_priority) able to tell which
+    /// of them moved.
+    ///
+    /// **Derived, and therefore not in the chunk.** `CLAUDE.md` says derived
+    /// state is never serialized, and this is exactly that: the value itself
+    /// lives in `dev::pc::apic`, which saves it, and a snapshot that carried a
+    /// second copy could restore a machine whose two copies disagreed. A
+    /// restore instead lands in the `dirty` path, which adopts the device's.
+    tpr: AtomicU8,
 }
 
 impl AccelCpu {
@@ -707,6 +737,92 @@ impl AccelCpu {
         self.init_peer.store(signal.held, Ordering::Release);
         if let Some(page) = signal.page {
             self.shell.start_up(page);
+        }
+    }
+
+    /// Where this processor's local APIC keeps its register page.
+    ///
+    /// `IA32_APIC_BASE`'s frame, asked of the controller rather than of the
+    /// hypervisor: `kvm_sregs.apic_base` is the *kernel's* copy of a register
+    /// that, on this backend, belongs to a device on the board. `None` with no
+    /// controller wired, and `None` for one software has hardware-disabled,
+    /// because a disabled APIC has no register page at all (*Intel SDM* volume
+    /// 3A §11.4.3). The same predicate `cpu::x86`'s `prot::Exec::apic_page`
+    /// uses, for the same reason.
+    fn apic_page(&self) -> Option<u64> {
+        let base = self.controller()?.base_register();
+        (base & apic_base::ENABLE != 0).then_some(base & apic_base::BASE)
+    }
+
+    /// Keep `CR8` and the local APIC's task-priority register one value.
+    ///
+    /// **`CR8` has two writers and neither can see the other.** A 64-bit guest
+    /// can set its priority class with `MOV CR8`, which on hardware lands in
+    /// the vCPU without an exit; or with a store to the APIC's register page,
+    /// which leaves hardware as MMIO and lands in `dev::pc::apic`. The
+    /// interpreter has no such split — `prot::Exec::write_task_priority` sends
+    /// *both* routes to the device, so there is one home for the byte — and
+    /// that is why `accel::state` has no `cr8` to carry: what it needs is not
+    /// a translation but for the two copies to agree.
+    ///
+    /// So this is a two-way sync with a shadow rather than a copy in either
+    /// direction, and the shadow is what makes it two-way: a blind push of the
+    /// vCPU's `CR8` onto the device would undo an MMIO write the device had
+    /// already acted on, and a blind pull the other way would discard a
+    /// `MOV CR8`. Comparing each against what they last agreed on says which
+    /// of them actually moved. The device wins a tie, because its write is the
+    /// one that has already been observed — a `pc.lapic` re-evaluates delivery
+    /// on a TPR write and may already have dropped `INTR`.
+    ///
+    /// # Re-entrancy
+    ///
+    /// `CLAUDE.md` §concurrency: *mutate your own state in a short critical
+    /// section, release it, then make any outward call*. This holds **no lock
+    /// of this device's** — [`controller`](AccelCpu::controller) clones the
+    /// link out from under its own and drops it, the shadow is an atomic, and
+    /// the vCPU's page write takes only the vCPU's lock. The store into the
+    /// APIC's register page is then an ordinary outward call, made from
+    /// exactly the position [`poll_controller`](AccelCpu::poll_controller)
+    /// already makes one from, and the APIC is free to drive this processor's
+    /// `INTR` pin back while it is answering — which is the *point*: lowering
+    /// the priority class is how a blocked interrupt becomes deliverable.
+    ///
+    /// Once per slice, which is the granularity an accelerated processor has
+    /// for everything else its board can see.
+    fn sync_task_priority(&self, space: Option<&Arc<AddressSpace>>, vcpu: &Vcpu) {
+        let (Some(space), Some(page)) = (space, self.apic_page()) else {
+            return;
+        };
+        let agreed = self.tpr.load(Ordering::Relaxed);
+        if let Ok(theirs) = state::tpr_from_space(space, page)
+            && theirs != agreed
+        {
+            vcpu.set_cr8(theirs);
+            self.tpr.store(theirs, Ordering::Relaxed);
+            return;
+        }
+        let ours = vcpu.cr8();
+        if ours != agreed && state::tpr_through_space(space, page, ours).is_ok() {
+            self.tpr.store(ours, Ordering::Relaxed);
+        }
+    }
+
+    /// Take the local APIC's task priority as this processor's, without
+    /// asking which of them moved.
+    ///
+    /// The one moment [`sync_task_priority`](AccelCpu::sync_task_priority)'s
+    /// question has no answer: after a reset or a snapshot load there is no
+    /// *last agreed* value, because the shell's whole state came from
+    /// somewhere else. The device is authoritative there by construction —
+    /// `CR8` is not in the processor's chunk and never was, so the APIC's is
+    /// the only copy a snapshot carried.
+    fn adopt_task_priority(&self, space: Option<&Arc<AddressSpace>>, vcpu: &Vcpu) {
+        let (Some(space), Some(page)) = (space, self.apic_page()) else {
+            return;
+        };
+        if let Ok(theirs) = state::tpr_from_space(space, page) {
+            vcpu.set_cr8(theirs);
+            self.tpr.store(theirs, Ordering::Relaxed);
         }
     }
 
@@ -856,8 +972,8 @@ impl AccelCpu {
             ));
         };
         let space = self.memory.lock().clone();
-        if let Some(space) = space {
-            self.host.ensure_map(&space)?;
+        if let Some(space) = space.as_ref() {
+            self.host.ensure_map(space)?;
         }
         // Anything hardware cannot fetch, the interpreter runs — and if the
         // processor is still out there when its allowance runs out, this slice
@@ -886,6 +1002,10 @@ impl AccelCpu {
             } else {
                 state::load_into_vcpu(&self.shell, &vcpu)?;
             }
+            // The shell has just been rewritten from a snapshot or a reset, so
+            // there is no priority class the two sides last agreed on. The
+            // device's is the one a snapshot carried.
+            self.adopt_task_priority(space.as_ref(), &vcpu);
         }
         // An edge, taken once. It also ends a `HLT`, which is the whole point
         // of a non-maskable interrupt.
@@ -916,6 +1036,9 @@ impl AccelCpu {
         // The shell is made current before anything is decided about the exit,
         // so a `save` between rounds needs no cooperation from this module.
         state::store_from_vcpu(&vcpu, &self.shell)?;
+        // And `CR8`, which is not the shell's to hold: it lives in the board's
+        // local APIC, and the two copies are reconciled here.
+        self.sync_task_priority(space.as_ref(), &vcpu);
         if let Some(exit) = run.exit {
             match exit.reason {
                 ExitReason::HALT => self.halted.store(true, Ordering::Release),
@@ -1103,7 +1226,8 @@ impl Device for AccelCpu {
     /// about a list of fields**, and the list is
     /// [`accel::state`](crate::accel::state)'s — the register file, the system
     /// state, thirty-four model-specific registers, the debug registers, the
-    /// x87 and SSE files, and the time-stamp counter. A field missing from that
+    /// x87 and SSE files, the interrupt shadow, and the time-stamp counter. A
+    /// field missing from that
     /// list is not written here either, however complete the chunk looks, which
     /// is exactly how the memory-type ranges came to be saved as zeros off a
     /// vCPU that had them programmed. The module documentation's honest list is

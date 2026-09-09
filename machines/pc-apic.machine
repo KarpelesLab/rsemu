@@ -99,21 +99,35 @@ machine "pc-apic" {
   # Two of them, identical but for which one the APIC bus calls the bootstrap
   # processor — that is `lapic0`'s `bsp`, not a property of the core.
   #
-  # **These are 486s, so they have no model-specific registers**, and that is a
-  # limit of what a machine file can currently say rather than a choice. A local
-  # APIC's base register is `IA32_APIC_BASE`, an MSR, and the core does forward
-  # `RDMSR`/`WRMSR` for it through `LocalController` — but `cpu.x86`'s feature
-  # toggles (`msr`, `cr4`, and the rest of `Features`) are construction
-  # properties the *validator's* schema does not list, so writing `msr = true`
-  # here is rejected before the core ever sees it. Until that schema names them,
-  # an operating system on this board finds its local APIC at the address the
-  # `map` below gives rather than by asking the processor.
+  # **486s with the model-specific registers fitted**, which is a 486DX plus
+  # what a board with a local APIC in front of it actually needs. `msr` buys
+  # `RDMSR`/`WRMSR`, `RDTSC` and `IA32_APIC_BASE` — the register an operating
+  # system reads to *find* its local APIC instead of assuming the address the
+  # `map` below gives it; `mtrr` buys the memory-type ranges, so the board can
+  # say which of its physical addresses are cacheable.
+  #
+  # This comment used to say the toggles were unreachable — that the
+  # validator's schema did not list them, so `msr = true` was rejected before
+  # the core saw it. That stopped being true when `cpu.x86`'s schema started
+  # being generated from `CLASS.properties` instead of written out a second
+  # time (see `schema_for` in `src/cpu/x86/mod.rs`, which has the story), and
+  # nobody came back to this file. **The stale comment had a cost.** This is
+  # the only board in the tree that runs under `accel-kvm`, so it is the board
+  # `tests/kvm_smp.rs` compares a hardware snapshot against an interpreted one
+  # on — and a processor with no model-specific registers has nothing to
+  # compare. A vCPU whose guest had programmed `IA32_MTRR_DEF_TYPE` handed the
+  # interpreter a zero for a year, and `E = 0` in that register is not "the
+  # default": *Intel SDM* volume 3A 12.11.2.1 makes it *every physical address
+  # uncacheable*. The byte-for-byte chunk test passed throughout, because both
+  # sides of it held nothing.
 
   object cpu0 "cpu.x86" {
     clock   = cpu
     space   = mem
     iospace = "port"
     model   = "80486"
+    msr     = true
+    mtrr    = true
     engine  = "interp"
   }
 
@@ -122,6 +136,8 @@ machine "pc-apic" {
     space   = mem
     iospace = "port"
     model   = "80486"
+    msr     = true
+    mtrr    = true
     engine  = "interp"
   }
 

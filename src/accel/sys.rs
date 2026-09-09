@@ -416,6 +416,29 @@ impl Mapping {
         }
         Some(out)
     }
+
+    /// Store `N` bytes at `offset`, reporting whether they were in range.
+    ///
+    /// [`load_le`](Mapping::load_le)'s inverse, byte by byte for the same
+    /// reason: the region is shared with the kernel and there is no alignment
+    /// guarantee to justify a wider access.
+    #[inline]
+    pub fn store_le<const N: usize>(&self, offset: u64, value: [u8; N]) -> bool {
+        let Ok(at) = usize::try_from(offset) else {
+            return false;
+        };
+        let cells = self.cells();
+        let Some(end) = at.checked_add(N) else {
+            return false;
+        };
+        if end > cells.len() {
+            return false;
+        }
+        for (i, b) in value.iter().enumerate() {
+            cells[at + i].store(*b, core::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    }
 }
 
 impl Drop for Mapping {

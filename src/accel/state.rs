@@ -29,7 +29,9 @@
 //! | the x87 file, control, status and tag words | [`X87`] | `KVM_GET_FPU` | **yes** |
 //! | `XMM0`–`XMM15` | [`Sse`] | `KVM_GET_FPU` | **yes** |
 //! | `MXCSR` | [`Sse::mxcsr`] | `KVM_GET_FPU` | **out of hardware only** |
-//! | the local APIC, `CR8`'s storage included | `dev::pc::apic` | *not the kernel's* | **by construction** |
+//! | the **interrupt shadow** | `int_shadow` | `KVM_GET_VCPU_EVENTS` | **yes** |
+//! | the local APIC | `dev::pc::apic` | *not the kernel's* | **by construction** |
+//! | `CR8`, the task-priority class | `dev::pc::apic` | `kvm_run.cr8` | **reconciled by `accel::cpu`** |
 //! | `apic_base` | `core::wire::LocalController` | `kvm_sregs` | **carried, not applied** |
 //!
 //! # The local APIC is not on the honest list, and that is worth explaining
@@ -93,21 +95,6 @@
 //!
 //! Five things, and each says what closing it would take.
 //!
-//! * **`CR8`, when a 64-bit guest writes it on hardware.** `CR8` is the local
-//!   APIC's task-priority register seen through the processor, and in this
-//!   crate that APIC is a *device*. The interpreter therefore has no `cr8`
-//!   field at all: `prot::Exec::write_task_priority` stores to the APIC's
-//!   register page, so the device — and hence the snapshot — always has the
-//!   truth. A vCPU does not: `MOV CR8` on hardware lands in the vCPU's own
-//!   `cr8` without an exit, and nothing here syncs it back to the device, so
-//!   [`overlay_sys`] preserves the accelerator's copy and the device keeps a
-//!   stale one. **What closing it takes:** [`tpr_through_space`] is already the
-//!   route and [`ArchState::cr8`] already carries the value; what is missing is
-//!   a caller with both, which `accel::cpu` is — it holds the memory space and
-//!   can reach `IA32_APIC_BASE` through its [`LocalController`] link. One store
-//!   per hardware slice, on a path that already does five ioctls. It is not done
-//!   here because it is a change to how often a device is written from inside a
-//!   run loop, and that is a re-entrancy question rather than a translation one.
 //! * **`apic_base`.** Also the device's, and here the crate *does* have a seam:
 //!   [`LocalController::base_register`](crate::core::wire::LocalController::base_register)
 //!   is exactly a route from a core to the sibling that owns `IA32_APIC_BASE`,
@@ -147,18 +134,76 @@
 //!   rather than transferred. Only `FNSTENV` in a 16- or 32-bit form can
 //!   observe the difference. **What closing it takes:** `KVM_GET_XSAVE` again —
 //!   the legacy area has the two selector fields that `kvm_fpu` dropped.
+//! * **The rest of `kvm_vcpu_events`.** The **interrupt shadow** now crosses —
+//!   see below — but the structure carries three other things and none of them
+//!   has anywhere to land: a **pending or injected exception** with its error
+//!   code and payload, the **pending `NMI`**, and the **`NMI`-blocked** flag
+//!   that says the processor is between an `NMI` and its `IRET`. The
+//!   interpreter has no field for any of the three, and that is a statement
+//!   about `cpu::x86` rather than about the bridge: it delivers an exception
+//!   *within* the step that raised it, so between two instructions there is
+//!   never one owed; its `NMI` latch lives on the pin rather than in the
+//!   execution state; and it does not model `NMI` blocking at all — its
+//!   `int_shadow` suppresses `NMI` and `INTR` together, which is `MOV SS`
+//!   semantics rather than `IRET` semantics. [`overlay_events`] therefore
+//!   *preserves* all three rather than zeroing them, so a vCPU that owed the
+//!   guest a `#PF` still owes it after a slice-boundary push. **What closing
+//!   them takes** is not an ioctl — it is a pending-event field in `cpu::x86`'s
+//!   execution state and a chunk version to hold it, which is a core
+//!   deliverable rather than a translation one.
 //!
-//! There is a sixth that belongs to `accel::cpu` rather than to this module and
-//! is recorded here because this is the file a reader comes to: **the
-//! interruptibility state**. `kvm_vcpu_events` carries the pending exception,
-//! the pending `NMI`, the `NMI`-blocked flag and the interrupt shadow, and no
-//! `KVM_GET_VCPU_EVENTS` is issued anywhere in this backend. The interpreter's
-//! chunk *has* `int_shadow`, so the field exists at both ends and is simply
-//! never filled from hardware. A snapshot taken between a `STI` and the
-//! instruction after it therefore restores with the shadow lost, and the guest
-//! can take an interrupt one instruction early. **What closing it takes:** the
-//! `kvm_vcpu_events` transcription and two more ioctls in the pair below; no
-//! chunk change, since `int_shadow` is already written.
+//! # The interrupt shadow, which used to be on that list
+//!
+//! It was the sharpest item there and it is now carried, so what follows is why
+//! it needed its own ioctl and how the one boolean maps onto two bits.
+//!
+//! The shadow is the single instruction after a `STI`, a `MOV SS` or a `POP SS`
+//! during which an external interrupt is not recognised (*Intel SDM* volume 2B,
+//! `STI`; volume 3A §6.8.3). It exists so that `STI; HLT` cannot lose a wakeup
+//! and so that the second half of an `SS:SP` reload cannot be interrupted. It
+//! is not in `RFLAGS`, not in a control register and not in any model-specific
+//! register: on hardware it is the VMCS's *interruptibility state* or the
+//! VMCB's `INT_STATE`, and `KVM_GET_VCPU_EVENTS` is the only request that
+//! reports it. So a bridge built out of `KVM_GET_REGS`, `KVM_GET_SREGS` and
+//! `KVM_GET_MSRS` could not see it at any level of care.
+//!
+//! **It is the same shape of defect as the memory-type ranges**, and it is
+//! worth naming the shape: a field *both* engines drop looks identical on both
+//! sides, so an engine-versus-engine comparison of chunks passes. What catches
+//! it is a guest that observes its own state — here, one whose interrupt
+//! handler reads the `RIP` it interrupted off its own stack frame and so says
+//! whether the shadowed instruction ran first.
+//! `tests/x86_arch_state.rs`'s `shadow_guest` is that program.
+//!
+//! One boolean, two bits. `cpu::x86` has a single `int_shadow` where a
+//! hypervisor distinguishes blocking-by-`STI` from blocking-by-`MOV SS`; the
+//! way *out* of hardware is therefore "either bit means shadowed", and the way
+//! *in* picks `MOV SS` for the reasons [`SHADOW_INTO_HARDWARE`] gives. An AMD
+//! part does not distinguish them at all and reports both.
+//!
+//! # `CR8`, which also used to be on that list, is not a translation
+//!
+//! It is on the table above with a different verdict from everything else —
+//! *reconciled by `accel::cpu`* — and the reason is that `CR8` was never this
+//! module's to carry. It is the top nibble of the local APIC's task-priority
+//! register seen through the processor (*Intel SDM* volume 3A §11.8.6.1), and
+//! in this crate that APIC is a **device**. `cpu::x86` therefore has no `cr8`
+//! field at all: `prot::Exec::write_task_priority` stores to the register page
+//! whichever route the guest took, so there is one home for the byte and the
+//! snapshot already carries it — in the APIC's chunk.
+//!
+//! On hardware there are two homes. `MOV CR8` lands in the vCPU without an
+//! exit; a store to the APIC's page leaves hardware as MMIO and lands in the
+//! device. Neither sees the other, so what was needed was not a field in
+//! [`ArchState`] but for the two copies to agree — and the party that can make
+//! them agree is the one holding both the memory space and the
+//! [`LocalController`] link, which is `accel::cpu`. `AccelCpu::sync_task_priority`
+//! is that reconciliation: a two-way compare against the value the two sides
+//! last agreed on, once per slice, with the store made outside every lock this
+//! crate holds. [`tpr_through_space`] and [`tpr_from_space`] are the two routes
+//! it uses, and `kvm_run.cr8` — which `api.rst` documents as *"in
+//! (pre_kvm_run), out (post_kvm_run)"* and valid only without an in-kernel
+//! local APIC — is the vCPU's side of it, at the cost of no ioctl at all.
 //!
 //! [`X87`]: crate::cpu::x86::fpu::X87
 //! [`Sys::misc_enable`]: crate::cpu::x86::prot::Sys::misc_enable
@@ -179,7 +224,9 @@ use crate::cpu::x86::{Regs, X86};
 use crate::float::x87::F80;
 
 use super::AccelResult;
-use super::kvm::{KvmDebugregs, KvmDtable, KvmFpu, KvmRegs, KvmSegment, KvmSregs, Vcpu};
+use super::kvm::{
+    KvmDebugregs, KvmDtable, KvmFpu, KvmRegs, KvmSegment, KvmSregs, KvmVcpuEvents, Vcpu, events,
+};
 
 // ---------------------------------------------------------------------------
 // registers
@@ -664,6 +711,80 @@ pub fn fpu_from_kvm(kvm: &KvmFpu, base: &X87) -> (X87, Sse) {
 }
 
 // ---------------------------------------------------------------------------
+// interruptibility: the one piece of architectural state no register holds
+// ---------------------------------------------------------------------------
+
+/// Which shadow bit this crate writes into hardware, and why it is the
+/// *`MOV SS`* one rather than the `STI` one.
+///
+/// The interpreter has a single boolean where a hypervisor has two bits, so
+/// the way back has to choose one. It writes `MOV SS` blocking, for two
+/// reasons, and neither is arbitrary.
+///
+/// **It is the one that means what the interpreter means.** Blocking by `STI`
+/// suppresses `INTR` and leaves `NMI` alone; blocking by `MOV SS` suppresses
+/// both, because the whole point of that shadow is that an `SS:SP` pair is
+/// half-loaded and *nothing* may be pushed onto it (*Intel SDM* volume 3A
+/// §6.8.3, "masking exceptions and interrupts when switching stacks").
+/// [`cpu::x86`](crate::cpu::x86) checks `int_shadow` ahead of *both* the `NMI`
+/// latch and the `INTR` pin — see `exec::Exec::step` — so its shadow is the
+/// `MOV SS` one whatever raised it. Writing that bit reproduces the emulated
+/// processor rather than a slightly different one.
+///
+/// **It is also the one a VM entry will always accept.** VMX checks the
+/// guest's interruptibility state on entry (*SDM* volume 3C, the checks on
+/// guest non-register state), and blocking by `STI` is not a state a processor
+/// can be in with `RFLAGS.IF` clear — which an interpreter shadow raised by a
+/// `MOV SS` with interrupts already off legitimately is. Two bits describing
+/// two different blocking conditions are also not a state the architecture
+/// describes, so writing both instead of choosing would be inventing one.
+pub const SHADOW_INTO_HARDWARE: u8 = events::SHADOW_INT_MOV_SS;
+
+/// The interrupt shadow, out of a `kvm_vcpu_events` and into the interpreter.
+///
+/// **The only member of that structure both engines model**, and the module
+/// documentation's list says what happens to the other three.
+pub fn events_from_kvm(events: &KvmVcpuEvents, cpu: &X86) {
+    cpu.set_interrupt_shadow(events.interrupt_shadow());
+}
+
+/// The interrupt shadow, onto a `kvm_vcpu_events` the vCPU already has.
+///
+/// **An overlay, for [`overlay_sys`]'s reason and one of its own.** The
+/// pending exception, the pending and blocked `NMI` and the system-management
+/// state are all things the accelerator knows and the interpreter has no field
+/// for, so a wholesale write would replace them with zeros — a vCPU that owed
+/// the guest a `#PF` would silently stop owing it.
+///
+/// The flags field is where that is expressed rather than in the members: KVM
+/// reads `nmi.pending`, `sipi_vector` and the `smi` group **only** when the
+/// matching flag is set (`api.rst` §4.32, and it names those four because a
+/// running processor changes them underneath userspace), so clearing those
+/// three bits is how a client says *keep your own*. What is left set is what
+/// the kernel reported on the way out, `KVM_VCPUEVENT_VALID_SHADOW` included —
+/// and a host that does not report the shadow leaves that bit clear, which is
+/// the whole of the capability check.
+pub fn overlay_events(shadowed: bool, out: &mut KvmVcpuEvents) {
+    out.flags &= !(events::VCPUEVENT_VALID_NMI_PENDING
+        | events::VCPUEVENT_VALID_SIPI_VECTOR
+        | events::VCPUEVENT_VALID_SMM);
+    if out.shadow_valid() {
+        out.interrupt.shadow = if shadowed { SHADOW_INTO_HARDWARE } else { 0 };
+    }
+}
+
+/// A vCPU's interruptibility with the interpreter's shadow written over it.
+///
+/// # Errors
+///
+/// [`AccelError::Sys`](super::AccelError::Sys) if `KVM_GET_VCPU_EVENTS` fails.
+fn events_to_kvm(shadowed: bool, vcpu: &Vcpu) -> AccelResult<KvmVcpuEvents> {
+    let mut out = vcpu.events()?;
+    overlay_events(shadowed, &mut out);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // the local APIC's task priority, which is what CR8 is
 // ---------------------------------------------------------------------------
 
@@ -795,6 +916,11 @@ pub fn load_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
     vcpu.set_msrs(msrs_to_kvm(&sys))?;
     vcpu.set_debugregs(&dregs_to_kvm(&sys))?;
     vcpu.set_fpu(&fpu_to_kvm(&cpu.x87(), &cpu.sse()))?;
+    // Last, and it is a read-modify-write rather than a write: see
+    // [`overlay_events`]. Without it a guest resumed between a `STI` and the
+    // instruction after it takes an interrupt one instruction early, on the
+    // half-loaded `SS:SP` the shadow exists to protect.
+    vcpu.set_events(&events_to_kvm(cpu.interrupt_shadow(), vcpu)?)?;
     Ok(())
 }
 
@@ -838,6 +964,7 @@ pub fn store_from_vcpu(vcpu: &Vcpu, cpu: &X86) -> AccelResult<()> {
     let msrs = vcpu.msrs(READ_MSRS)?;
     let dregs = vcpu.debugregs()?;
     let fpu = vcpu.fpu()?;
+    let events = vcpu.events()?;
     // Registers first, system state second, and the order is load-bearing:
     // [`X86::set_regs`] recomputes the segment caches from the selectors when
     // the core is in real mode, which is right for a debugger writing `CS` and
@@ -853,6 +980,7 @@ pub fn store_from_vcpu(vcpu: &Vcpu, cpu: &X86) -> AccelResult<()> {
     let (x87, sse) = fpu_from_kvm(&fpu, &cpu.x87());
     cpu.set_x87(x87);
     cpu.set_sse(sse);
+    events_from_kvm(&events, cpu);
     // The counter, unconditionally and in this direction only. What the
     // hypervisor reports for `IA32_TSC` is what a `RDTSC` in the guest would
     // have returned, and `X86::cycles` is where this core's `RDTSC` reads
@@ -932,6 +1060,12 @@ pub fn differs(vcpu: &Vcpu, cpu: &X86) -> AccelResult<Option<&'static str>> {
     if comparable(vcpu.fpu()?) != comparable(fpu_to_kvm(&cpu.x87(), &cpu.sse())) {
         return Ok(Some("the floating-point state"));
     }
+    // Only the shadow, because it is the only member of `kvm_vcpu_events` the
+    // interpreter has anywhere to put. The others are compared against nothing
+    // rather than against zero — see the module documentation's honest list.
+    if vcpu.events()?.interrupt_shadow() != cpu.interrupt_shadow() {
+        return Ok(Some("the interrupt shadow"));
+    }
     Ok(None)
 }
 
@@ -964,6 +1098,17 @@ pub struct ArchState {
     pub dregs: KvmDebugregs,
     /// The x87 and SSE files.
     pub fpu: KvmFpu,
+    /// The interruptibility state: the interrupt shadow, and — for a value
+    /// that came out of a vCPU and is going back into one — the pending
+    /// exception, the pending and blocked `NMI` and the system-management
+    /// state as well.
+    ///
+    /// **Only the shadow survives a trip through the interpreter**, because
+    /// only the shadow has a field there. A caller moving state from one vCPU
+    /// to another through an `ArchState` carries all of it; a caller going via
+    /// [`into_interpreter`](ArchState::into_interpreter) does not, and the
+    /// module documentation says what that costs.
+    pub events: KvmVcpuEvents,
     /// `IA32_TSC`: the value a `RDTSC` in the guest would return at the instant
     /// this state was taken.
     ///
@@ -997,6 +1142,7 @@ impl ArchState {
             msrs: carried_of(&msrs),
             dregs: vcpu.debugregs()?,
             fpu: vcpu.fpu()?,
+            events: vcpu.events()?,
             tsc: msrs[TSC_AT],
         })
     }
@@ -1018,6 +1164,23 @@ impl ArchState {
             msrs: msrs_to_kvm(&sys).map(|(_, data)| data),
             dregs: dregs_to_kvm(&sys),
             fpu: fpu_to_kvm(&cpu.x87(), &cpu.sse()),
+            // Synthesised rather than read, because the interpreter has one
+            // boolean where the structure has four members. The valid flag is
+            // set so that the shadow travels; every other member is zero and
+            // [`into_vcpu`](ArchState::into_vcpu) leaves the destination's
+            // alone rather than writing these.
+            events: KvmVcpuEvents {
+                flags: events::VCPUEVENT_VALID_SHADOW,
+                interrupt: crate::accel::kvm::KvmEventInterrupt {
+                    shadow: if cpu.interrupt_shadow() {
+                        SHADOW_INTO_HARDWARE
+                    } else {
+                        0
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             tsc: cpu.cycles(),
         }
     }
@@ -1069,6 +1232,7 @@ impl ArchState {
         vcpu.set_msrs(values)?;
         vcpu.set_debugregs(&self.dregs)?;
         vcpu.set_fpu(&self.fpu)?;
+        vcpu.set_events(&events_to_kvm(self.events.interrupt_shadow(), vcpu)?)?;
         // The counter last, and unlike [`load_into_vcpu`] this **does** write
         // it: an `ArchState` is a state held outside both engines, so putting
         // one into a vCPU is a restore by definition rather than the resumption
@@ -1090,6 +1254,7 @@ impl ArchState {
         let (x87, sse) = fpu_from_kvm(&self.fpu, &cpu.x87());
         cpu.set_x87(x87);
         cpu.set_sse(sse);
+        events_from_kvm(&self.events, cpu);
         cpu.set_cycles(self.tsc);
     }
 }
@@ -1551,6 +1716,58 @@ mod tests {
         tpr_through_space(&space, 0xfee0_0000, 0x0b).expect("write TPR");
         assert_eq!(*apic.tpr.lock(), 0xb0, "CR8 is the top nibble of the TPR");
         assert_eq!(tpr_from_space(&space, 0xfee0_0000).expect("read TPR"), 0x0b);
+    }
+
+    #[test]
+    fn an_overlay_of_the_events_keeps_what_the_kernel_owns() {
+        // The shape of the bug this guards: a wholesale write would replace
+        // the pending exception and the blocked `NMI` with zeros, because the
+        // interpreter has no field for either. What the flags field says is
+        // *take these members from me*, so the three the kernel keeps live are
+        // expressed by clearing their bits rather than by copying values.
+        let mut ev = KvmVcpuEvents {
+            flags: events::VCPUEVENT_VALID_SHADOW
+                | events::VCPUEVENT_VALID_NMI_PENDING
+                | events::VCPUEVENT_VALID_SMM
+                | events::VCPUEVENT_VALID_PAYLOAD,
+            ..Default::default()
+        };
+        ev.nmi.pending = 1;
+        ev.nmi.masked = 1;
+        ev.exception.injected = 1;
+        ev.exception.nr = 14;
+        ev.smi.smm = 1;
+
+        overlay_events(true, &mut ev);
+        assert_eq!(ev.interrupt.shadow, SHADOW_INTO_HARDWARE);
+        assert!(ev.shadow_valid(), "the shadow is what this transfer is for");
+        assert_eq!(
+            ev.flags & events::VCPUEVENT_VALID_NMI_PENDING,
+            0,
+            "an emulated core has no pending-NMI field, so the kernel keeps its own"
+        );
+        assert_eq!(ev.flags & events::VCPUEVENT_VALID_SMM, 0);
+        assert_ne!(
+            ev.flags & events::VCPUEVENT_VALID_PAYLOAD,
+            0,
+            "the payload flag came from the kernel and goes back to it"
+        );
+        assert_eq!(ev.nmi.masked, 1, "and the values themselves are untouched");
+        assert_eq!(ev.exception.nr, 14);
+
+        overlay_events(false, &mut ev);
+        assert_eq!(ev.interrupt.shadow, 0);
+    }
+
+    #[test]
+    fn a_host_that_does_not_report_the_shadow_is_not_told_one() {
+        // No `KVM_CAP_INTR_SHADOW` means the kernel leaves the valid bit clear
+        // on the way out, and writing the field back would be writing a byte
+        // it has said it does not read.
+        let mut ev = KvmVcpuEvents::default();
+        overlay_events(true, &mut ev);
+        assert_eq!(ev.interrupt.shadow, 0);
+        assert!(!ev.interrupt_shadow());
     }
 
     #[test]
