@@ -445,6 +445,18 @@ mod tests {
                 generated.lines().nth(at).unwrap_or(""),
                 COMMITTED.lines().nth(at).unwrap_or("")
             ),
+            // Equal line counts with no differing line means the bytes differ
+            // where `str::lines` cannot see: a `\r`. Say so, because the
+            // obvious reading of "a prefix of the other" sends the reader
+            // looking for a truncated file. `.gitattributes` pins this file to
+            // LF so a Windows checkout cannot reintroduce it.
+            None if generated.lines().count() == COMMITTED.lines().count() => format!(
+                "the same {} lines but different bytes — almost certainly line endings; \
+                 generated has {} CR, committed has {}",
+                generated.lines().count(),
+                generated.matches('\r').count(),
+                COMMITTED.matches('\r').count()
+            ),
             None => format!(
                 "one file is a prefix of the other: {} generated lines, {} committed",
                 generated.lines().count(),

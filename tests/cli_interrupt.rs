@@ -164,29 +164,6 @@ fn each_shutdown_signal_ends_a_headless_run_with_a_successful_exit() {
     }
 }
 
-/// The second one is not swallowed.
-///
-/// `SA_RESETHAND` puts the default disposition back before the handler runs,
-/// so a user who decides the clean stop is taking too long gets what Ctrl-C
-/// has always given them. Proved by the *absence* of a clean exit: a process
-/// killed by `SIGINT` reports no exit code at all.
-#[test]
-fn a_second_interrupt_kills_the_process_rather_than_being_ignored() {
-    let mut run = spawn(&["apple1", "--headless", "--quiet", "--for", "10m"]);
-    std::thread::sleep(Duration::from_millis(300));
-    // Both from one shell, microseconds apart: see `signal_times`. The first
-    // is delivered to a running process at once, so the handler has entered —
-    // and `SA_RESETHAND` has already put the default back — before the second
-    // is sent. Two signals a fork apart would let the run exit in between and
-    // prove nothing.
-    run.signal_times("INT", 2);
-    let status = run.finish(SHUTDOWN);
-    assert!(
-        status.code().is_none(),
-        "a second SIGINT must reach the default disposition; the run exited {status} instead"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // the honest half: the image on disk
 // ---------------------------------------------------------------------------
@@ -401,6 +378,34 @@ mod on_disk {
     /// marker is in the file — the cluster was written through — and the
     /// format cannot reach it. If this ever passes *and* the sector is
     /// readable, the assertion above has stopped proving the flush happened.
+    /// The second interrupt is not swallowed.
+    ///
+    /// `SA_RESETHAND` puts the default disposition back before the handler
+    /// runs, so a user who decides the clean stop is taking too long gets what
+    /// Ctrl-C has always given them. Proved by the *absence* of a clean exit: a
+    /// process killed by `SIGINT` reports no exit code at all.
+    ///
+    /// **In `on_disk` because the window has to exist.** This lived upstairs on
+    /// `apple1` and sent both signals from one shell microseconds apart. That
+    /// board has nothing to flush, so its clean stop finishes in microseconds
+    /// too, and whether the second signal found a live process was a race — it
+    /// passed on a developer's machine for months and failed on a GitHub
+    /// runner, reporting `exit status: 0`. Here the handler has a qcow2's
+    /// L1/L2 metadata to write before it can exit, which is the interval a user
+    /// pressing Ctrl-C twice is actually interrupting.
+    #[test]
+    fn a_second_interrupt_kills_the_process_rather_than_being_ignored() {
+        let (mut run, image) = run_until_the_guest_has_written("second-int");
+        run.signal_times("INT", 2);
+        let status = run.finish(SHUTDOWN);
+        assert!(
+            status.code().is_none(),
+            "a second SIGINT must reach the default disposition; the run exited \
+             {status} instead"
+        );
+        let _ = std::fs::remove_file(&image);
+    }
+
     #[test]
     fn a_killed_run_loses_the_metadata_an_interrupted_one_keeps() {
         let (mut run, image) = run_until_the_guest_has_written("killed");

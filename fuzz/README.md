@@ -291,7 +291,45 @@ Then, in order:
 1. **Decide whose bug it is.** A panic inside `rsemu` is a finding. A panic
    inside a `fuzz_targets/` frame is a harness bug — the input decoder running
    off the end of a short input is the classic one — and fixing the harness is
-   not fixing the crash.
+   not fixing the crash. A panic inside a **dependency** is the third case, and
+   it is the awkward one: rsemu cannot fix it, and the nightly job stays red
+   until upstream does. Write it down here rather than rediscovering it, and
+   say what a fix needs.
+
+### Known upstream crashes
+
+**`blk_image`, `fstool`'s qcow2 writer — open, as of `fstool` 0.4.27.**
+
+```
+thread '<unnamed>' panicked at fstool-0.4.26/src/block/qcow2/mod.rs:952:36:
+index out of bounds: the len is 0 but the index is 0
+```
+
+`Qcow2::ensure_mapping` opens with
+
+```rust
+let (l1_idx, l2_idx, _) = self.l1l2.split_addr(vaddr);
+let l1_entry = self.l1l2.l1[l1_idx];
+```
+
+and indexes the L1 table without checking its length. A header whose
+`l1_size` is zero — which the mutator reaches in a couple of thousand
+executions from the seed corpus — leaves `l1` empty, and the first write to
+any virtual offset panics on `l1[0]`.
+
+A fix is upstream and small: `split_addr` already has the arithmetic, so
+`ensure_mapping` wants a bounds check returning the crate's own
+"image is malformed" error rather than indexing. **0.4.27 has the same
+unguarded line**, so bumping does not help; this entry names the version it
+was last checked against and should be re-checked on the next bump.
+
+What rsemu can do about it in the meantime is nothing honest. `dev::blk`
+hands guest-supplied image bytes to `fstool` by design, `MemResult` has no
+variant for "the parser aborted", and `catch_unwind` is not available on every
+target this crate builds for (`panic = "abort"` on wasm). The nightly `Fuzz`
+workflow is therefore expected to be red on `blk_image` until this is fixed
+upstream — which is exactly why it is written here, so that a *second*,
+unrelated crash in the same target is still visible as news.
 2. **Turn it into a unit test** in the module that owns the code, beside the
    rest of its tests (`CLAUDE.md`, Testing). The fuzz corpus is not a
    regression suite; a `#[test]` is.

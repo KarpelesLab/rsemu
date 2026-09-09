@@ -335,16 +335,28 @@ stage_crosshost() {
   # `wasm32-wasip1` has no `std::thread`, so libtest's default of a thread per
   # test aborts before the first one runs.
   export CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings=ExperimentalWarning $(pwd)/scripts/wasi-run.mjs"
+  # wasm-ld defaults the shadow stack to 1 MiB, and
+  # `machine::catalog::tests::every_shipped_machine_realizes` builds every board
+  # in the catalog in one call tree, which has been growing. On this host that
+  # fits; on GitHub's runner under node 22 it did not, and a wasm stack that
+  # runs off its end there took *node itself* down with SIGSEGV rather than
+  # trapping cleanly — so the failure named the runtime and not the depth.
+  # Four MiB is linear-memory address space, not committed pages, and the
+  # module's memory grows on demand either way. Verified as the axis rather
+  # than assumed: at 128 KiB this leg fails here too.
+  local wasm_rustflags="$RUSTFLAGS -C link-arg=-zstack-size=4194304"
   run "crosshost replay ($w)" \
+    env RUSTFLAGS="$wasm_rustflags" \
     cargo test --target "$w" --no-default-features \
     --features "$CROSSHOST_FEATURES" --test record_replay -- --test-threads=1
   run "crosshost unit tests ($w)" \
+    env RUSTFLAGS="$wasm_rustflags" \
     cargo test --target "$w" --no-default-features \
     --features "$CROSSHOST_FEATURES" --lib -- --test-threads=1 \
     core::state:: machine::
   rm -rf "$out/wasm"
   run "crosshost snapshot written by $w" \
-    env RSEMU_SNAPSHOT_WRITE_DIR="$out/wasm" \
+    env RSEMU_SNAPSHOT_WRITE_DIR="$out/wasm" RUSTFLAGS="$wasm_rustflags" \
     cargo test --target "$w" --no-default-features \
     --features "$CROSSHOST_FEATURES" --test crosshost_snapshot -- --test-threads=1
   unset CARGO_TARGET_WASM32_WASIP1_RUNNER

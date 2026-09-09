@@ -1,0 +1,30 @@
+# Line endings are part of the source, not of the checkout.
+#
+# Several things in this tree read a repository file with `include_str!` and
+# then match against `\n`-terminated literals: `src/ffi/header.rs` compares
+# `include/rsemu.h` byte-for-byte against what `src/ffi/abi.rs` generates, and
+# `fw::pcbios::tests::add_second_processor` rewrites `machines/pc-at.machine`
+# by searching for whole object blocks. A checkout that converted those files
+# to CRLF broke all three on `windows-latest` while passing everywhere else,
+# and the header test's own message — "one file is a prefix of the other, 533
+# generated lines, 533 committed" — pointed away from the cause, because
+# `str::lines` strips the `\r` that the byte comparison had just tripped on.
+#
+# So: LF in the working tree on every platform. `text=auto` still detects
+# binary content and leaves it alone; the explicit rules below say so for the
+# fixtures where a heuristic should not be the argument.
+* text=auto eol=lf
+
+# Binary fixtures, named rather than detected.
+*.png   binary
+*.bin   binary
+*.rom   binary
+*.nes   binary
+*.gb    binary
+*.img   binary
+*.fd    binary
+*.qcow2 binary
+*.wasm  binary
+*.tar   binary
+*.gz    binary
+*.xz    binary
