@@ -3675,7 +3675,6 @@ mod tests {
             // removes the dead flag arithmetic, and the store guard adds a
             // load, a compare and a branch *inside* the block. A backend has to
             // be right about all four combinations.
-            let mut alive = 0usize;
             let mut empty = alloc::vec::Vec::new();
             for flags in [lift::Flags::Eager, lift::Flags::Elide] {
                 for smc in [lift::Smc::EndBlock, lift::Smc::Guard] {
@@ -3683,26 +3682,38 @@ mod tests {
                     case.flags = flags;
                     case.smc = smc;
                     let run = agreed(&case, 12);
-                    if run.compiled > 0 {
-                        alive += 1;
-                    } else {
+                    if run.compiled == 0 {
                         empty.push(alloc::format!("{flags:?}/{smc:?}"));
                     }
                 }
             }
             // `agreed` has already panicked on any divergence, so what is left
-            // to assert is that the four combinations were *reached*. On
-            // `jit::x86` all four compile; on a backend with a refusal set one
-            // seeded program can land entirely inside it, which is a coverage
-            // fact and not a disagreement — so require every pair there and at
-            // least one anywhere, naming the ones that compiled nothing either
-            // way.
+            // is coverage — and coverage is not this test's to assert on every
+            // backend.
+            //
+            // On `jit::x86` all four pairs compile, and a pair that stopped
+            // compiling would be news, so require them. Elsewhere the sample is
+            // one seeded eight-instruction program: on `jit::arm64` all four
+            // pairs of it land inside the refusal set (`POPCOUNT`, `MULU2`, the
+            // divides, the atomics, `call_helper`, floats), which is a fact
+            // about eight instructions and not about the backend. Demanding
+            // even one compile here was a guess, and it was wrong — the aarch64
+            // job said so.
+            //
+            // Liveness is `a_generated_corpus_agrees_when_it_is_compiled`'s to
+            // assert, where 400 cases make "the backend compiled nothing at
+            // all" mean something. Here the pairs that compiled nothing are
+            // reported and nothing more.
             #[cfg(all(feature = "jit-x86", target_arch = "x86_64"))]
             assert!(empty.is_empty(), "compiled nothing: {empty:?}");
-            assert!(
-                alive > 0,
-                "no policy pair compiled anything; the backend is not reached at all"
-            );
+            #[cfg(not(all(feature = "jit-x86", target_arch = "x86_64")))]
+            if empty.len() == 4 {
+                std::eprintln!(
+                    "note: this backend compiled none of the four policy pairs \
+                     for one 8-instruction program ({empty:?}); the corpus test \
+                     is what gates liveness"
+                );
+            }
         }
     }
 
