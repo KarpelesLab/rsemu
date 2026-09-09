@@ -48,6 +48,13 @@ pub mod signal;
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod terminal;
 
+// Not feature-gated, unlike everything else optional in this tree. The module
+// is what *answers* "can this build trace?", and a facility that disappears
+// when it is off cannot say no — the command line would have to answer "unknown
+// option" to `--trace`, which is the wrong sentence. The `trace` feature gates
+// what the counters cost, not whether the question can be asked.
+pub mod trace;
+
 #[cfg(feature = "gdb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "gdb")))]
 pub mod gdb;

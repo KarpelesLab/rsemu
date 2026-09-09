@@ -133,6 +133,31 @@ RUN OPTIONS:
                         in, and leaving it to fill would hold a 16550's THRE
                         clear at 64 KiB and stall the guest. The summary says
                         how many bytes went that way
+    --trace <what>[=<file>]
+                        Write a table of counters describing what the run did
+                        to <file>, or to stdout when no file is given. <what>
+                        is a channel: `sched` (how many scheduler rounds, how
+                        long each was, what came due in them), `cpu` (per
+                        processor: blocks entered, how many by following a
+                        patched exit, translations made and thrown away, guest
+                        instructions retired inside a block against interpreted
+                        one at a time), `clock` (per-clock-domain tick totals),
+                        or `all`. Repeat it to send channels to different
+                        files; channels naming the same destination share one
+                        table.
+                        The output is two whitespace-separated columns, sorted
+                        by name, under a `#` header — a person reads it as a
+                        table and a script pulls a row out of it with one awk
+                        pattern on the first field. It contains no
+                        wall clock and no timestamp, deliberately: the trace of
+                        a deterministic run is itself deterministic, so `diff`
+                        between two of them is a real answer. Host time is
+                        callgrind's business; this says what the *guest* did.
+                        Tracing never changes what the guest does or when --
+                        the state hash is identical with it on and off, which
+                        `tests/cli_trace.rs` asserts. Needs a build with the
+                        `trace` feature; without it the flag is refused rather
+                        than ignored
     --screenshot <file> Write the machine's display to a PNG when the run ends,
                         however the run was driven -- headless, with a console
                         attached, under a debugger, or serving VNC. Needs a
@@ -334,6 +359,15 @@ struct RunArgs {
     /// (`--record-input`); a flag that also carried a duration or a stop
     /// condition would be a second way to say something the CLI already says.
     capture: Vec<(String, Option<String>)>,
+    /// `--trace <what>[=<file>]`: counter channels and where each one's table
+    /// goes, in the order they were given.
+    ///
+    /// Spelled the same way `--capture` is, and for the same reason: both are
+    /// "this named thing, to this destination", and a second vocabulary for the
+    /// same shape is a second thing to remember. Unresolved here — the channel
+    /// names are checked by [`Traces::open`] before the machine runs, along
+    /// with whether this build can trace at all.
+    trace: Vec<(String, Option<String>)>,
     /// Where to write a PNG of the display when the run ends, if `--screenshot`
     /// was given.
     screenshot: Option<String>,
@@ -517,6 +551,25 @@ fn run(args: &[String]) -> ExitCode {
         return fail(&e);
     }
 
+    // `--trace`, resolved before anything is built so that a misspelt channel
+    // or a build with the counters compiled out is a refusal now. The
+    // per-processor channel needs its own interception — a core keeps its
+    // statistics inside itself and there is no route from a `dyn Device` to a
+    // concrete one — so that goes in here, alongside the display capture and
+    // for exactly the same reason.
+    let traces = match Traces::open(&parsed) {
+        Ok(traces) => traces,
+        Err(e) => {
+            eprintln!("rsemu: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if traces.wants_cpu()
+        && let Err(e) = rsemu::host::trace::install(&mut options)
+    {
+        return fail(&e);
+    }
+
     // `--drive` images open here: before the build, so a drive finds its medium
     // waiting under the media slot the machine file names, and so a path that
     // does not exist fails before anything is realized.
@@ -652,6 +705,17 @@ fn run(args: &[String]) -> ExitCode {
         }
     };
 
+    // Counting starts *here*: after the build, after the reset a build performs,
+    // and before any loop below advances virtual time. A round the machine's own
+    // construction ran is not something the run did, and a trace that included
+    // it would answer a slightly different question every time a device's reset
+    // changed.
+    traces.start();
+    let traced = Traced {
+        traces: &traces,
+        hosts: &options.realize.hosts,
+    };
+
     // A debugger, if one was asked for, owns when the machine advances — so it
     // is checked before the console loop, which would otherwise own that.
     #[cfg(feature = "gdb")]
@@ -671,6 +735,7 @@ fn run(args: &[String]) -> ExitCode {
             scanout.as_deref(),
             audio.as_ref(),
             &mut drains,
+            traced,
             status,
         );
     }
@@ -689,6 +754,14 @@ fn run(args: &[String]) -> ExitCode {
             audio.take(),
             &mut drains,
         );
+        // This branch delivers its own outputs, but a trace is not one of the
+        // session's — it describes the run, and the run happened here like any
+        // other.
+        let status = if traces.finish(&machine, &options.realize.hosts, parsed.quiet) {
+            status
+        } else {
+            ExitCode::FAILURE
+        };
         return finish(&machine, status);
     }
 
@@ -702,6 +775,7 @@ fn run(args: &[String]) -> ExitCode {
             scanout.as_deref(),
             audio.as_ref(),
             &mut drains,
+            traced,
             status,
         );
     }
@@ -715,6 +789,7 @@ fn run(args: &[String]) -> ExitCode {
             scanout.as_deref(),
             audio.as_ref(),
             &mut drains,
+            traced,
             ExitCode::FAILURE,
         );
     }
@@ -725,6 +800,7 @@ fn run(args: &[String]) -> ExitCode {
         scanout.as_deref(),
         audio.as_ref(),
         &mut drains,
+        traced,
         ExitCode::SUCCESS,
     )
 }
@@ -740,6 +816,7 @@ fn deliver(
     scanout: Option<&dyn rsemu::host::display::Scanout>,
     audio: Option<&rsemu::host::audio::AudioStream>,
     drains: &mut Drains,
+    traced: Traced<'_>,
     status: ExitCode,
 ) -> ExitCode {
     // First, because it is the one that has a machine's own tail in it: a
@@ -748,7 +825,8 @@ fn deliver(
     let drew = write_screenshot(args, scanout);
     let played = write_recording(args, audio);
     let logged = write_input_log(args, machine.recorder());
-    let status = if drew && played && logged && captured {
+    let traced_ok = traced.traces.finish(machine, traced.hosts, args.quiet);
+    let status = if drew && played && logged && captured && traced_ok {
         status
     } else {
         ExitCode::FAILURE
@@ -1773,6 +1851,156 @@ impl Drains {
     }
 }
 
+/// What `--trace` asked for, resolved against this build.
+///
+/// The counterpart of [`Drains`] for counters instead of characters, and
+/// resolved at the same moment and for the same reason: a channel this build
+/// does not have, or a file that cannot be written, is a refusal *before* the
+/// machine starts rather than a discovery ten minutes into a firmware boot.
+#[derive(Debug, Default)]
+struct Traces {
+    /// One entry per destination — `None` is stdout — with the channels whose
+    /// rows go into it. Channels sharing a destination share one table, because
+    /// a table is named rows and rows do not collide.
+    outputs: Vec<(Option<String>, Vec<rsemu::core::trace::Channel>)>,
+    /// Every channel named, once each, in the order `Channel::ALL` lists them.
+    channels: Vec<rsemu::core::trace::Channel>,
+}
+
+/// `--trace`'s tables, and the capture table they read the processors out of.
+///
+/// One parameter rather than two, because [`deliver`] already carries every
+/// other output a run owes and a ninth argument is the point at which nobody
+/// reads a signature any more.
+#[derive(Debug, Clone, Copy)]
+struct Traced<'a> {
+    traces: &'a Traces,
+    hosts: &'a rsemu::core::hosts::HostObjects,
+}
+
+impl Traces {
+    /// Resolve `--trace` against the channels this build knows.
+    ///
+    /// # Why the refusals are here and not later
+    ///
+    /// All three of them describe something that cannot be made true by
+    /// running: a channel nobody has heard of, a build with the counters
+    /// compiled out, and an accelerated processor that keeps no translation
+    /// statistics because it is not translating. `--screenshot` on a machine
+    /// with no display took the same decision and for the same reason
+    /// (`check_outputs`): a flag that cannot be honoured is refused, not
+    /// ignored.
+    fn open(args: &RunArgs) -> Result<Traces, String> {
+        use rsemu::core::trace::Channel;
+
+        let mut out = Traces::default();
+        if args.trace.is_empty() {
+            return Ok(out);
+        }
+        if !rsemu::host::trace::available() {
+            return Err(String::from(
+                "--trace: this build has no counters; rebuild with the `trace` feature",
+            ));
+        }
+        for (what, path) in &args.trace {
+            // `all` is a wildcard and means "every channel this run can
+            // report", so a channel the run cannot answer is dropped from it
+            // with a word on stderr. A channel somebody *named* is refused
+            // instead, because that is a flag that cannot be honoured and
+            // `--screenshot` on a machine with no display set the precedent.
+            let wildcard = what == "all";
+            let mut named: Vec<Channel> = if wildcard {
+                Channel::ALL.to_vec()
+            } else {
+                let ch = Channel::from_name(what).ok_or_else(|| {
+                    let known = Channel::ALL
+                        .iter()
+                        .map(|c| format!("`{}` ({})", c.name(), c.summary()))
+                        .collect::<Vec<String>>()
+                        .join(", ");
+                    format!("--trace {what}: this build knows {known}, and `all`")
+                })?;
+                vec![ch]
+            };
+            if args.accel.is_some() && named.contains(&Channel::CPU) {
+                if !wildcard {
+                    return Err(String::from(
+                        "--trace cpu with --accel: an accelerated processor runs on the host's \
+                         own silicon and translates nothing, so it keeps none of these counters; \
+                         trace `sched` or `clock`, or drop --accel",
+                    ));
+                }
+                eprintln!(
+                    "rsemu: --trace all with --accel: leaving out `cpu`, because an accelerated \
+                     processor translates nothing and keeps none of those counters"
+                );
+                named.retain(|ch| *ch != Channel::CPU);
+            }
+            for ch in &named {
+                if !out.channels.contains(ch) {
+                    out.channels.push(*ch);
+                }
+            }
+            match out.outputs.iter_mut().find(|(to, _)| to == path) {
+                Some((_, channels)) => channels.extend(named),
+                None => out.outputs.push((path.clone(), named)),
+            }
+        }
+        // Sorted so the enable order — and therefore nothing at all, since the
+        // counters do not care — is stable, and so `# channels` in the header
+        // reads the same whichever order the flags were typed in.
+        out.channels.sort_unstable();
+        Ok(out)
+    }
+
+    /// Whether the per-processor counters were asked for, which is the only
+    /// channel that needs its constructors intercepted before the build.
+    fn wants_cpu(&self) -> bool {
+        self.channels.contains(&rsemu::core::trace::Channel::CPU)
+    }
+
+    /// Start counting.
+    ///
+    /// Called after the machine is built and before it runs, so that nothing a
+    /// *construction* did — a reset, a ROM load — is counted as something the
+    /// run did.
+    fn start(&self) {
+        rsemu::host::trace::enable(&self.channels);
+    }
+
+    /// Write every table, reporting whether the run should still count as a
+    /// success.
+    ///
+    /// Returns true when nothing was asked for. As with `--screenshot`, a table
+    /// that could not be written is an error rather than a silence.
+    fn finish(
+        &self,
+        machine: &Machine,
+        hosts: &rsemu::core::hosts::HostObjects,
+        quiet: bool,
+    ) -> bool {
+        let mut ok = true;
+        for (path, channels) in &self.outputs {
+            let text = rsemu::host::trace::collect(machine, hosts, channels).render();
+            match path {
+                Some(path) => match std::fs::write(path, text.as_bytes()) {
+                    Ok(()) => {
+                        if !quiet {
+                            println!("trace       {path} ({} bytes)", text.len());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("rsemu: --trace {path}: {e}");
+                        ok = false;
+                    }
+                },
+                None => print!("{text}"),
+            }
+        }
+        ok
+    }
+}
+
 /// `a`, `b` and `c`, or "none".
 fn list(names: &[String]) -> String {
     if names.is_empty() {
@@ -2169,6 +2397,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         #[cfg(feature = "dev-blk")]
         drives: Vec::new(),
         screenshot: None,
+        trace: Vec::new(),
         // 44 100 rather than 48 000: it is what a `.wav` is expected to be, and
         // every player on earth opens one without resampling it again.
         record_audio: None,
@@ -2275,6 +2504,25 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                     ));
                 }
                 out.capture.push((name.to_string(), path));
+            }
+            "--trace" => {
+                let spec = value(arg)?;
+                let (what, path) = match spec.split_once('=') {
+                    Some((what, path)) => (what, Some(path.to_string())),
+                    None => (spec.as_str(), None),
+                };
+                if what.is_empty() {
+                    return Err(format!("--trace wants <what>[=<file>], got `{spec}`"));
+                }
+                // Unlike `--capture`, two channels going to one destination is
+                // not an error and not even unusual: they merge into one table,
+                // because a table is named rows and rows do not collide. What
+                // *is* refused is asking for the same channel twice, which can
+                // only be a mistake — the second would silently win.
+                if out.trace.iter().any(|(had, _)| had == what) {
+                    return Err(format!("--trace {what}: named twice"));
+                }
+                out.trace.push((what.to_string(), path));
             }
             "--screenshot" => out.screenshot = Some(value(arg)?),
             "--record-audio" => out.record_audio = Some(value(arg)?),
