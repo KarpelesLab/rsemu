@@ -256,14 +256,38 @@ load. What is *not* covered is `LDAR`/`STLR` on a64, which still issue an
 ordinary load and store; `core::space::BusLock` carries the argument for the
 shape of the fix.
 
-**Both are reachable only under `ThreadingMode::Parallel`** — opt-in via
-`--threading parallel`, selected by **no machine file**, and not the default:
-`Deterministic` runs every guest on one host thread, where the finest
+**Both are reachable only under `ThreadingMode::Parallel`**, which is not the
+default: `Deterministic` runs every guest on one host thread, where the finest
 interleaving there is is one whole instruction and none of this can be observed.
 That is what makes them documented boundaries rather than live defects, and it
 is the sentence every SMP claim above should be read with. Separately, under
 `--accel kvm` the host's own silicon does the atomic, which is why an
 accelerated SMP boot is not evidence about this tree either way.
+
+**The four boards above really do run their processors at once when asked to.**
+`--threading parallel` is one flag on any of them, and a machine file can now
+declare the mode itself — `threading parallel`, a claim about the hardware
+rather than about the run, which `--threading` still overrides. Debian's arm64
+kernel on `arm64-virt-smp` prints `smp: Brought up 1 node, 2 CPUs` in that mode
+as readily as in the deterministic one, at `0.022746` against `0.022736`, and
+that ten-microsecond difference is exactly the reproducibility being given up.
+It is also *slower* on a two-processor board — 90 s of virtual time costs 187 s
+of wall in `parallel` against 137 s in `deterministic` — because the rendezvous
+costs a dispatch per runnable per round and two runnables do not repay it;
+`ThreadingMode::Parallel`'s own table says where the crossover is.
+
+No board in `machines/` declares the mode, and that is a decision rather than an
+oversight: a state hash is refused outside a deterministic mode, so a shipped
+board that declared `parallel` would take itself out of the regression suite for
+everybody who builds it. `machines/tests/smp-parallel.machine` is the in-tree
+board that does declare it, and `tests/parallel_smp_boards.rs` runs two RV64
+harts through 20 000 atomic increments each with no update lost — beside a
+*plain* counter that loses 7 700–10 800 of 40 000, which is what proves the two
+harts genuinely collided rather than taking turns.
+[`docs/techniques/parallel-execution.md`](docs/techniques/parallel-execution.md)
+is the whole argument: what the mode promises, what a machine file may say, what
+a run with no state hash is checked by instead, and a named list of what still
+does not work.
 
 `docs/platforms/arm64-virt.md` has the ledger, and it is long: PSCI
 `CPU_SUSPEND` is refused rather than implemented (`CPU_ON`, `CPU_OFF` and

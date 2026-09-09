@@ -17,6 +17,19 @@
 # because a processor is not a region and the table generator's survey cannot
 # count them (`src/dev/q35/acpi.rs`).
 #
+# # These two processors take turns unless you ask otherwise
+#
+# There is no `threading` statement below, and that is deliberate. The default
+# mode is `deterministic`: one host thread, round-robin, the two processors
+# alternating whole scheduler rounds. It is what keeps this board in the
+# regression suite, because `Machine::state_hash` is refused outside a
+# deterministic mode. `--threading parallel` runs them at the same instant on
+# host threads of their own, and a copy of this file with `threading parallel`
+# in it does the same with no flag; `docs/techniques/parallel-execution.md` has
+# what that buys, what it gives up, and the atomicity gaps it makes reachable.
+# `--accel kvm` is a different question again — there the host's silicon runs
+# both processors and neither the timing nor the atomics are ours.
+#
 # # What a Linux kernel does with it
 #
 # Measured, `--release`, on a Gentoo 6.6.67 `bzImage` under `--accel kvm`, on

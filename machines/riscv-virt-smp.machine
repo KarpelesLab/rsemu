@@ -15,6 +15,26 @@
 # what the second hart changes.
 #
 # ---------------------------------------------------------------------------
+# 0. These two harts take turns unless you ask otherwise
+# ---------------------------------------------------------------------------
+#
+# There is no `threading` statement below, and that is deliberate. The default
+# mode is `deterministic`: one host thread, round-robin, the two harts
+# alternating whole scheduler rounds. It is what keeps this board in the
+# regression suite, because `Machine::state_hash` is refused outside a
+# deterministic mode and a board that declared `parallel` would take itself out
+# of that suite for everybody who builds it.
+#
+#   rsemu run riscv-virt-smp --threading parallel …
+#
+# runs them at the same instant on host threads of their own, and a copy of
+# this file with `threading parallel` in it does the same with no flag.
+# `machines/tests/smp-parallel.machine` is a two-hart board that does declare
+# it, and `tests/parallel_smp_boards.rs` is what runs it. What the mode buys,
+# what it gives up, and the atomicity gaps it makes reachable are all in
+# `docs/techniques/parallel-execution.md`.
+#
+# ---------------------------------------------------------------------------
 # 1. The CLINT and the PLIC were already per-hart, and that is architectural
 # ---------------------------------------------------------------------------
 #

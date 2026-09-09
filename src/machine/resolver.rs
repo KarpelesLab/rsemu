@@ -102,9 +102,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::core::props::{Duration, Link, Props, Value};
+use crate::core::sched::ThreadingMode;
 use crate::machine::ast::{
     BinOp, Expr, ForStmt, InstanceStmt, MapStmt, Name, NamePart, ObjectDecl, OscDecl, ParamDecl,
-    Path, Property, SpaceDecl, Stmt, TemplateDecl, UnOp, WireStmt,
+    Path, Property, SpaceDecl, Stmt, TemplateDecl, ThreadingStmt, UnOp, WireStmt,
 };
 use crate::machine::diag::Diagnostic;
 use crate::machine::lexer::{NumLit, NumUnit, Radix};
@@ -457,6 +458,30 @@ pub struct Resolved {
     pub wires: Vec<Wire>,
     /// Where the machine's name was written.
     pub name_span: Span,
+    /// The threading mode the board declared with a `threading` statement, if
+    /// it declared one.
+    ///
+    /// # What a board is allowed to say, and what it is not
+    ///
+    /// `ROADMAP.md` §4.2 splits the question in two, and this field is only
+    /// the half that belongs to the hardware. Whether a board's processors are
+    /// **genuinely concurrent** is a fact about the board: an SMP machine's
+    /// cores really do execute at the same instant, and a NES's CPU and PPU
+    /// really do not — one drives the tree and the other is computed from it.
+    /// How many host threads to spend, and whether this particular run wants
+    /// reproducibility more than speed, are facts about the *run*, so
+    /// [`RealizeOptions::threading`](crate::machine::realize::RealizeOptions::threading)
+    /// overrides this and the worker count is not in the grammar at all.
+    ///
+    /// So a file that says `threading parallel` is stating a **default**, not
+    /// a requirement, and `rsemu run … --threading deterministic` still wins.
+    /// No file shipped in `machines/` declares one: the default has to stay
+    /// [`ThreadingMode::Deterministic`] for the regression suite, and a board
+    /// that quietly took itself out of it would be the worst of both.
+    pub threading: Option<ThreadingMode>,
+    /// Where the `threading` statement was written, for a diagnostic that
+    /// wants to point at it.
+    pub threading_span: Option<Span>,
     /// The whole `machine` block.
     pub span: Span,
 }
@@ -1537,6 +1562,8 @@ impl Resolver<'_> {
             maps: Vec::new(),
             wires: Vec::new(),
             name_span: machine.name.span,
+            threading: None,
+            threading_span: None,
             span: machine.span,
         };
 
@@ -1568,6 +1595,7 @@ impl Resolver<'_> {
             match stmt {
                 Stmt::Map(m) => out.maps.push(self.mapping(m, scope)?),
                 Stmt::Wire(w) => out.wires.push(self.wire(w, scope)?),
+                Stmt::Threading(t) => self.threading(t, &mut out)?,
                 _ => {}
             }
         }
@@ -1784,6 +1812,57 @@ impl Resolver<'_> {
             to: self.pin(&stmt.to, scope)?,
             span: stmt.span,
         })
+    }
+
+    /// Resolve one `threading` statement into [`Resolved::threading`].
+    ///
+    /// Two statements that agree are allowed, because a template or a `for`
+    /// body can legitimately produce the same declaration twice; two that
+    /// disagree are refused, because there is no defensible way to pick. The
+    /// diagnostic points at the second one and names both words, which is the
+    /// one thing the reader needs.
+    ///
+    /// `accel` is not a word a board may say. It is not a way of running a
+    /// board, it is a statement that the *host* is executing the guest, and
+    /// `--accel <backend>` is what selects it — a machine file that asked for
+    /// it would slave an interpreted board's clocks to the wall and call that
+    /// acceleration (see `rsemu run --threading`).
+    fn threading(&self, stmt: &ThreadingStmt, out: &mut Resolved) -> Result<(), Diagnostic> {
+        let mode = match stmt.mode.node.as_str() {
+            "deterministic" => ThreadingMode::Deterministic,
+            "parallel" => ThreadingMode::Parallel,
+            "accel" => {
+                return Err(Diagnostic::new(
+                    stmt.mode.span,
+                    "`threading accel` is not a property of a board: it says the host's own \
+                     silicon is executing the guest, which `rsemu run … --accel <backend>` \
+                     selects. A board can only say whether its processors are concurrent",
+                ));
+            }
+            other => {
+                return Err(Diagnostic::new(
+                    stmt.mode.span,
+                    format!(
+                        "`threading {other}` is not a mode; expected `deterministic` or \
+                         `parallel`"
+                    ),
+                ));
+            }
+        };
+        match out.threading {
+            Some(first) if first != mode => Err(Diagnostic::new(
+                stmt.mode.span,
+                format!(
+                    "this machine already declared `threading {first}`, and `threading {mode}` \
+                     here contradicts it"
+                ),
+            )),
+            _ => {
+                out.threading = Some(mode);
+                out.threading_span = Some(stmt.span);
+                Ok(())
+            }
+        }
     }
 
     fn pin(&self, path: &Path, scope: &str) -> Result<Pin, Diagnostic> {

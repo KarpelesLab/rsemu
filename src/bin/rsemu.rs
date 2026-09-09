@@ -94,7 +94,12 @@ RUN OPTIONS:
                         barrier per quantum -- faster on a machine with more
                         than one CPU, and NOT reproducible, so a state hash is
                         refused in it. N is the worker count; without it, one
-                        per runnable, capped at what the host has
+                        per runnable, capped at what the host has.
+                        A machine file can select the mode itself with a
+                        `threading` statement -- a claim about the board's
+                        hardware, not about this run -- and this flag overrides
+                        it. No shipped machine declares one. See
+                        docs/techniques/parallel-execution.md
     --accel <backend>   Run the machine's processors on the host's own silicon
                         instead of interpreting them. `kvm` is the one backend,
                         and it needs a build with `accel-kvm`, Linux, x86-64
@@ -530,7 +535,16 @@ fn run(args: &[String]) -> ExitCode {
     for (key, value) in &parsed.params {
         options = options.with_param(key.clone(), value.clone());
     }
-    options.realize.scheduler.mode = parsed.threading.0;
+    // `--threading` is the *run* speaking, so it goes in the slot that
+    // overrides the board; without the flag the machine file's own `threading`
+    // statement decides, and a file that says nothing gets the default. Setting
+    // `scheduler.mode` unconditionally would make `--accel`'s implied mode and
+    // the default alike silently outrank a board that asked for parallel.
+    if parsed.threading_given || parsed.threading.0 == ThreadingMode::Accel {
+        options.realize.threading = Some(parsed.threading.0);
+    } else {
+        options.realize.scheduler.mode = parsed.threading.0;
+    }
 
     // `--accel`. The backend is opened *before* the build and kept alive past
     // it: `AccelCpus` replaces the binding for `cpu.x86`, so what the machine
@@ -624,7 +638,12 @@ fn run(args: &[String]) -> ExitCode {
     // before the machine exists. Realizing twice to find out is not an option:
     // a `RealizeOptions`'s host objects are deliberately shared between builds,
     // so a second realize would open the same character port twice.
-    if parsed.threading.0 == ThreadingMode::Parallel {
+    //
+    // Asked of the *machine* rather than of the flag, because the machine file
+    // can select the mode now: a board that said `threading parallel` with no
+    // flag on the command line would otherwise get a pool-less scheduler, which
+    // runs every job inline in submission order and is parallel in name only.
+    if machine.threading_mode() == ThreadingMode::Parallel {
         let workers = parsed.threading.1.unwrap_or_else(|| {
             let runnables = machine
                 .devices()

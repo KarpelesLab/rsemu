@@ -265,8 +265,11 @@ something a person can actually run (§2).
 > not the whole of it) — and *ordering*, since every data barrier still retires
 > as a no-op, which is not harmless even when guest and host share an
 > architecture. **Both are reachable only under `ThreadingMode::Parallel`**,
-> which is opt-in and which no machine file selects, so they are documented
-> boundaries rather than live defects. `src/core/space/monitor.rs`,
+> which is opt-in and which no board in `machines/` selects, so they are
+> documented boundaries rather than live defects. A machine file *can* select
+> it — `threading parallel`, a claim about the board's hardware, which
+> `--threading` still overrides — and
+> `docs/techniques/parallel-execution.md` records why no shipped board does. `src/core/space/monitor.rs`,
 > `src/core/space/buslock.rs` and `docs/techniques/memory-models.md` carry the
 > long form, the last with `tests/smp_single_copy_atomicity.rs` and
 > `tests/memory_model_costs.rs` putting numbers on both.

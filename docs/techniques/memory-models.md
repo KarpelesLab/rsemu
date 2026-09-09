@@ -45,6 +45,15 @@ parallel translated execution is the only practical way to gain confidence that
 barrier lowering is right, and it belongs in the SMP-emulation gate alongside the
 atomics stress suite.
 
+The mode those guest programs have to run in, and what a run in it is checked
+by when a state hash is not available, is
+[`parallel-execution.md`](parallel-execution.md). The short version, because it
+decides how a litmus result should be read: a *lost update* is a value no
+interleaving could produce, so it is a gate on any host; a missing *barrier* is
+not, because a host strong enough to hide the reordering hides it before and
+after the fix. Litmus tests gate on a weak host, which is what the AArch64 CI
+leg is for.
+
 ## Implementation notes
 
 - Guest atomic instructions lower to host atomics through the IR's atomic ops
@@ -58,11 +67,12 @@ atomics stress suite.
 ## Where this stands today, measured
 
 Four things are kept and two are not. Everything below is reachable **only**
-under `ThreadingMode::Parallel`, which is opt-in (`--threading parallel`); no
-machine file selects it, `Deterministic` is the default, and `usermode`'s
-`ThreadSet` runs every guest thread on one host thread by design. Under one host
-thread the finest interleaving there is is one whole instruction, so none of it
-can be observed — which is why the tree has got this far without it mattering.
+under `ThreadingMode::Parallel`, which is opt-in (`--threading parallel`, or a
+`threading` statement in a machine file); no board in `machines/` selects it,
+`Deterministic` is the default, and `usermode`'s `ThreadSet` runs every guest
+thread on one host thread by design. Under one host thread the finest
+interleaving there is is one whole instruction, so none of it can be observed —
+which is why the tree has got this far without it mattering.
 
 **Kept.** The load-reserved pair, by `core::space::ExclusiveMonitor`: a store by
 any observer to the reservation granule clears the slot, so a store-conditional
@@ -321,8 +331,8 @@ MMIO operand at all.
 places.** What is bought by leaving it is the store path: 12.7 ns and linear
 scaling. What is paid is that a guest which races a plain store against another
 master's atomic on the same granule can lose that store, under
-`ThreadingMode::Parallel` only — no machine file selects it, `Deterministic`
-round-robins on one host thread where the finest grain is a whole instruction,
+`ThreadingMode::Parallel` only — no board in `machines/` selects it,
+`Deterministic` round-robins on one host thread where the finest grain is a whole instruction,
 and `Accel` never reaches either object because the host's silicon performs the
 guest's read-modify-write. The one exception to the `Deterministic` claim is
 `BusLock`'s: a lazily advanced device is caught up from inside the access that

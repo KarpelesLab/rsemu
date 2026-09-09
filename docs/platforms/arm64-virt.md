@@ -1033,8 +1033,10 @@ architectural claim to begin with.
 ### Which mode, and what it costs
 
 Reachable only under `ThreadingMode::Parallel`, which is opt-in
-(`--threading parallel`) and which no machine file in this tree selects. The
-argument that `Deterministic` is safe is structural rather than statistical:
+(`--threading parallel`) and which no board in `machines/` selects — though a
+machine file now can, with a `threading` statement; see
+[`../techniques/parallel-execution.md`](../techniques/parallel-execution.md).
+The argument that `Deterministic` is safe is structural rather than statistical:
 one host thread cannot interleave inside an instruction, and the test's
 one-instruction-quantum run — finer than any quantum the scheduler hands out —
 loses nothing before any of the fixes or after them. That is why this was worth
