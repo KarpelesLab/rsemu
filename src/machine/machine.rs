@@ -548,6 +548,7 @@ impl Machine {
         let report = self.sched.run_quantum_until(GlobalTime::MAX)?;
         self.sched.sync_lazy_devices()?;
         self.dispatch(&report)?;
+        crate::core::trace::quantum_report(&report);
         Ok(report)
     }
 
@@ -595,6 +596,11 @@ impl Machine {
             // not on the one the previous quantum ended at.
             self.sched.sync_lazy_devices()?;
             self.dispatch(&report)?;
+            // The scheduler channel's only hook (`core::trace`). It returns
+            // before reading the report when nothing is tracing, and is deleted
+            // outright in a build without the `trace` feature, so this loop is
+            // unchanged for everybody who is not asking a question.
+            crate::core::trace::quantum_report(&report);
             if self.sched.now() <= before {
                 // A quantum ends either at its natural boundary or, when the
                 // deadline falls before that, at the deadline itself — and the

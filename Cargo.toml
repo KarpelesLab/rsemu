@@ -106,6 +106,32 @@ gdb = ["std"]
 # a display device to have anything to show.
 vnc = ["std"]
 
+# Tracing and profiling output (src/core/trace.rs, src/host/trace.rs): what a
+# run *did*, as a two-column table of named counters — scheduler rounds and how
+# long each was, per-processor block entries, chaining, translations and
+# retired-versus-interpreted instructions, and per-clock-domain tick totals.
+# `rsemu run <machine> --trace all=run.trace` is the whole surface
+# (ROADMAP.md phase 9, "tracing/profiling output"; docs/testing/tracing.md).
+#
+# It exists because the tree kept needing exactly this and improvising it: the
+# figures `docs/platforms/pc64.md` and `docs/testing/long-run.md` quote — "982
+# 618 of 1 220 450 block entries in a guest second are chained", "99.3% retire
+# inside a translated block" — were read out of a debugger by hand, from
+# counters that already existed and had no way out of the process. This is that
+# way out.
+#
+# **A feature and not always-on, because the gate is compile time.** With it
+# off, every function in `core::trace` has an empty body and the hooks vanish,
+# so the block-entry and store paths carry zero instructions for it; with it on
+# and nothing enabled, a hook is one relaxed load and a not-taken branch. That
+# is the trade CLAUDE.md's "near-free when off" asks for, made explicit rather
+# than hoped for. No `std`: the counter core and the text rendering are
+# `no_std + alloc`, so a wasm embedder gets a trace too; only the part that
+# writes a *file* needs `std`, and that is `host::trace`, already inside
+# `host/`. Adds no dependency — the format is written by hand, in two columns,
+# for the same reason the CLI parses its own arguments.
+trace = []
+
 # Headless capture in `host::display::png`: a scanout surface as a PNG, and a
 # sequence of them as an APNG. Adds `oxideav-png` (and, through it, `compcol`)
 # — the only dependency any feature of this crate pulls. Needs `std`.

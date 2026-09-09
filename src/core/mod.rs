@@ -24,6 +24,7 @@
 //! | `registry` | by-name device construction (§4.4) |
 //! | `state` | versioned snapshots (§4.5) |
 //! | `sync` | the concurrency portability seam (§4.7) |
+//! | [`trace`] | structured tracing and profiling output: counters a run emits |
 //!
 //! Every module listed above now exists, and [`machine`](crate::machine)
 //! assembles them into a running [`Machine`](crate::machine::Machine). The
@@ -44,6 +45,7 @@ pub mod sched;
 pub mod space;
 pub mod state;
 pub mod sync;
+pub mod trace;
 pub mod value;
 pub mod wire;
 

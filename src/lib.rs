@@ -171,6 +171,11 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "wasm") {
         features.push("wasm");
     }
+    // Whether `--trace` can be honoured is a property of the build, and "which
+    // rsemu is this?" is what this function answers.
+    if cfg!(feature = "trace") {
+        features.push("trace");
+    }
     if cfg!(feature = "ffi") {
         features.push("ffi");
     }
