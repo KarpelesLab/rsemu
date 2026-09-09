@@ -395,7 +395,8 @@ fn seed_boundary(mark: &InsnStart, needed: &mut [bool]) {
 /// order by instructions per block and the saving orders with them. A frontend
 /// whose blocks are two instructions long has almost nothing here — and a
 /// frontend whose blocks get *longer* has more, which is why the last column
-/// says what a block was at the time rather than what it is now.
+/// says what a block was at the time rather than what it is now:
+/// `cpu::arm::a64::lift::Smc` has since taken that row's 6.44 to 10.80.
 ///
 /// # Why it is safe, stated as five rules
 ///

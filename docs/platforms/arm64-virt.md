@@ -580,6 +580,142 @@ board exists to run, which is the sort of thing only a profile says.
 is a column rather than a paragraph.
 
 
+### A store no longer ends a block, and that was the largest number in the profile
+
+The first profile of this board under callgrind — twenty guest seconds of the
+boot, `engine = "jit-host"` — found 350 host instructions per guest
+instruction, of which **twenty-five** were the code the JIT generated. Nearly
+everything else was per *block*:
+
+| | share |
+| --- | --- |
+| the dispatch loop (`Cpu::advance`) | 24.3% |
+| replaying deferred charges and boundaries | 19.3% |
+| the address space and the software TLB | 18.4% |
+| admitting a block: the entry fetch, its walk, the interrupt check | 13.7% |
+| reading a guest register | 7.8% |
+| **the code the JIT generated** | **7.7%** |
+
+Every row but the last is divided by the number at the bottom of
+`benches/a64_linux_boot.rs`'s census, and that number was **6.44 guest
+instructions per block** against a frontend limit of 64. A block ended at every
+store, because a store into the page a block was lifted from makes every
+instruction after it a translation of bytes that no longer exist, and the
+invalidation that catches it runs at a block boundary. Stores are 8.9% of this
+guest's instructions, so more than half of all block boundaries were one.
+
+#### Why x86's answer does not transfer, and what does
+
+`cpu::x86::lift` met this first. x86 makes coherent instruction caches
+architectural, so it *must* notice, and it does it with an **in-block guard**:
+after each store, three IR instructions compare the store's address page
+against the block's own and leave through a precise exit when they match. Then
+comes the part that matters here — the IR only has the address the guest
+computed, so the comparison is in **linear** space, two linear pages may alias
+one physical page, and a store through the other mapping walks straight past
+it. `cpu::x86::engine`'s `admit` therefore picks `Smc::Guard` only with paging
+**off** and `Smc::EndBlock` under it. On a paged guest — which is every guest
+worth measuring — x86 still ends a block at every store. The mechanism proposed
+for adoption here is one its author cannot use on the workload that motivated
+it, and copying it would have bought this board nothing at all.
+
+What transfers is the *argument*: the check wants to be a comparison against
+the physical page the block's bytes came from. And on this core there is
+somewhere better than the IR to make it. `engine::Host` sees the
+guest-**physical** address of every store there is — `Exec::wrote` already
+feeds `jit::DirtyPages`, which is what invalidates a *cached* translation, and
+`Admitted::base` is already the physical page the entry translation resolved
+to. `lift::Smc::HostGuard` is that same comparison made one step earlier: when
+a store's physical page is the running block's own, the host retires the run's
+tick allowance and the block leaves at its next guest instruction boundary,
+through the seam `ir::IrHost::spent` opened for the quantum. It is strictly
+stronger than the x86 guard rather than a weaker stand-in:
+
+- **no aliasing hole**, because both ends are physical — and on this
+  architecture that is not hypothetical, since patching kernel text through the
+  linear map while it is mapped executable elsewhere is how arm64 Linux does
+  modules, `ftrace` and jump labels;
+- **no IR at all**, where x86 pays three instructions per store;
+- **one implementation**, because a compiled store reaches
+  `Host::note_writes` through `FastMem::note_fast_store` and every other store
+  through `IrHost::store`.
+
+What it gives up is precision: the exit is per page, so a store to a datum that
+merely shares a page with the code leaves the block too. That is the block
+cache's own granularity, and the census prices it — 6 874 translations killed
+by a block's store in twenty guest seconds against 154 233 958 guest
+instructions retired. It is not a rate.
+
+#### The two things a store was the boundary for and nobody had listed
+
+"A store ends the block" was load-bearing for three things, and only one of them
+is self-modifying code. The other two are the engine's to pay, and both are
+answered in `IrHost::store` — neither can arrive through the backend's inlined
+path, because a memory plan covers plain little-endian RAM over a whole page:
+
+1. **An interrupt the store raised.** A write to the GIC, or to a device that
+   answers by pulling a wire, now happens between two instructions of a lifted
+   block, where `admit` would have seen it at the boundary that no longer
+   exists. `cpu::x86::engine` pays this on the identical argument and said so
+   first.
+2. **A store that remaps the address space.** The backend takes the inlined
+   memory path's host pointers out of the shadow TLB **once per block** and
+   they are valid until the TLB is flushed — and `jit::x86`'s own comment says
+   a flush happens at a block boundary, *never inside one*. A store that
+   retopologises was the only way in, and it was safe only because it ended its
+   block. The host now samples `AddressSpace::generation` at entry and again
+   after each such store.
+
+#### What it bought
+
+`benches/a64_linux_boot.rs`, twenty guest seconds of the boot,
+`engine = "jit-host"`, under callgrind with `--cache-sim=no`. The two columns
+are the same binary built twice with `engine.rs`'s `SMC` constant as the only
+difference, so nothing else moved; the same board under `rsemu run --for 20s`
+ends both runs on the same `Machine::state_hash` (`0x9cc4de4dee51678b`) with
+the same 154 233 958 guest instructions retired, so this is host cost alone:
+
+| | ends the block | the host guard |
+| --- | --- | --- |
+| **host instructions** | 51 758 768 516 | **44 220 119 264** (−14.56%) |
+| blocks executed | 23 935 454 | **14 283 856** (−40.3%) |
+| **guest instructions per block** | **6.44** | **10.80** |
+| distinct blocks lifted | 17 256 | 12 173 |
+| the dispatch loop (`Cpu::advance`) | 12 837 327 816 (24.80%) | 8 223 732 221 (18.60%) |
+| replaying deferred bookkeeping (`flush_thunk`) | 9 890 417 533 (19.11%) | 9 577 607 664 (21.66%) |
+| `admit` | 2 708 590 165 (5.23%) | 1 686 283 235 (3.81%) |
+| the entry translation (`Exec::translate`) | 2 148 445 889 (4.15%) | 1 511 586 330 (3.42%) |
+| reading a guest register (`get_slot_thunk`) | 1 898 506 495 (3.67%) | 1 522 825 771 (3.44%) |
+| the interrupt check (`Exec::pending_interrupt`) | 1 211 777 280 (2.34%) | 806 436 078 (1.82%) |
+| the per-block TLB resync (`jit::Tlb::sync`) | 1 040 195 675 (2.01%) | 634 823 351 (1.44%) |
+| the guard's own row (`Host::note_writes`) | 483 850 939 (0.93%) | 470 049 880 (1.06%) |
+| the inlined store path (`jit::Tlb::note_fast_store`) | 1 100 681 040 | 1 100 631 680 |
+
+Read the last three rows together with the second. The interrupt check went
+**down** even though this change added a call site to it, because there are 40%
+fewer blocks to admit; the inlined store path did not move at all, because the
+guest makes the same stores either way; and the guard's own row is where its
+cost lands — measured against the tree as it stood *before* this change, which
+carries no guard code at all, that row goes from 414 078 569 to 470 049 880, so
+the comparison costs about four host instructions per store and 56 M over the
+run against the 7.5 **G** the policy saves. And `flush_thunk` is where the
+saving stops: `ir::hoist_slot_reads` already found that what a replay costs is
+mostly the events in it, and halving the number of blocks moves events between
+regions rather than removing them, so that row grew as a *share* while shrinking
+by 3.2% in absolute terms.
+
+The same pair measured through `rsemu run … --for 20s --headless`, which also
+hashes a gigabyte of guest RAM at exit and so is a laxer denominator, agrees:
+63 910 138 422 → 56 758 893 297, or 50 158 333 101 → 43 007 087 976 (−14.26%)
+once the reset fill and the final hash — identical in both — are taken out.
+
+`benches/a64_dispatch.rs`'s ladder has a `+guard` column now, so the same claim
+has a runnable baseline beside it rather than a number in a commit message.
+`lift::Smc::EndBlock` stays, and `tests/a64_lift_differential.rs` runs the
+generated corpus through both policies: a policy that got faster by getting
+wrong should fail a test rather than win a column.
+
+
 ## Two processors
 
 [`machines/arm64-virt-smp.machine`](../../machines/arm64-virt-smp.machine) is

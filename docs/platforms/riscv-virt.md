@@ -180,9 +180,10 @@ how many boundaries a read is able to move above, which is bounded by how long
 a block is, and that workload's blocks retire 3.18 guest instructions against
 `pc64`'s 4.79 and `arm64-virt`'s 6.44 — the same ordering as the savings,
 −0.73%, −2.57% and −4.74%. A workload with longer blocks would be worth more
-here, and what bounds them on this core is named in
+here, and the thing that would lengthen them is named in
 [`src/cpu/riscv/lift.rs`](../../src/cpu/riscv/lift.rs): a store still ends
-every block.
+every block on this core, which A64 stopped doing in the same round and gained
+14.6% by.
 
 ### The CLINT can raise `mtip` in the middle of a block
 

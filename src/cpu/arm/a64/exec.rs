@@ -541,6 +541,23 @@ impl<'a> Exec<'a> {
         self.st.sys.timer_levels(self.counter()) & !self.lines.routed_timers() != 0
     }
 
+    /// The address space's topology generation, read live.
+    ///
+    /// One relaxed atomic load. `engine`'s host takes it at block entry and
+    /// again after every store a plan did not cover, because a store that
+    /// remaps retires the host pointers the backend took out of the shadow
+    /// TLB once at that entry — and under `lift::Smc::HostGuard` a store is no
+    /// longer a block boundary, so nothing else would notice before the next
+    /// inlined access used one.
+    ///
+    /// Gated with `mod engine` for the reason [`Exec::timer_edge`] is: the
+    /// interpreter reaches the address space through `AddressSpace::read` and
+    /// `write`, which take the topology guard themselves.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    pub(super) fn topology(&self) -> u64 {
+        self.space.generation()
+    }
+
     /// The cycle count at which this core's timer outputs would next change,
     /// or [`u64::MAX`] when nothing this run can do will change them.
     ///

@@ -28,7 +28,7 @@
 use rsemu::cpu::arm::a64::Config;
 use rsemu::cpu::arm::a64::differential::{Case, Verdict, compare, synthesize};
 use rsemu::cpu::arm::a64::isa::Nzcv;
-use rsemu::cpu::arm::a64::lift::Shape;
+use rsemu::cpu::arm::a64::lift::{Shape, Smc};
 
 /// Knuth's MMIX linear congruential generator.
 ///
@@ -76,6 +76,17 @@ fn sweep(cfg: Config, seed: u64, count: usize, shape: Shape) -> Coverage {
 }
 
 fn sweep_with(cfg: Config, seed: u64, count: usize, shape: Shape, strict: bool) -> Coverage {
+    sweep_policy(cfg, seed, count, shape, Smc::default(), strict)
+}
+
+fn sweep_policy(
+    cfg: Config,
+    seed: u64,
+    count: usize,
+    shape: Shape,
+    smc: Smc,
+    strict: bool,
+) -> Coverage {
     let mut rng = Lcg(seed);
     let mut cover = Coverage::default();
     for n in 0..count {
@@ -88,6 +99,7 @@ fn sweep_with(cfg: Config, seed: u64, count: usize, shape: Shape, strict: bool) 
         let mut case = Case::seeded(program(&mut rng, len))
             .with_config(cfg)
             .with_shape(shape)
+            .with_smc(smc)
             .with_nzcv(nzcv);
         if strict {
             case = case.strict();
@@ -102,7 +114,9 @@ fn sweep_with(cfg: Config, seed: u64, count: usize, shape: Shape, strict: bool) 
                 cover.insns += insns;
             }
             Ok(Verdict::Nothing) => cover.nothing += 1,
-            Err(e) => panic!("case {n} of seed {seed:#x} diverged under {shape:?}:\n{e}"),
+            Err(e) => {
+                panic!("case {n} of seed {seed:#x} diverged under {shape:?}/{smc:?}:\n{e}")
+            }
         }
     }
     cover
@@ -150,6 +164,39 @@ fn every_shape_agrees_with_the_interpreter_over_the_whole_corpus() {
         total_trapped += cover.trapped;
     }
     assert!(total_trapped > 0, "the fault path was never reached");
+}
+
+#[test]
+fn both_store_policies_agree_with_the_interpreter_over_the_whole_corpus() {
+    // The same seed for both, so a divergence names the policy rather than the
+    // case. `Smc::EndBlock` is the control the default is measured against and
+    // it has to stay *correct* as well as slower, or the comparison is
+    // between a policy and a bug.
+    let mut total_trapped = 0usize;
+    let mut by_policy = Vec::new();
+    for smc in [Smc::EndBlock, Smc::HostGuard] {
+        let cover = sweep_policy(
+            Config::cortex_a53(),
+            0x5eed_0021,
+            1000,
+            Shape::Trace,
+            smc,
+            false,
+        );
+        assert!(cover.agreed > 300, "{smc:?}: {cover:?}");
+        total_trapped += cover.trapped;
+        by_policy.push((smc, cover));
+    }
+    assert!(total_trapped > 0, "the fault path was never reached");
+    // And the guard has to be doing something: a store no longer cutting the
+    // block means the same corpus retires strictly more instructions per case.
+    let ended = &by_policy[0].1;
+    let guarded = &by_policy[1].1;
+    assert!(
+        guarded.insns > ended.insns,
+        "the store guard retired no more than the policy it replaced: \
+         {ended:?} against {guarded:?}"
+    );
 }
 
 #[test]

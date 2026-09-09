@@ -264,7 +264,7 @@ use crate::jit::{
 
 use super::exec::{Exec, State, Trap};
 use super::isa::Nzcv;
-use super::lift::{self, Origin, PC, SP, Shape, World};
+use super::lift::{self, Origin, PC, SP, Shape, Smc, World};
 use super::mmu::{Access, Tlb};
 use super::sysreg::sctlr;
 use super::{Config, Lines};
@@ -275,6 +275,28 @@ use super::{Config, Lines};
 /// a loop unrolls into one translation and a guest register stays in a
 /// temporary across the whole of it.
 const SHAPE: Shape = Shape::Trace;
+
+/// What a store does to the block it is in.
+///
+/// [`Smc::HostGuard`], because this core can afford the better of the two
+/// answers: [`Host::note_writes`] already sees the **guest-physical** page of
+/// every store a block makes, compiled or interpreted, on its way into
+/// [`DirtyPages`], and comparing it against [`Admitted::base`] is one
+/// comparison against a field that is already in cache.
+///
+/// [`Smc::EndBlock`] is what this core shipped first, and what it cost is the
+/// number `benches/a64_linux_boot.rs` was written to find: a block ended at
+/// every store, so a real arm64 Linux boot ran **6.44 guest instructions per
+/// block** against a frontend limit of 64, and 56% of the profile was per-block
+/// cost divided by that number.
+///
+/// `cpu::x86::lift` reached the same question first and answered it in the IR,
+/// with a guard that compares *linear* pages — and then had to refuse its own
+/// answer under paging, because two linear pages may alias one physical page.
+/// This is the same idea with the comparison moved to the one place that sees
+/// physical addresses, which is why it holds under translation and x86's does
+/// not. `cpu::arm::a64::lift`'s module docs have the argument in full.
+const SMC: Smc = Smc::HostGuard;
 
 /// How many blocks one [`advance`] may chain before it hands control back.
 ///
@@ -755,7 +777,7 @@ fn admit(cfg: &Config, subset: &mut Subset, exec: &mut Exec<'_>, pc: u64) -> Adm
         origin: key_origin(translating, phys),
         strict_align,
     };
-    let key = lift::key(&world, SHAPE);
+    let key = lift::key(&world, SHAPE, SMC);
 
     // Known unliftable: the interpreter takes this instruction, and reaching
     // it without a dispatcher round trip and a lift that fails at its first
@@ -849,7 +871,7 @@ pub(super) fn advance(
         rejected: None,
     };
 
-    let mut host = Host::new(&mut exec, pc, remaining);
+    let mut host = Host::new(&mut exec, pc, remaining, front.at.base);
     if front.at.leave {
         // The entry translation walked, and the walk raised the interrupt.
         // One instruction retires and the run hands the boundary back, which
@@ -1114,6 +1136,13 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         if core::mem::take(&mut self.admitted) {
             return Ok(Entry::Ready);
         }
+        // Whatever this boundary resolves to, the block that runs after it is
+        // a different block on a different page, so the code page the store
+        // guard compares against is replaced rather than kept. Set before
+        // `admit` can decline, because a declined boundary interprets and an
+        // interpreted store is drained by `drain` rather than by this host.
+        host.code_page = u64::MAX;
+        host.topology = host.exec.topology();
         // Registers live in the host's slots between the blocks of a chain and
         // are written back only when the run ends. Nothing `admit` reads is one
         // of them — it reads the system registers, the core's TLB and the tick
@@ -1121,6 +1150,7 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         // `advance` would have seen.
         let entry = match admit(self.cfg, self.subset, host.exec, pc) {
             Admit::Ready(at) => {
+                host.code_page = at.base;
                 if at.leave {
                     // The same window as the prologue's, at a chained
                     // boundary: `Dispatcher::run` asked [`IrHost::spent`]
@@ -1233,7 +1263,7 @@ impl Lifter<'_> {
             }
             space.read(phys, Width::U32, attrs).ok().map(|v| v as u32)
         };
-        let out = lift::lift(&self.at.world, pc, &mut src, lift::MAX_INSNS, SHAPE);
+        let out = lift::lift(&self.at.world, pc, &mut src, lift::MAX_INSNS, SHAPE, SMC);
         self.refused = refused;
         out
     }
@@ -1279,6 +1309,27 @@ struct Host<'a, 'e> {
     /// `(pc, next_pc)`.
     mark: Option<(u64, u64)>,
     dirty: DirtyPages,
+    /// The guest-**physical** page the running block's instructions came from,
+    /// replaced at every block boundary by [`Frontend::enter`].
+    ///
+    /// The whole of [`Smc::HostGuard`] on this side: [`Host::note_writes`]
+    /// compares every store's physical page against it, and a match retires
+    /// the allowance so the block leaves at the boundary the store's own
+    /// instruction ends at — which is exactly where `Smc::EndBlock` used to
+    /// put a block boundary, reached only when a store really did land in the
+    /// code.
+    code_page: u64,
+    /// The address space's topology generation as of this block's entry.
+    ///
+    /// A backend takes the inlined memory path's host pointers out of the
+    /// shadow TLB **once per block** and they are valid until the TLB is
+    /// flushed, which used to be impossible inside a block because a store
+    /// ended one. A store to a device that remaps is the way in, so
+    /// [`IrHost::store`] compares this against the live generation and leaves
+    /// the block when it moved. Nothing else can move it: a `TLBI` and every
+    /// write to `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1` and `SCTLR_EL1` are
+    /// outside the lifted subset, and an inlined store reaches plain RAM only.
+    topology: u64,
 }
 
 impl<'a, 'e> Host<'a, 'e> {
@@ -1304,7 +1355,7 @@ impl<'a, 'e> Host<'a, 'e> {
         self.allowance = 0;
     }
 
-    fn new(exec: &'a mut Exec<'e>, pc: u64, allowance: u64) -> Host<'a, 'e> {
+    fn new(exec: &'a mut Exec<'e>, pc: u64, allowance: u64, code_page: u64) -> Host<'a, 'e> {
         let mut slots = [0u64; lift::SLOT_COUNT as usize];
         slots[..31].copy_from_slice(&exec.st.x);
         slots[SP.0 as usize] = exec.st.sys.sp();
@@ -1316,12 +1367,14 @@ impl<'a, 'e> Host<'a, 'e> {
         slots[PC.0 as usize] = pc;
         Host {
             timer_edge: exec.timer_edge(),
+            topology: exec.topology(),
             exec,
             allowance,
             slots,
             trap: None,
             mark: None,
             dirty: DirtyPages::new(),
+            code_page,
         }
     }
 
@@ -1331,14 +1384,41 @@ impl<'a, 'e> Host<'a, 'e> {
         BusError::BadAccess
     }
 
-    /// Move whatever the last access wrote into the dirty log.
+    /// Move whatever the last access wrote into the dirty log, and leave the
+    /// block if any of it landed in the block's own code.
     ///
     /// Whatever landed, landed: a split store that faulted on its second page
     /// still wrote the first, and a translation of those bytes is stale either
     /// way.
+    ///
+    /// The one place [`Smc::HostGuard`] is implemented, and the reason it is
+    /// one place: an inlined store reaches it through
+    /// [`FastMem::note_fast_store`] and every other store through
+    /// [`IrHost::store`], so the compiled path and the interpreted one cannot
+    /// disagree about what a store into the code page does. Measured over
+    /// twenty guest seconds of an arm64 Linux boot, the comparison cost
+    /// **55 971 311 host instructions** — 414 078 569 to 470 049 880 for this
+    /// function — against 7.15 **G** the policy saved.
     fn note_writes(&mut self) {
         for i in 0..self.exec.wrote_n as usize {
-            self.dirty.note(self.exec.wrote[i], 1);
+            let phys = self.exec.wrote[i];
+            self.dirty.note(phys, 1);
+            // [`Smc::HostGuard`], and the whole of it. A store into the page
+            // this block's own instructions came from means every instruction
+            // after it is a translation of bytes that no longer exist, so the
+            // block leaves at its next guest instruction boundary — where
+            // `Dispatcher::run` drains the log above into the block cache and
+            // the next pass lifts the bytes the store left.
+            //
+            // Physical at both ends: `Exec::wrote` records the address the bus
+            // transaction reached and `Admitted::base` is what the entry
+            // translation resolved to, so a store through a second mapping of
+            // the code page is caught. That is the case `cpu::x86::lift`'s
+            // linear guard cannot see, and it is why this core does not need
+            // to fall back to `Smc::EndBlock` under translation.
+            if phys & !PAGE_MASK == self.code_page {
+                self.hand_back();
+            }
         }
         self.exec.wrote_n = 0;
     }
@@ -1360,9 +1440,39 @@ impl IrHost for Host<'_, '_> {
         }
     }
 
+    /// Perform a store, and answer the two questions a store used to answer
+    /// by ending the block.
+    ///
+    /// Both are asked here rather than at every guest instruction boundary
+    /// because this is where the answer can change, and [`Host::hand_back`]
+    /// carries it to the boundary for free. Neither can arrive through
+    /// [`FastMem::note_fast_store`]: a plan covers plain little-endian RAM
+    /// over a whole page, so an inlined store reaches no device and remaps
+    /// nothing.
+    ///
+    /// * **An interrupt this store raised.** A write to the GIC, or to a
+    ///   device that answers by pulling a wire, brings a line up between two
+    ///   instructions of a lifted block — where `Exec::step` would take it at
+    ///   the next one. [`admit`] cannot see it, because it runs at a block
+    ///   boundary and under [`Smc::HostGuard`] there no longer is one after a
+    ///   store. `cpu::x86::engine` pays this on exactly the same argument, and
+    ///   said so first.
+    /// * **A store that remapped the address space**, which retires the host
+    ///   pointers the backend took out of the shadow TLB at block entry. See
+    ///   [`Host::topology`].
+    ///
+    /// The cost is only on the path a plan does not cover — a device access, a
+    /// misaligned store, a page whose shadow entry has been evicted — and it
+    /// is not visible against what [`admit`] asks the first of these anyway:
+    /// across this change `Exec::pending_interrupt` went **down**, from
+    /// 1 188 799 920 host instructions to 806 436 078 over twenty guest
+    /// seconds of the boot, because there are 40% fewer blocks to admit.
     fn store(&mut self, mem: &MemOp, addr: u64, value: u64) -> MemResult {
         let done = self.exec.store(addr, mem.size.bytes(), value);
         self.note_writes();
+        if self.exec.pending_interrupt().is_some() || self.exec.topology() != self.topology {
+            self.hand_back();
+        }
         match done {
             Ok(()) => Ok(()),
             Err(trap) => Err(self.fault(trap)),
