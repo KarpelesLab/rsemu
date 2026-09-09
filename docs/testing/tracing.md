@@ -36,6 +36,11 @@ cpu.cpu0.cycles                 1000001
 cpu.cpu0.retired-total           500000
 sched.budgets                       200
 sched.events                          0
+sched.ended.allowance                100
+sched.ended.declined                  4
+sched.ended.event                     0
+sched.ended.exit                      0
+sched.ended.lazy                      0
 sched.quanta                        104
 sched.quanta.empty                    4
 sched.quanta.idle                     4
@@ -46,9 +51,9 @@ sched.ticks                     1011520
 ```
 
 Half a million guest instructions in 7 902 blocks, every one of them compiled to
-host code; a hundred scheduler rounds of a millisecond each plus four the
-headless loop declined at its slice boundaries. None of that was printable
-before.
+host code; a hundred scheduler rounds of a millisecond each — `ended.allowance`,
+the grid point, so nothing interrupted them — plus four the headless loop
+declined at its slice boundaries. None of that was printable before.
 
 ## Why this exists
 
@@ -111,13 +116,25 @@ the `cpu` channel costs the block-entry path nothing at all.
 | Row | Meaning |
 | --- | --- |
 | `sched.quanta` | rounds run |
-| `sched.quanta.idle` | rounds in which no runnable was given a budget: a boundary `run_until` **declined** because the deadline fell inside the round, or a machine with nothing runnable |
+| `sched.quanta.idle` | rounds in which no runnable was given a budget: a boundary `run_until` **declined** because the deadline fell inside the round, or a machine with nothing runnable. `sched.ended.declined` is what tells those two apart; this row is kept as the plain count it always was, so an old trace still compares |
 | `sched.quanta.empty` | rounds that advanced virtual time by nothing |
+| `sched.ended.allowance` | rounds that reached the quantum grid point: the allowance was spent and nothing interrupted them. Also every `accel` round, where the quantum *is* the allowance |
+| `sched.ended.event` | rounds a queued event came due in, before the grid point |
+| `sched.ended.lazy` | rounds a lazily advanced device's own deadline ended — a PPU reaching the dot it raises vblank on. Not visible at all before this row |
+| `sched.ended.declined` | boundaries `run_until` declined because the caller's deadline fell inside the round |
+| `sched.ended.exit` | rounds a runnable was asked to unwind out of: a stop-the-world, a debugger, a host `SIGINT` |
 | `sched.budgets` | runnable budgets issued — `budgets / quanta` is the machine's runnable count |
 | `sched.ticks` | ticks consumed by runnables, summed across domains (a volume of work, deliberately not converted to a time) |
 | `sched.events` | events dispatched out of rounds |
 | `sched.span-ns` | virtual nanoseconds the rounds covered — equal to the run, which is a useful self-check |
 | `sched.span-ns.log2.NN` | how many rounds needed *NN* bits of nanoseconds. Bucket 20 is about a millisecond; bucket 10 about a microsecond |
+
+The five `sched.ended.*` rows are a **partition**: every round ends for exactly
+one reason, so they sum to `sched.quanta`, and `tests/cli_trace.rs` asserts it.
+That is what makes a row going missing visible rather than quietly absorbed by
+its neighbour. `exit` displaces whichever of the other four the round would
+otherwise have named, because a four-tick round is explained by the flag and not
+by the grid point it never reached.
 
 `cpu`, under `cpu.<instance path>.` and again as a machine-wide total under
 `cpu.`:
@@ -147,10 +164,12 @@ zeroes reads as "the JIT is broken".
 * **A wall-clock figure.** Deliberately absent — see *Determinism* below.
 * **MMIO by region.** Wanted, specified below, and not implementable from
   outside `core::space`: the flat view carries an `Arc<dyn MemOps>` and no name.
-* **A reason for each quantum boundary** (allowance spent, timer edge, exit
-  flag, declined boundary). Also wanted, also specified below: the scheduler has
-  no "why did this round end" type, and `sched.quanta.idle` is the part that
-  *is* observable from a `QuantumReport`.
+* **A reason for each quantum boundary.** Was specified here and *is now
+  applied*: `core::sched::Ended` names the choice `natural_target` was already
+  making, `QuantumReport` carries it, and the five `sched.ended.*` rows above
+  are the result. It cost the scheduler one `u16` per round and a handful of
+  relaxed loads to see whether an exit flag was raised — measured at the bottom
+  of this document.
 
 ## The format
 
@@ -317,47 +336,7 @@ Two consequences, both real:
 Each of these needs a change inside a file this subsystem does not own. They are
 written out precisely enough to apply as-is.
 
-### 1. A reason for each quantum boundary — `src/core/sched.rs`
-
-`sched.quanta.idle` conflates a *declined boundary* with *a machine with nothing
-runnable*, because a `QuantumReport` cannot tell them apart, and neither
-"allowance spent" nor "a timer edge" is visible at all. The scheduler already
-chooses between exactly three candidate end-instants in `Scheduler::natural_target`
-and takes a fourth path in `Scheduler::decline_round`. Give that choice a name:
-
-```rust
-/// Why a scheduler round ended.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ended(pub u16);
-
-impl Ended {
-    /// The round reached the quantum grid point: the allowance was spent.
-    pub const ALLOWANCE: Ended = Ended(0);
-    /// A queued event came due before the grid point.
-    pub const EVENT: Ended = Ended(1);
-    /// A lazily advanced device's own deadline came first.
-    pub const LAZY: Ended = Ended(2);
-    /// `run_until` declined a boundary the deadline fell inside.
-    pub const DECLINED: Ended = Ended(3);
-    /// A runnable raised its exit flag (stop-the-world, a debugger, `SIGINT`).
-    pub const EXIT: Ended = Ended(4);
-}
-```
-
-* `natural_target` returns `(GlobalTime, Ended)` instead of `GlobalTime` — the
-  three arms already exist, one per candidate, and each names its own constant.
-* `QuantumReport` grows `pub ended: Ended`.
-* `decline_round` sets `Ended::DECLINED`; `close_round` takes the value
-  `natural_target` returned, except that a round cut short by a raised exit flag
-  reports `Ended::EXIT`.
-
-Then `core::trace::quantum_report` counts `Counter(8 + report.ended.0)` — the
-slots are already reserved — and the rows appear as `sched.ended.allowance`,
-`sched.ended.event`, `sched.ended.lazy`, `sched.ended.declined`,
-`sched.ended.exit`. No other file changes.
-
-### 2. MMIO by region — `src/core/space/flat.rs`
+### 1. MMIO by region — `src/core/space/flat.rs`
 
 A device MMIO count needs an identity at the dispatch site and there is none:
 `FlatTarget::Io` carries only `Arc<dyn MemOps>`, and the human-readable name
@@ -396,7 +375,7 @@ same callgrind measurement the store path already has in
 [`../platforms/pc64.md`](../platforms/pc64.md), taken by whoever owns
 `core::space`.
 
-### 3. RISC-V's retired-versus-interpreted split — `src/cpu/riscv/engine.rs`
+### 2. RISC-V's retired-versus-interpreted split — `src/cpu/riscv/engine.rs`
 
 `cpu::riscv::Jit::stats()` returns `(blocks, compiled)` where x86 and A64 return
 a struct with `retired` and `interpreted` in it, so the `cpu` channel's most
@@ -408,7 +387,7 @@ line and one per `interpret()` call into the second, and widen `jit_stats` to a
 struct in the shape of the other two. `host::trace::cpus`'s RISC-V arm then
 loses its `retired-total` fallback and reads the same rows as the other cores.
 
-### 4. Per-mechanism block counters — `src/jit/dispatch.rs`
+### 3. Per-mechanism block counters — `src/jit/dispatch.rs`
 
 `DispatchStats` already has `looked_up`, `resyncs` and `smc`, and
 `jit::CacheStats` has eleven more (`hits`, `misses`, `flushes`, `links`,

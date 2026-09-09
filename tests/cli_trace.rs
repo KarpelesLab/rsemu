@@ -203,6 +203,42 @@ fn the_sched_channel_reports_the_rounds_and_the_declined_boundaries() {
         1_000,
         "the distribution and the total disagree:\n{text}"
     );
+
+    // Why each of those rounds ended. Every round ends for exactly one reason,
+    // so the five rows are a partition of `sched.quanta` — which is the whole
+    // property, and the thing that makes a missing count visible rather than
+    // silently absorbed by another row.
+    let reasons = [
+        "sched.ended.allowance",
+        "sched.ended.event",
+        "sched.ended.lazy",
+        "sched.ended.declined",
+        "sched.ended.exit",
+    ];
+    let by_reason: u64 = reasons.iter().map(|r| row(&text, r)).sum();
+    assert_eq!(
+        by_reason, quanta,
+        "the end reasons must partition the rounds:\n{text}"
+    );
+    // And the split says what `sched.quanta.idle` could only hint at: the idle
+    // rounds are declined boundaries, not a machine with nothing runnable.
+    assert_eq!(
+        row(&text, "sched.ended.declined"),
+        idle,
+        "the headless loop's idle rounds are exactly its declined boundaries:\n{text}"
+    );
+    assert_eq!(
+        row(&text, "sched.ended.allowance"),
+        1_000,
+        "a one-millisecond quantum over a guest second spends its allowance a \
+         thousand times:\n{text}"
+    );
+    assert_eq!(
+        row(&text, "sched.ended.exit"),
+        0,
+        "nothing stops the world in an ordinary headless run:\n{text}"
+    );
+
     // Only `sched` was asked for, so nothing else is in the file.
     assert!(!text.contains("\nclock."), "{text}");
     let _ = std::fs::remove_file(&path);

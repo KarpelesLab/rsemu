@@ -186,10 +186,12 @@ impl Counter {
     /// declined because the deadline fell inside the round, or a machine with
     /// nothing runnable at all.
     ///
-    /// The two cannot be told apart from a `QuantumReport` alone — the
-    /// scheduler has no "why this round ended" type yet, and
-    /// `docs/testing/tracing.md` specifies the one it should grow. Named for
-    /// what is observable rather than for what is wanted.
+    /// Named for what is observable rather than for what is wanted, and kept
+    /// that way. [`Counter::ENDED`] is what tells the two apart now — a
+    /// declined boundary lands in `sched.ended.declined` and a machine with
+    /// nothing runnable does not — so this row stays as the plain count it has
+    /// always been rather than changing meaning under a reader who has an old
+    /// trace to compare against.
     pub const QUANTA_IDLE: Counter = Counter(1);
 
     /// Rounds that advanced virtual time by nothing.
@@ -213,6 +215,15 @@ impl Counter {
     /// Total virtual nanoseconds the traced rounds covered.
     pub const SPAN_NS: Counter = Counter(6);
 
+    /// The base of the *reason* each round ended: slot `ENDED + n` counts the
+    /// rounds that reported `Ended(n)`.
+    ///
+    /// Five wide today ([`Ended::COUNT`](crate::core::sched::Ended::COUNT)) in
+    /// a window of eight, so a sixth reason needs no slot arithmetic anywhere.
+    /// The rows sum to `sched.quanta` exactly: every round ends for exactly one
+    /// reason.
+    pub const ENDED: Counter = Counter(8);
+
     /// The base of a [`BUCKETS`]-wide power-of-two histogram of how long each
     /// round was, in nanoseconds.
     pub const SPAN_LOG2: Counter = Counter(16);
@@ -231,10 +242,15 @@ impl Counter {
         names[4] = "sched.budgets";
         names[5] = "sched.ticks";
         names[6] = "sched.span-ns";
-        // 8..16 is reserved for the *reason* each round ended — allowance
-        // spent, timer edge, lazy deadline, declined boundary, exit flag —
-        // which needs a type `core::sched` has not grown yet.
-        // `docs/testing/tracing.md` specifies it, down to the slot arithmetic.
+        // 8..16 is the *reason* each round ended, five of eight used. Written
+        // out rather than derived from `Ended::name`, because `NAMES` is a
+        // `const` and a `&'static str` from a `const fn` on another type would
+        // not make it any more honest — the test below asserts the two agree.
+        names[8] = "sched.ended.allowance";
+        names[9] = "sched.ended.event";
+        names[10] = "sched.ended.lazy";
+        names[11] = "sched.ended.declined";
+        names[12] = "sched.ended.exit";
         // 16..48 is the histogram, rendered by `Table::collect` from the index
         // rather than by a constant string each: thirty-two names would say
         // what the index already says.
@@ -459,6 +475,14 @@ pub fn quantum_report(report: &crate::core::sched::QuantumReport) {
         ticks,
         report.fired.len() as u64,
     );
+    // One slot per reason, so the five rows sum to `sched.quanta`. A reason
+    // outside the reserved window is dropped rather than allowed to land on
+    // the histogram: a sixth `Ended` added without widening this is a wrong
+    // row, and a wrong row is worse than a missing one.
+    #[cfg(feature = "trace")]
+    if report.ended.0 < Counter::SPAN_LOG2.0 - Counter::ENDED.0 {
+        raw(Counter(Counter::ENDED.0 + report.ended.0), 1);
+    }
 }
 
 // ---------------------------------------------------------------------------

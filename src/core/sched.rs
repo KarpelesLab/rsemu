@@ -2052,6 +2052,78 @@ enum Source {
 /// round, so the index is what puts it back.
 type Dispatched = (usize, Handle<(Box<dyn Runnable>, Consumed)>);
 
+/// Why a scheduler round ended.
+///
+/// `Scheduler::natural_target` already chooses between exactly three
+/// candidate end-instants and `Scheduler::decline_round` is a fourth path;
+/// this is that choice given a name, so a caller can tell *allowance spent*
+/// from *a timer edge* from *nothing was runnable*. Without it a round that
+/// issued no budget is indistinguishable from a boundary the caller's deadline
+/// fell inside, and `docs/testing/tracing.md` had to name its counter for what
+/// was observable rather than for what was wanted.
+///
+/// A `#[repr(transparent)]` newtype with `pub const` variants rather than an
+/// `enum`, per `CLAUDE.md`'s type conventions: a sixth reason must not break a
+/// downstream `match`, and the value is also an index — `core::trace` counts
+/// `Counter(8 + ended.0)`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ended(pub u16);
+
+impl Ended {
+    /// The round reached the quantum grid point: the allowance was spent.
+    ///
+    /// Also what an [`ThreadingMode::Accel`] round reports, where the quantum
+    /// *is* the allowance and the wall decides the rest.
+    pub const ALLOWANCE: Ended = Ended(0);
+
+    /// A queued event came due before the grid point.
+    pub const EVENT: Ended = Ended(1);
+
+    /// A lazily advanced device's own deadline came first.
+    pub const LAZY: Ended = Ended(2);
+
+    /// [`Scheduler::run_quantum_until`] declined a boundary the caller's
+    /// deadline fell inside: virtual time moved, nothing executed, and the
+    /// round runs whole when the caller asks for more time.
+    pub const DECLINED: Ended = Ended(3);
+
+    /// A runnable was asked to unwind — a stop-the-world, a debugger, a host
+    /// `SIGINT`. Reported in place of whichever of the four above the round
+    /// would otherwise have named, because it is the one that explains a short
+    /// round.
+    pub const EXIT: Ended = Ended(4);
+
+    /// How many reasons there are, which is the width `core::trace` reserves.
+    ///
+    /// There is deliberately **no** sixth for
+    /// [`Scheduler::step_quantum_until`]'s fragment, which is the one place a
+    /// round can stop at a caller's deadline having executed something: it
+    /// reports the candidate it was aiming at. A debugger stepping a machine is
+    /// not what these counters are for, and a reason only a debugger can
+    /// produce would put a row in every trace that is always zero.
+    pub const COUNT: u16 = 5;
+
+    /// A short name, for a trace row or a monitor line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Ended::ALLOWANCE => "allowance",
+            Ended::EVENT => "event",
+            Ended::LAZY => "lazy",
+            Ended::DECLINED => "declined",
+            Ended::EXIT => "exit",
+            _ => "?",
+        }
+    }
+}
+
+impl fmt::Display for Ended {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// What one round of the round-robin did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantumReport {
@@ -2063,6 +2135,8 @@ pub struct QuantumReport {
     pub consumed: Vec<(RunnableId, u64)>,
     /// Events that came due, in `(time, sequence)` order.
     pub fired: Vec<Event>,
+    /// Why the round ended where it did.
+    pub ended: Ended,
 }
 
 /// The machine's scheduler: virtual time, the event queue, and execution
@@ -2681,22 +2755,26 @@ impl Scheduler {
     /// Being a pure function of virtual time and machine state — never of how
     /// the caller sliced the run — is the whole point. See
     /// [`Scheduler::run_quantum_until`] for what it buys.
-    fn natural_target(&mut self) -> GlobalTime {
+    fn natural_target(&mut self) -> (GlobalTime, Ended) {
         let mut target = self.next_grid_point();
+        let mut why = Ended::ALLOWANCE;
         if let Some(deadline) = self.queue.next_deadline()
             && deadline < target
         {
             target = deadline;
+            why = Ended::EVENT;
         }
         if let Some(at) = self.lazy_deadline()
             && at < target
         {
             target = at;
+            why = Ended::LAZY;
         }
         // An event already in the past pulls the target below `now`; running
         // backwards is worse than firing it late, so the round stands still and
-        // the tail of `run_quantum_deterministic` pops it.
-        target.max(self.now)
+        // the tail of `run_quantum_deterministic` pops it. The reason survives
+        // the clamp: what ended the round is still the thing that was due.
+        (target.max(self.now), why)
     }
 
     /// The first multiple of the quantum strictly after `now`.
@@ -2747,7 +2825,7 @@ impl Scheduler {
         cut: Cut,
     ) -> SchedResult<QuantumReport> {
         let from = self.now;
-        let natural = self.natural_target();
+        let (natural, mut why) = self.natural_target();
         let target = match cut {
             // A debugger's fragment. See [`Scheduler::step_quantum_until`] for
             // why this exists and why nothing else may use it.
@@ -2800,8 +2878,25 @@ impl Scheduler {
         if count > 0 {
             self.cursor = (self.cursor + 1) % count;
         }
+        if self.exit_was_requested() {
+            why = Ended::EXIT;
+        }
 
-        self.close_round(from, target, consumed)
+        self.close_round(from, target, consumed, why)
+    }
+
+    /// Whether any runnable was asked to unwind during the round that just
+    /// ended.
+    ///
+    /// A handful of relaxed loads once per round — not per tick — so it is
+    /// below the noise of anything else the round does. It reads the flags
+    /// *after* the runnables returned, which is the only place the answer is
+    /// known: a flag raised mid-round is exactly the thing that made the round
+    /// short.
+    fn exit_was_requested(&self) -> bool {
+        self.runnables
+            .iter()
+            .any(|slot| slot.cursor.exit_requested())
     }
 
     /// A round the caller's deadline falls inside: virtual time moves to the
@@ -2832,6 +2927,7 @@ impl Scheduler {
             to: self.now,
             consumed: Vec::new(),
             fired,
+            ended: Ended::DECLINED,
         })
     }
 
@@ -2843,6 +2939,7 @@ impl Scheduler {
         from: GlobalTime,
         target: GlobalTime,
         consumed: Vec<(RunnableId, u64)>,
+        ended: Ended,
     ) -> SchedResult<QuantumReport> {
         // Trees nothing drives — a bare RTC crystal — still have to reach the
         // present, and the only way there is through absolute time. This is a
@@ -2862,6 +2959,7 @@ impl Scheduler {
             to: self.now,
             consumed,
             fired,
+            ended,
         })
     }
 
@@ -2933,9 +3031,13 @@ impl Scheduler {
         let from = self.now;
         // Not computed under `Source::Host`: it is unused there, and it walks
         // every lazy slot on a path that now runs once per guest exit.
-        let natural = match source {
+        // `why` starts at the allowance because that is what a `Source::Host`
+        // round always ends on: the quantum sizes the budgets and the wall
+        // decides the rest, so neither a queued event nor a lazy deadline can
+        // be the thing that ended it.
+        let (natural, mut why) = match source {
             Source::Emulated => self.natural_target(),
-            Source::Host => from,
+            Source::Host => (from, Ended::ALLOWANCE),
         };
         let target = match (source, cut) {
             // Under acceleration the target is **only** an allowance: it sizes
@@ -2965,7 +3067,7 @@ impl Scheduler {
             // the same place rather than spin the guest on an empty budget for
             // ever, so it declines to move the clock too.
             (Source::Host, _) if self.config.quantum.raw() == 0 => {
-                return self.close_round(from, from, Vec::new());
+                return self.close_round(from, from, Vec::new(), Ended::ALLOWANCE);
             }
             (Source::Host, _) => from.saturating_add(self.config.quantum),
             (Source::Emulated, Cut::Yes) => natural.min(limit),
@@ -3107,10 +3209,13 @@ impl Scheduler {
             }
             consumed.push((RunnableId(index as u32), used.ticks));
         }
+        if self.exit_was_requested() {
+            why = Ended::EXIT;
+        }
 
         match opened {
-            Some(opened) => self.close_round_slaved(from, opened, consumed),
-            None => self.close_round(from, target, consumed),
+            Some(opened) => self.close_round_slaved(from, opened, consumed, why),
+            None => self.close_round(from, target, consumed, why),
         }
     }
 
@@ -3220,6 +3325,7 @@ impl Scheduler {
         from: GlobalTime,
         opened: u64,
         consumed: Vec<(RunnableId, u64)>,
+        ended: Ended,
     ) -> SchedResult<QuantumReport> {
         let closed = self.host_nanos()?;
         let target = self
@@ -3245,6 +3351,7 @@ impl Scheduler {
             to: self.now,
             consumed,
             fired,
+            ended,
         })
     }
 
@@ -4357,6 +4464,86 @@ mod tests {
             sched.sync_for_access(dev, AccessKind::Guest).unwrap(),
             sched.forest().ticks(ppu).unwrap()
         );
+    }
+
+    // -- why a round ended --------------------------------------------------
+
+    #[test]
+    fn a_round_names_the_candidate_that_ended_it() {
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+
+        // Nothing due: the round runs to the quantum grid point.
+        assert_eq!(sched.run_quantum().unwrap().ended, Ended::ALLOWANCE);
+
+        // A queued event inside the next round ends it instead.
+        let at = sched.now.saturating_add(GlobalTime::from_nanos(500));
+        sched.schedule_at(at, EventTarget(3), 42);
+        let report = sched.run_quantum().unwrap();
+        assert_eq!(report.ended, Ended::EVENT);
+        assert_eq!(report.to, at);
+
+        // And a lazily advanced device's own deadline, which is the third
+        // candidate and the one no counter could see before.
+        let dev = sched.add_lazy_device(
+            ppu,
+            Box::new(Ppu {
+                next_event: Some(sched.forest().ticks(ppu).unwrap() + 300),
+                ..Ppu::default()
+            }),
+        );
+        let report = sched.run_quantum().unwrap();
+        assert_eq!(report.ended, Ended::LAZY);
+        let _ = dev;
+    }
+
+    #[test]
+    fn a_declined_boundary_says_so_rather_than_looking_like_an_empty_machine() {
+        // The distinction `sched.quanta.idle` could not draw. Both rounds issue
+        // no budget; only one of them is a caller's deadline.
+        let (mut sched, cpu, _ppu) = nes_scheduler();
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        let limit = sched.now.saturating_add(GlobalTime::from_nanos(500));
+        let report = sched.run_quantum_until(limit).unwrap();
+        assert_eq!(report.ended, Ended::DECLINED);
+        assert!(report.consumed.is_empty());
+
+        // A machine with nothing runnable at all still spends its allowance.
+        let (mut empty, _, _) = nes_scheduler();
+        let report = empty.run_quantum().unwrap();
+        assert_eq!(report.ended, Ended::ALLOWANCE);
+        assert!(report.consumed.is_empty());
+    }
+
+    #[test]
+    fn a_round_cut_short_by_the_exit_flag_reports_the_exit() {
+        for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+            let (mut sched, cpu, _ppu) = nes_scheduler_in(mode, 0);
+            stoppable(&mut sched, cpu, Some(4));
+            let report = sched.run_quantum().unwrap();
+            assert_eq!(report.consumed[0].1, 4, "{mode:?}");
+            // It would have been `ALLOWANCE`: the reason a round was four ticks
+            // long is the flag, not the grid point it never reached.
+            assert_eq!(report.ended, Ended::EXIT, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn every_reason_has_a_name_and_an_unknown_one_is_not_a_panic() {
+        for r in [
+            Ended::ALLOWANCE,
+            Ended::EVENT,
+            Ended::LAZY,
+            Ended::DECLINED,
+            Ended::EXIT,
+        ] {
+            assert!(!r.name().is_empty());
+            assert_ne!(r.name(), "?");
+            assert!(r.0 < Ended::COUNT);
+        }
+        // The point of the newtype: a sixth reason from a newer build renders
+        // rather than aborting a monitor.
+        assert_eq!(Ended(9).name(), "?");
     }
 
     #[test]
