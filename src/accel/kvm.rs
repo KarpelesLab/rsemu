@@ -228,6 +228,19 @@ const KVM_GET_DEBUGREGS: Req<KvmDebugregs> =
 /// `KVM_SET_DEBUGREGS`.
 const KVM_SET_DEBUGREGS: Req<KvmDebugregs> =
     Req::new(ioc(DIR_WRITE, 0xa2, size_of::<KvmDebugregs>() as u64));
+/// `KVM_GET_VCPU_EVENTS`: the interruptibility state — the pending exception,
+/// the pending and blocked `NMI`, and the **interrupt shadow**.
+///
+/// None of it is reachable through any other request. `KVM_GET_SREGS` reports
+/// `RFLAGS.IF`, which says whether the guest *wants* interrupts; this says
+/// whether the processor is currently allowed to take one, which is a
+/// different question for exactly one instruction after a `STI`, a `MOV SS`
+/// or a `POP SS` (*Intel SDM* volume 2B, `STI`; volume 3A §6.8.3).
+const KVM_GET_VCPU_EVENTS: Req<KvmVcpuEvents> =
+    Req::new(ioc(DIR_READ, 0x9f, size_of::<KvmVcpuEvents>() as u64));
+/// `KVM_SET_VCPU_EVENTS`.
+const KVM_SET_VCPU_EVENTS: Req<KvmVcpuEvents> =
+    Req::new(ioc(DIR_WRITE, 0xa0, size_of::<KvmVcpuEvents>() as u64));
 
 /// `KVM_GET_MSRS`, and `KVM_SET_MSRS` below it.
 ///
@@ -488,6 +501,174 @@ pub struct KvmDebugregs {
 }
 const _: () = assert!(size_of::<KvmDebugregs>() == 128);
 
+/// `struct kvm_vcpu_events`'s `exception` member: an exception the processor
+/// owes the guest but has not delivered.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmEventException {
+    /// Whether one is queued for injection on the next entry.
+    pub injected: u8,
+    /// Its vector.
+    pub nr: u8,
+    /// Whether [`error_code`](KvmEventException::error_code) means anything.
+    pub has_error_code: u8,
+    /// Whether one is pending. Valid only with
+    /// [`VCPUEVENT_VALID_PAYLOAD`](events::VCPUEVENT_VALID_PAYLOAD).
+    pub pending: u8,
+    /// The error code the exception pushes.
+    pub error_code: u32,
+}
+
+/// `struct kvm_vcpu_events`'s `interrupt` member.
+///
+/// The one this crate reads: [`shadow`](KvmEventInterrupt::shadow) is the
+/// state that makes `STI; HLT` a race-free idiom and that nothing else in the
+/// ABI reports.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmEventInterrupt {
+    /// Whether a vector is queued for injection on the next entry.
+    pub injected: u8,
+    /// That vector.
+    pub nr: u8,
+    /// Whether it is a software interrupt rather than an external one.
+    pub soft: u8,
+    /// The interrupt shadow: a mask of
+    /// [`SHADOW_INT_MOV_SS`](events::SHADOW_INT_MOV_SS) and
+    /// [`SHADOW_INT_STI`](events::SHADOW_INT_STI). Valid only when the kernel
+    /// sets [`VCPUEVENT_VALID_SHADOW`](events::VCPUEVENT_VALID_SHADOW) in
+    /// [`KvmVcpuEvents::flags`], which is how a host without
+    /// `KVM_CAP_INTR_SHADOW` says so without a separate capability probe.
+    pub shadow: u8,
+}
+
+/// `struct kvm_vcpu_events`'s `nmi` member.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmEventNmi {
+    /// Whether one is queued for injection on the next entry.
+    pub injected: u8,
+    /// Whether one is latched and owed. Written back only with
+    /// [`VCPUEVENT_VALID_NMI_PENDING`](events::VCPUEVENT_VALID_NMI_PENDING).
+    pub pending: u8,
+    /// Whether `NMI` is blocked — the processor is between an `NMI` and the
+    /// `IRET` that ends it (*Intel SDM* volume 3A section 6.7.1).
+    pub masked: u8,
+    /// Padding.
+    pub pad: u8,
+}
+
+/// `struct kvm_vcpu_events`'s `smi` member: system-management mode.
+///
+/// Nothing in this crate models it. It is transcribed because the structure
+/// has to be the right size and because a *load* must hand every one of these
+/// bytes back unchanged.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmEventSmi {
+    /// Whether the processor is in system-management mode.
+    pub smm: u8,
+    /// Whether an `SMI` is pending.
+    pub pending: u8,
+    /// Whether the `SMI` arrived inside an `NMI` handler.
+    pub smm_inside_nmi: u8,
+    /// Whether an `INIT` was latched while in system-management mode.
+    pub latched_init: u8,
+}
+
+/// `struct kvm_vcpu_events` — the processor's **interruptibility**, which is
+/// architectural state no other request reports.
+///
+/// Transcribed from `Documentation/virt/kvm/api.rst` section 4.31, which
+/// prints the structure. `triple_fault`, which later kernels carve out of
+/// [`reserved`](KvmVcpuEvents::reserved), is deliberately left inside it: the
+/// size is part of the `ioctl` number, so the structure cannot grow, and a
+/// backend that does not model a triple-fault *event* has nothing to put in
+/// the field but has to hand its bytes back untouched.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmVcpuEvents {
+    /// The pending or injected exception.
+    pub exception: KvmEventException,
+    /// The pending or injected interrupt, and the interrupt shadow.
+    pub interrupt: KvmEventInterrupt,
+    /// The non-maskable interrupt's pending and blocked state.
+    pub nmi: KvmEventNmi,
+    /// The Start-Up vector a processor waiting for one would take.
+    pub sipi_vector: u32,
+    /// Which of the members above the kernel filled in, and — on the way back
+    /// — which of them it should take. See [`events`].
+    pub flags: u32,
+    /// System-management mode.
+    pub smi: KvmEventSmi,
+    /// Reserved, and later kernels' `triple_fault` member. Round-tripped.
+    pub reserved: [u8; 27],
+    /// Whether [`exception_payload`](KvmVcpuEvents::exception_payload) means
+    /// anything.
+    pub exception_has_payload: u8,
+    /// The exception's payload — `CR2` for a page fault, `DR6` for a debug
+    /// exception — held back until the exception is actually delivered.
+    pub exception_payload: u64,
+}
+const _: () = assert!(size_of::<KvmVcpuEvents>() == 64);
+
+impl KvmVcpuEvents {
+    /// Whether the kernel filled [`KvmEventInterrupt::shadow`] in.
+    ///
+    /// A host without `KVM_CAP_INTR_SHADOW` leaves the flag clear and the
+    /// field meaningless, so this is the capability probe — asked of the
+    /// answer rather than of the device, which is one fewer number to
+    /// transcribe and cannot go stale.
+    #[must_use]
+    pub const fn shadow_valid(&self) -> bool {
+        self.flags & events::VCPUEVENT_VALID_SHADOW != 0
+    }
+
+    /// Whether the processor is inside an interrupt shadow: the one
+    /// instruction after a `STI`, a `MOV SS` or a `POP SS` during which an
+    /// external interrupt is not recognised.
+    ///
+    /// `false` on a host that does not report the shadow, which is the same
+    /// answer as *not shadowed* and is the only safe one — there is nothing
+    /// to carry.
+    #[must_use]
+    pub const fn interrupt_shadow(&self) -> bool {
+        self.shadow_valid() && self.interrupt.shadow != 0
+    }
+}
+
+/// The bits of [`KvmVcpuEvents::flags`], and of
+/// [`KvmEventInterrupt::shadow`].
+///
+/// The flags are a **two-way** field and that is the part worth reading twice.
+/// On the way out the kernel sets a bit to say *this member is filled in*; on
+/// the way in the bit says *take this member from me*, and a bit left clear
+/// means *keep whatever you have*. `api.rst` section 4.32 names the four
+/// members that are only written on request — `nmi.pending`, `sipi_vector`,
+/// `smi.smm` and `smi.pending` — because a running processor changes them
+/// underneath userspace, so a client that echoed them back would be undoing
+/// the kernel's own work.
+pub mod events {
+    /// Take `nmi.pending` from the structure.
+    pub const VCPUEVENT_VALID_NMI_PENDING: u32 = 1 << 0;
+    /// Take `sipi_vector` from the structure.
+    pub const VCPUEVENT_VALID_SIPI_VECTOR: u32 = 1 << 1;
+    /// `interrupt.shadow` is valid, in whichever direction it is travelling.
+    pub const VCPUEVENT_VALID_SHADOW: u32 = 1 << 2;
+    /// The `smi` member is valid.
+    pub const VCPUEVENT_VALID_SMM: u32 = 1 << 3;
+    /// `exception.pending`, `exception_has_payload` and `exception_payload`
+    /// are valid.
+    pub const VCPUEVENT_VALID_PAYLOAD: u32 = 1 << 4;
+    /// The triple-fault member inside `reserved` is valid.
+    pub const VCPUEVENT_VALID_TRIPLE_FAULT: u32 = 1 << 5;
+
+    /// The shadow a `MOV SS` or a `POP SS` casts over the next instruction.
+    pub const SHADOW_INT_MOV_SS: u8 = 1 << 0;
+    /// The shadow a `STI` casts over the next instruction.
+    pub const SHADOW_INT_STI: u8 = 1 << 1;
+}
+
 /// One entry of `struct kvm_msrs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -580,6 +761,14 @@ mod run {
     pub(super) const EXIT_REASON: u64 = 8;
     /// `__u8 if_flag`: whether the guest has interrupts enabled.
     pub(super) const IF_FLAG: u64 = 13;
+    /// `__u64 cr8`, and **both an input and an output** (`api.rst`'s
+    /// description of `struct kvm_run`). The kernel writes the guest's `CR8`
+    /// here after every exit and reads it back before every entry, but only
+    /// *"if in-kernel local APIC is not used"* — which is this backend, which
+    /// never issues `KVM_CREATE_IRQCHIP`. So it is the seam through which a
+    /// board's own local APIC and the processor's task-priority register stay
+    /// one value, and it costs no `ioctl` in either direction.
+    pub(super) const CR8: u64 = 16;
 
     /// `io.direction`: 0 in (`IN`), 1 out (`OUT`).
     pub(super) const IO_DIRECTION: u64 = 32;
@@ -1537,6 +1726,38 @@ impl Vcpu {
         Ok(())
     }
 
+    /// The interruptibility state: the pending exception, the pending and
+    /// blocked `NMI`, and the interrupt shadow.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_GET_VCPU_EVENTS` fails.
+    pub fn events(&self) -> AccelResult<KvmVcpuEvents> {
+        let inner = self.inner.lock();
+        let mut events = KvmVcpuEvents::default();
+        ioctl_struct(&inner.fd, KVM_GET_VCPU_EVENTS, &mut events)
+            .map_err(sys_err("KVM_GET_VCPU_EVENTS"))?;
+        Ok(events)
+    }
+
+    /// Set the interruptibility state.
+    ///
+    /// **What is written is decided by [`KvmVcpuEvents::flags`]**, not by this
+    /// call: a member whose flag is clear keeps whatever the kernel has. A
+    /// caller that has not just read the structure out of this same vCPU is
+    /// almost certainly writing four zeroed members it did not mean to.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_SET_VCPU_EVENTS` fails.
+    pub fn set_events(&self, events: &KvmVcpuEvents) -> AccelResult<()> {
+        let inner = self.inner.lock();
+        let mut events = *events;
+        ioctl_struct(&inner.fd, KVM_SET_VCPU_EVENTS, &mut events)
+            .map_err(sys_err("KVM_SET_VCPU_EVENTS"))?;
+        Ok(())
+    }
+
     /// Read `N` model-specific registers, in the order asked for.
     ///
     /// # Errors
@@ -1590,6 +1811,34 @@ impl Vcpu {
             ));
         }
         Ok(())
+    }
+
+    /// `CR8` — the task-priority class — as the guest last had it.
+    ///
+    /// Read out of the shared page rather than out of `kvm_sregs`, because the
+    /// page is where the kernel *puts* it for a VM whose local APIC is in
+    /// userspace, and reading it there costs nothing. Only the low four bits
+    /// are architectural: `CR8` is the top nibble of the local APIC's
+    /// task-priority register seen through the processor (*Intel SDM* volume
+    /// 3A §11.8.6.1), and `MOV CR8` with anything above bit 3 raises `#GP(0)`.
+    #[must_use]
+    pub fn cr8(&self) -> u8 {
+        let inner = self.inner.lock();
+        match inner.run.load_le::<8>(run::CR8) {
+            Some(bytes) => (u64::from_le_bytes(bytes) & 0xf) as u8,
+            None => 0,
+        }
+    }
+
+    /// Write it, to be taken by the next entry.
+    ///
+    /// Reports whether the shared page was big enough to hold the field, which
+    /// it is on every kernel that answers `KVM_GET_API_VERSION` with 12.
+    pub fn set_cr8(&self, class: u8) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .run
+            .store_le::<8>(run::CR8, u64::from(class & 0xf).to_le_bytes())
     }
 
     /// Whether the guest currently has interrupts enabled, as of the last

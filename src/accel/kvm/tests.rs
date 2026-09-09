@@ -179,6 +179,12 @@ fn the_ioctl_numbers_match_the_published_ones() {
     assert_eq!(KVM_SET_MSRS, 0x4008_ae89);
     assert_eq!(KVM_GET_SUPPORTED_CPUID, 0xc008_ae05);
     assert_eq!(KVM_SET_CPUID2, 0x4008_ae90);
+
+    // `kvm_vcpu_events` is 64 bytes, so 0x40 in the size field. Wrong by one
+    // byte and the kernel answers `ENOTTY`, which is why the size assertion
+    // beside the structure is a compile error rather than a runtime one.
+    assert_eq!(KVM_GET_VCPU_EVENTS.0, 0x8040_ae9f);
+    assert_eq!(KVM_SET_VCPU_EVENTS.0, 0x4040_aea0);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +270,7 @@ fn the_transcribed_structures_are_the_sizes_the_ioctl_numbers_encode() {
     assert_eq!(size_of::<KvmSegment>(), 24);
     assert_eq!(size_of::<KvmDtable>(), 16);
     assert_eq!(size_of::<KvmSregs>(), 312);
+    assert_eq!(size_of::<KvmVcpuEvents>(), 64);
     assert_eq!((KVM_GET_REGS.0 >> 16) & 0x3fff, size_of::<KvmRegs>() as u64);
     assert_eq!(
         (KVM_GET_SREGS.0 >> 16) & 0x3fff,
@@ -919,6 +926,108 @@ fn the_time_stamp_counter_crosses_in_both_directions() {
 
 /// A ROM is a **read-only** slot, so hardware fetches from it and a write to
 /// it leaves as MMIO.
+/// **The interrupt shadow comes out of hardware, and goes back in.**
+///
+/// The state `KVM_GET_VCPU_EVENTS` exists for. It is not in `RFLAGS`, not in a
+/// control register and not in any model-specific register, so before this
+/// pair of `ioctl`s a snapshot taken between a `STI` and the instruction after
+/// it restored with the shadow gone and the guest took an interrupt one
+/// instruction early.
+///
+/// Run in *hardware* rather than asserted against a constant, because the two
+/// shadow bits are not reported the same way on the two vendors: an Intel part
+/// distinguishes blocking-by-`STI` from blocking-by-`MOV SS`, and an AMD one
+/// has a single `INTERRUPT_SHADOW` bit in the VMCB and reports both. Anything
+/// this file asserted about *which* bit would be a statement about the host it
+/// last ran on, so what is asserted is *some* bit, which is the question the
+/// interpreter's one boolean actually asks.
+#[test]
+fn the_interrupt_shadow_survives_a_trip_through_hardware() {
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    // `cli; sti; out 0x80, al` — a port write is the shadowed instruction
+    // because it is the one that leaves hardware *before* it retires, so the
+    // exit lands with the shadow still owed. Measured: with anything else
+    // after the `sti`, the shadow is already spent by the first exit.
+    let vcpu = guest.vcpu_at(&[0xfa, 0xfb, 0xe6, 0x80, 0xf4]);
+    let before = vcpu.events().expect("KVM_GET_VCPU_EVENTS");
+    assert!(
+        before.shadow_valid(),
+        "this host does not report the interrupt shadow at all, which no x86 \
+         KVM since KVM_CAP_INTR_SHADOW does"
+    );
+    assert!(!before.interrupt_shadow(), "nothing has run yet");
+
+    // `run_once` rather than `run_until_exit`: this rig's I/O space has nothing
+    // at port 0x80, and the point is the state *at* the exit rather than what
+    // the port write meant.
+    vcpu.run_once().expect("enter the guest");
+    let after = vcpu.events().expect("KVM_GET_VCPU_EVENTS");
+    assert!(
+        after.interrupt_shadow(),
+        "the guest is stopped on the instruction its STI shadowed and the \
+         kernel does not say so: flags={:#x} shadow={:#x}",
+        after.flags,
+        after.interrupt.shadow
+    );
+
+    // And back in. Clearing it is the direction a restore takes when the
+    // snapshot was *not* in a shadow, and it has to be as effective as
+    // setting it — a spurious shadow suppresses an interrupt the guest is
+    // owed.
+    let mut cleared = after;
+    cleared.interrupt.shadow = 0;
+    vcpu.set_events(&cleared).expect("KVM_SET_VCPU_EVENTS");
+    assert!(
+        !vcpu.events().expect("read back").interrupt_shadow(),
+        "KVM_SET_VCPU_EVENTS did not take the shadow away"
+    );
+
+    let mut raised = after;
+    raised.interrupt.shadow = events::SHADOW_INT_MOV_SS;
+    vcpu.set_events(&raised).expect("KVM_SET_VCPU_EVENTS");
+    assert!(
+        vcpu.events().expect("read back").interrupt_shadow(),
+        "KVM_SET_VCPU_EVENTS did not put the shadow back"
+    );
+}
+
+/// **`CR8` travels through the shared page, in both directions.**
+///
+/// `api.rst`'s description of `struct kvm_run` calls `cr8` *"in (pre_kvm_run),
+/// out (post_kvm_run)"* and valid *"only if in-kernel local APIC is not
+/// used"* — which is this backend, permanently, because the board's local APIC
+/// is a device model rather than kernel state. That makes the field the seam
+/// through which `dev::pc::apic` and the processor's task-priority register
+/// stay one value, at the cost of no `ioctl` at all.
+///
+/// The guest here is a `HLT` in real mode, and that is deliberate: `MOV CR8`
+/// is a 64-bit-mode instruction, but the *register* exists whatever mode the
+/// processor is in, so the seam can be tested without building a long-mode
+/// world for it.
+#[test]
+fn cr8_goes_into_the_shared_page_and_comes_back_out() {
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    let vcpu = guest.vcpu_at(&[0xf4]);
+    assert_eq!(vcpu.cr8(), 0, "a fresh vCPU has priority class zero");
+
+    assert!(vcpu.set_cr8(0xb), "the kvm_run page holds the field");
+    vcpu.run_until_exit(2).expect("run to the HLT");
+    assert_eq!(
+        vcpu.cr8(),
+        0xb,
+        "the kernel took the class on entry and reported it back on exit, \
+         which is what makes this the route a MOV CR8 is noticed through"
+    );
+
+    // Only the low nibble is architectural: `MOV CR8` with anything above bit
+    // 3 raises `#GP(0)`, so a caller handing this a whole byte is handing it a
+    // bug rather than a wider register.
+    assert!(vcpu.set_cr8(0xff));
+    assert_eq!(vcpu.cr8(), 0xf);
+}
+
 #[test]
 fn firmware_is_a_read_only_slot_and_a_write_to_it_still_reaches_the_model() {
     let Some(kvm) = kvm() else { return };

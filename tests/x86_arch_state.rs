@@ -339,6 +339,23 @@ fn map_identity(space: &Arc<rsemu::core::space::AddressSpace>) {
     put(PDIR + 8, 0x20_0000 | LARGE | PRESENT_RW);
 }
 
+/// Everything a test writes into a board before running it: the bytes, where
+/// they go, and the world the processor wakes up in.
+///
+/// **A value rather than a function**, because this file now places two
+/// different guests and the two must be placed *identically* on both engines
+/// or the comparison is between two boards rather than two engines.
+struct Placement {
+    /// What to write into the memory space, and where.
+    blobs: Vec<(u64, Vec<u8>)>,
+    /// The system registers the processor wakes up with.
+    sys: Sys,
+    /// Where it starts.
+    rip: u64,
+    /// The stack it starts on. Zero where the guest never pushes.
+    rsp: u64,
+}
+
 /// Place a core in the world above and load the guest into its space.
 ///
 /// Shared by both engines, and that sharing is the point: an accelerated
@@ -346,37 +363,55 @@ fn map_identity(space: &Arc<rsemu::core::space::AddressSpace>) {
 /// shell is the device and `accel::state` is what carries the result into
 /// hardware. If this had to be done twice the two boards would not be the same
 /// board.
-fn place(cpu: &X86) {
+fn place(cpu: &X86, p: &Placement) {
     // One step discharges the reset sequence, which is what clears
     // `reset_pending`; without it the first round would run the sequence and
     // throw away what is written below.
     cpu.step();
     assert!(!cpu.reset_requested(), "the reset sequence did not run");
     let space = cpu.space().expect("the core has its space");
-    for (n, byte) in program().iter().enumerate() {
-        space
-            .write(
-                PROGRAM + n as u64,
-                Width::U8,
-                u64::from(*byte),
-                MemAttrs::DEFAULT,
-            )
-            .expect("the program fits in RAM");
+    for (at, bytes) in &p.blobs {
+        for (n, byte) in bytes.iter().enumerate() {
+            space
+                .write(
+                    at + n as u64,
+                    Width::U8,
+                    u64::from(*byte),
+                    MemAttrs::DEFAULT,
+                )
+                .expect("the blob fits in RAM");
+        }
     }
     map_identity(&space);
-    cpu.set_sys(system());
+    cpu.set_sys(p.sys);
     let mut regs = Regs::new();
     regs.cs = CODE_SEL;
     for sr in [seg::SS, seg::DS, seg::ES, seg::FS, seg::GS] {
         regs.set_segment(sr, DATA_SEL);
     }
-    regs.rip = PROGRAM;
+    regs.rip = p.rip;
+    regs.rsp = p.rsp;
     regs.eflags = rsemu::cpu::x86::flags::ALWAYS_SET;
     cpu.set_regs(regs);
 }
 
+/// The model-specific-register guest, placed.
+fn msr_placement() -> Placement {
+    Placement {
+        blobs: vec![(PROGRAM, program())],
+        sys: system(),
+        rip: PROGRAM,
+        rsp: 0,
+    }
+}
+
 /// The board with an emulated core: `engine` is `interp`, `jit` or `jit-host`.
-fn emulated(engine: &str, tag: &str) -> Machine {
+///
+/// The core comes back with the machine because a test that has to stop the
+/// guest at one exact instruction needs [`X86::step`], and because driving the
+/// `INTR` pin by hand is how a board with no interrupt controller gets an
+/// interrupt at all.
+fn emulated(engine: &str, tag: &str, p: &Placement) -> (Machine, Arc<X86>) {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let kept = Arc::clone(&cpus);
     let mut bindings = rsemu::machine::catalog::bindings().expect("this build's bindings");
@@ -397,8 +432,9 @@ fn emulated(engine: &str, tag: &str) -> Machine {
         &options,
     )
     .unwrap_or_else(|e| panic!("the board does not build with engine={engine}: {e}"));
-    place(&cpus.take().expect("the binding captured the core"));
-    machine
+    let core = cpus.take().expect("the binding captured the core");
+    place(&core, p);
+    (machine, core)
 }
 
 /// The same board with its core on host silicon, or `None` with no `/dev/kvm`.
@@ -406,7 +442,7 @@ fn emulated(engine: &str, tag: &str) -> Machine {
 /// `AccelCpus::install` is the whole of the interception: the machine file is
 /// used verbatim, `engine = "interp"` and all, and what changes is the engine
 /// underneath it.
-fn accelerated(tag: &str) -> Option<(Machine, Arc<AccelCpus>)> {
+fn accelerated(tag: &str, p: &Placement) -> Option<(Machine, Arc<AccelCpus>)> {
     if !Kvm::is_available() {
         return None;
     }
@@ -431,7 +467,7 @@ fn accelerated(tag: &str) -> Option<(Machine, Arc<AccelCpus>)> {
     )
     .unwrap_or_else(|e| panic!("the board does not realize under acceleration: {e}"));
     let cpu = accel.cpus().pop().expect("the board's processor");
-    place(cpu.shell());
+    place(cpu.shell(), p);
     Some((machine, accel))
 }
 
@@ -537,7 +573,8 @@ fn assert_the_guest_still_sees_its_registers(m: &Machine, whose: &str) {
 /// save, restore into a board whose core is `engine`, erase the witness, and
 /// run on. Everything the guest then reports it re-read for itself.
 fn a_hardware_snapshot_restores_under(engine: &str) {
-    let Some((mut hardware, accel)) = accelerated(&format!("kvm-to-{engine}")) else {
+    let Some((mut hardware, accel)) = accelerated(&format!("kvm-to-{engine}"), &msr_placement())
+    else {
         return;
     };
     run_until_witnessed(&mut hardware);
@@ -550,7 +587,7 @@ fn a_hardware_snapshot_restores_under(engine: &str) {
         u64::from(peek(&hardware, at::TSC_HI)) << 32 | u64::from(peek(&hardware, at::TSC_LO));
     let saved = hardware.save().expect("an accelerated machine saves");
 
-    let mut emulated = emulated(engine, &format!("kvm-to-{engine}"));
+    let (mut emulated, _core) = emulated(engine, &format!("kvm-to-{engine}"), &msr_placement());
     emulated
         .load(&saved)
         .unwrap_or_else(|e| panic!("a snapshot taken under KVM will not load under {engine}: {e}"));
@@ -576,14 +613,15 @@ fn a_snapshot_from_restores_under_hardware(engine: &str) {
     if !Kvm::is_available() {
         return;
     }
-    let mut emulated = emulated(engine, &format!("{engine}-to-kvm"));
+    let (mut emulated, _core) = emulated(engine, &format!("{engine}-to-kvm"), &msr_placement());
     run_until_witnessed(&mut emulated);
     assert_the_guest_still_sees_its_registers(&emulated, engine);
     let tsc_before =
         u64::from(peek(&emulated, at::TSC_HI)) << 32 | u64::from(peek(&emulated, at::TSC_LO));
     let saved = emulated.save().expect("the emulated machine saves");
 
-    let Some((mut hardware, accel)) = accelerated(&format!("{engine}-to-kvm")) else {
+    let Some((mut hardware, accel)) = accelerated(&format!("{engine}-to-kvm"), &msr_placement())
+    else {
         return;
     };
     hardware
@@ -637,13 +675,13 @@ fn a_snapshot_taken_under_the_jit_restores_under_kvm() {
 /// 486's does not, so the two tests would fail for different reasons.
 #[test]
 fn the_chunk_is_the_same_bytes_whichever_engine_wrote_it() {
-    let Some((mut hardware, _accel)) = accelerated("bytes") else {
+    let Some((mut hardware, _accel)) = accelerated("bytes", &msr_placement()) else {
         return;
     };
     run_until_witnessed(&mut hardware);
     let saved = hardware.save().expect("an accelerated machine saves");
 
-    let mut interpreted = emulated("interp", "bytes");
+    let (mut interpreted, _core) = emulated("interp", "bytes", &msr_placement());
     interpreted
         .load(&saved)
         .expect("a snapshot taken under KVM restores under the interpreter");
@@ -681,6 +719,419 @@ fn the_processors_chunk_version_is_unchanged_by_the_widened_model() {
          the class version *and* register the migration step in the same commit, \
          and add it to `default_migrations`"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the interrupt shadow
+// ---------------------------------------------------------------------------
+
+/// Where the interrupt handler goes.
+const HANDLER: u64 = 0x1800;
+/// The global descriptor table. Needed because *delivering* an interrupt
+/// reloads `CS` from it — the tests above never take one, so they get away
+/// with a zero-limit `GDTR`, and this one would triple-fault on it.
+const GDT: u64 = 0x5000;
+/// The interrupt descriptor table.
+const IDT: u64 = 0x4000;
+/// The stack the interrupt frame is pushed on.
+const STACK: u64 = 0x8000;
+/// The vector the test drives onto the `INTR` pin.
+const VECTOR: u8 = 0x20;
+/// What the shadow-covered `OUT` writes, so that a stray `AL` cannot look like
+/// a pass.
+const SENTINEL: u8 = 0x5a;
+
+/// Offsets in the witness area, for the shadow guest.
+mod sh {
+    /// How many times round the loop.
+    pub(crate) const TICK: u64 = 0;
+    /// How many interrupts the guest has taken.
+    pub(crate) const TAKEN: u64 = 4;
+    /// **The witness.** The `RIP` the *first* interrupt interrupted, as the
+    /// handler read it off its own stack frame.
+    pub(crate) const SEEN_RIP: u64 = 8;
+}
+
+/// The shadow guest, and the addresses inside it the assertions name.
+struct ShadowGuest {
+    placement: Placement,
+    /// The address of the `OUT` that the `STI` before it casts its shadow
+    /// over. A processor stopped here **is** a processor in an interrupt
+    /// shadow, which is what makes this a snapshot worth taking.
+    shadowed_at: u64,
+    /// The address after it: where a correctly shadowed interrupt is taken.
+    after_shadowed: u64,
+}
+
+/// **A guest that can tell whether it was interrupted one instruction early.**
+///
+/// The engine-versus-engine comparison in `tests/kvm_smp.rs` cannot see this
+/// class of defect at all: a field neither side carries looks *identical* on
+/// both sides. So, as with the model-specific registers above, the guest is
+/// the witness — and here it witnesses something no register holds.
+///
+/// The interrupt shadow is the one instruction after a `STI`, a `MOV SS` or a
+/// `POP SS` during which an external interrupt is not recognised (*Intel SDM*
+/// volume 2B, `STI`; volume 3A §6.8.3). It exists so that `STI; HLT` cannot
+/// lose a wakeup and so that a `SS:SP` reload cannot be interrupted halfway.
+/// It is not in `RFLAGS`, not in a control register and not in any MSR; on
+/// hardware it lives in the VMCS's interruptibility state, and
+/// `KVM_GET_VCPU_EVENTS` is the only request that reports it.
+///
+/// The program:
+///
+/// ```text
+///        bd 00 20 00 00   mov ebp, WITNESS       ; the witness area, once
+///   loop:
+///        ff 45 00         inc dword [rbp+0]      ; TICK
+///        b0 5a            mov al, 0x5a
+///        fa               cli                    ; so the STI below shadows
+///        fb               sti
+///        e6 80            out 0x80, al           ; <-- SHADOWED, and an exit
+///        eb f5            jmp loop
+///
+///   handler:                                     ; IDT vector 0x20
+///        83 7d 04 00      cmp dword [rbp+4], 0   ; only the first one counts
+///        75 06            jne skip
+///        8b 04 24         mov eax, [rsp]         ; the RIP it interrupted
+///        89 45 08         mov [rbp+8], eax
+///   skip:
+///        ff 45 04         inc dword [rbp+4]      ; TAKEN
+///        81 64 24 10 ..   and dword [rsp+16], ~IF ; return with IF clear, so
+///        48 cf            iretq                   ; a level-held INTR does not
+///                                                 ; storm
+/// ```
+///
+/// # Why the shadowed instruction is an `OUT`
+///
+/// Because a hypervisor's guest is only observable at an **exit**, and the
+/// snapshot has to be taken *inside* the shadow. Measured on this host rather
+/// than assumed: with `CLI; STI; OUT` in a loop, every `KVM_RUN` comes back
+/// with `RIP` pointing at the `OUT` and `KVM_GET_VCPU_EVENTS` reporting
+/// `interrupt.shadow = 3` — the port write has not retired and the shadow is
+/// still owed. The same sequence with an MMIO access, or with any instruction
+/// between the `STI` and the exit, comes back with the shadow already spent.
+/// So this shape parks the processor exactly where the defect lives, on every
+/// slice, with no timing luck involved.
+///
+/// # What each outcome means
+///
+/// The test asserts the *first* interrupt after the restore, with the `INTR`
+/// pin driven by hand only once the destination engine holds the state:
+///
+/// * `SEEN_RIP == after_shadowed` — the shadow crossed. The `OUT` ran, and
+///   only then was the interrupt taken.
+/// * `SEEN_RIP == shadowed_at` — **the shadow was dropped in the transfer.**
+///   The interrupt landed on the instruction the shadow was protecting. On a
+///   real guest that instruction is the second half of a `MOV SS; MOV ESP`
+///   pair and the interrupt is pushed onto a stack that does not exist yet.
+fn shadow_guest() -> ShadowGuest {
+    let mut main: Vec<u8> = Vec::new();
+    // mov ebp, WITNESS — zero-extends into RBP, so `[rbp+disp8]` reaches the
+    // witness area in 64-bit mode without a REX prefix or a 64-bit immediate.
+    main.push(0xbd);
+    #[allow(clippy::cast_possible_truncation)]
+    main.extend_from_slice(&(WITNESS as u32).to_le_bytes());
+    let loop_at = PROGRAM + main.len() as u64;
+    main.extend_from_slice(&[0xff, 0x45, sh::TICK as u8]); // inc dword [rbp+0]
+    main.extend_from_slice(&[0xb0, SENTINEL]); // mov al, SENTINEL
+    main.push(0xfa); // cli
+    main.push(0xfb); // sti
+    let shadowed_at = PROGRAM + main.len() as u64;
+    main.extend_from_slice(&[0xe6, 0x80]); // out 0x80, al
+    let after_shadowed = PROGRAM + main.len() as u64;
+    let from = PROGRAM + main.len() as u64 + 2;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let delta = (loop_at as i64 - from as i64) as i8;
+    #[allow(clippy::cast_sign_loss)]
+    main.extend_from_slice(&[0xeb, delta as u8]);
+
+    let handler: Vec<u8> = vec![
+        0x83,
+        0x7d,
+        sh::TAKEN as u8,
+        0x00, // cmp dword [rbp+TAKEN], 0
+        0x75,
+        0x06, // jne skip
+        0x8b,
+        0x04,
+        0x24, // mov eax, [rsp]
+        0x89,
+        0x45,
+        sh::SEEN_RIP as u8, // mov [rbp+SEEN_RIP], eax
+        // skip:
+        0xff,
+        0x45,
+        sh::TAKEN as u8, // inc dword [rbp+TAKEN]
+        // and dword [rsp+16], ~IF — the interrupt frame's RFLAGS. `INTR` is a
+        // level this test holds high, so returning with `IF` set would take
+        // the same interrupt again on the instruction after the `IRET` and the
+        // guest would never make progress.
+        0x81,
+        0x64,
+        0x24,
+        0x10,
+        0xff,
+        0xfd,
+        0xff,
+        0xff,
+        0x48,
+        0xcf, // iretq — the frame is the 64-bit one
+    ];
+
+    ShadowGuest {
+        placement: Placement {
+            blobs: vec![
+                (PROGRAM, main),
+                (HANDLER, handler),
+                (GDT, gdt()),
+                (IDT, idt()),
+            ],
+            sys: shadow_system(),
+            rip: PROGRAM,
+            rsp: STACK,
+        },
+        shadowed_at,
+        after_shadowed,
+    }
+}
+
+/// A three-entry global descriptor table: null, a 64-bit code segment at
+/// [`CODE_SEL`], a data segment at [`DATA_SEL`].
+///
+/// The tests above run with a zero-limit `GDTR` because nothing in them ever
+/// loads a descriptor. Taking an interrupt does: the gate names a code
+/// selector and the processor reads it out of this table.
+fn gdt() -> Vec<u8> {
+    let mut out = vec![0u8; 8];
+    // limit ffff, base 0, present/DPL0/code/readable, granular + long.
+    out.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0x9a, 0xaf, 0x00]);
+    // the same, as data: present/DPL0/data/writable, granular + 32-bit.
+    out.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0x92, 0xcf, 0x00]);
+    out
+}
+
+/// An interrupt descriptor table with one 64-bit interrupt gate, at
+/// [`VECTOR`].
+///
+/// A gate rather than a trap gate, and that is the point: an interrupt gate
+/// clears `IF` on entry (*Intel SDM* volume 3A §6.12.1.2), so the handler is
+/// not re-entered by the level this test holds on the pin.
+fn idt() -> Vec<u8> {
+    let mut out = vec![0u8; 16 * (VECTOR as usize + 1)];
+    let gate = 16 * VECTOR as usize;
+    #[allow(clippy::cast_possible_truncation)]
+    let lo = (HANDLER & 0xffff) as u16;
+    #[allow(clippy::cast_possible_truncation)]
+    let mid = ((HANDLER >> 16) & 0xffff) as u16;
+    #[allow(clippy::cast_possible_truncation)]
+    let hi = (HANDLER >> 32) as u32;
+    out[gate..gate + 2].copy_from_slice(&lo.to_le_bytes());
+    out[gate + 2..gate + 4].copy_from_slice(&CODE_SEL.to_le_bytes());
+    out[gate + 4] = 0; // no interrupt-stack table
+    out[gate + 5] = 0x8e; // present, DPL 0, 64-bit interrupt gate
+    out[gate + 6..gate + 8].copy_from_slice(&mid.to_le_bytes());
+    out[gate + 8..gate + 12].copy_from_slice(&hi.to_le_bytes());
+    out
+}
+
+/// [`system`], plus the two descriptor tables an interrupt needs.
+fn shadow_system() -> Sys {
+    let mut sys = system();
+    sys.gdtr = rsemu::cpu::x86::prot::TableReg {
+        base: GDT,
+        limit: 0x17,
+    };
+    sys.idtr = rsemu::cpu::x86::prot::TableReg {
+        base: IDT,
+        limit: 16 * u32::from(VECTOR) + 15,
+    };
+    sys
+}
+
+/// Run until the guest has been round its loop and the processor is stopped on
+/// the shadowed instruction.
+///
+/// The predicate is `RIP`, deliberately, rather than anything either engine
+/// reports about its own interruptibility: a test whose *gate* is the field
+/// under test cannot fail when that field is missing, it can only skip.
+fn park_in_the_shadow(m: &mut Machine, rip_of: &dyn Fn() -> u64, at: u64) -> bool {
+    for _ in 0..400 {
+        m.run_for(GlobalTime::from_nanos(200_000))
+            .expect("the board runs");
+        if peek(m, sh::TICK) > 0 && rip_of() == at {
+            return true;
+        }
+    }
+    false
+}
+
+/// Assert what the guest saw, on whichever engine it woke up on.
+fn assert_the_interrupt_waited(m: &Machine, g: &ShadowGuest, whose: &str) {
+    let taken = peek(m, sh::TAKEN);
+    let seen = u64::from(peek(m, sh::SEEN_RIP));
+    assert!(
+        taken > 0,
+        "{whose}: the restored guest never took the interrupt at all \
+         (tick={}, INTR was driven high before it ran)",
+        peek(m, sh::TICK)
+    );
+    assert_ne!(
+        seen, g.shadowed_at,
+        "{whose}: the interrupt was delivered *on* the instruction the STI \
+         shadowed, at {:#x}. The interrupt shadow did not survive the \
+         transfer — nothing but KVM_GET_VCPU_EVENTS reports it, and the \
+         emulated chunk's `int_shadow` is where it has to land. A real guest \
+         losing this takes an interrupt on a half-loaded SS:SP",
+        g.shadowed_at
+    );
+    assert_eq!(
+        seen, g.after_shadowed,
+        "{whose}: the interrupt was taken at {seen:#x}, which is neither the \
+         shadowed instruction ({:#x}) nor the one after it ({:#x}) — the guest \
+         is somewhere this test does not understand",
+        g.shadowed_at, g.after_shadowed
+    );
+}
+
+/// **A snapshot taken on hardware inside an interrupt shadow, restored under
+/// an emulated engine.**
+fn a_shadowed_hardware_snapshot_restores_under(engine: &str) {
+    let g = shadow_guest();
+    let tag = format!("shadow-kvm-to-{engine}");
+    let Some((mut hardware, accel)) = accelerated(&tag, &g.placement) else {
+        return;
+    };
+    let cpu = accel.cpus()[0].clone();
+    let shell = cpu.clone();
+    assert!(
+        park_in_the_shadow(
+            &mut hardware,
+            &move || shell.shell().regs().rip,
+            g.shadowed_at
+        ),
+        "the accelerated guest never stopped on the shadowed instruction at {:#x}",
+        g.shadowed_at
+    );
+    assert!(
+        cpu.entries() > 0,
+        "the processor never entered the guest, so nothing was accelerated"
+    );
+    // The intermediate claim, named so a failure says which half broke: the
+    // shell is this processor's architectural state between slices, and the
+    // shadow is part of that state.
+    assert!(
+        cpu.shell().interrupt_shadow(),
+        "the vCPU is stopped on the shadowed instruction and the shell does \
+         not know it — `accel::state::store_from_vcpu` is not reading \
+         KVM_GET_VCPU_EVENTS"
+    );
+    let saved = hardware.save().expect("an accelerated machine saves");
+    drop(hardware);
+
+    let (mut emulated, core) = emulated(engine, &tag, &g.placement);
+    emulated
+        .load(&saved)
+        .unwrap_or_else(|e| panic!("a snapshot taken under KVM will not load under {engine}: {e}"));
+    erase(&emulated);
+    assert_eq!(
+        core.regs().rip,
+        g.shadowed_at,
+        "the restore did not put the processor where the snapshot had it"
+    );
+    // Now, and only now, the pin. The board has no interrupt controller on
+    // purpose: what is under test is what the *core* does with the state it
+    // was handed, and a controller would add its own.
+    core.set_intr_vector(VECTOR);
+    core.set_intr(true);
+    for _ in 0..200 {
+        emulated
+            .run_for(GlobalTime::from_nanos(1_000_000))
+            .expect("the board runs");
+        if peek(&emulated, sh::TAKEN) > 0 {
+            break;
+        }
+    }
+    assert_the_interrupt_waited(&emulated, &g, engine);
+}
+
+/// **The other direction**: a snapshot taken under an emulated engine inside
+/// an interrupt shadow, restored onto host silicon.
+fn a_shadowed_snapshot_from_restores_under_hardware(engine: &str) {
+    if !Kvm::is_available() {
+        return;
+    }
+    let g = shadow_guest();
+    let tag = format!("shadow-{engine}-to-kvm");
+    let (mut emulated, core) = emulated(engine, &tag, &g.placement);
+    run_until_witnessed(&mut emulated);
+    // An emulated core stops between instructions wherever it is asked to, so
+    // it is walked to the shadow rather than parked there by an exit. Bounded
+    // by rather more than one turn of the loop.
+    for _ in 0..64 {
+        if core.regs().rip == g.shadowed_at {
+            break;
+        }
+        assert!(core.step() > 0, "the emulated core stopped");
+    }
+    assert_eq!(
+        core.regs().rip,
+        g.shadowed_at,
+        "the emulated guest never reached the shadowed instruction"
+    );
+    assert!(
+        core.interrupt_shadow(),
+        "the interpreter is on the instruction after a STI and does not think \
+         it is shadowed, which is a core bug rather than a transfer one"
+    );
+    let saved = emulated.save().expect("the emulated machine saves");
+    drop(emulated);
+
+    let Some((mut hardware, accel)) = accelerated(&tag, &g.placement) else {
+        return;
+    };
+    hardware
+        .load(&saved)
+        .unwrap_or_else(|e| panic!("a snapshot taken under {engine} will not load under KVM: {e}"));
+    erase(&hardware);
+    let cpu = accel.cpus()[0].clone();
+    cpu.shell().set_intr_vector(VECTOR);
+    cpu.shell().set_intr(true);
+    for _ in 0..200 {
+        hardware
+            .run_for(GlobalTime::from_nanos(1_000_000))
+            .expect("the board runs");
+        if peek(&hardware, sh::TAKEN) > 0 {
+            break;
+        }
+    }
+    assert!(
+        cpu.entries() > 0,
+        "the restored processor never entered the guest"
+    );
+    assert_the_interrupt_waited(&hardware, &g, "on hardware");
+}
+
+#[test]
+fn an_interrupt_shadow_survives_a_snapshot_from_kvm_to_the_interpreter() {
+    a_shadowed_hardware_snapshot_restores_under("interp");
+}
+
+#[test]
+fn an_interrupt_shadow_survives_a_snapshot_from_the_interpreter_to_kvm() {
+    a_shadowed_snapshot_from_restores_under_hardware("interp");
+}
+
+#[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+#[test]
+fn an_interrupt_shadow_survives_a_snapshot_from_kvm_to_the_jit() {
+    a_shadowed_hardware_snapshot_restores_under("jit");
+}
+
+#[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+#[test]
+fn an_interrupt_shadow_survives_a_snapshot_from_the_jit_to_kvm() {
+    a_shadowed_snapshot_from_restores_under_hardware("jit");
 }
 
 /// Says out loud whether the tests above actually ran.
