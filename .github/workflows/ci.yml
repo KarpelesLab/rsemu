@@ -397,9 +397,25 @@ jobs:
       # already assumes node, and the version is pinned here for the same
       # reason it is pinned in the `wasm` job: a runner's default node is not
       # part of this repository's contract.
+      #
+      # **24 rather than 22, and the difference is not cosmetic.** Under node 22
+      # this job died with `signal: 11, SIGSEGV` inside `node` itself, part-way
+      # through `machine::catalog::tests::every_shipped_machine_realizes` — the
+      # process was killed, not the guest, so no test reported a failure and the
+      # snapshot legs after it then failed for want of files that were never
+      # written. Ruled out as a wasm shadow-stack overflow: the same job with a
+      # 4 MiB stack (`scripts/check.sh`) crashed identically, and node 26 runs
+      # the same module to completion on a developer's host. What is left is the
+      # runtime, so the runtime is what moved.
+      #
+      # It could not be reproduced locally — there is no node 22 on the machine
+      # that diagnosed it — so this is the change the evidence points at rather
+      # than one that was watched to fail and then pass. If it comes back, the
+      # next thing to try is `--stack-size` on the `node` invocation in
+      # `scripts/check.sh`'s runner, and after that a runtime that is not node.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       # rustc drives the linker through `cc` for i686-unknown-linux-gnu, and
       # links against a 32-bit libc: without the multilib packages the target
       # installs fine and every link fails at `crt1.o`. `gcc-multilib` pulls
@@ -759,10 +775,21 @@ jobs:
             echo "::error title=aarch64::runner reports $arch; the litmus below would prove nothing"
             exit 1
           fi
-          rustc -vV | grep -qx 'host: aarch64-unknown-linux-gnu' || {
-            echo "::error title=aarch64::rustc is not native aarch64-unknown-linux-gnu"
+          # Captured, not piped into `grep -q`. Under the `pipefail` above,
+          # `rustc -vV | grep -qx …` fails the *pipeline* whenever `grep`
+          # matches early enough to close the pipe before `rustc` has finished
+          # writing: `rustc` takes SIGPIPE, and `pipefail` reports the death of
+          # the producer rather than the success of the consumer. That is a
+          # race, and it lost — this step failed with "rustc is not native"
+          # printed directly beneath `rustc -vV`'s own
+          # `host: aarch64-unknown-linux-gnu`. Same shape as the `strings |
+          # grep -q` that made `fetch-testdata.sh ovmf-debug` call every image a
+          # RELEASE build.
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "$host" != aarch64-unknown-linux-gnu ]; then
+            echo "::error title=aarch64::rustc reports host $host, not native aarch64-unknown-linux-gnu"
             exit 1
-          }
+          fi
           # Two litmus threads have to run at the same instant or the
           # store-buffer test degenerates into two sequential programs, which
           # can never produce the outcome. The referee is blocked at the

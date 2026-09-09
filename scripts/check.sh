@@ -335,15 +335,15 @@ stage_crosshost() {
   # `wasm32-wasip1` has no `std::thread`, so libtest's default of a thread per
   # test aborts before the first one runs.
   export CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings=ExperimentalWarning $(pwd)/scripts/wasi-run.mjs"
-  # wasm-ld defaults the shadow stack to 1 MiB, and
-  # `machine::catalog::tests::every_shipped_machine_realizes` builds every board
-  # in the catalog in one call tree, which has been growing. On this host that
-  # fits; on GitHub's runner under node 22 it did not, and a wasm stack that
-  # runs off its end there took *node itself* down with SIGSEGV rather than
-  # trapping cleanly — so the failure named the runtime and not the depth.
-  # Four MiB is linear-memory address space, not committed pages, and the
-  # module's memory grows on demand either way. Verified as the axis rather
-  # than assumed: at 128 KiB this leg fails here too.
+  # The shadow stack is four MiB rather than wasm-ld's default one.
+  #
+  # This did **not** fix the SIGSEGV it was first written for — see the node
+  # version pinned in `.github/workflows/ci.yml`, which is what did — and it is
+  # kept for the reason it was plausible: `every_shipped_machine_realizes`
+  # builds every board in the catalog in one call tree, that tree has grown all
+  # year, and at 128 KiB this leg does fail on a developer's host. Four MiB is
+  # linear-memory address space, not committed pages. It buys headroom against
+  # a real overflow; it was never the cause of the crash on the runner.
   local wasm_rustflags="$RUSTFLAGS -C link-arg=-zstack-size=4194304"
   run "crosshost replay ($w)" \
     env RUSTFLAGS="$wasm_rustflags" \
