@@ -2,7 +2,8 @@
 
 Consumed by: `core/sched` (the dispatched round), `machine/` (which mode a
 board asks for), `tests/parallel_threading.rs`,
-`tests/parallel_smp_boards.rs`, phase 8. Companion to
+`tests/parallel_smp_boards.rs`, `tests/memory_model_litmus.rs` (whose `machine`
+module is the litmus half of the same argument), phase 8. Companion to
 [`memory-models.md`](memory-models.md), which is about the *ordering* rules a
 parallel run has to preserve; this file is about what a parallel run is allowed
 to be, and how anyone ever knows it is right.
@@ -113,7 +114,11 @@ That gives four kinds of check, in descending order of how much they prove.
    are **not** gates on an x86-64 host, and `tests/memory_model_litmus.rs` says
    so at length: a host strong enough to hide the reordering hides it before
    and after the fix. They gate on a weak host, which is why an AArch64 CI leg
-   exists.
+   exists. On a *machine* they are weaker still, and the measurements below say
+   by how much: an interpreted guest instruction between the store and the load
+   is about as wide as the host's whole store-buffer window, so the machine-level
+   rows check that the barrier is executed rather than discriminate between
+   having one and not.
 3. **A real guest kernel that boots and stays up.** An SMP kernel's own
    spinlocks, IPIs, per-CPU areas and RCU are an atomics stress suite somebody
    else wrote and debugged. See the measurements below.
@@ -249,6 +254,92 @@ threads onto a board a user can run, which is a strictly stronger statement:
 the machine file, the realizer, the scheduler's dispatch, the address space and
 the RAM store are all in the picture now.
 
+**The litmus tests run against a machine now, and they are a blunter
+instrument there.** `tests/memory_model_litmus.rs`'s `machine` module runs two
+litmus shapes as guest programs on two boards that declare `threading
+parallel` — `machines/tests/smp-parallel.machine` (two RV64 harts) and
+`machines/tests/smp-parallel-a64.machine` (two Neoverse-N1-class cores, added
+for this). Ten rows: store-buffering and message-passing, each with the
+architecture's barrier, with `STLR`/`LDAR` where the architecture has it, and
+with neither.
+
+The harness is *in the guest*, and it has to be. A host-thread litmus stops
+both threads after every round and resets the flags; a machine cannot be
+stopped that finely without spending a whole quantum per litmus round, so both
+processors instead run a self-refereeing program that paces itself against the
+other with monotone counters, writes one byte per round saying what it
+observed, and parks. Rust joins the two records afterwards. Nothing in the
+guest ever reads a word the other processor wrote in order to decide an
+outcome, which is the one thing a memory-model test may not do.
+
+| row, 20 000 rounds, x86-64 release | forbidden outcome | rounds where one load was stale |
+| --- | --- | --- |
+| rv, SB, `fence rw,rw` | **0** | 111–1 698 |
+| rv, SB, neither | **0** | 1 050–8 365 |
+| a64, SB, `DMB ISH` | **0** | 889–2 763 |
+| a64, SB, `STLR`/`LDAR` | **0** | 3 793–6 230 |
+| a64, SB, neither | **0** | 4 376–6 463 |
+| rv, MP, `fence w,w` / `fence r,r` | **0** | — |
+| rv, MP, neither | **0** | — |
+| a64, MP, `DMB ISH` | **0** | — |
+| a64, MP, `STLR`/`LDAR` | **0** | — |
+| a64, MP, neither | **0** | — |
+
+Ranges over 31 runs — 25 sequential and two batches of six in parallel, 310
+row-runs in all — every one of which passed. The collision witness (a plain
+non-atomic increment both processors perform every round) lost 1 447–19 656 of
+40 000 across every row and every run, and never zero, so no run in that set
+was vacuous. Fifty to a hundred and thirty machine rounds per row-run, so the
+scheduler's rendezvous falls inside the litmus loop hundreds of times rather
+than around it.
+
+**The unfenced arm is zero too, and that is the finding.** On x86-64 the same
+is true of the host-thread rows, so it says nothing there; what is new is that
+it stays true of the *machine* rows for a reason that will not go away on a
+weakly ordered host. Between the guest's store and the guest's load sit a whole
+interpreted instruction and the scheduler's per-access cycle accounting —
+`tests/memory_model_costs.rs` puts the host's store-buffer window at about forty
+nanoseconds, and one interpreted guest instruction is the same order. So the
+machine-level store-buffer rows are a *check that the machine still executes
+the barrier*, not a discriminator between having one and not. The AArch64 CI
+job says so in its own comment rather than claiming the pair it cannot have.
+
+The third column is the closest thing to a signal: with a barrier, far fewer
+rounds saw *either* load stale — 111–1 698 against 1 050–8 365 on RISC-V — which
+is the fence delaying the load until the other processor's store is visible.
+The ranges nearly touch for the A64 acquire/release pair, so it is suggestive
+rather than a discriminator, and nothing gates on it.
+
+**MP was the shape that found something, and what it found was the torn load.**
+Message-passing needs no tight rendezvous — the reader is already spinning when
+the writer stores — so it is the row that could plausibly fail on a machine, and
+on the first release run of twenty thousand rounds the fenced RISC-V row
+reported one violation on an *x86-64* host, where store-store reordering cannot
+happen at all. It was `RamStore`'s missing single-copy atomicity: the reader
+spins on the flag while the writer stores it, and a four-byte load that mixes
+the old word with the new returns a value larger than either. Eleven
+occurrences in two million RISC-V rounds and thirteen in two million A64 ones
+(25 invocations of the search, four runs of 20 000 apiece), and **every single
+recorded pair was a byte-carry boundary** —
+
+```text
+flag=8959  payload=8704   (0x22ff under 0x2200)
+flag=4095  payload=3840   (0x0fff under 0x0f00)
+flag=19967 payload=19712  (0x4dff under 0x4d00)
+```
+
+— each the low byte of the previous round's value wearing the high bytes of
+this one. Only one round in 256 crosses such a boundary, so the rate among
+rounds that could tear is about 1 500 per million.
+
+The rows that gate were made immune to it rather than being made to depend on
+it: the reader compares the payload against its own round number, which the
+ping-pong pins to the flag value in every untorn case and which a torn flag
+cannot inflate. The sensitive comparison survives as
+`a_torn_flag_load_is_visible_through_a_whole_machine`, `#[ignore]`d, which is
+the first reproduction of that defect through a whole board rather than through
+two hand-spawned threads over an `AddressSpace`.
+
 ## What does not work yet
 
 Named, so that nothing here reads as finished.
@@ -259,25 +350,37 @@ Named, so that nothing here reads as finished.
   all three architectures forbid outright (*Intel SDM* vol. 3 §9.1.1, ARM DDI
   0487 B2.2.1, RISC-V Unprivileged ISA §1.4).
   `tests/smp_single_copy_atomicity.rs` catches it 117–361 times in sixty
-  thousand loads. This is the largest known gap and it is reachable only in
-  this mode.
+  thousand loads, and
+  `tests/memory_model_litmus.rs::machine::rv::a_torn_flag_load_is_visible_through_a_whole_machine`
+  now catches it through a whole board — four times in 1.6 million rounds, with
+  the torn values recorded. This is the largest known gap and it is reachable
+  only in this mode.
 * **`LDAR`/`STLR` on a64 still issue an ordinary load and store.**
   `core::space::BusLock` carries the argument for the shape of the fix.
-* **No litmus run on a weak host.** The roadmap's gate is litmus tests with no
-  violations on native threads *and* in a threaded browser build. The AArch64
-  CI leg exists and `wasm32-wasip1-threads` is executed by
-  `scripts/check.sh wasm-threads`, but neither has been made to run
-  `memory_model_litmus.rs` against a *machine* in `parallel` — the litmus tests
-  still build their concurrency by hand. That is the remaining distance to the
-  gate.
+* **No litmus run on a weak host has been *seen*.** The rows now exist and both
+  legs execute them — the `aarch64 (weak memory)` job runs the whole of
+  `tests/memory_model_litmus.rs`, the machine rows included, and
+  `scripts/check.sh wasm-threads` runs the same file on
+  `wasm32-wasip1-threads`. Every measurement above is from an x86-64 host, so
+  what the gate is still waiting on is a green run of those two legs and the
+  counts they print. Read the counts, not the tick: the machine-level
+  store-buffer rows are expected to read zero in every arm on both hosts, for
+  the sensitivity reason above.
+* **The threaded-wasm leg carries only the A64 machine rows.**
+  `scripts/check.sh`'s `WASM_THREADS_FEATURES` has `machine-a64-mini` and no
+  RISC-V feature at all, so `machine::rv` compiles out there and
+  `tests/riscv_amo_atomicity.rs` is already empty on that target for the same
+  reason. The A64 half of the gate is covered in a threaded browser build; the
+  RISC-V half is not, and closing it is one feature name.
 * **The atomicity suites still spawn their own threads.**
   `tests/a64_lse_atomicity.rs`, `tests/riscv_amo_atomicity.rs` and
   `tests/smp_single_copy_atomicity.rs` construct two `Exec`s over one
   `AddressSpace` and run them on `std::thread`s. That is a sharper instrument —
   it pins both threads in a tight loop and maximises collisions — and it is
-  worth keeping for that reason; but only `tests/parallel_smp_boards.rs`
-  currently makes the claim about a whole machine, and it makes it for RISC-V
-  `AMOADD` only.
+  worth keeping for that reason; but only `tests/parallel_smp_boards.rs` makes
+  the claim about a whole machine, and it makes it for RISC-V `AMOADD` only.
+  `tests/memory_model_litmus.rs`'s `machine` module is the *ordering* half of
+  the same move; the atomicity half has not been made.
 * **One oscillator, two processors** — see above. Every shipped `-smp` board is
   in this configuration.
 * **No `parallel` board is in the frame-hash regression**, and cannot be: the

@@ -703,6 +703,36 @@ jobs:
     # a non-zero count on the paths that are only ordered by accident there.
     # The number to read is never "the gate passed", it is the printed count
     # next to it, which is why `--nocapture` is not optional.
+    #
+    # ## The rows that run against a *machine*, and what they add
+    #
+    # `tests/memory_model_litmus.rs`'s `machine` module runs the same two
+    # litmus shapes as guest programs on two boards that declare `threading
+    # parallel` — `machines/tests/smp-parallel.machine` (two RV64 harts) and
+    # `machines/tests/smp-parallel-a64.machine` (two Neoverse-N1-class cores).
+    # They need no extra step: this job already runs the whole file, and they
+    # are in it.
+    #
+    # They are a strictly stronger claim about the same fences — the scheduler,
+    # the round rendezvous, the realizer, the address space and the RAM store
+    # are all in the picture, where the rows above are two `Exec`s and a
+    # `std::thread::scope`. They are also a **less sensitive instrument**, and
+    # `docs/techniques/parallel-execution.md` has the measurement: between the
+    # guest's store and the guest's load sits a whole interpreted instruction
+    # plus per-access cycle accounting, which is tens of nanoseconds where the
+    # host's store-buffer window is tens of nanoseconds too. So the
+    # machine-level store-buffer rows read **zero in every arm, fenced and
+    # unfenced alike**, on x86-64 and on this runner; the pair that means
+    # something up there means nothing down here, and neither half is required.
+    #
+    # What `RSEMU_WEAK_MEMORY_REQUIRED` does turn into an assertion for those
+    # rows is the collision witness: a plain, non-atomic increment both
+    # processors perform every round, which must lose some. A run in which it
+    # loses none is a run in which the board's two processors never landed
+    # inside each other, and every zero it printed is vacuous — the same
+    # argument the two required checks above make, at the level where "did the
+    # two things overlap" is a property of the *scheduler* rather than of the
+    # host.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
@@ -746,15 +776,18 @@ jobs:
       # for an unrelated reason must not be what stops the memory model from
       # being asked about.
       #
-      # `--release` because `ROUNDS` is 200 000 there and 20 000 otherwise, and
-      # the whole file takes about ten seconds once built.
+      # `--release` because `ROUNDS` is 200 000 there and 20 000 otherwise —
+      # and the machine rows are 20 000 litmus rounds rather than 2 000 — and
+      # the whole file takes about twenty seconds once built.
       # `--test-threads=1` because three of these tests run three threads
-      # apiece and a second test competing for the same cores moves every count
-      # in the file — the same reason `tests/memory_model_costs.rs` gives.
+      # apiece, and the machine rows put two guest processors on two workers
+      # each; a second test competing for the same cores moves every count in
+      # the file — the same reason `tests/memory_model_costs.rs` gives.
       #
-      # RSEMU_WEAK_MEMORY_REQUIRED turns two printed counts into assertions:
-      # the bare-relaxed control must reorder something, and so must the
-      # relaxed `fetch_or` that is a barrier on x86-64 and not here. Without
+      # RSEMU_WEAK_MEMORY_REQUIRED turns three printed counts into assertions:
+      # the bare-relaxed control must reorder something, the relaxed `fetch_or`
+      # that is a barrier on x86-64 and not here must too, and every
+      # machine-level row must have lost some of its plain increments. Without
       # them a runner that quietly became x86-64 would report a held gate that
       # nothing was holding — the argument `RSEMU_CROSSHOST_REQUIRED` makes in
       # the job above. Both are searches, so both retry (`ATTEMPTS` in the test
@@ -773,6 +806,29 @@ jobs:
             -- --nocapture --test-threads=1 || rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "::error title=weak memory::the litmus failed on aarch64 - read the printed counts above before assuming a regression"
+          fi
+          exit "$rc"
+      # The known-defect searches, which are `#[ignore]`d and therefore invisible
+      # to the step above. Both look for a torn load — `RamStore` is a
+      # `Vec<AtomicU8>` accessed by a byte loop, so a guest spinning on a word
+      # another processor is storing can observe a value that was never in
+      # memory — through a whole machine, which is the level
+      # `tests/smp_single_copy_atomicity.rs` does not reach.
+      #
+      # A gate rather than an advisory step, and narrowly: they pass whether or
+      # not they find a tear, and fail only when the run did not complete or
+      # when the pair they recorded was an *ordering* violation rather than a
+      # tear. On this runner that second case would be a defect in `Op::Fence`
+      # or `Op::Dmb` reached through a real board, which is precisely the thing
+      # no x86-64 job can look for.
+      - name: torn-load searches, through a machine
+        run: |
+          set -uo pipefail
+          rc=0
+          cargo test --release --all-features --test memory_model_litmus \
+            -- --ignored --nocapture --test-threads=1 a_torn_flag || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=weak memory::a machine-level torn-load search failed - read the recorded flag/payload pair above"
           fi
           exit "$rc"
       # The rest of the value of an arm64 runner, and it is not small: a

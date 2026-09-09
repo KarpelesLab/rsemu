@@ -1,0 +1,90 @@
+# smp-parallel-a64 - two AArch64 cores on one crystal, sharing one RAM,
+# running at once.
+#
+# `machines/tests/smp-parallel.machine` with `cpu.arm.a64` in place of
+# `cpu.riscv`, and it exists for one reason: the memory-model litmus tests in
+# `tests/memory_model_litmus.rs` need a *machine* to run against for each
+# guest/host memory-model pair the roadmap's phase 8 gate names, and A64 is the
+# guest architecture whose barriers (`DMB`, `STLR`/`LDAR`) the weak-host CI leg
+# was built to interrogate. RISC-V already had a board; this one is the other
+# half of the pair.
+#
+# Everything `machines/tests/smp-parallel.machine` says about the shape applies
+# here unchanged and is not repeated: `threading parallel` is a statement about
+# the hardware and a default rather than a demand, the worker count is a
+# property of the run and is deliberately not sayable in a file, and **one
+# crystal with two runnables is a degenerate configuration** that works only
+# because `SchedulerConfig::max_ticks_per_quantum` caps what the first runnable
+# may reserve. Read that file's header first; this one only records what is
+# different.
+#
+# ## What is different
+#
+# **The part is `neoverse-n1`, not `cortex-a53`.** An A53 is Armv8.0-A without
+# FEAT_LSE, so `LDADD` and `CAS` do not decode on it. Nothing in the litmus
+# programs needs an atomic today - they synchronise with plain monotone stores
+# and spin loops, which is what a litmus harness wants anyway because an atomic
+# in the harness would order the very thing under test - but an atomicity row
+# added later should not have to change the board underneath it.
+#
+# **Both cores come out of reset at the same address** and tell themselves
+# apart by `MPIDR_EL1`, which is the only thing `mpidr` below changes. That is
+# how a real SMP guest does it and how `machines/arm64-virt-smp.machine`'s spin
+# table does it; the alternative - a different reset vector per core - would be
+# a fixture-shaped answer to a question the hardware answers differently.
+#
+# **There is no generic timer.** `cntfrq` and `cntdiv` are left at their
+# defaults because nothing here reads `CNTPCT_EL0`; a board that wanted the
+# timer would set both, as `machines/a64-mini.machine` does.
+#
+# ## Sources
+#
+# *Arm Architecture Reference Manual for A-profile*, DDI 0487: D17.2.90
+# (`MPIDR_EL1`, whose bit 31 is RES1 and whose Aff0 is the low byte) and B2.3
+# for the ordering model the litmus programs are written against. No board
+# vendor's manual is involved - this is a test fixture, not a model of anything
+# anyone built.
+
+machine "smp-parallel-a64" {
+  # A board whose processors are concurrent, and says so.
+  threading parallel
+
+  # How much RAM the two cores share. The litmus scratch is the first kilobyte
+  # of it; the rest is headroom for a program that grows.
+  param shared = 64K
+
+  # One crystal for both cores, exactly as `arm64-virt-smp` has it.
+  osc core = 100 MHz
+
+  space mem { width = 64, unassigned = open-bus, endian = "little" }
+
+  # Identical but for `mpidr`, which is what `MPIDR_EL1` reports and what a
+  # guest program uses to decide which half of the fixture it is. Bit 31 is
+  # RES1; Aff0 is 0 and 1.
+  object cpu0 "cpu.arm.a64" {
+    clock  = core
+    space  = mem
+    engine = "interp"
+    cpu    = "neoverse-n1"
+    mpidr  = 0x80000000
+    reset  = 0x1000
+  }
+
+  object cpu1 "cpu.arm.a64" {
+    clock  = core
+    space  = mem
+    engine = "interp"
+    cpu    = "neoverse-n1"
+    mpidr  = 0x80000001
+    reset  = 0x1000
+  }
+
+  # `image` names a media slot: whoever runs the machine binds the bytes, and
+  # nothing below host/ opens a file. Both cores come out of reset in the same
+  # ROM and branch on `MPIDR_EL1`.
+  object rom "rom" { size = 4K, image = "code" }
+  object ram "ram" { size = shared }
+
+  map mem 0x00001000 size 4K     = rom
+  map mem 0x00100000 size shared = ram
+}
