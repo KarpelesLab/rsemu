@@ -78,6 +78,14 @@ four minutes, which is well past the shell prompt:
 | `jit` | 19.8 s (**1.27×**) | 103.7 s (**1.18×**) |
 | `jit-host` | 10.3 s (**2.44×**) | 56.8 s (**2.15×**) |
 
+Those cells **predate the store policy below**, which took 29.3% off the host
+instruction count of the same boot and is not in them: this file's own rule is
+that a before-and-after taken from two different sittings is not evidence, and
+re-running the sweep on a machine carrying five other jobs would have produced
+exactly that. The change was measured under callgrind instead, where the
+instrument does not care what else is running, and the table there is the one
+to read.
+
 Every cell is the median of three interleaved runs, and in each sweep all three
 engines — and the binary from before the last change, run in the same sweep —
 finished on one state hash: `0x887e28c90a99e82b` at sixty seconds and
@@ -180,10 +188,180 @@ how many boundaries a read is able to move above, which is bounded by how long
 a block is, and that workload's blocks retire 3.18 guest instructions against
 `pc64`'s 4.79 and `arm64-virt`'s 6.44 — the same ordering as the savings,
 −0.73%, −2.57% and −4.74%. A workload with longer blocks would be worth more
-here, and the thing that would lengthen them is named in
-[`src/cpu/riscv/lift.rs`](../../src/cpu/riscv/lift.rs): a store still ends
-every block on this core, which A64 stopped doing in the same round and gained
-14.6% by.
+here, and the thing that would lengthen them was named in
+[`src/cpu/riscv/lift.rs`](../../src/cpu/riscv/lift.rs) — a store ended every
+block on this core, which A64 stopped doing in the same round and gained 14.6%
+by. That is the next section, and it is worth **more** here for exactly the
+reason this one is worth less.
+
+### What a boot profile says, and what it said to do about it
+
+There was no RISC-V boot profile. `pc64` and `arm64-virt` each had one and this
+board did not, so the number every per-block cost is divided by — **guest
+instructions per block** — was unknown on the core with the shortest blocks in
+the tree. [`benches/riscv_linux_boot.rs`](../../benches/riscv_linux_boot.rs) is
+that profile: OpenSBI's `fw_jump` plus a Debian `riscv64` kernel and a busybox
+initramfs, 512 MiB, `engine = "jit-host"`, twenty guest seconds — which on this
+board's clock reaches `ftrace: allocating …`, so the workload is firmware and
+early kernel init rather than userspace, and a longer `--seconds` carries the
+same run on to a shell. Under callgrind with `--cache-sim=no` and
+`--smc-check=all-non-file`. The second flag
+is not optional — generated code lives in an anonymous mapping this process
+writes and then executes, and valgrind's default translation cache would run
+the bytes it saw first.
+
+**33 074 683 179 host instructions against 106 693 403 guest instructions
+retired — 310 host instructions per guest instruction, of which the code the
+JIT generated was twenty-three.** Everything else is the runtime around it, and
+almost all of it is per *block*:
+
+| | share | per guest instruction |
+| --- | --- | --- |
+| the dispatch loop (`Hart::advance`, everything inlined into it) | 29.53% | 91.5 |
+| replaying deferred charges and boundaries (`flush_thunk`) | 23.85% | 73.9 |
+| **the code the JIT generated** | **7.32%** | **22.7** |
+| the entry translation (`Exec::translate`) | 5.73% | 17.8 |
+| admitting a block: the fetch, its walk, the interrupt check | 4.94% | 15.3 |
+| the inlined store path (`jit::Tlb::note_fast_store` and its caller) | 4.77% | 14.8 |
+| reading a guest register (`get_slot_thunk`) | 2.83% | 8.8 |
+| zeroing guest RAM at reset (`RamStore::fill`) | 2.52% | — |
+| the per-block TLB resync (`jit::Tlb::sync`) | 2.48% | 7.7 |
+| the address space's write path (`FlatLeaf::write`) | 1.60% | 5.0 |
+| the scheduler's event queue (`EventQueue::advance_to`) | 1.30% | 4.0 |
+| the dirty log (`Host::note_writes`) | 1.16% | 3.6 |
+| lifting, verifying, allocating and compiling | 2.97% | 9.2 |
+
+That accounts for 91% of the run, and the `RamStore::fill` row is a startup
+cost rather than a rate — a reset zeroes 512 MiB of guest RAM once.
+
+**The number that decides all of it is at the bottom of the census this
+benchmark prints: 5.51 guest instructions per block**, against a frontend limit
+of 64 and against `pc64`'s 4.79 and `arm64-virt`'s 6.44. Every per-block row
+above is divided by that. So `ROADMAP.md` §9's remaining speed list —
+cross-block register allocation, memory-op fusion — is aimed at the 7.32%, and
+the measurement says the block length is aimed at the other 60.
+
+#### A store no longer ends a block
+
+A block ended at every store, because a store into the page a block was lifted
+from makes every instruction after it a translation of bytes that no longer
+exist, and the invalidation that catches it runs at a block boundary. The way
+out is `cpu::arm::a64::lift::Smc` — the same rule made a *policy* — and its
+author filed it here rather than applying it, on the grounds that it needed its
+own measurement on a real guest and two engine-side answers this core had not
+given. All three of the prerequisites that filing claimed turned out to be
+there, unchanged: `Admitted::base` is the physical page the entry translation
+resolved to, `Host::note_writes` already walks every store's guest-physical
+page into `jit::DirtyPages`, and `Host::spent` is one comparison of `Exec::used`
+against the run's allowance that `Host::hand_back` can already force.
+
+[`lift::Smc::HostGuard`](../../src/cpu/riscv/lift.rs) is therefore what x86's
+in-block guard is *for* without being what x86 emits: the comparison happens in
+the host, between two physical pages, and costs no IR at all. `cpu::x86::lift`
+has to express it over **linear** addresses because that is the only address
+the IR has, which is why x86 refuses the guard under paging — two linear pages
+may alias one physical page. Here both ends are physical, so a store through a
+second mapping of the code page is caught, and this core needs no fallback.
+
+The two engine-side answers are the interesting half, because "a store ends the
+block" was load-bearing for three things and only one of them is
+self-modifying code. Both are paid in `IrHost::store`, and neither can arrive
+through the backend's inlined path, because a memory plan covers plain
+little-endian RAM over a whole page:
+
+1. **An interrupt the store raised.** On this board that is not hypothetical
+   and it is not the GIC-shaped case the other two cores argue: the **CLINT is
+   lazily advanced**, so a write to `mtimecmp` republishes and can drive `mtip`
+   between two instructions of a lifted block, where `admit` would have seen it
+   at the boundary that no longer exists. `IrHost::load` already asks this
+   question for the *read* side of the same device, for the same reason; the
+   store side is the other half of it. `msip` and the PLIC's claim registers
+   are the same shape.
+2. **A topology change.** The backend takes the inlined memory path's host
+   pointers out of the shadow TLB **once per block**, and they die when the
+   topology moves. The host now samples `AddressSpace::generation` at block
+   entry and again after each store that reaches it.
+
+   The other two cores file this as *"a store that remaps the address space"*,
+   and **on this tree that route does not exist** — which is worth writing down
+   rather than inheriting. `core::space`'s ladder puts `LockRank::TOPOLOGY`
+   above `LockRank::BUS`; the access path holds the space's topology lock for
+   *reading* while a device handler runs; a handler that reaches back for the
+   write guard is a lock-order violation that panics in a debug build and
+   deadlocks in a release one. (It was written as a test here, and it hung,
+   which is how this was found.) The sanctioned spelling is
+   `core::device::Deferred`, whose queue `Machine` drains between quanta rather
+   than inside the access — so a remap a guest store asks for lands on a
+   quantum boundary either way. What the comparison does cover is a retopology
+   from *outside* this hart: a monitor hot-plugging through
+   `AddressSpace::try_topology`, or another runnable under
+   `ThreadingMode::Parallel`. Those are supposed to arrive through the
+   safe-point protocol, which is a block boundary, so this is the belt rather
+   than the braces. It is kept because what makes it unnecessary is a property
+   of `core::space`'s lock ladder rather than of the CPU, and a seam that
+   gained a synchronous remap would make it load-bearing again without
+   touching this file.
+
+#### What it bought
+
+The same twenty guest seconds, the same binary but for `engine.rs`'s `SMC`
+constant, the same **106 693 403** guest instructions retired, the same 98 381
+interpreted, and the same 12 232 755 inlined-probe loads and 12 828 801 inlined
+stores — so the guest did identical work and this is host cost alone. And the
+three engines agree on `Machine::state_hash` under the new policy over exactly
+this run: `riscv_linux_boot --seconds 20 --hash` ends on `0xabfba26d09bef47f`
+under `interp`, `jit` and `jit-host` alike, which is `ROADMAP.md` §0's promise
+checked against the oracle on a real guest rather than on a synthetic one.
+
+| | ends the block | the host guard |
+| --- | --- | --- |
+| **host instructions** | 33 074 683 179 | **23 373 298 446** (−29.33%) |
+| blocks executed | 19 353 716 | **6 705 422** (−65.4%) |
+| **guest instructions per block** | **5.51** | **15.91** |
+| distinct blocks lifted | 16 885 | 10 595 |
+| blocks reached by a patched exit | 90.2% | 83.5% |
+| *and then, by row:* | | |
+| the dispatch loop (`Hart::advance`) | 9 767 356 026 (29.53%) | 3 682 816 235 (15.76%) |
+| replaying deferred bookkeeping (`flush_thunk`) | 7 888 117 850 (23.85%) | 7 419 434 464 (31.74%) |
+| the entry translation (`Exec::translate`) | 1 895 197 134 (5.73%) | 708 483 746 (3.03%) |
+| `admit` | 1 633 912 051 (4.94%) | 576 199 031 (2.47%) |
+| reading a guest register (`get_slot_thunk`) | 936 211 473 (2.83%) | 617 595 980 (2.64%) |
+| the per-block TLB resync (`jit::Tlb::sync`) | 819 849 007 (2.48%) | 288 620 659 (1.23%) |
+| the interrupt check (`Exec::pending_interrupt`) | 139 684 790 (0.42%) | 51 600 108 (0.22%) |
+| the guard's own row (`Host::note_writes`) | 382 673 906 (1.16%) | 425 658 709 (1.82%) |
+| the inlined store path (`jit::Tlb::note_fast_store`) | 1 026 304 080 | 1 026 304 080 |
+| the code the JIT generated | 2 421 951 553 (7.32%) | 1 980 284 396 (8.47%) |
+
+Read the last four rows together with the second. **The interrupt check went
+down** even though this change added a call site to it, because there are 65%
+fewer blocks to admit — the same result A64 got, for the same reason. **The
+inlined store path did not move at all**, to the instruction, because the guest
+makes exactly the same stores either way; that row is the control that says the
+two columns really are the same guest work. **The guard's own row is where its
+cost lands**: `Host::note_writes` rises by 42 984 803 host instructions, about
+two per store, against 9.70 **G** the policy saved. And **the generated code
+shrank by 18%** without a single change to the code generator, because a
+block's prologue and epilogue are per block and there are now a third as many
+of them.
+
+The one row that rises as a *share* is the deferred-bookkeeping replay, and it
+is the informative one: it fell by 5.9% in absolute terms and rose from 23.85%
+to 31.74% of the run, because what a replay costs is mostly the events in it.
+It is now by a wide margin the largest row in this profile, and the next thing
+that shortens it is fewer events rather than fewer blocks — the same conclusion
+`arm64-virt` reached from a smaller version of the same table.
+
+What the policy gives up is precision: the exit is per **page**, so a store to
+a datum that merely shares a page with the code leaves the block too. That is
+the granularity the block cache's own invalidation has always had, and the
+census prices it — 51 translations killed by a block's store in twenty guest
+seconds against 106 693 403 guest instructions retired. It is not a rate.
+
+`tests/riscv_lift_differential.rs` runs the whole generated corpus under both
+policies against the one interpreter, and asserts that the guard retires
+strictly more instructions than the control as well as agreeing with it: a
+policy that got faster by getting *wrong* should fail a test rather than win a
+column.
 
 ### The CLINT can raise `mtip` in the middle of a block
 

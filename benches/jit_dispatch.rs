@@ -57,9 +57,10 @@
 //!   touches no memory. Its back edge is a direct `JAL`, so a trace unrolls it.
 //! * **`memcpy`** — a byte-at-a-time copy loop: a load, a store, six
 //!   arithmetic instructions and a branch. Every iteration crosses the memory
-//!   path twice, and the **store** ends the block under every shape
-//!   (`cpu::riscv::lift`, "A store still ends the block"), so this is the
-//!   workload that shows what that rule costs.
+//!   path twice. The **store** used to end the block under every shape, which
+//!   made this the workload that showed what that rule cost; under
+//!   [`lift::Smc::HostGuard`] it no longer does, and this is now the workload
+//!   that shows what dropping it bought.
 //! * **`load-heavy`** — four loads and a jump. Under the basic-block shape the
 //!   lifter ended a block at every access, so this was one guest instruction
 //!   per block and the highest ratio of memory work to everything else the
@@ -108,7 +109,7 @@ use std::time::{Duration, Instant};
 use rsemu::core::error::Result;
 use rsemu::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region, UnassignedPolicy};
 use rsemu::core::value::Width;
-use rsemu::cpu::riscv::lift::{self, Origin, PC, SLOT_COUNT, Shape, x_slot};
+use rsemu::cpu::riscv::lift::{self, Origin, PC, SLOT_COUNT, Shape, Smc, x_slot};
 use rsemu::cpu::riscv::{Config, Hart};
 use rsemu::ir::{AccessKind, Align, InsnStart, IrHost, MemOp, RegSlot};
 use rsemu::jit::{
@@ -607,6 +608,17 @@ fn with_backend(disp: Dispatcher, _allocate: bool) -> Dispatcher {
 /// it rather than leaving it at the maximum.
 const BLOCK_BUDGET: usize = 4096;
 
+/// What a store does to the block it is in — `cpu::riscv::engine`'s own
+/// policy, so this ladder measures the engine that ships.
+///
+/// [`BenchHost`] owes it the check `cpu::riscv::engine::Host::note_writes`
+/// makes, and pays it: a store into the page the program was loaded on sets
+/// [`BenchHost::smc`], which [`IrHost::spent`] reports. None of the workloads
+/// here stores into its own code, so the flag never fires and the column is a
+/// measurement of the ordinary path — but a workload that did would leave the
+/// block rather than run on through bytes it no longer holds.
+const SMC: Smc = Smc::HostGuard;
+
 // ---------------------------------------------------------------------------
 // The frontend and the host
 // ---------------------------------------------------------------------------
@@ -635,7 +647,7 @@ impl<H: ?Sized> Frontend<H> for Lifter {
         }
     }
     fn key(&mut self) -> u64 {
-        lift::key(&self.cfg, Origin::Bare, self.shape)
+        lift::key(&self.cfg, Origin::Bare, self.shape, SMC)
     }
     fn pc_slot(&self) -> RegSlot {
         PC
@@ -655,6 +667,7 @@ impl<H: ?Sized> Frontend<H> for Lifter {
             &mut src,
             lift::MAX_INSNS,
             self.shape,
+            SMC,
         )?;
         Ok(Translation {
             page: pc & !rsemu::jit::PAGE_MASK,
@@ -676,6 +689,11 @@ struct BenchHost {
     /// baseline the TLB row is compared against.
     tlb: Option<Tlb>,
     dirty: DirtyPages,
+    /// Whether a store has landed in the page the program was loaded on.
+    ///
+    /// [`SMC`]'s obligation. Monotone, which is what [`IrHost::spent`]
+    /// requires, and never set by any workload in this file.
+    smc: bool,
 }
 
 impl BenchHost {
@@ -691,6 +709,17 @@ impl BenchHost {
             tlb: tlb.then(|| Tlb::new(Arc::clone(&space))),
             space,
             dirty: DirtyPages::new(),
+            smc: false,
+        }
+    }
+
+    /// [`SMC`]'s comparison. Bare mode, so the address written is the physical
+    /// one, and the program is loaded at [`BASE`] on a page a block never
+    /// leaves.
+    fn note_store(&mut self, addr: u64, bytes: u64) {
+        self.dirty.note(addr, bytes);
+        if addr & !rsemu::jit::PAGE_MASK == BASE {
+            self.smc = true;
         }
     }
 
@@ -719,7 +748,7 @@ impl BenchHost {
         let bytes = mem.size.bytes();
         if addr.is_multiple_of(bytes) {
             if value.is_some() {
-                self.dirty.note(addr, bytes);
+                self.note_store(addr, bytes);
             }
             return self.once(addr, mem.size, value);
         }
@@ -736,7 +765,7 @@ impl BenchHost {
                 Ok(got)
             }
             Some(v) => {
-                self.dirty.note(addr, bytes);
+                self.note_store(addr, bytes);
                 for i in 0..bytes {
                     self.once(addr.wrapping_add(i), Width::U8, Some(v >> (8 * i)))?;
                 }
@@ -761,6 +790,12 @@ impl IrHost for BenchHost {
     }
     fn charge(&mut self, _ticks: u64) {}
     fn insn_start(&mut self, _mark: &InsnStart) {}
+
+    /// [`SMC`]'s obligation: leave the block at the first boundary after a
+    /// store into the page the code came from. Never true for these workloads.
+    fn spent(&self) -> bool {
+        self.smc
+    }
 }
 
 impl StoreLog for BenchHost {
@@ -799,7 +834,7 @@ impl FastMem for BenchHost {
         if let Some(tlb) = self.tlb.as_mut() {
             tlb.note_fast_store(addr, bytes);
         }
-        self.dirty.note(addr, bytes);
+        self.note_store(addr, bytes);
     }
 }
 

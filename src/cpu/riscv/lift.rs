@@ -85,7 +85,7 @@
 //! elimination may not remove one whose value is discarded — `lw x0, 0(a0)`
 //! really does read the bus.
 //!
-//! ## A store still ends the block, for a different reason
+//! ## A store and the block it is in
 //!
 //! A **load** cannot change what the rest of the block means. A store can: if
 //! it lands in the page the block was lifted from, every instruction after it
@@ -102,35 +102,77 @@
 //! readily, because a `JAL` linking into a register a later store uses as its
 //! base is enough.
 //!
-//! The invalidation mechanism's granularity is what forces the answer: a guest
-//! store is matched against cached translations at the **block boundary**
-//! (`jit::dispatch`), so a block boundary is where a store's effect on code
-//! can first be honoured. Ending the block after a store puts the boundary
-//! exactly there. It costs a store-heavy loop one extra block per store and
-//! costs a load-heavy one nothing at all, which is the shape of the trade.
+//! So the store has to be **noticed**, and [`Smc`] is the two ways of doing
+//! it. This used to have one answer, [`Smc::EndBlock`]: a guest store is
+//! matched against cached translations at the **block boundary**
+//! (`jit::dispatch`), so ending the block after a store puts a boundary
+//! exactly where the effect can first be honoured. Correct, and expensive.
+//! `benches/riscv_linux_boot.rs` is what says how expensive: over twenty guest
+//! seconds of OpenSBI plus a Debian `riscv64` kernel, a block held **5.51**
+//! guest instructions against a [`MAX_INSNS`] of 64, and every per-block cost
+//! in that profile — the dispatch loop at 29.5% of the run, the
+//! deferred-charge replay at 23.9%, the entry translation, the interrupt check
+//! `cpu::riscv::engine`'s `admit` does per block — was divided by that number.
 //!
-//! **The way out exists and this frontend has not taken it.** `jit::dispatch`
-//! records that an **x86** frontend would need a check *within* a block, and
-//! guesses that it needs "a finer hook than this one". It turned out not to:
-//! `cpu::arm::a64::lift::Smc` is the same rule made a policy, and the hook is
-//! [`IrHost::spent`](crate::ir::IrHost::spent), which already exists. A64's
-//! host compares the guest-**physical** page of every store — which it sees
-//! anyway, on the way into `jit::DirtyPages` — against the physical page the
-//! block's own bytes came from, and retires the run's tick allowance on a
-//! match, so the block leaves at the boundary after the store instead of
-//! before it. Nothing is emitted; a block simply stops ending at a store that
-//! did not matter. On an arm64 Linux boot that took a block from 6.44 guest
-//! instructions to 10.80 and 14.6% off the host instruction count.
+//! ### Why x86's answer is not this one
 //!
-//! Every piece of it is already here: `cpu::riscv::engine`'s `Admitted::base`
-//! is the physical page the entry translation resolved to, its `Host` has the
-//! same `note_writes` on the same `DirtyPages`, and its `spent` is the same
-//! comparison against the same allowance. What that engine would also have to
-//! answer is the pair A64 found underneath the rule — an interrupt a store
-//! *raises* on a device, and a store that **remaps** and so retires the host
-//! pointers the backend took out of the shadow TLB at block entry — because
-//! today both are answered by the block boundary a store creates. Until
-//! someone does that and measures it on a real guest, this rule stays.
+//! `cpu::x86::lift` faced the same cost first and solved it with an **in-block
+//! guard**: after each store, three IR instructions compare the store's
+//! address page against the block's own and leave through a precise exit when
+//! they match. It has to express it over *linear* addresses because that is
+//! the only address the IR has, which is exactly why x86 **refuses** the guard
+//! under paging — two linear pages may alias one physical page, so a store
+//! through the other mapping walks past a linear comparison.
+//!
+//! **The argument transfers; the mechanism does not have to.** What the guard
+//! is *for* is a comparison against the physical page a block's bytes came
+//! from, and on this core there is somewhere better to make it than the IR:
+//! `cpu::riscv::engine`'s `Host` sees the **guest-physical** address of every
+//! store there is. It already collects them — `Exec::note_write` feeds
+//! `jit::DirtyPages`, which is what invalidates a *cached* translation of a
+//! page the guest rewrote — and it is by physical page at both ends, because
+//! `Admitted::base` is the physical page the entry translation resolved to.
+//! [`Smc::HostGuard`] is that same comparison made one step earlier: when a
+//! store's physical page is the running block's own, the host retires the
+//! run's tick allowance and the block leaves at its next guest instruction
+//! boundary, which is the boundary the store's own instruction ends at.
+//!
+//! * **It has no aliasing hole.** Physical at both ends, so a store through a
+//!   second mapping of the code page is caught — the case that forces x86 back
+//!   to [`Smc::EndBlock`] under paging, and not a hypothetical here: Linux
+//!   patches kernel text through the linear map while it is mapped executable
+//!   elsewhere.
+//! * **It costs no IR at all.** Nothing is emitted; a block simply stops
+//!   ending at a store that did not matter.
+//! * **It is the same code for a compiled store and an interpreted one**,
+//!   because `FastMem::note_fast_store` and `IrHost::store` both go through
+//!   one `Host::note_writes`.
+//!
+//! What it gives up is precision: the exit is per **page**, so a store to a
+//! datum that merely shares a page with the code leaves the block too. That is
+//! the granularity the block cache's own invalidation has always had, and the
+//! boot measured what it costs — 51 translations killed by a block's store in
+//! twenty guest seconds, against 106 693 403 guest instructions retired. It is
+//! not a rate.
+//!
+//! ### What else a store used to be the boundary for
+//!
+//! "A store ends the block" was load-bearing for three things and not one, and
+//! the other two are `cpu::riscv::engine`'s to pay:
+//!
+//! * an interrupt a store *raises* — a write to `mtimecmp` on the
+//!   lazily-advanced CLINT, to `msip`, or to the PLIC — which `admit` would
+//!   have seen at the block boundary that no longer exists;
+//! * a **topology change**, which invalidates the host pointers the backend
+//!   took out of the shadow TLB once at block entry.
+//!
+//! Both are answered where the store happens, in `IrHost::store`, and neither
+//! can arrive through the backend's inlined path: a plan covers plain RAM
+//! only. `cpu::arm::a64::engine` and `cpu::x86::engine` pay the same two for
+//! the same reason, though they file the second as *"a store that remaps"* and
+//! on this tree a guest store cannot remap synchronously at all —
+//! `cpu::riscv::engine`'s `Host::topology` says what stops it, and what the
+//! comparison does still cover.
 //!
 //! # Superblocks: merging across direct branches
 //!
@@ -376,9 +418,9 @@ pub enum Stop {
     /// An encoding outside the subset. It was not lifted; the block's exit PC
     /// is its address, so the interpreter executes it next.
     Unsupported,
-    /// A load or store, which was lifted and ended the block because the
-    /// [`Shape::BasicBlock`] shape asked for it. Never reported by the other
-    /// two shapes, where an access is an ordinary instruction (module docs).
+    /// A memory access that ended the block: a store under
+    /// [`Smc::EndBlock`], and a load under [`Shape::BasicBlock`]. Under the
+    /// default pair an access is an ordinary instruction (module docs).
     Access,
     /// A transfer of control this block cannot follow: a `JALR` always, and a
     /// branch or a `JAL` under a [`Shape`] that does not merge.
@@ -414,12 +456,12 @@ pub enum Shape {
     /// instruction per block, and per-block dispatch then costs more than the
     /// work it dispatches to.
     BasicBlock,
-    /// An extended basic block: a **load** is an ordinary instruction, and only
-    /// a store or a transfer of control ends the block.
+    /// An extended basic block: a **load** is an ordinary instruction, and
+    /// only a transfer of control — or, under [`Smc::EndBlock`], a store —
+    /// ends the block.
     ///
     /// One entry, one exit, and the shape that isolates what dealing with the
-    /// tick column alone bought. A store still ends it, for a reason that is
-    /// about self-modifying code rather than about ticks (module docs).
+    /// tick column alone bought.
     Extended,
     /// A trace: direct branches are merged in, with a precise side exit for
     /// each path not taken.
@@ -501,16 +543,79 @@ impl Origin {
 
     /// This origin's contribution to [`Block::key`].
     ///
-    /// Bit 5 separates the two worlds, so a physical lift and a virtual lift
+    /// Bit 6 separates the two worlds, so a physical lift and a virtual lift
     /// of the same number never collide; above it sits the generation, exact
-    /// until it passes 2^58 — at one `SFENCE.VMA` per nanosecond, nine years —
+    /// until it passes 2^57 — at one `SFENCE.VMA` per nanosecond, four years —
     /// after which two generations may alias and a cache would return a stale
     /// block. Recorded rather than hidden: a wider key is the fix if it ever
     /// matters.
+    ///
+    /// It was bit 5 until [`Smc`] needed one below it, and moving the whole
+    /// field up is what keeps the key a partition rather than a set of
+    /// overlapping claims on the same bits.
     const fn key_bits(self) -> u64 {
         match self {
             Origin::Bare => 0,
-            Origin::Paged { generation } => (1 << 5) | generation.wrapping_shl(6),
+            Origin::Paged { generation } => (1 << 6) | generation.wrapping_shl(7),
+        }
+    }
+}
+
+/// What a store does to the block it is in.
+///
+/// RISC-V does not make instruction fetch coherent with stores — a guest owes
+/// a `FENCE.I` — but `ROADMAP.md` §0's bit-identical state hash across the two
+/// engines does, because the interpreter re-fetches every instruction. See the
+/// module docs, "A store and the block it is in", for the two answers and why
+/// [`Smc::HostGuard`] is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Smc {
+    /// A store is the last guest instruction in its block.
+    ///
+    /// Correct, and what this frontend did until the cost was measured: it
+    /// bounded a block at 5.51 guest instructions on a real riscv64 Linux
+    /// boot, against a [`MAX_INSNS`] of 64. It stays as the control a speed
+    /// claim is measured against, and as the answer for a caller with no
+    /// host-side store log.
+    EndBlock,
+    /// A store is an ordinary instruction, and the **host** compares its
+    /// guest-physical page against the running block's own.
+    ///
+    /// The default. It emits nothing — the check is `cpu::riscv::engine`'s
+    /// `Host::note_writes`, which every store already passes through on its
+    /// way to `jit::DirtyPages`, compiled and interpreted alike — and it is
+    /// exact where `cpu::x86::lift`'s in-block guard is not, because both ends
+    /// of the comparison are physical.
+    ///
+    /// # What a caller owes for it
+    ///
+    /// **A store into the running block's own physical page must leave the
+    /// block at the next guest instruction boundary.** A backend reaches that
+    /// boundary through [`IrHost::spent`](crate::ir::IrHost::spent); the
+    /// engine answers it by retiring the run's allowance. A caller that lifts
+    /// under this policy and does not implement that check gets a block that
+    /// executes bytes the guest has already overwritten, which the
+    /// architecture permits and this project does not.
+    ///
+    /// Two more things a store used to be the boundary for come with it, and
+    /// both are the engine's: an interrupt a store *raises* on a device — the
+    /// CLINT is lazily advanced and a write to `mtimecmp` republishes — and a
+    /// **topology change**, which retires the host pointers the backend took
+    /// out of the shadow TLB at block entry.
+    #[default]
+    HostGuard,
+}
+
+impl Smc {
+    /// This policy's contribution to [`Block::key`].
+    ///
+    /// In the key for the reason [`Shape`] is: both are *correct*, and a cache
+    /// that mixed them would make a measurement of one a measurement of
+    /// whichever happened to be resident.
+    const fn key_bits(self) -> u64 {
+        match self {
+            Smc::EndBlock => 0,
+            Smc::HostGuard => 1 << 5,
         }
     }
 }
@@ -577,12 +682,13 @@ pub fn lift<S: InsnSource>(
     src: &mut S,
     max_insns: usize,
     shape: Shape,
+    smc: Smc,
 ) -> Result<Lifted> {
     if !matches!(cfg.xlen, Xlen::Rv64) {
         return Err(Error::Unimplemented("the RISC-V IR frontend is RV64 only"));
     }
 
-    let mut lf = Lifter::new(cfg, origin, entry_pc, shape);
+    let mut lf = Lifter::new(cfg, origin, entry_pc, shape, smc);
     let page = lf.page;
     let mut pc = entry_pc;
     let mut insns = 0usize;
@@ -631,10 +737,10 @@ pub fn lift<S: InsnSource>(
             Flow::Access { next, store } => {
                 insns += 1;
                 pc = next;
-                // A store ends the block under every shape, and the reason is
-                // not the tick column — see "A store still ends the block" in
-                // the module docs.
-                if store || shape.access_ends_block() {
+                // A load ends the block only under [`Shape::BasicBlock`]. A
+                // store ends it under [`Smc::EndBlock`] and not otherwise —
+                // see "A store and the block it is in" in the module docs.
+                if shape.access_ends_block() || (store && matches!(smc, Smc::EndBlock)) {
                     break Stop::Access;
                 }
             }
@@ -685,7 +791,7 @@ pub fn lift<S: InsnSource>(
 /// dispatcher that derived the key itself would be a second copy of the
 /// answer, and the two would drift.
 #[must_use]
-pub fn key(cfg: &Config, origin: Origin, shape: Shape) -> u64 {
+pub fn key(cfg: &Config, origin: Origin, shape: Shape, smc: Smc) -> u64 {
     let mut key = 0u64;
     if cfg.ext.c {
         key |= 1;
@@ -696,7 +802,7 @@ pub fn key(cfg: &Config, origin: Origin, shape: Shape) -> u64 {
     if matches!(cfg.xlen, Xlen::Rv64) {
         key |= 4;
     }
-    key | shape.key_bits() | origin.key_bits()
+    key | shape.key_bits() | smc.key_bits() | origin.key_bits()
 }
 
 // The block bound is one page, and it is sound only because the smallest
@@ -1011,12 +1117,12 @@ struct Lifter<'a> {
 }
 
 impl<'a> Lifter<'a> {
-    fn new(cfg: &'a Config, origin: Origin, entry_pc: u64, shape: Shape) -> Lifter<'a> {
+    fn new(cfg: &'a Config, origin: Origin, entry_pc: u64, shape: Shape, smc: Smc) -> Lifter<'a> {
         Lifter {
             cfg,
             shape,
             page: entry_pc & !PAGE_MASK,
-            b: BlockBuilder::new(entry_pc, key(cfg, origin, shape)),
+            b: BlockBuilder::new(entry_pc, key(cfg, origin, shape, smc)),
             x: [None; 32],
             zero: None,
             ticks: 0,
@@ -1550,11 +1656,16 @@ mod tests {
     }
 
     fn lift_shaped(cfg: &Config, base: u64, words: &[u32], shape: Shape) -> Lifted {
+        lift_policy(cfg, base, words, shape, Smc::default())
+    }
+
+    fn lift_policy(cfg: &Config, base: u64, words: &[u32], shape: Shape, smc: Smc) -> Lifted {
         let mut src = Bytes {
             base,
             words: words.to_vec(),
         };
-        let lifted = lift(cfg, Origin::Bare, base, &mut src, MAX_INSNS, shape).expect("RV64 lifts");
+        let lifted =
+            lift(cfg, Origin::Bare, base, &mut src, MAX_INSNS, shape, smc).expect("RV64 lifts");
         verify(&lifted.block).unwrap_or_else(|e| panic!("{e}\n{}", lifted.block));
         lifted
     }
@@ -1922,16 +2033,48 @@ mod tests {
     }
 
     #[test]
-    fn a_store_ends_the_block_under_every_shape() {
+    fn a_store_ends_its_block_only_under_the_policy_that_says_so() {
         // Not about ticks: a store into the block's own page would make every
         // instruction after it a translation of bytes that no longer exist,
-        // and the interpreter — which re-fetches — would see the new ones.
+        // and the interpreter — which re-fetches — would see the new ones. The
+        // question is *where the boundary goes*, and `Smc` is the two answers.
+        let program = [sd(1, 2, 0), addi(6, 0, 1), ECALL];
+        let cfg = Config::rv64i();
         for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
-            let l = shaped(&[sd(1, 2, 0), addi(6, 0, 1), ECALL], shape);
-            assert_eq!(l.insns, 1, "{shape:?}");
-            assert_eq!(l.stop, Stop::Access, "{shape:?}");
+            let ended = lift_policy(&cfg, BASE, &program, shape, Smc::EndBlock);
+            assert_eq!(ended.insns, 1, "{shape:?}");
+            assert_eq!(ended.stop, Stop::Access, "{shape:?}");
         }
-        // A load does not, once the shape allows it.
+        // Under the default the store is an ordinary instruction, and the host
+        // is what notices one that landed in this block's own page. The
+        // `ecall` after the `addi` is outside the lifted subset, so the block
+        // still stops — three instructions later than it used to.
+        let guarded = lift_policy(&cfg, BASE, &program, Shape::Trace, Smc::HostGuard);
+        assert_eq!(guarded.insns, 2);
+        assert_eq!(guarded.stop, Stop::Unsupported);
+        assert_eq!(
+            shaped(&program, Shape::Trace).insns,
+            2,
+            "the default is the guard"
+        );
+        // and nothing is emitted for it: the whole difference between the two
+        // policies is where the block ends.
+        assert_eq!(
+            guarded
+                .block
+                .insts()
+                .iter()
+                .filter(|i| i.op == Opcode::BRCOND)
+                .count(),
+            0,
+            "unlike x86's, this guard costs no IR"
+        );
+        // A basic block still stops at a store, because a basic block stops at
+        // every access whatever the store policy is.
+        let basic = lift_policy(&cfg, BASE, &program, Shape::BasicBlock, Smc::HostGuard);
+        assert_eq!(basic.insns, 1);
+        assert_eq!(basic.stop, Stop::Access);
+        // A load does not end a trace, once the shape allows it.
         let l = shaped(&[ld(5, 1, 0), addi(6, 0, 1), ECALL], Shape::Trace);
         assert_eq!(l.insns, 2);
     }
@@ -1992,7 +2135,10 @@ mod tests {
     #[test]
     fn a_store_reads_both_registers_and_writes_none() {
         let l = rv64i(&[sd(1, 2, 16)]);
-        assert_eq!(l.stop, Stop::Access);
+        // The program is one word long, so under the default store policy the
+        // block runs off the end of it rather than stopping at the store —
+        // which is what `Stop::Unreadable` means here and nothing more.
+        assert_eq!(l.stop, Stop::Unreadable);
         let st = l
             .block
             .insts()
@@ -2343,6 +2489,7 @@ mod tests {
             &mut src,
             3,
             Shape::default(),
+            Smc::default(),
         )
         .expect("RV64 lifts");
         verify(&l.block).expect("a limited block still verifies");
@@ -2370,6 +2517,7 @@ mod tests {
             &mut src,
             MAX_INSNS,
             Shape::default(),
+            Smc::default(),
         )
         .expect_err("RV32 is not lifted yet");
         assert!(matches!(err, Error::Unimplemented(_)), "{err}");
@@ -2428,6 +2576,7 @@ mod tests {
             &mut src,
             MAX_INSNS,
             Shape::default(),
+            Smc::default(),
         )
         .expect("RV64 lifts")
         .block
@@ -2460,6 +2609,7 @@ mod tests {
                 &mut src,
                 MAX_INSNS,
                 Shape::default(),
+                Smc::default(),
             )
             .expect("RV64 lifts")
             .block

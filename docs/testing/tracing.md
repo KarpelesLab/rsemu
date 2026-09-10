@@ -25,54 +25,72 @@ rsemu run riscv-virt --media firmware=loop.bin --for 100ms --headless \
 # channels        sched,cpu,clock,mmio
 # state-hash      0xe49df53d39dbf916
 # cpu0            engine=jit-host
-clock.clint.ticks               1000000
-clock.cpu0.ticks                1000000
-clock.uart.ticks                  11520
-cpu.blocks                         7902
-cpu.compiled                       7902
-cpu.cpu0.blocks                    7902
-cpu.cpu0.compiled                  7902
-cpu.cpu0.cycles                 1000001
-cpu.cpu0.retired-total           500000
-mmio.flash.cfi#1.read                 0
-mmio.flash.cfi#1.write                0
-mmio.flash.cfi.read                   0
-mmio.flash.cfi.write                  0
-mmio.read                            15
-mmio.riscv.boot.read                 15
-mmio.riscv.boot.write                 0
-mmio.riscv.clint.read                 0
-mmio.riscv.clint.write                0
-mmio.riscv.plic.read                  0
-mmio.riscv.plic.write                 0
-mmio.riscv.syscon.read                0
-mmio.riscv.syscon.write               0
-mmio.uart.ns16550.read                0
-mmio.uart.ns16550.write               0
-mmio.virtio.mmio#1.read               0
-mmio.virtio.mmio#1.write              0
-mmio.virtio.mmio.read                 0
-mmio.virtio.mmio.write                0
-mmio.write                            0
-sched.budgets                       200
-sched.events                          0
-sched.ended.allowance                100
-sched.ended.declined                  4
-sched.ended.event                     0
-sched.ended.exit                      0
-sched.ended.lazy                      0
-sched.quanta                        104
-sched.quanta.empty                    4
-sched.quanta.idle                     4
-sched.span-ns                  99999999
-sched.span-ns.log2.00                 4
-sched.span-ns.log2.20               100
-sched.ticks                     1011520
+clock.clint.ticks                       1000000
+clock.cpu0.ticks                        1000000
+clock.uart.ticks                          11520
+cpu.blocks                                 7902
+cpu.chained                                7398
+cpu.compiled                               7902
+cpu.cpu0.blocks                            7902
+cpu.cpu0.chained                           7398
+cpu.cpu0.compiled                          7902
+cpu.cpu0.cycles                         1000001
+cpu.cpu0.fast-loads                           0
+cpu.cpu0.fast-stores                          0
+cpu.cpu0.interpreted                          1
+cpu.cpu0.invalidated                          0
+cpu.cpu0.invalidated.in-block                 0
+cpu.cpu0.invalidated.interpreted              0
+cpu.cpu0.retired                         499999
+cpu.cpu0.retired-total                   500000
+cpu.cpu0.translated                           5
+cpu.interpreted                               1
+cpu.invalidated                               0
+cpu.retired                              499999
+cpu.retired.permille                        999
+cpu.translated                                5
+mmio.flash.cfi#1.read                         0
+mmio.flash.cfi#1.write                        0
+mmio.flash.cfi.read                           0
+mmio.flash.cfi.write                          0
+mmio.read                                    15
+mmio.riscv.boot.read                         15
+mmio.riscv.boot.write                         0
+mmio.riscv.clint.read                         0
+mmio.riscv.clint.write                        0
+mmio.riscv.plic.read                          0
+mmio.riscv.plic.write                         0
+mmio.riscv.syscon.read                        0
+mmio.riscv.syscon.write                       0
+mmio.uart.ns16550.read                        0
+mmio.uart.ns16550.write                       0
+mmio.virtio.mmio#1.read                       0
+mmio.virtio.mmio#1.write                      0
+mmio.virtio.mmio.read                         0
+mmio.virtio.mmio.write                        0
+mmio.write                                    0
+sched.budgets                               200
+sched.ended.allowance                       100
+sched.ended.declined                          4
+sched.ended.event                             0
+sched.ended.exit                              0
+sched.ended.lazy                              0
+sched.events                                  0
+sched.quanta                                104
+sched.quanta.empty                            4
+sched.quanta.idle                             4
+sched.span-ns                          99999999
+sched.span-ns.log2.00                         4
+sched.span-ns.log2.20                       100
+sched.ticks                             1011520
 ```
 
 Half a million guest instructions in 7 902 blocks, every one of them compiled to
-host code; a hundred scheduler rounds of a millisecond each — `ended.allowance`,
-the grid point, so nothing interrupted them — plus four the headless loop
+host code and 7 398 of them reached without a lookup at all; five translations
+served over and over, and exactly **one** instruction the interpreter took —
+the first, before anything was lifted. A hundred scheduler rounds of a
+millisecond each — `ended.allowance`, the grid point, so nothing interrupted
+them — plus four the headless loop
 declined at its slice boundaries; and the whole board's MMIO in fifteen
 accesses, all of them the boot stub being fetched, with every device aperture
 named and sitting at zero because this guest is a two-instruction loop that
@@ -528,17 +546,21 @@ costs **zero** instructions on the RAM read and store paths and leaves
 already had. Counting costs about seven instructions per MMIO access. The
 tables are below.
 
-### 2. RISC-V's retired-versus-interpreted split — `src/cpu/riscv/engine.rs`
+### 2. RISC-V's retired-versus-interpreted split — applied
 
-`cpu::riscv::Jit::stats()` returns `(blocks, compiled)` where x86 and A64 return
-a struct with `retired` and `interpreted` in it, so the `cpu` channel's most
-useful row is missing on RISC-V. The count is already computed: `Run::insns`
-is folded into `minstret` at `engine.rs`'s `exec.st.csrs.minstret =
-exec.st.csrs.minstret.wrapping_add(run.insns as u64)`. Add `retired: u64` and
-`interpreted: u64` to `Jit`, accumulate `run.insns` into the first at that same
-line and one per `interpret()` call into the second, and widen `jit_stats` to a
-struct in the shape of the other two. `host::trace::cpus`'s RISC-V arm then
-loses its `retired-total` fallback and reads the same rows as the other cores.
+This entry specified widening `cpu::riscv::Jit::stats()` from `(blocks,
+compiled)` to a struct in the shape of the other two cores', and it is done —
+`cpu::riscv::JitStats` now carries `chained`, `translated`, `smc`,
+`smc_interpreted`, `retired`, `interpreted`, `fast_loads` and `fast_stores`,
+and `host::trace::cpus`'s RISC-V arm reads the same rows as the x86 and A64
+arms. `retired-total` stays beside them, because the architectural `minstret`
+counts interpreted instructions too and *"how much of this run did the
+translated engine carry"* is exactly the difference between the two.
+
+What made it worth doing was not the trace channel: `benches/riscv_linux_boot.rs`
+needed **guest instructions per block**, the number every per-block row of a
+profile is divided by, and there was nowhere on this core to read it from.
+`docs/platforms/riscv-virt.md` has what the first such profile said.
 
 ### 3. Per-mechanism block counters — `src/jit/dispatch.rs`
 

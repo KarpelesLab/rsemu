@@ -46,7 +46,7 @@
 use rsemu::cpu::riscv::Config;
 use rsemu::cpu::riscv::csr::Extensions;
 use rsemu::cpu::riscv::differential::{Case, Verdict, compare, synthesize};
-use rsemu::cpu::riscv::lift::Shape;
+use rsemu::cpu::riscv::lift::{Shape, Smc};
 
 /// A 64-bit linear congruential generator — Knuth's MMIX multiplier and
 /// increment.
@@ -89,21 +89,84 @@ fn sweep(cfg: Config, seed: u64, count: usize) -> (usize, usize, usize) {
 }
 
 fn shaped_sweep(cfg: Config, seed: u64, count: usize, shape: Shape) -> (usize, usize, usize) {
+    let (agreed, trapped, nothing, _) = sweep_policy(cfg, seed, count, shape, Smc::default());
+    (agreed, trapped, nothing)
+}
+
+/// The same sweep under a named store policy, reporting the guest instructions
+/// the subject retired as well as the verdicts.
+///
+/// The instruction total is what makes [`Smc`] a *measurable* claim in a test
+/// rather than only in a benchmark: a store that no longer ends the block means
+/// the same corpus retires strictly more instructions per case.
+fn sweep_policy(
+    cfg: Config,
+    seed: u64,
+    count: usize,
+    shape: Shape,
+    smc: Smc,
+) -> (usize, usize, usize, u64) {
     let mut rng = Lcg(seed);
     let (mut agreed, mut trapped, mut nothing) = (0, 0, 0);
+    let mut retired = 0u64;
     for n in 0..count {
         let len = 1 + (rng.next() % 12) as usize;
         let case = Case::seeded(program(&mut rng, len))
             .with_config(cfg)
-            .with_shape(shape);
+            .with_shape(shape)
+            .with_smc(smc);
         match compare(&case) {
-            Ok(Verdict::Agreed { .. }) => agreed += 1,
-            Ok(Verdict::Trapped { .. }) => trapped += 1,
+            Ok(Verdict::Agreed { insns, .. }) => {
+                agreed += 1;
+                retired += insns as u64;
+            }
+            Ok(Verdict::Trapped { insns, .. }) => {
+                trapped += 1;
+                retired += insns as u64;
+            }
             Ok(Verdict::Nothing) => nothing += 1,
-            Err(e) => panic!("case {n} of seed {seed:#x} diverged under {shape:?}:\n{e}"),
+            Err(e) => panic!("case {n} of seed {seed:#x} diverged under {shape:?}/{smc:?}:\n{e}"),
         }
     }
-    (agreed, trapped, nothing)
+    (agreed, trapped, nothing, retired)
+}
+
+#[test]
+fn both_store_policies_agree_with_the_interpreter_over_the_whole_corpus() {
+    // The same seed for both, so a divergence names the policy rather than the
+    // case. `Smc::EndBlock` is the control the default is measured against and
+    // it has to stay *correct* as well as slower, or the comparison is between
+    // a policy and a bug.
+    let (ended_ok, ended_trapped, _, ended_insns) = sweep_policy(
+        Config::rv64i(),
+        0x5eed_0021,
+        1_000,
+        Shape::Trace,
+        Smc::EndBlock,
+    );
+    let (guarded_ok, guarded_trapped, _, guarded_insns) = sweep_policy(
+        Config::rv64i(),
+        0x5eed_0021,
+        1_000,
+        Shape::Trace,
+        Smc::HostGuard,
+    );
+    assert!(ended_ok > 300, "{ended_ok} of 1000 agreed under EndBlock");
+    assert!(
+        guarded_ok > 300,
+        "{guarded_ok} of 1000 agreed under HostGuard"
+    );
+    assert!(
+        ended_trapped + guarded_trapped > 0,
+        "the fault path was never reached"
+    );
+    // And the guard has to be doing something: a store no longer cutting the
+    // block means the same corpus retires strictly more instructions.
+    assert!(
+        guarded_insns > ended_insns,
+        "the store guard retired no more than the policy it replaced: {ended_insns} against \
+         {guarded_insns}"
+    );
 }
 
 #[test]

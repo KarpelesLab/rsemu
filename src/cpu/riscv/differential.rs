@@ -84,13 +84,17 @@
 //!   vectoring into `mtvec` is the interpreter's job and a lifted block hands
 //!   the fault back rather than delivering it. Reported as
 //!   [`Verdict::Trapped`].
-//! * **Code a running trace overwrites.** RISC-V requires a `FENCE.I` between
-//!   a store to instruction memory and executing it, so a trace runs to its
-//!   end on the bytes it was lifted from while the oracle, being an
-//!   interpreter, sees the new ones. That is a legal disagreement rather than
-//!   a bug, so the harness's self-modifying-code cases put the store and the
-//!   re-execution in different blocks — see
-//!   `a_store_into_the_code_page_invalidates_the_translation_of_it`.
+//! * **Code a running trace overwrites**, in the sense of *which* bytes run.
+//!   RISC-V requires a `FENCE.I` between a store to instruction memory and
+//!   executing it, so the architecture permits a disagreement there. What is
+//!   covered is that the disagreement never happens: both of this harness's
+//!   hosts implement [`Smc::HostGuard`]'s obligation, leaving the block at the
+//!   first boundary after a store into the code page exactly as
+//!   `cpu::riscv::engine`'s host does, and the cached path asserts that such a
+//!   store invalidates the translation. A case that stores into its own code
+//!   therefore compares a *shorter* run against the same number of interpreted
+//!   instructions rather than comparing stale bytes against fresh ones —
+//!   see `a_store_into_the_code_page_invalidates_the_translation_of_it`.
 //! * **Paging.** [`Case`] is a bare machine-mode hart, so `satp` is off and
 //!   [`Origin::Bare`] is the truth rather than a claim. Lifting under
 //!   translation needs the entry translation to come from the fetch path
@@ -108,7 +112,7 @@ use crate::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region, Un
 use crate::core::value::Width;
 use crate::ir::{Align, Fault, InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot, verify};
 
-use super::lift::{self, Origin, PC, Shape, x_slot};
+use super::lift::{self, Origin, PC, Shape, Smc, x_slot};
 use super::{Config, Hart};
 
 #[cfg(feature = "jit")]
@@ -158,6 +162,8 @@ pub struct Case {
     /// [`Shape::BasicBlock`] one is a `setcond`/`movcond` pair — and all of
     /// them must agree with the one interpreter.
     pub shape: Shape,
+    /// What a store does to the block it is in.
+    pub smc: Smc,
 }
 
 impl Case {
@@ -170,6 +176,7 @@ impl Case {
             program,
             regs: [0; 32],
             shape: Shape::default(),
+            smc: Smc::default(),
         }
     }
 
@@ -177,6 +184,19 @@ impl Case {
     #[must_use]
     pub fn with_shape(mut self, shape: Shape) -> Case {
         self.shape = shape;
+        self
+    }
+
+    /// The same case under a different store policy.
+    ///
+    /// Both are correct and both must agree with the interpreter, which is why
+    /// the corpus runs the pair rather than only the default:
+    /// [`Smc::EndBlock`] is the control the speed of [`Smc::HostGuard`] is
+    /// measured against, and a policy that got faster by getting wrong should
+    /// fail a test rather than win a column.
+    #[must_use]
+    pub fn with_smc(mut self, smc: Smc) -> Case {
+        self.smc = smc;
         self
     }
 
@@ -448,6 +468,7 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
         &mut src,
         lift::MAX_INSNS,
         case.shape,
+        case.smc,
     )
     .expect("the harness builds RV64 cases only");
     if lifted.insns == 0 {
@@ -474,6 +495,17 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     // instruction on the path it inlined and retires only the ones it reached.
     let retired = interp.boundaries().saturating_sub(1) as usize;
     let subject_faulted = matches!(outcome, Outcome::Fault(_));
+    // Where the guest stands afterwards. At an exit the block published `PC`
+    // itself; at a **guard** exit it did not — this frontend binds `PC` at the
+    // exit boundary and nowhere else — so the boundary's own PC is the one
+    // [`Outcome::Spent`] carries, which is what a dispatcher uses too. The
+    // store guard is the only thing that can produce one here: the store
+    // retired, the block stopped in front of the next instruction, and the
+    // oracle is stepped exactly that far.
+    let left_at = match outcome {
+        Outcome::Spent { pc } => Some(pc),
+        _ => None,
+    };
 
     // ---- the oracle: the interpreter, the same instructions -------------
     let hart = Hart::new(case.cfg.with_reset_vector(BASE));
@@ -520,7 +552,7 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
         return Ok(Verdict::Trapped { insns: retired });
     }
 
-    if !matches!(outcome, Outcome::Exit) {
+    if !matches!(outcome, Outcome::Exit | Outcome::Spent { .. }) {
         return Err(diverged(
             case,
             format!("a lifted block must end in exit_tb, but it reported {outcome:?}"),
@@ -542,13 +574,16 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     }
 
     let want_pc = hart.pc();
-    let got_pc = host.slot(PC);
+    let got_pc = left_at.unwrap_or_else(|| host.slot(PC));
     if want_pc != got_pc {
+        let what = if left_at.is_some() {
+            "where the store guard left the block"
+        } else {
+            "the lifted block"
+        };
         return Err(diverged(
             case,
-            format!(
-                "pc: the interpreter says {want_pc:#018x}, the lifted block says {got_pc:#018x}"
-            ),
+            format!("pc: the interpreter says {want_pc:#018x}, {what} says {got_pc:#018x}"),
         ));
     }
 
@@ -752,6 +787,25 @@ struct Host {
     /// Of those, the ones the accesses spent — the data-dependent half, which
     /// the frontend deliberately leaves out of [`InsnStart::ticks`].
     access_ticks: u64,
+    /// Whether a store has landed in the page the program was loaded on.
+    ///
+    /// [`Smc::HostGuard`]'s obligation, restated here for the same reason
+    /// [`Host::access`] restates the misalignment rule: what is under test is
+    /// the *frontend*, and a harness that let a block run past a store into
+    /// its own code would be comparing bytes the interpreter has already
+    /// replaced against bytes it has not. `cpu::riscv::engine` answers it by
+    /// retiring the run's allowance; there is no allowance here, so the flag
+    /// **is** the answer — monotone, as [`IrHost::spent`] requires.
+    smc: bool,
+    /// Whether the case asked for [`Smc::HostGuard`], and so whether the flag
+    /// above is owed at all.
+    ///
+    /// Under [`Smc::EndBlock`] the *frontend* puts the boundary at the store
+    /// and the host owes nothing, so answering `true` there would end a run
+    /// that the policy says should carry straight on into the next block —
+    /// which is the block the cached harness lifts from the bytes the store
+    /// left, and the thing two of its tests are about.
+    guarded: bool,
 }
 
 impl Host {
@@ -767,6 +821,8 @@ impl Host {
             misaligned: case.cfg.misaligned,
             ticks: 0,
             access_ticks: 0,
+            smc: false,
+            guarded: matches!(case.smc, Smc::HostGuard),
         }
     }
 
@@ -785,7 +841,17 @@ impl Host {
         self.access_ticks += 1;
         match value {
             None => self.space.read(addr, width, self.attrs),
-            Some(v) => self.space.write(addr, width, v, self.attrs).map(|()| 0),
+            Some(v) => {
+                // The program is loaded at [`BASE`] and a block never leaves
+                // the page it started on, so one comparison covers every block
+                // this harness can lift. Bare mode, so the address written is
+                // the physical one — which is the comparison the engine makes
+                // with the two ends it has to translate first.
+                if addr & !super::PAGE_MASK == BASE {
+                    self.smc = true;
+                }
+                self.space.write(addr, width, v, self.attrs).map(|()| 0)
+            }
         }
     }
 
@@ -843,6 +909,20 @@ impl IrHost for Host {
     }
 
     fn insn_start(&mut self, _mark: &InsnStart) {}
+
+    /// [`Smc::HostGuard`]'s obligation: leave the block at the first boundary
+    /// after a store into the page the code came from.
+    ///
+    /// Monotone, because [`Host::smc`] is only ever set. Under
+    /// [`Smc::EndBlock`] it can still fire — a store is the last instruction
+    /// of its block there, so the only boundary left is the exit one — and
+    /// under it the *frontend* has already put the boundary where this would,
+    /// so answering `true` would end a chain that the policy says carries on
+    /// into the block lifted from the bytes the store left. See
+    /// [`Host::guarded`].
+    fn spent(&self) -> bool {
+        self.guarded && self.smc
+    }
 }
 
 /// This host reaches the address space directly, so there is no table for a
@@ -1223,6 +1303,7 @@ fn fast_loads(_disp: &Dispatcher) -> u64 {
 struct Lifter {
     cfg: Config,
     shape: Shape,
+    smc: Smc,
     space: Arc<AddressSpace>,
     attrs: MemAttrs,
     /// The first block the verifier rejected, reported as a divergence rather
@@ -1237,6 +1318,7 @@ impl Lifter {
         Lifter {
             cfg: case.cfg,
             shape: case.shape,
+            smc: case.smc,
             space,
             attrs: MemAttrs::DEFAULT.with_requester(case.cfg.requester),
             rejected: None,
@@ -1259,7 +1341,7 @@ impl<H: ?Sized> Frontend<H> for Lifter {
     }
 
     fn key(&mut self) -> u64 {
-        lift::key(&self.cfg, Origin::Bare, self.shape)
+        lift::key(&self.cfg, Origin::Bare, self.shape, self.smc)
     }
 
     fn pc_slot(&self) -> RegSlot {
@@ -1282,6 +1364,7 @@ impl<H: ?Sized> Frontend<H> for Lifter {
             &mut src,
             lift::MAX_INSNS,
             self.shape,
+            self.smc,
         )?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
@@ -1316,6 +1399,12 @@ struct CachedHost {
     misaligned: bool,
     ticks: u64,
     dirty: DirtyPages,
+    /// [`Host::smc`], on the path that actually reads its instructions out of
+    /// guest RAM — so this is the leg where leaving the block is what stops
+    /// the two engines running different bytes.
+    smc: bool,
+    /// [`Host::guarded`], for the same reason.
+    guarded: bool,
 }
 
 /// The world a bare machine-mode hart's accesses happen in.
@@ -1339,6 +1428,8 @@ impl CachedHost {
             misaligned: case.cfg.misaligned,
             ticks: 0,
             dirty: DirtyPages::new(),
+            smc: false,
+            guarded: matches!(case.smc, Smc::HostGuard),
         }
     }
 
@@ -1362,8 +1453,14 @@ impl CachedHost {
                 if done.is_ok() {
                     // The self-modifying-code hook. Drained by the dispatcher
                     // at the next block boundary, which is before anything can
-                    // execute the bytes this just changed.
+                    // execute the bytes this just changed — and under
+                    // [`Smc::HostGuard`] the *next* boundary is inside this
+                    // block rather than after it, which is what the flag is
+                    // for.
                     self.dirty.note(addr, width.bytes());
+                    if addr & !super::PAGE_MASK == BASE {
+                        self.smc = true;
+                    }
                 }
                 done
             }
@@ -1420,6 +1517,12 @@ impl IrHost for CachedHost {
     }
 
     fn insn_start(&mut self, _mark: &InsnStart) {}
+
+    /// [`Host::spent`]'s obligation, on the leg that can actually observe the
+    /// divergence it prevents.
+    fn spent(&self) -> bool {
+        self.guarded && self.smc
+    }
 }
 
 #[cfg(feature = "jit")]
@@ -1470,6 +1573,9 @@ impl FastMem for CachedHost {
             "an inlined store must report where it landed"
         );
         self.dirty.note(addr, bytes);
+        if addr & !super::PAGE_MASK == BASE {
+            self.smc = true;
+        }
     }
 }
 
@@ -1512,8 +1618,10 @@ mod tests {
 
     #[test]
     fn a_store_agrees_on_memory_and_a_load_reads_it_back() {
-        // The store ends its block, so the two runs are two cases — which is
-        // also how a dispatcher would see them.
+        // Two cases rather than one program, so the load reads what the store
+        // left through *memory* rather than through a register the same block
+        // happens to still hold — which is also how a dispatcher sees them
+        // whenever the two land in different blocks.
         let addr = BASE + DATA;
         let store = Case::new(vec![sd(1, 2, 0)])
             .with_reg(1, addr)
@@ -1798,7 +1906,17 @@ mod tests {
                 .with_reg(12, BASE);
             let run = agreed(&case, 12);
             assert!(run.smc > 0, "no translation was invalidated by the store");
-            assert!(run.translated > 1, "the loop was never lifted again");
+            // The control, and the reason it is one: under [`Smc::EndBlock`]
+            // the block ends *at* the store, so this one dispatcher run
+            // carries on and lifts the loop a second time out of the bytes the
+            // store left. Under the default the run leaves at the boundary
+            // after the store — that is `CachedHost::spent`, standing in for
+            // the engine's retired allowance — and it is the *next* `advance`
+            // that re-lifts, which is a dispatcher run this harness does not
+            // make. Both agree with the interpreter, which is the claim.
+            let ended = agreed(&case.clone().with_smc(Smc::EndBlock), 12);
+            assert!(ended.smc > 0, "the control invalidated nothing either");
+            assert!(ended.translated > 1, "the loop was never lifted again");
         }
 
         #[test]
@@ -1832,7 +1950,12 @@ mod tests {
                 run.smc > 0,
                 "the trace was not invalidated by its own store"
             );
-            assert!(run.translated > 1, "the trace was never lifted again");
+            // The control, for the reason the test above gives: under the
+            // policy this replaced the block ended at the store and the same
+            // dispatcher run lifted the trace again.
+            let ended = agreed(&case.clone().with_smc(Smc::EndBlock), 10);
+            assert!(ended.smc > 0, "the control invalidated nothing either");
+            assert!(ended.translated > 1, "the trace was never lifted again");
         }
 
         #[test]
@@ -1883,8 +2006,18 @@ mod tests {
             // `Csrs::translation_gen` moves, `Origin::Paged` carries it, and
             // the key no longer matches.
             let cfg = Config::rv64i();
-            let before = lift::key(&cfg, Origin::Paged { generation: 1 }, Shape::default());
-            let after = lift::key(&cfg, Origin::Paged { generation: 2 }, Shape::default());
+            let before = lift::key(
+                &cfg,
+                Origin::Paged { generation: 1 },
+                Shape::default(),
+                Smc::default(),
+            );
+            let after = lift::key(
+                &cfg,
+                Origin::Paged { generation: 2 },
+                Shape::default(),
+                Smc::default(),
+            );
             assert_ne!(before, after, "the generation is in the key");
 
             let mut cache = BlockCache::with_capacity(16);
@@ -1896,6 +2029,7 @@ mod tests {
                 &mut src,
                 4,
                 Shape::default(),
+                Smc::default(),
             )
             .expect("rv64");
             let id = cache.insert(BASE, before, BASE, lifted.insns, lifted.block);
@@ -1911,8 +2045,13 @@ mod tests {
         fn a_bare_block_and_a_paged_block_at_the_same_address_are_different_blocks() {
             let cfg = Config::rv64i();
             assert_ne!(
-                lift::key(&cfg, Origin::Bare, Shape::default()),
-                lift::key(&cfg, Origin::Paged { generation: 0 }, Shape::default()),
+                lift::key(&cfg, Origin::Bare, Shape::default(), Smc::default()),
+                lift::key(
+                    &cfg,
+                    Origin::Paged { generation: 0 },
+                    Shape::default(),
+                    Smc::default()
+                ),
                 "a physical lift and a virtual lift of the same number must not collide"
             );
         }
@@ -1923,11 +2062,19 @@ mod tests {
             // the block distinguishes one lifted before a remap from one
             // lifted after. The epoch does.
             let cfg = Config::rv64i();
-            let key = lift::key(&cfg, Origin::Bare, Shape::default());
+            let key = lift::key(&cfg, Origin::Bare, Shape::default(), Smc::default());
             let mut cache = BlockCache::with_capacity(16);
             let mut src = Words(&[addi(10, 10, 1)]);
-            let lifted =
-                lift::lift(&cfg, Origin::Bare, BASE, &mut src, 4, Shape::default()).expect("rv64");
+            let lifted = lift::lift(
+                &cfg,
+                Origin::Bare,
+                BASE,
+                &mut src,
+                4,
+                Shape::default(),
+                Smc::default(),
+            )
+            .expect("rv64");
             cache.insert(BASE, key, BASE, lifted.insns, lifted.block);
             assert!(cache.lookup(BASE, key).is_some());
             assert!(cache.sync(Epoch {

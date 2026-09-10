@@ -2067,3 +2067,15 @@ required-features = ["jit", "cpu-riscv-lift"]
 name             = "a64_linux_boot"
 harness          = false
 required-features = ["machine-arm64-virt", "cpu-arm-a64-lift", "jit"]
+
+[[bench]]
+# The same benchmark for the other 64-bit core: OpenSBI and a real riscv64
+# Linux kernel on `riscv-virt`, with the census a profile has to be divided by.
+# RISC-V was the least-measured of the three main cores -- x86 and A64 each had
+# a boot profile and this one did not, so its blocks-per-guest-instruction, the
+# multiplier on every per-block term, was unknown. Skips loudly without a
+# firmware, which is fetched and never committed. `harness = false` for the
+# reason the others give.
+name             = "riscv_linux_boot"
+harness          = false
+required-features = ["machine-riscv-virt", "cpu-riscv-lift", "jit"]

@@ -944,6 +944,17 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// The address space's topology generation, as the space itself counts it.
+    ///
+    /// Read at block entry and again after every store that reaches
+    /// [`IrHost::store`](crate::ir::IrHost::store), because a store to a
+    /// device that remaps retires the host pointers a backend took out of the
+    /// shadow TLB once for the whole block. One relaxed atomic load.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    pub(super) fn topology(&self) -> u64 {
+        self.space.generation()
+    }
+
     /// Remember the guest-physical page a write landed on.
     ///
     /// De-duplicated against what is already there, because a misaligned store
