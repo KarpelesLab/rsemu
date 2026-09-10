@@ -174,13 +174,13 @@
 //! # What is checked at a block boundary rather than at an instruction
 //!
 //! **Pending interrupts**, and it is worth being exact about why that is
-//! sound. Within a block nothing this hart does can raise one: a CSR write, an
-//! `MRET`, a `WFI` and an `SFENCE.VMA` are all outside the lifted subset and
-//! end the block, a **store** ends the block by construction
-//! ([`lift`](super::lift), "A store still ends the block"), and the platform
-//! timer is a value another runnable publishes between quanta. What is left is
-//! a **load** from a device that raises an interrupt as a side effect of being
-//! read.
+//! sound. Within a block nothing this hart does can raise one *unwatched*: a
+//! CSR write, an `MRET`, a `WFI` and an `SFENCE.VMA` are all outside the
+//! lifted subset and end the block; a **store** no longer ends the block
+//! ([`Smc::HostGuard`]) and so asks the question itself, in [`IrHost::store`];
+//! and the platform timer is a value another runnable publishes between
+//! quanta. What is left is a **load** from a device that raises an interrupt
+//! as a side effect of being read.
 //!
 //! **That last sentence used to end "which nothing on a `virt` board does",
 //! and it was wrong.** The CLINT does exactly that, and by design: it is a
@@ -296,7 +296,7 @@ use crate::jit::{
 use super::Config;
 use super::csr::{Lines, cause};
 use super::exec::{Exec, State, Trap};
-use super::lift::{self, Origin, PC, Shape};
+use super::lift::{self, Origin, PC, Shape, Smc};
 use super::mmu::{self, Access};
 
 /// How much of a block the frontend is allowed to swallow.
@@ -305,6 +305,22 @@ use super::mmu::{self, Access};
 /// a loop unrolls into one translation and a guest register stays in a
 /// temporary across the whole of it.
 const SHAPE: Shape = Shape::Trace;
+
+/// What a store does to the block it is in.
+///
+/// [`Smc::HostGuard`], because this hart can afford the better of the two
+/// answers: it sees the guest-**physical** page of every store on the way into
+/// [`StoreLog`], and [`Admitted::base`] is the physical page the entry
+/// translation resolved to, so the comparison the policy needs is two numbers
+/// this file already has.
+///
+/// [`Smc::EndBlock`] is what this hart shipped first, and what it cost is the
+/// reason the policy exists — measured on twenty guest seconds of a real
+/// riscv64 Linux boot, it bounded a block at **5.51** guest instructions
+/// against a `MAX_INSNS` of 64, and every per-block cost in
+/// `benches/riscv_linux_boot.rs`'s census was divided by that number.
+/// `docs/platforms/riscv-virt.md` has the two profiles side by side.
+const SMC: Smc = Smc::HostGuard;
 
 /// How many blocks one [`advance`] may chain before it hands control back.
 ///
@@ -403,6 +419,56 @@ const CODE_BUFFER: u64 = 256 << 20;
 pub(super) struct Jit {
     disp: Dispatcher,
     unlifted: Unlifted,
+    retired: u64,
+    interpreted: u64,
+    /// Translations an *interpreted* store invalidated.
+    ///
+    /// Counted here rather than read off `DispatchStats::smc`, which only sees
+    /// what a **block** wrote: the dispatcher drains [`StoreLog`] itself and
+    /// never learns about [`drain`], so a statistic that read only its counter
+    /// would report zero however well the other half worked. `cpu::arm::a64`
+    /// found that with a mutation pass, and this hart carries the split for
+    /// the same reason.
+    smc: u64,
+}
+
+/// What this hart's translated engine has done.
+///
+/// A statistic and never a behaviour — the engines are indistinguishable to
+/// the guest — but a per-block cost cannot be attributed without the number it
+/// is divided by, and until `benches/riscv_linux_boot.rs` there was nowhere on
+/// this core to read **guest instructions per block** from: `Jit` kept the
+/// two dispatcher totals, and the retired count went straight into the
+/// architectural `minstret`, which counts interpreted instructions too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Blocks executed.
+    pub blocks: u64,
+    /// Blocks executed as host code rather than interpreted IR.
+    pub compiled: u64,
+    /// Blocks reached by following a patched exit rather than a lookup.
+    pub chained: u64,
+    /// Distinct blocks lifted.
+    pub translated: u64,
+    /// Translations a store from a **block** invalidated, through
+    /// [`StoreLog`].
+    pub smc: u64,
+    /// Translations a store from an **interpreted instruction** invalidated,
+    /// through `drain`.
+    ///
+    /// Separate from [`Stats::smc`] because they are separate mechanisms on
+    /// separate paths, and a single total lets either of them stop working
+    /// while the other keeps the number above zero.
+    pub smc_interpreted: u64,
+    /// Guest instructions that retired **inside** a block.
+    pub retired: u64,
+    /// Guest instructions the interpreter executed, one per call.
+    pub interpreted: u64,
+    /// Compiled loads served from an **inlined** software-TLB probe, with no
+    /// call back into this hart's memory path.
+    pub fast_loads: u64,
+    /// Compiled stores served the same way.
+    pub fast_stores: u64,
 }
 
 impl Jit {
@@ -428,6 +494,9 @@ impl Jit {
         Jit {
             disp,
             unlifted: Unlifted::new(),
+            retired: 0,
+            interpreted: 0,
+            smc: 0,
         }
     }
 
@@ -437,10 +506,43 @@ impl Jit {
         self.unlifted.clear();
     }
 
-    /// Blocks executed, and how many of those ran as host code.
-    pub(super) fn stats(&self) -> (u64, u64) {
+    /// The whole census: what the dispatcher counted, and what this file
+    /// counted beside it.
+    pub(super) fn stats(&self) -> Stats {
         let s = self.disp.stats();
-        (s.blocks, s.compiled)
+        Stats {
+            blocks: s.blocks,
+            compiled: s.compiled,
+            chained: s.chained,
+            translated: s.translated,
+            smc: s.smc,
+            smc_interpreted: self.smc,
+            retired: self.retired,
+            interpreted: self.interpreted,
+            fast_loads: self.fast().0,
+            fast_stores: self.fast().1,
+        }
+    }
+
+    /// What the host code generator's inlined probes served, if there is one.
+    fn fast(&self) -> (u64, u64) {
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
+        {
+            self.disp
+                .backend()
+                .map(crate::jit::host::Engine::stats)
+                .map_or((0, 0), |s| (s.fast_loads, s.fast_stores))
+        }
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
+        {
+            (0, 0)
+        }
     }
 
     /// Whether this engine can use a [`mmu::Tlb`] shadow.
@@ -631,8 +733,9 @@ enum Admit {
 /// `step` takes the trap, and a block run instead would take it up to
 /// sixty-four instructions late. Asking it *per block* rather than per run is
 /// what keeps a chained run indistinguishable from a sequence of one-block
-/// ones: a store into the CLINT or the PLIC ends its block, and the interrupt
-/// it raises is seen at the very next boundary.
+/// ones: a store into the CLINT or the PLIC hands the run's allowance back
+/// from [`IrHost::store`], so the block leaves at the boundary after it and
+/// the interrupt it raises is seen here.
 ///
 /// **Then the entry fetch translation**, charged exactly as the interpreter's
 /// first fetch charges it, and performed on every execution rather than at
@@ -699,7 +802,7 @@ fn admit(cfg: &Config, unlifted: &Unlifted, exec: &mut Exec<'_>, pc: u64) -> Adm
     // A walk, and only a walk, can have moved the answer above.
     let leave = exec.used != charged && exec.pending_interrupt().is_some();
     let origin = key_origin(translating, phys);
-    let key = lift::key(cfg, origin, SHAPE);
+    let key = lift::key(cfg, origin, SHAPE, SMC);
 
     // Known unliftable: the interpreter takes this instruction, and reaching
     // it without a lift that fails at its first instruction is the whole point
@@ -754,7 +857,13 @@ pub(super) fn advance(
     cursor: Option<&TickCursor>,
     remaining: u64,
 ) -> (u64, Option<Exit>) {
-    let Jit { disp, unlifted } = jit;
+    let Jit {
+        disp,
+        unlifted,
+        retired,
+        interpreted,
+        smc,
+    } = jit;
     let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor).with_cursor(cursor);
     let pc = exec.st.pc;
 
@@ -766,8 +875,8 @@ pub(super) fn advance(
     // The dispatcher's first `enter` is then a no-op; see `Lifter::admitted`.
     let at = match admit(cfg, unlifted, &mut exec, pc) {
         Admit::Ready(at) => at,
-        Admit::Interpret => return interpret(disp, unlifted, exec),
-        Admit::Trap(trap) => return deliver(disp, unlifted, exec, trap, pc, pc),
+        Admit::Interpret => return interpret(interpreted, smc, disp, unlifted, exec),
+        Admit::Trap(trap) => return deliver(smc, disp, unlifted, exec, trap, pc, pc),
     };
 
     let mut front = Lifter {
@@ -794,7 +903,7 @@ pub(super) fn advance(
         rejected: None,
     };
 
-    let mut host = Host::new(&mut exec, pc, remaining);
+    let mut host = Host::new(&mut exec, pc, remaining, front.at.base);
     if front.at.leave {
         // The entry translation walked, and the walk raised the wire. One
         // instruction retires and the run hands the boundary back, which is
@@ -810,7 +919,7 @@ pub(super) fn advance(
         Err(_) => {
             drop(host);
             let Lifter { unlifted, .. } = front;
-            return interpret(disp, unlifted, exec);
+            return interpret(interpreted, smc, disp, unlifted, exec);
         }
     };
     let Host {
@@ -834,8 +943,10 @@ pub(super) fn advance(
         // fetch translation now hits the TLB the translation above filled — so
         // what it charges is what a purely interpreted hart would have
         // charged.
-        return interpret(disp, unlifted, exec);
+        return interpret(interpreted, smc, disp, unlifted, exec);
     }
+
+    *retired = retired.wrapping_add(run.insns as u64);
 
     // Every retired instruction, back into the architectural register file.
     // `x0` is hard-wired: the frontend never binds it, and forcing it here
@@ -858,7 +969,7 @@ pub(super) fn advance(
                 tval: fault.pc,
             });
             let next = mark.map_or(fault.pc, |m| m.1);
-            deliver(disp, unlifted, exec, trap, fault.pc, next)
+            deliver(smc, disp, unlifted, exec, trap, fault.pc, next)
         }
         Stop::Unsupported { op, at } => panic!(
             "the RISC-V frontend emitted {op} at index {at}, which the IR backend cannot execute"
@@ -869,7 +980,7 @@ pub(super) fn advance(
         // above passes, and the same one `Exec::step`'s fetch would produce.
         Stop::Declined if entry_trap.is_some() => {
             let trap = entry_trap.expect("just tested");
-            deliver(disp, unlifted, exec, trap, run.pc, run.pc)
+            deliver(smc, disp, unlifted, exec, trap, run.pc, run.pc)
         }
         // `Budget` ends a full chain, `Declined` a short one, `Spent` a block
         // that left part-way through because the hart's ticks ran out, and all
@@ -883,7 +994,7 @@ pub(super) fn advance(
         _ => {
             exec.st.pc = cfg.xlen.trunc(run.pc);
             let used = exec.used;
-            drain(disp, unlifted, &mut exec);
+            drain(smc, disp, unlifted, &mut exec);
             (used.max(1), None)
         }
     }
@@ -891,13 +1002,16 @@ pub(super) fn advance(
 
 /// Interpret one instruction, and tell the block cache what it wrote.
 fn interpret(
+    interpreted: &mut u64,
+    smc: &mut u64,
     disp: &mut Dispatcher,
     unlifted: &mut Unlifted,
     mut exec: Exec<'_>,
 ) -> (u64, Option<Exit>) {
+    *interpreted = interpreted.wrapping_add(1);
     let used = exec.step();
     let exit = exec.take_exit();
-    drain(disp, unlifted, &mut exec);
+    drain(smc, disp, unlifted, &mut exec);
     (used, exit)
 }
 
@@ -905,6 +1019,7 @@ fn interpret(
 /// takes one: out of the hart when the mask says so, into the guest's handler
 /// otherwise.
 fn deliver(
+    smc: &mut u64,
     disp: &mut Dispatcher,
     unlifted: &mut Unlifted,
     mut exec: Exec<'_>,
@@ -926,7 +1041,7 @@ fn deliver(
         }
     };
     let used = exec.used;
-    drain(disp, unlifted, &mut exec);
+    drain(smc, disp, unlifted, &mut exec);
     (used.max(1), out)
 }
 
@@ -936,12 +1051,13 @@ fn deliver(
 /// drains those itself; this is the other half, for every instruction outside
 /// the lifted subset — an `AMO`, an `SC`, a byte written by a trap handler
 /// running through the interpreter.
-fn drain(disp: &mut Dispatcher, unlifted: &mut Unlifted, exec: &mut Exec<'_>) {
+fn drain(smc: &mut u64, disp: &mut Dispatcher, unlifted: &mut Unlifted, exec: &mut Exec<'_>) {
     let mut hit = 0usize;
     for i in 0..exec.wrote_n as usize {
         hit += disp.cache_mut().note_write(exec.wrote[i], 1);
     }
     exec.wrote_n = 0;
+    *smc = smc.wrapping_add(hit as u64);
     if hit > 0 {
         // A page a translation came from has changed, so every answer in
         // [`Unlifted`] may have changed with it — an instruction that was
@@ -1004,6 +1120,13 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         if core::mem::take(&mut self.admitted) {
             return Ok(Entry::Ready);
         }
+        // Whatever this boundary resolves to, the block that runs after it is
+        // a different block on a different page, so the code page the store
+        // guard compares against is replaced rather than kept. Set before
+        // `admit` can decline, because a declined boundary interprets and an
+        // interpreted store is drained by [`drain`] rather than by this host.
+        host.code_page = u64::MAX;
+        host.topology = host.exec.topology();
         // Registers live in the host's slots between the blocks of a chain and
         // are written back only when the run ends. Nothing `admit` reads is
         // one of them — it reads the CSR file, the hart's TLB and the tick
@@ -1011,6 +1134,7 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         // `advance` would have seen.
         let entry = match admit(self.cfg, self.unlifted, host.exec, pc) {
             Admit::Ready(at) => {
+                host.code_page = at.base;
                 if at.leave {
                     // The same window as the prologue's, at a chained
                     // boundary: `Dispatcher::run` asked [`Host::spent`] before
@@ -1107,6 +1231,7 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
             &mut src,
             lift::MAX_INSNS,
             SHAPE,
+            SMC,
         )?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
@@ -1157,20 +1282,67 @@ struct Host<'a, 'e> {
     /// [`Exit::len`] is derived from comes from here.
     mark: Option<(u64, u64)>,
     dirty: DirtyPages,
+    /// The guest-**physical** page the running block's instructions came from,
+    /// replaced at every block boundary by [`Lifter::enter`].
+    ///
+    /// The whole of [`Smc::HostGuard`] on this side: [`Host::note_writes`]
+    /// compares every store's physical page against it, and a match retires
+    /// the allowance so the block leaves at the boundary the store's own
+    /// instruction ends at — which is exactly where [`Smc::EndBlock`] used to
+    /// put a block boundary, reached only when a store really did land in the
+    /// code.
+    code_page: u64,
+    /// The address space's topology generation as of this block's entry.
+    ///
+    /// A backend takes the inlined memory path's host pointers out of the
+    /// shadow TLB **once per block**, and they are valid until the topology
+    /// moves — which used to be impossible inside a block because a store
+    /// ended one. [`IrHost::store`] compares this against the live generation
+    /// and leaves the block when it moved.
+    ///
+    /// **What this is not.** `cpu::arm::a64::engine` files the same field
+    /// under *"a store to a device that remaps"*, and on this tree that
+    /// particular route does not exist: `core::space`'s ladder puts
+    /// `LockRank::TOPOLOGY` above `LockRank::BUS`, the access path holds the
+    /// space's topology lock for **reading** while a handler runs, and a
+    /// handler that reached back for the write guard is a lock-order violation
+    /// that panics in a debug build and deadlocks in a release one. The
+    /// sanctioned spelling is `core::device::Deferred`, whose queue is drained
+    /// by `Machine` between quanta rather than by whoever drove the access —
+    /// so a remap a *guest store* asks for lands at a quantum boundary, not
+    /// inside a block, and this comparison would not see it either way.
+    ///
+    /// What it does cover is a retopology from **outside** this hart: a
+    /// monitor hot-plugging through `AddressSpace::try_topology`, or another
+    /// runnable under `ThreadingMode::Parallel`. Those are supposed to arrive
+    /// through the safe-point protocol (`ROADMAP.md` §4.7), which is a block
+    /// boundary — so this is the belt rather than the braces, and it costs one
+    /// relaxed atomic load on the store path a memory plan does not cover,
+    /// which is 0.2% of this guest's stores. It is kept because the thing that
+    /// makes it unnecessary is a property of `core::space`'s lock ladder
+    /// rather than of this file, and a seam that gained a synchronous remap
+    /// would silently make it load-bearing again.
+    ///
+    /// Nothing this hart does can move it from inside a block in any case:
+    /// `SFENCE.VMA`, every CSR write and `MRET` are outside the lifted subset,
+    /// and an inlined store reaches plain RAM only.
+    topology: u64,
 }
 
 impl<'a, 'e> Host<'a, 'e> {
-    fn new(exec: &'a mut Exec<'e>, pc: u64, allowance: u64) -> Host<'a, 'e> {
+    fn new(exec: &'a mut Exec<'e>, pc: u64, allowance: u64, code_page: u64) -> Host<'a, 'e> {
         let mut slots = [0u64; lift::SLOT_COUNT as usize];
         slots[..32].copy_from_slice(&exec.st.x);
         slots[PC.0 as usize] = pc;
         Host {
+            topology: exec.topology(),
             exec,
             allowance,
             slots,
             trap: None,
             mark: None,
             dirty: DirtyPages::new(),
+            code_page,
         }
     }
 
@@ -1213,14 +1385,38 @@ impl<'a, 'e> Host<'a, 'e> {
         BusError::BadAccess
     }
 
-    /// Move whatever the last access wrote into the dirty log.
+    /// Move whatever the last access wrote into the dirty log, and leave the
+    /// block if any of it landed in the block's own code.
     ///
     /// Whatever landed, landed: a misaligned store that faulted on its second
     /// page still wrote the first, and a translation of those bytes is stale
     /// either way.
+    ///
+    /// The one place [`Smc::HostGuard`] is implemented, and the reason it is
+    /// one place: an inlined store reaches it through
+    /// [`FastMem::note_fast_store`] and every other store through
+    /// [`IrHost::store`], so the compiled path and the interpreted one cannot
+    /// disagree about what a store into the code page does.
     fn note_writes(&mut self) {
         for i in 0..self.exec.wrote_n as usize {
-            self.dirty.note(self.exec.wrote[i], 1);
+            let page = self.exec.wrote[i];
+            self.dirty.note(page, 1);
+            // [`Smc::HostGuard`], and the whole of it. A store into the page
+            // this block's own instructions came from means every instruction
+            // after it is a translation of bytes that no longer exist, so the
+            // block leaves at its next guest instruction boundary — where
+            // `Dispatcher::run` drains the log above into the block cache and
+            // the next pass lifts the bytes the store left.
+            //
+            // Physical at both ends: `Exec::note_write` records the page the
+            // bus transaction reached and [`Admitted::base`] is what the entry
+            // translation resolved to, so a store through a second mapping of
+            // the code page is caught. That is the case `cpu::x86::lift`'s
+            // linear guard cannot see, and it is why this hart does not need
+            // to fall back to [`Smc::EndBlock`] under translation.
+            if page == self.code_page {
+                self.hand_back();
+            }
         }
         self.exec.wrote_n = 0;
     }
@@ -1241,14 +1437,14 @@ impl IrHost for Host<'_, '_> {
     ///
     /// Everything else inside a block leaves the interrupt inputs alone.
     /// `Exec::charge` counts ticks and nothing on this hart is driven off that
-    /// count; a **store** ends the block by construction
-    /// ([`lift`](super::lift), "A store still ends the block"), so whatever it
-    /// raises is seen by the next boundary's [`admit`]; and every CSR write,
-    /// `MRET`, `WFI` and `SFENCE.VMA` is outside the lifted subset, so the
-    /// enables and the delegation this hart decides with are constant for the
-    /// length of a run. A **load** is what is left, and the module docs used
-    /// to dismiss it: *"a load from a device that raises an interrupt as a
-    /// side effect of being read, which nothing on a `virt` board does"*. The
+    /// count; a **store** asks this same question in [`IrHost::store`], which
+    /// is what it owes for no longer ending the block ([`Smc::HostGuard`]);
+    /// and every CSR write, `MRET`, `WFI` and `SFENCE.VMA` is outside the
+    /// lifted subset, so the enables and the delegation this hart decides with
+    /// are constant for the length of a run. A **load** is what is left, and
+    /// the module docs used to dismiss it: *"a load from a device that raises
+    /// an interrupt as a side effect of being read, which nothing on a `virt`
+    /// board does"*. The
     /// CLINT does. It is a lazily-advanced device
     /// (`ROADMAP.md` §4.2), so `MemOps::read` catches it up to this hart's
     /// live position before answering — and a comparator the guest moved into
@@ -1275,9 +1471,42 @@ impl IrHost for Host<'_, '_> {
         }
     }
 
+    /// Perform a store, and answer the two questions a store used to answer by
+    /// ending the block.
+    ///
+    /// Both are asked here rather than at every guest instruction boundary
+    /// because this is where the answer can change, and [`Host::hand_back`]
+    /// carries it to the boundary for free. Neither can arrive through
+    /// [`FastMem::note_fast_store`]: a plan covers plain little-endian RAM over
+    /// a whole page, so an inlined store reaches no device and remaps nothing.
+    ///
+    /// * **An interrupt this store raised.** A write to the CLINT's
+    ///   `mtimecmp`, to `msip`, or to the PLIC brings a line up between two
+    ///   instructions of a lifted block — where `Exec::step` would take it at
+    ///   the next one. [`admit`] cannot see it, because it runs at a block
+    ///   boundary and under [`Smc::HostGuard`] there no longer is one after a
+    ///   store. It is the same argument [`IrHost::load`] already makes for a
+    ///   lazily-advanced device answering a *read*, and the CLINT is that
+    ///   device on the shipped board at both ends.
+    /// * **A topology change**, which retires the host pointers the backend
+    ///   took out of the shadow TLB at block entry. The other two cores file
+    ///   this as *"a store that remaps"*; on this tree a guest store cannot
+    ///   remap synchronously at all, and [`Host::topology`] says exactly what
+    ///   stops it and what the comparison does still cover.
+    ///
+    /// The cost is only on the path a plan does not cover — a device access, a
+    /// misaligned store, a page whose shadow entry has been evicted — and
+    /// against what [`admit`] asks the first of these once per block it is not
+    /// a new question, only an earlier one. Measured over twenty guest seconds
+    /// of a riscv64 Linux boot, `Exec::pending_interrupt` went **down**, from
+    /// 139 684 790 host instructions to 51 600 108, because there are 65%
+    /// fewer blocks to admit.
     fn store(&mut self, mem: &MemOp, addr: u64, value: u64) -> MemResult {
         let done = self.exec.store(addr, mem.size.bytes(), value);
         self.note_writes();
+        if self.exec.pending_interrupt().is_some() || self.exec.topology() != self.topology {
+            self.hand_back();
+        }
         match done {
             Ok(()) => Ok(()),
             Err(trap) => Err(self.fault(trap)),
@@ -1486,6 +1715,116 @@ mod tests {
         }
     }
 
+    /// A one-register block that asserts this hart's machine timer line when it
+    /// is **written**, and does nothing else.
+    ///
+    /// The store half of [`RaiseOnRead`], and the first of the two answers
+    /// [`Smc::HostGuard`] owes. It used to need no answer at all: a store ended
+    /// its block, so whatever it raised was seen by the next boundary's
+    /// [`admit`]. `riscv.clint` is this device on the shipped board — a write
+    /// to `mtimecmp` republishes, and a comparator the guest moved into the
+    /// round that is already running is crossed there and then.
+    #[derive(Debug)]
+    struct RaiseOnWrite {
+        hart: crate::core::sync::Mutex<alloc::sync::Weak<Hart>>,
+    }
+
+    impl crate::core::space::MemOps for RaiseOnWrite {
+        fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+            dst.fill(0);
+            Ok(())
+        }
+
+        fn write(&self, _offset: u64, _src: &[u8], attrs: MemAttrs) -> MemResult {
+            if attrs.debug {
+                return Ok(());
+            }
+            if let Some(hart) = self.hart.lock().upgrade() {
+                hart.set_interrupt(crate::cpu::riscv::irq::MTI, true);
+            }
+            Ok(())
+        }
+    }
+
+    /// [`STORE_RAISER`] at zero with [`RaiseOnWrite`] mapped just past the RAM.
+    fn store_raising_hart(engine: Engine) -> Arc<Hart> {
+        let ram = Arc::new(RamStore::new(RAM));
+        write_words(&ram, 0, &STORE_RAISER);
+        let dev = Arc::new(RaiseOnWrite {
+            hart: crate::core::sync::Mutex::with_rank(
+                crate::core::sync::LockRank::LEAF,
+                alloc::sync::Weak::new(),
+            ),
+        });
+        let space = AddressSpace::new("mem", 64);
+        {
+            let mut topo = space.topology();
+            topo.map_with_perms(Region::ram("ram", ram), 0, Perms::RWX)
+                .expect("nothing else is mapped");
+            topo.map(
+                Region::io(
+                    "raiser",
+                    0x1000,
+                    Arc::clone(&dev) as Arc<dyn crate::core::space::MemOps>,
+                ),
+                RAM,
+            )
+            .expect("it does not overlap the RAM");
+        }
+        let hart = Arc::new(Hart::new(Config::rv64gc().with_reset_vector(0)).with_engine(engine));
+        hart.attach_space(Arc::new(space));
+        *dev.hart.lock() = Arc::downgrade(&hart);
+        hart
+    }
+
+    /// A store to a device that raises an interrupt, three instructions from
+    /// the end of a lifted trace.
+    ///
+    /// [`RAISER`] with the `ld` replaced by an `sd`, so the two fixtures differ
+    /// in exactly the thing under test. Under [`Smc::EndBlock`] the `sd` was
+    /// the last instruction of its block and this ran identically for a reason
+    /// that no longer exists.
+    const STORE_RAISER: [u32; 9] = [
+        0x0001_03b7, // lui    x7, 0x10        ; the device, just past the RAM
+        0x3004_6073, // csrrsi x0, mstatus, 8  ; MIE
+        0x0800_0313, // addi   x6, x0, 0x80    ; MTI
+        0x3043_2073, // csrrs  x0, mie, x6
+        0x01c3_b023, // sd     x28, 0(x7)      ; raises MTI   <- 0x10
+        0x0012_8293, // addi   x5, x5, 1
+        0x0012_8293, // addi   x5, x5, 1
+        0x0012_8293, // addi   x5, x5, 1
+        0xff1f_f06f, // jal    x0, -16
+    ];
+
+    #[test]
+    fn a_store_that_raises_an_interrupt_is_taken_where_the_interpreter_takes_it() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = store_raising_hart(Engine::Interp);
+            let jit = store_raising_hart(engine);
+            for n in 0..8 {
+                let a = interp.run_budget(1000);
+                let b = jit.run_budget(1000);
+                assert_eq!(a, b, "quantum {n}: different budgets under {engine:?}");
+            }
+            assert_eq!(
+                interp.csrs().mcause,
+                (1u64 << 63) | 7,
+                "the fixture never took a machine timer interrupt"
+            );
+            assert_eq!(
+                interp.csrs().mepc,
+                jit.csrs().mepc,
+                "mepc under {engine:?}: interpreter {:#x}, translated {:#x}. A block \
+                 that ran on past the store it raised on takes the trap three \
+                 instructions late.",
+                interp.csrs().mepc,
+                jit.csrs().mepc,
+            );
+            assert_eq!(interp.x(5), jit.x(5), "x5 under {engine:?}");
+            assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+        }
+    }
+
     /// An Sv39 root page table that lives **in a device** rather than in DRAM,
     /// and asserts this hart's machine timer line on the `at`-th walk that
     /// reads it.
@@ -1673,7 +2012,7 @@ mod tests {
                     "walk {at}: cycles under {engine:?}"
                 );
                 let stats = jit.jit_stats().expect("a jit hart keeps statistics");
-                assert!(stats.0 > 0, "walk {at}: no block ran under {engine:?}");
+                assert!(stats.blocks > 0, "walk {at}: no block ran under {engine:?}");
             }
             assert!(
                 taken > 0,
@@ -1887,7 +2226,7 @@ mod tests {
                 "the loop body ran on a mapping that refuses a fetch"
             );
             assert_eq!(
-                jit.jit_stats().expect("a jit hart").0,
+                jit.jit_stats().expect("a jit hart").blocks,
                 0,
                 "a block ran out of a mapping whose fetch the interpreter \
                  refuses, under {engine:?}"
@@ -1913,7 +2252,7 @@ mod tests {
                 "the non-executable page ran under the interpreter, so the \
                  fixture is not testing what it says it is"
             );
-            let blocks = jit.jit_stats().expect("a jit hart").0;
+            let blocks = jit.jit_stats().expect("a jit hart").blocks;
             assert!(
                 blocks > 0,
                 "the executable page never produced a block, so nothing was \
@@ -1926,7 +2265,7 @@ mod tests {
     fn a_translated_hart_and_an_interpreted_one_agree_on_every_column() {
         let (interp, jit) = agree(&LOOP, 1000, 64);
         assert!(interp.cycles() > 1000, "the run was too short to mean much");
-        let (blocks, _) = jit.jit_stats().expect("a JIT hart keeps statistics");
+        let blocks = jit.jit_stats().expect("a JIT hart keeps statistics").blocks;
         assert!(blocks > 0, "no block ran, so nothing was compared");
     }
 
@@ -2490,7 +2829,7 @@ mod tests {
         assert_eq!(at.origin, Origin::Paged { generation: 0x4 });
         assert_ne!(
             at.key,
-            lift::key(&b.cfg, Origin::Bare, SHAPE),
+            lift::key(&b.cfg, Origin::Bare, SHAPE, SMC),
             "a paged block must not key identically to a bare one at the same PC"
         );
 
@@ -2694,10 +3033,14 @@ mod tests {
             plain.run_budget(1000);
             host.run_budget(1000);
         }
-        let (blocks, compiled) = plain.jit_stats().expect("statistics");
+        let Stats {
+            blocks, compiled, ..
+        } = plain.jit_stats().expect("statistics");
         assert!(blocks > 0);
         assert_eq!(compiled, 0, "`jit` must not reach for a code generator");
-        let (blocks, compiled) = host.jit_stats().expect("statistics");
+        let Stats {
+            blocks, compiled, ..
+        } = host.jit_stats().expect("statistics");
         assert!(blocks > 0);
         #[cfg(any(
             all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
@@ -2723,7 +3066,7 @@ mod tests {
             interp.run_budget(1000);
             jit.run_budget(1000);
         }
-        let (before, _) = jit.jit_stats().expect("statistics");
+        let before = jit.jit_stats().expect("statistics").blocks;
         assert!(
             before > 0,
             "nothing was cached, so there is nothing to drop"

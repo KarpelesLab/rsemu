@@ -1451,17 +1451,22 @@ mod riscv {
         }
         // `RSEMU_LONGRUN_ENGINES=interp` is the control leg — an interpreter
         // against itself — and an interpreted hart has no statistics.
-        if let Some((blocks, host)) = hart.jit_stats() {
+        if let Some(stats) = hart.jit_stats() {
             assert!(
-                blocks > 0,
+                stats.blocks > 0,
                 "engine={engine} executed no translated block, so the run \
                  compared two interpreters"
             );
             eprintln!(
                 "riscv-virt engine={engine}: {} pass(es), {} timer interrupt(s), \
-                 {blocks} block(s) of which {host} as host code",
+                 {} block(s) of which {} as host code, {} guest instructions \
+                 retired in them ({:.2} per block)",
                 hart.x(18),
-                hart.x(24)
+                hart.x(24),
+                stats.blocks,
+                stats.compiled,
+                stats.retired,
+                stats.retired as f64 / stats.blocks.max(1) as f64,
             );
         }
     }

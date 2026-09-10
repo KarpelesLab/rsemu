@@ -361,16 +361,34 @@ fn cpus(machine: &Machine, hosts: &HostObjects, table: &mut Table) {
                 &name,
                 &format!("engine={}", kebab(&format!("{:?}", hart.engine()))),
             );
-            // RISC-V's `Jit` keeps only the two totals — the retired count goes
-            // straight into the architectural `minstret` instead, which is why
-            // the split this channel reports on the other two cores is missing
-            // here. `docs/testing/tracing.md` specifies the field to add.
+            // `retired-total` is the architectural `minstret`, which counts
+            // interpreted instructions too and is therefore *not* the
+            // `retired` row below: that one is what retired inside a block,
+            // and the two together are what says how much of a run the
+            // translated engine actually carried.
             table.set(&format!("cpu.{name}.retired-total"), hart.instret());
             table.set(&format!("cpu.{name}.cycles"), hart.cycles());
-            let Some((blocks, compiled)) = hart.jit_stats() else {
+            let Some(stats) = hart.jit_stats() else {
                 continue;
             };
-            emit(table, &name, &[("blocks", blocks), ("compiled", compiled)]);
+            let rows = [
+                ("blocks", stats.blocks),
+                ("compiled", stats.compiled),
+                ("chained", stats.chained),
+                ("translated", stats.translated),
+                // Counted apart for the reason A64 counts them apart: a single
+                // total lets one of the two mechanisms stop working while the
+                // other holds the number up. The sum is reported too, so the
+                // row means the same thing it does on x86.
+                ("invalidated", stats.smc + stats.smc_interpreted),
+                ("invalidated.in-block", stats.smc),
+                ("invalidated.interpreted", stats.smc_interpreted),
+                ("retired", stats.retired),
+                ("interpreted", stats.interpreted),
+                ("fast-loads", stats.fast_loads),
+                ("fast-stores", stats.fast_stores),
+            ];
+            emit(table, &name, &rows);
         }
     }
 

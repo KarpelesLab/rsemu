@@ -95,6 +95,10 @@ pub mod lift;
 #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
 mod engine;
 
+#[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv-lift")))]
+pub use engine::Stats as JitStats;
+
 pub mod mmu;
 
 #[cfg(test)]
@@ -628,17 +632,19 @@ impl Hart {
         self.engine
     }
 
-    /// Blocks executed and blocks executed as *host code*, on a hart running a
-    /// JIT engine that has run at least once.
+    /// What this hart's translated engine has done, or `None` on a hart
+    /// running the interpreter.
     ///
     /// A statistic and never a behaviour — the engines are indistinguishable
     /// to the guest — but a backend whose coverage is unmeasured is a backend
     /// whose coverage rots, and this is what tells `jit` and `jit-host`
-    /// apart.
+    /// apart. It also carries the number every per-block cost in a profile is
+    /// divided by: [`JitStats::retired`] over [`JitStats::blocks`], which is
+    /// what `benches/riscv_linux_boot.rs` prints.
     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-riscv-lift", feature = "jit"))))]
     #[must_use]
-    pub fn jit_stats(&self) -> Option<(u64, u64)> {
+    pub fn jit_stats(&self) -> Option<JitStats> {
         self.session.lock().jit.as_ref().map(|jit| jit.stats())
     }
 
