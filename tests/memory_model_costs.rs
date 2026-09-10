@@ -333,9 +333,19 @@ fn what_single_copy_atomicity_would_cost() {
 /// Recorded on the author's host: ~20 ns for four bytes, down from ~25 ns
 /// before `mark_dirty` stopped paying for a locked instruction on every store
 /// and `SpaceView::write` started carrying the value into the leaf instead of
-/// a stack buffer. Compare a candidate's *delta* against this, not against the
-/// bare access — the byte loop is a few per cent of what a guest store actually
+/// a stack buffer, and ~11.9 once `SpaceView::transfer` moved the run loop out
+/// of line. Compare a candidate's *delta* against this, not against the bare
+/// access — the byte loop is a few per cent of what a guest store actually
 /// costs, which is the number that decides whether the price is affordable.
+///
+/// **Read the two directions against each other, not only over time.** For
+/// three rounds the read was the dearer of the two — 15.1 ns against 13.7 for
+/// four bytes, and 356 host instructions against 256 — on a path that consults
+/// no monitor and marks nothing dirty, because only the store had a
+/// value-typed route into the leaf. `RamStore::read_value` gave the load the
+/// same shape, and it now reads ~11.3 against ~11.9 to write. A future round
+/// that finds these two far apart again should suspect the shape before the
+/// work.
 #[test]
 #[ignore = "a measurement, not a gate"]
 fn what_a_whole_store_through_the_space_costs() {

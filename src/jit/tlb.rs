@@ -395,10 +395,40 @@ impl Tlb {
     /// leaving the window empties the table, so no entry filled under one
     /// generation can ever be hit under another. That is the whole soundness
     /// argument, and it is why the flush cannot simply be dropped.
+    ///
+    /// # Why the equal case is inlined and nothing else is
+    ///
+    /// This is called at **every** block boundary, and twice: a backend asks
+    /// for a load plan and a store plan, and each of those resynchronises
+    /// before it answers. Over twenty guest seconds of an arm64 Linux boot
+    /// that is 30 075 820 calls — 14 284 095 blocks twice over, plus one per
+    /// shadow refresh — against 634 833 473 host instructions. **21 per
+    /// call**, for a function whose body in the overwhelming majority of cases
+    /// is a sixteen-byte compare and a `false`. Almost all of that was the
+    /// call itself.
+    ///
+    /// It is worth writing down what those 21 instructions were *not*, because
+    /// the obvious reading is wrong and a round has now paid for finding out:
+    /// they are **not the flush**. Making a cleared entry byte-uniform so that
+    /// [`Tlb::flush`] became a `memset` rather than four scalar stores per
+    /// entry moved this row by 1 225 728 instructions — 0.003% of the profile —
+    /// because the stamp window is 128 guest translation generations wide and
+    /// an arm64 Linux boot leaves one only a few hundred times in twenty
+    /// seconds. A guest that fences its translations harder would flush more,
+    /// and that is a measurement somebody should take on `riscv-virt` before
+    /// spending anything on it.
+    #[inline]
     pub fn sync(&mut self, epoch: Epoch) -> bool {
         if self.epoch == epoch {
             return false;
         }
+        self.resync(epoch)
+    }
+
+    /// [`Tlb::sync`] when the epoch has actually moved. Deliberately out of
+    /// line: it contains the flush, and inlining a whole-table fill into every
+    /// block boundary is the opposite of the point.
+    fn resync(&mut self, epoch: Epoch) -> bool {
         let stale = self.epoch.topology != epoch.topology
             || (self.epoch.translation >> STAMP_BITS) != (epoch.translation >> STAMP_BITS);
         self.epoch = epoch;
@@ -464,7 +494,6 @@ impl Tlb {
         ctx: Context,
         attrs: MemAttrs,
     ) -> MemResult<u64> {
-        let n = width.bytes() as usize;
         if matches!(kind, AccessKind::Store) {
             return self.space.read(phys, width, attrs);
         }
@@ -479,9 +508,12 @@ impl Tlb {
                 endian,
             } => {
                 self.stats.hits += 1;
-                let mut buf = [0u8; 8];
-                self.stores[store].read_at(offset, &mut buf[..n])?;
-                endian.load(&buf[..n], width)
+                // The store assembles the value itself, in the order the
+                // entry carries. `read_at` into a stack buffer and then
+                // `Endian::load` was the same store-to-load round trip the
+                // address space's own read path had, and the same fix: the
+                // width is known here, so the shifts are immediates.
+                self.stores[store].read_value(offset, width, endian)
             }
             Probe::Slow => {
                 self.stats.slow += 1;
@@ -498,11 +530,32 @@ impl Tlb {
     /// Write the low `width` bytes of `value` at guest address `addr`, whose
     /// physical address is `phys`.
     ///
+    /// # The reservation a hit still has to break
+    ///
+    /// A hit skips the permission check, the constraint check and the flat-view
+    /// walk, and every one of those is safe because [`Tlb::fill`] performed it
+    /// once. The [`ExclusiveMonitor`] is **not** in that list: a reservation is
+    /// taken and broken while entries live, so a store served from one owes the
+    /// monitor exactly what a store through [`AddressSpace::write`] owes it —
+    /// told on both sides of the transfer, and not at all for a debug access.
+    /// `core::space::monitor`'s *the transfer is the window* is the argument
+    /// for the pair; this is the second place that has to obey it.
+    ///
+    /// It was missing here for as long as this path existed, and the reason it
+    /// was never a wrong answer is that **nothing in production calls this
+    /// method**: a core with a shadow reaches it as generated code, through
+    /// [`Tlb::fast_set`] and [`Tlb::note_fast_store`], and pays the monitor in
+    /// its own `note_fast_store` (`cpu::arm::a64::exec` has the test). The two
+    /// backend test harnesses are the only callers. That makes this a
+    /// correctness repair rather than a fix, and it is worth making because the
+    /// module's own claim is that a hit is bit-identical to the slow path.
+    ///
     /// # Errors
     ///
     /// Exactly what [`AddressSpace::write`] would have said.
     ///
     /// [`AddressSpace::write`]: crate::core::space::AddressSpace::write
+    /// [`ExclusiveMonitor`]: crate::core::space::ExclusiveMonitor
     pub fn write(
         &mut self,
         addr: u64,
@@ -512,7 +565,6 @@ impl Tlb {
         ctx: Context,
         attrs: MemAttrs,
     ) -> MemResult {
-        let n = width.bytes() as usize;
         if !within_page(addr, width) {
             self.stats.split += 1;
             return self.space.write(phys, width, value, attrs);
@@ -524,9 +576,20 @@ impl Tlb {
                 endian,
             } => {
                 self.stats.hits += 1;
-                let mut buf = [0u8; 8];
-                endian.store(&mut buf[..n], width, value)?;
-                self.stores[store].write_at(offset, &buf[..n])
+                // As the read: the value goes straight to the store, which
+                // has had a width-typed entry point since the address space's
+                // own store path stopped staging bytes.
+                if attrs.debug {
+                    return self.stores[store].write_value(offset, width, value, endian);
+                }
+                // Keyed on the physical address, because that is what the slow
+                // path hands the space and what a sibling core's reservation
+                // was taken on.
+                let monitor = self.space.monitor();
+                monitor.note_store(phys, width.bytes());
+                let res = self.stores[store].write_value(offset, width, value, endian);
+                monitor.note_store(phys, width.bytes());
+                res
             }
             Probe::Slow => {
                 self.stats.slow += 1;
@@ -1228,6 +1291,45 @@ mod tests {
             second,
             tlb.space().read(addr, Width::U64, MemAttrs::DEFAULT)
         );
+    }
+
+    /// A store served from an entry breaks a reservation covering its bytes,
+    /// exactly as one through [`AddressSpace::read`]'s sibling would.
+    ///
+    /// The entry skips the permission and constraint checks because
+    /// [`Tlb::fill`] made them once. The monitor is not that kind of question:
+    /// the reservation is taken *after* the entry was filled, so nothing about
+    /// the fill can stand in for consulting it.
+    #[test]
+    fn a_store_served_from_an_entry_breaks_a_reservation_over_its_bytes() {
+        use crate::core::space::MonitorSlot;
+
+        let (mut tlb, _ram) = tlb();
+        let space = Arc::clone(tlb.space());
+        let addr = BASE + 0x2000;
+        // Fill the entry first, so the store under test is a hit rather than a
+        // miss that falls through to the address space.
+        tlb.write(addr, addr, Width::U32, 0, BARE, MemAttrs::DEFAULT)
+            .expect("the fill write lands");
+        assert_eq!(tlb.stats().misses, 1);
+
+        let slot = MonitorSlot::new(Arc::clone(&space), 4).expect("a free slot");
+        slot.reserve(addr);
+        assert!(slot.holds(), "the reservation is outstanding");
+        tlb.write(addr, addr, Width::U32, 0xa5a5_a5a5, BARE, MemAttrs::DEFAULT)
+            .expect("the write lands");
+        assert_eq!(tlb.stats().hits, 1, "and it was served from the entry");
+        assert!(
+            !slot.holds(),
+            "which broke the reservation over those bytes"
+        );
+
+        // A debug write must not: `MemAttrs::debug` promises no side effect,
+        // and a reservation a monitor silently dropped is one.
+        slot.reserve(addr);
+        tlb.write(addr, addr, Width::U32, 0x5a5a_5a5a, BARE, MemAttrs::DEBUG)
+            .expect("the debug write lands");
+        assert!(slot.holds(), "a debug write leaves the reservation alone");
     }
 
     #[test]

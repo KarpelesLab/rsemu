@@ -261,6 +261,151 @@
 //! limitation and it is deliberate — the alternative is a rank per space, which
 //! is no ladder at all.
 //!
+//! # Where this module's time actually goes
+//!
+//! `benches/a64_linux_boot.rs`'s profile has had a row reading *"the address
+//! space and the software TLB — 18.4%"* since the first one was taken, and
+//! three rounds fixed things inside it without ever splitting it. Split, over
+//! twenty guest seconds of an arm64 Linux boot, `engine = "jit-host"`,
+//! callgrind with `--smc-check=all-non-file`, against 154 233 793 guest
+//! instructions retired:
+//!
+//! | | host instructions | share | per guest instruction |
+//! | --- | --- | --- | --- |
+//! | **the whole profile** | 44 177 938 181 | 100% | 286.4 |
+//! | the value-typed **read** path (`AddressSpace::read` → `read_span_driven` → `FlatLeaf::read`) | 3 823 506 005 | 8.65% | 24.8 |
+//! | the inlined store's bookkeeping (`jit::Tlb::note_fast_store`, mostly `RamStore::mark_dirty`) | 1 100 637 360 | 2.49% | 7.1 |
+//! | the **bulk** transfer path (`FlatLeaf::write`, under `write_bytes`) | 635 354 676 | 1.44% | 4.1 |
+//! | the per-block TLB resync (`jit::Tlb::sync`) | 634 833 473 | 1.44% | 4.1 |
+//! | filling a TLB entry (`jit::Tlb::fill`, the flat-view probe) | 368 655 475 | 0.83% | 2.4 |
+//! | the value-typed **write** path (`AddressSpace::write` → `FlatEntry::write_value`) | 353 418 649 | 0.80% | 2.3 |
+//! | everything else in `space` and `jit::tlb` | 14 270 610 | 0.03% | 0.1 |
+//! | **the row, as a rate** | **6 930 676 248** | **15.69%** | **44.9** |
+//! | zeroing a gigabyte of guest RAM at reset (`RamStore::fill`) | 1 481 356 471 | 3.35% | *not a rate* |
+//!
+//! Five things in that are worth stating rather than leaving to be re-derived.
+//!
+//! **The inlined fast path is not in this row at all, and it is a tenth of
+//! it.** A load or store the backend inlines runs inside the generated block,
+//! which callgrind attributes to the anonymous mapping: 3 544 286 628 host
+//! instructions, 8.02% of the profile, for *all* the code the JIT emitted.
+//! `jit::x86::compile`'s `probe` is **twenty-two** of those instructions
+//! before the `mov` that is the access — the roadmap's "mask, compare, add,
+//! load" plus an alignment test, a tag to build and three ways out to the slow
+//! path — so 32 704 857 inlined accesses are on the order of 750 million, a
+//! fifth of the generated code and **1.7% of the profile**.
+//!
+//! Against that, the two calls each inlined access still makes are in this
+//! row, and the store's is the expensive one: 13 757 967 inlined stores
+//! against 1 100 637 360 host instructions in [`jit::Tlb::note_fast_store`] is
+//! **eighty host instructions of bookkeeping per twenty-three-instruction
+//! store**. Most of it was [`RamStore::mark_dirty`] rounding out a page count
+//! it keeps re-deriving and setting up a range loop that runs exactly once. So
+//! the interesting number is not the inlined path's length; it is that
+//! everything arranged around it costs several times what it does, and that is
+//! where a round aimed at *this* row has to look.
+//!
+//! **The read cost more than the write, on a path with strictly less to do.**
+//! The store had had a value-typed route into the leaf since the round that
+//! found `SpaceView::write` locating its target twice; the load had not, so it
+//! still filled a stack buffer through the span loop and read it back through
+//! [`Endian::load`] — which takes a *runtime* length, and therefore a variable
+//! shift per byte. Like for like, against a `Region::ram`, four bytes: **356
+//! host instructions to read and 256 to write**, and 15.1 ns against 13.7. The
+//! read now takes the same shape: 190 instructions and 13.0 ns.
+//!
+//! **The reads are not the guest's loads.** 18.9 million of those were served
+//! inline. What arrives here is what a plan cannot cover, and on this board
+//! that is dominated by the **page-table walk**: `cpu::arm::a64::mmu::walk`
+//! reads eight-byte descriptors through this module, which is why an
+//! eight-byte read is worth its own arm.
+//!
+//! **A row's name is not its cost.** Two of these are called far more often
+//! than the thing they are named after happens, and the call counts are what
+//! say so — 12 023 254 value reads, 1 301 179 value writes, 13 757 967 inlined
+//! stores, and **30 075 820** resyncs, which is *twice per block*. So the
+//! resync row is 21 instructions per call for a function whose body is
+//! usually a sixteen-byte compare, and almost none of it is the flush its
+//! name suggests; [`jit::Tlb::sync`] has the number that settles that. By the
+//! same count the write row is not the guest's stores either: 1.3 million
+//! value writes against 19 328 calls to
+//! [`AddressSpace::write_bytes`](AddressSpace::write_bytes) that moved 300-odd
+//! megabytes between them, and it was the *bulk* path that dominated.
+//!
+//! **[`RamStore::fill`] is a startup cost and is excluded from the rate.** It
+//! is one call: the board zeroing a gigabyte of guest RAM, a byte at a time,
+//! because the cells are [`AtomicU8`](core::sync::atomic::AtomicU8) and
+//! nothing may widen an atomic store. It is the largest single number in the
+//! table and it happens once.
+//!
+//! ## What the round that took that measurement then did
+//!
+//! Four changes, each aimed at a row above and at nothing else. The same
+//! twenty guest seconds, the same 154 233 793 guest instructions retired, the
+//! same 14 284 095 blocks and the same `Machine::state_hash`:
+//!
+//! | | before | after |
+//! | --- | --- | --- |
+//! | **the whole profile** | 44 177 938 181 | **41 013 034 205** (−7.16%) |
+//! | the read path, per read (12 023 254 of them) | 318 | **217** |
+//! | `jit::Tlb::note_fast_store`, per inlined store (13 757 967) | 80.0 | **62.0** |
+//! | the bulk write path (`FlatLeaf::write`, 19 328 transfers) | 635 354 676 | **219 625 356** |
+//! | the per-block resync (`jit::Tlb::sync`, 30 075 820 calls) | 634 833 473 | **4 877 397** |
+//! | **the row, as a rate** | 44.9 per guest instruction | **28.5** |
+//!
+//! * [`RamStore::read_value`] and the leaf and entry paths that carry a width
+//!   down to it, so a load stops staging bytes on the stack. Four bytes
+//!   through a `Region::ram`: 356 host instructions to 190.
+//! * [`RamStore::read_at`] and `write_at` sliced once rather than indexed per
+//!   byte, which is what the bulk row is: a 16 KiB DMA transfer was paying a
+//!   bounds check per byte.
+//! * [`RamStore::mark_dirty`] split so the one-page case — every guest store —
+//!   is a shift, a compare and a bit test, with the page count kept rather
+//!   than divided for.
+//! * [`jit::Tlb::sync`]'s equal case inlined, leaving the flush out of line.
+//!
+//! In wall clock the whole boot went from 2.426 s to 2.309 s, interleaved and
+//! pinned on one core, best of nine — **−4.8%**. Three such runs on a machine
+//! with five other agents on it gave −3.5%, −4.0% and −4.8%, so the effect is
+//! about four per cent and the spread is the host, not the change; a fourth
+//! run taken while a callgrind and a long run were competing for the same box
+//! measured −1.4% and is worth nothing. Either way it is less than the −7.16%
+//! of host instructions, which is the ordinary gap between an instruction
+//! count and a workload whose limit is branches and memory rather than issue
+//! width.
+//!
+//! ## What is left, with its number, so the next round starts here
+//!
+//! * **[`RamStore::fill`], 1 481 356 471 host instructions.** The largest
+//!   single number in the whole table and it is one call. It is also the one
+//!   place the sanctioned RAM host-pointer `unsafe` would plainly buy
+//!   something — a `memset` instead of a gigabyte of relaxed byte stores — and
+//!   it is a startup cost, so it never shows up in a rate. Whoever wants it
+//!   should say which of those two facts they are acting on.
+//! * **[`jit::Tlb::fill`], 368 655 475 over 1 509 220 fills — 244 each.** A
+//!   flat-view probe, then a linear `Arc::ptr_eq` scan of the store table to
+//!   intern the store. Amortised over roughly ten accesses per fill, which is
+//!   why it was not touched.
+//! * **The flush that this board does not do.** `jit::Tlb::sync`'s note has
+//!   the argument: the stamp window is 128 guest translation generations and
+//!   an arm64 Linux boot leaves it only a few hundred times in twenty seconds,
+//!   so the flush is 4 877 397 instructions in total. A RISC-V supervisor
+//!   moves its translation generation on every `SRET`; nobody has profiled
+//!   `riscv-virt` for this, and the answer there could be completely
+//!   different.
+//! * **30 075 820 calls to [`AddressSpace::generation`]** — one atomic load
+//!   each, made by `cpu::arm::a64::exec`'s `mem_plan` to build the [`Epoch`]
+//!   it then compares. The comparison is now inlined and nearly free; the
+//!   argument to it is not, and it is read afresh twice per block from outside
+//!   this module.
+//!
+//! [`Epoch`]: crate::jit::Epoch
+//! [`jit::Tlb::fill`]: crate::jit::Tlb::fill
+//!
+//! [`Endian::load`]: crate::core::value::Endian::load
+//! [`jit::Tlb::note_fast_store`]: crate::jit::Tlb::note_fast_store
+//! [`jit::Tlb::sync`]: crate::jit::Tlb::sync
+//!
 //! # `unsafe`
 //!
 //! None. `ROADMAP.md` §0 sanctions "the RAM host-pointer fast path" as one of
@@ -1086,6 +1231,36 @@ impl SpaceView<'_> {
     /// As [`AddressSpace::read`], less the retopology `Retry` case.
     #[inline]
     pub fn read(&self, addr: u64, width: Width, attrs: MemAttrs) -> MemResult<u64> {
+        // The same fast path [`SpaceView::write`] takes, and it was missing
+        // here for exactly as long as it took someone to profile the other
+        // direction. The general path below locates the target, fills a stack
+        // buffer a byte at a time inside `read_span_driven`'s run loop, and
+        // then reads that buffer straight back through `Endian::load` — which
+        // takes a **runtime** length, so its shift amount is a variable rather
+        // than an immediate and each byte costs a `shl %cl`.
+        //
+        // Carrying the width down to the leaf instead lets the store assemble
+        // the value in the register it returns. Under callgrind, against a
+        // `Region::ram`, `AddressSpace::read` of 1/2/4/8 bytes: 313/334/356/408
+        // host instructions to **178/181/190/206**, and in wall clock,
+        // interleaved and pinned, best of nine, 14.28/14.69/15.13/16.33 ns to
+        // 12.59/12.58/12.95/13.35. The four-byte read was 100 instructions
+        // dearer than the four-byte store it mirrors and is now 49 cheaper,
+        // which is about what the monitor pair and the dirty bit cost a store.
+        //
+        // The fast path is the whole access landing in one entry — every
+        // ordinary load, since a value-typed access crosses a region boundary
+        // only on a bus that permits one. `read_driven` keeps the general path
+        // whatever it is given: the bit it reports is per *run*, and it is the
+        // 6502's, which has no MMU and does not come through here hot.
+        if let Some(i) = self.locate(addr) {
+            let e = self.topo.flat.entry(i).expect("index came from locate");
+            let rel = addr - e.start();
+            if e.read_run_len(rel) >= width.bytes() {
+                return e.read_value(rel, width, attrs);
+            }
+        }
+        // Nothing mapped here, or the access straddles two entries.
         let n = width.bytes() as usize;
         let mut buf = [0u8; 8];
         let endian = self.read_span(addr, &mut buf[..n], attrs, Some(width))?;

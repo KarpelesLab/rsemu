@@ -994,6 +994,158 @@ fn a_value_write_across_two_entries_splits_and_keeps_the_first_entrys_order() {
     );
 }
 
+/// The read fast path and the span loop must agree — everywhere, at every
+/// width, under every attribute.
+///
+/// [`SpaceView::read`] resolves the target once and takes the value out of the
+/// leaf when the whole access lands in one entry.
+/// [`SpaceView::read_driven`] is what `read` **was**: `read_span_driven` into a
+/// stack buffer, then `Endian::load` over it. So the second is an oracle for
+/// the first, and the two must answer identically — the same value *and* the
+/// same error — over a map with one of every shape in it.
+///
+/// The devices below are deliberately side-effect-free. A `Fifo` would make
+/// the two calls differ for a reason that is not a defect, and the shape that
+/// answer belongs to is `a_debug_read_does_not_pop_a_fifo`.
+#[test]
+fn a_value_read_agrees_with_the_span_loop_everywhere() {
+    let space = AddressSpace::new("mem", 32);
+    let (le_store, le) = ram("le", 0x40);
+    let be_store = Arc::new(RamStore::new(0x40));
+    let (mirror_store, mirror_src) = ram("mirror-src", 0x10);
+    let (guarded_store, guarded) = ram("guarded", 0x40);
+    let (or_a_store, or_a) = ram("or-a", 0x40);
+    let (or_b_store, or_b) = ram("or-b", 0x40);
+    let rom = Arc::new(RomStore::from_slice(
+        &(0..0x40u8).map(|b| b ^ 0x5a).collect::<Vec<_>>(),
+    ));
+    for (i, store) in [&le_store, &be_store, &guarded_store, &or_a_store]
+        .into_iter()
+        .enumerate()
+    {
+        for off in 0..0x40u64 {
+            store
+                .write_u8(off, (off as u8).wrapping_mul(7).wrapping_add(i as u8 * 31))
+                .unwrap();
+        }
+    }
+    for off in 0..0x10u64 {
+        mirror_store.write_u8(off, 0xa0 | off as u8).unwrap();
+    }
+    for off in 0..0x40u64 {
+        or_b_store.write_u8(off, 0x80 >> (off % 8)).unwrap();
+    }
+
+    {
+        let mut t = space.topology();
+        // Plain little-endian RAM.
+        t.map(le, 0x000).unwrap();
+        // A big-endian region: the byte order now comes from the leaf.
+        t.map(
+            Region::ram("be", be_store.clone())
+                .with_constraints(AccessConstraints::ANY.with_endian(Endian::Big)),
+            0x040,
+        )
+        .unwrap();
+        // ROM, whose value path is separate from RAM's.
+        t.map(Region::rom("rom", rom, RomWrite::Ignore), 0x080)
+            .unwrap();
+        // A mirror: one entry, but a run that stops at every wrap — the case
+        // the fast path has to decline.
+        t.map(Region::mirror("mirror", mirror_src, 0x40).unwrap(), 0x0c0)
+            .unwrap();
+        // A device that accepts 32-bit accesses and nothing else, so the
+        // constraint check has something to refuse.
+        t.map(Region::io("reg32", 0x40, Arc::new(Reg32::default())), 0x100)
+            .unwrap();
+        // A big-endian 16-bit device: the I/O arm still materialises bytes.
+        t.map(Region::io("be16", 0x40, Arc::new(BeReg::default())), 0x140)
+            .unwrap();
+        // 0x180 is left unmapped.
+        // A mapping that permits neither writes nor execution, so
+        // `MemAttrs::read_perm` has a leaf that refuses a fetch and answers a
+        // load.
+        t.map_with_perms(guarded, 0x1c0, Perms::READ).unwrap();
+        // Reads and writes to two different chips at one address.
+        t.map(
+            Region::split(
+                "split",
+                Region::io("split-rd", 0x40, Arc::new(Scratch::new(0x40))),
+                Region::io("split-wr", 0x40, Arc::new(Scratch::new(0x40))),
+            )
+            .unwrap(),
+            0x200,
+        )
+        .unwrap();
+        // A wired-or, which is the one entry shape that keeps the byte path.
+        t.map(
+            Region::container_with(
+                "open-bus",
+                0x40,
+                vec![Mapping::new(or_a, 0), Mapping::new(or_b, 0)],
+                CombinePolicy::WiredOr,
+            ),
+            0x240,
+        )
+        .unwrap();
+    }
+
+    let attrs = [
+        MemAttrs::DEFAULT,
+        MemAttrs::DEFAULT.with_purpose(AccessPurpose::FETCH),
+        MemAttrs::DEBUG,
+        MemAttrs::DEFAULT.with_privileged(true),
+        MemAttrs::DEFAULT.with_bus(0xa5),
+    ];
+    let mut faults = 0u32;
+    let mut protected = 0u32;
+    for addr in 0..0x290u64 {
+        for width in [Width::U8, Width::U16, Width::U32, Width::U64] {
+            for a in attrs {
+                let fast = space.read(addr, width, a);
+                let span = space.read_driven(addr, width, a).map(|(v, _)| v);
+                assert_eq!(fast, span, "{addr:#06x} {width:?} {a:?}");
+                match fast {
+                    Err(BusError::BadAccess) => faults += 1,
+                    Err(BusError::Protected) => protected += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    // The map has to actually contain the refusals, or the loop above is
+    // asserting that two paths agree about nothing.
+    assert!(faults > 0, "no width or alignment refusal was reached");
+    assert!(protected > 0, "no permission refusal was reached");
+}
+
+/// A fetch of a page without [`Perms::EXEC`] is refused, and the value path is
+/// the one refusing it.
+///
+/// `FlatLeaf::read_value` asks [`MemAttrs::read_perm`] exactly as
+/// `FlatLeaf::read` does, and this is the assertion that stops it quietly
+/// asking for `READ` instead — which would be a mapping that becomes
+/// executable the moment it got hot enough to take the fast path.
+#[test]
+fn the_value_read_path_refuses_a_fetch_of_a_non_executable_mapping() {
+    let space = AddressSpace::new("mem", 16);
+    let (_store, region) = ram("text", 0x10);
+    space
+        .topology()
+        .map_with_perms(region, 0, Perms::RW)
+        .unwrap();
+    let fetch = MemAttrs::DEFAULT.with_purpose(AccessPurpose::FETCH);
+    assert!(space.read(0, Width::U32, MemAttrs::DEFAULT).is_ok());
+    assert_eq!(
+        space.read(0, Width::U32, fetch),
+        Err(BusError::Protected),
+        "a fetch wants EXEC, and this mapping has none"
+    );
+    // And a debug read is a data read however it is marked, which is the one
+    // asymmetry between the two directions.
+    assert!(space.read(0, Width::U32, MemAttrs::DEBUG).is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // Dirty tracking
 // ---------------------------------------------------------------------------

@@ -108,6 +108,7 @@
 //! | --- | --- |
 //! | the byte loop, four bytes | 1.3 |
 //! | one whole `AddressSpace::write`, four bytes | 11.9 |
+//! | one whole `AddressSpace::read`, four bytes | 11.3 |
 //! | one interpreted `mov [bx], eax` | 117 |
 //! | one interpreted `mov [bx], al` | 101 |
 //! | one interpreted `nop`, for scale | 56 |
@@ -126,6 +127,20 @@
 //! longer serialises on a `lock or` is a store the byte loop can overlap with,
 //! which is the direction that makes a wide aligned atomic *more* attractive
 //! rather than less.
+//!
+//! **The read row is new, and it is new because for three rounds it was the
+//! larger of the two and nobody had it.** A four-byte read cost 356 host
+//! instructions against the store's 256 — on a path with strictly less to do,
+//! since a read consults no monitor and marks nothing dirty. All of the
+//! difference was shape: the store had had [`RamStore::write_value`] since the
+//! round above, and the read still filled a stack buffer through the span loop
+//! and read it back through `Endian::load`, whose length is a *runtime* value
+//! and whose shift is therefore a variable. [`RamStore::read_value`] is the
+//! answer and it is the same answer. Interleaved and pinned, best of nine,
+//! 1/2/4/8 bytes: **14.28/14.69/15.13/16.33 ns to 12.59/12.58/12.95/13.35**,
+//! against a store that moved 13.56/13.77/13.72/14.10 to
+//! 13.17/13.36/13.42/13.85 in the same run. The read is now the cheaper of the
+//! two, which is the order the work says it should have been in all along.
 //!
 //! One case is *not* measured and should be before anyone spends the money: a
 //! compiled block whose store takes the **slow** path. An AArch64 or RISC-V
@@ -323,6 +338,46 @@ const fn align_gap(addr: usize) -> usize {
     addr.wrapping_neg() % (HOST_PAGE as usize)
 }
 
+/// The first `N` cells, assembled least-significant byte first.
+///
+/// `N` is a constant at every call site — one per [`Width`] — so the loop is
+/// unrolled and each shift is an immediate. `None` when the slice is shorter
+/// than `N`, which is a caller that did not bound-check; the callers here have,
+/// and the check is what makes that provable rather than asserted.
+#[inline(always)]
+fn le_cells<const N: usize>(cells: &[AtomicU8]) -> Option<u64> {
+    let chunk: &[AtomicU8; N] = cells.first_chunk()?;
+    let mut v = 0u64;
+    for (i, cell) in chunk.iter().enumerate() {
+        v |= u64::from(cell.load(Ordering::Relaxed)) << (8 * i);
+    }
+    Some(v)
+}
+
+/// The same for a plain byte slice, which may be read in one host load.
+#[inline(always)]
+fn le_bytes<const N: usize>(bytes: &[u8]) -> Option<u64> {
+    let chunk: &[u8; N] = bytes.first_chunk()?;
+    let mut v = 0u64;
+    for (i, b) in chunk.iter().enumerate() {
+        v |= u64::from(*b) << (8 * i);
+    }
+    Some(v)
+}
+
+/// Put a value assembled least-significant byte first into `endian` order.
+///
+/// A big-endian region wants the byte at the lowest address to be the *most*
+/// significant one, which for a value narrower than 64 bits is a swap and a
+/// shift back down.
+#[inline]
+const fn order(raw: u64, width: Width, endian: Endian) -> u64 {
+    match endian {
+        Endian::Little => raw,
+        Endian::Big => raw.swap_bytes() >> (64 - width.bits()),
+    }
+}
+
 /// Writable guest memory, addressed by byte offset and shareable across
 /// threads.
 ///
@@ -344,6 +399,15 @@ pub struct RamStore {
     dirty: Vec<AtomicU64>,
     page_bits: u32,
     len: u64,
+    /// `len.div_ceil(1 << page_bits)`, kept rather than recomputed.
+    ///
+    /// [`mark_dirty`](RamStore::mark_dirty) needs it to bound its loop and runs
+    /// on every store in the machine, and the divisor is a shift the compiler
+    /// cannot see is a power of two: it got the rounding right without a
+    /// `div`, but spent eight instructions of `cmp`/`sbb`/`cmp`/`adc` doing
+    /// it. Computed once in [`with_page_bits`](RamStore::with_page_bits),
+    /// which had it already.
+    pages: u64,
 }
 
 impl fmt::Debug for RamStore {
@@ -400,6 +464,7 @@ impl RamStore {
             dirty,
             page_bits,
             len,
+            pages,
         }
     }
 
@@ -448,7 +513,7 @@ impl RamStore {
     #[inline]
     #[must_use]
     pub fn page_count(&self) -> u64 {
-        self.len.div_ceil(self.page_size())
+        self.pages
     }
 
     #[inline]
@@ -469,8 +534,18 @@ impl RamStore {
     #[inline]
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> MemResult {
         let base = self.range(offset, dst.len() as u64)?;
-        for (i, b) in dst.iter_mut().enumerate() {
-            *b = self.cells[base + i].load(Ordering::Relaxed);
+        // Sliced once and then zipped, rather than indexed per byte: the
+        // indexed form re-checked the bound on every iteration, though `range`
+        // has already proved the whole span is inside the allocation. It is
+        // the bulk path that pays for that — a 16 KiB DMA transfer through
+        // `AddressSpace::write_bytes` was 32 872 host instructions and is now
+        // 11 363 — and every value access goes through `read_value` below.
+        let cells = self
+            .cells
+            .get(base..base + dst.len())
+            .ok_or(BusError::BadAccess)?;
+        for (b, cell) in dst.iter_mut().zip(cells) {
+            *b = cell.load(Ordering::Relaxed);
         }
         Ok(())
     }
@@ -480,8 +555,12 @@ impl RamStore {
     #[inline]
     pub fn write_at(&self, offset: u64, src: &[u8]) -> MemResult {
         let base = self.range(offset, src.len() as u64)?;
-        for (i, b) in src.iter().enumerate() {
-            self.cells[base + i].store(*b, Ordering::Relaxed);
+        let cells = self
+            .cells
+            .get(base..base + src.len())
+            .ok_or(BusError::BadAccess)?;
+        for (b, cell) in src.iter().zip(cells) {
+            cell.store(*b, Ordering::Relaxed);
         }
         self.mark_dirty(offset, src.len() as u64);
         Ok(())
@@ -503,6 +582,38 @@ impl RamStore {
         Ok(())
     }
 
+    /// Read `width` bytes at `offset` in `endian` order, as a value.
+    ///
+    /// The mirror of [`write_value`](RamStore::write_value), and it exists for
+    /// the same reason: nobody wanted the buffer. `read_at` into a stack array
+    /// followed by [`Endian::load`] is a store-to-load round trip on the
+    /// hottest path in the emulator, and it is the *worse* half of the pair,
+    /// because `Endian::load` takes a **runtime** length. That makes its shift
+    /// amount a variable — `shl %cl` per byte, from a count computed in the
+    /// loop — where a width known at this call is an immediate.
+    ///
+    /// The bytes are still read one at a time. They have to be: the cells are
+    /// [`AtomicU8`] and nothing may merge two atomic loads into one wider one,
+    /// which is the same rule that keeps [`write_value`](RamStore::write_value)
+    /// a byte loop and the reason `tests/memory_model_costs.rs` exists. What
+    /// changes here is only where the bytes are assembled — in the register
+    /// that returns them, at constant offsets, rather than through memory.
+    #[inline(always)]
+    pub fn read_value(&self, offset: u64, width: Width, endian: Endian) -> MemResult<u64> {
+        let base = self.range(offset, width.bytes())?;
+        let cells = self.cells.get(base..).ok_or(BusError::BadAccess)?;
+        // One arm per width, so each is a constant trip count and every shift
+        // below is an immediate.
+        let raw = match width {
+            Width::U8 => le_cells::<1>(cells),
+            Width::U16 => le_cells::<2>(cells),
+            Width::U32 => le_cells::<4>(cells),
+            Width::U64 => le_cells::<8>(cells),
+        }
+        .ok_or(BusError::BadAccess)?;
+        Ok(order(raw, width, endian))
+    }
+
     /// Write the low `width` bytes of `value` at `offset` in `endian` order,
     /// marking the pages they touch dirty.
     ///
@@ -513,7 +624,20 @@ impl RamStore {
     /// back, which is a store-to-load round trip on the hottest path in the
     /// emulator and buys nothing — nobody wanted the buffer, it was only ever
     /// the shape the API had.
-    #[inline]
+    ///
+    /// # `inline(always)`, on this and on [`read_value`](RamStore::read_value)
+    ///
+    /// `CLAUDE.md` allows `#[inline]` on a hot-path accessor and nothing
+    /// stronger, so the stronger form owes a reason. There are **two** call
+    /// sites for each of these — the flat leaf and the software TLB — and with
+    /// a plain `#[inline]` LLVM declines both rather than duplicating the byte
+    /// loop, exactly the way a second call site once stopped
+    /// `FlatLeaf::write_value` being inlined into `FlatEntry::write_value`.
+    /// Measured on a four-byte `AddressSpace::write` into a `Region::ram`:
+    /// 256 host instructions with one call site, **277** when the TLB became a
+    /// second, and 255 with this attribute and both. The read is the same
+    /// shape, 190 against 198.
+    #[inline(always)]
     pub fn write_value(&self, offset: u64, width: Width, value: u64, endian: Endian) -> MemResult {
         let bytes = width.bytes();
         let base = self.range(offset, bytes)?;
@@ -631,14 +755,44 @@ impl RamStore {
         }
         let first = offset >> self.page_bits;
         let last = offset.saturating_add(len - 1) >> self.page_bits;
-        for page in first..=last.min(self.page_count().saturating_sub(1)) {
-            let (word, bit) = (page / 64, page % 64);
-            if let Some(w) = self.dirty.get(word as usize) {
-                let mask = 1u64 << bit;
-                if w.load(Ordering::Relaxed) & mask == 0 {
-                    w.fetch_or(mask, Ordering::Relaxed);
-                }
-            }
+        // **One page is the case, not a case.** A guest access is at most
+        // eight bytes and a dirty page is at least one; the multi-page arm
+        // exists for `fill`, a DMA burst and a store that straddles a
+        // boundary. Splitting it out is what lets the common call be a shift,
+        // a compare and a bit test — the loop below cost a range set-up, a
+        // clamp against the page count and a per-iteration carry chain, all of
+        // it to run exactly once.
+        //
+        // This is the third round to touch this line and the reason is always
+        // the same: it is on the inlined store's path, where the whole point
+        // is that the store itself is four instructions. `jit::Tlb::`
+        // `note_fast_store` calls it for every store a compiled block makes.
+        if first == last {
+            self.mark_page(first);
+            return;
+        }
+        for page in first..=last {
+            self.mark_page(page);
+        }
+    }
+
+    /// Set one page's dirty bit, testing before setting.
+    ///
+    /// The test is [`mark_dirty`](RamStore::mark_dirty)'s, and its long
+    /// argument — why a locked read-modify-write here bought nothing, and what
+    /// the safe-point protocol supplies instead — is written there.
+    #[inline]
+    fn mark_page(&self, page: u64) {
+        if page >= self.pages {
+            return;
+        }
+        let (word, bit) = (page / 64, page % 64);
+        let Some(w) = self.dirty.get(word as usize) else {
+            return;
+        };
+        let mask = 1u64 << bit;
+        if w.load(Ordering::Relaxed) & mask == 0 {
+            w.fetch_or(mask, Ordering::Relaxed);
         }
     }
 
@@ -896,5 +1050,30 @@ impl RomStore {
         let at = usize::try_from(offset).map_err(|_| BusError::BadAccess)? + self.base;
         dst.copy_from_slice(&self.bytes[at..at + dst.len()]);
         Ok(())
+    }
+
+    /// Read `width` bytes at `offset` in `endian` order, as a value.
+    ///
+    /// [`RamStore::read_value`]'s read-only twin, and the cheaper of the two:
+    /// these bytes are not atomic, so nothing stops the compiler folding the
+    /// per-byte assembly below into one host load of the whole width.
+    #[inline]
+    pub fn read_value(&self, offset: u64, width: Width, endian: Endian) -> MemResult<u64> {
+        let end = offset
+            .checked_add(width.bytes())
+            .ok_or(BusError::BadAccess)?;
+        if end > self.len() {
+            return Err(BusError::BadAccess);
+        }
+        let at = usize::try_from(offset).map_err(|_| BusError::BadAccess)? + self.base;
+        let bytes = self.bytes.get(at..).ok_or(BusError::BadAccess)?;
+        let raw = match width {
+            Width::U8 => le_bytes::<1>(bytes),
+            Width::U16 => le_bytes::<2>(bytes),
+            Width::U32 => le_bytes::<4>(bytes),
+            Width::U64 => le_bytes::<8>(bytes),
+        }
+        .ok_or(BusError::BadAccess)?;
+        Ok(order(raw, width, endian))
     }
 }

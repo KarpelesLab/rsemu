@@ -320,6 +320,41 @@ impl FlatLeaf {
         }
     }
 
+    /// [`read`](FlatLeaf::read) for a width-typed access, producing the value
+    /// rather than filling a byte slice.
+    ///
+    /// The read side of [`write_value`](FlatLeaf::write_value), and identical
+    /// to [`read`](FlatLeaf::read) in every check it makes — the same
+    /// [`MemAttrs::read_perm`], which asks for [`Perms::EXEC`] on a fetch, and
+    /// the same [`AccessConstraints::check`]. Only the transfer differs: the
+    /// byte order is this leaf's own and is applied *at* the store, from the
+    /// constraints this call reads anyway, so the value never passes through a
+    /// stack buffer. See [`FlatEntry::read_value`] for the shape that keeps
+    /// the byte path and why.
+    #[inline]
+    pub fn read_value(&self, rel: u64, width: Width, attrs: MemAttrs) -> MemResult<u64> {
+        if !self.perms.contains(attrs.read_perm()) {
+            return Err(BusError::Protected);
+        }
+        let off = self.offset_of(rel);
+        self.constraints.check(off, width, attrs)?;
+        match &self.target {
+            FlatTarget::Ram(s) => s.read_value(off, width, self.constraints.endian),
+            FlatTarget::Rom { store, .. } => store.read_value(off, width, self.constraints.endian),
+            // A device answers in bytes, as `write_value` explains: `MemOps` is
+            // a slice interface because a device access is not width-bounded.
+            // The buffer is materialised here, where the call that fills it
+            // dwarfs it.
+            FlatTarget::Io(ops, id) => {
+                crate::core::trace::mmio(id.0, false);
+                let n = width.bytes() as usize;
+                let mut buf = [0u8; 8];
+                ops.read(off, &mut buf[..n], attrs)?;
+                self.constraints.endian.load(&buf[..n], width)
+            }
+        }
+    }
+
     /// Write to this leaf, `rel` bytes past the entry's start.
     #[inline]
     pub fn write(&self, rel: u64, src: &[u8], attrs: MemAttrs, width: Option<Width>) -> MemResult {
@@ -656,6 +691,31 @@ impl FlatEntry {
                 Ok(())
             }
         }
+    }
+
+    /// Read `width` bytes starting `rel` bytes into this entry, in the
+    /// entry's byte order.
+    ///
+    /// [`FlatEntry::read`] with the value carried out instead of a byte slice
+    /// filled in, and the exact counterpart of
+    /// [`write_value`](FlatEntry::write_value): the byte order comes from the
+    /// leaf that answers rather than from a second lookup ahead of it.
+    ///
+    /// The read side never consults [`write_to`](FlatEntry::write_to) — a
+    /// directed entry's write leaf answers `/WR` and nothing else — so unlike
+    /// the write there is only one shape to resolve, and only one that keeps
+    /// the byte path: a **combined** entry, which wired-ors several members
+    /// into one set of wires and therefore has one byte order for all of them.
+    /// [`FlatEntry::endian`] answers for the highest-priority member and the
+    /// combination has to happen in bytes before it is applied.
+    pub fn read_value(&self, rel: u64, width: Width, attrs: MemAttrs) -> MemResult<u64> {
+        if let EntryKind::Single(l) = &self.kind {
+            return l.read_value(rel, width, attrs);
+        }
+        let n = width.bytes() as usize;
+        let mut buf = [0u8; 8];
+        self.read(rel, &mut buf[..n], attrs, Some(width))?;
+        self.endian().load(&buf[..n], width)
     }
 
     /// Write `src` starting `rel` bytes into this entry.
