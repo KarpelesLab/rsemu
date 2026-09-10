@@ -7,12 +7,19 @@ is the catalogue and the licence table; this is the operating manual.
 The harness lives in [`tests/conformance/`](../../tests/conformance) and is one
 Cargo test target, `conformance`.
 
-One measurement here is **not** a conformance suite and has its own page:
+Two measurements here are **not** conformance suites and have their own pages:
 [`long-run.md`](long-run.md) runs the interpreter against each translated engine
 quantum by quantum over a real guest, which is what `ROADMAP.md` §0's
 "bit-identical state hash across the interpreter and the JIT" needs to mean
 something past the first millisecond. It follows the same fixture rules as
 everything below — fetched, never committed, and it skips loudly without one.
+
+[`benchmarks.md`](benchmarks.md) is the other, and it measures speed rather than
+accuracy: rsemu against QEMU on the same guest doing the same work, which is
+`ROADMAP.md` phase 8's gate and the first number in this project that is not
+measured against our own previous self. QEMU is run, never read (`ROADMAP.md`
+§1). Same fixture rules again, and it is a `scripts/check.sh` stage nobody's
+`cargo test` will trip over.
 
 ## Two commands
 

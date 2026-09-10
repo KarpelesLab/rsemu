@@ -30,6 +30,18 @@
 //! one as an emulated guest is ordinary use and committing one here would be
 //! redistribution (`CLAUDE.md`, *Testing*).
 //!
+//! # The half of the gate this is not
+//!
+//! Everything below is measured against rsemu's own previous self, which can
+//! say a change made things faster and can never say whether the result is
+//! fast. Phase 8's gate needs an external reference and names one:
+//! `scripts/bench-vs-qemu.sh` drives this same board and a `pc64` one under
+//! rsemu and under QEMU on the same guest doing the same work, and
+//! `docs/testing/benchmarks.md` publishes the ratio. Read the two together --
+//! the census here says *where* rsemu's time goes and the ratio there says
+//! *how much of it there is to spend*. (QEMU is run as an instrument and never
+//! read; `ROADMAP.md` §1.)
+//!
 //! # Under callgrind
 //!
 //! This host drifts several nanoseconds per instruction under concurrent
