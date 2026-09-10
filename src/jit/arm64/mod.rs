@@ -107,10 +107,10 @@ pub mod rt;
 #[cfg(test)]
 mod tests;
 
-pub use abi::{Ctx, Event, Vtable};
+pub use abi::{ChainFn, Ctx, Event, Vtable};
 pub use compile::{Compiled, Refusal, Regs, compile, compile_with, compiles};
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub use buf::{CodeBuf, DEFAULT_CAPACITY};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-pub use rt::{Engine, EngineStats};
+pub use rt::{Engine, EngineStats, Linkage};

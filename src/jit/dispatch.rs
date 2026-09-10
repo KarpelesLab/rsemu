@@ -26,6 +26,36 @@
 //! every run of a real guest. Now it is called once per block iteration, the
 //! chained ones included.
 //!
+//! # A link: when the patched exit reaches generated code
+//!
+//! The paragraph above is about *chaining*, which is a cache lookup skipped.
+//! A **link** is the same edge taken by the host processor: the predecessor's
+//! compiled code jumps into the successor's, and the Rust frame the block was
+//! entered through is never unwound. That is direct block linking, the
+//! technique every production translator uses — Bala, Duesterwald and
+//! Banerjia's Dynamo (PLDI 2000) calls it *fragment linking*, and Smith and
+//! Nair's *Virtual Machines* (2005) §2.6 sets it out as "translation chaining"
+//! — and `ROADMAP.md` §9.1's second mechanism is only half done without it.
+//!
+//! What it removes is not the hash lookup. It is the **re-entry**: a
+//! twenty-eight-field context, a thunk table, a six-register prologue and its
+//! epilogue, and the dispatcher's own call into an engine, once per block.
+//!
+//! What it may **not** remove is everything else this loop does at a boundary,
+//! and that is the whole design. [`Chain`] is where those checks moved, in the
+//! order this loop makes them, and its documentation is the list. Two of them
+//! are the ones a naive link gets wrong: a chain that never returns to Rust
+//! cannot be preempted, so [`IrHost::spent`](crate::ir::IrHost::spent) and the
+//! [`ExitFlag`] are asked at every linked boundary too; and a block a guest
+//! store invalidated must not be jumped into, so stores are drained against
+//! the cache *before* the successor is chosen.
+//!
+//! A link is refused — and the run comes back here — whenever the successor
+//! needs something a chain may not do: lifting, compiling, or a longer
+//! temporary frame. [`DispatchStats::linked`] counts the ones that were taken,
+//! separately from [`DispatchStats::chained`], because the two were the same
+//! number for as long as chaining meant only a lookup skipped.
+//!
 //! # Why self-modifying code is reported rather than intercepted
 //!
 //! A guest store goes through [`IrHost::store`](crate::ir::IrHost::store),
@@ -118,7 +148,23 @@ use crate::jit::tlb::{Epoch, PAGE_MASK, PAGE_SIZE};
     all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
     all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
 ))]
-use crate::jit::host::Engine;
+use core::marker::PhantomData;
+
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+use crate::core::error::Error;
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+use crate::jit::cache::CodeRef;
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+use crate::jit::host::{Engine, Linkage};
 
 /// One freshly lifted block, and what the cache needs to know about it.
 #[derive(Debug)]
@@ -349,6 +395,17 @@ pub struct DispatchStats {
     pub chained: u64,
     /// Blocks reached by a hash lookup.
     pub looked_up: u64,
+    /// Blocks entered by a **direct link**: a jump from the predecessor's own
+    /// compiled code, with no return to this loop at all.
+    ///
+    /// A subset of [`DispatchStats::chained`], and the one that says whether
+    /// the patch reached generated code. A block is counted here only when
+    /// everything a boundary owes was answered inside the chain — see
+    /// [`Chain`] — so the difference between the two is exactly the population
+    /// a link could not serve: a successor not yet compiled, one compiled in
+    /// an older code-buffer generation, or one needing a longer temporary
+    /// frame than the chain is standing on.
+    pub linked: u64,
     /// Blocks translated.
     pub translated: u64,
     /// Blocks invalidated by a guest store.
@@ -362,6 +419,293 @@ pub struct DispatchStats {
     /// unmeasured is a backend whose coverage rots, which is why it is
     /// counted rather than assumed.
     pub compiled: u64,
+}
+
+/// A block boundary a chain got past and could not follow.
+///
+/// The reason this is not simply "go round the loop again": by the time a
+/// chain gives up, [`Frontend::enter`] has already run for `pc` — it had to,
+/// because [`Frontend::key`] is answered out of what the entry resolved to —
+/// and on a guest whose fetch translates that is a page-table walk, charged in
+/// ticks. Going round the top of the loop would charge it a second time, which
+/// is the shape of bug `cpu::arm::a64::engine` documents at its own prologue.
+/// So [`Dispatcher::run`] resumes *below* the boundary work with whatever the
+/// chain already established.
+#[derive(Debug, Clone, Copy)]
+struct Resumed {
+    /// The guest PC the entry work was done for.
+    pc: u64,
+    /// What [`Frontend::key`] answered there.
+    key: u64,
+    /// The predecessor a link would be patched from.
+    from: Option<BlockId>,
+    /// The block the cache held, and whether a patched exit found it.
+    ///
+    /// `None` means the cache had none and the loop must lift one. `Some`
+    /// means the hit is counted and the predecessor patched already.
+    found: Option<(BlockId, bool)>,
+}
+
+/// What executing one block — or a whole chain of them — did.
+#[derive(Debug)]
+struct Ran {
+    /// The last block's outcome.
+    outcome: Outcome,
+    /// How many blocks executed.
+    blocks: usize,
+    /// What they retired.
+    insns: usize,
+    /// Whether the boundary after the last block has been dealt with here.
+    ///
+    /// True only for a chain: the drain, the epoch, the entry work and the
+    /// lookup all happen inside generated code, and the loop must not do them
+    /// again. `resumed` and `stopped` are what came of them.
+    closed: bool,
+    /// The boundary the chain stopped at, when it stopped at one it could not
+    /// follow.
+    resumed: Option<Resumed>,
+    /// The chain ending the whole run, and where the guest is.
+    stopped: Option<(Stop, u64)>,
+}
+
+/// The policy behind a direct link: what happens at a block boundary reached
+/// **inside** generated code.
+///
+/// `ROADMAP.md` §9.1's second mechanism carried to its end. The block cache
+/// has patched exits since it existed, but following one still meant returning
+/// to Rust and entering the successor through `Dispatcher::execute` — a
+/// context of twenty-eight fields, a thunk table, a prologue and an epilogue
+/// per block, measured at ~490 host instructions against a mean block of 10.8
+/// guest instructions on an AArch64 Linux boot. A link makes the successor a
+/// jump from the predecessor's own code, and this type is everything that jump
+/// may not skip.
+///
+/// # What a link must not break
+///
+/// Every one of these is a check [`Dispatcher::run`]'s loop makes at a block
+/// boundary, and [`Chain::step`] makes them in the same order for the same
+/// reasons:
+///
+/// * **The tick allowance.** [`IrHost::spent`] decides where a quantum ends,
+///   and a chain that never returned to Rust could not be preempted. It is
+///   asked here, at every boundary, exactly where the loop asks it.
+/// * **The safe point.** A raised [`ExitFlag`] is honoured within one block
+///   (see the module docs) — including a block reached by a link.
+/// * **Invalidation.** A guest store is drained against the cache *before* the
+///   successor is chosen, so a block a store invalidated is never jumped to;
+///   and the epoch is read at every boundary, so a retopology flushes the
+///   cache before the link that would otherwise have followed it.
+/// * **Staleness.** A [`CodeRef`] from before a code-buffer reset names
+///   whatever took its place, so a link is refused unless the reference
+///   carries the generation the engine is serving.
+/// * **Determinism.** Nothing above is skipped and nothing is reordered, so a
+///   linked chain retires exactly what an unlinked one does: the same faults
+///   at the same instructions, the same tick counts, the same oracle.
+///
+/// # What it may not do
+///
+/// **Translate, compile, or grow the temporary frame.** All three would run
+/// while the engine is executing: compiling can reset the code buffer under
+/// the code that called this, and growing the frame moves it out from under
+/// the register holding its address. A successor needing any of them is not
+/// linked to — the chain stops there, and the loop, which may do all three,
+/// enters it the ordinary way.
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[derive(Debug)]
+pub struct Chain<'a, F: ?Sized, H: ?Sized> {
+    cache: &'a mut BlockCache,
+    front: &'a mut F,
+    stats: &'a mut DispatchStats,
+    exit: Option<&'a ExitFlag>,
+    /// What the engine's code buffer looks like for as long as this runs.
+    link: Linkage,
+    /// The slot a block leaves the guest PC in.
+    pc_slot: RegSlot,
+    /// How many blocks the caller's budget still allows.
+    remaining: usize,
+    /// The block currently executing.
+    id: BlockId,
+    /// The predecessor of the next link.
+    from: Option<BlockId>,
+    /// Blocks this chain executed.
+    blocks: usize,
+    /// What they retired.
+    insns: usize,
+    /// The boundary it could not follow.
+    resumed: Option<Resumed>,
+    /// The run it ended outright.
+    stopped: Option<(Stop, u64)>,
+    /// What [`Frontend::enter`] said, when it said an error.
+    err: Option<Error>,
+    _host: PhantomData<*mut H>,
+}
+
+/// What [`Chain::step`] answers.
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Leave generated code. The [`Chain`] holds why.
+    Leave,
+    /// Jump to a successor's chain entry.
+    Go {
+        /// The block there.
+        id: BlockId,
+        /// Its compiled code.
+        code: CodeRef,
+        /// The host address of its chain entry.
+        entry: u64,
+    },
+}
+
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+impl<F, H> Chain<'_, F, H>
+where
+    F: Frontend<H> + ?Sized,
+    H: IrHost + StoreLog + FastMem + ?Sized,
+{
+    /// The slot a block leaves the guest PC in, for the backend that has to
+    /// read an `exit_tb`'s successor out of it.
+    #[inline]
+    #[must_use]
+    pub fn pc_slot(&self) -> RegSlot {
+        self.pc_slot
+    }
+
+    /// The block an id names, for the backend that has to point its context at
+    /// one.
+    #[inline]
+    #[must_use]
+    pub fn block(&self, id: BlockId) -> Option<&Block> {
+        self.cache.block(id)
+    }
+
+    /// One block boundary, reached inside generated code.
+    ///
+    /// `next` is where the guest is going, or `None` when the block did not
+    /// reach a terminator — a fault, or the tick allowance — and `retired` is
+    /// what that block retired. Answers with the successor to jump to, or
+    /// [`Step::Leave`].
+    ///
+    /// This is [`Dispatcher::run`]'s loop body from *"guest stores land before
+    /// the next block is chosen"* through the link patch, **moved**: the same
+    /// work in the same order, which is the point. See the type's docs.
+    pub fn step(&mut self, next: Option<u64>, retired: usize, host: &mut H) -> Step {
+        self.stats.blocks += 1;
+        self.blocks += 1;
+        self.insns += retired;
+
+        // Guest stores land before the next block is chosen, so a block
+        // invalidated by one is never served afterwards — and never jumped to,
+        // which is the same rule one level down.
+        let cache = &mut *self.cache;
+        let mut hit = 0usize;
+        host.drain_dirty(&mut |page| hit += cache.note_write(page, 1));
+        self.stats.smc += hit as u64;
+        // A block that wrote into its own page is gone, and the id that named
+        // it may already have been reused, so it cannot be a link's
+        // predecessor.
+        self.from = self.cache.block(self.id).is_some().then_some(self.id);
+
+        let Some(pc) = next else {
+            return Step::Leave;
+        };
+        if self.blocks >= self.remaining {
+            self.stopped = Some((Stop::Budget, pc));
+            return Step::Leave;
+        }
+        if self.exit.is_some_and(ExitFlag::raised) {
+            self.stopped = Some((Stop::Exit, pc));
+            return Step::Leave;
+        }
+        if host.spent() {
+            self.stopped = Some((Stop::Spent, pc));
+            return Step::Leave;
+        }
+        if self.cache.sync(self.front.epoch()) {
+            self.stats.resyncs += 1;
+            self.from = None;
+        }
+        match self.front.enter(pc, host) {
+            Ok(Entry::Ready) => {}
+            Ok(Entry::Leave) => {
+                self.stopped = Some((Stop::Declined, pc));
+                return Step::Leave;
+            }
+            Err(e) => {
+                // Not a guest condition, so it ends the run — but it ends it
+                // through the caller, which is the only place a `Result` can
+                // be returned from once the loop is inside generated code.
+                self.err = Some(e);
+                self.stopped = Some((Stop::Declined, pc));
+                return Step::Leave;
+            }
+        }
+        let key = self.front.key();
+        let found = match self.from.and_then(|f| self.cache.follow(f, pc, key)) {
+            Some(id) => Some((id, true)),
+            None => self.cache.lookup(pc, key).map(|id| {
+                self.stats.looked_up += 1;
+                (id, false)
+            }),
+        };
+        let Some((id, chained)) = found else {
+            // Nothing cached: lifting is the loop's job, not this one's.
+            self.resumed = Some(Resumed {
+                pc,
+                key,
+                from: self.from,
+                found: None,
+            });
+            return Step::Leave;
+        };
+        if chained {
+            self.stats.chained += 1;
+        } else if let Some(f) = self.from {
+            self.cache.link(f, pc, id);
+        }
+        // Compiled, in the generation this engine is serving — a reference
+        // from before a code-buffer reset names whatever took its place, and
+        // the engine cannot be asked, because it is running. And short enough
+        // for the frame every block of a chain shares, which cannot be grown
+        // from here: growing it moves it, and the running code holds its
+        // address in a register.
+        //
+        // Spelled as three `if`s rather than as a chain of `Option` combinators
+        // because a closure that captures `self` is not inlined into a thunk
+        // generated code enters through a function pointer: as
+        // `Option::filter` this cost 27 host instructions per block entry on
+        // an AArch64 Linux boot, against the four compares it is.
+        if let Some(code) = self.cache.code(id)
+            && code.generation == self.link.generation
+            && let Some(block) = self.cache.block(id)
+            && block.temp_count() <= self.link.temps
+        {
+            self.stats.compiled += 1;
+            self.stats.linked += 1;
+            self.id = id;
+            return Step::Go {
+                id,
+                code,
+                entry: self.link.base.wrapping_add(code.chain),
+            };
+        }
+        self.resumed = Some(Resumed {
+            pc,
+            key,
+            from: self.from,
+            found: Some((id, chained)),
+        });
+        Step::Leave
+    }
 }
 
 /// The loop that keeps a guest inside translated code.
@@ -505,65 +849,89 @@ impl Dispatcher {
         let mut from: Option<BlockId> = None;
         let mut blocks = 0usize;
         let mut insns = 0usize;
+        // Set when a chain stopped at a boundary it had already done the entry
+        // work for. See [`Resumed`]: going round the top of the loop would
+        // charge that work twice.
+        let mut resumed: Option<Resumed> = None;
 
         let stop = loop {
-            if blocks >= budget {
-                break Stop::Budget;
-            }
-            if self.exit.as_ref().is_some_and(ExitFlag::raised) {
-                break Stop::Exit;
-            }
-            // The tick budget, at a block boundary. Skipped for the first
-            // block of a run, and that is the same rule
-            // [`Interp`](crate::ir::Interp) applies to the first boundary of a
-            // block: a caller whose own interpreter always retires one guest
-            // instruction per call must not be handed a run that retired none,
-            // or the two stop agreeing about how far a quantum got. So a run
-            // executes at least one block, a block retires at least one
-            // instruction, and after that the host decides.
-            if blocks > 0 && host.spent() {
-                break Stop::Spent;
-            }
-            // Per block, not per run. A guest store can remap an address
-            // space, a store ends its block, and a chained successor would
-            // otherwise be served out of a cache lifted through the topology
-            // that store replaced — a window that did not exist while a run
-            // was one block long. The predecessor goes with it: a flush
-            // retires every id, so following a link from before one would
-            // reach whatever took the slot.
-            if self.cache.sync(front.epoch()) {
-                self.stats.resyncs += 1;
-                from = None;
-            }
-            // What this block owes before it exists as far as this loop is
-            // concerned: the entry translation, and whatever else the guest
-            // decides at a boundary. It is inside the loop rather than before
-            // it because a *chained* successor owes exactly the same thing,
-            // and a dispatcher that only charged the first block would make a
-            // chain cheaper than the blocks it replaced.
-            if front.enter(pc, host)? == Entry::Leave {
-                break Stop::Declined;
-            }
-
-            let key = front.key();
-            let (id, chained) = match from.and_then(|f| self.cache.follow(f, pc, key)) {
-                Some(id) => (id, true),
-                None => match self.cache.lookup(pc, key) {
-                    Some(id) => {
-                        self.stats.looked_up += 1;
-                        (id, false)
+            // The cache key for this boundary, and — when a chain resolved it
+            // already — the block it found.
+            let (key, mut ready) = match resumed.take() {
+                Some(r) => {
+                    pc = r.pc;
+                    from = r.from;
+                    (r.key, r.found)
+                }
+                None => {
+                    if blocks >= budget {
+                        break Stop::Budget;
                     }
-                    None => {
-                        let t = front.translate(pc)?;
-                        self.stats.translated += 1;
-                        if t.insns == 0 {
-                            break Stop::Untranslatable { pc };
+                    if self.exit.as_ref().is_some_and(ExitFlag::raised) {
+                        break Stop::Exit;
+                    }
+                    // The tick budget, at a block boundary. Skipped for the
+                    // first block of a run, and that is the same rule
+                    // [`Interp`](crate::ir::Interp) applies to the first
+                    // boundary of a block: a caller whose own interpreter
+                    // always retires one guest instruction per call must not
+                    // be handed a run that retired none, or the two stop
+                    // agreeing about how far a quantum got. So a run executes
+                    // at least one block, a block retires at least one
+                    // instruction, and after that the host decides.
+                    if blocks > 0 && host.spent() {
+                        break Stop::Spent;
+                    }
+                    // Per block, not per run. A guest store can remap an
+                    // address space, a store ends its block, and a chained
+                    // successor would otherwise be served out of a cache
+                    // lifted through the topology that store replaced — a
+                    // window that did not exist while a run was one block
+                    // long. The predecessor goes with it: a flush retires
+                    // every id, so following a link from before one would
+                    // reach whatever took the slot.
+                    if self.cache.sync(front.epoch()) {
+                        self.stats.resyncs += 1;
+                        from = None;
+                    }
+                    // What this block owes before it exists as far as this
+                    // loop is concerned: the entry translation, and whatever
+                    // else the guest decides at a boundary. It is inside the
+                    // loop rather than before it because a *chained* successor
+                    // owes exactly the same thing, and a dispatcher that only
+                    // charged the first block would make a chain cheaper than
+                    // the blocks it replaced.
+                    if front.enter(pc, host)? == Entry::Leave {
+                        break Stop::Declined;
+                    }
+                    (front.key(), None)
+                }
+            };
+            // A chain that already looked this up also already counted the hit
+            // and patched the predecessor, so neither happens twice.
+            let patched = ready.is_some();
+            let (id, chained) = match ready.take() {
+                Some(found) => found,
+                None => match from.and_then(|f| self.cache.follow(f, pc, key)) {
+                    Some(id) => (id, true),
+                    None => match self.cache.lookup(pc, key) {
+                        Some(id) => {
+                            self.stats.looked_up += 1;
+                            (id, false)
                         }
-                        (self.cache.insert(pc, key, t.page, t.insns, t.block), false)
-                    }
+                        None => {
+                            let t = front.translate(pc)?;
+                            self.stats.translated += 1;
+                            if t.insns == 0 {
+                                break Stop::Untranslatable { pc };
+                            }
+                            (self.cache.insert(pc, key, t.page, t.insns, t.block), false)
+                        }
+                    },
                 },
             };
-            if chained {
+            if patched {
+            } else if chained {
                 self.stats.chained += 1;
             } else if let Some(f) = from {
                 // The patch. Next time this predecessor exits to this PC it
@@ -577,53 +945,88 @@ impl Dispatcher {
             // whichever ran rather than off a fixed engine — a run that read
             // the wrong one would tell an oracle to step the wrong number of
             // times, which is the bug the retired count exists to avoid.
-            let (outcome, retired) = self.execute(id, host)?;
-            self.stats.blocks += 1;
-            blocks += 1;
-            // Every exit is preceded by one boundary that begins no guest
-            // instruction, and exactly one exit is reached, so this is what
-            // retired — at a fault too, where the faulting instruction opened
-            // its boundary and did not retire.
-            insns += retired;
+            //
+            // And it may be more than one block: a compiled block whose
+            // successor is compiled too jumps straight to it, and everything
+            // this loop does at a boundary is done by [`Chain::step`] instead.
+            let ran = self.execute(front, id, host, pc_slot, budget - blocks)?;
+            blocks += ran.blocks;
+            insns += ran.insns;
 
-            // Guest stores land before the next block is chosen, so a block
-            // invalidated by one is never served afterwards.
-            let cache = &mut self.cache;
-            let mut hit = 0usize;
-            host.drain_dirty(&mut |page| hit += cache.note_write(page, 1));
-            self.stats.smc += hit as u64;
-            let survived = self.cache.block(id).is_some();
+            if let Some(r) = ran.resumed {
+                resumed = Some(r);
+                continue;
+            }
+            if let Some((stop, at)) = ran.stopped {
+                pc = at;
+                break stop;
+            }
+            if !ran.closed {
+                self.stats.blocks += 1;
+                // Guest stores land before the next block is chosen, so a
+                // block invalidated by one is never served afterwards.
+                let cache = &mut self.cache;
+                let mut hit = 0usize;
+                host.drain_dirty(&mut |page| hit += cache.note_write(page, 1));
+                self.stats.smc += hit as u64;
+                let survived = self.cache.block(id).is_some();
+                match ran.outcome {
+                    Outcome::Exit => pc = host.read_slot(pc_slot) as u64,
+                    Outcome::Goto { pc: next } | Outcome::Lookup { pc: next } => pc = next,
+                    // The block left part-way through, at a guest instruction
+                    // boundary it published its state at. The chain ends here
+                    // whatever the block budget still allows: the ticks are
+                    // gone, and the next block would spend ticks the caller
+                    // does not have.
+                    //
+                    // **The one mutation survivor of this change**, and it is
+                    // stated rather than tested away. Deleting the `break`
+                    // leaves every test passing, because the loop then goes
+                    // round once, reads the epoch, and stops at the top with
+                    // the same `Stop::Spent` at the same PC —
+                    // `Frontend::enter` is never reached, so nothing is
+                    // charged and nothing is translated. The two are
+                    // equivalent *exactly while*
+                    // [`IrHost::spent`](crate::ir::IrHost::spent)'s
+                    // monotonicity holds, which is the contract that method
+                    // states and cannot check. This break is what makes the
+                    // equivalence not matter.
+                    Outcome::Spent { pc: at } => {
+                        pc = at;
+                        break Stop::Spent;
+                    }
+                    Outcome::Fault(f) => break Stop::Fault(f),
+                    Outcome::Unsupported { op, at } => break Stop::Unsupported { op, at },
+                }
+                // A block that wrote into its own page is gone, and the id
+                // that named it may already have been reused, so it cannot be
+                // the predecessor of the next link.
+                from = survived.then_some(id);
+                continue;
+            }
 
-            match outcome {
-                Outcome::Exit => pc = host.read_slot(pc_slot) as u64,
-                Outcome::Goto { pc: next } | Outcome::Lookup { pc: next } => pc = next,
-                // The block left part-way through, at a guest instruction
-                // boundary it published its state at. The chain ends here
-                // whatever the block budget still allows: the ticks are gone,
-                // and the next block would spend ticks the caller does not
-                // have.
-                //
-                // **The one mutation survivor of this change**, and it is
-                // stated rather than tested away. Deleting the `break` leaves
-                // every test passing, because the loop then goes round once,
-                // reads the epoch, and stops at the top with the same
-                // `Stop::Spent` at the same PC — `Frontend::enter` is never
-                // reached, so nothing is charged and nothing is translated.
-                // The two are equivalent *exactly while*
-                // [`IrHost::spent`](crate::ir::IrHost::spent)'s monotonicity
-                // holds, which is the contract that method states and cannot
-                // check. This break is what makes the equivalence not matter.
+            // A chain whose last block did not reach a terminator. Its own
+            // outcome is the answer, and the boundary work is already done.
+            match ran.outcome {
                 Outcome::Spent { pc: at } => {
                     pc = at;
                     break Stop::Spent;
                 }
                 Outcome::Fault(f) => break Stop::Fault(f),
                 Outcome::Unsupported { op, at } => break Stop::Unsupported { op, at },
+                // Unreachable: a chain that reached a terminator either
+                // followed it or recorded why it could not, both of which are
+                // handled above. Stopping is the conservative answer, and the
+                // guest is at a boundary either way.
+                Outcome::Exit => {
+                    pc = host.read_slot(pc_slot) as u64;
+                    break Stop::Budget;
+                }
+                Outcome::Goto { pc: next } | Outcome::Lookup { pc: next } => {
+                    pc = next;
+                    break Stop::Budget;
+                }
             }
-            // A block that wrote into its own page is gone, and the id that
-            // named it may already have been reused, so it cannot be the
-            // predecessor of the next link.
-            from = survived.then_some(id);
         };
 
         Ok(Run {
@@ -634,17 +1037,31 @@ impl Dispatcher {
         })
     }
 
-    /// Execute the block `id` names, and say what it did and how many guest
-    /// instructions it retired.
+    /// Execute the block `id` names — and everything a link takes it on to —
+    /// and say what happened.
     ///
     /// The one place that chooses an engine. A backend that takes the block
     /// runs it; anything else — no backend, a refusal, a code handle that a
     /// buffer reset invalidated — interprets, which is `ROADMAP.md` §9's
     /// *"degrades in speed rather than failing to run"* applied one level down,
     /// to a block rather than to a host.
-    fn execute<H>(&mut self, id: BlockId, host: &mut H) -> Result<(Outcome, usize)>
+    ///
+    /// A compiled block is entered through `Engine::run_chained`, so it may
+    /// jump straight on to a compiled successor without unwinding. What that
+    /// costs here is the [`Chain`] it has to build; what it costs the caller is
+    /// that the boundary after the last block may already have been dealt with
+    /// — see [`Ran::closed`].
+    fn execute<F, H>(
+        &mut self,
+        front: &mut F,
+        id: BlockId,
+        host: &mut H,
+        pc_slot: RegSlot,
+        remaining: usize,
+    ) -> Result<Ran>
     where
-        H: IrHost + FastMem,
+        F: Frontend<H> + ?Sized,
+        H: IrHost + StoreLog + FastMem,
     {
         #[cfg(any(
             all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
@@ -658,12 +1075,14 @@ impl Dispatcher {
                 cache,
                 backend,
                 stats,
+                exit,
                 ..
             } = self;
             if let Some(engine) = backend.as_mut() {
                 let block = cache
                     .block(id)
                     .expect("a block just found or just inserted is resident");
+                let temps = block.temp_count();
                 let code = match cache.code(id).filter(|c| engine.is_live(*c)) {
                     Some(code) => Some(code),
                     // A refusal is not an error and is not recorded against
@@ -674,23 +1093,76 @@ impl Dispatcher {
                 };
                 if let Some(code) = code {
                     cache.set_code(id, code);
-                    let block = cache
-                        .block(id)
-                        .expect("a block just found or just inserted is resident");
-                    if let Some(outcome) = engine.run(block, code, host) {
-                        stats.compiled += 1;
-                        let retired = engine.boundaries().saturating_sub(1) as usize;
-                        return Ok((outcome?, retired));
+                    // The temporary frame the whole chain shares, grown here
+                    // because this is the last point at which growing it is
+                    // safe: from a boundary inside generated code it would
+                    // move out from under the register holding its address.
+                    engine.reserve_temps(temps);
+                    let mut chain = Chain {
+                        link: engine.linkage(),
+                        cache,
+                        front,
+                        stats,
+                        exit: exit.as_ref(),
+                        pc_slot,
+                        remaining: remaining.max(1),
+                        id,
+                        from: None,
+                        blocks: 0,
+                        insns: 0,
+                        resumed: None,
+                        stopped: None,
+                        err: None,
+                        _host: PhantomData,
+                    };
+                    if let Some(outcome) = engine.run_chained(id, code, host, &mut chain) {
+                        // This block; `Chain::step` counts each one a link
+                        // took it on to.
+                        chain.stats.compiled += 1;
+                        let Chain {
+                            blocks,
+                            insns,
+                            resumed,
+                            stopped,
+                            err,
+                            ..
+                        } = chain;
+                        let outcome = outcome?;
+                        if let Some(e) = err {
+                            return Err(e);
+                        }
+                        return Ok(Ran {
+                            outcome,
+                            blocks,
+                            insns,
+                            closed: true,
+                            resumed,
+                            stopped,
+                        });
                     }
                 }
             }
         }
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
+        // No backend on this target, so nothing chains and nothing links:
+        // these three describe a chain and there is none to describe.
+        let _ = (&*front, pc_slot, remaining);
         let block = self
             .cache
             .block(id)
             .expect("a block just found or just inserted is resident");
         let outcome = self.interp.run(block, host)?;
-        Ok((outcome, self.interp.boundaries().saturating_sub(1) as usize))
+        Ok(Ran {
+            outcome,
+            blocks: 1,
+            insns: self.interp.boundaries().saturating_sub(1) as usize,
+            closed: false,
+            resumed: None,
+            stopped: None,
+        })
     }
 }
 
@@ -705,6 +1177,7 @@ mod tests {
     use super::*;
     use crate::core::error::BusError;
     use crate::core::space::MemResult;
+    use crate::core::value::Width;
     use crate::ir::{BlockBuilder, Const, InsnStart, MemOp, Type};
     use alloc::vec;
 
@@ -788,8 +1261,11 @@ mod tests {
         }
     }
 
-    /// A frontend over a fixed straight-line chain of blocks.
-    struct Chain {
+    /// A frontend over a fixed loop of blocks.
+    ///
+    /// Named for the loop rather than for the chaining, because [`Chain`] is
+    /// the thing that links them and two of those in one file is one too many.
+    struct Ring {
         /// `pc -> next pc`, for as many blocks as the test wants.
         step: u64,
         limit: u64,
@@ -798,7 +1274,7 @@ mod tests {
         translated: Vec<u64>,
     }
 
-    impl<H: ?Sized> Frontend<H> for Chain {
+    impl<H: ?Sized> Frontend<H> for Ring {
         fn epoch(&mut self) -> Epoch {
             self.epoch
         }
@@ -876,8 +1352,8 @@ mod tests {
     // take the call, which is the default and always correct.
     impl FastMem for Host {}
 
-    fn chain(step: u64, limit: u64) -> Chain {
-        Chain {
+    fn chain(step: u64, limit: u64) -> Ring {
+        Ring {
             step,
             limit,
             epoch: Epoch::default(),
@@ -1383,6 +1859,259 @@ mod tests {
         assert_eq!(run.blocks, 0, "no block starts once the flag is up");
     }
 
+    /// A block that stores `next` into memory at `store_at`, leaves `next` in
+    /// the PC slot, and exits.
+    ///
+    /// The store is what a self-modifying guest does: it goes through
+    /// [`IrHost::store`], the test host records the page, and the dispatcher
+    /// drains it at the boundary.
+    fn writer(pc: u64, next: u64, store_at: u64) -> Block {
+        let mut b = BlockBuilder::new(pc, 0);
+        b.insn_start(InsnStart {
+            pc,
+            next_pc: next,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(1);
+        let addr = b.imm(Type::I64, Const::Int(u128::from(store_at)));
+        let value = b.imm(Type::I64, Const::Int(0));
+        b.store(Type::I64, addr, value, MemOp::store(Width::U8));
+        let t = b.imm(Type::I64, Const::Int(u128::from(next)));
+        b.insn_start(InsnStart {
+            pc: next,
+            next_pc: next,
+            ticks: 1,
+            live: vec![(PC, t)],
+        });
+        b.exit_tb();
+        b.finish()
+    }
+
+    /// A two-block loop whose first block writes into the **second** block's
+    /// page every time it runs, and whose second block writes somewhere
+    /// nothing was ever lifted from.
+    ///
+    /// A self-modifying guest, in the shape that matters to a link: the
+    /// successor is invalidated by the predecessor, between the predecessor's
+    /// last instruction and the jump that would have entered it.
+    struct Writer {
+        translated: usize,
+    }
+
+    impl<H: ?Sized> Frontend<H> for Writer {
+        fn epoch(&mut self) -> Epoch {
+            Epoch::default()
+        }
+        fn key(&mut self) -> u64 {
+            0
+        }
+        fn pc_slot(&self) -> RegSlot {
+            PC
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            self.translated += 1;
+            let (next, at) = if pc == 0x1000 {
+                (0x2000, 0x2000)
+            } else {
+                (0x1000, 0x9000)
+            };
+            Ok(Translation {
+                block: writer(pc, next, at),
+                page: pc & !PAGE_MASK,
+                insns: 1,
+            })
+        }
+    }
+
+    /// The measurement this whole mechanism exists for, asserted rather than
+    /// assumed: a compiled chain is *entered by a jump*, and every block past
+    /// the first is reached without returning to this loop at all.
+    ///
+    /// [`DispatchStats::chained`] does not say this — it was above zero long
+    /// before a link reached generated code — which is exactly why
+    /// [`DispatchStats::linked`] is a separate counter.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_compiled_chain_past_its_first_block_never_returns_to_this_loop() {
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64))
+            .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
+        let mut f = chain(4, 0x1010);
+        let mut h = Host::default();
+        // Once round to lift and compile the four blocks.
+        d.run(&mut f, &mut h, 0x1000, 8).expect("runs");
+        let before = d.stats().linked;
+        let run = d.run(&mut f, &mut h, 0x1000, 64).expect("runs");
+        assert_eq!(run.blocks, 64);
+        assert_eq!(run.insns, 64);
+        assert_eq!(run.stop, Stop::Budget);
+        assert_eq!(
+            d.stats().linked - before,
+            63,
+            "every block but the first was entered by a jump"
+        );
+        assert_eq!(d.cache_stats().stale_links, 0);
+        d.cache().check().expect("consistent");
+    }
+
+    /// The safe point, inside a chain that never unwinds.
+    ///
+    /// A link is a jump from one block's code into another's, so the loop that
+    /// used to test the flag between them is not running. [`Chain::step`] tests
+    /// it instead, and this is what says so: the flag goes up while a chain is
+    /// mid-flight and the run stops at the very next boundary, with the guest
+    /// standing where the unlinked dispatcher would have left it.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_raised_exit_flag_stops_a_linked_chain_at_the_next_boundary() {
+        let flag = ExitFlag::default();
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64))
+            .with_exit_flag(flag.clone())
+            .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
+        let mut f = Gate {
+            chain: chain(4, 0x1010),
+            seen: Vec::new(),
+            limit: usize::MAX,
+        };
+        let mut h = Host::default();
+        d.run(&mut f, &mut h, 0x1000, 8).expect("runs");
+        assert!(d.stats().linked > 0, "nothing was linked");
+
+        // The flag goes up *during* the chain: `Gate::enter` is called from
+        // inside generated code at every boundary, so raising it at the third
+        // one is raising it with a compiled block in flight.
+        struct Raiser {
+            inner: Gate,
+            flag: ExitFlag,
+            at: usize,
+            seen: usize,
+        }
+        impl<H: ?Sized> Frontend<H> for Raiser {
+            fn epoch(&mut self) -> Epoch {
+                Frontend::<H>::epoch(&mut self.inner)
+            }
+            fn enter(&mut self, pc: u64, host: &mut H) -> Result<Entry> {
+                self.seen += 1;
+                if self.seen == self.at {
+                    self.flag.raise();
+                }
+                Frontend::<H>::enter(&mut self.inner, pc, host)
+            }
+            fn key(&mut self) -> u64 {
+                Frontend::<H>::key(&mut self.inner)
+            }
+            fn pc_slot(&self) -> RegSlot {
+                Frontend::<H>::pc_slot(&self.inner)
+            }
+            fn translate(&mut self, pc: u64) -> Result<Translation> {
+                Frontend::<H>::translate(&mut self.inner, pc)
+            }
+        }
+
+        let mut r = Raiser {
+            inner: f,
+            flag,
+            at: 3,
+            seen: 0,
+        };
+        let run = d.run(&mut r, &mut h, 0x1000, 64).expect("runs");
+        assert_eq!(run.stop, Stop::Exit);
+        // Three boundaries were entered, so three blocks ran and the fourth
+        // did not: the flag was honoured within one block of being raised.
+        assert_eq!(run.blocks, 3);
+        assert_eq!(run.insns, 3);
+        assert_eq!(run.pc, 0x100c);
+    }
+
+    /// Self-modifying code, one level down: a block that writes into its
+    /// successor's page must not be *jumped into* it either.
+    ///
+    /// The drain happens at the boundary inside generated code, before the
+    /// successor is chosen, which is the same order [`Dispatcher::run`] uses
+    /// and the reason a link cannot outrun an invalidation.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_block_that_writes_into_its_successors_page_is_not_linked_to_it() {
+        let mut interpreted = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut fi = Writer { translated: 0 };
+        let mut hi = Host::default();
+        let a = interpreted.run(&mut fi, &mut hi, 0x1000, 12).expect("runs");
+
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64))
+            .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
+        let mut f = Writer { translated: 0 };
+        let mut h = Host::default();
+        let b = d.run(&mut f, &mut h, 0x1000, 12).expect("runs");
+
+        assert_eq!(a, b, "a linked chain saw what the interpreter saw");
+        assert_eq!(hi.slots, h.slots);
+        // The predecessor never links to a successor its own store killed, so
+        // the successor is lifted afresh on every pass — six of them, plus the
+        // predecessor's one. Five invalidations rather than six: the first
+        // pass writes into a page nothing had been lifted from yet.
+        assert_eq!(d.stats().smc, 5, "the successor was invalidated each pass");
+        assert_eq!(d.stats().translated, fi.translated as u64);
+        assert_eq!(f.translated, 7);
+        // The other edge is linkable and was linked, so this is not a run in
+        // which linking simply never happened.
+        assert!(d.stats().linked > 0, "nothing was linked");
+        assert_eq!(d.cache_stats().stale_links, 0);
+        d.cache().check().expect("consistent");
+    }
+
+    /// A code buffer small enough to fill and be thrown away under a running
+    /// guest, which is the one thing a link may never follow into.
+    ///
+    /// A [`CodeRef`] from before a reset names whatever took its index, and a
+    /// link resolved from one would be a jump into another block's code — or
+    /// into the middle of an instruction. [`Chain`] refuses a reference whose
+    /// generation is not the one the engine is serving, and this is what says
+    /// so: the run still agrees with the interpreter, block for block and tick
+    /// for tick, with the buffer resetting throughout.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_code_buffer_reset_under_a_running_chain_is_never_jumped_into() {
+        // `Writer` invalidates its own successor on every pass, so the
+        // engine compiles for ever and a one-page buffer fills again and
+        // again — which is the churn this needs and a static loop cannot
+        // produce.
+        let mut interpreted = Dispatcher::with_cache(BlockCache::with_capacity(256));
+        let mut hi = Host::default();
+        let a = interpreted
+            .run(&mut Writer { translated: 0 }, &mut hi, 0x1000, 400)
+            .expect("runs");
+
+        let engine = crate::jit::host::Engine::with_capacity(4096).expect("a W^X code buffer");
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(256)).with_backend(engine);
+        let mut h = Host::default();
+        let b = d
+            .run(&mut Writer { translated: 0 }, &mut h, 0x1000, 400)
+            .expect("runs");
+
+        assert!(
+            d.backend().expect("a backend").stats().resets > 0,
+            "the buffer never filled, so this proves nothing"
+        );
+        assert!(d.stats().linked > 0, "nothing was linked");
+        assert_eq!(a, b, "a chain across a reset saw what the interpreter saw");
+        assert_eq!(hi.slots, h.slots);
+        assert_eq!(hi.ticks, h.ticks);
+        assert_eq!(d.cache_stats().stale_links, 0);
+        d.cache().check().expect("consistent");
+    }
+
     #[test]
     fn a_raised_exit_flag_stops_at_a_block_boundary() {
         let flag = ExitFlag::default();
@@ -1412,10 +2141,10 @@ mod tests {
         assert_eq!(d.stats().translated, 8, "every block was lifted again");
     }
 
-    /// A [`Chain`] that records every PC it was entered at and refuses to
+    /// A [`Ring`] that records every PC it was entered at and refuses to
     /// enter the `limit`th.
     struct Gate {
-        chain: Chain,
+        chain: Ring,
         seen: Vec<u64>,
         limit: usize,
     }
@@ -1467,7 +2196,7 @@ mod tests {
     /// A frontend that computes its key in `enter`, as the RISC-V engine does,
     /// and records what `key` was asked for and whether `enter` had run.
     struct Ordered {
-        chain: Chain,
+        chain: Ring,
         entered: Option<u64>,
         asked: Vec<(Option<u64>, u64)>,
     }
@@ -1534,9 +2263,9 @@ mod tests {
         assert_eq!(h.ticks, 3, "the declined block charged nothing");
     }
 
-    /// A [`Chain`] whose topology generation moves partway through a run.
+    /// A [`Ring`] whose topology generation moves partway through a run.
     struct Shifting {
-        chain: Chain,
+        chain: Ring,
         seen: usize,
         at: usize,
     }

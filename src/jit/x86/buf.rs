@@ -219,6 +219,21 @@ impl CodeBuf {
         })
     }
 
+    /// The address the mapping starts at.
+    ///
+    /// The one thing that turns a [`CodeRef`](crate::jit::CodeRef)'s chain
+    /// offset into an address a link can jump to. Exposed rather than kept
+    /// behind [`CodeBuf::entry`] because the resolver — `jit::dispatch`'s
+    /// chain thunk — runs while the engine that owns this buffer is executing
+    /// and may not borrow it; see
+    /// [`Linkage`](super::rt::Linkage), whose obligations this base is part
+    /// of.
+    #[inline]
+    #[must_use]
+    pub fn base(&self) -> u64 {
+        self.addr
+    }
+
     /// How many `mprotect` calls this buffer has made.
     ///
     /// A statistic rather than a knob, and it exists because the number used

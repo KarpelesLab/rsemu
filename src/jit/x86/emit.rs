@@ -639,6 +639,26 @@ impl Asm {
         self.modrm_mem(2, base, disp);
     }
 
+    /// `call r` — an indirect call through a register.
+    ///
+    /// What the direct-link pad uses: the address it calls is a plain field of
+    /// the context rather than a slot of the thunk table, because the thunk it
+    /// names is monomorphised over the *frontend* as well as the host and so
+    /// cannot live in a table built from the host alone.
+    pub fn call_r(&mut self, r: Reg) {
+        self.rex(false, 0, r.high());
+        self.byte(0xff);
+        self.modrm_rr(2, r.low());
+    }
+
+    /// `jmp r` — the direct link itself: on to the successor's chain entry,
+    /// with this block's frame left standing for it.
+    pub fn jmp_r(&mut self, r: Reg) {
+        self.rex(false, 0, r.high());
+        self.byte(0xff);
+        self.modrm_rr(4, r.low());
+    }
+
     /// Point a fixup at the current position.
     pub fn bind(&mut self, f: Fixup) {
         let here = self.here();

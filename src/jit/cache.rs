@@ -44,6 +44,16 @@
 //! the belt is the back edges, and the braces are there to prove the belt
 //! held.
 //!
+//! # What a link needs from a slot
+//!
+//! [`CodeRef`] carries three things this module never looks at: where the
+//! block's **chain entry** is, where its backend's event table is, and how
+//! long that table is. They are here because the one piece of code that
+//! resolves a link — `jit::dispatch`'s chain thunk — runs *while the engine is
+//! executing*, from inside generated code, and so may not borrow the engine to
+//! ask. [`CodeRef::generation`] is what makes all three safe to hold: a
+//! code-buffer reset bumps it and frees everything they name at once.
+//!
 //! # Self-modifying code
 //!
 //! Every block records the guest-**physical** page its bytes came from — a
@@ -99,6 +109,24 @@ pub struct CodeRef {
     pub index: u32,
     /// The code buffer generation it was emitted in.
     pub generation: u64,
+    /// The byte offset, in the code buffer, of this block's **chain entry**.
+    ///
+    /// Where a linked predecessor jumps to: past the prologue, which
+    /// establishes the host frame every block of a chain shares, and which a
+    /// block reached by a jump rather than by a call must therefore not run
+    /// again.
+    pub chain: u64,
+    /// Where the block's deferred bookkeeping lives, as a bare address.
+    ///
+    /// Opaque here — this module knows nothing about a backend's event tables
+    /// and does not dereference this — and carried for the same reason
+    /// [`CodeRef::chain`] is: what resolves a link is `jit::dispatch`'s chain
+    /// thunk, which runs *while the engine is executing* and so may not ask it
+    /// anything. A reference from an earlier [`CodeRef::generation`] names
+    /// freed memory, which is exactly what that field is checked for.
+    pub events: u64,
+    /// How many events that is.
+    pub event_count: u32,
 }
 
 /// How many successors one block may be chained to.
@@ -526,6 +554,15 @@ impl BlockCache {
     /// against every block in a chain. The key is checked anyway, because a
     /// world change between two blocks would otherwise be a way to execute a
     /// block from the previous world.
+    ///
+    /// `#[inline]` because this is now on the hot path *twice*: once in
+    /// [`Dispatcher::run`](crate::jit::Dispatcher::run)'s loop, where it was
+    /// always inlined into the caller, and once inside the chain thunk, which
+    /// generated code enters through a function pointer and which the inliner
+    /// therefore treats as cold. Measured at 42 host instructions per call as
+    /// an out-of-line call, and forcing it is worth 0.38% of a whole AArch64
+    /// Linux boot, which is why the hint is the strong one.
+    #[inline(always)]
     pub fn follow(&mut self, from: BlockId, pc: u64, key: u64) -> Option<BlockId> {
         let link = *self
             .slot(from)?
@@ -537,24 +574,31 @@ impl BlockCache {
             stamp: link.stamp,
         };
         let Some(live) = self.slot(id) else {
-            // The back edges should have cleared this. That they did not is a
-            // bug in this module rather than in the caller — so it is counted,
-            // and the caller falls back to a lookup instead of running a block
-            // that is not the one the link named.
-            if self
-                .slots
-                .get(link.target as usize)
-                .is_some_and(Option::is_some)
-            {
-                self.stats.stale_links += 1;
-            }
-            return None;
+            return self.dead_link(link.target);
         };
         if live.pc != pc || live.key != key {
             return None;
         }
         self.stats.chained += 1;
         Some(id)
+    }
+
+    /// A link whose target is gone: count it if the slot was reused, and say
+    /// *not here* either way.
+    ///
+    /// Outlined and `#[cold]` so that [`BlockCache::follow`] — which is now on
+    /// the hot path from inside generated code as well as from the dispatch
+    /// loop — is small enough for the inliner to take. The back edges should
+    /// have cleared this; that they did not is a bug in this module rather
+    /// than in the caller, so it is counted rather than executed, and the
+    /// caller falls back to a lookup instead of running a block that is not
+    /// the one the link named.
+    #[cold]
+    fn dead_link(&mut self, target: u32) -> Option<BlockId> {
+        if self.slots.get(target as usize).is_some_and(Option::is_some) {
+            self.stats.stale_links += 1;
+        }
+        None
     }
 
     /// Invalidate every block lifted from the page holding `phys`.
@@ -579,12 +623,29 @@ impl BlockCache {
     /// the common case — a store into a page nothing was ever lifted from — in
     /// one load and a test, which is what makes this affordable on every
     /// store.
+    #[inline]
     pub fn note_write(&mut self, phys: u64, len: u64) -> usize {
         if len == 0 {
             return 0;
         }
         let first = phys & !PAGE_MASK;
         let last = phys.saturating_add(len - 1) & !PAGE_MASK;
+        // The one-page case, inlined, because it is the only one a store
+        // drained page by page ever takes and because the filter test is the
+        // whole mechanism: one load, one test, and a counter. Everything else
+        // is a call.
+        if first == last {
+            if !self.filter_set(first) {
+                self.stats.filtered += 1;
+                return 0;
+            }
+            return self.hit_pages(first, last);
+        }
+        self.hit_pages(first, last)
+    }
+
+    /// [`BlockCache::note_write`]'s slow half: the pages the filter admitted.
+    fn hit_pages(&mut self, first: u64, last: u64) -> usize {
         let mut hit = 0;
         let mut page = first;
         loop {
