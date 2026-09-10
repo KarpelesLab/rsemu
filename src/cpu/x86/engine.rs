@@ -374,6 +374,30 @@ const FLAGS: Flags = Flags::Eager;
 /// thirty-two — see the module docs.
 const MAX_INSNS: usize = 32;
 
+/// What a store does to the block it is in.
+///
+/// **[`Smc::HostGuard`], in both worlds**, and it replaced a split: paging on
+/// meant [`Smc::EndBlock`] — a store was the last guest instruction in its
+/// block — and paging off meant [`Smc::Guard`], the three-instruction linear
+/// comparison [`lift`] emits after each store. The split existed because the
+/// in-block guard can only see the address the guest computed, and under
+/// paging two linear pages may alias one physical page, so it is refused
+/// there.
+///
+/// [`Host::note_writes`] makes the same comparison one step earlier and on the
+/// **physical** page at both ends: `Exec::wrote` records the address a bus
+/// write reached and [`Admitted::frame`] is what the entry translation
+/// resolved to. That has no aliasing hole, it emits no IR, and it is the same
+/// code for a compiled store and an interpreted one. `cpu::arm::a64::lift`
+/// took this route first and `cpu::x86::lift`'s module docs recorded that it
+/// would work here and that nobody had done it; this is that, done.
+///
+/// What it replaced is the expensive one: `admit` picked [`Smc::EndBlock`]
+/// whenever the guest paged, which is every guest worth measuring, so a store
+/// cost a whole block dispatch. `docs/platforms/pc64.md` has the boot it was
+/// measured on.
+const SMC: Smc = Smc::HostGuard;
+
 /// How many blocks one [`advance`] may chain before it hands control back.
 ///
 /// Sixteen, as on the other core, and for the same reason: what chaining buys
@@ -704,11 +728,6 @@ fn narrow_state_is_clean(state: &State) -> bool {
 struct Admitted {
     world: World,
     key: u64,
-    /// What a store does to the block it is in. Decided here rather than at
-    /// each of the two places that need it -- the cache key and the lift --
-    /// because a key that says one policy over a block lifted under the other
-    /// is a cache that cannot be wrong twice in the same direction.
-    smc: Smc,
     /// The linear page the block is bounded by, and the physical frame the
     /// entry translation resolved it to. Equal with `CR0.PG` clear.
     linear_page: u64,
@@ -880,8 +899,7 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
         linear & !PAGE_MASK
     };
 
-    let smc = if paged { Smc::EndBlock } else { Smc::Guard };
-    let key = lift::key(&world, SHAPE, smc, FLAGS);
+    let key = lift::key(&world, SHAPE, SMC, FLAGS);
     // Known unliftable: the interpreter takes this instruction, and reaching
     // it without a dispatcher round trip and a lift that fails at its first
     // instruction is the whole point of remembering it.
@@ -892,7 +910,6 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
     Admit::Ready(Box::new(Admitted {
         world,
         key,
-        smc,
         linear_page: linear & !PAGE_MASK,
         frame,
         leave,
@@ -1222,6 +1239,7 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
                 // frame of whichever block retired it.
                 host.frame = self.at.frame;
                 host.world = self.at.world;
+                host.topology = host.exec.mem.generation();
                 Ok(Entry::Ready)
             }
             Admit::Interpret => Ok(Entry::Leave),
@@ -1259,15 +1277,7 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
             };
             space.read(at, Width::U8, attrs).ok().map(|v| v as u8)
         };
-        let lifted = lift::lift(
-            &self.at.world,
-            pc,
-            &mut src,
-            MAX_INSNS,
-            SHAPE,
-            self.at.smc,
-            FLAGS,
-        )?;
+        let lifted = lift::lift(&self.at.world, pc, &mut src, MAX_INSNS, SHAPE, SMC, FLAGS)?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
         {
@@ -1308,10 +1318,20 @@ struct Host<'a, 'e> {
     /// through everything else.
     fault: Option<Fault>,
     dirty: DirtyPages,
-    /// The world and the physical frame of the block currently running, so
-    /// [`close_bus`] can read the last instruction's last byte back.
+    /// The world and the physical frame of the block currently running.
+    ///
+    /// [`close_bus`] reads the last instruction's last byte back through the
+    /// frame, and [`Smc::HostGuard`] compares every store's physical page
+    /// against it. Both follow the block across a page: [`Lifter::enter`]
+    /// replaces the pair at every chained boundary.
     world: World,
     frame: u64,
+    /// The address space's topology generation as of this block's entry.
+    ///
+    /// The second of the two things "a store ends the block" used to answer
+    /// for free, and the one that is easy to miss now that it does not. See
+    /// [`IrHost::store`].
+    topology: u64,
     /// The last byte of the instruction whose boundary is open, and whether it
     /// has made a data access. See [`close_bus`].
     cur_end: Option<u64>,
@@ -1336,6 +1356,7 @@ impl<'a, 'e> Host<'a, 'e> {
             slots[FLAG_SLOTS[i].0 as usize] = u64::from(eflags & bit != 0);
         }
         slots[EFLAGS_REST.0 as usize] = u64::from(eflags & !ARITH_MASK);
+        let topology = exec.mem.generation();
         Host {
             exec,
             allowance,
@@ -1344,6 +1365,7 @@ impl<'a, 'e> Host<'a, 'e> {
             dirty: DirtyPages::new(),
             world: at.world,
             frame: at.frame,
+            topology,
             cur_end: None,
             cur_access: false,
             end: None,
@@ -1415,17 +1437,51 @@ impl<'a, 'e> Host<'a, 'e> {
         BusError::Protected
     }
 
-    /// Move whatever this core has written into the dirty log.
+    /// Move whatever this core has written into the dirty log, and leave the
+    /// block if any of it landed in the block's own code.
     ///
     /// Whatever landed, landed: a store that crossed a page boundary and
     /// faulted on the second page still wrote the first, and a translation of
     /// those bytes is stale either way.
+    ///
+    /// **The one place [`Smc::HostGuard`] is implemented**, and it is one
+    /// place because x86 publishes no inlined store path (see [`FastMem`]):
+    /// every store a block makes arrives through [`IrHost::store`], so there
+    /// is nothing for a code generator to emit and nothing for the two paths
+    /// to disagree about.
     fn note_writes(&mut self) {
         for i in 0..self.exec.wrote_n as usize {
-            self.dirty.note(self.exec.wrote[i], 1);
+            // A page, not an address: `Exec::note_write` masks before it
+            // records, which is what makes the comparison below one `==`.
+            let page = self.exec.wrote[i];
+            self.dirty.note(page, 1);
+            // [`Smc::HostGuard`], and the whole of it. A store into the page
+            // this block's own instructions came from means every instruction
+            // after it is a translation of bytes that no longer exist, so the
+            // block leaves at its next guest instruction boundary -- which for
+            // a store is the one its own instruction ends at, and which is
+            // where `Dispatcher::run` drains the log above into the block
+            // cache so the next pass lifts the bytes the store left.
+            //
+            // Physical at both ends: `Exec::wrote` records the address the bus
+            // transaction reached, post-A20, and [`Admitted::frame`] is what
+            // the entry translation resolved to. That is the aliasing hole
+            // `lift`'s in-block guard has and cannot close, and closing it is
+            // what lets this core keep one policy in both worlds instead of
+            // falling back to [`Smc::EndBlock`] whenever the guest pages.
+            if page == self.frame {
+                self.hand_back();
+            }
         }
         self.exec.wrote_n = 0;
-        self.overflowed |= core::mem::take(&mut self.exec.wrote_over);
+        // The list stopped being the whole truth, so nothing can be ruled out
+        // -- including this block's own page. [`advance`] throws every
+        // translation away when it sees this; leaving the block is what keeps
+        // the *running* one from executing past a store it cannot account for.
+        if core::mem::take(&mut self.exec.wrote_over) {
+            self.overflowed = true;
+            self.hand_back();
+        }
     }
 }
 
@@ -1489,13 +1545,26 @@ impl IrHost for Host<'_, '_> {
         let done = self.exec.write_mem(sr, addr, mem.size.bytes() as u8, value);
         self.spent_a_cycle(before);
         self.note_writes();
-        // The other one, and unlike the RISC-V engine this core cannot lean on
-        // "a store ends the block": that is true under [`Smc::EndBlock`], which
-        // `admit` picks only when paging is on. With paging off the policy is
-        // [`Smc::Guard`], a store is an ordinary instruction, and a store into
-        // an interrupt controller — an APIC `ICR` write, an 8259A command — is
-        // then exactly as mid-block as the load above.
-        if self.pins() {
+        // The other two, and unlike the RISC-V engine this core cannot lean on
+        // "a store ends the block": under [`Smc::HostGuard`] a store is an
+        // ordinary instruction in every world, so both of these are as
+        // mid-block as the load above and neither has a boundary to be noticed
+        // at any more.
+        //
+        // * **An interrupt this store raised.** A write into an interrupt
+        //   controller — an APIC `ICR` write, an 8259A command — or into any
+        //   device that answers by pulling a wire, brings a line up between
+        //   two instructions of a lifted block, where `Exec::step` would have
+        //   taken it at the next one.
+        // * **A store that remapped the address space.** `Frontend::epoch`
+        //   reads the topology generation at every *block* boundary, which was
+        //   enough while a store was the last instruction in its block and is
+        //   not now: the rest of this block would otherwise run against a
+        //   topology the store replaced. It costs one relaxed atomic load per
+        //   store; `cpu::arm::a64::engine` pays the same one for the same
+        //   reason, plus the shadow-TLB pointers this core does not take out
+        //   because it publishes no [`FastMem`] plan.
+        if self.pins() || self.exec.mem.generation() != self.topology {
             self.hand_back();
         }
         match done {
@@ -2562,14 +2631,60 @@ mod tests {
 
     #[test]
     fn a_store_into_the_running_page_is_honoured_by_the_next_block() {
-        // Both policies, because they are different mechanisms: with paging
-        // off the block carries an in-block guard on the store's linear page,
-        // and under paging the store is the last instruction in its block and
-        // the dispatcher's page drain is what catches it. Both ends of the
-        // second are physical, which is the part a linear guard could not be.
+        // All three worlds, because [`SMC`] is now one mechanism in all of
+        // them: [`Host::note_writes`] compares the guest-physical page a store
+        // reached against the physical page the block's own bytes came from,
+        // retires the run's allowance, and the dispatcher's page drain at the
+        // next boundary is what throws the translation away. Physical at both
+        // ends, which is the part a linear guard could not be — and the reason
+        // the paged and long rows are the same mechanism as the flat one
+        // rather than [`Smc::EndBlock`] standing in for it.
         agree(&Case::new(SELF_MODIFYING.to_vec()), 8_000, 12);
         agree(&Case::new(SELF_MODIFYING.to_vec()).paged(), 8_000, 12);
         agree(&Case::new(SELF_MODIFYING.to_vec()).long(), 8_000, 12);
+    }
+
+    /// A store that misses the code page costs no block boundary — with paging
+    /// **on**, where it used to cost one every time.
+    ///
+    /// The `agree` fixtures above prove the two engines match; nothing in them
+    /// would notice [`SMC`] quietly reverting to [`Smc::EndBlock`], because
+    /// ending a block more often is *correct* and only slower. This is the
+    /// number that would move, on the engine rather than in the harness: the
+    /// loop below stores to a fixed address on another page once per pass, and
+    /// under [`Smc::EndBlock`] each of those was a block of its own.
+    #[test]
+    fn a_paged_store_that_misses_the_code_page_costs_no_boundary() {
+        // ```text
+        //   83 c0 01            add eax, 1
+        //   a3 00 11 00 00      mov [0x1100], eax   ; another page entirely
+        //   83 c3 01            add ebx, 1
+        //   eb f5               jmp back to the top
+        // ```
+        const LOOP: [u8; 13] = [
+            0x83, 0xc0, 0x01, // add eax, 1
+            0xa3, 0x00, 0x11, 0x00, 0x00, // mov [0x1100], eax
+            0x83, 0xc3, 0x01, // add ebx, 1
+            0xeb, 0xf3, // jmp back
+        ];
+        let case = Case::new(LOOP.to_vec()).paged();
+        let (space, _ram) = differential::machine(&case);
+        let cpu = core(&case, space, Engine::JitHost);
+        cpu.run_budget(20_000);
+        let stats = cpu
+            .jit_stats()
+            .expect("a translated engine keeps statistics");
+        assert!(stats.blocks > 0, "no block ran, so nothing was measured");
+        // Three guest instructions and a taken branch per pass, all in the
+        // entry page, so a trace covers whole passes. Under `Smc::EndBlock`
+        // the store ended one block per pass and the ratio could not exceed
+        // two; the assertion is deliberately well under what was measured
+        // (about ten) so it is a policy check rather than a tuning check.
+        let per_block = stats.retired as f64 / stats.blocks as f64;
+        assert!(
+            per_block > 4.0,
+            "{per_block:.2} guest instructions per block: a store is ending the block again              ({stats:?})"
+        );
     }
 
     #[test]

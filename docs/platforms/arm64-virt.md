@@ -619,6 +619,12 @@ worth measuring — x86 still ends a block at every store. The mechanism propose
 for adoption here is one its author cannot use on the workload that motivated
 it, and copying it would have bought this board nothing at all.
 
+(Written in the present tense at the time and now the past: `cpu::x86::engine`
+has since taken `Smc::HostGuard` itself, in both worlds, on the recommendation
+this section made. `docs/platforms/pc64.md` has that boot — 5.21 guest
+instructions per block to 12.17, which is a bigger ratio than the one below for
+exactly the reason argued here.)
+
 What transfers is the *argument*: the check wants to be a comparison against
 the physical page the block's bytes came from. And on this core there is
 somewhere better than the IR to make it. `engine::Host` sees the

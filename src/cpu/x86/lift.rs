@@ -53,7 +53,7 @@
 //! | real mode and virtual-8086 | `segment << 4 + offset` with a *16-bit offset wrap* is a different address path in `exec`, checked against three million hardware vectors, and generalising it is how that accuracy gets lost |
 //! | compatibility mode's 16-bit code segments, and a `67` address-size prefix in either world | 16-bit addressing inside a 32-bit segment, and 32-bit addressing inside a 64-bit one, are each a second effective-address form for no guest that matters |
 //! | a unified translation buffer | paging itself is **in** the subset now ([`Origin::Paged`]); what is out is paging on a part whose instruction and data translations share one array, where a data operand evicts the code page and the *next fetch* pays for a walk no static analysis can place — see "Paging" |
-//! | [`Smc::Guard`] under paging | the in-block guard compares **linear** pages and two of them may alias one physical page. [`Smc::EndBlock`] is the answer, and [`lift`] refuses the other combination rather than emitting a check that can miss |
+//! | [`Smc::Guard`] under paging | the in-block guard compares **linear** pages and two of them may alias one physical page. [`Smc::HostGuard`] is the answer -- the same comparison, made by the host on the *physical* page -- and [`lift`] refuses this combination rather than emitting a check that can miss |
 //! | `DIV`, `IDIV` | `#DE` is an exception the block cannot deliver, and the undefined flags come out of `exec::cord`'s trial-subtraction **loop**, which a block with only forward branches cannot express |
 //! | the string primitives, and a repeat prefix in front of anything but a no-operation | a loop inside a block; the IR's verifier rejects a backward [`Opcode::BRCOND`] because `ir::pass`'s liveness is a single backward walk. `PAUSE` and `ENDBR64` carry the prefix and are not loops, so they are in — see `classify` |
 //! | `LOCK`, `XCHG` with memory | the IR's atomics carry no [`MemOp`], so a byte- or word-wide atomic has no type to name (`ir`'s "Known gaps") |
@@ -249,12 +249,15 @@
 //! the other mapping would miss a guard that can only see linear addresses,
 //! and one linear page names a different physical page after a `CR3` reload.
 //! A guard that can miss is worse than no guard, so under [`Origin::Paged`]
-//! [`lift`] **refuses** [`Smc::Guard`] and [`Smc::EndBlock`] is the policy: a
-//! store is the last guest instruction in its block, the dispatcher's
-//! page-drain at the next boundary is reached before anything the store
-//! changed can execute, and the drain is by physical page at both ends —
-//! [`Lifted::page`] is the physical page the entry resolved to, and a host
-//! notes the physical address its store reached.
+//! [`lift`] **refuses** [`Smc::Guard`].
+//!
+//! What replaced it is [`Smc::HostGuard`] rather than [`Smc::EndBlock`], and
+//! the difference is where the comparison is made rather than what it
+//! compares: the host sees the guest-**physical** page of every store, so it
+//! makes the same test with no aliasing hole and no IR at all, and a store
+//! stays an ordinary instruction. [`Smc::EndBlock`] was the answer for four
+//! rounds and its cost is the second-largest number in
+//! `docs/platforms/pc64.md`'s profile of a real boot.
 //!
 //! **4. The key has to name the mapping, and a `CR3` generation is the wrong
 //! thing to name it with.** [`World::generation`] covers the segment bases;
@@ -284,11 +287,13 @@
 //! different distance to the end of the page — under one key.
 //!
 //! It also subsumes `CS.base`, which is why [`World::generation`] is left out
-//! of a paged key rather than added to it: under [`Smc::EndBlock`] no segment
-//! base appears as a constant in the emitted IR at all — [`MemOp::seg`]
-//! carries the register and the host folds the base — so the only thing
-//! `CS.base` decides is *which bytes* the entry names, and the physical page
-//! it resolved to decides that exactly.
+//! of a paged key rather than added to it: under either policy a paged block
+//! may be lifted under — [`Smc::EndBlock`] and [`Smc::HostGuard`] — no
+//! segment base appears as a constant in the emitted IR at all
+//! ([`MemOp::seg`] carries the register and the host folds the base), so the
+//! only thing `CS.base` decides is *which bytes* the entry names, and the
+//! physical page it resolved to decides that exactly. [`Smc::Guard`] is the
+//! one that does fold a base into a constant, and it is the one refused here.
 //!
 //! ## The contract a caller owes, which is the one that looks like a working JIT
 //!
@@ -423,11 +428,11 @@
 //!
 //! # Self-modifying code, which x86 makes architectural
 //!
-//! `ROADMAP.md` §9.1's third mechanism, and `jit::dispatch` already records
-//! that *"an x86 frontend needs the check **within** a block — x86 makes
-//! coherent instruction caches architectural — and will need a finer hook than
-//! this one"*. That note is acted on here rather than deferred, and the hook
-//! turned out not to be needed: the check is expressible in the IR.
+//! `ROADMAP.md` §9.1's third mechanism, and `jit::dispatch` still records that
+//! *"an x86 frontend needs the check **within** a block — x86 makes coherent
+//! instruction caches architectural — and will need a finer hook than this
+//! one"*. Both halves of that note turned out to be answerable without a new
+//! hook, and in two different ways, which is why there are three policies.
 //!
 //! * [`Smc::EndBlock`] is RISC-V's answer — a store is the last guest
 //!   instruction in its block, so the dispatcher's page-drain at the next
@@ -435,11 +440,14 @@
 //!   correct and it costs a block per store, which on x86 is expensive: a
 //!   store is not a rare instruction there the way it is in a register-rich
 //!   RISC.
-//! * [`Smc::Guard`] is the default **with paging off**. Under
-//!   [`Origin::Paged`] it is refused rather than emitted: the comparison below
-//!   is in linear space, two linear pages may alias one physical page, and a
-//!   guard that can be walked past is worse than no guard. A store is an
-//!   ordinary instruction, and
+//! * [`Smc::HostGuard`] is **the default, and the policy `cpu::x86::engine`
+//!   uses in every world**. It emits nothing at all; the comparison is made by
+//!   the host, on the guest-**physical** page, and it is the subject of the
+//!   section after next.
+//! * [`Smc::Guard`] is the in-block guard, and under [`Origin::Paged`] it is
+//!   refused rather than emitted: the comparison below is in linear space, two
+//!   linear pages may alias one physical page, and a guard that can be walked
+//!   past is worse than no guard. A store is an ordinary instruction, and
 //!   after it the block tests the store's **linear** page against its own:
 //!
 //!   ```text
@@ -476,35 +484,79 @@
 //! the physical address there, so two different linear pages alias one physical
 //! page and a linear comparison would miss one of them.
 //!
-//! ## A64 found somewhere better to make the comparison
+//! ## Somewhere better to make the comparison, which is [`Smc::HostGuard`]
 //!
 //! Everything above is about a guard **in the IR**, and the IR only has the
-//! address the guest computed, which is why the guard is linear and why it is
-//! therefore refused under paging — leaving [`Smc::EndBlock`] as the policy
-//! for every guest that pages, which is every guest worth measuring.
+//! address the guest computed. That is why the guard is linear, why it is
+//! refused under paging, and why [`Smc::EndBlock`] was the policy for every
+//! guest that pages — which is every guest worth measuring.
 //!
-//! `cpu::arm::a64::lift::Smc` makes the same check somewhere else:
-//! `cpu::arm::a64::engine`'s host already sees the guest-**physical** page of
-//! every store, because that is what feeds `jit::DirtyPages` and invalidates a
-//! *cached* translation, and comparing it against the physical page the
-//! running block's own bytes came from is one compare on a path that has just
-//! done a bus access. It emits no IR at all, it has no aliasing hole, and it
-//! leaves the block through [`IrHost::spent`](crate::ir::IrHost::spent), which
-//! already exists for the quantum. Measured on an arm64 Linux boot that took a
-//! block from 6.44 guest instructions to 10.80 and 14.6% off the host
-//! instruction count.
+//! `cpu::arm::a64::lift::Smc` made the same check somewhere else first, and
+//! this file recorded for a round that the same move would work here and that
+//! nobody had taken it. This is it taken. `cpu::x86::engine`'s `Host` already
+//! sees the guest-**physical** page of every store, because that is what feeds
+//! `jit::DirtyPages` and invalidates a *cached* translation, and
+//! `Admitted::frame` is already the physical page the entry translation
+//! resolved to. Comparing the two is one `==` on a path that has just done a
+//! translation and a bus access; a match calls `Host::hand_back`, which
+//! retires the run's tick allowance so the block leaves at its next guest
+//! instruction boundary — the boundary the store's own instruction ends at.
 //!
-//! **It would work here, and nobody has done it.** `engine`'s `Host` has the
-//! same `note_writes` over the same `DirtyPages`, `Lifted::page` is already
-//! the physical page a store is matched against, and `Host::pins` already
-//! shows the shape of an answer given at the store rather than at a boundary.
-//! What it would replace is not [`Smc::Guard`] — that is the *unpaged*
-//! policy, and it is already cheaper than a block — but `admit`'s fallback to
-//! [`Smc::EndBlock`] under paging, which is where a real x86 guest spends all
-//! of its time and where a store is still a whole block. It is a measurement
-//! nobody has taken; it is recorded here so that the next person does not
-//! start from "x86 will need a finer hook than this one", which is what
-//! `jit::dispatch` still says and which A64 has since shown to be false.
+//! It is strictly stronger than the in-block guard rather than a cheaper
+//! approximation of it:
+//!
+//! * **It has no aliasing hole.** The comparison is physical at both ends, so
+//!   a store through a second mapping of the code page is caught. That is the
+//!   case that forced [`Smc::EndBlock`] under paging, and on x86 it is not
+//!   hypothetical: patching kernel text through a writable alias while it is
+//!   mapped executable elsewhere is how Linux does `alternatives`, `ftrace`
+//!   and jump labels.
+//! * **It costs no IR at all**, against the guard's three instructions per
+//!   store and [`Smc::EndBlock`]'s whole block dispatch.
+//! * **There is one implementation.** x86 publishes no inlined store path
+//!   (`cpu::x86::engine`'s `FastMem`), so every store a block makes goes
+//!   through `IrHost::store` and there is nothing for a code generator to
+//!   emit and nothing for two paths to disagree about.
+//!
+//! What it gives up is precision: the exit is per **page**, so a store to a
+//! datum that merely shares a page with the code leaves the block too. That is
+//! the granularity the block cache's own invalidation has always had, and
+//! `benches/x86_linux_boot` measures what it costs on a real boot — 28 074
+//! translations killed by a block's store in nine hundred guest seconds,
+//! against 1 522 455 090 guest instructions retired. It is not a rate.
+//!
+//! Measured on that boot, with nothing changed but the policy: **5.21 guest
+//! instructions per block to 12.17**, and 292 140 467 block executions to
+//! 125 118 623. `docs/platforms/pc64.md` has the host-instruction attribution
+//! either side of it, and the identical `Machine::state_hash` that says the
+//! two columns are the same guest work.
+//!
+//! ### What else a store used to be the boundary for
+//!
+//! "A store ends the block" was load-bearing for three things and not one, and
+//! the other two are `cpu::x86::engine`'s to pay in `IrHost::store`:
+//!
+//! * an interrupt a store *raises* — an APIC `ICR` write, an 8259A command, a
+//!   device that answers by pulling a wire — which `admit` would have seen at
+//!   the block boundary that no longer exists. This core already paid it,
+//!   because [`Smc::Guard`] had already made a store an ordinary instruction
+//!   with paging off;
+//! * a store that **remaps the address space**, which `Frontend::epoch`
+//!   noticed at the next block boundary while a store was the last instruction
+//!   in its block. One relaxed atomic load per store now says so at the store.
+//!   There are no shadow-TLB host pointers to retire with it, which is the one
+//!   part of A64's answer this core does not need: it publishes no `FastMem`
+//!   plan.
+//!
+//! ### And one thing it makes unsound, which is flag elision at that boundary
+//!
+//! [`Flags::Elide`] is a claim about what nothing can observe *between* two
+//! boundaries, and a boundary the block may leave at is one the guest can
+//! stand on with an interrupt able to push a stale `EFLAGS`. [`Smc::Guard`]
+//! leaves through an exit sequence whose live map names every flag;
+//! [`Smc::HostGuard`] leaves at an ordinary boundary — the one opened for the
+//! store's successor — so that boundary elides nothing. One boundary per
+//! store, and only under this policy: see `Lifter::after_store`.
 //!
 //! # Precise state at a fault
 //!
@@ -844,21 +896,21 @@ impl Origin {
 
     /// The bits this origin contributes to [`key`], above the policies.
     ///
-    /// Bit 8 separates the two worlds, so a flat lift and a paged lift of the
-    /// same address never collide; above bit 9 sits the physical address or
+    /// Bit 9 separates the two worlds, so a flat lift and a paged lift of the
+    /// same address never collide; above bit 10 sits the physical address or
     /// the world generation.
     ///
-    /// Exact until either passes 2^55 — the bound
-    /// `cpu::riscv::lift::Origin::key_bits` states for the same encoding, one
-    /// bit lower here because [`key`] spends bit 7 on the code segment's
-    /// width. For the physical address that bound is unreachable rather than
-    /// merely distant: a page-table entry carries a 52-bit frame
-    /// ([`pte::FRAME64`](super::paging::pte)), so no address this core can
-    /// produce reaches it.
+    /// Exact until either passes 2^54 — the bound
+    /// `cpu::riscv::lift::Origin::key_bits` states for the same encoding, two
+    /// bits lower here because [`key`] spends one on the code segment's width
+    /// and one on [`Smc`]'s third policy. For the physical address that bound
+    /// is unreachable rather than merely distant: a page-table entry carries a
+    /// 52-bit frame ([`pte::FRAME64`](super::paging::pte)), so no address this
+    /// core can produce reaches it.
     const fn key_bits(self, generation: u64) -> u64 {
         match self {
-            Origin::Flat => generation.wrapping_shl(9),
-            Origin::Paged { phys } => (1 << 8) | phys.wrapping_shl(9),
+            Origin::Flat => generation.wrapping_shl(10),
+            Origin::Paged { phys } => (1 << 9) | phys.wrapping_shl(10),
         }
     }
 }
@@ -1132,29 +1184,54 @@ impl Shape {
 ///
 /// x86 makes coherent instruction caches architectural, so a store into the
 /// page a running block was lifted from must be honoured before the next
-/// instruction executes. See the module docs for the two answers and why
-/// [`Smc::Guard`] is the default.
+/// instruction executes. See the module docs for the three answers and why
+/// [`Smc::HostGuard`] is the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Smc {
     /// A store is the last guest instruction in its block.
     ///
-    /// The only policy under [`Origin::Paged`], because the alternative
-    /// compares linear pages and two of them may alias one physical page.
+    /// Correct everywhere and expensive everywhere: it costs a whole block
+    /// dispatch per store, and on this architecture a store is not rare. It
+    /// was the only policy under [`Origin::Paged`] until [`Smc::HostGuard`],
+    /// and it is kept as the control that policy is measured against.
     EndBlock,
     /// A store is an ordinary instruction, followed by a run-time test of its
-    /// linear page against the block's own.
+    /// **linear** page against the block's own, emitted into the block.
     ///
-    /// The default, and refused by [`lift`] under [`Origin::Paged`].
-    #[default]
+    /// Refused by [`lift`] under [`Origin::Paged`]: two linear pages may alias
+    /// one physical page, and a guard that can be walked past is worse than no
+    /// guard. Kept because `benches/x86_dispatch` measures it -- three IR
+    /// instructions per store against a whole block -- and because it is the
+    /// only one of the three that is expressed in the IR at all.
     Guard,
+    /// A store is an ordinary instruction and **the host** compares the
+    /// guest-physical page it reached against the physical page the block's
+    /// own bytes came from.
+    ///
+    /// The default, and the only policy that is both cheap and sound under
+    /// paging. It emits nothing: what it asks is that the caller's
+    /// [`IrHost`](crate::ir::IrHost) answer
+    /// [`spent`](crate::ir::IrHost::spent) `true` at the first guest
+    /// instruction boundary after such a store. See the module docs.
+    #[default]
+    HostGuard,
 }
 
 impl Smc {
+    /// Two bits, because there are three policies. See [`key`] for what that
+    /// pushed up by one.
     const fn key_bits(self) -> u64 {
         match self {
             Smc::EndBlock => 0,
             Smc::Guard => 1 << 2,
+            Smc::HostGuard => 2 << 2,
         }
+    }
+
+    /// Whether a store is the last guest instruction in its block.
+    #[inline]
+    const fn ends_block(self) -> bool {
+        matches!(self, Smc::EndBlock)
     }
 }
 
@@ -1177,7 +1254,7 @@ impl Flags {
     const fn key_bits(self) -> u64 {
         match self {
             Flags::Eager => 0,
-            Flags::Elide => 1 << 3,
+            Flags::Elide => 1 << 4,
         }
     }
 }
@@ -1210,16 +1287,18 @@ pub fn key(world: &World, shape: Shape, smc: Smc, flags: Flags) -> u64 {
         _ => 0u64,
     };
     shape.key_bits()
+        // Bits 2-3. Two bits since [`Smc::HostGuard`] made three policies, and
+        // everything above here moved up by one when it did.
         | smc.key_bits()
         | flags.key_bits()
-        | (u64::from(world.cmov) << 4)
-        | (variant << 5)
-        // Bit 7: the code segment's width. One part runs both worlds — an
+        | (u64::from(world.cmov) << 5)
+        | (variant << 6)
+        // Bit 8: the code segment's width. One part runs both worlds — an
         // x86-64 in 32-bit protected mode and the same part in long mode are
         // the same `Variant` — and the same bytes at the same address decode
         // to different instructions in each, so the number that names the part
         // cannot name the world.
-        | (u64::from(world.long()) << 7)
+        | (u64::from(world.long()) << 8)
         | world.origin.key_bits(world.generation)
 }
 
@@ -1402,7 +1481,7 @@ pub fn lift<S: InsnSource>(
             Flow::Access { next, store } => {
                 insns += 1;
                 eip = next;
-                if shape.access_ends_block() || (store && matches!(smc, Smc::EndBlock)) {
+                if shape.access_ends_block() || (store && smc.ends_block()) {
                     break Stop::Access;
                 }
             }
@@ -1641,6 +1720,20 @@ struct Lifter<'a> {
     next_pc: u64,
     /// Where a self-modifying-code exit inside this instruction resumes.
     resume: Resume,
+    /// Whether the instruction just lifted was a store under
+    /// [`Smc::HostGuard`], so the **next** boundary is one the block may leave
+    /// at and may therefore elide nothing.
+    ///
+    /// [`Flags::Elide`] is a claim about what can be observed *between two
+    /// boundaries*, and it holds only where nothing can stop at the boundary
+    /// in question with the guest standing on it. [`Smc::Guard`] leaves
+    /// through an exit sequence of its own, whose live map names every flag;
+    /// [`Smc::HostGuard`] leaves at the store's successor's ordinary boundary,
+    /// which is this. One boundary per store, and only under that policy: the
+    /// alternative was refusing the two policies together, which would have
+    /// cost `benches/x86_dispatch` the one-change-at-a-time property its
+    /// ladder is for.
+    after_store: bool,
     /// Ticks charged so far, counted from block entry.
     ticks: u64,
     /// The temporary holding the exit `EIP`, once a transfer has set one.
@@ -1670,6 +1763,7 @@ impl<'a> Lifter<'a> {
             ea: None,
             next_pc: 0,
             resume: Resume { at: 0, pc: None },
+            after_store: false,
             ticks: 0,
             pc_out: None,
             static_exit: None,
@@ -1988,11 +2082,14 @@ impl<'a> Lifter<'a> {
         // Under `Smc::EndBlock` nothing after this store exists to be
         // modified, because the block ends here; under `Shape::BasicBlock` the
         // access ends the block for its own reason and the guard would be
-        // unreachable. Everywhere else the guard is what makes x86's coherent
+        // unreachable; under `Smc::HostGuard` the comparison is the host's and
+        // is made on the physical page, so there is nothing to emit. That
+        // leaves `Smc::Guard`, where the guard is what makes x86's coherent
         // instruction cache architectural rather than aspirational.
         if matches!(self.smc, Smc::Guard) && !self.shape.access_ends_block() {
             self.smc_guard(sr, addr);
         }
+        self.after_store |= matches!(self.smc, Smc::HostGuard);
     }
 
     /// Check that a computed near transfer may transfer to `target`.
@@ -2503,7 +2600,13 @@ impl<'a> Lifter<'a> {
         // The boundary, then the static charge. `Exec::instruction` makes every
         // static charge before it makes any access, so one charge here is
         // exact rather than an approximation of two.
-        let skip = self.elidable(f, plan);
+        // A boundary the block may leave at names every flag. See
+        // [`Lifter::after_store`].
+        let skip = if core::mem::take(&mut self.after_store) {
+            0
+        } else {
+            self.elidable(f, plan)
+        };
         let live = self.live_state(skip);
         self.b.insn_start(InsnStart {
             pc: eip,
@@ -2816,8 +2919,14 @@ impl<'a> Lifter<'a> {
                 // that hit this block's own page must resume at the *target*
                 // rather than after the call. That is the whole reason
                 // `Resume` is a field.
+                // `!ends_block` rather than a policy name: under
+                // `Smc::EndBlock` the push ends the block before the target is
+                // reached, so a merge would be dead. Under either guard it is
+                // not, and a direct call is the commonest transfer in compiled
+                // code -- `Smc::HostGuard` is what made this reachable under
+                // paging, where it had never been taken.
                 let merged = self.shape.merges()
-                    && matches!(self.smc, Smc::Guard)
+                    && !self.smc.ends_block()
                     && self.world.linear(target) & !PAGE_MASK == self.page;
                 if merged {
                     self.resume = Resume {

@@ -53,14 +53,14 @@
 //! board walks every byte of its extended memory, and it would otherwise be a
 //! slice of the profile that is not emulation.
 //!
-//! **A nine-hundred-second boot does not finish under callgrind on this host.**
-//! It runs at about 160 M host instructions a second in the decompressor and
-//! under 10 M once the kernel proper is running, because `--smc-check` makes
-//! valgrind re-check its own translations of the mapping the JIT writes and
-//! the kernel phase is where a hundred thousand distinct blocks are compiled
-//! into it. Profile a shorter span — `--seconds 120` is the decompressor and
-//! finishes in a quarter of an hour — and take the census natively over the
-//! nine hundred, which costs under two minutes.
+//! **A nine-hundred-second boot does not finish under callgrind in useful
+//! time.** On an idle host it starts at about 480 M host instructions a second
+//! and is under 40 M once the kernel proper is running, because `--smc-check`
+//! makes valgrind re-check its own translations of the mapping the JIT writes
+//! and the kernel phase is where a hundred thousand distinct blocks are
+//! compiled into it. Profile a shorter span — `--seconds 120` is the
+//! decompressor and finishes in minutes — and take the census natively over
+//! the nine hundred, which costs under a minute.
 //!
 //! # What that profile said the first time it was taken
 //!
