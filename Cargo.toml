@@ -2079,3 +2079,16 @@ required-features = ["machine-arm64-virt", "cpu-arm-a64-lift", "jit"]
 name             = "riscv_linux_boot"
 harness          = false
 required-features = ["machine-riscv-virt", "cpu-riscv-lift", "jit"]
+
+[[bench]]
+# The x86 half of the same measurement: a real x86-64 Linux boot on `pc64`,
+# with the census a profile has to be divided by. It exists because the two
+# frontends are not interchangeable and the A64 numbers could not be assumed to
+# transfer -- x86 lifts fewer guest instructions per block than A64 does, and
+# every per-block cost in a profile is divided by exactly that number, so the
+# conclusion about *what to optimise next* is a different one on each core
+# until somebody measures both. Skips loudly without a kernel, which is fetched
+# and never committed. `harness = false` for the reason the others give.
+name             = "x86_linux_boot"
+harness          = false
+required-features = ["machine-pc64", "cpu-x86-lift", "jit"]

@@ -6,7 +6,7 @@
 //! not have to make, plus — in the last column — the **x86-64 host code
 //! generator** those mechanisms were all waiting for.
 //!
-//! # The nine configurations
+//! # The ten configurations
 //!
 //! | | translation | block shape | flags | stores | memory |
 //! | --- | --- | --- | --- | --- | --- |
@@ -18,6 +18,7 @@
 //! | `+trace` | " | direct branches merged, with side exits | eager | end the block | `jit::Tlb` |
 //! | `+elide` | " | trace | **elided** | end the block | `jit::Tlb` |
 //! | `+guard` | " | trace | elided | **guarded in place** | `jit::Tlb` |
+//! | `+hostguard` | " | trace | elided | **the host compares the physical page** | `jit::Tlb` |
 //! | `+compiled` | " | trace | elided | guarded in place | `jit::Tlb`, and **compiled to host code** with its temporaries in a frame |
 //! | `+allocated` | " | trace | elided | guarded in place | the same, with **linear-scan register allocation** |
 //!
@@ -55,6 +56,30 @@
 //!   costs a whole dispatch per store. The guard is three IR instructions
 //!   instead, and `memcpy` is the workload where the difference is the whole
 //!   loop.
+//! * **`+hostguard`** is `lift::Smc::HostGuard`, **which is what
+//!   `cpu::x86::engine` ships**, and it is the same comparison made by the
+//!   host on the guest-*physical* page instead of by the block on the linear
+//!   one. It emits nothing, so against `+guard` this column is three IR
+//!   instructions per store removed and one `==` in `BenchHost::access`
+//!   added — which on an IR interpreter is close to a wash and compiled is
+//!   three real instructions.
+//!
+//!   Measured on a quiet host, five million guest instructions, best of three:
+//!   the only row that moves is `memcpy`, **27.8 to 29.7 Mi/s (+6.8%)**, which
+//!   is the only workload with a store in its loop. `alu-loop` 28.1 to 27.7,
+//!   `branchy` 13.0 to 13.0 and `chain` 15.4 to 15.4 are the control, and
+//!   `load-heavy` 35.7 to 32.8 is this benchmark's noise floor rather than a
+//!   result: it has no store at all, so the two rows lift identically.
+//!
+//!   **The column understates it on purpose, and the understatement is the
+//!   point.** What the policy is actually worth is not visible on any workload
+//!   here: these guests are unpaged, so `+guard` was already available to
+//!   them, and the row above is therefore the cheap half of the change. The
+//!   expensive half is what it replaces *under paging*, where `Smc::Guard` is
+//!   refused and the fallback was `Smc::EndBlock` — a whole dispatch per
+//!   store, on every guest that pages. That is a real boot rather than a loop,
+//!   and `benches/x86_linux_boot` is where it is measured: 5.21 guest
+//!   instructions per block to 12.17.
 //!
 //! # The workloads
 //!
@@ -172,7 +197,7 @@ fn main() {
         args.insns, args.reps
     );
     println!(
-        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
         "workload",
         "interpreter",
         "lift-each",
@@ -182,11 +207,12 @@ fn main() {
         "+trace",
         "+elide",
         "+guard",
+        "+hostguard",
         "+compiled",
         "+allocated",
     );
 
-    // The eight configurations, in the order the table lists them. Each one
+    // The ten configurations, in the order the table lists them. Each one
     // changes exactly one thing from the row above it, which is what lets a
     // number attach to a mechanism rather than to a release.
     let configs = [
@@ -197,8 +223,9 @@ fn main() {
         Config::new(true, true, Shape::Trace, Flags::Eager, Smc::EndBlock),
         Config::new(true, true, Shape::Trace, Flags::Elide, Smc::EndBlock),
         Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard),
-        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard).compiled(Regs::Frame),
-        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard).compiled(Regs::Scan),
+        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::HostGuard),
+        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::HostGuard).compiled(Regs::Frame),
+        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::HostGuard).compiled(Regs::Scan),
     ];
 
     for w in workloads() {
@@ -223,7 +250,7 @@ fn main() {
         // invisible.
         if let (Some(frame), Some(scan)) = (times.iter().nth_back(1), times.last()) {
             println!(
-                "{:<12} {:>95} {:>11}",
+                "{:<12} {:>107} {:>11}",
                 "",
                 "the allocator against the frame:",
                 ratio(*frame, *scan)
@@ -681,6 +708,17 @@ struct BenchHost {
     base: [u64; seg::COUNT],
     limit: u64,
     dirty: DirtyPages,
+    /// `Smc::HostGuard`'s comparator and its answer: the physical page the
+    /// program is on, and whether a store has landed in it.
+    ///
+    /// Unconditional rather than switched on the row's policy, because what
+    /// the `+hostguard` column is *for* is the cost of asking — one compare
+    /// per store — and a host that only asked on the rows that use the policy
+    /// would be measuring a different program on each row. None of the
+    /// workloads writes its own code, so it never answers `true`; that it
+    /// would is what `cpu::x86::differential` asserts.
+    code_page: u64,
+    smc: bool,
 }
 
 impl BenchHost {
@@ -703,6 +741,8 @@ impl BenchHost {
             base: world.seg_base,
             limit: RAM_SIZE - 1,
             dirty: DirtyPages::new(),
+            code_page: differential::code_page(case.paged),
+            smc: false,
         }
     }
 
@@ -735,12 +775,14 @@ impl BenchHost {
             ),
             (Some(tlb), Some(v)) => {
                 self.dirty.note(lin, size);
+                self.smc |= lin & !0xfff == self.code_page;
                 tlb.write(lin, lin, mem.size, v, RING0, MemAttrs::DEFAULT)
                     .map(|()| 0)
             }
             (None, None) => self.space.read(lin, mem.size, MemAttrs::DEFAULT),
             (None, Some(v)) => {
                 self.dirty.note(lin, size);
+                self.smc |= lin & !0xfff == self.code_page;
                 self.space
                     .write(lin, mem.size, v, MemAttrs::DEFAULT)
                     .map(|()| 0)
@@ -764,6 +806,11 @@ impl IrHost for BenchHost {
     }
     fn charge(&mut self, _ticks: u64) {}
     fn insn_start(&mut self, _mark: &InsnStart) {}
+    /// `Smc::HostGuard`'s obligation: leave the block at the first boundary
+    /// after a store into the page the code came from.
+    fn spent(&self) -> bool {
+        self.smc
+    }
 }
 
 impl StoreLog for BenchHost {

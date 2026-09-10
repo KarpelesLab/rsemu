@@ -665,9 +665,11 @@ fn the_paged_corpus_agrees_through_the_cached_and_chained_runtime() {
 ///
 /// This is the case the in-block guard could not have handled and the reason
 /// `lift` refuses it under paging: the guard compares linear pages, and both
-/// ends of the real mechanism are physical. `Smc::EndBlock` puts the boundary
-/// where the store is, the host notes the physical page its store reached, and
-/// the cache invalidates the translation whose bytes came from that page.
+/// ends of the real mechanism are physical. Under `Smc::HostGuard` — the
+/// policy `Case::paged` leaves in place — the host compares the physical page
+/// its store reached against the physical page the block's bytes came from,
+/// hands the run's allowance back so the block leaves at the store's own
+/// boundary, and the cache invalidates the translation there.
 ///
 /// The assertion that matters is the last one: without invalidation the block
 /// would run the instruction it was lifted from and the interpreter would run
@@ -935,7 +937,7 @@ fn a_generated_corpus_agrees_on_a_486() {
 /// that instruction. Under the interpreter the store is visible immediately,
 /// because the interpreter re-fetches; under a translated block it is visible
 /// only if the block gives the dispatcher a boundary to invalidate at, which is
-/// exactly what the two [`Smc`] policies do in their two different ways.
+/// exactly what the three [`Smc`] policies do in their three different ways.
 fn self_modifying() -> Vec<u8> {
     vec![
         // 0: mov [eax], bl        — EAX is set to 4 by the caller
@@ -948,8 +950,8 @@ fn self_modifying() -> Vec<u8> {
 }
 
 #[test]
-fn a_store_into_a_running_block_is_honoured_under_both_policies() {
-    for smc in [Smc::EndBlock, Smc::Guard] {
+fn a_store_into_a_running_block_is_honoured_under_every_policy() {
+    for smc in [Smc::EndBlock, Smc::Guard, Smc::HostGuard] {
         for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
             // EAX points at offset 4, BL holds `0x47` — `inc edi` — so the
             // instruction the block was lifted from changes under it.
@@ -983,13 +985,105 @@ fn a_store_that_misses_the_code_page_invalidates_nothing() {
         // mov [eax], bl ; inc esi ; hlt — EAX points into the data window.
         0x88, 0x18, 0x46, 0xf4,
     ];
-    let case = Case::seeded(program).with_smc(Smc::Guard);
-    let run = measure_cached(&case, 32).expect("agrees");
-    assert!(matches!(run.verdict, Verdict::Agreed { .. }));
-    assert_eq!(run.smc, 0, "a data store must not invalidate a translation");
+    for smc in [Smc::Guard, Smc::HostGuard] {
+        let case = Case::seeded(program.clone()).with_smc(smc);
+        let run = measure_cached(&case, 32).unwrap_or_else(|e| panic!("{smc:?}: {e}"));
+        assert!(matches!(run.verdict, Verdict::Agreed { .. }), "{smc:?}");
+        assert_eq!(
+            run.smc, 0,
+            "{smc:?}: a data store must not invalidate a translation"
+        );
+        assert_eq!(
+            run.insns_retired, 2,
+            "{smc:?}: the guard must not cut the block short: {run:?}"
+        );
+    }
+}
+
+/// **The win, asserted rather than left to the profile**: with paging on, a
+/// store is an ordinary instruction.
+///
+/// [`Smc::EndBlock`] was the only policy this frontend would lift a paged
+/// block under until [`Smc::HostGuard`], and what it cost was a whole block
+/// dispatch per store on the only kind of guest that matters. The two halves
+/// of that claim are one comparison: the same program, the same paged world,
+/// the two policies, and the number of blocks it takes.
+///
+/// The program stores through a register `Case::seeded` aims at the data
+/// window, so the store misses the code page and neither policy has anything
+/// to invalidate — which is the common case and the one the block count is
+/// about.
+/// A boundary the host guard can leave at names every flag, even under
+/// [`Flags::Elide`].
+///
+/// The one thing `Smc::HostGuard` makes unsound and the reason
+/// `lift::Lifter::after_store` exists. Elision is a claim about what nothing
+/// can observe *between* two boundaries; a boundary the block may stop at is
+/// one the guest stands on, where an interrupt can push `EFLAGS`. The other
+/// two policies do not have the problem — `Smc::EndBlock` has no boundary
+/// after the store and `Smc::Guard` leaves through an exit sequence whose live
+/// map names everything — so this is the mutation that survives every other
+/// test in this file.
+///
+/// ```text
+///   01 d1     add ecx, edx    ; writes all six flags
+///   88 18     mov [eax], bl   ; EAX points at offset 7 — this block's page
+///   01 d9     add ecx, ebx    ; unconditionally writes all six and cannot
+///   f4        hlt             ;   fault, so its boundary is elidable
+///   90        nop             ; the byte the store rewrites, with itself
+/// ```
+///
+/// The block leaves at the third instruction's boundary, so the first `add`'s
+/// flags are the guest's architectural flags there and the interpreter, which
+/// is stepped exactly two instructions, has them. Elide that boundary and the
+/// block publishes the flags the case started with instead.
+#[test]
+fn a_boundary_the_host_guard_leaves_at_names_every_flag() {
+    let program = vec![0x01, 0xd1, 0x88, 0x18, 0x01, 0xd9, 0xf4, 0x90];
+    for flags in [Flags::Eager, Flags::Elide] {
+        let case = Case::new(program.clone())
+            .with_reg(0, 7)
+            .with_reg(1, 0x8000_0001)
+            .with_reg(2, 0x8000_0001)
+            .with_reg(3, 0x90)
+            .with_flags(flags);
+        let verdict = compare(&case).unwrap_or_else(|e| panic!("{flags:?}: {e}"));
+        assert!(
+            matches!(verdict, Verdict::Agreed { insns: 2, .. }),
+            "{flags:?}: the block must stop at the store's own boundary, and agree there: \
+             {verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn a_paged_store_is_an_ordinary_instruction_under_the_host_guard() {
+    let program = vec![
+        0x88, 0x02, // mov [edx], al
+        0x46, // inc esi
+        0x47, // inc edi
+        0xf4, // hlt — outside the subset, so the block ends before it
+    ];
+    let ended = measure_cached(
+        &Case::seeded(program.clone())
+            .paged()
+            .with_smc(Smc::EndBlock),
+        32,
+    )
+    .expect("EndBlock agrees");
+    let guarded = measure_cached(&Case::seeded(program).paged(), 32).expect("HostGuard agrees");
+    for run in [&ended, &guarded] {
+        assert!(matches!(run.verdict, Verdict::Agreed { .. }), "{run:?}");
+        assert_eq!(run.insns_retired, 3, "{run:?}");
+        assert_eq!(run.smc, 0, "the store missed the code page: {run:?}");
+    }
     assert_eq!(
-        run.insns_retired, 2,
-        "the guard must not cut the block short: {run:?}"
+        ended.blocks, 2,
+        "under EndBlock the store is the last instruction in its block: {ended:?}"
+    );
+    assert_eq!(
+        guarded.blocks, 1,
+        "under HostGuard a store that misses the code page costs no boundary at all: {guarded:?}"
     );
 }
 
@@ -1092,10 +1186,13 @@ fn a_computed_near_transfer_is_judged_the_same_by_both_engines() {
         ("jmp r11", vec![0x41, 0xff, 0xe3]),
         ("call r11", vec![0x41, 0xff, 0xd3]),
     ];
-    // `RET` is not here and cannot be: the word it transfers to has to be put
-    // on the stack first, and under `Smc::EndBlock` -- which paging forces, and
-    // long mode forces paging -- a store is the last instruction in its block.
-    // So `push r15; ret` is two blocks, which is the *next* test.
+    // `RET` is not here because the word it transfers to has to be put on the
+    // stack first, and this list is what one freshly lifted block does. Under
+    // `Smc::EndBlock` that was a hard limit -- a store was the last
+    // instruction in its block, so `push r15; ret` was two blocks -- and under
+    // `Smc::HostGuard` it is one block again. The *next* test is the one that
+    // drives it, because a chained runtime is where a `RET` to a chosen word
+    // was testable at all when this was written.
     for (what, program) in taken {
         match compare(&Case::seeded(program).long()) {
             Ok(Verdict::Agreed { .. }) => {}
@@ -1114,11 +1211,11 @@ fn a_computed_near_transfer_is_judged_the_same_by_both_engines() {
 #[test]
 fn a_computed_near_transfer_is_judged_the_same_through_the_runtime() {
     const BAD: u64 = 0x1234_5678_9abc_def0;
-    // `push` then `ret` is two blocks under `Smc::EndBlock`, which is what
-    // makes a chained runtime the only place a `RET` to a *chosen* word can be
-    // tested at all — and the third case is the one that matters, because a
-    // block that transfers to a word it has just put there is what a function
-    // return is.
+    // `push` then `ret` was two blocks under `Smc::EndBlock` — which is what
+    // made a chained runtime the only place a `RET` to a *chosen* word could
+    // be tested at all — and is one under `Smc::HostGuard`. Either way the
+    // third case is the one that matters, because a block that transfers to a
+    // word it has just put there is what a function return is.
     let cases: [(&str, Vec<u8>, bool); 5] = [
         ("jmp r15", vec![0x41, 0xff, 0xe7], true),
         ("call r15", vec![0x41, 0xff, 0xd7], true),
@@ -1232,7 +1329,7 @@ fn a_call_and_a_return_agree_through_the_stack() {
         0xf4, // hlt
     ];
     for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
-        for smc in [Smc::EndBlock, Smc::Guard] {
+        for smc in [Smc::EndBlock, Smc::Guard, Smc::HostGuard] {
             let case = Case::seeded(program.clone())
                 .with_shape(shape)
                 .with_smc(smc);
@@ -1321,23 +1418,27 @@ fn a_call_that_rewrites_its_own_target_resumes_at_the_target() {
     // ESP is four bytes past the target, so the pushed return address lands
     // exactly on it. Under `Smc::Guard` the trace has already merged across the
     // call, so the store's page guard is the only thing between the push and
-    // executing bytes that no longer exist.
-    let case = Case::new(call_that_overwrites_its_own_target())
-        .with_reg(4, 0x20)
-        .with_shape(Shape::Trace)
-        .with_smc(Smc::Guard);
-    let mut case = case;
-    case.keep_esp = true;
-    let run = measure_cached(&case, 32).expect("the two engines agree");
-    assert!(
-        matches!(run.verdict, Verdict::Agreed { .. }),
-        "{:?}",
-        run.verdict
-    );
-    assert!(
-        run.smc > 0,
-        "the push never invalidated a translation, so the case is not testing what it says"
-    );
+    // executing bytes that no longer exist. `Smc::HostGuard` merges the same
+    // call and answers the same store from the host, which the loop below is
+    // what checks.
+    for smc in [Smc::Guard, Smc::HostGuard] {
+        let mut case = Case::new(call_that_overwrites_its_own_target())
+            .with_reg(4, 0x20)
+            .with_shape(Shape::Trace)
+            .with_smc(smc);
+        case.keep_esp = true;
+        let run = measure_cached(&case, 32).unwrap_or_else(|e| panic!("{smc:?}: {e}"));
+        assert!(
+            matches!(run.verdict, Verdict::Agreed { .. }),
+            "{smc:?}: {:?}",
+            run.verdict
+        );
+        assert!(
+            run.smc > 0,
+            "{smc:?}: the push never invalidated a translation, so the case is not testing what \
+             it says"
+        );
+    }
 }
 
 #[test]
@@ -1389,7 +1490,7 @@ fn a_pop_into_a_stack_relative_address_uses_the_stack_pointer_it_ends_with() {
         0xf4,
     ];
     for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
-        for smc in [Smc::EndBlock, Smc::Guard] {
+        for smc in [Smc::EndBlock, Smc::Guard, Smc::HostGuard] {
             let case = Case::seeded(program.clone())
                 .with_shape(shape)
                 .with_smc(smc);

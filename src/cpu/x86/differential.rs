@@ -155,7 +155,8 @@
 //! testable at all, and on x86 it is not optional: the architecture makes a
 //! coherent instruction cache a guarantee rather than a courtesy, so a store
 //! into a running block's own page has to be honoured before the next
-//! instruction — which is exactly what [`lift::Smc::Guard`] emits and what
+//! instruction — which is exactly what [`lift::Smc::HostGuard`] asks this
+//! file's two hosts for, what [`lift::Smc::Guard`] emits instead, and what
 //! `a_store_into_the_running_blocks_own_page_is_honoured_immediately` checks.
 //!
 //! # What breaking it deliberately caught
@@ -288,7 +289,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-#[cfg(any(feature = "jit", test))]
 use crate::core::device::DebugTranslation;
 use crate::core::error::BusError;
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region};
@@ -300,7 +300,6 @@ use super::lift::{
     self, ARITH_MASK, EFLAGS_REST, FLAG_BITS, FLAG_SLOTS, Flags, Origin, RIP, SLOT_COUNT, Shape,
     Smc, World, r_slot,
 };
-#[cfg(any(feature = "jit", test))]
 use super::paging::debug_translate;
 use super::paging::{Access, pte};
 use super::prot::{SegReg, Sys, ar, cr0, cr4, efer};
@@ -371,8 +370,10 @@ pub const LONG_RAM_SIZE: u64 = 12 * 4096;
 /// translation is what names it, so moving the program would test the same
 /// thing twice — which makes the two windows **aliases of one set of physical
 /// frames**. That is deliberate too: two linear pages naming one physical page
-/// is exactly the arrangement the in-block store guard could not see, and the
-/// reason [`Smc::Guard`] is refused under paging.
+/// is exactly the arrangement the in-block store guard could not see — the
+/// reason [`Smc::Guard`] is refused under paging, and the reason
+/// [`Smc::HostGuard`], which compares physical pages, can be the policy there
+/// instead of a whole block per store.
 pub const HIGH: u64 = 0x0000_0280_c040_0000;
 
 /// Where the high window's page-directory-pointer table sits, physically.
@@ -410,6 +411,18 @@ pub const PTAB64: u64 = BASE + 0x3000;
 /// paging adds. The four guest pages sit at `PAGED_PROGRAM ..
 /// PAGED_PROGRAM + RAM_SIZE`.
 pub const PAGED_PROGRAM: u64 = BASE + 0x4000;
+
+/// The guest-**physical** page the program's bytes are on.
+///
+/// [`Smc::HostGuard`]'s comparator, which is physical at both ends: a store
+/// reaches a physical address and this is where a block's own instructions
+/// came from. Linear [`BASE`] is identity-mapped with paging off and resolves
+/// to [`PAGED_PROGRAM`] with it on, which is exactly the aliasing the linear
+/// guard cannot see and this constant does not have to.
+#[must_use]
+pub const fn code_page(paged: bool) -> u64 {
+    (if paged { PAGED_PROGRAM } else { BASE }) & !0xfff
+}
 
 /// The selector the flat code segment is loaded from.
 const CODE_SEL: u16 = 0x08;
@@ -620,9 +633,11 @@ impl Case {
     ///   translations are separate arrays — see
     ///   [`World::of`](lift::World::of). A 386 and a 486 are refused there and
     ///   would be refused here.
-    /// * **The store policy becomes [`Smc::EndBlock`]**, because
-    ///   [`Smc::Guard`] compares linear pages and [`lift`] refuses it under
-    ///   paging.
+    /// * **[`Smc::Guard`] becomes [`Smc::HostGuard`]**, because the in-block
+    ///   guard compares linear pages and [`lift`] refuses it under paging.
+    ///   Nothing else is touched: [`Smc::EndBlock`] and [`Smc::HostGuard`] are
+    ///   both liftable here, and which of the two a case asked for is the
+    ///   comparison half of this file's own tests.
     ///
     /// Both are silent rather than assertions because the point of a
     /// constructor is that the case it builds is one the frontend accepts.
@@ -630,7 +645,9 @@ impl Case {
     pub const fn paged(mut self) -> Case {
         self.paged = true;
         self.variant = Variant::X86_64;
-        self.smc = Smc::EndBlock;
+        if matches!(self.smc, Smc::Guard) {
+            self.smc = Smc::HostGuard;
+        }
         self
     }
 
@@ -885,14 +902,25 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
         return Ok(Verdict::Trapped { insns: retired });
     }
 
-    if !matches!(outcome, Outcome::Exit) {
-        return Err(diverged(
-            case,
-            format!("a lifted block must end in exit_tb, but it reported {outcome:?}"),
-        ));
-    }
-
-    let pc = host.slot(RIP);
+    // Where the guest stands afterwards. At an exit the block bound `RIP`
+    // itself — this frontend binds it at an exit boundary and nowhere else —
+    // and at a [`Smc::HostGuard`] departure it did not, so the boundary's own
+    // PC is the one [`Outcome::Spent`] carries. That is the same number
+    // `cpu::x86::engine`'s `advance` publishes from `Run::pc`.
+    let pc = match outcome {
+        Outcome::Exit => host.slot(RIP),
+        // The store guard fired: the store retired, the block stopped in front
+        // of the next instruction, and the oracle above was stepped exactly
+        // that far. What the two are then compared on is the same state at the
+        // same PC, which is the whole claim the guard makes.
+        Outcome::Spent { pc } => pc,
+        other => {
+            return Err(diverged(
+                case,
+                format!("a lifted block must end in exit_tb, but it reported {other:?}"),
+            ));
+        }
+    };
     state(case, &cpu, &host, pc, "the lifted block", false)?;
 
     // The cumulative column the block publishes at its boundaries is *static*
@@ -1474,6 +1502,18 @@ struct Host {
     access_ticks: u64,
     /// The interpreter's own memory path, present exactly when the case pages.
     mmu: Option<Mmu>,
+    /// The guest-physical page the program was loaded on, and whether a store
+    /// has landed in it.
+    ///
+    /// [`Smc::HostGuard`]'s obligation, restated here for the same reason
+    /// [`Host::access`] restates the memory rule: what is under test is the
+    /// *frontend*, and a harness that let a block run past a store into its
+    /// own code would be comparing bytes the interpreter has already replaced
+    /// against bytes it has not. `cpu::x86::engine` answers it by retiring the
+    /// run's tick allowance; there is no allowance here, so the flag **is**
+    /// the answer — monotone, as [`IrHost::spent`] requires.
+    code_page: u64,
+    smc: bool,
 }
 
 /// Enough of a core for [`Exec`] to exist over: the memory path under paging.
@@ -1521,6 +1561,8 @@ impl Host {
             ticks: 0,
             access_ticks: 0,
             mmu: case.paged.then(|| Mmu::new(case)),
+            code_page: code_page(case.paged),
+            smc: false,
         }
     }
 
@@ -1572,22 +1614,42 @@ impl Host {
             space,
             ticks,
             access_ticks,
+            code_page,
+            smc,
             ..
         } = self;
         let mmu = mmu.as_mut().expect("only a paged host reaches here");
         let sr = mem.seg.map_or(seg::DS, |s| s.0);
         let size = mem.size.bytes() as u8;
         let before = mmu.state.cycles;
-        let answer = {
+        let (answer, lin) = {
             let mut exec = Exec::new(&mut mmu.state, space, None, &mmu.cfg, &mmu.lines);
-            match value {
+            let lin = exec.seg_linear(sr, addr, u64::from(size), value.is_some());
+            let answer = match value {
                 None => exec.read_mem(sr, addr, size),
                 Some(v) => exec.write_mem(sr, addr, size, v).map(|()| 0),
-            }
+            };
+            (answer, lin)
         };
         let spent = mmu.state.cycles.wrapping_sub(before);
         *ticks += spent;
         *access_ticks += spent;
+        // [`Smc::HostGuard`], on the paged leg. The first byte and the last,
+        // because a store that crosses a page boundary lands in two frames
+        // that need not be adjacent -- and the second of them can be the code.
+        if answer.is_ok()
+            && value.is_some()
+            && let Ok(lin) = lin
+        {
+            for at in [lin, lin + u64::from(size) - 1] {
+                if mmu
+                    .phys_of(space, at)
+                    .is_some_and(|p| p & !0xfff == *code_page)
+                {
+                    *smc = true;
+                }
+            }
+        }
         // The IR carries one bus error and the vector is the interpreter's
         // business: `#GP`, `#SS` and now `#PF` all arrive here as *a fault*,
         // and what is compared is that both engines took one at the same
@@ -1636,10 +1698,17 @@ impl Host {
         // transaction whatever its alignment: only a page crossing splits one,
         // and `Exec::linear_read` only splits when paging is on.
         self.charge_bus();
-        match value {
+        let done = match value {
             None => self.space.read(lin, mem.size, self.attrs),
             Some(v) => self.space.write(lin, mem.size, v, self.attrs).map(|()| 0),
+        };
+        // [`Smc::HostGuard`], on the unpaged leg, where the linear address a
+        // segment produced *is* the physical one.
+        if done.is_ok() && value.is_some() {
+            let last = lin + mem.size.bytes() - 1;
+            self.smc |= lin & !0xfff == self.code_page || last & !0xfff == self.code_page;
         }
+        done
     }
 }
 
@@ -1668,17 +1737,16 @@ impl Mmu {
     /// Where a linear address is — the whole physical address, not its page —
     /// without touching anything.
     ///
-    /// Wanted by the cached path, which logs a store by the physical page it
-    /// reached, and by the test that checks this machine's tables resolve the
-    /// entry to the page [`world`] claims. Neither exists in a build with no
-    /// `jit` and no tests, hence the gate.
+    /// Wanted by [`Smc::HostGuard`] on both legs, by the cached path, which
+    /// logs a store by the physical page it reached, and by the test that
+    /// checks this machine's tables resolve the entry to the page [`world`]
+    /// claims.
     ///
     /// The self-modifying-code half needs the *physical* page a store reached
     /// and `Exec::write_mem` does not report one. A debug walk answers it with
     /// none of the side effects — no accessed bit, no `CR2`, no buffer fill,
     /// no cycles — which is exactly right here: every one of those has already
     /// happened, on the executing walk the store itself made.
-    #[cfg(any(feature = "jit", test))]
     fn phys_of(&self, space: &AddressSpace, linear: u64) -> Option<u64> {
         match debug_translate(&self.state.sys, self.cfg.features, space, linear) {
             DebugTranslation::Identity => Some(linear),
@@ -1715,6 +1783,19 @@ impl IrHost for Host {
     }
 
     fn insn_start(&mut self, _mark: &InsnStart) {}
+
+    /// [`Smc::HostGuard`]'s obligation: leave the block at the first boundary
+    /// after a store into the page the code came from.
+    ///
+    /// Monotone, because [`Host::smc`] is only ever set. Unconditional rather
+    /// than switched on `Case::smc`, so that one implementation is exercised
+    /// by every leg: under [`Smc::EndBlock`] the store is the last instruction
+    /// of its block and the only boundary left is the exit one, which no
+    /// engine leaves at, and under [`Smc::Guard`] the block has already left
+    /// through the guard [`lift`] emitted.
+    fn spent(&self) -> bool {
+        self.smc
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,8 +2008,11 @@ impl HostView {
             bus: 0,
             ticks: self.ticks,
             access_ticks: self.access_ticks,
-            // A view, not a machine: nothing here performs an access.
+            // A view, not a machine: nothing here performs an access, so
+            // neither half of the store guard can be reached.
             mmu: None,
+            code_page: 0,
+            smc: false,
         }
     }
 }
@@ -2167,6 +2251,12 @@ struct CachedHost {
     space: Arc<AddressSpace>,
     /// The interpreter's own memory path, present exactly when the case pages.
     mmu: Option<Mmu>,
+    /// [`Smc::HostGuard`]'s comparator and its answer, exactly as on
+    /// [`Host`]. Both legs implement it, because a policy only one of them
+    /// honoured would be a divergence between the two halves of this harness
+    /// rather than a property of the frontend.
+    code_page: u64,
+    smc: bool,
 }
 
 /// The world a ring-0 access happens in, with paging off.
@@ -2190,6 +2280,8 @@ impl CachedHost {
             dirty: DirtyPages::new(),
             space,
             mmu: seed.mmu,
+            code_page: seed.code_page,
+            smc: false,
         }
     }
 
@@ -2231,6 +2323,8 @@ impl CachedHost {
             space,
             ticks,
             dirty,
+            code_page,
+            smc,
             ..
         } = self;
         let mmu = mmu.as_mut().expect("only a paged host reaches here");
@@ -2257,6 +2351,10 @@ impl CachedHost {
             for at in [lin, lin + u64::from(size) - 1] {
                 if let Some(phys) = mmu.phys_of(space, at) {
                     dirty.note(phys, 1);
+                    // [`Smc::HostGuard`]. The dirty log is what invalidates a
+                    // *cached* translation of the page; this is what stops the
+                    // block that is running from executing past the store.
+                    *smc |= phys & !0xfff == *code_page;
                 }
             }
         }
@@ -2292,11 +2390,13 @@ impl CachedHost {
                     .map(|()| 0);
                 if done.is_ok() {
                     // The self-modifying-code hook. Drained by the dispatcher
-                    // at the next block boundary — which the lifter's own
-                    // page guard is what *makes* reachable in time, because on
-                    // x86 the next instruction may be the one that was
-                    // rewritten.
+                    // at the next block boundary — which whichever [`Smc`]
+                    // policy is in force is what *makes* reachable in time,
+                    // because on x86 the next instruction may be the one that
+                    // was rewritten.
                     self.dirty.note(lin, mem.size.bytes());
+                    let last = lin + mem.size.bytes() - 1;
+                    self.smc |= lin & !0xfff == self.code_page || last & !0xfff == self.code_page;
                 }
                 done
             }
@@ -2327,6 +2427,11 @@ impl IrHost for CachedHost {
     }
 
     fn insn_start(&mut self, _mark: &InsnStart) {}
+
+    /// [`Smc::HostGuard`]'s obligation on the cached leg. See [`Host::spent`].
+    fn spent(&self) -> bool {
+        self.smc
+    }
 }
 
 #[cfg(feature = "jit")]

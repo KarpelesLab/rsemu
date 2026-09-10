@@ -433,7 +433,7 @@ twice:
 | `FLAGS = Flags::Eager` | every one of those writes flags and five read them back — `ADC`, `SBB`, `SETB`, `CMOVZ` and the `Jcc`s |
 | `IrHost::spent` | that run has no store in it, so nothing but the tick allowance can end a quantum inside it |
 | `admit`'s exclusion list | `PUSHFQ`/`POPFQ` every eighth pass, `CLI`/`STI` every thirty-second — `STI` leaves the interrupt shadow `admit` refuses on |
-| `Smc::EndBlock` | every sixteenth pass the guest **rewrites its own immediate**, from the same page it is executing: 106 058 translations thrown away against 106 089 made |
+| `Smc::HostGuard` | every sixteenth pass the guest **rewrites its own immediate**, from the same page it is executing: 106 058 translations thrown away against 106 089 made. (The counts were taken while the policy under paging was still `Smc::EndBlock`; what the seam is called changed, what the guest does about it did not.) |
 | the entry translation in `admit` | `INVLPG` on the running code page every sixty-fourth pass — the x86 analogue of the `TLBI` above, and `paging::Buffers::Split` means it is the only thing that cools a fetch translation |
 | an interrupt from inside a chain | an 8254 into a master 8259A into `INTR`, at 83.8 µs against a quantum of at most 100 µs: 11 922 interrupts in a guest second |
 | a synchronous entry from inside a chain | `INT 0x30` every two hundred and fifty-sixth pass |
