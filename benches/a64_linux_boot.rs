@@ -128,6 +128,28 @@
 //! only a twentieth of the cost. **What is left to aim at has moved**: the
 //! replay is now the largest row in this profile, and the next thing that
 //! shortens it is fewer events rather than fewer blocks.
+//!
+//! # And how many of those events are the accuracy guarantee
+//!
+//! That question was then put to this benchmark directly, and the answer is
+//! written where the decision that creates the cost is written: `ir`'s module
+//! docs, decision 2, *"What decision 2 costs, and what a comparison against
+//! QEMU is measuring"*. The short form, because `ROADMAP.md` §8's gate
+//! depends on it — QEMU runs with `-icount` off, so a wall-clock comparison
+//! prices rsemu's per-access accounting as if it were overhead:
+//!
+//! * The replay is **62.1 host instructions per guest instruction**, against
+//!   28.8 for the code the JIT generated. It is two events per guest
+//!   instruction on every frontend in this tree, a boundary at 38 host
+//!   instructions and a charge at 17, plus 13 to enter and leave each replay.
+//! * A scratch build that accounts per **region** instead — the granularity a
+//!   translator with no guarantee would keep anyway, and not shippable —
+//!   ran the same guest work for **37 805 131 461** host instructions against
+//!   44 219 859 493. **The guarantee costs 11.9% of this boot**, and that is a
+//!   lower bound, since the per-access ticks the host charges inside an access
+//!   are not removed by it.
+//! * About a sixth of that is implementation rather than guarantee, and the
+//!   two changes that recover it are named there with their measured worth.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
