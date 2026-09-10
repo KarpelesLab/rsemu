@@ -351,6 +351,14 @@ pub struct Compiled {
     /// what keeps `ROADMAP.md` §9's precise exceptions exact.
     alloc: Allocation,
     offset: u64,
+    /// Where this block's **chain entry** sits, relative to its own first
+    /// byte: immediately past the prologue.
+    ///
+    /// A block entered by a call runs the prologue and gets a host frame; a
+    /// block entered by a *link* inherits the frame its predecessor is
+    /// standing in, so it must start here instead. See
+    /// [`Compiler::epilogue`]'s chain pad.
+    chain: u64,
 }
 
 impl Compiled {
@@ -366,6 +374,17 @@ impl Compiled {
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Where its chain entry was placed in the code buffer.
+    ///
+    /// The address a linked predecessor jumps to. Absolute within the buffer,
+    /// like [`Compiled::offset`], because that is the form the block cache
+    /// carries and the chain thunk adds a base to.
+    #[inline]
+    #[must_use]
+    pub fn chain_entry(&self) -> u64 {
+        self.offset + self.chain
     }
 
     /// The bookkeeping a flush replays, which the runtime hands generated code
@@ -681,6 +700,8 @@ struct Compiler<'a> {
     exits: Vec<Fixup>,
     /// Jumps to the pad that leaves with [`status::SPENT`], one per flush.
     spent: Vec<Fixup>,
+    /// Where the chain entry ended up — set once, by [`Compiler::run`].
+    chain: u64,
 }
 
 /// The stack this backend reserves below its saved registers.
@@ -779,6 +800,7 @@ impl<'a> Compiler<'a> {
             branches: Vec::new(),
             exits: Vec::new(),
             spent: Vec::new(),
+            chain: 0,
         })
     }
 
@@ -788,6 +810,11 @@ impl<'a> Compiler<'a> {
             return Err(Refusal::Shape("the block does not end in a terminator"));
         }
         self.prologue();
+        // Past the prologue, which a block reached by a link must not run
+        // again: it is standing in the frame its predecessor built, and a
+        // second set of pushes would grow the host stack once per guest
+        // branch.
+        self.chain = self.asm.here() as u64;
         for (at, inst) in insts.iter().enumerate() {
             // Before the position a branch lands on, so the taken path skips
             // the range it did not execute — see the module docs.
@@ -808,6 +835,7 @@ impl<'a> Compiler<'a> {
             events: self.plan.events.into_boxed_slice(),
             alloc: self.alloc,
             offset: 0,
+            chain: self.chain,
         })
     }
 
@@ -841,11 +869,49 @@ impl<'a> Compiler<'a> {
         for f in core::mem::take(&mut self.exits) {
             self.asm.bind(f);
         }
+        self.chain_pad();
         self.asm.alu_ri(Alu::Add, Reg::Rsp, FRAME);
         for r in [Reg::R15, Reg::R14, Reg::R13, Reg::R12, Reg::Rbp, Reg::Rbx] {
             self.asm.pop(r);
         }
         self.asm.ret();
+    }
+
+    /// The direct link: ask the dispatcher for the successor's code and jump
+    /// to it, or fall through into the frame teardown below.
+    ///
+    /// Every way out of a block arrives here with its [`status`] in `rax` —
+    /// the three terminators, the spent pad above, and the fault sequence —
+    /// and the reason it is *every* way out rather than the two that can chain
+    /// is that the thunk is what closes the block off: it publishes the exit
+    /// boundary, drains the guest's stores against the block cache and counts
+    /// what retired. A fault that skipped it would leave that undone, and the
+    /// caller would have to know which of two shapes it got back.
+    ///
+    /// [`Ctx::chain`](super::rt::Ctx::chain) being zero is a caller that has
+    /// not enabled linking — `Engine::run` rather than `Engine::run_chained`,
+    /// which is what this backend's own benchmarks and its differential use —
+    /// and then the whole of it is a store, a load, a `test`, a taken `jcc`
+    /// and a load: five instructions once per block exit.
+    fn chain_pad(&mut self) {
+        self.asm.mov_mr(Reg::Rbx, off::OUT_STATUS, Reg::Rax);
+        self.asm.mov_rm(Reg::Rax, Reg::Rbx, off::CHAIN);
+        self.asm.test_rr(Reg::Rax, Reg::Rax);
+        let off_ = self.asm.jcc(Cc::E);
+        self.ctx_to_rdi();
+        self.asm.call_r(Reg::Rax);
+        self.asm.test_rr(Reg::Rax, Reg::Rax);
+        let end = self.asm.jcc(Cc::E);
+        // The successor's chain entry. `rbx`, `r12`, `r14` and `rsp` are
+        // already what its body expects — the same context, the same temporary
+        // frame, the same thunk table and the same frame depth — which is the
+        // whole of why a link is a jump and not a call. The thunk guarantees
+        // the frame is long enough for the block it names; it cannot grow one,
+        // because growing it would move it under the code now running.
+        self.asm.jmp_r(Reg::Rax);
+        self.asm.bind(off_);
+        self.asm.bind(end);
+        self.asm.mov_rm(Reg::Rax, Reg::Rbx, off::OUT_STATUS);
     }
 
     /// Leave the block with `code` in `rax`.

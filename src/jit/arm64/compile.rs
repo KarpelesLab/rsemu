@@ -228,6 +228,14 @@ pub struct Compiled {
     /// Where the register allocator put every temporary.
     alloc: Allocation,
     offset: u64,
+    /// Where this block's **chain entry** sits, relative to its own first
+    /// byte: immediately past the prologue.
+    ///
+    /// A block entered by a call runs the prologue and gets a host frame; a
+    /// block entered by a *link* inherits the frame its predecessor is
+    /// standing in, so it must start here instead. See
+    /// [`Compiler::epilogue`]'s chain pad.
+    chain: u64,
 }
 
 impl Compiled {
@@ -243,6 +251,17 @@ impl Compiled {
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Where its chain entry was placed in the code buffer.
+    ///
+    /// The address a linked predecessor jumps to. Absolute within the buffer,
+    /// like [`Compiled::offset`], because that is the form the block cache
+    /// carries and the chain thunk adds a base to.
+    #[inline]
+    #[must_use]
+    pub fn chain_entry(&self) -> u64 {
+        self.offset + self.chain
     }
 
     /// The bookkeeping a flush replays, which the runtime hands generated code
@@ -517,6 +536,8 @@ struct Compiler<'a> {
     exits: Vec<Fixup>,
     /// Jumps to the pad that leaves with [`status::SPENT`], one per flush.
     spent: Vec<Fixup>,
+    /// Where the chain entry ended up — set once, by [`Compiler::run`].
+    chain: u64,
     /// Set when an offset had no encoding. Checked once, at the end of
     /// [`Compiler::run`]: an address this backend cannot form is a refusal,
     /// and the interpreter runs the block.
@@ -612,6 +633,7 @@ impl<'a> Compiler<'a> {
             branches: Vec::new(),
             exits: Vec::new(),
             spent: Vec::new(),
+            chain: 0,
             unreachable_offset: false,
         })
     }
@@ -622,6 +644,10 @@ impl<'a> Compiler<'a> {
             return Err(Refusal::Shape("the block does not end in a terminator"));
         }
         self.prologue();
+        // Past the prologue, which a block reached by a link must not run
+        // again: it is standing in the frame its predecessor built, and a
+        // second set of saves would grow the host stack once per guest branch.
+        self.chain = self.asm.here() as u64;
         for (at, inst) in insts.iter().enumerate() {
             // Before the position a branch lands on, so the taken path skips
             // the range it did not execute.
@@ -654,6 +680,7 @@ impl<'a> Compiler<'a> {
             events: self.plan.events.into_boxed_slice(),
             alloc: self.alloc,
             offset: 0,
+            chain: self.chain,
         })
     }
 
@@ -687,6 +714,7 @@ impl<'a> Compiler<'a> {
         for f in core::mem::take(&mut self.exits) {
             self.asm.bind(f);
         }
+        self.chain_pad();
         self.asm.ldp(Reg::X19, Reg::X20, Reg::SP, SAVE_AT);
         self.asm.ldp(Reg::X21, Reg(22), Reg::SP, SAVE_AT + 16);
         self.asm.ldp(Reg(23), Reg(24), Reg::SP, SAVE_AT + 32);
@@ -695,6 +723,42 @@ impl<'a> Compiler<'a> {
         self.asm.ldp(Reg::X29, Reg::X30, Reg::SP, SAVE_AT + 80);
         self.asm.add_imm(64, Reg::SP, Reg::SP, FRAME_SIZE as u32);
         self.asm.ret();
+    }
+
+    /// The direct link: ask the dispatcher for the successor's code and
+    /// branch to it, or fall through into the frame teardown below.
+    ///
+    /// Every way out of a block arrives here with its [`status`] in `x0` — the
+    /// three terminators, the spent pad above, and the fault sequence — and
+    /// the reason it is *every* way out rather than the two that can chain is
+    /// that the thunk is what closes the block off: it publishes the exit
+    /// boundary, drains the guest's stores against the block cache and counts
+    /// what retired.
+    ///
+    /// `BLR` overwrites `X30`, which the prologue has already saved and the
+    /// epilogue reloads; the link itself is `BR`, which leaves it alone,
+    /// because the successor's own epilogue is what eventually returns.
+    ///
+    /// [`Ctx::chain`](super::abi::Ctx::chain) being zero is a caller that has
+    /// not enabled linking, and then the whole of it is a store, a load, a
+    /// taken `CBZ` and a load: four instructions once per block exit.
+    fn chain_pad(&mut self) {
+        self.store_ctx(Reg::X0, off::OUT_STATUS);
+        self.load_ctx(IP, off::CHAIN);
+        let off_ = self.asm.cbz(64, IP, true);
+        self.ctx_to_arg();
+        self.asm.blr(IP);
+        let end = self.asm.cbz(64, Reg::X0, true);
+        // The successor's chain entry. `x19`, `x20`, `x21` and `sp` are
+        // already what its body expects — the same context, the same temporary
+        // frame, the same thunk table and the same frame depth — which is the
+        // whole of why a link is a branch and not a call. The thunk guarantees
+        // the frame is long enough for the block it names; it cannot grow one,
+        // because growing it would move it under the code now running.
+        self.asm.br(Reg::X0);
+        self.asm.bind(off_);
+        self.asm.bind(end);
+        self.load_ctx(Reg::X0, off::OUT_STATUS);
     }
 
     /// Leave the block with `code` in `x0`.

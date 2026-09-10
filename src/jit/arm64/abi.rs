@@ -187,6 +187,20 @@ pub struct Ctx {
     pub events: *const Event,
     /// How many [`Ctx::events`] there are, so a range can be clamped.
     pub event_count: u64,
+    /// The direct-link thunk, as a plain address, or zero for no linking.
+    ///
+    /// A `ChainFn` the dispatcher monomorphised over its frontend *and* its
+    /// host, which is why it is here and not a slot of [`Vtable`]: that table
+    /// is built from the host type alone.
+    pub chain: u64,
+    /// What the chain thunk is handed besides this context — the dispatcher's
+    /// own control block, opaque here.
+    pub chain_ctl: *mut c_void,
+    /// The [`status`] the block reached its exit with, parked across the call
+    /// to the chain thunk, which destroys `x0`.
+    pub out_status: u64,
+    /// How many blocks the chain executed inside generated code.
+    pub blocks_run: u64,
 }
 
 /// Byte offsets into [`Ctx`], as generated code bakes them in.
@@ -229,7 +243,25 @@ pub mod off {
     pub const ST_TAG: u64 = 160;
     /// [`Ctx::fast_writes`](super::Ctx::fast_writes).
     pub const FAST_WRITES: u64 = 168;
+    /// [`Ctx::chain`](super::Ctx::chain).
+    pub const CHAIN: u64 = 192;
+    /// [`Ctx::out_status`](super::Ctx::out_status).
+    pub const OUT_STATUS: u64 = 208;
 }
+
+/// The direct-link thunk: what a block calls at its exit instead of returning.
+///
+/// Handed the [`Ctx`] it is running against — [`Ctx::chain_ctl`] is how it
+/// finds everything else — and answers with the host address of the
+/// successor's **chain entry**, or zero for *stop here*.
+///
+/// # Safety
+///
+/// An implementation is entered from machine code, so it must be `extern "C"`,
+/// must not unwind, and must return either zero or the address of a chain
+/// entry in a code buffer that is live and executable — see `rt`'s
+/// `chain_thunk`, which is the only implementation.
+pub type ChainFn = unsafe extern "C" fn(*mut c_void) -> u64;
 
 /// The thunks generated code calls, one table per host type.
 ///
@@ -283,7 +315,7 @@ pub mod vt {
 /// `ctx` must be the pointer generated code was entered with, which
 /// `Engine::run` takes from a live `&mut Ctx` it holds for the whole call.
 #[inline]
-unsafe fn ctx<'a>(ctx: *mut c_void) -> &'a mut Ctx {
+pub(super) unsafe fn ctx_of<'a>(ctx: *mut c_void) -> &'a mut Ctx {
     // SAFETY: the caller's obligation, stated above. The reference does not
     // outlive the thunk, and generated code holds no Rust reference of its
     // own, so this is the only live borrow of the context while it exists.
@@ -299,7 +331,7 @@ unsafe fn ctx<'a>(ctx: *mut c_void) -> &'a mut Ctx {
 /// must be the type the [`Vtable`] was built for, which it is because the two
 /// are set from the same monomorphization.
 #[inline]
-unsafe fn host_of<'a, H>(c: &mut Ctx) -> &'a mut H {
+pub(super) unsafe fn host_of<'a, H>(c: &mut Ctx) -> &'a mut H {
     // SAFETY: the caller's obligation, stated above.
     unsafe { &mut *c.host.cast::<H>() }
 }
@@ -313,7 +345,7 @@ unsafe fn host_of<'a, H>(c: &mut Ctx) -> &'a mut H {
 /// *Initialized*, not meaningful: a slot the executed path never assigned
 /// holds whatever an earlier block left there.
 #[inline]
-unsafe fn temps_of<'a>(c: &Ctx, len: usize) -> &'a [u64] {
+pub(super) unsafe fn temps_of<'a>(c: &Ctx, len: usize) -> &'a [u64] {
     // SAFETY: the caller's obligation, stated above.
     unsafe { core::slice::from_raw_parts(c.temps, len) }
 }
@@ -369,7 +401,7 @@ unsafe extern "C" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo: u64,
     // the `&mut H`, the `&Block` and the `&[Event]` here do not alias. The
     // range is clamped rather than trusted.
     unsafe {
-        let c = ctx(raw);
+        let c = ctx_of(raw);
         let block = &*c.block;
         let all = core::slice::from_raw_parts(c.events, c.event_count as usize);
         let hi = (hi as usize).min(all.len());
@@ -418,7 +450,7 @@ unsafe extern "C" fn get_slot_thunk<H: IrHost + FastMem>(raw: *mut c_void, slot:
     // SAFETY: as `flush_thunk`. `temps_of` is given the block's own temporary
     // count, which is the length `Engine::run` sized the frame to.
     unsafe {
-        let c = ctx(raw);
+        let c = ctx_of(raw);
         let block = &*c.block;
         let slot = RegSlot(slot as u16);
         if shadowed(c, block, slot) {
@@ -443,7 +475,7 @@ unsafe extern "C" fn load_thunk<H: IrHost + FastMem>(
     // outlives the run; `out` is the eight bytes of stack the prologue
     // reserved.
     unsafe {
-        let c = ctx(raw);
+        let c = ctx_of(raw);
         let mem = &*mem;
         match host_of::<H>(c).load(mem, addr) {
             Ok(value) => {
@@ -463,7 +495,7 @@ unsafe extern "C" fn store_thunk<H: IrHost + FastMem>(
 ) -> u64 {
     // SAFETY: as `load_thunk`.
     unsafe {
-        let c = ctx(raw);
+        let c = ctx_of(raw);
         let mem = &*mem;
         match host_of::<H>(c).store(mem, addr, value) {
             Ok(()) => 0,
@@ -475,7 +507,7 @@ unsafe extern "C" fn store_thunk<H: IrHost + FastMem>(
 unsafe extern "C" fn fast_tick_thunk<H: IrHost + FastMem>(raw: *mut c_void) {
     // SAFETY: as `flush_thunk`.
     unsafe {
-        let c = ctx(raw);
+        let c = ctx_of(raw);
         host_of::<H>(c).note_fast_load();
     }
 }
@@ -487,7 +519,7 @@ unsafe extern "C" fn fast_store_thunk<H: IrHost + FastMem>(
 ) {
     // SAFETY: as `flush_thunk`.
     unsafe {
-        let c = ctx(raw);
+        let c = ctx_of(raw);
         host_of::<H>(c).note_fast_store(addr, bytes);
     }
 }
@@ -537,6 +569,13 @@ mod tests {
             off::FAST_WRITES
         );
         assert!(core::mem::offset_of!(Ctx, events) > off::FAST_WRITES as usize);
+        // The direct link's two, which generated code reaches with a scaled
+        // immediate exactly as it reaches the rest.
+        assert_eq!(core::mem::offset_of!(Ctx, chain) as u64, off::CHAIN);
+        assert_eq!(
+            core::mem::offset_of!(Ctx, out_status) as u64,
+            off::OUT_STATUS
+        );
     }
 
     #[test]
@@ -562,6 +601,8 @@ mod tests {
             off::ST_MASK,
             off::ST_TAG,
             off::FAST_WRITES,
+            off::CHAIN,
+            off::OUT_STATUS,
         ] {
             assert!(at.is_multiple_of(8) && at / 8 <= 4095, "{at} is reachable");
         }

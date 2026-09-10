@@ -318,6 +318,19 @@ impl CodeBuf {
         self.syncs
     }
 
+    /// The address the mapping starts at.
+    ///
+    /// The one thing that turns a [`CodeRef`](crate::jit::CodeRef)'s chain
+    /// offset into an address a link can branch to. Exposed rather than kept
+    /// behind [`CodeBuf::entry`] because the resolver — `rt`'s chain thunk —
+    /// runs while the engine that owns this buffer is executing and may not
+    /// borrow it; see [`Linkage`](super::rt::Linkage).
+    #[inline]
+    #[must_use]
+    pub fn base(&self) -> u64 {
+        self.addr
+    }
+
     /// How many bytes are committed.
     #[inline]
     #[must_use]

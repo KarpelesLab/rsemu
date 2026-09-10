@@ -866,6 +866,16 @@ impl Asm {
         self.word(0xd63f_0000 | (u32::from(target.0) << 5));
     }
 
+    /// `BR Rn` — DDI 0487 C6.2, *BR*: an indirect branch that leaves `X30`
+    /// alone, which is what a **direct link** is: on to the successor's chain
+    /// entry, standing in this block's frame, with the return address the
+    /// prologue saved still on the stack.
+    ///
+    /// `1101011 0 0 00 11111 0000 00 Rn(5) 00000`.
+    pub fn br(&mut self, target: Reg) {
+        self.word(0xd61f_0000 | (u32::from(target.0) << 5));
+    }
+
     /// `RET` — DDI 0487 C6.2, *RET*: branch to `X30`.
     pub fn ret(&mut self) {
         self.word(0xd65f_03c0);

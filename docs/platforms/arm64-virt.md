@@ -716,6 +716,78 @@ generated corpus through both policies: a policy that got faster by getting
 wrong should fail a test rather than win a column.
 
 
+### The patched exit became a jump, and what that turned out to be worth
+
+`jit::cache` has patched block exits since it existed, but *following* one only
+ever skipped the hash lookup. The successor was still entered the long way:
+back into Rust, a twenty-eight-field `Ctx` and a six-slot thunk table rebuilt on
+the stack, a six-register prologue, and its epilogue on the way out. The
+predecessor's compiled code now **jumps into the successor's**, past that
+prologue, standing in the frame it already has — direct block linking, which
+Dynamo (Bala, Duesterwald and Banerjia, PLDI 2000) calls fragment linking and
+Smith and Nair's *Virtual Machines* §2.6 calls translation chaining.
+
+Nothing a boundary owes is skipped. `jit::dispatch::Chain::step` is
+`Dispatcher::run`'s loop body **moved**, in the same order: the store drain
+against the block cache, the block budget, the safe-point flag,
+`IrHost::spent`, the epoch, `Frontend::enter` — which on this board is `admit`,
+the entry fetch translation, and the largest single item at a boundary — and the
+cache lookup. A chain may not translate, compile, or grow the shared temporary
+frame, because all three would run while the engine is executing; a successor
+needing any of them ends the chain and the loop enters it the ordinary way.
+
+Twenty guest seconds of the boot, `engine = "jit-host"`, callgrind with
+`--cache-sim=no`, the same binary built twice:
+
+| | returns to Rust | a direct link |
+| --- | --- | --- |
+| **host instructions** | 44 177 649 910 | **43 648 473 272** (−1.20%) |
+| the dispatch loop (`Cpu::advance`, and now also `chain_thunk`) | 8 223 722 029 (18.61%) | **7 738 759 136** (17.73%, −5.90%) |
+| the code the JIT generated | 4 445 563 962 | 4 355 740 373 (−2.02%) |
+| blocks executed | 14 284 095 | 14 284 095 |
+| — reached by a patched exit | 11 165 155 (78.2%) | 11 165 155 |
+| — **entered by a jump** | 0 | **12 162 968 (85.2%)** |
+| guest instructions retired in blocks | 154 233 793 | 154 233 793 |
+| `admit` | 1 686 361 107 | 1 686 361 107 |
+| replaying deferred bookkeeping (`flush_thunk`) | 9 577 604 530 | 9 577 604 530 |
+| reading a guest register (`get_slot_thunk`) | 1 522 827 816 | 1 522 827 816 |
+| the per-block TLB resync (`jit::Tlb::sync`) | 634 833 473 | 634 833 473 |
+
+Every census number is identical and so is `Machine::state_hash`, which is the
+claim worth more than the ratio: a link is a speed knob and never a semantic
+one. More links than patched exits, because a link is taken on a hash hit too —
+the patch is what makes the *lookup* free, and the jump is separate from it.
+
+#### Why it is one percent and not ten
+
+The row this was aimed at is `Cpu::advance` — 18.6% of the run, **576 host
+instructions per block entry** — and the arithmetic says most of that is not the
+re-entry a link removes:
+
+| per block entry | |
+| --- | --- |
+| the `Ctx` and thunk table a call rebuilds | 34 stores |
+| …of which a linked boundary must still re-point | 20 |
+| the prologue and epilogue a jump skips | ~20, less the ~8 the chain pad adds |
+| the engine's own entry and exit bookkeeping | ~20 |
+| **everything else at a boundary** — `admit`, the entry translation, the exit boundary's publish, the store drain, the two TLB plans, `follow` | **~500** |
+
+Measured, the link is worth **34 host instructions of the dispatch row and 6 of
+the generated code**: 40 out of the ~740 a block boundary costs once `admit`
+(118 per block entry) and the two `Tlb::sync` calls the `MemPlan`s go through
+(44) are counted with it. That is the honest size of this technique on this
+guest, and the reason it is not larger is the last row of the table: what a
+block boundary costs here is work the guest itself owes, not scaffolding around
+it. The plans in particular are re-taken on every boundary and almost never
+change — a generation on a `MemPlan` that a chain could compare against would
+take those 44 back with no link involved at all.
+
+What the link *does* change structurally is that a block boundary is now one
+call into Rust rather than two frames and a dispatcher round trip, which is
+where §9.1's fourth mechanism — guest registers kept in host registers across a
+boundary — would have to start.
+
+
 ## Two processors
 
 [`machines/arm64-virt-smp.machine`](../../machines/arm64-virt-smp.machine) is

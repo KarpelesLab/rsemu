@@ -99,4 +99,4 @@ mod tests;
 
 pub use buf::{CodeBuf, DEFAULT_CAPACITY};
 pub use compile::{Compiled, Refusal, Regs, compile, compile_with, compiles};
-pub use rt::{Ctx, Engine, EngineStats, Event, Vtable};
+pub use rt::{ChainFn, Ctx, Engine, EngineStats, Event, Linkage, Vtable};

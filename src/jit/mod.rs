@@ -28,6 +28,16 @@
 //! for. [`FastMem`] has the argument; the interesting half of it is what a host
 //! with a *guest* MMU owes on top of a bare one.
 //!
+//! The second mechanism is now finished rather than half-done.
+//! [`BlockCache`] has patched exits since it existed, but *following* one
+//! still meant returning to Rust and entering the successor through a fresh
+//! context, a fresh thunk table and a fresh host frame. A **direct link** is
+//! the patched exit reaching generated code: the predecessor jumps into the
+//! successor, and only what a boundary genuinely owes — the tick allowance,
+//! the safe point, the store drain, the epoch and the guest's own entry work —
+//! happens in between, in one call back into [`Chain`]. What that is worth,
+//! and what it is not worth, is in `docs/platforms/arm64-virt.md`.
+//!
 //! §9.1's **fourth** mechanism — *"superblocks / traces — merge across direct
 //! branches, keep guest registers in host registers across block boundaries
 //! within a trace"* — is not here, and that is where it belongs: merging is a
@@ -196,6 +206,11 @@ pub use x86 as host;
 pub use arm64 as host;
 
 pub use cache::{BlockCache, BlockId, CacheStats, CodeRef, DEFAULT_CAPACITY, EXITS};
+#[cfg(any(
+    all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+    all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+))]
+pub use dispatch::{Chain, Step};
 pub use dispatch::{
     DirtyPages, DispatchStats, Dispatcher, Entry, Frontend, Run, Stop, StoreLog, Translation,
 };
