@@ -277,6 +277,25 @@
 //! to `MemAttrs` on every access), RISC-V's `reservation`, the m68k's
 //! prefetch queue.
 //!
+//! ### What the *replay* actually reads out of one, which is less
+//!
+//! Recorded while pricing decision 2, and left as a note rather than acted on.
+//! All three engines that run lifted code — `cpu::arm::a64::engine`,
+//! `cpu::x86::engine`, `cpu::riscv::engine` — read **only [`InsnStart::pc`]
+//! and [`InsnStart::next_pc`]** in [`IrHost::insn_start`]. Nothing reads
+//! [`InsnStart::ticks`] at run time (the verifier checks it, and three test
+//! hosts log it), and [`InsnStart::live`] is read on the fault and publish
+//! paths rather than at the boundary.
+//!
+//! That matters because finding the record is **nine of the thirty-eight host
+//! instructions a boundary event costs**: a `Vec` deref, a bounds check, a
+//! multiply by 48 and two loads, per guest instruction. A replay event that
+//! carried `pc` and `next_pc` itself would remove all of it — except that
+//! [`IrHost::insn_start`] takes `&InsnStart`, so the record has to be found
+//! anyway for the call. Narrowing that seam is what would finish the job, and
+//! it is a seam change rather than a backend one, which is why it is written
+//! down here instead of done.
+//!
 //! ## 4. A mode change is a barrier, not a call
 //!
 //! ARM banks `r13`/`r14` per mode, ARMv7-M swaps `sp` between MSP and PSP, the
