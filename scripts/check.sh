@@ -49,6 +49,9 @@
 #   fuzz     `cargo fuzz build` (needs a nightly and cargo-fuzz)
 #   long     the engine-divergence long run (needs a fetched arm64 kernel for
 #            its real leg; nightly in CI, not in --all)
+#   qemu     ROADMAP.md phase 8's other half: rsemu against QEMU on the same
+#            guest, wall clock, black-box (needs a fetched kernel and a
+#            qemu-system on PATH; minutes per repetition, so not in --all)
 #
 # `combos` is the one that is not a copy of an existing CI step. Cargo features
 # are additive, so `--all-features` compiles every conjunction of them — but it
@@ -69,7 +72,7 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 
-STAGES=(fast test wasm combos crosshost wasm-threads sweep fuzz long)
+STAGES=(fast test wasm combos crosshost wasm-threads sweep fuzz long qemu)
 DEFAULT_STAGES=(fast test wasm combos)
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -637,6 +640,44 @@ stage_long_x86() {
     cargo test --release --features "$LONGRUN_FEATURES" \
       --test engine_longrun -- --ignored --nocapture --test-threads=1 \
       a_real_x86_linux_boot_agrees_across_the_engines
+}
+
+# ROADMAP.md phase 8's gate is two claims and the tree only ever held one of
+# them: a published benchmark suite, and **within 2x of QEMU wall-clock**. Every
+# performance number before this stage was self-referential -- callgrind against
+# our own previous baseline, which can say whether a run got faster and never
+# whether it is fast. `scripts/bench-vs-qemu.sh` is the external reference and
+# `docs/testing/benchmarks.md` is what it published.
+#
+# Not in `--all` and not in the per-commit set. One repetition of the arm64 leg
+# is a minute and a half of wall clock and the x86 leg is a great deal more, so
+# this is a stage somebody runs on purpose. It is also the only stage whose
+# result is a *number* rather than a pass: it prints the ratio and exits 0
+# either way, because the gate is a judgement about that number and a script
+# that failed the build at 2.01x would be asserting a precision nobody has.
+#
+# It skips itself, loudly, without a qemu-system or a fetched kernel.
+# RSEMU_BENCH_REQUIRED=1 turns those skips into failures for a runner that
+# installed both on purpose, exactly as RSEMU_CROSSHOST_REQUIRED does.
+stage_qemu() {
+  local reps="${RSEMU_BENCH_REPS:-5}"
+  # `RSEMU_BENCH_GUEST=arm64` is how somebody re-measures one leg without
+  # spending the x86 one's hour on it -- the arm64 leg is minutes and the x86
+  # leg is not, and a knob that makes the cheap half runnable is the difference
+  # between a stage that gets used and a stage that gets skipped.
+  local guest="${RSEMU_BENCH_GUEST:-all}"
+  if ! command -v qemu-system-aarch64 >/dev/null 2>&1 &&
+     ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+    if [ -n "${RSEMU_BENCH_REQUIRED:-}" ]; then
+      record "FAIL  qemu comparison -- RSEMU_BENCH_REQUIRED is set, so this had to run"
+      FAILED=$((FAILED + 1))
+    else
+      record "skip  qemu comparison (no qemu-system on PATH)"
+    fi
+    return 0
+  fi
+  run "qemu comparison (${guest}, ${reps} reps, interleaved)" \
+    scripts/bench-vs-qemu.sh --guest "$guest" --reps "$reps"
 }
 
 stage_fuzz() {
