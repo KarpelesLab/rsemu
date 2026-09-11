@@ -347,6 +347,13 @@ pub struct Machine {
     /// threading mode, and attaching one has to be able to fail — see
     /// [`Machine::set_recorder`].
     recorder: Option<Arc<Recorder>>,
+    /// Whether a debugger currently has the machine stopped (§4.3).
+    ///
+    /// Not machine state and never snapshotted: it belongs to whatever is
+    /// debugging, and a snapshot loaded by a plain `rsemu run` is not halted.
+    /// It is kept here only so a device realized — or a debugger attached —
+    /// after the fact can be told what it missed.
+    debug_halted: bool,
 }
 
 /// The parts a realizer hands to [`Machine::assemble`].
@@ -390,6 +397,7 @@ impl Machine {
             shape: parts.shape,
             deferred: parts.deferred,
             recorder: None,
+            debug_halted: false,
         }
     }
 
@@ -495,6 +503,38 @@ impl Machine {
         // where a caller can see it.
         let _ = self.sched.apply_clock_requests();
         self.sweep();
+    }
+
+    /// Tell every device that a debugger has stopped the machine, or let it go.
+    ///
+    /// The producing end of [`Device::debug_halt`], and the only one. A gdb
+    /// stub halts a machine by *not calling the run loop* — there is no flag
+    /// anywhere below `host/` that says so, and there is no wire to drive
+    /// because nothing inside the machine knows. So the host that stopped it
+    /// says so here, and the board's debug unit turns that into the freeze
+    /// lines its `DBGMCU_APB1_FZ` bits ask for.
+    ///
+    /// Broadcast in **declaration order**, like [`reset`](Machine::reset) and
+    /// for the same reason, with the deferred queue drained after each device.
+    /// Idempotent: telling a machine twice that it is halted changes nothing,
+    /// which is what lets a session loop call this every turn from whatever it
+    /// already knows rather than having to detect an edge.
+    pub fn set_debug_halted(&mut self, halted: bool) {
+        if self.debug_halted == halted {
+            return;
+        }
+        self.debug_halted = halted;
+        for i in 0..self.devices.len() {
+            let device = Arc::clone(&self.devices[i].device);
+            device.debug_halt(halted);
+            self.deferred.drain();
+        }
+    }
+
+    /// Whether a debugger has the machine stopped.
+    #[must_use]
+    pub fn debug_halted(&self) -> bool {
+        self.debug_halted
     }
 
     /// Push every device's host-visible state out to the host.

@@ -46,6 +46,16 @@ ordinary devices with wire sinks and sources — the core knows nothing about
   core halts, and when the APB clock stops, so it cannot be a counter something
   decrements from a register access. `st.iwdg` and `st.wwdg` are lazily-advanced
   devices that publish the tick their counter next does something at.
+- **Except when a debugger says otherwise, which needs a seam of its own.** The
+  one thing that does stop an IWDG is `DBGMCU_APB1_FZ.DBG_IWDG_STOP` while the
+  core is halted, and without it a breakpoint in the loop that kicks the dog
+  resets the board under you. "The core is halted" is not guest state, is not a
+  wire anything inside the machine drives, and is not `MemAttrs::debug` — that
+  says *this access* is a debugger's, not *the machine is stopped*. It arrives
+  on `Device::debug_halt`, which `Machine::set_debug_halted` broadcasts and the
+  gdb session drives once a turn before it lets the machine move; `st.dbgmcu`
+  is the only device in the tree that overrides it, and it turns the level into
+  one output pin per freeze bit.
 - **A device that resets the machine must let go of its own lock first.** A
   reset reaches every device on the machine, including the one that asked for
   it, so both watchdogs decide inside a short critical section, release the

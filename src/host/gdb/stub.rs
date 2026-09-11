@@ -1062,6 +1062,9 @@ mod tests {
         steps: usize,
         resumed: usize,
         began: usize,
+        /// Every level [`DebugTarget::set_debug_halted`] has been given, in
+        /// order. A machine turns these into `Device::debug_halt`.
+        halted: Vec<bool>,
         /// What `qXfer:memory-map:read` answers. Empty means the target has no
         /// map, which is the default and the pre-existing behaviour.
         map: Vec<MemRegion>,
@@ -1115,6 +1118,7 @@ mod tests {
                 steps: 0,
                 resumed: 0,
                 began: 0,
+                halted: Vec::new(),
                 map: Vec::new(),
             }
         }
@@ -1222,6 +1226,9 @@ mod tests {
         fn begin_resume(&mut self) {
             self.began += 1;
         }
+        fn set_debug_halted(&mut self, halted: bool) {
+            self.halted.push(halted);
+        }
         fn resume(&mut self) -> TargetResult<Option<Stop>> {
             self.resumed += 1;
             if self.resumed >= 3 {
@@ -1238,6 +1245,76 @@ mod tests {
             // typed on is the whole reason it is a parameter.
             (command == "ping").then(|| format!("pong from {cpu}\n"))
         }
+    }
+
+    /// The session tells the target when it has the machine stopped.
+    ///
+    /// The producing half of the `DBGMCU` freeze path: `DBG_IWDG_STOP` means
+    /// "stopped when core is halted", and nothing below `host/` knows a
+    /// debugger has the core — a halt here is the run loop not being called.
+    /// So the level has to be *pushed*, once a turn, before
+    /// [`GdbServer::poll`] lets the machine move. This drives a real listener
+    /// over loopback because that is where the level is computed.
+    #[test]
+    fn a_session_tells_its_target_when_it_has_the_machine_stopped() {
+        use crate::host::gdb::packet::frame;
+        use crate::host::gdb::{GdbServer, Progress};
+        use std::io::Write;
+
+        let mut server = GdbServer::bind(":0").expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        client.set_nodelay(true).expect("nodelay");
+        let mut target = FakeTarget::new();
+
+        /// Turn the session over until `target` has been told `want`, or give
+        /// up. Bounded rather than a spin: a failure here must be a failing
+        /// test, not a hung one.
+        fn pump(server: &mut GdbServer, target: &mut FakeTarget, want: bool) -> bool {
+            for _ in 0..200 {
+                server.poll(target).expect("poll");
+                if target.halted.last() == Some(&want) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // Attached and sitting at the prompt: nothing has said `c`, so the
+        // machine is stopped and the target is told so.
+        assert!(pump(&mut server, &mut target, true), "{:?}", target.halted);
+
+        // `c` — and the level has to be false *before* the slice runs, so the
+        // last thing the target heard when `resume` was first called is the
+        // release rather than the halt.
+        let mut wire = Vec::new();
+        frame(b"c", &mut wire);
+        client.write_all(&wire).expect("write");
+        assert!(pump(&mut server, &mut target, false), "{:?}", target.halted);
+        assert!(target.resumed > 0, "the machine never ran");
+
+        // Ctrl-C, which arrives as a bare 0x03 outside a packet.
+        client.write_all(&[0x03]).expect("write");
+        assert!(pump(&mut server, &mut target, true), "{:?}", target.halted);
+
+        // And hanging up releases it, from the halted state it is in now: a
+        // board whose watchdog stayed frozen after its debugger went away
+        // would never reset again.
+        drop(client);
+        let mut detached = false;
+        for _ in 0..200 {
+            if server.poll(&mut target).expect("poll") == Progress::Detached {
+                detached = true;
+                break;
+            }
+        }
+        assert!(detached, "the server never noticed the client hang up");
+        assert_eq!(
+            target.halted.last(),
+            Some(&false),
+            "a detach left the machine halted: {:?}",
+            target.halted
+        );
     }
 
     /// Send one packet and return everything the stub wrote, as text.

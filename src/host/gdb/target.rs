@@ -366,6 +366,19 @@ pub trait DebugTarget {
     /// this is what makes Ctrl-C work.
     fn resume(&mut self) -> TargetResult<Option<Stop>>;
 
+    /// Told whether the session currently has the machine stopped.
+    ///
+    /// Defaults to doing nothing, which is right for a target that is not a
+    /// whole machine. A machine passes it on to its devices, and a board's
+    /// debug unit turns it into the freeze lines an `STM32`'s
+    /// `DBGMCU_APB1_FZ` bits ask for — the reason a breakpoint in a loop that
+    /// kicks the watchdog does not reset the board underneath you.
+    ///
+    /// A level rather than an edge: the session says what it is on every turn
+    /// and the machine ignores a repeat, so no caller has to remember what it
+    /// last said.
+    fn set_debug_halted(&mut self, _halted: bool) {}
+
     /// What is mapped where, for `qXfer:memory-map:read`.
     ///
     /// GDB asks once per session and uses the answer to decide whether a write
@@ -1345,6 +1358,10 @@ impl DebugTarget for MachineTarget<'_> {
                 *slot = here;
             }
         }
+    }
+
+    fn set_debug_halted(&mut self, halted: bool) {
+        self.machine.set_debug_halted(halted);
     }
 
     fn resume(&mut self) -> TargetResult<Option<Stop>> {

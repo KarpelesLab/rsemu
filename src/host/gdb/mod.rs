@@ -254,6 +254,19 @@ impl GdbServer {
         }
 
         if !closed && outcome == Outcome::Continue {
+            // Whatever the packets just decided is what the machine is about
+            // to do, and `drive` is the only thing here that advances virtual
+            // time — so the machine is told *before* it moves rather than
+            // after. A device that freezes while the core is halted (an
+            // STM32's `DBGMCU`, through `Device::debug_halt`) needs the level
+            // in place for the slice, not a turn late.
+            //
+            // A single-step is deliberately not un-halting: `s` is serviced
+            // inside `on_event` above, with the level still where the last
+            // stop left it. That is what the hardware does too — stepping is
+            // halting repeatedly, and a watchdog frozen at a breakpoint stays
+            // frozen while you walk through the loop.
+            target.set_debug_halted(!conn.stub.is_running());
             conn.stub.drive(target, &mut out);
         }
 
@@ -280,6 +293,10 @@ impl GdbServer {
         if closed {
             self.conn = None;
             self.detached = true;
+            // Nothing is holding the core any more, whether the client said
+            // `D` or simply went away. A machine that kept a frozen watchdog
+            // after its debugger hung up would be a machine that never reset.
+            target.set_debug_halted(false);
             return Ok(Progress::Detached);
         }
         if running {

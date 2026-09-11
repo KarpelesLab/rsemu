@@ -405,6 +405,30 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// Return to a documented reset state.
     fn reset(&self, kind: ResetKind);
 
+    /// A debugger has stopped the machine, or let it go again.
+    ///
+    /// Defaults to doing nothing, which is right for every device but the one
+    /// or two on a board that model the **debug unit** — an STM32's `DBGMCU`,
+    /// a Cortex-A's `EDSCR`. Those exist to answer one question the guest
+    /// cannot: *is the core halted right now*, so that the peripherals whose
+    /// freeze bits are set can stop counting. A watchdog that resets the board
+    /// while somebody sits at a breakpoint is the defect this exists to fix.
+    ///
+    /// This is the **only** seam that carries it. "Halted" is not guest state,
+    /// so it is not a register a device can read; it is not a wire, because
+    /// nothing inside the machine drives it; and it is not
+    /// [`MemAttrs::debug`](crate::core::space::MemAttrs), which says *this
+    /// access* came from a debugger rather than *the machine is stopped*. A
+    /// host that stops the machine says so with
+    /// [`Machine::set_debug_halted`](crate::machine::Machine::set_debug_halted),
+    /// which broadcasts here.
+    ///
+    /// Called at a scheduling boundary with the machine stopped, in
+    /// declaration order, exactly as [`reset`](Device::reset) is — so an
+    /// implementation may take its own locks and may drive wires. It is a
+    /// *level*, not an edge: the same value may arrive twice.
+    fn debug_halt(&self, _halted: bool) {}
+
     /// Push everything already accepted from the guest out to the host.
     ///
     /// Defaults to doing nothing, which is right for a device that holds no
