@@ -1311,6 +1311,24 @@ dev-stm32-wdg = []
 # ST RM0351 S14; no emulator source was consulted (ROADMAP.md S1).
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-crc = []
+
+# The STM32 embedded flash interface (src/dev/stm32/flash.rs): the controller
+# at 0x4002_3C00 on an F4 and 0x4002_2000 on an L4, and **the array behind
+# it**. Firmware writes ACR.LATENCY before it raises the clock, and a
+# bootloader or a settings page programs and erases the same window it executes
+# from -- neither of which a read-only `rom` object can answer. The array is
+# published as one container region whose read half is a RamStore (so a fetch
+# never calls into a device) and whose write half is this controller (so a
+# store cannot reach the array without passing CR, the erased-state check and
+# write protection): the directed split core::space::flat already had for a
+# Master System cartridge. Key sequences and the wrong-key lock, PSIZE
+# programming on an F4 and 64-bit double-word programming on an L4, erase at
+# the F4's **unequal** sector sizes (RM0090 Table 5) and the L4's uniform
+# pages, WRP write protection, option bytes with OPTSTRT and the OBL_LAUNCH
+# reset. PCROP and RDP are stored and not enforced; the caches and ECC are not
+# modelled. Written from ST RM0090 §3 and ST RM0351 §3; no emulator source was
+# consulted (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-flash = []
 # The STM32 reset and clock controller (src/dev/stm32/rcc.rs): the chip every
 # vendor startup sequence talks to first, and the one a board cannot fake with
 # RAM. `SystemInit` sets CR.HSEON and spins on HSERDY, sets PLLON and spins on
