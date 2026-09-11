@@ -28,13 +28,17 @@
 //! | SCB | `CPUID`, `ICSR`, `VTOR`, `AIRCR`, `SCR`, `CCR`, `SHPR1-3`, `SHCSR`, `CFSR`, `HFSR`, `MMFAR`, `BFAR`, `CPACR` |
 //! | MPU | eight regions, `RBAR`/`RASR` with sub-region disable and `PRIVDEFENA` |
 //! | FPU | `FPCCR`, `FPCAR`, `FPDSCR` and the read-only `MVFR0`–`MVFR2`, on a part that has one; all six read as zero on a part that does not, and `CPACR.CP10`/`CP11` are then RAZ/WI so a `VMOV` raises `NOCP` |
-//! | DWT / ITM / FPB / TPIU | not implemented; reads return zero and writes are dropped |
+//! | DWT | `CYCCNT` and the `CTRL` bits that gate it; the comparators and the profile counters are not there and `DWT_CTRL` says so |
+//! | Debug | `DEMCR.TRCENA`, because nothing in the DWT answers until it is set |
+//! | ITM / FPB / TPIU | not implemented; reads return zero and writes are dropped |
 //!
 //! # Sources
 //!
 //! DDI 0403 B1.5 (the exception model), B3.2 (the System Control Space), B3.3
-//! (the MPU), B3.4 (the NVIC), B3.5 (SysTick). No emulator source of any
-//! licence was consulted (`ROADMAP.md` §1).
+//! (the MPU), B3.4 (the NVIC), B3.5 (SysTick), C1.6 (`DEMCR`) and C1.8 (the
+//! DWT). The bit-band alias windows are the address map's, DDI 0403 B3.1 and
+//! the Cortex-M3/M4 TRMs' "Bit-banding". No emulator source of any licence
+//! was consulted (`ROADMAP.md` §1).
 
 use core::fmt;
 
@@ -430,6 +434,28 @@ pub struct Sys {
     /// what those bits mean.
     pub syst_calib: u32,
 
+    /// `DEMCR` at `0xE000EDFC` (DDI 0403 C1.6.5).
+    ///
+    /// Only `TRCENA` is implemented. It is the master switch for the whole
+    /// trace block, and the reason it is here rather than read-as-zero is
+    /// the idiom every vendor HAL's microsecond delay is built on: set
+    /// `TRCENA`, set `DWT_CTRL.CYCCNTENA`, then spin on `DWT_CYCCNT`. With
+    /// `TRCENA` dropped the spin never ends and nothing says why.
+    pub demcr: u32,
+    /// `DWT_CTRL` at `0xE0001000` (DDI 0403 C1.8.7).
+    ///
+    /// Held as the whole register: the read-only feature bits
+    /// ([`DWT_CTRL_FIXED`]) are part of the stored value, and a write keeps
+    /// them and takes `CYCCNTENA` from the value.
+    pub dwt_ctrl: u32,
+    /// `DWT_CYCCNT` at `0xE0001004`: core clock cycles, wrapping at 2³².
+    ///
+    /// Driven from the cycles the core charges through the bus
+    /// ([`Sys::tick_cyccnt`]), which is the same tick `SysTick` counts.
+    /// There is no second clock, so the count is deterministic and belongs
+    /// in the snapshot.
+    pub dwt_cyccnt: u32,
+
     /// `MPU_CTRL`.
     pub mpu_ctrl: u32,
     /// `MPU_RNR`.
@@ -492,6 +518,9 @@ impl Sys {
             syst_cvr: 0,
             // NOREF | SKEW.
             syst_calib: (1 << 31) | (1 << 30),
+            demcr: 0,
+            dwt_ctrl: DWT_CTRL_FIXED,
+            dwt_cyccnt: 0,
             mpu_ctrl: 0,
             mpu_rnr: 0,
             mpu_rbar: [0; MPU_REGIONS],
@@ -723,6 +752,94 @@ impl Sys {
 // The register map
 // ---------------------------------------------------------------------------
 
+/// `DEMCR.TRCENA`: the trace block's master enable (DDI 0403 C1.6.5).
+///
+/// Nothing else in `DEMCR` is implemented — there is no halting debug, no
+/// vector catch and no debug monitor — so it is the only writable bit.
+pub const DEMCR_TRCENA: u32 = 1 << 24;
+
+/// `DWT_CTRL.CYCCNTENA`: the cycle counter runs (DDI 0403 C1.8.7).
+pub const DWT_CTRL_CYCCNTENA: u32 = 1 << 0;
+
+/// The read-only part of `DWT_CTRL`: what this DWT does and does not have.
+///
+/// `NUMCOMP` (bits 31:28) zero — no comparators, so no watchpoints and no
+/// `PC` sampling packets. `NOTRCPKT` (27) and `NOEXTTRIG` (26) set — there is
+/// no trace port and no cross-trigger. `NOPRFCNT` (24) set — `DWT_CPICNT`
+/// through `DWT_FOLDCNT` are not implemented and read as zero, and this bit
+/// is how software tells that apart from "implemented and idle". `NOCYCCNT`
+/// (25) is deliberately **clear**: the cycle counter is the one thing here
+/// that is real.
+pub const DWT_CTRL_FIXED: u32 = (1 << 27) | (1 << 26) | (1 << 24);
+
+/// `DWT_CTRL`.
+pub const DWT_CTRL: u32 = 0xe000_1000;
+/// `DWT_CYCCNT`.
+pub const DWT_CYCCNT: u32 = 0xe000_1004;
+/// `DWT_PCSR`, the program counter sample register.
+pub const DWT_PCSR: u32 = 0xe000_101c;
+/// `DEMCR`.
+pub const DEMCR: u32 = 0xe000_edfc;
+
+// ---------------------------------------------------------------------------
+// Bit-banding
+// ---------------------------------------------------------------------------
+
+/// Base of the SRAM bit-band region: the low megabyte of the SRAM map.
+pub const SRAM_BITBAND_BASE: u32 = 0x2000_0000;
+/// Base of the SRAM bit-band alias: thirty-two megabytes at `0x22000000`.
+pub const SRAM_BITBAND_ALIAS: u32 = 0x2200_0000;
+/// Base of the peripheral bit-band region: the low megabyte of the
+/// peripheral map.
+pub const PERIPH_BITBAND_BASE: u32 = 0x4000_0000;
+/// Base of the peripheral bit-band alias: thirty-two megabytes at
+/// `0x42000000`.
+pub const PERIPH_BITBAND_ALIAS: u32 = 0x4200_0000;
+/// How much of the underlying map one alias window covers: one megabyte.
+pub const BITBAND_REGION_LEN: u32 = 0x0010_0000;
+/// How much address space one alias window occupies: thirty-two bytes of
+/// alias per byte of region, so thirty-two megabytes.
+pub const BITBAND_ALIAS_LEN: u32 = BITBAND_REGION_LEN * 32;
+
+/// Where a bit-band alias address points.
+///
+/// The architecture states the mapping in bytes and bits-within-a-byte —
+/// `bit_word_offset = (byte_offset × 32) + (bit_number × 4)` — and this is
+/// that relation read backwards, so `bit` is always `0..=7`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitBand {
+    /// Address of the byte in the bit-band region that holds the bit.
+    pub byte: u32,
+    /// Which bit of that byte, counting from the least significant.
+    pub bit: u32,
+}
+
+/// The bit a bit-band alias address names, or `None` if `addr` is not inside
+/// either alias window.
+///
+/// This is pure address arithmetic and says nothing about whether the part
+/// *has* the alias — [`Config::bit_band`](super::Config::bit_band) decides
+/// that, and a Cortex-M7 answers `None` by never asking.
+#[must_use]
+pub const fn bit_band_target(addr: u32) -> Option<BitBand> {
+    let (alias, region) =
+        if addr >= SRAM_BITBAND_ALIAS && addr - SRAM_BITBAND_ALIAS < BITBAND_ALIAS_LEN {
+            (SRAM_BITBAND_ALIAS, SRAM_BITBAND_BASE)
+        } else if addr >= PERIPH_BITBAND_ALIAS && addr - PERIPH_BITBAND_ALIAS < BITBAND_ALIAS_LEN {
+            (PERIPH_BITBAND_ALIAS, PERIPH_BITBAND_BASE)
+        } else {
+            return None;
+        };
+    let offset = addr - alias;
+    Some(BitBand {
+        byte: region + offset / 32,
+        // Bits [4:2] of the offset. Bits [1:0] are ignored, which is what
+        // makes a byte or halfword access to the alias name the same bit as
+        // the word access containing it.
+        bit: (offset % 32) / 4,
+    })
+}
+
 /// Base of the private peripheral bus.
 pub const PPB_BASE: u32 = 0xe000_0000;
 /// One byte past the private peripheral bus.
@@ -835,8 +952,21 @@ impl Sys {
             // STIR is write-only; a read returns zero rather than faulting.
             0xe000_ef00 => 0,
 
+            // The debug block. Only `DEMCR.TRCENA` is implemented; `DHCSR`,
+            // `DCRSR` and `DCRDR` fall through to the catch-all below and
+            // read as zero, which is what "no halting debug" looks like from
+            // the inside.
+            DEMCR => self.demcr,
+
+            // The DWT. `DWT_PCSR` is not here because its value is not in
+            // `Sys` — the core intercepts it on the way past, because the
+            // only thing that knows the program counter is the core.
+            DWT_CTRL => self.dwt_ctrl,
+            DWT_CYCCNT => self.dwt_cyccnt,
+
             // Everything else inside the PPB: the ID and feature registers,
-            // and the trace and debug blocks this core does not implement.
+            // the DWT's unimplemented profile counters and comparators, and
+            // the ITM, FPB and TPIU blocks this core does not implement.
             _ if in_ppb(word) => 0,
             _ => return None,
         })
@@ -989,10 +1119,49 @@ impl Sys {
                 }
             }
 
+            // `TRCENA` and nothing else: a write that tries to arm vector
+            // catch or the debug monitor is dropped rather than remembered,
+            // so a read never claims a facility that is not there.
+            DEMCR => self.demcr = value & DEMCR_TRCENA,
+
+            // The DWT is behind `TRCENA`. DDI 0403 C1.6.5 makes the trace
+            // block's registers unavailable while it is clear, which is why
+            // every vendor HAL sets it *before* touching `DWT_CTRL` — and
+            // honouring it here is what turns firmware that forgot into a
+            // visible zero rather than a counter that mysteriously works.
+            DWT_CTRL if self.demcr & DEMCR_TRCENA != 0 => {
+                self.dwt_ctrl = DWT_CTRL_FIXED | (value & DWT_CTRL_CYCCNTENA);
+            }
+            // Software writes zero here to restart a measurement; any other
+            // value is equally legal and the counter continues from it.
+            DWT_CYCCNT if self.demcr & DEMCR_TRCENA != 0 => self.dwt_cyccnt = value,
+            DWT_CTRL | DWT_CYCCNT => {}
+
             _ if in_ppb(word) => {}
             _ => return false,
         }
         true
+    }
+
+    /// Whether `DWT_CYCCNT` is counting: both `DEMCR.TRCENA` and
+    /// `DWT_CTRL.CYCCNTENA`, which is the pair firmware sets in that order.
+    #[inline]
+    #[must_use]
+    pub const fn cyccnt_enabled(&self) -> bool {
+        self.demcr & DEMCR_TRCENA != 0 && self.dwt_ctrl & DWT_CTRL_CYCCNTENA != 0
+    }
+
+    /// Advance `DWT_CYCCNT` by `ticks` processor clocks.
+    ///
+    /// The same tick [`Sys::tick_systick`] counts, charged per access through
+    /// the bus by the core — not a second clock, and not a post-hoc table of
+    /// instruction lengths. It wraps at 2³², which is the whole basis of the
+    /// `now - start < n` idiom the counter exists for.
+    pub fn tick_cyccnt(&mut self, ticks: u64) {
+        if !self.cyccnt_enabled() {
+            return;
+        }
+        self.dwt_cyccnt = self.dwt_cyccnt.wrapping_add((ticks & 0xffff_ffff) as u32);
     }
 
     /// One word of an NVIC bitmap, shifted so bit zero is external interrupt

@@ -49,7 +49,10 @@ use super::isa::{
     BitfieldOp, Cond, DpOp, DualMulOp, ExtendOp, HalfMulOp, HintOp, Insn, MemOffset, MiscOp,
     Operand, SatQOp, Shift, ShiftType, Size, decode, is_32bit,
 };
-use super::sys::{Access, Exception, MPU_REGIONS, Sys, ccr, control, exc_return, fsr, in_ppb};
+use super::sys::{
+    Access, BitBand, DWT_PCSR, Exception, MPU_REGIONS, Sys, bit_band_target, ccr, control,
+    exc_return, fsr, in_ppb,
+};
 use super::{Config, xpsr};
 
 #[cfg(feature = "cpu-arm-v7m-fp")]
@@ -436,9 +439,17 @@ impl<'a> Exec<'a> {
         }
     }
 
-    /// Advance SysTick by the cycles this step charged, pending the exception
-    /// if the counter wrapped and `TICKINT` is set.
+    /// Advance SysTick and `DWT_CYCCNT` by the cycles this step charged,
+    /// pending the SysTick exception if its counter wrapped and `TICKINT` is
+    /// set.
+    ///
+    /// Both counters are driven from `used` — the cycles this step actually
+    /// charged through the bus — rather than from a table of instruction
+    /// lengths or anything resembling a wall clock. That is what makes
+    /// `DWT_CYCCNT` deterministic, and it is why there is one clock here and
+    /// not two that can disagree.
     fn tick_time(&mut self) {
+        self.state.sys.tick_cyccnt(self.used);
         if self.state.sys.tick_systick(self.used) && self.state.sys.syst_csr & 0b10 != 0 {
             self.state.sys.set_pending(Exception::SYSTICK, true);
         }
@@ -649,6 +660,9 @@ impl<'a> Exec<'a> {
             return self.read_ppb(addr, bytes);
         }
         self.check_mpu(addr, bytes, Access::Read, privileged)?;
+        if let Some(target) = self.bit_band(addr) {
+            return self.read_bit_band(addr, target, privileged);
+        }
         let attrs = self.attrs.with_privileged(privileged);
         if addr.is_multiple_of(bytes) {
             let width = width_of(bytes);
@@ -684,6 +698,9 @@ impl<'a> Exec<'a> {
             return self.write_ppb(addr, bytes, value);
         }
         self.check_mpu(addr, bytes, Access::Write, privileged)?;
+        if let Some(target) = self.bit_band(addr) {
+            return self.write_bit_band(addr, target, value, privileged);
+        }
         let attrs = self.attrs.with_privileged(privileged);
         if addr.is_multiple_of(bytes) {
             let width = width_of(bytes);
@@ -715,12 +732,131 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // Bit-banding
+    // -----------------------------------------------------------------
+
+    /// The bit `addr` names, if this part has the alias windows and `addr`
+    /// is in one.
+    ///
+    /// Called after the MPU check and before the bus access, which is where
+    /// the hardware puts it: the alias is decoded by the processor's bus
+    /// matrix, downstream of the MPU that lives in the core. So an MPU region
+    /// describing `0x20000000` does *not* describe `0x22000000`, and CMSIS
+    /// setups that bit-band have to cover both — see
+    /// [`Config::with_bit_band`](super::Config::with_bit_band).
+    #[inline]
+    fn bit_band(&self, addr: u32) -> Option<BitBand> {
+        if self.cfg.bit_band {
+            bit_band_target(addr)
+        } else {
+            None
+        }
+    }
+
+    /// Which bit of the *word* holding `target.byte` the alias names, once
+    /// the word is in this core's byte order.
+    ///
+    /// The architecture states the mapping in bytes, and the access this
+    /// makes is a word, so the byte's lane within that word has to be put
+    /// back. Under BE-8 the byte at the word's own address is the most
+    /// significant one, which is the only thing endianness changes here.
+    fn bit_lane(&self, target: BitBand) -> u32 {
+        let byte_in_word = target.byte % 4;
+        let lane = if self.cfg.endian == Endian::Little {
+            byte_in_word
+        } else {
+            3 - byte_in_word
+        };
+        lane * 8 + target.bit
+    }
+
+    /// The word behind a bit-band alias, through the ordinary dispatcher.
+    ///
+    /// `alias` is what goes in `BFAR` if the bus refuses: the instruction
+    /// named the alias, and a fault report that named the target instead
+    /// would point at an address the program never wrote down.
+    fn bit_band_word(&mut self, alias: u32, word: u32, privileged: bool) -> Ex<u32> {
+        let attrs = self.attrs.with_privileged(privileged);
+        match self.space.read(u64::from(word), Width::U32, attrs) {
+            Ok(v) => Ok(self.to_cpu_order(word, Width::U32, v as u32)),
+            Err(_) => Err(self.bus_fault(alias, Access::Read)),
+        }
+    }
+
+    /// Read one bit through a bit-band alias.
+    ///
+    /// The result is zero or one and nothing else, whatever the access width
+    /// was: a byte, halfword or word load from the alias all name the same
+    /// bit and all answer with it, because bits [1:0] of the alias offset
+    /// are not part of the mapping.
+    fn read_bit_band(&mut self, alias: u32, target: BitBand, privileged: bool) -> Ex<u32> {
+        let word = target.byte & !3;
+        let value = self.bit_band_word(alias, word, privileged)?;
+        Ok((value >> self.bit_lane(target)) & 1)
+    }
+
+    /// Write one bit through a bit-band alias.
+    ///
+    /// Bit [0] of the value decides; bits [31:1] are ignored, so writing
+    /// `0x01` and writing `0xFF` do the same thing and so do `0x00` and
+    /// `0x0E`.
+    ///
+    /// # One read and one write, and nothing in between
+    ///
+    /// The read-modify-write goes through the normal dispatcher, so a device
+    /// mapped at the target sees exactly the two accesses it would see from
+    /// an `LDR`/`STR` pair and its read side effects happen exactly once.
+    /// What it must *not* see is another master's access landing between
+    /// them — the architecture makes a bit-band write indivisible — so the
+    /// pair is taken under the space's [`BusLock`](crate::core::space::BusLock),
+    /// the same primitive an x86 `LOCK` prefix and a RISC-V AMO use, which
+    /// carries the barrier at each end as well as the exclusion.
+    ///
+    /// The extra cycle is charged here rather than assumed: this is two bus
+    /// accesses, and cycle accounting in this core is per-access.
+    ///
+    /// The guard borrows the *space* rather than `self`, copying
+    /// `self.space` out first — the same shape `cpu::riscv::exec` and
+    /// `cpu::arm::a64::exec` use, and what leaves `self` free to be borrowed
+    /// mutably underneath it.
+    fn write_bit_band(&mut self, alias: u32, target: BitBand, value: u32, privileged: bool) -> Ex {
+        let word = target.byte & !3;
+        let lane = self.bit_lane(target);
+        let space: &'a AddressSpace = self.space;
+        let _bus = space.bus_lock().acquire();
+        self.cycle(1);
+        let old = self.bit_band_word(alias, word, privileged)?;
+        let new = if value & 1 != 0 {
+            old | (1 << lane)
+        } else {
+            old & !(1 << lane)
+        };
+        let attrs = self.attrs.with_privileged(privileged);
+        let new = self.to_cpu_order(word, Width::U32, new);
+        match self
+            .space
+            .write(u64::from(word), Width::U32, u64::from(new), attrs)
+        {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.bus_fault(alias, Access::Write)),
+        }
+    }
+
     /// Read from the private peripheral bus.
     ///
     /// Sub-word reads take the containing word and extract, which is what the
     /// byte-addressable priority registers need and what the architecture
     /// permits for them (DDI 0403 B3.2.3).
     fn read_ppb(&mut self, addr: u32, bytes: u32) -> Ex<u32> {
+        // `DWT_PCSR` is the one register in the block whose value is not in
+        // `Sys`: it samples the program counter, and the only thing that
+        // knows the program counter is the core. Sampling profilers read it
+        // and nothing else, so intercepting it here costs the hot path
+        // nothing and keeps a derived value out of the snapshot.
+        if addr & !3 == DWT_PCSR {
+            return Ok(extract(self.insn_addr, addr, bytes));
+        }
         let Some(word) = self.state.sys.read_word(addr, self.attrs.debug) else {
             return Err(self.bus_fault(addr, Access::Read));
         };

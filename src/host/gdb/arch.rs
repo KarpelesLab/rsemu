@@ -1940,7 +1940,11 @@ fn v7m_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 #[cfg(feature = "cpu-arm-v7m")]
 pub static V7M: Arch = Arch {
     class: &crate::cpu::arm::v7m::CLASS,
-    verified_version: 1,
+    // 2 re-read against the chunk that gained `DEMCR` and the DWT's live
+    // registers. Those go in with the rest of the system block, well past the
+    // register file and the retire counter below, so every offset here is
+    // where it was.
+    verified_version: 2,
     features: &V7M_FEATURES,
     architecture: Some("arm"),
     regs: &V7M_REGS,

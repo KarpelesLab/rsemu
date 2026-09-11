@@ -11,16 +11,24 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::core::props::{Props, Value};
-use crate::core::space::{AddressSpace, RamStore, Region, UnassignedPolicy};
+use crate::core::space::{
+    AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, RamStore, Region,
+    UnassignedPolicy,
+};
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
-use crate::core::value::Width;
+use crate::core::value::{Endian, Width};
 
 use super::isa::{
     Cond, DpOp, Insn, MemOffset, Operand, ShiftType, Size, decode, decode_imm_shift, is_32bit,
     thumb_expand_imm,
 };
-use super::sys::{Access, Exception, Sys, ccr, exc_return, fsr, shcsr};
+use super::sys::{
+    Access, DEMCR, DEMCR_TRCENA, DWT_CTRL, DWT_CTRL_CYCCNTENA, DWT_CTRL_FIXED, DWT_CYCCNT,
+    DWT_PCSR, Exception, Sys, bit_band_target, ccr, exc_return, fsr, in_ppb, shcsr,
+};
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -35,15 +43,83 @@ const ENTRY: u32 = 0x200;
 const STACK: u32 = 0x1000;
 /// How much RAM a harness gets.
 const RAM: u64 = 0x4000;
+/// Where the harness maps its second RAM: the base of the bit-band region on
+/// a Cortex-M3 or M4, so that the alias at `0x22000000` has something to
+/// alias. A real part puts its SRAM here for exactly that reason.
+const SRAM: u32 = 0x2000_0000;
+/// How much RAM lives at [`SRAM`].
+const SRAM_LEN: u64 = 0x1000;
+/// Where the harness maps its counting register, inside the peripheral
+/// bit-band region.
+const COUNTER: u32 = 0x4002_0000;
+/// One `LDR r0,[r1]` followed by a `B .`, for [`Harness::read_via_cpu`].
+const LOAD_GADGET: u32 = 0x180;
+/// One `STR r0,[r1]` followed by a `B .`, for [`Harness::write_via_cpu`].
+const STORE_GADGET: u32 = 0x184;
+
+/// An MMIO register that counts the accesses it serves.
+///
+/// A bit-band write is a read-modify-write, and the thing worth asserting
+/// about it is that the device underneath sees *one* read and *one* write —
+/// not two reads because the model asked twice, and not a read the debug path
+/// also took.
+#[derive(Debug, Default)]
+struct CountingRegister {
+    value: AtomicU32,
+    reads: AtomicU32,
+    writes: AtomicU32,
+}
+
+impl MemOps for CountingRegister {
+    fn read(&self, _offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        if !attrs.debug {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        dst.copy_from_slice(&self.value.load(Ordering::Relaxed).to_le_bytes());
+        Ok(())
+    }
+
+    fn write(&self, _offset: u64, src: &[u8], _attrs: MemAttrs) -> MemResult {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(src);
+        self.value
+            .store(u32::from_le_bytes(bytes), Ordering::Relaxed);
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A genuine thirty-two-bit register: one width, naturally aligned.
+    ///
+    /// Said deliberately. A bit-band read-modify-write that tried to do its
+    /// work a byte at a time — which the mapping's own arithmetic invites,
+    /// since it is stated in bytes and bits-within-a-byte — would be refused
+    /// here, and most peripheral registers are this shape.
+    fn constraints(&self) -> AccessConstraints {
+        AccessConstraints::word(Width::U32, Endian::Little)
+    }
+}
 
 /// A core with RAM, a vector table, and the given halfwords at [`ENTRY`].
 struct Harness {
     cpu: Arc<ArmV7m>,
     ram: Arc<RamStore>,
+    /// The RAM at [`SRAM`].
+    sram: Arc<RamStore>,
+    /// The register at [`COUNTER`], on a harness built with one.
+    counter: Option<Arc<CountingRegister>>,
 }
 
 impl Harness {
     fn new(cfg: Config, code: &[u16]) -> Harness {
+        Harness::build(cfg, code, false)
+    }
+
+    /// The same harness with a [`CountingRegister`] mapped at [`COUNTER`].
+    fn with_counter(cfg: Config, code: &[u16]) -> Harness {
+        Harness::build(cfg, code, true)
+    }
+
+    fn build(cfg: Config, code: &[u16], counter: bool) -> Harness {
         let ram = Arc::new(RamStore::new(RAM));
         ram.write_at(u64::from(VECTORS), &STACK.to_le_bytes())
             .unwrap();
@@ -59,16 +135,45 @@ impl Harness {
             ram.write_at(u64::from(ENTRY) + (i as u64) * 2, &half.to_le_bytes())
                 .unwrap();
         }
+        // The two one-instruction gadgets `read_via_cpu` and `write_via_cpu`
+        // branch to, each parked behind a `B .` so a step that does not fault
+        // lands somewhere harmless.
+        for (at, insn) in [(LOAD_GADGET, 0x6808u16), (STORE_GADGET, 0x6008)] {
+            ram.write_at(u64::from(at), &insn.to_le_bytes()).unwrap();
+            ram.write_at(u64::from(at) + 2, &0xe7feu16.to_le_bytes())
+                .unwrap();
+        }
+        let sram = Arc::new(RamStore::new(SRAM_LEN));
         let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::FAULT);
         space
             .topology()
             .map(Region::ram("ram", Arc::clone(&ram)), 0)
             .unwrap();
+        space
+            .topology()
+            .map(Region::ram("sram", Arc::clone(&sram)), u64::from(SRAM))
+            .unwrap();
+        let counter = counter.then(|| {
+            let ops = Arc::new(CountingRegister::default());
+            space
+                .topology()
+                .map(
+                    Region::io("counter", 4, Arc::clone(&ops) as Arc<dyn MemOps>),
+                    u64::from(COUNTER),
+                )
+                .unwrap();
+            ops
+        });
         let cpu = Arc::new(ArmV7m::new(cfg));
         cpu.attach_space(Arc::new(space));
         // Consume the reset sequence.
         cpu.step();
-        Harness { cpu, ram }
+        Harness {
+            cpu,
+            ram,
+            sram,
+            counter,
+        }
     }
 
     /// A Cortex-M4 running `code`.
@@ -76,18 +181,89 @@ impl Harness {
         Harness::new(Config::CORTEX_M4, code)
     }
 
+    /// A word of guest state, read out of band rather than through the core.
+    ///
+    /// The private peripheral bus is answered by the core's own system block
+    /// — there is nothing in the address space to read — so it is routed to
+    /// [`Sys`] with the debug flag set, which is what keeps a test's own
+    /// `word` call from clearing `SYST_CSR.COUNTFLAG` under the test.
     fn word(&self, addr: u32) -> u32 {
+        if in_ppb(addr) {
+            return self.cpu.with_sys(|s| s.read_word(addr, true).unwrap_or(0));
+        }
+        let (store, at) = self.store_for(addr);
         let mut v = 0u32;
         for k in 0..4 {
-            v |= u32::from(self.ram.read_u8(u64::from(addr) + k).unwrap()) << (8 * k);
+            v |= u32::from(store.read_u8(at + k).unwrap()) << (8 * k);
         }
         v
     }
 
     fn set_word(&self, addr: u32, value: u32) {
-        self.ram
-            .write_at(u64::from(addr), &value.to_le_bytes())
-            .unwrap();
+        if in_ppb(addr) {
+            self.cpu.with_sys(|s| s.write_word(addr, value));
+            return;
+        }
+        let (store, at) = self.store_for(addr);
+        store.write_at(at, &value.to_le_bytes()).unwrap();
+    }
+
+    /// Which backing store holds `addr`, and at what offset.
+    fn store_for(&self, addr: u32) -> (&Arc<RamStore>, u64) {
+        if addr >= SRAM {
+            (&self.sram, u64::from(addr - SRAM))
+        } else {
+            (&self.ram, u64::from(addr))
+        }
+    }
+
+    /// Load a word from `addr` **through the core**, so the MPU, the private
+    /// peripheral bus and the bit-band alias all apply.
+    ///
+    /// One real `LDR`, not a back door: the whole point of the bit-band tests
+    /// is what the core's own data path does with an address, and a harness
+    /// that reached around it would test nothing.
+    fn read_via_cpu(&self, addr: u32) -> u32 {
+        self.via_cpu(LOAD_GADGET, addr, 0).0
+    }
+
+    /// Store `value` to `addr` through the core. See [`Harness::read_via_cpu`].
+    fn write_via_cpu(&self, addr: u32, value: u32) {
+        let (_, faulted) = self.via_cpu(STORE_GADGET, addr, value);
+        assert!(!faulted, "the store to {addr:#x} faulted");
+    }
+
+    /// Whether a load from `addr` through the core faults.
+    fn read_via_cpu_faults(&self, addr: u32) -> bool {
+        self.via_cpu(LOAD_GADGET, addr, 0).1
+    }
+
+    /// Run one gadget with `r1 = addr` and `r0 = value`, restoring the
+    /// registers and any fault bookkeeping afterwards so the caller can do it
+    /// again.
+    fn via_cpu(&self, gadget: u32, addr: u32, value: u32) -> (u32, bool) {
+        let saved = self.cpu.regs();
+        self.cpu.set_reg(0, value);
+        self.cpu.set_reg(1, addr);
+        self.cpu.set_pc(gadget);
+        self.cpu.step();
+        let out = self.cpu.reg(0);
+        // "Did it fault" is asked of the exception the step entered rather
+        // than of the bus-fault counter: an MPU refusal is a MemManage and
+        // never reaches the bus, so the counter would say no.
+        let faulted = self.cpu.current_exception() != Exception::THREAD;
+        self.cpu.set_regs(saved);
+        if faulted {
+            // A handler is active and `CFSR` holds why. Neither is what the
+            // caller asked about, so neither is left behind for the next call
+            // to trip over.
+            self.cpu.with_sys(|s| {
+                s.cfsr = 0;
+                s.hfsr = 0;
+                s.active = [0; Exception::COUNT / 32];
+            });
+        }
+        (out, faulted)
     }
 }
 
@@ -868,9 +1044,13 @@ fn the_configurable_faults_are_enabled_by_shcsr_and_nothing_else() {
 #[test]
 fn an_unimplemented_ppb_register_reads_as_zero_rather_than_faulting() {
     let mut sys = Sys::new(CPUID_CORTEX_M4, 8, 8);
-    // The DWT's cycle counter: firmware probes for it, and a fault would be
-    // a worse answer than "not present".
-    assert_eq!(sys.read_word(0xe000_1004, false), Some(0));
+    // The ITM's trace enable: firmware probes for it, and a fault would be a
+    // worse answer than "not present".
+    assert_eq!(sys.read_word(0xe000_0e00, false), Some(0));
+    // The DWT's profile counters, which `DWT_CTRL.NOPRFCNT` says are not
+    // there — so software can tell "absent" from "implemented and idle".
+    assert_eq!(sys.read_word(0xe000_1008, false), Some(0));
+    assert_ne!(sys.read_word(DWT_CTRL, false).unwrap() & (1 << 24), 0);
     // Outside the PPB there is nothing to answer with.
     assert_eq!(sys.read_word(0x2000_0000, false), None);
 }
@@ -1368,4 +1548,385 @@ fn width_matches_the_fetch_the_decoder_would_ask_for() {
     assert_eq!(Insn::width_of(0x2042), 2);
     assert_eq!(Insn::width_of(0xf8d0), 4);
     assert_eq!(Width::U16.bytes(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// The DWT cycle counter (DDI 0403 C1.6.5 and C1.8.7)
+// ---------------------------------------------------------------------------
+
+/// `n` `NOP`s.
+fn nops(n: usize) -> Vec<u16> {
+    alloc::vec![0xbf00u16; n]
+}
+
+/// The two writes every vendor HAL makes before it reads `DWT_CYCCNT`, in the
+/// order it makes them: the trace block first, then the counter.
+fn enable_cyccnt(h: &Harness) {
+    h.set_word(DEMCR, DEMCR_TRCENA);
+    h.set_word(DWT_CTRL, DWT_CTRL_CYCCNTENA);
+}
+
+/// Where [`cyccnt_delay_loop`] parks once its wait is over.
+const PARK_PC: u32 = ENTRY + 12;
+
+/// The idiom this whole register exists for, as Thumb:
+///
+/// ```text
+///     ldr  r1, =DWT_CYCCNT
+///     ldr  r0, [r1]
+/// loop:
+///     ldr  r2, [r1]
+///     subs r2, r2, r0
+///     cmp  r2, #n
+///     blo  loop
+/// park:
+///     b    park
+/// ```
+///
+/// With the counter pinned at zero `r2` is always zero and `blo` is always
+/// taken, which is the silent hang the register's absence caused.
+fn cyccnt_delay_loop(n: u16) -> Vec<u16> {
+    assert!(n <= 0xff, "`CMP Rn,#imm8` carries eight bits");
+    alloc::vec![
+        0x4903,     // ldr  r1, [pc, #12]
+        0x6808,     // ldr  r0, [r1]
+        0x680a,     // ldr  r2, [r1]
+        0x1a12,     // subs r2, r2, r0
+        0x2a00 | n, // cmp  r2, #n
+        0xd3fb,     // blo  -10
+        0xe7fe,     // b    .
+        0xbf00,     // nop, to align the literal
+        (DWT_CYCCNT & 0xffff) as u16,
+        (DWT_CYCCNT >> 16) as u16,
+    ]
+}
+
+#[test]
+fn cyccnt_is_frozen_until_trcena_and_cyccntena_are_both_set() {
+    let h = Harness::m4(&[0xbf00, 0xbf00, 0xbf00]);
+    h.cpu.step();
+    h.cpu.step();
+    assert_eq!(h.word(DWT_CYCCNT), 0);
+    // `TRCENA` alone is not enough, and — the half that bites — neither is
+    // `CYCCNTENA` alone, because a write to `DWT_CTRL` with the trace block
+    // off does not stick.
+    h.set_word(DWT_CTRL, DWT_CTRL_CYCCNTENA);
+    assert_eq!(h.word(DWT_CTRL) & DWT_CTRL_CYCCNTENA, 0);
+    h.cpu.step();
+    assert_eq!(h.word(DWT_CYCCNT), 0);
+
+    h.set_word(DEMCR, DEMCR_TRCENA);
+    assert_eq!(h.word(DEMCR), DEMCR_TRCENA);
+    h.set_word(DWT_CTRL, DWT_CTRL_CYCCNTENA);
+    assert_eq!(h.word(DWT_CTRL), DWT_CTRL_FIXED | DWT_CTRL_CYCCNTENA);
+    h.cpu.step();
+    assert!(h.word(DWT_CYCCNT) > 0);
+}
+
+#[test]
+fn cyccnt_advances_by_the_instruction_cycle_count() {
+    // The counter is the core's own tick and not a second clock: whatever
+    // `run` says it charged through the bus is exactly what `DWT_CYCCNT`
+    // moved by.
+    let h = Harness::m4(&nops(100));
+    enable_cyccnt(&h);
+    let before = h.word(DWT_CYCCNT);
+    let cycles = h.cpu.run(100);
+    assert!(cycles > 0);
+    assert_eq!(u64::from(h.word(DWT_CYCCNT).wrapping_sub(before)), cycles);
+}
+
+#[test]
+fn a_cyccnt_busy_wait_terminates() {
+    let h = Harness::m4(&cyccnt_delay_loop(64));
+    enable_cyccnt(&h);
+    // Stepping rather than `run(10_000)`: the loop parks on a `B .`, which
+    // `run` would happily spin on for the rest of the budget, so "did it
+    // finish" has to be asked of the program counter.
+    let mut consumed = 0u64;
+    while consumed < 10_000 && h.cpu.pc() != PARK_PC {
+        consumed += h.cpu.step();
+    }
+    assert!(consumed < 10_000, "the wait loop must exit");
+    assert_eq!(h.cpu.pc(), PARK_PC);
+    // It waited for what it asked for, and not by accident of a counter that
+    // jumped.
+    assert!(h.cpu.reg(2) >= 64, "r2 = {}", h.cpu.reg(2));
+}
+
+#[test]
+fn a_cyccnt_busy_wait_hangs_without_the_counter() {
+    // The negative half, and the bug this register closes: the same program
+    // with the trace block left off never reaches its park.
+    let h = Harness::m4(&cyccnt_delay_loop(64));
+    let mut consumed = 0u64;
+    while consumed < 2_000 && h.cpu.pc() != PARK_PC {
+        consumed += h.cpu.step();
+    }
+    assert_ne!(h.cpu.pc(), PARK_PC);
+}
+
+#[test]
+fn writing_cyccnt_restarts_it_from_the_written_value() {
+    let h = Harness::m4(&nops(64));
+    enable_cyccnt(&h);
+    h.set_word(DWT_CYCCNT, 0xffff_fff0);
+    assert_eq!(h.word(DWT_CYCCNT), 0xffff_fff0);
+    let used = h.cpu.run(32);
+    assert!(used > 0x10, "the run has to be long enough to wrap");
+    // Wrapping at 2^32 is the whole basis of `now - start < n`, so it is
+    // asserted rather than assumed.
+    let now = h.word(DWT_CYCCNT);
+    assert_eq!(now, 0xffff_fff0u32.wrapping_add(used as u32));
+    assert!(now < 0xffff_fff0, "the counter must have wrapped past zero");
+}
+
+#[test]
+fn cyccnt_is_write_ignored_while_the_trace_block_is_off() {
+    let mut sys = Sys::new(CPUID_CORTEX_M4, 8, 8);
+    sys.write_word(DWT_CYCCNT, 0x1234_5678);
+    assert_eq!(sys.read_word(DWT_CYCCNT, false), Some(0));
+    sys.write_word(DEMCR, DEMCR_TRCENA);
+    sys.write_word(DWT_CYCCNT, 0x1234_5678);
+    assert_eq!(sys.read_word(DWT_CYCCNT, false), Some(0x1234_5678));
+}
+
+#[test]
+fn demcr_keeps_trcena_and_drops_what_is_not_implemented() {
+    let mut sys = Sys::new(CPUID_CORTEX_M4, 8, 8);
+    // Vector catch and the debug monitor are not modelled, so a read must not
+    // claim them back.
+    sys.write_word(DEMCR, DEMCR_TRCENA | (1 << 16) | 1);
+    assert_eq!(sys.read_word(DEMCR, false), Some(DEMCR_TRCENA));
+}
+
+#[test]
+fn dwt_ctrl_advertises_exactly_what_is_there() {
+    let mut sys = Sys::new(CPUID_CORTEX_M4, 8, 8);
+    let ctrl = sys.read_word(DWT_CTRL, false).unwrap();
+    assert_eq!(ctrl >> 28, 0, "NUMCOMP: no comparators");
+    assert_eq!(ctrl & (1 << 25), 0, "NOCYCCNT clear: the counter is real");
+    assert_ne!(
+        ctrl & (1 << 24),
+        0,
+        "NOPRFCNT set: the profile counters are not"
+    );
+}
+
+#[test]
+fn dwt_pcsr_samples_the_program_counter() {
+    // A host-side sampling profiler reads this and nothing else. It is the
+    // one register in the block whose value is not in `Sys`.
+    let h = Harness::m4(&[0xbf00]);
+    assert_eq!(h.read_via_cpu(DWT_PCSR), LOAD_GADGET);
+}
+
+#[test]
+fn cyccnt_survives_save_and_load() {
+    let h = Harness::m4(&nops(16));
+    enable_cyccnt(&h);
+    h.cpu.run(20);
+    let counted = h.word(DWT_CYCCNT);
+    assert!(counted > 0);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name).unwrap();
+    let mut writer = StateWriter::new(shape);
+    {
+        let mut chunk = writer.chunk("cpu", CLASS.name, CLASS.version).unwrap();
+        Device::save(h.cpu.as_ref(), &mut chunk).unwrap();
+    }
+    let bytes = writer.to_vec().unwrap();
+
+    let restored = ArmV7m::new(Config::CORTEX_M4);
+    let reader = StateReader::new(&bytes).unwrap();
+    let migrations = Migrations::new();
+    let chunk = reader
+        .load("cpu", CLASS.name, CLASS.version, &migrations)
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+
+    assert_eq!(restored.with_sys(|s| s.dwt_cyccnt), counted);
+    assert_eq!(restored.with_sys(|s| s.demcr), DEMCR_TRCENA);
+    assert_eq!(
+        restored.with_sys(|s| s.dwt_ctrl),
+        DWT_CTRL_FIXED | DWT_CTRL_CYCCNTENA
+    );
+    // And it keeps counting on the far side, from where it left off.
+    assert!(restored.with_sys(|s| s.cyccnt_enabled()));
+}
+
+// ---------------------------------------------------------------------------
+// Bit-banding (Cortex-M3/M4 TRM "Bit-banding")
+// ---------------------------------------------------------------------------
+
+/// The alias address of bit `bit` of the byte at `addr`, spelled the way the
+/// manual spells it rather than the way [`bit_band_target`] reads it back.
+fn alias_of(addr: u32, bit: u32) -> u32 {
+    let (region, alias) = if addr >= 0x4000_0000 {
+        (0x4000_0000u32, 0x4200_0000u32)
+    } else {
+        (0x2000_0000u32, 0x2200_0000u32)
+    };
+    alias + (addr - region) * 32 + bit * 4
+}
+
+#[test]
+fn the_bit_band_mapping_is_its_own_inverse() {
+    // `bit_word_addr = base + (byte_offset * 32) + (bit_number * 4)`, read
+    // backwards. Both windows, both ends, and the bits below a word that make
+    // a byte access to the alias name the same bit.
+    for (region, alias) in [(0x2000_0000u32, 0x2200_0000u32), (0x4000_0000, 0x4200_0000)] {
+        for byte in [0u32, 1, 3, 0x10, 0x2_0000, 0x000f_ffff] {
+            for bit in 0..8u32 {
+                let at = alias_of(region + byte, bit);
+                let target = bit_band_target(at).unwrap();
+                assert_eq!(target.byte, region + byte);
+                assert_eq!(target.bit, bit);
+                // Bits [1:0] of the alias offset are not part of the mapping.
+                assert_eq!(bit_band_target(at + 3).unwrap(), target);
+            }
+        }
+        // One past the end of the window is not an alias any more.
+        assert!(bit_band_target(alias + 0x0200_0000).is_none());
+        assert!(bit_band_target(alias - 1).is_none());
+    }
+    assert!(
+        bit_band_target(0x2000_0000).is_none(),
+        "the region is not the alias"
+    );
+}
+
+#[test]
+fn reading_a_bit_band_alias_returns_the_bit() {
+    let h = Harness::m4(&[0xbf00]);
+    h.set_word(0x2000_0010, 0b1010);
+    // Alias of byte 0x10, bit 1 = 0x2200_0000 + 0x10*32 + 1*4.
+    assert_eq!(alias_of(0x2000_0010, 1), 0x2200_0204);
+    assert_eq!(h.read_via_cpu(0x2200_0204), 1);
+    assert_eq!(h.read_via_cpu(0x2200_0200), 0);
+    // The bit lives in the byte the arithmetic names, not in the word: bit 1
+    // of byte 0x11 is bit 9 of the word at 0x2000_0010.
+    h.set_word(0x2000_0010, 1 << 9);
+    assert_eq!(h.read_via_cpu(alias_of(0x2000_0011, 1)), 1);
+    assert_eq!(h.read_via_cpu(alias_of(0x2000_0010, 1)), 0);
+}
+
+#[test]
+fn writing_a_bit_band_alias_sets_or_clears_exactly_one_bit() {
+    let h = Harness::m4(&[0xbf00]);
+    h.set_word(0x2000_0010, 0xffff_ffff);
+    h.write_via_cpu(0x2200_0204, 0); // clear bit 1
+    assert_eq!(h.word(0x2000_0010), 0xffff_fffd);
+    h.write_via_cpu(0x2200_0204, 0x8000_0001); // only bit 0 of the value matters
+    assert_eq!(h.word(0x2000_0010), 0xffff_ffff);
+    // And `0x0E` is a zero, for the same reason.
+    h.write_via_cpu(0x2200_0204, 0x0000_000e);
+    assert_eq!(h.word(0x2000_0010), 0xffff_fffd);
+    // Nothing around it moved.
+    assert_eq!(h.word(0x2000_000c), 0);
+    assert_eq!(h.word(0x2000_0014), 0);
+}
+
+#[test]
+fn a_byte_access_to_the_alias_behaves_like_the_word_access_containing_it() {
+    // `LDRB r0,[r1]` and `STRB r0,[r1]`, run at the alias word's own address
+    // plus one, which is not a word boundary and does not have to be.
+    let h = Harness::m4(&[0xbf00]);
+    h.set_word(0x2000_0010, 0b1010);
+    h.ram
+        .write_at(u64::from(LOAD_GADGET), &0x7808u16.to_le_bytes())
+        .unwrap();
+    assert_eq!(h.read_via_cpu(0x2200_0205), 1);
+    assert_eq!(h.read_via_cpu(0x2200_0201), 0);
+}
+
+#[test]
+fn the_peripheral_alias_reaches_mmio_with_one_read_and_one_write() {
+    let h = Harness::with_counter(Config::CORTEX_M4, &[0xbf00]);
+    let counter = h.counter.clone().unwrap();
+    counter.value.store(0x0000_00f0, Ordering::Relaxed);
+    counter.reads.store(0, Ordering::Relaxed);
+    counter.writes.store(0, Ordering::Relaxed);
+    let space = h.cpu.space().unwrap();
+    let locked = space.bus_lock().taken();
+
+    let alias = alias_of(COUNTER, 3);
+    assert_eq!(alias, 0x4240_000c);
+    h.write_via_cpu(alias, 1);
+
+    // Exactly the two accesses an `LDR`/`STR` pair would make: a device with
+    // a read side effect must not see the read twice, and must not see a
+    // narrower access than the register it published.
+    assert_eq!(counter.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(counter.writes.load(Ordering::Relaxed), 1);
+    assert_eq!(counter.value.load(Ordering::Relaxed), 0x0000_00f8);
+    // And the pair was indivisible, which is what the alias promises.
+    assert_eq!(space.bus_lock().taken(), locked + 1);
+    assert!(!space.bus_lock().held(), "the bus was given back");
+
+    // Reading it back is one more read and no write at all.
+    assert_eq!(h.read_via_cpu(alias), 1);
+    assert_eq!(h.read_via_cpu(alias_of(COUNTER, 0)), 0);
+    assert_eq!(counter.reads.load(Ordering::Relaxed), 3);
+    assert_eq!(counter.writes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_cortex_m7_has_no_bit_band_region() {
+    let h = Harness::new(Config::CORTEX_M7, &[0xbf00]);
+    assert!(!h.cpu.config().bit_band);
+    assert!(h.read_via_cpu_faults(0x2200_0000));
+    // The region itself is still there; it is the alias that is not.
+    h.set_word(0x2000_0010, 0xabcd_1234);
+    assert!(!h.read_via_cpu_faults(0x2000_0010));
+    assert_eq!(h.read_via_cpu(0x2000_0010), 0xabcd_1234);
+}
+
+#[test]
+fn a_cortex_m3_has_the_bit_band_region_and_a_cortex_m4f_keeps_it() {
+    // Written as a table rather than six `assert!`s on constants, which the
+    // compiler folds and clippy then objects to.
+    let parts = [
+        (Config::CORTEX_M3, true),
+        (Config::CORTEX_M4, true),
+        (Config::CORTEX_M4F, true),
+        (Config::CORTEX_M7, false),
+        (Config::CORTEX_M7F, false),
+    ];
+    for (cfg, expected) in parts {
+        assert_eq!(cfg.bit_band, expected, "{:#x}", cfg.cpuid);
+        assert_eq!(cfg.with_bit_band(!expected).bit_band, !expected);
+    }
+    let h = Harness::new(Config::CORTEX_M3, &[0xbf00]);
+    h.set_word(0x2000_0010, 0b1010);
+    assert_eq!(h.read_via_cpu(0x2200_0204), 1);
+    // And it follows the part a `.machine` file names.
+    let props = Props::new().with("part", Value::from("cortex-m7"));
+    assert!(!ArmV7m::from_props(&props).unwrap().config().bit_band);
+    let props = Props::new().with("part", Value::from("cortex-m3"));
+    assert!(ArmV7m::from_props(&props).unwrap().config().bit_band);
+}
+
+#[test]
+fn the_mpu_sees_the_alias_address_and_not_the_target() {
+    // Bit-banding happens in the bus matrix, downstream of the MPU, so a
+    // region that covers `0x20000000` does not cover `0x22000000`. That is
+    // the hardware's behaviour and the reason CMSIS setups describe both.
+    let h = Harness::m4(&[0xbf00]);
+    h.set_word(0x2000_0010, 0b1010);
+    h.cpu.with_sys(|s| {
+        // Region 0: the whole address space, read/write.
+        s.mpu_rbar[0] = 0;
+        s.mpu_rasr[0] = (0b011 << 24) | (31 << 1) | 1;
+        // Region 1: 1 KiB at the bit-band region, with `AP` left at zero,
+        // which is "no access to anybody".
+        s.mpu_rbar[1] = SRAM;
+        s.mpu_rasr[1] = (9 << 1) | 1;
+        s.mpu_ctrl = 0b101; // ENABLE | PRIVDEFENA
+    });
+    // The target is refused through its own address...
+    assert!(h.read_via_cpu_faults(0x2000_0010));
+    // ...and reached through the alias, which region 1 does not describe.
+    assert_eq!(h.read_via_cpu(0x2200_0204), 1);
 }

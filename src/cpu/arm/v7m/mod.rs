@@ -80,9 +80,14 @@
 //!   `FPSCR.AHP` — the alternative half-precision format — is RES0 for the
 //!   same reason: it reads back as zero so a guest can tell.
 //!   `tests/conformance/ledgers/cpu-arm-v7m-fp.txt` is the full list.
-//! - **The debug architecture.** No DWT, ITM, FPB, TPIU or halting debug.
-//!   Their registers read as zero. `BKPT` is a HardFault with
-//!   `HFSR.DEBUGEVT`, which is what a part with no debugger attached does.
+//! - **The debug architecture**, bar the one piece of it firmware runs on its
+//!   own. No halting debug, no ITM, no FPB, no TPIU, and no DWT comparators,
+//!   watchpoints or profile counters; their registers read as zero and
+//!   `DWT_CTRL.NOPRFCNT` says so. What *is* there is `DEMCR.TRCENA` and
+//!   `DWT_CYCCNT`, because a vendor HAL's microsecond delay spins on the
+//!   cycle counter and a counter pinned at zero is a silent hang rather than
+//!   a missing feature. `BKPT` is a HardFault with `HFSR.DEBUGEVT`, which is
+//!   what a part with no debugger attached does.
 //! - **Imprecise bus faults.** There is no write buffer, so every data abort
 //!   is precise and `BFSR.IMPRECISERR` is never set.
 //! - **Cache and TCM behaviour** on the M7. The core is not the place for it;
@@ -329,6 +334,14 @@ pub struct Config {
     /// architectural maximum. CMSIS discovers this by writing `0xFF` to a
     /// priority register and reading it back, so it has to be modelled.
     pub priority_bits: u8,
+    /// Whether this part has the bit-band alias windows.
+    ///
+    /// Cortex-M3 and Cortex-M4 do; Cortex-M7 does not, and neither do the
+    /// M0/M0+/M23/M33 parts this core does not model. It is a property of
+    /// the *core's* bus matrix rather than of a board, which is why it is
+    /// here and not a region a `.machine` file has to remember to map — see
+    /// [`Config::with_bit_band`], which says why in full.
+    pub bit_band: bool,
 }
 
 impl Config {
@@ -340,6 +353,7 @@ impl Config {
         ext: Extensions::CORTEX_M4,
         cpuid: CPUID_CORTEX_M4,
         priority_bits: 3,
+        bit_band: true,
     };
 
     /// A Cortex-M7: the same architecture, a different `CPUID`, and four
@@ -347,6 +361,12 @@ impl Config {
     pub const CORTEX_M7: Config = Config {
         cpuid: CPUID_CORTEX_M7,
         priority_bits: 4,
+        // No bit-banding. The M7's bus interfaces are AXI and AHB with
+        // caches and TCMs in front of them; ARM dropped the alias rather
+        // than make a read-modify-write in the bus matrix coherent with all
+        // of that. Firmware that bit-bands on an M7 faults, and so does
+        // firmware that bit-bands here.
+        bit_band: false,
         ..Config::CORTEX_M4
     };
 
@@ -385,6 +405,34 @@ impl Config {
     #[must_use]
     pub const fn with_endian(mut self, endian: Endian) -> Config {
         self.endian = endian;
+        self
+    }
+
+    /// Same configuration, with or without the bit-band alias windows.
+    ///
+    /// # Bit-banding belongs to the core
+    ///
+    /// The alias is decoded by the processor's own bus matrix, so it is the
+    /// core's view of its address space and not a device, not a region and
+    /// not a line in a `.machine` file. Three things follow, and each of
+    /// them is wrong if the alias is modelled anywhere else:
+    ///
+    /// * it reaches **whatever** is mapped at the target, MMIO with read
+    ///   side effects included, because the remap happens upstream of the
+    ///   decode rather than inside some peripheral;
+    /// * it is there even on a board that maps its SRAM somewhere else
+    ///   entirely, because `0x22000000` aliases `0x20000000` whether or not
+    ///   anything answers at `0x20000000`;
+    /// * it disappears with the part, not with the board — which is exactly
+    ///   what this flag is.
+    ///
+    /// The MPU sits *between* the core and that bus matrix, so an MPU region
+    /// covering the bit-band region does not cover its alias. That is the
+    /// hardware's behaviour and the reason CMSIS MPU setups have to describe
+    /// both windows.
+    #[must_use]
+    pub const fn with_bit_band(mut self, bit_band: bool) -> Config {
+        self.bit_band = bit_band;
         self
     }
 
@@ -1240,7 +1288,9 @@ impl fmt::Display for Listed {
 /// The `cpu.arm.v7m` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.arm.v7m",
-    version: 1,
+    // 2: the snapshot gained `DEMCR` and the DWT's two live registers. 0.0.x,
+    // so the old layout is simply gone rather than read behind a shim.
+    version: 2,
     summary: "ARMv7E-M (Cortex-M4/M7 class) CPU core with Thumb-2, DSP, NVIC and MPU",
     properties: &[
         PropertySpec {
@@ -1495,10 +1545,10 @@ fn save_sys(sys: &Sys, w: &mut ChunkWriter<'_>) -> Result<()> {
     w.write_u32(sys.afsr)?;
     w.write_u32(sys.cpacr)?;
     // The floating-point block, only on a part that has one — which keeps a
-    // Cortex-M3's or an FPU-less M4's chunk byte-identical to what version 1
-    // of this class always wrote. `MVFR0`-`MVFR2` are configuration rather
-    // than state and are never written; `fp_present` is derived from them and
-    // so answers the same question on both sides of a round trip.
+    // Cortex-M3's or an FPU-less M4's chunk the same shape whichever part it
+    // is. `MVFR0`-`MVFR2` are configuration rather than state and are never
+    // written; `fp_present` is derived from them and so answers the same
+    // question on both sides of a round trip.
     if sys.fp_present() {
         w.write_u32(sys.fpccr)?;
         w.write_u32(sys.fpcar)?;
@@ -1510,6 +1560,12 @@ fn save_sys(sys: &Sys, w: &mut ChunkWriter<'_>) -> Result<()> {
     w.write_u32(sys.syst_rvr)?;
     w.write_u32(sys.syst_cvr)?;
     w.write_u32(sys.syst_calib)?;
+    // The debug and trace block. `DWT_CYCCNT` is guest-visible state a busy
+    // wait is sitting on, so a snapshot that dropped it would resume into a
+    // loop whose start point no longer means anything.
+    w.write_u32(sys.demcr)?;
+    w.write_u32(sys.dwt_ctrl)?;
+    w.write_u32(sys.dwt_cyccnt)?;
     w.write_u32(sys.mpu_ctrl)?;
     w.write_u32(sys.mpu_rnr)?;
     w.write_u8(sys.mpu_regions)?;
@@ -1559,6 +1615,9 @@ fn load_sys(sys: &mut Sys, r: &mut ChunkReader<'_>) -> Result<()> {
     sys.syst_rvr = r.read_u32()?;
     sys.syst_cvr = r.read_u32()?;
     sys.syst_calib = r.read_u32()?;
+    sys.demcr = r.read_u32()?;
+    sys.dwt_ctrl = r.read_u32()?;
+    sys.dwt_cyccnt = r.read_u32()?;
     sys.mpu_ctrl = r.read_u32()?;
     sys.mpu_rnr = r.read_u32()?;
     sys.mpu_regions = r.read_u8()?;

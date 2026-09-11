@@ -45,6 +45,22 @@ secondary reference for the exception model.
   A-profile core and nothing else. Its board is
   [`../platforms/stm32f407.md`](../platforms/stm32f407.md), which also records
   how a peripheral raises an interrupt when the NVIC has no wire of its own.
+- **Bit-banding is the core's, not the board's.** Cortex-M3 and Cortex-M4
+  alias the low megabyte of SRAM bit-by-bit at `0x22000000` and the low
+  megabyte of the peripheral map at `0x42000000`; Cortex-M7 does not. The
+  remap happens in the *processor's* bus matrix, so it is a `Config` flag on
+  `cpu.arm.v7m` and a step in `exec.rs`'s data path — never a region a
+  `.machine` file maps. Three consequences follow from putting it there and
+  each is wrong anywhere else: the alias reaches whatever is mapped at the
+  target, MMIO with read side effects included; it exists on a board that
+  puts its SRAM somewhere other than `0x20000000`, because the alias is an
+  address-map fact rather than a memory fact; and it disappears with the part
+  rather than with the board. The bus matrix is *downstream of the MPU*, so
+  an MPU region covering `0x20000000` does not cover `0x22000000` — real
+  firmware has to describe both windows, and so does ours. A bit-band write
+  is a read-modify-write of the target word under the space's `BusLock`, so a
+  device sees exactly one read and one write and no other master gets in
+  between.
 - **The M profile's FPU is a different shape too.** FPv4-SP/FPv5 is
   single-precision-only on the parts that matter, `FPSCR` carries the condition
   flags a `VCMP` writes (A-profile puts them in `PSTATE`), and — the part with
