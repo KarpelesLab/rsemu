@@ -220,7 +220,8 @@ would answer that the machine file does not.
 | [`testing/conformance-suites.md`](testing/conformance-suites.md) | Every suite, **with its licence** and whether it may be vendored |
 | [`testing/cpu-interface.md`](testing/cpu-interface.md) | The four methods a 6502 core must expose for the harness to drive it |
 | [`testing/accuracycoin.md`](testing/accuracycoin.md) | Reading AccuracyCoin's 141 results out of RAM with no screen and no controller |
-| [`testing/benchmarks.md`](testing/benchmarks.md) | rsemu against QEMU, wall clock, on a committed workload set — `ROADMAP.md` phase 8's other half, black-box (§1) and with the denominator named |
+| [`bench-host.md`](bench-host.md) | The register every gated number belongs to: the reference host, the committed workloads, and which rows have been run — a gate citing an unpopulated row has not been met |
+| [`testing/benchmarks.md`](testing/benchmarks.md) | rsemu against QEMU, wall clock, on a committed workload set — `ROADMAP.md` phase 8's other half, black-box (§1) and with the denominator named. Measured: about 20× on `arm64-virt` and 110× on `pc64` against a gate of 2×, with both a plain and an `-icount` QEMU baseline |
 | [`testing/long-run.md`](testing/long-run.md) | The interpreter against each translated engine, quantum by quantum, over a real guest — the gate two engine defects went through |
 | [`testing/tracing.md`](testing/tracing.md) | `--trace`: what a run did, as counters a script can read — the numbers `long-run.md` and `platforms/pc64.md` used to record by hand |
 

@@ -21,7 +21,7 @@ This roadmap defines the architecture, the phase order, and the acceptance gate
 for each phase. It is written to be executed top-to-bottom; every phase ships
 something a person can actually run (§2).
 
-> **Status (2026-09-07).** Phases 0-4 are done, phase 5 has landed its IR *and*
+> **Status (2026-09-11).** Phases 0-4 are done, phase 5 has landed its IR *and*
 > a host JIT backend, phase 5b has its gate, phase 6a is met and 6b is close,
 > and phase 7 has a working KVM backend. ~444k lines of Rust across 418 files,
 > **5,335 tests** green under `--all-features`, one crate in `cargo tree`, and
@@ -221,14 +221,26 @@ something a person can actually run (§2).
 > 240 s of RISC-V guest time, 900 s of x86 and 20 s of AArch64: `jit-host` at
 > **2.15×**, **3.20×** and **5.61×** over the interpreter — the RISC-V figure
 > having *fallen* from 2.28× because the interpreter it is measured against got
-> 1.27× faster — with **97.3%** of the x86 guest's instructions retiring inside
-> a translated block (84.5% one round ago), **97.96%** of the AArch64 guest's,
-> and 99.8% of compiled RISC-V stores writing guest RAM inline. What is *not*
+> 1.27× faster — with **99.3%** of the x86 guest's instructions retiring inside
+> a translated block (97.3% one round ago and 84.5% two before that), **99.4%**
+> of the AArch64 guest's, and 99.8% of compiled RISC-V stores writing guest RAM
+> inline. What is *not*
 > done: the aarch64 *host* backend, the **wasm backend** (§11.4), and the
 > tier-2 pipeline — the browser still runs interpreted. Nor is the ≥100 MIPS
-> half of the gate claimed, because §11's reference host (`docs/bench-host.md`)
-> is still unfilled and this project's own rule is that a gate citing an
-> unpopulated table has not been met.
+> half of the gate claimed: `docs/bench-host.md` now names the reference host
+> and its versus-QEMU row is measured, but its CPU-throughput row — `coremark`
+> on RV64GC — has not been run, and this project's own rule is that a gate
+> citing an unpopulated row has not been met.
+>
+> **And there is an external number, for the first time.** `rsemu` against
+> `qemu-system-…` black-box on the same guest doing the same work (§1):
+> **about twenty times** QEMU's wall clock on `arm64-virt` and **about a
+> hundred and ten** on `pc64`, against phase 8's gate of 2×. The suite, the
+> method, the noise floor and both QEMU baselines are in
+> [`docs/testing/benchmarks.md`](docs/testing/benchmarks.md); what the
+> distance is made of is §13's phase 8, which was re-ordered around it — the
+> code the JIT *generates* is 7–8% of a boot on all three cores, so the gap is
+> in the runtime around it rather than in the code generator.
 >
 > **Phase 5b has its gate, on two architectures.** A hand-built static musl
 > Rust binary runs through musl's `_start` on rv64 *and* aarch64 and exits 0
@@ -2378,16 +2390,160 @@ reaches **≥ 80 % of native** on the same CPU-bound workload, on the reference
 host.
 
 ### Phase 8 — Performance
-Superblocks, cross-block guest-register allocation, tier-2 feedback-driven
-recompilation, `aarch64` + `riscv64` backends, **SMP emulation on both native
-threads and wasm workers** with a correct memory model, memory-op fusion.
+> **Re-ordered against measurements, which the first version of this phase had
+> none of.** It read, in full: *"Superblocks, cross-block guest-register
+> allocation, tier-2 feedback-driven recompilation, `aarch64` + `riscv64`
+> backends, SMP emulation on both native threads and wasm workers with a
+> correct memory model, memory-op fusion."* Every optimisation named there
+> improves **the code the JIT generates**, and that code is **7.32%** of a
+> RISC-V boot's host instructions, **8.02%** of an AArch64 one's and **8.22%**
+> of an x86-64 one's. (A64 has two splits of the same boot that disagree —
+> `src/core/space.rs` sums the anonymous mapping at 8.02% and
+> `docs/platforms/arm64-virt.md`'s chaining table at 10.06% — and nobody has
+> reconciled them. The argument needs only that both are under a ninth.)
+> Making all of it free, on all three cores, would not move
+> the gate's ratio by a tenth. Nothing below is deleted and nothing is
+> re-scoped — the 8% is real work and it is what is left once the 92% has been
+> dealt with. It is re-ordered behind the three *runtime* items the profiles put
+> in front of it, none of which is a code generator at all.
+
+**The evidence is in the tree; read it rather than this paragraph.**
+[`docs/testing/benchmarks.md`](docs/testing/benchmarks.md) is the external
+half — five workloads on two guest architectures, run black-box under both
+emulators, interleaved, nine repetitions on `arm64-virt` and three on `pc64`.
+The per-core profiles are the internal half:
+[`benches/riscv_linux_boot.rs`](benches/riscv_linux_boot.rs),
+[`benches/a64_linux_boot.rs`](benches/a64_linux_boot.rs) and
+[`benches/x86_linux_boot.rs`](benches/x86_linux_boot.rs) with the
+`docs/platforms/` page for each board, which carry callgrind attributions
+beside the census every per-block row has to be divided by; `src/ir`'s
+decision 2 prices the accuracy guarantee against a counterfactual build.
+Three limits on all of it, stated once rather than in each item below. **Each
+profile is one workload over one span**: A64's is twenty guest seconds of boot,
+RISC-V's is twenty that reach `ftrace: allocating`, so it is firmware and early
+init rather than userspace, and x86's is a hundred and twenty of the kernel's
+own self-decompressor, because a nine-hundred-second boot does not finish under
+callgrind in useful time. **No profile exists of `hash`, `awk` or `gzip`** —
+the compute phases, which are where the ratio against QEMU is worst. And the
+wall-clock side was taken on a shared host at a load average near fifty, where
+a single repetition of the arm64 leg can flatter rsemu by nearly 2×.
+
+1. **x86's inlined memory path. The largest single item on any core.**
+   `cpu::x86::engine` publishes no `FastMem` plan at all, so *every* guest
+   access on this core takes the call out through `Exec::read_mem` to
+   `AddressSpace`: **22.34% of the profile, 146 host instructions per guest
+   instruction**, against an A64 that serves most of its accesses from an
+   inlined TLB probe. It is a frontend change rather than a wiring one — an x86
+   load's address is an *effective* address, so inlining means lowering the
+   segment fold into generated code. The row is 28.69% in the kernel phase as
+   far as that could be seen, so it is not an artefact of profiling the
+   decompressor.
+2. **Fewer replay events.** Replaying the deferred charges and boundaries
+   (`flush_thunk`) is the largest row in two profiles and the second largest in
+   the third — **21.66%** on A64 after the block-length work, **31.74%** on
+   RISC-V, 12.32% on x86's kernel phase — and it *rose* as a share each time
+   blocks got longer, because what a replay costs is the events in it rather
+   than the number of blocks. Its size is a decision, and the decision is
+   priced: a scratch build accounting per *region* rather than per guest
+   instruction ran the same boot for **11.9% fewer host instructions**, which
+   is what §0's bit-identical state hash across engines costs on this workload,
+   and it is a lower bound. About a sixth of that is implementation rather than
+   guarantee and the two changes that recover it are measured (−0.93% for an
+   addition in place of a loop whose trip count is one; −1.40% for replaying a
+   boundary and its charge as one event). The rest buys the fault site, the
+   preemption point and the tick stream, and there is no version that is cheap
+   and keeps all three. **Read the negative result before proposing anything
+   here**: publishing the host's tick headroom so `IrHost::spent` need not be
+   asked at every boundary is obviously correct, was built twice, and was
+   *slower* both times (+1.85% and +4.02%), because `flush_thunk` uses no
+   callee-saved registers and one more live value buys a stack frame on every
+   one of 61.9 M calls. The seam change that would work is written down in
+   `src/ir`, and it is a seam change rather than a backend one.
+3. **The scheduler's round boundary.** `EventQueue::advance_to` is **4.19%** of
+   the x86 profile and 1.30% of the RISC-V one, and on x86 it is the row that
+   did *not* move — 4 901 063 174 host instructions on both sides, to the
+   instruction — across a change that removed 57% of the block dispatches. It
+   is per *round*, so neither longer blocks nor better generated code touches
+   it, and nothing has yet measured what it is a function of: the quantum is
+   `SchedulerConfig::max_ticks_per_quantum` = 10 000 and no sweep of it against
+   a real guest exists. That is a measurement rather than a design, which makes
+   it the cheapest item on this list. It is unattributed on A64, where it fell
+   below the profile's cut.
+4. **Block length, the only lever anyone has actually pulled.** Three rounds of
+   *a store no longer ending a block* took A64 from 6.44 guest instructions per
+   block to 10.80 (−14.6% host instructions), RISC-V from 5.51 to 15.91
+   (−29.3%) and x86 from 5.21 to 12.17 (−22.2%), each with an identical
+   `Machine::state_hash` either side. **Superblocks are the item from the
+   original list that attacks this directly**, which is why they are now the
+   first code-generation item rather than the last — and what is left to take
+   is smaller than what was taken, since every per-block row is already divided
+   by two to three times more instructions than when the first profile was
+   read.
+5. **Then the generated code: cross-block guest-register allocation, memory-op
+   fusion, tier-2 feedback-driven recompilation.** Aimed at the 8%, kept, and
+   to be estimated against the one boundary technique that has been measured
+   rather than against intuition. Full **direct block linking** — a
+   predecessor's compiled code jumping into its successor's, past the prologue,
+   85.2% of entries — was worth **1.20%** of an A64 boot, because the re-entry
+   a link removes is 40 host instructions of the ~740 a boundary owes and the
+   rest is work the guest itself is due: `admit`, the entry translation, the
+   two TLB plans. Any proposal in this group argued from "the boundary is
+   expensive" has to say *which part* of the boundary. Cross-block register
+   allocation is the item that gains most from where chaining stopped, because
+   a boundary is now one call into Rust rather than two frames and a dispatcher
+   round trip. Tier-2 stays last: a feedback tier re-optimises the 8%.
+6. **`aarch64` + `riscv64` host backends.** Unchanged and unmoved — this is
+   reach rather than speed. There is one host backend, x86-64 Linux, and the
+   browser runs interpreted, so what a second backend buys is that a host which
+   is not this one gets a JIT at all. For the same reason, no number this
+   project has published says anything about how fast rsemu is on an ARM
+   laptop.
+7. **SMP emulation on native threads and wasm workers, with a correct memory
+   model.** Unchanged, and it is a *correctness* deliverable that happens to
+   live in the performance phase — its gate below is litmus tests and a stress
+   suite, not a ratio. What is in its way is recorded rather than assumed:
+   `RamStore` is a `Vec<AtomicU8>` and every access is a byte loop, so an
+   aligned load racing an aligned store can tear, and every data barrier still
+   retires as a no-op. Both are reachable only under `ThreadingMode::Parallel`,
+   which no board in `machines/` selects
+   ([`docs/techniques/parallel-execution.md`](docs/techniques/parallel-execution.md)).
+
 **Gate:** published benchmark suite; **within 2× of QEMU wall-clock** on the
 committed workload set, on the reference host (**black-box comparison only** —
-running it as a measuring instrument, never reading it, §1). 2× is the number;
-if it proves wrong, change it in a commit that says why rather than leaving it
-unstated. SMP emulation passes a stress suite (`kvm-unit-tests` atomics/barriers)
+running it as a measuring instrument, never reading it, §1). The suite half is
+met — `scripts/bench-vs-qemu.sh` and
+[`docs/testing/benchmarks.md`](docs/testing/benchmarks.md) — and the ratio half
+is now a number rather than a question: **19–24× on `arm64-virt` and about
+110× on `pc64`**, against plain QEMU driving the same guest through the same
+work. 2× is still the number. It has not proved wrong; it has proved *distant*,
+which is a different thing and not grounds for moving it — a gate that moves to
+meet its measurement stops being a gate. If it is ever changed, that happens in
+a commit that says why rather than being left unstated.
+
+Two things about the comparison are now known and belong beside it. **The one
+genuine fairness question is answered in both directions rather than argued.**
+rsemu's per-access cycle accounting is not switchable — it is how the bus
+charges time (§4.2) and it is what the state hash is over (§0) — and it costs
+11.9% of a boot, where QEMU accounts only under `-icount`. So the table
+publishes plain QEMU *and* `qemu -icount`, and the answer is
+architecture-dependent: `-icount` costs QEMU 3.6× on `pc64`, most of the
+difference between 110× and 31×, and essentially nothing on `arm64-virt`, where
+rsemu is still 17.8× away from the accounting side. The AArch64 distance may
+not be attributed to cycle accounting. **And the two cores are not one problem
+at two depths**: rsemu's AArch64 *interpreter* is 89.7× its QEMU while rsemu's
+x86-64 *host JIT* is 109.9× its own, so `pc64` needs an answer of its own, and
+item 1 is most of it.
+
+SMP emulation passes a stress suite (`kvm-unit-tests` atomics/barriers)
 plus the Cambridge **litmus tests** for each guest/host memory-model pair, with
 no violations, on native threads *and* in a threaded browser build.
+
+**What is still unmeasured**, so the list above is not mistaken for a complete
+one: there is no RISC-V leg against QEMU, because the reference host has no
+`qemu-system-riscv64`; no profile of a userspace compute workload on any core;
+no performance measurement of the SMP half at all; and every figure here was
+taken on a loaded shared machine, so a re-measurement on a quiet host is the
+first thing to do when one is available.
 
 ### Phase 9 — Frontends, remote, and debugging depth
 VNC (then SPICE) server, local windowing backends, audio, gamepad, `noroi`

@@ -29,10 +29,22 @@ and a `pc64` x86-64 guest in **about a hundred and ten times what
 
 The gate wants 2×. rsemu is an order of magnitude away on AArch64 and two orders
 away on x86-64. That is the number the roadmap's gate needs, and an honest bad
-one is worth more than a flattering one: this is the distance phase 8's work
-list — superblocks, cross-block guest-register allocation, tier-2 feedback
-recompilation, memory-op fusion — exists to close, and it is now measurable
-rather than assumed.
+one is worth more than a flattering one: the distance is now measurable rather
+than assumed.
+
+**And it is not the distance phase 8's original work list was aimed at**, which
+is the second thing this measurement cost the roadmap. That list —
+superblocks, cross-block guest-register allocation, tier-2 feedback
+recompilation, memory-op fusion —
+improves the code the JIT *generates*, and the three callgrind profiles taken
+beside this measurement put that code at **7.32% of a RISC-V boot, 8.02% of an
+AArch64 one and 8.22% of an x86-64 one**. Free code generation, on every core,
+does not close a tenth of a 20× gap. `ROADMAP.md` phase 8 has been re-ordered
+around that: the runtime items — x86's missing inlined memory path, the
+deferred-charge replay, the scheduler's round boundary, and block length, which
+is the only lever anyone has yet pulled — come first, and the code-generation
+items are kept where their 8% puts them. *"What has to change for the gate to
+be met"*, at the bottom of this page, is the short form.
 
 ## Provenance
 
@@ -194,14 +206,23 @@ same size as the phase.
 The argument:
 
 rsemu always does per-access cycle accounting — it is how the bus charges time
-(`ROADMAP.md` §4.2) and it is not switchable. It is also **about a fifth of
-rsemu's host instructions**: `benches/a64_linux_boot.rs`'s census puts
-`flush_thunk`, which replays a block's deferred charges and boundaries, at
-19.3 % of the profile before the store-ends-a-block change and 21.66 % after it.
-QEMU does that accounting only under `-icount`. Comparing rsemu against
-plain QEMU therefore compares an emulator that is counting against one that is
-not, and comparing it against `-icount` compares against a mode almost nobody
-runs. Neither alone is the honest number, so both are published:
+(`ROADMAP.md` §4.2), it is what the cross-engine state hash is over (§0), and it
+is not switchable. QEMU does that accounting only under `-icount`. Comparing
+rsemu against plain QEMU therefore compares an emulator that is counting against
+one that is not, and comparing it against `-icount` compares against a mode
+almost nobody runs. Neither alone is the honest number, so both are published.
+
+**What it costs is measured, and two numbers get confused here.** The *replay*
+of deferred charges and boundaries (`flush_thunk`) is about a fifth of rsemu's
+host instructions — 19.3 % of `benches/a64_linux_boot.rs`'s profile before the
+store-ends-a-block change and 21.66 % after it — but that is the whole
+bookkeeping row, not what the accuracy promise costs, because a translator with
+no promise still keeps *some* budget. The number that is only about the promise
+is the counterfactual in `src/ir`'s decision 2: a scratch build accounting per
+**region** instead of per guest instruction ran the same boot for **11.9 %
+fewer host instructions**. That is the figure to quote at this comparison, and
+it is a lower bound — the per-access ticks charged inside an access are not
+removed by it. So:
 
 * **`qemu`** is what a person gets by typing `qemu-system-…`. It is the number
   that answers "how much slower is rsemu than the thing people actually use?",
@@ -420,29 +441,56 @@ re-measured and re-read, not by an exit status.
 
 ## What has to change for the gate to be met
 
-The gate is 2×. Where the distance actually is, from the tables above and from
-the census in [`benches/a64_linux_boot.rs`](../../benches/a64_linux_boot.rs) —
-which independently measured **350 host instructions per guest instruction**, of
-which the code the JIT generated was **twenty-five**:
+The gate is 2×. `ROADMAP.md` phase 8 is the ordered list and this is the short
+form of it, from the tables above and from the three boot profiles taken beside
+them — [`benches/a64_linux_boot.rs`](../../benches/a64_linux_boot.rs), which
+measured **350 host instructions per guest instruction** before the
+block-length work and 287 after it, of which the code the JIT generated was
+twenty-five; [`benches/riscv_linux_boot.rs`](../../benches/riscv_linux_boot.rs)
+at 310 and then 219; and
+[`benches/x86_linux_boot.rs`](../../benches/x86_linux_boot.rs) at 652 and then
+508. Each of those is one workload over one span, and each says which — twenty
+guest seconds of boot on A64, twenty on RISC-V that reach `ftrace: allocating`,
+and a hundred and twenty on x86 that are the kernel's own self-decompressor,
+because a nine-hundred-second boot does not finish under callgrind.
 
-1. **The dispatch loop and the deferred-charge replay, not the generated code.**
-   Seven per cent of rsemu's host instructions are the code the JIT emitted. The
-   other ninety-three are the machinery around it. No amount of better code
-   generation moves a ratio whose numerator is mostly not code generation, which
-   is why phase 8's list is the list it is.
-2. **Block length.** The census says 6.44 guest instructions per block before
-   the store-ends-a-block change and 10.80 after it. Every per-block cost is
-   divided by that number, and superblocks are the item on phase 8's list that
-   attacks it directly.
-3. **The x86 core is a different problem from the A64 one.** 110× against 20×
+1. **Not the generated code.** It is **7.32%** of the RISC-V boot, **8.02%** of
+   the AArch64 one and **8.22%** of the x86-64 one. The other ninety-two are
+   the machinery around it, and no amount of better code generation moves a
+   ratio whose numerator is mostly not code generation. Phase 8's original list
+   was entirely code generation; it has been re-ordered behind the runtime
+   items for exactly this reason.
+2. **x86 publishes no inlined memory path, and that is the largest single item
+   on any core**: 22.34% of `pc64`'s profile and 146 host instructions per guest
+   instruction go through the address space, because `cpu::x86::engine`'s
+   `FastMem` is empty and every access takes the call. A64 serves most of its
+   accesses from an inlined probe. This is most of why the x86 leg of the tables
+   above is five times the AArch64 one.
+3. **The deferred-charge replay, which is the largest row left on two of three
+   cores** — and of which 11.9% of a boot is the accuracy promise §0 requires,
+   measured against a per-region counterfactual rather than estimated. A sixth
+   of that is implementation and is recoverable; the rest is the promise.
+4. **Block length.** 6.44 guest instructions per block on A64 before the
+   store-ends-a-block change and 10.80 after, 5.51 → 15.91 on RISC-V, 5.21 →
+   12.17 on x86, worth −14.6%, −29.3% and −22.2% of the host instructions.
+   Every per-block cost is divided by that number, and superblocks are the item
+   on phase 8's list that attacks it directly.
+5. **The x86 core is a different problem from the A64 one.** 110× against 20×
    is not a tuning gap — and the sharper form of it is that rsemu's *AArch64
    interpreter* is 90× QEMU while rsemu's *x86-64 host JIT* is 110×. Phase 8
    should not treat the two cores as the same problem at different depths.
-4. **A quieter host, and a longer workload.** The two limitations of this
+6. **A quieter host, and a longer workload.** The two limitations of this
    measurement are in the tables: it was taken under a load average near fifty,
    and the QEMU side of `arm64-virt` runs for four seconds where its own
    run-to-run spread is most of a second. Both are fixable and neither changes
    an order of magnitude.
+
+And what none of it measured, because the profiles are boots and this suite's
+worst phases are not: **there is no profile of `hash`, `awk` or `gzip` on any
+core.** The attribution above says where a *boot* spends its host instructions;
+`hash` is 112× on AArch64 and 456× on x86-64 and nobody has yet taken a
+callgrind profile of it. Anyone looking for the next item for phase 8 should
+take that profile rather than reason from these.
 
 Whoever closes any of this: re-run this page's command, replace the tables, and
 say in the commit which workload moved. A ratio that changed without a named

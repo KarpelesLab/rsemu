@@ -658,11 +658,29 @@ run third-party system software — `riscv-virt`, `arm64-virt`, `arm64-virt-smp`
 `pc64`, `q35-linux`, `q35-linux-smp` and `q35-uefi` — so
 `rsemu run -p engine=jit-host` picks it from the command line there. It is
 **still a literal** on `pc-at`, `pc-at-smp`, `pc-apic`, `q35` and `a64-mini`,
-which are therefore still interpreted whatever you pass. And no number in this
-repository sits on the declared reference host, because
-[`docs/bench-host.md`](docs/bench-host.md) has not been filled in — by the
-project's own rule that makes every one of them informative rather than
-gating.
+which are therefore still interpreted whatever you pass. And the table above is
+**informative rather than gating**: [`docs/bench-host.md`](docs/bench-host.md)
+now names the reference host, but these ratios were not taken under the
+discipline the benchmark harness applies — interleaved sides, a minimum over
+repetitions, a run-to-run spread beside every figure. One set of numbers in
+this repository was, and it is the next paragraph.
+
+**And rsemu has been measured against something other than itself.** Every
+figure above compares rsemu with rsemu, which can say a change made things
+faster and can never say whether the result is fast.
+[`docs/testing/benchmarks.md`](docs/testing/benchmarks.md) is the external
+comparison phase 8's gate asks for: the same kernel, the same initramfs and the
+same five workloads under rsemu and under `qemu-system-…`, timed by markers the
+*guest* prints, with QEMU run as a measuring instrument and never read (that is
+a licence rule, not a preference — see below). The answer is **about twenty
+times QEMU's wall clock on `arm64-virt` and about a hundred and ten on
+`pc64`**, against a gate of 2×, and the interesting part is where the distance
+lives: the code the JIT *generates* is **under a tenth** of a boot's host
+instructions on all three cores — 7.32%, 8.02% and 8.22% where it has been
+split out. So what the gate measures is the runtime *around* the generated
+code: the address space, the deferred-charge replay, the block boundary, the
+scheduler round. `ROADMAP.md` phase 8 is that list, in the order the profiles
+put it.
 
 **Hardware acceleration** is real, and it is KVM on Linux x86-64.
 `rsemu run q35-linux --media kernel=bzImage --accel kvm` boots that same stock
@@ -768,6 +786,8 @@ cargo build --no-default-features   # no_std core, as CI checks it
 
 scripts/check.sh         # everything CI gates on, per commit
 scripts/check.sh --all   # plus the full per-feature sweep (long)
+scripts/check.sh qemu    # rsemu against QEMU — minutes to an hour, on purpose,
+                         # and in neither of the two sets above
 ```
 
 `scripts/check.sh` is the whole CI workflow as one command, so "I ran the
