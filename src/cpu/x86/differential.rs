@@ -3795,14 +3795,18 @@ mod tests {
             //
             // `jit::x86` lowers everything this frontend emits, so more than
             // one block per case is the right floor there. `jit::arm64` refuses
-            // a documented set — `POPCOUNT`, `MULU2`/`MULS2`, the rotates with
-            // carry, the divides, the exclusives and atomics, `call_helper`,
-            // `phi`, `i128` and floats — and an x86 guest reaches several of
-            // them often, so the same corpus compiled 61 blocks there on the
-            // first run that ever executed that backend. Nothing diverged: the
-            // blocks it *did* compile agreed with the interpreter, which is
-            // what this test is for. Keeping the x86 floor and asserting
-            // liveness elsewhere says both of those things.
+            // a documented set — the rotates with carry, the divides, the
+            // exclusives and atomics, `call_helper`, `phi`, `i128` and floats —
+            // and an x86 guest reaches several of them often, so the same
+            // corpus compiled 61 blocks there on the first run that ever
+            // executed that backend. (It refused `POPCOUNT` and
+            // `MULU2`/`MULS2` then too, and *that* was the one that mattered:
+            // x86's parity flag lifts to a population count on nearly every ALU
+            // instruction, so 61 was the count of blocks that never wrote
+            // flags. Both are lowered now.) Nothing diverged: the blocks it
+            // *did* compile agreed with the interpreter, which is what this
+            // test is for. Keeping the x86 floor and asserting liveness
+            // elsewhere says both of those things.
             #[cfg(all(feature = "jit-x86", target_arch = "x86_64"))]
             assert!(
                 compiled > 400,
@@ -3842,12 +3846,13 @@ mod tests {
             //
             // On `jit::x86` all four pairs compile, and a pair that stopped
             // compiling would be news, so require them. Elsewhere the sample is
-            // one seeded eight-instruction program: on `jit::arm64` all four
-            // pairs of it land inside the refusal set (`POPCOUNT`, `MULU2`, the
-            // divides, the atomics, `call_helper`, floats), which is a fact
-            // about eight instructions and not about the backend. Demanding
-            // even one compile here was a guess, and it was wrong — the aarch64
-            // job said so.
+            // one seeded eight-instruction program, and whether any of its four
+            // pairs lands inside a backend's refusal set (the divides, the
+            // atomics, `call_helper`, floats) is a fact about eight
+            // instructions and not about the backend. Demanding even one
+            // compile here was a guess, and it was wrong — the aarch64 job said
+            // so, back when `POPCOUNT` was still refused there and every block
+            // that wrote a flag went with it.
             //
             // Liveness is `a_generated_corpus_agrees_when_it_is_compiled`'s to
             // assert, where 400 cases make "the backend compiled nothing at

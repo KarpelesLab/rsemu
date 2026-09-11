@@ -76,20 +76,36 @@
 //!   *bounded* retry requirement, and inlining one means deciding in generated
 //!   code what happens when the exclusive monitor is lost. `ROADMAP.md` §9.1's
 //!   sixth mechanism, and not this round's.
-//! * **`popcount`** — A64's population count is `CNT`, which is a SIMD
-//!   instruction (DDI 0487 C7.2, *CNT (vector)*), and the base A64 integer set
-//!   has none. The SWAR sequence the x86 backend open-codes would work, but no
-//!   frontend this backend can be differentially tested against emits
-//!   `popcount` on a machine that also runs on this host — `cpu::x86::lift`
-//!   does, and an x86 guest under an aarch64 host is a combination nothing in
-//!   the tree exercises yet. Shipping code generation the harnesses cannot
-//!   reach is the thing `jit::x86::compiles` refuses to do, and this follows it.
-//! * **`mulu2`/`muls2`** — `UMULH`/`SMULH` make these two instructions, and
-//!   they are the first thing to add once the differential runs on a real
-//!   runner. They are out of this round for the same reason: nothing has
-//!   executed them.
 //! * **`rotlc`/`rotrc`, the divides, `addc`/`subb`, `mulhsu`, `call_helper`,
 //!   `phi`** — as in the x86 backend, for its reasons.
+//!
+//! # Two refusals that expired, and what expired them
+//!
+//! `popcount` and `mulu2`/`muls2` were refused in the round that landed this
+//! backend, and the reason given for both was that **nothing had executed
+//! them**: no frontend this backend could be differentially tested against
+//! emitted them on a machine that also ran on this host, so lowering them
+//! would have been shipping code generation the harnesses could not reach.
+//!
+//! That premise is gone. The `aarch64 (weak memory)` CI job runs
+//! `tests/x86_engines.rs` on an aarch64 runner — an x86 guest under an aarch64
+//! host is exactly the combination the refusal said nothing exercised, and it
+//! is a job that runs every commit. Worse, the refusal was *load-bearing* in
+//! the wrong direction: x86's parity flag is a population count, so
+//! `cpu::x86::lift` emits `popcount` on nearly every ALU instruction, and a
+//! backend that refuses it refuses nearly every x86 block. The job did not
+//! measure a slow JIT; it measured no JIT at all.
+//!
+//! * **`popcount`** is now four instructions through the vector unit — `FMOV`,
+//!   `CNT`, `ADDV`, `FMOV` (DDI 0487 C7.2). The base A64 integer set still has
+//!   no population count, and the alternative was still the SWAR sequence the
+//!   x86 backend open-codes; the lowering below says why the vector unit won
+//!   and [`emit`](super::emit)'s module docs say why the `SIGILL` that was the
+//!   reason to avoid SIMD cannot happen on the only host that executes this.
+//! * **`mulu2`/`muls2`** are `UMULH`/`SMULH` at 64 bits and a `MUL` plus a
+//!   shift below it, over the two-destination plumbing
+//!   [`linear_scan`] already had — the same shape the x86 backend uses, and
+//!   no new allocator machinery.
 //!
 //! # The software TLB, inlined
 //!
@@ -124,7 +140,7 @@ use crate::jit::PAGE_MASK;
 use crate::jit::tlb::FastSet;
 
 use super::abi::{Event, off, status, vt};
-use super::emit::{Asm, Cond as Cc, Fixup, Logic, Reg, ShiftOp};
+use super::emit::{Asm, Cond as Cc, Fixup, Logic, Reg, ShiftOp, VReg};
 
 /// Why a block was not compiled.
 ///
@@ -194,6 +210,9 @@ pub fn compiles(op: Opcode) -> bool {
             | Opcode::ROTR
             | Opcode::CLZ
             | Opcode::CTZ
+            | Opcode::POPCOUNT
+            | Opcode::MULU2
+            | Opcode::MULS2
             | Opcode::SETCOND
             | Opcode::MOVCOND
             | Opcode::BRCOND
@@ -357,6 +376,12 @@ const B: Reg = Reg::X10;
 const C: Reg = Reg::X11;
 /// The fourth scratch, and the one the TLB probe leaves a host address in.
 const D: Reg = Reg::X12;
+/// The only vector register this backend uses, and only inside a `popcount`.
+///
+/// Never live across an instruction, so it needs no allocator bank and no
+/// prologue slot. See [`VReg::V16`] for why it is `v16` and not `v0`.
+const VEC: VReg = VReg::V16;
+
 /// Where a thunk's address is loaded before the `BLR`.
 ///
 /// `x16` is IP0, which AAPCS64 §6.1.1 sets aside for exactly this: a scratch a
@@ -1240,6 +1265,48 @@ impl<'a> Compiler<'a> {
                 }
                 self.write(inst, acc)?;
             }
+            // **Four instructions through the vector unit**, and no width
+            // check, which is the one bit-counting op that needs none: `CNT`
+            // counts the eight bytes of the register it is handed, and a value
+            // is held canonically masked to its type, so counting the whole
+            // 64-bit register counts exactly the type's bits whether the type
+            // is `i64`, `i32` or `i1`. [`Compiler::write`] still applies its
+            // masks afterwards; the answer is at most 64, so they never remove
+            // a bit.
+            //
+            // **Why the vector unit and not SWAR.** The base A64 integer set
+            // has no population count at all, so the two candidates were this
+            // and the shift/mask/multiply sequence `jit::x86::compile`'s
+            // `Compiler::popcount` open-codes. The x86 one is fifteen
+            // instructions *because x86 has cheap 64-bit immediates*;
+            // transcribed here it is closer to twenty, since each
+            // of `0x5555…`, `0x3333…`, `0x0f0f…` and `0x0101…` is four
+            // `MOVZ`/`MOVK` unless a logical-immediate encoder is written
+            // first. And this is not a rare opcode on this backend's one real
+            // workload: x86's parity flag *is* a population count, so
+            // `cpu::x86::lift` puts one on nearly every ALU
+            // instruction, and a block of x86 that never wrote flags would be
+            // an unusual block. Sixteen extra instructions per guest ALU
+            // instruction is not a micro-optimisation to wave away.
+            //
+            // The reason this was refused until now was a `SIGILL` on a host
+            // without FEAT_AdvSIMD. That risk is void: `buf` and `rt` are
+            // gated to aarch64 Linux, and `neon` is a *default* target feature
+            // of `aarch64-unknown-linux-gnu`, so rsemu's own compiled code may
+            // already contain AdvSIMD before any of this runs.
+            // [`emit`](super::emit)'s module docs carry the same argument at
+            // the encoder.
+            Opcode::POPCOUNT => {
+                let a = self.src_typed(at, 0, inst.ty)?;
+                let acc = self.acc(inst, &[]);
+                let s = self.operand(A, a);
+                self.asm.fmov_to_vec(VEC, s);
+                self.asm.cnt_8b(VEC, VEC);
+                self.asm.addv_8b(VEC, VEC);
+                self.asm.fmov_from_vec(acc, VEC);
+                self.write(inst, acc)?;
+            }
+            Opcode::MULU2 | Opcode::MULS2 => self.widening_multiply(at, inst, w)?,
             Opcode::SETCOND => {
                 let cond = inst
                     .cond
@@ -1442,6 +1509,60 @@ impl<'a> Compiler<'a> {
         // `i32` amount of four billion is above 64 here rather than negative.
         self.asm.csel(64, A, A, out_of_range, Cc::Lo);
         self.write(inst, A)
+    }
+
+    /// `mulu2`/`muls2`: the low half into the destination, the high half into
+    /// `dst2`.
+    ///
+    /// `jit::x86::compile`'s `Compiler::widening_multiply` with the two
+    /// instructions swapped, and it is a **two**-instruction lowering at 64
+    /// bits rather than x86's fixed `rdx:rax` pair: A64 computes the top half
+    /// of a 64×64 product with its own instruction (DDI 0487 C6.2, *UMULH* and
+    /// *SMULH*) and neither result lands in a register the caller did not
+    /// choose. Below 64 bits the whole product fits in one register, so the
+    /// high half is a shift — and the signed case wants both operands
+    /// sign-extended first, after which bits `w .. 2w` of the 64-bit product
+    /// are the same bits a 128-bit product would have there.
+    ///
+    /// The high half is computed **before** the low one at 64 bits, because
+    /// `MUL` writes the accumulator both operands are still sitting in.
+    fn widening_multiply(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
+        let a = self.src_typed(at, 0, inst.ty)?;
+        let b = self.src_typed(at, 1, inst.ty)?;
+        let high = inst
+            .dst2
+            .ok_or(Refusal::Shape("a widening multiply produces its high half"))?;
+        let high_ty = self
+            .block
+            .type_of(high)
+            .ok_or(Refusal::Shape("the high half was never allocated"))?;
+        check_type(high_ty)?;
+        let signed = inst.op == Opcode::MULS2;
+        self.load_temp(A, a);
+        self.load_temp(B, b);
+        if w == 64 {
+            if signed {
+                self.asm.smulh(C, A, B);
+            } else {
+                self.asm.umulh(C, A, B);
+            }
+            self.asm.mul(64, A, A, B);
+        } else {
+            if signed {
+                self.sext(A, w);
+                self.sext(B, w);
+            }
+            self.asm.mul(64, A, A, B);
+            self.asm.lsr_imm(64, C, A, w);
+        }
+        self.write(inst, A)?;
+        // `Interp` masks the high half twice as well: once to the
+        // instruction's width, where it takes it out of the double-width
+        // product, and once to the temporary it lands in.
+        self.mask(C, inst.ty);
+        self.mask(C, high_ty);
+        self.commit(high, C);
+        Ok(())
     }
 
     // ---- memory --------------------------------------------------------
