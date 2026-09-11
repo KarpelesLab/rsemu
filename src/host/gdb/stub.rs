@@ -18,6 +18,7 @@
 //! | `Z2` `z2` | write watchpoints, on the selected thread's space |
 //! | `H` `qC` `qfThreadInfo` `qsThreadInfo` `T` `qThreadExtraInfo` | CPUs as threads |
 //! | `qSupported` `qXfer:features:read` | negotiation and the target description |
+//! | `qXfer:memory-map:read` | what is mapped where, when the target can say |
 //! | `QStartNoAckMode` | drop the `+`/`-` handshake |
 //! | `qRcmd` | the `monitor` command, answered for the selected thread |
 //! | `qAttached` `qSymbol` `!` | the attach handshake |
@@ -48,7 +49,7 @@ use super::packet::{
     ACK, Event, NAK, frame, hex_decode, parse_hex_u64, parse_hex_usize, push_hex, push_hex_u8,
     push_hex_u64,
 };
-use super::target::{DebugTarget, Stop, StopKind, TargetError};
+use super::target::{DebugTarget, Stop, StopKind, TargetError, memory_map_xml};
 
 /// What the caller should do once the stub has processed an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -850,11 +851,19 @@ impl Stub {
             }
             // `PacketSize` is hex, and is the size of a *packet*, so a reply
             // never needs splitting below it.
-            self.send(
-                b"PacketSize=1000;qXfer:features:read+;QStartNoAckMode+;swbreak+;hwbreak+;\
-                  vContSupported+",
-                out,
+            let mut reply = Vec::from(
+                &b"PacketSize=1000;qXfer:features:read+;QStartNoAckMode+;swbreak+;hwbreak+;\
+                   vContSupported+"[..],
             );
+            // Offered only by a target that has a map to give. A stub that
+            // advertised it and then answered `E00` would have GDB believe the
+            // machine described itself and found nothing mapped, which is a
+            // worse answer than never claiming it: with no map at all GDB
+            // treats every address as writable, exactly as it did before.
+            if target.memory_map(self.query_thread).is_ok() {
+                reply.extend_from_slice(b";qXfer:memory-map:read+");
+            }
+            self.send(&reply, out);
             return Outcome::Continue;
         }
         if rest == b"C" {
@@ -912,6 +921,9 @@ impl Stub {
         if let Some(args) = rest.strip_prefix(b"Xfer:features:read:") {
             return self.features(args, target, out);
         }
+        if let Some(args) = rest.strip_prefix(b"Xfer:memory-map:read:") {
+            return self.memory_map(args, target, out);
+        }
         self.send_empty(out);
         Outcome::Continue
     }
@@ -935,6 +947,65 @@ impl Stub {
             None => self.send_empty(out),
         }
         Outcome::Continue
+    }
+
+    /// `qXfer:memory-map:read::<offset>,<length>` — what is mapped where.
+    ///
+    /// GDB reads this once and uses it to decide whether a write is allowed at
+    /// all, which is what makes `load` report "cannot write to read-only
+    /// memory" instead of issuing a write the bus silently refuses.
+    ///
+    /// The annex is **empty** for this object, unlike `features`, whose annex
+    /// names the document. A client that sends one anyway is asking for
+    /// something that does not exist.
+    fn memory_map(
+        &mut self,
+        args: &[u8],
+        target: &mut dyn DebugTarget,
+        out: &mut Vec<u8>,
+    ) -> Outcome {
+        let Some(colon) = args.iter().position(|b| *b == b':') else {
+            self.send_error(&TargetError::Unsupported, out);
+            return Outcome::Continue;
+        };
+        let (annex, range) = args.split_at(colon);
+        if !annex.is_empty() {
+            self.send(b"E00", out);
+            return Outcome::Continue;
+        }
+        let Some((offset, length)) = Self::parse_range(range.get(1..).unwrap_or(&[])) else {
+            self.send_error(&TargetError::Unsupported, out);
+            return Outcome::Continue;
+        };
+        // The map belongs to the selected thread's address space, for the same
+        // reason the target description does: two cores on two buses are two
+        // different maps and the protocol has one.
+        let regions = match target.memory_map(self.query_thread) {
+            Ok(regions) => regions,
+            Err(e) => {
+                self.send_error(&e, out);
+                return Outcome::Continue;
+            }
+        };
+        let xml = memory_map_xml(&regions);
+        self.send_chunk(xml.as_bytes(), offset, length, out);
+        Outcome::Continue
+    }
+
+    /// Reply with `[offset, offset + length)` of `document`, marked `m` when
+    /// more follows and `l` when it does not.
+    ///
+    /// The tail end of every `qXfer` read, and shared so that a new object
+    /// cannot get the continuation marker subtly wrong — a document whose
+    /// last chunk says `m` makes GDB ask for an empty one forever.
+    fn send_chunk(&mut self, document: &[u8], offset: u64, length: usize, out: &mut Vec<u8>) {
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+        let slice = document.get(offset..).unwrap_or(&[]);
+        let take = slice.len().min(length);
+        let mut payload = Vec::with_capacity(take + 1);
+        payload.push(if take < slice.len() { b'm' } else { b'l' });
+        payload.extend_from_slice(slice.get(..take).unwrap_or(&[]));
+        self.send(&payload, out);
     }
 
     fn features(
@@ -967,14 +1038,7 @@ impl Stub {
             return Outcome::Continue;
         };
         let xml = arch.target_xml();
-        let bytes = xml.as_bytes();
-        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-        let slice = bytes.get(offset..).unwrap_or(&[]);
-        let take = slice.len().min(length);
-        let mut payload = Vec::with_capacity(take + 1);
-        payload.push(if take < slice.len() { b'm' } else { b'l' });
-        payload.extend_from_slice(slice.get(..take).unwrap_or(&[]));
-        self.send(&payload, out);
+        self.send_chunk(xml.as_bytes(), offset, length, out);
         Outcome::Continue
     }
 }
@@ -984,7 +1048,7 @@ mod tests {
     use super::*;
     use crate::host::gdb::arch::{Arch, Feature, RegDesc, RegType};
     use crate::host::gdb::packet::Framer;
-    use crate::host::gdb::target::{TargetResult, WatchSupport};
+    use crate::host::gdb::target::{MemKind, MemRegion, TargetResult, WatchSupport};
 
     /// A target with no machine behind it: two "CPUs" with four bytes of state
     /// each and a 256-byte memory. Enough to drive every packet, and it makes
@@ -998,6 +1062,9 @@ mod tests {
         steps: usize,
         resumed: usize,
         began: usize,
+        /// What `qXfer:memory-map:read` answers. Empty means the target has no
+        /// map, which is the default and the pre-existing behaviour.
+        map: Vec<MemRegion>,
     }
 
     static FAKE_REGS: &[RegDesc] = &[
@@ -1048,6 +1115,7 @@ mod tests {
                 steps: 0,
                 resumed: 0,
                 began: 0,
+                map: Vec::new(),
             }
         }
     }
@@ -1055,6 +1123,12 @@ mod tests {
     impl DebugTarget for FakeTarget {
         fn cpu_count(&self) -> usize {
             2
+        }
+        fn memory_map(&self, _cpu: usize) -> TargetResult<Vec<MemRegion>> {
+            if self.map.is_empty() {
+                return Err(TargetError::Unsupported);
+            }
+            Ok(self.map.clone())
         }
         fn cpu_path(&self, cpu: usize) -> TargetResult<&str> {
             match cpu {
@@ -1310,6 +1384,75 @@ mod tests {
                 &mut stub,
                 &mut target,
                 b"qXfer:features:read:threads:0,10"
+            )),
+            "E00"
+        );
+    }
+
+    /// A target that cannot describe itself must not be advertised as one
+    /// that can: GDB reads `qXfer:memory-map:read` exactly once, and a stub
+    /// that offers the object and then errors has told GDB the machine tried
+    /// to describe itself and failed.
+    #[test]
+    fn a_target_with_no_memory_map_never_offers_the_object() {
+        let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
+        let reply = payload(&ask(&mut stub, &mut target, b"qSupported:swbreak+"));
+        assert!(!reply.contains("memory-map"), "{reply}");
+        // And asking anyway is the error the target gave, not a panic and not
+        // an empty document.
+        assert_eq!(
+            payload(&ask(
+                &mut stub,
+                &mut target,
+                b"qXfer:memory-map:read::0,100"
+            )),
+            "E16"
+        );
+    }
+
+    #[test]
+    fn a_memory_map_is_advertised_and_served_in_pieces() {
+        let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
+        target.map = vec![
+            MemRegion {
+                kind: MemKind::Rom,
+                start: 0,
+                length: 0x1000,
+            },
+            MemRegion {
+                kind: MemKind::Ram,
+                start: 0x2000_0000,
+                length: 0x8000,
+            },
+        ];
+        let reply = payload(&ask(&mut stub, &mut target, b"qSupported:swbreak+"));
+        assert!(reply.contains("qXfer:memory-map:read+"), "{reply}");
+
+        let mut whole = String::new();
+        let mut offset = 0usize;
+        loop {
+            let request = format!("qXfer:memory-map:read::{offset:x},20");
+            let reply = payload(&ask(&mut stub, &mut target, request.as_bytes()));
+            let (tag, body) = reply.split_at(1);
+            whole.push_str(body);
+            offset += body.len();
+            if tag == "l" {
+                break;
+            }
+        }
+        assert!(whole.starts_with("<?xml"), "{whole}");
+        assert!(whole.contains("<memory type=\"rom\" start=\"0x0\" length=\"0x1000\"/>"));
+        assert!(
+            whole.contains("<memory type=\"ram\" start=\"0x20000000\" length=\"0x8000\"/>"),
+            "{whole}"
+        );
+        // This object's annex is empty. One that names a document is asking
+        // for something that does not exist.
+        assert_eq!(
+            payload(&ask(
+                &mut stub,
+                &mut target,
+                b"qXfer:memory-map:read:map.xml:0,10"
             )),
             "E00"
         );

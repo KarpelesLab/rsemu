@@ -205,6 +205,76 @@ pub struct WatchSupport {
     pub access: bool,
 }
 
+/// What a region of the guest's address space is, as far as GDB's memory map
+/// has words for it.
+///
+/// Three types exist in the memory-map DTD — `ram`, `rom` and `flash` — and
+/// only two are here. **`flash` is missing on purpose.** Declaring a range as
+/// flash tells GDB to stop writing it with `M`/`X` and to use `vFlashErase`,
+/// `vFlashWrite` and `vFlashDone` instead, and this stub implements none of
+/// those: claiming it would turn a `load` that fails into a `load` that hangs
+/// on an unanswered packet. Making it true is two pieces of work, neither of
+/// them here — the three `vFlash` packets, and a way to write a
+/// [`RomStore`](crate::core::space::RomStore) that does not exist yet, because
+/// `core::space` refuses a write to a read-only mapping *including* a debug
+/// one, deliberately and in as many words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemKind {
+    /// Readable and writable: GDB may patch it.
+    Ram,
+    /// Readable only. GDB refuses to write here and says why, instead of
+    /// issuing a write the bus will refuse.
+    Rom,
+}
+
+impl MemKind {
+    /// The `type` attribute this is in a memory map.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MemKind::Ram => "ram",
+            MemKind::Rom => "rom",
+        }
+    }
+}
+
+/// One `<memory>` element of `qXfer:memory-map:read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemRegion {
+    /// What kind of memory this is.
+    pub kind: MemKind,
+    /// First address covered.
+    pub start: u64,
+    /// How many bytes.
+    pub length: u64,
+}
+
+/// Render a memory map as the document `qXfer:memory-map:read` serves.
+///
+/// The shape is the memory-map DTD's, which the GDB manual's "Memory Map
+/// Format" appendix gives in full.
+#[must_use]
+pub fn memory_map_xml(regions: &[MemRegion]) -> String {
+    let mut xml = String::with_capacity(96 + regions.len() * 64);
+    xml.push_str("<?xml version=\"1.0\"?>\n");
+    xml.push_str(
+        "<!DOCTYPE memory-map PUBLIC \"+//IDN gnu.org//DTD GDB Memory Map V1.0//EN\" \
+                  \"http://sourceware.org/gdb/gdb-memory-map.dtd\">\n",
+    );
+    xml.push_str("<memory-map>\n");
+    for region in regions {
+        let _ = writeln!(
+            xml,
+            "  <memory type=\"{}\" start=\"{:#x}\" length=\"{:#x}\"/>",
+            region.kind.as_str(),
+            region.start,
+            region.length
+        );
+    }
+    xml.push_str("</memory-map>\n");
+    xml
+}
+
 /// What the debugger can do to a machine.
 ///
 /// Every method takes an explicit CPU index rather than an implicit "current
@@ -295,6 +365,26 @@ pub trait DebugTarget {
     /// Bounded rather than open-ended so the caller keeps servicing the socket:
     /// this is what makes Ctrl-C work.
     fn resume(&mut self) -> TargetResult<Option<Stop>>;
+
+    /// What is mapped where, for `qXfer:memory-map:read`.
+    ///
+    /// GDB asks once per session and uses the answer to decide whether a write
+    /// is allowed at all, so a target that cannot describe itself should keep
+    /// refusing rather than guess: with no map GDB treats every address as
+    /// ordinary writable memory, which is what it did before this existed.
+    ///
+    /// **The addresses are the CPU's bus addresses**, not translated ones.
+    /// That is what a memory map means — it describes the machine, not a
+    /// process — and it is exact on every machine without an MMU. On one with
+    /// an MMU and paging on, GDB is matching the map against virtual addresses
+    /// from its own packets, so treat it as advisory there.
+    ///
+    /// # Errors
+    ///
+    /// [`TargetError::Unsupported`] when there is no map to give.
+    fn memory_map(&self, _cpu: usize) -> TargetResult<Vec<MemRegion>> {
+        Err(TargetError::Unsupported)
+    }
 
     /// Answer a `qRcmd` monitor command. `None` means "no such command".
     ///
@@ -1278,6 +1368,69 @@ impl DebugTarget for MachineTarget<'_> {
             }
         }
         Ok(None)
+    }
+
+    /// Built from the flat view of the CPU's own address space, so it is the
+    /// map the machine file actually produced rather than a board-specific
+    /// string someone has to remember to update.
+    ///
+    /// The classification is the one question GDB asks of a region — may I
+    /// write here — answered from where a *write* to that range would land:
+    /// its own leaf, or the separate one an incompletely decoded board sends
+    /// writes to. A range whose write side is a
+    /// [`FlatTarget::Rom`](crate::core::space::FlatTarget::Rom) is `rom` however
+    /// the mapping is permitted, because a ROM store answers a write by
+    /// ignoring it or faulting either way.
+    ///
+    /// Adjacent ranges of the same kind are merged. The flat view splits on
+    /// every mapping boundary and GDB has no use for the seams; a board with
+    /// sixteen consecutive peripheral pages is one `<memory>` element here.
+    fn memory_map(&self, cpu: usize) -> TargetResult<Vec<MemRegion>> {
+        use crate::core::space::{FlatTarget, Perms};
+
+        let entry = self.cpu(cpu)?;
+        let space = self.space(entry)?;
+        // `try_view` rather than `view`, for the reason `monitor_map` gives:
+        // a description is a nicety and blocking on a mid-flight retopology
+        // is not.
+        let view = space.try_view().ok_or(TargetError::Unsupported)?;
+        let mut out: Vec<MemRegion> = Vec::new();
+        for flat in view.flat_view().entries() {
+            if flat.is_empty() {
+                continue;
+            }
+            // Where a write lands: the entry's own leaf unless the board sends
+            // writes somewhere else. A combined entry — a wired-or of several
+            // devices — has no single leaf, and is writable if it answers a
+            // write at all, which is what `ram` claims.
+            let kind = match flat.write_to().or_else(|| flat.leaf()) {
+                Some(leaf) if leaf.perms().contains(Perms::WRITE) => {
+                    match leaf.target() {
+                        // A ROM store ignores or faults a write whatever the
+                        // mapping permits, so `rom` is the truth.
+                        FlatTarget::Rom { .. } => MemKind::Rom,
+                        _ => MemKind::Ram,
+                    }
+                }
+                Some(_) => MemKind::Rom,
+                // No leaf at all: a combined entry, which answers writes.
+                None => MemKind::Ram,
+            };
+            match out.last_mut() {
+                Some(last)
+                    if last.kind == kind
+                        && last.start.saturating_add(last.length) == flat.start() =>
+                {
+                    last.length = last.length.saturating_add(flat.len());
+                }
+                _ => out.push(MemRegion {
+                    kind,
+                    start: flat.start(),
+                    length: flat.len(),
+                }),
+            }
+        }
+        Ok(out)
     }
 
     fn monitor(&mut self, cpu: usize, command: &str) -> Option<String> {

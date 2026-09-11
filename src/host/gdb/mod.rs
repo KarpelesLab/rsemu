@@ -16,7 +16,7 @@
 //! | --- | --- |
 //! | [`packet`] | framing, checksums, `+`/`-`, escapes, run-length encoding |
 //! | [`arch`] | per-CPU register maps and the `qXfer:features:read` XML |
-//! | [`target`] | the [`DebugTarget`] seam, and a [`Machine`] behind it |
+//! | [`target`] | the [`DebugTarget`] seam, the memory map, and a [`Machine`] behind it |
 //! | [`stub`] | the protocol: one packet in, one reply out |
 //! | this module | the listener, the session loop, and [`serve`] |
 //!
@@ -75,6 +75,13 @@
 //!   register file; upstream GDB additionally insists on knowing the machine,
 //!   and has no 6502. `rsemu debug` says so at startup rather than letting the
 //!   user find out from GDB's error. [`arch`] has the long form.
+//! * **Flash programming.** `qXfer:memory-map:read` describes what is mapped
+//!   where, in the two types the machine can honour — see [`MemKind`] — and
+//!   never claims `flash`, because `vFlashErase`, `vFlashWrite` and
+//!   `vFlashDone` are not implemented and a range declared flash is a range
+//!   GDB writes only through them. So `load` into a board's ROM still fails,
+//!   and now fails with GDB saying which region refused rather than with a bus
+//!   error from nowhere.
 //!
 //! # Sources
 //!
@@ -94,7 +101,10 @@ use std::time::Duration;
 use crate::machine::Machine;
 
 pub use stub::Outcome;
-pub use target::{DebugTarget, MachineTarget, Stop, StopKind, TargetError, TargetResult};
+pub use target::{
+    DebugTarget, MachineTarget, MemKind, MemRegion, Stop, StopKind, TargetError, TargetResult,
+    memory_map_xml,
+};
 
 /// How long an idle poll sleeps rather than spinning on a socket that has
 /// nothing to say.

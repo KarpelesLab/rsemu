@@ -35,6 +35,27 @@ be declared in `org.gnu.gdb.arm.m-system` rather than beside `r0`-`r12`. The
 register table stays one flat slice in `g`-packet order and `Arch::features`
 records where the boundaries fall in it.
 
+## The memory map
+
+`qXfer:memory-map:read` returns what is mapped where, and GDB uses it to decide
+whether a write is allowed at all — without one it assumes every address is
+ordinary writable memory. rsemu builds it from the **flat view of the CPU's own
+address space**, coalescing adjacent ranges of the same kind, so it is whatever
+the `.machine` file produced rather than a per-board string somebody maintains.
+A range is `ram` when a write to it would land somewhere that takes writes and
+`rom` otherwise; a target that cannot describe itself does not advertise the
+object at all, rather than advertising it and erroring.
+
+**`flash` is never claimed**, and that is a deliberate gap rather than an
+oversight. Declaring a range as flash tells GDB to write it with `vFlashErase`,
+`vFlashWrite` and `vFlashDone`, none of which this stub answers, so the claim
+would turn a `load` that fails cleanly into one that stalls. Making it true
+needs those three packets *and* a way to write a `RomStore`, which `core::space`
+has no seam for: a write to a read-only mapping is refused for a debug access
+too, on purpose (`src/core/space/flat.rs` says so in as many words). So `load`
+into a board's ROM still does not work — it now fails with GDB naming the
+read-only region instead of with a bus error from nowhere.
+
 ## DWARF
 
 | Source | Covers |
