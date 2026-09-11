@@ -149,6 +149,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
+use crate::core::spin;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::{Endian, Width};
@@ -689,6 +690,14 @@ struct Pins {
 struct Session {
     state: State,
     space: Option<Arc<AddressSpace>>,
+    /// The spin detector's per-core state (`core::spin`).
+    ///
+    /// Beside the space rather than inside [`State`], and for the same reason
+    /// the space is: neither is architectural. [`Device::load`] replaces the
+    /// whole `State`, and a restore that also unplugged the detector the
+    /// machine attached would be a diagnostic that quietly stops working after
+    /// the first snapshot.
+    spin: spin::Watch,
 }
 
 impl fmt::Debug for Session {
@@ -751,6 +760,7 @@ impl ArmV7m {
                 Session {
                     state: State::new(&cfg),
                     space: None,
+                    spin: spin::Watch::new(cfg.requester),
                 },
             ),
         }
@@ -1127,14 +1137,14 @@ impl ArmV7m {
         let nmi = self.lines.nmi();
         let reset = self.lines.take_reset();
         let mut session = self.session.lock();
-        let Session { state, space } = &mut *session;
+        let Session { state, space, spin } = &mut *session;
         if reset {
             state.reset_pending = true;
         }
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &self.cfg).step(&external, nmi)
+        Exec::new(state, &space, &self.cfg, spin).step(&external, nmi)
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -1144,6 +1154,7 @@ impl ArmV7m {
     /// otherwise is how a scheduler ends up with a CPU in an impossible
     /// state.
     pub fn run(&self, budget: u64) -> u64 {
+        self.session.lock().spin.refresh();
         let mut used = 0;
         while used < budget {
             let n = self.step();
@@ -1167,7 +1178,14 @@ impl ArmV7m {
     /// cycle count and its domain's tick count in step over any number of
     /// quanta while never letting a single one overrun.
     pub fn run_budget(&self, ticks: u64) -> u64 {
-        let owed = self.session.lock().state.debt;
+        let owed = {
+            let mut session = self.session.lock();
+            // Once per scheduler round, which is the granularity a change of
+            // arming takes effect at — the per-load path holds a copy and
+            // touches no atomic (`core::spin`).
+            session.spin.refresh();
+            session.state.debt
+        };
         if owed >= ticks {
             self.session.lock().state.debt = owed - ticks;
             return ticks;
@@ -1348,6 +1366,11 @@ pub fn register(reg: &mut Registry) -> Result<()> {
 impl Device for ArmV7m {
     fn class(&self) -> &'static DeviceClass {
         &CLASS
+    }
+
+    fn set_spin_detector(&self, cpu: u32, detector: Option<Arc<spin::Detector>>) -> bool {
+        self.session.lock().spin.attach(cpu, detector);
+        true
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

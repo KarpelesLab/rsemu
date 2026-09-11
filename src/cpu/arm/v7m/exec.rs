@@ -43,6 +43,7 @@
 //! (`ROADMAP.md` §1).
 
 use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs};
+use crate::core::spin::Watch;
 use crate::core::value::{Endian, Width};
 
 use super::isa::{
@@ -339,6 +340,11 @@ pub(super) struct Exec<'a> {
     state: &'a mut State,
     space: &'a AddressSpace,
     cfg: &'a Config,
+    /// The spin detector's per-core state (`core::spin`). Borrowed from the
+    /// session rather than held in [`State`], because it is diagnostic wiring
+    /// and not architectural state: a snapshot restore replaces the whole
+    /// `State` and must not take the detector with it.
+    spin: &'a mut Watch,
     attrs: MemAttrs,
     /// Address of the instruction being executed.
     insn_addr: u32,
@@ -351,12 +357,18 @@ pub(super) struct Exec<'a> {
 
 impl<'a> Exec<'a> {
     /// Borrow a core for one step.
-    pub(super) fn new(state: &'a mut State, space: &'a AddressSpace, cfg: &'a Config) -> Exec<'a> {
+    pub(super) fn new(
+        state: &'a mut State,
+        space: &'a AddressSpace,
+        cfg: &'a Config,
+        spin: &'a mut Watch,
+    ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         Exec {
             state,
             space,
             cfg,
+            spin,
             attrs,
             insn_addr: 0,
             branched: false,
@@ -654,7 +666,31 @@ impl<'a> Exec<'a> {
 
     /// Read `bytes` bytes, honouring the private peripheral bus, the MPU and
     /// unaligned support.
+    ///
+    /// **The core's single data-read choke point**, and therefore where the
+    /// spin detector's load hook goes. It wraps [`Exec::read_data`] rather than
+    /// being it, because that one returns from four places — the PPB, the
+    /// bit-band alias, the aligned path and the byte-by-byte path — and a hook
+    /// repeated four times is a hook that will eventually be four different
+    /// hooks. A fault reports nothing: the guest did not get a value, so there
+    /// is no value for a streak to be made of.
     fn read_mem(&mut self, addr: u32, bytes: u32, privileged: bool) -> Ex<u32> {
+        let value = self.read_data(addr, bytes, privileged)?;
+        // `insn_addr`, not `r[15]`: the PC reads as the instruction's address
+        // plus four while it executes, and a report naming an address four
+        // bytes past the poll would send a reader to the wrong line.
+        self.spin.load(
+            self.space,
+            u64::from(self.insn_addr),
+            u64::from(addr),
+            u64::from(addr),
+            u64::from(value),
+        );
+        Ok(value)
+    }
+
+    /// [`Exec::read_mem`] without the diagnostic hook.
+    fn read_data(&mut self, addr: u32, bytes: u32, privileged: bool) -> Ex<u32> {
         self.cycle(1);
         if in_ppb(addr) {
             if !in_vendor_ppb(addr) {
@@ -699,6 +735,10 @@ impl<'a> Exec<'a> {
     /// Write `bytes` bytes, honouring the private peripheral bus, the MPU and
     /// unaligned support.
     fn write_mem(&mut self, addr: u32, bytes: u32, value: u32, privileged: bool) -> Ex {
+        // A store of this core's ends any load streak, whether or not it
+        // completes: a loop that got as far as issuing one is a loop that is
+        // doing something (`core::spin`).
+        self.spin.store();
         self.cycle(1);
         if in_ppb(addr) {
             if !in_vendor_ppb(addr) {
@@ -951,6 +991,9 @@ impl<'a> Exec<'a> {
         // Taking an exception ends a `WFI` or `WFE` whether or not the
         // instruction stream ever gets back to it.
         self.state.asleep = false;
+        // And it ends any load streak: a loop waiting on a handler that is
+        // legitimately slow is not stuck (`core::spin`).
+        self.spin.interrupt();
         // Whether this context's floating-point registers travel with the
         // frame. `CONTROL.FPCA` says the context has used the FPU; `CPACR`
         // has to still allow it, because firmware that turns the coprocessor

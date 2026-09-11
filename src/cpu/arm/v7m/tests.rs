@@ -13,11 +13,13 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::core::device::Device;
 use crate::core::props::{Props, Value};
 use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, RamStore, Region,
     UnassignedPolicy,
 };
+use crate::core::spin;
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use crate::core::value::{Endian, Width};
 
@@ -107,6 +109,9 @@ struct Harness {
     sram: Arc<RamStore>,
     /// The register at [`COUNTER`], on a harness built with one.
     counter: Option<Arc<CountingRegister>>,
+    /// The spin detector, on a harness built with one
+    /// ([`Harness::m4_with_spin_detector`]).
+    spin: Option<Arc<spin::Detector>>,
 }
 
 impl Harness {
@@ -173,12 +178,32 @@ impl Harness {
             ram,
             sram,
             counter,
+            spin: None,
         }
     }
 
     /// A Cortex-M4 running `code`.
     fn m4(code: &[u16]) -> Harness {
         Harness::new(Config::CORTEX_M4, code)
+    }
+
+    /// The same harness with a spin detector armed at `threshold` consecutive
+    /// loads (`core::spin`).
+    ///
+    /// The detector is attached the way a machine attaches one — through
+    /// [`Device::set_spin_detector`] — so this exercises the same route a board
+    /// takes, not a back door into the core.
+    fn m4_with_spin_detector(code: &[u16], threshold: u64) -> Harness {
+        let mut h = Harness::m4(code);
+        let detector = spin::Detector::new(threshold);
+        h.cpu.set_spin_detector(0, Some(Arc::clone(&detector)));
+        h.spin = Some(detector);
+        h
+    }
+
+    /// What the detector has found.
+    fn spin_events(&self) -> Vec<crate::core::trace::Event> {
+        self.spin.as_ref().map_or_else(Vec::new, |d| d.events())
     }
 
     /// A word of guest state, read out of band rather than through the core.
@@ -1929,4 +1954,179 @@ fn the_mpu_sees_the_alias_address_and_not_the_target() {
     assert!(h.read_via_cpu_faults(0x2000_0010));
     // ...and reached through the alias, which region 1 does not describe.
     assert_eq!(h.read_via_cpu(0x2200_0204), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The spin detector (`core::spin`)
+// ---------------------------------------------------------------------------
+
+/// Where the poll loops below read from: a word of SRAM that nothing writes.
+///
+/// The address the issue proposing this feature named was `0x2000_1000`, which
+/// is one word **past** the end of this harness's SRAM ([`SRAM_LEN`] is
+/// `0x1000`), so a load there would have faulted rather than spun.
+const POLLED: u32 = SRAM + 0x100;
+
+/// `loop: ldr r0,[r1]; b loop` — the shape a compiler emits for
+/// `while (!*p) ;`, and the overwhelmingly common way firmware hangs.
+///
+/// No compare: the detector keys on the *load*, and what the loop does with
+/// the value afterwards is not its business. A `cmp`/`beq` pair would make the
+/// encoding longer and test nothing more.
+fn poll_loop() -> [u16; 2] {
+    [0x6808, 0xe7fd]
+}
+
+/// `loop: ldr r0,[r1]; adds r0,#1; str r0,[r1]; b loop` — a loop that reads a
+/// word, increments it and writes it back. It never terminates either, and it
+/// is making progress every iteration.
+fn counting_loop() -> [u16; 4] {
+    [0x6808, 0x3001, 0x6008, 0xe7fb]
+}
+
+/// Point `r1` at `addr`, start at [`ENTRY`] and run for `cycles`.
+fn spin_for(h: &Harness, addr: u32, cycles: u64) {
+    h.cpu.set_reg(1, addr);
+    h.cpu.set_pc(ENTRY);
+    h.cpu.run(cycles);
+}
+
+#[test]
+fn a_poll_loop_on_a_ram_word_is_reported_with_its_pc_and_address() {
+    let h = Harness::m4_with_spin_detector(&poll_loop(), 1000);
+    spin_for(&h, POLLED, 10_000);
+
+    let events = h.spin_events();
+    assert_eq!(events.len(), 1, "one report, not one per iteration");
+    let ev = &events[0];
+    assert_eq!(ev.kind, crate::core::trace::EventKind::SPIN);
+    assert_eq!(ev.cpu, 0);
+    // The address of the `LDR` itself, not `r[15]`, which reads as the
+    // instruction plus four while the instruction is executing.
+    assert_eq!(ev.pc, u64::from(ENTRY));
+    assert_eq!(ev.addr, u64::from(POLLED));
+    assert_eq!(ev.value, 0);
+    assert_eq!(ev.count, 1000, "the streak is the threshold, exactly");
+    assert_eq!(
+        ev.region.as_deref(),
+        Some("sram"),
+        "the report names what answered"
+    );
+    // And it renders as a sentence somebody can act on.
+    let line = format!("{ev}");
+    assert!(line.contains("cpu0"), "{line}");
+    assert!(line.contains("0x20000100"), "{line}");
+    assert!(line.contains("(sram)"), "{line}");
+}
+
+#[test]
+fn a_loop_that_makes_progress_is_not_reported() {
+    // The same address, read from the same instruction, forever — and every
+    // iteration writes it back one higher. The store ends the streak, and the
+    // changing value would end it too.
+    let h = Harness::m4_with_spin_detector(&counting_loop(), 1000);
+    spin_for(&h, POLLED, 100_000);
+    assert!(h.spin_events().is_empty());
+    assert!(h.word(POLLED) > 1000, "the loop really did run");
+}
+
+#[test]
+fn a_flag_that_a_timer_sets_before_the_threshold_is_not_reported() {
+    // SysTick is a timer inside the core, so this needs no board: `COUNTFLAG`
+    // sets when the counter wraps and clears when the register is read, which
+    // is exactly the shape of a status bit a peripheral sets under a polling
+    // loop. With a reload of 100 the flag changes the value the loop sees far
+    // more often than once per thousand loads.
+    let h = Harness::m4_with_spin_detector(&poll_loop(), 1000);
+    h.set_word(0xe000_e014, 100); // SYST_RVR
+    h.set_word(0xe000_e010, 0b101); // SYST_CSR: ENABLE | CLKSOURCE
+    spin_for(&h, 0xe000_e010, 100_000);
+    assert!(
+        h.spin_events().is_empty(),
+        "a flag that keeps changing is not a stuck loop"
+    );
+
+    // The control, so the emptiness above is the timer and not a detector that
+    // was never armed: with the counter stopped the same loop reads the same
+    // word forever and is reported.
+    let h = Harness::m4_with_spin_detector(&poll_loop(), 1000);
+    h.set_word(0xe000_e010, 0);
+    spin_for(&h, 0xe000_e010, 100_000);
+    assert_eq!(h.spin_events().len(), 1);
+}
+
+#[test]
+fn the_event_is_emitted_once_and_again_only_after_the_value_changes() {
+    let h = Harness::m4_with_spin_detector(&poll_loop(), 1000);
+    spin_for(&h, POLLED, 100_000);
+    assert_eq!(
+        h.spin_events().len(),
+        1,
+        "a hundred thousand cycles of the same loop is still one line"
+    );
+
+    // Something outside the core finally writes the word. The streak restarts
+    // on the new value and, when that one gets stuck too, says so again.
+    h.set_word(POLLED, 0x5a);
+    h.cpu.run(100_000);
+    let events = h.spin_events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].value, 0);
+    assert_eq!(events[1].value, 0x5a);
+    assert_eq!(events[1].addr, u64::from(POLLED));
+}
+
+#[test]
+fn an_interrupt_resets_the_streak() {
+    // A loop polling a word that never changes, with an interrupt arriving
+    // more often than the threshold. Nothing about the loop has changed — it
+    // is as stuck as it ever was — but a handler running in between is the
+    // documented reason not to report it (`core::spin`).
+    let h = Harness::m4_with_spin_detector(&poll_loop(), 1000);
+    // IRQ0's handler is a bare `BX LR`, so it returns immediately and the loop
+    // resumes where it left off.
+    h.set_word(16 * 4, 0x341);
+    h.set_word(0x340, 0x4770_4770);
+    h.cpu.with_sys(|s| s.set_enable(Exception::IRQ0, true));
+    h.cpu.set_reg(1, POLLED);
+    h.cpu.set_pc(ENTRY);
+    for _ in 0..200 {
+        h.cpu.pend_irq(0);
+        h.cpu.run(500);
+    }
+    assert!(
+        h.spin_events().is_empty(),
+        "an interrupt every few hundred cycles keeps the streak short"
+    );
+
+    // The same run with nothing interrupting it, so the absence above is the
+    // interrupt and not the arithmetic.
+    let h = Harness::m4_with_spin_detector(&poll_loop(), 1000);
+    h.cpu.set_reg(1, POLLED);
+    h.cpu.set_pc(ENTRY);
+    for _ in 0..200 {
+        h.cpu.run(500);
+    }
+    assert_eq!(h.spin_events().len(), 1);
+}
+
+#[test]
+fn a_disarmed_core_watches_nothing_and_an_armed_one_can_be_disarmed() {
+    // The default: nothing attached, so the hook is the field test and the
+    // not-taken branch it was written to be.
+    let h = Harness::m4(&poll_loop());
+    spin_for(&h, POLLED, 100_000);
+    assert!(h.spin_events().is_empty());
+
+    let h = Harness::m4_with_spin_detector(&poll_loop(), 1000);
+    let detector = Arc::clone(h.spin.as_ref().expect("armed"));
+    detector.disarm();
+    // Picked up at the start of the next run rather than at the next load —
+    // the per-load path holds a copy and touches no atomic.
+    spin_for(&h, POLLED, 100_000);
+    assert!(h.spin_events().is_empty());
+
+    detector.set_threshold(1000);
+    spin_for(&h, POLLED, 100_000);
+    assert_eq!(h.spin_events().len(), 1);
 }
