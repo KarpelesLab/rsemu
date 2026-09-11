@@ -591,7 +591,7 @@ fn the_x86_64_register_map_agrees_with_the_core() {
     assert_eq!(target.cpu_count(), 1, "one core");
     let arch = target.arch(0).expect("a register map");
     assert_eq!(arch.class.name, "cpu.x86");
-    assert_eq!(arch.feature, "org.gnu.gdb.i386.core");
+    assert_eq!(arch.features[0].name, "org.gnu.gdb.i386.core");
     assert_eq!(arch.architecture, Some("i386:x86-64"));
     // 16 * 8 + rip + eflags + six selectors + eight ten-byte x87 registers +
     // eight control words: gdb's own AMD64 core block, with no SSE feature.
@@ -746,7 +746,7 @@ fn the_register_view_follows_the_address_space_width() {
     assert_eq!(arch.regs[0].name, "eax");
     // The i386 view is `org.gnu.gdb.i386.core` too, and gdb only accepts that
     // name with the x87 block after the integer file.
-    assert_eq!(arch.feature, "org.gnu.gdb.i386.core");
+    assert_eq!(arch.features[0].name, "org.gnu.gdb.i386.core");
     assert_eq!(arch.regs.len(), 32);
     assert_eq!(arch.regs[16].name, "st0");
     assert_eq!(arch.regs[31].name, "fop");
@@ -766,7 +766,7 @@ fn the_older_class_name_is_debuggable_too() {
     let x86 = rsemu::host::gdb::arch::for_class("cpu.x86").expect("cpu.x86 has a map");
     let i8086 = rsemu::host::gdb::arch::for_class("cpu.i8086").expect("cpu.i8086 has a map");
     assert_eq!(i8086.regs.len(), x86.regs.len());
-    assert_eq!(i8086.feature, x86.feature);
+    assert_eq!(i8086.features[0].name, x86.features[0].name);
     assert_eq!(i8086.pc, x86.pc);
     for (a, b) in i8086.regs.iter().zip(x86.regs) {
         assert_eq!(a, b, "the two views of one core disagree");
@@ -1041,7 +1041,7 @@ fn the_aarch64_register_map_agrees_with_the_core() {
     assert_eq!(target.cpu_count(), 1, "one AArch64 core");
     let arch = target.arch(0).expect("a register map");
     assert_eq!(arch.class.name, "cpu.arm.a64");
-    assert_eq!(arch.feature, "org.gnu.gdb.aarch64.core");
+    assert_eq!(arch.features[0].name, "org.gnu.gdb.aarch64.core");
     assert_eq!(arch.architecture, Some("aarch64"));
     // 31 * 8 + sp + pc + a four-byte cpsr: what GDB's own AArch64 layout is.
     assert_eq!(arch.packet_len(), 268);

@@ -28,6 +28,13 @@ supertrait chain, so a map is a table of byte offsets into the device's
 "what is not here", and the one thing that would collapse every map in that file
 into a call.
 
+A description may hold **more than one `<feature>`**, and one does. GDB numbers
+registers across the whole document but looks each one up *inside* the feature
+its gdbarch expects it in, so ARMv7-M's `msp`, `psp` and mask registers have to
+be declared in `org.gnu.gdb.arm.m-system` rather than beside `r0`-`r12`. The
+register table stays one flat slice in `g`-packet order and `Arch::features`
+records where the boundaries fall in it.
+
 ## DWARF
 
 | Source | Covers |
@@ -181,7 +188,7 @@ is a session with nothing in it — no registers, no `$pc`, no breakpoints.
 | `pc-at` | 1 | the i386 sixteen plus the same x87 block; a 144-byte `g` packet. `org.gnu.gdb.i386.core` with **no** `<architecture>`, so GDB resolves it to `i386` on its own — measured, on a GDB built for x86-64 — and `set architecture i8086` still validates against it. |
 | `pc-at-smp`, `pc-apic` | **2** | as above, one thread per processor |
 | `gameboy` | 1 | `a f b c d e h l sp pc`; a 12-byte `g` packet. No `<architecture>`: upstream GDB has no SM83. |
-| `stm32f407` | 1 | `r0`-`r12`, `sp`, `lr`, `pc`, `xpsr`; a 68-byte `g` packet claiming `org.gnu.gdb.arm.m-profile` and `arm`, which GDB **accepts**. |
+| `stm32f407` | 1 | `r0`-`r12`, `sp`, `lr`, `pc`, `xpsr` in `org.gnu.gdb.arm.m-profile`, then `msp`, `psp`, `primask`, `basepri`, `faultmask`, `control` in `org.gnu.gdb.arm.m-system`: a 92-byte `g` packet claiming `arm`, which GDB **accepts**. The only map in the tree split across two features — the M-profile gdbarch looks the system registers up in the second one, so declaring them in the first hides them. |
 | `m68k-mini` | 1 | `d0`-`d7`, `a0`-`a5`, `fp`, `sp`, `ps`, `pc`; a 72-byte `g` packet claiming `org.gnu.gdb.m68k.core` and `m68k`, which GDB **accepts**. |
 | `apple1`, `nes-*`, `sms-*`, `arm926`, `beneater-6502` | 1 | per core. The 6502, Z80 and ARMv5 maps are complete; the first two carry no `<architecture>`, so a stock GDB refuses the description — see above. |
 | `mips-mini` | **0** | no map for `cpu.mips`, deliberately — see below. |

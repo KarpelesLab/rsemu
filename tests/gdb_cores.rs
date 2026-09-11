@@ -205,11 +205,16 @@ fn the_v7m_register_map_agrees_with_the_core() {
     assert_eq!(target.cpu_count(), 1, "the STM32's core is a thread now");
     let arch = target.arch(0).expect("a register map");
     assert_eq!(arch.class.name, "cpu.arm.v7m");
-    assert_eq!(arch.feature, "org.gnu.gdb.arm.m-profile");
+    assert_eq!(arch.features[0].name, "org.gnu.gdb.arm.m-profile");
     assert_eq!(arch.architecture, Some("arm"));
     // `r0`-`r12`, `sp`, `lr`, `pc`, `xpsr`: seventeen words, which is exactly
-    // what GDB's M-profile gdbarch asks that feature for.
-    assert_eq!(arch.packet_len(), 68);
+    // what GDB's M-profile gdbarch asks that feature for — and then six more
+    // in `org.gnu.gdb.arm.m-system`, which is where `msp`, `psp` and the mask
+    // registers have to be for GDB to find them. `tests/gdb_v7m.rs` holds
+    // those against the core; the width of the `g` packet is here, because
+    // that is what the seventeen used to be a statement about.
+    assert_eq!(arch.features[1].name, "org.gnu.gdb.arm.m-system");
+    assert_eq!(arch.packet_len(), 92);
 
     let mut regs = cpu.regs();
     for (i, slot) in regs.r.iter_mut().enumerate() {
@@ -303,7 +308,7 @@ fn the_m68k_register_map_agrees_with_the_core() {
     assert_eq!(target.cpu_count(), 1, "the 68000 is a thread now");
     let arch = target.arch(0).expect("a register map");
     assert_eq!(arch.class.name, "cpu.m68k");
-    assert_eq!(arch.feature, "org.gnu.gdb.m68k.core");
+    assert_eq!(arch.features[0].name, "org.gnu.gdb.m68k.core");
     assert_eq!(arch.architecture, Some("m68k"));
     // `d0`-`d7`, `a0`-`a5`, `fp`, `sp`, `ps`, `pc`: eighteen words.
     assert_eq!(arch.packet_len(), 72);

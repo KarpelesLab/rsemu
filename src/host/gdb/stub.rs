@@ -982,7 +982,7 @@ impl Stub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::gdb::arch::{Arch, RegDesc, RegType};
+    use crate::host::gdb::arch::{Arch, Feature, RegDesc, RegType};
     use crate::host::gdb::packet::Framer;
     use crate::host::gdb::target::{TargetResult, WatchSupport};
 
@@ -1026,7 +1026,7 @@ mod tests {
     static FAKE_ARCH: Arch = Arch {
         class: &FAKE_CLASS,
         verified_version: 1,
-        feature: "org.rsemu.fake",
+        features: &[Feature::whole("org.rsemu.fake")],
         architecture: None,
         regs: FAKE_REGS,
         pc: 1,

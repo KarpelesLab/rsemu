@@ -41,6 +41,21 @@
 //! rejected. That is the shape to aim at; `org.rsemu.*` is the honest fallback,
 //! not the house style.
 //!
+//! # One map, several features
+//!
+//! GDB's numbering is flat and its *grouping* is not. A register's number is
+//! its position in the whole description, across every `<feature>`; which
+//! feature it is in decides whether GDB's gdbarch finds it at all, because a
+//! gdbarch looks each register up by name **inside** the feature it expects it
+//! in. So [`Arch::regs`] is one slice in `g`-packet order, and
+//! [`Arch::features`] says where the boundaries fall in it.
+//!
+//! [`V7M`] is the only map that needs more than one today, and it needs it
+//! badly: `msp`, `psp`, `primask`, `basepri`, `faultmask` and `control` belong
+//! to `org.gnu.gdb.arm.m-system`, and the same six declared inside
+//! `org.gnu.gdb.arm.m-profile` would be six registers GDB never finds — while
+//! also breaking that feature's promise to contain exactly the seventeen.
+//!
 //! # Where the register values come from
 //!
 //! There is **no route from a `dyn Device` to a concrete CPU type**:
@@ -239,6 +254,50 @@ pub struct Computed {
     pub selects: &'static [usize],
 }
 
+/// One `<feature>` element of a target description.
+///
+/// A feature is a *named group* of registers, and the name is the whole of its
+/// meaning to GDB: `org.gnu.gdb.arm.m-profile` tells GDB's ARM gdbarch that
+/// this target is M-profile, and `org.gnu.gdb.arm.m-system` tells it where to
+/// find `MSP`, `PSP` and the mask registers. Putting a register in the wrong
+/// one is not cosmetic — the gdbarch looks for each register *in* the feature
+/// it belongs to, and finds nothing if it is elsewhere.
+///
+/// The registers themselves stay in [`Arch::regs`], one flat slice in
+/// `g`-packet order. A feature names the index its registers **start** at, and
+/// runs to the start of the next one (or to the end of the map). That way the
+/// common single-feature case states no count that could drift out of step
+/// with the table beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Feature {
+    /// The `name` attribute, which is what GDB matches on.
+    ///
+    /// `org.rsemu.*` rather than `org.gnu.gdb.*` on purpose where a map cannot
+    /// keep the promise: an `org.gnu.gdb.…` name asserts that the feature
+    /// contains exactly the registers GDB's own gdbarch expects for it, in its
+    /// order.
+    pub name: &'static str,
+    /// Index into [`Arch::regs`] of this feature's first register.
+    pub first: usize,
+}
+
+impl Feature {
+    /// The whole register map as one feature — every core but ARMv7-M.
+    #[must_use]
+    pub const fn whole(name: &'static str) -> Feature {
+        Feature { name, first: 0 }
+    }
+
+    /// A feature starting at register `first`.
+    ///
+    /// Dead in a build with no core that splits its register file, which is
+    /// every build without `cpu-arm-v7m`.
+    #[allow(dead_code)]
+    const fn at(name: &'static str, first: usize) -> Feature {
+        Feature { name, first }
+    }
+}
+
 /// Everything the stub needs to debug one kind of CPU.
 #[derive(Debug)]
 pub struct Arch {
@@ -248,12 +307,19 @@ pub struct Arch {
     /// read off. A different version means the layout may have moved and the
     /// offsets are no longer trustworthy — see [`Arch::check`].
     pub verified_version: u32,
-    /// The feature name in the target description.
+    /// The `<feature>` elements the description is split into, in order.
     ///
-    /// `org.rsemu.*` rather than `org.gnu.gdb.*` on purpose: an `org.gnu.gdb.…`
-    /// name is a promise to GDB that the feature contains exactly the registers
-    /// GDB's own gdbarch expects for it, in its order, and none of these do.
-    pub feature: &'static str,
+    /// Almost every core has one, and [`Feature::whole`] writes that case. A
+    /// core has more than one when GDB's own gdbarch splits the register file:
+    /// ARMv7-M's system registers live in `org.gnu.gdb.arm.m-system` rather
+    /// than in `org.gnu.gdb.arm.m-profile`, and a description that put them in
+    /// the core feature would be claiming that feature contains registers GDB
+    /// does not expect to find there.
+    ///
+    /// [`Arch::regs`] stays one flat slice in `g`-packet order whatever the
+    /// split, because that order is the protocol's rather than the
+    /// description's: a register's number is its index here, across features.
+    pub features: &'static [Feature],
     /// The `<architecture>` element, when upstream GDB has a gdbarch by that
     /// name.
     ///
@@ -339,6 +405,25 @@ impl Arch {
         self.class.version == self.verified_version
     }
 
+    /// Which `<feature>` register `index` is declared in.
+    ///
+    /// `None` for an index past the end of the map. A register's *number* is
+    /// its position in [`Arch::regs`] whatever feature it is in — that is the
+    /// protocol's numbering, and the description's `regnum` attribute says so
+    /// explicitly — so this is for diagnostics and for the tests that hold the
+    /// split where GDB expects it, not for anything on the packet path.
+    #[must_use]
+    pub fn feature_of(&self, index: usize) -> Option<&'static str> {
+        if index >= self.regs.len() {
+            return None;
+        }
+        self.features
+            .iter()
+            .rev()
+            .find(|f| f.first <= index)
+            .map(|f| f.name)
+    }
+
     /// The target description GDB reads through `qXfer:features:read`.
     #[must_use]
     pub fn target_xml(&self) -> String {
@@ -349,18 +434,26 @@ impl Arch {
         if let Some(arch) = self.architecture {
             let _ = writeln!(xml, "  <architecture>{arch}</architecture>");
         }
-        let _ = writeln!(xml, "  <feature name=\"{}\">", self.feature);
-        for (i, reg) in self.regs.iter().enumerate() {
-            let _ = writeln!(
-                xml,
-                "    <reg name=\"{}\" bitsize=\"{}\" type=\"{}\" regnum=\"{}\"/>",
-                reg.name,
-                reg.bytes * 8,
-                reg.ty.as_str(),
-                i
-            );
+        for (n, feature) in self.features.iter().enumerate() {
+            // A feature runs to the next one's first register, or to the end.
+            let end = self
+                .features
+                .get(n + 1)
+                .map_or(self.regs.len(), |next| next.first);
+            let _ = writeln!(xml, "  <feature name=\"{}\">", feature.name);
+            for i in feature.first..end.min(self.regs.len()) {
+                let reg = self.regs[i];
+                let _ = writeln!(
+                    xml,
+                    "    <reg name=\"{}\" bitsize=\"{}\" type=\"{}\" regnum=\"{}\"/>",
+                    reg.name,
+                    reg.bytes * 8,
+                    reg.ty.as_str(),
+                    i
+                );
+            }
+            xml.push_str("  </feature>\n");
         }
-        xml.push_str("  </feature>\n");
         xml.push_str("</target>\n");
         xml
     }
@@ -516,7 +609,7 @@ static MOS6502_REGS: &[RegDesc] = &[
 pub static MOS6502: Arch = Arch {
     class: &crate::cpu::mos6502::CLASS,
     verified_version: 4,
-    feature: "org.rsemu.mos6502",
+    features: &[Feature::whole("org.rsemu.mos6502")],
     architecture: None,
     regs: MOS6502_REGS,
     pc: 5,
@@ -569,7 +662,7 @@ static Z80_REGS: &[RegDesc] = &[
 pub static Z80: Arch = Arch {
     class: &crate::cpu::z80::CLASS,
     verified_version: 2,
-    feature: "org.rsemu.z80",
+    features: &[Feature::whole("org.rsemu.z80")],
     architecture: None,
     regs: Z80_REGS,
     pc: 5,
@@ -620,7 +713,7 @@ const fn arm_regs() -> [RegDesc; 17] {
 pub static ARM: Arch = Arch {
     class: &crate::cpu::arm::aprofile::CLASS,
     verified_version: 3,
-    feature: "org.rsemu.arm",
+    features: &[Feature::whole("org.rsemu.arm")],
     architecture: Some("arm"),
     regs: &ARM_REGS,
     pc: 15,
@@ -680,7 +773,7 @@ const fn riscv_regs() -> [RegDesc; 33] {
 pub static RISCV: Arch = Arch {
     class: &crate::cpu::riscv::CLASS,
     verified_version: 1,
-    feature: "org.rsemu.riscv",
+    features: &[Feature::whole("org.rsemu.riscv")],
     architecture: Some("riscv:rv64"),
     regs: &RISCV_REGS,
     pc: 32,
@@ -978,7 +1071,7 @@ fn i386_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 pub static I386: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
     verified_version: 8,
-    feature: "org.gnu.gdb.i386.core",
+    features: &[Feature::whole("org.gnu.gdb.i386.core")],
     architecture: None,
     regs: &I386_REGS,
     pc: 8,
@@ -1010,7 +1103,7 @@ pub static I386: Arch = Arch {
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::I8086_CLASS,
     verified_version: 6,
-    feature: "org.gnu.gdb.i386.core",
+    features: &[Feature::whole("org.gnu.gdb.i386.core")],
     architecture: None,
     regs: &I386_REGS,
     pc: 8,
@@ -1192,7 +1285,7 @@ fn amd64_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 pub static AMD64: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
     verified_version: 8,
-    feature: "org.gnu.gdb.i386.core",
+    features: &[Feature::whole("org.gnu.gdb.i386.core")],
     architecture: Some("i386:x86-64"),
     regs: &AMD64_REGS,
     pc: 16,
@@ -1432,7 +1525,7 @@ fn a64_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 pub static A64: Arch = Arch {
     class: &crate::cpu::arm::a64::CLASS,
     verified_version: 2,
-    feature: "org.gnu.gdb.aarch64.core",
+    features: &[Feature::whole("org.gnu.gdb.aarch64.core")],
     architecture: Some("aarch64"),
     regs: &A64_REGS,
     pc: 32,
@@ -1493,7 +1586,7 @@ static SM83_REGS: &[RegDesc] = &[
 pub static SM83: Arch = Arch {
     class: &crate::cpu::sm83::CLASS,
     verified_version: 1,
-    feature: "org.rsemu.sm83",
+    features: &[Feature::whole("org.rsemu.sm83")],
     architecture: None,
     regs: SM83_REGS,
     pc: 9,
@@ -1506,34 +1599,93 @@ pub static SM83: Arch = Arch {
 
 // -- ARMv7-M ----------------------------------------------------------------
 
-/// `src/cpu/arm/v7m/mod.rs`'s `save`: `r[0..16]` as `u32`, the *other* stack
-/// pointer, a byte saying which one that is, then `xPSR`.
+/// Where each field of `cpu.arm.v7m`'s chunk starts.
+///
+/// `src/cpu/arm/v7m/mod.rs`'s `save`, in order: `r[0..16]` as `u32`, the
+/// *other* stack pointer, a byte saying which one that is, `xPSR`, `PRIMASK`
+/// and `FAULTMASK` as bytes, `BASEPRI` as a byte, then `CONTROL` as a word.
+///
+/// A module of named constants rather than literals at each use, because six
+/// of the eight are read by the hooks below as well as by the table, and an
+/// offset written twice is an offset that can move once.
+#[cfg(feature = "cpu-arm-v7m")]
+mod v7m_layout {
+    /// `r[13]`, the *selected* stack pointer.
+    pub(super) const SP: usize = 13 * 4;
+    /// The stack pointer that is not selected.
+    pub(super) const SP_OTHER: usize = 64;
+    /// One byte: whether `r[13]` is `PSP` rather than `MSP`.
+    pub(super) const SP_IS_PSP: usize = 68;
+    /// `xPSR`.
+    pub(super) const XPSR: usize = 69;
+    /// `PRIMASK.PM`, one byte.
+    pub(super) const PRIMASK: usize = 73;
+    /// `FAULTMASK.FM`, one byte.
+    pub(super) const FAULTMASK: usize = 74;
+    /// `BASEPRI`, one byte.
+    pub(super) const BASEPRI: usize = 75;
+    /// `CONTROL`, a word.
+    pub(super) const CONTROL: usize = 76;
+    /// One past `CONTROL`: the shortest chunk the hooks can decode.
+    pub(super) const REACH: usize = CONTROL + 4;
+
+    /// `xPSR.Exception` — non-zero in Handler mode (DDI 0403 B1.4.2).
+    pub(super) const EXCEPTION: u32 = 0x1ff;
+    /// `CONTROL.SPSEL`, which selects `PSP` in Thread mode (DDI 0403 B1.4.4).
+    pub(super) const SPSEL: u32 = 1 << 1;
+}
+
+/// gdb's register numbers for the M-profile map, which the hooks below switch
+/// on.
+#[cfg(feature = "cpu-arm-v7m")]
+mod v7m_reg {
+    /// `sp` — `r[13]`, and computed only so that a `G` packet writes it
+    /// *after* the registers that decide which bank it is.
+    pub(super) const SP: usize = 13;
+    /// `xpsr`, computed because writing it can change the mode and so the
+    /// stack-pointer banking.
+    pub(super) const XPSR: usize = 16;
+    /// The first register of `org.gnu.gdb.arm.m-system`.
+    pub(super) const MSP: usize = 17;
+    /// `psp`.
+    pub(super) const PSP: usize = 18;
+    /// `primask`, which gdb wants as a word and the core keeps as a byte.
+    pub(super) const PRIMASK: usize = 19;
+    /// `basepri`, likewise.
+    pub(super) const BASEPRI: usize = 20;
+    /// `faultmask`, likewise.
+    pub(super) const FAULTMASK: usize = 21;
+    /// `control`, computed because it selects the stack-pointer bank.
+    pub(super) const CONTROL: usize = 22;
+}
+
+/// `r0`-`r12`, `sp`, `lr`, `pc`, `xpsr`, then the system block.
 ///
 /// `r[13]` is the selected stack pointer and `r[15]` the program counter
 /// (`Regs`'s own documentation), so gdb's `sp`, `lr` and `pc` are slices of the
-/// register array and no banking hook is needed: the chunk already holds the
-/// active bank where an ARM programmer expects it, with the inactive one beside
-/// it. That is the opposite of AArch64, where the chunk holds both banks and
-/// nothing says which is `SP` — which is why this map needs no [`Computed`] and
-/// [`A64`] does.
+/// register array: the chunk already holds the active bank where an ARM
+/// programmer expects it, with the inactive one beside it. `MSP` and `PSP`
+/// individually are not slices — which of the two bytes ranges each one is
+/// depends on `sp_is_psp` — so those are the [`Computed`] entries, along with
+/// the three mask registers the core keeps narrower than gdb asks for.
 #[cfg(feature = "cpu-arm-v7m")]
-static V7M_REGS: [RegDesc; 17] = v7m_regs();
+static V7M_REGS: [RegDesc; 23] = v7m_regs();
 
 #[cfg(feature = "cpu-arm-v7m")]
-const fn v7m_regs() -> [RegDesc; 17] {
+const fn v7m_regs() -> [RegDesc; 23] {
     const NAMES: [&str; 16] = [
         "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp",
         "lr", "pc",
     ];
-    // `xpsr` is register 16, straight after `pc`, and lives past `sp_other`
-    // (a `u32`) and `sp_is_psp` (a byte).
-    let mut out = [RegDesc::int("xpsr", 4, 69); 17];
+    let mut out = [RegDesc::int("xpsr", 4, RegDesc::COMPUTED); 23];
     let mut i = 0;
     while i < 16 {
         out[i] = RegDesc {
             name: NAMES[i],
             bytes: 4,
-            offset: i * 4,
+            // `sp` answers from the hook, so that a whole-file write puts it
+            // in the bank `CONTROL` selects rather than the one it used to.
+            offset: if i == 13 { RegDesc::COMPUTED } else { i * 4 },
             ty: match i {
                 13 => RegType::DataPtr,
                 15 => RegType::CodePtr,
@@ -1542,7 +1694,227 @@ const fn v7m_regs() -> [RegDesc; 17] {
         };
         i += 1;
     }
+    // `org.gnu.gdb.arm.m-system`, every entry of it computed: two banked stack
+    // pointers and three registers the core keeps narrower than gdb declares
+    // them, plus a `CONTROL` whose write has to re-derive the banking.
+    out[v7m_reg::MSP] = RegDesc {
+        name: "msp",
+        bytes: 4,
+        offset: RegDesc::COMPUTED,
+        ty: RegType::DataPtr,
+    };
+    out[v7m_reg::PSP] = RegDesc {
+        name: "psp",
+        bytes: 4,
+        offset: RegDesc::COMPUTED,
+        ty: RegType::DataPtr,
+    };
+    out[v7m_reg::PRIMASK] = RegDesc::int("primask", 4, RegDesc::COMPUTED);
+    out[v7m_reg::BASEPRI] = RegDesc::int("basepri", 4, RegDesc::COMPUTED);
+    out[v7m_reg::FAULTMASK] = RegDesc::int("faultmask", 4, RegDesc::COMPUTED);
+    out[v7m_reg::CONTROL] = RegDesc::int("control", 4, RegDesc::COMPUTED);
     out
+}
+
+/// The two features an M-profile description is split into.
+///
+/// GDB's ARM gdbarch looks each register up **in the feature it belongs to**,
+/// so `msp` declared inside `org.gnu.gdb.arm.m-profile` is a register GDB does
+/// not find. The manual's ARM Features appendix names `msp` and `psp` as what
+/// `org.gnu.gdb.arm.m-system` must contain; the four mask and control
+/// registers are looked for in the same feature and are what every M-profile
+/// stub puts there, which is why they are here and not in an `org.rsemu.*`
+/// feature of our own.
+#[cfg(feature = "cpu-arm-v7m")]
+static V7M_FEATURES: [Feature; 2] = [
+    Feature::whole("org.gnu.gdb.arm.m-profile"),
+    Feature::at("org.gnu.gdb.arm.m-system", v7m_reg::MSP),
+];
+
+/// The banked stack pointers, the narrow system registers, and the two writes
+/// that have to re-derive which bank is which.
+///
+/// Three separate jobs, and they are all here because they all turn on one
+/// byte of the chunk:
+///
+/// * **Banking.** The chunk keeps the *selected* stack pointer in `r[13]` and
+///   the other one beside it, with `sp_is_psp` saying which is which. gdb asks
+///   for `msp` and `psp` by name, so each is one of the two depending on that
+///   byte.
+/// * **Width.** `PRIMASK` and `FAULTMASK` are single bits and `BASEPRI` is a
+///   byte; gdb declares all three thirty-two bits wide, as the parts' own
+///   `MRS` encodings do (DDI 0403 B4.2.2-B4.2.5).
+/// * **The invariant.** `sp_is_psp` is not independent state: it is
+///   `!Handler && CONTROL.SPSEL` (DDI 0403 B1.4.1), and the core keeps it that
+///   way with `sync_stack` after every write to either input. A debugger's
+///   write goes through `Device::load`, which restores the byte as it finds
+///   it — so writing `xpsr` or `control` here re-derives it, or the core
+///   resumes with the guest's stack pointer in the wrong bank.
+#[cfg(feature = "cpu-arm-v7m")]
+static V7M_COMPUTED: Computed = Computed {
+    read: v7m_read,
+    write: v7m_write,
+    reach: v7m_layout::REACH,
+    // `control` selects which bank `sp`, `msp` and `psp` land in, so it is
+    // written before them. `xpsr` is the other input to that decision and is
+    // an ordinary slice write, which the first pass does in register order —
+    // sixteen comes before twenty-two, so it is already in place.
+    selects: &[v7m_reg::CONTROL],
+};
+
+/// Whether `r[13]` currently holds `PSP`.
+#[cfg(feature = "cpu-arm-v7m")]
+fn v7m_sp_is_psp(chunk: &[u8]) -> Option<bool> {
+    Some(*chunk.get(v7m_layout::SP_IS_PSP)? != 0)
+}
+
+/// A `u32` field of the chunk.
+#[cfg(feature = "cpu-arm-v7m")]
+fn v7m_word(chunk: &[u8], offset: usize) -> Option<u32> {
+    let slice = chunk.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+/// Restore `sp_is_psp = !Handler && CONTROL.SPSEL`, swapping the banks if the
+/// answer changed. The core's `sync_stack`, done to a chunk.
+#[cfg(feature = "cpu-arm-v7m")]
+fn v7m_sync_stack(chunk: &mut [u8]) -> Option<()> {
+    let xpsr = v7m_word(chunk, v7m_layout::XPSR)?;
+    let control = v7m_word(chunk, v7m_layout::CONTROL)?;
+    let want_psp = xpsr & v7m_layout::EXCEPTION == 0 && control & v7m_layout::SPSEL != 0;
+    if want_psp == v7m_sp_is_psp(chunk)? {
+        return Some(());
+    }
+    let sp = v7m_word(chunk, v7m_layout::SP)?;
+    let other = v7m_word(chunk, v7m_layout::SP_OTHER)?;
+    chunk
+        .get_mut(v7m_layout::SP..v7m_layout::SP + 4)?
+        .copy_from_slice(&other.to_le_bytes());
+    chunk
+        .get_mut(v7m_layout::SP_OTHER..v7m_layout::SP_OTHER + 4)?
+        .copy_from_slice(&sp.to_le_bytes());
+    *chunk.get_mut(v7m_layout::SP_IS_PSP)? = u8::from(want_psp);
+    Some(())
+}
+
+#[cfg(feature = "cpu-arm-v7m")]
+fn v7m_read(chunk: &[u8], index: usize, out: &mut Vec<u8>) -> Access {
+    // The offset this register's bytes are at, or `None` for one that is not
+    // the hook's.
+    let offset = match index {
+        v7m_reg::SP => Some(v7m_layout::SP),
+        v7m_reg::XPSR => Some(v7m_layout::XPSR),
+        v7m_reg::CONTROL => Some(v7m_layout::CONTROL),
+        v7m_reg::MSP | v7m_reg::PSP => {
+            let Some(is_psp) = v7m_sp_is_psp(chunk) else {
+                return Access::Refused;
+            };
+            // `MSP` is `r[13]` unless `PSP` is the selected one, and `PSP` is
+            // the mirror of that.
+            Some(if is_psp == (index == v7m_reg::PSP) {
+                v7m_layout::SP
+            } else {
+                v7m_layout::SP_OTHER
+            })
+        }
+        // The narrow ones, widened to the width gdb declared.
+        v7m_reg::PRIMASK | v7m_reg::BASEPRI | v7m_reg::FAULTMASK => {
+            let at = match index {
+                v7m_reg::PRIMASK => v7m_layout::PRIMASK,
+                v7m_reg::BASEPRI => v7m_layout::BASEPRI,
+                _ => v7m_layout::FAULTMASK,
+            };
+            return match chunk.get(at) {
+                Some(byte) => {
+                    out.extend_from_slice(&u32::from(*byte).to_le_bytes());
+                    Access::Done
+                }
+                None => Access::Refused,
+            };
+        }
+        _ => None,
+    };
+    let Some(offset) = offset else {
+        return Access::Slice;
+    };
+    match chunk.get(offset..offset + 4) {
+        Some(bytes) => {
+            out.extend_from_slice(bytes);
+            Access::Done
+        }
+        None => Access::Refused,
+    }
+}
+
+#[cfg(feature = "cpu-arm-v7m")]
+fn v7m_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
+    let narrow = |chunk: &mut [u8], at: usize, byte: u8| match chunk.get_mut(at) {
+        Some(slot) => {
+            *slot = byte;
+            Access::Done
+        }
+        None => Access::Refused,
+    };
+    if data.len() != 4 {
+        // Every register this hook owns is four bytes on the wire.
+        return match index {
+            v7m_reg::SP
+            | v7m_reg::XPSR
+            | v7m_reg::MSP
+            | v7m_reg::PSP
+            | v7m_reg::PRIMASK
+            | v7m_reg::BASEPRI
+            | v7m_reg::FAULTMASK
+            | v7m_reg::CONTROL => Access::Refused,
+            _ => Access::Slice,
+        };
+    }
+    let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let offset = match index {
+        v7m_reg::SP => v7m_layout::SP,
+        v7m_reg::XPSR | v7m_reg::CONTROL => {
+            let at = if index == v7m_reg::XPSR {
+                v7m_layout::XPSR
+            } else {
+                v7m_layout::CONTROL
+            };
+            let Some(dst) = chunk.get_mut(at..at + 4) else {
+                return Access::Refused;
+            };
+            dst.copy_from_slice(data);
+            // Both inputs to the banking invariant; either can move it.
+            return match v7m_sync_stack(chunk) {
+                Some(()) => Access::Done,
+                None => Access::Refused,
+            };
+        }
+        v7m_reg::MSP | v7m_reg::PSP => {
+            let Some(is_psp) = v7m_sp_is_psp(chunk) else {
+                return Access::Refused;
+            };
+            if is_psp == (index == v7m_reg::PSP) {
+                v7m_layout::SP
+            } else {
+                v7m_layout::SP_OTHER
+            }
+        }
+        // `PRIMASK.PM` and `FAULTMASK.FM` are one bit each and the chunk holds
+        // them as a `bool`, so anything non-zero is the bit set — writing the
+        // low byte verbatim would put a value in there that `read_bool`
+        // rejects on the way back in.
+        v7m_reg::PRIMASK => return narrow(chunk, v7m_layout::PRIMASK, u8::from(value != 0)),
+        v7m_reg::FAULTMASK => return narrow(chunk, v7m_layout::FAULTMASK, u8::from(value != 0)),
+        // `BASEPRI` is a whole byte, and the bits above it are RES0.
+        v7m_reg::BASEPRI => return narrow(chunk, v7m_layout::BASEPRI, value as u8),
+        _ => return Access::Slice,
+    };
+    match chunk.get_mut(offset..offset + 4) {
+        Some(dst) => {
+            dst.copy_from_slice(data);
+            Access::Done
+        }
+        None => Access::Refused,
+    }
 }
 
 /// The ARMv7E-M core: `stm32f407`'s Cortex-M4.
@@ -1550,11 +1922,17 @@ const fn v7m_regs() -> [RegDesc; 17] {
 /// `org.gnu.gdb.arm.m-profile` is claimed, and it is a claim this map keeps:
 /// gdb's ARM gdbarch looks for that feature *first*, and finding it is how gdb
 /// learns the target is M-profile at all — it wants `r0`-`r12`, `sp`, `lr`,
-/// `pc` and `xpsr`, in that order, and that is the seventeen above. Getting
-/// that right is worth more here than on any other core in the tree: an
+/// `pc` and `xpsr`, in that order, and that is the first seventeen above.
+/// Getting that right is worth more here than on any other core in the tree: an
 /// M-profile gdb knows about `EXC_RETURN` addresses and the exception stack
 /// frame, so a fault in an interrupt handler unwinds instead of ending at a
 /// magic `0xfffffff9`.
+///
+/// `org.gnu.gdb.arm.m-system` carries the six the manual calls the system
+/// registers. They are what the questions a Cortex-M debugger is actually for
+/// are answered with — which stack a fault frame is on, whether interrupts are
+/// masked and by what, whether the code that faulted was unprivileged — and
+/// none of them is reachable through the core feature.
 ///
 /// `<architecture>arm</architecture>` rather than `armv7e-m`: `arm` is the bfd
 /// architecture name every gdb build with an ARM port answers to, and the
@@ -1563,7 +1941,7 @@ const fn v7m_regs() -> [RegDesc; 17] {
 pub static V7M: Arch = Arch {
     class: &crate::cpu::arm::v7m::CLASS,
     verified_version: 1,
-    feature: "org.gnu.gdb.arm.m-profile",
+    features: &V7M_FEATURES,
     architecture: Some("arm"),
     regs: &V7M_REGS,
     pc: 15,
@@ -1573,7 +1951,7 @@ pub static V7M: Arch = Arch {
         offset: 80,
         bytes: 8,
     }),
-    computed: None,
+    computed: Some(&V7M_COMPUTED),
 };
 
 // -- Motorola 68000 ---------------------------------------------------------
@@ -1680,7 +2058,7 @@ fn m68k_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 pub static M68K: Arch = Arch {
     class: &crate::cpu::m68k::CLASS,
     verified_version: 2,
-    feature: "org.gnu.gdb.m68k.core",
+    features: &[Feature::whole("org.gnu.gdb.m68k.core")],
     architecture: Some("m68k"),
     regs: &M68K_REGS,
     pc: 17,
@@ -1761,12 +2139,64 @@ mod tests {
         }
     }
 
+    /// A feature span that does not start where the last one ended, or that
+    /// starts past the end of the map, silently drops registers out of the
+    /// description: `target_xml` walks `first..next.first`, so a gap is
+    /// registers no feature declares and GDB never sees.
+    #[test]
+    fn every_feature_span_covers_the_map_exactly_once() {
+        for arch in all() {
+            let (first, rest) = arch
+                .features
+                .split_first()
+                .unwrap_or_else(|| panic!("{}: no features at all", arch.class.name));
+            assert_eq!(
+                first.first, 0,
+                "{}: the first feature starts at register {}",
+                arch.class.name, first.first
+            );
+            let mut previous = first.first;
+            for feature in rest {
+                assert!(
+                    feature.first > previous,
+                    "{}: `{}` starts at {}, which is not past the feature before it",
+                    arch.class.name,
+                    feature.name,
+                    feature.first
+                );
+                previous = feature.first;
+            }
+            assert!(
+                previous < arch.regs.len(),
+                "{}: a feature starts at {previous}, past the {} registers there are",
+                arch.class.name,
+                arch.regs.len()
+            );
+            // And every register is in exactly one of them.
+            for (i, reg) in arch.regs.iter().enumerate() {
+                assert!(
+                    arch.feature_of(i).is_some(),
+                    "{}: `{}` is in no feature",
+                    arch.class.name,
+                    reg.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_generated_description_names_every_register_once() {
         for arch in all() {
             let xml = arch.target_xml();
             assert!(xml.starts_with("<?xml"), "{}", arch.class.name);
-            assert!(xml.contains(arch.feature), "{}", arch.class.name);
+            for feature in arch.features {
+                assert!(
+                    xml.contains(&format!("<feature name=\"{}\">", feature.name)),
+                    "{}: no `{}` element",
+                    arch.class.name,
+                    feature.name
+                );
+            }
             for (i, reg) in arch.regs.iter().enumerate() {
                 let expect = format!(
                     "<reg name=\"{}\" bitsize=\"{}\" type=\"{}\" regnum=\"{}\"/>",
@@ -1861,5 +2291,59 @@ mod tests {
     fn the_6502_g_packet_is_seven_bytes() {
         assert_eq!(MOS6502.packet_len(), 7);
         assert_eq!(MOS6502.chunk_reach(), 15);
+    }
+
+    /// One single-feature description, pinned whole.
+    ///
+    /// [`Arch::features`] replaced a single `feature: &str`, and the thing that
+    /// change could have broken without any other test noticing is the *shape*
+    /// of the document a one-feature core emits — every core but ARMv7-M. So
+    /// one of them is written out here in full: byte for byte what the stub
+    /// sent before the split existed.
+    #[cfg(feature = "cpu-mos6502")]
+    #[test]
+    fn a_single_feature_description_is_the_document_it_always_was() {
+        assert_eq!(
+            MOS6502.target_xml(),
+            "<?xml version=\"1.0\"?>\n\
+             <!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n\
+             <target version=\"1.0\">\n  \
+               <feature name=\"org.rsemu.mos6502\">\n    \
+                 <reg name=\"a\" bitsize=\"8\" type=\"int\" regnum=\"0\"/>\n    \
+                 <reg name=\"x\" bitsize=\"8\" type=\"int\" regnum=\"1\"/>\n    \
+                 <reg name=\"y\" bitsize=\"8\" type=\"int\" regnum=\"2\"/>\n    \
+                 <reg name=\"sp\" bitsize=\"8\" type=\"data_ptr\" regnum=\"3\"/>\n    \
+                 <reg name=\"p\" bitsize=\"8\" type=\"int\" regnum=\"4\"/>\n    \
+                 <reg name=\"pc\" bitsize=\"16\" type=\"code_ptr\" regnum=\"5\"/>\n  \
+               </feature>\n\
+             </target>\n"
+        );
+    }
+
+    /// The split description, which is the whole point of [`Feature`].
+    #[cfg(feature = "cpu-arm-v7m")]
+    #[test]
+    fn the_m_profile_description_has_two_features_and_keeps_one_numbering() {
+        let xml = V7M.target_xml();
+        let profile = xml
+            .find("<feature name=\"org.gnu.gdb.arm.m-profile\">")
+            .expect("the core feature");
+        let system = xml
+            .find("<feature name=\"org.gnu.gdb.arm.m-system\">")
+            .expect("the system feature");
+        assert!(profile < system, "the core feature comes first");
+        // `xpsr` is the last register of the core feature and `msp` the first
+        // of the system one, and the numbering runs straight through: GDB
+        // numbers by `regnum`, not by feature.
+        assert!(xml.contains("<reg name=\"xpsr\" bitsize=\"32\" type=\"int\" regnum=\"16\"/>"));
+        assert!(xml.contains("<reg name=\"msp\" bitsize=\"32\" type=\"data_ptr\" regnum=\"17\"/>"));
+        assert!(xml.contains("<reg name=\"control\" bitsize=\"32\" type=\"int\" regnum=\"22\"/>"));
+        assert_eq!(V7M.feature_of(16), Some("org.gnu.gdb.arm.m-profile"));
+        assert_eq!(V7M.feature_of(17), Some("org.gnu.gdb.arm.m-system"));
+        assert_eq!(V7M.feature_of(23), None);
+        // Twenty-three words: seventeen in the core feature and six in the
+        // system one, which is what the `g` packet is once the description
+        // declares them.
+        assert_eq!(V7M.packet_len(), 92);
     }
 }
