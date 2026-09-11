@@ -1204,6 +1204,26 @@ machine-riscv-virt = ["cpu-riscv", "dev-riscv", "dev-virtio", "dev-flash-cfi"]
 # Adds no dependencies and is `no_std + alloc`.
 cpu-arm-v7m = []
 
+# The FPv4-SP / FPv5-SP floating-point extension for `cpu-arm-v7m`
+# (src/cpu/arm/v7m/fp.rs and fpisa.rs): `S0`-`S31`, `FPSCR`, the whole
+# single-precision instruction set a Cortex-M4F executes -- VABS VADD VCMP(E)
+# VCVT (integer, fixed-point and half) VDIV VFMA/VFMS/VFNMA/VFNMS VLDM VLDR
+# VMLA/VMLS VMOV (immediate, register, core and core-pair) VMRS VMSR VMUL
+# VNEG VNMLA/VNMLS/VNMUL VPOP VPUSH VSQRT VSTM VSTR VSUB -- plus the FPv5
+# additions a single-precision Cortex-M7 has (VSEL, VMAXNM/VMINNM,
+# VCVTA/N/P/M, VRINT*), and the M-profile exception model that goes with them:
+# `CPACR` gating with a NOCP UsageFault when the coprocessor is off,
+# `CONTROL.FPCA`, the 26-word extended frame, `EXC_RETURN[4]`, and **lazy state
+# preservation** with `FPCCR.LSPEN`/`LSPACT` and `FPCAR`, which is what
+# firmware's interrupt latency actually depends on. The arithmetic is the
+# crate's software IEEE-754 (`float`), not host `f32`, so a guest FPU is
+# bit-reproducible across hosts (ROADMAP.md §9.1). Single precision only:
+# `MVFR0.D_Precision` reads zero and a `VADD.F64` is UNDEFINED, which is what
+# an FPv4-SP-D16 or FPv5-SP-D16 part does. Selected per instance by
+# `part = "cortex-m4f"` / `"cortex-m7f"`, so one build still runs an M3.
+# `no_std + alloc`, no `unsafe`, no dependencies.
+cpu-arm-v7m-fp = ["cpu-arm-v7m", "float"]
+
 # STM32 peripherals (src/dev/stm32): a GPIO port and a USART, as separate
 # classes a `.machine` file places at the addresses its reference manual gives
 # them. The GPIO is the whole F4 register file -- MODER/OTYPER/OSPEEDR/PUPDR,
@@ -1327,6 +1347,10 @@ dev-stm32-pwr = []
 # than in any device model. Adds no dependencies.
 machine-stm32f407 = [
     "cpu-arm-v7m",
+    # An F407 has FPv4-SP-D16, and firmware built `-mfloat-abi=hard` needs it
+    # from its first function call. The board file chooses whether to model the
+    # part with it (`part = "cortex-m4f"`); this only makes the option exist.
+    "cpu-arm-v7m-fp",
     "dev-stm32",
     "dev-stm32-i2c",
     "dev-stm32-rcc",

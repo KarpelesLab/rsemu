@@ -733,6 +733,13 @@ fn run_one_arch_test(
 const LEDGERS: &[(&str, bool)] = &[
     // (file stem, keyed by test name rather than by opcode)
     ("accuracycoin", false),
+    // No downloadable VFP corpus exists to key this one to a run: the ARMv7E-M
+    // floating-point unit is measured by its in-tree ledger table, its
+    // differential against the A64 core's wrapper and the `clang`-built corpus,
+    // all of which live in `src/cpu/arm/v7m`. The file is here because it is a
+    // known-gaps list in the same format and under the same rule — it only ever
+    // shrinks — and the parser check below is what keeps it honest.
+    ("cpu-arm-v7m-fp", true),
     ("riscv-arch-test", true),
     ("sst-6502", false),
     ("sst-nes6502", false),

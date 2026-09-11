@@ -190,66 +190,64 @@ hang:
     b hang
 "#;
 
-/// One test's name and body.
+/// One test's name and body, and which part it runs on.
 struct Test {
     name: &'static str,
     body: &'static str,
+    /// The part to build it for. A floating-point test needs a Cortex-M4F,
+    /// and it needs `clang` to accept the VFP mnemonics, which is why the
+    /// part travels with the test rather than being a property of the runner.
+    part: Config,
+}
+
+impl Test {
+    const fn new(name: &'static str, body: &'static str) -> Test {
+        Test {
+            name,
+            body,
+            part: Config::CORTEX_M4,
+        }
+    }
+
+    /// The same test on a Cortex-M4F.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    const fn on_m4f(self) -> Test {
+        Test {
+            part: Config::CORTEX_M4F,
+            ..self
+        }
+    }
+
+    /// Whether this test's part has a floating-point unit, which decides the
+    /// `-mfpu` `clang` needs.
+    const fn wants_fpu(&self) -> bool {
+        self.part.ext.fp.present()
+    }
 }
 
 /// The corpus.
 static CORPUS: &[Test] = &[
-    Test {
-        name: "t32-dataproc",
-        body: super::corpus::DATAPROC,
-    },
-    Test {
-        name: "t32-shift",
-        body: super::corpus::SHIFT,
-    },
-    Test {
-        name: "t32-memory",
-        body: super::corpus::MEMORY,
-    },
-    Test {
-        name: "t32-multiply",
-        body: super::corpus::MULTIPLY,
-    },
-    Test {
-        name: "t32-bitfield",
-        body: super::corpus::BITFIELD,
-    },
-    Test {
-        name: "t32-branch",
-        body: super::corpus::BRANCH,
-    },
-    Test {
-        name: "t32-it",
-        body: super::corpus::IT,
-    },
-    Test {
-        name: "dsp-simd",
-        body: super::corpus::DSP_SIMD,
-    },
-    Test {
-        name: "dsp-multiply",
-        body: super::corpus::DSP_MULTIPLY,
-    },
-    Test {
-        name: "exceptions",
-        body: super::corpus::EXCEPTIONS,
-    },
-    Test {
-        name: "faults",
-        body: super::corpus::FAULTS,
-    },
-    Test {
-        name: "nvic-systick",
-        body: super::corpus::NVIC_SYSTICK,
-    },
-    Test {
-        name: "mpu",
-        body: super::corpus::MPU,
-    },
+    Test::new("t32-dataproc", super::corpus::DATAPROC),
+    Test::new("t32-shift", super::corpus::SHIFT),
+    Test::new("t32-memory", super::corpus::MEMORY),
+    Test::new("t32-multiply", super::corpus::MULTIPLY),
+    Test::new("t32-bitfield", super::corpus::BITFIELD),
+    Test::new("t32-branch", super::corpus::BRANCH),
+    Test::new("t32-it", super::corpus::IT),
+    Test::new("dsp-simd", super::corpus::DSP_SIMD),
+    Test::new("dsp-multiply", super::corpus::DSP_MULTIPLY),
+    Test::new("exceptions", super::corpus::EXCEPTIONS),
+    Test::new("faults", super::corpus::FAULTS),
+    Test::new("nvic-systick", super::corpus::NVIC_SYSTICK),
+    Test::new("mpu", super::corpus::MPU),
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    Test::new("fp-arith", super::corpus::FP_ARITH).on_m4f(),
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    Test::new("fp-convert", super::corpus::FP_CONVERT).on_m4f(),
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    Test::new("fp-memory", super::corpus::FP_MEMORY).on_m4f(),
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    Test::new("fp-exceptions", super::corpus::FP_EXCEPTIONS).on_m4f(),
 ];
 
 /// What running one test produced.
@@ -280,7 +278,18 @@ enum Outcome {
 
 /// Assemble one test, returning the loadable object.
 fn assemble(clang: &str, dir: &Path, test: &Test) -> Result<Object, String> {
-    let source = format!("{PROLOGUE}{}{EPILOGUE}", test.body);
+    // A floating-point test gets the `CPACR` enable in front of it, because
+    // every one of them would otherwise open with the same eight lines and
+    // the first `NOCP` would be reported as a mysterious HardFault.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    let enable = if test.wants_fpu() {
+        super::corpus::ENABLE_FP
+    } else {
+        ""
+    };
+    #[cfg(not(feature = "cpu-arm-v7m-fp"))]
+    let enable = "";
+    let source = format!("{PROLOGUE}{enable}{}{EPILOGUE}", test.body);
     let src = dir.join(format!("{}.S", test.name));
     let obj = dir.join(format!("{}.o", test.name));
     std::fs::write(&src, source).map_err(|e| format!("writing {}: {e}", src.display()))?;
@@ -289,6 +298,13 @@ fn assemble(clang: &str, dir: &Path, test: &Test) -> Result<Object, String> {
             "--target=thumbv7em-none-eabi",
             "-mcpu=cortex-m4",
             "-mthumb",
+            // A test that names `S0` needs the assembler told the unit is
+            // there; one that does not is unaffected by the flag.
+            if test.wants_fpu() {
+                "-mfpu=fpv4-sp-d16"
+            } else {
+                "-mfpu=none"
+            },
             "-c",
             "-o",
         ])
@@ -304,7 +320,7 @@ fn assemble(clang: &str, dir: &Path, test: &Test) -> Result<Object, String> {
 }
 
 /// Run one loaded object to completion.
-fn run(object: &Object) -> Outcome {
+fn run(object: &Object, part: Config) -> Outcome {
     let flash = Arc::new(RamStore::new(FLASH_SIZE));
     flash.write_at(0, &object.image).expect("image fits");
     let ram = Arc::new(RamStore::new(RAM_SIZE));
@@ -322,7 +338,7 @@ fn run(object: &Object) -> Outcome {
             .expect("RAM fits");
     }
 
-    let cpu = ArmV7m::new(Config::CORTEX_M4);
+    let cpu = ArmV7m::new(part);
     cpu.attach_space(Arc::new(space));
     Device::reset(&cpu, ResetKind::Cold);
 
@@ -462,7 +478,7 @@ fn built_corpus() {
                 continue;
             }
         };
-        match run(&object) {
+        match run(&object, test.part) {
             Outcome::Pass => passed += 1,
             Outcome::Failed {
                 check,
@@ -519,10 +535,7 @@ fn the_loader_rejects_a_relocation() {
     // `.word _start` cannot be resolved by the assembler, so it becomes a
     // relocation — exactly the case the loader must refuse rather than load
     // as zeroes.
-    let test = Test {
-        name: "loader-guard",
-        body: "    .word _start\n",
-    };
+    let test = Test::new("loader-guard", "    .word _start\n");
     match assemble(&clang, &dir, &test) {
         Err(why) => assert!(
             why.contains("relocation"),

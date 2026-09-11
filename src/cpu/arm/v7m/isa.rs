@@ -1249,6 +1249,15 @@ pub enum Insn {
         /// floating-point unit.
         cp: u8,
     },
+    /// A floating-point instruction, decoded by [`super::fpisa`].
+    ///
+    /// Only reachable where the FPv4-SP/FPv5 extension is compiled in; without
+    /// it a coprocessor 10 encoding stays an [`Insn::Coproc`] and the
+    /// interpreter raises `UFSR.NOCP`, which is what a part without the option
+    /// does.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
+    Fp(super::fpisa::FpInsn),
     /// An encoding this architecture does not define.
     Undefined,
 }
@@ -1706,6 +1715,26 @@ const fn extend16(op: ExtendOp, rd: u8, rm: u8) -> Insn {
 // 32-bit encodings (DDI 0403 A5.3)
 // ---------------------------------------------------------------------------
 
+/// A coprocessor, Advanced SIMD or floating-point encoding (A5.3.18).
+///
+/// Where the floating-point extension is compiled in, [`super::fpisa::decode`]
+/// gets first refusal; anything it does not recognise stays an
+/// [`Insn::Coproc`], which carries the coprocessor number so the interpreter
+/// can tell `UFSR.NOCP` from `UFSR.UNDEFINSTR` using the *configuration* — a
+/// runtime fact the decoder does not have.
+#[inline]
+fn coproc(hw1: u16, hw2: u16, b: u32) -> Insn {
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    if let Some(fp) = super::fpisa::decode(hw1, hw2) {
+        return Insn::Fp(fp);
+    }
+    #[cfg(not(feature = "cpu-arm-v7m-fp"))]
+    let _ = (hw1, hw2);
+    Insn::Coproc {
+        cp: field(b, 11, 8) as u8,
+    }
+}
+
 /// Decode a thirty-two-bit T32 instruction (DDI 0403 A5.3).
 fn decode_32(hw1: u16, hw2: u16) -> Insn {
     let a = u32::from(hw1);
@@ -1716,9 +1745,7 @@ fn decode_32(hw1: u16, hw2: u16) -> Insn {
         0b01 => {
             if op2 & 0b1000000 != 0 {
                 // Coprocessor, Advanced SIMD, floating point (A5.3.18).
-                Insn::Coproc {
-                    cp: field(b, 11, 8) as u8,
-                }
+                coproc(hw1, hw2, b)
             } else if op2 & 0b1100100 == 0b0000000 {
                 decode_32_ldm_stm(a, b)
             } else if op2 & 0b1100100 == 0b0000100 {
@@ -1738,9 +1765,7 @@ fn decode_32(hw1: u16, hw2: u16) -> Insn {
         }
         0b11 => {
             if op2 & 0b1000000 != 0 {
-                Insn::Coproc {
-                    cp: field(b, 11, 8) as u8,
-                }
+                coproc(hw1, hw2, b)
             } else if op2 & 0b1110001 == 0b0000000 {
                 decode_32_store_single(a, b)
             } else if op2 & 0b1100111 == 0b0000001
@@ -3259,6 +3284,8 @@ impl fmt::Display for Insn {
             Insn::Svc { imm } => write!(f, "SVC #{imm}"),
             Insn::Udf { imm } => write!(f, "UDF #{imm}"),
             Insn::Coproc { cp } => write!(f, "<coproc p{cp}>"),
+            #[cfg(feature = "cpu-arm-v7m-fp")]
+            Insn::Fp(fp) => fp.fmt(f),
             Insn::Undefined => f.write_str("UNDEFINED"),
         }
     }

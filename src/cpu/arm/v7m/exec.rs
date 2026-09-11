@@ -52,6 +52,13 @@ use super::isa::{
 use super::sys::{Access, Exception, MPU_REGIONS, Sys, ccr, control, exc_return, fsr, in_ppb};
 use super::{Config, xpsr};
 
+#[cfg(feature = "cpu-arm-v7m-fp")]
+use super::fp;
+#[cfg(feature = "cpu-arm-v7m-fp")]
+use super::fpisa::{DataOp, FpInsn, UnaryOp};
+#[cfg(feature = "cpu-arm-v7m-fp")]
+use super::sys::fpccr;
+
 /// A fault on its way back up to [`Exec::step`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Trap {
@@ -120,6 +127,14 @@ pub(super) struct State {
     pub control: u32,
     /// The NVIC, SCB, SysTick and MPU.
     pub sys: Sys,
+    /// `S0`–`S31` and `FPSCR`.
+    ///
+    /// Present whatever the configuration says, because a `Config` with no
+    /// FPU simply never reaches it — one field costs 132 bytes and saves a
+    /// second `State` shape. `save`/`load` write it only for a part that has
+    /// a unit, so a Cortex-M3's snapshot is unchanged.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    pub fp: fp::Fpu,
     /// Cycles executed since power-on.
     pub cycles: u64,
     /// Cycles already run that a future scheduler budget still owes — see
@@ -149,6 +164,17 @@ pub(super) struct State {
 impl State {
     /// Power-on state, before the reset sequence has run.
     pub(super) fn new(cfg: &Config) -> State {
+        let sys = Sys::new(
+            cfg.cpuid,
+            cfg.priority_bits,
+            if cfg.ext.mpu { MPU_REGIONS as u8 } else { 0 },
+        );
+        #[cfg(feature = "cpu-arm-v7m-fp")]
+        let sys = if cfg.ext.fp.present() {
+            sys.with_fp(cfg.ext.fp.mvfr())
+        } else {
+            sys
+        };
         State {
             r: [0; 16],
             sp_other: 0,
@@ -160,11 +186,9 @@ impl State {
             faultmask: false,
             basepri: 0,
             control: 0,
-            sys: Sys::new(
-                cfg.cpuid,
-                cfg.priority_bits,
-                if cfg.ext.mpu { MPU_REGIONS as u8 } else { 0 },
-            ),
+            sys,
+            #[cfg(feature = "cpu-arm-v7m-fp")]
+            fp: fp::Fpu::new(),
             cycles: 0,
             debt: 0,
             asleep: false,
@@ -781,13 +805,26 @@ impl<'a> Exec<'a> {
         // Taking an exception ends a `WFI` or `WFE` whether or not the
         // instruction stream ever gets back to it.
         self.state.asleep = false;
-        let frame_align = self.state.sys.ccr & ccr::STKALIGN != 0;
+        // Whether this context's floating-point registers travel with the
+        // frame. `CONTROL.FPCA` says the context has used the FPU; `CPACR`
+        // has to still allow it, because firmware that turns the coprocessor
+        // off mid-flight must not make the core push registers it can no
+        // longer reach (DDI 0403E B1.5.7).
+        let fp_frame = self.fp_frame_wanted();
+        // The extended frame forces eight-byte alignment whatever
+        // `CCR.STKALIGN` says.
+        let frame_align = self.state.sys.ccr & ccr::STKALIGN != 0 || fp_frame;
+        let framesize = if fp_frame {
+            exc_return::EXTENDED_FRAME
+        } else {
+            exc_return::BASIC_FRAME
+        };
         let mut sp = self.state.r[13];
         let aligned = frame_align && sp & 4 != 0;
         if aligned {
             sp = sp.wrapping_sub(4);
         }
-        sp = sp.wrapping_sub(32);
+        sp = sp.wrapping_sub(framesize);
         // The `SPSEL`-selected stack is the one that gets the frame; the
         // handler then runs on the main stack.
         self.state.r[13] = sp;
@@ -812,6 +849,16 @@ impl<'a> Exec<'a> {
                 stack_failed = true;
             }
         }
+        // The floating-point half of the frame: either written now, or
+        // reserved with `FPCAR` pointing at it and `LSPACT` set so the first
+        // floating-point instruction in the handler writes it instead. This
+        // has to happen while the interrupted context's mode and privilege
+        // are still current, because `FPCCR.USER`/`THREAD` record them.
+        #[cfg(feature = "cpu-arm-v7m-fp")]
+        if fp_frame {
+            stack_failed |= self.stack_fp_frame(sp, privileged);
+        }
+
         if stack_failed {
             // The frame is lost; the architecture reports `STKERR` and the
             // fault escalates. Reporting it and continuing into the handler
@@ -820,13 +867,16 @@ impl<'a> Exec<'a> {
             self.state.sys.hfsr |= fsr::HF_FORCED;
         }
 
-        let lr = if self.state.in_handler() {
+        let mut lr = if self.state.in_handler() {
             exc_return::HANDLER_MSP
         } else if self.state.control & control::SPSEL != 0 {
             exc_return::THREAD_PSP
         } else {
             exc_return::THREAD_MSP
         };
+        if fp_frame {
+            lr &= !exc_return::FP_FRAME;
+        }
         self.state.r[14] = lr;
 
         // Handler mode, on the main stack, with `ITSTATE` cleared.
@@ -836,6 +886,7 @@ impl<'a> Exec<'a> {
         self.state.sys.set_active(exc, true);
         self.state.sys.set_pending(exc, false);
         self.state.exclusive = None;
+        self.enter_fp_context();
 
         let vector = self.state.sys.vtor.wrapping_add(exc.vector_offset());
         match self.read_vector(vector) {
@@ -861,15 +912,27 @@ impl<'a> Exec<'a> {
         if !self.state.sys.is_active(returning) {
             return Err(Trap::INVPC);
         }
-        // Only the three integer values are legal here. The floating-point
-        // ones (`0xFFFFFFE1`, `E9`, `ED`) name a frame this core never
-        // pushes, because it has no FPU.
-        let (to_handler, use_psp) = match magic {
+        // Six legal values: the three integer ones, and the three with bit 4
+        // clear that name the extended frame. A part with no FPU never
+        // produces one of the latter, so it rejects them here — which is what
+        // makes a stray `EXC_RETURN` a fault rather than a wild unstack.
+        let fp_frame = magic & exc_return::FP_FRAME == 0;
+        let (to_handler, use_psp) = match magic | exc_return::FP_FRAME {
             exc_return::HANDLER_MSP => (true, false),
             exc_return::THREAD_MSP => (false, false),
             exc_return::THREAD_PSP => (false, true),
             _ => return Err(Trap::INVPC),
         };
+        if fp_frame && !self.fp_present() {
+            return Err(Trap::INVPC);
+        }
+        // Unstacking the floating-point registers is itself a use of the
+        // coprocessor: if firmware disabled `CPACR` inside the handler, the
+        // return takes a `NOCP` UsageFault rather than writing registers it
+        // may no longer reach (DDI 0403E B1.5.8).
+        if fp_frame && !self.state.sys.fp_enabled(self.state.privileged()) {
+            return Err(Trap::NOCP);
+        }
         let nested = self.state.sys.active_count() > 1;
         if !to_handler && nested && self.state.sys.ccr & ccr::NONBASETHRDENA == 0 {
             return Err(Trap::INVPC);
@@ -896,6 +959,11 @@ impl<'a> Exec<'a> {
             self.state.xpsr = (self.state.xpsr & !(xpsr::EXCEPTION | xpsr::IT_MASK))
                 | u32::from(next.0) & xpsr::EXCEPTION;
             self.state.sync_stack();
+            // Tail-chaining skips the unstack and the restack, but it is
+            // still an `ExceptionTaken`: the new handler starts with no
+            // floating-point context of its own and with `FPSCR` back at
+            // `FPDSCR`, exactly as if it had been entered the long way.
+            self.enter_fp_context();
             let vector = self.state.sys.vtor.wrapping_add(next.vector_offset());
             match self.read_vector(vector) {
                 Some(entry) => {
@@ -937,6 +1005,15 @@ impl<'a> Exec<'a> {
                 Err(_) => unstack_failed = true,
             }
         }
+        // The floating-point half, if the frame has one. A frame that was
+        // only ever *reserved* — `LSPACT` still set, so no handler touched
+        // the FPU — needs no restore at all: `S0`–`S15` still hold what the
+        // interrupted code left there, which is the whole point of the lazy
+        // scheme. Clearing `LSPACT` is all the unstack it gets.
+        #[cfg(feature = "cpu-arm-v7m-fp")]
+        if fp_frame {
+            unstack_failed |= self.unstack_fp_frame(sp, privileged);
+        }
         if unstack_failed {
             self.state.sys.cfsr |= fsr::BF_UNSTKERR;
             self.state.sys.hfsr |= fsr::HF_FORCED;
@@ -949,11 +1026,17 @@ impl<'a> Exec<'a> {
         self.state.r[14] = frame[5];
 
         let stacked_xpsr = frame[7];
-        let mut sp = sp.wrapping_add(32);
-        if self.state.sys.ccr & ccr::STKALIGN != 0 && stacked_xpsr & (1 << 9) != 0 {
+        let framesize = if fp_frame {
+            exc_return::EXTENDED_FRAME
+        } else {
+            exc_return::BASIC_FRAME
+        };
+        let mut sp = sp.wrapping_add(framesize);
+        if (self.state.sys.ccr & ccr::STKALIGN != 0 || fp_frame) && stacked_xpsr & (1 << 9) != 0 {
             sp = sp.wrapping_add(4);
         }
         self.state.r[13] = sp;
+        self.leave_fp_context(fp_frame);
 
         // Restore the flags, `GE`, `ITSTATE`, `T` and the exception number in
         // one go; the reserved bits are dropped.
@@ -1571,7 +1654,21 @@ impl<'a> Exec<'a> {
                 }
                 Ok(())
             }
-            Insn::Coproc { .. } => Err(Trap::NOCP),
+            // A coprocessor this core does not have is `NOCP`. Ten and
+            // eleven are the floating-point unit: on a part that has one and
+            // has it enabled, an encoding the decoder did not recognise is a
+            // *defined-but-absent* instruction — a double-precision `VADD` on
+            // a single-precision part, say — and that is UNDEFINED, not
+            // `NOCP`.
+            Insn::Coproc { cp } => {
+                if (cp == 10 || cp == 11) && self.state.sys.fp_enabled(self.state.privileged()) {
+                    Err(Trap::UNDEFINED)
+                } else {
+                    Err(Trap::NOCP)
+                }
+            }
+            #[cfg(feature = "cpu-arm-v7m-fp")]
+            Insn::Fp(fp) => self.fp_instruction(fp),
             Insn::Udf { .. } | Insn::Undefined => Err(Trap::UNDEFINED),
         }
     }
@@ -2027,11 +2124,543 @@ impl<'a> Exec<'a> {
                 if !self.state.in_handler() {
                     control = (control & !control::SPSEL) | (value & control::SPSEL);
                 }
+                // `FPCA` is writable only where there is an FPU, and is RES0
+                // otherwise — software uses it to hand a context's
+                // floating-point state to a scheduler by hand.
+                if self.fp_present() {
+                    control = (control & !control::FPCA) | (value & control::FPCA);
+                }
                 self.state.control = control;
                 self.state.sync_stack();
             }
             _ => {}
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The floating-point extension's hooks into the exception model
+    //
+    // These four are *not* feature-gated, because the exception sequence
+    // names them whether or not an FPU was compiled in; without one they are
+    // constant-false and empty, and the optimiser deletes them.
+    // -----------------------------------------------------------------
+
+    /// Whether this part has a floating-point unit at all.
+    #[inline]
+    fn fp_present(&self) -> bool {
+        self.state.sys.fp_present()
+    }
+
+    /// Whether an exception taken now gets the extended, 26-word frame.
+    ///
+    /// Two conditions, not one: the context must have used the FPU
+    /// (`CONTROL.FPCA`) *and* `CPACR` must still allow it. Firmware that
+    /// turns the coprocessor off mid-flight must not make the core push
+    /// registers it can no longer reach (DDI 0403E B1.5.7).
+    fn fp_frame_wanted(&self) -> bool {
+        self.state.control & control::FPCA != 0
+            && self.state.sys.fp_enabled(self.state.privileged())
+    }
+
+    /// `ExceptionTaken`'s floating-point half: the handler starts with no
+    /// floating-point context of its own, and — if `FPCCR.ASPEN` is set —
+    /// with `FPSCR` reloaded from `FPDSCR`, so it does not inherit the
+    /// interrupted code's rounding mode or flush-to-zero setting.
+    fn enter_fp_context(&mut self) {
+        if !self.fp_present() {
+            return;
+        }
+        self.state.control &= !control::FPCA;
+        #[cfg(feature = "cpu-arm-v7m-fp")]
+        if self.state.sys.fpccr & fpccr::ASPEN != 0 {
+            self.state.fp.fpscr = self.state.sys.fpdscr;
+        }
+    }
+
+    /// `PopStack`'s last line: `CONTROL.FPCA` becomes the inverse of
+    /// `EXC_RETURN[4]`, so a context that was interrupted mid-`VADD` comes
+    /// back still owning a floating-point context.
+    fn leave_fp_context(&mut self, fp_frame: bool) {
+        if !self.fp_present() {
+            return;
+        }
+        if fp_frame {
+            self.state.control |= control::FPCA;
+        } else {
+            self.state.control &= !control::FPCA;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The floating-point interpreter
+// ---------------------------------------------------------------------------
+
+/// The FPv4-SP / FPv5-SP half of the interpreter.
+///
+/// Kept in its own `impl` so the whole extension is one `#[cfg]` rather than
+/// twenty. The *arithmetic* is [`super::fp`]'s and, under it,
+/// [`crate::float`]'s; what is here is the register plumbing, the memory
+/// accesses and the lazy-stacking protocol.
+///
+/// Cycle counts are the Cortex-M4 TRM's floating-point instruction timings:
+/// one cycle for the single-pass operations (which [`Exec::execute_one`]
+/// already charges), three for the multiply-accumulates, fourteen for `VDIV`
+/// and `VSQRT`, and one per word for the transfers, which the bus accesses
+/// charge themselves.
+#[cfg(feature = "cpu-arm-v7m-fp")]
+impl Exec<'_> {
+    /// Execute one floating-point instruction.
+    #[allow(clippy::too_many_lines)] // One arm per form; splitting hides the map.
+    fn fp_instruction(&mut self, insn: FpInsn) -> Ex {
+        use crate::float::{Flags, Round};
+
+        // `CPACR` is checked before anything else, including before the
+        // instruction is rejected as absent: the architecture's coprocessor
+        // check precedes the decode, so a `VSEL` on a disabled FPv4 part is
+        // `NOCP` rather than UNDEFINED.
+        if !self.state.sys.fp_enabled(self.state.privileged()) {
+            return Err(Trap::NOCP);
+        }
+        if insn.needs_v5() && !self.cfg.ext.fp.has_v5() {
+            return Err(Trap::UNDEFINED);
+        }
+        // The rest of `ExecuteFPCheck`: resolve a deferred lazy push, then
+        // claim a floating-point context so an exception taken after this
+        // instruction carries the registers away with it.
+        self.preserve_fp_state()?;
+        if self.state.sys.fpccr & fpccr::ASPEN != 0 {
+            self.state.control |= control::FPCA;
+        }
+
+        let env = self.state.fp.env();
+        match insn {
+            FpInsn::Data { op, d, n, m } => {
+                let (a, b, c) = (self.state.fp.s(d), self.state.fp.s(n), self.state.fp.s(m));
+                // The chained forms below are deliberately two operations:
+                // `VMLA` is `FPAdd(Sd, FPMul(Sn, Sm))` and rounds twice.
+                // `VFMA` and its three siblings are the fused ones.
+                let (value, flags) = match op {
+                    DataOp::Add => fp::add(b, c, env),
+                    DataOp::Sub => fp::sub(b, c, env),
+                    DataOp::Mul => fp::mul(b, c, env),
+                    DataOp::Nmul => {
+                        let (v, f) = fp::mul(b, c, env);
+                        (fp::neg(v), f)
+                    }
+                    DataOp::Div => fp::div(b, c, env),
+                    DataOp::Mla => {
+                        let (p, f1) = fp::mul(b, c, env);
+                        let (v, f2) = fp::add(a, p, env);
+                        (v, f1 | f2)
+                    }
+                    DataOp::Mls => {
+                        let (p, f1) = fp::mul(b, c, env);
+                        let (v, f2) = fp::add(a, fp::neg(p), env);
+                        (v, f1 | f2)
+                    }
+                    DataOp::Nmla => {
+                        let (p, f1) = fp::mul(b, c, env);
+                        let (v, f2) = fp::add(fp::neg(a), fp::neg(p), env);
+                        (v, f1 | f2)
+                    }
+                    DataOp::Nmls => {
+                        let (p, f1) = fp::mul(b, c, env);
+                        let (v, f2) = fp::add(fp::neg(a), p, env);
+                        (v, f1 | f2)
+                    }
+                    DataOp::Fma => fp::mul_add(a, b, c, env),
+                    DataOp::Fms => fp::mul_add(a, fp::neg(b), c, env),
+                    DataOp::Fnma => fp::mul_add(fp::neg(a), fp::neg(b), c, env),
+                    DataOp::Fnms => fp::mul_add(fp::neg(a), b, c, env),
+                    DataOp::Maxnm => fp::max_min_num(b, c, false, env),
+                    DataOp::Minnm => fp::max_min_num(b, c, true, env),
+                };
+                self.state.fp.finish(d, value, flags);
+                self.cycle(match op {
+                    DataOp::Div => 13,
+                    DataOp::Mla
+                    | DataOp::Mls
+                    | DataOp::Nmla
+                    | DataOp::Nmls
+                    | DataOp::Fma
+                    | DataOp::Fms
+                    | DataOp::Fnma
+                    | DataOp::Fnms => 2,
+                    _ => 0,
+                });
+                Ok(())
+            }
+
+            FpInsn::Unary { op, d, m } => {
+                let a = self.state.fp.s(m);
+                // `VMOV`, `VABS` and `VNEG` are bit operations: they raise
+                // nothing, they do not quieten a signaling NaN, and
+                // flush-to-zero does not touch them.
+                let (value, flags) = match op {
+                    UnaryOp::Mov => (a, Flags::NONE),
+                    UnaryOp::Abs => (fp::abs(a), Flags::NONE),
+                    UnaryOp::Neg => (fp::neg(a), Flags::NONE),
+                    UnaryOp::Sqrt => fp::sqrt(a, env),
+                    UnaryOp::RintR => fp::round_int(a, env, false),
+                    UnaryOp::RintZ => fp::round_int(a, env.round(Round::TowardZero), false),
+                    UnaryOp::RintX => fp::round_int(a, env, true),
+                };
+                self.state.fp.finish(d, value, flags);
+                if op == UnaryOp::Sqrt {
+                    self.cycle(13);
+                }
+                Ok(())
+            }
+
+            FpInsn::MovImm { d, imm } => {
+                self.state.fp.set_s(d, imm);
+                Ok(())
+            }
+
+            FpInsn::Cmp {
+                d,
+                m,
+                with_zero,
+                signal_all,
+            } => {
+                let a = self.state.fp.s(d);
+                let b = if with_zero { 0 } else { self.state.fp.s(m) };
+                let (nzcv, flags) = fp::compare(a, b, signal_all, env);
+                // The result lands in `FPSCR`'s own condition flags; getting
+                // it into `APSR` takes a `VMRS APSR_nzcv, FPSCR`.
+                self.state.fp.fpscr = (self.state.fp.fpscr & !fp::fpscr::FLAGS) | nzcv;
+                fp::accumulate(&mut self.state.fp.fpscr, flags);
+                Ok(())
+            }
+
+            FpInsn::CvtInt {
+                d,
+                m,
+                to_int,
+                signed,
+                round_zero,
+            } => {
+                let a = self.state.fp.s(m);
+                let (value, flags) = if to_int {
+                    let env = if round_zero {
+                        env.round(Round::TowardZero)
+                    } else {
+                        env
+                    };
+                    fp::to_fixed(a, 32, !signed, 0, env)
+                } else {
+                    fp::from_fixed(a, 32, !signed, 0, env)
+                };
+                self.state.fp.finish(d, value, flags);
+                Ok(())
+            }
+
+            FpInsn::CvtMode { mode, d, m, signed } => {
+                let a = self.state.fp.s(m);
+                let (value, flags) = fp::to_fixed(a, 32, !signed, 0, env.round(mode.round()));
+                self.state.fp.finish(d, value, flags);
+                Ok(())
+            }
+
+            FpInsn::RintMode { mode, d, m } => {
+                let a = self.state.fp.s(m);
+                let (value, flags) = fp::round_int(a, env.round(mode.round()), false);
+                self.state.fp.finish(d, value, flags);
+                Ok(())
+            }
+
+            FpInsn::CvtFixed {
+                d,
+                to_fixed,
+                unsigned,
+                wide,
+                frac,
+            } => {
+                let a = self.state.fp.s(d);
+                let bits = if wide { 32 } else { 16 };
+                let (value, flags) = if to_fixed {
+                    // Float to fixed always rounds toward zero; there is no
+                    // `VCVTR` form of this one.
+                    fp::to_fixed(
+                        a,
+                        bits,
+                        unsigned,
+                        u32::from(frac),
+                        env.round(Round::TowardZero),
+                    )
+                } else {
+                    fp::from_fixed(a, bits, unsigned, u32::from(frac), env)
+                };
+                self.state.fp.finish(d, value, flags);
+                Ok(())
+            }
+
+            FpInsn::CvtHalf { d, m, to_half, top } => {
+                if to_half {
+                    // Only half of `Sd` is written; the other half keeps what
+                    // it had, which is what makes `VCVTB`/`VCVTT` a pair.
+                    let (half, flags) = fp::single_to_half(self.state.fp.s(m), env);
+                    let old = self.state.fp.s(d);
+                    let value = if top {
+                        (old & 0x0000_ffff) | (u32::from(half) << 16)
+                    } else {
+                        (old & 0xffff_0000) | u32::from(half)
+                    };
+                    self.state.fp.finish(d, value, flags);
+                } else {
+                    let src = self.state.fp.s(m);
+                    let half = if top { (src >> 16) as u16 } else { src as u16 };
+                    let (value, flags) = fp::half_to_single(half, env);
+                    self.state.fp.finish(d, value, flags);
+                }
+                Ok(())
+            }
+
+            FpInsn::Sel { cond, d, n, m } => {
+                // The *integer* flags, not `FPSCR`'s: `VSEL` reads `APSR`.
+                let value = if cond.passes(self.state.xpsr) {
+                    self.state.fp.s(n)
+                } else {
+                    self.state.fp.s(m)
+                };
+                self.state.fp.set_s(d, value);
+                Ok(())
+            }
+
+            FpInsn::MovCore { to_fp, rt, n } => {
+                if to_fp {
+                    let value = self.reg(rt);
+                    self.state.fp.set_s(n, value);
+                } else {
+                    let value = self.state.fp.s(n);
+                    self.set_reg(rt, value);
+                }
+                Ok(())
+            }
+
+            FpInsn::MovCore2 { to_fp, rt, rt2, m } => {
+                if to_fp {
+                    let (a, b) = (self.reg(rt), self.reg(rt2));
+                    self.state.fp.set_s(m, a);
+                    self.state.fp.set_s(m.wrapping_add(1), b);
+                } else {
+                    let (a, b) = (self.state.fp.s(m), self.state.fp.s(m.wrapping_add(1)));
+                    self.set_reg(rt, a);
+                    self.set_reg(rt2, b);
+                }
+                self.cycle(1);
+                Ok(())
+            }
+
+            FpInsn::Sys { to_core, rt, reg } => self.fp_sys_register(to_core, rt, reg),
+
+            FpInsn::Mem {
+                load,
+                d,
+                rn,
+                imm,
+                add,
+            } => {
+                // `Rn == PC` is the literal form, and the base is the
+                // instruction's own address aligned down to a word — not the
+                // `PC + 4` that `r[15]` holds (DDI 0403E A7.7.232).
+                let base = if rn == 15 {
+                    self.state.r[15] & !3
+                } else {
+                    self.reg(rn)
+                };
+                let addr = if add {
+                    base.wrapping_add(imm)
+                } else {
+                    base.wrapping_sub(imm)
+                };
+                // An extension-register access is never permitted to be
+                // unaligned, whatever `CCR.UNALIGN_TRP` says.
+                self.check_alignment(addr, 4, true)?;
+                let privileged = self.state.privileged();
+                if load {
+                    let value = self.read_mem(addr, 4, privileged)?;
+                    self.state.fp.set_s(d, value);
+                } else {
+                    let value = self.state.fp.s(d);
+                    self.write_mem(addr, 4, value, privileged)?;
+                }
+                Ok(())
+            }
+
+            FpInsn::Multi {
+                load,
+                d,
+                rn,
+                count,
+                add,
+                writeback,
+            } => {
+                let base = self.reg(rn);
+                let bytes = u32::from(count) * 4;
+                let start = if add { base } else { base.wrapping_sub(bytes) };
+                self.check_alignment(start, 4, true)?;
+                let privileged = self.state.privileged();
+                for k in 0..u32::from(count) {
+                    let at = start.wrapping_add(k * 4);
+                    let s = d.wrapping_add(k as u8);
+                    if load {
+                        let value = self.read_mem(at, 4, privileged)?;
+                        self.state.fp.set_s(s, value);
+                    } else {
+                        let value = self.state.fp.s(s);
+                        self.write_mem(at, 4, value, privileged)?;
+                    }
+                }
+                if writeback {
+                    let updated = if add { base.wrapping_add(bytes) } else { start };
+                    self.set_reg(rn, updated);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// `VMRS` and `VMSR`.
+    ///
+    /// `FPSCR` (`reg == 1`) is the only register either direction can reach on
+    /// a real M-profile part, and `Rt == 15` on a `VMRS` of it is
+    /// `APSR_nzcv` — the sequence a `VCMP` has to be followed by before a
+    /// branch can test the result. The `MVFR` encodings are answered on a read
+    /// because ARMv7-A defines them in the same field and nothing is harmed by
+    /// it; everything else is UNDEFINED rather than a silent zero, so firmware
+    /// probing an encoding this core does not have finds out.
+    fn fp_sys_register(&mut self, to_core: bool, rt: u8, reg: u8) -> Ex {
+        if !to_core {
+            if reg != 1 {
+                return Err(Trap::UNDEFINED);
+            }
+            let value = self.reg(rt);
+            self.state.fp.fpscr = value & fp::fpscr::WRITABLE;
+            return Ok(());
+        }
+        let value = match reg {
+            1 if rt == 15 => {
+                let nzcv = self.state.fp.fpscr & fp::fpscr::FLAGS;
+                self.state.xpsr =
+                    (self.state.xpsr & !xpsr::FLAGS) | nzcv | (self.state.xpsr & xpsr::Q);
+                return Ok(());
+            }
+            1 => self.state.fp.fpscr,
+            // `MVFR0` is `0b0111`, `MVFR1` `0b0110`, `MVFR2` `0b0101`.
+            7 => self.state.sys.mvfr[0],
+            6 => self.state.sys.mvfr[1],
+            5 => self.state.sys.mvfr[2],
+            _ => return Err(Trap::UNDEFINED),
+        };
+        self.set_reg(rt, value);
+        Ok(())
+    }
+
+    /// Write the floating-point half of an exception frame, or reserve it.
+    ///
+    /// Returns whether an access failed, which the caller folds into
+    /// `BFSR.STKERR`. With `FPCCR.LSPEN` set — the reset state, and what
+    /// nearly all firmware runs — nothing is written: the space is reserved,
+    /// `FPCAR` records where it is, and `LSPACT` says a push is owed. That is
+    /// what keeps interrupt latency off the floating-point register file for
+    /// a handler that never touches it.
+    fn stack_fp_frame(&mut self, frame: u32, privileged: bool) -> bool {
+        let base = frame.wrapping_add(exc_return::FP_OFFSET);
+        if self.state.sys.fpccr & fpccr::LSPEN == 0 {
+            let mut failed = false;
+            for k in 0..16u32 {
+                let value = self.state.fp.s(k as u8);
+                failed |= self
+                    .write_mem(base.wrapping_add(k * 4), 4, value, privileged)
+                    .is_err();
+            }
+            let fpscr = self.state.fp.fpscr;
+            failed |= self
+                .write_mem(base.wrapping_add(0x40), 4, fpscr, privileged)
+                .is_err();
+            return failed;
+        }
+        self.state.sys.fpcar = base;
+        let mut ccr = self.state.sys.fpccr
+            & !(fpccr::USER
+                | fpccr::THREAD
+                | fpccr::HFRDY
+                | fpccr::MMRDY
+                | fpccr::BFRDY
+                | fpccr::MONRDY);
+        ccr |= fpccr::LSPACT;
+        // The privilege and mode the deferred push must use are the
+        // *interrupted* context's, captured here because by the time the push
+        // happens the core is somewhere else entirely.
+        if !privileged {
+            ccr |= fpccr::USER;
+        }
+        if !self.state.in_handler() {
+            ccr |= fpccr::THREAD;
+        }
+        if !self.state.faultmask {
+            ccr |= fpccr::HFRDY;
+        }
+        if self.state.sys.is_enabled(Exception::MEM_MANAGE) {
+            ccr |= fpccr::MMRDY;
+        }
+        if self.state.sys.is_enabled(Exception::BUS_FAULT) {
+            ccr |= fpccr::BFRDY;
+        }
+        self.state.sys.fpccr = ccr;
+        false
+    }
+
+    /// Read the floating-point half of an exception frame back.
+    ///
+    /// A frame that was only ever reserved needs no restore at all: `LSPACT`
+    /// still being set means nothing in the handler used the FPU, so
+    /// `S0`–`S15` still hold exactly what the interrupted code left in them.
+    /// Clearing the bit is the whole of the unstack, and it is also why lazy
+    /// stacking is a *latency* optimisation in both directions.
+    fn unstack_fp_frame(&mut self, frame: u32, privileged: bool) -> bool {
+        if self.state.sys.fpccr & fpccr::LSPACT != 0 {
+            self.state.sys.fpccr &= !fpccr::LSPACT;
+            return false;
+        }
+        let base = frame.wrapping_add(exc_return::FP_OFFSET);
+        let mut failed = false;
+        for k in 0..16u32 {
+            match self.read_mem(base.wrapping_add(k * 4), 4, privileged) {
+                Ok(value) => self.state.fp.set_s(k as u8, value),
+                Err(_) => failed = true,
+            }
+        }
+        match self.read_mem(base.wrapping_add(0x40), 4, privileged) {
+            Ok(value) => self.state.fp.fpscr = value & fp::fpscr::WRITABLE,
+            Err(_) => failed = true,
+        }
+        failed
+    }
+
+    /// Perform a deferred lazy push, if one is owed.
+    ///
+    /// `LSPACT` is cleared *before* the writes rather than after: an `FPCAR`
+    /// pointing at unmapped memory would otherwise be retried by every
+    /// subsequent floating-point instruction, and a fault that repeats
+    /// forever is worse than one reported once. The privilege is the one
+    /// `FPCCR.USER` recorded at reservation, not the current one.
+    fn preserve_fp_state(&mut self) -> Ex {
+        if self.state.sys.fpccr & fpccr::LSPACT == 0 {
+            return Ok(());
+        }
+        let base = self.state.sys.fpcar;
+        let privileged = self.state.sys.fpccr & fpccr::USER == 0;
+        self.state.sys.fpccr &= !fpccr::LSPACT;
+        for k in 0..16u32 {
+            let value = self.state.fp.s(k as u8);
+            self.write_mem(base.wrapping_add(k * 4), 4, value, privileged)?;
+        }
+        let fpscr = self.state.fp.fpscr;
+        self.write_mem(base.wrapping_add(0x40), 4, fpscr, privileged)?;
+        Ok(())
     }
 }
 

@@ -10,12 +10,16 @@
 //! registers, and the memory-mapped NVIC, SysTick, SCB and MPU at
 //! `0xE000E000`.
 //!
-//! What there is **not**: the FPv4-SP / FPv5 floating-point unit. `CPACR`
-//! exists and reads zero from reset, so a `VMOV` raises a UsageFault with
-//! `UFSR.NOCP` exactly as it would on a Cortex-M4 without the option — which
-//! is honest, and is what lets firmware detect the absence. Lazy FP stacking,
-//! `FPCCR` and the extended exception frame are absent with it. See
-//! "Unimplemented" below.
+//! The **FPv4-SP / FPv5-SP floating-point unit** is here too, behind the
+//! `cpu-arm-v7m-fp` feature and selected per instance by
+//! [`Config::CORTEX_M4F`] or [`Config::CORTEX_M7F`]: `S0`–`S31`, `FPSCR`, the
+//! single-precision instruction set, `CPACR` gating, `CONTROL.FPCA`, the
+//! 26-word extended exception frame and **lazy state preservation**. A part
+//! configured without it — every `Config` whose `ext.fp` is [`FpUnit::None`],
+//! which includes [`Config::CORTEX_M4`] — reads `CPACR` as zero and raises a
+//! `UFSR.NOCP` UsageFault on a `VMOV`, exactly as a Cortex-M4 without the
+//! option does. Double precision is not implemented at either revision; see
+//! "Unimplemented" below and [`fp`]'s own documentation.
 //!
 //! # Using it from another crate
 //!
@@ -62,15 +66,20 @@
 //! | --- | --- |
 //! | [`isa`] | the T32 decoder — both widths — producing one value the interpreter and the disassembler share |
 //! | [`sys`] | exception numbers, priorities, and the register map at `0xE000E000` |
+//! | `fp` | the floating-point register file, `FPSCR`, and the Arm rules over [`crate::float`] |
+//! | `fpisa` | the floating-point encodings, and their disassembly |
 //! | `dsp` (private) | the SIMD and extending-move semantics |
 //! | `exec` (private) | the interpreter and its timing model |
 //!
 //! # Unimplemented, stated plainly
 //!
-//! - **FPv4-SP / FPv5.** No `S0`–`S31`, no `FPSCR`, no lazy stacking. A
-//!   coprocessor 10/11 access is a `NOCP` UsageFault, which is the correct
-//!   behaviour for a part without the option but is *not* an implementation
-//!   of the option.
+//! - **Double-precision floating point.** The two units modelled are
+//!   FPv4-SP-D16 and FPv5-SP-D16, which are real part configurations;
+//!   `MVFR0.D_Precision` reads zero and every coprocessor 11 encoding is
+//!   UNDEFINED. An FPv5-D16 Cortex-M7 with double precision is not modelled.
+//!   `FPSCR.AHP` — the alternative half-precision format — is RES0 for the
+//!   same reason: it reads back as zero so a guest can tell.
+//!   `tests/conformance/ledgers/cpu-arm-v7m-fp.txt` is the full list.
 //! - **The debug architecture.** No DWT, ITM, FPB, TPIU or halting debug.
 //!   Their registers read as zero. `BKPT` is a HardFault with
 //!   `HFSR.DEBUGEVT`, which is what a part with no debugger attached does.
@@ -90,8 +99,19 @@
 pub mod isa;
 pub mod sys;
 
+#[cfg(feature = "cpu-arm-v7m-fp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
+pub mod fp;
+
+#[cfg(feature = "cpu-arm-v7m-fp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
+pub mod fpisa;
+
 mod dsp;
 mod exec;
+
+#[cfg(all(test, feature = "cpu-arm-v7m-fp"))]
+mod fptests;
 
 #[cfg(test)]
 mod tests;
@@ -185,14 +205,13 @@ pub struct Extensions {
     /// arithmetic, the half-word and dual multiplies, `SEL`, `USAD8`, `PKH`
     /// and the packing extends. This is what the E in ARMv7E-M means.
     pub dsp: bool,
-    /// The FPv4-SP / FPv5 floating-point unit.
+    /// Which floating-point unit, if any.
     ///
-    /// **Not implemented.** [`ArmV7m::new`] forces this to false rather than
-    /// letting [`ArmV7m::config`] claim a unit that is not there, so a
-    /// caller that sets it gets a part without an FPU and a `CPACR` that says
-    /// so. The field exists because the extension is real and will have
-    /// somewhere to go when it lands.
-    pub fp: bool,
+    /// Requires the `cpu-arm-v7m-fp` feature to be anything but
+    /// [`FpUnit::None`]: [`ArmV7m::new`] forces it back rather than letting
+    /// [`ArmV7m::config`] claim a unit that was not compiled in, so a build
+    /// without the feature gets a part with no FPU and a `CPACR` that says so.
+    pub fp: FpUnit,
     /// A PMSAv7 memory protection unit with eight regions.
     pub mpu: bool,
 }
@@ -201,15 +220,85 @@ impl Extensions {
     /// A Cortex-M3: ARMv7-M, no DSP, an MPU if the SoC bought one.
     pub const CORTEX_M3: Extensions = Extensions {
         dsp: false,
-        fp: false,
+        fp: FpUnit::None,
         mpu: true,
     };
-    /// A Cortex-M4 or M7: ARMv7E-M, DSP and MPU present, FPU absent.
+    /// A Cortex-M4 or M7 without the floating-point option.
     pub const CORTEX_M4: Extensions = Extensions {
         dsp: true,
-        fp: false,
+        fp: FpUnit::None,
         mpu: true,
     };
+    /// A Cortex-M4**F**: the same part with FPv4-SP-D16.
+    pub const CORTEX_M4F: Extensions = Extensions {
+        fp: FpUnit::V4Sp,
+        ..Extensions::CORTEX_M4
+    };
+    /// A Cortex-M7 with the single-precision FPU: FPv5-SP-D16.
+    pub const CORTEX_M7F: Extensions = Extensions {
+        fp: FpUnit::V5Sp,
+        ..Extensions::CORTEX_M4
+    };
+}
+
+/// Which revision of the floating-point extension a part has.
+///
+/// Not a boolean, because the difference is guest-visible twice over:
+/// `MVFR2.FPMisc` advertises the FPv5 instruction group, and an FPv5 encoding
+/// executed on an FPv4 part must be UNDEFINED rather than quietly working.
+/// Firmware probes by executing, so "we decoded it anyway" is a conformance
+/// failure (`ROADMAP.md` §6.1.1).
+///
+/// **Both variants are single-precision.** FPv4-SP-D16 and FPv5-SP-D16 are
+/// real part configurations; an FPv5-D16 Cortex-M7 with double precision is
+/// not modelled, so `MVFR0.D_Precision` reads zero and a `VADD.F64` traps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FpUnit {
+    /// No floating-point unit. `CPACR.CP10`/`CP11` are RAZ/WI and every
+    /// coprocessor 10/11 encoding raises `UFSR.NOCP`.
+    #[default]
+    None,
+    /// FPv4-SP-D16, the Cortex-M4F unit: single precision, sixteen doubles'
+    /// worth of registers, no `VSEL`/`VMAXNM`/`VRINT`/`VCVTA`.
+    V4Sp,
+    /// FPv5-SP-D16, the single-precision Cortex-M7 unit: FPv4-SP plus the
+    /// Armv8-style `VSEL`, `VMAXNM`/`VMINNM`, `VCVTA/N/P/M` and `VRINT*`.
+    V5Sp,
+}
+
+impl FpUnit {
+    /// Whether any floating-point unit is present.
+    #[must_use]
+    #[inline]
+    pub const fn present(self) -> bool {
+        !matches!(self, FpUnit::None)
+    }
+
+    /// Whether the FPv5 instruction group is present.
+    #[must_use]
+    #[inline]
+    pub const fn has_v5(self) -> bool {
+        matches!(self, FpUnit::V5Sp)
+    }
+
+    /// `MVFR0`, `MVFR1` and `MVFR2`, from the Cortex-M4 and Cortex-M7
+    /// Technical Reference Manuals.
+    ///
+    /// `MVFR0 = 0x1011_0021`: all rounding modes, no short vectors, square
+    /// root and divide present, no trapped exceptions, **no double
+    /// precision**, single precision present, sixteen 64-bit registers.
+    /// `MVFR1` advertises fused multiply-accumulate, half-precision
+    /// conversion, default-NaN mode and flush-to-zero mode. `MVFR2.FPMisc`
+    /// is four on FPv5 — "`VSEL`, `VMAXNM`/`VMINNM`, `VRINT*` and
+    /// `VCVTA/N/P/M` are present" — and zero on FPv4.
+    #[must_use]
+    pub const fn mvfr(self) -> [u32; 3] {
+        match self {
+            FpUnit::None => [0; 3],
+            FpUnit::V4Sp => [0x1011_0021, 0x1100_0011, 0],
+            FpUnit::V5Sp => [0x1011_0021, 0x1200_0011, 0x0000_0040],
+        }
+    }
 }
 
 /// How this particular part differs from the generic ARMv7E-M.
@@ -261,6 +350,22 @@ impl Config {
         ..Config::CORTEX_M4
     };
 
+    /// A Cortex-M4F: [`Config::CORTEX_M4`] with FPv4-SP-D16.
+    ///
+    /// `CPUID` is unchanged — the FPU is not part of the part number, and
+    /// firmware discovers it from `MVFR0` and by writing `CPACR` — which is
+    /// why this differs from `CORTEX_M4` in exactly one field.
+    pub const CORTEX_M4F: Config = Config {
+        ext: Extensions::CORTEX_M4F,
+        ..Config::CORTEX_M4
+    };
+
+    /// A Cortex-M7 with the single-precision FPU: FPv5-SP-D16.
+    pub const CORTEX_M7F: Config = Config {
+        ext: Extensions::CORTEX_M7F,
+        ..Config::CORTEX_M7
+    };
+
     /// A Cortex-M3: ARMv7-M without the DSP extension, so every `SADD8`,
     /// `QADD`, `SMLAD` and `PKHBT` traps as UNDEFINED.
     pub const CORTEX_M3: Config = Config {
@@ -303,6 +408,27 @@ impl Default for Config {
         Config::CORTEX_M4
     }
 }
+
+/// The part names a `.machine` file may give as `part`.
+///
+/// The `f` spellings are only offered where the floating-point unit is
+/// compiled in, so a board that asks for a Cortex-M4F in a build without the
+/// `cpu-arm-v7m-fp` feature is rejected by the validator with the list of what
+/// it could have said — rather than quietly getting a part with no FPU and
+/// faulting on its first `VMOV`.
+#[cfg(feature = "cpu-arm-v7m-fp")]
+const PARTS: &[&str] = &[
+    "cortex-m3",
+    "cortex-m4",
+    "cortex-m4f",
+    "cortex-m7",
+    "cortex-m7f",
+];
+
+/// The part names a `.machine` file may give as `part`, without the
+/// floating-point unit compiled in.
+#[cfg(not(feature = "cpu-arm-v7m-fp"))]
+const PARTS: &[&str] = &["cortex-m3", "cortex-m4", "cortex-m7"];
 
 // ---------------------------------------------------------------------------
 // The visible register file
@@ -555,13 +681,15 @@ impl ArmV7m {
     /// The first [`step`](ArmV7m::step) runs the reset sequence, which is
     /// what reads `SP` and `PC` out of the vector table.
     ///
-    /// `cfg.ext.fp` is forced false: there is no floating-point unit, and a
-    /// configuration that claimed one would make [`ArmV7m::config`] lie.
+    /// Without the `cpu-arm-v7m-fp` feature, `cfg.ext.fp` is forced back to
+    /// [`FpUnit::None`]: the unit is not compiled in, and a configuration that
+    /// claimed one would make [`ArmV7m::config`] lie.
     #[must_use]
     pub fn new(cfg: Config) -> ArmV7m {
+        #[cfg(not(feature = "cpu-arm-v7m-fp"))]
         let cfg = Config {
             ext: Extensions {
-                fp: false,
+                fp: FpUnit::None,
                 ..cfg.ext
             },
             ..cfg
@@ -590,7 +718,7 @@ impl ArmV7m {
     pub fn from_props(props: &Props) -> Result<ArmV7m> {
         let mut r = props.reader();
         let part = if props.contains("part") {
-            r.require_enum("part", &["cortex-m3", "cortex-m4", "cortex-m7"])?
+            r.require_enum("part", PARTS)?
         } else {
             "cortex-m4"
         };
@@ -598,11 +726,14 @@ impl ArmV7m {
         let priority_bits = r.or_range("priority-bits", 0u64, 0..=8)?;
         let dsp_override = r.or("dsp", true)?;
         let mpu_override = r.or("mpu", true)?;
+        let fp_override = r.or("fp", true)?;
         r.finish()?;
         let base = match part {
             "cortex-m3" => Config::CORTEX_M3,
             "cortex-m4" => Config::CORTEX_M4,
+            "cortex-m4f" => Config::CORTEX_M4F,
             "cortex-m7" => Config::CORTEX_M7,
+            "cortex-m7f" => Config::CORTEX_M7F,
             // `require_enum` has already rejected anything else.
             _ => Config::CORTEX_M4,
         };
@@ -614,7 +745,15 @@ impl ArmV7m {
             },
             ext: Extensions {
                 dsp: base.ext.dsp && dsp_override,
-                fp: false,
+                // `fp = false` on an `f` part is how a board models the same
+                // silicon with the unit left out; there is no way to add one
+                // to a part that does not have it, which is why this only
+                // ever subtracts.
+                fp: if fp_override {
+                    base.ext.fp
+                } else {
+                    FpUnit::None
+                },
                 mpu: base.ext.mpu && mpu_override,
             },
             ..base
@@ -629,6 +768,42 @@ impl ArmV7m {
     #[must_use]
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// Read `S0`–`S31`.
+    ///
+    /// Separate from [`ArmV7m::regs`] rather than a field of [`Regs`]: a
+    /// Cortex-M3 has no such registers, and a debugger that wants them can
+    /// ask. Reading one here does **not** resolve a pending lazy push, which
+    /// is deliberate — these are the architectural registers, and where the
+    /// interrupted context's copy currently lives is `FPCAR`'s business.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
+    #[must_use]
+    pub fn s(&self, index: u8) -> u32 {
+        self.session.lock().state.fp.s(index)
+    }
+
+    /// Write `Sn`.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
+    pub fn set_s(&self, index: u8, value: u32) {
+        self.session.lock().state.fp.set_s(index, value);
+    }
+
+    /// Read `FPSCR`.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
+    #[must_use]
+    pub fn fpscr(&self) -> u32 {
+        self.session.lock().state.fp.fpscr
+    }
+
+    /// Write `FPSCR`, masked to the bits this core implements.
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m-fp")))]
+    pub fn set_fpscr(&self, value: u32) {
+        self.session.lock().state.fp.fpscr = value & fp::fpscr::WRITABLE;
     }
 
     /// Give the core the address space it executes from.
@@ -1072,7 +1247,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "part",
             kind: ValueKind::Str,
             required: false,
-            summary: "which part to model: cortex-m3, cortex-m4 or cortex-m7",
+            summary: "which part to model: cortex-m3, cortex-m4[f] or cortex-m7[f]",
+        },
+        PropertySpec {
+            name: "fp",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "leave the floating-point unit out of an `f` part (default true)",
         },
         PropertySpec {
             name: "big-endian",
@@ -1213,6 +1394,14 @@ impl Device for ArmV7m {
         w.write_u8(state.last_svc)?;
         w.write_u8(state.last_bkpt)?;
         save_sys(&state.sys, w)?;
+        // `S0`-`S31` and `FPSCR`, only on a part that has them.
+        #[cfg(feature = "cpu-arm-v7m-fp")]
+        if self.cfg.ext.fp.present() {
+            for value in state.fp.s {
+                w.write_u32(value)?;
+            }
+            w.write_u32(state.fp.fpscr)?;
+        }
         for word in self.lines.snapshot() {
             w.write_u32(word)?;
         }
@@ -1248,6 +1437,13 @@ impl Device for ArmV7m {
         state.last_svc = r.read_u8()?;
         state.last_bkpt = r.read_u8()?;
         load_sys(&mut state.sys, r)?;
+        #[cfg(feature = "cpu-arm-v7m-fp")]
+        if self.cfg.ext.fp.present() {
+            for value in &mut state.fp.s {
+                *value = r.read_u32()?;
+            }
+            state.fp.fpscr = r.read_u32()?;
+        }
         let mut lines = [0u32; IRQ_WORDS];
         for word in &mut lines {
             *word = r.read_u32()?;
@@ -1298,6 +1494,16 @@ fn save_sys(sys: &Sys, w: &mut ChunkWriter<'_>) -> Result<()> {
     w.write_u32(sys.bfar)?;
     w.write_u32(sys.afsr)?;
     w.write_u32(sys.cpacr)?;
+    // The floating-point block, only on a part that has one — which keeps a
+    // Cortex-M3's or an FPU-less M4's chunk byte-identical to what version 1
+    // of this class always wrote. `MVFR0`-`MVFR2` are configuration rather
+    // than state and are never written; `fp_present` is derived from them and
+    // so answers the same question on both sides of a round trip.
+    if sys.fp_present() {
+        w.write_u32(sys.fpccr)?;
+        w.write_u32(sys.fpcar)?;
+        w.write_u32(sys.fpdscr)?;
+    }
     w.write_u32(sys.cpuid)?;
     w.write_bool(sys.reset_requested)?;
     w.write_u32(sys.syst_csr)?;
@@ -1342,6 +1548,11 @@ fn load_sys(sys: &mut Sys, r: &mut ChunkReader<'_>) -> Result<()> {
     sys.bfar = r.read_u32()?;
     sys.afsr = r.read_u32()?;
     sys.cpacr = r.read_u32()?;
+    if sys.fp_present() {
+        sys.fpccr = r.read_u32()?;
+        sys.fpcar = r.read_u32()?;
+        sys.fpdscr = r.read_u32()?;
+    }
     sys.cpuid = r.read_u32()?;
     sys.reset_requested = r.read_bool()?;
     sys.syst_csr = r.read_u32()?;
@@ -1415,15 +1626,12 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS.name)
-        .prop(PropSchema::new("part", ValueKind::Str).values(&[
-            "cortex-m3",
-            "cortex-m4",
-            "cortex-m7",
-        ]))
+        .prop(PropSchema::new("part", ValueKind::Str).values(PARTS))
         .prop(PropSchema::new("big-endian", ValueKind::Bool))
         .prop(PropSchema::new("priority-bits", ValueKind::Uint).range(0, 8))
         .prop(PropSchema::new("dsp", ValueKind::Bool))
         .prop(PropSchema::new("mpu", ValueKind::Bool))
+        .prop(PropSchema::new("fp", ValueKind::Bool))
         // Inputs only. `irq0`…`irq239` are the NVIC's external lines.
         .port_bank("irq", PortDir::In, IRQ_LINES)
         .port("nmi", PortDir::In)
