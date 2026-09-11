@@ -575,6 +575,94 @@ CPU cores, and it is worth doing the next time one of them is opened: the eleven
 cache counters are exactly what a "why is this workload translating so much"
 question wants.
 
+## The spin detector, which is the other thing on a load path
+
+`core::spin` is not a counter channel and not gated on the `trace` feature — it
+lives in `core/`, which is never feature-gated — but it shares this file's
+subject: it is a hook on a path a guest access takes, and the same question had
+to be answered before it was written. It emits a `core::trace::Event`, the
+structured record that exists because a finding worth *reading* cannot be a
+total.
+
+What it watches is one processor loading the same address, from the same
+instruction, and getting the same value, N times running with no store of its
+own and no interrupt in between — which is what firmware polling a status bit on
+a peripheral nobody modelled looks like from the outside. `rsemu run <machine>
+--spin-detect` turns it on; `Machine::arm_spin_detector` is the same thing from
+Rust, and `Detector::set_stops_the_run` is the budget mode a CI test wants, where
+`run_for` returns `Error::Spin` naming the loop instead of the run quietly
+using up its time.
+
+```
+rsemu: a processor stopped making progress:
+rsemu:   cpu0 spinning at 0x0800000a reading 0x20000100 (ram) = 0x00000000 for 10000 iterations
+```
+
+### What the hook costs
+
+**Off by default and armed at run time, not at compile time.** That is the
+difference from everything above, and it is deliberate: the failure this catches
+happens to somebody bringing a board up, who has not built a special binary and
+does not know yet that they are going to need one. So "off" has to be cheap
+rather than absent, and the cost of "off" is the number that had to justify the
+design.
+
+It is one load of a `u64` the core already has in cache and a branch that is
+never taken. `Watch::load` is `#[inline]`; everything behind the test is
+`#[cold]` and `#[inline(never)]`, so the disarmed fall-through is what the code
+layout and the branch predictor are optimised for, and the armed path pays a
+call for it. There is no atomic on the per-load path at all — the threshold is
+*copied* into the per-core `Watch` when the detector is attached and re-read once
+per scheduler round.
+
+Measured with callgrind on this host, `--release`, `--features
+machine-stm32f407,cli`. The workload is a five-instruction firmware that polls
+one word of SRAM forever — the densest load path there is, one watched load
+every six guest cycles — run at `--for 100ms` and `--for 300ms`, **differencing
+the two** so that realize, start-up and the dynamic loader cancel. 200 ms of
+guest time is 33 600 000 CPU cycles at this part's 168 MHz, so 5 600 000 guest
+data loads. The control is the same tree with the three call sites compiled out.
+
+| build | `Ir` per 200 ms of guest | vs. control | per guest load |
+| --- | --- | --- | --- |
+| hooks removed (control) | **5 350 387 469** | — | — |
+| hooks present, disarmed | **5 359 720 804** | +9 333 335, **+0.174%** | **+1.67** |
+| hooks present, `--spin-detect` | **5 398 921 911** | +48 534 442, **+0.907%** | **+8.67** |
+
+Read the percentages as what they are: the denominator is the *whole board* —
+thirty-odd peripherals, the clock forest and the scheduler, about 955 host
+instructions per guest load — so they understate what the hook costs the
+interpreter alone and overstate nothing. The per-load column is the figure that
+does not depend on which board it was measured on, and it is the one to compare
+against a future change.
+
+Under two instructions per load for the disarmed hook is the branch the design
+promised. Eight and a half for the armed one is the `#[cold]` call plus three
+comparisons, an increment and a store; inlining `watched` would take a few of
+those back and would cost the disarmed path its layout, which is the trade this
+feature exists on the wrong side of.
+
+### Reproducing it
+
+```sh
+# a vector table, `ldr r1,[pc,#4]`, and `loop: ldr r0,[r1]; cmp r0,#0; beq loop`
+python3 -c 'import struct,sys; sys.stdout.buffer.write(
+  struct.pack("<II", 0x20010000, 0x08000009)
+  + b"".join(struct.pack("<H", h) for h in (0x4901,0x6808,0x2800,0xd0fc))
+  + struct.pack("<I", 0x20000100))' > poll.bin
+
+cargo build --release --features machine-stm32f407,cli --bin rsemu
+for span in 100ms 300ms; do
+  valgrind --tool=callgrind --callgrind-out-file=cg.$span \
+    ./target/release/rsemu run stm32f407 --headless --quiet \
+      --for $span --media firmware=poll.bin >/dev/null 2>&1
+  grep '^summary:' cg.$span
+done
+```
+
+Add `--spin-detect` for the armed row. For the control row, delete the three
+`self.spin.*` calls in `cpu::arm::v7m::exec` and rebuild.
+
 ## See also
 
 * [`long-run.md`](long-run.md) — the harness whose hand-taken numbers this
