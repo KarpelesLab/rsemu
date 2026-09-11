@@ -710,6 +710,16 @@ mostly the events in it, and halving the number of blocks moves events between
 regions rather than removing them, so that row grew as a *share* while shrinking
 by 3.2% in absolute terms.
 
+Removing events is what was done next. Each guest instruction's charge is now
+fused into the boundary it follows, so the pair every frontend emits is one
+event rather than two, and a whole instruction's ticks are charged in one
+addition rather than a loop. On the tree as it stands with block chaining
+(40 652 778 453 for this same boot) that is **−2.11%** of the run, the replay
+falling from 9 577 604 530 to 8 716 064 190 with every other row unchanged to
+the instruction and `Machine::state_hash` unchanged. `src/ir/mod.rs`'s
+decision 2 has the table, the RISC-V numbers — where the same pair is worth
+−6.58% — and the next one along, which is measured and not taken.
+
 The same pair measured through `rsemu run … --for 20s --headless`, which also
 hashes a gigabyte of guest RAM at exit and so is a laxer denominator, agrees:
 63 910 138 422 → 56 758 893 297, or 50 158 333 101 → 43 007 087 976 (−14.26%)

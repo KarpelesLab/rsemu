@@ -148,8 +148,10 @@
 //!   44 219 859 493. **The guarantee costs 11.9% of this boot**, and that is a
 //!   lower bound, since the per-access ticks the host charges inside an access
 //!   are not removed by it.
-//! * About a sixth of that is implementation rather than guarantee, and the
-//!   two changes that recover it are named there with their measured worth.
+//! * About a sixth of that is implementation rather than guarantee. The two
+//!   changes that recover it are named there and have both since landed —
+//!   `Exec::charge_n` and the charge fused into its boundary — for −2.11% of
+//!   this boot at an unchanged `Machine::state_hash`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

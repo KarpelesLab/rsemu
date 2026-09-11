@@ -139,6 +139,12 @@
 //! loop. Of a charge's 17: three are the context, nine are
 //! [`IrHost::charge`], five are the loop.
 //!
+//! That breakdown is the profile *this table* was taken from, and two of its
+//! rows have since been spent — see "What of that is not buying accuracy"
+//! below. It is kept as written because it is the attribution the decisions
+//! after it were made from, and because the rows that are left are still where
+//! the cost is.
+//!
 //! ### The counterfactual, which is the number the comparison needs
 //!
 //! A build that accounts per **region** instead of per guest instruction —
@@ -168,23 +174,78 @@
 //!
 //! ### What of that is not buying accuracy
 //!
-//! Two things, each measured on its own against the same boot and each
-//! reaching the same `Machine::state_hash` (`0x9cc4de4dee51678b`) — which is
-//! the acceptance test for anything in this paragraph, since a saving that
-//! changes the hash is not a saving:
+//! Two things, and **both have landed**. Each reaches the same
+//! `Machine::state_hash` as the build before it — which is the acceptance test
+//! for anything in this section, since a saving that changes the hash is not a
+//! saving — on the arm64 boot (`0xe3817b2c3ff2f7c5`) and on twenty guest
+//! seconds of the RISC-V one (`0xb812efa16513982b`), with every census line
+//! unchanged on both.
 //!
-//! * **`Host::charge` loops.** `cpu::arm::a64::engine`'s implementation is
-//!   `for _ in 0..ticks { self.exec.charge() }` over two counters that both
-//!   just add. The loop scaffolding alone is 524 562 606 host instructions —
-//!   5.5% of the replay for a loop whose trip count is one — and replacing it
-//!   with an addition each is **−0.93%** of the whole run.
-//! * **The pair is replayed as two events.** A boundary and its charge are
+//! * **`Host::charge` looped.** `cpu::arm::a64::engine` and
+//!   `cpu::riscv::engine` each wrote it `for _ in 0..ticks {
+//!   self.exec.charge() }` over counters that only add. The loop scaffolding
+//!   alone was 524 562 606 host instructions — 5.5% of the replay, for a loop
+//!   whose trip count is **one** on A64 and one or two on RISC-V.
+//!   `Exec::charge_n` does the additions once; on
+//!   RISC-V it also reads `mcountinhibit` once for the whole charge, which
+//!   nothing inside a charge can write. `cpu::x86::engine` already had the
+//!   scaled form.
+//! * **The pair was replayed as two events.** A boundary and its charge are
 //!   adjacent in the event list by construction: every frontend emits them
 //!   together, and neither a region split nor a branch target can fall between
-//!   them except in a shape no frontend produces. A backend that fuses them
-//!   pays one dispatch, one loop tail and one `host_of` instead of two:
-//!   **−1.40%**, and `flush_thunk` gets *shorter*, from 98 compiled
+//!   them except in a shape no frontend produces. `plan` now fuses the charge
+//!   into the boundary — under three conditions written out in
+//!   `jit::x86::compile::plan`, of which the load-bearing one is that no flush
+//!   point separates the two — and `flush_thunk` applies it **after** the
+//!   `spent` return, so a block that stops there still unwinds the instruction
+//!   that boundary opens. The replay pays one dispatch, one loop tail and one
+//!   `host_of` instead of two, and `flush_thunk` gets *shorter*: 98 compiled
 //!   instructions to 80.
+//!
+//! Re-measured together on the tree they landed in, which is **not** the tree
+//! the table above was taken from — `cpu::arm::a64::lift`'s host store guard
+//! and `jit::dispatch`'s block chaining have both landed since, and they took
+//! the whole-run denominator from 44.2 G to 40.7 G while leaving the replay
+//! the largest row in it. Same boot, same 154 233 793 guest instructions, same
+//! hash:
+//!
+//! | | host instructions | against master |
+//! | --- | --- | --- |
+//! | master | 40 652 778 453 | — |
+//! | the fusion alone | 40 243 459 515 | **−1.01%** |
+//! | both | 39 795 015 187 | **−2.11%** |
+//!
+//! `flush_thunk` itself goes from 9 577 604 530 (23.56% of the run, 62.1 per
+//! guest instruction) to 8 716 064 190 (21.90%, 56.5), and **every other row
+//! in the profile is unchanged to the instruction** — which is the check that
+//! the two changes are the two changes.
+//!
+//! The RISC-V boot is the same pair of changes and about three times the
+//! answer, which is worth writing down because it says what the size of this
+//! depends on. `benches/riscv_linux_boot.rs`, twenty guest seconds of Linux on
+//! `machines/riscv-virt.machine`, 106 693 403 guest instructions in 6 705 422
+//! blocks, hash `0xb812efa16513982b` both sides:
+//!
+//! | | host instructions | the replay |
+//! | --- | --- | --- |
+//! | master | 21 858 365 313 | 7 419 434 464 (33.94%, 69.5 per guest insn) |
+//! | both | 20 421 215 743 (**−6.58%**) | 6 001 576 913 (29.39%, 56.3) |
+//!
+//! Two things make it larger here. This core's `charge` loop had a
+//! `mcountinhibit` test and a third addition in its body, and it runs 15.91
+//! guest instructions per block against A64's 10.80 — so a replay is longer,
+//! and a longer replay is more events under one set of clamps. Both are
+//! reasons the replay was a third of this core's profile to begin with.
+//!
+//! One number in that table is worth more than the saving it belongs to. A
+//! build carrying the fused-charge machinery with the fusion *disabled* —
+//! `charge_n` in, every boundary's slot left zero — runs 40 834 139 798, which
+//! is **slower than master**. The always-false `if ticks != 0` at the end of
+//! the boundary arm is about four host instructions per boundary once the
+//! register pressure it adds is counted, so fusion has to remove a whole
+//! 17-instruction charge event before it earns anything. It does, on every
+//! frontend in this tree, because every one of them emits the pair. A frontend
+//! that did not would pay for a mechanism it never triggers.
 //!
 //! ### And one that looked like it and is not, which is the more useful result
 //!
@@ -208,13 +269,22 @@
 //! | headroom taken eagerly, once per replay | 44 159 528 013 | **+1.85%** |
 //!
 //! The mechanism is visible in the compiled code and it is not about the
-//! arithmetic. `flush_thunk` today uses **no callee-saved registers at all** —
-//! it has no prologue and no epilogue, and `Ctx` in `rdi` plus the event
-//! cursor is the whole of its state. A headroom counter is one more value live
-//! across the loop, and that one value buys a three-push, three-pop frame on
-//! every one of the 61 908 759 calls plus the spills around it: 98 compiled
-//! instructions become 103 eager and 119 lazy. The `spent()` calls avoided are
-//! worth less than the frame.
+//! arithmetic. `flush_thunk` used **no callee-saved registers at all** when
+//! that was measured — no prologue, no epilogue, and `Ctx` in `rdi` plus the
+//! event cursor was the whole of its state. A headroom counter is one more
+//! value live across the loop, and that one value buys a three-push, three-pop
+//! frame on every one of the 61 908 759 calls plus the spills around it: 98
+//! compiled instructions become 103 eager and 119 lazy. The `spent()` calls
+//! avoided are worth less than the frame.
+//!
+//! The premise has since weakened and the conclusion has not. Fusing the
+//! charge put the fused count live across the boundary arm, and `flush_thunk`
+//! now pushes two registers — so the frame is already paid, and a third shape
+//! would be adding a value to a loop that has one rather than to a loop that
+//! has none. It is still one more live value in the same eight registers, and
+//! the saving it chases is still smaller than the last one that lost to this,
+//! so the note below stands: the headroom has to live in the context, not in a
+//! local.
 //!
 //! Recorded here rather than left to be rediscovered, with the thing that
 //! would have to change for it to work: the headroom would have to live in
@@ -224,15 +294,61 @@
 //! backend design, it is unproven, and the two savings above are worth more
 //! than it is.
 //!
+//! ### The next one, measured and not taken: narrowing [`IrHost::insn_start`]
+//!
+//! All three engines' `insn_start` read [`InsnStart::pc`] and
+//! [`InsnStart::next_pc`] and nothing else. [`InsnStart::ticks`] is read by no
+//! host at run time — it is the static column, and the replay is careful to
+//! use the *charged* count instead, because the static one undercounts as soon
+//! as an access in the block spends a data-dependent tick — and
+//! [`InsnStart::live`] belongs to the fault and publish paths, which reach it
+//! through `Block::marks()` directly rather than through this call. So the
+//! only thing the record lookup in the replay buys is the *reference this
+//! method's signature asks for*: a bounds check, the `marks()` pointer, and a
+//! multiply by the 48 bytes an [`InsnStart`] occupies, per boundary, to
+//! produce an argument of which two fields are read.
+//!
+//! An event that carried `pc` and `next_pc` would remove it. That was built as
+//! a scratch tree — a second, narrow seam beside the wide one, overridden on
+//! the A64 host only, with the x86 backend's `Event::Boundary` grown to carry
+//! the pair — and measured against the fused build above on the same boot at
+//! the same `Machine::state_hash`:
+//!
+//! | | host instructions | data reads | L1 read misses |
+//! | --- | --- | --- | --- |
+//! | the fused build | 39 795 011 727 | 12 260 472 648 | 181 455 993 |
+//! | `pc`/`next_pc` in the event | 38 662 111 267 | 11 797 603 379 | 139 511 415 |
+//! | | **−2.85%** | **−3.77%** | **−23.1%** |
+//!
+//! The replay falls from 8 716 064 190 to 7 581 203 644, **−13.0%**.
+//!
+//! The third column is the one that decides it, because it is the objection.
+//! An `Event` is sixteen bytes today and would be thirty-two, and this type
+//! exists because a dense array streams — `jit::x86::rt::Event` records a 25%
+//! loss when the replay walked the `Inst` array instead. Doubling it turns out
+//! to *reduce* data cache pressure rather than add to it: the sixteen bytes
+//! are appended to an array that is already being walked front to back, and
+//! they buy not touching the `marks()` array at all, which is 48 bytes per
+//! entry reached by a computed index. Forty-two million L1 read misses fewer.
+//!
+//! **Not landed here**, and the reason is scope rather than doubt: it changes
+//! a trait every core implements, so it is one change to [`IrHost`], to
+//! [`Interp`], to both backends and to three engines, and it wants to be made
+//! as one. What is settled is the number, and that the objection to it does
+//! not hold.
+//!
 //! ### And what would have to be given up to do better than that
 //!
 //! The rest of the 62.1 is buying something, and it is worth naming what,
 //! because each is a `ROADMAP.md` §0 non-negotiable rather than a preference:
 //!
-//! * **The seven context stores and the nine finding the mark** buy a fault
-//!   delivered at the guest instruction that took it, with the architectural
-//!   state that instruction started with. Give them up and an exception
-//!   arrives at the block's entry PC.
+//! * **The seven context stores** buy a fault delivered at the guest
+//!   instruction that took it, with the architectural state that instruction
+//!   started with. Give them up and an exception arrives at the block's entry
+//!   PC. (The *nine finding the mark* were in this bullet and do not belong
+//!   here: only `Ctx::mark`, the index, is what the fault path reads back, and
+//!   the lookup itself is bought by nothing but this trait's own signature.
+//!   See below.)
 //! * **The allowance question at every boundary** buys a translated block that
 //!   leaves at exactly the boundary the interpreter leaves at.
 //!   `cpu::arm::a64::engine`'s `spent` folds its generic timer's comparator

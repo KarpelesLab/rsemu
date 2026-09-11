@@ -351,6 +351,15 @@ It is now by a wide margin the largest row in this profile, and the next thing
 that shortens it is fewer events rather than fewer blocks — the same conclusion
 `arm64-virt` reached from a smaller version of the same table.
 
+That conclusion was then acted on, and this is the core it was worth most on.
+Fusing each guest instruction's charge into the boundary it follows, and
+charging a whole instruction's ticks in one addition instead of a loop, took
+the same twenty guest seconds from 21 858 365 313 host instructions to
+20 421 215 743 — **−6.58% of the whole run** — with the replay falling from
+7 419 434 464 to 6 001 576 913 (31.74% to 29.39%) at an unchanged
+`Machine::state_hash` and an unchanged census. `src/ir/mod.rs`'s decision 2 has
+both changes and the A64 numbers beside them.
+
 What the policy gives up is precision: the exit is per **page**, so a store to
 a datum that merely shares a page with the code leaves the block too. That is
 the granularity the block cache's own invalidation has always had, and the
