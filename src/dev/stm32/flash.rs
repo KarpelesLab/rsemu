@@ -14,6 +14,12 @@
 //! here rather than a third register map. No emulator source of any licence was
 //! consulted (`ROADMAP.md` §1).
 //!
+//! **The two families do not share a base address.** RM0090 §2.3 puts the F4's
+//! flash interface at `0x4002_3C00`, the kilobyte above the RCC; RM0351 §2.2.2
+//! puts the L4's at `0x4002_2000`. Neither is in this file — a base is a `map`
+//! statement — but a board derived from the wrong one decodes nothing, and the
+//! two numbers being close enough to look interchangeable is how that happens.
+//!
 //! # The array and the interface: one device, two regions
 //!
 //! This is the design question the device exists to answer, so it is answered
@@ -76,6 +82,15 @@
 //!   an operation is running, which is what firmware polls.
 //! * **`FSTPG` row timing.** Fast programming is accepted and behaves as
 //!   ordinary double-word programming, so `MISERR` and `FASTERR` never set.
+//! * **Write-back to a host file.** The array's contents are in the snapshot,
+//!   so a settings page survives a save and restore, but nothing writes them
+//!   back to the image on `unrealize`. That wants the [`Medium`] seam
+//!   [`cfi`](crate::dev::flash::cfi) already uses — a `persist` property and
+//!   a `flush` — and it is deliberately not bolted on here: the seam brings a
+//!   snapshot policy and a read-only-medium error path with it, and half of
+//!   that is worse than none.
+//!
+//! [`Medium`]: crate::dev::medium::Medium
 //!
 //! # Time
 //!
