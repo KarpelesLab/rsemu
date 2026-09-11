@@ -12,6 +12,7 @@
 //! | [`usart`] | `st.usart` | a USART/UART on the character-device seam, in both the F4 and the F7/H7 register layouts |
 //! | [`sdmmc`] | `st.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
 //! | [`spi`] | `st.spi` | the F4 family's SPI/I2S master, RM0090 §28 |
+//! | [`dma`] | `st.dma` | a DMA controller in either family layout: eight streams (RM0090 §10) or seven channels (RM0351 §11) |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
 //! | [`tim`] | `st.tim` | a TIM timer in its basic, general-purpose or advanced form |
 //!
@@ -49,6 +50,10 @@ pub mod usart;
 #[cfg(feature = "dev-stm32-sdmmc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-sdmmc")))]
 pub mod sdmmc;
+
+#[cfg(feature = "dev-stm32-dma")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-dma")))]
+pub mod dma;
 
 #[cfg(feature = "dev-stm32-i2c")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-i2c")))]
@@ -92,6 +97,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     gpio::register(registry)?;
     #[cfg(feature = "dev-stm32")]
     usart::register(registry)?;
+    #[cfg(feature = "dev-stm32-dma")]
+    dma::register(registry)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::register(registry)?;
     #[cfg(feature = "dev-stm32-i2c")]
@@ -115,6 +122,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     gpio::bind(bindings)?;
     #[cfg(feature = "dev-stm32")]
     usart::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-dma")]
+    dma::bind(bindings)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::bind(bindings)?;
     #[cfg(feature = "dev-stm32-i2c")]
@@ -141,6 +150,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     let mut out: Vec<ClassSchema> = alloc::vec![];
     #[cfg(feature = "dev-stm32")]
     out.extend([gpio::schema(), usart::schema()]);
+    #[cfg(feature = "dev-stm32-dma")]
+    out.push(dma::schema());
     #[cfg(feature = "dev-stm32-sdmmc")]
     out.push(sdmmc::schema());
     #[cfg(feature = "dev-stm32-i2c")]

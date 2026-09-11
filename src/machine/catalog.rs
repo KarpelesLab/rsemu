@@ -968,6 +968,7 @@ pub fn registry() -> Result<Registry> {
     crate::dev::sitronix::register(&mut reg)?;
     #[cfg(any(
         feature = "dev-stm32",
+        feature = "dev-stm32-dma",
         feature = "dev-stm32-sdmmc",
         feature = "dev-stm32-spi",
         feature = "dev-stm32-octospi",
@@ -1082,6 +1083,7 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::sitronix::bind(&mut b)?;
     #[cfg(any(
         feature = "dev-stm32",
+        feature = "dev-stm32-dma",
         feature = "dev-stm32-sdmmc",
         feature = "dev-stm32-spi",
         feature = "dev-stm32-octospi",
@@ -1199,6 +1201,7 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(any(
         feature = "dev-stm32",
+        feature = "dev-stm32-dma",
         feature = "dev-stm32-sdmmc",
         feature = "dev-stm32-spi",
         feature = "dev-stm32-octospi",
