@@ -1514,9 +1514,10 @@ impl IrHost for Host<'_, '_> {
     }
 
     fn charge(&mut self, ticks: u64) {
-        for _ in 0..ticks {
-            self.exec.charge();
-        }
+        // One call rather than a loop over `Exec::charge`, with the
+        // `mcountinhibit` test read once for the whole charge rather than once
+        // per tick — nothing inside a charge can write that CSR.
+        self.exec.charge_n(ticks);
     }
 
     /// One load and one compare, at every guest instruction boundary but a

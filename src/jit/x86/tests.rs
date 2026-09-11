@@ -1163,6 +1163,277 @@ fn a_value_read_at_the_instruction_a_flush_runs_ahead_of_needs_a_saved_register(
     assert!(agree(&block, true));
 }
 
+/// The plan's events for `block`, under both register policies.
+///
+/// Both, because the fusion happens in `plan` and `plan` runs once per policy
+/// — a policy that somehow reached a different event array would be a
+/// different guest, not a differently allocated one.
+fn events_of(block: &Block) -> Vec<super::rt::Event> {
+    let frame = super::compile::compile_with(block, Regs::Frame).expect("compiles");
+    let scan = super::compile::compile_with(block, Regs::Scan).expect("compiles");
+    assert_eq!(
+        frame.events(),
+        scan.events(),
+        "the two policies planned different bookkeeping\n{block}"
+    );
+    frame.events().to_vec()
+}
+
+/// A block of `n` guest instructions, each `insn_start` then `charge(ticks)`.
+fn charged(n: u64, ticks: u64) -> Block {
+    let mut b = BlockBuilder::new(BASE, 0);
+    let mut at = 0;
+    for i in 0..n {
+        b.insn_start(InsnStart {
+            pc: BASE + i * 4,
+            next_pc: BASE + i * 4 + 4,
+            ticks: at,
+            live: Vec::new(),
+        });
+        b.charge(ticks);
+        at += ticks;
+    }
+    b.insn_start(InsnStart {
+        pc: BASE + n * 4,
+        next_pc: BASE + n * 4,
+        ticks: at,
+        live: Vec::new(),
+    });
+    b.exit_tb();
+    b.finish()
+}
+
+#[test]
+fn a_charge_is_fused_into_the_boundary_it_follows() {
+    use super::rt::Event;
+
+    // Two events per guest instruction is what every frontend in this tree
+    // emits, and it is the thing this fuses: the replay walks one event with
+    // the count in it instead of two with a discriminant test between them.
+    let block = charged(3, 2);
+    assert_eq!(
+        events_of(&block),
+        [
+            Event::Boundary {
+                mark: 0,
+                exit: false,
+                ticks: 2
+            },
+            Event::Boundary {
+                mark: 1,
+                exit: false,
+                ticks: 2
+            },
+            Event::Boundary {
+                mark: 2,
+                exit: false,
+                ticks: 2
+            },
+            // The exit boundary: a terminator follows it, so no charge can.
+            Event::Boundary {
+                mark: 3,
+                exit: true,
+                ticks: 0
+            },
+        ],
+        "{block}"
+    );
+    assert!(agree(&block, true), "{block}");
+}
+
+#[test]
+fn a_charge_of_zero_is_never_fused_because_the_call_still_happens() {
+    use super::rt::Event;
+
+    // `IrHost::charge` is called once per `Opcode::CHARGE` with that opcode's
+    // own immediate — the count is hashed output and not a budget (`ir`'s
+    // module docs, decision 2) — so a host counting calls must see the same
+    // number of them. Zero in the boundary's slot means *no fused charge*, so
+    // a `charge(0)` cannot be encoded there and stays an event of its own.
+    // Fusing it would be invisible in every tick comparison in this file and
+    // visible to a host that counts.
+    let block = charged(2, 0);
+    assert_eq!(
+        events_of(&block),
+        [
+            Event::Boundary {
+                mark: 0,
+                exit: false,
+                ticks: 0
+            },
+            Event::Charge(0),
+            Event::Boundary {
+                mark: 1,
+                exit: false,
+                ticks: 0
+            },
+            Event::Charge(0),
+            Event::Boundary {
+                mark: 2,
+                exit: true,
+                ticks: 0
+            },
+        ],
+        "{block}"
+    );
+    // And the calls themselves, against the oracle. `Scratch::charge` logs
+    // every one, so this is the assertion the event array above cannot make.
+    assert!(agree(&block, true), "{block}");
+    assert!(agree_within(&block, true, 0), "{block}");
+}
+
+#[test]
+fn a_second_charge_for_one_guest_instruction_stays_a_second_call() {
+    use super::rt::Event;
+
+    // A frontend is free to emit two charges for one guest instruction, and
+    // `IrHost::charge` is then called twice, in order, with each immediate.
+    // Only the first has a slot to be fused into; the second must not
+    // overwrite it and must not be added to it.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(3);
+    b.charge(5);
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 4,
+        ticks: 8,
+        live: Vec::new(),
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect("well formed");
+    assert_eq!(
+        events_of(&block),
+        [
+            Event::Boundary {
+                mark: 0,
+                exit: false,
+                ticks: 3
+            },
+            Event::Charge(5),
+            Event::Boundary {
+                mark: 1,
+                exit: true,
+                ticks: 0
+            },
+        ],
+        "{block}"
+    );
+    assert!(agree(&block, true), "{block}");
+
+    let mut host = Scratch::new(true);
+    let mut interp = Interp::new();
+    interp.run(&block, &mut host).expect("runs");
+    assert_eq!(interp.ticks(), 8);
+}
+
+#[test]
+fn a_charge_a_branch_can_arrive_at_is_not_fused_into_a_boundary_before_it() {
+    use super::rt::Event;
+
+    // The condition that is not about the two events being adjacent. A
+    // `brcond` targeting the charge makes it the top of a region, so the
+    // fall-through replays the boundary at the branch and the charge is
+    // replayed by the flush at the *target* — by both paths. Fusing across
+    // that flush point would charge the taken path for a boundary it never
+    // reached and replay the boundary twice on the fall-through.
+    for take in [false, true] {
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        // `x < x` never holds; `x == x` always does.
+        let x = b.imm(Type::I64, Const::Int(3));
+        let cond = if take { Cond::Eq } else { Cond::LtU };
+        let sel = b.setcond(cond, Type::I64, x, x);
+        let over = b.emit_raw(Opcode::BRCOND, Type::I64, None, None, &[sel], None, None, 0);
+        b.charge(7);
+        // The branch lands on the charge itself, which is the shape the
+        // `events.len() > region` condition exists for.
+        b.patch_aux(over, b.next_index() as u32);
+        b.charge(4);
+        b.insn_start(InsnStart {
+            pc: BASE + 4,
+            next_pc: BASE + 4,
+            ticks: 11,
+            live: vec![(RegSlot(0), x)],
+        });
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+
+        // Non-vacuity: the branch really does target the charge.
+        let insts = block.insts();
+        let brcond = insts
+            .iter()
+            .position(|i| i.op == Opcode::BRCOND)
+            .expect("a branch");
+        assert_eq!(insts[insts[brcond].aux as usize].op, Opcode::CHARGE);
+
+        assert_eq!(
+            events_of(&block),
+            [
+                Event::Boundary {
+                    mark: 0,
+                    exit: false,
+                    ticks: 0
+                },
+                Event::Charge(7),
+                Event::Charge(4),
+                Event::Boundary {
+                    mark: 1,
+                    exit: true,
+                    ticks: 0
+                },
+            ],
+            "{block}"
+        );
+        assert!(agree(&block, true), "{block}");
+
+        let mut host = Scratch::new(true);
+        let mut interp = Interp::new();
+        interp.run(&block, &mut host).expect("runs");
+        assert_eq!(interp.ticks(), if take { 4 } else { 11 });
+    }
+}
+
+#[test]
+fn a_boundary_that_stops_the_block_does_not_charge_its_own_fused_ticks() {
+    // Where the fused charge has to be applied *after* the `spent` return and
+    // not before it. The allowance runs out at the second boundary, which the
+    // block leaves at — and the guest instruction that boundary opens has not
+    // run, so its charge is part of what is unwound. Applying the fused count
+    // first would leave the compiled engine `ticks` ahead of the interpreter
+    // at the one boundary the two have to agree about, and `ROADMAP.md` §0's
+    // identical state hash across engines would stop holding for every core
+    // that admits a block it is not sure fits.
+    //
+    // Every allowance from nothing to more than the block spends, so the stop
+    // lands on each boundary in turn and then on none of them.
+    let block = charged(4, 3);
+    for allowance in 0..16 {
+        assert!(agree_within(&block, true, allowance), "{block}");
+    }
+    // Non-vacuity: an allowance in the middle really does stop the run.
+    let mut host = Scratch::within(true, 5);
+    assert!(matches!(
+        Interp::new().run(&block, &mut host),
+        Ok(crate::ir::Outcome::Spent { .. })
+    ));
+    // and the ticks charged at that stop are the instructions that *ran*: two
+    // boundaries' worth at three each, and nothing for the third.
+    assert_eq!(host.ticks, 6);
+}
+
 #[test]
 fn a_charge_a_branch_jumps_over_is_never_charged() {
     // The reason a `brcond` is a region boundary. The skipped range holds a

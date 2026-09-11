@@ -643,7 +643,34 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
                     .imm
                     .ok_or(Refusal::Shape("a charge needs a tick count"))?
                     .bits() as u64;
-                events.push(Event::Charge(ticks));
+                // Fuse into the boundary just ahead of it where all three
+                // hold, and emit an event of its own where they do not.
+                //
+                // * `ticks != 0`, so a `charge(0)` stays a call of its own and
+                //   a host counting calls sees the same count.
+                // * `events.len() > region`, so the last event was pushed
+                //   *inside this region* and no flush point lies between the
+                //   two. This is the condition a `brcond` targeting the charge
+                //   breaks: the target starts a new region, `region` moves up
+                //   to here, and the charge is then reachable by a path that
+                //   never ran the boundary.
+                // * that last event is a boundary whose slot is still free, so
+                //   a second charge for one guest instruction stays a second
+                //   call, in order, after the first.
+                //
+                // Nothing else in this file changes, `Plan::can_stop` least of
+                // all: fusion removes charges and never a boundary, so the
+                // ranges that can end a block are exactly the ranges that
+                // could before.
+                let open = events.len() > region as usize;
+                match events.last_mut() {
+                    Some(Event::Boundary { ticks: slot, .. })
+                        if open && ticks != 0 && *slot == 0 =>
+                    {
+                        *slot = ticks;
+                    }
+                    _ => events.push(Event::Charge(ticks)),
+                }
             }
             Opcode::INSN_START => {
                 block
@@ -656,6 +683,8 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
                     // range of events and never sees an instruction index.
                     // `ir::Interp` asks the same question of `insts[at + 1]`.
                     exit: insts.get(i + 1).is_some_and(|next| next.op.is_terminator()),
+                    // Filled in by the charge that follows, if one does.
+                    ticks: 0,
                 });
             }
             _ => {}

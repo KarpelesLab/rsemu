@@ -469,8 +469,23 @@ impl<'a> Exec<'a> {
     /// Charge one bus access.
     #[inline]
     pub(super) fn charge(&mut self) {
-        self.used += 1;
-        self.st.cycles = self.st.cycles.wrapping_add(1);
+        self.charge_n(1);
+    }
+
+    /// Charge `ticks` bus accesses at once.
+    ///
+    /// Every addition here is unconditional, so `ticks` of them is one of them
+    /// scaled, and the loop this replaces in
+    /// [`IrHost::charge`](crate::ir::IrHost::charge) had a **trip count of
+    /// one**: `lift::FETCH_TICKS` is the whole static column on this core, so
+    /// the scaffolding was the cost and the body was two increments.
+    /// `cpu::x86::engine`'s `charge` already had the scaled form and says the
+    /// same thing. Guest-visible state is identical by construction: `charge`
+    /// is this with `ticks == 1`, so the two cannot drift.
+    #[inline]
+    pub(super) fn charge_n(&mut self, ticks: u64) {
+        self.used += ticks;
+        self.st.cycles = self.st.cycles.wrapping_add(ticks);
     }
 
     // -----------------------------------------------------------------
