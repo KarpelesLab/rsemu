@@ -974,6 +974,7 @@ pub fn registry() -> Result<Registry> {
         feature = "dev-stm32-i2c",
         feature = "dev-stm32-exti",
         feature = "dev-stm32-wdg",
+        feature = "dev-stm32-crc",
         feature = "machine-spi-flash"
     ))]
     crate::dev::stm32::register(&mut reg)?;
@@ -1090,6 +1091,7 @@ pub fn bindings() -> Result<Bindings> {
         feature = "dev-stm32-i2c",
         feature = "dev-stm32-exti",
         feature = "dev-stm32-wdg",
+        feature = "dev-stm32-crc",
         feature = "machine-spi-flash"
     ))]
     crate::dev::stm32::bind(&mut b)?;
@@ -1209,6 +1211,7 @@ pub fn classes() -> ClassTable {
         feature = "dev-stm32-i2c",
         feature = "dev-stm32-exti",
         feature = "dev-stm32-wdg",
+        feature = "dev-stm32-crc",
         feature = "machine-spi-flash"
     ))]
     for schema in crate::dev::stm32::schemas() {

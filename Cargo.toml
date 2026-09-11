@@ -1241,6 +1241,23 @@ dev-stm32-exti = []
 # `unsafe`, no dependencies.
 dev-stm32-wdg = []
 
+# The STM32 CRC calculation unit (src/dev/stm32/crc.rs): one class, `st.crc`,
+# in the two shapes the family has. Every STM32 carries one at 0x40023000 and
+# firmware uses it for image checksums, settings-block integrity and hash
+# seeding, so a part without it is a bus fault in the middle of a boot rather
+# than a feature somebody misses later. `variant = "f4"` is the original
+# F1/F2/F4 block: a fixed CRC-32 over 0x04C11DB7 from 0xFFFFFFFF, no
+# reversal, 32-bit DR writes only. `variant = "v2"` is the F0/F3/F7/L0/L4/
+# G0/G4/H7/WB one, where POL, INIT, a 7/8/16/32-bit POLYSIZE and bit
+# reversal on the way in and out are all programmable and DR takes 8-, 16-
+# and 32-bit writes. The accumulator is the manual's shift register run one
+# bit at a time, which is what makes a seven-bit polynomial fed eight-bit
+# units come out right. Every test vector is derived from the polynomial
+# rather than lifted from an implementation. Written from ST RM0090 S4.4 and
+# ST RM0351 S14; no emulator source was consulted (ROADMAP.md S1).
+# `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-crc = []
+
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4 at 168 MHz, 1 MiB of flash aliased at zero, the three
 # SRAM banks, five GPIO ports and USART2 on the terminal. The first M-profile
