@@ -84,6 +84,21 @@ because nothing but a `Runnable` is bounded by a budget. So the defect was not
 on its own board**", which a guest feels directly: sixty seconds of `--for` on
 `arm64-virt` reached a printk timestamp of 0.3 s.
 
+The same command after the change, and it is the shortest statement of what
+this was worth:
+
+```console
+$ rsemu run arm64-virt --media kernel=… --initrd … --for 1s --capture console
+[    0.689553] evm: HMAC attrs: 0x1
+ran to 1000000000 ns of virtual time
+  cpu      1000000000 ticks
+  uart     1500000 ticks
+```
+
+One second of `--for`, one billion ticks of a 1 GHz core, and a kernel whose own
+printk clock reads 0.69 s — the rest being the idle the boot actually spends.
+Sixty seconds used to reach 0.3.
+
 `pc64`'s 1/4.96 rather than 1/10 is the arithmetic working exactly as
 described. Its rounds are cut short by its lazily-advanced devices, and a round
 cut short is a round that still hands out up to the full cap — so *more* rounds
@@ -173,6 +188,17 @@ Three things follow:
   committed state hashes in `tests/goldens/frame-hashes.txt` and left every
   other one identical to the bit.
 
+And one rule that is not obvious until a board needs it: **a share that rounds
+down to nothing still gets one tick**, whenever the span itself is not zero.
+Dividing starves a slow domain otherwise, which is a different bug from the one
+the share fixes — `tests/vnc_input.rs` is the board that found it, an 8086 at
+4.77 MHz and an 8042 at 1 193 Hz on one crystal, where the controller's tick is
+838 µs against a 1 ms round, so half a round is six tenths of one tick and the
+keyboard never moved a byte. The span stays the ceiling, so the runnable that
+takes that tick leaves the next one nothing and the round-robin's rotation
+gives that one its turn next round — which is what happened before any share
+bound existed.
+
 ### What it does not fix
 
 Each of two processors on one crystal still executes at **half** the rate its
@@ -223,6 +249,19 @@ clock:
 `RSEMU_LONGRUN_MS` and `RSEMU_X86_LONGRUN_MS` are the knobs; the `_SECONDS`
 spellings still work and still mean whole seconds, so an old command line does
 what it always said and simply costs a hundred times the wall clock.
+
+`scripts/check.sh long` with those budgets, all three legs green on this host
+(contended, so these are upper bounds):
+
+| leg | wall |
+| --- | --- |
+| synthetic, 300 ms, three architectures, two engines each | 40.7 s |
+| `arm64-virt` kernel, 1 200 ms — 1 200 quanta, `jit` 154 s and `jit-host` 117 s | 273.2 s |
+| `pc64` kernel, 200 000 ms — 440 082 quanta, `jit` 418 s and `jit-host` 310 s | 729.4 s |
+
+The x86 leg's own documentation budgeted "about sixteen minutes for the two
+engines together" at 900 guest seconds, and 200 covers **more** guest work than
+that did — 2.0e10 processor ticks against 1.81e10 — in twelve.
 
 The bench default is the sharpest check available that the two spans really are
 the same run: `benches/a64_linux_boot` at its new 200 000 000 ns default
