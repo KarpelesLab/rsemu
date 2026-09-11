@@ -142,21 +142,38 @@ What is compared is host wall-clock seconds to drive one guest from reset to a
 fixed point in its own execution — which needs no equivalence between the two
 timelines and cannot be gamed by either side's idea of a second.
 
-That choice turned out to be load-bearing rather than merely careful.
-`--for` does **not** currently mean what a reader would assume, on either
-board: at `--for 10s`, `rsemu run arm64-virt` reports its core as having taken
+That choice turned out to be load-bearing rather than merely careful, and the
+reason it did is worth keeping: **it found a defect.**
+
+`--for` did **not** mean what a reader would assume, on either board. At
+`--for 10s`, `rsemu run arm64-virt` reported its core as having taken
 100 000 000 ticks of a clock the machine file rates at 1 GHz — a hundredth of
-the elapsed span — and `rsemu run pc64` reports 201 600 000 of a 100 MHz one,
-about a fifth. Every *other* clocked device in the same two summaries matches
+the elapsed span — and `rsemu run pc64` reported 201 600 000 of a 100 MHz one,
+about a fifth. Every *other* clocked device in the same two summaries matched
 its declared oscillator exactly (the PL011 at `uartclk / 16` = 1.5 MHz, the
-8254 at 105/88 MHz, the MC146818 at 32 768 Hz, the 16550 at 115 200 Hz), so
-this is specific to the processor objects and it is stable across spans. The
-guest feels it: sixty seconds of `--for` on `arm64-virt` gets a Linux kernel to
-a printk timestamp of 0.3 s. Whether that is the summary mislabelling a
-counter or the domain genuinely running slow is a question for whoever owns
-`core::clock` — but it is exactly the sort of thing a benchmark built on
-"n virtual seconds equals m real ones" would have silently inherited, and this
-one does not.
+8254 at 105/88 MHz, the MC146818 at 32 768 Hz, the 16550 at 115 200 Hz), so it
+was specific to the processor objects and stable across spans. The guest felt
+it: sixty seconds of `--for` on `arm64-virt` got a Linux kernel to a printk
+timestamp of 0.3 s.
+
+It was the domain genuinely running slow. `SchedulerConfig::max_ticks_per_
+quantum` capped a scheduler round at **ten thousand** processor ticks whatever
+the board declared, against a 1 ms quantum that owes a 1 GHz core a million,
+and because a budget is recomputed from the tree's absolute position every
+round, what a round could not spend became a backlog the next round re-capped.
+A processor's effective rate was *ten thousand × rounds per guest second* and
+the `osc` statement had no bearing on it.
+[`../techniques/execution-budgets.md`](../techniques/execution-budgets.md) is
+the whole argument and the fix; both boards' cores now advance at exactly their
+declared rate.
+
+Two things follow for this page. The ratios below are **unaffected**, which is
+the point of measuring host wall-clock to a marker in the guest's own output: a
+benchmark built on "n virtual seconds equals m real ones" would have silently
+inherited the defect, and this one could not. And every `--for` on the rsemu
+side of `scripts/bench-vs-qemu.sh` is a *bound* rather than a plan — it only
+has to be more virtual time than the workload needs — so the bounds are now
+generous by a factor of a hundred rather than tight, which costs nothing.
 
 The guest also prints a digest of what each phase produced — the sha256 prefix,
 the awk sum, the compressed size — and **a run whose digest disagrees with the

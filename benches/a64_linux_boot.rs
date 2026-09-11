@@ -168,8 +168,8 @@ fn main() {
     let initrd = fixture("RSEMU_ARM64_INITRD").unwrap_or_default();
 
     println!(
-        "rsemu arm64-virt Linux boot — engine={}, {} virtual seconds, {} rep(s)\n",
-        args.engine, args.seconds, args.reps
+        "rsemu arm64-virt Linux boot — engine={}, {} virtual ns, {} rep(s)\n",
+        args.engine, args.nanos, args.reps
     );
     println!(
         "{:<10} {:>9} {:>12} {:>10} {:>18}",
@@ -260,7 +260,7 @@ fn boot(
     args: &Args,
 ) -> (Duration, rsemu::cpu::arm::a64::JitStats, u64) {
     let (mut machine, cpu) = board(kernel, initrd, args);
-    let span = GlobalTime::from_nanos(args.seconds * 1_000_000_000);
+    let span = GlobalTime::from_nanos(args.nanos);
     let start = Instant::now();
     machine.run_for(span).expect("the machine advances");
     let elapsed = start.elapsed();
@@ -294,7 +294,7 @@ fn board(kernel: &[u8], initrd: &[u8], args: &Args) -> (Machine, Arc<Cpu>) {
         Ok(cpu)
     });
     let entry = catalog::machine("arm64-virt").expect("this build ships it");
-    let options = catalog::build_options()
+    let mut options = catalog::build_options()
         .expect("the catalog agrees with itself")
         .with_bindings(bindings)
         .with_media("kernel", kernel)
@@ -306,6 +306,7 @@ fn board(kernel: &[u8], initrd: &[u8], args: &Args) -> (Machine, Arc<Cpu>) {
             "cmdline",
             "earlycon=pl011,0x9000000 console=ttyAMA0 rdinit=/init",
         );
+    options.realize.scheduler.max_ticks_per_quantum = (args.cap > 0).then_some(args.cap);
     let registry = catalog::registry().expect("a registry");
     let machine = build(entry.name, entry.source, &registry, &options)
         .unwrap_or_else(|e| panic!("arm64-virt does not build: {e}"));
@@ -334,8 +335,25 @@ fn skip() {
 
 /// What the command line can change.
 struct Args {
-    /// How much *virtual* time to run, in seconds.
+    /// How much *virtual* time to run, in seconds. Only ever set from
+    /// `--seconds`; `nanos` is what the run actually uses.
     seconds: u64,
+    /// The span to run, in nanoseconds. `--nanos` names it directly and
+    /// `--seconds` multiplies up into it.
+    ///
+    /// Nanoseconds rather than seconds because a guest second of this board
+    /// stopped being a usable unit: its processor used to execute ten million
+    /// ticks a guest second, because `SchedulerConfig::max_ticks_per_quantum`
+    /// capped a round at a rate-blind ten thousand whatever the machine file
+    /// declared, and it executes the billion the file says now. The default
+    /// below is the old `--seconds 20` divided by that hundred, and it
+    /// reproduces that run's census to the instruction: 154 233 793 guest
+    /// instructions retired, 10.80 per block.
+    nanos: u64,
+    /// `SchedulerConfig::max_ticks_per_quantum`, for reproducing the
+    /// measurement that removed it. Zero — the default — is `None`, which is
+    /// the shipping configuration: a budget bounded by the round alone.
+    cap: u64,
     /// `interp`, `jit` or `jit-host`.
     engine: String,
     reps: usize,
@@ -348,6 +366,8 @@ impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Args {
         let mut out = Args {
             seconds: 20,
+            nanos: 200_000_000,
+            cap: 0,
             engine: "jit-host".to_string(),
             reps: 1,
             hash: false,
@@ -355,7 +375,12 @@ impl Args {
         let mut it = args.peekable();
         while let Some(arg) = it.next() {
             match arg.as_str() {
-                "--seconds" => out.seconds = next(&mut it, "--seconds").parse().expect("a number"),
+                "--seconds" => {
+                    out.seconds = next(&mut it, "--seconds").parse().expect("a number");
+                    out.nanos = out.seconds * 1_000_000_000;
+                }
+                "--nanos" => out.nanos = next(&mut it, "--nanos").parse().expect("a number"),
+                "--cap" => out.cap = next(&mut it, "--cap").parse().expect("a number"),
                 "--engine" => out.engine = next(&mut it, "--engine"),
                 "--reps" => out.reps = next(&mut it, "--reps").parse().expect("a number"),
                 "--hash" => out.hash = true,

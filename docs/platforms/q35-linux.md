@@ -5,6 +5,21 @@ Consumed by [`machines/q35-linux.machine`](../../machines/q35-linux.machine),
 [`src/dev/q35`](../../src/dev/q35). The chipset is [`q35`](q35.md)'s and the
 entry is [`pc64`](pc64.md)'s; neither of those pages is repeated here.
 
+
+> **Guest-time figures on this page predate the removal of
+> `SchedulerConfig::max_ticks_per_quantum`.** That constant capped a
+> scheduler round at ten thousand processor ticks whatever the board
+> declared, so this board's 100 MHz core ran at 1/4.96 of its
+> declared rate against virtual time, and a guest second bought 4.96
+> times less processor work than it does now. Every *virtual second*,
+> *guest second*, `--for` span and printk timestamp below was measured at
+> that rate and is kept as it was taken; divide by 4.96 to get the
+> guest time that buys the same work today. Ratios, host-instruction
+> counts, per-block figures and hashes taken over a *guest-side* window
+> are unaffected.
+> [`../techniques/execution-budgets.md`](../techniques/execution-budgets.md)
+> has the mechanism and the measurement.
+
 ## Why a third board and not a flag on one of the two
 
 [`q35`](q35.md) has the chipset — ECAM, the PAM file at `0x90`, the ICH9's

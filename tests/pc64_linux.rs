@@ -105,7 +105,18 @@ use x86boot::{Drains, Script};
 ///
 /// A ceiling rather than a target: the run stops early when the processor
 /// stops making progress.
-const DEFAULT_MS: u64 = 900_000;
+///
+/// **190 000, where it was 900 000**, and the two are the same run. Every
+/// guest-second figure in the paragraph above was taken while
+/// `SchedulerConfig::max_ticks_per_quantum` capped a round at ten thousand of
+/// this board's 100 MHz processor rather than the quantum's hundred thousand,
+/// which measured out as 4.96x fewer processor ticks per guest second; the cap
+/// is gone and the budget is divided by that, so the ceiling costs the same
+/// four or five wall-clock minutes and reaches the same place.
+/// `docs/techniques/execution-budgets.md` has the arithmetic. The 250 and 490
+/// virtual seconds quoted here and below are *at the old rate* and are left as
+/// they were measured.
+const DEFAULT_MS: u64 = 190_000;
 
 /// Everything the board needs to construct, with a `cpu.x86` that pushes what
 /// it builds into `cpus`.

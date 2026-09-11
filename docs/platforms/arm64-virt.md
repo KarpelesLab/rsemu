@@ -5,6 +5,21 @@ Consumed by [`machines/arm64-virt.machine`](../../machines/arm64-virt.machine),
 [`tests/a64_linux.rs`](../../tests/a64_linux.rs). The core is
 [`cpu.arm.a64`](../../src/cpu/arm/a64); this page is about the board around it.
 
+
+> **Guest-time figures on this page predate the removal of
+> `SchedulerConfig::max_ticks_per_quantum`.** That constant capped a
+> scheduler round at ten thousand processor ticks whatever the board
+> declared, so this board's 1 GHz core ran at 1/100 of its
+> declared rate against virtual time, and a guest second bought a hundred
+> times less processor work than it does now. Every *virtual second*,
+> *guest second*, `--for` span and printk timestamp below was measured at
+> that rate and is kept as it was taken; divide by a hundred to get the
+> guest time that buys the same work today. Ratios, host-instruction
+> counts, per-block figures and hashes taken over a *guest-side* window
+> are unaffected.
+> [`../techniques/execution-budgets.md`](../techniques/execution-budgets.md)
+> has the mechanism and the measurement.
+
 ## Why the board exists
 
 `cpu.arm.a64` was, before this, a strong core with nowhere to run. 666
@@ -548,6 +563,15 @@ an interpreted instruction is in the middle of a block, and only a lift filled
 the cost table, so it was uncosted too. `engine.rs`'s `Probe` closed half of
 that by lifting the cold PC instead of guessing at it. The seam closes the rest
 and deletes both, because a block that can leave never needs to be refused.
+
+> That **10 000** was `SchedulerConfig::max_ticks_per_quantum`, a rate-blind
+> constant rather than anything this board declared, and it is gone: a round
+> now hands this 1 GHz core the quantum's own million ticks. The refusal it
+> caused had already been deleted by the seam described here, so nothing above
+> changes — but a block's worst case is now three orders of magnitude inside a
+> round rather than half of one, which is worth knowing before anyone
+> re-derives a bound from that number.
+> `docs/techniques/execution-budgets.md` has the rest.
 
 Measured over the **boot**, from reset to `/init`'s banner — a guest-side
 window, so both columns run the same 137 984 quanta and the same 1 071 503 716

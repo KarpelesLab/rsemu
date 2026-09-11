@@ -548,26 +548,39 @@ stage_wasm_threads() {
 # want a shipped board, because the whole point of it is a guest nobody
 # designed for this.
 LONGRUN_FEATURES="machine-arm64-virt,cpu-arm-a64-lift,machine-riscv-virt,cpu-riscv-lift,cpu-x86-lift,dev-pc,machine-pc64,jit,jit-x86"
+#
+# Every budget below is in guest **milliseconds** and every one of them is the
+# number it used to be in guest seconds, divided by how much more guest work a
+# guest second now buys. `SchedulerConfig::max_ticks_per_quantum` used to cap a
+# round at a rate-blind ten thousand processor ticks whatever the board
+# declared, so `arm64-virt` and `riscv-virt` ran their 1 GHz cores at a
+# hundredth of their declared rate and `pc64` its 100 MHz core at a fifth. The
+# cap is gone; the legs cover the same guest work in the same wall clock, at a
+# hundredth and a fifth of the guest time. `RSEMU_LONGRUN_MS` and
+# `RSEMU_X86_LONGRUN_MS` are the knobs; the `_SECONDS` spellings still work and
+# still mean whole seconds.
 stage_long() {
-  local secs kernel initrd
-  secs="${RSEMU_LONGRUN_SECONDS:-120}"
+  local ms kernel initrd
+  ms="${RSEMU_LONGRUN_MS:-1200}"
   kernel="${RSEMU_ARM64_KERNEL:-testdata/arm64/linux}"
   initrd="${RSEMU_ARM64_INITRD:-testdata/arm64/initramfs.cpio}"
 
   # The synthetic workloads, lengthened. No fixture, so this leg always runs.
   #
-  # Its own budget rather than `$secs`: the synthetic guests are *designed*
-  # around the mechanisms that broke and reach every one of them inside a
-  # second, so a hundred and twenty of them would be a hundred and twenty
-  # seconds of the same thing. What wants the long budget is the kernel, which
-  # is the only leg that can find something nobody designed for.
+  # Its own budget rather than `$ms`: the synthetic guests are *designed*
+  # around the mechanisms that broke and reach every one of them in a fraction
+  # of the kernel leg's budget, so handing them the whole of it would be four
+  # times as much of the same thing. What wants the long budget is the kernel,
+  # which is the only leg that can find something nobody designed for.
   #
-  # It is 30 rather than 120 for the A64 and RISC-V legs and for the x86 one
-  # alike: at 30 guest seconds the x86 workload alone is about three minutes,
-  # which is where the whole stage's synthetic half sits.
-  local syn="${RSEMU_LONGRUN_SYNTHETIC_SECONDS:-30}"
-  run "long synthetic (${syn}s of guest time)" \
-    env RSEMU_LONGRUN_SECONDS="$syn" \
+  # It is 300 ms rather than 1 200 for the A64 and RISC-V legs and for the x86
+  # one alike, which is 30 guest seconds' worth of work at the rate those
+  # boards actually ran before the tick cap went: at that budget the x86
+  # workload alone is about three minutes, which is where the whole stage's
+  # synthetic half sits.
+  local syn="${RSEMU_LONGRUN_SYNTHETIC_MS:-300}"
+  run "long synthetic (${syn}ms of guest time)" \
+    env RSEMU_LONGRUN_MS="$syn" \
     cargo test --release --features "$LONGRUN_FEATURES" --test engine_longrun
 
   if [ ! -s "$kernel" ]; then
@@ -578,9 +591,9 @@ stage_long() {
       record "skip  long kernel boot (no $kernel: scripts/fetch-testdata.sh arm64-linux arm64-initramfs)"
     fi
   else
-    run "long kernel boot (${secs}s of guest time)" \
+    run "long kernel boot (${ms}ms of guest time)" \
       env RSEMU_ARM64_KERNEL="$kernel" RSEMU_ARM64_INITRD="$initrd" \
-          RSEMU_LONGRUN_SECONDS="$secs" \
+          RSEMU_LONGRUN_MS="$ms" \
       cargo test --release --features "$LONGRUN_FEATURES" \
         --test engine_longrun -- --ignored --nocapture --test-threads=1 \
         a_real_arm64_linux_boot_agrees_across_the_engines
@@ -596,29 +609,34 @@ stage_long() {
 #
 # Its own function and its own budget, because `pc64` measures time differently
 # from `arm64-virt`. That board runs a 100 MHz processor and has no firmware, so
-# the bzImage decompresses itself from the reset vector: at 120 guest seconds
-# the last thing the guest has printed is "KASLR disabled" and it is still in
-# the decompressor, where 120 of `arm64-virt` is well past both defects that
-# gate exists for. So RSEMU_X86_LONGRUN_SECONDS is the knob.
+# the bzImage decompresses itself from the reset vector, and it wants far more
+# guest work than the arm64 leg to reach the same depth. So
+# RSEMU_X86_LONGRUN_MS is the knob.
 #
-# 900 rather than something smaller is measured rather than chosen. The
-# calibration run re-introduced `admit`'s interrupt-shadow refusal and this leg
-# caught it at **quantum 1 280 242, 635.04 s of guest time** — the first `STI`
-# the kernel executes is that far in, because everything up to
-# `local_irq_enable` runs with interrupts off. The same run at 600 guest seconds
-# passes with that defect planted. docs/testing/long-run.md has the table.
+# **200 000 ms, where it was 900 guest seconds.** That is measured rather than
+# chosen, twice over. The calibration run re-introduced `admit`'s
+# interrupt-shadow refusal and this leg caught it at **quantum 1 280 242,
+# 635.04 s of guest time** — the first `STI` the kernel executes is that far
+# in, because everything up to `local_irq_enable` runs with interrupts off —
+# and the same run at 600 guest seconds passed with that defect planted, so 900
+# was 1.42x the depth the gate needs. Then the tick cap went: this board's
+# processor was running at 20.16 MHz against the 100 MHz it declares, measured
+# as 201 600 000 ticks in ten guest seconds, so a guest second now buys 4.96x
+# the guest work. 900 / 4.96 = 181 s reaches the old depth; 200 s is that with
+# the margin rounded up, and the first `STI` now falls at about 128 s.
 #
 # It costs about sixteen minutes for the two engines together, which is what the
-# nightly's ninety-minute budget is sized for.
+# nightly's ninety-minute budget is sized for, and re-sizing the budget by the
+# ratio is what keeps it there.
 #
-# RSEMU_LONGRUN_SECONDS deliberately does not drive it. The two boards' guest
-# seconds are not comparable budgets, and one variable driving both would make
-# whichever is the shorter of them meaningless.
+# RSEMU_LONGRUN_MS deliberately does not drive it. The two boards' guest time is
+# not a comparable budget, and one variable driving both would make whichever is
+# the shorter of them meaningless.
 stage_long_x86() {
-  local kernel initrd secs
+  local kernel initrd ms
   kernel="${RSEMU_X86_KERNEL:-testdata/x86/bzImage}"
   initrd="${RSEMU_X86_INITRD:-testdata/x86/initramfs-x86.cpio}"
-  secs="${RSEMU_X86_LONGRUN_SECONDS:-900}"
+  ms="${RSEMU_X86_LONGRUN_MS:-200000}"
 
   if [ ! -s "$kernel" ]; then
     if [ -n "${RSEMU_LONGRUN_REQUIRED:-}" ]; then
@@ -634,9 +652,9 @@ stage_long_x86() {
   # to compare. `machines/pc64.machine` says why an initramfs is the only root
   # this board can be given at all.
   [ -s "$initrd" ] || initrd=""
-  run "long x86 kernel boot (${secs}s of guest time)" \
+  run "long x86 kernel boot (${ms}ms of guest time)" \
     env RSEMU_X86_KERNEL="$kernel" RSEMU_X86_INITRD="$initrd" \
-        RSEMU_LONGRUN_SECONDS="$secs" \
+        RSEMU_LONGRUN_MS="$ms" \
     cargo test --release --features "$LONGRUN_FEATURES" \
       --test engine_longrun -- --ignored --nocapture --test-threads=1 \
       a_real_x86_linux_boot_agrees_across_the_engines

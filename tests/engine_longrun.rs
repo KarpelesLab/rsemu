@@ -378,17 +378,25 @@ mod a64_tests {
     use super::a64::{self, Tlbi};
     use super::longrun::{self, Options, What};
 
-    /// How much guest time the synthetic runs cover by default.
+    /// How much guest time the synthetic runs cover by default, in
+    /// milliseconds.
     ///
-    /// Small, because this runs on every commit. `RSEMU_LONGRUN_SECONDS`
-    /// raises it, and the nightly job does.
-    const DEFAULT_SECONDS: u64 = 2;
+    /// Small, because this runs on every commit. `RSEMU_LONGRUN_MS` raises it,
+    /// and the nightly job does.
+    ///
+    /// **20 ms, where it was 2 whole seconds.** Not a reduction in coverage: a
+    /// guest second of this board's 1 GHz core used to be ten million cycles,
+    /// because `SchedulerConfig::max_ticks_per_quantum` capped a round at a
+    /// rate-blind ten thousand ticks whatever the board declared, and it is a
+    /// billion now. 20 ms is 20 million — the same guest *work* the old two
+    /// seconds bought, twice over, in the same wall clock. What is genuinely
+    /// smaller is the number of *seam events*: the workload's timer fires on
+    /// guest time, so a hundredth of the guest time is a hundredth of the
+    /// interrupts. Doubling the work is the margin bought back against that.
+    const DEFAULT_MILLIS: u64 = 20;
 
-    fn seconds() -> u64 {
-        std::env::var("RSEMU_LONGRUN_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_SECONDS)
+    fn millis() -> u64 {
+        longrun::budget_millis("RSEMU_LONGRUN", DEFAULT_MILLIS)
     }
 
     /// Which translated engines to compare against the oracle.
@@ -403,11 +411,11 @@ mod a64_tests {
 
     /// Run the synthetic workload under every engine and compare, failing on
     /// the first quantum anything parts.
-    fn run(tag: &str, tlbi: Tlbi, secs: u64) {
+    fn run(tag: &str, tlbi: Tlbi, ms: u64) {
         for engine in engines() {
             let (mut oracle, _) = a64::board("interp", &format!("{tag}.oracle.{engine}"), tlbi);
             let (mut under_test, cpu) = a64::board(&engine, &format!("{tag}.{engine}"), tlbi);
-            let opts = Options::to_guest_seconds(secs).hashing_every(2_000);
+            let opts = Options::to_guest_millis(ms).hashing_every(2_000);
             match longrun::lockstep(tag, &mut oracle, &engine, &mut under_test, &opts) {
                 Ok(summary) => eprintln!("{tag} engine={engine}: {summary}"),
                 Err(d) => panic!("{d}"),
@@ -418,7 +426,7 @@ mod a64_tests {
 
     #[test]
     fn a_synthetic_a64_workload_agrees_across_the_engines() {
-        run("a64-longrun", Tlbi::Never, seconds());
+        run("a64-longrun", Tlbi::Never, millis());
     }
 
     /// The same workload with `TLBI VMALLE1` in the loop — **the regression
@@ -449,7 +457,7 @@ mod a64_tests {
     /// long form.
     #[test]
     fn a_tlbi_in_the_loop_agrees_across_the_engines() {
-        run("a64-longrun-tlbi", Tlbi::Every256, seconds());
+        run("a64-longrun-tlbi", Tlbi::Every256, millis());
     }
 
     /// The instrument's own calibration: plant a divergence and check that the
@@ -609,13 +617,14 @@ mod arm64_virt {
             Err(_) => Vec::new(),
         };
 
-        let secs: u64 = std::env::var("RSEMU_LONGRUN_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            // 30 s of guest time clears both known defects (15.04 s and
-            // 23.46 s) with room; the nightly asks for 120, which is where the
-            // hand bisect stopped.
-            .unwrap_or(30);
+        // 300 ms of guest time clears both known defects with room, and the
+        // nightly asks for 1 200 ms. Those were 30 s and 120 s, and the
+        // defects were at 15.04 s and 23.46 s, when a round handed this 1 GHz
+        // core a rate-blind ten thousand ticks instead of the quantum's
+        // million: the same guest work now arrives a hundred times earlier in
+        // guest time, so every one of these numbers is the old one divided by
+        // a hundred and the run reaches exactly as far.
+        let ms: u64 = longrun::budget_millis("RSEMU_LONGRUN", 300);
         let engines: Vec<String> = std::env::var("RSEMU_LONGRUN_ENGINES")
             .unwrap_or_else(|_| "jit,jit-host".to_string())
             .split(',')
@@ -629,7 +638,7 @@ mod arm64_virt {
             // The full hash walks 512 MiB, so it is taken rarely; the
             // per-quantum device fingerprint is what finds a divergence first
             // and it costs nothing by comparison.
-            let opts = Options::to_guest_seconds(secs)
+            let opts = Options::to_guest_millis(ms)
                 .hashing_every(20_000)
                 .reporting_every(10_000);
             match longrun::lockstep("arm64-virt", &mut oracle, &engine, &mut under_test, &opts) {
@@ -690,7 +699,10 @@ mod riscv {
     /// next read of `mtime` rather than at a quantum boundary, and `mtip`
     /// rises between two instructions of a lifted block. A period longer than
     /// a quantum would put every edge on a boundary, where both engines see it
-    /// in the same place and the run says nothing.
+    /// in the same place and the run says nothing. 4 µs against the 1 ms a
+    /// round now covers is two and a half orders of magnitude of margin; it
+    /// was a factor of two and a half when a round was capped at 10 000 ticks
+    /// of the 1 GHz domain.
     const PERIOD: u64 = 40;
 
     /// The machine-mode half, at [`DRAM`]: physical-memory protection, the
@@ -1296,15 +1308,28 @@ mod riscv {
     /// `riscv.clint` is a lazily-advanced device (`ROADMAP.md` §4.2) and its
     /// `Registers::read` calls `sync` before answering, precisely so that *"a
     /// guest load catches the chip up to the core's live position"* — the
-    /// sentence is `cpu::riscv::engine`'s own. A hart on this board is given
-    /// `SchedulerConfig::max_ticks_per_quantum` — ten thousand — of a 1 GHz
-    /// domain per round, which is 10 µs, and `mtime` counts at 10 MHz, so a
-    /// round's worth of execution spans about **a hundred** distinct `mtime`
-    /// values. Eight quanta should therefore find several hundred.
+    /// sentence is `cpu::riscv::engine`'s own. A hart on this board is given a
+    /// round's worth of its own 1 GHz domain, which on the default 1 ms
+    /// quantum is a **million** ticks, and `mtime` counts at 10 MHz, so a
+    /// round's worth of execution spans about **ten thousand** distinct
+    /// `mtime` values. Eight quanta should therefore find tens of thousands.
+    ///
+    /// The floor below is not moved to match, deliberately. It was written
+    /// against the *bug* — one value per quantum — and an order of magnitude
+    /// above it, which is what a floor is for; tightening it to whatever the
+    /// current budget happens to produce would make it a second copy of the
+    /// scheduler's arithmetic rather than a test of the catch-up.
+    ///
+    /// (When this was written a round was capped at a rate-blind ten thousand
+    /// ticks, so it spanned a hundred `mtime` values and eight quanta found
+    /// 800. `SchedulerConfig::max_ticks_per_quantum` has since been replaced
+    /// by a bound the domain's own rate decides, which is why the number in
+    /// the paragraph below is the one it is.)
     ///
     /// # What it used to find: seven. One per quantum.
     ///
-    /// It finds **800** now. There were two causes and the fix needed both.
+    /// It found **800** when the fix landed. There were two causes and the fix
+    /// needed both.
     ///
     /// **Cause 1 — the hart published nothing. Fixed.**
     /// `Scheduler::arm_live_cursors` builds each lazy device's live view on
@@ -1399,12 +1424,13 @@ mod riscv {
         }
         // x7 is t2.
         let seen = hart.x(7);
-        // A round is 10 000 ticks of a 1 GHz domain and `mtime` counts at
-        // 10 MHz, so a hundred `mtime` values fall inside one — and the probe
-        // loop is four instructions, far finer than the hundred core ticks
-        // between two of them, so it sees essentially all of them. Half that
-        // is the floor: it is an order of magnitude above the one-per-quantum
-        // the bug produces, and well below what a correct catch-up gives.
+        // A round is a millisecond of a 1 GHz domain and `mtime` counts at
+        // 10 MHz, so ten thousand `mtime` values fall inside one — and the
+        // probe loop is four instructions, far finer than the hundred core
+        // ticks between two of them, so it sees essentially all of them. The
+        // floor stays where it was written, two orders of magnitude below
+        // that and one above the one-per-quantum the bug produces: see the
+        // doc comment for why it is not tightened.
         let want = QUANTA * 50;
         assert!(
             seen >= want,
@@ -1504,15 +1530,15 @@ mod riscv_tests {
 
     #[test]
     fn a_synthetic_riscv_workload_agrees_across_the_engines() {
-        let secs: u64 = std::env::var("RSEMU_LONGRUN_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
+        // 20 ms where it was 2 s, for the reason the A64 synthetic leg's
+        // `DEFAULT_MILLIS` gives: this board's hart is 1 GHz and a guest
+        // second of it is now a billion cycles rather than ten million.
+        let ms: u64 = longrun::budget_millis("RSEMU_LONGRUN", 20);
         let seams = seams();
         for engine in engines() {
             let (mut oracle, _) = riscv::board("interp", &format!("oracle.{engine}"), seams);
             let (mut under_test, hart) = riscv::board(&engine, &engine, seams);
-            let opts = Options::to_guest_seconds(secs).hashing_every(2_000);
+            let opts = Options::to_guest_millis(ms).hashing_every(2_000);
             match longrun::lockstep("riscv-virt", &mut oracle, &engine, &mut under_test, &opts) {
                 Ok(summary) => eprintln!("riscv-virt engine={engine}: {summary}"),
                 Err(d) => panic!("{d}"),
@@ -1649,11 +1675,13 @@ machine "x86-longrun" {
 
     /// The 8254 count [`MAIN`] programs counter 0 with.
     ///
-    /// 100 ticks of a 1.193 MHz input is 83.8 µs, against a quantum of at most
-    /// 10 000 ticks of a 100 MHz processor — 100 µs. So the timer edge lands
-    /// **inside** a quantum rather than on its boundary, on nearly every
-    /// quantum, which is the whole point: a boundary edge would be taken at the
-    /// same instruction by any engine.
+    /// 100 ticks of a 1.193 MHz input is 83.8 µs, against a quantum of 1 ms.
+    /// So the timer edge lands **inside** a quantum rather than on its
+    /// boundary, on nearly every quantum, which is the whole point: a boundary
+    /// edge would be taken at the same instruction by any engine. (The margin
+    /// used to be 83.8 µs against 100 µs, because a round was capped at a
+    /// rate-blind 10 000 ticks of this board's 100 MHz processor. Removing
+    /// that cap widened it rather than closing it.)
     const TIMER_COUNT: u16 = 100;
 
     /// The main loop, at [`CODE`].
@@ -2257,25 +2285,33 @@ mod x86_tests {
     /// What the per-commit run costs, and why it is a count of quanta rather
     /// than the guest seconds the other legs use.
     ///
-    /// One guest second of this board is 24 818 quanta, 192 618 passes round
+    /// One guest second of this board was 24 818 quanta, 192 618 passes round
     /// the loop and about three seconds of wall time **per engine** — twice
     /// what the rest of this file costs put together — and effectively all of
     /// it is repetition: the workload reaches every seam it was written for
-    /// inside the first two hundred quanta. Six thousand is 0.24 s of guest
-    /// time and roughly 46 000 passes, which is still 2 900 code rewrites, 700
-    /// `INVLPG`s, 2 800 timer interrupts and 180 software ones.
+    /// inside the first two hundred quanta. Six thousand quanta was 0.24 s of
+    /// guest time and roughly 46 000 passes, which was still 2 900 code
+    /// rewrites, 700 `INVLPG`s, 2 800 timer interrupts and 180 software ones.
     ///
-    /// `RSEMU_LONGRUN_SECONDS` removes the cap and asks for guest seconds
+    /// **1 200, where it was 6 000.** A quantum on this board now carries the
+    /// whole millisecond of its 100 MHz processor rather than the ten thousand
+    /// ticks a rate-blind `SchedulerConfig::max_ticks_per_quantum` allowed it,
+    /// so a quantum is worth about ten times the guest work it was. The counts
+    /// above that are *per pass* — rewrites, `INVLPG`s, software interrupts —
+    /// therefore come out roughly where they were at a fifth of the quanta,
+    /// and the count that is per guest *time* does not: about 560 timer
+    /// interrupts against 2 800. A fifth rather than a tenth is the margin
+    /// bought back against that, at twice the old wall clock for this leg.
+    ///
+    /// `RSEMU_LONGRUN_MS` removes the cap and asks for guest milliseconds
     /// instead, which is what `scripts/check.sh long` and the nightly do.
-    const DEFAULT_QUANTA: u64 = 6_000;
+    /// `RSEMU_LONGRUN_SECONDS` still works and still means whole seconds.
+    const DEFAULT_QUANTA: u64 = 1_200;
 
     /// How far to run, and how often to take the full hash.
     fn budget() -> Options {
-        match std::env::var("RSEMU_LONGRUN_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            Some(secs) => Options::to_guest_seconds(secs),
+        match longrun::budget_millis_opt("RSEMU_LONGRUN") {
+            Some(ms) => Options::to_guest_millis(ms),
             None => Options::to_guest_seconds(u64::MAX).at_most(DEFAULT_QUANTA),
         }
         .hashing_every(2_000)
@@ -2431,10 +2467,14 @@ mod pc64 {
     /// # What it costs
     ///
     /// `docs/testing/long-run.md` has the measured table. `pc64` runs a
-    /// 100 MHz processor and a quantum is at most 10 000 of its ticks, so a
-    /// guest second is on the order of 10 000 quanta — far fewer than the
-    /// synthetic x86 board's 24 818, because that guest leaves a block on
-    /// nearly every pass and this one does not.
+    /// 100 MHz processor and a quantum is 1 ms of it, so a guest second is on
+    /// the order of 1 000 quanta once the lazily-advanced devices have cut
+    /// some of them short — and a guest second is now a hundred million
+    /// processor cycles rather than the twenty million a rate-blind
+    /// `max_ticks_per_quantum` allowed it, so **a guest second of this board
+    /// is about five times the work it was**. `scripts/check.sh`'s
+    /// `RSEMU_X86_LONGRUN_SECONDS` was re-sized by exactly that ratio when the
+    /// cap went, so the leg covers the same guest work in the same wall time.
     ///
     /// # When the fixture is absent
     ///
@@ -2477,10 +2517,15 @@ mod pc64 {
             initrd.len()
         );
 
-        let secs: u64 = std::env::var("RSEMU_LONGRUN_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
+        // Was 30 guest seconds, and `scripts/check.sh` asked for 900. A
+        // quantum on this board now carries the whole millisecond of its
+        // 100 MHz processor rather than the ten thousand ticks a rate-blind
+        // `SchedulerConfig::max_ticks_per_quantum` allowed it, which on this
+        // board — whose rounds are cut short by its lazily-advanced devices,
+        // so a round was already fuller than the arm64 one — is 4.96x the
+        // guest work per guest second, measured. Both numbers are divided by
+        // that: 6 000 ms here and 200 000 in `check.sh`.
+        let ms: u64 = longrun::budget_millis("RSEMU_LONGRUN", 6_000);
         let engines: Vec<String> = std::env::var("RSEMU_LONGRUN_ENGINES")
             .unwrap_or_else(|_| "jit,jit-host".to_string())
             .split(',')
@@ -2495,7 +2540,7 @@ mod pc64 {
             // The full hash walks the board's whole extended memory, so it is
             // taken rarely; the per-quantum device fingerprint is what finds a
             // divergence first and costs nothing beside a quantum.
-            let opts = Options::to_guest_seconds(secs)
+            let opts = Options::to_guest_millis(ms)
                 .hashing_every(20_000)
                 .reporting_every(10_000);
             let (mut said, mut heard) = (Vec::new(), Vec::new());

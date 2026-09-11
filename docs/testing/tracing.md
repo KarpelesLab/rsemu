@@ -5,7 +5,7 @@ implemented it. This is that, and this file is what it emits, why those things
 and not others, what it costs, and what is specified but not yet wired.
 
 ```
-rsemu run pc64 --media kernel=bzImage --for 900s --headless --trace all=boot.trace
+rsemu run pc64 --media kernel=bzImage --for 200s --headless --trace all=boot.trace
 ```
 
 Nothing here needs a fetched fixture to try, though. Eight bytes of RV64 —

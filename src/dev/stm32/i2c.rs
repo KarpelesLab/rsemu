@@ -121,7 +121,7 @@ mod tests;
 const CLASS_NAME: &str = "st.i2c";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How many bytes of address space the register block occupies.
 ///
@@ -417,6 +417,27 @@ struct State {
     sr1: u32,
     /// The data register.
     dr: u8,
+    /// The **shift register**, when reception has filled both.
+    ///
+    /// RM0090 §25.6.6 describes `BTF` in reception as *"a new byte is received
+    /// (including ACK pulse) and DR has not been read yet (RxNE=1)"*, and
+    /// §25.3.3's EV7_1 as the interface then waiting *"until BTF is cleared by
+    /// a read in the DR register, stretching SCL low"*. Two bytes are held at
+    /// that moment, not one, and a model with a single `dr` has nowhere to put
+    /// the second — it overwrote the first, and the byte the guest had not read
+    /// yet was simply lost.
+    ///
+    /// **Why nothing noticed for so long.** Reaching this state at all needs
+    /// the core to execute a whole I2C byte's worth of cycles without polling,
+    /// which needs a scheduler round longer than a byte:
+    /// `stm32f407`'s 168 MHz core against a 100 kHz bus is 15 000 cycles a
+    /// byte, and a round handed out `SchedulerConfig::max_ticks_per_quantum`'s
+    /// rate-blind **ten thousand**. Removing that cap made a round a whole
+    /// millisecond of this core — eleven bytes — and
+    /// `tests/stm32f407_i2c.rs`'s page read came back as bytes 1, 3, 5, 7 of
+    /// the payload, every other one dropped. The cap was not protecting
+    /// anything by design; it was hiding this.
+    shift: Option<u8>,
     /// A byte written to `DR` that the engine has not taken yet. `TxE` is its
     /// inverse while transmitting, which is what makes a driver's
     /// `while (!(SR1 & TxE));` mean something.
@@ -465,6 +486,7 @@ impl Default for State {
             fltr: 0,
             sr1: 0,
             dr: 0,
+            shift: None,
             tx_pending: false,
             msl: false,
             tra: false,
@@ -1123,9 +1145,15 @@ impl Shared {
         if state.any(SR1_RXNE) {
             // §25.6.6: `BTF` is set "in reception when a new byte is received
             // (including ACK pulse) and DR has not been read yet (RxNE=1)".
+            // The new byte stays in the **shift register** and the one the
+            // guest has not read stays in `DR`; `Shared::decide` then stretches
+            // SCL until `DR` is read. Overwriting `DR` here is what dropped a
+            // byte — see [`State::shift`].
             state.set(SR1_BTF);
+            state.shift = Some(byte);
+        } else {
+            state.dr = byte;
         }
-        state.dr = byte;
         state.set(SR1_RXNE);
         if state.cr1 & CR1_ACK == 0 {
             // We refused it, so the slave has stopped transmitting.
@@ -1223,6 +1251,14 @@ impl RegisterPort {
                 // register", and `BTF` "by either a read or write in the DR
                 // register" — which is also what releases the stretch.
                 state.clear(SR1_RXNE | SR1_BTF);
+                // §25.3.3, EV7_1: with both registers full, the read of `DR`
+                // moves the shift register's byte into it and leaves `RxNE`
+                // set, so the guest's next read gets the byte that arrived
+                // while it was busy rather than the one after that.
+                if let Some(next) = state.shift.take() {
+                    state.dr = next;
+                    state.set(SR1_RXNE);
+                }
                 state.sr1_read = false;
                 (value, After::Pump)
             }
@@ -1494,6 +1530,9 @@ impl Device for Stm32I2c {
         w.write_u32(state.fltr)?;
         w.write_u32(state.sr1)?;
         w.write_u8(state.dr)?;
+        // Both halves always written, so both are always read.
+        w.write_bool(state.shift.is_some())?;
+        w.write_u8(state.shift.unwrap_or(0))?;
         w.write_bool(state.tx_pending)?;
         w.write_bool(state.msl)?;
         w.write_bool(state.tra)?;
@@ -1530,6 +1569,11 @@ impl Device for Stm32I2c {
             fltr: r.read_u32()?,
             sr1: r.read_u32()?,
             dr: r.read_u8()?,
+            shift: {
+                let has = r.read_bool()?;
+                let value = r.read_u8()?;
+                has.then_some(value)
+            },
             tx_pending: r.read_bool()?,
             msl: r.read_bool()?,
             tra: r.read_bool()?,

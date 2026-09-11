@@ -93,8 +93,21 @@ pub(crate) struct Options {
 impl Options {
     /// Run to `seconds` of guest time with sensible defaults for the rest.
     pub(crate) fn to_guest_seconds(seconds: u64) -> Options {
+        Options::to_guest_millis(seconds.saturating_mul(1_000))
+    }
+
+    /// The same, in milliseconds.
+    ///
+    /// A whole second stopped being a usable unit for these budgets when
+    /// `SchedulerConfig::max_ticks_per_quantum` went: a guest second of a
+    /// 1 GHz board used to be ten million processor cycles and is now a
+    /// billion, so every budget in this file had to shrink by two orders of
+    /// magnitude to cost the wall clock what it cost before. One millisecond
+    /// is a whole scheduler quantum, which is the smallest unit any of this
+    /// can be expressed in anyway.
+    pub(crate) fn to_guest_millis(millis: u64) -> Options {
         Options {
-            deadline: GlobalTime::from_nanos(seconds.saturating_mul(1_000_000_000)),
+            deadline: GlobalTime::from_nanos(millis.saturating_mul(1_000_000)),
             // Coarse: a full hash walks RAM, and the per-quantum fingerprint is
             // what actually finds a divergence first.
             hash_every: 100_000,
@@ -120,6 +133,38 @@ impl Options {
         self.max_quanta = quanta;
         self
     }
+}
+
+/// How much guest time a long run was asked for, in milliseconds.
+///
+/// Two knobs rather than one, and the older of them is kept working on
+/// purpose. `RSEMU_LONGRUN_MS` is the unit these budgets are now written in;
+/// `RSEMU_LONGRUN_SECONDS` still means whole guest seconds, so a command line
+/// or a CI job from before the change does what it always said — it simply
+/// costs a hundred times the wall clock on a 1 GHz board, because a guest
+/// second of one is now a billion processor cycles rather than the ten million
+/// a rate-blind `SchedulerConfig::max_ticks_per_quantum` allowed it.
+///
+/// `_MS` wins when both are set, so `scripts/check.sh` can name the budget it
+/// means without stripping an inherited `_SECONDS` out of the environment.
+pub(crate) fn budget_millis(env: &str, default_ms: u64) -> u64 {
+    budget_millis_opt(env).unwrap_or(default_ms)
+}
+
+/// As [`budget_millis`], with no default: `None` when neither knob is set.
+///
+/// The x86 synthetic leg's default is a count of *quanta* rather than a span
+/// of guest time, so it needs to know whether it was asked at all.
+pub(crate) fn budget_millis_opt(env: &str) -> Option<u64> {
+    if let Ok(ms) = std::env::var(format!("{env}_MS"))
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        return Some(ms);
+    }
+    std::env::var(env)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1_000))
 }
 
 /// What a completed run did, for the log.

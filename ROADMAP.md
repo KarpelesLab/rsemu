@@ -967,9 +967,22 @@ snapshot header, since queued deadlines are meaningless without it.
   binary heap for far-future events. Events carry a monotonically increasing
   sequence number so ties break deterministically.
 - **Execution budgets.** A CPU is never "stepped one instruction" by the
-  scheduler; it is handed a budget ("run until virtual time T or 10 000 ticks,
-  whichever first") and reports back how much it consumed. This is what makes
-  JIT block execution and cycle accounting coexist.
+  scheduler; it is handed a budget ("run until virtual time T, or until this
+  processor's share of what its crystal has left, whichever first") and reports
+  back how much it consumed. This is what makes JIT block execution and cycle
+  accounting coexist.
+
+  The tick half of that parenthesis said *"or 10 000 ticks"* and was a literal
+  constant in the code, which was a defect rather than an illustration: a 1 GHz
+  core is owed a million ticks by a 1 ms quantum, so `arm64-virt` and
+  `riscv-virt` ran their processors at **one percent** of the rate their own
+  machine files declare while every other clocked device on the board kept
+  exact time. The tick bound is now *a share of the tree*, which is the only
+  job a constant was doing that was worth doing — a tree with one runnable
+  divides by one and the round's target is the whole bound.
+  `docs/techniques/execution-budgets.md` has the mechanism, the measurement
+  that found it from outside, and what removing it was worth in host
+  instructions.
 - **Sync-on-access (catch-up).** The event queue handles *scheduled* behaviour —
   the PPU raises NMI at a known dot. It cannot handle *sampled* behaviour: the
   6502 reads `$2002` at an arbitrary cycle and the PPU must be at exactly that
