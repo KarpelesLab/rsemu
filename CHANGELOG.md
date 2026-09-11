@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/rsemu/compare/v0.0.4...v0.0.5) - 2026-09-11
+
+### Added
+
+- *(jit)* a tick budget a block can leave at an instruction boundary
+- *(space)* [**breaking**] a global exclusive monitor, so a sibling's store breaks the reservation
+- *(machine)* the JIT engines are reachable from the command line
+- *(cpu-arm-a64)* [**breaking**] an IR frontend, and the engine that runs its blocks
+- *(accel)* [**breaking**] a Linux kernel boots to userspace on host silicon
+- *(cpu-x86)* [**breaking**] lift paged code, named by what the entry resolved to
+- *(cpu-riscv)* engine = "jit", so a machine can reach the dispatcher
+- *(ir)* linear-scan register allocation, and what it costs precise state
+- *(jit)* an x86-64 host backend, with the software TLB inlined into it
+- *(cpu-x86)* lift 32-bit protected mode into the translation IR
+
+### Fixed
+
+- *(trace)* the interning test's key has to fit a 32-bit `usize`
+- *(machine)* the machine-file fuzz target learns `threading`
+- *(cpu-riscv)* the hart publishes a live position, so a timer read is answered at the instant of the read
+- *(sync)* [**breaking**] threaded wasm gets the threaded backend, and it has to say so
+- *(space)* a straddling write takes the write side's byte order too
+- *(cpu-riscv,cpu-x86)* a load can raise the interrupt wire inside a block
+- *(cpu-arm-a64)* the timer edge is computed after a walk that can cross it
+- *(cpu-arm-a64)* gate timer_edge with its only caller
+- *(cpu-arm-a64)* a host fence for the acquire/release accesses
+- *(cpu-arm-a64)* two engine divergences an arm64 Linux boot found past twenty seconds
+- *(cpu-arm-a64)* gate translate_fetch on the engine that calls it
+- *(host)* make Ctrl-C end a run through finish rather than around it
+- *(cpu-arm-a64)* the bucket-margin report needs std, which the feature does not imply
+- *(space)* host_ptr must skip the alignment slack, like every other accessor
+
+### Other
+
+- *(jit)* the chaining helpers need the gate their only callers have
+- Merge branch 'worktree-agent-a4371c5913d9b0140'
+- *(cpu-x86)* [**breaking**] the host guard, so a store no longer ends a paged block
+- *(cpu-x86)* a real x86-64 Linux boot, with the census a profile needs
+- spell the coverage distinction as `cfg!`, which cannot be dead code
+- the coverage constant needs the gate its users have, and signals do not queue
+- coverage fractions are a property of the host backend, named once
+- *(cpu-x86)* liveness belongs to the corpus, not to one seeded program
+- the aarch64 preflight lost a race with itself, and crosshost needs node 24
+- *(cpu-x86)* the compiled-coverage floors belong to the backend, not the corpus
+- the four failing jobs, three fixed and one written down
+- Merge branch 'worktree-agent-a08f7014a7e304730'
+- *(cpu-arm-a64)* [**breaking**] a store stops ending a block, because the host can see the page it landed on
+- *(cpu-riscv,cpu-x86)* the slot-read hoist reaches the other two frontends
+- Merge branch 'worktree-agent-aff679f8302dc0623'
+- Merge branch 'worktree-agent-a3db4279c35f6a110'
+- Merge branch 'worktree-agent-ab7c55788acc5978c'
+- *(wasm)* run the suite on wasm32-wasip1-threads, and say what it found
+- Merge branch 'worktree-agent-aaef38d9f719e1cad'
+- the AArch64 leg exists now, and two comments still said it did not
+- Merge branch 'worktree-agent-a4967afa4517f22c0'
+- Merge branch 'worktree-agent-a04b4f34d80f406fb'
+- *(cpu-arm-a64)* the long run stops being something somebody does by hand
+- *(cpu-arm-a64)* ISB is 31% of the barrier stream, not 40%
+- Merge branch 'worktree-agent-ab6745a7cf3aefcef'
+- *(cpu-x86)* MAX_INSNS goes to thirty-two now the upper arm is gone
+- Merge branch 'worktree-agent-a33c56adcaaf711b9'
+- *(jit-x86)* the temporary frame stops being cleared, and the U loses its right arm
+- the tick allowance takes both cores past 99% retired in blocks
+- Merge branch 'worktree-agent-a8247fd29b1a326ab'
+- *(cpu-x86)* [**breaking**] 97.3% to 99.3% of a Linux boot inside a translated block
+- *(cpu-riscv)* a block leaves when the hart's ticks run out
+- Merge branch 'worktree-agent-a9195ba74c4fd5d79'
+- Merge branch 'worktree-agent-a624808cd91c98a0a'
+- *(deps)* fstool 0.4.26 takes the tree from 23 third-party crates to 10
+- Merge branch 'worktree-agent-abe5a7278a36b654f'
+- *(cpu-arm-a64)* [**breaking**] the budget guard lifts a cold PC instead of guessing at it
+- Merge branch 'worktree-agent-a0127d022851e35b4'
+- *(cpu-arm-a64)* the software TLB's fast path, inlined into compiled code
+- *(deps)* fstool 0.4.25 drops ten third-party crates, tinyvec among them
+- Merge branch 'worktree-agent-a257daf5348ddcd77'
+- Merge branch 'worktree-agent-a28a9febe7887be47'
+- Merge branch 'worktree-agent-ab6c06f2766f3462a'
+- Merge branch 'worktree-agent-ad90767a5f7773fb4'
+- Merge branch 'worktree-agent-a6f1add36f0b152b3'
+- *(accel)* one page walk per slice, and the measured numbers
+- *(accel)* what the two engines agree about, measured line for line
+- *(cpu-riscv)* [**breaking**] a paged hart publishes a LoadPlan, so a compiled load needs no call
+- Merge branch 'worktree-agent-a7f9c932c88907426'
+- the unsafe ceiling is seven, and the seventh is the signal disposition
+- Merge branch 'worktree-agent-ac79776f77a85412a'
+- Merge branch 'worktree-agent-a176e68c47228bf60'
+- Merge branch 'worktree-agent-ad298bafa1bf75018'
+- Merge branch 'worktree-agent-a582c461314190650'
+- Merge branch 'worktree-agent-a8c31f0557c91d5ec'
+- *(machine)* q35-linux reads off its disk now
+- Merge branch 'worktree-agent-a6237079568edb1f3'
+- Merge branch 'worktree-agent-a5ed51bcf433288db'
+- *(jit)* [**breaking**] chain blocks on a real guest, and stop paying 144 µs to compile one
+- Merge branch 'worktree-agent-a68879c0e859b6804'
+- Merge branch 'worktree-agent-aa79687f9f1821bf3'
+- Merge branch 'worktree-agent-af4af447a0627593e'
+- *(jit)* the guard's compiled numbers, measured at the table's own settings
+- Merge branch 'worktree-agent-af09d4e27f0f0fa04'
+
 ## [0.0.4](https://github.com/KarpelesLab/rsemu/compare/v0.0.3...v0.0.4) - 2026-09-02
 
 ### Added
