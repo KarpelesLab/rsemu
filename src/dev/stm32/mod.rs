@@ -10,7 +10,8 @@
 //! | --- | --- | --- |
 //! | [`gpio`] | `st.gpio` | one general-purpose I/O port: `MODER`…`AFR`, the atomic `BSRR`, and the pin mux |
 //! | [`usart`] | `st.usart` | a USART/UART on the character-device seam, in both the F4 and the F7/H7 register layouts |
-//! | [`sdmmc`] | `st.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
+//! | [`sdmmc`] | `stm32.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
+//! | [`sdio`] | `stm32.sdio` | the F2/F4/F7 SDIO and the L1/L4 SDMMC1: the older block, its thirty-two-word FIFO and an **external** DMA request |
 //! | [`spi`] | `stm32.spi` | an SPI master and slave in either generation by `variant`: RM0090 §28's F4 block, or RM0351 §42's with its FIFO and programmable `DS` |
 //! | [`dma`] | `st.dma` | a DMA controller in either family layout: eight streams (RM0090 §10) or seven channels (RM0351 §11) |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
@@ -38,7 +39,10 @@
 //! a variant of one, it says so at the top of its own file and names the manual
 //! it was written from: [`sdmmc`] is the H7's, RM0433, and is not the F4's
 //! SDIO. A model that quietly averaged two families would be a model of no
-//! real part.
+//! real part. [`sdio`] *is* that F4 block, from RM0090 §31 — two classes rather
+//! than one with a `variant`, because `WAITRESP = 10b` means "no response" in
+//! one and "short response, CRC not checked" in the other, and no property
+//! reconciles that. The pair is the worked example of where the line falls.
 //!
 //! That applies with force to [`octospi`]: **RM0433's STM32H7 has a QUADSPI,
 //! not an OCTOSPI.** The OCTOSPI manuals are RM0432 (L4+), RM0455 and RM0468
@@ -60,6 +64,10 @@ pub mod usart;
 #[cfg(feature = "dev-stm32-sdmmc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-sdmmc")))]
 pub mod sdmmc;
+
+#[cfg(feature = "dev-stm32-sdio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-sdio")))]
+pub mod sdio;
 
 #[cfg(feature = "dev-stm32-dma")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-dma")))]
@@ -157,6 +165,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     dma::register(registry)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::register(registry)?;
+    #[cfg(feature = "dev-stm32-sdio")]
+    sdio::register(registry)?;
     #[cfg(feature = "dev-stm32-i2c")]
     i2c::register(registry)?;
     #[cfg(feature = "dev-stm32-spi")]
@@ -202,6 +212,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     dma::bind(bindings)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-sdio")]
+    sdio::bind(bindings)?;
     #[cfg(feature = "dev-stm32-i2c")]
     i2c::bind(bindings)?;
     #[cfg(feature = "dev-stm32-spi")]
@@ -250,6 +262,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(dma::schema());
     #[cfg(feature = "dev-stm32-sdmmc")]
     out.extend([sdmmc::schema()]);
+    #[cfg(feature = "dev-stm32-sdio")]
+    out.extend([sdio::schema()]);
     #[cfg(feature = "dev-stm32-i2c")]
     out.extend([i2c::schema()]);
     #[cfg(feature = "dev-stm32-spi")]

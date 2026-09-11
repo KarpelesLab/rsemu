@@ -14,7 +14,8 @@ controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 | NVMe | [NVM Express specifications](https://nvmexpress.org/specifications/) | **Free** |
 | SCSI | [T10](https://www.t10.org/) — SPC (primary commands), SBC (block commands) | Drafts free |
 | SD / MMC | SD Association simplified specifications | sdcard.org **[browser]** — the *simplified* specs are free |
-| STM32 SDMMC host controller | ST **RM0433** §55 (H7 family); RM0090 §31 for the F4's older SDIO | st.com **[browser]** — free downloads |
+| STM32 SDMMC host controller | ST **RM0433** §55 (H7 family) | st.com **[browser]** — free downloads |
+| STM32 SDIO host controller | ST **RM0090** §31 (F2/F4/F7); ST **RM0351** §47 for the L1/L4's `SDMMC1`, which is the same IP under a confusing name | st.com **[browser]** — free downloads |
 | virtio-blk | [`virtio.md`](virtio.md) | Free |
 | Parallel NOR flash (CFI) | JEDEC **JESD68.01** (Common Flash Interface) and **JEP137B**; the Intel StrataFlash P30 datasheet for the Intel/Sharp command set, the Spansion/Cypress S29GL datasheets for the AMD one | **Free** — jedec.org registration; the datasheets are open downloads |
 | Serial NOR flash (SPI) | The **Winbond W25Q** datasheets (`W25Q128JV` rev F/H, and the 64/32/16 Mbit siblings) — instruction set §8.1, status registers §7.1, timing §9.6; JEDEC **JEP106** for the manufacturer byte | **Free** — open downloads from winbond.com |
@@ -22,9 +23,20 @@ controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 
 SD/MMC is split in two, and the split is the point: `dev/sd/card` is the
 **card** — the command set, the state machine and the registers — and knows
-nothing about any controller, while `dev/stm32/sdmmc` is one host controller
-that drives it. An SPI-mode card is the same die behind different framing, so
-an SPI controller hangs off the same `SdCard` rather than a second model of it.
+nothing about any controller, while `dev/stm32/sdmmc` and `dev/stm32/sdio` are
+two host controllers that drive it. An SPI-mode card is the same die behind
+different framing, so an SPI controller hangs off the same `SdCard` rather than
+a second model of it.
+
+**Two** STM32 host controllers rather than one with a `variant`, because ST
+shipped two peripherals under overlapping names: `stm32.sdmmc` is the H7's
+(RM0433 §55, internal DMA, `CMDTRANS`) and `stm32.sdio` is the F2/F4/F7's and
+the L1/L4's (RM0090 §31, no DMA of its own, a request line to an external
+controller). In `SDIO_CMD`, bits 7:6 are `WAITRESP` on one and
+`CMDTRANS`/`CMDSTOP` on the other, and `WAITRESP = 10b` means "no response" on
+one and "short response, CRC not checked" on the other — a value that means two
+things is not something a property reconciles, and a model that averaged them
+would be a model of no real part.
 Like NOR flash, and for the same reason, the card takes a media slot rather
 than an `fstool::BlockDevice`: the contents are a flat image and `fstool` would
 drag `std` into a `no_std` device. A large or sparse image is a `dev/blk/sd`

@@ -1102,6 +1102,29 @@ dev-sd-card = []
 # no dependencies.
 dev-stm32-sdmmc = ["dev-sd-card"]
 
+# The STM32 **SDIO** host controller (src/dev/stm32/sdio.rs): the *other* SD
+# host, and the one most in-field STM32 designs actually have -- SDIO on the
+# F2/F4/F7 (RM0090 S31) and SDMMC1 on the L1/L4 (RM0351 S47), which are the
+# same IP. POWER, CLKCR, ARG, CMD, RESPCMD, RESP1-RESP4, DTIMER, DLEN, DCTRL,
+# DCOUNT, STA, ICR, MASK, FIFOCNT and a **thirty-two**-word FIFO. It is not
+# `dev-stm32-sdmmc` with a property: `CMD` puts WAITRESP where the H7 puts
+# CMDTRANS/CMDSTOP, `WAITRESP = 10b` means "no response" here and "short
+# response, no CRC check" there, R3 and R4 consequently report CCRCFAIL rather
+# than CMDREND, STA bits 11-21 are a different register (CMDACT/TXACT/RXACT,
+# and TXDAVL/RXDAVL which the H7 does not have at all), and every one of STA's
+# twenty-four bits is maskable. Two classes, because no property reconciles a
+# field that means two things.
+#
+# There is **no internal DMA**: this block is not a bus master and takes no
+# `space`. It drives a request *line* -- an output pin, `dma` -- and an external
+# controller performs an ordinary bus access at the FIFO aperture, exactly as on
+# the part. Wire it to one of `st.dma`'s `req` inputs (`dev-stm32-dma`, not
+# implied: the CPU path works without one) and the pair moves a block end to
+# end. Also drives `irq` from STA & MASK. Needs `dev-sd-card` to have anything
+# to talk to. Written from ST RM0090 and RM0351; no emulator source was
+# consulted (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-sdio = ["dev-sd-card"]
+
 # Serial NOR flash (src/dev/flash/spinor.rs): a Winbond **W25Q**-class SPI part
 # -- the chip on the back of nearly every board with an SoC on the front. The
 # JEDEC id (9Fh), read (03h), fast read (0Bh) and the dual/quad forms, page
@@ -1431,6 +1454,10 @@ machine-stm32f407 = [
     "dev-stm32-pwr",
     "dev-stm32-tim",
     "dev-stm32-dma",
+    # The F407's SD host, and with it the one peripheral on that board that
+    # drives a DMA request line: `sdio.dma -> dma2.req3`. It brings `dev-sd-card`
+    # with it, because a controller with nothing to talk to is a register model.
+    "dev-stm32-sdio",
     "dev-stm32-exti",
     "dev-stm32-crc",
     "dev-stm32-wdg",

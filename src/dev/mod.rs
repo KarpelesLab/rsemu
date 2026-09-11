@@ -136,6 +136,7 @@ pub mod sms;
     feature = "dev-stm32",
     feature = "dev-stm32-dma",
     feature = "dev-stm32-sdmmc",
+    feature = "dev-stm32-sdio",
     feature = "dev-stm32-spi",
     feature = "dev-stm32-octospi",
     feature = "dev-stm32-i2c",
