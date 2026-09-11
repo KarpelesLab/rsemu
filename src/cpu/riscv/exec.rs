@@ -414,10 +414,26 @@ impl<'a> Exec<'a> {
     /// Charge one bus access.
     #[inline]
     pub(super) fn charge(&mut self) {
-        self.used += 1;
-        self.st.cycles = self.st.cycles.wrapping_add(1);
+        self.charge_n(1);
+    }
+
+    /// Charge `ticks` bus accesses at once.
+    ///
+    /// The scaled form of [`Exec::charge`], and the `mcountinhibit` test is
+    /// read **once** rather than once per tick: nothing between two ticks of
+    /// one charge can write that CSR, because a charge is a single call with
+    /// no guest instruction inside it and nothing else runs inside one. The
+    /// loop this replaces in [`IrHost::charge`](crate::ir::IrHost::charge) ran
+    /// two additions, that test and a third addition per tick, for a static
+    /// column `lift` makes one or two. `cpu::x86::engine`'s `charge` already
+    /// had the scaled form. Guest-visible state is identical by construction:
+    /// `charge` is this with `ticks == 1`.
+    #[inline]
+    pub(super) fn charge_n(&mut self, ticks: u64) {
+        self.used += ticks;
+        self.st.cycles = self.st.cycles.wrapping_add(ticks);
         if self.st.csrs.mcountinhibit & 1 == 0 {
-            self.st.csrs.mcycle = self.st.csrs.mcycle.wrapping_add(1);
+            self.st.csrs.mcycle = self.st.csrs.mcycle.wrapping_add(ticks);
         }
     }
 
