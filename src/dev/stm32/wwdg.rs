@@ -57,6 +57,15 @@
 //! [`next_event_tick`](crate::core::Device::next_event_tick); there is no loop
 //! and no host clock anywhere in this file.
 //!
+//! # Freezing
+//!
+//! `DBGMCU_APB1_FZ.DBG_WWDG_STOP` stops the counter while a debugger has the
+//! core halted, which is what stops a breakpoint inside the refresh loop from
+//! resetting the board under you. The bit belongs to the debug unit rather
+//! than to this peripheral, so what this class offers is the `freeze` input
+//! pin the debug unit drives — `st.dbgmcu` is what drives
+//! it — and with nothing wired to it the watchdog counts through a halt.
+//!
 //! # The reset
 //!
 //! Expiry drives a **pulse on the `reset` pin**, from outside the state lock —
@@ -74,17 +83,18 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -196,17 +206,27 @@ impl State {
     }
 
     /// PCLK1 cycles until that event.
-    fn next_event(&self) -> Option<u64> {
+    ///
+    /// `None` while the debug unit is holding the counter: a frozen watchdog
+    /// has no next event, so the scheduler stops coming back for it.
+    fn next_event(&self, frozen: bool) -> Option<u64> {
+        if frozen {
+            return None;
+        }
         let decrements = self.decrements_to_event()?;
         let divider = self.divider();
         Some((divider - self.prescale) + decrements.saturating_sub(1) * divider)
     }
 
     /// Advance `n` PCLK1 cycles.
-    fn step(&mut self, n: u64) -> Outcome {
+    ///
+    /// `frozen` is the debug unit's `DBG_WWDG_STOP` reaching this block: the
+    /// tick still moves — the domain does not stop because one chip on it did
+    /// — but the counter does not.
+    fn step(&mut self, n: u64, frozen: bool) -> Outcome {
         let end = self.tick + n;
         let mut out = Outcome::default();
-        if self.active {
+        if self.active && !frozen {
             let divider = self.divider();
             let mut remaining = n;
             while remaining > 0 {
@@ -248,6 +268,13 @@ struct Registers {
     state: Mutex<State>,
     /// Which bit `WDGTB` starts at on this part.
     wdgtb_shift: u32,
+    /// Whether the debug unit is holding the counter still.
+    ///
+    /// An atomic rather than a field of [`State`], for the two reasons
+    /// `st.iwdg` gives for its own: it is read on every step, and it is **not**
+    /// the machine's state — it belongs to whatever is debugging, so it stays
+    /// out of the snapshot.
+    frozen: AtomicBool,
     /// The reset output, pulsed on expiry.
     reset_out: Mutex<Option<WireSource>>,
     /// The early-wakeup interrupt output. A level, held until `EWIF` clears.
@@ -266,7 +293,8 @@ struct Registers {
 impl fmt::Debug for Registers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Registers");
-        s.field("wdgtb_shift", &self.wdgtb_shift);
+        s.field("wdgtb_shift", &self.wdgtb_shift)
+            .field("frozen", &self.frozen.load(Ordering::Relaxed));
         match self.state.try_lock() {
             Some(state) => s.field("state", &*state),
             None => s.field("state", &"<locked>"),
@@ -276,10 +304,15 @@ impl fmt::Debug for Registers {
 }
 
 impl Registers {
+    /// Whether the debug unit is holding the counter.
+    fn frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
     /// Republish what the lock-free lazy surface reads.
     fn publish(&self, state: &State) {
         self.tick.store(state.tick, Ordering::Relaxed);
-        let at = match state.next_event() {
+        let at = match state.next_event(self.frozen()) {
             Some(delta) => state.tick.saturating_add(delta.max(1)),
             None => u64::MAX,
         };
@@ -325,8 +358,11 @@ impl Registers {
                     return;
                 }
                 let span = target - state.tick;
-                let step = state.next_event().unwrap_or(span).clamp(1, span);
-                let outcome = state.step(step);
+                let step = state
+                    .next_event(self.frozen())
+                    .unwrap_or(span)
+                    .clamp(1, span);
+                let outcome = state.step(step, self.frozen());
                 self.publish(&state);
                 (state.tick >= target, outcome)
             };
@@ -347,6 +383,16 @@ impl Registers {
             return;
         };
         let _ = handle.sync(AccessKind::Guest);
+    }
+
+    /// The debug unit changed its mind about freezing.
+    fn set_frozen(&self, frozen: bool) {
+        // Catch up on the old setting first, or the cycles either side of the
+        // change are counted under the wrong one.
+        self.sync(MemAttrs::DEFAULT);
+        self.frozen.store(frozen, Ordering::Release);
+        let state = self.state.lock();
+        self.publish(&state);
     }
 
     /// `CFR`'s `WDGTB` field, as a mask.
@@ -459,6 +505,9 @@ impl MemOps for Registers {
 pub struct Wwdg {
     regs: Arc<Registers>,
     region: RegionRef,
+    /// The input pins the machine layer has taken; a net holds its sinks
+    /// weakly, so the device keeps the strong reference.
+    pins: Mutex<Vec<Arc<FreezePin>>>,
 }
 
 impl Wwdg {
@@ -486,6 +535,7 @@ impl Wwdg {
         let wdgtb_shift = wdgtb_shift.clamp(F4_WDGTB_SHIFT, L4_WDGTB_SHIFT);
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::default()),
+            frozen: AtomicBool::new(false),
             wdgtb_shift,
             reset_out: Mutex::with_rank(LockRank::WIRE, None),
             irq_out: Mutex::with_rank(LockRank::WIRE, None),
@@ -498,7 +548,11 @@ impl Wwdg {
             REGISTER_BYTES,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
-        Wwdg { regs, region }
+        Wwdg {
+            regs,
+            region,
+            pins: Mutex::with_rank(LockRank::DEVICE, Vec::new()),
+        }
     }
 
     /// Which bit `WDGTB` starts at on this part.
@@ -537,6 +591,17 @@ impl Wwdg {
     /// scheduler calls it directly.
     pub fn advance_to(&self, tick: u64) {
         self.regs.advance_to(tick);
+    }
+
+    /// Hold or release the counter, as the debug unit's freeze bit does.
+    pub fn set_frozen(&self, frozen: bool) {
+        self.regs.set_frozen(frozen);
+    }
+
+    /// Whether the debug unit is holding the counter.
+    #[must_use]
+    pub fn frozen(&self) -> bool {
+        self.regs.frozen()
     }
 }
 
@@ -631,6 +696,18 @@ impl Device for Wwdg {
         Ok(())
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        if port != "freeze" {
+            return None;
+        }
+        let pin = Arc::new(FreezePin {
+            regs: Arc::clone(&self.regs),
+            inputs: FanIn::new(sources),
+        });
+        self.pins.lock().push(Arc::clone(&pin));
+        Some(SinkPin { sink: pin, line: 0 })
+    }
+
     fn announce(&self, port: &str) {
         // `ewi` idles low out of reset, which a fresh net already is, but a
         // machine wired after a snapshot load has to be told about a flag that
@@ -710,6 +787,42 @@ pub fn schema() -> ClassSchema {
         .region("regs")
         .port("reset", PortDir::Out)
         .port("ewi", PortDir::Out)
+        .port("freeze", PortDir::In)
+}
+
+// ---------------------------------------------------------------------------
+// Input pins
+// ---------------------------------------------------------------------------
+
+/// The debug unit's freeze input, as something a wire can drive.
+///
+/// `DBGMCU_APB1_FZ.DBG_WWDG_STOP` (RM0090 §38.16.3) stops this counter while
+/// a debugger has the core halted, exactly as `DBG_IWDG_STOP` does for the
+/// independent one — and for the same reason: a breakpoint inside the loop
+/// that refreshes `CR` is otherwise a reset. The bit belongs to the debug
+/// unit, so what this class offers is the pin the debug unit drives; with
+/// nothing wired to it the watchdog counts through a halt, which is what the
+/// hardware does with the bit clear.
+#[derive(Debug)]
+pub struct FreezePin {
+    regs: Arc<Registers>,
+    inputs: FanIn,
+}
+
+impl FreezePin {
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for FreezePin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        self.regs
+            .set_frozen(self.inputs.resolve(Resolve::Or).is_high());
+    }
 }
 
 #[cfg(test)]
@@ -1055,13 +1168,50 @@ mod tests {
     }
 
     #[test]
+    fn the_freeze_pin_holds_the_counter_while_a_debugger_has_the_core() {
+        // A breakpoint inside the loop that refreshes `CR` is the case this
+        // exists for: `DBGMCU_APB1_FZ.DBG_WWDG_STOP` stops the countdown
+        // rather than letting it reset the board under the debugger.
+        let d = wwdg();
+        let reset = watch(&d, "reset");
+        poke(&d, 0x00, CR_WDGA | T_MASK); // 64 decrements to the reset
+        let deadline = 64 * BASE_DIVIDER;
+
+        d.advance_to(deadline / 2);
+        let held = d.counter();
+        d.set_frozen(true);
+        assert!(d.frozen());
+        // Well past the deadline, and the counter has not moved.
+        d.advance_to(deadline * 4);
+        assert_eq!(d.counter(), held, "a frozen counter does not count");
+        assert_eq!(edges(&reset), 0);
+        assert_eq!(
+            Device::next_event_tick(&d),
+            None,
+            "and it asks the scheduler for nothing"
+        );
+
+        // Released, it picks up exactly where it was: the remaining half of
+        // the timeout, not the time the debugger spent looking at it.
+        d.set_frozen(false);
+        d.advance_to(deadline * 4 + deadline / 2 - 1);
+        assert_eq!(edges(&reset), 0, "not yet");
+        d.advance_to(deadline * 4 + deadline / 2);
+        assert_eq!(edges(&reset), 1);
+    }
+
+    #[test]
     fn the_schema_and_the_device_agree_about_pins_and_regions() {
         let d = wwdg();
         let schema = schema();
         assert!(schema.port_named("reset").is_some());
         assert!(schema.port_named("ewi").is_some());
-        assert!(schema.port_named("freeze").is_none());
+        assert!(schema.port_named("freeze").is_some());
+        // `freeze` is an input the debug unit drives, not an output: a
+        // `connect` to it is still wrong.
         assert!(Device::connect(&d, "freeze", dummy_source()).is_err());
+        assert!(Device::sink(&d, "freeze", &[WireId::new(1)]).is_some());
+        assert!(Device::sink(&d, "reset", &[WireId::new(1)]).is_none());
         assert!(Device::region(&d, "").is_some());
         assert!(Device::region(&d, "regs").is_some());
         assert!(Device::region(&d, "counter").is_none());

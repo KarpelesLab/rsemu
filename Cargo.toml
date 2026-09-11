@@ -1368,6 +1368,23 @@ dev-stm32-firewall = []
 # `unsafe`, no dependencies.
 dev-stm32-wdg = []
 
+# The STM32 debug support block (src/dev/stm32/dbgmcu.rs): one class,
+# `st.dbgmcu`, at 0xE0042000. Four registers -- IDCODE, CR, APB1_FZ and
+# APB2_FZ -- and the only customer is the debugger rather than the firmware.
+# It is what makes a board with a watchdog on it debuggable: without
+# DBG_IWDG_STOP, a breakpoint in a main loop that kicks the IWDG resets the
+# part while you are looking at it. Every freeze bit is a real output pin, so
+# a machine file wires `dbgmcu.iwdg -> iwdg.freeze` and the level carried is
+# the bit *and* the core being halted -- which reaches the device through
+# `Device::debug_halt`, broadcast by `Machine::set_debug_halted` from the gdb
+# session. A stored bit nothing consults would be the defect this fixes. The
+# registers survive a system reset and are cleared only by a cold one, as
+# RM0090 S38.16.2 says. Written from ST RM0090 S38 (S38.6.1 for IDCODE,
+# S38.16.2-4 for the rest) and ARM DDI 0403 B3.1 for why 0xE0042000 is
+# vendor space at all; no emulator source was consulted (ROADMAP.md S1).
+# `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-dbgmcu = []
+
 # The STM32 CRC calculation unit (src/dev/stm32/crc.rs): one class, `st.crc`,
 # in the two shapes the family has. Every STM32 carries one at 0x40023000 and
 # firmware uses it for image checksums, settings-block integrity and hash
@@ -1503,6 +1520,9 @@ machine-stm32f407 = [
     "dev-stm32-exti",
     "dev-stm32-crc",
     "dev-stm32-wdg",
+    # The debug block, which is what makes the two watchdogs above debuggable:
+    # without DBG_IWDG_STOP a breakpoint in the kick loop resets the part.
+    "dev-stm32-dbgmcu",
     "dev-stm32-flash",
     "dev-stm32-rtc",
     "dev-stm32-rng",

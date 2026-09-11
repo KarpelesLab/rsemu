@@ -23,6 +23,7 @@
 //! | [`crc`] | `st.crc` | the CRC calculation unit, fixed on an F4 and programmable from the F0/F3/F7/L4 on |
 //! | [`iwdg`] | `st.iwdg` | the independent watchdog: a down-counter on the LSI that resets the board |
 //! | [`wwdg`] | `st.wwdg` | the window watchdog, which also resets the board when a kick comes *early* |
+//! | [`dbgmcu`] | `st.dbgmcu` | the debug unit: `IDCODE` and the freeze bits that stop a peripheral while a debugger has the core halted |
 //! | [`rcc`] | `st.rcc` | the reset and clock controller: ready bits, the PLL and prescaler tree, the peripheral gates, the backup domain |
 //! | [`pwr`] | `st.pwr` | the power controller: `DBP`, voltage scaling and the F42x over-drive |
 //! | [`rng`] | `st.rng` | the random number generator: `CR`/`SR`/`DR`, both error paths, and a stream the machine seeds |
@@ -117,6 +118,10 @@ pub mod flash;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-wdg")))]
 pub mod iwdg;
 
+#[cfg(feature = "dev-stm32-dbgmcu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-dbgmcu")))]
+pub mod dbgmcu;
+
 #[cfg(feature = "dev-stm32-rcc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-rcc")))]
 pub mod rcc;
@@ -200,6 +205,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     iwdg::register(registry)?;
     #[cfg(feature = "dev-stm32-wdg")]
     wwdg::register(registry)?;
+    #[cfg(feature = "dev-stm32-dbgmcu")]
+    dbgmcu::register(registry)?;
     #[cfg(feature = "dev-stm32-rcc")]
     rcc::register(registry)?;
     #[cfg(feature = "dev-stm32-pwr")]
@@ -251,6 +258,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     iwdg::bind(bindings)?;
     #[cfg(feature = "dev-stm32-wdg")]
     wwdg::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-dbgmcu")]
+    dbgmcu::bind(bindings)?;
     #[cfg(feature = "dev-stm32-rcc")]
     rcc::bind(bindings)?;
     #[cfg(feature = "dev-stm32-pwr")]
@@ -301,6 +310,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(flash::schema());
     #[cfg(feature = "dev-stm32-wdg")]
     out.extend([iwdg::schema(), wwdg::schema()]);
+    #[cfg(feature = "dev-stm32-dbgmcu")]
+    out.push(dbgmcu::schema());
     #[cfg(feature = "dev-stm32-rcc")]
     out.push(rcc::schema());
     #[cfg(feature = "dev-stm32-pwr")]

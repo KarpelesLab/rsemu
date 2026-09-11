@@ -145,6 +145,7 @@ pub mod sms;
     feature = "dev-stm32-exti",
     feature = "dev-stm32-firewall",
     feature = "dev-stm32-wdg",
+    feature = "dev-stm32-dbgmcu",
     feature = "dev-stm32-crc",
     feature = "dev-stm32-flash",
     feature = "dev-stm32-rcc",

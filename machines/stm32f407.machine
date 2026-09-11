@@ -181,6 +181,13 @@ machine "stm32f407" {
   param ahb1-base   = 0x40020000
   param ahb2-base   = 0x50000000   # USB OTG FS, DCMI, CRYP/HASH and the RNG
 
+  # The debug block is not on any of those buses. `0xE0000000`-`0xE00FFFFF` is
+  # the Cortex-M private peripheral bus, and DDI 0403 B3.1 leaves the window
+  # from `0xE0042000` up implementation-defined — which is exactly why ST put
+  # `DBGMCU` there (RM0090 S38.16.1). Everything below `0xE0040000` in that
+  # range belongs to the core and never reaches this file; this does.
+  param dbgmcu-base = 0xE0042000
+
   # Peripheral offsets from their bus's base. An STM32 peripheral is allotted a
   # kilobyte, so the GPIO ports are 0x400 apart and the arithmetic below says so
   # rather than repeating six constants that must agree.
@@ -526,6 +533,17 @@ machine "stm32f407" {
   object iwdg "st.iwdg" { clock = lsi,           window = false }
   object wwdg "st.wwdg" { clock = hse * 21 / 4,  wdgtb-shift = 7 }
 
+  # -- the debug block -------------------------------------------------------
+  #
+  # `DBGMCU`, and the reason the two watchdogs above are debuggable at all. A
+  # breakpoint in a loop that kicks the `IWDG` resets the part while you are
+  # sitting at the prompt; `DBG_IWDG_STOP` is what stops that, and the freeze
+  # wires at the bottom of this file are what carry it. `dev-id` is the
+  # F405/407/415/417's `0x413` (RM0090 S38.6.1) and `rev-id` is revision A --
+  # ST's own DFU loader reads `IDCODE` to decide which flash geometry it is
+  # talking to, so the number is load-bearing rather than decorative.
+  object dbgmcu "st.dbgmcu" { dev-id = 0x413, rev-id = 0x1000 }
+
   # -- the real-time clock ---------------------------------------------------
   #
   # The other thing on the LSE, and the only peripheral on the die that keeps
@@ -620,6 +638,12 @@ machine "stm32f407" {
   map mem apb1-base + i2c1-off   size 0x28 = i2c1
   map mem apb1-base + pwr-off    size 0x08 = pwr
   map mem apb1-base + rtc-off    size 0xd0 = rtc
+
+  # And the debug block, which is on neither APB. It is in `mem` and **not** in
+  # `dmabus`: the private peripheral bus belongs to the processor that owns it
+  # and a DMA engine cannot see it (DDI 0403 B3.1), which is the same reason
+  # CCM is missing from `dmabus` further up.
+  map mem dbgmcu-base size 0x10 = dbgmcu
 
   # APB2: the two advanced timers at the bottom, then SYSCFG and EXTI, then the
   # TIM9/TIM10/TIM11 run four kilobytes up.
@@ -897,6 +921,7 @@ machine "stm32f407" {
   # the part: a real `NRST` clears every block on the die. Nothing here relies
   # on the difference, and widening it needs a machine-level reset sink that
   # does not exist yet.
+  #
   # **The OR gate is load-bearing and the obvious wiring is wrong.** Writing
   #
   #     wire iwdg.reset -> cpu.reset        # do not do this
@@ -921,6 +946,26 @@ machine "stm32f407" {
   wire wwdg.reset   -> rcc.wwdgrst
   wire wwdg.reset   -> wdgreset.in1
   wire wdgreset.out -> cpu.reset
+
+  # -- the debug freeze lines ------------------------------------------------
+  #
+  # Each `DBG_xxx_STOP` bit in `DBGMCU_APB1_FZ`/`APB2_FZ` is an output pin here,
+  # and the level it carries is *the bit and the core being halted* -- a chip
+  # whose core is running freezes nothing, whatever the debugger wrote. The
+  # halt itself is not a wire: nothing inside the machine knows the debugger
+  # stopped it, so it arrives through `Device::debug_halt`, which the gdb
+  # session broadcasts. See RM0090 S38.16.3 and S38.16.4 for the bit numbers.
+  #
+  # Two lines, because two peripherals on this board have a `freeze` sink.
+  # Without them a breakpoint is a reset, which is the whole complaint.
+  wire dbgmcu.iwdg -> iwdg.freeze
+  wire dbgmcu.wwdg -> wwdg.freeze
+
+  # `st.dbgmcu` also drives a pin for every timer bit and for `DBG_RTC_STOP`,
+  # and none of them is wired here: `st.tim` and `st.rtc` have no `freeze`
+  # sink to wire them to. That is a gap in those two classes rather than in
+  # this file -- the bits read back correctly, and the day a timer grows the
+  # sink the line is `wire dbgmcu.tim2 -> tim2.freeze` and nothing else.
 
   # -- the backup domain -----------------------------------------------------
   #
