@@ -13,6 +13,7 @@
 //! | [`sdmmc`] | `st.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
 //! | [`spi`] | `st.spi` | the F4 family's SPI/I2S master, RM0090 §28 |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
+//! | [`tim`] | `st.tim` | a TIM timer in its basic, general-purpose or advanced form |
 //!
 //! # Which part
 //!
@@ -61,6 +62,10 @@ pub mod spi;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-octospi")))]
 pub mod octospi;
 
+#[cfg(feature = "dev-stm32-tim")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-tim")))]
+pub mod tim;
+
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
 pub mod demo;
@@ -69,6 +74,8 @@ pub mod demo;
 pub use octospi::Octospi;
 #[cfg(feature = "dev-stm32-spi")]
 pub use spi::Stm32Spi;
+#[cfg(feature = "dev-stm32-tim")]
+pub use tim::Tim;
 
 use alloc::vec::Vec;
 
@@ -93,6 +100,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     spi::register(registry)?;
     #[cfg(feature = "dev-stm32-octospi")]
     octospi::register(registry)?;
+    #[cfg(feature = "dev-stm32-tim")]
+    tim::register(registry)?;
     Ok(())
 }
 
@@ -114,11 +123,19 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     spi::bind(bindings)?;
     #[cfg(feature = "dev-stm32-octospi")]
     octospi::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-tim")]
+    tim::bind(bindings)?;
     Ok(())
 }
 
 /// Every class's validator schema.
+///
+/// Every arm below is `cfg`-gated, so a build that enables exactly one of them
+/// creates the vector and immediately pushes to it — which is what
+/// `vec_init_then_push` objects to, and which no rewriting fixes while the set
+/// of arms is a build configuration rather than a list.
 #[must_use]
+#[allow(clippy::vec_init_then_push)]
 pub fn schemas() -> Vec<ClassSchema> {
     #[allow(unused_mut)]
     let mut out: Vec<ClassSchema> = alloc::vec![];
@@ -132,5 +149,7 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(spi::schema());
     #[cfg(feature = "dev-stm32-octospi")]
     out.push(octospi::schema());
+    #[cfg(feature = "dev-stm32-tim")]
+    out.push(tim::schema());
     out
 }

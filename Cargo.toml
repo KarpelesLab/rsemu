@@ -1162,6 +1162,20 @@ dev-stm32-spi = ["bus-spi"]
 # `no_std + alloc`, no dependencies.
 dev-stm32-octospi = ["bus-spi"]
 
+# The STM32 TIM timers (src/dev/stm32/tim.rs): one `st.tim` class covering the
+# basic (TIM6/TIM7), general-purpose (TIM2-TIM5) and advanced-control
+# (TIM1/TIM8) forms as a `variant` property, with `width` and `channels` for
+# what an instance actually bonds. The counter, the prescaler and the
+# auto-reload with their **shadow registers**, up/down/center-aligned counting,
+# the update event with UDIS/URS/OPM and the advanced timer's RCR repetition,
+# and output compare in every OCxM mode including PWM 1 and 2 -- each channel an
+# output wire a board routes to a pin. Lazily advanced on its own clock domain,
+# so an update interrupt lands on the tick it is due on. Input capture, the
+# slave-mode controller, DMA and dead-time insertion are deliberately absent and
+# the module says so. Written from ST RM0090 §17-19. `no_std + alloc`, no
+# `unsafe`, no dependencies.
+dev-stm32-tim = []
+
 # The `spi-flash` demo board (machines/spi-flash.machine plus the classes it
 # names): a hart, RAM, an STM32 SPI master and an OCTOSPI, and a W25Q-class
 # SPI-NOR part on the bus -- the smallest machine that exercises a serial flash

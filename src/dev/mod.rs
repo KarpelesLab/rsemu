@@ -138,6 +138,7 @@ pub mod sms;
     feature = "dev-stm32-spi",
     feature = "dev-stm32-octospi",
     feature = "dev-stm32-i2c",
+    feature = "dev-stm32-tim",
     feature = "machine-spi-flash"
 ))]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]
