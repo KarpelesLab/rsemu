@@ -51,7 +51,7 @@ use super::isa::{
 };
 use super::sys::{
     Access, BitBand, DWT_PCSR, Exception, MPU_REGIONS, Sys, bit_band_target, ccr, control,
-    exc_return, fsr, in_ppb,
+    exc_return, fsr, in_ppb, in_vendor_ppb,
 };
 use super::{Config, xpsr};
 
@@ -657,11 +657,17 @@ impl<'a> Exec<'a> {
     fn read_mem(&mut self, addr: u32, bytes: u32, privileged: bool) -> Ex<u32> {
         self.cycle(1);
         if in_ppb(addr) {
-            return self.read_ppb(addr, bytes);
-        }
-        self.check_mpu(addr, bytes, Access::Read, privileged)?;
-        if let Some(target) = self.bit_band(addr) {
-            return self.read_bit_band(addr, target, privileged);
+            if !in_vendor_ppb(addr) {
+                return self.read_ppb(addr, bytes);
+            }
+            // The vendor window: the board decodes it, not the processor. The
+            // MPU is skipped because it does not cover the PPB at all (DDI
+            // 0403 B3.5), and there is no bit-band alias up here.
+        } else {
+            self.check_mpu(addr, bytes, Access::Read, privileged)?;
+            if let Some(target) = self.bit_band(addr) {
+                return self.read_bit_band(addr, target, privileged);
+            }
         }
         let attrs = self.attrs.with_privileged(privileged);
         if addr.is_multiple_of(bytes) {
@@ -695,11 +701,15 @@ impl<'a> Exec<'a> {
     fn write_mem(&mut self, addr: u32, bytes: u32, value: u32, privileged: bool) -> Ex {
         self.cycle(1);
         if in_ppb(addr) {
-            return self.write_ppb(addr, bytes, value);
-        }
-        self.check_mpu(addr, bytes, Access::Write, privileged)?;
-        if let Some(target) = self.bit_band(addr) {
-            return self.write_bit_band(addr, target, value, privileged);
+            if !in_vendor_ppb(addr) {
+                return self.write_ppb(addr, bytes, value);
+            }
+            // As `read_mem`: the vendor window is the board's.
+        } else {
+            self.check_mpu(addr, bytes, Access::Write, privileged)?;
+            if let Some(target) = self.bit_band(addr) {
+                return self.write_bit_band(addr, target, value, privileged);
+            }
         }
         let attrs = self.attrs.with_privileged(privileged);
         if addr.is_multiple_of(bytes) {

@@ -19,6 +19,13 @@
 //! something else at `0xE000E000` will find the processor wins, which is what
 //! hardware does.
 //!
+//! **With one window as the exception**, and it is in the same table: DDI 0403
+//! B3.1 leaves `0xE0042000`–`0xE00FEFFF` *implementation defined*, between the
+//! ETM and the CoreSight ROM table. That is where a silicon vendor puts its
+//! own debug block — an STM32's `DBGMCU` is at `0xE0042000` — so the processor
+//! does **not** answer there and the access goes to the address space, which
+//! is the only way a board can model one at all. See [`in_vendor_ppb`].
+//!
 //! # What is modelled and what is not
 //!
 //! | Block | State |
@@ -850,6 +857,35 @@ pub const PPB_END: u32 = 0xe010_0000;
 #[must_use]
 pub const fn in_ppb(addr: u32) -> bool {
     addr >= PPB_BASE && addr < PPB_END
+}
+
+/// First address of the **vendor** window of the external PPB.
+///
+/// DDI 0403 B3.1 Table B3-1 divides `0xE0000000`–`0xE00FFFFF` in two. The
+/// *internal* half below `0xE0040000` is the architecture's own — ITM, DWT,
+/// FPB, SCS — and belongs to the processor. Above it sit the TPIU at
+/// `0xE0040000` and the ETM at `0xE0041000`, the ROM table at `0xE00FF000`,
+/// and between those a window the architecture leaves **implementation
+/// defined**. That window is where a silicon vendor puts its own debug block,
+/// and an STM32's `DBGMCU` is at `0xE0042000` precisely because of this line
+/// in the table.
+pub const VENDOR_PPB_BASE: u32 = 0xe004_2000;
+
+/// One byte past the vendor window: the CoreSight ROM table starts here.
+pub const VENDOR_PPB_END: u32 = 0xe00f_f000;
+
+/// Whether an address is in the part of the PPB the **board** decodes.
+///
+/// Everywhere else in the PPB the processor answers, and it wins over anything
+/// a machine file maps — that is what *private* means. Here it does not: the
+/// architecture defines nothing at these addresses, so the access goes to the
+/// address space like any other, and a board with no debug block there faults
+/// rather than reading a helpful zero. A wrong `DBGMCU` base is then a bus
+/// fault instead of a register file that silently reads back nothing.
+#[inline]
+#[must_use]
+pub const fn in_vendor_ppb(addr: u32) -> bool {
+    addr >= VENDOR_PPB_BASE && addr < VENDOR_PPB_END
 }
 
 impl Sys {
