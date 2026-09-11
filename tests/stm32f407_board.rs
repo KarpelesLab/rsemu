@@ -267,8 +267,8 @@ fn the_board_realizes_with_the_core_bound_and_the_usart_wired_to_it() {
     let (m, _port) = boot();
     assert_eq!(m.name(), "stm32f407");
     for path in [
-        "cpu", "rom", "ram1", "ram2", "ccmram", "rcc", "gpioa", "gpiob", "gpioc", "gpiod", "gpioe",
-        "gpioh", "usart2",
+        "cpu", "eflash", "ram1", "ram2", "ccmram", "rcc", "gpioa", "gpiob", "gpioc", "gpiod",
+        "gpioe", "gpioh", "usart2",
     ] {
         assert!(
             m.device(path).is_some(),
@@ -288,24 +288,53 @@ fn the_board_realizes_with_the_core_bound_and_the_usart_wired_to_it() {
     assert_eq!(peek(&m, GPIOD), 0, "GPIOD MODER");
 }
 
+/// The flash interface's register window, AHB1 + 0x3c00.
+const FLASH_IF: u64 = 0x4002_3c00;
+/// `FLASH_SR` on an F4 (RM0090 §3.9.5).
+const FLASH_SR: u64 = 0x0c;
+/// `SR.PGSERR`: the control register was not set up for this access.
+const SR_PGSERR: u64 = 1 << 7;
+
 #[test]
-fn flash_is_not_writable_through_the_bus() {
-    // `perms = "r-x"` on both mappings of the flash. A stray store into a
-    // program is a fault rather than a silently modified program, and that is
-    // a property of the decode in front of the chip rather than of the chip.
+fn flash_is_not_silently_modified_through_the_bus() {
+    // This test used to assert that a store into the flash window *faults*,
+    // which was the honest thing to check while `perms = "r-x"` on the mapping
+    // was the only thing protecting the array. It is not what the part does.
+    //
+    // RM0090 §3.9.5: a write while `CR` is not configured for programming sets
+    // `SR.PGSERR`, the array keeps its contents, and **the bus sees no fault**.
+    // Faulting where the silicon sets a status bit would send firmware down a
+    // path it never takes on hardware — there is no BusFault handler in a
+    // vendor HAL for this, because there is no BusFault.
+    //
+    // So the guarantee worth pinning is the one that actually matters, and it
+    // is stronger than the old one: the store is accepted by the bus, the
+    // program is unchanged, and firmware that reads `SR` can tell it happened.
     let (m, _port) = boot();
     let space = m.space("mem").expect("the memory space");
-    assert!(
+    let before = peek(&m, 0x0800_0000);
+
+    for addr in [0x0800_0000, 0x0000_0000] {
         space
-            .write(0x0800_0000, Width::U32, 0, MemAttrs::DEFAULT)
-            .is_err(),
-        "the flash mapping accepted a write"
+            .write(addr, Width::U32, 0, MemAttrs::DEFAULT)
+            .expect("the part takes the store and drops it, rather than faulting");
+    }
+
+    assert_eq!(
+        peek(&m, 0x0800_0000),
+        before,
+        "a locked flash was silently modified"
     );
-    assert!(
-        space
-            .write(0x0000_0000, Width::U32, 0, MemAttrs::DEFAULT)
-            .is_err(),
-        "the boot alias accepted a write"
+    assert_eq!(
+        peek(&m, 0x0000_0000),
+        before,
+        "the boot alias is the same array and was silently modified"
+    );
+    assert_ne!(
+        peek(&m, FLASH_IF + FLASH_SR) & SR_PGSERR,
+        0,
+        "the store was dropped without telling firmware, which is the one \
+         outcome worse than either faulting or programming"
     );
     // SRAM, at the same instant, does not object.
     assert!(
