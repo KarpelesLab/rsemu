@@ -117,6 +117,9 @@ fn every_op_the_backend_claims_it_lowers_has_a_lowering() {
         Opcode::ROTR,
         Opcode::CLZ,
         Opcode::CTZ,
+        Opcode::POPCOUNT,
+        Opcode::MULU2,
+        Opcode::MULS2,
         Opcode::SETCOND,
         Opcode::MOVCOND,
         Opcode::BRCOND,
@@ -135,9 +138,6 @@ fn every_op_the_backend_claims_it_lowers_has_a_lowering() {
     // that quietly grew would be a backend shipping code generation nothing
     // has executed.
     for op in [
-        Opcode::POPCOUNT,
-        Opcode::MULU2,
-        Opcode::MULS2,
         Opcode::ROTLC,
         Opcode::ROTRC,
         Opcode::DIV_U,
@@ -161,10 +161,120 @@ fn an_op_the_backend_does_not_lower_is_refused_and_not_miscompiled() {
         live: Vec::new(),
     });
     let x = b.imm(Type::I64, Const::Int(0xff));
-    let _ = b.unary(Opcode::POPCOUNT, Type::I64, x);
+    let y = b.imm(Type::I64, Const::Int(3));
+    let _ = b.binary(Opcode::DIV_U, Type::I64, x, y);
     b.exit_tb();
     let block = b.finish();
-    assert_eq!(compile(&block).err(), Some(Refusal::Op(Opcode::POPCOUNT)));
+    assert_eq!(compile(&block).err(), Some(Refusal::Op(Opcode::DIV_U)));
+}
+
+/// The one lowering in this backend that leaves the integer unit.
+///
+/// Asserted as words for the reason every encoding here is: the functional
+/// differential runs on one CI runner and nowhere else, so on every other host
+/// this is the only thing between a typo in a `Rn` field and a `popcount` that
+/// counts the wrong register. And it is asserted as a *sequence*, because the
+/// four instructions are only correct in this order — `CNT` counts each byte
+/// separately and it is `ADDV` that makes the eight per-byte counts one
+/// number.
+#[test]
+fn a_popcount_is_the_four_vector_instructions_in_order() {
+    fn code_for(ty: Type) -> Vec<u32> {
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(1);
+        let x = b.imm(ty, Const::Int(0xff));
+        let _ = b.unary(Opcode::POPCOUNT, ty, x);
+        b.exit_tb();
+        words(compile(&b.finish()).expect("popcount compiles").code())
+    }
+    for ty in [Type::I64, Type::I32, Type::I1] {
+        let code = code_for(ty);
+        // `fmov d16, Xn` / `cnt v16.8b, v16.8b` / `addv b16, v16.8b` /
+        // `fmov Xd, d16`. The register fields of the two `FMOV`s vary with
+        // where the allocator put things, so the two fixed words are matched
+        // exactly and the moves by their opcode.
+        let at = code
+            .iter()
+            .position(|w| *w == 0x0e20_5a10)
+            .unwrap_or_else(|| panic!("`cnt v16.8b, v16.8b` is in the block for {ty:?}"));
+        assert!(at > 0, "a `CNT` must have an `FMOV` feeding it");
+        assert_eq!(
+            code[at - 1] & 0xffff_fc1f,
+            0x9e67_0010,
+            "`fmov d16, Xn` comes first"
+        );
+        assert_eq!(code[at + 1], 0x0e31_ba10, "`addv b16, v16.8b` comes next");
+        assert_eq!(
+            code[at + 2] & 0xffff_ffe0,
+            0x9e66_0200,
+            "`fmov Xd, d16` takes the answer back"
+        );
+        // No SWAR left over: the four instructions are the whole lowering, so
+        // none of the magic constants can be in the block.
+        for magic in [0x5555u16, 0x3333, 0x0f0f, 0x0101] {
+            assert!(
+                !code.iter().any(|w| (w >> 5) & 0xffff == u32::from(magic)),
+                "the vector lowering materialises no mask constant"
+            );
+        }
+    }
+}
+
+/// `mulu2`/`muls2` at 64 bits: the high half is one instruction, not a call
+/// and not a shift.
+#[test]
+fn a_widening_multiply_is_a_mulh_and_a_mul() {
+    fn code_for(op: Opcode, ty: Type) -> Vec<u32> {
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(1);
+        let x = b.imm(ty, Const::Int(0xdead_beef));
+        let y = b.imm(ty, Const::Int(0x1234_5678));
+        let low = b.temp(ty);
+        let high = b.temp(ty);
+        b.emit_raw(op, ty, Some(low), Some(high), &[x, y], None, None, 0);
+        b.exit_tb();
+        words(
+            compile(&b.finish())
+                .expect("a widening multiply compiles")
+                .code(),
+        )
+    }
+    // `umulh x11, x9, x10` and `smulh x11, x9, x10`: the accumulator and the
+    // second scratch in, the third scratch out.
+    let unsigned = code_for(Opcode::MULU2, Type::I64);
+    assert!(
+        unsigned.contains(&0x9bca_7d2b),
+        "`umulh x11, x9, x10` is the unsigned high half"
+    );
+    let signed = code_for(Opcode::MULS2, Type::I64);
+    assert!(
+        signed.contains(&0x9b4a_7d2b),
+        "`smulh x11, x9, x10` is the signed one"
+    );
+    assert!(
+        !signed.contains(&0x9bca_7d2b),
+        "and the two are not the same instruction"
+    );
+    // Below 64 bits the product fits in one register, so there is no `MULH` at
+    // all — the high half is a shift, and a `SMULH` there would be a wrong
+    // answer rather than a slow one.
+    let narrow = code_for(Opcode::MULU2, Type::I32);
+    assert!(
+        !narrow.iter().any(|w| w & 0xff60_7c00 == 0x9b40_7c00),
+        "a 32-bit widening multiply needs no high-half instruction"
+    );
 }
 
 #[test]

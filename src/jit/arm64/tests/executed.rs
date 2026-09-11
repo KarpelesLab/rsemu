@@ -632,7 +632,7 @@ fn emit_one(b: &mut BlockBuilder, r: &mut Rng, pool: &[(Temp, Type)]) -> Vec<(Te
     let w = ty.bits();
     let any = |r: &mut Rng| of_type(r, pool, ty);
 
-    match r.below(19) {
+    match r.below(20) {
         0 => {
             let op = r.pick(&[
                 Opcode::ADD,
@@ -691,10 +691,13 @@ fn emit_one(b: &mut BlockBuilder, r: &mut Rng, pool: &[(Temp, Type)]) -> Vec<(Te
             vec![(b.binary(op, ty, x, n), ty)]
         }
         5 => {
-            let op = r.pick(&[Opcode::CLZ, Opcode::CTZ]);
+            let op = r.pick(&[Opcode::CLZ, Opcode::CTZ, Opcode::POPCOUNT]);
             // Zero often, because the zero input is the case a lowering gets
             // wrong: `CLZ` must answer the type's width and `CTZ`, through
-            // `RBIT`, the same.
+            // `RBIT`, the same. `POPCOUNT` is here rather than in an arm of its
+            // own because it is the same shape — and because it is the op the
+            // `aarch64 (weak memory)` job needs most, x86's parity flag being a
+            // population count on nearly every ALU instruction.
             let x = if r.below(3) == 0 {
                 b.imm(ty, Const::Int(0))
             } else {
@@ -859,6 +862,19 @@ fn emit_one(b: &mut BlockBuilder, r: &mut Rng, pool: &[(Temp, Type)]) -> Vec<(Te
             // `aarch64` CI job exists to have a machine for.
             b.emit_raw(Opcode::FENCE, Type::I64, None, None, &[], None, None, 0);
             Vec::new()
+        }
+        19 => {
+            // A widening multiply, whose *second* destination is the thing
+            // worth generating: `linear_scan` has to keep both halves alive
+            // and the backend has to put the high one somewhere the low one's
+            // write does not tread on. At 64 bits this is `UMULH`/`SMULH` and
+            // below it a shift, so both arms are reached by the type pick.
+            let op = r.pick(&[Opcode::MULU2, Opcode::MULS2]);
+            let low = b.temp(ty);
+            let high = b.temp(ty);
+            let (x, y) = (any(r), any(r));
+            b.emit_raw(op, ty, Some(low), Some(high), &[x, y], None, None, 0);
+            vec![(low, ty), (high, ty)]
         }
         _ => {
             let ty = r.pick(&[Type::I32, Type::I64]);
