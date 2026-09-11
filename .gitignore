@@ -16,3 +16,8 @@ web/dist/
 # guest is ordinary use while shipping it here is redistribution.
 # docs/testing/conformance-suites.md has the verified licence table.
 /testdata/
+
+# Per-agent CARGO_TARGET_DIR (see the parallel-agent convention): each worktree
+# builds into its own, so a shared one cannot make an agent run another's binary.
+/target-agent/
+target-agent/
