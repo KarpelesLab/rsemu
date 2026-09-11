@@ -1205,6 +1205,23 @@ cpu-arm-v7m = []
 # no dependencies.
 dev-stm32 = []
 
+# The STM32 external interrupt controller and its pin multiplexer
+# (src/dev/stm32/exti.rs, src/dev/stm32/syscfg.rs): two classes, `st.exti` and
+# `st.syscfg`. Together they are the path from *a GPIO pin moved* to *the NVIC
+# took an interrupt*, which no other peripheral provides: every button, every
+# card-detect switch and every "data ready" line an external chip raises goes
+# through EXTI, and `SYSCFG_EXTICR1..4` is the four-bit-per-line mux that
+# decides which port drives each of lines 0-15. `st.exti` carries
+# IMR/EMR/RTSR/FTSR/SWIER/PR in one or two banks (23 lines on an F4, up to 40
+# on an L4), one interrupt output pin per line so the board -- not the device
+# -- decides that lines 5-9 share IRQ 23, and one `event` pin for the pulse
+# `WFE` waits on. `st.syscfg` adds MEMRMP, PMC/CFGR1 and the F4's CMPCR or the
+# L4's SCSR/CFGR2/SWPR/SKR/SWPR2, selected by a `variant` property. MEMRMP
+# reads back but moves no mapping; the file says so. Written from ST RM0090
+# S9 and S12 and ST RM0351 S9 and S13; no emulator source was consulted
+# (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-exti = []
+
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4 at 168 MHz, 1 MiB of flash aliased at zero, the three
 # SRAM banks, five GPIO ports and USART2 on the terminal. The first M-profile

@@ -13,6 +13,8 @@
 //! | [`sdmmc`] | `st.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
 //! | [`spi`] | `st.spi` | the F4 family's SPI/I2S master, RM0090 §28 |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
+//! | [`exti`] | `st.exti` | the external interrupt/event controller: what turns a pin edge into an NVIC request |
+//! | [`syscfg`] | `st.syscfg` | `EXTICR`, the pin multiplexer that decides which port drives each EXTI line |
 //!
 //! # Which part
 //!
@@ -61,6 +63,14 @@ pub mod spi;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-octospi")))]
 pub mod octospi;
 
+#[cfg(feature = "dev-stm32-exti")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
+pub mod exti;
+
+#[cfg(feature = "dev-stm32-exti")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
+pub mod syscfg;
+
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
 pub mod demo;
@@ -93,6 +103,10 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     spi::register(registry)?;
     #[cfg(feature = "dev-stm32-octospi")]
     octospi::register(registry)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    exti::register(registry)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    syscfg::register(registry)?;
     Ok(())
 }
 
@@ -114,6 +128,10 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     spi::bind(bindings)?;
     #[cfg(feature = "dev-stm32-octospi")]
     octospi::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    exti::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    syscfg::bind(bindings)?;
     Ok(())
 }
 
@@ -132,5 +150,7 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(spi::schema());
     #[cfg(feature = "dev-stm32-octospi")]
     out.push(octospi::schema());
+    #[cfg(feature = "dev-stm32-exti")]
+    out.extend([exti::schema(), syscfg::schema()]);
     out
 }
