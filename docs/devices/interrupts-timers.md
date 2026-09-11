@@ -21,6 +21,7 @@ ordinary devices with wire sinks and sources — the core knows nothing about
 | RISC-V CLINT | Privileged spec — `mtime` / `mtimecmp` |
 | RISC-V PLIC | [RISC-V PLIC specification](https://github.com/riscv/riscv-plic-spec) |
 | ARM GIC v2/v3/v4 | Arm IHI 0069 **[browser]** |
+| STM32 TIM (`st.tim`) | ST RM0090 §17 (general-purpose), §18 (advanced-control), §19 (basic); RM0351 §31–§34 is the same block on an L4. `CK_INT` comes from §7.2, and on an F4 it is **twice** the APB clock whenever that bus has a prescaler — a board's `clock =` expression says which, never the device |
 | NES / Game Boy interrupt lines | The platform documentation — these machines have wires, not controllers |
 
 ## Implementation notes
@@ -37,3 +38,15 @@ ordinary devices with wire sinks and sources — the core knows nothing about
 - These devices are also where `MemAttrs::debug` earns its keep — a monitor
   reading an interrupt controller's status register must not acknowledge an
   interrupt.
+- **A shadowed register is the classic timer bug.** An STM32 TIM buffers `PSC`
+  always, `ARR` under `CR1.ARPE` and `CCRx` under `CCMRx.OCxPE`, so a write is
+  visible in the preload register immediately and in the counter's behaviour
+  only at the next update event. A model that writes straight through looks
+  correct until firmware changes a PWM duty cycle mid-period. Test it directly:
+  write the register mid-period, assert the *old* value still governs, then
+  assert the new one takes over at the wrap.
+- A lazily advanced timer (`Device::is_lazy`) must publish `next_event_tick` as
+  the exact tick of its next observable change — the next overflow, underflow or
+  compare match — and compute the span between two of them in closed form. A
+  per-tick loop is fine when the events are hundreds of ticks apart, as on a
+  Game Boy; it is not when a prescaler of 65535 puts them four billion apart.
