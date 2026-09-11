@@ -206,7 +206,6 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(octospi::schema());
     #[cfg(feature = "dev-stm32-tim")]
     out.push(tim::schema());
-    out.extend([octospi::schema()]);
     #[cfg(feature = "dev-stm32-exti")]
     out.extend([exti::schema(), syscfg::schema()]);
     #[cfg(feature = "dev-stm32-crc")]
