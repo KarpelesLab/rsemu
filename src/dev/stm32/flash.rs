@@ -1010,6 +1010,12 @@ impl Shared {
         } else if value & F4_CR_MER1 != 0 {
             Some((BANK, self.size.saturating_sub(BANK)))
         } else if value & F4_CR_SER != 0 {
+            // `SNB[6:3]`, four bits, as an F405/407 has it (RM0090 §3.9.7).
+            // An F42x/F43x widens the field to reach its second bank's
+            // sectors 12-23; this model does not decode that width, so on a
+            // 2 MiB part those sectors are reachable through `MER1` and not
+            // one at a time. `f4_sector` describes them regardless, because
+            // the geometry is Table 6 and the field width is this variant.
             f4_sector(self.size, (value >> 3) & 0b1111)
         } else {
             None
