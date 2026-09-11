@@ -15,6 +15,8 @@
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
 //! | [`exti`] | `st.exti` | the external interrupt/event controller: what turns a pin edge into an NVIC request |
 //! | [`syscfg`] | `st.syscfg` | `EXTICR`, the pin multiplexer that decides which port drives each EXTI line |
+//! | [`iwdg`] | `st.iwdg` | the independent watchdog: a down-counter on the LSI that resets the board |
+//! | [`wwdg`] | `st.wwdg` | the window watchdog, which also resets the board when a kick comes *early* |
 //!
 //! # Which part
 //!
@@ -71,6 +73,14 @@ pub mod exti;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
 pub mod syscfg;
 
+#[cfg(feature = "dev-stm32-wdg")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-wdg")))]
+pub mod iwdg;
+
+#[cfg(feature = "dev-stm32-wdg")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-wdg")))]
+pub mod wwdg;
+
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
 pub mod demo;
@@ -107,6 +117,10 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     exti::register(registry)?;
     #[cfg(feature = "dev-stm32-exti")]
     syscfg::register(registry)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    iwdg::register(registry)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    wwdg::register(registry)?;
     Ok(())
 }
 
@@ -132,6 +146,10 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     exti::bind(bindings)?;
     #[cfg(feature = "dev-stm32-exti")]
     syscfg::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    iwdg::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    wwdg::bind(bindings)?;
     Ok(())
 }
 
@@ -152,5 +170,7 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(octospi::schema());
     #[cfg(feature = "dev-stm32-exti")]
     out.extend([exti::schema(), syscfg::schema()]);
+    #[cfg(feature = "dev-stm32-wdg")]
+    out.extend([iwdg::schema(), wwdg::schema()]);
     out
 }

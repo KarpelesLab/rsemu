@@ -1222,6 +1222,25 @@ dev-stm32 = []
 # (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-exti = []
 
+# The two STM32 watchdogs (src/dev/stm32/iwdg.rs, src/dev/stm32/wwdg.rs): two
+# classes, `st.iwdg` and `st.wwdg`. Both **reset the machine**, which is the
+# whole reason a bootloader arms one before jumping to an application, and
+# neither can be modelled without the scheduler: each is a lazily-advanced
+# device on its own clock domain that publishes when its counter next does
+# something and is caught up on access. `st.iwdg` is the LSI down-counter --
+# the key register's start/reload/unlock protocol, the prescaler and reload,
+# the SR update flags, the optional window register, and a `freeze` pin for
+# the debug unit's DBG_IWDG_STOP. `st.wwdg` is the PCLK1 one, which resets
+# both when the counter passes 0x3F and when a refresh arrives while the
+# counter is still above the window, and raises an early-wakeup interrupt one
+# decrement before the reset. Each drives a `reset` pin, pulsed from outside
+# its own state lock so that resetting the world does not deadlock against
+# the device's own reset. `RCC_CSR.IWDGRSTF`/`WWDGRSTF` are RCC's to latch off
+# that pin. Written from ST RM0090 S20 and S21 and ST RM0351 S35 and S36; no
+# emulator source was consulted (ROADMAP.md S1). `no_std + alloc`, no
+# `unsafe`, no dependencies.
+dev-stm32-wdg = []
+
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4 at 168 MHz, 1 MiB of flash aliased at zero, the three
 # SRAM banks, five GPIO ports and USART2 on the terminal. The first M-profile
