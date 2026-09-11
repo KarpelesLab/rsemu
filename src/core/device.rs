@@ -195,6 +195,18 @@ impl ExportId {
     /// is a fact about the fabric rather than about either chip.
     pub const PORT_PASSTHROUGH: ExportId = ExportId(4);
 
+    /// A clock controller's output rates. Transported as [`Export::Opaque`].
+    ///
+    /// A peripheral's clock is a *rate*, and neither of the other two shapes
+    /// carries one: a wire is a level and a cell is a counter. An STM32's RCC
+    /// is the motivating case — `PCLK1` is whatever the PLL factors and the
+    /// APB prescaler currently say, a USART's baud divisor is computed against
+    /// it, and both change the instant the guest writes `RCC_CFGR`.
+    ///
+    /// The payload's type is a contract between the controller and the
+    /// peripherals of its own family, so it is opaque here.
+    pub const CLOCK_TREE: ExportId = ExportId(5);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -206,6 +218,7 @@ impl ExportId {
             ExportId::CYCLE_GATE => Some("cycle gate"),
             ExportId::DMC_FETCH => Some("DMC sample fetch"),
             ExportId::PORT_PASSTHROUGH => Some("I/O port pass-through"),
+            ExportId::CLOCK_TREE => Some("clock tree"),
             _ => None,
         }
     }

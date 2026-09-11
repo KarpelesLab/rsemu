@@ -28,7 +28,7 @@
 //! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
 //! | [`linuxboot`] | `dev-linuxboot` | the Linux/x86 boot protocol: a bzImage into memory and a stub that enters it |
 //! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
-//! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port and a USART |
+//! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port, a USART, and — under their own features — the reset/clock and power controllers |
 //! | [`q35`] | `dev-q35` | the q35 chipset: an 82Q35 (G)MCH, an ICH9 LPC bridge, ECAM, and the ACPI table generator |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, and the device tree generator |
 //! | [`virtio`] | `dev-virtio` | virtio: split virtqueues, the MMIO transport, and block and entropy devices |
@@ -143,6 +143,8 @@ pub mod sms;
     feature = "dev-stm32-exti",
     feature = "dev-stm32-wdg",
     feature = "dev-stm32-crc",
+    feature = "dev-stm32-rcc",
+    feature = "dev-stm32-pwr",
     feature = "machine-spi-flash"
 ))]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]

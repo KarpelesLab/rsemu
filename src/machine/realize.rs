@@ -3447,6 +3447,8 @@ machine "exports" {
             ExportId::TIMEBASE,
             ExportId::CYCLE_GATE,
             ExportId::DMC_FETCH,
+            ExportId::PORT_PASSTHROUGH,
+            ExportId::CLOCK_TREE,
         ] {
             assert!(id.name().is_some(), "{id:?} has no name");
         }
