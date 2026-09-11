@@ -77,6 +77,10 @@ pub mod dma;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-i2c")))]
 pub mod i2c;
 
+#[cfg(feature = "dev-stm32-i2c-v2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-i2c-v2")))]
+pub mod i2c_v2;
+
 #[cfg(feature = "dev-stm32-spi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-spi")))]
 pub mod spi;
@@ -169,6 +173,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     sdio::register(registry)?;
     #[cfg(feature = "dev-stm32-i2c")]
     i2c::register(registry)?;
+    #[cfg(feature = "dev-stm32-i2c-v2")]
+    i2c_v2::register(registry)?;
     #[cfg(feature = "dev-stm32-spi")]
     spi::register(registry)?;
     #[cfg(feature = "dev-stm32-octospi")]
@@ -216,6 +222,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     sdio::bind(bindings)?;
     #[cfg(feature = "dev-stm32-i2c")]
     i2c::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-i2c-v2")]
+    i2c_v2::bind(bindings)?;
     #[cfg(feature = "dev-stm32-spi")]
     spi::bind(bindings)?;
     #[cfg(feature = "dev-stm32-octospi")]
@@ -266,6 +274,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.extend([sdio::schema()]);
     #[cfg(feature = "dev-stm32-i2c")]
     out.extend([i2c::schema()]);
+    #[cfg(feature = "dev-stm32-i2c-v2")]
+    out.extend([i2c_v2::schema()]);
     #[cfg(feature = "dev-stm32-spi")]
     out.extend([spi::schema()]);
     #[cfg(feature = "dev-stm32-octospi")]

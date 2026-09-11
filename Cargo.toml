@@ -1169,6 +1169,22 @@ dev-at24c = ["bus-i2c"]
 # chapter 25, cited by section. Needs `bus-i2c` and `dev-stm32`.
 dev-stm32-i2c = ["dev-stm32", "bus-i2c"]
 
+# The STM32 I2C peripheral, **v2** -- the completely different block an F0, F3,
+# F7, L0, L4, L5, G0, G4, H7, U5 or WB carries, with TIMINGR, ISR/ICR, PECR and
+# RXDR/TXDR. Not a mode of `dev-stm32-i2c` and not a superset of it: firmware
+# for one does not run on the other, so it is a class of its own
+# (`st.i2c-v2`) beside `st.i2c`. The whole of master mode in both link
+# styles -- the CR2.NBYTES/RELOAD/AUTOEND transfer machine that is the
+# central difference from v1, TC against TCR, the automatic STOP after a NACK
+# and after AUTOEND, 7- and 10-bit addressing with HEAD10R, TIMINGR's SCLL/SCLH
+# as the real SCL half periods, write-1-to-clear flags through ICR, SMBus PEC,
+# and the EV/ER interrupts plus the two DMA request lines. Slave mode --
+# OAR1, OAR2 with OA2MSK, the general call, ADDR/DIR/ADDCODE, NOSTRETCH and OVR
+# -- on the transactional link; the wired link needs a combined bit engine that
+# `bus::i2c` does not have yet, and the module says so. Written from ST RM0351
+# Rev. 9 chapter 39, cited by section. Needs `bus-i2c` and `dev-stm32`.
+dev-stm32-i2c-v2 = ["dev-stm32", "bus-i2c"]
+
 
 # The STM32 SPI master (src/dev/stm32/spi.rs): CR1/CR2, SR, DR, CRCPR and the
 # software-slave-management bits, master and slave, both link models, driving

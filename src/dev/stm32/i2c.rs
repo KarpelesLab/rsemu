@@ -20,7 +20,11 @@
 //! `a_debug_dump_of_the_whole_block_clears_nothing` is the assertion.
 //!
 //! The v2 block belongs under a name of its own when somebody needs it. It is
-//! not a mode of this one.
+//! not a mode of this one — and somebody did: it is
+//! [`crate::dev::stm32::i2c_v2`], class `st.i2c-v2`, behind the
+//! `dev-stm32-i2c-v2` feature. The two are cross-checked against one EEPROM in
+//! that module's `the_v1_and_v2_blocks_leave_the_same_bytes_in_the_same_eeprom`,
+//! which is the only thing they share.
 //!
 //! # Source
 //!
