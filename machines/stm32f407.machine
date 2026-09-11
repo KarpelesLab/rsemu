@@ -897,10 +897,30 @@ machine "stm32f407" {
   # the part: a real `NRST` clears every block on the die. Nothing here relies
   # on the difference, and widening it needs a machine-level reset sink that
   # does not exist yet.
-  wire iwdg.reset -> cpu.reset
-  wire iwdg.reset -> rcc.iwdgrst
-  wire wwdg.reset -> cpu.reset
-  wire wwdg.reset -> rcc.wwdgrst
+  # **The OR gate is load-bearing and the obvious wiring is wrong.** Writing
+  #
+  #     wire iwdg.reset -> cpu.reset        # do not do this
+  #     wire iwdg.reset -> rcc.iwdgrst
+  #     wire wwdg.reset -> cpu.reset
+  #     wire wwdg.reset -> rcc.wwdgrst
+  #
+  # puts all four ends on **one net**, because `cpu.reset` is a sink of both
+  # and a net is the transitive closure of what touches it — which is what a
+  # wire *is*, and is right for copper. It is not right for this: on the die
+  # these are two separate signals that happen to reach the same reset
+  # controller, and merging them means either watchdog expiring sets *both*
+  # `IWDGRSTF` and `WWDGRSTF`, so firmware can no longer tell which one
+  # rebooted it. Every unit test in the tree passes with that wiring;
+  # `tests/stm32f407_watchdog.rs` is what catches it.
+  #
+  # So each watchdog keeps its own net, reaching only its own cause pin and one
+  # input of the gate, and the gate is the single thing that drives the core.
+  object wdgreset "wire.or" { inputs = 2 }
+  wire iwdg.reset   -> rcc.iwdgrst
+  wire iwdg.reset   -> wdgreset.in0
+  wire wwdg.reset   -> rcc.wwdgrst
+  wire wwdg.reset   -> wdgreset.in1
+  wire wdgreset.out -> cpu.reset
 
   # -- the backup domain -----------------------------------------------------
   #
