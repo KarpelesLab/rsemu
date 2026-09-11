@@ -167,9 +167,12 @@ of the guest's width and does not tear", which is true and misleads twice. A
 the byte loop, because no reader can un-tear a store made in four pieces — so
 the guarantee follows whichever core is storing. And `jit::x86` is the *host*
 backend: inlining happens only where a core publishes `FastMem::store_plan`,
-which AArch64 and RISC-V do and **x86 does not**. An x86 guest inlines no memory
-access at all, so its stores tear in both engines, which is precisely the
-configuration `tests/smp_single_copy_atomicity.rs` measures.
+which AArch64 and RISC-V do unconditionally and **x86 does only in long mode**
+(`cpu::x86::lift::Lifter::flat`, and `docs/platforms/pc64.md`'s "The inlined
+memory path" for what it refuses). So an x86 guest's stores tear wherever a plan
+does not reach — below long mode, through `FS` or `GS`, in a read-modify-write,
+and in the interpreter, which is the configuration
+`tests/smp_single_copy_atomicity.rs` builds its cores in.
 
 `core::space::store`'s "What per-byte atomicity is not" has three candidate
 shapes, all re-derivable from `tests/memory_model_costs.rs`, and why none was
