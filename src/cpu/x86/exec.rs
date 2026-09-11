@@ -297,7 +297,7 @@ impl Queue {
 /// lock: a device asserting `INTR` from inside a CPU-initiated MMIO write
 /// would otherwise re-enter the CPU's own critical section and deadlock (the
 /// re-entrancy contract, `ROADMAP.md` §4.7).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct State {
     /// The general register file.
     pub regs: Regs,
@@ -486,7 +486,7 @@ impl<'a> Exec<'a> {
     /// De-duplicated, because a page-crossing store makes up to eight writes
     /// into two pages and a walk's write-back makes up to four into one.
     #[inline]
-    fn note_write(&mut self, phys: u64) {
+    pub(super) fn note_write(&mut self, phys: u64) {
         let page = phys & !0xfff;
         if self.wrote[..self.wrote_n as usize].contains(&page) {
             return;
