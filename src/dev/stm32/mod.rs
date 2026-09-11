@@ -11,7 +11,7 @@
 //! | [`gpio`] | `st.gpio` | one general-purpose I/O port: `MODER`…`AFR`, the atomic `BSRR`, and the pin mux |
 //! | [`usart`] | `st.usart` | a USART/UART on the character-device seam, in both the F4 and the F7/H7 register layouts |
 //! | [`sdmmc`] | `st.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
-//! | [`spi`] | `st.spi` | the F4 family's SPI/I2S master, RM0090 §28 |
+//! | [`spi`] | `stm32.spi` | an SPI master and slave in either generation by `variant`: RM0090 §28's F4 block, or RM0351 §42's with its FIFO and programmable `DS` |
 //! | [`dma`] | `st.dma` | a DMA controller in either family layout: eight streams (RM0090 §10) or seven channels (RM0351 §11) |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
 //! | [`tim`] | `st.tim` | a TIM timer in its basic, general-purpose or advanced form |

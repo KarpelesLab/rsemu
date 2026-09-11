@@ -71,8 +71,13 @@ struct Harness {
 }
 
 fn harness(link: Link) -> Harness {
+    harness_with(Variant::F4, link)
+}
+
+/// The same, of whichever generation the test is about.
+fn harness_with(variant: Variant, link: Link) -> Harness {
     let bus = Arc::new(SpiBus::new());
-    let spi = Stm32Spi::with_bus(link, Some(Arc::clone(&bus)), ChipSelect(0));
+    let spi = Stm32Spi::with_bus(variant, link, Some(Arc::clone(&bus)), ChipSelect(0));
     let regs = ops(&spi);
     Harness {
         spi,
@@ -80,6 +85,21 @@ fn harness(link: Link) -> Harness {
         bus,
         now: core::cell::Cell::new(0),
     }
+}
+
+/// A `"f7"` peripheral with an [`Echo`] framed to match `bits` on its bus.
+///
+/// The transactional link asks the *slave* how a word is framed
+/// (`SpiBus::transfer` -> `bus::spi::exchange`), so a test about `DS` has to
+/// frame the peer the same way or it is testing nothing.
+fn fifo_with_echo(bits: u8) -> (Harness, Arc<Echo>) {
+    let h = harness_with(Variant::Fifo, Link::Transactional);
+    let echo = Echo::new(Format::new(Mode::Mode0, bits, BitOrder::MsbFirst));
+    h.bus
+        .attach(ChipSelect(0), Arc::clone(&echo) as Arc<dyn SpiSlave>)
+        .expect("cs0 is free");
+    h.bus.select(Some(ChipSelect(0)));
+    (h, echo)
 }
 
 impl Harness {
@@ -109,6 +129,43 @@ impl Harness {
     fn run(&self, ticks: u64) {
         self.now.set(self.now.get() + ticks);
         self.spi.advance_to(self.now.get());
+    }
+
+    /// Write `bytes` to `offset` as one access of that width.
+    fn write_wide(&self, offset: u64, bytes: &[u8]) {
+        self.regs
+            .write(offset, bytes, MemAttrs::DEFAULT)
+            .expect("a legal cycle");
+    }
+
+    /// Read `N` bytes from `offset` as one access of that width.
+    fn read_wide<const N: usize>(&self, offset: u64) -> [u8; N] {
+        let mut out = [0u8; N];
+        self.regs
+            .read(offset, &mut out, MemAttrs::DEFAULT)
+            .expect("a legal cycle");
+        out
+    }
+
+    /// One byte of `DR`, which on an `"f7"` is one frame at `DS <= 8`.
+    fn read_dr_byte(&self) -> u8 {
+        self.read_wide::<1>(0x0c)[0]
+    }
+
+    /// Set `DS` to `bits`, keeping the rest of `CR2`.
+    fn set_ds(&self, bits: u8) {
+        let keep = self.read(0x04) & !(CR2_DS_MASK << CR2_DS_SHIFT);
+        self.write(0x04, keep | ((u16::from(bits) - 1) << CR2_DS_SHIFT));
+    }
+
+    /// `SR.FRLVL`, as a number of quarters.
+    fn frlvl(&self) -> u16 {
+        (self.read(0x08) >> SR_FRLVL_SHIFT) & SR_LVL_MASK
+    }
+
+    /// `SR.FTLVL`, as a number of quarters.
+    fn ftlvl(&self) -> u16 {
+        (self.read(0x08) >> SR_FTLVL_SHIFT) & SR_LVL_MASK
     }
 
     /// Poll `BSY` the way a driver does, for at most `limit` ticks.
@@ -161,7 +218,7 @@ fn a_reserved_cr2_bit_is_forced_to_zero() {
     // §28.5.2: bit 3 is "forced to 0 by hardware", not merely reserved.
     h.write(0x04, 0xffff);
     assert_eq!(h.read(0x04) & (1 << 3), 0);
-    assert_eq!(h.read(0x04), CR2_MASK);
+    assert_eq!(h.read(0x04), CR2_MASK_F4);
 }
 
 #[test]
@@ -779,4 +836,526 @@ fn a_snapshot_carries_a_half_consumed_overrun_sequence() {
     // it could not do if the snapshot had lost the first.
     assert_eq!(other.read(0x08) & SR_OVR, SR_OVR, "the clearing read");
     assert_eq!(other.read(0x08) & SR_OVR, 0);
+}
+
+// ---------------------------------------------------------------------------
+// the `"f7"` block: the FIFO
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_f7_reset_values_are_the_manuals() {
+    let h = harness_with(Variant::Fifo, Link::Transactional);
+    assert_eq!(h.read(0x00), 0x0000, "CR1");
+    // RM0351 §42.6.2: `0x0700`, which is `DS` powering up at eight bits and
+    // nothing else. Getting this wrong gives a peripheral whose frames are
+    // one bit wide until a driver writes `CR2`.
+    assert_eq!(h.read(0x04), 0x0700, "CR2");
+    assert_eq!(h.read(0x08), 0x0002, "SR: TXE set, both levels empty");
+    assert_eq!(h.frlvl(), 0);
+    assert_eq!(h.ftlvl(), 0);
+    assert_eq!(h.spi.format().bits, 8, "and so the frame is eight bits");
+}
+
+#[test]
+fn a_byte_write_to_dr_shifts_exactly_one_frame_when_ds_is_eight() {
+    let (h, echo) = fifo_with_echo(8);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(0);
+    // One 8-bit store to `DR` — what `*(volatile uint8_t *)&SPI->DR = x` is.
+    h.write_wide(0x0c, &[0x9f]);
+    h.wait(256);
+    assert_eq!(echo.seen(), [0x9f], "one frame, not two");
+    // `FRXTH` set, so one byte is enough.
+    assert_eq!(h.read(0x08) & SR_RXNE, SR_RXNE);
+    assert_eq!(h.frlvl(), 1, "a quarter of the FIFO");
+    assert_eq!(h.read_dr_byte(), 0xff);
+    assert_eq!(h.read(0x08) & SR_RXNE, 0, "and that byte is gone");
+    assert_eq!(h.frlvl(), 0);
+}
+
+#[test]
+fn a_halfword_write_to_dr_with_ds_eight_sends_two_frames() {
+    let (h, echo) = fifo_with_echo(8);
+    h.enable_master(0);
+    // §42.4.9's data packing: one 16-bit store, two frames, low byte first.
+    h.write_wide(0x0c, &[0x34, 0x12]);
+    assert_ne!(h.ftlvl(), 0, "the second byte is still queued");
+    h.wait(256);
+    assert_eq!(echo.seen(), [0x34, 0x12]);
+    assert_eq!(h.ftlvl(), 0, "and now the transmit side is empty");
+}
+
+#[test]
+fn rxne_waits_for_two_bytes_when_frxth_is_clear() {
+    let (h, _echo) = fifo_with_echo(8);
+    // `FRXTH` clear out of reset: `RXNE` is a *half-full* FIFO, two bytes.
+    assert_eq!(h.read(0x04) & CR2_FRXTH, 0);
+    h.enable_master(0);
+    h.write_wide(0x0c, &[0xaa]);
+    h.wait(256);
+    assert_eq!(h.frlvl(), 1, "one byte arrived");
+    assert_eq!(h.read(0x08) & SR_RXNE, 0, "and it is not enough");
+    h.write_wide(0x0c, &[0xbb]);
+    h.wait(256);
+    assert_eq!(h.read(0x08) & SR_RXNE, SR_RXNE, "two is");
+    // And one 16-bit read unpacks the pair, low byte first.
+    assert_eq!(h.read_wide::<2>(0x0c), [0xff, 0x55]);
+    assert_eq!(h.read(0x08) & SR_RXNE, 0);
+}
+
+#[test]
+fn frlvl_and_ftlvl_report_quarter_half_full() {
+    let h = harness_with(Variant::Fifo, Link::Transactional);
+    let echo = Echo::new(Format::DEFAULT);
+    h.bus
+        .attach(ChipSelect(0), Arc::clone(&echo) as Arc<dyn SpiSlave>)
+        .expect("cs0 is free");
+    h.bus.select(Some(ChipSelect(0)));
+    // A master that is not *enabled* starts nothing, so the transmit FIFO can
+    // be filled and looked at rather than drained as fast as it is written.
+    h.write(0x00, CR1_MSTR | CR1_SSM | CR1_SSI);
+    for (i, want) in [(0u8, 1u16), (1, 2), (2, 3), (3, 3)] {
+        h.write_wide(0x0c, &[0x10 + i]);
+        assert_eq!(h.ftlvl(), want, "after {} byte(s)", i + 1);
+    }
+    assert_eq!(
+        h.read(0x08) & SR_TXE,
+        0,
+        "three or four bytes is above half"
+    );
+    assert_eq!(h.read(0x08) & SR_BSY, 0, "but nothing is shifting");
+
+    // Now let them go, one frame — eight bits at BR = 0, so sixteen ticks —
+    // at a time, and watch the other level fill.
+    h.write(0x00, h.read(0x00) | CR1_SPE);
+    for (n, want) in [(1u32, 1u16), (2, 2), (3, 3), (4, 3)] {
+        h.run(16);
+        assert_eq!(h.frlvl(), want, "after {n} frame(s)");
+    }
+    // The manual has four codes for five occupancies, so three and four bytes
+    // share one — which is why `00` is the only level a driver can trust.
+    assert_eq!(h.ftlvl(), 0);
+    assert_eq!(echo.seen(), [0x10, 0x11, 0x12, 0x13]);
+}
+
+#[test]
+fn a_fifth_received_frame_sets_ovr_and_is_dropped() {
+    let (h, _echo) = fifo_with_echo(8);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(0);
+    // Four frames fill the receive FIFO exactly, and nothing reads it.
+    h.write_wide(0x0c, &[0x01, 0x02]);
+    h.wait(256);
+    h.write_wide(0x0c, &[0x03, 0x04]);
+    h.wait(256);
+    assert_eq!(h.frlvl(), 3, "full");
+    assert_eq!(h.read(0x08) & SR_OVR, 0, "and not yet an overrun");
+    // The fifth completes with nowhere to go.
+    h.write_wide(0x0c, &[0x05]);
+    h.wait(256);
+    assert_eq!(h.read(0x08) & SR_OVR, SR_OVR);
+    // The four that did fit are the *first* four: §42.4.9 drops the new frame,
+    // it does not push the oldest out.
+    assert_eq!(
+        [
+            h.read_dr_byte(),
+            h.read_dr_byte(),
+            h.read_dr_byte(),
+            h.read_dr_byte()
+        ],
+        [0xff, 0xfe, 0xfd, 0xfc]
+    );
+    // And the clearing sequence is still the F4's: a read of `DR`, then a read
+    // of `SR` — and it is the read *after* that one which comes back clear,
+    // because the clearing read still reports the flag it is clearing.
+    assert_eq!(h.read(0x08) & SR_OVR, SR_OVR, "the clearing read");
+    assert_eq!(h.read(0x08) & SR_OVR, 0);
+}
+
+// ---------------------------------------------------------------------------
+// the `"f7"` block: `DS`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ds_values_below_four_read_back_as_eight_bits() {
+    let h = harness_with(Variant::Fifo, Link::Transactional);
+    // §42.6.2: `0b0000`, `0b0001` and `0b0010` are "not used" and the hardware
+    // forces `0b0111`. Forced on the way in, so the read-back does not claim a
+    // frame size the peripheral is not using.
+    for code in 0u16..3 {
+        h.write(0x04, code << CR2_DS_SHIFT);
+        assert_eq!((h.read(0x04) >> CR2_DS_SHIFT) & CR2_DS_MASK, 7, "DS={code}");
+        assert_eq!(h.spi.format().bits, 8);
+    }
+    // And the first legal code really is four bits.
+    h.write(0x04, DS_CODE_MIN << CR2_DS_SHIFT);
+    assert_eq!(h.spi.format().bits, 4);
+}
+
+#[test]
+fn a_five_bit_frame_clocks_five_bits_and_is_right_aligned() {
+    let (h, echo) = fifo_with_echo(5);
+    h.set_ds(5);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(0);
+    // The top three bits of the byte are not on the wire at all.
+    h.write_wide(0x0c, &[0xff]);
+    // Five bit times at BR = 0 is ten ticks, not sixteen — which is the whole
+    // claim that this is a frame size and not a rounded-up byte.
+    h.run(9);
+    assert_eq!(h.read(0x08) & SR_BSY, SR_BSY, "nine ticks is not a frame");
+    h.run(1);
+    assert_eq!(h.read(0x08) & SR_BSY, 0, "ten is");
+    assert_eq!(echo.seen(), [0x1f], "right-aligned and masked to DS");
+    assert_eq!(h.read_dr_byte(), 0x1f, "and so is what comes back");
+}
+
+#[test]
+fn a_twelve_bit_frame_takes_two_fifo_bytes_each_way() {
+    let (h, echo) = fifo_with_echo(12);
+    h.set_ds(12);
+    h.enable_master(0);
+    // Above eight bits the FIFO is still a *byte* FIFO, so one byte is half a
+    // frame and nothing goes out for it.
+    h.write_wide(0x0c, &[0xbc]);
+    h.run(64);
+    assert!(echo.seen().is_empty(), "half a frame is not a frame");
+    assert_eq!(h.ftlvl(), 1, "and the byte is waiting for its partner");
+    h.write_wide(0x0c, &[0x0a]);
+    h.wait(256);
+    assert_eq!(echo.seen(), [0x0abc], "little-endian, right-aligned");
+    // Two bytes back, so the receive level is a half rather than a quarter.
+    assert_eq!(h.frlvl(), 2);
+    assert_eq!(h.read_wide::<2>(0x0c), [0xff, 0x0f], "0xfff, right-aligned");
+}
+
+#[test]
+fn sixteen_bit_frames_still_work_on_the_fifo_block() {
+    let (h, echo) = fifo_with_echo(16);
+    h.set_ds(16);
+    h.enable_master(0);
+    h.write_wide(0x0c, &[0xef, 0xbe]);
+    h.wait(256);
+    assert_eq!(echo.seen(), [0xbeef]);
+    // And `CR1` bit 11 is *not* what chose it: on this block that bit is
+    // `CRCL`, so setting it changes the CRC and not the frame.
+    h.write(0x00, h.read(0x00) | CR1_CRCL);
+    assert_eq!(h.spi.format().bits, 16, "DS decides, not DFF");
+}
+
+#[test]
+fn the_variant_decides_what_cr1_bit_eleven_means() {
+    let f4 = harness(Link::Transactional);
+    f4.write(0x00, CR1_DFF);
+    assert_eq!(f4.spi.format().bits, 16, "`f4`: bit 11 is DFF");
+
+    let f7 = harness_with(Variant::Fifo, Link::Transactional);
+    f7.write(0x00, CR1_CRCL);
+    assert_eq!(f7.spi.format().bits, 8, "`f7`: bit 11 is CRCL, DS decides");
+    // Which is the divergence a `variant` has to make real rather than
+    // paper over: neither driver half-works as the other.
+    assert_eq!(f4.read(0x04) & (CR2_DS_MASK << CR2_DS_SHIFT), 0);
+    assert_ne!(f7.read(0x04) & (CR2_DS_MASK << CR2_DS_SHIFT), 0);
+}
+
+// ---------------------------------------------------------------------------
+// the `"f7"` block: `CRCL`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crcl_runs_a_sixteen_bit_crc_and_sends_it_as_two_eight_bit_frames() {
+    let (h, echo) = fifo_with_echo(8);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(CR1_CRCEN | CR1_CRCL);
+    // Three data frames, which is enough shifting for a sixteen-bit
+    // accumulator to reach into its top half — an eight-bit CRC could not
+    // hold the value the next assertion checks.
+    for byte in [0x31u8, 0x41, 0x59] {
+        h.write_wide(0x0c, &[byte]);
+        h.wait(256);
+        h.read_dr_byte();
+    }
+    let txcrc = h.read(0x18);
+    assert!(txcrc > 0xff, "a sixteen-bit CRC over eight-bit frames");
+
+    // §42.4.11: the CRC follows the data. It is wider than a frame here, so it
+    // takes two of them, most significant first.
+    h.write(0x00, h.read(0x00) | CR1_CRCNEXT);
+    h.wait(256);
+    let seen = echo.seen();
+    assert_eq!(seen.len(), 5, "three data frames and two of CRC");
+    assert_eq!(
+        seen[seen.len() - 2..],
+        [u32::from(txcrc >> 8), u32::from(txcrc & 0xff)]
+    );
+    assert_eq!(h.read(0x00) & CR1_CRCNEXT, 0, "and it cleared itself");
+    // The echo answered with something else, so the comparison fails — which
+    // is the flag doing its job over the reassembled sixteen bits.
+    assert_eq!(h.read(0x08) & SR_CRCERR, SR_CRCERR);
+}
+
+#[test]
+fn crcl_clear_is_an_eight_bit_crc_in_one_frame() {
+    let (h, echo) = fifo_with_echo(8);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(CR1_CRCEN);
+    h.write_wide(0x0c, &[0x31]);
+    h.wait(256);
+    h.read_dr_byte();
+    let txcrc = h.read(0x18);
+    assert!(txcrc <= 0xff, "eight bits wide");
+    h.write(0x00, h.read(0x00) | CR1_CRCNEXT);
+    h.wait(256);
+    assert_eq!(echo.seen().last().copied(), Some(u32::from(txcrc)));
+}
+
+// ---------------------------------------------------------------------------
+// the `"f7"` block: odd-length DMA
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ldma_tx_puts_five_frames_on_the_wire_from_three_halfword_writes() {
+    let (h, echo) = fifo_with_echo(8);
+    // What a driver programs before starting an odd-length packed DMA.
+    h.write(0x04, h.read(0x04) | CR2_TXDMAEN | CR2_LDMA_TX);
+    h.enable_master(0);
+    // Five data as three 16-bit accesses: the sixth byte is padding.
+    for pair in [[0u8, 1], [2, 3], [4, 0xff]] {
+        h.write_wide(0x0c, &pair);
+        h.run(64);
+    }
+    assert_eq!(
+        echo.seen(),
+        [0, 1, 2, 3, 4],
+        "five frames, and the pad is not"
+    );
+    // The held byte is still counted — it occupies an entry — so the stream is
+    // ended the way a driver ends one, by dropping the DMA enable.
+    assert_ne!(h.ftlvl(), 0);
+    h.write(0x04, h.read(0x04) & !CR2_TXDMAEN);
+    assert_eq!(h.ftlvl(), 0);
+    assert_eq!(h.read(0x08) & SR_BSY, 0);
+    h.run(64);
+    assert_eq!(echo.seen().len(), 5, "and it never went out");
+}
+
+#[test]
+fn without_ldma_tx_the_same_three_writes_send_six_frames() {
+    let (h, echo) = fifo_with_echo(8);
+    h.enable_master(0);
+    for pair in [[0u8, 1], [2, 3], [4, 0xff]] {
+        h.write_wide(0x0c, &pair);
+        h.run(64);
+    }
+    // Which is exactly the bug `LDMA_TX` exists to prevent: one frame too many.
+    assert_eq!(echo.seen(), [0, 1, 2, 3, 4, 0xff]);
+}
+
+#[test]
+fn ldma_rx_lets_the_odd_last_byte_raise_rxne() {
+    let (h, _echo) = fifo_with_echo(8);
+    // `FRXTH` clear, as a packed DMA read leaves it: `RXNE` at two bytes.
+    h.enable_master(0);
+    h.write_wide(0x0c, &[0x00]);
+    h.wait(256);
+    assert_eq!(h.frlvl(), 1);
+    assert_eq!(h.read(0x08) & SR_RXNE, 0, "the DMA would stall here");
+
+    h.write(0x04, h.read(0x04) | CR2_RXDMAEN | CR2_LDMA_RX);
+    // Nothing in flight and nothing queued, so the lone byte can only be the
+    // odd last one — and now it is reachable.
+    assert_eq!(h.read(0x08) & SR_RXNE, SR_RXNE);
+    // The 16-bit read the DMA makes pops the one byte and zeroes the rest.
+    assert_eq!(h.read_wide::<2>(0x0c), [0xff, 0x00]);
+    assert_eq!(h.read(0x08) & SR_RXNE, 0);
+}
+
+// ---------------------------------------------------------------------------
+// the `"f7"` block: the debug rule, and a snapshot
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_debug_read_of_dr_pops_nothing_out_of_the_receive_fifo() {
+    let (h, _echo) = fifo_with_echo(8);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(0);
+    h.write_wide(0x0c, &[0x01, 0x02]);
+    h.wait(256);
+    assert_eq!(h.frlvl(), 2);
+
+    // A debugger dumping the block reads `DR` like anything else, and if that
+    // popped the FIFO the guest's next read would return the *second* byte and
+    // its driver would be one byte out for the rest of the transfer.
+    for _ in 0..4 {
+        assert_eq!(h.read_debug(0x0c), 0xfe_ff);
+    }
+    assert_eq!(h.frlvl(), 2, "nothing was consumed");
+    assert_eq!(h.read(0x08) & SR_RXNE, SR_RXNE);
+    assert_eq!(h.read_dr_byte(), 0xff, "and the guest still gets its own");
+}
+
+#[test]
+fn a_snapshot_carries_both_fifos() {
+    let (h, _echo) = fifo_with_echo(8);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(0);
+    // Three frames fill the receive side...
+    h.write_wide(0x0c, &[0x01, 0x02]);
+    h.wait(256);
+    h.write_wide(0x0c, &[0x03]);
+    h.wait(256);
+    assert_eq!(h.frlvl(), 3);
+    // ...and a write with no time to drain leaves the transmit side loaded and
+    // a frame in flight, which is the state a snapshot has to survive.
+    h.write_wide(0x0c, &[0x04, 0x05]);
+    assert_ne!(h.ftlvl(), 0);
+    let bytes = snapshot(&h.spi);
+
+    let other = harness_with(Variant::Fifo, Link::Transactional);
+    restore(&other.spi, &bytes);
+    assert_eq!(snapshot(&other.spi), bytes, "identical bytes");
+    assert_eq!(other.read(0x08), h.read(0x08));
+    // And the restored peripheral hands back the same three bytes, in order,
+    // which is the only thing that proves the *contents* came across and not
+    // just the level field.
+    assert_eq!(
+        [
+            other.read_dr_byte(),
+            other.read_dr_byte(),
+            other.read_dr_byte()
+        ],
+        [0xff, 0xfe, 0xfd]
+    );
+}
+
+#[test]
+fn a_snapshot_carries_a_half_sent_sixteen_bit_crc() {
+    let (h, _echo) = fifo_with_echo(8);
+    h.write(0x04, h.read(0x04) | CR2_FRXTH);
+    h.enable_master(CR1_CRCEN | CR1_CRCL);
+    h.write_wide(0x0c, &[0x31]);
+    h.wait(256);
+    h.read_dr_byte();
+    // Between the two halves of the CRC: `CRCNEXT` has fired and one frame of
+    // two has gone. A snapshot that called this "not started" would send the
+    // high half twice on resume.
+    h.write(0x00, h.read(0x00) | CR1_CRCNEXT);
+    h.run(16);
+    let bytes = snapshot(&h.spi);
+
+    let other = harness_with(Variant::Fifo, Link::Transactional);
+    restore(&other.spi, &bytes);
+    assert_eq!(snapshot(&other.spi), bytes, "identical bytes");
+}
+
+#[test]
+fn the_variant_property_is_optional_and_checked() {
+    let props = Props::new()
+        .with("link", Value::from("transactional"))
+        .with("bus", Value::from("spi-variant-test"))
+        .with("variant", Value::from("f7"));
+    assert_eq!(
+        Stm32Spi::new(&props).expect("a legal peripheral").variant(),
+        Variant::Fifo
+    );
+    let default = Props::new()
+        .with("link", Value::from("transactional"))
+        .with("bus", Value::from("spi-variant-default"));
+    assert_eq!(
+        Stm32Spi::new(&default)
+            .expect("a legal peripheral")
+            .variant(),
+        Variant::F4,
+        "the boards in the tree are F4s"
+    );
+    // The H7's is a third IP and not a third value; naming it has to fail
+    // rather than quietly give an F4.
+    let h7 = Props::new()
+        .with("link", Value::from("transactional"))
+        .with("bus", Value::from("spi-variant-h7"))
+        .with("variant", Value::from("h7"));
+    assert!(Stm32Spi::new(&h7).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// against a real part
+// ---------------------------------------------------------------------------
+
+/// Read a W25Q's `9Fh` identifier through the FIFO, popping `DR` however
+/// `frxth` says to.
+///
+/// The proof that this is a controller and not a register model: every byte
+/// below is a frame clocked down [`crate::bus::spi`] into
+/// [`crate::dev::flash::spinor`]'s own command decoder, and the identifier can
+/// only come back if the frames were right.
+#[cfg(feature = "dev-flash-spinor")]
+fn jedec_through_the_fifo(frxth: bool) -> [u8; 3] {
+    use crate::dev::flash::SpiNor;
+
+    let h = harness_with(Variant::Fifo, Link::Transactional);
+    let part = SpiNor::new(&Props::new().with("size", Value::Size(1024 * 1024)))
+        .expect("a plausible part");
+    h.bus
+        .attach(ChipSelect(0), part.slave())
+        .expect("cs0 is free");
+
+    // Hardware NSS rather than `SSM`, because the chip select is what delimits
+    // a flash command: `SSOE` with `SPE` drops it, and clearing `SPE` raises
+    // it again (§28.3.1), which is exactly what the board in
+    // `machines/spi-flash.machine` does.
+    let cr2 = h.read(0x04) | CR2_SSOE | if frxth { CR2_FRXTH } else { 0 };
+    h.write(0x04, cr2);
+    h.write(0x00, CR1_MSTR | CR1_SPE);
+    assert_eq!(h.bus.selected(), Some(ChipSelect(0)), "NSS went low");
+
+    // `9Fh` and three bytes of clocking, packed two to an access in the
+    // FRXTH-clear case and one at a time otherwise — the same four frames
+    // either way.
+    if frxth {
+        for byte in [0x9fu8, 0, 0, 0] {
+            h.write_wide(0x0c, &[byte]);
+            h.wait(512);
+        }
+    } else {
+        h.write_wide(0x0c, &[0x9f, 0]);
+        h.wait(512);
+        h.write_wide(0x0c, &[0, 0]);
+        h.wait(512);
+    }
+    assert_eq!(h.frlvl(), 3, "four bytes, which is the whole FIFO");
+    assert_eq!(h.read(0x08) & SR_OVR, 0, "and not one too many");
+
+    let got = if frxth {
+        // The first byte is the part answering the opcode, which is idle.
+        assert_eq!(h.read_dr_byte(), 0xff);
+        [h.read_dr_byte(), h.read_dr_byte(), h.read_dr_byte()]
+    } else {
+        let first = h.read_wide::<2>(0x0c);
+        let second = h.read_wide::<2>(0x0c);
+        assert_eq!(first[0], 0xff);
+        [first[1], second[0], second[1]]
+    };
+    // Raising the chip select is what ends the command on the part.
+    h.write(0x00, h.read(0x00) & !CR1_SPE);
+    assert_eq!(h.bus.selected(), None);
+    got
+}
+
+#[cfg(feature = "dev-flash-spinor")]
+#[test]
+fn the_jedec_id_of_a_spinor_comes_back_through_the_fifo() {
+    // `EFh` is Winbond (JEP106 bank 1), `40h` the W25Q ordering option, and
+    // `14h` the capacity byte of a 1 MiB part — the logarithm of the density.
+    assert_eq!(
+        jedec_through_the_fifo(true),
+        [0xef, 0x40, 0x14],
+        "FRXTH set"
+    );
+    // And the same identifier, read two bytes to an access. The packing is
+    // invisible on the wire, which is the claim being made.
+    assert_eq!(
+        jedec_through_the_fifo(false),
+        [0xef, 0x40, 0x14],
+        "FRXTH clear, packed"
+    );
 }

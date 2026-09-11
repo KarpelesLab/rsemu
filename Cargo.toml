@@ -1147,11 +1147,19 @@ dev-at24c = ["bus-i2c"]
 dev-stm32-i2c = ["dev-stm32", "bus-i2c"]
 
 
-# The STM32F4 SPI master (src/dev/stm32/spi.rs): CR1/CR2, SR, DR, CRCPR and the
-# software-slave-management bits, driving `bus-spi` as its controller. RM0090
-# §28 and that family only -- the H7's SPI shares a name with this one and
-# almost nothing else, which is why it would be another module rather than a
-# property. `no_std + alloc`, no dependencies.
+# The STM32 SPI master (src/dev/stm32/spi.rs): CR1/CR2, SR, DR, CRCPR and the
+# software-slave-management bits, master and slave, both link models, driving
+# `bus-spi` as its controller. One class, `stm32.spi`, covering **both**
+# generations of the block as a `variant` property, because the registers never
+# moved and one engine serves both: `f4` is RM0090 §28 (one buffer each way,
+# `CR1.DFF` picks 8 or 16 bits) and `f7` is RM0351 §42 (F0/F3/F7/L4/L4+/L5/
+# G0/G4/WB) with a **four-byte FIFO each way** -- `FRLVL`/`FTLVL`/`FRXTH`, an
+# access-width-sensitive `DR` where an 8-bit store sends one frame and a 16-bit
+# store sends two, a 4-to-16-bit `DS`, `CRCL` and its CRC over the programmable
+# size, and `LDMA_RX`/`LDMA_TX` for an odd-length packed DMA. The H7's SPI
+# shares a name with both and almost nothing else -- `CFG1`/`CFG2`, `TSIZE`,
+# split `TXDR`/`RXDR` -- which is why that one would be another module rather
+# than a third value. `no_std + alloc`, no dependencies.
 dev-stm32-spi = ["bus-spi"]
 
 # The OCTOSPI controller (src/dev/stm32/octospi.rs): the indirect mode, which

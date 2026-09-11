@@ -1,41 +1,168 @@
-//! The STM32**F4** SPI peripheral.
+//! The STM32 SPI peripheral, in both of the generations ST shipped it in.
 //!
-//! # Which family, and why it matters
+//! # Two generations, one register map
 //!
-//! ST reuses the name `SPI` across families for blocks that share pins and
-//! nothing else. This models the **F4's**, from ST's **RM0090** (rev 21, June
-//! 2024, DocID018909), chapter **28 "Serial peripheral interface (SPI)"** — the
-//! classic nine-register, 16-bit-wide, no-FIFO block that most SPI guest
-//! software targets, and the one on the F405/415, F407/417, F427/437 and
-//! F429/439.
+//! ST revised this block once, and — unlike the [`usart`](super::usart), where
+//! the revision moved every register — it moved nothing. `CR1`, `CR2`, `SR`,
+//! `DR`, `CRCPR`, `RXCRCR`, `TXCRCR`, `I2SCFGR` and `I2SPR` sit at `0x00`…
+//! `0x20` in both; the baud-rate divisor is `2^(BR + 1)` in both; and
+//! `MSTR`/`CPOL`/`CPHA`/`LSBFIRST`/`BR`, `SSM`/`SSI`/`SSOE`, `MODF`, `OVR`,
+//! `RXONLY`, `BIDIMODE` and the CRC machinery mean the same thing in both.
+//! What the revision changed is the **data path**:
 //!
-//! The **H7's SPI is a different IP, not a superset** (RM0433): its
+//! | | `variant = "f4"` (RM0090 §28) | `variant = "f7"` (RM0351 §42) |
+//! | --- | --- | --- |
+//! | parts | F1, F2, **F4**, L1 | F0, F3, **F7**, L4, L4+, L5, G0, G4, WB |
+//! | buffers | one word each way | a **four-byte FIFO** each way |
+//! | frame size | `CR1.DFF`: 8 or 16 bits | `CR2.DS[3:0]`: **4 to 16 bits** |
+//! | `CR1` bit 11 | `DFF` | `CRCL`, the CRC *length* |
+//! | `CR2` reset | `0x0000` | `0x0700` — `DS` powers up at eight bits |
+//! | `RXNE` rises | on a whole word | at the threshold `CR2.FRXTH` picks |
+//! | `TXE` means | the buffer is free | the Tx FIFO is at or below half |
+//! | fill levels | none | `SR.FRLVL[10:9]`, `SR.FTLVL[12:11]` |
+//! | `DR` access width | irrelevant | an 8-bit access moves **one** byte, a 16-bit access **two** |
+//! | odd-length DMA | n/a | `CR2.LDMA_TX`, `CR2.LDMA_RX` |
+//!
+//! The value is spelled `"f7"` to match [`usart`](super::usart)'s vocabulary
+//! for the same generation of ST redesign — a board that writes
+//! `variant = "f7"` for its USART writes the same word here. The manual this
+//! half was written from is ST **RM0351** (STM32L4x5/L4x6), chapter **42**,
+//! *Serial peripheral interface (SPI)*; the block is the same one in the other
+//! families named above. The default is `"f4"`, because
+//! [`machines/spi-flash.machine`] and [`machines/spi-panel.machine`] are F4
+//! boards and a default that matches the boards in the tree is one fewer line
+//! in each of them.
+//!
+//! # Why that is a property and not a second class
+//!
+//! [`i2c`](super::i2c) refuses the same move, and the difference is the point.
+//! I²C v1 and v2 share a *name*: different registers at different offsets, and
+//! — the part that decides it — a different **transfer engine**, since v2's
+//! `CR2` carries `NBYTES`/`AUTOEND` and the hardware runs the transfer that v1
+//! drives byte by byte from software. Nothing could serve both.
+//!
+//! Here one engine serves both. [`Shared::advance_to`], [`Shared::begin`],
+//! [`Shared::finish`], [`Shared::tx_bit`], [`Shared::capture`],
+//! [`Shared::check_mode_fault`] and the whole slave face are written once and
+//! are correct for both generations; what forks is how a frame is *fetched*
+//! and *deposited*, which is a dozen lines at each end. A second class would
+//! have been a second copy of the engine, kept in step by hand — the exact
+//! drift [`crate::bus::spi`] exists to prevent between its own two links.
+//!
+//! **Neither half silently half-works as the other**, which is the thing a
+//! `variant` has to get right, and it gets it right by being faithful rather
+//! than by refusing: an F4-targeted driver that sets `CR1.DFF` on an `"f7"`
+//! instance sets `CRCL` and keeps eight-bit frames, and an L4-targeted driver
+//! that programs `CR2.DS` and `FRXTH` on an `"f4"` instance writes reserved
+//! bits that read back zero and never sees `RXNE` per byte. That is what the
+//! silicon does to each of them.
+//!
+//! The **H7's SPI is a third IP, not a further revision** (RM0433): its
 //! configuration is split across `CFG1`/`CFG2`, `CR2` holds a `TSIZE` transfer
 //! counter, `CR1` a `CSTART` bit, the data register is split into `TXDR` and
-//! `RXDR` behind multi-entry FIFOs with `TXP`/`RXP`/`EOT` flags, and the frame
-//! size runs from 4 to 32 bits. Nothing in the F4's `0x00`-`0x20` map survives
-//! that. A board with an H7 gets a second module rather than a property on this
-//! one.
+//! `RXDR`, the flags are `TXP`/`RXP`/`EOT`, and the frame size runs to 32 bits.
+//! Nothing in the `0x00`-`0x20` map above survives that. A board with an H7
+//! gets a second module rather than a third value of this property.
 //!
-//! # Register map (§28.5.10, Table 130)
+//! # Register map (RM0090 §28.5.10 Table 130; RM0351 §42.6.10)
 //!
-//! | Offset | Name | Reset | Notes |
-//! | --- | --- | --- | --- |
-//! | `0x00` | `CR1` | `0x0000` | mode, framing, baud rate, `SPE` |
-//! | `0x04` | `CR2` | `0x0000` | `SSOE`, DMA and interrupt enables |
-//! | `0x08` | `SR` | `0x0002` | `TXE` is set out of reset |
-//! | `0x0c` | `DR` | `0x0000` | **two buffers**: a write loads Tx, a read pops Rx |
-//! | `0x10` | `CRCPR` | `0x0007` | the CRC polynomial |
-//! | `0x14` | `RXCRCR` | `0x0000` | read-only |
-//! | `0x18` | `TXCRCR` | `0x0000` | read-only |
-//! | `0x1c` | `I2SCFGR` | `0x0000` | see below |
-//! | `0x20` | `I2SPR` | `0x0002` | see below |
+//! | Offset | Name | Reset (`f4`) | Reset (`f7`) | Notes |
+//! | --- | --- | --- | --- | --- |
+//! | `0x00` | `CR1` | `0x0000` | `0x0000` | mode, framing, baud rate, `SPE` |
+//! | `0x04` | `CR2` | `0x0000` | `0x0700` | `SSOE`, DMA and interrupt enables, `DS` |
+//! | `0x08` | `SR` | `0x0002` | `0x0002` | `TXE` is set out of reset |
+//! | `0x0c` | `DR` | `0x0000` | `0x0000` | **two buffers**: a write loads Tx, a read pops Rx |
+//! | `0x10` | `CRCPR` | `0x0007` | `0x0007` | the CRC polynomial |
+//! | `0x14` | `RXCRCR` | `0x0000` | `0x0000` | read-only |
+//! | `0x18` | `TXCRCR` | `0x0000` | `0x0000` | read-only |
+//! | `0x1c` | `I2SCFGR` | `0x0000` | `0x0000` | see below |
+//! | `0x20` | `I2SPR` | `0x0002` | `0x0002` | see below |
 //!
 //! Every register is sixteen bits in a thirty-two bit slot; §28.5 says
 //! accesses are by half-word or word. Byte access is **not defined by the
-//! manual at all** — ST's own headers do it to `DR` in 8-bit frame format, so
-//! it is accepted here and reaches the low half, and the module says so rather
-//! than pretending the manual answered.
+//! manual at all** for the F4 — ST's own headers do it to `DR` in 8-bit frame
+//! format, so it is accepted here and reaches the low half, and the module says
+//! so rather than pretending the manual answered. On the `"f7"` half byte
+//! access to `DR` is not a liberty but the *specified* way to move one byte:
+//! RM0351 §42.4.9 makes the access width part of the semantics.
+//!
+//! # The FIFO, and why the access width is the interesting part
+//!
+//! RM0351 §42.4.9: the `"f7"` block has a 32-bit — that is, **four-byte** —
+//! FIFO in each direction, and how many frames a `DR` access moves depends on
+//! how wide the access is:
+//!
+//! * With `DS ≤ 8` a frame is one byte. An 8-bit write to `DR` pushes **one**
+//!   byte, so one frame; a 16-bit write pushes **two**, so two frames, low byte
+//!   first. That is ST's "data packing", and it is why a driver written for
+//!   this part uses `*(volatile uint8_t *)&SPI->DR` and a driver written for
+//!   the F4 does not care.
+//! * With `DS > 8` a frame is two bytes, little-endian, right-aligned in `DR`.
+//! * `CR2.FRXTH` decides when `RXNE` rises: set, at one byte in the Rx FIFO;
+//!   clear, at two. A driver that leaves it clear and then reads single bytes
+//!   waits for ever, which is the bug this bit exists to cause.
+//! * `SR.FRLVL`/`SR.FTLVL` report the fill in quarters. The manual gives four
+//!   codes for a FIFO with five occupancies, so *three* bytes and *four* bytes
+//!   both read `11`; this model saturates, and says so here because a driver
+//!   that waits for `FTLVL == 00` is waiting on the one code that is exact.
+//! * `TXE` is "at or below half" — two bytes — not "empty", and `BSY` is "a
+//!   frame is shifting **or** the Tx FIFO is not empty".
+//! * A frame that completes with no room in the Rx FIFO sets `OVR` and is
+//!   lost, cleared by the read-`DR`-then-read-`SR` sequence exactly as on the
+//!   F4.
+//!
+//! ## `DS`, and what a non-byte-multiple frame does
+//!
+//! `CR2.DS[3:0]` is `frame bits - 1`, so `0b0011` is four bits and `0b1111` is
+//! sixteen. RM0351 §42.6.2: values below `0b0011` are "not used" and the
+//! hardware **forces `0b0111`, eight bits** — so a driver that writes zero gets
+//! a working eight-bit peripheral rather than a wedged one, and this model
+//! forces the same value on the way in so a read-back tells the truth.
+//!
+//! A frame is **right-aligned in `DR`** whatever its width, and it moves as a
+//! *whole frame* on the wire: `DS = 5` clocks five bits, not eight and not a
+//! rounded-up byte. It still occupies one FIFO byte, because the FIFO is a byte
+//! FIFO; five-bit frames therefore pack four to a full FIFO, and the top three
+//! bits of each byte are not on the wire at all.
+//!
+//! ## `CRCL`, and a CRC wider than a frame
+//!
+//! On the `"f7"` half `CR1` bit 11 is `CRCL`, the **CRC length**: clear is an
+//! 8-bit CRC, set is a 16-bit one (§42.6.1). The calculators are fed `DS`-bit
+//! data at that width, which is the whole of "CRC over the programmable size".
+//! When the CRC is wider than a frame — `CRCL` set with `DS = 8`, the ordinary
+//! case — it goes out as `ceil(CRC bits / DS)` frames, most significant first,
+//! and the received CRC is reassembled from the same number before it is
+//! compared. On the `"f4"` half the CRC length *is* the frame length, so that
+//! reduces to the single frame it always was.
+//!
+//! ## `LDMA_TX` and `LDMA_RX`, which exist for an odd count
+//!
+//! §42.4.9 again. With packing on, a DMA moves two bytes per access, so an
+//! **odd** number of data does not divide into accesses: the last write has a
+//! byte too many and the last read finds a byte too few. The two bits tell the
+//! peripheral the count is odd.
+//!
+//! * `LDMA_TX` — a 16-bit write to `DR` pushes its low byte and **holds** its
+//!   high byte back; the next write promotes the held byte ahead of its own.
+//!   Five bytes written as three 16-bit accesses therefore put exactly five
+//!   frames on the wire and the sixth byte is never sent — it is dropped when
+//!   the stream ends (`SPE` or `TXDMAEN` clears). The model is one byte deeper
+//!   in the pipeline than the silicon, which counts DMA requests and so knows
+//!   which access is the last; a register block cannot know that, and holding
+//!   the byte is the only way to get the *frame count* right, which is what the
+//!   bit is for. The disclosed cost: the held byte occupies a FIFO entry, so
+//!   `FTLVL` and `BSY` stand until the stream is ended — which is what a
+//!   driver does anyway, in the DMA-complete callback that clears `TXDMAEN`.
+//! * `LDMA_RX` — the `RXNE` threshold falls to one byte **once the stream has
+//!   drained**: no frame in flight and the Tx FIFO empty. Then and only then a
+//!   lone byte can be the odd last one, so `RXNE` rises for it even with
+//!   `FRXTH` clear, and the 16-bit read that follows pops the one byte and
+//!   answers with it in the low half. Without this the DMA stalls on the last
+//!   byte of an odd count, which is the stall the bit exists to prevent.
+//!
+//! Both are gated on their direction's `DMAEN`, as §42.6.2 says ("it has
+//! significance only if the TXDMAEN bit is set").
 //!
 //! # The parts real drivers trip over, and which are modelled
 //!
@@ -55,9 +182,9 @@
 //!   bit is done by a read from the `SPI_DR` register followed by a read
 //!   access to the `SPI_SR` register", and until then the receive buffer is
 //!   *frozen* — every further frame is dropped rather than overwriting it.
-//! * **`DR` is two registers.** A write goes to the Tx buffer, a read comes
-//!   from the Rx buffer, and in 8-bit format §28.5.4 says the top half of a
-//!   read is forced to zero.
+//! * **`DR` is two registers.** A write goes to the Tx side, a read comes from
+//!   the Rx side, and in 8-bit frame format §28.5.4 says the top half of a read
+//!   is forced to zero.
 //! * **Receive-only masters clock themselves.** §28.3.4: with `RXONLY` set (or
 //!   `BIDIMODE` set and `BIDIOE` clear) a master "communication starts
 //!   immediately and stops when the `SPE` bit is cleared" — no `DR` write is
@@ -72,7 +199,8 @@
 //! this peripheral's clock domain either way — §28.5.1's baud-rate divisor is
 //! `2^(BR+1)`, so one bit is one `SCK` period is `2^(BR+1)` ticks of `PCLK` —
 //! so a driver polling `BSY` sees the same timing under both. What differs is
-//! only whether the edges exist.
+//! only whether the edges exist. `DS` is visible in that number: a five-bit
+//! frame costs five bit times, not eight.
 //!
 //! # Slave mode
 //!
@@ -81,7 +209,8 @@
 //! [`SlavePins`] on the `sck-in`, `mosi-in`,
 //! `nss-in` and `miso-out` pins, so another controller — or a guest bit-banging
 //! GPIO — clocks it and `DR`, `TXE`, `RXNE`, `OVR` and `BSY` move exactly as
-//! they would in master mode.
+//! they would in master mode. On the `"f7"` half the FIFOs are in that path
+//! too: a slave answers from its Tx FIFO and deposits into its Rx FIFO.
 //!
 //! **NSS is split into two pins**, `nss` (out) and `nss-in` (in). The real part
 //! has one bidirectional pin; an rsemu wire has fixed drivers and cannot be
@@ -98,7 +227,19 @@
 //! format) bit is likewise stored; `FRE` never sets, because TI framing
 //! changes where NSS pulses and nothing in this tree watches for that.
 //!
+//! **`CR2.NSSP` is stored and does not pulse.** §42.4.5 restricts it to a
+//! master with `CPHA = 0`, and what it does is drop NSS for one clock period
+//! *between* frames — which every part in this tree would read as the end of a
+//! command, since a serial flash commits on the rising edge of its chip select
+//! (`crate::dev::flash::spinor`). A driver sets `NSSP` for a
+//! one-frame-per-select protocol and there is no such part here yet; a pulse
+//! implemented against parts that would mis-commit on it would be a worse model
+//! than an honest register, so it is an honest register.
+//!
 //! No emulator source of any licence was consulted (`ROADMAP.md` §1).
+//!
+//! [`machines/spi-flash.machine`]: https://github.com/KarpelesLab/rsemu/blob/master/machines/spi-flash.machine
+//! [`machines/spi-panel.machine`]: https://github.com/KarpelesLab/rsemu/blob/master/machines/spi-panel.machine
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -126,7 +267,12 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "stm32.spi";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// Two since the `"f7"` variant landed: the chunk carries both FIFOs, the
+/// `LDMA_TX` held byte and the CRC-transfer position, and a version-1 chunk has
+/// none of them. Pre-1.0 and no migration, because no version-1 snapshot of
+/// this class outlives the release it was written by.
+const STATE_VERSION: u32 = 2;
 
 /// How much address space the peripheral occupies.
 ///
@@ -159,8 +305,14 @@ const CR1_SSI: u16 = 1 << 8;
 const CR1_SSM: u16 = 1 << 9;
 /// Receive only.
 const CR1_RXONLY: u16 = 1 << 10;
-/// Data frame format: set is sixteen bits, clear is eight.
+/// Data frame format: set is sixteen bits, clear is eight. `"f4"` only.
 const CR1_DFF: u16 = 1 << 11;
+/// The same bit on the `"f7"` block, where it is the CRC *length*: set is a
+/// sixteen-bit CRC, clear an eight-bit one (RM0351 §42.6.1). The frame size
+/// moved to `CR2.DS`, so bit 11 was free to mean something else — which is why
+/// an F4 driver that writes `DFF` here gets a wider CRC and the same eight-bit
+/// frames it started with.
+const CR1_CRCL: u16 = 1 << 11;
 /// The next transfer carries the CRC.
 const CR1_CRCNEXT: u16 = 1 << 12;
 /// Hardware CRC calculation enable.
@@ -186,9 +338,38 @@ const CR2_ERRIE: u16 = 1 << 5;
 const CR2_RXNEIE: u16 = 1 << 6;
 /// Tx buffer empty interrupt enable.
 const CR2_TXEIE: u16 = 1 << 7;
-/// Everything `CR2` defines. Bit 3 is forced to zero by hardware (§28.5.2).
-const CR2_MASK: u16 =
+/// Everything the `"f4"` `CR2` defines. Bit 3 is forced to zero by hardware
+/// (§28.5.2).
+const CR2_MASK_F4: u16 =
     CR2_RXDMAEN | CR2_TXDMAEN | CR2_SSOE | CR2_FRF | CR2_ERRIE | CR2_RXNEIE | CR2_TXEIE;
+
+// -- CR2, the `"f7"` additions (RM0351 §42.6.2) ------------------------------
+
+/// NSS pulse management: pulse NSS between frames. Stored, not acted on — see
+/// the module docs.
+const CR2_NSSP: u16 = 1 << 3;
+/// Data size, bits 11:8. The field holds `bits - 1`.
+const CR2_DS_SHIFT: u32 = 8;
+/// And its mask, once shifted down.
+const CR2_DS_MASK: u16 = 0xf;
+/// The code `DS` holds for eight bits, which is what the hardware forces when
+/// software writes one of the three "not used" values below it.
+const DS_CODE_EIGHT: u16 = 0b0111;
+/// The smallest `DS` code the manual defines: four-bit frames.
+const DS_CODE_MIN: u16 = 0b0011;
+/// FIFO reception threshold: set, `RXNE` rises at one byte; clear, at two.
+const CR2_FRXTH: u16 = 1 << 12;
+/// The number of data to receive by DMA is odd.
+const CR2_LDMA_RX: u16 = 1 << 13;
+/// The number of data to transmit by DMA is odd.
+const CR2_LDMA_TX: u16 = 1 << 14;
+/// Everything the `"f7"` `CR2` defines. Bit 15 is reserved.
+const CR2_MASK_FIFO: u16 =
+    CR2_MASK_F4 | CR2_NSSP | (CR2_DS_MASK << CR2_DS_SHIFT) | CR2_FRXTH | CR2_LDMA_RX | CR2_LDMA_TX;
+
+/// What `CR2` powers up with on the `"f7"` block: `DS` at eight bits, which is
+/// the whole of RM0351 §42.6.2's `0x0700` reset value.
+const CR2_RESET_FIFO: u16 = DS_CODE_EIGHT << CR2_DS_SHIFT;
 
 // -- SR (§28.5.3) -----------------------------------------------------------
 
@@ -208,12 +389,27 @@ const SR_OVR: u16 = 1 << 6;
 const SR_BSY: u16 = 1 << 7;
 /// TI-mode frame error. Never set here; see the module docs.
 const SR_FRE: u16 = 1 << 8;
+/// FIFO reception level, bits 10:9. `"f7"` only (RM0351 §42.6.3).
+const SR_FRLVL_SHIFT: u32 = 9;
+/// FIFO transmission level, bits 12:11.
+const SR_FTLVL_SHIFT: u32 = 11;
+/// The two-bit field both levels are.
+const SR_LVL_MASK: u16 = 0x3;
+/// Both level fields at once, for clearing them before they are recomputed.
+const SR_LEVELS: u16 = (SR_LVL_MASK << SR_FRLVL_SHIFT) | (SR_LVL_MASK << SR_FTLVL_SHIFT);
 
 /// What `SR` reads as out of reset: the transmit buffer is empty.
 const SR_RESET: u16 = SR_TXE;
 
 /// The polynomial `CRCPR` powers up with (§28.5.5).
 const CRCPR_RESET: u16 = 0x0007;
+
+/// How deep each `"f7"` FIFO is, in bytes.
+///
+/// RM0351 §42.4.9 calls it a 32-bit FIFO, so four bytes — which is four frames
+/// at `DS ≤ 8` and two at `DS > 8`, because the FIFO is a byte FIFO and a wide
+/// frame takes two of them.
+const FIFO_BYTES: usize = 4;
 
 /// What `I2SPR` powers up with (§28.5.9).
 const I2SPR_RESET: u16 = 0x0002;
@@ -248,12 +444,160 @@ pub mod pin {
 }
 
 // ---------------------------------------------------------------------------
+// the variant
+// ---------------------------------------------------------------------------
+
+/// Which generation of the block an instance is.
+///
+/// The module docs say why this is a property rather than a second class, and
+/// what each value costs a driver written for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// RM0090 §28: one word each way, `CR1.DFF` picks eight or sixteen bits.
+    /// F1, F2, F4, L1.
+    F4,
+    /// RM0351 §42: a four-byte FIFO each way and a four-to-sixteen-bit
+    /// `CR2.DS`. F0, F3, F7, L4, L4+, L5, G0, G4, WB.
+    Fifo,
+}
+
+impl Variant {
+    /// The name a machine description writes.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Variant::F4 => "f4",
+            Variant::Fifo => "f7",
+        }
+    }
+
+    /// Every name [`Variant::from_name`] answers to, for the validator.
+    pub const NAMES: &'static [&'static str] = &["f4", "f7"];
+
+    /// The variant `name` refers to, if it is one.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Variant> {
+        match name {
+            "f4" => Some(Variant::F4),
+            "f7" => Some(Variant::Fifo),
+            _ => None,
+        }
+    }
+
+    /// Whether this generation has the FIFOs.
+    const fn has_fifo(self) -> bool {
+        matches!(self, Variant::Fifo)
+    }
+
+    /// The bits `CR2` keeps out of a write.
+    const fn cr2_mask(self) -> u16 {
+        match self {
+            Variant::F4 => CR2_MASK_F4,
+            Variant::Fifo => CR2_MASK_FIFO,
+        }
+    }
+
+    /// What `CR2` powers up with.
+    const fn cr2_reset(self) -> u16 {
+        match self {
+            Variant::F4 => 0,
+            Variant::Fifo => CR2_RESET_FIFO,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the FIFO
+// ---------------------------------------------------------------------------
+
+/// One of the `"f7"` block's four-byte FIFOs (RM0351 §42.4.9).
+///
+/// A **byte** FIFO, because that is what the silicon has: a frame of eight bits
+/// or fewer occupies one entry and a wider one occupies two, which is what
+/// makes `FRLVL`/`FTLVL` count in bytes and what makes the access width of a
+/// `DR` access decide how many frames it moves.
+///
+/// Four bytes shift rather than wrap. A ring would need a head index in the
+/// snapshot for no gain at this depth, and a straight array compares equal
+/// only when the *contents* are equal, which is what the round-trip test wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Fifo {
+    bytes: [u8; FIFO_BYTES],
+    len: u8,
+}
+
+impl Fifo {
+    /// How many bytes are in it.
+    const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// How many more bytes it can take.
+    const fn free(&self) -> usize {
+        FIFO_BYTES - self.len as usize
+    }
+
+    /// Append `byte`, or report that there was no room.
+    ///
+    /// RM0351 §42.4.9: a write to a full Tx FIFO is ignored, and a frame that
+    /// completes with a full Rx FIFO sets `OVR` — so neither direction wants a
+    /// panic here, and both want to know.
+    fn push(&mut self, byte: u8) -> bool {
+        if self.len() == FIFO_BYTES {
+            return false;
+        }
+        self.bytes[self.len()] = byte;
+        self.len += 1;
+        true
+    }
+
+    /// Take the oldest byte.
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let byte = self.bytes[0];
+        self.bytes.copy_within(1.., 0);
+        self.len -= 1;
+        self.bytes[self.len()] = 0;
+        Some(byte)
+    }
+
+    /// The byte `n` places along, without taking it. The debug path.
+    const fn at(&self, n: usize) -> Option<u8> {
+        if n >= self.len as usize {
+            None
+        } else {
+            Some(self.bytes[n])
+        }
+    }
+
+    /// Drop everything.
+    fn clear(&mut self) {
+        *self = Fifo::default();
+    }
+
+    /// The two-bit level code `FRLVL`/`FTLVL` report for `bytes` occupancy.
+    ///
+    /// RM0351 §42.6.3 gives four codes — empty, quarter, half, full — for a
+    /// four-byte FIFO, which has five occupancies. Three bytes has no code of
+    /// its own, so it saturates into `11` along with four; the module docs say
+    /// so, because `00` is the only code a driver can treat as exact.
+    const fn level(bytes: usize) -> u16 {
+        if bytes >= 3 { 3 } else { bytes as u16 }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // state
 // ---------------------------------------------------------------------------
 
 /// Everything the guest can see or change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct State {
+    /// Which generation this instance is. Construction-time and never moves,
+    /// but it lives here because every decision in the engine consults it.
+    variant: Variant,
     /// Domain ticks simulated. The authoritative copy; the atomic mirrors it.
     ticks: u64,
     cr1: u16,
@@ -293,14 +637,33 @@ struct State {
     /// Whether `SR` has been accessed since `MODF` set, which is the first
     /// half of §28.3.10's other clearing sequence.
     modf_sr_seen: bool,
+
+    // -- `"f7"` only ---------------------------------------------------------
+    /// The transmit FIFO. Unused, and always empty, on an `"f4"`.
+    tx_fifo: Fifo,
+    /// The receive FIFO.
+    rx_fifo: Fifo,
+    /// The high byte of the last packed `DR` write, held back by `LDMA_TX`
+    /// until another write promotes it. See the module docs.
+    tx_held: Option<u8>,
+    /// How many frames of the CRC transfer are still to go, or zero.
+    ///
+    /// One for every `"f4"` CRC and for a `"f7"` CRC that fits in a frame;
+    /// more when `CRCL` is wider than `DS`, which is the ordinary
+    /// sixteen-bit-CRC-over-eight-bit-data case.
+    crc_left: u8,
+    /// The CRC being reassembled from those frames as they arrive.
+    crc_in: u16,
 }
 
-impl Default for State {
-    fn default() -> State {
+impl State {
+    /// A freshly reset peripheral of `variant`.
+    fn new(variant: Variant) -> State {
         State {
+            variant,
             ticks: 0,
             cr1: 0,
-            cr2: 0,
+            cr2: variant.cr2_reset(),
             sr: SR_RESET,
             tx: 0,
             rx: 0,
@@ -323,16 +686,75 @@ impl Default for State {
             nss_in: Level::High,
             ovr_dr_read: false,
             modf_sr_seen: false,
+            tx_fifo: Fifo::default(),
+            rx_fifo: Fifo::default(),
+            tx_held: None,
+            crc_left: 0,
+            crc_in: 0,
         }
     }
-}
 
-impl State {
-    /// The framing `CR1` describes (§28.5.1).
+    /// How many bits a frame carries.
+    ///
+    /// `CR1.DFF` on an `"f4"` (§28.5.1); `CR2.DS[3:0] + 1` on an `"f7"`, where
+    /// RM0351 §42.6.2 forces the three codes below `0b0011` to eight bits. The
+    /// forcing also happens on the way *in*, so a read-back of `CR2` agrees
+    /// with this — it is here as well because `CR2` can be restored from a
+    /// snapshot written by a version that did not force it.
+    fn frame_bits(&self) -> u8 {
+        match self.variant {
+            Variant::F4 => {
+                if self.cr1 & CR1_DFF != 0 {
+                    16
+                } else {
+                    8
+                }
+            }
+            Variant::Fifo => {
+                let code = (self.cr2 >> CR2_DS_SHIFT) & CR2_DS_MASK;
+                let code = if code < DS_CODE_MIN {
+                    DS_CODE_EIGHT
+                } else {
+                    code
+                };
+                (code + 1) as u8
+            }
+        }
+    }
+
+    /// How many FIFO bytes one frame occupies: one, or two above eight bits.
+    fn frame_bytes(&self) -> usize {
+        if self.frame_bits() > 8 { 2 } else { 1 }
+    }
+
+    /// How wide the CRC calculators are.
+    ///
+    /// The frame width on an `"f4"`, where §28.3.6 ties the two together
+    /// ("CRC8 for 8-bit data, CRC16 for 16-bit data"); `CR1.CRCL` on an
+    /// `"f7"`, where RM0351 §42.6.1 unties them.
+    fn crc_bits(&self) -> u8 {
+        match self.variant {
+            Variant::F4 => self.frame_bits(),
+            Variant::Fifo => {
+                if self.cr1 & CR1_CRCL != 0 {
+                    16
+                } else {
+                    8
+                }
+            }
+        }
+    }
+
+    /// How many frames the CRC takes to send, most significant first.
+    fn crc_frames(&self) -> u8 {
+        self.crc_bits().div_ceil(self.frame_bits()).max(1)
+    }
+
+    /// The framing `CR1` and `CR2` describe.
     fn format(&self) -> Format {
         Format::new(
             Mode::from_cpol_cpha(self.cr1 & CR1_CPOL != 0, self.cr1 & CR1_CPHA != 0),
-            if self.cr1 & CR1_DFF != 0 { 16 } else { 8 },
+            self.frame_bits(),
             if self.cr1 & CR1_LSBFIRST != 0 {
                 BitOrder::LsbFirst
             } else {
@@ -406,6 +828,153 @@ impl State {
     fn nss_output_low(&self) -> bool {
         self.is_master() && self.is_enabled() && self.cr1 & CR1_SSM == 0 && self.cr2 & CR2_SSOE != 0
     }
+
+    // -- the `"f7"` data path ------------------------------------------------
+
+    /// How many bytes are queued to go out, the held one included.
+    ///
+    /// `LDMA_TX`'s held byte is *in* the FIFO as far as the guest can tell —
+    /// it occupies an entry and it is going to be sent — so it counts towards
+    /// `FTLVL` and towards `TXE`. What it does not do is start a frame.
+    fn tx_total(&self) -> usize {
+        self.tx_fifo.len() + usize::from(self.tx_held.is_some())
+    }
+
+    /// How many bytes must be in the Rx FIFO for `RXNE` to rise.
+    ///
+    /// `CR2.FRXTH` decides it (RM0351 §42.6.2), except at the very end of an
+    /// odd-length DMA read: with `LDMA_RX` set and the stream drained — nothing
+    /// in flight and nothing left to send — a lone byte can only be the odd
+    /// last one, so it raises `RXNE` even with `FRXTH` clear. See the module
+    /// docs for why that condition is the one a register block can know.
+    fn rxne_threshold(&self) -> usize {
+        if self.cr2 & (CR2_LDMA_RX | CR2_RXDMAEN) == (CR2_LDMA_RX | CR2_RXDMAEN)
+            && !self.busy
+            && self.tx_total() == 0
+        {
+            return 1;
+        }
+        if self.cr2 & CR2_FRXTH != 0 { 1 } else { 2 }
+    }
+
+    /// Recompute the flags the FIFO levels derive.
+    ///
+    /// A no-op on an `"f4"`, which has no levels and whose `TXE`, `RXNE` and
+    /// `BSY` are set and cleared at the moments §28.3.7 names. On an `"f7"`
+    /// all four are *functions of the fill*, so they are recomputed rather
+    /// than edited, and every path that touches a FIFO ends here.
+    fn refresh(&mut self) {
+        if !self.variant.has_fifo() {
+            return;
+        }
+        let tx = self.tx_total();
+        let rx = self.rx_fifo.len();
+        self.sr = (self.sr & !SR_LEVELS)
+            | (Fifo::level(rx) << SR_FRLVL_SHIFT)
+            | (Fifo::level(tx) << SR_FTLVL_SHIFT);
+        // §42.4.9: `TXE` is "at or below half", not "empty".
+        if tx <= FIFO_BYTES / 2 {
+            self.sr |= SR_TXE;
+        } else {
+            self.sr &= !SR_TXE;
+        }
+        if rx > 0 && rx >= self.rxne_threshold() {
+            self.sr |= SR_RXNE;
+        } else {
+            self.sr &= !SR_RXNE;
+        }
+        // "A frame is being shifted, or the Tx FIFO is not empty" — and a CRC
+        // transfer still owing a frame counts, because a driver polling `BSY`
+        // before dropping its chip select would otherwise cut the CRC in half.
+        // A disabled peripheral is not busy whatever it is holding, which is
+        // the same clause `SPE` falling already relies on.
+        if self.busy || (self.is_enabled() && (tx > 0 || self.crc_left > 0)) {
+            self.sr |= SR_BSY;
+        } else {
+            self.sr &= !SR_BSY;
+        }
+    }
+
+    /// Take the next outgoing frame, right-aligned, or report there is none.
+    ///
+    /// One buffer on an `"f4"`; `frame_bytes()` little-endian bytes out of the
+    /// Tx FIFO on an `"f7"`, so a nine-bit frame waits for its second byte
+    /// rather than going out half-formed.
+    fn pop_tx_frame(&mut self) -> Option<u16> {
+        match self.variant {
+            Variant::F4 => {
+                if !self.tx_pending {
+                    return None;
+                }
+                self.tx_pending = false;
+                Some(self.tx)
+            }
+            Variant::Fifo => {
+                let need = self.frame_bytes();
+                if self.tx_fifo.len() < need {
+                    return None;
+                }
+                let lo = u16::from(self.tx_fifo.pop().unwrap_or(0));
+                let word = if need == 2 {
+                    lo | (u16::from(self.tx_fifo.pop().unwrap_or(0)) << 8)
+                } else {
+                    lo
+                };
+                Some((u32::from(word) & self.format().mask()) as u16)
+            }
+        }
+    }
+
+    /// What [`State::pop_tx_frame`] would answer, without taking it.
+    fn peek_tx_frame(&self) -> Option<u16> {
+        match self.variant {
+            Variant::F4 => self.tx_pending.then_some(self.tx),
+            Variant::Fifo => {
+                let need = self.frame_bytes();
+                if self.tx_fifo.len() < need {
+                    return None;
+                }
+                let lo = u16::from(self.tx_fifo.at(0)?);
+                let word = if need == 2 {
+                    lo | (u16::from(self.tx_fifo.at(1)?) << 8)
+                } else {
+                    lo
+                };
+                Some((u32::from(word) & self.format().mask()) as u16)
+            }
+        }
+    }
+
+    /// Queue `byte` to go out, dropping it if the FIFO is full.
+    ///
+    /// §42.4.9: a write to a full Tx FIFO is ignored. `TXE` is what stops a
+    /// driver getting here, and one that writes anyway loses the byte exactly
+    /// as it would on the part.
+    fn push_tx_byte(&mut self, byte: u8) {
+        let _ = self.tx_fifo.push(byte);
+    }
+
+    /// Whether `LDMA_TX`'s held byte applies to this write.
+    ///
+    /// §42.6.2 gates it on `TXDMAEN`, and packing only exists at `DS ≤ 8`.
+    fn ldma_tx_active(&self) -> bool {
+        self.variant.has_fifo()
+            && self.cr2 & (CR2_LDMA_TX | CR2_TXDMAEN) == (CR2_LDMA_TX | CR2_TXDMAEN)
+            && self.frame_bytes() == 1
+    }
+
+    /// Empty the transmit side, held byte included.
+    ///
+    /// What `SPE` falling does. §42.4.10's disable procedure says to wait for
+    /// `FTLVL == 00` first; a guest that does not wait would otherwise leave
+    /// `BSY` set for ever, since nothing clocks a disabled peripheral. The
+    /// **receive** FIFO is deliberately left alone — the manual lets a driver
+    /// read what already arrived after disabling.
+    fn flush_tx(&mut self) {
+        self.tx_fifo.clear();
+        self.tx_held = None;
+        self.tx_pending = false;
+    }
 }
 
 /// One turn of the CRC, MSB first.
@@ -415,8 +984,12 @@ impl State {
 /// recurrence down, so this is the conventional non-reflected, zero-initial
 /// form, and a guest checking a CRC against a peer that uses another
 /// convention will disagree with this model exactly as it would with itself.
-fn crc_step(crc: u16, data: u16, bits: u8, poly: u16) -> u16 {
-    let width = u32::from(bits);
+///
+/// `data_bits` and `crc_bits` are separate because RM0351 §42.6.1's `CRCL`
+/// unties them: an `"f7"` may run a sixteen-bit CRC over five-bit frames. On
+/// an `"f4"` they are always equal and this is the function it always was.
+fn crc_step(crc: u16, data: u16, data_bits: u8, crc_bits: u8, poly: u16) -> u16 {
+    let width = u32::from(crc_bits);
     let mask: u32 = if width >= 32 {
         u32::MAX
     } else {
@@ -424,7 +997,7 @@ fn crc_step(crc: u16, data: u16, bits: u8, poly: u16) -> u16 {
     };
     let top = 1u32 << (width - 1);
     let mut acc = u32::from(crc) & mask;
-    for i in (0..width).rev() {
+    for i in (0..u32::from(data_bits)).rev() {
         let bit = (u32::from(data) >> i) & 1;
         let msb = acc & top != 0;
         acc = (acc << 1) & mask;
@@ -458,6 +1031,9 @@ struct Pins {
 /// Everything both halves of the device reach.
 struct Shared {
     state: Mutex<State>,
+    /// Which generation this instance is. Construction-time, so `reset` can
+    /// rebuild a [`State`] without consulting the one it is replacing.
+    variant: Variant,
     /// How words reach the slaves, written down in the machine file.
     link: Link,
     /// The bus this peripheral drives as a master, transactionally.
@@ -485,7 +1061,9 @@ struct Shared {
 impl fmt::Debug for Shared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Shared");
-        s.field("link", &self.link).field("cs", &self.cs);
+        s.field("variant", &self.variant)
+            .field("link", &self.link)
+            .field("cs", &self.cs);
         match self.state.try_lock() {
             Some(state) => s.field("state", &*state).finish(),
             None => s.field("state", &"<in use>").finish(),
@@ -498,6 +1076,10 @@ impl Stm32Spi {
     ///
     /// Properties:
     ///
+    /// * `variant` — `"f4"` (RM0090 §28, no FIFO) or `"f7"` (RM0351 §42, a
+    ///   four-byte FIFO each way and a four-to-sixteen-bit `DS`). Defaults to
+    ///   `"f4"`; the module docs say why this is a property and what a driver
+    ///   written for one sees on the other.
     /// * `link` — `"transactional"` or `"wired"`. Required, and deliberately
     ///   so: `docs/buses/low-speed.md` asks for the choice to be made rather
     ///   than defaulted into.
@@ -512,6 +1094,8 @@ impl Stm32Spi {
     /// of range.
     pub fn new(props: &Props) -> Result<Stm32Spi> {
         let mut r = props.reader();
+        let variant =
+            Variant::from_name(r.or_enum("variant", "f4", Variant::NAMES)?).unwrap_or(Variant::F4);
         let link_name = r.require_str("link")?.to_string();
         let bus_name = r.optional_str("bus")?.map(String::from);
         let cs = r.or_range("cs", 0u64, 0..=(MAX_CHIP_SELECTS as u64 - 1))?;
@@ -538,14 +1122,20 @@ impl Stm32Spi {
             .as_deref()
             .map(|name| buses::attach(props, name))
             .transpose()?;
-        Ok(Stm32Spi::with_bus(link, bus, ChipSelect(cs as u8)))
+        Ok(Stm32Spi::with_bus(variant, link, bus, ChipSelect(cs as u8)))
     }
 
     /// A peripheral on a bus the caller already holds.
     #[must_use]
-    pub fn with_bus(link: Link, bus: Option<Arc<SpiBus>>, cs: ChipSelect) -> Stm32Spi {
+    pub fn with_bus(
+        variant: Variant,
+        link: Link,
+        bus: Option<Arc<SpiBus>>,
+        cs: ChipSelect,
+    ) -> Stm32Spi {
         let shared = Arc::new(Shared {
-            state: Mutex::with_rank(LockRank::DEVICE, State::default()),
+            state: Mutex::with_rank(LockRank::DEVICE, State::new(variant)),
+            variant,
             link,
             bus,
             cs,
@@ -573,6 +1163,12 @@ impl Stm32Spi {
             pins,
             region,
         }
+    }
+
+    /// Which generation of the block this is.
+    #[must_use]
+    pub fn variant(&self) -> Variant {
+        self.shared.variant
     }
 
     /// How this peripheral carries a word.
@@ -636,18 +1232,38 @@ enum Emit {
 }
 
 impl Shared {
-    fn publish(&self, state: &State) {
+    /// Republish what the lock-free side reads, after recomputing the flags a
+    /// FIFO fill decides.
+    ///
+    /// Taking `&mut` is what keeps [`State::refresh`] from being forgotten:
+    /// every path that ends in a publish gets its levels, `TXE`, `RXNE` and
+    /// `BSY` brought into line with the FIFOs first, and on an `"f4"` the
+    /// refresh is a no-op.
+    fn publish(&self, state: &mut State) {
+        state.refresh();
         self.ticks.store(state.ticks, Ordering::Relaxed);
         self.next_event
             .store(Shared::next_event(state), Ordering::Relaxed);
     }
 
+    /// Whether a master has a frame it could start on the next tick.
+    ///
+    /// A receive-only master always has one — it clocks itself for as long as
+    /// it is enabled (§28.3.4) — and so does one with a whole frame waiting in
+    /// its Tx FIFO or a CRC transfer part-way through. The last two matter
+    /// because the `"f7"` block can hold several frames: without them the
+    /// device would fall idle with work queued and nothing would wake it, since
+    /// only a register write calls [`Shared::begin`] from outside.
+    fn pending(state: &State) -> bool {
+        state.is_master()
+            && state.is_enabled()
+            && (state.receive_only() || state.crc_left > 0 || state.peek_tx_frame().is_some())
+    }
+
     /// The tick the next thing happens on, or [`NO_EVENT`].
     fn next_event(state: &State) -> u64 {
         if !state.busy {
-            // A receive-only master clocks itself for as long as it is
-            // enabled, so it is never idle (§28.3.4).
-            if state.is_master() && state.is_enabled() && state.receive_only() {
+            if Shared::pending(state) {
                 return state.ticks.saturating_add(1);
             }
             return NO_EVENT;
@@ -767,29 +1383,46 @@ impl Shared {
             return false;
         }
         // §28.3.6: with `CRCNEXT` set the next frame carries the CRC instead
-        // of the data, and the calculators are frozen while it does.
-        let crc_frame = state.cr1 & CR1_CRCEN != 0 && state.cr1 & CR1_CRCNEXT != 0;
-        if crc_frame {
-            state.shift = state.txcrc;
+        // of the data, and the calculators are frozen while it does. §42.4.11
+        // adds only that the CRC may be wider than a frame, in which case it
+        // takes more than one of them.
+        if state.crc_left == 0 && state.cr1 & (CR1_CRCEN | CR1_CRCNEXT) == (CR1_CRCEN | CR1_CRCNEXT)
+        {
+            state.crc_left = state.crc_frames();
+            state.crc_in = 0;
             state.cr1 &= !CR1_CRCNEXT;
+        }
+        if state.crc_left > 0 {
+            // Most significant frame first, which is the order the bits go out
+            // in and so the order they have to be cut in.
+            let shift = u32::from(state.frame_bits()) * u32::from(state.crc_left - 1);
+            let word = if shift >= 16 {
+                0
+            } else {
+                u32::from(state.txcrc) >> shift
+            };
+            state.shift = (word & state.format().mask()) as u16;
+            state.crc_frame = true;
         } else if state.receive_only() {
             // §28.3.4: the clock free-runs and nothing is driven out.
             state.shift = 0xffff;
-        } else if state.tx_pending {
-            state.shift = state.tx;
-            state.tx_pending = false;
+            state.crc_frame = false;
+        } else if let Some(frame) = state.pop_tx_frame() {
+            state.shift = frame;
+            state.crc_frame = false;
         } else {
             return false;
         }
-        state.crc_frame = crc_frame;
         // The Tx buffer emptied into the shift register, which is exactly what
-        // §28.3.7 says sets `TXE`.
+        // §28.3.7 says sets `TXE`. On an `"f7"` `TXE` is a function of the
+        // fill instead, and `refresh` below overwrites this.
         state.sr |= SR_TXE;
         state.sr |= SR_BSY;
         state.busy = true;
         state.started = state.ticks;
         state.edges = 0;
         state.shift_in = 0;
+        state.refresh();
         true
     }
 
@@ -800,33 +1433,69 @@ impl Shared {
         state.busy = false;
         state.sr &= !SR_BSY;
         if state.crc_frame {
-            // §28.3.6: at the end of a CRC frame the received word is compared
-            // with the calculated one.
-            if received != state.rxcrc {
-                state.sr |= SR_CRCERR;
+            // §28.3.6: at the end of a CRC transfer the received value is
+            // compared with the calculated one. Reassembled across however many
+            // frames it took, most significant first.
+            let bits = u32::from(state.frame_bits());
+            state.crc_in = ((u32::from(state.crc_in) << bits) | u32::from(received)) as u16;
+            state.crc_left = state.crc_left.saturating_sub(1);
+            if state.crc_left == 0 {
+                state.crc_frame = false;
+                let crc_bits = u32::from(state.crc_bits());
+                let mask = if crc_bits >= 16 {
+                    u16::MAX
+                } else {
+                    (1u16 << crc_bits) - 1
+                };
+                if state.crc_in & mask != state.rxcrc & mask {
+                    state.sr |= SR_CRCERR;
+                }
             }
-            state.crc_frame = false;
+            state.refresh();
             return;
         }
         if state.cr1 & CR1_CRCEN != 0 {
             let poly = state.crcpr;
-            let bits = format.bits;
-            state.txcrc = crc_step(state.txcrc, state.shift, bits, poly);
-            state.rxcrc = crc_step(state.rxcrc, received, bits, poly);
+            let data_bits = format.bits;
+            let crc_bits = state.crc_bits();
+            state.txcrc = crc_step(state.txcrc, state.shift, data_bits, crc_bits, poly);
+            state.rxcrc = crc_step(state.rxcrc, received, data_bits, crc_bits, poly);
         }
         if state.transmit_only() {
             // §28.3.4: nothing arrives on a wire the peripheral is driving.
+            state.refresh();
             return;
         }
-        if state.sr & SR_RXNE != 0 {
-            // §28.3.10: "the receiver buffer contents are not updated with the
-            // newly received data" — the buffer freezes and the frame is lost.
-            state.sr |= SR_OVR;
-            state.ovr_dr_read = false;
-        } else {
-            state.rx = received;
-            state.sr |= SR_RXNE;
+        match state.variant {
+            Variant::F4 => {
+                if state.sr & SR_RXNE != 0 {
+                    // §28.3.10: "the receiver buffer contents are not updated
+                    // with the newly received data" — the buffer freezes and
+                    // the frame is lost.
+                    state.sr |= SR_OVR;
+                    state.ovr_dr_read = false;
+                } else {
+                    state.rx = received;
+                    state.sr |= SR_RXNE;
+                }
+            }
+            Variant::Fifo => {
+                // §42.4.9: a frame that completes with no room left in the Rx
+                // FIFO is lost and sets `OVR`. Room is counted in *bytes*,
+                // because a wide frame needs two of them.
+                let need = state.frame_bytes();
+                if state.rx_fifo.free() < need {
+                    state.sr |= SR_OVR;
+                    state.ovr_dr_read = false;
+                } else {
+                    state.rx_fifo.push(received as u8);
+                    if need == 2 {
+                        state.rx_fifo.push((received >> 8) as u8);
+                    }
+                }
+            }
         }
+        state.refresh();
     }
 
     /// The bit of the shift register that goes out for bit index `n`.
@@ -874,11 +1543,11 @@ impl Shared {
                     // A receive-only master starts the next frame the instant
                     // the previous one ends, for as long as `SPE` stands.
                     if state.ticks < target && Shared::begin(&mut state) {
-                        self.publish(&state);
+                        self.publish(&mut state);
                         Step::Present
                     } else {
                         state.ticks = state.ticks.max(target);
-                        self.publish(&state);
+                        self.publish(&mut state);
                         Step::Done
                     }
                 } else {
@@ -888,7 +1557,7 @@ impl Shared {
                             let end = state.end_tick();
                             if end > target {
                                 state.ticks = target;
-                                self.publish(&state);
+                                self.publish(&mut state);
                                 Step::Done
                             } else {
                                 state.ticks = end;
@@ -901,7 +1570,7 @@ impl Shared {
                                 .saturating_add((u64::from(state.edges) + 1) * half);
                             if edge_at > target {
                                 state.ticks = target;
-                                self.publish(&state);
+                                self.publish(&mut state);
                                 Step::Done
                             } else {
                                 state.ticks = edge_at;
@@ -928,7 +1597,7 @@ impl Shared {
                                     let received = state.shift_in as u16;
                                     Shared::finish(&mut state, received);
                                 }
-                                self.publish(&state);
+                                self.publish(&mut state);
                                 Step::Edges(out)
                             }
                         }
@@ -956,7 +1625,7 @@ impl Shared {
                     {
                         let mut state = self.state.lock();
                         Shared::finish(&mut state, reply);
-                        self.publish(&state);
+                        self.publish(&mut state);
                     }
                     self.publish_irq();
                 }
@@ -1002,6 +1671,14 @@ impl Shared {
         state.sr &= !SR_BSY;
         state.nss_low = false;
         state.modf_sr_seen = false;
+        // `SPE` fell, so the transmit side goes with it — see `State::flush_tx`
+        // for why a peripheral nothing clocks may not be left holding bytes.
+        // A CRC transfer part-way through goes too, or re-enabling the
+        // peripheral would put its remaining frame on the wire out of nowhere.
+        state.flush_tx();
+        state.crc_left = 0;
+        state.crc_frame = false;
+        state.refresh();
         true
     }
 }
@@ -1037,6 +1714,14 @@ struct After {
 impl RegisterBlock {
     /// Read one register. `debug` suppresses every side effect.
     fn read_register(&self, offset: u64, debug: bool) -> u16 {
+        if offset == 0x0c && self.shared.variant.has_fifo() {
+            // The FIFO's `DR` is not a register with a value — how much it
+            // moves depends on the access width. [`MemOps::read`] calls
+            // [`RegisterBlock::read_dr_fifo`] with the real one; anything that
+            // arrives here without one gets the half-word semantics, which is
+            // what ST's own headers do by default.
+            return self.read_dr_fifo(2, debug);
+        }
         let mut state = self.shared.state.lock();
         match offset {
             0x00 => state.cr1,
@@ -1090,6 +1775,81 @@ impl RegisterBlock {
         }
     }
 
+    /// Pop `DR` on an `"f7"`, where the access width is part of the meaning.
+    ///
+    /// RM0351 §42.4.9: an 8-bit read takes **one** byte out of the Rx FIFO and
+    /// a 16-bit read takes **two**, so an eight-bit-frame driver can unpack a
+    /// pair in one access. Above eight bits a frame *is* two bytes, so any
+    /// access takes the whole frame.
+    ///
+    /// A short FIFO is not an error: a 16-bit read that finds one byte answers
+    /// with it in the low half and leaves the upper half zero, which is the
+    /// last read of an odd-length DMA (`LDMA_RX`, module docs).
+    ///
+    /// `debug` reads the same bytes and **pops nothing** — the `MemAttrs::debug`
+    /// rule, and the sharpest case of it in this file: a debugger that dumped
+    /// the block would eat the guest's data, and the guest would never know.
+    fn read_dr_fifo(&self, len: usize, debug: bool) -> u16 {
+        let mut state = self.shared.state.lock();
+        let want = if len == 1 && state.frame_bytes() == 1 {
+            1
+        } else {
+            2
+        };
+        if debug {
+            let lo = u16::from(state.rx_fifo.at(0).unwrap_or(0));
+            let hi = u16::from(state.rx_fifo.at(1).unwrap_or(0));
+            return if want == 1 { lo } else { lo | (hi << 8) };
+        }
+        let mut value = 0u16;
+        for i in 0..want {
+            match state.rx_fifo.pop() {
+                Some(byte) => value |= u16::from(byte) << (8 * i),
+                None => break,
+            }
+        }
+        if state.sr & SR_OVR != 0 {
+            // The first half of §28.3.10's clearing sequence, unchanged by the
+            // FIFO: a read of `DR`, then a read of `SR`.
+            state.ovr_dr_read = true;
+        }
+        state.refresh();
+        value
+    }
+
+    /// Push `DR` on an `"f7"`, where the access width is part of the meaning.
+    ///
+    /// The mirror of [`RegisterBlock::read_dr_fifo`]: an 8-bit write queues one
+    /// byte and a 16-bit write queues two, low byte first — two frames at
+    /// `DS ≤ 8`, one at `DS > 8`. A 32-bit write is not a width the manual
+    /// defines for `DR`; it is taken as its low half-word, which is the same
+    /// liberty the `"f4"` half already takes.
+    ///
+    /// `LDMA_TX` is the one wrinkle, and the module docs carry the argument.
+    fn write_dr_fifo(&self, src: &[u8]) -> After {
+        let mut after = After::default();
+        let mut state = self.shared.state.lock();
+        let two = src.len() > 1;
+        let lo = src[0];
+        let hi = if two { src[1] } else { 0 };
+        // Whatever the last packed write held back goes in ahead of this one:
+        // it was written first and the wire order is the write order.
+        if let Some(held) = state.tx_held.take() {
+            state.push_tx_byte(held);
+        }
+        state.push_tx_byte(lo);
+        if two {
+            if state.ldma_tx_active() {
+                state.tx_held = Some(hi);
+            } else {
+                state.push_tx_byte(hi);
+            }
+        }
+        after.started = Shared::begin(&mut state);
+        self.shared.publish(&mut state);
+        after
+    }
+
     /// Write one register, reporting what has to happen once the lock is
     /// released.
     fn write_register(&self, offset: u64, value: u16) -> After {
@@ -1125,6 +1885,12 @@ impl RegisterBlock {
                     // and clears `BSY` (§28.3.7).
                     state.busy = false;
                     state.sr &= !SR_BSY;
+                    // And empties the transmit side, which on an `"f7"` is
+                    // what keeps `BSY` — a function of `FTLVL` there — from
+                    // standing for ever. `State::flush_tx` has the argument.
+                    state.flush_tx();
+                    state.crc_left = 0;
+                    state.crc_frame = false;
                 }
                 Shared::check_mode_fault(&mut state);
                 if state.format() != was_format {
@@ -1137,18 +1903,39 @@ impl RegisterBlock {
                 }
                 after.started = Shared::begin(&mut state);
                 after.announce = true;
-                self.shared.publish(&state);
+                self.shared.publish(&mut state);
             }
             0x04 => {
                 let was_nss = state.nss_output_low();
-                state.cr2 = value & CR2_MASK;
+                let was_format = state.format();
+                let mut next = value & state.variant.cr2_mask();
+                if state.variant.has_fifo() {
+                    // §42.6.2: the three `DS` codes below `0b0011` are "not
+                    // used" and the hardware forces eight bits. Forcing it on
+                    // the way in is what makes a read-back tell the truth
+                    // rather than reporting a size the peripheral is not using.
+                    if (next >> CR2_DS_SHIFT) & CR2_DS_MASK < DS_CODE_MIN {
+                        next = (next & !(CR2_DS_MASK << CR2_DS_SHIFT))
+                            | (DS_CODE_EIGHT << CR2_DS_SHIFT);
+                    }
+                }
+                state.cr2 = next;
+                if !state.ldma_tx_active() {
+                    // The packed stream is over — `TXDMAEN` or `LDMA_TX` went
+                    // away — so the byte held back for a frame that will never
+                    // be asked for goes with it.
+                    state.tx_held = None;
+                }
+                if state.format() != was_format {
+                    after.reframe = true;
+                }
                 Shared::check_mode_fault(&mut state);
                 let nss = state.nss_output_low();
                 state.nss_low = nss;
                 if nss != was_nss {
                     after.nss = Some(nss);
                 }
-                self.shared.publish(&state);
+                self.shared.publish(&mut state);
             }
             0x08 => {
                 // §28.5.3: every bit is read-only except `CRCERR`, which is
@@ -1167,7 +1954,7 @@ impl RegisterBlock {
                 state.tx_pending = true;
                 state.sr &= !SR_TXE;
                 after.started = Shared::begin(&mut state);
-                self.shared.publish(&state);
+                self.shared.publish(&mut state);
             }
             0x10 => state.crcpr = value,
             // `RXCRCR` and `TXCRCR` are read-only (§28.5.6, §28.5.7).
@@ -1216,6 +2003,20 @@ impl MemOps for RegisterBlock {
             return Ok(());
         }
         self.shared.sync(attrs);
+        if register == 0x0c && self.shared.variant.has_fifo() {
+            // `DR` is a FIFO port, not a value in a word: the access width
+            // decides how much comes out, and the byte lane within the word
+            // does not enter into it — ST's own accessor is a `uint8_t` cast at
+            // offset zero and the manual defines nothing else.
+            let bytes = self.read_dr_fifo(dst.len(), attrs.debug).to_le_bytes();
+            for (i, byte) in dst.iter_mut().enumerate() {
+                *byte = bytes.get(i).copied().unwrap_or(0);
+            }
+            if !attrs.debug {
+                self.shared.publish_irq();
+            }
+            return Ok(());
+        }
         let value = u32::from(self.read_register(register, attrs.debug));
         let bytes = value.to_le_bytes();
         for (i, byte) in dst.iter_mut().enumerate() {
@@ -1247,6 +2048,13 @@ impl MemOps for RegisterBlock {
             return Ok(());
         }
         self.shared.sync(attrs);
+        if register == 0x0c && self.shared.variant.has_fifo() {
+            // As above, and for the same reason: how many frames this write
+            // queues is a property of how wide it is.
+            let after = self.write_dr_fifo(src);
+            self.settle(after);
+            return Ok(());
+        }
         // A byte write reaches its own lane of the sixteen-bit register; the
         // rest keeps what it had, which is what a narrow store on this bus
         // does.
@@ -1297,8 +2105,11 @@ impl SpiSlave for Shared {
             return u32::MAX;
         }
         let out = state.shift;
-        state.shift = state.tx;
-        state.tx_pending = false;
+        // The shift register reloads from whatever the transmit side holds —
+        // the single buffer on an `"f4"`, the head of the Tx FIFO on an
+        // `"f7"`. A slave with nothing queued repeats zeroes, which is what an
+        // unloaded shift register does.
+        state.shift = state.pop_tx_frame().unwrap_or(0);
         state.sr |= SR_TXE;
         Shared::finish(&mut state, mosi as u16);
         u32::from(out)
@@ -1309,7 +2120,7 @@ impl SpiSlave for Shared {
         if state.is_master() || !state.is_enabled() {
             return u32::MAX;
         }
-        u32::from(state.tx)
+        u32::from(state.peek_tx_frame().unwrap_or(0))
     }
 }
 
@@ -1385,9 +2196,9 @@ impl Device for Stm32Spi {
             *state = State {
                 ticks,
                 nss_in,
-                ..State::default()
+                ..State::new(self.shared.variant)
             };
-            self.shared.publish(&state);
+            self.shared.publish(&mut state);
         }
         self.shared.miso.store(true, Ordering::Relaxed);
         self.pins.reset();
@@ -1422,6 +2233,26 @@ impl Device for Stm32Spi {
         // untouched would make the guest's next read lie.
         w.write_bool(state.ovr_dr_read)?;
         w.write_bool(state.modf_sr_seen)?;
+        // The `"f7"` data path. Written unconditionally — an `"f4"`'s FIFOs are
+        // empty and cost nine bytes, and a chunk whose shape depended on a
+        // construction property would be one more thing a loader has to agree
+        // about before it can read the first field.
+        for byte in state.tx_fifo.bytes {
+            w.write_u8(byte)?;
+        }
+        w.write_u8(state.tx_fifo.len)?;
+        for byte in state.rx_fifo.bytes {
+            w.write_u8(byte)?;
+        }
+        w.write_u8(state.rx_fifo.len)?;
+        w.write_bool(state.tx_held.is_some())?;
+        w.write_u8(state.tx_held.unwrap_or(0))?;
+        // Where a multi-frame CRC transfer had got to. A snapshot taken between
+        // the two halves of a sixteen-bit CRC over eight-bit frames is a
+        // snapshot mid-CRC, and restoring it as "not started" would send the
+        // high half twice.
+        w.write_u8(state.crc_left)?;
+        w.write_u16(state.crc_in)?;
         let (rx, tx, count, selected, sck, mosi, loaded) = self.pins.snapshot();
         w.write_u32(rx)?;
         w.write_u32(tx)?;
@@ -1437,6 +2268,10 @@ impl Device for Stm32Spi {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let mut state = State {
+            // Not in the chunk: it is a construction property, and a snapshot
+            // restored into a differently built machine is a machine-shape
+            // mismatch rather than something to paper over here.
+            variant: self.shared.variant,
             ticks: r.read_u64()?,
             cr1: r.read_u16()?,
             cr2: r.read_u16()?,
@@ -1459,7 +2294,25 @@ impl Device for Stm32Spi {
             nss_in: Level::High,
             ovr_dr_read: r.read_bool()?,
             modf_sr_seen: r.read_bool()?,
+            tx_fifo: Fifo::default(),
+            rx_fifo: Fifo::default(),
+            tx_held: None,
+            crc_left: 0,
+            crc_in: 0,
         };
+        for i in 0..FIFO_BYTES {
+            state.tx_fifo.bytes[i] = r.read_u8()?;
+        }
+        state.tx_fifo.len = r.read_u8()?.min(FIFO_BYTES as u8);
+        for i in 0..FIFO_BYTES {
+            state.rx_fifo.bytes[i] = r.read_u8()?;
+        }
+        state.rx_fifo.len = r.read_u8()?.min(FIFO_BYTES as u8);
+        let held = r.read_bool()?;
+        let held_byte = r.read_u8()?;
+        state.tx_held = held.then_some(held_byte);
+        state.crc_left = r.read_u8()?;
+        state.crc_in = r.read_u16()?;
         let pins = (
             r.read_u32()?,
             r.read_u32()?,
@@ -1473,7 +2326,7 @@ impl Device for Stm32Spi {
             let mut slot = self.shared.state.lock();
             state.nss_in = slot.nss_in;
             *slot = state;
-            self.shared.publish(&slot);
+            self.shared.publish(&mut slot);
         }
         self.pins.restore(pins);
         self.shared.restore_nss(state.nss_low);
@@ -1595,9 +2448,17 @@ impl Instance for Stm32Spi {}
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "STM32F4 SPI (RM0090 §28): CR1/CR2/SR/DR/CRCPR, master and slave, the four \
-              CPOL/CPHA modes, 8- and 16-bit frames, SSM/SSI/SSOE and the mode fault",
+    summary: "STM32 SPI, F4 (RM0090 §28) or F0/F3/F7/L4/G4/WB (RM0351 §42) by `variant`: \
+              CR1/CR2/SR/DR/CRCPR, master and slave, the four CPOL/CPHA modes, SSM/SSI/SSOE \
+              and the mode fault, and on the later block a four-byte FIFO each way with \
+              FRLVL/FTLVL/FRXTH, a 4-to-16-bit DS, CRCL and LDMA_RX/LDMA_TX",
     properties: &[
+        PropertySpec {
+            name: "variant",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which generation: `f4` (no FIFO, DFF) or `f7` (FIFO, DS). Default `f4`",
+        },
         PropertySpec {
             name: "link",
             kind: ValueKind::Str,
@@ -1642,6 +2503,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
+        .prop(PropSchema::new("variant", ValueKind::Str).values(Variant::NAMES))
         .prop(
             PropSchema::new("link", ValueKind::Str)
                 .required()
