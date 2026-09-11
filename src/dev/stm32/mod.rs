@@ -15,6 +15,11 @@
 //! | [`dma`] | `st.dma` | a DMA controller in either family layout: eight streams (RM0090 §10) or seven channels (RM0351 §11) |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
 //! | [`tim`] | `st.tim` | a TIM timer in its basic, general-purpose or advanced form |
+//! | [`exti`] | `st.exti` | the external interrupt/event controller: what turns a pin edge into an NVIC request |
+//! | [`syscfg`] | `st.syscfg` | `EXTICR`, the pin multiplexer that decides which port drives each EXTI line |
+//! | [`crc`] | `st.crc` | the CRC calculation unit, fixed on an F4 and programmable from the F0/F3/F7/L4 on |
+//! | [`iwdg`] | `st.iwdg` | the independent watchdog: a down-counter on the LSI that resets the board |
+//! | [`wwdg`] | `st.wwdg` | the window watchdog, which also resets the board when a kick comes *early* |
 //!
 //! # Which part
 //!
@@ -70,6 +75,25 @@ pub mod octospi;
 #[cfg(feature = "dev-stm32-tim")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-tim")))]
 pub mod tim;
+#[cfg(feature = "dev-stm32-exti")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
+pub mod exti;
+
+#[cfg(feature = "dev-stm32-exti")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
+pub mod syscfg;
+
+#[cfg(feature = "dev-stm32-crc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-crc")))]
+pub mod crc;
+
+#[cfg(feature = "dev-stm32-wdg")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-wdg")))]
+pub mod iwdg;
+
+#[cfg(feature = "dev-stm32-wdg")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-wdg")))]
+pub mod wwdg;
 
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
@@ -109,6 +133,16 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     octospi::register(registry)?;
     #[cfg(feature = "dev-stm32-tim")]
     tim::register(registry)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    exti::register(registry)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    syscfg::register(registry)?;
+    #[cfg(feature = "dev-stm32-crc")]
+    crc::register(registry)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    iwdg::register(registry)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    wwdg::register(registry)?;
     Ok(())
 }
 
@@ -134,6 +168,16 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     octospi::bind(bindings)?;
     #[cfg(feature = "dev-stm32-tim")]
     tim::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    exti::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-exti")]
+    syscfg::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-crc")]
+    crc::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    iwdg::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-wdg")]
+    wwdg::bind(bindings)?;
     Ok(())
 }
 
@@ -153,14 +197,21 @@ pub fn schemas() -> Vec<ClassSchema> {
     #[cfg(feature = "dev-stm32-dma")]
     out.push(dma::schema());
     #[cfg(feature = "dev-stm32-sdmmc")]
-    out.push(sdmmc::schema());
+    out.extend([sdmmc::schema()]);
     #[cfg(feature = "dev-stm32-i2c")]
-    out.push(i2c::schema());
+    out.extend([i2c::schema()]);
     #[cfg(feature = "dev-stm32-spi")]
-    out.push(spi::schema());
+    out.extend([spi::schema()]);
     #[cfg(feature = "dev-stm32-octospi")]
     out.push(octospi::schema());
     #[cfg(feature = "dev-stm32-tim")]
     out.push(tim::schema());
+    out.extend([octospi::schema()]);
+    #[cfg(feature = "dev-stm32-exti")]
+    out.extend([exti::schema(), syscfg::schema()]);
+    #[cfg(feature = "dev-stm32-crc")]
+    out.extend([crc::schema()]);
+    #[cfg(feature = "dev-stm32-wdg")]
+    out.extend([iwdg::schema(), wwdg::schema()]);
     out
 }
