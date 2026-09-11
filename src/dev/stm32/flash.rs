@@ -38,16 +38,16 @@
 //! 3. **Two overlapping mappings**: a [`RamStore`]-backed region that answers
 //!    reads and fetches, and an I/O region at the same address that answers
 //!    writes. This is a shape `core::space` already has a name for — the
-//!    *directed split* in [`flat`](crate::core::space::flat), where
-//!    `FlatEntry::write_to` carries the write winner when it is not the read
-//!    winner — and it was built for a Master System cartridge that reads a ROM
-//!    bank and writes the RAM behind it. A flash array is the same board one
-//!    layer in.
+//!    *directed split* the flattener resolves with
+//!    [`FlatEntry::write_to`](crate::core::space::FlatEntry::write_to), which
+//!    carries the write winner when it is not the read winner — and it was
+//!    built for a Master System cartridge that reads a ROM bank and writes the
+//!    RAM behind it. A flash array is the same board one layer in.
 //!
 //! Option 3 is what is implemented. Reads and fetches resolve to
-//! `FlatTarget::Ram` and never call this device at all; writes resolve to
-//! [`Program`], which applies RM0090 §3.6 / RM0351 §3.3 and only then touches
-//! the store.
+//! `FlatTarget::Ram` and never call this device at all; writes resolve to the
+//! private `Program` handler, which applies RM0090 §3.6 / RM0351 §3.3 and only
+//! then touches the store.
 //!
 //! The two children live inside **one** container region, published as
 //! `flash.array`, rather than as two regions the board must map twice at the
