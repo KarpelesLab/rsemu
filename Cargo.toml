@@ -1327,6 +1327,28 @@ dev-stm32-dma = []
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-exti = []
 
+# The STM32L0/L4/L4+ Firewall (src/dev/stm32/firewall.rs): one class,
+# `st.firewall`, and the only peripheral in this tree whose answer to an
+# illegal access is to **reset the machine** rather than to raise a fault.
+# It fences three regions -- a code segment and a non-volatile data segment in
+# flash, a volatile data segment in SRAM1, each a start/length pair at 256- or
+# 64-byte granularity -- and lets nothing in except through the **call gate**,
+# the first word of the code segment. A jump into the middle of the protected
+# code, a read of the protected data by untrusted code, or a DMA write into a
+# closed volatile segment all pulse `reset`, which a board wires to the core
+# and to `rcc.fwrst` so `RCC_CSR.FWRSTF` says what happened. The exit protocol
+# is `FW_CR.FPA`: set it and leaving the code segment closes the firewall, leave
+# it clear and leaving is a reset. There is no enable bit -- clearing
+# `SYSCFG_CFGR1.FWDIS` is what switches it on, so `st.syscfg` drives a `fwdis`
+# pin and this feature is what makes that bit load-bearing. Because the state
+# machine is driven by *where the processor is fetching*, the device sits in the
+# bus path: it publishes a `bus` region the board maps as the processor's whole
+# address space and forwards to the real map behind it. Written from ST RM0351
+# S4 and S9.2.2 and ST RM0432 S4, with the register offsets cross-checked
+# against ST's own CMSIS FIREWALL_TypeDef; no emulator source was consulted
+# (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-firewall = []
+
 # The two STM32 watchdogs (src/dev/stm32/iwdg.rs, src/dev/stm32/wwdg.rs): two
 # classes, `st.iwdg` and `st.wwdg`. Both **reset the machine**, which is the
 # whole reason a bootloader arms one before jumping to an application, and

@@ -143,6 +143,7 @@ pub mod sms;
     feature = "dev-stm32-i2c-v2",
     feature = "dev-stm32-tim",
     feature = "dev-stm32-exti",
+    feature = "dev-stm32-firewall",
     feature = "dev-stm32-wdg",
     feature = "dev-stm32-crc",
     feature = "dev-stm32-flash",

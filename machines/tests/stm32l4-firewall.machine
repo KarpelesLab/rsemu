@@ -1,0 +1,116 @@
+# stm32l4-firewall - the smallest board with an STM32L4 Firewall on it.
+#
+# It models no product, and it is deliberately not in the catalog.
+# `machines/tests/` is where a board that exists for one test lives, beside
+# `two-uarts.machine` and `x86-mini.machine`: `rsemu machines` does not list
+# these, `every_shipped_machine_realizes` does not build them, and nothing here
+# is offered to a person as a machine to run. `tests/stm32l4_firewall.rs`
+# includes this file by path.
+#
+# ---------------------------------------------------------------------------
+# Why it exists
+# ---------------------------------------------------------------------------
+#
+# `st.firewall` is the one peripheral in this tree that is not beside the bus
+# but *in* it, and two of its three connections are wires whose whole content is
+# a number written in a machine file:
+#
+#   * `syscfg.fwdis -> fw.fwdis` is what switches the firewall on. There is no
+#     enable bit on the firewall itself; clearing `SYSCFG_CFGR1.FWDIS` is the
+#     enable, and a board that forgets this wire has a firewall that protects
+#     nothing while every unit test still passes.
+#   * `fw.reset -> rcc.fwrst` is what makes `RCC_CSR.FWRSTF` mean something.
+#     The flag is RCC's state, not the firewall's, exactly as `IWDGRSTF` is.
+#
+# Neither is visible below the machine layer, so both need a board to be tested
+# on, and no *shipped* board can be the one: an STM32F407 has no firewall, and a
+# complete L4 is a file's worth of peripherals this test does not need.
+#
+# ---------------------------------------------------------------------------
+# The two spaces
+# ---------------------------------------------------------------------------
+#
+# This is the part worth reading twice. The firewall's state machine is driven
+# by **where the processor is fetching** — the call gate opens it, a fetch
+# outside the code segment closes it — so the device has to see every access the
+# core makes, not only the ones aimed at a protected segment. So there are two
+# address spaces: `mem` is the real memory map, and `cpubus` is what the core
+# is given, and the only thing in `cpubus` is the firewall's `bus` window over
+# the whole 4 GiB. Every fetch and every load the core makes is judged and then
+# forwarded into `mem`.
+#
+# A DMA controller reaching the protected segments would be given a space shaped
+# the same way; there is none on this board.
+#
+# ---------------------------------------------------------------------------
+# The part
+# ---------------------------------------------------------------------------
+#
+# Shaped like an STM32L476: a Cortex-M4 on the 4 MHz MSI it comes out of reset
+# on, 1 MiB of flash at 0x08000000 aliased at zero, 96 KiB of SRAM1 at
+# 0x20000000, and the three blocks this test needs at the addresses RM0351
+# Table 1 gives them. The flash is modelled as plain RAM rather than as
+# `st.flash`, because what is being tested is the fence and not the programming
+# interface.
+#
+# Sources: ST **RM0351** rev 9 - Table 1 for the memory map, §4 for the
+# firewall, §6.4.29 for `RCC_CSR`, §9.2.2 for `SYSCFG_CFGR1`. No emulator source
+# of any licence was consulted (ROADMAP.md §1).
+
+machine "stm32l4-firewall" {
+  param flash = 1M
+  param sram  = 96K
+
+  # The MSI at its reset range, which is what an L4 boots on (RM0351 §6.2.3).
+  osc msi = 4000000 Hz
+
+  # The real map, and the core's view of it. See the note above.
+  space mem    { width = 32 }
+  space cpubus { width = 32 }
+
+  object cpu "cpu.arm.v7m" {
+    clock         = msi
+    space         = cpubus
+    part          = "cortex-m4"
+    priority-bits = 4
+  }
+
+  # `image` names a media slot, so whoever runs the machine binds the bytes.
+  object code  "ram" { size = flash }
+  object sram1 "ram" { size = sram }
+
+  # `ports = 8` is A through H, which is what an L476 in an LQFP100 has. The
+  # mux is not what this board is for; `fwdis` is.
+  object syscfg "st.syscfg" { variant = "l4", ports = 8 }
+
+  object fw "st.firewall" {
+    space      = mem
+    flash-base = 0x08000000
+    sram-base  = 0x20000000
+  }
+
+  # Only for `CSR`: this board never touches a clock gate, and the firewall's
+  # reset cause has to land somewhere firmware can read it.
+  object rcc "st.rcc" { clock = msi, variant = "l4" }
+
+  # -- the map ---------------------------------------------------------------
+  #
+  # The flash is mapped twice: at 0x08000000 where it lives, and at zero, which
+  # is the boot alias `MEMRMP` selects and where the core fetches its initial
+  # `SP` and `PC`. This board does not model the remap, so the alias is a plain
+  # second mapping rather than `syscfg.boot`.
+  map mem 0x00000000 size flash  = code
+  map mem 0x08000000 size flash  = code
+  map mem 0x20000000 size sram   = sram1
+  map mem 0x40010000 size 0x2c   = syscfg
+  map mem 0x40011c00 size 0x24   = fw
+  map mem 0x40021000 size 0x98   = rcc
+
+  # And the core sees the firewall and nothing else.
+  map cpubus 0 size 4G = fw.bus
+
+  # -- the two wires the board exists for -------------------------------------
+  wire syscfg.fwdis -> fw.fwdis
+  wire fw.reset     -> cpu.reset
+  wire fw.reset     -> rcc.fwrst
+}

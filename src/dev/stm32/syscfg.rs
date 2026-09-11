@@ -188,6 +188,9 @@ const CFGR1_FWDIS: u32 = 1 << 0;
 /// bit 2 off before this is applied.
 const MEM_MODE_MASK: u32 = 0x7;
 
+/// The pin `CFGR1.FWDIS` is published on, for a firewall to watch.
+const FWDIS_PIN: &str = "fwdis";
+
 // ---------------------------------------------------------------------------
 // Variants
 // ---------------------------------------------------------------------------
@@ -374,6 +377,8 @@ struct Registers {
     out: Mutex<[Option<WireSource>; LINES as usize]>,
     /// What `MEMRMP` points at address zero.
     boot: Arc<BootAlias>,
+    /// `CFGR1.FWDIS`, as a level a firewall can watch.
+    fwdis_out: Mutex<Option<WireSource>>,
 }
 
 impl fmt::Debug for Registers {
@@ -436,6 +441,23 @@ impl Registers {
         for (n, source) in sources.iter().enumerate() {
             let Some(source) = source else { continue };
             source.set(Level::from_bool(levels & (1 << n) != 0));
+        }
+    }
+
+    /// Republish `FWDIS` on its pin.
+    ///
+    /// The level **is** the bit: high is the reset value and means the
+    /// firewall is off. A level on a wire rather than an export because that
+    /// is what it is on the die, and because a snapshot then restores it the
+    /// way every other wire is restored (`ROADMAP.md` §4.3).
+    fn drive_fwdis(&self) {
+        let (source, high) = {
+            let source = self.fwdis_out.lock().clone();
+            let state = self.state.lock();
+            (source, state.cfgr1 & CFGR1_FWDIS != 0)
+        };
+        if let Some(source) = source {
+            source.set(Level::from_bool(high));
         }
     }
 
@@ -518,7 +540,16 @@ impl Registers {
                     // nothing.
                     next |= state.cfgr1 & CFGR1_FWDIS & value;
                 }
+                let moved = next != state.cfgr1;
                 state.cfgr1 = next;
+                if moved && self.variant == Variant::L4 {
+                    // Out of the critical section before the outward call, as
+                    // the re-entrancy contract asks: a firewall told `FWDIS`
+                    // has gone low starts judging accesses immediately.
+                    drop(state);
+                    self.drive_fwdis();
+                    return false;
+                }
             }
             (_, 0x08..=0x14) if offset.is_multiple_of(4) => {
                 state.exticr[((offset - 0x08) / 4) as usize] = value & 0xffff;
@@ -667,6 +698,7 @@ impl Syscfg {
             memrmp_reset,
             out: Mutex::with_rank(LockRank::WIRE, [const { None }; LINES as usize]),
             boot: Arc::clone(&boot),
+            fwdis_out: Mutex::with_rank(LockRank::WIRE, None),
         });
         *regs.state.lock() = regs.reset_state();
         boot.select(regs.state.lock().memrmp & MEM_MODE_MASK);
@@ -829,6 +861,7 @@ impl Device for Syscfg {
         // The BOOT pins decide what is at zero out of reset, so the window goes
         // back with the register.
         self.regs.boot.select(memrmp & MEM_MODE_MASK);
+        self.regs.drive_fwdis();
         self.regs.refresh();
     }
 
@@ -899,6 +932,7 @@ impl Device for Syscfg {
         // The window is derived state and is never in the chunk: it is
         // recomputed from the `MEMRMP` that just came back.
         self.regs.boot.select(state.memrmp & MEM_MODE_MASK);
+        self.regs.drive_fwdis();
         self.regs.refresh();
         Ok(())
     }
@@ -912,9 +946,23 @@ impl Device for Syscfg {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        if port == FWDIS_PIN {
+            if self.regs.variant != Variant::L4 {
+                return Err(Error::Config {
+                    at: port.to_string(),
+                    message: String::from(
+                        "`fwdis` is `CFGR1`'s bit 0, and an F4 has `PMC` there and no firewall to \
+                         switch on",
+                    ),
+                });
+            }
+            *self.regs.fwdis_out.lock() = Some(source);
+            self.regs.drive_fwdis();
+            return Ok(());
+        }
         let n = port_index(port, "exti", LINES).ok_or_else(|| Error::Config {
             at: port.to_string(),
-            message: String::from("a SYSCFG drives `exti0`…`exti15`"),
+            message: String::from("a SYSCFG drives `exti0`…`exti15` and, on an L4, `fwdis`"),
         })?;
         self.regs.out.lock()[n as usize] = Some(source);
         self.regs.refresh();
@@ -926,6 +974,8 @@ impl Device for Syscfg {
         // here: a line pointed at a pin that is already high comes up high.
         if port_index(port, "exti", LINES).is_some() {
             self.regs.refresh();
+        } else if port == FWDIS_PIN {
+            self.regs.drive_fwdis();
         }
     }
 
@@ -1029,7 +1079,8 @@ pub fn schema() -> ClassSchema {
         .region("")
         .region("regs")
         .region("boot")
-        .port_bank("exti", PortDir::Out, LINES);
+        .port_bank("exti", PortDir::Out, LINES)
+        .port(FWDIS_PIN, PortDir::Out);
     // One bank per port letter. The schema declares every letter the widest
     // part has, because it cannot see what `ports` was set to; the device
     // refuses a pin of a port this package does not bond.

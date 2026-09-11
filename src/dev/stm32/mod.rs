@@ -17,7 +17,8 @@
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
 //! | [`tim`] | `st.tim` | a TIM timer in its basic, general-purpose or advanced form |
 //! | [`exti`] | `st.exti` | the external interrupt/event controller: what turns a pin edge into an NVIC request |
-//! | [`syscfg`] | `st.syscfg` | `EXTICR`, the pin multiplexer that decides which port drives each EXTI line |
+//! | [`syscfg`] | `st.syscfg` | `MEMRMP`'s boot alias and `EXTICR`, the pin multiplexer that decides which port drives each EXTI line |
+//! | [`firewall`] | `st.firewall` | the L0/L4 Firewall: three fenced segments, one call gate, and a reset for anything else |
 //! | [`flash`] | `st.flash` | the embedded flash interface: wait states, the unlock keys, and a programmable array |
 //! | [`crc`] | `st.crc` | the CRC calculation unit, fixed on an F4 and programmable from the F0/F3/F7/L4 on |
 //! | [`iwdg`] | `st.iwdg` | the independent watchdog: a down-counter on the LSI that resets the board |
@@ -99,6 +100,10 @@ pub mod tim;
 #[cfg(feature = "dev-stm32-exti")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
 pub mod syscfg;
+
+#[cfg(feature = "dev-stm32-firewall")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-firewall")))]
+pub mod firewall;
 
 #[cfg(feature = "dev-stm32-crc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-crc")))]
@@ -185,6 +190,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     exti::register(registry)?;
     #[cfg(feature = "dev-stm32-exti")]
     syscfg::register(registry)?;
+    #[cfg(feature = "dev-stm32-firewall")]
+    firewall::register(registry)?;
     #[cfg(feature = "dev-stm32-crc")]
     crc::register(registry)?;
     #[cfg(feature = "dev-stm32-flash")]
@@ -234,6 +241,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     exti::bind(bindings)?;
     #[cfg(feature = "dev-stm32-exti")]
     syscfg::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-firewall")]
+    firewall::bind(bindings)?;
     #[cfg(feature = "dev-stm32-crc")]
     crc::bind(bindings)?;
     #[cfg(feature = "dev-stm32-flash")]
@@ -284,6 +293,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(tim::schema());
     #[cfg(feature = "dev-stm32-exti")]
     out.extend([exti::schema(), syscfg::schema()]);
+    #[cfg(feature = "dev-stm32-firewall")]
+    out.push(firewall::schema());
     #[cfg(feature = "dev-stm32-crc")]
     out.extend([crc::schema()]);
     #[cfg(feature = "dev-stm32-flash")]
