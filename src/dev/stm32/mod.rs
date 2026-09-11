@@ -23,6 +23,7 @@
 //! | [`wwdg`] | `st.wwdg` | the window watchdog, which also resets the board when a kick comes *early* |
 //! | [`rcc`] | `st.rcc` | the reset and clock controller: ready bits, the PLL and prescaler tree, the peripheral gates, the backup domain |
 //! | [`pwr`] | `st.pwr` | the power controller: `DBP`, voltage scaling and the F42x over-drive |
+//! | [`rtc`] | `st.rtc` | the real-time clock: a BCD calendar, both alarms, the wakeup timer and the thirty-two backup registers |
 //!
 //! # Which part
 //!
@@ -109,6 +110,10 @@ pub mod wwdg;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-pwr")))]
 pub mod pwr;
 
+#[cfg(feature = "dev-stm32-rtc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-rtc")))]
+pub mod rtc;
+
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
 pub mod demo;
@@ -121,6 +126,8 @@ pub use octospi::Octospi;
 pub use pwr::Pwr;
 #[cfg(feature = "dev-stm32-rcc")]
 pub use rcc::{ClockOutput, Clocks, Rcc};
+#[cfg(feature = "dev-stm32-rtc")]
+pub use rtc::Rtc;
 #[cfg(feature = "dev-stm32-spi")]
 pub use spi::Stm32Spi;
 #[cfg(feature = "dev-stm32-tim")]
@@ -169,6 +176,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     rcc::register(registry)?;
     #[cfg(feature = "dev-stm32-pwr")]
     pwr::register(registry)?;
+    #[cfg(feature = "dev-stm32-rtc")]
+    rtc::register(registry)?;
     Ok(())
 }
 
@@ -210,6 +219,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     rcc::bind(bindings)?;
     #[cfg(feature = "dev-stm32-pwr")]
     pwr::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-rtc")]
+    rtc::bind(bindings)?;
     Ok(())
 }
 
@@ -250,5 +261,7 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(rcc::schema());
     #[cfg(feature = "dev-stm32-pwr")]
     out.push(pwr::schema());
+    #[cfg(feature = "dev-stm32-rtc")]
+    out.push(rtc::schema());
     out
 }

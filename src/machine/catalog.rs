@@ -979,6 +979,7 @@ pub fn registry() -> Result<Registry> {
         feature = "dev-stm32-flash",
         feature = "dev-stm32-rcc",
         feature = "dev-stm32-pwr",
+        feature = "dev-stm32-rtc",
         feature = "machine-spi-flash"
     ))]
     crate::dev::stm32::register(&mut reg)?;
@@ -1100,6 +1101,7 @@ pub fn bindings() -> Result<Bindings> {
         feature = "dev-stm32-flash",
         feature = "dev-stm32-rcc",
         feature = "dev-stm32-pwr",
+        feature = "dev-stm32-rtc",
         feature = "machine-spi-flash"
     ))]
     crate::dev::stm32::bind(&mut b)?;
@@ -1224,6 +1226,7 @@ pub fn classes() -> ClassTable {
         feature = "dev-stm32-flash",
         feature = "dev-stm32-rcc",
         feature = "dev-stm32-pwr",
+        feature = "dev-stm32-rtc",
         feature = "machine-spi-flash"
     ))]
     for schema in crate::dev::stm32::schemas() {
