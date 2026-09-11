@@ -174,6 +174,12 @@ typedef enum rsemu_status {
      */
     RSEMU_ACCEL = -15,
     /*
+     * A processor is spinning on a load whose value never changes, and the
+     * run was armed to stop when that happens (`core::spin`). The message
+     * names the processor, the program counter and the address.
+     */
+    RSEMU_SPIN = -16,
+    /*
      * A panic was caught at the boundary. A machine that returns this is
      * poisoned: only `rsemu_last_error` and `rsemu_free` still work on it.
      */

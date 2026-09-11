@@ -849,5 +849,124 @@ fn itoa(mut value: u64) -> String {
     String::from_utf8(digits[at..].to_vec()).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Structured events
+// ---------------------------------------------------------------------------
+
+/// What a structured [`Event`] reports.
+///
+/// The same extensible-enumeration rule as [`Channel`] and [`Counter`], and for
+/// the same reason: a diagnostic that wants a record rather than a total adds a
+/// variant here, and a downstream `match` must not break when one does.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventKind(pub u16);
+
+impl EventKind {
+    /// Not a kind. Reserved so a zeroed [`Event`] is never mistaken for one.
+    pub const NONE: EventKind = EventKind(0);
+
+    /// A processor is spinning on a load whose value does not change. The
+    /// first producer, and what this shape was drawn around
+    /// ([`crate::core::spin`]).
+    pub const SPIN: EventKind = EventKind(1);
+
+    /// A short name, for a message and for a log line. `None` for a kind this
+    /// build does not know, which is what an open enumeration has to allow.
+    #[must_use]
+    pub const fn name(self) -> Option<&'static str> {
+        match self.0 {
+            0 => Some("none"),
+            1 => Some("spinning"),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Display for EventKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.name() {
+            Some(name) => f.write_str(name),
+            None => write!(f, "event kind #{}", self.0),
+        }
+    }
+}
+
+/// One structured diagnostic record: something a processor did, at a place, to
+/// a value.
+///
+/// # Why this is not a counter
+///
+/// Everything above is a total, for the reason the module docs give at length:
+/// a record per block entry is hundreds of millions of records, which is a cost
+/// no hot path can carry and an output nobody reads. This shape exists for the
+/// opposite population — a finding that happens a *handful* of times in a whole
+/// run and whose entire value is the particulars. "Some processor spun" is
+/// useless; *"cpu0 at `0x08001234` read `0x40023800`, got zero, ten thousand
+/// times running"* is the answer, and neither a counter nor a histogram can
+/// carry it.
+///
+/// The fields are the ones any memory-shaped finding has — which processor,
+/// which instruction, which address, what value, how many times, and what the
+/// address turned out to be — chosen as the *intersection* of what such a
+/// diagnostic reports rather than the union of what one of them might want.
+/// [`crate::core::spin`] is the first producer and [`EventKind`] is open so it
+/// is not the last.
+///
+/// # Where these are collected
+///
+/// **Not here.** The counters above are process-global because a hook inside
+/// `jit::Dispatcher::run` has no machine in hand to attribute a count to; an
+/// event producer *does* — it was handed an object by the machine that armed
+/// it, and that object is where its events go. So this module owns the shape
+/// and nothing else: there is no static event log, no ring buffer, and nothing
+/// for two machines in one process — or two tests in one test binary — to
+/// share by accident. That is the difference that makes an event stream
+/// deterministic where a global counter total is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    /// What kind of finding this is.
+    pub kind: EventKind,
+    /// Which processor: the index the machine gave it when it handed out the
+    /// diagnostic, counting only the devices that could report, in declaration
+    /// order. See
+    /// [`Device::set_spin_detector`](crate::core::device::Device::set_spin_detector)
+    /// for why that rather than the requester id.
+    pub cpu: u32,
+    /// The address of the instruction responsible.
+    pub pc: u64,
+    /// The guest address the instruction touched, in the width the guest
+    /// computed it in — **virtual** where the core has an MMU, because that is
+    /// the number in the listing the reader is holding.
+    pub addr: u64,
+    /// The value that was seen there.
+    pub value: u64,
+    /// How many times, where the finding is a repetition; one otherwise.
+    pub count: u64,
+    /// What [`addr`](Event::addr) resolved to — the region or device name —
+    /// when the producer could name it.
+    ///
+    /// `None` is honest rather than empty: an address the topology does not
+    /// cover, and a producer with no address space in hand, both say nothing
+    /// rather than inventing a name.
+    pub region: Option<String>,
+}
+
+impl core::fmt::Display for Event {
+    /// One line, in the order a reader asks the questions: who, where, what,
+    /// how often.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "cpu{} {} at {:#010x} reading {:#010x}",
+            self.cpu, self.kind, self.pc, self.addr
+        )?;
+        if let Some(region) = &self.region {
+            write!(f, " ({region})")?;
+        }
+        write!(f, " = {:#010x} for {} iterations", self.value, self.count)
+    }
+}
+
 #[cfg(test)]
 mod tests;

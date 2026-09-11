@@ -100,6 +100,10 @@ pub enum RsemuStatus {
     /// an `accel-*` feature can produce one, and only on a host that has the
     /// hypervisor device -- an embedder without one never sees this code.
     Accel = -15,
+    /// A processor is spinning on a load whose value never changes, and the
+    /// run was armed to stop when that happens (`core::spin`). The message
+    /// names the processor, the program counter and the address.
+    Spin = -16,
     /// A panic was caught at the boundary. A machine that returns this is
     /// poisoned: only [`rsemu_last_error`] and [`rsemu_free`] still work on it.
     Panic = -100,
@@ -128,6 +132,7 @@ impl RsemuStatus {
             Error::Bus(BusError::Protected) => RsemuStatus::BusProtected,
             Error::Bus(BusError::Retry) => RsemuStatus::BusRetry,
             Error::Accel(_) => RsemuStatus::Accel,
+            Error::Spin(_) => RsemuStatus::Spin,
         }
     }
 
@@ -151,13 +156,14 @@ impl RsemuStatus {
             RsemuStatus::BusProtected => "the mapping does not permit this access\0",
             RsemuStatus::BusRetry => "target busy, retry\0",
             RsemuStatus::Accel => "acceleration backend error\0",
+            RsemuStatus::Spin => "a processor is spinning on an unchanging load\0",
             RsemuStatus::Panic => "a panic was caught at the C ABI boundary\0",
         }
     }
 
     /// Every code, so `rsemu_strerror` can answer without a `transmute` and a
     /// test can assert the header lists exactly these.
-    pub(super) const ALL: [RsemuStatus; 17] = [
+    pub(super) const ALL: [RsemuStatus; 18] = [
         RsemuStatus::Ok,
         RsemuStatus::NullPointer,
         RsemuStatus::BufferTooSmall,
@@ -174,6 +180,7 @@ impl RsemuStatus {
         RsemuStatus::BusProtected,
         RsemuStatus::BusRetry,
         RsemuStatus::Accel,
+        RsemuStatus::Spin,
         RsemuStatus::Panic,
     ];
 }

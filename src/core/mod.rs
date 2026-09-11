@@ -26,6 +26,7 @@
 //! | `state` | versioned snapshots (§4.5) |
 //! | `sync` | the concurrency portability seam (§4.7) |
 //! | [`trace`] | structured tracing and profiling output: counters a run emits |
+//! | [`spin`] | catching a processor stuck on a load whose value never changes |
 //!
 //! Every module listed above now exists, and [`machine`](crate::machine)
 //! assembles them into a running [`Machine`](crate::machine::Machine). The
@@ -45,6 +46,7 @@ pub mod record;
 pub mod registry;
 pub mod sched;
 pub mod space;
+pub mod spin;
 pub mod state;
 pub mod sync;
 pub mod trace;
@@ -57,4 +59,5 @@ pub use exec::{Access, Exit, ExitMask, ExitReason, ExitingCore, Run};
 pub use hosts::{Captured, HostKind, HostObjects, InputPolicy};
 pub use record::{Channel, InputEvent, InputLog, InputSink, Recorder};
 pub use registry::Registry;
+pub use spin::Detector as SpinDetector;
 pub use value::{Endian, Width};

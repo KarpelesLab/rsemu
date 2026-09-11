@@ -56,6 +56,14 @@ pub enum Error {
     /// linked. This is what it becomes when it crosses into the crate's own
     /// error type.
     Accel(String),
+    /// A processor is spinning on a load whose value never changes, and the
+    /// run was asked to stop when that happens
+    /// ([`spin::Detector::set_stops_the_run`](crate::core::spin::Detector::set_stops_the_run)).
+    ///
+    /// Carries the finding itself rather than a rendered sentence, because the
+    /// caller is usually a test and a test wants the program counter as a
+    /// number. [`Display`](fmt::Display) renders it the way a person reads it.
+    Spin(crate::core::trace::Event),
     /// The operation is not implemented in this build yet.
     ///
     /// Distinct from an error: it means "rsemu has not got here", not "you did
@@ -104,6 +112,7 @@ impl fmt::Display for Error {
             Error::State(message) => write!(f, "snapshot error: {message}"),
             Error::Ir(message) => write!(f, "malformed IR: {message}"),
             Error::Accel(message) => write!(f, "acceleration error: {message}"),
+            Error::Spin(event) => write!(f, "{event}"),
             Error::Unimplemented(what) => write!(f, "not implemented yet: {what}"),
         }
     }

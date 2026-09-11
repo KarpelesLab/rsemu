@@ -99,6 +99,7 @@ use crate::core::sched::{
     Runnable, RunnableId, Scheduler, SchedulerSnapshot,
 };
 use crate::core::space::{AddressSpace, RequesterId};
+use crate::core::spin::Detector as SpinDetector;
 use crate::core::state::{MachineShape, Migrations, Sink, Source, StateReader, StateWriter};
 use crate::core::wire::{Level, Wire, WireId};
 use crate::machine::realize::Instance;
@@ -354,6 +355,17 @@ pub struct Machine {
     /// It is kept here only so a device realized — or a debugger attached —
     /// after the fact can be told what it missed.
     debug_halted: bool,
+    /// The spin detector, if one is armed (`core::spin`).
+    ///
+    /// `None` is the ordinary case and costs one `Option` test per scheduling
+    /// round. Like the recorder it is a property of the *run* rather than of
+    /// the description, so it is not in [`MachineParts`] — a caller arms it
+    /// after realize and can disarm it again.
+    spin: Option<Arc<SpinDetector>>,
+    /// How many of the detector's findings the run loop has already turned into
+    /// an [`Error::Spin`], so a resumed run reports the next one rather than the
+    /// same one for ever.
+    spin_reported: usize,
 }
 
 /// The parts a realizer hands to [`Machine::assemble`].
@@ -398,6 +410,8 @@ impl Machine {
             deferred: parts.deferred,
             recorder: None,
             debug_halted: false,
+            spin: None,
+            spin_reported: 0,
         }
     }
 
@@ -668,6 +682,11 @@ impl Machine {
             // outright in a build without the `trace` feature, so this loop is
             // unchanged for everybody who is not asking a question.
             crate::core::trace::quantum_report(&report);
+            // Budget mode. One `Option` test per round when nothing is armed,
+            // which is the same price the recorder already pays.
+            if let Some(stuck) = self.spin_stop() {
+                return Err(stuck);
+            }
             if self.sched.now() <= before {
                 // A quantum ends either at its natural boundary or, when the
                 // deadline falls before that, at the deadline itself — and the
@@ -685,6 +704,107 @@ impl Machine {
             }
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // the spin detector
+    // -----------------------------------------------------------------
+
+    /// Watch every processor for a load that repeats `threshold` times without
+    /// its value changing, and report it (`core::spin`).
+    ///
+    /// Returns the detector, which is where the findings go and what
+    /// [`Detector::set_stops_the_run`](crate::core::spin::Detector::set_stops_the_run)
+    /// is set on. Arming an already-armed machine changes the threshold and
+    /// keeps the same detector, its findings and this run's place in them — so
+    /// a caller reaching for this to *adjust* a threshold mid-run neither loses
+    /// what has been found already nor has it reported a second time.
+    /// [`Machine::disarm_spin_detector`] is how to start over.
+    ///
+    /// Processors are numbered in [`Machine::devices`] order — declaration
+    /// order — and only devices that actually take the detector consume a
+    /// number, so `cpu0` in a report is the first processor the description
+    /// declares. That numbering is a property of the description and not of the
+    /// run, which is what makes two runs of one machine report the same names.
+    ///
+    /// A threshold of zero disarms — see [`Machine::disarm_spin_detector`],
+    /// which is the same thing said out loud.
+    pub fn arm_spin_detector(&mut self, threshold: u64) -> Arc<SpinDetector> {
+        let detector = match &self.spin {
+            Some(existing) => {
+                existing.set_threshold(threshold);
+                Arc::clone(existing)
+            }
+            None => {
+                let detector = SpinDetector::new(threshold);
+                self.spin = Some(Arc::clone(&detector));
+                self.spin_reported = 0;
+                detector
+            }
+        };
+        self.hand_out_spin_detector();
+        detector
+    }
+
+    /// Stop watching, and forget what was found.
+    ///
+    /// The detector is detached from every processor, so a caller still holding
+    /// one from [`Machine::arm_spin_detector`] keeps a live handle to an object
+    /// nothing reports to any more — which is the honest outcome, and why this
+    /// clears it as well.
+    pub fn disarm_spin_detector(&mut self) {
+        if let Some(detector) = self.spin.take() {
+            detector.disarm();
+            detector.clear();
+        }
+        self.spin_reported = 0;
+        self.hand_out_spin_detector();
+    }
+
+    /// The armed spin detector, if there is one.
+    #[must_use]
+    pub fn spin_detector(&self) -> Option<&Arc<SpinDetector>> {
+        self.spin.as_ref()
+    }
+
+    /// Give — or take away — the detector, numbering the runnables as it goes.
+    fn hand_out_spin_detector(&self) {
+        let mut cpu = 0u32;
+        for entry in &self.devices {
+            if entry
+                .device
+                .set_spin_detector(cpu, self.spin.as_ref().map(Arc::clone))
+            {
+                cpu += 1;
+            }
+        }
+    }
+
+    /// The next finding the run has not already reported, if the detector is
+    /// armed and set to stop the run.
+    ///
+    /// Checked at a round boundary rather than inside one: a processor reports
+    /// while it is executing, and unwinding a half-finished round to say so
+    /// would need a scheduling boundary this machine does not have. Waiting for
+    /// the boundary costs at most one round of virtual time and keeps
+    /// `run_for`'s additivity (§11.6) intact.
+    ///
+    /// A **watermark** rather than clearing the detector, because a caller who
+    /// resumes after an error wants the *next* loop rather than the same one
+    /// again — and because a machine with three stuck processors has three
+    /// findings, and throwing two of them away to avoid repeating the first is
+    /// the wrong trade. Nothing is lost: [`Detector::events`] still holds
+    /// everything afterwards.
+    fn spin_stop(&mut self) -> Option<Error> {
+        // Cloned out of the `Option` so the borrow ends before the watermark
+        // is moved.
+        let detector = Arc::clone(self.spin.as_ref()?);
+        if !detector.stops_the_run() {
+            return None;
+        }
+        let event = detector.events().get(self.spin_reported)?.clone();
+        self.spin_reported += 1;
+        Some(Error::Spin(event))
     }
 
     /// Run for `span` of virtual time from wherever the machine is now.

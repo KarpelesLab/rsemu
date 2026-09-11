@@ -40,6 +40,7 @@ use crate::core::hosts::HostObjects;
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{Budget, Consumed, LazyHandle, TickCursor};
 use crate::core::space::{RegionRef, RequesterId};
+use crate::core::spin::Detector as SpinDetector;
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::sync::AtomicU64;
 use crate::core::wire::{DmaPeripheral, IntAck, LocalController, WireId, WireSink, WireSource};
@@ -489,6 +490,33 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// `map cpubus 0 size 2K = wram` asks for.
     fn region(&self, _name: &str) -> Option<RegionRef> {
         None
+    }
+
+    /// Attach, replace or remove the spin detector this device reports to, and
+    /// tell it which processor it is.
+    ///
+    /// Defaulted to ignoring both, which is right for everything that is not a
+    /// CPU core: only something that issues loads has a streak to watch. A core
+    /// that implements it hands the detector to its
+    /// [`spin::Watch`](crate::core::spin::Watch).
+    ///
+    /// `cpu` is the index the machine is offering, and **the return value is
+    /// what makes that number mean something**: a device that takes the
+    /// detector returns `true` and consumes the index, one that ignores it
+    /// returns `false` and the machine offers the same index to the next
+    /// device. So `cpu0` is the first device that can actually report, not the
+    /// first runnable — a board whose UART takes execution budgets does not
+    /// push its processor to `cpu1`.
+    ///
+    /// It is deliberately *not* the device's
+    /// [`RequesterId`](crate::core::space::RequesterId), which is `ANONYMOUS`
+    /// on most boards and would name every core `cpu0`.
+    ///
+    /// Like [`export`](Device::export), this is wiring rather than guest state:
+    /// it survives [`reset`](Device::reset), it is never serialized, and a
+    /// snapshot restore must not drop it.
+    fn set_spin_detector(&self, _cpu: u32, _detector: Option<Arc<SpinDetector>>) -> bool {
+        false
     }
 
     /// The sink for input pin `port`, and the line the device knows it by.
