@@ -72,12 +72,12 @@ pub mod spi;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-octospi")))]
 pub mod octospi;
 
-#[cfg(feature = "dev-stm32-tim")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-tim")))]
-pub mod tim;
 #[cfg(feature = "dev-stm32-exti")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
 pub mod exti;
+#[cfg(feature = "dev-stm32-tim")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-tim")))]
+pub mod tim;
 
 #[cfg(feature = "dev-stm32-exti")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-exti")))]
