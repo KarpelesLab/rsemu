@@ -74,6 +74,23 @@
 //! `cpu::x86::lift::Smc::HostGuard` is that measurement acted on and took the
 //! divisor to 12.17. `docs/platforms/pc64.md`, *"Where the host instructions
 //! go"*, has the attribution either side of it and the method in full.
+//!
+//! # And what it said next, which is the row this census gained two lines for
+//!
+//! With the divisor fixed, the largest single item left was the address space
+//! at 146 host instructions per guest instruction — because x86 published no
+//! inlined memory path and every load and store a block made took a call. It
+//! publishes one now, in long mode, and the two rows at the bottom of the
+//! census are how far it reaches: **0.187 loads and 0.107 stores per guest
+//! instruction** over the whole nine hundred, served by a probe in generated
+//! code with no call at all.
+//!
+//! On the same hundred and twenty guest seconds either side of that change:
+//! **82 149 446 793 host instructions to 61 067 485 370, −25.7%** — 458 per
+//! guest instruction retired in a block to 340 — with the census identical in
+//! every row and the nine-hundred-second `Machine::state_hash` unchanged at
+//! `0xb996f48fb92dd24b`. `docs/platforms/pc64.md`, *"The inlined memory
+//! path"*, has the per-function attribution and what the design refuses.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -153,6 +170,16 @@ fn main() {
         "translations a store killed",
         s.invalidated,
         s.invalidated as f64 / retired,
+    );
+    row(
+        "loads served by an inlined probe",
+        s.fast_loads,
+        s.fast_loads as f64 / retired,
+    );
+    row(
+        "stores served by an inlined probe",
+        s.fast_stores,
+        s.fast_stores as f64 / retired,
     );
     println!("\nguest instructions per block: {:.2}", retired / blocks);
     println!(

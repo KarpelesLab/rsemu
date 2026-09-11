@@ -49,6 +49,16 @@
 //! branch (`lift::Lifter::insn`), so `next_pc - pc` is the encoding length,
 //! and an exit boundary is the one with `next_pc == pc`.
 //!
+//! The inlined memory path made that first half stop being free, and it is the
+//! one place where this core needs something from the `jit` seam that the seam
+//! does not have. An access the **backend** serves never reaches
+//! [`IrHost::load`], and [`FastMem::note_fast_load`] is handed neither the
+//! address nor the value, so there is nothing for `Exec::phys_read` to latch
+//! and nothing here to latch it from. The block carries the byte instead, in
+//! `lift::OPEN_BUS`, and [`Host::bus_locked`] is what stops a published slot
+//! from overwriting a byte a *call* left — including the one a page-table walk
+//! leaves on its way to a fault.
+//!
 //! **2. Every write this core makes is collected in one place.** RISC-V's
 //! interpreter reports its stores through a field its `Exec` fills and its
 //! blocks report theirs through [`StoreLog`]; here both are the same field,
@@ -332,14 +342,16 @@ use crate::jit::{
     Translation,
 };
 
-use super::exec::{Exec, Fault, State};
+use super::exec::{Ex, Exec, Fault, State, VEC_SS};
+#[cfg(test)]
+use super::isa::seg;
 use super::lift::{
-    self, ARITH_MASK, EFLAGS_REST, FLAG_BITS, FLAG_SLOTS, Flags, Origin, RIP, SLOT_COUNT, Shape,
-    Smc, World, r_slot,
+    self, ARITH_MASK, EFLAGS_REST, FLAG_BITS, FLAG_SLOTS, Flags, OPEN_BUS, Origin, RIP, SLOT_COUNT,
+    Shape, Smc, World, r_slot,
 };
 use super::paging::Access;
 use super::prot::canonical;
-use super::{Config, Lines, flags, isa::seg};
+use super::{Config, Lines, flags};
 
 /// How much of a block the frontend is allowed to swallow.
 ///
@@ -492,6 +504,15 @@ pub struct Stats {
     /// encodings outside the subset and 36.6 M are inside it and were refused
     /// at a boundary, nearly all of them in the tail of a quantum.
     pub interpreted: u64,
+    /// Compiled loads served from an **inlined** software-TLB probe, with no
+    /// call back into this core's memory path.
+    ///
+    /// Zero under `engine = "jit"`, on a part with `Buffers::Unified`, and in
+    /// every world `cpu::x86::lift::Lifter::flat` refuses — which is every one
+    /// below long mode. See this file's `impl FastMem`.
+    pub fast_loads: u64,
+    /// Compiled stores served the same way.
+    pub fast_stores: u64,
 }
 
 /// What deciding whether a block may run needs, and the dispatcher does not.
@@ -540,6 +561,31 @@ impl Jit {
         }
     }
 
+    /// Whether this engine can use a `paging::Tlb` shadow.
+    ///
+    /// Only the host code generator inlines an access ([`FastMem`]); the
+    /// portable backend calls [`IrHost::load`] for every one, so a shadow
+    /// attached for it would be filled and never read. A fill probes the
+    /// address space's flat view, so it is asked for by the one engine that
+    /// reads it, and a `jit-host` that fell back to the portable backend —
+    /// no `jit::host` backend for this target — does not ask.
+    pub(super) fn wants_shadow(&self) -> bool {
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
+        {
+            self.disp.backend().is_some()
+        }
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
+        {
+            false
+        }
+    }
+
     /// Throw every translation away.
     pub(super) fn flush(&mut self) {
         self.disp.cache_mut().flush();
@@ -563,6 +609,29 @@ impl Jit {
             invalidated: s.smc,
             retired: self.at.retired,
             interpreted: self.at.interpreted,
+            fast_loads: self.fast().0,
+            fast_stores: self.fast().1,
+        }
+    }
+
+    /// What the host code generator's inlined probes served, if there is one.
+    fn fast(&self) -> (u64, u64) {
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
+        {
+            self.disp
+                .backend()
+                .map(crate::jit::host::Engine::stats)
+                .map_or((0, 0), |s| (s.fast_loads, s.fast_stores))
+        }
+        #[cfg(not(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        )))]
+        {
+            (0, 0)
         }
     }
 
@@ -1342,6 +1411,21 @@ struct Host<'a, 'e> {
     /// Whether a write overran `Exec::wrote`, so the dirty log is incomplete
     /// and [`advance`] has to throw every translation away. See [`drain`].
     overflowed: bool,
+    /// Whether `State::open_bus` is `Exec`'s to own rather than the block's.
+    ///
+    /// The open bus is the one piece of architectural state a block cannot
+    /// simply carry in a slot, because both engines write it and they write it
+    /// at different moments. An access the backend serves leaves the byte in
+    /// [`OPEN_BUS`], which arrives here through [`IrHost::write_slot`] at the
+    /// boundary the block leaves at; an access that took the **call** latched
+    /// the byte itself, in `Exec::phys_read` — and so did the page-table walk
+    /// of an access that then *faulted*, which is the case that makes this a
+    /// flag rather than an ordering.
+    ///
+    /// Set by every access that reaches [`IrHost::load`] or [`IrHost::store`],
+    /// cleared by every one the backend served. While it is set, a published
+    /// [`OPEN_BUS`] is dropped: `Exec` has the newer byte, by construction.
+    bus_locked: bool,
 }
 
 impl<'a, 'e> Host<'a, 'e> {
@@ -1371,6 +1455,9 @@ impl<'a, 'e> Host<'a, 'e> {
             end: None,
             end_access: false,
             overflowed: false,
+            // Nothing has run, so nothing has replaced what `Exec` already
+            // holds.
+            bus_locked: true,
         }
     }
 
@@ -1429,6 +1516,41 @@ impl<'a, 'e> Host<'a, 'e> {
     #[inline]
     fn spent_a_cycle(&mut self, before: u64) {
         self.cur_access |= self.exec.used != before;
+    }
+
+    /// One access, through whichever of the two paths its [`MemOp`] names.
+    ///
+    /// `value` is `Some` for a store and `None` for a load; a store answers
+    /// zero.
+    ///
+    /// # The two paths, and why they are the same answer
+    ///
+    /// A [`MemOp`] that carries a segment register is an **effective** address:
+    /// `Exec::read_mem` folds the base in and checks the limit, the access
+    /// rights and the present bit, and that is the whole of what x86 has above
+    /// paging. A [`MemOp`] with no segment is a **linear** address, and
+    /// `lift::Lifter::flat` emits one only in long mode and only through `CS`,
+    /// `DS`, `ES` or `SS`, whose bases are architecturally zero — so the fold it
+    /// skipped was the identity and the checks it skipped do not exist
+    /// (*Intel SDM* volume 3 §3.4.4).
+    ///
+    /// What is left of `Exec::seg_linear` in that world is the canonical test,
+    /// which is here, and the vector it raises, which is `#GP(0)` for the three
+    /// data segments and `#SS(0)` for the stack — and the stack's has already
+    /// been asked in the block, because [`lift::STACK`] is the only place that
+    /// distinction survives the segment register being dropped.
+    ///
+    /// The two paths are therefore one answer written twice, which is the
+    /// property `differential::compare` checks instruction by instruction.
+    fn linear_or_segmented(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> Ex<u64> {
+        let bytes = mem.size.bytes() as u8;
+        match (mem.seg, value) {
+            (Some(s), None) => self.exec.read_mem(s.0, addr, bytes),
+            (Some(s), Some(v)) => self.exec.write_mem(s.0, addr, bytes, v).map(|()| 0),
+            (None, _) if !canonical(addr) => Err(Fault::gp(0)),
+            (None, None) => self.exec.linear_read(addr, bytes),
+            (None, Some(v)) => self.exec.linear_write(addr, bytes, v).map(|()| 0),
+        }
     }
 
     /// Report an x86 fault as the bus error the IR speaks, keeping the vector.
@@ -1490,7 +1612,28 @@ impl IrHost for Host<'_, '_> {
         u128::from(self.slots[slot.0 as usize])
     }
 
+    /// # The one slot that is not a slot
+    ///
+    /// [`OPEN_BUS`] goes straight through to `Exec` rather than into the array,
+    /// and it is dropped entirely while [`Host::bus_locked`] holds. Both halves
+    /// are load-bearing:
+    ///
+    /// * **Straight through**, because [`publish`] writes the register file and
+    ///   `EFLAGS` and there is no third thing for the open bus to be folded
+    ///   into. Publication is the only time a slot arrives here, and by then
+    ///   the block has finished.
+    /// * **Dropped while locked**, because a fault that a *call* raised has
+    ///   already left a byte here — an access that takes a `#PF` reads page-table
+    ///   entries on the way to failing, and those are bus cycles that latch —
+    ///   and the block is publishing the boundary the faulting instruction
+    ///   *started* at, whose byte is one transaction older.
     fn write_slot(&mut self, slot: RegSlot, value: u128) {
+        if slot == OPEN_BUS {
+            if !self.bus_locked {
+                self.exec.state.open_bus = value as u8;
+            }
+            return;
+        }
         self.slots[slot.0 as usize] = value as u64;
     }
 
@@ -1508,10 +1651,21 @@ impl IrHost for Host<'_, '_> {
                 Err(self.raise(Fault::gp(0)))
             };
         }
-        let sr = mem.seg.map_or(seg::DS, |s| s.0);
+        // The same non-access, for the stack. See [`lift::STACK`]: the inlined
+        // memory path drops the segment register, and this is the one thing
+        // `Exec::seg_linear` reads out of it that a data segment's answer does
+        // not cover.
+        if mem.space == lift::STACK {
+            return if canonical(addr) {
+                Ok(0)
+            } else {
+                Err(self.raise(Fault::coded(VEC_SS, 0)))
+            };
+        }
         let before = self.exec.used;
-        let done = self.exec.read_mem(sr, addr, mem.size.bytes() as u8);
+        let done = self.linear_or_segmented(mem, addr, None);
         self.spent_a_cycle(before);
+        self.bus_locked = true;
         // One of the two calls a block makes that can bring an interrupt pin
         // up, and the one that is easy to miss.
         //
@@ -1540,10 +1694,10 @@ impl IrHost for Host<'_, '_> {
     }
 
     fn store(&mut self, mem: &MemOp, addr: u64, value: u64) -> MemResult {
-        let sr = mem.seg.map_or(seg::DS, |s| s.0);
         let before = self.exec.used;
-        let done = self.exec.write_mem(sr, addr, mem.size.bytes() as u8, value);
+        let done = self.linear_or_segmented(mem, addr, Some(value)).map(|_| ());
         self.spent_a_cycle(before);
+        self.bus_locked = true;
         self.note_writes();
         // The other two, and unlike the RISC-V engine this core cannot lean on
         // "a store ends the block": under [`Smc::HostGuard`] a store is an
@@ -1620,17 +1774,127 @@ impl StoreLog for Host<'_, '_> {
     }
 }
 
-/// **x86 publishes no inlined load path, and that is a property of the guest.**
+/// **x86 publishes an inlined memory path in long mode and refuses one
+/// everywhere else**, and the refusals are the interesting half.
 ///
-/// A load's address here is an *effective* address: the segment base is added
-/// and the limit checked before anything reaches a table, and the frontend
-/// says so by giving every [`MemOp`] a `SegId`. The backend refuses to inline
-/// a segmented access for the same reason (`jit::x86`'s `Compiler::inlinable`),
-/// so this is the same answer said twice. Inlining x86's loads means lowering
-/// the segment fold into generated code — a base add and a limit compare
-/// against state a `MOV DS, ax` can change between two instructions — and that
-/// is a frontend change rather than a wiring one.
-impl FastMem for Host<'_, '_> {}
+/// A load's address on this core is an *effective* address: the segment base is
+/// added and the limit checked before anything reaches a table, which is why
+/// the frontend gives a [`MemOp`] a `SegId` and why `jit::x86`'s
+/// `Compiler::inlinable` refuses a segmented access. Nothing about that has
+/// changed. What changed is that in **long mode** the fold is the identity for
+/// `CS`, `DS`, `ES` and `SS` — bases defined to be zero, no limit, no access
+/// rights (*Intel SDM* volume 3 §3.4.4) — so `lift::Lifter::flat` emits the
+/// linear address it already computed and clears the register, and the backend
+/// inlines it with no segment logic of its own.
+///
+/// The table the probe reads is `paging::Tlb`'s shadow, written in lockstep
+/// with this core's own data buffer so that a hit here implies a hit there and
+/// the walk an inlined access skips is one that has already been charged. What
+/// is left for the host to pay is in [`FastMem::note_fast_load`] and
+/// [`FastMem::note_fast_store`].
+///
+/// # What this refuses, said plainly
+///
+/// * **Everything below long mode.** A 32-bit protected-mode `DS` has a real
+///   base and a real limit, both of them hidden descriptor state that a
+///   `MOV DS, ax` replaces, and a block keyed under [`Origin::Paged`] is keyed
+///   by the physical page of its bytes rather than by `World::generation`.
+/// * **`FS` and `GS`, always.** Their bases come from an MSR and are live
+///   state, which is the same objection.
+/// * **Paging off**, where nothing fills the shadow, and **the A20 gate shut**,
+///   where a host pointer resolved before `Exec::masked` names a different page
+///   from the one the bus would reach.
+/// * **Every instruction that touches memory twice**, or that can fault after
+///   its access — a read-modify-write, a computed `RET`, `PUSH [m]`. The reason
+///   is the open bus and is written out on `lift::Plan::one_last_access`.
+/// * **A part with `Buffers::Unified`**, a 386 and a 486, whose data
+///   translations land in a thirty-two-slot array a sixty-four-slot shadow
+///   cannot index in lockstep with.
+impl FastMem for Host<'_, '_> {
+    fn load_plan(&mut self) -> Option<crate::jit::MemPlan> {
+        self.exec.mem_plan(crate::ir::AccessKind::Load)
+    }
+
+    fn store_plan(&mut self) -> Option<crate::jit::MemPlan> {
+        self.exec.mem_plan(crate::ir::AccessKind::Store)
+    }
+
+    /// One aligned load was served inline; charge for it.
+    ///
+    /// Everything [`IrHost::load`] would have done, minus the bytes:
+    ///
+    /// * **one bus cycle's clocks**, and only one — a hit in the shadow implies
+    ///   a hit in this core's own buffer, so the walk was charged when the entry
+    ///   was filled;
+    /// * **`close_bus`'s question**, which is *did this guest instruction drive
+    ///   the bus after its own fetch*, and an inlined load did;
+    /// * **the open bus goes back to being the block's**, because this access
+    ///   latched nothing in `Exec` and the byte is in [`OPEN_BUS`].
+    ///
+    /// What is deliberately **not** here is the interrupt-pin check
+    /// [`IrHost::load`] makes. That exists because a read of a lazily-advanced
+    /// device — the local APIC, the HPET — catches the chip up and can bring a
+    /// line up mid-block. An inlined load reaches plain RAM by construction:
+    /// `jit::Tlb::fill` caches only a page that resolves to a direct `RamStore`
+    /// with permissive constraints, so there is no device to advance and no pin
+    /// that can rise.
+    fn note_fast_load(&mut self) {
+        let clocks = self.exec.variant().bus_clocks();
+        self.exec.charge(clocks);
+        self.cur_access = true;
+        self.bus_locked = false;
+    }
+
+    /// One aligned store was served inline; pay what moving the bytes did not.
+    ///
+    /// Generated code wrote through the host address the shadow's store entry
+    /// carries and did nothing else. This is the rest of `Exec::phys_write`:
+    ///
+    /// * **one bus cycle's clocks**, as above;
+    /// * **the `RamStore`'s own dirty bitmap**, which `jit::Tlb::note_fast_store`
+    ///   marks — the only record a framebuffer refresh or a live snapshot has;
+    /// * **the global exclusive monitor**, broken by `SpaceView::write` on every
+    ///   store that goes through the address space and by nothing at all on one
+    ///   that does not. A sibling core's reservation surviving a store because
+    ///   the store happened to be compiled is the same defect in a faster
+    ///   wrapper. Once rather than on both sides of the transfer, because the
+    ///   bytes had already landed before this was called and there is no "before"
+    ///   left to take;
+    /// * **`Exec::wrote`**, and through [`Host::note_writes`] both of the things
+    ///   it feeds: the guest-physical dirty log the dispatcher drains to
+    ///   invalidate a translation of the page just written, and `Smc::HostGuard`
+    ///   — the comparison against this block's own frame that makes x86's
+    ///   coherent instruction cache architectural rather than aspirational.
+    ///
+    /// Called *after* the bytes have landed, which is unobservable: nothing runs
+    /// in between and the fast path cannot fault.
+    ///
+    /// # Panics
+    ///
+    /// Never on a guest condition. A shadow entry that does not resolve to RAM
+    /// cannot have been used by generated code, which found a host address in it
+    /// one instruction earlier; reaching that arm is a code-generation bug, and
+    /// losing the dirty page silently would hide it.
+    fn note_fast_store(&mut self, addr: u64, bytes: u64) {
+        let clocks = self.exec.variant().bus_clocks();
+        self.exec.charge(clocks);
+        self.cur_access = true;
+        self.bus_locked = false;
+        let phys = self
+            .exec
+            .state
+            .tlb
+            .shadow_mut()
+            .and_then(|shadow| shadow.note_fast_store(addr, bytes));
+        let Some(phys) = phys else {
+            debug_assert!(false, "an inlined store used an entry that holds no RAM");
+            return;
+        };
+        self.exec.mem.monitor().note_store(phys, bytes);
+        self.exec.note_write(phys);
+        self.note_writes();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2232,6 +2496,121 @@ mod tests {
             // is driven at `Bits::B32` there.
             agree_on(&seeded(seed * 11 + 5).compat(), Engine::JitHost, 6_000, 6);
         }
+    }
+
+    // -- the inlined memory path -----------------------------------------
+    //
+    // The differential harnesses above already say the two engines agree; what
+    // these say is that the agreement is reached over the *inlined* path rather
+    // than over a plan nothing ever published, and that the three things an
+    // inlined store walks past are paid.
+
+    /// Long mode serves its memory inline, and no other world does.
+    ///
+    /// [`BUSY_LOOP`] in each of the four worlds `World::of` accepts: two loads
+    /// and two stores per pass, none of them a read-modify-write, so every one
+    /// of them is a candidate. Only long mode has segment bases the frontend
+    /// may drop — see `lift::Lifter::flat` — and compatibility mode is long
+    /// mode's *tables* under a 32-bit code segment, which is not the same
+    /// question and is refused.
+    #[test]
+    fn long_mode_serves_its_memory_inline_and_no_other_world_does() {
+        let jit = agree(&busy(2), 8_000, 8);
+        let s = jit.jit_stats().expect("statistics");
+        assert!(s.fast_loads > 0, "the shadow was never warm for a load");
+        assert!(s.fast_stores > 0, "the shadow was never warm for a store");
+        for world in [0usize, 1, 3] {
+            let jit = agree(&busy(world), 8_000, 8);
+            let s = jit.jit_stats().expect("statistics");
+            assert_eq!(
+                (s.fast_loads, s.fast_stores),
+                (0, 0),
+                "world {world} has segment bases, so nothing in it may be inlined"
+            );
+        }
+    }
+
+    /// An inlined store marks the dirty bitmap an interpreted one marks.
+    ///
+    /// Generated code writes through the host address the shadow carries, and
+    /// `RamStore::write_at` — which is what marks the bitmap — never runs. That
+    /// bitmap is the only record a framebuffer refresh or a live snapshot has
+    /// (`ROADMAP.md` §4.1), and losing it is silent in every other test here.
+    ///
+    /// Compared against the interpreter rather than asserted against a page
+    /// number, because the page a generated program's store lands on is not
+    /// this test's business and the *set* of them is exactly the invariant.
+    #[test]
+    fn an_inlined_store_leaves_the_dirty_pages_an_interpreted_one_leaves() {
+        let case = busy(2);
+        let (space_a, ram_a) = differential::machine(&case);
+        let (space_b, ram_b) = differential::machine(&case);
+        let interp = core(&case, space_a, Engine::Interp);
+        let jit = core(&case, space_b, Engine::JitHost);
+        interp.run_budget(40_000);
+        jit.run_budget(40_000);
+        assert!(
+            jit.jit_stats().expect("statistics").fast_stores > 0,
+            "no store was served inline, so this proves nothing"
+        );
+        let pages = |ram: &RamStore| {
+            let mut out = alloc::vec::Vec::new();
+            ram.for_each_dirty_page(|p| out.push(p));
+            out
+        };
+        assert_eq!(
+            pages(&ram_a),
+            pages(&ram_b),
+            "a compiled store left a different set of pages dirty"
+        );
+    }
+
+    /// And it breaks a sibling's reservation, which `SpaceView::write` does for
+    /// every store that goes through the address space and nothing at all does
+    /// for one that does not.
+    ///
+    /// One monitor slot per page of guest RAM, reserved on both machines, and
+    /// the two sets of survivors compared: a reservation that outlived a store
+    /// because the store happened to be compiled is a lost update in guest
+    /// software on whichever core held it.
+    #[test]
+    fn an_inlined_store_breaks_the_reservations_an_interpreted_one_breaks() {
+        let case = busy(2);
+        let (space_a, _ram_a) = differential::machine(&case);
+        let (space_b, _ram_b) = differential::machine(&case);
+        // A kibibyte is the widest granule a slot carries
+        // (`monitor::MAX_GRANULE_SHIFT`), so this is four per page.
+        let reserve = |space: &Arc<AddressSpace>| {
+            (0..case.ram_size() / 1024)
+                .map(|granule| {
+                    let slot = crate::core::space::MonitorSlot::new(Arc::clone(space), 10)
+                        .expect("a monitor slot");
+                    slot.reserve(differential::BASE + granule * 1024);
+                    slot
+                })
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        let held_a = reserve(&space_a);
+        let held_b = reserve(&space_b);
+        let interp = core(&case, Arc::clone(&space_a), Engine::Interp);
+        let jit = core(&case, Arc::clone(&space_b), Engine::JitHost);
+        interp.run_budget(40_000);
+        jit.run_budget(40_000);
+        assert!(
+            jit.jit_stats().expect("statistics").fast_stores > 0,
+            "no store was served inline, so this proves nothing"
+        );
+        let survivors = |slots: &[crate::core::space::MonitorSlot]| {
+            slots
+                .iter()
+                .map(|s| s.holds())
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        assert_eq!(
+            survivors(&held_a),
+            survivors(&held_b),
+            "a compiled store left a reservation an interpreted one broke"
+        );
     }
 
     #[test]

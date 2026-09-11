@@ -1432,6 +1432,22 @@ struct Segments {
     limit: [u64; seg::COUNT],
 }
 
+/// The linear address a [`MemOp`] names, through a [`Segments`] or not at all.
+///
+/// A descriptor carries a segment register and is an *effective* address;
+/// one with none carries a **linear** address, because `lift::Lifter::flat`
+/// already made the fold. The unpaged legs of this harness only ever see the
+/// second in a world whose bases are zero, so the two answers coincide — but
+/// saying so here rather than defaulting to `DS` is what makes a later world
+/// with a based `DS` a compile-time question rather than a silent one.
+fn linear_of(segs: &Segments, mem: &MemOp, addr: u64) -> MemResult<u64> {
+    match mem.seg {
+        Some(sr) => segs.linear(sr.0, addr, mem.size.bytes()),
+        None if crate::cpu::x86::prot::canonical(addr) => Ok(addr),
+        None => Err(BusError::Protected),
+    }
+}
+
 impl Segments {
     const fn flat_data() -> Segments {
         Segments {
@@ -1619,15 +1635,26 @@ impl Host {
             ..
         } = self;
         let mmu = mmu.as_mut().expect("only a paged host reaches here");
-        let sr = mem.seg.map_or(seg::DS, |s| s.0);
         let size = mem.size.bytes() as u8;
         let before = mmu.state.cycles;
         let (answer, lin) = {
             let mut exec = Exec::new(&mut mmu.state, space, None, &mmu.cfg, &mmu.lines);
-            let lin = exec.seg_linear(sr, addr, u64::from(size), value.is_some());
-            let answer = match value {
-                None => exec.read_mem(sr, addr, size),
-                Some(v) => exec.write_mem(sr, addr, size, v).map(|()| 0),
+            // A `MemOp` with no segment carries a **linear** address: the
+            // frontend's inlined path already made the fold, which in long mode
+            // is the identity, and the canonical test is all that is left of
+            // `Exec::seg_linear` there. See `lift::STACK`.
+            let answer = match (mem.seg, value) {
+                (Some(sr), None) => exec.read_mem(sr.0, addr, size),
+                (Some(sr), Some(v)) => exec.write_mem(sr.0, addr, size, v).map(|()| 0),
+                (None, _) if !crate::cpu::x86::prot::canonical(addr) => {
+                    Err(crate::cpu::x86::exec::Fault::gp(0))
+                }
+                (None, None) => exec.linear_read(addr, size),
+                (None, Some(v)) => exec.linear_write(addr, size, v).map(|()| 0),
+            };
+            let lin = match mem.seg {
+                Some(sr) => exec.seg_linear(sr.0, addr, u64::from(size), value.is_some()),
+                None => Ok(addr),
             };
             (answer, lin)
         };
@@ -1682,7 +1709,11 @@ impl Host {
         // near transfer asking whether its target may be transferred to, which
         // is `Exec::jump_near`'s canonical test. No memory, no bus cycle, no
         // clocks. See `lift`'s constant for the whole contract.
-        if mem.space == lift::TRANSFER {
+        // The same non-access for a stack address, which differs from the one
+        // above only in the vector it raises — `#SS(0)` rather than `#GP(0)`,
+        // a distinction this harness folds into `BusError::Protected` along
+        // with every other fault. See `lift::STACK`.
+        if mem.space == lift::TRANSFER || mem.space == lift::STACK {
             return if crate::cpu::x86::prot::canonical(addr) {
                 Ok(0)
             } else {
@@ -1692,8 +1723,7 @@ impl Host {
         if self.mmu.is_some() {
             return self.paged_access(mem, addr, value);
         }
-        let sr = mem.seg.map_or(seg::DS, |s| s.0);
-        let lin = self.segs.linear(sr, addr, mem.size.bytes())?;
+        let lin = linear_of(&self.segs, mem, addr)?;
         // Paging is out of the lifted subset, so a whole access is one bus
         // transaction whatever its alignment: only a page crossing splits one,
         // and `Exec::linear_read` only splits when paging is on.
@@ -2328,15 +2358,26 @@ impl CachedHost {
             ..
         } = self;
         let mmu = mmu.as_mut().expect("only a paged host reaches here");
-        let sr = mem.seg.map_or(seg::DS, |s| s.0);
         let size = mem.size.bytes() as u8;
         let before = mmu.state.cycles;
         let (answer, lin) = {
             let mut exec = Exec::new(&mut mmu.state, space, None, &mmu.cfg, &mmu.lines);
-            let lin = exec.seg_linear(sr, addr, u64::from(size), value.is_some());
-            let answer = match value {
-                None => exec.read_mem(sr, addr, size),
-                Some(v) => exec.write_mem(sr, addr, size, v).map(|()| 0),
+            // A `MemOp` with no segment carries a **linear** address: the
+            // frontend's inlined path already made the fold, which in long mode
+            // is the identity, and the canonical test is all that is left of
+            // `Exec::seg_linear` there. See `lift::STACK`.
+            let answer = match (mem.seg, value) {
+                (Some(sr), None) => exec.read_mem(sr.0, addr, size),
+                (Some(sr), Some(v)) => exec.write_mem(sr.0, addr, size, v).map(|()| 0),
+                (None, _) if !crate::cpu::x86::prot::canonical(addr) => {
+                    Err(crate::cpu::x86::exec::Fault::gp(0))
+                }
+                (None, None) => exec.linear_read(addr, size),
+                (None, Some(v)) => exec.linear_write(addr, size, v).map(|()| 0),
+            };
+            let lin = match mem.seg {
+                Some(sr) => exec.seg_linear(sr.0, addr, u64::from(size), value.is_some()),
+                None => Ok(addr),
             };
             (answer, lin)
         };
@@ -2366,7 +2407,11 @@ impl CachedHost {
         // near transfer asking whether its target may be transferred to, which
         // is `Exec::jump_near`'s canonical test. No memory, no bus cycle, no
         // clocks. See `lift`'s constant for the whole contract.
-        if mem.space == lift::TRANSFER {
+        // The same non-access for a stack address, which differs from the one
+        // above only in the vector it raises — `#SS(0)` rather than `#GP(0)`,
+        // a distinction this harness folds into `BusError::Protected` along
+        // with every other fault. See `lift::STACK`.
+        if mem.space == lift::TRANSFER || mem.space == lift::STACK {
             return if crate::cpu::x86::prot::canonical(addr) {
                 Ok(0)
             } else {
@@ -2376,8 +2421,7 @@ impl CachedHost {
         if self.mmu.is_some() {
             return self.paged_access(mem, addr, value);
         }
-        let sr = mem.seg.map_or(seg::DS, |s| s.0);
-        let lin = self.segs.linear(sr, addr, mem.size.bytes())?;
+        let lin = linear_of(&self.segs, mem, addr)?;
         self.ticks += self.bus;
         match value {
             None => self

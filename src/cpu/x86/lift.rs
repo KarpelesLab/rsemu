@@ -289,11 +289,18 @@
 //! It also subsumes `CS.base`, which is why [`World::generation`] is left out
 //! of a paged key rather than added to it: under either policy a paged block
 //! may be lifted under — [`Smc::EndBlock`] and [`Smc::HostGuard`] — no
-//! segment base appears as a constant in the emitted IR at all
-//! ([`MemOp::seg`] carries the register and the host folds the base), so the
+//! segment base appears as a constant in the emitted IR at all, so the
 //! only thing `CS.base` decides is *which bytes* the entry names, and the
 //! physical page it resolved to decides that exactly. [`Smc::Guard`] is the
 //! one that does fold a base into a constant, and it is the one refused here.
+//!
+//! The inlined memory path below does not weaken that, and the reason is worth
+//! stating because it is the one thing that would: `Lifter::flat` drops a
+//! segment register only where the base it would have folded is
+//! *architecturally* zero — long mode's `CS`, `DS`, `ES` and `SS` — so the
+//! address in the IR is the same number under every world a paged key can
+//! collide. `FS` and `GS` have a base that an MSR moves, and they are refused
+//! for exactly this reason rather than for a cost.
 //!
 //! ## The contract a caller owes, which is the one that looks like a working JIT
 //!
@@ -544,9 +551,9 @@
 //! * a store that **remaps the address space**, which `Frontend::epoch`
 //!   noticed at the next block boundary while a store was the last instruction
 //!   in its block. One relaxed atomic load per store now says so at the store.
-//!   There are no shadow-TLB host pointers to retire with it, which is the one
-//!   part of A64's answer this core does not need: it publishes no `FastMem`
-//!   plan.
+//!   The shadow-TLB host pointers a remap retires go with it, and they are
+//!   `paging::Tlb::sync`'s to drop: it mirrors a topology change into the
+//!   shadow on the same call that flushes this core's own buffer.
 //!
 //! ### And one thing it makes unsound, which is flag elision at that boundary
 //!
@@ -577,10 +584,59 @@
 //! only fault a lifted instruction can take is on a **data** operand: a
 //! segment-limit or access-rights violation — `#GP` through most registers and
 //! `#SS` through the stack, which is why [`MemOp::seg`] carries the register
-//! rather than the frontend folding the base into the address — and, under
-//! [`Origin::Paged`], a `#PF` from the host's own translation. All three
-//! arrive as one thing here, because the vector is the interpreter's business
-//! and what the block owes is the state *at* the instruction.
+//! rather than the frontend folding the base into the address, everywhere the
+//! fold is not the identity — and, under [`Origin::Paged`], a `#PF` from the
+//! host's own translation. All three arrive as one thing here, because the
+//! vector is the interpreter's business and what the block owes is the state
+//! *at* the instruction.
+//!
+//! # The inlined memory path
+//!
+//! `jit::x86`'s `Compiler::inlinable` refuses to inline a **segmented** access,
+//! and for four years every access this frontend emitted was one — so x86 paid
+//! a call into `IrHost::load` for every load and store a block made, where A64
+//! and RISC-V paid a mask, a compare and an add. On a `pc64` boot that was the
+//! largest single item in the profile: the address space and the memory path
+//! around it were **50.8%** of 82.1 G host instructions over 120 guest seconds.
+//!
+//! The refusal was right and the premise underneath it had stopped being true.
+//! An x86 load's address is an *effective* address — base plus index times
+//! scale plus displacement, then the segment base, then a width wrap — and
+//! every part of that except the segment base is already in the IR, computed by
+//! `Lifter::ea` and masked by [`World::addr_mask`]. What was left was the
+//! fold, and **in long mode the fold is the identity** for four of the six
+//! registers: `CS`, `DS`, `ES` and `SS` are defined to have a base of zero and
+//! no limit whatever their descriptor caches hold (*Intel SDM* volume 3
+//! §3.4.4), which is the rule [`World::of`] already writes into
+//! [`World::seg_base`].
+//!
+//! So `Lifter::flat` emits the linear address it already had and clears
+//! [`MemOp::seg`], and the backend inlines the access with no segment logic of
+//! its own. The table it probes is `paging::Tlb`'s shadow, written in lockstep
+//! with this core's own data buffer. **What that costs is 25.7% of the whole
+//! profile**: 82.1 G host instructions to 61.1 G over the same 179 393 038
+//! guest instructions retired in blocks — 458 per guest instruction to 340 —
+//! with `Machine::state_hash` identical at nine hundred guest seconds.
+//!
+//! Three things had to be settled, and each is a refusal rather than a
+//! mechanism:
+//!
+//! * **The fault vector.** Dropping the register drops the one thing
+//!   `Exec::seg_linear` reads out of it in long mode: a non-canonical address is
+//!   `#SS(0)` through the stack and `#GP(0)` through everything else. The three
+//!   data segments need nothing — `cpu::x86::engine`'s host answers `#GP(0)`
+//!   itself — and the stack carries [`STACK`], an add and an unsigned compare
+//!   branched over in the case that always holds.
+//! * **`FS` and `GS`.** Their bases come from an MSR and are live state, and
+//!   under [`Origin::Paged`] a block is keyed by the physical page of its bytes
+//!   rather than by [`World::generation`] — so a block that folded one in would
+//!   be reused under another. Refused outright, base zero or not. Linux puts its
+//!   per-CPU area behind `GS`, so this is a real exclusion.
+//! * **The open bus.** [`OPEN_BUS`] and `Plan::one_last_access` have it. An
+//!   access the backend serves never reaches `IrHost::load`, so nothing latches
+//!   `State::open_bus` for it and the block has to carry the byte — in a slot,
+//!   published at a boundary, which is why an instruction that can fault *after*
+//!   its access keeps the call.
 //!
 //! # Guest state: the slot numbering
 //!
@@ -742,8 +798,31 @@ pub const OF: RegSlot = RegSlot(22);
 /// the subset that write it, and `LAHF` the only one that reads it.
 pub const EFLAGS_REST: RegSlot = RegSlot(23);
 
+/// The byte the last bus transaction left on the data bus.
+///
+/// `State::open_bus` — architectural on this core in the strict sense, because
+/// it is in the snapshot and therefore in `Machine::state_hash`, and because an
+/// access nothing answers reads it back (`Exec::phys_read`).
+///
+/// It is a slot because of [`Origin::Flat`]'s inlined memory path and for no
+/// other reason. `IrHost::load` latches the byte itself, so a block whose every
+/// access is a call needs no slot at all; an access the **backend** serves
+/// never reaches the host, and [`FastMem::note_fast_load`] is handed neither the
+/// address nor the value, so the byte has nowhere to come from but the block.
+/// So the block carries it: one shift after each inlined access, published like
+/// any other slot at the boundary the guest could be standing on.
+///
+/// Unlike every other slot it is **never read back** — nothing in the subset
+/// consumes the open bus — and `cpu::x86::engine`'s `Host` writes it straight
+/// through to `Exec` rather than into the slot array, because a fault that a
+/// *call* raised has already latched the byte the walk put there and a
+/// published slot must not overwrite it. See that file's `Host::bus_locked`.
+///
+/// [`FastMem::note_fast_load`]: crate::jit::FastMem::note_fast_load
+pub const OPEN_BUS: RegSlot = RegSlot(24);
+
 /// One past the highest slot this frontend numbers.
-pub const SLOT_COUNT: u16 = 24;
+pub const SLOT_COUNT: u16 = 25;
 
 /// The six arithmetic flag slots, in this frontend's own order.
 pub const FLAG_SLOTS: [RegSlot; 6] = [CF, PF, AF, ZF, SF, OF];
@@ -840,6 +919,34 @@ pub const PAGE_MASK: u64 = PAGE_SIZE - 1;
 /// refuses to inline anything that is not [`MemSpace::MEM`], so both backends
 /// route this to the host without knowing what it is.
 pub const TRANSFER: MemSpace = MemSpace(0x86);
+
+/// The space a **stack** address's canonical test is asked in.
+///
+/// Exactly [`TRANSFER`]'s mechanism and contract — no bus cycle, no clocks, no
+/// memory, `Ok(0)` when the address is canonical — with one difference, which
+/// is the whole reason it exists: it raises `#SS(0)` where [`TRANSFER`] raises
+/// `#GP(0)`.
+///
+/// # Why a stack address needs one and a data address does not
+///
+/// The inlined memory path (`Lifter::flat`) hands the backend a **linear**
+/// address and clears [`MemOp::seg`], because `jit::x86`'s `Compiler::inlinable`
+/// refuses to inline a segmented access. In long mode that is exact for `CS`,
+/// `DS`, `ES` and `SS` — their bases are defined to be zero, so the effective
+/// address *is* the linear one — and it costs nothing, because the fold it
+/// drops is the identity.
+///
+/// What it does drop is the *register*, and `Exec::seg_linear` reads one thing
+/// out of it: a non-canonical address is `#SS(0)` through the stack and
+/// `#GP(0)` through everything else. For the three data segments the host's own
+/// canonical test answers `#GP(0)` and nothing is emitted. For `SS` the block
+/// tests the address itself — an add and an unsigned compare, branched over in
+/// the case that always holds — and reaches this space only when it does not.
+///
+/// The alternative was refusing `SS` altogether, which on an x86-64 guest is
+/// every `PUSH`, every `POP`, and every `[RSP+n]` and `[RBP-n]` operand a
+/// compiler emits — which is to say most of the accesses worth inlining.
+pub const STACK: MemSpace = MemSpace(0x87);
 
 /// How many guest instructions [`lift`] takes by default.
 ///
@@ -1637,6 +1744,58 @@ impl Plan {
             _ => 0,
         }
     }
+
+    /// Whether this plan's guest instruction makes **at most one** memory
+    /// access and can fault at nothing after it.
+    ///
+    /// The gate on `Lifter::flat`, and it is written default-deny on purpose:
+    /// a plan added later and not thought about here keeps the call it has
+    /// always had, which costs speed and never correctness.
+    ///
+    /// # What the question is actually about, which is the open bus
+    ///
+    /// An access the **backend** serves never reaches `IrHost::load`, so
+    /// nothing latches `State::open_bus` for it and the block carries the byte
+    /// in [`OPEN_BUS`] instead. A slot is published at a *boundary*, and a fault
+    /// publishes the boundary the faulting instruction **started** at — so a
+    /// second access that faults would publish the byte from before the first,
+    /// where the interpreter has the byte the first access left. That is a
+    /// state-hash divergence and nothing shallower would find it: it needs an
+    /// instruction that touches memory twice and faults on the second touch,
+    /// which is `add [copy-on-write page], 1`.
+    ///
+    /// So the clauses below are all one clause said about different shapes:
+    /// *is there anything after this access that the guest could fault on*.
+    ///
+    /// * **A read-modify-write is two accesses.** `ADD`, `INC`, `NEG`, `NOT`,
+    ///   a shift and `BSWAP` with a memory operand all read it and write it
+    ///   back, and the write can take a `#PF` the read did not — a page mapped
+    ///   read-only is exactly that. `CMP` and `TEST` are the two that read a
+    ///   memory destination and never write it.
+    /// * **A computed transfer checks its target after the access.**
+    ///   `RET`, `JMP r/m` and `CALL r/m` reach [`TRANSFER`] after their operand
+    ///   read, and that raises `#GP(0)`. A *relative* call cannot:
+    ///   [`static_target`] refuses a non-canonical one at lift time, so the
+    ///   push is the whole instruction.
+    /// * **`PUSH [m]` and `POP [m]` are two accesses**, one of each; with a
+    ///   register or an immediate operand they are one.
+    fn one_last_access(self, f: &Fields) -> bool {
+        match self {
+            // The memory operand is the *source*, or the instruction is one of
+            // the two that reads a memory destination without writing it back.
+            Plan::Alu(op) => matches!(op, Op::CMP | Op::TEST) || !Lifter::is_memory(f, f.insn.dst),
+            Plan::Mov
+            | Plan::MovX { .. }
+            | Plan::SetCc(_)
+            | Plan::CmovCc(_)
+            | Plan::Mul { .. }
+            | Plan::ImulShort
+            | Plan::BitScan { .. }
+            | Plan::CallRel { .. } => true,
+            Plan::Push | Plan::Pop => !Lifter::touches_memory(f),
+            _ => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1740,6 +1899,27 @@ struct Lifter<'a> {
     pc_out: Option<Temp>,
     /// The exit `EIP` where it is a constant, for the exit boundary's `pc`.
     static_exit: Option<u64>,
+    /// Whether the instruction being lifted may take the inlined memory path.
+    ///
+    /// Reset to `false` before every instruction and set by
+    /// `Plan::one_last_access` alone, so an instruction nobody has thought
+    /// about keeps the call it has always had. See `Lifter::flat`.
+    flat_insn: bool,
+    /// How many memory accesses the instruction being lifted has emitted.
+    ///
+    /// Only the first may be flat, and `Plan::one_last_access` is supposed to
+    /// mean there is never a second; this is what turns "supposed to" into a
+    /// debug assertion.
+    flat_used: u8,
+    /// The temporary holding [`OPEN_BUS`], where the block is the authority for
+    /// it.
+    ///
+    /// `Some` exactly while the last bus transaction the block made was one the
+    /// backend may have served itself. Cleared by an access that goes through
+    /// [`IrHost::load`](crate::ir::IrHost::load), because that latches
+    /// `State::open_bus` for real and a stale temporary published over it would
+    /// be a state-hash divergence.
+    ob: Option<Temp>,
 }
 
 impl<'a> Lifter<'a> {
@@ -1767,6 +1947,9 @@ impl<'a> Lifter<'a> {
             ticks: 0,
             pc_out: None,
             static_exit: None,
+            flat_insn: false,
+            flat_used: 0,
+            ob: None,
         }
     }
 
@@ -2034,6 +2217,13 @@ impl<'a> Lifter<'a> {
         if let Some(t) = self.rest {
             live.push((EFLAGS_REST, t));
         }
+        // Only where the block is the authority for it. An access that went
+        // through `IrHost::load` latched `State::open_bus` itself, and naming
+        // the slot at a boundary after one would publish a stale byte over a
+        // live one.
+        if let Some(t) = self.ob {
+            live.push((OPEN_BUS, t));
+        }
         live
     }
 
@@ -2048,7 +2238,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    fn mem_op(size: u8, sr: u8, kind: AccessKind) -> MemOp {
+    fn mem_op(size: u8, sr: u8, kind: AccessKind, flat: bool) -> MemOp {
         MemOp {
             size: Self::width_of(size),
             sign: Sign::Unsigned,
@@ -2056,7 +2246,14 @@ impl<'a> Lifter<'a> {
             // Carried rather than folded into the address: the descriptor is
             // hidden state, and the fault differs by register — a stack
             // violation is `#SS` where every other segment raises `#GP`.
-            seg: Some(SegId(sr)),
+            //
+            // Cleared on the inlined path, where the fold has already been made
+            // because in long mode it is the identity, and the fault vector has
+            // been settled by `Lifter::flat` and [`STACK`]. `jit::x86`'s
+            // `Compiler::inlinable` refuses a segmented access, so this field is
+            // the whole of what decides whether an access is generated code or
+            // a call.
+            seg: (!flat).then_some(SegId(sr)),
             endian: Endian::Little,
             // Alignment is the *host's* business, not a constraint the block
             // states: an unaligned access is one bus transaction unless it
@@ -2071,14 +2268,128 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Whether this access may take the inlined path, and the guard it owes if
+    /// it does.
+    ///
+    /// Every clause is a case where a linear address and a segmented one are
+    /// the **same number**, so that handing the backend the first is not an
+    /// approximation of the second:
+    ///
+    /// * **Long mode only.** Below it a segment has a base, a limit, a present
+    ///   bit and a direction, all of them hidden descriptor state that a
+    ///   `MOV DS, ax` replaces between two instructions — and `World::of` lets
+    ///   `DS`, `ES`, `FS` and `GS` carry any of it. In long mode `CS`, `DS`,
+    ///   `ES` and `SS` are *defined* to have a base of zero and no limit
+    ///   (*Intel SDM* volume 3 §3.4.4), which `World::of` writes into
+    ///   [`World::seg_base`] without consulting the descriptor cache at all.
+    /// * **Never `FS` or `GS`.** Their bases come from an MSR and are real,
+    ///   changing state: folding one in would make the block a function of the
+    ///   world, and under [`Origin::Paged`] a block is keyed by the physical
+    ///   page of its bytes and *not* by [`World::generation`]. A block lifted
+    ///   under one `GS` base would be reused under another. The base is checked
+    ///   for zero as well, which is redundant given the register test and is
+    ///   what makes the claim self-evident rather than inherited.
+    /// * **Only where the instruction's access is its last chance to fault**
+    ///   (`Plan::one_last_access`), because the byte the access leaves on the
+    ///   open bus rides in a slot that is published at a *boundary*, and a fault
+    ///   after the access publishes the boundary the instruction started at.
+    /// * **The first access of the instruction**, for the same reason, asserted
+    ///   rather than assumed.
+    fn flat(&mut self, sr: u8) -> bool {
+        if !self.flat_insn || self.flat_used > 0 {
+            return false;
+        }
+        if !self.world.long()
+            || matches!(sr, seg::FS | seg::GS)
+            || self.world.seg_base[sr as usize] != 0
+        {
+            return false;
+        }
+        self.flat_used += 1;
+        true
+    }
+
+    /// Remember the byte this transfer leaves on the data bus.
+    ///
+    /// `Exec::phys_read` and `Exec::phys_write` both latch
+    /// `value >> (8 * (size - 1))`, narrowed to a byte by the store into
+    /// `State::open_bus`; the narrowing is `cpu::x86::engine`'s to do, so this
+    /// is the shift and nothing else. At one byte it is not even that.
+    fn note_open_bus(&mut self, value: Temp, size: u8) {
+        self.ob = Some(if size <= 1 {
+            value
+        } else {
+            self.shr_const(value, u32::from(size - 1) * 8)
+        });
+    }
+
+    /// The canonical guard an `SS`-relative access on the inlined path owes.
+    ///
+    /// `(addr + 2^47) < 2^48` unsigned is `prot::canonical` written so that it
+    /// is an add and one unsigned compare: a canonical address is either below
+    /// `2^47`, where the bias lands it in `[2^47, 2^48)`, or at or above
+    /// `2^64 - 2^47`, where the bias wraps it into `[0, 2^47)`. Everything
+    /// between biases to `2^48` or above and wraps nowhere.
+    ///
+    /// Branched **over** in the case that always holds, so the cost in the
+    /// common case is an add, a compare and a not-taken branch.
+    fn require_stack(&mut self, addr: Temp) {
+        let bias = self.konst(1u64 << 47);
+        let biased = self.b.binary(Opcode::ADD, Type::I64, addr, bias);
+        let limit = self.konst(1u64 << 48);
+        let over = self.b.emit_raw(
+            Opcode::BRCOND,
+            Type::I64,
+            None,
+            None,
+            &[biased, limit],
+            None,
+            Some(Cond::LtU),
+            0,
+        );
+        let mem = MemOp {
+            size: Width::U8,
+            sign: Sign::Unsigned,
+            space: STACK,
+            seg: None,
+            endian: Endian::Little,
+            align: Align::None,
+            kind: AccessKind::Fetch,
+            // It can fault, which is the entire point, so it is not removable.
+            volatile: true,
+        };
+        let _ = self.b.load(Type::I64, addr, mem);
+        let after = self.b.next_index() as u32;
+        self.b.patch_aux(over, after);
+    }
+
     fn mem_load(&mut self, sr: u8, addr: Temp, size: u8) -> Temp {
-        let mem = Self::mem_op(size, sr, AccessKind::Load);
-        self.b.load(Type::I64, addr, mem)
+        let flat = self.flat(sr);
+        if flat && sr == seg::SS {
+            self.require_stack(addr);
+        }
+        let mem = Self::mem_op(size, sr, AccessKind::Load, flat);
+        let value = self.b.load(Type::I64, addr, mem);
+        if flat {
+            self.note_open_bus(value, size);
+        } else {
+            self.ob = None;
+        }
+        value
     }
 
     fn mem_store(&mut self, sr: u8, addr: Temp, value: Temp, size: u8) {
-        let mem = Self::mem_op(size, sr, AccessKind::Store);
+        let flat = self.flat(sr);
+        if flat && sr == seg::SS {
+            self.require_stack(addr);
+        }
+        let mem = Self::mem_op(size, sr, AccessKind::Store, flat);
         self.b.store(Type::I64, addr, value, mem);
+        if flat {
+            self.note_open_bus(value, size);
+        } else {
+            self.ob = None;
+        }
         // Under `Smc::EndBlock` nothing after this store exists to be
         // modified, because the block ends here; under `Shape::BasicBlock` the
         // access ends the block for its own reason and the guard would be
@@ -2632,7 +2943,18 @@ impl<'a> Lifter<'a> {
             let _ = self.ea(f);
         }
 
-        self.emit(f, plan, eip, next_eip)
+        // Whether this instruction's access — if it makes one — may be the
+        // backend's to serve. Decided here, before anything is emitted, because
+        // the answer is a property of the whole instruction and not of the
+        // access. See `Plan::one_last_access`.
+        self.flat_insn = plan.one_last_access(f);
+        self.flat_used = 0;
+        let flow = self.emit(f, plan, eip, next_eip);
+        debug_assert!(
+            self.flat_used <= 1,
+            "an instruction `Plan::one_last_access` called single-access made two"
+        );
+        flow
     }
 
     /// Which flag slots this boundary may leave out.
@@ -4669,6 +4991,210 @@ mod tests {
             Flags::default(),
         );
         assert_eq!(l.insns, 0, "49 90 is an exchange, not a no-operation");
+    }
+
+    // -- the inlined memory path -----------------------------------------
+
+    /// A long-mode block in the shape the inlined path is asked about.
+    fn long_lift(bytes: &[u8]) -> Lifted {
+        let mut world = paged_world(0x0020_0000);
+        world.bits = Bits::B64;
+        lift_at(
+            &world,
+            AT,
+            bytes,
+            Shape::default(),
+            Smc::HostGuard,
+            Flags::default(),
+        )
+    }
+
+    /// Every ordinary memory descriptor a block carries, load and store alike.
+    fn data_ops(block: &Block) -> Vec<MemOp> {
+        block
+            .insts()
+            .iter()
+            .filter_map(|i| i.mem)
+            .filter(|m| m.space == MemSpace::MEM)
+            .collect()
+    }
+
+    /// The whole of what `jit::x86`'s `Compiler::inlinable` looks at.
+    fn inlinable(m: &MemOp) -> bool {
+        m.space == MemSpace::MEM && m.seg.is_none()
+    }
+
+    /// In long mode the fold is the identity through the four segments that
+    /// have no base, so the frontend hands the backend the linear address it
+    /// already computed and clears the register.
+    #[test]
+    fn a_long_mode_data_access_is_handed_to_the_backend_as_a_linear_address() {
+        for (what, bytes) in [
+            ("mov rax, [rbx]", &[0x48u8, 0x8b, 0x03][..]),
+            ("mov [rbx], rax", &[0x48, 0x89, 0x03][..]),
+            ("mov eax, [rbx+8]", &[0x8b, 0x43, 0x08][..]),
+            ("cmp rax, [rbx]", &[0x48, 0x3b, 0x03][..]),
+            ("movzx eax, byte [rbx]", &[0x0f, 0xb6, 0x03][..]),
+            ("push rax", &[0x50][..]),
+            ("pop rax", &[0x58][..]),
+            ("mov rax, [rsp+8]", &[0x48, 0x8b, 0x44, 0x24, 0x08][..]),
+        ] {
+            let l = long_lift(bytes);
+            assert_eq!(l.insns, 1, "{what} lifts");
+            let ops = data_ops(&l.block);
+            assert_eq!(ops.len(), 1, "{what} makes one ordinary access");
+            assert!(inlinable(&ops[0]), "{what} must reach the backend inlined");
+        }
+    }
+
+    /// And below long mode it never does, because a segment there has a base
+    /// and a limit that live in the descriptor cache.
+    #[test]
+    fn nothing_below_long_mode_is_handed_over_as_a_linear_address() {
+        for world in [flat_world(), paged_world(0x0020_0000)] {
+            let l = lift_at(
+                &world,
+                AT,
+                &[0x8b, 0x03],
+                Shape::default(),
+                Smc::HostGuard,
+                Flags::default(),
+            );
+            assert_eq!(l.insns, 1);
+            let ops = data_ops(&l.block);
+            assert_eq!(ops.len(), 1);
+            assert!(
+                !inlinable(&ops[0]),
+                "a segmented world must keep the segment register"
+            );
+        }
+    }
+
+    /// `FS` and `GS` keep the call whatever their bases hold.
+    ///
+    /// Their bases are an MSR's and therefore live state, and a paged block is
+    /// keyed by the physical page of its bytes rather than by
+    /// [`World::generation`] — so a block that folded one in would be reused
+    /// under a different one. Linux puts its per-CPU area behind `GS`, so this
+    /// is a real refusal and not a hypothetical one.
+    #[test]
+    fn the_two_segments_that_still_have_a_base_in_long_mode_keep_the_call() {
+        for (what, prefix) in [("fs", 0x64u8), ("gs", 0x65)] {
+            let l = long_lift(&[prefix, 0x48, 0x8b, 0x03]);
+            assert_eq!(l.insns, 1, "{what}-relative load lifts");
+            let ops = data_ops(&l.block);
+            assert_eq!(ops.len(), 1);
+            assert!(
+                !inlinable(&ops[0]),
+                "{what} has a base an MSR can change, so it keeps the call"
+            );
+        }
+        // Even with the base at zero, which is what this world's `GS` holds:
+        // the refusal is about the register, not about the number in it.
+        let mut world = paged_world(0x0020_0000);
+        world.bits = Bits::B64;
+        assert_eq!(world.seg_base[usize::from(seg::GS)], 0);
+        let l = lift_at(
+            &world,
+            AT,
+            &[0x65, 0x48, 0x8b, 0x03],
+            Shape::default(),
+            Smc::HostGuard,
+            Flags::default(),
+        );
+        assert!(!inlinable(&data_ops(&l.block)[0]));
+    }
+
+    /// An instruction that touches memory twice keeps the call for both halves,
+    /// and so does one that can fault after its access.
+    ///
+    /// The reason is [`OPEN_BUS`] and is written out on
+    /// `Plan::one_last_access`: the byte an inlined access leaves on the data
+    /// bus rides in a slot published at a *boundary*, and a fault publishes the
+    /// boundary the instruction started at.
+    #[test]
+    fn an_instruction_that_can_fault_after_its_access_keeps_the_call() {
+        for (what, bytes, ops) in [
+            // Read-modify-write: the store can take a `#PF` the load did not,
+            // which is a copy-on-write page exactly.
+            ("add [rbx], rax", &[0x48u8, 0x01, 0x03][..], 2),
+            ("inc qword [rbx]", &[0x48, 0xff, 0x03][..], 2),
+            ("shl qword [rbx], 1", &[0x48, 0xd1, 0x23][..], 2),
+            ("not qword [rbx]", &[0x48, 0xf7, 0x13][..], 2),
+            // `RET` checks its target after popping it.
+            ("ret", &[0xc3][..], 1),
+            // `PUSH [m]` is a load and a store.
+            ("push qword [rbx]", &[0xff, 0x33][..], 2),
+        ] {
+            let l = long_lift(bytes);
+            assert_eq!(l.insns, 1, "{what} lifts");
+            let found = data_ops(&l.block);
+            assert_eq!(found.len(), ops, "{what} makes {ops} ordinary accesses");
+            for m in &found {
+                assert!(!inlinable(m), "{what} must keep the call");
+            }
+        }
+    }
+
+    /// A stack access on the inlined path carries its own canonical guard.
+    ///
+    /// The linear path drops the segment register, and `#SS(0)` rather than
+    /// `#GP(0)` is the one thing `Exec::seg_linear` reads out of it in long
+    /// mode. A data access needs nothing, because the host's own canonical test
+    /// answers `#GP(0)`.
+    #[test]
+    fn a_stack_access_on_the_inlined_path_carries_its_own_canonical_guard() {
+        let guards = |l: &Lifted| {
+            l.block
+                .insts()
+                .iter()
+                .filter(|i| i.mem.is_some_and(|m| m.space == STACK))
+                .count()
+        };
+        assert_eq!(guards(&long_lift(&[0x50])), 1, "push rax");
+        assert_eq!(guards(&long_lift(&[0x58])), 1, "pop rax");
+        assert_eq!(
+            guards(&long_lift(&[0x48, 0x8b, 0x44, 0x24, 0x08])),
+            1,
+            "mov rax, [rsp+8] is an SS-relative operand"
+        );
+        assert_eq!(
+            guards(&long_lift(&[0x48, 0x8b, 0x03])),
+            0,
+            "a DS-relative load needs no guard"
+        );
+        // And an access that keeps the call needs none either, because the
+        // segment register is still there to name the vector.
+        assert_eq!(guards(&long_lift(&[0xff, 0x33])), 0, "push qword [rbx]");
+    }
+
+    /// Every inlined access publishes the byte it leaves on the data bus, and
+    /// an access that keeps the call publishes nothing — because
+    /// `IrHost::load` latches it in `Exec` and a stale temporary over the top
+    /// of that is a state-hash divergence.
+    #[test]
+    fn the_open_bus_is_named_at_a_boundary_exactly_where_the_block_owns_it() {
+        // The block's **last** boundary, which is the exit: whether the byte
+        // left there is the block's to publish depends on what the last access
+        // before it was, and nothing else.
+        let names_open_bus = |l: &Lifted| {
+            l.block
+                .marks()
+                .last()
+                .is_some_and(|m| m.live.iter().any(|&(s, _)| s == OPEN_BUS))
+        };
+        // `mov rax, [rbx]` then `nop`: the load was inlined, so the byte is the
+        // block's.
+        assert!(names_open_bus(&long_lift(&[0x48, 0x8b, 0x03, 0x90])));
+        // `add [rbx], rax` keeps the call for both halves, so the block is not
+        // the authority and no boundary names it.
+        assert!(!names_open_bus(&long_lift(&[0x48, 0x01, 0x03, 0x90])));
+        // And an access that keeps the call *clears* an earlier inlined one.
+        assert!(!names_open_bus(&long_lift(&[
+            0x48, 0x8b, 0x03, // mov rax, [rbx]
+            0x48, 0x01, 0x0b, // add [rbx], rcx
+            0x90, // nop
+        ])));
     }
 
     // -- ticks and the page bound ----------------------------------------

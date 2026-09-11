@@ -360,7 +360,7 @@ impl TlbEntry {
 ///
 /// Derived state, and therefore never serialized (`CLAUDE.md`, Devices): the
 /// snapshot chunk carries no buffer and a restored machine simply re-walks.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct Tlb {
     /// Instruction translations — and, on [`Buffers::Unified`], data ones too.
     insn: [TlbEntry; ITLB_ENTRIES],
@@ -371,6 +371,32 @@ pub struct Tlb {
     /// The address-space topology generation these translations were taken
     /// under. A remap invalidates them all.
     generation: u64,
+    /// The host half of the same answers, for a code generator that inlines a
+    /// load. See [`Tlb::attach_shadow`].
+    #[cfg(feature = "jit")]
+    shadow: Option<alloc::boxed::Box<crate::jit::Tlb>>,
+}
+
+/// A clone carries the translations and **not** the shadow.
+///
+/// The only caller is `Device::save`, which lifts a whole `super::exec::State`
+/// out from under the lock to serialize it, and a snapshot carries no derived
+/// state at all — this buffer included (`CLAUDE.md`, *Devices*). Dropping the
+/// shadow is always sound in the direction that matters: a table with no shadow
+/// publishes no [`crate::jit::MemPlan`], so every access takes the call. The
+/// *original* keeps its own, which stays in lockstep with the translations the
+/// original still holds.
+impl Clone for Tlb {
+    fn clone(&self) -> Tlb {
+        Tlb {
+            insn: self.insn,
+            data: self.data,
+            buffers: self.buffers,
+            generation: self.generation,
+            #[cfg(feature = "jit")]
+            shadow: None,
+        }
+    }
 }
 
 impl Tlb {
@@ -382,7 +408,73 @@ impl Tlb {
             data: [TlbEntry::empty(); DTLB_ENTRIES],
             buffers,
             generation: 0,
+            #[cfg(feature = "jit")]
+            shadow: None,
         }
+    }
+
+    /// Give this buffer a [`jit::Tlb`](crate::jit::Tlb) shadow over `space`.
+    ///
+    /// # What the shadow is
+    ///
+    /// This table answers *linear page → physical frame*, which is half of what
+    /// a compiled load needs; the other half is *physical page → host address*,
+    /// and that is what `jit::Tlb` caches. The shadow is that second half,
+    /// indexed by the **same** linear page in the **same** slot, so a compiled
+    /// load reaches guest memory in a mask, a compare and an add —
+    /// `ROADMAP.md` §9.1's first mechanism, inlined.
+    ///
+    /// # Why it lives here rather than beside the engine
+    ///
+    /// Because the condition a hit has to satisfy is *"a hit here implies a hit
+    /// in the table that owes the walk"*, and the only way to guarantee that is
+    /// to write the two in lockstep — same index, same page, same moment. Every
+    /// eviction this table makes is an eviction of the shadow slot, and every
+    /// one of them happens in a method of this type: [`Tlb::insert`],
+    /// [`Tlb::invalidate`], [`Tlb::flush`] and [`Tlb::sync`]. A shadow kept
+    /// next to the engine would not hear about the ones an *interpreted*
+    /// instruction makes, and a core is reachable through `Cpu::step`, a
+    /// monitor and a debugger without entering the dispatcher at all.
+    ///
+    /// # Two things this core has that A64 and RISC-V do not
+    ///
+    /// * **One data array serves loads and stores.** `cpu::arm::a64::mmu`
+    ///   keeps a separate array per access kind, so filling a load entry can
+    ///   never evict a store one; here it can, so [`Tlb::insert`] clears the
+    ///   shadow slot in **both** sets and the fill that follows rewrites only
+    ///   the one the walk was for.
+    /// * **Only a part with [`Buffers::Split`] gets one.** On a unified part a
+    ///   data translation lands in the thirty-two-slot instruction array, which
+    ///   a sixty-four-slot shadow cannot index in lockstep with. `super::lift`
+    ///   already refuses paged code on those parts for its own reason, so
+    ///   nothing is lost that was reachable.
+    #[cfg(feature = "jit")]
+    pub fn attach_shadow(&mut self, space: alloc::sync::Arc<crate::core::space::AddressSpace>) {
+        if !matches!(self.buffers, Buffers::Split) {
+            return;
+        }
+        let shadow = crate::jit::Tlb::with_entries(space, DTLB_ENTRIES as u64);
+        debug_assert_eq!(
+            shadow.entries(),
+            DTLB_ENTRIES as u64,
+            "the shadow must index exactly as the data array does"
+        );
+        self.shadow = Some(alloc::boxed::Box::new(shadow));
+    }
+
+    /// The shadow, if one was attached.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub fn shadow_mut(&mut self) -> Option<&mut crate::jit::Tlb> {
+        self.shadow.as_deref_mut()
+    }
+
+    /// Whether a shadow is attached.
+    #[cfg(feature = "jit")]
+    #[inline]
+    #[must_use]
+    pub fn has_shadow(&self) -> bool {
+        self.shadow.is_some()
     }
 
     /// How this part's buffers are arranged.
@@ -403,7 +495,7 @@ impl Tlb {
     }
 
     /// Discard every cached translation, in both halves.
-    pub const fn flush(&mut self) {
+    pub fn flush(&mut self) {
         let mut i = 0;
         while i < ITLB_ENTRIES {
             self.insn[i] = TlbEntry::empty();
@@ -414,6 +506,14 @@ impl Tlb {
             self.data[i] = TlbEntry::empty();
             i += 1;
         }
+        // The shadow is only ever as live as this table is, so it goes with
+        // it. Losing it costs a refill; keeping an entry after this table
+        // dropped the matching one would let a compiled access skip a walk
+        // this table has just made itself owe again.
+        #[cfg(feature = "jit")]
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.flush();
+        }
     }
 
     /// Discard the translation for one linear address, as `INVLPG` does.
@@ -421,7 +521,7 @@ impl Tlb {
     /// Both halves, because `INVLPG` invalidates *the* translation for a page
     /// and the processor has no notion of invalidating only the data copy
     /// (*Intel SDM* volume 2, `INVLPG`; volume 3A §4.10.4.1).
-    pub const fn invalidate(&mut self, linear: u64) {
+    pub fn invalidate(&mut self, linear: u64) {
         let page = linear >> 12;
         let slot = (page as usize) % ITLB_ENTRIES;
         if self.insn[slot].page == page {
@@ -431,6 +531,14 @@ impl Tlb {
         if self.data[slot].page == page {
             self.data[slot] = TlbEntry::empty();
         }
+        // Unconditionally, and in both of the shadow's sets: a shadow entry
+        // that outlived the translation it shadows is exactly the promise
+        // `jit::fast` forbids, and an `INVLPG` is rare enough that clearing a
+        // slot that was already empty costs nothing worth measuring.
+        #[cfg(feature = "jit")]
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.invalidate_page(linear);
+        }
     }
 
     /// Discard everything if the address space has been remapped since these
@@ -438,10 +546,21 @@ impl Tlb {
     ///
     /// Called before every lookup. The generation counter is read without a
     /// lock by design (`core::space`), so this is one relaxed load per access.
-    pub const fn sync(&mut self, generation: u64) {
+    pub fn sync(&mut self, generation: u64) {
         if self.generation != generation {
             self.generation = generation;
             self.flush();
+        }
+        // The shadow holds *host pointers*, so a remap retires them whether or
+        // not this table had anything cached — and its own epoch has to move
+        // with this one or `Tlb::plan` would hand generated code a tag built
+        // from a generation the table is no longer filling under.
+        #[cfg(feature = "jit")]
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.sync(crate::jit::Epoch {
+                topology: generation,
+                translation: 0,
+            });
         }
     }
 
@@ -463,9 +582,18 @@ impl Tlb {
     }
 
     /// Record a translation in the half `fetch` selects.
-    pub const fn insert(&mut self, entry: TlbEntry, fetch: bool) {
+    pub fn insert(&mut self, entry: TlbEntry, fetch: bool) {
         if self.in_data(fetch) {
             self.data[(entry.page as usize) % DTLB_ENTRIES] = entry;
+            // Whatever the shadow held at this index belonged to the page this
+            // insert has just evicted, in *both* sets — this core's data array
+            // is one array for loads and stores alike, so a load's walk evicts
+            // the entry a store was using. `Exec::refresh_shadow` rewrites the
+            // one set this walk was actually for, immediately after.
+            #[cfg(feature = "jit")]
+            if let Some(shadow) = self.shadow.as_mut() {
+                shadow.invalidate_page(entry.page << 12);
+            }
         } else {
             self.insn[(entry.page as usize) % ITLB_ENTRIES] = entry;
         }
@@ -774,6 +902,15 @@ impl Exec<'_> {
                 && (!write || write_allowed(entry.writable, user, t.wp))
                 && !(access.fetch && entry.no_execute);
             if allowed && (!write || entry.dirty) {
+                // A hit fills no entry, so nothing invalidated the shadow's
+                // slot and nothing is about to rewrite it. That is exactly the
+                // case the shadow would otherwise never reach: a page whose
+                // entry was made by a *load* walk has an empty store set, and
+                // its dirty bit is usually already set, so every later store to
+                // it returns here and the inlined path would never once be
+                // taken. The guard is one index and one compare.
+                #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+                self.refresh_shadow(access, linear, entry.frame | (linear & 0xfff), false);
                 return Ok(entry.frame | (linear & 0xfff));
             }
             if !allowed {
@@ -834,7 +971,110 @@ impl Exec<'_> {
             },
             access.fetch,
         );
+        // In lockstep with the insert above, at the same index, for the same
+        // linear page — which is the whole of what makes an inlined access
+        // indistinguishable from this one. A hit in the shadow then implies a
+        // hit here, so the walk it skips is a walk that has already happened
+        // and has already been charged.
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        self.refresh_shadow(access, linear, walked.phys, true);
         Ok(walked.phys)
+    }
+
+    /// Write the shadow's slot for this page, so a compiled access may serve it
+    /// without calling back.
+    ///
+    /// Loads and stores only — the backend inlines nothing else
+    /// (`jit::x86::compile`, `Compiler::inlinable`) — and only under the
+    /// conditions that make a hit here mean exactly what a hit in this core's
+    /// own buffer means:
+    ///
+    /// * **The A20 gate must be open.** `Exec::masked` folds bit 20 out of the
+    ///   physical address on the way to the bus, and the shadow's host pointer
+    ///   was resolved from the address *before* that fold. With the gate shut
+    ///   the two are different pages. `lift::World::of` refuses a machine with
+    ///   the gate shut for its own reason, so nothing compiled can read what
+    ///   this refusal keeps out — but a fill is cheaper to skip than to reason
+    ///   about later.
+    /// * **A store entry is filled only by a walk *for a store*.** That walk is
+    ///   what checked `R/W` against `CR0.WP` and what set the leaf's dirty bit;
+    ///   filling the store set from a read's answer would lose both, and this
+    ///   core's read hit does not consult either.
+    /// * **A write's answer also fills the load set.** One walk, two sets,
+    ///   because a page this core may write at this privilege is a page it may
+    ///   read at it — and a read-modify-write instruction would otherwise walk
+    ///   twice for the two halves of one access.
+    ///
+    /// `phys` is the **whole** physical address, offset included, and not the
+    /// frame: `jit::Tlb::fill` refuses a page whose virtual and physical offsets
+    /// disagree, because a translation preserves them and one that does not is
+    /// not a page translation. Handing it a frame refuses every page but the
+    /// one an access happens to reach at offset zero.
+    ///
+    /// The privilege rides in the tag rather than being checked here, which is
+    /// what lets a supervisor entry and a user entry for the same page coexist
+    /// at one index the way this core's own buffer cannot: the tag is compared
+    /// by generated code, so a level that does not match is a miss and a miss
+    /// is the slow path.
+    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+    fn refresh_shadow(&mut self, access: Access, linear: u64, phys: u64, walked: bool) {
+        if access.fetch || self.lines.a20_mask() != u32::MAX {
+            return;
+        }
+        let ctx = crate::jit::Context {
+            level: if access.user { 3 } else { 0 },
+            translating: true,
+        };
+        let Some(shadow) = self.state.tlb.shadow_mut() else {
+            return;
+        };
+        let kind = if access.write {
+            crate::ir::AccessKind::Store
+        } else {
+            crate::ir::AccessKind::Load
+        };
+        if walked {
+            shadow.fill(kind, linear, phys, ctx);
+            // A walk for a store answers the load's question too, and a
+            // read-modify-write would otherwise walk twice for the two halves of
+            // one access. Only on the walk: doing it on a *hit* would re-probe
+            // the flat view every time a store page and a load page shared an
+            // index, which is a per-access cost where a walk is a per-page one.
+            if access.write {
+                shadow.fill(crate::ir::AccessKind::Load, linear, phys, ctx);
+            }
+        } else if !shadow.caches(kind, linear, ctx) {
+            shadow.fill(kind, linear, phys, ctx);
+        }
+    }
+
+    /// The table an inlined access of this kind resolves through, if generated
+    /// code may use it.
+    ///
+    /// Read once per block by `cpu::x86::engine`'s [`FastMem`] implementation.
+    /// Three refusals, each a case where a hit would not mean what a hit in
+    /// this core's own path means:
+    ///
+    /// * **paging off**, where nothing fills this table and the shadow's
+    ///   entries were all taken under a translation that is no longer running;
+    /// * **the A20 gate shut**, for the reason [`Exec::refresh_shadow`] gives;
+    /// * **no shadow**, which is every part with [`Buffers::Unified`] and every
+    ///   build with no translation runtime.
+    ///
+    /// [`FastMem`]: crate::jit::FastMem
+    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+    pub(super) fn mem_plan(&mut self, kind: crate::ir::AccessKind) -> Option<crate::jit::MemPlan> {
+        if !self.state.sys.paging() || self.lines.a20_mask() != u32::MAX {
+            return None;
+        }
+        let ctx = crate::jit::Context {
+            level: if self.cpl() == 3 { 3 } else { 0 },
+            translating: true,
+        };
+        let generation = self.mem.generation();
+        self.state.tlb.sync(generation);
+        let shadow = self.state.tlb.shadow_mut()?;
+        Some(shadow.plan(kind, ctx))
     }
 
     /// A data read or write — the common case, and the one every operand
