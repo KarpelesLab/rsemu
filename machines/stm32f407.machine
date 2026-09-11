@@ -184,6 +184,8 @@ machine "stm32f407" {
   param gpio-stride = 0x400
   param crc-off     = 0x3000       # AHB1 + 0x3000
   param rcc-off     = 0x3800       # AHB1 + 0x3800
+  param flash-off   = 0x3c00       # AHB1 + 0x3c00: the flash interface
+  param rtc-off     = 0x2800       # APB1 + 0x2800
   param dma-off     = 0x6000       # AHB1 + 0x6000, and DMA2 a kilobyte above
   param dma-stride  = 0x400
 
@@ -218,6 +220,11 @@ machine "stm32f407" {
   # an uncalibrated RC and why firmware that needs a real timeout uses the LSE.
   # The typical figure is what the manual's own timeout table is computed from.
   osc lsi = 32000 Hz
+
+  # The low-speed external crystal, and the reason 32768 is not a round number
+  # picked for looks: the RTC divides it by 128 and then by 256, so one calendar
+  # second is exactly 32768 of these ticks and nothing rounds. RM0090 §7.2.4.
+  osc lse = 32768 Hz
 
   # The USART's own can. One tick of a USART's clock domain is one *character*
   # time, so this is divided down to the character rate rather than to the baud
@@ -289,7 +296,16 @@ machine "stm32f407" {
   #
   # `image` names a media slot: whoever runs the machine binds the bytes
   # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
-  object rom "rom" { size = flash, image = "firmware" }
+  # The flash array **and** its controller, which are one device because they
+  # are one AHB slave on the die. `eflash.array` below is the array; the
+  # register window at `flash-off` is the interface that programs it. The object
+  # cannot be called `flash` — `param flash` above already claims that name.
+  object eflash "st.flash" {
+    clock   = hse
+    variant = "f4"
+    size    = flash
+    image   = "firmware"
+  }
 
   object ram1   "ram" { size = sram1 }
   object ram2   "ram" { size = sram2 }
@@ -414,6 +430,17 @@ machine "stm32f407" {
   object iwdg "st.iwdg" { clock = lsi,           window = false }
   object wwdg "st.wwdg" { clock = hse * 21 / 4,  wdgtb-shift = 7 }
 
+  # -- the real-time clock ---------------------------------------------------
+  #
+  # The other thing on the LSE, and the only peripheral on the die that keeps
+  # its state through a system reset — which is why firmware parks a reset
+  # reason in `BKP0R` and expects to find it. `epoch` is the calendar its backup
+  # domain comes up with, and it is written **here** rather than read from the
+  # host: a board seeded from `now()` replays differently every run and its
+  # snapshot hash would mean nothing. Leaving `epoch` out gets RM0090 §26's own
+  # reset value, 1 January 2000.
+  object rtc "st.rtc" { clock = lse, epoch = "2024-01-01T00:00:00" }
+
   # -- the GPIO ports --------------------------------------------------------
   #
   # One class, six instances, differing only in their reset values — which are
@@ -447,19 +474,24 @@ machine "stm32f407" {
   # Every base is a `param` from the top of the file; see the note there for why
   # a fixed part still parameterises its own map.
   #
-  # `perms = "r-x"` on the flash: the part's flash is not writable through the
-  # AHB — a program to it goes through the flash interface's key sequence, which
-  # this board does not model — so a stray `STR` into it is a BusFault rather
-  # than a silently modified program. That is a property of the *decode* in
-  # front of the chip and so belongs on the mapping (`core::space`).
+  # The flash array carries **no** `perms` and that is deliberate. It used to
+  # be mapped `r-x`, so a stray `STR` was a BusFault — which was the honest
+  # thing to do while nothing modelled the flash interface, because the
+  # alternative was a silently modified program. Now `st.flash` is that
+  # interface: the array is published as two overlapping children of one
+  # region, a store-backed read side and an I/O write side, so a fetch still
+  # goes straight to memory with no device call while every *write* reaches the
+  # controller and is judged by its rules. A stray `STR` now sets `SR.PGSERR`
+  # and is dropped, which is what the silicon does — the lock bit, not the bus,
+  # is what protects the array on a real part.
   #
   # It is mapped twice on purpose. 0x08000000 is where flash lives; 0x00000000
   # is the **boot alias**, which is what the BOOT0/BOOT1 pins select and what
   # the core fetches its initial `SP` and `PC` from out of reset. Modelling the
   # pins would mean an RCC-shaped device; a board that boots from flash is the
   # overwhelmingly common case and this file states which one it is.
-  map mem boot-base            size flash = rom { perms = "r-x" }
-  map mem flash-base           size flash = rom { perms = "r-x" }
+  map mem boot-base            size flash = eflash.array
+  map mem flash-base           size flash = eflash.array
   map mem ccm-base             size ccm   = ccmram   # and only in `mem`
   map mem sram-base            size sram1 = ram1
   map mem sram-base + sram1    size sram2 = ram2     # SRAM2 abuts SRAM1
@@ -488,6 +520,7 @@ machine "stm32f407" {
   map mem apb1-base + usart2-off size 0x2c = usart2
   map mem apb1-base + i2c1-off   size 0x28 = i2c1
   map mem apb1-base + pwr-off    size 0x08 = pwr
+  map mem apb1-base + rtc-off    size 0xd0 = rtc
 
   # APB2: the two advanced timers at the bottom, then SYSCFG and EXTI, then the
   # TIM9/TIM10/TIM11 run four kilobytes up.
@@ -510,6 +543,7 @@ machine "stm32f407" {
   map mem ahb1-base + gpio-stride * 7 size 0x28 = gpioh
   map mem ahb1-base + crc-off size 0x0c = crc
   map mem ahb1-base + rcc-off size 0x90 = rcc
+  map mem ahb1-base + flash-off size 0x1c = eflash
   map mem ahb1-base + dma-off + dma-stride * 0 size 0xd0 = dma1
   map mem ahb1-base + dma-off + dma-stride * 1 size 0xd0 = dma2
 
@@ -524,7 +558,7 @@ machine "stm32f407" {
   # The DMA controllers' own register blocks are deliberately absent: a stream
   # that reprograms a stream is not a transfer any board wants modelled, and
   # leaving them out makes it a fault rather than a surprise.
-  map dmabus flash-base           size flash = rom { perms = "r--" }
+  map dmabus flash-base           size flash = eflash.array { perms = "r--" }
   map dmabus sram-base            size sram1 = ram1
   map dmabus sram-base + sram1    size sram2 = ram2
   map dmabus apb1-base + tim-stride * 0 size 0x50 = tim2
@@ -541,6 +575,7 @@ machine "stm32f407" {
   map dmabus apb1-base + usart2-off size 0x2c = usart2
   map dmabus apb1-base + i2c1-off   size 0x28 = i2c1
   map dmabus apb1-base + pwr-off    size 0x08 = pwr
+  map dmabus apb1-base + rtc-off    size 0xd0 = rtc
   map dmabus apb2-base + tim-stride * 0 size 0x50 = tim1
   map dmabus apb2-base + tim-stride * 1 size 0x50 = tim8
   map dmabus apb2-base + syscfg-off size 0x24 = syscfg
@@ -617,6 +652,14 @@ machine "stm32f407" {
   wire exti.irq14 -> cpu.irq40    # EXTI15_10
   wire exti.irq15 -> cpu.irq40    # EXTI15_10
 
+  # The flash interface's own vector: RM0090 Table 62 position 4.
+  wire eflash.irq -> cpu.irq4
+
+  # The RTC, through its three EXTI lines. Table 62 positions 41, 2 and 3.
+  wire exti.irq17 -> cpu.irq41   # RTC_Alarm
+  wire exti.irq21 -> cpu.irq2    # TAMP_STAMP
+  wire exti.irq22 -> cpu.irq3    # RTC_WKUP
+
   # The timers. The four advanced-timer positions are shared with TIM9-TIM11
   # (for TIM1) and TIM12-TIM14 (for TIM8), which is what their names in Table 62
   # say: `TIM1_BRK_TIM9`, `TIM1_UP_TIM10`, `TIM1_TRG_COM_TIM11`, `TIM1_CC`.
@@ -686,6 +729,23 @@ machine "stm32f407" {
   # it is on the die: it is what makes RCC's `BDCR` writable, and a firmware
   # that configures the RTC or the LSE sets it first and clears it after.
   wire pwr.dbp -> rcc.dbp
+
+  # And the two `BDCR` bits that reach the RTC as wires rather than as a handle,
+  # for the same reason: `RTCEN` gates the clock the calendar counts, and
+  # `BDRST` resets the whole backup domain — the calendar and all thirty-two
+  # `BKPxR` with it. A system reset reaches neither, which is exactly why
+  # firmware can leave a reset reason in `BKP0R` and find it again.
+  wire rcc.rtcen -> rtc.rtcen
+  wire rcc.bdrst -> rtc.bdrst
+
+  # The RTC's three interrupts do not reach the NVIC directly: each is an
+  # *internal* EXTI line, so firmware has to unmask the line as well as the
+  # vector. RM0090 §12.2.5 gives the F4's numbering — 17 alarm, 21 tamper and
+  # time-stamp, 22 wakeup — which is not the L4's 18/19/20, and this is the file
+  # that number belongs in.
+  wire rtc.alarm  -> exti.line17
+  wire rtc.stamp  -> exti.line21
+  wire rtc.wakeup -> exti.line22
 
   # -- the pins --------------------------------------------------------------
   #

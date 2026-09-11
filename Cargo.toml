@@ -1329,6 +1329,28 @@ dev-stm32-crc = []
 # modelled. Written from ST RM0090 §3 and ST RM0351 §3; no emulator source was
 # consulted (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-flash = []
+# The STM32 real-time clock (src/dev/stm32/rtc.rs): one class, `st.rtc`, and
+# the only peripheral on the die that keeps its state across a system reset --
+# which is why firmware parks a reset reason in one of the thirty-two `BKPxR`
+# and expects to find it again. A **BCD** calendar packed the way RM0351 §37.6
+# packs it, counted in binary underneath so the carry is written once, with the
+# full Gregorian leap rule and a `WDU` the date drives. It runs off an `osc lse`
+# through the scheduler on exact integer arithmetic -- one calendar second is
+# (PREDIV_A + 1) * (PREDIV_S + 1) = 32768 cycles of a 32.768 kHz can -- and
+# **never reads the host clock**: the starting calendar is the `epoch` property,
+# because a board seeded from `now()` replays differently every run. The
+# write-protection dance firmware actually trips on is modelled rather than
+# waved through: `WPR` takes 0xCA then 0x53 and anything else re-arms it,
+# `INITF` follows `INIT` by the manual's two RTCCLK cycles, and reading `TR` or
+# `SSR` locks the shadow until `DR` is read. Both alarms with their field masks,
+# `WDSEL` and sub-second matching; the wakeup timer on all four RTCCLK dividers
+# and on `ck_spre`; a timestamp input; and backup registers that survive a
+# system reset and go only to `BDCR.BDRST`. Consumes RCC's `rtcen` and `bdrst`
+# outputs -- their first consumer. `CALR` smooth calibration and tamper
+# detection are storage, not behaviour. Written from ST RM0351 §37 and ST
+# RM0090 §26; no emulator source was consulted (ROADMAP.md §1). `no_std +
+# alloc`, no `unsafe`, no dependencies.
+dev-stm32-rtc = []
 # The STM32 reset and clock controller (src/dev/stm32/rcc.rs): the chip every
 # vendor startup sequence talks to first, and the one a board cannot fake with
 # RAM. `SystemInit` sets CR.HSEON and spins on HSERDY, sets PLLON and spins on
@@ -1382,6 +1404,8 @@ machine-stm32f407 = [
     "dev-stm32-exti",
     "dev-stm32-crc",
     "dev-stm32-wdg",
+    "dev-stm32-flash",
+    "dev-stm32-rtc",
     "dev-at24c",
 ]
 
