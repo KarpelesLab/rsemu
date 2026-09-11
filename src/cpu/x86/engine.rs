@@ -2446,6 +2446,34 @@ mod tests {
     /// How many of them there are, so a loop cannot silently stop covering one.
     const WORLDS: usize = 4;
 
+    /// Whether this build has a host code generator at all.
+    ///
+    /// `Engine::JitHost` is accepted on every target — it falls back to the
+    /// portable backend where there is nothing to generate code with — so the
+    /// three tests below, which exist to say the agreement was reached over the
+    /// *inlined* path, have nothing to observe on such a host and would assert
+    /// against a counter that can only be zero. macOS is the case in CI:
+    /// `aarch64-apple-darwin` matches neither backend, because `jit::arm64`'s
+    /// buffer and runtime are Linux-only.
+    ///
+    /// Written as a `cfg!` expression rather than a `#[cfg]` item so it is
+    /// compiled in every configuration and read by plain `if`s. A `const` whose
+    /// only readers sit inside `#[cfg]` blocks is *dead code* in the builds that
+    /// gate them out, and `dead_code` is denied — that exact shape has broken
+    /// this tree twice.
+    const HOST_COMPILES: bool = cfg!(any(
+        all(
+            feature = "jit-x86",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ),
+        all(
+            feature = "jit-arm64",
+            target_os = "linux",
+            target_arch = "aarch64"
+        )
+    ));
+
     /// A generated program, which is what the differential corpus runs.
     fn seeded(seed: u64) -> Case {
         Case::seeded(differential::program(seed, 24))
@@ -2517,8 +2545,16 @@ mod tests {
     fn long_mode_serves_its_memory_inline_and_no_other_world_does() {
         let jit = agree(&busy(2), 8_000, 8);
         let s = jit.jit_stats().expect("statistics");
-        assert!(s.fast_loads > 0, "the shadow was never warm for a load");
-        assert!(s.fast_stores > 0, "the shadow was never warm for a store");
+        if HOST_COMPILES {
+            assert!(s.fast_loads > 0, "the shadow was never warm for a load");
+            assert!(s.fast_stores > 0, "the shadow was never warm for a store");
+        } else {
+            assert_eq!(
+                (s.fast_loads, s.fast_stores),
+                (0, 0),
+                "nothing generates code on this host, so nothing may be inlined"
+            );
+        }
         for world in [0usize, 1, 3] {
             let jit = agree(&busy(world), 8_000, 8);
             let s = jit.jit_stats().expect("statistics");
@@ -2550,7 +2586,7 @@ mod tests {
         interp.run_budget(40_000);
         jit.run_budget(40_000);
         assert!(
-            jit.jit_stats().expect("statistics").fast_stores > 0,
+            !HOST_COMPILES || jit.jit_stats().expect("statistics").fast_stores > 0,
             "no store was served inline, so this proves nothing"
         );
         let pages = |ram: &RamStore| {
@@ -2597,7 +2633,7 @@ mod tests {
         interp.run_budget(40_000);
         jit.run_budget(40_000);
         assert!(
-            jit.jit_stats().expect("statistics").fast_stores > 0,
+            !HOST_COMPILES || jit.jit_stats().expect("statistics").fast_stores > 0,
             "no store was served inline, so this proves nothing"
         );
         let survivors = |slots: &[crate::core::space::MonitorSlot]| {
