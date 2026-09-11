@@ -31,6 +31,7 @@
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
 use crate::core::sched::TickCursor;
 use crate::core::space::{AccessPurpose, AddressSpace, BusLockGuard, MemAttrs, MonitorSlot};
+use crate::core::spin::Watch;
 use crate::core::sync;
 use crate::core::value::Width;
 
@@ -160,6 +161,15 @@ pub(super) struct Exec<'a> {
     pub(super) wrote: [u64; 2],
     /// How many of [`Exec::wrote`] are live.
     pub(super) wrote_n: u8,
+    /// The spin detector's per-hart state, when the session lent one
+    /// (`core::spin`).
+    ///
+    /// An `Option` because this arrives through a builder rather than through
+    /// [`Exec::new`], which already takes seven arguments; the test helpers in
+    /// `engine` that build an `Exec` by hand pass nothing and watch nothing.
+    /// The cost on the load path is a null test against a niche-packed
+    /// reference, ahead of the watch's own disarmed test.
+    spin: Option<&'a mut Watch>,
     /// This hart's slot in the space's global exclusive monitor, if it has
     /// one.
     ///
@@ -257,6 +267,7 @@ impl<'a> Exec<'a> {
             exits,
             exit: None,
             attrs,
+            spin: None,
             monitor,
             used: 0,
             next_pc: this_pc,
@@ -276,6 +287,17 @@ impl<'a> Exec<'a> {
     /// began (`ROADMAP.md` §4.2, `core::sched::TickCursor`).
     pub(super) fn with_cursor(mut self, cursor: Option<&'a TickCursor>) -> Exec<'a> {
         self.cursor = cursor;
+        self
+    }
+
+    /// Lend this borrow the hart's spin detector state (`core::spin`).
+    ///
+    /// A builder rather than an eighth constructor argument, for the same
+    /// reason [`Exec::with_cursor`] is one: it is wiring the session owns and
+    /// the interpreter merely borrows, and the helpers that build an `Exec` to
+    /// ask it one question do not have one.
+    pub(super) fn with_spin(mut self, spin: &'a mut Watch) -> Exec<'a> {
+        self.spin = Some(spin);
         self
     }
 
@@ -998,7 +1020,20 @@ impl<'a> Exec<'a> {
     pub(super) fn load(&mut self, vaddr: u64, bytes: u64) -> Result<u64, Trap> {
         let width = Width::from_bytes(bytes).ok_or(Trap::bare(cause::LOAD_ACCESS))?;
         if vaddr.is_multiple_of(bytes) {
-            return self.read_once(vaddr, width, Access::Load);
+            // `read_once` open-coded, because the spin detector wants the
+            // physical address as well as the virtual one: the virtual is what
+            // goes in the report, because it is the number in the listing, and
+            // the physical is what the topology can put a name to
+            // (`core::spin`). The misaligned path below is not watched — it is
+            // eight separate byte reads, and a poll loop is not misaligned.
+            let phys = self.translate(vaddr, Access::Load, bytes)?;
+            let value = self.read_at(vaddr, phys, width, Access::Load)?;
+            let space = self.space;
+            let pc = self.this_pc;
+            if let Some(watch) = self.spin.as_deref_mut() {
+                watch.load(space, pc, vaddr, phys, value);
+            }
+            return Ok(value);
         }
         if !self.cfg.misaligned {
             return Err(Trap {
@@ -1016,6 +1051,10 @@ impl<'a> Exec<'a> {
 
     /// Store `bytes` bytes, splitting a misaligned access into bytes.
     pub(super) fn store(&mut self, vaddr: u64, bytes: u64, value: u64) -> Result<(), Trap> {
+        // A store of this hart's ends any load streak (`core::spin`).
+        if let Some(watch) = self.spin.as_deref_mut() {
+            watch.store();
+        }
         let width = Width::from_bytes(bytes).ok_or(Trap::bare(cause::STORE_ACCESS))?;
         // A store into the reservation set breaks it, which is what makes a
         // load-reserved/store-conditional pair fail when something else wrote
@@ -1130,6 +1169,11 @@ impl<'a> Exec<'a> {
     /// into `xPP`, and the hart moves to the handling privilege. Delegation
     /// decides which of the two register sets is used.
     pub(super) fn enter_trap(&mut self, trap: Trap, interrupt: bool) {
+        // Taking a trap ends any load streak: a loop waiting on a handler that
+        // is legitimately slow is not stuck (`core::spin`).
+        if let Some(watch) = self.spin.as_deref_mut() {
+            watch.interrupt();
+        }
         let csrs = &mut self.st.csrs;
         let bit = 1u64 << trap.cause;
         let delegated = if interrupt {

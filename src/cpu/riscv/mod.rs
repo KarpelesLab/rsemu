@@ -124,6 +124,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed, ExitFlag, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot, RequesterId};
+use crate::core::spin;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicU32, AtomicU64, LockRank, Ordering};
 use crate::core::value::Width;
@@ -404,6 +405,12 @@ struct Session {
     /// on the step path: every route that builds an [`Exec`] already holds
     /// this one. See [`Hart::attach_cursor`].
     cursor: Option<TickCursor>,
+    /// The spin detector's per-hart state (`core::spin`).
+    ///
+    /// Wiring, like `cursor` and `time_src` above: a reset replaces `state`
+    /// and a snapshot restore replaces it again, and neither must unplug a
+    /// detector the machine attached.
+    spin: spin::Watch,
     /// The translation runtime, on a hart configured for it.
     ///
     /// Built on the first run rather than in `new`, because `new` performs no
@@ -498,6 +505,7 @@ impl Hart {
                     monitor: None,
                     time_src: None,
                     cursor: None,
+                    spin: spin::Watch::new(cfg.requester),
                     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
                     jit: None,
                 },
@@ -892,6 +900,7 @@ impl Hart {
             monitor,
             time_src,
             cursor,
+            spin,
             ..
         } = &mut *session;
         if let Some(timer) = time_src {
@@ -911,7 +920,8 @@ impl Hart {
             exits,
             monitor.as_ref(),
         )
-        .with_cursor(cursor.as_ref());
+        .with_cursor(cursor.as_ref())
+        .with_spin(spin);
         let used = exec.step();
         (used, exec.take_exit())
     }
@@ -960,6 +970,7 @@ impl Hart {
                 monitor,
                 time_src,
                 cursor,
+                spin,
                 jit,
             } = &mut *session;
             if let Some(timer) = time_src {
@@ -979,6 +990,7 @@ impl Hart {
                 exits,
                 monitor.as_ref(),
                 cursor.as_ref(),
+                spin,
                 remaining,
             );
         }
@@ -994,6 +1006,7 @@ impl Hart {
     /// "run about this much" helper, and the overrun is in the number it
     /// returns.
     pub fn run(&self, budget: u64) -> u64 {
+        self.session.lock().spin.refresh();
         let mut used = 0;
         while used < budget {
             let (n, _) = self.advance(budget - used);
@@ -1040,7 +1053,14 @@ impl Hart {
     /// is written now because the change that lets `mtime` move inside a round
     /// would otherwise land as a state-hash divergence with no obvious cause.
     pub fn run_budget(&self, ticks: u64) -> u64 {
-        let owed = self.session.lock().state.debt;
+        let owed = {
+            let mut session = self.session.lock();
+            // Once per scheduler round, which is the granularity a change of
+            // arming takes effect at — the per-load path holds a copy and
+            // touches no atomic (`core::spin`).
+            session.spin.refresh();
+            session.state.debt
+        };
         if owed >= ticks {
             self.session.lock().state.debt = owed - ticks;
             return ticks;
@@ -1342,6 +1362,11 @@ impl Device for Hart {
             Some(pa) => DebugTranslation::Mapped(pa),
             None => DebugTranslation::Unmapped,
         }
+    }
+
+    fn set_spin_detector(&self, cpu: u32, detector: Option<Arc<spin::Detector>>) -> bool {
+        self.session.lock().spin.attach(cpu, detector);
+        true
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

@@ -286,6 +286,7 @@ use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitMask};
 use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
+use crate::core::spin::Watch;
 use crate::core::value::Width;
 use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, verify};
 use crate::jit::{
@@ -855,6 +856,7 @@ pub(super) fn advance(
     exits: ExitMask,
     monitor: Option<&MonitorSlot>,
     cursor: Option<&TickCursor>,
+    spin: &mut Watch,
     remaining: u64,
 ) -> (u64, Option<Exit>) {
     let Jit {
@@ -864,7 +866,9 @@ pub(super) fn advance(
         interpreted,
         smc,
     } = jit;
-    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor).with_cursor(cursor);
+    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor)
+        .with_cursor(cursor)
+        .with_spin(spin);
     let pc = exec.st.pc;
 
     // The entry work for the *first* block, done here rather than through
@@ -2619,6 +2623,9 @@ mod tests {
                 ExitMask::NONE,
                 None,
                 None,
+                // Nothing is watching in a bench: `Watch::default()` is
+                // disarmed, which is the same shape an unarmed machine has.
+                &mut Watch::default(),
                 budget,
             )
             .0

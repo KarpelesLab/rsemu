@@ -1910,3 +1910,88 @@ fn a_running_hart_publishes_its_position_to_the_devices_it_reads() {
         "what was published last is not where the hart actually is"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The spin detector (`core::spin`)
+// ---------------------------------------------------------------------------
+
+/// The word the poll loops below wait on. Nothing writes it.
+const POLLED: u64 = BASE + 0x1000;
+
+const fn lw(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i(0x03, 2, rd, rs1, imm)
+}
+const fn sw(rs1: u32, rs2: u32, imm: i32) -> u32 {
+    s(0x23, 2, rs1, rs2, imm)
+}
+const fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 {
+    b(0, rs1, rs2, imm)
+}
+
+/// Arm a detector on `h`'s hart the way a machine would, through the device
+/// surface rather than through a back door.
+fn watch(h: &Harness, threshold: u64) -> Arc<crate::core::spin::Detector> {
+    let detector = crate::core::spin::Detector::new(threshold);
+    assert!(
+        h.hart.set_spin_detector(0, Some(Arc::clone(&detector))),
+        "a hart must take a detector, or a machine cannot number it"
+    );
+    detector
+}
+
+#[test]
+fn a_hart_polling_an_unchanging_word_is_reported() {
+    //   lui x1, POLLED
+    //   loop: lw x2, 0(x1)
+    //         beq x2, x0, loop
+    let h = Harness::rv64i(&[
+        lui(1, POLLED as u32),
+        lw(2, 1, 0),
+        beq(2, 0, -4),
+        // Unreached; the loop above never leaves.
+        ECALL,
+    ]);
+    let detector = watch(&h, 500);
+    h.hart.run(100_000);
+
+    let events = detector.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].pc, BASE + 4, "the `lw`, not the branch");
+    assert_eq!(events[0].addr, POLLED);
+    assert_eq!(events[0].value, 0);
+    assert_eq!(events[0].count, 500);
+    assert_eq!(events[0].region.as_deref(), Some("ram"));
+}
+
+#[test]
+fn a_hart_making_progress_is_not_reported() {
+    //   lui x1, POLLED
+    //   loop: lw  x2, 0(x1)
+    //         addi x2, x2, 1
+    //         sw  x2, 0(x1)
+    //         beq x0, x0, loop
+    let h = Harness::rv64i(&[
+        lui(1, POLLED as u32),
+        lw(2, 1, 0),
+        addi(2, 2, 1),
+        sw(1, 2, 0),
+        beq(0, 0, -12),
+    ]);
+    let detector = watch(&h, 500);
+    h.hart.run(100_000);
+    assert!(detector.events().is_empty());
+    assert!(h.get_u64(POLLED) & 0xffff_ffff > 500, "the loop really ran");
+}
+
+#[test]
+fn a_trap_ends_the_streak_on_a_hart_too() {
+    // The same poll loop, with an `ecall` in the body. A trap taken every
+    // iteration keeps the streak at one whatever the threshold is; the handler
+    // is `mtvec`'s default of zero, which faults and traps again, so the hart
+    // makes no progress at all and is still not reported — which is the rule,
+    // stated and tested rather than inferred.
+    let h = Harness::rv64i(&[lui(1, POLLED as u32), lw(2, 1, 0), ECALL, beq(2, 0, -8)]);
+    let detector = watch(&h, 500);
+    h.hart.run(100_000);
+    assert!(detector.events().is_empty());
+}
