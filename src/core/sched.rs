@@ -1412,15 +1412,21 @@ pub enum ThreadingMode {
     /// | ticks/round | 2 runnables | 4 | 8 |
     /// | --- | --- | --- | --- |
     /// | 1 000 | 0.2–0.5× | 0.8× | 0.8–1.6× |
-    /// | 10 000 (the default cap) | 0.83× | 1.5× | 2.5× |
+    /// | 10 000 | 0.83× | 1.5× | 2.5× |
     /// | 100 000 | 1.0–1.5× | 1.8–2.6× | 3.5–3.7× |
     /// | 1 000 000 | 1.5× | 2.5–3.3× | 3.7× |
     ///
     /// Two conclusions worth stating plainly rather than burying:
     ///
-    /// * **Two CPUs at the default [`SchedulerConfig::max_ticks_per_quantum`]
-    ///   are slower in this mode than in the deterministic one.** A machine
-    ///   with two cores wants a larger cap before it asks for parallelism.
+    /// * **Two CPUs at ten thousand ticks a round are slower in this mode
+    ///   than in the deterministic one.** That was the shipped default when
+    ///   these numbers were taken, and it is why the row is worth keeping now
+    ///   that [`SchedulerConfig::max_ticks_per_quantum`] defaults to `None`:
+    ///   an uncapped round is a round of whatever the board's oscillators owe
+    ///   it, so a 1 GHz core at the 1 ms `DEFAULT_QUANTUM` is on the million
+    ///   row and a 1 MHz one is below the thousand row. The mode's crossover
+    ///   is a property of the *board*, not of a scheduler constant, and a slow
+    ///   machine still wants a longer quantum before it asks for parallelism.
     /// * The speedup saturates near 4× however many runnables there are,
     ///   because the barrier is per round and the round is only as short as its
     ///   slowest runnable. This is a rendezvous design, not a free-running one,
@@ -3188,8 +3194,9 @@ impl Scheduler {
     /// decides whether the mode is worth using on a two-CPU machine. A round
     /// costs roughly a couple of microseconds per *dispatched* job — a queue
     /// push, a wake, and a wait — against which a round's actual work must be
-    /// measured. Two CPUs at the default
-    /// [`SchedulerConfig::max_ticks_per_quantum`] of 10 000 is well inside the
+    /// measured. Two CPUs at ten thousand ticks a round — what
+    /// [`SchedulerConfig::max_ticks_per_quantum`] used to impose on every
+    /// board, and what a slow one still lands on — is well inside the
     /// region where two dispatches cost more than the second core saves;
     /// one dispatch and a driver thread that works instead of blocking roughly
     /// halves that overhead. It is still a real cost, and
