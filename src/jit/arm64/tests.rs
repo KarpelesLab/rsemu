@@ -277,6 +277,187 @@ fn a_guest_instructions_bookkeeping_costs_no_code_at_all() {
     assert_eq!(size(1), size(64), "a guest instruction costs nothing");
 }
 
+#[test]
+fn a_charge_is_fused_into_the_boundary_it_follows() {
+    use super::abi::Event;
+
+    // The same fusion `jit::x86::tests` asserts, and it has to be the same one:
+    // the two backends replay the same event array through the same rules, and
+    // `ROADMAP.md` §0's identical state hash is across *engines*, so a
+    // backend that planned its bookkeeping differently would be a different
+    // guest on an aarch64 host.
+    //
+    // This half of the file runs on any host — nothing below executes a single
+    // A64 instruction, it only reads what `plan` decided — so the shape is
+    // checked everywhere even though the differential in `mod executed` is
+    // not. All four conditions are here: the ordinary pair that fuses, a
+    // `charge(0)` that may not (`IrHost::charge` is called once per opcode, so
+    // a host counting calls would see one fewer), a second charge for one
+    // guest instruction that stays a second call in order, and a charge a
+    // `brcond` targets, which has a flush point ahead of it and is therefore
+    // replayed by both paths rather than by the boundary before it.
+    fn events(block: &Block) -> Vec<Event> {
+        let frame = compile_with(block, Regs::Frame).expect("compiles");
+        let scan = compile_with(block, Regs::Scan).expect("compiles");
+        assert_eq!(
+            frame.events(),
+            scan.events(),
+            "the two policies planned different bookkeeping\n{block}"
+        );
+        frame.events().to_vec()
+    }
+
+    fn charged(ticks: u64) -> Block {
+        let mut b = BlockBuilder::new(BASE, 0);
+        for i in 0..2u64 {
+            b.insn_start(InsnStart {
+                pc: BASE + i * 4,
+                next_pc: BASE + i * 4 + 4,
+                ticks: i * ticks,
+                live: Vec::new(),
+            });
+            b.charge(ticks);
+        }
+        b.insn_start(InsnStart {
+            pc: BASE + 8,
+            next_pc: BASE + 8,
+            ticks: 2 * ticks,
+            live: Vec::new(),
+        });
+        b.exit_tb();
+        b.finish()
+    }
+
+    let block = charged(2);
+    assert_eq!(
+        events(&block),
+        [
+            Event::Boundary {
+                mark: 0,
+                exit: false,
+                ticks: 2
+            },
+            Event::Boundary {
+                mark: 1,
+                exit: false,
+                ticks: 2
+            },
+            Event::Boundary {
+                mark: 2,
+                exit: true,
+                ticks: 0
+            },
+        ],
+        "{block}"
+    );
+
+    let block = charged(0);
+    assert_eq!(
+        events(&block),
+        [
+            Event::Boundary {
+                mark: 0,
+                exit: false,
+                ticks: 0
+            },
+            Event::Charge(0),
+            Event::Boundary {
+                mark: 1,
+                exit: false,
+                ticks: 0
+            },
+            Event::Charge(0),
+            Event::Boundary {
+                mark: 2,
+                exit: true,
+                ticks: 0
+            },
+        ],
+        "{block}"
+    );
+
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(3);
+    b.charge(5);
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 4,
+        ticks: 8,
+        live: Vec::new(),
+    });
+    b.exit_tb();
+    let block = b.finish();
+    assert_eq!(
+        events(&block),
+        [
+            Event::Boundary {
+                mark: 0,
+                exit: false,
+                ticks: 3
+            },
+            Event::Charge(5),
+            Event::Boundary {
+                mark: 1,
+                exit: true,
+                ticks: 0
+            },
+        ],
+        "{block}"
+    );
+
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    let x = b.imm(Type::I64, Const::Int(3));
+    let over = b.emit_raw(Opcode::BRCOND, Type::I64, None, None, &[x], None, None, 0);
+    b.charge(7);
+    b.patch_aux(over, b.next_index() as u32);
+    b.charge(4);
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 4,
+        ticks: 11,
+        live: Vec::new(),
+    });
+    b.exit_tb();
+    let block = b.finish();
+    // Non-vacuity: the branch really does target the charge.
+    let insts = block.insts();
+    let brcond = insts
+        .iter()
+        .position(|i| i.op == Opcode::BRCOND)
+        .expect("a branch");
+    assert_eq!(insts[insts[brcond].aux as usize].op, Opcode::CHARGE);
+    assert_eq!(
+        events(&block),
+        [
+            Event::Boundary {
+                mark: 0,
+                exit: false,
+                ticks: 0
+            },
+            Event::Charge(7),
+            Event::Charge(4),
+            Event::Boundary {
+                mark: 1,
+                exit: true,
+                ticks: 0
+            },
+        ],
+        "{block}"
+    );
+}
+
 /// Whether the backend's lowering of `op` calls into the host *after* reading
 /// its operands and before writing its results.
 ///

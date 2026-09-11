@@ -121,8 +121,13 @@ const fn error_of(code: u64) -> BusError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// [`IrHost::charge`], with the tick count [`Opcode::CHARGE`] carried.
+    ///
+    /// Only a charge `plan` could not fuse into the boundary ahead of it: a
+    /// `charge(0)`, a second charge for one guest instruction, or one with a
+    /// flush point in between. See [`Event::Boundary::ticks`].
     Charge(u64),
-    /// [`IrHost::insn_start`], by index into [`Block::marks`].
+    /// [`IrHost::insn_start`], by index into [`Block::marks`], and the charge
+    /// that follows it.
     Boundary {
         /// The index into [`Block::marks`].
         mark: u32,
@@ -133,8 +138,33 @@ pub enum Event {
         /// block, once, at compile time — the replay cannot see instruction
         /// indices and must be told.
         exit: bool,
+        /// The [`Opcode::CHARGE`] fused into this boundary, or zero for none.
+        ///
+        /// Every frontend in this tree emits `INSN_START` immediately followed
+        /// by the instruction's static tick column, so this pair is **two
+        /// events per guest instruction** and the second one costs a slice
+        /// step, a discriminant test and a call. Carrying the count here makes
+        /// it one event: `plan` fuses only where the two are adjacent *and* no
+        /// flush point separates them, so the replay does the same two writes
+        /// and makes the same two calls in the same order either way.
+        ///
+        /// Zero means none rather than a charge of zero, and the distinction
+        /// is load-bearing: [`IrHost::charge`] is called once per
+        /// [`Opcode::CHARGE`] with its own immediate, so a `charge(0)` has to
+        /// stay an [`Event::Charge`] or a host counting calls would see one
+        /// fewer.
+        ticks: u64,
     },
 }
+
+/// The sixteen bytes this type's own documentation promises, asserted.
+///
+/// `ticks` is free: `Event::Charge` leaves four bytes of tail padding beside
+/// its `u64`, and `rustc` puts the discriminant and the boundary's `mark` and
+/// `exit` there. That is a layout decision and not a guarantee, and the whole
+/// argument for a dense event array is that it streams past the cache — so a
+/// field added here without checking this would cost 50% more of it silently.
+const _: () = assert!(core::mem::size_of::<Event>() == 16);
 
 /// The execution context a compiled block runs against.
 ///
@@ -500,7 +530,11 @@ unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(
                     c.committed = 1;
                     host_of::<H>(c).charge(ticks);
                 }
-                Event::Boundary { mark: index, exit } => {
+                Event::Boundary {
+                    mark: index,
+                    exit,
+                    ticks,
+                } => {
                     // `compile` refuses a marker pointing at no record, so the
                     // skip is unreachable rather than a boundary lost.
                     let Some(mark) = block.marks().get(index as usize) else {
@@ -536,6 +570,20 @@ unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(
                     // path already rests on.
                     if c.boundaries > 1 && !exit && host_of::<H>(c).spent() {
                         return 1;
+                    }
+                    // The fused charge, **after** the return above and not
+                    // before it. A boundary that stops the block unwinds the
+                    // guest instruction it begins, and that instruction's own
+                    // charge is part of what is unwound — charging it here
+                    // would leave the block one instruction's ticks ahead of
+                    // the interpreter at exactly the boundary the two engines
+                    // have to agree about. Otherwise this is `Event::Charge`'s
+                    // arm verbatim, and the order of the two writes is
+                    // unobservable there for the reason written out there.
+                    if ticks != 0 {
+                        c.ticks = c.ticks.wrapping_add(ticks);
+                        c.committed = 1;
+                        host_of::<H>(c).charge(ticks);
                     }
                 }
             }

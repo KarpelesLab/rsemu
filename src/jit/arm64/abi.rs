@@ -113,8 +113,12 @@ pub const fn error_of(code: u64) -> BusError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// [`IrHost::charge`], with the tick count [`Opcode::CHARGE`](crate::ir::Opcode::CHARGE) carried.
+    ///
+    /// Only a charge `plan` could not fuse into the boundary ahead of it; see
+    /// [`Event::Boundary::ticks`], and `jit::x86::rt::Event` for why.
     Charge(u64),
-    /// [`IrHost::insn_start`], by index into [`Block::marks`].
+    /// [`IrHost::insn_start`], by index into [`Block::marks`], and the charge
+    /// that follows it.
     Boundary {
         /// The index into [`Block::marks`].
         mark: u32,
@@ -123,8 +127,15 @@ pub enum Event {
         /// [`InsnStart::pc`] is then a static placeholder and the real
         /// successor is in the slot the map publishes.
         exit: bool,
+        /// The [`Opcode::CHARGE`](crate::ir::Opcode::CHARGE) fused into this
+        /// boundary, or zero for none — `jit::x86::rt::Event` has the argument
+        /// and the rule, and `plan` here is the same fusion.
+        ticks: u64,
     },
 }
+
+/// The same sixteen bytes `jit::x86::rt::Event` asserts, for the same reason.
+const _: () = assert!(core::mem::size_of::<Event>() == 16);
 
 /// The execution context a compiled block runs against.
 ///
@@ -416,7 +427,11 @@ unsafe extern "C" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo: u64,
                     c.committed = 1;
                     host_of::<H>(c).charge(ticks);
                 }
-                Event::Boundary { mark: index, exit } => {
+                Event::Boundary {
+                    mark: index,
+                    exit,
+                    ticks,
+                } => {
                     // `compile` refuses a marker pointing at no record, so the
                     // skip is unreachable rather than a boundary lost.
                     let Some(mark) = block.marks().get(index as usize) else {
@@ -438,6 +453,16 @@ unsafe extern "C" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo: u64,
                     // block's first boundary, and never at an exit boundary.
                     if c.boundaries > 1 && !exit && host_of::<H>(c).spent() {
                         return 1;
+                    }
+                    // The fused charge, **after** the return above: a boundary
+                    // that stops the block unwinds the guest instruction it
+                    // begins, and that instruction's own charge is part of
+                    // what is unwound. `jit::x86::rt`'s flush has the long
+                    // form.
+                    if ticks != 0 {
+                        c.ticks = c.ticks.wrapping_add(ticks);
+                        c.committed = 1;
+                        host_of::<H>(c).charge(ticks);
                     }
                 }
             }

@@ -483,7 +483,20 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
                     .imm
                     .ok_or(Refusal::Shape("a charge needs a tick count"))?
                     .bits() as u64;
-                events.push(Event::Charge(ticks));
+                // Fuse into the boundary just ahead of it where the three
+                // conditions `jit::x86::compile::plan` writes out hold: a
+                // non-zero count, no flush point in between
+                // (`events.len() > region`, which is what a `brcond` targeting
+                // the charge breaks), and a boundary whose slot is still free.
+                let open = events.len() > region as usize;
+                match events.last_mut() {
+                    Some(Event::Boundary { ticks: slot, .. })
+                        if open && ticks != 0 && *slot == 0 =>
+                    {
+                        *slot = ticks;
+                    }
+                    _ => events.push(Event::Charge(ticks)),
+                }
             }
             Opcode::INSN_START => {
                 block
@@ -495,6 +508,8 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
                     // Read here because the replay cannot: it is handed a
                     // range of events and never sees an instruction index.
                     exit: insts.get(i + 1).is_some_and(|next| next.op.is_terminator()),
+                    // Filled in by the charge that follows, if one does.
+                    ticks: 0,
                 });
             }
             _ => {}
