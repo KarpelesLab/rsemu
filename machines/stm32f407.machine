@@ -42,17 +42,31 @@
 # What this board does not have
 # ---------------------------------------------------------------------------
 #
-# **RCC is a scratch window, not a device.** `rcc` below is plain RAM at the
-# real address: writes to `AHB1ENR` and friends read back, so firmware that
-# gates a peripheral clock proceeds — but nothing is gated, and a `CR` poll for
-# `HSERDY` or `PLLRDY` spins forever, because plain RAM reads back what was
-# written and those are hardware-set bits. Firmware that brings up the PLL needs
-# an `st.rcc` device, which is not written yet. This file says so rather than
-# pretending the window is a clock controller.
+# **RCC is a device, and the polls it answers terminate.** `rcc` below is
+# `st.rcc` at the real address. Setting `CR.HSEON` produces `CR.HSERDY` after
+# `ready-delay` ticks of the device's own clock domain and `CR.PLLON` produces
+# `CR.PLLRDY` the same way; `CFGR.SW` is refused outright while the source it
+# names is not ready, so `SWS` agrees only once the switch has actually
+# happened. The three spin loops every vendor `SystemInit` opens with therefore
+# exit, which is exactly what the scratch RAM window that used to be here could
+# not do — RAM reads back what was written and all three of those are
+# hardware-set bits.
 #
-# The same goes for every other peripheral of the part: SPI, I2C, the OTG cores,
-# SDIO, the ADCs, the timers, EXTI and the DMA controllers are all absent. They
-# are separate device classes and separate `object` lines, and this file is the
+# Two things it still does not do, both visible rather than hidden:
+#
+# * **It re-rates nothing.** The oscillator ratios below are fixed at the
+#   values a configured F407 runs at, so a guest that reprograms `PLLCFGR`
+#   changes what `st.rcc` computes and publishes and changes no scheduler rate.
+#   `core::clock` can re-rate a domain; no seam reaches it from a device yet
+#   (`src/dev/stm32/rcc.rs`, "The clock outputs").
+# * **Nothing consumes the gates.** Every `xxENR` and `xxRSTR` bit is a real
+#   output pin, and no peripheral in this tree has an enable input to wire it
+#   to — which is why there is not one `wire rcc.apb1en...` line below. A
+#   peripheral whose clock the guest never enables still works here.
+#
+# What is genuinely absent is the rest of the die: SPI, I2C2 and I2C3, the OTG
+# cores, SDIO, the ADCs, the DAC, CAN, the RTC, the FSMC and Ethernet. They are
+# separate device classes and separate `object` lines, and this file is the
 # floor they get added to.
 #
 # GPIOF, GPIOG and GPIOI exist on the die but the LQFP100 bonds no pins of them,
@@ -154,14 +168,33 @@ machine "stm32f407" {
   param ccm-base    = 0x10000000
   param sram-base   = 0x20000000
   param apb1-base   = 0x40000000
+  param apb2-base   = 0x40010000
   param ahb1-base   = 0x40020000
 
   # Peripheral offsets from their bus's base. An STM32 peripheral is allotted a
   # kilobyte, so the GPIO ports are 0x400 apart and the arithmetic below says so
   # rather than repeating six constants that must agree.
   param usart2-off  = 0x4400       # APB1 + 0x4400
+  param i2c1-off    = 0x5400       # APB1 + 0x5400
+  param wwdg-off    = 0x2c00       # APB1 + 0x2c00
+  param iwdg-off    = 0x3000       # APB1 + 0x3000
+  param pwr-off     = 0x7000       # APB1 + 0x7000
+  param syscfg-off  = 0x3800       # APB2 + 0x3800
+  param exti-off    = 0x3c00       # APB2 + 0x3c00
   param gpio-stride = 0x400
+  param crc-off     = 0x3000       # AHB1 + 0x3000
   param rcc-off     = 0x3800       # AHB1 + 0x3800
+  param dma-off     = 0x6000       # AHB1 + 0x6000, and DMA2 a kilobyte above
+  param dma-stride  = 0x400
+
+  # The timers come in three runs of *consecutive* kilobytes, so one stride and
+  # three bases place all fourteen: TIM2-TIM7 and then TIM12-TIM14 from the
+  # bottom of APB1, nine in a row with no hole between them; TIM1 and TIM8 from
+  # the bottom of APB2; TIM9, TIM10 and TIM11 at APB2 + 0x4000. The run being
+  # unbroken is why the arithmetic below counts rather than naming each one —
+  # and why the jump from TIM7 to TIM12 at index 6 is worth reading twice.
+  param tim-stride  = 0x400
+  param tim9-off    = 0x4000       # APB2 + 0x4000: TIM9, TIM10, TIM11
 
   # -- crystals --------------------------------------------------------------
   #
@@ -172,10 +205,19 @@ machine "stm32f407" {
   # HSE turns out to be, the core runs at 21 times it (ROADMAP.md §4.2).
   #
   # What is *not* here: HSI, the PLL's own registers, and the AHB/APB
-  # prescalers. Those are RCC's, and RCC is a scratch window (see the header),
-  # so a guest that reprograms the PLL changes no rate. When an `st.rcc` lands,
-  # the domains below are what it will drive.
+  # prescalers. Those are RCC's, and `st.rcc` computes every one of them as an
+  # exact rational and publishes it — but it drives no domain, so a guest that
+  # reprograms the PLL changes what RCC reports and changes no rate below. See
+  # the header. The ratios here are what a configured F407 runs at.
   osc hse = 8000000 Hz
+
+  # The low-speed internal RC, which is the only thing the independent watchdog
+  # counts — that is what makes it independent: it is not on the APB and
+  # reprogramming the PLL does not move it. RM0090 §7.2.5 gives it as 32 kHz
+  # typical, and DS8626's Table 39 as 17–47 kHz across the full range, which is
+  # an uncalibrated RC and why firmware that needs a real timeout uses the LSE.
+  # The typical figure is what the manual's own timeout table is computed from.
+  osc lsi = 32000 Hz
 
   # The USART's own can. One tick of a USART's clock domain is one *character*
   # time, so this is divided down to the character rate rather than to the baud
@@ -190,13 +232,34 @@ machine "stm32f407" {
   # slower crystal would throttle the port; a faster one would not speed it up.
   osc uartclk = 1843200 Hz
 
-  # -- the bus ---------------------------------------------------------------
+  # -- the buses -------------------------------------------------------------
   #
-  # One flat 32-bit space. `unassigned` is left at its default of `fault`, so an
-  # access to a hole raises a BusFault the guest can see rather than a
-  # plausible-looking zero — a Cortex-M4 has a BusFault handler, and hiding the
-  # abort would hide our own memory-map bugs with it.
-  space mem { width = 32 }
+  # **Two** 32-bit spaces, because an F4 has two views of its own memory and the
+  # difference is the one that costs a driver author an afternoon.
+  #
+  # `mem` is the core's view: everything the part decodes, CCM included.
+  # `dmabus` is what a master on the bus matrix sees (RM0090 §2.1, Figure 1),
+  # and **CCM is not in it**. Core-coupled memory hangs off the Cortex-M4's own
+  # D-bus and no DMA controller reaches it; a stream programmed at 0x10000000
+  # takes a bus error and raises `TEIF`, which is what the silicon does and what
+  # the driver author is trying to find out. A comment saying "no DMA reaches
+  # it" on a single-space board was not a mechanism — `st.dma` masters whatever
+  # space its object names, so the way to say it is to give the controllers a
+  # space without CCM in it.
+  #
+  # What `dmabus` is *not* is a faithful bus matrix. The real one is per master:
+  # DMA1's memory port and DMA2's differ over flash and over which peripheral
+  # buses they reach, and Ethernet and USB HS have ports of their own. Modelling
+  # that means a space per master, and this board models the one distinction
+  # that changes whether a driver works. The flash mapping here is `r--` rather
+  # than `r-x`: nothing fetches instructions through a DMA controller.
+  #
+  # `unassigned` is left at its default of `fault` on both, so an access to a
+  # hole raises a fault the guest can see rather than a plausible-looking zero
+  # — a Cortex-M4 has a BusFault handler, and hiding the abort would hide our
+  # own memory-map bugs with it.
+  space mem    { width = 32 }
+  space dmabus { width = 32 }
 
   # -- the core --------------------------------------------------------------
   #
@@ -207,14 +270,18 @@ machine "stm32f407" {
   # wrong changes what a guest's `NVIC_SetPriority` does — it is modelled rather
   # than assumed.
   #
-  # No FPU: the core does not implement FPv4-SP, so `CPACR` reads zero and a
-  # `VMOV` raises a NOCP UsageFault exactly as it would on an M4 without the
-  # option. An F407 *has* the FPU, so firmware built with `-mfpu=fpv4-sp-d16`
-  # will fault here. That is a stated limitation of the core, not of this board.
+  # **The FPU is present.** `part = "cortex-m4f"` is a Cortex-M4 with FPv4-SP-D16
+  # — the unit an F407 actually has, and the one firmware built
+  # `-mfloat-abi=hard` needs from its first function call, because GCC uses
+  # `s0`–`s31` as scratch even in code that computes no floats. Single precision
+  # only: `MVFR0.D_Precision` reads zero, as it does on the part, so a `VADD.F64`
+  # is UNDEFINED rather than slow. `part = "cortex-m4"` models the same silicon
+  # with the option left out — `CPACR` reads zero and a `VMOV` is a NOCP
+  # UsageFault — and is what this board said before the unit landed.
   object cpu "cpu.arm.v7m" {
     clock         = hse * 21
     space         = mem
-    part          = "cortex-m4"
+    part          = "cortex-m4f"
     priority-bits = 4
   }
 
@@ -228,9 +295,124 @@ machine "stm32f407" {
   object ram2   "ram" { size = sram2 }
   object ccmram "ram" { size = ccm }
 
-  # The RCC register window. See the header: this is RAM at the right address,
-  # not a clock controller.
-  object rcc "ram" { size = 1K }
+  # -- the clock tree and the power controller -------------------------------
+  #
+  # `hse` here is the rate of the crystal RCC is told about, which has to agree
+  # with the `osc hse` above because they are the same can: the oscillator is
+  # what the emulator's domains are derived from and this number is what RCC
+  # runs `PLLCFGR`'s M, N, P and Q over. They are written twice because nothing
+  # in the machine language lets a property read an oscillator's rate, and the
+  # duplication is better than a device that guesses.
+  #
+  # `ready-delay` is left at its default of sixteen ticks of this device's clock
+  # domain — two microseconds of the 8 MHz can. A real HSE takes milliseconds
+  # to start and a real PLL microseconds to lock; a board that wants the
+  # crystal's figure writes the number and gets it, and firmware that polls a
+  # ready bit cannot tell the difference except in how much virtual time it
+  # burns. The default is short because nothing here is measuring startup.
+  object rcc "st.rcc" {
+    clock   = hse
+    variant = "f4"
+    hse     = 8000000
+  }
+
+  # `PWR_CR.DBP` is the only thing on this board with a consumer: it is what
+  # unlocks RCC's `BDCR`, and a firmware that configures the RTC writes it
+  # first. `variant = "f4"` is the plain F405/F407 block — `CR` and `CSR` and
+  # nothing else. An F427/F429 is `"f42x"`, which adds the over-drive bits.
+  object pwr "st.pwr" {
+    clock   = hse
+    variant = "f4"
+  }
+
+  # -- the timers ------------------------------------------------------------
+  #
+  # Fourteen of them, one class. `variant` picks the feature subset: `basic` is
+  # TIM6/TIM7, a counter and an update interrupt and nothing else; `advanced` is
+  # TIM1/TIM8, which add `RCR`, `BDTR.MOE`, the complementary outputs and a
+  # *split* interrupt output; everything else is `general`. `width = 32` is
+  # TIM2 and TIM5, which are the only two 32-bit counters on an F4, and
+  # `channels` is what the instance bonds — four on TIM1–TIM5 and TIM8, two on
+  # TIM9 and TIM12, one on TIM10, TIM11, TIM13 and TIM14 (RM0090 §17–§19).
+  #
+  # The clock is **`CK_INT`, not the APB bus clock**, and on an F4 the two are
+  # not the same number: RM0090 §7.2 says that when an APB prescaler is other
+  # than 1 the timer clocks are *twice* the APB clock. This board runs the
+  # documented 168 MHz configuration — HPRE = 1, PPRE1 = 4, PPRE2 = 2 — so
+  # PCLK1 is 42 MHz and an APB1 timer counts at 84 MHz, PCLK2 is 84 MHz and an
+  # APB2 timer counts at 168 MHz. The doubling is applied here rather than in
+  # the device, because which half of that rule applies is a property of how the
+  # board programmed RCC and the device cannot see it.
+  object tim1  "st.tim" { clock = hse * 21,     variant = "advanced", channels = 4 }
+  object tim2  "st.tim" { clock = hse * 21 / 2, variant = "general",  channels = 4, width = 32 }
+  object tim3  "st.tim" { clock = hse * 21 / 2, variant = "general",  channels = 4 }
+  object tim4  "st.tim" { clock = hse * 21 / 2, variant = "general",  channels = 4 }
+  object tim5  "st.tim" { clock = hse * 21 / 2, variant = "general",  channels = 4, width = 32 }
+  object tim6  "st.tim" { clock = hse * 21 / 2, variant = "basic" }
+  object tim7  "st.tim" { clock = hse * 21 / 2, variant = "basic" }
+  object tim8  "st.tim" { clock = hse * 21,     variant = "advanced", channels = 4 }
+  object tim9  "st.tim" { clock = hse * 21,     variant = "general",  channels = 2 }
+  object tim10 "st.tim" { clock = hse * 21,     variant = "general",  channels = 1 }
+  object tim11 "st.tim" { clock = hse * 21,     variant = "general",  channels = 1 }
+  object tim12 "st.tim" { clock = hse * 21 / 2, variant = "general",  channels = 2 }
+  object tim13 "st.tim" { clock = hse * 21 / 2, variant = "general",  channels = 1 }
+  object tim14 "st.tim" { clock = hse * 21 / 2, variant = "general",  channels = 1 }
+
+  # -- the DMA controllers ---------------------------------------------------
+  #
+  # Two, both the stream-based face (RM0090 §10): eight streams each, `LISR`
+  # and `HISR`, `SxCR` and the rest. `space = dmabus` is the load-bearing word
+  # — see the note on the two spaces above for why CCM is not in it.
+  #
+  # One tick of the clock domain is one beat, so this is a beat every four AHB
+  # cycles. That is a rate rather than a figure from the manual: the real
+  # controller arbitrates for the matrix and takes a variable number of cycles
+  # per beat, and what matters for firmware is that a transfer *takes time at
+  # all* rather than completing inside the store that sets `EN`.
+  #
+  # **Nothing drives a request line.** `req0`–`req7` are inputs and no
+  # peripheral on this board has a request output to wire to them (neither
+  # `st.usart` nor `st.i2c` publishes one), so the streams here serve
+  # memory-to-memory transfers and nothing else. The request matrix of RM0090
+  # Table 43 is a fact about the part and belongs in this file, exactly as a
+  # vector number does; it goes in when there is a peripheral that can drive one.
+  object dma1 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
+  object dma2 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
+
+  # -- the external-interrupt path -------------------------------------------
+  #
+  # Two objects, because on the die it is two blocks: `SYSCFG`'s `EXTICR1`–
+  # `EXTICR4` choose *which port's* pin n drives EXTI line n, and `EXTI` decides
+  # what an edge on that line does. `ports = 8` is A through H, two letters
+  # more than this package bonds — the count is from A and GPIOH is port index
+  # 7, so F and G exist in the mux with nothing wired to them.
+  #
+  # `lines = 23` is the F4's count (RM0090 §12.2.5): 0–15 from the GPIO mux,
+  # then 16 PVD, 17 RTC alarm, 18 OTG FS wakeup, 19 Ethernet wakeup, 20 OTG HS
+  # wakeup, 21 tamper/timestamp and 22 RTC wakeup. **Lines 16–22 are undriven
+  # here**, because none of those peripherals is on this board and `st.pwr`
+  # publishes no PVD output; `SWIER` still raises them, which is how a test
+  # exercises a line with no source.
+  object syscfg "st.syscfg" { variant = "f4", ports = 8 }
+  object exti   "st.exti"   { lines = 23 }
+
+  # -- the CRC unit ----------------------------------------------------------
+  #
+  # `variant = "f4"` is the fixed-polynomial block: CRC-32/MPEG-2, word writes
+  # only, and no `POL` or `INIT` register. The programmable one that the
+  # F0/F3/F7/L4 carry is `"v2"` and is a different register file, which is why
+  # it is a property and not an assumption.
+  object crc "st.crc" { variant = "f4" }
+
+  # -- the watchdogs ---------------------------------------------------------
+  #
+  # The independent one counts the LSI and `window = false` because an F4 has no
+  # `WINR`; the window one counts PCLK1 and `wdgtb-shift = 7` puts `WDGTB` at
+  # bits [8:7], which is where an F4 has it (an L4 moved it to [12:11]).
+  #
+  # Both drive `reset`, and both are wired to the core's reset input below.
+  object iwdg "st.iwdg" { clock = lsi,           window = false }
+  object wwdg "st.wwdg" { clock = hse * 21 / 4,  wdgtb-shift = 7 }
 
   # -- the GPIO ports --------------------------------------------------------
   #
@@ -278,34 +460,232 @@ machine "stm32f407" {
   # overwhelmingly common case and this file states which one it is.
   map mem boot-base            size flash = rom { perms = "r-x" }
   map mem flash-base           size flash = rom { perms = "r-x" }
-  map mem ccm-base             size ccm   = ccmram   # CCM: no DMA reaches it
+  map mem ccm-base             size ccm   = ccmram   # and only in `mem`
   map mem sram-base            size sram1 = ram1
   map mem sram-base + sram1    size sram2 = ram2     # SRAM2 abuts SRAM1
 
-  # APB1, then AHB1. Each register block is mapped at its own base and at its
-  # own size: a peripheral decodes the low bytes of its kilobyte and the rest of
-  # the kilobyte is a **hole** rather than a mirror — which is what the part
-  # does, and what makes a wrong offset a fault instead of a plausible answer.
+  # Then the peripherals, bus by bus. Each register block is mapped at its own
+  # base and at its own size: a peripheral decodes the low bytes of its kilobyte
+  # and the rest of the kilobyte is a **hole** rather than a mirror — which is
+  # what the part does, and what makes a wrong offset a fault instead of a
+  # plausible answer. The one place that is generous is a timer: `st.tim`
+  # decodes one 0x50 window whatever the variant, so TIM6 and TIM7 answer above
+  # the `ARR` their registers stop at.
+  #
+  # APB1 from the bottom: the nine timers it carries, the two watchdogs, the
+  # USART, I2C1 and the power controller.
+  map mem apb1-base + tim-stride * 0 size 0x50 = tim2
+  map mem apb1-base + tim-stride * 1 size 0x50 = tim3
+  map mem apb1-base + tim-stride * 2 size 0x50 = tim4
+  map mem apb1-base + tim-stride * 3 size 0x50 = tim5
+  map mem apb1-base + tim-stride * 4 size 0x50 = tim6
+  map mem apb1-base + tim-stride * 5 size 0x50 = tim7
+  map mem apb1-base + tim-stride * 6 size 0x50 = tim12
+  map mem apb1-base + tim-stride * 7 size 0x50 = tim13
+  map mem apb1-base + tim-stride * 8 size 0x50 = tim14
+  map mem apb1-base + wwdg-off   size 0x0c = wwdg
+  map mem apb1-base + iwdg-off   size 0x14 = iwdg
   map mem apb1-base + usart2-off size 0x2c = usart2
-  map mem 0x40005400 size 0x28  = i2c1
+  map mem apb1-base + i2c1-off   size 0x28 = i2c1
+  map mem apb1-base + pwr-off    size 0x08 = pwr
 
-  # The six ports the LQFP100 bonds, at A + n * 0x400: A, B, C, D, E, then H,
-  # which is 7. F, G and I exist on the die and have no pins in this package.
+  # APB2: the two advanced timers at the bottom, then SYSCFG and EXTI, then the
+  # TIM9/TIM10/TIM11 run four kilobytes up.
+  map mem apb2-base + tim-stride * 0 size 0x50 = tim1
+  map mem apb2-base + tim-stride * 1 size 0x50 = tim8
+  map mem apb2-base + syscfg-off size 0x24 = syscfg
+  map mem apb2-base + exti-off   size 0x18 = exti
+  map mem apb2-base + tim9-off + tim-stride * 0 size 0x50 = tim9
+  map mem apb2-base + tim9-off + tim-stride * 1 size 0x50 = tim10
+  map mem apb2-base + tim9-off + tim-stride * 2 size 0x50 = tim11
+
+  # AHB1. The six GPIO ports the LQFP100 bonds, at A + n * 0x400: A, B, C, D, E,
+  # then H, which is 7. F, G and I exist on the die and have no pins in this
+  # package. Then CRC, RCC, and the two DMA controllers.
   map mem ahb1-base + gpio-stride * 0 size 0x28 = gpioa
   map mem ahb1-base + gpio-stride * 1 size 0x28 = gpiob
   map mem ahb1-base + gpio-stride * 2 size 0x28 = gpioc
   map mem ahb1-base + gpio-stride * 3 size 0x28 = gpiod
   map mem ahb1-base + gpio-stride * 4 size 0x28 = gpioe
   map mem ahb1-base + gpio-stride * 7 size 0x28 = gpioh
+  map mem ahb1-base + crc-off size 0x0c = crc
+  map mem ahb1-base + rcc-off size 0x90 = rcc
+  map mem ahb1-base + dma-off + dma-stride * 0 size 0xd0 = dma1
+  map mem ahb1-base + dma-off + dma-stride * 1 size 0xd0 = dma2
 
-  map mem ahb1-base + rcc-off size 1K = rcc
+  # -- the same map as a bus master sees it ----------------------------------
+  #
+  # `dmabus`, which is what `dma1` and `dma2` transfer across. It is `mem`
+  # minus two things: **CCM**, which no master on the matrix reaches, and the
+  # boot alias, which exists for the core's first fetch and is not a window
+  # anything DMAs through. Flash is `r--` here rather than `r-x` because nothing
+  # executes out of a DMA controller.
+  #
+  # The DMA controllers' own register blocks are deliberately absent: a stream
+  # that reprograms a stream is not a transfer any board wants modelled, and
+  # leaving them out makes it a fault rather than a surprise.
+  map dmabus flash-base           size flash = rom { perms = "r--" }
+  map dmabus sram-base            size sram1 = ram1
+  map dmabus sram-base + sram1    size sram2 = ram2
+  map dmabus apb1-base + tim-stride * 0 size 0x50 = tim2
+  map dmabus apb1-base + tim-stride * 1 size 0x50 = tim3
+  map dmabus apb1-base + tim-stride * 2 size 0x50 = tim4
+  map dmabus apb1-base + tim-stride * 3 size 0x50 = tim5
+  map dmabus apb1-base + tim-stride * 4 size 0x50 = tim6
+  map dmabus apb1-base + tim-stride * 5 size 0x50 = tim7
+  map dmabus apb1-base + tim-stride * 6 size 0x50 = tim12
+  map dmabus apb1-base + tim-stride * 7 size 0x50 = tim13
+  map dmabus apb1-base + tim-stride * 8 size 0x50 = tim14
+  map dmabus apb1-base + wwdg-off   size 0x0c = wwdg
+  map dmabus apb1-base + iwdg-off   size 0x14 = iwdg
+  map dmabus apb1-base + usart2-off size 0x2c = usart2
+  map dmabus apb1-base + i2c1-off   size 0x28 = i2c1
+  map dmabus apb1-base + pwr-off    size 0x08 = pwr
+  map dmabus apb2-base + tim-stride * 0 size 0x50 = tim1
+  map dmabus apb2-base + tim-stride * 1 size 0x50 = tim8
+  map dmabus apb2-base + syscfg-off size 0x24 = syscfg
+  map dmabus apb2-base + exti-off   size 0x18 = exti
+  map dmabus apb2-base + tim9-off + tim-stride * 0 size 0x50 = tim9
+  map dmabus apb2-base + tim9-off + tim-stride * 1 size 0x50 = tim10
+  map dmabus apb2-base + tim9-off + tim-stride * 2 size 0x50 = tim11
+  map dmabus ahb1-base + gpio-stride * 0 size 0x28 = gpioa
+  map dmabus ahb1-base + gpio-stride * 1 size 0x28 = gpiob
+  map dmabus ahb1-base + gpio-stride * 2 size 0x28 = gpioc
+  map dmabus ahb1-base + gpio-stride * 3 size 0x28 = gpiod
+  map dmabus ahb1-base + gpio-stride * 4 size 0x28 = gpioe
+  map dmabus ahb1-base + gpio-stride * 7 size 0x28 = gpioh
+  map dmabus ahb1-base + crc-off size 0x0c = crc
+  map dmabus ahb1-base + rcc-off size 0x90 = rcc
 
   # -- interrupts ------------------------------------------------------------
   #
-  # The whole of the wiring, and the reason this board exists: no controller
-  # between the peripheral and the core, and the vector-table position written
-  # once, here. RM0090 Table 62 gives USART1 position 37, USART2 38, USART3 39.
-  wire usart2.irq -> cpu.irq38
+  # The reason this board exists: no controller between the peripheral and the
+  # core, and every vector-table position written once, here. Each number below
+  # is a **position in RM0090 Table 62** and is named in the comment beside it,
+  # because a wrong one does not fail — it silently runs somebody else's
+  # handler, and no amount of testing the device finds that.
+  #
+  # Two properties of Table 62 shape the lines below.
+  #
+  # * **A position can have more than one source.** TIM1's update event and
+  #   TIM9's only interrupt share position 25; EXTI lines 5 through 9 share 23
+  #   and 10 through 15 share 40. Those are wired-OR on the die and are a fan-in
+  #   here: several `wire` statements naming one `cpu.irq{n}`, which
+  #   `core::wire` resolves. They are written out one per source, which is what
+  #   `ROADMAP.md` §5 asks for.
+  # * **A source can have more than one position.** An advanced timer splits
+  #   its interrupt four ways — break, update, trigger/commutation, and
+  #   capture/compare — and `st.tim` publishes two of those four, `irq-up` and
+  #   `irq-cc`. Break and trigger/commutation have no pin because the model has
+  #   no `BDTR` break input and no commutation event (`src/dev/stm32/tim.rs`,
+  #   "What is modelled, and what is not"), so positions 24 and 26 are driven by
+  #   TIM9 and TIM11 alone and 43 and 45 by TIM12 and TIM14 alone. When the
+  #   break input lands, it gets a line here and nothing else changes.
+  #
+  # What is *not* wired, and why, so the gaps are legible rather than lost:
+  # position 4 (FLASH) and 5 (RCC) — `st.rcc`'s `CIR` is storage and raises no
+  # interrupt; 1 (PVD) — `st.pwr` publishes no PVD output; 18–22 (ADC, CAN1)
+  # and everything above 47 that is not a timer — no such device on this board.
+  # The independent watchdog has no vector at all on any STM32: expiry is a
+  # reset, which is why `iwdg` appears under the reset wiring and not here.
+
+  # WWDG's early-wakeup interrupt is **position 0**, the first entry in Table 62
+  # and the lowest-numbered external interrupt an STM32F4 has. It fires one
+  # decrement before the reset, which is the last chance firmware has to save
+  # anything.
+  wire wwdg.ewi -> cpu.irq0
+
+  # EXTI. Lines 0-4 have a vector each at positions 6-10; lines 5-9 share
+  # position 23 (`EXTI9_5`) and lines 10-15 share 40 (`EXTI15_10`). A handler
+  # for either of the grouped ones reads `PR` to find out which line it was,
+  # which is why one core pin with five or six sources on it is the faithful
+  # model and not a shortcut.
+  wire exti.irq0  -> cpu.irq6     # EXTI0
+  wire exti.irq1  -> cpu.irq7     # EXTI1
+  wire exti.irq2  -> cpu.irq8     # EXTI2
+  wire exti.irq3  -> cpu.irq9     # EXTI3
+  wire exti.irq4  -> cpu.irq10    # EXTI4
+  wire exti.irq5  -> cpu.irq23    # EXTI9_5
+  wire exti.irq6  -> cpu.irq23    # EXTI9_5
+  wire exti.irq7  -> cpu.irq23    # EXTI9_5
+  wire exti.irq8  -> cpu.irq23    # EXTI9_5
+  wire exti.irq9  -> cpu.irq23    # EXTI9_5
+  wire exti.irq10 -> cpu.irq40    # EXTI15_10
+  wire exti.irq11 -> cpu.irq40    # EXTI15_10
+  wire exti.irq12 -> cpu.irq40    # EXTI15_10
+  wire exti.irq13 -> cpu.irq40    # EXTI15_10
+  wire exti.irq14 -> cpu.irq40    # EXTI15_10
+  wire exti.irq15 -> cpu.irq40    # EXTI15_10
+
+  # The timers. The four advanced-timer positions are shared with TIM9-TIM11
+  # (for TIM1) and TIM12-TIM14 (for TIM8), which is what their names in Table 62
+  # say: `TIM1_BRK_TIM9`, `TIM1_UP_TIM10`, `TIM1_TRG_COM_TIM11`, `TIM1_CC`.
+  wire tim9.irq     -> cpu.irq24   # TIM1_BRK_TIM9 (TIM1's break has no pin)
+  wire tim1.irq-up  -> cpu.irq25   # TIM1_UP_TIM10
+  wire tim10.irq    -> cpu.irq25   # TIM1_UP_TIM10
+  wire tim11.irq    -> cpu.irq26   # TIM1_TRG_COM_TIM11 (no commutation pin)
+  wire tim1.irq-cc  -> cpu.irq27   # TIM1_CC
+  wire tim2.irq     -> cpu.irq28   # TIM2
+  wire tim3.irq     -> cpu.irq29   # TIM3
+  wire tim4.irq     -> cpu.irq30   # TIM4
+  wire tim12.irq    -> cpu.irq43   # TIM8_BRK_TIM12 (TIM8's break has no pin)
+  wire tim8.irq-up  -> cpu.irq44   # TIM8_UP_TIM13
+  wire tim13.irq    -> cpu.irq44   # TIM8_UP_TIM13
+  wire tim14.irq    -> cpu.irq45   # TIM8_TRG_COM_TIM14 (no commutation pin)
+  wire tim8.irq-cc  -> cpu.irq46   # TIM8_CC
+  wire tim5.irq     -> cpu.irq50   # TIM5
+  wire tim6.irq     -> cpu.irq54   # TIM6_DAC — shared with the DAC's underrun
+  wire tim7.irq     -> cpu.irq55   # TIM7
+
+  # The DMA controllers, one vector per stream. Neither controller's streams are
+  # contiguous in the table: DMA1's streams 0-6 are at 11-17 and its **stream 7
+  # is at 47**, and DMA2's streams 0-4 are at 56-60 with 5, 6 and 7 at 68, 69
+  # and 70. Those two discontinuities are the easiest thing on this whole part
+  # to get wrong, and a board that assumed the obvious run would put six
+  # transfers' completions on six other peripherals' handlers.
+  wire dma1.irq0 -> cpu.irq11    # DMA1_Stream0
+  wire dma1.irq1 -> cpu.irq12    # DMA1_Stream1
+  wire dma1.irq2 -> cpu.irq13    # DMA1_Stream2
+  wire dma1.irq3 -> cpu.irq14    # DMA1_Stream3
+  wire dma1.irq4 -> cpu.irq15    # DMA1_Stream4
+  wire dma1.irq5 -> cpu.irq16    # DMA1_Stream5
+  wire dma1.irq6 -> cpu.irq17    # DMA1_Stream6
+  wire dma1.irq7 -> cpu.irq47    # DMA1_Stream7
+  wire dma2.irq0 -> cpu.irq56    # DMA2_Stream0
+  wire dma2.irq1 -> cpu.irq57    # DMA2_Stream1
+  wire dma2.irq2 -> cpu.irq58    # DMA2_Stream2
+  wire dma2.irq3 -> cpu.irq59    # DMA2_Stream3
+  wire dma2.irq4 -> cpu.irq60    # DMA2_Stream4
+  wire dma2.irq5 -> cpu.irq68    # DMA2_Stream5
+  wire dma2.irq6 -> cpu.irq69    # DMA2_Stream6
+  wire dma2.irq7 -> cpu.irq70    # DMA2_Stream7
+
+  wire usart2.irq -> cpu.irq38    # USART2 (USART1 is 37, USART3 39)
+
+  # -- resets ----------------------------------------------------------------
+  #
+  # Either watchdog expiring pulses `reset`, and a watchdog reset on the part is
+  # a system reset: the core restarts and `RCC_CSR` remembers which of the two
+  # did it, because the flag is RCC's state and not the watchdog's. So each
+  # pulse goes two places — the core's reset input, and the matching cause pin
+  # on RCC. That is the whole of the difference between a board that reboots and
+  # a board whose firmware can tell you *why* it rebooted.
+  #
+  # `cpu.reset` resets the core and not the peripherals, which is narrower than
+  # the part: a real `NRST` clears every block on the die. Nothing here relies
+  # on the difference, and widening it needs a machine-level reset sink that
+  # does not exist yet.
+  wire iwdg.reset -> cpu.reset
+  wire iwdg.reset -> rcc.iwdgrst
+  wire wwdg.reset -> cpu.reset
+  wire wwdg.reset -> rcc.wwdgrst
+
+  # -- the backup domain -----------------------------------------------------
+  #
+  # `PWR_CR.DBP` is a level on a net rather than a handle, because that is what
+  # it is on the die: it is what makes RCC's `BDCR` writable, and a firmware
+  # that configures the RTC or the LSE sets it first and clears it after.
+  wire pwr.dbp -> rcc.dbp
 
   # -- the pins --------------------------------------------------------------
   #
@@ -321,6 +701,122 @@ machine "stm32f407" {
   # have nothing to carry. The GPIO's alternate-function inputs exist for the
   # peripherals whose pin genuinely is a level — an SPI clock, a chip select, a
   # timer's compare output.
+
+  # -- the external-interrupt mux --------------------------------------------
+  #
+  # Three hops, and the middle one is the mux: the port drives its pin, SYSCFG's
+  # `EXTICR` decides which port's pin *n* is what EXTI line *n* sees, and EXTI
+  # decides what an edge there does. Only the first hop is per-pin wiring, and
+  # it is written out below because a machine file has no loops — which is the
+  # honest cost of saying, once, that every bonded pin on this package can be an
+  # interrupt source. A port whose pin is not selected by `EXTICR` drives a
+  # level nothing looks at, exactly as on the die.
+  #
+  # GPIOH is two lines rather than sixteen: the LQFP100 bonds PH0 and PH1 (the
+  # OSC_IN/OSC_OUT pair) and nothing else of port H, so there are no other pins
+  # to be an interrupt source.
+  wire gpioa.p0  -> syscfg.pa0
+  wire gpioa.p1  -> syscfg.pa1
+  wire gpioa.p2  -> syscfg.pa2
+  wire gpioa.p3  -> syscfg.pa3
+  wire gpioa.p4  -> syscfg.pa4
+  wire gpioa.p5  -> syscfg.pa5
+  wire gpioa.p6  -> syscfg.pa6
+  wire gpioa.p7  -> syscfg.pa7
+  wire gpioa.p8  -> syscfg.pa8
+  wire gpioa.p9  -> syscfg.pa9
+  wire gpioa.p10 -> syscfg.pa10
+  wire gpioa.p11 -> syscfg.pa11
+  wire gpioa.p12 -> syscfg.pa12
+  wire gpioa.p13 -> syscfg.pa13
+  wire gpioa.p14 -> syscfg.pa14
+  wire gpioa.p15 -> syscfg.pa15
+  wire gpiob.p0  -> syscfg.pb0
+  wire gpiob.p1  -> syscfg.pb1
+  wire gpiob.p2  -> syscfg.pb2
+  wire gpiob.p3  -> syscfg.pb3
+  wire gpiob.p4  -> syscfg.pb4
+  wire gpiob.p5  -> syscfg.pb5
+  wire gpiob.p6  -> syscfg.pb6
+  wire gpiob.p7  -> syscfg.pb7
+  wire gpiob.p8  -> syscfg.pb8
+  wire gpiob.p9  -> syscfg.pb9
+  wire gpiob.p10 -> syscfg.pb10
+  wire gpiob.p11 -> syscfg.pb11
+  wire gpiob.p12 -> syscfg.pb12
+  wire gpiob.p13 -> syscfg.pb13
+  wire gpiob.p14 -> syscfg.pb14
+  wire gpiob.p15 -> syscfg.pb15
+  wire gpioc.p0  -> syscfg.pc0
+  wire gpioc.p1  -> syscfg.pc1
+  wire gpioc.p2  -> syscfg.pc2
+  wire gpioc.p3  -> syscfg.pc3
+  wire gpioc.p4  -> syscfg.pc4
+  wire gpioc.p5  -> syscfg.pc5
+  wire gpioc.p6  -> syscfg.pc6
+  wire gpioc.p7  -> syscfg.pc7
+  wire gpioc.p8  -> syscfg.pc8
+  wire gpioc.p9  -> syscfg.pc9
+  wire gpioc.p10 -> syscfg.pc10
+  wire gpioc.p11 -> syscfg.pc11
+  wire gpioc.p12 -> syscfg.pc12
+  wire gpioc.p13 -> syscfg.pc13
+  wire gpioc.p14 -> syscfg.pc14
+  wire gpioc.p15 -> syscfg.pc15
+  wire gpiod.p0  -> syscfg.pd0
+  wire gpiod.p1  -> syscfg.pd1
+  wire gpiod.p2  -> syscfg.pd2
+  wire gpiod.p3  -> syscfg.pd3
+  wire gpiod.p4  -> syscfg.pd4
+  wire gpiod.p5  -> syscfg.pd5
+  wire gpiod.p6  -> syscfg.pd6
+  wire gpiod.p7  -> syscfg.pd7
+  wire gpiod.p8  -> syscfg.pd8
+  wire gpiod.p9  -> syscfg.pd9
+  wire gpiod.p10 -> syscfg.pd10
+  wire gpiod.p11 -> syscfg.pd11
+  wire gpiod.p12 -> syscfg.pd12
+  wire gpiod.p13 -> syscfg.pd13
+  wire gpiod.p14 -> syscfg.pd14
+  wire gpiod.p15 -> syscfg.pd15
+  wire gpioe.p0  -> syscfg.pe0
+  wire gpioe.p1  -> syscfg.pe1
+  wire gpioe.p2  -> syscfg.pe2
+  wire gpioe.p3  -> syscfg.pe3
+  wire gpioe.p4  -> syscfg.pe4
+  wire gpioe.p5  -> syscfg.pe5
+  wire gpioe.p6  -> syscfg.pe6
+  wire gpioe.p7  -> syscfg.pe7
+  wire gpioe.p8  -> syscfg.pe8
+  wire gpioe.p9  -> syscfg.pe9
+  wire gpioe.p10 -> syscfg.pe10
+  wire gpioe.p11 -> syscfg.pe11
+  wire gpioe.p12 -> syscfg.pe12
+  wire gpioe.p13 -> syscfg.pe13
+  wire gpioe.p14 -> syscfg.pe14
+  wire gpioe.p15 -> syscfg.pe15
+  wire gpioh.p0  -> syscfg.ph0
+  wire gpioh.p1  -> syscfg.ph1
+
+  # The mux's sixteen outputs into EXTI's sixteen GPIO lines. Lines 16-22 are
+  # the peripheral wakeups (PVD, the RTC, the OTG and Ethernet cores) and are
+  # undriven on this board — see the `exti` object above.
+  wire syscfg.exti0  -> exti.line0
+  wire syscfg.exti1  -> exti.line1
+  wire syscfg.exti2  -> exti.line2
+  wire syscfg.exti3  -> exti.line3
+  wire syscfg.exti4  -> exti.line4
+  wire syscfg.exti5  -> exti.line5
+  wire syscfg.exti6  -> exti.line6
+  wire syscfg.exti7  -> exti.line7
+  wire syscfg.exti8  -> exti.line8
+  wire syscfg.exti9  -> exti.line9
+  wire syscfg.exti10 -> exti.line10
+  wire syscfg.exti11 -> exti.line11
+  wire syscfg.exti12 -> exti.line12
+  wire syscfg.exti13 -> exti.line13
+  wire syscfg.exti14 -> exti.line14
+  wire syscfg.exti15 -> exti.line15
 
   # -- I2C: the interrupt pair, then the two open-drain nets -----------------
   #

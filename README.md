@@ -411,13 +411,24 @@ port. The whole boot is 2,156,716 ms of guest time — minutes of host time — 
 `docs/platforms/q35-uefi.md` is the ledger of what is still in the way.
 
 `stm32f407` is a microcontroller rather than a computer: an **STM32F407VGT6**,
-the part on ST's own STM32F4 Discovery board — a Cortex-M4 out of flash aliased
-at zero, six GPIO ports as instances of one class, and USART2 on your terminal.
-It is where an M-profile core answers the question the other boards never ask,
-because a Cortex-M's interrupt controller is *inside the core*: a peripheral
-drives `cpu.irq38` directly, and 38 is USART2's row in the part's vector table,
-written in the machine file where the part is chosen rather than in any device
-model.
+the part on ST's own STM32F4 Discovery board — a Cortex-M4F out of flash aliased
+at zero, six GPIO ports as instances of one class, USART2 on your terminal, and
+the peripherals a startup file actually talks to: the clock and power
+controllers, fourteen timers, two DMA controllers, the EXTI pin-interrupt mux
+and both watchdogs. It is where an M-profile core answers the question the other
+boards never ask, because a Cortex-M's interrupt controller is *inside the
+core*: a peripheral drives `cpu.irq38` directly, and 38 is USART2's row in the
+part's vector table, written in the machine file where the part is chosen rather
+than in any device model. Fifty-odd such rows are written there now, each with
+its name from the manual beside it, and a test makes the handlers say which
+number they were reached through — because a vector wired to the wrong core pin
+does not fail, it quietly runs somebody else's code.
+
+The two DMA controllers master a **second address space**, which is how the
+board says the thing a comment cannot: an F4's core-coupled memory is on the
+Cortex-M4's own bus and no DMA reaches it, so `dmabus` has SRAM and the
+peripherals in it and no CCM, and a stream pointed at `0x10000000` raises a
+transfer error exactly as the silicon does.
 
 Beside them are the fifteen synthetic boards, each the smallest
 machine that exercises one thing: `spi-panel` (a display path over SPI),
