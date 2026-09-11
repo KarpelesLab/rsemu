@@ -799,7 +799,12 @@ impl Hart {
     /// Only the engine that reads one asks for it, and the point of being able
     /// to see that from outside is that a table nothing looks at is a cost
     /// with no benefit.
-    #[cfg(all(test, feature = "jit"))]
+    // The gate is the one `mod engine` carries, not `jit` alone: the only
+    // callers are that module's tests, and it needs the frontend *and* the
+    // runtime. Gated on `jit` by itself this is dead code in any build that
+    // takes the runtime without the RISC-V lift — which the sweep's random
+    // feature combinations do draw, and `dead_code` is denied.
+    #[cfg(all(test, feature = "cpu-riscv-lift", feature = "jit"))]
     pub(super) fn has_shadow(&self) -> bool {
         self.session.lock().tlb.has_shadow()
     }
