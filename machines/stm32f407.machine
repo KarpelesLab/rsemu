@@ -408,13 +408,25 @@ machine "stm32f407" {
   # per beat, and what matters for firmware is that a transfer *takes time at
   # all* rather than completing inside the store that sets `EN`.
   #
-  # **One peripheral drives a request line**, and it is `sdio` — see below. The
-  # request matrix of RM0090 Table 43 is a fact about the part and so belongs in
-  # this file, exactly as a vector number does, and the one entry of it that has
-  # a device to hang off it is written out under the interrupts. Every other
-  # `req` input is unconnected, because neither `st.usart` nor `st.i2c` nor
-  # `st.spi` publishes an output yet; for those peripherals the streams here
-  # still serve memory-to-memory transfers.
+  # **One peripheral drives a request line**, and it is `sdio` — written out
+  # under the interrupts. The request matrix of RM0090 Table 43 is a fact about
+  # the part and so belongs in this file, exactly as a vector number does.
+  #
+  # **The rest of the matrix stays out, and not for want of a device.**
+  # `st.tim` now publishes `dma-up`, `dma-ch1`–`dma-ch4` and `dma-trg`, so
+  # `wire tim2.dma-up -> dma1.req1` is a line this file could carry today, and
+  # `TIM2`'s `DCR`/`DMAR` burst window would write straight into its own `CCRx`.
+  # What stops it is the other half of the table: Table 43 maps each request to
+  # a stream **and a channel**, and `st.dma`'s `CHSEL` is stored without gating
+  # the transfer. Wire `TIM2_UP` to both of the streams the table gives it and a
+  # guest using one of those streams for something else gets beats it never
+  # asked for. Honouring `CHSEL` is a change to `st.dma`. `sdio` is exempt
+  # because it is wired to one stream, not to the pair.
+  #
+  # Every other `req` input is unconnected — `st.usart`, `st.i2c` and `st.spi`
+  # publish no output yet — so for those peripherals the streams here still
+  # serve memory-to-memory transfers. The timer's end of the seam is proved by
+  # `st.tim`'s own board-level test.
   object dma1 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
   object dma2 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
 
@@ -566,20 +578,22 @@ machine "stm32f407" {
   # and the rest of the kilobyte is a **hole** rather than a mirror — which is
   # what the part does, and what makes a wrong offset a fault instead of a
   # plausible answer. The one place that is generous is a timer: `st.tim`
-  # decodes one 0x50 window whatever the variant, so TIM6 and TIM7 answer above
-  # the `ARR` their registers stop at.
+  # decodes one 0x64 window whatever the variant, so TIM6 and TIM7 answer above
+  # the `ARR` their registers stop at. The window runs to 0x64 rather than to
+  # `DMAR`'s 0x4c because `TIMx_OR` is at 0x50 on an F4 (RM0090 §17.4.19 and
+  # §17.4.20, TIM2's and TIM5's) and `OR2` is at 0x60 on an L4.
   #
   # APB1 from the bottom: the nine timers it carries, the two watchdogs, the
   # USART, I2C1 and the power controller.
-  map mem apb1-base + tim-stride * 0 size 0x50 = tim2
-  map mem apb1-base + tim-stride * 1 size 0x50 = tim3
-  map mem apb1-base + tim-stride * 2 size 0x50 = tim4
-  map mem apb1-base + tim-stride * 3 size 0x50 = tim5
-  map mem apb1-base + tim-stride * 4 size 0x50 = tim6
-  map mem apb1-base + tim-stride * 5 size 0x50 = tim7
-  map mem apb1-base + tim-stride * 6 size 0x50 = tim12
-  map mem apb1-base + tim-stride * 7 size 0x50 = tim13
-  map mem apb1-base + tim-stride * 8 size 0x50 = tim14
+  map mem apb1-base + tim-stride * 0 size 0x64 = tim2
+  map mem apb1-base + tim-stride * 1 size 0x64 = tim3
+  map mem apb1-base + tim-stride * 2 size 0x64 = tim4
+  map mem apb1-base + tim-stride * 3 size 0x64 = tim5
+  map mem apb1-base + tim-stride * 4 size 0x64 = tim6
+  map mem apb1-base + tim-stride * 5 size 0x64 = tim7
+  map mem apb1-base + tim-stride * 6 size 0x64 = tim12
+  map mem apb1-base + tim-stride * 7 size 0x64 = tim13
+  map mem apb1-base + tim-stride * 8 size 0x64 = tim14
   map mem apb1-base + wwdg-off   size 0x0c = wwdg
   map mem apb1-base + iwdg-off   size 0x14 = iwdg
   map mem apb1-base + usart2-off size 0x2c = usart2
@@ -589,14 +603,14 @@ machine "stm32f407" {
 
   # APB2: the two advanced timers at the bottom, then SYSCFG and EXTI, then the
   # TIM9/TIM10/TIM11 run four kilobytes up.
-  map mem apb2-base + tim-stride * 0 size 0x50 = tim1
-  map mem apb2-base + tim-stride * 1 size 0x50 = tim8
+  map mem apb2-base + tim-stride * 0 size 0x64 = tim1
+  map mem apb2-base + tim-stride * 1 size 0x64 = tim8
   map mem apb2-base + syscfg-off size 0x24 = syscfg
   map mem apb2-base + exti-off   size 0x18 = exti
   map mem apb2-base + sdio-off   size 0x400 = sdio
-  map mem apb2-base + tim9-off + tim-stride * 0 size 0x50 = tim9
-  map mem apb2-base + tim9-off + tim-stride * 1 size 0x50 = tim10
-  map mem apb2-base + tim9-off + tim-stride * 2 size 0x50 = tim11
+  map mem apb2-base + tim9-off + tim-stride * 0 size 0x64 = tim9
+  map mem apb2-base + tim9-off + tim-stride * 1 size 0x64 = tim10
+  map mem apb2-base + tim9-off + tim-stride * 2 size 0x64 = tim11
 
   # AHB1. The six GPIO ports the LQFP100 bonds, at A + n * 0x400: A, B, C, D, E,
   # then H, which is 7. F, G and I exist on the die and have no pins in this
@@ -632,31 +646,31 @@ machine "stm32f407" {
   map dmabus flash-base           size flash = eflash.array { perms = "r--" }
   map dmabus sram-base            size sram1 = ram1
   map dmabus sram-base + sram1    size sram2 = ram2
-  map dmabus apb1-base + tim-stride * 0 size 0x50 = tim2
-  map dmabus apb1-base + tim-stride * 1 size 0x50 = tim3
-  map dmabus apb1-base + tim-stride * 2 size 0x50 = tim4
-  map dmabus apb1-base + tim-stride * 3 size 0x50 = tim5
-  map dmabus apb1-base + tim-stride * 4 size 0x50 = tim6
-  map dmabus apb1-base + tim-stride * 5 size 0x50 = tim7
-  map dmabus apb1-base + tim-stride * 6 size 0x50 = tim12
-  map dmabus apb1-base + tim-stride * 7 size 0x50 = tim13
-  map dmabus apb1-base + tim-stride * 8 size 0x50 = tim14
+  map dmabus apb1-base + tim-stride * 0 size 0x64 = tim2
+  map dmabus apb1-base + tim-stride * 1 size 0x64 = tim3
+  map dmabus apb1-base + tim-stride * 2 size 0x64 = tim4
+  map dmabus apb1-base + tim-stride * 3 size 0x64 = tim5
+  map dmabus apb1-base + tim-stride * 4 size 0x64 = tim6
+  map dmabus apb1-base + tim-stride * 5 size 0x64 = tim7
+  map dmabus apb1-base + tim-stride * 6 size 0x64 = tim12
+  map dmabus apb1-base + tim-stride * 7 size 0x64 = tim13
+  map dmabus apb1-base + tim-stride * 8 size 0x64 = tim14
   map dmabus apb1-base + wwdg-off   size 0x0c = wwdg
   map dmabus apb1-base + iwdg-off   size 0x14 = iwdg
   map dmabus apb1-base + usart2-off size 0x2c = usart2
   map dmabus apb1-base + i2c1-off   size 0x28 = i2c1
   map dmabus apb1-base + pwr-off    size 0x08 = pwr
   map dmabus apb1-base + rtc-off    size 0xd0 = rtc
-  map dmabus apb2-base + tim-stride * 0 size 0x50 = tim1
-  map dmabus apb2-base + tim-stride * 1 size 0x50 = tim8
+  map dmabus apb2-base + tim-stride * 0 size 0x64 = tim1
+  map dmabus apb2-base + tim-stride * 1 size 0x64 = tim8
   map dmabus apb2-base + syscfg-off size 0x24 = syscfg
   map dmabus apb2-base + exti-off   size 0x18 = exti
   # The SDIO, because DMA2 reads its FIFO. Without this line the request
   # line would be raised and every beat would take a bus fault.
   map dmabus apb2-base + sdio-off   size 0x400 = sdio
-  map dmabus apb2-base + tim9-off + tim-stride * 0 size 0x50 = tim9
-  map dmabus apb2-base + tim9-off + tim-stride * 1 size 0x50 = tim10
-  map dmabus apb2-base + tim9-off + tim-stride * 2 size 0x50 = tim11
+  map dmabus apb2-base + tim9-off + tim-stride * 0 size 0x64 = tim9
+  map dmabus apb2-base + tim9-off + tim-stride * 1 size 0x64 = tim10
+  map dmabus apb2-base + tim9-off + tim-stride * 2 size 0x64 = tim11
   map dmabus ahb1-base + gpio-stride * 0 size 0x28 = gpioa
   map dmabus ahb1-base + gpio-stride * 1 size 0x28 = gpiob
   map dmabus ahb1-base + gpio-stride * 2 size 0x28 = gpioc
@@ -744,7 +758,8 @@ machine "stm32f407" {
   wire tim9.irq     -> cpu.irq24   # TIM1_BRK_TIM9 (TIM1's break has no pin)
   wire tim1.irq-up  -> cpu.irq25   # TIM1_UP_TIM10
   wire tim10.irq    -> cpu.irq25   # TIM1_UP_TIM10
-  wire tim11.irq    -> cpu.irq26   # TIM1_TRG_COM_TIM11 (no commutation pin)
+  wire tim1.irq-trg -> cpu.irq26   # TIM1_TRG_COM — `SR.TIF`; commutation is not modelled
+  wire tim11.irq    -> cpu.irq26   # TIM1_TRG_COM_TIM11
   wire tim1.irq-cc  -> cpu.irq27   # TIM1_CC
   wire tim2.irq     -> cpu.irq28   # TIM2
   wire tim3.irq     -> cpu.irq29   # TIM3
@@ -752,11 +767,57 @@ machine "stm32f407" {
   wire tim12.irq    -> cpu.irq43   # TIM8_BRK_TIM12 (TIM8's break has no pin)
   wire tim8.irq-up  -> cpu.irq44   # TIM8_UP_TIM13
   wire tim13.irq    -> cpu.irq44   # TIM8_UP_TIM13
-  wire tim14.irq    -> cpu.irq45   # TIM8_TRG_COM_TIM14 (no commutation pin)
+  wire tim8.irq-trg -> cpu.irq45   # TIM8_TRG_COM — as TIM1's
+  wire tim14.irq    -> cpu.irq45   # TIM8_TRG_COM_TIM14
   wire tim8.irq-cc  -> cpu.irq46   # TIM8_CC
   wire tim5.irq     -> cpu.irq50   # TIM5
   wire tim6.irq     -> cpu.irq54   # TIM6_DAC — shared with the DAC's underrun
   wire tim7.irq     -> cpu.irq55   # TIM7
+
+  # -- the internal trigger matrix -------------------------------------------
+  #
+  # `ITR0`–`ITR3` are the four internal trigger sources `SMCR.TS` chooses
+  # between, and which timer each one comes from is fixed in silicon per part:
+  # RM0090's "TIMx internal trigger connection" tables, in §17.3.15 for
+  # TIM2–TIM5 and in §18's timer-synchronization section for TIM1 and TIM8.
+  # That is a fact about the *part*, which is
+  # why it is wiring here and not a table inside `st.tim` — the same argument
+  # as a vector number, and as `st.dma`'s request matrix.
+  #
+  # This is what makes `TIM1` prescale `TIM2`, or one timer gate another: the
+  # master sets `CR2.MMS` and the slave sets `SMCR.SMS`/`TS`, and the wire in
+  # between is already here. TIM9–TIM14 are left out on purpose: two of their
+  # four `ITR` inputs come from another timer's `OC1REF` rather than from its
+  # `TRGO`, and `st.tim` publishes no such pin.
+  wire tim1.trgo -> tim2.itr0
+  wire tim1.trgo -> tim3.itr0
+  wire tim1.trgo -> tim4.itr0
+  wire tim1.trgo -> tim8.itr0
+
+  wire tim2.trgo -> tim1.itr1
+  wire tim2.trgo -> tim3.itr1
+  wire tim2.trgo -> tim4.itr1
+  wire tim2.trgo -> tim5.itr0
+  wire tim2.trgo -> tim8.itr1
+
+  wire tim3.trgo -> tim1.itr2
+  wire tim3.trgo -> tim2.itr2
+  wire tim3.trgo -> tim4.itr2
+  wire tim3.trgo -> tim5.itr1
+
+  wire tim4.trgo -> tim1.itr3
+  wire tim4.trgo -> tim2.itr3
+  wire tim4.trgo -> tim3.itr3
+  wire tim4.trgo -> tim5.itr2
+  wire tim4.trgo -> tim8.itr2
+
+  wire tim5.trgo -> tim1.itr0
+  wire tim5.trgo -> tim3.itr2
+  wire tim5.trgo -> tim8.itr3
+
+  wire tim8.trgo -> tim2.itr1
+  wire tim8.trgo -> tim4.itr3
+  wire tim8.trgo -> tim5.itr3
 
   # The DMA controllers, one vector per stream. Neither controller's streams are
   # contiguous in the table: DMA1's streams 0-6 are at 11-17 and its **stream 7
