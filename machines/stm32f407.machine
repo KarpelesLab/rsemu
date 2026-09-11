@@ -66,9 +66,9 @@
 #   peripheral whose clock the guest never enables still works here.
 #
 # What is genuinely absent is the rest of the die: SPI, I2C2 and I2C3, the OTG
-# cores, SDIO, the ADCs, the DAC, CAN, the RTC, the FSMC and Ethernet. They are
-# separate device classes and separate `object` lines, and this file is the
-# floor they get added to.
+# cores, the ADCs, the DAC, CAN, the FSMC and Ethernet. They are separate device
+# classes and separate `object` lines, and this file is the floor they get added
+# to.
 #
 # GPIOF, GPIOG and GPIOI exist on the die but the LQFP100 bonds no pins of them,
 # so this board does not instantiate them. A file for an F407ZGT6 (LQFP144, A–G)
@@ -100,6 +100,14 @@ machine "stm32f407" {
   # a half period lasts -- so firmware that polls `SR1` sees one timeline.
   param i2clink = "wired"
   param i2cbus  = "i2c1"
+
+  # Which named card socket the SDIO controller drives. The **socket** is on the
+  # board whether or not anything is in it, which is the honest model of an F407
+  # design: the peripheral is bonded out on every one of them, and whether a card
+  # is present is a runtime question. An empty socket answers every command with
+  # `CTIMEOUT`, and firmware concludes there is no card — which is what a board
+  # with nothing plugged in does. A host puts a card in by opening this slot.
+  param sd-slot = "sd0"
 
   # How much flash the part has: 1 MiB on the -VG suffix, 512 KiB on a -VE.
   param flash = 1M
@@ -183,6 +191,7 @@ machine "stm32f407" {
   param pwr-off     = 0x7000       # APB1 + 0x7000
   param syscfg-off  = 0x3800       # APB2 + 0x3800
   param exti-off    = 0x3c00       # APB2 + 0x3c00
+  param sdio-off    = 0x2c00       # APB2 + 0x2c00
   param gpio-stride = 0x400
   param crc-off     = 0x3000       # AHB1 + 0x3000
   param rcc-off     = 0x3800       # AHB1 + 0x3800
@@ -399,14 +408,31 @@ machine "stm32f407" {
   # per beat, and what matters for firmware is that a transfer *takes time at
   # all* rather than completing inside the store that sets `EN`.
   #
-  # **Nothing drives a request line.** `req0`–`req7` are inputs and no
-  # peripheral on this board has a request output to wire to them (neither
-  # `st.usart` nor `st.i2c` publishes one), so the streams here serve
-  # memory-to-memory transfers and nothing else. The request matrix of RM0090
-  # Table 43 is a fact about the part and belongs in this file, exactly as a
-  # vector number does; it goes in when there is a peripheral that can drive one.
+  # **One peripheral drives a request line**, and it is `sdio` — see below. The
+  # request matrix of RM0090 Table 43 is a fact about the part and so belongs in
+  # this file, exactly as a vector number does, and the one entry of it that has
+  # a device to hang off it is written out under the interrupts. Every other
+  # `req` input is unconnected, because neither `st.usart` nor `st.i2c` nor
+  # `st.spi` publishes an output yet; for those peripherals the streams here
+  # still serve memory-to-memory transfers.
   object dma1 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
   object dma2 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
+
+  # -- the SD host -----------------------------------------------------------
+  #
+  # `stm32.sdio` and **not** `stm32.sdmmc`: an F407 has the older block of
+  # RM0090 §31, where `SDIO_CMD` bits 7:6 are `WAITRESP` rather than
+  # `CMDTRANS`/`CMDSTOP`, `WAITRESP = 10b` means "no response" rather than
+  # "short response, no CRC", and the FIFO is thirty-two words. The two are
+  # separate device classes for exactly that reason; `src/dev/stm32/sdio.rs`
+  # lists the rest.
+  #
+  # It takes no `space`, because unlike the H7's SDMMC it is **not a bus
+  # master**: it raises a request and DMA2 does the moving. That is why its
+  # register block is mapped into `dmabus` below as well as into `mem` — the
+  # stream's beat is an ordinary bus read at `CPAR`, and `CPAR` points at this
+  # peripheral's FIFO.
+  object sdio "stm32.sdio" { slot = sd-slot }
 
   # -- the external-interrupt path -------------------------------------------
   #
@@ -567,6 +593,7 @@ machine "stm32f407" {
   map mem apb2-base + tim-stride * 1 size 0x50 = tim8
   map mem apb2-base + syscfg-off size 0x24 = syscfg
   map mem apb2-base + exti-off   size 0x18 = exti
+  map mem apb2-base + sdio-off   size 0x400 = sdio
   map mem apb2-base + tim9-off + tim-stride * 0 size 0x50 = tim9
   map mem apb2-base + tim9-off + tim-stride * 1 size 0x50 = tim10
   map mem apb2-base + tim9-off + tim-stride * 2 size 0x50 = tim11
@@ -624,6 +651,9 @@ machine "stm32f407" {
   map dmabus apb2-base + tim-stride * 1 size 0x50 = tim8
   map dmabus apb2-base + syscfg-off size 0x24 = syscfg
   map dmabus apb2-base + exti-off   size 0x18 = exti
+  # The SDIO, because DMA2 reads its FIFO. Without this line the request
+  # line would be raised and every beat would take a bus fault.
+  map dmabus apb2-base + sdio-off   size 0x400 = sdio
   map dmabus apb2-base + tim9-off + tim-stride * 0 size 0x50 = tim9
   map dmabus apb2-base + tim9-off + tim-stride * 1 size 0x50 = tim10
   map dmabus apb2-base + tim9-off + tim-stride * 2 size 0x50 = tim11
@@ -752,6 +782,17 @@ machine "stm32f407" {
   wire dma2.irq7 -> cpu.irq70    # DMA2_Stream7
 
   wire usart2.irq -> cpu.irq38    # USART2 (USART1 is 37, USART3 39)
+  wire sdio.irq   -> cpu.irq49    # SDIO
+
+  # The DMA request, and the only `req` pin on this board that anything drives.
+  # RM0090 Table 43 puts SDIO on **DMA2, channel 4, streams 3 and 6** — a
+  # peripheral with one request line reaching two streams, and a driver picks
+  # one. This board wires stream 3, which is what ST's own `SD_SDIO_DMA_STREAM`
+  # default names; a design that wants stream 6 changes this one line. Wiring
+  # both would model the silicon's fan-out exactly, and would also let a guest
+  # that armed both streams with `CHSEL = 4` have each beat served twice, which
+  # is a configuration the reference manual forbids rather than one to emulate.
+  wire sdio.dma   -> dma2.req3
 
   # RM0090 Table 62 calls position **80** `HASH_RNG`: "Hash and Rng global
   # interrupt", vector address 0x0000_0180. The two cross-check — an external
