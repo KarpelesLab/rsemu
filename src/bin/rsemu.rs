@@ -164,6 +164,18 @@ RUN OPTIONS:
                         `tests/cli_trace.rs` asserts. Needs a build with the
                         `trace` feature; without it the flag is refused rather
                         than ignored
+    --spin-detect       Report a processor that is spinning on a load whose
+                        value never changes -- firmware polling a status bit on
+                        a peripheral that is not modelled, which is the most
+                        common way a board bring-up hangs and which otherwise
+                        produces no output at all. One line per loop when the
+                        run ends, naming the processor, the instruction, the
+                        address, the value and how many iterations. The run is
+                        not stopped: `--for` already bounds it, and a diagnostic
+                        that ended a run early would be one more thing to
+                        explain. Changes nothing the guest does or when
+                        (`core::spin`), and costs the interpreter one field
+                        test per load when it is off
     --screenshot <file> Write the machine's display to a PNG when the run ends,
                         however the run was driven -- headless, with a console
                         attached, under a debugger, or serving VNC. Needs a
@@ -374,6 +386,16 @@ struct RunArgs {
     /// names are checked by [`Traces::open`] before the machine runs, along
     /// with whether this build can trace at all.
     trace: Vec<(String, Option<String>)>,
+    /// Whether `--spin-detect` was given, and at what streak length.
+    ///
+    /// `None` is off, which is the default and costs nothing: no detector is
+    /// built, so every core's watch stays disarmed. There is no way to type a
+    /// different threshold, deliberately —
+    /// [`DEFAULT_THRESHOLD`](rsemu::core::spin::DEFAULT_THRESHOLD) is chosen so
+    /// that no ordinary loop reaches it, and a caller who genuinely needs
+    /// another number is writing Rust against `Machine::arm_spin_detector`
+    /// rather than typing a command line.
+    spin: Option<u64>,
     /// Where to write a PNG of the display when the run ends, if `--screenshot`
     /// was given.
     screenshot: Option<String>,
@@ -660,6 +682,14 @@ fn run(args: &[String]) -> ExitCode {
         machine
             .scheduler_mut()
             .set_pool(Arc::new(rsemu::core::sync::Pool::new(workers)));
+    }
+
+    // The spin detector, armed before anything runs so the first quantum is
+    // watched like every other one. After the pool, because handing it out
+    // walks the device list and a `--threading parallel` machine has just had
+    // that list read for a different reason.
+    if let Some(threshold) = parsed.spin {
+        machine.arm_spin_detector(threshold);
     }
 
     if !parsed.quiet {
@@ -1012,12 +1042,38 @@ fn interrupted(machine: &Machine) -> bool {
 /// A flush failure turns a successful run into a failing exit, because the run
 /// did not do what the user asked: the bytes are not on disk.
 fn finish(machine: &Machine, status: ExitCode) -> ExitCode {
+    report_spin(machine);
     match machine.flush() {
         Ok(()) => status,
         Err(e) => {
             eprintln!("rsemu: flushing at exit: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Say what `--spin-detect` found, if it was given and it found anything.
+///
+/// On stderr rather than stdout, and after the run rather than during it: this
+/// is a diagnostic *about* the run and not output of it, and a guest's console
+/// is often what is on stdout. Every exit path goes through [`finish`], so a
+/// run that was interrupted, or driven from a debugger, or serving VNC, reports
+/// the same way a headless one does.
+fn report_spin(machine: &Machine) {
+    let Some(detector) = machine.spin_detector() else {
+        return;
+    };
+    let events = detector.events();
+    if events.is_empty() {
+        return;
+    }
+    eprintln!("rsemu: a processor stopped making progress:");
+    for event in &events {
+        eprintln!("rsemu:   {event}");
+    }
+    let dropped = detector.dropped();
+    if dropped > 0 {
+        eprintln!("rsemu:   ...and {dropped} more that did not fit");
     }
 }
 
@@ -2418,6 +2474,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         drives: Vec::new(),
         screenshot: None,
         trace: Vec::new(),
+        spin: None,
         // 44 100 rather than 48 000: it is what a `.wav` is expected to be, and
         // every player on earth opens one without resampling it again.
         record_audio: None,
@@ -2544,6 +2601,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 }
                 out.trace.push((what.to_string(), path));
             }
+            "--spin-detect" => out.spin = Some(rsemu::core::spin::DEFAULT_THRESHOLD),
             "--screenshot" => out.screenshot = Some(value(arg)?),
             "--record-audio" => out.record_audio = Some(value(arg)?),
             "--audio-rate" => {
