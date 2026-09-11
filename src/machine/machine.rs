@@ -486,6 +486,14 @@ impl Machine {
             device.reset(kind);
             self.deferred.drain();
         }
+        // A reset is a scheduling boundary like any other: a clock controller
+        // that came out of reset on its internal RC has already asked for the
+        // rating that says so, and the forest reflects it before the next round
+        // computes a budget from it. Ignored rather than propagated because
+        // `reset` cannot fail, and a rating the forest refuses leaves it
+        // exactly as it was — the first round then reports the same refusal
+        // where a caller can see it.
+        let _ = self.sched.apply_clock_requests();
         self.sweep();
     }
 
@@ -557,6 +565,12 @@ impl Machine {
         self.pump_inputs()?;
         let report = self.sched.run_quantum_until(GlobalTime::MAX)?;
         self.sched.sync_lazy_devices()?;
+        // Catching a device up is where it notices its own deadline passed —
+        // an `st.rcc` whose PLL has just locked, say — so a clock request can
+        // appear here, at the boundary, with nothing in flight. Applying it now
+        // rather than one round later is what keeps "the forest says what the
+        // registers say" true the moment a caller gets control back.
+        self.sched.apply_clock_requests()?;
         self.dispatch(&report)?;
         crate::core::trace::quantum_report(&report);
         Ok(report)
@@ -605,6 +619,9 @@ impl Machine {
             // advanced device must see it standing on the instant that fired,
             // not on the one the previous quantum ended at.
             self.sched.sync_lazy_devices()?;
+            // As in [`Machine::run_quantum`]: the catch-up above is a boundary
+            // and a clock controller may have just asked for something at it.
+            self.sched.apply_clock_requests()?;
             self.dispatch(&report)?;
             // The scheduler channel's only hook (`core::trace`). It returns
             // before reading the report when nothing is tracing, and is deleted
@@ -789,6 +806,14 @@ impl Machine {
             let mut r = chunk.reader();
             entry.device.load(&mut r)?;
         }
+        // Before the clocks, and that order is load-bearing. The clock chunk
+        // stores unit positions and tick counters, not the domains' *ratings* —
+        // a rating comes from whichever device drives it. A controller that has
+        // just loaded a configured `PLLCFGR` has asked for the tree the
+        // snapshot was taken with, and the unit position about to be restored
+        // is counted in that tree's units. Restoring the position first and
+        // re-rating afterwards would rescale it a second time.
+        self.sched.apply_clock_requests()?;
         let clocks = reader.load(CLOCK_PATH, CLOCK_CLASS, MACHINE_STATE_VERSION, migrations)?;
         load_clocks(self.sched.forest_mut(), &mut clocks.reader())?;
         // After the clocks: the scheduler's restore republishes every lazily
@@ -1030,15 +1055,30 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// the writer and the reader agree without either of them having to have kept a
 /// list of handles.
 ///
-/// A domain's **sub-tick phase** is not written here and does not need to be:
-/// it is `unit_position % units_per_tick`, so the oscillator positions above
-/// determine it, and [`ClockForest::restore_ticks`] reconstructs it rather than
-/// zeroing it. That holds because nothing in the tree calls `set_rating`,
-/// `reparent` or `set_gated`, which are the only three things that would make a
-/// domain's phase independent of its tree's position. The first caller of one
-/// of those has to add the phase to this chunk — and bump
-/// [`MACHINE_STATE_VERSION`] and write the migration, which is why the
-/// condition is recorded here rather than left to be rediscovered.
+/// # Two things this chunk does not carry, and what they cost
+///
+/// A domain's **sub-tick phase** is not written here. For a domain nothing has
+/// ever re-rated it does not need to be — it is `unit_position %
+/// units_per_tick`, so the oscillator positions above determine it, and
+/// [`ClockForest::restore_ticks`] reconstructs it rather than zeroing it.
+/// `set_rating`, `reparent` and `set_gated` are the three things that make a
+/// domain's phase independent of its tree's position, and **the clock-control
+/// seam is the first caller of one of them**
+/// ([`ClockControl`](crate::core::clock::ClockControl)): a board whose
+/// `st.rcc` drives its domains restores with those domains' phase set to zero
+/// rather than to what they had, which is up to one tick of each.
+///
+/// A domain's **rating** is not written here either. It comes from whoever
+/// drives it, so restoring is a two-step: the device chunks load first, the
+/// controller among them asks for the tree its registers describe, and
+/// [`Machine::load_with`] applies that **before** the positions below are
+/// restored — see the comment there. A domain that is re-rated by something
+/// that is *not* a device would not be restored at all.
+///
+/// Both are the same fix: write the phase and the `mul`/`div` into this chunk,
+/// bump [`MACHINE_STATE_VERSION`] and write the migration. It is deliberately
+/// not done here because it re-blesses every golden state hash in the tree, and
+/// that is a change worth making on its own.
 fn save_clocks(forest: &ClockForest, sink: &mut impl Sink) -> Result<()> {
     let oscillators: Vec<_> = forest.oscillators().collect();
     sink.write_seq_len(oscillators.len() as u64)?;

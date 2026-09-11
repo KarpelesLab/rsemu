@@ -68,6 +68,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
+
 // ---------------------------------------------------------------------------
 // small integer helpers
 // ---------------------------------------------------------------------------
@@ -247,6 +249,25 @@ impl Rational {
     /// `self × mul / div`, or `None` on overflow or a zero `div`.
     pub fn checked_scale(self, mul: u64, div: u64) -> Option<Rational> {
         self.checked_mul(Rational::new(mul, div).ok()?)
+    }
+
+    /// `self / other`, or `None` if `other` is zero or the result does not fit.
+    ///
+    /// The operation a clock controller needs: a device that knows an output is
+    /// 168 MHz and that the domain's parent is an 8 MHz can wants the exact
+    /// `21/1` that relates them, not a rounded one. Cross-reduction happens
+    /// before either multiplication, so the intermediate cannot overflow on the
+    /// way to a small answer.
+    pub fn checked_div(self, other: Rational) -> Option<Rational> {
+        if other.is_zero() {
+            return None;
+        }
+        // `other` is in lowest terms and non-zero, so swapping its parts is a
+        // reduced rational and `checked_mul` does the cross-reduction.
+        self.checked_mul(Rational {
+            num: other.den,
+            den: other.num,
+        })
     }
 }
 
@@ -1137,14 +1158,74 @@ impl ClockForest {
         if mul == 0 || div == 0 {
             return Err(ClockError::ZeroRate(self.domains[id.index()].name.clone()));
         }
+        self.set_ratings(&[RateRequest {
+            domain: id,
+            mul,
+            div,
+        }])
+    }
+
+    /// Re-rates several domains **together**, recomputing each affected tree
+    /// exactly once.
+    ///
+    /// Not a loop over [`ClockForest::set_rating`], and the difference is not
+    /// cosmetic. A tree's unit multiplier `A` is monotonically non-decreasing,
+    /// so every intermediate state a sequence of single re-ratings passes
+    /// through leaves its numerator in `A` **for ever**. Re-rating `pclk1`
+    /// before `sysclk` on an STM32 that has just switched to its PLL folds in
+    /// the lcm of a ratio that never existed on the hardware, and the tree's
+    /// unit rate — and with it the headroom in its `u64` unit counter — pays
+    /// for it permanently. Applying a guest's whole `PLLCFGR`+`CFGR` change as
+    /// one batch is what keeps `A` down to the lcm of the ratios the machine
+    /// actually has.
+    ///
+    /// Every counter in every changed subtree is materialized first, exactly as
+    /// [`ClockForest::set_rating`] describes; the rest of each tree keeps its
+    /// phase.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClockForest::set_rating`]. **All or nothing**: one bad entry leaves
+    /// the forest exactly as it was, with none of the batch applied.
+    pub fn set_ratings(&mut self, changes: &[RateRequest]) -> ClockResult<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        for r in changes {
+            self.check_domain(r.domain)?;
+            if self.domains[r.domain.index()].parent.is_none() {
+                return Err(ClockError::NotApplicable(alloc::format!(
+                    "`{}` is an oscillator root; set its frequency instead",
+                    self.domains[r.domain.index()].name
+                )));
+            }
+            if r.mul == 0 || r.div == 0 {
+                return Err(ClockError::ZeroRate(
+                    self.domains[r.domain.index()].name.clone(),
+                ));
+            }
+        }
         let backup = self.clone();
-        let osc = self.domains[id.index()].root;
-        self.rebase_subtree(id);
-        self.domains[id.index()].mul = mul;
-        self.domains[id.index()].div = div;
-        if let Err(e) = self.recompute_tree(osc) {
-            *self = backup;
-            return Err(e);
+        // Every rebase happens before any rating moves, so each counter is
+        // materialized at the rate it was counted at. `rebase_subtree` is
+        // idempotent, so overlapping subtrees cost nothing and mean nothing.
+        for r in changes {
+            self.rebase_subtree(r.domain);
+        }
+        let mut trees: Vec<OscillatorId> = Vec::new();
+        for r in changes {
+            self.domains[r.domain.index()].mul = r.mul;
+            self.domains[r.domain.index()].div = r.div;
+            let osc = self.domains[r.domain.index()].root;
+            if !trees.contains(&osc) {
+                trees.push(osc);
+            }
+        }
+        for osc in trees {
+            if let Err(e) = self.recompute_tree(osc) {
+                *self = backup;
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -1341,13 +1422,17 @@ impl ClockForest {
     /// was one tick behind after 200 µs.
     ///
     /// Aligning the anchor down to a whole tick reproduces the phase the saved
-    /// machine had, exactly, because a domain's anchor only ever moves through
-    /// here: [`ClockForest::set_rating`], [`ClockForest::reparent`] and
-    /// [`ClockForest::set_gated`] are the other three writers and nothing in
-    /// the tree calls them, so a live domain has `base_unit == 0` and its phase
-    /// is `units % units_per_tick`. Should one of those three ever be used, the
-    /// phase becomes independent of the tree position and has to be *written*
-    /// into the chunk; there is a test that pins what this does today.
+    /// machine had, exactly, **for a domain whose anchor has only ever moved
+    /// through here**: such a domain has `base_unit == 0` and its phase is
+    /// `units % units_per_tick`, which the tree's restored position recovers.
+    /// [`ClockForest::set_rating`], [`ClockForest::reparent`] and
+    /// [`ClockForest::set_gated`] are the other three writers, and
+    /// [`ClockControl`] is now a caller of the first: a domain a guest has
+    /// re-rated has a phase independent of its tree's position, and this
+    /// restores it as zero rather than as what it was. That is up to one tick
+    /// of that domain, once, and the fix is to write the phase into the
+    /// snapshot chunk — `machine::machine`'s `save_clocks` says what that
+    /// costs. There is a test that pins what this does today.
     ///
     /// The tick count itself is unchanged — `(units % units_per_tick) /
     /// units_per_tick` is zero — so a snapshot re-saved immediately after a
@@ -1518,6 +1603,197 @@ impl ClockForest {
         o.residual = 0;
         o.recompute_conversion();
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the clock-control seam
+// ---------------------------------------------------------------------------
+
+/// One requested change to a domain's rating: `parent × mul / div`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateRequest {
+    /// The domain to re-rate. Never an oscillator root.
+    pub domain: DomainId,
+    /// The new multiplier on the parent's rate. Never zero.
+    pub mul: u64,
+    /// The new divisor. Never zero.
+    pub div: u64,
+}
+
+impl RateRequest {
+    /// A request for an exact ratio of the domain's parent.
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::ZeroRate`] if `ratio` is zero — a stopped domain is
+    /// [`ClockForest::set_gated`]'s business, not a rating of zero.
+    pub fn from_ratio(domain: DomainId, ratio: Rational) -> ClockResult<RateRequest> {
+        if ratio.is_zero() {
+            return Err(ClockError::ZeroRate(alloc::format!(
+                "clock domain #{}",
+                domain.index()
+            )));
+        }
+        Ok(RateRequest {
+            domain,
+            mul: ratio.num(),
+            div: ratio.den(),
+        })
+    }
+
+    /// The requested rating as an exact rational.
+    #[must_use]
+    pub fn ratio(&self) -> Rational {
+        // `div` is never zero in a well-formed request; a malformed one is
+        // refused by the forest rather than papered over here.
+        Rational::new(self.mul, self.div).unwrap_or(Rational::ONE)
+    }
+}
+
+/// A device's route to re-rate a clock domain — the clock-control seam.
+///
+/// # Why a queue and not a call
+///
+/// A device that models a PLL learns the new rate from inside `MemOps::write`,
+/// which runs several frames below whoever owns the forest and holds no `&mut`
+/// to anything. That is not an accident of the plumbing. Re-rating rescales a
+/// whole tree's unit position and every domain's `units_per_tick`, and those
+/// are derived state a scheduler caches and a parallel round has already handed
+/// to its workers; doing it mid-round would be a torn read of the time model.
+///
+/// So a device **requests**, and whoever owns the forest **applies**, at a
+/// point it chooses. The rule the scheduler uses, and the one any other owner
+/// should use:
+///
+/// * A request is applied at the **scheduling boundary at or after it**, never
+///   inside a round.
+/// * At that boundary the re-rated domain and everything below it has its tick
+///   counter materialized: ticks already counted stay counted, at the rate they
+///   were counted at, and counting continues at the new rate. **No tick is lost
+///   and none is duplicated** — [`ClockForest::ticks`] is continuous across the
+///   change. The fraction of a tick that was in flight is discarded, which is
+///   what a PLL that relocks does: it starts a new edge. Domains that are not
+///   below a re-rated one keep their phase exactly.
+/// * A request carries no timestamp, and several requests for one domain
+///   coalesce to the last. **The outcome therefore does not depend on where
+///   inside a round the guest's write landed** — only on which boundary follows
+///   it.
+///
+/// A request that does not change the domain's rating is dropped rather than
+/// applied, because applying it would reset that domain's phase for nothing.
+///
+/// # What this does not do
+///
+/// It re-rates. It does not gate, reparent, or move a domain between
+/// oscillators, and it does not move events already posted: the event queue
+/// holds absolute instants, and a tick converted at posting time stays where it
+/// was converted to. A lazily-advanced device needs nothing — its next event is
+/// asked for in its own ticks and converted afresh every round, so it follows
+/// the new rate by construction.
+#[derive(Debug)]
+pub struct ClockControl {
+    /// At most one entry per domain, so a burst of register writes costs one.
+    pending: Mutex<Vec<RateRequest>>,
+    /// Whether `pending` is non-empty, readable without taking the lock: the
+    /// owner asks this once per scheduling boundary and the answer is almost
+    /// always no.
+    dirty: AtomicBool,
+    /// How many batches have been applied, for a device that wants to know its
+    /// request has landed.
+    applied: AtomicU64,
+}
+
+impl Default for ClockControl {
+    fn default() -> ClockControl {
+        ClockControl::new()
+    }
+}
+
+impl ClockControl {
+    /// An empty controller.
+    #[must_use]
+    pub fn new() -> ClockControl {
+        ClockControl {
+            // A leaf: a device asks for a re-rate from inside its own write
+            // path, and nothing may nest under this.
+            pending: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+            dirty: AtomicBool::new(false),
+            applied: AtomicU64::new(0),
+        }
+    }
+
+    /// Ask for `domain` to become `parent × mul / div` at the next boundary.
+    ///
+    /// Supersedes any earlier request for the same domain.
+    pub fn request(&self, domain: DomainId, mul: u64, div: u64) {
+        self.push(RateRequest { domain, mul, div });
+    }
+
+    /// Ask for `domain` to become an exact ratio of its parent.
+    ///
+    /// A zero ratio is **ignored**: an output whose source has stopped is a
+    /// gating question, and answering it with a rating of zero would only make
+    /// the forest refuse the batch.
+    pub fn request_ratio(&self, domain: DomainId, ratio: Rational) {
+        if let Ok(r) = RateRequest::from_ratio(domain, ratio) {
+            self.push(r);
+        }
+    }
+
+    fn push(&self, request: RateRequest) {
+        {
+            let mut pending = self.pending.lock();
+            match pending.iter_mut().find(|r| r.domain == request.domain) {
+                Some(slot) => *slot = request,
+                None => pending.push(request),
+            }
+        }
+        // Release, so an owner that sees the flag sees the entry behind it.
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Whether anything is waiting to be applied.
+    ///
+    /// One load per scheduling boundary, which is what keeps the seam off the
+    /// bill of a machine whose clocks never move.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Takes the pending batch, **in domain order**, and clears it.
+    ///
+    /// Sorted rather than left in arrival order so that the batch — and the
+    /// intermediate states the forest passes through applying it — is a pure
+    /// function of *what* was requested and not of the order two devices
+    /// happened to write their registers in.
+    #[must_use]
+    pub fn take(&self) -> Vec<RateRequest> {
+        if !self.is_pending() {
+            return Vec::new();
+        }
+        let mut batch = {
+            let mut pending = self.pending.lock();
+            self.dirty.store(false, Ordering::Release);
+            core::mem::take(&mut *pending)
+        };
+        batch.sort_by_key(|r| r.domain);
+        batch
+    }
+
+    /// How many batches this controller has had applied.
+    ///
+    /// A device that has to know its request landed — to recompute a divisor,
+    /// say — compares against the value it saw when it asked.
+    #[must_use]
+    pub fn applied(&self) -> u64 {
+        self.applied.load(Ordering::Acquire)
+    }
+
+    /// Record that a batch was applied. For whoever owns the forest.
+    pub fn note_applied(&self) {
+        self.applied.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1994,5 +2270,280 @@ mod tests {
             assert!(back == ns || back == ns - 1, "{ns} -> {back}");
         }
         assert_eq!(GlobalTime::MAX.as_nanos(), u64::MAX);
+    }
+
+    // -- the clock-control seam ---------------------------------------------
+
+    /// An STM32-shaped tree: one crystal, a system clock under it, a bus clock
+    /// under that, and two peripheral clocks under *that*.
+    fn stm32() -> (ClockForest, DomainId, DomainId, DomainId, DomainId) {
+        let mut f = ClockForest::new();
+        let hse = f
+            .add_oscillator("hse", Rational::integer(8_000_000))
+            .unwrap();
+        // The reset state of an F4: SYSCLK is the 16 MHz internal RC, which a
+        // board with one declared crystal writes as `hse * 2`.
+        let sys = f.add_domain("sysclk", hse, 2, 1).unwrap();
+        let hclk = f.add_domain("hclk", sys, 1, 1).unwrap();
+        let pclk1 = f.add_domain("pclk1", hclk, 1, 4).unwrap();
+        let pclk2 = f.add_domain("pclk2", hclk, 1, 2).unwrap();
+        (f, sys, hclk, pclk1, pclk2)
+    }
+
+    #[test]
+    fn a_division_of_rationals_is_exact() {
+        // The operation a clock controller does on every register write: it
+        // knows an output is 168 MHz and that the parent is an 8 MHz can, and
+        // what the forest wants is the 21/1 between them.
+        let a = Rational::integer(168_000_000);
+        let b = Rational::integer(8_000_000);
+        assert_eq!(a.checked_div(b).unwrap(), Rational::integer(21));
+        // 42 MHz off a 168 MHz parent is a quarter, exactly.
+        assert_eq!(
+            Rational::integer(42_000_000)
+                .checked_div(Rational::integer(168_000_000))
+                .unwrap(),
+            Rational::new(1, 4).unwrap()
+        );
+        // The NES master is not an integer and the answer is still exact.
+        let master = Rational::new(236_250_000, 11).unwrap();
+        assert_eq!(
+            master.checked_div(Rational::integer(12)).unwrap(),
+            Rational::new(236_250_000, 132).unwrap()
+        );
+        assert_eq!(a.checked_div(Rational::integer(0)), None);
+    }
+
+    #[test]
+    fn a_batch_re_rating_is_continuous_in_every_counter() {
+        // The rule the seam promises: ticks counted before the change stay
+        // counted, at the rate they were counted at, and counting continues at
+        // the new one. No tick is lost and none is duplicated.
+        let (mut f, sys, hclk, pclk1, pclk2) = stm32();
+        // A millisecond at the reset rate: 16 000 SYSCLK ticks.
+        f.advance_domain(sys, 16_000).unwrap();
+        let before = [
+            f.ticks(sys).unwrap(),
+            f.ticks(hclk).unwrap(),
+            f.ticks(pclk1).unwrap(),
+            f.ticks(pclk2).unwrap(),
+        ];
+        assert_eq!(before, [16_000, 16_000, 4_000, 8_000]);
+
+        // `SystemClock_Config`: the PLL at 168 MHz, HPRE 1, PPRE1 4, PPRE2 2.
+        f.set_ratings(&[
+            RateRequest {
+                domain: sys,
+                mul: 21,
+                div: 1,
+            },
+            RateRequest {
+                domain: hclk,
+                mul: 1,
+                div: 1,
+            },
+            RateRequest {
+                domain: pclk1,
+                mul: 1,
+                div: 4,
+            },
+            RateRequest {
+                domain: pclk2,
+                mul: 1,
+                div: 2,
+            },
+        ])
+        .unwrap();
+
+        let after = [
+            f.ticks(sys).unwrap(),
+            f.ticks(hclk).unwrap(),
+            f.ticks(pclk1).unwrap(),
+            f.ticks(pclk2).unwrap(),
+        ];
+        assert_eq!(before, after, "a re-rating must not move a tick counter");
+        assert_eq!(
+            f.domain_frequency(sys).unwrap(),
+            Rational::integer(168_000_000)
+        );
+        assert_eq!(
+            f.domain_frequency(pclk1).unwrap(),
+            Rational::integer(42_000_000)
+        );
+        assert_eq!(
+            f.domain_frequency(pclk2).unwrap(),
+            Rational::integer(84_000_000)
+        );
+
+        // And the next millisecond is counted at the new rate, exactly.
+        f.advance_domain(sys, 168_000).unwrap();
+        assert_eq!(f.ticks(sys).unwrap(), 16_000 + 168_000);
+        assert_eq!(f.ticks(pclk1).unwrap(), 4_000 + 42_000);
+        assert_eq!(f.ticks(pclk2).unwrap(), 8_000 + 84_000);
+        // The intra-tree ratio is exact from the change onwards, not merely
+        // close: four PCLK1 ticks per HCLK tick, for ever.
+        assert_eq!(f.convert_ticks(hclk, pclk1, 4_000).unwrap(), 1_000);
+    }
+
+    #[test]
+    fn a_batch_costs_less_lcm_than_the_same_changes_one_at_a_time() {
+        // Why `set_ratings` is not a loop. A tree's unit multiplier only ever
+        // grows, so every intermediate ratio a sequence passes through is paid
+        // for for ever — including ones the machine never actually had.
+        let batched = {
+            let (mut f, sys, hclk, pclk1, pclk2) = stm32();
+            f.set_ratings(&[
+                RateRequest {
+                    domain: sys,
+                    mul: 21,
+                    div: 1,
+                },
+                RateRequest {
+                    domain: hclk,
+                    mul: 1,
+                    div: 1,
+                },
+                RateRequest {
+                    domain: pclk1,
+                    mul: 1,
+                    div: 4,
+                },
+                RateRequest {
+                    domain: pclk2,
+                    mul: 1,
+                    div: 2,
+                },
+            ])
+            .unwrap();
+            f.unit_rate(f.root_of(sys).unwrap()).unwrap()
+        };
+        let looped = {
+            let (mut f, sys, hclk, pclk1, pclk2) = stm32();
+            // Bottom-up, which is the order a register write arrives in as
+            // often as not.
+            f.set_rating(pclk1, 1, 4).unwrap();
+            f.set_rating(pclk2, 1, 2).unwrap();
+            f.set_rating(hclk, 1, 1).unwrap();
+            f.set_rating(sys, 21, 1).unwrap();
+            f.unit_rate(f.root_of(sys).unwrap()).unwrap()
+        };
+        assert!(
+            batched <= looped,
+            "batching must never cost more unit rate than looping: {batched} vs {looped}"
+        );
+    }
+
+    #[test]
+    fn a_refused_batch_leaves_the_forest_exactly_as_it_was() {
+        let (mut f, sys, hclk, pclk1, _) = stm32();
+        f.advance_domain(sys, 1_234).unwrap();
+        let before = (
+            f.ticks(sys).unwrap(),
+            f.ticks(pclk1).unwrap(),
+            f.domain_frequency(sys).unwrap(),
+            f.unit_position(f.root_of(sys).unwrap()).unwrap(),
+        );
+        // The second entry is illegal, so none of the batch may land.
+        let e = f
+            .set_ratings(&[
+                RateRequest {
+                    domain: sys,
+                    mul: 21,
+                    div: 1,
+                },
+                RateRequest {
+                    domain: hclk,
+                    mul: 1,
+                    div: 0,
+                },
+            ])
+            .expect_err("a zero divisor");
+        assert!(matches!(e, ClockError::ZeroRate(_)), "{e}");
+        assert_eq!(
+            (
+                f.ticks(sys).unwrap(),
+                f.ticks(pclk1).unwrap(),
+                f.domain_frequency(sys).unwrap(),
+                f.unit_position(f.root_of(sys).unwrap()).unwrap(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn a_domain_outside_the_change_keeps_its_phase() {
+        // A re-rating materializes the counters *in the changed subtree* and
+        // leaves everything else alone — including the fraction of a tick a
+        // sibling was part-way through, which decides when its next tick falls.
+        let mut f = ClockForest::new();
+        let root = f
+            .add_oscillator("root", Rational::integer(1_000_000))
+            .unwrap();
+        let a = f.add_domain("a", root, 1, 4).unwrap();
+        let b = f.add_domain("b", root, 1, 4).unwrap();
+        // Three units in: both `a` and `b` are three quarters through a tick.
+        f.advance_units(f.root_of(a).unwrap(), 3).unwrap();
+        assert_eq!((f.ticks(a).unwrap(), f.ticks(b).unwrap()), (0, 0));
+
+        f.set_rating(a, 1, 2).unwrap();
+        // One more unit: `b` completes the tick it was three quarters through.
+        f.advance_units(f.root_of(b).unwrap(), 1).unwrap();
+        assert_eq!(
+            f.ticks(b).unwrap(),
+            1,
+            "an untouched domain keeps its phase"
+        );
+        // `a` restarted on a fresh edge at the change, so its half-rate tick is
+        // still two units away.
+        assert_eq!(
+            f.ticks(a).unwrap(),
+            0,
+            "a re-rated domain starts a new edge"
+        );
+    }
+
+    #[test]
+    fn a_controller_coalesces_and_orders_what_it_is_asked_for() {
+        let (f, sys, hclk, _, _) = stm32();
+        let _ = &f;
+        let control = ClockControl::new();
+        assert!(!control.is_pending());
+        assert!(control.take().is_empty());
+
+        // Requested out of order, and `sysclk` twice: the last value wins and
+        // the batch comes back in domain order, so what the forest sees does
+        // not depend on the order the guest wrote its registers in.
+        control.request(hclk, 1, 2);
+        control.request(sys, 2, 1);
+        control.request(sys, 21, 1);
+        assert!(control.is_pending());
+        let batch = control.take();
+        assert_eq!(
+            batch,
+            alloc::vec![
+                RateRequest {
+                    domain: sys,
+                    mul: 21,
+                    div: 1
+                },
+                RateRequest {
+                    domain: hclk,
+                    mul: 1,
+                    div: 2
+                },
+            ]
+        );
+        assert!(!control.is_pending());
+        assert!(control.take().is_empty());
+
+        // A ratio of zero is not a rating, and is dropped rather than queued.
+        control.request_ratio(sys, Rational::integer(0));
+        assert!(!control.is_pending());
+        control.request_ratio(sys, Rational::new(21, 2).unwrap());
+        assert_eq!(control.take()[0].ratio(), Rational::new(21, 2).unwrap());
+
+        assert_eq!(control.applied(), 0);
+        control.note_applied();
+        assert_eq!(control.applied(), 1);
     }
 }

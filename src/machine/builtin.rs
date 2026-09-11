@@ -14,10 +14,16 @@
 //! address, that the guest cannot write", had to invent a class to say so, and
 //! that is ceremony of exactly the kind this module exists to avoid.
 //!
+//! `clock` is the same argument again, for time rather than for bytes. A
+//! machine file names a clock domain by naming an object, which leaves
+//! `SYSCLK`, `HCLK` and `PCLK1` — nodes of the tree that are not peripherals —
+//! with nothing to be named by, and so leaves a clock controller's `sysclk = …`
+//! with nothing to point at.
+//!
 //! These live here rather than in `dev/` for two reasons: they are always
 //! compiled, like the language itself, and they are described entirely by
-//! `core::space` — no device model is involved, and inventing a
-//! `dev-memory` feature to hold one region would be ceremony.
+//! `core::space` and `core::clock` — no device model is involved, and inventing
+//! a `dev-memory` feature to hold one region would be ceremony.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -29,7 +35,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::space::{RamStore, Region, RegionRef, RomStore, RomWrite};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::machine::realize::{Bindings, Instance};
+use crate::machine::realize::{BindCtx, Bindings, Instance};
 use crate::machine::validate::{ClassSchema, PropSchema};
 
 /// The class name a machine file writes.
@@ -37,6 +43,9 @@ const RAM_CLASS_NAME: &str = "ram";
 
 /// And the one for read-only memory.
 const ROM_CLASS_NAME: &str = "rom";
+
+/// And the one for a bare node in the clock forest.
+const CLOCK_CLASS_NAME: &str = "clock";
 
 /// Read/write memory: `size` bytes, mapped wherever a `map` statement puts it.
 ///
@@ -298,6 +307,97 @@ pub fn ram_schema() -> ClassSchema {
         .region("")
 }
 
+// ---------------------------------------------------------------------------
+// clock — a named node in the oscillator forest
+// ---------------------------------------------------------------------------
+
+/// A node in the clock forest and nothing else.
+///
+/// A machine file names a clock domain by naming an object: `clock = hse * 21`
+/// creates a domain, and `clock = cpu / 4` hangs one off another object's. That
+/// is enough while every rate is fixed at build time, and not enough the moment
+/// a controller has to *drive* a rate: `SYSCLK`, `HCLK` and `PCLK1` are not
+/// peripherals, so there was no object to name them with and nothing for
+/// `st.rcc`'s `sysclk = …` to point at.
+///
+/// This is that object. It has no registers, no state, no reset behaviour and
+/// no ports — it exists so a tree can be written the way the reference manual
+/// draws it:
+///
+/// ```text
+/// object sysclk "clock" { clock = hse * 21 }
+/// object hclk   "clock" { clock = sysclk }
+/// object pclk1  "clock" { clock = hclk / 4 }
+/// object tim2   "st.tim" { clock = pclk1 * 2 }
+/// ```
+///
+/// and so that a controller can then re-rate `sysclk` and have every one of
+/// them follow, exactly, by integer ratio.
+///
+/// It lives here for the reason `ram` does: it is not a model of anything, it
+/// is described entirely by `core::clock`, and inventing a feature to hold a
+/// device with no body would be ceremony.
+#[derive(Debug)]
+struct ClockNode;
+
+impl ClockNode {
+    /// Validate `props` — of which there are none — and build the node.
+    fn new(props: &Props) -> Result<ClockNode> {
+        props.reader().finish()?;
+        Ok(ClockNode)
+    }
+}
+
+impl Device for ClockNode {
+    fn class(&self) -> &'static DeviceClass {
+        &CLOCK_CLASS
+    }
+
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // Nothing outward. The domain itself is the realizer's doing.
+        Ok(())
+    }
+
+    fn reset(&self, _kind: ResetKind) {
+        // A wire has no state to clear. The *rate* is the controller's, and a
+        // controller restores it from its own reset.
+    }
+}
+
+impl Instance for ClockNode {
+    fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
+        // The one thing that can be wrong about one of these, said where the
+        // machine file's author can act on it: an object whose entire purpose
+        // is to be a clock domain, with no `clock =` on it, is a typo.
+        if ctx.domain().is_none() {
+            return Err(Error::Config {
+                at: alloc::string::String::from(ctx.path()),
+                message: alloc::string::String::from(
+                    "a `clock` object is a node in the oscillator forest and needs a rate: \
+                     write `clock = <oscillator or object> * m / n`",
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The `clock` device class.
+pub static CLOCK_CLASS: DeviceClass = DeviceClass {
+    name: CLOCK_CLASS_NAME,
+    version: 1,
+    summary: "a named node in the clock forest: no registers, no state, just a domain \
+              other objects hang off and a controller can re-rate",
+    properties: &[],
+    construct: |props| Ok(Box::new(ClockNode::new(props)?)),
+};
+
+/// What the validator should know about `clock`.
+#[must_use]
+pub fn clock_schema() -> ClassSchema {
+    ClassSchema::new(CLOCK_CLASS_NAME)
+}
+
 /// Add every built-in class to a registry.
 ///
 /// # Errors
@@ -306,6 +406,7 @@ pub fn ram_schema() -> ClassSchema {
 pub fn register(registry: &mut Registry) -> Result<()> {
     registry.add(&RAM_CLASS)?;
     registry.add(&ROM_CLASS)?;
+    registry.add(&CLOCK_CLASS)?;
     super::combinator::register(registry)
 }
 
@@ -317,13 +418,16 @@ pub fn register(registry: &mut Registry) -> Result<()> {
 pub fn bind(bindings: &mut Bindings) -> Result<()> {
     bindings.bind(RAM_CLASS_NAME, |props| Ok(Arc::new(Ram::new(props)?)))?;
     bindings.bind(ROM_CLASS_NAME, |props| Ok(Arc::new(Rom::new(props)?)))?;
+    bindings.bind(CLOCK_CLASS_NAME, |props| {
+        Ok(Arc::new(ClockNode::new(props)?))
+    })?;
     super::combinator::bind(bindings)
 }
 
 /// Every built-in class's validator schema, in registration order.
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
-    let mut out = alloc::vec![ram_schema(), rom_schema()];
+    let mut out = alloc::vec![ram_schema(), rom_schema(), clock_schema()];
     out.extend(super::combinator::schemas());
     out
 }

@@ -204,6 +204,7 @@ impl<'a> BindCtx<'a> {
             path: &peer.path,
             class: peer.class,
             requester: peer.requester,
+            domain: peer.domain,
         })
     }
 
@@ -352,6 +353,7 @@ pub struct Peer<'a> {
     path: &'a str,
     class: &'static DeviceClass,
     requester: RequesterId,
+    domain: Option<DomainId>,
 }
 
 impl<'a> Peer<'a> {
@@ -369,6 +371,18 @@ impl<'a> Peer<'a> {
     /// [`MemAttrs`](crate::core::space::MemAttrs).
     pub fn requester(&self) -> RequesterId {
         self.requester
+    }
+
+    /// The clock domain the machine file gave it, if any.
+    ///
+    /// The route a clock controller takes to its own outputs: `st.rcc`'s
+    /// `sysclk = "sysclk"` names an object, and what the device needs is that
+    /// object's [`DomainId`] so it can ask
+    /// [`ClockControl`](crate::core::clock::ClockControl) to re-rate it. There
+    /// is no other way to get one — handles are minted by the realizer and a
+    /// machine file cannot write one down.
+    pub fn domain(&self) -> Option<DomainId> {
+        self.domain
     }
 }
 
@@ -1263,6 +1277,11 @@ impl<'a> Realizer<'a> {
                 built.device.attach_lazy(handle);
                 lazy = Some(id);
             }
+            // The clock-control seam, handed to everything: a device that does
+            // not drive a clock never overrides the method and never learns it
+            // exists. After `bind`, so a controller already knows which of its
+            // peers' domains are its outputs.
+            built.device.attach_clock_control(sched.clock_control());
             out.push(DeviceEntry {
                 path: built.path.clone(),
                 class: built.class,

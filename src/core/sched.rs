@@ -132,7 +132,10 @@ use alloc::vec::Vec;
 use core::cmp::{Ordering, Reverse};
 use core::fmt;
 
-use crate::core::clock::{ClockError, ClockForest, DomainId, GlobalTime, OscillatorId, Rational};
+use crate::core::clock::{
+    ClockControl, ClockError, ClockForest, DomainId, GlobalTime, OscillatorId, RateRequest,
+    Rational,
+};
 use crate::core::sync::{AtomicBool, AtomicU64, Handle, Mutex, Ordering as AtomicOrdering, Pool};
 
 // ---------------------------------------------------------------------------
@@ -2363,6 +2366,12 @@ pub struct Scheduler {
     /// snapshot says, and pinning it to a host reading taken before the load
     /// would make the first round jump.
     accel_anchor: Option<(u64, GlobalTime)>,
+    /// The clock-control seam: what devices have asked the forest to become.
+    ///
+    /// Drained at every scheduling boundary and nowhere else — see
+    /// [`Scheduler::apply_clock_requests`] for the rule and
+    /// [`ClockControl`] for why a device cannot simply call the forest.
+    clocks: Arc<ClockControl>,
 }
 
 impl fmt::Debug for Scheduler {
@@ -2407,6 +2416,7 @@ impl Scheduler {
             rate,
             host_clock: None,
             accel_anchor: None,
+            clocks: Arc::new(ClockControl::new()),
         }
     }
 
@@ -2523,6 +2533,95 @@ impl Scheduler {
         // no longer has.
         self.clock_epoch = self.clock_epoch.wrapping_add(1);
         &mut self.forest
+    }
+
+    /// The clock-control seam, for handing to a device that drives a clock.
+    ///
+    /// A device holds one of these from registration onwards and asks it for a
+    /// new rating whenever the guest reprograms a PLL or a prescaler. The
+    /// scheduler is what applies the request, at a scheduling boundary — see
+    /// [`Scheduler::apply_clock_requests`].
+    #[inline]
+    pub fn clock_control(&self) -> Arc<ClockControl> {
+        Arc::clone(&self.clocks)
+    }
+
+    /// Applies whatever devices have asked of the clock forest.
+    ///
+    /// **This is the only place a requested re-rating takes effect.** The
+    /// scheduler calls it at the head of a round, which catches anything asked
+    /// for between rounds, and at the moment a round closes, which is where a
+    /// guest write made *inside* the round lands.
+    /// [`Machine`](crate::machine::Machine) calls it twice more, at instants of
+    /// the same kind: after a quantum's lazily advanced devices have been
+    /// caught up, and after a reset or a snapshot load. Nothing is ever applied
+    /// while a round is in flight.
+    ///
+    /// # Why the boundary, and what it buys
+    ///
+    /// A re-rating rescales a tree's unit position and every domain's
+    /// `units_per_tick`. The per-runnable-per-slot ratio table this module caches, the
+    /// live cursors a parallel round arms, and the budgets already handed out
+    /// are all derived from those numbers; changing them under a running round
+    /// would be a torn read of the time model, and in
+    /// [`ThreadingMode::Parallel`] a genuine race.
+    ///
+    /// Deferring to the boundary is also what makes the result *independent of
+    /// where in the round the write happened*. The request carries no
+    /// timestamp; a second request for the same domain replaces the first; the
+    /// batch is sorted by domain. Two runs that write the same value at
+    /// different cycles of the same round reach the same state.
+    ///
+    /// # What happens to the ticks already counted
+    ///
+    /// [`ClockForest::set_ratings`] materializes every counter in each changed
+    /// subtree before any rating moves, so ticks counted at the old rate stay
+    /// counted and counting continues at the new one:
+    /// [`ClockForest::ticks`] is continuous across the change, with no tick
+    /// lost and none duplicated. The sub-tick fraction in flight is discarded —
+    /// a relocked PLL starts a new edge — which is why a request that would not
+    /// change a domain's rating is **dropped** here rather than applied: it
+    /// would reset that domain's phase for nothing.
+    ///
+    /// The whole batch is applied in one call, so a tree's unit multiplier
+    /// takes the lcm of the ratios the machine ends up with rather than of
+    /// every intermediate a loop would pass through.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::Clock`] if the forest refuses the batch — typically
+    /// [`ClockError::LcmUnavailable`], a guest having asked for a ratio that
+    /// admits no exact common unit tick. The forest is left exactly as it was;
+    /// the failure is reported rather than approximated, because a timing model
+    /// that quietly degrades is worse than one that refuses.
+    pub fn apply_clock_requests(&mut self) -> SchedResult<()> {
+        if !self.clocks.is_pending() {
+            return Ok(());
+        }
+        let batch = self.clocks.take();
+        let mut changes: Vec<RateRequest> = Vec::with_capacity(batch.len());
+        for r in batch {
+            let Ok(d) = self.forest.domain(r.domain) else {
+                // An unknown handle is the requester's bug, not a reason to
+                // stop the machine: it cannot have changed anything.
+                continue;
+            };
+            let (now, want) = (Rational::new(d.mul(), d.div()), Rational::new(r.mul, r.div));
+            if now.is_ok() && now == want {
+                continue;
+            }
+            changes.push(r);
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.forest.set_ratings(&changes)?;
+        // Every cached conversion in this module is now stale, and the lazy
+        // slots' published positions were taken at the old `units_per_tick`.
+        self.clock_epoch = self.clock_epoch.wrapping_add(1);
+        self.publish_lazy_positions();
+        self.clocks.note_applied();
+        Ok(())
     }
 
     /// The event queue.
@@ -2894,6 +2993,11 @@ impl Scheduler {
     }
 
     fn run_quantum_bounded(&mut self, limit: GlobalTime, cut: Cut) -> SchedResult<QuantumReport> {
+        // Anything asked for between rounds — a monitor, a reset, a device
+        // loaded from a snapshot — lands here, before a single budget is
+        // computed from a rate that is about to change. A round's own requests
+        // are applied by its tail; this is almost always one atomic load.
+        self.apply_clock_requests()?;
         match self.config.mode {
             ThreadingMode::Deterministic => self.run_quantum_deterministic(limit, cut),
             ThreadingMode::Parallel => self.run_quantum_dispatched(limit, cut, Source::Emulated),
@@ -3133,6 +3237,10 @@ impl Scheduler {
         self.advance_undriven_trees(target)?;
 
         self.now = target;
+        // After every tree has been carried to `target` at the rate it ran the
+        // round at, and before anything reads a position: this is the boundary
+        // a guest write made inside the round takes effect at.
+        self.apply_clock_requests()?;
         // Before the events are popped, so a handler reached through a handle
         // sees the position the event fired at rather than the previous one.
         self.publish_lazy_positions();
@@ -3528,6 +3636,8 @@ impl Scheduler {
             self.forest.advance_to_global(osc, target)?;
         }
         self.now = target;
+        // The same boundary [`Scheduler::close_round`] applies requests at.
+        self.apply_clock_requests()?;
         self.publish_lazy_positions();
         let mut fired = Vec::new();
         while let Some(e) = self.queue.pop_due(self.now) {
@@ -6354,5 +6464,211 @@ mod tests {
         let a = history();
         assert!(a.len() > 100);
         assert_eq!(a, history());
+    }
+
+    // -- the clock-control seam ---------------------------------------------
+
+    /// A runnable that asks for a re-rating part-way through its budget, the
+    /// way a guest write to `PLLCFGR` does.
+    #[derive(Debug)]
+    struct Reprogrammer {
+        control: Arc<ClockControl>,
+        /// Which domain to re-rate, and to what.
+        target: DomainId,
+        mul: u64,
+        div: u64,
+        /// How far into its budget the write happens — the whole point of the
+        /// test is that this must not matter.
+        at: u64,
+        done: bool,
+    }
+
+    impl Runnable for Reprogrammer {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            if !self.done && budget.ticks > self.at {
+                self.done = true;
+                self.control.request(self.target, self.mul, self.div);
+            }
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    /// A crystal with a processor on one domain and a peripheral on another.
+    fn rerate_scheduler() -> (Scheduler, DomainId, DomainId) {
+        let mut forest = ClockForest::new();
+        let hse = forest
+            .add_oscillator("hse", Rational::integer(8_000_000))
+            .expect("a real crystal");
+        let sys = forest.add_domain("sysclk", hse, 2, 1).expect("hse * 2");
+        let pclk = forest.add_domain("pclk", sys, 1, 4).expect("sysclk / 4");
+        let sched = Scheduler::new(forest, SchedulerConfig::default());
+        (sched, sys, pclk)
+    }
+
+    #[test]
+    fn a_requested_re_rating_lands_on_the_round_boundary_and_not_before() {
+        let (mut sched, sys, pclk) = rerate_scheduler();
+        let control = sched.clock_control();
+        sched.add_runnable(
+            sys,
+            Box::new(Reprogrammer {
+                control: Arc::clone(&control),
+                target: sys,
+                mul: 21,
+                div: 1,
+                at: 4,
+                done: false,
+            }),
+        );
+
+        assert_eq!(
+            sched.forest().domain_frequency(sys).unwrap(),
+            Rational::integer(16_000_000)
+        );
+        let report = sched.run_quantum().unwrap();
+        assert!(report.to > report.from);
+        // The whole round ran at the old rate — a millisecond of a 16 MHz
+        // system clock — and the new one is in force the moment it closed.
+        assert_eq!(sched.forest().ticks(sys).unwrap(), 16_000);
+        assert_eq!(
+            sched.forest().domain_frequency(sys).unwrap(),
+            Rational::integer(168_000_000),
+            "the boundary is where a request takes effect"
+        );
+        assert_eq!(
+            sched.forest().domain_frequency(pclk).unwrap(),
+            Rational::integer(42_000_000),
+            "and everything below it follows, exactly"
+        );
+        assert_eq!(control.applied(), 1);
+
+        // The next round is budgeted at the new rate.
+        sched.run_quantum().unwrap();
+        assert_eq!(sched.forest().ticks(sys).unwrap(), 16_000 + 168_000);
+        // No tick was lost or duplicated at the change: the peripheral counted
+        // a quarter of each, at each rate.
+        assert_eq!(sched.forest().ticks(pclk).unwrap(), 4_000 + 42_000);
+    }
+
+    #[test]
+    fn where_in_a_round_the_write_happened_changes_nothing() {
+        // The rule that makes this seam deterministic. A request carries no
+        // timestamp, so two machines that reprogram the same PLL at different
+        // cycles of the same round are in the same state afterwards — tick
+        // counters, virtual time and all.
+        let mut states = Vec::new();
+        for at in [0u64, 1, 4_000, 15_999] {
+            let (mut sched, sys, pclk) = rerate_scheduler();
+            let control = sched.clock_control();
+            sched.add_runnable(
+                sys,
+                Box::new(Reprogrammer {
+                    control,
+                    target: sys,
+                    mul: 21,
+                    div: 1,
+                    at,
+                    done: false,
+                }),
+            );
+            for _ in 0..4 {
+                sched.run_quantum().unwrap();
+            }
+            states.push((
+                sched.now(),
+                sched.forest().ticks(sys).unwrap(),
+                sched.forest().ticks(pclk).unwrap(),
+                sched.forest().domain_frequency(sys).unwrap(),
+            ));
+        }
+        assert!(
+            states.windows(2).all(|w| w[0] == w[1]),
+            "a re-rating must not depend on where in the round it was asked for: {states:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_that_changes_nothing_is_dropped() {
+        // Applying it would materialize the subtree's counters and throw away
+        // the fraction of a tick in flight — a phase change for no reason.
+        let (mut sched, sys, pclk) = rerate_scheduler();
+        let control = sched.clock_control();
+        sched.add_runnable(sys, Box::new(Cpu::default()));
+        sched.run_quantum().unwrap();
+        let before = (
+            sched.forest().ticks(sys).unwrap(),
+            sched.forest().ticks(pclk).unwrap(),
+        );
+
+        control.request(sys, 2, 1);
+        // Written unreduced: the same rating, said differently.
+        control.request(pclk, 25, 100);
+        sched.apply_clock_requests().unwrap();
+        assert_eq!(
+            control.applied(),
+            0,
+            "nothing moved, so nothing was applied"
+        );
+        assert_eq!(
+            (
+                sched.forest().ticks(sys).unwrap(),
+                sched.forest().ticks(pclk).unwrap()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn a_lazy_device_on_a_re_rated_domain_keeps_its_deadline_in_ticks() {
+        // The other half of "devices already on the domain behave correctly":
+        // a lazily-advanced device names its next event in its **own** ticks,
+        // and the scheduler converts that afresh every round. So a re-rating
+        // moves the instant the deadline falls at, and leaves the tick it falls
+        // on exactly where the device put it.
+        let (mut sched, sys, pclk) = rerate_scheduler();
+        let control = sched.clock_control();
+        let dev = sched.add_lazy_device(
+            pclk,
+            Box::new(Ppu {
+                next_event: Some(1_000),
+                ..Ppu::default()
+            }),
+        );
+        let _ = dev;
+        sched.add_runnable(sys, Box::new(Cpu::default()));
+
+        // At 4 MHz, tick 1000 of `pclk` is 250 us away.
+        let slow = sched.forest().global_time_of_tick(pclk, 1_000).unwrap();
+        // `as_nanos` floors, so 250 us reads back as one unit short of it.
+        assert_eq!(slow.as_nanos(), 249_999);
+
+        control.request(sys, 21, 1);
+        sched.apply_clock_requests().unwrap();
+
+        // At 42 MHz it is 23.8 us away — the same tick, sooner, which is what
+        // a device that counts bus cycles means by it.
+        let fast = sched.forest().global_time_of_tick(pclk, 1_000).unwrap();
+        assert!(fast < slow);
+        assert_eq!(fast.as_nanos(), 23_809);
+        // And the round the scheduler picks ends there rather than at the old
+        // instant, because `lazy_deadline` reconverts rather than caching.
+        assert_eq!(sched.lazy_deadline(), Some(fast));
+    }
+
+    #[test]
+    fn a_re_rating_the_forest_refuses_stops_the_round_rather_than_degrading() {
+        let (mut sched, sys, _) = rerate_scheduler();
+        let control = sched.clock_control();
+        sched.add_runnable(sys, Box::new(Cpu::default()));
+        // A divisor of zero is not a rate, and the forest says so rather than
+        // picking something nearby.
+        control.request(sys, 3, 0);
+        let e = sched.run_quantum().expect_err("the forest refuses");
+        assert!(matches!(e, SchedError::Clock(_)), "{e}");
+        assert_eq!(
+            sched.forest().domain_frequency(sys).unwrap(),
+            Rational::integer(16_000_000),
+            "and leaves the forest exactly as it was"
+        );
     }
 }

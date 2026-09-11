@@ -34,6 +34,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
 
+use crate::core::clock::ClockControl;
 use crate::core::error::{Error, Result};
 use crate::core::hosts::HostObjects;
 use crate::core::props::{Props, ValueKind};
@@ -813,6 +814,28 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// A device that is not lazy never gets one.
     fn attach_lazy(&self, handle: LazyHandle) {
         let _ = handle;
+    }
+
+    /// Told how to re-rate a clock domain — the clock-control seam.
+    ///
+    /// A clock controller — `st.rcc`, and every PLL after it — computes what
+    /// its outputs are worth from inside `MemOps::write`, several frames below
+    /// whoever owns the forest. This is the route from there to the time model:
+    /// the device keeps the handle, asks it for a new rating whenever its
+    /// outputs move, and the scheduler applies the request at its next
+    /// boundary. See [`ClockControl`] for the rule and for what happens to the
+    /// ticks already counted.
+    ///
+    /// Handed to every device the machine registers, because a device that does
+    /// not override this never learns it exists. Overriding it is the whole of
+    /// opting in; a device that drives a clock must also be told **which**
+    /// domains are its outputs, and that is the machine file's business, not
+    /// this method's.
+    ///
+    /// Called once, by the machine layer, after the device is registered — so
+    /// after `bind`, which is where a device learns its peers' domains.
+    fn attach_clock_control(&self, control: Arc<ClockControl>) {
+        let _ = control;
     }
 }
 

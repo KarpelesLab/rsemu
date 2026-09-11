@@ -108,10 +108,11 @@
 //! and otherwise inert: the byte pipe under this device has no bit time. The
 //! *pace* a machine file gives the device (see below) is what stands in for
 //! the baud rate, and it is set in the machine file rather than derived from
-//! this register, which is a stated limit rather than an oversight —
-//! re-rating a clock domain from a guest register write is a `core::clock`
-//! feature (`ROADMAP.md` §4.2, "runtime re-rating") that no machine has needed
-//! yet.
+//! this register, which is a stated limit rather than an oversight. Re-rating
+//! a clock domain from a guest register write is now something a device can do
+//! — `core::clock`'s [`ClockControl`](crate::core::clock::ClockControl), and
+//! `docs/techniques/clock-control.md` — so the limit is that nothing has asked
+//! this device for it, not that there is nowhere to ask.
 //!
 //! # Pacing
 //!
