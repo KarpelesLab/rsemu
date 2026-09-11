@@ -1680,7 +1680,7 @@ pub struct SchedulerConfig {
     /// runnable's own ticks. `None` — the default — leaves a budget bounded
     /// by the round itself: the span the runnable's own oscillator tree has
     /// left, divided by the runnables that share it
-    /// ([`Scheduler::tree_shares`]).
+    /// (`Scheduler::tree_shares`).
     ///
     /// # Why this is not a number any more
     ///
@@ -1697,7 +1697,7 @@ pub struct SchedulerConfig {
     ///
     /// The deficit never came back, either. A budget is recomputed from the
     /// tree's absolute position every round (see
-    /// [`Scheduler::ticks_until_after`]), so the ticks a capped round left
+    /// `Scheduler::ticks_until_after`), so the ticks a capped round left
     /// behind became a backlog that the next round re-capped: the core's
     /// effective rate was *`max_ticks_per_quantum` × rounds per second* and
     /// the machine file's `osc` statement had no bearing on it at all.
@@ -1706,17 +1706,17 @@ pub struct SchedulerConfig {
     ///
     /// * **Bounding a runnable's share** so its siblings are scheduled at all.
     ///   That is a real job and it is now done in the units it belongs in —
-    ///   see [`Scheduler::tree_shares`], which divides the span a tree has
+    ///   see `Scheduler::tree_shares`, which divides the span a tree has
     ///   left among the runnables that share it. A tree with one runnable
     ///   divides by one, so on every board but an `-smp` one a budget is now
-    ///   exactly what [`Scheduler::ticks_until`] offers and nothing else.
+    ///   exactly what `Scheduler::ticks_until` offers and nothing else.
     /// * **Bounding how late an exit is noticed.** It never did this one. The
     ///   safe-point protocol does: every core tests its [`ExitFlag`] at each
     ///   block boundary (`ROADMAP.md` §4.7), so a stop lands within one block
     ///   however long the budget is, and `jit::dispatch` tests it at each
     ///   linked boundary too. Interrupt latency is not it either — a queued
     ///   event pulls the round's target in through
-    ///   [`Scheduler::natural_target`], and one raised mid-round reaches the
+    ///   `Scheduler::natural_target`, and one raised mid-round reaches the
     ///   core through [`TickCursor`].
     ///
     /// # What it is for now
@@ -3929,7 +3929,17 @@ impl Scheduler {
             },
             Err(_) => 1,
         };
-        let share = span / n;
+        // A share of zero out of a span that is not zero would **starve a slow
+        // domain for ever**, which is a different bug from the one the share
+        // exists to fix. `tests/vnc_input.rs`'s board is the case: an 8086 at
+        // 4.77 MHz and an 8042 at 1 193 Hz on one crystal, where the
+        // controller's tick is 838 us against a 1 ms round, so half a round
+        // rounds down to nothing and the keyboard never moves a byte. One tick
+        // is the floor, and the span is still the ceiling — the runnable that
+        // took it leaves the next one a span of zero, and the round-robin's
+        // rotation gives that one its turn next round, which is what happened
+        // before any of this existed.
+        let share = if span == 0 { 0 } else { (span / n).max(1) };
         match self.config.max_ticks_per_quantum {
             Some(cap) => share.min(cap),
             None => share,
@@ -4381,6 +4391,42 @@ mod tests {
         assert_eq!(budgets, alloc::vec![500_000, 500_000]);
         // And the tree advanced by the whole round, once, not twice.
         assert_eq!(sched.now(), GlobalTime::from_nanos(1_000_000));
+    }
+
+    /// A domain too slow for its share of a round still gets a tick.
+    ///
+    /// The share divides, and dividing can round to nothing: an 8042 at
+    /// 1 193 Hz sharing a crystal with an 8086 is offered half of the one tick
+    /// a 1 ms round is worth, which is zero, and a controller offered zero
+    /// every round never moves a byte. `tests/vnc_input.rs` is that board and
+    /// caught it. One tick is the floor whenever the span is not itself zero;
+    /// the runnable that takes it leaves the next one nothing, and the
+    /// round-robin's rotation gives that one its turn next round.
+    #[test]
+    fn a_domain_too_slow_to_have_a_share_still_gets_a_tick() {
+        let mut forest = ClockForest::new();
+        let osc = forest
+            .add_oscillator("xtal", Rational::new(14_318_180, 1).unwrap())
+            .unwrap();
+        let cpu = forest.add_domain("cpu", osc, 1, 3).unwrap();
+        let kbc = forest.add_domain("kbc", osc, 1, 12_000).unwrap();
+        let mut sched = Scheduler::new(forest, SchedulerConfig::default());
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        sched.add_runnable(kbc, Box::new(Cpu::default()));
+
+        // A 1 ms round is 4 772 CPU cycles and 1.19 controller ticks, so the
+        // controller's *half* is nought point six of one.
+        for _ in 0..8 {
+            sched.run_quantum().unwrap();
+        }
+        assert!(
+            sched.forest().ticks(kbc).unwrap() > 0,
+            "the controller was starved by a share that rounded to zero"
+        );
+        assert!(
+            sched.forest().ticks(cpu).unwrap() > 10_000,
+            "and the processor still got the bulk of the crystal"
+        );
     }
 
     /// A gated sibling is not counted, so the one that still runs gets the
