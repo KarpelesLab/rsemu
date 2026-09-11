@@ -1318,9 +1318,13 @@ dev-stm32-dma = []
 # -- decides that lines 5-9 share IRQ 23, and one `event` pin for the pulse
 # `WFE` waits on. `st.syscfg` adds MEMRMP, PMC/CFGR1 and the F4's CMPCR or the
 # L4's SCSR/CFGR2/SWPR/SKR/SWPR2, selected by a `variant` property. MEMRMP
-# reads back but moves no mapping; the file says so. Written from ST RM0090
-# S9 and S12 and ST RM0351 S9 and S13; no emulator source was consulted
-# (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
+# **moves the memory**: the block publishes a `boot` region a board maps where
+# the alias at address zero belongs, and MEM_MODE picks which of the board's
+# `boot-sources` answers through it, so a bootloader that remaps SRAM to zero
+# and branches there fetches SRAM. On an L4 it also drives `fwdis`, which is
+# what switches `st.firewall` on. Written from ST RM0090 S9 and S12 and ST
+# RM0351 S9 and S13; no emulator source was consulted (ROADMAP.md S1).
+# `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-exti = []
 
 # The two STM32 watchdogs (src/dev/stm32/iwdg.rs, src/dev/stm32/wwdg.rs): two

@@ -48,13 +48,49 @@
 //! hardware does and it is worth knowing: the classic symptom is one spurious
 //! interrupt immediately after `HAL_GPIO_Init`.
 //!
+//! # `MEMRMP`, and why the boot alias is a window rather than a mapping
+//!
+//! `MEMRMP.MEM_MODE` picks what answers at address zero: the main flash, the
+//! system bootloader, an external memory, or SRAM. A board that wants that to
+//! work gives this object the space it lives in and the address of each
+//! encoding's memory, and maps the block's **`boot` region** where the alias
+//! belongs:
+//!
+//! ```text
+//! object syscfg "st.syscfg" {
+//!   space        = mem
+//!   boot-size    = 1M
+//!   boot-sources = [ 0x08000000, 0, 0, 0x20000000 ]   # index = MEM_MODE
+//! }
+//! map mem 0 size 1M = syscfg.boot
+//! ```
+//!
+//! The `boot` region is a **decoder, not a mapping**: an access to it is
+//! forwarded to `boot-sources[MEM_MODE]` plus the offset. That is deliberate
+//! and it is not the obvious implementation, which would be to retopologise the
+//! space from the `MEMRMP` write handler. It cannot be: that write arrives
+//! *through* the space, so the topology lock is already held for reading on
+//! this very thread, and [`AddressSpace::topology`] would deadlock against it
+//! while [`AddressSpace::try_topology`] can only ever fail. The documented
+//! alternative — a [`Deferred`](crate::core::device::Deferred) action — is
+//! drained after a scheduler *event*, a whole quantum after the `LDR` that the
+//! remap was supposed to redirect. A decoder has neither problem, and it is
+//! also what the die is: the alias at zero is address decoding, not a second
+//! copy of the flash.
+//!
+//! The sources are resolved once, at bind, into a private space of their own,
+//! so a later retopology of the machine's map is not seen through the alias.
+//! Nothing on an STM32 retopologises anything, and the alternative was to hold
+//! a foreign space's read guard inside an MMIO handler.
+//!
+//! An encoding whose entry is `0` has no memory behind it — the F407 has
+//! neither a system bootloader image nor an FSMC here — and reads back as a
+//! bus fault, which is what an unmapped alias does. A board that gives no
+//! `boot-sources` at all publishes no `boot` region and `MEMRMP` is then a
+//! latch, as it was.
+//!
 //! # What is here and not modelled
 //!
-//! * **`MEMRMP` does not move anything.** The field reads back and a snapshot
-//!   carries it, but the boot alias at address zero is a `map` statement in the
-//!   machine file and this block has no handle on the address space to rebase
-//!   it with. Firmware that remaps SRAM to zero and jumps there will fetch the
-//!   old alias. Stated rather than hidden.
 //! * **`SCSR`'s SRAM2 erase completes instantly and erases nothing**, because
 //!   the RAM belongs to another object. `SRAM2BSY` therefore always reads zero
 //!   and a polling loop finishes.
@@ -67,6 +103,9 @@
 //! ST **RM0090** rev 21 §9 "System configuration controller (SYSCFG)" and ST
 //! **RM0351** rev 9 §9 for the L4 block. No emulator source of any licence was
 //! consulted (`ROADMAP.md` §1).
+//!
+//! [`AddressSpace::topology`]: crate::core::space::AddressSpace::topology
+//! [`AddressSpace::try_topology`]: crate::core::space::AddressSpace::try_topology
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -79,12 +118,15 @@ use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKi
 use crate::core::error::BusError;
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
+use crate::core::space::{
+    AccessConstraints, AddressSpace, Mapping, MemAttrs, MemOps, MemResult, Region, RegionRef,
+};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::machine::Instance;
+use crate::machine::realize::BindCtx;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema, port_index};
 
 /// The class name a machine description writes.
@@ -104,6 +146,19 @@ const PORT_LETTERS: &[u8] = b"abcdefghijk";
 
 /// How many ports the widest part has.
 pub const MAX_PORTS: u32 = 11;
+
+/// How many `MEM_MODE` encodings the widest variant decodes.
+///
+/// Two bits on an F407 and three on an L4, so the table is eight long and an
+/// F407 simply never selects past index 3.
+pub const MEM_MODES: usize = 8;
+
+/// The `boot-sources` entry that means "this encoding has no memory".
+///
+/// Spelled `0` in a machine file, because address zero is where the alias
+/// *is*: an encoding that aliased the alias would be the one address a board
+/// can never mean.
+const NO_SOURCE: u64 = u64::MAX;
 
 /// How many bytes an F4's registers occupy: up to and including `CMPCR`.
 const F4_BYTES: u64 = 0x24;
@@ -127,6 +182,11 @@ const CMPCR_READY: u32 = 1 << 8;
 /// `CFGR1`'s firewall-disable bit on an L4: reset high, and software may only
 /// ever clear it.
 const CFGR1_FWDIS: u32 = 1 << 0;
+
+/// `MEMRMP`'s `MEM_MODE` field — two bits on an F4, three on an L4, and the
+/// wider mask everywhere because the narrow variant's own mask has already cut
+/// bit 2 off before this is applied.
+const MEM_MODE_MASK: u32 = 0x7;
 
 // ---------------------------------------------------------------------------
 // Variants
@@ -215,6 +275,89 @@ struct State {
 }
 
 // ---------------------------------------------------------------------------
+// The boot alias
+// ---------------------------------------------------------------------------
+
+/// The window `MEMRMP` points: an address decoder, not a second mapping.
+///
+/// See the module documentation for why this forwards rather than
+/// retopologising.
+#[derive(Debug)]
+struct BootAlias {
+    /// What each `MEM_MODE` encoding aliases, or [`NO_SOURCE`].
+    sources: [u64; MEM_MODES],
+    /// Those sources, resolved at bind into a space of this block's own.
+    ///
+    /// Cloned out and the lock released before the forwarded access, because
+    /// that access takes a [`LockRank::TOPOLOGY`] guard and this one is a leaf
+    /// — holding it across would invert the ladder.
+    space: Mutex<Option<Arc<AddressSpace>>>,
+    /// Where `MEM_MODE` currently points. An atomic and not the register lock:
+    /// this is read on every fetch the core makes through the alias.
+    base: AtomicU64,
+}
+
+impl BootAlias {
+    /// A decoder for `sources`, with every encoding empty until `select`.
+    fn new(sources: [u64; MEM_MODES]) -> BootAlias {
+        BootAlias {
+            sources,
+            space: Mutex::with_rank(LockRank::LEAF, None),
+            base: AtomicU64::new(NO_SOURCE),
+        }
+    }
+
+    /// Whether a board asked for a boot alias at all.
+    fn configured(&self) -> bool {
+        self.sources.iter().any(|s| *s != NO_SOURCE)
+    }
+
+    /// Point the window at what `MEM_MODE` selects.
+    fn select(&self, mode: u32) {
+        let base = self
+            .sources
+            .get(mode as usize)
+            .copied()
+            .unwrap_or(NO_SOURCE);
+        self.base.store(base, Ordering::Relaxed);
+    }
+
+    /// The space and base an access should be forwarded to.
+    fn target(&self) -> Option<(Arc<AddressSpace>, u64)> {
+        let base = self.base.load(Ordering::Relaxed);
+        if base == NO_SOURCE {
+            return None;
+        }
+        let space = self.space.lock().clone()?;
+        Some((space, base))
+    }
+}
+
+impl MemOps for BootAlias {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        // `attrs` travels unchanged, `MemAttrs::debug` included: a decoder has
+        // no state to disturb and the memory behind it makes its own decision.
+        let Some((space, base)) = self.target() else {
+            return Err(BusError::Unassigned);
+        };
+        space.read_bytes(base.wrapping_add(offset), dst, attrs)
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
+        let Some((space, base)) = self.target() else {
+            return Err(BusError::Unassigned);
+        };
+        space.write_bytes(base.wrapping_add(offset), src, attrs)
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        // Whatever is on the far side decides; a decoder that imposed a width
+        // of its own would refuse accesses the aliased memory accepts.
+        AccessConstraints::ANY
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The register block
 // ---------------------------------------------------------------------------
 
@@ -229,6 +372,8 @@ struct Registers {
     memrmp_reset: u32,
     /// The sixteen line outputs, connected at realize time.
     out: Mutex<[Option<WireSource>; LINES as usize]>,
+    /// What `MEMRMP` points at address zero.
+    boot: Arc<BootAlias>,
 }
 
 impl fmt::Debug for Registers {
@@ -356,7 +501,14 @@ impl Registers {
     fn write_register(&self, offset: u64, value: u32) -> bool {
         let mut state = self.state.lock();
         match (self.variant, offset) {
-            (_, 0x00) => state.memrmp = value & self.variant.memrmp_mask(),
+            (_, 0x00) => {
+                state.memrmp = value & self.variant.memrmp_mask();
+                // Moving the window is a relaxed store into the decoder, so it
+                // is safe under the register lock and it lands before this
+                // write's own bus cycle ends — which is what firmware that
+                // remaps and branches to zero depends on.
+                self.boot.select(state.memrmp & MEM_MODE_MASK);
+            }
             (_, 0x04) => {
                 let mut next = value & self.variant.cfgr1_mask();
                 if self.variant == Variant::L4 {
@@ -433,6 +585,8 @@ impl MemOps for Registers {
 pub struct Syscfg {
     regs: Arc<Registers>,
     region: RegionRef,
+    /// The boot alias, when a board asked for one.
+    boot_region: Option<RegionRef>,
     /// The input pins the machine layer has taken; the device keeps the strong
     /// reference because a net holds its sinks weakly.
     pins: Mutex<Vec<Arc<PortPin>>>,
@@ -458,30 +612,75 @@ impl Syscfg {
         };
         let ports = r.or_range("ports", u64::from(MAX_PORTS), 1..=u64::from(MAX_PORTS))? as u32;
         let memrmp = r.or_range("memrmp-reset", 0u64, 0..=u64::from(u32::MAX))? as u32;
+        let boot_size = r.or_size("boot-size", 0)?;
+        let mut sources = [NO_SOURCE; MEM_MODES];
+        if let Some(list) = r.optional_list("boot-sources")? {
+            if list.len() > MEM_MODES {
+                return Err(Error::Property(format!(
+                    "`boot-sources` is indexed by MEM_MODE, so it has at most {MEM_MODES} \
+                     entries, not {}",
+                    list.len()
+                )));
+            }
+            for (mode, value) in list.iter().enumerate() {
+                let addr = value.to_addr("boot-sources")?;
+                if addr != 0 {
+                    sources[mode] = addr;
+                }
+            }
+        }
         r.finish()?;
-        Ok(Syscfg::build(variant, ports, memrmp))
+        if sources.iter().any(|s| *s != NO_SOURCE) && boot_size == 0 {
+            return Err(Error::Property(String::from(
+                "`boot-sources` names memory for the alias at zero but `boot-size` is 0, so the \
+                 alias has no window to decode: give it the size of the widest source",
+            )));
+        }
+        Ok(Syscfg::build_with_boot(
+            variant, ports, memrmp, boot_size, sources,
+        ))
     }
 
     /// Build one directly — the route a test takes.
     #[must_use]
     pub fn build(variant: Variant, ports: u32, memrmp_reset: u32) -> Syscfg {
+        Syscfg::build_with_boot(variant, ports, memrmp_reset, 0, [NO_SOURCE; MEM_MODES])
+    }
+
+    /// Build one with a boot alias of `boot_size` bytes over `sources`.
+    ///
+    /// `sources` is indexed by `MEM_MODE`; [`NO_SOURCE`] is an encoding with no
+    /// memory behind it.
+    fn build_with_boot(
+        variant: Variant,
+        ports: u32,
+        memrmp_reset: u32,
+        boot_size: u64,
+        sources: [u64; MEM_MODES],
+    ) -> Syscfg {
         let ports = ports.clamp(1, MAX_PORTS);
+        let boot = Arc::new(BootAlias::new(sources));
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::default()),
             variant,
             ports,
             memrmp_reset,
             out: Mutex::with_rank(LockRank::WIRE, [const { None }; LINES as usize]),
+            boot: Arc::clone(&boot),
         });
         *regs.state.lock() = regs.reset_state();
+        boot.select(regs.state.lock().memrmp & MEM_MODE_MASK);
         let region = Arc::new(Region::io(
             "syscfg",
             variant.register_bytes(),
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
+        let boot_region = (boot_size > 0)
+            .then(|| Arc::new(Region::io("boot", boot_size, boot as Arc<dyn MemOps>)) as RegionRef);
         Syscfg {
             regs,
             region,
+            boot_region,
             pins: Mutex::with_rank(LockRank::DEVICE, Vec::new()),
         }
     }
@@ -525,13 +724,70 @@ impl Syscfg {
         self.regs.selected_port(&state, n)
     }
 
-    /// `MEMRMP`'s `MEM_MODE` field.
-    ///
-    /// Read back by a board that wants to honour the boot alias; this block
-    /// does not move the mapping itself. See the module documentation.
+    /// `MEMRMP`'s `MEM_MODE` field — which memory answers at address zero.
     #[must_use]
     pub fn mem_mode(&self) -> u32 {
-        self.regs.state.lock().memrmp & 0x7
+        self.regs.state.lock().memrmp & MEM_MODE_MASK
+    }
+
+    /// Resolve `boot-sources` against `space` and arm the alias.
+    ///
+    /// Normally done by [`Instance::bind`] from the object's `space =`
+    /// property; a test that builds its own space calls this.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if an entry names an address `space` has nothing
+    /// mapped at — the entry is the *base* of the memory the alias points at,
+    /// so an address inside a region does not count.
+    pub fn attach_boot_sources(&self, at: &str, space: &Arc<AddressSpace>) -> Result<()> {
+        if !self.regs.boot.configured() {
+            return Ok(());
+        }
+        // Resolve first, with only the machine's space held, and build the
+        // private one afterwards: both guards are `LockRank::TOPOLOGY`, and
+        // taking the second inside the first is the same rank twice.
+        let mut found: Vec<Mapping> = Vec::new();
+        {
+            let view = space.view();
+            for base in self.regs.boot.sources {
+                if base == NO_SOURCE || found.iter().any(|m| m.base == base) {
+                    continue;
+                }
+                let Some((_, mapping)) = view.mappings().find(|(_, m)| m.base == base) else {
+                    return Err(Error::Config {
+                        at: String::from(at),
+                        message: format!(
+                            "`boot-sources` names {base:#x}, and `{}` has nothing mapped there — \
+                             the entry is the *base* of the memory the alias points at, not an \
+                             address inside it",
+                            space.name()
+                        ),
+                    });
+                };
+                found.push(mapping.clone());
+            }
+        }
+
+        let sources = AddressSpace::new(format!("{at}.boot-sources"), space.bits());
+        {
+            let mut topo = sources.topology();
+            for mapping in found {
+                topo.map_with(mapping)?;
+            }
+        }
+        *self.regs.boot.space.lock() = Some(Arc::new(sources));
+        Ok(())
+    }
+
+    /// The guest address the boot alias currently forwards to, if any.
+    ///
+    /// `None` for an encoding this board gave no memory, and for a block with
+    /// no `boot-sources` at all.
+    #[must_use]
+    pub fn boot_target(&self) -> Option<u64> {
+        let base = self.regs.boot.base.load(Ordering::Relaxed);
+        (base != NO_SOURCE).then_some(base)
     }
 }
 
@@ -563,12 +819,16 @@ impl Device for Syscfg {
         // and each port will keep driving them (`ROADMAP.md` §4.5) — this is
         // the mux, not the pad, and a mux that invented a level for its own
         // input would publish a falling edge nothing made.
-        {
+        let memrmp = {
             let mut state = self.regs.state.lock();
             let inputs = state.inputs;
             *state = self.regs.reset_state();
             state.inputs = inputs;
-        }
+            state.memrmp
+        };
+        // The BOOT pins decide what is at zero out of reset, so the window goes
+        // back with the register.
+        self.regs.boot.select(memrmp & MEM_MODE_MASK);
         self.regs.refresh();
     }
 
@@ -636,12 +896,19 @@ impl Device for Syscfg {
             *value = r.read_u16()?;
         }
         *self.regs.state.lock() = state;
+        // The window is derived state and is never in the chunk: it is
+        // recomputed from the `MEMRMP` that just came back.
+        self.regs.boot.select(state.memrmp & MEM_MODE_MASK);
         self.regs.refresh();
         Ok(())
     }
 
     fn region(&self, name: &str) -> Option<RegionRef> {
-        matches!(name, "" | "regs").then(|| Arc::clone(&self.region))
+        match name {
+            "" | "regs" => Some(Arc::clone(&self.region)),
+            "boot" => self.boot_region.clone(),
+            _ => None,
+        }
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
@@ -675,7 +942,22 @@ impl Device for Syscfg {
     }
 }
 
-impl Instance for Syscfg {}
+/// The machine layer's half: the boot alias has to be told what it aliases.
+impl Instance for Syscfg {
+    fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
+        if !self.regs.boot.configured() {
+            return Ok(());
+        }
+        let space = ctx.space().ok_or_else(|| Error::Config {
+            at: String::from(ctx.path()),
+            message: String::from(
+                "`boot-sources` names memory in the space this block lives in, so the object has \
+                 to declare one: add `space = mem`",
+            ),
+        })?;
+        self.attach_boot_sources(ctx.path(), space)
+    }
+}
 
 /// The `st.syscfg` device class.
 pub static CLASS: DeviceClass = DeviceClass {
@@ -700,6 +982,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "MEMRMP's reset value, which the BOOT pins decide",
+        },
+        PropertySpec {
+            name: "boot-size",
+            kind: ValueKind::Size,
+            required: false,
+            summary: "how many bytes the `boot` alias decodes; 0 publishes no alias",
+        },
+        PropertySpec {
+            name: "boot-sources",
+            kind: ValueKind::List,
+            required: false,
+            summary: "what each MEM_MODE aliases, by base address, indexed by MEM_MODE; 0 is none",
         },
     ],
     construct: |props| Ok(Box::new(Syscfg::new(props)?)),
@@ -730,8 +1024,11 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4"]))
         .prop(PropSchema::new("ports", ValueKind::Uint).range(1, u64::from(MAX_PORTS)))
         .prop(PropSchema::new("memrmp-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
+        .prop(PropSchema::new("boot-size", ValueKind::Size))
+        .prop(PropSchema::new("boot-sources", ValueKind::List))
         .region("")
         .region("regs")
+        .region("boot")
         .port_bank("exti", PortDir::Out, LINES);
     // One bank per port letter. The schema declares every letter the widest
     // part has, because it cannot see what `ports` was set to; the device
@@ -934,8 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn memrmp_reads_back_and_does_not_move_a_mapping() {
-        // Stated behaviour, not an accident: see the module documentation.
+    fn memrmp_reads_back_and_only_mem_mode_is_writable() {
         let s = Syscfg::build(Variant::F4, 9, 0);
         assert_eq!(peek(&s, 0x00), 0);
         poke(&s, 0x00, 0x3);
@@ -950,6 +1246,162 @@ mod tests {
         poke(&boot, 0x00, 0);
         Device::reset(&boot, ResetKind::Cold);
         assert_eq!(peek(&boot, 0x00), 1);
+    }
+
+    /// An F407-shaped board: 64 KiB of "flash" at 0x08000000 and 16 KiB of
+    /// "SRAM" at 0x20000000, with the alias over both at zero.
+    ///
+    /// Small stores rather than the part's real sizes, because what is being
+    /// tested is the decode and not the geometry.
+    fn boot_rig() -> (Arc<Syscfg>, Arc<AddressSpace>) {
+        use crate::core::space::RamStore;
+
+        const FLASH: u64 = 0x0800_0000;
+        const SRAM: u64 = 0x2000_0000;
+        let s = Arc::new(Syscfg::build_with_boot(
+            Variant::F4,
+            9,
+            0,
+            0x1_0000,
+            [
+                FLASH, NO_SOURCE, NO_SOURCE, SRAM, NO_SOURCE, NO_SOURCE, NO_SOURCE, NO_SOURCE,
+            ],
+        ));
+        let space = Arc::new(AddressSpace::new("mem", 32));
+        {
+            let mut topo = space.topology();
+            topo.map(
+                Arc::new(Region::ram("flash", Arc::new(RamStore::new(0x1_0000)))) as RegionRef,
+                FLASH,
+            )
+            .expect("flash maps");
+            topo.map(
+                Arc::new(Region::ram("sram", Arc::new(RamStore::new(0x4000)))) as RegionRef,
+                SRAM,
+            )
+            .expect("sram maps");
+            topo.map(Device::region(s.as_ref(), "boot").expect("a boot alias"), 0)
+                .expect("the alias maps");
+            topo.map(Arc::clone(&s.region), 0x4001_3800)
+                .expect("the registers map");
+        }
+        (s, space)
+    }
+
+    /// Bind `s` to `space` the way the machine layer would.
+    fn bind_boot(s: &Syscfg, space: &Arc<AddressSpace>) {
+        s.attach_boot_sources("syscfg", space)
+            .expect("the sources resolve");
+    }
+
+    #[test]
+    fn memrmp_switches_the_boot_alias_to_sram() {
+        // The whole point of the register: what is at zero changes.
+        let (s, space) = boot_rig();
+        bind_boot(&s, &space);
+
+        let attrs = MemAttrs::DEFAULT;
+        space
+            .write(0x0800_0010, Width::U32, 0xf1a5_4001, attrs)
+            .expect("flash is writable in this rig");
+        space
+            .write(0x2000_0010, Width::U32, 0x5a5a_0001, attrs)
+            .expect("sram");
+
+        assert_eq!(s.boot_target(), Some(0x0800_0000));
+        assert_eq!(space.read(0x10, Width::U32, attrs).ok(), Some(0xf1a5_4001));
+
+        // MEM_MODE = 11: SRAM1 at zero (RM0090 §9.2.1).
+        space
+            .write(0x4001_3800, Width::U32, 3, attrs)
+            .expect("MEMRMP is writable");
+        assert_eq!(s.boot_target(), Some(0x2000_0000));
+        assert_eq!(
+            space.read(0x10, Width::U32, attrs).ok(),
+            Some(0x5a5a_0001),
+            "0x00000000 still reads flash after a remap to SRAM"
+        );
+
+        // And it is the same memory, not a copy: a store through the alias is
+        // visible at SRAM's own address.
+        space
+            .write(0x20, Width::U32, 0xdead_beef, attrs)
+            .expect("the alias is writable");
+        assert_eq!(
+            space.read(0x2000_0020, Width::U32, MemAttrs::DEBUG).ok(),
+            Some(0xdead_beef)
+        );
+
+        // Back to flash, and a reset takes the window back with the register.
+        space
+            .write(0x4001_3800, Width::U32, 0, attrs)
+            .expect("back");
+        assert_eq!(space.read(0x10, Width::U32, attrs).ok(), Some(0xf1a5_4001));
+        space
+            .write(0x4001_3800, Width::U32, 3, attrs)
+            .expect("sram");
+        Device::reset(s.as_ref(), ResetKind::Cold);
+        assert_eq!(s.boot_target(), Some(0x0800_0000));
+    }
+
+    #[test]
+    fn a_mem_mode_this_board_gave_no_memory_faults_rather_than_aliasing_the_wrong_thing() {
+        // MEM_MODE = 01 is the system bootloader and 10 the FSMC; an F407VG in
+        // an LQFP100 has neither modelled here, and a silent alias to flash
+        // would be a board that lies about what it is.
+        let (s, space) = boot_rig();
+        bind_boot(&s, &space);
+        space
+            .write(0x4001_3800, Width::U32, 1, MemAttrs::DEFAULT)
+            .expect("MEMRMP");
+        assert_eq!(s.boot_target(), None);
+        assert!(space.read(0x10, Width::U32, MemAttrs::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn an_unbound_alias_and_a_bad_source_are_both_refused_rather_than_silent() {
+        // Nothing bound: the window has no space to forward into.
+        let (_s, space) = boot_rig();
+        assert!(space.read(0x10, Width::U32, MemAttrs::DEFAULT).is_err());
+
+        // A `boot-sources` entry naming an address the space has nothing at is
+        // a machine-file bug, and bind is where it is caught.
+        let other = Arc::new(Syscfg::build_with_boot(
+            Variant::F4,
+            9,
+            0,
+            0x1000,
+            [
+                0xdead_0000,
+                NO_SOURCE,
+                NO_SOURCE,
+                NO_SOURCE,
+                NO_SOURCE,
+                NO_SOURCE,
+                NO_SOURCE,
+                NO_SOURCE,
+            ],
+        ));
+        assert!(other.attach_boot_sources("syscfg", &space).is_err());
+
+        // And a block with no `boot-sources` publishes no alias at all.
+        assert!(Device::region(&syscfg(), "boot").is_none());
+    }
+
+    #[test]
+    fn boot_sources_without_a_window_is_a_property_error() {
+        let props = Props::new().with(
+            "boot-sources",
+            Value::from(alloc::vec![Value::from(0x0800_0000u64)]),
+        );
+        assert!(Syscfg::new(&props).is_err(), "no `boot-size`");
+        let sized = Props::new()
+            .with(
+                "boot-sources",
+                Value::from(alloc::vec![Value::from(0x0800_0000u64)]),
+            )
+            .with("boot-size", Value::from(0x1000u64));
+        assert!(Syscfg::new(&sized).is_ok());
     }
 
     #[test]

@@ -460,7 +460,26 @@ machine "stm32f407" {
   # here**, because none of those peripherals is on this board and `st.pwr`
   # publishes no PVD output; `SWIER` still raises them, which is how a test
   # exercises a line with no source.
-  object syscfg "st.syscfg" { variant = "f4", ports = 8 }
+  #
+  # `boot-sources` is the other half of this block: `SYSCFG_MEMRMP.MEM_MODE`
+  # decides what answers at address zero, and the list is indexed by that field
+  # — 00 main flash, 01 the system bootloader, 10 the FSMC's bank 1, 11 SRAM1
+  # (RM0090 §9.2.1). Two of the four are `0`, which means "this board has no
+  # such memory": there is no system-bootloader image in this tree and an
+  # F407VG in an LQFP100 bonds no FSMC. Firmware that selects either gets a bus
+  # fault at zero, which is honest — the alternative is a silent alias to the
+  # wrong memory.
+  #
+  # `boot-size` is the width of the window, and the flash's size is the widest
+  # of the sources. SRAM1 is 112 KiB, so a fetch at 0x1c000 with `MEM_MODE = 11`
+  # is past the end of what SRAM answers and faults, exactly as on the part.
+  object syscfg "st.syscfg" {
+    variant      = "f4"
+    ports        = 8
+    space        = mem
+    boot-size    = flash
+    boot-sources = [ flash-base, 0, 0, sram-base ]
+  }
   object exti   "st.exti"   { lines = 23 }
 
   # -- the CRC unit ----------------------------------------------------------
@@ -562,12 +581,13 @@ machine "stm32f407" {
   # and is dropped, which is what the silicon does — the lock bit, not the bus,
   # is what protects the array on a real part.
   #
-  # It is mapped twice on purpose. 0x08000000 is where flash lives; 0x00000000
-  # is the **boot alias**, which is what the BOOT0/BOOT1 pins select and what
-  # the core fetches its initial `SP` and `PC` from out of reset. Modelling the
-  # pins would mean an RCC-shaped device; a board that boots from flash is the
-  # overwhelmingly common case and this file states which one it is.
-  map mem boot-base            size flash = eflash.array
+  # 0x08000000 is where flash lives. 0x00000000 is the **boot alias**, which is
+  # what the BOOT0/BOOT1 pins select out of reset and what
+  # `SYSCFG_MEMRMP.MEM_MODE` moves afterwards — so it is not a second mapping of
+  # the flash, it is `syscfg`'s decoder, and which memory is behind it is the
+  # `boot-sources` list on that object. `memrmp-reset` is left at zero, which is
+  # BOOT0 low: flash.
+  map mem boot-base            size flash = syscfg.boot
   map mem flash-base           size flash = eflash.array
   map mem ccm-base             size ccm   = ccmram   # and only in `mem`
   map mem sram-base            size sram1 = ram1

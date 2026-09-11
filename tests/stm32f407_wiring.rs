@@ -505,3 +505,101 @@ fn a_dma_stream_faults_on_ccm_and_copies_out_of_sram() {
         "a byte came out of CCM over the bus matrix"
     );
 }
+
+#[test]
+fn the_same_edge_on_pb0_is_ignored_until_exticr1_selects_port_b() {
+    // The seam this board has three objects for: a port drives a pin, SYSCFG's
+    // `EXTICR` chooses which port's pin 0 is EXTI line 0, and only then does an
+    // edge there reach `PR`. A mux that ignored `EXTICR` would look identical
+    // on port A, and that is the failure this catches.
+    //
+    // `GPIOB`'s base is AHB1 + 0x400; `MODER` is at 0x00 and `BSRR` at 0x18
+    // (RM0090 §8.4). PB0 in output mode lets the port drive its own pin, which
+    // is the only source of an edge on this board.
+    const GPIOB: u64 = 0x4002_0400;
+    const MODER: u64 = 0x00;
+    const BSRR: u64 = 0x18;
+    const IMR: u64 = 0x00;
+    const RTSR: u64 = 0x08;
+    const PR: u64 = 0x14;
+    const EXTICR1: u64 = 0x08;
+
+    let m = boot();
+    store(&m, GPIOB + MODER, 0b01); // PB0 general-purpose output
+    store(&m, EXTI + IMR, 1); // line 0 unmasked
+    store(&m, EXTI + RTSR, 1); // rising edge
+
+    // EXTICR1 comes out of reset naming port A, and PA0 is not moving.
+    assert_eq!(peek(&m, SYSCFG + EXTICR1) & 0xf, 0, "reset is port A");
+    store(&m, GPIOB + BSRR, 1); // PB0 -> high
+    assert_eq!(
+        peek(&m, EXTI + PR) & 1,
+        0,
+        "an edge on PB0 reached EXTI line 0 while EXTICR1 still named port A"
+    );
+
+    // Point the line at port B. PB0 is already high, so the mux republishes a
+    // low-to-high transition on the line and `PR0` sets on the spot — which is
+    // the spurious interrupt a real `HAL_GPIO_Init` produces.
+    store(&m, SYSCFG + EXTICR1, 1);
+    assert_eq!(
+        peek(&m, EXTI + PR) & 1,
+        1,
+        "EXTICR1 selected port B and the pin sitting high did not reach line 0"
+    );
+
+    // And it is genuinely the mux rather than an accident of ordering: clear
+    // the pending bit, take PB0 low and back up, and it sets again.
+    store(&m, EXTI + PR, 1);
+    assert_eq!(peek(&m, EXTI + PR) & 1, 0);
+    store(&m, GPIOB + BSRR, 1 << 16); // PB0 -> low
+    assert_eq!(peek(&m, EXTI + PR) & 1, 0, "a falling edge, and no FTSR");
+    store(&m, GPIOB + BSRR, 1);
+    assert_eq!(peek(&m, EXTI + PR) & 1, 1);
+}
+
+#[test]
+fn memrmp_switches_the_boot_alias_to_sram() {
+    // `SYSCFG_MEMRMP.MEM_MODE` is what the BOOT pins set and what firmware
+    // moves afterwards, and moving it has to move the memory: the reason a
+    // bootloader writes this register is to run a vector table out of SRAM.
+    //
+    // The board comes up at `MEM_MODE = 00`, so zero is the flash.
+    let m = boot();
+    let flash_word = peek(&m, 0x0800_0000);
+    assert_eq!(
+        peek(&m, 0),
+        flash_word,
+        "the alias is the flash out of reset"
+    );
+
+    store(&m, SRAM1 + 0x40, 0xcafe_f00d);
+    assert_ne!(peek(&m, 0x40), 0xcafe_f00d, "SRAM is not at zero yet");
+
+    // `MEM_MODE = 11`: embedded SRAM at 0x00000000 (RM0090 §9.2.1).
+    store(&m, SYSCFG, 0b11);
+    assert_eq!(peek(&m, SYSCFG) & 0b11, 0b11);
+    assert_eq!(
+        peek(&m, 0x40),
+        0xcafe_f00d,
+        "MEMRMP selected SRAM and 0x00000000 still reads the flash"
+    );
+
+    // The same memory, not a copy: a store through the alias lands in SRAM1.
+    store(&m, 0x44, 0x1234_5678);
+    assert_eq!(peek(&m, SRAM1 + 0x44), 0x1234_5678);
+
+    // And back. `MEM_MODE = 01` is the system bootloader, which the part has
+    // and this board does not model, so it faults rather than aliasing the
+    // flash a second time.
+    store(&m, SYSCFG, 0b00);
+    assert_eq!(peek(&m, 0), flash_word);
+    store(&m, SYSCFG, 0b01);
+    assert!(
+        m.space("mem")
+            .expect("the memory space")
+            .read(0, Width::U32, MemAttrs::DEBUG)
+            .is_err(),
+        "the system-bootloader encoding aliased something this board does not have"
+    );
+}
