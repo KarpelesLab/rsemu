@@ -1,0 +1,76 @@
+# stm32f4-sdio — an SDIO controller, a DMA2, and a card, with a hart to drive
+# them.
+#
+# Not a part. It is the smallest board on which the thing `tests/stm32_sdio.rs`
+# has to prove can happen: a **program** sets `DCTRL.DMAEN`, arms a DMA2 stream
+# at the SDIO's FIFO, sends `CMD17`, and a block of the card arrives in RAM with
+# the guest touching neither the FIFO nor the data. Everything between the two
+# peripherals is the request line, on the scheduler's own timeline.
+#
+# `machines/stm32f407.machine` has the same pair at their real addresses with
+# their real vector and their real Table 43 stream, and is the board a person
+# would use. This one exists because *that* one needs a Cortex-M4 and a vector
+# table and a Thumb-2 program to say anything, and none of that is what is under
+# test here — the register block does not know or care what is fetching from it.
+# `tests/stm32_sdmmc.rs` makes the same choice for the same reason.
+#
+# Sources: ST **RM0090** §31 for the SDIO, §10 for the DMA, Table 1 for the two
+# addresses, which are the part's own. The RISC-V hart is not from ST and is not
+# pretending to be.
+
+machine "stm32f4-sdio-test" {
+  # Which named card socket the controller and the card meet in, so two of these
+  # can run in one process without swapping cards.
+  param slot = "sd0"
+
+  osc sysclk = 100000000 Hz
+
+  # The DMA's own domain: one tick is one beat, so a transfer takes bus time
+  # instead of finishing inside the store that arms it. Four beats per hart
+  # instruction is fast enough that a 128-word block lands inside a millisecond
+  # of virtual time and slow enough that the firmware's wait loop really waits.
+  osc dmaclk = 25000000 Hz
+
+  space mem { width = 32 }
+
+  object cpu "cpu.riscv" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    xlen   = "rv32"
+    isa    = "ima"
+    hartid = 0
+    reset  = 0x00000000
+  }
+
+  object fw   "rom" { size = 64K, image = "firmware" }
+  object dram "ram" { size = 1M }
+
+  # An 8 MiB high-capacity card, exact in its CSD encoding.
+  object card "sd.card" {
+    size          = 8M
+    high-capacity = true
+    slot          = slot
+    image         = "card"
+  }
+
+  # The older SD host: RM0090 §31, not the H7's SDMMC. It takes no `space`,
+  # because it is not a bus master — that is the whole difference, and it is why
+  # there is a second object below.
+  object sdio "stm32.sdio" { slot = slot }
+
+  # DMA2 in the stream face. It masters `mem`, which is how it reaches both the
+  # SDIO's FIFO and the guest's RAM.
+  object dma2 "st.dma" { clock = dmaclk, space = mem, variant = "stream" }
+
+  map mem 0x00000000 size 64K  = fw
+  map mem 0x20000000 size 1M   = dram
+  map mem 0x40012c00 size 1K   = sdio
+  map mem 0x40026400 size 0xd0 = dma2
+
+  # The seam. RM0090 Table 43 puts SDIO on DMA2 channel 4, streams 3 and 6; the
+  # firmware arms stream 3. `CHSEL` is stored and not acted on, so this wire is
+  # what selects the stream — which is the point: the request matrix is a fact
+  # about the part and lives in a board file.
+  wire sdio.dma -> dma2.req3
+}
