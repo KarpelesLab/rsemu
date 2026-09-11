@@ -1499,9 +1499,10 @@ impl IrHost for Host<'_, '_> {
     }
 
     fn charge(&mut self, ticks: u64) {
-        for _ in 0..ticks {
-            self.exec.charge();
-        }
+        // One call rather than a loop over `Exec::charge`: every addition in
+        // it is unconditional, so `ticks` of them is one of them scaled.
+        // `cpu::x86::engine` already does this and says why.
+        self.exec.charge_n(ticks);
     }
 
     fn insn_start(&mut self, mark: &InsnStart) {
