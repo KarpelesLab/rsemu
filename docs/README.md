@@ -193,6 +193,7 @@ would answer that the machine file does not.
 | [`devices/interrupts-timers.md`](devices/interrupts-timers.md) | 8259, APIC/IOAPIC, PIT, HPET, RTC, PLIC/CLINT |
 | [`devices/video-audio.md`](devices/video-audio.md) | VGA/VBE, framebuffers, sound hardware |
 | [`devices/network-input.md`](devices/network-input.md) | NIC models, PS/2, HID |
+| [`devices/stm32-clock-power.md`](devices/stm32-clock-power.md) | STM32 RCC and PWR: the ready bits, the clock tree, the peripheral gates, `DBP` |
 
 ### System software interfaces
 | | |

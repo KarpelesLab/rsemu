@@ -1205,6 +1205,33 @@ cpu-arm-v7m = []
 # no dependencies.
 dev-stm32 = []
 
+# The STM32 reset and clock controller (src/dev/stm32/rcc.rs): the chip every
+# vendor startup sequence talks to first, and the one a board cannot fake with
+# RAM. `SystemInit` sets CR.HSEON and spins on HSERDY, sets PLLON and spins on
+# PLLRDY, writes CFGR.SW and spins until SWS agrees -- a RAM window answers none
+# of those, so the spin is infinite. This class answers them: every xxxON grows
+# its xxxRDY after a configurable number of ticks of the device's own clock
+# domain (it is lazily advanced, so the guest's poll is what catches it up and
+# nothing reads the host clock), SW is refused outright when the source it names
+# is not ready, and SYSCLK/HCLK/PCLK1/PCLK2/the timer clocks/RTCCLK are computed
+# as **exact rationals** from the PLL factors and the prescalers and published
+# through an `ExportId::CLOCK_TREE` handle. Every xxENR and xxRSTR bit is an
+# output pin, so a peripheral can be told it has no clock and can be reset by
+# its own xxRST bit. `BDCR` is write-protected until `PWR_CR.DBP` arrives on the
+# `dbp` input. Both the F4 (RM0090 §7) and L4 (RM0351 §6) layouts, selected by a
+# construction property. `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-rcc = []
+
+# The STM32 power controller (src/dev/stm32/pwr.rs): DBP, which is what opens
+# the RCC's backup domain and reaches it as a wire rather than a handle because
+# that is what it is on the die; the voltage-scaling ready flag, which an F4
+# reports as CSR.VOSRDY going *set* and an L4 as SR2.VOSF going *clear*; and the
+# F42x/F43x over-drive's ODEN/ODSWEN with their ODRDY/ODSWRDY. Lazily advanced
+# like the RCC, so a regulator transition costs virtual time and no host time.
+# Four layouts -- f4, f42x, l4, l4plus -- from RM0090 §5 and RM0351 §5.
+# `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-pwr = []
+
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4 at 168 MHz, 1 MiB of flash aliased at zero, the three
 # SRAM banks, five GPIO ports and USART2 on the terminal. The first M-profile
@@ -1212,7 +1239,14 @@ dev-stm32 = []
 # interrupt on a core whose NVIC is inside it" -- `wire usart2.irq -> cpu.irq38`,
 # with the number coming from RM0090 Table 62 and living in this file rather
 # than in any device model. Adds no dependencies.
-machine-stm32f407 = ["cpu-arm-v7m", "dev-stm32", "dev-stm32-i2c", "dev-at24c"]
+machine-stm32f407 = [
+    "cpu-arm-v7m",
+    "dev-stm32",
+    "dev-stm32-i2c",
+    "dev-stm32-rcc",
+    "dev-stm32-pwr",
+    "dev-at24c",
+]
 
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the
 # base, CB, ED, DD/FD and DDCB/FDCB pages, the undocumented IX/IY halves, SLL

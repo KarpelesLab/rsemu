@@ -13,6 +13,8 @@
 //! | [`sdmmc`] | `st.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
 //! | [`spi`] | `st.spi` | the F4 family's SPI/I2S master, RM0090 §28 |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
+//! | [`rcc`] | `st.rcc` | the reset and clock controller: ready bits, the PLL and prescaler tree, the peripheral gates, the backup domain |
+//! | [`pwr`] | `st.pwr` | the power controller: `DBP`, voltage scaling and the F42x over-drive |
 //!
 //! # Which part
 //!
@@ -61,12 +63,24 @@ pub mod spi;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-octospi")))]
 pub mod octospi;
 
+#[cfg(feature = "dev-stm32-rcc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-rcc")))]
+pub mod rcc;
+
+#[cfg(feature = "dev-stm32-pwr")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-pwr")))]
+pub mod pwr;
+
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
 pub mod demo;
 
 #[cfg(feature = "dev-stm32-octospi")]
 pub use octospi::Octospi;
+#[cfg(feature = "dev-stm32-pwr")]
+pub use pwr::Pwr;
+#[cfg(feature = "dev-stm32-rcc")]
+pub use rcc::{ClockOutput, Clocks, Rcc};
 #[cfg(feature = "dev-stm32-spi")]
 pub use spi::Stm32Spi;
 
@@ -93,6 +107,10 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     spi::register(registry)?;
     #[cfg(feature = "dev-stm32-octospi")]
     octospi::register(registry)?;
+    #[cfg(feature = "dev-stm32-rcc")]
+    rcc::register(registry)?;
+    #[cfg(feature = "dev-stm32-pwr")]
+    pwr::register(registry)?;
     Ok(())
 }
 
@@ -114,13 +132,20 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     spi::bind(bindings)?;
     #[cfg(feature = "dev-stm32-octospi")]
     octospi::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-rcc")]
+    rcc::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-pwr")]
+    pwr::bind(bindings)?;
     Ok(())
 }
 
 /// Every class's validator schema.
+// Every line of the body is feature-gated, so which of them is the first --
+// and whether any survives at all -- depends on the build. Both lints are
+// about code a human wrote in one piece, and this is not that.
+#[allow(unused_mut, clippy::vec_init_then_push)]
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
-    #[allow(unused_mut)]
     let mut out: Vec<ClassSchema> = alloc::vec![];
     #[cfg(feature = "dev-stm32")]
     out.extend([gpio::schema(), usart::schema()]);
@@ -132,5 +157,9 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(spi::schema());
     #[cfg(feature = "dev-stm32-octospi")]
     out.push(octospi::schema());
+    #[cfg(feature = "dev-stm32-rcc")]
+    out.push(rcc::schema());
+    #[cfg(feature = "dev-stm32-pwr")]
+    out.push(pwr::schema());
     out
 }
