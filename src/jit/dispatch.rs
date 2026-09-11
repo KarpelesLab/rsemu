@@ -1177,7 +1177,6 @@ mod tests {
     use super::*;
     use crate::core::error::BusError;
     use crate::core::space::MemResult;
-    use crate::core::value::Width;
     use crate::ir::{BlockBuilder, Const, InsnStart, MemOp, Type};
     use alloc::vec;
 
@@ -1865,6 +1864,15 @@ mod tests {
     /// The store is what a self-modifying guest does: it goes through
     /// [`IrHost::store`], the test host records the page, and the dispatcher
     /// drains it at the boundary.
+    // Only the backend-gated chaining tests construct these, so they carry the
+    // same gate: a build with no host code generator compiles them unused, and
+    // `-D warnings` makes that an error. Found by the feature sweep on
+    // `--features jit` alone, which is the only configuration that has a
+    // dispatcher and no backend.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     fn writer(pc: u64, next: u64, store_at: u64) -> Block {
         let mut b = BlockBuilder::new(pc, 0);
         b.insn_start(InsnStart {
@@ -1876,7 +1884,12 @@ mod tests {
         b.charge(1);
         let addr = b.imm(Type::I64, Const::Int(u128::from(store_at)));
         let value = b.imm(Type::I64, Const::Int(0));
-        b.store(Type::I64, addr, value, MemOp::store(Width::U8));
+        b.store(
+            Type::I64,
+            addr,
+            value,
+            MemOp::store(crate::core::value::Width::U8),
+        );
         let t = b.imm(Type::I64, Const::Int(u128::from(next)));
         b.insn_start(InsnStart {
             pc: next,
@@ -1895,10 +1908,28 @@ mod tests {
     /// A self-modifying guest, in the shape that matters to a link: the
     /// successor is invalidated by the predecessor, between the predecessor's
     /// last instruction and the jump that would have entered it.
+    // Only the backend-gated chaining tests construct these, so they carry the
+    // same gate: a build with no host code generator compiles them unused, and
+    // `-D warnings` makes that an error. Found by the feature sweep on
+    // `--features jit` alone, which is the only configuration that has a
+    // dispatcher and no backend.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     struct Writer {
         translated: usize,
     }
 
+    // Only the backend-gated chaining tests construct these, so they carry the
+    // same gate: a build with no host code generator compiles them unused, and
+    // `-D warnings` makes that an error. Found by the feature sweep on
+    // `--features jit` alone, which is the only configuration that has a
+    // dispatcher and no backend.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
     impl<H: ?Sized> Frontend<H> for Writer {
         fn epoch(&mut self) -> Epoch {
             Epoch::default()
