@@ -20,6 +20,7 @@
 //! | `wire` | interrupt and GPIO lines (§4.3) |
 //! | `device` | the device trait, lifecycle, composition (§4.4) |
 //! | `props` | dynamic property values and typed extraction (§4.4) |
+//! | [`rand`] | the seeded stream a device draws "random" bytes from, and how a board's one seed becomes a stream per instance |
 //! | [`record`] | the record/replay seam: non-deterministic input, timestamped (§4.5) |
 //! | `registry` | by-name device construction (§4.4) |
 //! | `state` | versioned snapshots (§4.5) |
@@ -39,6 +40,7 @@ pub mod error;
 pub mod exec;
 pub mod hosts;
 pub mod props;
+pub mod rand;
 pub mod record;
 pub mod registry;
 pub mod sched;

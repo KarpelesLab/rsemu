@@ -1378,6 +1378,28 @@ dev-stm32-rcc = []
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-pwr = []
 
+# The STM32 random number generator (src/dev/stm32/rng.rs): one class, `st.rng`,
+# three registers -- CR, SR, DR -- and the determinism problem behind them.
+# Firmware enables the block, polls SR.DRDY and reads DR, which is what an
+# mbedTLS or lwIP port does on its first handshake, so a part without it is a
+# spin that never ends. The numbers do **not** come from the host: they come
+# from `core::rand`'s seeded SplitMix64, started from the board's `seed`
+# property mixed with this instance's path, so a machine run twice deals the
+# same words and a board with two blocks on it does not deal the same words
+# twice. The stream's position is in the snapshot, or a restore replays numbers
+# the guest has already had. DR is the sharpest case of ROADMAP.md S15's
+# invariant 5 in the tree: the word is drawn when DRDY sets rather than when DR
+# is read, so a debugger's memory window can show it without taking it away
+# from the guest. Both error paths are modelled because drivers check them --
+# `fault = "seed"` sets SECS/SEIS and halts until SEIS is cleared *and* RNGEN
+# toggled, `fault = "clock"` sets CECS/CEIS and keeps producing, and `ced =
+# true` gives the L4+/G0/G4/H7/WB part's CR.CED, which switches clock error
+# detection off. Lazily advanced on its own clock domain, so a word costs
+# virtual time and no host time. Written from ST RM0090 S24 and ST RM0351 S26;
+# no emulator source was consulted (ROADMAP.md S1). `no_std + alloc`, no
+# `unsafe`, no dependencies.
+dev-stm32-rng = []
+
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4F at 168 MHz, 1 MiB of flash aliased at zero, the three
 # SRAM banks, six GPIO ports, USART2 on the terminal, the clock and power
@@ -1406,6 +1428,7 @@ machine-stm32f407 = [
     "dev-stm32-wdg",
     "dev-stm32-flash",
     "dev-stm32-rtc",
+    "dev-stm32-rng",
     "dev-at24c",
 ]
 

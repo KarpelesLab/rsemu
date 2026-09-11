@@ -270,9 +270,9 @@ fn store(m: &Machine, addr: u64, value: u64) {
 fn every_peripheral_the_part_has_is_on_the_board() {
     let m = boot();
     for path in [
-        "rcc", "pwr", "crc", "iwdg", "wwdg", "exti", "syscfg", "dma1", "dma2", "tim1", "tim2",
-        "tim3", "tim4", "tim5", "tim6", "tim7", "tim8", "tim9", "tim10", "tim11", "tim12", "tim13",
-        "tim14",
+        "rcc", "pwr", "crc", "rng", "iwdg", "wwdg", "exti", "syscfg", "dma1", "dma2", "tim1",
+        "tim2", "tim3", "tim4", "tim5", "tim6", "tim7", "tim8", "tim9", "tim10", "tim11", "tim12",
+        "tim13", "tim14",
     ] {
         assert!(
             m.device(path).is_some(),
@@ -300,6 +300,7 @@ fn the_register_blocks_decode_where_rm0090_table_1_puts_them() {
         ("tim9", 0x4001_4000),
         ("iwdg", 0x4000_3000),
         ("wwdg", 0x4000_2c00),
+        ("rng", 0x5006_0800),
     ] {
         assert!(
             m.space("mem")

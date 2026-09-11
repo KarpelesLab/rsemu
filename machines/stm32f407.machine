@@ -11,7 +11,8 @@
 #
 # Sources: ST **RM0090** rev 21 (reference manual for STM32F405/415, F407/417,
 # F427/437 and F429/439) — §2.3 for the memory map, §7 for the reset and clock
-# tree, §8 for the GPIOs, §30 for the USART, and Table 62 for the vector table.
+# tree, §8 for the GPIOs, §24 for the RNG, §30 for the USART, and Table 62 for
+# the vector table.
 # ST **DS8626** rev 9 (the F407VG datasheet) for what the LQFP100 bonds and for
 # the alternate-function table. The ARMv7-M Architecture Reference Manual, ARM
 # DDI 0403, for the core. No emulator source of any licence was consulted
@@ -170,6 +171,7 @@ machine "stm32f407" {
   param apb1-base   = 0x40000000
   param apb2-base   = 0x40010000
   param ahb1-base   = 0x40020000
+  param ahb2-base   = 0x50000000   # USB OTG FS, DCMI, CRYP/HASH and the RNG
 
   # Peripheral offsets from their bus's base. An STM32 peripheral is allotted a
   # kilobyte, so the GPIO ports are 0x400 apart and the arithmetic below says so
@@ -188,6 +190,17 @@ machine "stm32f407" {
   param rtc-off     = 0x2800       # APB1 + 0x2800
   param dma-off     = 0x6000       # AHB1 + 0x6000, and DMA2 a kilobyte above
   param dma-stride  = 0x400
+  param rng-off     = 0x60800      # AHB2 + 0x60800, above CRYP and HASH
+
+  # The one number this board hands to anything that needs "random" bytes.
+  #
+  # It is written **here** for the reason the RTC's `epoch` is: a value taken
+  # from the host replays differently every run and the machine's state hash
+  # would mean nothing (ROADMAP.md §0). One number covers the board because
+  # `st.rng` mixes its own instance path into it, so two blocks would not share
+  # a stream even though they share this line -- and `rsemu run stm32f407 -p
+  # seed=7` reshuffles the whole board without editing anything.
+  param seed        = 1
 
   # The timers come in three runs of *consecutive* kilobytes, so one stride and
   # three bases place all fourteen: TIM2-TIM7 and then TIM12-TIM14 from the
@@ -420,6 +433,32 @@ machine "stm32f407" {
   # it is a property and not an assumption.
   object crc "st.crc" { variant = "f4" }
 
+  # -- the random number generator -------------------------------------------
+  #
+  # An F405/407 has one (an F401 or an F411 does not), on AHB2 above CRYP and
+  # HASH -- which this part does not carry; the F415/417 do. RM0090 §24.
+  #
+  # `clock = hse * 6` is the 48 MHz PLL48CLK the RNG runs off, written as a
+  # ratio of the crystal for the reason every other clock here is: it stays
+  # exact. `latency` is left at its default of 40, which is the manual's figure
+  # for the periods of RNG_CLK between two consecutive numbers, so a word costs
+  # 833 ns of virtual time rather than being free.
+  #
+  # `ced` is absent because an F4's `CR` has no such bit -- clock error
+  # detection disable arrived with the L4 -- and `fault` is absent because the
+  # block works. Both exist so that a driver's error path can be exercised by a
+  # board that asks for it; see `src/dev/stm32/rng.rs`.
+  #
+  # The seed is the board's, and what the device actually draws from is that
+  # number mixed with the object name below. Which is to say: **this is not an
+  # entropy source.** The same board deals the same numbers every run, on
+  # purpose, and firmware that needs unpredictable bytes must not ask an
+  # emulator for them.
+  object rng "st.rng" {
+    clock = hse * 6
+    seed  = seed
+  }
+
   # -- the watchdogs ---------------------------------------------------------
   #
   # The independent one counts the LSI and `window = false` because an F4 has no
@@ -547,6 +586,11 @@ machine "stm32f407" {
   map mem ahb1-base + dma-off + dma-stride * 0 size 0xd0 = dma1
   map mem ahb1-base + dma-off + dma-stride * 1 size 0xd0 = dma2
 
+  # AHB2, of which this part populates one kilobyte: the RNG at 0x50060800
+  # (RM0090 Table 1). Twelve bytes are decoded and the rest of the kilobyte is a
+  # hole, as everywhere else here.
+  map mem ahb2-base + rng-off size 0x0c = rng
+
   # -- the same map as a bus master sees it ----------------------------------
   #
   # `dmabus`, which is what `dma1` and `dma2` transfer across. It is `mem`
@@ -591,6 +635,10 @@ machine "stm32f407" {
   map dmabus ahb1-base + gpio-stride * 7 size 0x28 = gpioh
   map dmabus ahb1-base + crc-off size 0x0c = crc
   map dmabus ahb1-base + rcc-off size 0x90 = rcc
+  # The RNG is on AHB2 and a DMA controller does reach it — RNG_DR is a DMA
+  # source on the real part, which is how a driver fills a buffer without
+  # polling — so it is in this view too.
+  map dmabus ahb2-base + rng-off size 0x0c = rng
 
   # -- interrupts ------------------------------------------------------------
   #
@@ -704,6 +752,15 @@ machine "stm32f407" {
   wire dma2.irq7 -> cpu.irq70    # DMA2_Stream7
 
   wire usart2.irq -> cpu.irq38    # USART2 (USART1 is 37, USART3 39)
+
+  # RM0090 Table 62 calls position **80** `HASH_RNG`: "Hash and Rng global
+  # interrupt", vector address 0x0000_0180. The two cross-check — an external
+  # interrupt *n* is exception *n + 16*, so 80 is exception 96 and its vector is
+  # at 4 * 96 = 0x180, which is what the table prints. It is a *shared* vector:
+  # on an F415/417 the hash processor drives the same line, and firmware written
+  # for one of those reads both status registers in the handler. This part has
+  # no CRYP or HASH, so the RNG has it to itself.
+  wire rng.irq -> cpu.irq80       # HASH_RNG
 
   # -- resets ----------------------------------------------------------------
   #
