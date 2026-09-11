@@ -38,13 +38,33 @@
 //! rounded `f64`, because a ratio inside one oscillator's tree is exact by
 //! construction (`CLAUDE.md`, *Determinism*).
 //!
-//! **What this does not yet do is re-rate the scheduler's clock domains.**
-//! `core::clock` can do it — `ClockForest::set_rating` is right there — but no
-//! seam reaches it from a device: `RealizeCtx` and `BindCtx` hand out a
-//! `DomainId` and no forest. So a peripheral that wants to follow `PCLK1`
-//! reads the rate out of [`Clocks`] and scales its own arithmetic; the day a
-//! clock-control seam lands, this device is the one that drives it, and
-//! nothing in the interface below has to change.
+//! **And it re-rates the scheduler's clock domains.** A board that says
+//!
+//! ```text
+//! osc hse = 8000000 Hz
+//! object sysclk "clock" { clock = hse * 2 }      # the reset rate: HSI, 16 MHz
+//! object hclk   "clock" { clock = sysclk }
+//! object pclk1  "clock" { clock = hclk / 4 }
+//! object pclk2  "clock" { clock = hclk / 2 }
+//! object rcc "st.rcc" {
+//!   clock = hse, variant = "f4", hse = 8000000,
+//!   sysclk = "sysclk", hclk = "hclk", pclk1 = "pclk1", pclk2 = "pclk2"
+//! }   # and `timclk1`/`timclk2` for what the timers count
+//! ```
+//!
+//! gets a `SYSCLK` that really is 168 MHz once the guest's `SystemInit` has
+//! run, and peripherals hung off `pclk1` that really do follow `PPRE1`. The
+//! request goes through [`crate::core::clock::ClockControl`] and
+//! is applied by the scheduler at a round boundary, never mid-round; that type
+//! documents the rule and what becomes of the ticks already counted. An output
+//! no board named drives nothing, which is every board that has not been
+//! rewritten to the shape above — they keep the fixed ratios their machine file
+//! declares, and [`Clocks`] is still the way a peripheral reads a rate.
+//!
+//! `drive_domains` has the two deviations this bakes in: a rating is measured
+//! against the domain's parent, so HSI and the PLL are modelled as exact ratios
+//! of the HSE crystal rather than as independent cans, and an output of zero
+//! leaves its domain where it was rather than stopping it.
 //!
 //! # Sources
 //!
@@ -77,7 +97,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::clock::Rational;
+use crate::core::clock::{ClockControl, DomainId, Rational};
 use crate::core::device::{
     Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
@@ -190,6 +210,33 @@ impl fmt::Display for ClockOutput {
     }
 }
 
+/// The clock outputs a machine file may hand `st.rcc` a domain for, each with
+/// the output it hangs off — RM0090 §7.2's tree, in the order it is walked.
+///
+/// A property of this name takes the *object* whose clock domain is that
+/// output; `None` for a parent means the crystal itself, which is the `hse`
+/// property. Declaration order is top-down, so a single pass over it rates
+/// every output against something already settled.
+pub const OUTPUT_TREE: &[(ClockOutput, &str)] = &[
+    (ClockOutput::SYSCLK, "sysclk"),
+    (ClockOutput::HCLK, "hclk"),
+    (ClockOutput::PCLK1, "pclk1"),
+    (ClockOutput::PCLK2, "pclk2"),
+    (ClockOutput::TIMCLK1, "timclk1"),
+    (ClockOutput::TIMCLK2, "timclk2"),
+];
+
+/// Which output `out` hangs off, or `None` when it hangs off the crystal.
+fn parent_output(out: ClockOutput) -> Option<ClockOutput> {
+    Some(match out {
+        ClockOutput::HCLK => ClockOutput::SYSCLK,
+        ClockOutput::PCLK1 | ClockOutput::PCLK2 => ClockOutput::HCLK,
+        ClockOutput::TIMCLK1 => ClockOutput::PCLK1,
+        ClockOutput::TIMCLK2 => ClockOutput::PCLK2,
+        _ => return None,
+    })
+}
+
 /// The rates an `st.rcc` is driving, as a consumer sees them.
 ///
 /// Published as [`ExportId::CLOCK_TREE`]. A peripheral holds one of these from
@@ -236,17 +283,21 @@ impl Clocks {
     }
 
     /// Publish a recomputed table, bumping the generation if anything moved.
-    fn publish(&self, next: [Rational; ClockOutput::COUNT]) {
+    ///
+    /// Returns whether anything did, so a caller with more to do about a change
+    /// — re-rating the scheduler's domains — does it only when there is one.
+    fn publish(&self, next: [Rational; ClockOutput::COUNT]) -> bool {
         {
             let mut rates = self.rates.lock();
             if *rates == next {
-                return;
+                return false;
             }
             *rates = next;
         }
         // Release, so a consumer that reads the generation and then the rates
         // cannot see the new number with the old table.
         self.generation.fetch_add(1, Ordering::Release);
+        true
     }
 }
 
@@ -853,6 +904,14 @@ struct Registers {
     tick: AtomicU64,
     next_event: AtomicU64,
     lazy: Mutex<Option<LazyHandle>>,
+    /// Which object the machine file named for each driven clock output, in
+    /// the order the chain is measured in. Wiring, fixed at construction.
+    named: Vec<(ClockOutput, String)>,
+    /// The domains those names resolved to, filled in at bind.
+    domains: Mutex<Vec<(ClockOutput, DomainId)>>,
+    /// The clock-control seam, or `None` for an instance nobody registered —
+    /// a unit test holding the device directly.
+    control: Mutex<Option<Arc<ClockControl>>>,
 }
 
 impl fmt::Debug for Registers {
@@ -1143,7 +1202,91 @@ impl Registers {
             let state = self.state.lock();
             self.rates(&state)
         };
-        self.clocks.publish(next);
+        if self.clocks.publish(next) {
+            self.drive_domains(&next);
+        }
+    }
+
+    /// Ask the scheduler to re-rate whichever clock domains this controller was
+    /// told are its outputs.
+    ///
+    /// # What a rating is measured against
+    ///
+    /// A [`ClockForest`](crate::core::clock::ClockForest) domain is rated
+    /// against its **parent**, so a request is a ratio and never a frequency.
+    /// The tree the machine file is expected to have built is the one RM0090
+    /// §7.2 draws, and [`OUTPUT_TREE`] is that shape written down: `SYSCLK` off
+    /// the crystal, `HCLK` off `SYSCLK`, `PCLK1` and `PCLK2` off `HCLK`, and
+    /// each timer clock off its own APB clock. Every output is rated against
+    /// the **nearest ancestor this instance was actually given**, falling all
+    /// the way back to the `hse` reference: a board that names only `pclk1`
+    /// gets `pclk1 / hse`, which is right if that is how it wired the domain
+    /// and wrong if it did not.
+    ///
+    /// `timclk1`/`timclk2` are outputs of their own rather than a `× 2` a board
+    /// could write itself, because the doubling is conditional — RM0090 §7.2:
+    /// "if the APB prescaler is 1 the timer clock is PCLKx, else 2 × PCLKx" —
+    /// and a machine file that froze either answer would be wrong half the
+    /// time.
+    ///
+    /// **`hse` is the reference, and it has to be the truth.** The property
+    /// already has to agree with the board's `osc hse` — `stm32f407.machine`
+    /// says so at the point it writes the number twice — and this is the second
+    /// thing that depends on it.
+    ///
+    /// # The deviation this bakes in
+    ///
+    /// An output expressed as a ratio of the domain's parent cannot say *which*
+    /// crystal it came from. A board with one high-speed oscillator therefore
+    /// models HSI and the PLL as exact ratios of HSE: the rate a guest measures
+    /// is exactly right, and the physical independence of the two cans is not
+    /// modelled. Saying it properly needs a reparent across trees at the moment
+    /// `SWS` changes, which is a bigger seam than this one and is not here.
+    ///
+    /// An output of zero — its source is stopped, or `SWS` names something that
+    /// is not running — leaves its domain at the rate it had rather than
+    /// stopping it. Stopping a domain is
+    /// [`ClockForest::set_gated`](crate::core::clock::ClockForest::set_gated)'s
+    /// business and belongs with the peripheral clock-enable half of the
+    /// problem, not here.
+    fn drive_domains(&self, rates: &[Rational; ClockOutput::COUNT]) {
+        let control = self.control.lock().clone();
+        let Some(control) = control else { return };
+        let outputs = self.domains.lock().clone();
+        if outputs.is_empty() {
+            return;
+        }
+        let reference = Rational::integer(self.freq.hse);
+        if reference.is_zero() {
+            return;
+        }
+        for (out, _) in OUTPUT_TREE {
+            let Some(domain) = outputs.iter().find(|(o, _)| o == out).map(|(_, d)| *d) else {
+                continue;
+            };
+            let hz = rates[usize::from(out.0)];
+            if hz.is_zero() {
+                continue;
+            }
+            // Up the tree until something this instance drives is found: that
+            // domain is the parent the machine file must have given it, so that
+            // is what the ratio is against.
+            let mut against = reference;
+            let mut cursor = *out;
+            while let Some(parent) = parent_output(cursor) {
+                if outputs.iter().any(|(o, _)| *o == parent) {
+                    against = rates[usize::from(parent.0)];
+                    break;
+                }
+                cursor = parent;
+            }
+            if against.is_zero() {
+                continue;
+            }
+            if let Some(ratio) = hz.checked_div(against) {
+                control.request_ratio(domain, ratio);
+            }
+        }
     }
 
     // -- the gate outputs --------------------------------------------------
@@ -1476,13 +1619,35 @@ impl Rcc {
             lsi: r.or("lsi", defaults.lsi)?,
         };
         let ready_delay = r.or("ready-delay", DEFAULT_READY_DELAY)?;
+        let mut named: Vec<(ClockOutput, String)> = Vec::new();
+        for (out, prop) in OUTPUT_TREE {
+            if let Some(name) = r.optional_str(prop)? {
+                named.push((*out, String::from(name)));
+            }
+        }
         r.finish()?;
-        Ok(Rcc::with_config(variant, freq, ready_delay))
+        Ok(Rcc::with_outputs(variant, freq, ready_delay, named))
     }
 
     /// Build one directly — the route a test takes.
     #[must_use]
     pub fn with_config(variant: Variant, freq: Frequencies, ready_delay: u64) -> Rcc {
+        Rcc::with_outputs(variant, freq, ready_delay, Vec::new())
+    }
+
+    /// Build one that drives clock domains, naming the object behind each
+    /// output.
+    ///
+    /// The names are resolved against the machine's objects at bind time; an
+    /// output nobody named drives nothing. See `drive_domains` for what a
+    /// rating is measured against.
+    #[must_use]
+    pub fn with_outputs(
+        variant: Variant,
+        freq: Frequencies,
+        ready_delay: u64,
+        named: Vec<(ClockOutput, String)>,
+    ) -> Rcc {
         let layout = variant.layout();
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::reset(layout)),
@@ -1497,6 +1662,9 @@ impl Rcc {
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
+            named,
+            domains: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+            control: Mutex::with_rank(LockRank::LEAF, None),
         });
         regs.recompute();
         let region = Arc::new(Region::io(
@@ -1738,9 +1906,38 @@ impl Device for Rcc {
     fn attach_lazy(&self, handle: LazyHandle) {
         *self.regs.lazy.lock() = Some(handle);
     }
+
+    fn attach_clock_control(&self, control: Arc<ClockControl>) {
+        *self.regs.control.lock() = Some(control);
+        // The rates were computed before this arrived — at construction, and
+        // again at every reset — so the first request has to be made from here
+        // rather than from the next one. Without it a part that comes out of
+        // reset on its internal RC would leave its domains at whatever the
+        // machine file declared until the guest happened to touch `CFGR`.
+        let rates = *self.regs.clocks.rates.lock();
+        self.regs.drive_domains(&rates);
+    }
 }
 
-impl Instance for Rcc {}
+impl Instance for Rcc {
+    fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
+        let mut resolved = Vec::with_capacity(self.regs.named.len());
+        for (out, name) in &self.regs.named {
+            let peer = ctx.peer(name)?;
+            let domain = peer.domain().ok_or_else(|| Error::Config {
+                at: String::from(ctx.path()),
+                message: format!(
+                    "`{out}` names `{name}`, which has no clock domain of its own; give it a \
+                     rate with `clock = …` — an `object {name} \"clock\"` is the usual way to \
+                     say that this is a node of the tree and nothing else"
+                ),
+            })?;
+            resolved.push((*out, domain));
+        }
+        *self.regs.domains.lock() = resolved;
+        Ok(())
+    }
+}
 
 /// The `st.rcc` device class.
 pub static CLASS: DeviceClass = DeviceClass {
@@ -1786,6 +1983,45 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "how many ticks of this device's clock domain an oscillator takes to \
                       become ready (default 16)",
         },
+        PropertySpec {
+            name: "sysclk",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is SYSCLK; it must hang off the `hse` \
+                      crystal, and this controller re-rates it as the registers move",
+        },
+        PropertySpec {
+            name: "hclk",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is HCLK; it must hang off `sysclk`",
+        },
+        PropertySpec {
+            name: "pclk1",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is PCLK1; it must hang off `hclk`",
+        },
+        PropertySpec {
+            name: "pclk2",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is PCLK2; it must hang off `hclk`",
+        },
+        PropertySpec {
+            name: "timclk1",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is what an APB1 timer counts; it must \
+                      hang off `pclk1`, and is PCLK1 doubled unless PPRE1 is one",
+        },
+        PropertySpec {
+            name: "timclk2",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is what an APB2 timer counts; it must \
+                      hang off `pclk2`, and is PCLK2 doubled unless PPRE2 is one",
+        },
     ],
     construct: |props| Ok(Box::new(Rcc::new(props)?)),
 };
@@ -1823,6 +2059,10 @@ pub fn schema() -> ClassSchema {
         .port(RTCEN_PIN, PortDir::Out)
         .port(BDRST_PIN, PortDir::Out)
         .port(DBP_PIN, PortDir::In);
+    // The driven clock outputs, from the one table that says what they are.
+    for (_, prop) in OUTPUT_TREE {
+        schema = schema.prop(PropSchema::new(*prop, ValueKind::Str));
+    }
     // The union of both layouts' pins: a `wire` to one this variant does not
     // have is refused by the device, which is where the variant is known.
     for bank in ALL_BANKS {

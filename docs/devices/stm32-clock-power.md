@@ -166,15 +166,22 @@ or a reset controller drives one; the RCC does not guess.
 
 ## Open
 
-- **Nothing re-rates the scheduler's clock domains.** `ClockForest::set_rating`
-  exists, but no seam reaches it from a device: `RealizeCtx` and `BindCtx` hand
-  out a `DomainId` and no forest. So a peripheral follows `PCLK1` by reading the
-  rate and scaling its own arithmetic, rather than by its scheduler domain
-  changing rate underneath it. When that seam lands, `st.rcc` is what drives it
-  and none of the interfaces above change.
 - **The RCC is told its crystal twice**: once as the `osc` a machine file
   declares and once as this device's `hse`/`lse` properties. Nothing checks that
-  the two agree. The same seam fixes it.
+  the two agree, and `hse` is now load-bearing twice over — it is also the
+  reference every driven clock output's ratio is measured against.
+- **No board in `machines/` names a clock output yet**, so on every shipped
+  board the rates are still fixed at what the machine file declares and only
+  the published [`Clocks`] table moves. Rewriting one is a behavioural change:
+  a part comes out of reset on its internal RC, so a board that hands `SYSCLK`
+  to `st.rcc` runs at 16 MHz until its firmware configures the PLL.
+- **An output of zero does not stop its domain.** `SWS` naming a source that is
+  not running leaves the domain at the rate it had; gating belongs with the
+  peripheral clock-enable half of the problem.
+- **A rating is measured against the domain's parent**, so a controller cannot
+  say *which* crystal an output came from: a board with one high-speed
+  oscillator models HSI and the PLL as exact ratios of HSE. The rate a guest
+  measures is exact; the independence of the two cans is not modelled.
 - The F4 `*LPENR` and L4 `*SMENR` low-power gate registers reset to zero rather
   than to the manual's "every implemented peripheral enabled" constants, which
   were not to hand to check. Nothing in a startup path reads them.

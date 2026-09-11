@@ -664,3 +664,131 @@ fn pwr_dbp_reaches_the_rcc_over_a_wire() {
     poke(&rcc, BDCR, 1);
     assert_eq!(peek(&rcc, BDCR) & 1, 1, "and open once DBP arrives");
 }
+
+// -- the clock-control seam ---------------------------------------------------
+
+/// An instance wired to four fabricated domains, bypassing the machine layer:
+/// `bind` is what fills this in on a real board, and its only input is a
+/// `DomainId` per named output.
+fn driving() -> (Rcc, Arc<ClockControl>) {
+    let rcc = Rcc::with_outputs(
+        Variant::F4,
+        Frequencies::default(),
+        DELAY,
+        alloc::vec![
+            (ClockOutput::SYSCLK, String::from("sysclk")),
+            (ClockOutput::HCLK, String::from("hclk")),
+            (ClockOutput::PCLK1, String::from("pclk1")),
+            (ClockOutput::PCLK2, String::from("pclk2")),
+            (ClockOutput::TIMCLK1, String::from("timclk1")),
+            (ClockOutput::TIMCLK2, String::from("timclk2")),
+        ],
+    );
+    let mut forest = crate::core::clock::ClockForest::new();
+    let hse = forest
+        .add_oscillator("hse", Rational::integer(8_000_000))
+        .expect("a crystal");
+    let sys = forest.add_domain("sysclk", hse, 2, 1).expect("hse * 2");
+    let hclk = forest.add_domain("hclk", sys, 1, 1).expect("sysclk");
+    let pclk1 = forest.add_domain("pclk1", hclk, 1, 4).expect("hclk / 4");
+    let pclk2 = forest.add_domain("pclk2", hclk, 1, 2).expect("hclk / 2");
+    let tim1 = forest
+        .add_domain("timclk1", pclk1, 2, 1)
+        .expect("pclk1 * 2");
+    let tim2 = forest
+        .add_domain("timclk2", pclk2, 2, 1)
+        .expect("pclk2 * 2");
+    *rcc.regs.domains.lock() = alloc::vec![
+        (ClockOutput::SYSCLK, sys),
+        (ClockOutput::HCLK, hclk),
+        (ClockOutput::PCLK1, pclk1),
+        (ClockOutput::PCLK2, pclk2),
+        (ClockOutput::TIMCLK1, tim1),
+        (ClockOutput::TIMCLK2, tim2),
+    ];
+    let control = Arc::new(ClockControl::new());
+    Device::attach_clock_control(&rcc, Arc::clone(&control));
+    (rcc, control)
+}
+
+#[test]
+fn attaching_the_seam_asks_for_the_reset_tree_at_once() {
+    // A part comes out of reset on HSI with every prescaler at one, and a
+    // machine file's declared ratios are not that. Asking only on the next
+    // register write would leave the domains wrong until the guest happened to
+    // touch `CFGR`.
+    let (_rcc, control) = driving();
+    let batch = control.take();
+    assert_eq!(batch.len(), 6, "every named output is asked for");
+    // 16 MHz off an 8 MHz reference, then unity all the way down: HSI, no
+    // prescaling. Domain ids are 1..4 in creation order.
+    assert_eq!(batch[0].ratio(), Rational::integer(2));
+    for r in &batch[1..] {
+        assert_eq!(r.ratio(), Rational::ONE);
+    }
+}
+
+#[test]
+fn the_pll_and_the_prescalers_become_exact_ratios_of_their_parents() {
+    // RM0090 §7.3.2's own worked example: HSE 8 MHz, M=8, N=336, P=2. The
+    // device already computed 168 MHz; what this asserts is what it asks the
+    // forest for, which is a ratio and never a frequency.
+    let (rcc, control) = driving();
+    let _ = control.take();
+
+    poke(&rcc, CR, CR_HSION | CR_HSEON);
+    rcc.advance_to(DELAY + 1);
+    poke(&rcc, PLLCFGR, 8 | (336 << 6) | (1 << 22));
+    poke(&rcc, CR, CR_HSION | CR_HSEON | CR_PLLON);
+    rcc.advance_to(2 * DELAY + 2);
+    // HPRE 1, PPRE1 4, PPRE2 2, SW = PLL.
+    poke(&rcc, CFGR, (5 << 10) | (4 << 13) | 2);
+    rcc.advance_to(2 * DELAY + 4);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(168_000_000)
+    );
+
+    let batch = control.take();
+    let of = |out: ClockOutput| {
+        let domain = rcc
+            .regs
+            .domains
+            .lock()
+            .iter()
+            .find(|(o, _)| *o == out)
+            .map(|(_, d)| *d)
+            .expect("a driven output");
+        batch
+            .iter()
+            .find(|r| r.domain == domain)
+            .expect("a request for it")
+            .ratio()
+    };
+    // SYSCLK against the crystal, HCLK against SYSCLK, and both APB clocks
+    // against HCLK — never against each other, and never against absolute time.
+    assert_eq!(of(ClockOutput::SYSCLK), Rational::integer(21));
+    assert_eq!(of(ClockOutput::HCLK), Rational::ONE);
+    assert_eq!(of(ClockOutput::PCLK1), Rational::new(1, 4).unwrap());
+    assert_eq!(of(ClockOutput::PCLK2), Rational::new(1, 2).unwrap());
+    // "If the APB prescaler is 1 the timer clock is PCLKx, else 2 x PCLKx"
+    // (RM0090 7.2). Both prescalers are above one here, so both timer clocks
+    // are their bus clock doubled — and each is rated against *its own* bus.
+    assert_eq!(of(ClockOutput::TIMCLK1), Rational::integer(2));
+    assert_eq!(of(ClockOutput::TIMCLK2), Rational::integer(2));
+}
+
+#[test]
+fn an_output_nobody_named_is_driven_by_nothing() {
+    // Every board in `machines/` is in this state, and none of them may change
+    // because the seam exists.
+    let rcc = f4();
+    let control = Arc::new(ClockControl::new());
+    Device::attach_clock_control(&rcc, Arc::clone(&control));
+    poke(&rcc, CFGR, 7 << 10);
+    rcc.advance_to(DELAY + 1);
+    assert!(
+        !control.is_pending(),
+        "an unwired controller drives nothing"
+    );
+}
