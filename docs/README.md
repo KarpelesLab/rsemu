@@ -193,6 +193,7 @@ would answer that the machine file does not.
 | [`devices/interrupts-timers.md`](devices/interrupts-timers.md) | 8259, APIC/IOAPIC, PIT, HPET, RTC, PLIC/CLINT |
 | [`devices/video-audio.md`](devices/video-audio.md) | VGA/VBE, framebuffers, sound hardware |
 | [`devices/network-input.md`](devices/network-input.md) | NIC models, PS/2, HID |
+| [`devices/dma.md`](devices/dma.md) | DMA controllers as bus masters, and the peripheral-request seam |
 
 ### System software interfaces
 | | |

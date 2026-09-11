@@ -134,6 +134,7 @@ pub mod sms;
 
 #[cfg(any(
     feature = "dev-stm32",
+    feature = "dev-stm32-dma",
     feature = "dev-stm32-sdmmc",
     feature = "dev-stm32-spi",
     feature = "dev-stm32-octospi",

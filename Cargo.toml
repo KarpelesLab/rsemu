@@ -1205,6 +1205,27 @@ cpu-arm-v7m = []
 # no dependencies.
 dev-stm32 = []
 
+# The STM32 DMA controllers (src/dev/stm32/dma.rs): one transfer engine behind
+# both of the family's register faces, chosen by a `variant` property. "stream"
+# is the F2/F4/F7 controller of RM0090 §10 -- eight streams, LISR/HISR with the
+# flag groups at bits 0/6/16/22, SxCR with DIR/CIRC/PINC/MINC/PSIZE/MSIZE/PL,
+# PINCOS, the DBM/CT double buffer, and SxNDTR/SxPAR/SxM0AR/SxM1AR/SxFCR.
+# "channel" is the F0/F1/F3/L0/L1/L4/G0/G4/WB controller of RM0351 §11 -- seven
+# channels, ISR/IFCR with GIF, CCRx with MEM2MEM, and CSELR. Size conversion
+# follows RM0351 Table 41 (truncate down, zero-extend up), HTIF lands at the
+# midpoint, TCIF at zero, TEIF on a bus fault or an illegal configuration.
+#
+# It is a **bus master**: it needs `space = ...` on its object, and that space
+# is how a board says what its bus matrix reaches (an F4's CCM is not DMA
+# territory). It is also **runnable** -- one tick of its clock domain is one
+# beat -- because a transfer takes bus time and the scheduler owns time, and a
+# peripheral asks for that beat by driving one of the `req0`..`req7` input
+# pins. The stream FIFO, MBURST/PBURST, PFCTRL and the DMAMUX are not modelled;
+# see the module header for exactly what each of those costs. Written from ST
+# RM0090 and RM0351; no emulator source was consulted (ROADMAP.md §1).
+# `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-dma = []
+
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4 at 168 MHz, 1 MiB of flash aliased at zero, the three
 # SRAM banks, five GPIO ports and USART2 on the terminal. The first M-profile
