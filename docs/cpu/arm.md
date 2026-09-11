@@ -12,8 +12,8 @@ Consumed by: `cpu/arm/aprofile` (ARMv5TE today, ARMv6/ARMv7-A later),
 | Arm ARM, ARMv5 and ARMv5TE (DDI 0100) | The **v5 architecture**: A32 and Thumb encodings, the seven modes, the exception model, and part B's CP15 register map, VMSAv5 translation table walk, domain model, access permissions and fault-status encodings | developer.arm.com **[browser]** |
 | ARM926EJ-S TRM (DDI 0198) | The implementation-defined half of the above: the main ID and cache type register values, the c7 `test and clean` behaviour, the TCM status register, and the instruction cycle timings | developer.arm.com **[browser]** |
 | GIC Architecture Specification (IHI 0069) | Generic Interrupt Controller v3/v4 — required by any modern ARM board | `developer.arm.com/documentation/ihi0069/latest/` **[browser]** |
-| Arm ARM for ARMv7-M (DDI 0403) | The **M profile**: T32 only, Handler/Thread modes, the exception model and `EXC_RETURN`, the NVIC/SCB/SysTick/MPU register map at `0xE000E000`, PMSAv7 | `developer.arm.com/documentation/ddi0403/latest/` **[browser]** |
-| Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489) | The implementation-defined values a guest can see: `CPUID`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
+| Arm ARM for ARMv7-M (DDI 0403) | The **M profile**: T32 only, Handler/Thread modes, the exception model and `EXC_RETURN`, the NVIC/SCB/SysTick/MPU register map at `0xE000E000`, PMSAv7, and the **FPv4-SP/FPv5 extension** — A2.5 for `FPSCR` and the data types, A6.4/A7.5 for the encodings, A7.7 for the per-instruction pseudocode, B1.5.7 for `FPCCR`/`FPCAR`/`FPDSCR` and lazy state preservation | `developer.arm.com/documentation/ddi0403/latest/` **[browser]** |
+| Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489) | The implementation-defined values a guest can see: `CPUID`, `MVFR0`/`MVFR1`/`MVFR2`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
 | PrimeCell UART (PL011), TRM DDI 0183 | The UART every ARM virtual board exposes | developer.arm.com **[browser]** |
 
 Arm's site blocks automated fetches but the documents are free to download after
@@ -45,6 +45,18 @@ secondary reference for the exception model.
   A-profile core and nothing else. Its board is
   [`../platforms/stm32f407.md`](../platforms/stm32f407.md), which also records
   how a peripheral raises an interrupt when the NVIC has no wire of its own.
+- **The M profile's FPU is a different shape too.** FPv4-SP/FPv5 is
+  single-precision-only on the parts that matter, `FPSCR` carries the condition
+  flags a `VCMP` writes (A-profile puts them in `PSTATE`), and — the part with
+  no A-profile analogue at all — exception entry can *reserve* the sixteen
+  register slots of the extended frame and write them later, on the first
+  floating-point instruction the handler executes. `FPCCR.LSPEN`/`LSPACT` and
+  `FPCAR` are that mechanism, and firmware's interrupt latency depends on it, so
+  it is modelled rather than collapsed into an eager push. The arithmetic itself
+  is `crate::float`, shared with every other core, because
+  [`ROADMAP.md`](../../ROADMAP.md) §9.1 makes guest floating point
+  bit-reproducible across hosts. `tests/conformance/ledgers/cpu-arm-v7m-fp.txt`
+  is the list of what is deliberately absent.
 - The A64 encoding is regular enough that a generated decoder from the manual's
   encoding tables is straightforward — unlike x86. `cpu/arm/a64/isa.rs` is that
   decoder: one `(mask, bits)` row per instruction, bucketed at compile time on

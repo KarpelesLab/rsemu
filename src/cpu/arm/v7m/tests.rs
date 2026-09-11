@@ -268,9 +268,16 @@ fn the_wide_encodings_decode_to_what_they_say() {
     );
     // A coprocessor encoding is distinct from an undefined one: the fault
     // differs, and firmware reads exactly that bit to find out there is no
-    // FPU.
+    // coprocessor. Fourteen is the debug one, which nothing here implements
+    // whatever features are on; coprocessor ten is the FPU, and where that is
+    // compiled in it decodes to a real instruction instead.
+    let [a, b] = wide(0xee00_0e10);
+    assert!(matches!(decode(a, b), Insn::Coproc { cp: 14 }));
     let [a, b] = wide(0xeeb0_0a40);
+    #[cfg(not(feature = "cpu-arm-v7m-fp"))]
     assert!(matches!(decode(a, b), Insn::Coproc { cp: 10 }));
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    assert!(matches!(decode(a, b), Insn::Fp(_)));
 }
 
 #[test]
@@ -500,8 +507,9 @@ fn a_cortex_m3_has_no_dsp_extension() {
 
 #[test]
 fn a_coprocessor_access_is_nocp_rather_than_undefined() {
-    // `VMOV.F32 s0, s0` — there is no FPU, and firmware distinguishes
-    // "absent" from "not an instruction" by exactly this bit.
+    // `VMOV.F32 s0, s0` on a part with no FPU — firmware distinguishes
+    // "absent" from "not an instruction" by exactly this bit. `Harness::m4`
+    // is a plain Cortex-M4, so this stays true whatever features are on.
     let h = Harness::m4(&wide(0xeeb0_0a40));
     h.cpu.with_sys(|s| s.shcsr |= shcsr::USGFAULTENA);
     h.cpu.step();
@@ -1322,17 +1330,26 @@ fn a_part_without_an_mpu_says_so_and_permits_everything() {
 }
 
 #[test]
-fn the_configuration_never_claims_a_floating_point_unit() {
-    // There is none, so `config()` must not say there is: firmware that
-    // trusted it would take a `NOCP` UsageFault on its first `VMOV`.
+fn the_configuration_never_claims_a_floating_point_unit_it_does_not_have() {
+    // A named part without the option must not grow one, and `config()` must
+    // not say it did: firmware that trusted it would take a `NOCP` UsageFault
+    // on its first `VMOV`. Where `cpu-arm-v7m-fp` is not compiled in, even a
+    // configuration that asks for a unit gets none.
+    assert_eq!(Config::CORTEX_M4.ext.fp, FpUnit::None);
+    assert_eq!(Config::CORTEX_M3.ext.fp, FpUnit::None);
     let cfg = Config {
         ext: Extensions {
-            fp: true,
+            fp: FpUnit::V4Sp,
             ..Config::CORTEX_M4.ext
         },
         ..Config::CORTEX_M4
     };
-    assert!(!ArmV7m::new(cfg).config().ext.fp);
+    let claimed = ArmV7m::new(cfg).config().ext.fp;
+    if cfg!(feature = "cpu-arm-v7m-fp") {
+        assert_eq!(claimed, FpUnit::V4Sp);
+    } else {
+        assert_eq!(claimed, FpUnit::None);
+    }
 }
 
 #[test]

@@ -1,0 +1,112 @@
+# Known gaps: cpu-arm-v7m-fp, the FPv4-SP / FPv5-SP floating-point extension
+# (src/cpu/arm/v7m/fp.rs, fpisa.rs, and the exception-model hooks in exec.rs).
+#
+# Unlike the other files beside this one, this ledger is not keyed by the name
+# of a test in a downloaded suite: there is no permissively licensed VFP
+# conformance corpus to download. What measures this core instead is
+#
+#   * src/cpu/arm/v7m/fptests.rs's LEDGER -- a table of
+#     (operation, operands, FPSCR mode bits) -> (result bits, cumulative
+#     flags), each row worked out from IEEE 754-2019 §5 and DDI 0403E A7.7 and
+#     written down before it was run;
+#   * the same table again through real instructions
+#     (`the_ledger_runs_through_the_interpreter_too`), so an encoding that
+#     reached the wrong helper cannot hide behind a correct helper;
+#   * a differential against `cpu::arm::a64`'s floating-point wrapper, which
+#     was transcribed separately from DDI 0487 and sits on the same
+#     `crate::float`: 7 FPSCR mode settings x 16 x 16 operand pairs across
+#     VADD, VMUL, VDIV, VMAXNM, VMINNM, VSQRT, VRINT and the four-way VCMP,
+#     plus VFMA over four addends -- about 39 000 comparisons, all equal;
+#   * four `clang`-built self-checking programs in the ARMv7E-M corpus
+#     (`fp-arith`, `fp-convert`, `fp-memory`, `fp-exceptions`), 78 checks,
+#     which is where the *encodings* are validated against a real assembler
+#     rather than against this project's own idea of them.
+#
+# Everything below is a deliberate and stated non-implementation. The rule is
+# the same as the other ledgers': **this file only ever shrinks**, a defect
+# never goes in it, and every line says which paragraph of the architecture it
+# is declining and what a guest sees instead.
+#
+# ---------------------------------------------------------------------------
+# 2026-09-11: the initial landing.
+#
+#   * the LEDGER table: 57 of 57 rows match.
+#   * the a64 differential: no divergence.
+#   * the built corpus: 17 of 17 programs pass, four of them floating point.
+# ---------------------------------------------------------------------------
+
+double-precision            # FPv5-D16's F64 arithmetic. `MVFR0.D_Precision`
+                            # reads zero, so the part advertises itself as
+                            # FPv4-SP-D16 / FPv5-SP-D16 -- both of which are
+                            # real configurations -- and every coprocessor 11
+                            # encoding is UNDEFINED, which is what a
+                            # single-precision part does. Firmware built
+                            # `-mfpu=fpv5-d16` traps on its first `VADD.F64`
+                            # rather than computing something wrong.
+                            # DDI 0403E A2.5.2, A7.7.
+
+fpscr.ahp                   # The alternative half-precision format: binary16
+                            # with no infinities and no NaNs, reachable only
+                            # through `VCVTB`/`VCVTT`. RES0 here, so a write
+                            # reads back as zero and a guest can tell. The
+                            # IEEE half conversions (`AHP == 0`) are complete.
+                            # DDI 0403E A2.5.3, A7.7.51.
+
+fpscr.trap-enables          # `IDE`, `IXE`, `UFE`, `OFE`, `DZE`, `IOE`. RES0,
+                            # as on every Cortex-M part: trapped
+                            # floating-point exceptions are not implemented
+                            # and `MVFR0.FP_Exception_Trapping` says so. The
+                            # cumulative bits are what firmware uses.
+                            # DDI 0403E A2.5.3.
+
+fpscr.len-stride-qc         # `Len` and `Stride` are VFPv2 short vectors,
+                            # which no M-profile part has; `QC` needs
+                            # Advanced SIMD, which no M-profile part has
+                            # either. All three RES0.
+
+fpccr.rdy-bits              # `MONRDY`, `BFRDY`, `MMRDY`, `HFRDY` are
+                            # captured at reservation time and read back, but
+                            # nothing consults them: this core performs the
+                            # deferred push synchronously on the instruction
+                            # that triggers it, so a fault on that push is
+                            # reported as an ordinary precise fault from that
+                            # instruction rather than replayed through the
+                            # recorded readiness. `USER` and `THREAD`, which
+                            # decide the *privilege* of the deferred push, are
+                            # honoured. DDI 0403E B1.5.7, B3.2.22.
+
+vmrs-reserved-registers     # `VMRS`/`VMSR` reach `FPSCR` (`reg == 0b0001`),
+                            # and `VMRS` also answers the `MVFR` encodings
+                            # ARMv7-A defines in the same field. Every other
+                            # `reg` value is UNDEFINED rather than a silent
+                            # zero, so firmware probing for `FPSID` or
+                            # `FPEXC` -- neither of which M-profile has --
+                            # finds out. DDI 0403E A7.7.243.
+
+lazy-push-fault-recovery    # If the deferred push faults, `FPCCR.LSPACT` is
+                            # cleared *before* the writes rather than after,
+                            # so the fault is reported once instead of by
+                            # every subsequent floating-point instruction.
+                            # The architecture does not say which, and a
+                            # fault that repeats forever is the worse of the
+                            # two. Stated in `Exec::preserve_fp_state`.
+
+debug-read-resolves-lazy    # A debugger reading `S0`-`S15` through
+                            # `ArmV7m::s` while a lazy push is outstanding
+                            # sees the *architectural* registers, not the
+                            # interrupted context's copy, and does not
+                            # resolve the reservation. That is the honest
+                            # answer for a `MemAttrs::debug` read (it must not
+                            # have side effects), but a debugger that wants
+                            # the interrupted context has to follow `FPCAR`
+                            # itself. No gdb stub exposes the S registers yet,
+                            # so nothing depends on it today.
+
+fp-instruction-timings      # The cycle model is the Cortex-M4 TRM's
+                            # published figures -- one cycle for the
+                            # single-pass operations, three for the
+                            # multiply-accumulates, fourteen for `VDIV` and
+                            # `VSQRT` -- and not the M7's, which differ. The
+                            # core-wide timing model already says it does not
+                            # model the pipeline (`exec.rs`); this is the
+                            # floating-point row of the same statement.

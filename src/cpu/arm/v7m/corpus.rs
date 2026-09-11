@@ -1351,3 +1351,563 @@ mpu_main:
     str.w r1, [r0]
     CHECK 7, r6, 0x00000000
 "#;
+
+// ---------------------------------------------------------------------------
+// The FPv4-SP floating-point unit
+//
+// Every expected bit pattern below is IEEE 754-2019's result for the
+// operation at binary32, with DDI 0403E A7.7's Arm-specific choices where
+// IEEE leaves one open. Nothing here was read off a run of this core: the
+// values were worked out from the formats and written down first, which is
+// what makes the corpus evidence rather than a recording.
+// ---------------------------------------------------------------------------
+
+/// Enable `CP10` and `CP11`, which every test below has to do first because
+/// `CPACR` is zero out of reset.
+#[cfg(feature = "cpu-arm-v7m-fp")]
+pub(super) const ENABLE_FP: &str = r#"
+    LOADC r0, 0xe000ed88
+    ldr r1, [r0]
+    LOADC r2, 0x00f00000
+    orr r1, r1, r2
+    str r1, [r0]
+    dsb
+    isb
+"#;
+
+/// The single-precision arithmetic, its rounding modes and its flags.
+#[cfg(feature = "cpu-arm-v7m-fp")]
+pub(super) const FP_ARITH: &str = r#"
+    @ 1.5 + 2.25 = 3.75, exactly, with no flag raised.
+    LOADC r0, 0x3fc00000
+    LOADC r1, 0x40100000
+    vmov s0, r0
+    vmov s1, r1
+    vadd.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 1, r2, 0x40700000
+    vmrs r2, fpscr
+    CHECK 2, r2, 0x00000000
+
+    @ 7.0 / 2.0 = 3.5, and 2.0 * 3.0 = 6.0.
+    LOADC r0, 0x40e00000
+    LOADC r1, 0x40000000
+    vmov s0, r0
+    vmov s1, r1
+    vdiv.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 3, r2, 0x40600000
+    LOADC r0, 0x40000000
+    LOADC r1, 0x40400000
+    vmov s0, r0
+    vmov s1, r1
+    vmul.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 4, r2, 0x40c00000
+
+    @ sqrt(9.0) = 3.0, and VABS/VNEG are bit operations.
+    LOADC r0, 0x41100000
+    vmov s0, r0
+    vsqrt.f32 s1, s0
+    vmov r2, s1
+    CHECK 5, r2, 0x40400000
+    vneg.f32 s2, s1
+    vmov r2, s2
+    CHECK 6, r2, 0xc0400000
+    vabs.f32 s3, s2
+    vmov r2, s3
+    CHECK 7, r2, 0x40400000
+
+    @ 1/3 in each of the four rounding modes. Round-to-nearest and
+    @ round-toward-positive give the value above, the other two the value
+    @ below, and inexact is raised every time.
+    LOADC r0, 0x3f800000
+    LOADC r1, 0x40400000
+    vmov s0, r0
+    vmov s1, r1
+    movs r3, #0
+    movs r4, #0
+    vmsr fpscr, r3
+    vdiv.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 8, r2, 0x3eaaaaab
+    LOADC r3, 0x00400000
+    vmsr fpscr, r3
+    vdiv.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 9, r2, 0x3eaaaaab
+    LOADC r3, 0x00800000
+    vmsr fpscr, r3
+    vdiv.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 10, r2, 0x3eaaaaaa
+    LOADC r3, 0x00c00000
+    vmsr fpscr, r3
+    vdiv.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 11, r2, 0x3eaaaaaa
+    vmrs r2, fpscr
+    LOADC r3, 0x0000001f
+    and r2, r2, r3
+    CHECK 12, r2, 0x00000010
+
+    @ 1.0 / 0.0 raises divide-by-zero and gives +inf; 0.0 / 0.0 raises
+    @ invalid and gives the default NaN.
+    movs r3, #0
+    vmsr fpscr, r3
+    LOADC r0, 0x3f800000
+    movs r1, #0
+    vmov s0, r0
+    vmov s1, r1
+    vdiv.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 13, r2, 0x7f800000
+    vmrs r2, fpscr
+    LOADC r3, 0x0000001f
+    and r2, r2, r3
+    CHECK 14, r2, 0x00000002
+    movs r3, #0
+    vmsr fpscr, r3
+    vmov s0, s1
+    vdiv.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 15, r2, 0x7fc00000
+    vmrs r2, fpscr
+    LOADC r3, 0x0000001f
+    and r2, r2, r3
+    CHECK 16, r2, 0x00000001
+
+    @ VMLA is chained and VFMA is fused, and here they differ: the product
+    @ (1 + 2^-23)^2 rounds to 1 + 2^-22, which the addend cancels exactly,
+    @ but the unrounded product leaves 2^-46 behind.
+    movs r3, #0
+    vmsr fpscr, r3
+    LOADC r0, 0x3f800001
+    LOADC r1, 0xbf800002
+    vmov s0, r0
+    vmov s1, r0
+    vmov s2, r1
+    vmla.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 17, r2, 0x00000000
+    vmov s2, r1
+    vfma.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 18, r2, 0x28800000
+
+    @ VCMP writes FPSCR's own flags, and VMRS APSR_nzcv moves them across.
+    @ Unordered sets C and V both, which is what makes BVS the "was a NaN
+    @ involved" test.
+    LOADC r0, 0x3f800000
+    LOADC r1, 0x40000000
+    vmov s0, r0
+    vmov s1, r1
+    vcmp.f32 s0, s1
+    vmrs APSR_nzcv, fpscr
+    CHECKF 19, 0x80000000
+    vcmp.f32 s1, s0
+    vmrs APSR_nzcv, fpscr
+    CHECKF 20, 0x20000000
+    vcmp.f32 s0, s0
+    vmrs APSR_nzcv, fpscr
+    CHECKF 21, 0x60000000
+    LOADC r0, 0x7fc00000
+    vmov s0, r0
+    vcmp.f32 s0, s1
+    vmrs APSR_nzcv, fpscr
+    CHECKF 22, 0x30000000
+
+    @ A quiet NaN propagates its payload with DN clear, and is replaced by
+    @ the default NaN with DN set.
+    movs r3, #0
+    vmsr fpscr, r3
+    LOADC r0, 0x7fc01234
+    LOADC r1, 0x3f800000
+    vmov s0, r0
+    vmov s1, r1
+    vadd.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 23, r2, 0x7fc01234
+    LOADC r3, 0x02000000
+    vmsr fpscr, r3
+    vadd.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 24, r2, 0x7fc00000
+
+    @ With FZ set a subnormal operand is replaced by a zero of its own sign
+    @ and IDC records it; with FZ clear it is used exactly.
+    movs r3, #0
+    vmsr fpscr, r3
+    movs r0, #1
+    LOADC r1, 0x3f800000
+    vmov s0, r0
+    vmov s1, r1
+    vmul.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 25, r2, 0x00000001
+    LOADC r3, 0x01000000
+    vmsr fpscr, r3
+    vmul.f32 s2, s0, s1
+    vmov r2, s2
+    CHECK 26, r2, 0x00000000
+    vmrs r2, fpscr
+    LOADC r3, 0x0000009f
+    and r2, r2, r3
+    CHECK 27, r2, 0x00000080
+
+    b pass
+"#;
+
+/// The conversions: integer, fixed point and half precision.
+#[cfg(feature = "cpu-arm-v7m-fp")]
+pub(super) const FP_CONVERT: &str = r#"
+    movs r3, #0
+    vmsr fpscr, r3
+
+    @ VCVT truncates whatever FPSCR.RMode says; VCVTR uses the mode.
+    LOADC r0, 0x40600000
+    vmov s0, r0
+    vcvt.s32.f32 s1, s0
+    vmov r2, s1
+    CHECK 1, r2, 0x00000003
+    vcvtr.s32.f32 s1, s0
+    vmov r2, s1
+    CHECK 2, r2, 0x00000004
+
+    @ Negative, and the unsigned form of a negative saturates to zero with
+    @ invalid raised.
+    LOADC r0, 0xc0600000
+    vmov s0, r0
+    vcvt.s32.f32 s1, s0
+    vmov r2, s1
+    CHECK 3, r2, 0xfffffffd
+    movs r3, #0
+    vmsr fpscr, r3
+    vcvt.u32.f32 s1, s0
+    vmov r2, s1
+    CHECK 4, r2, 0x00000000
+    vmrs r2, fpscr
+    LOADC r3, 0x0000001f
+    and r2, r2, r3
+    CHECK 5, r2, 0x00000001
+
+    @ Out of range saturates to the end of the range, and a NaN gives zero.
+    movs r3, #0
+    vmsr fpscr, r3
+    LOADC r0, 0x7f800000
+    vmov s0, r0
+    vcvt.s32.f32 s1, s0
+    vmov r2, s1
+    CHECK 6, r2, 0x7fffffff
+    LOADC r0, 0xff800000
+    vmov s0, r0
+    vcvt.s32.f32 s1, s0
+    vmov r2, s1
+    CHECK 7, r2, 0x80000000
+    LOADC r0, 0x7fc00000
+    vmov s0, r0
+    vcvt.s32.f32 s1, s0
+    vmov r2, s1
+    CHECK 8, r2, 0x00000000
+
+    @ Integer to float, signed and unsigned, and the case where the two
+    @ differ: 0xffffffff is -1 signed and 2^32-1 unsigned.
+    movs r3, #0
+    vmsr fpscr, r3
+    LOADC r0, 0xffffffff
+    vmov s0, r0
+    vcvt.f32.s32 s1, s0
+    vmov r2, s1
+    CHECK 9, r2, 0xbf800000
+    vcvt.f32.u32 s1, s0
+    vmov r2, s1
+    CHECK 10, r2, 0x4f800000
+
+    @ Fixed point: 1.0 with sixteen fraction bits is 0x00010000, and back.
+    LOADC r0, 0x3f800000
+    vmov s0, r0
+    vcvt.s32.f32 s0, s0, #16
+    vmov r2, s0
+    CHECK 11, r2, 0x00010000
+    vcvt.f32.s32 s0, s0, #16
+    vmov r2, s0
+    CHECK 12, r2, 0x3f800000
+
+    @ Half precision, both halves of the register. 1.0 is 0x3c00 as a half.
+    LOADC r0, 0x3f800000
+    vmov s0, r0
+    LOADC r1, 0xdeadbeef
+    vmov s1, r1
+    vcvtb.f16.f32 s1, s0
+    vmov r2, s1
+    CHECK 13, r2, 0xdead3c00
+    vmov s1, r1
+    vcvtt.f16.f32 s1, s0
+    vmov r2, s1
+    CHECK 14, r2, 0x3c00beef
+
+    @ And back out of each half.
+    LOADC r0, 0x11113c00
+    vmov s0, r0
+    vcvtb.f32.f16 s1, s0
+    vmov r2, s1
+    CHECK 15, r2, 0x3f800000
+    LOADC r0, 0x3c001111
+    vmov s0, r0
+    vcvtt.f32.f16 s1, s0
+    vmov r2, s1
+    CHECK 16, r2, 0x3f800000
+
+    @ A subnormal half is a normal single, which is why flush-to-zero must
+    @ not reach a half-precision operand.
+    LOADC r3, 0x01000000
+    vmsr fpscr, r3
+    LOADC r0, 0x00000001
+    vmov s0, r0
+    vcvtb.f32.f16 s1, s0
+    vmov r2, s1
+    CHECK 17, r2, 0x33800000
+
+    @ VMOV with an immediate, and the two-register core transfer.
+    movs r3, #0
+    vmsr fpscr, r3
+    vmov.f32 s0, #1.0
+    vmov r2, s0
+    CHECK 18, r2, 0x3f800000
+    LOADC r0, 0x11112222
+    LOADC r1, 0x33334444
+    vmov s4, s5, r0, r1
+    vmov r2, s4
+    CHECK 19, r2, 0x11112222
+    vmov r2, s5
+    CHECK 20, r2, 0x33334444
+    vmov r4, r5, s4, s5
+    CHECK 21, r4, 0x11112222
+    CHECK 22, r5, 0x33334444
+
+    b pass
+"#;
+
+/// The extension-register loads and stores.
+#[cfg(feature = "cpu-arm-v7m-fp")]
+pub(super) const FP_MEMORY: &str = r#"
+    @ VSTR then VLDR, with a positive and a negative offset.
+    LOADC r0, 0x20000200
+    LOADC r1, 0x12345678
+    vmov s0, r1
+    vstr s0, [r0]
+    ldr r2, [r0]
+    CHECK 1, r2, 0x12345678
+    vstr s0, [r0, #8]
+    ldr r2, [r0, #8]
+    CHECK 2, r2, 0x12345678
+    LOADC r3, 0x9abcdef0
+    str r3, [r0, #-4]
+    vldr s1, [r0, #-4]
+    vmov r2, s1
+    CHECK 3, r2, 0x9abcdef0
+
+    @ VSTMIA with writeback, then VLDMDB back to where it started.
+    LOADC r0, 0x20000300
+    LOADC r1, 0x00000011
+    vmov s0, r1
+    LOADC r1, 0x00000022
+    vmov s1, r1
+    LOADC r1, 0x00000033
+    vmov s2, r1
+    vstmia r0!, {s0-s2}
+    CHECK 4, r0, 0x2000030c
+    ldr r2, [r0, #-12]
+    CHECK 5, r2, 0x00000011
+    ldr r2, [r0, #-4]
+    CHECK 6, r2, 0x00000033
+    vldmdb r0!, {s8-s10}
+    CHECK 7, r0, 0x20000300
+    vmov r2, s8
+    CHECK 8, r2, 0x00000011
+    vmov r2, s10
+    CHECK 9, r2, 0x00000033
+
+    @ VPUSH and VPOP are the SP spelling of the same two encodings.
+    LOADC r1, 0x0000abcd
+    vmov s0, r1
+    LOADC r1, 0x0000ef01
+    vmov s15, r1
+    mov r4, sp
+    vpush {s0-s15}
+    mov r5, sp
+    subs r5, r4, r5
+    CHECK 10, r5, 0x00000040
+    ldr r2, [sp]
+    CHECK 11, r2, 0x0000abcd
+    ldr r2, [sp, #60]
+    CHECK 12, r2, 0x0000ef01
+    movs r1, #0
+    vmov s0, r1
+    vmov s15, r1
+    vpop {s0-s15}
+    CHECK 13, sp, 0x20010000
+    vmov r2, s0
+    CHECK 14, r2, 0x0000abcd
+    vmov r2, s15
+    CHECK 15, r2, 0x0000ef01
+
+    @ A literal VLDR, which is how a compiler gets a constant into an S
+    @ register without a core register.
+    vldr s2, one_point_five
+    vmov r2, s2
+    CHECK 16, r2, 0x3fc00000
+
+    b pass_fp_memory
+
+    .align 2
+one_point_five:
+    .word 0x3fc00000
+
+    .thumb_func
+pass_fp_memory:
+    b pass
+"#;
+
+/// `CONTROL.FPCA`, the extended frame, and lazy state preservation.
+///
+/// The two handlers record what they saw in `R5`, `R6` and `R7`: those are
+/// not in the exception frame, so they survive the return, and they are low
+/// registers, so every `CHECK` against them assembles narrow.
+#[cfg(feature = "cpu-arm-v7m-fp")]
+pub(super) const FP_EXCEPTIONS: &str = r#"
+    b fp_exc_main
+
+    @ Records the frame pointer in r5, EXC_RETURN in r6 and FPCCR in r7,
+    @ and touches nothing else -- in particular, no floating-point register,
+    @ so a lazy reservation is still outstanding when it returns.
+    .thumb_func
+fp_handler:
+    mov r5, sp
+    mov r6, lr
+    LOADC r7, 0xe000ef34
+    ldr r7, [r7]
+    bx lr
+
+    @ The same, but its first act is a floating-point instruction, which is
+    @ what has to resolve the reservation before it clobbers S0.
+    .thumb_func
+fp_handler_uses_fp:
+    movs r3, #0
+    vmov s0, r3
+    mov r5, sp
+    mov r6, lr
+    bx lr
+
+    .thumb_func
+fp_exc_main:
+    @ CONTROL.FPCA is clear until a floating-point instruction sets it.
+    mrs r2, control
+    movs r3, #4
+    ands r2, r2, r3
+    CHECK 1, r2, 0x00000000
+    LOADC r0, 0xcafe0001
+    vmov s0, r0
+    mrs r2, control
+    movs r3, #4
+    ands r2, r2, r3
+    CHECK 2, r2, 0x00000004
+
+    @ Install the recording handler, and fill the frame area with a sentinel
+    @ so "the core did not write here" is something the test can see.
+    LOADC r0, HANDLER_PTR
+    adr r1, fp_handler
+    orr r1, r1, #1
+    str r1, [r0]
+
+    mov r4, sp
+    sub r2, r4, #0x68
+    movs r3, #0
+    LOADC r1, 0x5a5a5a5a
+fill_frame:
+    str r1, [r2, r3]
+    adds r3, r3, #4
+    cmp r3, #0x68
+    blt fill_frame
+
+    svc #0
+
+    @ The frame was the extended one -- twenty-six words -- and EXC_RETURN
+    @ had bit 4 clear to say so.
+    subs r2, r4, r5
+    CHECK 3, r2, 0x00000068
+    movs r3, #0x10
+    ands r2, r6, r3
+    CHECK 4, r2, 0x00000000
+
+    @ Lazy stacking left the S-register slots untouched...
+    ldr r2, [r5, #0x20]
+    CHECK 5, r2, 0x5a5a5a5a
+    @ ...with LSPACT set while the handler ran...
+    movs r3, #1
+    ands r2, r7, r3
+    CHECK 6, r2, 0x00000001
+    @ ...and FPCAR pointing at the slot S0 would have gone in. The check is
+    @ written out rather than using CHECK, which compares against a constant.
+    LOADC r0, 0xe000ef38
+    ldr r2, [r0]
+    adds r3, r5, #0x20
+    cmp r2, r3
+    beq 8000f
+    movs r0, #7
+    b fail
+8000:
+
+    @ Nothing in the handler used the FPU, so S0 came back untouched, the
+    @ reservation was discarded, and the whole frame was popped.
+    vmov r2, s0
+    CHECK 8, r2, 0xcafe0001
+    LOADC r0, 0xe000ef34
+    ldr r2, [r0]
+    movs r3, #1
+    ands r2, r2, r3
+    CHECK 9, r2, 0x00000000
+    mov r2, sp
+    CHECK 10, r2, 0x20010000
+
+    @ Now a handler that does use the FPU: the deferred push has to happen
+    @ before it clobbers S0, so the interrupted value reaches the frame and
+    @ comes back on return.
+    LOADC r0, HANDLER_PTR
+    adr r1, fp_handler_uses_fp
+    orr r1, r1, #1
+    str r1, [r0]
+    LOADC r0, 0xcafe0002
+    vmov s0, r0
+    svc #0
+    vmov r2, s0
+    CHECK 11, r2, 0xcafe0002
+
+    @ With FPCCR.ASPEN clear a floating-point instruction no longer claims a
+    @ context, so the next exception gets the basic eight-word frame.
+    LOADC r0, 0xe000ef34
+    ldr r1, [r0]
+    LOADC r2, 0x80000000
+    bics r1, r1, r2
+    str r1, [r0]
+    mrs r1, control
+    movs r2, #4
+    bics r1, r1, r2
+    msr control, r1
+    isb
+    LOADC r0, HANDLER_PTR
+    adr r1, fp_handler
+    orr r1, r1, #1
+    str r1, [r0]
+    LOADC r0, 0x0000beef
+    vmov s0, r0
+    mov r4, sp
+    svc #0
+    subs r2, r4, r5
+    CHECK 12, r2, 0x00000020
+    movs r3, #0x10
+    ands r2, r6, r3
+    CHECK 13, r2, 0x00000010
+
+    b pass
+"#;

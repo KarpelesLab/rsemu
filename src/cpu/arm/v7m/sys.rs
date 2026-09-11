@@ -27,7 +27,7 @@
 //! | SysTick | the full 24-bit reload counter, `COUNTFLAG`, the `TICKINT` interrupt |
 //! | SCB | `CPUID`, `ICSR`, `VTOR`, `AIRCR`, `SCR`, `CCR`, `SHPR1-3`, `SHCSR`, `CFSR`, `HFSR`, `MMFAR`, `BFAR`, `CPACR` |
 //! | MPU | eight regions, `RBAR`/`RASR` with sub-region disable and `PRIVDEFENA` |
-//! | FPU | **not implemented.** `CPACR` exists so that `CP10`/`CP11` accesses raise a `NOCP` UsageFault rather than being silently ignored |
+//! | FPU | `FPCCR`, `FPCAR`, `FPDSCR` and the read-only `MVFR0`–`MVFR2`, on a part that has one; all six read as zero on a part that does not, and `CPACR.CP10`/`CP11` are then RAZ/WI so a `VMOV` raises `NOCP` |
 //! | DWT / ITM / FPB / TPIU | not implemented; reads return zero and writes are dropped |
 //!
 //! # Sources
@@ -219,9 +219,58 @@ pub mod control {
     pub const NPRIV: u32 = 1 << 0;
     /// Thread mode uses the process stack.
     pub const SPSEL: u32 = 1 << 1;
-    /// Floating-point context is active. Never set: there is no FPU.
+    /// Floating-point context is active: the current context has used the
+    /// FPU, so an exception taken from it gets the extended frame. Set by any
+    /// floating-point instruction while `FPCCR.ASPEN` is set, and cleared on
+    /// exception entry.
     pub const FPCA: u32 = 1 << 2;
 }
+
+/// The `FPCCR` bits (DDI 0403E B3.2.22).
+///
+/// The "ready" quartet — `MONRDY`, `BFRDY`, `MMRDY`, `HFRDY` — records, at the
+/// moment the frame was *reserved*, which fault handlers could have been taken
+/// had the deferred push been done then. They are captured on reservation and
+/// are informational here: this core performs the deferred push synchronously
+/// on the instruction that triggers it, so a fault on that push is reported as
+/// an ordinary precise fault from that instruction rather than replayed
+/// through the recorded readiness.
+pub mod fpccr {
+    /// Automatic state preservation: a floating-point instruction sets
+    /// `CONTROL.FPCA`. Set at reset.
+    pub const ASPEN: u32 = 1 << 31;
+    /// Lazy state preservation: exception entry *reserves* the register slots
+    /// instead of writing them. Set at reset.
+    pub const LSPEN: u32 = 1 << 30;
+    /// DebugMonitor was ready when the frame was reserved.
+    pub const MONRDY: u32 = 1 << 8;
+    /// BusFault was ready when the frame was reserved.
+    pub const BFRDY: u32 = 1 << 6;
+    /// MemManage was ready when the frame was reserved.
+    pub const MMRDY: u32 = 1 << 5;
+    /// HardFault was ready when the frame was reserved.
+    pub const HFRDY: u32 = 1 << 4;
+    /// The reservation was made from Thread mode.
+    pub const THREAD: u32 = 1 << 3;
+    /// The reservation was made from unprivileged code, which is the
+    /// privilege the deferred push must use.
+    pub const USER: u32 = 1 << 1;
+    /// Lazy state preservation is active: a frame is reserved and the
+    /// registers have not been written to it yet.
+    pub const LSPACT: u32 = 1 << 0;
+
+    /// Every bit software may write. The reserved space between them is RES0.
+    pub const WRITABLE: u32 =
+        ASPEN | LSPEN | MONRDY | BFRDY | MMRDY | HFRDY | THREAD | USER | LSPACT;
+}
+
+/// The bits `FPDSCR` holds: `DN`, `FZ` and `RMode`, the mode half of `FPSCR`
+/// (DDI 0403E B3.2.21).
+///
+/// `AHP` would be here too on a part that implemented the alternative
+/// half-precision format; this core does not, so it is RES0 in both `FPSCR`
+/// and `FPDSCR` (see `super::fp`).
+pub const FPDSCR_WRITABLE: u32 = (1 << 25) | (1 << 24) | (3 << 22);
 
 // ---------------------------------------------------------------------------
 // EXC_RETURN
@@ -236,6 +285,30 @@ pub mod exc_return {
     pub const THREAD_MSP: u32 = 0xffff_fff9;
     /// Return to Thread mode, using the process stack.
     pub const THREAD_PSP: u32 = 0xffff_fffd;
+
+    /// Bit 4: **clear** when the frame is the extended, 26-word one that
+    /// carries `S0`–`S15` and `FPSCR`.
+    ///
+    /// Clear-means-present is the architecture's choice, not a transcription
+    /// slip: it makes the three integer values above the ones with the bit
+    /// set, so a core without an FPU never produces a value with it clear.
+    pub const FP_FRAME: u32 = 1 << 4;
+
+    /// Return to Handler mode on the main stack, with an extended frame.
+    pub const HANDLER_MSP_FP: u32 = HANDLER_MSP & !FP_FRAME;
+    /// Return to Thread mode on the main stack, with an extended frame.
+    pub const THREAD_MSP_FP: u32 = THREAD_MSP & !FP_FRAME;
+    /// Return to Thread mode on the process stack, with an extended frame.
+    pub const THREAD_PSP_FP: u32 = THREAD_PSP & !FP_FRAME;
+
+    /// How many bytes the basic exception frame occupies.
+    pub const BASIC_FRAME: u32 = 0x20;
+    /// How many bytes the extended frame occupies: eight words, then
+    /// `S0`–`S15`, then `FPSCR`, then one reserved word — twenty-six in all.
+    pub const EXTENDED_FRAME: u32 = 0x68;
+    /// Where `S0` sits inside the extended frame, which is also the value
+    /// `FPCAR` takes.
+    pub const FP_OFFSET: u32 = 0x20;
 
     /// Whether a `PC` value is an `EXC_RETURN` rather than an address.
     ///
@@ -313,8 +386,33 @@ pub struct Sys {
     /// `AFSR`. Nothing here sets it; it exists so a read does not fault.
     pub afsr: u32,
     /// `CPACR`. Zero at reset, which is what makes `CP10`/`CP11` raise
-    /// `NOCP`.
+    /// `NOCP` until firmware enables the FPU.
     pub cpacr: u32,
+
+    /// `MVFR0`, `MVFR1` and `MVFR2` at `0xE000EF40`–`0xE000EF48`, or all zero
+    /// on a part with no floating-point unit.
+    ///
+    /// Read-only feature registers, so they are configuration rather than
+    /// state: [`Sys::with_fp`] sets them and nothing else ever writes them.
+    /// They are also the one thing that tells [`Sys`] whether an FPU exists,
+    /// which is what gates `CPACR.CP10`/`CP11` and the three `FPCCR`-block
+    /// registers below.
+    pub mvfr: [u32; 3],
+    /// `FPCCR` at `0xE000EF34` (DDI 0403E B3.2.22).
+    ///
+    /// `ASPEN` and `LSPEN` are both set at reset, so a part that has an FPU
+    /// starts with automatic *and* lazy state preservation on — which is the
+    /// configuration nearly all firmware runs in and the one that decides
+    /// interrupt latency.
+    pub fpccr: u32,
+    /// `FPCAR` at `0xE000EF38`: where a reserved-but-not-yet-written
+    /// floating-point frame is waiting. Meaningful only while
+    /// `FPCCR.LSPACT` is set.
+    pub fpcar: u32,
+    /// `FPDSCR` at `0xE000EF3C`: the value `FPSCR` is given on exception
+    /// entry, so a handler does not inherit the interrupted code's rounding
+    /// mode.
+    pub fpdscr: u32,
     /// `CPUID`.
     pub cpuid: u32,
     /// A `SYSRESETREQ` was written to `AIRCR`. The machine, not the core,
@@ -383,6 +481,10 @@ impl Sys {
             bfar: 0,
             afsr: 0,
             cpacr: 0,
+            mvfr: [0; 3],
+            fpccr: 0,
+            fpcar: 0,
+            fpdscr: 0,
             cpuid,
             reset_requested: false,
             syst_csr: 0,
@@ -402,6 +504,50 @@ impl Sys {
             sys.set_enable(Exception(n), true);
         }
         sys
+    }
+
+    /// The same block on a part that has a floating-point unit.
+    ///
+    /// `mvfr` is the part's `MVFR0`/`MVFR1`/`MVFR2`, and a non-zero `MVFR0` is
+    /// what makes [`Sys::fp_present`] true — one fact rather than two that can
+    /// disagree. `FPCCR` comes up with `ASPEN` and `LSPEN` set, which is the
+    /// architecture's reset value.
+    #[must_use]
+    pub fn with_fp(mut self, mvfr: [u32; 3]) -> Sys {
+        self.mvfr = mvfr;
+        self.fpccr = fpccr::ASPEN | fpccr::LSPEN;
+        self
+    }
+
+    /// Whether this part has a floating-point unit.
+    ///
+    /// Without one, `CPACR.CP10`/`CP11` are RAZ/WI and `FPCCR`, `FPCAR` and
+    /// `FPDSCR` read as zero — the state a Cortex-M4 without the option is in,
+    /// and the state firmware probes for.
+    #[must_use]
+    #[inline]
+    pub const fn fp_present(&self) -> bool {
+        self.mvfr[0] != 0
+    }
+
+    /// Whether `CPACR` currently grants the caller access to the
+    /// floating-point coprocessors.
+    ///
+    /// `CP10` and `CP11` must be programmed identically or the result is
+    /// UNPREDICTABLE; this takes `CP10` as the answer and ignores `CP11`,
+    /// which is the choice a part has to make and is stated here rather than
+    /// hidden. Access is `0b00` denied, `0b01` privileged only, `0b11` full
+    /// (DDI 0403E B3.2.20).
+    #[must_use]
+    pub const fn fp_enabled(&self, privileged: bool) -> bool {
+        if !self.fp_present() {
+            return false;
+        }
+        match (self.cpacr >> 20) & 3 {
+            0b01 => privileged,
+            0b11 => true,
+            _ => false,
+        }
     }
 
     /// Read one exception's bit out of a bitmap.
@@ -664,6 +810,15 @@ impl Sys {
             0xe000_ed3c => self.afsr,
             0xe000_ed88 => self.cpacr,
 
+            // The floating-point block. All six read as zero on a part with
+            // no FPU, which is how firmware discovers there is none.
+            0xe000_ef34 => self.fpccr,
+            0xe000_ef38 => self.fpcar,
+            0xe000_ef3c => self.fpdscr,
+            0xe000_ef40 => self.mvfr[0],
+            0xe000_ef44 => self.mvfr[1],
+            0xe000_ef48 => self.mvfr[2],
+
             // MPU.
             0xe000_ed90 => u32::from(self.mpu_regions) << 8,
             0xe000_ed94 => self.mpu_ctrl,
@@ -787,7 +942,23 @@ impl Sys {
             0xe000_ed34 => self.mmfar = value,
             0xe000_ed38 => self.bfar = value,
             0xe000_ed3c => self.afsr = value,
-            0xe000_ed88 => self.cpacr = value & 0x00f0_0000,
+            // `CPACR.CP10`/`CP11` are the only bits this core implements, and
+            // they are RAZ/WI without an FPU: a part with no coprocessor
+            // cannot be told to enable one.
+            0xe000_ed88 => {
+                if self.fp_present() {
+                    self.cpacr = value & 0x00f0_0000;
+                }
+            }
+
+            // The floating-point block, write-ignored without an FPU.
+            0xe000_ef34 if self.fp_present() => self.fpccr = value & fpccr::WRITABLE,
+            // `FPCAR` is an eight-byte-aligned address; the low three bits
+            // are RES0.
+            0xe000_ef38 if self.fp_present() => self.fpcar = value & !7,
+            0xe000_ef3c if self.fp_present() => self.fpdscr = value & FPDSCR_WRITABLE,
+            // `MVFR0`-`MVFR2` are read-only feature registers.
+            0xe000_ef34..=0xe000_ef48 => {}
 
             0xe000_ed90 => {}
             0xe000_ed94..=0xe000_edb8 if self.mpu_regions == 0 => {}
