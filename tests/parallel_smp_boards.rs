@@ -32,12 +32,18 @@
 //!   is now in the picture.
 //! * **The degenerate case is pinned rather than described.** One crystal and
 //!   two runnables is outside the clock model in both modes
-//!   (`Scheduler::ticks_until_after`), and what saves it is
-//!   [`SchedulerConfig::max_ticks_per_quantum`] capping the first runnable's
-//!   share. Raise the cap above the round's whole span and the second hart
-//!   gets a budget of zero — for ever. That is a real limitation of every
-//!   shipped `-smp` board and it has a test of its own here, so it cannot
-//!   quietly stop being true in either direction.
+//!   (`Scheduler::ticks_until_after`), and what used to save it was a
+//!   rate-blind constant — `SchedulerConfig::max_ticks_per_quantum`, ten
+//!   thousand — capping the first runnable's share so there was something
+//!   left for the second. Raising that constant above the round's span handed
+//!   the second hart a budget of zero, for ever, and this file asserted it.
+//!   [`Scheduler::round_allowance`] replaced the constant with the quantity it
+//!   was standing in for: a round's worth of the tree, **divided by the
+//!   runnables that share it**. The test below is the old one turned round —
+//!   with no cap at all, both harts still run, and each gets half the round.
+//!   What is left of the limitation is that half: two processors on one
+//!   crystal each execute at half the rate their board declares, which is the
+//!   part only two oscillators can fix.
 //!
 //! # What it is not
 //!
@@ -56,7 +62,7 @@
 //! tight loop, is in `docs/techniques/parallel-execution.md`.
 //!
 //! [`Machine::state_hash`]: rsemu::machine::Machine::state_hash
-//! [`SchedulerConfig::max_ticks_per_quantum`]: rsemu::core::sched::SchedulerConfig::max_ticks_per_quantum
+//! [`Scheduler::round_allowance`]: rsemu::core::sched::Scheduler
 
 // `std` because `parallel` is a threading mode and a `no_std` build has no
 // threads — the same reason `parallel_threading.rs` gives.
@@ -429,37 +435,40 @@ fn a_file_selected_parallel_machine_with_no_workers_still_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// the degenerate configuration, pinned
+// the degenerate configuration, and what is left of it
 // ---------------------------------------------------------------------------
 
-/// Two runnables on one oscillator starve the second one whenever the tick cap
-/// does not bite.
+/// Two runnables on one oscillator both run, with **no tick cap at all**.
 ///
-/// This is not a bug in the parallel round; it is the clock model, and
-/// `Scheduler::ticks_until_after` says so in both modes. A tree has one unit
-/// counter, so the span between `now` and the round's target is shared out:
-/// the first runnable is offered all of it and the second is offered what is
-/// left. What normally leaves something is
-/// [`SchedulerConfig::max_ticks_per_quantum`], which caps the first at 10 000
-/// of the round's 100 000 ticks on this board.
+/// This test is the inverse of the one it replaces, and the inversion is the
+/// point. A tree has one unit counter, so the span between `now` and the
+/// round's target is shared out: `Scheduler::ticks_until_after` offers the
+/// first runnable all of it and the second whatever is left. What used to
+/// leave anything was `SchedulerConfig::max_ticks_per_quantum` — a rate-blind
+/// 10 000 against this board's 100 000 ticks a round — and raising it past the
+/// span handed hart 1 a budget of zero, every round, for ever. The old test
+/// asserted exactly that and said a fix had to come here and delete it.
 ///
-/// Raise the cap past the whole span and hart 1 is handed a budget of zero,
-/// every round, for ever. The test asserts exactly that, so the limitation is
-/// a fact in the suite rather than a paragraph — and so that a fix, when one
-/// comes, has to come here and delete it.
+/// `Scheduler::round_allowance` is that fix: the share bound is now *a round's
+/// worth of the tree divided by the runnables that share it*, so with the cap
+/// removed entirely each hart is offered half the round and both execute.
+/// `SchedulerConfig::max_ticks_per_quantum` is `None` here — the default — and
+/// the test still sets it explicitly, because the whole claim is that nothing
+/// is capping anything.
 ///
-/// The fix is not a bigger cap. It is two oscillators, which is what the
-/// hardware has (§4.2, "as many roots as the real board has crystals") and
-/// what `machines/tests/heterogeneous.machine` uses.
-///
-/// [`SchedulerConfig::max_ticks_per_quantum`]: rsemu::core::sched::SchedulerConfig::max_ticks_per_quantum
+/// **What is not fixed** is the half. Each hart executes at half the 100 MHz
+/// this board declares, because one counter cannot say that one of two
+/// processors halted while the other ran. That still wants two oscillators,
+/// which is what `machines/tests/heterogeneous.machine` has and what §4.2's
+/// "as many roots as the real board has crystals" asks for; it is a property
+/// of every shipped `-smp` file and is written up in
+/// `docs/techniques/parallel-execution.md`.
 #[test]
-fn one_oscillator_and_no_tick_cap_starves_the_second_hart() {
+fn one_oscillator_and_no_tick_cap_runs_both_harts() {
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.scheduler.workers = 2;
-    // Far beyond the ~100 000 ticks a 1 ms round covers at 100 MHz, so the
-    // first runnable is offered the whole span and reserves it.
-    options.realize.scheduler.max_ticks_per_quantum = u64::MAX;
+    // No explicit ceiling: the only thing bounding a budget is the round.
+    options.realize.scheduler.max_ticks_per_quantum = None;
     options.realize.media.insert("code", rom());
     let registry = catalog::registry().expect("a registry");
     let mut m = rsemu::machine::build("smp-parallel.machine", SMP_PARALLEL, &registry, &options)
@@ -470,13 +479,11 @@ fn one_oscillator_and_no_tick_cap_starves_the_second_hart() {
     }
     assert!(
         word(&m, PRIVATE) > 0,
-        "hart 0 did not run either, so this test is measuring something else"
+        "hart 0 did not run, so this test is measuring something else"
     );
-    assert_eq!(
-        word(&m, PRIVATE + 4),
-        0,
-        "hart 1 executed, so the tick reservation no longer starves it — good news, \
-         and this test and the paragraph in docs/techniques/parallel-execution.md \
-         both need deleting"
+    assert!(
+        word(&m, PRIVATE + 4) > 0,
+        "hart 1 was starved with no cap in play, which is the defect \
+         Scheduler::round_allowance exists to have fixed"
     );
 }

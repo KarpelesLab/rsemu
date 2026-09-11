@@ -576,7 +576,7 @@ native window: ALSA is an `ioctl` protocol and the alternative to `libc` is an
 eighth `unsafe` subsystem, which the ceiling of seven forbids.
 
 **A run can say what it did**, in numbers rather than prose. `rsemu run pc64
---media kernel=bzImage --for 900s --headless --trace all=boot.trace` writes a
+--media kernel=bzImage --for 200s --headless --trace all=boot.trace` writes a
 plain two-column table — `cpu.retired.permille 987`, `sched.quanta 24818`,
 `mmio.pia.read 1461001` — that `awk` reads with one pattern and `diff` compares
 between two runs. **Counters, not an event stream**: every measurement this

@@ -192,22 +192,70 @@ counter, so one counter cannot express one processor halted while the other
 runs. Two cores want two roots, which is also what §4.2 says the hardware has —
 "as many roots as the real board has crystals".
 
-What keeps it working is not a fix, it is a cap. The parallel round hands out
-every budget before anything runs, so it *reserves*: each runnable on a tree is
-offered the span its predecessors could not have used, and the first one would
-take all of it were it not for `SchedulerConfig::max_ticks_per_quantum`. On a
-100 MHz board with a 1 ms quantum the round's span is 100 000 ticks and the cap
-is 10 000, so both processors get 10 000 and both run.
+### What used to keep it working, and why that had to go
 
-Raise the cap past the round's whole span and **the second processor is handed
-a budget of zero, every round, for ever.** The deterministic mode survives the
-same configuration for a different reason — it rotates its round-robin cursor,
-so the two processors alternate whole rounds — and the parallel round has no
-cursor to rotate.
-
+A cap, and a rate-blind one. The parallel round hands out every budget before
+anything runs, so it *reserves*: each runnable on a tree is offered the span
+its predecessors could not have used, and the first one would take all of it
+were it not for `SchedulerConfig::max_ticks_per_quantum`. On a 100 MHz board
+with a 1 ms quantum the round's span was 100 000 ticks and the cap was 10 000,
+so both processors got 10 000 and both ran. Raise that constant past the
+round's whole span and **the second processor was handed a budget of zero,
+every round, for ever** — which
 `tests/parallel_smp_boards.rs::one_oscillator_and_no_tick_cap_starves_the_second_hart`
-asserts exactly that, so the limitation is a fact in the suite rather than a
-paragraph, and a fix has to come here and delete both.
+asserted, so that the limitation was a fact in the suite rather than a
+paragraph.
+
+The constant could not stay, because it was doing this job by accident while
+doing damage everywhere else. Ten thousand ticks is a *hundredth* of what a
+1 GHz core is owed by a 1 ms quantum, and a budget is recomputed from the
+tree's absolute position every round, so the ticks a capped round left behind
+became a backlog the next round re-capped. `arm64-virt` and `riscv-virt` ran
+their processors at one percent of the rate their own machine files declare,
+for ever, beside devices that kept exact time — measurable from outside as
+`rsemu run arm64-virt --for 10s --trace clock` reporting `clock.cpu.ticks
+100000000` where a 1 GHz oscillator owes ten seconds 10 000 000 000, next to a
+PL011 at exactly 15 000 000. `pc64` reported about a fifth rather than a
+hundredth, for the arithmetic reason that its rounds are cut short by its
+lazily-advanced devices and a shorter round is a *fuller* one.
+
+### What replaced it: a share, in the units a share belongs in
+
+`Scheduler::tree_shares` and `Scheduler::take_share`. A round offers each
+runnable **the span its tree has left, divided by however many runnables still
+have a turn in this round**, counting itself down as it goes. The first of two
+is offered half; the second then finds half the span gone and one sharer left,
+so it is offered the other half. A gated domain is left out of the count
+rather than counted and handed nothing.
+
+Three things follow, and the third is why this is the shape it is:
+
+* **Two processors on one crystal both run, with no cap at all.**
+  `tests/parallel_smp_boards.rs::one_oscillator_and_no_tick_cap_runs_both_harts`
+  is the old test turned round.
+* **The deterministic and parallel rounds now agree by construction** rather
+  than by accident of ordering, since both divide the same span the same way.
+* **A tree with one runnable divides by one.** The bound is then exactly the
+  span, nothing is rounded away, and the budget is precisely what
+  `Scheduler::ticks_until` offers — which is what it was before any of this
+  existed. That is every board in `machines/` except the four `-smp` ones, and
+  it is why replacing the constant moved exactly two committed state hashes
+  (`riscv-virt`, the one board in the frame-hash regression whose processor the
+  cap was throttling) and left every other one identical to the bit.
+
+### What is *not* fixed: the half
+
+Each of two processors on one crystal executes at half the rate its board
+declares. One unit counter still cannot say that one of them halted while the
+other ran, and dividing is the best a single counter can do. That still wants
+two oscillators, which is what `machines/tests/heterogeneous.machine` has.
+Changing the four shipped `-smp` files to declare one crystal per processor is
+the remaining half of this, and it is a separate decision: it moves each of
+those boards' hashes again, and `Scheduler::arm_parallel_cursors` only speaks
+for a tree no runnable drives when exactly *one* runnable in the machine is
+entitled to — so a board that gains a second oscillator loses the live view its
+RTC-crystal devices are caught up through. Both need measuring before the files
+change.
 
 ## Measured
 
@@ -233,10 +281,19 @@ would be a sample.
 **And it is slower.** 90 seconds of virtual time on that board: **137 s** of
 wall in `deterministic`, **187 s** in `parallel`. That is not a surprise and it
 is not a regression — `ThreadingMode::Parallel`'s own documentation has a table
-saying two runnables at the default `max_ticks_per_quantum` are *slower* in
-this mode, because a round costs a dispatch per runnable and the barrier is per
-round. A two-processor board wants a larger cap before it asks for parallelism;
-the mode's speedup is a four-processor-and-up proposition.
+saying two runnables at a ten-thousand-tick budget are *slower* in this mode,
+because a round costs a dispatch per runnable and the barrier is per round. The
+mode's speedup is a four-processor-and-up proposition.
+
+Both numbers predate the tick cap's removal and both are now measurements of a
+board doing a hundredth of the guest work per virtual second that the same
+command does today — the *ratio* is what that paragraph is about and it is not
+obviously changed, but the seconds are not comparable to a run of the current
+tree and are kept as what they were rather than restated. What *has* changed in
+this mode's favour is the denominator: a round now carries a full quantum of
+guest work rather than ten thousand ticks of it, so the per-round dispatch and
+barrier are amortised over a hundred times as much on a 1 GHz board. Where the
+crossover now lies wants re-measuring.
 
 **`AMOADD` loses nothing through a whole machine.** `tests/parallel_smp_boards.rs`,
 two RV64 harts, 20 000 atomic increments each:

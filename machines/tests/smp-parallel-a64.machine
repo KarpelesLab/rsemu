@@ -13,10 +13,10 @@
 # here unchanged and is not repeated: `threading parallel` is a statement about
 # the hardware and a default rather than a demand, the worker count is a
 # property of the run and is deliberately not sayable in a file, and **one
-# crystal with two runnables is a degenerate configuration** that works only
-# because `SchedulerConfig::max_ticks_per_quantum` caps what the first runnable
-# may reserve. Read that file's header first; this one only records what is
-# different.
+# crystal with two runnables is a degenerate configuration** in which each
+# processor is offered half a round by `Scheduler::tree_shares` and therefore
+# runs at half the rate declared here. Read that file's header first; this one
+# only records what is different.
 #
 # ## What is different
 #

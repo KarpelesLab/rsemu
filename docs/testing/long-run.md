@@ -73,7 +73,7 @@ window closed unseen.
 cargo test --release --test engine_longrun
 
 # longer, locally
-RSEMU_LONGRUN_SECONDS=30 cargo test --release --test engine_longrun
+RSEMU_LONGRUN_MS=300 cargo test --release --test engine_longrun
 
 # the real gate — two kernels now, one per core
 scripts/fetch-testdata.sh arm64-linux arm64-initramfs x86-linux initramfs-x86
@@ -96,14 +96,15 @@ beside one another.
 
 | Variable | Effect |
 | --- | --- |
-| `RSEMU_LONGRUN_SECONDS` | guest seconds to compare (2 for the A64 and RISC-V synthetics, 30 for either kernel leg, 120 in CI). The x86 *synthetic* leg is capped at 6 000 quanta instead when this is unset — see below — and setting it lifts the cap |
+| `RSEMU_LONGRUN_MS` | guest **milliseconds** to compare (20 for the A64 and RISC-V synthetics, 300 for either kernel leg, 1 200 in CI). The x86 *synthetic* leg is capped at 1 200 quanta instead when this is unset — see below — and setting this lifts the cap |
+| `RSEMU_LONGRUN_SECONDS` | the same knob in whole guest seconds. Still honoured, and `_MS` wins when both are set. Every default above used to be written here — 2, 30 and 120 — and is now a hundredth of that, for the reason under *[A guest second stopped meaning what it meant](#a-guest-second-stopped-meaning-what-it-meant)* |
 | `RSEMU_LONGRUN_ENGINES` | comma-separated; default `jit,jit-host`. `interp` is the control — an interpreter against itself must always agree |
 | `RSEMU_ARM64_KERNEL`, `RSEMU_ARM64_INITRD` | the AArch64 fixture, as in `tests/a64_linux.rs` |
 | `RSEMU_ARM64_RAM` | that board's DRAM; default 512M |
 | `RSEMU_X86_KERNEL`, `RSEMU_X86_INITRD` | the x86-64 fixture: a `bzImage` and an initramfs, as in `tests/pc64_linux.rs` |
 | `RSEMU_X86_RAM` | `pc64`'s extended memory; default 256M |
 | `RSEMU_X86_CMDLINE` | the kernel command line, replacing the one below. `nokaslr` is not optional on this board |
-| `RSEMU_X86_LONGRUN_SECONDS` | (`check.sh`) the x86 kernel leg's own budget; default 900. **Not** `RSEMU_LONGRUN_SECONDS`, for the reason under "Two kernels, two budgets" |
+| `RSEMU_X86_LONGRUN_MS` | (`check.sh`) the x86 kernel leg's own budget, in guest milliseconds; default 200 000, which was 900 guest seconds. **Not** `RSEMU_LONGRUN_MS`, for the reason under "Two kernels, two budgets". `RSEMU_X86_LONGRUN_SECONDS` is gone rather than kept: `check.sh` is its only caller |
 | `RSEMU_LONGRUN_REQUIRED` | (`check.sh`) a missing kernel is a failure rather than a skip |
 | `RSEMU_X86_LONGRUN_SEAMS` | the x86 synthetic leg's bisecting knob: a comma-separated subset of `timer,invlpg,smc,shadow,flags,int` to keep. Absent, everything |
 | `RSEMU_RISCV_LONGRUN_SEAMS` | the same for the RISC-V leg: `timer,clint,sfence,csr,amo,ecall` |
@@ -142,25 +143,61 @@ paragraph that used to stand here. `pc64` with a stock `bzImage` in its slot,
 both engines, quantum by quantum — the section after next has what it costs and
 what it caught.
 
+## A guest second stopped meaning what it meant
+
+**Every guest-time number on this page below this line was measured before
+`SchedulerConfig::max_ticks_per_quantum` was removed, and none of them has been
+rewritten.** They are kept as they were taken, with the ratio stated once here.
+
+That constant capped a scheduler round at ten thousand processor ticks whatever
+the board's oscillators declared, and a budget is recomputed from the tree's
+absolute position every round, so what a round could not spend became a backlog
+the next round re-capped. A processor's effective rate was therefore *ten
+thousand × rounds per guest second*, and the machine file had no say in it:
+`arm64-virt` and `riscv-virt` ran their 1 GHz cores at **1/100** of the
+declared rate, `pc64` its 100 MHz one at **1/4.96**, measured with
+`--trace clock`. `docs/techniques/execution-budgets.md` is the whole argument.
+
+So a guest second of those boards is now a hundred, and 4.96, times the guest
+work it was on this page. Every budget was divided by exactly that when the cap
+went, so each leg covers the same guest work in the same wall clock:
+
+| leg | was | is |
+| --- | --- | --- |
+| `check.sh long`, arm64 kernel | 120 s | 1 200 ms |
+| `check.sh long`, synthetics | 30 s | 300 ms |
+| `check.sh long`, x86 kernel | 900 s | 200 000 ms |
+| A64/RISC-V synthetic default | 2 s | 20 ms |
+| x86 synthetic default | 6 000 quanta | 1 200 quanta |
+
+Read every guest-time figure below as *the guest work that figure bought at the
+time*, and divide by 100 or 4.96 to get the guest time that buys it now.
+
 ## Two kernels, two budgets
 
-`RSEMU_LONGRUN_SECONDS` drives the AArch64 gate and `RSEMU_X86_LONGRUN_SECONDS`
-drives the x86 one, and that is deliberate rather than untidy. A guest second
+`RSEMU_LONGRUN_MS` drives the AArch64 gate and `RSEMU_X86_LONGRUN_MS` drives
+the x86 one, and that is deliberate rather than untidy. A unit of guest time
 does not mean the same thing on the two boards:
 
 * `arm64-virt` runs a 1 GHz core and reaches a shell inside twenty guest
-  seconds. 120 is well past both defects the gate exists for.
+  seconds *at the rate it ran then* — 200 ms now. 1 200 ms is well past both
+  defects the gate exists for.
 * `pc64` runs a **100 MHz** processor and has no firmware, so the `bzImage`
-  decompresses itself from the reset vector. Measured on the Debian installer
-  kernel: at 120 guest seconds the last thing the guest has printed is
-  `KASLR disabled: 'nokaslr' on cmdline` and it is still in the decompressor;
-  `Linux version` does not appear until somewhere between 400 and 600.
+  decompresses itself from the reset vector, and it needs far more guest work
+  than the arm64 leg to reach the same depth. Measured on the Debian installer
+  kernel, at the old rate: at 120 guest seconds the last thing the guest has
+  printed is `KASLR disabled: 'nokaslr' on cmdline` and it is still in the
+  decompressor; `Linux version` does not appear until somewhere between 400
+  and 600.
 
-So `RSEMU_LONGRUN_SECONDS=120` on both would have made the x86 leg a test of
-`REP MOVS` and nothing else. **900** is the default in `scripts/check.sh`, and
-that number is measured rather than chosen: the calibration below re-introduced
-a defect that needs an `STI`, and the first `STI` a Linux kernel executes on
-this board is at 635 guest seconds. The nightly's `workflow_dispatch` can raise
+So one budget on both would have made the x86 leg a test of `REP MOVS` and
+nothing else. **200 000 ms** is the default in `scripts/check.sh`, and that
+number is measured twice rather than chosen: the calibration below
+re-introduced a defect that needs an `STI`, and the first `STI` a Linux kernel
+executed on this board was at 635 guest seconds *at the old rate* — 128 s at
+the rate the board now runs — against a 900-second budget, so the gate had
+1.42x the depth it needs. 900 / 4.96 = 181 s reaches the same place; 200 s is
+that with the margin rounded up. The nightly's `workflow_dispatch` can raise
 either budget independently.
 
 ## The instrument is calibrated
@@ -369,10 +406,14 @@ seconds**, and the reason is in the second row of that table: one guest second
 of that board is 24 818 quanta and about three seconds of wall time per engine,
 which is twice what the rest of the target costs put together, and effectively
 all of it is repetition — the workload reaches every seam it was written for
-inside the first two hundred quanta. Six thousand quanta is 0.24 s of guest
+inside the first two hundred quanta. Six thousand quanta was 0.24 s of guest
 time, 46 000 passes round the loop, 2 900 code rewrites, 700 `INVLPG`s and 2 800
-timer interrupts. `RSEMU_LONGRUN_SECONDS` removes the cap, which is what
-`scripts/check.sh long` and the nightly do.
+timer interrupts. The cap is **1 200** now: a quantum on this board carries ten
+times the guest work it did, so a fifth of the quanta brings the per-pass counts
+back where they were — and the one count that is per guest *time* does not come
+back, about 560 timer interrupts against 2 800. A fifth rather than a tenth is
+the margin bought against that. `RSEMU_LONGRUN_MS` removes the cap, which is
+what `scripts/check.sh long` and the nightly do.
 
 The interpreter is the floor in every lockstep row — it is roughly 0.95 s of
 wall time per guest second on this host on its own — so the comparison costs
@@ -505,10 +546,16 @@ where it was found. It is green now, and both halves of the fix are worth
 recording because the shape recurs.
 
 A guest reads `mtime` in a tight loop and counts distinct values. Over eight
-quanta it should see several hundred: a hart on this board gets
-`SchedulerConfig::max_ticks_per_quantum` — ten thousand — of a 1 GHz domain per
-round, which is 10 µs, and `mtime` counts at 10 MHz. **It saw seven. One per
-quantum.** It sees **800** now, which is the hundred a round predicts.
+quanta it should see several hundred: a hart on this board was then given
+`SchedulerConfig::max_ticks_per_quantum` — a rate-blind ten thousand — of a
+1 GHz domain per round, which is 10 µs, and `mtime` counts at 10 MHz. **It saw
+seven. One per quantum.** It saw **800** once the fix landed, which is the
+hundred a round predicted.
+
+That cap is gone: a round now gives the hart a whole quantum of its own domain,
+a million ticks, so the same probe sees tens of thousands. The test's floor was
+written against the *bug* — one value per quantum — and is deliberately left
+where it is rather than retuned to the current budget.
 
 `riscv.clint` is a lazily-advanced device and its `Registers::read` calls `sync`
 before answering, precisely so a guest load catches the chip up to the core's

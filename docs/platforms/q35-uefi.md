@@ -618,12 +618,15 @@ mechanism now covers the whole fabric rather than one bridge's own registers:
   holds a clock domain — asks for the next tick while anything is owed and runs
   the sweep from `advance_to`.
 
-The bound is one scheduler round, and a round on this board is capped at
-`max_ticks_per_quantum` = 10 000 processor cycles rather than at the quantum's
-1 ms. **A window placed through ECAM therefore decodes late** — within a few
-thousand guest instructions of the write, where real firmware programs every BAR
-in `PciBusDxe` and reads the first device register in a different driver
-entirely. That is the honest cost of not having a `Deferred` on the access path,
+The bound is one scheduler round. When this was written a round on this board
+was capped at a rate-blind `max_ticks_per_quantum` of 10 000 processor cycles
+rather than at the quantum's 1 ms; it is now the quantum's worth of the
+processor's own domain, which on a 100 MHz core is 100 000 cycles. **A window
+placed through ECAM therefore decodes late** — within one round of the write,
+where real firmware programs every BAR in `PciBusDxe` and reads the first
+device register in a different driver entirely. The bound moved with the cap
+and nothing observed here changed, which is itself the argument that a round is
+the wrong unit for it. That is the honest cost of not having a `Deferred` on the access path,
 and it is written down in `bar.rs` rather than left to be discovered.
 
 One thing that fell out of it: `Bars::sync` now knows what it already placed, so

@@ -3,6 +3,21 @@
 Consumed by: `boards/riscv-virt` — the first machine that boots a real
 operating system.
 
+
+> **Guest-time figures on this page predate the removal of
+> `SchedulerConfig::max_ticks_per_quantum`.** That constant capped a
+> scheduler round at ten thousand processor ticks whatever the board
+> declared, so this board's 1 GHz core ran at 1/100 of its
+> declared rate against virtual time, and a guest second bought a hundred
+> times less processor work than it does now. Every *virtual second*,
+> *guest second*, `--for` span and printk timestamp below was measured at
+> that rate and is kept as it was taken; divide by a hundred to get the
+> guest time that buys the same work today. Ratios, host-instruction
+> counts, per-block figures and hashes taken over a *guest-side* window
+> are unaffected.
+> [`../techniques/execution-budgets.md`](../techniques/execution-budgets.md)
+> has the mechanism and the measurement.
+
 ## Why this board
 
 It is the smallest credible target that boots upstream Linux: a RISC-V hart, a
@@ -634,10 +649,12 @@ were unaffected either way; the test uses a device of its own that raises a line
 when read, which is a shape a board is free to have.
 
 **The bound.** `mtime` *was* a staircase to the guest, one step per scheduler
-round: with no comparator armed a round runs to
-`SchedulerConfig::max_ticks_per_quantum`, and the step measured on this board
-was exactly 10 000 `rtc` ticks — one millisecond — every round, for as long as
-the machine ran. That is what the cross-tree arming removed. A guest that loads
+round: with no comparator armed a round runs to the end of the quantum, and the
+step measured on this board was exactly 10 000 `rtc` ticks — one millisecond —
+every round, for as long as the machine ran. (10 000 because a round then gave
+the hart a rate-blind `SchedulerConfig::max_ticks_per_quantum` of 10 000 of its
+own 1 GHz ticks, which is 10 µs; a round now gives it the quantum's million, so
+the same staircase would have a step of a whole millisecond of `rtc`.) That is what the cross-tree arming removed. A guest that loads
 `mtime` now sees it advance inside the round, and the residual step is the one
 `rtc` tick a single 100-core-tick interval is worth. `csrr time` still lags by
 up to that one tick, because it reads `Registers::mtime_cell` as `republish`

@@ -35,14 +35,20 @@
 # `Scheduler::ticks_until_after` says at length why that is outside the clock
 # model in *both* threading modes: one counter cannot express one processor
 # halted while the other runs. What makes the board work anyway is
-# `SchedulerConfig::max_ticks_per_quantum`, which caps what the first runnable
-# may take and leaves the rest of the round's span for the second.
+# `Scheduler::tree_shares`: a round offers each runnable the span its tree has
+# left divided by however many runnables still have a turn, so the first hart
+# is offered half and the second is offered the other half.
 #
-# It is written here because it is a real limitation of a board every shipped
-# `-smp` file has, not a property of this fixture: with a quantum short enough
-# that one hart's cap covers the whole round, the second hart gets a budget of
-# zero and does not run at all. `docs/techniques/parallel-execution.md` has the
-# arithmetic and the test that pins it.
+# It is written here because what is *left* of the limitation is a real
+# property of a board every shipped `-smp` file has, not of this fixture: each
+# hart executes at **half** the 100 MHz declared above, because dividing is the
+# best one counter can do. Two crystals is the fix and
+# `machines/tests/heterogeneous.machine` is the board that has them.
+#
+# Until 2026-09 a rate-blind `SchedulerConfig::max_ticks_per_quantum` of 10 000
+# stood in for the share, and raising it past a round's span starved the second
+# hart for ever. `docs/techniques/parallel-execution.md` has that history, the
+# arithmetic, and the test that pins the current behaviour.
 #
 # ## Sources
 #

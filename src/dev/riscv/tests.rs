@@ -1120,9 +1120,17 @@ fn the_single_hart_board_runs_only_hart_zero() {
     // The control for the test above, and the thing that says the two board
     // files are genuinely different rather than both being SMP. The same
     // program on `riscv-virt` spins forever, because nothing writes the flag.
+    //
+    // **Forty quanta, where it was four thousand.** This is the one test here
+    // that spends its whole ceiling — the others stop the moment the guest
+    // powers off — and a quantum on this board is a hundred times the guest
+    // work it used to be, because `SchedulerConfig::max_ticks_per_quantum`
+    // gave a 1 GHz hart ten thousand ticks a round instead of the quantum's
+    // million. Forty is forty milliseconds of a hart that spins on one branch;
+    // four thousand would be four seconds of it, in a debug build.
     let mut b = board("smp-control", &two_hart_handshake());
     assert_eq!(
-        b.run(4_000),
+        b.run(40),
         None,
         "something answered hart 0 on a one-hart board"
     );

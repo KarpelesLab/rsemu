@@ -156,7 +156,12 @@ use x86boot::{Drains, Script};
 /// PCI bus, walk an ACPI namespace, and probe a controller. A ceiling rather
 /// than a target — the run stops early when the processor stops making
 /// progress, or when the guest prints `RSEMU_KERNEL_STOP_AT`.
-const DEFAULT_MS: u64 = 1_500_000;
+///
+/// **315 000, where it was 1 500 000**, still half again `pc64`'s. Both were
+/// divided by the 4.96 that a guest second of a 100 MHz board gained when
+/// `SchedulerConfig::max_ticks_per_quantum` went; see that file's `DEFAULT_MS`
+/// and `docs/techniques/execution-budgets.md`.
+const DEFAULT_MS: u64 = 315_000;
 
 /// What the test stamps over the front of a blank namespace.
 ///

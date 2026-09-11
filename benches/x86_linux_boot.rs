@@ -302,6 +302,15 @@ fn skip() {
 /// What the command line can change.
 struct Args {
     /// How much *virtual* time to run, in seconds.
+    ///
+    /// **24, where it was 120.** Not a shorter profile: a guest second of this
+    /// board is 4.96 times the processor work it used to be, because
+    /// `SchedulerConfig::max_ticks_per_quantum` capped a round at ten thousand
+    /// of its 100 MHz core's ticks instead of the quantum's hundred thousand,
+    /// so this is the same span of the boot in the same wall clock. Every
+    /// guest-second figure in this file's documentation was taken at the old
+    /// rate; divide by 4.96 to get the guest time that buys it now.
+    /// `docs/techniques/execution-budgets.md` has the arithmetic.
     seconds: u64,
     /// `interp`, `jit` or `jit-host`.
     engine: String,
@@ -318,7 +327,7 @@ struct Args {
 impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Args {
         let mut out = Args {
-            seconds: 120,
+            seconds: 24,
             engine: "jit-host".to_string(),
             reps: 1,
             hash: false,

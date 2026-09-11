@@ -209,6 +209,7 @@ would answer that the machine file does not.
 | | |
 | --- | --- |
 | [`techniques/binary-translation.md`](techniques/binary-translation.md) | DBT, JIT, register allocation |
+| [`techniques/execution-budgets.md`](techniques/execution-budgets.md) | How many ticks a scheduler round hands a processor, why a rate-blind cap made a board's declared clock rate a fiction, and what removing it cost in host instructions |
 | [`techniques/memory-models.md`](techniques/memory-models.md) | x86-TSO, ARM/POWER relaxed models, barrier lowering |
 | [`techniques/parallel-execution.md`](techniques/parallel-execution.md) | What `ThreadingMode::Parallel` promises, what a machine file may say, and how a run with no state hash is checked |
 | [`techniques/virtualization.md`](techniques/virtualization.md) | KVM, Hypervisor.framework, WHPX |

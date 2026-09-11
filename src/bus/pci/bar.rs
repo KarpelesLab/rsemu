@@ -115,10 +115,12 @@
 //! with no access in flight. On a q35 that device is the host bridge
 //! ([`crate::dev::q35::mch`]), which already keeps a clock domain for exactly
 //! this reason — its own `PCIEXBAR` window moves from inside an ECAM write and
-//! met the problem first. The bound is one scheduler round: `Machine::advance_to`
-//! calls `Scheduler::sync_lazy_devices` after every quantum, and a round on a
-//! PC-shaped board is capped at `SchedulerConfig::max_ticks_per_quantum`
-//! processor cycles, not at the quantum's wall-clock length.
+//! met the problem first. The bound is one scheduler round:
+//! `Machine::advance_to` calls `Scheduler::sync_lazy_devices` after every
+//! quantum, and a round's length in processor cycles is the quantum's worth of
+//! the processor's own clock domain — 100 000 on a 100 MHz board, against the
+//! rate-blind `SchedulerConfig::max_ticks_per_quantum` of 10 000 that used to
+//! decide it.
 //!
 //! Two consequences worth writing down rather than discovering:
 //!
