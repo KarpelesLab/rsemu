@@ -45,7 +45,19 @@ oxideav-png = { version = "0.1", default-features = false, optional = true }
 # `purecrypto` -- permitted -- **and `serde` + `serde_json`**, because a LUKS2
 # header is a JSON document. That is a deliberate trade for a machine that
 # actually needs an encrypted guest disk, not a default.
-fstool = { version = "0.4.26", default-features = false, features = [
+#
+# **Upper-bounded deliberately.** `fstool` 0.4.28 is the first release whose
+# `std` build demands at least one filesystem feature
+# (`fat`, `ext`, ... or `filesystems`), because its `inspect` entry point has
+# nothing to dispatch to otherwise. This crate uses the **block layer only** --
+# `BlockDevice`, `block::open_image*`, `Error` -- and never names `AnyFs` or
+# `inspect`, so a filesystem feature here would be dead weight pulled in to
+# satisfy a check that does not apply to us. `/Cargo.lock` is gitignored, so
+# without this bound a fresh clone resolves 0.4.30 and fails to compile while a
+# warm cache keeps working -- which is the shape of break that reaches CI only
+# when its cache expires. See `docs/upstream/fstool-std-filesystem-feature.md`
+# for the upstream fix this is waiting on; lift the bound when it lands.
+fstool = { version = ">=0.4.26, <0.4.28", default-features = false, features = [
   "gzip",
   "zstd",
 ], optional = true }
