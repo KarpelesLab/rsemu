@@ -397,6 +397,11 @@ fn a_zero_length_segment_is_disabled() {
     assert_eq!(rig.resets(), 0);
 }
 
+// The only test here that needs a *second* device. `syscfg` lives behind
+// `dev-stm32-exti`, so without this gate a build of `dev-stm32-firewall` alone
+// fails to compile its tests — which `cargo build` does not notice and the
+// feature sweep's `cargo test` does.
+#[cfg(feature = "dev-stm32-exti")]
 #[test]
 fn fwdis_from_a_real_syscfg_is_what_switches_the_firewall_on() {
     // The seam the issue is about: `SYSCFG_CFGR1.FWDIS` had no reader, so

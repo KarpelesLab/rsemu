@@ -509,7 +509,7 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// push its processor to `cpu1`.
     ///
     /// It is deliberately *not* the device's
-    /// [`RequesterId`](crate::core::space::RequesterId), which is `ANONYMOUS`
+    /// [`RequesterId`], which is `ANONYMOUS`
     /// on most boards and would name every core `cpu0`.
     ///
     /// Like [`export`](Device::export), this is wiring rather than guest state:

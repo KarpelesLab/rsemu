@@ -41,9 +41,9 @@
 //! `CR2` carries `NBYTES`/`AUTOEND` and the hardware runs the transfer that v1
 //! drives byte by byte from software. Nothing could serve both.
 //!
-//! Here one engine serves both. [`Shared::advance_to`], [`Shared::begin`],
-//! [`Shared::finish`], [`Shared::tx_bit`], [`Shared::capture`],
-//! [`Shared::check_mode_fault`] and the whole slave face are written once and
+//! Here one engine serves both. `Shared::advance_to`, `Shared::begin`,
+//! `Shared::finish`, `Shared::tx_bit`, `Shared::capture`,
+//! `Shared::check_mode_fault` and the whole slave face are written once and
 //! are correct for both generations; what forks is how a frame is *fetched*
 //! and *deposited*, which is a dozen lines at each end. A second class would
 //! have been a second copy of the engine, kept in step by hand — the exact
@@ -1253,7 +1253,7 @@ impl Shared {
     /// its Tx FIFO or a CRC transfer part-way through. The last two matter
     /// because the `"f7"` block can hold several frames: without them the
     /// device would fall idle with work queued and nothing would wake it, since
-    /// only a register write calls [`Shared::begin`] from outside.
+    /// only a register write calls `Shared::begin` from outside.
     fn pending(state: &State) -> bool {
         state.is_master()
             && state.is_enabled()

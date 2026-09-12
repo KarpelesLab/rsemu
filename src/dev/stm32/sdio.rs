@@ -24,14 +24,14 @@
 //!   that costs the most, because it fails *quietly*: a driver that sends
 //!   `ACMD41` with `10b` — the right thing on an H7 — gets `CMDSENT`, an
 //!   untouched `RESP1` and an OCR of zero, and concludes the card never powered
-//!   up. See [`Shape::of`], which is four lines and is the whole of it.
+//!   up. See `Shape::of`, which is four lines and is the whole of it.
 //! * **There is no "short, no CRC" encoding at all**, which is why `R3` and
 //!   `R4` — whose CRC field is all ones because they carry none (Physical Layer
 //!   §4.9.4) — are sent with `WAITRESP = 01b` and come back with
 //!   **`CCRCFAIL` instead of `CMDREND`**. That is not a failure, and every
 //!   STM32 SD driver clears it and carries on; a model that reported `CMDREND`
 //!   would be one whose `ACMD41` loop never terminates on real firmware. See
-//!   [`Shared::run_command`].
+//!   `Shared::run_command`.
 //! * **The FIFO is thirty-two words**, not sixteen, and the half thresholds are
 //!   at eight words either way rather than at the midpoint: `TXFIFOHE` means
 //!   "at least eight words can be written", `RXFIFOHF` "at least eight words
@@ -86,7 +86,7 @@
 //! and strand a tail of fewer than eight that no further request would ever
 //! collect. Following `RXDAVL` and FIFO room instead moves the same words, in
 //! the same order, at the same points in the stream. When `st.dma` grows
-//! bursts, [`Regs::dma_request`] is the one function to revisit.
+//! bursts, `Regs::dma_request` is the one function to revisit.
 //!
 //! Nothing outward happens while the register lock is held: both levels are
 //! computed under it, the lock is dropped, and only then are the wires driven
