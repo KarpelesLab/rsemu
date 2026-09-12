@@ -100,6 +100,8 @@ pub fn default_migrations() -> Result<Migrations> {
     let mut migrations = Migrations::new();
     #[cfg(feature = "dev-flash-spinor")]
     crate::dev::flash::spinor::migrations(&mut migrations)?;
+    #[cfg(feature = "dev-stm32-octospi")]
+    crate::dev::stm32::octospi::migrations(&mut migrations)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::migrations(&mut migrations)?;
     Ok(migrations)
@@ -117,6 +119,8 @@ mod tests {
     const CLASSES: &[&str] = &[
         #[cfg(feature = "dev-flash-spinor")]
         crate::dev::flash::spinor::CLASS_NAME,
+        #[cfg(feature = "dev-stm32-octospi")]
+        crate::dev::stm32::octospi::CLASS_NAME,
     ];
 
     #[test]

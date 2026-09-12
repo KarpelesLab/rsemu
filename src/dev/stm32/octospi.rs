@@ -57,19 +57,30 @@
 //! 0" and `DLR` "has no meaning" while `FMODE = 11`, and this model answers the
 //! same way.
 //!
-//! # One data line, and what a `DCYC` means here
+//! # How many wires, and what a `DCYC` means here
 //!
-//! `bus::spi` is a single-line fabric, so `CCR`'s `IMODE`/`ADMODE`/`ABMODE`/
-//! `DMODE` are stored, read back, and used only to decide whether each phase
-//! happens at all — not how many wires carry it. Dummy cycles are therefore
-//! converted to whole bytes at **eight cycles to the byte**, which is exactly
-//! right for every single-line command (`0Bh` fast read is `DCYC = 8`, one
-//! byte) and is a documented approximation for a quad one. A configuration
-//! copied from a real board's quad setup will not line up byte for byte with
-//! the flash's expectations, and the module says so rather than inventing a
-//! wire count the fabric does not have.
+//! `CCR`'s `IMODE`/`ADMODE`/`ABMODE`/`DMODE` say both *whether* a phase
+//! happens and *how many lines carry it*, and both halves are used: each phase
+//! is clocked down [`crate::bus::spi`] as [`Lines`], which the part on the far
+//! end reads out of
+//! [`SpiSlave::transfer_wide`](crate::bus::spi::SpiSlave::transfer_wide). A
+//! [`psram.qspi`](crate::dev::psram) in QPI mode cannot decode a one-line
+//! opcode at all, so a model that discarded the width would have it answering
+//! commands the silicon never understood.
 //!
-//! # Time
+//! That is also what makes `TCR.DCYC` right. A dummy phase is counted in
+//! *clocks* by every datasheet and by this register; how many bytes those
+//! clocks carry depends on the width of the data phase they precede. `0Bh`
+//! fast read is `DCYC = 8` on one line — one byte, as before — and `EBh` is
+//! `DCYC = 6` on four, which is 24 bits and therefore three. A configuration
+//! copied off a real board now lines up byte for byte with the part's
+//! expectations.
+//!
+//! The fabric's remaining limit is the *wired* link: there is one `mosi` wire
+//! in the pin map, so `link = "wired"` carries no width. This peripheral takes
+//! `link = "transactional"` and nothing else, so the limit never reaches it.
+//!
+//! # Time, and the chip-select-low period
 //!
 //! **Deliberately zero**, and this one is forced rather than chosen. A
 //! memory-mapped access happens *inside a guest load*: the CPU is mid-access,
@@ -77,15 +88,40 @@
 //! load later. So the frame is clocked to completion within the access, and
 //! the peripheral takes no clock domain.
 //!
-//! The consequence is unusually tidy. `CR.TCEN` and `LPTR` exist so that
-//! hardware releases `NCS` after an idle period, letting the memory drop into
-//! standby (AN5050 §9.2.2); this model **already releases the chip select at
-//! the end of every transaction**, so it is permanently in the state the
-//! timeout counter exists to produce, and `TOF` correspondingly never sets.
-//! The registers are stored and read back so a driver sees its own
-//! configuration — `CR`'s `TCEN` (bit 3) with them, and `DMAEN` (bit 2), which
-//! is inert for the plainer reason that nothing in this tree is a DMA peer
-//! this peripheral could hand a burst to.
+//! It still *counts*, and that is a different thing from taking time. Every
+//! phase's length in serial-clock cycles is exact integer arithmetic — a byte
+//! on `n` lines is `8/n` cycles — so the peripheral knows how long it held the
+//! chip select without ever reading a clock. Three register fields that were
+//! dead storage are live on the back of that count, and all three exist
+//! because of pseudo-static RAM:
+//!
+//! * **`DCR3.CSBOUND`** — release `NCS` at every `2^CSBOUND`-byte boundary. A
+//!   QSPI PSRAM's linear burst wraps inside a 1 KiB page, so `CSBOUND = 10` is
+//!   how a driver reads across one.
+//! * **`DCR3.MAXTRAN`** — release `NCS` after `MAXTRAN + 1` bytes. This is the
+//!   field ST put there for **tCEM**: an APS6404L refreshes only while the
+//!   chip select is high, and a burst that never lets go loses data.
+//! * **`CR.TCEN` + `LPTR`** — the timeout. `LPTR` bounds the chip-select-low
+//!   period in serial-clock cycles; a transaction that exceeds it sets `SR.TOF`
+//!   and raises the interrupt when `TOIE` is set.
+//!
+//! `LPTR` is the one place this model reads the hardware's field differently
+//! from the hardware, and it is worth being exact about. On silicon the
+//! counter runs on the *idle* time after the last memory-mapped access and
+//! releases `NCS` when it expires (AN5050 §9.2.2). This model releases the
+//! chip select at the end of every transaction, so it has no idle period with
+//! `NCS` low to count — the state the counter exists to produce is the state
+//! it is permanently in. The quantity that is left, and the one a PSRAM driver
+//! actually programs `LPTR` against, is how long a single assertion lasted, so
+//! that is what the counter measures here. With `TCEN` clear it measures
+//! nothing, which is the default.
+//!
+//! `DCR4.REFRESH` stays stored-and-inert, for the reason the rest of this
+//! section gives: it is denominated in *kernel-clock* cycles, and reaching
+//! those from serial-clock cycles means `DCR2.PRESCALER` and a clock domain
+//! this peripheral deliberately does not have. `CR.DMAEN` (bit 2) is inert for
+//! the plainer reason that nothing in this tree is a DMA peer this peripheral
+//! could hand a burst to.
 //!
 //! # `MemAttrs::debug` and the window
 //!
@@ -103,7 +139,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::bus::spi::{ChipSelect, Link, MAX_CHIP_SELECTS, SpiBus, buses};
+use crate::bus::spi::{ChipSelect, Lines, Link, MAX_CHIP_SELECTS, SpiBus, buses};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -119,7 +155,7 @@ use crate::machine::validate::{ClassSchema, PropSchema};
 pub const CLASS_NAME: &str = "stm32.octospi";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How much address space the register block occupies.
 pub const REGISTER_BYTES: u64 = 0x400;
@@ -137,6 +173,10 @@ pub const WINDOW_BYTES: u64 = 256 * 1024 * 1024;
 const CR_EN: u32 = 1 << 0;
 /// Abort the transaction in flight. Self-clearing.
 const CR_ABORT: u32 = 1 << 1;
+/// Timeout counter enable, bit 3. See the module docs for what this model
+/// counts with it: the chip-select-low period of a transaction, since it has
+/// no idle period with `NCS` low to count instead.
+const CR_TCEN: u32 = 1 << 3;
 /// FIFO threshold, bits 12:8.
 const CR_FTHRES_SHIFT: u32 = 8;
 /// And its mask, once shifted down.
@@ -175,6 +215,17 @@ const FMODE_MAPPED: u32 = 3;
 const DCR1_DEVSIZE_SHIFT: u32 = 16;
 /// And its mask, once shifted down.
 const DCR1_DEVSIZE_MASK: u32 = 0x1f;
+
+// -- DCR3 (0x010) -----------------------------------------------------------
+
+/// Chip-select boundary, bits 20:16: release `NCS` whenever a transaction
+/// crosses a `2^CSBOUND`-byte boundary. Zero disables it.
+const DCR3_CSBOUND_SHIFT: u32 = 16;
+/// And its mask, once shifted down.
+const DCR3_CSBOUND_MASK: u32 = 0x1f;
+/// Maximum transfer, bits 7:0: release `NCS` after `MAXTRAN + 1` bytes. Zero
+/// disables it. This is ST's field for a pseudo-static RAM's tCEM.
+const DCR3_MAXTRAN_MASK: u32 = 0xff;
 
 // -- SR (0x020) and FCR (0x024) --------------------------------------------
 
@@ -247,19 +298,48 @@ fn config(message: String) -> Error {
 // the command a set of registers describes
 // ---------------------------------------------------------------------------
 
+/// The line count a `CCR` mode field names.
+///
+/// `000` is "this phase does not happen"; `001` to `100` are one, two, four
+/// and eight lines. The reserved encodings above `100` are read as one line
+/// rather than refused — a nonsense mode field is the guest's bug to see in
+/// the frame it gets, not a reason to fault a register write.
+fn mode_lines(mode: u32) -> Option<Lines> {
+    match mode {
+        0 => None,
+        2 => Some(Lines::DUAL),
+        3 => Some(Lines::QUAD),
+        4 => Some(Lines::OCTAL),
+        _ => Some(Lines::SINGLE),
+    }
+}
+
+/// One phase of a frame: how many bytes, and on how many wires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Phase {
+    /// The value to clock out, most significant byte first.
+    value: u32,
+    /// How many bytes of it.
+    bytes: u8,
+    /// How many wires carry them.
+    lines: Lines,
+}
+
 /// One of the three parallel register sets, decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Command {
-    /// Whether the instruction phase happens, and the instruction itself.
-    instruction: Option<(u32, u8)>,
-    /// How many address bytes, or none.
-    address_bytes: u8,
-    /// The alternate bytes and how many of them, or none.
-    alternate: Option<(u32, u8)>,
-    /// How many dummy bytes sit between the header and the data.
-    dummy_bytes: u8,
-    /// Whether a data phase happens at all.
-    has_data: bool,
+    /// The instruction phase, or none.
+    instruction: Option<Phase>,
+    /// The address phase — its width, and how many bytes — or none. The value
+    /// is supplied per transaction rather than by the registers.
+    address: Option<(u8, Lines)>,
+    /// The alternate-byte phase, or none.
+    alternate: Option<Phase>,
+    /// The dummy phase, in **bits on the wire**: `DCYC` clocks at the width of
+    /// the data phase that follows them.
+    dummy_bits: u64,
+    /// The data phase's width, or none when the command has no data phase.
+    data: Option<Lines>,
 }
 
 impl Command {
@@ -267,22 +347,54 @@ impl Command {
     /// `ir` and `abr`.
     fn decode(ccr: u32, tcr: u32, ir: u32, abr: u32) -> Command {
         let field = |shift: u32, mask: u32| (ccr >> shift) & mask;
-        let imode = field(CCR_IMODE_SHIFT, MODE_MASK);
-        let admode = field(CCR_ADMODE_SHIFT, MODE_MASK);
-        let abmode = field(CCR_ABMODE_SHIFT, MODE_MASK);
-        let dmode = field(CCR_DMODE_SHIFT, MODE_MASK);
+        let imode = mode_lines(field(CCR_IMODE_SHIFT, MODE_MASK));
+        let admode = mode_lines(field(CCR_ADMODE_SHIFT, MODE_MASK));
+        let abmode = mode_lines(field(CCR_ABMODE_SHIFT, MODE_MASK));
+        let dmode = mode_lines(field(CCR_DMODE_SHIFT, MODE_MASK));
         // Every `*SIZE` field is `n + 1` bytes: 8, 16, 24 or 32 bits.
         let isize = (field(CCR_ISIZE_SHIFT, SIZE_MASK) + 1) as u8;
         let asize = (field(CCR_ADSIZE_SHIFT, SIZE_MASK) + 1) as u8;
         let absize = (field(CCR_ABSIZE_SHIFT, SIZE_MASK) + 1) as u8;
+        // `DCYC` is a count of *clocks*, and how many bits a clock carries is
+        // the width of the phase it belongs to — the data phase's, since the
+        // dummy cycles sit immediately before it. `0Bh` is 8 clocks on one
+        // line, one byte; `EBh` is 6 clocks on four, three bytes.
+        let dummy_lines = dmode.unwrap_or(Lines::SINGLE);
         Command {
-            instruction: (imode != 0).then_some((ir, isize)),
-            address_bytes: if admode != 0 { asize } else { 0 },
-            alternate: (abmode != 0).then_some((abr, absize)),
-            // Eight cycles to the byte. The module docs say why, and what it
-            // costs on a multi-line configuration.
-            dummy_bytes: ((tcr & TCR_DCYC_MASK).div_ceil(8)) as u8,
-            has_data: dmode != 0,
+            instruction: imode.map(|lines| Phase {
+                value: ir,
+                bytes: isize,
+                lines,
+            }),
+            address: admode.map(|lines| (asize, lines)),
+            alternate: abmode.map(|lines| Phase {
+                value: abr,
+                bytes: absize,
+                lines,
+            }),
+            dummy_bits: dummy_lines.bits(u64::from(tcr & TCR_DCYC_MASK)),
+            data: dmode,
+        }
+    }
+
+    /// How many address bytes this command carries, zero for none.
+    const fn address_bytes(&self) -> u8 {
+        match self.address {
+            Some((bytes, _)) => bytes,
+            None => 0,
+        }
+    }
+
+    /// Whether a data phase happens at all.
+    const fn has_data(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// The width the data phase runs at, single-line when there is none.
+    const fn data_lines(&self) -> Lines {
+        match self.data {
+            Some(lines) => lines,
+            None => Lines::SINGLE,
         }
     }
 }
@@ -330,6 +442,19 @@ struct State {
     writing: bool,
     /// How many data bytes of it are still to move.
     remaining: u64,
+    /// How many serial-clock cycles the open transaction has held the chip
+    /// select for so far.
+    ///
+    /// Counted rather than timed: this peripheral has no clock domain (the
+    /// module docs say why), but a byte on `n` lines is exactly `8 / n`
+    /// clocks, so the length of an assertion is integer arithmetic over the
+    /// frame it issued. `CR.TCEN` turns it into `SR.TOF`.
+    ///
+    /// In the snapshot because an indirect transaction is: a machine saved
+    /// between an `AR` write and the last `DR` read has a frame open, and a
+    /// restore that forgot how long it had been open would let a burst the
+    /// guest split correctly run past the timeout on the far side.
+    cs_cycles: u64,
 }
 
 impl State {
@@ -342,6 +467,31 @@ impl State {
     /// (AN5050 §5.2).
     const fn device_bytes(&self) -> u64 {
         1u64 << (((self.dcr1 >> DCR1_DEVSIZE_SHIFT) & DCR1_DEVSIZE_MASK) + 1)
+    }
+
+    /// The chip-select boundary `DCR3.CSBOUND` names, in bytes, or [`None`]
+    /// when the field is zero and the feature is off.
+    ///
+    /// A transaction that would cross one is split there and the chip select
+    /// is released, which is how a driver reads across a PSRAM's 1 KiB page
+    /// wrap: `CSBOUND = 10`.
+    const fn cs_boundary(&self) -> Option<u64> {
+        match (self.dcr3 >> DCR3_CSBOUND_SHIFT) & DCR3_CSBOUND_MASK {
+            0 => None,
+            n => Some(1u64 << n),
+        }
+    }
+
+    /// How many bytes `DCR3.MAXTRAN` allows in one chip-select assertion, or
+    /// [`None`] when the field is zero.
+    ///
+    /// `MAXTRAN + 1`, per the field's own definition. ST put it there for
+    /// tCEM: the part refreshes only while the chip select is high.
+    const fn max_transfer(&self) -> Option<u64> {
+        match self.dcr3 & DCR3_MAXTRAN_MASK {
+            0 => None,
+            n => Some(n as u64 + 1),
+        }
     }
 
     /// The FIFO threshold, in bytes.
@@ -435,36 +585,60 @@ impl Shared {
         }
     }
 
-    /// Exchange one byte with whatever is on the chip select.
-    fn byte(&self, out: u8) -> u8 {
-        self.bus
-            .as_ref()
-            .map_or(IDLE_BYTE, |bus| bus.transfer(u32::from(out)) as u8)
+    /// Exchange one byte with whatever is on the chip select, on `lines`
+    /// wires, and charge the chip-select-low counter for it.
+    ///
+    /// A byte is eight bits however wide the phase is, so what the width
+    /// changes is the number of *clocks* it took: `8 / lines`. That is the
+    /// arithmetic the whole timeout rests on and it is exact — every width a
+    /// serial memory has divides eight.
+    ///
+    /// Called with no lock of ours held: it reaches another device. The cycle
+    /// count comes back rather than being folded in here for the same reason.
+    fn byte_on(&self, out: u8, lines: Lines) -> (u8, u64) {
+        let got = self.bus.as_ref().map_or(IDLE_BYTE, |bus| {
+            bus.transfer_wide(u32::from(out), lines) as u8
+        });
+        (got, lines.cycles(8))
     }
 
     /// Assert the chip select and clock the header phases of `cmd`.
     ///
-    /// Called with no lock of ours held: it reaches another device.
-    fn open(&self, cmd: &Command, address: u32) {
+    /// Returns how many serial-clock cycles that took. Called with no lock of
+    /// ours held: it reaches another device.
+    fn open(&self, cmd: &Command, address: u32) -> u64 {
         if let Some(bus) = &self.bus {
             bus.select(Some(self.cs));
         }
-        if let Some((instruction, bytes)) = cmd.instruction {
-            for i in (0..bytes).rev() {
-                self.byte((instruction >> (8 * u32::from(i))) as u8);
+        let mut cycles = 0;
+        if let Some(phase) = cmd.instruction {
+            for i in (0..phase.bytes).rev() {
+                cycles += self
+                    .byte_on((phase.value >> (8 * u32::from(i))) as u8, phase.lines)
+                    .1;
             }
         }
-        for i in (0..cmd.address_bytes).rev() {
-            self.byte((address >> (8 * u32::from(i))) as u8);
-        }
-        if let Some((alternate, bytes)) = cmd.alternate {
+        if let Some((bytes, lines)) = cmd.address {
             for i in (0..bytes).rev() {
-                self.byte((alternate >> (8 * u32::from(i))) as u8);
+                cycles += self.byte_on((address >> (8 * u32::from(i))) as u8, lines).1;
             }
         }
-        for _ in 0..cmd.dummy_bytes {
-            self.byte(IDLE_BYTE);
+        if let Some(phase) = cmd.alternate {
+            for i in (0..phase.bytes).rev() {
+                cycles += self
+                    .byte_on((phase.value >> (8 * u32::from(i))) as u8, phase.lines)
+                    .1;
+            }
         }
+        // The dummy phase is a count of bits on the wire; the link moves
+        // bytes, so a phase that is not a whole number of them is rounded up
+        // — a fractional byte is a byte, and a driver that programmed one has
+        // asked for something the fabric cannot frame.
+        let dummy_lines = cmd.data_lines();
+        for _ in 0..cmd.dummy_bits.div_ceil(8) {
+            cycles += self.byte_on(IDLE_BYTE, dummy_lines).1;
+        }
+        cycles
     }
 
     /// Release the chip select.
@@ -474,18 +648,74 @@ impl Shared {
         }
     }
 
-    /// Run a complete self-contained frame and return what came back.
+    /// End one chip-select assertion that lasted `cycles`, raising `TOF` if
+    /// the timeout counter was enabled and it went on too long.
+    ///
+    /// The chip select is released either way — this model has no idle period
+    /// with `NCS` low, which is exactly why the counter measures the assertion
+    /// rather than the idle after it. See the module docs.
+    fn end_select(&self, cycles: u64) {
+        self.close();
+        let raise = {
+            let mut state = self.state.lock();
+            // The counter belongs to the assertion that just ended. Zeroing it
+            // here rather than at the next `open` is what keeps it out of an
+            // *idle* snapshot, where a leftover count would be state the
+            // peripheral no longer has — and `catalog`'s resume ledger
+            // notices, because a restore normalises it and the re-save differs.
+            state.cs_cycles = 0;
+            if state.cr & CR_TCEN != 0 && cycles > u64::from(state.lptr) {
+                state.sr |= SR_TOF;
+                true
+            } else {
+                false
+            }
+        };
+        if raise {
+            self.publish_irq();
+        }
+    }
+
+    /// Run a complete self-contained frame.
+    ///
+    /// The data phase is split wherever `DCR3` says the chip select must be
+    /// released — at a `CSBOUND` boundary, after `MAXTRAN + 1` bytes — and
+    /// each piece is a fresh frame at the address it starts from, which is
+    /// what the hardware issues and what a PSRAM's tCEM needs.
     fn frame(&self, cmd: &Command, address: u32, data: &mut [u8], writing: bool) {
-        self.open(cmd, address);
-        if cmd.has_data {
-            for byte in data.iter_mut() {
-                let got = self.byte(if writing { *byte } else { IDLE_BYTE });
+        let (boundary, maxtran) = {
+            let state = self.state.lock();
+            (state.cs_boundary(), state.max_transfer())
+        };
+        if !cmd.has_data() || data.is_empty() {
+            let cycles = self.open(cmd, address);
+            self.end_select(cycles);
+            return;
+        }
+        let lines = cmd.data_lines();
+        let mut at = 0u64;
+        let total = data.len() as u64;
+        while at < total {
+            let base = u64::from(address) + at;
+            let mut span = total - at;
+            if let Some(boundary) = boundary {
+                // How far it is to the next boundary from here.
+                span = span.min(boundary - (base % boundary));
+            }
+            if let Some(maxtran) = maxtran {
+                span = span.min(maxtran);
+            }
+            let mut cycles = self.open(cmd, base as u32);
+            for byte in &mut data[at as usize..(at + span) as usize] {
+                let (got, spent) = self.byte_on(if writing { *byte } else { IDLE_BYTE }, lines);
+                cycles += spent;
                 if !writing {
                     *byte = got;
                 }
             }
+            self.end_select(cycles);
+            at += span;
         }
-        self.close();
     }
 }
 
@@ -753,7 +983,7 @@ impl RegisterBlock {
             }
             0x110 => {
                 state.ir = value;
-                if state.read_command().address_bytes == 0 {
+                if state.read_command().address_bytes() == 0 {
                     self.trigger(&mut state, 0)
                 } else {
                     After::Nothing
@@ -817,7 +1047,7 @@ impl RegisterBlock {
             FMODE_POLL => After::Poll { cmd, address },
             mode @ (FMODE_READ | FMODE_WRITE) => {
                 let writing = mode == FMODE_WRITE;
-                if !cmd.has_data {
+                if !cmd.has_data() {
                     // A command with no data phase — `06h` write enable, `20h`
                     // sector erase — is complete the moment its header has
                     // been clocked.
@@ -917,20 +1147,24 @@ impl RegisterBlock {
                 address,
                 writing,
             } => {
-                self.shared.open(&cmd, address);
+                let cycles = self.shared.open(&cmd, address);
                 let close = {
-                    let state = self.shared.state.lock();
+                    let mut state = self.shared.state.lock();
+                    state.cs_cycles = cycles;
                     !state.open
                 };
                 if close {
                     // A header-only command: nothing more to clock, so the
                     // chip select rises here — which is where the flash
                     // commits it.
-                    self.shared.close();
+                    self.shared.end_select(cycles);
                 }
                 let _ = writing;
             }
-            After::Close => self.shared.close(),
+            After::Close => {
+                let cycles = self.shared.state.lock().cs_cycles;
+                self.shared.end_select(cycles);
+            }
             After::Poll { cmd, address } => self.poll(&cmd, address),
         }
     }
@@ -988,6 +1222,7 @@ impl RegisterBlock {
             return Ok(());
         }
         let mut close = false;
+        let lines = self.shared.state.lock().read_command().data_lines();
         for byte in dst.iter_mut() {
             let take = {
                 let mut state = self.shared.state.lock();
@@ -1003,10 +1238,17 @@ impl RegisterBlock {
                     true
                 }
             };
-            *byte = if take { self.shared.byte(IDLE_BYTE) } else { 0 };
+            if take {
+                let (got, spent) = self.shared.byte_on(IDLE_BYTE, lines);
+                *byte = got;
+                self.shared.state.lock().cs_cycles += spent;
+            } else {
+                *byte = 0;
+            }
         }
         if close {
-            self.shared.close();
+            let cycles = self.shared.state.lock().cs_cycles;
+            self.shared.end_select(cycles);
         }
         Ok(())
     }
@@ -1014,6 +1256,7 @@ impl RegisterBlock {
     /// Write to `DR`, pushing bytes into the open transaction.
     fn write_data(&self, src: &[u8]) -> MemResult {
         let mut close = false;
+        let lines = self.shared.state.lock().read_command().data_lines();
         for byte in src {
             let push = {
                 let mut state = self.shared.state.lock();
@@ -1030,11 +1273,13 @@ impl RegisterBlock {
                 }
             };
             if push {
-                self.shared.byte(*byte);
+                let spent = self.shared.byte_on(*byte, lines).1;
+                self.shared.state.lock().cs_cycles += spent;
             }
         }
         if close {
-            self.shared.close();
+            let cycles = self.shared.state.lock().cs_cycles;
+            self.shared.end_select(cycles);
         }
         Ok(())
     }
@@ -1220,7 +1465,10 @@ impl Device for Octospi {
         // restoring it as idle would strand the part.
         w.write_bool(state.open)?;
         w.write_bool(state.writing)?;
-        w.write_u64(state.remaining)
+        w.write_u64(state.remaining)?;
+        // v2: how long the open transaction has held the chip select, in
+        // serial-clock cycles. See `State::cs_cycles`.
+        w.write_u64(state.cs_cycles)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1231,6 +1479,7 @@ impl Device for Octospi {
         let open = r.read_bool()?;
         let writing = r.read_bool()?;
         let remaining = r.read_u64()?;
+        let cs_cycles = r.read_u64()?;
         let state = State {
             cr: values[0],
             dcr1: values[1],
@@ -1266,6 +1515,7 @@ impl Device for Octospi {
             } else {
                 0
             },
+            cs_cycles: if open { cs_cycles } else { 0 },
         };
         let was_open = {
             let mut slot = self.shared.state.lock();
@@ -1353,6 +1603,39 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 /// [`Error::Config`] if the class is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     bindings.bind(CLASS_NAME, |props| Ok(Arc::new(Octospi::new(props)?)))
+}
+
+/// Register this class's snapshot upgrade steps.
+///
+/// `crate::machine::default_migrations` calls this, so a save state written by
+/// an older build loads through [`Machine::load`](crate::machine::Machine::load)
+/// with nothing for the caller to arrange.
+///
+/// # v1 -> v2: the chip-select cycle counter
+///
+/// v1 ended after the open transaction's `remaining`; v2 appends the
+/// serial-clock count that `CR.TCEN` turns into `SR.TOF`. The v1 encoding is a
+/// *prefix* of the v2 one, so the step is a verbatim copy followed by a zero —
+/// which is what a v1 build meant by it, since a v1 build never let `TOF` set
+/// at all. A snapshot taken part way through a long indirect burst therefore
+/// restores with the counter back at nothing, and the timeout on the far side
+/// of the restore measures only what followed. That is the honest limit: v1
+/// did not record the number, so no upgrade can produce it.
+///
+/// The copy is verbatim rather than field-by-field for the reason
+/// `dev::flash::spinor::migrations` gives: re-decoding every field only to
+/// re-encode it identically is a second copy of `load` that nothing forces to
+/// stay in step.
+///
+/// # Errors
+///
+/// [`Error::State`] if a step is already registered for this class.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS_NAME, 1, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_u64(0)
+    })
 }
 
 /// What the validator should know about `stm32.octospi`.
