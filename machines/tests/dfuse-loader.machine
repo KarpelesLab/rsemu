@@ -1,0 +1,74 @@
+# dfuse-loader — an STM32-shaped part whose firmware arrives as a `.dfu`.
+#
+# The board `tests/dfuse_loader.rs` builds. It exists to prove one thing end to
+# end: a **DfuSe** container (ST UM0391) bound to a media slot puts each of its
+# elements at the address the *file* carries, in more than one region, and the
+# core then executes what landed.
+#
+# Everything else here is the smallest STM32 that can host that. A `.machine`
+# file names a `dfu.loader`; nothing else changes. In particular the flash is
+# **not** given an `image =` — the loader writes it through the flash's own
+# debug door, which is what a programmer over SWD does before the core runs, and
+# what makes an element aimed at 0x08000000 land in the array rather than being
+# swallowed by a locked programming interface.
+#
+# The three elements the test builds are deliberately in three places:
+#
+#   0x08000000  the vector table — initial SP and the reset vector
+#   0x08000100  the code
+#   0x20000010  a word in SRAM
+#
+# A loader that could only take one blob at one address (`arm.loader`,
+# `riscv.loader`) cannot express that, and neither can a media slot, which is
+# `{name, bytes}` with no address anywhere in it. That is the whole argument for
+# `dfu.loader` being a device.
+#
+# Sources: ST **RM0090** rev 21 §2.3 for the memory map an F4 has (flash at
+# 0x08000000 aliased at zero for boot, SRAM1 at 0x20000000, the flash interface
+# at 0x40023C00) and the ARMv7-M Architecture Reference Manual, ARM DDI 0403,
+# for the reset behaviour the core has. No emulator source of any licence was
+# consulted (ROADMAP.md §1).
+
+machine "dfuse-loader" {
+  param flash = 128K
+  param sram  = 32K
+
+  # An HSE at the F4 Discovery's crystal. Nothing here is timing-sensitive; the
+  # flash controller and the core both need a domain to live on.
+  osc hse = 8000000 Hz
+
+  space mem { width = 32 }
+
+  object cpu "cpu.arm.v7m" {
+    clock         = hse
+    space         = mem
+    part          = "cortex-m4"
+    priority-bits = 4
+  }
+
+  # No `image =`: the DfuSe loader below fills it. The array comes up erased
+  # (0xff), so the test can tell a byte an element wrote from the gap between
+  # two elements, which a zero-filled array would hide.
+  object eflash "st.flash" {
+    clock   = hse
+    variant = "f4"
+    size    = flash
+  }
+
+  object sram1 "ram" { size = sram }
+
+  # Declared last so that its cold-reset reload runs after the RAM it writes
+  # into has been cleared. Reset runs in declaration order.
+  object dfu "dfu.loader" {
+    image = "firmware"
+    space = mem
+  }
+
+  # Flash twice: where it lives, and the boot alias at zero the core fetches its
+  # initial `SP` and `PC` through. This board does not model `SYSCFG.MEMRMP`, so
+  # the alias is a plain second mapping.
+  map mem 0x00000000 size flash = eflash.array
+  map mem 0x08000000 size flash = eflash.array
+  map mem 0x20000000 size sram  = sram1
+  map mem 0x40023c00 size 0x1c  = eflash
+}

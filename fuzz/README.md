@@ -32,6 +32,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `state_roundtrip` | `StateWriter` → `StateReader`, structured input     | writer/reader are inverses |
 | `state_migration` | `machine::default_migrations` — the upgrade steps this build ships, then the device `load` behind them | a step never panics on an old chunk; what it produces is loadable or refused, never half-applied |
 | `flash_cfi`       | `dev::flash::cfi` — the NOR flash MMIO surface and its snapshot chunk | a program only ever clears bits |
+| `dfuse_image`     | `dev::dfuse::Image::parse` and `dev::dfuse::Loader` over a DfuSe (`.dfu`, UM0391) container | never panics; an accepted element describes bytes that exist; `verify-crc` only ever narrows; an element outside every mapped region is refused rather than dropped |
 | `ir_verify`       | `ir::verify` over arbitrary blocks, then `ir::eliminate_dead_code` and `ir::Liveness` | never panics; a block the verifier accepts survives elimination and still verifies |
 | `riscv_lift`      | `cpu::riscv::lift` → `ir::verify` → `ir::Interp`, against `cpu::riscv`'s interpreter | the lifted block and the interpreter agree on registers, PC, ticks, memory and faults |
 | `record_log`      | `core::record::InputLog` — a recorded session, plus the replay path that reads it | never panics; canonical encoding; a replay cursor always advances |

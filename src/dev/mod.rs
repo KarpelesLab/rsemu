@@ -18,6 +18,7 @@
 //! | [`medium`] | `dev-medium` | what a drive's platter *is*: the storage seam every block device stores its bytes behind |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
+//! | [`dfuse`] | `dev-dfuse` | DfuSe (`.dfu`, UM0391) firmware images: the container that carries an address per element, and the loader that honours it |
 //! | [`fdt`] | `dev-fdt` | the flattened device tree *format*: the encoder every board's generator writes through |
 //! | [`flash`] | `dev-flash-cfi`, `dev-flash-spinor` | NOR flash: parallel (CFI) and serial (W25Q on SPI) |
 //! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
@@ -127,6 +128,10 @@ pub mod lcd;
 #[cfg(feature = "dev-linuxboot")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-linuxboot")))]
 pub mod linuxboot;
+
+#[cfg(feature = "dev-dfuse")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-dfuse")))]
+pub mod dfuse;
 
 #[cfg(feature = "dev-st7272a")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-st7272a")))]

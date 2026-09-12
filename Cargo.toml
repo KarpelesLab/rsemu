@@ -1953,6 +1953,26 @@ dev-ata-disk = ["dev-medium"]
 # dependencies.
 dev-linuxboot = []
 
+# DfuSe (`.dfu`) firmware images (src/dev/dfuse.rs): ST's UM0391 container, and
+# the `dfu.loader` device that writes it in. A `.dfu` is how STM32 firmware is
+# distributed and what `dfu-util` and STM32CubeProgrammer flash, and unlike a
+# `.bin` it carries a **load address per element**, grouped into targets (one
+# per alternate setting: internal flash, option bytes). A media slot is
+# `{name, bytes}` and no address travels with it, so the piece that understands
+# the container is a device on the `arm.loader` / `x86.linuxboot` pattern: it
+# takes the slot, parses it, and puts every element where the file says, at bind
+# and at cold reset.
+#
+# The parser validates rather than trusts -- prefix, DFUImageSize against the
+# real length, every target and element header against the bytes present, the
+# suffix's signature, bLength and bcdDFU, the CRC (DFU's uninverted convention),
+# no overlapping elements, and that something is mapped where each one lands --
+# and every refusal names an offset. `fuzz/fuzz_targets/dfuse_image.rs` is the
+# target that keeps it that way. Written from ST UM0391 and the USB-IF DFU 1.1
+# class specification; `dfu-util` is GPL-2.0 and no emulator or flasher source
+# was opened (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no dependencies.
+dev-dfuse = []
+
 # What a drive's platter *is* (src/dev/medium.rs): the `Medium` trait -- capacity,
 # bytes by offset, flush, read-only, and a snapshot policy -- plus the media slot
 # a run installs one into, which is the other half of `--drive hd0=disk.qcow2`.

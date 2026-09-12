@@ -964,6 +964,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::q35::register(&mut reg)?;
     #[cfg(feature = "dev-linuxboot")]
     crate::dev::linuxboot::register(&mut reg)?;
+    #[cfg(feature = "dev-dfuse")]
+    crate::dev::dfuse::register(&mut reg)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::register(&mut reg)?;
     #[cfg(feature = "dev-st7272a")]
@@ -1096,6 +1098,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::q35::bind(&mut b)?;
     #[cfg(feature = "dev-linuxboot")]
     crate::dev::linuxboot::bind(&mut b)?;
+    #[cfg(feature = "dev-dfuse")]
+    crate::dev::dfuse::bind(&mut b)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::bind(&mut b)?;
     #[cfg(feature = "dev-st7272a")]
@@ -1276,6 +1280,8 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-linuxboot")]
     table.insert(crate::dev::linuxboot::schema());
+    #[cfg(feature = "dev-dfuse")]
+    table.insert(crate::dev::dfuse::schema());
     #[cfg(feature = "dev-lcdc")]
     for schema in crate::dev::lcd::schemas() {
         table.insert(schema);
