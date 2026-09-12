@@ -1510,8 +1510,12 @@ dev-stm32-crc = []
 # those would have bought nothing. Written from FIPS 180-4 S6.1.2/S6.2.2, RFC
 # 1321 S3.4, RFC 2104 and ST RM0090 S25 / RM0432 S26, and tested against the
 # published vectors in those documents plus RFC 4231 and RFC 2202 -- the point
-# of a hash being that it agrees with everyone else's. No emulator source was
-# consulted (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
+# of a hash being that it agrees with everyone else's. **No shipped board
+# carries it**: RM0090 S25 is the F415/417 and F43x dies and an F407 has no such
+# block, so machines/stm32f407.machine does not instantiate one and
+# machines/tests/stm32f4-hash.machine is where tests/stm32_hash.rs runs it --
+# including the proof that it shares vector 80 with the RNG. No emulator source
+# was consulted (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-hash = []
 
 # The STM32 embedded flash interface (src/dev/stm32/flash.rs): the controller
@@ -1631,11 +1635,6 @@ machine-stm32f407 = [
     "dev-stm32-sdio",
     "dev-stm32-exti",
     "dev-stm32-crc",
-    # The hash processor at 0x5006_0400, sharing vector 80 with the RNG. See the
-    # board file: RM0090 S25 puts the block on the F415/417 and F43x dies rather
-    # than on an F407's, and machines/stm32f407.machine says so where it is
-    # instantiated.
-    "dev-stm32-hash",
     "dev-stm32-wdg",
     # The debug block, which is what makes the two watchdogs above debuggable:
     # without DBG_IWDG_STOP a breakpoint in the kick loop resets the part.

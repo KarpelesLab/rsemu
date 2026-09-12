@@ -1,0 +1,130 @@
+# stm32f4-hash — the smallest board with an STM32 hash processor on it, and a
+# random number generator beside it sharing its interrupt.
+#
+# It models no product, and it is deliberately not in the catalog.
+# `machines/tests/` is where a board that exists for one test lives, beside
+# `stm32f4-sdio.machine` and `stm32l4-firewall.machine`: `rsemu machines` does
+# not list these, `every_shipped_machine_realizes` does not build them, and
+# nothing here is offered to a person as a machine to run. `tests/stm32_hash.rs`
+# includes this file by path.
+#
+# ---------------------------------------------------------------------------
+# Why it is not on `machines/stm32f407.machine`
+# ---------------------------------------------------------------------------
+#
+# Because an STM32F407 does not have one. RM0090 covers eight dies and §25
+# applies to the **F415/417 and F43x** parts; an F407VG's datasheet, DS8626,
+# lists no cryptographic acceleration at all. That board's header promises "A
+# real part, not a synthesis", and a hash processor on it would have made the
+# promise false — so the block lives here instead, on a board that promises
+# nothing.
+#
+# ---------------------------------------------------------------------------
+# What it is for
+# ---------------------------------------------------------------------------
+#
+# `src/dev/stm32/hash.rs` proves the register face against FIPS 180-4, RFC 1321,
+# RFC 2104, RFC 4231 and RFC 2202, one device at a time. Three things are only
+# true of a *machine*, and this board is the smallest one on which they can be
+# said:
+#
+#   * **The block decodes at AHB2 + 0x60400 and stops after `HR7`.** An address
+#     is a `map` statement, and a `map` statement is only ever wrong on a board.
+#   * **`variant` reaches the device.** An F4's `CR` has no `ALGO[1]`, so asking
+#     for SHA-256 gets MD5 — which is the only symptom, from outside, of a
+#     construction property having been applied at all.
+#   * **Vector 80 is shared.** RM0090 Table 62 calls position 80 `HASH_RNG` and
+#     means it: two peripherals, one core pin, one handler. That is why there is
+#     an `st.rng` below — the sharing has to be real for the test to be about
+#     anything, and a board with only the hash processor on `irq80` would assert
+#     nothing that a single-driver wire does not already assert.
+#
+# The wrong-vector failure is the one worth spelling out, because it is silent:
+# a peripheral wired to the wrong `cpu.irq{n}` still pends, the core still takes
+# an exception, and the only symptom is that somebody else's handler runs. The
+# test therefore asks the handler what it is executing as.
+#
+# ---------------------------------------------------------------------------
+# The shape
+# ---------------------------------------------------------------------------
+#
+# F4-shaped without being any F4: a Cortex-M4 on a 168 MHz clock, a small ROM
+# at zero where the core fetches its initial `SP` and `PC`, SRAM at 0x20000000,
+# and the two AHB2 blocks at the addresses RM0090 Table 1 gives them — which
+# are the family's own numbers and are what a driver would use. There is no
+# RCC, no flash controller and no GPIO, because none of them is what is under
+# test and `machines/stm32f407.machine` is where a complete part lives.
+#
+# The RNG's `seed` is written here for the reason it is written on every board
+# that has one: a machine run twice has to reach the same state (ROADMAP.md §0),
+# and the device mixes this number with its own instance path. This test never
+# reads `RNG_DR`; the seed is here so that the object realizes and so that a
+# future test on this board is reproducible.
+#
+# Sources: ST **RM0090** rev 21 — §25 for the hash processor, §24 for the RNG,
+# Table 1 for both addresses and Table 62 for the shared vector. The ARMv7-M
+# Architecture Reference Manual, ARM DDI 0403, for the core and for the rule
+# that external interrupt *n* is exception *n + 16*. No emulator source of any
+# licence was consulted (ROADMAP.md §1).
+
+machine "stm32f4-hash" {
+  param rom  = 64K
+  param sram = 16K
+  param seed = 1
+
+  # The F4's headline clock. Nothing here is rate-sensitive; it is a number so
+  # the core has a domain to be scheduled in.
+  osc sysclk = 168000000 Hz
+
+  # PLL48CLK, which is what an F4's RNG runs off (RM0090 §24.3).
+  osc rngclk = 48000000 Hz
+
+  space mem { width = 32 }
+
+  # `part = "cortex-m4"` and not `"cortex-m4f"`: the firmware this board runs is
+  # six kinds of `MOV`/`STR`/`LDR`, so asking for the FPU would only add
+  # `cpu-arm-v7m-fp` to the feature set the test needs.
+  object cpu "cpu.arm.v7m" {
+    clock         = sysclk
+    space         = mem
+    part          = "cortex-m4"
+    priority-bits = 4
+  }
+
+  # `image` names a media slot, so whoever runs the machine binds the bytes.
+  object code "rom" { size = rom, image = "firmware" }
+  object ram  "ram" { size = sram }
+
+  # The hash processor. `variant = "f4"` is RM0090 §25 — SHA-1 and MD5, with
+  # `ALGO[1]` and `MDMAT` undecoded. An L4+ or H7 board would say `"v2"`.
+  object hash "st.hash" { variant = "f4" }
+
+  # The other half of `HASH_RNG`.
+  object rng "st.rng" {
+    clock = rngclk
+    seed  = seed
+  }
+
+  map mem 0x00000000 size rom   = code
+  map mem 0x20000000 size sram  = ram
+  # 0x330 bytes, which is `CR` through the second `HR7` window. The rest of the
+  # kilobyte is a hole and faults, as it does on the part.
+  map mem 0x50060400 size 0x330 = hash
+  map mem 0x50060800 size 0x0c  = rng
+
+  # -- the wire this board exists for ----------------------------------------
+  #
+  # RM0090 Table 62, position **80**, "Hash and Rng global interrupt", vector
+  # address 0x0000_0180. External interrupt *n* is exception *n + 16*, so 80 is
+  # exception 96 and 4 × 96 = 0x180 — the table and the architecture agree.
+  #
+  # Both peripherals drive it, and that is the point rather than an accident.
+  # The pin is the wired-OR of the two, so clearing one source leaves the line
+  # high while the other is pending, and a driver that owns only one block has
+  # to read the other's status register before deciding the interrupt was not
+  # its own. It takes two `wire` statements and no new machinery: `cpu.irq80`
+  # resolves two drivers the way a complete board's `cpu.irq23` resolves five
+  # EXTI lines.
+  wire hash.irq -> cpu.irq80
+  wire rng.irq  -> cpu.irq80
+}
