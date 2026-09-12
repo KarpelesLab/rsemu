@@ -450,7 +450,7 @@ impl MemOps for Peripheral {
         // safe, and nothing of ours is held either.
         let dma = self.dma.lock().clone();
         if let Some(dma) = dma {
-            dma.set_request(0, level);
+            dma.set_request(0, 0, level);
         }
         Ok(())
     }
@@ -696,18 +696,37 @@ fn the_stream_face_packs_flags_where_rm0090_says() {
 fn pins_follow_the_manuals_numbering() {
     let stream = Dma::with_variant(Variant::Stream);
     assert_eq!(stream.pin_index("irq0", "irq"), Some(0));
-    assert_eq!(stream.pin_index("req7", "req"), Some(7));
-    assert_eq!(stream.pin_index("req8", "req"), None);
+    assert_eq!(stream.req_pin("req7"), Some((7, 0)));
+    assert_eq!(stream.req_pin("req8"), None);
 
     let channel = Dma::with_variant(Variant::Channel);
     assert_eq!(channel.pin_index("irq1", "irq"), Some(0));
-    assert_eq!(channel.pin_index("req7", "req"), Some(6));
-    assert_eq!(
-        channel.pin_index("req0", "req"),
-        None,
-        "channels count from 1"
-    );
+    assert_eq!(channel.req_pin("req7"), Some((6, 0)));
+    assert_eq!(channel.req_pin("req0"), None, "channels count from 1");
     assert!(Device::connect(&channel, "irq0", never_driven()).is_err());
+}
+
+#[test]
+fn a_selector_qualified_pin_names_a_cell_of_the_request_matrix() {
+    let stream = Dma::with_variant(Variant::Stream);
+    // RM0090 Table 43's SDIO cell: DMA2, stream 3, channel 4. Slot 5, because
+    // slot 0 is the unnumbered pin.
+    assert_eq!(stream.req_pin("req3c4"), Some((3, 5)));
+    assert_eq!(stream.req_pin("req0c0"), Some((0, 1)));
+    assert_eq!(
+        stream.req_pin("req0c15"),
+        Some((0, 16)),
+        "the channel face's four-bit CSELR sets the bound, not CHSEL's three"
+    );
+    assert_eq!(stream.req_pin("req0c16"), None);
+    assert_eq!(stream.req_pin("req8c0"), None);
+    assert_eq!(stream.req_pin("reqc0"), None);
+    assert_eq!(stream.req_pin("req0c"), None);
+
+    // The channel face renumbers the unit and keeps the selector.
+    let channel = Dma::with_variant(Variant::Channel);
+    assert_eq!(channel.req_pin("req1c9"), Some((0, 10)));
+    assert_eq!(channel.req_pin("req0c1"), None);
 }
 
 fn never_driven() -> WireSource {
@@ -890,4 +909,269 @@ fn a_board_that_forgets_the_space_is_told_so() {
         err.to_string().contains("masters the bus"),
         "the message names the fix: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `CHSEL`, the other half of RM0090 Table 43
+// ---------------------------------------------------------------------------
+
+/// `CHSEL` in `SxCR`, RM0090 §10.5.5 bits 27:25.
+const fn chsel(n: u32) -> u32 {
+    n << 25
+}
+
+#[test]
+fn a_request_on_the_wrong_channel_is_not_served() {
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    rig.put(periph, Width::U8, 0x5a);
+    // Stream 0 listening to channel 4, which is where Table 43 puts SDIO.
+    arm_p2m(&rig, periph, RAM_BASE + 0x100, 4, chsel(4));
+
+    // Something else on the same stream, on channel 2.
+    rig.dma.set_selected_request(0, 2, Level::High);
+    assert_eq!(
+        rig.dma.pump(8),
+        0,
+        "CHSEL says 4, so channel 2 is not heard"
+    );
+    assert_eq!(rig.dma.remaining(0), 4);
+
+    rig.dma.set_selected_request(0, 4, Level::High);
+    assert_eq!(rig.dma.pump(8), 4, "and channel 4 is");
+    assert_eq!(rig.dma.remaining(0), 0);
+}
+
+#[test]
+fn the_unnumbered_pin_is_served_whatever_chsel_reads() {
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    rig.put(periph, Width::U8, 0x11);
+    arm_p2m(&rig, periph, RAM_BASE + 0x100, 2, chsel(7));
+
+    // A board that wired `req0` said it was not modelling the selector.
+    rig.dma.set_request(0, Level::High);
+    assert_eq!(rig.dma.pump(8), 2);
+}
+
+#[test]
+fn chsel_is_write_protected_while_the_stream_runs() {
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    rig.put(periph, Width::U8, 0x22);
+    arm_p2m(&rig, periph, RAM_BASE + 0x100, 4, chsel(3));
+    rig.dma.set_selected_request(0, 3, Level::High);
+    assert_eq!(rig.dma.pump(2), 2);
+
+    // `CHSEL` is write-protected while `EN` is set (RM0090 §10.5.5), so this
+    // write is dropped and the stream keeps hearing channel 3.
+    rig.poke(s_cr(0), S_CR_MINC | chsel(5) | CR_EN);
+    assert_eq!(rig.peek(s_cr(0)) & chsel(7), chsel(3));
+    assert_eq!(rig.dma.pump(2), 2, "still channel 3");
+}
+
+#[test]
+fn the_channel_face_gates_on_its_cselr_nibble() {
+    let rig = Rig::channel();
+    let periph = RAM_BASE + 0x20;
+    let mem = RAM_BASE + 0x100;
+    rig.put(periph, Width::U8, 0x77);
+    // Channel 3 — unit 2 — selecting request 9 out of `CSELR`.
+    rig.poke(0xa8, 9 << (4 * 2));
+    rig.poke(c_par(3), periph as u32);
+    rig.poke(c_mar(3), mem as u32);
+    rig.poke(c_ndtr(3), 2);
+    rig.poke(c_cr(3), C_CR_MINC | CR_EN);
+
+    rig.dma.set_selected_request(2, 4, Level::High);
+    assert_eq!(rig.dma.pump(8), 0, "CSELR selects 9, not 4");
+    rig.dma.set_selected_request(2, 9, Level::High);
+    assert_eq!(rig.dma.pump(8), 2);
+}
+
+#[test]
+fn two_requests_in_one_table_cell_are_wired_or() {
+    // RM0090 Table 43 puts TIM2_CH2 *and* TIM2_CH4 on DMA1 stream 6 channel 3:
+    // one line into the stream, driven by two sources. A board writes two
+    // `wire` statements into `req6c3`, and the second dropping must not cancel
+    // the first holding.
+    let dma = Dma::with_variant(Variant::Stream);
+    let ids = WireIdAllocator::new();
+    let (a, b) = (ids.alloc(), ids.alloc());
+    let pin = Device::sink(&dma, "req6c3", &[a, b]).expect("a cell of Table 43");
+
+    pin.sink.set_level(a, pin.line, Level::High);
+    pin.sink.set_level(b, pin.line, Level::High);
+    pin.sink.set_level(b, pin.line, Level::Low);
+    assert!(
+        dma.shared.held[6][4].load(Ordering::SeqCst),
+        "the other driver is still holding the line"
+    );
+    pin.sink.set_level(a, pin.line, Level::Low);
+    assert!(!dma.shared.held[6][4].load(Ordering::SeqCst));
+}
+
+// ---------------------------------------------------------------------------
+// `PFCTRL`, peripheral flow control
+// ---------------------------------------------------------------------------
+
+/// A peripheral that is the flow controller: it has a fixed number of items to
+/// give and says so on the last one, the way an SDIO block does once the card
+/// has decided how long the transfer is.
+#[derive(Debug)]
+struct FlowController {
+    left: Mutex<u32>,
+}
+
+impl DmaPeripheral for FlowController {
+    fn dma_read(&self, _terminal: bool) -> u8 {
+        unreachable!("the STM32 controller reads the bus at CPAR, not the peer")
+    }
+    fn dma_write(&self, _byte: u8, _terminal: bool) {
+        unreachable!("the STM32 controller writes the bus at CPAR, not the peer")
+    }
+    fn dma_ready(&self) -> bool {
+        *self.left.lock() > 0
+    }
+    fn dma_last(&self) -> bool {
+        // Sampled once per beat, before the item moves.
+        let mut left = self.left.lock();
+        *left = left.saturating_sub(1);
+        *left == 0
+    }
+}
+
+/// Arm stream 0 peripheral-to-memory with `PFCTRL` and a flow-controlling peer.
+fn arm_pfctrl(rig: &Rig, periph: u64, mem: u64, ndtr: u32, items: u32) -> Arc<FlowController> {
+    let peer = Arc::new(FlowController {
+        left: Mutex::with_rank(LockRank::DEVICE, items),
+    });
+    rig.dma
+        .attach_dma_peripheral("req0c4", Arc::downgrade(&peer) as Weak<dyn DmaPeripheral>);
+    arm_p2m(rig, periph, mem, ndtr, S_CR_PFCTRL);
+    peer
+}
+
+#[test]
+fn the_peripheral_ends_a_flow_controlled_transfer_before_ndtr_runs_out() {
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    let mem = RAM_BASE + 0x100;
+    rig.put(periph, Width::U8, 0x5a);
+    // `NDTR` is a maximum (RM0090 §10.3.2), and the peripheral has three items.
+    let peer = arm_pfctrl(&rig, periph, mem, 64, 3);
+
+    assert_eq!(rig.dma.pump(64), 3, "the peer stopped asking after three");
+    assert_eq!(*peer.left.lock(), 0);
+    assert!(!rig.dma.is_running(0), "the peripheral ended the transfer");
+    assert_eq!(rig.peek(s_cr(0)) & CR_EN, 0, "and EN came down with it");
+    assert_ne!(
+        rig.isr() & (1 << S_TCIF),
+        0,
+        "TCIF, at the peripheral's word"
+    );
+    assert_eq!(
+        rig.dma.remaining(0),
+        61,
+        "NDTR keeps whatever the maximum had left"
+    );
+    for i in 0..3 {
+        assert_eq!(rig.byte(mem + i), 0x5a);
+    }
+    assert_eq!(rig.byte(mem + 3), 0, "and nothing past the last item");
+}
+
+#[test]
+fn a_flow_controlled_stream_still_stops_when_the_maximum_is_too_small() {
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    let mem = RAM_BASE + 0x100;
+    rig.put(periph, Width::U8, 0x5a);
+    // The peripheral has eight items and firmware allowed two: RM0090 §10.5.6
+    // says a stream whose `NDTR` is zero serves no transaction.
+    let peer = arm_pfctrl(&rig, periph, mem, 2, 8);
+
+    assert_eq!(rig.dma.pump(64), 2);
+    assert!(!rig.dma.is_running(0));
+    assert_eq!(rig.dma.remaining(0), 0, "and it did not reload");
+    assert_eq!(*peer.left.lock(), 6, "the peripheral still had six to give");
+}
+
+#[test]
+fn a_flow_controlled_stream_does_not_reload_in_circular_mode() {
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    let mem = RAM_BASE + 0x100;
+    rig.put(periph, Width::U8, 0x5a);
+    // `CIRC` alongside `PFCTRL` is a combination RM0090 forbids; the flow
+    // controller wins rather than the buffer wrapping for ever.
+    let peer = Arc::new(FlowController {
+        left: Mutex::with_rank(LockRank::DEVICE, 2),
+    });
+    rig.dma
+        .attach_dma_peripheral("req0", Arc::downgrade(&peer) as Weak<dyn DmaPeripheral>);
+    arm_p2m(&rig, periph, mem, 4, S_CR_PFCTRL | S_CR_CIRC);
+
+    assert_eq!(rig.dma.pump(64), 2);
+    assert!(!rig.dma.is_running(0));
+    assert_eq!(rig.dma.remaining(0), 2, "stopped where the peripheral said");
+}
+
+#[test]
+fn pfctrl_is_ignored_in_memory_to_memory_mode() {
+    // RM0090 §10.5.5: with `DIR = 10` there is no peripheral on either port,
+    // so hardware forces `PFCTRL` to zero and the count ends the transfer.
+    let rig = Rig::stream();
+    let src = RAM_BASE;
+    let dst = RAM_BASE + 0x100;
+    for i in 0..4u64 {
+        rig.put(src + i, Width::U8, 0xa0 + i);
+    }
+    rig.poke(s_par(0), src as u32);
+    rig.poke(s_m0ar(0), dst as u32);
+    rig.poke(s_ndtr(0), 4);
+    rig.poke(
+        s_cr(0),
+        (2 << 6) | S_CR_PINC | S_CR_MINC | S_CR_PFCTRL | CR_EN,
+    );
+    assert_eq!(rig.dma.pump(16), 4);
+    assert_eq!(rig.dma.remaining(0), 0);
+    assert_ne!(rig.isr() & (1 << S_TCIF), 0);
+}
+
+#[test]
+fn a_selected_request_survives_save_and_load() {
+    let saved = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    saved.put(periph, Width::U8, 0x5a);
+    arm_p2m(&saved, periph, RAM_BASE + 0x100, 8, chsel(6));
+    saved.dma.set_selected_request(0, 6, Level::High);
+    assert_eq!(saved.dma.pump(3), 3);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("dma", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("dma", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved.dma, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    let restored = Rig::stream();
+    restored.put(periph, Width::U8, 0x5a);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("dma", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored.dma, &mut chunk.reader()).unwrap();
+
+    // The latch travelled *in its slot*: the restored stream is still hearing
+    // channel 6 and nothing else, so it finishes without a new wire event.
+    assert_eq!(restored.dma.pump(5), 5);
+    assert_eq!(restored.dma.remaining(0), 0);
+    assert!(
+        restored.dma.shared.held[0][7].load(Ordering::SeqCst),
+        "slot 7 is channel 6"
+    );
+    assert!(!restored.dma.shared.held[0][0].load(Ordering::SeqCst));
 }

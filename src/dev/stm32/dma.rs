@@ -36,6 +36,9 @@
 //!   variant = "channel"   7 channels  window 0xac   pins irq1..irq7, req1..req7
 //! ```
 //!
+//! Each `req` pin also has a selector-qualified form, `req{n}c{sel}`, which is
+//! the other half of RM0090 Table 43 — see "`CHSEL`" below.
+//!
 //! The pin numbers follow the **manual's** numbering, which is why the channel
 //! face starts at one: RM0351 calls them `DMA1_Channel1`..`DMA1_Channel7` and a
 //! board file should be able to say what the reference manual says.
@@ -72,13 +75,13 @@
 //! line. So the seam here is the line and nothing else, and a peripheral needs
 //! no knowledge of DMA beyond driving it:
 //!
-//! * The controller exposes one **input pin per unit**, `req0`..`req7`
-//!   (`req1`..`req7` on the channel face). A board wires the peripheral's
-//!   request output to the unit its part's request matrix puts it on — RM0090
-//!   Table 43, RM0351 Table 40 — exactly as it wires an interrupt to the
-//!   core's numbered pin. The matrix is a fact about the *part*, so it lives in
-//!   the board file and not in this device (see `machines/stm32f407.machine`
-//!   on why `wire usart2.irq -> cpu.irq38` is written there).
+//! * The controller exposes an **input pin per unit and per selector**. A
+//!   board wires the peripheral's request output to the cell its part's
+//!   request matrix puts it on — RM0090 Table 43, RM0351 Table 40 — exactly as
+//!   it wires an interrupt to the core's numbered pin. The matrix is a fact
+//!   about the *part*, so it lives in the board file and not in this device
+//!   (see `machines/stm32f407.machine` on why `wire usart2.irq -> cpu.irq38`
+//!   is written there).
 //! * **A level of [`Level::High`] means "I want service".** Hold it while you
 //!   have data (or room) and drop it when the controller's access to your data
 //!   register has satisfied you: that is a FIFO-style peripheral and it gets
@@ -94,9 +97,56 @@
 //!   may raise its line from inside its own register handler, with its own lock
 //!   held, and cannot be re-entered by the controller.
 //!
-//! `CHSEL` (stream) and `CSELR` (channel) are stored and read back but do not
-//! gate the transfer, because the request matrix they index is in the board's
-//! wiring. A guest that programs the wrong one still transfers here.
+//! # `CHSEL`, and why a request pin carries a channel number
+//!
+//! RM0090 Table 43 is a **matrix**, not a list. Every request reaches a
+//! particular stream *on a particular channel*, several requests share each
+//! stream, and `SxCR.CHSEL` is how firmware says which of them this stream is
+//! listening to. `TIM2_UP` is on DMA1 stream 1 channel 3 **and** on stream 7
+//! channel 3; a guest driving a display out of stream 7 with `CHSEL = 5` must
+//! not have TIM2's update event stealing its beats.
+//!
+//! So a request pin carries the channel:
+//!
+//! ```text
+//!   req3         stream 3, any channel      — served whatever CHSEL reads
+//!   req3c4       stream 3, channel 4        — served only while CHSEL == 4
+//! ```
+//!
+//! and the same on the channel face, where the selector is this unit's nibble
+//! of `CSELR` (RM0351 §11.6.7) and reaches sixteen values rather than eight.
+//! The unnumbered pin is not a legacy form to be migrated away: it is what a
+//! board writes when one peripheral is wired to one unit and the selector is
+//! not part of what is being modelled, and a `mem2mem` unit needs no pin at
+//! all.
+//!
+//! A pin may have **several drivers**, because a cell of the table routinely
+//! holds several requests: `TIM2_CH2` and `TIM2_CH4` are both stream 6
+//! channel 3, OR'd onto one line on the die. The pin resolves its drivers as a
+//! wired-OR, so two `wire` statements into `req6c3` behave the way the silicon
+//! does instead of the second one cancelling the first.
+//!
+//! # Who ends the transfer: `PFCTRL`
+//!
+//! Normally the *stream* is the flow controller — it counts `NDTR` down and
+//! stops at zero. RM0090 §10.3.2 lets the **peripheral** be the flow
+//! controller instead (`SxCR.PFCTRL`), which is how ST's own F4 SD driver arms
+//! the SDIO streams: the card decides how much data there is, `NDTR` is only a
+//! maximum, and the peripheral signals its last item.
+//!
+//! That signal is [`DmaPeripheral::dma_last`], asked of the unit's data-side
+//! peer before each beat. It is **not** the `terminal` flag on
+//! [`DmaPeripheral::dma_read`] — that one runs the other way, telling a
+//! peripheral that the *controller's* count has expired, which is precisely
+//! the case `PFCTRL` turns off. When it answers true the beat still happens
+//! and then `TCIF` goes up and `EN` comes down, whatever `NDTR` is left.
+//! `CIRC` and `DBM` get no say, both being combinations the manual forbids
+//! alongside `PFCTRL`; a `NDTR` that reaches zero first also stops the stream,
+//! per RM0090 §10.5.6, and that is firmware having under-programmed the
+//! maximum. A peripheral that publishes no peer, or one whose `dma_last` is
+//! the default `false`, never ends a flow-controlled transfer — which is what
+//! arming `PFCTRL` against a peripheral that cannot flow-control does on the
+//! part.
 //!
 //! # A bus master, and the re-entrancy contract
 //!
@@ -125,9 +175,15 @@
 //! comes with it; `PSIZE`/`MSIZE` with RM0351 Table 41's truncate-on-narrowing
 //! and zero-extend-on-widening; `PINC`/`MINC` and the stream face's `PINCOS`;
 //! `CIRC` reload; the stream face's `DBM`/`CT` double buffer; `MEM2MEM` and
-//! stream `DIR=10`; `HTIF` at the midpoint, `TCIF` at zero, `TEIF` on a bus
-//! fault and on an illegal configuration; per-unit interrupt outputs; priority
-//! arbitration; the whole of the snapshot.
+//! stream `DIR=10`; **`CHSEL`/`CSELR` gating the request**; **`PFCTRL`, with
+//! the peripheral ending the transfer**; `HTIF` at the midpoint, `TCIF` at
+//! zero, `TEIF` on a bus fault and on an illegal configuration; per-unit
+//! interrupt outputs; priority arbitration; the whole of the snapshot.
+//!
+//! **DMAMUX** (RM0432 §14), which the L4+/G4/H7/WB route requests through, is
+//! a separate class, `st.dmamux`; `mux = true` on *this* object is still
+//! refused, because a DMA controller multiplexing its own requests is not what
+//! those parts do.
 //!
 //! Not modelled, and stored-and-inert rather than silently absent:
 //!
@@ -136,18 +192,13 @@
 //!   move the same bytes here; what a FIFO buys on the part is bus efficiency
 //!   and a burst's timing, and neither is visible to firmware that is not
 //!   measuring the bus.
-//! * **`PFCTRL`, peripheral flow control.** Stored and ignored, so the F4
-//!   SDIO's flow-controlled path still needs a seam that lets the peripheral
-//!   end the transfer. That is the next piece, not this one.
 //! * **`DMEIF`, the direct-mode error.** Nothing raises it.
-//! * **DMAMUX** (RM0432 §14), which the L4+/G4/H7/WB route requests through,
-//!   is a separate device — `st.dmamux` — and is **not written**. `mux = true`
-//!   is refused with that message rather than quietly behaving like `CSELR`.
 
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
@@ -160,7 +211,7 @@ use crate::core::space::{
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{DmaPeripheral, Level, WireId, WireSink, WireSource};
+use crate::core::wire::{DmaPeripheral, FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -168,10 +219,31 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "st.dma";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// 2: the request latch became one bit per *selector slot* rather than one
+/// boolean per unit, when `CHSEL` started gating (RM0090 Table 43).
+const STATE_VERSION: u32 = 2;
 
 /// The most units either face has — eight, the stream controller's.
 pub const MAX_UNITS: usize = 8;
+
+/// The most request selectors either face has.
+///
+/// Sixteen, from the channel face: `CSELR` gives each channel a **four-bit**
+/// `CxS` field (RM0351 §11.6.7). The stream face's `CHSEL` is three bits, so
+/// eight of these are never selected there. Bounds that come from a field
+/// width rather than from a part's request table are the ones that stay true
+/// across the family.
+pub const MAX_SELECTORS: usize = 16;
+
+/// Latch slots per unit: one per selector, plus slot zero.
+///
+/// **Slot zero is the unnumbered `req{n}` pin** — a request that arrives with
+/// no channel attached and is therefore served whatever `CHSEL`/`CSELR` says.
+/// It is what a board writes when it is wiring one peripheral to one unit and
+/// does not care to model the selector, and what every test that predates the
+/// gating uses.
+const SLOTS: usize = MAX_SELECTORS + 1;
 
 /// Beats one [`Device::run`] call will move however long the budget is.
 ///
@@ -239,6 +311,8 @@ const S_CR_DMEIE: u32 = 1 << 1;
 const S_CR_TEIE: u32 = 1 << 2;
 const S_CR_HTIE: u32 = 1 << 3;
 const S_CR_TCIE: u32 = 1 << 4;
+/// `PFCTRL`, bit 5: the **peripheral** is the flow controller, not the stream.
+const S_CR_PFCTRL: u32 = 1 << 5;
 const S_CR_CIRC: u32 = 1 << 8;
 const S_CR_PINC: u32 = 1 << 9;
 const S_CR_MINC: u32 = 1 << 10;
@@ -400,6 +474,30 @@ struct Config {
     prio: u8,
     /// Which interrupt sources are enabled, as `F_*` bits.
     ie: u8,
+    /// `CHSEL` (stream) or this unit's `CSELR` nibble (channel): which of the
+    /// part's request lines this unit is listening to.
+    sel: u8,
+    /// `PFCTRL`: the peripheral ends the transfer, not the count.
+    pfctrl: bool,
+}
+
+/// A unit that could move a beat this round, and what it needs to.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    unit: usize,
+    /// False only for memory-to-memory, the one mode with no peripheral.
+    needs_request: bool,
+    /// `CHSEL`/`CSELR` as the unit currently reads it — which request lines
+    /// wired to this unit it is listening to.
+    sel: u8,
+}
+
+impl Candidate {
+    const NONE: Candidate = Candidate {
+        unit: 0,
+        needs_request: false,
+        sel: 0,
+    };
 }
 
 /// A single beat, planned with the lock held and executed without it.
@@ -433,15 +531,16 @@ struct Shared {
     /// Every register, at `DEVICE` rank. **Never held across a bus access, a
     /// wire change or a call into a peripheral** (`CLAUDE.md`, re-entrancy).
     state: Mutex<State>,
-    /// The level each request line is currently driving. A peripheral that
-    /// holds it high is asking for continuous service.
-    held: [AtomicBool; MAX_UNITS],
+    /// The level each request line is currently driving, per unit and per
+    /// **selector slot**. A peripheral that holds its line high is asking for
+    /// continuous service; whether the unit hears it depends on `CHSEL`.
+    held: [[AtomicBool; SLOTS]; MAX_UNITS],
     /// A rising edge that has not yet bought its beat. Consumed by the beat,
     /// so a peripheral that pulses once per item gets one beat per pulse.
     ///
     /// An atomic and not a lock, deliberately: the inbound wire path must be
     /// able to run inside a peripheral's own critical section.
-    pending: [AtomicBool; MAX_UNITS],
+    pending: [[AtomicBool; SLOTS]; MAX_UNITS],
     /// The optional data-side handle a requester may publish on its pin. Only
     /// [`DmaPeripheral::dma_ready`] is used — see the module documentation.
     peer: [Mutex<Option<Weak<dyn DmaPeripheral>>>; MAX_UNITS],
@@ -469,8 +568,8 @@ impl Shared {
             variant,
             units: variant.units(),
             state: Mutex::with_rank(LockRank::DEVICE, State::reset(variant)),
-            held: core::array::from_fn(|_| AtomicBool::new(false)),
-            pending: core::array::from_fn(|_| AtomicBool::new(false)),
+            held: core::array::from_fn(|_| core::array::from_fn(|_| AtomicBool::new(false))),
+            pending: core::array::from_fn(|_| core::array::from_fn(|_| AtomicBool::new(false))),
             peer: core::array::from_fn(|_| Mutex::with_rank(LockRank::LEAF, None)),
             irq: core::array::from_fn(|_| Mutex::with_rank(LockRank::WIRE, None)),
             bus: Mutex::with_rank(LockRank::LEAF, None),
@@ -481,7 +580,13 @@ impl Shared {
 
     /// Decode `unit`'s control register, or `None` if it is programmed with a
     /// combination the part calls reserved.
-    fn config(&self, u: &Unit) -> Option<Config> {
+    ///
+    /// It takes the whole `state` and not one [`Unit`] because the channel
+    /// face's request selector lives in a *shared* register: `CSELR` holds all
+    /// seven nibbles (RM0351 §11.6.7), where the stream face keeps `CHSEL`
+    /// inside each `SxCR`.
+    fn config(&self, state: &State, unit: usize) -> Option<Config> {
+        let u = &state.unit[unit];
         match self.variant {
             Variant::Stream => {
                 let dir = match (u.cr >> 6) & 3 {
@@ -529,6 +634,11 @@ impl Shared {
                     },
                     prio: ((u.cr >> 16) & 3) as u8,
                     ie,
+                    sel: ((u.cr >> 25) & 7) as u8,
+                    // RM0090 §10.5.5: "when the memory-to-memory mode is
+                    // selected, `PFCTRL` is forced to 0 by hardware" — there is
+                    // no peripheral on either port to be the flow controller.
+                    pfctrl: u.cr & S_CR_PFCTRL != 0 && (u.cr >> 6) & 3 != 2,
                 })
             }
             Variant::Channel => {
@@ -564,6 +674,12 @@ impl Shared {
                     pstep: pw.bytes() as u32,
                     prio: ((u.cr >> 12) & 3) as u8,
                     ie,
+                    // RM0351 §11.6.7: `C1S` at bits 3:0, `C2S` at 7:4, and so
+                    // on, and this face's unit 0 is the manual's channel 1.
+                    sel: ((state.cselr >> (4 * unit)) & 0xf) as u8,
+                    // There is no `PFCTRL` on the channel face at all: the
+                    // channel controller is always the flow controller.
+                    pfctrl: false,
                 })
             }
         }
@@ -587,33 +703,84 @@ impl Shared {
     // -- the request latch ---------------------------------------------------
 
     /// Record a request line's new level. Takes no lock and calls nothing.
-    fn set_request(&self, unit: usize, level: Level) {
-        if unit >= self.units {
+    ///
+    /// `slot` is [`SLOTS`]'s numbering: zero for the unnumbered pin, `sel + 1`
+    /// for a line the board attached to selector `sel`.
+    fn set_request(&self, unit: usize, slot: usize, level: Level) {
+        if unit >= self.units || slot >= SLOTS {
             return;
         }
         let high = level == Level::High;
-        self.held[unit].store(high, Ordering::SeqCst);
+        self.held[unit][slot].store(high, Ordering::SeqCst);
         if high {
-            self.pending[unit].store(true, Ordering::SeqCst);
+            self.pending[unit][slot].store(true, Ordering::SeqCst);
         }
     }
 
-    /// Whether `unit`'s peripheral is asking for service.
+    /// The two latch slots `unit` listens to while its selector reads `sel`.
+    ///
+    /// RM0090 Table 43 is a matrix, not a list: a request reaches a stream only
+    /// on the *channel* the table puts it on, so a stream with `CHSEL = 4`
+    /// hears the line wired to `req{n}c4` and is deaf to every other line on
+    /// the same stream. Slot zero is always heard, because a board that wired
+    /// the plain `req{n}` pin said it was not modelling the selector.
+    const fn slots_for(sel: u8) -> [usize; 2] {
+        [0, sel as usize + 1]
+    }
+
+    /// Whether `unit`'s peripheral is asking for service, with `unit`'s
+    /// selector currently reading `sel`.
     ///
     /// Called with nothing of ours held, because it may call into the
     /// peripheral.
-    fn requesting(&self, unit: usize) -> bool {
-        if self.held[unit].load(Ordering::SeqCst) || self.pending[unit].load(Ordering::SeqCst) {
-            return true;
+    fn requesting(&self, unit: usize, sel: u8) -> bool {
+        for slot in Shared::slots_for(sel) {
+            if self.held[unit][slot].load(Ordering::SeqCst)
+                || self.pending[unit][slot].load(Ordering::SeqCst)
+            {
+                return true;
+            }
         }
-        let peer = self.peer[unit]
+        match self.peer(unit) {
+            Some(peer) => peer.dma_ready(),
+            None => false,
+        }
+    }
+
+    /// `unit`'s data-side peer, if it published one and is still alive.
+    fn peer(&self, unit: usize) -> Option<Arc<dyn DmaPeripheral>> {
+        self.peer[unit]
             .lock()
             .clone()
             .as_ref()
-            .and_then(Weak::upgrade);
-        match peer {
-            Some(peer) => peer.dma_ready(),
-            None => false,
+            .and_then(Weak::upgrade)
+    }
+
+    /// One unit's row of a latch array, packed one bit per slot.
+    fn latch_bits(&self, latch: &[[AtomicBool; SLOTS]; MAX_UNITS], unit: usize) -> u32 {
+        let mut bits = 0u32;
+        for (slot, cell) in latch[unit].iter().enumerate() {
+            if cell.load(Ordering::SeqCst) {
+                bits |= 1 << slot;
+            }
+        }
+        bits
+    }
+
+    /// Put a packed row back.
+    fn set_latch_bits(&self, latch: &[[AtomicBool; SLOTS]; MAX_UNITS], unit: usize, bits: u32) {
+        for (slot, cell) in latch[unit].iter().enumerate() {
+            cell.store(bits & (1 << slot) != 0, Ordering::SeqCst);
+        }
+    }
+
+    /// Spend the edge `unit` was just served on.
+    ///
+    /// Both slots, because either could have been the one asking and a beat
+    /// answers the unit rather than the pin.
+    fn spend_request(&self, unit: usize, sel: u8) {
+        for slot in Shared::slots_for(sel) {
+            self.pending[unit][slot].store(false, Ordering::SeqCst);
         }
     }
 
@@ -818,7 +985,7 @@ impl Shared {
 
     /// `EN` has gone 0→1: latch the pointers, or refuse the configuration.
     fn arm(&self, unit: usize, state: &mut State) {
-        let cfg = self.config(&state.unit[unit]);
+        let cfg = self.config(state, unit);
         let u = &mut state.unit[unit];
         let Some(cfg) = cfg else {
             // A reserved `DIR` or a reserved `PSIZE`/`MSIZE`. RM0090 §10.3.13
@@ -841,10 +1008,9 @@ impl Shared {
     /// The units that could move a beat, highest priority first.
     ///
     /// RM0090 §10.3.2: the software priority `PL` decides, and units of equal
-    /// priority go in ascending unit number. Returns each candidate with
-    /// whether it needs a request line to be asking.
-    fn candidates(&self, state: &State) -> ([(usize, bool); MAX_UNITS], usize) {
-        let mut out = [(0usize, false); MAX_UNITS];
+    /// priority go in ascending unit number.
+    fn candidates(&self, state: &State) -> ([Candidate; MAX_UNITS], usize) {
+        let mut out = [Candidate::NONE; MAX_UNITS];
         let mut len = 0;
         for prio in (0..4u8).rev() {
             for unit in 0..self.units {
@@ -852,11 +1018,17 @@ impl Shared {
                 if !u.running || u.cur_ndtr == 0 {
                     continue;
                 }
-                let Some(cfg) = self.config(u) else { continue };
+                let Some(cfg) = self.config(state, unit) else {
+                    continue;
+                };
                 if cfg.prio != prio {
                     continue;
                 }
-                out[len] = (unit, !cfg.mem2mem);
+                out[len] = Candidate {
+                    unit,
+                    needs_request: !cfg.mem2mem,
+                    sel: cfg.sel,
+                };
                 len += 1;
             }
         }
@@ -864,15 +1036,19 @@ impl Shared {
     }
 
     /// Plan `unit`'s next beat, with the lock held and nothing called outward.
-    fn plan(&self, state: &State, unit: usize) -> Option<Beat> {
+    ///
+    /// The `bool` alongside is `PFCTRL`, carried out of the lock so the caller
+    /// knows whether to ask the peripheral about the end of the transfer.
+    fn plan(&self, state: &State, unit: usize) -> Option<(Beat, bool)> {
         let u = &state.unit[unit];
         if !u.running || u.cur_ndtr == 0 {
             return None;
         }
-        let cfg = self.config(u)?;
+        let cfg = self.config(state, unit)?;
+        let u = &state.unit[unit];
         let (pw, mw) = (cfg.pw, cfg.mw);
         let (par, mar) = (u64::from(u.cur_par), u64::from(u.cur_mar));
-        Some(match cfg.dir {
+        let beat = match cfg.dir {
             Dir::PeriphToMem => Beat {
                 src: par,
                 dst: mar,
@@ -885,14 +1061,18 @@ impl Shared {
                 src_w: mw,
                 dst_w: pw,
             },
-        })
+        };
+        Some((beat, cfg.pfctrl))
     }
 
     /// Account for a beat that has already happened. Returns the unit's new
     /// interrupt level, to be driven once the lock is gone.
-    fn commit(&self, unit: usize, faulted: bool) -> Level {
+    ///
+    /// `last` is the peripheral's answer to "was that your final item?",
+    /// sampled before the beat and meaningful only under `PFCTRL`.
+    fn commit(&self, unit: usize, faulted: bool, last: bool) -> Level {
         let mut state = self.state.lock();
-        let Some(cfg) = self.config(&state.unit[unit]) else {
+        let Some(cfg) = self.config(&state, unit) else {
             return Level::Low;
         };
         let u = &mut state.unit[unit];
@@ -914,9 +1094,29 @@ impl Shared {
                 u.half_done = true;
                 u.flags |= F_HT;
             }
-            if u.cur_ndtr == 0 {
+            if cfg.pfctrl && last {
+                // RM0090 §10.3.2, peripheral flow control: the peripheral has
+                // just passed its last item, so *it* ends the transfer —
+                // `TCIF` goes up and the stream disables itself with whatever
+                // `NDTR` happens to be left. Neither `CIRC` nor `DBM` gets a
+                // say: the manual forbids both alongside `PFCTRL`, and
+                // reloading here would be a transfer the peripheral has said
+                // is over.
                 u.flags |= F_TC;
-                if cfg.dbm {
+                u.cr &= !CR_EN;
+                u.running = false;
+            } else if u.cur_ndtr == 0 {
+                u.flags |= F_TC;
+                if cfg.pfctrl {
+                    // The count was a *maximum* (RM0090 §10.3.2) and it ran
+                    // out before the peripheral was done. RM0090 §10.5.6: a
+                    // stream whose `NDTR` is zero can serve no transaction, so
+                    // it stops here — and, unlike the flow-controlled end
+                    // above, this is the firmware having under-programmed the
+                    // maximum rather than a transfer that finished.
+                    u.cr &= !CR_EN;
+                    u.running = false;
+                } else if cfg.dbm {
                     // Double buffer: swap `CT`, reload, and point the memory
                     // port at the other buffer (RM0090 §10.3.10).
                     u.cr ^= S_CR_CT;
@@ -949,20 +1149,28 @@ impl Shared {
             self.candidates(&state)
         };
         let mut chosen = None;
-        for &(unit, needs_request) in &cands[..len] {
-            if !needs_request || self.requesting(unit) {
-                chosen = Some(unit);
+        for cand in &cands[..len] {
+            if !cand.needs_request || self.requesting(cand.unit, cand.sel) {
+                chosen = Some(*cand);
                 break;
             }
         }
-        let Some(unit) = chosen else { return false };
+        let Some(cand) = chosen else { return false };
+        let unit = cand.unit;
 
-        let Some(beat) = ({
+        let Some((beat, pfctrl)) = ({
             let state = self.state.lock();
             self.plan(&state, unit)
         }) else {
             return false;
         };
+
+        // Peripheral flow control (RM0090 §10.3.2): ask, *before* moving the
+        // item, whether it is the peripheral's last. Before, because on the
+        // part the signal arrives with the data — and because a peripheral
+        // whose last word has just been read out has nothing left to answer
+        // with. Nothing of ours is held, as for every other outward call here.
+        let last = pfctrl && self.peer(unit).is_some_and(|peer| peer.dma_last());
 
         // Nothing of ours is held for either access.
         let moved = bus.read(beat.src, beat.src_w, attrs).and_then(|value| {
@@ -975,10 +1183,10 @@ impl Shared {
             bus.write(beat.dst, beat.dst_w, truncated, attrs)
         });
 
-        let level = self.commit(unit, moved.is_err());
+        let level = self.commit(unit, moved.is_err(), last);
         // The edge is spent whether or not the beat faulted: the peripheral
         // was served, and a fault is not a reason to serve it twice.
-        self.pending[unit].store(false, Ordering::SeqCst);
+        self.spend_request(unit, cand.sel);
         self.drive_irq(unit, level);
         true
     }
@@ -987,9 +1195,8 @@ impl Shared {
     fn refresh_irq(&self, unit: usize) {
         let level = {
             let state = self.state.lock();
-            let u = &state.unit[unit];
-            match self.config(u) {
-                Some(cfg) => Level::from_bool(u.flags & cfg.ie != 0),
+            match self.config(&state, unit) {
+                Some(cfg) => Level::from_bool(state.unit[unit].flags & cfg.ie != 0),
                 None => Level::Low,
             }
         };
@@ -1020,12 +1227,35 @@ impl Shared {
     }
 }
 
-impl WireSink for Shared {
-    fn set_level(&self, _src: WireId, line: u32, level: Level) {
+/// One request *pin*, with the wired-OR of everything driving it.
+///
+/// A cell of RM0090 Table 43 routinely holds more than one request —
+/// `TIM2_CH2` and `TIM2_CH4` are both DMA1 stream 6 channel 3 — and on the
+/// part those are OR'd onto one line into the stream. A board therefore writes
+/// two `wire` statements into the same pin, and without this the second
+/// driver's low would cancel the first's high. [`FanIn`] is exactly that
+/// bookkeeping, so the pin owns one and resolves it as a wired-OR.
+///
+/// It is *derived* state and deliberately not snapshotted: a `FanIn` is a
+/// cache of what the drivers last said, the resolved level is what the latch
+/// in [`Shared`] holds, and a load is followed by the machine re-announcing
+/// every net.
+#[derive(Debug)]
+struct RequestPin {
+    shared: Arc<Shared>,
+    unit: usize,
+    slot: usize,
+    drivers: FanIn,
+}
+
+impl WireSink for RequestPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
         // No lock, no outward call: the beat this asks for happens in `run`.
         // That is what lets a peripheral raise its request from inside its own
         // register handler.
-        self.set_request(line as usize, level);
+        self.drivers.set(src, level);
+        self.shared
+            .set_request(self.unit, self.slot, self.drivers.resolve(Resolve::Or));
     }
 }
 
@@ -1085,6 +1315,8 @@ impl MemOps for Registers {
 pub struct Dma {
     shared: Arc<Shared>,
     region: RegionRef,
+    /// The device owns its input pins; a wire holds only a `Weak` to them.
+    pins: Mutex<Vec<Arc<RequestPin>>>,
 }
 
 impl Dma {
@@ -1107,9 +1339,10 @@ impl Dma {
             return Err(Error::Config {
                 at: String::from(CLASS_NAME),
                 message: String::from(
-                    "DMAMUX request routing (RM0432 §14) is a separate peripheral, `st.dmamux`, \
-                     and it is not written: drop `mux` and wire each peripheral's request to the \
-                     channel its part's request matrix puts it on",
+                    "DMAMUX request routing (RM0432 §14) is a separate peripheral on the die and \
+                     a separate class here, `st.dmamux`: declare one and wire it between the \
+                     peripherals and this controller's `req` pins, rather than asking a DMA \
+                     controller to be its own multiplexer",
                 ),
             });
         }
@@ -1127,7 +1360,11 @@ impl Dma {
                 shared: Arc::clone(&shared),
             }) as Arc<dyn MemOps>,
         ));
-        Dma { shared, region }
+        Dma {
+            shared,
+            region,
+            pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+        }
     }
 
     /// Which register face this instance wears.
@@ -1152,10 +1389,23 @@ impl Dma {
         }
     }
 
-    /// Raise or drop unit `unit`'s request line directly, as a wired
-    /// peripheral would.
+    /// Raise or drop unit `unit`'s **unselected** request line directly, as a
+    /// peripheral wired to the plain `req{n}` pin would.
+    ///
+    /// Served whatever `CHSEL`/`CSELR` reads — see [`Dma::set_selected_request`]
+    /// for the gated form.
     pub fn set_request(&self, unit: usize, level: Level) {
-        self.shared.set_request(unit, level);
+        self.shared.set_request(unit, 0, level);
+    }
+
+    /// Raise or drop the request line the board attached to unit `unit`'s
+    /// selector `sel`, as a peripheral wired to `req{unit}c{sel}` would.
+    ///
+    /// It buys a beat only while the unit's `CHSEL` (stream face) or `CSELR`
+    /// nibble (channel face) reads `sel`, which is the half of RM0090
+    /// Table 43 a `req{n}`-only wiring throws away.
+    pub fn set_selected_request(&self, unit: usize, sel: u8, level: Level) {
+        self.shared.set_request(unit, sel as usize + 1, level);
     }
 
     /// What `NDTR` currently reads for `unit`.
@@ -1193,6 +1443,28 @@ impl Dma {
         let unit = n.checked_sub(first)?;
         (unit < self.shared.units).then_some(unit)
     }
+
+    /// The unit and latch slot a `req` pin name selects.
+    ///
+    /// `req3` is the unnumbered line and lands in slot zero. `req3c4` is
+    /// "stream 3, channel 4" — one cell of RM0090 Table 43 — and lands in
+    /// slot 5, where only a stream reading `CHSEL = 4` can hear it.
+    fn req_pin(&self, port: &str) -> Option<(usize, usize)> {
+        let rest = port.strip_prefix("req")?;
+        let (number, sel) = match rest.split_once('c') {
+            Some((number, sel)) => {
+                let sel: usize = sel.parse().ok()?;
+                (number, sel.checked_add(1)?)
+            }
+            None => (rest, 0),
+        };
+        if sel > MAX_SELECTORS {
+            return None;
+        }
+        let n: usize = number.parse().ok()?;
+        let unit = n.checked_sub(self.shared.variant.first_pin())?;
+        (unit < self.shared.units).then_some((unit, sel))
+    }
 }
 
 impl Device for Dma {
@@ -1209,8 +1481,10 @@ impl Device for Dma {
     fn reset(&self, _kind: ResetKind) {
         *self.shared.state.lock() = State::reset(self.shared.variant);
         for unit in 0..self.shared.units {
-            self.shared.held[unit].store(false, Ordering::SeqCst);
-            self.shared.pending[unit].store(false, Ordering::SeqCst);
+            for slot in 0..SLOTS {
+                self.shared.held[unit][slot].store(false, Ordering::SeqCst);
+                self.shared.pending[unit][slot].store(false, Ordering::SeqCst);
+            }
         }
         for unit in 0..self.shared.units {
             self.shared.refresh_irq(unit);
@@ -1232,9 +1506,11 @@ impl Device for Dma {
             w.write_u8(u.flags)?;
             // The request latch is guest-visible through its effect: a
             // transfer caught mid-flight resumes only if the peripheral is
-            // still asking, so the levels travel with the state.
-            w.write_bool(self.shared.held[unit].load(Ordering::SeqCst))?;
-            w.write_bool(self.shared.pending[unit].load(Ordering::SeqCst))?;
+            // still asking, so the levels travel with the state. One bit per
+            // selector slot, packed, because `SLOTS` of them per unit as
+            // separate booleans is the same information four times the size.
+            w.write_u32(self.shared.latch_bits(&self.shared.held, unit))?;
+            w.write_u32(self.shared.latch_bits(&self.shared.pending, unit))?;
         }
         w.write_u32(state.cselr)
     }
@@ -1248,7 +1524,7 @@ impl Device for Dma {
             )));
         }
         let mut state = State::reset(self.shared.variant);
-        let mut latch = [(false, false); MAX_UNITS];
+        let mut latch = [(0u32, 0u32); MAX_UNITS];
         for (unit, slot) in latch.iter_mut().enumerate().take(units) {
             let u = &mut state.unit[unit];
             u.cr = r.read_u32()?;
@@ -1263,13 +1539,14 @@ impl Device for Dma {
             u.running = r.read_bool()?;
             u.half_done = r.read_bool()?;
             u.flags = r.read_u8()?;
-            *slot = (r.read_bool()?, r.read_bool()?);
+            *slot = (r.read_u32()?, r.read_u32()?);
         }
         state.cselr = r.read_u32()?;
         *self.shared.state.lock() = state;
         for (unit, &(held, pending)) in latch.iter().enumerate().take(units) {
-            self.shared.held[unit].store(held, Ordering::SeqCst);
-            self.shared.pending[unit].store(pending, Ordering::SeqCst);
+            self.shared.set_latch_bits(&self.shared.held, unit, held);
+            self.shared
+                .set_latch_bits(&self.shared.pending, unit, pending);
         }
         for unit in 0..units {
             self.shared.refresh_irq(unit);
@@ -1304,16 +1581,22 @@ impl Device for Dma {
         }
     }
 
-    fn sink(&self, port: &str, _sources: &[WireId]) -> Option<SinkPin> {
-        let unit = self.pin_index(port, "req")?;
-        Some(SinkPin {
-            sink: Arc::clone(&self.shared) as Arc<dyn WireSink>,
-            line: unit as u32,
-        })
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        let (unit, slot) = self.req_pin(port)?;
+        let pin = Arc::new(RequestPin {
+            shared: Arc::clone(&self.shared),
+            unit,
+            slot,
+            drivers: FanIn::new(sources),
+        });
+        self.pins.lock().push(Arc::clone(&pin));
+        Some(SinkPin { sink: pin, line: 0 })
     }
 
     fn attach_dma_peripheral(&self, port: &str, peer: Weak<dyn DmaPeripheral>) {
-        if let Some(unit) = self.pin_index(port, "req") {
+        // The data-side handle is per *unit*: a stream has one peripheral
+        // feeding it at a time, whichever of its eight channels is selected.
+        if let Some((unit, _)) = self.req_pin(port) {
             *self.shared.peer[unit].lock() = Some(peer);
         }
     }
@@ -1365,7 +1648,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "mux",
             kind: ValueKind::Bool,
             required: false,
-            summary: "route requests through a DMAMUX — refused, `st.dmamux` is not written",
+            summary: "route requests through a DMAMUX — refused: `st.dmamux` is its own class",
         },
     ],
     construct: |props| Ok(Box::new(Dma::new(props)?)),
@@ -1404,6 +1687,13 @@ pub fn schema() -> ClassSchema {
         schema = schema
             .port(format!("irq{unit}"), PortDir::Out)
             .port(format!("req{unit}"), PortDir::In);
+        // And the selector-qualified form, one pin per cell of the part's
+        // request matrix, declared as a bank so an error message prints
+        // `req0c0`..`req0c15` rather than sixteen lines. Both faces get all
+        // sixteen: `CHSEL` only reaches eight, and a stream wired to `req0c9`
+        // would never fire, but the schema is per class and an instance's
+        // `variant` is a property.
+        schema = schema.port_bank(format!("req{unit}c"), PortDir::In, MAX_SELECTORS as u32);
     }
     schema
 }
