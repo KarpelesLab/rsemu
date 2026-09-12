@@ -61,19 +61,23 @@
 //! * The `I2Cx_EV` and `I2Cx_ER` interrupt outputs, gated by `ITEVTEN`,
 //!   `ITBUFEN` and `ITERREN` exactly as §25.6.2 lists them.
 //!
+//! **Slave mode, §25.3.2, on both links**: `OAR1` with its 7- or 10-bit own
+//! address, `OAR2` under `ENDUAL`, the general call under `ENGC`, `EV1`
+//! (`ADDR`, cleared by reading `SR1` then `SR2`, with `TRA`, `DUALF` and
+//! `GENCALL` in `SR2`), `EV2`/`EV3` for the data phase, `EV4`'s `STOPF`, `AF`
+//! when a master-receiver ends a read, `OVR` under `NOSTRETCH`, and the clock
+//! stretching that is a **level on SCL** rather than a flag — which is what
+//! makes another controller on the same board stall on it.
+//!
+//! The slave face is **one object serving both links**
+//! ([`ControllerWires::attach_slave`](crate::bus::i2c::wires::ControllerWires::attach_slave)):
+//! a transactional [`I2cBus`] routes to it by address, a wired one reaches it
+//! from the edges on the two nets this peripheral would otherwise drive. There
+//! is therefore no way for the two to disagree, which was the whole objection
+//! to bolting a wired slave on separately.
+//!
 //! # What is not
 //!
-//! * **Slave mode.** `OAR1`, `OAR2` and the `SR2` fields that go with it
-//!   (`DUALF`, `GENCALL`, `SMBHOST`, `SMBDEFAULT`) are readable and writable
-//!   and nothing answers to them. The reason is structural rather than a
-//!   shortage of enthusiasm: on real silicon one pair of pins carries both
-//!   roles, so a wired slave mode needs a single bit engine that drives *and*
-//!   listens on the same [`OpenDrain`](crate::bus::i2c::wires::OpenDrain)
-//!   pair. [`crate::bus::i2c::wires`] has that engine on the slave side and the
-//!   master side separately, and gluing them at this level would give a
-//!   transactional slave that behaves differently from the wired one — which is
-//!   the exact failure this bus was written to avoid. It is a day's work in
-//!   `bus::i2c`, not a paragraph here.
 //! * **SMBus and PEC.** `SMBUS`, `SMBTYPE`, `ENARP`, `ENPEC`, `PEC`, `ALERT`,
 //!   `PECERR`, `TIMEOUT` and `SMBALERT` are register storage. SMBus is a
 //!   command layer and a timeout regime on top of I²C (`docs/buses/low-speed.md`)
@@ -102,10 +106,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::bus::i2c::wires::{MasterEvent, MasterOp, MasterWires, MasterWiresState, pin as line};
+use crate::bus::i2c::wires::{
+    ControllerWires, ControllerWiresState, MasterEvent, MasterOp, pin as line,
+};
 use crate::bus::i2c::{
-    Ack, Address, BYTE_HALF_PERIODS, Direction, I2cBus, Link, START_HALF_PERIODS,
-    STOP_HALF_PERIODS, buses,
+    Ack, Address, BYTE_HALF_PERIODS, Direction, GENERAL_CALL, I2cBus, I2cSlave, Link,
+    START_HALF_PERIODS, STOP_HALF_PERIODS, buses,
 };
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
@@ -125,7 +131,7 @@ mod tests;
 const CLASS_NAME: &str = "st.i2c";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// How many bytes of address space the register block occupies.
 ///
@@ -141,6 +147,10 @@ pub const REGISTER_BYTES: u64 = 0x28;
 
 /// `CR1` bit 0: peripheral enable (§25.6.1).
 const CR1_PE: u32 = 1 << 0;
+/// `CR1` bit 6: `ENGC`, answer the general call address (§25.6.1).
+const CR1_ENGC: u32 = 1 << 6;
+/// `CR1` bit 7: `NOSTRETCH`, slave mode only — do not hold SCL down.
+const CR1_NOSTRETCH: u32 = 1 << 7;
 /// `CR1` bit 8: start generation.
 const CR1_START: u32 = 1 << 8;
 /// `CR1` bit 9: stop generation.
@@ -170,6 +180,10 @@ const CR2_MASK: u32 = CR2_FREQ | CR2_ITERREN | CR2_ITEVTEN | CR2_ITBUFEN | (1 <<
 /// Everything `OAR1` defines, bit 14 included — §25.6.3 says it "should always
 /// be kept at 1 by software", so it is writable and reads back.
 const OAR1_MASK: u32 = (1 << 15) | (1 << 14) | 0x3ff;
+/// `OAR1` bit 15: `ADDMODE`, the own address is ten bits rather than seven.
+const OAR1_ADDMODE: u32 = 1 << 15;
+/// `OAR2` bit 0: `ENDUAL`, the second own address answers as well (§25.6.4).
+const OAR2_ENDUAL: u32 = 1 << 0;
 /// Everything `OAR2` defines.
 const OAR2_MASK: u32 = 0xff;
 
@@ -206,6 +220,10 @@ const SR2_MSL: u32 = 1 << 0;
 const SR2_BUSY: u32 = 1 << 1;
 /// `SR2` bit 2: `TRA`, data bytes are being transmitted rather than received.
 const SR2_TRA: u32 = 1 << 2;
+/// `SR2` bit 4: `GENCALL`, the address that matched was the general call.
+const SR2_GENCALL: u32 = 1 << 4;
+/// `SR2` bit 7: `DUALF`, the address that matched was `OAR2`'s.
+const SR2_DUALF: u32 = 1 << 7;
 
 /// `CCR` bits 11:0: the clock control value (§25.6.8).
 const CCR_VALUE: u32 = 0xfff;
@@ -234,12 +252,17 @@ const NO_EVENT: u64 = u64::MAX;
 
 /// The rank this controller's own state takes.
 ///
-/// Above [`crate::bus::i2c::WIRES_RANK`] because the controller calls *into* its
-/// bit engine, and its neighbour [`crate::bus::i2c::FABRIC_RANK`] documents the
-/// whole ladder. It is nevertheless never held across a call into the engine or
-/// the fabric — every handler decides under the lock and acts outside it — so
-/// the rank is belt and braces rather than the thing that makes this correct.
-const STATE_RANK: LockRank = LockRank::new(0x4700);
+/// **Below** [`crate::bus::i2c::WIRES_RANK`], which is the direction traffic
+/// actually runs once the peripheral can be addressed: an edge on the net
+/// reaches the bit engine, the bit engine calls the slave face, and the slave
+/// face is this register file. [`crate::bus::i2c::FABRIC_RANK`] documents the
+/// whole ladder; the same argument puts this below the fabric, which is the
+/// transactional spelling of the identical call chain.
+///
+/// The register block goes the other way — state, then engine — so it is never
+/// held across a call into the engine or the fabric: every handler decides
+/// under the lock and acts outside it.
+const STATE_RANK: LockRank = LockRank::new(0x4950);
 
 // ---------------------------------------------------------------------------
 // The device
@@ -316,6 +339,17 @@ const fn stage_from_code(code: u8) -> Stage {
     }
 }
 
+/// Which own address a START matched, for `SR2`'s `GENCALL` and `DUALF`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressMatch {
+    /// `OAR1`, the ordinary own address.
+    Oar1,
+    /// `OAR2`, under `ENDUAL` (§25.6.4).
+    Oar2,
+    /// The general call, under `ENGC` (UM10204 §3.1.13).
+    General,
+}
+
 /// A bus event in flight, as this controller records it.
 ///
 /// The same four cases as [`MasterOp`], kept separately because the
@@ -387,8 +421,10 @@ struct Shared {
     link: Link,
     /// The bus this controller drives in [`Link::Transactional`] mode.
     bus: Option<Arc<I2cBus>>,
-    /// The bit engine it drives in [`Link::Wired`] mode.
-    wires: Arc<MasterWires>,
+    /// The bit engine it drives in [`Link::Wired`] mode — and, because that
+    /// engine carries both roles on one pin pair, the way another controller
+    /// reaches this peripheral's slave face.
+    wires: Arc<ControllerWires>,
     /// Domain ticks simulated, published for the scheduler's lock-free
     /// question. Mirrors `State::ticks`.
     ticks: AtomicU64,
@@ -463,6 +499,13 @@ struct State {
     /// Set by a **non-debug** read of `SR1`: the first half of every clearing
     /// sequence in §25.6.6.
     sr1_read: bool,
+    /// Whether the **slave face** is in a transaction: addressed by another
+    /// controller, and not yet stopped (§25.3.2).
+    slave_active: bool,
+    /// `SR2`'s `GENCALL`: the address that matched was the general call.
+    gencall: bool,
+    /// `SR2`'s `DUALF`: the address that matched was `OAR2`'s.
+    dualf: bool,
     /// The bus event in flight, mirrored here in both link models so the engine
     /// loop, the snapshot and `next_event_tick` ask one question.
     op: Option<Op>,
@@ -499,6 +542,9 @@ impl Default for State {
             ten: None,
             rx_done: false,
             sr1_read: false,
+            slave_active: false,
+            gencall: false,
+            dualf: false,
             op: None,
             halves_left: 0,
             next_edge: 0,
@@ -554,6 +600,12 @@ impl State {
         if self.tra {
             v |= SR2_TRA;
         }
+        if self.gencall {
+            v |= SR2_GENCALL;
+        }
+        if self.dualf {
+            v |= SR2_DUALF;
+        }
         v
     }
 
@@ -574,11 +626,44 @@ impl State {
 
     /// Whether the peripheral is holding SCL low waiting for software
     /// (§25.3.3, Figure 243 note 1).
+    ///
+    /// The slave face stretches for the same reason and at the same three
+    /// points §25.3.2 lists: `ADDR` set and `EV1` not done, a received byte the
+    /// guest has not read, and a transmit register the guest has not filled.
+    /// `NOSTRETCH` turns all three off, and then an unserved register is an
+    /// overrun instead (§25.6.1).
     const fn stretching(&self) -> bool {
+        if self.slave_active {
+            return self.cr1 & CR1_NOSTRETCH == 0
+                && (self.any(SR1_ADDR | SR1_RXNE | SR1_BTF) || (self.tra && !self.tx_pending));
+        }
         matches!(
             self.stage,
             Stage::AddressWait | Stage::Address2Wait | Stage::AddrWait
         ) || (matches!(self.stage, Stage::Tx | Stage::Rx) && self.any(SR1_BTF))
+    }
+
+    /// Which of this peripheral's own addresses `address` matches (§25.6.3,
+    /// §25.6.4), or `None` for one that is somebody else's.
+    fn own_address(&self, address: Address) -> Option<AddressMatch> {
+        if self.oar1 & OAR1_ADDMODE == 0 {
+            // Seven bits: `ADD[7:1]`.
+            if address == Address::Seven(((self.oar1 >> 1) & 0x7f) as u8) {
+                return Some(AddressMatch::Oar1);
+            }
+        } else if address == Address::Ten((self.oar1 & 0x3ff) as u16) {
+            return Some(AddressMatch::Oar1);
+        }
+        // `OAR2` is seven bits only, and only when `ENDUAL` says so.
+        if self.oar2 & OAR2_ENDUAL != 0
+            && address == Address::Seven(((self.oar2 >> 1) & 0x7f) as u8)
+        {
+            return Some(AddressMatch::Oar2);
+        }
+        if self.cr1 & CR1_ENGC != 0 && address == GENERAL_CALL {
+            return Some(AddressMatch::General);
+        }
+        None
     }
 
     /// The level `I2Cx_EV` should be at (§25.6.2, `ITEVTEN`).
@@ -618,7 +703,9 @@ impl Stm32I2c {
     ///   deliberately so: `docs/buses/low-speed.md` asks for this choice to be
     ///   made rather than defaulted into, and `bus::spi` set the precedent.
     /// * `bus` — the name of the [`I2cBus`] to drive. Required for
-    ///   `transactional`, ignored for `wired`.
+    ///   `transactional`. A `wired` controller drives its lines instead, but a
+    ///   bus named here still carries its **slave face**, so a machine may put
+    ///   one on both fabrics deliberately.
     ///
     /// # Errors
     ///
@@ -652,7 +739,7 @@ impl Stm32I2c {
             .as_deref()
             .map(|name| buses::attach(props, name))
             .transpose()?;
-        Ok(Stm32I2c::with_bus(link, bus))
+        Stm32I2c::with_bus(link, bus)
     }
 
     /// A controller on a bus the caller already holds.
@@ -660,13 +747,23 @@ impl Stm32I2c {
     /// What [`Stm32I2c::new`] ends up calling, and the way to build one without
     /// going through the named table — an embedder that owns its own
     /// [`I2cBus`], or a test that wants a bus nothing else can reach.
-    #[must_use]
-    pub fn with_bus(link: Link, bus: Option<Arc<I2cBus>>) -> Stm32I2c {
+    ///
+    /// A controller puts its **slave face** on both links here: on the bus by
+    /// address, and on the bit engine's target half. That face answers nothing
+    /// until `OAR1`, `OAR2` or `ENGC` is enabled, and it refuses every address
+    /// while this controller is itself the master — which is how "a part cannot
+    /// address itself" is modelled.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the bus already holds
+    /// [`MAX_SLAVES`](crate::bus::i2c::MAX_SLAVES) devices.
+    pub fn with_bus(link: Link, bus: Option<Arc<I2cBus>>) -> Result<Stm32I2c> {
         let shared = Arc::new(Shared {
             state: Mutex::with_rank(STATE_RANK, State::default()),
             link,
-            bus,
-            wires: Arc::new(MasterWires::new()),
+            bus: bus.clone(),
+            wires: Arc::new(ControllerWires::new()),
             ticks: AtomicU64::new(0),
             next_event: AtomicU64::new(NO_EVENT),
             ev: Mutex::with_rank(LockRank::WIRE, None),
@@ -675,11 +772,21 @@ impl Stm32I2c {
             er_level: AtomicBool::new(false),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
         });
+        // One face, both links: a transactional bus routes to it by address
+        // and a wired one reaches it through the engine's target half, so a
+        // wired slave cannot behave differently from a transactional one.
+        let face = Arc::new(SlaveFace {
+            shared: Arc::clone(&shared),
+        }) as Arc<dyn I2cSlave>;
+        shared.wires.attach_slave(Arc::clone(&face));
+        if let Some(bus) = bus.as_ref() {
+            bus.attach(face)?;
+        }
         let port = Arc::new(RegisterPort {
             shared: Arc::clone(&shared),
         });
         let region = Arc::new(Region::io("i2c", REGISTER_BYTES, port as Arc<dyn MemOps>));
-        Stm32I2c { shared, region }
+        Ok(Stm32I2c { shared, region })
     }
 
     /// How this controller carries a byte.
@@ -696,7 +803,7 @@ impl Stm32I2c {
 
     /// Its wire-level engine, for a machine that drives the lines.
     #[must_use]
-    pub fn wires(&self) -> &Arc<MasterWires> {
+    pub fn wires(&self) -> &Arc<ControllerWires> {
         &self.shared.wires
     }
 
@@ -1188,6 +1295,7 @@ impl Shared {
                 }
             };
             if !step {
+                self.refresh_stretch();
                 return;
             }
             let event = self.half_step();
@@ -1199,7 +1307,210 @@ impl Shared {
             }
             self.pump();
             self.update_interrupts();
+            self.refresh_stretch();
         }
+    }
+
+    /// Let the slave face release SCL once software has served it.
+    ///
+    /// [`Link::Wired`] only, and outside every engine lock: driving the pin
+    /// re-enters the target engine, so this may never be called from inside a
+    /// [`SlaveFace`] method. The *stall* is put on by the engine itself at the
+    /// end of a nine-bit slot; only the release needs asking for, because
+    /// nothing on the wire says when software got round to it (§25.3.2).
+    fn refresh_stretch(&self) {
+        if self.link == Link::Wired {
+            self.wires.refresh_stretch();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The slave face
+// ---------------------------------------------------------------------------
+
+/// This controller seen from the bus: slave mode, §25.3.2.
+///
+/// The **same object on both links** — a transactional [`I2cBus`] routes to it
+/// by address, a [`ControllerWires`] reaches it from the edges on the nets this
+/// peripheral would otherwise drive — so there is one implementation of ST's
+/// slave mode and no way for the two to disagree.
+///
+/// Every method takes the state lock for a short critical section and releases
+/// it before doing anything outward, which is the re-entrancy contract read
+/// literally: the outward part here is only re-driving the interrupt lines.
+struct SlaveFace {
+    shared: Arc<Shared>,
+}
+
+impl fmt::Debug for SlaveFace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stm32I2cSlave").finish_non_exhaustive()
+    }
+}
+
+impl I2cSlave for SlaveFace {
+    fn address(&self, address: Address, dir: Direction) -> Ack {
+        let answer = {
+            let mut state = self.shared.state.lock();
+            // A part cannot address itself: while this controller is the master
+            // its own slave face is deaf.
+            if !state.enabled() || state.stage != Stage::Idle {
+                return Ack::Nack;
+            }
+            match state.own_address(address) {
+                // §25.6.1's `ACK`: "0: No acknowledge returned". A slave with
+                // the bit clear does not answer its own address either.
+                Some(_) if state.cr1 & CR1_ACK == 0 => {
+                    Self::end_transaction(&mut state);
+                    return Ack::Nack;
+                }
+                None => {
+                    // UM10204 §3.1.11: a repeated START that addressed somebody
+                    // else ends our transaction.
+                    Self::end_transaction(&mut state);
+                    return Ack::Nack;
+                }
+                Some(matched) => {
+                    state.slave_active = true;
+                    state.msl = false;
+                    state.tra = dir == Direction::Read;
+                    state.gencall = matched == AddressMatch::General;
+                    state.dualf = matched == AddressMatch::Oar2;
+                    // §25.3.2's `EV1`: `ADDR` is set and cleared by reading
+                    // `SR1` then `SR2`.
+                    state.set(SR1_ADDR);
+                    state.sr1_read = false;
+                    if state.tra {
+                        // The data register is empty and the master is waiting
+                        // for the first byte — `EV3_1`.
+                        state.tx_pending = false;
+                        state.set(SR1_TXE);
+                    }
+                    Ack::Ack
+                }
+            }
+        };
+        self.shared.update_interrupts();
+        answer
+    }
+
+    fn ten_bit_header(&self, high: u8) -> bool {
+        let state = self.shared.state.lock();
+        state.enabled()
+            && state.stage == Stage::Idle
+            && state.cr1 & CR1_ACK != 0
+            && state.oar1 & OAR1_ADDMODE != 0
+            && ((state.oar1 >> 8) & 0x3) == u32::from(high & 0x3)
+    }
+
+    fn write(&self, byte: u8) -> Ack {
+        let answer = {
+            let mut state = self.shared.state.lock();
+            if !state.slave_active {
+                return Ack::Nack;
+            }
+            if !state.any(SR1_RXNE) {
+                state.dr = byte;
+                state.set(SR1_RXNE);
+            } else if state.shift.is_none() {
+                // §25.6.6: `BTF` in reception is "a new byte is received
+                // (including ACK pulse) and DR has not been read yet". Two
+                // bytes are held at that moment, not one.
+                state.shift = Some(byte);
+                state.set(SR1_BTF);
+            } else {
+                // Both full and the guest still has not read: the byte is lost
+                // and §25.6.6's `OVR` says so. Only reachable with `NOSTRETCH`,
+                // because otherwise the clock is already held down.
+                state.set(SR1_OVR);
+            }
+            // §25.6.1: the acknowledge follows `ACK`, so software clearing it
+            // is how a slave refuses the next byte.
+            if state.cr1 & CR1_ACK != 0 {
+                Ack::Ack
+            } else {
+                Ack::Nack
+            }
+        };
+        self.shared.update_interrupts();
+        answer
+    }
+
+    fn read(&self) -> u8 {
+        let mut state = self.shared.state.lock();
+        if !state.tx_pending {
+            // Nothing loaded. §25.6.6's underrun: the previous byte goes out
+            // again and `OVR` is set. An undriven SDA reads as the pull-up, so
+            // that is what an empty register puts on the bus.
+            state.set(SR1_OVR);
+            return 0xff;
+        }
+        state.dr
+    }
+
+    fn read_ack(&self, ack: Ack) {
+        {
+            let mut state = self.shared.state.lock();
+            if !state.slave_active {
+                return;
+            }
+            state.tx_pending = false;
+            if ack.is_ack() {
+                // §25.3.2's `EV3`: the master wants another one.
+                state.set(SR1_TXE);
+            } else {
+                // §25.3.2: "a NACK is received: AF is set" and the slave
+                // releases the lines until the STOP.
+                state.set(SR1_AF);
+                state.clear(SR1_TXE);
+            }
+        }
+        self.shared.update_interrupts();
+    }
+
+    fn stop(&self) {
+        {
+            let mut state = self.shared.state.lock();
+            if !state.slave_active {
+                return;
+            }
+            // §25.6.6: `STOPF` is "set by hardware when a Stop condition is
+            // detected ... after an acknowledge (if ACK=1)", and it is a slave
+            // flag only.
+            state.set(SR1_STOPF);
+            Self::end_transaction(&mut state);
+        }
+        self.shared.update_interrupts();
+    }
+
+    fn stretching(&self) -> bool {
+        let state = self.shared.state.lock();
+        state.slave_active && state.stretching()
+    }
+
+    fn peek(&self) -> u8 {
+        let state = self.shared.state.lock();
+        if state.tx_pending { state.dr } else { 0xff }
+    }
+}
+
+impl SlaveFace {
+    /// Leave slave mode without touching a flag the guest still has to see.
+    ///
+    /// `STOPF` and `AF` survive: both are cleared by a software sequence
+    /// (§25.6.6), and a driver that never saw them would have no idea the
+    /// transfer ended.
+    fn end_transaction(state: &mut State) {
+        if !state.slave_active {
+            return;
+        }
+        state.slave_active = false;
+        state.tra = false;
+        state.gencall = false;
+        state.dualf = false;
+        state.tx_pending = false;
+        state.clear(SR1_TXE);
     }
 }
 
@@ -1284,7 +1595,9 @@ impl RegisterPort {
                 // arming latch is not cleared by anything in between.
                 state.clear(SR1_ADDR);
                 state.sr1_read = false;
-                if state.stage == Stage::AddrWait {
+                // §25.3.2's `EV1` is the same two reads and ends there: a slave
+                // has no address phase of its own to advance.
+                if state.stage == Stage::AddrWait && !state.slave_active {
                     state.stage = if state.tra { Stage::Tx } else { Stage::Rx };
                     if state.tra {
                         // §25.3.3, `EV8_1`: the data register is empty and the
@@ -1335,6 +1648,9 @@ impl RegisterPort {
                     state.tra = false;
                     state.tx_pending = false;
                     state.stage = Stage::Idle;
+                    state.slave_active = false;
+                    state.gencall = false;
+                    state.dualf = false;
                 }
                 let now_ack = state.cr1 & CR1_ACK != 0;
                 if had_ack != now_ack && matches!(state.op, Some(Op::Read(_))) {
@@ -1418,6 +1734,10 @@ impl RegisterPort {
     }
 
     /// Do what a handler asked for, with no lock held.
+    ///
+    /// Every path ends with [`Shared::refresh_stretch`]: reading `DR` or
+    /// writing it is exactly what ends a slave-mode stall, and on the wired
+    /// link that stall is a level somebody else is waiting on.
     fn finish(&self, after: After) {
         match after {
             After::Nothing => {}
@@ -1437,6 +1757,7 @@ impl RegisterPort {
                 self.shared.update_interrupts();
             }
         }
+        self.shared.refresh_stretch();
     }
 }
 
@@ -1550,6 +1871,11 @@ impl Device for Stm32I2c {
         // of `SR1` and the read of `SR2` has to resume *inside* that sequence,
         // or the guest's next `SR2` read stops clearing `ADDR`.
         w.write_bool(state.sr1_read)?;
+        // The slave face's own three: which of `OAR1`/`OAR2`/the general call
+        // matched is `SR2` state the guest can still read back.
+        w.write_bool(state.slave_active)?;
+        w.write_bool(state.gencall)?;
+        w.write_bool(state.dualf)?;
         let (op, operand) = state.op.map_or((0, 0), Op::code);
         w.write_u8(op)?;
         w.write_u8(operand)?;
@@ -1594,6 +1920,9 @@ impl Device for Stm32I2c {
             },
             rx_done: r.read_bool()?,
             sr1_read: r.read_bool()?,
+            slave_active: r.read_bool()?,
+            gencall: r.read_bool()?,
+            dualf: r.read_bool()?,
             op: {
                 let code = r.read_u8()?;
                 let operand = r.read_u8()?;
@@ -1603,7 +1932,7 @@ impl Device for Stm32I2c {
             next_edge: r.read_u64()?,
             high_half: r.read_bool()?,
         };
-        let wires = MasterWiresState::read(r)?;
+        let wires = ControllerWiresState::read(r)?;
         {
             let mut slot = self.shared.state.lock();
             *slot = state;

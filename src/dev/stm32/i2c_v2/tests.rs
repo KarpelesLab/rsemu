@@ -23,7 +23,7 @@ use super::*;
 
 use alloc::vec::Vec;
 
-use crate::bus::i2c::wires::{MasterWires, pin as line};
+use crate::bus::i2c::wires::{ControllerWires, pin as line};
 use crate::core::device::{Device, ResetKind};
 use crate::core::props::{Props, Value};
 use crate::core::space::{RegionKind, RegionRef};
@@ -238,7 +238,7 @@ impl Board {
 /// Put the controller and the EEPROM on two open-drain nets, as a machine
 /// file's four `wire` statements do.
 fn wire_up(ctrl: &Stm32I2cV2, eeprom: &At24c) {
-    let master: &Arc<MasterWires> = ctrl.wires();
+    let master: &Arc<ControllerWires> = ctrl.wires();
     let slave = Arc::clone(eeprom.wires());
     let scl_ids = [WireId::new(1), WireId::new(2)];
     let sda_ids = [WireId::new(3), WireId::new(4)];
@@ -651,7 +651,8 @@ fn the_v1_and_v2_blocks_leave_the_same_bytes_in_the_same_eeprom() {
     let bus = Arc::new(I2cBus::new());
     let eeprom = At24c::new(&Props::new()).expect("an EEPROM");
     bus.attach(eeprom.slave()).expect("room on the bus");
-    let ctrl = Stm32I2c::with_bus(Link::Transactional, Some(Arc::clone(&bus)));
+    let ctrl =
+        Stm32I2c::with_bus(Link::Transactional, Some(Arc::clone(&bus))).expect("a controller");
     let r = regs_v1(&ctrl);
     let mut now = 0_u64;
     let mut step = |now: &mut u64, n: u64| {
@@ -1370,4 +1371,427 @@ fn a_reset_keeps_the_tick_and_drops_everything_else() {
     assert_eq!(peek(&board.region, CR1), 0);
     assert_eq!(peek(&board.region, TIMINGR), 0);
     assert_eq!(peek(&board.region, ISR), ISR_TXE);
+}
+
+// ---------------------------------------------------------------------------
+// Two controllers on one wired bus
+// ---------------------------------------------------------------------------
+
+/// Put any number of open-drain participants on two nets, exactly as a machine
+/// file's `wire` statements do.
+///
+/// The general form of [`wire_up`]: a board with two controllers on one bus has
+/// four drivers per net, not two, and the fan-in has to be told about all of
+/// them before anything moves.
+fn wire_nets(parts: &[Arc<ControllerWires>]) -> (Arc<Wire>, Arc<Wire>) {
+    let n = parts.len();
+    let scl_ids: Vec<WireId> = (0..n).map(|i| WireId::new(1 + i as u64)).collect();
+    let sda_ids: Vec<WireId> = (0..n).map(|i| WireId::new(1 + (n + i) as u64)).collect();
+    let mut scl = Wire::builder().sources(&scl_ids);
+    let mut sda = Wire::builder().sources(&sda_ids);
+    for part in parts {
+        scl = scl.sink(part.sink(line::SCL, &scl_ids), line::SCL);
+        sda = sda.sink(part.sink(line::SDA, &sda_ids), line::SDA);
+    }
+    let scl = scl.build_shared();
+    let sda = sda.build_shared();
+    for (i, part) in parts.iter().enumerate() {
+        part.connect(line::SCL, WireSource::new(Arc::clone(&scl), scl_ids[i]));
+        part.connect(line::SDA, WireSource::new(Arc::clone(&sda), sda_ids[i]));
+        part.announce();
+    }
+    (scl, sda)
+}
+
+/// The target's own address in these tests.
+const TARGET_ADDRESS: u8 = 0x42;
+
+/// Two v2 controllers sharing one SCL/SDA pair and one virtual clock.
+struct TwoBlocks {
+    a: Stm32I2cV2,
+    ra: RegionRef,
+    b: Stm32I2cV2,
+    rb: RegionRef,
+    now: u64,
+    #[allow(dead_code)]
+    nets: (Arc<Wire>, Arc<Wire>),
+}
+
+impl TwoBlocks {
+    fn new() -> TwoBlocks {
+        let a = Stm32I2cV2::with_bus(Link::Wired, None).expect("a wired controller");
+        let b = Stm32I2cV2::with_bus(Link::Wired, None).expect("a wired controller");
+        let nets = wire_nets(&[Arc::clone(a.wires()), Arc::clone(b.wires())]);
+        let ra = regs(&a);
+        let rb = regs(&b);
+        // Both blocks, initialised the way §39.4.5 asks.
+        for r in [&ra, &rb] {
+            poke(r, TIMINGR, TIMINGR_USED);
+            poke(r, CR1, CR1_PE);
+        }
+        // B answers an address of its own; A does not, so nothing it sends can
+        // come back to it.
+        poke(&rb, OAR1, OAR1_OA1EN | sadd(TARGET_ADDRESS));
+        TwoBlocks {
+            a,
+            ra,
+            b,
+            rb,
+            now: 0,
+            nets,
+        }
+    }
+
+    /// One tick of the shared clock for both blocks.
+    fn step(&mut self) {
+        self.now += 1;
+        self.a.advance_to(self.now);
+        self.b.advance_to(self.now);
+    }
+
+    /// Run the bus, serving B's slave face and A's transmit register, until
+    /// A reports `STOPF`. Reports what B received.
+    fn run_until_a_stops(&mut self, out: &mut [u32], data: &[u8]) -> Vec<u8> {
+        let mut sent = 0;
+        let mut got = Vec::new();
+        for _ in 0..20_000 {
+            // B's slave face, driven as §39.4.9's sequence asks.
+            let isr_b = peek_with(&self.rb, ISR, MemAttrs::DEBUG);
+            if isr_b & ISR_ADDR != 0 {
+                out[0] = isr_b;
+                poke(&self.rb, ICR, ISR_ADDR);
+                continue;
+            }
+            if isr_b & ISR_RXNE != 0 {
+                got.push(peek(&self.rb, RXDR) as u8);
+                continue;
+            }
+            // A's master side.
+            let isr_a = peek_with(&self.ra, ISR, MemAttrs::DEBUG);
+            if isr_a & ISR_NACKF != 0 {
+                panic!("the other controller did not answer its own address");
+            }
+            if isr_a & ISR_STOPF != 0 {
+                out[1] = peek_with(&self.rb, ISR, MemAttrs::DEBUG);
+                return got;
+            }
+            if isr_a & ISR_TXIS != 0 && sent < data.len() {
+                poke(&self.ra, TXDR, u32::from(data[sent]));
+                sent += 1;
+                continue;
+            }
+            self.step();
+        }
+        panic!("the transfer never finished");
+    }
+}
+
+#[test]
+fn one_controller_addresses_another_over_the_wired_link() {
+    // Issue #10. Two `st.i2c-v2` blocks, one pair of open-drain nets, no
+    // `I2cBus` anywhere: the address and every byte reach the second block's
+    // slave face through the same SCL and SDA it would have driven itself.
+    const PAYLOAD: [u8; 3] = [0x11, 0x22, 0x33];
+    let mut two = TwoBlocks::new();
+    let n = u8::try_from(PAYLOAD.len()).unwrap();
+    poke(
+        &two.ra,
+        CR2,
+        sadd(TARGET_ADDRESS) | nb(n) | CR2_AUTOEND | CR2_START,
+    );
+
+    let mut seen = [0u32; 2];
+    let got = two.run_until_a_stops(&mut seen, &PAYLOAD);
+    assert_eq!(got, PAYLOAD.to_vec(), "the bytes the target received");
+
+    assert_ne!(seen[0] & ISR_ADDR, 0, "§39.4.9: ADDR on an address match");
+    assert_eq!(seen[0] & ISR_DIR, 0, "DIR = 0: the target receives");
+    assert_eq!(
+        (seen[0] & ISR_ADDCODE_MASK) >> ISR_ADDCODE_SHIFT,
+        u32::from(TARGET_ADDRESS),
+        "and ADDCODE is the address that matched"
+    );
+    assert_ne!(
+        seen[1] & ISR_STOPF,
+        0,
+        "the target saw the STOP on the wire, not through a fabric call"
+    );
+}
+
+#[test]
+fn a_wired_target_stretches_scl_until_its_guest_clears_addr() {
+    // The half of §39.4.9 a transactional link cannot show: the stall is a
+    // level on the net. Do *not* serve B, and A makes no progress at all.
+    let mut two = TwoBlocks::new();
+    poke(
+        &two.ra,
+        CR2,
+        sadd(TARGET_ADDRESS) | nb(1) | CR2_AUTOEND | CR2_START,
+    );
+    for _ in 0..400 {
+        two.step();
+    }
+    let isr_b = peek_with(&two.rb, ISR, MemAttrs::DEBUG);
+    assert_ne!(isr_b & ISR_ADDR, 0, "the target was addressed");
+    assert!(two.b.stretching(), "and it is holding the clock");
+    assert_eq!(
+        two.b.wires().scl().net(),
+        Level::Low,
+        "on the net, where anything else on the bus can see it"
+    );
+    let stuck = peek_with(&two.ra, ISR, MemAttrs::DEBUG);
+    assert_eq!(stuck & ISR_STOPF, 0, "the controller got nowhere");
+
+    // Serve it and the transfer finishes.
+    poke(&two.rb, ICR, ISR_ADDR);
+    let mut seen = [0u32; 2];
+    let got = two.run_until_a_stops(&mut seen, &[0x99]);
+    assert_eq!(got, alloc::vec![0x99]);
+}
+
+#[test]
+fn two_controllers_starting_together_arbitrate_and_the_loser_raises_arlo() {
+    // §3.1.8 and §39.4.10 at the register level, and the reason the wired link
+    // exists at all: A addresses 0x42, B addresses 0x50. `0x42 << 1` is
+    // 1000 0100 and `0x50 << 1` is 1010 0000, so they agree for two bits and
+    // then A sends a zero where B sends a one. A wins, B raises `ARLO` — and
+    // B's own slave face answers the address that beat it.
+    const PAYLOAD: [u8; 2] = [0xde, 0xad];
+    let mut two = TwoBlocks::new();
+    let n = u8::try_from(PAYLOAD.len()).unwrap();
+    poke(
+        &two.ra,
+        CR2,
+        sadd(TARGET_ADDRESS) | nb(n) | CR2_AUTOEND | CR2_START,
+    );
+    poke(&two.rb, CR2, sadd(0x50) | nb(1) | CR2_AUTOEND | CR2_START);
+
+    let mut got = Vec::new();
+    let mut sent = 0;
+    let mut arlo = false;
+    let mut addressed = false;
+    for _ in 0..20_000 {
+        let isr_b = peek_with(&two.rb, ISR, MemAttrs::DEBUG);
+        if isr_b & ISR_ARLO != 0 && !arlo {
+            arlo = true;
+            poke(&two.rb, ICR, ISR_ARLO);
+            continue;
+        }
+        if isr_b & ISR_ADDR != 0 {
+            addressed = true;
+            poke(&two.rb, ICR, ISR_ADDR);
+            continue;
+        }
+        if isr_b & ISR_RXNE != 0 {
+            got.push(peek(&two.rb, RXDR) as u8);
+            continue;
+        }
+        let isr_a = peek_with(&two.ra, ISR, MemAttrs::DEBUG);
+        assert_eq!(isr_a & ISR_ARLO, 0, "the lower address must win");
+        if isr_a & ISR_STOPF != 0 {
+            break;
+        }
+        if isr_a & ISR_TXIS != 0 && sent < PAYLOAD.len() {
+            poke(&two.ra, TXDR, u32::from(PAYLOAD[sent]));
+            sent += 1;
+            continue;
+        }
+        two.step();
+    }
+    assert!(arlo, "§39.4.10: the loser sets ARLO");
+    assert!(
+        addressed,
+        "and switches back to slave mode in time to answer the winner"
+    );
+    assert_eq!(
+        got,
+        PAYLOAD.to_vec(),
+        "no information is lost (UM10204 §3.1.8)"
+    );
+}
+
+#[test]
+fn a_wired_controller_pair_round_trips_mid_transfer() {
+    // Both halves of the shared engine are live at once here — one sending a
+    // byte, the other decoding it — and a snapshot has to bring both back.
+    const PAYLOAD: [u8; 2] = [0x5a, 0xa5];
+    let mut two = TwoBlocks::new();
+    poke(
+        &two.ra,
+        CR2,
+        sadd(TARGET_ADDRESS) | nb(2) | CR2_AUTOEND | CR2_START,
+    );
+    // Far enough in to be part way through the address byte.
+    for _ in 0..12 {
+        two.step();
+    }
+    let mut shape = MachineShape::new();
+    shape.add_device("i2c", ST_I2C_V2_CLASS.name).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w
+            .chunk("i2c", ST_I2C_V2_CLASS.name, ST_I2C_V2_CLASS.version)
+            .unwrap();
+        two.b.save(&mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load(
+            "i2c",
+            ST_I2C_V2_CLASS.name,
+            ST_I2C_V2_CLASS.version,
+            &Migrations::new(),
+        )
+        .unwrap();
+    two.b.load(&mut chunk.reader()).unwrap();
+
+    let mut seen = [0u32; 2];
+    let got = two.run_until_a_stops(&mut seen, &PAYLOAD);
+    assert_eq!(
+        got,
+        PAYLOAD.to_vec(),
+        "a target reloaded mid-byte carried on from where it was"
+    );
+}
+
+#[cfg(feature = "dev-stm32-i2c")]
+#[test]
+fn a_v2_block_addresses_a_v1_block_over_one_pair_of_wires() {
+    // The fork on one bus, which is the arrangement a real board has: an F4 and
+    // an L4 do not share a register, a flag or a driver shape, and neither
+    // knows the other is an STM32. What they share is two nets.
+    use crate::dev::stm32::i2c::Stm32I2c;
+
+    /// `CR1` bits the v1 block needs: `PE` and `ACK`.
+    const V1_CR1_RUN: u32 = (1 << 0) | (1 << 10);
+    /// v1 register offsets, spelled out rather than imported: the two blocks
+    /// agree about nothing, which is the point of the test.
+    const V1_OAR1: u64 = 0x08;
+    const V1_DR: u64 = 0x10;
+    const V1_SR1: u64 = 0x14;
+    const V1_SR2: u64 = 0x18;
+    const V1_CCR: u64 = 0x1c;
+    const V1_SR1_ADDR: u32 = 1 << 1;
+    const V1_SR1_RXNE: u32 = 1 << 6;
+    const V1_SR1_STOPF: u32 = 1 << 4;
+
+    const PAYLOAD: [u8; 4] = [0x01, 0x23, 0x45, 0x67];
+
+    let v2 = Stm32I2cV2::with_bus(Link::Wired, None).expect("a wired v2 block");
+    let v1 = Stm32I2c::with_bus(Link::Wired, None).expect("a wired v1 block");
+    wire_nets(&[Arc::clone(v2.wires()), Arc::clone(v1.wires())]);
+
+    let r2 = regs(&v2);
+    let r1 = v1.region("").expect("the v1 block maps its registers");
+    poke(&r2, TIMINGR, TIMINGR_USED);
+    poke(&r2, CR1, CR1_PE);
+    // `CCR` of 4 is v1's spelling of the same four-tick half period
+    // `TIMINGR_USED` asks for (RM0090 §25.6.8 against RM0351 §39.4.5).
+    poke(&r1, V1_CCR, 4);
+    poke(&r1, V1_OAR1, u32::from(TARGET_ADDRESS) << 1);
+    poke(&r1, CR1, V1_CR1_RUN);
+
+    let n = u8::try_from(PAYLOAD.len()).unwrap();
+    poke(
+        &r2,
+        CR2,
+        sadd(TARGET_ADDRESS) | nb(n) | CR2_AUTOEND | CR2_START,
+    );
+
+    let mut now = 0u64;
+    let mut sent = 0usize;
+    let mut got = Vec::new();
+    for _ in 0..40_000 {
+        // The v1 block, served with §25.3.2's slave sequence.
+        let sr1 = peek_with(&r1, V1_SR1, MemAttrs::DEBUG);
+        if sr1 & V1_SR1_ADDR != 0 {
+            // `EV1`: read `SR1`, then `SR2`.
+            peek(&r1, V1_SR1);
+            peek(&r1, V1_SR2);
+            continue;
+        }
+        if sr1 & V1_SR1_RXNE != 0 {
+            got.push(peek(&r1, V1_DR) as u8);
+            continue;
+        }
+        // The v2 block, served with §39.4.7's.
+        let isr = peek_with(&r2, ISR, MemAttrs::DEBUG);
+        assert_eq!(isr & ISR_NACKF, 0, "the v1 block never answered");
+        if isr & ISR_STOPF != 0 {
+            break;
+        }
+        if isr & ISR_TXIS != 0 && sent < PAYLOAD.len() {
+            poke(&r2, TXDR, u32::from(PAYLOAD[sent]));
+            sent += 1;
+            continue;
+        }
+        now += 1;
+        v2.advance_to(now);
+        v1.advance_to(now);
+    }
+    assert_eq!(got, PAYLOAD.to_vec(), "the bytes that crossed the fork");
+    assert_ne!(
+        peek_with(&r1, V1_SR1, MemAttrs::DEBUG) & V1_SR1_STOPF,
+        0,
+        "and the v1 block saw the STOP"
+    );
+}
+
+#[test]
+fn slave_byte_control_counts_nbytes_and_reloads_through_tcr() {
+    // §39.4.9. `SBC` makes the *target* run the counting machine the master
+    // side runs, which is what SMBus needs and what nothing else should use.
+    let (ctrl, r, bus) = slave_on_a_bus();
+    poke(&r, OAR1, OAR1_OA1EN | sadd(0x42));
+    // Two bytes this leg, and a reload after them.
+    poke(&r, CR1, CR1_PE | CR1_SBC);
+    poke(&r, CR2, nb(2) | CR2_RELOAD);
+
+    assert_eq!(bus.start(Address::Seven(0x42), Direction::Write), Ack::Ack);
+    poke(&r, ICR, ISR_ADDR);
+
+    assert_eq!(bus.write(0x01), Ack::Ack, "the first of two");
+    assert_eq!(peek(&r, RXDR), 0x01);
+    assert_eq!(
+        bus.write(0x02),
+        Ack::Ack,
+        "the last of a leg that reloads is still acknowledged — NACKing it \
+         would end the transfer the reload exists to continue"
+    );
+    assert_ne!(peek(&r, ISR) & ISR_TCR, 0, "§39.4.9: TCR ends the leg");
+    assert!(
+        ctrl.stretching(),
+        "and the clock is held for the new NBYTES"
+    );
+    assert_eq!(peek(&r, RXDR), 0x02);
+
+    // Software reprograms the counter: one more byte, and this time no reload.
+    poke(&r, CR2, nb(1));
+    assert_eq!(peek(&r, ISR) & ISR_TCR, 0, "writing NBYTES clears TCR");
+    assert_eq!(
+        bus.write(0x03),
+        Ack::Nack,
+        "§39.4.9 with RELOAD = 0: the last byte of the count is refused"
+    );
+    assert_eq!(peek(&r, RXDR), 0x03, "and it is still handed over");
+    bus.stop();
+}
+
+#[test]
+fn without_sbc_a_slave_acknowledges_whatever_it_has_room_for() {
+    // The ordinary target, and the reason `SBC` is a bit rather than the
+    // default: `NBYTES` means nothing to a slave that is not counting.
+    let (_ctrl, r, bus) = slave_on_a_bus();
+    poke(&r, OAR1, OAR1_OA1EN | sadd(0x42));
+    poke(&r, CR2, nb(1));
+    assert_eq!(bus.start(Address::Seven(0x42), Direction::Write), Ack::Ack);
+    poke(&r, ICR, ISR_ADDR);
+    for byte in 0..4u8 {
+        assert_eq!(bus.write(byte), Ack::Ack);
+        assert_eq!(peek(&r, RXDR), u32::from(byte));
+    }
+    assert_eq!(peek(&r, ISR) & ISR_TCR, 0, "and TCR is a master flag here");
+    bus.stop();
 }

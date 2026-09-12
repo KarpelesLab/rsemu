@@ -69,23 +69,24 @@
 //!   outputs `TXDMAEN`/`RXDMAEN` raise, in the level style
 //!   [`crate::dev::stm32::dma`] asks a peripheral for.
 //!
-//! **Slave mode, on the transactional link**: `OAR1` with its 7- or 10-bit own
+//! **Slave mode, §39.4.9, on both links**: `OAR1` with its 7- or 10-bit own
 //! address, `OAR2` with `OA2MSK`, the general call under `GCEN`, `ADDR` with
 //! `DIR` and `ADDCODE`, `RXNE`/`TXIS` for the data phase, `NOSTRETCH` and the
-//! `OVR` it makes possible, and software `NACK`.
+//! `OVR` it makes possible, software `NACK`, and `SBC` — the target running the
+//! same `NBYTES`/`RELOAD` counting machine the master side runs, with `TCR`
+//! ending a leg and a stretched clock waiting for the next `NBYTES`.
+//!
+//! The slave face is **one object serving both links**
+//! ([`ControllerWires::attach_slave`](crate::bus::i2c::wires::ControllerWires::attach_slave)):
+//! a transactional [`I2cBus`] routes to it by address, a wired one reaches it
+//! from the edges on the two nets this peripheral would otherwise drive, and
+//! the clock stretch is then a level anything else on the bus can see rather
+//! than a question somebody has to ask. §39.4.10's "the peripheral
+//! automatically switches back to slave mode" after `ARLO` needs no switching
+//! at all: both halves are always listening.
 //!
 //! # What is not
 //!
-//! * **Slave mode on the wired link.** The reason is the structural one v1's
-//!   header sets out and it has not changed: on real silicon one pair of pins
-//!   carries both roles, so a wired slave needs a single bit engine that drives
-//!   *and* listens on the same [`OpenDrain`](crate::bus::i2c::wires::OpenDrain)
-//!   pair, and [`crate::bus::i2c::wires`] has the master engine and the slave
-//!   engine separately. Bolting them together here would give a wired slave
-//!   that behaves differently from the transactional one, which is the exact
-//!   failure the bus was written to avoid. It is a day's work in `bus::i2c`,
-//!   not a paragraph here — and until it is done, a machine that puts this
-//!   controller on a `wired` link gets a master and nothing else.
 //! * **`TIMEOUTR`.** `TIMEOUTA`, `TIMEOUTB`, `TIDLE`, `TIMOUTEN` and `TEXTEN`
 //!   are storage. The SMBus timeouts measure how long SCL has been low and how
 //!   long the bus has been idle, and this model has no idle to measure: it
@@ -93,10 +94,6 @@
 //!   `ALERT` are therefore never set by hardware here, only cleared by `ICR`.
 //! * **The noise filters.** `DNF` and `ANFOFF` are storage: this model clocks
 //!   in half periods and has no spikes to suppress.
-//! * **`SBC`.** Slave byte control is stored and read back. It gates a slave's
-//!   per-byte acknowledge through `NBYTES`/`RELOAD`, which needs the slave side
-//!   to run the same counting machine the master side does; a slave that
-//!   acknowledges whenever it has room is what this model does instead.
 //! * **`WUPEN`.** There is no stop mode to wake from.
 //!
 //! Everything in that list reads back what was written, so a driver that
@@ -123,7 +120,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::bus::i2c::wires::{MasterEvent, MasterOp, MasterWires, MasterWiresState, pin as line};
+use crate::bus::i2c::wires::{
+    ControllerWires, ControllerWiresState, MasterEvent, MasterOp, pin as line,
+};
 use crate::bus::i2c::{
     Ack, Address, BYTE_HALF_PERIODS, Direction, GENERAL_CALL, I2cBus, I2cSlave, Link,
     START_HALF_PERIODS, STOP_HALF_PERIODS, buses,
@@ -146,7 +145,7 @@ mod tests;
 const CLASS_NAME: &str = "st.i2c-v2";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How many bytes of address space the register block occupies.
 ///
@@ -179,6 +178,8 @@ const CR1_ERRIE: u32 = 1 << 7;
 const CR1_TXDMAEN: u32 = 1 << 14;
 /// `CR1` bit 15: `RXDMAEN`.
 const CR1_RXDMAEN: u32 = 1 << 15;
+/// `CR1` bit 16: `SBC`, slave byte control (§39.4.9).
+const CR1_SBC: u32 = 1 << 16;
 /// `CR1` bit 17: `NOSTRETCH`, slave mode only.
 const CR1_NOSTRETCH: u32 = 1 << 17;
 /// `CR1` bit 19: `GCEN`, answer the general call.
@@ -324,11 +325,14 @@ const NO_EVENT: u64 = u64::MAX;
 
 /// The rank this controller's own state takes.
 ///
-/// The same rank the v1 block takes, and for the same reasons: above
-/// [`crate::bus::i2c::WIRES_RANK`] because the controller calls *into* its bit
-/// engine, and never held across a call into the engine, the fabric or a
-/// sibling. Two controllers on one bus therefore never hold each other's.
-const STATE_RANK: LockRank = LockRank::new(0x4700);
+/// The same rank the v1 block takes, and for the same reason: **below**
+/// [`crate::bus::i2c::WIRES_RANK`], because an edge on the net reaches the bit
+/// engine, the bit engine calls the slave face, and the slave face is this
+/// register file. Going the other way — a register write that submits a bus
+/// operation — releases this before it touches the engine, so the ladder only
+/// ever runs one way. Two controllers on one bus therefore never hold each
+/// other's.
+const STATE_RANK: LockRank = LockRank::new(0x4950);
 
 /// The SMBus PEC polynomial, `x^8 + x^2 + x + 1` (§39.4.13).
 const PEC_POLY: u8 = 0x07;
@@ -426,8 +430,8 @@ const fn stage_from_code(code: u8) -> Stage {
 /// A bus event in flight, as this controller records it.
 ///
 /// The same four cases as [`MasterOp`], kept separately because the
-/// transactional link has no [`MasterWires`] to hold them and a snapshot has to
-/// carry them either way.
+/// transactional link has no [`ControllerWires`] to hold them and a snapshot
+/// has to carry them either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     Start,
@@ -499,8 +503,10 @@ struct Shared {
     /// The bus this controller drives in [`Link::Transactional`] mode, and the
     /// one its slave face hangs off.
     bus: Option<Arc<I2cBus>>,
-    /// The bit engine it drives in [`Link::Wired`] mode.
-    wires: Arc<MasterWires>,
+    /// The bit engine it drives in [`Link::Wired`] mode — and, since it is
+    /// the engine that carries both roles, the one another controller reaches
+    /// this peripheral's slave face through.
+    wires: Arc<ControllerWires>,
     /// Domain ticks simulated, published for the scheduler's lock-free
     /// question. Mirrors `State::ticks`.
     ticks: AtomicU64,
@@ -714,7 +720,8 @@ impl State {
     const fn stretching(&self) -> bool {
         if self.slave_active {
             return self.cr1 & CR1_NOSTRETCH == 0
-                && (self.any(ISR_ADDR | ISR_RXNE) || (self.any(ISR_DIR) && self.any(ISR_TXE)));
+                && (self.any(ISR_ADDR | ISR_RXNE | ISR_TCR)
+                    || (self.any(ISR_DIR) && self.any(ISR_TXE)));
         }
         match self.stage {
             Stage::Tx => self.any(ISR_TXIS | ISR_TC | ISR_TCR),
@@ -747,6 +754,38 @@ impl State {
     /// The level the receive DMA request should be at.
     const fn rx_drq(&self) -> bool {
         self.cr1 & CR1_RXDMAEN != 0 && self.any(ISR_RXNE)
+    }
+
+    /// The acknowledge slave byte control asks for, for the byte just taken.
+    ///
+    /// §39.4.9. Without `SBC` a slave acknowledges whatever it has room for,
+    /// which is the ordinary I²C target and what every non-SMBus part does.
+    /// With it, the **slave runs the master's counting machine**: `NBYTES` is
+    /// loaded at the address match, decremented per byte, and what happens when
+    /// it reaches zero is `RELOAD`'s business — set, and the leg ends with
+    /// `TCR` and a stretched clock waiting for a new `NBYTES`; clear, and the
+    /// last byte is not acknowledged.
+    ///
+    /// This is one method rather than a second engine because the wired target
+    /// half hands bytes to exactly the same [`SlaveFace::write`] the fabric
+    /// does, so there is one place to count them.
+    fn slave_byte_control(state: &mut State) -> Ack {
+        if state.cr1 & CR1_SBC == 0 {
+            return Ack::Ack;
+        }
+        state.count = state.count.saturating_sub(1);
+        if state.count != 0 {
+            return Ack::Ack;
+        }
+        if state.cr2 & CR2_RELOAD != 0 {
+            // The leg is over and software decides what the next one is. The
+            // byte itself is still acknowledged: NACKing it here would end the
+            // transfer the reload exists to continue.
+            state.set(ISR_TCR);
+            Ack::Ack
+        } else {
+            Ack::Nack
+        }
     }
 
     /// Which of this peripheral's own addresses `address` matches, and the
@@ -807,7 +846,9 @@ impl Stm32I2cV2 {
     ///   deliberately so: `docs/buses/low-speed.md` asks for this choice to be
     ///   made rather than defaulted into.
     /// * `bus` — the name of the [`I2cBus`] to drive. Required for
-    ///   `transactional`, ignored for `wired`.
+    ///   `transactional`. A `wired` controller drives its lines instead, but a
+    ///   bus named here still carries its **slave face**, so a machine may put
+    ///   one on both fabrics deliberately.
     ///
     /// # Errors
     ///
@@ -865,7 +906,7 @@ impl Stm32I2cV2 {
             state: Mutex::with_rank(STATE_RANK, State::default()),
             link,
             bus: bus.clone(),
-            wires: Arc::new(MasterWires::new()),
+            wires: Arc::new(ControllerWires::new()),
             ticks: AtomicU64::new(0),
             next_event: AtomicU64::new(NO_EVENT),
             ev: Mutex::with_rank(LockRank::WIRE, None),
@@ -878,11 +919,16 @@ impl Stm32I2cV2 {
             rx_drq_level: AtomicBool::new(false),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
         });
+        // The slave face is the same object on both links: a transactional
+        // bus routes to it by address, a wired one reaches it through the
+        // engine's target half. Building it once is what makes a wired slave
+        // behave identically to a transactional one (§39.4.9).
+        let face = Arc::new(SlaveFace {
+            shared: Arc::clone(&shared),
+        }) as Arc<dyn I2cSlave>;
+        shared.wires.attach_slave(Arc::clone(&face));
         if let Some(bus) = bus.as_ref() {
-            let face = Arc::new(SlaveFace {
-                shared: Arc::clone(&shared),
-            });
-            bus.attach(face as Arc<dyn I2cSlave>)?;
+            bus.attach(face)?;
         }
         let port = Arc::new(RegisterPort {
             shared: Arc::clone(&shared),
@@ -905,7 +951,7 @@ impl Stm32I2cV2 {
 
     /// Its wire-level engine, for a machine that drives the lines.
     #[must_use]
-    pub fn wires(&self) -> &Arc<MasterWires> {
+    pub fn wires(&self) -> &Arc<ControllerWires> {
         &self.shared.wires
     }
 
@@ -1464,6 +1510,7 @@ impl Shared {
                 }
             };
             if !step {
+                self.refresh_stretch();
                 return;
             }
             let event = self.half_step();
@@ -1475,6 +1522,20 @@ impl Shared {
             }
             self.pump();
             self.update_outputs();
+            self.refresh_stretch();
+        }
+    }
+
+    /// Let the target half release SCL once software has served it.
+    ///
+    /// [`Link::Wired`] only, and outside every engine lock: driving the pin
+    /// re-enters the target engine, so this may never be called from inside a
+    /// [`SlaveFace`] method. The *stall* is set by the engine itself at the end
+    /// of a nine-bit slot; only the release needs asking for, because nothing
+    /// on the wire says when software got round to it (§39.4.9).
+    fn refresh_stretch(&self) {
+        if self.link == Link::Wired {
+            self.wires.refresh_stretch();
         }
     }
 }
@@ -1522,6 +1583,13 @@ impl I2cSlave for SlaveFace {
                 }
                 Some(code) => {
                     state.slave_active = true;
+                    if state.cr1 & CR1_SBC != 0 {
+                        // §39.4.9: "the number of bytes to be received must be
+                        // programmed in the NBYTES field ... in the same way as
+                        // in master mode". The counter is the same counter.
+                        state.count = nbytes(state.cr2);
+                        state.clear(ISR_TCR);
+                    }
                     // §39.7.7: `ADDCODE` is "updated with the received address
                     // when an address match event occurs", and `DIR` says which
                     // way the master asked to go.
@@ -1570,7 +1638,7 @@ impl I2cSlave for SlaveFace {
                     state.cr2 &= !CR2_NACK;
                     Ack::Nack
                 } else {
-                    Ack::Ack
+                    State::slave_byte_control(&mut state)
                 }
             }
         };
@@ -1806,6 +1874,9 @@ impl RegisterPort {
                 self.shared.update_outputs();
             }
         }
+        // Reading `RXDR` or writing `TXDR` is what ends a slave-mode stall, and
+        // on the wired link that stall is a level somebody else is waiting on.
+        self.shared.refresh_stretch();
     }
 }
 
@@ -1955,7 +2026,7 @@ impl Device for Stm32I2cV2 {
             next_edge: r.read_u64()?,
             high_half: r.read_bool()?,
         };
-        let wires = MasterWiresState::read(r)?;
+        let wires = ControllerWiresState::read(r)?;
         {
             let mut slot = self.shared.state.lock();
             *slot = state;

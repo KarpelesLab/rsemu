@@ -18,7 +18,7 @@ use super::*;
 
 use alloc::vec::Vec;
 
-use crate::bus::i2c::wires::{MasterWires, pin as line};
+use crate::bus::i2c::wires::{ControllerWires, pin as line};
 use crate::core::device::{Device, ResetKind};
 use crate::core::props::{Props, Value};
 use crate::core::space::{RegionKind, RegionRef};
@@ -62,6 +62,7 @@ fn peek(region: &RegionRef, offset: u64) -> u32 {
 const CR1: u64 = 0x00;
 const CR2: u64 = 0x04;
 const OAR1: u64 = 0x08;
+const OAR2: u64 = 0x0c;
 const DR: u64 = 0x10;
 const SR1: u64 = 0x14;
 const SR2: u64 = 0x18;
@@ -96,9 +97,10 @@ impl Board {
             Link::Transactional => {
                 bus.attach(eeprom.slave()).expect("room on the bus");
                 Stm32I2c::with_bus(Link::Transactional, Some(Arc::clone(&bus)))
+                    .expect("a controller")
             }
             Link::Wired => {
-                let ctrl = Stm32I2c::with_bus(Link::Wired, None);
+                let ctrl = Stm32I2c::with_bus(Link::Wired, None).expect("a wired controller");
                 wire_up(&ctrl, &eeprom);
                 ctrl
             }
@@ -223,7 +225,7 @@ impl Board {
 /// Put the controller and the EEPROM on two open-drain nets, as a machine
 /// file's four `wire` statements do.
 fn wire_up(ctrl: &Stm32I2c, eeprom: &At24c) {
-    let master: &Arc<MasterWires> = ctrl.wires();
+    let master: &Arc<ControllerWires> = ctrl.wires();
     let slave = Arc::clone(eeprom.wires());
     let scl_ids = [WireId::new(1), WireId::new(2)];
     let sda_ids = [WireId::new(3), WireId::new(4)];
@@ -274,7 +276,7 @@ fn the_link_is_a_required_property_and_a_transactional_one_needs_a_bus() {
 
 #[test]
 fn the_reset_values_are_the_ones_the_reference_manual_gives() {
-    let ctrl = Stm32I2c::with_bus(Link::Wired, None);
+    let ctrl = Stm32I2c::with_bus(Link::Wired, None).expect("a wired controller");
     let r = regs(&ctrl);
     // §25.6.1 to §25.6.10: everything resets to zero except TRISE, which is 2.
     assert_eq!(peek(&r, CR1), 0);
@@ -291,7 +293,7 @@ fn the_reset_values_are_the_ones_the_reference_manual_gives() {
 fn the_register_block_takes_half_words_and_words_and_nothing_else() {
     // §25.6: "The peripheral registers can be accessed by half-words (16 bits)
     // or words (32 bits)."
-    let ctrl = Stm32I2c::with_bus(Link::Wired, None);
+    let ctrl = Stm32I2c::with_bus(Link::Wired, None).expect("a wired controller");
     let r = regs(&ctrl);
     let block = ops(&r);
     let mut half = [0u8; 2];
@@ -307,7 +309,7 @@ fn the_register_block_takes_half_words_and_words_and_nothing_else() {
 #[test]
 fn a_software_reset_puts_everything_back() {
     // §25.6.1: "When set, the I2C is under reset state."
-    let ctrl = Stm32I2c::with_bus(Link::Wired, None);
+    let ctrl = Stm32I2c::with_bus(Link::Wired, None).expect("a wired controller");
     let r = regs(&ctrl);
     poke(&r, CCR, 0x1234);
     poke(&r, CR1, CR1_PE);
@@ -571,7 +573,7 @@ fn a_transfer_part_way_through_its_address_phase_round_trips() {
     }
     let bytes = w.to_vec().unwrap();
 
-    let other = Stm32I2c::with_bus(Link::Wired, None);
+    let other = Stm32I2c::with_bus(Link::Wired, None).expect("a wired controller");
     let reader = StateReader::new(&bytes).unwrap();
     let chunk = reader
         .load(
@@ -619,4 +621,252 @@ fn a_reset_keeps_the_tick_and_drops_everything_else() {
     assert_eq!(peek(&board.region, CR1), 0);
     assert_eq!(peek(&board.region, SR1), 0);
     assert_eq!(peek(&board.region, TRISE), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Slave mode (§25.3.2)
+// ---------------------------------------------------------------------------
+
+/// A controller with nothing else on its bus, for driving its slave face
+/// directly.
+fn slave_on_a_bus() -> (Stm32I2c, RegionRef, Arc<I2cBus>) {
+    let bus = Arc::new(I2cBus::new());
+    let ctrl =
+        Stm32I2c::with_bus(Link::Transactional, Some(Arc::clone(&bus))).expect("a controller");
+    let region = regs(&ctrl);
+    poke(&region, CCR, CCR_VALUE_USED);
+    poke(&region, CR1, CR1_PE | CR1_ACK);
+    (ctrl, region, bus)
+}
+
+/// §25.3.2's `EV1`: `ADDR` is cleared by reading `SR1` then `SR2`.
+fn clear_addr(region: &RegionRef) -> u32 {
+    peek(region, SR1);
+    peek(region, SR2)
+}
+
+#[test]
+fn a_slave_answers_its_own_address_and_says_which_one_matched() {
+    let (ctrl, r, bus) = slave_on_a_bus();
+    poke(&r, OAR1, sadd7(0x42));
+
+    assert_eq!(bus.start(Address::Seven(0x41), Direction::Write), Ack::Nack);
+    assert_eq!(peek(&r, SR1) & SR1_ADDR, 0, "a near miss is a miss");
+
+    assert_eq!(bus.start(Address::Seven(0x42), Direction::Write), Ack::Ack);
+    assert_ne!(peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_ADDR, 0, "EV1");
+    assert!(
+        ctrl.stretching(),
+        "and ADDR holds SCL down until EV1 is done"
+    );
+
+    let sr2 = clear_addr(&r);
+    assert_eq!(sr2 & SR2_MSL, 0, "a slave is not the master");
+    assert_eq!(sr2 & SR2_TRA, 0, "and it is receiving");
+    assert_eq!(sr2 & SR2_DUALF, 0);
+    assert_eq!(sr2 & SR2_GENCALL, 0);
+    assert_eq!(peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_ADDR, 0);
+
+    assert_eq!(bus.write(0xa5), Ack::Ack);
+    assert_ne!(peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_RXNE, 0, "EV2");
+    assert_eq!(peek(&r, DR), 0xa5);
+
+    bus.stop();
+    assert_ne!(
+        peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_STOPF,
+        0,
+        "EV4: a STOP is a slave event"
+    );
+    // §25.6.6: `STOPF` is cleared by reading `SR1` then writing `CR1`.
+    peek(&r, SR1);
+    poke(&r, CR1, CR1_PE | CR1_ACK);
+    assert_eq!(peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_STOPF, 0);
+}
+
+#[test]
+fn the_second_own_address_and_the_general_call_each_raise_their_own_sr2_bit() {
+    // §25.6.4's `ENDUAL` and §25.6.1's `ENGC`, which are the two reasons `SR2`
+    // has `DUALF` and `GENCALL` at all: `ADDR` alone does not say which of
+    // three addresses matched.
+    let (_ctrl, r, bus) = slave_on_a_bus();
+    poke(&r, OAR1, sadd7(0x42));
+    poke(&r, OAR2, sadd7(0x18) | OAR2_ENDUAL);
+    poke(&r, CR1, CR1_PE | CR1_ACK | CR1_ENGC);
+
+    assert_eq!(bus.start(Address::Seven(0x18), Direction::Write), Ack::Ack);
+    let sr2 = clear_addr(&r);
+    assert_ne!(sr2 & SR2_DUALF, 0, "OAR2 matched");
+    assert_eq!(sr2 & SR2_GENCALL, 0);
+    bus.stop();
+    peek(&r, SR1);
+    poke(&r, CR1, CR1_PE | CR1_ACK | CR1_ENGC);
+
+    assert_eq!(bus.start(GENERAL_CALL, Direction::Write), Ack::Ack);
+    let sr2 = clear_addr(&r);
+    assert_ne!(sr2 & SR2_GENCALL, 0, "the general call matched");
+    assert_eq!(sr2 & SR2_DUALF, 0);
+
+    // With `ENDUAL` clear again `OAR2` answers nothing.
+    bus.stop();
+    poke(&r, OAR2, sadd7(0x18));
+    assert_eq!(bus.start(Address::Seven(0x18), Direction::Write), Ack::Nack);
+}
+
+#[test]
+fn a_slave_transmitter_serves_dr_and_stops_on_the_masters_nack() {
+    let (_ctrl, r, bus) = slave_on_a_bus();
+    poke(&r, OAR1, sadd7(0x42));
+
+    assert_eq!(bus.start(Address::Seven(0x42), Direction::Read), Ack::Ack);
+    let sr2 = clear_addr(&r);
+    assert_ne!(sr2 & SR2_TRA, 0, "§25.6.7's TRA: the slave transmits");
+    assert_ne!(
+        peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_TXE,
+        0,
+        "EV3_1: the data register is empty"
+    );
+
+    poke(&r, DR, 0x7e);
+    assert_eq!(bus.read(Ack::Ack), 0x7e);
+    assert_ne!(peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_TXE, 0, "EV3");
+
+    poke(&r, DR, 0x7f);
+    assert_eq!(bus.read(Ack::Nack), 0x7f);
+    assert_ne!(
+        peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_AF,
+        0,
+        "§25.3.2: a NACK from the master sets AF"
+    );
+}
+
+#[test]
+fn a_slave_with_ack_clear_answers_nothing_at_all() {
+    // §25.6.1: "0: No acknowledge returned", and the address byte is a byte.
+    let (_ctrl, r, bus) = slave_on_a_bus();
+    poke(&r, OAR1, sadd7(0x42));
+    poke(&r, CR1, CR1_PE);
+    assert_eq!(bus.start(Address::Seven(0x42), Direction::Write), Ack::Nack);
+    assert_eq!(peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_ADDR, 0);
+}
+
+#[test]
+fn a_controller_in_the_middle_of_its_own_transfer_is_deaf_to_its_own_address() {
+    // A part cannot address itself. On a wired bus this is not a nicety: the
+    // slave face is on the same two nets the master half is driving, so without
+    // this every controller would answer its own address byte.
+    let (_ctrl, r, bus) = slave_on_a_bus();
+    poke(&r, OAR1, sadd7(0x42));
+    poke(&r, CR1, CR1_PE | CR1_ACK | CR1_START);
+    for _ in 0..4 {
+        assert_eq!(bus.start(Address::Seven(0x42), Direction::Write), Ack::Nack);
+    }
+    assert_eq!(peek_with(&r, SR1, MemAttrs::DEBUG) & SR1_ADDR, 0);
+}
+
+#[test]
+fn a_wired_controller_is_addressed_over_the_pins_it_would_drive() {
+    // Issue #10 for the v1 block. Two `st.i2c` peripherals, one pair of
+    // open-drain nets, no `I2cBus` anywhere.
+    const PAYLOAD: [u8; 3] = [0xa0, 0xb1, 0xc2];
+    /// The address the second block answers to.
+    const TARGET: u8 = 0x42;
+
+    let a = Stm32I2c::with_bus(Link::Wired, None).expect("a wired controller");
+    let b = Stm32I2c::with_bus(Link::Wired, None).expect("a wired controller");
+    let (ra, rb) = (regs(&a), regs(&b));
+    wire_two(a.wires(), b.wires());
+    for r in [&ra, &rb] {
+        poke(r, CR2, 42);
+        poke(r, CCR, CCR_VALUE_USED);
+        poke(r, CR1, CR1_PE | CR1_ACK);
+    }
+    poke(&rb, OAR1, sadd7(TARGET));
+
+    // A drives the transfer with §25.3.3's master sequence; B is served with
+    // §25.3.2's slave one. Neither knows the other is an STM32.
+    poke(&ra, CR1, CR1_PE | CR1_ACK | CR1_START);
+    let mut now = 0u64;
+    let mut sent = 0usize;
+    let mut got = Vec::new();
+    let mut b_addressed = false;
+    let mut stalled = false;
+    for _ in 0..40_000 {
+        let sr1_b = peek_with(&rb, SR1, MemAttrs::DEBUG);
+        if sr1_b & SR1_ADDR != 0 {
+            if !b_addressed {
+                stalled = b.stretching();
+            }
+            b_addressed = true;
+            clear_addr(&rb);
+            continue;
+        }
+        if sr1_b & SR1_RXNE != 0 {
+            got.push(peek(&rb, DR) as u8);
+            continue;
+        }
+        let sr1_a = peek_with(&ra, SR1, MemAttrs::DEBUG);
+        assert_eq!(sr1_a & SR1_AF, 0, "the other block never answered");
+        if sr1_a & SR1_SB != 0 {
+            peek(&ra, SR1);
+            poke(&ra, DR, u32::from(TARGET) << 1);
+            continue;
+        }
+        if sr1_a & SR1_ADDR != 0 {
+            peek(&ra, SR1);
+            peek(&ra, SR2);
+            continue;
+        }
+        if sr1_a & SR1_TXE != 0 && sent < PAYLOAD.len() {
+            poke(&ra, DR, u32::from(PAYLOAD[sent]));
+            sent += 1;
+            continue;
+        }
+        if sent == PAYLOAD.len() && sr1_a & (SR1_TXE | SR1_BTF) == (SR1_TXE | SR1_BTF) {
+            poke(&ra, CR1, CR1_PE | CR1_ACK | CR1_STOP);
+            sent += 1;
+            continue;
+        }
+        if sent > PAYLOAD.len() && peek_with(&rb, SR1, MemAttrs::DEBUG) & SR1_STOPF != 0 {
+            break;
+        }
+        now += 1;
+        a.advance_to(now);
+        b.advance_to(now);
+    }
+    assert!(b_addressed, "the second block never saw its own address");
+    assert!(stalled, "and it held SCL down until EV1 was done");
+    assert_eq!(got, PAYLOAD.to_vec(), "the bytes that reached it");
+    assert_ne!(
+        peek_with(&rb, SR1, MemAttrs::DEBUG) & SR1_STOPF,
+        0,
+        "EV4, seen on the wire rather than through a fabric call"
+    );
+}
+
+/// The `OAR1`/`OAR2` spelling of a seven-bit own address: `ADD[7:1]`.
+const fn sadd7(address: u8) -> u32 {
+    (address as u32) << 1
+}
+
+/// Put two combined engines on one SCL/SDA pair.
+fn wire_two(a: &Arc<ControllerWires>, b: &Arc<ControllerWires>) -> (Arc<Wire>, Arc<Wire>) {
+    let scl_ids = [WireId::new(1), WireId::new(2)];
+    let sda_ids = [WireId::new(3), WireId::new(4)];
+    let scl = Wire::builder()
+        .sources(&scl_ids)
+        .sink(a.sink(line::SCL, &scl_ids), line::SCL)
+        .sink(b.sink(line::SCL, &scl_ids), line::SCL)
+        .build_shared();
+    let sda = Wire::builder()
+        .sources(&sda_ids)
+        .sink(a.sink(line::SDA, &sda_ids), line::SDA)
+        .sink(b.sink(line::SDA, &sda_ids), line::SDA)
+        .build_shared();
+    a.connect(line::SCL, WireSource::new(Arc::clone(&scl), scl_ids[0]));
+    a.connect(line::SDA, WireSource::new(Arc::clone(&sda), sda_ids[0]));
+    b.connect(line::SCL, WireSource::new(Arc::clone(&scl), scl_ids[1]));
+    b.connect(line::SDA, WireSource::new(Arc::clone(&sda), sda_ids[1]));
+    a.announce();
+    b.announce();
+    (scl, sda)
 }
