@@ -14,6 +14,7 @@
 //! | [`sdio`] | `stm32.sdio` | the F2/F4/F7 SDIO and the L1/L4 SDMMC1: the older block, its thirty-two-word FIFO and an **external** DMA request |
 //! | [`spi`] | `stm32.spi` | an SPI master and slave in either generation by `variant`: RM0090 §28's F4 block, or RM0351 §42's with its FIFO and programmable `DS` |
 //! | [`dma`] | `st.dma` | a DMA controller in either family layout: eight streams (RM0090 §10) or seven channels (RM0351 §11) |
+//! | [`dmamux`] | `st.dmamux` | the DMA request multiplexer of the L4+/G4/WB (RM0432 §14): `CxCR` routing, synchronization and the four request generators |
 //! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
 //! | [`tim`] | `st.tim` | a TIM timer in its basic, general-purpose or advanced form |
 //! | [`exti`] | `st.exti` | the external interrupt/event controller: what turns a pin edge into an NVIC request |
@@ -75,6 +76,10 @@ pub mod sdio;
 #[cfg(feature = "dev-stm32-dma")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-dma")))]
 pub mod dma;
+
+#[cfg(feature = "dev-stm32-dmamux")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-dmamux")))]
+pub mod dmamux;
 
 #[cfg(feature = "dev-stm32-i2c")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-i2c")))]
@@ -182,6 +187,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     usart::register(registry)?;
     #[cfg(feature = "dev-stm32-dma")]
     dma::register(registry)?;
+    #[cfg(feature = "dev-stm32-dmamux")]
+    dmamux::register(registry)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::register(registry)?;
     #[cfg(feature = "dev-stm32-sdio")]
@@ -237,6 +244,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     usart::bind(bindings)?;
     #[cfg(feature = "dev-stm32-dma")]
     dma::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-dmamux")]
+    dmamux::bind(bindings)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::bind(bindings)?;
     #[cfg(feature = "dev-stm32-sdio")]
@@ -295,6 +304,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.extend([gpio::schema(), usart::schema()]);
     #[cfg(feature = "dev-stm32-dma")]
     out.push(dma::schema());
+    #[cfg(feature = "dev-stm32-dmamux")]
+    out.push(dmamux::schema());
     #[cfg(feature = "dev-stm32-sdmmc")]
     out.extend([sdmmc::schema()]);
     #[cfg(feature = "dev-stm32-sdio")]

@@ -1345,11 +1345,56 @@ dev-stm32 = []
 # territory). It is also **runnable** -- one tick of its clock domain is one
 # beat -- because a transfer takes bus time and the scheduler owns time, and a
 # peripheral asks for that beat by driving one of the `req0`..`req7` input
-# pins. The stream FIFO, MBURST/PBURST, PFCTRL and the DMAMUX are not modelled;
-# see the module header for exactly what each of those costs. Written from ST
-# RM0090 and RM0351; no emulator source was consulted (ROADMAP.md §1).
+# pins.
+#
+# A request pin also comes in a selector-qualified form, `req{n}c{sel}`, which
+# is the other half of RM0090 Table 43: every request reaches a stream *and* a
+# channel, `CHSEL` (or the channel face's `CSELR` nibble) picks which of the
+# eight a unit is listening to, and a line wired to the qualified pin is heard
+# only while the selector agrees. That is what lets a board wire a whole
+# request matrix -- `TIM2_UP` is on two streams -- without handing a guest
+# beats it never asked for. Several drivers on one pin are OR'd, because a cell
+# of the table routinely holds two requests.
+#
+# **PFCTRL**, peripheral flow control (RM0090 §10.3.2), is modelled too: with
+# it set `NDTR` is a maximum and the peripheral ends the transfer, answering
+# `DmaPeripheral::dma_last` on the beat that carries its final item. That is
+# how ST's own F4 SD driver arms the SDIO streams.
+#
+# The stream FIFO and MBURST/PBURST are still stored-and-inert, so FEIF and
+# DMEIF never fire; the DMAMUX is a separate class, `dev-stm32-dmamux`. See the
+# module header for exactly what each of those costs. Written from ST RM0090
+# and RM0351; no emulator source was consulted (ROADMAP.md §1).
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-dma = []
+
+# The STM32 DMAMUX (src/dev/stm32/dmamux.rs), class `st.dmamux`: the request
+# multiplexer that the L4+/G0/G4/WB/H7/L5/U5 put between their peripherals and
+# their DMA controllers. On an F4 the request matrix is fixed in silicon --
+# RM0090 Table 43 puts SDIO on DMA2 stream 3 channel 4 and nothing moves it --
+# and a board file spells that matrix out in `wire` statements. The DMAMUX
+# replaces the table with a register: DMAMUX_CxCR.DMAREQ_ID steers any of the
+# part's 128 request lines to any DMA channel, so `wire dmamux.ch0 -> dma1.req1`
+# is the wiring and the routing is whatever the guest writes.
+#
+# On top of the routing it carries the two elaborations of RM0432 §14:
+# **synchronization** (SE/SPOL/SYNC_ID/NBREQ) holds a channel's requests back
+# until an edge on one of eight `sync` inputs, then lets exactly NBREQ+1
+# through, pulsing the channel's `evt` output as the last one goes if EGE is
+# set; and the four **request generators** (RGxCR with SIG_ID/GPOL/GNBREQ)
+# manufacture GNBREQ+1 requests from an edge on one of thirty-two `trg` inputs,
+# with no peripheral involved at all. Both count, and both raise an overrun --
+# SOF in DMAMUX_CSR, OF in DMAMUX_RGSR, cleared through CFR/RGCFR and reported
+# on one `irq` pin because the part has one vector (the G4 calls it DMAMUX_OVR).
+#
+# It needs no `space`: it is a wire router, not a bus master, and it takes only
+# a `channels` property (7 by default, up to 16). Pair it with `dev-stm32-dma`'s
+# **channel** face, which is the one every DMAMUX part has. Written from ST
+# RM0432 §14, with RM0440 §13 and RM0434 §15 as the same block on other
+# families -- note that **RM0351 has no DMAMUX at all** and routes with
+# DMA_CSELR instead. No emulator source was consulted (ROADMAP.md §1).
+# `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-dmamux = []
 # The STM32 external interrupt controller and its pin multiplexer
 # (src/dev/stm32/exti.rs, src/dev/stm32/syscfg.rs): two classes, `st.exti` and
 # `st.syscfg`. Together they are the path from *a GPIO pin moved* to *the NVIC

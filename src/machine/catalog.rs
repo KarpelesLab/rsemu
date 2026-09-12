@@ -971,6 +971,7 @@ pub fn registry() -> Result<Registry> {
     #[cfg(any(
         feature = "dev-stm32",
         feature = "dev-stm32-dma",
+        feature = "dev-stm32-dmamux",
         feature = "dev-stm32-sdmmc",
         feature = "dev-stm32-sdio",
         feature = "dev-stm32-spi",
@@ -1102,6 +1103,7 @@ pub fn bindings() -> Result<Bindings> {
     #[cfg(any(
         feature = "dev-stm32",
         feature = "dev-stm32-dma",
+        feature = "dev-stm32-dmamux",
         feature = "dev-stm32-sdmmc",
         feature = "dev-stm32-sdio",
         feature = "dev-stm32-spi",
@@ -1236,6 +1238,7 @@ pub fn classes() -> ClassTable {
     #[cfg(any(
         feature = "dev-stm32",
         feature = "dev-stm32-dma",
+        feature = "dev-stm32-dmamux",
         feature = "dev-stm32-sdmmc",
         feature = "dev-stm32-sdio",
         feature = "dev-stm32-spi",
