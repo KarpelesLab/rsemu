@@ -92,6 +92,71 @@ no bit handling of its own.
 A machine file names which style it uses and why; `machines/spi-panel.machine`
 is the worked example.
 
+## I²C, as built (`bus-i2c`)
+
+The same two link styles as SPI, and the same rule: `link = "transactional"`
+hands a bus event to `I2cBus` in one call, `link = "wired"` drives SCL and SDA
+as real open-drain nets, one edge per half bit period, paced by the scheduler.
+A machine file names which, and `st.i2c`/`st.i2c-v2` make the property
+**required** so nothing inherits a default.
+
+**A bus event costs the same virtual time either way**, and `bus::i2c` is where
+that is fixed rather than in any controller: `START_HALF_PERIODS` (4),
+`BYTE_HALF_PERIODS` (18 — nine bit slots, eight data plus the acknowledge) and
+`STOP_HALF_PERIODS` (2). The controller decides only what a half period
+*lasts* — v1 from `CCR`/`DUTY`/`F-S`, v2 from `TIMINGR`'s `SCLL`/`SCLH`. Anything
+that changes those counts changes the guest-visible timeline of every board, so
+`a_wired_transfer_costs_the_half_periods_the_fabric_charges_for_it` and each
+block's `both_link_models_…` test assert them to the tick.
+
+### One pin pair carries both roles
+
+`MasterWires` and `SlaveWires` each model one role on a pin pair of its own. A
+board has neither — an I²C peripheral drives the lines when it is the
+controller and watches the *same two nets* when it is not — so `ControllerWires`
+is the part a controller actually instantiates: one pin pair, both state
+machines, their drive requests wired-AND together the way the pad does it.
+That is what makes four things expressible, and the last three are the reason
+the wired link exists at all:
+
+- a controller **addressed by another controller**, acknowledging per byte;
+- **clock stretching as a level on SCL**, so the other controller stalls on the
+  net rather than by asking `I2cBus::stretching` a question;
+- **multi-master arbitration** — two controllers starting together, the wired
+  AND letting the lower address through, the loser reading a low where it drove
+  a high and turning its driver off;
+- and the loser then **answering the address that beat it**, because its target
+  half has been following the same byte since the START. ST's "the peripheral
+  automatically switches back to slave mode" needs no switching.
+
+A controller's target face is the **same `I2cSlave` object** a transactional
+`I2cBus` routes to. There is one implementation of a peripheral's slave mode
+and no way for the two links to disagree about it, which is the only reason
+building this was worth doing rather than special-casing the wired path.
+
+A device whose face can stretch must call `ControllerWires::refresh_stretch`
+from `advance_to` **and after every register access**: the engine puts the stall
+on by itself at the end of a nine-bit slot, but nothing on the wire says when
+software got round to serving it.
+
+Two things the second controller made necessary, both recorded here because
+they look like details and are not:
+
+- **A controller waits for a free bus** (§3.1.8). The gap between two of
+  somebody else's bits is not a START opportunity — SDA and SCL are both high in
+  the middle of every `1` bit, and pulling SDA down there forges a START inside
+  their byte. `MasterCore` stalls instead, and tells a *repeated* START apart
+  from a fresh one by whether its own half is still holding SCL down. It has to
+  be the half's own request rather than the pin: the target half pulls the same
+  SDA low to acknowledge somebody else's byte.
+- **An open-drain fan-in starts released.** `FanIn::new` starts every slot low,
+  which is the neutral level for the wired-*OR* it was written for. On these
+  nets low is *asserted*, so a fresh fan-in reads the net low until every driver
+  has announced — and the realize sweep announces them one at a time. A `BUSY`
+  latched from that is a transaction that never happened, and a controller that
+  then refuses to start never sends anything at all. `OpenDrain::learn_sources`
+  sets every slot high when it builds the fan.
+
 ## What a snapshot has to carry, and what it must not re-announce
 
 A frame is not atomic with respect to a save. `Machine::save` can land between

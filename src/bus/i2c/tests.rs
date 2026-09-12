@@ -14,8 +14,18 @@
 //! clock stretching and arbitration are meaningless in a transactional model
 //! and fall out of the open-drain nets in a wired one, which is the whole
 //! reason [`super::wires`] exists.
+//!
+//! The [`TwoWay`](tests::TwoWay) group is the same argument one step further
+//! on. A board does not have a master on one pin pair and a target on another;
+//! it has peripherals that are both on one. So
+//! [`a_controller_is_addressed_over_the_same_pins_it_would_drive`](tests::a_controller_is_addressed_over_the_same_pins_it_would_drive),
+//! [`a_target_half_stretches_as_a_level_on_scl_not_as_a_flag`](tests::a_target_half_stretches_as_a_level_on_scl_not_as_a_flag)
+//! and
+//! [`the_loser_of_an_arbitration_answers_the_winner_that_addressed_it`](tests::the_loser_of_an_arbitration_answers_the_winner_that_addressed_it)
+//! are the three things only [`super::wires::ControllerWires`] can express, and
+//! the last is the one that has no transactional shadow at all.
 
-use super::wires::{MasterEvent, MasterOp, MasterWires, SlaveWires, pin};
+use super::wires::{ControllerWires, MasterEvent, MasterOp, MasterWires, SlaveWires, pin};
 use super::*;
 
 use alloc::vec;
@@ -892,4 +902,406 @@ fn a_bit_engines_state_round_trips_through_its_own_codec() {
     let mut src = SliceSource::new(&bytes);
     let back = super::wires::SlaveWiresState::read(&mut src).expect("it decodes");
     assert_eq!(s, back);
+}
+
+// ---------------------------------------------------------------------------
+// Both roles on one pin pair
+// ---------------------------------------------------------------------------
+
+/// Two controllers on two nets, each with a target face of its own.
+///
+/// What a board with two I²C peripherals on one bus is, and the arrangement
+/// [`MasterWires`] + [`SlaveWires`] could not express: there, a controller's
+/// target face would need a second pin pair, and a board has one.
+struct TwoWay {
+    parts: Vec<Arc<ControllerWires>>,
+    #[allow(dead_code)]
+    scl: Arc<Wire>,
+    #[allow(dead_code)]
+    sda: Arc<Wire>,
+}
+
+impl TwoWay {
+    fn new(faces: &[Option<Arc<Recorder>>]) -> TwoWay {
+        let parts: Vec<Arc<ControllerWires>> = faces
+            .iter()
+            .map(|face| {
+                let part = Arc::new(ControllerWires::new());
+                if let Some(face) = face {
+                    part.attach_slave(Arc::clone(face) as Arc<dyn I2cSlave>);
+                }
+                part
+            })
+            .collect();
+        let n = parts.len();
+        let scl_ids: Vec<WireId> = (0..n).map(|i| WireId::new(1 + i as u64)).collect();
+        let sda_ids: Vec<WireId> = (0..n).map(|i| WireId::new(1 + (n + i) as u64)).collect();
+        let mut scl = Wire::builder().sources(&scl_ids);
+        let mut sda = Wire::builder().sources(&sda_ids);
+        for part in &parts {
+            scl = scl.sink(part.sink(pin::SCL, &scl_ids), pin::SCL);
+            sda = sda.sink(part.sink(pin::SDA, &sda_ids), pin::SDA);
+        }
+        let scl = scl.build_shared();
+        let sda = sda.build_shared();
+        for (i, part) in parts.iter().enumerate() {
+            part.connect(pin::SCL, WireSource::new(Arc::clone(&scl), scl_ids[i]));
+            part.connect(pin::SDA, WireSource::new(Arc::clone(&sda), sda_ids[i]));
+            part.announce();
+        }
+        TwoWay { parts, scl, sda }
+    }
+
+    /// Run one bus event on `who` to completion.
+    fn run(&self, who: usize, op: MasterOp) -> MasterEvent {
+        assert!(self.parts[who].submit(op), "the engine was already busy");
+        for _ in 0..256 {
+            match self.parts[who].tick() {
+                MasterEvent::Working | MasterEvent::Stretched => {}
+                other => return other,
+            }
+        }
+        panic!("{op:?} never finished");
+    }
+}
+
+#[test]
+fn a_controller_is_addressed_over_the_same_pins_it_would_drive() {
+    // The whole of issue #10 at the bit level: the target face hangs off the
+    // controller's *own* SCL and SDA, and the sequence of `I2cSlave` calls it
+    // sees is the one a dedicated `SlaveWires` would have produced.
+    let face = Recorder::new(Address::Seven(0x22), &[0xa1, 0xa2]);
+    let bus = TwoWay::new(&[None, Some(Arc::clone(&face))]);
+
+    assert_eq!(bus.run(0, MasterOp::Start), MasterEvent::Started);
+    assert_eq!(
+        bus.run(
+            0,
+            MasterOp::Write(Address::Seven(0x22).first_byte(Direction::Write))
+        ),
+        MasterEvent::Wrote(Ack::Ack),
+        "the other controller acknowledged its own address"
+    );
+    assert_eq!(
+        bus.run(0, MasterOp::Write(0x5a)),
+        MasterEvent::Wrote(Ack::Ack)
+    );
+    // A repeated START turns it round.
+    assert_eq!(bus.run(0, MasterOp::Start), MasterEvent::Started);
+    assert_eq!(
+        bus.run(
+            0,
+            MasterOp::Write(Address::Seven(0x22).first_byte(Direction::Read))
+        ),
+        MasterEvent::Wrote(Ack::Ack)
+    );
+    assert_eq!(
+        bus.run(0, MasterOp::Read(Ack::Nack)),
+        MasterEvent::Read(0xa1)
+    );
+    assert_eq!(bus.run(0, MasterOp::Stop), MasterEvent::Stopped);
+
+    assert_eq!(
+        face.take_log(),
+        vec![
+            Call::Address(Address::Seven(0x22), Direction::Write),
+            Call::Write(0x5a),
+            Call::Address(Address::Seven(0x22), Direction::Read),
+            Call::Read(0xa1),
+            Call::ReadAck(Ack::Nack),
+            Call::Stop,
+        ]
+    );
+}
+
+#[test]
+fn a_target_half_stretches_as_a_level_on_scl_not_as_a_flag() {
+    // §3.1.9 through a controller's target face, and the reason the wired link
+    // exists: the stall is a **level on the net**, so the other controller
+    // stalls on it without asking anybody a question. A transactional bus has
+    // to call `I2cBus::stretching` to find this out; here nothing is asked.
+    let face = Recorder::new(Address::Seven(0x30), &[]);
+    let bus = TwoWay::new(&[None, Some(Arc::clone(&face))]);
+    assert_eq!(bus.run(0, MasterOp::Start), MasterEvent::Started);
+
+    // The face needs time once it has taken the address, which is where the
+    // nine-bit slot ends and where a real peripheral raises `ADDR`.
+    face.stretch
+        .store(true, crate::core::sync::Ordering::Relaxed);
+    assert_eq!(
+        bus.run(
+            0,
+            MasterOp::Write(Address::Seven(0x30).first_byte(Direction::Write))
+        ),
+        MasterEvent::Wrote(Ack::Ack)
+    );
+    assert_eq!(
+        bus.parts[1].scl().driving(),
+        Level::Low,
+        "the target half pulled the clock down itself"
+    );
+    assert_eq!(bus.parts[0].scl().net(), Level::Low);
+
+    // The other controller makes no progress at all while that holds. Its first
+    // half period is the *low* one, which it owns and spends putting the bit on
+    // SDA; every one after that is the high half it cannot have.
+    assert!(bus.parts[0].submit(MasterOp::Write(0x5a)));
+    assert_eq!(bus.parts[0].tick(), MasterEvent::Working);
+    for _ in 0..16 {
+        assert_eq!(
+            bus.parts[0].tick(),
+            MasterEvent::Stretched,
+            "a held clock buys no progress"
+        );
+    }
+
+    // Software served it. Only the face's own device can release this, which is
+    // exactly the asymmetry §3.1.9 describes.
+    face.stretch
+        .store(false, crate::core::sync::Ordering::Relaxed);
+    bus.parts[1].refresh_stretch();
+    assert_eq!(bus.parts[1].scl().driving(), Level::High);
+
+    let mut event = None;
+    for _ in 0..64 {
+        match bus.parts[0].tick() {
+            MasterEvent::Working | MasterEvent::Stretched => {}
+            other => {
+                event = Some(other);
+                break;
+            }
+        }
+    }
+    assert_eq!(event, Some(MasterEvent::Wrote(Ack::Ack)));
+    assert!(
+        face.take_log().contains(&Call::Write(0x5a)),
+        "and the byte arrived once the stall was over"
+    );
+}
+
+#[test]
+fn the_loser_of_an_arbitration_answers_the_winner_that_addressed_it() {
+    // §3.1.8 plus §39.4.10, which only a shared pin pair can express: B tries
+    // to start a transfer of its own at the same instant A addresses *B*, loses
+    // on SDA, and its target half — which has been following the same byte
+    // since the START — answers the address that beat it.
+    let a_face = Recorder::new(Address::Seven(0x7f), &[]);
+    let b_face = Recorder::new(Address::Seven(0x20), &[]);
+    let bus = TwoWay::new(&[Some(Arc::clone(&a_face)), Some(Arc::clone(&b_face))]);
+    let (a, b) = (&bus.parts[0], &bus.parts[1]);
+
+    // Both see a valid START: §3.1.8's "within the minimum hold time".
+    assert!(a.submit(MasterOp::Start));
+    assert!(b.submit(MasterOp::Start));
+    for _ in 0..8 {
+        a.tick();
+        b.tick();
+    }
+    assert!(!a.is_working() && !b.is_working());
+
+    // A addresses 0x20, which is B. B is trying for 0x40. 0x20 is 010 0000 and
+    // 0x40 is 100 0000, so they differ on the very first bit and A wins.
+    assert!(a.submit(MasterOp::Write(
+        Address::Seven(0x20).first_byte(Direction::Write)
+    )));
+    assert!(b.submit(MasterOp::Write(
+        Address::Seven(0x40).first_byte(Direction::Write)
+    )));
+    let mut b_lost = false;
+    let mut a_result = None;
+    for _ in 0..64 {
+        if let MasterEvent::ArbitrationLost = b.tick() {
+            b_lost = true;
+        }
+        match a.tick() {
+            MasterEvent::Working | MasterEvent::Stretched => {}
+            other => {
+                a_result = Some(other);
+                break;
+            }
+        }
+    }
+    assert!(
+        b_lost,
+        "the controller sending the higher address must lose"
+    );
+    assert_eq!(
+        a_result,
+        Some(MasterEvent::Wrote(Ack::Ack)),
+        "and the loser's own target face acknowledged the winner"
+    );
+    assert_eq!(b.sda().driving(), Level::High, "the loser let SDA go");
+
+    assert_eq!(
+        bus.run(0, MasterOp::Write(0xc3)),
+        MasterEvent::Wrote(Ack::Ack)
+    );
+    assert_eq!(bus.run(0, MasterOp::Stop), MasterEvent::Stopped);
+    assert_eq!(
+        b_face.take_log(),
+        vec![
+            Call::Address(Address::Seven(0x20), Direction::Write),
+            Call::Write(0xc3),
+            Call::Stop,
+        ],
+        "the byte reached the loser through the pins it had been driving"
+    );
+    assert_eq!(
+        a_face.take_log(),
+        vec![Call::Address(Address::Seven(0x20), Direction::Write)],
+        "the winner's own target face was offered the address it had just sent \
+         — one pin pair cannot help hearing itself — and took nothing further"
+    );
+}
+
+#[test]
+fn a_controller_with_no_target_face_is_exactly_a_master() {
+    // The property that makes this one type rather than two: attach nothing and
+    // the engine is a `MasterWires` with a spare AND gate.
+    let face = Recorder::new(Address::Seven(0x11), &[]);
+    let bus = TwoWay::new(&[None, Some(Arc::clone(&face))]);
+    assert_eq!(bus.run(0, MasterOp::Start), MasterEvent::Started);
+    assert_eq!(
+        bus.parts[0].scl().driving(),
+        Level::Low,
+        "a START still ends with the clock held down"
+    );
+    let mut ticks = 0;
+    assert!(bus.parts[0].submit(MasterOp::Write(0x00)));
+    while bus.parts[0].is_working() {
+        bus.parts[0].tick();
+        ticks += 1;
+    }
+    assert_eq!(
+        ticks, BYTE_HALF_PERIODS,
+        "and a byte costs what the fabric charges for one"
+    );
+}
+
+#[test]
+fn a_combined_engines_state_round_trips_through_its_own_codec() {
+    let face = Recorder::new(Address::Seven(0x22), &[]);
+    let bus = TwoWay::new(&[None, Some(Arc::clone(&face))]);
+    bus.run(0, MasterOp::Start);
+    // Stop half way through the address byte: the controller half is mid-write
+    // and the target half is mid-decode, and both have to come back.
+    assert!(bus.parts[0].submit(MasterOp::Write(
+        Address::Seven(0x22).first_byte(Direction::Write)
+    )));
+    for _ in 0..7 {
+        bus.parts[0].tick();
+    }
+
+    for part in &bus.parts {
+        let taken = part.snapshot();
+        let mut bytes = Vec::new();
+        taken.write(&mut bytes).expect("it encodes");
+        let mut src = SliceSource::new(&bytes);
+        let back = super::wires::ControllerWiresState::read(&mut src).expect("it decodes");
+        assert_eq!(taken, back);
+    }
+}
+
+#[test]
+fn a_realized_bus_with_nobody_driving_is_free() {
+    // The realize sweep announces one driver at a time, so an open-drain net
+    // built on a fan-in that starts *low* — which is what `FanIn::new` does,
+    // because it was written for wired-OR interrupts — reads low until the last
+    // driver has spoken. A controller that latched `BUSY` from that would refuse
+    // to start a transfer on a bus nothing is on.
+    let face = Recorder::new(Address::Seven(0x50), &[]);
+    let bus = TwoWay::new(&[None, Some(Arc::clone(&face))]);
+    assert_eq!(bus.parts[0].scl().net(), Level::High);
+    assert_eq!(bus.parts[0].sda().net(), Level::High);
+    assert!(!bus.parts[0].busy(), "nothing has happened yet");
+    assert!(!bus.parts[1].busy());
+}
+
+#[test]
+fn a_controller_waits_for_a_bus_somebody_else_already_owns() {
+    // §3.1.8: "A controller may start a transfer only if the bus is free." The
+    // gap between two of another controller's bits is not a START opportunity —
+    // SDA is high and SCL is high in the middle of every `1` bit, and pulling
+    // SDA down there forges a START inside their byte.
+    let face = Recorder::new(Address::Seven(0x50), &[]);
+    let bus = TwoWay::new(&[None, Some(Arc::clone(&face))]);
+
+    assert_eq!(bus.run(0, MasterOp::Start), MasterEvent::Started);
+    assert!(bus.parts[1].busy(), "the other controller saw the START");
+
+    // B now wants the bus. Every half period it spends is a stall, and it
+    // drives nothing: A's byte goes out untouched.
+    assert!(bus.parts[1].submit(MasterOp::Start));
+    assert!(bus.parts[0].submit(MasterOp::Write(
+        Address::Seven(0x50).first_byte(Direction::Write)
+    )));
+    let mut a_event = None;
+    for _ in 0..64 {
+        assert_eq!(
+            bus.parts[1].tick(),
+            MasterEvent::Stretched,
+            "the bus is not B's to take"
+        );
+        match bus.parts[0].tick() {
+            MasterEvent::Working | MasterEvent::Stretched => {}
+            other => {
+                a_event = Some(other);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        a_event,
+        Some(MasterEvent::Wrote(Ack::Ack)),
+        "the address A sent arrived intact"
+    );
+    assert_eq!(
+        face.take_log(),
+        vec![Call::Address(Address::Seven(0x50), Direction::Write)],
+        "and the target saw one START, not two"
+    );
+
+    // A finishes. The bus is free and B's START, still submitted, goes through.
+    assert_eq!(bus.run(0, MasterOp::Stop), MasterEvent::Stopped);
+    assert!(!bus.parts[1].busy());
+    let mut b_event = None;
+    for _ in 0..64 {
+        match bus.parts[1].tick() {
+            MasterEvent::Working | MasterEvent::Stretched => {}
+            other => {
+                b_event = Some(other);
+                break;
+            }
+        }
+    }
+    assert_eq!(b_event, Some(MasterEvent::Started), "B's turn");
+}
+
+#[test]
+fn a_repeated_start_is_not_mistaken_for_taking_somebody_elses_bus() {
+    // The other half of the rule above, and the reason it is written in terms
+    // of *our own* drivers rather than a flag: a repeated START happens on a
+    // busy bus by definition, and the thing that says the bus is ours is that
+    // we are the one holding SCL down between operations.
+    let face = Recorder::new(Address::Seven(0x50), &[0x42]);
+    let bus = TwoWay::new(&[None, Some(Arc::clone(&face))]);
+    assert_eq!(bus.run(0, MasterOp::Start), MasterEvent::Started);
+    assert_eq!(
+        bus.run(
+            0,
+            MasterOp::Write(Address::Seven(0x50).first_byte(Direction::Write))
+        ),
+        MasterEvent::Wrote(Ack::Ack)
+    );
+    assert!(bus.parts[0].busy());
+    let mut ticks = 0;
+    assert!(bus.parts[0].submit(MasterOp::Start));
+    while bus.parts[0].is_working() {
+        bus.parts[0].tick();
+        ticks += 1;
+    }
+    assert_eq!(
+        ticks, START_HALF_PERIODS,
+        "a repeated START costs what a START costs, with nothing spent waiting"
+    );
 }

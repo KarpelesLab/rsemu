@@ -61,6 +61,15 @@
 //! [`wires::SlaveWires`]. `both_link_models_produce_identical_traffic` asserts
 //! that the two paths deliver the identical sequence of `I2cSlave` calls.
 //!
+//! **And so is a controller's own slave mode.** A memory-mapped I²C block is
+//! both roles on one pin pair, so it uses [`wires::ControllerWires`] and hands
+//! it the *same* [`I2cSlave`] it puts on this fabric. A transactional bus then
+//! routes to that face by address and a wired one reaches it from the edges on
+//! the nets the block would otherwise drive — and the two cannot disagree,
+//! because there is only one of it. Multi-master arbitration (§3.1.8) and a
+//! clock stretch that is a level rather than a question follow from the nets,
+//! and are the reason [`Link::Wired`] is worth its cost.
+//!
 //! # Clock stretching is real in both, and differently
 //!
 //! This is the part a transactional model usually cannot express, so it is
