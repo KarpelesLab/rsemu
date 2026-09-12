@@ -150,7 +150,7 @@ use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region,
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{DmaPeripheral, Level, WireSource};
 use crate::dev::sd::card::{Data, Reply, SdCard};
 use crate::dev::sd::slots::{self, Slot};
 use crate::machine::realize::Instance;
@@ -593,6 +593,43 @@ impl fmt::Debug for Sdio {
         f.debug_struct("Sdio")
             .field("slot", &self.shared.slot_name)
             .finish_non_exhaustive()
+    }
+}
+
+/// The peripheral-as-flow-controller half of the DMA seam.
+///
+/// The *data* never travels through this trait: a stream beat is an ordinary
+/// bus read or write at `CPAR`, which is `SDIO_FIFO`, so `dma_read` and
+/// `dma_write` are unreachable here and say so rather than inventing a byte.
+/// What the controller needs from this side is the two questions a wire cannot
+/// answer between beats — whether service is still wanted, and whether the item
+/// about to move is the **card's** last.
+///
+/// `dma_last` is what makes `SxCR.PFCTRL` work, and it is the case ST's own F4
+/// SD driver arms: `NDTR` is then a maximum and the peripheral ends the
+/// transfer. Note it is deliberately *not* derived from the DPSM — `DCOUNT`
+/// reaching zero means the **card** has finished while the last words are still
+/// in the FIFO, so a last-item signal taken from the DPSM would cut a block
+/// short by up to thirty-two words with `DATAEND` set. It is the FIFO holding
+/// exactly one word, on a card-to-host transfer whose card has no more to give.
+impl DmaPeripheral for Shared {
+    fn dma_read(&self, _terminal: bool) -> u8 {
+        unreachable!("an SDIO stream beat is a bus read at CPAR, not a trait call")
+    }
+
+    fn dma_write(&self, _byte: u8, _terminal: bool) {
+        unreachable!("an SDIO stream beat is a bus write at CPAR, not a trait call")
+    }
+
+    fn dma_ready(&self) -> bool {
+        self.regs.lock().dma_request()
+    }
+
+    fn dma_last(&self) -> bool {
+        let regs = self.regs.lock();
+        regs.dctrl & DCTRL_DTDIR != 0
+            && regs.dpsm.is_none_or(|dpsm| dpsm.left == 0)
+            && regs.fifo.len() == 1
     }
 }
 
@@ -1139,6 +1176,14 @@ impl MemOps for Port {
 // ---------------------------------------------------------------------------
 
 impl Device for Sdio {
+    /// The flow-control half of the request seam, handed over on the same pin
+    /// the request level is driven from. `st.dma` samples it only while
+    /// `SxCR.PFCTRL` is set; with `PFCTRL` clear the controller's own `NDTR` is
+    /// the flow controller and this is never consulted.
+    fn dma_peripheral(&self, port: &str) -> Option<Arc<dyn DmaPeripheral>> {
+        (port == pin::DMA).then(|| Arc::clone(&self.shared) as Arc<dyn DmaPeripheral>)
+    }
+
     fn class(&self) -> &'static DeviceClass {
         &CLASS
     }
