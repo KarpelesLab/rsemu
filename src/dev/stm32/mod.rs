@@ -21,6 +21,7 @@
 //! | [`firewall`] | `st.firewall` | the L0/L4 Firewall: three fenced segments, one call gate, and a reset for anything else |
 //! | [`flash`] | `st.flash` | the embedded flash interface: wait states, the unlock keys, and a programmable array |
 //! | [`crc`] | `st.crc` | the CRC calculation unit, fixed on an F4 and programmable from the F0/F3/F7/L4 on |
+//! | [`hash`] | `st.hash` | the hash processor: SHA-1/MD5 (plus SHA-224/256 on `v2`), HMAC, and the `CSR` context swap |
 //! | [`iwdg`] | `st.iwdg` | the independent watchdog: a down-counter on the LSI that resets the board |
 //! | [`wwdg`] | `st.wwdg` | the window watchdog, which also resets the board when a kick comes *early* |
 //! | [`dbgmcu`] | `st.dbgmcu` | the debug unit: `IDCODE` and the freeze bits that stop a peripheral while a debugger has the core halted |
@@ -109,6 +110,10 @@ pub mod firewall;
 #[cfg(feature = "dev-stm32-crc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-crc")))]
 pub mod crc;
+
+#[cfg(feature = "dev-stm32-hash")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-hash")))]
+pub mod hash;
 
 #[cfg(feature = "dev-stm32-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-flash")))]
@@ -199,6 +204,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     firewall::register(registry)?;
     #[cfg(feature = "dev-stm32-crc")]
     crc::register(registry)?;
+    #[cfg(feature = "dev-stm32-hash")]
+    hash::register(registry)?;
     #[cfg(feature = "dev-stm32-flash")]
     flash::register(registry)?;
     #[cfg(feature = "dev-stm32-wdg")]
@@ -252,6 +259,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     firewall::bind(bindings)?;
     #[cfg(feature = "dev-stm32-crc")]
     crc::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-hash")]
+    hash::bind(bindings)?;
     #[cfg(feature = "dev-stm32-flash")]
     flash::bind(bindings)?;
     #[cfg(feature = "dev-stm32-wdg")]
@@ -306,6 +315,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(firewall::schema());
     #[cfg(feature = "dev-stm32-crc")]
     out.extend([crc::schema()]);
+    #[cfg(feature = "dev-stm32-hash")]
+    out.push(hash::schema());
     #[cfg(feature = "dev-stm32-flash")]
     out.push(flash::schema());
     #[cfg(feature = "dev-stm32-wdg")]
