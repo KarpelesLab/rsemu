@@ -424,6 +424,21 @@ its name from the manual beside it, and a test makes the handlers say which
 number they were reached through — because a vector wired to the wrong core pin
 does not fail, it quietly runs somebody else's code.
 
+Its input device is a **4x4 matrix keypad** on PE0-PE7, and it is there because
+it is the one thing on this board that an ordinary wire could not carry. A
+matrix keypad has no register block: sixteen switches, eight pins, and firmware
+that drives one row low at a time and reads the columns back through the
+pull-ups. That needs a net where *nobody driving* is a state distinct from
+*somebody driving low*, so a driver presents a tri-state `Drive` rather than a
+level, `OTYPER` and `PUPDR` decide what a pad actually presents, `IDR` reads
+the **pin** rather than the port's intention, and the machine file says
+`wire gpioe.p0 -> keypad.row0 { pull = "up" }` to put the resistor on the
+copper where it belongs. Before that, a row configured input-with-pull-up read
+low with nothing attached and firmware saw every key held. The pad has no series
+diodes, which is the truth about a cheap membrane part: press three corners of a
+rectangle and a test watches the fourth ghost, through the wire model rather
+than through a special case.
+
 The two DMA controllers master a **second address space**, which is how the
 board says the thing a comment cannot: an F4's core-coupled memory is on the
 Cortex-M4's own bus and no DMA reaches it, so `dmabus` has SRAM and the

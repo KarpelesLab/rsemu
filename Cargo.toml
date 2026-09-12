@@ -1102,6 +1102,38 @@ dev-flash-cfi = ["dev-medium"]
 # Specification. `no_std + alloc`, no `unsafe`, no dependencies.
 dev-sd-card = []
 
+# A GPIO matrix keypad (src/dev/keypad.rs): R row conductors, C column
+# conductors, and a switch contact at each crossing that -- while it is held --
+# shorts its row net to its column net. That is the whole part; a keypad matrix
+# has no register block, because the firmware does the scanning.
+#
+# Modelled: both scan directions off one wiring (drive a row low and read the
+# columns, or drive a column low and read the rows), `diodes = false` ghosting
+# computed as the connected component of the closed contacts -- so three corners
+# of a rectangle really do fabricate the fourth -- `diodes = true` to break
+# that, a `layout` so a host input map and a recording name `"5"` or `"ok"`
+# rather than a coordinate, and contact bounce as `bounce` extra transitions
+# `bounce-time` ticks apart, scheduled through the device's own clock domain as
+# a lazily advanced device (`ROADMAP.md` §4.2) and never a wall clock. The
+# device presents `Drive::Low` or `Drive::HiZ` and never `Drive::High`, because
+# a switch has no output stage; the pull-up comes from the net (`{ pull = "up" }`)
+# or from the MCU's PUPDR, so this needs `core::wire`'s tri-state model and
+# nothing else.
+#
+# Not modelled: the analogue of a partially closed contact, key-down current
+# (an emulated matrix sinks none), and the resistive ladder of an analogue
+# keypad -- that is a different part on one ADC pin, not a matrix.
+#
+# Presses cross into the machine through the record/replay seam and nowhere
+# else (`ROADMAP.md` §4.5): the matrix is a named host object, so a board whose
+# keypad the recorder does not know about is refused at build time.
+#
+# Written from what a switch between two conductors does; the electrical model
+# is `core::wire`'s, which cites ST RM0090 §8.3.10 for the pad side. No emulator
+# source was consulted (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no
+# dependencies.
+dev-keypad-matrix = []
+
 # The STM32H7 SDMMC host controller (src/dev/stm32/sdmmc.rs): the register
 # block a driver programs -- POWER, CLKCR, ARGR, CMDR, RESPCMDR, RESP1R-RESP4R,
 # DTIMER, DLENR, DCTRL, DCNTR, STAR, ICR, MASKR and the sixteen-word FIFO --
@@ -1567,6 +1599,11 @@ machine-stm32f407 = [
     "dev-stm32-rtc",
     "dev-stm32-rng",
     "dev-at24c",
+    # The 4x4 matrix keypad on PE0-PE7. It is the board's input device and it is
+    # also the only thing in the tree that needs a net to resolve itself: eight
+    # pins, two drivers apiece and a pull-up, which is what `{ pull = "up" }`
+    # in the machine file selects.
+    "dev-keypad-matrix",
 ]
 
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the

@@ -96,6 +96,10 @@ pub mod gb;
 )]
 pub mod flash;
 
+#[cfg(feature = "dev-keypad-matrix")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-keypad-matrix")))]
+pub mod keypad;
+
 #[cfg(feature = "dev-nes-io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-io")))]
 pub mod nes;

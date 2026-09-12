@@ -944,6 +944,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::flash::register(&mut reg)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::register(&mut reg)?;
+    #[cfg(feature = "dev-keypad-matrix")]
+    crate::dev::keypad::register(&mut reg)?;
     #[cfg(feature = "dev-ata-disk")]
     crate::dev::ata::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
@@ -1073,6 +1075,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::flash::bind(&mut b)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::bind(&mut b)?;
+    #[cfg(feature = "dev-keypad-matrix")]
+    crate::dev::keypad::bind(&mut b)?;
     #[cfg(feature = "dev-ata-disk")]
     crate::dev::ata::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
@@ -1213,6 +1217,8 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::sd::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "dev-keypad-matrix")]
+    table.insert(crate::dev::keypad::schema());
     #[cfg(feature = "dev-ata-disk")]
     for schema in crate::dev::ata::schemas() {
         table.insert(schema);

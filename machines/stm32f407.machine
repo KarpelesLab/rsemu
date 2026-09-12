@@ -1102,6 +1102,64 @@ machine "stm32f407" {
   wire gpioh.p0  -> syscfg.ph0
   wire gpioh.p1  -> syscfg.ph1
 
+  # -- the keypad ------------------------------------------------------------
+  #
+  # A 4x4 matrix keypad on PE0–PE7, which is the input device a board like this
+  # one actually has: no controller, no register, sixteen switches and eight
+  # pins. Firmware drives one row low at a time and reads the columns back.
+  #
+  # **The eight nets below resolve themselves, and that is the point.** Every
+  # other wire in this file is an ordinary one-driver line whose sink decides
+  # what it means; these eight have two drivers apiece and a pull-up resistor of
+  # their own, so the *net* has to resolve them:
+  #
+  #   * the port's pad presents a `Drive` — a push-pull stage, an open-drain
+  #     stage that lets go of a one, or `PUPDR`'s resistor when `MODER` says the
+  #     pin is an input;
+  #   * a pressed key shorts its row net to its column net, which is the keypad
+  #     driving low, or nothing at all when the key is up;
+  #   * `{ pull = "up" }` is the resistor that decides the line when neither is
+  #     driving.
+  #
+  # Without it a row configured input-with-pull-up would read **low** with
+  # nothing connected, and scanning firmware would see every key held.
+  #
+  # Two statements per line because a pin is bidirectional and a `wire`
+  # statement is not: the first makes the port a driver of the net and the
+  # keypad a sensor of it, the second makes the keypad a driver and joins
+  # `in{n}` to the same piece of copper. The pull is written once — a net is the
+  # connected component of these statements, not one of them — and the whole net
+  # therefore includes `syscfg.pe{n}` from the block above, so EXTI sees the
+  # **pin** rather than what the port meant to do with it. That is what an
+  # interrupt-on-keypress needs and what a one-driver net could not express.
+  #
+  # `layout` names the keys so the host input map and a recording say `"5"` or
+  # `"#"` rather than a coordinate. `diodes = false` is the truth about a cheap
+  # membrane keypad: press three corners of a rectangle and the fourth ghosts.
+  object keypad "keypad.matrix" {
+    rows   = 4,
+    cols   = 4,
+    diodes = false,
+    layout = "1,2,3,A,4,5,6,B,7,8,9,C,*,0,#,D"
+  }
+
+  wire gpioe.p0    -> keypad.row0 { pull = "up" }
+  wire keypad.row0 -> gpioe.in0
+  wire gpioe.p1    -> keypad.row1 { pull = "up" }
+  wire keypad.row1 -> gpioe.in1
+  wire gpioe.p2    -> keypad.row2 { pull = "up" }
+  wire keypad.row2 -> gpioe.in2
+  wire gpioe.p3    -> keypad.row3 { pull = "up" }
+  wire keypad.row3 -> gpioe.in3
+  wire gpioe.p4    -> keypad.col0 { pull = "up" }
+  wire keypad.col0 -> gpioe.in4
+  wire gpioe.p5    -> keypad.col1 { pull = "up" }
+  wire keypad.col1 -> gpioe.in5
+  wire gpioe.p6    -> keypad.col2 { pull = "up" }
+  wire keypad.col2 -> gpioe.in6
+  wire gpioe.p7    -> keypad.col3 { pull = "up" }
+  wire keypad.col3 -> gpioe.in7
+
   # The mux's sixteen outputs into EXTI's sixteen GPIO lines. Lines 16-22 are
   # the peripheral wakeups (PVD, the RTC, the OTG and Ethernet cores) and are
   # undriven on this board — see the `exti` object above.
