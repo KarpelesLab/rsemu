@@ -1495,12 +1495,18 @@ impl<'a> Realizer<'a> {
         // *net*, so it is collected against a pin here and folded onto that
         // pin's component once every union has happened.
         let mut pulls: Vec<(usize, Pull, usize)> = Vec::new();
+        // The statements themselves, kept because a component is coarser than
+        // they are: which drivers reach *this* input pin is a per-pin fact, and
+        // the union-find has thrown it away by the time the net is built. See
+        // `drivers_of`.
+        let mut edges: Vec<(usize, usize)> = Vec::new();
         for (index, wire) in self.machine.wires.iter().enumerate() {
             let from = pins.intern(wire.from.object, &wire.from.port);
             let to = pins.intern(wire.to.object, &wire.to.port);
             pins.drives[from] = true;
             pins.receives[to] = true;
             pins.union(from, to);
+            edges.push((from, to));
             if let Some(value) = wire.props.get("pull") {
                 let word = value.as_str().unwrap_or_default();
                 let pull = Pull::from_name(word).ok_or_else(|| {
@@ -1595,7 +1601,18 @@ impl<'a> Realizer<'a> {
                         ),
                     )
                 })?;
-                let sink = instance.sink(port, &source_ids).ok_or_else(|| {
+                // **The pin's own drivers, not the net's.** A component grows
+                // by sharing a pin, so one `st.dma` request line wired to two
+                // streams merges every other request on those streams' nets
+                // into one blob; handing each sink the whole blob would have a
+                // stream served by a peripheral no `wire` statement ever
+                // connected to it. On the silicon each input has its own OR
+                // gate over the lines that reach it, and this is that gate.
+                // For a net where every driver does reach every receiver —
+                // which is every shared-interrupt line in this tree — the two
+                // lists are the same.
+                let mine = drivers_of(&edges, &ids, pin);
+                let sink = instance.sink(port, &mine).ok_or_else(|| {
                     config(
                         built.path.clone(),
                         format!("no input pin `{port}` on this device"),
@@ -1741,6 +1758,22 @@ impl<'a> Realizer<'a> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// The wire ids of the sources a `wire` statement points at `pin`.
+///
+/// Sorted and deduplicated, so a [`FanIn`](crate::core::wire::FanIn) built from
+/// it is identical across runs and two statements naming the same driver twice
+/// collapse — which is what `wire a.out -> b.in` written twice means.
+fn drivers_of(edges: &[(usize, usize)], ids: &[WireId], pin: usize) -> Vec<WireId> {
+    let mut out: Vec<WireId> = edges
+        .iter()
+        .filter(|(_, to)| *to == pin)
+        .map(|(from, _)| ids[*from])
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
 
 /// Interned wire pins with a union-find over them.
 #[derive(Debug, Default)]

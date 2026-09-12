@@ -521,11 +521,19 @@ pub trait Device: Send + Sync + fmt::Debug {
 
     /// The sink for input pin `port`, and the line the device knows it by.
     ///
-    /// `sources` is every id that will drive this pin's net. §4.3 requires a
-    /// sink to track *which* sources are asserting — that is what makes
-    /// wired-OR correct when one source deasserts — and a `FanIn` is told its
-    /// sources at construction, while a device is constructed long before any
-    /// `WireId` exists. This call is the only moment both are known.
+    /// `sources` is every id a `wire` statement points at **this pin**. §4.3
+    /// requires a sink to track *which* sources are asserting — that is what
+    /// makes wired-OR correct when one source deasserts — and a `FanIn` is told
+    /// its sources at construction, while a device is constructed long before
+    /// any `WireId` exists. This call is the only moment both are known.
+    ///
+    /// This pin's drivers, not the net's, and the distinction only appears on a
+    /// net whose component is larger than its statements: one driver wired to
+    /// two inputs merges both inputs' nets, and the other input's drivers are
+    /// then on this pin's net without ever having been wired to it. The wire
+    /// still delivers them here — the net is one `Wire` — and a `FanIn` built
+    /// from this list ignores them, which is the OR gate the silicon has on
+    /// each input.
     fn sink(&self, _port: &str, _sources: &[WireId]) -> Option<SinkPin> {
         None
     }
