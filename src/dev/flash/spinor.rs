@@ -50,7 +50,7 @@
 //!
 //! That is now this part's choice rather than the fabric's limit.
 //! `bus::spi` carries a per-phase [`Lines`](crate::bus::spi::Lines) on
-//! [`SpiSlave::transfer_wide`](crate::bus::spi::SpiSlave::transfer_wide), and
+//! [`SpiSlave::transfer_wide`], and
 //! [`psram.qspi`](crate::dev::psram) reads it — it has to, because its command
 //! set stops being decodable in the wrong width. A NOR flash's does not: every
 //! opcode here is a one-line opcode and the width only changes what the frame
