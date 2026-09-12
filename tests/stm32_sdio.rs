@@ -25,6 +25,13 @@
 //!   unwritten — with `DATAEND` set, so the SDIO would look fine.
 //! * A transfer that completes inside the store that arms it. The `TCIF` wait
 //!   loop below really spins: one beat costs one tick of the DMA's clock domain.
+//! * **A `PFCTRL` that is stored and ignored.** The last pair of tests arms one
+//!   stream twice over — same wiring, same block, same oversized `SxNDTR`, only
+//!   `SxCR.PFCTRL` differing — and the transfer ends on the card's last word in
+//!   one and never ends in the other. That is RM0090 §10.3.2 having an effect,
+//!   and it is only reachable through a real card: the signal is
+//!   `DmaPeripheral::dma_last`, which on this block means the FIFO holding its
+//!   final word, and nothing but a card decides when that is.
 //!
 //! The firmware **polls** rather than taking an interrupt, because a trap
 //! handler hand-assembled here would be testing the hart.
@@ -132,6 +139,37 @@ const BUF_B: u32 = RAM + 0x2000;
 const FLAG: u32 = RAM + 0x3000;
 const DIFF: u32 = RAM + 0x3004;
 const LAST_STA: u32 = RAM + 0x3008;
+/// Where the flow-control firmware reports `LISR`, `SxNDTR` and `SxCR` as they
+/// stood when it stopped waiting.
+const LAST_LISR: u32 = RAM + 0x300c;
+const LAST_NDTR: u32 = RAM + 0x3010;
+const LAST_CR: u32 = RAM + 0x3014;
+
+/// `SxCR.PFCTRL`, RM0090 §10.5.5 bit 5: the peripheral is the flow controller.
+const PFCTRL: u32 = 1 << 5;
+/// `SxCR.EN`.
+const CR_EN: u32 = 1;
+
+/// What the flow-control firmware programs into `SxNDTR`.
+///
+/// **Deliberately larger than the block.** A 512-byte block is 128 words; this
+/// is 192, so sixty-four items of the count are surplus. That is the shape ST's
+/// own F4 SD driver arms — under `PFCTRL` the count is a *maximum* (RM0090
+/// §10.3.2) and the card decides how much data there is — and it is what makes
+/// "the peripheral ended the transfer" distinguishable from "the count ran
+/// out": if the count had ended it, `NDTR` would read zero.
+const OVERSIZED_WORDS: u32 = 192;
+/// The surplus that must still be sitting in `NDTR` afterwards.
+const SURPLUS_WORDS: u32 = OVERSIZED_WORDS - 512 / 4;
+
+/// How many times the flow-control firmware polls `LISR` before giving up.
+///
+/// It has to be bounded, because the negative half of the pair is the case
+/// where `TCIF` never arrives — an unbounded spin there would be a test that
+/// hangs rather than one that fails. A block is 128 beats at 25 MHz, about
+/// 5 µs, and the loop is five instructions at 100 MHz, so the positive case
+/// leaves after a hundred-odd turns; this is three orders of magnitude more.
+const POLL_LIMIT: u32 = 100_000;
 
 const MAGIC: u32 = 0x5d_10_de_00;
 
@@ -314,35 +352,44 @@ fn transfer(code: &mut Vec<u32>, buffer: u32, cr: u32, dctrl: u32, index: u32, b
     code.push(sw(A0, T2, 0));
 }
 
-/// The program.
-fn firmware() -> Vec<u8> {
-    let mut code: Vec<u32> = Vec::new();
+/// Set the three base registers up and walk the card through identification.
+///
+/// `T0` ends holding the SDIO base, `T3` DMA2's, `T2` the address the last
+/// `SDIO_STA` is reported through, and the card is addressed, on a four-bit bus
+/// and at the transfer clock.
+fn identify(code: &mut Vec<u32>) {
     code.extend_from_slice(&li(T0, SDIO));
     code.extend_from_slice(&li(T3, DMA2));
     code.extend_from_slice(&li(T2, LAST_STA));
 
     // Power the card and run the bus at the identification clock: 48 MHz over
     // 118 + 2 is 400 kHz, which is what a driver programs.
-    set(&mut code, R_POWER, POWER_ON);
-    set(&mut code, R_CLKCR, 118);
+    set(code, R_POWER, POWER_ON);
+    set(code, R_CLKCR, 118);
 
     // The identification sequence of Physical Layer §4.2, in the v1 encoding.
-    command(&mut code, 0, 0, 0); // CMD0  GO_IDLE_STATE, no response
-    command(&mut code, 8, 0x1aa, SHORT); // CMD8  SEND_IF_COND, R7
-    command(&mut code, 55, 0, SHORT); // CMD55 APP_CMD, R1
-    command(&mut code, 41, 0x40ff_8000, SHORT); // ACMD41 with HCS, R3 → CCRCFAIL
-    command(&mut code, 2, 0, LONG); // CMD2  ALL_SEND_CID, R2
+    command(code, 0, 0, 0); // CMD0  GO_IDLE_STATE, no response
+    command(code, 8, 0x1aa, SHORT); // CMD8  SEND_IF_COND, R7
+    command(code, 55, 0, SHORT); // CMD55 APP_CMD, R1
+    command(code, 41, 0x40ff_8000, SHORT); // ACMD41 with HCS, R3 → CCRCFAIL
+    command(code, 2, 0, LONG); // CMD2  ALL_SEND_CID, R2
 
-    command(&mut code, 3, 0, SHORT); // CMD3 SEND_RELATIVE_ADDR, R6
+    command(code, 3, 0, SHORT); // CMD3 SEND_RELATIVE_ADDR, R6
     // R6's top half is the published address, and the card ignores the rest of a
     // CMD7 argument, so the whole word can be handed straight back.
     code.push(lw(T1, T0, R_RESP1));
-    command_addressed(&mut code, 7, SHORT); // CMD7 SELECT_CARD
-    command_addressed(&mut code, 55, SHORT); // CMD55 APP_CMD
-    command(&mut code, 6, 0b10, SHORT); // ACMD6 SET_BUS_WIDTH, four bits
-    command(&mut code, 16, 512, SHORT); // CMD16 SET_BLOCKLEN
+    command_addressed(code, 7, SHORT); // CMD7 SELECT_CARD
+    command_addressed(code, 55, SHORT); // CMD55 APP_CMD
+    command(code, 6, 0b10, SHORT); // ACMD6 SET_BUS_WIDTH, four bits
+    command(code, 16, 512, SHORT); // CMD16 SET_BLOCKLEN
     // Four-bit bus and the transfer clock, now that identification is over.
-    set(&mut code, R_CLKCR, (0b01 << 11) | (1 << 8));
+    set(code, R_CLKCR, (0b01 << 11) | (1 << 8));
+}
+
+/// The program.
+fn firmware() -> Vec<u8> {
+    let mut code: Vec<u32> = Vec::new();
+    identify(&mut code);
 
     // Read a block, write it somewhere else, read that back — every one of the
     // three through DMA2, and the FIFO never named by the program.
@@ -382,6 +429,76 @@ fn firmware() -> Vec<u8> {
     bytes
 }
 
+/// A program that arms **one** flow-controlled read and reports what the stream
+/// looked like when it stopped.
+///
+/// The pair of tests below run this with `PFCTRL` set and clear and compare;
+/// everything else about the two runs is identical, which is what makes the
+/// comparison mean anything.
+fn flow_control_firmware(pfctrl: bool) -> Vec<u8> {
+    let mut code: Vec<u32> = Vec::new();
+    identify(&mut code);
+
+    // Arm stream 3 at the FIFO with an oversized count. `PINC` is clear, so
+    // `CPAR` stays on the peripheral's data register.
+    set_at(&mut code, T3, R_LIFCR, S3_FLAGS);
+    set_at(&mut code, T3, s_par(3), SDIO + R_FIFO);
+    set_at(&mut code, T3, s_m0ar(3), BUF_A);
+    set_at(&mut code, T3, s_ndtr(3), OVERSIZED_WORDS);
+    set_at(
+        &mut code,
+        T3,
+        s_cr(3),
+        if pfctrl { CR_READ | PFCTRL } else { CR_READ },
+    );
+
+    // `DTEN` first, then `CMD17`: this block has no `CMDTRANS`, so the DPSM
+    // waits on DAT until the command goes out.
+    set(&mut code, R_DTIMER, 0x00ff_ffff);
+    set(&mut code, R_DLEN, 512);
+    set(&mut code, R_DCTRL, DCTRL_READ);
+    command(&mut code, 17, SOURCE_BLOCK, SHORT);
+
+    // Poll `LISR.TCIF3` a bounded number of times. The flag is out of reach of a
+    // twelve-bit immediate, so it comes down to bit zero rather than being
+    // masked in place.
+    code.extend_from_slice(&li(A2, POLL_LIMIT));
+    let wait = code.len();
+    code.push(lw(A0, T3, R_LISR));
+    code.push(srli(A0, A0, TCIF3_SHIFT));
+    code.push(andi(A0, A0, 1));
+    // Out of the loop, over the two instructions that close it.
+    code.push(bne(A0, ZERO, 12));
+    code.push(addi(A2, A2, -1));
+    let back = -(((code.len() - wait) * 4) as i32);
+    code.push(bne(A2, ZERO, back));
+
+    // Three registers, as the guest sees them: whether the stream said it had
+    // finished, what was left of the count, and whether `EN` is still up.
+    for (offset, at) in [
+        (R_LISR, LAST_LISR),
+        (s_ndtr(3), LAST_NDTR),
+        (s_cr(3), LAST_CR),
+    ] {
+        code.push(lw(A0, T3, offset));
+        code.extend_from_slice(&li(T1, at));
+        code.push(sw(A0, T1, 0));
+    }
+    code.push(lw(A0, T0, R_STA));
+    code.push(sw(A0, T2, 0));
+
+    code.extend_from_slice(&li(T1, FLAG));
+    code.extend_from_slice(&li(A0, MAGIC));
+    code.push(sw(A0, T1, 0));
+    code.push(jal(ZERO, 0));
+
+    let mut bytes = Vec::with_capacity(code.len() * 4);
+    for word in code {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
 /// What the card holds when the machine starts.
 ///
 /// Generated rather than committed: a test image is not something to keep in the
@@ -397,8 +514,15 @@ fn card_image() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn boot(slot_name: &str) -> (Machine, alloc::sync::Arc<rsemu::dev::sd::slots::Slot>) {
+    boot_with(slot_name, firmware())
+}
+
+fn boot_with(
+    slot_name: &str,
+    image: Vec<u8>,
+) -> (Machine, alloc::sync::Arc<rsemu::dev::sd::slots::Slot>) {
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
-    options.realize.media.insert("firmware", firmware());
+    options.realize.media.insert("firmware", image);
     options.realize.media.insert("card", card_image());
     options
         .resolve
@@ -510,4 +634,88 @@ fn the_transfer_takes_bus_time_rather_than_finishing_inside_a_store() {
         .expect("it runs");
     assert_ne!(peek(&machine, FLAG), MAGIC, "nowhere near finished");
     assert!(run_until_done(&mut machine), "and it does finish");
+}
+
+// ---------------------------------------------------------------------------
+// Peripheral flow control
+// ---------------------------------------------------------------------------
+
+/// What one run of [`flow_control_firmware`] reports.
+struct FlowRun {
+    /// Whether `LISR.TCIF3` was up: the stream said the transfer was over.
+    complete: bool,
+    /// `SxNDTR`, in items.
+    remaining: u32,
+    /// Whether `SxCR.EN` was still set.
+    enabled: bool,
+    /// The block the stream put in RAM.
+    buffer: Vec<u8>,
+}
+
+fn run_flow_controlled(slot_name: &str, pfctrl: bool) -> FlowRun {
+    let (mut machine, _slot) = boot_with(slot_name, flow_control_firmware(pfctrl));
+    assert!(
+        run_until_done(&mut machine),
+        "the firmware never reached its end; the last SDIO_STA it saw was {:#010x}",
+        peek(&machine, LAST_STA)
+    );
+    FlowRun {
+        complete: peek(&machine, LAST_LISR) & (1 << TCIF3_SHIFT) != 0,
+        remaining: peek(&machine, LAST_NDTR),
+        enabled: peek(&machine, LAST_CR) & CR_EN != 0,
+        buffer: peek_bytes(&machine, BUF_A, 512),
+    }
+}
+
+#[test]
+fn the_card_ends_a_pfctrl_transfer_and_the_count_never_reaches_zero() {
+    // RM0090 §10.3.2, peripheral flow control, against the peripheral it exists
+    // for: ST's own F4 SD driver arms the SDIO streams this way because the
+    // *card* decides how much data there is, and `SxNDTR` is then only a
+    // ceiling. Here the ceiling is fifty per cent too high on purpose.
+    let run = run_flow_controlled("sdio-board-pfctrl", true);
+
+    let image = card_image();
+    assert_eq!(
+        run.buffer,
+        &image[512..1024],
+        "every byte of the block still landed"
+    );
+    assert!(
+        run.complete,
+        "TCIF3 never came up: the SDIO's last word did not end the transfer"
+    );
+    assert!(!run.enabled, "and EN came down with it (RM0090 §10.3.2)");
+    assert_eq!(
+        run.remaining, SURPLUS_WORDS,
+        "the count stopped with its surplus unconsumed — had it been the count \
+         that ended the transfer, this would be zero"
+    );
+}
+
+#[test]
+fn without_pfctrl_the_same_oversized_count_leaves_the_stream_asking() {
+    // The companion, so the assertion above cannot pass for the wrong reason.
+    // The wiring, the block, the count and the program are identical; only
+    // `PFCTRL` differs. With the stream as flow controller nobody can tell it
+    // the card has finished, so it sits on sixty-four items it will never be
+    // offered — which is the bug `PFCTRL` exists to avoid, and the reason a
+    // driver that guesses `NDTR` has to guess it exactly.
+    let run = run_flow_controlled("sdio-board-no-pfctrl", false);
+
+    let image = card_image();
+    assert_eq!(
+        run.buffer,
+        &image[512..1024],
+        "the block arrived either way: this is about who ends the transfer"
+    );
+    assert!(
+        !run.complete,
+        "TCIF3 came up without PFCTRL, so the PFCTRL case proves nothing"
+    );
+    assert!(run.enabled, "the stream is still armed, waiting for more");
+    assert_eq!(
+        run.remaining, SURPLUS_WORDS,
+        "and stalled at the same point, with no one to say it was over"
+    );
 }
