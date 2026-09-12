@@ -4,15 +4,15 @@
 //! | --- | --- | --- |
 //! | [`scanout`] | `dev-lcdc` | a generic parallel-RGB scanout engine: geometry, pixel format, framebuffer base, frame period |
 //! | [`demo`] | `dev-lcdc` | the `spi-panel` board's demo firmware, assembled at compile time |
-//! | [`panel`] | `dev-ssd1306` | the seam a **smart panel** presents: a controller that owns its own framebuffer |
+//! | [`panel`] | `dev-ssd1306`, `dev-st77xx` | the seam a **smart panel** presents: a controller that owns its own framebuffer |
 //!
 //! Those are the two kinds of display device and they need different seams —
 //! [`panel`] is where the difference is written down.
 //!
 //! `no_std + alloc`, no dependencies.
 
-#[cfg(feature = "dev-ssd1306")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dev-ssd1306")))]
+#[cfg(any(feature = "dev-ssd1306", feature = "dev-st77xx"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "dev-ssd1306", feature = "dev-st77xx"))))]
 pub mod panel;
 
 #[cfg(feature = "dev-lcdc")]

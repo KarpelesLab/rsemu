@@ -8,7 +8,11 @@
 //! contrast, brightness, scan direction, standby. Pixels arrive on a separate
 //! parallel-RGB input (DCLK, HSYNC, VSYNC, DE and up to twenty-four data
 //! lines). It is emphatically *not* an ST7735 or ST7789, which stream
-//! framebuffer content over SPI into their own GRAM.
+//! framebuffer content over SPI into their own GRAM — those are `st77xx`, a
+//! separate model in this same module under its own feature, and the difference
+//! between the two files is the difference `dev::lcd::panel` exists to express.
+//! (Plain code spans rather than links: that module is not compiled into a
+//! build that has only this one.)
 //!
 //! This was checked rather than assumed, and here is the evidence from the
 //! datasheet (Sitronix **ST7272A**, version 0.5, 2018/05):

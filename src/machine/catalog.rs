@@ -231,6 +231,19 @@ pub static OLED_SPI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/oled-spi.machine"),
 };
 
+/// The `tft-spi` board, when this build has the SPI bus and an ST77xx.
+///
+/// `oled-spi`'s colour twin, and the same shape: no processor, one controller,
+/// one panel that owns its own frame memory.
+#[cfg(feature = "machine-tft-spi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-tft-spi")))]
+pub static TFT_SPI: CatalogEntry = CatalogEntry {
+    name: "tft-spi",
+    summary: "the smallest ST7789 board: an SPI controller and a 240x240 TFT that owns its picture",
+    media: &[],
+    source: include_str!("../../machines/tft-spi.machine"),
+};
+
 /// The `spi-flash` board, when this build has a hart, the SPI bus and the
 /// serial-flash devices.
 ///
@@ -801,6 +814,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&SMS_PAL);
     #[cfg(feature = "machine-oled-spi")]
     out.push(&OLED_SPI);
+    #[cfg(feature = "machine-tft-spi")]
+    out.push(&TFT_SPI);
     #[cfg(feature = "machine-spi-panel")]
     out.push(&SPI_PANEL);
     #[cfg(feature = "machine-spi-flash")]
@@ -986,7 +1001,7 @@ pub fn registry() -> Result<Registry> {
     crate::dev::dfuse::register(&mut reg)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::register(&mut reg)?;
-    #[cfg(feature = "dev-st7272a")]
+    #[cfg(any(feature = "dev-st7272a", feature = "dev-st77xx"))]
     crate::dev::sitronix::register(&mut reg)?;
     #[cfg(feature = "dev-ssd1306")]
     crate::dev::solomon::register(&mut reg)?;
@@ -1122,7 +1137,7 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::dfuse::bind(&mut b)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::bind(&mut b)?;
-    #[cfg(feature = "dev-st7272a")]
+    #[cfg(any(feature = "dev-st7272a", feature = "dev-st77xx"))]
     crate::dev::sitronix::bind(&mut b)?;
     #[cfg(feature = "dev-ssd1306")]
     crate::dev::solomon::bind(&mut b)?;
@@ -1257,7 +1272,7 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "bus-spi")]
     table.insert(crate::bus::spi::controller::schema());
-    #[cfg(feature = "dev-st7272a")]
+    #[cfg(any(feature = "dev-st7272a", feature = "dev-st77xx"))]
     for schema in crate::dev::sitronix::schemas() {
         table.insert(schema);
     }

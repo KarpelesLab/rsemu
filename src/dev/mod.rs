@@ -26,10 +26,10 @@
 //! | [`nvme`] | `dev-nvme` | an NVM Express controller: a PCI function that DMA-walks its own queues |
 //! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
-//! | [`lcd`] | `dev-lcdc`, `dev-ssd1306` | display controllers: a generic RGB scanout engine, and the device-owned-framebuffer seam every smart panel presents |
+//! | [`lcd`] | `dev-lcdc`, `dev-ssd1306`, `dev-st77xx` | display controllers: a generic RGB scanout engine, and the device-owned-framebuffer seam every smart panel presents |
 //! | [`solomon`] | `dev-ssd1306` | the SSD1306/SSD1309 and SH1106 monochrome OLED: its own GDDRAM over SPI or I²C |
 //! | [`linuxboot`] | `dev-linuxboot` | the Linux/x86 boot protocol: a bzImage into memory and a stub that enters it |
-//! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
+//! | [`sitronix`] | `dev-st7272a`, `dev-st77xx` | the ST7272A TFT panel driver, which holds no picture, and the ST7789/ST7735, which hold theirs |
 //! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port, a USART, and — under their own features — the reset/clock and power controllers |
 //! | [`q35`] | `dev-q35` | the q35 chipset: an 82Q35 (G)MCH, an ICH9 LPC bridge, ECAM, and the ACPI table generator |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, and the device tree generator |
@@ -122,8 +122,11 @@ pub mod pc;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
 pub mod ppu;
 
-#[cfg(any(feature = "dev-lcdc", feature = "dev-ssd1306"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "dev-lcdc", feature = "dev-ssd1306"))))]
+#[cfg(any(feature = "dev-lcdc", feature = "dev-ssd1306", feature = "dev-st77xx"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "dev-lcdc", feature = "dev-ssd1306", feature = "dev-st77xx")))
+)]
 pub mod lcd;
 
 #[cfg(feature = "dev-linuxboot")]
@@ -134,8 +137,8 @@ pub mod linuxboot;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-dfuse")))]
 pub mod dfuse;
 
-#[cfg(feature = "dev-st7272a")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dev-st7272a")))]
+#[cfg(any(feature = "dev-st7272a", feature = "dev-st77xx"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "dev-st7272a", feature = "dev-st77xx"))))]
 pub mod sitronix;
 
 #[cfg(feature = "dev-ssd1306")]

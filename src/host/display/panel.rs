@@ -178,6 +178,8 @@ pub mod capture {
         alloc::vec![
             #[cfg(feature = "dev-ssd1306")]
             crate::dev::solomon::ssd1306::SSD1306_PANEL,
+            #[cfg(feature = "dev-st77xx")]
+            crate::dev::sitronix::st77xx::ST77XX_PANEL,
         ]
     }
 

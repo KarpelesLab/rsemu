@@ -694,6 +694,24 @@ dev-st7272a = ["bus-spi"]
 # `bus-i2c`. `no_std + alloc`, no dependencies.
 dev-ssd1306 = ["bus-spi", "bus-i2c"]
 
+# The Sitronix ST7789/ST7789V and ST7735/ST7735S (src/dev/sitronix/st77xx.rs):
+# the 240x320 and 128x160 colour TFT controllers on every small IPS module. Like
+# `dev-ssd1306` and **unlike `dev-st7272a`**, this part holds the picture: frame
+# memory lives in the controller and a guest fills it over the same SPI it
+# configures the part with, so it presents the device-owned framebuffer seam of
+# `src/dev/lcd/panel.rs` rather than reading guest RAM.
+#
+# Covers the MIPI DCS command set of ST7789V datasheet v1.0 ch. 7-9 --
+# CASET/RASET windowed RAMWR with its wrap, MADCTL orientation (MV really does
+# turn the *window*, not just the picture), COLMOD at 12, 16 and 18 bits,
+# inversion, partial mode, vertical scroll, idle mode, sleep, and RDDID/RDDST/
+# RAMRD read-back through `SpiSlave`'s full-duplex answer. Commands are
+# distinguished from parameters by the D/CX pin rather than by a parameter
+# count, exactly as the silicon does, so a fourteen-parameter gamma table cannot
+# desynchronise the stream. Both SPI framings: 4-line with a D/CX wire and
+# 3-line with D/CX as the first of nine bits. Needs `bus-spi`. `no_std + alloc`,
+# no dependencies.
+dev-st77xx = ["bus-spi"]
 
 # A generic RGB scanout engine (src/dev/lcd): the half of a display path that
 # owns *where the pixels are* — a framebuffer base in an address space, a
@@ -725,6 +743,14 @@ machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
 # captures the picture through `host::display::panel`. Adds no dependencies.
 machine-oled-spi = ["bus-spi", "dev-ssd1306"]
 
+# The `tft-spi` board (machines/tft-spi.machine plus the classes it names):
+# `oled-spi`'s colour twin -- an SPI controller and an ST7789 on the far end of
+# it, no processor, and the same argument for both. It exists so the ST77xx's
+# windowed writes, MADCTL rotation and read-back have somewhere a driver can
+# reach them the way a driver does, and so `tests/tft_panel.rs` can clock a real
+# frame down a real SPI link and capture the picture through
+# `host::display::panel`. Adds no dependencies.
+machine-tft-spi = ["bus-spi", "dev-st77xx"]
 
 # The translation IR (src/ir): the architecture-neutral op set every CPU
 # frontend lifts into and every JIT backend lowers from, its typed SSA blocks,

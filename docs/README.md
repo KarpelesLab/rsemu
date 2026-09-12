@@ -170,9 +170,10 @@ losing 7 700–10 800 of 40 000 to prove the two really collided.
 whole argument, including what a parallel run is checked by when a state hash
 is not available.
 
-Boards with no page here — `pc-apic`, `spi-flash`, `spi-panel`, `arm926`,
-`a64-mini`, `mips-mini`, `z80-mini`, `m68k-mini`, `ne2k-mini`, `nvme-mini`,
-`ahci-mini`, `usb-mini`, `xhci-mini`, `xhci-pci-mini`, `hub-mini` — are
+Boards with no page here — `pc-apic`, `spi-flash`, `spi-panel`, `oled-spi`,
+`tft-spi`, `arm926`, `a64-mini`, `mips-mini`, `z80-mini`, `m68k-mini`,
+`ne2k-mini`, `nvme-mini`, `ahci-mini`, `usb-mini`, `xhci-mini`,
+`xhci-pci-mini`, `hub-mini` — are
 synthetic: the smallest machine that exercises one subsystem, described in
 `machines/*.machine` and in the `Cargo.toml` comment on their feature. They boot
 a guest this repository builds, and there is nothing about them a platform page

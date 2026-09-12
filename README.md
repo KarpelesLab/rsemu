@@ -445,8 +445,11 @@ Cortex-M4's own bus and no DMA reaches it, so `dmabus` has SRAM and the
 peripherals in it and no CCM, and a stream pointed at `0x10000000` raises a
 transfer error exactly as the silicon does.
 
-Beside them are the fifteen synthetic boards, each the smallest
-machine that exercises one thing: `spi-panel` (a display path over SPI),
+Beside them are the seventeen synthetic boards, each the smallest
+machine that exercises one thing: `spi-panel` (a display path over SPI, with a
+panel whose pixels are in guest RAM), `oled-spi` and `tft-spi` (an SSD1306 and
+an ST7789, the first two devices here that hold their *own* framebuffer and are
+filled by commands on a bus rather than by guest stores),
 `spi-flash` (an RV32 program that programs a Winbond part through an OCTOSPI
 window and then *executes out of it*), `arm926` (an ARM926EJ-S with CP15, the
 VMSAv5 MMU and a parameterised peripheral aperture, the starting point for a
