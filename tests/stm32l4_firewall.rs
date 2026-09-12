@@ -1,15 +1,18 @@
-//! The STM32L4 Firewall on a board, with the two wires that are only a board.
+//! The STM32L4 Firewall on a board, with the three wires that are only a board.
 //!
 //! `src/dev/stm32/firewall/tests.rs` proves the state machine. This proves the
 //! machine layer carries it: that clearing `SYSCFG_CFGR1.FWDIS` reaches the
-//! firewall over a wire and switches it on, that an illegal access pulses a
-//! reset line the board drew to the core *and* to `rcc.fwrst`, and that
-//! `RCC_CSR.FWRSTF` therefore says what rebooted the part.
+//! firewall over a wire and switches it on, that `RCC_APB2ENR.FWEN` reaches it
+//! over another and is what gives the register block a clock, that an illegal
+//! access pulses a reset line the board drew to the core *and* to `rcc.fwrst`,
+//! and that `RCC_CSR.FWRSTF` therefore says what rebooted the part.
 //!
-//! Neither of those can fail in a unit test and neither can fail loudly: a
-//! board that forgot `wire syscfg.fwdis -> fw.fwdis` has a firewall that
-//! protects nothing, and one that forgot `wire fw.reset -> rcc.fwrst` has a
-//! firmware that cannot tell a firewall reset from a power-on.
+//! None of those can fail in a unit test and none can fail loudly: a board that
+//! forgot `wire syscfg.fwdis -> fw.fwdis` has a firewall that protects nothing,
+//! one that forgot `wire rcc.apb2en7 -> fw.clken` has one whose registers
+//! answer before its clock exists, and one that forgot
+//! `wire fw.reset -> rcc.fwrst` has a firmware that cannot tell a firewall
+//! reset from a power-on.
 //!
 //! The accesses are made over the bus rather than by running a program, which
 //! is the same choice `tests/stm32f407_wiring.rs` makes for the peripherals it
@@ -51,6 +54,10 @@ const CSR: u64 = RCC + 0x94;
 const FWRSTF: u64 = 1 << 24;
 /// `RCC_CSR.RMVF`, which clears the reset flags. Bit 23 on an L4.
 const RMVF: u64 = 1 << 23;
+/// `RCC_APB2ENR` (RM0351 §6.4.16).
+const APB2ENR: u64 = RCC + 0x60;
+/// `RCC_APB2ENR.FWEN`, the firewall's clock gate.
+const FWEN: u64 = 1 << 7;
 
 /// The code segment: 0x08001000, 0x400 bytes.
 const CSSA: u64 = 0x0000_1000;
@@ -61,10 +68,16 @@ const NVDSSA: u64 = 0x0000_2000;
 /// Its length.
 const NVDSL: u64 = 0x0000_0200;
 
-/// The call gate: the first word of the code segment.
-const GATE: u64 = 0x0800_0000 + CSSA;
+/// The code segment's base: the call gate's dummy first word.
+const CODE: u64 = 0x0800_0000 + CSSA;
+/// The call gate's entry — the *second* word of the segment (RM0351 §4.3.6).
+const GATE: u64 = CODE + 4;
+/// Its third word, which has to be the very next fetch.
+const GATE_3RD: u64 = CODE + 8;
 /// The middle of the protected routine, which is not a legal entry point.
-const INSIDE_CODE: u64 = GATE + 8;
+const INSIDE_CODE: u64 = CODE + 0x20;
+/// An interrupt handler, in the unprotected flash where §4.3.2 wants it.
+const HANDLER: u64 = 0x0800_0000 + 0x200;
 /// Unprotected flash, where the caller lives.
 const OUTSIDE: u64 = 0x0800_0000 + 0x100;
 /// The first word of the protected data.
@@ -111,8 +124,18 @@ fn peek(m: &Machine, addr: u64) -> u64 {
         .expect("a mapped word")
 }
 
+/// Walk the call gate: `CSSA + 4` then `CSSA + 8`, back to back.
+fn enter(m: &Machine) {
+    fetch(m, GATE).expect("the gate's second word");
+    fetch(m, GATE_3RD).expect("and its third");
+}
+
 /// Program the two flash segments and enable the firewall.
+///
+/// Step 1 of RM0351 §4.3.5's procedure first: without `RCC_APB2ENR.FWEN` the
+/// block is unclocked and the segment writes go nowhere.
 fn arm(m: &Machine) {
+    store(m, APB2ENR, FWEN).expect("FWEN");
     store(m, FW_CSSA, CSSA).expect("CSSA");
     store(m, FW + 0x04, CSL).expect("CSL");
     store(m, FW + 0x08, NVDSSA).expect("NVDSSA");
@@ -140,6 +163,7 @@ fn clearing_fwdis_over_the_wire_is_what_switches_the_firewall_on() {
     let m = boot();
     assert_eq!(load(&m, CFGR1).ok(), Some(FWDIS), "FWDIS resets high");
 
+    store(&m, APB2ENR, FWEN).expect("FWEN");
     store(&m, FW_CSSA, CSSA).expect("CSSA");
     store(&m, FW + 0x04, CSL).expect("CSL");
     assert!(
@@ -194,7 +218,7 @@ fn the_protected_data_is_reachable_only_through_the_call_gate() {
         Err(BusError::Protected),
         "untrusted code read the protected data"
     );
-    assert!(fetch(&m, GATE).is_ok(), "the call gate");
+    enter(&m);
     assert_eq!(load(&m, NVDS).ok(), Some(0xc0ff_ee00));
 
     // `FW_CR.FPA` is the exit protocol: set it, then leave. Without it the
@@ -216,7 +240,7 @@ fn the_board_snapshots_and_restores_with_the_firewall_open() {
     // worse, reachable.
     let m = boot();
     arm(&m);
-    assert!(fetch(&m, GATE).is_ok());
+    enter(&m);
 
     let bytes = m.save().expect("the machine snapshots");
     let before = m.state_hash().expect("a hash");
@@ -229,4 +253,63 @@ fn the_board_snapshots_and_restores_with_the_firewall_open() {
         "a save/load round trip changed the machine's state hash"
     );
     assert!(load(&other, NVDS).is_ok(), "still open after the restore");
+}
+
+#[test]
+fn an_interrupt_taken_while_open_reaches_rcc_through_the_same_two_wires() {
+    // The interrupt case, end to end on a board, because it is the one place
+    // where a firmware sees the whole story: the handler runs (the firewall
+    // having closed behind it), the return into the protected routine trips the
+    // fence, and `RCC_CSR.FWRSTF` is what says so afterwards.
+    //
+    // RM0351 §4.3.2 and AN4730 §2.2. Nothing here tells the firewall an
+    // exception was taken — there is no such seam and the silicon has no such
+    // rule; the handler's fetch is judged as the ordinary exit it looks like.
+    let m = boot();
+    store(&m, CSR, RMVF).expect("RMVF");
+    arm(&m);
+    enter(&m);
+    assert!(load(&m, NVDS).is_ok(), "open");
+
+    // A call gate that leaves `FPA` set is AN4730's "does not manage the bit
+    // FPA" shape, and it is the one where the interrupt is survivable.
+    store(&m, FW + 0x20, 1).expect("FPA");
+    assert!(fetch(&m, HANDLER).is_ok(), "the handler runs unprotected");
+    assert_eq!(peek(&m, CSR) & FWRSTF, 0, "and nothing reset yet");
+    assert_eq!(
+        load(&m, NVDS),
+        Err(BusError::Protected),
+        "the firewall closed as the handler was entered"
+    );
+
+    // Everything after that is a reset, including the perfectly ordinary
+    // `BX LR` back into the middle of the interrupted routine.
+    store(&m, CSR, RMVF).expect("RMVF");
+    assert_eq!(fetch(&m, INSIDE_CODE), Err(BusError::Protected));
+    assert_ne!(
+        peek(&m, CSR) & FWRSTF,
+        0,
+        "returning into the protected code did not reach `rcc.fwrst`"
+    );
+}
+
+#[test]
+fn the_firewall_hears_nothing_until_rcc_gives_it_a_clock() {
+    // The third wire, and the third thing only a board can test:
+    // `RCC_APB2ENR.FWEN` is step 1 of §4.3.5's procedure, so until it is set
+    // the segment registers swallow every write. A board that forgot
+    // `wire rcc.apb2en7 -> fw.clken` would let a firmware skip the step.
+    let m = boot();
+    assert_eq!(load(&m, APB2ENR).ok(), Some(0), "FWEN resets low");
+
+    store(&m, FW_CSSA, CSSA).expect("CSSA");
+    assert_eq!(
+        load(&m, FW_CSSA).ok(),
+        Some(0),
+        "the block is unclocked and took the write anyway"
+    );
+
+    store(&m, APB2ENR, FWEN).expect("FWEN");
+    store(&m, FW_CSSA, CSSA).expect("CSSA");
+    assert_eq!(load(&m, FW_CSSA).ok(), Some(CSSA), "and now it lands");
 }

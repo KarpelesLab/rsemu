@@ -59,25 +59,86 @@
 //! * **Closed** — the state the firewall enters when it is enabled. Any access
 //!   to the code segment or to the non-volatile data segment, and any access to
 //!   the volatile data segment unless `FW_CR.VDS` says it is shared, is a
-//!   system reset. The one exception is a **fetch of the first word of the code
-//!   segment**: that is the call gate, the single entry point, and it opens the
-//!   firewall.
+//!   system reset. The one way in is the call gate.
 //! * **Opened** — the protected segments are reachable. It stays open until the
-//!   processor fetches an instruction outside the code segment (and outside the
-//!   volatile data segment, if `VDE` allows execution there).
+//!   processor fetches an instruction outside the protected code — the code
+//!   segment, and the volatile data segment while `VDE = 1` and `VDS = 0`.
 //!
-//! Leaving the code segment is where `FPA` earns its name. Quoting ST's own
-//! HAL: "when FPA bit is set, any code executed outside the protected segment
-//! will close the Firewall", and "when FPA bit is reset, any code executed
-//! outside the protected segment when the Firewall is opened will generate a
-//! system reset". So the exit protocol is: set `FPA`, then branch out. The
-//! hardware clears `FPA` as it closes, so the next exit needs its own.
+//! # The call gate is three words and the entry is the second
 //!
-//! **An interrupt taken while the firewall is open is an exit like any other.**
-//! The exception's vector fetch lands outside the code segment and the firewall
-//! judges it by `FPA`, which is why ST's guidance is to keep interrupts masked
-//! inside the protected code. This model does not give an exception entry a
-//! special case; see "What is not modelled".
+//! RM0351 §4.3.6 "call gate sequence" is precise about this, and it is the part
+//! that is easy to get wrong:
+//!
+//! > The "call gate" is composed of 3 words located on the first three 32-bit
+//! > addresses of the base address of the code segment and of the Volatile data
+//! > segment if it is declared as not shared (VDS = 0) and executable
+//! > (VDE = 1). – 1st word: Dummy 32-bit words always closed in order to
+//! > protect the "call gate" opening from an access due to a prefetch buffer.
+//! > – 2nd and 3rd words: 2 specific 32-bit words called "call gate" and always
+//! > opened.
+//!
+//! So the entry point is **`CSSA + 4`**, not `CSSA`, and the first word exists
+//! precisely to be forbidden: a prefetch buffer running ahead of a branch to
+//! `CSSA + 4` would otherwise open the gate by accident. Opening takes **two**
+//! fetches, `CSSA + 4` then `CSSA + 8`, with nothing in between:
+//!
+//! > The 2nd word and 3rd word execution must not be interrupted by any
+//! > intermediate instruction fetch; otherwise, the Firewall is not considered
+//! > open and comes back to a close state. Then, executing the 3rd word after
+//! > receiving the intermediate instruction fetch would generate a system reset
+//! > as a consequence.
+//!
+//! which is modelled literally: a fetch of `+4` arms the sequence, a fetch of
+//! `+8` while armed opens the firewall, any other fetch disarms it, and a fetch
+//! of `+8` that is not armed is a reset. That is also the honest answer to "the
+//! gate's words are not required to be `NOP`s" — the hardware never looks at
+//! what is *written* there. What it checks is the order of the fetches, and a
+//! model can check exactly that.
+//!
+//! The volatile data segment carries a gate of its own on the same three words
+//! from `VDSSA`, but only while it is executable and not shared (`VDE = 1`,
+//! `VDS = 0`); a shared segment needs no gate because nothing fences it.
+//!
+//! # Closing it, and what an interrupt does
+//!
+//! Leaving the protected code is where `FPA` earns its name. RM0351 §4.3.6,
+//! "Closing the Firewall": the protected code writes the Firewall Pre Arm Flag
+//! and then jumps to any executable location outside the segments, and "if the
+//! Firewall Pre Arm Flag is not set when the protected code jumps to a non
+//! protected segment, a reset is generated". The hardware clears `FPA` as it
+//! closes, so the next exit needs its own.
+//!
+//! **An interrupt is not a special case, and that is the whole of it.** The
+//! firewall snoops the AMBA bus (§4.3.1). It sees a fetch outside the code
+//! segment and has no way to know whether a branch or an exception entry put
+//! the processor there, so it judges that fetch by `FPA` like any other exit.
+//! RM0351 §4.3.2, "Interrupts management", states the consequence rather than a
+//! rule of its own:
+//!
+//! > The code protected by the Firewall must not be interruptible. It is up to
+//! > the user code to disable any interrupt source before executing the code
+//! > protected by the Firewall. If this constraint is not respected, if an
+//! > interrupt comes while the protected code is executed (Firewall opened),
+//! > the Firewall will be closed as soon as the interrupt subroutine is
+//! > executed. When the code returns back to the protected code area, a
+//! > Firewall alarm will raise since the "call gate" sequence will not be
+//! > applied and a reset will be generated.
+//!
+//! ST **AN4730** §2.2 splits that into the two `FPA` cases explicitly. With the
+//! flag left set, the handler's first fetch **closes** the firewall and the
+//! *return* into the middle of the protected routine is the reset, "since the
+//! protected code continues from the point where it was interrupted, without
+//! re-opening the FIREWALL through a Call gate sequence". With the flag clear —
+//! which is what AN4730's own Figure 4 call gate does, clearing `FPA` on entry
+//! and setting it again on the way out — "the reset is generated by the
+//! FIREWALL as soon as the interrupt is served".
+//!
+//! Both of those *are* the ordinary-exit rule applied to the handler's fetch.
+//! So the core does not have to tell this device that an exception was taken,
+//! and no seam was added for one: a model that gave an exception entry a case
+//! of its own would be modelling a rule the silicon does not have. §4.3.2
+//! settles the other direction too — "There is no interrupt generated by the
+//! Firewall" — so the reset line is this device's only output.
 //!
 //! # Why this device sits in the bus path
 //!
@@ -96,10 +157,6 @@
 //! map cpubus 0 size 4G = firewall.bus
 //! ```
 //!
-//! A DMA master reaches the segments the same way — map `firewall.bus` into its
-//! space too — and needs no special case here, because a controller never
-//! fetches and every rule that is not about fetches is about addresses alone.
-//!
 //! An access the firewall refuses returns [`BusError::Protected`] *and* pulses
 //! the reset line. The error is not the interesting half: on the part the reset
 //! is asserted and the access never completes, and returning the bytes anyway
@@ -110,27 +167,72 @@
 //! looking at it would be useless, and `ROADMAP.md` §15's invariant 5 forbids
 //! the state change outright.
 //!
+//! # A bus master gets a different window
+//!
+//! A DMA controller is *not* judged by the processor's rules, which is why it
+//! cannot be handed the processor's window:
+//!
+//! > All DMA accesses to the protected segments are forbidden, whatever the
+//! > Firewall state, and generate a system reset. (§4.3.4, and again in §4.2)
+//!
+//! "Whatever the Firewall state" is the whole difference. While the firewall is
+//! open the code segment is readable by the core and still a reset for a
+//! master, so the device publishes a **second** filter region, `dma`, which a
+//! board maps into a master's space:
+//!
+//! ```text
+//! map dmabus 0 size 4G = firewall.dma
+//! ```
+//!
+//! It judges by address alone, in every state, and moves no part of the state
+//! machine — a controller never fetches, so it can neither open the gate nor
+//! close it. Which region an access arrived through is how the firewall knows
+//! which master made it; keying on the requester id in `MemAttrs` instead would
+//! oblige every board to allocate ids that nothing else on an STM32 uses.
+//!
+//! `FW_CR.VDS` is deliberately *not* consulted here. Sharing is a rule about
+//! the processor (Table 18 is a processor table), and the DMA sentence is
+//! unqualified in all three places it appears — §4.2, §4.3.4 and AN4730 §2.1.
+//! The literal reading is the conservative one and it is what is implemented;
+//! if a real design turns out to put a DMA buffer in a shared volatile segment
+//! and run, this is the line to revisit.
+//!
+//! # The clock gate
+//!
+//! `RCC_APB2ENR.FWEN` is bit 7 on an L4, and it is not an ordinary enable:
+//! "Set by software, reset by hardware. Software can only write 1. A write at 0
+//! has no effect" (§6.4.16). It is step 1 of §4.3.5's initialization procedure,
+//! so a firmware that forgets it writes the segment registers into a block that
+//! is not listening.
+//!
+//! A board draws `wire rcc.apb2en7 -> firewall.clken` and the register block
+//! goes dead while that is low: writes are dropped and reads return zero. The
+//! *fence* is not gated, because it cannot need to be — `FWEN` can never be
+//! cleared, so a firewall that reached the enabled state has a clock by
+//! construction. An unwired `clken` is clocked, which is the right default for
+//! a board that did not model its RCC.
+//!
 //! # What is not modelled
 //!
-//! * **The interrupt special case.** RM0351 §4.3.5 discusses what happens when
-//!   an exception is taken with the firewall open; this model treats the
-//!   handler's fetch as an ordinary exit, so with `FPA` clear it resets. That
-//!   is the conservative reading and it matches ST's own advice to mask
-//!   interrupts inside the protected code, but a firmware that relies on the
-//!   documented interrupt behaviour would see a reset this part does not give.
-//! * **The second word of the call gate.** RM0351 describes the gate as two
-//!   words of `NOP`; this model requires only that entry be at the first one
-//!   and does not check what is written there.
-//! * **The firewall's own clock gate.** `RCC_AHB2ENR`/`APB2ENR`'s bit is not
-//!   consulted, as everywhere else in this tree.
+//! * **`FW_CR`'s own access rule.** RM0351 §4.3.5: while `NVDSL` is non-zero
+//!   the configuration register may be reached only when the firewall is
+//!   opened, and AN4730 §1.6 adds that an access in the closed state generates a
+//!   reset. Here `FW_CR` answers in every state.
+//! * **AN4730 §2.3's write-buffer hazard.** On the part, `FPA` written across
+//!   the AHB/APB bridge may not be visible by the time the next instruction
+//!   returns from the call gate, which is why ST's procedure reads it back.
+//!   There is no bridge latency in this model, so the hazard cannot arise; the
+//!   read-back is harmless either way.
 //!
 //! # Sources
 //!
-//! ST **RM0351** rev 9 §4 "Firewall (FW)" and §9.2.2 for `SYSCFG_CFGR1`, ST
-//! **RM0432** §4, and ST's `stm32l4xx_hal_firewall` documentation for the `FPA`
-//! wording quoted above. Register offsets cross-checked against ST's own CMSIS
-//! `FIREWALL_TypeDef`. No emulator source of any licence was consulted
-//! (`ROADMAP.md` §1).
+//! ST **RM0351** rev 11 §4 "Firewall (FW)" — §4.3.2 for interrupts and DMA,
+//! §4.3.4 Table 18 for the segment access matrix, §4.3.5 for initialization,
+//! §4.3.6 for the call-gate sequence and the closing rule — plus §6.4.16 for
+//! `RCC_APB2ENR.FWEN` and §9.2.2 for `SYSCFG_CFGR1`; ST **RM0432** §4; and ST
+//! **AN4730** rev 2 §2.1 (DMA) and §2.2 (interrupts). Register offsets
+//! cross-checked against ST's own CMSIS `FIREWALL_TypeDef`. No emulator source
+//! of any licence was consulted (`ROADMAP.md` §1).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -147,7 +249,7 @@ use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicBool, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::machine::Instance;
@@ -158,7 +260,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 const CLASS_NAME: &str = "st.firewall";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How many bytes of registers the block decodes: up to and including `FW_CR`.
 const REGISTER_BYTES: u64 = 0x24;
@@ -225,6 +327,20 @@ enum Verdict {
     Reset,
 }
 
+/// How far a closed firewall has got through the two-fetch call-gate sequence.
+///
+/// RM0351 §4.3.6: the gate's second and third words "must not be interrupted by
+/// any intermediate instruction fetch", so half a sequence is a state and not a
+/// flag — and it has to remember *whose* gate it is, because the volatile data
+/// segment has one of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Nothing started, or an intermediate fetch threw the sequence away.
+    Idle,
+    /// The second word at `base + 4` was fetched; `base + 8` now opens it.
+    Second(u64),
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -242,6 +358,8 @@ struct State {
     cr: u32,
     /// Whether the call gate has been entered and not yet left.
     open: bool,
+    /// How far through the call-gate sequence a closed firewall is.
+    gate: Gate,
     /// `SYSCFG_CFGR1.FWDIS`, as the wire last delivered it.
     ///
     /// **Saved**, for the reason `st.syscfg` saves its input levels: it is a
@@ -250,6 +368,14 @@ struct State {
     /// with this false would protect nothing until SYSCFG happened to
     /// republish.
     disabled: bool,
+    /// `RCC_APB2ENR.FWEN`, as the `clken` wire last delivered it.
+    ///
+    /// The *pin level*, not the answer: a pin nothing drives sits low, and a
+    /// board that declared no `clken` wire must still get a clocked block. So
+    /// the question is asked through [`Shared::clocked`], which consults
+    /// `clken_wired` first. Saved for the reason `disabled` is — it is a level
+    /// a sibling drives, and chunk load order is nobody's to depend on.
+    clocked: bool,
 }
 
 impl Default for State {
@@ -264,7 +390,9 @@ impl Default for State {
             vdsl: 0,
             cr: 0,
             open: false,
+            gate: Gate::Idle,
             disabled: true,
+            clocked: false,
         }
     }
 }
@@ -287,6 +415,13 @@ struct Shared {
     downstream: Mutex<Option<Arc<AddressSpace>>>,
     /// The reset output, pulsed on an illegal access.
     reset_out: Mutex<Option<WireSource>>,
+    /// Whether a board drew a `clken` wire.
+    ///
+    /// Topology rather than state, so it is not serialized: it is set when the
+    /// machine layer asks for the sink and it answers the question a bare pin
+    /// level cannot, which is whether the low it is sitting at means "the RCC
+    /// has not been told to clock this" or "nobody models an RCC here".
+    clken_wired: AtomicBool,
 }
 
 impl fmt::Debug for Shared {
@@ -303,6 +438,15 @@ impl fmt::Debug for Shared {
 }
 
 impl Shared {
+    /// Whether the register block has a clock.
+    ///
+    /// A board that wired `clken` is asserting that the clock is the RCC's to
+    /// give, so the pin decides; one that did not gets a clocked block, which
+    /// is the same default `fwdis` takes in the other direction.
+    fn clocked(&self, state: &State) -> bool {
+        !self.clken_wired.load(Ordering::Relaxed) || state.clocked
+    }
+
     /// The code segment, as `(start, len)`; `len` is zero when it is disabled.
     fn code(&self, state: &State) -> (u64, u64) {
         (
@@ -341,18 +485,41 @@ impl Shared {
         Segment::Unprotected
     }
 
+    /// Whether the volatile data segment is executable *protected* code.
+    ///
+    /// RM0351 §4.3.4: "The VDS bit gets priority over the VDE bit, this last
+    /// bit value being ignored in such a case" — a shared segment is ordinary
+    /// memory, so running out of it is running outside the fence, not inside
+    /// it. Only `VDS = 0, VDE = 1` makes it part of the protected code.
+    fn vds_is_protected_code(state: &State) -> bool {
+        state.cr & CR_VDS == 0 && state.cr & CR_VDE != 0
+    }
+
     /// Whether a fetch at `addr` counts as still being inside the protected
-    /// code — the code segment, or the volatile data segment when `VDE` says
-    /// that is executable.
+    /// code — the code segment, or an executable, unshared volatile segment.
     fn executing_inside(&self, state: &State, addr: u64, len: u64) -> bool {
         match self.segment_of(state, addr, len) {
             Segment::Code => true,
-            Segment::Vds => state.cr & CR_VDE != 0,
+            Segment::Vds => Shared::vds_is_protected_code(state),
             _ => false,
         }
     }
 
-    /// Judge one access, advancing the state machine.
+    /// Where a call gate may live: the code segment always, and the volatile
+    /// data segment while it is executable and unshared (RM0351 §4.3.6).
+    ///
+    /// A zero-length segment is not protected, so it has no gate either — the
+    /// alternative would arm the sequence on unprotected memory.
+    fn gate_bases(&self, state: &State) -> [Option<u64>; 2] {
+        let (code, code_len) = self.code(state);
+        let (vds, vds_len) = self.vds(state);
+        [
+            (code_len != 0).then_some(code),
+            (vds_len != 0 && Shared::vds_is_protected_code(state)).then_some(vds),
+        ]
+    }
+
+    /// Judge one access from the processor, advancing the state machine.
     ///
     /// Takes the state lock and releases it; the caller pulses the reset line
     /// afterwards, outside the critical section.
@@ -368,43 +535,90 @@ impl Shared {
                 // entitled to make anywhere — or a fetch that has not left.
                 return Verdict::Allow;
             }
-            // The processor is leaving. `FPA` decides whether that is the
-            // documented exit or the failure the peripheral exists to catch.
+            // The processor is leaving, whether it meant to or because an
+            // exception was taken: the firewall snoops addresses and cannot
+            // tell those apart (§4.3.2). `FPA` decides which it is.
             if state.cr & CR_FPA == 0 {
                 return Verdict::Reset;
             }
             state.cr &= !CR_FPA;
             state.open = false;
+            state.gate = Gate::Idle;
             // And the fetch itself is now judged as a closed firewall would —
             // it lands outside the segments, so it falls through below.
         }
 
+        if fetch {
+            let bases = self.gate_bases(&state);
+            if let Some(verdict) = Shared::judge_gate_fetch(&mut state, bases, addr) {
+                return verdict;
+            }
+        }
+
         match self.segment_of(&state, addr, len) {
             Segment::Unprotected => Verdict::Allow,
-            Segment::Code => {
-                // The call gate: the single entry point, and it is the *first
-                // word* of the segment. Anything else in the segment — a jump
-                // into the middle of it, a read of it by unprotected code — is
-                // the illegal entry this peripheral exists for.
-                let (start, _) = self.code(&state);
-                if fetch && addr == start {
-                    state.open = true;
-                    Verdict::Allow
-                } else {
-                    Verdict::Reset
-                }
-            }
-            Segment::Nvds => Verdict::Reset,
+            // The gate words were dealt with above, so anything still here is
+            // the illegal entry the peripheral exists for: a jump into the
+            // middle of the routine, a read of it by unprotected code, or the
+            // dummy first word that exists to catch a runaway prefetch.
+            Segment::Code | Segment::Nvds => Verdict::Reset,
             Segment::Vds => {
-                if state.cr & CR_VDS == 0 {
-                    Verdict::Reset
-                } else if fetch && state.cr & CR_VDE == 0 {
-                    // Shared, but not executable.
-                    Verdict::Reset
-                } else {
+                // Shared means shared: "Read/write/execute accesses allowed if
+                // VDS = 1 (whatever VDE bit value)" (§4.3.4, Table 18).
+                if state.cr & CR_VDS != 0 {
                     Verdict::Allow
+                } else {
+                    Verdict::Reset
                 }
             }
+        }
+    }
+
+    /// The call-gate sequence, for a fetch made while the firewall is closed.
+    ///
+    /// `Some` when this fetch *is* part of a gate and needs no further
+    /// judgement; `None` when it is an ordinary fetch, in which case any
+    /// half-finished sequence has been thrown away by the time this returns —
+    /// §4.3.6's "must not be interrupted by any intermediate instruction
+    /// fetch".
+    fn judge_gate_fetch(state: &mut State, bases: [Option<u64>; 2], addr: u64) -> Option<Verdict> {
+        if let Gate::Second(base) = state.gate
+            && addr == base.wrapping_add(8)
+        {
+            state.gate = Gate::Idle;
+            state.open = true;
+            return Some(Verdict::Allow);
+        }
+        state.gate = Gate::Idle;
+        for base in bases.into_iter().flatten() {
+            if addr == base.wrapping_add(4) {
+                state.gate = Gate::Second(base);
+                return Some(Verdict::Allow);
+            }
+            if addr == base.wrapping_add(8) {
+                // The third word reached without the second, or after an
+                // intermediate fetch threw the sequence away: "executing the
+                // 3rd word after receiving the intermediate instruction fetch
+                // would generate a system reset as a consequence".
+                return Some(Verdict::Reset);
+            }
+        }
+        None
+    }
+
+    /// Judge one access from a bus master.
+    ///
+    /// There is no state machine here and no `FW_CR` bit that softens it:
+    /// "All DMA accesses to the protected segments are forbidden, whatever the
+    /// Firewall state, and generate a system reset" (§4.3.4).
+    fn judge_master(&self, addr: u64, len: u64) -> Verdict {
+        let state = self.state.lock();
+        if state.disabled {
+            return Verdict::Allow;
+        }
+        match self.segment_of(&state, addr, len) {
+            Segment::Unprotected => Verdict::Allow,
+            _ => Verdict::Reset,
         }
     }
 
@@ -424,14 +638,27 @@ impl Shared {
         self.downstream.lock().clone()
     }
 
-    /// Judge, and reset if that is the answer. `true` means "let it through".
-    fn gate(&self, addr: u64, len: u64, attrs: MemAttrs) -> MemResult {
+    /// Judge a processor access, and reset if that is the answer.
+    fn filter_cpu(&self, addr: u64, len: u64, attrs: MemAttrs) -> MemResult {
         if attrs.debug {
             // No judgement and no state change: a debugger that rebooted the
             // machine by looking at it would be useless (`ROADMAP.md` §15).
             return Ok(());
         }
-        match self.judge(addr, len, attrs.is_fetch()) {
+        self.settle(self.judge(addr, len, attrs.is_fetch()))
+    }
+
+    /// Judge a bus master's access, and reset if that is the answer.
+    fn filter_master(&self, addr: u64, len: u64, attrs: MemAttrs) -> MemResult {
+        if attrs.debug {
+            return Ok(());
+        }
+        self.settle(self.judge_master(addr, len))
+    }
+
+    /// Turn a verdict into a result, pulsing the reset line outside the lock.
+    fn settle(&self, verdict: Verdict) -> MemResult {
+        match verdict {
             Verdict::Allow => Ok(()),
             Verdict::Reset => {
                 self.pulse_reset();
@@ -461,6 +688,14 @@ struct Registers {
 impl Registers {
     fn read_register(&self, offset: u64) -> u32 {
         let state = self.shared.state.lock();
+        if !self.shared.clocked(&state) {
+            // `RCC_APB2ENR.FWEN` is step 1 of §4.3.5's procedure and the block
+            // is deaf until it is set. Returning zero rather than a bus fault
+            // is what an STM32 does with an unclocked APB peripheral, and it is
+            // also the failure a firmware that skipped the step would see:
+            // every segment register reads back as it was never written.
+            return 0;
+        }
         match offset {
             0x00 => state.cssa,
             0x04 => state.csl,
@@ -475,6 +710,9 @@ impl Registers {
 
     fn write_register(&self, offset: u64, value: u32) {
         let mut state = self.shared.state.lock();
+        if !self.shared.clocked(&state) {
+            return;
+        }
         // "The Firewall segment registers can be written only when the
         // Firewall is disabled" (RM0351 §4.4). `FW_CR` is not one of them: the
         // protected code has to be able to set `FPA` on its way out.
@@ -529,10 +767,34 @@ impl MemOps for Registers {
 // The bus filter
 // ---------------------------------------------------------------------------
 
-/// The processor's whole address range, judged and then forwarded.
+/// Which set of rules a filter region applies.
+///
+/// The two are genuinely different rule sets, not one with a flag: the
+/// processor's is a state machine that fetches drive, and a master's is a fixed
+/// address test that "whatever the Firewall state" makes independent of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Master {
+    /// The processor, whose fetches move the state machine.
+    Cpu,
+    /// Any other bus master, for which every segment is always forbidden.
+    Dma,
+}
+
+/// A master's whole address range, judged and then forwarded.
 #[derive(Debug)]
 struct Filter {
     shared: Arc<Shared>,
+    master: Master,
+}
+
+impl Filter {
+    /// Judge `[offset, offset + len)` by this region's rules.
+    fn judge(&self, offset: u64, len: u64, attrs: MemAttrs) -> MemResult {
+        match self.master {
+            Master::Cpu => self.shared.filter_cpu(offset, len, attrs),
+            Master::Dma => self.shared.filter_master(offset, len, attrs),
+        }
+    }
 }
 
 impl MemOps for Filter {
@@ -540,7 +802,7 @@ impl MemOps for Filter {
         let Some(down) = self.shared.downstream() else {
             return Err(BusError::Unassigned);
         };
-        self.shared.gate(offset, dst.len() as u64, attrs)?;
+        self.judge(offset, dst.len() as u64, attrs)?;
         down.read_bytes(offset, dst, attrs)
     }
 
@@ -548,7 +810,7 @@ impl MemOps for Filter {
         let Some(down) = self.shared.downstream() else {
             return Err(BusError::Unassigned);
         };
-        self.shared.gate(offset, src.len() as u64, attrs)?;
+        self.judge(offset, src.len() as u64, attrs)?;
         down.write_bytes(offset, src, attrs)
     }
 
@@ -569,9 +831,10 @@ pub struct Firewall {
     shared: Arc<Shared>,
     regs: RegionRef,
     bus: RegionRef,
-    /// The `fwdis` input pin; the device keeps the strong reference because a
-    /// net holds its sinks weakly.
-    pins: Mutex<Vec<Arc<FwdisPin>>>,
+    dma: RegionRef,
+    /// The `fwdis` and `clken` input pins; the device keeps the strong
+    /// references because a net holds its sinks weakly.
+    pins: Mutex<Vec<Arc<InputPin>>>,
 }
 
 impl Firewall {
@@ -605,6 +868,7 @@ impl Firewall {
             sram_base,
             downstream: Mutex::with_rank(LockRank::LEAF, None),
             reset_out: Mutex::with_rank(LockRank::WIRE, None),
+            clken_wired: AtomicBool::new(false),
         });
         let regs = Arc::new(Region::io(
             "firewall",
@@ -618,12 +882,22 @@ impl Firewall {
             bus_size,
             Arc::new(Filter {
                 shared: Arc::clone(&shared),
+                master: Master::Cpu,
+            }) as Arc<dyn MemOps>,
+        )) as RegionRef;
+        let dma = Arc::new(Region::io(
+            "firewall-dma",
+            bus_size,
+            Arc::new(Filter {
+                shared: Arc::clone(&shared),
+                master: Master::Dma,
             }) as Arc<dyn MemOps>,
         )) as RegionRef;
         Firewall {
             shared,
             regs,
             bus,
+            dma,
             pins: Mutex::with_rank(LockRank::DEVICE, Vec::new()),
         }
     }
@@ -648,27 +922,62 @@ impl Firewall {
         self.shared.state.lock().open
     }
 
+    /// Whether the block's `RCC_APB2ENR.FWEN` clock is running.
+    #[must_use]
+    pub fn clocked(&self) -> bool {
+        let state = self.shared.state.lock();
+        self.shared.clocked(&state)
+    }
+
     /// Drive `FWDIS` directly — the route a test with no SYSCFG takes.
     ///
     /// High is *disabled*, which is the sense of the bit and of the wire.
     pub fn set_fwdis(&self, level: bool) {
         let mut state = self.shared.state.lock();
-        state.disabled = level;
-        if level {
-            // Back to idle: nothing is checked, so nothing is open either.
+        State::apply_fwdis(&mut state, level);
+    }
+
+    /// Drive `FWEN` directly — the route a test with no RCC takes.
+    ///
+    /// Driving the pin at all is what makes it load-bearing, exactly as a
+    /// board's `wire` is.
+    pub fn set_clken(&self, level: bool) {
+        self.shared.clken_wired.store(true, Ordering::Relaxed);
+        self.shared.state.lock().clocked = level;
+    }
+}
+
+impl State {
+    /// Take a new `FWDIS` level, from the wire or from a test.
+    fn apply_fwdis(state: &mut State, high: bool) {
+        state.disabled = high;
+        if high {
+            // Back to idle: nothing is checked, so nothing is open and no
+            // half-finished call gate is remembered either.
             state.open = false;
+            state.gate = Gate::Idle;
         }
     }
 }
 
-/// One `fwdis` input, as something a wire can drive.
+/// Which of the device's two level inputs an [`InputPin`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Input {
+    /// `SYSCFG_CFGR1.FWDIS`: high switches the firewall off.
+    Fwdis,
+    /// `RCC_APB2ENR.FWEN`: low leaves the register block unclocked.
+    Clken,
+}
+
+/// One level input, as something a wire can drive.
 #[derive(Debug)]
-pub struct FwdisPin {
+pub struct InputPin {
     shared: Arc<Shared>,
+    which: Input,
     inputs: FanIn,
 }
 
-impl FwdisPin {
+impl InputPin {
     /// The per-source levels currently seen.
     #[must_use]
     pub fn inputs(&self) -> &FanIn {
@@ -676,14 +985,14 @@ impl FwdisPin {
     }
 }
 
-impl WireSink for FwdisPin {
+impl WireSink for InputPin {
     fn set_level(&self, src: WireId, _line: u32, level: Level) {
         self.inputs.set(src, level);
         let high = self.inputs.resolve(Resolve::Or).is_high();
         let mut state = self.shared.state.lock();
-        state.disabled = high;
-        if high {
-            state.open = false;
+        match self.which {
+            Input::Fwdis => State::apply_fwdis(&mut state, high),
+            Input::Clken => state.clocked = high,
         }
     }
 }
@@ -695,7 +1004,7 @@ impl Device for Firewall {
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
         // Nothing outward: `bind` takes the space and `map` statements place
-        // the two regions.
+        // the three regions.
         Ok(())
     }
 
@@ -720,7 +1029,17 @@ impl Device for Firewall {
         w.write_u32(state.vdsl)?;
         w.write_u32(state.cr)?;
         w.write_bool(state.open)?;
+        // A half-finished call gate is guest-visible: restore into `Idle` and a
+        // routine that had fetched `CSSA + 4` would reset on `CSSA + 8`.
+        match state.gate {
+            Gate::Idle => w.write_bool(false)?,
+            Gate::Second(base) => {
+                w.write_bool(true)?;
+                w.write_u64(base)?;
+            }
+        }
         w.write_bool(state.disabled)?;
+        w.write_bool(state.clocked)?;
         Ok(())
     }
 
@@ -743,7 +1062,13 @@ impl Device for Firewall {
             vdsl: r.read_u32()?,
             cr: r.read_u32()?,
             open: r.read_bool()?,
+            gate: if r.read_bool()? {
+                Gate::Second(r.read_u64()?)
+            } else {
+                Gate::Idle
+            },
             disabled: r.read_bool()?,
+            clocked: r.read_bool()?,
         };
         *self.shared.state.lock() = state;
         Ok(())
@@ -753,6 +1078,7 @@ impl Device for Firewall {
         match name {
             "" | "regs" => Some(Arc::clone(&self.regs)),
             "bus" => Some(Arc::clone(&self.bus)),
+            "dma" => Some(Arc::clone(&self.dma)),
             _ => None,
         }
     }
@@ -769,11 +1095,19 @@ impl Device for Firewall {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
-        if port != "fwdis" {
-            return None;
+        let which = match port {
+            "fwdis" => Input::Fwdis,
+            "clken" => Input::Clken,
+            _ => return None,
+        };
+        if which == Input::Clken {
+            // A board that drew the wire has said the clock is the RCC's to
+            // give, and an RCC's `FWEN` resets low.
+            self.shared.clken_wired.store(true, Ordering::Relaxed);
         }
-        let pin = Arc::new(FwdisPin {
+        let pin = Arc::new(InputPin {
             shared: Arc::clone(&self.shared),
+            which,
             inputs: FanIn::new(sources),
         });
         self.pins.lock().push(Arc::clone(&pin));
@@ -819,7 +1153,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "bus-size",
             kind: ValueKind::Size,
             required: false,
-            summary: "how much address space the `bus` filter covers (4 GiB)",
+            summary: "how much address space the `bus` and `dma` filters cover (4 GiB)",
         },
     ],
     construct: |props| Ok(Box::new(Firewall::new(props)?)),
@@ -853,8 +1187,10 @@ pub fn schema() -> ClassSchema {
         .region("")
         .region("regs")
         .region("bus")
+        .region("dma")
         .port("reset", PortDir::Out)
         .port("fwdis", PortDir::In)
+        .port("clken", PortDir::In)
 }
 
 #[cfg(test)]

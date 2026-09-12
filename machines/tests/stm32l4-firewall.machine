@@ -12,19 +12,23 @@
 # ---------------------------------------------------------------------------
 #
 # `st.firewall` is the one peripheral in this tree that is not beside the bus
-# but *in* it, and two of its three connections are wires whose whole content is
-# a number written in a machine file:
+# but *in* it, and three of its connections are wires whose whole content is a
+# number written in a machine file:
 #
 #   * `syscfg.fwdis -> fw.fwdis` is what switches the firewall on. There is no
 #     enable bit on the firewall itself; clearing `SYSCFG_CFGR1.FWDIS` is the
 #     enable, and a board that forgets this wire has a firewall that protects
 #     nothing while every unit test still passes.
+#   * `rcc.apb2en7 -> fw.clken` is `RCC_APB2ENR.FWEN`, step 1 of the
+#     initialization procedure in RM0351 §4.3.5. A board that forgets it has a
+#     firewall whose registers answer before its clock exists.
 #   * `fw.reset -> rcc.fwrst` is what makes `RCC_CSR.FWRSTF` mean something.
 #     The flag is RCC's state, not the firewall's, exactly as `IWDGRSTF` is.
 #
-# Neither is visible below the machine layer, so both need a board to be tested
-# on, and no *shipped* board can be the one: an STM32F407 has no firewall, and a
-# complete L4 is a file's worth of peripherals this test does not need.
+# None is visible below the machine layer, so each needs a board to be tested
+# on, and no *shipped* board can be the one: an STM32F407 has no firewall (the
+# block is L0/L4/L4+ only), and a complete L4 is a file's worth of peripherals
+# this test does not need.
 #
 # ---------------------------------------------------------------------------
 # The two spaces
@@ -39,8 +43,10 @@
 # the whole 4 GiB. Every fetch and every load the core makes is judged and then
 # forwarded into `mem`.
 #
-# A DMA controller reaching the protected segments would be given a space shaped
-# the same way; there is none on this board.
+# A DMA controller would be given a space shaped the same way but over the
+# firewall's *other* window, `fw.dma`: RM0351 §4.3.4 forbids a master every
+# protected segment "whatever the Firewall state", which is not the rule the
+# processor gets. There is no master on this board.
 #
 # ---------------------------------------------------------------------------
 # The part
@@ -53,9 +59,10 @@
 # `st.flash`, because what is being tested is the fence and not the programming
 # interface.
 #
-# Sources: ST **RM0351** rev 9 - Table 1 for the memory map, §4 for the
-# firewall, §6.4.29 for `RCC_CSR`, §9.2.2 for `SYSCFG_CFGR1`. No emulator source
-# of any licence was consulted (ROADMAP.md §1).
+# Sources: ST **RM0351** rev 11 - Table 1 for the memory map, §4 for the
+# firewall, §6.4.16 for `RCC_APB2ENR`, §6.4.29 for `RCC_CSR`, §9.2.2 for
+# `SYSCFG_CFGR1`. No emulator source of any licence was consulted
+# (ROADMAP.md §1).
 
 machine "stm32l4-firewall" {
   param flash = 1M
@@ -89,8 +96,9 @@ machine "stm32l4-firewall" {
     sram-base  = 0x20000000
   }
 
-  # Only for `CSR`: this board never touches a clock gate, and the firewall's
-  # reset cause has to land somewhere firmware can read it.
+  # For `CSR` and for `APB2ENR`: the firewall's reset cause has to land
+  # somewhere firmware can read it, and `APB2ENR.FWEN` is step 1 of RM0351
+  # §4.3.5's initialization procedure.
   object rcc "st.rcc" { clock = msi, variant = "l4" }
 
   # -- the map ---------------------------------------------------------------
@@ -109,8 +117,14 @@ machine "stm32l4-firewall" {
   # And the core sees the firewall and nothing else.
   map cpubus 0 size 4G = fw.bus
 
-  # -- the two wires the board exists for -------------------------------------
+  # -- the three wires the board exists for -----------------------------------
+  #
+  # `apb2en7` is `RCC_APB2ENR.FWEN` (RM0351 §6.4.16), the firewall's clock gate
+  # and step 1 of §4.3.5's procedure. Until it is set the register block is deaf
+  # and a firmware's segment writes go nowhere, which is the failure ST's
+  # procedure is written to avoid.
   wire syscfg.fwdis -> fw.fwdis
+  wire rcc.apb2en7  -> fw.clken
   wire fw.reset     -> cpu.reset
   wire fw.reset     -> rcc.fwrst
 }
