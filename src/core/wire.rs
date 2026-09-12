@@ -981,6 +981,30 @@ pub trait DmaPeripheral: Send + Sync + fmt::Debug {
     fn dma_ready(&self) -> bool {
         true
     }
+
+    /// Whether the item about to move is the **peripheral's** last one.
+    ///
+    /// This is the peripheral-as-flow-controller signal, and it runs the
+    /// opposite way to `terminal` on [`dma_read`](DmaPeripheral::dma_read) and
+    /// [`dma_write`](DmaPeripheral::dma_write). Those tell the peripheral that
+    /// the *controller's* count has expired; this asks the peripheral whether
+    /// its own has. The two are not interchangeable, and only one machine can
+    /// end a transfer at a time:
+    ///
+    /// * **The controller is the flow controller** — an 8237, or an STM32
+    ///   stream with `PFCTRL = 0`. `NDTR`/the count decides, the peripheral is
+    ///   told with `terminal`, and this is never consulted.
+    /// * **The peripheral is the flow controller** — ST RM0090 §10.3.2, an
+    ///   STM32 stream with `PFCTRL = 1`. The programmed count is a *maximum*
+    ///   and the peripheral says when the last item goes past; this is that
+    ///   signal, sampled by the controller before it moves each item.
+    ///
+    /// Defaulting to `false` is the honest answer for a peripheral that cannot
+    /// be a flow controller: it simply never ends the transfer, which is what
+    /// arming a stream `PFCTRL` against such a peripheral does on the part.
+    fn dma_last(&self) -> bool {
+        false
+    }
 }
 
 /// Per-source level state: the bookkeeping that makes wired-OR possible.
