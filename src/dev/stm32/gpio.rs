@@ -56,14 +56,28 @@
 //! nothing come out of it — which is the behaviour that makes a missing
 //! `GPIO_Init` look like the bug it is.
 //!
+//! `OTYPER` and `PUPDR` are load-bearing. A pad presents a
+//! [`Drive`] rather than a level: push-pull drives
+//! both rails, open-drain drives low and **lets go** of a one, and `PUPDR`'s
+//! resistor is what holds the pin when no stage is driving it. `IDR` reads the
+//! net back rather than the port's own intention wherever the pin is on a net
+//! that resolves itself ([`NetMode::Resolved`](crate::core::wire::NetMode#variant.Resolved)), so
+//! an open-drain output senses what somebody else is
+//! doing to the line — which is how a wired-AND bus works and how a keypad
+//! column is read. A pin on an ordinary per-sink net, or on no net
+//! at all, keeps the older rule; every board predating tri-state is unaffected.
+//!
+//! On such a net a board wires `p{n}` alone and the port both drives and senses
+//! through it, which is what one pin of real silicon is. `in{n}` stays for the
+//! older arrangement, where the two directions are two nets.
+//!
 //! What is **not** modelled: `AFR`'s *value*. Selecting AF7 rather than AF8 on
 //! a pin picks which peripheral of several the mux connects, and this model
 //! has one `af{n}` line rather than sixteen. The nibble is stored and reads
 //! back, so firmware configures normally; a board that wires two peripherals
 //! to one pin would need the selection honoured, and does not exist yet.
-//! `OTYPER`, `OSPEEDR` and `PUPDR` are likewise stored and read back but
-//! change no level: open-drain, slew rate and pull resistors are analogue
-//! properties of a net this model does not have.
+//! `OSPEEDR` is likewise stored and read back but changes no level: slew rate
+//! is a property of an analogue net this model does not have.
 //!
 //! # Sources
 //!
@@ -87,7 +101,7 @@ use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region,
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU32, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::core::wire::{Drive, FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema, port_index};
 
@@ -113,6 +127,14 @@ pub const REGISTER_BYTES: u64 = 0x28;
 const MODE_OUTPUT: u32 = 0b01;
 /// `MODER` pin mode: alternate function, driven by the `af{n}` input.
 const MODE_ALTERNATE: u32 = 0b10;
+/// `MODER` pin mode: analogue. The Schmitt trigger and both pull resistors are
+/// switched off (RM0090 §8.3.12).
+const MODE_ANALOG: u32 = 0b11;
+
+/// `PUPDR` pin setting: pull-up.
+const PUPD_UP: u32 = 0b01;
+/// `PUPDR` pin setting: pull-down.
+const PUPD_DOWN: u32 = 0b10;
 
 /// `LCKR`'s lock key, bit 16 (RM0090 §8.4.8).
 const LCKK: u32 = 1 << 16;
@@ -177,6 +199,65 @@ impl State {
     /// The two `MODER` bits of pin `n`.
     fn mode(&self, n: u32) -> u32 {
         (self.moder >> (n * 2)) & 0b11
+    }
+
+    /// The two `PUPDR` bits of pin `n`.
+    fn pupd(&self, n: u32) -> u32 {
+        (self.pupdr >> (n * 2)) & 0b11
+    }
+
+    /// Whether pin `n`'s output stage is open-drain (`OTYPER` bit set).
+    fn open_drain(&self, n: u32) -> bool {
+        self.otyper & (1 << n) != 0
+    }
+
+    /// The weak drive pin `n`'s pull resistor contributes.
+    ///
+    /// RM0090 §8.3.10 and Table 23: the pull resistors are selectable in input,
+    /// output and alternate-function mode alike — an open-drain output with a
+    /// pull-up is the standard way to build an I²C or a keypad line — and
+    /// §8.3.12 switches both of them off in analogue mode.
+    fn pull(&self, n: u32) -> Drive {
+        if self.mode(n) == MODE_ANALOG {
+            return Drive::HiZ;
+        }
+        match self.pupd(n) {
+            PUPD_UP => Drive::WeakHigh,
+            PUPD_DOWN => Drive::WeakLow,
+            _ => Drive::HiZ,
+        }
+    }
+
+    /// What pin `n`'s pad presents to the net: its output stage where it has
+    /// one, and its pull resistor where it does not.
+    ///
+    /// The whole of RM0090 Table 22, in one function. `MODER` picks which of
+    /// `ODR` and the alternate function reaches the stage (or neither, for an
+    /// input); `OTYPER` decides whether that stage is push-pull or open-drain,
+    /// and an open-drain stage asked for a one simply **lets go**, which is the
+    /// point of it; `PUPDR` is what holds the pin when nothing is driving.
+    ///
+    /// One [`Drive`] covers all three because a pull resistor only matters when
+    /// the stage is not driving: a push-pull output overrules the resistor
+    /// beside it in hardware, and [`Drive`]'s strength ordering says so.
+    fn pad_drive(&self, n: u32, alternate: u32) -> Drive {
+        let bit = 1u32 << n;
+        let driven = match self.mode(n) {
+            MODE_OUTPUT => Some(Level::from_bool(self.odr & bit != 0)),
+            MODE_ALTERNATE => Some(Level::from_bool(alternate & bit != 0)),
+            // Input and analogue: the port drives nothing.
+            _ => None,
+        };
+        match driven {
+            Some(level) if self.open_drain(n) => match Drive::open_drain(level) {
+                // Asked for a one, so the stage is off and the resistor is all
+                // that is left.
+                Drive::HiZ => self.pull(n),
+                held => held,
+            },
+            Some(level) => Drive::strong(level),
+            None => self.pull(n),
+        }
     }
 }
 
@@ -246,23 +327,62 @@ impl fmt::Debug for Registers {
 }
 
 impl Registers {
-    /// What each pin is at: `ODR` where the pin is an output, the alternate
-    /// function's level where `MODER` says so, and whatever is driving it from
-    /// outside elsewhere.
+    /// What `IDR` reads: the level each **pad** is at.
+    ///
+    /// RM0090 §8.3.10 is unambiguous that this is the pin and not the port's
+    /// intention — "the data present on the I/O pin are sampled into the input
+    /// data register every AHB1 clock cycle" — so where the pin is on a net
+    /// that resolves itself ([`NetMode::Resolved`]), that net's level is the
+    /// answer, whatever this port is driving. An open-drain output with a one in
+    /// `ODR` therefore reads back whatever *somebody else* is doing to the line,
+    /// which is how every wired-AND bus is sensed and how a keypad column is
+    /// read.
+    ///
+    /// A pin whose net is [`NetMode::PerSink`], or that is not wired at all,
+    /// keeps the older rule — `ODR`, the alternate function, or the `in{n}` pad
+    /// — because such a net has no resolved level to report and every board in
+    /// the tree predating tri-state depends on it.
+    ///
+    /// Analogue mode reads zero either way: §8.3.12 disconnects the Schmitt
+    /// trigger, and "read access to the input data register gets the value 0".
     fn pin_levels(&self, state: &State) -> u32 {
         let external = self.pads.get(PadKind::External);
         let alternate = self.pads.get(PadKind::Alternate);
-        let mut out = 0u32;
+        // Rank WIRE nests under rank DEVICE, which the caller holds; nothing
+        // outward is called from here, only atomics are read.
+        let out = self.out.lock();
+        let mut levels = 0u32;
         for n in 0..PINS {
             let bit = 1u32 << n;
-            let level = match state.mode(n) {
-                MODE_OUTPUT => state.odr & bit,
-                MODE_ALTERNATE => alternate & bit,
-                // Input (`00`) and analogue (`11`): the port drives nothing,
-                // so the pin is whatever the outside world has it at.
-                _ => external & bit,
+            if state.mode(n) == MODE_ANALOG {
+                continue;
+            }
+            let resolved = out[n as usize]
+                .as_ref()
+                .filter(|source| source.wire().mode().is_resolved())
+                .map(WireSource::net_level);
+            let high = match resolved {
+                Some(level) => level.is_high(),
+                None => match state.mode(n) {
+                    MODE_OUTPUT => state.odr & bit != 0,
+                    MODE_ALTERNATE => alternate & bit != 0,
+                    // Input: the pin is whatever the outside world has it at.
+                    _ => external & bit != 0,
+                },
             };
-            out |= level;
+            if high {
+                levels |= bit;
+            }
+        }
+        levels
+    }
+
+    /// What each pad presents to its net, one [`Drive`] per pin.
+    fn pin_drives(&self, state: &State) -> [Drive; PINS as usize] {
+        let alternate = self.pads.get(PadKind::Alternate);
+        let mut out = [Drive::HiZ; PINS as usize];
+        for (n, slot) in out.iter_mut().enumerate() {
+            *slot = state.pad_drive(n as u32, alternate);
         }
         out
     }
@@ -273,14 +393,14 @@ impl Registers {
     /// device, and the re-entrancy contract is that outward calls happen after
     /// the critical section rather than inside it (`CLAUDE.md`, "Concurrency").
     fn refresh_pins(&self) {
-        let levels = {
+        let drives = {
             let state = self.state.lock();
-            self.pin_levels(&state)
+            self.pin_drives(&state)
         };
         let sources: Vec<Option<WireSource>> = self.out.lock().clone().into_iter().collect();
         for (n, source) in sources.iter().enumerate() {
             let Some(source) = source else { continue };
-            source.set(Level::from_bool(levels & (1 << n) != 0));
+            source.drive(drives[n]);
         }
     }
 
@@ -805,7 +925,7 @@ mod tests {
     use crate::core::props::Value;
     use crate::core::registry::Registry;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
-    use crate::core::wire::{Wire, WireIdAllocator};
+    use crate::core::wire::{Pull, Wire, WireIdAllocator};
 
     /// A port with every register at zero — the reset state of `GPIOC`
     /// upwards.
@@ -1142,5 +1262,166 @@ mod tests {
     fn dummy_source() -> WireSource {
         let id = WireId::new(9);
         WireSource::new(Wire::builder().source(id).build_shared(), id)
+    }
+
+    // -- OTYPER, PUPDR and a net that resolves itself ----------------------
+
+    /// A pin on a net that resolves itself, plus one other open-drain driver on
+    /// the same net — the keypad column arrangement, in miniature.
+    ///
+    /// The port drives and senses through `p{n}` alone, which is what one pin of
+    /// real silicon is.
+    fn pin_on_a_resolved_net(gpio: &Gpio, n: u32, pull: Pull) -> (Arc<Wire>, WireSource) {
+        let ids = WireIdAllocator::new();
+        let port_id = ids.alloc();
+        let other_id = ids.alloc();
+        let wire = Wire::builder()
+            .sources(&[port_id, other_id])
+            .resolved(pull)
+            .build_shared();
+        Device::connect(
+            gpio,
+            &format!("p{n}"),
+            WireSource::new(Arc::clone(&wire), port_id),
+        )
+        .expect("a port drives its pins");
+        (Arc::clone(&wire), WireSource::new(wire, other_id))
+    }
+
+    /// Set pin `n`'s two `PUPDR` bits.
+    fn set_pull(gpio: &Gpio, n: u32, bits: u32) {
+        let pupdr = (peek(gpio, 0x0c) & !(0b11 << (n * 2))) | (bits << (n * 2));
+        poke(gpio, 0x0c, pupdr);
+    }
+
+    /// Make pin `n`'s output stage open-drain.
+    fn as_open_drain(gpio: &Gpio, n: u32) {
+        poke(gpio, 0x04, peek(gpio, 0x04) | (1 << n));
+    }
+
+    #[test]
+    fn an_input_with_a_pull_up_reads_high_when_nothing_drives_it() {
+        // The defect this whole change exists for: before `PUPDR` was
+        // load-bearing, a row pin configured input-with-pull-up read *low* with
+        // nothing on the other end, so scanning firmware saw every key held.
+        let gpio = port();
+        let (_wire, other) = pin_on_a_resolved_net(&gpio, 4, Pull::None);
+        set_pull(&gpio, 4, PUPD_UP);
+        assert_eq!(
+            peek(&gpio, 0x10) & (1 << 4),
+            1 << 4,
+            "IDR, through the pull-up"
+        );
+        // A switch to ground wins over the resistor, and letting go restores it.
+        other.drive(Drive::Low);
+        assert_eq!(peek(&gpio, 0x10) & (1 << 4), 0);
+        other.release();
+        assert_eq!(peek(&gpio, 0x10) & (1 << 4), 1 << 4);
+        // Pull-down, and the whole thing is upside down.
+        set_pull(&gpio, 4, PUPD_DOWN);
+        assert_eq!(peek(&gpio, 0x10) & (1 << 4), 0);
+        // No resistor at all: nothing holds the pin, and the net says so.
+        set_pull(&gpio, 4, 0);
+        assert_eq!(peek(&gpio, 0x10) & (1 << 4), 0);
+    }
+
+    #[test]
+    fn an_open_drain_output_lets_go_of_a_one_and_senses_the_line() {
+        // RM0090 §8.3.10: with `OTYPER` set, "0 in the Output register
+        // activates the N-MOS whereas a 1 in the Output register leaves the
+        // port in Hi-Z". That is what makes a wired-AND bus, and what makes a
+        // keypad row scan work.
+        let gpio = port();
+        let (wire, other) = pin_on_a_resolved_net(&gpio, 2, Pull::Up);
+        as_output(&gpio, 2);
+        as_open_drain(&gpio, 2);
+        poke(&gpio, 0x18, 1 << 2);
+        assert_eq!(
+            wire.resolve_net(),
+            Level::High,
+            "the stage let go; the pull-up holds"
+        );
+        assert_eq!(peek(&gpio, 0x10) & (1 << 2), 1 << 2);
+        // Somebody else pulling the line down is visible in IDR *even though*
+        // this port is an output with a one in ODR. That read is the whole
+        // point of an open-drain pin and was impossible before.
+        other.drive(Drive::Low);
+        assert_eq!(peek(&gpio, 0x10) & (1 << 2), 0);
+        assert_eq!(
+            peek(&gpio, 0x14) & (1 << 2),
+            1 << 2,
+            "ODR still reads back the one"
+        );
+        other.release();
+        assert_eq!(peek(&gpio, 0x10) & (1 << 2), 1 << 2);
+        // A zero in ODR turns the N-MOS on, and now the port holds the line.
+        poke(&gpio, 0x18, 1 << (2 + 16));
+        assert_eq!(wire.resolve_net(), Level::Low);
+        assert_eq!(peek(&gpio, 0x10) & (1 << 2), 0);
+        assert_eq!(wire.contention(), 0, "nobody ever fought for it");
+    }
+
+    #[test]
+    fn a_push_pull_output_still_drives_both_rails() {
+        let gpio = port();
+        let (wire, _other) = pin_on_a_resolved_net(&gpio, 7, Pull::Down);
+        as_output(&gpio, 7);
+        set_pull(&gpio, 7, PUPD_DOWN);
+        poke(&gpio, 0x18, 1 << 7);
+        assert_eq!(
+            wire.resolve_net(),
+            Level::High,
+            "a push-pull stage overrules every resistor beside it"
+        );
+        poke(&gpio, 0x18, 1 << (7 + 16));
+        assert_eq!(wire.resolve_net(), Level::Low);
+    }
+
+    #[test]
+    fn analogue_mode_disconnects_the_trigger_and_both_resistors() {
+        // §8.3.12: in analogue mode the Schmitt trigger is deactivated, the
+        // pull resistors are disabled, and "read access to the input data
+        // register gets the value 0".
+        let gpio = port();
+        let (wire, other) = pin_on_a_resolved_net(&gpio, 11, Pull::Up);
+        poke(&gpio, 0x00, 0b11 << (11 * 2));
+        set_pull(&gpio, 11, PUPD_UP);
+        assert_eq!(
+            wire.drive_of(wire.sources()[0]),
+            Some(Drive::HiZ),
+            "the resistor is disconnected too"
+        );
+        other.drive(Drive::High);
+        assert_eq!(
+            peek(&gpio, 0x10) & (1 << 11),
+            0,
+            "IDR reads zero regardless"
+        );
+    }
+
+    #[test]
+    fn a_pin_on_an_ordinary_net_keeps_the_rule_it_always_had() {
+        // Every board in the tree predates tri-state and wires `p{n}` to a
+        // per-sink net. Nothing about those may move.
+        let gpio = port();
+        let ids = WireIdAllocator::new();
+        let id = ids.alloc();
+        let wire = Wire::builder().source(id).build_shared();
+        Device::connect(&gpio, "p5", WireSource::new(Arc::clone(&wire), id)).expect("p5");
+        as_output(&gpio, 5);
+        set_pull(&gpio, 5, PUPD_DOWN);
+        poke(&gpio, 0x18, 1 << 5);
+        assert_eq!(
+            peek(&gpio, 0x10) & (1 << 5),
+            1 << 5,
+            "IDR follows ODR, as it did before the net could resolve anything"
+        );
+        assert_eq!(wire.level_of(id), Some(Level::High));
+        // And an input pin still follows `in{n}`.
+        let gpio = port();
+        let src = WireId::new(1);
+        let pin = Device::sink(&gpio, "in3", &[src]).expect("in3");
+        pin.sink.set_level(src, 3, Level::High);
+        assert_eq!(peek(&gpio, 0x10) & (1 << 3), 1 << 3);
     }
 }
