@@ -1,0 +1,140 @@
+# oled-spi — the smallest board an SSD1306 driver can run against.
+#
+#   rsemu run oled-spi
+#
+# An SPI controller and a **Solomon Systech SSD1306** on the far end of it, and
+# nothing else. It models no product. It exists so that the first display device
+# in this tree that owns its own framebuffer has somewhere a driver can reach it
+# the way a driver actually does — program the controller, clock out an
+# initialisation sequence, clock out a page of GDDRAM, and see a picture come
+# out of the scanout seam.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately missing
+# ---------------------------------------------------------------------------
+#
+# **A processor.** Every register on this board is reached through an address
+# space, and a test or a monitor drives those directly — the same shape
+# `nvme-mini` and `ne2k-mini` use, and for the same reason: a failure on a board
+# with three objects on it is a failure in the device, while a failure on a
+# board with twenty is a bisection. `spi-panel` is where a hart executes.
+#
+# ---------------------------------------------------------------------------
+# Why there is no `D/C̅` wire
+# ---------------------------------------------------------------------------
+#
+# The SSD1306 has three interfaces (datasheet §8.1, Table 8-1, selected by the
+# BS1/BS2 strapping pins at assembly time) and two of them are SPI:
+#
+#   interface = "spi4"   eight-bit words, and a separate D/C̅ pin says whether
+#                        each byte is a command or a pixel. The common wiring,
+#                        and it needs a GPIO output to drive the pin.
+#
+#   interface = "spi3"   nine-bit words, the **first bit** of which is D/C̅
+#                        (§8.1.4). The pin is unused and tied low. Three wires
+#                        and no GPIO.
+#
+# This board uses `spi3`, and that is a real choice rather than a dodge: rsemu's
+# generic SPI controller takes word widths from 1 to 32 bits, so a nine-bit
+# frame costs nothing, and there is no general-purpose output block in the tree
+# for a fourth wire to hang off. `interface = "spi4"` is modelled and tested —
+# `src/dev/solomon/ssd1306.rs` drives the pin as an ordinary `WireSink` — it
+# simply has no board yet.
+#
+# ---------------------------------------------------------------------------
+# `mount = "rotated"`, and why a property says which way up the glass is
+# ---------------------------------------------------------------------------
+#
+# Every SSD1306 initialisation sequence ever written sends `A1h` (segment remap)
+# and `C8h` (COM scan direction), and the reason is **not** that the picture
+# wants mirroring. The 0.96″ and 1.3″ modules everyone buys have their glass
+# bonded 180° to the die's nominal SEG/COM order, and those two commands cancel
+# it out. Which corner of the glass SEG0 lands on is a board fact that no
+# register can observe, so it is a property here rather than something the model
+# guesses. A board that wrote a bare die onto its own panel the right way up
+# would say `mount = "normal"` and its firmware would leave `A0h`/`C0h` alone.
+
+machine "oled-spi" {
+  # Which modelling style the SPI link uses — `docs/buses/low-speed.md` asks
+  # that this be written down rather than inherited. `wired` drives SCK, MOSI
+  # and CS as real wires one edge at a time; `transactional` hands the panel a
+  # whole word per call. A transfer costs the same virtual time either way.
+  param link = "wired"
+
+  # Which named SPI bus the controller and the panel meet on, so two of these
+  # can run in one process without talking over each other.
+  param spibus = "oled0"
+
+  # Which member of the family: `ssd1306`, `ssd1309`, or `sh1106` — 132 columns
+  # of GDDRAM with the visible window starting two columns in, which is the
+  # difference a driver written for the other part gets wrong.
+  param part = "ssd1306"
+
+  # The module's geometry. 128x64 is the usual one; 128x32 is the other, and its
+  # firmware also has to set the multiplex ratio to 31 (§10.1.16).
+  param width  = 128
+  param height = 64
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One oscillator, so every ratio on this board is exact (ROADMAP.md §4.2).
+  # The panel does not use it: an SSD1306's refresh runs on an internal RC
+  # oscillator with no pin, no readable counter and no interrupt, so there is
+  # nothing about it a guest or a test could observe and nothing to schedule.
+  # `src/dev/lcd/panel.rs` sets out why a device-owned framebuffer has no frame
+  # rate to publish.
+  osc sysclk = 48000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # One flat 32-bit space. `unassigned` is left at its default of `fault`, so an
+  # access to a hole is an access fault rather than a plausible-looking zero.
+  space mem { width = 32 }
+
+  # -- the SPI controller ----------------------------------------------------
+  #
+  # One chip select, for the panel. Word width is set by the guest through
+  # `CTRL` bits 12:8 — nine bits, for the reason above.
+  object spi "spi.controller" {
+    clock        = sysclk
+    link         = link
+    bus          = spibus
+    chip-selects = 1
+  }
+
+  # -- the panel -------------------------------------------------------------
+  #
+  # No `clock`: it has no timed behaviour anything can see. Its whole state is
+  # GDDRAM and a register file, and both change inside the byte that caused it.
+  object oled "solomon.ssd1306" {
+    variant   = part
+    interface = "spi3"
+    mount     = "rotated"
+    width     = width
+    height    = height
+    bus       = spibus
+    cs        = 0
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # The register block is smaller than its window and does not decode the
+  # address bits above its own, so it answers over and over through it — which
+  # is what a peripheral on a coarsely decoded SoC bus does.
+  map mem 0x40000000 size 4K = mirror(spi)   # 6 registers, 170 times over
+
+  # -- the SPI wires ---------------------------------------------------------
+  #
+  # Used when `link = "wired"`, idle otherwise. There is no `miso`: the
+  # SSD1306's SPI interface has no data output at all (§8.1.3), which is why
+  # firmware has no way to read its GDDRAM back over SPI and every driver keeps
+  # a shadow buffer in guest memory.
+  wire spi.sck  -> oled.sck
+  wire spi.mosi -> oled.mosi
+  wire spi.cs0  -> oled.cs
+
+  # Not wired, and deliberately: the panel's `res` pin. This board ties RES̅
+  # high through a pull-up, which is what an unwired reset input already means
+  # here (see `src/dev/solomon/ssd1306.rs`), so naming it would add a net that
+  # never changes.
+}

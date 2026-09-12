@@ -673,19 +673,26 @@ fn downcast<T: Any + Send + Sync>(
 ///
 /// A `Vec` rather than one slot because a machine with two of something — a PC
 /// with an MDA *and* a CGA — is not this type's business to refuse.
-pub struct Captured<T> {
+///
+/// `T: ?Sized`, so a table may hold a **trait object**. One concrete type per
+/// table is what a captured PPU or VDP wants — the host is reaching for that
+/// exact device. A *family* of unrelated parts that present the same seam is
+/// the other case: one `Captured<dyn Panel>` is the table an SSD1306 and an
+/// ST7789 both push into, and a host asks for "this build's panel" without
+/// knowing which silicon answered.
+pub struct Captured<T: ?Sized> {
     /// [`LockRank::LEAF`]: pushed to from a constructor, read by the host, and
     /// nothing is locked while it is held.
     seen: Mutex<Vec<Arc<T>>>,
 }
 
-impl<T> Default for Captured<T> {
+impl<T: ?Sized> Default for Captured<T> {
     fn default() -> Captured<T> {
         Captured::new()
     }
 }
 
-impl<T> fmt::Debug for Captured<T> {
+impl<T: ?Sized> fmt::Debug for Captured<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.seen.try_lock() {
             Some(seen) => f
@@ -700,7 +707,7 @@ impl<T> fmt::Debug for Captured<T> {
     }
 }
 
-impl<T> Captured<T> {
+impl<T: ?Sized> Captured<T> {
     /// Nothing captured yet.
     #[must_use]
     pub fn new() -> Captured<T> {

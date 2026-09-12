@@ -215,6 +215,22 @@ pub static SPI_PANEL: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/spi-panel.machine"),
 };
 
+/// The `oled-spi` board, when this build has the SPI bus and an SSD1306.
+///
+/// A synthetic board rather than a product: the smallest machine around the
+/// first display device in the tree that owns its own framebuffer. It has no
+/// processor, for the reason `nvme-mini` has none — a test drives the
+/// controller's registers through the address space directly, which is how a
+/// driver reaches them anyway.
+#[cfg(feature = "machine-oled-spi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-oled-spi")))]
+pub static OLED_SPI: CatalogEntry = CatalogEntry {
+    name: "oled-spi",
+    summary: "the smallest SSD1306 board: an SPI controller and a 128x64 OLED that owns its picture",
+    media: &[],
+    source: include_str!("../../machines/oled-spi.machine"),
+};
+
 /// The `spi-flash` board, when this build has a hart, the SPI bus and the
 /// serial-flash devices.
 ///
@@ -783,6 +799,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&SMS_NTSC);
     #[cfg(feature = "machine-sms")]
     out.push(&SMS_PAL);
+    #[cfg(feature = "machine-oled-spi")]
+    out.push(&OLED_SPI);
     #[cfg(feature = "machine-spi-panel")]
     out.push(&SPI_PANEL);
     #[cfg(feature = "machine-spi-flash")]
@@ -970,6 +988,8 @@ pub fn registry() -> Result<Registry> {
     crate::bus::spi::controller::register(&mut reg)?;
     #[cfg(feature = "dev-st7272a")]
     crate::dev::sitronix::register(&mut reg)?;
+    #[cfg(feature = "dev-ssd1306")]
+    crate::dev::solomon::register(&mut reg)?;
     #[cfg(any(
         feature = "dev-stm32",
         feature = "dev-stm32-dma",
@@ -1104,6 +1124,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::bus::spi::controller::bind(&mut b)?;
     #[cfg(feature = "dev-st7272a")]
     crate::dev::sitronix::bind(&mut b)?;
+    #[cfg(feature = "dev-ssd1306")]
+    crate::dev::solomon::bind(&mut b)?;
     #[cfg(any(
         feature = "dev-stm32",
         feature = "dev-stm32-dma",
@@ -1237,6 +1259,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::bus::spi::controller::schema());
     #[cfg(feature = "dev-st7272a")]
     for schema in crate::dev::sitronix::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-ssd1306")]
+    for schema in crate::dev::solomon::schemas() {
         table.insert(schema);
     }
     #[cfg(any(

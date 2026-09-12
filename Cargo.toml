@@ -672,6 +672,29 @@ dev-usb-xhci-pci = ["dev-usb-xhci", "bus-pci"]
 # so a firmware that dims the panel produces a dimmer picture. Needs `bus-spi`.
 dev-st7272a = ["bus-spi"]
 
+# The Solomon Systech SSD1306/SSD1309 and the Sino Wealth SH1106
+# (src/dev/solomon): the 128x64 monochrome OLED on more hobby boards than any
+# other display. Unlike `dev-st7272a` this part **owns its own framebuffer** --
+# the picture is in the controller's GDDRAM and the guest sends it a byte at a
+# time over a serial bus, so nothing dirties a guest page and the pixels are
+# architectural state that has to be in the snapshot. That seam is
+# `src/dev/lcd/panel.rs` and `src/host/display/panel.rs`, designed here and
+# meant to be reused by every later smart panel.
+#
+# Covers the page-addressed GDDRAM of datasheet Rev 1.1 §8.7, all three
+# addressing modes with their exact wrap rules (§10.1.3), the full command set
+# with its parameter counts, contrast/invert/entire-on/display-off, segment
+# remap, COM scan direction, multiplex ratio, display start line and offset --
+# and the SH1106's 132-column RAM with the two-column visible offset, which is
+# the single most misimplemented thing about this family.
+#
+# **Both transports**, which is why it needs both bus features: 4-wire SPI with
+# D/C as an ordinary wire, 3-wire SPI where D/C is the first of nine bits, and
+# I2C where a control byte selects command-versus-data. Needs `bus-spi` and
+# `bus-i2c`. `no_std + alloc`, no dependencies.
+dev-ssd1306 = ["bus-spi", "bus-i2c"]
+
+
 # A generic RGB scanout engine (src/dev/lcd): the half of a display path that
 # owns *where the pixels are* — a framebuffer base in an address space, a
 # geometry, a pixel format, a stride, and a frame period derived from a clock
@@ -690,6 +713,18 @@ dev-lcdc = []
 # something. The machine file writes down which SPI modelling style it uses, and
 # `-p link=transactional` switches it. Adds no dependencies.
 machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
+
+# The `oled-spi` board (machines/oled-spi.machine plus the classes it names): an
+# SPI controller and an SSD1306 on the far end of it, and nothing else -- **no
+# processor**, for the reason `nvme-mini` has none. Every register is reached
+# through an address space and a test drives those directly, which is how a
+# driver reaches them anyway, and a failure on a board with three objects is a
+# failure in the device rather than a bisection. It is the board that makes the
+# device-owned framebuffer reachable end to end: `tests/oled_panel.rs` clocks a
+# real initialisation sequence and a real frame down a real SPI link and
+# captures the picture through `host::display::panel`. Adds no dependencies.
+machine-oled-spi = ["bus-spi", "dev-ssd1306"]
+
 
 # The translation IR (src/ir): the architecture-neutral op set every CPU
 # frontend lifts into and every JIT backend lowers from, its typed SSA blocks,

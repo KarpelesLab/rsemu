@@ -90,6 +90,10 @@ pub mod lcd;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
 pub mod nes;
 
+#[cfg(feature = "dev-ssd1306")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-ssd1306")))]
+pub mod panel;
+
 #[cfg(feature = "dev-pc-video")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-video")))]
 pub mod pc;
