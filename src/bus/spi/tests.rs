@@ -1072,3 +1072,119 @@ fn the_register_block_is_word_wide_only() {
     let mut word = [0u8; 4];
     assert!(block.read(0x02, &mut word, MemAttrs::DEFAULT).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// How many wires a phase runs on
+// ---------------------------------------------------------------------------
+
+/// A slave that records the width of every word as well as the word.
+#[derive(Debug)]
+struct WidthLog {
+    seen: Mutex<Vec<(u32, Lines)>>,
+}
+
+impl WidthLog {
+    fn new() -> Arc<WidthLog> {
+        Arc::new(WidthLog {
+            seen: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+        })
+    }
+}
+
+impl SpiSlave for WidthLog {
+    fn format(&self) -> Format {
+        Format::DEFAULT
+    }
+
+    fn select(&self, _selected: bool) {}
+
+    fn transfer(&self, mosi: u32) -> u32 {
+        self.transfer_wide(mosi, Lines::SINGLE)
+    }
+
+    fn transfer_wide(&self, mosi: u32, lines: Lines) -> u32 {
+        self.seen.lock().push((mosi, lines));
+        u32::from(lines.count())
+    }
+}
+
+#[test]
+fn a_width_converts_between_bits_and_clocks_exactly() {
+    // The arithmetic every dummy phase and every tCEM budget rests on. Each
+    // width a serial memory has divides eight, so none of this rounds.
+    assert_eq!(Lines::SINGLE.cycles(8), 8);
+    assert_eq!(Lines::DUAL.cycles(8), 4);
+    assert_eq!(Lines::QUAD.cycles(8), 2);
+    assert_eq!(Lines::OCTAL.cycles(8), 1);
+    // And back: `DCYC = 6` on four lines is 24 bits, which is three bytes —
+    // the conversion a quad fast read lives or dies by.
+    assert_eq!(Lines::QUAD.bits(6), 24);
+    assert_eq!(Lines::SINGLE.bits(8), 8);
+    // Zero is a mode field's "this phase does not happen", and a phase that is
+    // happening is on at least one wire.
+    assert_eq!(Lines(0).count(), 1);
+    assert_eq!(Lines(0).cycles(8), 8);
+    assert!(!Lines(3).is_standard());
+    assert!(Lines::QUAD.is_standard());
+}
+
+#[test]
+fn the_default_transfer_is_one_line_and_a_slave_that_ignores_it_still_works() {
+    // The compatibility claim for every part already on this fabric: `Echo`
+    // implements `transfer` only, and a quad word reaches it unchanged.
+    let echo = Echo::new(Format::DEFAULT, &[0xa5, 0x5a]);
+    let bus = SpiBus::new();
+    bus.attach(ChipSelect(0), Arc::clone(&echo) as Arc<dyn SpiSlave>)
+        .expect("cs0 is free");
+    bus.select(Some(ChipSelect(0)));
+    assert_eq!(bus.transfer(0x11), 0xa5);
+    assert_eq!(bus.transfer_wide(0x22, Lines::QUAD), 0x5a);
+    assert_eq!(
+        echo.take_log(),
+        vec![
+            Word::Select(true),
+            Word::Transfer(0x11),
+            Word::Transfer(0x22)
+        ],
+        "the same two words, whatever the master said about wires"
+    );
+}
+
+#[test]
+fn a_slave_that_cares_is_told_which_width_each_word_arrived_on() {
+    let log = WidthLog::new();
+    let bus = SpiBus::new();
+    bus.attach(ChipSelect(0), Arc::clone(&log) as Arc<dyn SpiSlave>)
+        .expect("cs0 is free");
+    bus.select(Some(ChipSelect(0)));
+    // A mixed-width frame, which is what a quad command is: the opcode on one
+    // wire, the rest on four.
+    assert_eq!(bus.transfer(0xeb), 1);
+    assert_eq!(bus.transfer_wide(0x12, Lines::QUAD), 4);
+    assert_eq!(bus.transfer_wide(0x34, Lines::OCTAL), 8);
+    assert_eq!(
+        *log.seen.lock(),
+        vec![
+            (0xeb, Lines::SINGLE),
+            (0x12, Lines::QUAD),
+            (0x34, Lines::OCTAL)
+        ]
+    );
+}
+
+#[test]
+fn the_wired_front_end_is_one_bit_per_edge_and_says_so() {
+    // The seam's remaining limit, asserted rather than only documented: there
+    // is one `mosi` wire in the pin map, so a part reached through `SlavePins`
+    // is told `SINGLE` however the controller was configured.
+    let log = WidthLog::new();
+    let pins = Arc::new(SlavePins::new(Arc::clone(&log) as Arc<dyn SpiSlave>));
+    pins.drive(pin::CS, Level::Low);
+    for _ in 0..8 {
+        pins.drive(pin::MOSI, Level::High);
+        pins.drive(pin::SCK, Level::High);
+        pins.drive(pin::SCK, Level::Low);
+    }
+    pins.drive(pin::CS, Level::High);
+    assert_eq!(*log.seen.lock(), vec![(0xff, Lines::SINGLE)]);
+}

@@ -8,6 +8,7 @@ relevant to embedded and SoC machines rather than the PC or the consoles.
 | I²C / SMBus | NXP **UM10204** *I2C-bus specification and user manual* — search nxp.com for "UM10204" | The definitive document. SMBus adds timeouts and a command layer on top; SBS Forum publishes the SMBus specification |
 | SPI | No formal standard — Motorola's original application note plus each peripheral's datasheet | In practice the *device* datasheet is the specification: mode (CPOL/CPHA), word size, framing |
 | SPI NOR flash | Winbond **W25Q** datasheets; see [`storage.md`](storage.md) | The one SPI peripheral almost every board has, and the one whose *semantics* matter more than its framing |
+| QSPI pseudo-static RAM | AP Memory **APS6404L-3SQR** datasheet; ISSI IS66WVS2M8, Espressif ESP-PSRAM64H and Lyontek LY68L6400 share the command set | The instruction table, tCEM (8 µs of chip-select-low), the 1 KiB burst wrap and `C0h`'s toggle, and the `9Fh` identification bytes. ST **RM0432**/**RM0456**'s OCTOSPI chapter for `DCR3`'s `CSBOUND` and `MAXTRAN`, the two controller fields that exist to satisfy tCEM |
 | 1-Wire | Analog Devices / Maxim device datasheets and application notes | Timing-defined protocol; the datasheet is authoritative |
 | MDIO | IEEE 802.3 Clause 22 / 45 | For PHY management behind Ethernet MACs |
 
@@ -51,10 +52,37 @@ Three things, each recorded where a future change would want them:
 - **A slave declares one mode, and some parts accept two.** A W25Q works in
   mode 0 and mode 3 — they differ only in where SCK rests between frames — so
   `flash.spinor` takes a `mode` property rather than the seam expressing "either".
-- **The fabric has one data line.** Dual and quad commands are decoded and
-  their byte streams are right, but nothing can say that a phase runs on two or
-  four wires, so they cost single-line time. A controller that cares is
-  measuring a bus width the fabric does not have.
+- **The *wired* fabric has one data line.** A transactional word now carries
+  its width — `Lines` on `SpiSlave::transfer_wide`, per *phase*, because an
+  APS6404L's `EBh` is a one-line opcode with a four-line address, dummy and
+  data — and `stm32.octospi` passes `CCR`'s `IMODE`/`ADMODE`/`ABMODE`/`DMODE`
+  straight through, which is also what makes its `DCYC` convert to the right
+  number of bytes on a quad command. What has not changed is the pin map:
+  there is one `mosi` wire and one `miso` wire, so `SlavePins` announces
+  `Lines::SINGLE` and `link = "wired"` cannot express a quad phase. A part
+  whose command set stops being decodable in the wrong width — `psram.qspi`
+  after `35h` — therefore needs a transactional master, and says so.
+
+### How a slave gets time
+
+It does not have a clock domain, and `SpiSlave::select` carries no timestamp.
+Both were considered for `psram.qspi`, whose datasheet specifies **tCEM** — the
+maximum time the chip select may stay low before the array goes unrefreshed —
+and both were refused for the reason `flash.spinor` already gives about its own
+busy window: `SCK` is the *master's* clock, the part's internal oscillator is
+not a crystal any board wires, and a slave is reached from inside its
+controller's own `advance_to`, where arming a scheduler event is not available.
+
+What is left is the only clock actually on the link, and it turns out to be
+enough: **the master's, counted**. A word arrives with the width it was clocked
+at, a byte on `n` wires is exactly `8 / n` clocks, and so a slave can add up the
+length of a chip-select assertion in integer arithmetic without reading a clock
+of any kind. `psram.qspi` takes its budget as `tcem-cycles` rather than
+nanoseconds because a slave has no rate to convert with — 8 µs is 672 clocks at
+84 MHz and 480 at 60, and the *board* is what knows which. `stm32.octospi`
+computes the same number on its side of the same bus, which is what lets
+`CR.TCEN`/`LPTR` raise `SR.TOF` and `DCR3`'s `CSBOUND`/`MAXTRAN` split a burst
+before the part complains.
 
 `SpiSlave::turnaround` covers the parts that answer in the *second half of the
 same word* rather than the next one — the ST7272A's read frame is `R A6..A0`

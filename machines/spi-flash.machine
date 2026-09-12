@@ -61,8 +61,10 @@
 # not available.
 #
 # The dual and quad read commands are decoded and their byte streams are right,
-# but `bus::spi` has one data line, so they cost single-line time. This board's
-# firmware uses `03h` and `0Bh`, where the question does not arise.
+# but `flash.spinor` does not read the per-phase line width `bus::spi` now
+# carries, so they cost single-line time. This board's firmware uses `03h` and
+# `0Bh`, where the question does not arise; a board that cares about quad
+# timing wants `psram.qspi`, which does read it.
 
 machine "spi-flash" {
   # Which named SPI bus the controllers and the flash meet on, so that two of

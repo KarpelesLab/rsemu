@@ -53,6 +53,29 @@
 //! device model cannot express the wrong thing: whatever it returns is what was
 //! already in its shift register.
 //!
+//! # How many wires a phase runs on
+//!
+//! SPI proper has one data line each way, and that is what [`Shifter`] and
+//! [`SlavePins`] drive. The parts that made it past that — a quad NOR flash, a
+//! QSPI PSRAM — do not change what a *word* is; they change how many of its
+//! bits go out per clock, and they change it **per phase of a frame**: an
+//! APS6404L's `EBh` sends its opcode on one line and its address, dummy and
+//! data on four.
+//!
+//! So the width is not in [`Format`], which is what a part declares once. It
+//! rides with the word, as [`Lines`] on [`SpiSlave::transfer_wide`], because
+//! the master is what decides it and it changes three times inside one frame.
+//! A part that does not care implements [`SpiSlave::transfer`] and never sees
+//! it; a part that does — [`crate::dev::psram`], whose command set stops being
+//! decodable in the wrong width — reads it and answers accordingly.
+//!
+//! **The wired link is one bit per edge and stays that way.** There is one
+//! `mosi` wire and one `miso` wire in the pin map, so [`SlavePins`] announces
+//! [`Lines::SINGLE`] and nothing it drives can be wider. Width is carried by
+//! [`Link::Transactional`] alone, which is the link a memory controller with a
+//! width field in its registers uses anyway. `docs/buses/low-speed.md` records
+//! it as the seam's remaining limit.
+//!
 //! # Finding each other
 //!
 //! A controller and its slaves are separate objects in a machine description and
@@ -227,6 +250,93 @@ pub const MIN_WORD_BITS: u8 = 1;
 /// consists of 16 bits of data").
 pub const MAX_WORD_BITS: u8 = 32;
 
+/// How many data lines one phase of a frame is clocked on.
+///
+/// One is SPI as specified; two, four and eight are the dual, quad and octal
+/// extensions every serial memory has grown. The number is the count of wires,
+/// so [`Lines(4)`](Lines) carries four bits per clock and an eight-bit word
+/// takes two cycles rather than eight.
+///
+/// **Deliberately not part of [`Format`].** A part declares its framing once;
+/// its *width changes inside a single frame* — an APS6404L's `EBh` is a
+/// one-line opcode followed by a four-line address, dummy and data — and it is
+/// the master that decides, out of its own command register. So it travels
+/// with the word, on [`SpiSlave::transfer_wide`] and [`SpiBus::transfer_wide`].
+///
+/// A `#[repr(transparent)]` newtype with `pub const` variants rather than an
+/// enum (`CLAUDE.md`, "Type conventions"): the set is open — hyperbus and the
+/// 16-line parts exist — and a `match` downstream must not break when a wider
+/// one appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct Lines(pub u8);
+
+impl Lines {
+    /// One wire each way. Plain SPI, and what every existing part on this
+    /// fabric uses.
+    pub const SINGLE: Lines = Lines(1);
+    /// Two, as `3Bh`/`BBh` on a NOR flash use.
+    pub const DUAL: Lines = Lines(2);
+    /// Four: `IO0..IO3`, which is what "QSPI" means in a part number.
+    pub const QUAD: Lines = Lines(4);
+    /// Eight, the OCTOSPI's reason for existing.
+    pub const OCTAL: Lines = Lines(8);
+
+    /// The wire count, with zero read as one.
+    ///
+    /// Zero is what a controller's mode field means by "this phase does not
+    /// happen"; a phase that *is* happening is on at least one wire, and
+    /// treating zero as one keeps every divisor here non-zero without a
+    /// caller having to remember.
+    #[must_use]
+    pub const fn count(self) -> u8 {
+        if self.0 == 0 { 1 } else { self.0 }
+    }
+
+    /// Whether this is a width a serial memory actually has.
+    ///
+    /// Not enforced anywhere — a controller may be programmed with nonsense
+    /// and the result should be a frame the part does not understand, not a
+    /// panic — but a device model that wants to complain has something to
+    /// complain about.
+    #[must_use]
+    pub const fn is_standard(self) -> bool {
+        matches!(self.0, 1 | 2 | 4 | 8)
+    }
+
+    /// How many clock cycles `bits` bits take at this width.
+    ///
+    /// The conversion the whole type exists for: a datasheet counts a dummy
+    /// phase in *clocks* and a controller's register counts it in clocks too,
+    /// while a transactional link moves *bytes*. Rounded up, because a
+    /// fractional clock is a clock.
+    #[must_use]
+    pub const fn cycles(self, bits: u64) -> u64 {
+        bits.div_ceil(self.count() as u64)
+    }
+
+    /// How many bits `cycles` cycles carry at this width.
+    ///
+    /// The inverse, and the direction a controller uses: `DCYC = 6` on four
+    /// lines is 24 bits, which is three bytes of a transactional frame.
+    #[must_use]
+    pub const fn bits(self, cycles: u64) -> u64 {
+        cycles * self.count() as u64
+    }
+}
+
+impl Default for Lines {
+    fn default() -> Lines {
+        Lines::SINGLE
+    }
+}
+
+impl fmt::Display for Lines {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-line", self.count())
+    }
+}
+
 /// Everything a datasheet gets to decide about how bits are framed.
 ///
 /// Carried by value: it is four bytes of configuration and copying it is
@@ -337,6 +447,28 @@ pub trait SpiSlave: Send + Sync + fmt::Debug {
     /// Only called while selected.
     fn transfer(&self, mosi: u32) -> u32;
 
+    /// Exchange one word that the master clocked on `lines` wires.
+    ///
+    /// The width channel. Everything [`transfer`](SpiSlave::transfer) says
+    /// still holds — same word, same full duplex, same one call per word — and
+    /// this adds the one thing a quad part cannot do without: *how many wires
+    /// the master used for this phase*. A QSPI PSRAM in QPI mode cannot decode
+    /// a one-line opcode at all, and a model that never learned the width
+    /// would answer a command the silicon would not have understood.
+    ///
+    /// The default ignores it and forwards, which is right for every part with
+    /// one data line: the width of a phase it does not vary is not information
+    /// it can use. Override it *instead of* thinking about
+    /// [`transfer`](SpiSlave::transfer) — implement `transfer` as this at
+    /// [`Lines::SINGLE`], the way [`crate::dev::psram`] does.
+    ///
+    /// Only [`Link::Transactional`] carries a width; [`SlavePins`] drives one
+    /// `mosi` wire and so always says [`Lines::SINGLE`].
+    fn transfer_wide(&self, mosi: u32, lines: Lines) -> u32 {
+        let _ = lines;
+        self.transfer(mosi)
+    }
+
     /// What this slave would put on MISO if a word started now, without
     /// starting one.
     ///
@@ -390,6 +522,15 @@ pub trait SpiSlave: Send + Sync + fmt::Debug {
 /// does not clock individual bits, so that [`SpiBus::transfer`] and
 /// [`SlavePins`] cannot drift apart about what a read frame returns.
 pub fn exchange(slave: &dyn SpiSlave, mosi: u32) -> u32 {
+    exchange_wide(slave, mosi, Lines::SINGLE)
+}
+
+/// One word through `slave` on `lines` wires, honouring a mid-word turnaround.
+///
+/// [`exchange`] is this at [`Lines::SINGLE`]. The turnaround splice is
+/// unaffected by the width — a turnaround is a position in the *word*, and a
+/// word is the same word however many wires carried it.
+pub fn exchange_wide(slave: &dyn SpiSlave, mosi: u32, lines: Lines) -> u32 {
     let format = slave.format();
     let turn = match (slave.turnaround(), format.order) {
         (Some(n), BitOrder::MsbFirst) if n > 0 && n < format.bits => Some(n),
@@ -403,7 +544,7 @@ pub fn exchange(slave: &dyn SpiSlave, mosi: u32) -> u32 {
             .partial(n, mosi >> remaining)
             .map(|word| (remaining, word))
     });
-    let presented = format.truncate(slave.transfer(mosi));
+    let presented = format.truncate(slave.transfer_wide(mosi, lines));
     match spliced {
         Some((remaining, word)) => {
             let mask = if remaining >= 32 {
@@ -702,6 +843,17 @@ impl SpiBus {
     /// controller clocking a bus with no slave on it is a perfectly ordinary
     /// thing for firmware to do while probing.
     pub fn transfer(&self, word: u32) -> u32 {
+        self.transfer_wide(word, Lines::SINGLE)
+    }
+
+    /// Exchange one word, clocked on `lines` wires, with whichever slave is
+    /// selected.
+    ///
+    /// [`transfer`](SpiBus::transfer) is this at [`Lines::SINGLE`]. The fabric
+    /// does nothing with the width but hand it on: it is the *master's*
+    /// statement about how it drove the pins for this phase, and only the part
+    /// on the other end can say whether that was a command it understands.
+    pub fn transfer_wide(&self, word: u32, lines: Lines) -> u32 {
         let Some(cs) = self.selected() else {
             return u32::MAX;
         };
@@ -710,7 +862,7 @@ impl SpiBus {
         };
         // Outside the lock: the slave may remap, drive a wire or reach a
         // sibling from inside `transfer`.
-        exchange(&*slave, word)
+        exchange_wide(&*slave, word, lines)
     }
 
     /// What the selected slave would return, without transferring anything.

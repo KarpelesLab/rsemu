@@ -41,14 +41,22 @@
 //!
 //! # One data line, and what that costs
 //!
-//! `bus::spi` models **one** MOSI and one MISO, which is what SPI is. The dual
-//! and quad commands (`3Bh`, `BBh`, `6Bh`, `EBh`) exist on this part because
-//! everything real uses them, and they are decoded here: the opcode is
+//! The dual and quad commands (`3Bh`, `BBh`, `6Bh`, `EBh`) exist on this part
+//! because everything real uses them, and they are decoded here: the opcode is
 //! accepted, the address, mode and dummy phases are consumed, the `QE` bit
 //! gates the quad ones, and the **byte stream is exactly right**. What is not
 //! modelled is that their address and data phases take a half or a quarter of
-//! the clocks — the seam has no notion of how many lines a phase uses, so
-//! every command here costs single-line time.
+//! the clocks, so every command here costs single-line time.
+//!
+//! That is now this part's choice rather than the fabric's limit.
+//! `bus::spi` carries a per-phase [`Lines`](crate::bus::spi::Lines) on
+//! [`SpiSlave::transfer_wide`](crate::bus::spi::SpiSlave::transfer_wide), and
+//! [`psram.qspi`](crate::dev::psram) reads it — it has to, because its command
+//! set stops being decodable in the wrong width. A NOR flash's does not: every
+//! opcode here is a one-line opcode and the width only changes what the frame
+//! *costs*. Reading it would mean this part refusing a controller that clocked
+//! `EBh` on one wire, which would break the boards in this tree that do
+//! exactly that and gain nothing a timing model does not already owe.
 //!
 //! The dummy phases follow from converting the datasheet's *clock* counts into
 //! *bytes* at the line count each phase uses, which is the only conversion
