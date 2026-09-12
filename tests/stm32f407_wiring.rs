@@ -603,3 +603,147 @@ fn memrmp_switches_the_boot_alias_to_sram() {
         "the system-bootloader encoding aliased something this board does not have"
     );
 }
+
+/// A firmware image that does nothing but stay alive: a vector table whose
+/// reset vector points at `B .`.
+///
+/// [`boot`]'s empty image is fine for a test that pokes a peripheral and reads
+/// it straight back, because the machine only has to get through realize. It is
+/// *not* fine for one that runs the scheduler: a core that resets to `SP = 0`
+/// and `PC = 0` faults into lockup and stops asking for time, and a peripheral
+/// starved of quanta looks exactly like a peripheral that was never wired.
+fn spinning_firmware() -> Vec<u8> {
+    let mut image = vec![0u8; 0x400];
+    image[0x00..0x04].copy_from_slice(&STACK.to_le_bytes());
+    image[0x04..0x08].copy_from_slice(&(ENTRY | 1).to_le_bytes());
+    // `B .` — encoding T2, DDI 0403 A7.7.12, with an `imm11` of -2 halfwords.
+    let at = ENTRY as usize;
+    image[at..at + 2].copy_from_slice(&0xe7feu16.to_le_bytes());
+    image
+}
+
+#[test]
+fn tim2_reaches_stream_7_only_when_chsel_names_its_channel() {
+    // RM0090 Table 43 puts `TIM2_UP` on DMA1 **stream 1 channel 3** and on
+    // **stream 7 channel 3**. This board wires both, which it could not do
+    // before `CHSEL` gated the request: a guest using stream 7 for one of the
+    // seven other requests that share it would otherwise be handed TIM2's
+    // update events as well. That is the failure this test exists for, and it
+    // is invisible to any unit test of either device.
+    //
+    // Stream 7's registers are at DMA1 + 0x10 + 0x18 * 7 (RM0090 §10.5).
+    const S7CR: u64 = DMA1 + 0x10 + 0x18 * 7;
+    const S7NDTR: u64 = S7CR + 4;
+    const S7PAR: u64 = S7CR + 8;
+    const S7M0AR: u64 = S7CR + 0x0c;
+    /// `HISR` is DMA1 + 0x04, and stream 7's flags sit at bit 22 (§10.5.2).
+    const HISR: u64 = DMA1 + 0x04;
+    const TCIF7: u64 = 1 << (22 + 5);
+    /// `TIM2_DIER.UDE`, RM0090 §17.4.4 bit 8: an update raises the DMA request.
+    const DIER_UDE: u64 = 1 << 8;
+
+    /// `CHSEL` is `SxCR` bits 27:25.
+    fn chsel(n: u64) -> u64 {
+        n << 25
+    }
+
+    /// Arm stream 7 peripheral-to-memory on channel `sel` and let TIM2's
+    /// update event drive it, returning what `NDTR` reached.
+    ///
+    /// It polls `NDTR` between quanta the way a driver waiting on a transfer
+    /// does, and that is not incidental: `st.tim` catches its counter up on
+    /// access, so a run with no reads in it is a timer that produces no
+    /// updates. Eight rounds is several times what the transfer needs.
+    fn remaining_after_eight_rounds(sel: u64) -> (u64, u64) {
+        let mut m = boot_with(spinning_firmware());
+        store(&m, S7PAR, SRAM1 + 0x100);
+        store(&m, S7M0AR, SRAM1 + 0x200);
+        store(&m, S7NDTR, 4);
+        // Peripheral-to-memory, byte on both sides, `MINC`, then `EN`.
+        store(&m, S7CR, chsel(sel) | (1 << 10) | 1);
+        // `PSC` = 99, `ARR` = 9: an update every thousand timer ticks.
+        store(&m, TIM2 + 0x28, 99);
+        store(&m, TIM2 + 0x2c, 9);
+        store(&m, TIM2 + 0x0c, DIER_UDE);
+        store(&m, TIM2, 1); // `CR1.CEN`
+        let mut left = 4;
+        for _ in 0..8 {
+            m.run_for(GlobalTime::from_nanos(1_000_000))
+                .expect("it runs");
+            left = peek(&m, S7NDTR);
+        }
+        (left, peek(&m, HISR) & TCIF7)
+    }
+
+    // Channel 5 is a channel TIM2 is not on — Table 43's stream 7 channel 5 is
+    // `TIM3_CH3` — so the update events must not be heard.
+    assert_eq!(
+        remaining_after_eight_rounds(5),
+        (4, 0),
+        "stream 7 is listening to channel 5 and heard TIM2 on channel 3"
+    );
+
+    // The same stream and the same wiring with `CHSEL = 3`: now it is TIM2's.
+    assert_eq!(
+        remaining_after_eight_rounds(3),
+        (0, TCIF7),
+        "TIM2_UP is wired to `dma1.req7c3` and CHSEL says 3, so it should move"
+    );
+}
+
+#[test]
+fn a_stream_hears_only_the_request_wired_to_it_and_not_its_neighbours() {
+    // The finer half of the same story, and the one that is a machine-layer
+    // fact rather than a device one.
+    //
+    // Table 43's DMA1 channel 3 column is all TIM2: stream 1 is
+    // `TIM2_UP`/`TIM2_CH3`, stream 5 is `TIM2_CH1`, **stream 6 is
+    // `TIM2_CH2`/`TIM2_CH4`**, stream 7 is `TIM2_UP`/`TIM2_CH4`. Writing that
+    // column down puts `tim2.dma-up` into two pins and `tim2.dma-ch4` into two
+    // more, and a net is a *connected component* of the wire statements — so
+    // streams 1, 6 and 7 end up in one component with five drivers in it.
+    //
+    // A sink handed the component's drivers rather than its own would have
+    // stream 6 served by TIM2's **update** event, which is exactly the spurious
+    // beat `CHSEL` gating exists to prevent, arriving by a different road.
+    // `realize::drivers_of` is what stops it.
+    //
+    // So: `UDE` on and every `CCxDE` off. Stream 1 is wired to `TIM2_UP` and
+    // must run; stream 6 is not and must not.
+    const S1CR: u64 = DMA1 + 0x10 + 0x18;
+    const S6CR: u64 = DMA1 + 0x10 + 0x18 * 6;
+    /// `LISR` is DMA1 + 0x00 and stream 1's flags sit at bit 6 (§10.5.1).
+    const TCIF1: u64 = 1 << (6 + 5);
+    /// `TIM2_DIER.UDE`, RM0090 §17.4.4 bit 8.
+    const DIER_UDE: u64 = 1 << 8;
+
+    let mut m = boot_with(spinning_firmware());
+    for (cr, dst) in [(S1CR, SRAM1 + 0x200), (S6CR, SRAM1 + 0x300)] {
+        store(&m, cr + 8, SRAM1 + 0x100); // `SxPAR`
+        store(&m, cr + 0x0c, dst); // `SxM0AR`
+        store(&m, cr + 4, 4); // `SxNDTR`
+        // Peripheral-to-memory, byte on both sides, `MINC`, `CHSEL = 3`, `EN`.
+        store(&m, cr, (3 << 25) | (1 << 10) | 1);
+    }
+    store(&m, TIM2 + 0x28, 99); // `PSC`
+    store(&m, TIM2 + 0x2c, 9); // `ARR`
+    store(&m, TIM2 + 0x0c, DIER_UDE); // the update event only
+    store(&m, TIM2, 1); // `CR1.CEN`
+
+    let mut stream1 = 4;
+    let mut stream6 = 4;
+    for _ in 0..8 {
+        m.run_for(GlobalTime::from_nanos(1_000_000))
+            .expect("it runs");
+        stream1 = peek(&m, S1CR + 4);
+        stream6 = peek(&m, S6CR + 4);
+    }
+
+    assert_eq!(stream1, 0, "stream 1 is `TIM2_UP`'s and should have run");
+    assert_eq!(peek(&m, DMA1) & TCIF1, TCIF1);
+    assert_eq!(
+        stream6, 4,
+        "stream 6's channel-3 cell is `TIM2_CH2`/`TIM2_CH4`, and neither is \
+         enabled: it heard a request no `wire` statement gave it"
+    );
+}

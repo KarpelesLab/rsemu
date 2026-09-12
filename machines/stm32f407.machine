@@ -415,25 +415,29 @@ machine "stm32f407" {
   # per beat, and what matters for firmware is that a transfer *takes time at
   # all* rather than completing inside the store that sets `EN`.
   #
-  # **One peripheral drives a request line**, and it is `sdio` — written out
-  # under the interrupts. The request matrix of RM0090 Table 43 is a fact about
-  # the part and so belongs in this file, exactly as a vector number does.
+  # **The request matrix is wired out below**, under the interrupts. RM0090
+  # Tables 43 and 44 are a fact about the part — which peripheral reaches which
+  # stream, on which channel — so they belong in this file, exactly as a vector
+  # number does.
   #
-  # **The rest of the matrix stays out, and not for want of a device.**
-  # `st.tim` now publishes `dma-up`, `dma-ch1`–`dma-ch4` and `dma-trg`, so
-  # `wire tim2.dma-up -> dma1.req1` is a line this file could carry today, and
-  # `TIM2`'s `DCR`/`DMAR` burst window would write straight into its own `CCRx`.
-  # What stops it is the other half of the table: Table 43 maps each request to
-  # a stream **and a channel**, and `st.dma`'s `CHSEL` is stored without gating
-  # the transfer. Wire `TIM2_UP` to both of the streams the table gives it and a
-  # guest using one of those streams for something else gets beats it never
-  # asked for. Honouring `CHSEL` is a change to `st.dma`. `sdio` is exempt
-  # because it is wired to one stream, not to the pair.
+  # It took `CHSEL` to become wirable. Those tables are a *matrix*: every
+  # request reaches a stream **and** a channel, several requests share each
+  # stream, and `SxCR.CHSEL` is how firmware picks which of them the stream is
+  # listening to. `TIM2_UP` is on DMA1 stream 1 channel 3 *and* on stream 7
+  # channel 3, so wiring it to both plain `req1`/`req7` pins would hand a guest
+  # that is driving something else out of stream 7 beats it never asked for.
+  # `st.dma` now takes the channel in the pin name — `req7c3` is "stream 7,
+  # channel 3", served only while that stream's `CHSEL` reads 3 — and that is
+  # what makes the whole table safe to write down.
   #
-  # Every other `req` input is unconnected — `st.usart`, `st.i2c` and `st.spi`
-  # publish no output yet — so for those peripherals the streams here still
-  # serve memory-to-memory transfers. The timer's end of the seam is proved by
-  # `st.tim`'s own board-level test.
+  # A cell of the table holding two requests (`TIM2_CH2`/`TIM2_CH4` on stream 6
+  # channel 3) is two `wire` statements into one pin. They are OR'd there, the
+  # way they are OR'd on the die.
+  #
+  # `st.usart`, `st.i2c` and `st.spi` publish no request output yet, so their
+  # rows of the table are missing rather than wrong; `st.tim` and `stm32.sdio`
+  # are the two that do, and between them they cover most of both tables. Every
+  # unwired `req` input still serves memory-to-memory transfers.
   object dma1 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
   object dma2 "st.dma" { clock = hse * 21 / 4, space = dmabus, variant = "stream" }
 
@@ -889,15 +893,105 @@ machine "stm32f407" {
   wire usart2.irq -> cpu.irq38    # USART2 (USART1 is 37, USART3 39)
   wire sdio.irq   -> cpu.irq49    # SDIO
 
-  # The DMA request, and the only `req` pin on this board that anything drives.
-  # RM0090 Table 43 puts SDIO on **DMA2, channel 4, streams 3 and 6** — a
-  # peripheral with one request line reaching two streams, and a driver picks
-  # one. This board wires stream 3, which is what ST's own `SD_SDIO_DMA_STREAM`
-  # default names; a design that wants stream 6 changes this one line. Wiring
-  # both would model the silicon's fan-out exactly, and would also let a guest
-  # that armed both streams with `CHSEL = 4` have each beat served twice, which
-  # is a configuration the reference manual forbids rather than one to emulate.
-  wire sdio.dma   -> dma2.req3
+  # -- the DMA request matrix ------------------------------------------------
+  #
+  # RM0090 **Table 43** (DMA1) and **Table 44** (DMA2), which are what decide
+  # that `SD_SDIO_DMA_STREAM` is stream 3 and that a `HAL_DMA_Init` for
+  # `USART2_TX` names stream 6. Each cell is a stream *and* a channel, so a
+  # request goes to `reqNcM`: stream N, channel M, heard only while that
+  # stream's `SxCR.CHSEL` reads M. `st.dma`'s header has the long form.
+  #
+  # Read a line as one cell of the table. Where a cell holds several requests
+  # they are OR'd onto one line on the die, which here is several `wire`
+  # statements into the same pin — see stream 6 channel 3 below.
+  #
+  # Only the rows whose peripheral publishes a request output can be here:
+  # `st.tim` (`dma-up`, `dma-ch1`–`dma-ch4`, `dma-trg`) and `stm32.sdio`
+  # (`dma`). The ADC, DAC, SPI, USART, I²C, DCMI, CRYP and HASH rows are absent
+  # because those models drive nothing yet, not because the table omits them;
+  # their streams still serve memory-to-memory transfers. `st.tim` publishes no
+  # COM-event pin either, so the two cells that OR a `TIMx_COM` in — DMA2
+  # stream 4 channel 6 and stream 7 channel 7 — carry the rest of their cell
+  # and not that part of it.
+
+  # DMA1, channel 1 — TIM7's update event reaches two streams.
+  wire tim7.dma-up  -> dma1.req2c1
+  wire tim7.dma-up  -> dma1.req4c1
+
+  # DMA1, channel 2 — TIM4.
+  wire tim4.dma-ch1 -> dma1.req0c2
+  wire tim4.dma-ch2 -> dma1.req3c2
+  wire tim4.dma-up  -> dma1.req6c2
+  wire tim4.dma-ch3 -> dma1.req7c2
+
+  # DMA1, channel 3 — TIM2. The stream-6 and stream-7 cells each hold two
+  # requests, and `TIM2_UP` appears twice: once on stream 1, once on stream 7.
+  # That duplication is the whole reason `CHSEL` had to start gating.
+  wire tim2.dma-up  -> dma1.req1c3
+  wire tim2.dma-ch3 -> dma1.req1c3
+  wire tim2.dma-ch1 -> dma1.req5c3
+  wire tim2.dma-ch2 -> dma1.req6c3
+  wire tim2.dma-ch4 -> dma1.req6c3
+  wire tim2.dma-up  -> dma1.req7c3
+  wire tim2.dma-ch4 -> dma1.req7c3
+
+  # DMA1, channel 5 — TIM3.
+  wire tim3.dma-ch4 -> dma1.req2c5
+  wire tim3.dma-up  -> dma1.req2c5
+  wire tim3.dma-ch1 -> dma1.req4c5
+  wire tim3.dma-trg -> dma1.req4c5
+  wire tim3.dma-ch2 -> dma1.req5c5
+  wire tim3.dma-ch3 -> dma1.req7c5
+
+  # DMA1, channel 6 — TIM5. `TIM5_CH4`/`TIM5_TRIG` is on streams 1 and 3 alike.
+  wire tim5.dma-ch3 -> dma1.req0c6
+  wire tim5.dma-up  -> dma1.req0c6
+  wire tim5.dma-ch4 -> dma1.req1c6
+  wire tim5.dma-trg -> dma1.req1c6
+  wire tim5.dma-ch1 -> dma1.req2c6
+  wire tim5.dma-ch4 -> dma1.req3c6
+  wire tim5.dma-trg -> dma1.req3c6
+  wire tim5.dma-ch2 -> dma1.req4c6
+  wire tim5.dma-up  -> dma1.req6c6
+
+  # DMA1, channel 7 — TIM6, whose only DMA request is its update event.
+  wire tim6.dma-up  -> dma1.req1c7
+
+  # DMA2, channel 0 — the three-capture-compare cells, one line for CH1, CH2
+  # and CH3 together, which is what a `DCR`/`DMAR` burst across three `CCRx`
+  # registers is arranged for.
+  wire tim8.dma-ch1 -> dma2.req2c0
+  wire tim8.dma-ch2 -> dma2.req2c0
+  wire tim8.dma-ch3 -> dma2.req2c0
+  wire tim1.dma-ch1 -> dma2.req6c0
+  wire tim1.dma-ch2 -> dma2.req6c0
+  wire tim1.dma-ch3 -> dma2.req6c0
+
+  # DMA2, channel 4 — the SD host, on **streams 3 and 6** both. One request
+  # line reaching two streams is what the silicon does; a driver arms one of
+  # them and `CHSEL = 4` is what tells this board which. ST's own
+  # `SD_SDIO_DMA_STREAM` default is stream 3.
+  wire sdio.dma     -> dma2.req3c4
+  wire sdio.dma     -> dma2.req6c4
+
+  # DMA2, channel 6 — TIM1. `TIM1_CH1` is on streams 1 and 3; stream 4's cell
+  # is `TIM1_CH4`/`TIM1_TRIG`/`TIM1_COM`, of which this board can drive two.
+  wire tim1.dma-trg -> dma2.req0c6
+  wire tim1.dma-ch1 -> dma2.req1c6
+  wire tim1.dma-ch2 -> dma2.req2c6
+  wire tim1.dma-ch1 -> dma2.req3c6
+  wire tim1.dma-ch4 -> dma2.req4c6
+  wire tim1.dma-trg -> dma2.req4c6
+  wire tim1.dma-up  -> dma2.req5c6
+  wire tim1.dma-ch3 -> dma2.req6c6
+
+  # DMA2, channel 7 — TIM8, the same shape one channel over.
+  wire tim8.dma-up  -> dma2.req1c7
+  wire tim8.dma-ch1 -> dma2.req2c7
+  wire tim8.dma-ch2 -> dma2.req3c7
+  wire tim8.dma-ch3 -> dma2.req4c7
+  wire tim8.dma-ch4 -> dma2.req7c7
+  wire tim8.dma-trg -> dma2.req7c7
 
   # RM0090 Table 62 calls position **80** `HASH_RNG`: "Hash and Rng global
   # interrupt", vector address 0x0000_0180. The two cross-check — an external
