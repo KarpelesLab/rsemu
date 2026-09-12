@@ -975,6 +975,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::uart::ns16550::register(&mut reg)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::register(&mut reg)?;
+    #[cfg(feature = "dev-psram-qspi")]
+    crate::dev::psram::register(&mut reg)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::register(&mut reg)?;
     #[cfg(feature = "dev-keypad-matrix")]
@@ -1111,6 +1113,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::uart::ns16550::bind(&mut b)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::bind(&mut b)?;
+    #[cfg(feature = "dev-psram-qspi")]
+    crate::dev::psram::bind(&mut b)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::bind(&mut b)?;
     #[cfg(feature = "dev-keypad-matrix")]
@@ -1256,6 +1260,8 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::flash::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "dev-psram-qspi")]
+    table.insert(crate::dev::psram::schema());
     #[cfg(feature = "dev-sd-card")]
     for schema in crate::dev::sd::schemas() {
         table.insert(schema);

@@ -1243,6 +1243,20 @@ dev-stm32-sdio = ["dev-sd-card"]
 # instruction cut short by the chip select is not executed at all. Written from
 # the Winbond W25Q128JV datasheet. Needs `bus-spi`.
 dev-flash-spinor = ["bus-spi"]
+# QSPI pseudo-static RAM (src/dev/psram.rs): an AP Memory **APS6404L**-class
+# part -- the two to eight megabytes of RAM a microcontroller board hangs off
+# its OCTOSPI when the die's own SRAM runs out. Read (03h), fast read (0Bh),
+# fast read quad (EBh), write (02h) and quad write (38h), the 35h/F5h QPI mode
+# switch that makes *every* phase four wires, the 1 KiB linear-burst wrap and
+# C0h's toggle to 32 bytes, 9Fh identification, and the 66h/99h reset. It is an
+# `SpiSlave`, and the first part on this fabric whose frames are not all one
+# wire wide: `bus-spi` carries `Lines` per phase and `stm32.octospi` passes
+# `CCR`'s width fields straight through. It also carries the constraint that
+# makes pseudo-static RAM a device rather than memory -- **tCEM**, the maximum
+# time the chip select may stay low before the array goes unrefreshed -- as a
+# cycle budget the part checks and reports. Written from the APS6404L
+# datasheet. Needs `bus-spi`.
+dev-psram-qspi = ["bus-spi"]
 # The I2C bus (src/bus/i2c): the fabric, in both modelling styles that
 # docs/buses/low-speed.md asks to be deliberate rather than accidental.
 # `transactional` hands a bus event to the slave in one call; `wired` makes SCL

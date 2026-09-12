@@ -26,6 +26,7 @@
 //! | [`nvme`] | `dev-nvme` | an NVM Express controller: a PCI function that DMA-walks its own queues |
 //! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
+//! | [`psram`] | `dev-psram-qspi` | QSPI pseudo-static RAM: an APS6404L-class part, quad frames and tCEM |
 //! | [`lcd`] | `dev-lcdc`, `dev-ssd1306`, `dev-st77xx` | display controllers: a generic RGB scanout engine, and the device-owned-framebuffer seam every smart panel presents |
 //! | [`solomon`] | `dev-ssd1306` | the SSD1306/SSD1309 and SH1106 monochrome OLED: its own GDDRAM over SPI or I²C |
 //! | [`linuxboot`] | `dev-linuxboot` | the Linux/x86 boot protocol: a bzImage into memory and a stub that enters it |
@@ -117,6 +118,10 @@ pub mod nvme;
 #[cfg(feature = "dev-pc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc")))]
 pub mod pc;
+
+#[cfg(feature = "dev-psram-qspi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-psram-qspi")))]
+pub mod psram;
 
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
