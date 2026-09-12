@@ -429,6 +429,14 @@ pub struct Wire {
     /// The driven pin. Several wires may share one — that is wired-OR, and the
     /// sink tracks its sources.
     pub to: Pin,
+    /// Attributes of the **net**, evaluated: `pull`, today.
+    ///
+    /// The net is the connected component these statements build, so a value
+    /// written on one wire covers every pin in that component; the realizer is
+    /// what unifies them and what refuses a component that says two things.
+    pub props: Props,
+    /// Where each of those attributes was written.
+    pub prop_spans: PropSpans,
     /// The whole statement.
     pub span: Span,
 }
@@ -1258,6 +1266,7 @@ impl Resolver<'_> {
             Stmt::Wire(w) => Stmt::Wire(WireStmt {
                 from: self.substitute_path(&w.from, env)?,
                 to: self.substitute_path(&w.to, env)?,
+                props: self.substitute_props(&w.props, env)?,
                 span: w.span,
             }),
             other => other.clone(),
@@ -1807,9 +1816,12 @@ impl Resolver<'_> {
     }
 
     fn wire(&self, stmt: &WireStmt, scope: &str) -> Result<Wire, Diagnostic> {
+        let (props, prop_spans) = self.props(&stmt.props, scope)?;
         Ok(Wire {
             from: self.pin(&stmt.from, scope)?,
             to: self.pin(&stmt.to, scope)?,
+            props,
+            prop_spans,
             span: stmt.span,
         })
     }

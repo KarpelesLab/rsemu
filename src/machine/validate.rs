@@ -54,6 +54,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::core::props::{Props, Value, ValueKind, check_enum, check_range};
+use crate::core::wire::Pull;
 use crate::machine::diag::Diagnostic;
 use crate::machine::resolver::{MapTarget, ObjectId, PropSpans, Resolved, SpaceId};
 use crate::machine::span::Span;
@@ -704,14 +705,53 @@ fn check_region(
     }
 }
 
-/// A wire's endpoints must be pins, pointing the right way.
+/// A wire's endpoints must be pins, pointing the right way, and its trailing
+/// block may only say things about the net.
 fn check_wire(
     machine: &Resolved,
     wire: &crate::machine::resolver::Wire,
     classes: &impl Classes,
 ) -> Result<(), Diagnostic> {
     check_pin(machine, &wire.from, classes, true)?;
-    check_pin(machine, &wire.to, classes, false)
+    check_pin(machine, &wire.to, classes, false)?;
+    check_net_props(wire)
+}
+
+/// The attributes a `wire` statement's block may carry.
+///
+/// A short closed list rather than a [`ClassSchema`], because a net has no
+/// class: it is copper, and what can be said about it is a property of the
+/// wire model rather than of anything plugged into it.
+fn check_net_props(wire: &crate::machine::resolver::Wire) -> Result<(), Diagnostic> {
+    for (name, value) in wire.props.iter() {
+        let span = wire.prop_spans.get_or(name, wire.span);
+        match name {
+            "pull" => {
+                let Some(word) = value.as_str() else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "`pull` is a word — `\"up\"`, `\"down\"` or `\"none\"`",
+                    ));
+                };
+                if Pull::from_name(word).is_none() {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!(
+                            "`pull = \"{word}\"` is not a resistor; expected `\"up\"`, \
+                             `\"down\"` or `\"none\"`"
+                        ),
+                    ));
+                }
+            }
+            other => {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("`{other}` is not an attribute of a net; a `wire` block takes `pull`"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_pin(
@@ -1320,5 +1360,45 @@ error: wire cycle through combinational devices: `n1` → `n2` → `n1`; one dev
             "an edge detector holds a bit"
         );
         assert!(stock.get("wire.xor").is_none());
+    }
+
+    #[test]
+    fn a_nets_block_takes_a_pull_and_nothing_else() {
+        let classes = ClassTable::new().with(cpu_class()).with(
+            ClassSchema::new("nes.ppu")
+                .port("nmi", PortDir::Out)
+                .region("regs"),
+        );
+        let machine = |block: &str| {
+            format!(
+                "machine \"m\" {{\n  \
+                   osc master = 1000000 Hz\n  \
+                   space cpubus {{ width = 16 }}\n  \
+                   object cpu \"mos6502\" {{ clock = master / 12, space = cpubus }}\n  \
+                   object ppu \"nes.ppu\" {{ clock = master / 4 }}\n  \
+                   wire ppu.nmi -> cpu.nmi{block}\n\
+                 }}\n"
+            )
+        };
+        check(
+            &machine(" { pull = \"up\" }"),
+            &classes,
+            &ValidateOptions::new().requiring_known_classes(),
+        )
+        .expect("`pull` is what a net block is for");
+        check(&machine(""), &classes, &ValidateOptions::new())
+            .expect("and the block stays optional");
+
+        // A net has no class, so what may be said about it is a short closed
+        // list rather than a schema — and the diagnostic has to say so.
+        let unknown = error(&machine(" { pullup = \"yes\" }"), &classes);
+        assert!(unknown.contains("pullup"), "{unknown}");
+        assert!(unknown.contains("not an attribute of a net"), "{unknown}");
+
+        let misspelt = error(&machine(" { pull = \"high\" }"), &classes);
+        assert!(misspelt.contains("not a resistor"), "{misspelt}");
+
+        let wrong_kind = error(&machine(" { pull = 1 }"), &classes);
+        assert!(wrong_kind.contains("`pull` is a word"), "{wrong_kind}");
     }
 }

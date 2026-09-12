@@ -263,7 +263,7 @@ pub struct MapStmt {
     pub span: Span,
 }
 
-/// `wire ppu.nmi -> cpu.nmi`
+/// `wire ppu.nmi -> cpu.nmi`, or `wire keypad.col0 -> gpioc.in0 { pull = "up" }`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireStmt {
     /// The source pin.
@@ -271,6 +271,14 @@ pub struct WireStmt {
     /// The destination pin. Several sources may name one destination; that is
     /// a wired-OR, and §5 says it is declared once per source.
     pub to: Path,
+    /// Optional trailing block of **net** attributes: `pull`, and whatever else
+    /// is a property of the copper rather than of either end.
+    ///
+    /// A net is a connected component of these statements rather than one
+    /// statement, so an attribute written on any wire of a net applies to the
+    /// whole of it. Writing two different values across one net is a
+    /// diagnostic, not a race — see `realize`.
+    pub props: Vec<Property>,
     /// The whole statement.
     pub span: Span,
 }
@@ -675,10 +683,15 @@ fn dump_stmt(stmt: &Stmt, depth: usize, out: &mut String) {
         }
         Stmt::Wire(s) => {
             out.push_str(&format!(
-                "wire {} -> {}\n",
+                "wire {} -> {}",
                 dump_path(&s.from),
                 dump_path(&s.to)
             ));
+            if !s.props.is_empty() {
+                out.push(' ');
+                dump_props(&s.props, out);
+            }
+            out.push('\n');
         }
         Stmt::Threading(s) => {
             out.push_str(&format!("threading {}\n", s.mode.node));

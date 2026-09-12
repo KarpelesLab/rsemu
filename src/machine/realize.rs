@@ -131,7 +131,7 @@ use crate::core::space::{
 use crate::core::state::MachineShape;
 use crate::core::sync::AtomicU64;
 use crate::core::value::Endian;
-use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSource};
+use crate::core::wire::{NetMode, Pull, Wire, WireId, WireIdAllocator, WireSource};
 use crate::machine::machine::{
     DeviceEntry, LazyAdapter, Machine, MachineParts, Net, PinRef, RunAdapter,
 };
@@ -1491,12 +1491,35 @@ impl<'a> Realizer<'a> {
     /// `Wire`'s per-source state exists for.
     fn build_wires(&mut self) -> Result<(Vec<Net>, Vec<PinRef>)> {
         let mut pins = Pins::default();
-        for wire in &self.machine.wires {
+        // A `pull` is written on a wire statement but is a property of the
+        // *net*, so it is collected against a pin here and folded onto that
+        // pin's component once every union has happened.
+        let mut pulls: Vec<(usize, Pull, usize)> = Vec::new();
+        for (index, wire) in self.machine.wires.iter().enumerate() {
             let from = pins.intern(wire.from.object, &wire.from.port);
             let to = pins.intern(wire.to.object, &wire.to.port);
             pins.drives[from] = true;
             pins.receives[to] = true;
             pins.union(from, to);
+            if let Some(value) = wire.props.get("pull") {
+                let word = value.as_str().unwrap_or_default();
+                let pull = Pull::from_name(word).ok_or_else(|| {
+                    // The validator says this first and with a caret; realize
+                    // must not depend on having been validated.
+                    let object = self
+                        .machine
+                        .object(wire.from.object)
+                        .map_or("?", |o| o.name.as_str());
+                    config(
+                        format!("wire {object}.{}", wire.from.port),
+                        format!(
+                            "`pull = \"{word}\"` is not a resistor; expected `\"up\"`, \
+                             `\"down\"` or `\"none\"`"
+                        ),
+                    )
+                })?;
+                pulls.push((from, pull, index));
+            }
         }
 
         let allocator = WireIdAllocator::new();
@@ -1514,13 +1537,46 @@ impl<'a> Realizer<'a> {
             }
         }
 
-        for (_root, group) in members {
+        for (root, group) in members {
             let sources: Vec<usize> = group.iter().copied().filter(|p| pins.drives[*p]).collect();
             for pin in &sources {
                 ids[*pin] = allocator.alloc();
             }
             let source_ids: Vec<WireId> = sources.iter().map(|p| ids[*p]).collect();
-            let mut builder = Wire::builder().sources(&source_ids);
+            // One net, one answer. A `pull` written anywhere on the component
+            // decides the whole of it, and two statements that disagree are a
+            // description error rather than a race — the copper cannot carry
+            // two different resistors.
+            let mut mode = NetMode::PerSink;
+            let mut declared_at: Option<usize> = None;
+            for (pin, pull, index) in pulls.iter().copied() {
+                if pins.find(pin) != root {
+                    continue;
+                }
+                match declared_at {
+                    Some(first) if mode.pull() != pull => {
+                        let (object, port) = pins.pin(pin);
+                        let at = self.device(object, "wire")?.path.clone();
+                        return Err(config(
+                            at,
+                            format!(
+                                "this net already has `pull = \"{}\"` from the wire statement \
+                                 declaring `{port}`'s net (statement {}), and `pull = \"{}\"` on \
+                                 statement {} contradicts it",
+                                mode.pull().name(),
+                                first + 1,
+                                pull.name(),
+                                index + 1,
+                            ),
+                        ));
+                    }
+                    _ => {
+                        mode = NetMode::Resolved(pull);
+                        declared_at = Some(index);
+                    }
+                }
+            }
+            let mut builder = Wire::builder().sources(&source_ids).mode(mode);
             let receivers: Vec<usize> = group
                 .iter()
                 .copied()
@@ -1895,7 +1951,7 @@ mod tests {
     use crate::core::state::{ChunkReader, ChunkWriter, Migrations, Sink, Source, StateReader};
     use crate::core::sync::Mutex;
     use crate::core::value::Width;
-    use crate::core::wire::{FanIn, Level, Resolve, WireSink};
+    use crate::core::wire::{Drive, FanIn, Level, Resolve, WireSink};
     use crate::machine::{BuildOptions, build};
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
@@ -3483,5 +3539,88 @@ machine "exports" {
         assert_eq!(b.len(), 1);
         assert!(!b.is_empty());
         assert_eq!(b.classes().collect::<Vec<_>>(), ["test.ram"]);
+    }
+
+    /// `two.machine` with a `pull` attribute on one of its two wires.
+    const PULLED: &str = r#"
+machine "two" {
+  osc master = 1000000 Hz
+  space cpubus { width = 16 }
+  object cpu "test.cpu"   { clock = master / 4, space = cpubus }
+  object a   "test.timer" { clock = master / 4 }
+  object b   "test.timer" { clock = master / 4 }
+  wire a.out -> cpu.irq { pull = "up" }
+  wire b.out -> cpu.irq
+}
+"#;
+
+    #[test]
+    fn a_pull_on_one_wire_puts_the_whole_net_in_resolved_mode() {
+        // A net is a connected component, not a statement, so the resistor is
+        // declared once and covers both drivers.
+        let options = BuildOptions::new().with_bindings(bindings());
+        let machine = build("pulled.machine", PULLED, &registry(), &options).expect("builds");
+        assert_eq!(machine.nets().len(), 1);
+        let wire = machine.nets()[0].wire();
+        assert_eq!(wire.mode(), NetMode::Resolved(Pull::Up));
+        let (a, b) = (
+            machine.nets()[0].sources()[0].id,
+            machine.nets()[0].sources()[1].id,
+        );
+        assert_eq!(
+            wire.resolve_net(),
+            Level::Low,
+            "the realize sweep announced two push-pull outputs idling low, and \
+             a stage overrules a resistor; putting a part that does not know \
+             about tri-state on a pulled net is exactly that"
+        );
+        // Both stages let go, and the resistor is all that is left.
+        wire.drive(a, Drive::HiZ);
+        wire.drive(b, Drive::HiZ);
+        assert_eq!(wire.resolve_net(), Level::High);
+        wire.drive(a, Drive::Low);
+        assert_eq!(wire.resolve_net(), Level::Low);
+        wire.drive(b, Drive::Low);
+        wire.drive(a, Drive::HiZ);
+        assert_eq!(wire.resolve_net(), Level::Low, "b still holds it down");
+        wire.drive(b, Drive::HiZ);
+        assert_eq!(wire.resolve_net(), Level::High);
+    }
+
+    #[test]
+    fn a_net_cannot_carry_two_different_resistors() {
+        const CONTRADICTORY: &str = r#"
+machine "two" {
+  osc master = 1000000 Hz
+  space cpubus { width = 16 }
+  object cpu "test.cpu"   { clock = master / 4, space = cpubus }
+  object a   "test.timer" { clock = master / 4 }
+  object b   "test.timer" { clock = master / 4 }
+  wire a.out -> cpu.irq { pull = "up" }
+  wire b.out -> cpu.irq { pull = "down" }
+}
+"#;
+        let options = BuildOptions::new().with_bindings(bindings());
+        let err = build("bad.machine", CONTRADICTORY, &registry(), &options)
+            .expect_err("one piece of copper cannot have two resistors on it");
+        let text = err.to_string();
+        assert!(text.contains("pull"), "{text}");
+        assert!(text.contains("contradicts"), "{text}");
+    }
+
+    #[test]
+    fn a_net_with_no_pull_block_is_the_wire_model_that_was_always_there() {
+        const PLAIN: &str = r#"
+machine "two" {
+  osc master = 1000000 Hz
+  space cpubus { width = 16 }
+  object cpu "test.cpu"   { clock = master / 4, space = cpubus }
+  object a   "test.timer" { clock = master / 4 }
+  wire a.out -> cpu.irq
+}
+"#;
+        let options = BuildOptions::new().with_bindings(bindings());
+        let machine = build("plain.machine", PLAIN, &registry(), &options).expect("builds");
+        assert_eq!(machine.nets()[0].wire().mode(), NetMode::PerSink);
     }
 }

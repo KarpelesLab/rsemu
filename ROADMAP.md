@@ -1112,6 +1112,20 @@ exactly the condition under which the realize sweep above has a topological
 order, so the cycle check and the sweep ordering are **one computation** rather
 than two rules that could disagree.
 
+**A net can resolve itself, and that is a third thing a driver can do.** A
+`Level` is two-valued because an input pin always reads *some* level, but an
+output *stage* has a third state — not driving — and without it there is no
+open-drain bus, no `PUPDR` and no keypad matrix. So a driver presents a
+`Drive` (Hi-Z, a pull resistor, or a stage at one of the rails), a net carries a
+`Pull` of its own, and a machine file opts a net in with `wire a.p -> b.in {
+pull = "up" }`. Such a net resolves centrally — strength beats polarity, two
+drivers of equal strength in opposition is a fault that is *counted* rather than
+guessed at, and the order drivers were registered in never enters into it — and
+hands every sink the resolved level, once per source, so a sink that keeps a
+`FanIn` stays correct without knowing any of this happened. The default stays
+per-sink resolution, which is what a shared `/IRQ` wants and what every
+interrupt line in the tree is.
+
 Level and edge semantics both, with the *edge detector as a device* rather than
 a flag, so it snapshots correctly. Ships with the standard combinators as
 ordinary devices: `wire.split`, `wire.or`, `wire.and`, `wire.not`,

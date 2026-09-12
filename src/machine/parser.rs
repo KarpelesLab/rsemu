@@ -19,7 +19,7 @@
 //! space     := "space" name props
 //! object    := "object" name STRING props?
 //! map       := "map" name expr "size" expr "=" expr props?
-//! wire      := "wire" path "->" path
+//! wire      := "wire" path "->" path props?
 //! threading := "threading" ("deterministic" | "parallel")
 //! include   := "include" STRING
 //! template  := "template" name ("(" param-list ")")? block
@@ -413,9 +413,18 @@ impl Parser {
         let from = self.path()?;
         self.expect(&TokenKind::Arrow, "`->`")?;
         let to = self.path()?;
+        // An optional trailing block carries attributes of the **net** — the
+        // pull resistor, today — as distinct from attributes of either pin.
+        let props = if self.at(&TokenKind::LBrace) {
+            let open = self.advance().span;
+            self.props(open)?
+        } else {
+            Vec::new()
+        };
         Ok(Stmt::Wire(WireStmt {
             from,
             to,
+            props,
             span: start.join(self.prev_span()),
         }))
     }
@@ -1105,5 +1114,27 @@ for j in 0..=3 {
         }
         let src = SourceFile::new("t", &text);
         assert!(parse(&src).is_ok());
+    }
+
+    #[test]
+    fn a_wire_may_carry_a_block_of_net_attributes() {
+        // The resistor belongs to the copper rather than to either pin, so it
+        // is written on the wire, and the printer puts it back where it was.
+        let dumped = dump(r#"machine "m" { wire keypad.col0 -> gpioc.in0 { pull = "up" } }"#);
+        assert!(
+            dumped.contains(r#"wire keypad.col0 -> gpioc.in0 { pull = "up" }"#),
+            "{dumped}"
+        );
+        // A bare wire still prints as a bare wire.
+        let plain = dump(r#"machine "m" { wire a.out -> b.in }"#);
+        assert!(plain.contains("wire a.out -> b.in\n"), "{plain}");
+    }
+
+    #[test]
+    fn a_net_attribute_block_is_checked_for_syntax_like_any_other() {
+        assert!(
+            err(r#"machine "m" { wire a.out -> b.in { pull } }"#).contains('='),
+            "a property still needs a value"
+        );
     }
 }

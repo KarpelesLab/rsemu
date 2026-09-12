@@ -30,6 +30,32 @@
 //! state (`ROADMAP.md` §4.5, invariant 6). It emits a transient pulse on its
 //! output wire; [`EdgeLatch`] is the matching consumer.
 //!
+//! # Tri-state, and who resolves a net
+//!
+//! A [`Level`] is two-valued and stays that way: an input pin always reads
+//! *some* level. An output **stage** has a third state — not driving — and
+//! without it there is no open-drain bus, no `PUPDR` and no keypad matrix,
+//! because "nobody is holding this line" cannot be said. So a driver presents a
+//! [`Drive`]: Hi-Z, a pull resistor, or a stage at one of the rails.
+//!
+//! Who turns that into a level is a property of the **net**, and a machine file
+//! picks it per net ([`NetMode`]):
+//!
+//! * [`NetMode::PerSink`], the default and what every interrupt line here is:
+//!   the wire delivers the changed driver's own level and each sink resolves
+//!   its own [`FanIn`], as described above.
+//! * [`NetMode::Resolved`]: the wire resolves — strength beats polarity, the
+//!   net's own [`Pull`] decides when every stage has let go, and opposition at
+//!   equal strength is a fault that [`Wire::contention`] *counts* rather than
+//!   guesses at — and hands every sink the resolved level, once per source. A
+//!   sink that keeps a [`FanIn`] therefore stays correct without being taught
+//!   any of this, since a fan-in whose every entry holds one level returns it
+//!   under either [`Resolve`].
+//!
+//! Nothing about a net's resolution is state: it is a function of the drives, so
+//! a net stays derived (`ROADMAP.md` §4.5) and a snapshot carries each driver's
+//! [`Drive`] and nothing else.
+//!
 //! # Re-entrancy and cycles
 //!
 //! A sink notified of a level change may drive another wire from inside
@@ -82,7 +108,7 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::SeqCst};
 
 /// The state of a signal line.
 ///
@@ -216,6 +242,236 @@ impl Resolve {
             Resolve::Or => Level::Low,
             Resolve::And => Level::High,
         }
+    }
+}
+
+/// What one driver puts on a net, as an output stage rather than as a level.
+///
+/// [`Level`] is what a net *is at*; this is what a driver *does to it*, and the
+/// two are not the same thing. A CMOS push-pull stage holds the net at one rail
+/// or the other; an open-drain stage either holds it low or lets go entirely;
+/// a pull resistor holds it weakly and loses to anything actually driving.
+/// Without the distinction there is no open-drain bus, no `PUPDR` and no keypad
+/// matrix, because "not driving" cannot be said.
+///
+/// `Level` deliberately stays two-valued. A sink is a piece of silicon with an
+/// input pin, and an input pin always reads *some* level: the third state lives
+/// on the driver's side of the net and is resolved away before anything sees it
+/// ([`Wire::resolve_net`]). A third `Level` variant would instead have handed a
+/// Hi-Z to eight hundred call sites that read it as low.
+///
+/// Strength beats polarity: a strong driver overrules every weak one, and a net
+/// with nothing but weak drivers settles where they say. Two drivers of equal
+/// strength pulling opposite ways is a *fault* — a short, in hardware — and
+/// [`Wire::contention`] counts it; [`Wire::resolve_net`] says what the model
+/// answers meanwhile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Drive {
+    /// Not driving: high impedance. An input pin, an analogue pin, an
+    /// open-drain stage with a one in its output register, an open contact.
+    #[default]
+    HiZ,
+    /// A pull-down resistor. Loses to any strong driver.
+    WeakLow,
+    /// A pull-up resistor. Loses to any strong driver. The one a keypad matrix
+    /// is built on.
+    WeakHigh,
+    /// An output stage holding the net low.
+    Low,
+    /// An output stage holding the net high.
+    High,
+}
+
+impl Drive {
+    /// The strong drive of `level`: a push-pull output stage.
+    #[inline]
+    pub const fn strong(level: Level) -> Drive {
+        match level {
+            Level::Low => Drive::Low,
+            Level::High => Drive::High,
+        }
+    }
+
+    /// The weak drive of `level`: a pull resistor.
+    #[inline]
+    pub const fn weak(level: Level) -> Drive {
+        match level {
+            Level::Low => Drive::WeakLow,
+            Level::High => Drive::WeakHigh,
+        }
+    }
+
+    /// An open-drain stage asked for `level`: it pulls low, or lets go.
+    ///
+    /// The whole of `OTYPER = 1` (ST RM0090 §8.3.10) and of an I²C driver.
+    #[inline]
+    pub const fn open_drain(level: Level) -> Drive {
+        match level {
+            Level::Low => Drive::Low,
+            Level::High => Drive::HiZ,
+        }
+    }
+
+    /// The level this driver is holding, or `None` when it is not driving.
+    #[inline]
+    pub const fn level(self) -> Option<Level> {
+        match self {
+            Drive::HiZ => None,
+            Drive::Low | Drive::WeakLow => Some(Level::Low),
+            Drive::High | Drive::WeakHigh => Some(Level::High),
+        }
+    }
+
+    /// Whether this drives nothing at all.
+    #[inline]
+    pub const fn is_hiz(self) -> bool {
+        matches!(self, Drive::HiZ)
+    }
+
+    /// Whether this is an output stage rather than a resistor.
+    #[inline]
+    pub const fn is_strong(self) -> bool {
+        matches!(self, Drive::Low | Drive::High)
+    }
+
+    /// Whether this is a pull resistor.
+    #[inline]
+    pub const fn is_weak(self) -> bool {
+        matches!(self, Drive::WeakLow | Drive::WeakHigh)
+    }
+
+    /// The encoding used for an atomic slot and for a snapshot.
+    ///
+    /// `Low` is zero and `High` is one, so a net built before anything drives
+    /// it still reads low, and a snapshot written when the byte meant a bare
+    /// [`Level`] still decodes to what it meant.
+    #[inline]
+    pub const fn code(self) -> u8 {
+        match self {
+            Drive::Low => 0,
+            Drive::High => 1,
+            Drive::HiZ => 2,
+            Drive::WeakLow => 3,
+            Drive::WeakHigh => 4,
+        }
+    }
+
+    /// Decode [`Drive::code`].
+    ///
+    /// `None` for a byte this build does not know, which is how a snapshot from
+    /// a later version is diagnosed rather than silently taken as low.
+    #[inline]
+    pub const fn from_code(code: u8) -> Option<Drive> {
+        match code {
+            0 => Some(Drive::Low),
+            1 => Some(Drive::High),
+            2 => Some(Drive::HiZ),
+            3 => Some(Drive::WeakLow),
+            4 => Some(Drive::WeakHigh),
+            _ => None,
+        }
+    }
+}
+
+impl From<Level> for Drive {
+    #[inline]
+    fn from(level: Level) -> Drive {
+        Drive::strong(level)
+    }
+}
+
+/// The resistor a net carries in its own right — a component on the board,
+/// rather than inside any of the parts the net joins.
+///
+/// A pull-up on a printed circuit board is a fact about the *net*, not about
+/// anything connected to it, which is why it belongs to the wire and is not a
+/// fifth driver somebody has to invent a device to hold. It resolves exactly as
+/// a weak [`Drive`] does, and fights an on-chip pull of the opposite polarity on
+/// equal terms, because that is what two resistors do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Pull {
+    /// No resistor. A net whose drivers have all let go then has no level of
+    /// its own; [`Wire::resolve_net`] says what the model answers.
+    #[default]
+    None,
+    /// A pull-up: the net idles high.
+    Up,
+    /// A pull-down: the net idles low.
+    Down,
+}
+
+impl Pull {
+    /// The weak drive this resistor contributes, if any.
+    #[inline]
+    pub const fn drive(self) -> Drive {
+        match self {
+            Pull::None => Drive::HiZ,
+            Pull::Up => Drive::WeakHigh,
+            Pull::Down => Drive::WeakLow,
+        }
+    }
+
+    /// The word a machine file writes, or `None` for one that is not a pull.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Pull> {
+        match name {
+            "none" | "float" => Some(Pull::None),
+            "up" => Some(Pull::Up),
+            "down" => Some(Pull::Down),
+            _ => None,
+        }
+    }
+
+    /// The word a machine file writes for this pull.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Pull::None => "none",
+            Pull::Up => "up",
+            Pull::Down => "down",
+        }
+    }
+}
+
+/// Who turns a net's drivers into the level its sinks are told about.
+///
+/// Two answers, and a machine file picks one per net.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum NetMode {
+    /// **Each sink does it.** The wire delivers the changed driver's own level,
+    /// unresolved, and a sink with several drivers keeps a [`FanIn`] and
+    /// combines them under its own [`Resolve`]. Every interrupt line in the
+    /// tree works this way and it stays the default: a shared `/IRQ` is a
+    /// wired-OR whichever end does the OR-ing, and the sink is the end that
+    /// knows the polarity.
+    #[default]
+    PerSink,
+    /// **The wire does it.** Drivers are tri-state ([`Drive`]), the net carries
+    /// a [`Pull`] of its own, and every sink is told the *resolved* level.
+    ///
+    /// Wanted as soon as "nobody is driving" is a state distinct from "somebody
+    /// is driving low": an open-drain bus, a GPIO pad whose `PUPDR` decides what
+    /// an unconnected pin reads, a keypad matrix. A sink that keeps a [`FanIn`]
+    /// stays correct without being changed, because the net hands it the
+    /// resolved level *for every one of its sources* — so any [`Resolve`] over
+    /// them returns that same level.
+    Resolved(Pull),
+}
+
+impl NetMode {
+    /// The net's own resistor; [`Pull::None`] for a per-sink net.
+    #[inline]
+    pub const fn pull(self) -> Pull {
+        match self {
+            NetMode::PerSink => Pull::None,
+            NetMode::Resolved(pull) => pull,
+        }
+    }
+
+    /// Whether the wire resolves rather than its sinks.
+    #[inline]
+    pub const fn is_resolved(self) -> bool {
+        matches!(self, NetMode::Resolved(_))
     }
 }
 
@@ -734,14 +990,39 @@ pub trait DmaPeripheral: Send + Sync + fmt::Debug {
 /// net. When the APU deasserts its IRQ while the cartridge still asserts,
 /// `resolve(Resolve::Or)` still answers `High`.
 ///
+/// Whether a [`Drive::code`] reads as [`Level::High`].
+///
+/// Open-coded rather than `Drive::from_code(c).level()` because this runs once
+/// per source on every interrupt delivery in the machine, and two chained
+/// `match`es on the hot path is two more than it needs.
+#[inline]
+const fn code_is_high(code: u8) -> bool {
+    // `High` and `WeakHigh`; everything else — including `HiZ` — reads low.
+    matches!(code, 1 | 4)
+}
+
 /// The source list is fixed at construction, so updates are wait-free and
 /// allocation-free, and the whole thing is `Send + Sync` with no lock.
+///
+/// # What a slot holds
+///
+/// A [`Drive`], not a [`Level`]: the same bookkeeping serves a wired-OR sink
+/// and the tri-state resolution a [`NetMode::Resolved`] net performs, and one
+/// store is better than two that can disagree. The level-shaped API
+/// ([`FanIn::set`], [`FanIn::level_of`], [`FanIn::resolve`]) is the one nearly
+/// every sink uses and it is unchanged: it records *strong* drives, which is
+/// what a sink on a per-sink net is being told about. [`Drive::HiZ`] reads back
+/// as [`Level::Low`] through that API and as itself through
+/// [`FanIn::drive_of`] — so a sink that has not been taught about tri-state
+/// cannot be handed one by accident, because only a resolved net produces one
+/// and a resolved net resolves it away first.
 #[derive(Debug)]
 pub struct FanIn {
     /// Sorted and deduplicated, so lookup is a binary search and iteration
     /// order is deterministic.
     sources: Box<[WireId]>,
-    levels: Box<[AtomicBool]>,
+    /// One [`Drive::code`] per source.
+    drives: Box<[AtomicU8]>,
 }
 
 impl FanIn {
@@ -749,13 +1030,22 @@ impl FanIn {
     ///
     /// Duplicates are collapsed; order does not matter.
     pub fn new(sources: &[WireId]) -> Self {
+        Self::with_drive(sources, Drive::Low)
+    }
+
+    /// Track these sources, all initially at `drive`.
+    ///
+    /// [`Drive::HiZ`] is what a tri-state net wants: nothing is driving a net
+    /// nobody has driven yet, which is a different statement from "everybody is
+    /// driving it low" and resolves differently under a [`Pull`].
+    pub fn with_drive(sources: &[WireId], drive: Drive) -> Self {
         let mut ids: Vec<WireId> = sources.to_vec();
         ids.sort_unstable();
         ids.dedup();
-        let levels: Vec<AtomicBool> = ids.iter().map(|_| AtomicBool::new(false)).collect();
+        let drives: Vec<AtomicU8> = ids.iter().map(|_| AtomicU8::new(drive.code())).collect();
         FanIn {
             sources: ids.into_boxed_slice(),
-            levels: levels.into_boxed_slice(),
+            drives: drives.into_boxed_slice(),
         }
     }
 
@@ -777,13 +1067,25 @@ impl FanIn {
     }
 
     #[inline]
+    fn drive_at(&self, i: usize) -> Drive {
+        // A slot only ever holds a code this build wrote, so the fallback is
+        // unreachable; `Low` keeps it total without an `unwrap` in the hot path.
+        Drive::from_code(self.drives[i].load(SeqCst)).unwrap_or(Drive::Low)
+    }
+
+    #[inline]
     fn level_at(&self, i: usize) -> Level {
-        Level::from_bool(self.levels[i].load(SeqCst))
+        Level::from_bool(code_is_high(self.drives[i].load(SeqCst)))
     }
 
     #[inline]
     fn set_at(&self, i: usize, level: Level) -> bool {
-        self.levels[i].swap(level.as_bool(), SeqCst) != level.as_bool()
+        self.drive_at_set(i, Drive::strong(level))
+    }
+
+    #[inline]
+    fn drive_at_set(&self, i: usize, drive: Drive) -> bool {
+        self.drives[i].swap(drive.code(), SeqCst) != drive.code()
     }
 
     /// Record `src`'s level.
@@ -800,20 +1102,90 @@ impl FanIn {
         }
     }
 
+    /// Record `src`'s drive, tri-state and all.
+    ///
+    /// [`FanIn::set`] is this with [`Drive::strong`] applied; the return value
+    /// means the same thing.
+    #[inline]
+    pub fn set_drive(&self, src: WireId, drive: Drive) -> bool {
+        match self.index_of(src) {
+            Some(i) => self.drive_at_set(i, drive),
+            None => false,
+        }
+    }
+
     /// The level last recorded for `src`, or `None` if it is not tracked.
+    ///
+    /// A source that is not driving reads [`Level::Low`]; ask
+    /// [`FanIn::drive_of`] to tell that from a source holding the net low.
     #[inline]
     pub fn level_of(&self, src: WireId) -> Option<Level> {
         self.index_of(src).map(|i| self.level_at(i))
     }
 
+    /// The drive last recorded for `src`, or `None` if it is not tracked.
+    #[inline]
+    pub fn drive_of(&self, src: WireId) -> Option<Drive> {
+        self.index_of(src).map(|i| self.drive_at(i))
+    }
+
     /// Whether any source is currently high.
+    #[inline]
     pub fn any_high(&self) -> bool {
-        self.levels.iter().any(|l| l.load(SeqCst))
+        self.drives.iter().any(|d| code_is_high(d.load(SeqCst)))
     }
 
     /// Whether every source is currently high. Vacuously true with no sources.
+    #[inline]
     pub fn all_high(&self) -> bool {
-        self.levels.iter().all(|l| l.load(SeqCst))
+        self.drives.iter().all(|d| code_is_high(d.load(SeqCst)))
+    }
+
+    /// Resolve the tracked drives the way a net does, under `pull`.
+    ///
+    /// The rule, and the reason it does not depend on the order sources were
+    /// registered in (CLAUDE.md, *Determinism*): count the drivers at each
+    /// strength and polarity, then take the strongest polarity that has any
+    /// driver at all, with the net's own resistor counted among the weak ones.
+    ///
+    /// Two drivers of equal strength pulling opposite ways is a short circuit,
+    /// and hardware has no defined answer for it. The model answers
+    /// [`Level::Low`] — an output stage sinking to ground is what usually wins a
+    /// real fight, and a defined answer beats an arbitrary one — and reports
+    /// the fault through the second half of the return value, which
+    /// [`Wire::contention`] counts. Two *weak* drivers in opposition is a
+    /// resistor divider rather than a fault, but it is equally not a level, so
+    /// it is reported the same way.
+    ///
+    /// A net with no driver and no pull is floating; it reads [`Level::Low`]
+    /// and is also reported. Nothing here is state: the answer is a function of
+    /// the drives alone, so a net stays derived (`ROADMAP.md` §4.5).
+    pub fn resolve_drives(&self, pull: Pull) -> (Level, bool) {
+        let (mut strong_low, mut strong_high) = (false, false);
+        let (mut weak_low, mut weak_high) = (false, false);
+        for i in 0..self.drives.len() {
+            match self.drive_at(i) {
+                Drive::HiZ => {}
+                Drive::Low => strong_low = true,
+                Drive::High => strong_high = true,
+                Drive::WeakLow => weak_low = true,
+                Drive::WeakHigh => weak_high = true,
+            }
+        }
+        match pull.drive() {
+            Drive::WeakLow => weak_low = true,
+            Drive::WeakHigh => weak_high = true,
+            _ => {}
+        }
+        if strong_low || strong_high {
+            let fought = strong_low && strong_high;
+            (Level::from_bool(strong_high && !strong_low), fought)
+        } else if weak_low || weak_high {
+            let fought = weak_low && weak_high;
+            (Level::from_bool(weak_high && !weak_low), fought)
+        } else {
+            (Level::Low, true)
+        }
     }
 
     /// The level of the net under the given resolution.
@@ -833,8 +1205,14 @@ impl FanIn {
     /// Records only: nothing is propagated, because a reset propagates through
     /// the devices' own reset paths.
     pub fn clear(&self) {
-        for l in self.levels.iter() {
-            l.store(false, SeqCst);
+        self.clear_to(Drive::Low);
+    }
+
+    /// The same, to an arbitrary drive — [`Drive::HiZ`] for a tri-state net,
+    /// whose reset state is "nobody is driving".
+    pub fn clear_to(&self, drive: Drive) {
+        for d in self.drives.iter() {
+            d.store(drive.code(), SeqCst);
         }
     }
 
@@ -847,6 +1225,16 @@ impl FanIn {
             .collect()
     }
 
+    /// The same, keeping the tri-state: every source and its drive, in id
+    /// order. What a [`Wire`] writes to a snapshot.
+    pub fn snapshot_drives(&self) -> Vec<(WireId, Drive)> {
+        self.sources
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, self.drive_at(i)))
+            .collect()
+    }
+
     /// Restore state produced by [`FanIn::snapshot`].
     ///
     /// Entries for sources this `FanIn` does not track are ignored: a snapshot
@@ -856,7 +1244,16 @@ impl FanIn {
     pub fn restore(&self, state: &[(WireId, Level)]) {
         for (id, level) in state {
             if let Some(i) = self.index_of(*id) {
-                self.levels[i].store(level.as_bool(), SeqCst);
+                self.drives[i].store(Drive::strong(*level).code(), SeqCst);
+            }
+        }
+    }
+
+    /// Restore state produced by [`FanIn::snapshot_drives`].
+    pub fn restore_drives(&self, state: &[(WireId, Drive)]) {
+        for (id, drive) in state {
+            if let Some(i) = self.index_of(*id) {
+                self.drives[i].store(drive.code(), SeqCst);
             }
         }
     }
@@ -903,6 +1300,7 @@ struct SinkPort {
 /// Built through [`Wire::builder`]; sources and sinks are fixed thereafter.
 pub struct Wire {
     inputs: FanIn,
+    mode: NetMode,
     /// One flag per source, set when its level moved and has not been
     /// delivered. This is what makes a re-entrant `set` cost an iteration
     /// rather than a stack frame.
@@ -912,7 +1310,16 @@ pub struct Wire {
     /// protects no state, so nothing is held across the outward call.
     delivering: AtomicBool,
     unsettled: AtomicUsize,
+    /// On a [`NetMode::Resolved`] net, the level last delivered, so an
+    /// unchanged resolution costs nothing. Derived — a cache of
+    /// [`Wire::resolve_net`] — so it is neither snapshotted nor restored; the
+    /// sentinel below makes the first delivery unconditional.
+    last_resolved: AtomicU8,
+    contention: AtomicUsize,
 }
+
+/// A resolved wire's cached level before anything has been delivered.
+const RESOLVED_UNKNOWN: u8 = 2;
 
 impl Wire {
     /// How many delivery passes one outermost [`Wire::set`] runs before
@@ -942,10 +1349,24 @@ impl Wire {
     /// that indistinguishable from outside: the wire converges on the levels
     /// last written.
     pub fn set(&self, src: WireId, level: Level) -> bool {
+        self.drive(src, Drive::strong(level))
+    }
+
+    /// Drive `src`'s output stage, delivering the change to every sink.
+    ///
+    /// [`Wire::set`] is this with [`Drive::strong`] applied, which is what an
+    /// ordinary push-pull output does and what every driver in the tree did
+    /// before tri-state existed. A [`Drive::HiZ`] on a [`NetMode::PerSink`] net
+    /// is recorded but resolves as low for the sinks, since nothing on such a
+    /// net can represent "not driving"; put the net in
+    /// [`NetMode::Resolved`] to make it mean what it says.
+    ///
+    /// Returns whether the drive moved, exactly as [`Wire::set`] does.
+    pub fn drive(&self, src: WireId, drive: Drive) -> bool {
         let Some(i) = self.inputs.index_of(src) else {
             return false;
         };
-        if !self.inputs.set_at(i, level) {
+        if !self.inputs.drive_at_set(i, drive) {
             return false;
         }
         self.pending[i].store(true, SeqCst);
@@ -958,6 +1379,10 @@ impl Wire {
     /// Wanted after a snapshot load, and after a reset that changed levels
     /// without propagating. Delivery is idempotent, so this is always safe.
     pub fn refresh(&self) {
+        // A resolved net delivers only when its level *moves*, so forget what
+        // was last delivered or a refresh after a snapshot load would decide
+        // there was nothing to say.
+        self.last_resolved.store(RESOLVED_UNKNOWN, SeqCst);
         for p in self.pending.iter() {
             p.store(true, SeqCst);
         }
@@ -978,19 +1403,10 @@ impl Wire {
         loop {
             let mut passes: u32 = 0;
             loop {
-                let mut moved = false;
-                for (i, src) in self.inputs.sources.iter().enumerate() {
-                    // Take the flag first, then read the level: a racing writer
-                    // that beats us to the level sets the flag again, so the
-                    // worst case is one redundant, idempotent delivery.
-                    if self.pending[i].swap(false, SeqCst) {
-                        moved = true;
-                        let level = self.inputs.level_at(i);
-                        for port in self.sinks.iter() {
-                            port.sink.with(|s| s.set_level(*src, port.line, level));
-                        }
-                    }
-                }
+                let moved = match self.mode {
+                    NetMode::PerSink => self.deliver_per_sink(),
+                    NetMode::Resolved(pull) => self.deliver_resolved(pull),
+                };
                 if !moved {
                     break;
                 }
@@ -1020,6 +1436,62 @@ impl Wire {
         }
     }
 
+    /// One pass of [`NetMode::PerSink`] delivery: each moved source's own
+    /// level, to every sink, for the sinks to resolve. Returns whether
+    /// anything was delivered.
+    fn deliver_per_sink(&self) -> bool {
+        let mut moved = false;
+        for (i, src) in self.inputs.sources().iter().enumerate() {
+            // Take the flag first, then read the level: a racing writer that
+            // beats us to the level sets the flag again, so the worst case is
+            // one redundant, idempotent delivery.
+            if self.pending[i].swap(false, SeqCst) {
+                moved = true;
+                let level = self.inputs.level_at(i);
+                for port in self.sinks.iter() {
+                    port.sink.with(|s| s.set_level(*src, port.line, level));
+                }
+            }
+        }
+        moved
+    }
+
+    /// One pass of [`NetMode::Resolved`] delivery.
+    ///
+    /// The net resolves once, and the answer goes to every sink **once per
+    /// source**. Repeating it per source is not waste: it is what keeps the
+    /// forty sinks in the tree that keep a [`FanIn`] correct without being
+    /// rewritten, since a fan-in whose every entry holds the resolved level
+    /// returns that level under [`Resolve::Or`] and under [`Resolve::And`]
+    /// alike. A sink that ignores `src` and takes the level sees the same
+    /// thing repeated, which is idempotent.
+    fn deliver_resolved(&self, pull: Pull) -> bool {
+        let mut any_pending = false;
+        for p in self.pending.iter() {
+            if p.swap(false, SeqCst) {
+                any_pending = true;
+            }
+        }
+        if !any_pending {
+            return false;
+        }
+        let (level, fought) = self.inputs.resolve_drives(pull);
+        if fought {
+            self.contention.fetch_add(1, SeqCst);
+        }
+        // A driver that moved without moving the net — one open-drain stage
+        // letting go while another still holds the net low — is not news.
+        if self.last_resolved.swap(u8::from(level.is_high()), SeqCst) == u8::from(level.is_high()) {
+            return false;
+        }
+        for src in self.inputs.sources() {
+            for port in self.sinks.iter() {
+                port.sink.with(|s| s.set_level(*src, port.line, level));
+            }
+        }
+        true
+    }
+
     /// The per-source levels, for a sink or a snapshot to inspect.
     #[inline]
     pub fn inputs(&self) -> &FanIn {
@@ -1033,15 +1505,57 @@ impl Wire {
     }
 
     /// The level `src` is driving, or `None` if it is not a source here.
+    ///
+    /// A source that is not driving reads [`Level::Low`]; [`Wire::drive_of`]
+    /// tells that from a source holding the net low.
     #[inline]
     pub fn level_of(&self, src: WireId) -> Option<Level> {
         self.inputs.level_of(src)
+    }
+
+    /// The output stage `src` presents, or `None` if it is not a source here.
+    #[inline]
+    pub fn drive_of(&self, src: WireId) -> Option<Drive> {
+        self.inputs.drive_of(src)
+    }
+
+    /// Who resolves this net, and the resistor it carries.
+    #[inline]
+    pub fn mode(&self) -> NetMode {
+        self.mode
     }
 
     /// The level of the net under the given resolution.
     #[inline]
     pub fn resolve(&self, mode: Resolve) -> Level {
         self.inputs.resolve(mode)
+    }
+
+    /// The level of the net under **its own** resolution.
+    ///
+    /// For a [`NetMode::Resolved`] net this is the level its sinks are being
+    /// told, computed from the drives and the net's [`Pull`] by
+    /// [`FanIn::resolve_drives`] — which is where the rule, including what a
+    /// short circuit and a floating net answer, is written down. For a
+    /// [`NetMode::PerSink`] net there is no such thing, so this reports the
+    /// wired-OR the default [`Resolve`] implies and every sink is still free to
+    /// disagree.
+    pub fn resolve_net(&self) -> Level {
+        match self.mode {
+            NetMode::PerSink => self.inputs.resolve(Resolve::Or),
+            NetMode::Resolved(pull) => self.inputs.resolve_drives(pull).0,
+        }
+    }
+
+    /// How many times this net has resolved a **contention**: two drivers of
+    /// equal strength in opposition, or nothing driving it at all.
+    ///
+    /// A diagnostic, like [`Wire::unsettled`], and not snapshotted. A non-zero
+    /// count on a [`NetMode::Resolved`] net means either a short in the machine
+    /// description or a net that wants a [`Pull`] and has not been given one.
+    /// It stays zero on a per-sink net, which cannot express either fault.
+    pub fn contention(&self) -> usize {
+        self.contention.load(SeqCst)
     }
 
     /// How many sinks are connected.
@@ -1064,12 +1578,30 @@ impl Wire {
         self.inputs.snapshot()
     }
 
+    /// The architectural state, keeping the tri-state: every source and its
+    /// drive.
+    ///
+    /// What a machine writes. The *net's* level is derived from these and is
+    /// never stored — the wire keeps a cache of it and
+    /// [`Wire::refresh`] discards it — so `ROADMAP.md` §4.5's rule that a net
+    /// is derived state survives tri-state unchanged. What is saved here is
+    /// each driver's output stage, which is the driver's own state mirrored
+    /// where the sinks can be handed it again on load.
+    pub fn snapshot_drives(&self) -> Vec<(WireId, Drive)> {
+        self.inputs.snapshot_drives()
+    }
+
     /// Restore state from [`Wire::snapshot`] without delivering anything.
     ///
     /// Call [`Wire::refresh`] afterwards if the sinks do not restore their own
     /// input state.
     pub fn restore(&self, state: &[(WireId, Level)]) {
         self.inputs.restore(state);
+    }
+
+    /// Restore state from [`Wire::snapshot_drives`], delivering nothing.
+    pub fn restore_drives(&self, state: &[(WireId, Drive)]) {
+        self.inputs.restore_drives(state);
     }
 }
 
@@ -1078,8 +1610,10 @@ impl fmt::Debug for Wire {
         // Manual: a sink is a trait object and is not `Debug`.
         f.debug_struct("Wire")
             .field("inputs", &self.inputs)
+            .field("mode", &self.mode)
             .field("sinks", &self.sinks.len())
             .field("unsettled", &self.unsettled.load(SeqCst))
+            .field("contention", &self.contention.load(SeqCst))
             .finish()
     }
 }
@@ -1092,6 +1626,7 @@ impl fmt::Debug for Wire {
 pub struct WireBuilder {
     sources: Vec<WireId>,
     sinks: Vec<SinkPort>,
+    mode: NetMode,
 }
 
 impl WireBuilder {
@@ -1142,10 +1677,37 @@ impl WireBuilder {
         self
     }
 
-    /// Finish. Every source starts [`Level::Low`] and nothing is delivered;
-    /// devices announce their reset levels themselves.
+    /// Who resolves this net.
+    ///
+    /// Defaults to [`NetMode::PerSink`], which is what every net in the tree
+    /// was before tri-state existed and what an interrupt line still wants.
+    #[must_use]
+    pub fn mode(mut self, mode: NetMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Shorthand for [`WireBuilder::mode`] with [`NetMode::Resolved`].
+    #[must_use]
+    pub fn resolved(self, pull: Pull) -> Self {
+        self.mode(NetMode::Resolved(pull))
+    }
+
+    /// Finish. Nothing is delivered; devices announce their reset levels
+    /// themselves.
+    ///
+    /// A per-sink net starts with every source at [`Level::Low`], as it always
+    /// has. A resolved net starts with every source at [`Drive::HiZ`], because
+    /// a part that has not been told to drive anything is not driving — which
+    /// is the whole distinction the mode exists for, and getting it wrong here
+    /// would make a pulled-up net read low until its first write.
     pub fn build(self) -> Wire {
-        let inputs = FanIn::new(&self.sources);
+        let idle = if self.mode.is_resolved() {
+            Drive::HiZ
+        } else {
+            Drive::Low
+        };
+        let inputs = FanIn::with_drive(&self.sources, idle);
         let pending: Vec<AtomicBool> = inputs
             .sources()
             .iter()
@@ -1153,10 +1715,13 @@ impl WireBuilder {
             .collect();
         Wire {
             inputs,
+            mode: self.mode,
             pending: pending.into_boxed_slice(),
             sinks: self.sinks.into_boxed_slice(),
             delivering: AtomicBool::new(false),
             unsettled: AtomicUsize::new(0),
+            last_resolved: AtomicU8::new(RESOLVED_UNKNOWN),
+            contention: AtomicUsize::new(0),
         }
     }
 
@@ -1171,6 +1736,7 @@ impl fmt::Debug for WireBuilder {
         f.debug_struct("WireBuilder")
             .field("sources", &self.sources)
             .field("sinks", &self.sinks.len())
+            .field("mode", &self.mode)
             .finish()
     }
 }
@@ -1210,6 +1776,36 @@ impl WireSource {
         self.wire.set(self.id, level)
     }
 
+    /// Present `drive` — an output stage rather than a level, so this is the
+    /// one an open-drain pin, a pull resistor or a switch contact uses.
+    /// Returns whether it changed, as [`Wire::drive`] does.
+    #[inline]
+    pub fn drive(&self, drive: Drive) -> bool {
+        self.wire.drive(self.id, drive)
+    }
+
+    /// Stop driving: [`WireSource::drive`] with [`Drive::HiZ`].
+    #[inline]
+    pub fn release(&self) -> bool {
+        self.drive(Drive::HiZ)
+    }
+
+    /// The output stage this port is currently presenting.
+    #[inline]
+    pub fn drive_state(&self) -> Drive {
+        self.wire.drive_of(self.id).unwrap_or(Drive::HiZ)
+    }
+
+    /// The level of the whole net, as its own resolution computes it.
+    ///
+    /// What a bidirectional pin reads back: a part that drives a pin and then
+    /// samples it is reading the net, not its own output stage, and on an
+    /// open-drain net the two differ whenever somebody else is pulling.
+    #[inline]
+    pub fn net_level(&self) -> Level {
+        self.wire.resolve_net()
+    }
+
     /// Drive high.
     #[inline]
     pub fn raise(&self) -> bool {
@@ -1222,7 +1818,11 @@ impl WireSource {
         self.set(Level::Low)
     }
 
-    /// The level this port is currently driving.
+    /// The level this port is currently driving, and [`Level::Low`] when it is
+    /// driving nothing at all.
+    ///
+    /// [`WireSource::drive_state`] is the one that tells those apart, and
+    /// [`WireSource::net_level`] is what the *pin* is at.
     #[inline]
     pub fn level(&self) -> Level {
         self.wire.level_of(self.id).unwrap_or(Level::Low)
@@ -2510,5 +3110,288 @@ mod tests {
         assert_eq!(IntAckResponse::Autovector.vector(), None);
         assert!(IntAckResponse::Autovector.answered());
         assert!(!IntAckResponse::Declined.answered());
+    }
+
+    // -- tri-state and per-net resolution ---------------------------------
+
+    /// An open-drain stage: it pulls low or it lets go, nothing else.
+    fn open_drain(wire: &Arc<Wire>, src: WireId, low: bool) {
+        wire.drive(src, if low { Drive::Low } else { Drive::HiZ });
+    }
+
+    #[test]
+    fn a_drive_says_which_of_three_things_a_stage_is_doing() {
+        assert_eq!(Drive::strong(Level::High), Drive::High);
+        assert_eq!(Drive::weak(Level::Low), Drive::WeakLow);
+        assert_eq!(Drive::open_drain(Level::Low), Drive::Low);
+        assert_eq!(
+            Drive::open_drain(Level::High),
+            Drive::HiZ,
+            "an open-drain stage asked for a one lets go; that is the whole point"
+        );
+        assert_eq!(Drive::HiZ.level(), None);
+        assert_eq!(Drive::WeakHigh.level(), Some(Level::High));
+        assert!(Drive::Low.is_strong() && !Drive::WeakLow.is_strong());
+        assert!(Drive::WeakLow.is_weak() && !Drive::Low.is_weak());
+        assert!(Drive::HiZ.is_hiz());
+        // `Low` and `High` keep codes 0 and 1, which is what lets a snapshot
+        // written before tri-state existed still decode.
+        assert_eq!(Drive::Low.code(), 0);
+        assert_eq!(Drive::High.code(), 1);
+        for d in [
+            Drive::HiZ,
+            Drive::WeakLow,
+            Drive::WeakHigh,
+            Drive::Low,
+            Drive::High,
+        ] {
+            assert_eq!(Drive::from_code(d.code()), Some(d));
+        }
+        assert_eq!(Drive::from_code(5), None);
+    }
+
+    #[test]
+    fn a_pull_up_holds_a_net_nobody_is_driving() {
+        let probe = Probe::new();
+        let wire = Wire::builder()
+            .sources(&[A, B])
+            .sink(probe.clone() as Arc<dyn WireSink>, 0)
+            .resolved(Pull::Up)
+            .build_shared();
+        // Nothing has driven anything: every source starts Hi-Z, not low, which
+        // is the distinction the mode exists for.
+        assert_eq!(wire.drive_of(A), Some(Drive::HiZ));
+        assert_eq!(wire.resolve_net(), Level::High);
+        wire.refresh();
+        assert_eq!(probe.level(), Level::High);
+        // One open-drain stage pulls the whole net down...
+        open_drain(&wire, A, true);
+        assert_eq!(probe.level(), Level::Low);
+        // ...and while it holds, the other letting go changes nothing.
+        open_drain(&wire, B, false);
+        assert_eq!(probe.level(), Level::Low);
+        open_drain(&wire, A, false);
+        assert_eq!(probe.level(), Level::High);
+        assert_eq!(wire.contention(), 0);
+    }
+
+    #[test]
+    fn a_pull_down_is_the_same_arrangement_upside_down() {
+        let probe = Probe::new();
+        let wire = Wire::builder()
+            .sources(&[A])
+            .sink(probe.clone() as Arc<dyn WireSink>, 0)
+            .resolved(Pull::Down)
+            .build_shared();
+        wire.refresh();
+        assert_eq!(probe.level(), Level::Low);
+        wire.drive(A, Drive::High);
+        assert_eq!(
+            probe.level(),
+            Level::High,
+            "a strong driver beats a resistor"
+        );
+        wire.drive(A, Drive::HiZ);
+        assert_eq!(probe.level(), Level::Low);
+    }
+
+    #[test]
+    fn strength_beats_polarity_and_a_resistor_never_wins() {
+        let wire = Wire::builder()
+            .sources(&[A, B])
+            .resolved(Pull::Up)
+            .build_shared();
+        wire.drive(A, Drive::WeakLow);
+        assert_eq!(
+            wire.resolve_net(),
+            Level::Low,
+            "two resistors in opposition is a divider, not a level; the model \
+             answers low and counts it"
+        );
+        assert!(wire.contention() > 0);
+        let before = wire.contention();
+        wire.drive(B, Drive::High);
+        assert_eq!(
+            wire.resolve_net(),
+            Level::High,
+            "a stage overrules both resistors"
+        );
+        assert_eq!(
+            wire.contention(),
+            before,
+            "one strong driver is not a fight"
+        );
+        wire.drive(A, Drive::Low);
+        assert_eq!(wire.resolve_net(), Level::Low);
+        assert!(
+            wire.contention() > before,
+            "two stages in opposition is a short"
+        );
+    }
+
+    #[test]
+    fn a_net_with_no_driver_and_no_resistor_is_reported_rather_than_guessed() {
+        let wire = Wire::builder()
+            .sources(&[A])
+            .resolved(Pull::None)
+            .build_shared();
+        assert_eq!(wire.resolve_net(), Level::Low);
+        wire.refresh();
+        assert!(
+            wire.contention() > 0,
+            "a floating net has no level; answering low is a choice, and the \
+             counter is how a machine description finds out it made it"
+        );
+    }
+
+    #[test]
+    fn the_resolution_does_not_depend_on_the_order_drivers_registered_in() {
+        // The same three drives, declared both ways round, must resolve alike.
+        let forward = Wire::builder()
+            .sources(&[A, B, C])
+            .resolved(Pull::Up)
+            .build_shared();
+        let backward = Wire::builder()
+            .sources(&[C, B, A])
+            .resolved(Pull::Up)
+            .build_shared();
+        for wire in [&forward, &backward] {
+            wire.drive(A, Drive::WeakHigh);
+            wire.drive(B, Drive::HiZ);
+            wire.drive(C, Drive::Low);
+        }
+        assert_eq!(forward.resolve_net(), backward.resolve_net());
+        assert_eq!(forward.resolve_net(), Level::Low);
+        assert_eq!(forward.snapshot_drives(), backward.snapshot_drives());
+    }
+
+    #[test]
+    fn a_fan_in_keeping_sink_stays_correct_on_a_resolved_net() {
+        // The compatibility claim in `deliver_resolved`, asserted: a sink that
+        // wired-ORs its sources — which is every non-test sink in the tree —
+        // reports the net's resolved level without knowing tri-state exists.
+        let irq = Irq::new(&[A, B]);
+        let wire = Wire::builder()
+            .sources(&[A, B])
+            .sink(irq.clone() as Arc<dyn WireSink>, 0)
+            .resolved(Pull::Up)
+            .build_shared();
+        wire.refresh();
+        assert_eq!(
+            irq.level(),
+            Level::High,
+            "the pull-up, through an OR-ing sink"
+        );
+        open_drain(&wire, B, true);
+        assert_eq!(
+            irq.level(),
+            Level::Low,
+            "an OR of all-low entries is low, which is what the net says"
+        );
+        open_drain(&wire, B, false);
+        assert_eq!(irq.level(), Level::High);
+    }
+
+    #[test]
+    fn a_per_sink_net_is_untouched_by_any_of_this() {
+        // The default, and what every interrupt line in the tree is: the wire
+        // delivers the driver's own level and the sink resolves.
+        let irq = Irq::new(&[A, B]);
+        let wire = Wire::builder()
+            .sources(&[A, B])
+            .sink(irq.clone() as Arc<dyn WireSink>, 0)
+            .build_shared();
+        assert_eq!(wire.mode(), NetMode::PerSink);
+        assert_eq!(wire.drive_of(A), Some(Drive::Low), "still low, not Hi-Z");
+        wire.set(A, Level::High);
+        wire.set(B, Level::High);
+        assert_eq!(irq.level(), Level::High);
+        wire.set(A, Level::Low);
+        assert_eq!(
+            irq.level(),
+            Level::High,
+            "the shared-interrupt case: B still asserts"
+        );
+        assert_eq!(
+            wire.contention(),
+            0,
+            "a per-sink net cannot express a short"
+        );
+    }
+
+    #[test]
+    fn a_resolved_net_says_nothing_when_a_driver_moves_without_moving_it() {
+        let probe = Probe::new();
+        let wire = Wire::builder()
+            .sources(&[A, B])
+            .sink(probe.clone() as Arc<dyn WireSink>, 0)
+            .resolved(Pull::Up)
+            .build_shared();
+        open_drain(&wire, A, true);
+        open_drain(&wire, B, true);
+        let calls = probe.calls();
+        // B letting go while A still holds the net down is not news.
+        open_drain(&wire, B, false);
+        assert_eq!(probe.calls(), calls);
+        assert_eq!(probe.level(), Level::Low);
+    }
+
+    #[test]
+    fn a_resolved_nets_drives_round_trip_through_a_snapshot() {
+        let wire = Wire::builder()
+            .sources(&[A, B])
+            .resolved(Pull::Up)
+            .build_shared();
+        wire.drive(A, Drive::Low);
+        wire.drive(B, Drive::WeakHigh);
+        let saved = wire.snapshot_drives();
+        assert_eq!(saved, vec![(A, Drive::Low), (B, Drive::WeakHigh)]);
+        let restored = Wire::builder()
+            .sources(&[A, B])
+            .resolved(Pull::Up)
+            .build_shared();
+        restored.restore_drives(&saved);
+        assert_eq!(
+            restored.resolve_net(),
+            wire.resolve_net(),
+            "a level flattened to two states would have brought the net back \
+             at the wrong rail"
+        );
+        assert_eq!(restored.snapshot_drives(), saved);
+    }
+
+    #[test]
+    fn a_pull_is_spelled_the_way_a_machine_file_writes_it() {
+        assert_eq!(Pull::from_name("up"), Some(Pull::Up));
+        assert_eq!(Pull::from_name("down"), Some(Pull::Down));
+        assert_eq!(Pull::from_name("none"), Some(Pull::None));
+        assert_eq!(Pull::from_name("float"), Some(Pull::None));
+        assert_eq!(Pull::from_name("pullup"), None);
+        assert_eq!(Pull::Up.name(), "up");
+        assert_eq!(Pull::Up.drive(), Drive::WeakHigh);
+        assert_eq!(Pull::None.drive(), Drive::HiZ);
+        assert_eq!(NetMode::Resolved(Pull::Down).pull(), Pull::Down);
+        assert!(!NetMode::PerSink.is_resolved());
+    }
+
+    #[test]
+    fn a_source_handle_can_let_go_and_read_the_net_back() {
+        let wire = Wire::builder()
+            .sources(&[A, B])
+            .resolved(Pull::Up)
+            .build_shared();
+        let a = WireSource::new(Arc::clone(&wire), A);
+        let b = WireSource::new(Arc::clone(&wire), B);
+        a.drive(Drive::Low);
+        assert_eq!(a.drive_state(), Drive::Low);
+        assert_eq!(
+            b.net_level(),
+            Level::Low,
+            "a pin reads the net, not its own stage — which is how an \
+             open-drain bus is sensed at all"
+        );
+        assert_eq!(b.drive_state(), Drive::HiZ);
+        a.release();
+        assert_eq!(b.net_level(), Level::High);
     }
 }

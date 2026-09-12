@@ -101,7 +101,7 @@ use crate::core::sched::{
 use crate::core::space::{AddressSpace, RequesterId};
 use crate::core::spin::Detector as SpinDetector;
 use crate::core::state::{MachineShape, Migrations, Sink, Source, StateReader, StateWriter};
-use crate::core::wire::{Level, Wire, WireId};
+use crate::core::wire::{Drive, Wire, WireId};
 use crate::machine::realize::Instance;
 
 /// The snapshot chunk holding the oscillator forest's tick counters.
@@ -110,7 +110,7 @@ pub const CLOCK_PATH: &str = "/clock";
 /// The class name recorded on the [`CLOCK_PATH`] chunk.
 pub const CLOCK_CLASS: &str = "machine.clock";
 
-/// The snapshot chunk holding every wire source's level.
+/// The snapshot chunk holding what every wire source is driving.
 pub const WIRE_PATH: &str = "/wires";
 
 /// The class name recorded on the [`WIRE_PATH`] chunk.
@@ -600,6 +600,18 @@ impl Machine {
         for pin in &self.sweep {
             if let Some(instance) = self.devices[pin.device].instance.as_ref() {
                 instance.announce(&pin.port);
+            }
+        }
+        // A net that resolves itself has a level of its own — its
+        // [`Pull`](crate::core::wire::Pull) — which no device announces and
+        // which is exactly the level a keypad column or an I²C line idles at
+        // while nothing is driving. Announcing drives only move such a net when
+        // a driver leaves Hi-Z, so without this the sinks would come up
+        // believing a pulled-up line was low. Idempotent; per-sink nets have no
+        // level of their own and are left alone.
+        for net in &self.nets {
+            if net.wire.mode().is_resolved() {
+                net.wire.refresh();
             }
         }
         self.deferred.drain();
@@ -1332,15 +1344,23 @@ fn load_sched<'a>(sched: &mut Scheduler, src: &mut impl Source<'a>) -> Result<()
     Ok(())
 }
 
-/// Write each net's per-source levels.
+/// Write each net's per-source drives.
+///
+/// A *drive*, not a level, since tri-state arrived: "nobody is driving" is not
+/// "everybody is driving low" and a snapshot that flattened the two would bring
+/// a pulled-up net back at the wrong rail. The encoding is
+/// [`Drive::code`](crate::core::wire::Drive::code), whose `0` and `1` are still
+/// `Low` and `High`, so a snapshot written when this byte meant a bare level
+/// still loads. The net's own *resolved* level is not written at all: it is
+/// derived from these (`ROADMAP.md` §4.5).
 fn save_wires(nets: &[Net], sink: &mut impl Sink) -> Result<()> {
     sink.write_seq_len(nets.len() as u64)?;
     for net in nets {
-        let levels = net.wire.snapshot();
-        sink.write_seq_len(levels.len() as u64)?;
-        for (id, level) in levels {
+        let drives = net.wire.snapshot_drives();
+        sink.write_seq_len(drives.len() as u64)?;
+        for (id, drive) in drives {
             sink.write_u64(id.raw())?;
-            sink.write_u8(u8::from(level.is_high()))?;
+            sink.write_u8(drive.code())?;
         }
     }
     Ok(())
@@ -1357,21 +1377,17 @@ fn load_wires<'a>(nets: &[Net], src: &mut impl Source<'a>) -> Result<()> {
         )));
     }
     for net in nets {
-        // Nine bytes per source: a `u64` id and a level byte.
+        // Nine bytes per source: a `u64` id and a drive byte.
         let sources = src.read_seq_len(9)? as usize;
-        let mut levels = Vec::with_capacity(sources.min(src.remaining()));
+        let mut drives = Vec::with_capacity(sources.min(src.remaining()));
         for _ in 0..sources {
             let id = WireId::new(src.read_u64()?);
-            let level = match src.read_u8()? {
-                0 => Level::Low,
-                1 => Level::High,
-                other => {
-                    return Err(Error::State(format!("wire level {other} is not 0 or 1")));
-                }
-            };
-            levels.push((id, level));
+            let byte = src.read_u8()?;
+            let drive = Drive::from_code(byte)
+                .ok_or_else(|| Error::State(format!("wire drive {byte} is not a drive code")))?;
+            drives.push((id, drive));
         }
-        net.wire.restore(&levels);
+        net.wire.restore_drives(&drives);
     }
     // Restoring a level does not *deliver* it, and a sink's own fan-in is
     // derived state that nothing else rebuilds — so a re-announce is what
