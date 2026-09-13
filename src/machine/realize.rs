@@ -340,6 +340,61 @@ impl<'a> BindCtx<'a> {
             )
         })
     }
+
+    /// The region called `name` on the sibling device at `path` — what a `map`
+    /// statement naming `path.name` would place.
+    ///
+    /// For a **decoder**: a device whose own region answers at an address and
+    /// forwards each access into somebody else's region, choosing where by a
+    /// pin level, a bit in a register or the address itself. The Amiga has two
+    /// on one board — the `OVL` overlay, which answers at zero out of the
+    /// Kickstart ROM or chip RAM, and the CIA decode, which spreads each 8520's
+    /// sixteen back-to-back registers 256 bytes apart on one data-bus lane —
+    /// and neither of their targets can be found any other way.
+    ///
+    /// The route `st.syscfg`'s boot alias takes is to name the *address* a
+    /// source is mapped at and copy that mapping. It fails in exactly these
+    /// cases: chip RAM's only address is the one the overlay itself claims, and
+    /// a CIA register block is not mapped anywhere at all until something
+    /// decodes it.
+    ///
+    /// This is not a fourth handle mechanism beside [`export`](BindCtx::export).
+    /// It reaches nothing a machine file cannot already name: a region is what
+    /// `map` statements are made of, and the device publishes it through the
+    /// same [`Device::region`] the realizer maps from. A consumer gets a region
+    /// — never a device, and never bytes — so it can only reach the contents by
+    /// mapping it into a space of its own.
+    ///
+    /// # Errors
+    ///
+    /// If nothing in the machine is called `path`, or if it has no region
+    /// `name`. Both name the consumer and the source.
+    pub fn region(&self, path: &str, name: &str) -> Result<RegionRef> {
+        let Some(peer) = self.peers.iter().find(|b| b.path == path) else {
+            let names: Vec<&str> = self.peers.iter().map(|b| b.path.as_str()).collect();
+            return Err(config(
+                self.path,
+                format!(
+                    "names `{path}`, but this machine has no object called `{path}`; it has {}",
+                    list(&names)
+                ),
+            ));
+        };
+        peer.device.region(name).ok_or_else(|| {
+            let what = if name.is_empty() {
+                String::from("no region of its own")
+            } else {
+                format!("no region `{name}`")
+            };
+            config(
+                self.path,
+                format!(
+                    "names `{path}`, but `{path}` is a `{}` and has {what}",
+                    peer.class.name
+                ),
+            )
+        })
+    }
 }
 
 /// A named neighbour, as much of one as the machine layer shows a device.
