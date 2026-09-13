@@ -214,6 +214,7 @@ fn the_board_realizes_with_every_object_the_map_needs() {
         "cia_a_decode",
         "cia_b_decode",
         "paula",
+        "df0",
     ] {
         assert!(
             m.device(path).is_some(),
@@ -557,6 +558,87 @@ fn a_guest_serdat_reaches_the_host_serial_port() {
     m.run_for(GlobalTime::from_nanos(5_000_000))
         .expect("it runs");
     assert_eq!(host.drain(), b"A".to_vec());
+}
+
+/// A raw MFM disk for DF0 in which every track starts with its own number and
+/// then the `$4489` sync mark, and is otherwise blank.
+fn numbered_disk() -> Vec<u8> {
+    const TRACK: usize = 12_500;
+    let mut raw = vec![0u8; 160 * TRACK];
+    for (t, track) in raw.chunks_mut(TRACK).enumerate() {
+        track[..3].copy_from_slice(&[t as u8, 0x44, 0x89]);
+    }
+    raw
+}
+
+#[test]
+fn df0_answers_the_cia_lines_the_way_table_8_5_says() {
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("kickstart", kickstart());
+    options.realize.media.insert("df0", numbered_disk());
+    let registry = catalog::registry().expect("a registry");
+    // The shipped board leaves DF0 empty; this one names a slot for it.
+    let shipped = catalog::machine("amiga-a500").unwrap().source;
+    let source = shipped.replace(
+        "object df0 \"amiga.floppy\" { clock = clk / 8, paula = paula }",
+        "object df0 \"amiga.floppy\" { clock = clk / 8, paula = paula, image = \"df0\" }",
+    );
+    assert_ne!(source, shipped, "the substitution found its line");
+    let mut m = rsemu::machine::build("amiga-a500", &source, &registry, &options)
+        .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
+
+    const CIAB_PRB: u64 = 0xBF_D100;
+    const CIAB_ICR: u64 = 0xBF_DD00;
+    const RDY: u8 = 0x20;
+    const TK0: u8 = 0x10;
+    const WPRO: u8 = 0x08;
+    const CHNG: u8 = 0x04;
+    let lines = |m: &Machine| peek_byte(m, CIAA_PRA) & (RDY | TK0 | WPRO | CHNG);
+
+    assert_eq!(
+        lines(&m),
+        RDY | TK0 | WPRO | CHNG,
+        "deselected: all pulled up"
+    );
+
+    // Appendix F: "ddrb ... (set to 0xFF)". Then the motor, then the select —
+    // "software that selects drives must set up the motor signal before
+    // selecting any drives".
+    poke_byte(&m, CIAB_DDRB, 0xff);
+    poke_byte(&m, CIAB_PRB, 0xff);
+    poke_byte(&m, CIAB_PRB, 0x7f); // MTR* low
+    poke_byte(&m, CIAB_PRB, 0x77); // SEL0* low
+    assert_eq!(
+        lines(&m),
+        WPRO,
+        "ready, on track 0, not protected, and the change flop set at power-up"
+    );
+
+    // One step towards the centre: DIR low, then a pulse on STEP*.
+    poke_byte(&m, CIAB_PRB, 0x75);
+    poke_byte(&m, CIAB_PRB, 0x74);
+    poke_byte(&m, CIAB_PRB, 0x75);
+    assert_eq!(
+        lines(&m),
+        WPRO | TK0 | CHNG,
+        "off track 0, and the flop reset"
+    );
+
+    // Let a revolution pass: the index pulse falls on CIA-B's /FLAG. Reading
+    // the ICR clears it, so read it once, afterwards.
+    let _ = peek_byte(&m, CIAB_ICR);
+    m.run_for(GlobalTime::from_nanos(250_000_000))
+        .expect("it runs");
+    assert_eq!(peek_byte(&m, CIAB_ICR) & 0x10, 0x10, "ICR FLAG: the index");
+
+    // And Paula reads the track under the head: cylinder 1, side 0, track 2,
+    // whose sync mark sets DSKSYN.
+    poke_word(&m, CUSTOM + 0x09E, 0x8100); // ADKCON: SET | FAST
+    poke_word(&m, CUSTOM + 0x07E, 0x4489); // DSKSYNC
+    poke_word(&m, CUSTOM + 0x09C, 0x7fff); // INTREQ: clear everything
+    m.run_for(GlobalTime::from_nanos(250_000_000))
+        .expect("it runs");
+    assert_eq!(peek_word(&m, INTREQR) & 0x1000, 0x1000, "DSKSYN");
 }
 
 #[test]

@@ -162,6 +162,16 @@ machine "amiga-a500" {
   # `serial`.
   object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial" }
 
+  # -- the internal drive ----------------------------------------------------
+  #
+  # See `src/dev/amiga/floppy.rs`. DF0, on the colour clock like Paula because
+  # the cells it hands Paula are timed in Paula's ticks. It is empty, which is
+  # an A500 waiting at the insert-disk screen. The class takes
+  # `image = "<slot>"`, a raw MFM dump of 160 tracks of 12,500 bytes; it is not
+  # named here because a named slot must be bound, and a board that could not
+  # run without a disk would be the wrong default.
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula }
+
   # -- the overlay -----------------------------------------------------------
   #
   # See `src/dev/amiga/gary.rs`. At reset `OVL` is asserted and the window at
@@ -225,4 +235,22 @@ machine "amiga-a500" {
   # expansion bus shares both lines; nothing is plugged into it.
   wire cia_a.irq -> paula.int2
   wire cia_b.irq -> paula.int6
+
+  # The floppy lines (chapter 8, Table 8-5; Appendix E). CIA-B's port B is
+  # eight outputs to the drives, and CIA-A's PA2-PA5 four inputs from them. The
+  # drive's outputs are open-collector, so each net carries the pull-up the CIA
+  # pins have, and a deselected drive lets go. Only DF0 is fitted: SEL1*-SEL3*
+  # on PB4-PB6 go to the external connector, where nothing is plugged in.
+  wire cia_b.pb7 -> df0.mtr   { pull = "up" }    # MTR*   motor
+  wire cia_b.pb3 -> df0.sel   { pull = "up" }    # SEL0*  select the internal drive
+  wire cia_b.pb2 -> df0.side  { pull = "up" }    # SIDE*  low: side 1
+  wire cia_b.pb1 -> df0.dir   { pull = "up" }    # DIR    low: towards the centre
+  wire cia_b.pb0 -> df0.step  { pull = "up" }    # STEP*
+  wire df0.rdy   -> cia_a.pa5 { pull = "up" }    # RDY*
+  wire df0.tk0   -> cia_a.pa4 { pull = "up" }    # TK0*
+  wire df0.wpro  -> cia_a.pa3 { pull = "up" }    # WPRO*
+  wire df0.chng  -> cia_a.pa2 { pull = "up" }    # CHNG*
+  # "Disk index pulse ($BFDD00, bit 4)": CIA-B's /FLAG, whose falling edge sets
+  # ICR bit 4 and can raise level 6.
+  wire df0.index -> cia_b.flag { pull = "up" }   # INDEX*
 }

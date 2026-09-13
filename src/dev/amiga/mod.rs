@@ -9,6 +9,7 @@
 //! | [`gary`] | the `OVL` overlay — whether the Kickstart ROM or chip RAM answers at address zero |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
+//! | [`floppy`] | `dev-amiga-floppy`: a floppy drive — the mechanism on the CIA ports, raw MFM cells for Paula |
 //!
 //! plus [`regs`], which is Appendix B of the hardware manual as data and is
 //! what makes the first of those a decode rather than three scattered ones.
@@ -62,6 +63,10 @@ pub mod regs;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-paula")))]
 pub mod paula;
 
+#[cfg(feature = "dev-amiga-floppy")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-floppy")))]
+pub mod floppy;
+
 use crate::core::error::Result;
 
 /// Add every class in this module to a registry.
@@ -75,6 +80,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     gary::register(registry)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::register(registry)?;
+    #[cfg(feature = "dev-amiga-floppy")]
+    floppy::register(registry)?;
     Ok(())
 }
 
@@ -89,6 +96,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     gary::bind(bindings)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-floppy")]
+    floppy::bind(bindings)?;
     Ok(())
 }
 
@@ -99,5 +108,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     let mut schemas = alloc::vec![cia_decode::schema(), custom::schema(), gary::schema()];
     #[cfg(feature = "dev-amiga-paula")]
     schemas.push(paula::schema());
+    #[cfg(feature = "dev-amiga-floppy")]
+    schemas.push(floppy::schema());
     schemas
 }

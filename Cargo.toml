@@ -2590,6 +2590,18 @@ dev-amiga = []
 # dependencies.
 dev-amiga-paula = ["dev-amiga"]
 
+# An Amiga floppy drive (src/dev/amiga/floppy.rs): the mechanism the two CIAs
+# drive -- the motor flop clocked by select, step and direction with the
+# refusal to step past track 0, side select, the disk-change flop that only a
+# step with a disk in clears, RDY*/TK0*/WPRO*/CHNG* as open-collector outputs,
+# the 32-bit identification word on RDY* with the motor off, and an index
+# pulse once a revolution for CIA-B's FLAG -- and the raw MFM cells under the
+# head, which it hands to Paula's read line and takes back on a write. Disks
+# are raw MFM tracks; no image format is decoded here. From the Amiga Hardware
+# Reference Manual's chapter 8 and its Appendix E disk connector. Implies
+# `dev-amiga-paula`. `no_std + alloc`, no dependencies.
+dev-amiga-floppy = ["dev-amiga-paula"]
+
 # The `amiga-a500` board (machines/amiga-a500.machine plus the classes it
 # names): a big-endian 24-bit space, chip RAM at zero behind the `OVL`
 # overlay, the custom chip registers at $DFF000, and a 512 KiB Kickstart socket
@@ -2599,7 +2611,7 @@ dev-amiga-paula = ["dev-amiga"]
 # Paula is on it, carrying both CIAs' interrupts onto the 68000's IPL pins and
 # the UART onto the host port `serial`. It boots a synthetic ROM and stops
 # there: Agnus and Denise are still to come. Adds no dependencies.
-machine-amiga-a500 = ["cpu-m68k", "dev-amiga-paula", "dev-mos8520"]
+machine-amiga-a500 = ["cpu-m68k", "dev-amiga-floppy", "dev-mos8520"]
 
 # The network seam (src/dev/net/link.rs): what a NIC model is attached to --
 # frames out, frames in **against a virtual tick**, carrier, and a station
