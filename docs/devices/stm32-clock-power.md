@@ -100,20 +100,66 @@ The L4's second APB1 word is `apb1enb` rather than `apb1en2` because a bank pin
 is a prefix followed by decimal digits: `apb1en21` would otherwise be two pins
 with one spelling.
 
-**What a peripheral should implement.** Two input pins, both levels:
+**What a peripheral implements**, through `src/dev/stm32/gate.rs` — one
+`ClockGate` beside its register state and two input pins, both levels:
 
 | Pin | High means | What the peripheral does |
 | --- | --- | --- |
-| `enable` | the clock is running | low: registers read as zero and writes are dropped — or a bus fault, where the part faults |
-| `reset` | the reset line is pulled | on the rising edge, `Device::reset(ResetKind::Bus)` on itself; stay reset while it is high |
+| `enable` | the clock is running | low: every register reads as zero, writes are dropped, and anything the block counts stops where it is |
+| `reset` | the reset line is pulled | on the rising edge, the register file goes back to its reset values; the block stays deaf while the level stands |
 
-Both are `Device::sink`, and both must be safe to receive with no lock held —
-the RCC drives them *after* its own critical section. A peripheral with neither
-pin wired behaves as it does today, ungated, so the five peripherals being
-written alongside this one can adopt the pins one at a time.
+Both are `Device::sink`, and both are safe to receive with no lock held — the
+RCC drives them *after* its own critical section. **A peripheral whose `enable`
+nobody wired is clocked**, which is what keeps every board written before the
+gate working and lets peripherals adopt the pins one at a time; it is
+`st.firewall`'s `clken` rule, generalised.
+
+Not a bus fault: ST's note under each `xxENR` register is that the registers
+are not readable — zero comes back — and that accesses are not effective, so a
+firmware that forgets one `RCC_AHB1ENR` write sees a port that will not
+configure rather than a HardFault that would have said why. Removing a clock is
+**not** a reset: the values behind the registers survive it, and `xxRSTR` is
+the pin that clears them.
+
+The gate's level is deliberately **not** in any device's snapshot. `Rcc::load`
+restores `xxENR`/`xxRSTR` and republishes every connected gate pin, and no
+peripheral's `load` touches its gate, so the two cannot disagree whichever
+order the chunks load in — and adopting the gate moved no device's encoding.
+
+**Who has the pins**, and who has something else instead:
+
+| Class | `enable` | `reset` | Notes |
+| --- | --- | --- | --- |
+| `st.gpio`, `st.usart`, `st.tim`, `st.dma`, `st.dmamux`, `st.crc`, `st.rng`, `st.syscfg`, `st.i2c`, `st.i2c-v2`, `stm32.spi`, `st.octospi`, `stm32.sdio`, `stm32.sdmmc`, `st.hash`, `st.pwr` | yes | yes | |
+| `st.wwdg` | yes | — | its `reset` is the watchdog's **output**, and two opposite things cannot share a pin name; `APB1RSTR.WWDGRST` has no input here |
+| `st.firewall` | `clken` | — | predates this module: `FWEN` is write-once and its level is inside that device's snapshot |
+| `st.rtc` | `rtcen` | `bdrst` | the RTC's gate is `BDCR.RTCEN`, not an `xxENR` bit |
+| `st.iwdg`, `st.exti`, `st.dbgmcu` | — | — | the part gives them no `xxENR` bit: the IWDG runs from the LSI whatever RCC says |
+| `st.flash` | — | — | not yet gated |
+
+What a gated peripheral does with its **level outputs** — an `irq` line, a DMA
+request — is not uniform yet, and the manuals do not settle it. A block with no
+clock cannot change its flip-flops, which argues for the line holding what it
+had; a request line stuck high at a controller that *is* clocked drains a
+stream into a peripheral that is switched off, which argues for dropping it.
+`stm32.sdio`, `stm32.sdmmc` and `st.hash` drop `irq`/`dma` on the first gated
+access; everything else holds. Closing that properly wants a `Gated`
+notification on the enable pin's edge, which this round did not add.
 
 Two more named outputs: `rtcen` (`BDCR.RTCEN`) and `bdrst` (`BDCR.BDRST`), for
 an RTC model to watch.
+
+### The clock interrupt — a wire out
+
+`CIR` (F4) and `CIER`/`CIFR`/`CICR` (L4) are live: a ready bit coming true
+while its `xxRDYIE` stands sets the matching flag and raises the `irq` output,
+which an F4 board wires to NVIC position 5 (`wire rcc.irq -> cpu.irq5`).
+
+The flag is set only when the enable is — "set by hardware when the … clock
+becomes stable **and** `xxRDYIE` is set" (RM0090 §7.3.5, RM0351 §6.4.6) — so a
+firmware that polls `CR` never finds one of these appear behind it. `CSSF` is
+the one flag nothing sets: a failing HSE is not modelled, and on the part it
+takes the NMI rather than this line.
 
 ### `PWR_CR.DBP` — a wire, not a handle
 
@@ -185,5 +231,14 @@ or a reset controller drives one; the RCC does not guess.
 - The F4 `*LPENR` and L4 `*SMENR` low-power gate registers reset to zero rather
   than to the manual's "every implemented peripheral enabled" constants, which
   were not to hand to check. Nothing in a startup path reads them.
-- RCC interrupts (`CIR`, `CIER`/`CIFR`/`CICR`) are storage: no ready or
-  clock-security event is raised.
+- **The clock security system raises nothing.** `CSSON` is stored and a failing
+  HSE is not modelled, so `CSSF` — and the NMI it takes on the part — is the
+  one interrupt source here that no path sets. The eight ready flags are live.
+- **No shipped board wires a gate pin.** The classes have `enable` and `reset`;
+  `machines/stm32f407.machine` draws neither, so on that board every peripheral
+  is clocked from the first instruction as it was before. Wiring it is a
+  behavioural change that belongs in its own commit: the part's peripherals
+  come out of reset gated, so the board's nine hand-assembled test programs and
+  the demo firmware `rsemu run stm32f407` ships would each have to enable their
+  own clocks first, exactly as vendor firmware does.
+  `machines/tests/stm32f4-gated.machine` is the board that does wire them.

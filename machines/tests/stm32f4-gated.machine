@@ -1,0 +1,101 @@
+# stm32f4-gated - an STM32F4 whose peripherals are wired to their clock gates.
+#
+# It models no product and it is deliberately not in the catalog.
+# `machines/tests/` is where a board that exists for one test lives, beside
+# `stm32l4-firewall.machine` and `two-uarts.machine`: `rsemu machines` does not
+# list these, `every_shipped_machine_realizes` does not build them, and nothing
+# here is offered to a person as a machine to run. `tests/stm32_clock_gate.rs`
+# includes this file by path.
+#
+# ---------------------------------------------------------------------------
+# Why it exists
+# ---------------------------------------------------------------------------
+#
+# `st.rcc` drives every `RCC_xxENR` and `xxRSTR` bit as an output pin, and
+# since `src/dev/stm32/gate.rs` landed a peripheral has `enable` and `reset`
+# sinks to receive one. Whether those two ends meet is a *board* question: a
+# unit test can drive a pin directly, and only a machine file can get the bit
+# number wrong.
+#
+# So the four lines this board exists for are
+#
+#   wire rcc.ahb1en3  -> gpiod.enable      # RM0090 S7.3.12, AHB1ENR.GPIODEN
+#   wire rcc.apb1en17 -> usart2.enable     # S7.3.13, APB1ENR.USART2EN
+#   wire rcc.apb1en0  -> tim2.enable       # S7.3.13, APB1ENR.TIM2EN
+#   wire rcc.irq      -> cpu.irq5          # Table 62, position 5 is RCC
+#
+# and their `xxRSTR` companions. A board that draws them behaves like the part:
+# firmware that forgets `RCC_AHB1ENR` finds a GPIO port whose `MODER` reads
+# back zero however often it writes it. That is exactly why
+# `machines/stm32f407.machine` does *not* draw them yet -- see
+# `docs/platforms/stm32f407.md`; the part comes out of reset with its
+# peripheral clocks off, and nine hand-assembled test programs plus the demo
+# image shipped for `rsemu run stm32f407` predate the gate. This board pays
+# that price in one file instead.
+#
+# ---------------------------------------------------------------------------
+# The part
+# ---------------------------------------------------------------------------
+#
+# Shaped like an STM32F407 and cut down to what the test drives: a Cortex-M4,
+# RAM standing in for the flash, and four peripherals at the addresses RM0090
+# Table 1 gives them. `st.flash` is absent because nothing here programs an
+# array; `st.syscfg`'s boot alias is absent because the plain map below is the
+# same alias without a second device to configure.
+
+machine "stm32f4-gated" {
+  param console = "console"
+  param flash   = 64K
+  param sram    = 64K
+
+  # The Discovery board's can, which is what `st.rcc` measures its tree from.
+  osc hse = 8000000 Hz
+
+  space mem { width = 32 }
+
+  object cpu "cpu.arm.v7m" {
+    clock         = hse * 21
+    space         = mem
+    part          = "cortex-m4"
+    priority-bits = 4
+  }
+
+  object code "rom" { size = flash, image = "firmware" }
+  object sram1 "ram" { size = sram }
+
+  object rcc    "st.rcc"   { clock = hse, variant = "f4", hse = 8000000 }
+  object gpiod  "st.gpio"  { }
+  object usart2 "st.usart" { clock = hse / 8, port = console, variant = "f4" }
+  object tim2   "st.tim"   { clock = hse * 21 / 2, variant = "general", channels = 4, width = 32 }
+
+  # -- the map (RM0090 Table 1) ----------------------------------------------
+  map mem 0x00000000 size flash = code     # the boot alias BOOT0/BOOT1 select
+  map mem 0x08000000 size flash = code
+  map mem 0x20000000 size sram  = sram1
+  map mem 0x40000000 size 0x64  = tim2
+  map mem 0x40004400 size 0x2c  = usart2
+  map mem 0x40020c00 size 0x28  = gpiod
+  map mem 0x40023800 size 0x90  = rcc
+
+  # -- the gates -------------------------------------------------------------
+  #
+  # The bit numbers are facts about the *part*, from RM0090 S7.3.12 and
+  # S7.3.13, and they belong in a board file for the same reason a vector
+  # number does. An `enable` nobody wires leaves its peripheral clocked, so
+  # every line below is load-bearing: delete one and that peripheral stops
+  # caring whether its clock was ever switched on.
+  wire rcc.ahb1en3  -> gpiod.enable       # AHB1ENR.GPIODEN
+  wire rcc.ahb1rst3 -> gpiod.reset        # AHB1RSTR.GPIODRST
+  wire rcc.apb1en17  -> usart2.enable     # APB1ENR.USART2EN
+  wire rcc.apb1rst17 -> usart2.reset      # APB1RSTR.USART2RST
+  wire rcc.apb1en0   -> tim2.enable       # APB1ENR.TIM2EN
+  wire rcc.apb1rst0  -> tim2.reset        # APB1RSTR.TIM2RST
+
+  # -- the interrupts --------------------------------------------------------
+  #
+  # An M-profile core's NVIC is inside the core, so a peripheral drives
+  # `cpu.irq{n}` directly and *n* is RM0090 Table 62's position: 5 is the RCC's
+  # global interrupt, which `CIR`'s ready flags raise, and 38 is USART2's.
+  wire rcc.irq    -> cpu.irq5
+  wire usart2.irq -> cpu.irq38
+}
