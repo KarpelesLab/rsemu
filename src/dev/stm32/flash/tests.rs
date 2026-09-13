@@ -1529,3 +1529,59 @@ fn read_protection_level_2_is_permanent() {
     assert_eq!(flash.peek(F4_OPTCR), before);
     assert_eq!(sr(&flash), 0);
 }
+
+/// The geometry a loader is told about, which has to be the part's own: GDB
+/// aligns every `vFlashErase` to the blocksize declared here, so a single
+/// blocksize over unequal sectors would have it erase ranges the silicon
+/// cannot.
+#[test]
+fn the_published_erase_geometry_is_the_part_s_own() {
+    let layout = Program {
+        shared: Arc::clone(&f4().shared),
+    }
+    .flash_layout()
+    .expect("an F4 array is programmable by a loader");
+    assert_eq!(layout.erased, 0xff, "RM0090 §3.6.3: an erased cell is ones");
+    // RM0090 Table 5: four of 16 KiB, one of 64 KiB, seven of 128 KiB.
+    assert_eq!(
+        layout.blocks,
+        alloc::vec![
+            EraseBlocks {
+                offset: 0,
+                length: 4 * 16 * 1024,
+                blocksize: 16 * 1024,
+            },
+            EraseBlocks {
+                offset: 64 * 1024,
+                length: 64 * 1024,
+                blocksize: 64 * 1024,
+            },
+            EraseBlocks {
+                offset: 128 * 1024,
+                length: 7 * 128 * 1024,
+                blocksize: 128 * 1024,
+            },
+        ]
+    );
+    // The whole megabyte is covered, with no gap and no overlap.
+    let covered: u64 = layout.blocks.iter().map(|b| b.length).sum();
+    assert_eq!(covered, F4_SIZE);
+
+    // The L4's pages are uniform (RM0351 §3.2), both banks alike, so it is one
+    // run whatever `DUALBANK` says.
+    let l4 = l4();
+    let page = l4.shared.page;
+    let layout = Program {
+        shared: Arc::clone(&l4.shared),
+    }
+    .flash_layout()
+    .expect("an L4 array is programmable too");
+    assert_eq!(
+        layout.blocks,
+        alloc::vec![EraseBlocks {
+            offset: 0,
+            length: L4_SIZE,
+            blocksize: page,
+        }]
+    );
+}

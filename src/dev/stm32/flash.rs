@@ -57,6 +57,15 @@
 //! the one exception, and it is opted into rather than paid for by everybody —
 //! see "What the read side costs, and when", below.
 //!
+//! That handler is also where the **loader's door** is: a write marked
+//! [`MemAttrs::debug`] is a direct poke into the array, because a debugger
+//! programming flash drives the part's programming interface over SWD rather
+//! than storing through the AHB. `Program` publishes that door, and the
+//! sectors behind it, through [`MemOps::flash_layout`] — which is what lets the
+//! gdbstub declare the array `flash` in `qXfer:memory-map:read` and serve
+//! `vFlashErase`/`vFlashWrite`/`vFlashDone` for it without `core::space` having
+//! to relax anything (`src/host/gdb/target.rs`).
+//!
 //! The two children live inside **one** container region, published as
 //! `flash.array`, rather than as two regions the board must map twice at the
 //! same address. That placement is a property of the *chip* — it is how the
@@ -190,7 +199,8 @@ use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{
-    AccessConstraints, Mapping, MemAttrs, MemOps, MemResult, Perms, RamStore, Region, RegionRef,
+    AccessConstraints, EraseBlocks, FlashLayout, Mapping, MemAttrs, MemOps, MemResult, Perms,
+    RamStore, Region, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, AtomicU32, AtomicU64, LockRank, Mutex, Ordering};
@@ -1295,6 +1305,39 @@ impl Shared {
 
     // -- the array's write side ----------------------------------------------
 
+    /// The array's erase geometry, as a loader outside the guest sees it.
+    ///
+    /// The F4's sectors are unequal (RM0090 Table 5), so equal-sized runs are
+    /// coalesced and the result is three runs per bank rather than a blocksize
+    /// that is a lie about eleven of the twelve. The L4's pages are uniform
+    /// (RM0351 §3.2, RM0432 §3.3.1), so it is one run whatever `DUALBANK`
+    /// says: both banks have the same page size and the two are contiguous.
+    fn layout(&self) -> FlashLayout {
+        if !self.variant.is_f4() {
+            return FlashLayout::uniform(self.size, self.page);
+        }
+        let mut blocks: Vec<EraseBlocks> = Vec::new();
+        for snb in 0..24 {
+            let Some((offset, len)) = f4_sector(self.size, snb) else {
+                continue;
+            };
+            match blocks.last_mut() {
+                Some(run) if run.blocksize == len && run.offset + run.length == offset => {
+                    run.length += len;
+                }
+                _ => blocks.push(EraseBlocks {
+                    offset,
+                    length: len,
+                    blocksize: len,
+                }),
+            }
+        }
+        FlashLayout {
+            blocks,
+            erased: 0xff,
+        }
+    }
+
     /// A guest store into the flash window.
     ///
     /// Never returns a bus error for a *flash* reason: the controller reports
@@ -1903,6 +1946,15 @@ impl MemOps for Program {
         // dispatcher should refuse it rather than hand this a long slice to
         // report `SIZERR` about.
         AccessConstraints::IO
+    }
+
+    fn flash_layout(&self) -> Option<FlashLayout> {
+        // The promise this makes is the one [`Shared::program`] already keeps:
+        // a debug write here is the loader's door — a direct poke into the
+        // array that moves no status bit — so a debugger can put an image in
+        // without unlocking anything, and an erase is that poke with `0xff`,
+        // which is what a sector reads as afterwards (RM0090 §3.6.3).
+        Some(self.shared.layout())
     }
 }
 
