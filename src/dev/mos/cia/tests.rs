@@ -584,6 +584,30 @@ fn the_pc_strobe_goes_low_for_one_cycle_after_a_prb_access() {
     assert_eq!(pc.drive_state(), Drive::High);
 }
 
+#[test]
+fn one_chips_output_can_drive_another_chips_input_without_nesting_locks() {
+    // The regression: `refresh` used to hold its `WIRE`-ranked output table
+    // while driving, so the far chip's sink took its `DEVICE` state lock under
+    // `WIRE`. The rank checker is live in this build (`cfg(test)`), which the
+    // `--no-default-features` board test in `tests/` is not, so it lives here.
+    let a = Cia::bare();
+    let b = Cia::bare();
+    let src = WireId::new(1);
+    let flag = b.sink("flag", &[src]).expect("flag is a sink");
+    let wire = Wire::builder()
+        .source(src)
+        .sink(flag.sink, flag.line)
+        .build_shared();
+    a.connect_pin("pc", WireSource::new(wire, src))
+        .expect("pc is a source");
+
+    a.advance_to(10);
+    let _ = peek(&a, 0x1); // /PC low: a falling edge on B's /FLAG
+    assert_eq!(b.icr() & ICR_FLAG, ICR_FLAG);
+    a.advance_to(11); // and back up, from inside the catch-up path
+    assert_eq!(peek(&b, 0xd) & ICR_FLAG, ICR_FLAG);
+}
+
 // ---------------------------------------------------------------------------
 // the invariants every device has
 // ---------------------------------------------------------------------------

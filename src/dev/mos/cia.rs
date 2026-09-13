@@ -266,7 +266,7 @@ struct Shared {
 }
 
 /// Where each output pin drives, once a `wire` statement has named it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Outputs {
     irq: Option<WireSource>,
     pc: Option<WireSource>,
@@ -449,7 +449,9 @@ impl Cia {
             ticks: AtomicU64::new(0),
             next_event: AtomicU64::new(NO_EVENT),
             out: Mutex::with_rank(LockRank::WIRE, Outputs::default()),
-            lazy: Mutex::with_rank(LockRank::WIRE, None),
+            // A leaf: `sync` holds it only long enough to clone the handle, and
+            // calls through the clone after letting go.
+            lazy: Mutex::with_rank(LockRank::LEAF, None),
         });
         shared.publish(&shared.state.lock());
         let port = Arc::new(CiaRegs {
@@ -638,11 +640,18 @@ impl Shared {
 
     /// Drive every output pin to whatever the state now says.
     ///
-    /// Called with no lock held: the re-entrancy contract in `core::device` is
-    /// that outward calls happen after the critical section, never inside it.
+    /// Called with no lock held, and **holding none while it drives**: the
+    /// state is snapshotted and the sources cloned out of [`Shared::out`], and
+    /// only then does anything reach a wire. A wire delivers synchronously, so
+    /// driving from inside either critical section would run the far end's
+    /// sink under this chip's lock — and when the far end is another 8520, its
+    /// sink takes its own `DEVICE`-ranked state lock, which may not nest under
+    /// `WIRE`. That is the re-entrancy contract in `CLAUDE.md` (mutate, release,
+    /// *then* call outward), and it is the shape `st.gpio`'s `refresh_pins`
+    /// already has.
     fn refresh(&self) {
         let pins = self.state.lock().pins();
-        let out = self.out.lock();
+        let out = self.out.lock().clone();
         if let Some(src) = &out.irq {
             src.set(pins.irq);
         }
