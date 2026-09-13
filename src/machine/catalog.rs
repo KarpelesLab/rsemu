@@ -701,7 +701,7 @@ pub static AMIGA_A500: CatalogEntry = CatalogEntry {
     name: "amiga-a500",
     summary: "an Amiga 500's memory map: a 7.09 MHz 68000, chip RAM under the OVL overlay, the \
               $DFF000 custom-chip space, a Kickstart socket",
-    media: &["kickstart"],
+    media: &["kickstart", "df0"],
     source: include_str!("../../machines/amiga-a500.machine"),
 };
 

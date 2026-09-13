@@ -184,12 +184,12 @@ machine "amiga-a500" {
   # -- the internal drive ----------------------------------------------------
   #
   # See `src/dev/amiga/floppy.rs`. DF0, on the colour clock like Paula because
-  # the cells it hands Paula are timed in Paula's ticks. It is empty, which is
-  # an A500 waiting at the insert-disk screen. The class takes
-  # `image = "<slot>"`, a raw MFM dump of 160 tracks of 12,500 bytes; it is not
-  # named here because a named slot must be bound, and a board that could not
-  # run without a disk would be the wrong default.
-  object df0 "amiga.floppy" { clock = clk / 8, paula = paula }
+  # the cells it hands Paula are timed in Paula's ticks. Its disk is the `df0`
+  # media slot: an ADF (`--media df0=adf:disk.adf`, or out of an Amiga Forever
+  # disc with `,disk=<name>`), a raw MFM dump, or `--drive df0=disk.adf` to
+  # have the guest's writes go back to the file. Nothing bound is an empty
+  # drive - an A500 waiting at the insert-disk screen.
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
 
   # -- Agnus -----------------------------------------------------------------
   #
