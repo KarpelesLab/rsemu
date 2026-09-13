@@ -870,3 +870,138 @@ fn wire_two(a: &Arc<ControllerWires>, b: &Arc<ControllerWires>) -> (Arc<Wire>, A
     b.announce();
     (scl, sda)
 }
+
+// ---------------------------------------------------------------------------
+// The clock gate
+// ---------------------------------------------------------------------------
+
+/// Draw this instance's `RCC_APB1ENR.I2CxEN` wire, which starts low.
+fn enable_pin(ctrl: &Stm32I2c, id: WireId) -> SinkPin {
+    Device::sink(ctrl, gate::ENABLE_PIN, &[id]).expect("an STM32 I2C has `enable`")
+}
+
+#[test]
+fn a_gated_controller_reads_as_zero_and_drops_writes() {
+    // GitHub issue #14: with `RCC_APB1ENR.I2CxEN` clear the block is not
+    // readable — every register answers zero — and a write to it is not
+    // effective.
+    let mut board = Board::new(Link::Transactional);
+    board.init();
+    assert_eq!(peek(&board.region, CCR), CCR_VALUE_USED);
+
+    let id = WireId::new(9);
+    let pin = enable_pin(&board.ctrl, id);
+    // Drawing the wire is the assertion that the clock is RCC's to give.
+    assert_eq!(peek(&board.region, CR1), 0, "the whole block reads as zero");
+    assert_eq!(peek(&board.region, CCR), 0);
+    assert_eq!(
+        peek_with(&board.region, SR1, MemAttrs::DEBUG),
+        0,
+        "and so does a debug read, because that is what the bus returns"
+    );
+
+    poke(&board.region, CCR, 0x123);
+    poke(&board.region, CR1, CR1_PE | CR1_START);
+
+    pin.sink.set_level(id, 0, Level::High);
+    // Removing a clock is not a reset: `I2CxRST` is the pin that resets, so
+    // everything written before the gate shut is still there, and nothing
+    // written while it was shut arrived.
+    assert_eq!(peek(&board.region, CCR), CCR_VALUE_USED);
+    assert_eq!(peek(&board.region, CR1), CR1_PE);
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_controller_clocked() {
+    // Every machine file written before the gate existed draws no `enable`
+    // wire, and none of those boards may go deaf because this landed.
+    let mut board = Board::new(Link::Transactional);
+    board.init();
+    board.write_page(0x50, 0x00, &[0x5a]);
+    board.step(DEFAULT_EEPROM_WRITE);
+    assert_eq!(board.read_from(0x50, 0x00, 1), alloc::vec![0x5a]);
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back() {
+    // `RCC_APB1RSTR.I2CxRST`, as a level: the block is deaf while it stands
+    // and comes back at its reset values when it is let go.
+    let mut board = Board::new(Link::Transactional);
+    board.init();
+    assert_eq!(peek(&board.region, CCR), CCR_VALUE_USED);
+
+    let id = WireId::new(11);
+    let pin = Device::sink(&board.ctrl, gate::RESET_PIN, &[id]).expect("an STM32 I2C has `reset`");
+    // Nothing has driven it yet, so the block is still live.
+    assert_eq!(peek(&board.region, CCR), CCR_VALUE_USED);
+
+    pin.sink.set_level(id, 0, Level::High);
+    assert_eq!(
+        peek(&board.region, CCR),
+        0,
+        "held in reset, the block is deaf"
+    );
+    poke(&board.region, CCR, 0x111);
+    pin.sink.set_level(id, 0, Level::Low);
+    assert_eq!(
+        peek(&board.region, CCR),
+        0,
+        "and what it kept is the reset value"
+    );
+    assert_eq!(peek(&board.region, CR1), 0, "`PE` included");
+    assert_eq!(peek(&board.region, TRISE), 2, "§25.6.9's reset value");
+}
+
+#[test]
+fn a_gated_controller_clocks_nothing_onto_its_bus() {
+    // The half a register model alone would get wrong: this is a bus
+    // controller, and with no clock there is no SCL edge for it to drive.
+    let mut board = Board::new(Link::Transactional);
+    board.init();
+
+    let id = WireId::new(12);
+    let pin = enable_pin(&board.ctrl, id);
+    poke(&board.region, CR1, CR1_PE | CR1_ACK | CR1_START);
+    board.step(4_000);
+    assert_eq!(
+        peek_with(&board.region, SR1, MemAttrs::DEBUG),
+        0,
+        "no `SB`, and the block would not report one if there were"
+    );
+    let bus = board
+        .ctrl
+        .bus()
+        .expect("a transactional controller has a bus");
+    assert!(!bus.state().is_busy(), "no START ever reached the bus");
+
+    // And when the clock comes back the same firmware sequence works.
+    pin.sink.set_level(id, 0, Level::High);
+    board.write_page(0x50, 0x20, &[0xc3, 0x3c]);
+    board.step(DEFAULT_EEPROM_WRITE);
+    assert_eq!(board.read_from(0x50, 0x20, 2), alloc::vec![0xc3, 0x3c]);
+}
+
+#[test]
+fn a_gated_slave_face_answers_nothing() {
+    // The other direction: another master on the bus addresses a peripheral
+    // whose clock is off and finds nobody there.
+    let bus = Arc::new(I2cBus::new());
+    let ctrl =
+        Stm32I2c::with_bus(Link::Transactional, Some(Arc::clone(&bus))).expect("a controller");
+    let r = regs(&ctrl);
+    poke(&r, OAR1, sadd7(0x42));
+    poke(&r, CR1, CR1_PE | CR1_ACK);
+    assert!(
+        bus.start(Address::Seven(0x42), Direction::Write).is_ack(),
+        "clocked, it answers its own address"
+    );
+    bus.stop();
+
+    let id = WireId::new(13);
+    let _pin = enable_pin(&ctrl, id);
+    assert!(
+        !bus.start(Address::Seven(0x42), Direction::Write).is_ack(),
+        "gated, it cannot compare an address or pull SDA down"
+    );
+    assert!(!ctrl.stretching(), "nor hold SCL down waiting for software");
+}

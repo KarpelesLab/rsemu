@@ -1909,3 +1909,199 @@ fn or1_and_or2_read_back_what_was_written() {
     Device::reset(&tim, ResetKind::Cold);
     assert_eq!(peek_debug(&tim, OFF_OR1), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The clock gate (`super::super::gate`)
+// ---------------------------------------------------------------------------
+
+/// Draw the `enable` wire and hand back the source that drives it.
+///
+/// Drawing it is the assertion that RCC owns this clock, so the timer is
+/// unclocked from that moment until something sets the bit — which is what
+/// `RCC_APB1ENR` reads out of reset.
+fn draw_enable(tim: &Tim, id: u64) -> WireSource {
+    drive_input(tim, gate::ENABLE_PIN, id)
+}
+
+#[test]
+fn a_gated_timer_reads_as_zero_and_drops_writes() {
+    // RM0090 §7.3.10 ff.: with `TIMxEN` clear the registers are not readable
+    // and an access to them is not effective.
+    let tim = general();
+    poke(&tim, OFF_ARR, 0x1234);
+    poke(&tim, OFF_PSC, 7);
+    start(&tim);
+
+    let enable = draw_enable(&tim, 900);
+    assert_eq!(peek(&tim, OFF_ARR), 0, "the whole block reads as zero");
+    assert_eq!(peek(&tim, OFF_CR1), 0);
+    assert_eq!(peek_debug(&tim, OFF_ARR), 0, "and so does a debug read");
+
+    poke(&tim, OFF_ARR, 0xbeef);
+    poke(&tim, OFF_EGR, EGR_UG);
+    assert_eq!(peek(&tim, OFF_SR) & SR_UIF, 0, "nothing was effective");
+
+    // Removing a clock is not a reset: what was programmed is still there.
+    enable.set(Level::High);
+    assert_eq!(
+        peek(&tim, OFF_ARR),
+        0x1234,
+        "the write was dropped, not the state"
+    );
+    assert_eq!(peek(&tim, OFF_PSC), 7);
+    assert_eq!(peek(&tim, OFF_CR1) & CR1_CEN, CR1_CEN);
+}
+
+#[test]
+fn a_gated_counter_stands_still_and_resumes_where_it_stopped() {
+    // The half a register model would get wrong: no `CK_INT`, no edge to
+    // count, and no burst of the ticks that went by when it comes back.
+    let tim = general();
+    poke(&tim, OFF_ARR, 99);
+    poke(&tim, OFF_PSC, 3); // CK_INT / 4
+    poke(&tim, OFF_EGR, EGR_UG);
+    poke(&tim, OFF_SR, 0);
+    start(&tim);
+
+    tim.advance_by(18);
+    assert_eq!(tim.counter(), 4, "18 of 20 ticks are four counter clocks");
+
+    let enable = draw_enable(&tim, 901);
+    assert_eq!(
+        tim.next_event(),
+        None,
+        "nothing for the scheduler to wait on"
+    );
+    tim.advance_by(1_000);
+    assert_eq!(tim.counter(), 4, "the counter has no clock to count");
+    assert_eq!(peek_debug(&tim, OFF_SR) & SR_UIF, 0, "and no update fired");
+
+    enable.set(Level::High);
+    assert!(
+        tim.next_event().is_some(),
+        "and the scheduler is armed again"
+    );
+    // Two ticks were left of the division the counter stopped in: the phase
+    // survived the gating, so the fifth clock lands on the second of them.
+    tim.advance_by(1);
+    assert_eq!(tim.counter(), 4);
+    tim.advance_by(1);
+    assert_eq!(
+        tim.counter(),
+        5,
+        "it resumed mid-division, not from scratch"
+    );
+    tim.advance_by(4 * 94);
+    assert_eq!(peek(&tim, OFF_SR) & SR_UIF, 0, "still one clock short");
+    tim.advance_by(4);
+    assert_eq!(
+        peek(&tim, OFF_SR) & SR_UIF,
+        SR_UIF,
+        "and the period is exact"
+    );
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_timer_counting() {
+    // Every board written before the gate draws no wire, and none of them may
+    // stop ticking because this landed.
+    let tim = general();
+    poke(&tim, OFF_ARR, 9);
+    start(&tim);
+    tim.advance_by(5);
+    assert_eq!(peek(&tim, OFF_CNT), 5);
+    assert!(tim.next_event().is_some());
+}
+
+#[test]
+fn an_external_clock_edge_does_not_move_an_unclocked_counter() {
+    // External clock mode moves the counter from a pin rather than from the
+    // advance, so the gate has to be asked there too: the mux picks what
+    // clocks the prescaler, not what clocks the counter register.
+    let tim = general();
+    poke(&tim, OFF_ARR, 0xffff);
+    poke(&tim, OFF_SMCR, SMS_EXT1 | (TS_TI1FP1 << SMCR_TS_SHIFT));
+    configure_capture(&tim, 0, 0, 0, 0);
+    start(&tim);
+    let ti1 = drive_input(&tim, "ti1", 902);
+
+    ti1.set(Level::High);
+    ti1.set(Level::Low);
+    assert_eq!(tim.counter(), 1, "one edge, one count");
+
+    let enable = draw_enable(&tim, 903);
+    for _ in 0..4 {
+        ti1.set(Level::High);
+        ti1.set(Level::Low);
+    }
+    enable.set(Level::High);
+    assert_eq!(tim.counter(), 1, "the four edges had no clock to count on");
+    ti1.set(Level::High);
+    assert_eq!(tim.counter(), 2);
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back() {
+    // `RCC_APB1RSTR.TIMxRST`, as a level: the block is deaf while it stands
+    // and comes back at its reset values when it is let go.
+    let tim = general();
+    poke(&tim, OFF_ARR, 0x4321);
+    poke(&tim, OFF_CCR1, 0x21);
+    start(&tim);
+
+    let reset = drive_input(&tim, gate::RESET_PIN, 904);
+    reset.set(Level::High);
+    assert_eq!(peek(&tim, OFF_ARR), 0, "held in reset, the block is deaf");
+    poke(&tim, OFF_ARR, 0x1111);
+    reset.set(Level::Low);
+    assert_eq!(
+        peek(&tim, OFF_ARR),
+        0,
+        "and what it kept is the reset value"
+    );
+    assert_eq!(peek(&tim, OFF_CCR1), 0);
+    assert_eq!(peek(&tim, OFF_CR1) & CR1_CEN, 0, "`CEN` included");
+    assert_eq!(tim.counter(), 0);
+}
+
+#[test]
+fn the_reset_pin_leaves_the_input_nets_alone() {
+    // What the nets are driving belongs to whatever is on the other end of the
+    // wire, exactly as at `Device::reset`.
+    let tim = general();
+    let ti1 = drive_input(&tim, "ti1", 905);
+    ti1.set(Level::High);
+    let reset = drive_input(&tim, gate::RESET_PIN, 906);
+    reset.set(Level::High);
+    reset.set(Level::Low);
+
+    // `TI1` is still high, so the timer sees the *fall* next and not a phantom
+    // rise: a reset that had forgotten the level would capture on both.
+    configure_capture(&tim, 0, 0, 0, 0);
+    poke(&tim, OFF_ARR, 0xffff);
+    start(&tim);
+    tim.advance_by(4);
+    ti1.set(Level::Low);
+    assert_eq!(
+        peek(&tim, OFF_SR) & SR_CC1IF,
+        0,
+        "a fall is not the active edge"
+    );
+    ti1.set(Level::High);
+    assert_eq!(peek(&tim, OFF_SR) & SR_CC1IF, SR_CC1IF);
+}
+
+#[test]
+fn the_gate_pins_are_in_the_schema() {
+    let schema = schema();
+    for pin in [gate::ENABLE_PIN, gate::RESET_PIN] {
+        assert!(
+            Device::sink(&general(), pin, &[WireId::new(1)]).is_some(),
+            "the device answers `{pin}`"
+        );
+        assert!(
+            schema.port_named(pin).is_some(),
+            "and the validator knows `{pin}`"
+        );
+    }
+}

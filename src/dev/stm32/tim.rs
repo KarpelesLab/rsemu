@@ -117,10 +117,26 @@
 //! is stored and does not divide the counter — it is the dead-time and digital
 //! filter divider, neither of which is modelled.
 //!
-//! Peripheral clock **gating** — `RCC_APB1ENR` — is not an input here. When a
-//! clock controller lands it may either publish a gated domain, in which case
-//! this device needs no change, or drive an enable, in which case the seam is
-//! one new input pin. Neither is invented in advance.
+//! # The clock gate
+//!
+//! Peripheral clock gating *is* an input here, as the two pins
+//! [`gate`] describes: `enable` is this timer's `RCC_xxENR` bit
+//! and `reset` is its `RCC_xxRSTR` bit. On an F4 that is `APB1ENR` bits 0–8
+//! for `TIM2`…`TIM7`, `TIM12`…`TIM14` and `APB2ENR` bits 0, 1, 16, 17 and 18
+//! for `TIM1`, `TIM8`, `TIM9`, `TIM10` and `TIM11` (RM0090 §7.3.10–§7.3.11),
+//! with `APB1RSTR`/`APB2RSTR` carrying the reset bit at the same position:
+//!
+//! ```text
+//! wire rcc.apb1en0  -> tim2.enable
+//! wire rcc.apb1rst0 -> tim2.reset
+//! ```
+//!
+//! An `enable` no board drew leaves the timer clocked, so every machine file
+//! written before the gate keeps working. While it *is* drawn and low the
+//! register block reads as zero and drops writes, and — the half that matters
+//! for a counter — `CK_INT` is not there to be counted: the counter stands
+//! where it is with the prescaler's phase intact and resumes from there, never
+//! in a burst of the ticks it missed.
 //!
 //! # Sources
 //!
@@ -152,6 +168,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU32, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -921,6 +938,9 @@ struct Shared {
     next_event: AtomicU64,
     /// How deep the current `TRGO` cascade is — see [`MAX_TRGO_DEPTH`].
     depth: AtomicU32,
+    /// `RCC_xxENR`'s `TIMxEN` and `RCC_xxRSTR`'s `TIMxRST`, as a board's wires
+    /// deliver them.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Shared {
@@ -945,7 +965,24 @@ impl Shared {
     /// auto-reload value is null." That is a real behaviour and it is also what
     /// keeps a freshly reset timer from asking the scheduler for an event every
     /// single tick.
+    ///
+    /// The peripheral clock is the other half of the question: a timer whose
+    /// `TIMxEN` is clear has no `CK_INT` edge to count ([`gate`](super::gate)),
+    /// so nothing here counts one either.
     fn counting(&self, regs: &Regs) -> bool {
+        self.gate.clocked() && self.armed(regs)
+    }
+
+    /// [`Shared::counting`] without the clock gate: whether the counter *would*
+    /// be running if the peripheral clock were there.
+    ///
+    /// This, and not [`Shared::counting`], is what the next event is computed
+    /// from, deliberately. The counter does not move while the clock is off, so
+    /// neither does the instant it was heading for, and keeping that instant
+    /// published is what lets the timer resume from exactly where it stopped —
+    /// [`Tim::next_event`] is where the gate hides it from the scheduler, which
+    /// has nothing to come back for in the meantime.
+    fn armed(&self, regs: &Regs) -> bool {
         self.cnt_en(regs) && regs.arr_shadow != 0 && !self.externally_clocked(regs)
     }
 
@@ -1087,7 +1124,11 @@ impl Shared {
     /// diagram), so `PSC` divides an external clock exactly as it divides the
     /// internal one, and `psc_count` is the same phase either way.
     fn external_clock(&self, regs: &mut Regs) {
-        if regs.cr1 & CR1_CEN == 0 || regs.arr_shadow == 0 {
+        // The mux picks what clocks the *prescaler*; the counter register it
+        // feeds is still on `CK_INT`, so an external edge arriving with
+        // `TIMxEN` clear moves nothing (`gate`). [`Shared::counting`] cannot
+        // say this, because it is false in external clock mode by definition.
+        if !self.gate.clocked() || regs.cr1 & CR1_CEN == 0 || regs.arr_shadow == 0 {
             return;
         }
         regs.psc_count += 1;
@@ -1604,7 +1645,7 @@ impl Shared {
         // or clocked from a pin: accepting it can start, clock or reset the
         // counter, and nothing else will wake the device to do it.
         let filters = self.next_filter_deadline(regs).max(now + 1);
-        if !self.counting(regs) {
+        if !self.armed(regs) {
             return filters;
         }
         let per = u64::from(regs.psc_shadow) + 1;
@@ -2223,6 +2264,7 @@ impl Tim {
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
             depth: AtomicU32::new(0),
+            gate: ClockGate::new(),
         });
         {
             let regs = shared.regs.lock();
@@ -2260,8 +2302,17 @@ impl Tim {
 
     /// The tick this device's own next observable change falls on, if it has
     /// one.
+    ///
+    /// `None` while `TIMxEN` is clear: an unclocked timer has nothing for the
+    /// scheduler to come back for. The instant behind it is kept rather than
+    /// cleared, because it was computed from a counter that is not moving
+    /// (`Shared::armed`) and is therefore still the right one the moment the
+    /// clock returns.
     #[must_use]
     pub fn next_event(&self) -> Option<u64> {
+        if !self.shared.gate.clocked() {
+            return None;
+        }
         match self.shared.next_event.load(Ordering::Relaxed) {
             u64::MAX => None,
             tick => Some(tick),
@@ -2302,25 +2353,9 @@ impl Device for Tim {
     }
 
     fn reset(&self, _kind: ResetKind) {
-        {
-            let mut regs = self.shared.regs.lock();
-            let raw_ti = regs.ti_raw;
-            let raw_etr = regs.etr_raw;
-            let itr = regs.itr;
-            *regs = Regs::reset(&self.shared.cfg);
-            // A reset clears the filters and the selector, but it does not
-            // change what the *nets* are driving: those levels belong to
-            // whatever is on the other end of the wire.
-            regs.ti_raw = raw_ti;
-            regs.etr_raw = raw_etr;
-            regs.itr = itr;
-            // The tick is the clock domain's position, not this device's state,
-            // and `Machine::reset` does not rewind domains — rewinding it here
-            // would ask the next catch-up to replay every cycle since power-on.
-            let now = self.shared.tick.load(Ordering::Relaxed);
-            self.shared.publish(&regs, now);
-        }
-        self.shared.drive();
+        // A bus reset and `RCC_xxRSTR`'s `TIMxRST` put the same block back to
+        // the same values, so there is one implementation of it.
+        self.shared.gate_reset();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -2496,6 +2531,10 @@ impl Device for Tim {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset` first; `ti1`…`itr3` are this device's own.
+        if let Some(pin) = gate::sink(&self.shared, port, sources) {
+            return Some(pin);
+        }
         let cfg = self.shared.cfg;
         let which = input_pin(port)?;
         // A basic timer has neither channels nor a slave controller, and an
@@ -2544,8 +2583,49 @@ impl Device for Tim {
     }
 }
 
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        {
+            let mut regs = self.regs.lock();
+            let raw_ti = regs.ti_raw;
+            let raw_etr = regs.etr_raw;
+            let itr = regs.itr;
+            *regs = Regs::reset(&self.cfg);
+            // A reset clears the filters and the selector, but it does not
+            // change what the *nets* are driving: those levels belong to
+            // whatever is on the other end of the wire.
+            regs.ti_raw = raw_ti;
+            regs.etr_raw = raw_etr;
+            regs.itr = itr;
+            // The tick is the clock domain's position, not this device's state,
+            // and `Machine::reset` does not rewind domains — rewinding it here
+            // would ask the next catch-up to replay every cycle since power-on.
+            let now = self.tick.load(Ordering::Relaxed);
+            self.publish(&regs, now);
+        }
+        // The contract says no lock is held here, which is what the outputs
+        // this drops back to their idle levels need (`ROADMAP.md` §4.4).
+        self.drive();
+    }
+}
+
 impl MemOps for Shared {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        if !self.gate.live() {
+            // No `TIMxEN`, or `TIMxRST` standing: the block is not readable and
+            // zero is what the bus returns, for a debug read as much as for a
+            // guest one ([`gate`](super::gate)). Nothing is synced first — an
+            // unclocked timer has nothing to catch up on.
+            if !matches!(dst.len(), 2 | 4) {
+                return Err(BusError::BadAccess);
+            }
+            dst.fill(0);
+            return Ok(());
+        }
         self.sync(attrs);
         let reg = offset & !3;
         let basic = matches!(self.cfg.variant, Variant::Basic);
@@ -2597,6 +2677,14 @@ impl MemOps for Shared {
     fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
         if attrs.debug {
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: an access to an unclocked block is lost, so this
+            // one starts no counter and moves no shadow.
+            if !matches!(src.len(), 2 | 4) {
+                return Err(BusError::BadAccess);
+            }
+            return Ok(());
         }
         self.sync(attrs);
         let reg = offset & !3;
@@ -2712,7 +2800,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `st.tim`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("variant", ValueKind::Str).values(&["basic", "general", "advanced"]))
         .prop(PropSchema::new("width", ValueKind::Uint).range(16, 32))
         .prop(PropSchema::new("channels", ValueKind::Uint).range(0, MAX_CHANNELS as u64))
@@ -2753,7 +2841,9 @@ pub fn schema() -> ClassSchema {
         .port("itr0", PortDir::In)
         .port("itr1", PortDir::In)
         .port("itr2", PortDir::In)
-        .port("itr3", PortDir::In)
+        .port("itr3", PortDir::In);
+    // `RCC_APB1ENR.TIMxEN` and `RCC_APB1RSTR.TIMxRST`, or `APB2`'s pair.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

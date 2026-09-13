@@ -471,3 +471,121 @@ fn a_snapshot_round_trips_to_an_identical_chunk() {
     assert!(other.octospi.busy(), "and the frame is still open");
     assert_eq!(other.read(0x020) & SR_BUSY, SR_BUSY);
 }
+
+// ---------------------------------------------------------------------------
+// the clock gate
+// ---------------------------------------------------------------------------
+
+/// Draw this instance's `RCC_AHB3ENR.OCTOSPIxEN` wire, which starts low.
+fn enable_pin(octospi: &Octospi, id: WireId) -> SinkPin {
+    Device::sink(octospi, gate::ENABLE_PIN, &[id]).expect("an OCTOSPI has `enable`")
+}
+
+#[test]
+fn a_gated_peripheral_reads_as_zero_and_drops_writes() {
+    // GitHub issue #14: with `OCTOSPIxEN` clear the block is not readable —
+    // every register answers zero — and a write to it is not effective.
+    let rec = Recorder::new(&[]);
+    let h = harness(Arc::clone(&rec) as Arc<dyn SpiSlave>);
+    h.write(0x100, CCR_SINGLE_24);
+    h.enable(FMODE_WRITE);
+    assert_eq!(h.read(0x100), CCR_SINGLE_24);
+
+    let id = WireId::new(1);
+    let pin = enable_pin(&h.octospi, id);
+    // Drawing the wire is the assertion that the clock is RCC's to give, and
+    // an `xxENR` bit resets low.
+    assert_eq!(h.read(0x000), 0, "the whole block reads as zero");
+    assert_eq!(h.read(0x100), 0);
+    assert_eq!(h.read(0x008), 0, "`DCR1` included");
+    let mut byte = [0u8; 1];
+    h.regs
+        .read(0x020, &mut byte, MemAttrs::DEBUG)
+        .expect("a debug read is a legal cycle");
+    assert_eq!(byte[0], 0, "and a debug read sees the same nothing");
+
+    // Writing `IR` is what triggers an opcode-only frame, and this one does
+    // not arrive at all.
+    h.write(0x110, 0x06);
+    assert!(rec.frames().is_empty(), "the write was not effective");
+
+    pin.sink.set_level(id, 0, Level::High);
+    // Removing a clock is not a reset: `OCTOSPIxRST` is the pin that resets.
+    assert_eq!(h.read(0x100), CCR_SINGLE_24);
+    assert_eq!(h.read(0x000) & CR_EN, CR_EN, "`EN` still stands");
+    assert_eq!(h.read(0x110), 0, "and `IR` never took the write");
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_peripheral_clocked() {
+    // Every machine file written before the gate existed draws no `enable`
+    // wire, and none of those boards may go deaf because this landed.
+    let rec = Recorder::new(&[]);
+    let h = harness(Arc::clone(&rec) as Arc<dyn SpiSlave>);
+    h.enable(FMODE_WRITE);
+    h.write(0x100, CCR_OPCODE_ONLY);
+    h.write(0x110, 0x06);
+    assert_eq!(rec.frames(), [[0x06]]);
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back() {
+    // `RCC_AHB3RSTR.OCTOSPIxRST`, as a level: the block is deaf while it
+    // stands and comes back at its reset values when it is let go.
+    let rec = Recorder::new(&[]);
+    let h = harness(Arc::clone(&rec) as Arc<dyn SpiSlave>);
+    h.write(0x100, CCR_SINGLE_24);
+    h.enable(FMODE_WRITE);
+
+    let id = WireId::new(2);
+    let pin = Device::sink(&h.octospi, gate::RESET_PIN, &[id]).expect("an OCTOSPI has `reset`");
+    // Nothing has driven it yet, so the block is still live.
+    assert_eq!(h.read(0x100), CCR_SINGLE_24);
+
+    pin.sink.set_level(id, 0, Level::High);
+    assert_eq!(h.read(0x100), 0, "held in reset, the block is deaf");
+    h.write(0x100, CCR_OPCODE_ONLY);
+    pin.sink.set_level(id, 0, Level::Low);
+    assert_eq!(h.read(0x100), 0, "and what it kept is the reset value");
+    assert_eq!(h.read(0x000), 0, "`EN` included");
+    assert_eq!(h.read(0x008), 0, "`DCR1` too");
+}
+
+#[test]
+fn a_gated_peripheral_clocks_nothing_and_its_window_stops_decoding() {
+    // The half a register model alone would get wrong. The aperture is the
+    // region a CPU executes out of, and with no clock there is no frame for it
+    // to answer with, so it does not decode at all.
+    let rec = Recorder::new(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xde, 0xad, 0xbe, 0xef]);
+    let h = harness(Arc::clone(&rec) as Arc<dyn SpiSlave>);
+    h.write(0x100, CCR_SINGLE_24);
+    h.write(0x108, 8);
+    h.write(0x110, 0x0b);
+    h.enable(FMODE_MAPPED);
+    assert_eq!(
+        window_read(&h, 0x1234, 4).expect("clocked, it answers"),
+        [0xde, 0xad, 0xbe, 0xef]
+    );
+    let before = rec.frames().len();
+
+    let id = WireId::new(3);
+    let pin = enable_pin(&h.octospi, id);
+    assert_eq!(
+        window_read(&h, 0x1234, 4).unwrap_err(),
+        BusError::Unassigned,
+        "gated, the window does not decode"
+    );
+    assert_eq!(
+        h.window
+            .write(0x1234, &[0x00], MemAttrs::DEFAULT)
+            .unwrap_err(),
+        BusError::Unassigned
+    );
+    assert_eq!(rec.frames().len(), before, "and nothing reached the bus");
+
+    // And when the clock comes back the window answers again, out of the
+    // registers that survived the gating.
+    pin.sink.set_level(id, 0, Level::High);
+    assert!(window_read(&h, 0x1234, 4).is_ok());
+    assert_eq!(rec.frames().len(), before + 1);
+}

@@ -913,3 +913,227 @@ fn a_reset_clears_the_register_block_and_leaves_the_card_alone() {
         "the card is its own device and resets itself"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The clock gate (`RCC_AHB3ENR.SDMMC1EN`, `RCC_AHB3RSTR.SDMMC1RST`)
+// ---------------------------------------------------------------------------
+
+/// Wire one of the two gate inputs up, and hand back the pin and its source.
+///
+/// Drawing the `enable` wire is itself the assertion that RCC owns this clock,
+/// so a controller comes back gated **off** from this call.
+fn gate_pin(dev: &Sdmmc, port: &str) -> (SinkPin, WireId) {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let pin = Device::sink(dev, port, &[id]).expect("a gate pin this controller has");
+    (pin, id)
+}
+
+/// Wire `irq` to a fresh counting sink.
+fn watch_irq(dev: &Sdmmc) -> Arc<Counter> {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let sink = Arc::new(Counter::default());
+    let pin: Arc<dyn WireSink> = Arc::clone(&sink) as Arc<dyn WireSink>;
+    let wire = Arc::new(Wire::builder().source(id).sink(pin, 0).build());
+    dev.connect(pin::IRQ, WireSource::new(wire, id))
+        .expect("the only pin this device drives");
+    sink
+}
+
+#[test]
+fn a_gated_controller_reads_as_zero_and_drops_every_write() {
+    // GitHub issue #14: with `RCC_AHB3ENR.SDMMC1EN` clear the block is not
+    // readable — zero comes back — and a write to it is not effective.
+    let rig = rig();
+    bring_up(&rig.dev);
+    poke(&rig.dev, R_ICR, ICR_MASK);
+    poke(&rig.dev, R_MASKR, STA_DATAEND);
+    poke(&rig.dev, R_DTIMER, 0x00ff_ffff);
+    let power = peek(&rig.dev, R_POWER);
+    let clkcr = peek(&rig.dev, R_CLKCR);
+    assert_ne!(power, 0);
+
+    let (enable, id) = gate_pin(&rig.dev, gate::ENABLE_PIN);
+    assert_eq!(peek(&rig.dev, R_POWER), 0, "the whole block reads as zero");
+    assert_eq!(peek(&rig.dev, R_CLKCR), 0);
+    assert_eq!(peek(&rig.dev, R_STAR), 0);
+    assert_eq!(peek(&rig.dev, R_MASKR), 0);
+    assert_eq!(peek(&rig.dev, R_DTIMER), 0);
+    assert_eq!(
+        peek_debug(&rig.dev, R_STAR),
+        0,
+        "and so does a debug read, because that is what the bus returns"
+    );
+
+    // Not effective, and not a bus fault: an STM32's bridge answers.
+    poke(&rig.dev, R_CLKCR, 0x3ff);
+    poke(&rig.dev, R_POWER, 0);
+    poke(&rig.dev, R_MASKR, 0);
+
+    enable.sink.set_level(id, 0, Level::High);
+    // Removing a clock is not a reset — `SDMMC1RST` is what resets — so every
+    // register is exactly where the guest left it.
+    assert_eq!(peek(&rig.dev, R_POWER), power);
+    assert_eq!(peek(&rig.dev, R_CLKCR), clkcr);
+    assert_eq!(peek(&rig.dev, R_MASKR), STA_DATAEND);
+    assert_eq!(peek(&rig.dev, R_DTIMER), 0x00ff_ffff);
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_controller_clocked() {
+    // Every machine file written before the gate draws no `enable`, and none of
+    // them may go deaf because this landed.
+    let rig = rig();
+    let want = pattern(0x2c);
+    rig.card.write_media(0, &want).expect("inside");
+    bring_up(&rig.dev);
+    poke(&rig.dev, R_IDMABASE0R, RAM_BASE as u32);
+    poke(&rig.dev, R_IDMACTRLR, IDMA_EN);
+    arm_data(&rig.dev, BLOCK as u32, true);
+    command(&rig.dev, 17, 0, WAITRESP_SHORT);
+    assert_eq!(ram_read(&rig.space, RAM_BASE, want.len()), want);
+}
+
+#[test]
+fn a_gated_controller_issues_no_command() {
+    // The half a register model alone would get wrong: there is no `SDMMC_CK`,
+    // so the CPSM does not run and the card is never addressed.
+    let rig = rig();
+    bring_up(&rig.dev);
+    poke(&rig.dev, R_ICR, ICR_MASK);
+    let phase = rig.card.phase();
+    let arg = peek(&rig.dev, R_ARGR);
+
+    let (enable, id) = gate_pin(&rig.dev, gate::ENABLE_PIN);
+    poke(&rig.dev, R_ARGR, 0xdead_beef);
+    poke(
+        &rig.dev,
+        R_CMDR,
+        13 | (WAITRESP_SHORT << CMD_WAITRESP_SHIFT) | CMD_CPSMEN,
+    );
+
+    enable.sink.set_level(id, 0, Level::High);
+    assert_eq!(
+        peek(&rig.dev, R_ARGR),
+        arg,
+        "the argument write was dropped too"
+    );
+    assert_eq!(
+        peek(&rig.dev, R_STAR) & STA_LATCHED,
+        0,
+        "no CMDSENT, no CMDREND and no CTIMEOUT: nothing was sent to time out"
+    );
+    assert_eq!(rig.card.phase(), phase, "and the card was never spoken to");
+}
+
+#[test]
+fn a_gated_controller_moves_no_fifo_word_and_masters_no_idma_burst() {
+    let rig = rig();
+    let irq = watch_irq(&rig.dev);
+    rig.card.write_media(0, &pattern(0x39)).expect("inside");
+    bring_up(&rig.dev);
+    poke(&rig.dev, R_MASKR, STA_CMDREND);
+    arm_data(&rig.dev, BLOCK as u32, true);
+    command(&rig.dev, 17, 0, WAITRESP_SHORT);
+    assert_eq!(irq.level.load(AtomicOrdering::SeqCst), 1);
+    let dcntr = peek(&rig.dev, R_DCNTR);
+    let first = peek_debug(&rig.dev, R_FIFOR);
+
+    let (enable, id) = gate_pin(&rig.dev, gate::ENABLE_PIN);
+    for _ in 0..8 {
+        assert_eq!(peek(&rig.dev, R_FIFOR), 0, "a gated FIFO hands out nothing");
+    }
+    assert_eq!(
+        irq.level.load(AtomicOrdering::SeqCst),
+        0,
+        "and an unclocked controller raises no interrupt"
+    );
+    // The internal DMA is armed entirely through this register block, so a
+    // write that is not effective is a burst that never starts.
+    poke(&rig.dev, R_IDMABASE0R, RAM_BASE as u32);
+    poke(&rig.dev, R_IDMACTRLR, IDMA_EN);
+
+    enable.sink.set_level(id, 0, Level::High);
+    assert_eq!(
+        peek(&rig.dev, R_DCNTR),
+        dcntr,
+        "not one word left the FIFO while the clock was off"
+    );
+    assert_eq!(peek_debug(&rig.dev, R_FIFOR), first);
+    assert_eq!(
+        peek(&rig.dev, R_IDMACTRLR),
+        0,
+        "and the IDMA was never armed"
+    );
+    assert_eq!(
+        ram_read(&rig.space, RAM_BASE, 16),
+        alloc::vec![0u8; 16],
+        "so guest memory was never touched"
+    );
+    assert_eq!(irq.level.load(AtomicOrdering::SeqCst), 1, "it resumes");
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_block_back_and_leaves_the_card_alone() {
+    // `RCC_AHB3RSTR.SDMMC1RST`, as a level: the block is deaf while it stands
+    // and comes back at its reset values when it is let go.
+    let rig = rig();
+    bring_up(&rig.dev);
+    arm_data(&rig.dev, BLOCK as u32, true);
+    command(&rig.dev, 17, 0, WAITRESP_SHORT);
+    assert_ne!(peek(&rig.dev, R_POWER), 0);
+
+    let (reset, id) = gate_pin(&rig.dev, gate::RESET_PIN);
+    // An `enable` nobody drew stays clocked, so `reset` alone is what shuts the
+    // block here.
+    reset.sink.set_level(id, 0, Level::High);
+    assert_eq!(
+        peek(&rig.dev, R_POWER),
+        0,
+        "held in reset, the block is deaf"
+    );
+    poke(&rig.dev, R_POWER, POWER_ON);
+
+    reset.sink.set_level(id, 0, Level::Low);
+    assert_eq!(
+        peek(&rig.dev, R_POWER),
+        0,
+        "and what it kept is the reset value"
+    );
+    assert_eq!(peek(&rig.dev, R_STAR) & STA_LATCHED, 0);
+    assert_eq!(peek(&rig.dev, R_DCNTR), 0, "the FIFO and the DPSM went too");
+    assert_ne!(peek(&rig.dev, R_STAR) & STA_RXFIFOE, 0);
+    assert_eq!(
+        rig.card.phase(),
+        Phase::SendingData,
+        "the card is its own device and its reset line is not this one"
+    );
+
+    // The address space the IDMA masters is the machine's wiring, not chip
+    // state, so a peripheral reset does not take it away.
+    let want = pattern(0x84);
+    rig.card.write_media(0, &want).expect("inside");
+    bring_up(&rig.dev);
+    poke(&rig.dev, R_IDMABASE0R, RAM_BASE as u32);
+    poke(&rig.dev, R_IDMACTRLR, IDMA_EN);
+    arm_data(&rig.dev, BLOCK as u32, true);
+    command(&rig.dev, 17, 0, WAITRESP_SHORT);
+    assert_eq!(ram_read(&rig.space, RAM_BASE, want.len()), want);
+}
+
+#[test]
+fn a_reset_level_that_did_not_move_is_not_an_edge() {
+    let rig = rig();
+    let (reset, id) = gate_pin(&rig.dev, gate::RESET_PIN);
+    reset.sink.set_level(id, 0, Level::High);
+    reset.sink.set_level(id, 0, Level::Low);
+    bring_up(&rig.dev);
+    let power = peek(&rig.dev, R_POWER);
+    reset.sink.set_level(id, 0, Level::Low);
+    assert_eq!(
+        peek(&rig.dev, R_POWER),
+        power,
+        "a low that was already low resets nothing"
+    );
+}

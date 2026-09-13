@@ -66,6 +66,26 @@
 //! up before the guest's poll of `SR` is answered. Nothing here sleeps and
 //! nothing reads the host clock.
 //!
+//! # The clock
+//!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which
+//! is `RCC_AHB2ENR.RNGEN`, bit 6 (RM0090 §7.3.11), and `reset`, which is
+//! `RCC_AHB2RSTR.RNGRST`, the same bit of the AHB2 peripheral reset register.
+//! Those are RCC's bits and not `CR`'s: `CR.RNGEN` is the guest switching the
+//! block on, and it cannot even be written while the clock is off. A board
+//! draws the two wires or it does not; an undrawn `enable` leaves the block
+//! clocked. [`gate`](super::gate) has the rules.
+//!
+//! Gating this one stops it **counting**, which is the half a register model
+//! would get wrong. `CR`, `SR` and `DR` answer zero and drop writes, and the
+//! forty periods of `RNG_CLK` a word takes stop elapsing, because there is no
+//! `RNG_CLK` to count: the deadline slides forward with the cursor for as long
+//! as the gate is shut, so a word that was ten periods away is still ten
+//! periods away when the clock comes back. The block resumes where it stopped
+//! rather than dealing every word it "owes" in one go, and the stream does not
+//! advance meanwhile — how long a guest left its RNG clock off does not change
+//! which numbers it gets.
+//!
 //! # `DR` and the debugger
 //!
 //! This is the sharpest instance in the tree of `ROADMAP.md` §15's invariant 5:
@@ -121,7 +141,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::rand::{Stream, derive_seed};
@@ -130,7 +150,8 @@ use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region,
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Level, WireId, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -296,6 +317,9 @@ struct Registers {
     /// The absolute tick of the next word, or [`u64::MAX`] for none. Same
     /// no-lock rule.
     next_event: AtomicU64,
+    /// `RCC_AHB2ENR.RNGEN` and `RCC_AHB2RSTR.RNGRST`, as a board's wires
+    /// deliver them.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Registers {
@@ -358,7 +382,21 @@ impl Registers {
             if target <= state.tick {
                 return;
             }
+            let elapsed = target - state.tick;
             state.tick = target;
+            if !self.gate.live() {
+                // No `RCC_AHB2ENR.RNGEN`, or `RNGRST` standing: there are no
+                // periods of `RNG_CLK` to count, so the wait for the next word
+                // does not get any shorter. The deadline slides with the
+                // cursor instead of falling behind it, which is what makes the
+                // block resume where it stopped rather than deal every word it
+                // owes the moment the clock comes back.
+                if state.ready_at != NO_DEADLINE {
+                    state.ready_at = state.ready_at.saturating_add(elapsed);
+                }
+                self.publish(&state);
+                return;
+            }
             if state.ready_at <= target {
                 // The word is drawn *here*, when `DRDY` sets, so that a debug
                 // read of `DR` can see the same word the guest will get
@@ -482,10 +520,45 @@ impl Registers {
     }
 }
 
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_AHB2RSTR.RNGRST`: the register file goes back to its reset
+        // values and the stream back to its seed, which is what
+        // `Device::reset` does and for the same reason — a reset-and-rerun
+        // deals the same numbers. The tick survives, because it is this
+        // device's cursor in a clock domain that does not rewind just because
+        // a block on it was reset.
+        {
+            let mut state = self.state.lock();
+            let tick = state.tick;
+            let mut stream = state.stream;
+            stream.rewind();
+            *state = State::reset(stream, self.fault);
+            state.tick = tick;
+            self.publish(&state);
+        }
+        self.refresh_irq();
+    }
+}
+
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
         if offset >= REGISTER_BYTES {
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // No `RCC_AHB2ENR.RNGEN`, or `RNGRST` standing: the block is not
+            // readable and the value that comes back is zero
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself returns. Neither kind of
+            // read reaches `DR`'s consume path or the lazy catch-up, so a
+            // gated block loses no word and counts no tick.
+            dst.fill(0);
+            return Ok(());
         }
         self.sync(attrs);
         let value = self.read_register(offset, attrs.debug)?;
@@ -509,6 +582,12 @@ impl MemOps for Registers {
             // interrupted and one to `SR` would drop an error flag the guest
             // has not seen. Neither can be made harmless.
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: a write to an unclocked block is lost, so
+            // `CR.RNGEN` cannot be set and `SR`'s latched errors cannot be
+            // cleared until RCC gives this block its clock.
+            return Ok(());
         }
         let mut word = [0u8; 4];
         for (slot, byte) in word.iter_mut().zip(src) {
@@ -580,6 +659,7 @@ impl Rng {
             lazy: Mutex::with_rank(LockRank::LEAF, None),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(NO_DEADLINE),
+            gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "rng",
@@ -753,6 +833,12 @@ impl Device for Rng {
         }
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`; `irq` is an output and the block has no other
+        // input, its data path being a stream rather than a wire.
+        gate::sink(&self.regs, port, sources)
+    }
+
     fn is_lazy(&self) -> bool {
         // A word lands some number of ticks after the guest asked for one, and
         // the guest's poll of `SR` is what has to see it. The scheduler owns
@@ -838,14 +924,16 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `st.rng`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("seed", ValueKind::Uint))
         .prop(PropSchema::new("latency", ValueKind::Uint))
         .prop(PropSchema::new("ced", ValueKind::Bool))
         .prop(PropSchema::new("fault", ValueKind::Str).values(&["none", "seed", "clock"]))
         .region("")
         .region("regs")
-        .port(IRQ_PIN, PortDir::Out)
+        .port(IRQ_PIN, PortDir::Out);
+    // `RCC_AHB2ENR.RNGEN` and `RCC_AHB2RSTR.RNGRST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]
@@ -1117,13 +1205,108 @@ mod tests {
     }
 
     #[test]
-    fn only_this_ones_pin_exists() {
+    fn the_irq_is_the_only_output_and_the_gate_adds_two_inputs() {
         let d = rng_at_seed(1);
         assert!(Device::connect(&d, "nreset", dummy_source()).is_err());
         assert_eq!(
             schema().port_named(IRQ_PIN).map(|p| p.dir),
             Some(PortDir::Out)
         );
+        let id = WireId::new(1);
+        for pin in [gate::ENABLE_PIN, gate::RESET_PIN] {
+            assert!(schema().port_named(pin).is_some());
+            assert!(Device::sink(&d, pin, &[id]).is_some());
+        }
+        assert!(Device::sink(&d, IRQ_PIN, &[id]).is_none(), "an output");
+    }
+
+    // -----------------------------------------------------------------------
+    // The clock gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_block_whose_clock_is_disabled_reads_as_zero_and_produces_nothing() {
+        // GitHub issue #14, and what `gate` exists for: with
+        // `RCC_AHB2ENR.RNGEN` clear the block is not readable — every register
+        // answers zero — a write to it is not effective, and no word lands
+        // however long the guest waits, because there is no `RNG_CLK` whose
+        // periods to count.
+        let d = rng_at_seed(5);
+        write(&d, CR, CR_RNGEN | CR_IE);
+
+        let id = WireId::new(1);
+        let pin = Device::sink(&d, gate::ENABLE_PIN, &[id]).expect("an RNG has `enable`");
+        // Drawing the wire is the assertion that the clock is RCC's to give,
+        // and an `xxENR` bit resets low.
+        assert_eq!(read(&d, CR), 0, "the whole block reads as zero");
+        assert_eq!(read(&d, SR), 0);
+        assert_eq!(peek(&d, CR), 0, "and so does a debug read");
+
+        // Ten latencies of a domain that is running produce no word at all.
+        d.advance_to(d.tick() + 10 * d.latency());
+        pin.sink.set_level(id, 0, Level::High);
+        assert_eq!(read(&d, SR) & SR_DRDY, 0, "nothing was counted");
+        assert_eq!(read(&d, CR), CR_RNGEN | CR_IE, "and `CR` kept what it had");
+
+        // The wait resumes from where it stopped rather than being over: the
+        // forty periods still have to elapse, and they start from here.
+        d.advance_to(d.tick() + d.latency() - 1);
+        assert_eq!(read(&d, SR) & SR_DRDY, 0, "one period short");
+        d.advance_to(d.tick() + 1);
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY);
+    }
+
+    #[test]
+    fn a_word_already_drawn_survives_the_gating() {
+        // Removing a clock is not a reset: the word that was sitting in `DR`
+        // when the gate shut is the word the guest gets when it opens again,
+        // and the gated reads of it consumed nothing.
+        let d = rng_at_seed(7);
+        enable(&d);
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY);
+        let waiting = peek(&d, DR);
+
+        let id = WireId::new(1);
+        let pin = Device::sink(&d, gate::ENABLE_PIN, &[id]).expect("an RNG has `enable`");
+        assert_eq!(read(&d, DR), 0, "not readable, and it takes nothing away");
+        pin.sink.set_level(id, 0, Level::High);
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY, "`DRDY` is where it was");
+        assert_eq!(read(&d, DR), waiting);
+    }
+
+    #[test]
+    fn an_unwired_enable_leaves_the_block_clocked() {
+        // Every board written before the gate existed draws no `enable` wire,
+        // and none of them may go deaf because this landed.
+        let d = rng_at_seed(11);
+        enable(&d);
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY);
+        assert_ne!(read(&d, DR), 0);
+    }
+
+    #[test]
+    fn the_reset_pin_puts_the_register_file_back() {
+        // `RCC_AHB2RSTR.RNGRST`, as a level: the block is deaf while it stands
+        // and comes back at its reset values — stream included — when it is
+        // let go.
+        let d = rng_at_seed(13);
+        enable(&d);
+        write(&d, CR, CR_RNGEN | CR_IE);
+        assert_eq!(read(&d, SR) & SR_DRDY, SR_DRDY);
+
+        let id = WireId::new(2);
+        let pin = Device::sink(&d, gate::RESET_PIN, &[id]).expect("an RNG has `reset`");
+        pin.sink.set_level(id, 0, Level::High);
+        assert_eq!(read(&d, CR), 0, "held in reset, the block is deaf");
+        write(&d, CR, CR_RNGEN);
+        pin.sink.set_level(id, 0, Level::Low);
+        assert_eq!(read(&d, CR), 0, "and what it kept is the reset value");
+        assert_eq!(read(&d, SR), 0, "`DRDY` with it");
+        assert_eq!(d.irq_level(), Level::Low);
+        // The stream went back to its seed, so the block deals what it would
+        // have dealt from cold — which is what makes the reset path
+        // reproducible rather than merely deterministic-ish.
+        assert_eq!(words(&d, 2), words(&rng_at_seed(13), 2));
     }
 
     fn dummy_source() -> WireSource {

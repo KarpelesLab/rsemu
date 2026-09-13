@@ -289,3 +289,188 @@ impl crate::core::wire::WireSink for Probe {
             .store(u32::from(level.is_high()), Ordering::Relaxed);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The clock gate (`RCC_APB1ENR.PWREN`, `RCC_APB1RSTR.PWRRST`)
+// ---------------------------------------------------------------------------
+
+/// Wire one of the two gate inputs up, and hand back the pin and its source.
+///
+/// Drawing the `enable` wire is itself the assertion that RCC owns this clock,
+/// so a controller comes back gated **off** from this call.
+fn gate_pin(pwr: &Pwr, port: &str) -> (SinkPin, crate::core::wire::WireId) {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let pin = Device::sink(pwr, port, &[id]).expect("a gate pin a PWR has");
+    (pin, id)
+}
+
+/// Connect `dbp` to a probe and hand it back.
+fn watch_dbp(pwr: &Pwr) -> Arc<Probe> {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let sink = Arc::new(Probe::default());
+    let wire = Wire::builder()
+        .source(id)
+        .sink(Arc::clone(&sink) as Arc<dyn crate::core::wire::WireSink>, 0)
+        .build_shared();
+    Device::connect(pwr, DBP_PIN, WireSource::new(wire, id)).expect("dbp");
+    sink
+}
+
+#[test]
+fn a_gated_pwr_reads_as_zero_and_drops_every_write() {
+    // GitHub issue #14, and the sequence this peripheral exists for: a
+    // `SystemClock_Config` that forgets `RCC_APB1ENR.PWREN` finds a `VOS` that
+    // will not take and a `VOSRDY` that never moves.
+    let pwr = pwr(Variant::F42x);
+    let cr = peek(&pwr, CR);
+    assert_eq!(peek(&pwr, F4_CSR) & F4_CSR_VOSRDY, F4_CSR_VOSRDY);
+
+    let (enable, id) = gate_pin(&pwr, gate::ENABLE_PIN);
+    assert_eq!(peek(&pwr, CR), 0, "the whole block reads as zero");
+    assert_eq!(peek(&pwr, F4_CSR), 0, "`VOSRDY` included");
+    assert_eq!(
+        peek_debug(&pwr, F4_CSR),
+        0,
+        "and so does a debug read, because that is what the bus returns"
+    );
+
+    // Not effective, and not a bus fault: an STM32's bridge answers.
+    poke(&pwr, CR, (cr & !(0b11 << 14)) | (0b10 << 14));
+    tick(&pwr, DELAY * 4);
+
+    enable.sink.set_level(id, 0, Level::High);
+    // Removing a clock is not a reset — `PWRRST` is what resets — so the
+    // register file is exactly where it was, `VOS` never moved and the
+    // regulator was never asked to.
+    assert_eq!(peek(&pwr, CR), cr);
+    assert_eq!(peek(&pwr, F4_CSR) & F4_CSR_VOSRDY, F4_CSR_VOSRDY);
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_pwr_clocked() {
+    // Every machine file written before the gate draws no `enable`, and none of
+    // them may go deaf because this landed.
+    let pwr = pwr(Variant::L4);
+    poke(&pwr, CR, (peek(&pwr, CR) & !(0b11 << 9)) | (0b10 << 9));
+    assert_eq!(peek(&pwr, L4_SR2) & L4_SR2_VOSF, L4_SR2_VOSF);
+    tick(&pwr, DELAY);
+    assert_eq!(peek(&pwr, L4_SR2) & L4_SR2_VOSF, 0);
+}
+
+#[test]
+fn a_gated_regulator_transition_waits_rather_than_catching_up() {
+    // The half a register model alone would get wrong. A transition in flight
+    // when the clock goes has `ready-delay` ticks left, and it still has them
+    // when the clock comes back — it does not finish the instant it returns,
+    // and it does not finish while it is away either.
+    let pwr = pwr(Variant::L4);
+    let (enable, id) = gate_pin(&pwr, gate::ENABLE_PIN);
+    enable.sink.set_level(id, 0, Level::High);
+
+    poke(&pwr, CR, (peek(&pwr, CR) & !(0b11 << 9)) | (0b10 << 9));
+    tick(&pwr, DELAY - 2);
+    assert_eq!(peek(&pwr, L4_SR2) & L4_SR2_VOSF, L4_SR2_VOSF, "two to go");
+
+    enable.sink.set_level(id, 0, Level::Low);
+    // A hundred ticks with no clock is a hundred ticks the regulator did not
+    // count, so the two it had left are still two.
+    tick(&pwr, 100);
+    enable.sink.set_level(id, 0, Level::High);
+    assert_eq!(
+        peek(&pwr, L4_SR2) & L4_SR2_VOSF,
+        L4_SR2_VOSF,
+        "it did not catch up on the way back"
+    );
+    tick(&pwr, 1);
+    assert_eq!(peek(&pwr, L4_SR2) & L4_SR2_VOSF, L4_SR2_VOSF);
+    tick(&pwr, 1);
+    assert_eq!(
+        peek(&pwr, L4_SR2) & L4_SR2_VOSF,
+        0,
+        "and arrives on its own"
+    );
+}
+
+#[test]
+fn a_gated_pwr_holds_the_dbp_level_it_had() {
+    // The one output this device drives is a **latched configuration bit**, not
+    // something combinational the block computes each cycle. A guest cannot
+    // move it while the clock is off — the write to `CR` is not effective — so
+    // the honest answer is that it does not move. Driving it low would claim
+    // that gating `APB1` re-arms the backup domain's write protection, which
+    // is in the `VSWITCH` domain and is not gated by `APB1` at all.
+    let pwr = pwr(Variant::F4);
+    let dbp = watch_dbp(&pwr);
+    poke(&pwr, CR, peek(&pwr, CR) | (1 << 8));
+    assert!(dbp.is_high());
+
+    let (enable, id) = gate_pin(&pwr, gate::ENABLE_PIN);
+    poke(&pwr, CR, peek(&pwr, CR) & !(1 << 8));
+    assert!(
+        dbp.is_high(),
+        "the write was not effective, so nothing moved"
+    );
+    assert!(pwr.dbp(), "and `CR.DBP` is still set behind the bridge");
+
+    enable.sink.set_level(id, 0, Level::High);
+    assert!(
+        dbp.is_high(),
+        "and it is still set when the clock comes back"
+    );
+    poke(&pwr, CR, peek(&pwr, CR) & !(1 << 8));
+    assert!(!dbp.is_high(), "now the guest can close it again");
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back_and_closes_the_backup_domain() {
+    // `RCC_APB1RSTR.PWRRST`, as a level: the block is deaf while it stands and
+    // comes back at its reset values when it is let go — and `CR`'s reset value
+    // has `DBP` clear, which makes the reset line the one thing that *does*
+    // move this output.
+    let pwr = pwr(Variant::F42x);
+    let dbp = watch_dbp(&pwr);
+    poke(&pwr, CR, peek(&pwr, CR) | (1 << 8) | F4_CR_ODEN);
+    assert!(dbp.is_high());
+
+    let (reset, id) = gate_pin(&pwr, gate::RESET_PIN);
+    // An `enable` nobody drew stays clocked, so `reset` alone is what shuts the
+    // block here.
+    reset.sink.set_level(id, 0, Level::High);
+    assert!(!dbp.is_high(), "the reset line closed the backup domain");
+    assert_eq!(peek(&pwr, CR), 0, "held in reset, the block is deaf");
+    poke(&pwr, CR, 1 << 8);
+    assert!(
+        !dbp.is_high(),
+        "and a write while it stands is not effective"
+    );
+
+    reset.sink.set_level(id, 0, Level::Low);
+    assert_eq!(
+        peek(&pwr, CR),
+        Variant::F42x.cr_reset(),
+        "and what it kept is the reset value"
+    );
+    assert_eq!(
+        peek(&pwr, F4_CSR) & (F4_CSR_ODRDY | F4_CSR_ODSWRDY),
+        0,
+        "the over-drive it had armed went with it"
+    );
+    assert_eq!(
+        Device::next_event_tick(&pwr),
+        None,
+        "and so did the deadline it was counting to"
+    );
+}
+
+#[test]
+fn a_reset_level_that_did_not_move_is_not_an_edge() {
+    let pwr = pwr(Variant::F4);
+    let (reset, id) = gate_pin(&pwr, gate::RESET_PIN);
+    reset.sink.set_level(id, 0, Level::High);
+    reset.sink.set_level(id, 0, Level::Low);
+    poke(&pwr, CR, peek(&pwr, CR) | (1 << 8));
+    reset.sink.set_level(id, 0, Level::Low);
+    assert!(pwr.dbp(), "a low that was already low resets nothing");
+}

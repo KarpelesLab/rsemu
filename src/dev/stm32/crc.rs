@@ -62,6 +62,18 @@
 //! **not** reload it; firmware is expected to write `RESET` afterwards and the
 //! manual says so.
 //!
+//! # The clock
+//!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which
+//! is `RCC_AHB1ENR.CRCEN`, bit 12 (RM0090 §7.3.10), and `reset`, which is
+//! `RCC_AHB1RSTR.CRCRST`, the same bit of the AHB1 peripheral reset register.
+//! A board draws them or it does not; an undrawn `enable` leaves the unit
+//! clocked, so no board written before the gate existed changes behaviour.
+//! [`gate`](super::gate) has the rules and what a gated block does — the short
+//! of it being that a read answers zero and a write is lost, while the
+//! accumulator keeps its value, because removing a clock is not a reset and
+//! `CRCRST` is the pin that resets.
+//!
 //! # Where the test vectors come from
 //!
 //! From the polynomial, not from anybody's implementation. The shift register
@@ -82,13 +94,15 @@ use alloc::format;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
+use crate::core::wire::WireId;
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
@@ -285,6 +299,9 @@ impl State {
 struct Registers {
     state: Mutex<State>,
     variant: Variant,
+    /// `RCC_AHB1ENR.CRCEN` and `RCC_AHB1RSTR.CRCRST`, as a board's wires
+    /// deliver them.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Registers {
@@ -372,10 +389,32 @@ impl Registers {
     }
 }
 
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_AHB1RSTR.CRCRST`: the accumulator goes back to `INIT` and the
+        // programmable parameters to theirs, which is what `Device::reset`
+        // does and for the same reason — a checksum that depended on what ran
+        // before the reset would not be a checksum.
+        *self.state.lock() = State::default();
+    }
+}
+
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
         if offset >= self.variant.register_bytes() {
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // No `RCC_AHB1ENR.CRCEN`, or `CRCRST` standing: the block is not
+            // readable and the value that comes back is zero
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself returns.
+            dst.fill(0);
+            return Ok(());
         }
         // Nothing here changes on a read — `DR`'s accumulator moves on writes
         // alone — so a debug read is the same read (`ROADMAP.md` §15,
@@ -397,6 +436,11 @@ impl MemOps for Registers {
             // into a checksum it is about to compare. There is no harmless
             // version.
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: a write to an unclocked block is lost, and the
+            // bytes it carried are folded into nothing.
+            return Ok(());
         }
         let mut word = [0u8; 4];
         for (slot, byte) in word.iter_mut().zip(src) {
@@ -453,6 +497,7 @@ impl Crc {
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::default()),
             variant,
+            gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "crc",
@@ -553,6 +598,12 @@ impl Device for Crc {
     fn region(&self, name: &str) -> Option<RegionRef> {
         matches!(name, "" | "regs").then(|| Arc::clone(&self.region))
     }
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`, and nothing else: this block is arithmetic
+        // with an address, so the clock gate brings it its only two pins.
+        gate::sink(&self.regs, port, sources)
+    }
 }
 
 impl Instance for Crc {}
@@ -592,10 +643,12 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `st.crc`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "v2"]))
         .region("")
-        .region("regs")
+        .region("regs");
+    // `RCC_AHB1ENR.CRCEN` and `RCC_AHB1RSTR.CRCRST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]
@@ -604,6 +657,7 @@ mod tests {
     use crate::core::props::Value;
     use crate::core::registry::Registry;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+    use crate::core::wire::Level;
     use alloc::vec::Vec;
 
     /// The check string every CRC catalogue uses, and the one the arithmetic
@@ -957,6 +1011,80 @@ mod tests {
     }
 
     #[test]
+    fn a_block_whose_clock_is_disabled_reads_as_zero_and_keeps_its_accumulator() {
+        // GitHub issue #14, and what `gate` exists for: with
+        // `RCC_AHB1ENR.CRCEN` clear the block is not readable — every register
+        // answers zero — and a write to it is not effective, so nothing is
+        // folded into the checksum.
+        let d = v2();
+        write(&d, 0x04, 0xa5, 1).expect("a byte write to IDR");
+        for byte in CHECK {
+            poke_byte(&d, *byte);
+        }
+        let accumulated = peek(&d, 0x00);
+
+        let id = WireId::new(1);
+        let pin = Device::sink(&d, gate::ENABLE_PIN, &[id]).expect("a CRC unit has `enable`");
+        // Drawing the wire is the assertion that the clock is RCC's to give,
+        // and an `xxENR` bit resets low.
+        assert_eq!(peek(&d, 0x00), 0, "the whole block reads as zero");
+        assert_eq!(peek(&d, 0x04), 0, "IDR included");
+        assert_eq!(peek(&d, 0x14), 0);
+        let mut word = [0u8; 4];
+        d.regs
+            .read(0x00, &mut word, MemAttrs::DEBUG)
+            .expect("a debug read of a gated block is answered");
+        assert_eq!(u32::from_le_bytes(word), 0, "and so does a debug read");
+
+        // Neither the byte nor the `CR.RESET` reaches the unit.
+        poke_byte(&d, b'?');
+        poke(&d, 0x08, CR_RESET);
+
+        pin.sink.set_level(id, 0, Level::High);
+        // The accumulator kept its value across the gating: removing a clock
+        // is not a reset, and `CRCRST` is the pin that resets.
+        assert_eq!(peek(&d, 0x00), accumulated, "the write was not effective");
+        assert_eq!(peek(&d, 0x04), 0xa5, "and IDR is where it was");
+        // And now the clock is running again.
+        poke(&d, 0x08, CR_RESET);
+        assert_eq!(peek(&d, 0x00), DEFAULT_INIT);
+    }
+
+    #[test]
+    fn an_unwired_enable_leaves_the_unit_clocked() {
+        // Every board written before the gate existed draws no `enable` wire,
+        // and none of them may go deaf because this landed.
+        let d = f4();
+        poke(&d, 0x00, 0);
+        assert_eq!(peek(&d, 0x00), 0xc704_dd7b);
+    }
+
+    #[test]
+    fn the_reset_pin_puts_the_register_file_back() {
+        // `RCC_AHB1RSTR.CRCRST`, as a level: the block is deaf while it stands
+        // and comes back at its reset values when it is let go.
+        let d = v2();
+        poke(&d, 0x10, 0x1234_5678);
+        poke(&d, 0x14, 0x1021);
+        poke(&d, 0x08, CR_RESET);
+        assert_eq!(peek(&d, 0x00), 0x1234_5678);
+
+        let id = WireId::new(2);
+        let pin = Device::sink(&d, gate::RESET_PIN, &[id]).expect("a CRC unit has `reset`");
+        pin.sink.set_level(id, 0, Level::High);
+        assert_eq!(peek(&d, 0x10), 0, "held in reset, the block is deaf");
+        poke(&d, 0x10, 0xffff_0000);
+        pin.sink.set_level(id, 0, Level::Low);
+        assert_eq!(
+            peek(&d, 0x10),
+            DEFAULT_INIT,
+            "and what it kept is the reset value"
+        );
+        assert_eq!(peek(&d, 0x14), DEFAULT_POLYNOMIAL);
+        assert_eq!(peek(&d, 0x00), DEFAULT_INIT, "the accumulator with it");
+    }
+
+    #[test]
     fn a_snapshot_round_trips_to_identical_state() {
         let saved = v2();
         poke(&saved, 0x14, 0x1021);
@@ -1033,10 +1161,18 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_and_the_device_agree_about_regions() {
+    fn the_schema_and_the_device_agree_about_regions_and_pins() {
         let d = v2();
         let schema = schema();
-        assert_eq!(schema.ports.len(), 0, "this block has no pins");
+        // The gate's two, and no others: this block has no interrupt and no
+        // data path that is a wire.
+        assert_eq!(schema.ports.len(), 2);
+        let id = WireId::new(1);
+        for pin in [gate::ENABLE_PIN, gate::RESET_PIN] {
+            assert!(schema.port_named(pin).is_some());
+            assert!(Device::sink(&d, pin, &[id]).is_some());
+        }
+        assert!(Device::sink(&d, "irq", &[id]).is_none());
         assert!(Device::region(&d, "").is_some());
         assert!(Device::region(&d, "regs").is_some());
         assert!(Device::region(&d, "dr").is_none());

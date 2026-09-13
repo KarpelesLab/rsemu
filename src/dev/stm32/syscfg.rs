@@ -89,6 +89,34 @@
 //! `boot-sources` at all publishes no `boot` region and `MEMRMP` is then a
 //! latch, as it was.
 //!
+//! # The clock
+//!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which
+//! is `RCC_APB2ENR.SYSCFGEN`, bit 14 (RM0090 §7.3.14), and `reset`, which is
+//! `RCC_APB2RSTR.SYSCFGRST`, the same bit of the APB2 peripheral reset
+//! register. A board draws them or it does not; an undrawn `enable` leaves the
+//! block clocked. [`gate`](super::gate) has the rules. Forgetting the
+//! `SYSCFGEN` write is the classic EXTI bug — `EXTICR` will not take a value,
+//! so every line stays pointed at port A — and with the wire drawn a board
+//! reproduces it exactly.
+//!
+//! Two things here are deliberately **not** gated.
+//!
+//! * The **boot alias** ([`BootAlias`]) is an address decoder the core fetches
+//!   through, not a register. The alias at zero answers the reset vector fetch
+//!   — before any software has enabled any clock — so a window that went dead
+//!   without `SYSCFGEN` would make a machine unable to start at all. What
+//!   *does* stop is moving it: `MEMRMP` is a register, so a gated block drops
+//!   the write and the window stays where the BOOT pins left it.
+//! * A **pin level arriving** on `p{x}{n}` still crosses the mux to its EXTI
+//!   line. The selection cannot change while the gate is shut, since `EXTICR`
+//!   is one of the registers that has gone deaf, so the mux is a frozen piece
+//!   of combinational routing between two devices that have clocks of their
+//!   own. Dropping the level instead would leave this block's record of what
+//!   the ports are driving quietly wrong, with nothing to re-announce it when
+//!   the clock returned — the same reason [`Device::reset`] keeps those levels
+//!   rather than inventing low ones for them.
+//!
 //! # What is here and not modelled
 //!
 //! * **`SCSR`'s SRAM2 erase completes instantly and erases nothing**, because
@@ -125,6 +153,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::realize::BindCtx;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema, port_index};
@@ -379,6 +408,9 @@ struct Registers {
     boot: Arc<BootAlias>,
     /// `CFGR1.FWDIS`, as a level a firewall can watch.
     fwdis_out: Mutex<Option<WireSource>>,
+    /// `RCC_APB2ENR.SYSCFGEN` and `RCC_APB2RSTR.SYSCFGRST`, as a board's wires
+    /// deliver them.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Registers {
@@ -573,11 +605,46 @@ impl Registers {
     }
 }
 
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_APB2RSTR.SYSCFGRST`: the register file goes back to its reset
+        // values, which is what `Device::reset` does and with the same two
+        // consequences — the boot window follows `MEMRMP` back to what the
+        // BOOT pins chose, and the pin levels survive, because they are what
+        // the ports are driving and a mux that invented a level for its own
+        // input would publish an edge nothing made.
+        let memrmp = {
+            let mut state = self.state.lock();
+            let inputs = state.inputs;
+            *state = self.reset_state();
+            state.inputs = inputs;
+            state.memrmp
+        };
+        self.boot.select(memrmp & MEM_MODE_MASK);
+        self.drive_fwdis();
+        self.refresh();
+    }
+}
+
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
         let [a, b, c, d] = dst else {
             return Err(BusError::BadAccess);
         };
+        if !self.gate.live() {
+            // No `RCC_APB2ENR.SYSCFGEN`, or `SYSCFGRST` standing: the block is
+            // not readable and the value that comes back is zero
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself returns. Only the
+            // *registers* are gated — the boot alias has a `MemOps` of its own
+            // and the core fetches through it.
+            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            return Ok(());
+        }
         // Nothing here clears or advances on a read, so a debug read is the
         // same read (`ROADMAP.md` §15, invariant 5).
         let bytes = self.read_register(offset & !3).to_le_bytes();
@@ -594,6 +661,13 @@ impl MemOps for Registers {
             // interrupt; one to `CFGR1` would latch the firewall shut for
             // good. Neither has a harmless version.
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: the write is lost, so `EXTICR` keeps pointing
+            // every line where it pointed and `MEMRMP` leaves the boot window
+            // where the BOOT pins put it. This is the missing `SYSCFGEN`
+            // write, as firmware experiences it.
+            return Ok(());
         }
         let value = u32::from_le_bytes([*a, *b, *c, *d]);
         if self.write_register(offset & !3, value) {
@@ -699,6 +773,7 @@ impl Syscfg {
             out: Mutex::with_rank(LockRank::WIRE, [const { None }; LINES as usize]),
             boot: Arc::clone(&boot),
             fwdis_out: Mutex::with_rank(LockRank::WIRE, None),
+            gate: ClockGate::new(),
         });
         *regs.state.lock() = regs.reset_state();
         boot.select(regs.state.lock().memrmp & MEM_MODE_MASK);
@@ -980,6 +1055,9 @@ impl Device for Syscfg {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        if let Some(pin) = gate::sink(&self.regs, port, sources) {
+            return Some(pin);
+        }
         let (index, pin) = parse_pin(port, self.regs.ports)?;
         let sink = Arc::new(PortPin {
             regs: Arc::clone(&self.regs),
@@ -1087,7 +1165,8 @@ pub fn schema() -> ClassSchema {
     for letter in PORT_LETTERS {
         schema = schema.port_bank(format!("p{}", *letter as char), PortDir::In, LINES);
     }
-    schema
+    // `RCC_APB2ENR.SYSCFGEN` and `RCC_APB2RSTR.SYSCFGRST`.
+    gate::ports(schema)
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,6 +1710,141 @@ mod tests {
         assert_eq!(device.class().name, CLASS_NAME);
     }
 
+    // -----------------------------------------------------------------------
+    // The clock gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_block_whose_clock_is_disabled_reads_as_zero_and_drops_writes() {
+        // GitHub issue #14, and the classic EXTI bug in one test: with
+        // `RCC_APB2ENR.SYSCFGEN` clear the block is not readable — every
+        // register answers zero — and `EXTICR` will not take a value, so every
+        // line stays pointed where it was.
+        let s = syscfg();
+        select(&s, 4, 1);
+        poke(&s, 0x04, 0x0004_0000);
+
+        let id = WireId::new(1);
+        let pin = Device::sink(&s, gate::ENABLE_PIN, &[id]).expect("a SYSCFG has `enable`");
+        // Drawing the wire is the assertion that the clock is RCC's to give,
+        // and an `xxENR` bit resets low.
+        assert_eq!(peek(&s, 0x08), 0, "the whole block reads as zero");
+        assert_eq!(peek(&s, 0x04), 0, "PMC included");
+        let mut word = [0u8; 4];
+        s.regs
+            .read(0x08, &mut word, MemAttrs::DEBUG)
+            .expect("a debug read of a gated block is answered");
+        assert_eq!(u32::from_le_bytes(word), 0, "and so does a debug read");
+
+        select(&s, 4, 2);
+        assert_eq!(
+            s.selected_port(4),
+            Some(1),
+            "the write was not effective, so the mux did not move"
+        );
+
+        pin.sink.set_level(id, 0, Level::High);
+        // The registers kept their values across the gating: removing a clock
+        // is not a reset, and `SYSCFGRST` is the pin that resets.
+        assert_eq!(peek(&s, 0x0c) & 0xf, 1, "EXTICR2's line 4 field");
+        assert_eq!(peek(&s, 0x04), 0x0004_0000);
+        select(&s, 4, 2);
+        assert_eq!(s.selected_port(4), Some(2), "and now the clock is running");
+    }
+
+    #[test]
+    fn a_gated_mux_still_forwards_a_pin_to_its_line() {
+        // The mux between two clocked devices is combinational routing, and
+        // `EXTICR` cannot move while the gate is shut, so a level arriving
+        // from a port reaches its EXTI line as it did. Dropping it would leave
+        // this block's record of what the ports drive quietly wrong, with
+        // nothing to re-announce it when the clock came back.
+        let s = syscfg();
+        let line0 = watch(&s, "exti0");
+        let _enable = Device::sink(&s, gate::ENABLE_PIN, &[WireId::new(1)]);
+        let src = WireId::new(2);
+        let pa0 = Device::sink(&s, "pa0", &[src]).expect("pa0");
+        pa0.sink.set_level(src, 0, Level::High);
+        assert!(high(&line0), "the line followed the pin");
+        assert_eq!(peek(&s, 0x08), 0, "though the block cannot be read to see");
+        pa0.sink.set_level(src, 0, Level::Low);
+        assert!(!high(&line0));
+    }
+
+    #[test]
+    fn the_boot_alias_is_not_gated() {
+        // The alias at zero answers the reset vector fetch, which happens
+        // before any software has enabled any clock, so a window that went
+        // dead without `SYSCFGEN` would be a machine that cannot start. What
+        // *does* stop is moving it: `MEMRMP` is a register like any other.
+        let (s, space) = boot_rig();
+        bind_boot(&s, &space);
+        let attrs = MemAttrs::DEFAULT;
+        space
+            .write(0x0800_0010, Width::U32, 0xf1a5_4001, attrs)
+            .expect("flash is writable in this rig");
+
+        let _enable =
+            Device::sink(s.as_ref(), gate::ENABLE_PIN, &[WireId::new(1)]).expect("`enable`");
+        assert_eq!(
+            space.read(0x10, Width::U32, attrs).ok(),
+            Some(0xf1a5_4001),
+            "the core still fetches through the alias"
+        );
+        assert_eq!(
+            space.read(0x4001_3800, Width::U32, attrs).ok(),
+            Some(0),
+            "while the registers beside it answer nothing"
+        );
+        // MEM_MODE = 11 would put SRAM at zero, if the write reached anything.
+        space
+            .write(0x4001_3800, Width::U32, 3, attrs)
+            .expect("a gated write is dropped, not faulted");
+        assert_eq!(
+            s.boot_target(),
+            Some(0x0800_0000),
+            "the window did not move"
+        );
+    }
+
+    #[test]
+    fn an_unwired_enable_leaves_the_block_clocked() {
+        // Every board written before the gate existed draws no `enable` wire,
+        // and none of them may go deaf because this landed.
+        let s = syscfg();
+        select(&s, 7, 3);
+        assert_eq!(s.selected_port(7), Some(3));
+    }
+
+    #[test]
+    fn the_reset_pin_puts_the_register_file_back() {
+        // `RCC_APB2RSTR.SYSCFGRST`, as a level: the block is deaf while it
+        // stands and comes back at its reset values when it is let go.
+        let s = syscfg();
+        let line0 = watch(&s, "exti0");
+        s.set_pin(1, 0, true); // PB0 high
+        select(&s, 0, 1);
+        assert!(high(&line0));
+
+        let id = WireId::new(2);
+        let pin = Device::sink(&s, gate::RESET_PIN, &[id]).expect("a SYSCFG has `reset`");
+        pin.sink.set_level(id, 0, Level::High);
+        assert_eq!(peek(&s, 0x08), 0, "held in reset, the block is deaf");
+        assert_eq!(
+            s.selected_port(0),
+            Some(0),
+            "and every line is back on port A"
+        );
+        assert!(!high(&line0), "which nothing is driving");
+        select(&s, 0, 1);
+        pin.sink.set_level(id, 0, Level::Low);
+        assert_eq!(peek(&s, 0x08), 0, "what it kept is the reset value");
+        // The pin levels survived, so pointing a line back at PB0 finds it
+        // still high rather than publishing an edge nothing made.
+        select(&s, 0, 1);
+        assert!(high(&line0));
+    }
+
     #[test]
     fn the_schema_and_the_device_agree_about_pins_and_regions() {
         let s = Syscfg::build(Variant::F4, MAX_PORTS, 0);
@@ -1646,6 +1860,11 @@ mod tests {
             assert!(schema.port_named(&format!("exti{n}")).is_some());
         }
         assert!(schema.port_named("exti16").is_none());
+        // And the two the clock gate brings.
+        for pin in [gate::ENABLE_PIN, gate::RESET_PIN] {
+            assert!(schema.port_named(pin).is_some());
+            assert!(Device::sink(&s, pin, &[src]).is_some());
+        }
         assert!(Device::region(&s, "").is_some());
         assert!(Device::region(&s, "regs").is_some());
         assert!(Device::region(&s, "mux").is_none());

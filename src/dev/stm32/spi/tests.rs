@@ -1359,3 +1359,129 @@ fn the_jedec_id_of_a_spinor_comes_back_through_the_fifo() {
         "FRXTH clear, packed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the clock gate
+// ---------------------------------------------------------------------------
+
+/// A master with an [`Echo`] on chip select zero, which is the shape every
+/// question about "did anything reach the bus" needs.
+fn master_with_echo() -> (Harness, Arc<Echo>) {
+    let h = harness(Link::Transactional);
+    let echo = Echo::new(Format::DEFAULT);
+    h.bus
+        .attach(ChipSelect(0), Arc::clone(&echo) as Arc<dyn SpiSlave>)
+        .expect("cs0 is free");
+    h.bus.select(Some(ChipSelect(0)));
+    (h, echo)
+}
+
+/// Draw this instance's clock-enable wire, which starts low.
+fn enable_pin(spi: &Stm32Spi, id: WireId) -> SinkPin {
+    Device::sink(spi, gate::ENABLE_PIN, &[id]).expect("an STM32 SPI has `enable`")
+}
+
+#[test]
+fn a_gated_peripheral_reads_as_zero_and_drops_writes() {
+    // GitHub issue #14: with this instance's `xxENR` bit clear the block is
+    // not readable — every register answers zero — and a write to it is not
+    // effective.
+    let h = harness(Link::Transactional);
+    h.write(0x10, 0x1234);
+    h.enable_master(0);
+    assert_eq!(h.read(0x08) & SR_TXE, SR_TXE);
+
+    let id = WireId::new(1);
+    let pin = enable_pin(&h.spi, id);
+    // Drawing the wire is the assertion that the clock is RCC's to give, and
+    // an `xxENR` bit resets low.
+    assert_eq!(h.read(0x00), 0, "the whole block reads as zero");
+    assert_eq!(h.read(0x08), 0, "`SR` included, `TXE` and all");
+    assert_eq!(h.read(0x10), 0, "and `CRCPR`");
+    assert_eq!(h.read_debug(0x08), 0, "a debug read sees the same nothing");
+
+    h.write(0x10, 0x4321);
+
+    pin.sink.set_level(id, 0, Level::High);
+    // Removing a clock is not a reset: `xxRSTR` is the pin that resets, so
+    // what was written before the gate shut is still there and what was
+    // written while it was shut never arrived.
+    assert_eq!(h.read(0x10), 0x1234);
+    assert_eq!(h.read(0x00) & CR1_SPE, CR1_SPE, "`SPE` still stands");
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_spi_clocked() {
+    // Every machine file written before the gate existed draws no `enable`
+    // wire, and none of those boards may go deaf because this landed.
+    let (h, echo) = master_with_echo();
+    h.enable_master(0);
+    h.write(0x0c, 0x5a);
+    h.wait(64);
+    assert_eq!(echo.seen(), [0x5a]);
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back() {
+    // This instance's `RCC_xxRSTR` bit, as a level: the block is deaf while it
+    // stands and comes back at its reset values when it is let go.
+    let h = harness(Link::Transactional);
+    h.write(0x10, 0x1234);
+    h.enable_master(0);
+
+    let id = WireId::new(2);
+    let pin = Device::sink(&h.spi, gate::RESET_PIN, &[id]).expect("an STM32 SPI has `reset`");
+    // Nothing has driven it yet, so the block is still live.
+    assert_eq!(h.read(0x10), 0x1234);
+
+    pin.sink.set_level(id, 0, Level::High);
+    assert_eq!(h.read(0x10), 0, "held in reset, the block is deaf");
+    h.write(0x10, 0x4321);
+    pin.sink.set_level(id, 0, Level::Low);
+    assert_eq!(h.read(0x10), 0x0007, "§28.5.5's reset value came back");
+    assert_eq!(h.read(0x00), 0, "`SPE` included");
+    assert_eq!(h.read(0x08), SR_TXE, "and `SR` is the manual's 0x0002");
+}
+
+#[test]
+fn a_gated_master_clocks_no_frame_onto_its_bus() {
+    // The half a register model alone would get wrong: this is a bus
+    // controller, and with no clock there is no `SCK` edge for it to drive.
+    let (h, echo) = master_with_echo();
+    h.enable_master(0);
+
+    let id = WireId::new(3);
+    let pin = enable_pin(&h.spi, id);
+    h.write(0x0c, 0x5a);
+    h.run(4_000);
+    assert!(echo.seen().is_empty(), "no frame reached the slave");
+    assert_eq!(h.read(0x08), 0, "and no `BSY` to report one with");
+
+    // And when the clock comes back the same driver sequence works, from
+    // where it stopped rather than four thousand ticks late.
+    pin.sink.set_level(id, 0, Level::High);
+    h.write(0x0c, 0x5a);
+    h.wait(64);
+    assert_eq!(echo.seen(), [0x5a]);
+}
+
+#[test]
+fn a_gated_slave_answers_nothing() {
+    // The other direction: another master clocks the slave-side pins of a
+    // peripheral whose clock is off.
+    let h = harness(Link::Transactional);
+    h.write(0x00, CR1_SPE);
+    let face = Arc::clone(h.spi.pins().slave());
+    h.write(0x0c, 0x3c);
+    assert_eq!(face.transfer(0xa5), 0, "the shift register starts empty");
+    assert_eq!(face.transfer(0xa5), 0x3c, "clocked, it answers from `DR`");
+
+    let id = WireId::new(4);
+    let _pin = enable_pin(&h.spi, id);
+    assert_eq!(
+        face.transfer(0x5a),
+        u32::MAX,
+        "gated, nothing latches the master's edges"
+    );
+    assert_eq!(face.peek(), u32::MAX);
+}

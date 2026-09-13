@@ -217,6 +217,25 @@
 //! tri-stated, which is the same split
 //! [`crate::dev::sitronix`] makes for the ST7272A's `SDA`.
 //!
+//! # The clock gate
+//!
+//! Two *inputs* arrive from the reset and clock controller: `enable`, which is
+//! this instance's clock-enable bit — on the F4 that is `RCC_APB2ENR` bit 12
+//! for SPI1 and `RCC_APB1ENR` bits 14 and 15 for SPI2 and SPI3 (RM0090
+//! §7.3.10–§7.3.15) — and `reset`, which is the identically numbered bit of
+//! the matching `xxRSTR`. A board draws them or it does not; an undrawn
+//! `enable` leaves the peripheral clocked, so every machine file written
+//! before the gate keeps working. [`gate`](super::gate) has the rules and what
+//! a gated block does.
+//!
+//! The register half is the easy half. This is a **bus controller**, so a
+//! gated instance also drives no `SCK` edge, starts no frame, and answers
+//! nothing when another master clocks its slave pins; a frame that was in
+//! flight resumes from where it stopped rather than replaying the time the
+//! clock was away. `nss-in` keeps arriving, because it is a level another
+//! device drives, but a gated peripheral does not fault on it: `MODF` needs a
+//! clock to latch.
+//!
 //! # What is not modelled, and says so
 //!
 //! `I2SCFGR` and `I2SPR` are stored and read back — a driver that probes them
@@ -260,6 +279,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireId, WireSink, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -1056,6 +1076,10 @@ struct Shared {
     sinks: Mutex<Vec<Arc<InputSink>>>,
     /// The catch-up handle the register block syncs through.
     lazy: Mutex<Option<LazyHandle>>,
+    /// This instance's `RCC_xxENR` and `RCC_xxRSTR` bits, as a board's wires
+    /// deliver them. Wiring rather than chip state, so it sits beside the
+    /// register file and not inside it.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Shared {
@@ -1147,6 +1171,7 @@ impl Stm32Spi {
             irq: Mutex::with_rank(LockRank::WIRE, None),
             sinks: Mutex::with_rank(LockRank::WIRE, Vec::new()),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
+            gate: ClockGate::new(),
         });
         let pins = Arc::new(SlavePins::new(Arc::clone(&shared) as Arc<dyn SpiSlave>));
         let port = Arc::new(RegisterBlock {
@@ -1526,6 +1551,21 @@ impl Shared {
     /// what to do under the state lock, releases it, then drives the wire or
     /// reaches the slave (`core::device`, the re-entrancy contract).
     fn advance_to(&self, target: u64) {
+        if !self.gate.live() {
+            // No peripheral clock, no `SCK`: nothing is shifted, nothing is
+            // sampled and no frame begins. The tick still moves, because the
+            // *domain* is running and a device that fell behind would be asked
+            // to catch up — which is precisely what must not happen here — so
+            // the start of a frame in flight slides with it and the frame
+            // finishes the same number of ticks after the clock comes back as
+            // it had left to run ([`gate`](super::gate)).
+            let mut state = self.state.lock();
+            let delta = target.saturating_sub(state.ticks);
+            state.started = state.started.saturating_add(delta);
+            state.ticks = state.ticks.max(target);
+            self.publish(&mut state);
+            return;
+        }
         loop {
             enum Step {
                 Done,
@@ -1680,6 +1720,37 @@ impl Shared {
         state.crc_frame = false;
         state.refresh();
         true
+    }
+}
+
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // This instance's `RCC_xxRSTR` bit: the register file goes back to its
+        // reset values, which is what `Device::reset` does to it. Two things
+        // that call does are left out, both for the reason spelled beside
+        // `State::nss_in` — the MISO level and the fabric shifter's framing
+        // belong to whatever drives and clocks this peripheral rather than to
+        // the peripheral, and the shifter re-reads `format()` at its next
+        // select in any case. Releasing the slave-select output is *not* left
+        // out: a block held in reset does not go on holding a part selected.
+        {
+            let mut state = self.state.lock();
+            let ticks = state.ticks;
+            let nss_in = state.nss_in;
+            *state = State {
+                ticks,
+                nss_in,
+                ..State::new(self.variant)
+            };
+            self.publish(&mut state);
+        }
+        self.drive_nss(false);
+        self.announce_all();
+        self.publish_irq();
     }
 }
 
@@ -2002,6 +2073,14 @@ impl MemOps for RegisterBlock {
             dst.fill(0);
             return Ok(());
         }
+        if !self.shared.gate.live() {
+            // No clock-enable bit, or the reset bit standing: the block is not
+            // readable and what comes back is zero ([`gate`](super::gate)). A
+            // debug read sees the same nothing, because that is what the bus
+            // itself returns — and a gated `DR` pops no FIFO either way.
+            dst.fill(0);
+            return Ok(());
+        }
         self.shared.sync(attrs);
         if register == 0x0c && self.shared.variant.has_fifo() {
             // `DR` is a FIFO port, not a value in a word: the access width
@@ -2045,6 +2124,11 @@ impl MemOps for RegisterBlock {
             return Err(BusError::BadAccess);
         }
         if register > LAST_REGISTER {
+            return Ok(());
+        }
+        if !self.shared.gate.live() {
+            // Not effective: the write is lost, so it starts no frame, moves
+            // no chip select and queues nothing in the Tx FIFO.
             return Ok(());
         }
         self.shared.sync(attrs);
@@ -2093,11 +2177,25 @@ impl SpiSlave for Shared {
         // NSS is what selects a slave, and it is the same pin a master watches
         // for a mode fault (§28.3.1). `SlavePins` has already turned the wire's
         // active-low level into this boolean.
+        //
+        // The level is recorded whatever the gate says — it belongs to
+        // whatever drives it, exactly as at `Device::reset` — but `MODF` is a
+        // flag the peripheral *latches*, and a peripheral with no clock
+        // latches nothing.
         state.nss_in = Level::from_bool(!selected);
-        Shared::check_mode_fault(&mut state);
+        if self.gate.live() {
+            Shared::check_mode_fault(&mut state);
+        }
     }
 
     fn transfer(&self, mosi: u32) -> u32 {
+        if !self.gate.live() {
+            // A slave with no clock of its own cannot shift: the master's
+            // `SCK` edges arrive and nothing latches them. An undriven MISO is
+            // whatever the net pulls it to, which is what `u32::MAX` says
+            // here.
+            return u32::MAX;
+        }
         let mut state = self.state.lock();
         if state.is_master() || !state.is_enabled() {
             // Not listening. A master's own MISO input is not this path, and a
@@ -2116,6 +2214,9 @@ impl SpiSlave for Shared {
     }
 
     fn peek(&self) -> u32 {
+        if !self.gate.live() {
+            return u32::MAX;
+        }
         let state = self.state.lock();
         if state.is_master() || !state.is_enabled() {
             return u32::MAX;
@@ -2156,7 +2257,9 @@ impl WireSink for InputSink {
                 let faulted = {
                     let mut state = self.shared.state.lock();
                     state.nss_in = level;
-                    Shared::check_mode_fault(&mut state)
+                    // The level is kept either way; only the *fault* needs a
+                    // clock to latch it.
+                    self.shared.gate.live() && Shared::check_mode_fault(&mut state)
                 };
                 if faulted {
                     self.shared.drive_nss(false);
@@ -2338,7 +2441,12 @@ impl Device for Stm32Spi {
         matches!(name, "" | "regs").then(|| Arc::clone(&self.region))
     }
 
-    fn sink(&self, port: &str, _sources: &[WireId]) -> Option<SinkPin> {
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset` first. Neither name collides: this peripheral's
+        // own inputs are `miso`, `nss-in`, `sck-in` and `mosi-in`.
+        if let Some(pin) = gate::sink(&self.shared, port, sources) {
+            return Some(pin);
+        }
         // The slave-side data pins are the fabric's own.
         let slave_line = match port {
             pin::SCK_IN => Some(slave_pin::SCK),
@@ -2502,7 +2610,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `stm32.spi`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("variant", ValueKind::Str).values(Variant::NAMES))
         .prop(
             PropSchema::new("link", ValueKind::Str)
@@ -2521,7 +2629,9 @@ pub fn schema() -> ClassSchema {
         .port(pin::MISO_OUT, PortDir::Out)
         .port("irq", PortDir::Out)
         .region("")
-        .region("regs")
+        .region("regs");
+    // This instance's `RCC_xxENR` and `RCC_xxRSTR` bits.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

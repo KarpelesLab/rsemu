@@ -100,6 +100,25 @@
 //! writes `wire sdio.irq -> cpu.irq49`, 49 being SDIO's position in RM0090
 //! Table 62.
 //!
+//! # The clock gate
+//!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which on
+//! an F4 is **`RCC_APB2ENR` bit 11, `SDIOEN`**, and `reset`, which is
+//! `RCC_APB2RSTR` bit 11, `SDIORST` (RM0090 §7.3.10–§7.3.15 for the enable
+//! registers; the bit position is the peripheral's slot in `APB2`, and it is
+//! the same one in both). On an L4, where this IP is called `SDMMC1`, the pair
+//! is `RCC_APB2ENR.SDMMC1EN` and `RCC_APB2RSTR.SDMMC1RST` — a different bit,
+//! which is the board file's business rather than this device's.
+//!
+//! ```text
+//!   wire rcc.apb2en11  -> sdio.enable
+//!   wire rcc.apb2rst11 -> sdio.reset
+//! ```
+//!
+//! A board draws them or it does not; an **undrawn `enable` leaves the
+//! controller clocked**, so no machine file written before the gate changes
+//! behaviour. [`gate`](super::gate) has the rules and what a gated block does.
+//!
 //! # Time
 //!
 //! As in the H7 model, **zero**, and for the same reasons: a command completes
@@ -143,16 +162,17 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{DmaPeripheral, Level, WireSource};
+use crate::core::wire::{DmaPeripheral, Level, WireId, WireSource};
 use crate::dev::sd::card::{Data, Reply, SdCard};
 use crate::dev::sd::slots::{self, Slot};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -622,10 +642,20 @@ impl DmaPeripheral for Shared {
     }
 
     fn dma_ready(&self) -> bool {
+        // An unclocked controller asks for nothing: the DPSM is not running,
+        // so there is no beat for the stream to service. Asked here as well as
+        // at the wire, because `SxCR.PFCTRL` makes this the question the
+        // controller puts instead of sampling the level.
+        if !self.gate.live() {
+            return false;
+        }
         self.regs.lock().dma_request()
     }
 
     fn dma_last(&self) -> bool {
+        if !self.gate.live() {
+            return false;
+        }
         let regs = self.regs.lock();
         regs.dctrl & DCTRL_DTDIR != 0
             && regs.dpsm.is_none_or(|dpsm| dpsm.left == 0)
@@ -649,6 +679,10 @@ struct Shared {
     /// enabled, and the symptom is the one the silicon gives — a transfer that
     /// never advances.
     drq: Mutex<Option<WireSource>>,
+    /// `RCC_APB2ENR.SDIOEN` and `RCC_APB2RSTR.SDIORST`, as a board's wires
+    /// deliver them. Wiring rather than chip state, so it sits beside `regs`
+    /// and not in it.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Shared {
@@ -685,6 +719,7 @@ impl Sdio {
             slot_name,
             irq: Mutex::with_rank(CELL_RANK, None),
             drq: Mutex::with_rank(CELL_RANK, None),
+            gate: ClockGate::new(),
         });
         let port = Arc::new(Port {
             shared: Arc::clone(&shared),
@@ -748,9 +783,33 @@ impl Sdio {
     }
 
     /// Whether the DMA request line is currently asking for service.
+    ///
+    /// The *line*, so a gated controller answers false however full the FIFO
+    /// is. The accessors above report register content instead and are
+    /// deliberately not gated: they are a harness looking inside the chip
+    /// rather than a guest looking at it through the bridge.
     #[must_use]
     pub fn dma_requesting(&self) -> bool {
-        self.shared.regs.lock().dma_request()
+        self.shared.gate.live() && self.shared.regs.lock().dma_request()
+    }
+}
+
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_APB2RSTR.SDIORST`: the register block, the FIFO and the DPSM go
+        // back to their reset values and the two outputs follow. The **card**
+        // does not — it is its own device on the other side of the socket, and
+        // pulling the controller's reset line is not a `POWER` cycle. That is
+        // the line `Device::reset` draws, for the same reason.
+        {
+            let mut regs = self.regs.lock();
+            *regs = Regs::reset();
+        }
+        self.refresh_outputs();
     }
 }
 
@@ -766,12 +825,20 @@ impl Shared {
     /// (`CLAUDE.md`, "Concurrency"). Both levels are computed in one pass so the
     /// two outputs can never disagree about the same register image.
     fn refresh_outputs(&self) {
-        let (irq, drq) = {
+        let (irq, drq) = if self.gate.live() {
             let regs = self.regs.lock();
             (
                 regs.status() & regs.mask & MASK_MASK != 0,
                 regs.dma_request(),
             )
+        } else {
+            // Both outputs are combinational from a register image the block
+            // cannot present without a clock, so a gated controller asserts
+            // neither: no interrupt, and no DMA request that would otherwise
+            // spin `st.dma` against an aperture answering zero. The latched
+            // `STA` behind them is untouched, so both levels come back exactly
+            // as they were when the clock does.
+            (false, false)
         };
         if let Some(wire) = self.irq.lock().as_ref() {
             wire.set(Level::from(irq));
@@ -1141,6 +1208,24 @@ impl MemOps for Port {
         if dst.len() != 4 || !offset.is_multiple_of(4) {
             return Err(BusError::BadAccess);
         }
+        if !self.shared.gate.live() {
+            // No `RCC_APB2ENR.SDIOEN`, or `SDIORST` standing: the block is not
+            // readable and zero is what the bridge returns
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself answers — and it is also the
+            // one read that must not pop the FIFO, which this one cannot.
+            dst.fill(0);
+            if !attrs.debug {
+                // Still drive the outputs, for the same reason the ungated path
+                // does it here: this is where a DMA stream's beat arrives, and
+                // the request line has to go down or `st.dma` keeps asking. RCC
+                // driving `enable` low does not call back into a peripheral —
+                // the gate has no hook for it — so the first access after the
+                // clock goes is where a level output settles.
+                self.shared.refresh_outputs();
+            }
+            return Ok(());
+        }
         let value = self.shared.read_register(offset, attrs.debug);
         dst.copy_from_slice(&value.to_le_bytes());
         if !attrs.debug {
@@ -1159,6 +1244,13 @@ impl MemOps for Port {
             // A debug write would send a command, move a block or clear a
             // status bit; none of those can be made harmless.
             return Err(BusError::BadAccess);
+        }
+        if !self.shared.gate.live() {
+            // Not effective: no command goes out, no FIFO word moves, no status
+            // bit changes. This is also the path a DMA stream's beat arrives
+            // on, so gating it here is what stops a transfer in flight.
+            self.shared.refresh_outputs();
+            return Ok(());
         }
         self.shared
             .write_register(offset, u32::from_le_bytes([src[0], src[1], src[2], src[3]]));
@@ -1322,6 +1414,13 @@ impl Device for Sdio {
         }
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`, and the controller has no other input: the card
+        // reaches it through the socket and the DMA through the bus, and
+        // neither of those is a pin.
+        gate::sink(&self.shared, port, sources)
+    }
+
     fn announce(&self, _port: &str) {
         self.shared.refresh_outputs();
     }
@@ -1365,12 +1464,14 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `stm32.sdio`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("slot", ValueKind::Str))
         .port(pin::IRQ, PortDir::Out)
         .port(pin::DMA, PortDir::Out)
         .region("")
-        .region("regs")
+        .region("regs");
+    // `RCC_APB2ENR.SDIOEN` and `RCC_APB2RSTR.SDIORST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

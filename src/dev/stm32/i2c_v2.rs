@@ -99,6 +99,22 @@
 //! Everything in that list reads back what was written, so a driver that
 //! programs it and then checks does not see a wrong answer — it sees no effect.
 //!
+//! # The clock gate
+//!
+//! Two *inputs* arrive from the reset and clock controller: `enable`, which is
+//! this instance's clock-enable bit — `RCC_APB1ENR1` bits 21, 22 and 23 for
+//! I2C1, I2C2 and I2C3 on the L4 (RM0351 §6.4.16 ff.) — and `reset`, which is
+//! the identically numbered bit of the matching `xxRSTR`. A board draws them
+//! or it does not; an undrawn `enable` leaves the controller clocked, so every
+//! machine file written before the gate keeps working. [`gate`](super::gate)
+//! has the rules and what a gated block does.
+//!
+//! A gated I²C is not merely unreadable: it is a **bus controller with no
+//! clock**, so it does not step the bit engine, does not answer its own
+//! address as a slave, and does not hold SCL down. Whatever was in flight
+//! resumes from where it stopped rather than replaying the time the clock was
+//! away.
+//!
 //! # Time
 //!
 //! **The scheduler owns it** (`CLAUDE.md`). A *lazily advanced* device
@@ -136,6 +152,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireId, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::Instance;
 
 #[cfg(all(test, feature = "dev-at24c"))]
@@ -525,6 +542,10 @@ struct Shared {
     rx_drq_level: AtomicBool,
     /// The catch-up handle the register block syncs through.
     lazy: Mutex<Option<LazyHandle>>,
+    /// The peripheral's clock-enable and reset bits, as a board's wires deliver
+    /// them. Wiring rather than chip state, so it sits beside the register file
+    /// and not inside it.
+    gate: ClockGate,
 }
 
 /// Everything the guest can see or change.
@@ -918,6 +939,7 @@ impl Stm32I2cV2 {
             tx_drq_level: AtomicBool::new(false),
             rx_drq_level: AtomicBool::new(false),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
+            gate: ClockGate::new(),
         });
         // The slave face is the same object on both links: a transactional
         // bus routes to it by address, a wired one reaches it through the
@@ -1493,6 +1515,26 @@ impl Shared {
     /// what to do under the state lock, releases it, then drives the wire or
     /// reaches the bus (`core::device`, the re-entrancy contract).
     fn advance_to(&self, target: u64) {
+        if !self.gate.live() {
+            // No peripheral clock, no SCL: nothing is shifted and no bus event
+            // happens. The tick still moves, because the *domain* is running
+            // and a device that fell behind would be asked to catch up — which
+            // is precisely what must not happen here — so the deadline of an
+            // operation in flight slides with it and the transfer resumes from
+            // where it stopped ([`gate`](super::gate)).
+            {
+                let mut state = self.state.lock();
+                let delta = target.saturating_sub(state.ticks);
+                state.next_edge = state.next_edge.saturating_add(delta);
+                state.ticks = state.ticks.max(target);
+                self.publish(&state);
+            }
+            // And whatever it was holding SCL down for, it is not holding it
+            // now: the slave face is deaf while the gate is shut, so this
+            // releases the line rather than wedging the bus.
+            self.refresh_stretch();
+            return;
+        }
         loop {
             let step = {
                 let mut state = self.state.lock();
@@ -1540,6 +1582,31 @@ impl Shared {
     }
 }
 
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // The peripheral reset line, which is the same thing `Device::reset`
+        // does to this block and for the same reason — including releasing
+        // both open-drain drivers, because a block held in reset is not
+        // holding SCL or SDA down. The tick is kept: a reset line does not
+        // rewind a clock domain (`ROADMAP.md` §4.2).
+        {
+            let mut state = self.state.lock();
+            let ticks = state.ticks;
+            *state = State {
+                ticks,
+                ..State::default()
+            };
+            self.publish(&state);
+        }
+        self.wires.reset();
+        self.update_outputs();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The slave face
 // ---------------------------------------------------------------------------
@@ -1563,6 +1630,11 @@ impl fmt::Debug for SlaveFace {
 
 impl I2cSlave for SlaveFace {
     fn address(&self, address: Address, dir: Direction) -> Ack {
+        if !self.shared.gate.live() {
+            // No clock, no slave: an unclocked peripheral cannot compare an
+            // address, let alone pull SDA down for the acknowledge.
+            return Ack::Nack;
+        }
         let answer = {
             let mut state = self.shared.state.lock();
             // A part cannot address itself: while this controller is the master
@@ -1610,6 +1682,9 @@ impl I2cSlave for SlaveFace {
     }
 
     fn ten_bit_header(&self, high: u8) -> bool {
+        if !self.shared.gate.live() {
+            return false;
+        }
         let state = self.shared.state.lock();
         state.enabled()
             && state.stage == Stage::Idle
@@ -1618,6 +1693,9 @@ impl I2cSlave for SlaveFace {
     }
 
     fn write(&self, byte: u8) -> Ack {
+        if !self.shared.gate.live() {
+            return Ack::Nack;
+        }
         let answer = {
             let mut state = self.shared.state.lock();
             if !state.slave_active {
@@ -1647,6 +1725,11 @@ impl I2cSlave for SlaveFace {
     }
 
     fn read(&self) -> u8 {
+        if !self.shared.gate.live() {
+            // An undriven SDA reads as the pull-up, and a gated shift register
+            // drives nothing.
+            return 0xff;
+        }
         let mut state = self.shared.state.lock();
         if state.any(ISR_TXE) {
             // Nothing loaded. §39.4.9: an underrun under `NOSTRETCH` sends
@@ -1658,6 +1741,9 @@ impl I2cSlave for SlaveFace {
     }
 
     fn read_ack(&self, ack: Ack) {
+        if !self.shared.gate.live() {
+            return;
+        }
         {
             let mut state = self.shared.state.lock();
             state.set(ISR_TXE);
@@ -1671,6 +1757,10 @@ impl I2cSlave for SlaveFace {
     }
 
     fn stop(&self) {
+        if !self.shared.gate.live() {
+            // There is no clock to latch `STOPF` with.
+            return;
+        }
         {
             let mut state = self.shared.state.lock();
             if !state.slave_active {
@@ -1684,11 +1774,20 @@ impl I2cSlave for SlaveFace {
     }
 
     fn stretching(&self) -> bool {
+        if !self.shared.gate.live() {
+            // Whatever the flags say, a block with no clock is not the thing
+            // holding SCL down — and if it were, nothing would ever release
+            // it, because software cannot reach the registers to be served.
+            return false;
+        }
         let state = self.shared.state.lock();
         state.slave_active && state.stretching()
     }
 
     fn peek(&self) -> u8 {
+        if !self.shared.gate.live() {
+            return 0xff;
+        }
         let state = self.shared.state.lock();
         if state.any(ISR_TXE) { 0xff } else { state.txdr }
     }
@@ -1885,6 +1984,14 @@ impl MemOps for RegisterPort {
         if !matches!(dst.len(), 2 | 4) || !offset.is_multiple_of(4) {
             return Err(BusError::BadAccess);
         }
+        if !self.shared.gate.live() {
+            // No clock-enable bit, or the reset bit standing: the block is not
+            // readable and what comes back is zero ([`gate`](super::gate)). A
+            // debug read sees the same nothing, because that is what the bus
+            // itself returns.
+            dst.fill(0);
+            return Ok(());
+        }
         self.shared.sync(attrs);
         // Before the state lock: the fabric and the bit engine both rank above
         // it, so asking either while holding it is a ladder violation.
@@ -1906,6 +2013,11 @@ impl MemOps for RegisterPort {
             // A debug write would start a transfer, move a chip's address or
             // clear a flag, none of which the core can make harmless.
             return Err(BusError::BadAccess);
+        }
+        if !self.shared.gate.live() {
+            // Not effective: the write is lost, so it starts no transfer and
+            // clears no flag.
+            return Ok(());
         }
         self.shared.sync(attrs);
         let value = match src.len() {
@@ -2042,6 +2154,11 @@ impl Device for Stm32I2cV2 {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset` first; neither name collides with a bus line, an
+        // interrupt output or a DMA request here.
+        if let Some(pin) = gate::sink(&self.shared, port, sources) {
+            return Some(pin);
+        }
         match port {
             line::SCL_NAME => Some(SinkPin {
                 sink: self.shared.wires.sink(line::SCL, sources),
@@ -2164,7 +2281,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(
             PropSchema::new("link", ValueKind::Str)
                 .required()
@@ -2179,5 +2296,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .port(pin::TX_DRQ, PortDir::Out)
         .port(pin::RX_DRQ, PortDir::Out)
         .region("")
-        .region("regs")
+        .region("regs");
+    // The peripheral's `xxENR` and `xxRSTR` bits.
+    gate::ports(schema)
 }

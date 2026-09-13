@@ -59,6 +59,27 @@
 //! `ICR` or by masking it in `MASKR`, which is what the silicon requires and
 //! what makes a handler that forgets both loop forever, as it would on hardware.
 //!
+//! # The clock gate
+//!
+//! Two *inputs* arrive from the reset and clock controller: `enable`, which is
+//! `SDMMC1EN` in the H7's `RCC_AHB3ENR`, and `reset`, which is `SDMMC1RST` in
+//! `RCC_AHB3RSTR` at the same position (RM0433 §8.7, the `AHBxENR`/`AHBxRSTR`
+//! map; SDMMC1 sits in the D1 domain alongside the FMC and the QUADSPI). Which
+//! bit of it is a fact about the *part*, exactly as the vector number above is,
+//! so it belongs in the board file and is written `n` here:
+//!
+//! ```text
+//!   wire rcc.ahb3en{n}  -> sdmmc1.enable
+//!   wire rcc.ahb3rst{n} -> sdmmc1.reset
+//! ```
+//!
+//! A board draws them or it does not; an **undrawn `enable` leaves the
+//! controller clocked**, so no machine file written before the gate changes
+//! behaviour. [`gate`](super::gate) has the rules and what a gated block does.
+//! What it means here is that a gated controller sends no command, moves no
+//! FIFO word and masters no IDMA burst — all three happen inside a register
+//! write, and a write to a block without a clock is not effective.
+//!
 //! # Time
 //!
 //! **Deliberately zero**, and this is the decision most worth arguing.
@@ -112,7 +133,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{
@@ -121,9 +142,10 @@ use crate::core::space::{
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Level, WireId, WireSource};
 use crate::dev::sd::card::{Data, Reply, SdCard};
 use crate::dev::sd::slots::{self, Slot};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -554,6 +576,10 @@ struct Shared {
     /// only uses the FIFO path.
     bus: Mutex<Option<Arc<AddressSpace>>>,
     requester: Mutex<RequesterId>,
+    /// `RCC_AHB3ENR.SDMMC1EN` and `RCC_AHB3RSTR.SDMMC1RST`, as a board's wires
+    /// deliver them. Wiring rather than chip state, so it sits beside `regs`
+    /// and not in it.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Shared {
@@ -591,6 +617,7 @@ impl Sdmmc {
             irq: Mutex::with_rank(CELL_RANK, None),
             bus: Mutex::with_rank(CELL_RANK, None),
             requester: Mutex::with_rank(CELL_RANK, RequesterId::ANONYMOUS),
+            gate: ClockGate::new(),
         });
         let port = Arc::new(Port {
             shared: Arc::clone(&shared),
@@ -640,6 +667,27 @@ impl Sdmmc {
     }
 }
 
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_AHB3RSTR.SDMMC1RST`: the register block, the FIFO and the DPSM
+        // go back to their reset values and the interrupt follows. The **card**
+        // does not — it is its own device on the other side of the socket, and
+        // pulling the controller's reset line is not a `POWER` cycle. Nor does
+        // the address space the IDMA masters: that is the machine's wiring and
+        // survives a peripheral reset exactly as the wire handles do. Both are
+        // the lines `Device::reset` draws, for the same reasons.
+        {
+            let mut regs = self.regs.lock();
+            *regs = Regs::reset();
+        }
+        self.refresh_irq();
+    }
+}
+
 impl Shared {
     fn card(&self) -> Option<Arc<SdCard>> {
         self.slot.card()
@@ -655,10 +703,16 @@ impl Shared {
     /// listening, and the re-entrancy contract says to release first
     /// (`CLAUDE.md`, "Concurrency").
     fn refresh_irq(&self) {
-        let asserted = {
+        let asserted = if self.gate.live() {
             let busy = self.card_busy();
             let regs = self.regs.lock();
             regs.status(busy) & regs.mask & MASK_MASK != 0
+        } else {
+            // `STA & MASK` is combinational from a register image the block
+            // cannot present without a clock, so a gated controller raises no
+            // interrupt. The latched `STA` behind it is untouched, so the level
+            // comes back exactly as it was when the clock does.
+            false
         };
         if let Some(irq) = self.irq.lock().as_ref() {
             irq.set(Level::from(asserted));
@@ -1102,6 +1156,21 @@ impl MemOps for Port {
         if dst.len() != 4 || !offset.is_multiple_of(4) {
             return Err(BusError::BadAccess);
         }
+        if !self.shared.gate.live() {
+            // No `RCC_AHB3ENR.SDMMC1EN`, or `SDMMC1RST` standing: the block is
+            // not readable and zero is what the bridge returns
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself answers — and it is also the
+            // one read that must not pop the FIFO, which this one cannot.
+            dst.fill(0);
+            if !attrs.debug {
+                // RCC driving `enable` low does not call back into a peripheral
+                // — the gate has no hook for it — so the interrupt level
+                // settles at the first access afterwards.
+                self.shared.refresh_irq();
+            }
+            return Ok(());
+        }
         let value = self.shared.read_register(offset, attrs.debug);
         dst.copy_from_slice(&value.to_le_bytes());
         if !attrs.debug {
@@ -1118,6 +1187,13 @@ impl MemOps for Port {
             // A debug write would send a command, move a block or clear a
             // status bit; none of those can be made harmless.
             return Err(BusError::BadAccess);
+        }
+        if !self.shared.gate.live() {
+            // Not effective: no command goes out, no FIFO word moves and no
+            // IDMA burst is mastered. All three happen inside this call, so
+            // dropping it is the whole of stopping them.
+            self.shared.refresh_irq();
+            return Ok(());
         }
         self.shared
             .write_register(offset, u32::from_le_bytes([src[0], src[1], src[2], src[3]]));
@@ -1270,6 +1346,13 @@ impl Device for Sdmmc {
         Ok(())
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`, and the controller has no other input: the card
+        // reaches it through the socket and the IDMA through the address space,
+        // and neither of those is a pin.
+        gate::sink(&self.shared, port, sources)
+    }
+
     fn announce(&self, _port: &str) {
         self.shared.refresh_irq();
     }
@@ -1325,11 +1408,13 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `stm32.sdmmc`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("slot", ValueKind::Str))
         .port(pin::IRQ, PortDir::Out)
         .region("")
-        .region("regs")
+        .region("regs");
+    // `RCC_AHB3ENR.SDMMC1EN` and `RCC_AHB3RSTR.SDMMC1RST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

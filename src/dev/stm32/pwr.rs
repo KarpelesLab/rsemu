@@ -26,6 +26,47 @@
 //! is modelling the protection, and a domain that could never be opened would
 //! be a board bug wearing a device bug's clothes.
 //!
+//! # The clock gate
+//!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which is
+//! **`RCC_APB1ENR` bit 28, `PWREN`**, and `reset`, which is `RCC_APB1RSTR` bit
+//! 28, `PWRRST` (RM0090 §7.3.10–§7.3.15 for the enable registers; the bit
+//! position is the peripheral's slot in `APB1`, and it is the same one in
+//! both). On an L4 the pair is `RCC_APB1ENR1.PWREN` and `RCC_APB1RSTR1.PWRRST`
+//! at the same bit (RM0351 §6.4.17):
+//!
+//! ```text
+//!   wire rcc.apb1en28  -> pwr.enable
+//!   wire rcc.apb1rst28 -> pwr.reset
+//! ```
+//!
+//! This is the gate a vendor startup sequence trips over first: `PWREN` is the
+//! write that has to come *before* `PWR_CR.VOS`, and a firmware that forgets it
+//! finds a `VOS` that will not take and a `VOSRDY` that never moves — which,
+//! with the gate wired, is now what this model does too. A board draws the
+//! wires or it does not; an **undrawn `enable` leaves the controller clocked**,
+//! so no machine file written before the gate changes behaviour.
+//! [`gate`](super::gate) has the rules.
+//!
+//! ## What a gated PWR does with `dbp`
+//!
+//! **It holds the level it had.** `DBP` is a bit of `CR`, and a block with no
+//! clock accepts no write to `CR`, so the guest cannot move it — the honest
+//! answer is therefore that it cannot change, and the wire is left exactly
+//! where it was rather than being forced low. Forcing it low would be a
+//! *different* claim: that removing the peripheral clock re-arms the
+//! backup-domain write protection. Nothing in RM0090 §5.1.4 says so, and the
+//! protection is in the backup domain, which is on `VSWITCH` and is the part
+//! of the chip that is explicitly *not* gated by `APB1` — that is what makes it
+//! the backup domain. A peripheral whose output is *combinational* from its
+//! register file — an interrupt, a DMA request — does go low when the clock
+//! does, because there is no clock left to compute it with; `DBP` is a latched
+//! configuration bit that something else reads, and it stays.
+//!
+//! `reset` is the pin that does move it: `PWRRST` puts `CR` back to its reset
+//! value, where `DBP` is clear, and [`Gated::gate_reset`](super::gate::Gated)
+//! republishes the level from outside the lock like every other write path.
+//!
 //! # Time
 //!
 //! A regulator transition takes tens of microseconds. As in the RCC, that is
@@ -69,7 +110,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{AccessKind, LazyHandle};
@@ -77,7 +118,8 @@ use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region,
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Level, WireId, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -299,6 +341,10 @@ struct Registers {
     tick: AtomicU64,
     next_event: AtomicU64,
     lazy: Mutex<Option<LazyHandle>>,
+    /// `RCC_APB1ENR.PWREN` and `RCC_APB1RSTR.PWRRST`, as a board's wires
+    /// deliver them. Wiring rather than chip state, so it sits beside the
+    /// register file and not in it.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Registers {
@@ -311,6 +357,30 @@ impl fmt::Debug for Registers {
             None => s.field("tick", &"<locked>"),
         };
         s.finish()
+    }
+}
+
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_APB1RSTR.PWRRST`: the register file and the three transition
+        // deadlines go back to their reset values, and `dbp` is republished
+        // from outside the lock — `CR`'s reset value has `DBP` clear, so this
+        // is the one thing that *does* move the level. The device's own tick is
+        // not state the reset line owns: it is where this device has been
+        // advanced to, and rewinding it would be a time-travelling peripheral.
+        // Both are the lines `Device::reset` draws, for the same reasons.
+        {
+            let mut state = self.state.lock();
+            let tick = state.tick;
+            *state = State::reset(self.variant);
+            state.tick = tick;
+            self.republish(&state);
+        }
+        self.refresh_dbp();
     }
 }
 
@@ -359,6 +429,25 @@ impl Registers {
     fn advance_to(&self, tick: u64) {
         let mut state = self.state.lock();
         if tick <= state.tick {
+            return;
+        }
+        if !self.gate.live() {
+            // No clock, so nothing counts: a transition caught by the gate
+            // waits, and resumes with the ticks it had left rather than
+            // finishing the instant the clock comes back. Sliding the
+            // deadlines forward by the elapsed time is what "resumes where it
+            // stopped" means for a device whose position is an absolute tick —
+            // simply not advancing `tick` would leave the catch-up to fire
+            // every deadline at once on the next access.
+            let elapsed = tick - state.tick;
+            let state = &mut *state;
+            state.tick = tick;
+            for at in [&mut state.vos_at, &mut state.od_at, &mut state.odsw_at] {
+                if *at != NO_DEADLINE {
+                    *at = at.saturating_add(elapsed);
+                }
+            }
+            self.republish(state);
             return;
         }
         state.tick = tick;
@@ -499,6 +588,16 @@ impl MemOps for Registers {
         let [a, b, c, d] = dst else {
             return Err(BusError::BadAccess);
         };
+        if !self.gate.live() {
+            // No `RCC_APB1ENR.PWREN`, or `PWRRST` standing: the block is not
+            // readable and zero is what the bridge returns
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself answers. Not even `sync`
+            // runs: catching a stopped device up is the thing the gate exists
+            // to prevent.
+            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            return Ok(());
+        }
         self.sync(attrs);
         let value = self.read_register(offset & !3);
         let bytes = value.to_le_bytes();
@@ -515,6 +614,12 @@ impl MemOps for Registers {
             // the `dbp` wire. It is refused rather than guessed at
             // (`ROADMAP.md` §15, invariant 5).
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: `VOS` does not move, no transition is armed and
+            // `DBP` cannot change — which is why the `dbp` output keeps the
+            // level it had rather than being driven low. See the module note.
+            return Ok(());
         }
         self.sync(attrs);
         self.write_register(offset & !3, u32::from_le_bytes([*a, *b, *c, *d]));
@@ -568,6 +673,7 @@ impl Pwr {
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
+            gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "pwr",
@@ -674,6 +780,12 @@ impl Device for Pwr {
         Ok(())
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`, and a PWR has no other input: `dbp` is the one
+        // pin it had and it is an output, so neither name is taken.
+        gate::sink(&self.regs, port, sources)
+    }
+
     fn announce(&self, port: &str) {
         if port == DBP_PIN {
             self.regs.refresh_dbp();
@@ -752,7 +864,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `st.pwr`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "f42x", "l4", "l4plus"]))
         .prop(PropSchema::new("ready-delay", ValueKind::Uint))
         .region("")
@@ -760,7 +872,9 @@ pub fn schema() -> ClassSchema {
         // `wire pwr.dbp -> rcc.dbp`: the backup domain opens when this goes
         // high, and it is a level on a net rather than a handle because that
         // is what it is on the die.
-        .port(DBP_PIN, PortDir::Out)
+        .port(DBP_PIN, PortDir::Out);
+    // `RCC_APB1ENR.PWREN` and `RCC_APB1RSTR.PWRRST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

@@ -939,3 +939,182 @@ fn an_output_is_driven_with_the_register_lock_released() {
     assert_eq!(ch0.level(), Level::High);
     assert_eq!(vec![Level::High], *ch0.seen.lock());
 }
+
+// ---------------------------------------------------------------------------
+// the clock gate (`super::super::gate`)
+// ---------------------------------------------------------------------------
+
+impl Rig {
+    /// Draw one of the two gate wires and hand back the source that drives it.
+    ///
+    /// Drawing `enable` is the assertion that RCC owns this clock, so the
+    /// multiplexer is unclocked from that moment until something sets the bit
+    /// — which is what `RCC_AHB1ENR` reads out of reset.
+    fn draw_gate(&self, port: &str) -> WireSource {
+        let id = self.ids.alloc();
+        let pin = Device::sink(&self.mux, port, &[id]).expect("the gate offers this pin");
+        let wire = Arc::new(Wire::builder().source(id).sink(pin.sink, pin.line).build());
+        WireSource::new(wire, id)
+    }
+
+    /// Route line 17 to channel 0, which is all most of these tests need.
+    fn route_17_to_0(&self) {
+        self.poke(
+            ccr(0),
+            Ccr {
+                id: 17,
+                ..Ccr::default()
+            }
+            .bits(),
+        );
+    }
+}
+
+#[test]
+fn a_gated_multiplexer_reads_as_zero_and_drops_writes() {
+    // RM0432 §6.4.16: with the clock enable clear the registers are not
+    // readable and an access to them is not effective.
+    let rig = Rig::new(7);
+    rig.route_17_to_0();
+
+    let enable = rig.draw_gate(gate::ENABLE_PIN);
+    assert_eq!(rig.peek(ccr(0)), 0, "the whole block reads as zero");
+    assert_eq!(rig.csr(), 0);
+
+    rig.poke(
+        ccr(0),
+        Ccr {
+            id: 23,
+            ..Ccr::default()
+        }
+        .bits(),
+    );
+
+    // Removing a clock is not a reset: what was programmed is still there.
+    enable.set(Level::High);
+    assert_eq!(
+        rig.peek(ccr(0)) & CCR_DMAREQ_ID,
+        17,
+        "the write was dropped, not the routing"
+    );
+}
+
+#[test]
+fn a_gated_multiplexer_routes_nothing_and_resumes_where_it_was() {
+    // A synchronous block with no clock edge cannot notice that an input
+    // moved, so no output follows one — and the routing that was programmed is
+    // still the routing when the clock comes back.
+    let rig = Rig::new(7);
+    let ch0 = rig.probe_channel(0);
+    rig.route_17_to_0();
+
+    rig.mux.set_request(17, Level::High);
+    assert_eq!(ch0.level(), Level::High);
+    rig.mux.set_request(17, Level::Low);
+    ch0.clear();
+
+    let enable = rig.draw_gate(gate::ENABLE_PIN);
+    for _ in 0..4 {
+        rig.mux.set_request(17, Level::High);
+        rig.mux.set_request(17, Level::Low);
+    }
+    assert_eq!(ch0.rises(), 0, "nothing sampled the four pulses");
+    assert!(!rig.mux.forwarding(0));
+
+    enable.set(Level::High);
+    rig.mux.set_request(17, Level::High);
+    assert_eq!(
+        ch0.level(),
+        Level::High,
+        "and line 17 still reaches channel 0"
+    );
+}
+
+#[test]
+fn a_gated_generator_neither_triggers_nor_counts_its_credit() {
+    // The request generator and the synchronizer are the two things this block
+    // does over time; both are clocked, so both stop.
+    let rig = Rig::new(7);
+    let ch0 = rig.probe_channel(0);
+    // Channel 0 is fed by generator 0, which sits on request line 1.
+    rig.poke(
+        ccr(0),
+        Ccr {
+            id: generator_line(0) as u32,
+            ..Ccr::default()
+        }
+        .bits(),
+    );
+    // Generator 0: enabled, rising edge of `trg5`, three requests a trigger.
+    rig.poke(
+        rgcr(0),
+        5 | RGCR_GE | (0b01 << RGCR_GPOL_SHIFT) | (2 << RGCR_GNBREQ_SHIFT),
+    );
+
+    rig.mux.set_trigger(5, Level::High);
+    assert_eq!(ch0.rises(), 3, "one trigger, three requests");
+    ch0.clear();
+
+    let enable = rig.draw_gate(gate::ENABLE_PIN);
+    rig.mux.set_trigger(5, Level::Low);
+    rig.mux.set_trigger(5, Level::High);
+    assert_eq!(ch0.rises(), 0, "no clock, no generated request");
+    assert_eq!(rig.rgsr(), 0, "and no overrun either");
+
+    enable.set(Level::High);
+    rig.mux.set_trigger(5, Level::Low);
+    rig.mux.set_trigger(5, Level::High);
+    assert_eq!(ch0.rises(), 3, "the generator is as it was programmed");
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_multiplexer_routing() {
+    // Nothing written before the gate draws these wires, and none of it may go
+    // deaf because this landed.
+    let rig = Rig::new(7);
+    let ch0 = rig.probe_channel(0);
+    rig.route_17_to_0();
+    rig.mux.set_request(17, Level::High);
+    assert_eq!(ch0.level(), Level::High);
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back() {
+    // `RCC_AHB1RSTR.DMAMUX1RST`, as a level: the block is deaf while it stands
+    // and comes back at its reset values when it is let go.
+    let rig = Rig::new(7);
+    let ch0 = rig.probe_channel(0);
+    rig.route_17_to_0();
+    rig.mux.set_request(17, Level::High);
+    assert_eq!(ch0.level(), Level::High);
+
+    let reset = rig.draw_gate(gate::RESET_PIN);
+    reset.set(Level::High);
+    assert_eq!(
+        ch0.level(),
+        Level::Low,
+        "the reset dropped the output it was holding"
+    );
+    assert_eq!(rig.peek(ccr(0)), 0, "held in reset, the block is deaf");
+    rig.route_17_to_0();
+    reset.set(Level::Low);
+    assert_eq!(rig.peek(ccr(0)), 0, "and what it kept is the reset value");
+    rig.mux.set_request(17, Level::High);
+    assert!(!rig.mux.forwarding(0), "line 17 is routed nowhere again");
+}
+
+#[test]
+fn the_gate_pins_are_in_the_schema() {
+    let rig = Rig::new(7);
+    let schema = schema();
+    for pin in [gate::ENABLE_PIN, gate::RESET_PIN] {
+        assert!(
+            Device::sink(&rig.mux, pin, &[WireId::new(1)]).is_some(),
+            "the device answers `{pin}`"
+        );
+        assert!(
+            schema.port_named(pin).is_some(),
+            "and the validator knows `{pin}`"
+        );
+    }
+}

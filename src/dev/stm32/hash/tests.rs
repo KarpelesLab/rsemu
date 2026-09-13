@@ -900,3 +900,179 @@ fn a_snapshot_from_the_other_variant_is_refused() {
         .unwrap();
     assert!(Device::load(&restored, &mut chunk.reader()).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// The clock gate (`RCC_AHB2ENR.HASHEN`, `RCC_AHB2RSTR.HASHRST`)
+// ---------------------------------------------------------------------------
+
+/// Wire one of the two gate inputs up, and hand back the pin and its source.
+///
+/// Drawing the `enable` wire is itself the assertion that RCC owns this clock,
+/// so a processor comes back gated **off** from this call.
+fn gate_pin(d: &Hash, port: &str) -> (SinkPin, WireId) {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let pin = Device::sink(d, port, &[id]).expect("a gate pin this block has");
+    (pin, id)
+}
+
+/// How many words `CR.NBW` says are in the FIFO.
+fn nbw(d: &Hash) -> u32 {
+    (peek(d, R_CR) >> CR_NBW_SHIFT) & 0xf
+}
+
+#[test]
+fn a_gated_processor_reads_as_zero_and_drops_every_write() {
+    // GitHub issue #14: with `RCC_AHB2ENR.HASHEN` clear the block is not
+    // readable — zero comes back — and a write to it is not effective.
+    let d = f4();
+    start(&d, Algo::Sha1, 0b10, false, false);
+    poke(&d, R_IMR, IMR_DINIE);
+    poke(&d, R_STR, 7);
+    let cr = peek(&d, R_CR);
+    assert_ne!(cr, 0);
+
+    let (enable, id) = gate_pin(&d, gate::ENABLE_PIN);
+    assert_eq!(peek(&d, R_CR), 0, "the whole block reads as zero");
+    assert_eq!(peek(&d, R_IMR), 0);
+    assert_eq!(peek(&d, R_STR), 0);
+    assert_eq!(peek(&d, R_SR), 0, "`BUSY` and `DINIS` included");
+    assert_eq!(peek(&d, R_CSR), 0, "and the context block with them");
+    assert_eq!(
+        read(&d, R_SR, MemAttrs::DEBUG),
+        0,
+        "and so does a debug read, because that is what the bus returns"
+    );
+
+    // Not effective, and not a bus fault: an STM32's bridge answers.
+    assert!(try_write(&d, R_IMR, IMR_MASK, MemAttrs::DEFAULT).is_ok());
+    assert!(try_write(&d, R_CR, 0, MemAttrs::DEFAULT).is_ok());
+
+    enable.sink.set_level(id, 0, Level::High);
+    // Removing a clock is not a reset — `HASHRST` is what resets — so every
+    // register is exactly where the guest left it.
+    assert_eq!(peek(&d, R_CR), cr);
+    assert_eq!(peek(&d, R_IMR), IMR_DINIE);
+    assert_eq!(peek(&d, R_STR), 7);
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_processor_clocked() {
+    // Every machine file written before the gate draws no `enable`, and none of
+    // them may go deaf because this landed.
+    let d = f4();
+    assert_eq!(
+        digest(&d, Algo::Sha1, 0b10, b"abc"),
+        hex("a9993e364706816aba3e25717850c26c9cd0d89d")
+    );
+}
+
+#[test]
+fn a_gated_processor_digests_nothing_and_resumes_where_it_stopped() {
+    // The half a register model alone would get wrong. The words written while
+    // the clock is off are lost — the FIFO never took them — and the chaining
+    // state, the bit counter and the FIFO all keep their values, so the message
+    // that comes out is the one that was actually fed.
+    let want = digest(&f4(), Algo::Sha1, 0b10, TWO_BLOCK);
+
+    let d = f4();
+    start(&d, Algo::Sha1, 0b10, false, false);
+    feed(&d, 0b10, &TWO_BLOCK[..28]);
+    let held = nbw(&d);
+    assert_eq!(held, 7, "seven of the sixteen words are in the FIFO");
+    let hr0 = peek(&d, R_HR_HIGH);
+
+    let (enable, id) = gate_pin(&d, gate::ENABLE_PIN);
+    // Every one of these is a write to `DIN`, and not one of them is effective.
+    feed(&d, 0b10, b"XXXXXXXXXXXXXXXX");
+    // Nor is the `DCAL` that would otherwise have padded and finalised here.
+    poke(&d, R_STR, STR_DCAL);
+
+    enable.sink.set_level(id, 0, Level::High);
+    assert_eq!(nbw(&d), held, "the FIFO took none of it");
+    assert_eq!(peek(&d, R_HR_HIGH), hr0, "and nothing was compressed");
+
+    feed(&d, 0b10, &TWO_BLOCK[28..]);
+    poke(&d, R_STR, STR_DCAL);
+    assert_eq!(
+        digest_of(&d, Algo::Sha1),
+        want,
+        "the digest is of the message, not of the message plus the noise"
+    );
+}
+
+#[test]
+fn a_gated_processor_drives_neither_of_its_two_outputs() {
+    let d = f4();
+    let irq = watch(&d, pin::IRQ);
+    let drq = watch(&d, pin::DMA);
+    start(&d, Algo::Sha1, 0b10, false, false);
+    poke(&d, R_CR, peek(&d, R_CR) | CR_DMAE);
+    poke(&d, R_IMR, IMR_DINIE);
+    assert!(
+        irq.high.load(Ordering::Relaxed),
+        "`DINIS` is set and enabled"
+    );
+    assert!(drq.high.load(Ordering::Relaxed), "and `DIN` has room");
+
+    let (enable, id) = gate_pin(&d, gate::ENABLE_PIN);
+    // RCC driving `enable` low does not call back into the peripheral — the
+    // gate has no hook for it — so both levels settle at the first write
+    // afterwards, which for a DMA stream is the `DIN` beat it asked for. A read
+    // is not one of those points, here or when the clock is on: this block's
+    // reads move nothing and so can move no output.
+    assert_eq!(peek(&d, R_SR), 0);
+    poke(&d, R_DIN, 0xdead_beef);
+    assert!(!irq.high.load(Ordering::Relaxed), "no clock, no interrupt");
+    assert!(!drq.high.load(Ordering::Relaxed), "and no request");
+    assert_eq!(d.irq_level(), Level::Low);
+    assert!(!d.dma_requesting(), "nor when a stream asks directly");
+
+    enable.sink.set_level(id, 0, Level::High);
+    poke(&d, R_IMR, IMR_DINIE);
+    assert!(irq.high.load(Ordering::Relaxed), "and both come back");
+    assert!(drq.high.load(Ordering::Relaxed));
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back() {
+    // `RCC_AHB2RSTR.HASHRST`, as a level: the block is deaf while it stands and
+    // comes back at its reset values when it is let go.
+    let d = v2();
+    start(&d, Algo::Sha256, 0b10, false, false);
+    feed(&d, 0b10, &TWO_BLOCK[..28]);
+    poke(&d, R_IMR, IMR_MASK);
+    assert_ne!(peek(&d, R_CR), 0);
+
+    let (reset, id) = gate_pin(&d, gate::RESET_PIN);
+    // An `enable` nobody drew stays clocked, so `reset` alone is what shuts the
+    // block here.
+    reset.sink.set_level(id, 0, Level::High);
+    assert_eq!(peek(&d, R_CR), 0, "held in reset, the block is deaf");
+    poke(&d, R_IMR, IMR_DCIE);
+
+    reset.sink.set_level(id, 0, Level::Low);
+    assert_eq!(peek(&d, R_CR), 0, "and what it kept is the reset value");
+    assert_eq!(peek(&d, R_IMR), 0);
+    assert_eq!(peek(&d, R_STR), 0);
+    assert_eq!(nbw(&d), 0, "the FIFO went with it");
+    assert_eq!(peek(&d, R_SR), SR_DINIS, "and the block is idle, not busy");
+    // The digest in flight went too: the block starts again from `CR.INIT`.
+    assert_eq!(
+        digest(&d, Algo::Sha256, 0b10, b"abc"),
+        hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    );
+}
+
+#[test]
+fn a_reset_level_that_did_not_move_is_not_an_edge() {
+    let d = f4();
+    let (reset, id) = gate_pin(&d, gate::RESET_PIN);
+    reset.sink.set_level(id, 0, Level::High);
+    reset.sink.set_level(id, 0, Level::Low);
+    start(&d, Algo::Sha1, 0b10, false, false);
+    feed(&d, 0b10, &TWO_BLOCK[..28]);
+    let held = nbw(&d);
+    reset.sink.set_level(id, 0, Level::Low);
+    assert_eq!(nbw(&d), held, "a low that was already low resets nothing");
+}

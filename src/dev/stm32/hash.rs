@@ -123,6 +123,30 @@
 //! precisely that, against the FIPS vector, and the snapshot round-trip
 //! asserts it across `save`/`load` as well.
 //!
+//! # The clock gate
+//!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which on
+//! an F4 is **`RCC_AHB2ENR` bit 5, `HASHEN`**, and `reset`, which is
+//! `RCC_AHB2RSTR` bit 5, `HASHRST` (RM0090 §7.3.10–§7.3.15 for the enable
+//! registers; the bit position is the peripheral's slot in `AHB2`, and it is
+//! the same one in both):
+//!
+//! ```text
+//!   wire rcc.ahb2en5  -> hash.enable
+//!   wire rcc.ahb2rst5 -> hash.reset
+//! ```
+//!
+//! A board draws them or it does not; an **undrawn `enable` leaves the
+//! processor clocked**, so no machine file written before the gate changes
+//! behaviour. [`gate`](super::gate) has the rules and what a gated block does.
+//!
+//! A gated HASH digests nothing: `DIN` takes no word and `DCAL` starts no
+//! compression, because both of those happen inside a register write and a
+//! write to a block without a clock is not effective. The chaining state,
+//! the FIFO and the bit counter keep their values across the gating and the
+//! digest resumes exactly where it stopped — removing a clock is not a reset,
+//! and `HASHRST` is the pin that resets.
+//!
 //! # Which part
 //!
 //! `variant = "f4"` (the default) is RM0090 §25: **SHA-1 and MD5**, no
@@ -139,14 +163,15 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Level, WireId, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -972,6 +997,10 @@ struct Registers {
     variant: Variant,
     irq: Mutex<Option<WireSource>>,
     drq: Mutex<Option<WireSource>>,
+    /// `RCC_AHB2ENR.HASHEN` and `RCC_AHB2RSTR.HASHRST`, as a board's wires
+    /// deliver them. Wiring rather than chip state, so it sits beside the
+    /// running state and not in it.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Registers {
@@ -986,13 +1015,37 @@ impl fmt::Debug for Registers {
     }
 }
 
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_AHB2RSTR.HASHRST`: everything goes — `CR`, `IMR`, `STR`, the
+        // FIFO, the chaining variables, the bit counter, the HMAC phase and
+        // the key schedule — and the two outputs follow. That is the whole of
+        // `State`, which is the same line `Device::reset` draws; the variant is
+        // a property of the part rather than state, so it stays.
+        *self.state.lock() = State::new();
+        self.refresh_outputs();
+    }
+}
+
 impl Registers {
     /// Drive both outputs from one register image, with no lock held — the
     /// re-entrancy contract in `CLAUDE.md`.
     fn refresh_outputs(&self) {
-        let (irq, drq) = {
+        let (irq, drq) = if self.gate.live() {
             let state = self.state.lock();
             (state.irq(), state.dma_request())
+        } else {
+            // Both outputs are combinational from a register image the block
+            // cannot present without a clock, so a gated processor asserts
+            // neither: no interrupt, and no DMA request that would otherwise
+            // spin a stream against a `DIN` that swallows nothing. The state
+            // behind them is untouched, so both levels come back exactly as
+            // they were when the clock does.
+            (false, false)
         };
         if let Some(wire) = self.irq.lock().as_ref() {
             wire.set(Level::from_bool(irq));
@@ -1080,6 +1133,18 @@ impl MemOps for Registers {
         if offset >= REGISTER_BYTES {
             return Err(BusError::BadAccess);
         }
+        if !self.gate.live() {
+            // No `RCC_AHB2ENR.HASHEN`, or `HASHRST` standing: the block is not
+            // readable and zero is what the bridge returns
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself answers. The check sits
+            // below the aperture bound and above the decode: the bound is the
+            // region's and still faults, while a reserved word *inside* the
+            // aperture reads as zero here rather than faulting, which is the
+            // bridge answering and not this block.
+            dst.fill(0);
+            return Ok(());
+        }
         let value = self.read_register(offset)?;
         let bytes = value.to_le_bytes();
         for (slot, byte) in dst.iter_mut().zip(bytes) {
@@ -1094,6 +1159,14 @@ impl MemOps for Registers {
         }
         if attrs.debug {
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: `DIN` takes no word, `DCAL` starts no compression
+            // and `CR.INIT` restarts nothing. The digest in flight keeps its
+            // chaining variables and its bit counter and goes on from there
+            // when the clock comes back.
+            self.refresh_outputs();
+            return Ok(());
         }
         let mut word = [0u8; 4];
         for (slot, byte) in word.iter_mut().zip(src) {
@@ -1149,6 +1222,7 @@ impl Hash {
             variant,
             irq: Mutex::with_rank(LockRank::WIRE, None),
             drq: Mutex::with_rank(LockRank::WIRE, None),
+            gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "hash",
@@ -1165,15 +1239,21 @@ impl Hash {
     }
 
     /// The interrupt line's current level.
+    ///
+    /// The *line*, so a gated processor answers low whatever `SR & IMR` holds.
     #[must_use]
     pub fn irq_level(&self) -> Level {
-        Level::from_bool(self.regs.state.lock().irq())
+        Level::from_bool(self.regs.gate.live() && self.regs.state.lock().irq())
     }
 
     /// Whether the DMA request is asserted.
+    ///
+    /// The *line* again. [`Hash::digest`] below reports register content
+    /// instead and is deliberately not gated: it is a harness looking inside
+    /// the chip rather than a guest looking at it through the bridge.
     #[must_use]
     pub fn dma_requesting(&self) -> bool {
-        self.regs.state.lock().dma_request()
+        self.regs.gate.live() && self.regs.state.lock().dma_request()
     }
 
     /// The digest registers, `HR0`..`HR7`.
@@ -1313,6 +1393,12 @@ impl Device for Hash {
         }
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`, and the processor has no other input: its data
+        // path is `DIN` and not a pin.
+        gate::sink(&self.regs, port, sources)
+    }
+
     fn announce(&self, _port: &str) {
         self.regs.refresh_outputs();
     }
@@ -1357,12 +1443,14 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// The validator's view of this class.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "v2"]))
         .port(pin::IRQ, PortDir::Out)
         .port(pin::DMA, PortDir::Out)
         .region("")
-        .region("regs")
+        .region("regs");
+    // `RCC_AHB2ENR.HASHEN` and `RCC_AHB2RSTR.HASHRST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

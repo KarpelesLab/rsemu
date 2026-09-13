@@ -66,6 +66,32 @@
 //! pin the debug unit drives — `st.dbgmcu` is what drives
 //! it — and with nothing wired to it the watchdog counts through a halt.
 //!
+//! # The clock gate
+//!
+//! The watchdog runs on PCLK1, and `RCC_APB1ENR.WWDGEN` is the bit that gives
+//! it that clock — bit 11 on an F4 (RM0090 §7.3.11). So this class takes the
+//! `enable` input [`gate`] describes:
+//!
+//! ```text
+//! wire rcc.apb1en11 -> wwdg.enable
+//! ```
+//!
+//! An `enable` no board drew leaves the watchdog clocked, so every machine
+//! file written before the gate keeps working. While it is drawn and low the
+//! three registers read as zero and drop writes, and the down-counter stops
+//! where it is: a watchdog with no clock cannot count out, so it cannot reset
+//! the board, and `T` is where it was when the clock comes back.
+//!
+//! **`APB1RSTR.WWDGRST` has no pin here, and deliberately.** [`gate`] spells
+//! the peripheral-reset input `reset`, and on this device that name is already
+//! the watchdog's own *output* — the pulse that resets the board. Two opposite
+//! things cannot share one pin name, and the output is the one a board has
+//! been wiring since this class was written, so the class declares
+//! [`gate::ENABLE_PIN`] alone rather than [`gate::ports`]. A board that wants
+//! `WWDGRST` modelled wires it to the machine's reset instead, and loses
+//! nothing by it: there is nothing in `CR`/`CFR` that only a peripheral reset
+//! can clear, `WDGA` included — [`Device::reset`] already takes that down.
+//!
 //! # The reset
 //!
 //! Expiry drives a **pulse on the `reset` pin**, from outside the state lock —
@@ -95,6 +121,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -207,10 +234,11 @@ impl State {
 
     /// PCLK1 cycles until that event.
     ///
-    /// `None` while the debug unit is holding the counter: a frozen watchdog
-    /// has no next event, so the scheduler stops coming back for it.
-    fn next_event(&self, frozen: bool) -> Option<u64> {
-        if frozen {
+    /// `None` while the counter is held: a watchdog that is not counting has
+    /// no next event. See [`Registers::stopped`] for the two things that hold
+    /// it — the debug unit's freeze, and the absence of PCLK1 itself.
+    fn next_event(&self, held: bool) -> Option<u64> {
+        if held {
             return None;
         }
         let decrements = self.decrements_to_event()?;
@@ -220,13 +248,13 @@ impl State {
 
     /// Advance `n` PCLK1 cycles.
     ///
-    /// `frozen` is the debug unit's `DBG_WWDG_STOP` reaching this block: the
-    /// tick still moves — the domain does not stop because one chip on it did
-    /// — but the counter does not.
-    fn step(&mut self, n: u64, frozen: bool) -> Outcome {
+    /// `held` is [`Registers::stopped`]: the tick still moves — the domain does
+    /// not stop because one chip on it did — but the counter does not, and
+    /// picks up from where it stood rather than catching up.
+    fn step(&mut self, n: u64, held: bool) -> Outcome {
         let end = self.tick + n;
         let mut out = Outcome::default();
-        if self.active && !frozen {
+        if self.active && !held {
             let divider = self.divider();
             let mut remaining = n;
             while remaining > 0 {
@@ -287,7 +315,13 @@ struct Registers {
     /// not take a lock.
     tick: AtomicU64,
     /// The absolute tick of the next event, or [`u64::MAX`] for none.
+    ///
+    /// Computed as though the peripheral clock were there, whatever the gate
+    /// says — see [`Registers::stopped`] and [`Device::next_event_tick`].
     next_event: AtomicU64,
+    /// `RCC_APB1ENR.WWDGEN`, as a board's wire delivers it. The reset half of
+    /// the gate has no pin here; the module documentation says why.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Registers {
@@ -309,7 +343,24 @@ impl Registers {
         self.frozen.load(Ordering::Acquire)
     }
 
+    /// Whether the counter is standing still, for either of the two reasons it
+    /// can be: the debug unit's `DBG_WWDG_STOP`, or no `RCC_APB1ENR.WWDGEN` to
+    /// count PCLK1 with ([`gate`](super::gate)).
+    ///
+    /// A gated watchdog therefore cannot count out, and cannot reset the board
+    /// — which is the whole of what removing its clock means.
+    fn stopped(&self) -> bool {
+        self.frozen() || !self.gate.clocked()
+    }
+
     /// Republish what the lock-free lazy surface reads.
+    ///
+    /// The instant is computed from [`Registers::frozen`] alone and not from
+    /// [`Registers::stopped`], deliberately: nothing republishes when an
+    /// `RCC_APB1ENR` bit moves, so the instant the counter was heading for is
+    /// kept — it is still the right one, the counter not having moved — and
+    /// [`Device::next_event_tick`] is what hides it from the scheduler while
+    /// the clock is off.
     fn publish(&self, state: &State) {
         self.tick.store(state.tick, Ordering::Relaxed);
         let at = match state.next_event(self.frozen()) {
@@ -358,11 +409,12 @@ impl Registers {
                     return;
                 }
                 let span = target - state.tick;
-                let step = state
-                    .next_event(self.frozen())
-                    .unwrap_or(span)
-                    .clamp(1, span);
-                let outcome = state.step(step, self.frozen());
+                // One step for the whole span when the counter is held, which
+                // is what keeps a long gated stretch from walking the loop once
+                // per decrement that is not happening.
+                let held = self.stopped();
+                let step = state.next_event(held).unwrap_or(span).clamp(1, span);
+                let outcome = state.step(step, held);
                 self.publish(&state);
                 (state.tick >= target, outcome)
             };
@@ -462,11 +514,30 @@ impl Registers {
     }
 }
 
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    // `gate_reset` keeps its default, which does nothing: this class declares
+    // no `reset` pin — the name belongs to the watchdog's own output — so
+    // nothing can drive the edge that would call it. The module documentation
+    // has the argument.
+}
+
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
         let [a, b, c, d] = dst else {
             return Err(BusError::BadAccess);
         };
+        if !self.gate.live() {
+            // No `RCC_APB1ENR.WWDGEN`: the block is not readable and zero is
+            // what the bus returns, for a debug read as much as for a guest
+            // one ([`gate`](super::gate)). Nothing is synced first — an
+            // unclocked watchdog has nothing to catch up on.
+            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            return Ok(());
+        }
         self.sync(attrs);
         // No register here clears on a read, so a debug read is the same read.
         let bytes = self.read_register(offset & !3).to_le_bytes();
@@ -483,6 +554,11 @@ impl MemOps for Registers {
             // about to be reset by, or reset the machine outright. There is no
             // harmless version (`ROADMAP.md` §15, invariant 5).
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: the write is lost, so it arms nothing and
+            // refreshes nothing.
+            return Ok(());
         }
         self.sync(attrs);
         let value = u32::from_le_bytes([*a, *b, *c, *d]);
@@ -542,6 +618,7 @@ impl Wwdg {
             lazy: Mutex::with_rank(LockRank::LEAF, None),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
+            gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "wwdg",
@@ -697,6 +774,12 @@ impl Device for Wwdg {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` only. `gate::sink` would also answer to `reset`, and on this
+        // device that name is the watchdog's own output — so it is offered the
+        // one port it may have, and never asked about the other.
+        if port == gate::ENABLE_PIN {
+            return gate::sink(&self.regs, port, sources);
+        }
         if port != "freeze" {
             return None;
         }
@@ -730,6 +813,13 @@ impl Device for Wwdg {
     }
 
     fn next_event_tick(&self) -> Option<u64> {
+        if !self.regs.gate.clocked() {
+            // Nothing to come back for: with `WWDGEN` clear the counter is not
+            // moving, so what `next_event` holds is not due — and it is still
+            // the right instant when the clock returns, because it was computed
+            // from a counter that has not moved (`Registers::publish`).
+            return None;
+        }
         match self.regs.next_event.load(Ordering::Relaxed) {
             u64::MAX => None,
             at => Some(at),
@@ -788,6 +878,9 @@ pub fn schema() -> ClassSchema {
         .port("reset", PortDir::Out)
         .port("ewi", PortDir::Out)
         .port("freeze", PortDir::In)
+        // `RCC_APB1ENR.WWDGEN`, and this half of the gate only: `gate::ports`
+        // would also declare `reset`, which is taken by the output above.
+        .port(gate::ENABLE_PIN, PortDir::In)
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,6 +1308,113 @@ mod tests {
         assert!(Device::region(&d, "").is_some());
         assert!(Device::region(&d, "regs").is_some());
         assert!(Device::region(&d, "counter").is_none());
+    }
+
+    // -- the clock gate (`super::super::gate`) -------------------------------
+
+    /// Draw the `enable` wire and hand back the source that drives it.
+    ///
+    /// Drawing it is the assertion that RCC owns this clock, so the watchdog
+    /// is unclocked from that moment until something sets the bit — which is
+    /// what `RCC_APB1ENR` reads out of reset.
+    fn draw_enable(d: &Wwdg) -> WireSource {
+        let ids = WireIdAllocator::new();
+        let id = ids.alloc();
+        let pin = Device::sink(d, gate::ENABLE_PIN, &[id]).expect("a WWDG has `enable`");
+        let wire = Wire::builder()
+            .source(id)
+            .sink(pin.sink, pin.line)
+            .build_shared();
+        WireSource::new(wire, id)
+    }
+
+    #[test]
+    fn a_gated_watchdog_reads_as_zero_and_drops_writes() {
+        // RM0090 §7.3.11: with `WWDGEN` clear the registers are not readable
+        // and an access to them is not effective.
+        let d = wwdg();
+        poke(&d, 0x04, CFR_EWI | 0x40); // a window, and the early wakeup
+        let enable = draw_enable(&d);
+
+        assert_eq!(peek(&d, 0x00), 0, "the whole block reads as zero");
+        assert_eq!(peek(&d, 0x04), 0);
+        assert_eq!(peek(&d, 0x08), 0);
+
+        poke(&d, 0x00, CR_WDGA | T_MASK);
+        assert!(!d.active(), "the write armed nothing");
+
+        // Removing a clock is not a reset: what was programmed is still there.
+        enable.set(Level::High);
+        assert_eq!(peek(&d, 0x04), CFR_EWI | 0x40);
+        assert_eq!(peek(&d, 0x00), T_MASK, "`WDGA` never got set");
+    }
+
+    #[test]
+    fn a_gated_watchdog_does_not_count_and_cannot_reset_the_board() {
+        // PCLK1 is the only clock this counter has, and `WWDGEN` is what
+        // gives it: with the bit clear there is nothing to count out on.
+        let d = wwdg();
+        let reset = watch(&d, "reset");
+        poke(&d, 0x00, CR_WDGA | T_MASK); // 64 decrements to the reset
+        let deadline = 64 * BASE_DIVIDER;
+
+        d.advance_to(deadline / 2);
+        let held = d.counter();
+        let enable = draw_enable(&d);
+        assert_eq!(
+            Device::next_event_tick(&d),
+            None,
+            "nothing for the scheduler to come back for"
+        );
+
+        // Well past the deadline, and the counter has not moved.
+        d.advance_to(deadline * 4);
+        assert_eq!(d.counter(), held, "an unclocked counter does not count");
+        assert_eq!(edges(&reset), 0, "and a board it cannot count out on");
+
+        enable.set(Level::High);
+        assert!(
+            Device::next_event_tick(&d).is_some(),
+            "and the scheduler is armed again"
+        );
+        // It picks up from where it stopped: the decrements it did not make
+        // while the clock was off are not owed to it.
+        d.advance_to(deadline * 4 + BASE_DIVIDER);
+        assert_eq!(d.counter(), held - 1, "one decrement, not thirty-two");
+        assert_eq!(edges(&reset), 0);
+        d.advance_to(deadline * 4 + (u64::from(held) - 0x3f) * BASE_DIVIDER);
+        assert_eq!(edges(&reset), 1, "and the rest of the countdown is exact");
+    }
+
+    #[test]
+    fn an_unwired_enable_leaves_the_watchdog_counting() {
+        // Every board written before the gate draws no wire, and none of them
+        // may stop watching because this landed.
+        let d = wwdg();
+        let reset = watch(&d, "reset");
+        poke(&d, 0x00, CR_WDGA | T_MASK);
+        d.advance_to(64 * BASE_DIVIDER);
+        assert_eq!(edges(&reset), 1);
+    }
+
+    #[test]
+    fn the_gate_takes_the_enable_pin_and_leaves_reset_to_the_output() {
+        // `APB1RSTR.WWDGRST` has no pin here: `reset` is already the name of
+        // the pulse this device drives at the board, and the two cannot share
+        // it. So the class declares `enable` alone.
+        let d = wwdg();
+        let schema = schema();
+        assert!(Device::sink(&d, gate::ENABLE_PIN, &[WireId::new(1)]).is_some());
+        assert!(schema.port_named(gate::ENABLE_PIN).is_some());
+        assert!(
+            Device::sink(&d, gate::RESET_PIN, &[WireId::new(2)]).is_none(),
+            "`reset` is an output, and a sink for it would shadow one"
+        );
+        assert!(Device::connect(&d, gate::RESET_PIN, dummy_source()).is_ok());
+        assert!(
+            Device::connect(&d, gate::ENABLE_PIN, dummy_source()).is_err(),
+            "and `enable` is an input, so it drives nothing"
+        );
     }
 
     /// A wire with one source, so a pin has something to drive.

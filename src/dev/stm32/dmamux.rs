@@ -169,6 +169,27 @@
 //! * **`DMAMUX2`**, the H7's second instance in front of the BDMA, is this
 //!   same class with a different `channels` and a different board table.
 //!
+//! # The clock gate
+//!
+//! Two inputs come from the reset and clock controller, as
+//! [`gate`] describes them: `enable` is this multiplexer's
+//! `RCC_AHB1ENR` clock-enable bit — `DMAMUX1EN`, whose position is
+//! part-specific, RM0432 §6.4.16 — and `reset` is `RCC_AHB1RSTR`'s
+//! `DMAMUX1RST` at the same place.
+//!
+//! ```text
+//! wire rcc.ahb1en2  -> dmamux.enable     # whatever the part's §6.4.16 says
+//! wire rcc.ahb1rst2 -> dmamux.reset
+//! ```
+//!
+//! An `enable` no board drew leaves the multiplexer clocked, so nothing
+//! written before the gate changes. While it is drawn and low the register
+//! block reads as zero and drops writes, and the routing stops with it: this
+//! is a synchronous block, so **an input that moves while the clock is off is
+//! not sampled** — no channel output changes, no synchronization credit is
+//! granted and no generator runs. `CxCR` and the credit a channel was holding
+//! survive, because removing a clock is not a reset.
+//!
 //! `no_std + alloc`, no `unsafe`, no dependencies.
 
 use alloc::boxed::Box;
@@ -186,6 +207,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema, port_index};
 
@@ -405,6 +427,9 @@ struct Shared {
     evt: [Mutex<Option<WireSource>>; MAX_CHANNELS],
     /// The single overrun interrupt.
     irq: Mutex<Option<WireSource>>,
+    /// `RCC_AHB1ENR`'s `DMAMUX1EN` and `RCC_AHB1RSTR`'s `DMAMUX1RST`, as a
+    /// board's wires deliver them.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Shared {
@@ -426,6 +451,7 @@ impl Shared {
             ch: core::array::from_fn(|_| Mutex::with_rank(LockRank::WIRE, None)),
             evt: core::array::from_fn(|_| Mutex::with_rank(LockRank::WIRE, None)),
             irq: Mutex::with_rank(LockRank::WIRE, None),
+            gate: ClockGate::new(),
         }
     }
 
@@ -726,12 +752,24 @@ impl Shared {
 
     // -- the inbound wires --------------------------------------------------
 
+    /// Whether the multiplexer is clocked, and so able to see an input at all.
+    ///
+    /// This is a synchronous block: `CxCR` decides what reaches which channel
+    /// on a clock edge, and with `DMAMUX1EN` clear there is no edge on which
+    /// to notice that an input moved ([`gate`](super::gate)). The level is not
+    /// recorded either — recording one the routing never acted on would leave
+    /// the state saying a line is high while every output says it is low.
+    fn sampling(&self) -> bool {
+        self.gate.live()
+    }
+
     /// Record a request line's new level and route it.
     fn set_request(&self, line: usize, level: Level) {
         let update = {
             let mut state = self.state.lock();
             let high = level == Level::High;
-            if line == 0 || line >= REQUEST_LINES || state.request[line] == high {
+            if line == 0 || line >= REQUEST_LINES || state.request[line] == high || !self.sampling()
+            {
                 return;
             }
             state.request[line] = high;
@@ -745,7 +783,7 @@ impl Shared {
         let update = {
             let mut state = self.state.lock();
             let high = level == Level::High;
-            if line >= SYNC_LINES || state.sync[line] == high {
+            if line >= SYNC_LINES || state.sync[line] == high || !self.sampling() {
                 return;
             }
             state.sync[line] = high;
@@ -759,7 +797,7 @@ impl Shared {
         let update = {
             let mut state = self.state.lock();
             let high = level == Level::High;
-            if line >= TRIGGER_LINES || state.trigger[line] == high {
+            if line >= TRIGGER_LINES || state.trigger[line] == high || !self.sampling() {
                 return;
             }
             state.trigger[line] = high;
@@ -773,6 +811,23 @@ impl Shared {
 // the MMIO face
 // ---------------------------------------------------------------------------
 
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_AHB1RSTR.DMAMUX1RST`: the register file, the credits and the
+        // remembered input levels go back to where a bus reset puts them,
+        // which is the same place.
+        *self.state.lock() = State::reset();
+        // Outside the critical section: a channel that was forwarding when the
+        // reset arrived has a wire still holding high until `refresh` says
+        // otherwise out loud.
+        self.refresh();
+    }
+}
+
 /// The register block, as something an address space dispatches to.
 #[derive(Debug)]
 struct Registers {
@@ -784,6 +839,13 @@ impl MemOps for Registers {
         let [a, b, c, d] = dst else {
             return Err(BusError::BadAccess);
         };
+        if !self.shared.gate.live() {
+            // No `DMAMUX1EN`, or `DMAMUX1RST` standing: the block is not
+            // readable and zero is what the bus returns, for a debug read as
+            // much as for a guest one ([`gate`](super::gate)).
+            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            return Ok(());
+        }
         // Nothing here has a read side effect — the overrun flags are cleared
         // through `CFR`/`RGCFR` — so a debug read is the same read
         // (`ROADMAP.md` §15, invariant 5).
@@ -801,6 +863,11 @@ impl MemOps for Registers {
             // seen, and one to `CxCR` would re-route a live request. Neither
             // can be made harmless, so it is refused rather than guessed at.
             return Err(BusError::BadAccess);
+        }
+        if !self.shared.gate.live() {
+            // Not effective: the write is lost, so it re-routes nothing and
+            // clears no overrun.
+            return Ok(());
         }
         let update = self
             .shared
@@ -985,11 +1052,9 @@ impl Device for Dmamux {
     }
 
     fn reset(&self, _kind: ResetKind) {
-        *self.shared.state.lock() = State::reset();
-        // Every output idles low, and `refresh` is what says so out loud —
-        // a channel that was forwarding when the reset arrived has a wire
-        // still holding high otherwise.
-        self.shared.refresh();
+        // A bus reset and `RCC_AHB1RSTR.DMAMUX1RST` put the same block back to
+        // the same place, so there is one implementation of it.
+        self.shared.gate_reset();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -1119,6 +1184,11 @@ impl Device for Dmamux {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset` first; `req{n}`, `sync{n}` and `trg{n}` are
+        // this device's own.
+        if let Some(pin) = gate::sink(&self.shared, port, sources) {
+            return Some(pin);
+        }
         let (bank, line) = self.input_index(port)?;
         let pin = Arc::new(InputPin {
             shared: Arc::clone(&self.shared),
@@ -1176,7 +1246,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// generators lives.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("channels", ValueKind::Uint).range(1, MAX_CHANNELS as u64))
         .region("")
         .region("regs")
@@ -1185,7 +1255,9 @@ pub fn schema() -> ClassSchema {
         .port_bank(pin::TRIGGER, PortDir::In, TRIGGER_LINES as u32)
         .port_bank(pin::CHANNEL, PortDir::Out, MAX_CHANNELS as u32)
         .port_bank(pin::EVENT, PortDir::Out, MAX_CHANNELS as u32)
-        .port(pin::IRQ, PortDir::Out)
+        .port(pin::IRQ, PortDir::Out);
+    // `RCC_AHB1ENR.DMAMUX1EN` and `RCC_AHB1RSTR.DMAMUX1RST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

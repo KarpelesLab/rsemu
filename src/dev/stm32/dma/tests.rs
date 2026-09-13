@@ -1175,3 +1175,159 @@ fn a_selected_request_survives_save_and_load() {
     );
     assert!(!restored.dma.shared.held[0][0].load(Ordering::SeqCst));
 }
+
+// ---------------------------------------------------------------------------
+// the clock gate (`super::super::gate`)
+// ---------------------------------------------------------------------------
+
+/// Draw one of the two gate wires and hand back the source that drives it.
+///
+/// Drawing `enable` is the assertion that RCC owns this clock, so the
+/// controller is unclocked from that moment until something sets the bit —
+/// which is what `RCC_AHB1ENR` reads out of reset.
+fn draw_gate(dma: &Dma, port: &str) -> WireSource {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let pin = Device::sink(dma, port, &[id]).expect("the gate offers this pin");
+    let wire = Wire::builder()
+        .source(id)
+        .sink(pin.sink, pin.line)
+        .build_shared();
+    WireSource::new(wire, id)
+}
+
+#[test]
+fn a_gated_controller_reads_as_zero_and_drops_writes() {
+    // RM0090 §7.3.12: with `DMAxEN` clear the registers are not readable and
+    // an access to them is not effective.
+    let rig = Rig::stream();
+    rig.poke(s_par(0), 0x4001_1004);
+    rig.poke(s_ndtr(0), 9);
+
+    let enable = draw_gate(&rig.dma, gate::ENABLE_PIN);
+    assert_eq!(rig.peek(s_par(0)), 0, "the whole block reads as zero");
+    assert_eq!(rig.peek(s_ndtr(0)), 0);
+    assert_eq!(rig.isr(), 0);
+
+    rig.poke(s_ndtr(0), 0x55);
+    rig.poke(s_cr(0), CR_EN);
+    assert!(!rig.dma.is_running(0), "the write armed nothing");
+
+    // Removing a clock is not a reset: what was programmed is still there.
+    enable.set(Level::High);
+    assert_eq!(rig.peek(s_par(0)), 0x4001_1004);
+    assert_eq!(
+        rig.peek(s_ndtr(0)),
+        9,
+        "the write was dropped, not the state"
+    );
+}
+
+#[test]
+fn a_gated_controller_moves_no_beat_and_resumes_mid_transfer() {
+    // A controller with no clock does not arbitrate, so a transfer stands at
+    // the beat it had reached and goes on from there rather than restarting.
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    let mem = RAM_BASE + 0x100;
+    rig.put(periph, Width::U8, 0x5a);
+    arm_p2m(&rig, periph, mem, 8, 0);
+
+    rig.dma.set_request(0, Level::High);
+    assert_eq!(rig.dma.pump(3), 3);
+    assert_eq!(rig.dma.remaining(0), 5);
+
+    let enable = draw_gate(&rig.dma, gate::ENABLE_PIN);
+    assert_eq!(rig.dma.pump(16), 0, "no clock, no beat");
+    assert_eq!(rig.dma.remaining(0), 5, "and `NDTR` is where it stopped");
+
+    enable.set(Level::High);
+    assert_eq!(rig.dma.pump(16), 5, "the remaining five, not all eight");
+    assert_eq!(rig.dma.remaining(0), 0);
+    assert_eq!(rig.byte(mem + 7), 0x5a);
+}
+
+#[test]
+fn a_request_pulsed_at_a_gated_controller_buys_no_later_beat() {
+    // The edge is the controller's to latch and there is no clock to latch it
+    // on; the *level* is the wire's, so a peripheral that holds its line is
+    // still heard when the clock comes back.
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    rig.put(periph, Width::U8, 0x5a);
+    arm_p2m(&rig, periph, RAM_BASE + 0x100, 8, 0);
+    let enable = draw_gate(&rig.dma, gate::ENABLE_PIN);
+
+    for _ in 0..4 {
+        rig.dma.set_request(0, Level::High);
+        rig.dma.set_request(0, Level::Low);
+    }
+    enable.set(Level::High);
+    assert_eq!(rig.dma.pump(16), 0, "four pulses into an unclocked latch");
+
+    rig.dma.set_request(0, Level::High);
+    assert_eq!(
+        rig.dma.pump(16),
+        8,
+        "a held line is served as it always was"
+    );
+}
+
+#[test]
+fn an_unwired_enable_leaves_the_controller_transferring() {
+    // Every board written before the gate draws no wire, and none of them may
+    // stop moving data because this landed.
+    let rig = Rig::channel();
+    let src = RAM_BASE;
+    let dst = RAM_BASE + 0x100;
+    rig.put(src, Width::U32, 0x1122_3344);
+    rig.poke(c_par(1), src as u32);
+    rig.poke(c_mar(1), dst as u32);
+    rig.poke(c_ndtr(1), 1);
+    rig.poke(c_cr(1), C_CR_MEM2MEM | CR_EN);
+    assert_eq!(rig.dma.pump(4), 1);
+}
+
+#[test]
+fn the_reset_pin_puts_the_register_file_back() {
+    // `RCC_AHB1RSTR.DMAxRST`, as a level: the block is deaf while it stands
+    // and comes back at its reset values when it is let go.
+    let rig = Rig::stream();
+    let periph = RAM_BASE + 0x20;
+    rig.put(periph, Width::U8, 0x5a);
+    arm_p2m(&rig, periph, RAM_BASE + 0x100, 8, 0);
+    rig.dma.set_request(0, Level::High);
+    assert_eq!(rig.dma.pump(2), 2);
+
+    let reset = draw_gate(&rig.dma, gate::RESET_PIN);
+    reset.set(Level::High);
+    assert_eq!(rig.peek(s_ndtr(0)), 0, "held in reset, the block is deaf");
+    rig.poke(s_ndtr(0), 4);
+    reset.set(Level::Low);
+    assert_eq!(
+        rig.peek(s_ndtr(0)),
+        0,
+        "and what it kept is the reset value"
+    );
+    assert_eq!(rig.peek(s_cr(0)) & CR_EN, 0);
+    assert!(!rig.dma.is_running(0));
+    // The latched request went with it, so nothing moves until a peripheral
+    // asks again.
+    assert_eq!(rig.dma.pump(4), 0);
+}
+
+#[test]
+fn the_gate_pins_are_in_the_schema() {
+    let dma = Dma::with_variant(Variant::Stream);
+    let schema = schema();
+    for pin in [gate::ENABLE_PIN, gate::RESET_PIN] {
+        assert!(
+            Device::sink(&dma, pin, &[WireId::new(1)]).is_some(),
+            "the device answers `{pin}`"
+        );
+        assert!(
+            schema.port_named(pin).is_some(),
+            "and the validator knows `{pin}`"
+        );
+    }
+}

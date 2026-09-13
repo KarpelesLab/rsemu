@@ -71,6 +71,31 @@
 //! through it, which is what one pin of real silicon is. `in{n}` stays for the
 //! older arrangement, where the two directions are two nets.
 //!
+//! # The clock
+//!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which
+//! is this port's `RCC_AHB1ENR` bit (bit 0 is `GPIOAEN`, bit 7 `GPIOHEN`, and
+//! an F429 runs to bit 10; RM0090 §7.3.10), and `reset`, which is the same bit
+//! of `RCC_AHB1RSTR`. A board draws them or it does not; an undrawn `enable`
+//! leaves the port clocked, so no board written before the gate existed
+//! changes behaviour. [`gate`](super::gate) has the rules.
+//!
+//! Only the **register block** is gated, and that is the whole of it: an
+//! unclocked port answers zero to every read of `MODER`…`AFRH` and drops every
+//! write, which is exactly the symptom a firmware that forgot its
+//! `RCC_AHB1ENR` write sees — a port that will not configure, rather than a
+//! HardFault that would have said why. The **pads** are wires rather than
+//! registers, and they do not move: an unclocked port cannot change what it
+//! drives, and nothing extra is needed to stop it, because the only routes to
+//! `ODR` and `MODER` are writes the gate has already dropped. Nor does what it
+//! drives evaporate — the output stage holds a configuration that was latched
+//! into it, and clock-gating a port that is already set up is something
+//! firmware does on purpose. An `af{n}` level still reaches the pad, for the
+//! same reason seen from the other side: that is the *other* peripheral's
+//! output crossing the mux, and whether it is clocked is its own gate's
+//! business. `GPIOxRST` is what puts the pads back, through the configuration
+//! registers it resets.
+//!
 //! What is **not** modelled: `AFR`'s *value*. Selecting AF7 rather than AF8 on
 //! a pin picks which peripheral of several the mux connects, and this model
 //! has one `af{n}` line rather than sixteen. The nibble is stored and reads
@@ -102,6 +127,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU32, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Drive, FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema, port_index};
 
@@ -281,6 +307,9 @@ struct Registers {
     pads: Pads,
     /// The sixteen pin outputs, connected at realize time.
     out: Mutex<[Option<WireSource>; PINS as usize]>,
+    /// This port's `RCC_AHB1ENR` and `RCC_AHB1RSTR` bits, as a board's wires
+    /// deliver them.
+    gate: ClockGate,
 }
 
 /// What is arriving on the pins from outside the port.
@@ -545,11 +574,37 @@ impl Registers {
     }
 }
 
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // This port's `RCC_AHB1RSTR` bit: the configuration registers go back
+        // to their reset values, `LCKR`'s lock included, exactly as at
+        // `Device::reset` — and the pads follow them, because a port reset to
+        // all-input is a port that has let go of its pins. The *pad* levels
+        // arriving from outside are untouched, for the reason `Device::reset`
+        // gives: they are other devices' state.
+        *self.state.lock() = State::reset(&self.reset_values);
+        self.refresh_pins();
+    }
+}
+
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
         let [a, b, c, d] = dst else {
             return Err(BusError::BadAccess);
         };
+        if !self.gate.live() {
+            // No `RCC_AHB1ENR` bit, or this port's `GPIOxRST` standing: the
+            // block is not readable and the value that comes back is zero
+            // ([`gate`](super::gate)), `IDR` included — there is no AHB1 clock
+            // to sample the pins into it with. A debug read sees the same
+            // nothing, because that is what the bus itself returns.
+            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            return Ok(());
+        }
         let (value, moved) = self.read_register(offset & !3, attrs.debug);
         let bytes = value.to_le_bytes();
         (*a, *b, *c, *d) = (bytes[0], bytes[1], bytes[2], bytes[3]);
@@ -569,6 +624,12 @@ impl MemOps for Registers {
             // harmless, so it is refused rather than guessed at
             // (`ROADMAP.md` §15, invariant 5).
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective: the write is lost, so `ODR` does not move and
+            // neither does any pad. `LCKR`'s key sequence does not advance
+            // either — an unclocked port has nothing to advance it with.
+            return Ok(());
         }
         let value = u32::from_le_bytes([*a, *b, *c, *d]);
         if self.write_register(offset & !3, value) {
@@ -629,6 +690,7 @@ impl Gpio {
             reset_values,
             pads: Pads::default(),
             out: Mutex::with_rank(LockRank::WIRE, [const { None }; PINS as usize]),
+            gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "gpio",
@@ -780,6 +842,9 @@ impl Device for Gpio {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        if let Some(pin) = gate::sink(&self.regs, port, sources) {
+            return Some(pin);
+        }
         let (n, kind) = match port_index(port, "in", PINS) {
             Some(n) => (n, PadKind::External),
             None => (port_index(port, "af", PINS)?, PadKind::Alternate),
@@ -841,7 +906,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `st.gpio`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("moder-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("ospeedr-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("pupdr-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
@@ -851,7 +916,9 @@ pub fn schema() -> ClassSchema {
         // port does not; `af{n}` is the peripheral the mux selects.
         .port_bank("p", PortDir::Out, PINS)
         .port_bank("in", PortDir::In, PINS)
-        .port_bank("af", PortDir::In, PINS)
+        .port_bank("af", PortDir::In, PINS);
+    // This port's `RCC_AHB1ENR` and `RCC_AHB1RSTR` bits.
+    gate::ports(schema)
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,6 +1229,105 @@ mod tests {
         );
     }
 
+    // -- the clock gate ----------------------------------------------------
+
+    #[test]
+    fn a_port_whose_clock_is_disabled_reads_as_zero_and_keeps_its_pins() {
+        // GitHub issue #14, and what `gate` exists for: with this port's
+        // `RCC_AHB1ENR` bit clear the block is not readable — every register
+        // answers zero — and a write to it is not effective, which is the
+        // firmware bug that looks like a port that will not configure.
+        let gpio = port();
+        let (wire, _other) = pin_on_a_resolved_net(&gpio, 5, Pull::Down);
+        as_output(&gpio, 5);
+        poke(&gpio, 0x18, 1 << 5);
+        assert_eq!(wire.resolve_net(), Level::High);
+
+        let id = WireId::new(1);
+        let pin = Device::sink(&gpio, gate::ENABLE_PIN, &[id]).expect("a port has `enable`");
+        // Drawing the wire is the assertion that the clock is RCC's to give,
+        // and an `xxENR` bit resets low.
+        assert_eq!(peek(&gpio, 0x00), 0, "the whole block reads as zero");
+        assert_eq!(peek(&gpio, 0x14), 0, "ODR");
+        assert_eq!(peek(&gpio, 0x10), 0, "IDR: nothing samples the pins now");
+        assert_eq!(peek_debug(&gpio, 0x14), 0, "and so does a debug read");
+        // The pad is a wire and not a register: it holds what the port was
+        // driving when the clock went away.
+        assert_eq!(wire.resolve_net(), Level::High, "the pad did not move");
+        poke(&gpio, 0x18, 1 << (5 + 16));
+        assert_eq!(
+            wire.resolve_net(),
+            Level::High,
+            "and the write that would have moved it was not effective"
+        );
+
+        pin.sink.set_level(id, 0, Level::High);
+        // The registers kept their values across the gating: removing a clock
+        // is not a reset, and `GPIOxRST` is the pin that resets.
+        assert_eq!(peek(&gpio, 0x14), 1 << 5);
+        assert_eq!(peek(&gpio, 0x00), MODE_OUTPUT << (5 * 2));
+        poke(&gpio, 0x18, 1 << (5 + 16));
+        assert_eq!(wire.resolve_net(), Level::Low, "and the clock is back");
+    }
+
+    #[test]
+    fn a_gated_port_still_lets_its_alternate_function_through() {
+        // The `af{n}` input is the *other* peripheral's output crossing the
+        // pad mux, and that peripheral has a gate of its own. A port whose
+        // `GPIOxEN` is clear holds the configuration it was given, so the
+        // alternate function keeps reaching the pin — which is what makes
+        // clock-gating an already-configured port the harmless saving
+        // firmware takes it for.
+        let gpio = port();
+        let (wire, _other) = pin_on_a_resolved_net(&gpio, 3, Pull::Down);
+        poke(&gpio, 0x00, MODE_ALTERNATE << (3 * 2));
+        let _enable = Device::sink(&gpio, gate::ENABLE_PIN, &[WireId::new(1)]);
+        let src = WireId::new(2);
+        let af = Device::sink(&gpio, "af3", &[src]).expect("af3");
+        af.sink.set_level(src, 0, Level::High);
+        assert_eq!(wire.resolve_net(), Level::High, "the mux is not clocked");
+        assert_eq!(
+            peek(&gpio, 0x10),
+            0,
+            "though `IDR` cannot be read to see it"
+        );
+    }
+
+    #[test]
+    fn an_unwired_enable_leaves_the_port_clocked() {
+        // Every board written before the gate existed draws no `enable` wire,
+        // and none of them may go deaf because this landed.
+        let gpio = port();
+        as_output(&gpio, 1);
+        poke(&gpio, 0x18, 1 << 1);
+        assert_eq!(peek(&gpio, 0x14), 1 << 1);
+    }
+
+    #[test]
+    fn the_reset_pin_puts_the_register_file_back_and_lets_go_of_the_pins() {
+        // This port's `RCC_AHB1RSTR` bit, as a level: the block is deaf while
+        // it stands and comes back at its reset values when it is let go.
+        let gpio = port();
+        let (wire, _other) = pin_on_a_resolved_net(&gpio, 8, Pull::Down);
+        as_output(&gpio, 8);
+        poke(&gpio, 0x18, 1 << 8);
+        assert_eq!(wire.resolve_net(), Level::High);
+
+        let id = WireId::new(2);
+        let pin = Device::sink(&gpio, gate::RESET_PIN, &[id]).expect("a port has `reset`");
+        pin.sink.set_level(id, 0, Level::High);
+        assert_eq!(peek(&gpio, 0x14), 0, "held in reset, the block is deaf");
+        assert_eq!(
+            wire.resolve_net(),
+            Level::Low,
+            "a port reset to all-input has let go of its pins"
+        );
+        poke(&gpio, 0x18, 1 << 8);
+        pin.sink.set_level(id, 0, Level::Low);
+        assert_eq!(peek(&gpio, 0x14), 0, "and what it kept is the reset value");
+        assert_eq!(peek(&gpio, 0x00), 0, "MODER included");
+    }
+
     #[test]
     fn only_a_full_word_is_a_legal_access() {
         let gpio = port();
@@ -1253,6 +1419,11 @@ mod tests {
             assert!(Device::sink(&gpio, &format!("af{n}"), &[src]).is_some());
         }
         assert!(schema.port_named("p16").is_none());
+        // And the two the clock gate brings.
+        for pin in [gate::ENABLE_PIN, gate::RESET_PIN] {
+            assert!(schema.port_named(pin).is_some());
+            assert!(Device::sink(&gpio, pin, &[src]).is_some());
+        }
         assert!(Device::region(&gpio, "").is_some());
         assert!(Device::region(&gpio, "regs").is_some());
         assert!(Device::region(&gpio, "pins").is_none());

@@ -193,6 +193,27 @@
 //!   and a burst's timing, and neither is visible to firmware that is not
 //!   measuring the bus.
 //! * **`DMEIF`, the direct-mode error.** Nothing raises it.
+//!
+//! # The clock gate
+//!
+//! Two inputs come from the reset and clock controller, as
+//! [`gate`] describes them: `enable` is this controller's
+//! `RCC_AHB1ENR` bit — bit 21 for `DMA1` and bit 22 for `DMA2` on an F4,
+//! RM0090 §7.3.12 — and `reset` is `RCC_AHB1RSTR`'s bit at the same position.
+//!
+//! ```text
+//! wire rcc.ahb1en21  -> dma1.enable
+//! wire rcc.ahb1rst21 -> dma1.reset
+//! ```
+//!
+//! An `enable` no board drew leaves the controller clocked, so every machine
+//! file written before the gate keeps working. While it is drawn and low the
+//! register block reads as zero and drops writes, and the engine stops with
+//! it: a controller with no clock **moves no beat and answers no request**,
+//! and a request pulse that arrives meanwhile is not latched, because there is
+//! no clock to latch it on. What a unit was part-way through — `NDTR`, the
+//! current addresses, the flags — is untouched and the transfer goes on from
+//! there, since removing a clock is not a reset.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -212,6 +233,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{DmaPeripheral, FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -548,6 +570,9 @@ struct Shared {
     irq: [Mutex<Option<WireSource>>; MAX_UNITS],
     /// The space this controller masters, weakly: the machine owns the space.
     bus: Mutex<Option<(Weak<AddressSpace>, RequesterId)>>,
+    /// `RCC_AHB1ENR`'s `DMAxEN` and `RCC_AHB1RSTR`'s `DMAxRST`, as a board's
+    /// wires deliver them.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Shared {
@@ -573,6 +598,7 @@ impl Shared {
             peer: core::array::from_fn(|_| Mutex::with_rank(LockRank::LEAF, None)),
             irq: core::array::from_fn(|_| Mutex::with_rank(LockRank::WIRE, None)),
             bus: Mutex::with_rank(LockRank::LEAF, None),
+            gate: ClockGate::new(),
         }
     }
 
@@ -711,8 +737,15 @@ impl Shared {
             return;
         }
         let high = level == Level::High;
+        // The *level* is the wire's and is recorded whatever the clock is
+        // doing: a peripheral that holds its line high is still holding it
+        // when the clock comes back, and forgetting that would leave it
+        // waiting for an edge it has no reason to send again.
         self.held[unit][slot].store(high, Ordering::SeqCst);
-        if high {
+        // The *edge* is this controller's to latch, and with no clock there is
+        // nothing to latch it on ([`gate`](super::gate)): a pulse that arrives
+        // while `DMAxEN` is clear buys no beat later.
+        if high && self.gate.live() {
             self.pending[unit][slot].store(true, Ordering::SeqCst);
         }
     }
@@ -1144,6 +1177,12 @@ impl Shared {
     /// release, touch the bus, retake the lock to commit, release, and only
     /// then drive a wire.
     fn step(&self, bus: &AddressSpace, attrs: MemAttrs) -> bool {
+        if !self.gate.live() {
+            // No `DMAxEN`, or `DMAxRST` standing: the engine has no clock to
+            // arbitrate or move a beat on. Every unit keeps `NDTR` and its
+            // current addresses, so the transfer resumes rather than restarts.
+            return false;
+        }
         let (cands, len) = {
             let state = self.state.lock();
             self.candidates(&state)
@@ -1263,6 +1302,28 @@ impl WireSink for RequestPin {
 // the MMIO face
 // ---------------------------------------------------------------------------
 
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_AHB1RSTR.DMAxRST`: the register file and the request latches go
+        // back to where a bus reset puts them, which is the same place.
+        *self.state.lock() = State::reset(self.variant);
+        for unit in 0..self.units {
+            for slot in 0..SLOTS {
+                self.held[unit][slot].store(false, Ordering::SeqCst);
+                self.pending[unit][slot].store(false, Ordering::SeqCst);
+            }
+        }
+        // Outside the critical section, as every wire change here is.
+        for unit in 0..self.units {
+            self.refresh_irq(unit);
+        }
+    }
+}
+
 /// The register block, as something an address space dispatches to.
 #[derive(Debug)]
 struct Registers {
@@ -1274,6 +1335,13 @@ impl MemOps for Registers {
         let [a, b, c, d] = dst else {
             return Err(BusError::BadAccess);
         };
+        if !self.shared.gate.live() {
+            // No `DMAxEN`, or `DMAxRST` standing: the block is not readable and
+            // zero is what the bus returns, for a debug read as much as for a
+            // guest one ([`gate`](super::gate)).
+            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            return Ok(());
+        }
         // Nothing here has a read side effect — the status registers are
         // cleared through `IFCR` and `NDTR` only counts down as beats move —
         // so a debug read is the same read (`ROADMAP.md` §15, invariant 5).
@@ -1291,6 +1359,11 @@ impl MemOps for Registers {
             // would drop an interrupt the guest has not seen. Neither can be
             // made harmless, so it is refused rather than guessed at.
             return Err(BusError::BadAccess);
+        }
+        if !self.shared.gate.live() {
+            // Not effective: the write is lost, so it arms no stream and
+            // clears no flag.
+            return Ok(());
         }
         let touched = self
             .shared
@@ -1479,16 +1552,9 @@ impl Device for Dma {
     }
 
     fn reset(&self, _kind: ResetKind) {
-        *self.shared.state.lock() = State::reset(self.shared.variant);
-        for unit in 0..self.shared.units {
-            for slot in 0..SLOTS {
-                self.shared.held[unit][slot].store(false, Ordering::SeqCst);
-                self.shared.pending[unit][slot].store(false, Ordering::SeqCst);
-            }
-        }
-        for unit in 0..self.shared.units {
-            self.shared.refresh_irq(unit);
-        }
+        // A bus reset and `RCC_AHB1RSTR.DMAxRST` put the same controller back
+        // to the same place, so there is one implementation of it.
+        self.shared.gate_reset();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -1582,6 +1648,11 @@ impl Device for Dma {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset` first; `req{n}` and `req{n}c{sel}` are this
+        // device's own.
+        if let Some(pin) = gate::sink(&self.shared, port, sources) {
+            return Some(pin);
+        }
         let (unit, slot) = self.req_pin(port)?;
         let pin = Arc::new(RequestPin {
             shared: Arc::clone(&self.shared),
@@ -1695,7 +1766,8 @@ pub fn schema() -> ClassSchema {
         // `variant` is a property.
         schema = schema.port_bank(format!("req{unit}c"), PortDir::In, MAX_SELECTORS as u32);
     }
-    schema
+    // `RCC_AHB1ENR.DMAxEN` and `RCC_AHB1RSTR.DMAxRST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

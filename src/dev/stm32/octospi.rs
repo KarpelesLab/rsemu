@@ -123,6 +123,25 @@
 //! the plainer reason that nothing in this tree is a DMA peer this peripheral
 //! could hand a burst to.
 //!
+//! # The clock gate
+//!
+//! Two *inputs* arrive from the reset and clock controller: `enable`, this
+//! instance's `RCC_AHB3ENR.OCTOSPIxEN` bit, and `reset`, the matching
+//! `RCC_AHB3RSTR.OCTOSPIxRST`. (AHB3 is where ST puts the memory interfaces on
+//! every family that has this block — RM0432 for the L4+; the bit *number*
+//! differs between them, so a board's machine file names it and this module
+//! does not.) A board draws the two wires or it does not; an undrawn `enable`
+//! leaves the peripheral clocked, so every machine file written before the
+//! gate keeps working. [`gate`](super::gate) has the rules and what a gated
+//! block does.
+//!
+//! Gating reaches **both** regions. The register block answers zero and drops
+//! writes, and the memory-mapped window stops decoding altogether — the same
+//! `Unassigned` a window nobody has armed gives, because a peripheral with no
+//! clock cannot clock a frame out of the flash to answer with. That is the
+//! half a register model alone would get wrong, and it is the half firmware
+//! notices: this is the region a CPU executes out of.
+//!
 //! # `MemAttrs::debug` and the window
 //!
 //! A debug read of the memory-mapped window is **refused**, and that is the
@@ -140,14 +159,15 @@ use alloc::sync::Arc;
 use core::fmt;
 
 use crate::bus::spi::{ChipSelect, Lines, Link, MAX_CHIP_SELECTS, SpiBus, buses};
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Level, WireId, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
@@ -550,6 +570,10 @@ struct Shared {
     irq: Mutex<Option<WireSource>>,
     /// The level it is being held at. An atomic so a debug read is free.
     irq_level: AtomicBool,
+    /// `RCC_AHB3ENR.OCTOSPIxEN` and `RCC_AHB3RSTR.OCTOSPIxRST`, as a board's
+    /// wires deliver them. Wiring rather than chip state, so it sits beside
+    /// the register file and not inside it.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Shared {
@@ -780,6 +804,7 @@ impl Octospi {
             window,
             irq: Mutex::with_rank(LockRank::WIRE, None),
             irq_level: AtomicBool::new(false),
+            gate: ClockGate::new(),
         });
         let regs: RegionRef = Arc::new(Region::io(
             "octospi",
@@ -830,6 +855,29 @@ impl Octospi {
     #[must_use]
     pub fn irq_asserted(&self) -> bool {
         self.shared.irq_level.load(Ordering::Relaxed)
+    }
+}
+
+impl Gated for Shared {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_AHB3RSTR.OCTOSPIxRST`: the register file goes back to its reset
+        // values, which is what `Device::reset` does to it — chip select
+        // included, because a block held in reset is not still holding a part
+        // selected halfway through an indirect transfer.
+        let was_open = {
+            let mut state = self.state.lock();
+            let open = state.open;
+            *state = State::default();
+            open
+        };
+        if was_open {
+            self.close();
+        }
+        self.publish_irq();
     }
 }
 
@@ -1087,6 +1135,15 @@ impl MemOps for RegisterBlock {
         if within + dst.len() as u64 > 4 {
             return Err(BusError::BadAccess);
         }
+        if !self.shared.gate.live() {
+            // No `OCTOSPIxEN`, or `OCTOSPIxRST` standing: the block is not
+            // readable and what comes back is zero ([`gate`](super::gate)). A
+            // debug read sees the same nothing, because that is what the bus
+            // itself returns — and a gated `DR` clocks no byte out of the
+            // flash either way.
+            dst.fill(0);
+            return Ok(());
+        }
         if register == 0x050 {
             let result = self.read_data(dst, attrs);
             if !attrs.debug {
@@ -1114,6 +1171,11 @@ impl MemOps for RegisterBlock {
             // A debug write would start a transaction or push a byte into a
             // flash, neither of which the core can make harmless.
             return Err(BusError::BadAccess);
+        }
+        if !self.shared.gate.live() {
+            // Not effective: the write is lost, so it opens no transaction and
+            // pushes nothing into the flash.
+            return Ok(());
         }
         if register == 0x050 {
             return self.write_data(src);
@@ -1304,6 +1366,14 @@ impl MappedWindow {
     /// Whether the peripheral is in a position to answer, and the command to
     /// answer with.
     fn armed(&self, writing: bool) -> Option<Command> {
+        if !self.shared.gate.live() {
+            // A peripheral with no clock decodes nothing: it could not clock a
+            // frame out of the flash to answer with, and the aperture is not a
+            // register block whose "reads as zero" rule could stand in for
+            // that. The caller turns this into `Unassigned`, which is what a
+            // window nobody armed already gives.
+            return None;
+        }
         let state = self.shared.state.lock();
         if state.cr & CR_EN == 0 || state.fmode() != FMODE_MAPPED || state.open {
             return None;
@@ -1396,6 +1466,12 @@ impl Device for Octospi {
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
         // Nothing outward: `map` statements place both regions.
         Ok(())
+    }
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`, and an OCTOSPI has no other input: its data
+        // path is a bus rather than a pin.
+        gate::sink(&self.shared, port, sources)
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
@@ -1641,7 +1717,7 @@ pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()>
 /// What the validator should know about `stm32.octospi`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(
             PropSchema::new("link", ValueKind::Str)
                 .required()
@@ -1654,7 +1730,9 @@ pub fn schema() -> ClassSchema {
         .region("")
         .region("regs")
         .region("mem")
-        .region("flash")
+        .region("flash");
+    // `RCC_AHB3ENR.OCTOSPIxEN` and `RCC_AHB3RSTR.OCTOSPIxRST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]

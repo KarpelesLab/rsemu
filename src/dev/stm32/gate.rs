@@ -74,6 +74,21 @@
 //! RM0351 §6.4.16) and its level is inside that device's snapshot for a
 //! reason of its own. The design is the same one; only the spelling differs.
 //!
+//! # What is not settled: a gated peripheral's level outputs
+//!
+//! An `irq` line or a DMA request is a level the peripheral drives, and no
+//! manual says what becomes of one when the clock stops. A block with no clock
+//! cannot change a flip-flop, which argues for the line holding what it had; a
+//! request line stuck high at a controller that *is* clocked drains a stream
+//! into a peripheral that is switched off, which argues for dropping it.
+//!
+//! Today most devices hold, and [`sdio`](super::sdio), [`sdmmc`](super::sdmmc)
+//! and [`hash`](super::hash) drop `irq`/`dma` on their first gated access.
+//! Making that uniform wants a notification on the `enable` pin's edge —
+//! [`ClockGate`] has none, because a level that has been *stored* is all
+//! [`ClockGate::clocked`] needs, and the day a device must act on the change
+//! is the day to add it.
+//!
 //! # Why the level is not serialized
 //!
 //! A [`ClockGate`] holds a level a *sibling* drives, and the usual rule for
