@@ -64,7 +64,17 @@ RUN OPTIONS:
     --initrd <file>     Bind the `initrd` media slot: a ramdisk staged in
                         guest RAM, which the generated device tree then points
                         the kernel at
-    --media <n>=<file>  Bind any media slot by name
+    --media <n>=<file>  Bind any media slot by name. A plain path is read as a
+                        file; a source that needs decoding on the way in is
+                        named with a scheme:
+                          kickstart:<file>            an Amiga Kickstart ROM,
+                            plain or AMIROMTYPE1-keyed. A keyed image is
+                            decoded with the `rom.key` beside it, or with
+                            `,key=<file>`. The checksum is verified.
+                          kickstart:<dvd.iso>,rom=<name>
+                            the same, straight out of an Amiga Forever disc
+                            image, key included, nothing extracted by hand.
+                            Omit `rom=` to be told which ROMs it holds.
     --drive <n>=<file>[,<opt>…]
                         Back a media slot with the image *file* rather than a
                         copy of its bytes: the guest's writes go to the file,
@@ -458,13 +468,25 @@ fn run(args: &[String]) -> ExitCode {
     };
 
     // Read every image before building anything, so a typo'd path fails before
-    // a machine is half assembled.
+    // a machine is half assembled. A plain path is a file, which is what a
+    // media specification has always been; `host::media` is what lets one name
+    // a source that needs decoding on the way in, such as a keyed Amiga
+    // Kickstart or one still inside its DVD image.
     let mut images: Vec<(String, Vec<u8>)> = Vec::new();
     for (slot, path) in &parsed.media {
-        match std::fs::read(path) {
-            Ok(bytes) => images.push((slot.clone(), bytes)),
+        match rsemu::host::media::read(path) {
+            Ok(loaded) => {
+                // A source with something to report says it once, naming the
+                // slot: what was decoded is not visible anywhere else, and
+                // "checksum verified" is the sentence the user asked for by
+                // pointing at a container in the first place.
+                if let Some(note) = loaded.note {
+                    eprintln!("rsemu: {slot}: {note}");
+                }
+                images.push((slot.clone(), loaded.bytes));
+            }
             Err(e) => {
-                eprintln!("rsemu: cannot read {path}: {e}");
+                eprintln!("rsemu: {e}");
                 return ExitCode::FAILURE;
             }
         }

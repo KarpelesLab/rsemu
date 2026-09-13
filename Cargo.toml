@@ -2202,6 +2202,40 @@ dev-medium = []
 # `--all-features` build through `caseless -> unicode-normalization`.
 dev-blk = ["std", "dev-medium", "dep:fstool"]
 
+# Amiga Kickstart ROMs as a **media source** (src/host/media/kickstart.rs):
+# `--media firmware=kickstart:<file>` decodes what the user already owns and
+# binds the plain bytes to a media slot, so nothing below `host/` learns a new
+# type and no device learns a container format.
+#
+# Three things, all of which a user's own Amiga Forever installation needs:
+#
+#   * **The ROM header and its checksum.** A Kickstart is a 32-bit
+#     one's-complement sum with end-around carry over every big-endian longword,
+#     and a good image sums to $FFFFFFFF. A ROM that fails it is refused, loudly,
+#     rather than left to misbehave on a board later. The footer's size longword
+#     is what says whether there is a checksum at all, which is the only rule
+#     that holds across Cloanto's set -- expansion and bootstrap ROMs share the
+#     `.rom` extension and carry no footer.
+#   * **`AMIROMTYPE1`.** Cloanto's keyed container: eleven ASCII bytes then the
+#     image XORed with a cycling `rom.key`. The key is the user's, found beside
+#     the ROM or named with `,key=<file>`. rsemu never carries one, never caches
+#     a decoded image, and never copies either anywhere.
+#   * **The DVD image.** `,rom=<name>` reads straight out of an Amiga Forever
+#     disc through `fstool`'s ISO 9660 module, key included, with nothing
+#     extracted by hand first. That is the whole reason this pulls `fstool`:
+#     the flagship case is a 1.7 GB ISO that must not be read into memory to
+#     find one 512 KiB file inside it.
+#
+# Written from the Amiga Hardware Reference Manual (Commodore-Amiga), Cloanto's
+# published description of the format, and ECMA-119 for where `CD001` sits. No
+# Amiga emulator source was opened: WinUAE, FS-UAE, UAE, vAmiga and Hatari are
+# GPL, and AROS is weak-copyleft MPL-derived -- a binary we run, never a source
+# we read (ROADMAP.md §1).
+#
+# Adds `fstool` (Karpelès Lab, MIT -- permitted, and already what `dev-blk`
+# uses), and `std`, because reading a file is the point.
+media-kickstart = ["std", "dep:fstool"]
+
 # The PC/AT's IDE interface (src/dev/pc/ide.rs): one channel, which is address
 # decode and nothing else. The command block (0x1f0/0x170) and the control
 # block (0x3f6/0x376) as two separate regions, because the AT decodes them at
