@@ -8,12 +8,14 @@
 //! | [`custom`] | the register window at `$DFF000`, the appendix's table, and the subscription seam a chip attaches through |
 //! | [`gary`] | the `OVL` overlay — whether the Kickstart ROM or chip RAM answers at address zero |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
+//! | `agnus` | `dev-amiga-agnus`: Agnus — the beam counters and sync, `DMACON`, the copper, the blitter, and every DMA transfer |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
 //! | [`floppy`] | `dev-amiga-floppy`: a floppy drive — the mechanism on the CIA ports, raw MFM cells for Paula |
 //! | `denise` | `dev-amiga-denise`: Denise — the colour table, playfields, sprites and collisions, driven a line at a time by whatever counts the beam |
 //!
 //! plus [`regs`], which is Appendix B of the hardware manual as data and is
-//! what makes the first of those a decode rather than three scattered ones.
+//! what makes the first of those a decode rather than three scattered ones, and
+//! [`dma`], the lock-free half of Agnus's chip-RAM DMA.
 //!
 //! # The map
 //!
@@ -40,11 +42,12 @@
 //!
 //! # What is here and what is not
 //!
-//! Deliberately absent from this module: Agnus. Denise is `dev-amiga-denise`.
-//! The 8520s are `mos.8520` in [`dev::mos`](crate::dev::mos). The custom register space answers and counts
-//! what it could not route ([`custom::CustomBus::unclaimed`]), which is a
-//! measurement of how much chipset is still missing rather than a pretence that
-//! none is.
+//! Deliberately absent from this module: the floppy's disk images, the serial
+//! port's host end and the video output's, which are host adapters. The 8520s
+//! are `mos.8520` in [`dev::mos`](crate::dev::mos). The custom register space
+//! answers and counts what it could not route
+//! ([`custom::CustomBus::unclaimed`]), which is a measurement of how much
+//! chipset is still missing rather than a pretence that none is.
 //!
 //! # Provenance
 //!
@@ -55,11 +58,15 @@
 //! every one the author is aware of (UAE and its descendants, vAmiga) is GPL,
 //! and AROS is MPL-derived weak copyleft. `ROADMAP.md` §1.
 
+#[cfg(feature = "dev-amiga-agnus")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-agnus")))]
+pub mod agnus;
 pub mod cia_decode;
 pub mod custom;
 #[cfg(feature = "dev-amiga-denise")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-denise")))]
 pub mod denise;
+pub mod dma;
 pub mod gary;
 pub mod regs;
 
@@ -88,6 +95,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     paula::register(registry)?;
     #[cfg(feature = "dev-amiga-floppy")]
     floppy::register(registry)?;
+    #[cfg(feature = "dev-amiga-agnus")]
+    agnus::register(registry)?;
     Ok(())
 }
 
@@ -106,6 +115,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     paula::bind(bindings)?;
     #[cfg(feature = "dev-amiga-floppy")]
     floppy::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-agnus")]
+    agnus::bind(bindings)?;
     Ok(())
 }
 
@@ -120,5 +131,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     schemas.push(floppy::schema());
     #[cfg(feature = "dev-amiga-denise")]
     schemas.push(denise::schema());
+    #[cfg(feature = "dev-amiga-agnus")]
+    schemas.push(agnus::schema());
     schemas
 }

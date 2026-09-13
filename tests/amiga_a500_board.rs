@@ -44,9 +44,7 @@ const CUSTOM: u64 = 0xDF_F000;
 /// `COLOR00`, at offset `$180` — a Denise register, write-only.
 const COLOR00: u64 = CUSTOM + 0x180;
 
-/// `JOY0DAT`, at offset `$00A` — readable, and owned by Denise alone, so on a
-/// board without Denise it is the clearest thing to point at when asking what a
-/// read with nothing attached does.
+/// `JOY0DAT`, at offset `$00A` — readable, and owned by Denise alone.
 const JOY0DAT: u64 = CUSTOM + 0x00A;
 
 /// `DMACONR`, at offset `$002` — readable, owned by Agnus and Paula together.
@@ -215,6 +213,8 @@ fn the_board_realizes_with_every_object_the_map_needs() {
         "cia_b_decode",
         "paula",
         "df0",
+        "agnus",
+        "denise",
     ] {
         assert!(
             m.device(path).is_some(),
@@ -248,11 +248,8 @@ fn the_firmware_runs_out_of_the_overlay_and_reaches_the_custom_chip_space() {
 
     let bus = custom_bus(&m);
 
-    // The word reached the register space in the right byte order. Nothing is
-    // subscribed to Denise's half of the table, so the write was not claimed —
-    // which is the placeholder state this board is in and is worth asserting
-    // rather than glossing: when Denise lands, this count goes to zero and the
-    // colour ends up in a palette entry instead.
+    // The word reached the register space in the right byte order, and with
+    // Denise on the board it was claimed: nothing on this board falls through.
     assert_eq!(
         bus.floating(),
         COLOUR,
@@ -261,8 +258,8 @@ fn the_firmware_runs_out_of_the_overlay_and_reaches_the_custom_chip_space() {
     );
     assert_eq!(
         bus.unclaimed(),
-        1,
-        "exactly one access, and nothing owns COLOR00 in this build"
+        0,
+        "COLOR00 is Denise's, and Denise is on the board"
     );
 }
 
@@ -277,12 +274,14 @@ fn the_custom_space_decodes_words_and_refuses_everything_else() {
     poke_word(&m, COLOR00, 0x0123);
     assert_eq!(peek_word(&m, COLOR00), 0x0123);
 
-    // A readable register whose owner is not in this build answers the same
-    // way rather than inventing a value.
-    assert_eq!(peek_word(&m, JOY0DAT), 0x0123);
+    // An offset the appendix leaves empty answers the same way rather than
+    // inventing a value.
+    assert_eq!(peek_word(&m, CUSTOM + 0x068), 0x0123);
 
-    // One owned by two chips, of which only Paula is here: Paula answers, and
-    // drives none of `DMACONR`'s bits — they are Agnus's.
+    // A readable register with its owner present answers from the chip:
+    // Denise's `JOY0DAT` with no mouse moved, and `DMACONR`, which Agnus and
+    // Paula share and whose every bit is Agnus's, with no channel enabled.
+    assert_eq!(peek_word(&m, JOY0DAT), 0x0000);
     assert_eq!(peek_word(&m, DMACONR), 0x0000);
 
     // The appendix's registers are words. A byte access has no documented
@@ -298,14 +297,14 @@ fn the_custom_space_decodes_words_and_refuses_everything_else() {
         "an unaligned word read should be refused"
     );
 
-    // The appendix's table stops at $1E4 and the board maps 512 bytes, so
-    // $DFF200 is off the end of the window and the space's `fault` policy
-    // applies.
+    // The appendix's table stops at $1FE and the board maps 512 bytes, so
+    // $DFF200 is off the end of the window. On an A500 an empty address
+    // completes and floats (Appendix K), so it is not an error either.
     assert!(
         space
             .read(CUSTOM + 0x200, Width::U16, MemAttrs::DEFAULT)
-            .is_err(),
-        "the board maps only the 512 bytes the appendix documents"
+            .is_ok(),
+        "past the 512 bytes the appendix documents, the bus floats"
     );
 }
 

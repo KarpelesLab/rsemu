@@ -2616,16 +2616,39 @@ dev-amiga-floppy = ["dev-amiga-paula"]
 # dependencies.
 dev-amiga-denise = ["dev-amiga"]
 
+# Agnus (src/dev/amiga/agnus): the chip an Amiga's timing hangs off.
+# `amiga.agnus` is a lazily-advanced device on the colour clock (`clk / 8` of an
+# A500 crystal), one tick per horizontal count, so the beam counters -- PAL and
+# NTSC line counts, long and short fields under `LACE`, NTSC's alternating line
+# lengths, VPOSR/VHPOSR and their write twins -- are counted rather than derived
+# from a duration, and every rate beside them is an exact integer ratio. It
+# drives `vsync` and `hsync` pins for the CIAs' TOD inputs, implements
+# DMACON/DMACONR, runs the copper (MOVE through the custom bus with the
+# copper's own origin, WAIT with its masks and BFD, SKIP, the field restart)
+# and the blitter (all four channels, masks, shifters, minterms, descending
+# mode, both area fills, the zero flag, the D pipeline, line mode, the speed
+# table's timing, and the ECS big-blit registers), and does every DMA
+# transfer: Denise's bitplane lines and fields pushed through its video handle
+# and its sprite words written through the bus, Paula's disk and audio slots
+# served through its port every line, VERTB and BLIT raised in Paula. Implies
+# `dev-amiga-paula` and `dev-amiga-denise`, whose handles it drives -- both
+# links are optional on the board, but the types are not. Written from the
+# Amiga Hardware Reference Manual; no emulator source was consulted. Adds no
+# dependencies and is `no_std + alloc`.
+dev-amiga-agnus = ["dev-amiga", "dev-amiga-paula", "dev-amiga-denise"]
+
 # The `amiga-a500` board (machines/amiga-a500.machine plus the classes it
 # names): a big-endian 24-bit space, chip RAM at zero behind the `OVL`
 # overlay, the custom chip registers at $DFF000, and a 512 KiB Kickstart socket
 # at the top of the space. `-p chip-ram=1M` gives the trapdoor-expanded
 # machine. The two 8520 CIAs are on it at $BFE001 and $BFD000, each on its own
-# byte lane, clocked by the E clock, with CIA-A's PA0 driving the overlay, and
-# Paula is on it, carrying both CIAs' interrupts onto the 68000's IPL pins and
-# the UART onto the host port `serial`. It boots a synthetic ROM and stops
-# there: Agnus and Denise are still to come. Adds no dependencies.
-machine-amiga-a500 = ["cpu-m68k", "dev-amiga-floppy", "dev-mos8520"]
+# byte lane, clocked by the E clock, with CIA-A's PA0 driving the overlay.
+# Paula carries both CIAs' interrupts onto the 68000's IPL pins and the UART
+# onto the host port `serial`; Agnus counts the beam on the colour clock, feeds
+# the CIAs' TOD inputs, runs the copper and blitter and does every DMA
+# transfer; Denise turns the lines Agnus hands it into a picture. It boots a
+# synthetic ROM. Adds no dependencies.
+machine-amiga-a500 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-mos8520"]
 
 # The network seam (src/dev/net/link.rs): what a NIC model is attached to --
 # frames out, frames in **against a virtual tick**, carrier, and a station

@@ -238,6 +238,20 @@ impl ExportId {
     /// two classes, so it travels as `Opaque`.
     pub const AMIGA_VIDEO: ExportId = ExportId(8);
 
+    /// Amiga chip-RAM direct memory access as Agnus sees it: chip RAM,
+    /// `DMACON`, the disk and audio pointers and the beam position. Transported
+    /// as [`Export::Opaque`].
+    ///
+    /// Every DMA pointer on an Amiga is an Agnus register and `DMACON` gates
+    /// every channel. `amiga.agnus` keeps that state where it can be reached
+    /// without its own lock, and publishes it for a test or a monitor to look
+    /// at. Like [`CUSTOM_BUS`](ExportId::CUSTOM_BUS), the handle's type is a
+    /// contract among the Amiga classes.
+    ///
+    /// Nine: seven is Paula's seam and eight Denise's line input, both
+    /// allocated on branches of their own in the same round.
+    pub const CHIP_DMA: ExportId = ExportId(9);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -253,6 +267,7 @@ impl ExportId {
             ExportId::CUSTOM_BUS => Some("custom-chip register bus"),
             ExportId::PAULA => Some("Paula's DMA and disk seam"),
             ExportId::AMIGA_VIDEO => Some("Amiga video line input"),
+            ExportId::CHIP_DMA => Some("chip-RAM DMA"),
             _ => None,
         }
     }

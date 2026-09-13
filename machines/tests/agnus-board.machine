@@ -1,0 +1,82 @@
+# agnus-board - an A500's map with Agnus and the two CIAs in it, and nothing
+# of Denise or Paula.
+#
+# Not in the catalog: `machines/tests/` is where a board that exists for one
+# test lives. `tests/agnus_board.rs` runs it by path. It is the A500's own map,
+# written out again rather than borrowed, because `machines/amiga-a500.machine`
+# is being grown in parallel by the Paula work and this board has to prove Agnus
+# without depending on that file's state on any given day.
+#
+# ---------------------------------------------------------------------------
+# What it proves
+# ---------------------------------------------------------------------------
+#
+# * **The clock.** Agnus counts the colour clock, one tick per horizontal beam
+#   count, and on a PAL A500 that is the 28 375 160 Hz crystal over eight:
+#   3 546 895 Hz, the figure chapter 2 of the Hardware Reference Manual gives
+#   for "one horizontal count". The processor is the same crystal over four and
+#   the CIAs' E clock the crystal over forty, so every rate on the board is an
+#   integer ratio of every other.
+# * **The sync wires.** The 8520 appendix says CIA-A's TOD input counts "VSync
+#   or line tick" and CIA-B's counts horizontal sync. Here that is literally
+#   two `wire` statements, and every field must be one count on the first
+#   counter and every line one count on the second - 49.92 and 15 625.3 a
+#   second on PAL.
+# * **The copper and the blitter through the bus**, writing and reading chip RAM
+#   the processor wrote, with `DMACONR` and `VHPOSR` read back at $DFF000.
+#
+# ---------------------------------------------------------------------------
+# What the A500 needs from this file
+# ---------------------------------------------------------------------------
+#
+# The `agnus` object and the two sync wires, exactly as below. `clock = clk / 8`
+# only if the board's oscillator is the crystal; the A500 file's is.
+
+machine "agnus-board" {
+  param chip-ram       = 512K
+  param kickstart-size = 512K
+  param rom-base       = 0xF80000
+
+  osc   clk = 28375160 Hz
+
+  space mem { width = 24, endian = "big" }
+
+  object cpu "cpu.m68k" {
+    clock  = clk / 4
+    space  = mem
+    engine = "interp"
+  }
+
+  object chipram "ram" { size = chip-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+  object custom  "amiga.custom" { }
+
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+  }
+
+  object gary "amiga.gary" {
+    space = mem
+    rom   = kick
+    ram   = chipram
+    size  = chip-ram
+  }
+
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  map mem 0x000000 size chip-ram       = gary.overlay { endian = "big" }
+  map mem 0xBFD000 size 0x1000         = cia_b_decode { endian = "big" }
+  map mem 0xBFE000 size 0x1000         = cia_a_decode { endian = "big" }
+  map mem 0xDFF000 size 0x200          = custom
+  map mem rom-base size kickstart-size = kick         { endian = "big" }
+
+  wire cia_a.pa0    -> gary.ovl
+  wire agnus.vsync  -> cia_a.tod
+  wire agnus.hsync  -> cia_b.tod
+}

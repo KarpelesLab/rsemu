@@ -399,20 +399,33 @@ impl CustomBus {
     /// Write the word register at `offset`.
     ///
     /// Returns whether anything took it: `false` for an unclaimed offset, a
-    /// read-only register, a copper write the `*`/`~` columns refuse, or a
-    /// register whose chip this build does not have.
+    /// read-only register, a copper write the `*`/`~` columns refuse, a
+    /// register whose chip this build does not have, or `NO-OP` — the one of
+    /// those that is not counted as unclaimed.
     pub fn write(&self, offset: u16, value: u16, from: Origin) -> bool {
         // The data bus carries the word whether or not anything latches it,
         // which is the half of the floating-word model that is not a guess.
         if !from.debug {
             self.floating.store(u64::from(value), Ordering::Relaxed);
         }
-        let Some(reg) = regs::lookup(offset).filter(|r| r.writable()) else {
+        let Some(reg) = regs::lookup(offset) else {
             if !from.debug {
                 self.unclaimed.fetch_add(1, Ordering::Relaxed);
             }
             return false;
         };
+        if reg.no_op() {
+            // `NO-OP(NULL)` at `$1FE`: the appendix's own name for an address a
+            // write reaches and nothing latches. Not a missing chip, so not
+            // counted.
+            return false;
+        }
+        if !reg.writable() {
+            if !from.debug {
+                self.unclaimed.fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
+        }
         if let Driver::Copper { danger } = from.driver
             && !copper_may_write(reg.access, danger)
         {
@@ -749,11 +762,24 @@ mod tests {
         let c = custom();
         assert!(!c.bus().write(COLOR00, 0x0abc, Origin::cpu()));
         assert_eq!(c.bus().read(COLOR00, Origin::cpu()), 0x0abc);
-        // An offset the appendix leaves blank, and `$1FE`, which it does not
-        // list either.
+        // An offset the appendix leaves blank, and `$1FE`, which it lists as
+        // `NO-OP` with no access letter: neither is readable.
         assert_eq!(c.bus().read(0x068, Origin::cpu()), 0x0abc);
         assert_eq!(c.bus().read(0x1fe, Origin::cpu()), 0x0abc);
         assert_eq!(c.bus().unclaimed(), 4);
+    }
+
+    #[test]
+    fn a_write_to_no_op_is_dropped_and_not_counted() {
+        // The copper's padding address. A board with every chip present and a
+        // copper list that pads with it must still read zero unclaimed.
+        let c = custom();
+        c.bus().attach(Probe::new(ChipId::AGNUS, 0)).unwrap();
+        assert!(!c.bus().write(0x1fe, 0x0000, Origin::copper(false)));
+        assert!(!c.bus().write(0x1fe, 0x1234, Origin::cpu()));
+        assert_eq!(c.bus().unclaimed(), 0);
+        assert_eq!(c.bus().refused_copper_writes(), 0);
+        assert_eq!(c.bus().floating(), 0x1234, "the word was still on the bus");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# amiga-a500 - a Commodore Amiga 500's memory map.
+# amiga-a500 - a Commodore Amiga 500: the map, both CIAs and the chipset.
 #
 #   rsemu run amiga-a500 --media kickstart=kick.rom
 #   rsemu run amiga-a500 -p chip-ram=1M --media kickstart=kick.rom
@@ -9,11 +9,11 @@
 # otherwise.
 #
 # And the two 8520 CIAs, decoded where Appendix F puts them, with CIA-A's PA0
-# driving the overlay; and Paula, through which every interrupt reaches the
-# processor. Agnus and Denise are not in this build, so a real Kickstart will
-# not get far: it will find its reset vector, run, and then wait forever on a
-# chipset that is not all there. `custom` counts every access it could not
-# route so how far away the chipset is can be measured rather than guessed.
+# driving the overlay; Paula, through which every interrupt reaches the
+# processor; Agnus, which counts the beam, runs the copper and the blitter and
+# makes every DMA transfer; and Denise, which turns the lines Agnus hands it
+# into a picture. `custom` counts every access it could not route, which on
+# this board should be none that reach a chip register.
 #
 # Written from the Amiga Hardware Reference Manual (Commodore-Amiga Inc., 3rd
 # edition): Appendix D for the address map, Appendix B for the register table.
@@ -53,15 +53,15 @@
 # parity the lane is decided by.
 #
 # The clock is the 68000's E clock, one tenth of the processor clock (Appendix
-# F: ".709379 Mhz PAL", ".715909 Mhz NTSC"). A `clock` expression names an
-# oscillator rather than another object, so it is written against the crystal:
-# the processor is `clk / 4`, which makes the E clock `clk / 40`.
+# F: ".709379 Mhz PAL", ".715909 Mhz NTSC"). It is written against the crystal
+# like every other clock on the board: the processor is `clk / 4`, which makes
+# the E clock `clk / 40`. (`cpu / 10` would say the same thing.)
+#
+# The TOD inputs: CIA-A's counts a 50/60 Hz event - "VSync or line tick" - and
+# CIA-B's counts horizontal sync. Agnus drives both, at the bottom of the file.
 #
 # What is not wired yet, and why:
 #
-# * TOD. CIA-A's time-of-day input counts a 50/60 Hz event - "VSync or line
-#   tick" - and CIA-B's counts horizontal sync. Neither is the E clock, and
-#   nothing in the tree generates a video timing pulse yet. It waits for Agnus.
 # * The keyboard on CIA-A's SP and CNT, the game-port fire buttons on PA6 and
 #   PA7, the LED on PA1, the Centronics port on CIA-A port B and CIA-B's PA0-PA2,
 #   and the serial handshakes on CIA-B's PA3-PA7. Every one of those pins is a
@@ -69,17 +69,26 @@
 #   looks like: an unpressed button, no printer, no modem.
 
 # ---------------------------------------------------------------------------
-# What is deliberately not mapped
+# What is deliberately not mapped, and what an access to it does
 # ---------------------------------------------------------------------------
 #
 # $20 0000 - $9F FFFF   the primary autoconfig space: nothing to configure
 # $C0 0000 - $D7 FFFF   "slow" expansion RAM on boards that have it
 # $DC 0000 - $DC FFFF   the battery-backed clock, which an A500 has no socket for
 # $E8 0000 - $EF FFFF   the autoconfig space proper
+# $F0 0000 - $F7 FFFF   "Reserved. Do not use." (Appendix D) - and probed by
+#                       Kickstart, with a word read at $F00000, while the
+#                       overlay is still up
 #
-# The space's `unassigned` policy is left at its default of `fault`, so any of
-# those is a bus error rather than a comfortable zero. A 68000 has BERR, which
-# is what makes that the honest setting.
+# An access to any of them **completes and floats**: the space's `unassigned`
+# policy is `open-bus`. Appendix D marks these ranges reserved, not faulting;
+# Appendix K has the bus controller drive /DTACK for a slave that does not
+# answer and /BERR only for a bus collision or a DMA error; and the MC68000
+# user's manual (section 5.4) leaves /BERR to external circuitry a board may
+# omit. So an empty address on an A500 reads whatever the bus floats to, and a
+# write to one is lost. A `fault` policy here made Kickstart's first probe of
+# $F00000 a bus error whose vector was still in the ROM overlay, and the
+# processor double-faulted.
 
 machine "amiga-a500" {
   # -- how much of each memory -----------------------------------------------
@@ -108,8 +117,9 @@ machine "amiga-a500" {
   # that one number (ROADMAP.md 4.2), which is the whole reason the chipset can
   # be dot-exact against the processor. PAL: 28.37516 MHz, processor at a
   # quarter of it, 7.09379 MHz. `-p master=28636360` gives the NTSC machine and
-  # a 7.15909 MHz processor; nothing else on this board changes, because
-  # nothing else on this board is a chip yet.
+  # a 7.15909 MHz processor, and every clock below follows it; an NTSC machine
+  # also needs `standard = "ntsc"` on `agnus` and `denise`, because line counts
+  # are a fact about the chips rather than about the crystal.
   param master = 28375160
   osc   clk    = master Hz
 
@@ -118,8 +128,9 @@ machine "amiga-a500" {
   # 24 bits. A 68000 has 23 address pins and A0 is implied by the two data
   # strobes, so the chip drives a 16-megabyte space and the top byte of a
   # 32-bit address never leaves the package - which is exactly why the ROM at
-  # $F80000 and the chip registers at $DFF000 are where they are.
-  space mem { width = 24, endian = "big" }
+  # $F80000 and the chip registers at $DFF000 are where they are. Empty
+  # addresses float rather than fault: see the block above the machine.
+  space mem { width = 24, endian = "big", unassigned = open-bus }
 
   # -- the processor ---------------------------------------------------------
   object cpu "cpu.m68k" {
@@ -171,6 +182,30 @@ machine "amiga-a500" {
   # named here because a named slot must be bound, and a board that could not
   # run without a disk would be the wrong default.
   object df0 "amiga.floppy" { clock = clk / 8, paula = paula }
+
+  # -- Agnus -----------------------------------------------------------------
+  #
+  # See `src/dev/amiga/agnus/`. One tick of its clock is one count of the
+  # horizontal beam counter: "one horizontal count takes one cycle of the
+  # system clock (processor is twice this)", 3 546 895 Hz on PAL (chapter 2),
+  # which is exactly the crystal over eight. It holds every DMA pointer, so it
+  # names chip RAM, and it names the two chips it moves data for: Paula's disk
+  # and audio slots, and the lines it pushes into Denise.
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    paula    = paula
+    video    = denise
+  }
+
+  # -- Denise ----------------------------------------------------------------
+  #
+  # See `src/dev/amiga/denise.rs`. It counts no beam and reads no memory: Agnus
+  # drives it a line at a time. Its clock is its 7M pin, the crystal over four,
+  # which is what a host scans the picture out against.
+  object denise "amiga.denise" { custom = custom, clock = clk / 4 }
 
   # -- the overlay -----------------------------------------------------------
   #
@@ -253,4 +288,10 @@ machine "amiga-a500" {
   # "Disk index pulse ($BFDD00, bit 4)": CIA-B's /FLAG, whose falling edge sets
   # ICR bit 4 and can raise level 6.
   wire df0.index -> cia_b.flag { pull = "up" }   # INDEX*
+
+  # Video timing into the CIAs' time-of-day counters (Appendix F: CIA-A's TOD
+  # is "VSync or line tick", CIA-B's horizontal sync). Each counts rising
+  # edges; Agnus raises `vsync` at line 0 and `hsync` at count 0 of each line.
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
 }

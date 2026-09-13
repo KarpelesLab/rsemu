@@ -2,7 +2,7 @@
 //!
 //! Appendix B of the *Amiga Hardware Reference Manual* (Commodore-Amiga,
 //! 3rd edition), "Register Summary — Address Order", is a table of about two
-//! hundred word-wide registers at offsets `$000`…`$1E4` from the custom-chip
+//! hundred word-wide registers at offsets `$000`…`$1FE` from the custom-chip
 //! base. This module is that table as data, plus the four facts the appendix
 //! records about each entry and nothing else:
 //!
@@ -43,17 +43,27 @@
 //!   taken. A table that routed these writes to Agnus alone would leave Denise
 //!   no way to learn its own window.
 //!
-//! # Two things the appendix does *not* say
+//! # `$1FE`, `SPRHDAT`, and the copy this was checked against
 //!
-//! * **`$1FE`.** Appendix B does end with a row `NO-OP(NULL) 1FE` — after
-//!   `DIWHIGH` and two `RESERVED` rows — but with no access letter and no chip,
-//!   so there is nothing to route and it is not a row here: an access to `$1FE`
-//!   is an unclaimed offset, which for a *write* is the no-op the copper wants.
-//!   Appendix A does not list it. (An earlier revision of this comment said
-//!   neither appendix did; re-reading Appendix B for Denise found the row.)
-//! * **Byte accesses.** Every entry is a word. What the chips do with a single
-//!   data strobe is not in the appendix, so [`custom`](super::custom) refuses
-//!   a byte access rather than inventing an answer; see its documentation.
+//! The table was first transcribed through a summarising tool and has since
+//! been checked, row by row, against the Appendix B text of the Amiga
+//! Developer CD 2.1 edition of the manual. Every row matched except that two
+//! were missing:
+//!
+//! * **`SPRHDAT` at `$078`** — "Ext. logic UHRES sprite pointer and data id",
+//!   `~`, `W`, `A(E)`. An ECS row; nothing on an original-chip-set board acts
+//!   on it, but the decode is the appendix's and so is this row.
+//! * **`NO-OP(NULL)` at `$1FE`**, the appendix's last line, with no access
+//!   letter and no chip. It is declared with neither, and
+//!   [`custom`](super::custom) treats a write to such a row as the no-op it is
+//!   named for: dropped, and *not* counted as unclaimed, because it is the
+//!   address a copper list is written to pad with.
+//!
+//! # Byte accesses
+//!
+//! Every entry is a word. What the chips do with a single data strobe is not
+//! in the appendix, so [`custom`](super::custom) refuses a byte access rather
+//! than inventing an answer; see its documentation.
 
 use core::fmt;
 
@@ -235,6 +245,14 @@ impl Reg {
         self.access.contains(Access::WRITE) || self.access.contains(Access::STROBE)
     }
 
+    /// Whether this row is the appendix's `NO-OP(NULL)`: an address with no chip
+    /// and no access, which a write reaches and nothing latches.
+    #[must_use]
+    #[inline]
+    pub const fn no_op(&self) -> bool {
+        self.chip.0 == 0 && self.access.0 == 0
+    }
+
     /// Whether this address is a strobe rather than a register.
     #[must_use]
     #[inline]
@@ -359,6 +377,7 @@ static DECLARED: &[Reg] = &[
     reg(0x070, "BLTCDAT",  &[A],       &[W, DMA_USUAL, COP_DANGER]),
     reg(0x072, "BLTBDAT",  &[A],       &[W, DMA_USUAL, COP_DANGER]),
     reg(0x074, "BLTADAT",  &[A],       &[W, DMA_USUAL, COP_DANGER]),
+    reg(0x078, "SPRHDAT",  &[A],       &[W, COP_DANGER, ECS]),
     reg(0x07c, "DENISEID", &[D],       &[R, COP_DANGER, ECS]),
     reg(0x07e, "DSKSYNC",  &[P],       &[W, COP_DANGER]),
     reg(0x080, "COP1LCH",  &[A],       &[W, PAIR, ECS]),
@@ -518,6 +537,7 @@ static DECLARED: &[Reg] = &[
     reg(0x1e0, "VSSTRT",   &[A],       &[W, ECS]),
     reg(0x1e2, "HCENTER",  &[A],       &[W, ECS]),
     reg(0x1e4, "DIWHIGH",  &[A, D],    &[W, ECS]),
+    reg(0x1fe, "NO-OP",    &[],        &[]),
 ];
 
 /// The declaration above, indexed by `offset / 2`.

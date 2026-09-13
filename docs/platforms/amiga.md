@@ -2,21 +2,23 @@
 
 Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
 `machines/amiga-a500.machine`, `machines/tests/amiga-denise.machine`,
-`tests/amiga_a500_board.rs`, `tests/amiga_denise_board.rs`.
+`machines/tests/agnus-board.machine`, `tests/amiga_a500_board.rs`,
+`tests/amiga_denise_board.rs`, `tests/agnus_board.rs`,
+`tests/amiga_a500_chipset.rs`.
 
 A 68000, 512 KiB of chip RAM, a Kickstart ROM, two 8520 CIAs and three custom
-chips — Agnus, Denise and Paula. **What exists today is the memory map and its
-decoders, both 8520s, Paula, the internal floppy drive, and Denise**
-(`dev-amiga-denise`). **Agnus is not there yet**, so nothing counts the beam:
-Denise is proved on its own test board, and the A500 shows no picture until Agnus
-pushes lines into it. This page is the ledger of what the board decided, what it
-had to leave open, and what the missing chip will need from it.
+chips — Agnus, Denise and Paula. **All of them are on the A500 board now**: the
+memory map and its decoders, both 8520s, Paula, the internal floppy drive,
+Agnus and Denise, with Agnus counting the beam and pushing lines into Denise.
+This page is the ledger of what the board decided, what it had to leave open,
+and where each chip meets the others.
 
 ## Primary sources
 
 | Source | Covers |
 | --- | --- |
 | [*Amiga Hardware Reference Manual*, 3rd edition](https://archive.org/details/amiga-hardware-reference-manual-3rd-edition) (Commodore-Amiga Inc.) | Appendix B, the custom-chip register summary in address order and its legend; Appendix A, every register's bits; Appendix D, the system memory maps; Appendix F, the CIA addresses, chip selects and clocks; Appendix E, the port signal assignments and the disk connector; chapter 7, interrupts; chapter 8, the disk controller, the drive lines and the UART; chapter 5, audio. For Denise: Chapter 3 (playfields, the display window, data-fetch timing, dual playfields, scrolling, hold-and-modify, extra-half-brite), Chapter 4 (sprites), Chapter 7 (video priorities, collision detection), Appendix A (register bits), Appendix C (the ECS notes, including the display window's chip column) and Appendix J (Denise's pins) |
+| The same manual as it appears on the Amiga Developer CD 2.1 | Chapter 2 (the copper, the beam counters' ranges and clocks), chapter 3 (display window and data fetch), chapter 4 (sprite DMA), chapter 6 (the blitter), chapter 7 (DMA control, beam position, interrupts), Appendix A (bit layouts), Appendix C (ECS, Agnus identification) — what `amiga.agnus` is written from, and the copy `regs.rs` was checked against row by row |
 | MC68000 User's Manual (Motorola) | The reset sequence, and the instruction encodings the test ROMs are hand-assembled from |
 
 **Nothing else.** Every Amiga emulator the project is aware of is copyleft and
@@ -28,7 +30,7 @@ so is AROS's source: AROS is something rsemu may run, never something it reads.
 | | |
 | --- | --- |
 | Chip RAM | `$00_0000`–`$07_FFFF`, and `$08_0000`–`$0F_FFFF` on a 1 MiB machine |
-| Custom chips | `$DF_F000`–`$DF_FFFF`; the register table fills offsets `$000`–`$1E4` |
+| Custom chips | `$DF_F000`–`$DF_FFFF`; the register table fills offsets `$000`–`$1FE` |
 | CIA-A | `$BFEr01`, register `r` = 0–F; "selected when A12 is low, A13 high" |
 | CIA-B | `$BFDr00`; "selected when A12 is high, A13 low" |
 | System ROM | `$FC_0000`–`$FF_FFFF` in the edition's own map — see below |
@@ -40,6 +42,14 @@ so is AROS's source: AROS is something rsemu may run, never something it reads.
 | Floppy lines | CIA-B `PB0`–`PB7`: `STEP*`, `DIR`, `SIDE*`, `SEL0*`–`SEL3*`, `MTR*`; CIA-A `PA2`–`PA5`: `CHNG*`, `WPRO*`, `TK0*`, `RDY*`; the index pulse on CIA-B's `/FLAG` (Table 8-5, Appendix E) |
 
 ## What the board decided, and why
+
+**An empty address completes and floats.** The space's `unassigned` policy is
+`open-bus`. Appendix D marks the gaps "Reserved. Do not use", not faulting;
+Appendix K has the bus controller drive `/DTACK` for a slave that does not
+answer and `/BERR` only for a bus collision or DMA error; and the MC68000 user's
+manual (§5.4) makes `/BERR` external circuitry a board may omit. Kickstart 2.04
+and AROS both probe `$F00000` while the overlay is still up, and under a
+`fault` policy that probe double-faulted the processor.
 
 **The overlay is a decoder, not a remap.** `amiga.gary` owns one region at
 address zero and forwards every access to the Kickstart ROM or to chip RAM by
@@ -92,10 +102,10 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 
 | | Why it is open | What happens instead |
 | --- | --- | --- |
-| **`$1FE`** | Appendix B's last row is `NO-OP(NULL) 1FE`, with no access letter and no chip; Appendix A does not list it | An unclaimed offset: a write is dropped and counted |
 | **Byte access to a custom register** | Every entry is a word and the manual says nothing about a single data strobe | Refused by the region's access constraints |
 | **Reading a write-only custom register** | The manual does not say | The last word driven onto the bus — **a placeholder** that Agnus's DMA cycles will replace; `CustomBus::unclaimed` counts every use |
-| **`$DFF200`–`$DFFFFF`** | Appendix D gives a 4 KiB window, the table fills 512 bytes, and whether the rest mirrors is not stated | Only 512 bytes mapped; the rest faults. `mirror(custom)` is a one-word change |
+| **`$DFF200`–`$DFFFFF`** | Appendix D gives a 4 KiB window, the table fills 512 bytes, and whether the rest mirrors is not stated | Only 512 bytes mapped; the rest floats like any empty address. `mirror(custom)` is a one-word change |
+| **Kickstart 1.x's 256 KiB ROM** | `-p kickstart-size=256K -p rom-base=0xFC0000` fails to build: `amiga.gary` sizes the overlay from `chip-ram` (512 KiB), which is larger than the ROM it forwards to | Not supported yet; the overlay would need to mirror a smaller ROM across its window |
 | **A0–A7 in a CIA window** | The notation gives one hex digit of register select; nothing says whether the low byte is decoded | Not decoded — `$BFE003` is register 0 |
 | **The ROM base** | The edition's map is `$FC_0000`, a 256 KiB Kickstart; 512 KiB images start at `$F8_0000` | `rom-base` and `kickstart-size` are parameters, defaulting to 512 KiB |
 
@@ -107,24 +117,16 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 | **Audio's state diagram** | Figure 5-8's arrows are not legible in the available scan | The chapter's prose: see `paula.rs` |
 | **Disk images** | ADF is AmigaDOS's format, not the hardware's | The drive's `image` slot takes a raw MFM dump of its own layout; nothing encodes a file system yet |
 
-## What each chip will need
+## How the chips meet
 
 * **Agnus, Denise** — implement `CustomChip` on their register block, take a
   `custom = <object>` property, and call `CustomBus::attach` from `bind`. The
   copper writes through the same bus with `Origin::copper(danger)`.
   `src/dev/amiga/custom.rs` has the contract in full.
-* **Agnus, for Paula** — a `paula = paula` link and `PaulaPort` from
-  `ExportId::PAULA`, on the same `clk / 8` clock: disk read and write words in
-  its DMA slots against `DSKPT`, audio `restart`/`fetch` requests against
-  `AUDxLC` and its own pointers, and `request` with `VERTB` and `BLIT`. The
-  board then needs one line for it. `DMACONR` is Agnus's to answer: Paula drives
-  none of its bits.
-* **Agnus, for the CIAs** — the TOD inputs: CIA-A's `tod` from vertical sync,
-  CIA-B's from horizontal sync. Two `wire` lines.
-* **Agnus, for Denise** — a `video = denise` link and the `Video` handle from
-  `ExportId::AMIGA_VIDEO`: one `line()` per line of fetched bitplane words and
-  one `field(lof)` per field, sprite DMA as ordinary `Origin::dma()` register
-  writes, and optionally a lock-free `Beam::position()`.
+* **The 8520s** — `wire cia_a.pa0 -> gary.ovl`, an `amiga.cia-decode` per chip,
+  their interrupts through Paula, and their TOD inputs from Agnus:
+  `wire agnus.vsync -> cia_a.tod`, `wire agnus.hsync -> cia_b.tod`.
+* **Agnus** — `paula = paula` and `video = denise`; see *Agnus* below.
 
 ## Where the table departs from Appendix B
 
@@ -132,9 +134,10 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 | --- | --- | --- | --- |
 | `DIWSTRT` `$08E`, `DIWSTOP` `$090` | `A` | `A D` | Appendix C, "Display Window Specification", prints both `W A D`; the window's horizontal resolution is one low-resolution pixel, which only the chip that serializes pixels can compare against. Without it Denise could not clip its own output |
 
-`SPRHDAT` at `$078` (`W A(E)`, "Ext. logic UHRES sprite pointer and data id") is
-in Appendix B and not in the table. It is an ECS Agnus register and nothing reads
-it yet; it is recorded here so whoever adds it knows the row is real.
+`SPRHDAT` at `$078` and `NO-OP(NULL)` at `$1FE` are in Appendix B and were
+missing from the first transcription; both are rows now. A write to `NO-OP` is
+dropped and is **not** counted as unclaimed, because it is the address copper
+lists pad with.
 
 ## Denise
 
@@ -167,16 +170,8 @@ one. `host::display::amiga` reports `Video::fields()` as the frame counter and a
 frame period of the last field's colour clocks × 2 ticks of Denise's `clock`
 domain (its 7M pin).
 
-**On an A500** Denise needs two statements, beside `custom`:
-
-```text
-object denise "amiga.denise" { custom = custom, clock = clk / 4 }
-```
-
-plus `dev-amiga-denise` in `machine-amiga-a500`'s feature list. Nothing pushes
-lines until Agnus lands, so the board would show an empty picture — but every
-Denise register store would be claimed, which moves `CustomBus::unclaimed`
-(`tests/amiga_a500_board.rs` asserts `1` for its `COLOR00` store today).
+**On the A500** Denise is `object denise "amiga.denise" { custom = custom,
+clock = clk / 4 }`, and Agnus names it with `video = denise`.
 
 | Open | What this model does |
 | --- | --- |
@@ -187,3 +182,64 @@ Denise register store would be claimed, which moves `CustomBus::unclaimed`
 | Interlaced field order | long field on even rows, short on odd |
 | Where horizontal blanking falls in the 368 visible pixels | not cut; the picture is 400 low-resolution pixels from `x = 64` |
 | The mouse and joystick inputs | not wired; `JOYTEST` and `JOYxDAT` work as registers |
+
+## Agnus
+
+`amiga.agnus`, feature `dev-amiga-agnus`. The module documentation in
+`src/dev/amiga/agnus/` is the long form; this is what a board author needs.
+
+**Time is the colour clock.** One tick of the chip's domain is one count of
+the horizontal beam counter — "3,546,895 Hz" PAL, "3,579,545 Hz" NTSC
+(chapter 2) — so an A500 gives it `clock = clk / 8` of its 28.37516 or
+28.63636 MHz crystal. The processor is `clk / 4` and the CIAs' E clock
+`clk / 40`: integer ratios in one tree, and the line and field lengths are
+counted rather than derived from a duration.
+
+**Counters.** PAL fields of 312 or 313 lines of 227 counts; NTSC 262 or 263
+with lines alternating 227 and 228. `LOF` toggles under `BPLCON0`'s `LACE`
+and holds otherwise, and comes out of reset set — the manual gives no reset
+value, but its last beam position "(226,312)" and "PAL line counts (313)" are
+both a long field's. `VPOSR` carries the Agnus identification from Appendix C:
+`$00` PAL, `$10` NTSC.
+
+**Pins.**
+
+| pin | rising edge | wire it to |
+| --- | --- | --- |
+| `vsync` | line 0, count 0 — "start of vertical blank" | CIA-A's `tod` |
+| `hsync` | count 0 of each line | CIA-B's `tod` |
+| `blit` | the count a blit finishes on (one count wide) | nothing on an A500: Paula hears `BLIT` through its seam |
+
+The widths (three lines, seventeen counts) are nominal: the original chip set's
+sync placement is not in the manual.
+
+**What it drives into the other chips.**
+
+* The copper writes through `amiga.custom` with `Origin::copper(cdang)`.
+* Neither Paula nor Denise reads chip RAM; Agnus pushes into both.
+* **Denise** (`video = denise`, `ExportId::AMIGA_VIDEO`): each line's
+  bitplane words through `Video::line` as the beam leaves the line, each field
+  through `Video::field` before any position in it is reported, sprite control
+  and data words written into `SPRxPOS`/`SPRxCTL`/`SPRxDATA`/`SPRxDATB` through
+  the bus with `Origin::dma()`, and Agnus's beam handed over with
+  `Video::connect_beam` so a mid-line write lands on its pixel.
+* **Paula** (`paula = paula`, `ExportId::PAULA`): on each line's first count,
+  while `DMAEN` and a disk or audio enable are on, the slot through
+  `PaulaPort` — disk words stored at or fetched from `DSKPT`, audio restarts
+  from `AUDxLC` and fetches — and `VERTB` and `BLIT` requested on their counts.
+* `ChipDma` (`ExportId::CHIP_DMA`, nine) holds what those need without Agnus's
+  lock — chip RAM, `DMACON`, `DSKPT`, `AUDxLC` — and is published for tests
+  and monitors.
+
+**Where the manual left a choice, and what was chosen.**
+
+| | Choice | Why |
+| --- | --- | --- |
+| Copper cycle parity | Even horizontal counts | The manual's own loop example waits for `$E2`, the last count of a PAL line |
+| Copper restart | Line 0, count 0 | Appendix A's `COPINS`: "at the beginning of each vertical blank time" |
+| A `MOVE` the seam refuses | The copper carries on | Nothing says it stops |
+| First sprite control fetch | The first line after table 3-13's vertical blank | The pointers are written "during the vertical blanking interval before the first display" |
+| Line-mode texture and `ONEDOT` | `BSH` counts down; the first dot of a row is kept | The manual gives register set-up, not the stepping |
+| Bitplane fetch | All of a line's words as it ends | Pointer changes mid-fetch apply to the whole line |
+| Contention | None: no slot is lent or stolen, `BLTPRI` is stored only | The arbitration figure is a sketch, not a timing |
+| The copper's write permission | Appendix B's `*`/`~` columns, the original chip set's rule | Appendix C gives ECS a wider one; an A500 Agnus is not ECS |

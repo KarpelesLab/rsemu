@@ -13,7 +13,8 @@
 //! data bus, the mouse inputs, the 7M and CCK clocks, `/CSYNC` and the RGB
 //! outputs: no vertical counter, no memory bus. So this model does not count
 //! the beam and does not read memory. It is **driven**, through the seam below,
-//! and a test drives it from a synthetic source until Agnus exists.
+//! by Agnus (`amiga.agnus`, `video = denise`), and a test may drive it from a
+//! synthetic source instead.
 //!
 //! # The seam Agnus drives
 //!
