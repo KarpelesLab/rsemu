@@ -292,11 +292,13 @@ fn agnus_raises_its_own_sources_through_the_port() {
 
 /// A sink standing in for a processor's interrupt pins: it takes a
 /// `DEVICE`-ranked lock, as any device's input does.
+#[cfg(feature = "dev-mos8520")]
 #[derive(Debug)]
 struct LockingSink {
     seen: Mutex<u32>,
 }
 
+#[cfg(feature = "dev-mos8520")]
 impl WireSink for LockingSink {
     fn set_level(&self, _src: WireId, _line: u32, _level: Level) {
         *self.seen.lock() += 1;
