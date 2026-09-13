@@ -204,6 +204,7 @@ would answer that the machine file does not.
 | [`system/usermode-abi.md`](system/usermode-abi.md) | Level 3: ELF loading, the auxiliary vector, the syscall ABI, and the sandbox policy |
 | [`system/debug-protocols.md`](system/debug-protocols.md) | GDB remote serial protocol, DWARF |
 | [`system/remote-display.md`](system/remote-display.md) | RFB/VNC, SPICE |
+| [`system/kickstart-media.md`](system/kickstart-media.md) | Amiga Kickstart ROMs read from the user's own media: the header and checksum, Cloanto's `AMIROMTYPE1` wrapper, reading one out of an Amiga Forever disc image, and why a Kickstart is a media decode where a DfuSe file is a loader device |
 | [`system/cpu-state-model.md`](system/cpu-state-model.md) | The engine-independent architectural CPU state: what crosses between an interpreter, a JIT and a vCPU, and what a TSC is when the two engines count at different rates |
 
 ### Techniques
@@ -242,6 +243,8 @@ resource an emulator author would reach for by reflex, and each is off limits:
 | Bochs, DOSBox, MAME, VICE, Dolphin, PCSX2, Nestopia, higan | GPL/LGPL | Copyleft |
 | **Linux kernel source and in-tree `Documentation/`** | GPLv2 | See below — this one catches people |
 | SeaBIOS, coreboot | GPL | Use EDK II (BSD-2-Clause-Patent) instead |
+| WinUAE, FS-UAE, UAE, vAmiga, Hatari | GPL | Copyleft. Use the Amiga Hardware Reference Manual |
+| **AROS** | AROS Public License (MPL-derived) | Weak copyleft. A binary we *run* — it is a fine black-box fixture — never a source we read |
 
 ### The Linux kernel trap
 
