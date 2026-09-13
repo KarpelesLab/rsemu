@@ -209,6 +209,15 @@ impl ExportId {
     /// peripherals of its own family, so it is opaque here.
     pub const CLOCK_TREE: ExportId = ExportId(5);
 
+    /// The Amiga custom-chip register bus. Transported as [`Export::Opaque`].
+    ///
+    /// `amiga.custom` owns the decode of the 512-byte window at `$DFF000` and
+    /// the table that says which of Agnus, Denise and Paula answers at each
+    /// offset; a chip model subscribes to it rather than mapping a scatter of
+    /// sub-windows of its own. The handle's type is a contract between those
+    /// classes and not `core`'s business, which is what `Opaque` is for.
+    pub const CUSTOM_BUS: ExportId = ExportId(6);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -221,6 +230,7 @@ impl ExportId {
             ExportId::DMC_FETCH => Some("DMC sample fetch"),
             ExportId::PORT_PASSTHROUGH => Some("I/O port pass-through"),
             ExportId::CLOCK_TREE => Some("clock tree"),
+            ExportId::CUSTOM_BUS => Some("custom-chip register bus"),
             _ => None,
         }
     }

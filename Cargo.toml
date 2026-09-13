@@ -2558,6 +2558,35 @@ machine-mips-mini = ["cpu-mips"]
 # to wire. Adds no dependencies.
 machine-m68k-mini = ["cpu-m68k"]
 
+# The Amiga board classes (src/dev/amiga): the custom-chip register space at
+# $DFF000, the `OVL` overlay, and the 8520 address decode, and nothing else.
+# `amiga.custom` owns the decode -- 256 word registers in 512 bytes, transcribed
+# from Appendix B of the Amiga Hardware Reference Manual with each entry's
+# owning chip, access direction and copper privilege -- and publishes a
+# subscription seam a chip model attaches to, so Agnus, Denise and Paula can be
+# added one at a time without any of them re-deriving the address map.
+# `amiga.gary` is the overlay: an address decoder at zero that answers out of
+# the Kickstart ROM until the CIA clears `OVL` and out of chip RAM afterwards,
+# which is how a 68000 finds a reset vector on a machine whose RAM holds
+# nothing. `amiga.cia-decode` is the board's half of an 8520: register select on
+# A8-A11 and one byte lane of the data bus, so a decode-free CIA model plugs in
+# unchanged. **No chipset**: Agnus, Denise, Paula and the 8520 CIAs are not
+# here, and the register space counts every access it could not route so how
+# much is missing is a number rather than a guess. Written from the hardware
+# manual; no Amiga emulator source was consulted, because they are all copyleft
+# (ROADMAP.md 1). Adds no dependencies and is `no_std + alloc`.
+dev-amiga = []
+
+# The `amiga-a500` board (machines/amiga-a500.machine plus the classes it
+# names): a big-endian 24-bit space, chip RAM at zero behind the `OVL`
+# overlay, the custom chip registers at $DFF000, and a 512 KiB Kickstart socket
+# at the top of the space. `-p chip-ram=1M` gives the trapdoor-expanded
+# machine. It boots a synthetic ROM out of the overlay and stops there: the two
+# CIAs and the three custom chips are still to come, and the machine file
+# carries the address decode and the wiring each of them needs. Adds no
+# dependencies.
+machine-amiga-a500 = ["cpu-m68k", "dev-amiga"]
+
 # The network seam (src/dev/net/link.rs): what a NIC model is attached to --
 # frames out, frames in **against a virtual tick**, carrier, and a station
 # address -- plus `NetPort`, the deterministic in-memory backend every test uses

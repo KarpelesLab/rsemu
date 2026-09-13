@@ -681,6 +681,29 @@ pub static M68K_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/m68k-mini.machine"),
 };
 
+/// A Commodore Amiga 500's memory map, when this build has the board classes.
+///
+/// The map and the two decoders that make it work, and no chipset: chip RAM at
+/// zero behind the `OVL` overlay, the custom-chip register space at
+/// `$DFF000`, and a Kickstart socket at the top of a 24-bit big-endian space.
+/// The `kickstart` slot takes the ROM image — a 512 KiB one at `$F8_0000` by
+/// default, and `-p kickstart-size=256K -p rom-base=0xFC0000` for the 256 KiB
+/// socket the hardware manual's own appendix describes.
+///
+/// Agnus, Denise, Paula and the two 8520 CIAs are **not** in this build, so a
+/// real Kickstart finds its reset vector and then waits on a chipset that is
+/// not there. `machines/amiga-a500.machine` carries the decode and the wiring
+/// each of them will need, and `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-a500")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a500")))]
+pub static AMIGA_A500: CatalogEntry = CatalogEntry {
+    name: "amiga-a500",
+    summary: "an Amiga 500's memory map: a 7.09 MHz 68000, chip RAM under the OVL overlay, the \
+              $DFF000 custom-chip space, a Kickstart socket",
+    media: &["kickstart"],
+    source: include_str!("../../machines/amiga-a500.machine"),
+};
+
 /// A minimal R3000A board, when this build has a MIPS core.
 ///
 /// A synthetic board rather than a product: a 32-bit **physical** space, a
@@ -776,6 +799,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&GAMEBOY);
     #[cfg(feature = "machine-m68k-mini")]
     out.push(&M68K_MINI);
+    #[cfg(feature = "machine-amiga-a500")]
+    out.push(&AMIGA_A500);
     #[cfg(feature = "machine-mips-mini")]
     out.push(&MIPS_MINI);
     #[cfg(feature = "machine-ne2k-mini")]
@@ -953,6 +978,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::st25dv::register(&mut reg)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::register(&mut reg)?;
+    #[cfg(feature = "dev-amiga")]
+    crate::dev::amiga::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-a64")]
     crate::cpu::arm::a64::register(&mut reg)?;
     #[cfg(feature = "dev-arm")]
@@ -1095,6 +1122,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::st25dv::bind(&mut b)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::bind(&mut b)?;
+    #[cfg(feature = "dev-amiga")]
+    crate::dev::amiga::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-a64")]
     crate::cpu::arm::a64::bind(&mut b)?;
     #[cfg(feature = "dev-arm")]
@@ -1228,6 +1257,10 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-st25dv")]
     table.insert(crate::dev::st25dv::schema());
+    #[cfg(feature = "dev-amiga")]
+    for schema in crate::dev::amiga::schemas() {
+        table.insert(schema);
+    }
     #[cfg(feature = "dev-apple1")]
     for schema in crate::dev::apple1::schemas() {
         table.insert(schema);
@@ -2318,6 +2351,19 @@ mod tests {
             ("mips-mini", "firmware") => &[
                 0x00, 0x00, 0xf0, 0x0b, // j 0xbfc00000
                 0x00, 0x00, 0x00, 0x00, // nop, in the delay slot
+            ],
+            // The same three things for the Amiga, out of the `OVL` overlay
+            // rather than out of a ROM mapped at zero: at reset the Kickstart
+            // socket is what answers at $000000, so the two reset longwords
+            // are the first eight bytes of the *ROM image*. The stack pointer
+            // is the top of the default 512 KiB of chip RAM.
+            // `tests/amiga_a500_board.rs` is where the overlay is made to
+            // flip and the custom register space is made to answer.
+            #[cfg(feature = "machine-amiga-a500")]
+            ("amiga-a500", "kickstart") => &[
+                0x00, 0x08, 0x00, 0x00, // SSP = $00080000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
             ],
             #[cfg(feature = "machine-m68k-mini")]
             ("m68k-mini", "firmware") => &[

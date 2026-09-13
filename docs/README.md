@@ -56,6 +56,7 @@ the question never arises.
 ### Machines
 | | |
 | --- | --- |
+| [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500: the memory map, the `OVL` overlay, the custom-chip register seam, and what the manual leaves open |
 | [`platforms/apple1.md`](platforms/apple1.md) | Apple 1: the MC6821, the clock, and the monitor-ROM licence question |
 | [`platforms/nes.md`](platforms/nes.md) | NES / Famicom |
 | [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |
@@ -243,8 +244,8 @@ resource an emulator author would reach for by reflex, and each is off limits:
 | Bochs, DOSBox, MAME, VICE, Dolphin, PCSX2, Nestopia, higan | GPL/LGPL | Copyleft |
 | **Linux kernel source and in-tree `Documentation/`** | GPLv2 | See below — this one catches people |
 | SeaBIOS, coreboot | GPL | Use EDK II (BSD-2-Clause-Patent) instead |
-| WinUAE, FS-UAE, UAE, vAmiga, Hatari | GPL | Copyleft. Use the Amiga Hardware Reference Manual |
-| **AROS** | AROS Public License (MPL-derived) | Weak copyleft. A binary we *run* — it is a fine black-box fixture — never a source we read |
+| UAE, WinUAE, FS-UAE, vAmiga, Hatari, and every other Amiga or 68k-machine emulator | GPL / copyleft | Use the *Amiga Hardware Reference Manual* ([`platforms/amiga.md`](platforms/amiga.md)) |
+| **AROS** source | AROS Public License (MPL-derived, weak copyleft) | A binary a board may *run* — a fine black-box fixture — never a source to read |
 
 ### The Linux kernel trap
 
