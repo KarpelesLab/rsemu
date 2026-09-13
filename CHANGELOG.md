@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/rsemu/compare/v0.0.5...v0.0.6) - 2026-09-13
+
+### Added
+
+- *(machine)* DF0 on the A500 takes a disk
+- *(dev-amiga-floppy)* ADF disks, encoded into the MFM tracks trackdisk reads
+- *(machine)* an A500 you can see, type at and point at
+- *(dev-amiga)* the keyboard's protocol and the mouse's quadrature, through the seam
+- *(dev-amiga-paula)* the four pot pins read on POTGOR
+- *(dev-amiga-denise)* the mouse pins clock JOY0DAT and JOY1DAT
+- *(dev-amiga-agnus)* Agnus, and the whole A500 chipset running together
+- *(dev-amiga-denise)* Denise -- colour, playfields, HAM, sprites and collisions
+- *(dev-amiga)* the A500's internal floppy drive on the CIA ports
+- *(dev-amiga)* Paula, and both CIAs interrupting the A500 through it
+- *(machine)* put the two 8520s on the A500, with CIA-A's PA0 driving OVL
+- *(dev-amiga)* the A500 memory map, the OVL overlay and the custom-chip seam
+- *(machine)* reach a named neighbour's region from bind
+- *(dev-cia)* the MOS 8520 CIA
+- *(media)* read an Amiga Kickstart from the media the user already owns
+- *(dev-atecc)* the ATECC508A/608 secure element on I²C, and the crypto it needs
+- *(machine)* put the ST25DV64K on the stm32f407 board
+- *(dev-st25dv)* the ST25DV dynamic NFC tag, with the RF reader as a host door
+- *(gdb)* [**breaking**] `load` into flash, through the door the device opened
+- *(dev-stm32-flash)* describe the array's sectors, so a loader can program it
+- *(space)* a device can publish the erase geometry a loader programs it through
+- *(dev-flash)* enforce PCROP and RDP rather than store them
+- *(dev-stm32)* sixteen peripherals honour their clock gate
+- *(dev-stm32-rcc)* the clock interrupt, so a ready bit can raise IRQ 5
+- *(dev-stm32)* a clock gate a peripheral can receive, and a USART that honours it
+- *(dev-stm32-i2c)* [**breaking**] slave mode on both links, and v2's `SBC`
+- *(bus-i2c)* one pin pair carries both roles, so a controller can be addressed
+- *(dev-psram-qspi)* an APS6404L-class QSPI pseudo-static RAM
+- *(dev-stm32-octospi)* [**breaking**] pass CCR's widths through, and count the chip select low
+- *(bus-spi)* carry the line width of a phase with the word
+- *(dev-st77xx)* the ST7789/ST7735, whose commands are addressed rather than counted
+- *(dev-ssd1306)* the SSD1306/SH1106, and the seam a device-owned framebuffer needs
+- *(dev-dfuse)* DfuSe (.dfu, UM0391) images, each element at its own address
+- *(dev-sdio)* the SDIO answers as a DMA flow controller
+- *(machine)* wire the F407's DMA request matrix from RM0090 Tables 43/44
+- *(dev-dmamux)* the STM32 DMA request multiplexer
+- *(dev-dma)* [**breaking**] CHSEL gates the request, and PFCTRL ends the transfer
+- *(wire)* let a DMA peripheral say which item is its last
+- *(dev-keypad)* a GPIO matrix keypad, and the stm32f407 gets one on PE0-PE7
+- *(wire)* [**breaking**] a third driver state, and a net that resolves itself
+- *(dev-stm32)* the HASH processor, context swap included
+- *(dev-stm32-firewall)* [**breaking**] the interrupt case, and the call gate is three words
+- *(cli)* `--spin-detect`, so a hung board says why
+- *(cpu-riscv)* wire the hart interpreter to the spin detector
+- *(cpu-arm)* wire the ARMv7-M interpreter to the spin detector
+- *(spin)* catch a processor stuck on a load whose value never changes
+- *(dev-stm32-dbgmcu)* st.dbgmcu, with a real output pin per freeze bit
+- *(cpu-arm)* [**breaking**] the external PPB's vendor window belongs to the board
+- *(device)* a debugger's halt reaches a device through `Device::debug_halt`
+- *(dev-stm32-firewall)* the STM32L4 Firewall, and FWDIS becomes load-bearing
+- *(dev-stm32-exti)* [**breaking**] SYSCFG.MEMRMP moves what answers at address zero
+- *(machine)* chain the F407's timers through the internal trigger matrix
+- *(dev-stm32-tim)* [**breaking**] input capture, the slave-mode controller and the DMA burst window
+- *(dev-i2c-v2)* st.i2c-v2, the block every STM32 since the F0 carries
+- *(machine)* the SDIO on the F407, and the first request line anything drives
+- *(dev-sdio)* the F2/F4/F7 SDIO, as a sibling of the H7 SDMMC rather than a variant of it
+- *(dev-stm32)* [**breaking**] the F0/F3/F7/L4/G4/WB SPI, as a variant with its FIFO
+- *(dev-stm32-rng)* the STM32 RNG, from a stream the machine seeds
+- *(dev-rcc)* st.rcc drives sysclk, hclk, pclk1, pclk2 and the timer clocks
+- *(clock)* a device can re-rate a clock domain, at a scheduling boundary
+- *(machine)* the F407 carries its flash interface and its real-time clock
+- *(dev-rtc)* the STM32 real-time clock, its BCD calendar and its backup domain
+- *(dev-stm32)* an `st.flash` that owns the array it programs
+- *(cpu-arm-v7m)* [**breaking**] the DWT cycle counter, and the bit-band alias windows
+- *(gdb)* qXfer:memory-map:read, built from the machine's own address space
+- *(gdb)* [**breaking**] a target description is a list of features, and ARMv7-M has two
+- *(machine)* the F407's nine peripherals, at their Table 62 vectors and behind a bus matrix
+
+### Fixed
+
+- *(dev-cia)* a write to a one-shot timer's high byte starts it
+- *(dev-amiga-paula)* no disk word is lost between Agnus's slots
+- *(dev-cia)* SP and CNT are open drain, and SP's output latch resets low
+- *(dev-amiga)* route DIWSTRT and DIWSTOP to Denise as well as Agnus
+- *(dev-cia)* release the output table before driving a pin
+- *(machine)* restore the brace a union merge ate
+- *(dev-flash)* an F4 comes back from a reset with its option register locked
+- *(machine)* hand a sink the drivers wired to it, not its whole net
+- *(dev-stm32)* OTYPER and PUPDR decide what a pad presents, and IDR reads the pin
+- *(dev-stm32)* a feature has to compile its own tests, alone
+- *(machine)* the F407's two watchdog resets stop sharing one net
+- *(machine)* register st.tim in a build that enables only dev-stm32-tim
+- *(cpu-x86)* the inlined-path tests need a host that generates code
+- *(cpu-riscv)* gate `has_shadow` on what its callers are gated on
+- *(sched)* a share that rounds to nothing still gets one tick
+- *(sched)* [**breaking**] a budget is a share of the round, not ten thousand ticks
+
+### Other
+
+- *(machine)* the A500 tests bind DF0 now the board names its slot
+- *(machine)* an A500's empty addresses float, and Kickstart needs them to
+- *(dev-amiga)* gate the CIA-only sink with the test that uses it
+- *(dev-cia)* two 8520s on a 68000 test board
+- name the Amiga emulators and AROS in the provenance exclusion table
+- *(dev-stm32)* the gate link resolves on its own, and one that pointed at a private type
+- *(machine)* a board that wires its clock gates, and the docs for why it is not the F407
+- *(dev-flash)* the link text already resolves
+- *(dev-stm32-hash)* a board for the hash processor, not a part that lacks one
+- *(dev-sdio)* prove PFCTRL against a real card, both ways
+- bound fstool below the release that demands a filesystem feature
+- *(spin)* the detector on a whole board, and what it costs
+- *(machine)* the F407's watchdog reset path, end to end
+- ignore the per-agent CARGO_TARGET_DIR
+- *(dev-sdio)* a guest moves blocks over DMA2 without ever reading the FIFO
+- *(machine)* the F407's flash guarantee is no silent modification, not a fault
+- *(dev-stm32)* the two flash bases, and that nothing writes the array back
+- *(dev-stm32)* link the flash module header at items rustdoc can reach
+- *(dev-stm32)* say which SNB field width the F4 flash decodes
+- declare the `dev-stm32-flash` feature
+- *(gdb-v7m)* the four M-profile behaviours a debugger gets wrong
+- Merge branch 'worktree-agent-a2b16c84daee86067'
+- Merge branch 'worktree-agent-a4af39317f2a25f0b'
+- *(sched)* what the budget change measured, end to end
+
 ## [0.0.5](https://github.com/KarpelesLab/rsemu/compare/v0.0.4...v0.0.5) - 2026-09-11
 
 ### Added
