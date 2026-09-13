@@ -2637,6 +2637,30 @@ dev-amiga-denise = ["dev-amiga"]
 # dependencies and is `no_std + alloc`.
 dev-amiga-agnus = ["dev-amiga", "dev-amiga-paula", "dev-amiga-denise"]
 
+# The Amiga keyboard (src/dev/amiga/keyboard.rs): `amiga.keyboard`, the
+# documented protocol on KCLK and KDAT rather than the microcontroller inside --
+# each code rotated so the up/down flag goes last and sent active low, 20/20/20
+# microsecond bit timing, the computer's handshake pulse latched after the last
+# clock, the 143 ms timeout into resync mode with `$F9` and a retransmit, the
+# power-up sync and its `$FD`/held keys/`$FE` stream, Caps Lock's LED-state
+# code, and the ten-code type-ahead buffer with `$FA` on overflow. Keys cross
+# the record/replay seam as the manual's own raw keycodes through a named host
+# object, so a recorded session replays exactly. From Appendix G and chapter 8
+# of the Amiga Hardware Reference Manual; no emulator source and no keyboard
+# firmware consulted. Implies `dev-amiga`. `no_std + alloc`, no dependencies.
+dev-amiga-keyboard = ["dev-amiga"]
+
+# The Amiga mouse (src/dev/amiga/mouse.rs): `amiga.mouse`, host motion turned
+# into quadrature transitions on the game port's four counter pins at a rate a
+# real mouse reaches -- so Denise's JOY0DAT counters count, wrap and show the
+# pins in their low bits the way chapter 8 and Appendix A describe, rather than
+# having deltas written into them -- plus the left button on a CIA-A port pin
+# and the right and middle buttons on Paula's pot pins, each applied after the
+# motion posted before it. Through the record/replay seam as a named host
+# object. From the Amiga Hardware Reference Manual; no emulator source
+# consulted. Implies `dev-amiga`. `no_std + alloc`, no dependencies.
+dev-amiga-mouse = ["dev-amiga"]
+
 # The `amiga-a500` board (machines/amiga-a500.machine plus the classes it
 # names): a big-endian 24-bit space, chip RAM at zero behind the `OVL`
 # overlay, the custom chip registers at $DFF000, and a 512 KiB Kickstart socket

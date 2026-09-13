@@ -1198,6 +1198,13 @@ pub mod mouse {
     }
 }
 
+#[cfg(any(feature = "dev-amiga-keyboard", feature = "dev-amiga-mouse"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "dev-amiga-keyboard", feature = "dev-amiga-mouse")))
+)]
+pub mod amiga;
+
 #[cfg(test)]
 mod tests {
     use super::*;
