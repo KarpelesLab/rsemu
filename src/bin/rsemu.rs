@@ -75,6 +75,14 @@ RUN OPTIONS:
                             the same, straight out of an Amiga Forever disc
                             image, key included, nothing extracted by hand.
                             Omit `rom=` to be told which ROMs it holds.
+                          adf:<file>                  an Amiga ADF disk,
+                            checked for its length, with a line saying
+                            whether its boot block will boot. The guest's
+                            writes stay in the session; `--drive df0=` is
+                            the spelling that writes them back.
+                          adf:<dvd.iso>,disk=<name>
+                            the same, out of an Amiga Forever disc image.
+                            Omit `disk=` to be told which disks it holds.
     --drive <n>=<file>[,<opt>…]
                         Back a media slot with the image *file* rather than a
                         copy of its bytes: the guest's writes go to the file,
@@ -533,8 +541,12 @@ fn run(args: &[String]) -> ExitCode {
     // and an ordinary machine. Without it `rsemu run q35-linux` refused to
     // start over an empty bay it had been given no way to name — `--drive
     // nvme0=…` was the only spelling that worked, and it needs a file.
+    // `df0` is an Amiga's internal drive, and the `floppy` argument again: an
+    // A500 with nothing in DF0 is the one at the insert-disk screen, and
+    // `amiga.floppy` reads no bytes as no disk. `--drive df0=disk.adf` still
+    // finds the slot, because the drive looks its medium up by the slot's name.
     for slot in [
-        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0",
+        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));

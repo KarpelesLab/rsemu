@@ -2250,6 +2250,18 @@ dev-blk = ["std", "dev-medium", "dep:fstool"]
 # uses), and `std`, because reading a file is the point.
 media-kickstart = ["std", "dep:fstool"]
 
+# Amiga ADF disk images as a media source (src/host/media/adf.rs):
+# `--media df0=adf:<disk.adf>` checks the length and says whether the boot block
+# will boot, and `--media df0=adf:<dvd.iso>,disk=<name>` reads the disk straight
+# out of an Amiga Forever disc image, nothing extracted. The disk that results
+# is a copy -- the guest's writes stay in the session -- and `--drive df0=` is
+# the spelling that writes through. Encoding the sectors into the MFM a drive
+# presents is the floppy's job, not this feature's (`dev-amiga-floppy`); a plain
+# path to an .adf works without this. Written from the Amiga ROM Kernel
+# Reference Manual: Devices, Appendix C, and ECMA-119. Adds `fstool` (MIT,
+# first-party) and `std`, as `media-kickstart` does, for the same reason.
+media-adf = ["std", "dep:fstool"]
+
 # The PC/AT's IDE interface (src/dev/pc/ide.rs): one channel, which is address
 # decode and nothing else. The command block (0x1f0/0x170) and the control
 # block (0x3f6/0x376) as two separate regions, because the AT decodes them at
@@ -2596,11 +2608,16 @@ dev-amiga-paula = ["dev-amiga"]
 # step with a disk in clears, RDY*/TK0*/WPRO*/CHNG* as open-collector outputs,
 # the 32-bit identification word on RDY* with the motor off, and an index
 # pulse once a revolution for CIA-B's FLAG -- and the raw MFM cells under the
-# head, which it hands to Paula's read line and takes back on a write. Disks
-# are raw MFM tracks; no image format is decoded here. From the Amiga Hardware
-# Reference Manual's chapter 8 and its Appendix E disk connector. Implies
-# `dev-amiga-paula`. `no_std + alloc`, no dependencies.
-dev-amiga-floppy = ["dev-amiga-paula"]
+# head, which it hands to Paula's read line and takes back on a write. A disk
+# is an ADF, encoded track by track into the MFM `trackdisk.device` reads --
+# the $4489 sync, the odd/even split, both checksums, the gap -- and decoded back
+# into sectors when a guest writes (src/dev/amiga/adf.rs, from the Amiga ROM
+# Kernel Reference Manual: Devices, Appendix C), or raw MFM tracks of this
+# crate's own layout. A `--drive df0=disk.adf` medium takes the guest's writes
+# back to the file. From the Amiga Hardware Reference Manual's chapter 8 and its
+# Appendix E disk connector. Implies `dev-amiga-paula` and `dev-medium`, the
+# storage seam a write-through disk is. `no_std + alloc`, no dependencies.
+dev-amiga-floppy = ["dev-amiga-paula", "dev-medium"]
 
 # Denise (src/dev/amiga/denise.rs), the Amiga's video output chip: the 32
 # colour registers, single and dual playfields, hold-and-modify and

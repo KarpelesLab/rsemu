@@ -670,8 +670,10 @@ const KEYBOARD_PORT: &str = "keyboard";
 /// here, so the two lists had quietly parted; `q35-uefi` grew one too, and a
 /// `demo,machine-q35-uefi` module would have refused to assemble the board over
 /// a bay it had been given no way to name.
+///
+/// `df0` is an Amiga's internal drive: empty is the insert-disk screen.
 const EMPTY_BAYS: &[&str] = &[
-    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0",
+    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0",
 ];
 
 /// Where the media image a boot binds comes from.

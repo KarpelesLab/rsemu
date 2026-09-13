@@ -19,6 +19,8 @@
 //!   --media firmware=/path/to/fw.bin                      a file
 //!   --media firmware=kickstart:/path/to/kick.rom          a decoded Kickstart
 //!   --media firmware=kickstart:/path/to/dvd.iso,rom=<name>
+//!   --media df0=adf:/path/to/disk.adf                     a checked ADF
+//!   --media df0=adf:/path/to/dvd.iso,disk=<name>
 //! ```
 //!
 //! The scheme list is closed and short — anything that is not one of these
@@ -36,8 +38,15 @@ use crate::core::error::{Error, Result};
 #[cfg_attr(docsrs, doc(cfg(feature = "media-kickstart")))]
 pub mod kickstart;
 
+#[cfg(feature = "media-adf")]
+#[cfg_attr(docsrs, doc(cfg(feature = "media-adf")))]
+pub mod adf;
+
 /// The prefix that selects the Kickstart source.
 const KICKSTART: &str = "kickstart:";
+
+/// The prefix that selects the ADF source.
+const ADF: &str = "adf:";
 
 /// Bytes for a media slot, and anything worth telling the user about them.
 #[derive(Debug, Clone)]
@@ -63,6 +72,9 @@ pub struct Loaded {
 pub fn read(spec: &str) -> Result<Loaded> {
     if let Some(rest) = spec.strip_prefix(KICKSTART) {
         return read_kickstart(rest);
+    }
+    if let Some(rest) = spec.strip_prefix(ADF) {
+        return read_adf(rest);
     }
     let bytes = std::fs::read(spec).map_err(|e| Error::Config {
         at: spec.to_string(),
@@ -97,6 +109,59 @@ fn read_kickstart(rest: &str) -> Result<Loaded> {
     })
 }
 
+#[cfg(feature = "media-adf")]
+fn read_adf(rest: &str) -> Result<Loaded> {
+    let disk = adf::open(rest)?;
+    let note = Some(disk.describe());
+    Ok(Loaded {
+        bytes: disk.bytes,
+        note,
+    })
+}
+
+#[cfg(not(feature = "media-adf"))]
+fn read_adf(rest: &str) -> Result<Loaded> {
+    Err(Error::Config {
+        at: rest.to_string(),
+        message: String::from(
+            "this build has no `adf` media source; rebuild with the `media-adf` feature to read \
+             an Amiga disk image this way (a plain path to an .adf works without it)",
+        ),
+    })
+}
+
+/// Where the ISO 9660 standard identifier sits: the volume descriptor set
+/// begins at logical sector 16 of 2048 bytes, and `CD001` is at offset 1 of a
+/// descriptor (ECMA-119 §6.7.1, §8.1.2).
+#[cfg(any(feature = "media-kickstart", feature = "media-adf"))]
+const ISO_MAGIC_OFFSET: u64 = 16 * 2048 + 1;
+
+/// Whether `path` carries the ISO 9660 standard identifier.
+///
+/// A cheap two-syscall probe rather than a format guess from the extension: an
+/// Amiga Forever disc image is 1.7 GB and must not be read into memory to find
+/// out what it is, and a ROM or an ADF must not be handed to a filesystem
+/// reader. Shared by every source that can look inside a disc.
+#[cfg(any(feature = "media-kickstart", feature = "media-adf"))]
+fn is_iso(path: &std::path::Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).map_err(|e| Error::Config {
+        at: path.display().to_string(),
+        message: alloc::format!("cannot be opened: {e}"),
+    })?;
+    if file.seek(SeekFrom::Start(ISO_MAGIC_OFFSET)).is_err() {
+        return Ok(false);
+    }
+    let mut magic = [0u8; 5];
+    match file.read_exact(&mut magic) {
+        // Short of 32 KiB is every ROM there is, and no ISO; an ADF is longer,
+        // and its sector 16 is not a volume descriptor.
+        Ok(()) => Ok(&magic == b"CD001"),
+        Err(_) => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +185,16 @@ mod tests {
             panic!("expected a config error");
         };
         assert_eq!(at, "/nonexistent/rsemu/media-test.bin");
+    }
+
+    #[cfg(not(feature = "media-adf"))]
+    #[test]
+    fn an_adf_scheme_this_build_lacks_says_which_feature_it_wants() {
+        let e = read("adf:/some/disk.adf").unwrap_err();
+        let Error::Config { message, .. } = e else {
+            panic!("expected a config error");
+        };
+        assert!(message.contains("media-adf"), "{message}");
     }
 
     #[cfg(not(feature = "media-kickstart"))]

@@ -32,6 +32,10 @@ Every run prints one line naming what it decoded, because nothing else can:
 rsemu: firmware: Kickstart 40.68, 512 KiB, keyed, checksum verified
 ```
 
+An ADF disk comes off the same disc the same way, as
+`--media df0=adf:<dvd.iso>,disk=<name>`; `docs/platforms/amiga.md` (*Disks*)
+has that source, and why the disk it produces is a copy.
+
 ## Media decode, not a loader device
 
 `dfu.loader` (`src/dev/dfuse.rs`) is the precedent that decides this, and it

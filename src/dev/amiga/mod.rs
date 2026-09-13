@@ -11,6 +11,7 @@
 //! | `agnus` | `dev-amiga-agnus`: Agnus — the beam counters and sync, `DMACON`, the copper, the blitter, and every DMA transfer |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
 //! | [`floppy`] | `dev-amiga-floppy`: a floppy drive — the mechanism on the CIA ports, raw MFM cells for Paula |
+//! | [`adf`] | `dev-amiga-floppy`: not a class — an ADF's sectors encoded as the MFM tracks `trackdisk.device` reads, and decoded back |
 //! | `denise` | `dev-amiga-denise`: Denise — the colour table, playfields, sprites and collisions, driven a line at a time by whatever counts the beam |
 //! | `keyboard` | `dev-amiga-keyboard`: the keyboard — Appendix G's `KCLK`/`KDAT` protocol, keyed from the host through the record/replay seam |
 //! | `mouse` | `dev-amiga-mouse`: the mouse — host motion as quadrature transitions for Denise's counters, and three buttons |
@@ -44,8 +45,10 @@
 //!
 //! # What is here and what is not
 //!
-//! Deliberately absent from this module: the floppy's disk images, the serial
-//! port's host end and the video output's, which are host adapters. The 8520s
+//! Deliberately absent from this module: where a disk image comes from (a
+//! file, an Amiga Forever disc — `host::media::adf`), the serial port's host
+//! end and the video output's, which are host adapters. What an image *means*
+//! to the drive is here, in [`adf`]. The 8520s
 //! are `mos.8520` in [`dev::mos`](crate::dev::mos). The custom register space
 //! answers and counts what it could not route
 //! ([`custom::CustomBus::unclaimed`]), which is a measurement of how much
@@ -85,6 +88,10 @@ pub mod paula;
 #[cfg(feature = "dev-amiga-floppy")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-floppy")))]
 pub mod floppy;
+
+#[cfg(feature = "dev-amiga-floppy")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-floppy")))]
+pub mod adf;
 
 use crate::core::error::Result;
 

@@ -6,7 +6,7 @@
 //! cable.
 //!
 //! ```text
-//!   object df0 "amiga.floppy" { clock = clk / 8, paula = paula }
+//!   object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
 //!
 //!   wire cia_b.pb7 -> df0.mtr   { pull = "up" }    # MTR*
 //!   wire cia_b.pb3 -> df0.sel   { pull = "up" }    # SEL0*
@@ -57,12 +57,40 @@
 //! # The disk
 //!
 //! [`MfmDisk`] is raw MFM: 160 tracks of cells, cylinder 0 side 0 first, as a
-//! controller would see them. The `image` media slot takes exactly that, back
-//! to back ([`MfmDisk::from_raw`]) — a layout of this crate's own, not an Amiga
-//! format. Nothing here encodes a file system; turning an ADF's sectors into
-//! AmigaDOS tracks is a separate job, and the tests build their tracks by hand.
-//! Writes land in the tracks and are part of the snapshot; nothing is written
-//! back to the host.
+//! controller would see them. Whatever the image was, that is what the head
+//! passes over and what a write changes. The `image` media slot takes two
+//! shapes, told apart by length:
+//!
+//! * **an ADF**, 901 120 bytes of AmigaDOS sectors, which is encoded track by
+//!   track into the MFM `trackdisk.device` expects ([`super::adf`] has the
+//!   format and where it came from);
+//! * **raw MFM**, [`TRACKS`] × [`TRACK_BYTES`] bytes of cells back to back
+//!   ([`MfmDisk::from_raw`]) — a layout of this crate's own, not an Amiga
+//!   format, for a disk no sector image can describe.
+//!
+//! An empty slot is an empty drive, which is what a board with nothing in DF0
+//! binds.
+//!
+//! # Where a write goes
+//!
+//! Into the tracks, always: they are the disk, and they are in the snapshot.
+//! Whether it goes any further is a property of the **run**, never of the
+//! board, and the split is the one `--hd0` and `--drive hd0=` already draw for
+//! a hard disk:
+//!
+//! * **Bytes in a media slot** (`--media df0=…`, including an ADF read out of a
+//!   disc image) are a copy. The guest's writes last as long as the session
+//!   and its snapshots, and the file they came from is never touched. That is
+//!   the only safe default for an image the user may own exactly one copy of,
+//!   and the only possible one for an ADF inside an ISO.
+//! * **A [`Medium`] installed under the slot's name** (`--drive df0=disk.adf`)
+//!   is the disk itself. A track the guest wrote is decoded back into sectors
+//!   when the head leaves it, when the motor stops, and at every flush, and
+//!   each sector that decodes goes to the medium at its ADF offset. A sector
+//!   that does not — a track written in some other format — cannot be said in
+//!   an ADF at all: the file keeps what it had and the next flush fails naming
+//!   it, rather than a run that looked successful having quietly kept less than
+//!   the guest wrote.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -79,18 +107,20 @@ use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::wire::{Drive, FanIn, Level, Resolve, WireId, WireSink, WireSource};
+use crate::dev::medium::{self, Medium};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
+use super::adf;
 use super::paula::{DiskDrive, FAST_CELL_TICKS, PaulaPort};
 
 /// The class name a machine file writes.
 pub const CLASS_NAME: &str = "amiga.floppy";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// Cylinders on a double-density disk: 80, which with two sides and 11 sectors
 /// of 512 bytes is the manual's "over 900,000 bytes per disk".
@@ -121,6 +151,9 @@ pub const MEDIA_RANK: LockRank = LockRank::new(0x5400);
 
 /// A tick no event is scheduled for.
 const NO_EVENT: u64 = u64::MAX;
+
+/// A dirty-track set with every track in it.
+const ALL_TRACKS: [u64; 3] = [u64::MAX, u64::MAX, (1 << (TRACKS - 128)) - 1];
 
 // -- pins -------------------------------------------------------------------
 
@@ -191,6 +224,75 @@ impl MfmDisk {
         })
     }
 
+    /// A disk from an ADF: [`adf::ADF_BYTES`] of sectors, each track encoded
+    /// as [`adf::encode_track`] lays it out. `None` if the length is anything
+    /// else.
+    #[must_use]
+    pub fn from_adf(bytes: &[u8]) -> Option<MfmDisk> {
+        if bytes.len() != adf::ADF_BYTES {
+            return None;
+        }
+        Some(MfmDisk {
+            tracks: bytes
+                .chunks(adf::TRACK_DATA)
+                .enumerate()
+                .map(|(t, data)| adf::encode_track(t as u8, data))
+                .collect(),
+            write_protected: false,
+        })
+    }
+
+    /// A disk from either shape the `image` slot takes, told apart by length.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Property`] naming `name` and both lengths, or saying that a
+    /// high-density ADF is not a disk for a double-density drive.
+    pub fn from_image(name: &str, bytes: &[u8]) -> Result<MfmDisk> {
+        if let Some(disk) = MfmDisk::from_adf(bytes) {
+            return Ok(disk);
+        }
+        if let Some(disk) = MfmDisk::from_raw(bytes) {
+            return Ok(disk);
+        }
+        let why = if bytes.len() == adf::ADF_HD_BYTES {
+            String::from(
+                "a high-density ADF, 22 sectors a track, and this is a double-density drive",
+            )
+        } else {
+            format!(
+                "neither an ADF ({} bytes) nor a raw MFM disk ({TRACKS} tracks of \
+                 {TRACK_BYTES} bytes, {} in all)",
+                adf::ADF_BYTES,
+                TRACKS * TRACK_BYTES
+            )
+        };
+        Err(Error::Property(format!(
+            "property `image`: `{name}` is {} bytes, which is {why}",
+            bytes.len()
+        )))
+    }
+
+    /// The sectors of every track that decode as AmigaDOS ones, laid out as an
+    /// ADF, and how many did not. A sector that does not decode is zeroes.
+    #[must_use]
+    pub fn to_adf(&self) -> (Vec<u8>, usize) {
+        let mut out = vec![0u8; adf::ADF_BYTES];
+        let mut missing = 0;
+        for (t, track) in self.tracks.iter().enumerate() {
+            for (s, sector) in adf::decode_track(track, t as u8).into_iter().enumerate() {
+                match sector {
+                    Some(data) => {
+                        let at = adf::track_offset(t) + s * adf::SECTOR_BYTES;
+                        out[at..at + adf::SECTOR_BYTES].copy_from_slice(&data);
+                    }
+                    None => missing += 1,
+                }
+            }
+        }
+        (out, missing)
+    }
+
     /// Replace one track's cells, starting at the index. Shorter data leaves
     /// the rest of the track blank; longer data is cut at the revolution.
     ///
@@ -256,6 +358,10 @@ struct State {
     /// The identification bit `RDY*` shows while selected with the motor off.
     id_bit: bool,
     disk: Option<MfmDisk>,
+    /// Tracks written since they were last decoded back to a medium, one bit
+    /// per track. Kept whether or not there is a medium, so a snapshot says
+    /// the same thing either way.
+    dirty: [u64; 3],
 }
 
 impl State {
@@ -275,7 +381,37 @@ impl State {
             id_next: 0,
             id_bit: false,
             disk: None,
+            dirty: [0; 3],
         }
+    }
+
+    fn is_dirty(&self, track: usize) -> bool {
+        self.dirty[track / 64] >> (track % 64) & 1 != 0
+    }
+
+    fn mark_dirty(&mut self, track: usize) {
+        self.dirty[track / 64] |= 1 << (track % 64);
+    }
+
+    /// Take the written tracks a medium should be told about: every one when
+    /// `all`, and otherwise every one the head is not still over — a track is
+    /// not finished while the drive may still be writing it.
+    fn take_written(&mut self, all: bool) -> Vec<(usize, Vec<u8>)> {
+        if self.dirty == [0; 3] {
+            return Vec::new();
+        }
+        let here = self.spinning().then(|| self.track());
+        let mut out = Vec::new();
+        for t in 0..TRACKS {
+            if !self.is_dirty(t) || (!all && here == Some(t)) {
+                continue;
+            }
+            self.dirty[t / 64] &= !(1 << (t % 64));
+            if let Some(disk) = &self.disk {
+                out.push((t, disk.tracks[t].clone()));
+            }
+        }
+        out
     }
 
     fn spinning(&self) -> bool {
@@ -394,6 +530,24 @@ struct Shared {
     out: Mutex<Outputs>,
     lazy: Mutex<Option<LazyHandle>>,
     paula: Mutex<Option<PaulaPort>>,
+    /// The medium the disk in the drive *is*, when the run installed one. Not
+    /// part of the snapshot: it is host state.
+    medium: Mutex<Option<Arc<dyn Medium>>>,
+    /// Whether there is one, readable without a lock on the path every input
+    /// change takes.
+    backed: AtomicBool,
+    /// What went wrong writing back since the last flush, for the next flush
+    /// to report.
+    faults: Mutex<Faults>,
+}
+
+/// Write-back failures, held for the flush that reports them.
+#[derive(Debug, Default)]
+struct Faults {
+    /// Track and sector of every sector a written track did not decode for.
+    lost: Vec<(usize, usize)>,
+    /// The first error the medium returned.
+    error: Option<Error>,
 }
 
 impl fmt::Debug for Shared {
@@ -436,15 +590,57 @@ impl Shared {
     }
 
     fn update(&self, f: impl FnOnce(&mut State)) {
-        let moved = {
+        let (moved, written) = {
             let mut state = self.state.lock();
-            let before = (state.pins(), state.spinning());
+            let before = (state.pins(), state.spinning(), state.track());
             f(&mut state);
             self.publish(&state);
-            before != (state.pins(), state.spinning())
+            let after = (state.pins(), state.spinning(), state.track());
+            // A track is handed back when the head leaves it or stops passing
+            // over it, which is when a write to it has to be over.
+            let left = before.2 != after.2 || (before.1 && !after.1);
+            let written = if left && self.backed.load(Ordering::Relaxed) {
+                state.take_written(false)
+            } else {
+                Vec::new()
+            };
+            ((before.0, before.1) != (after.0, after.1), written)
         };
+        self.write_back(written);
         if moved {
             self.refresh();
+        }
+    }
+
+    /// Decode written tracks and put their sectors on the medium, with none of
+    /// this drive's state locked.
+    fn write_back(&self, written: Vec<(usize, Vec<u8>)>) {
+        if written.is_empty() {
+            return;
+        }
+        let Some(medium) = self.medium.lock().clone() else {
+            return;
+        };
+        let mut lost = Vec::new();
+        let mut error = None;
+        for (t, mfm) in written {
+            for (s, sector) in adf::decode_track(&mfm, t as u8).into_iter().enumerate() {
+                let Some(data) = sector else {
+                    lost.push((t, s));
+                    continue;
+                };
+                let at = (adf::track_offset(t) + s * adf::SECTOR_BYTES) as u64;
+                if let Err(e) = medium.write_at(at, &data)
+                    && error.is_none()
+                {
+                    error = Some(medium::error_at(at, e));
+                }
+            }
+        }
+        let mut faults = self.faults.lock();
+        faults.lost.extend(lost);
+        if faults.error.is_none() {
+            faults.error = error;
         }
     }
 
@@ -486,13 +682,14 @@ impl DiskDrive for Shared {
         let Some(disk) = state.disk.as_mut() else {
             return;
         };
-        if disk.write_protected {
+        if disk.write_protected || cells.is_empty() {
             return;
         }
         for (i, c) in cells.iter().enumerate() {
             let at = start + i as u64 * cell;
             disk.set_cell(track, (at / FAST_CELL_TICKS) % TRACK_CELLS, *c);
         }
+        state.mark_dirty(track);
     }
 }
 
@@ -531,12 +728,20 @@ pub struct Floppy {
 }
 
 impl Floppy {
-    /// Validate `props` and build an empty drive.
+    /// Validate `props` and build the drive, with the disk its `image` names.
+    ///
+    /// # Where the disk comes from
+    ///
+    /// The `image` slot's name is looked up first as a host-installed
+    /// [`Medium`] — what `--drive df0=disk.adf` puts there — which must be an
+    /// ADF, and which the guest's writes go back to. Otherwise the slot's bytes
+    /// are the disk, and writes stay in the session. See the module docs.
     ///
     /// # Errors
     ///
-    /// [`Error::Property`] if `paula` is missing, or a property this class does
-    /// not know was given.
+    /// [`Error::Property`] if `paula` is missing, a property this class does
+    /// not know was given, or the image is neither shape the slot takes;
+    /// [`Error::Config`] if a supplied medium is not an ADF or cannot be read.
     pub fn new(props: &Props) -> Result<Floppy> {
         let mut r = props.reader();
         let paula_path = r.require_link("paula")?.as_str().to_string();
@@ -544,20 +749,32 @@ impl Floppy {
         let protected: bool = r.or("write-protected", false)?;
         r.finish()?;
         let drive = Floppy::bare(paula_path);
-        if let Some(image) = image.filter(|m| !m.is_empty()) {
-            let mut disk = MfmDisk::from_raw(image.bytes()).ok_or_else(|| {
-                Error::Property(format!(
-                    "property `image`: `{}` is {} bytes, and a raw MFM disk is {} tracks of \
-                     {TRACK_BYTES} bytes, {} in all",
-                    image.name(),
-                    image.len(),
-                    TRACKS,
-                    TRACKS * TRACK_BYTES
-                ))
-            })?;
-            disk.write_protected = protected;
-            drive.shared.state.lock().disk = Some(disk);
-        }
+
+        // A medium the host installed under the slot's name wins, exactly as it
+        // does for `ata.disk`: a run that said `--drive df0=…` meant it.
+        let supplied = match (props.hosts(), image) {
+            (Some(hosts), Some(image)) => {
+                medium::get(hosts, image.name())?.and_then(|slot| slot.take())
+            }
+            _ => None,
+        };
+        let disk = match (supplied, image) {
+            (Some(medium), image) => {
+                let name = image.map_or("image", crate::core::props::Media::name);
+                let mut disk = disk_on(&*medium, name)?;
+                disk.write_protected = protected || medium.is_read_only();
+                *drive.shared.medium.lock() = Some(medium);
+                drive.shared.backed.store(true, Ordering::Relaxed);
+                Some(disk)
+            }
+            (None, Some(image)) if !image.is_empty() => {
+                let mut disk = MfmDisk::from_image(image.name(), image.bytes())?;
+                disk.write_protected = protected;
+                Some(disk)
+            }
+            (None, _) => None,
+        };
+        drive.shared.state.lock().disk = disk;
         Ok(drive)
     }
 
@@ -571,6 +788,9 @@ impl Floppy {
             out: Mutex::with_rank(LockRank::WIRE, Outputs::default()),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
             paula: Mutex::with_rank(LockRank::LEAF, None),
+            medium: Mutex::with_rank(LockRank::LEAF, None),
+            backed: AtomicBool::new(false),
+            faults: Mutex::with_rank(LockRank::LEAF, Faults::default()),
         });
         Floppy {
             shared,
@@ -580,18 +800,41 @@ impl Floppy {
     }
 
     /// Put a disk in. The change flop stays set until the head is stepped.
+    ///
+    /// A disk put in by hand is its own: a disk that was a medium goes out
+    /// first, its written tracks handed back, and the medium with it.
     pub fn insert(&self, disk: MfmDisk) {
-        self.shared.update(|st| st.disk = Some(disk));
+        self.detach_medium();
+        self.shared.update(|st| {
+            st.disk = Some(disk);
+            st.dirty = [0; 3];
+        });
     }
 
     /// Take the disk out, which sets the change flop.
+    ///
+    /// A disk that is a medium has its written tracks handed back first, and
+    /// the medium leaves with it; a failure to do that is kept for the next
+    /// [`flush`](Device::flush) to report.
     pub fn eject(&self) -> Option<MfmDisk> {
+        self.detach_medium();
         let mut taken = None;
         self.shared.update(|st| {
             taken = st.disk.take();
+            st.dirty = [0; 3];
             st.changed = true;
         });
         taken
+    }
+
+    /// Hand a medium its written tracks and let go of it.
+    fn detach_medium(&self) {
+        if !self.shared.backed.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let written = self.shared.state.lock().take_written(true);
+        self.shared.write_back(written);
+        let _ = self.shared.medium.lock().take();
     }
 
     /// A copy of the disk in the drive, writes included.
@@ -645,6 +888,28 @@ impl Device for Floppy {
         self.shared.update(|st| st.motor = false);
     }
 
+    fn flush(&self) -> Result<()> {
+        let written = self.shared.state.lock().take_written(true);
+        self.shared.write_back(written);
+        let medium = self.shared.medium.lock().clone();
+        let faults = core::mem::take(&mut *self.shared.faults.lock());
+        if let Some(e) = faults.error {
+            return Err(e);
+        }
+        if let Some(medium) = medium {
+            medium.flush().map_err(|e| medium::error_at(0, e))?;
+        }
+        if let Some(&(track, sector)) = faults.lost.first() {
+            return Err(Error::State(format!(
+                "{} sector(s) the guest wrote do not decode as AmigaDOS sectors, the first \
+                 track {track} sector {sector}; an ADF cannot hold them, so the file keeps \
+                 what it had there",
+                faults.lost.len()
+            )));
+        }
+        Ok(())
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let st = self.shared.state.lock().clone();
         w.write_u64(st.ticks)?;
@@ -663,6 +928,9 @@ impl Device for Floppy {
         }
         w.write_u8(st.cylinder)?;
         w.write_u8(st.id_next)?;
+        for word in st.dirty {
+            w.write_u64(word)?;
+        }
         w.write_bool(st.disk.is_some())?;
         if let Some(disk) = &st.disk {
             w.write_bool(disk.write_protected)?;
@@ -687,6 +955,10 @@ impl Device for Floppy {
         st.id_bit = r.read_bool()?;
         st.cylinder = r.read_u8()?.min(CYLINDERS - 1);
         st.id_next = r.read_u8()? % 32;
+        for word in &mut st.dirty {
+            *word = r.read_u64()?;
+        }
+        st.dirty[2] &= ALL_TRACKS[2];
         if r.read_bool()? {
             let mut disk = MfmDisk::blank();
             disk.write_protected = r.read_bool()?;
@@ -701,6 +973,11 @@ impl Device for Floppy {
                 track.copy_from_slice(bytes);
             }
             st.disk = Some(disk);
+        }
+        if self.shared.backed.load(Ordering::Relaxed) && st.disk.is_some() {
+            // The snapshot's tracks are the disk now, and the medium has to
+            // come to agree with them: every track is owed to it.
+            st.dirty = ALL_TRACKS;
         }
         {
             let mut state = self.shared.state.lock();
@@ -778,6 +1055,25 @@ impl Instance for Floppy {
     }
 }
 
+/// Read an ADF medium into a disk.
+fn disk_on(medium: &dyn Medium, name: &str) -> Result<MfmDisk> {
+    let capacity = medium.capacity();
+    if capacity != adf::ADF_BYTES as u64 {
+        return Err(Error::Config {
+            at: name.to_string(),
+            message: format!(
+                "a medium in a floppy drive is an ADF of {} bytes, and this one is {capacity}",
+                adf::ADF_BYTES
+            ),
+        });
+    }
+    let mut bytes = vec![0u8; adf::ADF_BYTES];
+    medium
+        .read_at(0, &mut bytes)
+        .map_err(|e| medium::error_at(0, e))?;
+    MfmDisk::from_adf(&bytes).ok_or_else(|| Error::State(String::from("an ADF changed length")))
+}
+
 /// The `amiga.floppy` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
@@ -795,7 +1091,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "image",
             kind: ValueKind::Media,
             required: false,
-            summary: "the media slot a raw MFM disk is bound to; absent or empty is no disk",
+            summary: "the media slot the disk is bound to: an ADF or a raw MFM dump, or an ADF \
+                      medium installed under the slot's name; absent or empty is no disk",
         },
         PropertySpec {
             name: "write-protected",

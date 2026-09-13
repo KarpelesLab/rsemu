@@ -23,6 +23,7 @@ decided, what it had to leave open, and where each chip meets the others.
 | The same manual as it appears on the Amiga Developer CD 2.1 | Chapter 2 (the copper, the beam counters' ranges and clocks), chapter 3 (display window and data fetch), chapter 4 (sprite DMA), chapter 6 (the blitter), chapter 7 (DMA control, beam position, interrupts), Appendix A (bit layouts), Appendix C (ECS, Agnus identification) — what `amiga.agnus` is written from, and the copy `regs.rs` was checked against row by row |
 | MC68000 User's Manual (Motorola) | The reset sequence, and the instruction encodings the test ROMs are hand-assembled from |
 | The same *Hardware Reference Manual*, for input | Appendix G, "Keyboard Interface" (pp. 357-364): the protocol, timing, handshake, resync, power-up sequence, special codes and the matrix table with every key's legend; chapter 8, "The Keyboard" (pp. 251-254) and "Reading Mouse/Trackball Controllers" and "Mouse Buttons" (pp. 229-233); Table 8-4 (`POTGO`); Appendix A, `JOY0DAT` and `JOYTEST` (pp. 281-282); Appendix E, CIA port assignments; Appendix F, the 8520's serial port and "Bidirectional Feature" |
+| [*Amiga ROM Kernel Reference Manual: Devices*, 3rd edition](http://amigadev.elowar.com/read/ADCD_2.1/Devices_Manual_guide/node015B.html) (Commodore-Amiga Inc.), Appendix C | The floppy's track and sector layout, the MFM encoding and its odd/even split, and the boot block's type and checksum — what `src/dev/amiga/adf.rs` and `src/host/media/adf.rs` are written from. See *Disks* below for the one thing it leaves out |
 
 **Nothing else.** Every Amiga emulator the project is aware of is copyleft and
 is listed under *Deliberately excluded* in [`../README.md`](../README.md), and
@@ -118,7 +119,100 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 | **`MSBSYNC`, precompensation** | One sentence each, and precomp is analogue | Stored and not acted on |
 | **`DSKSYNC` out of reset** | The manual does not say | Zero — which matches an idle, zero read line on every cell, so `DSKSYN` is requested until software loads a sync word |
 | **Audio's state diagram** | Figure 5-8's arrows are not legible in the available scan | The chapter's prose: see `paula.rs` |
-| **Disk images** | ADF is AmigaDOS's format, not the hardware's | The drive's `image` slot takes a raw MFM dump of its own layout; nothing encodes a file system yet |
+| **The sector checksum's arithmetic** | Appendix C of the RKRM *Devices* names both fields and gives no formula | An XOR of the region's MFM longwords, data cells only — pinned down against Kickstart's own `trackdisk.device`; see *Disks* |
+
+## Disks
+
+DF0 takes an **ADF** — AmigaDOS's 1760 sectors back to back, 901 120 bytes —
+and encodes it into the raw MFM tracks a drive head presents, because an Amiga
+never reads a sector: `trackdisk.device` has Paula DMA a whole track into chip
+RAM and finds the sectors in software. `src/dev/amiga/adf.rs` has the codec.
+
+**The track**, from the RKRM *Devices*, Appendix C ("Commodore-Amiga Disk
+Format", "MFM Track Encoding"): a gap, then eleven sectors with no gaps between
+them. Each sector is `$00 $00` (MFM `$AAAA $AAAA`), two `$A1` sync bytes with a
+missing clock (`$4489 $4489`), a longword of format `$FF`, track, sector and
+sectors-until-the-gap, sixteen bytes of OS recovery info, a longword header
+checksum, a longword data checksum, and 512 bytes of data — 1088 bytes of MFM.
+Each field is encoded as a block, **all its odd bits first, then all its even
+bits**, each data bit behind a clock bit that is set only between two zeroes.
+The manual's `$4489` pins the cell order: data in the `$5555` cells. Eleven
+sectors are 11 968 bytes of the drive's 12 500-byte revolution; the gap is the
+other 532, written first, the order of the manual's "first-ever write".
+
+**The checksums.** Appendix C does not give the arithmetic, and neither does any
+other Commodore document found (the 1.3 RKRM *Libraries and Devices*, the
+AmigaOS wiki's trackdisk chapter). What is used: the XOR of the region's
+longwords **as encoded on the disk**, masked to the data cells, `$5555_5555` —
+the header sum over the format longword and the recovery info, the data sum over
+the 512 bytes. That it is an XOR of 32-bit chunks is how it is publicly described
+(techtravels.org, 2010, a hardware project); which chunks and which mask were
+established **black-box against Kickstart**: 2.04 boots a Workbench ADF encoded
+this way, and refuses the same disk with one cell flipped in every data sum, or
+in every header sum (`tests/amiga_adf.rs`, behind `RSEMU_AMIGA_ROM_DIR` and
+`RSEMU_AMIGA_ADF_DIR`). No emulator's source or output was consulted.
+
+**Where a write goes** is decided by the run, never by the board, and on the
+line `--hd0` and `--drive hd0=` already draw for a hard disk:
+
+| Given as | The guest's writes |
+| --- | --- |
+| `--media df0=disk.adf`, `--media df0=adf:…` | Land in the session's tracks and its snapshots. The file is never touched: it may be the user's only copy of a Workbench disk, and an ADF inside a disc image cannot be written at all |
+| `--drive df0=disk.adf` (`,ro` to protect it) | Go back to the file. A written track is decoded into sectors when the head leaves it, when the motor stops, and at every flush; each sector that decodes goes to its ADF offset. One that does not — a track written in some other format — cannot be said in an ADF, so the file keeps what it had and the flush fails naming it |
+
+**The media syntax** follows `kickstart:`:
+
+```
+rsemu run <board> --media df0=disk.adf                         a plain path works
+rsemu run <board> --media df0=adf:disk.adf                     checked, with a note
+rsemu run <board> --media df0=adf:<dvd.iso>,disk=<name>        out of Amiga Forever
+rsemu run <board> --drive df0=disk.adf                          writes go to the file
+```
+
+`adf:` (feature `media-adf`) checks the length, refuses a high-density image by
+name, and says whether the boot block will boot (RKRM *Devices*, Appendix C:
+`DOS` type, "an additive carry wraparound sum of 0xffffffff"). `disk=` resolves
+in `/Amiga Files/Shared/adf/`, `.adf` optional; a disc with no `disk=` lists
+what it holds. A raw MFM dump of the drive's own layout (160 × 12 500 bytes)
+still works, told apart by length.
+
+**An empty drive is the default.** A named media slot must be bound, so
+`rsemu run` and the wasm front end bind `df0` to no bytes when nobody names a
+disk — the same list, and the same argument, as a PC's `floppy` — and
+`amiga.floppy` reads no bytes as no disk. The shipped `amiga-a500.machine` does
+not name the slot yet; `machines/tests/amiga-a500-df0.machine` is the board with
+the one property that does, `image = "df0"` on `df0`.
+
+### How far a real disk gets
+
+Kickstart 2.04 with the Workbench 2.04 ADF, both read in place: the boot block
+runs, AmigaDOS reads the root block on cylinder 40, and the head works across
+the disk from cylinder 0 to 78 loading Workbench for about thirty virtual
+seconds. Then exec raises the dead-end alert `$81000005`, a corrupt memory
+list, reboots, and shows the alert waiting for a mouse button that this board
+does not have. Workbench 1.3 on the same Kickstart does the same after about
+eleven seconds. No write reaches the disk in either run. That alert is the next
+thing to chase, and nothing so far points at the drive: the disk is never
+written, and the sectors Kickstart loaded to get that far are ones whose sums
+it checked.
+
+Two things stood between Kickstart and the drive, and one still does:
+
+* **Paula's disk queue lost words.** Agnus serves the disk slot once a line
+  (227 counts) and a `FAST` word is 112, so a third word sometimes finishes
+  before the slot; a two-word read queue dropped it, which shifted every
+  sector after it and failed every checksum on every disk. Reads now wait for
+  Agnus however many there are, and a write keeps six words in hand, because a
+  one-word queue ran dry just as the slot arrived and left a hole in the track.
+* **The 8520's one-shot start.** "In one-shot mode, a write to timer-high ...
+  will transfer the timer latch to the counter and initiate counting regardless
+  of the start bit" (Appendix F). `timer.device` calibrates against the TOD
+  clock with exactly that write, and without it Kickstart waited forever.
+* **Byte access to a custom register** is still refused (the *Open* row above),
+  and Kickstart 2.04 reads `$DFF07D` as a byte, 2.05 `$DFF006`: a bus error and
+  a dead-end alert `$80000002` before `trackdisk.device` touches a drive. The
+  real-disk tests stand a byte-tolerant window in front of the same custom bus,
+  test-local and labelled, until `custom.rs` decides what one data strobe does.
 
 ## An address with nothing at it floats; it does not fault
 

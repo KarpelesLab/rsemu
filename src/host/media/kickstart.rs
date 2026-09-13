@@ -400,11 +400,6 @@ pub const ISO_ROM_DIR: &str = "/Amiga Files/Shared/rom";
 /// The name of the key file, beside the ROMs, on the disc and on disk alike.
 pub const KEY_NAME: &str = "rom.key";
 
-/// Where the ISO 9660 standard identifier sits: the volume descriptor set
-/// begins at logical sector 16 of 2048 bytes, and `CD001` is at offset 1 of a
-/// descriptor (ECMA-119 §6.7.1, §8.1.2).
-const ISO_MAGIC_OFFSET: u64 = 16 * 2048 + 1;
-
 /// Everything after `kickstart:` on a media specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Spec {
@@ -472,7 +467,7 @@ impl Spec {
 /// an image that fails its own checksum.
 pub fn open(spec: &str) -> Result<Image> {
     let spec = Spec::parse(spec)?;
-    if is_iso(&spec.source)? {
+    if super::is_iso(&spec.source)? {
         return from_iso(&spec);
     }
     if spec.rom.is_some() {
@@ -491,31 +486,6 @@ pub fn open(spec: &str) -> Result<Image> {
         None
     };
     decode(&origin, &file, key.as_deref())
-}
-
-/// Whether `path` carries the ISO 9660 standard identifier.
-///
-/// A cheap two-syscall probe rather than a format guess from the extension: an
-/// Amiga Forever disc image is 1.7 GB and must not be read into memory to find
-/// out what it is, and a `.rom` must not be handed to a filesystem reader.
-fn is_iso(path: &Path) -> Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        config(
-            &path.display().to_string(),
-            format!("cannot be opened: {e}"),
-        )
-    })?;
-    if file.seek(SeekFrom::Start(ISO_MAGIC_OFFSET)).is_err() {
-        return Ok(false);
-    }
-    let mut magic = [0u8; 5];
-    match file.read_exact(&mut magic) {
-        Ok(()) => Ok(&magic == b"CD001"),
-        // Short of 32 KiB is every ROM there is, and no ISO.
-        Err(_) => Ok(false),
-    }
 }
 
 /// The key for a plain-file source: `key=` if it was given, else `rom.key`

@@ -2434,6 +2434,11 @@ mod tests {
             // run, behind `RSEMU_OVMF_CODE` and `RSEMU_OVMF_DISK`.
             #[cfg(feature = "machine-q35-uefi")]
             ("q35-uefi", "flash0" | "flash1" | "nvme0") => &[],
+            // An empty internal drive, which is what `rsemu run` and the wasm
+            // front end bind when nobody names a disk: an A500 at the
+            // insert-disk screen. `tests/amiga_adf.rs` puts a disk in it.
+            #[cfg(feature = "machine-amiga-a500")]
+            ("amiga-a500", "df0") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

@@ -16,6 +16,11 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        Rig::with(Floppy::bare(String::from("paula")))
+    }
+
+    /// A rig around a drive built some other way.
+    fn with(drive: Floppy) -> Rig {
         let paula = Paula::with_port(
             String::from("custom"),
             Arc::new(CharPort::new()) as Arc<dyn CharDevice>,
@@ -23,7 +28,6 @@ impl Rig {
         );
         let custom = Custom::new(&Props::new()).expect("no properties");
         custom.bus().attach(paula.chip()).expect("attaches");
-        let drive = Floppy::bare(String::from("paula"));
         drive.attach(paula.port());
         let outs = core::array::from_fn(|i| {
             let src = WireId::new(50 + i as u64);
@@ -369,10 +373,17 @@ fn the_class_names_its_controller_and_its_pins() {
     let loaded = Floppy::new(&with(raw)).unwrap().disk().expect("a disk");
     assert!(loaded.write_protected);
     assert_eq!(loaded.track(159)[TRACK_BYTES - 1], 0x55);
-    let e = Floppy::new(&with(alloc::vec![0; 901_120]))
+    let e = Floppy::new(&with(alloc::vec![0; 901_121]))
         .unwrap_err()
         .to_string();
-    assert!(e.contains("df0") && e.contains("901120"), "{e}");
+    assert!(
+        e.contains("df0") && e.contains("901121") && e.contains("901120"),
+        "{e}"
+    );
+    let e = Floppy::new(&with(alloc::vec![0; 2 * 901_120]))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("high-density"), "{e}");
     assert!(Floppy::new(&with(Vec::new())).unwrap().disk().is_none());
 
     let schema = schema();
@@ -381,4 +392,184 @@ fn the_class_names_its_controller_and_its_pins() {
     }
     assert!(f.sink("mtr", &[WireId::new(1)]).is_some());
     assert!(f.sink("rdy", &[WireId::new(1)]).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// ADF images, and writing them back
+// ---------------------------------------------------------------------------
+
+/// An ADF whose every sector is distinct.
+fn adf_image() -> Vec<u8> {
+    (0..adf::ADF_BYTES)
+        .map(|i| (i as u8) ^ ((i / adf::SECTOR_BYTES) as u8).wrapping_mul(29))
+        .collect()
+}
+
+/// Props for a drive whose `df0` slot holds `bytes`, in a build whose host
+/// objects are `hosts`.
+fn props_with(bytes: Vec<u8>, hosts: Option<Arc<crate::core::HostObjects>>) -> Props {
+    use crate::core::props::{Link, Media, Value};
+    let props = Props::new()
+        .with("paula", Value::Link(Link::new("paula").unwrap()))
+        .with("image", Media::new("df0", bytes));
+    match hosts {
+        Some(hosts) => props.with_hosts(hosts),
+        None => props,
+    }
+}
+
+/// A drive whose disk is an ADF medium, and the medium.
+fn backed_drive(image: &[u8]) -> (Floppy, Arc<crate::core::space::RamStore>) {
+    let hosts = Arc::new(crate::core::HostObjects::new());
+    let store = Arc::new(crate::core::space::RamStore::new(adf::ADF_BYTES as u64));
+    Medium::write_at(&*store, 0, image).unwrap();
+    assert!(medium::install(&hosts, "df0", Arc::clone(&store) as Arc<dyn Medium>).unwrap());
+    let drive = Floppy::new(&props_with(Vec::new(), Some(hosts))).expect("a drive");
+    (drive, store)
+}
+
+/// Lay `mfm` under the head of the track the drive is on, as Paula would.
+fn write_track(rig: &Rig, mfm: &[u8]) {
+    let cells: Vec<u8> = (0..TRACK_CELLS)
+        .map(|i| mfm[(i / 8) as usize] >> (7 - i % 8) & 1)
+        .collect();
+    let shared = Arc::clone(&rig.drive.shared);
+    shared.write_cells(0, FAST_CELL_TICKS, &cells);
+}
+
+#[test]
+fn an_adf_in_the_slot_is_encoded_into_tracks_that_decode_back_to_it() {
+    let image = adf_image();
+    let drive = Floppy::new(&props_with(image.clone(), None)).expect("an ADF is a disk");
+    let disk = drive.disk().expect("a disk");
+    assert_eq!(
+        disk.track(3),
+        &adf::encode_track(3, &image[3 * 5632..4 * 5632])[..]
+    );
+    assert_eq!(disk.to_adf(), (image, 0));
+}
+
+#[test]
+fn a_medium_gets_a_written_track_when_the_head_leaves_it_and_not_before() {
+    let image = adf_image();
+    let (drive, store) = backed_drive(&image);
+    let rig = Rig::with(drive);
+    rig.select(true);
+    rig.step(true); // cylinder 1, side 0: track 2
+
+    let new: Vec<u8> = image[2 * 5632..3 * 5632].iter().map(|b| !b).collect();
+    write_track(&rig, &adf::encode_track(2, &new));
+    let mut back = vec![0u8; adf::ADF_BYTES];
+    Medium::read_at(&*store, 0, &mut back).unwrap();
+    assert_eq!(back, image, "the head is still over the track: nothing yet");
+
+    rig.step(true);
+    Medium::read_at(&*store, 0, &mut back).unwrap();
+    assert_eq!(
+        &back[2 * 5632..3 * 5632],
+        &new[..],
+        "stepping off handed it back"
+    );
+    assert_eq!(&back[..2 * 5632], &image[..2 * 5632]);
+    assert_eq!(&back[3 * 5632..], &image[3 * 5632..]);
+    assert!(Device::flush(&rig.drive).is_ok());
+}
+
+#[test]
+fn a_flush_hands_back_the_track_under_the_head_and_stopping_the_motor_does_too() {
+    let image = adf_image();
+    let (drive, store) = backed_drive(&image);
+    let rig = Rig::with(drive);
+    rig.select(true);
+    let new = vec![0x11; 5632];
+    write_track(&rig, &adf::encode_track(0, &new));
+    Device::flush(&rig.drive).expect("a clean flush");
+    let mut back = vec![0u8; 5632];
+    Medium::read_at(&*store, 0, &mut back).unwrap();
+    assert_eq!(back, new, "flush");
+
+    let newer = vec![0x22; 5632];
+    write_track(&rig, &adf::encode_track(0, &newer));
+    rig.set("sel", true);
+    rig.set("mtr", true);
+    rig.set("sel", false); // the motor flop clocked off
+    Medium::read_at(&*store, 0, &mut back).unwrap();
+    assert_eq!(back, newer, "motor off");
+}
+
+#[test]
+fn a_track_an_adf_cannot_hold_keeps_the_files_sectors_and_fails_the_flush() {
+    let image = adf_image();
+    let (drive, store) = backed_drive(&image);
+    let rig = Rig::with(drive);
+    rig.select(true);
+    // Cells, but no AmigaDOS sectors: a disk formatted some other way.
+    write_track(&rig, &vec![0x92; TRACK_BYTES]);
+    let e = Device::flush(&rig.drive).expect_err("an ADF cannot say this");
+    assert!(e.to_string().contains("11 sector(s)"), "{e}");
+    let mut back = vec![0u8; adf::ADF_BYTES];
+    Medium::read_at(&*store, 0, &mut back).unwrap();
+    assert_eq!(back, image, "the file keeps what it had");
+    assert!(
+        Device::flush(&rig.drive).is_ok(),
+        "a fault is reported once, not forever"
+    );
+}
+
+#[test]
+fn bytes_in_a_slot_are_a_copy_and_a_flush_has_nothing_to_say() {
+    let image = adf_image();
+    let rig = Rig::with(Floppy::new(&props_with(image, None)).unwrap());
+    rig.select(true);
+    write_track(&rig, &vec![0x92; TRACK_BYTES]);
+    rig.step(true);
+    assert!(Device::flush(&rig.drive).is_ok());
+    assert_eq!(rig.drive.disk().unwrap().track(0), &[0x92; TRACK_BYTES][..]);
+}
+
+#[test]
+fn a_medium_that_is_not_an_adf_is_refused_by_name() {
+    let hosts = Arc::new(crate::core::HostObjects::new());
+    let store: Arc<dyn Medium> = Arc::new(crate::core::space::RamStore::new(1024));
+    assert!(medium::install(&hosts, "df0", store).unwrap());
+    let e = Floppy::new(&props_with(Vec::new(), Some(hosts)))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("df0") && e.contains("901120"), "{e}");
+}
+
+#[test]
+fn a_snapshot_keeps_the_written_tracks_owed_and_a_backed_load_owes_them_all() {
+    let rig = Rig::new();
+    rig.drive.insert(MfmDisk::from_adf(&adf_image()).unwrap());
+    rig.select(true);
+    write_track(&rig, &vec![0x55; TRACK_BYTES]);
+    let bytes = snapshot(&rig.drive);
+
+    let other = Rig::new();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("df0", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&other.drive, &mut chunk.reader()).unwrap();
+    assert_eq!(snapshot(&other.drive), bytes, "dirty tracks included");
+
+    // Loaded into a drive whose disk is a medium, the snapshot's disk is what
+    // the medium must come to hold.
+    let image = adf_image();
+    let (drive, store) = backed_drive(&vec![0u8; adf::ADF_BYTES]);
+    let backed = Rig::with(drive);
+    let chunk = reader
+        .load("df0", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&backed.drive, &mut chunk.reader()).unwrap();
+    let e = Device::flush(&backed.drive).expect_err("track 0 is not an AmigaDOS track");
+    assert!(e.to_string().contains("track 0"), "{e}");
+    let mut back = vec![0u8; adf::ADF_BYTES];
+    Medium::read_at(&*store, 0, &mut back).unwrap();
+    assert_eq!(
+        &back[5632..],
+        &image[5632..],
+        "every other track was written"
+    );
 }

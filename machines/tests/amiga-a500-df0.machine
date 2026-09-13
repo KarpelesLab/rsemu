@@ -1,0 +1,316 @@
+# amiga-a500-df0 - `amiga-a500.machine` with a disk slot on DF0.
+#
+# It models no product and is deliberately not in the catalog: `machines/tests/`
+# is where a board that exists for one test lives. `tests/amiga_adf.rs` runs it
+# by path, and so can a person:
+#
+#   rsemu run machines/tests/amiga-a500-df0.machine \
+#     --media kickstart=kickstart:<dvd.iso>,rom=amiga-os-204 \
+#     --media df0=adf:<dvd.iso>,disk=amiga-os-204-workbench
+#
+# ---------------------------------------------------------------------------
+# Why it exists
+# ---------------------------------------------------------------------------
+#
+# The shipped board is somebody else's to edit this round. Everything below is
+# a copy of it with exactly one difference, in the "internal drive" section:
+# `df0` names the media slot `df0`. An A500 needs that one property and
+# nothing else to boot a disk. An unbound `df0` is an empty drive, not an
+# error, because `rsemu run` and the wasm front end bind an empty slot for it
+# the way they do for a PC's `floppy` - so this board still starts with no
+# disk, at the insert-disk screen, exactly as the shipped one does.
+#
+# The rest of the original header follows.
+#
+# The map and the two decoders that make it work: chip RAM at zero, the custom
+# chip registers at $DFF000, the Kickstart ROM at the top of the space, and the
+# `OVL` overlay that puts the ROM at zero as well until software says
+# otherwise.
+#
+# And the two 8520 CIAs, decoded where Appendix F puts them, with CIA-A's PA0
+# driving the overlay; Paula, through which every interrupt reaches the
+# processor; Agnus, which counts the beam, runs the copper and the blitter and
+# makes every DMA transfer; and Denise, which turns the lines Agnus hands it
+# into a picture. `custom` counts every access it could not route, which on
+# this board should be none that reach a chip register.
+#
+# Written from the Amiga Hardware Reference Manual (Commodore-Amiga Inc., 3rd
+# edition): Appendix D for the address map, Appendix B for the register table.
+# No Amiga emulator source was consulted; they are all copyleft (ROADMAP.md 1).
+#
+# ---------------------------------------------------------------------------
+# Big-endian, and it is the board's job to say so
+# ---------------------------------------------------------------------------
+#
+# rsemu carries byte order per *region*, not per initiator, so nothing checks
+# that a machine put a 68000 on a big-endian map - get it wrong and every word
+# is swapped and the reset vector points somewhere absurd. `m68k-mini.machine`
+# has the long version. Every `map` below either says `endian = "big"` or
+# names a region that declares it (`amiga.custom` does, because a word-wide
+# big-endian register file is a fact about the chips rather than about the
+# board).
+#
+# ---------------------------------------------------------------------------
+# The CIAs
+# ---------------------------------------------------------------------------
+#
+# From the manual's Appendix F ("8520 Complex Interface Adapters") and the
+# port-assignment table in Appendix E:
+#
+#   CIA-A   $BFEr01   data bits 7-0,  chip select A12*   "can generate INT2"
+#   CIA-B   $BFDr00   data bits 15-8, chip select A13*   "can generate INT6"
+#
+# where `r` is the register, 0-F. So the sixteen registers are 256 bytes apart,
+# each chip answers on one half of the data bus, and only one chip is ever
+# selected by one access: CIA-A's select is A12 *low* (and its window has A13
+# high), CIA-B's is A13 low (with A12 high). A word read at $BFE000 is CIA-A's
+# register 0 in the low byte and nothing in the high byte, not both chips.
+#
+# `mos.8520` publishes its registers back to back and decodes nothing, so the
+# spreading-out and the lane are the board's, in `amiga.cia-decode`. Both
+# windows start on the even address, so the window's own parity is the address
+# parity the lane is decided by.
+#
+# The clock is the 68000's E clock, one tenth of the processor clock (Appendix
+# F: ".709379 Mhz PAL", ".715909 Mhz NTSC"). It is written against the crystal
+# like every other clock on the board: the processor is `clk / 4`, which makes
+# the E clock `clk / 40`. (`cpu / 10` would say the same thing.)
+#
+# The TOD inputs: CIA-A's counts a 50/60 Hz event - "VSync or line tick" - and
+# CIA-B's counts horizontal sync. Agnus drives both, at the bottom of the file.
+#
+# What is not wired yet, and why:
+#
+# * The keyboard on CIA-A's SP and CNT, the game-port fire buttons on PA6 and
+#   PA7, the LED on PA1, the Centronics port on CIA-A port B and CIA-B's PA0-PA2,
+#   and the serial handshakes on CIA-B's PA3-PA7. Every one of those pins is a
+#   pull-up with nothing on it, which is what a machine with nothing plugged in
+#   looks like: an unpressed button, no printer, no modem.
+
+# ---------------------------------------------------------------------------
+# What is deliberately not mapped, and what an access to it does
+# ---------------------------------------------------------------------------
+#
+# $20 0000 - $9F FFFF   the primary autoconfig space: nothing to configure
+# $C0 0000 - $D7 FFFF   "slow" expansion RAM on boards that have it
+# $DC 0000 - $DC FFFF   the battery-backed clock, which an A500 has no socket for
+# $E8 0000 - $EF FFFF   the autoconfig space proper
+# $F0 0000 - $F7 FFFF   "Reserved. Do not use." (Appendix D) - and probed by
+#                       Kickstart, with a word read at $F00000, while the
+#                       overlay is still up
+#
+# An access to any of them **completes and floats**: the space's `unassigned`
+# policy is `open-bus`. Appendix D marks these ranges reserved, not faulting;
+# Appendix K has the bus controller drive /DTACK for a slave that does not
+# answer and /BERR only for a bus collision or a DMA error; and the MC68000
+# user's manual (section 5.4) leaves /BERR to external circuitry a board may
+# omit. So an empty address on an A500 reads whatever the bus floats to, and a
+# write to one is lost. A `fault` policy here made Kickstart's first probe of
+# $F00000 a bus error whose vector was still in the ROM overlay, and the
+# processor double-faulted.
+
+machine "amiga-a500-df0" {
+  # -- how much of each memory -----------------------------------------------
+  #
+  # A stock A500 has 512 KiB of chip RAM; a 1 MiB Agnus takes a trapdoor
+  # expansion up to 1 MiB and the second half answers at $080000. Appendix D
+  # lists $00 0000-$07 FFFF and $08 0000-$0F FFFF as the two halves.
+  param chip-ram = 512K
+
+  # Kickstart 1.x is 256 KiB and lives at $FC0000; 2.0 and later are 512 KiB
+  # and live at $F80000. Appendix D of the manual's own edition says
+  # $FC 0000-$FF FFFF, which is the 1.x machine it was written for; the socket
+  # is the top of the space either way, so the two move together:
+  #
+  #   -p kickstart-size=256K -p rom-base=0xFC0000
+  #
+  # gives the 1.x map. They are two parameters rather than one derived from the
+  # other because the description language does not substitute a parameter into
+  # another parameter's default.
+  param kickstart-size = 512K
+  param rom-base       = 0xF80000
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One oscillator on the board, and everything on it is an exact division of
+  # that one number (ROADMAP.md 4.2), which is the whole reason the chipset can
+  # be dot-exact against the processor. PAL: 28.37516 MHz, processor at a
+  # quarter of it, 7.09379 MHz. `-p master=28636360` gives the NTSC machine and
+  # a 7.15909 MHz processor, and every clock below follows it; an NTSC machine
+  # also needs `standard = "ntsc"` on `agnus` and `denise`, because line counts
+  # are a fact about the chips rather than about the crystal.
+  param master = 28375160
+  osc   clk    = master Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # 24 bits. A 68000 has 23 address pins and A0 is implied by the two data
+  # strobes, so the chip drives a 16-megabyte space and the top byte of a
+  # 32-bit address never leaves the package - which is exactly why the ROM at
+  # $F80000 and the chip registers at $DFF000 are where they are. Empty
+  # addresses float rather than fault: see the block above the machine.
+  space mem { width = 24, endian = "big", unassigned = open-bus }
+
+  # -- the processor ---------------------------------------------------------
+  object cpu "cpu.m68k" {
+    clock  = clk / 4
+    space  = mem
+    engine = "interp"
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media kickstart=kick.rom`), and nothing below host/ opens a file. An
+  # unbound slot leaves the ROM zeroed, which is a machine with an empty socket
+  # - it realizes, and the processor runs whatever a page of zeroes decodes to.
+  object chipram "ram" { size = chip-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+
+  # -- the custom chips ------------------------------------------------------
+  #
+  # 256 word registers in 512 bytes. The object is the *decode*, not a chip:
+  # Agnus, Denise and Paula subscribe to it (`custom = custom` below), and an
+  # access to a chip that is not in this build falls through to the floating
+  # chip data bus and is counted.
+  #
+  # Appendix D gives the window as $DF F000-$DF FFFF, four kilobytes, and the
+  # register table fills the first 512 bytes of it. Whether the block repeats
+  # through the rest is not in the manual, so this maps the 512 bytes the
+  # appendix documents and leaves the rest of the window faulting.
+  # `size 0x1000 = mirror(custom)` is the change if a guest turns out to need
+  # it.
+  object custom "amiga.custom" { }
+
+  # -- Paula -----------------------------------------------------------------
+  #
+  # See `src/dev/amiga/paula.rs`. Interrupts, the disk controller, the UART and
+  # the audio channels. Its clock is the colour clock, the crystal over eight -
+  # 3.546895 MHz PAL - because every period the manual gives for this chip is
+  # counted in it: `SERPER` "N+1 color clocks", an audio period of "124 color
+  # clocks" at the least. The UART's other end is the host character port
+  # `serial`.
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial" }
+
+  # -- the internal drive ----------------------------------------------------
+  #
+  # See `src/dev/amiga/floppy.rs`. DF0, on the colour clock like Paula because
+  # the cells it hands Paula are timed in Paula's ticks. Its disk is the `df0`
+  # media slot: an ADF (`--media df0=adf:disk.adf`, or out of an Amiga Forever
+  # disc with `,disk=<name>`), a raw MFM dump, or `--drive df0=disk.adf` to
+  # have the guest's writes go back to the file. Nothing bound is an empty
+  # drive - an A500 waiting at the insert-disk screen.
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
+
+  # -- Agnus -----------------------------------------------------------------
+  #
+  # See `src/dev/amiga/agnus/`. One tick of its clock is one count of the
+  # horizontal beam counter: "one horizontal count takes one cycle of the
+  # system clock (processor is twice this)", 3 546 895 Hz on PAL (chapter 2),
+  # which is exactly the crystal over eight. It holds every DMA pointer, so it
+  # names chip RAM, and it names the two chips it moves data for: Paula's disk
+  # and audio slots, and the lines it pushes into Denise.
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    paula    = paula
+    video    = denise
+  }
+
+  # -- Denise ----------------------------------------------------------------
+  #
+  # See `src/dev/amiga/denise.rs`. It counts no beam and reads no memory: Agnus
+  # drives it a line at a time. Its clock is its 7M pin, the crystal over four,
+  # which is what a host scans the picture out against.
+  object denise "amiga.denise" { custom = custom, clock = clk / 4 }
+
+  # -- the overlay -----------------------------------------------------------
+  #
+  # See `src/dev/amiga/gary.rs`. At reset `OVL` is asserted and the window at
+  # zero decodes to the ROM, which is how the processor finds a reset vector in
+  # a machine whose RAM holds nothing; CIA-A's PA0 clears it and chip RAM takes
+  # over the same addresses, where the exception vector table then lives.
+  #
+  # It names its two sources as *objects*, not addresses, because chip RAM's
+  # only address on this machine is zero and so is the decoder's own - there
+  # would be nothing to look up.
+  object gary "amiga.gary" {
+    space = mem
+    rom   = kick
+    ram   = chipram
+    size  = chip-ram
+  }
+
+  # -- the two 8520s ---------------------------------------------------------
+  #
+  # See the comment block at the top. `cia_a_decode` and `cia_b_decode` are the
+  # board's half of each chip: register select on A8-A11 and one byte lane.
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # Chip RAM is *not* mapped directly. It is reached through `gary.overlay`,
+  # which decides per access whether the ROM or the RAM answers at the low
+  # addresses - one decoder in front of both, rather than two mappings that
+  # would have to be swapped from inside a CIA write.
+  map mem 0x000000 size chip-ram       = gary.overlay { endian = "big" }
+  map mem 0xDFF000 size 0x200          = custom
+  map mem rom-base size kickstart-size = kick         { endian = "big" }
+  map mem 0xBFE000 size 0x1000         = cia_a_decode { endian = "big" }
+  map mem 0xBFD000 size 0x1000         = cia_b_decode { endian = "big" }
+
+  # -- wiring ----------------------------------------------------------------
+  #
+  # "PA0..OVL  ROM/RAM overlay bit" (Appendix E, port signal assignments).
+  # Active high: the same table stars `RDY*`, `TK0*`, `WPRO*`, `CHNG*` and
+  # `LED*` beside it and does not star `OVL`. Out of reset the CIA's port A is
+  # all inputs, so the pin shows the chip's pull-up and the ROM is at zero;
+  # software clears the overlay by making PA0 an output and writing a zero.
+  wire cia_a.pa0 -> gary.ovl
+
+  # Interrupts. "The various kinds of interrupts generated by the hardware are
+  # brought into the peripherals chip and are translated into six of the seven
+  # available interrupts of the 680x0" (chapter 7, "Interrupts"): Paula drives
+  # the processor's three IPL pins with an encoded level, and nothing else in
+  # the machine touches them.
+  wire paula.ipl0 -> cpu.ipl0
+  wire paula.ipl1 -> cpu.ipl1
+  wire paula.ipl2 -> cpu.ipl2
+
+  # "CIAA can generate interrupt INT2", "CIAB can generate INT6" (Appendix F),
+  # and INT2* sets PORTS, level 2, while INT6* sets EXTER, level 6 (chapter 7;
+  # figure 7-4 lists "external INT2 & CIAA" and "external INT6 & CIAB"). The
+  # expansion bus shares both lines; nothing is plugged into it.
+  wire cia_a.irq -> paula.int2
+  wire cia_b.irq -> paula.int6
+
+  # The floppy lines (chapter 8, Table 8-5; Appendix E). CIA-B's port B is
+  # eight outputs to the drives, and CIA-A's PA2-PA5 four inputs from them. The
+  # drive's outputs are open-collector, so each net carries the pull-up the CIA
+  # pins have, and a deselected drive lets go. Only DF0 is fitted: SEL1*-SEL3*
+  # on PB4-PB6 go to the external connector, where nothing is plugged in.
+  wire cia_b.pb7 -> df0.mtr   { pull = "up" }    # MTR*   motor
+  wire cia_b.pb3 -> df0.sel   { pull = "up" }    # SEL0*  select the internal drive
+  wire cia_b.pb2 -> df0.side  { pull = "up" }    # SIDE*  low: side 1
+  wire cia_b.pb1 -> df0.dir   { pull = "up" }    # DIR    low: towards the centre
+  wire cia_b.pb0 -> df0.step  { pull = "up" }    # STEP*
+  wire df0.rdy   -> cia_a.pa5 { pull = "up" }    # RDY*
+  wire df0.tk0   -> cia_a.pa4 { pull = "up" }    # TK0*
+  wire df0.wpro  -> cia_a.pa3 { pull = "up" }    # WPRO*
+  wire df0.chng  -> cia_a.pa2 { pull = "up" }    # CHNG*
+  # "Disk index pulse ($BFDD00, bit 4)": CIA-B's /FLAG, whose falling edge sets
+  # ICR bit 4 and can raise level 6.
+  wire df0.index -> cia_b.flag { pull = "up" }   # INDEX*
+
+  # Video timing into the CIAs' time-of-day counters (Appendix F: CIA-A's TOD
+  # is "VSync or line tick", CIA-B's horizontal sync). Each counts rising
+  # edges; Agnus raises `vsync` at line 0 and `hsync` at count 0 of each line.
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
+}
