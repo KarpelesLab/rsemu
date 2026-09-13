@@ -1316,17 +1316,29 @@ impl CiaRegs {
             0x4 => state.ta_latch = (state.ta_latch & 0xff00) | u16::from(value),
             // "The timer latch is loaded into the timer on any timer underflow,
             // on a force load, or following a write to the high byte of the
-            // prescaler while the timer is stopped."
+            // prescaler while the timer is stopped." And the 8520's own rule,
+            // which the 6526 does not have: "In one-shot mode, a write to
+            // timer-high (register 5 for timer A, register 7 for Timer B) will
+            // transfer the timer latch to the counter and initiate counting
+            // regardless of the start bit" (Amiga Hardware Reference Manual,
+            // Appendix F, "One-shot/continuous"). Kickstart's timer.device
+            // calibrates against TOD with exactly that write and no CRA start.
             0x5 => {
                 state.ta_latch = (state.ta_latch & 0x00ff) | (u16::from(value) << 8);
-                if state.cra & CR_START == 0 {
+                if state.cra & CR_ONESHOT != 0 {
+                    state.ta = state.ta_latch;
+                    state.cra |= CR_START;
+                } else if state.cra & CR_START == 0 {
                     state.ta = state.ta_latch;
                 }
             }
             0x6 => state.tb_latch = (state.tb_latch & 0xff00) | u16::from(value),
             0x7 => {
                 state.tb_latch = (state.tb_latch & 0x00ff) | (u16::from(value) << 8);
-                if state.crb & CR_START == 0 {
+                if state.crb & CR_ONESHOT != 0 {
+                    state.tb = state.tb_latch;
+                    state.crb |= CR_START;
+                } else if state.crb & CR_START == 0 {
                     state.tb = state.tb_latch;
                 }
             }

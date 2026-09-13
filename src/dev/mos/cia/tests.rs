@@ -191,6 +191,41 @@ fn the_high_byte_loads_the_counter_only_while_the_timer_is_stopped() {
 }
 
 #[test]
+fn a_high_byte_write_starts_a_one_shot_timer_whatever_the_start_bit_says() {
+    // "In one-shot mode, a write to timer-high (register 5 for timer A,
+    // register 7 for Timer B) will transfer the timer latch to the counter and
+    // initiate counting regardless of the start bit" (Amiga Hardware Reference
+    // Manual, Appendix F). Kickstart's timer.device leans on it: CRA = $08,
+    // then the latch, and no start bit is ever written.
+    let cia = Cia::bare();
+    poke(&cia, 0xe, CR_ONESHOT);
+    poke(&cia, 0x4, 4);
+    assert_eq!(peek(&cia, 0xe) & CR_START, 0, "the low byte starts nothing");
+    poke(&cia, 0x5, 0);
+    assert_eq!(peek(&cia, 0xe) & CR_START, CR_START, "the high byte did");
+    assert_eq!(cia.timer_a(), 4, "from the latch");
+    cia.advance_to(5);
+    assert_eq!(
+        cia.icr() & ICR_TA,
+        ICR_TA,
+        "and it runs out like any one-shot"
+    );
+    assert_eq!(peek(&cia, 0xe) & CR_START, 0);
+
+    poke(&cia, 0xf, CR_ONESHOT);
+    poke(&cia, 0x6, 2);
+    poke(&cia, 0x7, 0);
+    assert_eq!(peek(&cia, 0xf) & CR_START, CR_START, "timer B too");
+
+    // A continuous timer is still only loaded, and only while stopped.
+    let cia = Cia::bare();
+    poke(&cia, 0x4, 4);
+    poke(&cia, 0x5, 0);
+    assert_eq!(peek(&cia, 0xe) & CR_START, 0);
+    assert_eq!(cia.timer_a(), 4);
+}
+
+#[test]
 fn timer_b_counts_timer_a_underflows_which_is_how_a_long_delay_is_made() {
     // Timer B's input mode 10: the chained mode. At an Amiga's 709 kHz E clock
     // a single timer tops out at 92 ms and the pair at just under an hour.
