@@ -101,8 +101,11 @@
 //!
 //! * CIA-A answers at `$BFE001` and CIA-B at `$BFD000`. The 68000 has no `A0`
 //!   pin, so the odd address selects the lower byte lane (`/LDS`) and the even
-//!   one the upper (`/UDS`): one chip sits on `D0`-`D7` and the other on
-//!   `D8`-`D15`, and a word access at `$BFE000` reaches both at once.
+//!   one the upper (`/UDS`): CIA-A sits on `D0`-`D7` and CIA-B on `D8`-`D15`.
+//!   The two are **not** reached by one access: CIA-A's chip select is `A12`
+//!   low and CIA-B's is `A13` low (Appendix F, "(A12\*)" and "(A13\*)"), and
+//!   the two windows differ in exactly those bits, so a word at `$BFE000` is
+//!   CIA-A's register 0 in the low byte and an undriven high byte.
 //! * The register-select lines are `A8`-`A11`, so register *n* of CIA-A is at
 //!   `$BFE001 + n * 0x100` and register *n* of CIA-B at `$BFD000 + n * 0x100`.
 //! * φ2 is the **E clock**, the 68000's clock divided by ten: 709379 Hz on a

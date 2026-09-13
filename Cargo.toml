@@ -2581,11 +2581,11 @@ dev-amiga = []
 # names): a big-endian 24-bit space, chip RAM at zero behind the `OVL`
 # overlay, the custom chip registers at $DFF000, and a 512 KiB Kickstart socket
 # at the top of the space. `-p chip-ram=1M` gives the trapdoor-expanded
-# machine. It boots a synthetic ROM out of the overlay and stops there: the two
-# CIAs and the three custom chips are still to come, and the machine file
-# carries the address decode and the wiring each of them needs. Adds no
-# dependencies.
-machine-amiga-a500 = ["cpu-m68k", "dev-amiga"]
+# machine. The two 8520 CIAs are on it at $BFE001 and $BFD000, each on its own
+# byte lane, clocked by the E clock, with CIA-A's PA0 driving the overlay. It
+# boots a synthetic ROM out of the overlay and stops there: the three custom
+# chips are still to come. Adds no dependencies.
+machine-amiga-a500 = ["cpu-m68k", "dev-amiga", "dev-mos8520"]
 
 # The network seam (src/dev/net/link.rs): what a NIC model is attached to --
 # frames out, frames in **against a virtual tick**, carrier, and a station

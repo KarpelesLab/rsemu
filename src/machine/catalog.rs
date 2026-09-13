@@ -690,9 +690,9 @@ pub static M68K_MINI: CatalogEntry = CatalogEntry {
 /// default, and `-p kickstart-size=256K -p rom-base=0xFC0000` for the 256 KiB
 /// socket the hardware manual's own appendix describes.
 ///
-/// Agnus, Denise, Paula and the two 8520 CIAs are **not** in this build, so a
-/// real Kickstart finds its reset vector and then waits on a chipset that is
-/// not there. `machines/amiga-a500.machine` carries the decode and the wiring
+/// The two 8520 CIAs are on it, CIA-A's `PA0` driving the overlay. Agnus,
+/// Denise and Paula are **not**, so a real Kickstart finds its reset vector
+/// and then waits on a chipset that is not there. `machines/amiga-a500.machine` carries the decode and the wiring
 /// each of them will need, and `docs/platforms/amiga.md` the ledger.
 #[cfg(feature = "machine-amiga-a500")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a500")))]

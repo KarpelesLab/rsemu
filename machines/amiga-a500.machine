@@ -8,12 +8,11 @@
 # `OVL` overlay that puts the ROM at zero as well until software says
 # otherwise.
 #
-# It is *only* the map. Agnus, Denise, Paula and the two 8520 CIAs are not in
-# this build, so a real Kickstart will not get far: it will find its reset
-# vector, run, and then wait forever on a chipset that is not there. That is the
-# intended state of this board for now, and `custom` counts every access it
-# could not route so how far away the chipset is can be measured rather than
-# guessed.
+# And the two 8520 CIAs, decoded where Appendix F puts them, with CIA-A's PA0
+# driving the overlay. Agnus, Denise and Paula are not in this build, so a real
+# Kickstart will not get far: it will find its reset vector, run, and then wait
+# forever on a chipset that is not there. `custom` counts every access it could
+# not route so how far away the chipset is can be measured rather than guessed.
 #
 # Written from the Amiga Hardware Reference Manual (Commodore-Amiga Inc., 3rd
 # edition): Appendix D for the address map, Appendix B for the register table.
@@ -32,49 +31,41 @@
 # board).
 #
 # ---------------------------------------------------------------------------
-# The CIAs, which are not in this build
+# The CIAs
 # ---------------------------------------------------------------------------
 #
-# From the manual's 8520 appendix:
+# From the manual's Appendix F ("8520 Complex Interface Adapters") and the
+# port-assignment table in Appendix E:
 #
-#   CIA-A   $BFEr01   selected when A12 is low and A13 high   odd bytes,  D0-D7
-#   CIA-B   $BFDr00   selected when A12 is high and A13 low   even bytes, D8-D15
+#   CIA-A   $BFEr01   data bits 7-0,  chip select A12*   "can generate INT2"
+#   CIA-B   $BFDr00   data bits 15-8, chip select A13*   "can generate INT6"
 #
 # where `r` is the register, 0-F. So the sixteen registers are 256 bytes apart,
 # each chip answers on one half of the data bus, and only one chip is ever
-# selected by one access - a word read at $BFE000 is CIA-A's register 0 in the
-# low byte and nothing in the high byte, not both chips.
+# selected by one access: CIA-A's select is A12 *low* (and its window has A13
+# high), CIA-B's is A13 low (with A12 high). A word read at $BFE000 is CIA-A's
+# register 0 in the low byte and nothing in the high byte, not both chips.
 #
 # `mos.8520` publishes its registers back to back and decodes nothing, so the
-# spreading-out and the lane are the board's, in `amiga.cia-decode`:
+# spreading-out and the lane are the board's, in `amiga.cia-decode`. Both
+# windows start on the even address, so the window's own parity is the address
+# parity the lane is decided by.
 #
-#   object cia_a "mos.8520" { clock = cpu / 10 }     # the E clock: 709.379 kHz PAL
-#   object cia_b "mos.8520" { clock = cpu / 10 }
+# The clock is the 68000's E clock, one tenth of the processor clock (Appendix
+# F: ".709379 Mhz PAL", ".715909 Mhz NTSC"). A `clock` expression names an
+# oscillator rather than another object, so it is written against the crystal:
+# the processor is `clk / 4`, which makes the E clock `clk / 40`.
 #
-#   object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
-#   object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+# What is not wired yet, and why:
 #
-#   map mem 0xBFE000 size 0x1000 = cia_a_decode { endian = "big" }
-#   map mem 0xBFD000 size 0x1000 = cia_b_decode { endian = "big" }
-#
-#   wire cia_a.pa0 -> gary.ovl                       # "OVL memory overlay bit"
-#
-# Both windows start on the even address, so the window's own parity is the
-# address parity the lane is decided by. `tests/amiga_a500_board.rs` builds
-# exactly this with two sixteen-byte RAMs standing in for the chips.
-#
-# Three things that are not wiring yet, and why:
-#
-# * Interrupts. The appendix says CIA-A "can generate interrupt INT2" and CIA-B
-#   INT6. The enable and request bits for those levels are INTENA and INTREQ,
-#   which Appendix B assigns to Paula - so the processor sees a CIA through
-#   Paula, and `wire cia_a.irq -> cpu.ipl1` would model a machine Commodore
-#   never made. It waits for Paula.
 # * TOD. CIA-A's time-of-day input counts a 50/60 Hz event - "VSync or line
 #   tick" - and CIA-B's counts horizontal sync. Neither is the E clock, and
 #   nothing in the tree generates a video timing pulse yet. It waits for Agnus.
-# * Everything else on the ports: the LED, the floppy lines, the fire buttons,
-#   the parallel and serial handshakes.
+# * The keyboard on CIA-A's SP and CNT, the game-port fire buttons on PA6 and
+#   PA7, the LED on PA1, the Centronics port on CIA-A port B and CIA-B's PA0-PA2,
+#   and the serial handshakes on CIA-B's PA3-PA7. Every one of those pins is a
+#   pull-up with nothing on it, which is what a machine with nothing plugged in
+#   looks like: an unpressed button, no printer, no modem.
 
 # ---------------------------------------------------------------------------
 # What is deliberately not mapped
@@ -177,6 +168,16 @@ machine "amiga-a500" {
     size  = chip-ram
   }
 
+  # -- the two 8520s ---------------------------------------------------------
+  #
+  # See the comment block at the top. `cia_a_decode` and `cia_b_decode` are the
+  # board's half of each chip: register select on A8-A11 and one byte lane.
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
   # -- the memory map --------------------------------------------------------
   #
   # Chip RAM is *not* mapped directly. It is reached through `gary.overlay`,
@@ -186,4 +187,15 @@ machine "amiga-a500" {
   map mem 0x000000 size chip-ram       = gary.overlay { endian = "big" }
   map mem 0xDFF000 size 0x200          = custom
   map mem rom-base size kickstart-size = kick         { endian = "big" }
+  map mem 0xBFE000 size 0x1000         = cia_a_decode { endian = "big" }
+  map mem 0xBFD000 size 0x1000         = cia_b_decode { endian = "big" }
+
+  # -- wiring ----------------------------------------------------------------
+  #
+  # "PA0..OVL  ROM/RAM overlay bit" (Appendix E, port signal assignments).
+  # Active high: the same table stars `RDY*`, `TK0*`, `WPRO*`, `CHNG*` and
+  # `LED*` beside it and does not star `OVL`. Out of reset the CIA's port A is
+  # all inputs, so the pin shows the chip's pull-up and the ROM is at zero;
+  # software clears the overlay by making PA0 an output and writing a zero.
+  wire cia_a.pa0 -> gary.ovl
 }
