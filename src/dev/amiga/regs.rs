@@ -31,15 +31,26 @@
 //! Agnus, Denise or Paula an exercise in *behaviour* rather than one in
 //! re-deriving an address map three times.
 //!
+//! # Where this table departs from Appendix B, and why
+//!
+//! * **`DIWSTRT` and `DIWSTOP` belong to Agnus *and* Denise.** Appendix B, and
+//!   Appendix A's entry for the pair, print the chip column as `A`. Appendix C,
+//!   "Display Window Specification", prints both as `W A D`, and Chapter 3 says
+//!   the window's horizontal resolution is one low-resolution pixel — a
+//!   comparison only the chip that serializes pixels can make; Agnus counts
+//!   the beam in colour clocks, two pixels each. The manual contradicts
+//!   itself, and the reading that lets Denise clip its own output is the one
+//!   taken. A table that routed these writes to Agnus alone would leave Denise
+//!   no way to learn its own window.
+//!
 //! # Two things the appendix does *not* say
 //!
-//! * **`$1FE`.** The copper's conventional no-op target is widely quoted as a
-//!   register called `NO-OP` or `NULL` at `$1FE`. It is in neither Appendix A
-//!   nor Appendix B of the edition this table was transcribed from, whose last
-//!   entry is `DIWHIGH` at `$1E4`. It is therefore absent here, and an access
-//!   to `$1FE` is an unclaimed offset — which for a *write* is behaviourally
-//!   the no-op the copper wants anyway. Somebody with the printed book should
-//!   settle it.
+//! * **`$1FE`.** Appendix B does end with a row `NO-OP(NULL) 1FE` — after
+//!   `DIWHIGH` and two `RESERVED` rows — but with no access letter and no chip,
+//!   so there is nothing to route and it is not a row here: an access to `$1FE`
+//!   is an unclaimed offset, which for a *write* is the no-op the copper wants.
+//!   Appendix A does not list it. (An earlier revision of this comment said
+//!   neither appendix did; re-reading Appendix B for Denise found the row.)
 //! * **Byte accesses.** Every entry is a word. What the chips do with a single
 //!   data strobe is not in the appendix, so [`custom`](super::custom) refuses
 //!   a byte access rather than inventing an answer; see its documentation.
@@ -49,7 +60,7 @@ use core::fmt;
 /// Which chip answers at an address — a set, not a choice.
 ///
 /// A bitmask because the appendix's `AP`, `AD`, `ADP` and `DP` are real —
-/// twenty-one rows name more than one chip. `DMACONR`, "DMA control (and
+/// twenty-three rows name more than one chip. `DMACONR`, "DMA control (and
 /// blitter status) read", is answered by Agnus and Paula together, and `DMACON`
 /// is written to all three.
 #[repr(transparent)]
@@ -357,8 +368,8 @@ static DECLARED: &[Reg] = &[
     reg(0x088, "COPJMP1",  &[A],       &[S]),
     reg(0x08a, "COPJMP2",  &[A],       &[S]),
     reg(0x08c, "COPINS",   &[A],       &[W]),
-    reg(0x08e, "DIWSTRT",  &[A],       &[W]),
-    reg(0x090, "DIWSTOP",  &[A],       &[W]),
+    reg(0x08e, "DIWSTRT",  &[A, D],    &[W]),
+    reg(0x090, "DIWSTOP",  &[A, D],    &[W]),
     reg(0x092, "DDFSTRT",  &[A],       &[W]),
     reg(0x094, "DDFSTOP",  &[A],       &[W]),
     reg(0x096, "DMACON",   &[A, D, P], &[W]),
@@ -613,6 +624,22 @@ mod tests {
         assert!(!lookup(0x002).expect("DMACONR").writable());
         assert!(lookup(0x096).expect("DMACON").writable());
         assert!(!lookup(0x096).expect("DMACON").readable());
+    }
+
+    #[test]
+    fn the_display_window_reaches_denise_as_appendix_c_prints_it() {
+        // Appendix B says `A`; Appendix C, "Display Window Specification",
+        // says `W A D`. See the module documentation for why C is followed.
+        for offset in [0x08e, 0x090] {
+            let reg = lookup(offset).expect("DIWSTRT and DIWSTOP");
+            assert!(reg.chip.contains(ChipId::AGNUS), "{}", reg.name);
+            assert!(reg.chip.contains(ChipId::DENISE), "{}", reg.name);
+        }
+        let shared = declared()
+            .iter()
+            .filter(|r| r.chip.0.count_ones() > 1)
+            .count();
+        assert_eq!(shared, 23, "the count the ChipId documentation quotes");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //!
 //! # Why the decode is its own object
 //!
-//! Three chips share one aperture, and at twenty-one addresses they share a
+//! Three chips share one aperture, and at twenty-three addresses they share a
 //! *register*: `DMACON` at `$096` is written to Agnus, Denise and Paula alike,
 //! `DMACONR` at `$002` — "DMA control (and blitter status) read" — is answered
 //! by Agnus and Paula together, and every sprite's `POS` and `CTL` belong to
