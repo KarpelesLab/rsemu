@@ -176,8 +176,9 @@
 //!   `DMACONR`, which is Agnus's to answer.
 //!
 //! Each call advances Paula to `at` first, so Agnus need not care which of the
-//! two was caught up last; a word Paula assembled before Agnus came for it
-//! waits in a two-word queue.
+//! two was caught up last. A word Paula assembled before Agnus came for it
+//! waits, however many there are, and a write keeps a few words in hand; the
+//! comment on `WRITE_DEPTH` says why neither side may lose one.
 //!
 //! # Pots
 //!
@@ -222,7 +223,7 @@ use super::regs::{ChipId, Reg};
 pub const CLASS_NAME: &str = "amiga.paula";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// The character port a board gets when it does not name one.
 const DEFAULT_PORT: &str = "serial";
@@ -318,8 +319,25 @@ pub const FAST_CELL_TICKS: u64 = 7;
 /// A slow disk cell.
 pub const SLOW_CELL_TICKS: u64 = 14;
 
-/// How many assembled read words wait for Agnus before the oldest is lost.
-const READY_DEPTH: usize = 2;
+/// How many words Agnus may have handed over for a write that are still to go
+/// out.
+///
+/// The disk's DMA on the chip is demand-driven: a word moves when Paula needs
+/// it, and nothing is ever early or late enough to be lost. Agnus here serves
+/// the disk once a line instead (`agnus::slots`), up to three words a slot —
+/// chapter 6's "three cycles" — and a line is 227 or 228 colour clocks while a
+/// `FAST` word is 16 cells of 7, 112 clocks. So up to three go out between two
+/// slots on an exact interleave, and the scheduler may have brought this chip a
+/// word or two past a slot before Agnus serves it. Six holds all of that: a
+/// queue that held only what one slot gives ran dry just as the slot arrived
+/// and left a word's hole in the track.
+///
+/// The read side has no such depth. Words wait for Agnus however many there
+/// are — never more than the transfer has left — because a bounded queue there
+/// has to drop one, and a dropped word shifts every sector after it: two words
+/// of queue lost one in every seventy on a real track, and no sector of any
+/// disk passed its checksum.
+const WRITE_DEPTH: usize = 6;
 
 /// How many cells the disk path fetches from a drive at a time.
 const CHUNK: usize = 512;
@@ -465,8 +483,8 @@ struct Disk {
     out: u16,
     /// Cells of it left.
     out_bits: u8,
-    /// The next word Agnus has handed over for writing.
-    pending: Option<u16>,
+    /// Words Agnus has handed over for writing, oldest first.
+    pending: VecDeque<u16>,
 }
 
 /// One audio channel.
@@ -715,7 +733,7 @@ impl State {
         let d = &mut self.disk;
         d.active = false;
         d.ready.clear();
-        d.pending = None;
+        d.pending.clear();
         d.out_bits = 0;
         self.intreq |= int::DSKBLK;
     }
@@ -730,7 +748,7 @@ impl State {
             d.armed = false;
             d.active = false;
             d.ready.clear();
-            d.pending = None;
+            d.pending.clear();
             d.out_bits = 0;
             return;
         }
@@ -746,7 +764,7 @@ impl State {
         d.waiting = !d.write && adkcon & ADK_WORDSYNC != 0;
         d.word_bits = 0;
         d.ready.clear();
-        d.pending = None;
+        d.pending.clear();
         d.out_bits = 0;
         if d.remaining == 0 {
             self.disk_finish();
@@ -797,10 +815,6 @@ impl State {
         if let Some(w) = word
             && d.ready.len() < usize::from(d.remaining)
         {
-            if d.ready.len() == READY_DEPTH {
-                // Agnus did not come for the oldest in time.
-                d.ready.pop_front();
-            }
             d.ready.push_back(w);
         }
         if matched {
@@ -814,7 +828,7 @@ impl State {
     fn disk_write_cell(&mut self) -> Option<u8> {
         let d = &mut self.disk;
         if d.out_bits == 0 {
-            match d.pending.take() {
+            match d.pending.pop_front() {
                 Some(w) => {
                     d.out = w;
                     d.out_bits = 16;
@@ -830,7 +844,7 @@ impl State {
         let cell = (d.out >> 15) as u8;
         d.out <<= 1;
         d.out_bits -= 1;
-        if d.out_bits == 0 && d.pending.is_none() && d.remaining == 0 {
+        if d.out_bits == 0 && d.pending.is_empty() && d.remaining == 0 {
             self.disk_finish();
         }
         Some(cell)
@@ -1356,8 +1370,8 @@ impl CustomChip for PaulaRegs {
 /// Hand a write DMA its next word, counting it as transferred.
 fn give_disk_word(st: &mut State, word: u16) {
     let d = &mut st.disk;
-    if d.pending.is_none() && d.remaining > 0 {
-        d.pending = Some(word);
+    if d.pending.len() < WRITE_DEPTH && d.remaining > 0 {
+        d.pending.push_back(word);
         d.remaining -= 1;
     }
 }
@@ -1419,7 +1433,7 @@ impl PaulaPort {
     pub fn disk_write_wanted(&self, at: u64) -> bool {
         self.advance_to(at);
         let st = self.shared.state.lock();
-        st.disk_writing_dma() && st.disk.pending.is_none() && st.disk.remaining > 0
+        st.disk_writing_dma() && st.disk.pending.len() < WRITE_DEPTH && st.disk.remaining > 0
     }
 
     /// Disk write DMA: the word Agnus fetched from `DSKPT`.
@@ -1736,8 +1750,10 @@ impl Device for Paula {
         for v in &d.ready {
             w.write_u16(*v)?;
         }
-        w.write_bool(d.pending.is_some())?;
-        w.write_u16(d.pending.unwrap_or(0))?;
+        w.write_seq_len(d.pending.len() as u64)?;
+        for v in &d.pending {
+            w.write_u16(*v)?;
+        }
         for c in &st.aud {
             for v in [c.len, c.per, c.vol, c.latch, c.word] {
                 w.write_u16(v)?;
@@ -1805,17 +1821,24 @@ impl Device for Paula {
             d.equal_until = r.read_u64()?;
             d.next_cell = r.read_u64()?;
             let count = r.read_seq_len(2)?;
-            if count > READY_DEPTH as u64 {
+            if count > u64::from(d.remaining) {
                 return Err(Error::State(format!(
-                    "snapshot has {count} disk word(s) waiting in a {READY_DEPTH}-word queue"
+                    "snapshot has {count} disk word(s) waiting for a transfer with {} left",
+                    d.remaining
                 )));
             }
             for _ in 0..count {
                 d.ready.push_back(r.read_u16()?);
             }
-            let has = r.read_bool()?;
-            let word = r.read_u16()?;
-            d.pending = has.then_some(word);
+            let count = r.read_seq_len(2)?;
+            if count > WRITE_DEPTH as u64 {
+                return Err(Error::State(format!(
+                    "snapshot has {count} disk word(s) to write in a {WRITE_DEPTH}-word queue"
+                )));
+            }
+            for _ in 0..count {
+                d.pending.push_back(r.read_u16()?);
+            }
         }
         for c in &mut st.aud {
             c.len = r.read_u16()?;
