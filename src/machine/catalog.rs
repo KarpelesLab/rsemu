@@ -987,6 +987,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::ata::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
+    #[cfg(feature = "dev-mos8520")]
+    crate::dev::mos::register(&mut reg)?;
     #[cfg(feature = "dev-ne2000")]
     crate::dev::net::ne2000::register(&mut reg)?;
     #[cfg(feature = "dev-ahci")]
@@ -1127,6 +1129,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::ata::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
+    #[cfg(feature = "dev-mos8520")]
+    crate::dev::mos::bind(&mut b)?;
     #[cfg(feature = "dev-ne2000")]
     crate::dev::net::ne2000::bind(&mut b)?;
     #[cfg(feature = "dev-ahci")]
@@ -1280,6 +1284,10 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-wdc")]
     for schema in crate::dev::wdc::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-mos8520")]
+    for schema in crate::dev::mos::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "bus-spi")]

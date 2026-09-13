@@ -464,6 +464,20 @@ cpu-riscv-lift = ["cpu-riscv", "ir"]
 # `no_std + alloc`.
 cpu-x86-lift = ["cpu-x86", "ir"]
 
+# The MOS 8520 CIA (src/dev/mos/cia.rs): the peripheral chip an Amiga has two
+# of, and the first Amiga part that needs none of the custom chipset to exist.
+# Two 8-bit ports with their direction registers, every pin a wire; two 16-bit
+# timers with the one-shot, continuous, PB6/PB7 output and timer-B-counts-
+# timer-A-underflows modes; the 24-bit binary TOD counter with its alarm and
+# its latch-on-MSB-read rule; the serial shift register both ways round, which
+# is how an Amiga keyboard arrives; and the interrupt control register with its
+# read-to-clear and its SET/CLEAR write. Where the sixteen registers land is a
+# board fact and stays out of the part -- an Amiga puts them 256 bytes apart on
+# two byte lanes. Written from the MOS 6526 and MOS 8520 data sheets and the
+# Amiga Hardware Reference Manual, cited by section; no emulator was consulted
+# (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
+dev-mos8520 = []
+
 # The WDC 65xx peripherals (src/dev/wdc): the W65C51N ACIA as a character
 # device, the W65C22 VIA with both ports and both timers, and the 32 KiB
 # program EEPROM socket a 6502 breadboard computer boots from — plus
