@@ -130,6 +130,9 @@ fn build(source: &str, rom: Vec<u8>) -> (Machine, Arc<M68k>) {
         Ok(cpu)
     });
     options.realize.media.insert("kickstart", rom);
+    // DF0 names a media slot; an empty one is an empty drive (the PC floppy
+    // precedent, `tests/pc_at_ide.rs`). The front ends bind it for a user.
+    options.realize.media.insert("df0", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let machine = match rsemu::machine::build("amiga-a500", source, &registry, &options) {
         Ok(m) => m,

@@ -120,6 +120,9 @@ fn rom() -> Vec<u8> {
 fn options(hosts: &Arc<HostObjects>) -> BuildOptions {
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("kickstart", rom());
+    // DF0 names a media slot; an empty one is an empty drive (the PC floppy
+    // precedent, `tests/pc_at_ide.rs`). The front ends bind it for a user.
+    options.realize.media.insert("df0", Vec::new());
     options.realize.hosts = Arc::clone(hosts);
     options
 }

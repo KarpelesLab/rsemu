@@ -121,6 +121,9 @@ fn boot() -> Machine {
 fn build(source: &str, rom: Vec<u8>) -> Machine {
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("kickstart", rom);
+    // DF0 names a media slot; an empty one is an empty drive (the PC floppy
+    // precedent, `tests/pc_at_ide.rs`). The front ends bind it for a user.
+    options.realize.media.insert("df0", Vec::new());
     let registry = catalog::registry().expect("a registry");
     match rsemu::machine::build("amiga-a500", source, &registry, &options) {
         Ok(m) => m,
@@ -405,6 +408,9 @@ fn an_overlay_pointed_at_something_with_no_region_is_a_realize_error_naming_it()
     assert_ne!(source, entry.source, "the substitution found its line");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("kickstart", kickstart());
+    // DF0 names a media slot; an empty one is an empty drive (the PC floppy
+    // precedent, `tests/pc_at_ide.rs`). The front ends bind it for a user.
+    options.realize.media.insert("df0", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let err = match rsemu::machine::build("amiga-a500", &source, &registry, &options) {
         Ok(_) => panic!("an overlay onto a processor realized"),
@@ -547,6 +553,9 @@ fn a_guest_serdat_reaches_the_host_serial_port() {
     ]);
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("kickstart", rom);
+    // DF0 names a media slot; an empty one is an empty drive (the PC floppy
+    // precedent, `tests/pc_at_ide.rs`). The front ends bind it for a user.
+    options.realize.media.insert("df0", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let source = catalog::machine("amiga-a500").unwrap().source;
     let mut m = rsemu::machine::build("amiga-a500", source, &registry, &options)
@@ -576,14 +585,9 @@ fn df0_answers_the_cia_lines_the_way_table_8_5_says() {
     options.realize.media.insert("kickstart", kickstart());
     options.realize.media.insert("df0", numbered_disk());
     let registry = catalog::registry().expect("a registry");
-    // The shipped board leaves DF0 empty; this one names a slot for it.
-    let shipped = catalog::machine("amiga-a500").unwrap().source;
-    let source = shipped.replace(
-        "object df0 \"amiga.floppy\" { clock = clk / 8, paula = paula }",
-        "object df0 \"amiga.floppy\" { clock = clk / 8, paula = paula, image = \"df0\" }",
-    );
-    assert_ne!(source, shipped, "the substitution found its line");
-    let mut m = rsemu::machine::build("amiga-a500", &source, &registry, &options)
+    // The shipped board names DF0's `df0` slot, so a disk goes straight in.
+    let source = catalog::machine("amiga-a500").unwrap().source;
+    let mut m = rsemu::machine::build("amiga-a500", source, &registry, &options)
         .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
 
     const CIAB_PRB: u64 = 0xBF_D100;
