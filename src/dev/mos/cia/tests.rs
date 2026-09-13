@@ -465,14 +465,18 @@ fn a_byte_shifts_out_at_half_the_timer_a_underflow_rate() {
     let cnt = dummy_source(2);
     cia.connect_pin("sp", sp.clone()).expect("sp exists");
     cia.connect_pin("cnt", cnt.clone()).expect("cnt exists");
-    assert_eq!(sp.drive_state(), Drive::High, "output mode drives SP");
+    assert_eq!(
+        sp.drive_state(),
+        Drive::Low,
+        "output mode before any bit has left: the latch's reset level, low"
+    );
 
     poke(&cia, 0xc, 0xa5);
     cia.advance_to(2);
     assert_eq!(
         sp.drive_state(),
-        Drive::High,
-        "two underflows, and 0xa5's top bit is a one"
+        Drive::HiZ,
+        "two underflows, and 0xa5's top bit is a one: the open-drain stage lets go"
     );
     cia.advance_to(4);
     assert_eq!(sp.drive_state(), Drive::Low, "then a zero");

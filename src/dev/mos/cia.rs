@@ -61,8 +61,10 @@
 //!   without the counter rolling under it.
 //! * **The shift register**, both ways round: in on positive CNT edges, out at
 //!   half the timer A underflow rate with CNT driven as the shift clock, and
-//!   `ICR3` after the eighth bit either way. An Amiga keyboard arrives through
-//!   the input half.
+//!   `ICR3` after the eighth bit either way. SP and CNT are **open drain** in
+//!   output mode — a one lets go of the line — as Appendix F of the Amiga
+//!   manual says of the 8520. An Amiga keyboard arrives through the input
+//!   half, and its handshake is the output half pulling SP low.
 //! * **The interrupt control register**: five latched flags, a mask with the
 //!   `SET/CLEAR` write, the combinational `IR` bit, and the read that clears
 //!   every flag and releases the pin. A [`MemAttrs::debug`] read does none of
@@ -342,7 +344,8 @@ struct State {
     /// leaves every *second* underflow, which is what makes the shift rate half
     /// the underflow rate.
     sr_half: bool,
-    /// What the SP pin drives in output mode.
+    /// What the SP pin drives in output mode: the level of the last bit
+    /// shifted out, low before any has been.
     sp_out: bool,
     /// And CNT, which is the shift clock.
     cnt_out: bool,
@@ -408,7 +411,15 @@ impl State {
             sr_pending: false,
             sr_active: false,
             sr_half: false,
-            sp_out: true,
+            // The output latch, like every register but the timer latches, is
+            // zero out of reset; it is what SP carries in output mode until a
+            // bit has been shifted out, after which "SP will remain at the
+            // level of the last data bit transmitted" (Appendix F). An Amiga
+            // depends on it: its keyboard handshake is the processor "pulsing
+            // the SP line low then high" (chapter 8), which on CIA-A — whose
+            // serial port never transmits a byte — is turning the port to output
+            // and back.
+            sp_out: false,
             cnt_out: true,
             cnt_in: true,
             sp_in: true,
@@ -831,13 +842,17 @@ impl State {
             // tree's asserted-high convention: it is wired to things like
             // `/FLAG` that are polarity-sensitive.
             pc: Level::from(self.pc_until <= self.ticks),
+            // "Both CNT and SP outputs are open drain to allow such a common
+            // bus" (Appendix F, "Bidirectional Feature"): a one lets go and the
+            // line's pull-up has it, which is what lets an Amiga keyboard and
+            // the CIA share `KDAT`.
             sp: if self.cra & CRA_SPMODE != 0 {
-                Drive::strong(Level::from(self.sp_out))
+                Drive::open_drain(Level::from(self.sp_out))
             } else {
                 Drive::HiZ
             },
             cnt: if self.cra & CRA_SPMODE != 0 {
-                Drive::strong(Level::from(self.cnt_out))
+                Drive::open_drain(Level::from(self.cnt_out))
             } else {
                 Drive::HiZ
             },
