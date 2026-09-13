@@ -1735,6 +1735,12 @@ machine-stm32f407 = [
     "dev-stm32-rtc",
     "dev-stm32-rng",
     "dev-at24c",
+    # The ST25DV64K on the same two pins, which is the part ST sells on the
+    # X-NUCLEO-NFC04A1 shield for exactly this board. It is what makes the
+    # board's I2C bus carry two devices at once, and it is the only host door
+    # in the tree that a *device* opens on behalf of something outside the
+    # machine: `st25dv-rf:nfc`, which `HostObjects::seal` governs.
+    "dev-st25dv",
     # The 4x4 matrix keypad on PE0-PE7. It is the board's input device and it is
     # also the only thing in the tree that needs a net to resolve itself: eight
     # pins, two drivers apiece and a pull-up, which is what `{ pull = "up" }`

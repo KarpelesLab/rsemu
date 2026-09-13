@@ -163,6 +163,41 @@ machine "stm32f407" {
     bus   = i2cbus
   }
 
+  # -- the dynamic NFC tag, which the Discovery board does not have either ---
+  #
+  # An **ST25DV64K** at 0x53/0x57 on the same two pins. Also not on the bare
+  # Discovery board -- it is on ST's own X-NUCLEO-NFC04A1 shield, which is the
+  # part people plug into an F4 when they want NFC -- and it is here for two
+  # reasons the AT24C above cannot supply.
+  #
+  # First, **two devices on one bus**. The EEPROM answers 0xA0; this tag answers
+  # 0xA6 for its user memory, dynamic registers and mailbox and 0xAE for its
+  # system configuration area, so a driver that probes the bus finds three
+  # addresses and has to address each one deliberately.
+  #
+  # Second, **the RF side is a host door**, and this is the only device on any
+  # board in this tree that opens one on behalf of something outside the
+  # machine. A reader tapping the tag is non-deterministic input, so it crosses
+  # through `core::record` on the channel `st25dv-rf:nfc` and
+  # `HostObjects::seal` refuses a recorded build that has no such channel. There
+  # is no second way in: `src/dev/st25dv/rf.rs` has the argument, and
+  # `tests/st25dv_replay.rs` asserts that a recorded session replays to the same
+  # state hash.
+  #
+  # Its clock is the same 1 MHz domain the EEPROM uses, so `write-ticks` is tW
+  # in microseconds (5 ms, DS10925 6.4.3), `it-ticks` is the IT_TIME = 0 GPO
+  # pulse in microseconds (301 us, Eq. (1)) and `wdg-ticks` is the mailbox
+  # watchdog's 30 ms unit. `gpo = "open-drain"` is the -IE part, which is why
+  # the net below carries a pull-up.
+  object nfc "st.st25dv" {
+    clock   = hse / 8
+    density = "64K"
+    gpo     = "open-drain"
+    bus     = i2cbus
+    reader  = "nfc"
+    uid     = 0x0000000001
+  }
+
   # -- where everything is ---------------------------------------------------
   #
   # Every address is a parameter, and every default below is RM0090 Table 1's
@@ -1285,4 +1320,28 @@ machine "stm32f407" {
   wire eeprom.scl -> i2c1.scl
   wire i2c1.sda   -> eeprom.sda
   wire eeprom.sda -> i2c1.sda
+  wire i2c1.scl   -> nfc.scl
+  wire nfc.scl    -> i2c1.scl
+  wire i2c1.sda   -> nfc.sda
+  wire nfc.sda    -> i2c1.sda
+
+  # -- the tag's GPO, on PB5 -------------------------------------------------
+  #
+  # PB5 rather than one of PE0-PE7, because those eight are the keypad's, and
+  # PB5 is the pin next to I2C1's own PB6/PB7 -- which is where a shield with a
+  # tag on it would put an interrupt line.
+  #
+  # Two statements and one pull, for the reason the keypad section sets out at
+  # length: a net is the connected component of these statements, so this one
+  # holds the tag's open-drain stage, the port's input side (`in5`, which is
+  # what `IDR` reads) and the EXTI mux's PB5 input -- and, through the
+  # `gpiob.p5 -> syscfg.pb5` line in the block above, the port's output stage
+  # as well. `pull = "up"` is the board resistor the -IE part needs: without it
+  # an undriven open-drain output would resolve low and firmware would see a
+  # permanent interrupt.
+  #
+  # GPO idles high-Z and pulses low for IT_TIME on an enabled event, so an
+  # EXTI line configured for a falling edge is what a driver arms.
+  wire nfc.gpo -> gpiob.in5 { pull = "up" }
+  wire nfc.gpo -> syscfg.pb5
 }
