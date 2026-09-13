@@ -8,6 +8,7 @@
 //!
 //! | Module | Class | Covers |
 //! | --- | --- | --- |
+//! | [`gate`] | — | the peripheral clock gate: the `enable` and `reset` pins RCC's `xxENR`/`xxRSTR` bits drive, and what a gated block does |
 //! | [`gpio`] | `st.gpio` | one general-purpose I/O port: `MODER`…`AFR`, the atomic `BSRR`, and the pin mux |
 //! | [`usart`] | `st.usart` | a USART/UART on the character-device seam, in both the F4 and the F7/H7 register layouts |
 //! | [`sdmmc`] | `stm32.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
@@ -56,6 +57,8 @@
 //! `no_std + alloc`, no `unsafe`, no dependencies.
 //!
 //! [`machines/stm32f407.machine`]: https://github.com/KarpelesLab/rsemu/blob/master/machines/stm32f407.machine
+
+pub mod gate;
 
 #[cfg(feature = "dev-stm32")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]

@@ -53,6 +53,11 @@
 //! SPI clock or a timer compare output, is the case the GPIO's `af{n}` inputs
 //! exist for.
 //!
+//! Two *inputs* arrive from the reset and clock controller — `enable`, which
+//! is `RCC_APB1ENR.USART2EN`, and `reset`, which is `RCC_APB1RSTR.USART2RST`.
+//! A board draws them or it does not; an undrawn `enable` leaves the USART
+//! clocked. [`gate`](super::gate) has the rules and what a gated block does.
+//!
 //! # Baud rate
 //!
 //! `BRR` is stored and reported and **does not change the byte rate**. The
@@ -77,7 +82,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::BusError;
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -86,7 +91,8 @@ use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region,
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Level, WireId, WireSource};
+use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::host::chardev::{CharDevice, ports};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
@@ -239,6 +245,9 @@ struct Registers {
     variant: Variant,
     /// The interrupt output, connected at realize time.
     irq: Mutex<Option<WireSource>>,
+    /// `RCC_APB1ENR.USART2EN` and `RCC_APB1RSTR.USART2RST`, as a board's wires
+    /// deliver them.
+    gate: ClockGate,
 }
 
 impl fmt::Debug for Registers {
@@ -452,11 +461,33 @@ impl Registers {
     }
 }
 
+impl Gated for Registers {
+    fn clock_gate(&self) -> &ClockGate {
+        &self.gate
+    }
+
+    fn gate_reset(&self) {
+        // `RCC_APB1RSTR.USART2RST`: the register file goes back to its reset
+        // values. The host port's queues do not — what a user has typed is the
+        // host's state and not the machine's, exactly as at `Device::reset`.
+        *self.state.lock() = State::reset();
+        self.refresh_irq();
+    }
+}
+
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
         let [a, b, c, d] = dst else {
             return Err(BusError::BadAccess);
         };
+        if !self.gate.live() {
+            // No `RCC_APB1ENR.USART2EN`, or `USART2RST` standing: the block is
+            // not readable and the value that comes back is zero
+            // ([`gate`](super::gate)). A debug read sees the same nothing,
+            // because that is what the bus itself returns.
+            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            return Ok(());
+        }
         if !attrs.debug {
             // A byte the host has delivered should be visible the instant
             // firmware looks, not one scheduler tick later.
@@ -481,6 +512,11 @@ impl MemOps for Registers {
             // interrupted. Neither can be made harmless, so it is refused
             // rather than guessed at (`ROADMAP.md` §15, invariant 5).
             return Err(BusError::BadAccess);
+        }
+        if !self.gate.live() {
+            // Not effective, character and all: a write to an unclocked
+            // peripheral is lost, so this one reaches no chardev.
+            return Ok(());
         }
         self.write_register(offset & !3, u32::from_le_bytes([*a, *b, *c, *d]));
         self.refresh_irq();
@@ -538,6 +574,7 @@ impl Usart {
             port_name,
             variant,
             irq: Mutex::with_rank(LockRank::WIRE, None),
+            gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
             "usart",
@@ -646,6 +683,12 @@ impl Device for Usart {
         }
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // `enable` and `reset`, and the USART has no other input: its data
+        // path is the character seam rather than a pin.
+        gate::sink(&self.regs, port, sources)
+    }
+
     fn is_runnable(&self) -> bool {
         // Not because it executes anything, but because a character time is
         // real: the receiver has to be filled from the host and a refused
@@ -656,6 +699,12 @@ impl Device for Usart {
     }
 
     fn run(&self, budget: Budget) -> Consumed {
+        if !self.regs.gate.live() {
+            // No clock, no character time: the transmitter does not shift and
+            // the receiver does not sample. Both pick up where they stopped
+            // when the gate opens again.
+            return Consumed::new(budget.ticks);
+        }
         // At most one character per call, which is right however many ticks
         // the budget covers: a board sets the domain to the character rate.
         let moved = self.regs.transmit() | self.regs.poll_receiver();
@@ -711,14 +760,16 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `st.usart`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("port", ValueKind::Str))
         .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "f7"]))
         .region("")
         .region("regs")
         // An M-profile board wires this straight to the core: `wire
         // usart2.irq -> cpu.irq38`. There is no controller in between.
-        .port(IRQ_PIN, PortDir::Out)
+        .port(IRQ_PIN, PortDir::Out);
+    // `RCC_APB1ENR.USART2EN` and `RCC_APB1RSTR.USART2RST`.
+    gate::ports(schema)
 }
 
 #[cfg(test)]
@@ -823,6 +874,73 @@ mod tests {
                 ticks: 1,
             },
         );
+    }
+
+    #[test]
+    fn a_peripheral_whose_clock_is_disabled_reads_as_zero() {
+        // GitHub issue #14, and the reason `gate` exists: with
+        // `RCC_APB1ENR.USART2EN` clear the block is not readable — every
+        // register answers zero — and a write to it is not effective, so the
+        // character never reaches the chardev.
+        let (usart, port, map) = wired(Variant::F4);
+        enable(&usart, map);
+        assert_eq!(peek(&usart, map.sr) & SR_TXE, SR_TXE);
+
+        let id = WireId::new(1);
+        let pin = Device::sink(&usart, gate::ENABLE_PIN, &[id]).expect("a USART has `enable`");
+        // Drawing the wire is the assertion that the clock is RCC's to give,
+        // and an `xxENR` bit resets low.
+        assert_eq!(peek(&usart, map.sr), 0, "the whole block reads as zero");
+        assert_eq!(peek(&usart, map.cr1), 0);
+        assert_eq!(peek_debug(&usart, map.sr), 0, "and so does a debug read");
+
+        poke(&usart, map.tdr, u32::from(b'H'));
+        tick(&usart);
+        assert!(port.drain().is_empty(), "the write was not effective");
+
+        pin.sink.set_level(id, 0, Level::High);
+        // The registers kept their values across the gating: removing a clock
+        // is not a reset (RM0090 §7.3.13 has `USART2RST` for that).
+        assert_eq!(peek(&usart, map.cr1), map.ue | CR1_TE | CR1_RE);
+        assert_eq!(peek(&usart, map.sr) & SR_TXE, SR_TXE, "nothing was queued");
+
+        poke(&usart, map.tdr, u32::from(b'H'));
+        tick(&usart);
+        assert_eq!(port.drain(), b"H", "and now the clock is running");
+    }
+
+    #[test]
+    fn an_unwired_enable_leaves_the_usart_clocked() {
+        // Every board written before the gate existed draws no `enable` wire,
+        // and none of them may go deaf because this landed.
+        let (usart, port, map) = wired(Variant::F4);
+        enable(&usart, map);
+        poke(&usart, map.tdr, u32::from(b'x'));
+        tick(&usart);
+        assert_eq!(port.drain(), b"x");
+    }
+
+    #[test]
+    fn the_reset_pin_puts_the_register_file_back() {
+        // `RCC_APB1RSTR.USART2RST`, as a level: the block is deaf while it
+        // stands and comes back at its reset values when it is let go.
+        let (usart, _port, map) = wired(Variant::F4);
+        enable(&usart, map);
+        poke(&usart, map.brr, 0x1234);
+        assert_eq!(peek(&usart, map.brr), 0x1234);
+
+        let id = WireId::new(2);
+        let pin = Device::sink(&usart, gate::RESET_PIN, &[id]).expect("a USART has `reset`");
+        pin.sink.set_level(id, 0, Level::High);
+        assert_eq!(peek(&usart, map.brr), 0, "held in reset, the block is deaf");
+        pin.sink.set_level(id, 0, Level::Low);
+        assert_eq!(
+            peek(&usart, map.brr),
+            0,
+            "and what it kept is the reset value"
+        );
+        assert_eq!(peek(&usart, map.cr1), 0, "`UE` included");
+        assert_eq!(peek(&usart, map.sr), SR_RESET);
     }
 
     #[test]
