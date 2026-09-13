@@ -53,7 +53,9 @@
 //! Option 3 is what is implemented. Reads and fetches resolve to
 //! `FlatTarget::Ram` and never call this device at all; writes resolve to the
 //! private `Program` handler, which applies RM0090 §3.6 / RM0351 §3.3 and only
-//! then touches the store.
+//! then touches the store. A part with a read-side protection to enforce is
+//! the one exception, and it is opted into rather than paid for by everybody —
+//! see "What the read side costs, and when", below.
 //!
 //! The two children live inside **one** container region, published as
 //! `flash.array`, rather than as two regions the board must map twice at the
@@ -64,18 +66,92 @@
 //! flash silently writable as RAM, which is exactly the defect this device
 //! exists to remove.
 //!
+//! # Protection: what a fetch may do that a load may not
+//!
+//! Three protections, and they are not three of a kind. **`WRP`**, and the
+//! program/erase half of **`PCROP`**, are judged where every write already
+//! goes — the controller — and need nothing new. The read half is the
+//! interesting one.
+//!
+//! `PCROP` makes a range execute-only: "The protected area is execute-only: it
+//! can only be reached by the STM32 CPU, as an instruction code, while all
+//! other accesses (DMA, debug and CPU data read, write and erase) are strictly
+//! prohibited" (RM0351 §3.5.2). The silicon tells the two apart by **which bus
+//! the access arrived on** — `SR.RDERR` is "set by hardware when an address to
+//! be read through the D-bus belongs to a read protected area" (§3.7.5) — and
+//! **not** by where the program counter is. That is the distinction
+//! [`core::space`](crate::core::space) already carries: [`MemAttrs::purpose`]
+//! is [`AccessPurpose::FETCH`](crate::core::space::AccessPurpose::FETCH) for
+//! the I-code fetch a Cortex-M makes and
+//! [`DATA`](crate::core::space::AccessPurpose::DATA) for everything else, so
+//! the whole `PCROP` read check is `attrs.is_fetch()` and no PC anywhere.
+//!
+//! **A literal pool is therefore refused, and that is the hardware.**
+//! `LDR r0, =const` inside the protected range is a D-bus read *of* the range
+//! *by code in* the range, and the part raises `RDERR` for it exactly as it
+//! would for a debugger's read — which is why PCROP'd firmware is compiled
+//! execute-only (`-mslow-flash-data`, `armcc --no_literal_pools`; ST AN4701).
+//! A model that let the region read itself would happily run firmware that
+//! faults on silicon.
+//!
+//! `RDP` is the other half. Level 1: "In debug mode or when code is running
+//! from boot RAM or boot loader, the Flash main memory … \[is\] totally
+//! inaccessible. In these modes, a read or write access to the Flash generates
+//! a bus error" (RM0351 §3.5.1; RM0090 §3.6.3 says it of the F4). "In debug
+//! mode" is [`MemAttrs::debug`] — the access came from a debugger — so **the
+//! device refuses its own debug accesses**, and `core::space` never learns
+//! what an option byte is. [`Device::debug_halt`] carries the half of the same
+//! sentence that no attribute could: RM0351 §3.5.3's note that at level 1 the
+//! array cannot be programmed or erased *while the debug features are
+//! connected*, which is a rule about a **guest** store made while something
+//! has the core stopped.
+//!
+//! Level 1 → level 0 mass-erases the part (§3.5.1), level 2 is irreversible
+//! and refuses every further option write, and a `PCROP` area may be grown but
+//! never shrunk. Those are guest-visible, and tested.
+//!
+//! ## What the read side costs, and when
+//!
+//! The read child above is a [`RamStore`]: a fetch resolves to
+//! `FlatTarget::Ram` and never calls this device at all. A protection that has
+//! to *judge* a read needs the read, so a part that has one publishes an I/O
+//! read child instead — one virtual call and two relaxed loads per fetch, and
+//! no lock. The choice is made once, in [`Flash::new`]: a board arms it by
+//! giving option bytes that arm `RDP` or a `PCROP` range (`optr`,
+//! `pcrop1sr`/`pcrop1er`/…), or by writing `read-guard = true` for a part
+//! whose firmware arms them itself. A region tree is immutable once realized,
+//! so this cannot be decided later, and a machine that never mentions
+//! protection pays exactly nothing — which is the point.
+//!
+//! One consequence, stated rather than left to be found: protection is
+//! enforced from the **live** option registers (`PCROP`, `WRP`) and from the
+//! **stored** option byte (`RDP`), not from a third copy that only an
+//! option-byte load updates. So a shadow write takes effect before
+//! `OBL_LAUNCH` would have loaded it. The writes that could *weaken* a
+//! protection are refused where they arrive — a `PCROP` range may only grow,
+//! and `RDP` reads the byte an `OPTSTRT` programmed — so nothing escapes that
+//! way; what is missing is the window in which a part is already programmed
+//! and not yet reloaded.
+//!
 //! # What is not modelled
 //!
 //! * **The caches.** `ACR.ICEN`, `DCEN`, `PRFTEN`, `ICRST` and `DCRST` read
 //!   back and change nothing; `LATENCY` is recorded and readable
 //!   ([`Flash::latency`]) and costs no time. There is no instruction prefetch
 //!   queue here to flush.
-//! * **`PCROP` and `RDP`.** The registers exist and hold what is written to
-//!   them, and nothing enforces them: proprietary-code readout protection needs
-//!   the fetch path to know whether the *current* PC is inside the protected
-//!   range, and readout protection needs the debug seam to consult a device.
-//!   Both are real features and both are follow-on work; a model that stored
-//!   the bits and claimed enforcement would be worse than one that says so.
+//! * **The F4's `PCROP`.** `OPTCR.SPRMOD`, and the inverted `nWRPi` meaning it
+//!   brings, are an F42x/F43x feature (RM0090 §3.9.8); this variant decodes an
+//!   F405/407 — four-bit `SNB`, no second-bank sector numbers. The four
+//!   `pcrop*` properties are refused on `variant = "f4"` rather than silently
+//!   accepted. The F4's `RDP` *is* modelled, because every F4 has it.
+//! * **What `RDP` erases besides flash.** "The backup registers (RTC_BKPxR in
+//!   the RTC) and the SRAM2 are also erased" by a level 1 → 0 regression
+//!   (RM0351 §3.5.1). Those belong to other devices and this one has no wire
+//!   to them; the flash array is erased, and that is the part that is here.
+//! * **Level 2's other half.** That level 2 refuses every option-byte change
+//!   and cannot be left is modelled. That it also disables the debug port, the
+//!   boot from RAM and the bootloader belongs to the debug and boot plumbing,
+//!   not to this register block.
 //! * **ECC.** `ECCR` reads as its reset value; nothing injects a correction.
 //! * **Bus stalling during an operation.** A real part stalls a fetch from the
 //!   bank being erased. Here the array stays readable and only `SR.BSY` says
@@ -117,7 +193,7 @@ use crate::core::space::{
     AccessConstraints, Mapping, MemAttrs, MemOps, MemResult, Perms, RamStore, Region, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicBool, AtomicU32, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 use crate::machine::Instance;
@@ -307,10 +383,17 @@ const SR_PGSERR: u32 = 1 << 7;
 const SR_BSY: u32 = 1 << 16;
 /// L4+ `SR.PEMPTY`: the first location of the boot bank is erased.
 const SR_PEMPTY: u32 = 1 << 17;
+/// F4 `SR.RDERR`: a `PCROP` read error (RM0090 §3.9.5). The F405/407 this
+/// variant decodes has no `PCROP`, so nothing sets it here; the bit is named
+/// because it is in the error mask.
+const F4_SR_RDERR: u32 = 1 << 8;
+/// L4 `SR.RDERR`: "Set by hardware when an address to be read through the
+/// D-bus belongs to a read protected area of the flash (PCROP protection)"
+/// (RM0351 §3.7.5).
+const L4_SR_RDERR: u32 = 1 << 14;
 
 /// Every F4 error bit, for `OPERR` and for the interrupt.
-const F4_ERRORS: u32 =
-    SR_OPERR | SR_WRPERR | SR_PGAERR | F4_SR_PGPERR | SR_PGSERR | (1 << 8/* RDERR */);
+const F4_ERRORS: u32 = SR_OPERR | SR_WRPERR | SR_PGAERR | F4_SR_PGPERR | SR_PGSERR | F4_SR_RDERR;
 /// Every L4 error bit.
 const L4_ERRORS: u32 = SR_OPERR
     | SR_PROGERR
@@ -320,7 +403,7 @@ const L4_ERRORS: u32 = SR_OPERR
     | SR_PGSERR
     | (1 << 8/* MISERR */)
     | (1 << 9/* FASTERR */)
-    | (1 << 14/* RDERR */)
+    | L4_SR_RDERR
     | (1 << 15/* OPTVERR */);
 
 // -- CR bits -----------------------------------------------------------------
@@ -351,6 +434,9 @@ const L4_CR_FSTPG: u32 = 1 << 18;
 const CR_EOPIE: u32 = 1 << 24;
 /// `CR.ERRIE`, both families.
 const CR_ERRIE: u32 = 1 << 25;
+/// L4 `CR.RDERRIE` — `SR.RDERR` has its own interrupt enable, which is why a
+/// `PCROP` read error is not raised through `fail` with the rest (RM0351 §3.6).
+const L4_CR_RDERRIE: u32 = 1 << 26;
 /// L4 `CR.OBL_LAUNCH` — reload the option bytes and reset.
 const L4_CR_OBL_LAUNCH: u32 = 1 << 27;
 /// L4 `CR.OPTLOCK`.
@@ -368,6 +454,23 @@ const F4_OPTCR_OPTSTRT: u32 = 1 << 1;
 /// while `LOCK` is set, where an L4 splits the register between two locks.
 const L4_CR_OPERATION: u32 =
     CR_PG | L4_CR_PER | L4_CR_MER1 | L4_CR_MER2 | L4_CR_BKER | CR_STRT | L4_CR_FSTPG | (0xff << 3);
+
+/// The `RDP` byte that means level 0, no protection (RM0351 Table 14,
+/// RM0090 §3.6.3).
+const RDP_LEVEL0: u32 = 0xaa;
+/// The `RDP` byte that means level 2 — "an irreversible operation".
+const RDP_LEVEL2: u32 = 0xcc;
+/// Where the `RDP` byte sits in the F4's option register: `OPTCR[15:8]`
+/// (RM0090 §3.9.8). An L4 has it in `OPTR[7:0]` (RM0351 §3.7.8).
+const F4_OPTCR_RDP_SHIFT: u32 = 8;
+/// L4 `PCROP1ER.PCROP_RDP`, a set-only bit: "1: PCROP area is erased when the
+/// RDP level is decreased from Level 1 to Level 0 (full mass erase)"
+/// (RM0351 §3.7.10).
+const L4_PCROP_RDP: u32 = 1 << 31;
+/// A `PCROP` range is expressed in double words: "Bank x Base address +
+/// [PCROPx_STRT x 0x8] (included) to … [(PCROPx_END+1) x 0x8] (excluded)"
+/// (RM0351 §3.5.2).
+const PCROP_GRAIN: u64 = 8;
 
 /// A megabyte, the F4's bank size.
 const BANK: u64 = 1 << 20;
@@ -418,6 +521,35 @@ fn l4_page(size: u64, page: u64, dual: bool, pnb: u32, bank: bool) -> Option<(u6
     let base = if dual && bank { bank_len } else { 0 };
     let offset = base.checked_add(u64::from(pnb).checked_mul(page)?)?;
     (offset.checked_add(page)? <= size).then_some((offset, page))
+}
+
+/// The `RDP` level a variant's option word encodes (RM0351 Table 14,
+/// RM0090 §3.6.3): `0xAA` is level 0, `0xCC` is level 2, **anything else** is
+/// level 1 — including a blank byte, which is why a virgin part is protected.
+fn rdp_level_of(variant: Variant, word: u32) -> u8 {
+    let byte = if variant.is_f4() {
+        (word >> F4_OPTCR_RDP_SHIFT) & 0xff
+    } else {
+        word & 0xff
+    };
+    match byte {
+        RDP_LEVEL0 => 0,
+        RDP_LEVEL2 => 2,
+        _ => 1,
+    }
+}
+
+/// The area a `PCROP` start/end pair describes within its own bank, as
+/// `(offset, len)`; a zero length is "no area", which an option byte spells by
+/// putting the start above the end (RM0351 §3.7.9, and the factory value).
+fn pcrop_area(strt: u32, end: u32) -> (u64, u64) {
+    let strt = u64::from(strt & 0xffff);
+    let end = u64::from(end & 0xffff);
+    if strt > end {
+        return (0, 0);
+    }
+    // The end offset is **inclusive**, so the area runs to `(END + 1) * 8`.
+    (strt * PCROP_GRAIN, (end + 1 - strt) * PCROP_GRAIN)
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +717,18 @@ struct Shared {
     reset_out: Mutex<Option<WireSource>>,
     /// The interrupt output.
     irq_out: Mutex<Option<WireSource>>,
+    /// The read-side policy, republished lock-free whenever the option
+    /// registers move, so that a guarded fetch costs two relaxed loads and no
+    /// lock. One entry per bank, packed `start << 32 | end`, both byte offsets
+    /// into the array; `0` when that bank has no `PCROP` area.
+    pcrop: [AtomicU64; 2],
+    /// The `RDP` level in force, likewise published for the read side.
+    rdp: AtomicU32,
+    /// Whether a debugger has the core stopped ([`Device::debug_halt`]).
+    ///
+    /// Not guest state and not in the snapshot: it belongs to whatever is
+    /// debugging, which says so again the moment it reattaches.
+    halted: AtomicBool,
     /// The lock-free half of the lazy contract.
     tick: AtomicU64,
     next_event: AtomicU64,
@@ -627,8 +771,19 @@ impl Shared {
         let _ = handle.sync(kind);
     }
 
-    /// Republish what the lock-free lazy surface reads.
+    /// Republish what the lock-free lazy and read-side surfaces read.
     fn republish(&self, state: &State) {
+        self.rdp
+            .store(u32::from(self.rdp_level(state)), Ordering::Relaxed);
+        for bank in 0..2 {
+            let (offset, len) = self.pcrop_range(state, bank);
+            let packed = if len == 0 {
+                0
+            } else {
+                (offset << 32) | (offset + len)
+            };
+            self.pcrop[bank].store(packed, Ordering::Relaxed);
+        }
         self.tick.store(state.tick, Ordering::Relaxed);
         let next = if state.busy_at <= state.tick {
             u64::MAX
@@ -678,7 +833,7 @@ impl Shared {
                 }
                 let _ = self.array.write_at(offset, &new[..len]);
             }
-            Pending::Option => state.store_option_bytes(self.variant),
+            Pending::Option => self.commit_options(state),
         }
         let sr = self.sr_offset();
         *state.word_mut(sr) &= !SR_BSY;
@@ -693,6 +848,15 @@ impl Shared {
 
     fn cr_offset(&self) -> u64 {
         if self.variant.is_f4() { F4_CR } else { L4_CR }
+    }
+
+    /// Which register holds `RDP`: `OPTCR` on an F4, `OPTR` on an L4.
+    fn optr_offset(&self) -> u64 {
+        if self.variant.is_f4() {
+            F4_OPTCR
+        } else {
+            L4_OPTR
+        }
     }
 
     fn errors_mask(&self) -> u32 {
@@ -726,6 +890,318 @@ impl Shared {
         !self.variant.is_f4() && state.word(L4_OPTR) & (1 << 21) != 0
     }
 
+    // -- the protections ----------------------------------------------------
+
+    /// The `RDP` level the option **bytes** hold.
+    ///
+    /// The stored copy rather than the live register, and the difference
+    /// matters: a level change is defined as an option-byte *programming*
+    /// event — the 1→0 regression mass-erases the array at the moment it is
+    /// programmed (RM0351 §3.5.1) — so the byte is the level. Reading the live
+    /// shadow instead would let a guest lower the level by writing a register
+    /// it may write at any time, with no erase and no reset.
+    fn rdp_level(&self, state: &State) -> u8 {
+        rdp_level_of(self.variant, state.stored[0])
+    }
+
+    /// The `PCROP` area of `bank`, as `(offset, len)` into the array.
+    ///
+    /// Read from the live option registers, as write protection is: those are
+    /// the values the interface compares against, and the writes that could
+    /// weaken them are refused where they arrive ([`Shared::pcrop_write`]).
+    /// An F4 has none — `SPRMOD` is an F42x/F43x bit and this variant decodes
+    /// an F405/407 (see the module header).
+    fn pcrop_range(&self, state: &State, bank: usize) -> (u64, u64) {
+        if self.variant.is_f4() {
+            return (0, 0);
+        }
+        let dual = self.dual_bank(state);
+        if bank == 1 && !dual {
+            return (0, 0);
+        }
+        let (sr, er) = if bank == 0 {
+            (L4_PCROP1SR, L4_PCROP1ER)
+        } else {
+            (L4_PCROP2SR, L4_PCROP2ER)
+        };
+        let (within, len) = pcrop_area(state.word(sr), state.word(er));
+        if len == 0 {
+            return (0, 0);
+        }
+        let base = if dual {
+            (bank as u64) * (self.size / 2)
+        } else {
+            0
+        };
+        let offset = base.saturating_add(within);
+        if offset >= self.size {
+            return (0, 0);
+        }
+        (offset, len.min(self.size - offset))
+    }
+
+    /// Whether `[offset, offset + len)` meets a `PCROP` area, from the
+    /// lock-free mirror the read side uses.
+    fn pcrop_hit(&self, offset: u64, len: u64) -> bool {
+        let end = offset.saturating_add(len);
+        self.pcrop.iter().any(|packed| {
+            let packed = packed.load(Ordering::Relaxed);
+            packed != 0 && offset < (packed & 0xffff_ffff) && end > (packed >> 32)
+        })
+    }
+
+    /// Whether `[offset, offset + len)` meets a `PCROP` area, with the state
+    /// lock held — the program and erase side of the same question.
+    fn pcrop_protected(&self, state: &State, offset: u64, len: u64) -> bool {
+        let end = offset.saturating_add(len);
+        (0..2).any(|bank| {
+            let (base, area) = self.pcrop_range(state, bank);
+            area != 0 && offset < base + area && end > base
+        })
+    }
+
+    /// Whether a program or an erase is barred because something is debugging.
+    ///
+    /// "When the memory read protection level is selected (RDP level = 1), it
+    /// is not possible to program or erase Flash memory if the CPU debug
+    /// features are connected (JTAG or single wire)" (RM0351 §3.5.3, and the
+    /// same note under RM0090's *Write protections*, which adds "even if
+    /// nWRPi = 1"). Neither manual names a flag for the refusal; `WRPERR` is
+    /// the one both sections are about, and the one firmware polls.
+    ///
+    /// This is the half of "debug mode" that no access attribute can carry:
+    /// the access is the *guest's* own store, made while a debugger has the
+    /// core stopped. [`Device::debug_halt`] is the only seam that says so.
+    fn debug_locked(&self, state: &State) -> bool {
+        self.rdp_level(state) >= 1 && self.halted.load(Ordering::Acquire)
+    }
+
+    /// Raise `SR.RDERR` for a `PCROP` read, and nothing else.
+    ///
+    /// Not through [`Shared::fail`]: `RDERR` is not an operation error — it
+    /// has its own enable (`CR.RDERRIE`) and does not set `OPERR`
+    /// (RM0351 §3.6, Table 16).
+    fn raise_rderr(&self) {
+        // The two families put it in different bits of different registers,
+        // and `L4_SR`'s offset is the F4's `CR` — so the variant is asked
+        // rather than assumed, even though only an L4 can arm `PCROP` here.
+        let bit = if self.variant.is_f4() {
+            F4_SR_RDERR
+        } else {
+            L4_SR_RDERR
+        };
+        {
+            let mut state = self.state.lock();
+            let sr = self.sr_offset();
+            *state.word_mut(sr) |= bit;
+        }
+        self.refresh_irq();
+    }
+
+    /// The array's read side when a protection has to judge it: what
+    /// [`Guarded`] answers with.
+    ///
+    /// The whole of `PCROP` and the read half of `RDP` are decided here, on
+    /// two relaxed loads and without the state lock, because this is an
+    /// instruction fetch on a Cortex-M board.
+    fn read_array(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        if attrs.debug && self.rdp.load(Ordering::Relaxed) >= 1 {
+            // "In debug mode … the Flash main memory … [is] totally
+            // inaccessible. In these modes, a read or write access to the
+            // Flash generates a bus error" (RM0351 §3.5.1; RM0090 §3.6.3 says
+            // the same). The device refuses its own debug access — nothing in
+            // `core::space` knows what an option byte is.
+            return Err(BusError::Protected);
+        }
+        if !attrs.is_fetch() && self.pcrop_hit(offset, dst.len() as u64) {
+            // "The protected area is execute-only … all other accesses (DMA,
+            // debug and CPU data read, write and erase) are strictly
+            // prohibited" (RM0351 §3.5.2), and the silicon tells the two apart
+            // by the bus the access arrived on, not by where the PC is: "an
+            // address to be read through the D-bus" (§3.7.5). A literal-pool
+            // load by the protected code itself is a D-bus read and lands
+            // here, which is exactly why PCROP firmware is built execute-only.
+            dst.fill(0);
+            if !attrs.debug {
+                // A debug access may not move a status bit (`ROADMAP.md` §15,
+                // invariant 5) — it is refused the bytes and nothing else.
+                self.raise_rderr();
+            }
+            return Ok(());
+        }
+        self.array.read_at(offset, dst)
+    }
+
+    // -- the option bytes ----------------------------------------------------
+
+    /// An option register on an L4, with the two rules that stop a protection
+    /// from being written away.
+    fn write_option_l4(&self, state: &mut State, offset: u64, value: u32) {
+        if self.rdp_level(state) == 2 {
+            // "only read operations can be performed on the option bytes.
+            // Option bytes cannot be programmed nor erased … When attempting
+            // to modify the options bytes, the protection error flag WRPERR is
+            // set in the Flash_SR register" (RM0351 §3.5.1).
+            self.fail(state, SR_WRPERR);
+            return;
+        }
+        let value = match offset {
+            L4_PCROP1SR | L4_PCROP1ER | L4_PCROP2SR | L4_PCROP2ER => {
+                self.pcrop_write(state, offset, value)
+            }
+            _ => value,
+        };
+        *state.word_mut(offset) = value;
+    }
+
+    /// What a `PCROP` register write may do: grow the area, never shrink it.
+    ///
+    /// "If the user options modification tries to clear PCROP or to decrease
+    /// the PCROP area, the options programming is launched but PCROP area
+    /// stays unchanged. On the contrary, it is possible to increase the PCROP
+    /// area" (RM0351 §3.5.2). The manual states that of the option
+    /// *programming*; it is applied at the register because this model
+    /// enforces from the live registers ([`Shared::pcrop_range`]), and a
+    /// shadow write that shrank the area would defeat the protection without
+    /// programming anything. `PCROP_RDP` is `rs` — set-only — in hardware
+    /// (§3.7.10), and only the full mass erase of an `RDP` regression clears
+    /// it.
+    fn pcrop_write(&self, state: &State, offset: u64, value: u32) -> u32 {
+        let (sr, er) = if offset == L4_PCROP1SR || offset == L4_PCROP1ER {
+            (L4_PCROP1SR, L4_PCROP1ER)
+        } else {
+            (L4_PCROP2SR, L4_PCROP2ER)
+        };
+        let value = if offset == er {
+            value | (state.word(er) & L4_PCROP_RDP)
+        } else {
+            value
+        };
+        let (old_start, old_len) = pcrop_area(state.word(sr), state.word(er));
+        if old_len == 0 {
+            return value;
+        }
+        let (strt, end) = if offset == sr {
+            (value, state.word(er))
+        } else {
+            (state.word(sr), value)
+        };
+        let (start, len) = pcrop_area(strt, end);
+        let grows = len != 0 && start <= old_start && start + len >= old_start + old_len;
+        if grows { value } else { state.word(offset) }
+    }
+
+    /// `OPTSTRT`: start programming the option bytes.
+    fn start_options(&self, state: &mut State) {
+        if self.busy(state) {
+            self.fail(state, SR_PGSERR);
+            return;
+        }
+        if self.rdp_level(state) == 2 {
+            self.fail(state, SR_WRPERR);
+            return;
+        }
+        // An `RDP` regression erases the part before it reprograms the
+        // options, so it costs a mass erase rather than an option-page
+        // program (RM0351 §3.5.1).
+        let time = if self.regression(state) {
+            self.mass_erase_time
+        } else {
+            self.erase_time
+        };
+        self.start(state, Pending::Option, time);
+    }
+
+    /// Whether committing the live option registers would take `RDP` from
+    /// level 1 back to level 0 — the one option write that erases the part.
+    fn regression(&self, state: &State) -> bool {
+        self.rdp_level(state) == 1
+            && rdp_level_of(self.variant, state.word(self.optr_offset())) == 0
+    }
+
+    /// What `OPTSTRT` finishes: the live option registers become the option
+    /// bytes, unless this is the write that erases the part first.
+    fn commit_options(&self, state: &mut State) {
+        if self.regression(state) {
+            self.regress_rdp(state);
+            return;
+        }
+        state.store_option_bytes(self.variant);
+    }
+
+    /// `RDP` level 1 → level 0, which is the only way out of read protection
+    /// and costs the user code to take it.
+    ///
+    /// "When the RDP is reprogrammed to the value 0xAA to move from Level 1 to
+    /// Level 0, a mass erase of the Flash main memory is performed if
+    /// PCROP_RDP is set … If the bit PCROP_RDP is cleared … the full mass
+    /// erase is replaced by a partial mass erase that is successive page
+    /// erases … except for the pages protected by PCROP" (RM0351 §3.5.1).
+    /// RM0090 §3.6.3 has the same rule for the F4 without the PCROP half, and
+    /// adds what both do with the rest: "The other option bytes including
+    /// write protections remain unchanged from before the mass-erase
+    /// operation."
+    ///
+    /// The backup registers and SRAM2, which the same sentence erases, are not
+    /// this device's to erase and are not modelled — see the module header.
+    fn regress_rdp(&self, state: &mut State) {
+        let full = self.variant.is_f4() || state.word(L4_PCROP1ER) & L4_PCROP_RDP != 0;
+        if full {
+            let _ = self.array.fill(0, self.size, 0xff);
+        } else {
+            let page = self.page.max(1);
+            let mut at = 0;
+            while at < self.size {
+                let len = page.min(self.size - at);
+                if !self.pcrop_protected(state, at, len) {
+                    let _ = self.array.fill(at, len, 0xff);
+                }
+                at += page;
+            }
+        }
+        let mut stored = state.stored;
+        stored[0] = if self.variant.is_f4() {
+            (stored[0] & !(0xff << F4_OPTCR_RDP_SHIFT)) | (RDP_LEVEL0 << F4_OPTCR_RDP_SHIFT)
+        } else {
+            (stored[0] & !0xff) | RDP_LEVEL0
+        };
+        if full && !self.variant.is_f4() {
+            // "PCROP is disable[d]", and `PCROP_RDP` "is reset after a full
+            // mass erase due to a change of RDP from Level 1 to Level 0"
+            // (§3.7.10) — so the area goes back to the factory shape, whose
+            // start is above its end.
+            for (sr, er) in [(L4_PCROP1SR, L4_PCROP1ER), (L4_PCROP2SR, L4_PCROP2ER)] {
+                if let Some(slot) = self.option_slot(sr) {
+                    stored[slot] = 0x0000_ffff;
+                }
+                if let Some(slot) = self.option_slot(er) {
+                    stored[slot] = 0x0000_0000;
+                }
+            }
+        }
+        state.stored = stored;
+        // Options, shadow and array agree again: there is no state in which
+        // half of a regression has happened. The F4's `OPTLOCK` shares a
+        // register with its option bytes and is not one of them — programming
+        // the options does not re-lock the interface, only a reset does — so
+        // it survives the reload.
+        if self.variant.is_f4() {
+            let optlock = state.word(F4_OPTCR) & F4_OPTCR_OPTLOCK;
+            state.load_option_bytes(self.variant);
+            *state.word_mut(F4_OPTCR) = (state.word(F4_OPTCR) & !F4_OPTCR_OPTLOCK) | optlock;
+        } else {
+            state.load_option_bytes(self.variant);
+        }
+    }
+
+    /// Where an option register sits in the stored option-byte array.
+    fn option_slot(&self, offset: u64) -> Option<usize> {
+        self.variant
+            .option_words()
+            .iter()
+            .position(|&o| o == offset)
+    }
+
     /// Raise one or more error flags, and `OPERR` with them.
     fn fail(&self, state: &mut State, flags: u32) {
         let sr = self.sr_offset();
@@ -745,7 +1221,16 @@ impl Shared {
     // -- write protection ----------------------------------------------------
 
     /// Whether any byte of `[offset, offset + len)` is write-protected.
+    ///
+    /// A `PCROP` area counts: "Any PCROP protected address is also write
+    /// protected and any write access to one of these addresses will trigger
+    /// WRPERR. Any PCROP area is also erase protected" (RM0351 §3.5.2) — which
+    /// is also what makes a mass erase impossible while one is armed, since
+    /// the erase asks about the whole bank.
     fn protected(&self, state: &State, offset: u64, len: u64) -> bool {
+        if self.pcrop_protected(state, offset, len) {
+            return true;
+        }
         if self.variant.is_f4() {
             self.f4_protected(state, offset, len)
         } else {
@@ -817,6 +1302,12 @@ impl Shared {
     /// send firmware down a path it never takes on the part.
     fn program(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
         if attrs.debug {
+            if self.rdp.load(Ordering::Relaxed) >= 1 {
+                // The write half of RM0351 §3.5.1: at level 1 the array is
+                // inaccessible to a debugger in both directions. The loader's
+                // door below is exactly the door read protection closes.
+                return Err(BusError::Protected);
+            }
             // A debugger writing flash is a debugger *loading* flash: it drives
             // the programming interface over SWD rather than storing through
             // the AHB, so the honest model of the side door is a direct poke
@@ -858,7 +1349,7 @@ impl Shared {
             self.fail(state, SR_PGSERR);
             return;
         }
-        if self.protected(state, offset, src.len() as u64) {
+        if self.protected(state, offset, src.len() as u64) || self.debug_locked(state) {
             self.fail(state, SR_WRPERR);
             return;
         }
@@ -900,7 +1391,7 @@ impl Shared {
             self.fail(state, L4_SR_SIZERR);
             return;
         }
-        if self.protected(state, offset, 8) {
+        if self.protected(state, offset, 8) || self.debug_locked(state) {
             state.latch = None;
             self.fail(state, SR_WRPERR);
             return;
@@ -1050,7 +1541,7 @@ impl Shared {
             self.fail(state, SR_PGSERR);
             return;
         };
-        if self.protected(state, offset, len) {
+        if self.protected(state, offset, len) || self.debug_locked(state) {
             self.fail(state, SR_WRPERR);
             return;
         }
@@ -1066,6 +1557,12 @@ impl Shared {
         if !self.opt_unlocked(state) {
             return;
         }
+        if self.rdp_level(state) == 2 {
+            // "User option bytes can no longer be changed" (RM0090 §3.6.3).
+            // The F4's manual names no flag for the refusal, so unlike the L4
+            // — which names `WRPERR` — nothing is raised.
+            return;
+        }
         if offset == F4_OPTCR1 {
             *state.word_mut(F4_OPTCR1) = value & 0x0fff_0000;
             return;
@@ -1077,11 +1574,7 @@ impl Shared {
         if value & F4_OPTCR_OPTSTRT == 0 {
             return;
         }
-        if self.busy(state) {
-            self.fail(state, SR_PGSERR);
-            return;
-        }
-        self.start(state, Pending::Option, self.erase_time);
+        self.start_options(state);
     }
 
     fn write_l4(&self, state: &mut State, offset: u64, value: u32) -> MemResult<After> {
@@ -1116,7 +1609,7 @@ impl Shared {
             | L4_PCROP2ER | L4_WRP2AR | L4_WRP2BR
                 if self.opt_unlocked(state) =>
             {
-                *state.word_mut(offset) = value;
+                self.write_option_l4(state, offset, value);
             }
             _ => {}
         }
@@ -1135,8 +1628,8 @@ impl Shared {
         if !locked {
             next = (next & !L4_CR_OPERATION) | (value & L4_CR_OPERATION);
         }
-        next = (next & !(CR_EOPIE | CR_ERRIE | (1 << 26)))
-            | (value & (CR_EOPIE | CR_ERRIE | (1 << 26)));
+        next = (next & !(CR_EOPIE | CR_ERRIE | L4_CR_RDERRIE))
+            | (value & (CR_EOPIE | CR_ERRIE | L4_CR_RDERRIE));
         if value & CR_LOCK != 0 {
             next |= CR_LOCK;
         }
@@ -1151,11 +1644,7 @@ impl Shared {
             self.erase_l4(state, value);
         }
         if value & L4_CR_OPTSTRT != 0 && !opt_locked {
-            if self.busy(state) {
-                self.fail(state, SR_PGSERR);
-            } else {
-                self.start(state, Pending::Option, self.erase_time);
-            }
+            self.start_options(state);
         }
         if value & L4_CR_OBL_LAUNCH != 0 {
             if opt_locked || self.busy(state) {
@@ -1199,7 +1688,7 @@ impl Shared {
             self.fail(state, SR_PGSERR);
             return;
         };
-        if self.protected(state, offset, len) {
+        if self.protected(state, offset, len) || self.debug_locked(state) {
             self.fail(state, SR_WRPERR);
             return;
         }
@@ -1283,8 +1772,18 @@ impl Shared {
             let sr = state.word(self.sr_offset());
             let cr = state.word(self.cr_offset());
             let eop = sr & SR_EOP != 0 && cr & CR_EOPIE != 0;
-            let err = sr & self.errors_mask() != 0 && cr & CR_ERRIE != 0;
-            Level::from_bool(eop || err)
+            // On an L4 `RDERR` is enabled by `RDERRIE` and by nothing else
+            // (RM0351 Table 16); an F4 has no such bit and `ERRIE` covers it.
+            let (errors, rderr) = if self.variant.is_f4() {
+                (self.errors_mask(), false)
+            } else {
+                (
+                    self.errors_mask() & !L4_SR_RDERR,
+                    sr & L4_SR_RDERR != 0 && cr & L4_CR_RDERRIE != 0,
+                )
+            };
+            let err = sr & errors != 0 && cr & CR_ERRIE != 0;
+            Level::from_bool(eop || err || rderr)
         };
         let source = self.irq_out.lock().clone();
         if let Some(source) = source {
@@ -1345,6 +1844,34 @@ impl MemOps for Registers {
 
     fn constraints(&self) -> AccessConstraints {
         AccessConstraints::word(Width::U32, Endian::Little)
+    }
+}
+
+/// The array's **read** side when a protection has to judge a read.
+///
+/// Installed in place of the [`RamStore`] child when — and only when — the
+/// part has `PCROP` or `RDP` to enforce, because it costs a virtual call per
+/// instruction fetch. See the module header.
+#[derive(Debug)]
+struct Guarded {
+    shared: Arc<Shared>,
+}
+
+impl MemOps for Guarded {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        self.shared.read_array(offset, dst, attrs)
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
+        // Unreachable through the container, whose write winner is `Program`;
+        // implemented so that mapping this region alone still obeys `CR`.
+        self.shared.program(offset, src, attrs)
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        // Everything a store would have taken, bursts included: this stands in
+        // for memory, and a `memcpy` out of flash is an ordinary thing to do.
+        AccessConstraints::ANY
     }
 }
 
@@ -1419,6 +1946,13 @@ impl Flash {
             .optional_media("image")?
             .map(crate::core::props::Media::to_bytes);
         let optr = r.optional::<u64>("optr")?;
+        let pcrop = [
+            r.optional::<u64>("pcrop1sr")?,
+            r.optional::<u64>("pcrop1er")?,
+            r.optional::<u64>("pcrop2sr")?,
+            r.optional::<u64>("pcrop2er")?,
+        ];
+        let read_guard = r.or("read-guard", false)?;
         let program_time = r.or("program-time", DEFAULT_PROGRAM_TIME)?;
         let erase_time = r.or("erase-time", DEFAULT_ERASE_TIME)?;
         let mass_erase_time = r.or("mass-erase-time", DEFAULT_MASS_ERASE_TIME)?;
@@ -1457,6 +1991,35 @@ impl Flash {
                 ))
             })?;
         }
+        for (name, value) in ["pcrop1sr", "pcrop1er", "pcrop2sr", "pcrop2er"]
+            .into_iter()
+            .zip(pcrop)
+        {
+            let Some(value) = value else { continue };
+            if variant.is_f4() {
+                return Err(config(format!(
+                    "`{name}` is an L4 option register; the F4's PCROP is `OPTCR.SPRMOD` on an \
+                     F42x/F43x, which this variant does not decode"
+                )));
+            }
+            let value = u32::try_from(value).map_err(|_| {
+                config(format!(
+                    "`{name}` is a 32-bit register and {value:#x} is not"
+                ))
+            })?;
+            let offset = match name {
+                "pcrop1sr" => L4_PCROP1SR,
+                "pcrop1er" => L4_PCROP1ER,
+                "pcrop2sr" => L4_PCROP2SR,
+                _ => L4_PCROP2ER,
+            };
+            let slot = variant
+                .option_words()
+                .iter()
+                .position(|&o| o == offset)
+                .expect("every L4 PCROP register is an option word");
+            stored[slot] = value;
+        }
 
         // An L4's pages are 2 KiB; an L4+'s are 4 KiB when `OPTR.DUALBANK`
         // splits the array and 8 KiB when it does not (RM0432 §3.3.1).
@@ -1480,8 +2043,18 @@ impl Flash {
                 .map_err(|_| config(String::from("the flash refused its initial image")))?;
         }
 
+        // The read side is judged by the device only if there is something to
+        // judge: see the module header, "What that costs, and when".
+        let state = State::reset(variant, stored);
+        let guard = read_guard
+            || rdp_level_of(variant, stored[0]) >= 1
+            || (!variant.is_f4()
+                && [(L4_PCROP1SR, L4_PCROP1ER), (L4_PCROP2SR, L4_PCROP2ER)]
+                    .into_iter()
+                    .any(|(sr, er)| pcrop_area(state.word(sr), state.word(er)).1 != 0));
+
         let shared = Arc::new(Shared {
-            state: Mutex::with_rank(LockRank::DEVICE, State::reset(variant, stored)),
+            state: Mutex::with_rank(LockRank::DEVICE, state),
             variant,
             array: Arc::clone(&array_store),
             size,
@@ -1491,10 +2064,20 @@ impl Flash {
             mass_erase_time,
             reset_out: Mutex::with_rank(LockRank::WIRE, None),
             irq_out: Mutex::with_rank(LockRank::WIRE, None),
+            pcrop: [AtomicU64::new(0), AtomicU64::new(0)],
+            rdp: AtomicU32::new(0),
+            halted: AtomicBool::new(false),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
         });
+
+        // The read side's lock-free mirror starts out agreeing with the option
+        // bytes rather than with zero.
+        {
+            let state = shared.state.lock();
+            shared.republish(&state);
+        }
 
         let regs: RegionRef = Arc::new(Region::io(
             "flash.regs",
@@ -1509,7 +2092,17 @@ impl Flash {
         // device. `core::space::flat` resolves reads and writes separately, so
         // a fetch never calls into a device and a store never reaches the array
         // without passing through `CR`.
-        let read_side: RegionRef = Arc::new(Region::ram("flash.array", array_store));
+        let read_side: RegionRef = if guard {
+            Arc::new(Region::io(
+                "flash.guarded",
+                size,
+                Arc::new(Guarded {
+                    shared: Arc::clone(&shared),
+                }) as Arc<dyn MemOps>,
+            ))
+        } else {
+            Arc::new(Region::ram("flash.array", array_store))
+        };
         let write_side: RegionRef = Arc::new(Region::io(
             "flash.program",
             size,
@@ -1831,6 +2424,14 @@ impl Device for Flash {
     fn attach_lazy(&self, handle: LazyHandle) {
         *self.shared.lazy.lock() = Some(handle);
     }
+
+    fn debug_halt(&self, halted: bool) {
+        // The half of "debug mode" that no access attribute carries: at `RDP`
+        // level 1 the part refuses to program or erase while the debug
+        // features are connected, however ordinary the access looks
+        // (RM0351 §3.5.3). See [`Shared::debug_locked`].
+        self.shared.halted.store(halted, Ordering::Release);
+    }
 }
 
 impl Instance for Flash {}
@@ -1864,6 +2465,37 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "the option register as the option bytes hold it (F4: OPTCR; L4: OPTR)",
+        },
+        PropertySpec {
+            name: "pcrop1sr",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "L4 FLASH_PCROP1SR as the option bytes hold it: bank 1's PCROP start",
+        },
+        PropertySpec {
+            name: "pcrop1er",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "L4 FLASH_PCROP1ER: bank 1's PCROP end, and PCROP_RDP in bit 31",
+        },
+        PropertySpec {
+            name: "pcrop2sr",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "L4 FLASH_PCROP2SR: bank 2's PCROP start, on a dual-bank part",
+        },
+        PropertySpec {
+            name: "pcrop2er",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "L4 FLASH_PCROP2ER: bank 2's PCROP end",
+        },
+        PropertySpec {
+            name: "read-guard",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "judge every array read in the controller, for a part whose firmware arms \
+                      PCROP or RDP itself (implied when the option bytes arm either)",
         },
         PropertySpec {
             name: "program-time",
@@ -1913,6 +2545,11 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("size", ValueKind::Uint).required())
         .prop(PropSchema::new("image", ValueKind::Media))
         .prop(PropSchema::new("optr", ValueKind::Uint))
+        .prop(PropSchema::new("pcrop1sr", ValueKind::Uint))
+        .prop(PropSchema::new("pcrop1er", ValueKind::Uint))
+        .prop(PropSchema::new("pcrop2sr", ValueKind::Uint))
+        .prop(PropSchema::new("pcrop2er", ValueKind::Uint))
+        .prop(PropSchema::new("read-guard", ValueKind::Bool))
         .prop(PropSchema::new("program-time", ValueKind::Uint))
         .prop(PropSchema::new("erase-time", ValueKind::Uint))
         .prop(PropSchema::new("mass-erase-time", ValueKind::Uint))

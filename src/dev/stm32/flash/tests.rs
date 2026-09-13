@@ -968,3 +968,564 @@ fn the_register_block_is_word_only() {
     );
     assert!(Device::region(&flash, "nowhere").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Protection: PCROP and RDP (RM0351 §3.5, RM0090 §3.6.3)
+// ---------------------------------------------------------------------------
+
+/// The factory `OPTR` these tests start from, dual-bank so `PCROP2` exists.
+const L4_OPTR_FACTORY: u64 = 0xffef_f8aa | (1 << 21);
+
+/// An L4 whose option bytes arm bank 1's `PCROP` over the **double words**
+/// `[first, last]` — the granularity RM0351 §3.5.2 defines the area in.
+fn l4_pcrop(first: u32, last: u32, pcrop_rdp: bool) -> Flash {
+    let er = u64::from(last) | if pcrop_rdp { 1 << 31 } else { 0 };
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("l4")))
+        .with("size", Value::Uint(L4_SIZE))
+        .with("optr", Value::Uint(L4_OPTR_FACTORY))
+        .with("pcrop1sr", Value::Uint(u64::from(first)))
+        .with("pcrop1er", Value::Uint(er));
+    Flash::new(&props).expect("a PCROP part")
+}
+
+/// A part whose `RDP` option byte is `rdp` — `0xAA` level 0, `0xCC` level 2,
+/// anything else level 1 (RM0351 Table 14).
+fn with_rdp(variant: Variant, rdp: u32) -> Flash {
+    let optr = if variant.is_f4() {
+        u64::from((0x0fff_aaed_u32 & !(0xff << 8)) | (rdp << 8))
+    } else {
+        (L4_OPTR_FACTORY & !0xff) | u64::from(rdp)
+    };
+    let props = Props::new()
+        .with("variant", Value::Str(String::from(variant.as_str())))
+        .with(
+            "size",
+            Value::Uint(if variant.is_f4() { F4_SIZE } else { L4_SIZE }),
+        )
+        .with("optr", Value::Uint(optr));
+    Flash::new(&props).expect("a read-protected part")
+}
+
+/// Map the array at `0x0800_0000`, the way every STM32 board does.
+fn mapped(flash: &Flash) -> AddressSpace {
+    let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::FAULT);
+    let region = Device::region(flash, "array").expect("the array region");
+    space.topology().map(region, 0x0800_0000).unwrap();
+    space
+}
+
+/// The name of the child that answers reads — the whole of "does this part pay
+/// for a guarded read side".
+fn read_child(flash: &Flash) -> String {
+    let region = Device::region(flash, "array").expect("the array region");
+    let children = region.as_container().expect("a container").children();
+    String::from(children[0].region.name())
+}
+
+/// What a Cortex-M's I-code fetch carries, and the D-bus does not.
+fn fetch() -> MemAttrs {
+    MemAttrs::DEFAULT.with_purpose(crate::core::space::AccessPurpose::FETCH)
+}
+
+#[test]
+fn only_a_protected_part_pays_for_a_guarded_read_side() {
+    // Nothing armed: the read side is the store, and a fetch never calls this
+    // device at all.
+    assert_eq!(read_child(&f4()), "flash.array");
+    assert_eq!(read_child(&l4()), "flash.array");
+
+    // Option bytes that arm either protection buy the guard …
+    assert_eq!(read_child(&l4_pcrop(0x200, 0x21f, true)), "flash.guarded");
+    assert_eq!(read_child(&with_rdp(Variant::L4, 0x55)), "flash.guarded");
+    assert_eq!(read_child(&with_rdp(Variant::F4, 0x55)), "flash.guarded");
+
+    // … and so does a board that says its firmware will arm them itself.
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("l4")))
+        .with("size", Value::Uint(L4_SIZE))
+        .with("read-guard", Value::Bool(true));
+    assert_eq!(read_child(&Flash::new(&props).unwrap()), "flash.guarded");
+}
+
+#[test]
+fn an_f4_refuses_the_l4s_pcrop_properties() {
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("f4")))
+        .with("size", Value::Uint(F4_SIZE))
+        .with("pcrop1sr", Value::Uint(0x200));
+    let e = Flash::new(&props).unwrap_err().to_string();
+    assert!(e.contains("SPRMOD"), "{e}");
+}
+
+#[test]
+fn a_pcrop_area_may_be_fetched_and_not_read() {
+    // Double words 0x200..=0x21f — bytes 0x1000..0x1100 of bank 1.
+    let flash = l4_pcrop(0x200, 0x21f, true);
+    flash
+        .load_image(0x1000, &0x1234_5678u32.to_le_bytes())
+        .unwrap();
+    flash
+        .load_image(0x1100, &0xdead_beefu32.to_le_bytes())
+        .unwrap();
+    let space = mapped(&flash);
+
+    // An instruction fetch reaches the bytes: the area is execute-only, and
+    // execute is the one thing it is.
+    assert_eq!(
+        space.read(0x0800_1000, Width::U32, fetch()).unwrap(),
+        0x1234_5678
+    );
+    assert_eq!(sr(&flash) & L4_SR_RDERR, 0, "a fetch is not a read error");
+
+    // A load of the same address is a D-bus read and the bytes are not
+    // delivered: "Any read access performed through the D-bus to a PCROP
+    // protected area will trigger RDERR flag error" (RM0351 §3.5.2).
+    assert_eq!(
+        space
+            .read(0x0800_1000, Width::U32, MemAttrs::DEFAULT)
+            .unwrap(),
+        0
+    );
+    assert_eq!(sr(&flash) & L4_SR_RDERR, L4_SR_RDERR);
+    assert_eq!(sr(&flash) & SR_OPERR, 0, "RDERR is not an operation error");
+    clear_sr(&flash);
+
+    // One double word past the end is ordinary flash.
+    assert_eq!(
+        space
+            .read(0x0800_1100, Width::U32, MemAttrs::DEFAULT)
+            .unwrap(),
+        0xdead_beef
+    );
+    assert_eq!(sr(&flash) & L4_SR_RDERR, 0);
+}
+
+#[test]
+fn a_literal_pool_load_is_refused_like_any_other_data_read() {
+    // The nuance PCROP is famous for. `LDR r0, =const` inside the protected
+    // range is a D-bus read *of* the range *by code in* it, and the part
+    // refuses it exactly as it refuses a debugger's — the hardware keys on the
+    // bus, not on the PC, which is why this model has no PC to consult and why
+    // firmware for a PCROP'd part is built execute-only.
+    let flash = l4_pcrop(0x200, 0x21f, true);
+    flash
+        .load_image(0x10f8, &0xcafe_babeu32.to_le_bytes())
+        .unwrap();
+    let space = mapped(&flash);
+
+    // The code runs …
+    assert_eq!(
+        space.read(0x0800_1000, Width::U32, fetch()).unwrap(),
+        0xffff_ffff
+    );
+    // … and cannot read its own constant pool at the end of the same range.
+    assert_eq!(
+        space
+            .read(0x0800_10f8, Width::U32, MemAttrs::DEFAULT)
+            .unwrap(),
+        0
+    );
+    assert_eq!(sr(&flash) & L4_SR_RDERR, L4_SR_RDERR);
+}
+
+#[test]
+fn a_pcrop_read_error_raises_the_interrupt_only_through_rderrie() {
+    let flash = l4_pcrop(0x200, 0x21f, true);
+    let irq = probe(&flash, IRQ_PIN);
+    let space = mapped(&flash);
+
+    // `ERRIE` alone does nothing for it: `RDERR` has its own enable
+    // (RM0351 Table 16).
+    unlock(&flash);
+    flash.poke(L4_CR, CR_ERRIE).unwrap();
+    space
+        .read(0x0800_1000, Width::U32, MemAttrs::DEFAULT)
+        .unwrap();
+    assert!(!irq.is_high(), "ERRIE does not cover RDERR");
+    clear_sr(&flash);
+
+    flash.poke(L4_CR, L4_CR_RDERRIE).unwrap();
+    space
+        .read(0x0800_1000, Width::U32, MemAttrs::DEFAULT)
+        .unwrap();
+    assert!(irq.is_high(), "RDERRIE does");
+    clear_sr(&flash);
+    assert!(!irq.is_high());
+}
+
+#[test]
+fn a_debug_read_of_a_pcrop_area_gets_nothing_and_moves_nothing() {
+    let flash = l4_pcrop(0x200, 0x21f, true);
+    flash
+        .load_image(0x1000, &0x1234_5678u32.to_le_bytes())
+        .unwrap();
+    let space = mapped(&flash);
+
+    // "all other accesses (DMA, debug and CPU data read, write and erase) are
+    // strictly prohibited" — so a monitor sees zeros …
+    assert_eq!(
+        space
+            .read(0x0800_1000, Width::U32, MemAttrs::DEBUG)
+            .unwrap(),
+        0
+    );
+    // … and no status bit moved, which is the debug invariant
+    // (`ROADMAP.md` §15, invariant 5).
+    assert_eq!(sr(&flash), 0, "a debug access never sets RDERR");
+}
+
+#[test]
+fn a_pcrop_area_cannot_be_programmed_or_erased() {
+    let flash = l4_pcrop(0x200, 0x21f, true);
+    unlock(&flash);
+
+    // "Any PCROP protected address is also write protected and any write
+    // access to one of these addresses will trigger WRPERR" (§3.5.2).
+    flash.poke(L4_CR, CR_PG).unwrap();
+    flash.store(0x1000, &0u32.to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    assert_eq!(word(&flash, 0x1000), 0xffff_ffff);
+    clear_sr(&flash);
+
+    // "Any PCROP area is also erase protected" — and the protection is by
+    // page, "including the page containing the start address and the end
+    // address of this zone": bytes 0x1000..0x1100 are in page 2.
+    flash.poke(L4_CR, L4_CR_PER | (2 << 3) | CR_STRT).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    clear_sr(&flash);
+
+    // And "a software mass erase cannot be performed if one zone is PCROP
+    // protected": the erase asks about the whole bank, which contains it.
+    flash.poke(L4_CR, L4_CR_MER1 | CR_STRT).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    clear_sr(&flash);
+
+    // Page 1 is outside the area and erases normally.
+    flash.poke(L4_CR, L4_CR_PER | (1 << 3) | CR_STRT).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, 0);
+    settle(&flash);
+    assert_eq!(sr(&flash) & SR_EOP, SR_EOP);
+}
+
+#[test]
+fn a_pcrop_area_may_grow_but_never_shrink() {
+    let flash = l4_pcrop(0x200, 0x21f, true);
+    unlock(&flash);
+    opt_unlock(&flash);
+
+    // "If the user options modification tries to clear PCROP or to decrease
+    // the PCROP area … PCROP area stays unchanged" (§3.5.2).
+    flash.poke(L4_PCROP1SR, 0x208).unwrap();
+    assert_eq!(flash.peek(L4_PCROP1SR), 0x200, "a later start is a shrink");
+    flash.poke(L4_PCROP1ER, 0x210).unwrap();
+    assert_eq!(
+        flash.peek(L4_PCROP1ER) & 0xffff,
+        0x21f,
+        "an earlier end is a shrink"
+    );
+    // Clearing it outright — the factory "start above end" — is the same
+    // request, and is refused the same way.
+    flash.poke(L4_PCROP1SR, 0xffff).unwrap();
+    assert_eq!(flash.peek(L4_PCROP1SR), 0x200);
+
+    // "On the contrary, it is possible to increase the PCROP area."
+    flash.poke(L4_PCROP1SR, 0x100).unwrap();
+    assert_eq!(flash.peek(L4_PCROP1SR), 0x100);
+    flash.poke(L4_PCROP1ER, 0x2ff).unwrap();
+    assert_eq!(flash.peek(L4_PCROP1ER) & 0xffff, 0x2ff);
+    assert_eq!(
+        flash.peek(L4_PCROP1ER) & L4_PCROP_RDP,
+        L4_PCROP_RDP,
+        "PCROP_RDP is set-only, and a write that omitted it did not clear it"
+    );
+}
+
+#[test]
+fn rdp_level_1_shuts_the_debugger_out_of_the_array() {
+    for variant in [Variant::F4, Variant::L4] {
+        let flash = with_rdp(variant, 0x55);
+        flash.load_image(0, &0x1234_5678u32.to_le_bytes()).unwrap();
+        let space = mapped(&flash);
+
+        // "In debug mode … a read or write access to the Flash generates a bus
+        // error" (RM0351 §3.5.1; RM0090 §3.6.3).
+        assert_eq!(
+            space.read(0x0800_0000, Width::U32, MemAttrs::DEBUG),
+            Err(BusError::Protected)
+        );
+        assert_eq!(
+            space.write(0x0800_0000, Width::U32, 0, MemAttrs::DEBUG),
+            Err(BusError::Protected),
+            "the loader's door is exactly the door read protection closes"
+        );
+
+        // The guest's own code is unaffected: "Code executing in user mode
+        // (Boot Flash) can access Flash main memory … with all operations."
+        assert_eq!(
+            space
+                .read(0x0800_0000, Width::U32, MemAttrs::DEFAULT)
+                .unwrap(),
+            0x1234_5678
+        );
+        assert_eq!(
+            space.read(0x0800_0000, Width::U32, fetch()).unwrap(),
+            0x1234_5678
+        );
+    }
+
+    // Level 0 is the part everybody ships: the debugger reads it.
+    let flash = with_rdp(Variant::L4, 0xaa);
+    flash.load_image(0, &0x1234_5678u32.to_le_bytes()).unwrap();
+    let space = mapped(&flash);
+    assert_eq!(
+        space
+            .read(0x0800_0000, Width::U32, MemAttrs::DEBUG)
+            .unwrap(),
+        0x1234_5678
+    );
+}
+
+#[test]
+fn rdp_level_1_refuses_to_program_while_a_debugger_has_the_core() {
+    // The half of "debug mode" that no access attribute carries: an ordinary
+    // guest store, made while something has the core stopped (RM0351 §3.5.3).
+    let flash = with_rdp(Variant::L4, 0x55);
+    unlock(&flash);
+
+    Device::debug_halt(&flash, true);
+    flash.poke(L4_CR, CR_PG).unwrap();
+    flash.store(0x800, &0u32.to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    assert_eq!(word(&flash, 0x800), 0xffff_ffff);
+    clear_sr(&flash);
+
+    flash.poke(L4_CR, L4_CR_PER | (1 << 3) | CR_STRT).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR, "nor an erase");
+    clear_sr(&flash);
+
+    // The debugger lets go, and the same sequence programs.
+    Device::debug_halt(&flash, false);
+    flash.poke(L4_CR, CR_PG).unwrap();
+    flash.store(0x800, &0u32.to_le_bytes()).unwrap();
+    flash.store(0x804, &0u32.to_le_bytes()).unwrap();
+    settle(&flash);
+    assert_eq!(sr(&flash) & SR_WRPERR, 0);
+    assert_eq!(word(&flash, 0x800), 0);
+
+    // At level 0 a debugger may sit there all day.
+    let flash = l4();
+    unlock(&flash);
+    Device::debug_halt(&flash, true);
+    flash.poke(L4_CR, CR_PG).unwrap();
+    flash.store(0x800, &0u32.to_le_bytes()).unwrap();
+    flash.store(0x804, &0u32.to_le_bytes()).unwrap();
+    settle(&flash);
+    assert_eq!(sr(&flash) & SR_WRPERR, 0);
+    assert_eq!(word(&flash, 0x800), 0);
+}
+
+#[test]
+fn dropping_rdp_from_level_1_to_level_0_mass_erases_the_array() {
+    for variant in [Variant::F4, Variant::L4] {
+        let flash = with_rdp(variant, 0x55);
+        flash
+            .load_image(0x2000, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        let optr = if variant.is_f4() { F4_OPTCR } else { L4_OPTR };
+        unlock(&flash);
+        opt_unlock(&flash);
+
+        // Another option byte, *committed*, to prove the rest survives the
+        // erase: "The other option bytes including write protections remain
+        // unchanged from before the mass-erase operation" (RM0090 §3.6.3), and
+        // "the user options except PCROP protection are set to their previous
+        // values" (RM0351 §3.5.1) — previous meaning as programmed, so an
+        // uncommitted shadow write is not what survives.
+        if variant.is_f4() {
+            let value = flash.peek(F4_OPTCR) & !(1 << (16 + 3));
+            flash.poke(F4_OPTCR, value | F4_OPTCR_OPTSTRT).unwrap();
+        } else {
+            flash.poke(L4_WRP1AR, 4 | (7 << 16)).unwrap();
+            flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+        }
+        settle(&flash);
+        clear_sr(&flash);
+
+        // "programming the protection option byte (RDP) to Level 0 causes the
+        // Flash memory … to be mass-erased" (RM0090 §3.6.3, RM0351 §3.5.1).
+        let level0 = if variant.is_f4() {
+            (flash.peek(F4_OPTCR) & !(0xff << 8)) | (0xaa << 8)
+        } else {
+            (flash.peek(L4_OPTR) & !0xff) | 0xaa
+        };
+        flash.poke(optr, level0).unwrap();
+        if variant.is_f4() {
+            flash.poke(F4_OPTCR, level0 | F4_OPTCR_OPTSTRT).unwrap();
+        } else {
+            flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+        }
+        assert_eq!(sr(&flash) & SR_BSY, SR_BSY, "the erase takes time");
+        settle(&flash);
+        assert_eq!(sr(&flash) & SR_EOP, SR_EOP);
+
+        assert!(
+            flash.contents().iter().all(|&b| b == 0xff),
+            "the user code area is cleared before the protection is removed"
+        );
+        Device::reset(&flash, ResetKind::Warm);
+        let (mask, want) = if variant.is_f4() {
+            (0xff00, 0xaa00)
+        } else {
+            (0xff, 0xaa)
+        };
+        assert_eq!(
+            flash.peek(optr) & mask,
+            want,
+            "and the part is at level 0 afterwards"
+        );
+        if variant.is_f4() {
+            assert_eq!(
+                flash.peek(F4_OPTCR) & (1 << (16 + 3)),
+                0,
+                "the other option bytes remain unchanged"
+            );
+        } else {
+            assert_eq!(flash.peek(L4_WRP1AR), 4 | (7 << 16));
+        }
+
+        // A debugger may read it now.
+        let space = mapped(&flash);
+        assert_eq!(
+            space
+                .read(0x0800_0000, Width::U32, MemAttrs::DEBUG)
+                .unwrap(),
+            0xffff_ffff
+        );
+    }
+}
+
+#[test]
+fn a_cleared_pcrop_rdp_turns_the_mass_erase_into_a_partial_one() {
+    // "If the bit PCROP_RDP is cleared … the full mass erase is replaced by a
+    // partial mass erase that is successive page erases … except for the pages
+    // protected by PCROP" (RM0351 §3.5.1).
+    let flash = l4_pcrop(0x200, 0x21f, false);
+    unlock(&flash);
+    opt_unlock(&flash);
+    // Arm level 1 the way a part in the field is: through the option bytes.
+    flash
+        .poke(L4_OPTR, (flash.peek(L4_OPTR) & !0xff) | 0x55)
+        .unwrap();
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    settle(&flash);
+    clear_sr(&flash);
+
+    flash
+        .load_image(0x1000, &0xaaaa_aaaau32.to_le_bytes())
+        .unwrap();
+    flash
+        .load_image(0x4000, &0xbbbb_bbbbu32.to_le_bytes())
+        .unwrap();
+
+    flash
+        .poke(L4_OPTR, (flash.peek(L4_OPTR) & !0xff) | 0xaa)
+        .unwrap();
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    settle(&flash);
+
+    assert_eq!(
+        word(&flash, 0x1000),
+        0xaaaa_aaaa,
+        "the PCROP page is kept, which is what PCROP_RDP is for"
+    );
+    assert_eq!(word(&flash, 0x4000), 0xffff_ffff, "everything else went");
+    assert_eq!(
+        flash.peek(L4_PCROP1SR),
+        0x200,
+        "and PCROP itself survives a partial erase"
+    );
+}
+
+#[test]
+fn a_full_regression_erase_disables_pcrop() {
+    let flash = l4_pcrop(0x200, 0x21f, true);
+    unlock(&flash);
+    opt_unlock(&flash);
+    flash
+        .poke(L4_OPTR, (flash.peek(L4_OPTR) & !0xff) | 0x55)
+        .unwrap();
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    settle(&flash);
+    clear_sr(&flash);
+
+    flash
+        .poke(L4_OPTR, (flash.peek(L4_OPTR) & !0xff) | 0xaa)
+        .unwrap();
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    settle(&flash);
+
+    // "Deactivation of PCROP can only occur when the RDP is changing from
+    // level 1 to level 0", and `PCROP_RDP` "is reset after a full mass erase"
+    // (§3.5.2, §3.7.10).
+    assert_eq!(flash.peek(L4_PCROP1SR), 0xffff);
+    assert_eq!(flash.peek(L4_PCROP1ER), 0);
+    let space = mapped(&flash);
+    assert_eq!(
+        space
+            .read(0x0800_1000, Width::U32, MemAttrs::DEFAULT)
+            .unwrap(),
+        0xffff_ffff,
+        "the area reads as ordinary erased flash again"
+    );
+}
+
+#[test]
+fn read_protection_level_2_is_permanent() {
+    let flash = l4();
+    unlock(&flash);
+    opt_unlock(&flash);
+
+    // 0 → 2 directly, which erases nothing: "When the protection level is
+    // increased (0->1, 1->2, 0->2) there is no mass erase."
+    flash
+        .load_image(0x2000, &0x1234_5678u32.to_le_bytes())
+        .unwrap();
+    flash
+        .poke(L4_OPTR, (flash.peek(L4_OPTR) & !0xff) | 0xcc)
+        .unwrap();
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    settle(&flash);
+    assert_eq!(word(&flash, 0x2000), 0x1234_5678);
+    clear_sr(&flash);
+
+    // "Thus, the level 2 cannot be removed at all: it is an irreversible
+    // operation. When attempting to modify the options bytes, the protection
+    // error flag WRPERR is set" (RM0351 §3.5.1).
+    flash
+        .poke(L4_OPTR, (flash.peek(L4_OPTR) & !0xff) | 0xaa)
+        .unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    assert_eq!(flash.peek(L4_OPTR) & 0xff, 0xcc, "the shadow did not move");
+    clear_sr(&flash);
+
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    assert_eq!(sr(&flash) & SR_WRPERR, SR_WRPERR);
+    assert_eq!(sr(&flash) & SR_BSY, 0, "and nothing was started");
+    clear_sr(&flash);
+
+    Device::reset(&flash, ResetKind::Cold);
+    assert_eq!(flash.peek(L4_OPTR) & 0xff, 0xcc, "a reset does not help");
+
+    // An F4 refuses the same write silently: RM0090 §3.6.3 says the option
+    // bytes "can no longer be changed" and names no flag for the attempt.
+    let flash = with_rdp(Variant::F4, 0xcc);
+    unlock(&flash);
+    opt_unlock(&flash);
+    let before = flash.peek(F4_OPTCR);
+    flash
+        .poke(F4_OPTCR, (before & !(0xff << 8)) | (0xaa << 8))
+        .unwrap();
+    assert_eq!(flash.peek(F4_OPTCR), before);
+    assert_eq!(sr(&flash), 0);
+}
