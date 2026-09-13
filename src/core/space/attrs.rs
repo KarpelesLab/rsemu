@@ -623,4 +623,87 @@ pub trait MemOps: fmt::Debug + Send + Sync {
     fn constraints(&self) -> AccessConstraints {
         AccessConstraints::IO
     }
+
+    /// The erase geometry a *loader* programs this region through, if it has
+    /// one. `None` — the default — for everything that is not a programmable
+    /// array.
+    ///
+    /// Returning `Some` is a promise about [`MemAttrs::debug`] writes, and it
+    /// is the only way anything outside the device knows it can make one:
+    ///
+    /// * A debug write to this region **lands in the array**, whatever the
+    ///   controller's own rules would have said about it. That is the side
+    ///   door a part's programming interface is, and a device that would
+    ///   rather refuse a debug write (`dev::flash::cfi` does, because a write
+    ///   there advances a command state machine) says so by leaving this
+    ///   `None`.
+    /// * A debug write of [`FlashLayout::erased`] over a whole block is what
+    ///   that block reads as after an erase. So an eraser has no second entry
+    ///   point to call: it writes the erased byte.
+    ///
+    /// This exists because `core::space` refuses a write to a read-only
+    /// mapping *including a debug one*, on purpose — see
+    /// [`FlatLeaf::write`](super::FlatLeaf::write) — so a loader cannot get
+    /// into an array by being told it is a debugger. It gets in because the
+    /// device opened a door and described it.
+    fn flash_layout(&self) -> Option<FlashLayout> {
+        None
+    }
+}
+
+/// One run of equally sized erase blocks inside a programmable region.
+///
+/// Runs exist because the blocks are not always equal: an STM32F4 bank is four
+/// sectors of 16 KiB, one of 64 KiB and seven of 128 KiB (ST RM0090 Table 5),
+/// which is three runs. A part with uniform pages is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EraseBlocks {
+    /// Region-relative offset of the first block of the run.
+    pub offset: u64,
+    /// How many bytes the run covers. A whole number of blocks.
+    pub length: u64,
+    /// The erase granularity: the smallest range the part can erase.
+    pub blocksize: u64,
+}
+
+/// What a loader needs in order to program a region: where its erase blocks
+/// are, and what an erased cell reads as.
+///
+/// The offsets are **region-relative**, because that is what a device knows —
+/// where the region is mapped is the board's business and can be two places at
+/// once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashLayout {
+    /// The erase geometry, in ascending offset order, without gaps or
+    /// overlaps.
+    pub blocks: alloc::vec::Vec<EraseBlocks>,
+    /// The byte an erased cell reads as: `0xff` for NOR flash, and stated
+    /// rather than assumed because it is a property of the part.
+    pub erased: u8,
+}
+
+impl FlashLayout {
+    /// A layout of uniform `blocksize` blocks covering `length` bytes from
+    /// offset zero, erasing to `0xff`.
+    ///
+    /// # Panics
+    ///
+    /// Never: a `length` that is not a whole number of blocks is truncated to
+    /// one, and a zero `blocksize` produces no runs at all.
+    #[must_use]
+    pub fn uniform(length: u64, blocksize: u64) -> FlashLayout {
+        let blocks = if blocksize == 0 || length < blocksize {
+            alloc::vec::Vec::new()
+        } else {
+            alloc::vec![EraseBlocks {
+                offset: 0,
+                length: length - length % blocksize,
+                blocksize,
+            }]
+        };
+        FlashLayout {
+            blocks,
+            erased: 0xff,
+        }
+    }
 }

@@ -451,7 +451,8 @@ mod store;
 mod tests;
 
 pub use attrs::{
-    AccessConstraints, AccessPurpose, MemAttrs, MemOps, MemResult, Perms, RequesterId,
+    AccessConstraints, AccessPurpose, EraseBlocks, FlashLayout, MemAttrs, MemOps, MemResult, Perms,
+    RequesterId,
 };
 pub use buslock::{BusLock, BusLockGuard};
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
