@@ -1210,6 +1210,8 @@ fn install_capture(
     rsemu::host::display::sms::capture::install(options)?;
     #[cfg(feature = "dev-lcdc")]
     rsemu::host::display::lcd::capture::install(options)?;
+    #[cfg(feature = "dev-amiga-denise")]
+    rsemu::host::display::amiga::capture::install(options)?;
     // The pointer. Unconditional for the same reason a display is: the
     // interception constructs the same device from the same properties and
     // keeps an `Arc`, so whether a frontend is listening cannot change what was
@@ -1305,6 +1307,13 @@ fn take_scanout(
     }
     #[cfg(feature = "dev-sms")]
     if let Some(s) = rsemu::host::display::sms::capture::take_vdp(hosts) {
+        return Some(Box::new(s));
+    }
+    // Denise needs the machine for the same reason `lcd` does: its frame
+    // period is a field's colour clocks at its 7M domain's rate, which is the
+    // clock forest's to say.
+    #[cfg(feature = "dev-amiga-denise")]
+    if let Some(s) = rsemu::host::display::amiga::capture::take(hosts, machine) {
         return Some(Box::new(s));
     }
     // Last, because it is the generic one: a board with a console's own video
@@ -2307,6 +2316,18 @@ fn vnc_session(
     // be needed. `tests/vnc_pointer.rs` drives it with a mouse built by hand.
     #[cfg(feature = "dev-usb-hid")]
     if let Some(mouse) = rsemu::host::input::MouseSink::open(hosts) {
+        session = session.with_sink(Arc::new(mouse));
+    }
+    // An Amiga's keyboard and mouse. Their devices open named host objects of
+    // their own, and these sinks deliver into them downstream of the session's
+    // channel, so what a person does is recorded once, as keysyms and pointer
+    // positions, and replays through the same translation.
+    #[cfg(feature = "dev-amiga-keyboard")]
+    if let Some(keyboard) = rsemu::host::input::amiga::AmigaKeyboardSink::open(hosts) {
+        session = session.with_sink(Arc::new(keyboard));
+    }
+    #[cfg(feature = "dev-amiga-mouse")]
+    if let Some(mouse) = rsemu::host::input::amiga::AmigaMouseSink::open(hosts) {
         session = session.with_sink(Arc::new(mouse));
     }
 

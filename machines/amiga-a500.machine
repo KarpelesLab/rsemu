@@ -2,6 +2,12 @@
 #
 #   rsemu run amiga-a500 --media kickstart=kick.rom
 #   rsemu run amiga-a500 -p chip-ram=1M --media kickstart=kick.rom
+#   rsemu run amiga-a500 --media kickstart=kick.rom --vnc :5900
+#
+# The picture, the keyboard and the mouse reach a person through `--vnc`: the
+# session serves Denise's picture and types and points at the keyboard and
+# mouse at the bottom of this file. Without it, the terminal is attached to
+# Paula's UART, which is what a serial console is.
 #
 # The map and the two decoders that make it work: chip RAM at zero, the custom
 # chip registers at $DFF000, the Kickstart ROM at the top of the space, and the
@@ -62,11 +68,12 @@
 #
 # What is not wired yet, and why:
 #
-# * The keyboard on CIA-A's SP and CNT, the game-port fire buttons on PA6 and
-#   PA7, the LED on PA1, the Centronics port on CIA-A port B and CIA-B's PA0-PA2,
-#   and the serial handshakes on CIA-B's PA3-PA7. Every one of those pins is a
-#   pull-up with nothing on it, which is what a machine with nothing plugged in
-#   looks like: an unpressed button, no printer, no modem.
+# * Game port 1's fire button on PA7, the LED on PA1, the Centronics port on
+#   CIA-A port B and CIA-B's PA0-PA2, and the serial handshakes on CIA-B's
+#   PA3-PA7. Every one of those pins is a pull-up with nothing on it, which is
+#   what a machine with nothing plugged in looks like: an unpressed button, no
+#   printer, no modem. The keyboard (SP, CNT) and the mouse's left button (PA6)
+#   are wired at the bottom of the file.
 
 # ---------------------------------------------------------------------------
 # What is deliberately not mapped, and what an access to it does
@@ -113,9 +120,10 @@ machine "amiga-a500" {
 
   # -- the crystal -----------------------------------------------------------
   #
-  # One oscillator on the board, and everything on it is an exact division of
-  # that one number (ROADMAP.md 4.2), which is the whole reason the chipset can
-  # be dot-exact against the processor. PAL: 28.37516 MHz, processor at a
+  # One oscillator on the Amiga's own board, and everything on it is an exact
+  # division of that one number (ROADMAP.md 4.2), which is the whole reason the
+  # chipset can be dot-exact against the processor. (The keyboard and the
+  # mouse, at the bottom of the file, are not on this board.) PAL: 28.37516 MHz, processor at a
   # quarter of it, 7.09379 MHz. `-p master=28636360` gives the NTSC machine and
   # a 7.15909 MHz processor, and every clock below follows it; an NTSC machine
   # also needs `standard = "ntsc"` on `agnus` and `denise`, because line counts
@@ -294,4 +302,47 @@ machine "amiga-a500" {
   # edges; Agnus raises `vsync` at line 0 and `hsync` at count 0 of each line.
   wire agnus.vsync -> cia_a.tod
   wire agnus.hsync -> cia_b.tod
+
+  # -- the keyboard and the mouse --------------------------------------------
+  #
+  # Both are their own hardware at the end of a cable, and both are timed in
+  # microseconds: the keyboard's protocol is written that way (Appendix G:
+  # "about 20 microseconds", "143 ms"), and the mouse spreads a host's motion
+  # over time at a rate a real mouse reaches. So they share a microsecond clock
+  # of their own rather than a division of the Amiga's crystal, which the
+  # keyboard's own microcontroller never saw. It is a second oscillator tree;
+  # the scheduler converts between the two in fixed point.
+  osc periph = 1000000 Hz
+
+  # See `src/dev/amiga/keyboard.rs`. What a person types arrives as raw
+  # keycodes on the host keyboard port `keyboard`, through the record/replay
+  # seam, and leaves as Appendix G's protocol.
+  object kbd "amiga.keyboard" { clock = periph }
+
+  # "The keyboard data line is connected to the SP pin, the keyboard clock is
+  # connected to the CNT pin" (chapter 8); Appendix E: "SP...KDAT",
+  # "CNT..KCLK". KCLK is the keyboard's alone. KDAT is driven by both ends,
+  # open-collector with pull-ups at each (Appendix G), so it is two statements
+  # and one net: the keyboard pulls it low for a one, and the CIA pulls it low
+  # for the handshake by turning its serial port to output.
+  wire kbd.kclk  -> cia_a.cnt { pull = "up" }
+  wire cia_a.sp  -> kbd.kdat  { pull = "up" }
+  wire kbd.kdat  -> cia_a.sp
+
+  # See `src/dev/amiga/mouse.rs`. In game port 0, where the manual puts a mouse,
+  # moved through the host mouse port `mouse`. Its wheels are four
+  # open-collector quadrature lines into Denise's mouse counters (Appendix A,
+  # JOY0DAT: pin 1 Y, pin 3 YQ on M0V; pin 2 X, pin 4 XQ on M0H). The left
+  # button is "PA6..game port 0, pin 6 (fire button*)" (Appendix E); the right
+  # button is pin 9 and the middle pin 5 (chapter 8, "Mouse Buttons"), which are
+  # POTGO's DATLY and DATLX on Paula (Table 8-4).
+  object mouse "amiga.mouse" { clock = periph }
+
+  wire mouse.y      -> denise.m0v  { pull = "up" }
+  wire mouse.yq     -> denise.m0vq { pull = "up" }
+  wire mouse.x      -> denise.m0h  { pull = "up" }
+  wire mouse.xq     -> denise.m0hq { pull = "up" }
+  wire mouse.left   -> cia_a.pa6   { pull = "up" }
+  wire mouse.right  -> paula.potly { pull = "up" }
+  wire mouse.middle -> paula.potlx { pull = "up" }
 }

@@ -2670,9 +2670,11 @@ dev-amiga-mouse = ["dev-amiga"]
 # Paula carries both CIAs' interrupts onto the 68000's IPL pins and the UART
 # onto the host port `serial`; Agnus counts the beam on the colour clock, feeds
 # the CIAs' TOD inputs, runs the copper and blitter and does every DMA
-# transfer; Denise turns the lines Agnus hands it into a picture. It boots a
-# synthetic ROM. Adds no dependencies.
-machine-amiga-a500 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-mos8520"]
+# transfer; Denise turns the lines Agnus hands it into a picture. The keyboard
+# is on CIA-A's serial port and the mouse in game port 0, both typed and moved
+# through the record/replay seam. It boots a synthetic ROM. Adds no
+# dependencies.
+machine-amiga-a500 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-mos8520"]
 
 # The network seam (src/dev/net/link.rs): what a NIC model is attached to --
 # frames out, frames in **against a virtual tick**, carrier, and a station

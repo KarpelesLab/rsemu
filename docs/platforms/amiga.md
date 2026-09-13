@@ -1,17 +1,19 @@
 # Commodore Amiga 500
 
 Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
-`machines/amiga-a500.machine`, `machines/tests/amiga-denise.machine`,
-`machines/tests/agnus-board.machine`, `tests/amiga_a500_board.rs`,
-`tests/amiga_denise_board.rs`, `tests/agnus_board.rs`,
-`tests/amiga_a500_chipset.rs`.
+`host/input/amiga.rs`, `bin/rsemu.rs`, `machines/amiga-a500.machine`,
+`machines/tests/amiga-denise.machine`, `machines/tests/agnus-board.machine`,
+`tests/amiga_a500_board.rs`, `tests/amiga_denise_board.rs`,
+`tests/agnus_board.rs`, `tests/amiga_a500_chipset.rs`,
+`tests/amiga_a500_input.rs`.
 
 A 68000, 512 KiB of chip RAM, a Kickstart ROM, two 8520 CIAs and three custom
 chips — Agnus, Denise and Paula. **All of them are on the A500 board now**: the
 memory map and its decoders, both 8520s, Paula, the internal floppy drive,
-Agnus and Denise, with Agnus counting the beam and pushing lines into Denise.
-This page is the ledger of what the board decided, what it had to leave open,
-and where each chip meets the others.
+Agnus and Denise, with Agnus counting the beam and pushing lines into Denise —
+and the keyboard and mouse, so a person at `rsemu run amiga-a500 --vnc` sees
+the picture, types, and points. This page is the ledger of what the board
+decided, what it had to leave open, and where each chip meets the others.
 
 ## Primary sources
 
@@ -20,6 +22,7 @@ and where each chip meets the others.
 | [*Amiga Hardware Reference Manual*, 3rd edition](https://archive.org/details/amiga-hardware-reference-manual-3rd-edition) (Commodore-Amiga Inc.) | Appendix B, the custom-chip register summary in address order and its legend; Appendix A, every register's bits; Appendix D, the system memory maps; Appendix F, the CIA addresses, chip selects and clocks; Appendix E, the port signal assignments and the disk connector; chapter 7, interrupts; chapter 8, the disk controller, the drive lines and the UART; chapter 5, audio. For Denise: Chapter 3 (playfields, the display window, data-fetch timing, dual playfields, scrolling, hold-and-modify, extra-half-brite), Chapter 4 (sprites), Chapter 7 (video priorities, collision detection), Appendix A (register bits), Appendix C (the ECS notes, including the display window's chip column) and Appendix J (Denise's pins) |
 | The same manual as it appears on the Amiga Developer CD 2.1 | Chapter 2 (the copper, the beam counters' ranges and clocks), chapter 3 (display window and data fetch), chapter 4 (sprite DMA), chapter 6 (the blitter), chapter 7 (DMA control, beam position, interrupts), Appendix A (bit layouts), Appendix C (ECS, Agnus identification) — what `amiga.agnus` is written from, and the copy `regs.rs` was checked against row by row |
 | MC68000 User's Manual (Motorola) | The reset sequence, and the instruction encodings the test ROMs are hand-assembled from |
+| The same *Hardware Reference Manual*, for input | Appendix G, "Keyboard Interface" (pp. 357-364): the protocol, timing, handshake, resync, power-up sequence, special codes and the matrix table with every key's legend; chapter 8, "The Keyboard" (pp. 251-254) and "Reading Mouse/Trackball Controllers" and "Mouse Buttons" (pp. 229-233); Table 8-4 (`POTGO`); Appendix A, `JOY0DAT` and `JOYTEST` (pp. 281-282); Appendix E, CIA port assignments; Appendix F, the 8520's serial port and "Bidirectional Feature" |
 
 **Nothing else.** Every Amiga emulator the project is aware of is copyleft and
 is listed under *Deliberately excluded* in [`../README.md`](../README.md), and
@@ -213,7 +216,7 @@ clock = clk / 4 }`, and Agnus names it with `video = denise`.
 | Collisions outside the display window | not detected |
 | Interlaced field order | long field on even rows, short on odd |
 | Where horizontal blanking falls in the 368 visible pixels | not cut; the picture is 400 low-resolution pixels from `x = 64` |
-| The mouse and joystick inputs | not wired; `JOYTEST` and `JOYxDAT` work as registers |
+| The mouse inputs' `CCK`/`CCK*` multiplexing | not modelled: eight input pins, one per connector signal; see *Keyboard and mouse* |
 
 ## Agnus
 
@@ -275,3 +278,86 @@ sync placement is not in the manual.
 | Bitplane fetch | All of a line's words as it ends | Pointer changes mid-fetch apply to the whole line |
 | Contention | None: no slot is lent or stolen, `BLTPRI` is stored only | The arbitration figure is a sketch, not a timing |
 | The copper's write permission | Appendix B's `*`/`~` columns, the original chip set's rule | Appendix C gives ECS a wider one; an A500 Agnus is not ECS |
+
+## Keyboard and mouse
+
+`amiga.keyboard` (`dev-amiga-keyboard`) and `amiga.mouse` (`dev-amiga-mouse`),
+each its own device on its own microsecond clock (`osc periph = 1000000 Hz`),
+because both are hardware at the end of a cable timed in microseconds rather
+than divisions of the Amiga's crystal.
+
+**The keyboard is its protocol, not its microcontroller.** Appendix G on the
+wire: each code rotated so the up/down flag goes last ("6-5-4-3-2-1-0-7"),
+active low, KDAT set 20 µs before a 20 µs KCLK pulse and held 20 µs after.
+The computer's handshake — "pulsing the SP line low then high" — is latched
+from the rising edge of the last clock; with none within 143 ms the keyboard
+clocks out single ones until one comes, then sends `$F9` and the code again.
+Power-up is the same sync, then `$FD`, the keys held, `$FE`, and the Caps Lock
+LED off. Caps Lock sends only when pushed, with the up/down bit saying what the
+LED did. Ten codes wait in the type-ahead buffer; an eleventh is lost and `$FA`
+follows. No keyboard firmware is modelled or read.
+
+| Where the manual is silent | This model |
+| --- | --- |
+| When the handshake latch is armed | The last clock's rising edge — when the 8520 interrupts — and the line is sampled as the keyboard lets go of KDAT, to catch a pulse that began while it held a one |
+| When the next byte starts | When the handshake pulse has *ended*; starting under it would read the computer's own pulse as a one |
+| Self-test | Passes, instantly |
+| Power-up sync rate | 143 ms, the resync rule's |
+| Which key an overflow loses | The one that arrived to a full buffer |
+| Host key repeat | A down for a key already down is not a transition, and is dropped |
+| Keys moved during power-up sync | Not queued; the power-up stream reports what is held |
+| Reset warning, hard reset | Not modelled: "some A1000 and A2000 keyboards", hard reset "valid for all keyboards except the Amiga 500" |
+
+**The 8520's SP and CNT are open drain in output mode**, as Appendix F's
+"Bidirectional Feature" says, so the keyboard and CIA-A share KDAT on one
+resolved net. **SP's output latch is low out of reset** and holds the last bit
+shifted out afterwards ("SP will remain at the level of the last data bit
+transmitted"). That is a reading of the data sheet's "all other registers are
+reset to zero" rather than a sentence of it, and it is what makes turning
+CIA-A's serial port to output — which never transmits a byte — pull KDAT low
+for the handshake. **It is not yet confirmed against Kickstart**: neither
+Kickstart 2.04 nor AROS reaches keyboard initialisation on this board yet.
+
+**The mouse is quadrature transitions, not counter writes.** Host motion
+becomes one Gray-code step at a time on the connector's X, XQ, Y and YQ pins,
+200 µs apart (5 000 counts a second — 25 in/s at the manual's 200 counts an
+inch, 100 counts a PAL field, under the 127 a once-a-field reader can tell from
+a wrap), and Denise counts them. Three reasons, all the manual's: the counters
+wrap and software reads deltas, so a large host jump written straight in would
+read the wrong way; bits 1 and 0 of each counter "may be read to determine the
+state of these two clock pins", which a written counter has nowhere to keep;
+and a joystick is the same four pins (Table 8-3), so one needs no change to
+Denise. Denise decodes a counter's low bits as `(!Q, pin xor Q)` from Appendix
+A's joystick table and counts each change against the counter's own low bits,
+so a snapshot restores the count whatever order the pins are re-driven in.
+
+| Line | Where | Source |
+| --- | --- | --- |
+| Left button | CIA-A **PA6**, active low | Appendix E: "PA6..game port 0, pin 6 (fire button\*)"; chapter 8: "Port 1 uses bit 6" (its ports are numbered from 1) |
+| Right button | pin 9, `POTGO`/`POTGOR` bit 10 `DATLY` | Chapter 8, "Mouse Buttons"; Table 8-4 |
+| Middle button | pin 5, bit 8 `DATLX` | The same |
+
+A button change waits for the motion posted before it, so a click lands where
+the pointer was sent. Paula's `POTGOR` now reads a pot pin pulled low as zero
+whether the pin is an output or an input ("set both OUT… and DAT… to 1.
+Reading POTINP will produce a 0 if the button is pressed").
+
+**Input crosses the record/replay seam** as named host objects —
+`amiga-keyboard:keyboard` (one byte a movement, the raw code with bit 7 for a
+release) and `amiga-mouse:mouse` (two little-endian `i16` deltas and a button
+byte) — and a sealed build refuses either without a channel.
+`rsemu run --vnc` records the frontend's keysyms and pointer positions instead
+and translates downstream (`host::input::amiga`), so a recording replays through
+the same translation.
+
+**The keymap is positional, from the USA keyboard** in Appendix G's matrix
+table. A shifted character brings its own shift when the client sent none.
+`Control_R` is Ctrl; the Super and Meta keys are the Amiga keys; `Help` and
+`Insert` are Help; the Num-Lock-off keypad keys are their keypad positions.
+`Home`, `End`, `Page_Up`, `Page_Down`, `F11`, `F12`, `Print`, `Scroll_Lock`,
+`Pause`, `Num_Lock` and `Menu` have no Amiga key and send nothing. The keypad's
+`(` and `)` and the international `$2B` and `$30` have no PC keysym.
+
+**The picture reaches a person through `--vnc`.** `rsemu run` installs Denise's
+capture and serves its `Scanout`; without `--vnc` the terminal attaches to
+Paula's UART, the board's one character port.

@@ -56,7 +56,7 @@ the question never arises.
 ### Machines
 | | |
 | --- | --- |
-| [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500: the memory map, the `OVL` overlay, the custom-chip register seam, the two CIAs, Paula's interrupts, disk, UART and audio, the floppy drive, and what the manual leaves open |
+| [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500: the memory map, the `OVL` overlay, the custom-chip register seam, the two CIAs, Paula's interrupts, disk, UART and audio, the floppy drive, the keyboard protocol and the mouse counters, and what the manual leaves open |
 | [`platforms/apple1.md`](platforms/apple1.md) | Apple 1: the MC6821, the clock, and the monitor-ROM licence question |
 | [`platforms/nes.md`](platforms/nes.md) | NES / Famicom |
 | [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |
