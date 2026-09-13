@@ -181,9 +181,16 @@
 //!
 //! # Pots
 //!
-//! `POTGO` is stored and `POTGOR` answers from it: a pin set as an output
-//! reads its data bit, and an input reads one, which is an unpressed button
-//! with the pull-up Chapter 8 describes. The proportional counters (`POT0DAT`,
+//! `POTGO` is stored and `POTGOR` answers from it and from the four pot pins,
+//! `potlx`, `potly`, `potrx` and `potry` — pins 5 and 9 of each game port
+//! (Table 8-4: `DATLX` "port 1, pin 5 (middle mouse button)", `DATLY` "pin 9
+//! (right mouse button)"). A pin set as an output reads its data bit; an input
+//! reads high. Either way a pin something outside is pulling low reads zero:
+//! "A button is a normally open switch that shorts to ground … set both OUT…
+//! and DAT… to 1. Reading POTINP will produce a 0 if the button is pressed",
+//! which is an output stage weak enough for a switch to win, and the pot
+//! circuit's capacitor on an input that the same switch discharges. An
+//! unwired pin is an unpressed button. The proportional counters (`POT0DAT`,
 //! `POT1DAT`) read zero and `START` does nothing.
 
 use alloc::boxed::Box;
@@ -203,7 +210,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{AccessKind, Budget, Consumed, LazyHandle};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
-use crate::core::wire::{FanIn, Level, WireId, WireSink, WireSource};
+use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::host::chardev::{CharDevice, ports};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
@@ -228,6 +235,10 @@ pub const INT2_PIN: &str = "int2";
 
 /// The `INT6*` input: `EXTER`, level 6.
 pub const INT6_PIN: &str = "int6";
+
+/// The four pot pins, in `POTGO` order from bit 8 up: port 0's pin 5 and pin 9,
+/// then port 1's. Each is an input a switch to ground pulls low.
+pub const POT_PINS: [&str; 4] = ["potlx", "potly", "potrx", "potry"];
 
 /// A tick no event is scheduled for.
 const NO_EVENT: u64 = u64::MAX;
@@ -507,6 +518,9 @@ struct State {
     dmacon: u16,
     adkcon: u16,
     potgo: u16,
+    /// Which pot pins something outside is pulling low, bit `n` for
+    /// [`POT_PINS`]`[n]`. An input level: kept across a reset and a load.
+    pot_low: u8,
     serial: Serial,
     disk: Disk,
     aud: [Channel; 4],
@@ -1098,11 +1112,12 @@ impl State {
         for pin in 0..4 {
             let out = 1 << (9 + 2 * pin);
             let dat = 1 << (8 + 2 * pin);
-            let level = if self.potgo & out != 0 {
+            let driven = if self.potgo & out != 0 {
                 self.potgo & dat != 0
             } else {
                 true
             };
+            let level = driven && self.pot_low & (1 << pin) == 0;
             if level {
                 value |= dat;
             }
@@ -1493,6 +1508,29 @@ impl WireSink for IntPin {
 // the device
 // ---------------------------------------------------------------------------
 
+/// A pot pin: `potlx`, `potly`, `potrx` or `potry`.
+#[derive(Debug)]
+struct PotPin {
+    shared: Arc<Shared>,
+    pin: u8,
+    inputs: FanIn,
+}
+
+impl WireSink for PotPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        let low = !self.inputs.resolve(Resolve::And).is_high();
+        let bit = 1u8 << self.pin;
+        self.shared.with_state(|st| {
+            if low {
+                st.pot_low |= bit;
+            } else {
+                st.pot_low &= !bit;
+            }
+        });
+    }
+}
+
 /// Paula.
 #[derive(Debug)]
 pub struct Paula {
@@ -1500,6 +1538,7 @@ pub struct Paula {
     regs: Arc<PaulaRegs>,
     custom_path: String,
     pins: Mutex<Vec<Arc<IntPin>>>,
+    pots: Mutex<Vec<Arc<PotPin>>>,
 }
 
 impl Paula {
@@ -1547,6 +1586,7 @@ impl Paula {
             regs,
             custom_path,
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+            pots: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         }
     }
 
@@ -1649,9 +1689,11 @@ impl Device for Paula {
             let mut state = self.shared.state.lock();
             // The input lines are what other devices drive, and survive.
             let (int2, int6, reading) = (state.int2, state.int6, state.drive_reading);
+            let pot_low = state.pot_low;
             *state = State::fresh(state.ticks);
             state.int2 = int2;
             state.int6 = int6;
+            state.pot_low = pot_low;
             state.drive_reading = reading;
             state.apply_lines();
             self.shared.publish(&state);
@@ -1794,6 +1836,10 @@ impl Device for Paula {
         {
             let mut state = self.shared.state.lock();
             st.drive_reading = state.drive_reading;
+            // What the pot pins are pulled to is the far end's, and the far end
+            // restores its own state; nothing would re-deliver a level that
+            // did not move.
+            st.pot_low = state.pot_low;
             *state = st;
             self.shared.publish(&state);
         }
@@ -1826,6 +1872,18 @@ impl Device for Paula {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        if let Some(pin) = POT_PINS.iter().position(|p| *p == port) {
+            let pot = Arc::new(PotPin {
+                shared: Arc::clone(&self.shared),
+                pin: pin as u8,
+                inputs: FanIn::new(sources),
+            });
+            self.pots.lock().push(Arc::clone(&pot));
+            return Some(SinkPin {
+                sink: pot,
+                line: 2 + pin as u32,
+            });
+        }
         let six = match port {
             INT2_PIN => false,
             INT6_PIN => true,
@@ -1942,6 +2000,9 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("port", ValueKind::Str))
         .port(INT2_PIN, PortDir::In)
         .port(INT6_PIN, PortDir::In);
+    for pin in POT_PINS {
+        schema = schema.port(pin, PortDir::In);
+    }
     for pin in IPL_PINS {
         schema = schema.port(pin, PortDir::Out);
     }

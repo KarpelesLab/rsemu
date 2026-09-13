@@ -751,6 +751,29 @@ fn adkcon_takes_set_clr_and_potgo_answers_through_potgor() {
 }
 
 #[test]
+fn a_button_to_ground_on_a_pot_pin_reads_zero_either_way_round() {
+    let rig = Rig::new();
+    let src = WireId::new(9);
+    let pin = rig.paula.sink("potly", &[src]).expect("pin 9 of port 0");
+    let press = |down: bool| {
+        pin.sink.set_level(src, pin.line, Level::from_bool(!down));
+    };
+    // "set both OUT… and DAT… to 1. Reading POTINP will produce a 0 if the
+    // button is pressed, a 1 if it is not."
+    rig.poke(POTGO, 0x0c00);
+    assert_eq!(rig.peek(POTGOR) & 0x0400, 0x0400);
+    press(true);
+    assert_eq!(rig.peek(POTGOR) & 0x0400, 0, "pressed");
+    // As an input too, and the other three pins do not notice.
+    rig.poke(POTGO, 0x0000);
+    assert_eq!(rig.peek(POTGOR) & 0x5500, 0x5100);
+    press(false);
+    assert_eq!(rig.peek(POTGOR) & 0x5500, 0x5500);
+    assert!(rig.paula.sink("potrx", &[src]).is_some());
+    assert!(rig.paula.sink("pot9", &[src]).is_none());
+}
+
+#[test]
 fn paula_drives_no_bit_of_dmaconr() {
     let rig = Rig::new();
     rig.poke(DMACON, DMAF_SETCLR | DMAF_MASTER | DMAF_DISK);
