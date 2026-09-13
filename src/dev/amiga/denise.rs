@@ -106,7 +106,7 @@
 //! | single, dual, hold-and-modify, extra-half-brite | modelled |
 //! | `SPRxPOS`, `SPRxCTL`, `SPRxDATA`, `SPRxDATB` | modelled: horizontal comparator, arming, attachment, fixed sprite priority |
 //! | `CLXCON`, `CLXDAT` | modelled; `CLXDAT` clears on read, and not on a debugger's read |
-//! | `JOY0DAT`, `JOY1DAT`, `JOYTEST` | the counters and `JOYTEST`'s write; **no mouse or joystick input yet** |
+//! | `JOY0DAT`, `JOY1DAT`, `JOYTEST` | modelled: four 8-bit counters clocked by quadrature on the eight mouse pins, low two bits the pins' state; see [below](#the-mouse-counters) |
 //! | `DMACON` | latched only — the manual does not say what Denise does with it |
 //! | `BPL1DAT`–`BPL6DAT` | latched only; the bitplane words arrive through [`Video::line`] |
 //! | `STREQU`, `STRVBL`, `STRHOR`, `STRLONG` | accepted and ignored; [`Video::line`] and [`Video::field`] carry what they mean |
@@ -132,6 +132,31 @@
 //!   short field into the odd ones.
 //! * **`CLXDAT` bit 15**, "not used", reads as zero.
 //!
+//! # The mouse counters
+//!
+//! Appendix J gives Denise four mouse pins, `M0V`, `M0H`, `M1V` and `M1H`, and
+//! Appendix A's `JOY0DAT` entry says what is on them: each carries two
+//! connector pins "sampled (multiplexed) into the DENISE chip" at `CCK` and
+//! `CCK*` — pin 1 (`FORW*`, `Y`) and pin 3 (`LEFT*`, `YQ`) on `M0V`, pin 2
+//! (`BACK*`, `X`) and pin 4 (`RIGH*`, `XQ`) on `M0H`. The model does not
+//! multiplex: it has the eight signals as eight input pins, `m0v`, `m0vq`,
+//! `m0h`, `m0hq` and the same for port 1, each carrying its connector level.
+//!
+//! "After being sampled, these connector pin signals are used in quadrature to
+//! clock the mouse counters. The LEFT and RIGHT joystick functions (active
+//! high) are directly available on the Y1 and X1 bits … FORWARD … Y1 xor Y0".
+//! With the connector active low, that fixes a counter's low two bits as
+//! `(!Q, pin xor Q)`, which is the Gray-coded quadrature phase in binary. So a
+//! transition is counted by comparing the phase the pins now show with the
+//! counter's own low bits: one step up or one step down. A difference of two —
+//! both signals moving between samples, which one wire at a time never does —
+//! is counted as two up, because nothing says which way it went.
+//!
+//! Counting against the counter rather than against the last pins seen is what
+//! lets a snapshot restore the counter without the pins' history: whatever
+//! order the far end re-drives its pins in, the count comes back to the saved
+//! value.
+//!
 //! # Sources
 //!
 //! *Amiga Hardware Reference Manual*, Commodore-Amiga Inc., 3rd edition:
@@ -156,14 +181,15 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
+    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
+use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 use crate::machine::realize::{BindCtx, Instance};
-use crate::machine::validate::{ClassSchema, PropSchema};
+use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
 use super::custom::{CustomBus, CustomChip, Origin};
 use super::regs::{ChipId, Reg};
@@ -209,6 +235,18 @@ const CLXDAT: u16 = 0x00e;
 const JOY0DAT: u16 = 0x00a;
 const JOY1DAT: u16 = 0x00c;
 const JOYTEST: u16 = 0x036;
+
+/// The eight mouse inputs, in line order: for port 0 then port 1, the
+/// horizontal pair and then the vertical pair, each signal before its
+/// quadrature partner. See [the mouse counters](self#the-mouse-counters).
+pub const MOUSE_PINS: [&str; 8] = ["m0h", "m0hq", "m0v", "m0vq", "m1h", "m1hq", "m1v", "m1vq"];
+
+/// A counter's low two bits for a pair of connector levels: `(!Q, pin xor Q)`.
+#[inline]
+#[must_use]
+pub const fn quadrature_bits(pin_high: bool, q_high: bool) -> u8 {
+    ((!q_high) as u8) << 1 | (pin_high ^ q_high) as u8
+}
 const DENISEID: u16 = 0x07c;
 const DIWSTRT: u16 = 0x08e;
 const DIWSTOP: u16 = 0x090;
@@ -503,6 +541,9 @@ struct State {
     pending: VecDeque<Change>,
     clxdat: u16,
     joy: [u16; 2],
+    /// The eight mouse pins as last driven, bit `n` for [`MOUSE_PINS`]`[n]`,
+    /// set when high. An input level: kept across a reset and a load.
+    mouse_pins: u8,
     dmacon: u16,
     /// Fields begun since reset — the host's frame counter.
     fields: u64,
@@ -537,12 +578,49 @@ impl State {
             pending: VecDeque::new(),
             clxdat: 0,
             joy: [0; 2],
+            // Nothing plugged in: every connector pin pulled up.
+            mouse_pins: 0xff,
             dmacon: 0,
             fields: 0,
             lof: true,
             clocks: 0,
             last_field_clocks: 0,
             frame: vec![0; WIDTH as usize * standard.height() as usize],
+        }
+    }
+
+    /// Count whatever the mouse pins moved: each counter against its own low
+    /// two bits.
+    fn clock_counters(&mut self) {
+        for port in 0..2 {
+            for (axis, shift) in [(0usize, 0u16), (1, 8)] {
+                let base = port * 4 + axis * 2;
+                let pin = self.mouse_pins & (1 << base) != 0;
+                let q = self.mouse_pins & (1 << (base + 1)) != 0;
+                let counter = ((self.joy[port] >> shift) & 0xff) as u8;
+                let step = quadrature_bits(pin, q).wrapping_sub(counter) & 3;
+                let counted = match step {
+                    0 => counter,
+                    3 => counter.wrapping_sub(1),
+                    // One up, or both signals at once: two.
+                    n => counter.wrapping_add(n),
+                };
+                self.joy[port] =
+                    (self.joy[port] & !(0xff << shift)) | (u16::from(counted) << shift);
+            }
+        }
+    }
+
+    /// The counters' low bits brought into line with the pins, as at power-on.
+    fn settle_counters(&mut self) {
+        for port in 0..2 {
+            for (axis, shift) in [(0usize, 0u16), (1, 8)] {
+                let base = port * 4 + axis * 2;
+                let pin = self.mouse_pins & (1 << base) != 0;
+                let q = self.mouse_pins & (1 << (base + 1)) != 0;
+                self.joy[port] = (self.joy[port] & !(3 << shift))
+                    | (u16::from(quadrature_bits(pin, q)) << shift);
+            }
         }
     }
 
@@ -1007,7 +1085,31 @@ impl Video {
 
     fn reset(&self) {
         let mut st = self.state.lock();
+        let pins = st.mouse_pins;
         *st = State::new(self.standard);
+        st.mouse_pins = pins;
+        st.settle_counters();
+    }
+
+    /// The mouse counters, `[JOY0DAT, JOY1DAT]`, without a bus access.
+    #[must_use]
+    pub fn joy(&self) -> [u16; 2] {
+        self.state.lock().joy
+    }
+
+    /// Set mouse input `line` ([`MOUSE_PINS`] order) to `high`, counting the
+    /// transition.
+    pub fn set_mouse_pin(&self, line: usize, high: bool) {
+        if line >= MOUSE_PINS.len() {
+            return;
+        }
+        let mut st = self.state.lock();
+        let bit = 1u8 << line;
+        let was = st.mouse_pins;
+        st.mouse_pins = if high { was | bit } else { was & !bit };
+        if st.mouse_pins != was {
+            st.clock_counters();
+        }
     }
 
     /// Where the beam is now, if Denise has been given one. Called with no
@@ -1093,11 +1195,13 @@ impl Video {
             .collect();
 
         let mut st = self.state.lock();
+        let mouse_pins = st.mouse_pins;
         *st = State {
             regs,
             pending,
             clxdat,
             joy,
+            mouse_pins,
             dmacon,
             fields,
             lof,
@@ -1204,11 +1308,30 @@ impl CustomChip for Video {
 // the device
 // ---------------------------------------------------------------------------
 
+/// One mouse input, as something a wire drives.
+#[derive(Debug)]
+struct MousePin {
+    video: Arc<Video>,
+    line: usize,
+    inputs: FanIn,
+}
+
+impl WireSink for MousePin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        let high = self.inputs.resolve(Resolve::And).is_high();
+        self.video.set_mouse_pin(self.line, high);
+    }
+}
+
 /// The `amiga.denise` device.
 #[derive(Debug)]
 pub struct Denise {
     video: Arc<Video>,
     custom: String,
+    /// The mouse inputs handed out, kept alive for the nets that hold them
+    /// weakly.
+    pins: Mutex<Vec<Arc<MousePin>>>,
 }
 
 impl Denise {
@@ -1229,6 +1352,7 @@ impl Denise {
         Ok(Denise {
             video: Arc::new(Video::new(standard)),
             custom,
+            pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         })
     }
 
@@ -1268,6 +1392,21 @@ impl Device for Denise {
     fn export(&self, which: ExportId) -> Option<Export> {
         (which == ExportId::AMIGA_VIDEO).then(|| {
             Export::Opaque(Arc::clone(&self.video) as Arc<dyn core::any::Any + Send + Sync>)
+        })
+    }
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        let line = MOUSE_PINS.iter().position(|p| *p == port)?;
+        let pin = Arc::new(MousePin {
+            video: Arc::clone(&self.video),
+            line,
+            inputs: FanIn::new(sources),
+        });
+        // A net holds its sinks weakly; the device is what keeps them.
+        self.pins.lock().push(Arc::clone(&pin));
+        Some(SinkPin {
+            sink: pin,
+            line: line as u32,
         })
     }
 }
@@ -1325,9 +1464,13 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `amiga.denise`.
 #[must_use]
 pub fn schema() -> ClassSchema {
-    ClassSchema::new(CLASS_NAME)
+    let mut schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("custom", ValueKind::Link).required())
-        .prop(PropSchema::new("standard", ValueKind::Str))
+        .prop(PropSchema::new("standard", ValueKind::Str));
+    for pin in MOUSE_PINS {
+        schema = schema.port(pin, PortDir::In);
+    }
+    schema
 }
 
 #[cfg(test)]

@@ -739,6 +739,71 @@ fn joytest_writes_the_top_six_bits_of_all_four_counters() {
     assert_eq!((joy0, joy1), (0xfcfc, 0xfcfc));
 }
 
+/// Walk one axis of a port's pins through `steps` quadrature transitions, up
+/// for a positive count: the connector levels a mouse puts on `(pin, pin-Q)`.
+fn roll(v: &Video, first_line: usize, phase: &mut u8, steps: i32) {
+    for _ in 0..steps.unsigned_abs() {
+        *phase = if steps > 0 { *phase + 1 } else { *phase + 3 } & 3;
+        let gray = *phase ^ (*phase >> 1);
+        // Active high (!Q, !pin) is the Gray code; the pins carry the levels.
+        v.set_mouse_pin(first_line, gray & 1 == 0);
+        v.set_mouse_pin(first_line + 1, gray & 2 == 0);
+    }
+}
+
+#[test]
+fn the_mouse_pins_clock_the_counters_up_down_and_round() {
+    let v = video();
+    let joy0 = |v: &Video| CustomChip::read(v, reg(JOY0DAT), Origin::cpu());
+    assert_eq!(joy0(&v), 0, "every pin pulled up reads zero");
+
+    // Right five, down three: horizontal in the low byte, vertical in the high.
+    let (mut h, mut vv) = (0u8, 0u8);
+    roll(&v, 0, &mut h, 5);
+    roll(&v, 2, &mut vv, 3);
+    assert_eq!(joy0(&v), 0x0305);
+    // Left seven wraps the horizontal counter below zero.
+    roll(&v, 0, &mut h, -7);
+    assert_eq!(joy0(&v) & 0xff, 0xfe);
+    // "Bits 1 and 0 of each counter may be read to determine the state of
+    // these two clock pins": JOYTEST leaves them alone.
+    w(&v, JOYTEST, 0x0000);
+    assert_eq!(joy0(&v), u16::from(vv) << 8 | u16::from(h));
+    // Port 1's pins are port 1's.
+    let mut p1 = 0u8;
+    roll(&v, 4, &mut p1, 2);
+    assert_eq!(CustomChip::read(&v, reg(JOY1DAT), Origin::cpu()), 0x0002);
+}
+
+#[test]
+fn a_joystick_on_the_same_pins_reads_as_table_8_3_says() {
+    // "Right" is pin 4 (XQ) low: X1 set. "Back" is pin 2 (X) low: X1 xor X0.
+    let v = video();
+    let joy0 = |v: &Video| CustomChip::read(v, reg(JOY0DAT), Origin::cpu());
+    v.set_mouse_pin(1, false); // RIGH* closed
+    let x = joy0(&v);
+    assert_eq!((x >> 1) & 1, 1, "right: X1");
+    assert_eq!((x >> 1) & 1 ^ x & 1, 0, "and not back: X1 xor X0");
+    v.set_mouse_pin(1, true);
+    v.set_mouse_pin(0, false); // BACK* closed
+    let x = joy0(&v);
+    assert_eq!((x >> 1) & 1 ^ x & 1, 1, "back: X1 xor X0");
+    assert_eq!((x >> 1) & 1, 0, "and not right");
+}
+
+#[test]
+fn a_reset_keeps_the_pins_and_settles_the_counters_on_them() {
+    let v = video();
+    let mut h = 0u8;
+    roll(&v, 0, &mut h, 6);
+    v.reset();
+    assert_eq!(
+        CustomChip::read(&v, reg(JOY0DAT), Origin::cpu()),
+        u16::from(h),
+        "the count is gone and the pins' phase is what is left"
+    );
+}
+
 #[test]
 fn deniseid_on_an_original_denise_is_whatever_was_on_the_bus() {
     let custom = Custom::new(&Props::new()).unwrap();
