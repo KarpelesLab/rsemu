@@ -46,15 +46,49 @@ A range is `ram` when a write to it would land somewhere that takes writes and
 `rom` otherwise; a target that cannot describe itself does not advertise the
 object at all, rather than advertising it and erroring.
 
-**`flash` is never claimed**, and that is a deliberate gap rather than an
-oversight. Declaring a range as flash tells GDB to write it with `vFlashErase`,
-`vFlashWrite` and `vFlashDone`, none of which this stub answers, so the claim
-would turn a `load` that fails cleanly into one that stalls. Making it true
-needs those three packets *and* a way to write a `RomStore`, which `core::space`
-has no seam for: a write to a read-only mapping is refused for a debug access
-too, on purpose (`src/core/space/flat.rs` says so in as many words). So `load`
-into a board's ROM still does not work — it now fails with GDB naming the
-read-only region instead of with a bus error from nowhere.
+## Flash, and `load`
+
+**`flash` is claimed for a range a device says it will take a loader's write
+for, and for nothing else.** Declaring a range flash tells GDB to stop writing
+it with `M`/`X` and to use `vFlashErase`, `vFlashWrite` and `vFlashDone`
+instead, so the claim and the three packets are one feature: a stub that
+declared it without answering them would turn a `load` that fails cleanly into
+one that stalls. That is why the map claimed `ram`/`rom` only until the packets
+existed.
+
+The seam is `MemOps::flash_layout`. A device returns the erase geometry of its
+array — runs of equally sized blocks, plus the byte an erased cell reads as —
+and by returning it promises that a **debug write reaches the array**. That is
+the door `st.flash` already documents and `dfu.loader` already uses: a direct
+poke that moves no status bit, consumes no double-word latch and starts no
+operation, which is what a programming interface over SWD is. `dev::flash::cfi`
+publishes nothing, because a write there advances a command state machine and a
+debugger that erased a block by looking at it would be worse than no debugger;
+a `rom` object publishes nothing either, because there is nothing behind it that
+could take the write.
+
+**`core::space`'s refusal was not touched.** A write to a read-only mapping is
+still refused for a debug access, deliberately and in as many words
+(`src/core/space/flat.rs`), and widening it was the alternative design: it would
+have made every ROM on every board writable from a debugger in order to serve
+the one case where a device wanted it. So `load` into a board's ROM still does
+not work, and fails with GDB naming the read-only region.
+
+What the three packets mean here:
+
+* `vFlashErase` takes whole blocks — a part cannot erase half a sector, so a
+  range that starts or ends inside one takes the whole one with it — and leaves
+  them reading as the erased byte.
+* `vFlashWrite` puts the bytes in through the device's door. Nothing is
+  buffered, which is what a part with no page latch does.
+* `vFlashDone` **commits**, and since nothing was held back that means the two
+  things that are true only once the loading stops: derived state built from the
+  old contents is dropped (the `save`/`load` round trip that also follows an `M`
+  packet), and `Machine::flush` asks any device holding its array over a host
+  medium to write it back.
+
+A range the map did not call flash is refused with `E.memtype`, the protocol's
+own word for it, rather than with an errno.
 
 ## DWARF
 
@@ -75,8 +109,13 @@ mode against a running guest and asserts on what GDB printed. Running a GPL
 program as a client is black-box use, which `ROADMAP.md` §1 permits explicitly;
 nothing in that test reads GDB's source.
 
-It drives **three** guests — a 16-bit x86 one, an x86-64 one and an AArch64 one
-— and each skips on its own if the `gdb` to hand has no gdbarch for it. On the
+It drives **four** sessions — a 16-bit x86 guest, an x86-64 one, an AArch64 one,
+and a `load` into flash — and each skips on its own if the `gdb` to hand has no
+gdbarch for it. The flash session is on an x86-64 board because that is the one
+a stock `gdb` attaches to, with `st.flash` mapped onto it: the packets it
+proves are the stub's and the stub is one piece of code for every core, while
+the array's own board drives the same sequence with a client of ours in
+`tests/gdb_flash.rs`. On the
 common x86-64 developer machine the two x86 sessions run and the AArch64 one
 skips; with `gdb-multiarch`, or a cross `gdb` named in `$RSEMU_GDB`, all three
 run. Several tests in the same file need no `gdb` at all — the x86 fixture board

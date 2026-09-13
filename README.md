@@ -547,8 +547,12 @@ snapshots, a typed export seam so one device can hand another a handle, and a
 → run. There is a **gdb stub** (`rsemu debug apple1 --gdb :1234`) — driven end to
 end by a **real `gdb` binary** in `tests/gdb_real_client.rs`, on an x86 guest
 *and* an AArch64 one, which attaches, reads registers, writes a program into
-guest RAM, sets a breakpoint, hits it and steps. An **SMP board's processors are
-threads**: `pc-at-smp` answers `qfThreadInfo` with two, each with its own
+guest RAM, sets a breakpoint, hits it and steps. That same `gdb` **`load`s an
+image into flash**: the memory map declares a programmable array's real erase
+geometry and `vFlashErase`/`vFlashWrite`/`vFlashDone` program it, through the
+loader's door the device opens — a ROM has none, so `load` into one still fails,
+and `core::space` still refuses a write to a read-only mapping. An **SMP board's
+processors are threads**: `pc-at-smp` answers `qfThreadInfo` with two, each with its own
 register file, address space and watchpoints. And a **debugger's write into
 guest code invalidates the compiled blocks over it**, so a patch you set through
 gdb is the code that runs — on x86 and RISC-V; `cpu.arm.a64` is the documented

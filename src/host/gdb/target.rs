@@ -83,6 +83,13 @@ pub enum TargetError {
     Unmapped,
     /// A well-formed request this target cannot serve.
     Unsupported,
+    /// A `vFlashErase` or `vFlashWrite` for an address that is not in a region
+    /// the memory map declared `flash`.
+    ///
+    /// Its own variant because the protocol has its own reply for it —
+    /// `E.memtype`, which GDB reports as "flash memory operation on
+    /// non-flash memory" rather than as an errno.
+    NotFlash,
     /// A core changed its snapshot layout out from under its register map.
     LayoutMismatch {
         /// The device class whose layout moved.
@@ -105,11 +112,11 @@ impl TargetError {
     #[must_use]
     pub const fn code(&self) -> u8 {
         match self {
-            TargetError::NoSuchCpu => 3,                                  // ESRCH
-            TargetError::Fault | TargetError::Machine(_) => 5,            // EIO
-            TargetError::Unmapped => 14,                                  // EFAULT
-            TargetError::NoSuchRegister | TargetError::Unsupported => 22, // EINVAL
-            TargetError::LayoutMismatch { .. } => 8,                      // ENOEXEC
+            TargetError::NoSuchCpu => 3,                       // ESRCH
+            TargetError::Fault | TargetError::Machine(_) => 5, // EIO
+            TargetError::Unmapped => 14,                       // EFAULT
+            TargetError::NoSuchRegister | TargetError::Unsupported | TargetError::NotFlash => 22, // EINVAL
+            TargetError::LayoutMismatch { .. } => 8, // ENOEXEC
         }
     }
 }
@@ -122,6 +129,7 @@ impl fmt::Display for TargetError {
             TargetError::Fault => f.write_str("the guest bus refused the access"),
             TargetError::Unmapped => f.write_str("nothing is mapped at that virtual address"),
             TargetError::Unsupported => f.write_str("unsupported"),
+            TargetError::NotFlash => f.write_str("not a flash region"),
             TargetError::LayoutMismatch {
                 class,
                 expected,
@@ -208,16 +216,22 @@ pub struct WatchSupport {
 /// What a region of the guest's address space is, as far as GDB's memory map
 /// has words for it.
 ///
-/// Three types exist in the memory-map DTD — `ram`, `rom` and `flash` — and
-/// only two are here. **`flash` is missing on purpose.** Declaring a range as
-/// flash tells GDB to stop writing it with `M`/`X` and to use `vFlashErase`,
-/// `vFlashWrite` and `vFlashDone` instead, and this stub implements none of
-/// those: claiming it would turn a `load` that fails into a `load` that hangs
-/// on an unanswered packet. Making it true is two pieces of work, neither of
-/// them here — the three `vFlash` packets, and a way to write a
-/// [`RomStore`](crate::core::space::RomStore) that does not exist yet, because
-/// `core::space` refuses a write to a read-only mapping *including* a debug
-/// one, deliberately and in as many words.
+/// All three types the memory-map DTD has — `ram`, `rom` and `flash` — and
+/// what separates them is **how GDB writes**: `ram` with `M`/`X`, `rom` not at
+/// all, and `flash` only through `vFlashErase`, `vFlashWrite` and
+/// `vFlashDone`. So a stub may claim [`MemKind::Flash`] exactly when it answers
+/// those three for the range: a range declared flash by a stub that does not is
+/// a `load` that stalls rather than one that fails cleanly, which is why this
+/// enumeration had two variants until the packets existed to justify a third.
+///
+/// What makes a range flash here is not that a device is called one. It is that
+/// the device answering writes there published a
+/// [`FlashLayout`](crate::core::space::FlashLayout) — a device's promise that a
+/// *debug* write reaches its array, and a description of the blocks an erase
+/// works in. `core::space` still refuses a write to a read-only mapping,
+/// including a debug one, so a plain `rom` object is `rom` here and `load` into
+/// one still fails exactly as it did. The door is the device's, not a hole in
+/// the address space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemKind {
     /// Readable and writable: GDB may patch it.
@@ -225,6 +239,14 @@ pub enum MemKind {
     /// Readable only. GDB refuses to write here and says why, instead of
     /// issuing a write the bus will refuse.
     Rom,
+    /// Programmable through the `vFlash` packets, and through nothing else.
+    Flash {
+        /// The erase granularity, which is what GDB aligns its `vFlashErase`
+        /// ranges to. A part whose sectors are unequal is several regions, one
+        /// per run of equal sectors, rather than one region with a blocksize
+        /// that is a lie about most of it.
+        blocksize: u64,
+    },
 }
 
 impl MemKind {
@@ -234,7 +256,14 @@ impl MemKind {
         match self {
             MemKind::Ram => "ram",
             MemKind::Rom => "rom",
+            MemKind::Flash { .. } => "flash",
         }
+    }
+
+    /// Whether this is a range the `vFlash` packets own.
+    #[must_use]
+    pub const fn is_flash(self) -> bool {
+        matches!(self, MemKind::Flash { .. })
     }
 }
 
@@ -247,6 +276,45 @@ pub struct MemRegion {
     pub start: u64,
     /// How many bytes.
     pub length: u64,
+}
+
+/// One run of equal erase blocks, in the *bus* addresses a debugger uses.
+///
+/// [`MemRegion`] is what the protocol says; this is what the machine said, and
+/// it carries the two things the protocol has no room for: which byte an
+/// erased cell reads as, and the fact that a device promised a debug write
+/// would land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlashSpan {
+    /// First address covered.
+    start: u64,
+    /// How many bytes, a whole number of blocks.
+    length: u64,
+    /// The erase granularity.
+    blocksize: u64,
+    /// What an erased cell reads as.
+    erased: u8,
+}
+
+/// Append a region, merging it into the last one when the two are the same
+/// kind and touch.
+///
+/// The flat view splits on every mapping boundary and GDB has no use for the
+/// seams.
+fn push_region(out: &mut Vec<MemRegion>, kind: MemKind, start: u64, length: u64) {
+    if length == 0 {
+        return;
+    }
+    match out.last_mut() {
+        Some(last) if last.kind == kind && last.start.saturating_add(last.length) == start => {
+            last.length = last.length.saturating_add(length);
+        }
+        _ => out.push(MemRegion {
+            kind,
+            start,
+            length,
+        }),
+    }
 }
 
 /// Render a memory map as the document `qXfer:memory-map:read` serves.
@@ -263,13 +331,25 @@ pub fn memory_map_xml(regions: &[MemRegion]) -> String {
     );
     xml.push_str("<memory-map>\n");
     for region in regions {
-        let _ = writeln!(
+        let _ = write!(
             xml,
-            "  <memory type=\"{}\" start=\"{:#x}\" length=\"{:#x}\"/>",
+            "  <memory type=\"{}\" start=\"{:#x}\" length=\"{:#x}\"",
             region.kind.as_str(),
             region.start,
             region.length
         );
+        // A flash region carries its erase granularity as a child element: the
+        // one property the DTD defines, and the one GDB will not guess. A
+        // flash region without it is a region `load` cannot use.
+        match region.kind {
+            MemKind::Flash { blocksize } => {
+                let _ = writeln!(
+                    xml,
+                    ">\n    <property name=\"blocksize\">{blocksize:#x}</property>\n  </memory>"
+                );
+            }
+            MemKind::Ram | MemKind::Rom => xml.push_str("/>\n"),
+        }
     }
     xml.push_str("</memory-map>\n");
     xml
@@ -396,6 +476,58 @@ pub trait DebugTarget {
     ///
     /// [`TargetError::Unsupported`] when there is no map to give.
     fn memory_map(&self, _cpu: usize) -> TargetResult<Vec<MemRegion>> {
+        Err(TargetError::Unsupported)
+    }
+
+    /// Erase every block the range `[addr, addr + len)` touches, as `vFlashErase`
+    /// asks.
+    ///
+    /// **Whole blocks.** A part cannot erase half a sector, so a range that
+    /// starts or ends inside one takes the whole one with it; GDB aligns its
+    /// requests to the blocksize the memory map declared, so in practice the
+    /// two agree and this only decides what happens when they do not.
+    ///
+    /// Afterwards the range reads as the erased byte, which for NOR flash is
+    /// `0xff`.
+    ///
+    /// # Errors
+    ///
+    /// [`TargetError::NotFlash`] when any of the range is outside a region the
+    /// map declared `flash`, [`TargetError::Unsupported`] when this target has
+    /// no flash at all.
+    fn flash_erase(&mut self, _cpu: usize, _addr: u64, _len: u64) -> TargetResult<()> {
+        Err(TargetError::Unsupported)
+    }
+
+    /// Program `data` at `addr`, as `vFlashWrite` asks.
+    ///
+    /// The bytes go in as they are: this is the loader's door into the array,
+    /// not a guest store, so no programming sequence runs and no status bit
+    /// moves. A real part would only clear bits and would need the range
+    /// erased first; GDB erases before it writes, and a stub that re-imposed
+    /// the rule would fail a `load` the part itself would accept over SWD.
+    ///
+    /// # Errors
+    ///
+    /// As [`flash_erase`](DebugTarget::flash_erase).
+    fn flash_write(&mut self, _cpu: usize, _addr: u64, _data: &[u8]) -> TargetResult<()> {
+        Err(TargetError::Unsupported)
+    }
+
+    /// Finish a flash programming sequence, as `vFlashDone` asks.
+    ///
+    /// The point a stub with a write buffer empties it. This one has none —
+    /// every erase and every write has already landed in the array, which is
+    /// what a part with no page latch does — so "commit" here means the two
+    /// things that are only true once the loading stops: derived state built
+    /// from the bytes that changed is dropped, and any device holding the
+    /// array over a host medium is asked to write it back.
+    ///
+    /// # Errors
+    ///
+    /// [`TargetError::Unsupported`] when this target has no flash, and
+    /// whatever the machine reported when a flush failed.
+    fn flash_done(&mut self, _cpu: usize) -> TargetResult<()> {
         Err(TargetError::Unsupported)
     }
 
@@ -821,6 +953,146 @@ impl<'a> MachineTarget<'a> {
         // for the round's own boundary would step over every breakpoint between
         // here and it.
         self.machine.step_until(deadline)?;
+        Ok(())
+    }
+
+    /// Every range of `cpu`'s bus a device will let a loader program, in
+    /// ascending order.
+    ///
+    /// The one place the geometry is worked out: [`DebugTarget::memory_map`]
+    /// turns these into `<memory type="flash">` elements and the three
+    /// `vFlash` operations bound themselves by them, so the blocks GDB aligns
+    /// its erases to and the blocks an erase actually clears cannot drift
+    /// apart.
+    ///
+    /// A span exists when the leaf a *write* to the range lands on is a device
+    /// that published a [`FlashLayout`](crate::core::space::FlashLayout),
+    /// which is that device's promise that a
+    /// debug write reaches its array (`core::space` itself still refuses a
+    /// write to a read-only mapping, debug or not). Repeating windows are
+    /// skipped: a mirror puts one sector at several addresses, and erasing it
+    /// once per image is not what anyone means.
+    fn flash_spans(&self, cpu: usize) -> TargetResult<Vec<FlashSpan>> {
+        use crate::core::space::{FlatTarget, Perms};
+
+        let entry = self.cpu(cpu)?;
+        let space = self.space(entry)?;
+        let view = space.try_view().ok_or(TargetError::Unsupported)?;
+        let mut out: Vec<FlashSpan> = Vec::new();
+        for flat in view.flat_view().entries() {
+            if flat.is_empty() {
+                continue;
+            }
+            let Some(leaf) = flat.write_to().or_else(|| flat.leaf()) else {
+                continue;
+            };
+            if !leaf.perms().contains(Perms::WRITE) || leaf.period().is_some() {
+                continue;
+            }
+            let FlatTarget::Io(ops, _) = leaf.target() else {
+                continue;
+            };
+            let Some(layout) = ops.flash_layout() else {
+                continue;
+            };
+            // The entry covers `[base, base + len)` of the device's own
+            // region; each run of blocks is intersected with that, and the
+            // result put back in bus addresses.
+            let base = leaf.offset();
+            let covered = base.saturating_add(flat.len());
+            for run in &layout.blocks {
+                if run.blocksize == 0 {
+                    continue;
+                }
+                let lo = run.offset.max(base);
+                let hi = run.offset.saturating_add(run.length).min(covered);
+                if lo >= hi {
+                    continue;
+                }
+                let span = FlashSpan {
+                    start: flat.start().saturating_add(lo - base),
+                    length: hi - lo,
+                    blocksize: run.blocksize,
+                    erased: layout.erased,
+                };
+                match out.last_mut() {
+                    Some(last)
+                        if last.blocksize == span.blocksize
+                            && last.erased == span.erased
+                            && last.start.saturating_add(last.length) == span.start =>
+                    {
+                        last.length = last.length.saturating_add(span.length);
+                    }
+                    _ => out.push(span),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The spans, refusing a target that has no flash at all rather than
+    /// answering `vFlashErase` with a silent success.
+    fn flash_or_refuse(&self, cpu: usize) -> TargetResult<Vec<FlashSpan>> {
+        let spans = self.flash_spans(cpu)?;
+        if spans.is_empty() {
+            return Err(TargetError::Unsupported);
+        }
+        Ok(spans)
+    }
+
+    /// Put `src` at bus address `addr` through the debug door.
+    ///
+    /// **Bus address, not virtual.** Everything `vFlash*` carries was matched
+    /// by GDB against the memory map, and the map is the machine's own
+    /// addresses — see [`DebugTarget::memory_map`].
+    ///
+    /// The whole slice is offered first, because a store that takes a burst
+    /// should get one call. When it is refused the transfer is redone as
+    /// aligned stores, widest first: `st.flash`'s array declines a bulk write
+    /// on purpose — a block copy into flash is not a transfer the part can
+    /// perform — and a loader on the real part does the same thing, one
+    /// aligned store at a time through the programming interface.
+    fn flash_poke(&self, cpu: usize, addr: u64, src: &[u8]) -> TargetResult<()> {
+        let entry = self.cpu(cpu)?;
+        let space = self.space(entry)?;
+        let attrs = debug_attrs(entry.requester);
+        if src.is_empty() || space.write_bytes(addr, src, attrs).is_ok() {
+            return Ok(());
+        }
+        let mut at = 0u64;
+        let total = src.len() as u64;
+        while at < total {
+            let here = addr.wrapping_add(at);
+            let left = total - at;
+            // The widest power-of-two store, at most eight bytes, that both
+            // fits and is aligned where it lands.
+            let mut n = 8u64;
+            while n > 1 && (n > left || !here.is_multiple_of(n)) {
+                n /= 2;
+            }
+            let piece = &src[at as usize..(at + n) as usize];
+            space
+                .write_bytes(here, piece, attrs)
+                .map_err(|_| TargetError::Fault)?;
+            at += n;
+        }
+        Ok(())
+    }
+
+    /// Fill `[addr, addr + len)` with `byte`, which is how an erase is done:
+    /// the device's own door writes what the cells hold afterwards.
+    fn flash_fill(&self, cpu: usize, addr: u64, len: u64, byte: u8) -> TargetResult<()> {
+        /// Enough that a sector erase is a few hundred calls rather than tens
+        /// of thousands, small enough to be a stack-sized allocation.
+        const CHUNK: u64 = 4096;
+
+        let buf = vec![byte; CHUNK.min(len.max(1)) as usize];
+        let mut at = 0u64;
+        while at < len {
+            let n = CHUNK.min(len - at);
+            self.flash_poke(cpu, addr.wrapping_add(at), &buf[..n as usize])?;
+            at += n;
+        }
         Ok(())
     }
 
@@ -1399,6 +1671,14 @@ impl DebugTarget for MachineTarget<'_> {
     /// the mapping is permitted, because a ROM store answers a write by
     /// ignoring it or faulting either way.
     ///
+    /// A range whose write side is a device that published a
+    /// [`FlashLayout`](crate::core::space::FlashLayout) is `flash`, split into
+    /// one region per run of equal-sized erase blocks — which is where the
+    /// blocksize GDB aligns its erases to comes from. The device publishing
+    /// that layout is also what says a debug write reaches the array, so
+    /// nothing here has to decide whether `vFlashWrite` will work: only a
+    /// region that has already promised it is offered.
+    ///
     /// Adjacent ranges of the same kind are merged. The flat view splits on
     /// every mapping boundary and GDB has no use for the seams; a board with
     /// sixteen consecutive peripheral pages is one `<memory>` element here.
@@ -1410,6 +1690,7 @@ impl DebugTarget for MachineTarget<'_> {
         // `try_view` rather than `view`, for the reason `monitor_map` gives:
         // a description is a nicety and blocking on a mid-flight retopology
         // is not.
+        let spans = self.flash_spans(cpu)?;
         let view = space.try_view().ok_or(TargetError::Unsupported)?;
         let mut out: Vec<MemRegion> = Vec::new();
         for flat in view.flat_view().entries() {
@@ -1433,21 +1714,94 @@ impl DebugTarget for MachineTarget<'_> {
                 // No leaf at all: a combined entry, which answers writes.
                 None => MemKind::Ram,
             };
-            match out.last_mut() {
-                Some(last)
-                    if last.kind == kind
-                        && last.start.saturating_add(last.length) == flat.start() =>
-                {
-                    last.length = last.length.saturating_add(flat.len());
+            // A device that published an erase geometry gets `flash` for the
+            // part of this entry its blocks cover, and the ordinary answer for
+            // the rest — a board may map half an array, and half an array is
+            // still a real half.
+            let end = flat.end();
+            let mut pos = flat.start();
+            for span in &spans {
+                let lo = span.start.max(pos);
+                let hi = span.start.saturating_add(span.length).min(end);
+                if lo >= hi {
+                    continue;
                 }
-                _ => out.push(MemRegion {
-                    kind,
-                    start: flat.start(),
-                    length: flat.len(),
-                }),
+                push_region(&mut out, kind, pos, lo - pos);
+                let blocksize = span.blocksize;
+                push_region(&mut out, MemKind::Flash { blocksize }, lo, hi - lo);
+                pos = hi;
             }
+            push_region(&mut out, kind, pos, end.saturating_sub(pos));
         }
         Ok(out)
+    }
+
+    fn flash_erase(&mut self, cpu: usize, addr: u64, len: u64) -> TargetResult<()> {
+        let spans = self.flash_or_refuse(cpu)?;
+        if len == 0 {
+            return Ok(());
+        }
+        let end = addr.checked_add(len).ok_or(TargetError::NotFlash)?;
+        // Worked out in full before anything is written, so a request that
+        // runs off the end of the flash erases nothing rather than erasing up
+        // to the point it noticed.
+        let mut work: Vec<(u64, u64, u8)> = Vec::new();
+        let mut pos = addr;
+        while pos < end {
+            let span = spans
+                .iter()
+                .find(|s| pos >= s.start && pos - s.start < s.length)
+                .ok_or(TargetError::NotFlash)?;
+            let span_end = span.start.saturating_add(span.length);
+            let stop = end.min(span_end);
+            // Whole blocks: a part cannot erase half a sector, so a range that
+            // starts or ends inside one takes the whole one with it.
+            let lo = span.start + (pos - span.start) / span.blocksize * span.blocksize;
+            let hi = span.start
+                + ((stop - span.start).div_ceil(span.blocksize) * span.blocksize).min(span.length);
+            work.push((lo, hi - lo, span.erased));
+            pos = stop;
+        }
+        for (start, length, erased) in work {
+            self.flash_fill(cpu, start, length, erased)?;
+        }
+        Ok(())
+    }
+
+    fn flash_write(&mut self, cpu: usize, addr: u64, data: &[u8]) -> TargetResult<()> {
+        let spans = self.flash_or_refuse(cpu)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = addr
+            .checked_add(data.len() as u64)
+            .ok_or(TargetError::NotFlash)?;
+        // Every byte has to land in flash before any of them does: a write
+        // that ran off the end of the array and reported it afterwards would
+        // have already put half an image somewhere.
+        let mut pos = addr;
+        while pos < end {
+            let span = spans
+                .iter()
+                .find(|s| pos >= s.start && pos - s.start < s.length)
+                .ok_or(TargetError::NotFlash)?;
+            pos = span.start.saturating_add(span.length);
+        }
+        self.flash_poke(cpu, addr, data)
+    }
+
+    fn flash_done(&mut self, cpu: usize) -> TargetResult<()> {
+        self.flash_or_refuse(cpu)?;
+        // Nothing is buffered here, so this is not where the bytes land — they
+        // landed as the packets arrived, which is what a part with no page
+        // latch does. What is true only now is that the loading has stopped:
+        // the decoded blocks a JIT lifted from the old contents are dead, the
+        // watchpoint shadows are stale, and a device holding the array over a
+        // host medium has a reason to write it back.
+        self.invalidate_translations();
+        self.resync_watchpoints();
+        self.machine.flush().map_err(TargetError::Machine)?;
+        Ok(())
     }
 
     fn monitor(&mut self, cpu: usize, command: &str) -> Option<String> {

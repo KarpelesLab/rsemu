@@ -19,6 +19,7 @@
 //! | `H` `qC` `qfThreadInfo` `qsThreadInfo` `T` `qThreadExtraInfo` | CPUs as threads |
 //! | `qSupported` `qXfer:features:read` | negotiation and the target description |
 //! | `qXfer:memory-map:read` | what is mapped where, when the target can say |
+//! | `vFlashErase` `vFlashWrite` `vFlashDone` | `load` into a range the map called flash |
 //! | `QStartNoAckMode` | drop the `+`/`-` handshake |
 //! | `qRcmd` | the `monitor` command, answered for the selected thread |
 //! | `qAttached` `qSymbol` `!` | the attach handshake |
@@ -549,6 +550,73 @@ impl Stub {
         Outcome::Continue
     }
 
+    // -- flash programming -------------------------------------------------
+
+    /// `vFlashErase:<addr>,<length>` — erase the blocks that range touches.
+    ///
+    /// The length is a *sector* length rather than a packet length, so it is
+    /// not run through [`Stub::parse_range`]'s packet-size cap: erasing a
+    /// megabyte in one request is ordinary.
+    fn flash_erase(
+        &mut self,
+        args: &[u8],
+        target: &mut dyn DebugTarget,
+        out: &mut Vec<u8>,
+    ) -> Outcome {
+        let Some(comma) = args.iter().position(|b| *b == b',') else {
+            self.send_error(&TargetError::Unsupported, out);
+            return Outcome::Continue;
+        };
+        let (Some(addr), Some(len)) = (
+            parse_hex_u64(&args[..comma]),
+            parse_hex_u64(args.get(comma + 1..).unwrap_or(&[])),
+        ) else {
+            self.send_error(&TargetError::Unsupported, out);
+            return Outcome::Continue;
+        };
+        match target.flash_erase(self.query_thread, addr, len) {
+            Ok(()) => self.send_ok(out),
+            Err(TargetError::Unsupported) => self.send_empty(out),
+            Err(e) => self.send_error(&e, out),
+        }
+        Outcome::Continue
+    }
+
+    /// `vFlashWrite:<addr>:<binary>` — program bytes into an erased range.
+    ///
+    /// The payload is binary rather than hex and has already been unescaped by
+    /// the framer, exactly as `X`'s is. Its length is whatever is left of the
+    /// packet: unlike `X` there is no count to check it against, which is the
+    /// protocol's own choice and why a truncated write cannot be detected
+    /// here.
+    fn flash_write(
+        &mut self,
+        args: &[u8],
+        target: &mut dyn DebugTarget,
+        out: &mut Vec<u8>,
+    ) -> Outcome {
+        let Some(colon) = args.iter().position(|b| *b == b':') else {
+            self.send_error(&TargetError::Unsupported, out);
+            return Outcome::Continue;
+        };
+        let Some(addr) = parse_hex_u64(&args[..colon]) else {
+            self.send_error(&TargetError::Unsupported, out);
+            return Outcome::Continue;
+        };
+        let data = args.get(colon + 1..).unwrap_or(&[]);
+        match target.flash_write(self.query_thread, addr, data) {
+            Ok(()) => self.send_ok(out),
+            Err(TargetError::Unsupported) => self.send_empty(out),
+            // The protocol's own word for it, and the reason
+            // `TargetError::NotFlash` is a variant of its own: GDB turns this
+            // into "flash memory operation on non-flash memory" and names the
+            // address, where an errno would have it report a bus error.
+            Err(TargetError::NotFlash) => self.send(b"E.memtype", out),
+            Err(e) => self.send_error(&e, out),
+        }
+        Outcome::Continue
+    }
+
     // -- execution ---------------------------------------------------------
 
     /// The address a `c`/`s` packet optionally carries, and where it starts.
@@ -635,6 +703,24 @@ impl Stub {
     ) -> Outcome {
         if rest == b"Cont?" {
             self.send(b"vCont;c;C;s;S;t", out);
+            return Outcome::Continue;
+        }
+        if let Some(args) = rest.strip_prefix(b"FlashErase:") {
+            return self.flash_erase(args, target, out);
+        }
+        if let Some(args) = rest.strip_prefix(b"FlashWrite:") {
+            return self.flash_write(args, target, out);
+        }
+        if rest == b"FlashDone" {
+            match target.flash_done(self.query_thread) {
+                Ok(()) => self.send_ok(out),
+                // An empty reply, not an error, for a target with no flash:
+                // "this stub does not do that" is what GDB needs to hear, and
+                // an `E` would have it report a failed programming sequence it
+                // never started.
+                Err(TargetError::Unsupported) => self.send_empty(out),
+                Err(e) => self.send_error(&e, out),
+            }
             return Outcome::Continue;
         }
         let Some(actions) = rest.strip_prefix(b"Cont;") else {
@@ -1533,6 +1619,58 @@ mod tests {
             )),
             "E00"
         );
+    }
+
+    /// A flash region is a `<memory>` element with a child, and a target with
+    /// no flash answers the three packets the way it answers any packet it
+    /// does not know: empty.
+    ///
+    /// The empty reply is the load-bearing half. `E` would tell GDB a
+    /// programming sequence had started and failed, and GDB would report that
+    /// to a user who never asked for one — a stub that does not program flash
+    /// has to look like a stub that has never heard of the packet.
+    #[test]
+    fn a_flash_region_carries_a_blocksize_and_a_target_without_one_says_nothing() {
+        let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
+        target.map = vec![MemRegion {
+            kind: MemKind::Flash { blocksize: 0x1000 },
+            start: 0x0800_0000,
+            length: 0x2000,
+        }];
+        let mut whole = String::new();
+        let mut offset = 0usize;
+        loop {
+            let request = format!("qXfer:memory-map:read::{offset:x},40");
+            let reply = payload(&ask(&mut stub, &mut target, request.as_bytes()));
+            let (tag, body) = reply.split_at(1);
+            whole.push_str(body);
+            offset += body.len();
+            if tag == "l" {
+                break;
+            }
+        }
+        assert!(
+            whole.contains(
+                "<memory type=\"flash\" start=\"0x8000000\" length=\"0x2000\">\n    \
+                 <property name=\"blocksize\">0x1000</property>\n  </memory>"
+            ),
+            "{whole}"
+        );
+
+        // `FakeTarget` implements none of the three, which is the default
+        // every `DebugTarget` gets.
+        for packet in [
+            &b"vFlashErase:8000000,1000"[..],
+            &b"vFlashWrite:8000000:\x01\x02"[..],
+            &b"vFlashDone"[..],
+        ] {
+            assert_eq!(
+                payload(&ask(&mut stub, &mut target, packet)),
+                "",
+                "{}",
+                String::from_utf8_lossy(packet)
+            );
+        }
     }
 
     #[test]

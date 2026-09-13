@@ -1400,3 +1400,271 @@ fn a_real_gdb_debugs_an_aarch64_guest_end_to_end() {
 
     drop(server);
 }
+
+// ---------------------------------------------------------------------------
+// `load` into flash
+// ---------------------------------------------------------------------------
+
+/// A board with a programmable array on it, for the one thing `M` and `X`
+/// cannot do.
+///
+/// **Why an STM32 flash controller is on an x86 board.** `st.flash` is the only
+/// device in this tree with a loader's door — a debug write that lands in the
+/// array instead of running the part's programming rules — and it is the door,
+/// not the instruction set, that this test is about: `vFlashErase`,
+/// `vFlashWrite` and `vFlashDone` are answered by the stub, which is one piece
+/// of code for every core. The board that runs them therefore has to be one a
+/// stock `gdb` can attach to, and on a developer machine that is x86. Nothing
+/// in `st.flash` is ARM-specific — it is a slave with a register window and an
+/// array, and here it is a slave on a different bus. The STM32 board's own
+/// session is `tests/gdb_flash.rs`, which drives the same packets with a client
+/// of ours.
+#[cfg(all(feature = "cpu-x86", feature = "dev-stm32-flash"))]
+const X86_64_FLASH: &str = r#"
+machine "gdb-x86-flash" {
+  osc xtal = 100000000 Hz
+  space mem  { width = 64, unassigned = read-as-ones }
+  space port { width = 16 }
+  object cpu "cpu.x86" {
+    clock   = xtal
+    space   = mem
+    iospace = "port"
+    variant = "x86-64"
+    engine  = "interp"
+  }
+  object dram "ram" { size = 1M }
+  object eflash "st.flash" {
+    clock   = xtal
+    variant = "f4"
+    size    = 1M
+  }
+  map mem 0x00000000 size 1M = dram
+  map mem 0x08000000 size 1M = eflash.array
+  map mem 0x40023c00 size 0x1c = eflash
+}
+"#;
+
+/// Where the array is mapped, and where the ELF below says its bytes go.
+#[cfg(all(feature = "cpu-x86", feature = "dev-stm32-flash"))]
+const FLASH_BASE: u64 = 0x0800_0000;
+
+/// The image `load` puts there.
+///
+/// Chosen so that a mangled transfer is visible: `7d`, `23`, `24` and `2a` are
+/// the four bytes the packet layer has to escape (`}`, `#`, `$`, `*`), and the
+/// run of equal bytes is what run-length encoding would eat.
+#[cfg(all(feature = "cpu-x86", feature = "dev-stm32-flash"))]
+const FLASH_IMAGE: [u8; 16] = [
+    0x7d, 0x23, 0x24, 0x2a, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xde, 0xad, 0xbe, 0xef, 0x00, 0xff,
+];
+
+/// A minimal ELF64 holding [`FLASH_IMAGE`] at [`FLASH_BASE`].
+///
+/// Written from the ELF specification (the System V gABI's "Object Files" and
+/// "Program Loading" chapters) rather than produced by a toolchain, because
+/// `cargo test` has no assembler and a binary fixture in the tree is one nobody
+/// can read. GDB's `load` walks the *sections* of the file and uses each one's
+/// load address, which BFD derives from the program header containing it — so
+/// the file needs both: one `PT_LOAD` segment whose `p_paddr` is the flash
+/// address, and one `SHF_ALLOC` section inside it.
+#[cfg(all(feature = "cpu-x86", feature = "dev-stm32-flash"))]
+fn flash_elf() -> Vec<u8> {
+    /// Where the loadable bytes go in the file. A page, so that
+    /// `p_offset % p_align == p_vaddr % p_align` holds for a 4 KiB alignment.
+    const DATA_OFF: usize = 0x1000;
+
+    let names = b"\0.text\0.shstrtab\0";
+    let str_off = DATA_OFF + FLASH_IMAGE.len();
+    let sh_off = str_off + names.len();
+    let mut elf = vec![0u8; sh_off + 3 * 64];
+
+    let put16 =
+        |elf: &mut Vec<u8>, at: usize, v: u16| elf[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    let put32 =
+        |elf: &mut Vec<u8>, at: usize, v: u32| elf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |elf: &mut Vec<u8>, at: usize, v: u64| elf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+    // -- the ELF header ----------------------------------------------------
+    elf[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    put16(&mut elf, 16, 2); // e_type = ET_EXEC
+    put16(&mut elf, 18, 62); // e_machine = EM_X86_64
+    put32(&mut elf, 20, 1); // e_version
+    put64(&mut elf, 24, FLASH_BASE); // e_entry
+    put64(&mut elf, 32, 64); // e_phoff
+    put64(&mut elf, 40, sh_off as u64); // e_shoff
+    put16(&mut elf, 52, 64); // e_ehsize
+    put16(&mut elf, 54, 56); // e_phentsize
+    put16(&mut elf, 56, 1); // e_phnum
+    put16(&mut elf, 58, 64); // e_shentsize
+    put16(&mut elf, 60, 3); // e_shnum
+    put16(&mut elf, 62, 2); // e_shstrndx
+
+    // -- the one program header: R+X, loaded at the flash address ----------
+    let ph = 64;
+    put32(&mut elf, ph, 1); // p_type = PT_LOAD
+    put32(&mut elf, ph + 4, 5); // p_flags = R|X
+    put64(&mut elf, ph + 8, DATA_OFF as u64); // p_offset
+    put64(&mut elf, ph + 16, FLASH_BASE); // p_vaddr
+    put64(&mut elf, ph + 24, FLASH_BASE); // p_paddr — the load address
+    put64(&mut elf, ph + 32, FLASH_IMAGE.len() as u64); // p_filesz
+    put64(&mut elf, ph + 40, FLASH_IMAGE.len() as u64); // p_memsz
+    put64(&mut elf, ph + 48, 0x1000); // p_align
+
+    elf[DATA_OFF..DATA_OFF + FLASH_IMAGE.len()].copy_from_slice(&FLASH_IMAGE);
+    elf[str_off..str_off + names.len()].copy_from_slice(names);
+
+    // -- the sections: null, .text, .shstrtab ------------------------------
+    let text = sh_off + 64;
+    put32(&mut elf, text, 1); // sh_name = ".text"
+    put32(&mut elf, text + 4, 1); // sh_type = SHT_PROGBITS
+    put64(&mut elf, text + 8, 0x6); // sh_flags = ALLOC|EXECINSTR
+    put64(&mut elf, text + 16, FLASH_BASE); // sh_addr
+    put64(&mut elf, text + 24, DATA_OFF as u64); // sh_offset
+    put64(&mut elf, text + 32, FLASH_IMAGE.len() as u64); // sh_size
+    put64(&mut elf, text + 48, 1); // sh_addralign
+
+    let shstr = sh_off + 128;
+    put32(&mut elf, shstr, 7); // sh_name = ".shstrtab"
+    put32(&mut elf, shstr + 4, 3); // sh_type = SHT_STRTAB
+    put64(&mut elf, shstr + 24, str_off as u64); // sh_offset
+    put64(&mut elf, shstr + 32, names.len() as u64); // sh_size
+    put64(&mut elf, shstr + 48, 1); // sh_addralign
+    elf
+}
+
+/// The last gap in the debug surface: **a real `gdb` programming flash**.
+///
+/// `load` is the only command that sends `vFlashErase`, `vFlashWrite` and
+/// `vFlashDone`, and it sends them only because the memory map said the range
+/// was flash — which is why the two had to land together. What is proved here
+/// is that GDB's own flash machinery drives ours: it reads the map, erases the
+/// 16 KiB sector the F4 geometry declared, writes the section into it, ends the
+/// sequence, and the bytes are in the device's array afterwards. The array is
+/// asked directly at the end rather than only through `x`, so a `load` that
+/// satisfied the debugger without reaching the device would still fail here.
+#[cfg(all(feature = "cpu-x86", feature = "dev-stm32-flash"))]
+#[test]
+fn a_real_gdb_loads_an_image_into_flash() {
+    use rsemu::core::Captured;
+    use rsemu::dev::stm32::flash::Flash;
+
+    let Some(gdb) = find_gdb() else {
+        println!("skipping: no gdb binary. Set $RSEMU_GDB, or install gdb.");
+        return;
+    };
+    if !knows(&gdb, "i386:x86-64") {
+        println!("skipping: `{gdb}` has no x86-64 gdbarch, so it cannot attach to this board.");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("rsemu-gdb-flash-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let image = dir.join("image.elf");
+    {
+        let mut f = std::fs::File::create(&image).expect("create");
+        f.write_all(&flash_elf()).expect("write");
+    }
+
+    let parts: Arc<Captured<Flash>> = Arc::new(Captured::new());
+    let kept = Arc::clone(&parts);
+    let server = Server::start(move || {
+        let mut bindings = catalog::bindings().expect("this build's bindings");
+        let seen = Arc::clone(&kept);
+        bindings.replace("st.flash", move |props| {
+            let part = Arc::new(Flash::new(props)?);
+            seen.push(&part);
+            Ok(part)
+        });
+        let options = rsemu::machine::BuildOptions::new()
+            .with_classes(catalog::classes())
+            .with_bindings(bindings);
+        let registry = catalog::registry().expect("a registry");
+        rsemu::machine::build("gdb-x86-flash.machine", X86_64_FLASH, &registry, &options)
+            .unwrap_or_else(|e| panic!("the flash fixture does not realize: {e}"))
+    });
+    let port = server.addr.port();
+
+    let mut script = Vec::new();
+    if std::env::var_os("RSEMU_GDB_DEBUG_REMOTE").is_some() {
+        script.push(String::from("set debug remote 1"));
+    }
+    script.extend([
+        // The file first: `load` has nothing to load without one, and the ELF
+        // is also where GDB gets the architecture.
+        format!("file {}", image.display()),
+        format!("target remote 127.0.0.1:{port}"),
+        // What GDB thinks it may write, where — the memory map read back in
+        // GDB's own words, so a region that arrived as `ram` is visible here
+        // rather than only in a failure further down.
+        String::from("info mem"),
+        String::from("load"),
+        // Read it back off the target through `m`: a flash array answers reads
+        // like any other memory, which is the half of a flash part that is not
+        // special.
+        String::from("printf \"RSEMU w0 [%#x]\\n\", *(unsigned int *) 0x8000000"),
+        String::from("printf \"RSEMU w3 [%#x]\\n\", *(unsigned int *) 0x800000c"),
+        String::from("detach"),
+    ]);
+
+    let mut cmd = Command::new(&gdb);
+    cmd.arg("-batch").arg("-nx");
+    for line in &script {
+        cmd.arg("-ex").arg(line);
+    }
+    let out = cmd.output().expect("gdb runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let all = format!("{stdout}\n{stderr}");
+    println!("--- gdb stdout ---\n{stdout}\n--- gdb stderr ---\n{stderr}");
+
+    let says = |needle: &str| {
+        assert!(
+            all.contains(needle),
+            "gdb never said `{needle}`.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    };
+
+    // GDB's own view of the map: the array is flash, with the blocksize the
+    // F4's first four sectors have (RM0090 Table 5).
+    says("flash blocksize 0x4000");
+    // The transfer itself, in the words `load` prints.
+    says("Loading section .text");
+    says("lma 0x8000000");
+    // And the bytes, as little-endian words out of the array.
+    says("RSEMU w0 [0x2a24237d]");
+    says("RSEMU w3 [0xff00efbe]");
+    for bad in [
+        "Remote failure reply",
+        "Cannot access memory",
+        "Remote communication error",
+        "Ignoring packet error",
+        "flash memory operation on non-flash memory",
+    ] {
+        assert!(
+            !all.contains(bad),
+            "gdb reported `{bad}`:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+
+    // The array itself, not the debugger's word for it.
+    let part = parts.last().expect("the binding captured the part");
+    let contents = part.contents();
+    assert_eq!(
+        &contents[..FLASH_IMAGE.len()],
+        &FLASH_IMAGE[..],
+        "the image is not in the array"
+    );
+    assert!(
+        contents[FLASH_IMAGE.len()..0x4000]
+            .iter()
+            .all(|b| *b == 0xff),
+        "the rest of the erased sector should still read as ones"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}

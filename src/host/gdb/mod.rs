@@ -75,13 +75,14 @@
 //!   register file; upstream GDB additionally insists on knowing the machine,
 //!   and has no 6502. `rsemu debug` says so at startup rather than letting the
 //!   user find out from GDB's error. [`arch`] has the long form.
-//! * **Flash programming.** `qXfer:memory-map:read` describes what is mapped
-//!   where, in the two types the machine can honour — see [`MemKind`] — and
-//!   never claims `flash`, because `vFlashErase`, `vFlashWrite` and
-//!   `vFlashDone` are not implemented and a range declared flash is a range
-//!   GDB writes only through them. So `load` into a board's ROM still fails,
-//!   and now fails with GDB saying which region refused rather than with a bus
-//!   error from nowhere.
+//! * **`load` into a ROM.** `qXfer:memory-map:read` claims `flash` for a range
+//!   whose device published an erase geometry — see [`MemKind`] — and the three
+//!   `vFlash` packets program it. A `rom` object publishes none, because there
+//!   is nothing behind it that could take the write: `core::space` refuses a
+//!   write to a read-only mapping *including a debug one*, deliberately and in
+//!   as many words. So `load` into a board's ROM still fails, and fails with
+//!   GDB naming the read-only region rather than with a bus error from
+//!   nowhere.
 //!
 //! # Sources
 //!
