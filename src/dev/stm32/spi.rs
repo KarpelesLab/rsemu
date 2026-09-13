@@ -225,7 +225,7 @@
 //! §7.3.10–§7.3.15) — and `reset`, which is the identically numbered bit of
 //! the matching `xxRSTR`. A board draws them or it does not; an undrawn
 //! `enable` leaves the peripheral clocked, so every machine file written
-//! before the gate keeps working. [`gate`](super::gate) has the rules and what
+//! before the gate keeps working. [`gate`] has the rules and what
 //! a gated block does.
 //!
 //! The register half is the easy half. This is a **bus controller**, so a

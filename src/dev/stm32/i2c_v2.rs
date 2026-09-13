@@ -106,7 +106,7 @@
 //! I2C1, I2C2 and I2C3 on the L4 (RM0351 §6.4.16 ff.) — and `reset`, which is
 //! the identically numbered bit of the matching `xxRSTR`. A board draws them
 //! or it does not; an undrawn `enable` leaves the controller clocked, so every
-//! machine file written before the gate keeps working. [`gate`](super::gate)
+//! machine file written before the gate keeps working. [`gate`]
 //! has the rules and what a gated block does.
 //!
 //! A gated I²C is not merely unreadable: it is a **bus controller with no

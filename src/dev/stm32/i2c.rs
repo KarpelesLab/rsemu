@@ -98,7 +98,7 @@
 //! (RM0090 §7.3.13) — and `reset`, which is the identically numbered bit of
 //! `RCC_APB1RSTR`. A board draws them or it does not; an undrawn `enable`
 //! leaves the controller clocked, so every machine file written before the
-//! gate keeps working. [`gate`](super::gate) has the rules and what a gated
+//! gate keeps working. [`gate`] has the rules and what a gated
 //! block does.
 //!
 //! A gated I²C is not merely unreadable: it is a **bus controller with no

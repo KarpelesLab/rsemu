@@ -95,14 +95,14 @@
 //! is `RCC_APB2ENR.SYSCFGEN`, bit 14 (RM0090 §7.3.14), and `reset`, which is
 //! `RCC_APB2RSTR.SYSCFGRST`, the same bit of the APB2 peripheral reset
 //! register. A board draws them or it does not; an undrawn `enable` leaves the
-//! block clocked. [`gate`](super::gate) has the rules. Forgetting the
+//! block clocked. [`gate`] has the rules. Forgetting the
 //! `SYSCFGEN` write is the classic EXTI bug — `EXTICR` will not take a value,
 //! so every line stays pointed at port A — and with the wire drawn a board
 //! reproduces it exactly.
 //!
 //! Two things here are deliberately **not** gated.
 //!
-//! * The **boot alias** ([`BootAlias`]) is an address decoder the core fetches
+//! * The **boot alias** (`BootAlias`) is an address decoder the core fetches
 //!   through, not a register. The alias at zero answers the reset vector fetch
 //!   — before any software has enabled any clock — so a window that went dead
 //!   without `SYSCFGEN` would make a machine unable to start at all. What

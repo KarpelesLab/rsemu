@@ -78,7 +78,7 @@
 //! an F429 runs to bit 10; RM0090 §7.3.10), and `reset`, which is the same bit
 //! of `RCC_AHB1RSTR`. A board draws them or it does not; an undrawn `enable`
 //! leaves the port clocked, so no board written before the gate existed
-//! changes behaviour. [`gate`](super::gate) has the rules.
+//! changes behaviour. [`gate`] has the rules.
 //!
 //! Only the **register block** is gated, and that is the whole of it: an
 //! unclocked port answers zero to every read of `MODER`…`AFRH` and drops every

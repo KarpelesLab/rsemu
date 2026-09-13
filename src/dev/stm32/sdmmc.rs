@@ -75,7 +75,7 @@
 //!
 //! A board draws them or it does not; an **undrawn `enable` leaves the
 //! controller clocked**, so no machine file written before the gate changes
-//! behaviour. [`gate`](super::gate) has the rules and what a gated block does.
+//! behaviour. [`gate`] has the rules and what a gated block does.
 //! What it means here is that a gated controller sends no command, moves no
 //! FIFO word and masters no IDMA burst — all three happen inside a register
 //! write, and a write to a block without a clock is not effective.

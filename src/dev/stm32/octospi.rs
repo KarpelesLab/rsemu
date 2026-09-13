@@ -132,7 +132,7 @@
 //! differs between them, so a board's machine file names it and this module
 //! does not.) A board draws the two wires or it does not; an undrawn `enable`
 //! leaves the peripheral clocked, so every machine file written before the
-//! gate keeps working. [`gate`](super::gate) has the rules and what a gated
+//! gate keeps working. [`gate`] has the rules and what a gated
 //! block does.
 //!
 //! Gating reaches **both** regions. The register block answers zero and drops

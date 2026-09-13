@@ -69,7 +69,7 @@
 //! `RCC_AHB1RSTR.CRCRST`, the same bit of the AHB1 peripheral reset register.
 //! A board draws them or it does not; an undrawn `enable` leaves the unit
 //! clocked, so no board written before the gate existed changes behaviour.
-//! [`gate`](super::gate) has the rules and what a gated block does — the short
+//! [`gate`] has the rules and what a gated block does — the short
 //! of it being that a read answers zero and a write is lost, while the
 //! accumulator keeps its value, because removing a clock is not a reset and
 //! `CRCRST` is the pin that resets.

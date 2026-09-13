@@ -46,7 +46,7 @@
 //! with the gate wired, is now what this model does too. A board draws the
 //! wires or it does not; an **undrawn `enable` leaves the controller clocked**,
 //! so no machine file written before the gate changes behaviour.
-//! [`gate`](super::gate) has the rules.
+//! [`gate`] has the rules.
 //!
 //! ## What a gated PWR does with `dbp`
 //!

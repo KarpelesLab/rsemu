@@ -56,7 +56,7 @@
 //! Two *inputs* arrive from the reset and clock controller — `enable`, which
 //! is `RCC_APB1ENR.USART2EN`, and `reset`, which is `RCC_APB1RSTR.USART2RST`.
 //! A board draws them or it does not; an undrawn `enable` leaves the USART
-//! clocked. [`gate`](super::gate) has the rules and what a gated block does.
+//! clocked. [`gate`] has the rules and what a gated block does.
 //!
 //! # Baud rate
 //!

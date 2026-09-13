@@ -138,7 +138,7 @@
 //!
 //! A board draws them or it does not; an **undrawn `enable` leaves the
 //! processor clocked**, so no machine file written before the gate changes
-//! behaviour. [`gate`](super::gate) has the rules and what a gated block does.
+//! behaviour. [`gate`] has the rules and what a gated block does.
 //!
 //! A gated HASH digests nothing: `DIN` takes no word and `DCAL` starts no
 //! compression, because both of those happen inside a register write and a

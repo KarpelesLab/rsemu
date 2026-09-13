@@ -74,7 +74,7 @@
 //! Those are RCC's bits and not `CR`'s: `CR.RNGEN` is the guest switching the
 //! block on, and it cannot even be written while the clock is off. A board
 //! draws the two wires or it does not; an undrawn `enable` leaves the block
-//! clocked. [`gate`](super::gate) has the rules.
+//! clocked. [`gate`] has the rules.
 //!
 //! Gating this one stops it **counting**, which is the half a register model
 //! would get wrong. `CR`, `SR` and `DR` answer zero and drop writes, and the

@@ -117,7 +117,7 @@
 //!
 //! A board draws them or it does not; an **undrawn `enable` leaves the
 //! controller clocked**, so no machine file written before the gate changes
-//! behaviour. [`gate`](super::gate) has the rules and what a gated block does.
+//! behaviour. [`gate`] has the rules and what a gated block does.
 //!
 //! # Time
 //!
