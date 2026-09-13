@@ -196,6 +196,7 @@ machine "stm32f407" {
     bus     = i2cbus
     reader  = "nfc"
     uid     = 0x0000000001
+  }
 
   # -- the secure element, which the Discovery board does not have either -----
   #
