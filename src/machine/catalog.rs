@@ -947,7 +947,7 @@ pub fn registry() -> Result<Registry> {
     crate::dev::ppu::register(&mut reg)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::register(&mut reg)?;
-    #[cfg(feature = "dev-at24c")]
+    #[cfg(any(feature = "dev-at24c", feature = "dev-atecc"))]
     crate::dev::atmel::register(&mut reg)?;
     #[cfg(feature = "dev-st25dv")]
     crate::dev::st25dv::register(&mut reg)?;
@@ -1087,7 +1087,7 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::ppu::bind(&mut b)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::bind(&mut b)?;
-    #[cfg(feature = "dev-at24c")]
+    #[cfg(any(feature = "dev-at24c", feature = "dev-atecc"))]
     crate::dev::atmel::bind(&mut b)?;
     #[cfg(feature = "dev-st25dv")]
     crate::dev::st25dv::bind(&mut b)?;
@@ -1218,7 +1218,7 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::ppu::schema());
     #[cfg(feature = "dev-nes-apu")]
     table.insert(crate::dev::apu::schema());
-    #[cfg(feature = "dev-at24c")]
+    #[cfg(any(feature = "dev-at24c", feature = "dev-atecc"))]
     for schema in crate::dev::atmel::schemas() {
         table.insert(schema);
     }

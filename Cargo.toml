@@ -71,6 +71,42 @@ fstool = { version = ">=0.4.26, <0.4.28", default-features = false, features = [
 # exception, since `pktkit` is `std`.
 pktkit = { version = "0.1.3", default-features = false, optional = true }
 
+# SHA-256, HMAC-SHA-256, AES-128 and P-256 for the ATECC508A/608 secure element
+# (`dev/atmel/atecc.rs`), and for whichever secure element comes next.
+# First-party (Karpelès Lab, MIT) and named as a permitted dependency in
+# CLAUDE.md. Optional, so the default `cargo tree` is still only `rsemu`.
+#
+# **Three features, each for something a datasheet asks for:**
+#
+#   `hash`    SHA-256 and, built on it, HMAC-SHA-256 — the ATECC's `SHA`,
+#             `Nonce`, `GenDig`, `MAC`, `CheckMac` and `HMAC` family.
+#   `ec`      P-256 key generation, ECDSA sign/verify and ECDH — `GenKey`,
+#             `Sign`, `Verify` and `ECDH`. It
+#             pulls `bignum` and `rng` with it (and `hash`, already here). It is
+#             the **fixed-curve** path, which `purecrypto`'s `ec` module
+#             documents as usable *without* `alloc`: keygen, ECDH, sign/verify
+#             and the fixed-size encodings, which is exactly this crate's
+#             surface — so the `--no-default-features` gate keeps passing.
+#   `cipher`  AES-128, for the ATECC608's `AES` command and nothing else.
+#
+# Deliberately **not** `alloc`, `std`, `der`, `key` or `x509`: the DER/PEM
+# codecs and the runtime multi-curve path are what want a heap, and a secure
+# element speaks fixed-size byte strings on a wire. Nor `rng`'s host backends
+# (`linux-getrandom`, `wasi-getrandom`) — every byte a device here calls random
+# comes from `core::rand::Stream`, because a machine that asked the host for
+# entropy would not replay.
+#
+# **`0.7`, and the bound is this crate's MSRV.** `purecrypto` 0.8 raised its
+# `rust-version` to 1.89 while rsemu holds 1.88 (the note at the top of this
+# file, and the `msrv` CI job that builds `--all-features` on exactly that
+# toolchain). 0.7 is the newest series that compiles there. Lift it the day the
+# floor moves, not before.
+purecrypto = { version = "0.7", default-features = false, features = [
+  "hash",
+  "ec",
+  "cipher",
+], optional = true }
+
 [features]
 # The emulation core is always compiled and never feature-gated. Everything
 # else is one feature per component, so a NES build links a 6502 and nothing
@@ -1295,6 +1331,24 @@ dev-at24c = ["bus-i2c"]
 # `bus-i2c`.
 dev-st25dv = ["bus-i2c"]
 
+# The Microchip ATECC508A / ATECC608A / ATECC608B CryptoAuthentication secure
+# element (src/dev/atmel/atecc.rs): the part that sits behind the "secure
+# element" footprint on a very large number of boards, and the first device
+# here whose whole purpose is cryptography. Over I2C: the word-address byte
+# (reset/sleep/idle/command), the wake token and the watchdog that puts the
+# part back to sleep on its own, CRC-16 on every packet in both directions, the
+# Config/OTP/Data zones with their per-slot SlotConfig/KeyConfig rules and the
+# two-stage zone lock, and the command set -- `Read`, `Write`, `Lock`,
+# `UpdateExtra`, `Info`, `Counter`, `Random`, `Nonce`, `GenDig`, `MAC`,
+# `CheckMac`, `HMAC`, `SHA`, `GenKey`, `PrivWrite`, `Sign`, `Verify`, `ECDH`,
+# `SelfTest` and the 608's `AES`. Written from the ATECC508A (DS20005927) and
+# ATECC608A/B (DS40001977, DS40002239) datasheets, cited by section. The
+# **SWI** single-wire transport is not modelled and the module says what it
+# would need. Needs `bus-i2c` and pulls `purecrypto` for SHA-256, HMAC, AES-128
+# and P-256; every "random" byte and every generated key comes from the board's
+# `seed`, so two runs deal the same keys and hash the same.
+dev-atecc = ["bus-i2c", "dep:purecrypto"]
+
 # The STM32 I2C peripheral, **v1** -- the F1/F2/F4/L1 block with
 # CR1/CR2/OAR1/DR/SR1/SR2/CCR, not the completely different F0/F3/F7/H7 one with
 # TIMINGR and ISR/ICR. Master mode: the event sequence of RM0090 25.3.3 with its
@@ -1741,6 +1795,11 @@ machine-stm32f407 = [
     # in the tree that a *device* opens on behalf of something outside the
     # machine: `st25dv-rf:nfc`, which `HostObjects::seal` governs.
     "dev-st25dv",
+
+    # The second part on the same I2C bus, and the one that makes the bus worth
+    # having two devices on: a driver that talks to the wrong chip finds out.
+    # It is also what a great many F4 designs actually carry.
+    "dev-atecc",
     # The 4x4 matrix keypad on PE0-PE7. It is the board's input device and it is
     # also the only thing in the tree that needs a net to resolve itself: eight
     # pins, two drivers apiece and a pull-up, which is what `{ pull = "up" }`

@@ -196,6 +196,34 @@ machine "stm32f407" {
     bus     = i2cbus
     reader  = "nfc"
     uid     = 0x0000000001
+
+  # -- the secure element, which the Discovery board does not have either -----
+  #
+  # The second part on the same two wires, and the reason it is here is that
+  # one device on a bus proves addressing works but not that *addressing*
+  # works: an ATECC at 0x60 beside an EEPROM at 0x50 is a driver's first real
+  # chance to talk to the wrong chip. It is also the footprint a very large
+  # number of boards carry next to an F4, so firmware that expects to find one
+  # now can.
+  #
+  # `clock = hse / 8` is the same 1 MHz domain the EEPROM runs on, and it is
+  # load-bearing for the same reason: the datasheet's execution times
+  # (§9.4 -- 60 ms for a `Sign`, 115 ms for a `GenKey`) are expressed in this
+  # model as microseconds, so a 1 MHz domain makes them literal. The watchdog
+  # of §6.3 is 1.3 s in the same units, which is the default.
+  #
+  # **`seed = seed` is what makes it reproducible.** Every "random" byte the
+  # part deals, its serial number, and every key pair `GenKey` creates come from
+  # that number mixed with this object's name -- so two runs of this file
+  # produce the same keys and the same state hash, and `rsemu run ... -p seed=7`
+  # produces a different part without editing anything. It is emphatically not
+  # an entropy source, and firmware that needs unpredictable bytes must not ask
+  # an emulator for them.
+  object atecc "atmel.atecc" {
+    clock = hse / 8
+    part  = "atecc608b"
+    seed  = seed
+    bus   = i2cbus
   }
 
   # -- where everything is ---------------------------------------------------

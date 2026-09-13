@@ -158,6 +158,29 @@ they look like details and are not:
   then refuses to start never sends anything at all. `OpenDrain::learn_sources`
   sets every slot high when it builds the fan.
 
+### A wake pulse, on a bus that has no such thing
+
+The ATECC508A/608 (`atmel.atecc`) is woken by holding **SDA low for at least
+60 µs** — a condition I²C does not have a name for, because on this bus a long
+low is not a message. Firmware produces it the only way a controller can: by
+addressing `0x00` at a low bit rate and ignoring the NACK that comes back. So
+that is what the model watches for. An address phase to `0x00` *is* the wake
+token, in both link styles, and the part answers it with a NACK as the datasheet
+says it does.
+
+Writing it here rather than only in the device: this is a case where the
+faithful thing and the literal thing differ. A model that insisted on measuring
+the low time would work only under `link = "wired"`, and only for a controller
+whose clock is slow enough — which is to say it would model the *analogue*
+property and lose the behaviour. The part is also the first device here that
+NACKs its own address for two different reasons (a command is executing, §9.4;
+or it is asleep, §6.2), which is worth knowing when a driver's poll loop never
+terminates.
+
+`machines/stm32f407.machine` now carries that part alongside its AT24C02, which
+makes it the first board with **two devices on one I²C bus** — the configuration
+in which an address actually does something.
+
 ## What a snapshot has to carry, and what it must not re-announce
 
 A frame is not atomic with respect to a save. `Machine::save` can land between

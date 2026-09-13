@@ -22,10 +22,15 @@
 
 #![cfg(feature = "machine-stm32f407")]
 
+use std::sync::Arc;
+
+use rsemu::bus::i2c::{Ack, Address, Direction, I2cBus, buses};
 use rsemu::core::clock::GlobalTime;
+use rsemu::core::hosts::HostObjects;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::state::StateReader;
 use rsemu::core::value::Width;
+use rsemu::dev::atmel::atecc;
 use rsemu::machine::{Machine, catalog};
 
 /// `I2C1`'s base, per the machine file (RM0090 §2.3, Table 1).
@@ -543,10 +548,121 @@ fn the_two_link_models_leave_the_same_bytes_behind() {
     assert_eq!(bytes(&wired), bytes(&transactional));
 }
 
+/// The board with nothing in flash but a halt loop, and the I²C bus its two
+/// devices share.
+///
+/// The EEPROM test above needs firmware because the claim is about the *core*
+/// driving the peripheral. The claim below is about the **bus**: that the
+/// secure element is on the same two wires as the EEPROM, at its own address,
+/// and that it answers. So the master here is the test, and the firmware's only
+/// job is to keep the core out of the way.
+fn idle_board() -> (Machine, Arc<I2cBus>) {
+    let mut image = vec![0u8; ENTRY as usize + 2];
+    image[0..4].copy_from_slice(&STACK.to_le_bytes());
+    image[4..8].copy_from_slice(&(ENTRY | 1).to_le_bytes());
+    let entry = ENTRY as usize;
+    image[entry..entry + 2].copy_from_slice(&0xe7feu16.to_le_bytes()); // b .
+
+    let hosts = Arc::new(HostObjects::new());
+    let mach = catalog::machine("stm32f407").expect("this build ships stm32f407");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.hosts = Arc::clone(&hosts);
+    options.realize.media.insert("firmware", image);
+    options
+        .resolve
+        .params
+        .push((String::from("i2clink"), String::from("transactional")));
+    options
+        .resolve
+        .params
+        .push((String::from("i2cbus"), String::from("i2c-atecc")));
+    let registry = catalog::registry().expect("a registry");
+    let machine = match rsemu::machine::build(mach.name, mach.source, &registry, &options) {
+        Ok(m) => m,
+        Err(e) => panic!("the board does not realize: {e}"),
+    };
+    let bus = buses::get(&hosts, "i2c-atecc")
+        .expect("the host table answers")
+        .expect("the board opened its bus");
+    (machine, bus)
+}
+
+#[test]
+fn the_secure_element_answers_on_the_same_two_wires_as_the_eeprom() {
+    let (mut machine, bus) = idle_board();
+    assert!(
+        machine.device("atecc").is_some(),
+        "the board has no `atecc` instance"
+    );
+
+    // The EEPROM is at 0x50 (its datasheet §4.1) and answers at once; the
+    // ATECC is at 0x60 and, asleep, is not on the bus at all (§6.2). That is
+    // the whole point of putting two parts on one link.
+    assert_eq!(bus.start(Address::Seven(0x50), Direction::Write), Ack::Ack);
+    bus.stop();
+    assert_eq!(
+        bus.start(Address::Seven(atecc::DEFAULT_ADDRESS), Direction::Write),
+        Ack::Nack
+    );
+    bus.stop();
+
+    // The wake pulse, which nobody acknowledges, and the token that follows it.
+    assert_eq!(bus.start(Address::Seven(0x00), Direction::Write), Ack::Nack);
+    bus.stop();
+    let mut token = Vec::new();
+    assert_eq!(
+        bus.start(Address::Seven(atecc::DEFAULT_ADDRESS), Direction::Read),
+        Ack::Ack
+    );
+    for i in 0..4 {
+        token.push(bus.read(if i == 3 { Ack::Nack } else { Ack::Ack }));
+    }
+    bus.stop();
+    assert_eq!(token, atecc::WAKE_TOKEN.to_vec());
+    assert_eq!(bus.conflicts(), 0, "two parts, two addresses");
+
+    // And a command, through the same bus the guest's I2C1 would use. The
+    // board clocks the part from `hse / 8` = 1 MHz, so §9.4's execution times
+    // are microseconds and five milliseconds of virtual time is ample.
+    let packet = atecc::command(atecc::OP_INFO, 0x00, 0x0000, &[]);
+    assert_eq!(
+        bus.start(Address::Seven(atecc::DEFAULT_ADDRESS), Direction::Write),
+        Ack::Ack
+    );
+    assert_eq!(bus.write(atecc::WORD_COMMAND), Ack::Ack);
+    for byte in &packet {
+        assert_eq!(bus.write(*byte), Ack::Ack);
+    }
+    bus.stop();
+    machine
+        .run_for(GlobalTime::from_nanos(5_000_000))
+        .expect("it runs");
+
+    assert_eq!(
+        bus.start(Address::Seven(atecc::DEFAULT_ADDRESS), Direction::Read),
+        Ack::Ack
+    );
+    let count = bus.read(Ack::Ack);
+    let mut response = vec![count];
+    for i in 1..usize::from(count) {
+        let last = i + 1 == usize::from(count);
+        response.push(bus.read(if last { Ack::Nack } else { Ack::Ack }));
+    }
+    bus.stop();
+    assert_eq!(usize::from(count), response.len());
+    assert_eq!(
+        atecc::crc16(&response[..response.len() - 2]),
+        response[response.len() - 2..],
+        "§9.1.3: the part CRCs what it sends"
+    );
+    // `Info(Revision)` on the part the machine file names: an ATECC608B.
+    assert_eq!(&response[1..5], &[0x00, 0x00, 0x60, 0x03]);
+}
+
 #[test]
 fn the_board_realizes_with_the_i2c_wired_to_the_core_and_to_the_eeprom() {
     let (machine, _) = run("wired");
-    for path in ["i2c1", "eeprom"] {
+    for path in ["i2c1", "eeprom", "atecc"] {
         assert!(
             machine.device(path).is_some(),
             "the board has no `{path}` instance"

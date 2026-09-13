@@ -15,6 +15,7 @@
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`arm`] | `dev-arm` | the AArch64 `virt` board: a GICv2, a PL011, PSCI's landing place, and the device tree generator |
 //! | [`ata`] | `dev-ata-disk` | an ATA hard disk: the command block, the command set, CHS and LBA |
+//! | [`atmel`] | `dev-at24c`, `dev-atecc` | Atmel/Microchip I²C parts: the AT24C EEPROM and the ATECC508A/608 secure element |
 //! | [`medium`] | `dev-medium` | what a drive's platter *is*: the storage seam every block device stores its bytes behind |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
@@ -48,8 +49,8 @@
 //! The seam and the NE2000 itself are `no_std + alloc` and dependency-free, so
 //! the `--no-default-features` sweep runs their tests.
 
-#[cfg(feature = "dev-at24c")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dev-at24c")))]
+#[cfg(any(feature = "dev-at24c", feature = "dev-atecc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "dev-at24c", feature = "dev-atecc"))))]
 pub mod atmel;
 
 #[cfg(feature = "dev-apple1")]
