@@ -227,6 +227,16 @@ impl ExportId {
     /// floppy drive, whose raw bit cells arrive far too fast to be a wire. The
     /// handle's type is a contract among `dev::amiga`'s classes.
     pub const PAULA: ExportId = ExportId(7);
+    /// A video chip's line input: the handle the chip that counts the beam
+    /// pushes each finished line and field into, and hands its beam position
+    /// to.
+    ///
+    /// The Amiga's Denise publishes it and Agnus holds it — on the silicon
+    /// that is the strobe addresses and the bitplane DMA writes Agnus puts on
+    /// Denise's register bus once per line, carried a line at a time rather
+    /// than a word at a time. The handle's type is a contract between those
+    /// two classes, so it travels as `Opaque`.
+    pub const AMIGA_VIDEO: ExportId = ExportId(8);
 
     /// The name this id is known by, for an error message.
     ///
@@ -242,6 +252,7 @@ impl ExportId {
             ExportId::CLOCK_TREE => Some("clock tree"),
             ExportId::CUSTOM_BUS => Some("custom-chip register bus"),
             ExportId::PAULA => Some("Paula's DMA and disk seam"),
+            ExportId::AMIGA_VIDEO => Some("Amiga video line input"),
             _ => None,
         }
     }

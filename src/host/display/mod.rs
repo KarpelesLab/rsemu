@@ -22,7 +22,7 @@
 //!                             (Scanout)              → wasm exports → a canvas
 //! ```
 //!
-//! The device side is one small adapter per display device — [`nes`], [`lcd`],
+//! The device side is one small adapter per display device — [`nes`], [`lcd`], `amiga`,
 //! [`pc`], [`sms`] and [`gb`] — and the host side never learns which machine it
 //! is looking at. A virtio-gpu adds an adapter and nothing else changes.
 //!
@@ -77,6 +77,10 @@
 //! buffer is actually indexed.
 
 pub mod palette;
+
+#[cfg(feature = "dev-amiga-denise")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-denise")))]
+pub mod amiga;
 
 #[cfg(feature = "dev-gb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]

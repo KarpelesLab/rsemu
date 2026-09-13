@@ -1,0 +1,59 @@
+# amiga-denise - a 68000, the Amiga custom-chip register space, and Denise.
+#
+# It models no product and is deliberately not in the catalog: `machines/tests/`
+# is where a board that exists for one test lives. `tests/amiga_denise_board.rs`
+# runs it by path.
+#
+# ---------------------------------------------------------------------------
+# Why it exists
+# ---------------------------------------------------------------------------
+#
+# Denise is proved here rather than on `amiga-a500.machine` because that board
+# is somebody else's to edit this round, and because it has no Agnus: nothing
+# on it counts the beam, so nothing pushes lines. The test standing in for
+# Agnus does that through Denise's `ExportId::AMIGA_VIDEO` handle, while the
+# 68000 does what a program does - stores into COLOR00, BPLCON0, the window and
+# a manual-mode sprite through $DFF000, big-endian words through a real address
+# space - and reads CLXDAT back.
+#
+# What an A500 needs instead of this file is two statements; see the report
+# that came with this board, or the Denise section of docs/platforms/amiga.md.
+#
+# ---------------------------------------------------------------------------
+# The clock
+# ---------------------------------------------------------------------------
+#
+# One 28.37516 MHz PAL master crystal. The processor runs at a quarter of it,
+# and so does Denise: its pin 35 is 7M (Appendix J), one tick per
+# low-resolution pixel, and a colour clock is two. Denise does not tick - it is
+# driven a line at a time - but its host adapter turns a field's colour-clock
+# count into a frame period with this domain's exact frequency.
+
+machine "amiga-denise" {
+  param master = 28375160
+  osc   clk    = master Hz
+
+  # 24 bits and big-endian, for the reason `amiga-a500.machine` gives.
+  space mem { width = 24, endian = "big" }
+
+  object cpu "cpu.m68k" {
+    clock  = clk / 4
+    space  = mem
+    engine = "interp"
+  }
+
+  # The first eight bytes of the image are the reset stack pointer and PC.
+  object boot "rom" { size = 4K, image = "firmware" }
+  object ram  "ram" { size = 64K }
+
+  object custom "amiga.custom" { }
+
+  object denise "amiga.denise" {
+    custom = custom
+    clock  = clk / 4
+  }
+
+  map mem 0x000000 size 4K    = boot { endian = "big" }
+  map mem 0x010000 size 64K   = ram  { endian = "big" }
+  map mem 0xDFF000 size 0x200 = custom
+}

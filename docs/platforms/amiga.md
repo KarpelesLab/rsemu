@@ -1,19 +1,22 @@
 # Commodore Amiga 500
 
-Consumed by: `dev/amiga`, `dev/mos`, `machines/amiga-a500.machine`,
-`tests/amiga_a500_board.rs`.
+Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
+`machines/amiga-a500.machine`, `machines/tests/amiga-denise.machine`,
+`tests/amiga_a500_board.rs`, `tests/amiga_denise_board.rs`.
 
 A 68000, 512 KiB of chip RAM, a Kickstart ROM, two 8520 CIAs and three custom
 chips — Agnus, Denise and Paula. **What exists today is the memory map and its
-decoders, both 8520s, Paula, and the internal floppy drive; Agnus and Denise are
-not there yet.** This page is the ledger of what the board decided, what it had
-to leave open, and what the missing chips will need from it.
+decoders, both 8520s, Paula, the internal floppy drive, and Denise**
+(`dev-amiga-denise`). **Agnus is not there yet**, so nothing counts the beam:
+Denise is proved on its own test board, and the A500 shows no picture until Agnus
+pushes lines into it. This page is the ledger of what the board decided, what it
+had to leave open, and what the missing chip will need from it.
 
 ## Primary sources
 
 | Source | Covers |
 | --- | --- |
-| [*Amiga Hardware Reference Manual*, 3rd edition](https://archive.org/details/amiga-hardware-reference-manual-3rd-edition) (Commodore-Amiga Inc.) | Appendix B, the custom-chip register summary in address order and its legend; Appendix A, every register's bits; Appendix D, the system memory maps; Appendix F, the CIA addresses, chip selects and clocks; Appendix E, the port signal assignments and the disk connector; chapter 7, interrupts; chapter 8, the disk controller, the drive lines and the UART; chapter 5, audio |
+| [*Amiga Hardware Reference Manual*, 3rd edition](https://archive.org/details/amiga-hardware-reference-manual-3rd-edition) (Commodore-Amiga Inc.) | Appendix B, the custom-chip register summary in address order and its legend; Appendix A, every register's bits; Appendix D, the system memory maps; Appendix F, the CIA addresses, chip selects and clocks; Appendix E, the port signal assignments and the disk connector; chapter 7, interrupts; chapter 8, the disk controller, the drive lines and the UART; chapter 5, audio. For Denise: Chapter 3 (playfields, the display window, data-fetch timing, dual playfields, scrolling, hold-and-modify, extra-half-brite), Chapter 4 (sprites), Chapter 7 (video priorities, collision detection), Appendix A (register bits), Appendix C (the ECS notes, including the display window's chip column) and Appendix J (Denise's pins) |
 | MC68000 User's Manual (Motorola) | The reset sequence, and the instruction encodings the test ROMs are hand-assembled from |
 
 **Nothing else.** Every Amiga emulator the project is aware of is copyleft and
@@ -56,7 +59,7 @@ anywhere until something decodes it.
 
 **The custom-chip space is one decode with subscribers.** `amiga.custom` holds
 Appendix B as a table and each chip attaches to it, rather than each chip
-mapping its own scatter of windows. Twenty-one registers belong to more than
+mapping its own scatter of windows. Twenty-three registers belong to more than
 one chip (`DMACON` to all three, every sprite's `POS` and `CTL` to Agnus and
 Denise), and one table is the only place that fact can live once.
 
@@ -89,7 +92,7 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 
 | | Why it is open | What happens instead |
 | --- | --- | --- |
-| **`$1FE`** | Widely called the copper's `NO-OP`, but in neither Appendix A nor B of this edition, which ends at `DIWHIGH` (`$1E4`) | An unclaimed offset: a write is dropped and counted |
+| **`$1FE`** | Appendix B's last row is `NO-OP(NULL) 1FE`, with no access letter and no chip; Appendix A does not list it | An unclaimed offset: a write is dropped and counted |
 | **Byte access to a custom register** | Every entry is a word and the manual says nothing about a single data strobe | Refused by the region's access constraints |
 | **Reading a write-only custom register** | The manual does not say | The last word driven onto the bus — **a placeholder** that Agnus's DMA cycles will replace; `CustomBus::unclaimed` counts every use |
 | **`$DFF200`–`$DFFFFF`** | Appendix D gives a 4 KiB window, the table fills 512 bytes, and whether the rest mirrors is not stated | Only 512 bytes mapped; the rest faults. `mirror(custom)` is a one-word change |
@@ -118,3 +121,69 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
   none of its bits.
 * **Agnus, for the CIAs** — the TOD inputs: CIA-A's `tod` from vertical sync,
   CIA-B's from horizontal sync. Two `wire` lines.
+* **Agnus, for Denise** — a `video = denise` link and the `Video` handle from
+  `ExportId::AMIGA_VIDEO`: one `line()` per line of fetched bitplane words and
+  one `field(lof)` per field, sprite DMA as ordinary `Origin::dma()` register
+  writes, and optionally a lock-free `Beam::position()`.
+
+## Where the table departs from Appendix B
+
+| Register | Appendix B | The table | Why |
+| --- | --- | --- | --- |
+| `DIWSTRT` `$08E`, `DIWSTOP` `$090` | `A` | `A D` | Appendix C, "Display Window Specification", prints both `W A D`; the window's horizontal resolution is one low-resolution pixel, which only the chip that serializes pixels can compare against. Without it Denise could not clip its own output |
+
+`SPRHDAT` at `$078` (`W A(E)`, "Ext. logic UHRES sprite pointer and data id") is
+in Appendix B and not in the table. It is an ECS Agnus register and nothing reads
+it yet; it is recorded here so whoever adds it knows the row is real.
+
+## Denise
+
+`amiga.denise` is the colour table, single and dual playfields, hold-and-modify
+and extra-half-brite, `BPLCON1` scrolling, the eight sprites with attachment and
+`BPLCON2` priority, and `CLXCON`/`CLXDAT` collisions. `src/dev/amiga/denise.rs`
+has the full list of what is modelled and what only latches.
+
+**It is driven, not clocked.** Denise has no vertical counter and no memory bus
+(Appendix J), so the chip that counts the beam pushes lines into it through the
+`ExportId::AMIGA_VIDEO` handle:
+
+| Call | When | Carries |
+| --- | --- | --- |
+| `Video::line(&Line)` | as the beam leaves each line | `vpos`; the line's length in colour clocks; the bitplane words fetched for planes 1–6 and the `hpos` the first was fetched at |
+| `Video::field(lof)` | as the vertical counter wraps | the new field's long-frame bit |
+| `Video::connect_beam(Arc<dyn Beam>)` | once, at bind | a lock-free `position()` so a mid-line register write lands mid-line |
+
+Sprite DMA is **not** part of that seam: `SPRxPOS`/`CTL`/`DATA`/`DATB` arrive as
+register writes with `Origin::dma()`, because arming and disarming are their
+side effects and manual-mode sprites take the identical path.
+
+The coordinate rules are the manual's: a pixel on screen at `x = 2 × hpos`, a
+word fetched at `hpos = D` first displayed at `x = 2D + 17` (low resolution) or
+`2D + 9` (high), from Chapter 3's "$81/2 − 8.5 = $38" and "$81/2 − 4.5 = $3C".
+
+**It is its own `Scanout`, not a `Panel`.** A panel counts content changes and
+has no frame rate; Denise emits a field every 20 ms and the host must step by
+one. `host::display::amiga` reports `Video::fields()` as the frame counter and a
+frame period of the last field's colour clocks × 2 ticks of Denise's `clock`
+domain (its 7M pin).
+
+**On an A500** Denise needs two statements, beside `custom`:
+
+```text
+object denise "amiga.denise" { custom = custom, clock = clk / 4 }
+```
+
+plus `dev-amiga-denise` in `machine-amiga-a500`'s feature list. Nothing pushes
+lines until Agnus lands, so the board would show an empty picture — but every
+Denise register store would be claimed, which moves `CustomBus::unclaimed`
+(`tests/amiga_a500_board.rs` asserts `1` for its `COLOR00` store today).
+
+| Open | What this model does |
+| --- | --- |
+| Which pixel hold-and-modify holds at the start of a line | `COLOR00`, then whatever the serialized bits say |
+| `PF1P`/`PF2P` values 5–7 (Table 7-2 defines 0–4) | the same `group < code` comparison |
+| A sprite in front of one playfield and behind the other | a playfield a sprite is in front of is removed, then `PF2PRI` picks (Chapter 7's example) |
+| Collisions outside the display window | not detected |
+| Interlaced field order | long field on even rows, short on odd |
+| Where horizontal blanking falls in the 368 visible pixels | not cut; the picture is 400 low-resolution pixels from `x = 64` |
+| The mouse and joystick inputs | not wired; `JOYTEST` and `JOYxDAT` work as registers |

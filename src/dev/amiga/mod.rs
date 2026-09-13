@@ -10,6 +10,7 @@
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
 //! | [`floppy`] | `dev-amiga-floppy`: a floppy drive — the mechanism on the CIA ports, raw MFM cells for Paula |
+//! | `denise` | `dev-amiga-denise`: Denise — the colour table, playfields, sprites and collisions, driven a line at a time by whatever counts the beam |
 //!
 //! plus [`regs`], which is Appendix B of the hardware manual as data and is
 //! what makes the first of those a decode rather than three scattered ones.
@@ -39,7 +40,7 @@
 //!
 //! # What is here and what is not
 //!
-//! Deliberately absent from this module: Agnus, Denise and the video output.
+//! Deliberately absent from this module: Agnus. Denise is `dev-amiga-denise`.
 //! The 8520s are `mos.8520` in [`dev::mos`](crate::dev::mos). The custom register space answers and counts
 //! what it could not route ([`custom::CustomBus::unclaimed`]), which is a
 //! measurement of how much chipset is still missing rather than a pretence that
@@ -56,6 +57,9 @@
 
 pub mod cia_decode;
 pub mod custom;
+#[cfg(feature = "dev-amiga-denise")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-denise")))]
+pub mod denise;
 pub mod gary;
 pub mod regs;
 
@@ -77,6 +81,8 @@ use crate::core::error::Result;
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     cia_decode::register(registry)?;
     custom::register(registry)?;
+    #[cfg(feature = "dev-amiga-denise")]
+    denise::register(registry)?;
     gary::register(registry)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::register(registry)?;
@@ -93,6 +99,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     cia_decode::bind(bindings)?;
     custom::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-denise")]
+    denise::bind(bindings)?;
     gary::bind(bindings)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::bind(bindings)?;
@@ -110,5 +118,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     schemas.push(paula::schema());
     #[cfg(feature = "dev-amiga-floppy")]
     schemas.push(floppy::schema());
+    #[cfg(feature = "dev-amiga-denise")]
+    schemas.push(denise::schema());
     schemas
 }
