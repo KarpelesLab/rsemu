@@ -218,6 +218,16 @@ impl ExportId {
     /// classes and not `core`'s business, which is what `Opaque` is for.
     pub const CUSTOM_BUS: ExportId = ExportId(6);
 
+    /// Paula's side of the Amiga chipset's private seams. Transported as
+    /// [`Export::Opaque`].
+    ///
+    /// Two consumers, neither of which the register window can serve: Agnus's
+    /// DMA, which moves disk and audio words between chip RAM and Paula through
+    /// *early-read* and DMA-only addresses the processor never reads, and a
+    /// floppy drive, whose raw bit cells arrive far too fast to be a wire. The
+    /// handle's type is a contract among `dev::amiga`'s classes.
+    pub const PAULA: ExportId = ExportId(7);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -231,6 +241,7 @@ impl ExportId {
             ExportId::PORT_PASSTHROUGH => Some("I/O port pass-through"),
             ExportId::CLOCK_TREE => Some("clock tree"),
             ExportId::CUSTOM_BUS => Some("custom-chip register bus"),
+            ExportId::PAULA => Some("Paula's DMA and disk seam"),
             _ => None,
         }
     }

@@ -1,13 +1,14 @@
 //! Commodore Amiga: the memory map, and the seam the custom chips plug into.
 //!
-//! This module is the *board*, not the chipset. It has three classes and none
-//! of them is Agnus, Denise, Paula or an 8520:
+//! This module is the *board* and the chips on it. The board's classes are
+//! always here with `dev-amiga`; each chip is a feature of its own:
 //!
 //! | class | what it is |
 //! | --- | --- |
 //! | [`custom`] | the register window at `$DFF000`, the appendix's table, and the subscription seam a chip attaches through |
 //! | [`gary`] | the `OVL` overlay — whether the Kickstart ROM or chip RAM answers at address zero |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
+//! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
 //!
 //! plus [`regs`], which is Appendix B of the hardware manual as data and is
 //! what makes the first of those a decode rather than three scattered ones.
@@ -37,8 +38,8 @@
 //!
 //! # What is here and what is not
 //!
-//! Deliberately absent: Agnus, Denise, Paula, the 8520s themselves, the floppy, the
-//! serial port, the video output. The custom register space answers and counts
+//! Deliberately absent from this module: Agnus, Denise and the video output.
+//! The 8520s are `mos.8520` in [`dev::mos`](crate::dev::mos). The custom register space answers and counts
 //! what it could not route ([`custom::CustomBus::unclaimed`]), which is a
 //! measurement of how much chipset is still missing rather than a pretence that
 //! none is.
@@ -57,6 +58,10 @@ pub mod custom;
 pub mod gary;
 pub mod regs;
 
+#[cfg(feature = "dev-amiga-paula")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-paula")))]
+pub mod paula;
+
 use crate::core::error::Result;
 
 /// Add every class in this module to a registry.
@@ -68,6 +73,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     cia_decode::register(registry)?;
     custom::register(registry)?;
     gary::register(registry)?;
+    #[cfg(feature = "dev-amiga-paula")]
+    paula::register(registry)?;
     Ok(())
 }
 
@@ -80,11 +87,17 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     cia_decode::bind(bindings)?;
     custom::bind(bindings)?;
     gary::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-paula")]
+    paula::bind(bindings)?;
     Ok(())
 }
 
 /// What the validator should know about this module's classes.
 #[must_use]
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
-    alloc::vec![cia_decode::schema(), custom::schema(), gary::schema()]
+    #[allow(unused_mut)]
+    let mut schemas = alloc::vec![cia_decode::schema(), custom::schema(), gary::schema()];
+    #[cfg(feature = "dev-amiga-paula")]
+    schemas.push(paula::schema());
+    schemas
 }

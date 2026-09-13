@@ -44,10 +44,21 @@ const CUSTOM: u64 = 0xDF_F000;
 /// `COLOR00`, at offset `$180` — a Denise register, write-only.
 const COLOR00: u64 = CUSTOM + 0x180;
 
-/// `DMACONR`, at offset `$002` — readable, and owned by Agnus and Paula, so on
-/// a board with neither it is the clearest thing to point at when asking what a
+/// `JOY0DAT`, at offset `$00A` — readable, and owned by Denise alone, so on a
+/// board without Denise it is the clearest thing to point at when asking what a
 /// read with nothing attached does.
+const JOY0DAT: u64 = CUSTOM + 0x00A;
+
+/// `DMACONR`, at offset `$002` — readable, owned by Agnus and Paula together.
 const DMACONR: u64 = CUSTOM + 0x002;
+
+/// `INTENA`, `INTENAR` and `INTREQR`, Paula's.
+const INTENA: u64 = CUSTOM + 0x09A;
+const INTENAR: u64 = CUSTOM + 0x01C;
+const INTREQR: u64 = CUSTOM + 0x01E;
+
+/// `PORTS`, the level 2 request bit that `INT2*` sets.
+const PORTS: u16 = 0x0008;
 
 /// The word the firmware writes to `COLOR00`.
 const COLOUR: u16 = 0x0F00;
@@ -202,6 +213,7 @@ fn the_board_realizes_with_every_object_the_map_needs() {
         "cia_b",
         "cia_a_decode",
         "cia_b_decode",
+        "paula",
     ] {
         assert!(
             m.device(path).is_some(),
@@ -264,9 +276,13 @@ fn the_custom_space_decodes_words_and_refuses_everything_else() {
     poke_word(&m, COLOR00, 0x0123);
     assert_eq!(peek_word(&m, COLOR00), 0x0123);
 
-    // A readable register whose owners are not in this build answers the same
+    // A readable register whose owner is not in this build answers the same
     // way rather than inventing a value.
-    assert_eq!(peek_word(&m, DMACONR), 0x0123);
+    assert_eq!(peek_word(&m, JOY0DAT), 0x0123);
+
+    // One owned by two chips, of which only Paula is here: Paula answers, and
+    // drives none of `DMACONR`'s bits — they are Agnus's.
+    assert_eq!(peek_word(&m, DMACONR), 0x0000);
 
     // The appendix's registers are words. A byte access has no documented
     // meaning, so it is refused rather than guessed at.
@@ -435,6 +451,112 @@ fn a_guest_that_clears_ovl_through_cia_a_finds_chip_ram_at_zero() {
         "the store landed in chip RAM, so the CIA's pin reached the overlay"
     );
     assert_eq!(peek_long(&m, ROM), 0x0008_0000, "the ROM has not moved");
+}
+
+/// Where the interrupt test's handler counts.
+const COUNTER: u64 = 0x00_0100;
+
+/// A guest that takes CIA-A's timer as a level 2 autovectored interrupt.
+///
+/// Hand-assembled (MC68000UM for the encodings; Appendix F for the CIA
+/// registers; chapter 7 for `INTENA` and `INTREQ`):
+///
+/// ```text
+///   00c: jmp     ($00f80012).l            ; leave the overlay
+///   012: move.b  #$00, ($00bfe001).l      ; PRA:  OVL low
+///   01a: move.b  #$01, ($00bfe201).l      ; DDRA: PA0 an output -> chip RAM at 0
+///   022: move.l  #$00f80060, ($00000068).l; vector 26, the level 2 autovector
+///   02c: move.w  #$c008, ($00dff09a).l    ; INTENA: SET | INTEN | PORTS
+///   034: move.b  #$00, ($00bfe401).l      ; TA LO
+///   03c: move.b  #$10, ($00bfe501).l      ; TA HI: $1000 E clocks, 5.8 ms
+///   044: move.b  #$81, ($00bfed01).l      ; ICR: SET | TA
+///   04c: move.b  #$01, ($00bfee01).l      ; CRA: START, continuous
+///   054: move.w  #$2000, sr               ; unmask
+///   058: bra     *
+///   05a: nop; nop; nop
+///   060: addq.l  #1, ($00000100).l        ; the handler
+///   066: tst.b   ($00bfed01).l            ; read ICR: clears it, lets INT2* go
+///   06c: move.w  #$0008, ($00dff09c).l    ; INTREQ: clear PORTS
+///   074: rte
+/// ```
+fn timer_interrupt_rom() -> Vec<u8> {
+    image(&[
+        0x4ef9, 0x00f8, 0x0012, //
+        0x13fc, 0x0000, 0x00bf, 0xe001, //
+        0x13fc, 0x0001, 0x00bf, 0xe201, //
+        0x23fc, 0x00f8, 0x0060, 0x0000, 0x0068, //
+        0x33fc, 0xc008, 0x00df, 0xf09a, //
+        0x13fc, 0x0000, 0x00bf, 0xe401, //
+        0x13fc, 0x0010, 0x00bf, 0xe501, //
+        0x13fc, 0x0081, 0x00bf, 0xed01, //
+        0x13fc, 0x0001, 0x00bf, 0xee01, //
+        0x46fc, 0x2000, //
+        0x60fe, //
+        0x4e71, 0x4e71, 0x4e71, //
+        0x52b9, 0x0000, 0x0100, //
+        0x4a39, 0x00bf, 0xed01, //
+        0x33fc, 0x0008, 0x00df, 0xf09c, //
+        0x4e73,
+    ])
+}
+
+#[test]
+fn cia_a_interrupts_the_processor_at_level_2_through_paula() {
+    let mut m = build(
+        catalog::machine("amiga-a500").unwrap().source,
+        timer_interrupt_rom(),
+    );
+    // Fifty milliseconds: eight or so periods of a 5.8 ms timer.
+    m.run_for(GlobalTime::from_nanos(50_000_000))
+        .expect("it runs");
+    assert_eq!(peek_word(&m, INTENAR), 0x4008, "INTEN and PORTS");
+    let taken = peek_long(&m, COUNTER);
+    assert!(
+        (6..=10).contains(&taken),
+        "the handler ran {taken} times; a 5.8 ms timer over 50 ms is eight"
+    );
+    // Every one was acknowledged at the chip and at Paula, so nothing is left
+    // pending once the handler has run.
+    assert_eq!(peek_word(&m, INTREQR) & PORTS, 0);
+}
+
+#[test]
+fn an_unmasked_cia_b_request_is_level_6() {
+    let mut m = boot();
+    // CIA-B's timer B, one-shot, with its interrupt enabled: poke it straight
+    // through the board's decode and let the timer run out.
+    poke_word(&m, INTENA, 0xc000 | 0x2000); // SET | INTEN | EXTER
+    poke_byte(&m, 0xBF_D600, 0x02); // TB LO
+    poke_byte(&m, 0xBF_D700, 0x00); // TB HI
+    poke_byte(&m, 0xBF_DD00, 0x82); // ICR: SET | TB
+    poke_byte(&m, 0xBF_DF00, 0x09); // CRB: START | ONESHOT
+    m.run_for(GlobalTime::from_nanos(1_000_000))
+        .expect("it runs");
+    assert_eq!(peek_word(&m, INTREQR) & 0x2000, 0x2000, "EXTER");
+}
+
+#[test]
+fn a_guest_serdat_reaches_the_host_serial_port() {
+    // 00c: move.w #372, ($00dff032).l   SERPER: 9600 baud on PAL, (3546895/9600)-1
+    // 014: move.w #$0141, ($00dff030).l SERDAT: 'A' and a stop bit
+    // 01c: bra *
+    let rom = image(&[
+        0x33fc, 0x0173, 0x00df, 0xf032, //
+        0x33fc, 0x0141, 0x00df, 0xf030, //
+        0x60fe,
+    ]);
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("kickstart", rom);
+    let registry = catalog::registry().expect("a registry");
+    let source = catalog::machine("amiga-a500").unwrap().source;
+    let mut m = rsemu::machine::build("amiga-a500", source, &registry, &options)
+        .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
+    let host = rsemu::host::chardev::ports::open(&options.realize.hosts, "serial")
+        .expect("Paula opened it");
+    // Ten bits at 9600 baud is a little over a millisecond.
+    m.run_for(GlobalTime::from_nanos(5_000_000))
+        .expect("it runs");
+    assert_eq!(host.drain(), b"A".to_vec());
 }
 
 #[test]
