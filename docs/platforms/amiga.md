@@ -117,6 +117,38 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 | **Audio's state diagram** | Figure 5-8's arrows are not legible in the available scan | The chapter's prose: see `paula.rs` |
 | **Disk images** | ADF is AmigaDOS's format, not the hardware's | The drive's `image` slot takes a raw MFM dump of its own layout; nothing encodes a file system yet |
 
+## An address with nothing at it floats; it does not fault
+
+A real Kickstart 2.04 and the AROS ROM both halted on this board before their
+first chip register. Each sums its own image and then makes a **word read at
+`$F0_0000`** with `OVL` still up; under `unassigned = fault` that became a bus
+error whose vector came out of the ROM overlay, and the processor double-faulted.
+
+| Source | What it says |
+| --- | --- |
+| HRM Appendix D, p. 314 | `$F0_0000`–`$FB_FFFF` "Reserved. Do not use."; likewise `$10_0000`–`$1F_FFFF`, `$A0_0000`–`$BE_FFFF`, `$C0_0000`–`$DF_EFFF` around slow RAM and the clock, `$E0_0000`–`$E7_FFFF`. The A3000 map (p. 315) calls `$F0_0000` "Diagnostic ROM (Reserved)" |
+| MC68000UM §5.4 | `BERR` is asserted by "external circuitry" a board may provide |
+| HRM Appendix K, p. 397, `/DTACK` | "If a Zorro II slave does nothing, this /DTACK will be driven by the bus controller with no wait states" |
+| HRM Appendix K, pp. 393–394, `/BERR` | driven by the controller on "a detected bus collision or DMA error" |
+| HRM Appendix E, 86-pin expansion connector | the A500 carries the same `/DTACK`, `/OVR` and `RDY` as the A2000 |
+
+So on an A500 every Reserved range, every unfitted memory range (`$08_0000` on a
+512 KiB machine, slow RAM, the clock) and every empty autoconfig slot completes
+its cycle with nothing driving the data bus, and nothing documented raises
+`/BERR` for an empty address. No manual gives a floating value.
+**`unassigned = open-bus`** says exactly that; the 68000 core has no data-bus
+latch, so it reads zero, which is also what makes each of Kickstart's probes —
+diagnostic ROM, slow RAM, autoconfig, the second half of chip RAM — conclude
+"nothing fitted". `tests/amiga_a500_unassigned.rs` walks every range and runs
+the user's own ROMs in place behind `RSEMU_AMIGA_ROM_DIR`.
+
+With it, both ROMs go straight from the `$F0_0000` probe to CIA-A. Kickstart
+2.04's next refused access is a **byte** read of `$DF_F07D` (the "byte access to
+a custom register" row below), which it survives because its vectors are in
+chip RAM by then.
+
+## What each chip will need
+
 ## How the chips meet
 
 * **Agnus, Denise** — implement `CustomChip` on their register block, take a
