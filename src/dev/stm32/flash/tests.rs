@@ -707,6 +707,44 @@ fn an_uncommitted_option_write_does_not_survive_a_reset() {
 }
 
 #[test]
+fn an_f4_comes_back_from_a_reset_with_its_option_register_locked() {
+    // The F4 keeps `OPTLOCK` in the same register as its option bytes, and it
+    // is not one of them: "Reset value: 0x0FFF AAED" has bit 0 set
+    // (RM0090 §3.9.8), and the only way out is the key sequence. Committing
+    // the options while unlocked used to store the *unlocked* register, so the
+    // part came back from a reset able to reprogram its own protections.
+    let flash = f4();
+    unlock(&flash);
+    opt_unlock(&flash);
+    let value = flash.peek(F4_OPTCR) & !(1 << (16 + 5));
+    flash.poke(F4_OPTCR, value | F4_OPTCR_OPTSTRT).unwrap();
+    settle(&flash);
+
+    Device::reset(&flash, ResetKind::Warm);
+    assert_eq!(
+        flash.peek(F4_OPTCR) & F4_OPTCR_OPTLOCK,
+        F4_OPTCR_OPTLOCK,
+        "the option register is locked out of reset"
+    );
+    assert_eq!(
+        flash.peek(F4_OPTCR) & F4_OPTCR_OPTSTRT,
+        0,
+        "and OPTSTRT is a strobe, never stored"
+    );
+    assert_eq!(
+        flash.peek(F4_OPTCR) & (1 << (16 + 5)),
+        0,
+        "while the option byte that was committed survived"
+    );
+
+    // And it is locked in earnest: a write is dropped until the key sequence.
+    flash
+        .poke(F4_OPTCR, flash.peek(F4_OPTCR) | (1 << (16 + 5)))
+        .unwrap();
+    assert_eq!(flash.peek(F4_OPTCR) & (1 << (16 + 5)), 0);
+}
+
+#[test]
 fn the_option_registers_are_read_only_while_optlock_is_set() {
     let flash = l4();
     unlock(&flash);

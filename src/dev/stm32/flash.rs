@@ -505,9 +505,20 @@ impl State {
     }
 
     /// The reverse: what `OPTSTRT` commits.
+    ///
+    /// The F4 keeps `OPTLOCK` and `OPTSTRT` in the same register as its option
+    /// *bytes*, and neither is one: the lock is cleared by the key sequence and
+    /// set by a reset ("Reset value: 0x0FFF AAED", bit 0 — RM0090 §3.9.8), and
+    /// `OPTSTRT` is a strobe. Storing them as written would make a part come
+    /// back from a reset with its option register already unlocked, because
+    /// that is how it was when the commit happened.
     fn store_option_bytes(&mut self, variant: Variant) {
         for (slot, &offset) in variant.option_words().iter().enumerate() {
-            self.stored[slot] = self.words[(offset / 4) as usize];
+            let mut value = self.words[(offset / 4) as usize];
+            if variant.is_f4() && offset == F4_OPTCR {
+                value = (value | F4_OPTCR_OPTLOCK) & !F4_OPTCR_OPTSTRT;
+            }
+            self.stored[slot] = value;
         }
     }
 
