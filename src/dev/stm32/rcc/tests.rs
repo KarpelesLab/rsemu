@@ -20,6 +20,7 @@ const PLLCFGR: u64 = 0x04;
 const CFGR: u64 = 0x08;
 const AHB1RSTR: u64 = 0x10;
 const APB1ENR: u64 = 0x40;
+const CIR: u64 = 0x0c;
 const BDCR: u64 = 0x70;
 const CSR: u64 = 0x74;
 
@@ -98,6 +99,91 @@ impl WireSink for LevelProbe {
         self.high
             .store(u32::from(level.is_high()), Ordering::Relaxed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The clock interrupt
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_ready_bit_raises_the_interrupt_only_when_its_enable_is_set() {
+    // RM0090 §7.3.5: "Set by hardware when the HSE clock becomes stable and
+    // HSERDYIE is set." The enable is part of the setting condition, not a
+    // mask over an already-set flag.
+    let rcc = f4();
+    let (_wire, source, probe) = probe();
+    Device::connect(&rcc, IRQ_PIN, source).expect("an RCC drives `irq`");
+    assert!(!probe.is_high(), "nothing has happened yet");
+
+    poke(&rcc, CR, CR_HSION | CR_HSEON);
+    tick(&rcc, DELAY);
+    assert_eq!(peek(&rcc, CR) & CR_HSERDY, CR_HSERDY, "the crystal arrived");
+    assert_eq!(peek(&rcc, CIR), 0, "and nobody asked to be told");
+    assert!(!probe.is_high());
+
+    // HSERDYIE is bit 3 + 8; arm it and start the PLL instead.
+    poke(&rcc, CIR, 1 << (4 + 8));
+    poke(&rcc, CR, CR_HSION | CR_HSEON | CR_PLLON);
+    tick(&rcc, DELAY);
+    assert_eq!(peek(&rcc, CR) & CR_PLLRDY, CR_PLLRDY);
+    assert_eq!(peek(&rcc, CIR) & 0xff, 1 << 4, "PLLRDYF, and only it");
+    assert!(probe.is_high(), "and the line is up");
+}
+
+#[test]
+fn a_cir_flag_is_cleared_by_the_bit_sixteen_places_above_it() {
+    let rcc = f4();
+    let (_wire, source, probe) = probe();
+    Device::connect(&rcc, IRQ_PIN, source).expect("`irq`");
+    poke(&rcc, CIR, 1 << (4 + 8));
+    poke(&rcc, CR, CR_HSION | CR_PLLON);
+    tick(&rcc, DELAY);
+    assert!(probe.is_high());
+
+    // A write of one to PLLRDYC (bit 20) clears PLLRDYF (bit 4); the flags
+    // themselves are read-only, so writing one there does nothing at all.
+    poke(&rcc, CIR, (1 << (4 + 8)) | (1 << 4));
+    assert_eq!(
+        peek(&rcc, CIR) & 0xff,
+        1 << 4,
+        "a flag is not guest-writable"
+    );
+    assert!(probe.is_high());
+
+    poke(&rcc, CIR, (1 << (4 + 8)) | (1 << (4 + 16)));
+    assert_eq!(peek(&rcc, CIR) & 0xff, 0, "cleared");
+    assert_eq!(
+        peek(&rcc, CIR),
+        1 << (4 + 8),
+        "and the clear bit reads zero"
+    );
+    assert!(!probe.is_high(), "so the line goes down");
+}
+
+#[test]
+fn the_l4_splits_the_same_logic_into_three_registers() {
+    // RM0351 §6.4.5–§6.4.7: `CIER` at 0x18, `CIFR` at 0x1c (read-only) and
+    // `CICR` at 0x20 (write one to clear, reads zero). The bit positions are
+    // the L4's own — `MSIRDYF` is bit 2 and `PLLRDYF` is bit 5, not the F4's 4.
+    const CIER: u64 = 0x18;
+    const CIFR: u64 = 0x1c;
+    const CICR: u64 = 0x20;
+    let rcc = l4();
+    let (_wire, source, probe) = probe();
+    Device::connect(&rcc, IRQ_PIN, source).expect("`irq`");
+
+    poke(&rcc, CIER, 1 << 5);
+    poke(&rcc, CR, (1 << 0) | (1 << 24));
+    tick(&rcc, DELAY);
+    assert_eq!(peek(&rcc, CIFR), 1 << 5, "PLLRDYF");
+    assert!(probe.is_high());
+
+    poke(&rcc, CIFR, 0);
+    assert_eq!(peek(&rcc, CIFR), 1 << 5, "`CIFR` is read-only");
+    poke(&rcc, CICR, 1 << 5);
+    assert_eq!(peek(&rcc, CIFR), 0);
+    assert_eq!(peek(&rcc, CICR), 0, "`CICR` holds nothing of its own");
+    assert!(!probe.is_high());
 }
 
 // ---------------------------------------------------------------------------

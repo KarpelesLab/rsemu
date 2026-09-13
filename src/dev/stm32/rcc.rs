@@ -15,7 +15,8 @@
 //! | ready bits | each `xxxON` produces its `xxxRDY` after `ready-delay` ticks of this device's own clock domain, and drops it the moment `xxxON` clears |
 //! | the switch | `CFGR.SW` is refused outright when the source it names is not ready; when it is accepted, `SWS` follows one tick later |
 //! | the tree | `SYSCLK`, `HCLK`, `PCLK1`, `PCLK2`, the timer clocks and `RTCCLK` are computed as **exact rationals** from the PLL factors and the prescalers, and published through [`Clocks`] |
-//! | gating | every `xxENR` and `xxRSTR` bit is an output pin, so a peripheral is told it has no clock and is told when its reset line is pulled |
+//! | gating | every `xxENR` and `xxRSTR` bit is an output pin, and [`gate`](super::gate) is the input a peripheral receives it on |
+//! | interrupts | a ready bit coming true with its `xxRDYIE` set raises `CIR`/`CIFR`'s flag and the `irq` output, which an F4 board wires to NVIC position 5 |
 //! | the backup domain | `BDCR` is write-protected until `PWR_CR.DBP` arrives on the `dbp` input, and `BDRST` clears the domain |
 //! | reset causes | `CSR`'s `xxRSTF` flags are set by a pulse on the matching input pin and cleared by `RMVF` |
 //!
@@ -84,9 +85,15 @@
 //!   "every implemented peripheral enabled" constants. Those constants were
 //!   not to hand to check, and a number transcribed from memory is worse than
 //!   a stated gap. Nothing in a startup path reads them.
-//! * `CIR` (F4) and `CIER`/`CIFR`/`CICR` (L4) are storage: no RCC interrupt is
-//!   raised, because nothing generates a clock-security or ready event other
-//!   than the ready bits themselves and no firmware in the tree asks for one.
+//! * **The clock security system raises nothing.** `CSSON` is stored, and a
+//!   failing HSE — the event that sets `CSSF` and takes the NMI — is not
+//!   modelled, so that one flag of `CIR`/`CIFR` is the only one no path sets.
+//!   The eight ready flags and the `irq` output are live.
+//! * The interrupt line follows *flag AND enable* rather than the flag alone.
+//!   A flag can only be set while its enable stands (ST's own wording, quoted
+//!   at `Interrupts::raise`), so the two agree except for firmware that clears
+//!   `xxRDYIE` and leaves the flag standing; there the model drops the request
+//!   a tick early, which no driver can tell from having serviced it.
 //! * `SSCGR`, `PLLI2SCFGR`, `PLLSAICFGR`, `DCKCFGR`, `CCIPR`, `CCIPR2` and
 //!   `CRRCR` read back and select nothing: their outputs have no consumer yet.
 
@@ -146,6 +153,9 @@ pub const RTCEN_PIN: &str = "rtcen";
 
 /// The name of the backup-domain reset output (`BDCR.BDRST`).
 pub const BDRST_PIN: &str = "bdrst";
+
+/// The name of the clock-interrupt output — position 5 on an F4's NVIC.
+pub const IRQ_PIN: &str = "irq";
 
 /// How wide a gate bank is. Every `xxENR`/`xxRSTR` is one bit per peripheral.
 pub const BANK_WIDTH: u32 = 32;
@@ -381,8 +391,121 @@ struct ReadyBit {
     on: u32,
     /// The `xxxRDY` bit the hardware answers with.
     rdy: u32,
+    /// This source's bit in the interrupt flag register — `CIR` on an F4,
+    /// `CIFR` on an L4. The enable and the clear live at the same position in
+    /// their own words, which is what makes one number enough.
+    flag: u32,
     /// Which source it starts.
     osc: Osc,
+}
+
+/// Where a layout keeps its clock-interrupt flags, enables and clears.
+///
+/// The two families draw the same logic differently: an F4 packs all three
+/// into one register at three offsets from the flag's own bit, and an L4 gives
+/// each its own word. The *bit positions* are a per-family table either way,
+/// which is what [`ReadyBit::flag`] carries.
+#[derive(Debug, Clone, Copy)]
+enum Interrupts {
+    /// `RCC_CIR` (RM0090 §7.3.5): flags in `[7:0]`, enables in `[14:8]`,
+    /// write-one-to-clear in `[23:16]`.
+    One { cir: u64 },
+    /// `RCC_CIER`/`CIFR`/`CICR` (RM0351 §6.4.5–§6.4.7): the same bit in three
+    /// registers, the flag word read-only and the clear word write-one.
+    Three { cier: u64, cifr: u64, cicr: u64 },
+}
+
+/// How far above a flag its enable sits in an F4's `CIR`.
+const F4_IE_SHIFT: u32 = 8;
+
+/// How far above a flag its write-one-to-clear bit sits in an F4's `CIR`.
+const F4_CLEAR_SHIFT: u32 = 16;
+
+/// The flag bits an F4's `CIR` has: seven ready flags plus `CSSF` at 7.
+const F4_FLAGS: u32 = 0xff;
+
+/// The enable bits an F4's `CIR` has: one per ready flag, and none for `CSSF`
+/// — a clock security failure is an NMI, not a maskable request.
+const F4_ENABLES: u32 = 0x7f << F4_IE_SHIFT;
+
+/// The flag bits an L4's `CIFR` has: eight ready flags, `CSSF` at 8 and
+/// `LSECSSF` at 9, plus `HSI48RDYF` at 10 on a part that has an HSI48.
+const L4_FLAGS: u32 = 0x7ff;
+
+impl Interrupts {
+    /// Raise `flag`, if the guest asked to be told.
+    ///
+    /// "Set by hardware when the … clock becomes stable **and** `xxRDYIE` is
+    /// set" (RM0090 §7.3.5, RM0351 §6.4.6): the flag is not a record of the
+    /// event, it is a record of a *requested* event, which is why a firmware
+    /// that polls `CR` never sees one of these appear behind it.
+    ///
+    /// Returns whether anything moved.
+    fn raise(self, state: &mut State, flag: u32) -> bool {
+        let (enables, flags_reg, shift) = match self {
+            Interrupts::One { cir } => (state.word(cir), cir, F4_IE_SHIFT),
+            Interrupts::Three { cier, cifr, .. } => (state.word(cier), cifr, 0),
+        };
+        if enables & (1 << (flag + shift)) == 0 {
+            return false;
+        }
+        let word = state.word_mut(flags_reg);
+        let before = *word;
+        *word |= 1 << flag;
+        *word != before
+    }
+
+    /// Whether a flag and its enable are both standing.
+    fn pending(self, words: &[u32; WORDS]) -> bool {
+        match self {
+            Interrupts::One { cir } => {
+                let value = words[(cir / 4) as usize];
+                value & F4_FLAGS & (value >> F4_IE_SHIFT) != 0
+            }
+            Interrupts::Three { cier, cifr, .. } => {
+                words[(cifr / 4) as usize] & words[(cier / 4) as usize] & L4_FLAGS != 0
+            }
+        }
+    }
+
+    /// What a read of `offset` answers, or `None` if it is not one of these
+    /// registers.
+    fn read(self, state: &State, offset: u64) -> Option<u32> {
+        match self {
+            // The clear bits are write-only and read back as zero.
+            Interrupts::One { cir } if offset == cir => {
+                Some(state.word(cir) & (F4_FLAGS | F4_ENABLES))
+            }
+            Interrupts::Three { cicr, .. } if offset == cicr => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Apply a write to `offset`, and say whether it was one of these
+    /// registers.
+    fn write(self, state: &mut State, offset: u64, value: u32) -> bool {
+        match self {
+            Interrupts::One { cir } if offset == cir => {
+                // Flags are read-only, the enables are ordinary bits, and a
+                // one in `[23:16]` clears the flag below it.
+                let cleared = (value >> F4_CLEAR_SHIFT) & F4_FLAGS;
+                let kept = state.word(cir) & F4_FLAGS & !cleared;
+                *state.word_mut(cir) = kept | (value & F4_ENABLES);
+                true
+            }
+            Interrupts::Three { cifr, .. } if offset == cifr => {
+                // `CIFR` is read-only: only the hardware and `CICR` move it.
+                true
+            }
+            Interrupts::Three { cifr, cicr, .. } if offset == cicr => {
+                *state.word_mut(cifr) &= !(value & L4_FLAGS);
+                // `CICR` holds nothing of its own.
+                *state.word_mut(cicr) = 0;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// One bank of peripheral gate bits: a register and the pin prefix a machine
@@ -418,6 +541,8 @@ struct Layout {
     reset: &'static [Bank],
     /// Every `xxxON`/`xxxRDY` pair.
     ready: &'static [ReadyBit],
+    /// Where the clock-interrupt flags, enables and clears live.
+    interrupts: Interrupts,
     /// Reset values, as `(offset, value)`. Everything unnamed resets to zero.
     reset_values: &'static [(u64, u32)],
 }
@@ -496,18 +621,21 @@ static F4_READY: &[ReadyBit] = &[
         reg: 0x00,
         on: 0,
         rdy: 1,
+        flag: 2,
         osc: Osc::Hsi,
     },
     ReadyBit {
         reg: 0x00,
         on: 16,
         rdy: 17,
+        flag: 3,
         osc: Osc::Hse,
     },
     ReadyBit {
         reg: 0x00,
         on: 24,
         rdy: 25,
+        flag: 4,
         osc: Osc::Pll,
     },
     // `PLLI2S`, then `PLLSAI` — the second exists only on an F42x/F43x and is
@@ -517,24 +645,28 @@ static F4_READY: &[ReadyBit] = &[
         reg: 0x00,
         on: 26,
         rdy: 27,
+        flag: 5,
         osc: Osc::Aux,
     },
     ReadyBit {
         reg: 0x00,
         on: 28,
         rdy: 29,
+        flag: 6,
         osc: Osc::Aux,
     },
     ReadyBit {
         reg: 0x70,
         on: 0,
         rdy: 1,
+        flag: 1,
         osc: Osc::Lse,
     },
     ReadyBit {
         reg: 0x74,
         on: 0,
         rdy: 1,
+        flag: 0,
         osc: Osc::Lsi,
     },
 ];
@@ -593,6 +725,7 @@ static F4: Layout = Layout {
     enable: F4_ENABLE,
     reset: F4_RESET_BANKS,
     ready: F4_READY,
+    interrupts: Interrupts::One { cir: 0x0c },
     reset_values: F4_RESET_VALUES,
 };
 
@@ -657,6 +790,7 @@ static L4_READY: &[ReadyBit] = &[
         reg: 0x00,
         on: 0,
         rdy: 1,
+        flag: 2,
         osc: Osc::Msi,
     },
     // The L4's `HSION` is bit 8 and its `HSIRDY` is bit **10**, not 9 — bit 9
@@ -665,42 +799,49 @@ static L4_READY: &[ReadyBit] = &[
         reg: 0x00,
         on: 8,
         rdy: 10,
+        flag: 3,
         osc: Osc::Hsi,
     },
     ReadyBit {
         reg: 0x00,
         on: 16,
         rdy: 17,
+        flag: 4,
         osc: Osc::Hse,
     },
     ReadyBit {
         reg: 0x00,
         on: 24,
         rdy: 25,
+        flag: 5,
         osc: Osc::Pll,
     },
     ReadyBit {
         reg: 0x00,
         on: 26,
         rdy: 27,
+        flag: 6,
         osc: Osc::Aux,
     },
     ReadyBit {
         reg: 0x00,
         on: 28,
         rdy: 29,
+        flag: 7,
         osc: Osc::Aux,
     },
     ReadyBit {
         reg: 0x90,
         on: 0,
         rdy: 1,
+        flag: 1,
         osc: Osc::Lse,
     },
     ReadyBit {
         reg: 0x94,
         on: 0,
         rdy: 1,
+        flag: 0,
         osc: Osc::Lsi,
     },
 ];
@@ -763,6 +904,11 @@ static L4: Layout = Layout {
     enable: L4_ENABLE,
     reset: L4_RESET_BANKS,
     ready: L4_READY,
+    interrupts: Interrupts::Three {
+        cier: 0x18,
+        cifr: 0x1c,
+        cicr: 0x20,
+    },
     reset_values: L4_RESET_VALUES,
 };
 
@@ -880,6 +1026,8 @@ impl State {
 const KEY_RTCEN: u32 = 0xffff_0000;
 /// The output key of the `bdrst` pin.
 const KEY_BDRST: u32 = 0xffff_0001;
+/// The output key of the `irq` pin.
+const KEY_IRQ: u32 = 0xffff_0002;
 
 /// The register block, as something an address space can dispatch to.
 struct Registers {
@@ -971,6 +1119,10 @@ impl Registers {
                 if state.ready_at[i] <= tick {
                     state.ready_at[i] = NO_DEADLINE;
                     *state.word_mut(bit.reg) |= 1 << bit.rdy;
+                    // The oscillator arriving is what raises the interrupt, so
+                    // this is the one place it can happen: a ready bit is set
+                    // by time passing and by nothing else.
+                    self.layout.interrupts.raise(&mut state, bit.flag);
                 }
             }
             if state.switch_at <= tick {
@@ -982,7 +1134,9 @@ impl Registers {
             self.republish(&state);
         }
         // Outward, after the critical section: the rates may have moved and a
-        // consumer of `Clocks` is a stranger (`CLAUDE.md`, re-entrancy).
+        // consumer of `Clocks` is a stranger (`CLAUDE.md`, re-entrancy). So may
+        // the interrupt line, which a ready bit coming true is what raises.
+        self.refresh_outputs();
         self.recompute();
     }
 
@@ -1329,6 +1483,7 @@ impl Registers {
                     let high = match *key {
                         KEY_RTCEN => bdcr & (1 << 15) != 0,
                         KEY_BDRST => bdcr & (1 << 16) != 0,
+                        KEY_IRQ => self.layout.interrupts.pending(&words),
                         key => match self.key_source(key) {
                             Some((reg, bit)) => words[(reg / 4) as usize] & (1 << bit) != 0,
                             None => false,
@@ -1366,6 +1521,9 @@ impl Registers {
 
     fn read_register(&self, offset: u64) -> u32 {
         let state = self.state.lock();
+        if let Some(value) = self.layout.interrupts.read(&state, offset) {
+            return value;
+        }
         let value = state.word(offset);
         if offset == self.layout.csr {
             // `RMVF` is "cleared by writing 1" and reads back zero.
@@ -1385,6 +1543,9 @@ impl Registers {
 
             if offset == self.layout.bdcr {
                 self.write_bdcr(&mut state, value);
+            } else if self.layout.interrupts.write(&mut state, offset, value) {
+                // One of `CIR`/`CIER`/`CIFR`/`CICR`, whose rules are neither a
+                // plain register's nor `BDCR`'s.
             } else {
                 let keep = self.read_only(offset);
                 *state.word_mut(offset) = (before & keep) | (value & !keep);
@@ -1833,11 +1994,12 @@ impl Device for Rcc {
         let key = match port {
             RTCEN_PIN => KEY_RTCEN,
             BDRST_PIN => KEY_BDRST,
+            IRQ_PIN => KEY_IRQ,
             other => parse_bank_pin(self.regs.layout, other).ok_or_else(|| Error::Config {
                 at: port.to_string(),
                 message: format!(
-                    "an `{}` RCC drives `{RTCEN_PIN}`, `{BDRST_PIN}` and bits 0…{} of each of \
-                     {}",
+                    "an `{}` RCC drives `{RTCEN_PIN}`, `{BDRST_PIN}`, `{IRQ_PIN}` and bits \
+                     0…{} of each of {}",
                     self.regs.variant.as_str(),
                     BANK_WIDTH - 1,
                     banks_of(self.regs.layout),
@@ -2058,6 +2220,7 @@ pub fn schema() -> ClassSchema {
         .region("regs")
         .port(RTCEN_PIN, PortDir::Out)
         .port(BDRST_PIN, PortDir::Out)
+        .port(IRQ_PIN, PortDir::Out)
         .port(DBP_PIN, PortDir::In);
     // The driven clock outputs, from the one table that says what they are.
     for (_, prop) in OUTPUT_TREE {
