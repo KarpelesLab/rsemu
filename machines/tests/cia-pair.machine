@@ -1,0 +1,128 @@
+# cia-pair - two MOS 8520 CIAs on a 68000, which is the arrangement an Amiga
+# has and none of the rest of an Amiga.
+#
+# It models no product and is deliberately not in the catalog: `machines/tests/`
+# is where a board that exists for one test lives, beside `two-uarts.machine`
+# and `heterogeneous.machine`. `rsemu machines` does not list it,
+# `every_shipped_machine_realizes` does not build it, and `tests/cia_board.rs`
+# runs it by path.
+#
+# ---------------------------------------------------------------------------
+# Why it exists
+# ---------------------------------------------------------------------------
+#
+# `mos.8520` is the first Amiga part in the tree, and it is first precisely
+# because it needs none of the chipset: a CIA is a bus, a clock, some pins and
+# nothing else. There is no Amiga board to put it on yet, and inventing one
+# would mean inventing an Agnus, a Denise and a Paula to go with it. So this is
+# the honest minimum that exercises the part end to end — through a real address
+# space, on a real clock, with real wires between two of them — and the Amiga's
+# own decode is written down in `src/dev/mos/cia.rs` rather than half-built
+# here.
+#
+# ---------------------------------------------------------------------------
+# What this board is NOT, and what a real Amiga board will have to do
+# ---------------------------------------------------------------------------
+#
+# The sixteen registers are mapped **consecutively** here, which is the chip's
+# own decode of RS0-RS3 and is not what an Amiga does. An Amiga board will have
+# to do two things this file does not:
+#
+#   * **Byte lanes.** CIA-A answers at $BFE001 and CIA-B at $BFD000. A 68000 has
+#     no A0 pin, so the odd address is /LDS and the even one /UDS: CIA-A sits on
+#     D0-D7, CIA-B on D8-D15, and a *word* access at $BFE000 selects both at
+#     once and must be split into one byte for each.
+#   * **A 256-byte register stride.** The four register-select lines are A8-A11,
+#     so register n of CIA-A is at $BFE001 + n * 0x100. `map` can repeat a
+#     region (`mirror()`) but cannot spread one, so that decode is a small
+#     Amiga-specific region that forwards (offset >> 8) & 0xF to the right chip
+#     on the right lane. It is a board fact, and it stays in the board.
+#
+# ---------------------------------------------------------------------------
+# The clocks
+# ---------------------------------------------------------------------------
+#
+# One 7.09379 MHz crystal - a PAL Amiga's 68000 clock, which is the 28.37516 MHz
+# master oscillator divided by four - and the CIAs run on the **E clock**, that
+# divided by ten, exactly as an Amiga's do. Both are in one oscillator tree, so
+# every ratio on this board is exact (ROADMAP.md 4.2).
+#
+# The TOD pins are **not** wired, and that is the interesting omission. On an
+# Amiga they come from the display: CIA-A's from the vertical blank and CIA-B's
+# from horizontal sync, which are two different rates and neither is the E
+# clock. There is no video here to generate either, and no combinator in
+# `core::wire` turns a clock into a pulse train, so `tests/cia_board.rs` drives
+# the pins itself through the device handle its binding captured. A board with a
+# display drives them with a wire and this file does not pretend to.
+
+machine "cia-pair" {
+  # How much ROM is at zero. The first 1 KiB of it is the exception vector
+  # table, which a 68000 fixes at address zero.
+  param rom = 4K
+
+  # Where RAM starts and how much there is.
+  param ram-base = 0x00100000
+  param ram      = 64K
+
+  # -- the crystal -----------------------------------------------------------
+  osc clk = 7093790 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # 24 bits and big-endian, both for the reason `m68k-mini.machine` gives at
+  # length: rsemu carries byte order per region, so a board that puts a 68000 on
+  # a little-endian map gets a byte-swapped world and a nonsense reset vector.
+  space mem { width = 24, endian = "big" }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.m68k" {
+    clock  = clk
+    space  = mem
+    engine = "interp"
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot, so whoever runs the machine binds the bytes and
+  # nothing below host/ opens a file. The first eight bytes of that image are
+  # the reset stack pointer and the reset PC.
+  object boot "rom" { size = rom, image = "firmware" }
+  object dram "ram" { size = ram }
+
+  # -- the two CIAs ----------------------------------------------------------
+  #
+  # `clock = clk / 10` is the E clock, and it is what the timers count. Nothing
+  # else about the two objects differs; which one is "A" and which is "B" is
+  # entirely what a board wires to them.
+  object cia_a "mos.8520" { clock = clk / 10 }
+  object cia_b "mos.8520" { clock = clk / 10 }
+
+  # -- the map ---------------------------------------------------------------
+  map mem 0x000000  size rom = boot   { endian = "big" }
+  map mem ram-base  size ram = dram   { endian = "big" }
+  map mem 0xa00000  size 16  = cia_a
+  map mem 0xa10000  size 16  = cia_b
+
+  # -- the wires -------------------------------------------------------------
+  #
+  # CIA-A's /PC into CIA-B's /FLAG. Both pins carry their true polarity - /PC
+  # idles high and pulses low for one cycle after an access to PRB, /FLAG is
+  # triggered by a negative edge - so this is the parallel-port handshake wired
+  # the way the silicon is, and it is the one place on this board where one chip
+  # can interrupt because of something the other one did.
+  wire cia_a.pc -> cia_b.flag
+
+  # One port pin of each, tied together with the pull-up both chips have on it.
+  # `pull = "up"` puts the net in resolved mode, which is what makes "an input
+  # pin presents a weak high and an output pin overrides it" mean anything.
+  wire cia_a.pa0 -> cia_b.pa1 { pull = "up" }
+
+  # CIA-A's interrupt at level 2, which is where an Amiga's lands after Paula
+  # has encoded it. `ipl0`..`ipl2` carry a priority *level* rather than three
+  # requests, so one wire on `ipl1` alone is level 2 and nothing else.
+  #
+  # CIA-B's `irq` is left unwired on purpose: on an Amiga it is level 6, and
+  # asking for that here would mean driving two of the three pins from one
+  # output, which is a priority encoder this board does not have.
+  wire cia_a.irq -> cpu.ipl1
+}
