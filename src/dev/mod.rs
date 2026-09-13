@@ -150,6 +150,10 @@ pub mod sitronix;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-ssd1306")))]
 pub mod solomon;
 
+#[cfg(feature = "dev-st25dv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-st25dv")))]
+pub mod st25dv;
+
 #[cfg(feature = "dev-sms")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
 pub mod sms;

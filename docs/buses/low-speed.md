@@ -9,6 +9,7 @@ relevant to embedded and SoC machines rather than the PC or the consoles.
 | SPI | No formal standard — Motorola's original application note plus each peripheral's datasheet | In practice the *device* datasheet is the specification: mode (CPOL/CPHA), word size, framing |
 | SPI NOR flash | Winbond **W25Q** datasheets; see [`storage.md`](storage.md) | The one SPI peripheral almost every board has, and the one whose *semantics* matter more than its framing |
 | QSPI pseudo-static RAM | AP Memory **APS6404L-3SQR** datasheet; ISSI IS66WVS2M8, Espressif ESP-PSRAM64H and Lyontek LY68L6400 share the command set | The instruction table, tCEM (8 µs of chip-select-low), the 1 KiB burst wrap and `C0h`'s toggle, and the `9Fh` identification bytes. ST **RM0432**/**RM0456**'s OCTOSPI chapter for `DCR3`'s `CSBOUND` and `MAXTRAN`, the two controller fields that exist to satisfy tCEM |
+| Dynamic NFC tag | ST **DS10925** *ST25DV04K / ST25DV16K / ST25DV64K* (DS13396 for the `-I2C`/`C` revisions); ISO/IEC 15693-3 and the NFC Forum Type 5 Tag specification for the RF framing; ST AN4910 for fast transfer mode | A dual-interface EEPROM: one array, an I²C host on two device addresses and an RF reader on a 13.56 MHz field, with a 256-byte mailbox between them. The datasheet's table numbers are the citations `src/dev/st25dv.rs` carries |
 | 1-Wire | Analog Devices / Maxim device datasheets and application notes | Timing-defined protocol; the datasheet is authoritative |
 | MDIO | IEEE 802.3 Clause 22 / 45 | For PHY management behind Ethernet MACs |
 

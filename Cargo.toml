@@ -1278,6 +1278,23 @@ bus-i2c = []
 # section. Needs `bus-i2c`.
 dev-at24c = ["bus-i2c"]
 
+# The ST ST25DV04K/16K/64K **dynamic NFC tag** (src/dev/st25dv): an EEPROM with
+# two faces. An I2C host reaches it on two device addresses -- 0x53 for user
+# memory, the dynamic registers and the 256-byte fast transfer mode mailbox,
+# 0x57 for the system configuration area -- and an ISO/IEC 15693 reader reaches
+# the same array over a 13.56 MHz field. The I2C half is byte and sequential
+# write with every inhibition rule of DS10925 6.4, the per-page internal write
+# cycle that makes acknowledge polling work, sequential read with no roll-over
+# anywhere, and the present-password command that opens an I2C security
+# session. The RF half is a **host door** (`st25dv::rf`): a reader is host input
+# crossing into a deterministic machine, so it is registered in `core::hosts`
+# like a joypad and a recorded session replays to the same state hash. Also the
+# GPO pin with IT_TIME pulses, field detect, the energy-harvesting flags, the
+# mailbox watchdog, and the four password-protected memory areas. Written from
+# ST DS10925 Rev 9 plus ISO/IEC 15693-3, cited by table and section. Needs
+# `bus-i2c`.
+dev-st25dv = ["bus-i2c"]
+
 # The STM32 I2C peripheral, **v1** -- the F1/F2/F4/L1 block with
 # CR1/CR2/OAR1/DR/SR1/SR2/CCR, not the completely different F0/F3/F7/H7 one with
 # TIMINGR and ISR/ICR. Master mode: the event sequence of RM0090 25.3.3 with its
