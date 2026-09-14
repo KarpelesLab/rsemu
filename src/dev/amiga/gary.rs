@@ -87,6 +87,42 @@
 //! retopology of the board's map is not seen through the overlay and no foreign
 //! space's read guard is held inside an MMIO handler.
 //!
+//! # A ROM smaller than the window: a 256 KiB Kickstart
+//!
+//! Kickstart 1.x is 256 KiB; the window at zero is as big as chip RAM, 512 KiB
+//! on a stock A500. The ROM **repeats** through it, every 256 KiB, and the
+//! documents say so from three directions:
+//!
+//! * **The select decodes a 512 KiB window.** The A2000's PAL listing — the
+//!   logic Gary replaced (*A500/A2000 Technical Reference Manual*, Commodore,
+//!   §7.3, `/ROME`) — enables the ROM for a read at `$F8_0000`–`$FF_FFFF`, and
+//!   at `$00_0000`–`$07_FFFF` while `OVL` is high: `A19`–`A23` and nothing
+//!   below them.
+//! * **The ROM socket carries `A1`–`A18`, and a 256 KiB part decodes 17 of
+//!   them.** A500 schematic #312511-03 rev. 6A/7, sheet 3: `U6`, a "62402", has
+//!   `A0`–`A16` on the processor's `A1`–`A17`, the processor's `A18` on pin 1
+//!   (`A17`), `/CS` grounded and `/OE` on Gary's `_ROMEN`. Rev. 5 (#312511-02,
+//!   sheet 3) fits an HN62402 "128K × 16 ROM" in the same place. A part with
+//!   one address pin fewer ignores `A18`, so it answers in both halves of the
+//!   window its select decodes.
+//! * **It could not be otherwise and boot.** Kickstart 1.x is built to run at
+//!   `$FC_0000` — Appendix D's "256K System ROM" — where `A18` is high; the
+//!   processor's first two fetches are at `$00_0000` and `$00_0004`, where it
+//!   is low. A ROM that decoded `A18` would be absent from one or the other.
+//!
+//! So the ROM side of the overlay is the ROM **mirrored across the first
+//! 512 KiB** ([`ROM_WINDOW`]), and a 512 KiB ROM mirrored once is itself.
+//! Past `ROM_WINDOW` — a 1 MiB chip-RAM board with `OVL` still up — the same
+//! PAL selects neither the ROM nor RAM (`/RE` wants `OVL` low), so that part of
+//! the window answers like any other empty address: the private space floats
+//! (the HRM's own words for the reset state, p. 223: "On other models, no RAM
+//! responds").
+//!
+//! The board's own ROM mapping has the same shape, which is the machine file's
+//! business and not this decoder's: `map mem 0xF80000 size 512K = mirror(kick)`
+//! puts a 256 KiB part at both `$F8_0000` and `$FC_0000`, exactly as `_ROMEN`
+//! does.
+//!
 //! # What is *not* modelled
 //!
 //! Gary does a great deal more than this — bus arbitration between the
@@ -97,9 +133,11 @@
 //! # Sources
 //!
 //! *Amiga Hardware Reference Manual*, Commodore-Amiga Inc., 3rd edition,
-//! Appendix D ("System Memory Maps") for the map; the M68000 User's Manual for
-//! the reset sequence. No emulator source of any licence was consulted
-//! (`ROADMAP.md` §1).
+//! Appendix D ("System Memory Maps") for the map and p. 223 for the reset
+//! state; the M68000 User's Manual for the reset sequence; the *A500/A2000
+//! Technical Reference Manual* §7.3 and A500 schematics #312511-02 and
+//! #312511-03 for how a 256 KiB ROM sits in the window. No emulator source of
+//! any licence was consulted (`ROADMAP.md` §1).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -111,6 +149,7 @@ use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region, RegionRef,
+    UnassignedPolicy,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, Ordering};
@@ -129,6 +168,11 @@ pub const OVL_PIN: &str = "ovl";
 
 /// The name of the region a `map` statement places at address zero.
 pub const OVERLAY_REGION: &str = "overlay";
+
+/// How much of the window the ROM's select covers: `$00_0000`–`$07_FFFF`, the
+/// `A19`–`A23` decode of the A2000 PAL's `/ROME` term. A smaller ROM repeats
+/// through it; see the module documentation.
+pub const ROM_WINDOW: u64 = 512 * 1024;
 
 // ---------------------------------------------------------------------------
 // the decoder
@@ -303,26 +347,56 @@ impl Gary {
     /// Public so a test or an embedder that builds a machine by hand can do
     /// what `bind` does from a machine file.
     ///
+    /// Chip RAM is mapped as it is. The ROM is repeated through the first
+    /// [`ROM_WINDOW`] bytes of the window, because a part with fewer address
+    /// pins than the socket ignores the top ones; anything of the window past
+    /// that floats while `OVL` is up.
+    ///
     /// # Errors
     ///
-    /// If the region is shorter than the window, which would leave part of
-    /// address zero decoding nothing.
+    /// If chip RAM is shorter than the window, which would leave part of
+    /// address zero decoding nothing once `OVL` drops; or if the ROM is empty,
+    /// larger than [`ROM_WINDOW`], or a size that does not repeat evenly
+    /// through it — a part ignoring its top address lines repeats at a power of
+    /// two.
     pub fn attach(&self, which: Side, region: &RegionRef, bits: u32) -> Result<()> {
-        if region.len() < self.overlay.len {
-            return Err(Error::Config {
-                at: String::from(CLASS_NAME),
-                message: format!(
-                    "the overlay decodes {:#x} bytes and its {} source holds only {:#x}",
-                    self.overlay.len,
-                    which.name(),
-                    region.len()
-                ),
-            });
-        }
-        let space = AddressSpace::new(format!("{CLASS_NAME}.{}", which.name()), bits);
-        {
-            let mut topo = space.topology();
-            topo.map(Arc::clone(region), 0)?;
+        let refuse = |why: String| Error::Config {
+            at: String::from(CLASS_NAME),
+            message: why,
+        };
+        let space = AddressSpace::new(format!("{CLASS_NAME}.{}", which.name()), bits)
+            .with_unassigned(UnassignedPolicy::OPEN_BUS);
+        match which {
+            Side::Ram => {
+                if region.len() < self.overlay.len {
+                    return Err(refuse(format!(
+                        "the overlay decodes {:#x} bytes and its ram source holds only {:#x}",
+                        self.overlay.len,
+                        region.len()
+                    )));
+                }
+                space.topology().map(Arc::clone(region), 0)?;
+            }
+            Side::Rom => {
+                let len = region.len();
+                if len == 0 || len > ROM_WINDOW || !ROM_WINDOW.is_multiple_of(len) {
+                    return Err(refuse(format!(
+                        "a {len:#x}-byte rom cannot repeat evenly through the {ROM_WINDOW:#x} \
+                         bytes its select decodes"
+                    )));
+                }
+                let span = self.overlay.len.min(ROM_WINDOW);
+                if len >= span {
+                    space.topology().map(Arc::clone(region), 0)?;
+                } else {
+                    let mirror = Region::mirror(
+                        format!("{CLASS_NAME}.rom-mirror"),
+                        Arc::clone(region),
+                        span,
+                    )?;
+                    space.topology().map(Arc::new(mirror), 0)?;
+                }
+            }
         }
         let slot = match which {
             Side::Rom => &self.overlay.rom,
@@ -587,10 +661,94 @@ mod tests {
     }
 
     #[test]
-    fn a_source_shorter_than_the_window_is_refused() {
+    fn a_ram_shorter_than_the_window_is_refused() {
         let g = Gary::new(&props()).unwrap();
         let short: RegionRef = Arc::new(Region::ram("short", Arc::new(RamStore::new(SIZE - 1))));
         assert!(g.attach(Side::Ram, &short, 24).is_err());
+    }
+
+    /// A ROM of `len` bytes whose every longword is its own offset, so a read
+    /// says which ROM byte answered.
+    fn numbered_rom(len: u64) -> RegionRef {
+        let mut image = vec![0u8; len as usize];
+        for (i, chunk) in image.chunks_mut(4).enumerate() {
+            chunk.copy_from_slice(&((i * 4) as u32).to_be_bytes());
+        }
+        Arc::new(Region::rom(
+            "kick",
+            Arc::new(RomStore::new(image)),
+            RomWrite::Ignore,
+        ))
+    }
+
+    fn sized(size: u64) -> Gary {
+        Gary::new(&props().with("size", Value::Size(size))).unwrap()
+    }
+
+    #[test]
+    fn a_256k_rom_repeats_through_a_512k_window() {
+        // Kickstart 1.x on a stock A500: the build that used to fail.
+        const K: u64 = 1024;
+        let g = sized(512 * K);
+        g.attach(Side::Rom, &numbered_rom(256 * K), 24).unwrap();
+        let ram: RegionRef = Arc::new(Region::ram("chipram", Arc::new(RamStore::new(512 * K))));
+        g.attach(Side::Ram, &ram, 24).unwrap();
+
+        assert_eq!(peek(&g, 0x00_0004), 4u32.to_be_bytes(), "the reset PC");
+        assert_eq!(
+            peek(&g, 0x04_0004),
+            4u32.to_be_bytes(),
+            "A18 is not decoded by a 256 KiB part: the same byte at $040004"
+        );
+        assert_eq!(
+            peek(&g, 0x07_fffc),
+            0x3_fffcu32.to_be_bytes(),
+            "the last word"
+        );
+        // And a longword read straddling the two copies wraps, as the pins do.
+        let mut pair = [0u8; 8];
+        g.overlay
+            .read(0x03_fffc, &mut pair, MemAttrs::DEFAULT)
+            .unwrap();
+        assert_eq!(pair, [0, 3, 0xff, 0xfc, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_512k_rom_fills_the_window_once() {
+        const K: u64 = 1024;
+        let g = sized(512 * K);
+        g.attach(Side::Rom, &numbered_rom(512 * K), 24).unwrap();
+        assert_eq!(peek(&g, 0x04_0004), 0x4_0004u32.to_be_bytes());
+    }
+
+    #[test]
+    fn past_the_rom_select_a_1m_window_floats_while_overlaid() {
+        // A 1 MiB chip-RAM board: the ROM's select stops at $07FFFF, and RAM is
+        // not selected until `OVL` drops.
+        const K: u64 = 1024;
+        let g = sized(1024 * K);
+        g.attach(Side::Rom, &numbered_rom(512 * K), 24).unwrap();
+        let ram: RegionRef = Arc::new(Region::ram("chipram", Arc::new(RamStore::new(1024 * K))));
+        g.attach(Side::Ram, &ram, 24).unwrap();
+        assert_eq!(peek(&g, 0x07_fffc), 0x7_fffcu32.to_be_bytes());
+        assert_eq!(peek(&g, 0x08_0000), [0; 4], "nothing drives the bus");
+        g.overlay
+            .write(0x08_0000, &[1, 2, 3, 4], MemAttrs::DEFAULT)
+            .unwrap();
+        drive(&g, Level::Low);
+        assert_eq!(
+            peek(&g, 0x08_0000),
+            [0; 4],
+            "and a store there reached no RAM"
+        );
+    }
+
+    #[test]
+    fn a_rom_that_cannot_repeat_evenly_is_refused() {
+        const K: u64 = 1024;
+        let g = sized(512 * K);
+        assert!(g.attach(Side::Rom, &numbered_rom(300 * K), 24).is_err());
+        assert!(g.attach(Side::Rom, &numbered_rom(1024 * K), 24).is_err());
     }
 
     #[test]
