@@ -400,8 +400,13 @@ fn the_seam_holds_the_copper_to_copcon() {
     b.store(0x5000, &[BLTCON0, 0x09f0, COPCON, 0x0002, 0xffff, 0xfffe]);
     b.start_copper(0x5000);
     b.run(100);
-    assert_eq!(b.custom.bus().refused_copper_writes(), 2);
+    assert_eq!(
+        b.custom.bus().refused_copper_writes(),
+        1,
+        "BLTCON0 refused, and the copper stopped there: COPCON was never tried"
+    );
     assert_eq!(b.agnus.shared.state.lock().blitter.con0, 0);
+    assert_eq!(b.agnus.shared.state.lock().copper.phase, Phase::Halted);
 
     b.poke(COPCON, CDANG);
     b.poke(COPJMP1, 0);
@@ -413,9 +418,41 @@ fn the_seam_holds_the_copper_to_copcon() {
     );
     assert_eq!(
         b.custom.bus().refused_copper_writes(),
-        3,
+        2,
         "COPCON still refused"
     );
+    assert_eq!(b.agnus.shared.state.lock().copper.phase, Phase::Halted);
+}
+
+#[test]
+fn a_halted_copper_writes_nothing_more_until_the_next_field_restarts_it() {
+    // The shape of the list Kickstart 1.3 and AROS hand the copper before
+    // their first screen: a pointer's high word, `$0000`, read as a MOVE to
+    // `$000`, followed by words that would be writes to real registers.
+    let b = Board::pal();
+    b.store(0x5000, &[0x0000, 0x1d16, COLOR00, 0x0bad, 0xffff, 0xfffe]);
+    b.start_copper(0x5000);
+    b.run(100);
+    assert!(
+        b.seen().is_empty(),
+        "nothing after the refused MOVE: {:?}",
+        b.seen()
+    );
+    assert_eq!(b.agnus.shared.state.lock().copper.phase, Phase::Halted);
+
+    // A field later the copper restarts at COP1LC — the same list — and halts
+    // again at the same place, so COLOR00 is never written.
+    b.run(u64::from(227u16) * 313 + 100);
+    assert!(b.seen().is_empty());
+
+    // A list that starts properly runs once the location register says so.
+    b.store(0x6000, &[COLOR00, 0x0123, 0xffff, 0xfffe]);
+    b.poke(COP1LCH, 0);
+    b.poke(COP1LCL, 0x6000);
+    b.poke(COPJMP1, 0);
+    b.run(100);
+    let writes: Vec<(u16, u16)> = b.seen().iter().map(|s| (s.0, s.1)).collect();
+    assert_eq!(writes, vec![(COLOR00, 0x0123)]);
 }
 
 #[test]

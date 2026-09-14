@@ -434,7 +434,8 @@ impl State {
                     _ => 1,
                 };
                 horizon = horizon.min(self.copper_cycles_ahead(std, cycles));
-            } else if !(copper.waits_for_blitter() && self.blitter.busy)
+            } else if copper.waiting()
+                && !(copper.waits_for_blitter() && self.blitter.busy)
                 && let Some(t) =
                     copper::ticks_until_reached(copper.ir1, copper.ir2, &self.beam, std)
             {
@@ -523,10 +524,14 @@ impl State {
             if let Some(Move { offset, value }) =
                 self.copper.cycle(|addr| mem.read(addr), &self.beam, busy)
             {
+                let danger = self.copcon & CDANG != 0;
+                // The bus still sees and counts the refused write; the copper
+                // stops behind it (`copper`'s module documentation).
+                self.copper.halt_if_refused(offset, danger);
                 self.outbox.push(Outward::Write {
                     offset,
                     value,
-                    from: Origin::copper(self.copcon & CDANG != 0),
+                    from: Origin::copper(danger),
                 });
             }
         }

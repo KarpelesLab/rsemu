@@ -62,11 +62,30 @@
 //! or `COPJMP2` reloads the program counter at once and abandons whatever the
 //! copper was doing.
 //!
+//! # A `MOVE` to a register the copper may not write halts it
+//!
+//! The manual gives the ranges — "Those it cannot affect at all are numbered
+//! $00 to $3E inclusive ... from $40 to $7E, are protected by" `CDANG`
+//! (chapter 2, *Control Register*) — and says the protection is there so "a
+//! runaway Copper (caused by a poorly formed instruction list)" cannot reach
+//! the blitter. It does not say what the copper does next. **This is
+//! inference from firmware, not from a manual:** it stops, and stays stopped
+//! until `COPJMP1`, `COPJMP2` or the next field restarts it.
+//!
+//! The evidence is two unrelated ROMs that boot on real machines and cannot
+//! have if it carried on. Kickstart 1.3's intuition loads its first `View`
+//! before any screen exists, so `LoadView` copies `LOFCprList->start` out of a
+//! null pointer — the longword at address 4, which is `ExecBase` — into
+//! `COP2LC`, and `copinit`'s `COPJMP2` sends the copper into exec's library
+//! base. AROS's graphics leaves `COP2LC` at zero and the copper runs the
+//! exception vectors. Both "lists" open with `$0000 xxxx`, a `MOVE` to `$000`.
+//! A copper that carried on from there went on to write `INTENA` with bits the
+//! system needs cleared, and each ROM stopped for good waiting for an
+//! interrupt that could no longer come; one that halts on the first word does
+//! nothing at all, which is what the real machines evidently do.
+//!
 //! # Not modelled
 //!
-//! * **What a refused `MOVE` does to the copper.** The bus refuses and counts
-//!   it; the copper carries on with the next instruction. Nothing in the manual
-//!   says it stops.
 //! * **The `COPINS` dummy address.** The manual says the copper "generates"
 //!   it on each instruction fetch. It is on the chip's internal register bus
 //!   and has no effect anyone can see.
@@ -82,6 +101,9 @@ pub enum Phase {
     Fetch2,
     /// A `WAIT` is holding; each cycle tests the comparison.
     Wait,
+    /// A `MOVE` hit a register the copper may not write; nothing happens until
+    /// a restart. See the module documentation.
+    Halted,
 }
 
 impl Phase {
@@ -92,6 +114,7 @@ impl Phase {
             Phase::Fetch1 => 0,
             Phase::Fetch2 => 1,
             Phase::Wait => 2,
+            Phase::Halted => 3,
         }
     }
 
@@ -102,6 +125,7 @@ impl Phase {
             0 => Some(Phase::Fetch1),
             1 => Some(Phase::Fetch2),
             2 => Some(Phase::Wait),
+            3 => Some(Phase::Halted),
             _ => None,
         }
     }
@@ -201,14 +225,34 @@ impl Copper {
                 }
                 None
             }
+            Phase::Halted => None,
         }
+    }
+
+    /// Stop until the next restart, because the `MOVE` just returned was to a
+    /// register the copper may not write with `danger` in the state it is in.
+    ///
+    /// Returns whether it stopped. The ranges are chapter 2's: `$00`–`$3E`
+    /// never, `$40`–`$7E` only with `CDANG`.
+    pub fn halt_if_refused(&mut self, offset: u16, danger: bool) -> bool {
+        let refused = offset < 0x40 || (offset < 0x80 && !danger);
+        if refused {
+            self.phase = Phase::Halted;
+        }
+        refused
     }
 
     /// Whether the next cycle will fetch or complete an instruction — work that
     /// cannot be skipped over.
     #[must_use]
     pub const fn fetching(&self) -> bool {
-        !matches!(self.phase, Phase::Wait)
+        matches!(self.phase, Phase::Fetch1 | Phase::Fetch2)
+    }
+
+    /// Whether a `WAIT` is holding.
+    #[must_use]
+    pub const fn waiting(&self) -> bool {
+        matches!(self.phase, Phase::Wait)
     }
 
     /// Whether a held `WAIT` needs the blitter to finish as well as the beam.
@@ -322,10 +366,10 @@ mod tests {
 
     #[test]
     fn a_phase_survives_its_snapshot_code_and_a_bad_code_does_not() {
-        for phase in [Phase::Fetch1, Phase::Fetch2, Phase::Wait] {
+        for phase in [Phase::Fetch1, Phase::Fetch2, Phase::Wait, Phase::Halted] {
             assert_eq!(Phase::from_code(phase.code()), Some(phase));
         }
-        assert_eq!(Phase::from_code(3), None);
+        assert_eq!(Phase::from_code(4), None);
     }
 
     #[test]
