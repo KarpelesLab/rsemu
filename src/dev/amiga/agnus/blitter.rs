@@ -64,7 +64,10 @@
 //! * The pixel is `BLTADAT` shifted right by `ASH` — the manual has `BLTADAT`
 //!   preloaded with `$8000` and `ASH` holding the x coordinate within the word.
 //!   A horizontal step moves `ASH`, carrying into the C and D pointers by a
-//!   word; a vertical step adds or subtracts `BLTCMOD` and `BLTDMOD`.
+//!   word; a vertical step adds or subtracts `BLTCMOD` — from **both** the C
+//!   and D pointers. **Evidence, not the manual:** Appendix A has software
+//!   preload both modulos alike, and Kickstart's own line routine loads only
+//!   `BLTCMOD`; see `step_vertical`.
 //! * The texture bit is bit `BSH` of `BLTBDAT`, fed to the function generator
 //!   as a whole word of that bit. **Inference:** `BSH` then counts down, wrapping
 //!   from 0 to 15, so successive pixels take successive less significant bits.
@@ -502,9 +505,22 @@ impl Blitter {
         }
     }
 
+    /// A row up or down: both pointers move by **`BLTCMOD`**.
+    ///
+    /// Appendix A says to preload `BLTCMOD` and `BLTDMOD` alike with the
+    /// plane's width, so a program that follows it cannot tell which of the
+    /// two the D pointer steps by. Commodore's own graphics library can: the
+    /// line-drawing path in Kickstart 3.1 (and in 1.3 and 2.04, which draw
+    /// their insert-disk pictures with it) loads `BLTCMOD`, `BLTCPT` and
+    /// `BLTDPT` for every line and never `BLTDMOD`, straight after an area
+    /// fill that left `BLTDMOD` at `-4`. Stepping D by `BLTDMOD` walked each
+    /// such line up through the allocation header in front of its work
+    /// buffer, and exec's `FreeMem` then stopped the machine with
+    /// `AN_MemCorrupt` (`$81000005`). On the machine those ROMs shipped for,
+    /// D's rows are C's rows — which is what this does.
     fn step_vertical(&mut self, up: bool) {
+        let modulo = i32::from(self.modulo[C] as i16) as u32;
         for channel in [C, D] {
-            let modulo = i32::from(self.modulo[channel] as i16) as u32;
             self.ptr[channel] = if up {
                 self.ptr[channel].wrapping_sub(modulo)
             } else {
@@ -779,6 +795,38 @@ mod tests {
         b.start_bltsize((((dx + 1) as u16) << 6) | 2);
         b.run_to_completion(ram);
         b
+    }
+
+    #[test]
+    fn a_line_steps_its_destination_by_bltcmod_whatever_bltdmod_holds() {
+        // The register state Kickstart 3.1 leaves behind: an area fill set
+        // `BLTDMOD` to -4, and the line that follows loads `BLTCMOD` only. A
+        // vertical line of eight pixels down a 2-byte-wide plane starting at
+        // $100 must stay in $100..$10E and never touch the words above it.
+        let mut ram = Ram::default();
+        let mut b = Blitter::new();
+        b.data[A] = 0x8000;
+        b.data[B] = 0xffff;
+        b.afwm = 0xffff;
+        b.alwm = 0xffff;
+        b.modulo[A] = (-28i16) as u16; // 4 * (dy - dx), dy = 0, dx = 7
+        b.modulo[B] = 0;
+        b.modulo[C] = 2;
+        b.modulo[D] = (-4i16) as u16; // left over from the fill
+        b.ptr[A] = (-14i16) as u16 as u32; // 4 * dy - 2 * dx
+        b.ptr[C] = 0x100;
+        b.ptr[D] = 0x100;
+        b.con0 = USEA | USEC | USED | 0xca;
+        b.con1 = LINE | SIGN; // octant 6: y major, down
+        b.start_bltsize((8 << 6) | 2);
+        b.run_to_completion(&mut ram);
+        assert!(
+            ram.writes.iter().all(|&a| (0x100..0x110).contains(&a)),
+            "every dot in the line's own rows: {:x?}",
+            ram.writes
+        );
+        assert_eq!(ram.writes.len(), 8);
+        assert_eq!(b.ptr[C], b.ptr[D], "D walked with C");
     }
 
     fn pixel(ram: &Ram, x: u32, y: u32) -> bool {
