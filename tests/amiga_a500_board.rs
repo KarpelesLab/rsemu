@@ -287,11 +287,29 @@ fn the_custom_space_decodes_words_and_refuses_everything_else() {
     assert_eq!(peek_word(&m, JOY0DAT), 0x0000);
     assert_eq!(peek_word(&m, DMACONR), 0x0000);
 
-    // The appendix's registers are words. A byte access has no documented
-    // meaning, so it is refused rather than guessed at.
-    assert!(
-        space.read(COLOR00, Width::U8, MemAttrs::DEFAULT).is_err(),
-        "a byte read of a custom register should be refused"
+    // The appendix's registers are words, and a byte access is the word access
+    // the chips see (`src/dev/amiga/custom.rs` has the sources): a read keeps
+    // the half its strobe selects, and a write drives the byte onto both halves
+    // (MC68000UM Table 3-1). The `DMACONR` read above left its own word on
+    // the bus, so put a known one back first.
+    poke_word(&m, COLOR00, 0x0123);
+    assert_eq!(
+        space.read(COLOR00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x01),
+        "UDS alone: the upper half of the floating word"
+    );
+    assert_eq!(
+        space.read(COLOR00 + 1, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x23),
+        "LDS alone: the lower half"
+    );
+    space
+        .write(COLOR00 + 1, Width::U8, 0x45, MemAttrs::DEFAULT)
+        .expect("a byte write reaches the register");
+    assert_eq!(
+        peek_word(&m, COLOR00),
+        0x4545,
+        "the byte in both halves, none kept"
     );
     assert!(
         space

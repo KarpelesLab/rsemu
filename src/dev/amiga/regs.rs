@@ -61,9 +61,9 @@
 //!
 //! # Byte accesses
 //!
-//! Every entry is a word. What the chips do with a single data strobe is not
-//! in the appendix, so [`custom`](super::custom) refuses a byte access rather
-//! than inventing an answer; see its documentation.
+//! Every entry is a word, and the chips only ever see words: a byte access is
+//! turned into the word access the hardware makes by
+//! [`custom`](super::custom), whose documentation has the sources.
 
 use core::fmt;
 

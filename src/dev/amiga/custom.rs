@@ -51,7 +51,9 @@
 //!
 //! and nothing else. By the time either method is called the bus has already:
 //!
-//! * rejected a byte or odd access, and an offset past `$1FE`;
+//! * turned a byte access into the word access the chips actually see (see
+//!   *Access width* below), and rejected a word at an odd offset and an offset
+//!   past `$1FE`;
 //! * looked the offset up in the appendix's table, so `reg.name`, `reg.chip`
 //!   and `reg.access` are to hand and no chip re-derives them;
 //! * established that this chip is one of the register's owners;
@@ -70,18 +72,55 @@
 //! calls [`CustomBus::write`] with [`Origin::copper`], so the `COPCON` danger
 //! rule is enforced in one place rather than inside Agnus.
 //!
-//! # Access width
+//! # Access width, and what a byte access does
 //!
-//! Every entry in the appendix is a **word**, so the region declares exactly
-//! that: 16 bits, naturally aligned, big-endian, no bulk transfers. A byte
-//! access is refused by [`AccessConstraints`] before any handler runs.
+//! Every entry in the appendix is a word, and the region takes words. It also
+//! takes **bytes**, because a 68000 can make a byte access to any address and
+//! the A500 does nothing to stop one reaching the chips. Kickstart 2.04 makes
+//! one: a byte read of `$DFF07D`, the low half of `DENISEID`. What happens then
+//! is settled by three documents, none of which is Appendix B:
 //!
-//! That is a deliberate refusal rather than a modelling decision: what a
-//! single-byte cycle does to a word-wide custom register is not in the manual.
-//! Refusing it makes a guest that tries one fail loudly here, where the ledger
-//! can record it, instead of quietly getting a value somebody guessed. A later
-//! round with a better source than the appendix should replace the refusal,
-//! not work around it.
+//! * **The chips never see a data strobe.** Denise and Paula have no `UDS`,
+//!   `LDS` or even `R/W` pin: their register interface is `D15`–`D0` and
+//!   `RGA8`–`RGA1` and nothing else (*Amiga Hardware Reference Manual*, 3rd
+//!   ed., Appendix J, "Custom Chip Pin Allocation List"). Agnus has `UDS*` and
+//!   `LDS*`, and its own pin description says each "is enabled only during a
+//!   processor DRAM access", where it picks `CASU*` or `CASL*`; a register
+//!   access is `AS*` and `RGEN*` with `A1`–`A8` (*A500/A2000 Technical
+//!   Reference Manual*, Commodore, Table 6-1 and the Fat Agnus description
+//!   after it).
+//! * **The board buffers all sixteen lines on one enable.** On the A500
+//!   (schematic #312511-02, sheet 2 of 9) the processor's data bus reaches the
+//!   chip data bus through two 74LS244s — `U12` for the upper byte, `U10` for
+//!   the lower — whose output enables are both Gary's `_OEB`, and comes back
+//!   through two 74LS373s (`U13`, `U11`) that share Gary's `_OEL` and
+//!   `_LATCH`. There is no per-byte enable that could leave half the bus
+//!   undriven. The A2000's PAL listing of the same logic (Technical Reference
+//!   Manual §7.3, `/CDR` and `/CDW`) enables the chip data buffers from the
+//!   register decode alone; the strobes gate only `UCEN`/`LCEN`, the RAM's CAS.
+//! * **A byte write drives the byte onto both halves.** MC68000 User's Manual
+//!   (M68000UM/AD rev. 8), Table 3-1, *Data Strobe Control of Data Bus*: with
+//!   `R/W` low and only `LDS` asserted, `D15`–`D8` carry "Valid Data Bits
+//!   7–0" as well as `D7`–`D0`; with only `UDS`, `D7`–`D0` carry bits 15–8.
+//!   The table marks those two rows as "a result of current implementation",
+//!   and that implementation is the part an A500 carries.
+//!
+//! So:
+//!
+//! * **A byte read** is a word read of the register — with every side effect a
+//!   word read has, since the chip cannot tell the difference — and the
+//!   processor keeps the half its strobe selected (§5.1.1: it "internally
+//!   positions the byte appropriately"): the upper byte at an even address,
+//!   the lower at an odd one.
+//! * **A byte write** is a word write of the register with **the same byte in
+//!   both halves**, whichever of the two addresses it was made at.
+//!   `MOVE.B #$20,$DFF09B` stores `$2020` — not `$0020`, and not `$20` into the
+//!   low half with the high half kept. That is the dangerous half of the rule
+//!   and it is the hardware's: a register cannot keep the half nobody
+//!   addressed, because nothing tells it which half that was.
+//!
+//! A word at an odd offset, anything wider than a word, and any offset past
+//! `$1FE` are still refused.
 //!
 //! # What a read of a write-only register answers
 //!
@@ -101,9 +140,13 @@
 //!
 //! *Amiga Hardware Reference Manual*, Commodore-Amiga Inc., 3rd edition:
 //! Appendix B ("Register Summary — Address Order") for the table and its
-//! legend, Appendix D ("System Memory Maps") for the `$DFF000` base. No
-//! emulator source of any licence was consulted (`ROADMAP.md` §1); every Amiga
-//! emulator the author is aware of is GPL and is off limits.
+//! legend, Appendix D ("System Memory Maps") for the `$DFF000` base, Appendix C
+//! (p. 299) for an absent `DENISEID`, Appendix J for the chips' pins. For byte
+//! access: the *A500/A2000 Technical Reference Manual* (Commodore), Table 6-1
+//! and §7.3; A500 schematic #312511-02 rev. 5, sheet 2; MC68000 User's Manual
+//! (M68000UM/AD rev. 8), Table 3-1 and §5.1. No emulator source of any licence
+//! was consulted (`ROADMAP.md` §1); every Amiga emulator the author is aware of
+//! is GPL and is off limits.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -478,32 +521,54 @@ struct Window {
 
 impl MemOps for Window {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-        if dst.len() != 2 || offset & 1 != 0 || offset >= SPAN {
+        if offset >= SPAN {
             return Err(BusError::BadAccess);
         }
         let from = Origin::cpu().for_debug(attrs.debug);
         // Big-endian on the wire; `AccessConstraints` says so too, so the
         // dispatcher will not have reordered anything for us.
-        let value = self.bus.read(offset as u16, from);
-        dst.copy_from_slice(&value.to_be_bytes());
+        match dst.len() {
+            2 if offset & 1 == 0 => {
+                let value = self.bus.read(offset as u16, from);
+                dst.copy_from_slice(&value.to_be_bytes());
+            }
+            1 => {
+                // The chip drives the whole word — it has no strobe to tell it
+                // otherwise — and the processor keeps one half of it.
+                let word = self.bus.read(offset as u16 & !1, from).to_be_bytes();
+                dst[0] = word[(offset & 1) as usize];
+            }
+            _ => return Err(BusError::BadAccess),
+        }
         Ok(())
     }
 
     fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-        if src.len() != 2 || offset & 1 != 0 || offset >= SPAN {
+        if offset >= SPAN {
             return Err(BusError::BadAccess);
         }
         let from = Origin::cpu().for_debug(attrs.debug);
-        let value = u16::from_be_bytes([src[0], src[1]]);
-        self.bus.write(offset as u16, value, from);
+        let value = match src.len() {
+            2 if offset & 1 == 0 => u16::from_be_bytes([src[0], src[1]]),
+            // MC68000UM Table 3-1: a byte write puts the byte on both halves of
+            // the data bus, and the board passes all sixteen lines to a chip
+            // that latches all sixteen. See the module docs.
+            1 => u16::from_be_bytes([src[0], src[0]]),
+            _ => return Err(BusError::BadAccess),
+        };
+        self.bus.write(offset as u16 & !1, value, from);
         Ok(())
     }
 
     fn constraints(&self) -> AccessConstraints {
-        // Word, aligned, big-endian, no bursts. Every entry in the appendix is
-        // a word, and a byte access has no documented meaning; see the module
-        // docs.
-        AccessConstraints::word(Width::U16, Endian::Big)
+        // A byte or a word, big-endian, no bursts. Alignment is checked here
+        // rather than by the dispatcher, because a byte may land on either
+        // half of a register and a word may not.
+        AccessConstraints {
+            min: Width::U8,
+            natural_alignment: false,
+            ..AccessConstraints::word(Width::U16, Endian::Big)
+        }
     }
 }
 
@@ -839,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn the_window_takes_words_and_nothing_else() {
+    fn the_window_takes_words_and_bytes_and_nothing_wider_or_odd() {
         let c = custom();
         assert_eq!(c.region("").unwrap().len(), 0x200);
         let ops = Window {
@@ -852,14 +917,102 @@ mod tests {
         assert_eq!(word, [0x0f, 0x00], "big-endian on the wire");
 
         let mut byte = [0u8; 1];
-        assert!(ops.read(0x180, &mut byte, MemAttrs::DEFAULT).is_err());
+        assert!(ops.read(0x180, &mut byte, MemAttrs::DEFAULT).is_ok());
         assert!(ops.read(0x181, &mut word, MemAttrs::DEFAULT).is_err());
         assert!(ops.read(0x200, &mut word, MemAttrs::DEFAULT).is_err());
+        assert!(ops.read(0x200, &mut byte, MemAttrs::DEFAULT).is_err());
+        let mut long = [0u8; 4];
+        assert!(ops.read(0x180, &mut long, MemAttrs::DEFAULT).is_err());
+        assert!(ops.write(0x181, &[1, 2], MemAttrs::DEFAULT).is_err());
         let k = ops.constraints();
         assert_eq!(
-            (k.min, k.max, k.endian),
-            (Width::U16, Width::U16, Endian::Big)
+            (k.min, k.max, k.endian, k.allow_bulk),
+            (Width::U8, Width::U16, Endian::Big, false)
         );
+    }
+
+    #[test]
+    fn a_byte_read_is_a_word_read_that_keeps_the_strobed_half() {
+        let c = custom();
+        let paula = Probe::new(ChipId::PAULA, 0x1234);
+        c.bus().attach(paula.clone()).unwrap();
+        let ops = Window {
+            bus: Arc::clone(c.bus()),
+        };
+        let mut byte = [0u8; 1];
+        // `DMACONR` at $002: UDS alone (the even address) is the upper half...
+        ops.read(0x002, &mut byte, MemAttrs::DEFAULT).unwrap();
+        assert_eq!(byte, [0x12]);
+        // ...and LDS alone (the odd address) the lower.
+        ops.read(0x003, &mut byte, MemAttrs::DEFAULT).unwrap();
+        assert_eq!(byte, [0x34]);
+        // Each was a whole read of the register as far as the chip knows: it
+        // has no strobe to say which half was wanted, so a register that
+        // clears on read clears on either byte.
+        let seen = paula.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|s| s.0 == 0x002 && s.1.is_none()));
+        // And the bus carried the whole word, not just the half that was kept.
+        assert_eq!(c.bus().floating(), 0x1234);
+    }
+
+    #[test]
+    fn a_byte_write_stores_the_byte_in_both_halves_at_either_address() {
+        let c = custom();
+        let denise = Probe::new(ChipId::DENISE, 0);
+        c.bus().attach(denise.clone()).unwrap();
+        let ops = Window {
+            bus: Arc::clone(c.bus()),
+        };
+        // `COLOR00` at $180. A byte at the even address is not "the high half,
+        // low half kept", and a byte at the odd one is not "the low half, high
+        // half kept": both drive one word with the byte twice.
+        ops.write(0x180, &[0x0a], MemAttrs::DEFAULT).unwrap();
+        ops.write(0x181, &[0x05], MemAttrs::DEFAULT).unwrap();
+        let writes: Vec<(u16, Option<u16>)> = denise.seen().iter().map(|s| (s.0, s.1)).collect();
+        assert_eq!(
+            writes,
+            vec![(0x180, Some(0x0a0a)), (0x180, Some(0x0505))],
+            "MC68000UM Table 3-1: the byte on D15-D8 and D7-D0 alike"
+        );
+    }
+
+    #[test]
+    fn a_byte_read_of_an_undriven_register_is_half_of_the_floating_bus() {
+        // The access Kickstart 2.04 makes: `$DFF07D`, the low half of
+        // `DENISEID`, on a board where nothing answers it. Appendix C (p. 299):
+        // "whatever value is left over on the bus from the last cycle".
+        let c = custom();
+        let ops = Window {
+            bus: Arc::clone(c.bus()),
+        };
+        ops.write(0x180, &[0x0f, 0xc3], MemAttrs::DEFAULT).unwrap();
+        let mut byte = [0u8; 1];
+        ops.read(0x07d, &mut byte, MemAttrs::DEFAULT).unwrap();
+        assert_eq!(byte, [0xc3]);
+        ops.read(0x07c, &mut byte, MemAttrs::DEFAULT).unwrap();
+        assert_eq!(byte, [0x0f]);
+    }
+
+    #[test]
+    fn a_debugger_byte_access_disturbs_nothing() {
+        let c = custom();
+        let paula = Probe::new(ChipId::PAULA, 0x00ff);
+        c.bus().attach(paula.clone()).unwrap();
+        c.bus().write(COLOR00, 0x0555, Origin::cpu());
+        let ops = Window {
+            bus: Arc::clone(c.bus()),
+        };
+        let debug = MemAttrs {
+            debug: true,
+            ..MemAttrs::DEFAULT
+        };
+        let mut byte = [0u8; 1];
+        ops.read(0x003, &mut byte, debug).unwrap();
+        assert_eq!(byte, [0xff]);
+        ops.write(0x181, &[0x99], debug).unwrap();
+        assert_eq!(c.bus().floating(), 0x0555);
+        assert!(paula.seen().iter().all(|s| s.2.debug));
     }
 
     #[test]
