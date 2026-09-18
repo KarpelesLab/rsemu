@@ -112,8 +112,10 @@ and Paula are lazily advanced and can be a millisecond apart, so an audio DMA
 slot sometimes arrives after Paula has crossed two word boundaries. `AUDxDR` is
 one flag rather than a count, so that word is fetched once and played twice,
 and the block's length counter — which counts boundaries — restarts early. A
-steady tone therefore comes out with the right level and the right side but a
-ragged edge. Fixing it belongs with the slot timing in `agnus/slots.rs`.
+steady tone still comes out with the right level, the right side and the right
+fundamental — a 2 217 Hz square measured at 2.22 kHz — but about a fifth of its
+words are repeats, which puts energy below the fundamental. Fixing it belongs
+with the slot timing in `agnus/slots.rs`.
 
 **A drive is its own device, on the CIA ports.** `amiga.floppy` takes `MTR*`,
 `SEL*`, `SIDE*`, `DIR` and `STEP*` as wires and answers on `RDY*`, `TK0*`,

@@ -403,13 +403,15 @@ fn a_machine_with_no_sound_chip_says_so() {
 /// 3 546 895 / 1 600 = 2 217 Hz on this PAL board — at full volume and on the
 /// **left** output, channels 0 and 3 being the left pair (Chapter 5).
 ///
-/// The assertions below are about *level and side* rather than pitch, and
-/// deliberately: Agnus and Paula are both lazily advanced and can be a
-/// millisecond apart, so an audio DMA slot sometimes lands after Paula has
-/// already crossed two word boundaries — `AUDxDR` is one flag, not a count, so
-/// that word is fetched once and played twice. The stream reproduces what the
-/// chipset fed the channel, which is the property this file is for; the
-/// chipset's own handshake is `agnus`'s business.
+/// A recorded file's strongest spectral component is 2.22 kHz, which is that
+/// figure. The assertions below are nonetheless about *level and side* rather
+/// than pitch, because the tone is not clean: Agnus and Paula are both lazily
+/// advanced and can be a millisecond apart, so an audio DMA slot sometimes
+/// lands after Paula has already crossed two word boundaries — `AUDxDR` is one
+/// flag, not a count, so that word is fetched once and played twice, and the
+/// repeats put energy below the fundamental. The stream reproduces what the
+/// chipset fed the channel, which is what this file is for; the chipset's own
+/// handshake is `agnus`'s business.
 #[cfg(feature = "machine-amiga-a500")]
 fn amiga_tone_rom() -> Vec<u8> {
     const CODE: &[u16] = &[
