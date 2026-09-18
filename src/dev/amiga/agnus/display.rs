@@ -30,11 +30,11 @@
 //!   the next MSB" (chapter 3, *Setting Display Window Stopping Position*).
 //! * **Horizontally**, from `DDFSTRT` to `DDFSTOP`, both using bits H8–H3
 //!   (Appendix A), clamped to the hardware limits `$18` and `$D8` (table 3-14).
-//!   The word count is the inverse of chapter 3's "DDFSTRT = DDFSTOP − (8 ×
-//!   (word count − 1)) for low resolution" and "− (4 × (word count − 2)) for
-//!   high resolution" — twenty words for `$38`–`$D0`, forty for `$3C`–`$D4` —
-//!   less one in high resolution at the `$D8` limit, where "only one word is
-//!   fetched".
+//!   The word count is counted in **eight-count blocks** from the block
+//!   `DDFSTRT` falls in to the one `DDFSTOP` falls in, one word a block in
+//!   low resolution and two in high. That agrees with chapter 3's formulas at
+//!   the values the manual uses — twenty words for `$38`–`$D0`, forty for
+//!   `$3C`–`$D4` — and departs from them elsewhere; see below.
 //! * **Which planes**: `BPLCON0`'s `BPU` count, "000-110 (NONE through 6
 //!   inclusive)".
 //! * **The pointers** advance by two per word, and at the end of the line
@@ -45,6 +45,27 @@
 //! video chip is attached, so the guest-visible state of a board does not
 //! depend on its wiring; the words are only read when somebody will look at
 //! them.
+//!
+//! **Inference from firmware: the high-resolution word count.** Chapter 3's
+//! "DDFSTRT = DDFSTOP − (4 × (word count − 2))" for high resolution, and table
+//! 3-14's "49 words" at `$18`–`$D8` ("only one word is fetched at this limit"),
+//! were this module's rule, and two unrelated ROMs that display correctly on
+//! real machines contradict them:
+//!
+//! * Kickstart 2.04's graphics library opens the Workbench screen, 640 pixels
+//!   of high resolution from a bitmap with 80 bytes a row, with `DDFSTRT $38`,
+//!   `DDFSTOP $D8` and `BPL1MOD`/`BPL2MOD` of −4. So it counts on 84 bytes — 42
+//!   words — being fetched a line; the formula with the `$D8` exception says
+//!   41, and the desktop came out sheared a word a line.
+//! * AROS opens an interlaced 640-pixel screen with `DDFSTRT $3C`,
+//!   `DDFSTOP $D0` and modulos of 80 — so 40 words a line; the formula says 39,
+//!   and it sheared the other way.
+//!
+//! Blocks of eight counts, aligned to eight, two words each in high resolution
+//! give 42, 40, and the manual's own 40 for `$3C`–`$D4` and 20 for `$38`–`$D0`.
+//! The fetch is plausibly the low-resolution machinery with two words to a
+//! block, but that is a reading of the evidence, not a sentence in a manual,
+//! and at `$18`–`$D8` it gives 50 where table 3-14 says 49.
 //!
 //! **Inference, and the one real simplification:** every word of a line is
 //! fetched when the line ends, so a pointer or `BPLCON0` change the copper makes
@@ -147,13 +168,14 @@ impl State {
         if stop < start {
             return None;
         }
+        // Eight-count blocks, one word each in low resolution and two in high:
+        // an inference from Kickstart 2.04 and AROS, which contradicts table
+        // 3-14's "49 words"; see the module documentation.
+        let blocks = ((stop & !7) - (start & !7)) / 8 + 1;
         let words = if self.bplcon0 & HIRES != 0 {
-            // "In high resolution mode the maximum here is 49 words, because
-            // the rightmost limit remains ($D8) and only one word is fetched at
-            // this limit" (chapter 3, *Maximum Display Window Size*).
-            (stop - start) / 4 + if stop == DDF_MAX { 1 } else { 2 }
+            blocks * 2
         } else {
-            (stop - start) / 8 + 1
+            blocks
         };
         Some((start, words))
     }
@@ -316,7 +338,25 @@ mod tests {
             "clamped to $18-$D8: \"a maximum of 25 words fetched in low resolution\""
         );
         st.bplcon0 = HIRES;
-        assert_eq!(st.fetch_window(), Some((0x18, 49)), "and 49 in high");
+        assert_eq!(
+            st.fetch_window(),
+            Some((0x18, 50)),
+            "50 in high, where table 3-14 says 49: the firmware evidence wins"
+        );
+    }
+
+    #[test]
+    fn a_high_resolution_fetch_counts_eight_count_blocks_as_the_firmware_expects() {
+        let mut st = State::new();
+        st.bplcon0 = HIRES;
+        // Kickstart 2.04's Workbench screen: modulo -4 on an 80-byte row.
+        st.ddfstrt = 0x38;
+        st.ddfstop = 0xd8;
+        assert_eq!(st.fetch_window(), Some((0x38, 42)));
+        // AROS's interlaced screen: modulo 80 on an 80-byte row.
+        st.ddfstrt = 0x3c;
+        st.ddfstop = 0xd0;
+        assert_eq!(st.fetch_window(), Some((0x3c, 40)));
     }
 
     #[test]
