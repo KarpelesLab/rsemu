@@ -35,13 +35,20 @@ const AUD0LEN: u16 = 0x0a4;
 const AUD0PER: u16 = 0x0a6;
 const AUD0VOL: u16 = 0x0a8;
 const AUD0DAT: u16 = 0x0aa;
+const AUD1LEN: u16 = 0x0b4;
+const AUD1PER: u16 = 0x0b6;
 const AUD1VOL: u16 = 0x0b8;
+const AUD3LEN: u16 = 0x0d4;
+const AUD3PER: u16 = 0x0d6;
+const AUD3VOL: u16 = 0x0d8;
 
 /// `DMACON`: `SET/CLR`, `DMAEN`, `DSKEN`, `AUD0EN`.
 const DMAF_SETCLR: u16 = 0x8000;
 const DMAF_MASTER: u16 = 0x0200;
 const DMAF_DISK: u16 = 0x0010;
 const DMAF_AUD0: u16 = 0x0001;
+const DMAF_AUD1: u16 = 0x0002;
+const DMAF_AUD3: u16 = 0x0008;
 
 /// `ADKCON`: `WORDSYNC`, `FAST`, `USE0V1`.
 const ADKF_WORDSYNC: u16 = 0x0400;
@@ -729,6 +736,216 @@ fn an_attached_channel_writes_its_words_into_the_next_channels_volume() {
     rig.poke(AUD0DAT, 0x0010);
     assert_eq!(rig.paula.shared.state.lock().aud[1].vol, 0x0010);
     assert_eq!(rig.paula.audio_output(0), (0, 0), "a modulator is silent");
+}
+
+// ---------------------------------------------------------------------------
+// audio: the host stream
+// ---------------------------------------------------------------------------
+
+/// One channel at full volume: `sample × volume`, 127 × 64.
+const FULL: i16 = 127 * 64;
+
+/// Start channel `ch` on a square wave at `per` colour clocks a sample and
+/// volume `vol`.
+///
+/// The word `$7f81` is +127 then −127 — each word is two samples, the high
+/// byte first (Chapter 5) — fed once through the seam Agnus fetches
+/// into. The block is one word long and nothing feeds another, so the output
+/// buffer keeps replaying the word it has: a square wave whose period is four
+/// times `per`, which is what the chapter's period formula says.
+fn square(rig: &Rig, ch: u16, per: u16, vol: u16) {
+    let base = 0x0a0 + ch * 0x10;
+    rig.poke(base + 4, 1);
+    rig.poke(base + 6, per);
+    rig.poke(base + 8, vol);
+    rig.poke(DMACON, DMAF_SETCLR | DMAF_MASTER | (1 << ch));
+    rig.paula.port().audio_word(usize::from(ch), 0, 0x7f81);
+}
+
+#[test]
+fn a_recorded_channel_produces_the_samples_the_period_formula_predicts() {
+    let rig = Rig::new();
+    rig.paula.set_recording(true);
+    // 256 colour clocks a sample is eight frames a sample at the divisor's 32,
+    // and 3 546 895 / 256 = 13 855 samples a second on a PAL machine.
+    square(&rig, 0, 256, 64);
+    rig.paula.advance_to(256 * 17);
+    let frames = rig.paula.take_audio();
+
+    assert_eq!(frames.len(), 256 * 17 / 32, "one frame every 32 colour clocks");
+    for (i, frame) in frames.iter().enumerate() {
+        // Nothing until the first word boundary at `per`: the channel is
+        // playing but its output buffer has not been loaded yet.
+        let want = if i < 8 {
+            0
+        } else if (i - 8) / 8 % 2 == 0 {
+            FULL
+        } else {
+            -FULL
+        };
+        assert_eq!(*frame, (want, 0), "frame {i}");
+    }
+}
+
+#[test]
+fn a_boundary_inside_a_frame_is_weighted_rather_than_rounded() {
+    // Chapter 5's minimum period, "124 color clocks", is deliberately *not* a
+    // multiple of the 32 a frame covers. The
+    // sample that starts at 124 begins seven eighths of the way through the
+    // frame that runs 96..128, so that frame is 28 colour clocks of silence
+    // and 4 of +8128: 8128 × 4 / 32 = 1016, exactly, with nothing rounded to
+    // a frame edge and nothing left to the size of the step the scheduler
+    // happened to take.
+    let rig = Rig::new();
+    rig.paula.set_recording(true);
+    square(&rig, 0, 124, 64);
+    rig.paula.advance_to(128);
+    let frames = rig.paula.take_audio();
+    assert_eq!(frames.len(), 4);
+    assert_eq!(frames[0], (0, 0));
+    assert_eq!(frames[2], (0, 0));
+    assert_eq!(frames[3], (FULL * 4 / 32, 0));
+}
+
+#[test]
+fn volume_scales_the_sample_and_bit_six_is_full_level() {
+    // Chapter 5: six bits, 0 to 64, and bit 6 — `$40` — is the 65th level
+    // however the rest of the register reads.
+    for (written, level) in [(64u16, 64i16), (32, 32), (1, 1), (0x40, 64), (0x7f, 64), (0, 0)] {
+        let rig = Rig::new();
+        rig.paula.set_recording(true);
+        square(&rig, 0, 256, written);
+        rig.paula.advance_to(512);
+        let frames = rig.paula.take_audio();
+        assert_eq!(frames.len(), 16);
+        assert_eq!(frames[15], (127 * level, 0), "AUD0VOL {written:#x}");
+    }
+}
+
+#[test]
+fn zero_and_three_are_the_left_output_and_one_and_two_the_right() {
+    // The machine's wiring (Chapter 5), and the one thing a mono mixdown would
+    // throw away.
+    for ch in 0..4u16 {
+        let rig = Rig::new();
+        rig.paula.set_recording(true);
+        square(&rig, ch, 256, 64);
+        rig.paula.advance_to(512);
+        let frame = *rig.paula.take_audio().last().expect("frames");
+        let want = if ch == 0 || ch == 3 {
+            (FULL, 0)
+        } else {
+            (0, FULL)
+        };
+        assert_eq!(frame, want, "channel {ch}");
+    }
+
+    // And a side is the *sum* of its pair.
+    let rig = Rig::new();
+    rig.paula.set_recording(true);
+    square(&rig, 0, 256, 64);
+    square(&rig, 3, 256, 64);
+    rig.paula.advance_to(512);
+    assert_eq!(
+        *rig.paula.take_audio().last().expect("frames"),
+        (2 * FULL, 0)
+    );
+}
+
+#[test]
+fn a_channel_that_stops_leaves_silence_rather_than_a_held_sample() {
+    let rig = Rig::new();
+    rig.paula.set_recording(true);
+    square(&rig, 0, 256, 64);
+    rig.paula.advance_to(512);
+    assert_eq!(rig.paula.take_audio().len(), 16);
+
+    rig.poke(DMACON, DMAF_AUD0);
+    rig.paula.advance_to(1024);
+    let frames = rig.paula.take_audio();
+    assert_eq!(frames.len(), 16);
+    assert!(
+        frames.iter().all(|f| *f == (0, 0)),
+        "a stopped channel is silent, not held: {frames:?}"
+    );
+}
+
+#[test]
+fn a_modulating_channel_is_heard_on_neither_side() {
+    // Its words go to the next channel's volume (Table 5-4) rather than to a
+    // speaker — including the mixer this file feeds.
+    let rig = Rig::new();
+    rig.paula.set_recording(true);
+    rig.poke(ADKCON, 0x8000 | ADKF_USE0V1);
+    square(&rig, 0, 256, 64);
+    rig.paula.advance_to(2048);
+    let frames = rig.paula.take_audio();
+    assert_eq!(frames.len(), 64);
+    assert!(frames.iter().all(|f| *f == (0, 0)), "{frames:?}");
+    // And it did modulate: the word reached channel 1's volume register.
+    assert_eq!(rig.paula.shared.state.lock().aud[1].vol, 0x7f81);
+}
+
+#[test]
+fn the_frames_do_not_depend_on_how_the_run_was_cut_up() {
+    // A period of 200 is not a multiple of a frame, so every other frame
+    // straddles a boundary and the weighting above is in play throughout.
+    fn whole() -> Vec<(i16, i16)> {
+        let rig = Rig::new();
+        rig.paula.set_recording(true);
+        square(&rig, 0, 200, 48);
+        rig.paula.advance_to(4000);
+        rig.paula.take_audio()
+    }
+
+    let once = whole();
+    assert_eq!(once.len(), 125);
+    assert_eq!(once, whole(), "the same run twice");
+
+    let sliced = {
+        let rig = Rig::new();
+        rig.paula.set_recording(true);
+        square(&rig, 0, 200, 48);
+        let mut frames = Vec::new();
+        // Seven colour clocks at a time: coprime with the period, with the
+        // divisor and with each other, so no two frames are filled the same
+        // way.
+        for at in (0..=4000).step_by(7) {
+            rig.paula.advance_to(at);
+            frames.extend(rig.paula.take_audio());
+        }
+        rig.paula.advance_to(4000);
+        frames.extend(rig.paula.take_audio());
+        frames
+    };
+    assert_eq!(once, sliced, "the integration is not a function of the step");
+}
+
+#[test]
+fn listening_is_not_machine_state() {
+    let heard = Rig::new();
+    heard.paula.set_recording(true);
+    let ignored = Rig::new();
+    for rig in [&heard, &ignored] {
+        square(rig, 0, 200, 64);
+        rig.paula.advance_to(4000);
+    }
+    assert_eq!(
+        snapshot(&heard.paula),
+        snapshot(&ignored.paula),
+        "the ring reached the snapshot"
+    );
+    assert_eq!(heard.paula.take_audio().len(), 125);
+    assert!(
+        ignored.paula.take_audio().is_empty(),
+        "nobody asked for frames"
+    );
+
+    // And whether anybody is listening is not something a reset undoes: it is
+    // the host's, not the guest's.
+    Device::reset(&heard.paula, ResetKind::Cold);
+    assert!(heard.paula.recording());
+    assert!(!ignored.paula.recording());
 }
 
 // ---------------------------------------------------------------------------

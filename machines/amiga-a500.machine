@@ -117,6 +117,12 @@ machine "amiga-a500" {
   # zero repeat a smaller ROM through the window (`src/dev/amiga/gary.rs`).
   param kickstart-size = 512K
 
+  # Whether Paula keeps stereo output frames for a host audio sink to drain.
+  # `-p audio=true` when something is listening; `--record-audio` switches it
+  # on by itself. Off by default because a ring nobody reads is work for
+  # nothing, and it is output rather than machine state either way.
+  param audio = false
+
   # -- the crystal -----------------------------------------------------------
   #
   # One oscillator on the Amiga's own board, and everything on it is an exact
@@ -177,8 +183,8 @@ machine "amiga-a500" {
   # 3.546895 MHz PAL - because every period the manual gives for this chip is
   # counted in it: `SERPER` "N+1 color clocks", an audio period of "124 color
   # clocks" at the least. The UART's other end is the host character port
-  # `serial`.
-  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial" }
+  # `serial`; `record` is the audio ring, above.
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
 
   # -- the internal drive ----------------------------------------------------
   #

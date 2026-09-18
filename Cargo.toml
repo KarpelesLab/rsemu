@@ -2619,9 +2619,13 @@ dev-amiga = []
 # stream, DSKSYNC matching, DSKBYTR, and DSKLEN's write-twice start), the UART
 # on a host character port, and the four audio channels' registers, back-up
 # counters and interrupts. The DMA fetch is Agnus's, reached through a seam
-# Paula publishes. Written from the manual; no emulator source consulted.
-# Implies `dev-amiga`, whose register bus it attaches to. `no_std + alloc`, no
-# dependencies.
+# Paula publishes. With `record` set -- which `--record-audio` does -- the chip
+# also produces the stereo stream a host plays or writes to a WAV: one frame
+# every 32 colour clocks, channels 0 and 3 to the left output and 1 and 2 to
+# the right, which is chapter 5's wiring, converted to a host rate by
+# `host::audio::amiga` (compiled by this feature too). Written from the manual;
+# no emulator source consulted. Implies `dev-amiga`, whose register bus it
+# attaches to. `no_std + alloc`, no dependencies.
 dev-amiga-paula = ["dev-amiga"]
 
 # An Amiga floppy drive (src/dev/amiga/floppy.rs): the mechanism the two CIAs

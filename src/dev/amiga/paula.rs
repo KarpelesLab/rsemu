@@ -150,8 +150,64 @@
 //! * attach modes send a modulator channel's words, one per period, to the
 //!   next channel's volume, period, or alternately both.
 //!
-//! [`Paula::audio_output`] reports each channel's current sample and volume.
-//! No host audio stream is produced yet.
+//! [`Paula::audio_output`] reports each channel's current sample and volume;
+//! [`Paula::take_audio`] is the host stream.
+//!
+//! ## The host stream
+//!
+//! The chip has **no output sample clock of its own** — each channel's DAC
+//! holds its byte for `AUDxPER` colour clocks and the four outputs are summed
+//! in two analogue mixers — so a host stream has to pick a rate, and this model
+//! picks [`AUDIO_SAMPLE_DIVISOR`]: one stereo frame every 32 colour clocks,
+//! 110 840.46875 Hz on a PAL A500. Chapter 5 bounds what that has to carry:
+//! the minimum period is "124 color clocks", so a channel
+//! produces at most 3 546 895 / 124 ≈ 28 604 samples a second (PAL) or
+//! 3 579 545 / 124 ≈ 28 867 (NTSC), and a frame rate 3.87 times that leaves
+//! everything the chip can make well inside its Nyquist limit.
+//!
+//! A frame is the **time integral** of each side's mixer over those 32 colour
+//! clocks, in exact integer arithmetic. A period boundary falling inside a
+//! frame is weighted by where it falls rather than rounded to a frame edge, so
+//! an edge never jitters with the scheduler's step and two identical runs
+//! produce identical bytes.
+//!
+//! The two sides are Chapter 5's wiring — **channels 0 and 3 are the left
+//! output, 1 and 2 the right** — and each side is `sample × volume` summed over
+//! its pair: an 8-bit signed sample and a volume of 0 to 64 (Chapter 5: 64, and
+//! any value with bit 6 set, are full level), twice over. A
+//! frame is therefore in ±16 384, which is the analogue sum and not a host
+//! sample; turning it into one is
+//! [`host::audio::amiga`](crate::host::audio::amiga)'s job.
+//!
+//! Frames are produced only while `record` is set, bounded by
+//! [`AUDIO_RING_FRAMES`], and **derived state**: absent from the snapshot,
+//! cleared by a reset, invisible to the guest, and produced without changing a
+//! single step the chip would otherwise have taken.
+//!
+//! ### The output filters, which are deliberately not modelled
+//!
+//! An Amiga's sound does not go from Paula's pins to the socket: on the board
+//! it passes a fixed RC low-pass and then the switchable "LED" low-pass, which
+//! CIA-A's `PA1` — the pin that also drives the power LED — switches in and
+//! out. Neither is modelled, and neither is declared as a
+//! [`Pole`](crate::host::audio::Pole), for three reasons:
+//!
+//! * they are **on the board, not in the chip**, and the corners differ between
+//!   an A1000, an A500 and an A1200, so a corner declared by this class would
+//!   be wrong for some machine that instantiates it;
+//! * the switchable one is *switchable*, and the audio seam's analogue stage is
+//!   a `&'static [Pole]` fixed when the host builds its resampler. A stage that
+//!   moves when a CIA pin moves is a change to that seam rather than a corner
+//!   of this file — and on `machines/amiga-a500.machine` `PA1` is documented as
+//!   one of the pins nothing is wired to;
+//! * the *Hardware Reference Manual* gives neither corner frequency, and the
+//!   figures in circulation come from board schematics this model has not
+//!   verified. `host::audio::gb` sets the precedent: declaring a corner nobody
+//!   here measured would be inventing a measurement.
+//!
+//! What the manual does bound is the band, above, so the stream carries
+//! everything the chip can produce whether or not a filter would have taken the
+//! top off it.
 //!
 //! # What Agnus must provide
 //!
@@ -243,6 +299,22 @@ pub const POT_PINS: [&str; 4] = ["potlx", "potly", "potrx", "potry"];
 
 /// A tick no event is scheduled for.
 const NO_EVENT: u64 = u64::MAX;
+
+/// Colour clocks one output frame covers.
+///
+/// The chip has no sample clock of its own, so this is the model's choice
+/// rather than a fact: 32 colour clocks is 110 840.46875 Hz on a PAL A500,
+/// 3.87 times the 28 604 Hz a channel reaches at the manual's minimum period
+/// of 124 (Chapter 5). The module documentation has the argument.
+pub const AUDIO_SAMPLE_DIVISOR: u64 = 32;
+
+/// How many stereo frames are kept before the oldest are dropped.
+///
+/// A third of a second at the divisor above, which is thirty times the slice a
+/// host drains on, and rather more than any front end in this tree leaves
+/// between two pulls. Overflowing it costs audio and nothing else: the count is
+/// reported by [`Paula::audio_dropped`] and no guest can see it.
+pub const AUDIO_RING_FRAMES: usize = 1 << 15;
 
 // ---------------------------------------------------------------------------
 // register bits
@@ -548,6 +620,20 @@ struct State {
     /// Bytes the UART finished sending, for the host once the lock is gone.
     /// Host state, never saved.
     host_out: Vec<u8>,
+    /// Whether output frames are being produced at all. Host state, never
+    /// saved, and kept across a reset and a load: whether anybody is listening
+    /// is not something the guest arrived at.
+    record: bool,
+    /// The frame being integrated: colour clocks already in it and the running
+    /// sum for each side. Derived output, never saved.
+    acc_ticks: u64,
+    acc_left: i64,
+    acc_right: i64,
+    /// Finished stereo frames, oldest first, for the host to drain. Host
+    /// state, never saved.
+    audio_out: VecDeque<(i16, i16)>,
+    /// Frames the ring dropped because nobody drained it. Diagnostic.
+    audio_dropped: u64,
 }
 
 /// A period register as a tick count: zero is a full turn of the counter.
@@ -918,6 +1004,92 @@ impl State {
         )
     }
 
+    /// Channel `ch`'s current sample and effective volume, 0–64.
+    ///
+    /// Silent while the channel is stopped or is a modulator: an attached
+    /// channel's words go to its neighbour's volume or period (Table 5-4)
+    /// rather than to a speaker. The volume is Chapter 5's: six bits, and bit
+    /// 6 — `$40`, the 65th level — is maximum however the rest of the register
+    /// reads.
+    fn channel_output(&self, ch: usize) -> (i8, u8) {
+        let Some(c) = self.aud.get(ch) else {
+            return (0, 0);
+        };
+        let (av, ap) = self.attached(ch);
+        if !c.playing || av || ap {
+            return (0, 0);
+        }
+        // Each word is two samples, the high byte first (Chapter 5).
+        let byte = if c.low_half {
+            c.word as u8
+        } else {
+            (c.word >> 8) as u8
+        };
+        let vol = if c.vol & 0x40 != 0 {
+            64
+        } else {
+            (c.vol & 0x3f) as u8
+        };
+        (byte as i8, vol)
+    }
+
+    /// What the two analogue mixers are summing at this instant: channels 0
+    /// and 3 to the left output, 1 and 2 to the right (Chapter 5).
+    ///
+    /// In ±16 384 — `sample × volume`, twice — which is the sum on the board
+    /// rather than a host sample.
+    fn audio_mix(&self) -> (i32, i32) {
+        let side = |a: usize, b: usize| {
+            let (sa, va) = self.channel_output(a);
+            let (sb, vb) = self.channel_output(b);
+            i32::from(sa) * i32::from(va) + i32::from(sb) * i32::from(vb)
+        };
+        (side(0, 3), side(1, 2))
+    }
+
+    /// Integrate the mixers from [`ticks`](State::ticks) to `to`, emitting
+    /// every frame that completes.
+    ///
+    /// Called with the outputs constant over the whole interval, which is what
+    /// `run_to` guarantees: it stops at every boundary that can move one. The
+    /// arithmetic is exact — a frame is a sum of `value × clocks` divided by
+    /// the divisor — so where a boundary falls inside a frame is *weighted*
+    /// rather than rounded, and nothing about the result depends on how the
+    /// interval was cut up.
+    fn audio_sample_to(&mut self, to: u64) {
+        if !self.record {
+            return;
+        }
+        let (left, right) = self.audio_mix();
+        let mut span = to.saturating_sub(self.ticks);
+        while span > 0 {
+            let take = span.min(AUDIO_SAMPLE_DIVISOR - self.acc_ticks);
+            self.acc_left += i64::from(left) * take as i64;
+            self.acc_right += i64::from(right) * take as i64;
+            self.acc_ticks += take;
+            span -= take;
+            if self.acc_ticks < AUDIO_SAMPLE_DIVISOR {
+                continue;
+            }
+            let divisor = AUDIO_SAMPLE_DIVISOR as i64;
+            let frame = (
+                (self.acc_left / divisor) as i16,
+                (self.acc_right / divisor) as i16,
+            );
+            self.acc_left = 0;
+            self.acc_right = 0;
+            self.acc_ticks = 0;
+            if self.audio_out.len() >= AUDIO_RING_FRAMES {
+                // Keep the newest: a host that fell this far behind wants the
+                // sound that is still coming, not a third of a second of
+                // history it has already missed.
+                self.audio_out.pop_front();
+                self.audio_dropped += 1;
+            }
+            self.audio_out.push_back(frame);
+        }
+    }
+
     fn audio_start(&mut self, ch: usize, now: u64) {
         let c = &mut self.aud[ch];
         c.playing = true;
@@ -1082,6 +1254,11 @@ impl State {
         while self.ticks < target {
             let step = self.next_boundary(target);
             self.disk_run(step, drives);
+            // Between two boundaries nothing can move an audio output, so the
+            // whole interval integrates at one value. This is the only line
+            // the host stream adds to the run loop, and it reads state rather
+            // than touching any.
+            self.audio_sample_to(step);
             self.ticks = step;
             self.fire(step);
         }
@@ -1566,13 +1743,12 @@ impl Paula {
         let mut r = props.reader();
         let custom_path = r.require_link("custom")?.as_str().to_string();
         let port_name = r.or("port", String::from(DEFAULT_PORT))?;
+        let record = r.or("record", false)?;
         r.finish()?;
         let port = ports::attach(props, &port_name)?;
-        Ok(Paula::with_port(
-            custom_path,
-            port as Arc<dyn CharDevice>,
-            port_name,
-        ))
+        let paula = Paula::with_port(custom_path, port as Arc<dyn CharDevice>, port_name);
+        paula.set_recording(record);
+        Ok(paula)
     }
 
     /// Build one against a character device the caller already has.
@@ -1641,25 +1817,47 @@ impl Paula {
     /// Silent while the channel is stopped or is a modulator.
     #[must_use]
     pub fn audio_output(&self, ch: usize) -> (i8, u8) {
-        let st = self.shared.state.lock();
-        let Some(c) = st.aud.get(ch) else {
-            return (0, 0);
-        };
-        let (av, ap) = st.attached(ch);
-        if !c.playing || av || ap {
-            return (0, 0);
-        }
-        let byte = if c.low_half {
-            c.word as u8
-        } else {
-            (c.word >> 8) as u8
-        };
-        let vol = if c.vol & 0x40 != 0 {
-            64
-        } else {
-            (c.vol & 0x3f) as u8
-        };
-        (byte as i8, vol)
+        self.shared.state.lock().channel_output(ch)
+    }
+
+    /// Whether stereo frames are being produced for a host sink.
+    ///
+    /// Off unless the `record` property or [`set_recording`](Self::set_recording)
+    /// says otherwise: a machine nobody is listening to should not be filling a
+    /// ring.
+    #[must_use]
+    pub fn recording(&self) -> bool {
+        self.shared.state.lock().record
+    }
+
+    /// Start or stop producing them, discarding anything already produced.
+    ///
+    /// Nothing guest-visible: the ring is output, it is absent from the
+    /// snapshot, and no register reports its depth.
+    pub fn set_recording(&self, on: bool) {
+        let mut st = self.shared.state.lock();
+        st.record = on;
+        st.acc_ticks = 0;
+        st.acc_left = 0;
+        st.acc_right = 0;
+        st.audio_out.clear();
+    }
+
+    /// Drain the output ring: stereo frames at the colour clock divided by
+    /// [`AUDIO_SAMPLE_DIVISOR`], left then right, oldest first.
+    ///
+    /// Each value is the analogue mixer's sum, in ±16 384; see the module
+    /// documentation for what that is and what a host does with it.
+    #[must_use]
+    pub fn take_audio(&self) -> Vec<(i16, i16)> {
+        self.shared.state.lock().audio_out.drain(..).collect()
+    }
+
+    /// How many frames the ring dropped because nobody drained it. Monotonic
+    /// until a reset, and purely diagnostic.
+    #[must_use]
+    pub fn audio_dropped(&self) -> u64 {
+        self.shared.state.lock().audio_dropped
     }
 
     /// The name of the character port the UART is joined to.
@@ -1704,11 +1902,16 @@ impl Device for Paula {
             // The input lines are what other devices drive, and survive.
             let (int2, int6, reading) = (state.int2, state.int6, state.drive_reading);
             let pot_low = state.pot_low;
+            // Whether a host is listening, and how much it has missed, are not
+            // things the guest arrived at and not things a reset undoes.
+            let (record, dropped) = (state.record, state.audio_dropped);
             *state = State::fresh(state.ticks);
             state.int2 = int2;
             state.int6 = int6;
             state.pot_low = pot_low;
             state.drive_reading = reading;
+            state.record = record;
+            state.audio_dropped = dropped;
             state.apply_lines();
             self.shared.publish(&state);
         }
@@ -1863,6 +2066,10 @@ impl Device for Paula {
             // restores its own state; nothing would re-deliver a level that
             // did not move.
             st.pot_low = state.pot_low;
+            // The output ring is the host's, not the snapshot's: a load keeps
+            // listening if it was, and starts the next frame from scratch.
+            st.record = state.record;
+            st.audio_dropped = state.audio_dropped;
             *state = st;
             self.shared.publish(&state);
         }
@@ -1993,6 +2200,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the host character port the UART is joined to (default `serial`)",
         },
+        PropertySpec {
+            name: "record",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "keep stereo output frames in a ring for a host audio sink to drain",
+        },
     ],
     construct: |props| Ok(Box::new(Paula::new(props)?)),
 };
@@ -2021,6 +2234,7 @@ pub fn schema() -> ClassSchema {
     let mut schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("custom", ValueKind::Link).required())
         .prop(PropSchema::new("port", ValueKind::Str))
+        .prop(PropSchema::new("record", ValueKind::Bool))
         .port(INT2_PIN, PortDir::In)
         .port(INT6_PIN, PortDir::In);
     for pin in POT_PINS {
