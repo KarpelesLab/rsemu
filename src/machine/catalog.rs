@@ -688,16 +688,20 @@ pub static M68K_MINI: CatalogEntry = CatalogEntry {
 /// internal drive, the keyboard and the mouse. The `kickstart` slot takes the
 /// ROM image in the socket at `$F8_0000`: 512 KiB by default, and
 /// `-p kickstart-size=256K` for a Kickstart 1.x, which the socket repeats
-/// through its window as the board does. Kickstart 1.3, 2.04 and 3.1 reach
-/// their insert-disk screens. `machines/amiga-a500.machine` carries the wiring,
-/// and `docs/platforms/amiga.md` the ledger.
+/// through its window as the board does. `-p slow-ram=512K` fits an A501 in
+/// the trapdoor. The `ext` slot fills a window at `$E0_0000` that a real A500
+/// does not have, for AROS's second ROM half; bound to no bytes, which the
+/// front ends do, the board is exactly the one without it. Kickstart 1.3, 2.04
+/// and 3.1 reach their insert-disk screens and AROS its desktop.
+/// `machines/amiga-a500.machine` carries the wiring, and
+/// `docs/platforms/amiga.md` the ledger.
 #[cfg(feature = "machine-amiga-a500")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a500")))]
 pub static AMIGA_A500: CatalogEntry = CatalogEntry {
     name: "amiga-a500",
     summary: "an Amiga 500's memory map: a 7.09 MHz 68000, chip RAM under the OVL overlay, the \
               $DFF000 custom-chip space, a Kickstart socket",
-    media: &["kickstart", "df0"],
+    media: &["kickstart", "df0", "ext"],
     source: include_str!("../../machines/amiga-a500.machine"),
 };
 
@@ -2435,6 +2439,10 @@ mod tests {
             // insert-disk screen. `tests/amiga_adf.rs` puts a disk in it.
             #[cfg(feature = "machine-amiga-a500")]
             ("amiga-a500", "df0") => &[],
+            // An empty extended-ROM window, which is the board without one:
+            // only AROS brings a second ROM half.
+            #[cfg(feature = "machine-amiga-a500")]
+            ("amiga-a500", "ext") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

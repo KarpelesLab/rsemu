@@ -549,8 +549,12 @@ fn run(args: &[String]) -> ExitCode {
     // A500 with nothing in DF0 is the one at the insert-disk screen, and
     // `amiga.floppy` reads no bytes as no disk. `--drive df0=disk.adf` still
     // finds the slot, because the drive looks its medium up by the slot's name.
+    // `ext` is the A500's extended-ROM window, which exists for AROS's second
+    // ROM half and which a real A500 does not have: no bytes is no ROM there,
+    // and the board is exactly the one without the window.
     for slot in [
         "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0",
+        "ext",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));

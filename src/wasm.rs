@@ -671,9 +671,11 @@ const KEYBOARD_PORT: &str = "keyboard";
 /// `demo,machine-q35-uefi` module would have refused to assemble the board over
 /// a bay it had been given no way to name.
 ///
-/// `df0` is an Amiga's internal drive: empty is the insert-disk screen.
+/// `df0` is an Amiga's internal drive: empty is the insert-disk screen. `ext`
+/// is the A500 board's extended-ROM window, which only AROS fills: no bytes is
+/// no ROM, and the board is then exactly the machine without the window.
 const EMPTY_BAYS: &[&str] = &[
-    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0",
+    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0", "ext",
 ];
 
 /// Where the media image a boot binds comes from.

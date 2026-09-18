@@ -126,6 +126,8 @@ fn desk(rom: &str, adf: &str, tag: &'static str, recorder: Arc<Recorder>) -> Opt
         .push(("kickstart-size".to_string(), format!("{}K", size / 1024)));
     options.realize.media.insert("kickstart", image.bytes);
     options.realize.media.insert("df0", disk);
+    // No extended ROM: a real A500 has no socket at $E00000.
+    options.realize.media.insert("ext", Vec::new());
     // What `rsemu run --record-input` does: the recorder goes in before the
     // build and realize wires the keyboard's and mouse's doors to it.
     options.realize.recorder = Some(Arc::clone(&recorder));

@@ -39,8 +39,18 @@
 //! `unassigned = open-bus` is the policy that says exactly that. The 68000
 //! core keeps no data-bus latch, so today it reads zero; that is also what a
 //! Kickstart's own probes need to conclude "nothing fitted" — no diagnostic
-//! cartridge at `$F0_0000`, no slow RAM at `$C0_0000`, no board at `$E8_0000`,
-//! no second half of chip RAM at `$08_0000`.
+//! cartridge at `$F0_0000`, no board at `$E8_0000`, no second half of chip RAM
+//! at `$08_0000`.
+//!
+//! # Bank 6 is not a hole
+//!
+//! `$C0_0000`–`$D7_FFFF` was on this list, and it should never have been:
+//! Gary decodes it. With no trapdoor card the chip registers answer there
+//! again, every 512 bytes, and with an A501 its RAM answers in the first
+//! 512 KiB (`src/dev/amiga/gary.rs` has the three documents that say so). The
+//! tests at the bottom of this file assert both, with synthetic firmware and
+//! no ROM, and that the extended-ROM window at `$E0_0000` is still a hole
+//! while its slot is empty.
 //!
 //! # How it is tested
 //!
@@ -92,7 +102,6 @@ const HOLES: &[(u64, u64, &str)] = &[
     (0xA0_0000, 0xBE_FFFF, "Reserved. Do not use."),
     (0xBF_0000, 0xBF_CFFF, "below the 8520-B window, in no row"),
     (0xBF_F000, 0xBF_FFFF, "above the 8520-A window, in no row"),
-    (0xC0_0000, 0xD7_FFFF, "Internal expansion (slow) memory"),
     (0xD8_0000, 0xDB_FFFF, "Reserved. Do not use."),
     (0xDC_0000, 0xDC_FFFF, "Real time clock, no socket"),
     (0xDD_0000, 0xDF_EFFF, "rest of C0 0000 - DF EFFF"),
@@ -121,6 +130,16 @@ fn source_with(line: &str) -> String {
 
 /// Build `source` with `rom` in the `kickstart` slot, keeping the processor.
 fn build(source: &str, rom: Vec<u8>) -> (Machine, Arc<M68k>) {
+    build_with(source, rom, &[], Vec::new())
+}
+
+/// [`build`], with board parameters and the `ext` slot's bytes.
+fn build_with(
+    source: &str,
+    rom: Vec<u8>,
+    params: &[(&str, &str)],
+    ext: Vec<u8>,
+) -> (Machine, Arc<M68k>) {
     let cores: Arc<Captured<M68k>> = Arc::new(Captured::new());
     let kept = Arc::clone(&cores);
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
@@ -133,6 +152,13 @@ fn build(source: &str, rom: Vec<u8>) -> (Machine, Arc<M68k>) {
     // DF0 names a media slot; an empty one is an empty drive (the PC floppy
     // precedent, `tests/pc_at_ide.rs`). The front ends bind it for a user.
     options.realize.media.insert("df0", Vec::new());
+    options.realize.media.insert("ext", ext);
+    for &(name, value) in params {
+        options
+            .resolve
+            .params
+            .push((name.to_string(), value.to_string()));
+    }
     let registry = catalog::registry().expect("a registry");
     let machine = match rsemu::machine::build("amiga-a500", source, &registry, &options) {
         Ok(m) => m,
@@ -393,4 +419,109 @@ fn real_roms_reach_cia_a_once_reserved_space_floats() {
             "{rom}: PA0 was made an output, so the ROM reached CIA-A"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bank 6 and the extended-ROM window: decoded, not floating
+// ---------------------------------------------------------------------------
+
+/// `INTENA` and `INTENAR`, Appendix B: the write-only enable at `$09A` and
+/// its read-back at `$01C`, offsets into the 512-byte register file.
+const INTENA: u64 = 0x09A;
+const INTENAR: u64 = 0x01C;
+const CHIP_REGS: u64 = 0xDF_F000;
+
+/// `SET/CLR` plus `SOFT`: set the software-interrupt enable (Appendix A).
+const SET_SOFT: u64 = 0x8004;
+
+#[test]
+fn with_no_card_bank_6_is_the_chip_registers_every_512_bytes() {
+    // The TRM's "Clock Warning" and the A2000 PAL's `/RGAE` terms: an address
+    // in `$C0_0000`-`$D7_FFFF` reaches the register file with only `A1`-`A8`.
+    let (m, _) = build(&source_with(SPACE_OPEN_BUS), prober());
+    for block in [0xC0_0000u64, 0xC7_FE00, 0xC8_0000, 0xD7_FE00] {
+        write(&m, CHIP_REGS + INTENA, Width::U16, 0x7FFF).expect("clear INTENA");
+        write(&m, block + INTENA, Width::U16, SET_SOFT)
+            .unwrap_or_else(|e| panic!("{block:#08x}: {e:?}"));
+        assert_eq!(
+            read(&m, CHIP_REGS + INTENAR, Width::U16).expect("INTENAR") & 0x4,
+            0x4,
+            "{block:#08x}: a write to INTENA's repeat reached INTENA"
+        );
+        assert_eq!(
+            read(&m, block + INTENAR, Width::U16),
+            read(&m, CHIP_REGS + INTENAR, Width::U16),
+            "{block:#08x}: and INTENAR reads the same through it"
+        );
+    }
+    // Past the bank, the reserved rows still float.
+    assert_eq!(read(&m, 0xD8_0000, Width::U16), Ok(0));
+}
+
+#[test]
+fn an_a501_answers_its_512k_and_leaves_the_rest_of_bank_6_to_the_registers() {
+    let (m, _) = build_with(
+        &source_with(SPACE_OPEN_BUS),
+        prober(),
+        &[("slow-ram", "512K")],
+        Vec::new(),
+    );
+    for addr in [0xC0_0000u64, 0xC4_0000, 0xC7_FFFC] {
+        write(&m, addr, Width::U32, 0x1234_5678).expect("slow RAM");
+        assert_eq!(read(&m, addr, Width::U32), Ok(0x1234_5678), "{addr:#08x}");
+        // Big-endian, like every other byte a 68000 stores.
+        assert_eq!(read(&m, addr, Width::U8), Ok(0x12), "{addr:#08x}");
+    }
+    // The card is 512 KiB: the megabyte above it is still the registers.
+    write(&m, CHIP_REGS + INTENA, Width::U16, 0x7FFF).expect("clear INTENA");
+    write(&m, 0xC8_0000 + INTENA, Width::U16, SET_SOFT).expect("the repeat");
+    assert_eq!(
+        read(&m, CHIP_REGS + INTENAR, Width::U16).expect("INTENAR") & 0x4,
+        0x4
+    );
+    // And the card's RAM is not the register file's.
+    write(&m, CHIP_REGS + INTENA, Width::U16, 0x7FFF).expect("clear INTENA");
+    write(&m, 0xC0_0000 + INTENA, Width::U16, SET_SOFT).expect("slow RAM");
+    assert_eq!(
+        read(&m, CHIP_REGS + INTENAR, Width::U16).expect("INTENAR") & 0x4,
+        0,
+        "a store to the card did not reach INTENA"
+    );
+}
+
+#[test]
+fn slow_ram_is_512k_or_none() {
+    let entry = catalog::machine("amiga-a500").expect("this build ships amiga-a500");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("kickstart", prober());
+    options.realize.media.insert("df0", Vec::new());
+    options.realize.media.insert("ext", Vec::new());
+    options
+        .resolve
+        .params
+        .push(("slow-ram".to_string(), "1M".to_string()));
+    let registry = catalog::registry().expect("a registry");
+    let err = match rsemu::machine::build("amiga-a500", entry.source, &registry, &options) {
+        Ok(_) => panic!("a 1 MiB card Gary cannot decode realized"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("slow-ram"), "{err}");
+}
+
+#[test]
+fn the_extended_rom_window_is_a_hole_until_its_slot_brings_bytes() {
+    // Empty: the row above already proves it floats. Filled with a 256 KiB
+    // image: it answers, repeated through the 512 KiB window, and drops writes.
+    let mut ext = vec![0u8; 256 * 1024];
+    for (i, chunk) in ext.chunks_mut(4).enumerate() {
+        chunk.copy_from_slice(&((i * 4) as u32 | 0xE000_0000).to_be_bytes());
+    }
+    let (m, _) = build_with(&source_with(SPACE_OPEN_BUS), prober(), &[], ext);
+    assert_eq!(read(&m, 0xE0_0004, Width::U32), Ok(0xE000_0004));
+    assert_eq!(read(&m, 0xE4_0004, Width::U32), Ok(0xE000_0004), "repeated");
+    assert_eq!(read(&m, 0xE7_FFFC, Width::U32), Ok(0xE003_FFFC));
+    write(&m, 0xE0_0004, Width::U32, 0).expect("a ROM drops a write");
+    assert_eq!(read(&m, 0xE0_0004, Width::U32), Ok(0xE000_0004));
+    // And the autoconfig space above it is untouched.
+    assert_eq!(read(&m, 0xE8_0000, Width::U16), Ok(0));
 }

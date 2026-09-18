@@ -3,6 +3,13 @@
 #   rsemu run amiga-a500 --media kickstart=kick.rom
 #   rsemu run amiga-a500 -p chip-ram=1M --media kickstart=kick.rom
 #   rsemu run amiga-a500 --media kickstart=kick.rom --vnc :5900
+#   rsemu run amiga-a500 -p slow-ram=512K --media kickstart=kick.rom
+#
+# AROS, whose ROM comes in two halves, needs the extended-ROM socket this
+# board carries for it and a real A500 does not (see `gary` below):
+#
+#   rsemu run amiga-a500 -p chip-ram=1M -p slow-ram=512K \
+#       --media kickstart=aros.rom --media ext=aros-ext.rom --media df0=aros-boot.adf
 #
 # The picture, the keyboard and the mouse reach a person through `--vnc`: the
 # session serves Denise's picture and types and points at the keyboard and
@@ -80,8 +87,10 @@
 # ---------------------------------------------------------------------------
 #
 # $20 0000 - $9F FFFF   the primary autoconfig space: nothing to configure
-# $C0 0000 - $D7 FFFF   "slow" expansion RAM on boards that have it
-# $DC 0000 - $DC FFFF   the battery-backed clock, which an A500 has no socket for
+# $D8 0000 - $DB FFFF   "Reserved. Do not use." (Appendix D)
+# $DC 0000 - $DC FFFF   the battery-backed clock, which comes on the A501 card
+#                       and is not modelled
+# $E0 0000 - $E7 FFFF   while the `ext` slot is empty, which is the default
 # $E8 0000 - $EF FFFF   the autoconfig space proper
 # $F0 0000 - $F7 FFFF   "Reserved. Do not use." (Appendix D) - and probed by
 #                       Kickstart, with a word read at $F00000, while the
@@ -116,6 +125,15 @@ machine "amiga-a500" {
   # is the whole of the 1.x configuration; the map below and the overlay at
   # zero repeat a smaller ROM through the window (`src/dev/amiga/gary.rs`).
   param kickstart-size = 512K
+
+  # The A501 trapdoor card's RAM at $C0 0000: `0`, a stock A500 with the
+  # trapdoor empty, or `512K`. It is "slow" RAM - on the chip bus, where "the
+  # processor is locked out by the custom chips" (A500/A2000 Technical
+  # Reference Manual), and out of reach of every DMA pointer. With no card,
+  # Gary decodes the whole of $C0 0000 - $D7 FFFF as the chip registers again,
+  # every 512 bytes; with one, only the megabyte above the card. See
+  # `src/dev/amiga/gary.rs` for the three documents that say so.
+  param slow-ram = 0
 
   # Whether Paula keeps stereo output frames for a host audio sink to drain.
   # `-p audio=true` when something is listening; `--record-audio` switches it
@@ -230,11 +248,26 @@ machine "amiga-a500" {
   # It names its two sources as *objects*, not addresses, because chip RAM's
   # only address on this machine is zero and so is the decoder's own - there
   # would be nothing to look up.
+  #
+  # Gary also decodes bank 6, $C0 0000 - $D7 FFFF: the trapdoor card's RAM
+  # when `slow-ram` fits one, and `custom`'s registers repeating everywhere
+  # else. The card's RAM is Gary's own rather than a `ram` object, because a
+  # stock board has none and an object cannot have no bytes.
+  #
+  # And a window at $E0 0000 for an extended ROM. **A real A500 has no such
+  # socket.** It exists to run AROS, whose ROM is two 512 KiB halves and whose
+  # second half - with the graphics library in it - is built to answer at
+  # $E0 0000. `ext` names the media slot (`--media ext=aros-ext.rom`), and the
+  # front ends bind it to no bytes when nobody names one. No bytes is no
+  # socket: the range floats exactly as it did before the window existed.
   object gary "amiga.gary" {
-    space = mem
-    rom   = kick
-    ram   = chipram
-    size  = chip-ram
+    space    = mem
+    rom      = kick
+    ram      = chipram
+    size     = chip-ram
+    custom   = custom
+    slow-ram = slow-ram
+    ext      = "ext"
   }
 
   # -- the two 8520s ---------------------------------------------------------
@@ -258,6 +291,12 @@ machine "amiga-a500" {
   map mem 0xF80000 size 512K           = mirror(kick) { endian = "big" }
   map mem 0xBFE000 size 0x1000         = cia_a_decode { endian = "big" }
   map mem 0xBFD000 size 0x1000         = cia_b_decode { endian = "big" }
+  # Big-endian by their own declaration, with no `endian` here: the card's
+  # RAM, the register decode and the extended ROM each say so on the region,
+  # because bank 6 (and an empty `ext`) is a container, and a container's byte
+  # order is its leaves'.
+  map mem 0xC00000 size 0x180000       = gary.bank6
+  map mem 0xE00000 size 512K           = gary.ext
 
   # -- wiring ----------------------------------------------------------------
   #

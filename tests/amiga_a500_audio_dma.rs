@@ -154,6 +154,7 @@ fn play(per: u16, millis: u64) -> (Vec<i16>, u32) {
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("kickstart", rom(per));
     options.realize.media.insert("df0", Vec::new());
+    options.realize.media.insert("ext", Vec::new());
     capture::install(&mut options).expect("a capture table");
     let registry = catalog::registry().expect("a registry");
     let mut machine: Machine =

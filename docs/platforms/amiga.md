@@ -23,7 +23,8 @@ decided, what it had to leave open, and where each chip meets the others.
 | [*Amiga Hardware Reference Manual*, 3rd edition](https://archive.org/details/amiga-hardware-reference-manual-3rd-edition) (Commodore-Amiga Inc.) | Appendix B, the custom-chip register summary in address order and its legend; Appendix A, every register's bits; Appendix D, the system memory maps; Appendix F, the CIA addresses, chip selects and clocks; Appendix E, the port signal assignments and the disk connector; chapter 7, interrupts; chapter 8, the disk controller, the drive lines and the UART; chapter 5, audio. For Denise: Chapter 3 (playfields, the display window, data-fetch timing, dual playfields, scrolling, hold-and-modify, extra-half-brite), Chapter 4 (sprites), Chapter 7 (video priorities, collision detection), Appendix A (register bits), Appendix C (the ECS notes, including the display window's chip column) and Appendix J (Denise's pins) |
 | The same manual as it appears on the Amiga Developer CD 2.1 | Chapter 2 (the copper, the beam counters' ranges and clocks), chapter 3 (display window and data fetch), chapter 4 (sprite DMA), chapter 6 (the blitter), chapter 7 (DMA control, beam position, interrupts), Appendix A (bit layouts), Appendix C (ECS, Agnus identification) — what `amiga.agnus` is written from, and the copy `regs.rs` was checked against row by row |
 | MC68000 User's Manual (Motorola, M68000UM/AD rev. 8) | The reset sequence, and the instruction encodings the test ROMs are hand-assembled from; Table 3-1 and §5.1 for what a byte access drives onto the bus |
-| *A500/A2000 Technical Reference Manual* (Commodore) | Table 6-1 (Fat Agnus's pins: `UDS*`/`LDS*` used only for DRAM), §7.3 (the A2000 PAL equations Gary replaced: the chip data buffers and `/ROME`), the 8520 section |
+| *A500/A2000 Technical Reference Manual* (Commodore) | Table 6-1 (Fat Agnus's pins: `UDS*`/`LDS*` used only for DRAM; `A1`–`A8` onto the register-address bus), §7.3 (the A2000 PAL equations Gary replaced: the chip data buffers, `/ROME`, and `/RGAE` for bank 6), the note on memory at `$C00000` and the clock section's "Clock Warning" |
+| *A500/A2000 Gary Specification* (Commodore; the copy in Dave Haynie's A2000 documents) | Gary's pins, its bank decode on `A17`–`A23`, `ERAM` (`$C0_0000`–`$C7_FFFF`, "expansion RAM") and the `NEXP` pin a trapdoor card grounds; `NROM` covering `$E0_0000`–`$E7_FFFF` |
 | A500 schematics #312511-02 rev. 5 and #312511-03 rev. 6A/7 (Commodore) | Sheet 2: the chip data bus buffers (`U10`–`U13`) and their shared enables; sheet 3: the ROM socket `U6` |
 | The same *Hardware Reference Manual*, for input | Appendix G, "Keyboard Interface" (pp. 357-364): the protocol, timing, handshake, resync, power-up sequence, special codes and the matrix table with every key's legend; chapter 8, "The Keyboard" (pp. 251-254) and "Reading Mouse/Trackball Controllers" and "Mouse Buttons" (pp. 229-233); Table 8-4 (`POTGO`); Appendix A, `JOY0DAT` and `JOYTEST` (pp. 281-282); Appendix E, CIA port assignments; Appendix F, the 8520's serial port and "Bidirectional Feature" |
 | [*Amiga ROM Kernel Reference Manual: Devices*, 3rd edition](http://amigadev.elowar.com/read/ADCD_2.1/Devices_Manual_guide/node015B.html) (Commodore-Amiga Inc.), Appendix C | The floppy's track and sector layout, the MFM encoding and its odd/even split, and the boot block's type and checksum — what `src/dev/amiga/adf.rs` and `src/host/media/adf.rs` are written from. See *Disks* below for the one thing it leaves out |
@@ -37,6 +38,7 @@ so is AROS's source: AROS is something rsemu may run, never something it reads.
 | | |
 | --- | --- |
 | Chip RAM | `$00_0000`–`$07_FFFF`, and `$08_0000`–`$0F_FFFF` on a 1 MiB machine |
+| Slow RAM | `$C0_0000`–`$D7_FFFF`, "Internal expansion (slow) memory (on some systems)"; an A501 card is 512 KiB at `$C0_0000` |
 | Custom chips | `$DF_F000`–`$DF_FFFF`; the register table fills offsets `$000`–`$1FE` |
 | CIA-A | `$BFEr01`, register `r` = 0–F; "selected when A12 is low, A13 high" |
 | CIA-B | `$BFDr00`; "selected when A12 is high, A13 low" |
@@ -305,14 +307,83 @@ error whose vector came out of the ROM overlay, and the processor double-faulted
 | HRM Appendix E, 86-pin expansion connector | the A500 carries the same `/DTACK`, `/OVR` and `RDY` as the A2000 |
 
 So on an A500 every Reserved range, every unfitted memory range (`$08_0000` on a
-512 KiB machine, slow RAM, the clock) and every empty autoconfig slot completes
+512 KiB machine, the clock) and every empty autoconfig slot completes
 its cycle with nothing driving the data bus, and nothing documented raises
 `/BERR` for an empty address. No manual gives a floating value.
 **`unassigned = open-bus`** says exactly that; the 68000 core has no data-bus
 latch, so it reads zero, which is also what makes each of Kickstart's probes —
-diagnostic ROM, slow RAM, autoconfig, the second half of chip RAM — conclude
-"nothing fitted". `tests/amiga_a500_unassigned.rs` walks every range and runs
-the user's own ROMs in place behind `RSEMU_AMIGA_ROM_DIR`.
+diagnostic ROM, autoconfig, the second half of chip RAM — conclude "nothing
+fitted". `tests/amiga_a500_unassigned.rs` walks every range and runs the
+user's own ROMs in place behind `RSEMU_AMIGA_ROM_DIR`.
+
+Slow RAM was on that list and should not have been: bank 6 is decoded whether
+or not a card is fitted. See the next section.
+
+## Bank 6: the trapdoor RAM, or the chip registers again
+
+`$C0_0000`–`$D7_FFFF` used to float like a hole. It is not one. What Gary does
+there is fixed by three Commodore documents between them:
+
+| Source | What it says |
+| --- | --- |
+| *Gary Specification*, address decoding and `NEXP` | `$C0_0000`–`$DF_FFFF` is `BANK6`; `$C0_0000`–`$C7_FFFF` is `ERAM`, "expansion RAM". `NEXP` "is externally pulled up. The expansion ram card grounds this line. This signal is used in the generation of NRAME" |
+| TRM §7.3, the A2000 `PALEN` equations | `/RGAE`, "Amiga chip register address decode", is asserted for `$C0_0000`–`$CF_FFFF`, `$D0_0000`–`$D7_FFFF` and `$DC_0000`–`$DF_FFFF` |
+| TRM Table 6-1, Fat Agnus | "the processor uses A1 to A8 to access one of the device registers" — nothing above `A8` reaches the register-address bus |
+| TRM, clock section, "Clock Warning" | "The addresses used by the real time clock chip access the custom chip registers without the memory expansion/real time clock module" |
+| TRM, on the A500 | "memory at $C00000 is 'slow' RAM (the processor is locked out by the custom chips)" |
+
+So:
+
+* **No card** (`-p slow-ram=0`, the default): all 1.5 MiB of the bank is the
+  chip registers, repeated every 512 bytes. A word written to `$C0_F09A` is a
+  write to `INTENA`, and `$C0_001C` reads `INTENAR`. Nothing there floats.
+* **An A501** (`-p slow-ram=512K`): the card's 512 KiB answers
+  `$C0_0000`–`$C7_FFFF`, and the megabyte above it is the registers as before.
+  The RAM is Gary's, not a `ram` object's, because a stock board has none and
+  an object cannot have no bytes; it is saved in Gary's snapshot chunk and
+  cleared by a cold reset. No DMA pointer reaches it, and bus contention — the
+  "slow" — is not modelled on this board at all.
+* **Anything else is refused.** Gary's `ERAM` is 512 KiB; bigger trapdoor
+  cards brought their own decode, which this board does not model.
+
+The same `/RGAE` term covers `$DC_0000`–`$DF_FFFF`, but on an A500 the clock
+that shares that range arrives on the same card, and which of the two answers
+there with a card fitted is not in any of these documents. So that range is
+left as it was: `$DF_F000`–`$DF_F1FF` is the register file and the rest
+floats.
+
+Kickstart's own probe agrees with both halves. With no card it now finds the
+registers repeating where it used to find a floating bus, and still concludes
+there is no RAM: **no Amiga golden moved**, not by a bit. With an A501,
+Kickstart 1.3's Workbench title bar reads "889256 free memory" instead of
+"365000" — 524 256 bytes more, the card less a 32-byte header — and AROS puts
+`ExecBase` at `$C0_0560`, in the card, which is what the TRM says the RAM is
+for ("when ExecBase is transferred to $C00000"). `tests/amiga_a500_unassigned.rs`
+asserts the decode with synthetic firmware; `tests/amiga_a500_kickstart.rs`
+the free-memory count, behind `RSEMU_AMIGA_ROM_DIR` and `RSEMU_AMIGA_ADF_DIR`.
+
+## `$E0_0000`: a window for AROS's second ROM half
+
+**A real A500 has no ROM socket at `$E0_0000`.** Gary's `NROM` term does
+decode `$E0_0000`–`$E7_FFFF`, but it selects the one Kickstart part — which,
+carrying `A1`–`A18`, would repeat itself there. That repeat is **not**
+modelled: an empty `ext` slot must leave the board exactly what it was, and it
+does (every golden above is unchanged).
+
+The window exists because AROS's Amiga ROM comes in two 512 KiB halves, and the
+second — the graphics library among it — is built to answer at `$E0_0000`.
+`amiga.gary` publishes an `ext` region there, bound to the `ext` media slot:
+
+* **no bytes** (what `rsemu run`, the wasm front end and every test bind when
+  nobody names one) is an empty container, so every access falls through to
+  the space's open bus exactly as before;
+* **an image** is a read-only ROM, repeated through the window if smaller (a
+  power of two up to 512 KiB), writes dropped.
+
+`kickstart:` decodes it the way it decodes the main ROM — keyed or plain, out of
+a file or an Amiga Forever disc image — so a keyed extended ROM works in this
+slot too (`amiga-os-130-a570-ext.rom`, 256 KiB and keyed, decodes and mirrors
+through the window).
 
 With it, both ROMs go straight from the `$F0_0000` probe to CIA-A. Kickstart
 2.04's next refused access was a **byte** read of `$DF_F07D`; see the next
@@ -384,65 +455,73 @@ with `RSEMU_AMIGA_ADF_DIR` as well it boots the Workbench 1.3 and 2.04 disks.
 | Kickstart 3.1 (40.063, A500/A600/A2000) | its insert-disk screen | The same picture with "3.1 ROM 40.063 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." |
 | Kickstart 2.04 + the Workbench 2.04 disk | the Workbench desktop, 42 s | A grey 640-pixel high-resolution screen; a black screen title bar reading "Copyright © 1985-1991 Commodore-Amiga, Inc. All Rights Reserved" with the red pointer over its first letters; below it the blue-titled "Workbench" window, its Ram Disk and Workbench2.0 icons, both scroll bars and the sizing gadget. The busy pointer appears while the disk is read. Nothing is out of place |
 | Kickstart 1.3 + the Workbench 1.3 disk | the Workbench desktop, 68 s | A plain blue 640-pixel high-resolution screen; a white screen title bar reading "Workbench release." and "365000 free memory", with the red pointer over its first letters; the RAM DISK and Workbench1.3 icons down the right-hand edge. The AmigaDOS shell the startup-sequence opens, then `[CLI 2]` — `LoadWB` — on the way |
-| AROS (2025-04-22 main ROM) | an alert on the serial port | See below |
+| Kickstart 1.3 + Workbench 1.3 + an A501 (`-p slow-ram=512K`) | the Workbench desktop, 72 s | The same desktop, the title bar reading "889256 free memory" |
+| AROS (2025-04-22), both ROM halves, its boot disk, `-p chip-ram=1M -p slow-ram=512K` | the `Workbook` desktop, 80 s | See *AROS* below |
 
-**AROS** is blocked by the board, not a chip. Its main ROM alone raises
-"graphics.library could not open library hidd" (`$C2038002`) over and over:
-the graphics code is in `aros-…-ext.rom`, which wants to be at `$E0_0000`, and
-an A500 has no socket there, so the shipped board does not map one. With that
-ROM mapped (a scratch board, not committed) AROS loads intuition, then **runs
-out of chip memory** on a 512 KiB board (`AvailMem` down to 16 bytes, grey
-screen, idle). With `-p chip-ram=1M` it draws its boot picture — a cat's eyes
-in the dark, 640 pixels of high resolution, square since the fetch fix below.
+### AROS
 
-That left one AROS question, and the 68000's whole clock answered it: on
-that scratch board (extended ROM at `$E0_0000`, `-p chip-ram=1M`), with
-`amiga.keyboard` wired to CIA-A, AROS used to stop at a plain grey screen
-(`COLOR00` `$AAA`, no bitplane DMA), and without it the picture appeared —
-until the scheduler started delivering the event a round ends on (the audio
-paragraph above has why), since when it stopped there with or without the
-keyboard. Its serial log ended at `romtaginit done` either way. It now draws
-the eyes and the logo with the keyboard wired. The shipped board is no
-witness: without the extended ROM it draws nothing with or without the
-keyboard. What was established on the way:
+AROS runs on the shipped board from its own boot disk, with its second ROM
+half in the `ext` window:
 
-* **The keyboard's side of the wire checks out** against Appendix G and the
-  8520 data sheet: eight positive `CNT` edges a byte, 60 µs a bit, the code
-  rotated and inverted into `SDR`, the handshake latched. Kickstart 1.3 and
-  AROS both receive `$FD` and `$FE` intact, and 1.3 receives typed keys.
-* **What sets it off is timing, not content.** AROS enables the `SP`
-  interrupt, reads `ICR` and `SDR`, and pulses `KDAT` low for about a
-  millisecond (`CRA` bit 6, timed on CIA-A's timer B) — before its input
-  handling is ready. The keyboard, still resynchronising after power-up, takes
-  that pulse as the handshake it has been waiting for and sends its power-up
-  stream about 1.5 ms later. Any code delivered then wedges AROS: `$FD`, `$FE`,
-  `$40` and `$FF` alike. The same codes delivered half a second later — the
-  keyboard started after the pulse, or its reply held back 500 ms — and AROS
-  boots to "Waiting for bootable media", keyboard working. 143 ms is not
-  enough.
-* **The wedge is a lost wake-up.** At 60 s nothing is ready: the Exec
-  Bootstrap Task is waiting on signal `$00080000` and `input.device` on
-  `$003F0000` (read through the RKRM's `ExecBase` and `Task` layouts).
-* **It was not the crystal's speed, but it was the processor's.** A crystal
-  four times faster wedged the same way, and a keyboard clock 5 % off did too —
-  but both kept the 68000 at the half of its clock it used to get on this
-  board (see *The 68000 gets its whole clock* above). Given its whole clock,
-  which it now has, AROS draws its eyes and its logo **with the keyboard**:
-  the same scratch board (the shipped file with `chip-ram = 1M` and the
-  extended ROM mapped at `$E00000`), 60 s, reaches the eyes-and-logo picture
-  rather than the flat grey it stopped at. So the keyboard was one way of
-  moving an interrupt into a window a half-speed processor left open. Taking DF0 off the board, or only its `TK0*`
-  wire, also avoids it (AROS's path then differs); taking the mouse off does
-  not.
-* **Ruled out:** resetting the 8520's shift counter when `CRA` bit 6 flips,
-  the one-shot timer-high start, and a spurious level-seven interrupt (Paula
-  could flicker its `IPL` pins through seven; fixed, but it never fired here).
-  The interrupt levels the processor takes are the same with and without the
-  keyboard, apart from the keyboard's own four at level 2.
+```
+rsemu run amiga-a500 -p chip-ram=1M -p slow-ram=512K \
+    --media kickstart=kickstart:<rom dir>/aros-20250422.rom \
+    --media ext=kickstart:<rom dir>/aros-20250422-ext.rom \
+    --media df0=adf:<adf dir>/aros-20250422-boot.adf --vnc :5900
+```
 
-So the open question is what on this board makes a code arriving in that
-window cost a wake-up. Holding the keyboard's reply back would hide it, but a
-real keyboard answers just as fast, so that would be a workaround, not a fix.
+Or all three straight out of the Amiga Forever disc image, nothing extracted:
+`--media kickstart=kickstart:<dvd.iso>,rom=aros-20250422`,
+`--media ext=kickstart:<dvd.iso>,rom=aros-20250422-ext` and
+`--media df0=adf:<dvd.iso>,disk=aros-20250422-boot`. Add `--headless --for 90s
+--screenshot aros.png` for a picture without a VNC client; the requester in
+step 3 then stays up, because nobody is there to answer it. What it does, measured
+in `tests/amiga_a500_kickstart.rs`:
+
+1. Its serial log reports a "1MiB ROM" in two regions, `$E0_0000` and
+   `$F8_0000`, and finds three memories: the card at `$C0_0000` (type
+   `$1705`), chip RAM from `$400` to `$10_0000`, and the two ROMs.
+2. It boots the disk: the grey screen, a blue-framed "AROS" shell window with
+   the copyright, licence, version and build-date lines.
+3. By 55 s a **"System requester"** sits over it: `Please insert volume "AROS
+   Live CD" in any drive`, `Retry` and `Cancel`. The disk's startup-sequence
+   asks `If EXISTS "AROS Live CD:"` — the CD Amiga Forever pairs this disk
+   with, for which the board has no drive. That is AROS asking, not the
+   hardware stopping, and it waits for a person.
+4. **Cancel** — Left-Amiga+B on the keyboard, which is what the test types —
+   and the startup-sequence carries on to `LoadWB` and `EndCLI`. By 80 s the
+   shell window is gone and the **`Workbook` desktop** is up: a title bar
+   reading "Workbook 1.0  Chip: 634k, Fast: 0k, Any: 634k" (the card's RAM is
+   counted as `Fast` and is full: AROS allocates from it first), the "AROS
+   Kickstart" disk icon and the "RAM Disk" icon, the red pointer. It does not
+   change after that, except that the title bar is cleared and redrawn about
+   every thirty seconds.
+
+**How much memory it needs.** With 512 KiB in all AROS runs out before it
+draws anything (the grey screen it has always stopped at here). With 1 MiB in
+all — `chip-ram=1M`, or 512 KiB of chip and an A501 — it gets as far as
+"Workbook 1.0" in the title bar and the shell window never closes. That is not
+the hardware either: read through the RKRM's `ExecBase`, `Task` and
+`MemHeader` layouts, every task is waiting on exactly the signals it waits on
+in the run that succeeds, and chip RAM has 127 KiB free in pieces of at most
+26 KiB. The run with 512 KiB more reaches the desktop with the same tasks in
+the same states. So `chip-ram=1M` plus an A501 is the configuration the test
+uses; it is not one Commodore sold (an A500 with a 1 MiB Agnus used the
+trapdoor for the second half of chip RAM), and the page says so rather than
+pretend.
+
+**What stood in the way before.** Without the window, the main ROM alone
+raised "graphics.library could not open library hidd" (`$C2038002`) over and
+over, because the graphics code is in the other half. A scratch board with
+that half mapped used to stop at a plain grey screen whenever the keyboard was
+wired — the "lost wake-up" earlier revisions of this page chased through the
+8520's serial port and the keyboard's handshake. It was the 68000 running at
+half its clock (see *The 68000 gets its whole clock*): with its whole clock
+AROS boots with the keyboard wired and reads keys through it, as step 4 shows.
+No defect in the chips was found on the way to the desktop. The one board
+defect found on the way was bank 6's decode (above): it floated where Gary
+decodes either the card's RAM or the chip registers, so there was no card to
+give AROS the memory it needs.
 
 What it took to get the Kickstarts there, beyond the byte access and the ROM
 mirror:

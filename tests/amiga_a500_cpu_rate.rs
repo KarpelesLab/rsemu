@@ -62,6 +62,7 @@ fn board() -> (Machine, Arc<M68k>) {
     });
     options.realize.media.insert("kickstart", rom());
     options.realize.media.insert("df0", Vec::new());
+    options.realize.media.insert("ext", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let source = catalog::machine("amiga-a500")
         .expect("this build ships amiga-a500")

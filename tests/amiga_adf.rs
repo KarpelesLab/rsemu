@@ -220,6 +220,7 @@ fn build(
     }
     options.realize.media.insert("kickstart", kickstart);
     options.realize.media.insert("df0", df0);
+    options.realize.media.insert("ext", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let machine = rsemu::machine::build("amiga-a500", board(), &registry, &options)
         .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
@@ -396,6 +397,7 @@ mod real {
         });
         options.realize.media.insert("kickstart", kickstart);
         options.realize.media.insert("df0", df0);
+        options.realize.media.insert("ext", Vec::new());
         let registry = catalog::registry().expect("a registry");
         let mut m = rsemu::machine::build("amiga-a500", board(), &registry, &options)
             .unwrap_or_else(|e| panic!("the board does not realize: {e}"));

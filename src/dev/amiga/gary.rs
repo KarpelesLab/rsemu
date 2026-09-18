@@ -1,8 +1,11 @@
-//! The `OVL` overlay: what answers at address zero.
+//! Gary's address decode: what answers at address zero, in bank 6, and at
+//! `$E0_0000`.
 //!
 //! One class, `amiga.gary`, named for the A500/A2000 gate array that does the
-//! board's address decoding. It models exactly one of that part's jobs, and it
-//! is the one a 68000 cannot start without.
+//! board's address decoding. It models three of that part's jobs: the `OVL`
+//! overlay, which a 68000 cannot start without; bank 6, where the trapdoor
+//! card's slow RAM or the chip registers answer; and a window at `$E0_0000`
+//! for an extended ROM, which a real A500 does not have (see below).
 //!
 //! # The problem the overlay solves
 //!
@@ -123,12 +126,75 @@
 //! puts a 256 KiB part at both `$F8_0000` and `$FC_0000`, exactly as `_ROMEN`
 //! does.
 //!
+//! # Bank 6: the trapdoor RAM, or the chip registers again
+//!
+//! Appendix D gives `$C0_0000`–`$D7_FFFF` as "Internal expansion (slow)
+//! memory (on some systems)". What the board does there is Gary's decode, and
+//! three Commodore documents pin it down between them:
+//!
+//! * **The Gary specification** ("A500/A2000 Gary Specification", Commodore)
+//!   splits the space into banks on `A17`–`A23` and names `$C0_0000`–
+//!   `$DF_FFFF` `BANK6` and `$C0_0000`–`$C7_FFFF` `ERAM`, "expansion RAM".
+//!   Its `NEXP` pin is "externally pulled up. The expansion ram card grounds
+//!   this line. This signal is used in the generation of NRAME" — the select
+//!   that sends a processor cycle to RAM on the chip bus. So the card is a
+//!   512 KiB decode, and only when a card says it is there.
+//! * **The A2000 PAL Gary replaced** (*A500/A2000 Technical Reference Manual*,
+//!   §7.3, `PALEN` U26) asserts `/RGAE` — "Amiga chip register address
+//!   decode" — for `$C0_0000`–`$CF_FFFF` and `$D0_0000`–`$D7_FFFF` (and
+//!   `$DC_0000`–`$DF_FFFF`), and Fat Agnus puts `A1`–`A8` and nothing else on
+//!   the register-address bus (TRM Table 6-1: "the processor uses A1 to A8 to
+//!   access one of the device registers"). Wherever no RAM is selected, bank 6
+//!   is the 256 chip registers, repeated every 512 bytes.
+//! * **The TRM says so in as many words**, for the clock in the same bank:
+//!   "The addresses used by the real time clock chip access the custom chip
+//!   registers without the memory expansion/real time clock module"
+//!   ("Clock Warning", in the A2000 clock section).
+//!
+//! So an A500 with **no card** decodes all of bank 6's first 1.5 MiB as the
+//! chip registers — a word written to `$C0_F09A` is a write to `INTENA` — and
+//! one with an **A501** answers `$C0_0000`–`$C7_FFFF` from the card's RAM and
+//! the other megabyte from the chip registers as before. The `bank6` region
+//! is exactly that: slow RAM for the first `slow-ram` bytes, then the register
+//! file named by `custom` repeated through the rest. Nothing here is ever
+//! open bus. (Cards larger than 512 KiB exist; they carry their own decode —
+//! Gary's `ERAM` term is 512 KiB — so `slow-ram` takes `0` or `512K` and
+//! nothing else.)
+//!
+//! The RAM is "slow" because it is on the chip bus — "the processor is locked
+//! out by the custom chips" (TRM, on `$C0_0000`) — but it is not chip RAM: no
+//! DMA pointer reaches it, and Agnus is not told about it here. This board
+//! does not model bus contention in the first place, so the difference is in
+//! what the DMA engines can address and nothing else.
+//!
+//! The register-bank decode is *not* extended to `$DC_0000`–`$DF_EFFF` here:
+//! the same PAL term covers it, but on an A500 the clock that shares that
+//! range comes on the same card, and which of the two answers there with a
+//! card fitted is not in any of these documents. The board keeps mapping the
+//! 512 bytes at `$DF_F000` alone.
+//!
+//! # `$E0_0000`: a socket for AROS's extended ROM
+//!
+//! **A real A500 has no ROM at `$E0_0000`.** Gary's `NROM` term does decode
+//! `$E0_0000`–`$E7_FFFF` (the Gary specification; the A2000 PAL's `/ROME`
+//! likewise), but it selects the same Kickstart part, whose socket carries
+//! `A1`–`A18` — so on the machine that range would repeat the Kickstart
+//! itself. That is **not** modelled: with nothing in the `ext` slot the `ext`
+//! region is an empty container, and the range floats exactly as it did before
+//! the socket existed.
+//!
+//! The socket exists to run AROS, whose Amiga ROM comes in two 512 KiB halves
+//! and whose second half — the graphics library among it — is built to answer
+//! at `$E0_0000`. With bytes in the slot, the `ext` region is that image,
+//! repeated through the 512 KiB window if it is smaller, read-only.
+//!
 //! # What is *not* modelled
 //!
 //! Gary does a great deal more than this — bus arbitration between the
-//! processor and the chipset, among other things — and none of it is here. This class is the
-//! overlay and nothing else, and it is named `amiga.gary` because that is the
-//! part the overlay lives in, not because the part is modelled.
+//! processor and the chipset, among other things — and none of it is here.
+//! This class is the overlay, bank 6 and the extended-ROM window, and it is
+//! named `amiga.gary` because that is the part those decodes live in, not
+//! because the part is modelled.
 //!
 //! # Sources
 //!
@@ -136,8 +202,10 @@
 //! Appendix D ("System Memory Maps") for the map and p. 223 for the reset
 //! state; the M68000 User's Manual for the reset sequence; the *A500/A2000
 //! Technical Reference Manual* §7.3 and A500 schematics #312511-02 and
-//! #312511-03 for how a 256 KiB ROM sits in the window. No emulator source of
-//! any licence was consulted (`ROADMAP.md` §1).
+//! #312511-03 for how a 256 KiB ROM sits in the window; the TRM's §7.3 PAL
+//! equations, Table 6-1, the `$C0_0000` note and "Clock Warning", and the
+//! *A500/A2000 Gary Specification*, for bank 6. No emulator source of any
+//! licence was consulted (`ROADMAP.md` §1).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -146,13 +214,14 @@ use alloc::sync::Arc;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
-use crate::core::props::{Props, ValueKind};
+use crate::core::props::{Media, Props, ValueKind};
 use crate::core::space::{
-    AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region, RegionRef,
-    UnassignedPolicy,
+    AccessConstraints, AddressSpace, Mapping, MemAttrs, MemOps, MemResult, RamStore, Region,
+    RegionRef, RomStore, RomWrite, UnassignedPolicy,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, Ordering};
+use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, WireId, WireSink};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
@@ -160,8 +229,33 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 /// The class name a machine file writes.
 pub const CLASS_NAME: &str = "amiga.gary";
 
-/// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+/// Snapshot version for this class's chunk encoding. 2 added the slow RAM's
+/// contents after the `OVL` level.
+const STATE_VERSION: u32 = 2;
+
+/// The name of the region a `map` statement places at `$C0_0000`.
+pub const BANK6_REGION: &str = "bank6";
+
+/// How much of bank 6 is decoded as RAM-or-registers: `$C0_0000`–`$D7_FFFF`,
+/// Appendix D's "Internal expansion (slow) memory" row and the first two
+/// `/RGAE` terms of the A2000 PAL.
+pub const BANK6_LEN: u64 = 0x18_0000;
+
+/// What Gary's `ERAM` term decodes when a card grounds `NEXP`:
+/// `$C0_0000`–`$C7_FFFF`. The only card size `slow-ram` accepts besides none.
+pub const ERAM_LEN: u64 = 512 * 1024;
+
+/// How often the chip registers repeat where `/RGAE` is decoded: `A1`–`A8`
+/// reach the register-address bus and nothing above them does, so every
+/// 512 bytes.
+pub const RGA_SPAN: u64 = 0x200;
+
+/// The name of the region a `map` statement places at `$E0_0000`.
+pub const EXT_REGION: &str = "ext";
+
+/// How much the extended-ROM window decodes: `$E0_0000`–`$E7_FFFF`, Gary's
+/// `NROM` term.
+pub const EXT_WINDOW: u64 = 512 * 1024;
 
 /// The name of the input pin the CIA drives.
 pub const OVL_PIN: &str = "ovl";
@@ -251,6 +345,58 @@ impl MemOps for Overlay {
 }
 
 // ---------------------------------------------------------------------------
+// bank 6's register decode
+// ---------------------------------------------------------------------------
+
+/// Bank 6 wherever `/RGAE` is decoded: the chip registers, every 512 bytes.
+///
+/// It forwards `offset mod RGA_SPAN` into the register file `custom` names,
+/// which is what an address with only `A1`–`A8` on the register-address bus
+/// comes to.
+#[derive(Debug)]
+struct Rga {
+    /// The register file, in a private space of this object's own at zero.
+    /// `None` until bind.
+    custom: Mutexed,
+}
+
+impl Rga {
+    fn target(&self) -> Option<Arc<AddressSpace>> {
+        self.custom.lock().clone()
+    }
+}
+
+impl MemOps for Rga {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        // `attrs` unchanged, `debug` included: the register file decides what
+        // a debugger's read may disturb, exactly as it does at `$DF_F000`.
+        let Some(space) = self.target() else {
+            return Err(BusError::Unassigned);
+        };
+        space.read_bytes(offset % RGA_SPAN, dst, attrs)
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
+        let Some(space) = self.target() else {
+            return Err(BusError::Unassigned);
+        };
+        space.write_bytes(offset % RGA_SPAN, src, attrs)
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        // The register file's own terms (`amiga.custom`): a byte or a word,
+        // big-endian, no bursts. A 68000 makes a longword two word cycles
+        // itself, so each half arrives here on its own address and is decoded
+        // on it, as at `$DF_F000`.
+        AccessConstraints {
+            min: Width::U8,
+            natural_alignment: false,
+            ..AccessConstraints::word(Width::U16, Endian::Big)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the pin
 // ---------------------------------------------------------------------------
 
@@ -276,7 +422,7 @@ impl WireSink for OvlPin {
 // the device
 // ---------------------------------------------------------------------------
 
-/// The `OVL` overlay decoder.
+/// The `OVL` overlay decoder, bank 6, and the extended-ROM window.
 #[derive(Debug)]
 pub struct Gary {
     overlay: Arc<Overlay>,
@@ -284,6 +430,17 @@ pub struct Gary {
     /// The objects named by `rom` and `ram`, resolved at bind.
     rom_path: String,
     ram_path: String,
+    /// The register file named by `custom`, resolved at bind; `None` leaves
+    /// the register part of bank 6 unmapped, so it floats.
+    custom_path: Option<String>,
+    /// The trapdoor card's RAM, when `slow-ram` fitted one.
+    slow: Option<Arc<RamStore>>,
+    /// Bank 6's register decode, when `custom` named a register file.
+    rga: Option<Arc<Rga>>,
+    /// `$C0_0000`–`$D7_FFFF`: the slow RAM, then the registers repeating.
+    bank6: RegionRef,
+    /// `$E0_0000`–`$E7_FFFF`: the extended ROM, or an empty container.
+    ext: RegionRef,
     /// The pin, kept alive here: a net holds only a `Weak` to its sinks
     /// (`ROADMAP.md` §4.3).
     pin: crate::core::sync::Mutex<Option<Arc<OvlPin>>>,
@@ -295,7 +452,9 @@ impl Gary {
     /// # Errors
     ///
     /// [`Error::Property`] if `rom`, `ram` or `size` is missing or of the wrong
-    /// kind, if `size` is zero, or if a property nothing here accepts was
+    /// kind, if `size` is zero, if `slow-ram` is neither none nor the 512 KiB
+    /// Gary's `ERAM` term decodes, if the `ext` image cannot repeat evenly
+    /// through its 512 KiB window, or if a property nothing here accepts was
     /// given.
     pub fn new(props: &Props) -> Result<Gary> {
         use crate::core::sync::LockRank;
@@ -303,10 +462,19 @@ impl Gary {
         let rom_path = r.require_link("rom")?.as_str().to_string();
         let ram_path = r.require_link("ram")?.as_str().to_string();
         let size = r.require_size("size")?;
+        let custom_path = r.optional_link("custom")?.map(|l| l.as_str().to_string());
+        let slow_len = r.or_size("slow-ram", 0)?;
+        let ext_image = r.optional_media("ext")?.map(Media::to_bytes);
         r.finish()?;
         if size == 0 {
             return Err(Error::Property(String::from(
                 "property `size`: an overlay that decodes no bytes cannot be mapped",
+            )));
+        }
+        if slow_len != 0 && slow_len != ERAM_LEN {
+            return Err(Error::Property(format!(
+                "property `slow-ram`: {slow_len:#x} bytes; Gary decodes a trapdoor card as \
+                 512 KiB at $C00000 (its ERAM term) or not at all, so `0` or `512K`"
             )));
         }
         let overlay = Arc::new(Overlay::new(size));
@@ -315,13 +483,70 @@ impl Gary {
             size,
             Arc::clone(&overlay) as Arc<dyn MemOps>,
         ));
+
+        // Bank 6. The RAM is big-endian like everything else a 68000 stores,
+        // declared on the region because a container's leaves carry their own
+        // byte order.
+        let slow = (slow_len > 0).then(|| Arc::new(RamStore::new(slow_len)));
+        let rga = custom_path.as_ref().map(|_| {
+            Arc::new(Rga {
+                custom: Mutexed::with_rank(LockRank::LEAF, None),
+            })
+        });
+        let mut children = alloc::vec::Vec::new();
+        if let Some(store) = &slow {
+            let ram = Region::ram("amiga.gary.slow", Arc::clone(store)).with_endian(Endian::Big);
+            children.push(Mapping::new(Arc::new(ram), 0));
+        }
+        if let Some(rga) = &rga {
+            let io = Region::io(
+                "amiga.gary.rga",
+                BANK6_LEN - slow_len,
+                Arc::clone(rga) as Arc<dyn MemOps>,
+            );
+            children.push(Mapping::new(Arc::new(io), slow_len));
+        }
+        let bank6 = Arc::new(Region::container("amiga.gary.bank6", BANK6_LEN, children));
+
+        let ext = Arc::new(ext_region(ext_image)?);
         Ok(Gary {
             overlay,
             region,
             rom_path,
             ram_path,
+            custom_path,
+            slow,
+            rga,
+            bank6,
+            ext,
             pin: crate::core::sync::Mutex::with_rank(LockRank::LEAF, None),
         })
+    }
+
+    /// Give bank 6 the register file it repeats, in a private space of its
+    /// own — what `bind` does with the object `custom` names.
+    ///
+    /// Public for the reason [`Gary::attach`] is. A decoder built without
+    /// `custom` has no register decode to give it to, and ignores the call.
+    ///
+    /// # Errors
+    ///
+    /// If the region cannot be mapped into the private space.
+    pub fn attach_custom(&self, region: &RegionRef, bits: u32) -> Result<()> {
+        let Some(rga) = &self.rga else {
+            return Ok(());
+        };
+        let space = AddressSpace::new(format!("{CLASS_NAME}.rga"), bits)
+            .with_unassigned(UnassignedPolicy::OPEN_BUS);
+        space.topology().map(Arc::clone(region), 0)?;
+        *rga.custom.lock() = Some(Arc::new(space));
+        Ok(())
+    }
+
+    /// How many bytes of slow RAM the trapdoor card brings: 0 with no card.
+    #[must_use]
+    pub fn slow_ram(&self) -> u64 {
+        self.slow.as_ref().map_or(0, |s| s.len())
     }
 
     /// Whether `OVL` is asserted — whether the ROM is what answers at zero.
@@ -407,6 +632,44 @@ impl Gary {
     }
 }
 
+/// The `$E0_0000` window for an extended-ROM image, or for none.
+///
+/// No bytes is an empty socket, and an empty socket is an **empty container**:
+/// nothing in the window answers, so every access falls through to the board
+/// space's own `unassigned` policy — exactly what the range did before this
+/// window existed. A ROM smaller than the window repeats through it, as a part
+/// with fewer address pins does (see the overlay's 256 KiB case above).
+fn ext_region(image: Option<Arc<[u8]>>) -> Result<Region> {
+    let Some(bytes) = image.filter(|b| !b.is_empty()) else {
+        return Ok(Region::container(
+            "amiga.gary.ext",
+            EXT_WINDOW,
+            alloc::vec::Vec::new(),
+        ));
+    };
+    let len = bytes.len() as u64;
+    if len > EXT_WINDOW || !EXT_WINDOW.is_multiple_of(len) {
+        return Err(Error::Config {
+            at: String::from(CLASS_NAME),
+            message: format!(
+                "an extended rom of {len:#x} bytes cannot repeat evenly through the \
+                 {EXT_WINDOW:#x} bytes at $E00000"
+            ),
+        });
+    }
+    let rom = Region::rom(
+        "amiga.gary.ext",
+        Arc::new(RomStore::new(bytes.to_vec())),
+        // Dropped on the bus, as the Kickstart socket's writes are.
+        RomWrite::Ignore,
+    )
+    .with_endian(Endian::Big);
+    if len == EXT_WINDOW {
+        return Ok(rom);
+    }
+    Region::mirror("amiga.gary.ext-mirror", Arc::new(rom), EXT_WINDOW)
+}
+
 /// Which of the overlay's two memories is being named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -438,7 +701,7 @@ impl Device for Gary {
         Ok(())
     }
 
-    fn reset(&self, _kind: ResetKind) {
+    fn reset(&self, kind: ResetKind) {
         // Both kinds. The processor is about to fetch its reset vector from
         // whatever is at zero, and a board whose overlay did not come back would
         // reset into empty RAM.
@@ -448,6 +711,13 @@ impl Device for Gary {
         // right order, because the level it publishes then is the level its own
         // reset left it at.
         self.overlay.ovl.store(true, Ordering::Relaxed);
+        // Power clears the card's RAM and a reset line does not, as for any
+        // other `ram` (`machine::builtin`).
+        if kind == ResetKind::Cold
+            && let Some(slow) = &self.slow
+        {
+            let _ = slow.fill(0, slow.len(), 0);
+        }
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -456,11 +726,31 @@ impl Device for Gary {
         // which way it was pointing would come back with the ROM over a
         // running system's vector table.
         w.write_bool(self.overlaid())?;
+        // The card's RAM, which is state like chip RAM's: Kickstart 1.3 puts
+        // `ExecBase` in it. No bytes with no card. The extended ROM is not
+        // saved, for the reason the `rom` class gives: it is the image the
+        // caller bound.
+        let mut bytes = alloc::vec![0u8; usize::try_from(self.slow_ram()).unwrap_or(0)];
+        if let Some(slow) = &self.slow {
+            slow.read_at(0, &mut bytes)?;
+        }
+        w.write_bytes(&bytes)?;
         Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let ovl = r.read_bool()?;
+        let bytes: &[u8] = r.read_bytes()?;
+        if bytes.len() as u64 != self.slow_ram() {
+            return Err(Error::State(format!(
+                "snapshot has {} byte(s) of slow RAM, this board has {}",
+                bytes.len(),
+                self.slow_ram()
+            )));
+        }
+        if let Some(slow) = &self.slow {
+            slow.write_at(0, bytes)?;
+        }
         self.overlay.ovl.store(ovl, Ordering::Relaxed);
         Ok(())
     }
@@ -468,6 +758,8 @@ impl Device for Gary {
     fn region(&self, name: &str) -> Option<RegionRef> {
         match name {
             "" | OVERLAY_REGION => Some(Arc::clone(&self.region)),
+            BANK6_REGION => Some(Arc::clone(&self.bank6)),
+            EXT_REGION => Some(Arc::clone(&self.ext)),
             _ => None,
         }
     }
@@ -499,6 +791,15 @@ impl Instance for Gary {
             })?;
             self.attach(which, &region, bits)?;
         }
+        if let Some(path) = &self.custom_path {
+            let region = ctx.region(path, "").map_err(|e| Error::Config {
+                at: ctx.path().to_string(),
+                message: format!(
+                    "`custom` has to name the chip-register decode bank 6 repeats: {e}"
+                ),
+            })?;
+            self.attach_custom(&region, bits)?;
+        }
         Ok(())
     }
 }
@@ -507,7 +808,8 @@ impl Instance for Gary {
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "the Amiga `OVL` overlay: the Kickstart ROM or chip RAM at address zero",
+    summary: "the Amiga's address decode: the `OVL` overlay at zero, bank 6 (trapdoor RAM or the \
+              chip registers) and an extended-ROM window",
     properties: &[
         PropertySpec {
             name: "rom",
@@ -526,6 +828,24 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Size,
             required: true,
             summary: "how many bytes the window at address zero decodes",
+        },
+        PropertySpec {
+            name: "custom",
+            kind: ValueKind::Link,
+            required: false,
+            summary: "the chip-register decode bank 6 repeats wherever no slow RAM answers",
+        },
+        PropertySpec {
+            name: "slow-ram",
+            kind: ValueKind::Size,
+            required: false,
+            summary: "the trapdoor card's RAM at $C00000: 0 (no card, the default) or 512K",
+        },
+        PropertySpec {
+            name: "ext",
+            kind: ValueKind::Media,
+            required: false,
+            summary: "the media slot for an extended ROM at $E00000; no bytes is no ROM",
         },
     ],
     construct: |props| Ok(Box::new(Gary::new(props)?)),
@@ -556,8 +876,13 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("rom", ValueKind::Link))
         .prop(PropSchema::new("ram", ValueKind::Link))
         .prop(PropSchema::new("size", ValueKind::Size))
+        .prop(PropSchema::new("custom", ValueKind::Link))
+        .prop(PropSchema::new("slow-ram", ValueKind::Size))
+        .prop(PropSchema::new("ext", ValueKind::Media))
         .region("")
         .region(OVERLAY_REGION)
+        .region(BANK6_REGION)
+        .region(EXT_REGION)
         .port(OVL_PIN, PortDir::In)
 }
 
@@ -565,7 +890,7 @@ pub fn schema() -> ClassSchema {
 mod tests {
     use super::*;
     use crate::core::props::{Link, Value};
-    use crate::core::space::{RamStore, RomStore, RomWrite};
+    use crate::core::space::RegionKind;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
     use alloc::vec;
     use alloc::vec::Vec;
@@ -805,5 +1130,210 @@ mod tests {
             "identical state after a round trip"
         );
         assert!(!restored.overlaid(), "the overlay came back cleared");
+    }
+
+    // -- bank 6 and the extended-ROM window ---------------------------------
+
+    use crate::core::value::Width;
+
+    const K: u64 = 1024;
+    const BANK6: u64 = 0xC0_0000;
+    const EXT: u64 = 0xE0_0000;
+
+    /// A decoder with `custom` named and `extra` properties, its register file
+    /// a 512-byte stand-in whose every word is its own offset, and its two
+    /// new regions placed where the board places them in a 24-bit space.
+    fn board(extra: Props) -> (Gary, AddressSpace) {
+        let mut p = props().with("custom", Value::Link(Link::new("custom").unwrap()));
+        for (name, value) in extra.iter() {
+            p = p.with(name, value.clone());
+        }
+        let g = Gary::new(&p).unwrap();
+        let mut regs = vec![0u8; RGA_SPAN as usize];
+        for (i, word) in regs.chunks_mut(2).enumerate() {
+            word.copy_from_slice(&((i * 2) as u16).to_be_bytes());
+        }
+        let custom: RegionRef = Arc::new(
+            Region::ram("custom", Arc::new(RamStore::new(RGA_SPAN))).with_endian(Endian::Big),
+        );
+        if let RegionKind::Ram(store) = custom.kind() {
+            store.write_at(0, &regs).unwrap();
+        }
+        g.attach_custom(&custom, 24).unwrap();
+        let space = AddressSpace::new("mem", 24).with_unassigned(UnassignedPolicy::OPEN_BUS);
+        space
+            .topology()
+            .map(g.region(BANK6_REGION).unwrap(), BANK6)
+            .unwrap();
+        space
+            .topology()
+            .map(g.region(EXT_REGION).unwrap(), EXT)
+            .unwrap();
+        (g, space)
+    }
+
+    fn word(space: &AddressSpace, addr: u64) -> u64 {
+        space.read(addr, Width::U16, MemAttrs::DEFAULT).unwrap()
+    }
+
+    #[test]
+    fn with_no_card_bank_6_is_the_register_file_every_512_bytes() {
+        let (g, space) = board(Props::new());
+        assert_eq!(g.slow_ram(), 0);
+        for base in [
+            BANK6,
+            BANK6 + 0x200,
+            BANK6 + 0x7_FE00,
+            BANK6 + BANK6_LEN - 0x200,
+        ] {
+            assert_eq!(word(&space, base + 0x09A), 0x09A, "{base:#x}");
+            assert_eq!(word(&space, base + 0x1FE), 0x1FE, "{base:#x}");
+        }
+        // A store lands in the register file, seen through every repeat.
+        space
+            .write(BANK6 + 0x10_0010, Width::U16, 0xBEEF, MemAttrs::DEFAULT)
+            .unwrap();
+        assert_eq!(word(&space, BANK6 + 0x010), 0xBEEF);
+        // A byte keeps its half, big-endian.
+        assert_eq!(
+            space.read(BANK6 + 0x011, Width::U8, MemAttrs::DEFAULT),
+            Ok(0xEF)
+        );
+        // Past the bank, nothing.
+        assert_eq!(word(&space, BANK6 + BANK6_LEN), 0);
+    }
+
+    #[test]
+    fn an_a501_answers_the_first_512k_and_the_registers_the_rest() {
+        let (g, space) = board(Props::new().with("slow-ram", Value::Size(512 * K)));
+        assert_eq!(g.slow_ram(), 512 * K);
+        for addr in [BANK6, BANK6 + 0x09A, BANK6 + ERAM_LEN - 4] {
+            space
+                .write(addr, Width::U32, 0x1234_5678, MemAttrs::DEFAULT)
+                .unwrap();
+            assert_eq!(
+                space.read(addr, Width::U32, MemAttrs::DEFAULT),
+                Ok(0x1234_5678),
+                "{addr:#x}"
+            );
+            assert_eq!(space.read(addr, Width::U8, MemAttrs::DEFAULT), Ok(0x12));
+        }
+        assert_eq!(
+            word(&space, BANK6 + ERAM_LEN + 0x09A),
+            0x09A,
+            "the registers"
+        );
+        assert_eq!(
+            word(&space, BANK6 + 0x09A + 2),
+            0x5678,
+            "and not under the card"
+        );
+    }
+
+    #[test]
+    fn slow_ram_is_512k_or_none() {
+        for bad in [256 * K, 1024 * K, 1536 * K] {
+            assert!(Gary::new(&props().with("slow-ram", Value::Size(bad))).is_err());
+        }
+        assert!(Gary::new(&props().with("slow-ram", Value::Size(0))).is_ok());
+    }
+
+    #[test]
+    fn without_custom_the_register_part_of_bank_6_floats() {
+        let g = Gary::new(&props()).unwrap();
+        let space = AddressSpace::new("mem", 24).with_unassigned(UnassignedPolicy::OPEN_BUS);
+        space
+            .topology()
+            .map(g.region(BANK6_REGION).unwrap(), BANK6)
+            .unwrap();
+        space
+            .write(BANK6, Width::U16, 0x1234, MemAttrs::DEFAULT)
+            .unwrap();
+        assert_eq!(word(&space, BANK6), 0);
+    }
+
+    #[test]
+    fn an_empty_ext_slot_is_no_rom_and_a_filled_one_repeats_through_the_window() {
+        let (_, space) = board(Props::new().with("ext", Media::new("ext", &[][..])));
+        assert_eq!(word(&space, EXT), 0, "floats");
+        space
+            .write(EXT, Width::U16, 0x1234, MemAttrs::DEFAULT)
+            .unwrap();
+        assert_eq!(word(&space, EXT), 0, "and keeps nothing");
+
+        let mut image = vec![0u8; (256 * K) as usize];
+        image[..4].copy_from_slice(&[0x11, 0x14, 0x4E, 0xF9]);
+        let (_, space) = board(Props::new().with("ext", Media::new("ext", image)));
+        assert_eq!(word(&space, EXT), 0x1114);
+        assert_eq!(
+            word(&space, EXT + 256 * K),
+            0x1114,
+            "a 256 KiB part repeats"
+        );
+        space.write(EXT, Width::U16, 0, MemAttrs::DEFAULT).unwrap();
+        assert_eq!(word(&space, EXT), 0x1114, "a write is dropped");
+    }
+
+    #[test]
+    fn an_ext_image_that_cannot_repeat_evenly_is_refused() {
+        for len in [300 * K, 1024 * K] {
+            let image = vec![0u8; len as usize];
+            assert!(Gary::new(&props().with("ext", Media::new("ext", image))).is_err());
+        }
+    }
+
+    #[test]
+    fn a_cold_reset_clears_the_card_and_a_warm_one_does_not() {
+        let (g, space) = board(Props::new().with("slow-ram", Value::Size(512 * K)));
+        space
+            .write(BANK6, Width::U16, 0xCAFE, MemAttrs::DEFAULT)
+            .unwrap();
+        Device::reset(&g, ResetKind::Warm);
+        assert_eq!(word(&space, BANK6), 0xCAFE);
+        Device::reset(&g, ResetKind::Cold);
+        assert_eq!(word(&space, BANK6), 0);
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_card_and_refuses_another_size() {
+        let (saved, space) = board(Props::new().with("slow-ram", Value::Size(512 * K)));
+        space
+            .write(BANK6 + 0x100, Width::U32, 0xDEAD_BEEF, MemAttrs::DEFAULT)
+            .unwrap();
+        drive(&saved, Level::Low);
+        let bytes = snapshot(&saved);
+
+        let (restored, space) = board(Props::new().with("slow-ram", Value::Size(512 * K)));
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("gary", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        assert_eq!(
+            snapshot(&restored),
+            bytes,
+            "identical state after a round trip"
+        );
+        assert_eq!(
+            space.read(BANK6 + 0x100, Width::U32, MemAttrs::DEFAULT),
+            Ok(0xDEAD_BEEF)
+        );
+
+        let (stock, _) = board(Props::new());
+        let chunk = reader
+            .load("gary", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        assert!(Device::load(&stock, &mut chunk.reader()).is_err());
+    }
+
+    #[test]
+    fn the_new_regions_and_properties_are_in_the_schema() {
+        let schema = schema();
+        for name in ["custom", "slow-ram", "ext"] {
+            assert!(schema.props.iter().any(|p| p.name == name), "{name}");
+        }
+        let (g, _) = board(Props::new());
+        assert_eq!(g.region(BANK6_REGION).unwrap().len(), BANK6_LEN);
+        assert_eq!(g.region(EXT_REGION).unwrap().len(), EXT_WINDOW);
     }
 }

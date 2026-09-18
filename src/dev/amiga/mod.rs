@@ -6,7 +6,7 @@
 //! | class | what it is |
 //! | --- | --- |
 //! | [`custom`] | the register window at `$DFF000`, the appendix's table, and the subscription seam a chip attaches through |
-//! | [`gary`] | the `OVL` overlay — whether the Kickstart ROM or chip RAM answers at address zero |
+//! | [`gary`] | the address decode: the `OVL` overlay at zero, bank 6 (an A501's slow RAM or the chip registers again) and a window at `$E0_0000` for AROS's second ROM half |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
 //! | `agnus` | `dev-amiga-agnus`: Agnus — the beam counters and sync, `DMACON`, the copper, the blitter, and every DMA transfer |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
