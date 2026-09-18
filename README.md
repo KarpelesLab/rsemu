@@ -98,11 +98,11 @@ quietly leaving the impression of a number.
 Every corpus is fetched by `scripts/fetch-testdata.sh`, never vendored, and
 gated behind an environment variable — a licensing rule as much as a size one.
 
-**Thirty-four machine files**, and `machines/` is where they live: a machine is
+**Thirty-seven machine files**, and `machines/` is where they live: a machine is
 described rather than compiled in. Which of them exists in a given binary is a
 feature set, and `rsemu machines` lists what *your* build has.
 
-Nineteen are consoles, computers and microcontrollers; the other fifteen are
+Twenty are consoles, computers and microcontrollers; the other seventeen are
 synthetic boards that exist so a subsystem has somewhere real to run.
 
 `nes-ntsc` and `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run headlessly, with an
@@ -121,7 +121,7 @@ FF00: D8 A2 FF 9A A9 7F 8D 12
 
 ### The boards that boot software this project did not write
 
-There are seven, on three architectures — counting a board and its
+There are eight, on four architectures — counting a board and its
 two-processor twin as one, which is what they are: an `-smp` file is the same
 board with a second `cpu` object and a table told about it. **Four of those
 twins exist** — `riscv-virt-smp`, `arm64-virt-smp`, `q35-linux-smp` and
@@ -444,6 +444,34 @@ board says the thing a comment cannot: an F4's core-coupled memory is on the
 Cortex-M4's own bus and no DMA reaches it, so `dmabus` has SRAM and the
 peripherals in it and no CCM, and a stream pointed at `0x10000000` raises a
 transfer error exactly as the silicon does.
+
+`amiga-a500` is the newest, and it is the one that boots a **desktop**. A
+68000, the full custom chipset — Agnus with the copper, the blitter and the
+beam, Denise, Paula, two 8520s, Gary's address decode — and a 3.5-inch drive on
+the CIA ports. Point it at a Kickstart and it draws what an A500 with an empty
+drive draws: **1.3's hand holding a disk, 2.04's and 3.1's check mark with the
+disk sliding into the drive**. Put a Workbench disk in DF0 and **1.3 and 2.04
+boot to their desktops** — title bar, icons, pointer — off the real ADF, read
+in place. Then **a person can use it**: through the same input seam a VNC
+client drives, a test double-clicks the disk icon, opens a Shell and types
+`echo hello` into it, on both releases. The four audio channels reach a host
+`.wav` in stereo, 0 and 3 left and 1 and 2 right, the way the machine is wired.
+**AROS boots its own boot disk to the Workbook desktop** as well, given the
+extended-ROM socket the board offers and more memory than Commodore ever sold
+in one — the machine file says so where it offers it.
+
+**Not one byte of any of that is in this repository, and none ever will be.**
+Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's
+own **Amiga Forever** files in place, decoding its keyed `AMIROMTYPE1` images
+with the `rom.key` beside them, and **skip with a printed reason** when the
+environment variable naming that directory is unset — so `cargo test` passes for
+somebody who owns none of it. What the goldens assert is *our rendering*: a hash
+of the picture Denise produced, at a fixed virtual instant, plus that nothing
+faulted. No Amiga emulator's source was opened for any of it — not UAE, not
+WinUAE, not vAmiga, not AROS's own tree — and
+[`docs/platforms/amiga.md`](docs/platforms/amiga.md) cites the *Amiga Hardware
+Reference Manual* chapter by chapter for what it does instead, including the
+handful of behaviours inferred from what the firmware itself demanded.
 
 Beside them are the seventeen synthetic boards, each the smallest
 machine that exercises one thing: `spi-panel` (a display path over SPI, with a
