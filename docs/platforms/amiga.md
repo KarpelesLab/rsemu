@@ -350,11 +350,43 @@ out of chip memory** on a 512 KiB board (`AvailMem` down to 16 bytes, grey
 screen, idle). With `-p chip-ram=1M` it draws its boot picture — a cat's eyes
 in the dark, 640 pixels of high resolution, square since the fetch fix below.
 
-That leaves one AROS question that is this board's: with `amiga.keyboard`
-wired to CIA-A, AROS stops at a plain grey screen and draws nothing, and
-without it the picture appears. Its serial log ends at `romtaginit done`
-either way. Kickstart 1.3, 2.04 and 3.1 are unaffected by the keyboard, so
-this is AROS reading something from it that the model answers differently.
+That leaves one AROS question, and it is still open: on that scratch board
+(extended ROM at `$E0_0000`, `-p chip-ram=1M`), with `amiga.keyboard` wired to
+CIA-A AROS stops at a plain grey screen (`COLOR00` `$AAA`, no bitplane DMA),
+and without it the picture appears. Its serial log ends at `romtaginit done`
+either way. The shipped board is no witness: without the extended ROM it draws
+nothing with or without the keyboard. What is established:
+
+* **The keyboard's side of the wire checks out** against Appendix G and the
+  8520 data sheet: eight positive `CNT` edges a byte, 60 µs a bit, the code
+  rotated and inverted into `SDR`, the handshake latched. Kickstart 1.3 and
+  AROS both receive `$FD` and `$FE` intact, and 1.3 receives typed keys.
+* **What sets it off is timing, not content.** AROS enables the `SP`
+  interrupt, reads `ICR` and `SDR`, and pulses `KDAT` low for about a
+  millisecond (`CRA` bit 6, timed on CIA-A's timer B) — before its input
+  handling is ready. The keyboard, still resynchronising after power-up, takes
+  that pulse as the handshake it has been waiting for and sends its power-up
+  stream about 1.5 ms later. Any code delivered then wedges AROS: `$FD`, `$FE`,
+  `$40` and `$FF` alike. The same codes delivered half a second later — the
+  keyboard started after the pulse, or its reply held back 500 ms — and AROS
+  boots to "Waiting for bootable media", keyboard working. 143 ms is not
+  enough.
+* **The wedge is a lost wake-up.** At 60 s nothing is ready: the Exec
+  Bootstrap Task is waiting on signal `$00080000` and `input.device` on
+  `$003F0000` (read through the RKRM's `ExecBase` and `Task` layouts).
+* **It is not speed.** A crystal four times faster wedges the same way, and a
+  keyboard clock 5 % off does too. Taking DF0 off the board, or only its `TK0*`
+  wire, also avoids it (AROS's path then differs); taking the mouse off does
+  not.
+* **Ruled out:** resetting the 8520's shift counter when `CRA` bit 6 flips,
+  the one-shot timer-high start, and a spurious level-seven interrupt (Paula
+  could flicker its `IPL` pins through seven; fixed, but it never fired here).
+  The interrupt levels the processor takes are the same with and without the
+  keyboard, apart from the keyboard's own four at level 2.
+
+So the open question is what on this board makes a code arriving in that
+window cost a wake-up. Holding the keyboard's reply back would hide it, but a
+real keyboard answers just as fast, so that would be a workaround, not a fix.
 
 What it took to get the Kickstarts there, beyond the byte access and the ROM
 mirror:
@@ -571,8 +603,11 @@ shifted out afterwards ("SP will remain at the level of the last data bit
 transmitted"). That is a reading of the data sheet's "all other registers are
 reset to zero" rather than a sentence of it, and it is what makes turning
 CIA-A's serial port to output — which never transmits a byte — pull KDAT low
-for the handshake. **It is not yet confirmed against Kickstart**: neither
-Kickstart 2.04 nor AROS reaches keyboard initialisation on this board yet.
+for the handshake. **Kickstart confirms it**: 1.3 turns the port round to
+answer the keyboard, receives the power-up stream as `SDR` `$04` and `$02`
+(`$FD`, `$FE`), and a key typed at its insert-disk screen arrives as `$7F` and
+`$7E` (`$40` down and up), each acknowledged. AROS does the same; see *Real
+Kickstarts* for what happens to it next.
 
 **The mouse is quadrature transitions, not counter writes.** Host motion
 becomes one Gray-code step at a time on the connector's X, XQ, Y and YQ pins,
