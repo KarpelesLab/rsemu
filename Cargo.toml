@@ -1319,6 +1319,22 @@ dev-psram-qspi = ["bus-spi"]
 # UM10204 Rev. 7.0, cited by section. `no_std + alloc`, no dependencies.
 bus-i2c = []
 
+# SWI, Microchip CryptoAuthentication's **single-wire interface**
+# (src/bus/swi): one self-clocked line, no clock and no address, with a UART at
+# the host end whose TX and RX are tied together through a resistor. The unit
+# of this fabric is a UART frame, because one frame carries one logical *bit* --
+# 0x7F a one, 0x7D a zero, at 230.4 kBaud with seven data bits, no parity and
+# one stop bit -- and eight of them make a flag (0x77 command, 0x88 transmit,
+# 0xBB idle, 0xCC sleep) or a byte of a group. The wake is arithmetic rather
+# than a call: the link reports how long each frame held the line low, which is
+# why a host wakes a part by sending 0x00 at half the baud rate, and the part
+# decides what its own tWLO is. A peripheral implements `SwiSlave` beside its
+# `I2cSlave` face and shares one packet layer between them. Written from the
+# openly published Microchip ATECC608B-TFLXTLS (DS40002249B) chapter 8 and
+# ATSHA204A (DS40002025A) chapter 5, cited by section; CryptoAuthLib is not
+# permissively licensed and was not opened. `no_std + alloc`, no dependencies.
+bus-swi = []
+
 # The Atmel AT24C01D/02D I2C serial EEPROM (src/dev/atmel): 128 or 256 bytes on
 # two wires, and the smallest honest device that proves an I2C bus works. Byte
 # and page write with the in-page roll-over the datasheet warns about,
@@ -1356,12 +1372,18 @@ dev-st25dv = ["bus-i2c"]
 # `UpdateExtra`, `Info`, `Counter`, `Random`, `Nonce`, `GenDig`, `MAC`,
 # `CheckMac`, `HMAC`, `SHA`, `GenKey`, `PrivWrite`, `Sign`, `Verify`, `ECDH`,
 # `SelfTest` and the 608's `AES`. Written from the ATECC508A (DS20005927) and
-# ATECC608A/B (DS40001977, DS40002239) datasheets, cited by section. The
-# **SWI** single-wire transport is not modelled and the module says what it
-# would need. Needs `bus-i2c` and pulls `purecrypto` for SHA-256, HMAC, AES-128
-# and P-256; every "random" byte and every generated key comes from the board's
-# `seed`, so two runs deal the same keys and hash the same.
-dev-atecc = ["bus-i2c", "dep:purecrypto"]
+# ATECC608A/B (DS40001977, DS40002239) datasheets, cited by section. Over
+# **SWI** as well (`bus-swi`): the same packet layer behind a single-wire front
+# end, so the flag and token stream of DS40002249B chapter 8 reaches the very
+# same command engine and answers the very same bytes -- the wake pulse and its
+# 04 11 33 43 token, the four flags, the eight-token LSb-first bytes of a
+# group, the section 8.3.1 I/O timeout that puts the part to sleep after a
+# malformed token, and the same section 6.3 watchdog. `interface` decides the
+# `I2C_Enable` configuration byte firmware reads. Needs `bus-i2c` and `bus-swi`
+# and pulls `purecrypto` for SHA-256, HMAC, AES-128 and P-256; every "random"
+# byte and every generated key comes from the board's `seed`, so two runs deal
+# the same keys and hash the same.
+dev-atecc = ["bus-i2c", "bus-swi", "dep:purecrypto"]
 
 # The STM32 I2C peripheral, **v1** -- the F1/F2/F4/L1 block with
 # CR1/CR2/OAR1/DR/SR1/SR2/CCR, not the completely different F0/F3/F7/H7 one with

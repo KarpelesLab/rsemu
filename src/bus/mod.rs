@@ -12,6 +12,7 @@
 //! | --- | --- | --- |
 //! | [`pci`] | `bus-pci` | PCI: configuration space, bus/device/function addressing, the `0xcf8`/`0xcfc` mechanism, master aborts |
 //! | [`spi`] | `bus-spi` | SPI: chip selects, the four modes, word size, bit order, full duplex — modelled transactionally *or* as clocked wires |
+//! | [`swi`] | `bus-swi` | SWI: Microchip CryptoAuthentication's single self-clocked wire, one UART frame per logical bit |
 //! | [`usb`] | `bus-usb` | USB: devices, endpoints, the four transfer types, descriptors, enumeration, speeds and ports — controller-agnostic |
 //!
 //! Everything here is `no_std + alloc` and names no host facility.
@@ -55,6 +56,10 @@ pub mod pci;
 #[cfg(feature = "bus-spi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bus-spi")))]
 pub mod spi;
+
+#[cfg(feature = "bus-swi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "bus-swi")))]
+pub mod swi;
 
 #[cfg(feature = "bus-usb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bus-usb")))]
