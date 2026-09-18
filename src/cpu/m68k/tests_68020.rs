@@ -1008,3 +1008,455 @@ fn the_68020_disassembly_lengths_match_everywhere_the_68000_ones_did() {
     );
     assert!(checked > 10_000, "only {checked} encodings were exercised");
 }
+
+// ---------------------------------------------------------------------------
+// Stack frames, the master stack, and tracing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_trap_pushes_format_0_on_a_68020_too() {
+    let board = m68020(&[0x4e43], |_| {}); // TRAP #3
+    board.handler(0, vector::TRAP_BASE + 3, 0x0c00);
+    let sr = board.cpu.regs().sr;
+    board.cpu.step();
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(sp, 0x2000 - 8);
+    assert_eq!(board.peek_word(sp), sr);
+    assert_eq!(board.peek_long(sp + 2), 0x402);
+    assert_eq!(board.peek_word(sp + 6), 0x008c);
+}
+
+#[test]
+fn m_selects_the_master_stack() {
+    // MOVE #$3000,SR sets S and M: A7 becomes the master stack pointer.
+    let board = m68020(&[0x46fc, 0x3000, 0x4e43], |r| r.msp = 0x1800);
+    board.handler(0, vector::TRAP_BASE + 3, 0x0c00);
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert!(r.master());
+    assert_eq!((r.a[7], r.ssp, r.msp), (0x1800, 0x2000, 0x1800));
+    // An ordinary exception stacks on it and leaves M alone.
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.a[7], 0x1800 - 8);
+    assert!(r.master());
+    assert_eq!(r.ssp, 0x2000, "the interrupt stack is untouched");
+}
+
+#[test]
+fn an_interrupt_in_master_state_leaves_a_throwaway_frame_on_the_interrupt_stack() {
+    // MC68020UM §6.1.9: the format 0 frame on the master stack, then M
+    // cleared and a format 1 copy on the interrupt stack with S set; the
+    // handler runs on the interrupt stack.
+    let board = m68020(&[0x4e71, 0x4e71], |r| {
+        r.sr = flags::S | flags::M; // mask 0
+        r.msp = 0x1800;
+        r.ssp = 0x2000;
+    });
+    board.handler(0, vector::AUTOVECTOR_BASE + 2, 0x0e00);
+    board.poke_word(0x0e00, 0x4e73); // the handler is just RTE
+    let sr = board.cpu.regs().sr;
+    board.cpu.set_ipl(2);
+    let used = board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x0e00);
+    assert!(!r.master(), "the handler runs with M clear");
+    assert_eq!(r.a[7], 0x2000 - 8, "on the interrupt stack");
+    assert_eq!(r.msp, 0x1800 - 8);
+    // The master stack's frame, format 0.
+    assert_eq!(board.peek_word(0x1800 - 8), sr);
+    assert_eq!(board.peek_long(0x1800 - 6), 0x400);
+    assert_eq!(board.peek_word(0x1800 - 2), 0x0068, "format 0, offset $068");
+    // The throwaway frame, format 1, the status word with S set.
+    assert_eq!(board.peek_word(0x2000 - 8), sr | flags::S);
+    assert_eq!(board.peek_long(0x2000 - 6), 0x400);
+    assert_eq!(board.peek_word(0x2000 - 2), 0x1068, "format 1, offset $068");
+    assert_eq!(used, 41, "Interrupt (M-Stack), MC68020UM §8.2.17");
+    // RTE pops the throwaway frame, which puts M back, then the real one.
+    board.cpu.set_ipl(0);
+    let used = board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x400);
+    assert!(r.master());
+    assert_eq!((r.a[7], r.ssp, r.msp), (0x1800, 0x2000, 0x1800));
+    assert_eq!(
+        used,
+        16 + 21,
+        "RTE (Throwaway) plus the normal frame under it"
+    );
+}
+
+#[test]
+fn an_odd_instruction_fetch_pushes_the_short_bus_fault_frame() {
+    // JMP to an odd address. MC68020UM Table 6-5, format $A, 16 words: the
+    // stacked PC is the odd target ("next instruction"), and both pipe stages
+    // are marked for rerun.
+    let board = m68020(&[0x4ed0], |r| r.a[0] = 0x0701);
+    board.handler(0, vector::ADDRESS_ERROR, 0x0800);
+    let sr = board.cpu.regs().sr;
+    let used = board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x800);
+    let sp = u64::from(r.a[7]);
+    assert_eq!(sp, 0x2000 - 32);
+    assert_eq!(board.peek_word(sp), sr, "+$00 SR");
+    assert_eq!(board.peek_long(sp + 2), 0x0701, "+$02 PC");
+    assert_eq!(
+        board.peek_word(sp + 6),
+        0xa00c,
+        "+$06 format $A, offset $00C"
+    );
+    assert_eq!(board.peek_word(sp + 0x0a), 0x3000, "+$0A SSW: RC and RB");
+    assert_eq!(used, 4 + 2 + 43, "JMP (An), then Bus Cycle Fault (Short)");
+}
+
+#[test]
+fn a_data_bus_error_pushes_the_long_frame_and_rte_reruns_the_cycle() {
+    // MOVE.W D0,($01002000).L on a 68020: nothing answers there.
+    let board = m68020(&[0x33c0, 0x0100, 0x2000, 0x4e71], |r| r.d[0] = 0xbeef);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.poke_word(0x0800, 0x4e73); // RTE, and let it rerun
+    let sr = board.cpu.regs().sr;
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x800);
+    let sp = u64::from(r.a[7]);
+    assert_eq!(sp, 0x2000 - 92, "46 words");
+    // MC68020UM Table 6-5, format $B, and Figure 6-8 for the SSW. The status
+    // word is the one at the fault: the MOVE had set its flags from $BEEF.
+    assert_eq!(board.peek_word(sp), sr | flags::N, "+$00 SR");
+    assert_eq!(
+        board.peek_long(sp + 2),
+        0x400,
+        "+$02 the faulted instruction"
+    );
+    assert_eq!(
+        board.peek_word(sp + 6),
+        0xb008,
+        "+$06 format $B, offset $008"
+    );
+    // DF, a write (RW clear), a word (SIZE 10), supervisor data (FC 5).
+    assert_eq!(board.peek_word(sp + 0x0a), 0x0125, "+$0A SSW");
+    assert_eq!(
+        board.peek_long(sp + 0x10),
+        0x0100_2000,
+        "+$10 fault address"
+    );
+    assert_eq!(
+        board.peek_long(sp + 0x18) & 0xffff,
+        0xbeef,
+        "+$18 data output buffer"
+    );
+    assert_eq!(board.peek_long(sp + 0x24), 0x404, "+$24 stage B address");
+    assert_eq!(
+        board.peek_word(sp + 0x36) >> 12,
+        super::exec::VERSION_68020,
+        "+$36 version number"
+    );
+    // RTE with DF still set reruns the write: the instruction starts again
+    // from its first word, and faults again, on a stack the first frame was
+    // popped from.
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().pc, 0x400, "restarted");
+    assert_eq!(board.cpu.regs().a[7], 0x2000);
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x800, "the rerun faulted again");
+    assert_eq!(r.a[7], 0x2000 - 92);
+}
+
+#[test]
+fn a_data_fault_completed_in_software_is_not_rerun() {
+    // MOVE.W ($01002000).L,D1 faults; the handler puts $1234 in the data
+    // input buffer, clears DF, and returns (MC68020UM §6.2.2).
+    let board = m68020(&[0x3239, 0x0100, 0x2000, 0x4e71], |_| {});
+    board.poke_long(u64::from(vector::BUS_ERROR) * 4, 0x0800);
+    board.load(
+        0x0800,
+        &[
+            0x2f7c, 0x0000, 0x1234, 0x002c, // MOVE.L #$1234,$2C(A7)
+            0x08af, 0x0000, 0x000a, // BCLR #0,$A(A7): DF is bit 8, the low bit of +$0A
+            0x4e73, // RTE
+        ],
+    );
+    for _ in 0..5 {
+        board.cpu.step();
+    }
+    let r = board.cpu.regs();
+    assert_eq!(r.d[1] & 0xffff, 0x1234);
+    assert_eq!(r.pc, 0x406, "past the MOVE, at the NOP");
+    assert_eq!(r.a[7], 0x2000);
+}
+
+#[test]
+fn a_prefetch_past_the_end_of_memory_is_not_a_fault_until_it_is_used() {
+    // An RTS as the last word of mapped memory: the 68020 fetches ahead into
+    // nothing, and must not fault for it (MC68020UM §6.1.2). The guarded
+    // region ends at $11000 and nothing is mapped after it.
+    let board = m68020(&[0x4ef9, 0x0001, 0x0ffe], |_| {}); // JMP $10FFE
+    board.guarded.write_u8(0xffe, 0x4e).unwrap();
+    board.guarded.write_u8(0xfff, 0x75).unwrap(); // RTS
+    board.poke_long(0x1ffc, 0x0500);
+    board.poke_word(0x500, 0x4e71);
+    board.with_regs(|r| {
+        r.a[7] = 0x1ffc;
+        r.ssp = 0x1ffc;
+    });
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.cpu.step(); // JMP
+    assert_eq!(board.cpu.regs().pc, 0x10ffe);
+    board.cpu.step(); // RTS
+    assert_eq!(board.cpu.regs().pc, 0x500, "no bus error");
+    // Falling off the end is one, when the missing word is reached, and it
+    // is the short frame at the instruction boundary.
+    let board = m68020(&[0x4ef9, 0x0001, 0x0ffe], |_| {});
+    board.guarded.write_u8(0xffe, 0x4e).unwrap();
+    board.guarded.write_u8(0xfff, 0x71).unwrap(); // NOP
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.cpu.step(); // JMP
+    board.cpu.step(); // NOP
+    assert_eq!(board.cpu.regs().pc, 0x11000);
+    board.cpu.step(); // the missing opcode
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x800);
+    let sp = u64::from(r.a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0xa008, "format $A");
+    assert_eq!(
+        board.peek_long(sp + 2),
+        0x11000,
+        "the instruction it could not fetch"
+    );
+    assert_eq!(board.peek_long(sp + 0x10), 0x11000, "and where");
+}
+
+#[test]
+fn rte_rejects_a_format_the_68020_does_not_define() {
+    for format in [0x3000u16, 0x9000] {
+        let board = m68020(&[0x4e73], |r| {
+            r.a[7] = 0x1ff0;
+            r.ssp = 0x1ff0;
+        });
+        board.handler(0, vector::FORMAT_ERROR, 0x0900);
+        board.poke_word(0x1ff0, 0x2700);
+        board.poke_long(0x1ff2, 0x0500);
+        board.poke_word(0x1ff6, format);
+        board.cpu.step();
+        let r = board.cpu.regs();
+        assert_eq!(r.pc, 0x900, "format {format:04x}");
+        assert_eq!(r.a[7], 0x1ff0 - 8, "the bad frame stays");
+    }
+}
+
+#[test]
+fn rte_returns_from_a_six_word_frame() {
+    let board = m68020(&[0x4e73], |r| {
+        r.a[7] = 0x1ff0;
+        r.ssp = 0x1ff0;
+    });
+    board.poke_word(0x1ff0, 0x2700);
+    board.poke_long(0x1ff2, 0x0500);
+    board.poke_word(0x1ff6, 0x2018);
+    board.poke_long(0x1ff8, 0x0400);
+    board.poke_word(0x500, 0x4e71);
+    let used = board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!((r.pc, r.a[7]), (0x500, 0x1ff0 + 12));
+    assert_eq!(used, 21, "RTE (Six Word)");
+}
+
+#[test]
+fn t1_traces_every_instruction_with_the_six_word_frame() {
+    let board = m68020(&[0x7001], |r| r.sr |= flags::T); // MOVEQ #1,D0
+    board.handler(0, vector::TRACE, 0x0f80);
+    let used = board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x0f80);
+    assert!(
+        !r.flag(flags::T) && !r.flag(flags::T0),
+        "tracing off in the handler"
+    );
+    let sp = u64::from(r.a[7]);
+    assert_eq!(board.peek_long(sp + 2), 0x402, "the next instruction");
+    assert_eq!(board.peek_word(sp + 6), 0x2024, "format 2, offset $024");
+    assert_eq!(board.peek_long(sp + 8), 0x400, "the traced instruction");
+    assert_eq!(used, 2 + 25, "MOVEQ, then Trace");
+}
+
+#[test]
+fn t0_traces_only_a_change_of_flow() {
+    // NOP then BRA.S: with T0 alone, the NOP runs untraced and the branch
+    // is traced (MC68020UM §6.1.7, Table 6-2).
+    let board = m68020(&[0x4e71, 0x6006], |r| r.sr |= flags::T0);
+    board.handler(0, vector::TRACE, 0x0f80);
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().pc, 0x402, "no trace after the NOP");
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x0f80);
+    assert_eq!(
+        board.peek_long(u64::from(r.a[7]) + 2),
+        0x40a,
+        "the branch target"
+    );
+    // A 68000 has no T0: the bit reads as zero.
+    let old = super::tests_68010::Board::new(Model::M68000);
+    old.boot(&[0x4e71]);
+    old.with_regs(|r| r.sr |= flags::T0);
+    assert_eq!(old.cpu.regs().sr & flags::T0, 0);
+}
+
+#[test]
+fn a_traced_trap_is_followed_by_the_trace() {
+    // TRAP #0 with T1: the trap's processing, then the trace's, so the trace
+    // handler returns into the trap handler (MC68020UM §6.1.11).
+    let board = m68020(&[0x4e40], |r| r.sr |= flags::T);
+    board.handler(0, vector::TRAP_BASE, 0x0c00);
+    board.handler(0, vector::TRACE, 0x0f80);
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x0f80, "in the trace handler");
+    let sp = u64::from(r.a[7]);
+    assert_eq!(
+        board.peek_long(sp + 2),
+        0x0c00,
+        "which returns to the trap handler"
+    );
+    assert_eq!(
+        board.peek_word(sp + 12),
+        board.cpu.regs().sr & !flags::T | flags::T
+    );
+    assert_eq!(sp, 0x2000 - 8 - 12);
+}
+
+// ---------------------------------------------------------------------------
+// Timing: MC68020UM §8.2, cache case
+// ---------------------------------------------------------------------------
+
+#[test]
+fn instruction_times_are_the_cache_case_column() {
+    let time = |words: &[u16], edit: fn(&mut super::Regs)| {
+        let board = m68020(words, edit);
+        board.poke_long(0x1000, 0x0000_0003);
+        board.cpu.step()
+    };
+    let a0 = |r: &mut super::Regs| r.a[0] = 0x1000;
+    let none = |_: &mut super::Regs| {};
+    // §8.2.16, §8.2.9, §8.2.6.
+    assert_eq!(time(&[0x4e71], none), 2, "NOP");
+    assert_eq!(time(&[0x7001], none), 2, "MOVEQ");
+    assert_eq!(time(&[0x2200], none), 2, "MOVE.L D0,D1: Rn to Dn");
+    assert_eq!(time(&[0x3210], a0), 6, "MOVE.W (A0),D1: (An) to Dn");
+    assert_eq!(time(&[0x22bc, 0, 1], a0), 8, "MOVE.L #,(A1): #.L to (An)");
+    assert_eq!(
+        time(&[0x3170, 0x0000, 0x0010], a0),
+        10,
+        "(d8,An,Xn) to (d16,An)"
+    );
+    // §8.2.8: the row plus the fetch-effective-address time.
+    assert_eq!(time(&[0xd050], a0), 2 + 4, "ADD.W (A0),D0");
+    assert_eq!(time(&[0xd190], a0), 4 + 4, "ADD.L D0,(A0)");
+    // §8.2.9: plus fetch immediate.
+    assert_eq!(time(&[0x0640, 0x0001], none), 2 + 2, "ADDI.W #1,D0");
+    assert_eq!(time(&[0x0690, 0, 1], a0), 4 + 4, "ADDI.L #1,(A0)");
+    // The manual's own worked example (§8.2): MULU.L D7,D1:D2 is 2 + 43 and
+    // DIVS.L #$10000,D3:D4 is 6 + 90.
+    assert_eq!(time(&[0x4c07, 0x2401], none), 45, "MULU.L D7,D1:D2");
+    assert_eq!(
+        time(&[0x4c7c, 0x4c03, 0x0001, 0x0000], |r| r.d[4] = 0x0002_0000),
+        96,
+        "DIVS.L #$10000,D3:D4"
+    );
+    // §8.2.15.
+    assert_eq!(time(&[0x6002], none), 6, "BRA.S, taken");
+    assert_eq!(time(&[0x6702], none), 4, "BEQ.S, not taken");
+    assert_eq!(time(&[0x6700, 0x0002], none), 6, "BEQ.W, not taken");
+    assert_eq!(time(&[0x51c8, 0x0002], |r| r.d[0] = 0), 10, "DBF, expired");
+    assert_eq!(time(&[0x51c8, 0x0002], |r| r.d[0] = 5), 6, "DBF, looping");
+    // §8.2.16 and §8.2.5.
+    assert_eq!(time(&[0x4e90], a0), 5 + 2, "JSR (A0)");
+    assert_eq!(time(&[0x43e8, 0x0010], a0), 2 + 2, "LEA (d16,A0),A1");
+    // §8.2.14: plus calculate immediate. MC68020UM's worked example charges
+    // BFCLR $6000{0:8} the *fetch* immediate row, 5, where the table's own
+    // footnote says calculate, 4; the footnote is what this core follows.
+    assert_eq!(
+        time(&[0xecf8, 0x0008, 0x6000], none),
+        16 + 4,
+        "BFCLR $6000.w{{0:8}}"
+    );
+    assert_eq!(time(&[0xecc0, 0x0008], none), 12, "BFCLR D0{{0:8}}");
+    // §8.2.7: MOVEM's 4 + 3n and MOVEC's row, each plus the calculate
+    // immediate address time its footnote names.
+    assert_eq!(
+        time(&[0x48e7, 0xc000], none),
+        4 + 3 * 2 + 4,
+        "MOVEM.L D0-D1,-(A7)"
+    );
+    assert_eq!(
+        time(&[0x4cd0, 0x0003], a0),
+        8 + 4 * 2 + 2,
+        "MOVEM.L (A0),D0-D1"
+    );
+    assert_eq!(time(&[0x4e7b, 0x0801], none), 12, "MOVEC D0,VBR");
+    assert_eq!(time(&[0x4e7a, 0x0801], none), 6, "MOVEC VBR,D0");
+    assert_eq!(time(&[0x4e75], |r| r.a[7] = 0x1000), 10, "RTS");
+    // §8.2.17.
+    let trap = |words: &[u16], vector: u8| {
+        let board = m68020(words, |_| {});
+        board.handler(0, vector, 0x0c00);
+        board.cpu.step()
+    };
+    assert_eq!(trap(&[0x4e40], vector::TRAP_BASE), 20, "TRAP #n");
+    assert_eq!(trap(&[0x4afc], vector::ILLEGAL), 20, "illegal instruction");
+    assert_eq!(
+        trap(&[0x57fa, 0x0000], vector::TRAPV),
+        6,
+        "TRAPEQ.W, no trap"
+    );
+}
+
+#[test]
+fn an_interrupt_on_the_interrupt_stack_is_26_clocks() {
+    let board = m68020(&[0x4e71], |r| r.sr = flags::S);
+    board.handler(0, vector::AUTOVECTOR_BASE + 1, 0x0e00);
+    board.cpu.set_ipl(1);
+    assert_eq!(board.cpu.step(), 26);
+}
+
+#[test]
+fn the_cycle_counter_advances_by_the_table_not_the_accesses() {
+    let board = m68020(&[0x2210, 0x4e71], |r| r.a[0] = 0x1000); // MOVE.L (A0),D1
+    let before = board.cpu.cycles();
+    assert_eq!(board.cpu.step(), 6);
+    assert_eq!(board.cpu.cycles() - before, 6);
+}
+
+#[test]
+fn a_68020_snapshot_round_trips_every_stack_pointer_and_control_register()
+-> crate::core::error::Result<()> {
+    use super::tests_68010::{restore, snapshot};
+    use super::{Config, M68k};
+    // In master state, with the cache enabled and a poisoned prefetch owed:
+    // all of it survives.
+    let board = m68020(&[0x4ef9, 0x0001, 0x0ffe], |r| {
+        r.sr = flags::S | flags::M;
+        r.usp = 0x0111_1111;
+        r.ssp = 0x0222_2222;
+        r.msp = 0x1800;
+        r.vbr = 0x0333_3333;
+        r.sfc = 1;
+        r.dfc = 5;
+        r.cacr = 1;
+        r.caar = 0x44;
+    });
+    board.guarded.write_u8(0xffe, 0x4e).unwrap();
+    board.guarded.write_u8(0xfff, 0x71).unwrap();
+    board.cpu.step(); // JMP to the last word: the prefetch behind it poisons
+    let bytes = snapshot(&board.cpu)?;
+    let other = M68k::new(Config::MC68020);
+    restore(&other, &bytes)?;
+    assert_eq!(other.regs(), board.cpu.regs());
+    assert_eq!(snapshot(&other)?, bytes, "a round trip is a fixed point");
+    // A 68EC020 is not a 68020, even with the same tail.
+    assert!(restore(&M68k::new(Config::MC68EC020), &bytes).is_err());
+    Ok(())
+}

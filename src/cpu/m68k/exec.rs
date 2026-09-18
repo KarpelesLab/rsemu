@@ -38,6 +38,17 @@
 //! frame pushes is exactly the hardware's — which is the whole reason to model
 //! the queue rather than a byte cursor.
 //!
+//! # One interpreter, several processors
+//!
+//! The 68010 and 68020 run through the same code, with the model deciding the
+//! few places they differ: which rows decode (`isa.rs`), which frame an
+//! exception builds (`enter_exception`, `fault`), whether an odd operand is an
+//! address error, whether a fetch that fails faults at once or when its word is
+//! used, and how an indexed extension word is read. The 68020's time comes from
+//! `timing.rs` and replaces the per-access count at the end of each step; the
+//! accesses themselves are the same ones, so a device sees the same bus cycles
+//! in the same order.
+//!
 //! # Sources
 //!
 //! *M68000 Family Programmer's Reference Manual* (M68000PRM) for every
@@ -54,6 +65,7 @@ use super::isa::{
     Arg, Cond, FieldSpec, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl, decode_for, ea_of,
     is_full_format,
 };
+use super::timing;
 use super::{Config, Lines, flags, vector};
 
 /// Function codes, as they appear on FC0–FC2 and in a group-0 stack frame's
@@ -494,6 +506,13 @@ pub(super) struct Exec<'a> {
     flow: bool,
     /// A function code `MOVES` substitutes for the ordinary data one.
     fc_override: Option<u8>,
+    /// What the instruction in progress did that a 68020's time depends on.
+    facts: timing::Facts,
+    /// The 68020's cache-case time for this step, from the tables; zero on
+    /// the other models, whose time is counted per access.
+    table: u32,
+    /// The exception being taken is an interrupt.
+    interrupting: bool,
     /// Cycles this step has charged.
     used: u64,
     /// Whether the source operand of the `MOVE` in progress came from memory.
@@ -532,6 +551,9 @@ impl<'a> Exec<'a> {
             snap: Snap::default(),
             flow: false,
             fc_override: None,
+            facts: timing::Facts::default(),
+            table: 0,
+            interrupting: false,
             used: 0,
             prologue: 4,
             source_was_memory: false,
@@ -544,6 +566,19 @@ impl<'a> Exec<'a> {
     /// Returns the cycles charged; zero only when the core is halted, which a
     /// scheduler must notice rather than spin on.
     pub(super) fn step(&mut self) -> u64 {
+        let before = self.state.cycles;
+        let used = self.step_inner();
+        if self.table != 0 {
+            // A 68020's time is its table entry, not the accesses made on the
+            // way — see `timing.rs` for why, and for the column.
+            self.used = u64::from(self.table);
+            self.state.cycles = before.wrapping_add(self.used);
+            return self.used;
+        }
+        used
+    }
+
+    fn step_inner(&mut self) -> u64 {
         self.state.last_vector = None;
         if self.state.reset_pending {
             self.reset_sequence();
@@ -1061,6 +1096,7 @@ impl<'a> Exec<'a> {
         // 68010 spends two fewer: its interrupt is 46(5/4) with one more
         // write for the format word (MC68000UM Table 9-19).
         self.prologue = if self.model == Model::M68010 { 12 } else { 14 };
+        self.interrupting = true;
         let frame = match self.model {
             Model::M68000 => Frame::Classic(None),
             // An interrupt taken on the master stack leaves a throwaway frame
@@ -1089,6 +1125,11 @@ impl<'a> Exec<'a> {
         // exception a `STOP` executed with T set leaves behind.
         self.state.stopped = false;
         self.state.last_vector = Some(vector);
+        if self.model.has_020()
+            && let Frame::Format(image) = &frame
+        {
+            self.table += timing::exception(image.format, self.interrupting, image.throwaway);
+        }
         // Four cycles of deciding what to do, for most exceptions. `TRAPV`
         // spends none — it already knew — `CHK` spends two more unless the
         // bound test is what failed, and an interrupt spends ten more because
@@ -1477,6 +1518,7 @@ impl<'a> Exec<'a> {
         }
         let insn = decode_for(self.model, self.opcode);
         let restarted = self.state.replay.is_some();
+        self.facts = timing::Facts::default();
 
         let outcome = if insn.privileged && !self.state.supervisor() {
             // A privilege violation is detected before anything is fetched, so
@@ -1489,6 +1531,18 @@ impl<'a> Exec<'a> {
         // with the instruction: it described this one and no other.
         if restarted {
             self.state.replay = None;
+        }
+        if self.model.has_020() {
+            let size = insn.size.resolve(self.opcode).unwrap_or(Size::Word);
+            self.table += match outcome {
+                Ok(()) => timing::instruction(insn, self.opcode, size, &self.facts),
+                // A jump, branch or return that got as far as fetching from
+                // an odd address has done all its work first.
+                Err(Trap::Address { .. }) if self.flow => {
+                    timing::instruction(insn, self.opcode, size, &self.facts)
+                }
+                Err(_) => timing::before_exception(insn, &self.facts),
+            };
         }
 
         match outcome {
@@ -1859,6 +1913,10 @@ impl<'a> Exec<'a> {
             return Ok(Loc::Value(0));
         };
         let reg = reg as usize;
+        // The indexed modes are classed when their extension word is read.
+        if !matches!(mode, Mode::Index8 | Mode::PcIndex8) {
+            self.facts.ea(ea_class(mode, size));
+        }
         match mode {
             Mode::DataReg => Ok(Loc::D(reg as u8)),
             Mode::AddrReg => Ok(Loc::A(reg as u8)),
@@ -2079,6 +2137,7 @@ impl<'a> Exec<'a> {
     fn index_020(&mut self, base: u32, delay: u32) -> Result<u32, Trap> {
         let word = self.ext(delay)?;
         if !is_full_format(self.model, word) {
+            self.facts.ea(timing::INDEX8);
             let index = self.scaled_index(
                 word & 0x8000 != 0,
                 ((word >> 12) & 7) as u8,
@@ -2092,6 +2151,15 @@ impl<'a> Exec<'a> {
             let pc0 = self.pc0;
             return Err(Trap::at(vector::ILLEGAL, pc0));
         };
+        self.facts.ea(match full.indirect {
+            Indirect::None => match full.bd_words {
+                0 => timing::BASE,
+                1 if !full.base_suppressed && !full.index_suppressed => timing::INDEX16,
+                1 => timing::BASE16,
+                _ => timing::BASE32,
+            },
+            _ => timing::INDIRECT + 3 * full.bd_words + full.od_words,
+        });
         let bd = self.displacement(full.bd_words)?;
         let od = self.displacement(full.od_words)?;
         let base = if full.base_suppressed { 0 } else { base };
@@ -2966,6 +3034,7 @@ impl<'a> Exec<'a> {
             Op::Bcc => self.state.test(Cond::from_opcode(self.opcode)),
             _ => true,
         };
+        self.facts.taken = taken;
         // The base for a branch is the address of the word after the opcode.
         let base = self.state.pc.wrapping_add(2);
         if insn.src == Arg::Disp32 {
@@ -3031,6 +3100,7 @@ impl<'a> Exec<'a> {
         let counter = (self.state.d[n] as u16).wrapping_sub(1);
         self.state.d[n] = merge(self.state.d[n], u32::from(counter), Size::Word);
         if counter == 0xffff {
+            self.facts.expired = true;
             // The counter ran out: fall through, and pay for the two fetches.
             self.internal(6);
             self.ext(0)?;
@@ -3142,6 +3212,9 @@ impl<'a> Exec<'a> {
     }
 
     fn op_imm_to_ccr(&mut self, op: Op) -> Result<(), Trap> {
+        // An instruction that writes SR is a change of flow to a 68020
+        // tracing with T0, since it refills its pipe (MC68020UM §6.1.7).
+        self.flow = true;
         let value = self.ext(0)? & 0xff;
         let ccr = u16::from(self.state.ccr());
         let result = match op {
@@ -3157,6 +3230,7 @@ impl<'a> Exec<'a> {
     }
 
     fn op_imm_to_sr(&mut self, op: Op) -> Result<(), Trap> {
+        self.flow = true;
         let value = self.ext(0)?;
         let sr = self.state.sr;
         let result = match op {
@@ -3199,6 +3273,7 @@ impl<'a> Exec<'a> {
     /// (M68000PRM, *MOVEM*).
     fn op_movem(&mut self, insn: Insn, size: Size) -> Result<(), Trap> {
         let mask = self.ext(0)?;
+        self.facts.registers = mask.count_ones();
         let to_memory = insn.dst == Arg::Ea;
         let Some((mode, reg)) = ea_of(Arg::Ea, self.opcode) else {
             let pc = self.state.pc;
@@ -3207,6 +3282,11 @@ impl<'a> Exec<'a> {
         let reg = reg as usize;
         let long = size == Size::Long;
 
+        if matches!(mode, Mode::PreDec | Mode::PostInc) {
+            // The walking forms never go through `resolve_ea`, which is where
+            // an operand's timing class is otherwise noted.
+            self.facts.ea(if mode == Mode::PreDec { 4 } else { 3 });
+        }
         if to_memory && mode == Mode::PreDec {
             // The register being walked is stored with the value it had
             // *before* the instruction started, not the value it has reached
@@ -3414,6 +3494,7 @@ impl<'a> Exec<'a> {
     fn op_moves(&mut self, size: Size) -> Result<(), Trap> {
         let word = self.ext(0)?;
         let to_memory = word & 0x0800 != 0;
+        self.facts.to_memory = to_memory;
         let index = u32::from(word >> 12);
         let loc = self.resolve(Arg::Ea, size)?;
         let extra = match ea_of(Arg::Ea, self.opcode) {
@@ -3474,6 +3555,9 @@ impl<'a> Exec<'a> {
             let low = self.read_word(sp.wrapping_add(4))?;
             let format = self.read_word(sp.wrapping_add(6))? >> 12;
             let pc = (u32::from(high) << 16) | u32::from(low);
+            if self.model.has_020() {
+                self.table += timing::rte(format);
+            }
             let size = match (format, self.model.has_020()) {
                 (0x0, _) => 8,
                 (0x8, false) => return self.rte_long_010(sp, sr),
@@ -3707,6 +3791,7 @@ impl<'a> Exec<'a> {
         let dr = usize::from(word & 7);
         let signed = word & 0x0800 != 0;
         let quad = word & 0x0400 != 0;
+        self.facts.signed = signed;
         if divisor == 0 {
             // As the word form: the condition codes the manual leaves
             // undefined are cleared, X excepted. The 68020's frame says where
@@ -3807,6 +3892,7 @@ impl<'a> Exec<'a> {
         let compare = self.state.d[dc] & size.mask();
         let result = dest.wrapping_sub(compare) & size.mask();
         self.set_sub_flags(compare, dest, result, size, false);
+        self.facts.taken = result == 0;
         if result == 0 {
             let update = self.state.d[du];
             self.write_loc(loc, size, update)?;
@@ -3840,6 +3926,7 @@ impl<'a> Exec<'a> {
             self.set_sub_flags(compare2, dest2, result2, size, false);
             equal = result2 == 0;
         }
+        self.facts.taken = equal;
         if equal {
             let (update1, update2) = (self.state.d[du1], self.state.d[du2]);
             self.write_loc(Loc::Mem(addr1), size, update1)?;
@@ -4002,6 +4089,7 @@ impl<'a> Exec<'a> {
                 let address = base.wrapping_add((offset >> 3) as u32);
                 let bit = (offset & 7) as u32;
                 let bytes = (bit + width).div_ceil(8);
+                self.facts.five_bytes = bytes == 5;
                 let span = self.read_span(address, bytes)?;
                 let shift = 8 * bytes - bit - width;
                 (
@@ -4489,6 +4577,28 @@ impl ExtraCycles {
             // nothing else in the instruction overlaps the adder.
             ExtraCycles::Control => 4,
         }
+    }
+}
+
+/// A non-indexed mode's row in the 68020 effective-address tables.
+const fn ea_class(mode: Mode, size: Size) -> timing::EaClass {
+    match mode {
+        Mode::DataReg => timing::DN,
+        Mode::AddrReg => timing::AN,
+        Mode::Indirect => 2,
+        Mode::PostInc => 3,
+        Mode::PreDec => 4,
+        Mode::Disp16 | Mode::PcDisp16 => 5,
+        Mode::AbsShort => 6,
+        Mode::AbsLong => 7,
+        Mode::Imm => {
+            if matches!(size, Size::Long) {
+                timing::IMM_L
+            } else {
+                timing::IMM_W
+            }
+        }
+        Mode::Index8 | Mode::PcIndex8 => timing::INDEX8,
     }
 }
 

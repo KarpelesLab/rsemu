@@ -15,7 +15,7 @@
 
 //! | `riscv` | `cpu-riscv` | RV64GC/RV32 interpreter, privileged modes, Sv39, software IEEE-754 |
 
-//! | `m68k` | `cpu-m68k` | MC68000 interpreter with a modelled prefetch queue, exceptions, disassembler |
+//! | `m68k` | `cpu-m68k` | MC68000 interpreter with a modelled prefetch queue, exceptions, disassembler; 68010, 68020 and 68EC020 as models of it |
 //! | `mips` | `cpu-mips` | MIPS I / R3000A interpreter: branch and load delay slots, CP0, the 64-entry TLB, disassembler |
 
 //! | `arm::a64` | `cpu-arm-a64` | AArch64 A64 interpreter: EL0/EL1, the VBAR_EL1 vector table, the VMSAv8-64 MMU, scalar floating point in software IEEE-754, `FEAT_LSE`/`FEAT_CRC32`/`FEAT_FP` as instance properties |

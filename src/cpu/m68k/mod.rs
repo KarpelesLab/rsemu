@@ -1,11 +1,14 @@
-//! The Motorola MC68000 and MC68010 — a bus-accurate interpreter with a
-//! modelled prefetch queue.
+//! The Motorola 680x0 — the 68000 as a bus-accurate interpreter with a
+//! modelled prefetch queue, and the 68010, 68020 and 68EC020 as models of it.
 //!
 //! The plain 68000, as fitted to the Amiga, the Atari ST, the Mega Drive and
 //! the first Macintoshes: 32-bit registers, a 16-bit data bus, 24 address
 //! pins, two stack pointers and a supervisor/user split. And, chosen by the
-//! `model` property ([`Model`]), the 68010 that some of those machines were
-//! upgraded with — see *The 68010* below.
+//! `model` property ([`Model`]), the 68010 some of those machines were
+//! upgraded with and the 68020 the later Amigas were built around — see
+//! *The 68010* and *The 68020* below. A 68000 is exactly what it was before
+//! the other models existed: the same bus cycles, the same times, the same
+//! snapshot bytes.
 //!
 //! # The 68010
 //!
@@ -34,11 +37,50 @@
 //! operand cycles on the bus (MC68000UM Appendix A), a timing effect with no
 //! architectural one.
 //!
+//! # The 68020
+//!
+//! The 68010 plus everything MC68020UM and M68000PRM give the 68020, with no
+//! coprocessor:
+//!
+//! - 32 address pins on the 68020, 24 on the 68EC020 — the only difference
+//!   between the two (MC68020UM §1) — and operands at any alignment; only an
+//!   instruction fetch from an odd address is an address error;
+//! - the scaled brief extension word and the full format: base and outer
+//!   displacements, suppressed base and index, memory indirection pre- and
+//!   post-indexed (M68000PRM §2.2);
+//! - `MULS.L`/`MULU.L`, `DIVS.L`/`DIVU.L`/`DIVSL.L`/`DIVUL.L`, the eight bit-field
+//!   instructions, `CAS`, `CAS2`, `CHK2`, `CMP2`, `CHK.L`, `PACK`, `UNPK`,
+//!   `EXTB.L`, `LINK.L`, `TRAPcc`, `Bcc.L`, `CALLM` and `RTM` for type 0
+//!   descriptors, and `TST`/`CMPI` on the extra modes;
+//! - the master and interrupt stack pointers and the **M** bit, trace on
+//!   change of flow (**T0**), and the stack frames of MC68020UM Table 6-5:
+//!   formats `$0`, `$1` (the throwaway frame an interrupt leaves on the
+//!   interrupt stack when taken in master state), `$2`, `$A` and `$B`. Format
+//!   `$9` belongs to a coprocessor and is never built; `RTE` treats it as a
+//!   format error;
+//! - `CACR` and `CAAR` through `MOVEC`. **The instruction cache is state
+//!   only**: its enable and freeze bits are kept, clear and clear-entry act on
+//!   contents that are not modelled, and it has no effect on timing or on
+//!   what reaches the bus — every fetch goes to memory, as with the cache off;
+//! - with no coprocessor, every F-line word is the line-F exception, and
+//!   `cpSAVE`/`cpRESTORE` are privileged first (MC68020UM §7.5.2);
+//! - a prefetch the 68020 cannot complete is a bus error only when the word is
+//!   used (§6.1.2), so running up to the last word of mapped memory is not
+//!   one.
+//!
+//! Its **timing is the cache-case column** of MC68020UM §8.2, charged per
+//! instruction: the one place this core uses a table, because the 68020 has
+//! no published per-access timing to count. `timing.rs` says why that column
+//! and where the tables are silent. Its bus cycles are the 68000's sequence,
+//! driven sixteen bits at a time as a 68020 does on a 16-bit port — which is
+//! what every region this framework maps accepts — and are not what its time
+//! is built from.
+//!
 //! # What "bus-accurate" means here
 //!
 //! A 68000 bus cycle is four clocks, and every published instruction time is a
 //! sum of bus cycles and microcode idle cycles (MC68000UM §8). This
-//! interpreter has no per-instruction cycle table: each access it makes
+//! interpreter has no per-instruction cycle table for it: each access it makes
 //! charges four, and the idle time is charged where the manual says it is
 //! spent. A device watching the bus sees the same reads and writes real
 //! hardware would, in the same order — including the extra word `MOVEM` reads
@@ -54,6 +96,7 @@
 //! [`Regs::prefetch`]`[0]` is the word at [`Regs::pc`] and `prefetch[1]` is
 //! the word at `pc + 2`; executing one instruction slides the queue once per
 //! instruction word. The module documentation on `exec.rs` has the long form.
+//! The later models keep the same queue.
 //!
 //! # Big-endian, and only 24 address pins
 //!
@@ -67,7 +110,8 @@
 //! Addresses reach the bus modulo 16 MiB, because A24–A31 are not brought out
 //! of the package. `(xxx).L` with a high byte set therefore aliases into the
 //! low 16 MiB, which is how the Amiga's mirrors and the Mac's 24-bit mode
-//! work, and the core masks every access accordingly.
+//! work, and the core masks every access accordingly. So do the 68010 and the
+//! 68EC020; the 68020 drives all 32 lines, and needs a 32-bit space.
 //!
 //! # Assembling one
 //!
@@ -112,6 +156,13 @@
 //! The corpus has no licence file, so it is fetched and run, never vendored.
 //! `src/cpu/m68k/conformance.rs` has the command.
 //!
+//! There is no such corpus for the 68010 or 68020. The same runner pushes every
+//! 68000 vector through each of them as well and fails on any difference from
+//! the 68000's result that is not one the manuals document; it prints each
+//! documented difference with the number of vectors that show it. The new
+//! instructions, addressing modes and frames are covered by hand-written tests
+//! whose expected values come from the manuals.
+//!
 //! What the corpus does *not* reach, because every vector runs in supervisor
 //! state with the interrupt mask at seven and tracing off: reset, interrupts,
 //! `STOP`, tracing, user mode and the privilege violation. Those are covered
@@ -119,18 +170,25 @@
 //!
 //! # What is not modelled
 //!
-//! Two things, both because they need something the framework does not carry
-//! yet, and both stated here rather than discovered later:
+//! Stated here rather than discovered later:
 //!
-//! - **The interrupt-acknowledge bus cycle.** It is CPU space — function code
-//!   7 — and `MemAttrs` has no function code, so the cycle is charged but not
-//!   driven. A vectoring controller arms its vector through
-//!   [`M68k::set_interrupt_vector`] instead of answering an access, and there
-//!   is consequently no spurious-interrupt path.
+//! - **CPU space.** `MemAttrs` carries no function code, so nothing on the bus
+//!   can answer a cycle in it. The interrupt-acknowledge cycle is charged but
+//!   not driven: a vectoring controller arms its vector through
+//!   [`M68k::set_interrupt_vector`] or answers through `core::wire`'s
+//!   `IntAck`, and there is no spurious-interrupt path. `BKPT`'s acknowledge
+//!   goes unanswered and ends in an illegal instruction; `CALLM` with a type 1
+//!   descriptor, which needs access-control hardware there, is a format error;
+//!   `MOVES` to a function code keeps only its supervisor bit.
 //! - **`STOP`'s bus behaviour.** It settles the prefetch queue before
 //!   stopping, which costs two bus cycles hardware makes on the way out
 //!   instead. The state is identical; the trace and the four-cycle published
 //!   time are not.
+//! - **Continuing a faulted instruction.** `RTE` from a 68010 or 68020 long
+//!   bus-fault frame restarts the instruction instead; see `exec.rs`.
+//! - **A 68020 on a 32-bit port.** The bus is driven sixteen bits at a time
+//!   whatever the region; the 68020's dynamic bus sizing to a wider port is
+//!   not modelled.
 //!
 //! # Modules
 //!
@@ -139,20 +197,23 @@
 //! | [`isa`] | the one declarative instruction description; decode and disassembly both read it |
 //! | [`disasm`] | the disassembler generated from that description |
 //! | `exec` (private) | the interpreter, the prefetch queue and exception processing |
+//! | `timing` (private) | the 68020's cache-case instruction times |
 //!
 //! # Sources
 //!
 //! Hardware documentation only (`ROADMAP.md` §1): the *M68000 Family
-//! Programmer's Reference Manual* (Motorola M68000PRM/AD) for the instruction
-//! set, encodings and condition codes, and the *MC68000 8-/16-/32-Bit
-//! Microprocessors User's Manual* (MC68000UM) for exception processing, the
-//! stack frames, the signal description and the timing tables. Both are listed
-//! in `docs/cpu/m68k.md`. No copyleft emulator was consulted, and no emulator
+//! Programmer's Reference Manual* (Motorola M68000PM/AD) for the instruction
+//! set, encodings and condition codes; the *M68000 8-/16-/32-Bit
+//! Microprocessors User's Manual* (MC68000UM) for the 68000's and the 68010's
+//! exception processing, stack frames, signals and timing tables; and the
+//! *MC68020 User's Manual* (MC68020UM) for the 68020's. All are listed in
+//! `docs/cpu/m68k.md`. No copyleft emulator was consulted, and no emulator
 //! source of any licence was used for the instruction semantics.
 
 pub mod disasm;
 mod exec;
 pub mod isa;
+mod timing;
 
 #[cfg(test)]
 mod tests;
@@ -828,7 +889,7 @@ struct Session {
     space: Option<Arc<AddressSpace>>,
 }
 
-/// An MC68000 core.
+/// A 680x0 core: a 68000, or the 68010 or 68020 its [`Model`] names.
 ///
 /// # Locking
 ///

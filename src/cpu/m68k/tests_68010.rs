@@ -535,7 +535,7 @@ fn an_interrupt_vectors_through_vbr_with_a_format_word() {
 }
 
 /// Save one core into a snapshot's `cpu` chunk.
-fn snapshot(cpu: &M68k) -> Result<Vec<u8>> {
+pub(super) fn snapshot(cpu: &M68k) -> Result<Vec<u8>> {
     let mut shape = MachineShape::new();
     shape.add_device("cpu", CLASS.name)?;
     let mut w = StateWriter::new(shape);
@@ -547,7 +547,7 @@ fn snapshot(cpu: &M68k) -> Result<Vec<u8>> {
 }
 
 /// Load one core out of such a snapshot.
-fn restore(cpu: &M68k, bytes: &[u8]) -> Result<()> {
+pub(super) fn restore(cpu: &M68k, bytes: &[u8]) -> Result<()> {
     let reader = StateReader::new(bytes)?;
     let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
     let mut r = chunk.reader();
