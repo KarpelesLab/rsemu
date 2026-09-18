@@ -106,7 +106,12 @@ impl Board {
 fn the_model_property_chooses_the_processor() {
     use crate::core::props::Props;
 
-    for (name, model) in [("68000", Model::M68000), ("68010", Model::M68010)] {
+    for (name, model) in [
+        ("68000", Model::M68000),
+        ("68010", Model::M68010),
+        ("68020", Model::M68020),
+        ("68ec020", Model::M68EC020),
+    ] {
         let cpu = M68k::from_props(&Props::new().with("model", name)).unwrap();
         assert_eq!(cpu.model(), model);
         assert_eq!(cpu.config().model, model);
@@ -121,7 +126,7 @@ fn the_model_property_chooses_the_processor() {
     );
     // The validator knows the same list.
     let schema = super::schema();
-    assert!(alloc::format!("{schema:?}").contains("68010"));
+    assert!(alloc::format!("{schema:?}").contains("68ec020"));
 }
 
 #[test]

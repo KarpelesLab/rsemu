@@ -51,7 +51,7 @@ use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
 use super::isa::{
-    Arg, Cond, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl, decode_for, ea_of,
+    Arg, Cond, FieldSpec, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl, decode_for, ea_of,
     is_full_format,
 };
 use super::{Config, Lines, flags, vector};
@@ -1710,7 +1710,7 @@ impl<'a> Exec<'a> {
                 }
                 Ok(())
             }
-            Op::Link => self.op_link(),
+            Op::Link => self.op_link(size),
             Op::Unlk => {
                 let n = reg_lo(opcode);
                 let frame = self.state.a[n];
@@ -1763,18 +1763,18 @@ impl<'a> Exec<'a> {
             | Op::Bfffo
             | Op::Bfins
             | Op::Bfset
-            | Op::Bftst
-            | Op::Callm
-            | Op::Cas
-            | Op::Cas2
-            | Op::Cmp2
-            | Op::Divl
-            | Op::Extb
-            | Op::Mull
-            | Op::Pack
-            | Op::Rtm
-            | Op::Trapcc
-            | Op::Unpk => Err(Trap::at(vector::ILLEGAL, pc0)),
+            | Op::Bftst => self.op_bitfield(insn.op),
+            Op::Callm => self.op_callm(),
+            Op::Rtm => self.op_rtm(),
+            Op::Cas => self.op_cas(size),
+            Op::Cas2 => self.op_cas2(size),
+            Op::Cmp2 => self.op_cmp2(size),
+            Op::Divl => self.op_divl(),
+            Op::Mull => self.op_mull(),
+            Op::Extb => self.op_extb(),
+            Op::Pack => self.op_pack(),
+            Op::Unpk => self.op_unpk(),
+            Op::Trapcc => self.op_trapcc(),
         }
     }
 
@@ -2629,6 +2629,12 @@ impl<'a> Exec<'a> {
             self.set_flag(flags::V, false);
             self.set_flag(flags::C, false);
             self.prologue = 8;
+            if self.model.has_020() {
+                // The 68020's six-word frame pushes the next instruction and
+                // the divide's own address (MC68020UM Table 6-5).
+                let next = self.state.pc.wrapping_add(2);
+                return Err(Trap::six(vector::DIVIDE_BY_ZERO, next, pc0));
+            }
             return Err(Trap::at(vector::DIVIDE_BY_ZERO, pc0));
         }
         if insn.op == Op::Divu {
@@ -2962,6 +2968,24 @@ impl<'a> Exec<'a> {
         };
         // The base for a branch is the address of the word after the opcode.
         let base = self.state.pc.wrapping_add(2);
+        if insn.src == Arg::Disp32 {
+            // A 68020 displacement byte of $ff: the displacement is the long
+            // that follows, still counted from the word after the opcode
+            // (M68000PRM, *Bcc*).
+            let hi = self.ext(0)?;
+            let lo = self.ext(0)?;
+            if !taken {
+                return self.settle();
+            }
+            let target = base.wrapping_add((u32::from(hi) << 16) | u32::from(lo));
+            if insn.op == Op::Bsr {
+                let ret = base.wrapping_add(4);
+                let sp = self.state.a[7].wrapping_sub(4);
+                self.state.a[7] = sp;
+                self.write_long(sp, ret)?;
+            }
+            return self.refill(target, 0);
+        }
         if byte == 0 {
             let word = self.queued()?;
             if !taken {
@@ -3045,9 +3069,16 @@ impl<'a> Exec<'a> {
         }
     }
 
-    fn op_link(&mut self) -> Result<(), Trap> {
+    fn op_link(&mut self, size: Size) -> Result<(), Trap> {
         let n = reg_lo(self.opcode);
-        let disp = i32::from(self.ext(0)? as i16) as u32;
+        // LINK.L carries a 32-bit displacement (M68000PRM, *LINK*).
+        let disp = if size == Size::Long {
+            let hi = self.ext(0)?;
+            let lo = self.ext(0)?;
+            (u32::from(hi) << 16) | u32::from(lo)
+        } else {
+            i32::from(self.ext(0)? as i16) as u32
+        };
         let sp = self.state.a[7].wrapping_sub(4);
         // The stack pointer is decremented *before* the register is read, so
         // `LINK A7,#d` pushes the new A7 rather than the old one — the one
@@ -3610,6 +3641,554 @@ impl<'a> Exec<'a> {
     }
 
     // ------------------------------------------------------------------
+    // The 68020's instructions
+    // ------------------------------------------------------------------
+
+    /// `MULS.L` and `MULU.L`: 32 × 32, keeping 32 bits or all 64 (M68000PRM,
+    /// *MULS*, *MULU*).
+    ///
+    /// **V** reports that a 32-bit result lost bits — for the signed form,
+    /// that the high long is not the sign extension of the low one; a 64-bit
+    /// result cannot overflow and clears it. With `Dh` = `Dl` the manual calls
+    /// the result undefined; this core writes the low long and then the high
+    /// one, so the register ends up holding the high long.
+    fn op_mull(&mut self) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let src = self.resolve(Arg::Ea, Size::Long)?;
+        let source = self.read_loc(src, Size::Long)?;
+        let dl = usize::from((word >> 12) & 7);
+        let dh = usize::from(word & 7);
+        let signed = word & 0x0800 != 0;
+        let quad = word & 0x0400 != 0;
+        let multiplicand = self.state.d[dl];
+        // Two 32-bit factors cannot overflow 64 bits; wrapping is spelled out
+        // only so the arithmetic does not depend on the build profile.
+        let product = if signed {
+            i64::from(source as i32).wrapping_mul(i64::from(multiplicand as i32)) as u64
+        } else {
+            u64::from(source).wrapping_mul(u64::from(multiplicand))
+        };
+        let low = product as u32;
+        if quad {
+            self.state.d[dl] = low;
+            self.state.d[dh] = (product >> 32) as u32;
+            self.set_flag(flags::N, product >> 63 != 0);
+            self.set_flag(flags::Z, product == 0);
+            self.set_flag(flags::V, false);
+        } else {
+            self.state.d[dl] = low;
+            let overflow = if signed {
+                product as i64 != i64::from(low as i32)
+            } else {
+                product >> 32 != 0
+            };
+            self.set_flag(flags::N, low >> 31 != 0);
+            self.set_flag(flags::Z, low == 0);
+            self.set_flag(flags::V, overflow);
+        }
+        self.set_flag(flags::C, false);
+        self.settle()
+    }
+
+    /// `DIVS.L`, `DIVU.L`, `DIVSL.L` and `DIVUL.L` (M68000PRM, *DIVS*,
+    /// *DIVU*).
+    ///
+    /// Bit 10 of the extension word asks for a 64-bit dividend in `Dr:Dq`;
+    /// without it the dividend is `Dq` and the remainder still goes to `Dr`
+    /// unless `Dr` is `Dq`. The remainder takes the dividend's sign, which is
+    /// what Rust's truncating division gives. A quotient that does not fit in
+    /// 32 bits sets **V** and leaves both registers alone.
+    fn op_divl(&mut self) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let word = self.ext(0)?;
+        let src = self.resolve(Arg::Ea, Size::Long)?;
+        let divisor = self.read_loc(src, Size::Long)?;
+        let dq = usize::from((word >> 12) & 7);
+        let dr = usize::from(word & 7);
+        let signed = word & 0x0800 != 0;
+        let quad = word & 0x0400 != 0;
+        if divisor == 0 {
+            // As the word form: the condition codes the manual leaves
+            // undefined are cleared, X excepted. The 68020's frame says where
+            // the next instruction is and which one divided (MC68020UM Table
+            // 6-5), and nothing was prefetched.
+            self.set_flag(flags::N, false);
+            self.set_flag(flags::Z, false);
+            self.set_flag(flags::V, false);
+            self.set_flag(flags::C, false);
+            let next = self.state.pc.wrapping_add(2);
+            return Err(Trap::six(vector::DIVIDE_BY_ZERO, next, pc0));
+        }
+        let low = u64::from(self.state.d[dq]);
+        let result = if signed {
+            let dividend = if quad {
+                ((u64::from(self.state.d[dr]) << 32) | low) as i64
+            } else {
+                i64::from(low as u32 as i32)
+            };
+            let divisor = i64::from(divisor as i32);
+            // Only i64::MIN / -1 can overflow here, and it wraps to a
+            // quotient the range check below rejects.
+            let quotient = dividend.wrapping_div(divisor);
+            let remainder = dividend.wrapping_rem(divisor);
+            i32::try_from(quotient)
+                .ok()
+                .map(|q| (q as u32, remainder as u32))
+        } else {
+            let dividend = if quad {
+                (u64::from(self.state.d[dr]) << 32) | low
+            } else {
+                low
+            };
+            let divisor = u64::from(divisor);
+            u32::try_from(dividend / divisor)
+                .ok()
+                .map(|q| (q, (dividend % divisor) as u32))
+        };
+        match result {
+            Some((quotient, remainder)) => {
+                // Remainder first, so a `Dr` that is `Dq` ends up holding
+                // only the quotient, as the manual says.
+                self.state.d[dr] = remainder;
+                self.state.d[dq] = quotient;
+                self.set_flag(flags::N, quotient >> 31 != 0);
+                self.set_flag(flags::Z, quotient == 0);
+                self.set_flag(flags::V, false);
+            }
+            None => self.set_flag(flags::V, true),
+        }
+        self.set_flag(flags::C, false);
+        self.settle()
+    }
+
+    /// `EXTB.L`: a byte sign-extended to a long (M68000PRM, *EXT, EXTB*).
+    fn op_extb(&mut self) -> Result<(), Trap> {
+        let n = reg_lo(self.opcode);
+        let value = i32::from(self.state.d[n] as i8) as u32;
+        self.state.d[n] = value;
+        self.set_logic_flags(value, Size::Long);
+        self.settle()
+    }
+
+    /// `TRAPcc`: trap through vector 7 if the condition holds, after skipping
+    /// the operand words that are only there for a handler to read
+    /// (M68000PRM, *TRAPcc*). The frame pushes the next instruction and the
+    /// `TRAPcc`'s own address (MC68020UM Table 6-5).
+    fn op_trapcc(&mut self) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let words = match self.opcode & 7 {
+            2 => 1,
+            3 => 2,
+            _ => 0,
+        };
+        for _ in 0..words {
+            self.ext(0)?;
+        }
+        self.settle()?;
+        if self.state.test(Cond::from_opcode(self.opcode)) {
+            let pc = self.state.pc;
+            return Err(Trap::six(vector::TRAPV, pc, pc0));
+        }
+        Ok(())
+    }
+
+    /// `CAS`: compare an operand with `Dc`, and write `Du` over it if they
+    /// are equal or load it into `Dc` if not (M68000PRM, *CAS*). The flags are
+    /// `CMP`'s, destination minus compare operand.
+    ///
+    /// The read and the write are one indivisible cycle on the bus; this bus
+    /// model has no lock to assert, and nothing else runs between them.
+    fn op_cas(&mut self, size: Size) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let dc = usize::from(word & 7);
+        let du = usize::from((word >> 6) & 7);
+        let loc = self.resolve(Arg::Ea, size)?;
+        let dest = self.read_loc(loc, size)?;
+        let compare = self.state.d[dc] & size.mask();
+        let result = dest.wrapping_sub(compare) & size.mask();
+        self.set_sub_flags(compare, dest, result, size, false);
+        if result == 0 {
+            let update = self.state.d[du];
+            self.write_loc(loc, size, update)?;
+        } else {
+            self.state.d[dc] = merge(self.state.d[dc], dest, size);
+        }
+        self.settle()
+    }
+
+    /// `CAS2`: `CAS` on two operands at once, each addressed by a register
+    /// (M68000PRM, *CAS2*). Both must match for either to be written; if
+    /// either does not, both are loaded into their compare registers, operand
+    /// 2 first, so that with `Dc1` = `Dc2` the register holds operand 1, as
+    /// the manual specifies.
+    fn op_cas2(&mut self, size: Size) -> Result<(), Trap> {
+        let first = self.ext(0)?;
+        let second = self.ext(0)?;
+        let addr1 = self.register(u32::from(first >> 12));
+        let addr2 = self.register(u32::from(second >> 12));
+        let (dc1, du1) = (usize::from(first & 7), usize::from((first >> 6) & 7));
+        let (dc2, du2) = (usize::from(second & 7), usize::from((second >> 6) & 7));
+        let dest1 = self.read_loc(Loc::Mem(addr1), size)?;
+        let dest2 = self.read_loc(Loc::Mem(addr2), size)?;
+        let compare1 = self.state.d[dc1] & size.mask();
+        let result1 = dest1.wrapping_sub(compare1) & size.mask();
+        self.set_sub_flags(compare1, dest1, result1, size, false);
+        let mut equal = result1 == 0;
+        if equal {
+            let compare2 = self.state.d[dc2] & size.mask();
+            let result2 = dest2.wrapping_sub(compare2) & size.mask();
+            self.set_sub_flags(compare2, dest2, result2, size, false);
+            equal = result2 == 0;
+        }
+        if equal {
+            let (update1, update2) = (self.state.d[du1], self.state.d[du2]);
+            self.write_loc(Loc::Mem(addr1), size, update1)?;
+            self.write_loc(Loc::Mem(addr2), size, update2)?;
+        } else {
+            self.state.d[dc2] = merge(self.state.d[dc2], dest2, size);
+            self.state.d[dc1] = merge(self.state.d[dc1], dest1, size);
+        }
+        self.settle()
+    }
+
+    /// `CMP2` and `CHK2`: is a register inside a bounds pair, lower bound
+    /// first in memory (M68000PRM, *CMP2*, *CHK2*)?
+    ///
+    /// The manual defines the result for a signed pair whose lower bound is
+    /// the arithmetically smaller and for an unsigned pair whose lower bound is
+    /// the logically smaller, without saying which comparison the processor
+    /// makes. One test answers both: the register is in range when its
+    /// distance above the lower bound, modulo the operand size, is no more
+    /// than the upper bound's. An address register is compared in all 32 bits
+    /// against bounds sign-extended to 32. **Z** says the register equals a
+    /// bound and **C** that it is outside; **N** and **V** are undefined and
+    /// left alone. `CHK2` out of range traps through vector 6.
+    fn op_cmp2(&mut self, size: Size) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let word = self.ext(0)?;
+        let index = u32::from(word >> 12);
+        let check = word & 0x0800 != 0;
+        let Loc::Mem(addr) = self.resolve(Arg::Ea, size)? else {
+            return Err(Trap::at(vector::ILLEGAL, pc0));
+        };
+        let lower = self.read_loc(Loc::Mem(addr), size)?;
+        let upper = self.read_loc(Loc::Mem(addr.wrapping_add(size.bytes())), size)?;
+        let (value, lower, upper, mask) = if index >= 8 {
+            let extend = |v: u32| match size {
+                Size::Byte => i32::from(v as i8) as u32,
+                Size::Word => i32::from(v as i16) as u32,
+                Size::Long => v,
+            };
+            (self.register(index), extend(lower), extend(upper), u32::MAX)
+        } else {
+            (
+                self.register(index) & size.mask(),
+                lower,
+                upper,
+                size.mask(),
+            )
+        };
+        let span = upper.wrapping_sub(lower) & mask;
+        let above = value.wrapping_sub(lower) & mask;
+        let outside = above > span;
+        self.set_flag(flags::Z, value == lower || value == upper);
+        self.set_flag(flags::C, outside);
+        self.settle()?;
+        if check && outside {
+            let pc = self.state.pc;
+            return Err(Trap::six(vector::CHK, pc, pc0));
+        }
+        Ok(())
+    }
+
+    /// `PACK`: two unpacked BCD digits, plus an adjustment, into one byte
+    /// (M68000PRM, *PACK*). Condition codes are not affected.
+    ///
+    /// The memory form reads two bytes by predecrement, the low one first —
+    /// the lower address holds the digit that ends up in the high nibble —
+    /// and writes one.
+    fn op_pack(&mut self) -> Result<(), Trap> {
+        let adjust = self.ext(0)?;
+        let (x, y) = (reg_lo(self.opcode), reg_hi(self.opcode));
+        let packed = |word: u16| -> u8 {
+            let v = word.wrapping_add(adjust);
+            (((v >> 4) & 0xf0) | (v & 0x0f)) as u8
+        };
+        if self.opcode & 8 == 0 {
+            let v = packed(self.state.d[x] as u16);
+            self.state.d[y] = merge(self.state.d[y], u32::from(v), Size::Byte);
+            return self.settle();
+        }
+        let low = self.predecrement(x, Size::Byte);
+        let low = self.read_byte(low)?;
+        let high = self.predecrement(x, Size::Byte);
+        let high = self.read_byte(high)?;
+        let v = packed((u16::from(high) << 8) | u16::from(low));
+        let at = self.predecrement(y, Size::Byte);
+        self.write_byte(at, v)?;
+        self.settle()
+    }
+
+    /// `UNPK`: one packed BCD byte into two digits, plus an adjustment
+    /// (M68000PRM, *UNPK*). The memory form writes the two bytes by
+    /// predecrement, the low one first.
+    fn op_unpk(&mut self) -> Result<(), Trap> {
+        let adjust = self.ext(0)?;
+        let (x, y) = (reg_lo(self.opcode), reg_hi(self.opcode));
+        let unpacked = |byte: u8| -> u16 {
+            let b = u16::from(byte);
+            (((b & 0xf0) << 4) | (b & 0x0f)).wrapping_add(adjust)
+        };
+        if self.opcode & 8 == 0 {
+            let v = unpacked(self.state.d[x] as u8);
+            self.state.d[y] = merge(self.state.d[y], u32::from(v), Size::Word);
+            return self.settle();
+        }
+        let at = self.predecrement(x, Size::Byte);
+        let byte = self.read_byte(at)?;
+        let v = unpacked(byte);
+        let low = self.predecrement(y, Size::Byte);
+        self.write_byte(low, v as u8)?;
+        let high = self.predecrement(y, Size::Byte);
+        self.write_byte(high, (v >> 8) as u8)?;
+        self.settle()
+    }
+
+    /// A bit field's offset and width, from its extension word and the
+    /// registers it names (M68000PRM, *BFTST*): the offset signed and as
+    /// wide as a register, the width 1–32.
+    fn field_spec(&self, word: u16) -> (i32, u32) {
+        let spec = FieldSpec::decode(word);
+        let offset = if spec.offset_reg {
+            self.state.d[usize::from(spec.offset)] as i32
+        } else {
+            i32::from(spec.offset)
+        };
+        let width = if spec.width_reg {
+            self.state.d[usize::from(spec.width)] & 31
+        } else {
+            u32::from(spec.width)
+        };
+        (offset, if width == 0 { 32 } else { width })
+    }
+
+    /// The bit-field instructions (M68000PRM, *BFCHG* to *BFTST*).
+    ///
+    /// Bit 0 of a field is its most significant bit, and the offset counts
+    /// from the most significant bit of the base. In a data register the
+    /// offset is taken modulo 32 and a field that runs off bit 0 wraps round
+    /// to bit 31; in memory the offset is signed and addresses bytes either
+    /// side of the base, and the field can straddle five of them. Every
+    /// instruction sets **N** and **Z** from the field as it was, except
+    /// `BFINS`, which sets them from what it inserts.
+    fn op_bitfield(&mut self, op: Op) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let (offset, width) = self.field_spec(word);
+        let reg = usize::from((word >> 12) & 7);
+        let top = if width == 32 {
+            u32::MAX
+        } else {
+            !(u32::MAX >> width)
+        };
+        let loc = self.resolve(Arg::Ea, Size::Long)?;
+        // The field, right-justified, and a way to put a new one back.
+        let (field, memory) = match loc {
+            Loc::D(n) => {
+                let rotated = self.state.d[usize::from(n)].rotate_left(offset as u32 & 31);
+                (rotated >> (32 - width), None)
+            }
+            Loc::Mem(base) => {
+                // Arithmetic shift: a negative offset reaches below the base.
+                let address = base.wrapping_add((offset >> 3) as u32);
+                let bit = (offset & 7) as u32;
+                let bytes = (bit + width).div_ceil(8);
+                let span = self.read_span(address, bytes)?;
+                let shift = 8 * bytes - bit - width;
+                (
+                    (span >> shift) as u32 & (top >> (32 - width)),
+                    Some((address, bytes, span, shift)),
+                )
+            }
+            _ => {
+                let pc0 = self.pc0;
+                return Err(Trap::at(vector::ILLEGAL, pc0));
+            }
+        };
+        let sign = 1u32 << (width - 1);
+        let inserted = if op == Op::Bfins {
+            self.state.d[reg] & (top >> (32 - width))
+        } else {
+            field
+        };
+        let flagged = if op == Op::Bfins { inserted } else { field };
+        self.set_flag(flags::N, flagged & sign != 0);
+        self.set_flag(flags::Z, flagged == 0);
+        self.set_flag(flags::V, false);
+        self.set_flag(flags::C, false);
+        let replacement = match op {
+            Op::Bfchg => Some(!field),
+            Op::Bfclr => Some(0),
+            Op::Bfset => Some(u32::MAX),
+            Op::Bfins => Some(inserted),
+            _ => None,
+        };
+        match op {
+            Op::Bfextu => self.state.d[reg] = field,
+            Op::Bfexts => {
+                self.state.d[reg] = if field & sign != 0 {
+                    field | !(top >> (32 - width))
+                } else {
+                    field
+                };
+            }
+            Op::Bfffo => {
+                // The offset of the first set bit, counted from the field's
+                // offset; offset plus width if there is none.
+                let lead = (field << (32 - width)).leading_zeros().min(width);
+                self.state.d[reg] = (offset as u32).wrapping_add(lead);
+            }
+            _ => {}
+        }
+        if let Some(value) = replacement {
+            let value = value & (top >> (32 - width));
+            match (loc, memory) {
+                (Loc::D(n), _) => {
+                    let n = usize::from(n);
+                    let mask = top.rotate_right(offset as u32 & 31);
+                    let placed = (value << (32 - width)).rotate_right(offset as u32 & 31);
+                    self.state.d[n] = (self.state.d[n] & !mask) | placed;
+                }
+                (_, Some((address, bytes, span, shift))) => {
+                    let mask = u64::from(top >> (32 - width)) << shift;
+                    let span = (span & !mask) | (u64::from(value) << shift);
+                    self.write_span(address, bytes, span)?;
+                }
+                _ => {}
+            }
+        }
+        self.settle()
+    }
+
+    /// Read `bytes` (1–5) bytes as one right-justified value, in the operand
+    /// cycles a 68020 on a 16-bit port would use: a long and then a byte for
+    /// five (M68000PRM, *BFCHG*: "long word with byte (for a 5-byte access)").
+    fn read_span(&mut self, address: u32, bytes: u32) -> Result<u64, Trap> {
+        Ok(match bytes {
+            1 => u64::from(self.read_byte(address)?),
+            2 => u64::from(self.read_word(address)?),
+            3 => {
+                let hi = u64::from(self.read_word(address)?);
+                (hi << 8) | u64::from(self.read_byte(address.wrapping_add(2))?)
+            }
+            4 => u64::from(self.read_long(address)?),
+            _ => {
+                let hi = u64::from(self.read_long(address)?);
+                (hi << 8) | u64::from(self.read_byte(address.wrapping_add(4))?)
+            }
+        })
+    }
+
+    /// Write back what [`Exec::read_span`] read.
+    fn write_span(&mut self, address: u32, bytes: u32, value: u64) -> Result<(), Trap> {
+        match bytes {
+            1 => self.write_byte(address, value as u8),
+            2 => self.write_word(address, value as u16),
+            3 => {
+                self.write_word(address, (value >> 8) as u16)?;
+                self.write_byte(address.wrapping_add(2), value as u8)
+            }
+            4 => self.write_long(address, value as u32),
+            _ => {
+                self.write_long(address, (value >> 8) as u32)?;
+                self.write_byte(address.wrapping_add(4), value as u8)
+            }
+        }
+    }
+
+    /// `CALLM`: call a module through its descriptor (M68000PRM, *CALLM*;
+    /// MC68020UM §9.7, §9.8.1).
+    ///
+    /// A type 0 descriptor — no change of access rights — is carried out in
+    /// full: the 24-byte module frame on the stack, the module data pointer
+    /// saved and reloaded through the register the entry word names, and
+    /// execution from the word after it. A type 1 descriptor asks external
+    /// access-control hardware, through CPU space, to change the access
+    /// level; there is none on this bus, and "if the processor receives a bus
+    /// error on any of these CPU space accesses ... the processor will take a
+    /// format error exception" (§9.8), so that is what it does. A descriptor
+    /// with an unknown option or type is a format error too.
+    fn op_callm(&mut self) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let word = self.ext(0)?;
+        let Loc::Mem(descriptor) = self.resolve_control(Arg::Ea, ExtraCycles::Control)? else {
+            return Err(Trap::at(vector::ILLEGAL, pc0));
+        };
+        let control = self.read_long(descriptor)?;
+        let option = control >> 29;
+        let kind = (control >> 24) & 0x1f;
+        if (option != 0 && option != 4) || kind != 0 {
+            return Err(Trap::raised(vector::FORMAT_ERROR, pc0));
+        }
+        let entry = self.read_long(descriptor.wrapping_add(4))?;
+        let data = self.read_long(descriptor.wrapping_add(8))?;
+        let entry_word = self.read_word(entry)?;
+        let register = u32::from(entry_word >> 12);
+        let ret = self.state.pc.wrapping_add(2);
+        let sp0 = self.state.a[7];
+        let frame = sp0.wrapping_sub(MODULE_FRAME);
+        // Opt and type from the descriptor; a type 0 call changes no access
+        // level, so the saved one is zero.
+        self.write_word(frame, ((option as u16) << 13) | ((kind as u16) << 8))?;
+        self.write_word(frame.wrapping_add(2), u16::from(self.state.ccr()))?;
+        self.write_word(frame.wrapping_add(4), word & 0xff)?;
+        self.write_word(frame.wrapping_add(6), 0)?;
+        self.write_long(frame.wrapping_add(8), descriptor)?;
+        self.write_long(frame.wrapping_add(12), ret)?;
+        let saved = self.register(register);
+        self.write_long(frame.wrapping_add(16), saved)?;
+        // With arguments passed by pointer, the caller's stack pointer goes in
+        // the frame for the callee to find them by (§9.7.1).
+        if option == 4 {
+            self.write_long(frame.wrapping_add(20), sp0)?;
+        }
+        self.state.a[7] = frame;
+        self.set_register(register, data);
+        if register == 15 {
+            // "the loaded value will be overwritten with the correct stack
+            // pointer value after the module stack frame is created"
+            self.state.a[7] = frame;
+        }
+        self.refill(entry.wrapping_add(2), 0)
+    }
+
+    /// `RTM`: return from a module, undoing `CALLM` (M68000PRM, *RTM*;
+    /// MC68020UM §9.8.2). A type 1 frame would need the access-control
+    /// hardware again and is a format error, as is anything unrecognised.
+    fn op_rtm(&mut self) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let sp = self.state.a[7];
+        let control = self.read_word(sp)?;
+        let option = control >> 13;
+        let kind = (control >> 8) & 0x1f;
+        if (option != 0 && option != 4) || kind != 0 {
+            return Err(Trap::raised(vector::FORMAT_ERROR, pc0));
+        }
+        let ccr = self.read_word(sp.wrapping_add(2))?;
+        let count = u32::from(self.read_word(sp.wrapping_add(4))? & 0xff);
+        let pc = self.read_long(sp.wrapping_add(12))?;
+        let saved = self.read_long(sp.wrapping_add(16))?;
+        let register = u32::from(self.opcode & 0xf);
+        self.set_register(register, saved);
+        // After the register, so `RTM A7` leaves the stack pointer the
+        // frame's removal made, "and the saved module data area pointer is
+        // lost".
+        self.state.a[7] = sp.wrapping_add(MODULE_FRAME).wrapping_add(count);
+        let sr = (self.state.sr & !flags::CCR) | (ccr & flags::CCR);
+        self.state.set_sr(sr);
+        self.refill(pc, 0)
+    }
+
+    // ------------------------------------------------------------------
     // Shared arithmetic
     // ------------------------------------------------------------------
 
@@ -3783,6 +4362,10 @@ const SSW_RC: u16 = 0x2000;
 const SSW_RB: u16 = 0x1000;
 /// Data fault: rerun the data cycle.
 const SSW_DF: u16 = 0x0100;
+
+/// The size of a `CALLM` module frame, arguments not included (MC68020UM
+/// Figure 9-12).
+const MODULE_FRAME: u32 = 24;
 
 /// The `CACR` bits with storage: **E** and **F** (MC68020UM Figure 4-2).
 const CACR_STORED: u32 = 0x3;

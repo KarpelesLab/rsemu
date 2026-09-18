@@ -192,10 +192,12 @@ use exec::{Bank, Exec, State};
 pub use isa::Model;
 
 /// The values the `model` property accepts, in [`Model::ALL`] order.
-///
-/// The 68020 packages are not offered yet: their addressing modes and
-/// instructions arrive in the commits after this one.
-const MODEL_NAMES: [&str; 2] = [Model::M68000.name(), Model::M68010.name()];
+const MODEL_NAMES: [&str; 4] = [
+    Model::M68000.name(),
+    Model::M68010.name(),
+    Model::M68020.name(),
+    Model::M68EC020.name(),
+];
 
 /// The 24 address pins.
 ///
@@ -1276,7 +1278,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "model",
             kind: ValueKind::Str,
             required: false,
-            summary: "which processor: `68000` (the default) or `68010`",
+            summary: "which processor: `68000` (the default), `68010`, `68020` or `68ec020`",
         },
     ],
     construct: |props| Ok(Box::new(M68k::from_props(props)?)),

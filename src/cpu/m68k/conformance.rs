@@ -1022,11 +1022,11 @@ fn explain(
         ));
     }
 
-    if is_020 && reference.vector == Some(3) && other.vector != Some(3) {
-        return Ok(Some(why::NO_ADDRESS_ERROR));
-    }
     if is_020 && matches!(insn.op, Op::Bra | Op::Bsr | Op::Bcc) && opcode & 0xff == 0xff {
         return Ok(Some(why::BCC_L));
+    }
+    if is_020 && reference.vector == Some(3) && other.vector != Some(3) {
+        return Ok(Some(why::NO_ADDRESS_ERROR));
     }
     let patches = if is_020 {
         index_patches(words)

@@ -141,15 +141,17 @@ impl fmt::Display for MnemonicOf<'_> {
         ) || matches!(
             d.insn.op,
             Op::Cas | Op::Cas2 | Op::Mull | Op::Divl | Op::Extb | Op::Trapcc
-        ) || (matches!(d.insn.op, Op::Chk | Op::Link) && d.size == Some(Size::Long))
-            || d.insn.src == Arg::Disp32;
+        ) || (matches!(d.insn.op, Op::Chk | Op::Link) && d.size == Some(Size::Long));
+        if d.insn.src == Arg::Disp32 && d.insn.op != Op::Link {
+            // A branch has no size of its own; `.L` names the 32-bit
+            // displacement form.
+            return f.write_str(".L");
+        }
         if suffixed && let Some(size) = d.size {
             if d.insn.op == Op::Trapcc && d.insn.src == Arg::None {
                 return Ok(());
             }
             write!(f, ".{}", size.suffix().to_ascii_uppercase())?;
-        } else if d.insn.src == Arg::Disp32 {
-            f.write_str(".L")?;
         }
         Ok(())
     }
