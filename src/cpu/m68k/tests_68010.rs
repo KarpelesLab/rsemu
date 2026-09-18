@@ -694,3 +694,47 @@ fn the_disassembler_and_the_68010_agree_on_lengths() {
     );
     assert!(checked > 500, "only {checked} encodings were exercised");
 }
+
+#[test]
+fn a_machine_file_can_ask_for_a_later_processor() {
+    // The property travels through the machine layer, and the validator
+    // rejects a model this core does not have before anything is built.
+    use crate::core::Captured;
+
+    let cores: Arc<Captured<M68k>> = Arc::new(Captured::new());
+    let kept = Arc::clone(&cores);
+    let mut options = crate::machine::BuildOptions::new();
+    options.classes.insert(super::schema());
+    for schema in crate::machine::builtin::schemas() {
+        options.classes.insert(schema);
+    }
+    options
+        .bindings
+        .bind("cpu.m68k", move |props| {
+            let cpu = Arc::new(M68k::from_props(props)?);
+            kept.push(&cpu);
+            Ok(cpu)
+        })
+        .expect("nothing else claims cpu.m68k");
+    crate::machine::builtin::bind(&mut options.bindings).expect("ram and rom");
+    let mut registry = crate::core::Registry::new();
+    crate::machine::builtin::register(&mut registry).expect("ram and rom");
+    super::register(&mut registry).expect("nothing else claims cpu.m68k");
+
+    let board = |model: &str| {
+        alloc::format!(
+            "machine \"m\" {{\n  osc x = 14000000 Hz\n  \
+             space mem {{ width = 24, endian = big }}\n  \
+             object dram \"ram\" {{ size = 64K }}\n  \
+             object cpu \"cpu.m68k\" {{ clock = x, space = mem, model = \"{model}\" }}\n  \
+             map mem 0 size 64K = dram {{ endian = \"big\" }}\n}}\n"
+        )
+    };
+    crate::machine::build("t.machine", &board("68020"), &registry, &options)
+        .expect("a 68020 board builds");
+    assert_eq!(cores.last().expect("the core").model(), Model::M68020);
+
+    let err = crate::machine::build("t.machine", &board("68040"), &registry, &options)
+        .expect_err("a processor this core does not model");
+    assert!(alloc::format!("{err}").contains("model"), "{err}");
+}
