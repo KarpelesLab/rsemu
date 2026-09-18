@@ -648,6 +648,7 @@ follows. No keyboard firmware is modelled or read.
 | Self-test | Passes, instantly |
 | Power-up sync rate | 143 ms, the resync rule's |
 | Which key an overflow loses | The one that arrived to a full buffer |
+| How fast host movements reach the controller | One every 5 ms; a host's burst waits rather than overflowing (see *Input*) |
 | Host key repeat | A down for a key already down is not a transition, and is dropped |
 | Keys moved during power-up sync | Not queued; the power-up stream reports what is held |
 | Reset warning, hard reset | Not modelled: "some A1000 and A2000 keyboards", hard reset "valid for all keyboards except the Amiga 500" |
@@ -708,3 +709,41 @@ table. A shifted character brings its own shift when the client sent none.
 **The picture reaches a person through `--vnc`.** `rsemu run` installs Denise's
 capture and serves its `Scanout`; without `--vnc` the terminal attaches to
 Paula's UART, the board's one character port.
+
+## Input: a person at the Workbench
+
+`tests/amiga_a500_workbench.rs` uses the booted desktops the way a person
+does, through the same seam a VNC client's events cross (`input:vnc` on the
+machine's recorder, a `Feed`, `AmigaKeyboardSink` and `AmigaMouseSink`), at
+fixed virtual instants, reading nothing back but Denise's pictures. On 2.04 it
+double-clicks the Workbench2.0 icon, double-clicks Shell in the window that
+opens, types `echo hello` and finds `hello` under it, then replays its own
+recording to the same state hash. On 1.3 it does the same with
+`echo "Hi, A500!"`, whose shifted characters the keymap supplies. Both need
+`RSEMU_AMIGA_ROM_DIR` and `RSEMU_AMIGA_ADF_DIR` and are worth `--release`.
+Run by hand with a small RFB client, `rsemu run amiga-a500 --media
+kickstart=kickstart:<rom> --media df0=<adf> --vnc 127.0.0.1:5977` does the
+same end to end.
+
+**A count is one framebuffer pixel.** Black-box, both Kickstarts at default
+preferences move the pointer one high-resolution pixel across and one
+interlaced line down per count, with no acceleration at the mouse's 5 000
+counts a second. The sink used two pixels a count and the pointer went half as
+far as the host's cursor. What a relative mouse cannot share with an absolute
+pointer is *position*: the first event only establishes one, Intuition stops
+the pointer at the screen's edges while the host carries on, and it confines
+the pointer while a window is dragged so the window stays on screen (the
+full-screen "Workbench" window cannot move, so dragging it freezes the pointer
+— Intuition's rule, not a lost count). The test homes by sweeping past the
+screen's top-left corner; a person does the same by eye.
+
+**A host's burst waits for the keyboard.** A VNC client's paste, or a
+frontend a slice behind, delivers many key movements at one instant; taken
+straight into the ten-code type-ahead buffer the twelfth was lost, often a
+release, and Workbench repeated that key until the next was pressed. Host
+movements now wait in a backlog and enter the controller one every 5 ms —
+faster than anyone types, several times slower than a code crosses the cable
+and is answered — so the buffer and `$FA` keep their Appendix G meaning for a
+computer that stops answering. Double-click, the right-button menus, dragging
+icons, screens and windows, Caps Lock and the operating system's key repeat all
+worked without a change.
