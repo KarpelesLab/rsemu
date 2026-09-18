@@ -130,6 +130,14 @@
 //! the event is neither reached nor in the future, so nothing bounds the next
 //! round by it and the device waits for somebody else's deadline —
 //! [`Scheduler::sync_lazy_devices`] has the measured cost of that.
+//!
+//! A crystal that carries **two** runnables — two processors on one
+//! oscillator, a processor and its DMA controllers — is the one place a domain
+//! stands anywhere but on its tree's counter. Each runnable executes the round
+//! from a position of its own, as the chips on one crystal all run at once, and
+//! the counter stands at the slowest of them; the faster keeps its lead in its
+//! own domain ([`Scheduler`]'s `advance_runnable` has the argument, and
+//! [`ClockForest::lead`] the number).
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeSet, BinaryHeap};
@@ -1694,9 +1702,8 @@ pub struct SchedulerConfig {
     pub quantum: GlobalTime,
     /// An explicit ceiling on the ticks handed out in one budget, in the
     /// runnable's own ticks. `None` — the default — leaves a budget bounded
-    /// by the round itself: the span the runnable's own oscillator tree has
-    /// left, divided by the runnables that share it
-    /// (`Scheduler::tree_shares`).
+    /// by the round itself: the span from where the runnable stands to the
+    /// round's target (`Scheduler::ticks_until`).
     ///
     /// # Why this is not a number any more
     ///
@@ -1712,20 +1719,19 @@ pub struct SchedulerConfig {
     /// `--for` reached a printk timestamp of 0.3 s.
     ///
     /// The deficit never came back, either. A budget is recomputed from the
-    /// tree's absolute position every round (see
-    /// `Scheduler::ticks_until_after`), so the ticks a capped round left
+    /// runnable's absolute position every round (see
+    /// `Scheduler::ticks_until`), so the ticks a capped round left
     /// behind became a backlog that the next round re-capped: the core's
     /// effective rate was *`max_ticks_per_quantum` × rounds per second* and
     /// the machine file's `osc` statement had no bearing on it at all.
     ///
     /// # The two jobs it was doing, and where each went
     ///
-    /// * **Bounding a runnable's share** so its siblings are scheduled at all.
-    ///   That is a real job and it is now done in the units it belongs in —
-    ///   see `Scheduler::tree_shares`, which divides the span a tree has
-    ///   left among the runnables that share it. A tree with one runnable
-    ///   divides by one, so on every board but an `-smp` one a budget is now
-    ///   exactly what `Scheduler::ticks_until` offers and nothing else.
+    /// * **Making sure a sibling on the same crystal is scheduled at all.**
+    ///   That job went away rather than moving: every runnable now has a
+    ///   position of its own and is offered its own clock's whole span
+    ///   (`Scheduler::advance_runnable`), so nothing one runnable consumes
+    ///   can leave another with nothing.
     /// * **Bounding how late an exit is noticed.** It never did this one. The
     ///   safe-point protocol does: every core tests its [`ExitFlag`] at each
     ///   block boundary (`ROADMAP.md` §4.7), so a stop lands within one block
@@ -3176,15 +3182,15 @@ impl Scheduler {
 
         let mut consumed = Vec::with_capacity(self.runnables.len());
         let count = self.runnables.len();
-        // How the tree's remaining span is divided, counted down as the round
-        // goes. See [`Scheduler::tree_shares`].
-        let mut shares = self.tree_shares();
+        // Crystals two runnables share this round. Nothing on one is given a
+        // live view — see [`Scheduler::shared_crystals`].
+        let shared = self.shared_crystals();
         for i in 0..count {
             let index = (self.cursor + i) % count;
             let id = RunnableId(index as u32);
             let domain = self.runnables[index].domain;
             let span = self.ticks_until(domain, target)?;
-            let allowed = self.take_share(&mut shares, domain, span);
+            let allowed = self.cap(span);
             if allowed == 0 {
                 consumed.push((id, 0));
                 continue;
@@ -3200,7 +3206,7 @@ impl Scheduler {
             // Everything sampled while this runnable executes must see where it
             // has got to, not where the quantum began (see [`TickCursor`]).
             let cursor = self.runnables[index].cursor.clone();
-            self.arm_live_cursors(index, &cursor);
+            self.arm_live_cursors(index, &cursor, &shared);
             let used = runnable.run(budget);
             self.disarm_live_cursors(&cursor);
             self.runnables[index].inner = Some(runnable);
@@ -3212,7 +3218,7 @@ impl Scheduler {
                 });
             }
             if used.ticks > 0 {
-                self.forest.advance_domain(domain, used.ticks)?;
+                self.advance_runnable(domain, used.ticks)?;
             }
             consumed.push((id, used.ticks));
         }
@@ -3314,8 +3320,8 @@ impl Scheduler {
     ///
     /// The two modes are one function because they differ in exactly one
     /// thing: where the round's elapsed virtual time comes from. Everything
-    /// else — the reservation of a shared tree's units, the submission, the
-    /// barrier, the overrun check, the cursor arming — is the same code, and
+    /// else — the budgets, the submission, the barrier, the overrun check,
+    /// the cursor arming — is the same code, and
     /// writing it twice is how the two would drift apart. [`Source`] is the
     /// difference, stated once.
     ///
@@ -3425,29 +3431,14 @@ impl Scheduler {
 
         let count = self.runnables.len();
         let mut allowed = Vec::with_capacity(count);
-        // Units of each tree already promised to an earlier runnable. See
-        // [`Scheduler::ticks_until_after`] for why a tree has to be shared out
-        // rather than handed to everyone whole.
-        let mut reserved: Vec<(OscillatorId, u64)> = Vec::new();
-        let mut shares = self.tree_shares();
+        // Every runnable from its own position to the target, exactly as the
+        // deterministic round hands it out: two on one crystal each get the
+        // whole span, and neither is reserved against the other
+        // ([`Scheduler::advance_runnable`]).
         for index in 0..count {
             let domain = self.runnables[index].domain;
-            let osc = self.forest.root_of(domain).ok();
-            let taken = osc
-                .and_then(|osc| reserved.iter().find(|(o, _)| *o == osc))
-                .map_or(0, |(_, units)| *units);
-            let span = self.ticks_until_after(domain, target, taken)?;
-            let ticks = self.take_share(&mut shares, domain, span);
-            allowed.push(ticks);
-            if let (Some(osc), Ok(per_tick)) =
-                (osc, self.forest.domain(domain).map(|d| d.units_per_tick()))
-            {
-                let units = ticks.saturating_mul(per_tick);
-                match reserved.iter_mut().find(|(o, _)| *o == osc) {
-                    Some((_, sum)) => *sum = sum.saturating_add(units),
-                    None => reserved.push((osc, units)),
-                }
-            }
+            let span = self.ticks_until(domain, target)?;
+            allowed.push(self.cap(span));
         }
 
         // The host reading that opens the round. Taken before anything runs so
@@ -3578,8 +3569,7 @@ impl Scheduler {
     ) -> SchedResult<()> {
         self.check_consumption(index, allowed, used)?;
         if used.ticks > 0 {
-            self.forest
-                .advance_domain(self.runnables[index].domain, used.ticks)?;
+            self.advance_runnable(self.runnables[index].domain, used.ticks)?;
         }
         Ok(())
     }
@@ -3950,12 +3940,34 @@ impl Scheduler {
     /// revision skipped the cross-tree slot entirely and left it on the
     /// quantum-boundary position, which is not a smaller error than a
     /// sub-tick ratio but a much larger one.
-    fn arm_live_cursors(&mut self, index: usize, cursor: &TickCursor) {
+    ///
+    /// # Not on a shared crystal
+    ///
+    /// A runnable on a crystal another runnable also drives arms nothing, and
+    /// no runnable arms a device that sits on such a crystal. Both execute the
+    /// whole round from their own positions, one after the other, so a live
+    /// view is exactly what would let the second of them read a device the
+    /// first has already carried past it — a timer from its future, an
+    /// interrupt raised before it reached the instant it belongs to. Left
+    /// unarmed, those devices are caught up to the position the scheduler
+    /// last published, which is the round's start and so at or behind every
+    /// runnable on the crystal; their own events still bound the round
+    /// ([`Scheduler::natural_target`]) and are delivered at its end. That is
+    /// the rule [`Scheduler::arm_parallel_cursors`] has always applied to a
+    /// tree driven by more than one runnable, so the two modes agree on it.
+    fn arm_live_cursors(&mut self, index: usize, cursor: &TickCursor, shared: &[OscillatorId]) {
         if self.lazy_snapshot.is_none() {
             self.lazy_snapshot = Some(self.lazy.iter().cloned().collect());
         }
         self.build_ratios();
         let domain = self.runnables[index].domain;
+        let Ok(osc) = self.forest.root_of(domain) else {
+            return;
+        };
+        if shared.contains(&osc) {
+            cursor.watch(None);
+            return;
+        }
         // The forest's position for the runnable's own domain, **not** what the
         // cursor currently reads. A core that overran its last budget has
         // already executed cycles the forest has not been told about and
@@ -3963,11 +3975,27 @@ impl Scheduler {
         // the cursor here would cancel the debt out and leave every lazy device
         // three dots per owed cycle behind — and, because the debt varies from
         // quantum to quantum, behind by a different amount each time.
-        let Ok(base_cursor) = self.forest.ticks(domain) else {
+        let (Ok(base_cursor), Ok(here)) = (self.forest.ticks(domain), self.forest.position(domain))
+        else {
             return;
         };
         for (slot, ratio) in self.lazy.iter().zip(self.ratios_of(index)) {
-            let (Some(ratio), Ok(base_tick)) = (*ratio, self.forest.ticks(slot.domain)) else {
+            let Ok(slot_osc) = self.forest.root_of(slot.domain) else {
+                continue;
+            };
+            if shared.contains(&slot_osc) {
+                continue;
+            }
+            // On the runnable's own crystal a device is placed against the
+            // runnable's own position, which a runnable that has had the
+            // crystal to itself since it last shared it may hold ahead of the
+            // tree's counter. Anywhere else, where the device's tree stands.
+            let base_tick = if slot_osc == osc {
+                self.forest.ticks_at_units(slot.domain, here)
+            } else {
+                self.forest.ticks(slot.domain)
+            };
+            let (Some(ratio), Ok(base_tick)) = (*ratio, base_tick) else {
                 continue;
             };
             slot.arm(Live {
@@ -4029,137 +4057,129 @@ impl Scheduler {
         Ok(())
     }
 
-    /// How many runnables have yet to be offered a budget on each tree, at the
-    /// start of a round.
+    /// The crystals two or more runnables drive this round.
     ///
-    /// The divisor in a round's share bound, and the whole of what
-    /// [`SchedulerConfig::max_ticks_per_quantum`] used to be standing in for.
-    /// A tree has **one** unit counter and every domain on it is a divider of
-    /// that counter, so two runnables on one crystal are spending one span
-    /// between them — [`Scheduler::ticks_until_after`] says so at length. Each
-    /// round therefore offers a runnable *the span its tree has left, divided
-    /// by however many runnables still have a turn in this round*, and counts
-    /// itself down as it goes:
-    ///
-    /// * The first of two is offered half. The second then finds half the span
-    ///   gone and one sharer left, so it is offered the other half.
-    /// * A runnable that under-consumes leaves its slack to the ones after it,
-    ///   which is what the deterministic round did already.
-    /// * **One runnable on a tree divides by one**, so the bound is exactly the
-    ///   span and nothing is rounded away. That is the case every board but an
-    ///   `-smp` one is in, and it is why replacing the old constant left their
-    ///   state hashes untouched.
-    ///
-    /// Gated domains are left out of the count rather than counted and handed
-    /// zero: a stopped processor should not be holding half a crystal.
-    ///
-    /// Recomputed per round rather than cached. It depends on what is gated,
-    /// which is runtime state a guest can change through a PLL, and the loop
-    /// is single digits by single digits on every board in the tree.
-    fn tree_shares(&self) -> Vec<(OscillatorId, u64)> {
-        let mut shares: Vec<(OscillatorId, u64)> = Vec::new();
-        // Nothing to divide, and an empty `Vec` does not allocate — which is
-        // what keeps this off the bill of a uniprocessor board's round.
+    /// Gated domains are not counted — a stopped processor shares nothing —
+    /// and the answer is recomputed every round, because what is gated is
+    /// runtime state a guest changes through a PLL. Empty, without
+    /// allocating, on a board with fewer than two runnables, which is what
+    /// keeps this off the bill of a uniprocessor board's round.
+    fn shared_crystals(&self) -> Vec<OscillatorId> {
+        let mut shared: Vec<OscillatorId> = Vec::new();
         if self.runnables.len() < 2 {
-            return shares;
+            return shared;
         }
-        for slot in &self.runnables {
-            if self.forest.is_gated(slot.domain).unwrap_or(true) {
-                continue;
-            }
-            let Ok(osc) = self.forest.root_of(slot.domain) else {
+        for (i, a) in self.runnables.iter().enumerate() {
+            let Some(osc) = self.active_root(a.domain) else {
                 continue;
             };
-            match shares.iter_mut().find(|(o, _)| *o == osc) {
-                Some((_, n)) => *n += 1,
-                None => shares.push((osc, 1)),
+            if shared.contains(&osc) {
+                continue;
+            }
+            if self.runnables[i + 1..]
+                .iter()
+                .any(|b| self.active_root(b.domain) == Some(osc))
+            {
+                shared.push(osc);
             }
         }
-        shares
+        shared
     }
 
-    /// This runnable's share of what its tree has left, and one fewer sharer
-    /// after it.
+    /// The crystal a runnable's domain is on, when the domain is running.
+    fn active_root(&self, domain: DomainId) -> Option<OscillatorId> {
+        if self.forest.is_gated(domain).unwrap_or(true) {
+            return None;
+        }
+        self.forest.root_of(domain).ok()
+    }
+
+    /// Move a runnable's domain on by what it consumed, and its crystal on to
+    /// the slowest runnable it carries.
     ///
-    /// `span` is what [`Scheduler::ticks_until_after`] offered; the result is
-    /// that divided by the runnables still to come on the same tree, then
-    /// lowered by [`SchedulerConfig::max_ticks_per_quantum`] if a caller asked
-    /// for an explicit ceiling.
-    fn take_share(&self, shares: &mut [(OscillatorId, u64)], domain: DomainId, span: u64) -> u64 {
-        let n = match self.forest.root_of(domain) {
-            Ok(osc) => match shares.iter_mut().find(|(o, _)| *o == osc) {
-                Some((_, n)) => {
-                    let here = (*n).max(1);
-                    *n = n.saturating_sub(1);
-                    here
-                }
-                None => 1,
-            },
-            Err(_) => 1,
-        };
-        // A share of zero out of a span that is not zero would **starve a slow
-        // domain for ever**, which is a different bug from the one the share
-        // exists to fix. `tests/vnc_input.rs`'s board is the case: an 8086 at
-        // 4.77 MHz and an 8042 at 1 193 Hz on one crystal, where the
-        // controller's tick is 838 us against a 1 ms round, so half a round
-        // rounds down to nothing and the keyboard never moves a byte. One tick
-        // is the floor, and the span is still the ceiling — the runnable that
-        // took it leaves the next one a span of zero, and the round-robin's
-        // rotation gives that one its turn next round, which is what happened
-        // before any of this existed.
-        let share = if span == 0 { 0 } else { (span / n).max(1) };
+    /// # Each runnable has a position of its own
+    ///
+    /// A crystal clocks every chip on it **at the same time**. Two processors
+    /// on one oscillator each execute its whole rate — a 68000 on an A500
+    /// retires `clk / 4` cycles a second whatever else is on the crystal, and
+    /// so does each of two CPUs sharing one. So every runnable is offered the
+    /// whole span from where *it* stands to the round's target
+    /// ([`Scheduler::ticks_until`]), and moves on by what it consumed without
+    /// moving anyone else ([`ClockForest::advance_alone`]).
+    ///
+    /// The tree's own counter — what every lazily-advanced device on the
+    /// crystal is published at, and what a snapshot's unit position is — then
+    /// stands at the **slowest** of the running runnables on it. That is the
+    /// one position every runnable on the crystal has reached, so no device is
+    /// ever published ahead of a processor that has yet to get there, and a
+    /// runnable that is ahead keeps its lead in its own domain
+    /// ([`ClockForest::lead`]) until the tree catches up. The deterministic
+    /// round advances runnable by runnable and the dispatched one after its
+    /// barrier; the result is the same, since each runnable's position depends
+    /// on nothing but what it consumed.
+    ///
+    /// # What this replaced
+    ///
+    /// A share. A tree has one counter, and the rule was that two runnables on
+    /// one crystal spend one span between them: the first was offered half the
+    /// round, the second the other half, and the counter moved once. The
+    /// hardware does not do that, and every board with two runnables on a
+    /// crystal ran each at a fraction of its declared rate — `amiga-a500`'s
+    /// 68000 at 50.2 % beside Paula's serial poll, the four `-smp` boards'
+    /// processors at 50 %, `stm32f407`'s Cortex-M4 at 33.3 % beside two DMA
+    /// controllers. The share's one real job, keeping a slow runnable on a
+    /// fast crystal from starving, is done by the arithmetic now: a runnable
+    /// is offered everything its own clock owes, so an 8042 at 1 193 Hz beside
+    /// an 8086 (`tests/vnc_input.rs`) gets its tick whenever one is due.
+    ///
+    /// # What the tree's counter still cannot say
+    ///
+    /// A runnable that stops consuming holds its crystal back: a tree stands
+    /// at the slowest runnable on it, exactly as a tree with one runnable has
+    /// always stood wherever that runnable stopped. Every core here consumes
+    /// its whole budget when it is halted, waiting for an interrupt or
+    /// switched off, so what this takes is a core that returns *nothing* for
+    /// ever — which on a crystal of its own stops the crystal too.
+    fn advance_runnable(&mut self, domain: DomainId, ticks: u64) -> SchedResult<()> {
+        self.forest.advance_alone(domain, ticks)?;
+        let osc = self.forest.root_of(domain)?;
+        let mut slowest: Option<u64> = None;
+        for slot in &self.runnables {
+            if self.active_root(slot.domain) != Some(osc) {
+                continue;
+            }
+            let at = self.forest.position(slot.domain)?;
+            slowest = Some(slowest.map_or(at, |s| s.min(at)));
+        }
+        if let Some(units) = slowest {
+            self.forest.advance_tree_to(osc, units)?;
+        }
+        Ok(())
+    }
+
+    /// A budget, lowered by [`SchedulerConfig::max_ticks_per_quantum`] if a
+    /// caller asked for an explicit ceiling.
+    fn cap(&self, span: u64) -> u64 {
         match self.config.max_ticks_per_quantum {
-            Some(cap) => share.min(cap),
-            None => share,
+            Some(cap) => span.min(cap),
+            None => span,
         }
     }
 
-    /// How many ticks of `domain` fit between its tree's current position and
-    /// `target`.
+    /// How many ticks of `domain` fit between where it stands and `target`.
     ///
-    /// Recomputed from the absolute target every quantum rather than carried
-    /// forward, so the rounding in the cross-tree step is bounded by one tick
-    /// and cannot accumulate.
+    /// *Where it stands* is the domain's own position, which is its tree's
+    /// unless the domain has run ahead of it on a crystal it shares
+    /// ([`Scheduler::advance_runnable`]). Recomputed from the absolute target
+    /// every quantum rather than carried forward, so the rounding in the
+    /// cross-tree step is bounded by one tick and cannot accumulate, and ticks
+    /// a round could not spend are handed out by the round that owns them.
     fn ticks_until(&self, domain: DomainId, target: GlobalTime) -> SchedResult<u64> {
-        self.ticks_until_after(domain, target, 0)
-    }
-
-    /// As [`Scheduler::ticks_until`], with `reserved` units of the tree already
-    /// promised to somebody else.
-    ///
-    /// A tree has **one** unit counter and every domain on it is a divider of
-    /// that counter, so two runnables on one tree do not advance independently
-    /// — advancing either moves both. The deterministic round gets this right
-    /// by accident of ordering: it advances each runnable's domain before
-    /// computing the next one's budget, so the second runnable sees the
-    /// position the first left.
-    ///
-    /// A parallel round hands every budget out before anything runs, so it has
-    /// to reserve instead: each runnable on a tree is given the span its
-    /// predecessors could not have used. The two agree exactly whenever every
-    /// runnable consumes what it was given, which is the ordinary case; where
-    /// one under-consumes, the deterministic round can hand the slack to a
-    /// later runnable and the parallel round cannot, because it has already
-    /// started them all.
-    ///
-    /// Note what this is *not* a workaround for: a board with two CPUs on one
-    /// crystal is outside the clock model in **both** modes, since one counter
-    /// cannot say that one of the two halted. Two CPUs want two oscillators —
-    /// which is also what the hardware has (§4.2, "as many roots as the real
-    /// board has crystals"). The reservation exists so that the degenerate
-    /// configuration behaves the same in both modes rather than diverging
-    /// silently.
-    fn ticks_until_after(
-        &self,
-        domain: DomainId,
-        target: GlobalTime,
-        reserved: u64,
-    ) -> SchedResult<u64> {
         if self.forest.is_gated(domain)? {
             return Ok(0);
         }
         let osc = self.forest.root_of(domain)?;
-        let here = self.forest.unit_position(osc)?.saturating_add(reserved);
+        let here = self.forest.position(domain)?;
         let there = self.forest.units_at_global(osc, target)?;
         if there <= here {
             return Ok(0);
@@ -4536,14 +4556,14 @@ mod tests {
         assert_eq!(sched.now(), GlobalTime::from_nanos(10_000_000));
     }
 
-    /// Two runnables on one crystal divide the round rather than starving each
-    /// other.
+    /// Two runnables on one crystal each execute the whole round.
     ///
-    /// One tree has one unit counter, so this is the only way a budget can be
-    /// shared; `Scheduler::tree_shares` is where it is done and the same code
-    /// serves the deterministic and the dispatched round.
+    /// A crystal clocks everything on it at once; it does not take turns. This
+    /// test used to assert `[500_000, 500_000]` — a share of one span between
+    /// the two — and every board with two runnables on a crystal ran each of
+    /// them at half its declared rate. See `Scheduler::advance_runnable`.
     #[test]
-    fn two_runnables_on_one_crystal_split_the_round() {
+    fn two_runnables_on_one_crystal_each_run_the_whole_round() {
         let mut forest = ClockForest::new();
         let osc = forest
             .add_oscillator("core", Rational::integer(1_000_000_000))
@@ -4556,22 +4576,108 @@ mod tests {
 
         let report = sched.run_quantum().unwrap();
         let budgets: Vec<u64> = report.consumed.iter().map(|(_, n)| *n).collect();
-        assert_eq!(budgets, alloc::vec![500_000, 500_000]);
-        // And the tree advanced by the whole round, once, not twice.
+        assert_eq!(budgets, alloc::vec![1_000_000, 1_000_000]);
+        // Each domain counts its own million, and the tree advanced by the
+        // whole round once, not twice.
+        assert_eq!(sched.forest().ticks(a).unwrap(), 1_000_000);
+        assert_eq!(sched.forest().ticks(b).unwrap(), 1_000_000);
+        assert_eq!(
+            sched.forest().unit_position(osc_of(&sched, a)).unwrap(),
+            1_000_000
+        );
         assert_eq!(sched.now(), GlobalTime::from_nanos(1_000_000));
     }
 
-    /// A domain too slow for its share of a round still gets a tick.
-    ///
-    /// The share divides, and dividing can round to nothing: an 8042 at
-    /// 1 193 Hz sharing a crystal with an 8086 is offered half of the one tick
-    /// a 1 ms round is worth, which is zero, and a controller offered zero
-    /// every round never moves a byte. `tests/vnc_input.rs` is that board and
-    /// caught it. One tick is the floor whenever the span is not itself zero;
-    /// the runnable that takes it leaves the next one nothing, and the
-    /// round-robin's rotation gives that one its turn next round.
+    fn osc_of(sched: &Scheduler, d: DomainId) -> OscillatorId {
+        sched.forest().root_of(d).unwrap()
+    }
+
+    /// The crystal stands at the slower of its runnables, and the faster keeps
+    /// its lead rather than being handed it a second time.
     #[test]
-    fn a_domain_too_slow_to_have_a_share_still_gets_a_tick() {
+    fn a_shared_crystal_stands_at_its_slowest_runnable() {
+        let mut forest = ClockForest::new();
+        let osc = forest
+            .add_oscillator("core", Rational::integer(1_000_000_000))
+            .unwrap();
+        let a = forest.add_domain("a", osc, 1, 1).unwrap();
+        let b = forest.add_domain("b", osc, 1, 1).unwrap();
+        let mut sched = Scheduler::new(forest, SchedulerConfig::default());
+        sched.add_runnable(a, Box::new(Cpu::default()));
+        // `b` stops a quarter of the way into the first round and consumes
+        // nothing after that.
+        sched.add_runnable(
+            b,
+            Box::new(Cpu {
+                halt_after: Some(250_000),
+                ..Cpu::default()
+            }),
+        );
+        let root = osc_of(&sched, a);
+        sched.run_quantum().unwrap();
+        assert_eq!(sched.forest().ticks(a).unwrap(), 1_000_000);
+        assert_eq!(sched.forest().ticks(b).unwrap(), 250_000);
+        assert_eq!(sched.forest().unit_position(root).unwrap(), 250_000);
+        assert_eq!(sched.forest().lead(a).unwrap(), 750_000);
+        // The next round gives `a` its own millisecond, not the 1.75 its
+        // tree's counter would have offered.
+        let report = sched.run_quantum().unwrap();
+        assert!(report.consumed.contains(&(RunnableId(0), 1_000_000)));
+        assert_eq!(sched.forest().ticks(a).unwrap(), 2_000_000);
+    }
+
+    /// Two runnables whose ticks are different sizes end a round a fraction of
+    /// the coarser one's tick apart, and the finer keeps exactly that as a
+    /// lead: nothing is rounded away and nothing is handed out twice.
+    #[test]
+    fn a_lead_inside_a_tick_is_kept_exactly() {
+        let mut forest = ClockForest::new();
+        let osc = forest
+            .add_oscillator("hse", Rational::integer(168_000_000))
+            .unwrap();
+        let cpu = forest.add_domain("cpu", osc, 1, 1).unwrap();
+        let dma = forest.add_domain("dma", osc, 1, 4).unwrap();
+        let mut sched = Scheduler::new(forest, SchedulerConfig::default());
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        sched.add_runnable(dma, Box::new(Cpu::default()));
+        let mut spent = (0, 0);
+        // A 30 µs quantum is 5 040 units: whole for the CPU, 1 260 DMA ticks.
+        // Uneven targets come from a round ending on an event instead.
+        for ns in [7_001u64, 13_337, 20_000, 31_999, 40_000] {
+            sched.schedule_at(GlobalTime::from_nanos(ns), EventTarget(0), 0);
+            for (id, n) in sched.run_quantum().unwrap().consumed {
+                match id.index() {
+                    0 => spent.0 += n,
+                    _ => spent.1 += n,
+                }
+            }
+        }
+        let t = sched.now();
+        let units = sched
+            .forest()
+            .units_at_global(osc_of(&sched, cpu), t)
+            .unwrap();
+        assert_eq!(spent.0, units, "the CPU executed exactly its clock");
+        assert_eq!(
+            spent.1,
+            units / 4,
+            "the DMA engine executed exactly its clock"
+        );
+        assert_eq!(sched.forest().ticks(cpu).unwrap(), spent.0);
+        assert_eq!(sched.forest().ticks(dma).unwrap(), spent.1);
+    }
+
+    /// A domain far slower than the round still gets every tick it is owed.
+    ///
+    /// An 8042 at 1 193 Hz sharing a crystal with an 8086 is owed 1.19 ticks by
+    /// a 1 ms round. Under the share it was offered half of that, which is
+    /// zero, and a controller offered zero every round never moves a byte —
+    /// `tests/vnc_input.rs` is that board and caught it, and a one-tick floor
+    /// was the repair. With each runnable offered its own clock's whole span
+    /// there is nothing to round away: the controller gets its tick in the
+    /// round that owes it, and exactly as many as its clock owes overall.
+    #[test]
+    fn a_domain_too_slow_for_a_round_still_gets_every_tick() {
         let mut forest = ClockForest::new();
         let osc = forest
             .add_oscillator("xtal", Rational::new(14_318_180, 1).unwrap())
@@ -4582,19 +4688,13 @@ mod tests {
         sched.add_runnable(cpu, Box::new(Cpu::default()));
         sched.add_runnable(kbc, Box::new(Cpu::default()));
 
-        // A 1 ms round is 4 772 CPU cycles and 1.19 controller ticks, so the
-        // controller's *half* is nought point six of one.
+        // A 1 ms round is 4 772 CPU cycles and 1.19 controller ticks.
         for _ in 0..8 {
             sched.run_quantum().unwrap();
         }
-        assert!(
-            sched.forest().ticks(kbc).unwrap() > 0,
-            "the controller was starved by a share that rounded to zero"
-        );
-        assert!(
-            sched.forest().ticks(cpu).unwrap() > 10_000,
-            "and the processor still got the bulk of the crystal"
-        );
+        // Eight milliseconds: 9.5 controller ticks and 38 181.8 CPU cycles.
+        assert_eq!(sched.forest().ticks(kbc).unwrap(), 9);
+        assert_eq!(sched.forest().ticks(cpu).unwrap(), 38_181);
     }
 
     /// A gated sibling is not counted, so the one that still runs gets the
@@ -5098,29 +5198,18 @@ mod tests {
     }
 
     #[test]
-    fn two_runnables_on_one_tree_share_its_counter_in_both_modes() {
-        // A tree has one unit counter and every domain on it is a divider of
-        // that counter, so two runnables on one oscillator do not advance
-        // independently: whatever the first one consumes has already moved the
-        // second one's clock. This test used to pin the consequence as a
-        // **finding** — the first runnable took the tree's whole span and the
-        // second was left with under a hundredth of it — and it is now the
-        // other way round, because `Scheduler::tree_shares` divides the span
-        // between them: the first is offered half, and the second then finds
-        // half the span gone and one sharer left.
+    fn two_runnables_on_one_tree_each_run_their_whole_clock_in_both_modes() {
+        // Two runnables on one oscillator each execute the round from their
+        // own position (`Scheduler::advance_runnable`), and the tree's counter
+        // moves once, to the slower of them. This test pinned two earlier
+        // answers in turn — the first runnable taking the whole span and the
+        // second under a hundredth of it, then a share of half each — and
+        // both were a single counter standing in for two positions.
         //
-        // What both modes must do is *agree*, and that is still the load in
-        // this test: a parallel round that handed every runnable the whole span
-        // would advance the tree twice over, hence the reservation in
-        // `ticks_until_after`. The two now agree by construction rather than by
-        // accident of ordering.
-        //
-        // Halves, not thirds or quarters: what neither mode can do without a
-        // per-domain counter is let one of the two halt while the other runs,
-        // so each of two processors on one crystal executes at half its
-        // declared rate. The design answer for a board that wants two CPUs is
-        // two oscillators; `machines/tests/heterogeneous.machine` says so at
-        // length, and it is what the hardware has.
+        // What both modes must do is *agree*, and that is still the load here:
+        // the deterministic round advances runnable by runnable and the
+        // dispatched one after its barrier, and neither may hand out the span
+        // twice or advance the tree twice.
         let mut reports = Vec::new();
         for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
             let (mut sched, cpu, ppu) = nes_scheduler_in(mode, 0);
@@ -5141,18 +5230,96 @@ mod tests {
             reports[0], reports[1],
             "the two modes hand out the same ticks"
         );
-        let (first, second, _) = reports[0];
-        // A 1 ms round is about 1 790 NES CPU cycles, so half is about 895 —
-        // and the PPU is master ÷ 4 against the CPU's ÷ 12, so the half the
-        // CPU left is three times as many of its own ticks.
-        assert!(
-            (850..=900).contains(&first),
-            "the CPU should get half the round's 1 790 cycles, got {first}"
-        );
-        assert!(
-            (2_600..=2_700).contains(&second),
-            "the PPU should get the other half — three times as many of its \
-             own dots — got {second}"
+        let (first, second, cpu_ticks) = reports[0];
+        // A 1 ms round is 1 789.77 NES CPU cycles and three times as many
+        // dots of a domain on master ÷ 4, each counted in full.
+        assert_eq!(first, 1_789, "the CPU's whole millisecond");
+        assert_eq!(second, 5_369, "and the other runnable's whole millisecond");
+        assert_eq!(cpu_ticks, first);
+    }
+
+    /// A runnable that publishes its progress the way a CPU does, touches a
+    /// lazily-advanced device once a round from the far end of its budget, and
+    /// records where the device stood when it looked.
+    #[derive(Debug)]
+    struct Toucher {
+        cursor: Arc<Mutex<Option<TickCursor>>>,
+        handle: Arc<Mutex<Option<LazyHandle>>>,
+        seen: Arc<Mutex<Vec<(u64, u64)>>>,
+        total: u64,
+    }
+
+    impl Runnable for Toucher {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            let cursor = self.cursor.lock().clone().expect("wired");
+            let handle = self.handle.lock().clone().expect("wired");
+            let start = self.total;
+            cursor.set(start + budget.ticks);
+            let at = handle.sync(AccessKind::Guest).expect("a sync");
+            self.seen.lock().push((start, at));
+            self.total += budget.ticks;
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    /// **The invariant a shared crystal rests on**: no runnable on it ever
+    /// reads a device another runnable has already carried past it.
+    ///
+    /// Each of two processors on one crystal executes the whole round, one
+    /// after the other. Had the first one's live view been armed, its read at
+    /// the far end of its budget would carry the device a millisecond on, and
+    /// the second — starting that same round from the round's beginning — would
+    /// read a device from its own future. So nothing on a shared crystal is
+    /// armed, and the device stands at the crystal's published position, which
+    /// is at or behind both.
+    #[test]
+    fn no_runnable_on_a_shared_crystal_reads_a_device_from_its_future() {
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        let other = sched.forest_mut().add_domain("cpu1", cpu, 1, 1).unwrap();
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut ids = Vec::new();
+        let mut wiring = Vec::new();
+        for domain in [cpu, other] {
+            let cursor = Arc::new(Mutex::new(None));
+            let handle = Arc::new(Mutex::new(None));
+            ids.push(sched.add_runnable(
+                domain,
+                Box::new(Toucher {
+                    cursor: Arc::clone(&cursor),
+                    handle: Arc::clone(&handle),
+                    seen: Arc::clone(&seen),
+                    total: 0,
+                }),
+            ));
+            wiring.push((cursor, handle));
+        }
+        for (id, (cursor, handle)) in ids.iter().zip(&wiring) {
+            *cursor.lock() = Some(sched.runnable_cursor(*id).unwrap());
+            *handle.lock() = Some(sched.lazy_handle(dev).unwrap());
+        }
+        for _ in 0..6 {
+            sched.run_quantum().unwrap();
+            sched.sync_lazy_devices().unwrap();
+        }
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 12, "both runnables ran every round");
+        for (start, at) in seen {
+            // Three dots per CPU cycle: the device must be at or behind the
+            // dot the reading runnable's turn began on.
+            assert!(
+                at <= 3 * start,
+                "a runnable that started at cycle {start} read the device at dot {at}, \
+                 past its own dot {}",
+                3 * start
+            );
+        }
+        // And both still ran their whole clock: six milliseconds of a
+        // 1 789 772.7 Hz processor.
+        assert_eq!(sched.forest().ticks(cpu).unwrap(), 10_738);
+        assert_eq!(
+            sched.forest().ticks(other).unwrap(),
+            sched.forest().ticks(cpu).unwrap()
         );
     }
 

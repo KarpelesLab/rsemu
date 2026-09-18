@@ -1259,8 +1259,32 @@ fn save_clocks(forest: &ClockForest, sink: &mut impl Sink) -> Result<()> {
     }
     let domains: Vec<_> = forest.domains().collect();
     sink.write_seq_len(domains.len() as u64)?;
-    for id in domains {
-        sink.write_u64(forest.ticks(id)?)?;
+    for id in &domains {
+        sink.write_u64(forest.ticks(*id)?)?;
+    }
+    // Leads, only when there is one. A runnable on a crystal another runnable
+    // shares may stand ahead of its tree at a round's end
+    // (`Scheduler::advance_runnable`), and its tick count above already says
+    // how many ticks ahead — but not where inside the tick the tree is, which
+    // a restored machine needs to hand out the next round's budgets exactly.
+    // Absent is *no lead anywhere*, which is every machine with at most one
+    // runnable per crystal and every snapshot a build before this one wrote,
+    // so neither their bytes nor their hashes change.
+    let leads: Vec<(u64, u64)> = domains
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| match forest.lead(*id) {
+            Ok(0) => None,
+            Ok(lead) => Some(Ok((index as u64, lead))),
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<core::result::Result<_, _>>()?;
+    if !leads.is_empty() {
+        sink.write_seq_len(leads.len() as u64)?;
+        for (index, lead) in leads {
+            sink.write_u64(index)?;
+            sink.write_u64(lead)?;
+        }
     }
     Ok(())
 }
@@ -1288,8 +1312,25 @@ fn load_clocks<'a>(forest: &mut ClockForest, src: &mut impl Source<'a>) -> Resul
             domains.len()
         )));
     }
-    for id in domains {
-        forest.restore_ticks(id, src.read_u64()?)?;
+    for id in &domains {
+        forest.restore_ticks(*id, src.read_u64()?)?;
+    }
+    // The optional lead section `save_clocks` writes only when a domain had
+    // one.
+    if src.remaining() > 0 {
+        let count = src.read_seq_len(16)?;
+        for _ in 0..count {
+            let index = src.read_u64()?;
+            let id = usize::try_from(index)
+                .ok()
+                .and_then(|i| domains.get(i))
+                .ok_or_else(|| {
+                    Error::State(format!(
+                        "snapshot names clock domain {index}, which this machine has not got"
+                    ))
+                })?;
+            forest.restore_lead(*id, src.read_u64()?)?;
+        }
     }
     Ok(())
 }

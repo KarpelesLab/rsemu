@@ -980,7 +980,7 @@ snapshot header, since queued deadlines are meaningless without it.
   sequence number so ties break deterministically.
 - **Execution budgets.** A CPU is never "stepped one instruction" by the
   scheduler; it is handed a budget ("run until virtual time T, or until this
-  processor's share of what its crystal has left, whichever first") and reports
+  processor's own clock reaches it, whichever first") and reports
   back how much it consumed. This is what makes JIT block execution and cycle
   accounting coexist.
 
@@ -989,9 +989,11 @@ snapshot header, since queued deadlines are meaningless without it.
   core is owed a million ticks by a 1 ms quantum, so `arm64-virt` and
   `riscv-virt` ran their processors at **one percent** of the rate their own
   machine files declare while every other clocked device on the board kept
-  exact time. The tick bound is now *a share of the tree*, which is the only
-  job a constant was doing that was worth doing — a tree with one runnable
-  divides by one and the round's target is the whole bound.
+  exact time. The tick bound is now the span from where the processor stands
+  to the round's target — its *own* position, so two processors on one crystal
+  each execute the crystal's whole rate, as they do on the hardware, rather
+  than dividing one span between them (which was the intermediate answer, and
+  ran every `-smp` board's processors at half speed).
   `docs/techniques/execution-budgets.md` has the mechanism, the measurement
   that found it from outside, and what removing it was worth in host
   instructions.

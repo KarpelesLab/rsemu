@@ -23,22 +23,20 @@ the next event a lazily-advanced device has of its own, whichever is soonest
 
 For each runnable, in turn:
 
-1. **`Scheduler::ticks_until_after`** asks how many ticks of the runnable's own
-   clock domain fit between where its oscillator tree actually stands and the
-   target. *Actually stands*, not where the target's own conversion says it
+1. **`Scheduler::ticks_until`** asks how many ticks of the runnable's own
+   clock domain fit between where it actually stands and the target. *Actually stands*, not where the target's own conversion says it
    should: a runnable stops on a tick boundary (§4.2, "stop at the cycle
    boundary before"), so a tree lags the exact conversion by whatever fraction
    of a tick the last round could not spend, and a round that was declined
    outright leaves a whole round's worth behind. Measuring from the real
    position is what hands those back.
-2. **`Scheduler::take_share`** divides that by however many runnables still
-   have a turn on the same tree in this round, and counts itself down — see
-   *[The share](#the-share)*. A tree with one runnable divides by one.
-3. **`SchedulerConfig::max_ticks_per_quantum`**, if a caller set one, lowers it
-   further. It is `None` by default.
+2. **`SchedulerConfig::max_ticks_per_quantum`**, if a caller set one, lowers it.
+   It is `None` by default.
 
-The runnable reports what it consumed, the forest advances by that, and the
-next runnable on the same tree sees the position the first one left.
+The runnable reports what it consumed and its domain moves on by that. A
+runnable on a crystal another runnable shares measures from its **own**
+position, not the tree's — see *[Two runnables on one
+crystal](#two-runnables-on-one-crystal)*.
 
 Two properties fall out, and both are load-bearing:
 
@@ -157,57 +155,87 @@ sweeps `WHEEL_LEVELS × WHEEL_SLOTS` cells on any round long enough to cross a
 level, whether or not a single event is queued. Removing the cap amortised it a
 hundredfold and left it standing.
 
-## The share
+## Two runnables on one crystal
 
-The cap was doing a second job, and that one is real: **bounding a runnable's
-share so its siblings are scheduled at all.**
+The cap was doing a second job, and that one is real: **making sure the
+second runnable on a crystal is scheduled at all.** A tree has one unit
+counter, and the round used to measure every budget from it: offer the first
+of two runnables the whole span, advance the counter by what it consumed, and
+the second finds nothing left. All four shipped `-smp` boards are in that
+configuration; on a 100 MHz board the cap of 10 000 against a 100 000-tick
+round was what left the second processor anything.
 
-A tree has one unit counter and every domain on it is a divider of that
-counter, so two runnables on one oscillator are spending one span between them.
-Offer the first one the whole span and the second is offered nothing. All four
-shipped `-smp` boards are in exactly that configuration, and so was the cap's
-only defence of them: on a 100 MHz board a round's span was 100 000 ticks and
-the cap was 10 000, so both processors got 10 000 and both ran. Raise the
-constant past the span and the second processor was starved for ever, which
-`tests/parallel_smp_boards.rs` asserted as a fact rather than describing.
+### The share, and why it was wrong
 
-`Scheduler::tree_shares` replaces that with the quantity it was standing in
-for. A round offers each runnable **the span its tree has left, divided by
-however many runnables still have a turn in this round**, counting itself down:
-the first of two gets half, the second then finds half the span gone and one
-sharer left, so it gets the other half. A gated domain is not counted.
+`Scheduler::tree_shares` replaced the cap with *the span the tree has left,
+divided by however many runnables still have a turn in this round*: the first
+of two got half, the second the other half, and the counter moved once. Both
+processors ran with no cap at all — but each at **half** the rate its board
+declares, and a board with three runnables on a crystal at a third. The
+premise was that two runnables on one crystal spend one span between them.
+The hardware does not work that way: a crystal clocks every chip on it at the
+same time, so a 68000 on an A500 retires `clk / 4` cycles a second whatever
+else is on the crystal, and so does each of two CPUs sharing one oscillator.
+Measured over 200 ms of virtual time before the change, as cycles each
+runnable *consumed* against what its clock owes:
+
+| board | runnables on one crystal | each executed |
+| --- | --- | --- |
+| `amiga-a500` | 68000, Paula (a serial poll) | 50.2 %, 49.8 % |
+| `arm64-virt-smp`, `riscv-virt-smp`, `pc-at-smp`, `pc-apic`, `q35-linux-smp` | two CPUs | 50.0 % each |
+| `stm32f407` | Cortex-M4, two DMA controllers | 33.3 % each |
+
+Every other board in `machines/` has at most one runnable per crystal and ran
+at 100 %.
+
+### Each runnable has a position of its own
+
+`Scheduler::advance_runnable` is what replaced the share. Every runnable is
+offered the whole span from **its own position** to the round's target, and
+moves on by what it consumed *without moving anyone else*
+(`ClockForest::advance_alone`). The tree's counter then stands at the
+**slowest** running runnable on it (`ClockForest::advance_tree_to`), and a
+runnable that is ahead keeps its lead in its own domain — `max(tree, own)`, in
+units, so no phase inside a tick is lost — until the tree catches up.
+
+The counter standing at the slowest is the invariant that makes this correct
+rather than merely fast. The counter is what every lazily-advanced device on
+the crystal is published at, so no device is ever published ahead of a
+processor that has yet to reach it. And during a round, a runnable on a shared
+crystal arms **no** live view, and nothing arms a device that sits on one
+(`Scheduler::arm_live_cursors`): two processors that each execute the round
+from its start, one after the other, would otherwise let the second read a
+device the first had already carried past it. That is the rule the parallel
+round has always applied to a tree driven by more than one runnable, so the
+two modes agree on it. What it costs is resolution inside a round for the
+devices those processors reach — `riscv-virt-smp`'s CLINT is caught up at
+round boundaries and at its own events rather than at each hart's cycle.
 
 Three things follow:
 
-* **Two processors on one crystal both run with no cap at all.**
-* **The deterministic and dispatched rounds agree by construction** — both
-  divide the same span the same way — rather than by accident of ordering.
-* **A tree with one runnable divides by one**, so the bound is exactly the
-  span and nothing is rounded away. That is every board in `machines/` except
-  the four `-smp` ones, which is why removing the constant moved exactly two
-  committed state hashes in `tests/goldens/frame-hashes.txt` and left every
-  other one identical to the bit.
+* **Every runnable executes the rate its board declares**, on every board,
+  in both modes; the table above reads 100 % in every row.
+* **A tree with one runnable is unchanged to the bit.** The runnable moves,
+  the tree follows it to the same unit, and every committed frame hash of a
+  uniprocessor board is identical.
+* **A slow runnable on a fast crystal needs no floor.** The share needed one:
+  an 8042 at 1 193 Hz beside an 8086 (`tests/vnc_input.rs`) was offered half
+  of the 1.19 ticks a 1 ms round owes it, which is zero, and a one-tick floor
+  was the repair. Offered its own clock's whole span, it gets every tick in
+  the round that owes it.
 
-And one rule that is not obvious until a board needs it: **a share that rounds
-down to nothing still gets one tick**, whenever the span itself is not zero.
-Dividing starves a slow domain otherwise, which is a different bug from the one
-the share fixes — `tests/vnc_input.rs` is the board that found it, an 8086 at
-4.77 MHz and an 8042 at 1 193 Hz on one crystal, where the controller's tick is
-838 µs against a 1 ms round, so half a round is six tenths of one tick and the
-keyboard never moved a byte. The span stays the ceiling, so the runnable that
-takes that tick leaves the next one nothing and the round-robin's rotation
-gives that one its turn next round — which is what happened before any share
-bound existed.
+A lead survives a snapshot: `save_clocks` writes the domain's tick count as
+always and, only when some domain has one, a trailing section with the lead in
+units. A machine with at most one runnable per crystal never has one, so its
+bytes — and every committed state hash — are what they were.
 
-### What it does not fix
+### What the counter still cannot say
 
-Each of two processors on one crystal still executes at **half** the rate its
-board declares. One counter cannot say that one of them halted while the other
-ran, and dividing is the best a single counter can do. That wants two
-oscillators, which is what `machines/tests/heterogeneous.machine` has and what
-§4.2's "as many roots as the real board has crystals" asks for.
-[`parallel-execution.md`](parallel-execution.md) says what has to be measured
-before the four shipped files change.
+A runnable that *stops consuming* holds its crystal back, since the tree
+stands at the slowest runnable on it — exactly as a tree with one runnable has
+always stood wherever that runnable stopped. Every core here consumes its whole
+budget when halted, waiting for an interrupt or switched off, so what this
+takes is a core that returns nothing for ever.
 
 ## The job the cap was never doing
 

@@ -30,20 +30,13 @@
 //!   threads onto the machine a user actually runs; it is a strictly stronger
 //!   statement, because everything between the guest instruction and the RAM
 //!   is now in the picture.
-//! * **The degenerate case is pinned rather than described.** One crystal and
-//!   two runnables is outside the clock model in both modes
-//!   (`Scheduler::ticks_until_after`), and what used to save it was a
-//!   rate-blind constant — `SchedulerConfig::max_ticks_per_quantum`, ten
-//!   thousand — capping the first runnable's share so there was something
-//!   left for the second. Raising that constant above the round's span handed
-//!   the second hart a budget of zero, for ever, and this file asserted it.
-//!   [`Scheduler::round_allowance`] replaced the constant with the quantity it
-//!   was standing in for: a round's worth of the tree, **divided by the
-//!   runnables that share it**. The test below is the old one turned round —
-//!   with no cap at all, both harts still run, and each gets half the round.
-//!   What is left of the limitation is that half: two processors on one
-//!   crystal each execute at half the rate their board declares, which is the
-//!   part only two oscillators can fix.
+//! * **Both processors run at the crystal's whole rate.** One crystal and two
+//!   runnables used to be outside the clock model: a tree has one counter, and
+//!   the two harts were first given whatever a rate-blind cap left over, then
+//!   half a round each. Each runnable now executes the round from a position of
+//!   its own and the crystal's counter stands at the slower of them
+//!   (`Scheduler::advance_runnable`), so each hart retires the 100 MHz this
+//!   board declares — which is asserted, to the cycle, below.
 //!
 //! # What it is not
 //!
@@ -62,17 +55,20 @@
 //! tight loop, is in `docs/techniques/parallel-execution.md`.
 //!
 //! [`Machine::state_hash`]: rsemu::machine::Machine::state_hash
-//! [`Scheduler::round_allowance`]: rsemu::core::sched::Scheduler
 
 // `std` because `parallel` is a threading mode and a `no_std` build has no
 // threads — the same reason `parallel_threading.rs` gives.
 #![cfg(all(feature = "cpu-riscv", feature = "std"))]
 
+use std::sync::Arc;
+
+use rsemu::core::Captured;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
 use rsemu::core::sched::ThreadingMode;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
+use rsemu::cpu::riscv::Hart;
 use rsemu::machine::{Machine, catalog};
 
 /// The fixture: two harts, one crystal, `threading parallel` in the file.
@@ -435,34 +431,17 @@ fn a_file_selected_parallel_machine_with_no_workers_still_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// the degenerate configuration, and what is left of it
+// one crystal, two processors, each at the crystal's rate
 // ---------------------------------------------------------------------------
 
 /// Two runnables on one oscillator both run, with **no tick cap at all**.
 ///
-/// This test is the inverse of the one it replaces, and the inversion is the
-/// point. A tree has one unit counter, so the span between `now` and the
-/// round's target is shared out: `Scheduler::ticks_until_after` offers the
-/// first runnable all of it and the second whatever is left. What used to
-/// leave anything was `SchedulerConfig::max_ticks_per_quantum` — a rate-blind
-/// 10 000 against this board's 100 000 ticks a round — and raising it past the
-/// span handed hart 1 a budget of zero, every round, for ever. The old test
-/// asserted exactly that and said a fix had to come here and delete it.
-///
-/// `Scheduler::round_allowance` is that fix: the share bound is now *a round's
-/// worth of the tree divided by the runnables that share it*, so with the cap
-/// removed entirely each hart is offered half the round and both execute.
-/// `SchedulerConfig::max_ticks_per_quantum` is `None` here — the default — and
-/// the test still sets it explicitly, because the whole claim is that nothing
-/// is capping anything.
-///
-/// **What is not fixed** is the half. Each hart executes at half the 100 MHz
-/// this board declares, because one counter cannot say that one of two
-/// processors halted while the other ran. That still wants two oscillators,
-/// which is what `machines/tests/heterogeneous.machine` has and what §4.2's
-/// "as many roots as the real board has crystals" asks for; it is a property
-/// of every shipped `-smp` file and is written up in
-/// `docs/techniques/parallel-execution.md`.
+/// The first of three answers this file has pinned. A tree has one unit
+/// counter, and hart 1 was once handed whatever a rate-blind 10 000-tick cap
+/// left of the round — nothing, once the cap went — and then half the round.
+/// Each runnable is now offered its own clock's whole span
+/// (`Scheduler::advance_runnable`); this test keeps the parallel half of that
+/// claim, and the one below measures the rate.
 #[test]
 fn one_oscillator_and_no_tick_cap_runs_both_harts() {
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
@@ -485,5 +464,141 @@ fn one_oscillator_and_no_tick_cap_runs_both_harts() {
         word(&m, PRIVATE + 4) > 0,
         "hart 1 was starved with no cap in play, which is the defect \
          Scheduler::round_allowance exists to have fixed"
+    );
+}
+
+/// `j .` minus four: `jal x0, -4`, the other half of a two-instruction loop.
+const JUMP_BACK: u32 = 0xffdf_f06f;
+
+/// `addi a0, a0, 1` then `j` back to it, in both harts: nothing but
+/// instruction fetches, and no data access for the two to contend over.
+fn counting_rom() -> Vec<u8> {
+    let mut out = Vec::new();
+    for word in [addi(A0, A0, 1), JUMP_BACK] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+/// Two harts on one 100 MHz crystal, **each** retiring 100 MHz.
+///
+/// A crystal clocks every chip on it at once; two processors on one
+/// oscillator do not take turns. The board used to run each of these harts at
+/// half the rate the file declares, because a round divided one crystal's
+/// span between the runnables on it. Here the claim is measured the way a
+/// guest would feel it: each hart's own count of the cycles it spent, against
+/// what 100 MHz owes the span, and the loop counter each one advanced against
+/// the instructions it retired.
+/// Deterministic, so the number is exact rather than a sample.
+#[test]
+fn two_harts_on_one_crystal_each_retire_the_crystals_whole_rate() {
+    let harts: Arc<Captured<Hart>> = Arc::new(Captured::new());
+    let kept = Arc::clone(&harts);
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.threading = Some(ThreadingMode::Deterministic);
+    options.bindings.replace("cpu.riscv", move |props| {
+        let hart = Arc::new(Hart::from_props(props)?);
+        kept.push(&hart);
+        Ok(hart)
+    });
+    options.realize.media.insert("code", counting_rom());
+    let registry = catalog::registry().expect("a registry");
+    let mut m = rsemu::machine::build("smp-parallel.machine", SMP_PARALLEL, &registry, &options)
+        .expect("the fixture realizes");
+    m.reset(ResetKind::Cold);
+    let harts = harts.all();
+    assert_eq!(harts.len(), 2, "both harts were captured");
+
+    m.run_until(GlobalTime::from_nanos(1_000_000))
+        .expect("a run");
+    let before: Vec<(u64, u64, u64)> = harts
+        .iter()
+        .map(|h| (h.cycles(), h.instret(), h.x(A0)))
+        .collect();
+    let span_ns = 20_000_000;
+    m.run_until(GlobalTime::from_nanos(1_000_000 + span_ns))
+        .expect("a run");
+    // 100 MHz for 20 ms.
+    let owed = 2_000_000u64;
+    for (n, (hart, (c0, i0, a0))) in harts.iter().zip(before).enumerate() {
+        let cycles = hart.cycles() - c0;
+        let retired = hart.instret() - i0;
+        let loops = hart.x(A0) - a0;
+        eprintln!(
+            "hart {n}: {cycles} cycles of {owed} owed, {retired} instructions, {loops} iterations"
+        );
+        assert!(
+            cycles.abs_diff(owed) <= 2,
+            "hart {n} retired {cycles} cycles where its crystal owes {owed}"
+        );
+        assert!(
+            (2 * loops).abs_diff(retired) <= 2,
+            "hart {n}'s {loops} iterations of two instructions do not account for {retired} \
+             retired"
+        );
+        assert!(retired > 0, "hart {n} executed nothing");
+    }
+}
+
+/// A processor that leads its crystal comes back from a snapshot leading it by
+/// exactly as much, so a restored machine runs on exactly as the saved one did.
+///
+/// Two harts on one crystal, one at the crystal's rate and one at a third of
+/// it: a round's target is rarely a whole tick of the slower one, so the faster
+/// ends each round up to two units ahead of the crystal's counter, which stands
+/// at the slower (`Scheduler::advance_runnable`). That lead is machine state.
+/// The tick counts a snapshot already stores say how many *ticks* ahead the
+/// fast hart is and not where inside a tick the crystal stands, so the clock
+/// chunk carries the lead itself — and only when there is one, so no machine
+/// with one runnable per crystal writes a byte more than it used to.
+#[test]
+fn a_lead_on_a_shared_crystal_survives_a_snapshot() {
+    let source = SMP_PARALLEL.replacen(
+        "object cpu1 \"cpu.riscv\" {\n    clock  = core",
+        "object cpu1 \"cpu.riscv\" {\n    clock  = core / 3",
+        1,
+    );
+    assert_ne!(
+        source, SMP_PARALLEL,
+        "the fixture's second hart was re-rated"
+    );
+    let build = || {
+        let mut options = catalog::build_options().expect("the catalog agrees with itself");
+        options.realize.threading = Some(ThreadingMode::Deterministic);
+        options.realize.media.insert("code", counting_rom());
+        let registry = catalog::registry().expect("a registry");
+        let mut m = rsemu::machine::build("smp-lead.machine", &source, &registry, &options)
+            .expect("the fixture realizes");
+        m.reset(ResetKind::Cold);
+        m
+    };
+    let mut a = build();
+    // Two milliseconds: 200 000 units, which is not a whole number of the
+    // slow hart's three-unit ticks.
+    a.run_until(GlobalTime::from_nanos(2_000_000))
+        .expect("a run");
+    let fast = a
+        .device("cpu0")
+        .and_then(|d| d.domain())
+        .expect("a clocked hart");
+    let lead = a.clocks().lead(fast).expect("a domain");
+    assert!(
+        lead > 0,
+        "the fast hart should end a round ahead of its crystal"
+    );
+    let snapshot = a.save().expect("a snapshot");
+
+    let mut b = build();
+    b.load(&snapshot).expect("it loads");
+    assert_eq!(b.clocks().lead(fast).unwrap(), lead, "the lead came back");
+    assert_eq!(b.state_hash().unwrap(), a.state_hash().unwrap());
+
+    let until = GlobalTime::from_nanos(7_000_000);
+    a.run_until(until).expect("a run");
+    b.run_until(until).expect("a run");
+    assert_eq!(
+        b.state_hash().unwrap(),
+        a.state_hash().unwrap(),
+        "the restored machine diverged from the one it was saved from"
     );
 }

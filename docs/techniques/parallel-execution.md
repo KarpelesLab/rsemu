@@ -182,21 +182,22 @@ takes one added line. `machines/tests/smp-parallel.machine` is the in-tree
 board that *does* declare it, and it exists so the path is exercised by the
 suite rather than only documented.
 
-## The degenerate configuration every one of those boards has
+## One crystal, two processors
 
 All four shipped `-smp` files put both processors on **one** oscillator, and so
-does the fixture, deliberately. That configuration is outside the clock model,
-in *both* threading modes, and `Scheduler::ticks_until_after` has said so all
-along: a tree has one unit counter and every domain on it is a divider of that
-counter, so one counter cannot express one processor halted while the other
-runs. Two cores want two roots, which is also what §4.2 says the hardware has —
-"as many roots as the real board has crystals".
+does the fixture, deliberately: it is what the hardware has. That configuration
+was outside the clock model for a long time, because a tree has one unit
+counter and the round measured every budget from it. It is not any more — each
+runnable now has a position of its own, and the counter stands at the slowest
+of them (*[What replaced the share](#what-replaced-the-share-a-position-per-runnable)*
+below) — but how it got there is worth keeping, because each step was a
+measured defect.
 
 ### What used to keep it working, and why that had to go
 
 A cap, and a rate-blind one. The parallel round hands out every budget before
-anything runs, so it *reserves*: each runnable on a tree is offered the span
-its predecessors could not have used, and the first one would take all of it
+anything runs, so it used to *reserve*: each runnable on a tree was offered the
+span its predecessors could not have used, and the first one would take all of it
 were it not for `SchedulerConfig::max_ticks_per_quantum`. On a 100 MHz board
 with a 1 ms quantum the round's span was 100 000 ticks and the cap was 10 000,
 so both processors got 10 000 and both ran. Raise that constant past the
@@ -219,43 +220,53 @@ PL011 at exactly 15 000 000. `pc64` reported about a fifth rather than a
 hundredth, for the arithmetic reason that its rounds are cut short by its
 lazily-advanced devices and a shorter round is a *fuller* one.
 
-### What replaced it: a share, in the units a share belongs in
+### The share, and the half it left
 
-`Scheduler::tree_shares` and `Scheduler::take_share`. A round offers each
-runnable **the span its tree has left, divided by however many runnables still
-have a turn in this round**, counting itself down as it goes. The first of two
-is offered half; the second then finds half the span gone and one sharer left,
-so it is offered the other half. A gated domain is left out of the count
-rather than counted and handed nothing.
+`Scheduler::tree_shares` and `Scheduler::take_share` replaced the cap with *the
+span the tree has left, divided by however many runnables still have a turn in
+this round*. Both processors ran with no cap at all, and the deterministic and
+parallel rounds agreed by construction — but each processor executed **half**
+the rate its board declares, because the rule was that two runnables on one
+crystal spend one span between them. Measured before the change, as cycles
+consumed against what the clock owes over 200 ms: 50.0 % for each CPU of
+`arm64-virt-smp`, `riscv-virt-smp`, `pc-at-smp`, `pc-apic` and
+`q35-linux-smp`; 33.3 % for each of `stm32f407`'s Cortex-M4 and two DMA
+controllers; and 50.2 % for `amiga-a500`'s 68000, whose crystal carried Paula's
+serial poll as a runnable (that one was a device that should never have been a
+runnable, and it no longer is).
 
-Three things follow, and the third is why this is the shape it is:
+The share's documentation said the remedy was two oscillators, one per
+processor. It was not: a crystal clocks every chip on it *at the same time*,
+and a board with two CPUs on one oscillator is an ordinary board.
 
-* **Two processors on one crystal both run, with no cap at all.**
-  `tests/parallel_smp_boards.rs::one_oscillator_and_no_tick_cap_runs_both_harts`
-  is the old test turned round.
-* **The deterministic and parallel rounds now agree by construction** rather
-  than by accident of ordering, since both divide the same span the same way.
-* **A tree with one runnable divides by one.** The bound is then exactly the
-  span, nothing is rounded away, and the budget is precisely what
-  `Scheduler::ticks_until` offers — which is what it was before any of this
-  existed. That is every board in `machines/` except the four `-smp` ones, and
-  it is why replacing the constant moved exactly two committed state hashes
-  (`riscv-virt`, the one board in the frame-hash regression whose processor the
-  cap was throttling) and left every other one identical to the bit.
+### What replaced the share: a position per runnable
 
-### What is *not* fixed: the half
+`Scheduler::advance_runnable`. Every runnable is offered the whole span from
+its own position to the round's target (`Scheduler::ticks_until`) and moves
+on by what it consumed without moving anyone else
+(`ClockForest::advance_alone`). The tree's counter then stands at the
+**slowest** running runnable on it, and a faster one keeps its lead in its own
+domain until the tree catches up. The parallel round no longer reserves
+anything: it hands out the same budgets the deterministic one does and applies
+the same advances after its barrier, so the two still agree by construction.
 
-Each of two processors on one crystal executes at half the rate its board
-declares. One unit counter still cannot say that one of them halted while the
-other ran, and dividing is the best a single counter can do. That still wants
-two oscillators, which is what `machines/tests/heterogeneous.machine` has.
-Changing the four shipped `-smp` files to declare one crystal per processor is
-the remaining half of this, and it is a separate decision: it moves each of
-those boards' hashes again, and `Scheduler::arm_parallel_cursors` only speaks
-for a tree no runnable drives when exactly *one* runnable in the machine is
-entitled to — so a board that gains a second oscillator loses the live view its
-RTC-crystal devices are caught up through. Both need measuring before the files
-change.
+The invariant that keeps this correct: **no lazily-advanced device a runnable
+on a shared crystal can observe is ever carried past that runnable's position
+during a round.** The counter is published at the slowest runnable, so a
+device caught up to it is at or behind all of them; and a runnable on a shared
+crystal arms no live view, nor does anyone arm a device that sits on one
+(`Scheduler::arm_live_cursors`), so no processor that executes the round first
+can drag a device into the future of one that executes it second. This is the
+rule `Scheduler::arm_parallel_cursors` below has always applied to a tree
+driven by more than one runnable; the deterministic round now applies it too.
+The price is resolution inside a round for the devices those processors reach:
+on `riscv-virt-smp` the CLINT is caught up at round boundaries and at its own
+events, not at each hart's cycle.
+
+What the counter still cannot say is a runnable that returns *nothing* for
+ever: the tree stands at the slowest runnable, so such a runnable holds its
+crystal back, exactly as a lone runnable that stops holds back its own. Every
+core here consumes its whole budget when halted or switched off.
 
 ## Measured
 

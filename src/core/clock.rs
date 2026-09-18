@@ -528,6 +528,27 @@ pub struct ClockDomain {
     base_unit: u64,
     base_ticks: u64,
     gated: bool,
+    /// Where this domain has got to **on its own**, in its tree's units, when
+    /// that is ahead of the tree; zero, or anything at or behind the tree,
+    /// when it is not.
+    ///
+    /// A tree has one unit counter, and every domain on it normally stands
+    /// exactly where that counter says. The exception is a domain a runnable
+    /// drives on a crystal that another runnable drives too: two processors on
+    /// one oscillator both execute the whole of a round, one after the other,
+    /// so each has a position of its own while the round is in progress, and
+    /// at its end the tree stands at the slower of them
+    /// ([`ClockForest::advance_alone`], [`ClockForest::advance_tree_to`]).
+    /// The faster one's lead is kept here, in units rather than in ticks so
+    /// that no sub-tick phase is lost, and it expires by itself as soon as
+    /// the tree catches up: the domain's position is always
+    /// `max(tree, own)`.
+    ///
+    /// Absolute rather than relative to the tree, so that advancing a tree —
+    /// which is the hot path — touches no domain. Rescaled with the tree like
+    /// `base_unit`, and carried through a snapshot as the lead
+    /// [`ClockForest::lead`] reports.
+    own: u64,
 }
 
 impl ClockDomain {
@@ -582,7 +603,13 @@ impl ClockDomain {
         self.gated
     }
 
-    /// The tick count this domain has reached at a given tree position.
+    /// Where this domain stands, given its tree's position.
+    #[inline]
+    fn position(&self, tree: u64) -> u64 {
+        tree.max(self.own)
+    }
+
+    /// The tick count this domain has reached at a given position.
     #[inline]
     fn ticks_at(&self, units: u64) -> u64 {
         if self.gated {
@@ -778,6 +805,7 @@ impl ClockForest {
             base_unit: 0,
             base_ticks: 0,
             gated: false,
+            own: 0,
         });
         let mut o = Oscillator {
             name: String::from(name),
@@ -837,6 +865,7 @@ impl ClockForest {
             base_unit: units_now,
             base_ticks: 0,
             gated: false,
+            own: 0,
         });
         self.domains[parent.index()].children.push(id);
         if let Err(e) = self.recompute_tree(osc) {
@@ -949,7 +978,46 @@ impl ClockForest {
     /// [`ClockError::UnknownDomain`] if the handle is not from this forest.
     pub fn ticks(&self, id: DomainId) -> ClockResult<u64> {
         let d = self.domain(id)?;
-        Ok(d.ticks_at(self.oscillators[d.root.index()].units))
+        Ok(d.ticks_at(d.position(self.oscillators[d.root.index()].units)))
+    }
+
+    /// Where a domain stands, in its tree's units: the tree's own position,
+    /// or further on for a domain that has run ahead of it
+    /// ([`ClockForest::advance_alone`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::UnknownDomain`] if the handle is not from this forest.
+    pub fn position(&self, id: DomainId) -> ClockResult<u64> {
+        let d = self.domain(id)?;
+        Ok(d.position(self.oscillators[d.root.index()].units))
+    }
+
+    /// How far a domain stands ahead of its tree, in the tree's units. Zero
+    /// for every domain nothing has advanced alone, which is every domain on a
+    /// crystal with at most one runnable.
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::UnknownDomain`] if the handle is not from this forest.
+    pub fn lead(&self, id: DomainId) -> ClockResult<u64> {
+        let d = self.domain(id)?;
+        let tree = self.oscillators[d.root.index()].units;
+        Ok(d.position(tree) - tree)
+    }
+
+    /// The tick count a domain reads with its tree at `units` — or where the
+    /// domain has already got to on its own, if that is further. Exact
+    /// intra-tree arithmetic: this is how a device on a crystal is placed
+    /// against a runnable that stands ahead of the crystal's counter.
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::UnknownDomain`] if the handle is not from this forest.
+    pub fn ticks_at_units(&self, id: DomainId, units: u64) -> ClockResult<u64> {
+        let d = self.domain(id)?;
+        let tree = self.oscillators[d.root.index()].units;
+        Ok(d.ticks_at(d.position(units.max(tree))))
     }
 
     /// The tree's position, in that tree's unit ticks.
@@ -1030,6 +1098,53 @@ impl ClockForest {
             })?;
         let osc = d.root;
         self.advance_units(osc, delta)
+    }
+
+    /// Advances one domain by `ticks` of its own, **leaving its tree where it
+    /// is**.
+    ///
+    /// For a crystal more than one runnable drives. A processor on such a
+    /// crystal executes the round from its own position, and so does the other
+    /// one; neither may drag the counter the other is also counted on, so each
+    /// moves alone and the tree is brought up to the slower of them
+    /// afterwards with [`ClockForest::advance_tree_to`]. With one runnable on a
+    /// tree the pair is exactly [`ClockForest::advance_domain`]: the domain
+    /// moves, and the tree follows it to the same unit.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClockForest::advance_domain`].
+    pub fn advance_alone(&mut self, id: DomainId, ticks: u64) -> ClockResult<()> {
+        let d = self.domain(id)?;
+        if d.gated {
+            return Err(ClockError::Gated(d.name.clone()));
+        }
+        let here = d.position(self.oscillators[d.root.index()].units);
+        let own = ticks
+            .checked_mul(d.units_per_tick)
+            .and_then(|delta| here.checked_add(delta))
+            .ok_or_else(|| ClockError::Overflow {
+                what: "unit position",
+                domains: alloc::vec![d.name.clone()],
+            })?;
+        self.domains[id.index()].own = own;
+        Ok(())
+    }
+
+    /// Advances a tree to unit position `units`, if it is not there already.
+    ///
+    /// The other half of [`ClockForest::advance_alone`]. Monotonic: a position
+    /// at or behind the tree's changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::UnknownOscillator`] or [`ClockError::Overflow`].
+    pub fn advance_tree_to(&mut self, osc: OscillatorId, units: u64) -> ClockResult<()> {
+        let cur = self.osc(osc)?.units;
+        if units > cur {
+            self.advance_units(osc, units - cur)?;
+        }
+        Ok(())
     }
 
     /// Advances a tree by a number of its own unit ticks.
@@ -1307,6 +1422,8 @@ impl ClockForest {
             for m in self.subtree(id) {
                 self.domains[m.index()].root = new_osc;
                 self.domains[m.index()].base_unit = dest_units;
+                // A lead is a position on the crystal it was earned on.
+                self.domains[m.index()].own = 0;
             }
         }
 
@@ -1367,8 +1484,12 @@ impl ClockForest {
         if d.gated == gated {
             return Ok(());
         }
-        d.base_ticks = d.ticks_at(units);
+        d.base_ticks = d.ticks_at(d.position(units));
+        // A gated domain's counter stands still wherever it was, and an
+        // ungated one resumes from the tree: a lead a stopped processor had
+        // is not a lead it keeps.
         d.base_unit = units;
+        d.own = 0;
         d.gated = gated;
         Ok(())
     }
@@ -1390,6 +1511,14 @@ impl ClockForest {
         let idx = osc.index();
         if idx >= self.oscillators.len() {
             return Err(ClockError::UnknownOscillator(osc));
+        }
+        // A restored tree has no lead on it until one is restored too
+        // ([`ClockForest::restore_lead`]); one left over from before the
+        // restore would put a domain wherever the old run had got to.
+        for d in &mut self.domains {
+            if d.root == osc {
+                d.own = 0;
+            }
         }
         let o = &mut self.oscillators[idx];
         o.base_units = 0;
@@ -1447,6 +1576,35 @@ impl ClockForest {
         let d = &mut self.domains[id.index()];
         d.base_ticks = ticks;
         d.base_unit = units - units % d.units_per_tick;
+        d.own = 0;
+        Ok(())
+    }
+
+    /// Puts a domain `lead` units ahead of its tree, keeping its tick count.
+    /// For snapshot restore only, after [`ClockForest::restore_ticks`].
+    ///
+    /// The count `restore_ticks` wrote already includes the lead — it is what
+    /// [`ClockForest::ticks`] read when the snapshot was taken — so this moves
+    /// the anchor rather than the count: the domain stands at `tree + lead`
+    /// and reads the same number there, with its phase aligned down to a
+    /// whole tick exactly as `restore_ticks` aligns it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::UnknownDomain`], or [`ClockError::Overflow`] for a lead
+    /// that does not fit.
+    pub fn restore_lead(&mut self, id: DomainId, lead: u64) -> ClockResult<()> {
+        self.check_domain(id)?;
+        let units = self.oscillators[self.domains[id.index()].root.index()].units;
+        let d = &mut self.domains[id.index()];
+        let own = units
+            .checked_add(lead)
+            .ok_or_else(|| ClockError::Overflow {
+                what: "unit position",
+                domains: alloc::vec![d.name.clone()],
+            })?;
+        d.base_unit = own - own % d.units_per_tick;
+        d.own = own;
         Ok(())
     }
 
@@ -1495,8 +1653,9 @@ impl ClockForest {
         let units = self.oscillators[self.domains[id.index()].root.index()].units;
         for m in self.subtree(id) {
             let d = &mut self.domains[m.index()];
-            d.base_ticks = d.ticks_at(units);
-            d.base_unit = units;
+            let here = d.position(units);
+            d.base_ticks = d.ticks_at(here);
+            d.base_unit = here;
         }
     }
 
@@ -1564,17 +1723,18 @@ impl ClockForest {
                 what: "unit position rescale",
                 domains: names(self),
             })?;
-        let mut new_bases: Vec<u64> = Vec::with_capacity(order.len());
+        // `own` rescales with `base_unit`: both are absolute positions on
+        // this tree, and a lead is as exact after a finer unit as before it.
+        let mut new_bases: Vec<(u64, u64)> = Vec::with_capacity(order.len());
         for id in &order {
-            new_bases.push(
-                self.domains[id.index()]
-                    .base_unit
-                    .checked_mul(f)
-                    .ok_or_else(|| ClockError::Overflow {
-                        what: "unit position rescale",
-                        domains: names(self),
-                    })?,
-            );
+            let d = &self.domains[id.index()];
+            let scale = |v: u64| {
+                v.checked_mul(f).ok_or_else(|| ClockError::Overflow {
+                    what: "unit position rescale",
+                    domains: names(self),
+                })
+            };
+            new_bases.push((scale(d.base_unit)?, scale(d.own)?));
         }
 
         let unit_rate = self.oscillators[osc.index()]
@@ -1589,7 +1749,7 @@ impl ClockForest {
             let d = &mut self.domains[id.index()];
             d.ratio = ratios[i];
             d.units_per_tick = ks[i];
-            d.base_unit = new_bases[i];
+            (d.base_unit, d.own) = new_bases[i];
         }
         let o = &mut self.oscillators[osc.index()];
         o.units = new_units;
@@ -2085,6 +2245,58 @@ mod tests {
         f.advance_domain(cpu, 10).unwrap();
         assert_eq!(f.ticks(ppu).unwrap(), 1_530);
         assert_eq!(f.ticks(pll).unwrap(), 300);
+    }
+
+    /// A domain moved on alone stands ahead of its tree, reads its own count,
+    /// and loses its lead only by the tree catching up — exactly, through a
+    /// re-rating that refines the unit, and not at all through a gate.
+    #[test]
+    fn a_domain_can_run_ahead_of_its_tree_and_the_tree_catches_up() {
+        let (mut f, master, cpu, ppu) = nes();
+        let osc = f.root_of(master).unwrap();
+        let other = f.add_domain("cpu1", master, 1, 12).unwrap();
+        f.advance_alone(cpu, 10).unwrap();
+        assert_eq!(f.ticks(cpu).unwrap(), 10);
+        assert_eq!(f.ticks(other).unwrap(), 0, "a sibling does not move");
+        assert_eq!(f.ticks(ppu).unwrap(), 0, "nor does anything on the tree");
+        assert_eq!(f.lead(cpu).unwrap(), 120);
+        assert_eq!(f.ticks_at_units(ppu, f.position(cpu).unwrap()).unwrap(), 30);
+
+        f.advance_alone(other, 4).unwrap();
+        f.advance_tree_to(osc, 48).unwrap();
+        assert_eq!(f.unit_position(osc).unwrap(), 48);
+        assert_eq!((f.ticks(cpu).unwrap(), f.ticks(other).unwrap()), (10, 4));
+        assert_eq!(f.lead(cpu).unwrap(), 72);
+        assert_eq!(f.ticks(ppu).unwrap(), 12);
+
+        // A finer unit rescales the lead with everything else.
+        let fine = f.add_domain("fine", master, 2, 1).unwrap();
+        assert_eq!(
+            f.domain(cpu).unwrap().units_per_tick(),
+            24,
+            "the unit halved"
+        );
+        assert_eq!(f.ticks(cpu).unwrap(), 10);
+        assert_eq!(f.ticks(fine).unwrap(), 0);
+        let lead = f.lead(cpu).unwrap();
+        assert_eq!(lead * 12 / f.domain(cpu).unwrap().units_per_tick(), 72);
+
+        // The tree passing it retires the lead; the count keeps going.
+        let cur = f.unit_position(osc).unwrap();
+        f.advance_tree_to(osc, cur + lead + f.domain(cpu).unwrap().units_per_tick())
+            .unwrap();
+        assert_eq!(f.lead(cpu).unwrap(), 0);
+        assert_eq!(f.ticks(cpu).unwrap(), 11);
+
+        // A gate keeps the count and drops the lead; ungating resumes from
+        // the tree.
+        f.advance_alone(cpu, 5).unwrap();
+        f.set_gated(cpu, true).unwrap();
+        assert_eq!(f.ticks(cpu).unwrap(), 16);
+        assert_eq!(f.lead(cpu).unwrap(), 0);
+        f.set_gated(cpu, false).unwrap();
+        assert_eq!(f.ticks(cpu).unwrap(), 16);
+        assert!(f.advance_alone(cpu, 1).is_ok());
     }
 
     #[test]

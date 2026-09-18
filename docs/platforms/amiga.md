@@ -147,7 +147,10 @@ refused one is still retried every round. `tests/amiga_a500_cpu_rate.rs`
 runs a two-instruction loop out of a synthetic ROM for 100 ms and asserts the
 68000 retired `clk / 4` of it to within one iteration: **709 380 cycles of
 709 379 owed** (100.00 %), where the same test on the old board reads 356 292
-(50.23 %).
+(50.23 %). The scheduler's own rule changed too — two runnables on one crystal
+now each execute its whole rate (`docs/techniques/execution-budgets.md`) —
+but the A500 has one runnable on its crystal now, so that change leaves this
+board's hashes exactly where this one put them.
 
 What moved: the two animated insert-disk screens (2.04 at 28 s, 3.1 at 12 s),
 which show the same picture with the disk at another point of its slide
