@@ -94,6 +94,27 @@ publishes `PaulaPort` as `ExportId::PAULA`. `src/dev/amiga/paula.rs` lists
 exactly what Agnus must call; every call carries a tick of the shared colour
 clock and catches Paula up to it first.
 
+**The four audio channels reach a host as stereo.** Paula's channels are two
+pairs — 0 and 3 to the left output, 1 and 2 to the right (chapter 5) — and with
+`record` set it integrates each pair's `sample × volume` sum over 32 colour
+clocks and queues the result, which `host::audio::amiga` converts to a host
+rate. 32 colour clocks is a choice, not a fact: the chip has no output sample
+clock, and the manual's minimum period of 124 bounds a channel at about
+28.6 kHz (PAL), so a frame rate of 110 840.46875 Hz carries everything it can
+produce. The board's two output filters — the fixed RC low-pass and the
+switchable "LED" one on CIA-A's `PA1` — are **not** modelled: they are on the
+board rather than in the chip, they differ between models, the switchable one
+cannot be a fixed `Pole` in the audio seam, and the Hardware Reference Manual
+gives neither corner frequency. `src/dev/amiga/paula.rs` has the long form.
+
+One known limitation, and it is in the *chipset* rather than the stream: Agnus
+and Paula are lazily advanced and can be a millisecond apart, so an audio DMA
+slot sometimes arrives after Paula has crossed two word boundaries. `AUDxDR` is
+one flag rather than a count, so that word is fetched once and played twice,
+and the block's length counter — which counts boundaries — restarts early. A
+steady tone therefore comes out with the right level and the right side but a
+ragged edge. Fixing it belongs with the slot timing in `agnus/slots.rs`.
+
 **A drive is its own device, on the CIA ports.** `amiga.floppy` takes `MTR*`,
 `SEL*`, `SIDE*`, `DIR` and `STEP*` as wires and answers on `RDY*`, `TK0*`,
 `WPRO*`, `CHNG*` and `INDEX*`, open-collector, exactly as Appendix E's connector
