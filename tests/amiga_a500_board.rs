@@ -559,6 +559,72 @@ fn an_unmasked_cia_b_request_is_level_6() {
     assert_eq!(peek_word(&m, INTREQR) & 0x2000, 0x2000, "EXTER");
 }
 
+/// A guest that walks Paula's level pins from five down to three, a hundred
+/// times, with every maskable level masked, and counts non-maskable interrupts.
+///
+/// Five is `101` and three is `011`. Paula's three `IPL` pins are three wires,
+/// and written in bit order they showed `111` between the two — level seven,
+/// which the 68000 recognises on the *transition* (MC68000UM §6.3.2) and takes
+/// whatever the mask says. An Amiga has no level-seven source at all (chapter
+/// 7's table stops at `EXTER`, six), so any count here is an interrupt that
+/// never happened. `RBF` and `VERTB` are the two requests used because a
+/// handler clearing `RBF` with a vertical blank pending is ordinary traffic.
+///
+/// ```text
+///   00c: jmp     ($00f80012).l             ; leave the overlay
+///   012: move.b  #$00, ($00bfe001).l       ; PRA:  OVL low
+///   01a: move.b  #$01, ($00bfe201).l       ; DDRA: PA0 an output -> chip RAM at 0
+///   022: move.l  #$00f8004e, ($0000007c).l ; vector 31, the level 7 autovector
+///   02c: move.w  #$c820, ($00dff09a).l     ; INTENA: SET | INTEN | RBF | VERTB
+///   034: move.w  #99, d0
+///   038: move.w  #$8820, ($00dff09c).l     ; INTREQ: SET | RBF | VERTB -> level 5
+///   040: move.w  #$0800, ($00dff09c).l     ; INTREQ: clear RBF        -> level 3
+///   048: dbra    d0, $038
+///   04c: bra     *
+///   04e: addq.l  #1, ($00000100).l         ; the level 7 handler
+///   054: rte
+/// ```
+///
+/// The status register keeps its reset mask of seven throughout, so nothing
+/// but level seven can be taken.
+fn level_walk_rom() -> Vec<u8> {
+    image(&[
+        0x4ef9, 0x00f8, 0x0012, //
+        0x13fc, 0x0000, 0x00bf, 0xe001, //
+        0x13fc, 0x0001, 0x00bf, 0xe201, //
+        0x23fc, 0x00f8, 0x004e, 0x0000, 0x007c, //
+        0x33fc, 0xc820, 0x00df, 0xf09a, //
+        0x303c, 0x0063, //
+        0x33fc, 0x8820, 0x00df, 0xf09c, //
+        0x33fc, 0x0800, 0x00df, 0xf09c, //
+        0x51c8, 0xffee, //
+        0x60fe, //
+        0x52b9, 0x0000, 0x0100, //
+        0x4e73,
+    ])
+}
+
+#[test]
+fn paula_moving_between_two_levels_never_raises_a_non_maskable_interrupt() {
+    let mut m = build(
+        catalog::machine("amiga-a500").unwrap().source,
+        level_walk_rom(),
+    );
+    m.run_for(GlobalTime::from_nanos(2_000_000))
+        .expect("it runs");
+    assert_eq!(
+        peek_word(&m, INTENAR),
+        0x4820,
+        "the guest reached its loop: INTEN, RBF and VERTB enabled"
+    );
+    assert_eq!(
+        peek_long(&m, COUNTER),
+        0,
+        "a level-seven interrupt was taken: the level pins passed through 7"
+    );
+    assert_eq!(peek_word(&m, INTREQR) & 0x0800, 0, "and the loop ran out");
+}
+
 #[test]
 fn a_guest_serdat_reaches_the_host_serial_port() {
     // 00c: move.w #372, ($00dff032).l   SERPER: 9600 baud on PAL, (3546895/9600)-1

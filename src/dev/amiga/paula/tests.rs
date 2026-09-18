@@ -275,6 +275,110 @@ fn the_external_lines_hold_their_bits_up_while_asserted() {
     assert_eq!(rig.paula.ipl(), 0);
 }
 
+/// A processor's three `IPL` pins as one sink, recording the encoded level it
+/// is shown after **every** delivery — the transients between pins included,
+/// which is the whole point.
+#[derive(Debug)]
+struct IplWatch {
+    bits: Mutex<u8>,
+    seen: Mutex<vec::Vec<u8>>,
+}
+
+impl IplWatch {
+    fn new() -> IplWatch {
+        IplWatch {
+            bits: Mutex::with_rank(LockRank::DEVICE, 0),
+            seen: Mutex::with_rank(LockRank::LEAF, vec::Vec::new()),
+        }
+    }
+
+    /// Every level the pins have shown since the last call.
+    fn take(&self) -> vec::Vec<u8> {
+        core::mem::take(&mut *self.seen.lock())
+    }
+}
+
+impl WireSink for IplWatch {
+    fn set_level(&self, _src: WireId, line: u32, level: Level) {
+        let now = {
+            let mut bits = self.bits.lock();
+            let bit = 1u8 << line;
+            *bits = if level.is_high() {
+                *bits | bit
+            } else {
+                *bits & !bit
+            };
+            *bits
+        };
+        self.seen.lock().push(now);
+    }
+}
+
+/// Paula's three level pins carry one number on three wires, and a wire
+/// delivers the instant it is set. Level seven is the one the 68000 takes on a
+/// *transition* rather than on the level (MC68000UM §6.3.2), so a level the
+/// pins merely flicker through is a non-maskable interrupt the Amiga has no
+/// source for at all — chapter 7's table stops at `EXTER`, level six.
+#[test]
+fn the_level_pins_never_flicker_through_a_level_neither_end_asked_for() {
+    // One request bit per level, from the table in `int`.
+    let of = [
+        (1u8, int::TBE),
+        (2, int::PORTS),
+        (3, int::VERTB),
+        (4, int::AUD0),
+        (5, int::RBF),
+        (6, int::EXTER),
+    ];
+    let rig = Rig::new();
+    let watch = Arc::new(IplWatch::new());
+    for (bit, name) in IPL_PINS.iter().enumerate() {
+        let src = WireId::new(200 + bit as u64);
+        let wire = Wire::builder()
+            .source(src)
+            .sink(Arc::clone(&watch) as Arc<dyn WireSink>, bit as u32)
+            .build_shared();
+        rig.paula
+            .connect(name, WireSource::new(wire, src))
+            .expect("an ipl pin");
+    }
+    rig.poke(INTENA, 0xffff);
+    for (high, high_bit) in of {
+        for (low, low_bit) in of {
+            if low >= high {
+                continue;
+            }
+            // Both pending, so the pins carry the higher level; then the
+            // handler clears its own bit and the lower one is left. Five down
+            // to three showed `111` on the way when the pins were written in
+            // bit order.
+            rig.poke(INTREQ, 0x7fff);
+            let _ = watch.take();
+            rig.poke(INTREQ, 0x8000 | high_bit | low_bit);
+            assert_eq!(rig.paula.ipl(), high);
+            let _ = watch.take();
+            rig.poke(INTREQ, high_bit);
+            assert_eq!(rig.paula.ipl(), low);
+            for level in watch.take() {
+                assert!(
+                    level <= high,
+                    "{high} -> {low} put level {level} on the pins, above either end"
+                );
+            }
+            // And back up, which no ordering can glitch but which the sweep
+            // should cover anyway.
+            rig.poke(INTREQ, 0x8000 | high_bit);
+            assert_eq!(rig.paula.ipl(), high);
+            for level in watch.take() {
+                assert!(
+                    level <= high,
+                    "{low} -> {high} put level {level} on the pins, above either end"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn agnus_raises_its_own_sources_through_the_port() {
     let rig = Rig::new();

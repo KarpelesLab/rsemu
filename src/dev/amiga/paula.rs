@@ -1364,12 +1364,41 @@ impl Shared {
     }
 
     /// Drive the interrupt level, holding no lock while the wires move.
+    ///
+    /// **Falling pins first, then rising ones.** The three `IPL` pins are one
+    /// encoded number but three wires, and a wire delivers the instant it is
+    /// set, so whatever the processor reads between the first pin and the last
+    /// is a number this chip never meant. Writing the pins in bit order lets
+    /// that number be *higher* than either the old level or the new one: going
+    /// from five (`101`) to three (`011`) sets `IPL1` while `IPL2` is still
+    /// high and shows `111` on the way — level seven, which the 68000
+    /// recognises as a **transition** rather than a level (MC68000UM §6.3.2)
+    /// and latches. One glitch is then a non-maskable interrupt the Amiga has
+    /// no source for at all; the only levels Paula can encode are one to six
+    /// (chapter 7, "Interrupts").
+    ///
+    /// Clearing before setting makes every value the pins pass through a
+    /// subset of the old level's bits (while clearing) or of the new one's
+    /// (while setting), so nothing above either end is ever on them, and seven
+    /// only if seven was asked for. A lower level can still show for an
+    /// instant — three from zero passes through one — which is harmless,
+    /// because the processor reads levels one to six at its next instruction
+    /// boundary, by which time the delivery is over. On real hardware the
+    /// encoder's outputs settle inside a clock and the 68000 synchronises its
+    /// `IPL` inputs to that clock; this tree has no clock inside a delivery,
+    /// so the encoder is where the coherence has to come from.
     fn refresh(&self) {
         let level = self.state.lock().ipl();
         let out = self.out.lock().clone();
-        for (bit, src) in out.ipl.iter().enumerate() {
-            if let Some(src) = src {
-                src.set(Level::from_bool(level >> bit & 1 != 0));
+        for want in [false, true] {
+            for (bit, src) in out.ipl.iter().enumerate() {
+                let high = level >> bit & 1 != 0;
+                if high != want {
+                    continue;
+                }
+                if let Some(src) = src {
+                    src.set(Level::from_bool(high));
+                }
             }
         }
     }
