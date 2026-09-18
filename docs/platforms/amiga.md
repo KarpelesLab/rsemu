@@ -306,7 +306,7 @@ is the whole of a Kickstart 1.x configuration.
 
 `tests/amiga_a500_kickstart.rs`, behind `RSEMU_AMIGA_ROM_DIR`, runs the user's
 ROMs in place on the shipped board and checks a hash of Denise's picture;
-with `RSEMU_AMIGA_ADF_DIR` as well it boots the Workbench 2.04 disk.
+with `RSEMU_AMIGA_ADF_DIR` as well it boots the Workbench 1.3 and 2.04 disks.
 `RSEMU_AMIGA_FRAME_DIR` writes the frames out as PNGs.
 
 | ROM | Reaches | What is on screen |
@@ -315,6 +315,7 @@ with `RSEMU_AMIGA_ADF_DIR` as well it boots the Workbench 2.04 disk.
 | Kickstart 2.04 (37.175) | its insert-disk screen, ~24 s | Dark purple background; the rainbow check mark top left; "2.0 Roms (37.175) / Copyright © 1985-1991 / Commodore-Amiga, Inc. / All Rights Reserved" in salmon; a salmon drive with a black slot, and a blue disk with a grey shutter and white label below it, animating into the drive. No pointer. The colours are the ones the ROM's own copper list loads |
 | Kickstart 3.1 (40.063, A500/A600/A2000) | its insert-disk screen, ~10 s | The same picture with "3.1 ROM 40.063 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." |
 | Kickstart 2.04 + the Workbench 2.04 disk | the Workbench desktop, ~57 s | A grey 640-pixel high-resolution screen; a black screen title bar reading "Copyright © 1985-1991 Commodore-Amiga, Inc. All Rights Reserved" with the red pointer over its first letters; below it the blue-titled "Workbench" window, its Ram Disk and Workbench2.0 icons, both scroll bars and the sizing gadget. The busy pointer appears while the disk is read. Nothing is out of place |
+| Kickstart 1.3 + the Workbench 1.3 disk | the Workbench desktop, ~85 s | A plain blue 640-pixel high-resolution screen; a white screen title bar reading "Workbench release." and "365000 free memory", with the red pointer over its first letters; the RAM DISK and Workbench1.3 icons down the right-hand edge. The AmigaDOS shell the startup-sequence opens is up by 40 s and `[CLI 2]` — `LoadWB` — by 60 |
 | AROS (2025-04-22 main ROM) | an alert on the serial port | See below |
 
 **AROS** is blocked by the board, not a chip. Its main ROM alone raises
@@ -360,6 +361,20 @@ mirror:
   gives 42 and 40 and the manual's own 40 and 20 at the standard windows — and
   50, not 49, at the `$18`–`$D8` limit, which is where it departs from the
   book. Both pictures are square with it.
+* **The head steps on the trailing edge of `STEP*`**
+  (`src/dev/amiga/floppy.rs`). Appendix E names no edge — the edge belongs to
+  the drive, and an Amiga's is an ordinary Shugart-compatible 3.5-inch
+  mechanism, whose interface has said since the SA400 that "the access motion
+  is initiated on the trailing edge of the step pulse". It matters because the
+  two Kickstarts drive the line differently: 2.04 asserts `SEL0*` and *then*
+  pulses `STEP*` inside the selected window, where either edge would do, but
+  1.3 deselects between pulses and asserts `SEL0*`, `DIR` and `STEP*` in one
+  `PRB` write, so its leading edge lands on the instant of selection. Stepping
+  on the leading edge dropped every 1.x step: the head never left cylinder 0,
+  the change flop — "reset when drive is selected and the head stepped, but
+  only if a disk is installed" — was never reset, `trackdisk` read the drive as
+  empty and never started the motor, and 1.3 sat on its insert-disk screen with
+  a disk in DF0.
 * **A refused copper `MOVE` halts the copper** until its next restart
   (`src/dev/amiga/agnus/copper.rs`). Inference from firmware: 1.3 loads a
   `View` with no copper list, which sends the copper into `ExecBase`, and AROS

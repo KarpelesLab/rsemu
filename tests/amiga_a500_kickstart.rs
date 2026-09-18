@@ -18,6 +18,7 @@
 //! | 3.1 | `AN_MemCorrupt`: a blitter line walked its D pointer by `BLTDMOD` | `src/dev/amiga/agnus/blitter.rs` |
 //! | 1.3, AROS | a copper sent into `ExecBase` wrote `INTENA` | `src/dev/amiga/agnus/copper.rs` |
 //! | 2.04 + Workbench 2.04 | `AN_MemCorrupt` at ~38 s, then (once past it) a desktop sheared a word a line | `agnus/blitter.rs` as above; `agnus/display.rs` (high-resolution fetch) |
+//! | 1.3 + Workbench 1.3 | the insert-disk screen forever: the drive's head never left cylinder 0 | `src/dev/amiga/floppy.rs` (`STEP*` trailing edge) |
 //!
 //! # What is in this file, and what is not
 //!
@@ -234,6 +235,40 @@ fn kickstart_2_04_boots_the_workbench_2_04_disk_to_its_desktop() {
     reaches_its_screen("amiga-os-204.rom", disk, 62, GOLDEN_204_WORKBENCH);
 }
 
+/// Kickstart 1.3 with the Workbench 1.3 disk in DF0, both read in place: the
+/// AmigaDOS shell the startup-sequence opens, `LoadWB`, and the Workbench 1.3
+/// desktop — a plain blue screen with a white title bar reading "Workbench
+/// release." and the free-memory count, the RAM DISK and Workbench1.3 icons
+/// down the right-hand edge, and the red pointer at the top left.
+///
+/// Ninety virtual seconds. 1.3 is slower to the desktop than 2.04 is: the
+/// shell banner is up by 40 s, `LoadWB` has opened `[CLI 2]` by 60, the icons
+/// are drawn by 90, and the picture no longer moves after that (the
+/// free-memory figure is still settling at 84 s and is identical at 90 and
+/// 100).
+///
+/// Before the drive stepped its head on the *trailing* edge of `STEP*` this
+/// run never got past the insert-disk screen: 1.3 asserts `SEL0*` and `STEP*`
+/// in one `PRB` write, every step was dropped, the change flop never reset and
+/// `trackdisk` never started the motor. `src/dev/amiga/floppy.rs` has the long
+/// version.
+#[test]
+fn kickstart_1_3_boots_the_workbench_1_3_disk_to_its_desktop() {
+    let Ok(dir) = std::env::var("RSEMU_AMIGA_ADF_DIR") else {
+        println!(
+            "amiga-a500: set RSEMU_AMIGA_ADF_DIR to an Amiga Forever `Shared/adf` directory \
+             to boot a real Workbench disk."
+        );
+        return;
+    };
+    let path = std::path::Path::new(&dir).join("amiga-os-134-workbench.adf");
+    let Ok(disk) = std::fs::read(&path) else {
+        println!("amiga-a500: {} is not there; skipped", path.display());
+        return;
+    };
+    reaches_its_screen("amiga-os-130.rom", disk, 90, GOLDEN_130_WORKBENCH);
+}
+
 /// AROS's 512 KiB main ROM alone. It cannot reach a screen on this board: its
 /// graphics library is in the extended ROM an A500 has no socket for, and it
 /// raises an alert saying so on the serial port. What is asserted is only that
@@ -255,3 +290,5 @@ const GOLDEN_204: u64 = 0x9a92_f494_18cf_2811;
 const GOLDEN_310: u64 = 0xfdec_fe27_9cd5_3349;
 /// At 62 s with the Workbench 2.04 disk: the desktop.
 const GOLDEN_204_WORKBENCH: u64 = 0x95a5_9a12_c942_e139;
+/// At 90 s with the Workbench 1.3 disk: the desktop.
+const GOLDEN_130_WORKBENCH: u64 = 0xb491_89ae_fb75_bd01;
