@@ -1,4 +1,5 @@
-//! Real Kickstarts on the A500, run in place, to their insert-disk screens.
+//! Real Kickstarts on the A500, run in place, to their insert-disk screens —
+//! and one of them on to the Workbench desktop.
 //!
 //! # Why this file exists
 //!
@@ -16,6 +17,7 @@
 //! | 2.04, 3.1 | graphics' genlock probe waiting on a one-shot timer that never started | `src/dev/mos/cia.rs` |
 //! | 3.1 | `AN_MemCorrupt`: a blitter line walked its D pointer by `BLTDMOD` | `src/dev/amiga/agnus/blitter.rs` |
 //! | 1.3, AROS | a copper sent into `ExecBase` wrote `INTENA` | `src/dev/amiga/agnus/copper.rs` |
+//! | 2.04 + Workbench 2.04 | `AN_MemCorrupt` at ~38 s, then (once past it) a desktop sheared a word a line | `agnus/blitter.rs` as above; `agnus/display.rs` (high-resolution fetch) |
 //!
 //! # What is in this file, and what is not
 //!
@@ -26,12 +28,16 @@
 //! time — our rendering of the screen, not ROM contents. The screens are
 //! described in words in `docs/platforms/amiga.md`.
 //!
+//! The Workbench test also needs `RSEMU_AMIGA_ADF_DIR`, Amiga Forever's
+//! `Shared/adf`, and reads the disk in place too. Nothing of it is asserted
+//! beyond the picture this emulator draws once it has booted.
+//!
 //! `RSEMU_AMIGA_FRAME_DIR`, when set, receives a PNG of each frame a test
 //! checks (in a build with `display-png`), so a person can look at it.
 //!
-//! The board is `machines/tests/amiga-a500-kickstart.machine`: the shipped
-//! A500 with its ROM socket decoded as a 512 KiB mirror, which is what lets a
-//! 256 KiB Kickstart 1.3 build at all.
+//! The board is the shipped `machines/amiga-a500.machine`, whose ROM socket is
+//! a 512 KiB mirror — which is what lets a 256 KiB Kickstart 1.3 build at all —
+//! with its drive empty.
 //!
 //! # If a golden moves
 //!
@@ -54,9 +60,6 @@ use rsemu::host::display::amiga::{DeniseScanout, capture};
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
 use rsemu::machine::{Machine, catalog};
 
-/// The board: the shipped A500 with the ROM socket fixed.
-const BOARD: &str = include_str!("../machines/tests/amiga-a500-kickstart.machine");
-
 /// One running board and the handles a test needs.
 struct Board {
     machine: Machine,
@@ -65,7 +68,9 @@ struct Board {
 }
 
 /// Build the board around the user's ROM `file`, or `None` if it is not there.
-fn board(file: &str) -> Option<Board> {
+///
+/// The drive is empty unless `df0` brings a disk.
+fn board(file: &str, df0: Vec<u8>) -> Option<Board> {
     let Ok(dir) = std::env::var("RSEMU_AMIGA_ROM_DIR") else {
         println!(
             "amiga-a500: set RSEMU_AMIGA_ROM_DIR to an Amiga Forever `Shared/rom` directory \
@@ -96,8 +101,14 @@ fn board(file: &str) -> Option<Board> {
         .params
         .push(("kickstart-size".to_string(), format!("{}K", size / 1024)));
     options.realize.media.insert("kickstart", image.bytes);
+    // No bytes is an empty drive: the insert-disk screen is what a Kickstart
+    // shows with nothing in DF0.
+    options.realize.media.insert("df0", df0);
     let registry = catalog::registry().expect("a registry");
-    let machine = rsemu::machine::build("amiga-a500-kickstart", BOARD, &registry, &options)
+    let source = catalog::machine("amiga-a500")
+        .expect("this build ships amiga-a500")
+        .source;
+    let machine = rsemu::machine::build("amiga-a500", source, &registry, &options)
         .unwrap_or_else(|e| panic!("{file}: the board does not realize: {e}"));
     let cpu = cores.last().expect("the binding captured the processor");
     let scanout = capture::take(&options.realize.hosts, &machine).expect("a Denise");
@@ -122,8 +133,8 @@ fn frame_hash(surface: &Surface) -> u64 {
 ///
 /// `RSEMU_AMIGA_TRACE=1` prints the processor's state once a second on the
 /// way, which is how a person finds where a ROM stopped.
-fn run_to(file: &str, seconds: u64) -> Option<(Board, u64)> {
-    let mut b = board(file)?;
+fn run_to(file: &str, df0: Vec<u8>, seconds: u64) -> Option<(Board, u64)> {
+    let mut b = board(file, df0)?;
     let trace = std::env::var_os("RSEMU_AMIGA_TRACE").is_some();
     for s in 1..=seconds {
         b.machine
@@ -161,8 +172,8 @@ fn run_to(file: &str, seconds: u64) -> Option<(Board, u64)> {
 }
 
 /// The checks every ROM that reaches its screen must pass, then the golden.
-fn reaches_its_screen(file: &str, seconds: u64, golden: u64) {
-    let Some((b, hash)) = run_to(file, seconds) else {
+fn reaches_its_screen(file: &str, df0: Vec<u8>, seconds: u64, golden: u64) {
+    let Some((b, hash)) = run_to(file, df0, seconds) else {
         return;
     };
     assert!(!b.cpu.is_halted(), "{file}: the processor double-faulted");
@@ -181,19 +192,46 @@ fn reaches_its_screen(file: &str, seconds: u64, golden: u64) {
 /// Kickstart 1.3 (34.5), 256 KiB: the hand holding a Workbench 1.3 disk.
 #[test]
 fn kickstart_1_3_draws_the_hand_and_disk() {
-    reaches_its_screen("amiga-os-130.rom", 12, GOLDEN_130);
+    reaches_its_screen("amiga-os-130.rom", Vec::new(), 12, GOLDEN_130);
 }
 
 /// Kickstart 2.04 (37.175): the check mark, the drive and the disk going in.
 #[test]
 fn kickstart_2_04_draws_the_insert_disk_animation() {
-    reaches_its_screen("amiga-os-204.rom", 28, GOLDEN_204);
+    reaches_its_screen("amiga-os-204.rom", Vec::new(), 28, GOLDEN_204);
 }
 
 /// Kickstart 3.1 (40.063, the A500/A600/A2000 part): the same picture.
 #[test]
 fn kickstart_3_1_draws_the_insert_disk_animation() {
-    reaches_its_screen("amiga-os-310-a600.rom", 12, GOLDEN_310);
+    reaches_its_screen("amiga-os-310-a600.rom", Vec::new(), 12, GOLDEN_310);
+}
+
+/// Kickstart 2.04 with the Workbench 2.04 disk in DF0, both read in place: the
+/// AmigaDOS shell window, `LoadWB`, and the Workbench desktop — a blue-framed
+/// "Workbench" window holding the Ram Disk and Workbench2.0 icons, on a grey
+/// 640-pixel high-resolution screen, with the red pointer at the top left.
+///
+/// Sixty-two virtual seconds, the least that proves it: the disk is read until
+/// about 57 s, and the picture has settled by 60. Before the blitter's line
+/// mode stepped D by `BLTCMOD` this run stopped with `AN_MemCorrupt` at about
+/// 38 s; before the high-resolution fetch counted in eight-count blocks it
+/// reached the desktop sheared a word a line.
+#[test]
+fn kickstart_2_04_boots_the_workbench_2_04_disk_to_its_desktop() {
+    let Ok(dir) = std::env::var("RSEMU_AMIGA_ADF_DIR") else {
+        println!(
+            "amiga-a500: set RSEMU_AMIGA_ADF_DIR to an Amiga Forever `Shared/adf` directory \
+             to boot a real Workbench disk."
+        );
+        return;
+    };
+    let path = std::path::Path::new(&dir).join("amiga-os-204-workbench.adf");
+    let Ok(disk) = std::fs::read(&path) else {
+        println!("amiga-a500: {} is not there; skipped", path.display());
+        return;
+    };
+    reaches_its_screen("amiga-os-204.rom", disk, 62, GOLDEN_204_WORKBENCH);
 }
 
 /// AROS's 512 KiB main ROM alone. It cannot reach a screen on this board: its
@@ -202,16 +240,18 @@ fn kickstart_3_1_draws_the_insert_disk_animation() {
 /// it runs to that point without a fault.
 #[test]
 fn aros_runs_until_it_needs_its_extended_rom() {
-    let Some((b, _)) = run_to("aros-20250422.rom", 4) else {
+    let Some((b, _)) = run_to("aros-20250422.rom", Vec::new(), 4) else {
         return;
     };
     assert!(!b.cpu.is_halted());
     assert_eq!(b.cpu.bus_faults().0, 0);
 }
 
-/// `amiga-a500-kickstart` at 12 s: the hand and disk on white.
+/// At 12 s: the hand and disk on white.
 const GOLDEN_130: u64 = 0x0d15_a156_1521_12c1;
 /// At 28 s: the check mark, the drive, and the disk below it mid-animation.
 const GOLDEN_204: u64 = 0x9a92_f494_18cf_2811;
 /// At 12 s: the same picture with the 3.1 text.
 const GOLDEN_310: u64 = 0xfdec_fe27_9cd5_3349;
+/// At 62 s with the Workbench 2.04 disk: the desktop.
+const GOLDEN_204_WORKBENCH: u64 = 0x95a5_9a12_c942_e139;

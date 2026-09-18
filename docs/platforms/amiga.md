@@ -5,7 +5,8 @@ Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
 `machines/tests/amiga-denise.machine`, `machines/tests/agnus-board.machine`,
 `tests/amiga_a500_board.rs`, `tests/amiga_denise_board.rs`,
 `tests/agnus_board.rs`, `tests/amiga_a500_chipset.rs`,
-`tests/amiga_a500_input.rs`, `tests/amiga_a500_kickstart.rs`.
+`tests/amiga_a500_input.rs`, `tests/amiga_adf.rs`,
+`tests/amiga_a500_kickstart.rs`.
 
 A 68000, 512 KiB of chip RAM, a Kickstart ROM, two 8520 CIAs and three custom
 chips — Agnus, Denise and Paula. **All of them are on the A500 board now**: the
@@ -111,7 +112,6 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 | **Reading a write-only custom register** | The manual does not say | The last word driven onto the bus — **a placeholder** that Agnus's DMA cycles will replace; `CustomBus::unclaimed` counts every use |
 | **`$DFF200`–`$DFFFFF`** | Appendix D gives a 4 KiB window, the table fills 512 bytes, and whether the rest mirrors is not stated | Only 512 bytes mapped; the rest floats like any empty address. `mirror(custom)` is a one-word change |
 | **A0–A7 in a CIA window** | The notation gives one hex digit of register select; nothing says whether the low byte is decoded | Not decoded — `$BFE003` is register 0 |
-| **The ROM base** | The edition's map is `$FC_0000`, a 256 KiB Kickstart; 512 KiB images start at `$F8_0000` | `kickstart-size` is a parameter defaulting to 512 KiB; the shipped board still has `rom-base` too — see *A 256 KiB Kickstart* for the one-line map that makes it unnecessary |
 
 | **Paula's disk bit cell** | "Two microseconds per bit cell" is 7.094 colour clocks, and Paula has no other clock | 7 colour clocks (14 slow): 1.974 µs PAL. The drive spins at the same rate, so a track reads back as written |
 | **The drive's spindle speed and index width** | Not in the manual | 100,000 cells a revolution (300 rpm at 2 µs), an index pulse of 1,000 cells |
@@ -179,24 +179,31 @@ still works, told apart by length.
 **An empty drive is the default.** A named media slot must be bound, so
 `rsemu run` and the wasm front end bind `df0` to no bytes when nobody names a
 disk — the same list, and the same argument, as a PC's `floppy` — and
-`amiga.floppy` reads no bytes as no disk. The shipped `amiga-a500.machine` does
-not name the slot yet; `machines/tests/amiga-a500-df0.machine` is the board with
-the one property that does, `image = "df0"` on `df0`.
+`amiga.floppy` reads no bytes as no disk. The shipped `amiga-a500.machine`
+names the slot, so every test that builds the board binds it — to no bytes for
+an empty drive.
 
 ### How far a real disk gets
 
-Kickstart 2.04 with the Workbench 2.04 ADF, both read in place: the boot block
-runs, AmigaDOS reads the root block on cylinder 40, and the head works across
-the disk from cylinder 0 to 78 loading Workbench for about thirty virtual
-seconds. Then exec raises the dead-end alert `$81000005`, a corrupt memory
-list, reboots, and shows the alert waiting for a mouse button that this board
-does not have. Workbench 1.3 on the same Kickstart does the same after about
-eleven seconds. No write reaches the disk in either run. That alert is the next
-thing to chase, and nothing so far points at the drive: the disk is never
-written, and the sectors Kickstart loaded to get that far are ones whose sums
-it checked.
+**Kickstart 2.04 boots the Workbench 2.04 disk to its desktop**, both files
+read in place: the boot block runs, AmigaDOS reads the root block on cylinder
+40, the head works across the disk for about fifty virtual seconds, the shell
+window prints "Amiga Release 2. Kickstart 37.175, Workbench 37.67", and
+`LoadWB` opens the Workbench window with its Ram Disk and Workbench2.0 icons.
+`tests/amiga_a500_kickstart.rs` hashes that picture at 62 s. Workbench 1.3 on
+the same Kickstart reaches its own desktop the same way. No write reaches
+either disk.
 
-Two things stood between Kickstart and the drive, and one still does:
+The alert that used to end this run at about thirty-eight seconds —
+`$81000005`, `AN_MemCorrupt` — was the blitter's, not the drive's: see *Real
+Kickstarts* below.
+
+**Kickstart 1.3 with a disk in the drive does not start the motor at all**, and
+sits at its insert-disk screen. 2.04 on the same board and the same disk boots
+it, so the drive answers the lines trackdisk drives; whatever 1.3 asks for
+first, it does not get. That is the next disk question.
+
+Two things stood between Kickstart and the drive:
 
 * **Paula's disk queue lost words.** Agnus serves the disk slot once a line
   (227 counts) and a `FAST` word is 112, so a third word sometimes finishes
@@ -208,11 +215,11 @@ Two things stood between Kickstart and the drive, and one still does:
   will transfer the timer latch to the counter and initiate counting regardless
   of the start bit" (Appendix F). `timer.device` calibrates against the TOD
   clock with exactly that write, and without it Kickstart waited forever.
-* **Byte access to a custom register** is still refused (the *Open* row above),
-  and Kickstart 2.04 reads `$DFF07D` as a byte, 2.05 `$DFF006`: a bus error and
-  a dead-end alert `$80000002` before `trackdisk.device` touches a drive. The
-  real-disk tests stand a byte-tolerant window in front of the same custom bus,
-  test-local and labelled, until `custom.rs` decides what one data strobe does.
+* **Byte access to a custom register.** Kickstart 2.04 reads `$DFF07D` as a
+  byte and 2.05 `$DFF006`, and the decode refused a byte access, which was a
+  bus error and a dead-end alert `$80000002` before `trackdisk.device` touched
+  a drive. `amiga.custom` answers them now — see *A byte access to a custom
+  register* below — and the test-local window that stood in for it is gone.
 
 ## An address with nothing at it floats; it does not fault
 
@@ -292,13 +299,14 @@ map mem 0xF80000 size 512K = mirror(kick) { endian = "big" }
 ```
 
 in place of `map mem rom-base size kickstart-size = kick`, and `param rom-base`
-goes. `machines/tests/amiga-a500-kickstart.machine` is the shipped board with
-exactly that change, and is what the real-ROM tests run.
+is gone. That is what the shipped board now says, so `-p kickstart-size=256K`
+is the whole of a Kickstart 1.x configuration.
 
 ## Real Kickstarts, as far as each gets
 
 `tests/amiga_a500_kickstart.rs`, behind `RSEMU_AMIGA_ROM_DIR`, runs the user's
-ROMs in place on that board and checks a hash of Denise's picture.
+ROMs in place on the shipped board and checks a hash of Denise's picture;
+with `RSEMU_AMIGA_ADF_DIR` as well it boots the Workbench 2.04 disk.
 `RSEMU_AMIGA_FRAME_DIR` writes the frames out as PNGs.
 
 | ROM | Reaches | What is on screen |
@@ -306,35 +314,52 @@ ROMs in place on that board and checks a hash of Denise's picture.
 | Kickstart 1.3 (34.5, 256 KiB) | its insert-disk screen, ~10 s | White background; a black-outlined hand holding a blue-violet 3½" disk with a grey shutter; the label reads "AMIGA Workbench" upside down, as the disk is held; "V1.3" beside it. Static. No pointer |
 | Kickstart 2.04 (37.175) | its insert-disk screen, ~24 s | Dark purple background; the rainbow check mark top left; "2.0 Roms (37.175) / Copyright © 1985-1991 / Commodore-Amiga, Inc. / All Rights Reserved" in salmon; a salmon drive with a black slot, and a blue disk with a grey shutter and white label below it, animating into the drive. No pointer. The colours are the ones the ROM's own copper list loads |
 | Kickstart 3.1 (40.063, A500/A600/A2000) | its insert-disk screen, ~10 s | The same picture with "3.1 ROM 40.063 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." |
+| Kickstart 2.04 + the Workbench 2.04 disk | the Workbench desktop, ~57 s | A grey 640-pixel high-resolution screen; a black screen title bar reading "Copyright © 1985-1991 Commodore-Amiga, Inc. All Rights Reserved" with the red pointer over its first letters; below it the blue-titled "Workbench" window, its Ram Disk and Workbench2.0 icons, both scroll bars and the sizing gadget. The busy pointer appears while the disk is read. Nothing is out of place |
 | AROS (2025-04-22 main ROM) | an alert on the serial port | See below |
 
 **AROS** is blocked by the board, not a chip. Its main ROM alone raises
 "graphics.library could not open library hidd" (`$C2038002`) over and over:
 the graphics code is in `aros-…-ext.rom`, which wants to be at `$E0_0000`, and
-an A500 has no socket there. With that ROM mapped (a scratch copy of the
-board, not committed) AROS loads intuition, then **runs out of chip memory**
-on a 512 KiB board (`AvailMem` down to 16 bytes, grey screen, idle). With
-`-p chip-ram=1M` it opens a 640×512 interlaced 4-plane screen whose picture is
-**sheared** a word per line: it sets `DDFSTRT $3C`, `DDFSTOP $D0`, hires, and
-bitplane modulos of 80 bytes. Chapter 3's formula gives 39 words for that
-window and Agnus fetches 39; a 640-pixel bitmap needs 40. Whether the real
-chip fetches in 8-count steps even in hires is not in any manual this project
-has, so Agnus was left alone; that is AROS's next question.
+an A500 has no socket there, so the shipped board does not map one. With that
+ROM mapped (a scratch board, not committed) AROS loads intuition, then **runs
+out of chip memory** on a 512 KiB board (`AvailMem` down to 16 bytes, grey
+screen, idle). With `-p chip-ram=1M` it draws its boot picture — a cat's eyes
+in the dark, 640 pixels of high resolution, square since the fetch fix below.
+
+That leaves one AROS question that is this board's: with `amiga.keyboard`
+wired to CIA-A, AROS stops at a plain grey screen and draws nothing, and
+without it the picture appears. Its serial log ends at `romtaginit done`
+either way. Kickstart 1.3, 2.04 and 3.1 are unaffected by the keyboard, so
+this is AROS reading something from it that the model answers differently.
 
 What it took to get the Kickstarts there, beyond the byte access and the ROM
 mirror:
 
-* **CIA one-shot start** (`src/dev/mos/cia.rs`): "In one-shot mode, a write to
-  timer-high ... will transfer the timer latch to the counter and initiate
-  counting regardless of the start bit" (HRM Appendix F; the TRM says the
-  same). 2.04's and 3.1's graphics library times its genlock probe that way
-  and waited forever without it.
+* **CIA one-shot start** (`src/dev/mos/cia.rs`, landed with the ADF work):
+  "In one-shot mode, a write to timer-high ... will transfer the timer latch to
+  the counter and initiate counting regardless of the start bit" (HRM Appendix
+  F; the TRM says the same). 2.04's and 3.1's graphics library times its
+  genlock probe that way, and `timer.device` calibrates against TOD with it;
+  without it Kickstart waited forever on a grey screen. The same write also
+  raises a toggle-mode `PB6`/`PB7`, because "the toggle output is set high
+  whenever the timer is started".
 * **Blitter line mode steps D by `BLTCMOD`** (`src/dev/amiga/agnus/blitter.rs`).
   Kickstart's line routine loads `BLTCMOD`, `BLTCPT` and `BLTDPT` and never
   `BLTDMOD`; after an area fill left `BLTDMOD` at −4, stepping D by it walked a
   line up through an allocation header and exec stopped 3.1 with
   `AN_MemCorrupt`. Appendix A has software load both modulos alike, so no
   conforming program can tell the difference.
+* **The high-resolution bitplane fetch counts eight-count blocks**
+  (`src/dev/amiga/agnus/display.rs`). **Inference from firmware, against the
+  manual.** Chapter 3's high-resolution formula and table 3-14's "49 words"
+  said 41 words for the `DDFSTRT $38`, `DDFSTOP $D8` window Kickstart 2.04's
+  Workbench screen uses, and the screen's own modulos of −4 on an 80-byte row
+  say it expects 42; AROS's `$3C`–`$D0` screen says 40 where the formula says
+  39. The desktop came out sheared a word a line, AROS's picture sheared the
+  other way. Counting eight-count blocks, two words each in high resolution,
+  gives 42 and 40 and the manual's own 40 and 20 at the standard windows — and
+  50, not 49, at the `$18`–`$D8` limit, which is where it departs from the
+  book. Both pictures are square with it.
 * **A refused copper `MOVE` halts the copper** until its next restart
   (`src/dev/amiga/agnus/copper.rs`). Inference from firmware: 1.3 loads a
   `View` with no copper list, which sends the copper into `ExecBase`, and AROS
@@ -468,6 +493,7 @@ sync placement is not in the manual.
 | First sprite control fetch | The first line after table 3-13's vertical blank | The pointers are written "during the vertical blanking interval before the first display" |
 | Line-mode texture and `ONEDOT` | `BSH` counts down; the first dot of a row is kept | The manual gives register set-up, not the stepping |
 | Bitplane fetch | All of a line's words as it ends | Pointer changes mid-fetch apply to the whole line |
+| How many words a high-resolution line fetches | Eight-count blocks, two words each — 42 for `$38`–`$D8`, where chapter 3's formula says 41 | Kickstart 2.04's Workbench screen and AROS both display square only this way; see *Real Kickstarts* |
 | Contention | None: no slot is lent or stolen, `BLTPRI` is stored only | The arbitration figure is a sketch, not a timing |
 | The copper's write permission | Appendix B's `*`/`~` columns, the original chip set's rule | Appendix C gives ECS a wider one; an A500 Agnus is not ECS |
 

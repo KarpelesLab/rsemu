@@ -105,26 +105,25 @@ machine "amiga-a500" {
   # lists $00 0000-$07 FFFF and $08 0000-$0F FFFF as the two halves.
   param chip-ram = 512K
 
-  # Kickstart 1.x is 256 KiB and lives at $FC0000; 2.0 and later are 512 KiB
-  # and live at $F80000. Appendix D of the manual's own edition says
-  # $FC 0000-$FF FFFF, which is the 1.x machine it was written for; the socket
-  # is the top of the space either way, so the two move together:
+  # Kickstart 1.x is 256 KiB; 2.0 and later are 512 KiB. Both go in one socket,
+  # and Gary's `_ROMEN` decodes it as a 512 KiB window, $F8 0000-$FF FFFF,
+  # from A19-A23 alone (the A2000 PAL it replaced, Technical Reference Manual
+  # 7.3). A 256 KiB part has no pin for A18, so it answers in both halves: at
+  # $FC0000, Appendix D's "256K System ROM", and at $F80000 as well. So
   #
-  #   -p kickstart-size=256K -p rom-base=0xFC0000
+  #   -p kickstart-size=256K
   #
-  # gives the 1.x map. They are two parameters rather than one derived from the
-  # other because the description language does not substitute a parameter into
-  # another parameter's default.
+  # is the whole of the 1.x configuration; the map below and the overlay at
+  # zero repeat a smaller ROM through the window (`src/dev/amiga/gary.rs`).
   param kickstart-size = 512K
-  param rom-base       = 0xF80000
 
   # -- the crystal -----------------------------------------------------------
   #
   # One oscillator on the Amiga's own board, and everything on it is an exact
   # division of that one number (ROADMAP.md 4.2), which is the whole reason the
   # chipset can be dot-exact against the processor. (The keyboard and the
-  # mouse, at the bottom of the file, are not on this board.) PAL: 28.37516 MHz, processor at a
-  # quarter of it, 7.09379 MHz. `-p master=28636360` gives the NTSC machine and
+  # mouse, at the bottom of the file, are not on this board.) PAL:
+  # 28.37516 MHz, processor at a quarter of it, 7.09379 MHz. `-p master=28636360` gives the NTSC machine and
   # a 7.15909 MHz processor, and every clock below follows it; an NTSC machine
   # also needs `standard = "ntsc"` on `agnus` and `denise`, because line counts
   # are a fact about the chips rather than about the crystal.
@@ -250,7 +249,7 @@ machine "amiga-a500" {
   # would have to be swapped from inside a CIA write.
   map mem 0x000000 size chip-ram       = gary.overlay { endian = "big" }
   map mem 0xDFF000 size 0x200          = custom
-  map mem rom-base size kickstart-size = kick         { endian = "big" }
+  map mem 0xF80000 size 512K           = mirror(kick) { endian = "big" }
   map mem 0xBFE000 size 0x1000         = cia_a_decode { endian = "big" }
   map mem 0xBFD000 size 0x1000         = cia_b_decode { endian = "big" }
 

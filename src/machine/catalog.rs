@@ -681,20 +681,16 @@ pub static M68K_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/m68k-mini.machine"),
 };
 
-/// A Commodore Amiga 500's memory map, when this build has the board classes.
+/// A Commodore Amiga 500, when this build has the board classes.
 ///
-/// The map and the two decoders that make it work, and no chipset: chip RAM at
-/// zero behind the `OVL` overlay, the custom-chip register space at
-/// `$DFF000`, and a Kickstart socket at the top of a 24-bit big-endian space.
-/// The `kickstart` slot takes the ROM image — a 512 KiB one at `$F8_0000` by
-/// default, and `-p kickstart-size=256K -p rom-base=0xFC0000` for the 256 KiB
-/// socket the hardware manual's own appendix describes.
-///
-/// The two 8520 CIAs are on it, CIA-A's `PA0` driving the overlay, and so is
-/// Paula, through which both CIAs interrupt the processor. Agnus and Denise are
-/// **not**, so a real Kickstart finds its reset vector and then waits on a
-/// chipset that is not all there. `machines/amiga-a500.machine` carries the
-/// wiring, and `docs/platforms/amiga.md` the ledger.
+/// A 68000, chip RAM at zero behind the `OVL` overlay, both 8520 CIAs, Agnus,
+/// Denise and Paula on the custom-chip register space at `$DFF000`, the
+/// internal drive, the keyboard and the mouse. The `kickstart` slot takes the
+/// ROM image in the socket at `$F8_0000`: 512 KiB by default, and
+/// `-p kickstart-size=256K` for a Kickstart 1.x, which the socket repeats
+/// through its window as the board does. Kickstart 1.3, 2.04 and 3.1 reach
+/// their insert-disk screens. `machines/amiga-a500.machine` carries the wiring,
+/// and `docs/platforms/amiga.md` the ledger.
 #[cfg(feature = "machine-amiga-a500")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a500")))]
 pub static AMIGA_A500: CatalogEntry = CatalogEntry {
