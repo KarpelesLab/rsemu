@@ -216,8 +216,8 @@ fn script() -> Vec<Vec<u8>> {
     s[13] = key(Keysym::from_ascii(b'!'), true).to_vec();
     s[14] = key(Keysym::from_ascii(b'!'), false).to_vec();
     // The pointer is somewhere; then it moves right 40 and up 20 framebuffer
-    // pixels — 20 counts right, 10 up — and in the same poll the left and
-    // right buttons go down where it stopped.
+    // pixels — 40 counts right, 20 up, a count a pixel — and in the same poll
+    // the left and right buttons go down where it stopped.
     s[MOVE - 1] = pointer(100, 100, 0).to_vec();
     s[MOVE] = [pointer(140, 80, 0), pointer(140, 80, 0b101)].concat();
     s
@@ -273,12 +273,12 @@ fn motion_counts_on_joy0dat_and_the_click_waits_for_it_on_pa6() {
     assert_eq!(joy_before, 0, "nothing has moved yet");
     assert_eq!(pra_before & 0x40, 0x40, "PA6 high: switch open");
 
-    // Twenty counts at five a millisecond take four: part of the way there
+    // Forty counts at five a millisecond take eight: part of the way there
     // two slices in, and neither counter ever jumps.
     let x = |joy: u16| (joy & 0xff) as u8;
     let y = |joy: u16| (joy >> 8) as u8;
     let (mid, pra_mid) = samples[MOVE + 1];
-    assert!(x(mid) > 0 && x(mid) < 20, "X on its way: {mid:#06x}");
+    assert!(x(mid) > 0 && x(mid) < 40, "X on its way: {mid:#06x}");
     assert_eq!(pra_mid & 0x40, 0x40, "the click has not landed mid-move");
     for pair in samples.windows(2) {
         let dx = x(pair[1].0).wrapping_sub(x(pair[0].0)) as i8;
@@ -289,8 +289,8 @@ fn motion_counts_on_joy0dat_and_the_click_waits_for_it_on_pa6() {
     }
 
     let (joy, pra) = *samples.last().expect("samples");
-    assert_eq!(x(joy), 20, "right 20: JOY0DAT {joy:#06x}");
-    assert_eq!(y(joy), (-10i8) as u8, "up 10 wraps below zero: {joy:#06x}");
+    assert_eq!(x(joy), 40, "right 40: JOY0DAT {joy:#06x}");
+    assert_eq!(y(joy), (-20i8) as u8, "up 20 wraps below zero: {joy:#06x}");
     assert_eq!(pra & 0x40, 0, "the left button closed PA6");
     let potgor = peek(&m, POTGOR, Width::U16) as u16;
     assert_eq!(

@@ -298,14 +298,26 @@ impl InputSink for AmigaKeyboardSink {
 /// Framebuffer pixels per mouse count.
 ///
 /// Denise's picture is laid out in high-resolution pixels across and two rows
-/// per line down (`host::display::amiga`), so a low-resolution pixel — the unit
-/// a pointer is positioned in — is two framebuffer pixels each way. One count a
-/// low-resolution pixel is a host convention, not a hardware fact: how far the
-/// guest's pointer moves per count is the guest's own business (its mouse speed
-/// and acceleration), and a relative mouse driven from an absolute protocol
-/// cannot track the host cursor exactly whatever the ratio.
+/// per line down (`host::display::amiga`). How far the guest's pointer moves
+/// per count is the guest's own business — its mouse speed and acceleration —
+/// so this is a host convention, not a hardware fact, and it is set by what
+/// the guests do: Kickstart 1.3 and 2.04 at their default preferences both
+/// move the pointer one high-resolution pixel across and one interlaced line
+/// down per count (black-box, `tests/amiga_a500_workbench.rs`), which is one
+/// framebuffer pixel each way. At one count a pixel the guest's pointer goes
+/// as far as the host's cursor did.
+///
+/// It was two, on the theory that a pointer is positioned in low-resolution
+/// pixels, and the pointer went half as far as the cursor: a person aiming at
+/// an icon in a VNC viewer drifted further off it with every move.
+///
+/// Distance is all a relative mouse can agree on. Where the two are differs
+/// by wherever the first event found the host cursor, and changes each time
+/// Intuition stops the pointer at a screen edge while the host goes on. A
+/// sweep past a corner pins the guest's pointer to a known place, which is how
+/// that test puts it where it wants.
 #[cfg(feature = "dev-amiga-mouse")]
-pub const PIXELS_PER_COUNT: i64 = 2;
+pub const PIXELS_PER_COUNT: i64 = 1;
 
 /// An [`InputSink`] that moves an `amiga.mouse`.
 ///
