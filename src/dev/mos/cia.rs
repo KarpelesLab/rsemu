@@ -1327,6 +1327,13 @@ impl CiaRegs {
                 state.ta_latch = (state.ta_latch & 0x00ff) | (u16::from(value) << 8);
                 if state.cra & CR_ONESHOT != 0 {
                     state.ta = state.ta_latch;
+                    // "The toggle output is set high whenever the timer is
+                    // started" — and this write is one of the ways a timer
+                    // starts, so a stopped toggle-mode timer raises PB6 here
+                    // exactly as it does when `CRA` sets the start bit.
+                    if state.cra & CR_START == 0 && state.cra & CR_OUTMODE != 0 {
+                        state.pb6 = true;
+                    }
                     state.cra |= CR_START;
                 } else if state.cra & CR_START == 0 {
                     state.ta = state.ta_latch;
@@ -1337,6 +1344,9 @@ impl CiaRegs {
                 state.tb_latch = (state.tb_latch & 0x00ff) | (u16::from(value) << 8);
                 if state.crb & CR_ONESHOT != 0 {
                     state.tb = state.tb_latch;
+                    if state.crb & CR_START == 0 && state.crb & CR_OUTMODE != 0 {
+                        state.pb7 = true;
+                    }
                     state.crb |= CR_START;
                 } else if state.crb & CR_START == 0 {
                     state.tb = state.tb_latch;

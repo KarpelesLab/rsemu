@@ -191,6 +191,19 @@ fn the_high_byte_loads_the_counter_only_while_the_timer_is_stopped() {
 }
 
 #[test]
+fn the_start_a_high_byte_write_makes_raises_a_toggle_output_like_any_other() {
+    // "The toggle output is set high whenever the timer is started, and set low
+    // by RES" (6526 data sheet, TIMER A OUTPUT MODES). The high-byte write is
+    // one of the ways an 8520's one-shot timer starts, so PB6 rises on it.
+    let cia = Cia::bare();
+    poke(&cia, 0xe, CR_ONESHOT | CR_OUTMODE | CR_PBON);
+    assert_eq!(peek(&cia, 0x1) & 0x40, 0, "PB6 low until the timer starts");
+    poke(&cia, 0x4, 0x10);
+    poke(&cia, 0x5, 0x00);
+    assert_eq!(peek(&cia, 0x1) & 0x40, 0x40, "and high once it has");
+}
+
+#[test]
 fn a_high_byte_write_starts_a_one_shot_timer_whatever_the_start_bit_says() {
     // "In one-shot mode, a write to timer-high (register 5 for timer A,
     // register 7 for Timer B) will transfer the timer latch to the counter and
