@@ -381,6 +381,10 @@ struct RunArgs {
     span: GlobalTime,
     /// Whether `--for` was given. Without it an interactive machine runs until
     /// the user stops it, and a headless one runs for a second.
+    ///
+    /// It is also what tells [`interact`] the run has an end of its own, so
+    /// that the end-of-input guess for a piped session does not shorten a span
+    /// the user asked for in so many words (`tests/cli_span.rs`).
     span_given: bool,
     /// The character port to attach this terminal to, if the user named one.
     console: Option<String>,
@@ -2236,7 +2240,18 @@ fn interact(
         // exhausted *and* the machine has gone quiet, there is nobody left to
         // wait for, so `printf … | rsemu run apple1` finishes rather than
         // hanging on a machine that will never be typed at again.
-        if term.at_eof() && moved == 0 {
+        //
+        // **Not when `--for` gave the run an end of its own.** The guess is for
+        // a session with no deadline; applied on top of one it silently
+        // shortens the run, and every output taken afterwards is from the wrong
+        // point on the guest's timeline. `rsemu run amiga-a500 --for 12s
+        // --screenshot x.png` with stdin not a terminal stopped at two virtual
+        // seconds — before Kickstart 1.3 draws anything — and wrote a blank
+        // grey screen, exit zero, no warning. A machine that has gone quiet is
+        // not a machine that has finished: an Amiga waiting on its own timers
+        // moves nothing through a serial port for the whole boot.
+        // `tests/cli_span.rs`.
+        if deadline.is_none() && term.at_eof() && moved == 0 {
             idle += 1;
             if idle >= IDLE_SLICES {
                 break ExitCode::SUCCESS;
