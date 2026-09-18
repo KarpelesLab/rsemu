@@ -95,7 +95,11 @@ fn a_byte_goes_out_least_significant_bit_first() {
 fn a_data_token_is_low_for_one_bit_time_and_a_wake_for_eight() {
     // The frame is start + seven data bits + stop (DS40002249B §9.3.2 note 1),
     // so the only long low pulse a 7N1 UART can make is 0x00's.
-    assert_eq!(Token::ONE.low_bits(), 1, "the start pulse, and nothing else");
+    assert_eq!(
+        Token::ONE.low_bits(),
+        1,
+        "the start pulse, and nothing else"
+    );
     assert_eq!(Token::ZERO.low_bits(), 1, "start, one high, then tZLO");
     assert_eq!(Token::WAKE.low_bits(), 8, "start plus seven zero data bits");
 

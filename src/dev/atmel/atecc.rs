@@ -1,5 +1,5 @@
 //! The Microchip ATECC508A / ATECC608A / ATECC608B CryptoAuthentication
-//! secure element, over I²C.
+//! secure element, over I²C and over the single wire.
 //!
 //! The part behind the "secure element" footprint on a very large number of
 //! boards — Arduino, Adafruit, ESP32, STM32, LoRaWAN modules, TPM-lite roles —
@@ -12,16 +12,32 @@
 //! The Microchip **ATECC508A** (DS20005927), **ATECC608A** (DS40001977) and
 //! **ATECC608B** (DS40002239) datasheets, cited by section throughout, plus
 //! FIPS 180-4 (SHA-256), RFC 2104 (HMAC) and FIPS 186-4 (ECDSA over P-256) for
-//! the primitives. **No emulator and no vendor library was consulted**
-//! (`ROADMAP.md` §1): CryptoAuthLib is permissively licensed and would have
-//! been readable, but the datasheet is the better source and is the only one
-//! this file is written from.
+//! the primitives. The single-wire chapter is cited by document number because
+//! it lives in two other openly published data sheets of the same silicon and
+//! the same wire: **ATECC608B-TFLXTLS** (DS40002249B) chapter 8, and
+//! **ATSHA204A** (DS40002025A) chapter 5, which is the one that writes the
+//! token byte values and the bit order down. Neither carries a confidentiality
+//! marking.
+//!
+//! **No emulator and no vendor library was consulted** (`ROADMAP.md` §1). In
+//! particular **CryptoAuthLib was not opened, and must not be**: it is *not*
+//! permissively licensed — Microchip ships it under their own licence
+//! restricting use to Microchip products — whatever the sentence in this
+//! module's original issue said.
 //!
 //! # What is modelled
 //!
 //! * **The I²C transport** (§7.1): the seven-bit address the `I2C_Address`
 //!   config byte selects, and the *word address* byte that opens every write —
 //!   `0x00` Reset, `0x01` Sleep, `0x02` Idle, `0x03` Command.
+//! * **The SWI transport** (DS40002249B §8), on [`crate::bus::swi`]: the
+//!   eight-token flags — `0x77` command, `0x88` transmit, `0xBB` idle, `0xCC`
+//!   sleep — the `0x7F`/`0x7D` bit tokens that carry a group least-significant
+//!   bit first, the wake pulse recognised by its width rather than its value,
+//!   and the §8.3.1 I/O timeout that puts the part to sleep when a token
+//!   stream stops making sense. It is a *front end*, not a second device: the
+//!   group it assembles goes into the same `start_command` the word address
+//!   `0x03` path does, and the answer comes out of the same buffer.
 //! * **The power state machine** (§6): sleep, idle and awake, the wake token
 //!   `04 11 33 43` a freshly woken part answers with, and the **watchdog**
 //!   (§6.3) that puts the part back to sleep by itself after tWATCHDOG whether
@@ -44,17 +60,22 @@
 //!
 //! # What is not
 //!
-//! * **The SWI single-wire transport** (§7.2). It is not a mode of this model
-//!   and pretending otherwise would be worse than the gap: SWI carries each
-//!   *logical bit* as one 230.4 kbaud UART token (`0x7F` = 1, `0x7D` = 0) with
-//!   flag bytes `0x88` command, `0x77` transmit, `0xCC` idle, `0xBB` sleep, and
-//!   a wake is a ≥ 60 µs low pulse on the same wire. What it needs is a
-//!   *transport seam that does not exist yet*: a one-wire, self-clocked link
-//!   with a UART on the other end, which is neither [`crate::bus::i2c`] nor a
-//!   GPIO. Everything above the transport in this file — the packet layer, the
-//!   state machine and every command — is already independent of it
-//!   (the command engine takes a packet and returns a packet), so SWI is a new
-//!   front end plus a link type, not a second device.
+//! * **Which interface the part was ordered with.** A real ATECC is an I²C
+//!   part or an SWI part at manufacture, and `I2C_Enable` (§2.2.4) says which.
+//!   This model sets that byte from the `interface` property and then answers
+//!   **both** faces regardless, deliberately: one object with one packet layer
+//!   is the point, and it is what lets
+//!   `the_swi_transport_carries_the_same_packets_as_i2c` put one command
+//!   through one device two ways. A host that wires up the face the part was
+//!   not ordered with gets silence on real silicon; here it gets an answer.
+//! * **The SWI GPIO** (DS40002249B §8.4). On an SWI part `SCL` becomes a
+//!   general-purpose output driven by `Info` in GPIO mode. The pin is not
+//!   modelled and that `Info` mode answers a parse error.
+//! * **A bit-banged SWI front end.** The data sheet defines the line's timings
+//!   as UART frames (§9.3.2), so [`crate::bus::swi`] carries frames. Firmware
+//!   that toggles the pulse widths through a GPIO would need an edge-level
+//!   engine the way [`crate::bus::i2c::wires`] is one; nothing in the tree
+//!   does yet.
 //! * `DeriveKey`, `KDF`, `SecureBoot` and the 608's `KDF`-adjacent modes. They
 //!   answer a parse error, and the module says so rather than inventing a
 //!   message layout.
@@ -95,7 +116,18 @@
 //! publishes the tick its current command finishes on, and is caught up before
 //! anything touches it. A command takes its datasheet execution time, during
 //! which the part **NACKs its own address** — which is what makes a driver's
-//! poll loop behave the way the datasheet's flow chart says.
+//! poll loop behave the way the datasheet's flow chart says. On the single
+//! wire the same interval is silence rather than a NACK (DS40002249B §8.2:
+//! "When the device is busy executing a command, it ignores the SDA pin and
+//! any flags that are sent by the system"), and there are two deadlines rather
+//! than one — tWATCHDOG, and the §8.3.1 I/O timeout that a half-sent group
+//! arms. Both are ticks of this device's clock domain and neither is a wall
+//! clock; the part registers them and the scheduler comes back.
+//!
+//! The wake pulse is the one piece of timing that does *not* belong to the
+//! scheduler, because it is not a duration this device waits out: it is the
+//! width of a frame the host already sent, which [`crate::bus::swi`] reports
+//! in nanoseconds and this module compares against [`WAKE_LOW_NS`].
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -110,6 +142,7 @@ use purecrypto::hash::{Digest, HmacSha256, Sha256};
 
 use crate::bus::i2c::wires::{SlaveWires, SlaveWiresState, pin as line};
 use crate::bus::i2c::{Ack, Address, Direction, I2cBus, I2cSlave, buses};
+use crate::bus::swi::{Flag, SwiLink, SwiSlave, TOKEN_BITS, Token, links};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -127,7 +160,9 @@ mod tests;
 const CLASS_NAME: &str = "atmel.atecc";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// 2 adds the single-wire front end's framing state.
+const STATE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // The wire-level constants (§7.1, §9.1)
@@ -289,6 +324,21 @@ const CONFIG_FIXED: usize = 16;
 /// does not own a frequency, so the number is in *its board's* ticks.
 pub const DEFAULT_WATCHDOG_TICKS: u64 = 1_300_000;
 
+/// tWLO: how long the single wire must be held low to be a wake rather than a
+/// data token, in nanoseconds.
+///
+/// 60 µs (DS40002249B §9.3.1, Table 9-3). This is the *part's* number, which is
+/// why [`crate::bus::swi`] does not know it: the wire reports how long each
+/// frame held the line low and the silicon decides what that means.
+pub const WAKE_LOW_NS: u64 = 60_000;
+
+/// tTIMEOUT-SWI in ticks of this device's clock domain (DS40002249B §8.3.1).
+///
+/// 65 ms, the data sheet's typical, expressed for a 1 MHz domain — the same
+/// convention [`DEFAULT_WATCHDOG_TICKS`] uses, and for the same reason: a
+/// device does not own a frequency.
+pub const DEFAULT_SWI_TIMEOUT_TICKS: u64 = 65_000;
+
 /// How long each command takes, in microseconds.
 ///
 /// These are the datasheet's per-command **maximum** execution times (§9.4),
@@ -421,6 +471,70 @@ impl Power {
     }
 }
 
+/// Which interface the part is ordered with (§2.2.4, `I2C_Enable`).
+///
+/// A real part is one or the other at manufacture, and bit 0 of configuration
+/// byte 14 is how firmware finds out. This model answers **both** faces
+/// whatever this says — see the module docs — so the property decides what a
+/// `Read` of the configuration zone reports and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Interface {
+    /// Two wires and an address (§7.1). `I2C_Enable` bit 0 set.
+    #[default]
+    I2c,
+    /// One self-clocked wire with a UART at the far end (DS40002249B §8).
+    /// `I2C_Enable` bit 0 clear, and SCL becomes a GPIO (§8.4).
+    Swi,
+}
+
+impl Interface {
+    /// The interface `name` selects, or `None`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Interface> {
+        match name {
+            "i2c" => Some(Interface::I2c),
+            "swi" => Some(Interface::Swi),
+            _ => None,
+        }
+    }
+
+    /// What `I2C_Enable`'s bit 0 reads (§2.2.4).
+    const fn i2c_enable(self) -> u8 {
+        match self {
+            Interface::I2c => 0x01,
+            Interface::Swi => 0x00,
+        }
+    }
+}
+
+/// Where the single-wire front end is in the token stream (DS40002249B §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SwiPhase {
+    /// Assembling the eight tokens of a flag, which is what the part waits for
+    /// between transactions (§8.2: "before any I/O transaction, the system must
+    /// send an eight bit flag").
+    #[default]
+    Flag,
+    /// Assembling the bytes of a command group, after [`Flag::COMMAND`].
+    Group,
+}
+
+impl SwiPhase {
+    const fn code(self) -> u8 {
+        match self {
+            SwiPhase::Flag => 0,
+            SwiPhase::Group => 1,
+        }
+    }
+
+    const fn from_code(code: u8) -> SwiPhase {
+        match code {
+            1 => SwiPhase::Group,
+            _ => SwiPhase::Flag,
+        }
+    }
+}
+
 /// Where the current I²C transaction is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Phase {
@@ -543,6 +657,8 @@ pub struct Atecc {
     wires: Arc<SlaveWires>,
     /// The bus to hook onto at realize time, if the machine named one.
     bus: Option<Arc<I2cBus>>,
+    /// The single wire to hook onto at realize time, likewise.
+    swi: Option<Arc<SwiLink>>,
 }
 
 /// Everything both halves of the device reach.
@@ -555,6 +671,10 @@ struct Shared {
     exec_scale: u64,
     /// tWATCHDOG, in ticks of this device's clock domain (§6.3).
     watchdog_ticks: u64,
+    /// tTIMEOUT-SWI, likewise (DS40002249B §8.3.1).
+    swi_timeout_ticks: u64,
+    /// Which interface `I2C_Enable` reports (§2.2.4).
+    interface: Interface,
     /// The board's seed, before this instance's path is mixed into it.
     board_seed: u64,
     /// Domain ticks simulated, published for the scheduler's lock-free
@@ -611,6 +731,24 @@ struct State {
     sha_active: bool,
     /// The two monotonic counters (§2.2, `Counter[0,1]`).
     counters: [u32; 2],
+
+    // -- the single-wire front end (DS40002249B §8) -------------------------
+    /// Whether the tokens coming in are a flag or a group byte.
+    swi_phase: SwiPhase,
+    /// The tokens of the byte being assembled, so far.
+    swi_acc: u8,
+    /// How many of its eight have arrived.
+    swi_bits: u32,
+    /// How long the group is, from its count byte (§4.1). There is no STOP on
+    /// this wire, so the count is the only thing that ends a group.
+    swi_expect: u64,
+    /// Whether the part is driving its response back, after a transmit flag.
+    swi_out: bool,
+    /// Which bit of `tx[tx_pos]` goes out next, least significant first.
+    swi_out_bit: u32,
+    /// The tick tTIMEOUT-SWI puts the part to sleep on, or [`NO_EVENT`]
+    /// (§8.3.1).
+    swi_timeout_at: u64,
     /// The deterministic byte source everything "random" comes from.
     stream: Stream,
 }
@@ -684,7 +822,10 @@ impl Atecc {
         let lock = r.or_str("lock", "none")?;
         let exec_scale: u64 = r.or("exec-scale", 1u64)?;
         let watchdog_ticks: u64 = r.or("watchdog-ticks", DEFAULT_WATCHDOG_TICKS)?;
+        let swi_timeout_ticks: u64 = r.or("swi-timeout-ticks", DEFAULT_SWI_TIMEOUT_TICKS)?;
+        let interface_name = r.or_str("interface", "i2c")?;
         let bus_name = r.optional_str("bus")?.map(String::from);
+        let swi_name = r.optional_str("swi")?.map(String::from);
         r.finish()?;
 
         let bad = |message: String| Error::Config {
@@ -695,6 +836,12 @@ impl Atecc {
             bad(alloc::format!(
                 "`part` is `{part_name}`; this class models `atecc508a`, `atecc608a` and \
                  `atecc608b`"
+            ))
+        })?;
+        let interface = Interface::from_name(interface_name).ok_or_else(|| {
+            bad(alloc::format!(
+                "`interface` is `{interface_name}`; a part is ordered as `i2c` or `swi` (§2.2.4, \
+                 `I2C_Enable`)"
             ))
         })?;
         if address > 0x7f {
@@ -741,6 +888,13 @@ impl Atecc {
             sha_msg: Vec::new(),
             sha_active: false,
             counters: [0; 2],
+            swi_phase: SwiPhase::Flag,
+            swi_acc: 0,
+            swi_bits: 0,
+            swi_expect: 0,
+            swi_out: false,
+            swi_out_bit: 0,
+            swi_timeout_at: NO_EVENT,
             stream: Stream::new(seed),
         };
         if let Some(image) = config {
@@ -784,6 +938,8 @@ impl Atecc {
             address: address as u8,
             exec_scale,
             watchdog_ticks,
+            swi_timeout_ticks,
+            interface,
             board_seed: seed,
             ticks: AtomicU64::new(0),
             next_event: AtomicU64::new(NO_EVENT),
@@ -794,8 +950,17 @@ impl Atecc {
             .as_deref()
             .map(|name| buses::attach(props, name))
             .transpose()?;
+        let swi = swi_name
+            .as_deref()
+            .map(|name| links::attach(props, name))
+            .transpose()?;
         let wires = Arc::new(SlaveWires::new(Arc::clone(&shared) as Arc<dyn I2cSlave>));
-        Ok(Atecc { shared, wires, bus })
+        Ok(Atecc {
+            shared,
+            wires,
+            bus,
+            swi,
+        })
     }
 
     /// The seven-bit address this part answers (§7.1).
@@ -826,6 +991,22 @@ impl Atecc {
     #[must_use]
     pub fn wires(&self) -> &Arc<SlaveWires> {
         &self.wires
+    }
+
+    /// This part as a single-wire device, for a host with a UART on the line
+    /// (DS40002249B §8).
+    ///
+    /// The *same object* [`slave`](Atecc::slave) hands over, behind the other
+    /// trait: one packet layer, two transports.
+    #[must_use]
+    pub fn swi(&self) -> Arc<dyn SwiSlave> {
+        Arc::clone(&self.shared) as Arc<dyn SwiSlave>
+    }
+
+    /// Which interface `I2C_Enable` reports (§2.2.4).
+    #[must_use]
+    pub fn interface(&self) -> Interface {
+        self.shared.interface
     }
 
     /// Whether the part is awake (§6).
@@ -1058,10 +1239,11 @@ impl Shared {
         state.config[4..8].copy_from_slice(&self.part.revnum());
         state.config[8..13].copy_from_slice(&serial[4..9]);
         // Byte 13 is the 608's `AES_Enable` and reserved on a 508A; byte 14 is
-        // `I2C_Enable`, whose bit 0 selects the I²C interface over SWI — which
-        // is the only interface this model has (§2.2.4).
+        // `I2C_Enable`, whose bit 0 selects the I²C interface over SWI
+        // (§2.2.4). Both front ends answer whichever this says — see the module
+        // docs — so what it decides is what firmware *reads*.
         state.config[13] = u8::from(self.part.has_aes());
-        state.config[14] = 0x01;
+        state.config[14] = self.interface.i2c_enable();
         state.config[15] = 0x00;
         state.config[16] = self.address << 1;
         self.publish(&state);
@@ -1070,13 +1252,19 @@ impl Shared {
     /// Publish what the scheduler may ask for without taking a lock.
     fn publish(&self, state: &State) {
         self.ticks.store(state.ticks, Ordering::Relaxed);
-        let next = if state.busy {
+        let mut next = if state.busy {
             state.busy_until.max(state.ticks.saturating_add(1))
         } else if state.power == Power::Awake && self.watchdog_ticks != 0 {
             state.awake_until.max(state.ticks.saturating_add(1))
         } else {
             NO_EVENT
         };
+        // The single wire's own deadline (DS40002249B §8.3.1), which can fall
+        // sooner than either: a host that stops part way through a group has
+        // tTIMEOUT-SWI, not tWATCHDOG.
+        if state.swi_timeout_at != NO_EVENT {
+            next = next.min(state.swi_timeout_at.max(state.ticks.saturating_add(1)));
+        }
         self.next_event.store(next, Ordering::Relaxed);
     }
 
@@ -1091,6 +1279,7 @@ impl Shared {
             state.busy = false;
         }
         self.expire_watchdog(&mut state, target);
+        self.expire_swi_timeout(&mut state, target);
         self.publish(&state);
     }
 
@@ -1118,6 +1307,39 @@ impl Shared {
         }
     }
 
+    /// DS40002249B §8.3.1: a host that stops part way through a token, or sends
+    /// an illegal one, does not hang the part — after tTIMEOUT-SWI it puts
+    /// *itself* to sleep, which is how the two ends resynchronise.
+    fn expire_swi_timeout(&self, state: &mut State, now: u64) {
+        if state.swi_timeout_at == NO_EVENT || now < state.swi_timeout_at {
+            return;
+        }
+        self.go_to_sleep(state);
+    }
+
+    /// Start the I/O timeout, or clear it if the model has it disabled.
+    fn arm_swi_timeout(&self, state: &mut State, now: u64) {
+        state.swi_timeout_at = if self.swi_timeout_ticks == 0 {
+            NO_EVENT
+        } else {
+            now.saturating_add(self.swi_timeout_ticks)
+        };
+    }
+
+    /// Forget where the token stream had got to.
+    ///
+    /// Not a data-sheet operation of its own: it is what every one of sleep,
+    /// idle and a wake does to the I/O channel (DS40002249B §8.1, §8.2).
+    fn swi_reset(&self, state: &mut State) {
+        state.swi_phase = SwiPhase::Flag;
+        state.swi_acc = 0;
+        state.swi_bits = 0;
+        state.swi_expect = 0;
+        state.swi_out = false;
+        state.swi_out_bit = 0;
+        state.swi_timeout_at = NO_EVENT;
+    }
+
     /// Whether a command is executing (§9.4).
     fn is_busy(&self, state: &State, now: u64) -> bool {
         state.busy && now < state.busy_until
@@ -1127,6 +1349,7 @@ impl Shared {
     fn go_to_sleep(&self, state: &mut State) {
         state.power = Power::Sleep;
         state.phase = Phase::Idle;
+        self.swi_reset(state);
         state.rx.clear();
         state.tx.clear();
         state.tx_pos = 0;
@@ -1147,6 +1370,10 @@ impl Shared {
         state.rx.clear();
         state.tx.clear();
         state.tx_pos = 0;
+        // DS40002249B §8.2: an idle flag "causes the input/output buffer to be
+        // flushed", which on the single wire includes where the token stream
+        // had got to.
+        self.swi_reset(state);
     }
 
     /// §6.1: the wake pulse, and the `04 11 33 43` a read then answers.
@@ -1159,6 +1386,11 @@ impl Shared {
             state.sha_msg.clear();
             state.sha_active = false;
         }
+        // DS40002249B §8.1: a wake token sent to a part that is already awake
+        // "will reset the I/O channel hardware on the device", losing what was
+        // in the output buffer — which is exactly what happens here anyway,
+        // because the buffer is about to hold the wake token instead.
+        self.swi_reset(state);
         state.power = Power::Awake;
         state.awake_until = now.saturating_add(self.watchdog_ticks);
         state.phase = Phase::Idle;
@@ -1175,6 +1407,10 @@ impl Shared {
         let packet = core::mem::take(&mut state.rx);
         state.tx.clear();
         state.tx_pos = 0;
+        // The old response is gone, so nothing is being driven on the single
+        // wire until the next transmit flag asks for the new one.
+        state.swi_out = false;
+        state.swi_out_bit = 0;
 
         // §9.1.1: the count byte covers the whole packet, CRC included, and a
         // packet whose CRC does not check out gets 0xFF rather than an attempt
@@ -2418,6 +2654,179 @@ impl I2cSlave for Shared {
 const MAX_PACKET: usize = 255;
 
 // ---------------------------------------------------------------------------
+// The single-wire face (DS40002249B §8)
+// ---------------------------------------------------------------------------
+
+impl Shared {
+    /// Eight tokens have made a flag (DS40002249B Table 8-1).
+    fn swi_flag(&self, state: &mut State, flag: Flag, now: u64) {
+        match flag {
+            // "After this flag, the system starts sending a command group to
+            // the device."
+            Flag::COMMAND => {
+                state.rx.clear();
+                state.swi_phase = SwiPhase::Group;
+                state.swi_expect = 0;
+                state.swi_out = false;
+                state.swi_out_bit = 0;
+            }
+            // §8.2: "turn the bus around so that the device can send data back
+            // to the system", and DS40002025A §5.2: "When valid data is in the
+            // output buffer, the transmit flag may be repeatedly issued to the
+            // device to resend the buffer" — so the buffer restarts here rather
+            // than carrying on where a previous read stopped.
+            Flag::TRANSMIT => {
+                state.tx_pos = 0;
+                state.swi_out_bit = 0;
+                state.swi_out = !state.tx.is_empty();
+            }
+            Flag::IDLE => {
+                self.go_idle(state);
+            }
+            Flag::SLEEP => {
+                self.go_to_sleep(state);
+            }
+            // "All other values are reserved and must not be used." The part is
+            // not told what to do with one, so this model does nothing with it
+            // and keeps waiting for a flag — the I/O timeout below is what
+            // rescues a host that has genuinely lost its place.
+            _ => {
+                let _ = now;
+            }
+        }
+    }
+
+    /// Eight tokens have made a byte of a command group (DS40002249B §4.1).
+    fn swi_group_byte(&self, state: &mut State, byte: u8, now: u64) {
+        if state.rx.len() >= MAX_PACKET {
+            self.swi_reset(state);
+            return;
+        }
+        state.rx.push(byte);
+        if state.rx.len() == 1 {
+            // §4.1: the count byte covers the whole group, CRC included. There
+            // is no STOP condition on this wire, so it is the *only* thing that
+            // says where the group ends. A count below the four-byte minimum
+            // cannot be waited for, so the group ends immediately and
+            // `validate` answers the I/O error §4.1 promises.
+            state.swi_expect = u64::from(byte).max(1);
+        }
+        if state.rx.len() as u64 >= state.swi_expect {
+            state.swi_phase = SwiPhase::Flag;
+            state.swi_expect = 0;
+            self.start_command(state, now);
+        }
+    }
+
+    /// Arm or clear the I/O timeout according to where the stream is
+    /// (DS40002249B §8.3.1: "The Timeout Counter is reset after every legal
+    /// token", and it runs while a token or a group is incomplete).
+    fn swi_retime(&self, state: &mut State, now: u64) {
+        if state.swi_bits != 0 || state.swi_phase == SwiPhase::Group {
+            self.arm_swi_timeout(state, now);
+        } else {
+            state.swi_timeout_at = NO_EVENT;
+        }
+    }
+}
+
+impl SwiSlave for Shared {
+    fn token(&self, token: Token, low_ns: u64) {
+        let mut state = self.state.lock();
+        let now = self.now(&state);
+        self.expire_watchdog(&mut state, now);
+        self.expire_swi_timeout(&mut state, now);
+
+        // §8.1: the wake token is the one frame recognised in every state,
+        // because what marks it is a pulse width rather than a value — "an
+        // extra long low pulse on the SDA pin, which cannot be confused with
+        // the shorter low pulses that occur during a data token".
+        if low_ns >= WAKE_LOW_NS {
+            self.wake(&mut state, now);
+            return;
+        }
+
+        // §8.1: "Devices that are either in the Idle or Sleep mode will ignore
+        // all data tokens until they receive a legal Wake token"; §8.2: "When
+        // the device is busy executing a command, it ignores the SDA pin and
+        // any flags that are sent by the system." Not sampling the pin means
+        // the framing starts again afterwards, rather than resuming mid-byte.
+        if state.power != Power::Awake || self.is_busy(&state, now) {
+            self.swi_reset(&mut state);
+            self.publish(&state);
+            return;
+        }
+
+        let Some(bit) = token.bit() else {
+            // §8.3.1: an illegal token does not fail anything on the spot. It
+            // starts tTIMEOUT-SWI, after which the part sleeps — which is how
+            // the two ends resynchronise.
+            self.swi_reset(&mut state);
+            self.arm_swi_timeout(&mut state, now);
+            self.publish(&state);
+            return;
+        };
+
+        // Least significant bit first (DS40002025A §5), so each token lands
+        // above the last and the eighth is bit 7.
+        state.swi_acc = (state.swi_acc >> 1) | (u8::from(bit) << 7);
+        state.swi_bits += 1;
+        if state.swi_bits >= TOKEN_BITS {
+            let byte = state.swi_acc;
+            state.swi_acc = 0;
+            state.swi_bits = 0;
+            match state.swi_phase {
+                SwiPhase::Flag => self.swi_flag(&mut state, Flag(byte), now),
+                SwiPhase::Group => self.swi_group_byte(&mut state, byte, now),
+            }
+        }
+        self.swi_retime(&mut state, now);
+        self.publish(&state);
+    }
+
+    fn next_token(&self) -> Option<Token> {
+        let mut state = self.state.lock();
+        let now = self.now(&state);
+        self.expire_watchdog(&mut state, now);
+        self.expire_swi_timeout(&mut state, now);
+        if !state.swi_out || state.power != Power::Awake || self.is_busy(&state, now) {
+            return None;
+        }
+        let Some(byte) = state.tx.get(state.tx_pos).copied() else {
+            state.swi_out = false;
+            return None;
+        };
+        let bit = (byte >> state.swi_out_bit) & 1 != 0;
+        state.swi_out_bit += 1;
+        if state.swi_out_bit >= TOKEN_BITS {
+            state.swi_out_bit = 0;
+            state.tx_pos += 1;
+            if state.tx_pos >= state.tx.len() {
+                state.swi_out = false;
+            }
+        }
+        self.publish(&state);
+        Some(Token::of(bit))
+    }
+
+    fn peek_token(&self) -> Option<Token> {
+        // The `MemAttrs::debug` rule on a bus: a monitor's look moves nothing,
+        // so this expires no timer and advances no bit — it only declines to
+        // report a token a timer has already taken away.
+        let state = self.state.lock();
+        let now = self.now(&state);
+        if !state.swi_out || state.power != Power::Awake || self.is_busy(&state, now) {
+            return None;
+        }
+        if self.watchdog_ticks != 0 && now >= state.awake_until {
+            return None;
+        }
+        let byte = state.tx.get(state.tx_pos).copied()?;
+        Some(Token::of((byte >> state.swi_out_bit) & 1 != 0))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Device
 // ---------------------------------------------------------------------------
 
@@ -2432,6 +2841,9 @@ impl Device for Atecc {
         self.seed_from_path(ctx.path());
         if let Some(bus) = &self.bus {
             bus.attach(self.slave())?;
+        }
+        if let Some(swi) = &self.swi {
+            swi.attach(self.swi())?;
         }
         Ok(())
     }
@@ -2478,6 +2890,15 @@ impl Device for Atecc {
         w.write_bool(state.sha_active)?;
         w.write_u32(state.counters[0])?;
         w.write_u32(state.counters[1])?;
+        // The single wire's framing, which is as much live state as the I²C
+        // phase above it: a snapshot taken mid-group resumes mid-group.
+        w.write_u8(state.swi_phase.code())?;
+        w.write_u8(state.swi_acc)?;
+        w.write_u32(state.swi_bits)?;
+        w.write_u64(state.swi_expect)?;
+        w.write_bool(state.swi_out)?;
+        w.write_u32(state.swi_out_bit)?;
+        w.write_u64(state.swi_timeout_at)?;
         // The stream's *position*: a snapshot taken mid-stream resumes
         // mid-stream rather than replaying numbers a guest already has.
         state.stream.save(w)?;
@@ -2506,6 +2927,13 @@ impl Device for Atecc {
         let sha_msg = r.read_bytes()?.to_vec();
         let sha_active = r.read_bool()?;
         let counters = [r.read_u32()?, r.read_u32()?];
+        let swi_phase = SwiPhase::from_code(r.read_u8()?);
+        let swi_acc = r.read_u8()?;
+        let swi_bits = r.read_u32()?;
+        let swi_expect = r.read_u64()?;
+        let swi_out = r.read_bool()?;
+        let swi_out_bit = r.read_u32()?;
+        let swi_timeout_at = r.read_u64()?;
 
         {
             let mut state = self.shared.state.lock();
@@ -2541,6 +2969,15 @@ impl Device for Atecc {
             state.sha_msg = sha_msg;
             state.sha_active = sha_active;
             state.counters = counters;
+            state.swi_phase = swi_phase;
+            state.swi_acc = swi_acc;
+            // A snapshot is untrusted input: a bit index past the end of a
+            // byte would drive the response out of a byte that is not there.
+            state.swi_bits = swi_bits.min(TOKEN_BITS - 1);
+            state.swi_expect = swi_expect;
+            state.swi_out = swi_out;
+            state.swi_out_bit = swi_out_bit.min(TOKEN_BITS - 1);
+            state.swi_timeout_at = swi_timeout_at;
             // The seed comes from the machine description and stays where it
             // is; only the *position* is in the snapshot (`core::rand`).
             state.stream.load(r)?;
@@ -2686,10 +3123,28 @@ pub static ATECC_CLASS: DeviceClass = DeviceClass {
             summary: "tWATCHDOG in ticks of this device's clock domain (§6.3; 0 disables it)",
         },
         PropertySpec {
+            name: "swi-timeout-ticks",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "tTIMEOUT-SWI in ticks of this device's clock domain (§8.3.1; 0 disables it)",
+        },
+        PropertySpec {
+            name: "interface",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "i2c or swi: what I2C_Enable reports (§2.2.4; both faces answer either way)",
+        },
+        PropertySpec {
             name: "bus",
             kind: ValueKind::Str,
             required: false,
             summary: "the named I2C bus to hang off, for a transactional link",
+        },
+        PropertySpec {
+            name: "swi",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the named single-wire link to hang off (§8)",
         },
     ],
     construct: |props| Ok(Box::new(Atecc::new(props)?)),
@@ -2727,7 +3182,10 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("lock", ValueKind::Str))
         .prop(PropSchema::new("exec-scale", ValueKind::Uint))
         .prop(PropSchema::new("watchdog-ticks", ValueKind::Uint))
+        .prop(PropSchema::new("swi-timeout-ticks", ValueKind::Uint))
+        .prop(PropSchema::new("interface", ValueKind::Str).values(&["i2c", "swi"]))
         .prop(PropSchema::new("bus", ValueKind::Str))
+        .prop(PropSchema::new("swi", ValueKind::Str))
         .port(line::SCL_NAME, PortDir::InOut)
         .port(line::SDA_NAME, PortDir::InOut)
 }

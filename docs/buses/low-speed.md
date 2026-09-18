@@ -1,7 +1,8 @@
 # Low-speed buses
 
-Consumed by: `bus/i2c`, `bus/spi`, and the sensor/EEPROM device models. Mostly
-relevant to embedded and SoC machines rather than the PC or the consoles.
+Consumed by: `bus/i2c`, `bus/spi`, `bus/swi`, and the sensor/EEPROM device
+models. Mostly relevant to embedded and SoC machines rather than the PC or the
+consoles.
 
 | Bus | Source | Notes |
 | --- | --- | --- |
@@ -181,6 +182,61 @@ terminates.
 makes it the first board with **two devices on one I²C bus** — the configuration
 in which an address actually does something.
 
+## SWI, as built (`bus-swi`)
+
+| Bus | Source | Notes |
+| --- | --- | --- |
+| SWI (CryptoAuthentication single wire) | Microchip **DS40002249B** (ATECC608B-TFLXTLS) chapter 8, and **DS40002025A** (ATSHA204A) chapter 5 | Both openly published, neither marked confidential. CryptoAuthLib is **not** permissively licensed — Microchip restricts it to Microchip products — and was not opened |
+
+`src/bus/swi` is the same part on one wire instead of two, and it is the first
+fabric here whose unit is **a UART frame**. The data sheet is unusually explicit
+about why: the bit timings "are designed to permit a standard UART running at
+230.4 kBaud to transmit and receive the tokens efficiently. Each byte
+transmitted or received by the UART corresponds to a single bit received or
+transmitted by the device" (§8.1), with "seven data bits, no parity and one Stop
+bit" (§9.3.2 note 1). So one frame is one *bit*: `0x7F` a one, `0x7D` a zero,
+eight of them least-significant first making a flag (`0x77` command, `0x88`
+transmit, `0xBB` idle, `0xCC` sleep) or a byte of a group.
+
+**The wake is arithmetic, and that is the interesting part.** §7.1.1 makes it
+"a data byte of `0x00` [transmitted] at a clock rate sufficiently slow so that
+SDA is low for a minimum period of tWLO", so the link reports each frame's
+longest low time in integer nanoseconds and the *device* compares it against its
+own 60 µs. At 230.4 kBaud a `0x00` is low for 34.7 µs and does **not** wake
+anything; a driver halves its baud rate for that one frame and gets 69.4 µs.
+Nothing in `bus/swi` knows what tWLO is, which is right: it is a property of the
+part, and the wire only carries pulse widths. Compare the I²C wake above, where
+the faithful thing and the literal thing genuinely differ — here they do not,
+because the host really does produce the pulse by choosing a baud rate.
+
+There is deliberately **no wired/bit-level twin** the way I²C and SPI have one.
+The data sheet defines this line's timings as UART frames rather than as edges,
+so a frame *is* the smallest honest unit; firmware that bit-bangs the pulse
+widths through a GPIO would need an edge-level engine, and nothing in the tree
+does yet. The echo a real host sees — TX and RX are tied together through a
+resistor (§8.5) — is wiring rather than protocol and is not modelled either.
+
+**The peripheral is still written once.** `atmel.atecc` implements `SwiSlave`
+beside its `I2cSlave`, both on one `Shared`, and a group assembled from tokens
+goes into the same `start_command` the I²C word address `0x03` path uses.
+`the_swi_transport_carries_the_same_packets_as_i2c` is the claim that matters:
+one command through one device over both transports, then a six-command script
+whose state moves — `Random`, `GenKey`, `Nonce`, `MAC` — run on two identically
+seeded parts, one per transport, with the transcripts compared.
+
+Two deadlines rather than one, both on the lazy-device seam: tWATCHDOG as ever,
+and §8.3.1's tTIMEOUT-SWI, which puts the part to **sleep** when a group or a
+token stops part way through. That is the protocol's whole resynchronisation
+story — there is no acknowledge on this wire to fail with, so a busy part is
+simply silent (§8.2) and a lost host waits the timeout out and starts again.
+
+What is missing is a **host**: no UART model in the tree can drive this link
+from a machine file, because `host::chardev` is a byte stream and a USART's TX
+is not a wire (`src/dev/stm32/usart.rs` says so in its own module docs). The
+device end is complete and the rendezvous table is there; wiring a UART's frame
+level to `SwiLink` is the next step, and it is a change to a UART rather than to
+this fabric.
+
 ## What a snapshot has to carry, and what it must not re-announce
 
 A frame is not atomic with respect to a save. `Machine::save` can land between
@@ -217,4 +273,7 @@ execution state across a guest access — the RISC-V hart's session mutex *is*
 device. `bus::spi` takes two ranks of its own between `BUS` and `DEVICE`
 (`FABRIC_RANK`, `SHIFTER_RANK`), which is what `LockRank::new` is for. Any other
 low-speed fabric will need the same, and the debug ladder catches it on the
-first test rather than at the first deadlock.
+first test rather than at the first deadlock. `bus::swi` is the third in that
+band (`0x4600`, after SPI's `0x4400` and I²C's `0x4500`), and it needs only one:
+a single wire has no bit engine under it, because the frame the host sends *is*
+the bit.

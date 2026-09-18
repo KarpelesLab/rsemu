@@ -21,6 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::bus::i2c::wires::{MasterEvent, MasterOp, MasterWires, pin as line};
+use crate::bus::swi::{BAUD, tokens_of};
 use crate::core::device::{Deferred, ResetKind};
 use crate::core::hosts::HostObjects;
 use crate::core::props::{Media, Value};
@@ -1286,11 +1287,9 @@ fn save(dev: &Atecc) -> Vec<u8> {
 #[test]
 fn a_wired_master_carries_the_same_packets_a_transactional_one_does() {
     // The claim `docs/buses/low-speed.md` asks for, on a device whose answer is
-    // a cryptographic packet rather than a byte of RAM. It is also the closest
-    // this tree can get to the issue's "the SWI transport carries the same
-    // packets as I²C": the *packet layer* is independent of the link, which is
-    // what a second transport would rest on, and the module docs say what SWI
-    // would still need.
+    // a cryptographic packet rather than a byte of RAM. The single-wire twin of
+    // it is `the_swi_transport_carries_the_same_packets_as_i2c`, below: three
+    // transports now reach one packet layer.
     let (transactional, bus) = provisioned();
     wake(&bus);
     let _ = read_packet(&bus);
@@ -1369,4 +1368,419 @@ fn a_wired_master_carries_the_same_packets_a_transactional_one_does() {
     }
     run(&[MasterOp::Stop]);
     assert_eq!(body(&packet), by_call);
+}
+
+// ---------------------------------------------------------------------------
+// The single wire (DS40002249B §8)
+// ---------------------------------------------------------------------------
+
+/// Put this part on a single wire nothing else can reach.
+///
+/// The *same object* the I²C fixtures put on a bus, behind the other trait, so
+/// a test can drive one device both ways.
+fn wire(dev: &Atecc) -> Arc<SwiLink> {
+    let link = Arc::new(SwiLink::new());
+    link.attach(dev.swi()).expect("an empty wire");
+    link
+}
+
+/// The wake pulse on one wire.
+///
+/// §7.1.1: "a data byte of 0x00 [transmitted] at a clock rate sufficiently slow
+/// so that SDA is low for a minimum period of tWLO". At 7N1 a `0x00` is low for
+/// eight bit times, so half the token rate makes 69 µs of it — over the 60 µs
+/// of [`WAKE_LOW_NS`] — and the host puts its rate back afterwards.
+fn swi_wake(link: &SwiLink) {
+    link.set_baud(BAUD / 2).expect("a real rate");
+    link.send(Token::WAKE);
+    link.set_baud(BAUD).expect("a real rate");
+}
+
+/// Take the wake token the part answers a freshly woken transmit flag with.
+fn swi_wake_token(link: &SwiLink) {
+    link.flag(Flag::TRANSMIT);
+    assert_eq!(
+        link.read_group(),
+        Some(WAKE_TOKEN.to_vec()),
+        "§8.3.2 step 7: the part answers a 0x11 status after a wake"
+    );
+}
+
+/// Send a command group, let it execute, and read the answer back.
+///
+/// The single-wire twin of [`call`], and deliberately the same shape: a flag,
+/// the group, tEXEC, a transmit flag, the group back.
+fn swi_call(dev: &Atecc, link: &SwiLink, packet: &[u8]) -> Vec<u8> {
+    link.flag(Flag::COMMAND);
+    link.write_group(packet);
+    assert!(dev.busy(), "§9.4: a command takes time");
+    dev.advance_to(dev.ticks() + 1_000_000);
+    link.flag(Flag::TRANSMIT);
+    body(&link.read_group().expect("the part answered"))
+}
+
+#[test]
+fn the_swi_transport_carries_the_same_packets_as_i2c() {
+    // The claim the whole front end exists to make. Two halves:
+    //
+    // 1. one device, two faces, one command — the packet layer is reached
+    //    through either transport and answers the identical bytes;
+    // 2. two identically seeded devices driven through a *sequence* that moves
+    //    their state — `Random` and `GenKey` draw from the deterministic
+    //    stream, `Nonce` and `MAC` carry `TempKey` between commands — one over
+    //    two wires and one over one, with the transcripts compared. A front end
+    //    that dropped or reordered a byte would pass (1) and fail this.
+    let (dev, bus) = provisioned();
+    let link = wire(&dev);
+
+    wake(&bus);
+    assert_eq!(read_packet(&bus), WAKE_TOKEN.to_vec());
+    let over_i2c = call(&dev, &bus, &command(OP_INFO, 0x00, 0x0000, &[]));
+    swi_wake(&link);
+    swi_wake_token(&link);
+    let over_swi = swi_call(&dev, &link, &command(OP_INFO, 0x00, 0x0000, &[]));
+    assert_eq!(
+        over_swi, over_i2c,
+        "one device, one packet layer, two transports"
+    );
+
+    let script = [
+        command(OP_RANDOM, 0x00, 0x0000, &[]),
+        command(OP_GENKEY, 0x04, 0x0001, &[]),
+        command(OP_NONCE, 0x03, 0x0000, &[0x9u8; 32]),
+        command(OP_MAC, 0x01, 0x0000, &[]),
+        command(OP_COUNTER, 0x01, 0x0000, &[]),
+        command(OP_READ, 0x00, 0x0000, &[]),
+    ];
+
+    let (two_wire, bus) = provisioned();
+    wake(&bus);
+    let _ = read_packet(&bus);
+    let by_i2c: Vec<Vec<u8>> = script.iter().map(|p| call(&two_wire, &bus, p)).collect();
+
+    let (one_wire, _) = provisioned();
+    let link = wire(&one_wire);
+    swi_wake(&link);
+    swi_wake_token(&link);
+    let by_swi: Vec<Vec<u8>> = script
+        .iter()
+        .map(|p| swi_call(&one_wire, &link, p))
+        .collect();
+
+    assert_eq!(by_swi, by_i2c);
+    // Not vacuously: the stream really did move, so these are not six copies
+    // of one answer.
+    assert_ne!(by_i2c[0], by_i2c[1]);
+    assert_eq!(by_i2c[0].len(), 32, "`Random` is 32 bytes (§9.2)");
+}
+
+#[test]
+fn a_wake_needs_a_low_pulse_longer_than_a_token_can_make() {
+    let (dev, _bus) = blank();
+    let link = wire(&dev);
+
+    // §8.1: a part asleep "ignores all data tokens until [it receives] a legal
+    // Wake token", and a token is not one however it is spelled.
+    link.flag(Flag::TRANSMIT);
+    assert_eq!(link.recv(), None);
+    assert!(!dev.awake());
+
+    // Nor is a 0x00 at the token rate: 34.7 µs of low against a 60 µs tWLO.
+    assert!(Token::WAKE.low_ns(BAUD) < WAKE_LOW_NS);
+    link.send(Token::WAKE);
+    assert!(!dev.awake(), "§9.3.1: that pulse is too short to be a wake");
+
+    // Slow the UART down and the same byte is one.
+    assert!(Token::WAKE.low_ns(BAUD / 2) >= WAKE_LOW_NS);
+    swi_wake(&link);
+    assert!(dev.awake());
+    swi_wake_token(&link);
+    // §9.1.3's own worked example, arriving down the other transport.
+    assert_eq!(body(&WAKE_TOKEN), vec![STATUS_AFTER_WAKE]);
+}
+
+#[test]
+fn a_group_rides_the_wire_as_0x7f_and_0x7d_tokens_in_both_directions() {
+    // The encoding itself, spelled out by hand rather than through the link's
+    // helpers, so this test would fail if `bus::swi` and this front end agreed
+    // with each other and disagreed with DS40002025A Table 5-1.
+    let (dev, _bus) = provisioned();
+    let link = wire(&dev);
+    swi_wake(&link);
+    swi_wake_token(&link);
+
+    let packet = command(OP_INFO, 0x00, 0x0000, &[]);
+    for token in tokens_of(Flag::COMMAND.0) {
+        link.send(token);
+    }
+    for byte in &packet {
+        // Least significant bit first (DS40002025A §5).
+        for i in 0..8 {
+            link.send(if (byte >> i) & 1 != 0 {
+                Token::ONE
+            } else {
+                Token::ZERO
+            });
+        }
+    }
+    assert!(dev.busy(), "the count byte ended the group, not a STOP");
+    dev.advance_to(dev.ticks() + 1_000_000);
+
+    for token in tokens_of(Flag::TRANSMIT.0) {
+        link.send(token);
+    }
+    let mut tokens = Vec::new();
+    while let Some(token) = link.recv() {
+        tokens.push(token);
+    }
+    assert!(
+        tokens.iter().all(|t| *t == Token::ONE || *t == Token::ZERO),
+        "the part drives nothing but 0x7f and 0x7d"
+    );
+    assert_eq!(tokens.len(), 7 * 8, "an `Info` response is seven bytes");
+    let mut bytes = Vec::new();
+    for chunk in tokens.chunks(8) {
+        let mut byte = 0u8;
+        for (i, token) in chunk.iter().enumerate() {
+            byte |= u8::from(*token == Token::ONE) << i;
+        }
+        bytes.push(byte);
+    }
+    assert_eq!(&body(&bytes)[..4], &dev.part().revnum());
+}
+
+#[test]
+fn each_of_the_four_flags_does_what_table_8_1_says() {
+    let (dev, _bus) = provisioned();
+    let link = wire(&dev);
+    swi_wake(&link);
+
+    // 0x88 Transmit: "wait for a bus turnaround time and then start
+    // transmitting its response".
+    swi_wake_token(&link);
+    // And again — DS40002025A §5.2: "When valid data is in the output buffer,
+    // the transmit flag may be repeatedly issued to the device to resend the
+    // buffer to the system."
+    swi_wake_token(&link);
+
+    // 0x77 Command: "the system starts sending a command group to the device".
+    let info = swi_call(&dev, &link, &command(OP_INFO, 0x00, 0x0000, &[]));
+    assert_eq!(&info[..4], &dev.part().revnum());
+
+    // Something in `TempKey` to tell idle from sleep by.
+    assert_eq!(
+        swi_call(&dev, &link, &command(OP_NONCE, 0x03, 0x0000, &[0x9u8; 32])),
+        vec![STATUS_OK]
+    );
+    let temp_key = dev.temp_key_for_test().expect("`Nonce` loaded it");
+
+    // 0xBB Idle: "the device goes into the idle mode ... It does not invalidate
+    // the contents of the TempKey". The I/O buffer does go.
+    link.flag(Flag::IDLE);
+    assert!(!dev.awake());
+    link.flag(Flag::TRANSMIT);
+    assert_eq!(link.recv(), None, "idle answers nothing at all");
+    swi_wake(&link);
+    assert_eq!(
+        dev.temp_key_for_test(),
+        Some(temp_key),
+        "§8.2: an idle flag keeps TempKey"
+    );
+
+    // 0xCC Sleep: "the low-power sleep mode, which causes a complete reset of
+    // the device, including invalidation of the contents of the SRAM and all
+    // volatile registers".
+    link.flag(Flag::SLEEP);
+    assert!(!dev.awake());
+    swi_wake(&link);
+    assert_eq!(
+        dev.temp_key_for_test(),
+        None,
+        "§8.2: a sleep flag takes TempKey with it"
+    );
+    swi_wake_token(&link);
+
+    // "All other values are reserved and must not be used." One that arrives
+    // anyway leaves the part where it was rather than inventing a meaning.
+    link.flag(Flag(0x5a));
+    assert!(dev.awake());
+    swi_wake_token(&link);
+}
+
+#[test]
+fn a_malformed_token_stream_sleeps_the_part_after_the_io_timeout() {
+    // §8.3.1: "Failure to send enough bits, or the transmission of an illegal
+    // token ... will cause the device to enter the Sleep mode after the
+    // tTIMEOUT-SWI interval." Note *after*: the part does not fail on the spot,
+    // which is what lets a host recover by waiting.
+    let (dev, _bus) = blank();
+    let link = wire(&dev);
+    swi_wake(&link);
+    swi_wake_token(&link);
+
+    link.send(Token(0x55));
+    assert!(dev.awake(), "an illegal token does not fail on the spot");
+    dev.advance_to(DEFAULT_SWI_TIMEOUT_TICKS - 1);
+    assert!(dev.awake(), "still inside tTIMEOUT-SWI");
+    dev.advance_to(DEFAULT_SWI_TIMEOUT_TICKS);
+    assert!(!dev.awake(), "§8.3.1: the part sleeps by itself");
+
+    // A group that stops half way through is the same failure: the count byte
+    // promised seven bytes and one arrived.
+    swi_wake(&link);
+    let at = dev.ticks();
+    link.flag(Flag::COMMAND);
+    link.write_group(&[0x07]);
+    dev.advance_to(at + DEFAULT_SWI_TIMEOUT_TICKS - 1);
+    assert!(dev.awake());
+    dev.advance_to(at + DEFAULT_SWI_TIMEOUT_TICKS);
+    assert!(
+        !dev.awake(),
+        "§8.3.1: nor does it wait forever for the rest"
+    );
+
+    // And so is a byte that stops half way through.
+    swi_wake(&link);
+    let at = dev.ticks();
+    link.send(Token::ONE);
+    link.send(Token::ZERO);
+    dev.advance_to(at + DEFAULT_SWI_TIMEOUT_TICKS);
+    assert!(!dev.awake());
+
+    // Whereas a part that is simply left alone between transactions keeps its
+    // watchdog and nothing else: the timeout counter is not running.
+    swi_wake(&link);
+    swi_wake_token(&link);
+    dev.advance_to(dev.ticks() + DEFAULT_SWI_TIMEOUT_TICKS * 4);
+    assert!(dev.awake(), "nothing was half sent, so nothing timed out");
+}
+
+#[test]
+fn the_watchdog_takes_the_part_on_the_single_wire_too() {
+    // §6.3 is a property of the part, not of a transport: the same tWATCHDOG
+    // that ends an I²C session ends this one, with nobody talking to the part.
+    let (dev, _bus) = build(&[]);
+    let link = wire(&dev);
+    swi_wake(&link);
+    swi_wake_token(&link);
+
+    dev.advance_to(DEFAULT_WATCHDOG_TICKS - 1);
+    assert!(dev.awake(), "still inside tWATCHDOG");
+    dev.advance_to(DEFAULT_WATCHDOG_TICKS);
+    assert!(!dev.awake(), "§6.3: the part sleeps by itself");
+    link.flag(Flag::TRANSMIT);
+    assert_eq!(link.recv(), None, "and answers nothing until it is woken");
+
+    swi_wake(&link);
+    assert!(dev.awake());
+    swi_wake_token(&link);
+
+    // And the other half of §6.3: a command that could not finish inside what
+    // is left of the watchdog is refused rather than cut off. `GenKey` takes
+    // 115 ms, and there are 10 left.
+    dev.advance_to(dev.ticks() + DEFAULT_WATCHDOG_TICKS - 10_000);
+    link.flag(Flag::COMMAND);
+    link.write_group(&command(OP_GENKEY, 0x04, 0x0001, &[]));
+    dev.advance_to(dev.ticks() + 2_000);
+    link.flag(Flag::TRANSMIT);
+    assert_eq!(
+        body(&link.read_group().expect("the part answered")),
+        vec![STATUS_WATCHDOG]
+    );
+}
+
+#[test]
+fn a_busy_part_ignores_the_single_wire_rather_than_nacking_it() {
+    // §8.2: "When the device is busy executing a command, it ignores the SDA
+    // pin and any flags that are sent by the system." There is no acknowledge
+    // on this wire to say so with, so what a host sees is silence — and §8.3.2
+    // is the procedure that follows from it: wait tEXEC, send the flag again.
+    let (dev, _bus) = provisioned();
+    let link = wire(&dev);
+    swi_wake(&link);
+    swi_wake_token(&link);
+
+    link.flag(Flag::COMMAND);
+    link.write_group(&command(OP_INFO, 0x00, 0x0000, &[]));
+    assert!(dev.busy());
+    link.flag(Flag::TRANSMIT);
+    assert_eq!(link.recv(), None, "silence, not a NACK");
+    assert!(!link.pending(), "and a monitor's look agrees");
+
+    dev.advance_to(dev.ticks() + 1_000_000);
+    // The swallowed flag has to be sent again: the part was not sampling the
+    // pin, so it did not half-receive it either.
+    link.flag(Flag::TRANSMIT);
+    assert!(link.pending(), "a debug peek finds the answer");
+    assert_eq!(
+        &body(&link.read_group().expect("the part answered"))[..4],
+        &dev.part().revnum()
+    );
+}
+
+#[test]
+fn the_interface_property_is_what_i2c_enable_reports() {
+    // §2.2.4: configuration byte 14 is `I2C_Enable`, and bit 0 is what tells
+    // firmware which part it is holding. Both faces answer either way — see
+    // the module docs — so this byte is the whole of the difference.
+    let (i2c, _) = build(&[("watchdog-ticks", Value::Uint(0))]);
+    assert_eq!(i2c.interface(), Interface::I2c);
+    assert_eq!(i2c.config()[14], 0x01);
+
+    let (swi, _) = build(&[
+        ("interface", Value::Str("swi".into())),
+        ("watchdog-ticks", Value::Uint(0)),
+    ]);
+    assert_eq!(swi.interface(), Interface::Swi);
+    assert_eq!(swi.config()[14], 0x00);
+
+    let mut p = Props::new();
+    p.insert("interface", Value::Str("spi".into()));
+    Atecc::new(&p).expect_err("a part is ordered as `i2c` or `swi`");
+}
+
+#[test]
+fn a_part_mid_group_on_the_single_wire_round_trips_to_an_identical_chunk() {
+    // The framing of a half-received group is live state exactly as the I²C
+    // phase is, so a snapshot has to carry it: this one is taken between two
+    // tokens of one byte of one group.
+    let (dev, _bus) = provisioned();
+    let link = wire(&dev);
+    swi_wake(&link);
+    swi_wake_token(&link);
+
+    let packet = command(OP_INFO, 0x00, 0x0000, &[]);
+    link.flag(Flag::COMMAND);
+    link.write_group(&packet[..3]);
+    // And one token of the fourth byte, so the snapshot lands mid-byte.
+    link.send(Token::of(packet[3] & 1 != 0));
+
+    let bytes = save(&dev);
+    let (other, _bus) = provisioned();
+    let link = wire(&other);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load(
+            "atecc",
+            ATECC_CLASS.name,
+            ATECC_CLASS.version,
+            &Migrations::new(),
+        )
+        .unwrap();
+    other.load(&mut chunk.reader()).unwrap();
+    assert_eq!(save(&other), bytes, "byte for byte, framing included");
+
+    // The restored part finishes the byte it was part way through rather than
+    // starting it again, and then the group.
+    for i in 1..8 {
+        link.send(Token::of((packet[3] >> i) & 1 != 0));
+    }
+    link.write_group(&packet[4..]);
+    assert!(other.busy(), "the group completed on its count byte");
+    other.advance_to(other.ticks() + 1_000_000);
+    link.flag(Flag::TRANSMIT);
+    assert_eq!(
+        &body(&link.read_group().expect("the part answered"))[..4],
+        &other.part().revnum()
+    );
 }
