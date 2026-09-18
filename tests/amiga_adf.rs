@@ -1,8 +1,8 @@
 //! ADF disks in DF0, read and written the way an Amiga does it: a whole raw
 //! track at a time, through Paula, to and from chip RAM.
 //!
-//! The board is `machines/tests/amiga-a500-df0.machine` — the shipped A500 with
-//! one property added, `image = "df0"` on the drive.
+//! The board is the shipped `machines/amiga-a500.machine`, whose drive names
+//! the `df0` media slot.
 //!
 //! # What is proved without anybody's files
 //!
@@ -45,8 +45,12 @@ use rsemu::dev::amiga::floppy::Floppy;
 use rsemu::dev::medium::{self, Medium};
 use rsemu::machine::{Machine, catalog};
 
-/// The board this file runs.
-const BOARD: &str = include_str!("../machines/tests/amiga-a500-df0.machine");
+/// The board this file runs: the shipped A500.
+fn board() -> &'static str {
+    catalog::machine("amiga-a500")
+        .expect("this build ships amiga-a500")
+        .source
+}
 
 /// Where the guest has Agnus put, or find, the track.
 const BUFFER: u32 = 0x1_0000;
@@ -211,7 +215,7 @@ fn build(
     options.realize.media.insert("kickstart", kickstart);
     options.realize.media.insert("df0", df0);
     let registry = catalog::registry().expect("a registry");
-    let machine = rsemu::machine::build("amiga-a500-df0", BOARD, &registry, &options)
+    let machine = rsemu::machine::build("amiga-a500", board(), &registry, &options)
         .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
     let drive = drives.last().expect("the binding captured the drive");
     (machine, drive)
@@ -373,8 +377,8 @@ mod real {
     }
 
     /// Run `kickstart` with `df0` in the drive for `seconds`, and return the
-    /// furthest cylinder the head reached. The custom-chip window is the
-    /// byte-tolerant stand-in; see [`shim`].
+    /// furthest cylinder the head reached. Kickstart's byte reads of custom
+    /// registers go through `amiga.custom` itself (`src/dev/amiga/custom.rs`).
     fn furthest(kickstart: Vec<u8>, df0: Vec<u8>, seconds: u64) -> u8 {
         let mut options = catalog::build_options().expect("the catalog agrees with itself");
         let drives: Arc<Captured<Floppy>> = Arc::new(Captured::new());
@@ -384,13 +388,10 @@ mod real {
             kept.push(&drive);
             Ok(drive)
         });
-        options.bindings.replace("amiga.custom", |props| {
-            Ok(Arc::new(shim::Custom::new(props)?))
-        });
         options.realize.media.insert("kickstart", kickstart);
         options.realize.media.insert("df0", df0);
         let registry = catalog::registry().expect("a registry");
-        let mut m = rsemu::machine::build("amiga-a500-df0", BOARD, &registry, &options)
+        let mut m = rsemu::machine::build("amiga-a500", board(), &registry, &options)
             .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
         let drive = drives.last().expect("the drive");
         let mut furthest = 0;
@@ -451,112 +452,5 @@ mod real {
                 "with every {field} checksum wrong the head still reached cylinder {furthest}"
             );
         }
-    }
-
-    /// A test-local stand-in for the open "byte access to a custom register"
-    /// row of `docs/platforms/amiga.md`.
-    ///
-    /// `amiga.custom` refuses a byte access, because the manual gives every
-    /// entry as a word and says nothing about one data strobe. Kickstart makes
-    /// them — 2.04 reads `$DFF07D` as a byte, 2.05 `$DFF006` — and on the board
-    /// as it stands each is a bus error and a dead-end alert long before
-    /// `trackdisk.device` touches the drive. What the chip does with one strobe
-    /// is not this file's question, and `custom.rs` is not this change's file,
-    /// so the real-disk runs put the same bus behind a window that answers a
-    /// byte out of its word (the upper strobe on the even address, the lower on
-    /// the odd) and writes a byte into an otherwise-zero word. Nothing else in
-    /// this file uses it, and it goes when `custom.rs` decides.
-    mod shim {
-        use std::sync::Arc;
-
-        use rsemu::core::device::{Device, DeviceClass, Export, ExportId, RealizeCtx, ResetKind};
-        use rsemu::core::error::{BusError, Result};
-        use rsemu::core::props::Props;
-        use rsemu::core::space::{
-            AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef,
-        };
-        use rsemu::core::state::{ChunkReader, ChunkWriter};
-        use rsemu::core::{Endian, Width};
-        use rsemu::dev::amiga::custom::{self, CustomBus, Origin};
-        use rsemu::machine::realize::Instance;
-
-        #[derive(Debug)]
-        struct Window {
-            bus: Arc<CustomBus>,
-        }
-
-        impl MemOps for Window {
-            fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-                let from = Origin::cpu().for_debug(attrs.debug);
-                let word = self.bus.read((offset & !1) as u16, from).to_be_bytes();
-                match dst.len() {
-                    1 => dst[0] = word[(offset & 1) as usize],
-                    2 if offset & 1 == 0 => dst.copy_from_slice(&word),
-                    _ => return Err(BusError::BadAccess),
-                }
-                Ok(())
-            }
-
-            fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-                let from = Origin::cpu().for_debug(attrs.debug);
-                let value = match src.len() {
-                    1 if offset & 1 == 0 => u16::from(src[0]) << 8,
-                    1 => u16::from(src[0]),
-                    2 if offset & 1 == 0 => u16::from_be_bytes([src[0], src[1]]),
-                    _ => return Err(BusError::BadAccess),
-                };
-                self.bus.write((offset & !1) as u16, value, from);
-                Ok(())
-            }
-
-            fn constraints(&self) -> AccessConstraints {
-                AccessConstraints::word(Width::U16, Endian::Big)
-                    .with_widths(Width::U8, Width::U16)
-                    .with_natural_alignment(false)
-            }
-        }
-
-        #[derive(Debug)]
-        pub(super) struct Custom {
-            inner: custom::Custom,
-            region: RegionRef,
-        }
-
-        impl Custom {
-            pub(super) fn new(props: &Props) -> Result<Custom> {
-                let inner = custom::Custom::new(props)?;
-                let window = Arc::new(Window {
-                    bus: Arc::clone(inner.bus()),
-                });
-                let region = Arc::new(Region::io("amiga.custom", 0x200, window));
-                Ok(Custom { inner, region })
-            }
-        }
-
-        impl Device for Custom {
-            fn class(&self) -> &'static DeviceClass {
-                self.inner.class()
-            }
-            fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-                self.inner.realize(ctx)
-            }
-            fn reset(&self, kind: ResetKind) {
-                self.inner.reset(kind);
-            }
-            fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-                self.inner.save(w)
-            }
-            fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-                self.inner.load(r)
-            }
-            fn region(&self, name: &str) -> Option<RegionRef> {
-                self.inner.region(name).map(|_| Arc::clone(&self.region))
-            }
-            fn export(&self, which: ExportId) -> Option<Export> {
-                self.inner.export(which)
-            }
-        }
-
-        impl Instance for Custom {}
     }
 }
