@@ -1,4 +1,4 @@
-//! The MC68000 instruction set, described **once**.
+//! The MC68000, MC68010 and MC68020 instruction sets, described **once**.
 //!
 //! CLAUDE.md forbids writing an instruction table twice — once for decode and
 //! once for disassembly — because the two then drift, and the disassembler is
@@ -25,6 +25,24 @@
 //! First match wins, so the list is ordered specific-before-general; a test
 //! asserts the ordering property the scan depends on.
 //!
+//! # One table, three processors
+//!
+//! A row names the processors that implement it ([`Models`]), and
+//! [`decode_for`] skips a row the model in hand does not have — so a 68000
+//! still sees `$4e7a` as an illegal instruction while a 68010 sees `MOVEC`,
+//! and `MOVE from SR` is two rows, one unprivileged for the 68000 and one
+//! privileged for everything after it (M68000PRM Appendix A, Table A-1, note
+//! 4). The rows a later processor *adds* in an encoding an earlier one left
+//! illegal must come before the row that would otherwise claim it and then
+//! reject it as illegal: `CAS.L` lives in the `11` size field of `MOVES`,
+//! `CHK2` in that of `ORI`, the bit-field instructions in that of the register
+//! shifts.
+//!
+//! Some 68020 instructions carry a word of their own before any effective
+//! address extension — `MULS.L`'s register pair, a bit field's offset and
+//! width, `MOVEC`'s control register. [`Insn::ext`] counts them, and both the
+//! interpreter and the disassembler consume them first.
+//!
 //! # Why there is no cycle column
 //!
 //! Deliberate, and for the same reason as the 6502 core: a 68000 cycle count is
@@ -36,14 +54,136 @@
 //!
 //! # Sources
 //!
-//! *M68000 Family Programmer's Reference Manual* (Motorola M68000PRM/AD) for
+//! *M68000 Family Programmer's Reference Manual* (Motorola M68000PM/AD) for
 //! the encodings, the condition-code rules and the addressing-mode legality
-//! tables; the *MC68000 8-/16-/32-Bit Microprocessors User's Manual*
-//! (MC68000UM) section 8 for instruction timing and section 6 for exception
-//! processing. `docs/cpu/other.md` records where to find both. No copyleft
-//! emulator was consulted.
+//! tables — Section 8's instruction format summary for every encoding, and
+//! Appendix A's Table A-1 for which processor has which instruction; the
+//! *MC68000 8-/16-/32-Bit Microprocessors User's Manual* (MC68000UM) section 8
+//! for instruction timing and section 6 for exception processing; the
+//! *MC68020 User's Manual* (MC68020UM) for the 68020. `docs/cpu/m68k.md`
+//! records where to find them. No copyleft emulator was consulted.
 
 use core::fmt;
+
+/// Which member of the family a core is.
+///
+/// A construction property, never a `#[cfg]`: a machine picks its processor
+/// in its `.machine` file, and one build has to run an Amiga 500 and an Amiga
+/// 1200 side by side.
+///
+/// Exhaustive on purpose — every place that asks "which processor" should be
+/// made to answer again when a 68030 arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum Model {
+    /// The MC68000: 24 address pins, a 16-bit bus, the group-0 frame without a
+    /// format word.
+    #[default]
+    M68000,
+    /// The MC68010: the 68000 plus a vector base register, `MOVEC`/`MOVES`,
+    /// `RTD`, a privileged `MOVE from SR`, and format words on every stack
+    /// frame (MC68000UM §1.3, §6.2.4).
+    M68010,
+    /// The MC68020: 32-bit addressing, the full extension-word addressing
+    /// modes, bit fields, 32-bit multiply and divide, a master stack pointer
+    /// and an instruction cache (MC68020UM §1).
+    M68020,
+    /// The MC68EC020: a 68020 with only 24 address pins (MC68020UM §1:
+    /// "the MC68EC020 ... 24-bit address bus"). Same instruction set.
+    M68EC020,
+}
+
+impl Model {
+    /// Every model, in order of introduction.
+    pub const ALL: [Model; 4] = [Model::M68000, Model::M68010, Model::M68020, Model::M68EC020];
+
+    /// The name the `model` property spells it with.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Model::M68000 => "68000",
+            Model::M68010 => "68010",
+            Model::M68020 => "68020",
+            Model::M68EC020 => "68ec020",
+        }
+    }
+
+    /// The model a `model` property value names.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Model> {
+        Model::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    /// Which bits of an address reach the pins.
+    ///
+    /// 24 on everything but the full 68020, whose 32 address lines are the
+    /// whole point of it. Applied to the address *after* it is computed in 32
+    /// bits, which is where the wrap happens on the real part too.
+    #[must_use]
+    pub const fn address_mask(self) -> u32 {
+        match self {
+            Model::M68020 => 0xffff_ffff,
+            _ => 0x00ff_ffff,
+        }
+    }
+
+    /// The 68010's architecture or later: `VBR`, format words, `MOVEC`.
+    #[inline]
+    #[must_use]
+    pub const fn has_010(self) -> bool {
+        !matches!(self, Model::M68000)
+    }
+
+    /// The 68020's architecture: either package.
+    #[inline]
+    #[must_use]
+    pub const fn has_020(self) -> bool {
+        matches!(self, Model::M68020 | Model::M68EC020)
+    }
+
+    /// This model's bit in a [`Models`] set.
+    #[must_use]
+    pub const fn bit(self) -> u8 {
+        match self {
+            Model::M68000 => 1,
+            Model::M68010 => 2,
+            Model::M68020 | Model::M68EC020 => 4,
+        }
+    }
+}
+
+impl fmt::Display for Model {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The processors that implement one row of the table.
+///
+/// The 68EC020 is a 68020 as far as the instruction set is concerned
+/// (M68000PRM Appendix A: "All references to the MC68000, MC68020, and
+/// MC68030 include references to the corresponding embedded controllers").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Models(pub u8);
+
+impl Models {
+    /// Every processor.
+    pub const ALL: Models = Models(7);
+    /// The 68000 alone — a behaviour the 68010 changed.
+    pub const M68000: Models = Models(1);
+    /// The 68010 and the 68020.
+    pub const FROM_010: Models = Models(6);
+    /// The 68020 alone.
+    pub const M68020: Models = Models(4);
+    /// The 68000 and the 68010 — a behaviour the 68020 changed.
+    pub const UNTIL_010: Models = Models(3);
+
+    /// Whether `model` implements the row.
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, model: Model) -> bool {
+        self.0 & model.bit() != 0
+    }
+}
 
 /// An operand width.
 ///
@@ -130,6 +270,10 @@ pub enum SizeSpec {
     /// instructions (`BTST`, `BCHG`, `BCLR`, `BSET`), whose operand size is a
     /// property of *where* the bit is (M68000PRM, *BTST*).
     BitOp,
+    /// Bits 10–9: `00` byte, `01` word, `10` long — `CHK2` and `CMP2`
+    /// (M68000PRM, *CHK2*). `11` is `CALLM`/`RTM`, which have rows of their
+    /// own ahead of this one.
+    Bits109,
 }
 
 impl SizeSpec {
@@ -177,6 +321,12 @@ impl SizeSpec {
                     Some(Size::Byte)
                 }
             }
+            SizeSpec::Bits109 => match (opcode >> 9) & 3 {
+                0 => Some(Size::Byte),
+                1 => Some(Size::Word),
+                2 => Some(Size::Long),
+                _ => None,
+            },
         }
     }
 }
@@ -201,6 +351,11 @@ pub enum Mode {
     /// `(d16,An)` — indirect with a signed 16-bit displacement.
     Disp16,
     /// `(d8,An,Xn)` — indirect with index and a signed 8-bit displacement.
+    ///
+    /// On a 68020 the same mode field also introduces the *full* extension
+    /// word — base and outer displacements, memory indirection, suppressed
+    /// base or index — when bit 8 of the first extension word is set
+    /// (M68000PRM §2.2.3); a 68000 ignores that bit.
     Index8,
     /// `(xxx).W` — absolute short, sign-extended to 32 bits.
     AbsShort,
@@ -208,7 +363,8 @@ pub enum Mode {
     AbsLong,
     /// `(d16,PC)` — program-counter relative.
     PcDisp16,
-    /// `(d8,PC,Xn)` — program-counter relative with index.
+    /// `(d8,PC,Xn)` — program-counter relative with index, and on a 68020
+    /// the full-format PC-relative modes as for [`Mode::Index8`].
     PcIndex8,
     /// `#<data>` — immediate.
     Imm,
@@ -252,6 +408,9 @@ impl Mode {
     ///
     /// Part of the instruction's length, which is why it belongs here rather
     /// than in the interpreter: the disassembler needs the same answer.
+    ///
+    /// For the indexed modes this is the brief format's one word; on a 68020
+    /// the first word may introduce more, which [`index_ext_words`] counts.
     #[must_use]
     pub const fn ext_words(self, size: Size) -> u32 {
         match self {
@@ -317,6 +476,12 @@ impl EaSet {
     pub const MOVEM_TO_REG: EaSet = EaSet(Self::CONTROL.0 | Mode::PostInc.bit());
     /// No mode at all — an operand slot that is not an effective address.
     pub const NONE: EaSet = EaSet(0);
+    /// A bit field's source: a data register or a control mode
+    /// (M68000PRM, *BFTST*).
+    pub const BITFIELD: EaSet = EaSet(Self::CONTROL.0 | Mode::DataReg.bit());
+    /// A bit field that is written: a data register or a control alterable
+    /// mode (M68000PRM, *BFCHG*).
+    pub const BITFIELD_ALT: EaSet = EaSet(Self::CONTROL_ALT.0 | Mode::DataReg.bit());
 
     /// Whether `mode` is in the set.
     #[must_use]
@@ -395,6 +560,18 @@ pub enum Arg {
     RegList,
     /// `MOVEP`'s `(d16,Ay)` operand, register in bits 2–0.
     MovepEa,
+    /// A signed 32-bit displacement in the next two extension words — `LINK.L`
+    /// and the 68020's `Bcc.L`.
+    Disp32,
+    /// `BKPT`'s breakpoint number in bits 2–0.
+    Vector3,
+    /// `MOVEC`'s control register, in bits 11–0 of its extension word.
+    Ctrl,
+    /// A general register named by bits 15–12 of the instruction's leading
+    /// extension word: `MOVEC`, `MOVES`, `CHK2`, `CMP2`.
+    ExtReg,
+    /// `TRAPcc`'s optional operand: none, a word or a long, by bits 2–0.
+    TrapData,
 }
 
 impl Arg {
@@ -528,13 +705,78 @@ define_ops! {
     Trapv = "TRAPV", "take an overflow exception if V is set";
     Tst = "TST", "test an operand against zero";
     Unlk = "UNLK", "unlink a stack frame";
+    // ---- the 68010's additions --------------------------------------------
+    Bkpt = "BKPT", "breakpoint: an acknowledge cycle, else an illegal-instruction exception";
+    MoveFromCcr = "MOVE", "move the condition codes to a destination";
+    Movec = "MOVEC", "move to or from a control register (privileged)";
+    Moves = "MOVES", "move to or from the address space SFC or DFC names (privileged)";
+    Rtd = "RTD", "return and deallocate parameters";
+    // ---- the 68020's additions --------------------------------------------
+    Bfchg = "BFCHG", "test a bit field and complement it";
+    Bfclr = "BFCLR", "test a bit field and clear it";
+    Bfexts = "BFEXTS", "extract a bit field, sign-extended";
+    Bfextu = "BFEXTU", "extract a bit field, zero-extended";
+    Bfffo = "BFFFO", "find the first one in a bit field";
+    Bfins = "BFINS", "insert a bit field";
+    Bfset = "BFSET", "test a bit field and set it";
+    Bftst = "BFTST", "test a bit field";
+    Callm = "CALLM", "call a module through its descriptor";
+    Cas = "CAS", "compare and swap, indivisibly";
+    Cas2 = "CAS2", "compare and swap two operands, indivisibly";
+    Cmp2 = "CMP2", "compare a register against a bounds pair (CHK2: and trap)";
+    Divl = "DIV", "32-bit divide: DIVS.L, DIVU.L, DIVSL.L, DIVUL.L";
+    Extb = "EXTB", "sign-extend a byte to a long";
+    Mull = "MUL", "32-bit multiply: MULS.L, MULU.L";
+    Pack = "PACK", "pack two unpacked BCD digits, with an adjustment";
+    Rtm = "RTM", "return from a module";
+    Trapcc = "TRAP", "take a trap if a condition holds";
+    Unpk = "UNPK", "unpack a BCD byte into two digits, with an adjustment";
 }
 
 impl Op {
     /// Whether the mnemonic takes a condition-code suffix from bits 11–8.
     #[must_use]
     pub const fn is_conditional(self) -> bool {
-        matches!(self, Op::Bcc | Op::Dbcc | Op::Scc)
+        matches!(self, Op::Bcc | Op::Dbcc | Op::Scc | Op::Trapcc)
+    }
+
+    /// The mnemonic, for the operations whose name is chosen by their
+    /// extension word rather than their opcode.
+    ///
+    /// `MULS.L` and `MULU.L` share an opcode and differ in bit 11 of the
+    /// extension word, and so do `CHK2` and `CMP2`; `DIVSL` is `DIVS.L` with a
+    /// 32-bit dividend and a remainder register distinct from the quotient
+    /// (M68000PRM, *DIVS*, *MULS*, *CHK2*).
+    #[must_use]
+    pub const fn mnemonic_with(self, ext: u16) -> &'static str {
+        let signed = ext & 0x0800 != 0;
+        match self {
+            Op::Mull => {
+                if signed {
+                    "MULS"
+                } else {
+                    "MULU"
+                }
+            }
+            Op::Divl => {
+                let quad = ext & 0x0400 != 0;
+                let remainder = (ext & 7) != (ext >> 12) & 7;
+                match (signed, !quad && remainder) {
+                    (true, true) => "DIVSL",
+                    (true, false) => "DIVS",
+                    (false, true) => "DIVUL",
+                    (false, false) => "DIVU",
+                }
+            }
+            Op::Cmp2 => {
+                if signed {
+                    "CHK2"
+                } else {
+                    "CMP2"
+                }
+            }
+            other => other.mnemonic(),
+        }
     }
 }
 
@@ -609,6 +851,13 @@ pub struct Insn {
     pub dst_modes: EaSet,
     /// Whether the encoding may only be executed in supervisor state.
     pub privileged: bool,
+    /// Which processors implement the row.
+    pub models: Models,
+    /// How many extension words the instruction carries *before* any
+    /// effective-address extension — `MOVEC`'s register word, `CAS2`'s two,
+    /// a bit field's offset and width. `PACK` and `UNPK`, which have no
+    /// effective address, count their adjustment word here too.
+    pub ext: u8,
 }
 
 impl Insn {
@@ -621,6 +870,8 @@ impl Insn {
         src_modes: EaSet::NONE,
         dst_modes: EaSet::NONE,
         privileged: false,
+        models: Models::ALL,
+        ext: 0,
     };
 
     const fn new(op: Op, size: SizeSpec, src: Arg, dst: Arg) -> Insn {
@@ -632,7 +883,27 @@ impl Insn {
             src_modes: EaSet::ALL,
             dst_modes: EaSet::ALL,
             privileged: false,
+            models: Models::ALL,
+            ext: 0,
         }
+    }
+
+    const fn models(mut self, models: Models) -> Insn {
+        self.models = models;
+        self
+    }
+
+    const fn since_010(self) -> Insn {
+        self.models(Models::FROM_010)
+    }
+
+    const fn only_020(self) -> Insn {
+        self.models(Models::M68020)
+    }
+
+    const fn with_ext(mut self, words: u8) -> Insn {
+        self.ext = words;
+        self
     }
 
     const fn src_ea(mut self, modes: EaSet) -> Insn {
@@ -692,11 +963,12 @@ macro_rules! table {
 }
 
 use Arg::{
-    AnHi, AnLo, BitNumber, Ccr, Disp8, Disp16, DnHi, DnLo, Ea, EaDst, Imm, MovepEa, PostHi, PostLo,
-    Quick, QuickByte, RegList, RmHi, RmLo, ShiftCount, Sr, Usp, Vector,
+    AnHi, AnLo, BitNumber, Ccr, Ctrl, Disp8, Disp16, Disp32, DnHi, DnLo, Ea, EaDst, ExtReg, Imm,
+    MovepEa, PostHi, PostLo, Quick, QuickByte, RegList, RmHi, RmLo, ShiftCount, Sr, TrapData, Usp,
+    Vector, Vector3,
 };
 use Size::{Byte, Long, Word};
-use SizeSpec::{Bit6, Bit8, BitOp, Bits76, Fixed, Move as MoveSize};
+use SizeSpec::{Bit6, Bit8, BitOp, Bits76, Bits109, Fixed, Move as MoveSize};
 
 table! {
     // ---- line 0: immediates, static bit operations, MOVEP ----------------
@@ -706,6 +978,26 @@ table! {
     0xffff 0x027c => Insn::new(Op::AndiToSr,  Fixed(Word), Imm, Sr).privileged();
     0xffff 0x0a3c => Insn::new(Op::EoriToCcr, Fixed(Byte), Imm, Ccr);
     0xffff 0x0a7c => Insn::new(Op::EoriToSr,  Fixed(Word), Imm, Sr).privileged();
+    // The 68020's line-0 additions all live in the `11` size field of an
+    // immediate instruction, which rejects it — so they must be matched first
+    // (M68000PRM §8, *Instruction Format Summary*). CAS2 is CAS with an
+    // immediate "effective address", and is matched before CAS for the same
+    // reason.
+    0xffff 0x0cfc => Insn::new(Op::Cas2, Fixed(Word), Arg::None, Arg::None).with_ext(2).only_020();
+    0xffff 0x0efc => Insn::new(Op::Cas2, Fixed(Long), Arg::None, Arg::None).with_ext(2).only_020();
+    0xffc0 0x0ac0 => Insn::new(Op::Cas,  Fixed(Byte), Arg::None, Ea)
+                        .dst_ea(EaSet::MEM_ALT).with_ext(1).only_020();
+    0xffc0 0x0cc0 => Insn::new(Op::Cas,  Fixed(Word), Arg::None, Ea)
+                        .dst_ea(EaSet::MEM_ALT).with_ext(1).only_020();
+    0xffc0 0x0ec0 => Insn::new(Op::Cas,  Fixed(Long), Arg::None, Ea)
+                        .dst_ea(EaSet::MEM_ALT).with_ext(1).only_020();
+    // RTM's register field sits where CALLM's effective address would name a
+    // register, which CALLM does not accept.
+    0xfff0 0x06c0 => Insn::new(Op::Rtm,   SizeSpec::None, Arg::None, Arg::None).only_020();
+    0xffc0 0x06c0 => Insn::new(Op::Callm, SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::CONTROL).with_ext(1).only_020();
+    0xf9c0 0x00c0 => Insn::new(Op::Cmp2,  Bits109, Ea, ExtReg)
+                        .src_ea(EaSet::CONTROL).with_ext(1).only_020();
     // MOVEP shares bit 8 with the dynamic bit instructions and is told apart
     // by its mode field being 001, which those forbid. Bit 7 is the direction,
     // and it gets a row of its own rather than a runtime test, so the
@@ -722,7 +1014,16 @@ table! {
     0xffc0 0x0880 => Insn::new(Op::Bclr,      BitOp, BitNumber, Ea).dst_ea(EaSet::DATA_ALT);
     0xffc0 0x08c0 => Insn::new(Op::Bset,      BitOp, BitNumber, Ea).dst_ea(EaSet::DATA_ALT);
     0xff00 0x0a00 => Insn::new(Op::Eori,      Bits76, Imm, Ea).dst_ea(EaSet::DATA_ALT);
-    0xff00 0x0c00 => Insn::new(Op::Cmpi,      Bits76, Imm, Ea).dst_ea(EaSet::DATA_ALT);
+    // The 68020 lets CMPI compare against a PC-relative operand; the 68000
+    // and 68010 do not (M68000PRM, *CMPI*: "PC relative addressing modes do
+    // not apply to MC68000").
+    0xff00 0x0c00 => Insn::new(Op::Cmpi,      Bits76, Imm, Ea)
+                        .dst_ea(EaSet::DATA.without(Mode::Imm)).only_020();
+    0xff00 0x0c00 => Insn::new(Op::Cmpi,      Bits76, Imm, Ea)
+                        .dst_ea(EaSet::DATA_ALT).models(Models::UNTIL_010);
+    // MOVES carries its direction in its extension word, not its opcode.
+    0xff00 0x0e00 => Insn::new(Op::Moves,     Bits76, ExtReg, Ea)
+                        .dst_ea(EaSet::MEM_ALT).with_ext(1).privileged().since_010();
     0xf1c0 0x0100 => Insn::new(Op::Btst,      BitOp, DnHi, Ea).dst_ea(EaSet::DATA);
     0xf1c0 0x0140 => Insn::new(Op::Bchg,      BitOp, DnHi, Ea).dst_ea(EaSet::DATA_ALT);
     0xf1c0 0x0180 => Insn::new(Op::Bclr,      BitOp, DnHi, Ea).dst_ea(EaSet::DATA_ALT);
@@ -749,19 +1050,38 @@ table! {
     // what the slots hold.
     0xffff 0x4e72 => Insn::new(Op::Stop,    Fixed(Word), Imm, Arg::None).privileged();
     0xffff 0x4e73 => Insn::new(Op::Rte,     SizeSpec::None, Arg::None, Arg::None).privileged();
+    0xffff 0x4e74 => Insn::new(Op::Rtd,     SizeSpec::None, Disp16, Arg::None).since_010();
     0xffff 0x4e75 => Insn::new(Op::Rts,     SizeSpec::None, Arg::None, Arg::None);
     0xffff 0x4e76 => Insn::new(Op::Trapv,   SizeSpec::None, Arg::None, Arg::None);
     0xffff 0x4e77 => Insn::new(Op::Rtr,     SizeSpec::None, Arg::None, Arg::None);
+    // Bit 0 is the direction: clear reads the control register.
+    0xffff 0x4e7a => Insn::new(Op::Movec,   Fixed(Long), Ctrl, ExtReg)
+                        .with_ext(1).privileged().since_010();
+    0xffff 0x4e7b => Insn::new(Op::Movec,   Fixed(Long), ExtReg, Ctrl)
+                        .with_ext(1).privileged().since_010();
     0xfff0 0x4e40 => Insn::new(Op::Trap,    SizeSpec::None, Vector, Arg::None);
     0xfff8 0x4e50 => Insn::new(Op::Link,    Fixed(Word), AnLo, Disp16);
     0xfff8 0x4e58 => Insn::new(Op::Unlk,    Fixed(Long), AnLo, Arg::None);
     0xfff8 0x4e60 => Insn::new(Op::MoveUsp, Fixed(Long), AnLo, Usp).privileged();
     0xfff8 0x4e68 => Insn::new(Op::MoveUsp, Fixed(Long), Usp, AnLo).privileged();
     0xfff8 0x4840 => Insn::new(Op::Swap,    Fixed(Word), DnLo, Arg::None);
+    // BKPT is PEA's address-register form, which PEA rejects.
+    0xfff8 0x4848 => Insn::new(Op::Bkpt,    SizeSpec::None, Vector3, Arg::None).since_010();
+    // LINK.L is NBCD's address-register form, and EXTB.L is LEA's
+    // data-register form; both reject those.
+    0xfff8 0x4808 => Insn::new(Op::Link,    Fixed(Long), AnLo, Disp32).only_020();
+    0xfff8 0x49c0 => Insn::new(Op::Extb,    Fixed(Long), DnLo, Arg::None).only_020();
     0xfff8 0x4880 => Insn::new(Op::Ext,     Bit6, DnLo, Arg::None);
     0xfff8 0x48c0 => Insn::new(Op::Ext,     Bit6, DnLo, Arg::None);
+    // MOVE from SR is privileged from the 68010 on — the change that let a
+    // virtual machine monitor hide the real supervisor state — and MOVE from
+    // CCR arrived in its place for user code (M68000PRM Table A-1, note 4).
     0xffc0 0x40c0 => Insn::new(Op::MoveFromSr, Fixed(Word), Sr, Ea)
-                        .dst_ea(EaSet::DATA_ALT);
+                        .dst_ea(EaSet::DATA_ALT).models(Models::M68000);
+    0xffc0 0x40c0 => Insn::new(Op::MoveFromSr, Fixed(Word), Sr, Ea)
+                        .dst_ea(EaSet::DATA_ALT).privileged().since_010();
+    0xffc0 0x42c0 => Insn::new(Op::MoveFromCcr, Fixed(Word), Ccr, Ea)
+                        .dst_ea(EaSet::DATA_ALT).since_010();
     0xffc0 0x44c0 => Insn::new(Op::MoveToCcr,  Fixed(Word), Ea, Ccr)
                         .src_ea(EaSet::DATA);
     0xffc0 0x46c0 => Insn::new(Op::MoveToSr,   Fixed(Word), Ea, Sr)
@@ -771,23 +1091,44 @@ table! {
     0xffc0 0x4ac0 => Insn::new(Op::Tas,  Fixed(Byte), Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
     0xffc0 0x4e80 => Insn::new(Op::Jsr,  SizeSpec::None, Ea, Arg::None).src_ea(EaSet::CONTROL);
     0xffc0 0x4ec0 => Insn::new(Op::Jmp,  SizeSpec::None, Ea, Arg::None).src_ea(EaSet::CONTROL);
+    // The 32-bit multiply and divide sit below MOVEM's memory-to-register
+    // encoding, in space the 68000 left empty.
+    0xffc0 0x4c00 => Insn::new(Op::Mull, Fixed(Long), Ea, Arg::None)
+                        .src_ea(EaSet::DATA).with_ext(1).only_020();
+    0xffc0 0x4c40 => Insn::new(Op::Divl, Fixed(Long), Ea, Arg::None)
+                        .src_ea(EaSet::DATA).with_ext(1).only_020();
     0xff80 0x4880 => Insn::new(Op::Movem, Bit6, RegList, Ea).dst_ea(EaSet::MOVEM_TO_MEM);
     0xff80 0x4c80 => Insn::new(Op::Movem, Bit6, Ea, RegList).src_ea(EaSet::MOVEM_TO_REG);
     0xff00 0x4000 => Insn::new(Op::Negx, Bits76, Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
     0xff00 0x4200 => Insn::new(Op::Clr,  Bits76, Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
     0xff00 0x4400 => Insn::new(Op::Neg,  Bits76, Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
     0xff00 0x4600 => Insn::new(Op::Not,  Bits76, Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
-    0xff00 0x4a00 => Insn::new(Op::Tst,  Bits76, Ea, Arg::None).src_ea(EaSet::DATA_ALT);
+    // TST reaches every mode on a 68020 — an address register as a word or a
+    // long, the PC-relative modes and an immediate (M68000PRM, *TST*).
+    0xff00 0x4a00 => Insn::new(Op::Tst,  Bits76, Ea, Arg::None).src_ea(EaSet::ALL).only_020();
+    0xff00 0x4a00 => Insn::new(Op::Tst,  Bits76, Ea, Arg::None)
+                        .src_ea(EaSet::DATA_ALT).models(Models::UNTIL_010);
+    0xf1c0 0x4100 => Insn::new(Op::Chk,  Fixed(Long), Ea, DnHi).src_ea(EaSet::DATA).only_020();
     0xf1c0 0x4180 => Insn::new(Op::Chk,  Fixed(Word), Ea, DnHi).src_ea(EaSet::DATA);
     0xf1c0 0x41c0 => Insn::new(Op::Lea,  Fixed(Long), Ea, AnHi).src_ea(EaSet::CONTROL);
 
-    // ---- line 5: ADDQ, SUBQ, Scc, DBcc ----------------------------------
+    // ---- line 5: ADDQ, SUBQ, Scc, DBcc, TRAPcc --------------------------
     0xf0f8 0x50c8 => Insn::new(Op::Dbcc, Fixed(Word), DnLo, Disp16);
+    // TRAPcc is Scc with an immediate or PC-relative "destination", which
+    // Scc rejects. Bits 2-0 say how many operand words follow.
+    0xf0ff 0x50fa => Insn::new(Op::Trapcc, Fixed(Word), TrapData, Arg::None).only_020();
+    0xf0ff 0x50fb => Insn::new(Op::Trapcc, Fixed(Long), TrapData, Arg::None).only_020();
+    0xf0ff 0x50fc => Insn::new(Op::Trapcc, SizeSpec::None, Arg::None, Arg::None).only_020();
     0xf0c0 0x50c0 => Insn::new(Op::Scc,  Fixed(Byte), Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
     0xf100 0x5000 => Insn::new(Op::Addq, Bits76, Quick, Ea).dst_ea(EaSet::ALTERABLE);
     0xf100 0x5100 => Insn::new(Op::Subq, Bits76, Quick, Ea).dst_ea(EaSet::ALTERABLE);
 
     // ---- line 6: branches -----------------------------------------------
+    // A displacement byte of $ff means a 32-bit displacement follows on a
+    // 68020; on a 68000 it is a branch by -1, to an odd address.
+    0xffff 0x60ff => Insn::new(Op::Bra, SizeSpec::None, Disp32, Arg::None).only_020();
+    0xffff 0x61ff => Insn::new(Op::Bsr, SizeSpec::None, Disp32, Arg::None).only_020();
+    0xf0ff 0x60ff => Insn::new(Op::Bcc, SizeSpec::None, Disp32, Arg::None).only_020();
     0xff00 0x6000 => Insn::new(Op::Bra, SizeSpec::None, Disp8, Arg::None);
     0xff00 0x6100 => Insn::new(Op::Bsr, SizeSpec::None, Disp8, Arg::None);
     0xf000 0x6000 => Insn::new(Op::Bcc, SizeSpec::None, Disp8, Arg::None);
@@ -795,8 +1136,11 @@ table! {
     // ---- line 7: MOVEQ ---------------------------------------------------
     0xf100 0x7000 => Insn::new(Op::Moveq, Fixed(Long), QuickByte, DnHi);
 
-    // ---- line 8: OR, DIV, SBCD ------------------------------------------
+    // ---- line 8: OR, DIV, SBCD, PACK, UNPK ------------------------------
     0xf1f0 0x8100 => Insn::new(Op::Sbcd, Fixed(Byte), RmLo, RmHi);
+    // PACK and UNPK are OR's register-destination forms, which OR rejects.
+    0xf1f0 0x8140 => Insn::new(Op::Pack, SizeSpec::None, RmLo, RmHi).with_ext(1).only_020();
+    0xf1f0 0x8180 => Insn::new(Op::Unpk, SizeSpec::None, RmLo, RmHi).with_ext(1).only_020();
     0xf1c0 0x80c0 => Insn::new(Op::Divu, Fixed(Word), Ea, DnHi).src_ea(EaSet::DATA);
     0xf1c0 0x81c0 => Insn::new(Op::Divs, Fixed(Word), Ea, DnHi).src_ea(EaSet::DATA);
     0xf100 0x8000 => Insn::new(Op::Or,   Bits76, Ea, DnHi).src_ea(EaSet::DATA);
@@ -833,7 +1177,26 @@ table! {
     0xf100 0xd000 => Insn::new(Op::Add,  Bits76, Ea, DnHi).src_ea(EaSet::ALL);
     0xf100 0xd100 => Insn::new(Op::Add,  Bits76, DnHi, Ea).dst_ea(EaSet::MEM_ALT);
 
-    // ---- line e: shifts and rotates --------------------------------------
+    // ---- line e: shifts, rotates and bit fields --------------------------
+    // The bit-field instructions occupy the size-11 encodings of the
+    // register shifts, so they are matched first. Unsized: the field is
+    // whatever the extension word says.
+    0xffc0 0xe8c0 => Insn::new(Op::Bftst,  SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+    0xffc0 0xe9c0 => Insn::new(Op::Bfextu, SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+    0xffc0 0xeac0 => Insn::new(Op::Bfchg,  SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
+    0xffc0 0xebc0 => Insn::new(Op::Bfexts, SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+    0xffc0 0xecc0 => Insn::new(Op::Bfclr,  SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
+    0xffc0 0xedc0 => Insn::new(Op::Bfffo,  SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+    0xffc0 0xeec0 => Insn::new(Op::Bfset,  SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
+    0xffc0 0xefc0 => Insn::new(Op::Bfins,  SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
     // The memory forms shift one bit of one word and must be matched first:
     // they occupy the bits-7-6 = 11 encoding the register forms leave unused.
     0xffc0 0xe0c0 => Insn::new(Op::Asr,  Fixed(Word), Arg::None, Ea).dst_ea(EaSet::MEM_ALT);
@@ -854,6 +1217,15 @@ table! {
     0xf118 0xe118 => Insn::new(Op::Rol,  Bits76, ShiftCount, DnLo);
 
     // ---- line f: unimplemented, the $F line coprocessor escape ------------
+    // With no coprocessor present every F-line word takes the line-F
+    // exception — except cpSAVE and cpRESTORE, which a 68020 checks for
+    // privilege before it tries to talk to any coprocessor, so user code gets
+    // a privilege violation instead (MC68020UM §7.5.2.3). Bits 11-9 are the
+    // coprocessor id and do not matter to that check.
+    0xf1c0 0xf100 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().only_020();
+    0xf1c0 0xf140 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().only_020();
     0xf000 0xf000 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None);
 }
 
@@ -877,7 +1249,7 @@ static NIBBLE: [(u16, u16); 16] = {
     spans
 };
 
-/// Decode an opcode word into its table row.
+/// Decode an opcode word into its table row, for a 68000.
 ///
 /// Unassigned encodings, illegal size fields and illegal addressing modes all
 /// return [`Insn::ILLEGAL`] — on a 68000 those are the same thing, an
@@ -886,11 +1258,22 @@ static NIBBLE: [(u16, u16); 16] = {
 #[inline]
 #[must_use]
 pub fn decode(opcode: u16) -> Insn {
+    decode_for(Model::M68000, opcode)
+}
+
+/// Decode an opcode word into its table row, for a given processor.
+///
+/// Rows the processor does not implement are skipped rather than matched, so
+/// an encoding a later part added falls through to whatever an earlier part
+/// made of it — almost always [`Insn::ILLEGAL`].
+#[inline]
+#[must_use]
+pub fn decode_for(model: Model, opcode: u16) -> Insn {
     let (start, end) = NIBBLE[(opcode >> 12) as usize];
     let mut i = start as usize;
     while i < end as usize {
         let pattern = &TABLE[i];
-        if pattern.matches(opcode) {
+        if pattern.insn.models.contains(model) && pattern.matches(opcode) {
             let insn = pattern.insn;
             return if legal(insn, opcode) {
                 insn
@@ -955,6 +1338,228 @@ pub fn ea_of(arg: Arg, opcode: u16) -> Option<(Mode, u8)> {
         _ => return None,
     };
     Mode::decode(field)
+}
+
+/// How a 68020 full-format extension word reaches memory, if it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Indirect {
+    /// No memory indirection: the address is base + index + displacement.
+    None,
+    /// Memory indirect, preindexed: the index is added *before* the pointer
+    /// is fetched.
+    Pre,
+    /// Memory indirect, postindexed: the index is added to the pointer
+    /// fetched.
+    Post,
+}
+
+/// A 68020 full-format extension word, decoded (M68000PRM §2.2.3, Figure 2-2
+/// and Table 2-2).
+///
+/// Everything the effective-address calculation and the disassembler need,
+/// and the number of words that follow it — which is the part of an
+/// instruction's length a 68000 never had to compute from data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FullExt {
+    /// Bit 15: the index is an address register.
+    pub index_addr: bool,
+    /// Bits 14–12: the index register.
+    pub index_reg: u8,
+    /// Bit 11: the whole index register, not its sign-extended low word.
+    pub index_long: bool,
+    /// Bits 10–9: the index is multiplied by 1, 2, 4 or 8.
+    pub scale: u8,
+    /// Bit 7: the base register is suppressed (reads as zero).
+    pub base_suppressed: bool,
+    /// Bit 6: the index is suppressed.
+    pub index_suppressed: bool,
+    /// Bits 5–4: how many words the base displacement occupies, 0, 1 or 2.
+    pub bd_words: u8,
+    /// Bits 2–0: whether, and how, the address is indirect.
+    pub indirect: Indirect,
+    /// How many words the outer displacement occupies, 0, 1 or 2.
+    pub od_words: u8,
+}
+
+impl FullExt {
+    /// Decode a full-format word, or `None` for one of the encodings Table
+    /// 2-2 marks reserved.
+    ///
+    /// A reserved encoding is not an addressing mode, so the instruction that
+    /// carries one is an illegal instruction. The manual does not say what a
+    /// 68020 actually does with one; vector 4 is the reading that cannot
+    /// silently compute a wrong address, and it is what this core does.
+    #[must_use]
+    pub const fn decode(word: u16) -> Option<FullExt> {
+        // Bit 3 is defined as zero.
+        if word & 0x0008 != 0 {
+            return None;
+        }
+        let bd_words = match (word >> 4) & 3 {
+            0 => return None,
+            1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        let index_suppressed = word & 0x0040 != 0;
+        let iis = word & 7;
+        let (indirect, od) = if index_suppressed {
+            match iis {
+                0 => (Indirect::None, 0),
+                1 => (Indirect::Pre, 1),
+                2 => (Indirect::Pre, 2),
+                3 => (Indirect::Pre, 3),
+                _ => return None,
+            }
+        } else {
+            match iis {
+                0 => (Indirect::None, 0),
+                1 => (Indirect::Pre, 1),
+                2 => (Indirect::Pre, 2),
+                3 => (Indirect::Pre, 3),
+                4 => return None,
+                5 => (Indirect::Post, 1),
+                6 => (Indirect::Post, 2),
+                _ => (Indirect::Post, 3),
+            }
+        };
+        // `od` above is the encoded size, 1 null, 2 word, 3 long.
+        let od_words = match od {
+            2 => 1,
+            3 => 2,
+            _ => 0,
+        };
+        Some(FullExt {
+            index_addr: word & 0x8000 != 0,
+            index_reg: ((word >> 12) & 7) as u8,
+            index_long: word & 0x0800 != 0,
+            scale: ((word >> 9) & 3) as u8,
+            base_suppressed: word & 0x0080 != 0,
+            index_suppressed,
+            bd_words,
+            indirect,
+            od_words,
+        })
+    }
+
+    /// Words that follow the extension word itself.
+    #[must_use]
+    pub const fn trailing_words(self) -> u32 {
+        self.bd_words as u32 + self.od_words as u32
+    }
+}
+
+/// Whether an indexed mode's first extension word is a full-format word on
+/// this processor.
+///
+/// Bit 8 selects it, and only a 68020 looks: the 68000 and 68010 ignore bits
+/// 10–8 of a brief word altogether (M68000PRM §2.2.3).
+#[inline]
+#[must_use]
+pub const fn is_full_format(model: Model, first: u16) -> bool {
+    model.has_020() && first & 0x0100 != 0
+}
+
+/// How many words an indexed mode occupies on this processor, given its
+/// first extension word — or `None` if that word is a reserved full format.
+#[must_use]
+pub const fn index_ext_words(model: Model, first: u16) -> Option<u32> {
+    if !is_full_format(model, first) {
+        return Some(1);
+    }
+    match FullExt::decode(first) {
+        Some(full) => Some(1 + full.trailing_words()),
+        None => None,
+    }
+}
+
+/// A bit field's `{offset:width}` specification, from the instruction's
+/// extension word (M68000PRM, *BFTST*, "Instruction Fields").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FieldSpec {
+    /// Bit 11: the offset is in a data register rather than immediate.
+    pub offset_reg: bool,
+    /// Bits 10–6: the immediate offset 0–31, or (bits 8–6) the register.
+    pub offset: u8,
+    /// Bit 5: the width is in a data register rather than immediate.
+    pub width_reg: bool,
+    /// Bits 4–0: the immediate width, 0 meaning 32, or (bits 2–0) the
+    /// register.
+    pub width: u8,
+    /// Bits 14–12: the data register `BFEXTU`, `BFEXTS`, `BFFFO` and `BFINS`
+    /// name.
+    pub reg: u8,
+}
+
+impl FieldSpec {
+    /// Split an extension word into its fields.
+    #[must_use]
+    pub const fn decode(word: u16) -> FieldSpec {
+        let offset_reg = word & 0x0800 != 0;
+        let width_reg = word & 0x0020 != 0;
+        FieldSpec {
+            offset_reg,
+            offset: if offset_reg {
+                ((word >> 6) & 7) as u8
+            } else {
+                ((word >> 6) & 0x1f) as u8
+            },
+            width_reg,
+            width: if width_reg {
+                (word & 7) as u8
+            } else {
+                (word & 0x1f) as u8
+            },
+            reg: ((word >> 12) & 7) as u8,
+        }
+    }
+}
+
+/// `MOVEC`'s control-register codes (M68000PRM, *MOVEC*).
+pub mod ctrl {
+    /// Source function code.
+    pub const SFC: u16 = 0x000;
+    /// Destination function code.
+    pub const DFC: u16 = 0x001;
+    /// Cache control register (68020).
+    pub const CACR: u16 = 0x002;
+    /// User stack pointer.
+    pub const USP: u16 = 0x800;
+    /// Vector base register.
+    pub const VBR: u16 = 0x801;
+    /// Cache address register (68020).
+    pub const CAAR: u16 = 0x802;
+    /// Master stack pointer (68020).
+    pub const MSP: u16 = 0x803;
+    /// Interrupt stack pointer (68020).
+    pub const ISP: u16 = 0x804;
+
+    /// Whether `model` has the control register `code` — anything else is an
+    /// illegal instruction (M68000PRM, *MOVEC*, note 1).
+    #[must_use]
+    pub const fn exists(model: super::Model, code: u16) -> bool {
+        match code {
+            SFC | DFC | USP | VBR => model.has_010(),
+            CACR | CAAR | MSP | ISP => model.has_020(),
+            _ => false,
+        }
+    }
+
+    /// The assembler name of a control register.
+    #[must_use]
+    pub const fn name(code: u16) -> Option<&'static str> {
+        Some(match code {
+            SFC => "SFC",
+            DFC => "DFC",
+            CACR => "CACR",
+            USP => "USP",
+            VBR => "VBR",
+            CAAR => "CAAR",
+            MSP => "MSP",
+            ISP => "ISP",
+            _ => return None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1053,26 +1658,37 @@ mod tests {
         // A tripwire on the whole table: a pattern that starts shadowing
         // another, or a legality rule that stops rejecting something, moves
         // these counts. The numbers themselves are only meaningful as a
-        // baseline — what matters is that they do not drift silently.
-        let mut legal = 0usize;
-        let mut line_a = 0usize;
-        let mut line_f = 0usize;
-        let mut ops = alloc::collections::BTreeSet::new();
-        for opcode in 0..=u16::MAX {
-            match decode(opcode).op {
-                Op::Illegal => {}
-                Op::LineA => line_a += 1,
-                Op::LineF => line_f += 1,
-                other => {
-                    legal += 1;
-                    ops.insert(other.mnemonic());
+        // baseline — what matters is that they do not drift silently, and
+        // the 68000's in particular is the number it was before the table
+        // learned about any other processor.
+        let mut reached: alloc::vec::Vec<Op> = alloc::vec::Vec::new();
+        for (model, expected) in [
+            (Model::M68000, 45_815usize),
+            (Model::M68010, 46_002),
+            (Model::M68020, 47_419),
+        ] {
+            let mut legal = 0usize;
+            let mut line_a = 0usize;
+            let mut line_f = 0usize;
+            for opcode in 0..=u16::MAX {
+                match decode_for(model, opcode).op {
+                    Op::Illegal => {}
+                    Op::LineA => line_a += 1,
+                    Op::LineF => line_f += 1,
+                    other => {
+                        legal += 1;
+                        if !reached.contains(&other) {
+                            reached.push(other);
+                        }
+                    }
                 }
             }
+            assert_eq!(line_a, 0x1000, "{model}: the whole $A line traps");
+            assert_eq!(line_f, 0x1000, "{model}: and the whole $F line");
+            assert_eq!(legal, expected, "{model}");
         }
-        assert_eq!(line_a, 0x1000, "the whole $A line traps");
-        assert_eq!(line_f, 0x1000, "and the whole $F line");
-        assert_eq!(legal, 45_815);
-        // Every operation in the table is reachable from some encoding.
+        // Every operation in the table is reachable from some encoding on
+        // some processor.
         for op in Op::ALL {
             // The three that decode to something other than an operation with
             // operands are counted above rather than collected here.
@@ -1080,12 +1696,109 @@ mod tests {
                 continue;
             }
             assert!(
-                ops.contains(op.mnemonic()),
+                reached.contains(op),
                 "{op:?} is in the table but no encoding reaches it"
             );
         }
     }
 
+    #[test]
+    fn the_68ec020_decodes_exactly_as_the_68020_does() {
+        for opcode in 0..=u16::MAX {
+            assert_eq!(
+                decode_for(Model::M68020, opcode),
+                decode_for(Model::M68EC020, opcode),
+                "{opcode:04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_processor_only_ever_adds_to_the_opcode_map() {
+        // The 68010 and 68020 are upward compatible (MC68000UM §1.1): every
+        // encoding that means something on an earlier part means the same
+        // operation on a later one. The exceptions are the ones the manuals
+        // list — MOVE from SR becoming privileged, and the 68020 giving a
+        // meaning to a Bcc displacement of $ff that the 68000 read as -1.
+        for opcode in 0..=u16::MAX {
+            let old = decode_for(Model::M68000, opcode);
+            let ten = decode_for(Model::M68010, opcode);
+            let twenty = decode_for(Model::M68020, opcode);
+            if old.op != Op::Illegal {
+                assert_eq!(old.op, ten.op, "{opcode:04x} changed on the 68010");
+                if old.op != Op::MoveFromSr {
+                    assert_eq!(old.privileged, ten.privileged, "{opcode:04x}");
+                }
+            }
+            if ten.op != Op::Illegal {
+                assert_eq!(ten.op, twenty.op, "{opcode:04x} changed on the 68020");
+                if ten.src != Arg::Disp8 || opcode & 0xff != 0xff {
+                    assert_eq!(ten.src, twenty.src, "{opcode:04x}");
+                    assert_eq!(ten.dst, twenty.dst, "{opcode:04x}");
+                }
+            }
+        }
+        assert!(decode_for(Model::M68010, 0x40c0).privileged);
+        assert!(!decode_for(Model::M68000, 0x40c0).privileged);
+    }
+
+    #[test]
+    fn the_new_encodings_decode_where_the_manual_puts_them() {
+        let m20 = |op| decode_for(Model::M68020, op).op;
+        let m10 = |op| decode_for(Model::M68010, op).op;
+        assert_eq!(m10(0x4e7a), Op::Movec);
+        assert_eq!(m10(0x4e7b), Op::Movec);
+        assert_eq!(m10(0x0e50), Op::Moves);
+        assert_eq!(m10(0x4e74), Op::Rtd);
+        assert_eq!(m10(0x42c0), Op::MoveFromCcr);
+        assert_eq!(m10(0x4848), Op::Bkpt);
+        assert_eq!(m10(0x4c00), Op::Illegal, "no MULS.L on a 68010");
+        assert_eq!(m20(0x4c00), Op::Mull);
+        assert_eq!(m20(0x4c40), Op::Divl);
+        assert_eq!(m20(0xe8c0), Op::Bftst);
+        assert_eq!(m20(0xe9d0), Op::Bfextu);
+        assert_eq!(m20(0xedc0), Op::Bfffo);
+        assert_eq!(m20(0xefd0), Op::Bfins);
+        assert_eq!(m20(0x0ad0), Op::Cas);
+        assert_eq!(m20(0x0cfc), Op::Cas2);
+        assert_eq!(m20(0x00d0), Op::Cmp2);
+        assert_eq!(m20(0x04d0), Op::Cmp2);
+        assert_eq!(m20(0x06c3), Op::Rtm);
+        assert_eq!(m20(0x06d0), Op::Callm);
+        assert_eq!(m20(0x8141), Op::Pack);
+        assert_eq!(m20(0x8189), Op::Unpk);
+        assert_eq!(m20(0x49c0), Op::Extb);
+        assert_eq!(m20(0x4808), Op::Link);
+        assert_eq!(m20(0x51fa), Op::Trapcc);
+        assert_eq!(m20(0x60ff), Op::Bra);
+        assert_eq!(m20(0x66ff), Op::Bcc);
+        assert_eq!(m20(0x4100), Op::Chk);
+        assert_eq!(m20(0x4a48), Op::Tst, "TST.W An");
+        assert_eq!(m20(0x4a3c), Op::Tst, "TST.B #imm");
+        assert_eq!(m20(0x0c3a), Op::Cmpi, "CMPI.B #,(d16,PC)");
+        assert_eq!(decode(0x0c3a).op, Op::Illegal);
+        // cpSAVE and cpRESTORE are line F with a privilege check first.
+        assert!(decode_for(Model::M68020, 0xf310).privileged);
+        assert!(!decode_for(Model::M68020, 0xf210).privileged);
+        assert!(!decode(0xf310).privileged);
+        // The 68000 still sees none of it.
+        for opcode in [
+            0x4e7a, 0x0e50, 0x4e74, 0x42c0, 0x4848, 0x4c00, 0xe8c0, 0x0ad0,
+        ] {
+            assert_eq!(decode(opcode).op, Op::Illegal, "{opcode:04x}");
+        }
+        // A reserved full-format word is not an addressing mode.
+        assert_eq!(FullExt::decode(0x0100), None, "BD SIZE 00 is reserved");
+        assert_eq!(FullExt::decode(0x0114), None, "I/IS 100 is reserved");
+        assert_eq!(
+            FullExt::decode(0x0154),
+            None,
+            "IS=1 with I/IS 1xx is reserved"
+        );
+        assert_eq!(index_ext_words(Model::M68000, 0x0134), Some(1));
+        assert_eq!(index_ext_words(Model::M68020, 0x0133), Some(1 + 2 + 2));
+        assert_eq!(index_ext_words(Model::M68020, 0x0126), Some(1 + 1 + 1));
+    }
     #[test]
     fn decode_never_panics() {
         for opcode in 0..=u16::MAX {

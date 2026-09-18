@@ -6,7 +6,7 @@ plus a machine description.
 
 | Architecture | Primary documentation | Notes |
 | --- | --- | --- |
-| Motorola 68000 | *M68000 Family Programmer's Reference Manual* and the 68000 User's Manual — NXP hosts current PDFs (search "M68000PRM"); [bitsavers](https://bitsavers.org/) has the originals | Amiga, Atari ST, Genesis, early Macs |
+| Motorola 68000 | see [`m68k.md`](m68k.md) — the 68000 and 68010 are implemented | Amiga, Atari ST, Genesis, early Macs |
 | MIPS | see [`mips.md`](mips.md) — the R3000A core is implemented | PlayStation, N64, routers |
 | PowerPC | *PowerPC Architecture Book* I–III; NXP hosts the classic PPC manuals | Mac, GameCube/Wii, embedded |
 | SuperH (SH-2/SH-4) | Renesas SH-2 and SH-4 hardware manuals | Saturn, Dreamcast |

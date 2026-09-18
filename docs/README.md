@@ -51,7 +51,8 @@ the question never arises.
 | [`cpu/arm.md`](cpu/arm.md) | ARMv5TE, ARMv7-A, ARMv7-M / Cortex-M, ARMv8-A / AArch64, GIC |
 | [`cpu/riscv.md`](cpu/riscv.md) | RV32/RV64, privileged spec, SBI |
 | [`cpu/mips.md`](cpu/mips.md) | MIPS I / R3000A, the LR33300, and why MIPS32 is the wrong CP0 manual |
-| [`cpu/other.md`](cpu/other.md) | 68000, PowerPC, SuperH, V850 |
+| [`cpu/m68k.md`](cpu/m68k.md) | Motorola 68000 and 68010: the manuals, the 68010's differences, and the corpus |
+| [`cpu/other.md`](cpu/other.md) | PowerPC, SuperH, V850 |
 
 ### Machines
 | | |

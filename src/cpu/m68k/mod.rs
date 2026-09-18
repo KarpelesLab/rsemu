@@ -1,11 +1,38 @@
-//! The Motorola MC68000 — a bus-accurate interpreter with a modelled prefetch
-//! queue.
+//! The Motorola MC68000 and MC68010 — a bus-accurate interpreter with a
+//! modelled prefetch queue.
 //!
 //! The plain 68000, as fitted to the Amiga, the Atari ST, the Mega Drive and
 //! the first Macintoshes: 32-bit registers, a 16-bit data bus, 24 address
-//! pins, two stack pointers and a supervisor/user split. Not the 68010 or the
-//! 68020 — no `MOVEC`, no `BFEXTU`, no 32-bit multiply, and the 68000's own
-//! group-0 exception frame rather than the 68010's format words.
+//! pins, two stack pointers and a supervisor/user split. And, chosen by the
+//! `model` property ([`Model`]), the 68010 that some of those machines were
+//! upgraded with — see *The 68010* below.
+//!
+//! # The 68010
+//!
+//! The same core with the 68010's differences (MC68000UM §1.3, §6, §9;
+//! M68000PRM Appendix A):
+//!
+//! - a vector base register, and `MOVEC` to reach it and the `SFC`/`DFC`
+//!   function-code registers; `MOVES` to use them; `RTD`; `MOVE from CCR`;
+//!   `BKPT`, which with no breakpoint hardware on the bus is an illegal
+//!   instruction;
+//! - `MOVE from SR` privileged;
+//! - a format word in every exception frame: format `$0` for four words, and
+//!   format `$8` — twenty-nine words — for a bus or address error, which `RTE`
+//!   can return from. This core restarts the faulted instruction rather than
+//!   continuing it from microcode state it does not have; `exec.rs`'s `fault`
+//!   says how that is made to come out the same, including a cycle the
+//!   handler completed in software;
+//! - `CLR`, `Scc` and `MOVE from SR` no longer read their destination first.
+//!
+//! Its timing is the 68000's, per access, with those accesses removed and the
+//! format word's write added, which makes every exception time in MC68000UM
+//! Table 9-19 that the core can take come out as published. The 68010's own
+//! faster microcode for `MULU`, `DIVU` and some branches (Tables 9-6 and 9-15)
+//! is not modelled, and neither is **loop mode** — a one-word instruction
+//! repeated by the `DBcc` after it, run from the prefetch queue with only its
+//! operand cycles on the bus (MC68000UM Appendix A), a timing effect with no
+//! architectural one.
 //!
 //! # What "bus-accurate" means here
 //!
@@ -120,7 +147,7 @@
 //! set, encodings and condition codes, and the *MC68000 8-/16-/32-Bit
 //! Microprocessors User's Manual* (MC68000UM) for exception processing, the
 //! stack frames, the signal description and the timing tables. Both are listed
-//! in `docs/cpu/other.md`. No copyleft emulator was consulted, and no emulator
+//! in `docs/cpu/m68k.md`. No copyleft emulator was consulted, and no emulator
 //! source of any licence was used for the instruction semantics.
 
 pub mod disasm;
@@ -129,6 +156,8 @@ pub mod isa;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_68010;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).
@@ -156,7 +185,15 @@ use crate::core::wire::{
     FanIn, IntAck, IntAckCycle, IntAckHandlers, IntAckResponse, Level, Resolve, WireId, WireSink,
 };
 
-use exec::{Exec, State};
+use exec::{Bank, Exec, State};
+
+pub use isa::Model;
+
+/// The values the `model` property accepts, in [`Model::ALL`] order.
+///
+/// The 68020 packages are not offered yet: their addressing modes and
+/// instructions arrive in the commits after this one.
+const MODEL_NAMES: [&str; 2] = [Model::M68000.name(), Model::M68010.name()];
 
 /// The 24 address pins.
 ///
@@ -199,13 +236,30 @@ pub mod flags {
     /// Bits 11, 12 and 14 have no storage and read as zero; the 68020's **M**
     /// bit is one of them.
     pub const IMPLEMENTED: u16 = T | S | IPL | CCR;
+    /// The 68020's master/interrupt state: with **S** set, whether `A7` is the
+    /// master stack pointer (MC68020UM §1.3.2).
+    pub const M: u16 = 0x1000;
+    /// The 68020's second trace bit, **T0**: trace on a change of flow. **T**
+    /// is the 68020's **T1** (MC68020UM §6.1.7).
+    pub const T0: u16 = 0x4000;
+
+    /// Every bit a given model implements: the 68010 has the 68000's, the
+    /// 68020 adds **M** and **T0**.
+    #[must_use]
+    pub const fn implemented(model: super::Model) -> u16 {
+        if model.has_020() {
+            IMPLEMENTED | M | T0
+        } else {
+            IMPLEMENTED
+        }
+    }
 }
 
-/// The exception vector numbers a 68000 defines.
+/// The exception vector numbers the family defines.
 ///
 /// A vector's address is four times its number, and the table starts at zero —
 /// which on a 68000 cannot be moved, because there is no vector base register
-/// (MC68000UM §6.1).
+/// (MC68000UM §6.1). From the 68010 on it starts at `VBR`.
 pub mod vector {
     /// Vector 0: the initial supervisor stack pointer.
     pub const RESET_SSP: u8 = 0;
@@ -231,6 +285,9 @@ pub mod vector {
     pub const LINE_A: u8 = 10;
     /// Vector 11: an unimplemented `$Fxxx` instruction.
     pub const LINE_F: u8 = 11;
+    /// Vector 14: format error — an `RTE` found a frame format it cannot use
+    /// (68010 on), or `CALLM`/`RTM` a descriptor it does not recognise.
+    pub const FORMAT_ERROR: u8 = 14;
     /// Vector 15: uninitialized interrupt vector.
     pub const UNINITIALIZED: u8 = 15;
     /// Vector 24: spurious interrupt — no device answered the acknowledge.
@@ -248,7 +305,11 @@ pub mod vector {
 ///
 /// `a[7]` is whichever stack pointer the **S** bit currently selects, and is
 /// always equal to [`Regs::ssp`] in supervisor state or [`Regs::usp`] in user
-/// state — the 68000 has two physical `A7`s and one name for them.
+/// state — the 68000 has two physical `A7`s and one name for them. A 68020 has
+/// three: with **S** and **M** both set, `a[7]` is [`Regs::msp`].
+///
+/// The control registers a 68000 does not have read as zero on one, and
+/// writing them there changes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Regs {
     /// The eight data registers.
@@ -257,7 +318,8 @@ pub struct Regs {
     pub a: [u32; 8],
     /// The user stack pointer.
     pub usp: u32,
-    /// The supervisor stack pointer.
+    /// The supervisor stack pointer — the *interrupt* stack pointer, `ISP`,
+    /// on a 68020, which is the one reset loads (MC68020UM §6.1.1).
     pub ssp: u32,
     /// The program counter: the address of the word in `prefetch[0]`.
     pub pc: u32,
@@ -265,6 +327,18 @@ pub struct Regs {
     pub sr: u16,
     /// The two-word instruction prefetch queue.
     pub prefetch: [u16; 2],
+    /// The 68020's master stack pointer.
+    pub msp: u32,
+    /// The vector base register (68010 on).
+    pub vbr: u32,
+    /// The source function code, three bits (68010 on).
+    pub sfc: u8,
+    /// The destination function code, three bits (68010 on).
+    pub dfc: u8,
+    /// The 68020's cache control register; only **E** and **F** are kept.
+    pub cacr: u32,
+    /// The 68020's cache address register.
+    pub caar: u32,
 }
 
 impl Regs {
@@ -272,6 +346,13 @@ impl Regs {
     #[must_use]
     pub const fn supervisor(&self) -> bool {
         self.sr & flags::S != 0
+    }
+
+    /// Whether the **M** bit selects the master stack pointer — meaningful
+    /// only in supervisor state on a 68020.
+    #[must_use]
+    pub const fn master(&self) -> bool {
+        self.sr & (flags::S | flags::M) == flags::S | flags::M
     }
 
     /// Whether a status flag is set.
@@ -328,12 +409,24 @@ pub enum Reg {
     A(u8),
     /// The user stack pointer.
     Usp,
-    /// The supervisor stack pointer.
+    /// The supervisor stack pointer; the interrupt stack pointer on a 68020.
     Ssp,
     /// The program counter.
     Pc,
     /// The status register.
     Sr,
+    /// The 68020's master stack pointer.
+    Msp,
+    /// The vector base register.
+    Vbr,
+    /// The source function code register.
+    Sfc,
+    /// The destination function code register.
+    Dfc,
+    /// The 68020's cache control register.
+    Cacr,
+    /// The 68020's cache address register.
+    Caar,
 }
 
 impl Reg {
@@ -361,11 +454,31 @@ impl Reg {
         Reg::Sr,
     ];
 
+    /// The 68010's additions to [`Reg::ALL`].
+    pub const M68010: &'static [Reg] = &[Reg::Vbr, Reg::Sfc, Reg::Dfc];
+
+    /// The 68020's additions to the 68010's.
+    pub const M68020: &'static [Reg] = &[Reg::Msp, Reg::Cacr, Reg::Caar];
+
+    /// Every register `model` has, in the order a debugger should list them.
+    #[must_use]
+    pub fn all_for(model: Model) -> Vec<Reg> {
+        let mut out = Reg::ALL.to_vec();
+        if model.has_010() {
+            out.extend_from_slice(Reg::M68010);
+        }
+        if model.has_020() {
+            out.extend_from_slice(Reg::M68020);
+        }
+        out
+    }
+
     /// How wide the register is.
     #[must_use]
     pub const fn width(self) -> Width {
         match self {
             Reg::Sr => Width::U16,
+            Reg::Sfc | Reg::Dfc => Width::U8,
             _ => Width::U32,
         }
     }
@@ -380,14 +493,20 @@ impl Reg {
             Reg::Ssp => regs.ssp,
             Reg::Pc => regs.pc,
             Reg::Sr => regs.sr as u32,
+            Reg::Msp => regs.msp,
+            Reg::Vbr => regs.vbr,
+            Reg::Sfc => regs.sfc as u32,
+            Reg::Dfc => regs.dfc as u32,
+            Reg::Cacr => regs.cacr,
+            Reg::Caar => regs.caar,
         }
     }
 
     /// Write this register into a register file, truncating to its width.
     ///
-    /// Writing `A7` writes whichever bank is active, and writing `USP` or
-    /// `SSP` writes that bank whether or not it is active — which is what a
-    /// debugger showing both of them needs.
+    /// Writing `A7` writes whichever bank is active, and writing `USP`, `SSP`
+    /// or `MSP` writes that bank whether or not it is active — which is what a
+    /// debugger showing all of them needs.
     pub const fn set(self, regs: &mut Regs, value: u32) {
         match self {
             Reg::D(n) => regs.d[(n & 7) as usize] = value,
@@ -395,7 +514,9 @@ impl Reg {
                 let n = (n & 7) as usize;
                 regs.a[n] = value;
                 if n == 7 {
-                    if regs.supervisor() {
+                    if regs.master() {
+                        regs.msp = value;
+                    } else if regs.supervisor() {
                         regs.ssp = value;
                     } else {
                         regs.usp = value;
@@ -410,12 +531,23 @@ impl Reg {
             }
             Reg::Ssp => {
                 regs.ssp = value;
-                if regs.supervisor() {
+                if regs.supervisor() && !regs.master() {
+                    regs.a[7] = value;
+                }
+            }
+            Reg::Msp => {
+                regs.msp = value;
+                if regs.master() {
                     regs.a[7] = value;
                 }
             }
             Reg::Pc => regs.pc = value,
             Reg::Sr => regs.sr = value as u16,
+            Reg::Vbr => regs.vbr = value,
+            Reg::Sfc => regs.sfc = (value & 7) as u8,
+            Reg::Dfc => regs.dfc = (value & 7) as u8,
+            Reg::Cacr => regs.cacr = value,
+            Reg::Caar => regs.caar = value,
         }
     }
 
@@ -432,9 +564,15 @@ impl Reg {
             }
             _ => match name {
                 "usp" => Some(Reg::Usp),
-                "ssp" | "sp" => Some(Reg::Ssp),
+                "ssp" | "sp" | "isp" => Some(Reg::Ssp),
                 "pc" => Some(Reg::Pc),
                 "sr" => Some(Reg::Sr),
+                "msp" => Some(Reg::Msp),
+                "vbr" => Some(Reg::Vbr),
+                "sfc" => Some(Reg::Sfc),
+                "dfc" => Some(Reg::Dfc),
+                "cacr" => Some(Reg::Cacr),
+                "caar" => Some(Reg::Caar),
                 _ => None,
             },
         }
@@ -450,6 +588,12 @@ impl fmt::Display for Reg {
             Reg::Ssp => f.write_str("ssp"),
             Reg::Pc => f.write_str("pc"),
             Reg::Sr => f.write_str("sr"),
+            Reg::Msp => f.write_str("msp"),
+            Reg::Vbr => f.write_str("vbr"),
+            Reg::Sfc => f.write_str("sfc"),
+            Reg::Dfc => f.write_str("dfc"),
+            Reg::Cacr => f.write_str("cacr"),
+            Reg::Caar => f.write_str("caar"),
         }
     }
 }
@@ -463,18 +607,37 @@ pub struct Config {
     /// This core's identity in `MemAttrs::requester`, for an IOMMU or a
     /// per-master filter.
     pub requester: RequesterId,
+    /// Which member of the family this is.
+    pub model: Model,
 }
 
 impl Config {
     /// A plain MC68000.
     pub const MC68000: Config = Config {
         requester: RequesterId::ANONYMOUS,
+        model: Model::M68000,
     };
+
+    /// An MC68010.
+    pub const MC68010: Config = Config::MC68000.with_model(Model::M68010);
+
+    /// An MC68020.
+    pub const MC68020: Config = Config::MC68000.with_model(Model::M68020);
+
+    /// An MC68EC020: a 68020 with 24 address pins.
+    pub const MC68EC020: Config = Config::MC68000.with_model(Model::M68EC020);
 
     /// Same configuration, with a different requester id.
     #[must_use]
     pub const fn with_requester(mut self, id: RequesterId) -> Self {
         self.requester = id;
+        self
+    }
+
+    /// Same configuration, as a different model.
+    #[must_use]
+    pub const fn with_model(mut self, model: Model) -> Self {
+        self.model = model;
         self
     }
 }
@@ -683,6 +846,8 @@ pub struct M68k {
     /// overrides it in [`Instance::bind`](crate::machine::Instance::bind),
     /// because a machine allocates one per initiator (`ROADMAP.md` §4.4).
     requester: AtomicU32,
+    /// Which processor this is. Fixed at construction.
+    model: Model,
     session: sync::Mutex<Session>,
     /// The strong end of every pin this core has handed to a wire.
     ///
@@ -716,10 +881,11 @@ impl M68k {
         M68k {
             lines: Arc::new(Lines::default()),
             requester: AtomicU32::new(cfg.requester.0),
+            model: cfg.model,
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
-                    state: State::new(),
+                    state: State::new(cfg.model),
                     space: None,
                 },
             ),
@@ -740,22 +906,32 @@ impl M68k {
         // machine file that names it should not need editing when the second
         // one lands.
         let _engine = r.or_enum("engine", "interp", &["interp"])?;
+        let model = r.or_enum("model", Model::M68000.name(), &MODEL_NAMES)?;
         r.finish()?;
+        let model = Model::from_name(model).unwrap_or_default();
         Ok(M68k::new(
-            Config::default().with_requester(RequesterId(requester as u32)),
+            Config::default()
+                .with_requester(RequesterId(requester as u32))
+                .with_model(model),
         ))
     }
 
     /// This core's configuration.
     ///
-    /// [`Config`] holds only the requester id, and that lives in an atomic
-    /// because the machine layer assigns it at bind time — so this is built
-    /// rather than stored.
+    /// The requester id lives in an atomic because the machine layer assigns
+    /// it at bind time — so this is built rather than stored.
     #[must_use]
     pub fn config(&self) -> Config {
         Config {
             requester: RequesterId(self.requester.load(Ordering::Relaxed)),
+            model: self.model,
         }
+    }
+
+    /// Which processor this core is.
+    #[must_use]
+    pub fn model(&self) -> Model {
+        self.model
     }
 
     /// Give the core the identity its accesses travel under.
@@ -792,29 +968,45 @@ impl M68k {
             pc: state.pc,
             sr: state.sr,
             prefetch: state.prefetch,
+            msp: state.sp(Bank::Master),
+            vbr: state.vbr,
+            sfc: state.sfc,
+            dfc: state.dfc,
+            cacr: state.cacr,
+            caar: state.caar,
         }
     }
 
     /// Overwrite the register file — a debugger, a test vector, a snapshot.
     ///
-    /// [`Regs::usp`] and [`Regs::ssp`] are authoritative: `a[7]` is set from
-    /// whichever the **S** bit in `regs.sr` selects, so a caller cannot leave
-    /// the two banks disagreeing.
+    /// [`Regs::usp`], [`Regs::ssp`] and [`Regs::msp`] are authoritative:
+    /// `a[7]` is set from whichever `regs.sr` selects, so a caller cannot
+    /// leave the banks disagreeing. Bits and registers the model does not
+    /// have are dropped.
     pub fn set_regs(&self, regs: Regs) {
         let mut session = self.session.lock();
         let state = &mut session.state;
         state.d = regs.d;
         state.a = regs.a;
-        state.sr = regs.sr & flags::IMPLEMENTED;
-        if state.supervisor() {
-            state.a[7] = regs.ssp;
-            state.other_sp = regs.usp;
-        } else {
-            state.a[7] = regs.usp;
-            state.other_sp = regs.ssp;
-        }
+        state.sr = regs.sr & state.sr_mask();
+        state.banks = [regs.usp, regs.ssp, regs.msp];
+        state.a[7] = state.banks[state.bank_of(state.sr) as usize];
         state.pc = regs.pc;
         state.prefetch = regs.prefetch;
+        // A register file placed from outside is whole: nothing is owed to a
+        // fetch that failed before it arrived.
+        state.poison = [None, None];
+        if self.model.has_010() {
+            state.vbr = regs.vbr;
+            state.sfc = regs.sfc & 7;
+            state.dfc = regs.dfc & 7;
+        }
+        if self.model.has_020() {
+            state.cacr = regs.cacr & 3;
+            state.caar = regs.caar;
+        } else {
+            state.banks[Bank::Master as usize] = 0;
+        }
     }
 
     /// Read one register by name.
@@ -844,6 +1036,13 @@ impl M68k {
     #[must_use]
     pub fn is_halted(&self) -> bool {
         self.session.lock().state.halted
+    }
+
+    /// The vector of the exception the last [`step`](M68k::step) took, if it
+    /// took one — for tests that need to know how a step ended.
+    #[cfg(test)]
+    pub(crate) fn last_exception(&self) -> Option<u8> {
+        self.session.lock().state.last_vector
     }
 
     /// Whether `STOP` has suspended the core until an interrupt.
@@ -1041,9 +1240,10 @@ impl M68k {
         let Some(space) = self.space() else {
             return Vec::new();
         };
-        disasm::disassemble_run(pc, count, |addr| {
+        let mask = self.model.address_mask();
+        disasm::disassemble_run_for(self.model, pc, count, |addr| {
             space
-                .read(u64::from(addr & ADDRESS_MASK), Width::U16, MemAttrs::DEBUG)
+                .read(u64::from(addr & mask), Width::U16, MemAttrs::DEBUG)
                 .ok()
                 .map(|v| v as u16)
         })
@@ -1056,7 +1256,7 @@ pub static CLASS: DeviceClass = DeviceClass {
     // 2: the chunk gained the scheduler debt, without which a restored core
     // runs one instruction free.
     version: 2,
-    summary: "Motorola MC68000 32-bit CPU core, bus-accurate interpreter",
+    summary: "Motorola MC68000/68010/68020 32-bit CPU core, interpreter",
     properties: &[
         PropertySpec {
             name: "requester",
@@ -1069,6 +1269,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "which execution engine; only `interp` exists until phase 5",
+        },
+        PropertySpec {
+            name: "model",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which processor: `68000` (the default) or `68010`",
         },
     ],
     construct: |props| Ok(Box::new(M68k::from_props(props)?)),
@@ -1166,7 +1372,7 @@ impl Device for M68k {
             // A cold start has no defined register contents on real hardware;
             // zeroing them is the reproducible choice, and determinism is a
             // first-class mode (`ROADMAP.md` §0).
-            session.state = State::new();
+            session.state = State::new(self.model);
         } else {
             // A warm reset is a pulse on the RESET pin: the register file
             // keeps its values and only the sequence's own effects apply.
@@ -1182,6 +1388,15 @@ impl Device for M68k {
         }
     }
 
+    /// The chunk, version 2.
+    ///
+    /// A 68000's is exactly what it was before this core knew about any other
+    /// processor, byte for byte. A later model appends a tail — its model, all
+    /// three stack pointers, the control registers and the fault bookkeeping —
+    /// which is a shape no older reader was ever asked for: a snapshot names
+    /// its device's properties, and an older build had no `model` to name. A
+    /// 68010 snapshot offered to a 68000 core fails on the trailing bytes
+    /// rather than loading half of itself.
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         // Fold the `RESET` pin's latch in first. It is not a field of its own
         // in the chunk: `reset_pending` is where it was always going, and a
@@ -1199,7 +1414,13 @@ impl Device for M68k {
         for value in state.a {
             w.write_u32(value)?;
         }
-        w.write_u32(state.other_sp)?;
+        // The stack pointer `a[7]` is not: the 68000's two-bank layout.
+        let other_sp = if state.supervisor() {
+            state.usp()
+        } else {
+            state.ssp()
+        };
+        w.write_u32(other_sp)?;
         w.write_u32(state.pc)?;
         w.write_u16(state.sr)?;
         w.write_u16(state.prefetch[0])?;
@@ -1216,25 +1437,60 @@ impl Device for M68k {
         w.write_u16(vector)?;
         w.write_bool(level_seven)?;
         w.write_u32(resets)?;
+        if self.model == Model::M68000 {
+            return Ok(());
+        }
+        w.write_u8(self.model as u8)?;
+        w.write_u32(state.sp(Bank::User))?;
+        w.write_u32(state.sp(Bank::Interrupt))?;
+        w.write_u32(state.sp(Bank::Master))?;
+        w.write_u32(state.vbr)?;
+        w.write_u8(state.sfc)?;
+        w.write_u8(state.dfc)?;
+        w.write_u32(state.cacr)?;
+        w.write_u32(state.caar)?;
+        w.write_bool(state.replay.is_some())?;
+        let replay = state.replay.unwrap_or(exec::Replay {
+            addr: 0,
+            read: false,
+            width: 0,
+            data: 0,
+        });
+        w.write_u32(replay.addr)?;
+        w.write_bool(replay.read)?;
+        w.write_u8(replay.width)?;
+        w.write_u32(replay.data)?;
+        for slot in state.poison {
+            w.write_bool(slot.is_some())?;
+            w.write_u32(slot.unwrap_or(0))?;
+        }
         Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        let mut state = State::new();
+        let mut state = State::new(self.model);
         for slot in &mut state.d {
             *slot = r.read_u32()?;
         }
         for slot in &mut state.a {
             *slot = r.read_u32()?;
         }
-        state.other_sp = r.read_u32()?;
+        let other_sp = r.read_u32()?;
         state.pc = r.read_u32()?;
-        state.sr = r.read_u16()?;
-        if state.sr & !flags::IMPLEMENTED != 0 {
+        let sr = r.read_u16()?;
+        if sr & !state.sr_mask() != 0 {
             return Err(Error::State(alloc::format!(
-                "status register 0x{:04x} sets bits a 68000 does not implement",
-                state.sr
+                "status register 0x{sr:04x} sets bits a {} does not implement",
+                self.model
             )));
+        }
+        state.sr = sr;
+        // The two-bank reading, which is the whole story on a 68000 and is
+        // overwritten from the tail on anything later.
+        if state.supervisor() {
+            state.banks[Bank::User as usize] = other_sp;
+        } else {
+            state.banks[Bank::Interrupt as usize] = other_sp;
         }
         state.prefetch[0] = r.read_u16()?;
         state.prefetch[1] = r.read_u16()?;
@@ -1259,12 +1515,43 @@ impl Device for M68k {
         }
         let level_seven = r.read_bool()?;
         let resets = r.read_u32()?;
+        if self.model != Model::M68000 {
+            let model = r.read_u8()?;
+            if model != self.model as u8 {
+                return Err(Error::State(alloc::format!(
+                    "a snapshot of model {model} cannot be loaded into a {}",
+                    self.model
+                )));
+            }
+            let usp = r.read_u32()?;
+            let isp = r.read_u32()?;
+            let msp = r.read_u32()?;
+            state.banks = [usp, isp, msp];
+            state.a[7] = state.banks[state.bank_of(state.sr) as usize];
+            state.vbr = r.read_u32()?;
+            state.sfc = r.read_u8()? & 7;
+            state.dfc = r.read_u8()? & 7;
+            state.cacr = r.read_u32()? & 3;
+            state.caar = r.read_u32()?;
+            let has_replay = r.read_bool()?;
+            let replay = exec::Replay {
+                addr: r.read_u32()?,
+                read: r.read_bool()?,
+                width: r.read_u8()?,
+                data: r.read_u32()?,
+            };
+            state.replay = has_replay.then_some(replay);
+            for slot in &mut state.poison {
+                let poisoned = r.read_bool()?;
+                let addr = r.read_u32()?;
+                *slot = poisoned.then_some(addr);
+            }
+        }
         self.session.lock().state = state;
         self.lines.restore((ipl, vector, level_seven, resets));
         Ok(())
     }
 }
-
 impl Initiator for M68k {
     fn requester(&self) -> RequesterId {
         RequesterId(self.requester.load(Ordering::Relaxed))
@@ -1316,6 +1603,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     ClassSchema::new(CLASS.name)
         .prop(PropSchema::new("requester", ValueKind::Uint))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("model", ValueKind::Str).values(&MODEL_NAMES))
         // Inputs only. `BERR`, `HALT`, `BR`/`BG` and `VPA` are real pins with
         // no model behind them: a bus error is reported through the address
         // space's result rather than a wire, and `VPA` is what *not* answering

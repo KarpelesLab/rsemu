@@ -4,11 +4,13 @@
 //! Not a side project: gdb's `disassemble`, the monitor's single-step display
 //! and any trace log need it, and CLAUDE.md forbids describing the instruction
 //! set twice. Everything here reads [`isa::TABLE`](super::isa::TABLE) through
-//! [`decode`]; there is no second opcode list to keep in step, and the
+//! [`decode_for`]; there is no second opcode list to keep in step, and the
 //! extension words are walked in the order the interpreter consumes them.
 //!
 //! Motorola syntax, which is what every 68000 assembler and every listing in
-//! the manual uses: `$1234(A0)`, `$12(A0,D1.w)`, `#$42`, `-(A7)`.
+//! the manual uses: `$1234(A0)`, `$12(A0,D1.w)`, `#$42`, `-(A7)`; and for the
+//! 68020's full extension word the forms of M68000PRM §2.2:
+//! `($1234,A0,D1.l*4)`, `([$10,A0],D1.w*2,$20)`, `([$10,A0,D1.w],$20)`.
 //!
 //! ```
 //! use rsemu::cpu::m68k::disasm::disassemble;
@@ -18,17 +20,29 @@
 //! assert_eq!(format!("{d}"), "MOVE.W $1234(A0),D3");
 //! assert_eq!(d.len, 4);
 //! ```
+//!
+//! # No round trip through an assembler
+//!
+//! There is no assembler in the crate, so the round trip the tests make is the
+//! one that matters to a monitor: for every encoding the interpreter runs to
+//! completion, the length printed here is the distance the program counter
+//! moved (`tests.rs`, one sweep per processor), and the text for each new
+//! instruction and addressing mode is checked against the manual's syntax.
 
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::isa::{Arg, Cond, ILLEGAL_OPCODE, Insn, Mode, Op, Size, decode, ea_of};
+use super::isa::{
+    Arg, Cond, FieldSpec, FullExt, ILLEGAL_OPCODE, Indirect, Insn, Mode, Model, Op, Size, SizeSpec,
+    ctrl, decode_for, ea_of, is_full_format,
+};
 
-/// The most extension words any 68000 instruction can carry.
+/// The most extension words any instruction can carry.
 ///
-/// `MOVE.L ($12345678).L,($12345678).L` is the worst case: two absolute long
-/// operands, four words, and the register-list forms never exceed it.
-pub const MAX_EXT_WORDS: usize = 4;
+/// On a 68000 the worst case is `MOVE.L ($12345678).L,($12345678).L`, four
+/// words. A 68020 `MOVE.L` between two memory-indirect modes with long base
+/// and outer displacements carries five words for each operand, ten.
+pub const MAX_EXT_WORDS: usize = 10;
 
 /// One decoded instruction at a known address.
 ///
@@ -40,7 +54,7 @@ pub struct Disassembled {
     pub pc: u32,
     /// The opcode word.
     pub opcode: u16,
-    /// The row [`decode`] returned for [`Disassembled::opcode`].
+    /// The row [`decode_for`] returned for [`Disassembled::opcode`].
     pub insn: Insn,
     /// The resolved operand size, if the row has one.
     pub size: Option<Size>,
@@ -57,6 +71,8 @@ pub struct Disassembled {
     /// page, gets a best-effort decode with the missing words read as zero
     /// rather than a panic — but it is told.
     pub truncated: bool,
+    /// The processor the words were decoded for.
+    pub model: Model,
 }
 
 impl Disassembled {
@@ -69,6 +85,10 @@ impl Disassembled {
         let base = self.pc.wrapping_add(2);
         match self.insn.op {
             Op::Bra | Op::Bsr | Op::Bcc => {
+                if self.insn.src == Arg::Disp32 {
+                    let disp = (u32::from(self.ext[0]) << 16) | u32::from(self.ext[1]);
+                    return Some(base.wrapping_add(disp));
+                }
                 let byte = self.opcode as i8;
                 if byte == 0 {
                     Some(base.wrapping_add(i32::from(self.ext[0] as i16) as u32))
@@ -106,22 +126,30 @@ pub struct MnemonicOf<'a>(&'a Disassembled);
 impl fmt::Display for MnemonicOf<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let d = self.0;
-        f.write_str(d.insn.op.mnemonic())?;
+        f.write_str(d.insn.op.mnemonic_with(d.ext[0]))?;
         if let Some(cond) = d.condition() {
             // Bcc with cc = T or F is BRA or BSR, which have their own rows,
             // so a condition printed here is always a real one.
             f.write_str(cond.name())?;
         }
-        // The size suffix is noise on instructions that have exactly one.
+        // The size suffix is noise on instructions that have exactly one —
+        // but the 68020 gave several of those a second size, and the long
+        // forms are spelled out so they cannot be read as the old ones.
         let suffixed = matches!(
             d.insn.size,
-            super::isa::SizeSpec::Bits76
-                | super::isa::SizeSpec::Bit6
-                | super::isa::SizeSpec::Bit8
-                | super::isa::SizeSpec::Move
-        );
+            SizeSpec::Bits76 | SizeSpec::Bit6 | SizeSpec::Bit8 | SizeSpec::Move | SizeSpec::Bits109
+        ) || matches!(
+            d.insn.op,
+            Op::Cas | Op::Cas2 | Op::Mull | Op::Divl | Op::Extb | Op::Trapcc
+        ) || (matches!(d.insn.op, Op::Chk | Op::Link) && d.size == Some(Size::Long))
+            || d.insn.src == Arg::Disp32;
         if suffixed && let Some(size) = d.size {
+            if d.insn.op == Op::Trapcc && d.insn.src == Arg::None {
+                return Ok(());
+            }
             write!(f, ".{}", size.suffix().to_ascii_uppercase())?;
+        } else if d.insn.src == Arg::Disp32 {
+            f.write_str(".L")?;
         }
         Ok(())
     }
@@ -142,6 +170,9 @@ impl fmt::Display for Disassembled {
         if matches!(self.insn.op, Op::LineA | Op::LineF) {
             return write!(f, " ${:04x}", self.opcode);
         }
+        if let Some(special) = self.special_operands(f) {
+            return special;
+        }
         // Two orders are in play and they are not the same one. Extension
         // words must be *consumed* in the order the instruction encodes them —
         // MOVEM's register-list word comes before the address it reads from,
@@ -149,6 +180,7 @@ impl fmt::Display for Disassembled {
         // *printed* source first. Resolving them in encoding order and then
         // printing by slot is what keeps both true.
         let mut cursor = Cursor::new(self);
+        cursor.at = usize::from(self.insn.ext);
         let mut resolved: [Option<Operand>; 2] = [None, None];
         for (slot, arg) in self.operand_order() {
             resolved[slot as usize] = cursor.operand(arg);
@@ -182,6 +214,141 @@ impl Disassembled {
             [(Slot::Src, insn.src), (Slot::Dst, insn.dst)]
         }
     }
+
+    /// The instructions whose operands live in their own extension word and
+    /// read in an order no pair of slots can express: `MULS.L D0,D1:D2`,
+    /// `BFEXTU (A0){4:8},D1`, `CAS2.L D0:D1,D2:D3,(A0):(A1)`.
+    fn special_operands(&self, f: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        let word = self.ext[0];
+        let op = self.insn.op;
+        let ea = |d: &Disassembled| {
+            let mut cursor = Cursor::new(d);
+            cursor.at = usize::from(d.insn.ext);
+            cursor.operand(Arg::Ea)
+        };
+        let result = match op {
+            Op::Movec => {
+                let control = Operand::Control(word & 0x0fff);
+                let general = Operand::general(word >> 12);
+                if self.insn.dst == Arg::Ctrl {
+                    write!(f, " {general},{control}")
+                } else {
+                    write!(f, " {control},{general}")
+                }
+            }
+            Op::Moves => {
+                let general = Operand::general(word >> 12);
+                let Some(ea) = ea(self) else {
+                    return Some(Ok(()));
+                };
+                if word & 0x0800 != 0 {
+                    write!(f, " {general},{ea}")
+                } else {
+                    write!(f, " {ea},{general}")
+                }
+            }
+            Op::Mull | Op::Divl => {
+                let Some(ea) = ea(self) else {
+                    return Some(Ok(()));
+                };
+                let low = (word >> 12) & 7;
+                let high = word & 7;
+                let pair = if op == Op::Mull {
+                    word & 0x0400 != 0
+                } else {
+                    word & 0x0400 != 0 || high != low
+                };
+                if pair {
+                    write!(f, " {ea},D{high}:D{low}")
+                } else {
+                    write!(f, " {ea},D{low}")
+                }
+            }
+            Op::Cas => {
+                let Some(ea) = ea(self) else {
+                    return Some(Ok(()));
+                };
+                write!(f, " D{},D{},{ea}", word & 7, (word >> 6) & 7)
+            }
+            Op::Cas2 => {
+                let second = self.ext[1];
+                let reg = |w: u16| Operand::general(w >> 12);
+                write!(
+                    f,
+                    " D{}:D{},D{}:D{},({}):({})",
+                    word & 7,
+                    second & 7,
+                    (word >> 6) & 7,
+                    (second >> 6) & 7,
+                    reg(word),
+                    reg(second)
+                )
+            }
+            Op::Bftst | Op::Bfchg | Op::Bfclr | Op::Bfset => {
+                let Some(ea) = ea(self) else {
+                    return Some(Ok(()));
+                };
+                write!(f, " {ea}{}", Field(FieldSpec::decode(word)))
+            }
+            Op::Bfextu | Op::Bfexts | Op::Bfffo => {
+                let Some(ea) = ea(self) else {
+                    return Some(Ok(()));
+                };
+                let spec = FieldSpec::decode(word);
+                write!(f, " {ea}{},D{}", Field(spec), spec.reg)
+            }
+            Op::Bfins => {
+                let Some(ea) = ea(self) else {
+                    return Some(Ok(()));
+                };
+                let spec = FieldSpec::decode(word);
+                write!(f, " D{},{ea}{}", spec.reg, Field(spec))
+            }
+            Op::Callm => {
+                let Some(ea) = ea(self) else {
+                    return Some(Ok(()));
+                };
+                write!(f, " #${:x},{ea}", word & 0xff)
+            }
+            Op::Rtm => write!(f, " {}", Operand::general(self.opcode & 0xf)),
+            Op::Pack | Op::Unpk => {
+                let memory = self.opcode & 8 != 0;
+                let (src, dst) = ((self.opcode & 7) as u8, ((self.opcode >> 9) & 7) as u8);
+                if memory {
+                    write!(f, " -(A{src}),-(A{dst}),#${word:x}")
+                } else {
+                    write!(f, " D{src},D{dst},#${word:x}")
+                }
+            }
+            Op::Extb => write!(f, " D{}", self.opcode & 7),
+            _ => return None,
+        };
+        Some(result)
+    }
+}
+
+/// A bit field's `{offset:width}`, each part immediate or a data register.
+struct Field(FieldSpec);
+
+impl fmt::Display for Field {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let spec = self.0;
+        f.write_str("{")?;
+        if spec.offset_reg {
+            write!(f, "D{}", spec.offset)?;
+        } else {
+            write!(f, "{}", spec.offset)?;
+        }
+        f.write_str(":")?;
+        if spec.width_reg {
+            write!(f, "D{}", spec.width)?;
+        } else {
+            // An immediate width of zero is 32 (M68000PRM, *BFTST*).
+            let width = if spec.width == 0 { 32 } else { spec.width };
+            write!(f, "{width}")?;
+        }
+        f.write_str("}")
+    }
 }
 
 /// Walks the extension words while formatting.
@@ -199,6 +366,12 @@ impl<'a> Cursor<'a> {
         let word = self.d.ext.get(self.at).copied().unwrap_or(0);
         self.at += 1;
         word
+    }
+
+    fn next_long(&mut self) -> u32 {
+        let hi = self.next();
+        let lo = self.next();
+        (u32::from(hi) << 16) | u32::from(lo)
     }
 
     /// Format one operand, consuming the extension words it owns.
@@ -233,14 +406,11 @@ impl<'a> Cursor<'a> {
             }
             Arg::QuickByte => Operand::Imm(i32::from(opcode as i8) as u32),
             Arg::Vector => Operand::Imm(u32::from(opcode & 0xf)),
+            Arg::Vector3 => Operand::Imm(u32::from(opcode & 7)),
             Arg::Imm => Operand::Imm(match size {
                 Size::Byte => u32::from(self.next() & 0xff),
                 Size::Word => u32::from(self.next()),
-                Size::Long => {
-                    let hi = self.next();
-                    let lo = self.next();
-                    (u32::from(hi) << 16) | u32::from(lo)
-                }
+                Size::Long => self.next_long(),
             }),
             Arg::BitNumber => Operand::Imm(u32::from(self.next() & 0xff)),
             Arg::Disp8 => {
@@ -258,6 +428,19 @@ impl<'a> Cursor<'a> {
                     _ => Operand::SignedImm(i32::from(word as i16)),
                 }
             }
+            Arg::Disp32 => {
+                let value = self.next_long();
+                match self.d.insn.op {
+                    Op::Bra | Op::Bsr | Op::Bcc => {
+                        Operand::Target(self.d.branch_target().unwrap_or(self.d.pc))
+                    }
+                    _ => Operand::SignedImm(value as i32),
+                }
+            }
+            Arg::TrapData => Operand::Imm(match opcode & 7 {
+                2 => u32::from(self.next()),
+                _ => self.next_long(),
+            }),
             Arg::Ccr => Operand::Ccr,
             Arg::Sr => Operand::Sr,
             Arg::Usp => Operand::Usp,
@@ -271,6 +454,8 @@ impl<'a> Cursor<'a> {
             }
             Arg::RegList => Operand::RegList(self.next(), self.d.predecrement_list()),
             Arg::MovepEa => Operand::Disp16(i32::from(self.next() as i16), (opcode & 7) as u8),
+            Arg::Ctrl => Operand::Control(self.d.ext[0] & 0x0fff),
+            Arg::ExtReg => Operand::general(self.d.ext[0] >> 12),
             Arg::Ea | Arg::EaDst => {
                 let (mode, reg) = ea_of(arg, opcode)?;
                 self.effective(mode, reg, size)
@@ -286,33 +471,48 @@ impl<'a> Cursor<'a> {
             Mode::PostInc => Operand::PostInc(reg),
             Mode::PreDec => Operand::PreDec(reg),
             Mode::Disp16 => Operand::Disp16(i32::from(self.next() as i16), reg),
-            Mode::Index8 => {
+            Mode::Index8 | Mode::PcIndex8 => {
+                let base = (mode == Mode::Index8).then_some(reg);
                 let ext = self.next();
-                Operand::Index(i32::from(ext as i8), Some(reg), Index::from_ext(ext))
+                if is_full_format(self.d.model, ext) {
+                    return self.full(base, ext);
+                }
+                let mut index = Index::from_ext(ext);
+                if !self.d.model.has_020() {
+                    // A 68000 ignores the scale bits, so printing them would
+                    // describe an address it does not compute.
+                    index.scale = 0;
+                }
+                Operand::Index(i32::from(ext as i8), base, index)
             }
             // Sign-extended, because $ff00.w addresses $ffff00 and a monitor
             // that prints the raw word sends the reader to the wrong place.
             Mode::AbsShort => Operand::AbsShort(i32::from(self.next() as i16) as u32),
-            Mode::AbsLong => {
-                let hi = self.next();
-                let lo = self.next();
-                Operand::AbsLong((u32::from(hi) << 16) | u32::from(lo))
-            }
+            Mode::AbsLong => Operand::AbsLong(self.next_long()),
             Mode::PcDisp16 => Operand::PcDisp(i32::from(self.next() as i16)),
-            Mode::PcIndex8 => {
-                let ext = self.next();
-                Operand::Index(i32::from(ext as i8), None, Index::from_ext(ext))
-            }
             Mode::Imm => Operand::Imm(match size {
                 Size::Byte => u32::from(self.next() & 0xff),
                 Size::Word => u32::from(self.next()),
-                Size::Long => {
-                    let hi = self.next();
-                    let lo = self.next();
-                    (u32::from(hi) << 16) | u32::from(lo)
-                }
+                Size::Long => self.next_long(),
             }),
         }
+    }
+
+    /// A 68020 full-format extension word and the displacements after it.
+    fn full(&mut self, base: Option<u8>, word: u16) -> Operand {
+        let Some(full) = FullExt::decode(word) else {
+            return Operand::Reserved(word);
+        };
+        let mut read = |words: u8| -> i32 {
+            match words {
+                1 => i32::from(self.next() as i16),
+                2 => self.next_long() as i32,
+                _ => 0,
+            }
+        };
+        let bd = read(full.bd_words);
+        let od = read(full.od_words);
+        Operand::Full(FullOperand { base, full, bd, od })
     }
 }
 
@@ -329,6 +529,8 @@ struct Index {
     addr: bool,
     reg: u8,
     long: bool,
+    /// Bits 10–9, the 68020's scale factor: ×1, ×2, ×4, ×8.
+    scale: u8,
 }
 
 impl Index {
@@ -337,6 +539,7 @@ impl Index {
             addr: ext & 0x8000 != 0,
             reg: ((ext >> 12) & 7) as u8,
             long: ext & 0x0800 != 0,
+            scale: ((ext >> 9) & 3) as u8,
         }
     }
 }
@@ -349,7 +552,75 @@ impl fmt::Display for Index {
             if self.addr { 'A' } else { 'D' },
             self.reg,
             if self.long { 'l' } else { 'w' }
-        )
+        )?;
+        if self.scale != 0 {
+            write!(f, "*{}", 1 << self.scale)?;
+        }
+        Ok(())
+    }
+}
+
+/// A full-format effective address, ready to print.
+#[derive(Debug, Clone, Copy)]
+struct FullOperand {
+    /// The base register, or `None` for the program counter.
+    base: Option<u8>,
+    full: FullExt,
+    bd: i32,
+    od: i32,
+}
+
+impl fmt::Display for FullOperand {
+    /// M68000PRM §2.2.3's syntax: the parts that are present, in order,
+    /// separated by commas; a suppressed base prints as `ZAn` or `ZPC` so the
+    /// mode (and so the PC-relative base) stays visible.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let full = self.full;
+        let base = match (self.base, full.base_suppressed) {
+            (Some(n), false) => alloc::format!("A{n}"),
+            (Some(n), true) => alloc::format!("ZA{n}"),
+            (None, false) => "PC".into(),
+            (None, true) => "ZPC".into(),
+        };
+        let index = (!full.index_suppressed).then_some(Index {
+            addr: full.index_addr,
+            reg: full.index_reg,
+            long: full.index_long,
+            scale: full.scale,
+        });
+        let mut inner: Vec<alloc::string::String> = Vec::new();
+        if full.bd_words != 0 {
+            inner.push(alloc::format!("{}", Signed(self.bd)));
+        }
+        inner.push(base);
+        match full.indirect {
+            Indirect::None => {
+                if let Some(index) = index {
+                    inner.push(alloc::format!("{index}"));
+                }
+                write!(f, "({})", inner.join(","))
+            }
+            Indirect::Pre => {
+                if let Some(index) = index {
+                    inner.push(alloc::format!("{index}"));
+                }
+                write!(f, "([{}]", inner.join(","))?;
+                if full.od_words != 0 {
+                    write!(f, ",{}", Signed(self.od))?;
+                }
+                f.write_str(")")
+            }
+            Indirect::Post => {
+                write!(f, "([{}]", inner.join(","))?;
+                if let Some(index) = index {
+                    write!(f, ",{index}")?;
+                }
+                if full.od_words != 0 {
+                    write!(f, ",{}", Signed(self.od))?;
+                }
+                f.write_str(")")
+            }
+        }
     }
 }
 
@@ -363,6 +634,10 @@ enum Operand {
     PreDec(u8),
     Disp16(i32, u8),
     Index(i32, Option<u8>, Index),
+    Full(FullOperand),
+    /// A full-format word Table 2-2 reserves, which the interpreter treats as
+    /// an illegal instruction.
+    Reserved(u16),
     AbsShort(u32),
     AbsLong(u32),
     PcDisp(i32),
@@ -373,6 +648,17 @@ enum Operand {
     Ccr,
     Sr,
     Usp,
+    /// A `MOVEC` control register code.
+    Control(u16),
+    /// `D0`-`D7` or `A0`-`A7` by a four-bit number.
+    General(u8),
+}
+
+impl Operand {
+    /// The general register a four-bit field names.
+    const fn general(field: u16) -> Operand {
+        Operand::General((field & 0xf) as u8)
+    }
 }
 
 impl fmt::Display for Operand {
@@ -388,6 +674,8 @@ impl fmt::Display for Operand {
                 Some(n) => write!(f, "{}(A{n},{index})", Signed(d)),
                 None => write!(f, "{}(PC,{index})", Signed(d)),
             },
+            Operand::Full(full) => full.fmt(f),
+            Operand::Reserved(word) => write!(f, "<reserved ${word:04x}>"),
             Operand::AbsShort(v) => write!(f, "${v:08x}.w"),
             Operand::AbsLong(v) => write!(f, "${v:08x}.l"),
             Operand::PcDisp(d) => write!(f, "{}(PC)", Signed(d)),
@@ -398,6 +686,11 @@ impl fmt::Display for Operand {
             Operand::Ccr => f.write_str("CCR"),
             Operand::Sr => f.write_str("SR"),
             Operand::Usp => f.write_str("USP"),
+            Operand::Control(code) => match ctrl::name(code) {
+                Some(name) => f.write_str(name),
+                None => write!(f, "${code:03x}"),
+            },
+            Operand::General(n) => write_reg_name(f, usize::from(n)),
         }
     }
 }
@@ -465,17 +758,24 @@ fn write_reg_name(f: &mut fmt::Formatter<'_>, index: usize) -> fmt::Result {
     }
 }
 
-/// Disassemble one instruction from a slice of words.
+/// Disassemble one instruction from a slice of words, for a 68000.
 ///
 /// Words the instruction needs but the slice does not have are read as zero
 /// and [`Disassembled::truncated`] is set, so a monitor listing to the end of
 /// a buffer degrades rather than panics.
 #[must_use]
 pub fn disassemble(pc: u32, words: &[u16]) -> Disassembled {
+    disassemble_for(Model::M68000, pc, words)
+}
+
+/// Disassemble one instruction from a slice of words, for a given processor.
+#[must_use]
+pub fn disassemble_for(model: Model, pc: u32, words: &[u16]) -> Disassembled {
     let opcode = words.first().copied().unwrap_or(0);
-    let insn = decode(opcode);
+    let insn = decode_for(model, opcode);
     let size = insn.size.resolve(opcode);
-    let needed = ext_words(insn, opcode, size.unwrap_or(Size::Word));
+    let word_at = |i: usize| words.get(i + 1).copied().unwrap_or(0);
+    let needed = ext_words(model, insn, opcode, size.unwrap_or(Size::Word), word_at);
     let mut ext = [0u16; MAX_EXT_WORDS];
     let mut truncated = words.is_empty();
     for (i, slot) in ext.iter_mut().enumerate().take(needed) {
@@ -493,17 +793,30 @@ pub fn disassemble(pc: u32, words: &[u16]) -> Disassembled {
         ext_len: needed as u8,
         len: 2 + 2 * needed as u8,
         truncated,
+        model,
     }
 }
 
 /// How many extension words an encoding carries.
 ///
-/// Derived from the row and the addressing modes, which is the same
-/// calculation the interpreter's prefetch slides perform — a length the
-/// disassembler computed independently would drift.
-fn ext_words(insn: Insn, opcode: u16, size: Size) -> usize {
-    let mut count = 0usize;
-    for arg in [insn.src, insn.dst] {
+/// Derived from the row, the addressing modes and — on a 68020, where an
+/// indexed mode's first extension word says how many follow it — the words
+/// themselves, walked in the order the interpreter consumes them. A length
+/// the disassembler computed independently would drift.
+fn ext_words(
+    model: Model,
+    insn: Insn,
+    opcode: u16,
+    size: Size,
+    word_at: impl Fn(usize) -> u16,
+) -> usize {
+    let mut count = usize::from(insn.ext);
+    let order = if insn.op == Op::Movem && insn.dst == Arg::RegList {
+        [insn.dst, insn.src]
+    } else {
+        [insn.src, insn.dst]
+    };
+    for arg in order {
         count += match arg {
             Arg::Imm => {
                 if size == Size::Long {
@@ -514,7 +827,19 @@ fn ext_words(insn: Insn, opcode: u16, size: Size) -> usize {
             }
             Arg::Disp16 | Arg::RegList | Arg::MovepEa | Arg::BitNumber => 1,
             Arg::Disp8 => usize::from(opcode as i8 == 0),
+            Arg::Disp32 => 2,
+            Arg::TrapData => match opcode & 7 {
+                2 => 1,
+                3 => 2,
+                _ => 0,
+            },
             Arg::Ea | Arg::EaDst => match ea_of(arg, opcode) {
+                Some((Mode::Index8 | Mode::PcIndex8, _)) => {
+                    // A reserved full-format word takes the illegal
+                    // instruction exception before anything follows it, so
+                    // the instruction is as long as that word.
+                    super::isa::index_ext_words(model, word_at(count)).unwrap_or(1) as usize
+                }
                 Some((mode, _)) => mode.ext_words(size) as usize,
                 None => 0,
             },
@@ -525,11 +850,21 @@ fn ext_words(insn: Insn, opcode: u16, size: Size) -> usize {
 }
 
 /// Disassemble `count` instructions starting at `pc`, reading guest memory
-/// through `read_word`.
+/// through `read_word`, for a 68000.
 ///
 /// `read_word` returns `None` for a word that cannot be read, which stops the
 /// run rather than inventing instructions out of a hole in the memory map.
 pub fn disassemble_run(
+    pc: u32,
+    count: usize,
+    read_word: impl FnMut(u32) -> Option<u16>,
+) -> Vec<Disassembled> {
+    disassemble_run_for(Model::M68000, pc, count, read_word)
+}
+
+/// [`disassemble_run`] for a given processor.
+pub fn disassemble_run_for(
+    model: Model,
     pc: u32,
     count: usize,
     mut read_word: impl FnMut(u32) -> Option<u16>,
@@ -551,7 +886,7 @@ pub fn disassemble_run(
         if have == 0 {
             break;
         }
-        let d = disassemble(at, &words[..have]);
+        let d = disassemble_for(model, at, &words[..have]);
         at = at.wrapping_add(u32::from(d.len));
         out.push(d);
     }

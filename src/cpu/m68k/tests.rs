@@ -1254,6 +1254,7 @@ fn the_disassembler_and_the_interpreter_agree_on_every_instruction_length() {
         pc: 0x400,
         sr: flags::S | flags::IPL,
         prefetch: [0, 0],
+        ..Regs::default()
     };
     base.a[7] = 0x2000;
 

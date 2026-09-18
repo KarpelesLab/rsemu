@@ -68,6 +68,16 @@
 //! user mode and the privilege violation. Every vector runs in supervisor
 //! state with the interrupt mask at seven and tracing off.
 //!
+//! # The other models
+//!
+//! The corpus is the 68000's; there is none of this kind for the 68010 or the
+//! 68020. `differential_against_the_68000` runs every vector through the
+//! later model as well, from the same initial state, and requires every
+//! difference from the 68000's result to fall into a category a manual
+//! documents — a format word in a frame, `RTE` reading one, `CLR` no longer
+//! reading its destination. Anything else fails the test and is printed. The
+//! same variables drive it.
+//!
 //! # Why the JSON parser is in here
 //!
 //! The dependency policy allows no `serde`, and this is one of two things in
@@ -86,7 +96,8 @@ use crate::core::space::{
 use crate::core::sync::{self, LockRank};
 use crate::core::value::Endian;
 
-use super::{ADDRESS_MASK, Config, M68k, Regs, flags};
+use super::isa::{Arg, Mode, Op, Size, decode_for, ea_of};
+use super::{ADDRESS_MASK, Config, M68k, Model, Regs, flags};
 
 /// Instruction families this core is knowingly wrong about, and why.
 ///
@@ -814,6 +825,495 @@ fn single_step_tests() {
             "families with a different bus trace: {trace_failures:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The differential: the same vectors through a later processor
+// ---------------------------------------------------------------------------
+//
+// There is no SingleStepTests corpus for the 68010 or the 68020, so the
+// evidence for those models is built the other way round: every 68000 vector
+// is run through the 68000 core — which the corpus has just shown to be exact
+// — and through the other model, from the same initial state, and every place
+// the two disagree must be one the manuals *say* they disagree. A difference
+// that fits no documented category fails the test and is printed.
+//
+// The 68020 side runs as a 68EC020. The corpus is a 24-bit world — its
+// registers are full of high bytes the 68000 simply does not drive — and the
+// only difference between the two packages is the eight address pins that
+// would take those accesses somewhere the vectors never describe (MC68020UM
+// §1). Everything else is the 68020.
+
+/// One core on its own recording bus.
+struct Rig {
+    bus: alloc::sync::Arc<Bus>,
+    cpu: M68k,
+}
+
+impl Rig {
+    fn new(model: Model) -> Rig {
+        let bus = alloc::sync::Arc::new(Bus::new());
+        let space = AddressSpace::new("cpu", 24)
+            .with_endian(Endian::Big)
+            .with_unassigned(UnassignedPolicy::FAULT);
+        space
+            .topology()
+            .map(
+                Region::io("ram", u64::from(ADDRESS_MASK) + 1, bus.clone()),
+                0,
+            )
+            .expect("16 MiB fits in 24 bits");
+        let cpu = M68k::new(Config::default().with_model(model));
+        cpu.attach_space(alloc::sync::Arc::new(space));
+        Rig { bus, cpu }
+    }
+
+    /// Run one vector from its initial state and report how it ended.
+    fn run(&self, initial: &Json) -> Outcome {
+        self.bus.rewind();
+        for cell in initial.get("ram").expect("ram").arr() {
+            let cell = cell.arr();
+            self.bus.poke(cell[0].num() as u32, cell[1].num() as u8);
+        }
+        // The pokes above are the vector's memory, not something the core
+        // did; only what the step writes counts as its effect.
+        self.bus.0.lock().dirty.clear();
+        self.cpu.set_reset_pending(false);
+        self.cpu.resume();
+        self.cpu.set_regs(regs_of(initial));
+        self.bus.take_log();
+        let cycles = self.cpu.step();
+        let regs = self.cpu.regs();
+        let writes = {
+            let state = self.bus.0.lock();
+            state
+                .dirty
+                .keys()
+                .map(|&addr| (addr, state.memory[addr as usize]))
+                .collect()
+        };
+        Outcome {
+            regs,
+            writes,
+            cycles,
+            trace: self.bus.take_log(),
+            vector: self.cpu.last_exception(),
+        }
+    }
+}
+
+/// How one step ended.
+struct Outcome {
+    regs: Regs,
+    /// Every byte the step wrote, with its final value.
+    writes: BTreeMap<u32, u8>,
+    cycles: u64,
+    trace: Vec<Access>,
+    vector: Option<u8>,
+}
+
+impl Outcome {
+    /// The registers a 68000 has, which is all the corpus describes.
+    fn visible(&self) -> (Regs, &BTreeMap<u32, u8>) {
+        let r = self.regs;
+        (
+            Regs {
+                d: r.d,
+                a: r.a,
+                usp: r.usp,
+                ssp: r.ssp,
+                pc: r.pc,
+                sr: r.sr,
+                prefetch: r.prefetch,
+                ..Regs::default()
+            },
+            &self.writes,
+        )
+    }
+}
+
+/// The instruction words a vector starts with: the queue, then memory.
+fn words_of(initial: &Json) -> [u16; 12] {
+    let regs = regs_of(initial);
+    let mut ram = BTreeMap::new();
+    for cell in initial.get("ram").expect("ram").arr() {
+        let cell = cell.arr();
+        ram.insert(cell[0].num() as u32 & ADDRESS_MASK, cell[1].num() as u8);
+    }
+    let mut words = [0u16; 12];
+    words[0] = regs.prefetch[0];
+    words[1] = regs.prefetch[1];
+    for (i, slot) in words.iter_mut().enumerate().skip(2) {
+        let at = regs.pc.wrapping_add(2 * i as u32) & ADDRESS_MASK;
+        let hi = ram.get(&at).copied().unwrap_or(0);
+        let lo = ram.get(&((at + 1) & ADDRESS_MASK)).copied().unwrap_or(0);
+        *slot = (u16::from(hi) << 8) | u16::from(lo);
+    }
+    words
+}
+
+/// Why a later model's result may differ from the 68000's, with the manual
+/// that says so. The differential test counts vectors under these names.
+mod why {
+    pub(super) const FRAME: &str =
+        "exception frame carries a format word (MC68000UM Fig. 6-6; MC68020UM Table 6-5)";
+    pub(super) const GROUP0_010: &str =
+        "bus/address error frame is format $8, 29 words (MC68000UM Fig. 6-8)";
+    pub(super) const NO_ADDRESS_ERROR: &str = "68020 accesses misaligned operands; only odd fetches take an address error (MC68020UM §6.1.3)";
+    pub(super) const RTE_FORMAT: &str =
+        "RTE reads and checks a format word (MC68000UM §6.4; MC68020UM §6.1.12)";
+    pub(super) const INDEX_020: &str =
+        "68020 applies the brief word's scale and bit 8's full format (M68000PRM §2.2.3)";
+    pub(super) const BCC_L: &str =
+        "68020 reads a $FF branch displacement as a 32-bit one (M68000PRM, Bcc)";
+    pub(super) const MOVEM_020: &str =
+        "68020 MOVEM -(An) stores An less one operand (M68000PRM, MOVEM)";
+    pub(super) const NO_RMW_READ: &str =
+        "68010 CLR/Scc/MOVE from SR do not read the destination (MC68000UM Tables 9-9, 9-10, 9-18)";
+    pub(super) const SCC_FOUR: &str =
+        "68010 Scc and MOVE from SR to Dn take four clocks (MC68000UM Tables 9-9, 9-18)";
+    pub(super) const FAULT_ON_WRITE: &str =
+        "68010 CLR's address error comes on the write, after the flags (no read first; Table 9-10)";
+    pub(super) const SR_020: &str =
+        "68020 SR has storage for T0 and M, and M selects the master stack (MC68020UM §1.3.2)";
+}
+
+/// Explain a difference between the 68000's outcome and another model's, or
+/// say that nothing documented explains it.
+fn explain(
+    model: Model,
+    words: &[u16; 12],
+    rte_format: u16,
+    reference: &Outcome,
+    other: &Outcome,
+) -> core::result::Result<Option<&'static str>, String> {
+    let opcode = words[0];
+    let insn = decode_for(Model::M68000, opcode);
+    let state_equal = reference.visible() == other.visible();
+    let is_020 = model.has_020();
+
+    if state_equal {
+        if is_020 {
+            // The 68020's cycles come from its own tables and its bus from a
+            // different pipeline; only its state is compared.
+            return Ok(None);
+        }
+        if reference.cycles == other.cycles && reference.trace == other.trace {
+            return Ok(None);
+        }
+        let memory_dst = matches!(ea_of(Arg::Ea, opcode), Some((mode, _)) if mode.is_memory());
+        match insn.op {
+            Op::Clr | Op::Scc | Op::MoveFromSr if memory_dst => return Ok(Some(why::NO_RMW_READ)),
+            Op::Scc | Op::MoveFromSr
+                if other.cycles + 2 == reference.cycles && other.trace == reference.trace =>
+            {
+                return Ok(Some(why::SCC_FOUR));
+            }
+            _ => {}
+        }
+        return Err(format!(
+            "same state, different bus: cycles {} against {}",
+            other.cycles, reference.cycles
+        ));
+    }
+
+    if is_020 && reference.vector == Some(3) && other.vector != Some(3) {
+        return Ok(Some(why::NO_ADDRESS_ERROR));
+    }
+    if is_020 && matches!(insn.op, Op::Bra | Op::Bsr | Op::Bcc) && opcode & 0xff == 0xff {
+        return Ok(Some(why::BCC_L));
+    }
+    if is_020 && uses_020_index_bits(words) {
+        return Ok(Some(why::INDEX_020));
+    }
+    if insn.op == Op::Rte && reference.vector.is_none() {
+        // Format 0 is the four-word frame, which returns exactly as the 68000
+        // does and pops two bytes more; anything this model does not define is
+        // a format error that leaves the stack alone.
+        let (mut r, _) = reference.visible();
+        let (mut o, _) = other.visible();
+        let fine = match rte_format {
+            0 => {
+                // A7 is whichever stack the popped status word selects, so
+                // the supervisor stack pointer is what to compare; and a
+                // 68020 keeps the M and T0 bits the 68000 drops.
+                let popped = o.ssp == r.ssp.wrapping_add(2);
+                r.a[7] = 0;
+                o.a[7] = 0;
+                r.ssp = 0;
+                o.ssp = 0;
+                o.sr &= !(flags::M | flags::T0);
+                popped && r == o
+            }
+            _ => other.vector == Some(super::vector::FORMAT_ERROR),
+        };
+        if fine {
+            return Ok(Some(why::RTE_FORMAT));
+        }
+        return Err(format!(
+            "RTE with format {rte_format} did not do what the format says; vectors {:?} {:?}\n{}",
+            reference.vector,
+            other.vector,
+            diff_regs(&reference.regs, &other.regs)
+        ));
+    }
+    if is_020
+        && matches!(
+            insn.op,
+            Op::MoveToSr | Op::OriToSr | Op::AndiToSr | Op::EoriToSr
+        )
+        && other.regs.sr & (flags::M | flags::T0) != 0
+    {
+        let (mut r, _) = reference.visible();
+        let (mut o, _) = other.visible();
+        o.sr &= !(flags::M | flags::T0);
+        // With M set, A7 is the master stack pointer the corpus never
+        // initialised; the interrupt stack pointer is where the 68000's
+        // supervisor stack pointer went.
+        r.a[7] = 0;
+        o.a[7] = 0;
+        if r == o && reference.writes == other.writes {
+            return Ok(Some(why::SR_020));
+        }
+    }
+    if is_020
+        && insn.op == Op::Movem
+        && insn.dst == Arg::Ea
+        && let Some((Mode::PreDec, reg)) = ea_of(Arg::Ea, opcode)
+        && words[1] & (0x80 >> reg) != 0
+    {
+        return Ok(Some(why::MOVEM_020));
+    }
+    if is_020 && insn.op == Op::Rte && reference.vector == other.vector {
+        // An RTE to an odd address: both take the address error, but the
+        // 68020's frame goes on whichever stack the status word it popped
+        // selects — the master stack if that word had M set.
+        return Ok(Some(why::RTE_FORMAT));
+    }
+    if let (Some(a), Some(b)) = (reference.vector, other.vector)
+        && a == b
+    {
+        // The same exception, so only the frame may differ: every register
+        // but the stack pointer the frame went on, and memory only inside
+        // the frames.
+        let (mut r, _) = reference.visible();
+        let (mut o, _) = other.visible();
+        let (r_sp, o_sp) = (r.a[7], o.a[7]);
+        r.a[7] = 0;
+        o.a[7] = 0;
+        r.ssp = 0;
+        o.ssp = 0;
+        let moved_fault = model == Model::M68010
+            && a == 3
+            && matches!(insn.op, Op::Clr | Op::Scc | Op::MoveFromSr);
+        if moved_fault {
+            r.sr &= !flags::CCR;
+            o.sr &= !flags::CCR;
+        }
+        if r != o {
+            return Err(format!(
+                "vector {a} in both, but registers other than the stack differ:\n{}",
+                diff_regs(&r, &o)
+            ));
+        }
+        // Each frame runs from its stack pointer up by its own size: the
+        // 68000's six or fourteen bytes, and the later model's by format
+        // (MC68000UM Figs. 6-6, 6-8; MC68020UM Table 6-5).
+        let other_size = match (model.has_020(), a) {
+            (false, 0..=3) => 58,
+            (false, _) => 8,
+            (true, 2) => 92,
+            (true, 3) => 32,
+            (true, 5..=7 | 9) => 12,
+            (true, _) => 8,
+        };
+        let low = r_sp.min(o_sp);
+        let high = r_sp
+            .wrapping_add(if a <= 3 { 14 } else { 6 })
+            .max(o_sp.wrapping_add(other_size));
+        let inside = |addr: &u32| (low..high).contains(addr);
+        let mut touched: Vec<u32> = reference.writes.keys().copied().collect();
+        touched.extend(other.writes.keys().copied());
+        let stray = touched
+            .iter()
+            .find(|addr| !inside(addr) && reference.writes.get(addr) != other.writes.get(addr));
+        if let Some(addr) = stray {
+            return Err(format!(
+                "frame difference outside the frames, at {addr:06x}"
+            ));
+        }
+        return Ok(Some(if moved_fault {
+            why::FAULT_ON_WRITE
+        } else if a <= 3 && model == Model::M68010 {
+            why::GROUP0_010
+        } else {
+            why::FRAME
+        }));
+    }
+    Err(format!(
+        "exception {:?} on the 68000, {:?} on the {model}",
+        reference.vector, other.vector
+    ))
+}
+
+/// Whether an instruction's indexed operand uses the extension-word bits a
+/// 68000 ignores and a 68020 does not: the scale in bits 10–9 and the
+/// full-format flag in bit 8.
+fn uses_020_index_bits(words: &[u16; 12]) -> bool {
+    let d = super::disasm::disassemble(0, words);
+    let insn = d.insn;
+    let mut at = usize::from(insn.ext);
+    let order = if insn.op == Op::Movem && insn.dst == Arg::RegList {
+        [insn.dst, insn.src]
+    } else {
+        [insn.src, insn.dst]
+    };
+    let size = d.size.unwrap_or(Size::Word);
+    for arg in order {
+        match arg {
+            Arg::Ea | Arg::EaDst => match ea_of(arg, d.opcode) {
+                Some((Mode::Index8 | Mode::PcIndex8, _)) => {
+                    if d.ext[at] & 0x0700 != 0 {
+                        return true;
+                    }
+                    at += 1;
+                }
+                Some((mode, _)) => at += mode.ext_words(size) as usize,
+                None => {}
+            },
+            Arg::Imm => at += if size == Size::Long { 2 } else { 1 },
+            Arg::Disp16 | Arg::RegList | Arg::MovepEa | Arg::BitNumber => at += 1,
+            Arg::Disp8 => at += usize::from(d.opcode as i8 == 0),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// What the differential found for one model.
+#[derive(Default)]
+struct Differential {
+    vectors: usize,
+    identical: usize,
+    explained: BTreeMap<&'static str, usize>,
+    /// Per instruction file: how many, and the first.
+    unexplained: BTreeMap<String, (usize, String)>,
+    unexplained_count: usize,
+}
+
+fn differential_file(path: &Path, limit: usize, model: Model, out: &mut Differential) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let vectors = Parser::new(&bytes).value();
+    let reference = Rig::new(Model::M68000);
+    let other = Rig::new(model);
+    for vector in vectors.arr().iter().take(limit) {
+        let name = vector.get("name").expect("name").str().to_string();
+        if ANOMALIES.iter().any(|(anomaly, _)| *anomaly == name) {
+            continue;
+        }
+        let initial = vector.get("initial").expect("initial");
+        let words = words_of(initial);
+        // What an RTE on the later model finds as its format: the high
+        // nibble of the word six bytes above the supervisor stack pointer.
+        let rte_format = {
+            let at = regs_of(initial).ssp.wrapping_add(6) & ADDRESS_MASK;
+            initial
+                .get("ram")
+                .expect("ram")
+                .arr()
+                .iter()
+                .map(Json::arr)
+                .find(|cell| cell[0].num() as u32 & ADDRESS_MASK == at)
+                .map_or(0, |cell| (cell[1].num() as u16) >> 4)
+        };
+        let a = reference.run(initial);
+        let b = other.run(initial);
+        out.vectors += 1;
+        match explain(model, &words, rte_format, &a, &b) {
+            Ok(None) => out.identical += 1,
+            Ok(Some(why)) => *out.explained.entry(why).or_insert(0) += 1,
+            Err(what) => {
+                out.unexplained_count += 1;
+                let file = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                out.unexplained
+                    .entry(file)
+                    .or_insert_with(|| (0, format!("{name}: {what}")))
+                    .0 += 1;
+            }
+        }
+    }
+}
+
+/// Run the 68000 corpus through the 68010 and the 68020, and account for
+/// every difference.
+///
+/// Uses the same variables as [`single_step_tests`]; without
+/// `RSEMU_680X0_DIR` it says so and passes.
+#[test]
+fn differential_against_the_68000() {
+    let Ok(dir) = std::env::var("RSEMU_680X0_DIR") else {
+        println!(
+            "differential: set RSEMU_680X0_DIR to a decompressed SingleStepTests/680x0 \
+             68000/v1 directory to run the 68000 corpus through the 68010 and 68020."
+        );
+        return;
+    };
+    let dir = Path::new(&dir);
+    let only: Option<Vec<String>> = std::env::var("RSEMU_680X0_TESTS")
+        .ok()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    let limit: usize = std::env::var("RSEMU_680X0_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            Some(name.strip_suffix(".json")?.to_string())
+        })
+        .collect();
+    names.sort();
+    let mut failed = Vec::new();
+    for model in [Model::M68010] {
+        let mut out = Differential::default();
+        for name in &names {
+            if let Some(only) = &only
+                && !only.iter().any(|o| o == name)
+            {
+                continue;
+            }
+            differential_file(&dir.join(format!("{name}.json")), limit, model, &mut out);
+        }
+        println!(
+            "differential {model}: {} vectors, {} identical to the 68000{}",
+            out.vectors,
+            out.identical,
+            if model.has_020() {
+                " in state (68020 cycles and bus order are its own)"
+            } else {
+                " in state, cycles and bus trace"
+            }
+        );
+        for (why, count) in &out.explained {
+            println!("  {count:>7}  {why}");
+        }
+        if out.unexplained_count != 0 {
+            println!("  {:>7}  UNEXPLAINED:", out.unexplained_count);
+            for (file, (count, first)) in &out.unexplained {
+                println!("           {count:>6} in {file}, first {first}");
+            }
+            failed.push((model, out.unexplained_count));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "differences no manual accounts for: {failed:?}"
+    );
 }
 
 #[test]

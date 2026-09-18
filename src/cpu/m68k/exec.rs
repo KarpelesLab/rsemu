@@ -44,14 +44,14 @@
 //! instruction's operation and condition-code rules — the per-instruction
 //! pages, which are the only place the irregular rules are stated. The
 //! *MC68000 User's Manual* (MC68000UM) §6 for exception processing and the two
-//! stack-frame formats, and §8 for instruction timing. `docs/cpu/other.md`
+//! stack-frame formats, and §8 for instruction timing. `docs/cpu/m68k.md`
 //! records where to find both. No copyleft emulator was consulted.
 
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
-use super::isa::{Arg, Cond, Insn, Mode, Op, Size, decode, ea_of};
-use super::{ADDRESS_MASK, Config, Lines, flags, vector};
+use super::isa::{Arg, Cond, Insn, Mode, Model, Op, Size, ctrl, decode_for, ea_of};
+use super::{Config, Lines, flags, vector};
 
 /// Function codes, as they appear on FC0–FC2 and in a group-0 stack frame's
 /// special status word (MC68000UM §3.1.1).
@@ -74,17 +74,23 @@ mod fc {
 /// re-entrancy contract, `ROADMAP.md` §4.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct State {
+    /// Which processor this is. Configuration rather than state — it is never
+    /// saved — but every method below needs it, so it travels with the
+    /// registers it decides the shape of.
+    pub model: Model,
     /// The eight data registers.
     pub d: [u32; 8],
     /// The eight address registers. `a[7]` is whichever stack pointer the
     /// current privilege state selects.
     pub a: [u32; 8],
-    /// The stack pointer that is *not* currently `a[7]`.
+    /// The stack pointers, by [`Bank`]: user, interrupt (the 68000's "SSP")
+    /// and master.
     ///
-    /// One register file with a shadow, rather than two named pointers, so
+    /// The active one is stale here — `a[7]` is authoritative for it — so
     /// every `a[reg]` access in the interpreter stays a plain array index and
-    /// the bank swap happens in exactly one place ([`State::set_sr`]).
-    pub other_sp: u32,
+    /// the bank swap happens in exactly one place ([`State::set_sr`]). A 68000
+    /// or 68010 never selects the master bank, because it has no **M** bit.
+    pub banks: [u32; 3],
     /// The program counter: the address of `prefetch[0]`.
     pub pc: u32,
     /// The status register. See [`super::flags`].
@@ -112,15 +118,71 @@ pub(super) struct State {
     /// charged against the next budget instead. Architectural, because a
     /// restored machine that forgot its debt runs one instruction free.
     pub debt: u64,
+    /// The vector base register (68010 on): where the vector table starts.
+    pub vbr: u32,
+    /// The source function code register, three bits (68010 on).
+    pub sfc: u8,
+    /// The destination function code register, three bits (68010 on).
+    pub dfc: u8,
+    /// The cache control register's **E** and **F** bits (68020).
+    pub cacr: u32,
+    /// The cache address register (68020).
+    pub caar: u32,
+    /// A bus access software has already completed, owed to the instruction
+    /// an `RTE` from a long fault frame is restarting. See [`Replay`].
+    pub replay: Option<Replay>,
+    /// Instruction words a 68020 failed to fetch into `prefetch[0]` and
+    /// `prefetch[1]`, by address: the bus error is owed to whatever consumes
+    /// them (MC68020UM §6.1.2). Always `None` on the other models, which
+    /// fault on the fetch itself.
+    pub poison: [Option<u32>; 2],
+    /// The vector of the most recent exception taken, for tests that need to
+    /// know *which* exception a step ended in. Never saved.
+    pub last_vector: Option<u8>,
+}
+
+/// The three stack-pointer banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Bank {
+    /// `USP`, selected when **S** is clear.
+    User = 0,
+    /// `ISP` — the 68000's `SSP` — selected when **S** is set and **M** is
+    /// clear.
+    Interrupt = 1,
+    /// `MSP`, selected when both **S** and **M** are set; 68020 only.
+    Master = 2,
+}
+
+/// One bus access that an exception handler completed in software.
+///
+/// A 68010 handler that sets the rerun flag in a long frame's special status
+/// word, or a 68020 handler that clears the data-fault flag, is saying "I did
+/// that access myself" — the read's data is in the frame's data input buffer,
+/// or the write has been made. This core cannot resume an instruction half
+/// way through it, so `RTE` restarts the instruction from its first word,
+/// and the one access the frame described is satisfied from here instead of
+/// from the bus when the restarted instruction reaches it (MC68000UM §6.3.9.2;
+/// MC68020UM §6.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Replay {
+    /// The address of the access.
+    pub addr: u32,
+    /// Whether it was a read.
+    pub read: bool,
+    /// One or two bytes.
+    pub width: u8,
+    /// What the read returns; ignored for a write, which is simply dropped.
+    pub data: u32,
 }
 
 impl State {
     /// Power-on state, before the reset sequence has run.
-    pub(super) const fn new() -> State {
+    pub(super) const fn new(model: Model) -> State {
         State {
+            model,
             d: [0; 8],
             a: [0; 8],
-            other_sp: 0,
+            banks: [0; 3],
             pc: 0,
             // Supervisor state with every interrupt masked, which is what a
             // reset leaves behind (MC68000UM §6.2.6).
@@ -133,6 +195,14 @@ impl State {
             faults: 0,
             last_fault: 0,
             debt: 0,
+            vbr: 0,
+            sfc: 0,
+            dfc: 0,
+            cacr: 0,
+            caar: 0,
+            replay: None,
+            poison: [None, None],
+            last_vector: None,
         }
     }
 
@@ -142,47 +212,75 @@ impl State {
         self.sr & flags::S != 0
     }
 
-    /// The user stack pointer, whichever bank it is in.
-    #[must_use]
-    pub(super) const fn usp(&self) -> u32 {
-        if self.supervisor() {
-            self.other_sp
+    /// The bank a status register value selects.
+    #[inline]
+    pub(super) const fn bank_of(&self, sr: u16) -> Bank {
+        if sr & flags::S == 0 {
+            Bank::User
+        } else if sr & flags::M != 0 && self.model.has_020() {
+            Bank::Master
         } else {
-            self.a[7]
+            Bank::Interrupt
         }
     }
 
-    /// The supervisor stack pointer, whichever bank it is in.
+    /// A stack pointer, whichever bank it is in.
     #[must_use]
-    pub(super) const fn ssp(&self) -> u32 {
-        if self.supervisor() {
+    pub(super) const fn sp(&self, bank: Bank) -> u32 {
+        if bank as u8 == self.bank_of(self.sr) as u8 {
             self.a[7]
         } else {
-            self.other_sp
+            self.banks[bank as usize]
         }
+    }
+
+    /// Overwrite a stack pointer, whichever bank it is in.
+    pub(super) const fn set_sp(&mut self, bank: Bank, value: u32) {
+        if bank as u8 == self.bank_of(self.sr) as u8 {
+            self.a[7] = value;
+        } else {
+            self.banks[bank as usize] = value;
+        }
+    }
+
+    /// The user stack pointer, whichever bank it is in.
+    #[must_use]
+    pub(super) const fn usp(&self) -> u32 {
+        self.sp(Bank::User)
+    }
+
+    /// The supervisor stack pointer — the interrupt stack pointer on a 68020 —
+    /// whichever bank it is in.
+    #[must_use]
+    pub(super) const fn ssp(&self) -> u32 {
+        self.sp(Bank::Interrupt)
     }
 
     /// Overwrite the user stack pointer.
     pub(super) const fn set_usp(&mut self, value: u32) {
-        if self.supervisor() {
-            self.other_sp = value;
-        } else {
-            self.a[7] = value;
-        }
+        self.set_sp(Bank::User, value);
     }
 
-    /// Write the status register, swapping stack pointers if **S** changed.
+    /// The status register bits this model has storage for.
+    #[inline]
+    pub(super) const fn sr_mask(&self) -> u16 {
+        flags::implemented(self.model)
+    }
+
+    /// Write the status register, swapping stack pointers if **S** or **M**
+    /// changed.
     ///
     /// The bank swap is the whole reason this is a method: `A7` names a
-    /// different physical register in the two states, and a `MOVE to SR` that
+    /// different physical register in each state, and a `MOVE to SR` that
     /// left the old one in place is the classic supervisor-mode bug
     /// (M68000PRM, *MOVE to SR*).
     pub(super) const fn set_sr(&mut self, value: u16) {
-        let value = value & flags::IMPLEMENTED;
-        if (value & flags::S) != (self.sr & flags::S) {
-            let active = self.a[7];
-            self.a[7] = self.other_sp;
-            self.other_sp = active;
+        let value = value & self.sr_mask();
+        let old = self.bank_of(self.sr);
+        let new = self.bank_of(value);
+        if old as u8 != new as u8 {
+            self.banks[old as usize] = self.a[7];
+            self.a[7] = self.banks[new as usize];
         }
         self.sr = value;
     }
@@ -247,7 +345,9 @@ impl State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Trap {
     /// A word or long access to an odd address, or an instruction fetch from
-    /// one. Group 0: a fourteen-byte frame.
+    /// one. Group 0: a fourteen-byte frame on a 68000, format `$8` on a 68010
+    /// and format `$A` on a 68020 — which only ever takes one for an
+    /// instruction fetch.
     Address {
         /// The address the instruction tried to reach, untruncated.
         addr: u32,
@@ -255,8 +355,13 @@ pub(super) enum Trap {
         read: bool,
         /// The function code that would have been driven.
         fc: u8,
+        /// How many bytes the faulted bus cycle carried.
+        width: u8,
+        /// What a faulted write was writing.
+        data: u32,
     },
-    /// The address space refused the access. Group 0, same frame shape.
+    /// The address space refused the access. Group 0, same frame shapes, but
+    /// format `$B` on a 68020.
     Bus {
         /// The address the instruction tried to reach, untruncated.
         addr: u32,
@@ -264,6 +369,10 @@ pub(super) enum Trap {
         read: bool,
         /// The function code that would have been driven.
         fc: u8,
+        /// How many bytes the faulted bus cycle carried.
+        width: u8,
+        /// What a faulted write was writing.
+        data: u32,
     },
     /// An ordinary vectored exception with the six-byte frame.
     Vectored {
@@ -271,13 +380,56 @@ pub(super) enum Trap {
         vector: u8,
         /// The program counter to push.
         pc: u32,
+        /// Which group it belongs to, which decides its frame on a 68020 and
+        /// whether a trace follows it.
+        kind: Kind,
     },
 }
 
+/// What sort of vectored exception a [`Trap::Vectored`] is (MC68020UM §6.1.11,
+/// Table 6-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// Group 3: the instruction was never executed — illegal, line A, line F,
+    /// privilege violation. Never traced.
+    Rejected,
+    /// Group 2 with a four-word frame: `TRAP #n`, a format error.
+    Trap,
+    /// Group 2 with the 68020's six-word frame, which also carries the
+    /// address of the instruction responsible: `CHK`, `CHK2`, `TRAPcc`,
+    /// `TRAPV`, a zero divide (MC68020UM Table 6-5). A four-word frame on
+    /// earlier parts.
+    Six(u32),
+}
+
 impl Trap {
-    /// A group-1 or group-2 exception through `vector`, pushing `pc`.
+    /// An exception through `vector` for an instruction that was never
+    /// executed, pushing `pc`.
     const fn at(vector: u8, pc: u32) -> Trap {
-        Trap::Vectored { vector, pc }
+        Trap::Vectored {
+            vector,
+            pc,
+            kind: Kind::Rejected,
+        }
+    }
+
+    /// An exception an instruction raises by executing, pushing `pc`.
+    const fn raised(vector: u8, pc: u32) -> Trap {
+        Trap::Vectored {
+            vector,
+            pc,
+            kind: Kind::Trap,
+        }
+    }
+
+    /// An exception an instruction raises by executing, whose 68020 frame
+    /// also records the instruction's own address.
+    const fn six(vector: u8, pc: u32, insn: u32) -> Trap {
+        Trap::Vectored {
+            vector,
+            pc,
+            kind: Kind::Six(insn),
+        }
     }
 }
 
@@ -306,15 +458,39 @@ enum Loc {
     Prefetched(u32, u32),
 }
 
+/// The address and stack-pointer registers as an instruction found them, so a
+/// fault part way through it can say which ones it has already moved.
+#[derive(Debug, Clone, Copy, Default)]
+struct Snap {
+    a: [u32; 7],
+    sp: [u32; 3],
+}
+
 /// One instruction's worth of execution, borrowing everything it needs.
 pub(super) struct Exec<'a> {
     state: &'a mut State,
     space: &'a AddressSpace,
     cfg: &'a Config,
     lines: &'a Lines,
+    /// Which processor, copied out of the configuration because nearly every
+    /// path asks.
+    model: Model,
+    /// The address pins this model has.
+    mask: u32,
     /// The opcode word being executed, kept for a group-0 frame's instruction
     /// register field.
     opcode: u16,
+    /// The address of that opcode word: where a restarted instruction starts.
+    pc0: u32,
+    /// The registers an instruction started with, on the models whose fault
+    /// frames can be returned from. Unused on a 68000.
+    snap: Snap,
+    /// Whether the instruction in progress changed the flow of control — a
+    /// branch taken, a jump, a return, a write to `SR` — which is what a
+    /// 68020 traces when only **T0** is set (MC68020UM §6.1.7).
+    flow: bool,
+    /// A function code `MOVES` substitutes for the ordinary data one.
+    fc_override: Option<u8>,
     /// Cycles this step has charged.
     used: u64,
     /// Whether the source operand of the `MOVE` in progress came from memory.
@@ -340,12 +516,19 @@ impl<'a> Exec<'a> {
         cfg: &'a Config,
         lines: &'a Lines,
     ) -> Exec<'a> {
+        let model = state.model;
         Exec {
             state,
             space,
             cfg,
             lines,
+            model,
+            mask: model.address_mask(),
             opcode: 0,
+            pc0: 0,
+            snap: Snap::default(),
+            flow: false,
+            fc_override: None,
             used: 0,
             prologue: 4,
             source_was_memory: false,
@@ -353,12 +536,12 @@ impl<'a> Exec<'a> {
             deferred_slides: 0,
         }
     }
-
     /// Run one reset sequence, exception sequence, or instruction.
     ///
     /// Returns the cycles charged; zero only when the core is halted, which a
     /// scheduler must notice rather than spin on.
     pub(super) fn step(&mut self) -> u64 {
+        self.state.last_vector = None;
         if self.state.reset_pending {
             self.reset_sequence();
             return self.used;
@@ -396,14 +579,26 @@ impl<'a> Exec<'a> {
     }
 
     /// The attributes every access this core makes carries.
+    ///
+    /// `MOVES` reaches the address space its function code register names;
+    /// the bus here has no function codes, so the part of one it can carry —
+    /// whether the space is a supervisor one, bit 2 — becomes the privilege
+    /// attribute and the rest is lost (MC68020UM §3.1, *Function Codes*).
     fn attrs(&self) -> MemAttrs {
+        let privileged = match self.fc_override {
+            Some(fc) => fc & 4 != 0,
+            None => self.state.supervisor(),
+        };
         MemAttrs::DEFAULT
             .with_requester(self.cfg.requester)
-            .with_privileged(self.state.supervisor())
+            .with_privileged(privileged)
     }
 
     /// The function code for a data access in the current privilege state.
     fn data_fc(&self) -> u8 {
+        if let Some(fc) = self.fc_override {
+            return fc;
+        }
         if self.state.supervisor() {
             fc::SUPER_DATA
         } else {
@@ -420,16 +615,33 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// The data a restarted instruction's access gets from a completed fault,
+    /// if this is that access. See [`Replay`].
+    fn replayed(&mut self, addr: u32, read: bool, width: u8) -> Option<u32> {
+        match self.state.replay {
+            Some(r) if r.addr == addr && r.read == read && r.width == width => {
+                self.state.replay = None;
+                Some(r.data)
+            }
+            _ => None,
+        }
+    }
+
     /// One byte read. Byte accesses have no alignment rule.
     fn read_byte(&mut self, addr: u32) -> Result<u8, Trap> {
+        if self.state.replay.is_some()
+            && let Some(data) = self.replayed(addr, true, 1)
+        {
+            return Ok(data as u8);
+        }
         self.internal(4);
         let fc = self.data_fc();
         match self
             .space
-            .read(u64::from(addr & ADDRESS_MASK), Width::U8, self.attrs())
+            .read(u64::from(addr & self.mask), Width::U8, self.attrs())
         {
             Ok(v) => Ok(v as u8),
-            Err(_) => Err(self.bus_fault(addr, true, fc)),
+            Err(_) => Err(self.bus_fault(addr, true, fc, 1, 0)),
         }
     }
 
@@ -441,29 +653,61 @@ impl<'a> Exec<'a> {
 
     /// One word read with an explicit function code, so an instruction fetch
     /// can report itself as program space in a group-0 frame.
+    ///
+    /// An odd address is an address error on a 68000 and a 68010. A 68020
+    /// takes one only for an instruction fetch; an operand may sit anywhere,
+    /// and the processor splits it into the bus cycles it needs (MC68020UM
+    /// §6.1.3, and §5.2.2 on misaligned operands). With a 16-bit port — which
+    /// is what this bus model is — a word at an odd address is two byte
+    /// cycles.
     fn read_word_fc(&mut self, addr: u32, fc: u8) -> Result<u16, Trap> {
+        let program = fc & 3 == 2;
+        // Before the alignment check: an address error a handler completed
+        // in software is exactly a misaligned access that must not fault
+        // again.
+        if self.state.replay.is_some()
+            && !program
+            && let Some(data) = self.replayed(addr, true, 2)
+        {
+            return Ok(data as u16);
+        }
         if addr & 1 != 0 {
-            return Err(Trap::Address {
-                addr,
-                read: true,
-                fc,
-            });
+            if !self.model.has_020() || program {
+                return Err(Trap::Address {
+                    addr,
+                    read: true,
+                    fc,
+                    width: 2,
+                    data: 0,
+                });
+            }
+            let hi = self.read_byte(addr)?;
+            let lo = self.read_byte(addr.wrapping_add(1))?;
+            return Ok((u16::from(hi) << 8) | u16::from(lo));
         }
         self.internal(4);
         match self
             .space
-            .read(u64::from(addr & ADDRESS_MASK), Width::U16, self.attrs())
+            .read(u64::from(addr & self.mask), Width::U16, self.attrs())
         {
             Ok(v) => Ok(v as u16),
-            Err(_) => Err(self.bus_fault(addr, true, fc)),
+            Err(_) => Err(self.bus_fault(addr, true, fc, 2, 0)),
         }
     }
 
     /// One long read: two word accesses, high word first.
     ///
     /// The 68000 has a 16-bit data bus, so there is no such thing as a 32-bit
-    /// bus cycle; a device watching the bus sees two.
+    /// bus cycle; a device watching the bus sees two. A 68020 on a 16-bit port
+    /// does the same, and a long at an odd address is a byte, a word and a
+    /// byte (MC68020UM §5.2.2).
     fn read_long(&mut self, addr: u32) -> Result<u32, Trap> {
+        if addr & 1 != 0 && self.model.has_020() {
+            let b0 = self.read_byte(addr)?;
+            let mid = self.read_word(addr.wrapping_add(1))?;
+            let b3 = self.read_byte(addr.wrapping_add(3))?;
+            return Ok((u32::from(b0) << 24) | (u32::from(mid) << 8) | u32::from(b3));
+        }
         let hi = self.read_word(addr)?;
         let lo = self.read_word(addr.wrapping_add(2))?;
         Ok((u32::from(hi) << 16) | u32::from(lo))
@@ -471,43 +715,61 @@ impl<'a> Exec<'a> {
 
     /// One byte write.
     fn write_byte(&mut self, addr: u32, value: u8) -> Result<(), Trap> {
+        if self.state.replay.is_some() && self.replayed(addr, false, 1).is_some() {
+            return Ok(());
+        }
         self.internal(4);
         let fc = self.data_fc();
         match self.space.write(
-            u64::from(addr & ADDRESS_MASK),
+            u64::from(addr & self.mask),
             Width::U8,
             u64::from(value),
             self.attrs(),
         ) {
             Ok(()) => Ok(()),
-            Err(_) => Err(self.bus_fault(addr, false, fc)),
+            Err(_) => Err(self.bus_fault(addr, false, fc, 1, u32::from(value))),
         }
     }
 
-    /// One word write, faulting on an odd address.
+    /// One word write, faulting on an odd address — except on a 68020, which
+    /// splits it (see [`Exec::read_word_fc`]).
     fn write_word(&mut self, addr: u32, value: u16) -> Result<(), Trap> {
         let fc = self.data_fc();
+        if self.state.replay.is_some() && self.replayed(addr, false, 2).is_some() {
+            return Ok(());
+        }
         if addr & 1 != 0 {
-            return Err(Trap::Address {
-                addr,
-                read: false,
-                fc,
-            });
+            if !self.model.has_020() {
+                return Err(Trap::Address {
+                    addr,
+                    read: false,
+                    fc,
+                    width: 2,
+                    data: u32::from(value),
+                });
+            }
+            self.write_byte(addr, (value >> 8) as u8)?;
+            return self.write_byte(addr.wrapping_add(1), value as u8);
         }
         self.internal(4);
         match self.space.write(
-            u64::from(addr & ADDRESS_MASK),
+            u64::from(addr & self.mask),
             Width::U16,
             u64::from(value),
             self.attrs(),
         ) {
             Ok(()) => Ok(()),
-            Err(_) => Err(self.bus_fault(addr, false, fc)),
+            Err(_) => Err(self.bus_fault(addr, false, fc, 2, u32::from(value))),
         }
     }
 
     /// One long write: two word accesses, high word first.
     fn write_long(&mut self, addr: u32, value: u32) -> Result<(), Trap> {
+        if addr & 1 != 0 && self.model.has_020() {
+            self.write_byte(addr, (value >> 24) as u8)?;
+            self.write_word(addr.wrapping_add(1), (value >> 8) as u16)?;
+            return self.write_byte(addr.wrapping_add(3), value as u8);
+        }
         self.write_word(addr, (value >> 16) as u16)?;
         self.write_word(addr.wrapping_add(2), value as u16)
     }
@@ -522,6 +784,9 @@ impl<'a> Exec<'a> {
     /// back first. It is visible on the bus, so a device with side effects can
     /// tell, and it is not an implementation detail we get to choose.
     fn write_long_low_first(&mut self, addr: u32, value: u32) -> Result<(), Trap> {
+        if addr & 1 != 0 && self.model.has_020() {
+            return self.write_long(addr, value);
+        }
         self.write_word(addr.wrapping_add(2), value as u16)?;
         self.write_word(addr, (value >> 16) as u16)
     }
@@ -539,15 +804,40 @@ impl<'a> Exec<'a> {
     /// (§4.7) is what makes it unreachable, and it does not exist yet. Until
     /// then a machine that remaps a space under a running CPU can see a
     /// spurious vector-2 exception, and `bus_faults` is where it shows up.
-    fn bus_fault(&mut self, addr: u32, read: bool, fc: u8) -> Trap {
+    fn bus_fault(&mut self, addr: u32, read: bool, fc: u8, width: u8, data: u32) -> Trap {
         self.state.faults = self.state.faults.wrapping_add(1);
         self.state.last_fault = addr;
-        Trap::Bus { addr, read, fc }
+        Trap::Bus {
+            addr,
+            read,
+            fc,
+            width,
+            data,
+        }
     }
-
     // ------------------------------------------------------------------
     // The prefetch queue
     // ------------------------------------------------------------------
+
+    /// Fetch one instruction word for the queue.
+    ///
+    /// On a 68000 or 68010 a refused fetch is a bus error on the spot. A 68020
+    /// fetches ahead of itself and "may delay taking the exception until it
+    /// attempts to use the prefetched information" (MC68020UM §6.1.2) — which
+    /// matters, because a routine ending in `RTS` at the last word of a mapped
+    /// region prefetches past it and must not fault. So there a refused fetch
+    /// *poisons* the word instead: `Ok(None)`, and the fault is raised only if
+    /// something consumes it (see [`Exec::queued`] and
+    /// [`Exec::instruction`]). An odd address is still an address error at
+    /// once, since no bus cycle is attempted (MC68020UM §6.1.3).
+    fn fetch(&mut self, addr: u32) -> Result<Option<u16>, Trap> {
+        let fc = self.program_fc();
+        match self.read_word_fc(addr, fc) {
+            Ok(word) => Ok(Some(word)),
+            Err(Trap::Bus { .. }) if self.model.has_020() => Ok(None),
+            Err(trap) => Err(trap),
+        }
+    }
 
     /// Slide the queue one word: shift, refill from `pc + 4`, advance `pc`.
     ///
@@ -555,12 +845,41 @@ impl<'a> Exec<'a> {
     /// makes the value an address-error frame pushes correct.
     fn slide(&mut self) -> Result<(), Trap> {
         let fetch = self.state.pc.wrapping_add(4);
-        let fc = self.program_fc();
-        let word = self.read_word_fc(fetch, fc)?;
+        let word = self.fetch(fetch)?;
         self.state.prefetch[0] = self.state.prefetch[1];
-        self.state.prefetch[1] = word;
+        self.state.prefetch[1] = word.unwrap_or(0);
+        self.state.poison = [
+            self.state.poison[1],
+            if word.is_none() { Some(fetch) } else { None },
+        ];
         self.state.pc = self.state.pc.wrapping_add(2);
         Ok(())
+    }
+
+    /// The word in `prefetch[1]`, or the bus error a 68020 deferred when it
+    /// failed to fetch it.
+    ///
+    /// Everything that reads an extension word out of the queue goes through
+    /// here, so a poisoned word is never mistaken for a displacement.
+    fn queued(&mut self) -> Result<u16, Trap> {
+        if let Some(addr) = self.state.poison[1] {
+            return Err(self.fetch_fault(addr));
+        }
+        Ok(self.state.prefetch[1])
+    }
+
+    /// The bus error for a poisoned instruction word, now that it is needed.
+    ///
+    /// Not [`Exec::bus_fault`]: the refused access was counted when it was
+    /// made, and this is the same access being owned up to.
+    fn fetch_fault(&self, addr: u32) -> Trap {
+        Trap::Bus {
+            addr,
+            read: true,
+            fc: self.program_fc(),
+            width: 2,
+            data: 0,
+        }
     }
 
     /// Take the next extension word, charging `delay` internal cycles between
@@ -570,7 +889,7 @@ impl<'a> Exec<'a> {
     /// manual's timing puts them before the refill, and a bus trace shows them
     /// there (MC68000UM Table 8-1).
     fn ext(&mut self, delay: u32) -> Result<u16, Trap> {
-        let word = self.state.prefetch[1];
+        let word = self.queued()?;
         if delay != 0 {
             self.internal(delay);
         }
@@ -579,10 +898,10 @@ impl<'a> Exec<'a> {
     }
 
     /// Take the next extension word but leave its refill for [`Exec::settle`].
-    fn ext_deferred(&mut self) -> u16 {
-        let word = self.state.prefetch[1];
+    fn ext_deferred(&mut self) -> Result<u16, Trap> {
+        let word = self.queued()?;
         self.deferred_slides += 1;
-        word
+        Ok(word)
     }
 
     /// Pay off any deferred refill, then perform the instruction's final
@@ -609,19 +928,38 @@ impl<'a> Exec<'a> {
     /// address error here, and the frame it pushes carries exactly this value.
     fn refill(&mut self, target: u32, gap: u32) -> Result<(), Trap> {
         self.deferred_slides = 0;
-        let fc = self.program_fc();
+        self.flow = true;
         self.state.pc = target.wrapping_sub(4);
-        let first = self.read_word_fc(target, fc)?;
+        let first = self.fetch(target)?;
         self.state.pc = target.wrapping_sub(2);
         if gap != 0 {
             self.internal(gap);
         }
-        let second = self.read_word_fc(target.wrapping_add(2), fc)?;
+        let second = self.fetch(target.wrapping_add(2))?;
         self.state.pc = target;
-        self.state.prefetch = [first, second];
+        self.state.prefetch = [first.unwrap_or(0), second.unwrap_or(0)];
+        self.state.poison = [
+            if first.is_none() { Some(target) } else { None },
+            if second.is_none() {
+                Some(target.wrapping_add(2))
+            } else {
+                None
+            },
+        ];
         Ok(())
     }
 
+    /// [`Exec::refill`] for exception processing and reset, where a fetch
+    /// that fails is not deferred: the first prefetches are part of the
+    /// exception sequence, and a bus error in them is a double bus fault
+    /// (MC68020UM §6.1.1, Figure 6-1).
+    fn refill_strict(&mut self, target: u32, gap: u32) -> Result<(), Trap> {
+        self.refill(target, gap)?;
+        match self.state.poison {
+            [Some(addr), _] | [None, Some(addr)] => Err(self.fetch_fault(addr)),
+            [None, None] => Ok(()),
+        }
+    }
     // ------------------------------------------------------------------
     // Reset, interrupts and exceptions
     // ------------------------------------------------------------------
@@ -637,12 +975,18 @@ impl<'a> Exec<'a> {
         // supervisor stack pointer lands in the user bank and the user one is
         // silently lost.
         self.state.set_sr(flags::S | flags::IPL);
+        // The 68010 and 68020 also zero the vector base, and the 68020 clears
+        // its cache's enable and freeze bits (MC68000UM §6.2.1; MC68020UM
+        // §6.1.1). A fault a handler was completing is abandoned with it.
+        self.state.vbr = 0;
+        self.state.cacr = 0;
+        self.state.replay = None;
         self.internal(4);
         let outcome = (|| -> Result<(), Trap> {
             let ssp = self.read_long(0)?;
             let pc = self.read_long(4)?;
             self.state.a[7] = ssp;
-            self.refill(pc, 0)
+            self.refill_strict(pc, 0)
         })();
         if outcome.is_err() {
             // Nothing can be done about a reset vector that cannot be read.
@@ -710,57 +1054,122 @@ impl<'a> Exec<'a> {
         let raised = (sr & !flags::IPL) | (u16::from(level) << 8);
         // Ten cycles more prologue than any other exception: four of them are
         // the acknowledge cycle above, and the rest is the microcode deciding
-        // what to do with the answer (MC68000UM Table 8-14, 44(5/3)).
-        self.prologue = 14;
-        self.enter_exception(vector, pc, raised, None);
+        // what to do with the answer (MC68000UM Table 8-14, 44(5/3)). The
+        // 68010 spends two fewer: its interrupt is 46(5/4) with one more
+        // write for the format word (MC68000UM Table 9-19).
+        self.prologue = if self.model == Model::M68010 { 12 } else { 14 };
+        let frame = match self.model {
+            Model::M68000 => Frame::Classic(None),
+            // An interrupt taken on the master stack leaves a throwaway frame
+            // on the interrupt stack too, and the handler runs there
+            // (MC68020UM §6.1.9).
+            _ if self.model.has_020() && sr & flags::M != 0 => Frame::format(0).throwaway(),
+            _ => Frame::format(0),
+        };
+        self.enter_exception(vector, pc, raised, frame);
     }
 
-    /// Perform exception processing for a group-1 or group-2 exception.
+    /// Perform exception processing.
     ///
     /// `new_sr` is the status register the handler starts with, before **S**
     /// is forced and **T** cleared; passing it in is how an interrupt raises
     /// the mask and everything else does not.
-    fn enter_exception(&mut self, vector: u8, pc: u32, new_sr: u16, group0: Option<Group0>) {
+    fn enter_exception(&mut self, vector: u8, pc: u32, new_sr: u16, frame: Frame) {
         let saved_sr = self.state.sr;
-        // Supervisor state, tracing off. The status register pushed is the one
-        // from *before* this (MC68000UM §6.2).
-        self.state.set_sr((new_sr | flags::S) & !flags::T);
+        // Supervisor state, tracing off — both trace bits on a 68020. The
+        // status register pushed is the one from *before* this (MC68000UM
+        // §6.2). **M** is left as it was: a 68020 stacks on whichever
+        // supervisor stack it selects (MC68020UM §6.1).
+        self.state
+            .set_sr((new_sr | flags::S) & !(flags::T | flags::T0));
         // Any exception resumes a stopped processor, including the trace
         // exception a `STOP` executed with T set leaves behind.
         self.state.stopped = false;
+        self.state.last_vector = Some(vector);
         // Four cycles of deciding what to do, for most exceptions. `TRAPV`
         // spends none — it already knew — `CHK` spends two more unless the
         // bound test is what failed, and an interrupt spends ten more because
         // it has an acknowledge cycle to run first.
         self.internal(self.prologue);
         let outcome = (|| -> Result<(), Trap> {
-            let mut sp = self.state.a[7];
-            // The 68000 writes the frame in this order, which is neither
-            // ascending nor descending; it is visible on the bus.
-            sp = sp.wrapping_sub(2);
-            self.write_word(sp, pc as u16)?;
-            sp = sp.wrapping_sub(4);
-            self.write_word(sp, saved_sr)?;
-            self.write_word(sp.wrapping_add(2), (pc >> 16) as u16)?;
-            if let Some(g0) = group0 {
-                sp = sp.wrapping_sub(2);
-                self.write_word(sp, g0.ir)?;
-                sp = sp.wrapping_sub(2);
-                self.write_word(sp, g0.addr as u16)?;
-                sp = sp.wrapping_sub(4);
-                self.write_word(sp, g0.ssw)?;
-                self.write_word(sp.wrapping_add(2), (g0.addr >> 16) as u16)?;
+            match frame {
+                Frame::Classic(group0) => {
+                    let mut sp = self.state.a[7];
+                    // The 68000 writes the frame in this order, which is
+                    // neither ascending nor descending; it is visible on the
+                    // bus.
+                    sp = sp.wrapping_sub(2);
+                    self.write_word(sp, pc as u16)?;
+                    sp = sp.wrapping_sub(4);
+                    self.write_word(sp, saved_sr)?;
+                    self.write_word(sp.wrapping_add(2), (pc >> 16) as u16)?;
+                    if let Some(g0) = group0 {
+                        sp = sp.wrapping_sub(2);
+                        self.write_word(sp, g0.ir)?;
+                        sp = sp.wrapping_sub(2);
+                        self.write_word(sp, g0.addr as u16)?;
+                        sp = sp.wrapping_sub(4);
+                        self.write_word(sp, g0.ssw)?;
+                        self.write_word(sp.wrapping_add(2), (g0.addr >> 16) as u16)?;
+                    }
+                    self.state.a[7] = sp;
+                }
+                Frame::Format(image) => {
+                    self.push_frame(&image, vector, saved_sr, pc)?;
+                    if image.throwaway {
+                        // The frame just written is on the master stack. Clear
+                        // **M**, which moves to the interrupt stack, and leave a
+                        // format $1 copy there with **S** set in its status
+                        // word — so an `RTE` from the handler lands back on the
+                        // master stack to find the real one (MC68020UM §6.1.9,
+                        // §6.1.12).
+                        let sr = self.state.sr & !flags::M;
+                        self.state.set_sr(sr);
+                        self.push_frame(&FrameImage::new(1), vector, saved_sr | flags::S, pc)?;
+                    }
+                }
             }
-            self.state.a[7] = sp;
-            let base = u32::from(vector) * 4;
+            let base = self
+                .state
+                .vbr
+                .wrapping_add(u32::from(vector).wrapping_mul(4));
             let target = self.read_long(base)?;
-            self.refill(target, 2)
+            self.refill_strict(target, 2)
         })();
         if outcome.is_err() {
             // A fault while taking an exception is the double bus fault: the
             // 68000 asserts HALT and stops until reset (MC68000UM §6.2.5).
             self.state.halted = true;
         }
+    }
+
+    /// Write a format-word frame (68010 and 68020) onto the active stack.
+    ///
+    /// The four words every format shares go at the bottom: `SR`, the
+    /// program counter, and the format and vector offset (MC68000UM Figure
+    /// 6-6; MC68020UM Table 6-5). The rest of the image goes above them,
+    /// written from the top down; the 68020 manual guarantees only the layout
+    /// and not the order of the bus cycles (MC68020UM §6.1: "all individual bus
+    /// cycles ... are not guaranteed to occur in the order in which they are
+    /// described"), and the 68010's is not published, so the base words go
+    /// out in the 68000's own order after the format word.
+    fn push_frame(&mut self, image: &FrameImage, vector: u8, sr: u16, pc: u32) -> Result<(), Trap> {
+        let total = 4 + u32::from(image.len);
+        let sp = self.state.a[7].wrapping_sub(total * 2);
+        for i in (0..image.len as usize).rev() {
+            if image.skip & (1u64 << i) != 0 {
+                continue;
+            }
+            let at = sp.wrapping_add(8 + 2 * i as u32);
+            self.write_word(at, image.words[i])?;
+        }
+        let format = (u16::from(image.format) << 12) | ((u16::from(vector) * 4) & 0x0fff);
+        self.write_word(sp.wrapping_add(6), format)?;
+        self.write_word(sp.wrapping_add(4), pc as u16)?;
+        self.write_word(sp, sr)?;
+        self.write_word(sp.wrapping_add(2), (pc >> 16) as u16)?;
+        self.state.a[7] = sp;
+        Ok(())
     }
 
     /// The special status word a group-0 frame carries.
@@ -791,7 +1200,9 @@ impl<'a> Exec<'a> {
     /// Turn a [`Trap`] into exception processing.
     fn service(&mut self, trap: Trap) {
         match trap {
-            Trap::Address { addr, read, fc } | Trap::Bus { addr, read, fc } => {
+            Trap::Address { addr, read, fc, .. } | Trap::Bus { addr, read, fc, .. }
+                if self.model == Model::M68000 =>
+            {
                 let vector = if matches!(trap, Trap::Address { .. }) {
                     vector::ADDRESS_ERROR
                 } else {
@@ -805,13 +1216,218 @@ impl<'a> Exec<'a> {
                 };
                 let pc = self.state.pc;
                 let sr = self.state.sr;
-                self.enter_exception(vector, pc, sr, Some(g0));
+                self.enter_exception(vector, pc, sr, Frame::Classic(Some(g0)));
             }
-            Trap::Vectored { vector, pc } => {
+            Trap::Address { .. } | Trap::Bus { .. } => self.fault(trap),
+            Trap::Vectored { vector, pc, kind } => {
                 let sr = self.state.sr;
-                self.enter_exception(vector, pc, sr, None);
+                let frame = match (self.model, kind) {
+                    (Model::M68000, _) => Frame::Classic(None),
+                    (model, Kind::Six(insn)) if model.has_020() => {
+                        let mut image = FrameImage::new(2);
+                        image.push((insn >> 16) as u16);
+                        image.push(insn as u16);
+                        Frame::Format(image)
+                    }
+                    _ => Frame::format(0),
+                };
+                self.enter_exception(vector, pc, sr, frame);
             }
         }
+    }
+
+    /// A bus or address error on a 68010 or 68020: the long frame that lets
+    /// an `RTE` finish the job.
+    ///
+    /// # Restart, not continuation
+    ///
+    /// Both processors save enough internal state to *continue* the faulted
+    /// instruction from the bus cycle that failed (MC68000UM §6.3.9.2;
+    /// MC68020UM §6.2). That state is microcode state and this interpreter
+    /// does not have any; what it has is the address of the instruction and
+    /// the registers it started with. So the frame's internal words — which
+    /// the manuals leave to the processor — carry the instruction's address
+    /// (on the 68010; the 68020's frame has it in its PC field already) and
+    /// the old values of every address register and stack pointer the
+    /// instruction had moved before the fault, and `RTE` puts those back and
+    /// **restarts the instruction from its first word**. The handler sees the
+    /// registers as the partly executed instruction left them, exactly as it
+    /// would on hardware; what differs is only how `RTE` finishes, and the
+    /// result is the same one.
+    ///
+    /// A bus cycle software completed itself — the 68010's rerun flag set, the
+    /// 68020's data-fault flag cleared — is honoured through [`Replay`].
+    fn fault(&mut self, trap: Trap) {
+        let (vector, addr, read, fc, width, data) = match trap {
+            Trap::Address {
+                addr,
+                read,
+                fc,
+                width,
+                data,
+            } => (vector::ADDRESS_ERROR, addr, read, fc, width, data),
+            Trap::Bus {
+                addr,
+                read,
+                fc,
+                width,
+                data,
+            } => (vector::BUS_ERROR, addr, read, fc, width, data),
+            Trap::Vectored { .. } => return,
+        };
+        let program = fc & 3 == 2;
+        let sr = self.state.sr;
+        let undo = self.undo_list();
+        if self.model == Model::M68010 {
+            // Format $8, twenty-nine words, twenty-six of them written: the
+            // three marked "unused, reserved" are skipped, and the note under
+            // MC68000UM Figure 6-8 says as much.
+            let rmw = matches!(decode_for(self.model, self.opcode).op, Op::Tas);
+            let ssw = (u16::from(program) << 13)
+                | (u16::from(!program && read) << 12)
+                | (u16::from(rmw) << 11)
+                | (u16::from(width == 1) << 9)
+                | (u16::from(read) << 8)
+                | u16::from(fc & 7);
+            let mut image = FrameImage::new(8);
+            image.push(ssw); // +$08
+            image.push((addr >> 16) as u16); // +$0A
+            image.push(addr as u16); // +$0C
+            image.skip_one(); // +$0E unused, reserved
+            image.push(data as u16); // +$10 data output buffer
+            image.skip_one(); // +$12 unused, reserved
+            image.push(0); // +$14 data input buffer: nothing arrived
+            image.skip_one(); // +$16 unused, reserved
+            image.push(self.opcode); // +$18 instruction input buffer
+            image.push(VERSION_68010 << 10); // +$1A version number
+            image.push((self.pc0 >> 16) as u16); // +$1C restart address
+            image.push(self.pc0 as u16);
+            image.push_undo(&undo, 4); // +$20..+$37
+            image.push(0); // +$38, the last internal word
+            // The stacked program counter is where the prefetch had got to,
+            // which the manual allows to be "advanced by as many as five
+            // words" past the instruction; it is the 68000's value.
+            let pc = self.state.pc;
+            self.enter_exception(vector, pc, sr, Frame::Format(image));
+            return;
+        }
+        if matches!(trap, Trap::Address { .. }) {
+            // A 68020 takes an address error only fetching an instruction
+            // from an odd address, before any bus cycle, and the frame is the
+            // short one: the "next instruction" is the one at that address,
+            // and both pipe stages want rerunning (MC68020UM §6.1.3, §6.2.1).
+            let mut image = FrameImage::new(0xa);
+            image.push(0); // +$08 internal register
+            image.push(SSW_RC | SSW_RB); // +$0A special status word
+            image.push(0); // +$0C stage C
+            image.push(0); // +$0E stage B
+            image.push(0); // +$10 data cycle fault address: not a data cycle
+            image.push(0);
+            image.push(0); // +$14, +$16 internal
+            image.push(0);
+            image.push(0); // +$18 data output buffer
+            image.push(0);
+            image.push(0); // +$1C, +$1E internal
+            image.push(0);
+            self.enter_exception(vector, addr, sr, Frame::Format(image));
+            return;
+        }
+        // Format $B, the long bus fault frame: the fault happened inside an
+        // instruction, and the stacked PC is that instruction's address
+        // (MC68020UM Table 6-5).
+        let size = match width {
+            1 => 0b01,
+            2 => 0b10,
+            _ => 0b00,
+        };
+        let rmw = matches!(
+            decode_for(self.model, self.opcode).op,
+            Op::Tas | Op::Cas | Op::Cas2
+        );
+        let ssw = if program {
+            SSW_FB | SSW_RB
+        } else {
+            SSW_DF
+                | (u16::from(rmw) << 7)
+                | (u16::from(read) << 6)
+                | (size << 4)
+                | u16::from(fc & 7)
+        };
+        let mut image = FrameImage::new(0xb);
+        // +$08 is an internal register; this core keeps "the fault was a data
+        // cycle" in its low bit, which the handler may clear DF over.
+        image.push(u16::from(!program));
+        image.push(ssw); // +$0A
+        image.push(0); // +$0C stage C
+        image.push(0); // +$0E stage B
+        image.push((addr >> 16) as u16); // +$10 data cycle fault address
+        image.push(addr as u16);
+        image.push(0); // +$14 internal
+        image.push(0); // +$16 internal
+        image.push((data >> 16) as u16); // +$18 data output buffer
+        image.push(data as u16);
+        for _ in 0..4 {
+            image.push(0); // +$1C..+$23 internal
+        }
+        let stage_b = self.pc0.wrapping_add(4);
+        image.push((stage_b >> 16) as u16); // +$24 stage B address
+        image.push(stage_b as u16);
+        image.push(0); // +$28, +$2A internal
+        image.push(0);
+        image.push(0); // +$2C data input buffer: nothing arrived
+        image.push(0);
+        for _ in 0..3 {
+            image.push(0); // +$30..+$35 internal
+        }
+        image.push(VERSION_68020 << 12); // +$36 version number
+        image.push_undo(&undo, 6); // +$38..+$5B
+        let pc0 = self.pc0;
+        self.enter_exception(vector, pc0, sr, Frame::Format(image));
+    }
+
+    /// The address registers and stack pointers the faulting instruction has
+    /// moved, with the values they had when it started, most important first.
+    ///
+    /// Data registers never need undoing: nothing writes one and then goes on
+    /// to a bus cycle that could fault, except `MOVEM`, which loads it again
+    /// when restarted. The registers the opcode names come first, because the
+    /// one a `MOVEM` is walking must survive a list too long for the frame.
+    fn undo_list(&self) -> UndoList {
+        let mut out = [(0u8, 0u32); 10];
+        let mut n = 0usize;
+        let now_a = self.state.a;
+        let now_sp = [
+            self.state.sp(Bank::User),
+            self.state.sp(Bank::Interrupt),
+            self.state.sp(Bank::Master),
+        ];
+        let consider = |code: u8, out: &mut [(u8, u32); 10], n: &mut usize| {
+            if out[..*n].iter().any(|(c, _)| *c == code) {
+                return;
+            }
+            let (old, now) = if code < 7 {
+                (self.snap.a[code as usize], now_a[code as usize])
+            } else {
+                let bank = (code - 7) as usize;
+                (self.snap.sp[bank], now_sp[bank])
+            };
+            if old != now && *n < out.len() {
+                out[*n] = (code, old);
+                *n += 1;
+            }
+        };
+        for reg in [self.opcode & 7, (self.opcode >> 9) & 7] {
+            if reg < 7 {
+                consider(reg as u8, &mut out, &mut n);
+            }
+        }
+        for code in 7..10 {
+            consider(code, &mut out, &mut n);
+        }
+        for code in 0..7 {
+            consider(code, &mut out, &mut n);
+        }
+        (out, n)
     }
 
     // ------------------------------------------------------------------
@@ -823,8 +1439,41 @@ impl<'a> Exec<'a> {
     fn instruction(&mut self) {
         self.opcode = self.state.prefetch[0];
         let pc0 = self.state.pc;
-        let traced = self.state.flag(flags::T);
-        let insn = decode(self.opcode);
+        self.pc0 = pc0;
+        self.flow = false;
+        let sr0 = self.state.sr;
+        let traced = sr0 & flags::T != 0;
+        // A 68020 traces only a change of flow when **T0** alone is set
+        // (MC68020UM §6.1.7, Table 6-2); **T1** with **T0** is reserved, and
+        // is read as **T1**.
+        let traced_flow = self.model.has_020() && sr0 & flags::T0 != 0;
+        if self.model.has_010() {
+            self.snap = Snap {
+                a: [
+                    self.state.a[0],
+                    self.state.a[1],
+                    self.state.a[2],
+                    self.state.a[3],
+                    self.state.a[4],
+                    self.state.a[5],
+                    self.state.a[6],
+                ],
+                sp: [
+                    self.state.sp(Bank::User),
+                    self.state.sp(Bank::Interrupt),
+                    self.state.sp(Bank::Master),
+                ],
+            };
+        }
+        // An opcode a 68020 could not fetch is a bus error now, at the
+        // instruction boundary: the short frame, whose `RTE` refetches it
+        // (MC68020UM §6.1.2, §6.2).
+        if let Some(addr) = self.state.poison[0] {
+            self.fault_at_boundary(addr);
+            return;
+        }
+        let insn = decode_for(self.model, self.opcode);
+        let restarted = self.state.replay.is_some();
 
         let outcome = if insn.privileged && !self.state.supervisor() {
             // A privilege violation is detected before anything is fetched, so
@@ -833,18 +1482,61 @@ impl<'a> Exec<'a> {
         } else {
             self.execute(insn, pc0)
         };
+        // A completed fault a restarted instruction did not reach is dropped
+        // with the instruction: it described this one and no other.
+        if restarted {
+            self.state.replay = None;
+        }
 
         match outcome {
             Ok(()) => {
-                if traced {
+                if traced || (traced_flow && self.flow) {
                     let pc = self.state.pc;
-                    self.service(Trap::at(vector::TRACE, pc));
+                    self.service(Trap::six(vector::TRACE, pc, pc0));
                 }
             }
-            Err(trap) => self.service(trap),
+            Err(trap) => {
+                self.service(trap);
+                // On a 68020 an instruction whose own execution raised an
+                // exception is still traced, straight after it: the trap is
+                // processed first, then the trace, so the trace handler
+                // returns into the trap handler (MC68020UM §6.1.11). A 68000
+                // or 68010 does not, and this core keeps what they do.
+                let executed = matches!(
+                    trap,
+                    Trap::Vectored {
+                        kind: Kind::Trap | Kind::Six(_),
+                        ..
+                    }
+                );
+                if self.model.has_020() && executed && !self.state.halted && (traced || traced_flow)
+                {
+                    let pc = self.state.pc;
+                    self.service(Trap::six(vector::TRACE, pc, pc0));
+                }
+            }
         }
     }
 
+    /// A 68020 bus error on an opcode fetch, raised when the processor
+    /// reaches it: format $A, "at instruction boundary", both pipe stages to
+    /// be rerun (MC68020UM §6.2.1).
+    fn fault_at_boundary(&mut self, addr: u32) {
+        let mut image = FrameImage::new(0xa);
+        image.push(0); // +$08 internal register
+        image.push(SSW_FC | SSW_RC | SSW_RB); // +$0A
+        for _ in 0..2 {
+            image.push(0); // +$0C, +$0E stages C and B
+        }
+        image.push((addr >> 16) as u16); // +$10 fault address
+        image.push(addr as u16);
+        for _ in 0..6 {
+            image.push(0); // +$14..+$1F
+        }
+        let pc = self.state.pc;
+        let sr = self.state.sr;
+        self.enter_exception(vector::BUS_ERROR, pc, sr, Frame::Format(image));
+    }
     /// Execute one decoded instruction.
     ///
     /// `pc0` is the address of the opcode word, which several exceptions push.
@@ -929,7 +1621,7 @@ impl<'a> Exec<'a> {
 
             Op::Muls | Op::Mulu => self.op_mul(insn),
             Op::Divs | Op::Divu => self.op_div(insn, pc0),
-            Op::Chk => self.op_chk(),
+            Op::Chk => self.op_chk(size),
 
             Op::Btst | Op::Bchg | Op::Bclr | Op::Bset => self.op_bit(insn, size),
             Op::Asl | Op::Asr | Op::Lsl | Op::Lsr | Op::Rol | Op::Ror | Op::Roxl | Op::Roxr => {
@@ -974,6 +1666,9 @@ impl<'a> Exec<'a> {
                 self.refill((u32::from(high) << 16) | u32::from(low), 0)
             }
             Op::Rte => {
+                if self.model.has_010() {
+                    return self.op_rte_formatted();
+                }
                 let sp = self.state.a[7];
                 let high = self.read_word(sp.wrapping_add(2))?;
                 let sr = self.read_word(sp)?;
@@ -982,13 +1677,24 @@ impl<'a> Exec<'a> {
                 self.state.set_sr(sr);
                 self.refill((u32::from(high) << 16) | u32::from(low), 0)
             }
+            Op::Rtd => {
+                // RTS, then the displacement added to the stack pointer. The
+                // displacement is already in the queue and is never fetched on
+                // its own, so this costs what RTS does: MC68000UM Table 9-18
+                // gives both 16(4/0).
+                let disp = i32::from(self.queued()? as i16) as u32;
+                let sp = self.state.a[7];
+                let target = self.read_long(sp)?;
+                self.state.a[7] = sp.wrapping_add(4).wrapping_add(disp);
+                self.refill(target, 0)
+            }
             Op::Trap => {
                 let n = (opcode & 0xf) as u8;
                 // A trap pushes the address of the *next* instruction. No
                 // prefetch happens first, so that address is computed rather
                 // than reached by sliding the queue.
                 let next = self.state.pc.wrapping_add(2);
-                Err(Trap::at(vector::TRAP_BASE.wrapping_add(n), next))
+                Err(Trap::raised(vector::TRAP_BASE.wrapping_add(n), next))
             }
             Op::Trapv => {
                 // Unlike TRAP, TRAPV finishes its prefetch first, so the
@@ -997,7 +1703,7 @@ impl<'a> Exec<'a> {
                 if self.state.flag(flags::V) {
                     self.prologue = 0;
                     let pc = self.state.pc;
-                    return Err(Trap::at(vector::TRAPV, pc));
+                    return Err(Trap::six(vector::TRAPV, pc, pc0));
                 }
                 Ok(())
             }
@@ -1014,7 +1720,7 @@ impl<'a> Exec<'a> {
                 self.settle()
             }
 
-            Op::MoveFromSr => self.op_move_from_sr(),
+            Op::MoveFromSr | Op::MoveFromCcr => self.op_move_from_sr(insn),
             Op::MoveToCcr | Op::MoveToSr => self.op_move_to_sr(insn),
             Op::MoveUsp => {
                 let n = reg_lo(opcode);
@@ -1030,6 +1736,42 @@ impl<'a> Exec<'a> {
             Op::OriToSr | Op::AndiToSr | Op::EoriToSr => self.op_imm_to_sr(insn.op),
             Op::Movem => self.op_movem(insn, size),
             Op::Movep => self.op_movep(insn, size),
+
+            // ---- the 68010's additions ------------------------------------
+            Op::Bkpt => {
+                // A breakpoint acknowledge cycle in CPU space, which nothing
+                // here can answer — `MemAttrs` has no function code — so it
+                // ends the way an unanswered one does, with the processor
+                // taking an illegal-instruction exception through vector 4
+                // and pushing the BKPT's own address (MC68020UM §6.1.10). The
+                // acknowledge cycle is charged the four clocks the 68010
+                // table assumes for it (MC68000UM Table 9-19).
+                self.internal(4);
+                Err(Trap::at(vector::ILLEGAL, pc0))
+            }
+            Op::Movec => self.op_movec(insn, pc0),
+            Op::Moves => self.op_moves(size),
+
+            // ---- the 68020's additions ------------------------------------
+            Op::Bfchg
+            | Op::Bfclr
+            | Op::Bfexts
+            | Op::Bfextu
+            | Op::Bfffo
+            | Op::Bfins
+            | Op::Bfset
+            | Op::Bftst
+            | Op::Callm
+            | Op::Cas
+            | Op::Cas2
+            | Op::Cmp2
+            | Op::Divl
+            | Op::Extb
+            | Op::Mull
+            | Op::Pack
+            | Op::Rtm
+            | Op::Trapcc
+            | Op::Unpk => Err(Trap::at(vector::ILLEGAL, pc0)),
         }
     }
 
@@ -1087,7 +1829,12 @@ impl<'a> Exec<'a> {
             | Arg::RegList
             | Arg::MovepEa
             | Arg::BitNumber
-            | Arg::Disp8 => {
+            | Arg::Disp8
+            | Arg::Disp32
+            | Arg::Vector3
+            | Arg::Ctrl
+            | Arg::ExtReg
+            | Arg::TrapData => {
                 debug_assert!(false, "{arg:?} is not resolved as an operand");
                 Ok(Loc::Value(0))
             }
@@ -1165,7 +1912,7 @@ impl<'a> Exec<'a> {
                 // counter an address error pushes, so it is not a free choice.
                 let defer = extra == ExtraCycles::MoveDest && self.source_was_memory;
                 let lo = if defer {
-                    self.ext_deferred()
+                    self.ext_deferred()?
                 } else {
                     self.ext(0)?
                 };
@@ -1651,8 +2398,14 @@ impl<'a> Exec<'a> {
         let dst = self.resolve(insn.dst, size)?;
         // CLR still reads its destination on a 68000 — the read is a real bus
         // cycle and a device can see it (MC68000UM Table 8-6, and the reason
-        // CLR is not usable on a read-sensitive register).
-        let value = self.read_loc(dst, size)?;
+        // CLR is not usable on a read-sensitive register). The 68010 dropped
+        // the read: its CLR to memory is one read, the prefetch, and one write
+        // (MC68000UM Table 9-10), and so is the 68020's (MC68020UM §8.2.11).
+        let value = if insn.op == Op::Clr && self.model.has_010() {
+            0
+        } else {
+            self.read_loc(dst, size)?
+        };
         let x = u32::from(self.state.flag(flags::X));
         let result = match insn.op {
             Op::Clr => {
@@ -1805,10 +2558,21 @@ impl<'a> Exec<'a> {
         self.settle()
     }
 
-    fn op_chk(&mut self) -> Result<(), Trap> {
-        let src = self.resolve(Arg::Ea, Size::Word)?;
-        let bound = self.read_loc(src, Size::Word)? as i16;
-        let value = self.state.d[reg_hi(self.opcode)] as i16;
+    fn op_chk(&mut self, size: Size) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let src = self.resolve(Arg::Ea, size)?;
+        // CHK.L is the 68020's, and compares all 32 bits (M68000PRM, *CHK*).
+        let (bound, value) = if size == Size::Long {
+            (
+                self.read_loc(src, size)? as i32,
+                self.state.d[reg_hi(self.opcode)] as i32,
+            )
+        } else {
+            (
+                i32::from(self.read_loc(src, size)? as i16),
+                i32::from(self.state.d[reg_hi(self.opcode)] as i16),
+            )
+        };
         // The manual defines N only for the two out-of-bounds cases and calls
         // Z, V and C undefined. The hardware clears those three and — this is
         // the part no document states — leaves **N alone** when the register
@@ -1827,7 +2591,7 @@ impl<'a> Exec<'a> {
             // than a negative one.
             self.prologue = if value > bound { 4 } else { 6 };
             let pc = self.state.pc;
-            return Err(Trap::at(vector::CHK, pc));
+            return Err(Trap::six(vector::CHK, pc, pc0));
         }
         self.internal(6);
         Ok(())
@@ -2088,7 +2852,7 @@ impl<'a> Exec<'a> {
         // The base for a branch is the address of the word after the opcode.
         let base = self.state.pc.wrapping_add(2);
         if byte == 0 {
-            let word = self.state.prefetch[1];
+            let word = self.queued()?;
             if !taken {
                 // A word displacement that is not taken still costs the fetch.
                 self.internal(4);
@@ -2137,7 +2901,7 @@ impl<'a> Exec<'a> {
             self.ext(0)?;
             return self.settle();
         }
-        let word = self.state.prefetch[1];
+        let word = self.queued()?;
         self.internal(2);
         let target = base.wrapping_add(i32::from(word as i16) as u32);
         self.refill(target, 0)
@@ -2147,16 +2911,19 @@ impl<'a> Exec<'a> {
         let set = self.state.test(Cond::from_opcode(self.opcode));
         let dst = self.resolve(Arg::Ea, Size::Byte)?;
         let value = if set { 0xff } else { 0x00 };
-        if !matches!(dst, Loc::D(_)) {
+        if !matches!(dst, Loc::D(_)) && !self.model.has_010() {
             // A memory destination is read before it is written, exactly as
             // CLR reads one: the 68000 has no write-only bus cycle, and a
-            // read-sensitive register notices.
+            // read-sensitive register notices. The 68010 does not read it
+            // (MC68000UM Table 9-9, "use nonfetching effective address
+            // calculation time").
             self.read_loc(dst, Size::Byte)?;
         }
         if matches!(dst, Loc::D(_)) {
             // Two extra cycles when the byte is set, which is the one place a
             // 68000's timing depends on a condition (MC68000UM Table 8-11).
-            if set {
+            // The 68010 takes four either way (Table 9-9).
+            if set && !self.model.has_010() {
                 self.internal(2);
             }
             self.write_loc(dst, Size::Byte, value)?;
@@ -2182,19 +2949,36 @@ impl<'a> Exec<'a> {
         self.settle()
     }
 
-    fn op_move_from_sr(&mut self) -> Result<(), Trap> {
+    fn op_move_from_sr(&mut self, insn: Insn) -> Result<(), Trap> {
         let dst = self.resolve(Arg::Ea, Size::Word)?;
+        let value = if insn.op == Op::MoveFromCcr {
+            u16::from(self.state.ccr())
+        } else {
+            self.state.sr
+        };
+        if self.model.has_010() {
+            // The 68010 neither reads the destination first nor spends the
+            // two extra cycles on a register: MOVE from SR and MOVE from CCR
+            // are 4(1/0) to a register and 8(1/1) plus a non-fetching address
+            // calculation to memory (MC68000UM Table 9-18). The write keeps
+            // the 68000's place after the final prefetch.
+            if matches!(dst, Loc::D(_)) {
+                self.write_loc(dst, Size::Word, u32::from(value))?;
+                return self.settle();
+            }
+            self.settle()?;
+            return self.write_loc(dst, Size::Word, u32::from(value));
+        }
         // The 68000 reads the destination first, which is why MOVE from SR is
         // a read-modify-write and the 68010 replaced it (MC68000UM Table 8-6).
         let _ = self.read_loc(dst, Size::Word)?;
-        let sr = self.state.sr;
         if matches!(dst, Loc::D(_)) {
             self.internal(2);
-            self.write_loc(dst, Size::Word, u32::from(sr))?;
+            self.write_loc(dst, Size::Word, u32::from(value))?;
             return self.settle();
         }
         self.settle()?;
-        self.write_loc(dst, Size::Word, u32::from(sr))
+        self.write_loc(dst, Size::Word, u32::from(value))
     }
 
     fn op_move_to_sr(&mut self, insn: Insn) -> Result<(), Trap> {
@@ -2285,8 +3069,14 @@ impl<'a> Exec<'a> {
             // The register being walked is stored with the value it had
             // *before* the instruction started, not the value it has reached
             // by the time its turn comes. That is a 68000 behaviour the 68020
-            // changed, and `MOVEM.L A7/D0-D7,-(A7)` depends on it.
-            let initial = self.state.a[reg];
+            // changed — it stores the initial value less one operand
+            // (M68000PRM, *MOVEM*) — and `MOVEM.L A7/D0-D7,-(A7)` depends on
+            // which one it is running on.
+            let initial = if self.model.has_020() {
+                self.state.a[reg].wrapping_sub(if long { 4 } else { 2 })
+            } else {
+                self.state.a[reg]
+            };
             for bit in 0..16u32 {
                 if mask & (1 << bit) == 0 {
                     continue;
@@ -2354,10 +3144,11 @@ impl<'a> Exec<'a> {
                 self.set_register(bit, value);
             }
         }
-        if !to_memory {
+        if !to_memory && !self.model.has_020() {
             // One word past the end, read and discarded. It is a real bus
             // cycle, and a MOVEM that ends at the top of a mapped region can
-            // fault on it.
+            // fault on it. The 68020 does not make it: its table counts n
+            // reads for n registers (MC68020UM §8.2.7).
             if walking {
                 self.state.a[reg] = addr.wrapping_add(2);
             }
@@ -2365,6 +3156,10 @@ impl<'a> Exec<'a> {
             if walking {
                 self.state.a[reg] = addr;
             }
+        } else if walking {
+            // A walking register the list also loads ends up holding the
+            // incremented address, not what was read (M68000PRM, *MOVEM*).
+            self.state.a[reg] = addr;
         }
         self.settle()
     }
@@ -2411,6 +3206,296 @@ impl<'a> Exec<'a> {
             self.state.d[n] = merge(self.state.d[n], value, size);
         }
         self.settle()
+    }
+
+    // ------------------------------------------------------------------
+    // The 68010's control instructions
+    // ------------------------------------------------------------------
+
+    /// The general register bits 15–12 of an extension word name: `D0`-`D7`
+    /// then `A0`-`A7`.
+    fn ext_register(&self, word: u16) -> u32 {
+        self.register(u32::from(word >> 12))
+    }
+
+    /// `MOVEC`: a control register to or from a general one (M68000PRM,
+    /// *MOVEC*). Always 32 bits; bits a register does not implement read as
+    /// zero, and a code the model does not have is an illegal instruction.
+    fn op_movec(&mut self, insn: Insn, pc0: u32) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let code = word & 0x0fff;
+        if !ctrl::exists(self.model, code) {
+            return Err(Trap::at(vector::ILLEGAL, pc0));
+        }
+        let to_control = insn.dst == Arg::Ctrl;
+        if to_control {
+            let value = self.ext_register(word);
+            match code {
+                ctrl::SFC => self.state.sfc = (value & 7) as u8,
+                ctrl::DFC => self.state.dfc = (value & 7) as u8,
+                ctrl::USP => self.state.set_sp(Bank::User, value),
+                ctrl::VBR => self.state.vbr = value,
+                // Only E and F have storage. C and CE act on the cache's
+                // contents, which are not modelled, and read as zero
+                // (MC68020UM §4.3.1).
+                ctrl::CACR => self.state.cacr = value & CACR_STORED,
+                ctrl::CAAR => self.state.caar = value,
+                ctrl::MSP => self.state.set_sp(Bank::Master, value),
+                _ => self.state.set_sp(Bank::Interrupt, value),
+            }
+            // 10(2/0) against the ext word and the prefetch (MC68000UM Table
+            // 9-18, "Register → Destination").
+            self.internal(2);
+        } else {
+            let value = match code {
+                ctrl::SFC => u32::from(self.state.sfc),
+                ctrl::DFC => u32::from(self.state.dfc),
+                ctrl::USP => self.state.sp(Bank::User),
+                ctrl::VBR => self.state.vbr,
+                ctrl::CACR => self.state.cacr,
+                ctrl::CAAR => self.state.caar,
+                ctrl::MSP => self.state.sp(Bank::Master),
+                _ => self.state.sp(Bank::Interrupt),
+            };
+            self.set_register(u32::from(word >> 12), value);
+            // 12(2/0), "Source → Register".
+            self.internal(4);
+        }
+        self.settle()
+    }
+
+    /// `MOVES`: an operand in the address space `SFC` or `DFC` names
+    /// (M68000PRM, *MOVES*).
+    ///
+    /// The internal time makes the totals the 68010's table gives, 18 to 28
+    /// clocks by mode (MC68000UM Table 9-16).
+    fn op_moves(&mut self, size: Size) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let to_memory = word & 0x0800 != 0;
+        let index = u32::from(word >> 12);
+        let loc = self.resolve(Arg::Ea, size)?;
+        let extra = match ea_of(Arg::Ea, self.opcode) {
+            Some((Mode::PostInc, _)) => 8,
+            Some((Mode::Disp16 | Mode::AbsShort | Mode::AbsLong, _)) => 4,
+            _ => 6,
+        };
+        self.internal(extra);
+        let fc = if to_memory {
+            self.state.dfc
+        } else {
+            self.state.sfc
+        };
+        if to_memory {
+            // Read after the address is resolved, so `MOVES An,(An)+` stores
+            // the incremented value, as the note in the manual says every
+            // implementation does.
+            let value = self.register(index);
+            self.fc_override = Some(fc);
+            let done = self.write_loc(loc, size, value);
+            self.fc_override = None;
+            done?;
+        } else {
+            self.fc_override = Some(fc);
+            let read = self.read_loc(loc, size);
+            self.fc_override = None;
+            let value = read?;
+            if index >= 8 {
+                // An address register takes the operand sign-extended.
+                let value = match size {
+                    Size::Byte => i32::from(value as i8) as u32,
+                    Size::Word => i32::from(value as i16) as u32,
+                    Size::Long => value,
+                };
+                self.set_register(index, value);
+            } else {
+                let n = index as usize;
+                self.state.d[n] = merge(self.state.d[n], value, size);
+            }
+        }
+        self.settle()
+    }
+
+    /// `RTE` on a processor with format words: read the format, then do what
+    /// it says (MC68000UM §6.4; MC68020UM §6.1.12, Figure 6-7).
+    ///
+    /// A format this model does not define is a format error, vector 14, and
+    /// the frame is left where it was — "the processor creates a normal
+    /// four-word ... stack frame below the frame that it was attempting to
+    /// use", so a handler can inspect the bad one.
+    fn op_rte_formatted(&mut self) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let mut throwaways = 0u32;
+        loop {
+            let sp = self.state.a[7];
+            let high = self.read_word(sp.wrapping_add(2))?;
+            let sr = self.read_word(sp)?;
+            let low = self.read_word(sp.wrapping_add(4))?;
+            let format = self.read_word(sp.wrapping_add(6))? >> 12;
+            let pc = (u32::from(high) << 16) | u32::from(low);
+            let size = match (format, self.model.has_020()) {
+                (0x0, _) => 8,
+                (0x8, false) => return self.rte_long_010(sp, sr),
+                (0x1, true) => {
+                    // A throwaway frame: take its status word, which switches
+                    // stacks, and start again with the frame on top of the
+                    // new one. The cap is this core's, not the processor's:
+                    // a chain of throwaway frames that long is a corrupt
+                    // stack, and hardware would walk it for as long as memory
+                    // lasts while holding the scheduler inside one step.
+                    self.state.a[7] = sp.wrapping_add(8);
+                    self.state.set_sr(sr);
+                    throwaways += 1;
+                    if throwaways > MAX_THROWAWAY_FRAMES {
+                        return Err(Trap::raised(vector::FORMAT_ERROR, pc0));
+                    }
+                    continue;
+                }
+                (0x2, true) => 12,
+                (0xa, true) => 32,
+                (0xb, true) => return self.rte_long_020(sp, sr, pc),
+                // Format $9 is the coprocessor mid-instruction frame. With no
+                // coprocessor on the bus there is nothing to resume the
+                // instruction with, so it is treated as a format this
+                // processor cannot use.
+                _ => return Err(Trap::raised(vector::FORMAT_ERROR, pc0)),
+            };
+            self.state.a[7] = sp.wrapping_add(size);
+            self.state.set_sr(sr);
+            return self.refill(pc, 0);
+        }
+    }
+
+    /// `RTE` from a 68010 format $8 frame (MC68000UM §6.4).
+    fn rte_long_010(&mut self, sp: u32, sr: u16) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        // Validity first: the version number this processor wrote, else a
+        // format error with the stack untouched.
+        let version = self.read_word(sp.wrapping_add(0x1a))?;
+        if (version >> 10) & 0xf != VERSION_68010 {
+            return Err(Trap::raised(vector::FORMAT_ERROR, pc0));
+        }
+        // Then accessibility: the last word of the frame.
+        self.read_word(sp.wrapping_add(0x38))?;
+        let ssw = self.read_word(sp.wrapping_add(0x08))?;
+        let addr = self.read_long(sp.wrapping_add(0x0a))?;
+        let dib = self.read_word(sp.wrapping_add(0x14))?;
+        let restart = self.read_long(sp.wrapping_add(0x1c))?;
+        let undo = self.read_undo(sp.wrapping_add(0x20), 4)?;
+        self.state.a[7] = sp.wrapping_add(58);
+        self.state.set_sr(sr);
+        self.apply_undo(&undo);
+        // RR set: software ran the cycle (MC68000UM Figure 6-9).
+        if ssw & 0x8000 != 0 {
+            let byte = ssw & 0x0200 != 0;
+            let read = ssw & 0x0100 != 0;
+            // A read-modify-write the handler finished has finished the
+            // instruction, and execution resumes after it.
+            if ssw & 0x0800 != 0 {
+                let next = restart.wrapping_add(self.instruction_length(restart));
+                return self.refill(next, 0);
+            }
+            let data = if byte {
+                if ssw & 0x0400 != 0 {
+                    u32::from(dib >> 8)
+                } else {
+                    u32::from(dib & 0xff)
+                }
+            } else {
+                u32::from(dib)
+            };
+            self.state.replay = Some(Replay {
+                addr,
+                read,
+                width: if byte { 1 } else { 2 },
+                data,
+            });
+        }
+        self.refill(restart, 0)
+    }
+
+    /// `RTE` from a 68020 format $B frame (MC68020UM §6.1.12, §6.2.3).
+    fn rte_long_020(&mut self, sp: u32, sr: u16, pc: u32) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let version = self.read_word(sp.wrapping_add(0x36))?;
+        if version >> 12 != VERSION_68020 {
+            return Err(Trap::raised(vector::FORMAT_ERROR, pc0));
+        }
+        self.read_word(sp.wrapping_add(0x5a))?;
+        let data_fault = self.read_word(sp.wrapping_add(0x08))? & 1 != 0;
+        let ssw = self.read_word(sp.wrapping_add(0x0a))?;
+        let addr = self.read_long(sp.wrapping_add(0x10))?;
+        let dib = self.read_long(sp.wrapping_add(0x2c))?;
+        let undo = self.read_undo(sp.wrapping_add(0x38), 6)?;
+        self.state.a[7] = sp.wrapping_add(92);
+        self.state.set_sr(sr);
+        self.apply_undo(&undo);
+        // DF cleared on a data fault: software did the cycle.
+        if data_fault && ssw & SSW_DF == 0 {
+            if ssw & 0x0080 != 0 {
+                // RM: the whole CAS, CAS2 or TAS was emulated, condition
+                // codes and all (MC68020UM §6.2.2).
+                let next = pc.wrapping_add(self.instruction_length(pc));
+                return self.refill(next, 0);
+            }
+            let width = if (ssw >> 4) & 3 == 0b01 { 1 } else { 2 };
+            let data = if width == 1 { dib & 0xff } else { dib & 0xffff };
+            self.state.replay = Some(Replay {
+                addr,
+                read: ssw & 0x0040 != 0,
+                width,
+                data,
+            });
+        }
+        self.refill(pc, 0)
+    }
+
+    /// Read `slots` undo entries a long frame carries.
+    fn read_undo(&mut self, at: u32, slots: u32) -> Result<UndoList, Trap> {
+        let mut out = [(0u8, 0u32); 10];
+        let mut n = 0;
+        for i in 0..slots {
+            let base = at.wrapping_add(6 * i);
+            let code = self.read_word(base)?;
+            let value = self.read_long(base.wrapping_add(2))?;
+            // Anything but a register code this core writes is ignored rather
+            // than trusted: a handler is entitled to scribble on words the
+            // manual calls internal.
+            if code < 10 && n < out.len() {
+                out[n] = (code as u8, value);
+                n += 1;
+            }
+        }
+        Ok((out, n))
+    }
+
+    /// Put back the registers a faulted instruction had already moved.
+    fn apply_undo(&mut self, undo: &UndoList) {
+        let (entries, n) = undo;
+        for &(code, value) in &entries[..*n] {
+            match code {
+                0..=6 => self.state.a[code as usize] = value,
+                7 => self.state.set_sp(Bank::User, value),
+                8 => self.state.set_sp(Bank::Interrupt, value),
+                _ => self.state.set_sp(Bank::Master, value),
+            }
+        }
+    }
+
+    /// How long the instruction at `pc` is, read without side effects.
+    ///
+    /// Only an `RTE` that must step *over* an instruction a handler emulated
+    /// needs this, which is why it goes through the disassembler — the one
+    /// other place instruction lengths are computed, from the same table.
+    fn instruction_length(&self, pc: u32) -> u32 {
+        let mut words = [0u16; super::disasm::MAX_EXT_WORDS + 1];
+        for (i, slot) in words.iter_mut().enumerate() {
+            let at = pc.wrapping_add(2 * i as u32) & self.mask;
+            *slot = self
+                .space
+                .read(u64::from(at), Width::U16, MemAttrs::DEBUG)
+                .map_or(0, |v| v as u16);
+        }
+        u32::from(super::disasm::disassemble_for(self.model, pc, &words).len)
     }
 
     // ------------------------------------------------------------------
@@ -2563,6 +3648,120 @@ struct Group0 {
     ssw: u16,
     addr: u32,
     ir: u16,
+}
+
+/// This core's version number in a 68010 long frame, bits 13–10 of the word
+/// at `SP + $1A`.
+///
+/// The manual says only that `RTE` compares it with the processor's own and
+/// takes a format error if they differ (MC68000UM §6.4); the value is this
+/// core's, and a frame another core wrote is not one it can restart from.
+pub(super) const VERSION_68010: u16 = 0x1;
+
+/// The same for a 68020 long bus fault frame, bits 15–12 of the word at
+/// `SP + $36` (MC68020UM §6.1.12).
+pub(super) const VERSION_68020: u16 = 0x1;
+
+/// 68020 special status word bits (MC68020UM Figure 6-8).
+const SSW_FC: u16 = 0x8000;
+/// Fault on pipe stage B.
+const SSW_FB: u16 = 0x4000;
+/// Rerun pipe stage C.
+const SSW_RC: u16 = 0x2000;
+/// Rerun pipe stage B.
+const SSW_RB: u16 = 0x1000;
+/// Data fault: rerun the data cycle.
+const SSW_DF: u16 = 0x0100;
+
+/// The `CACR` bits with storage: **E** and **F** (MC68020UM Figure 4-2).
+const CACR_STORED: u32 = 0x3;
+
+/// How many throwaway frames one `RTE` follows before calling the stack
+/// corrupt. See `op_rte_formatted`.
+const MAX_THROWAWAY_FRAMES: u32 = 256;
+
+/// Undo entries a long frame carries: `(code, old value)`, the code 0–6 for
+/// `A0`–`A6` and 7–9 for the user, interrupt and master stack pointers.
+type UndoList = ([(u8, u32); 10], usize);
+
+/// Which stack frame an exception builds.
+#[derive(Debug, Clone, Copy)]
+enum Frame {
+    /// The 68000's own: six bytes, or fourteen with the group-0 fields.
+    Classic(Option<Group0>),
+    /// A format-word frame, 68010 on.
+    Format(FrameImage),
+}
+
+impl Frame {
+    /// A frame of `format` with nothing past the first four words.
+    const fn format(format: u8) -> Frame {
+        Frame::Format(FrameImage::new(format))
+    }
+
+    /// The same frame, followed by a throwaway frame on the interrupt stack.
+    const fn throwaway(self) -> Frame {
+        match self {
+            Frame::Format(mut image) => {
+                image.throwaway = true;
+                Frame::Format(image)
+            }
+            other => other,
+        }
+    }
+}
+
+/// The words of a format-word frame beyond the four every format shares.
+#[derive(Debug, Clone, Copy)]
+struct FrameImage {
+    /// The format code, bits 15–12 of the format word.
+    format: u8,
+    /// `words[0]` is the word at `SP + 8`.
+    words: [u16; 42],
+    len: u8,
+    /// Words the processor reserves but does not write.
+    skip: u64,
+    /// Follow with a format $1 frame on the interrupt stack.
+    throwaway: bool,
+}
+
+impl FrameImage {
+    const fn new(format: u8) -> FrameImage {
+        FrameImage {
+            format,
+            words: [0; 42],
+            len: 0,
+            skip: 0,
+            throwaway: false,
+        }
+    }
+
+    fn push(&mut self, word: u16) {
+        self.words[self.len as usize] = word;
+        self.len += 1;
+    }
+
+    fn skip_one(&mut self) {
+        self.skip |= 1u64 << self.len;
+        self.len += 1;
+    }
+
+    /// `slots` undo entries of three words each: the register code, then the
+    /// value. An unused slot has code `$ffff`.
+    fn push_undo(&mut self, undo: &UndoList, slots: usize) {
+        let (entries, n) = undo;
+        let used = (*n).min(slots);
+        for &(code, value) in &entries[..used] {
+            self.push(u16::from(code));
+            self.push((value >> 16) as u16);
+            self.push(value as u16);
+        }
+        for _ in used..slots {
+            self.push(0xffff);
+            self.push(0);
+            self.push(0);
+        }
+    }
 }
 
 /// Which binary operation an ALU row performs.
