@@ -123,6 +123,13 @@
 //! dot, at which point the PPU's counter reads 82179 — the CPU cycle containing
 //! that dot has not finished. A device delivering its own event advances itself
 //! to the tick it asked for; it knows that tick, having scheduled it.
+//!
+//! The same goes for a lazily-advanced device's own event: a round that ends
+//! on one leaves the device *on* it, a fraction of a driving tick ahead of its
+//! domain's counter, rather than on the counter and short of it. Short of it,
+//! the event is neither reached nor in the future, so nothing bounds the next
+//! round by it and the device waits for somebody else's deadline —
+//! [`Scheduler::sync_lazy_devices`] has the measured cost of that.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeSet, BinaryHeap};
@@ -2863,6 +2870,29 @@ impl Scheduler {
     /// making progress, because a single [`LazyHandle::sync`] stops at the
     /// device's own next event and a quantum may contain several of them.
     ///
+    /// # The event a round ended on
+    ///
+    /// Then every event of a device's own whose instant has arrived is
+    /// delivered, even where that is **ahead of the tree**. A round that
+    /// [`Scheduler::lazy_deadline`] ended on a device's event stops at that
+    /// event's instant, but the tree it is counted on only advances by whole
+    /// ticks of the runnables that drive it (see the module documentation), so
+    /// the domain's counter can read one tick short of the event — a colour
+    /// clock short on an Amiga, where the last runnable of a round counts in
+    /// colour clocks and the round ended mid-way through one. Catching up to
+    /// that counter alone leaves the event unreached; and the next round cannot
+    /// be bounded by it either, because its instant is no longer in the future,
+    /// so it would wait for whatever deadline came next — on an A500, the
+    /// quantum grid, a millisecond on. Measured there under Kickstart 2.04,
+    /// Agnus had to be caught up by more than a scanline at a round boundary
+    /// 5 526 times in eight virtual seconds, by a median 3 410 colour clocks
+    /// and at most 3 547 — the whole quantum. Paula, caught up first, ran that
+    /// far past audio slots Agnus had not served, and a fifth of the words of a
+    /// steady tone played twice (`tests/amiga_a500_audio_dma.rs`). That is a
+    /// device skipping a scheduled event, which a run loop exists to prevent;
+    /// delivering it here is what an event dispatcher already does for a
+    /// queued one ([`Scheduler::sync_to_tick`]), for the same reason.
+    ///
     /// # Errors
     ///
     /// [`SchedError::Clock`] for a domain the forest does not know,
@@ -2879,6 +2909,27 @@ impl Scheduler {
                     break;
                 }
                 last = Some(at);
+            }
+            self.deliver_due_events(id, slot)?;
+        }
+        Ok(())
+    }
+
+    /// Advance one device through every event of its own whose instant is not
+    /// after [`Scheduler::now`]. See [`Scheduler::sync_lazy_devices`].
+    ///
+    /// Bounded by the instant, not by a count: past the tree's position there
+    /// is less than one tick of the domain that drives it, so this is one event
+    /// in practice, and a device that reports an event it cannot reach stops
+    /// the walk rather than spinning it.
+    fn deliver_due_events(&self, id: LazyId, slot: &LazySlot) -> SchedResult<()> {
+        while let Some(tick) = slot.next_event_tick() {
+            let from = slot.current_tick(id)?;
+            if tick <= from || self.forest.global_time_of_tick(slot.domain, tick)? > self.now {
+                break;
+            }
+            if slot.sync_to_tick(id, tick)? <= from {
+                break;
             }
         }
         Ok(())
@@ -5985,6 +6036,63 @@ mod tests {
             sched.run_quantum().unwrap();
         }
         assert_eq!(sched.lazy_deadline(), None);
+    }
+
+    /// A device with an event on every scanline: 341 dots, which is not a
+    /// whole number of 6502 cycles, so a round that ends on one usually leaves
+    /// the tree a dot or two short of it.
+    #[derive(Debug, Default)]
+    struct Scanlines {
+        tick: u64,
+    }
+
+    impl Scanlines {
+        const DOTS: u64 = 341;
+    }
+
+    impl LazyDevice for Scanlines {
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+        fn advance_to(&mut self, tick: u64) {
+            assert!(tick >= self.tick, "advance_to must never go backwards");
+            self.tick = tick;
+        }
+        fn next_event_tick(&self) -> Option<u64> {
+            Some((self.tick / Self::DOTS + 1) * Self::DOTS)
+        }
+    }
+
+    #[test]
+    fn the_event_a_round_ends_on_is_delivered_even_a_tick_short_of_it() {
+        // The round stops at the instant of the scanline, but the 6502 counts
+        // in twelve master ticks and a dot is four, so the tree stands a dot or
+        // two before it. Catching the device up to *that* left the event
+        // behind: it was no longer in the future, so it could not bound the
+        // next round either, and the device waited for whatever deadline came
+        // next. On the A500 that was the quantum grid, a millisecond away, and
+        // Paula ran ahead of Agnus's audio slots by up to fifteen lines.
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        let dev = sched.add_lazy_device(ppu, Box::new(Scanlines::default()));
+        let handle = sched.lazy_handle(dev).expect("a handle");
+
+        let mut short = 0;
+        for round in 0..200 {
+            sched.run_quantum().unwrap();
+            sched.sync_lazy_devices().unwrap();
+            let tick = handle.current_tick().unwrap();
+            let tree = sched.forest().ticks(ppu).unwrap();
+            if tick > tree {
+                short += 1;
+                assert!(tick - tree < 3, "less than one CPU cycle ahead, never more");
+            }
+            // No event of the device's own is left at or before `now`.
+            let next = (tick / Scanlines::DOTS + 1) * Scanlines::DOTS;
+            let at = sched.forest().global_time_of_tick(ppu, next).unwrap();
+            assert!(at > sched.now(), "round {round}: dot {next} is already due");
+        }
+        assert!(short > 0, "the rounding this test is about happened");
     }
 
     /// A device that reads its own registers as it simulates — the one way a

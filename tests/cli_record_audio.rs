@@ -404,14 +404,10 @@ fn a_machine_with_no_sound_chip_says_so() {
 /// **left** output, channels 0 and 3 being the left pair (Chapter 5).
 ///
 /// A recorded file's strongest spectral component is 2.22 kHz, which is that
-/// figure. The assertions below are nonetheless about *level and side* rather
-/// than pitch, because the tone is not clean: Agnus and Paula are both lazily
-/// advanced and can be a millisecond apart, so an audio DMA slot sometimes
-/// lands after Paula has already crossed two word boundaries — `AUDxDR` is one
-/// flag, not a count, so that word is fetched once and played twice, and the
-/// repeats put energy below the fundamental. The stream reproduces what the
-/// chipset fed the channel, which is what this file is for; the chipset's own
-/// handshake is `agnus`'s business.
+/// figure. The assertions below are about *level and side* rather than pitch,
+/// because this file is about the host stream; that every word of every block
+/// reaches the channel once and in order is `tests/amiga_a500_audio_dma.rs`'s
+/// claim.
 #[cfg(feature = "machine-amiga-a500")]
 fn amiga_tone_rom() -> Vec<u8> {
     const CODE: &[u16] = &[

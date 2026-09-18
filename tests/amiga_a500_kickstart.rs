@@ -285,9 +285,9 @@ fn aros_runs_until_it_needs_its_extended_rom() {
 /// At 12 s: the hand and disk on white.
 const GOLDEN_130: u64 = 0x0d15_a156_1521_12c1;
 /// At 28 s: the check mark, the drive, and the disk below it mid-animation.
-const GOLDEN_204: u64 = 0x9a92_f494_18cf_2811;
+const GOLDEN_204: u64 = 0x74ea_2a62_c231_b235;
 /// At 12 s: the same picture with the 3.1 text.
-const GOLDEN_310: u64 = 0xfdec_fe27_9cd5_3349;
+const GOLDEN_310: u64 = 0xb0e3_ceb0_63d8_207d;
 /// At 62 s with the Workbench 2.04 disk: the desktop.
 const GOLDEN_204_WORKBENCH: u64 = 0x95a5_9a12_c942_e139;
 /// At 90 s with the Workbench 1.3 disk: the desktop.
