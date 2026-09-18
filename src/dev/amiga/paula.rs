@@ -263,7 +263,7 @@ use crate::core::device::{
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::sched::{AccessKind, Budget, Consumed, LazyHandle};
+use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
@@ -1448,6 +1448,16 @@ impl Shared {
         if moved {
             self.refresh();
         }
+        // The host port is serviced here, on the chip's own time, rather than
+        // by a runnable. Paula executes nothing, and a runnable on the
+        // processor's crystal was taking a turn of every round from the
+        // 68000 to do this one poll (`docs/platforms/amiga.md`). Catch-up is
+        // reached at least once a round — `Scheduler::sync_lazy_devices`
+        // brings every lazy device to the round's end — and on every guest
+        // access besides, and only when time has moved, so a waiting byte is
+        // taken no later than it was before and a refused one is still
+        // retried every round.
+        self.pump();
     }
 
     /// Mutate the state at the current tick, then republish and re-drive.
@@ -1896,7 +1906,8 @@ impl Paula {
 
     /// Move bytes between the UART and the host.
     ///
-    /// What [`Device::run`] does; a test with no scheduler calls it directly.
+    /// What every catch-up that moves the chip does at its end; a test that
+    /// wants a byte taken without moving time calls it directly.
     pub fn pump(&self) {
         self.shared.pump();
     }
@@ -2157,18 +2168,6 @@ impl Device for Paula {
             sink: pin,
             line: u32::from(six),
         })
-    }
-
-    fn is_runnable(&self) -> bool {
-        // Not because it executes anything: a byte from the host has to be
-        // picked up, and a refused one retried, and the scheduler is the only
-        // thing allowed to decide when.
-        true
-    }
-
-    fn run(&self, budget: Budget) -> Consumed {
-        self.shared.pump();
-        Consumed::new(budget.ticks)
     }
 
     // -- lazily advanced (`ROADMAP.md` §4.2) ---------------------------------

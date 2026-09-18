@@ -131,14 +131,33 @@ first word boundary can come before its first slot. The model then plays the
 stale buffer for that boundary and counts it, so the first block is one word
 short. From the second block on the stream is exact at every period.
 
-**The 68000 runs at half its clock** — measured, not modelled: 6 204 233
-cycles executed in 1.74 virtual seconds, 50.2 % of what `clk / 4` owes. Paula
-is a runnable (it pumps the host serial port) on the processor's own crystal,
-and a round divides a crystal's span between the runnables on it
-(`Scheduler::tree_shares`), so Paula's pump consumes half of every round with
-nothing executing. The chips all keep time; only the processor is slow. That is
-a scheduler question with every board that has a pumping device on its CPU's
-crystal in its blast radius, and it is not fixed here.
+**The 68000 gets its whole clock.** It used to run at half: 6 204 233 cycles
+executed in 1.74 virtual seconds, 50.2 % of what `clk / 4` owes, measured
+from the processor's own count. Paula was a runnable — only so that it could
+poll the host serial port once a round — on the processor's own crystal, and
+a round divided a crystal's span between the runnables on it, so the poll took
+half of every round with nothing executing. The chips all kept time; only the
+processor was slow.
+
+Paula executes nothing, and it is not a runnable any more. The poll happens at
+the end of every catch-up that moves the chip (`Shared::advance_to`), which
+`Scheduler::sync_lazy_devices` reaches at least once a round and every guest
+access reaches besides, so a waiting byte is taken no later than it was and a
+refused one is still retried every round. `tests/amiga_a500_cpu_rate.rs`
+runs a two-instruction loop out of a synthetic ROM for 100 ms and asserts the
+68000 retired `clk / 4` of it to within one iteration: **709 380 cycles of
+709 379 owed** (100.00 %), where the same test on the old board reads 356 292
+(50.23 %).
+
+What moved: the two animated insert-disk screens (2.04 at 28 s, 3.1 at 12 s),
+which show the same picture with the disk at another point of its slide
+because the ROM reached the screen sooner; nothing else. The Workbench boots
+reach **the same desktops, bit for bit, much sooner**: Workbench 2.04's
+picture stops changing at 42 s rather than about 60, and Workbench 1.3's at
+68 s rather than about 88, so the tests now stop at 45 s and 72 s instead of
+62 s and 90 s. Over the *same* virtual span the host pays about 6 % more for
+twice the processor work (12.6-13.0 s → 13.5-13.7 s for 62 s of 2.04, 20.0 s
+→ 21.2 s for 90 s of 1.3).
 
 **A drive is its own device, on the CIA ports.** `amiga.floppy` takes `MTR*`,
 `SEL*`, `SIDE*`, `DIR` and `STEP*` as wires and answers on `RDY*`, `TK0*`,
@@ -233,10 +252,10 @@ an empty drive.
 
 **Kickstart 2.04 boots the Workbench 2.04 disk to its desktop**, both files
 read in place: the boot block runs, AmigaDOS reads the root block on cylinder
-40, the head works across the disk for about fifty virtual seconds, the shell
+40, the head works across the disk for about thirty-five virtual seconds, the shell
 window prints "Amiga Release 2. Kickstart 37.175, Workbench 37.67", and
 `LoadWB` opens the Workbench window with its Ram Disk and Workbench2.0 icons.
-`tests/amiga_a500_kickstart.rs` hashes that picture at 62 s. Workbench 1.3 on
+`tests/amiga_a500_kickstart.rs` hashes that picture at 45 s. Workbench 1.3 on
 the same Kickstart reaches its own desktop the same way. No write reaches
 either disk.
 
@@ -357,11 +376,11 @@ with `RSEMU_AMIGA_ADF_DIR` as well it boots the Workbench 1.3 and 2.04 disks.
 
 | ROM | Reaches | What is on screen |
 | --- | --- | --- |
-| Kickstart 1.3 (34.5, 256 KiB) | its insert-disk screen, ~10 s | White background; a black-outlined hand holding a blue-violet 3½" disk with a grey shutter; the label reads "AMIGA Workbench" upside down, as the disk is held; "V1.3" beside it. Static. No pointer |
-| Kickstart 2.04 (37.175) | its insert-disk screen, ~24 s | Dark purple background; the rainbow check mark top left; "2.0 Roms (37.175) / Copyright © 1985-1991 / Commodore-Amiga, Inc. / All Rights Reserved" in salmon; a salmon drive with a black slot, and a blue disk with a grey shutter and white label below it, animating into the drive. No pointer. The colours are the ones the ROM's own copper list loads |
-| Kickstart 3.1 (40.063, A500/A600/A2000) | its insert-disk screen, ~10 s | The same picture with "3.1 ROM 40.063 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." |
-| Kickstart 2.04 + the Workbench 2.04 disk | the Workbench desktop, ~57 s | A grey 640-pixel high-resolution screen; a black screen title bar reading "Copyright © 1985-1991 Commodore-Amiga, Inc. All Rights Reserved" with the red pointer over its first letters; below it the blue-titled "Workbench" window, its Ram Disk and Workbench2.0 icons, both scroll bars and the sizing gadget. The busy pointer appears while the disk is read. Nothing is out of place |
-| Kickstart 1.3 + the Workbench 1.3 disk | the Workbench desktop, ~85 s | A plain blue 640-pixel high-resolution screen; a white screen title bar reading "Workbench release." and "365000 free memory", with the red pointer over its first letters; the RAM DISK and Workbench1.3 icons down the right-hand edge. The AmigaDOS shell the startup-sequence opens is up by 40 s and `[CLI 2]` — `LoadWB` — by 60 |
+| Kickstart 1.3 (34.5, 256 KiB) | its insert-disk screen | White background; a black-outlined hand holding a blue-violet 3½" disk with a grey shutter; the label reads "AMIGA Workbench" upside down, as the disk is held; "V1.3" beside it. Static. No pointer |
+| Kickstart 2.04 (37.175) | its insert-disk screen | Dark purple background; the rainbow check mark top left; "2.0 Roms (37.175) / Copyright © 1985-1991 / Commodore-Amiga, Inc. / All Rights Reserved" in salmon; a salmon drive with a black slot, and a blue disk with a grey shutter and white label below it, animating into the drive. No pointer. The colours are the ones the ROM's own copper list loads |
+| Kickstart 3.1 (40.063, A500/A600/A2000) | its insert-disk screen | The same picture with "3.1 ROM 40.063 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." |
+| Kickstart 2.04 + the Workbench 2.04 disk | the Workbench desktop, 42 s | A grey 640-pixel high-resolution screen; a black screen title bar reading "Copyright © 1985-1991 Commodore-Amiga, Inc. All Rights Reserved" with the red pointer over its first letters; below it the blue-titled "Workbench" window, its Ram Disk and Workbench2.0 icons, both scroll bars and the sizing gadget. The busy pointer appears while the disk is read. Nothing is out of place |
+| Kickstart 1.3 + the Workbench 1.3 disk | the Workbench desktop, 68 s | A plain blue 640-pixel high-resolution screen; a white screen title bar reading "Workbench release." and "365000 free memory", with the red pointer over its first letters; the RAM DISK and Workbench1.3 icons down the right-hand edge. The AmigaDOS shell the startup-sequence opens, then `[CLI 2]` — `LoadWB` — on the way |
 | AROS (2025-04-22 main ROM) | an alert on the serial port | See below |
 
 **AROS** is blocked by the board, not a chip. Its main ROM alone raises
@@ -373,14 +392,16 @@ out of chip memory** on a 512 KiB board (`AvailMem` down to 16 bytes, grey
 screen, idle). With `-p chip-ram=1M` it draws its boot picture — a cat's eyes
 in the dark, 640 pixels of high resolution, square since the fetch fix below.
 
-That leaves one AROS question, and it is still open: on that scratch board
-(extended ROM at `$E0_0000`, `-p chip-ram=1M`), with `amiga.keyboard` wired to
-CIA-A AROS stops at a plain grey screen (`COLOR00` `$AAA`, no bitplane DMA),
-and without it the picture appeared — until the scheduler started delivering
-the event a round ends on (the audio paragraph above has why), since when it
-stops there with or without the keyboard. Its serial log ends at
-`romtaginit done` either way. The shipped board is no witness: without the extended ROM it draws
-nothing with or without the keyboard. What is established:
+That left one AROS question, and the 68000's whole clock answered it: on
+that scratch board (extended ROM at `$E0_0000`, `-p chip-ram=1M`), with
+`amiga.keyboard` wired to CIA-A, AROS used to stop at a plain grey screen
+(`COLOR00` `$AAA`, no bitplane DMA), and without it the picture appeared —
+until the scheduler started delivering the event a round ends on (the audio
+paragraph above has why), since when it stopped there with or without the
+keyboard. Its serial log ended at `romtaginit done` either way. It now draws
+the eyes and the logo with the keyboard wired. The shipped board is no
+witness: without the extended ROM it draws nothing with or without the
+keyboard. What was established on the way:
 
 * **The keyboard's side of the wire checks out** against Appendix G and the
   8520 data sheet: eight positive `CNT` edges a byte, 60 µs a bit, the code
@@ -399,14 +420,15 @@ nothing with or without the keyboard. What is established:
 * **The wedge is a lost wake-up.** At 60 s nothing is ready: the Exec
   Bootstrap Task is waiting on signal `$00080000` and `input.device` on
   `$003F0000` (read through the RKRM's `ExecBase` and `Task` layouts).
-* **It is not the crystal's speed, but it is the processor's.** A crystal four
-  times faster wedges the same way, and a keyboard clock 5 % off does too — but
-  both keep the 68000 at the half of its clock it gets on this board (see *The
-  68000 runs at half its clock* above). Given its whole clock instead (an
-  experiment with Paula's pump taken off the crystal, not a change in this
-  tree), AROS draws its eyes and its logo with the keyboard and without, before
-  the scheduler fix and after. So the keyboard, and the scheduler fix, are two
-  ways of moving an interrupt into a window a half-speed processor leaves open. Taking DF0 off the board, or only its `TK0*`
+* **It was not the crystal's speed, but it was the processor's.** A crystal
+  four times faster wedged the same way, and a keyboard clock 5 % off did too —
+  but both kept the 68000 at the half of its clock it used to get on this
+  board (see *The 68000 gets its whole clock* above). Given its whole clock,
+  which it now has, AROS draws its eyes and its logo **with the keyboard**:
+  the same scratch board (the shipped file with `chip-ram = 1M` and the
+  extended ROM mapped at `$E00000`), 60 s, reaches the eyes-and-logo picture
+  rather than the flat grey it stopped at. So the keyboard was one way of
+  moving an interrupt into a window a half-speed processor left open. Taking DF0 off the board, or only its `TK0*`
   wire, also avoids it (AROS's path then differs); taking the mouse off does
   not.
 * **Ruled out:** resetting the 8520's shift counter when `CRA` bit 6 flips,

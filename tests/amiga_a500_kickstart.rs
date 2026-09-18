@@ -213,11 +213,14 @@ fn kickstart_3_1_draws_the_insert_disk_animation() {
 /// "Workbench" window holding the Ram Disk and Workbench2.0 icons, on a grey
 /// 640-pixel high-resolution screen, with the red pointer at the top left.
 ///
-/// Sixty-two virtual seconds, the least that proves it: the disk is read until
-/// about 57 s, and the picture has settled by 60. Before the blitter's line
-/// mode stepped D by `BLTCMOD` this run stopped with `AN_MemCorrupt` at about
-/// 38 s; before the high-resolution fetch counted in eight-count blocks it
-/// reached the desktop sheared a word a line.
+/// Forty-five virtual seconds, the least that proves it with a margin: the
+/// picture reaches this desktop at 42 s and does not move again. It took 62
+/// until the 68000 was given its whole clock — Paula's serial poll used to be
+/// a runnable on the processor's crystal and took half of every round
+/// (`docs/platforms/amiga.md`), and the disk was read until about 57 s.
+/// Before the blitter's line mode stepped D by `BLTCMOD` this run stopped with
+/// `AN_MemCorrupt`; before the high-resolution fetch counted in eight-count
+/// blocks it reached the desktop sheared a word a line.
 #[test]
 fn kickstart_2_04_boots_the_workbench_2_04_disk_to_its_desktop() {
     let Ok(dir) = std::env::var("RSEMU_AMIGA_ADF_DIR") else {
@@ -232,7 +235,7 @@ fn kickstart_2_04_boots_the_workbench_2_04_disk_to_its_desktop() {
         println!("amiga-a500: {} is not there; skipped", path.display());
         return;
     };
-    reaches_its_screen("amiga-os-204.rom", disk, 62, GOLDEN_204_WORKBENCH);
+    reaches_its_screen("amiga-os-204.rom", disk, 45, GOLDEN_204_WORKBENCH);
 }
 
 /// Kickstart 1.3 with the Workbench 1.3 disk in DF0, both read in place: the
@@ -241,11 +244,11 @@ fn kickstart_2_04_boots_the_workbench_2_04_disk_to_its_desktop() {
 /// release." and the free-memory count, the RAM DISK and Workbench1.3 icons
 /// down the right-hand edge, and the red pointer at the top left.
 ///
-/// Ninety virtual seconds. 1.3 is slower to the desktop than 2.04 is: the
-/// shell banner is up by 40 s, `LoadWB` has opened `[CLI 2]` by 60, the icons
-/// are drawn by 90, and the picture no longer moves after that (the
-/// free-memory figure is still settling at 84 s and is identical at 90 and
-/// 100).
+/// Seventy-two virtual seconds. 1.3 is slower to the desktop than 2.04 is:
+/// the picture changes for the last time at 68 s and is this desktop from then
+/// on. With the 68000 at half its clock it took ninety — the shell banner was
+/// up by 40 s, `[CLI 2]` by 60 and the free-memory figure still settling at
+/// 84.
 ///
 /// Before the drive stepped its head on the *trailing* edge of `STEP*` this
 /// run never got past the insert-disk screen: 1.3 asserts `SEL0*` and `STEP*`
@@ -266,7 +269,7 @@ fn kickstart_1_3_boots_the_workbench_1_3_disk_to_its_desktop() {
         println!("amiga-a500: {} is not there; skipped", path.display());
         return;
     };
-    reaches_its_screen("amiga-os-130.rom", disk, 90, GOLDEN_130_WORKBENCH);
+    reaches_its_screen("amiga-os-130.rom", disk, 72, GOLDEN_130_WORKBENCH);
 }
 
 /// AROS's 512 KiB main ROM alone. It cannot reach a screen on this board: its
@@ -285,10 +288,10 @@ fn aros_runs_until_it_needs_its_extended_rom() {
 /// At 12 s: the hand and disk on white.
 const GOLDEN_130: u64 = 0x0d15_a156_1521_12c1;
 /// At 28 s: the check mark, the drive, and the disk below it mid-animation.
-const GOLDEN_204: u64 = 0x74ea_2a62_c231_b235;
+const GOLDEN_204: u64 = 0xcfa0_61a4_23d3_703d;
 /// At 12 s: the same picture with the 3.1 text.
-const GOLDEN_310: u64 = 0xb0e3_ceb0_63d8_207d;
-/// At 62 s with the Workbench 2.04 disk: the desktop.
+const GOLDEN_310: u64 = 0x26cc_b705_6fbc_7ba9;
+/// At 45 s with the Workbench 2.04 disk: the desktop.
 const GOLDEN_204_WORKBENCH: u64 = 0x95a5_9a12_c942_e139;
-/// At 90 s with the Workbench 1.3 disk: the desktop.
+/// At 72 s with the Workbench 1.3 disk: the desktop.
 const GOLDEN_130_WORKBENCH: u64 = 0xb491_89ae_fb75_bd01;
