@@ -35,20 +35,13 @@ const AUD0LEN: u16 = 0x0a4;
 const AUD0PER: u16 = 0x0a6;
 const AUD0VOL: u16 = 0x0a8;
 const AUD0DAT: u16 = 0x0aa;
-const AUD1LEN: u16 = 0x0b4;
-const AUD1PER: u16 = 0x0b6;
 const AUD1VOL: u16 = 0x0b8;
-const AUD3LEN: u16 = 0x0d4;
-const AUD3PER: u16 = 0x0d6;
-const AUD3VOL: u16 = 0x0d8;
 
 /// `DMACON`: `SET/CLR`, `DMAEN`, `DSKEN`, `AUD0EN`.
 const DMAF_SETCLR: u16 = 0x8000;
 const DMAF_MASTER: u16 = 0x0200;
 const DMAF_DISK: u16 = 0x0010;
 const DMAF_AUD0: u16 = 0x0001;
-const DMAF_AUD1: u16 = 0x0002;
-const DMAF_AUD3: u16 = 0x0008;
 
 /// `ADKCON`: `WORDSYNC`, `FAST`, `USE0V1`.
 const ADKF_WORDSYNC: u16 = 0x0400;
