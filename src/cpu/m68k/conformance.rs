@@ -978,6 +978,10 @@ mod why {
         "68020 SR has storage for T0 and M, and M selects the master stack (MC68020UM §1.3.2)";
 }
 
+/// Run the vector again on the other model with some instruction words
+/// replaced — `(word index, new word)`.
+type Rerun<'a> = dyn FnMut(&[(usize, u16)]) -> Outcome + 'a;
+
 /// Explain a difference between the 68000's outcome and another model's, or
 /// say that nothing documented explains it.
 fn explain(
@@ -986,6 +990,7 @@ fn explain(
     rte_format: u16,
     reference: &Outcome,
     other: &Outcome,
+    rerun: &mut Rerun<'_>,
 ) -> core::result::Result<Option<&'static str>, String> {
     let opcode = words[0];
     let insn = decode_for(Model::M68000, opcode);
@@ -1023,8 +1028,25 @@ fn explain(
     if is_020 && matches!(insn.op, Op::Bra | Op::Bsr | Op::Bcc) && opcode & 0xff == 0xff {
         return Ok(Some(why::BCC_L));
     }
-    if is_020 && uses_020_index_bits(words) {
-        return Ok(Some(why::INDEX_020));
+    let patches = if is_020 {
+        index_patches(words)
+    } else {
+        Vec::new()
+    };
+    if !patches.is_empty() {
+        // Not taken on trust: the same vector with the extension-word bits
+        // the 68000 ignores cleared must then be a vector the 68020 runs as
+        // the 68000 does, up to the other documented differences. Only then
+        // is the scale or the full format what made the difference.
+        let mut plain = *words;
+        for (index, word) in &patches {
+            plain[*index] = *word;
+        }
+        let again = rerun(&patches);
+        return match explain(model, &plain, rte_format, reference, &again, rerun) {
+            Ok(_) => Ok(Some(why::INDEX_020)),
+            Err(e) => Err(format!("even with the 68020 index bits cleared: {e}")),
+        };
     }
     if insn.op == Op::Rte && reference.vector.is_none() {
         // Format 0 is the four-word frame, which returns exactly as the 68000
@@ -1159,7 +1181,8 @@ fn explain(
 /// Whether an instruction's indexed operand uses the extension-word bits a
 /// 68000 ignores and a 68020 does not: the scale in bits 10–9 and the
 /// full-format flag in bit 8.
-fn uses_020_index_bits(words: &[u16; 12]) -> bool {
+fn index_patches(words: &[u16; 12]) -> Vec<(usize, u16)> {
+    let mut out = Vec::new();
     let d = super::disasm::disassemble(0, words);
     let insn = d.insn;
     let mut at = usize::from(insn.ext);
@@ -1174,7 +1197,9 @@ fn uses_020_index_bits(words: &[u16; 12]) -> bool {
             Arg::Ea | Arg::EaDst => match ea_of(arg, d.opcode) {
                 Some((Mode::Index8 | Mode::PcIndex8, _)) => {
                     if d.ext[at] & 0x0700 != 0 {
-                        return true;
+                        // Word `at + 1` of the instruction, with the bits a
+                        // 68000 ignores cleared.
+                        out.push((at + 1, d.ext[at] & !0x0700));
                     }
                     at += 1;
                 }
@@ -1187,7 +1212,41 @@ fn uses_020_index_bits(words: &[u16; 12]) -> bool {
             _ => {}
         }
     }
-    false
+    out
+}
+
+/// A vector's initial state with some of its instruction words replaced:
+/// word 0 and 1 are the prefetch queue, the rest are memory after it.
+fn patch_words(initial: &Json, patches: &[(usize, u16)]) -> Json {
+    let pc = regs_of(initial).pc;
+    let mut out = initial.clone();
+    let Json::Obj(fields) = &mut out else {
+        return out;
+    };
+    for (index, word) in patches {
+        if *index < 2 {
+            if let Some((_, Json::Arr(queue))) = fields.iter_mut().find(|(k, _)| k == "prefetch") {
+                queue[*index] = Json::Num(i64::from(*word));
+            }
+            continue;
+        }
+        let at = pc.wrapping_add(2 * *index as u32) & ADDRESS_MASK;
+        if let Some((_, Json::Arr(ram))) = fields.iter_mut().find(|(k, _)| k == "ram") {
+            ram.retain(|cell| {
+                let addr = cell.arr()[0].num() as u32 & ADDRESS_MASK;
+                addr != at && addr != (at + 1) & ADDRESS_MASK
+            });
+            ram.push(Json::Arr(vec![
+                Json::Num(i64::from(at)),
+                Json::Num(i64::from(word >> 8)),
+            ]));
+            ram.push(Json::Arr(vec![
+                Json::Num(i64::from((at + 1) & ADDRESS_MASK)),
+                Json::Num(i64::from(word & 0xff)),
+            ]));
+        }
+    }
+    out
 }
 
 /// What the differential found for one model.
@@ -1229,7 +1288,8 @@ fn differential_file(path: &Path, limit: usize, model: Model, out: &mut Differen
         let a = reference.run(initial);
         let b = other.run(initial);
         out.vectors += 1;
-        match explain(model, &words, rte_format, &a, &b) {
+        let mut rerun = |patches: &[(usize, u16)]| other.run(&patch_words(initial, patches));
+        match explain(model, &words, rte_format, &a, &b, &mut rerun) {
             Ok(None) => out.identical += 1,
             Ok(Some(why)) => *out.explained.entry(why).or_insert(0) += 1,
             Err(what) => {
@@ -1279,7 +1339,7 @@ fn differential_against_the_68000() {
         .collect();
     names.sort();
     let mut failed = Vec::new();
-    for model in [Model::M68010] {
+    for model in [Model::M68010, Model::M68EC020] {
         let mut out = Differential::default();
         for name in &names {
             if let Some(only) = &only

@@ -50,7 +50,10 @@
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
-use super::isa::{Arg, Cond, Insn, Mode, Model, Op, Size, ctrl, decode_for, ea_of};
+use super::isa::{
+    Arg, Cond, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl, decode_for, ea_of,
+    is_full_format,
+};
 use super::{Config, Lines, flags, vector};
 
 /// Function codes, as they appear on FC0–FC2 and in a group-0 stack frame's
@@ -1895,6 +1898,10 @@ impl<'a> Exec<'a> {
                 Ok(Loc::Mem(self.state.a[reg].wrapping_add(disp)))
             }
             Mode::Index8 => {
+                if self.model.has_020() {
+                    let base = self.state.a[reg];
+                    return self.index_020(base, extra.index_delay()).map(Loc::Mem);
+                }
                 let word = self.ext(extra.index_delay())?;
                 Ok(Loc::Mem(self.index_address(self.state.a[reg], word)))
             }
@@ -1927,6 +1934,9 @@ impl<'a> Exec<'a> {
             }
             Mode::PcIndex8 => {
                 let base = self.state.pc.wrapping_add(2);
+                if self.model.has_020() {
+                    return self.index_020(base, extra.index_delay()).map(Loc::Mem);
+                }
                 let word = self.ext(extra.index_delay())?;
                 Ok(Loc::Mem(self.index_address(base, word)))
             }
@@ -1956,6 +1966,16 @@ impl<'a> Exec<'a> {
     /// address arithmetic is charged as a block up front rather than spread
     /// around a fetch (MC68000UM Table 8-13).
     fn jump_target(&mut self) -> Result<u32, Trap> {
+        if self.model.has_020() {
+            // The 68020's jump address is an ordinary control address,
+            // including the memory-indirect modes, and its timing comes from
+            // the tables rather than from the queue (MC68020UM §8.2.5).
+            let Loc::Mem(target) = self.resolve_control(Arg::Ea, ExtraCycles::Control)? else {
+                let pc0 = self.pc0;
+                return Err(Trap::at(vector::ILLEGAL, pc0));
+            };
+            return Ok(target);
+        }
         let Some((mode, reg)) = ea_of(Arg::Ea, self.opcode) else {
             // decode() only lets control modes reach here.
             debug_assert!(false, "{:04x} is not a jump", self.opcode);
@@ -2009,6 +2029,7 @@ impl<'a> Exec<'a> {
     /// 68020's scale and full-format bits and are ignored here, which is what
     /// a 68000 does with them (M68000PRM §2.1).
     fn index_address(&self, base: u32, ext: u16) -> u32 {
+        debug_assert!(!self.model.has_020(), "a 68020 indexes through index_020");
         let reg = ((ext >> 12) & 7) as usize;
         let value = if ext & 0x8000 != 0 {
             self.state.a[reg]
@@ -2022,6 +2043,87 @@ impl<'a> Exec<'a> {
         };
         let disp = i32::from(ext as i8) as u32;
         base.wrapping_add(index).wrapping_add(disp)
+    }
+
+    /// The value of an index register, sized and scaled.
+    ///
+    /// The 68020 multiplies the index by 1, 2, 4 or 8 from bits 10–9 of the
+    /// extension word, in either format (M68000PRM §2.2.3); the scaled value is
+    /// 32 bits and wraps.
+    fn scaled_index(&self, addr: bool, reg: u8, long: bool, scale: u8) -> u32 {
+        let reg = reg as usize;
+        let value = if addr {
+            self.state.a[reg]
+        } else {
+            self.state.d[reg]
+        };
+        let value = if long {
+            value
+        } else {
+            i32::from(value as i16) as u32
+        };
+        value.wrapping_shl(u32::from(scale))
+    }
+
+    /// A 68020 indexed address: the brief format with its scale, or the full
+    /// format with base and outer displacements, suppression and memory
+    /// indirection (M68000PRM §2.2.3, Figure 2-2 and Table 2-2).
+    ///
+    /// `base` is `An`, or for the PC-relative modes the address of this
+    /// extension word. The displacements follow the word in the instruction
+    /// stream, base before outer, and are read before the indirection, which
+    /// is a long data read — misaligned or not, since a 68020 does not care.
+    ///
+    /// A reserved full-format word is an illegal instruction: see
+    /// [`FullExt::decode`].
+    fn index_020(&mut self, base: u32, delay: u32) -> Result<u32, Trap> {
+        let word = self.ext(delay)?;
+        if !is_full_format(self.model, word) {
+            let index = self.scaled_index(
+                word & 0x8000 != 0,
+                ((word >> 12) & 7) as u8,
+                word & 0x0800 != 0,
+                ((word >> 9) & 3) as u8,
+            );
+            let disp = i32::from(word as i8) as u32;
+            return Ok(base.wrapping_add(index).wrapping_add(disp));
+        }
+        let Some(full) = FullExt::decode(word) else {
+            let pc0 = self.pc0;
+            return Err(Trap::at(vector::ILLEGAL, pc0));
+        };
+        let bd = self.displacement(full.bd_words)?;
+        let od = self.displacement(full.od_words)?;
+        let base = if full.base_suppressed { 0 } else { base };
+        let index = if full.index_suppressed {
+            0
+        } else {
+            self.scaled_index(full.index_addr, full.index_reg, full.index_long, full.scale)
+        };
+        Ok(match full.indirect {
+            Indirect::None => base.wrapping_add(bd).wrapping_add(index),
+            Indirect::Pre => {
+                let pointer = self.read_long(base.wrapping_add(bd).wrapping_add(index))?;
+                pointer.wrapping_add(od)
+            }
+            Indirect::Post => {
+                let pointer = self.read_long(base.wrapping_add(bd))?;
+                pointer.wrapping_add(index).wrapping_add(od)
+            }
+        })
+    }
+
+    /// A base or outer displacement of `words` words, sign-extended.
+    fn displacement(&mut self, words: u8) -> Result<u32, Trap> {
+        Ok(match words {
+            1 => i32::from(self.ext(0)? as i16) as u32,
+            2 => {
+                let hi = self.ext(0)?;
+                let lo = self.ext(0)?;
+                (u32::from(hi) << 16) | u32::from(lo)
+            }
+            _ => 0,
+        })
     }
 
     /// Read a resolved operand.
@@ -2822,6 +2924,15 @@ impl<'a> Exec<'a> {
     /// handler sees the stack pointer the caller had.
     fn op_jsr(&mut self, pc0: u32) -> Result<(), Trap> {
         let target = self.jump_target()?;
+        if self.model.has_020() {
+            // Every extension word has been consumed, so the next instruction
+            // is the one after the word in the queue's first slot.
+            let ret = self.state.pc.wrapping_add(2);
+            let sp = self.state.a[7].wrapping_sub(4);
+            self.state.a[7] = sp;
+            self.write_long(sp, ret)?;
+            return self.refill(target, 0);
+        }
         // The return address is the byte after the whole instruction, which
         // the queue never slid to: the last extension word was read out of it
         // rather than fetched.

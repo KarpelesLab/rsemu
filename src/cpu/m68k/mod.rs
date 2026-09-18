@@ -158,6 +158,8 @@ pub mod isa;
 mod tests;
 #[cfg(test)]
 mod tests_68010;
+#[cfg(test)]
+mod tests_68020;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).
