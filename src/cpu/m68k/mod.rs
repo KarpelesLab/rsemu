@@ -1846,7 +1846,8 @@ impl WireSink for ResetPin {
 /// A description of this core's instruction set for `rsemu describe cpu.m68k`.
 ///
 /// Built from [`isa::TABLE`], so it cannot drift from what the interpreter
-/// implements.
+/// implements. Each row says which processors have it, because half the
+/// question about a 680x0 encoding is which part it is legal on.
 #[must_use]
 pub fn describe_isa() -> String {
     use core::fmt::Write as _;
@@ -1854,9 +1855,16 @@ pub fn describe_isa() -> String {
     for pattern in isa::TABLE {
         let insn = pattern.insn;
         let mark = if insn.privileged { '!' } else { ' ' };
+        let models = match insn.models {
+            m if m == isa::Models::ALL => "all   ",
+            m if m == isa::Models::FROM_010 => "010+  ",
+            m if m == isa::Models::M68020 => "020   ",
+            m if m == isa::Models::UNTIL_010 => "000010",
+            _ => "000   ",
+        };
         let _ = writeln!(
             out,
-            "{:04x}/{:04x} {mark}{:<8} {}",
+            "{:04x}/{:04x} {models} {mark}{:<8} {}",
             pattern.mask,
             pattern.value,
             insn.op.mnemonic(),
