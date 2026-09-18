@@ -863,6 +863,12 @@ fn boot_with(index: u32, media: Media) -> u32 {
         if let Err(e) = crate::host::audio::sms::capture::install(&mut options) {
             return fail(state, e);
         }
+        // An Amiga's is fixed too — a third of a second, and a PAL frame is
+        // sixteen times inside it.
+        #[cfg(feature = "dev-amiga-paula")]
+        if let Err(e) = crate::host::audio::amiga::capture::install(&mut options) {
+            return fail(state, e);
+        }
 
         let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
             Ok(m) => m,
@@ -935,6 +941,18 @@ fn boot_with(index: u32, media: Media) -> u32 {
         #[cfg(feature = "dev-sms")]
         if state.audio.is_none()
             && let Some(source) = crate::host::audio::sms::capture::take(&hosts, &machine)
+        {
+            state.audio = Some(crate::host::audio::AudioStream::new(
+                alloc::boxed::Box::new(source),
+                state.audio_rate,
+                crate::host::audio::SampleFormat::F32,
+            ));
+        }
+        // And Paula, whose rate is its colour clock over a constant — the same
+        // reason, and the first stereo source with a rational rate.
+        #[cfg(feature = "dev-amiga-paula")]
+        if state.audio.is_none()
+            && let Some(source) = crate::host::audio::amiga::capture::take(&hosts, &machine)
         {
             state.audio = Some(crate::host::audio::AudioStream::new(
                 alloc::boxed::Box::new(source),

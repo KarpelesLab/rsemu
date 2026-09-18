@@ -367,3 +367,165 @@ fn a_machine_with_no_sound_chip_says_so() {
     assert!(stderr.contains("no audio device"), "{stderr}");
     assert!(!wav_path.exists(), "and nothing was written");
 }
+
+// ---------------------------------------------------------------------------
+// The Amiga
+// ---------------------------------------------------------------------------
+
+/// A Kickstart-shaped image whose "firmware" plays a square wave on channel 0.
+///
+/// **No byte of any real ROM**: the program is hand-assembled here from the
+/// MC68000 user manual's instruction formats, exactly as `amiga_a500_board.rs`
+/// builds its own, and the register offsets are the *Amiga Hardware Reference
+/// Manual*'s Appendix B.
+///
+/// It runs out of the ROM's **own** window at `$F80000` rather than out of the
+/// overlay, because the first thing it does is take the overlay away: chip RAM
+/// has to answer at address zero before a waveform can be written into it. The
+/// overlay is CIA-A's `PA0` (Appendix E), so that is a `DDRA` and a `PRA` write
+/// through the real chip rather than a poke at a decoder.
+///
+/// ```text
+///   f8000c: 13fc 0001 00bf e201       move.b #$01,$bfe201    CIA-A DDRA: PA0 an output
+///           13fc 0000 00bf e001       move.b #$00,$bfe001    CIA-A PRA:  OVL low
+///           23fc 7f7f 7f7f 0000 1000  move.l #$7f7f7f7f,$1000   +127, four times
+///           23fc 8181 8181 0000 1004  move.l #$81818181,$1004   -127, four times
+///           33fc 0000 00df f0a0       move.w #$0000,$dff0a0  AUD0LC, high half
+///           33fc 1000 00df f0a2       move.w #$1000,$dff0a2  AUD0LC, low half
+///           33fc 0004 00df f0a4       move.w #4,$dff0a4      AUD0LEN: four words
+///           33fc 00c8 00df f0a6       move.w #200,$dff0a6    AUD0PER: 200 colour clocks
+///           33fc 0040 00df f0a8       move.w #64,$dff0a8     AUD0VOL: full level
+///           33fc 8201 00df f096       move.w #$8201,$dff096  DMACON: SET, DMAEN, AUD0EN
+///           60fe                      bra    *               and let it play
+/// ```
+///
+/// Eight samples of 200 colour clocks each is a 1 600 colour-clock cycle —
+/// 3 546 895 / 1 600 = 2 217 Hz on this PAL board — at full volume and on the
+/// **left** output, channels 0 and 3 being the left pair (Chapter 5).
+///
+/// The assertions below are about *level and side* rather than pitch, and
+/// deliberately: Agnus and Paula are both lazily advanced and can be a
+/// millisecond apart, so an audio DMA slot sometimes lands after Paula has
+/// already crossed two word boundaries — `AUDxDR` is one flag, not a count, so
+/// that word is fetched once and played twice. The stream reproduces what the
+/// chipset fed the channel, which is the property this file is for; the
+/// chipset's own handshake is `agnus`'s business.
+#[cfg(feature = "machine-amiga-a500")]
+fn amiga_tone_rom() -> Vec<u8> {
+    const CODE: &[u16] = &[
+        0x13fc, 0x0001, 0x00bf, 0xe201, // move.b #$01,$bfe201
+        0x13fc, 0x0000, 0x00bf, 0xe001, // move.b #$00,$bfe001
+        0x23fc, 0x7f7f, 0x7f7f, 0x0000, 0x1000, // move.l #$7f7f7f7f,$1000
+        0x23fc, 0x8181, 0x8181, 0x0000, 0x1004, // move.l #$81818181,$1004
+        0x33fc, 0x0000, 0x00df, 0xf0a0, // move.w #$0000,$dff0a0
+        0x33fc, 0x1000, 0x00df, 0xf0a2, // move.w #$1000,$dff0a2
+        0x33fc, 0x0004, 0x00df, 0xf0a4, // move.w #4,$dff0a4
+        0x33fc, 0x00c8, 0x00df, 0xf0a6, // move.w #200,$dff0a6
+        0x33fc, 0x0040, 0x00df, 0xf0a8, // move.w #64,$dff0a8
+        0x33fc, 0x8201, 0x00df, 0xf096, // move.w #$8201,$dff096
+        0x60fe, // bra *
+    ];
+    let mut image = vec![0u8; 512 * 1024];
+    image[0..4].copy_from_slice(&0x0008_0000u32.to_be_bytes()); // SSP: top of chip RAM
+    image[4..8].copy_from_slice(&0x00f8_000cu32.to_be_bytes()); // PC: the ROM's own window
+    for (i, word) in CODE.iter().enumerate() {
+        let at = 0x0c + 2 * i;
+        image[at..at + 2].copy_from_slice(&word.to_be_bytes());
+    }
+    image
+}
+
+/// The A500 records a second of **stereo** for a second of run, twice over
+/// identically, without moving the machine.
+///
+/// The stereo split is the claim worth making here: Paula's four channels are
+/// two pairs, 0 and 3 to the left output and 1 and 2 to the right (Chapter 5),
+/// so a model that mixed to mono would pass every length assertion and still
+/// have thrown away the one thing an Amiga is famous for.
+#[cfg(feature = "machine-amiga-a500")]
+#[test]
+fn an_amiga_records_a_second_of_stereo_for_a_second_of_run() {
+    let rom = scratch("tone.rom");
+    std::fs::write(&rom, amiga_tone_rom()).expect("the scratch directory is writable");
+    let wav_path = scratch("amiga.wav");
+    let again = scratch("amiga-again.wav");
+    let _ = std::fs::remove_file(&wav_path);
+    let _ = std::fs::remove_file(&again);
+
+    let media = format!("kickstart={}", rom.display());
+    let base: Vec<&str> = vec![
+        "run",
+        "amiga-a500",
+        "--headless",
+        "--media",
+        &media,
+        "--for",
+        "1s",
+    ];
+    let recording = |to: &std::path::Path, args: &[&str]| {
+        let mut args = args.to_vec();
+        args.push("--record-audio");
+        let path = to.to_str().expect("a UTF-8 scratch path");
+        args.push(path);
+        run(&args)
+    };
+
+    let (ok, stdout, stderr) = recording(&wav_path, &base);
+    assert!(ok, "rsemu run amiga-a500 --record-audio failed: {stderr}");
+
+    let bytes = std::fs::read(&wav_path).expect("--record-audio wrote a file");
+    let wav = parse_wav(&bytes);
+    assert_eq!(wav.channels, 2, "0 and 3 left, 1 and 2 right");
+    assert_eq!(wav.rate, 44_100, "the default --audio-rate");
+    assert_eq!(wav.bits, 16);
+    // A wider window than the consoles get, and in one direction only: Paula is
+    // lazily advanced (`ROADMAP.md` §4.2), so the last drain of the run sees it
+    // wherever its most recent DMA slot left it rather than exactly at the end.
+    assert!(
+        wav.frames > u64::from(wav.rate) * 9 / 10 && wav.frames <= u64::from(wav.rate) + 100,
+        "{} frames at {} Hz is not about a second",
+        wav.frames,
+        wav.rate
+    );
+
+    // The tone is on the left and the right is silent: a stereo split rather
+    // than a mono sum wearing two channels.
+    let samples: Vec<i16> = bytes[44..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|s| i16::from_le_bytes(*s))
+        .collect();
+    let (left, right): (Vec<i16>, Vec<i16>) =
+        samples.chunks_exact(2).map(|f| (f[0], f[1])).unzip();
+    assert!(
+        left.iter().any(|s| s.abs() > 1_000),
+        "the guest played a full-volume square on channel 0"
+    );
+    assert!(
+        right.iter().all(|s| s.abs() < 100),
+        "nothing was playing on channels 1 or 2"
+    );
+
+    // The same run again is the same file, byte for byte.
+    let (ok, _, stderr) = recording(&again, &base);
+    assert!(ok, "the second recording failed: {stderr}");
+    assert_eq!(
+        bytes,
+        std::fs::read(&again).expect("a second file"),
+        "two identical runs recorded different sound"
+    );
+
+    // And listening did not move the machine.
+    let (ok, quiet_stdout, stderr) = run(&base);
+    assert!(ok, "the unrecorded run failed: {stderr}");
+    assert_eq!(
+        state_hash(&stdout),
+        state_hash(&quiet_stdout),
+        "draining the sound chip changed where the machine ended up"
+    );
+
+    let _ = std::fs::remove_file(&wav_path);
+    let _ = std::fs::remove_file(&again);
+    let _ = std::fs::remove_file(&rom);
+}

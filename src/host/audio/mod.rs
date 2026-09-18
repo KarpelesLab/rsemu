@@ -31,8 +31,8 @@
 //!
 //! The device side is one small adapter per sound chip ([`nes::NesAudio`] is
 //! the first); the host side never learns which machine it is listening to. A
-//! Game Boy's APU, an SN76489 or an AC'97 each add an adapter and nothing else
-//! changes.
+//! Game Boy's APU, an SN76489, an Amiga's Paula or an AC'97 each add an adapter
+//! and nothing else changes.
 //!
 //! # Where the float line is
 //!
@@ -115,6 +115,10 @@ pub mod filter;
 pub mod resample;
 pub mod wav;
 
+#[cfg(feature = "dev-amiga-paula")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-paula")))]
+pub mod amiga;
+
 #[cfg(feature = "dev-gb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]
 pub mod gb;
@@ -135,11 +139,16 @@ mod tests;
 ///
 /// Reducing is not cosmetic: [`resample`] multiplies the denominator by the
 /// host rate, and an unreduced 236 250 000 / 264 — or a Game Boy's
-/// 4 194 304 / 128 — would push that product further up the `u64` range for
-/// nothing. Here rather than in one adapter because three of them need it —
-/// and gated on those three, because a build with no sound chip in it has no
-/// rate to reduce.
-#[cfg(any(feature = "dev-nes-apu", feature = "dev-gb", feature = "dev-sms"))]
+/// 4 194 304 / 128, or an Amiga's 28 375 160 / 256 — would push that product
+/// further up the `u64` range for nothing. Here rather than in one adapter
+/// because four of them need it — and gated on those four, because a build with
+/// no sound chip in it has no rate to reduce.
+#[cfg(any(
+    feature = "dev-nes-apu",
+    feature = "dev-gb",
+    feature = "dev-sms",
+    feature = "dev-amiga-paula"
+))]
 pub(crate) const fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let t = a % b;

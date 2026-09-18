@@ -202,10 +202,10 @@ RUN OPTIONS:
                         rather than running and writing nothing
     --record-audio <f>  Write the machine's sound to a RIFF/WAVE file when the
                         run ends, again however it was driven. Needs a machine
-                        with an audio device: a NES, a Game Boy or a Master
-                        System, and a machine with none is refused before it
-                        starts. The device is drained as the run goes, so a
-                        recording is as long as the run and there is no cap; if
+                        with an audio device: a NES, a Game Boy, a Master
+                        System or an Amiga, and a machine with none is refused
+                        before it starts. The device is drained as the run
+                        goes, so a recording is as long as the run; if
                         a ring ever did overflow the file says how much it lost
                         rather than shortening quietly
     --audio-rate <hz>   Sample rate for --record-audio (default 44100)
@@ -1236,13 +1236,15 @@ fn install_capture(
     rsemu::host::input::mouse::capture::install(options)?;
     #[cfg(feature = "dev-nes-apu")]
     rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
-    // The two console sound chips, and unlike the NES's these are installed
+    // The other three sound chips, and unlike the NES's these are installed
     // only when somebody asked for sound. The reason is the same one that makes
     // `ring_for` return zero: the interception's one effect on the machine is to
-    // switch the chip's `record` flag on, which both machine files leave off, so
-    // installing it on a run that is not recording would fill a ring nobody
-    // reads. Nothing guest-visible either way — `host::audio::tests` hashes a
-    // recorded Game Boy against an unrecorded one.
+    // switch the chip's `record` flag on, which every one of those machine files
+    // leaves off, so installing it on a run that is not recording would fill a
+    // ring nobody reads. Nothing guest-visible either way — `host::audio::tests`
+    // hashes a recorded Game Boy against an unrecorded one, and
+    // `dev::amiga::paula`'s tests hash a recorded Paula against an unrecorded
+    // one.
     #[cfg(feature = "dev-gb")]
     if args.record_audio.is_some() {
         rsemu::host::audio::gb::capture::install(options)?;
@@ -1250,6 +1252,10 @@ fn install_capture(
     #[cfg(feature = "dev-sms")]
     if args.record_audio.is_some() {
         rsemu::host::audio::sms::capture::install(options)?;
+    }
+    #[cfg(feature = "dev-amiga-paula")]
+    if args.record_audio.is_some() {
+        rsemu::host::audio::amiga::capture::install(options)?;
     }
     Ok(())
 }
@@ -1402,12 +1408,13 @@ fn write_screenshot(args: &RunArgs, scanout: Option<&dyn rsemu::host::display::S
 
 /// The sound of the machine just built, if it has any this build can hear.
 ///
-/// `machine` for the reason `take_scanout` takes it, and for two of the three
-/// chips rather than one: a Game Boy's APU and a Master System's PSG do not know
-/// their own sample rate, because it is their clock domain's frequency divided
-/// by a constant and a device cannot reach the clock forest from `&self`. The
-/// PSG's is not even the same between regions — 44 744.32 Hz on an NTSC console
-/// and 44 336.19 on a PAL one — and neither is an integer, which is exactly what
+/// `machine` for the reason `take_scanout` takes it, and for three of the four
+/// chips rather than one: a Game Boy's APU, a Master System's PSG and an
+/// Amiga's Paula do not know their own sample rate, because it is their clock
+/// domain's frequency divided by a constant and a device cannot reach the clock
+/// forest from `&self`. The PSG's is not even the same between regions —
+/// 44 744.32 Hz on an NTSC console and 44 336.19 on a PAL one — and neither is
+/// an integer, nor is a PAL Amiga's 110 840.46875, which is exactly what
 /// `StreamInfo`'s rational is for.
 #[allow(unused_variables)]
 fn take_audio(
@@ -1426,6 +1433,10 @@ fn take_audio(
     if let Some(s) = rsemu::host::audio::sms::capture::take(hosts, machine) {
         return Some(Box::new(s));
     }
+    #[cfg(feature = "dev-amiga-paula")]
+    if let Some(s) = rsemu::host::audio::amiga::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
     None
 }
 
@@ -1433,9 +1444,10 @@ fn take_audio(
 ///
 /// Ten milliseconds of *virtual* time. The bound that matters is the shallowest
 /// output ring in the tree: a Game Boy's is 8 192 frames at 32 768 Hz, which is
-/// a quarter of a second, and a Master System's is about a third. Ten
-/// milliseconds is twenty-five times inside the tighter of those, so a slow host
-/// or an unusually productive slice still cannot overflow one.
+/// a quarter of a second, a Master System's is about a third, and an Amiga's is
+/// 32 768 frames at 110 840 Hz, which is a third too. Ten milliseconds is
+/// twenty-five times inside the tightest of those, so a slow host or an
+/// unusually productive slice still cannot overflow one.
 ///
 /// Nothing about this is a wall-clock cadence. It is how far the machine is
 /// advanced per turn, and `Machine::run_for` is additive (`ROADMAP.md` §11.6):
