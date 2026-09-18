@@ -18,10 +18,10 @@
 //!
 //! Chapter 5 of the *Amiga Hardware Reference Manual* bounds what the rate has
 //! to carry: a channel plays one sample every `AUDxPER` colour clocks and the
-//! minimum period is "124 color clocks", so the fastest
-//! anything can come out of the chip is 3 546 895 / 124 ≈ 28 604 samples a
-//! second on a PAL machine and 3 579 545 / 124 ≈ 28 867 on an NTSC one. The
-//! frame rate is 3.87 times that.
+//! minimum period is "124 color clocks", so the fastest anything can come out
+//! of the chip is 3 546 895 / 124 ≈ 28 604 samples a second on a PAL machine
+//! and 3 579 545 / 124 ≈ 28 867 on an NTSC one. The frame rate is 3.87 times
+//! that.
 //!
 //! # Stereo, because the machine is
 //!
@@ -209,10 +209,7 @@ pub mod capture {
             .find(|d| d.class().name == CLASS_NAME)?;
         let domain = entry.domain()?;
         let freq = machine.clocks().domain_frequency(domain).ok()?;
-        Some((
-            freq.num(),
-            freq.den().saturating_mul(AUDIO_SAMPLE_DIVISOR),
-        ))
+        Some((freq.num(), freq.den().saturating_mul(AUDIO_SAMPLE_DIVISOR)))
     }
 }
 
@@ -249,7 +246,11 @@ mod tests {
     fn the_frame_rate_carries_the_fastest_a_channel_can_be_driven() {
         // Chapter 5: the minimum period is 124 colour clocks, so a channel
         // reaches 28 604 samples a second on a PAL machine.
-        assert_eq!((COLOUR_CLOCK_PAL + 62) / 124, 28_604, "rounded: 124 · 28 604 is 3 546 896");
+        assert_eq!(
+            (COLOUR_CLOCK_PAL + 62) / 124,
+            28_604,
+            "rounded: 124 · 28 604 is 3 546 896"
+        );
         let info = PaulaAudio::new(chip()).info();
         let frames = info.rate_num / info.rate_den;
         assert!(
@@ -280,7 +281,11 @@ mod tests {
     fn the_analogue_sum_doubles_into_the_seams_unit() {
         // A side at rest, at full negative and at full positive.
         assert_eq!(scale(0), 0);
-        assert_eq!(scale(-16_384), i16::MIN, "two channels at -128 and volume 64");
+        assert_eq!(
+            scale(-16_384),
+            i16::MIN,
+            "two channels at -128 and volume 64"
+        );
         assert_eq!(scale(127 * 64 * 2), 32_512);
     }
 }

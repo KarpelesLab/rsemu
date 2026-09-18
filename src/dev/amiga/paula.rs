@@ -160,10 +160,10 @@
 //! in two analogue mixers — so a host stream has to pick a rate, and this model
 //! picks [`AUDIO_SAMPLE_DIVISOR`]: one stereo frame every 32 colour clocks,
 //! 110 840.46875 Hz on a PAL A500. Chapter 5 bounds what that has to carry:
-//! the minimum period is "124 color clocks", so a channel
-//! produces at most 3 546 895 / 124 ≈ 28 604 samples a second (PAL) or
-//! 3 579 545 / 124 ≈ 28 867 (NTSC), and a frame rate 3.87 times that leaves
-//! everything the chip can make well inside its Nyquist limit.
+//! the minimum period is "124 color clocks", so a channel produces at most
+//! 3 546 895 / 124 ≈ 28 604 samples a second (PAL) or 3 579 545 / 124 ≈ 28 867
+//! (NTSC), and a frame rate 3.87 times that leaves everything the chip can make
+//! well inside its Nyquist limit.
 //!
 //! A frame is the **time integral** of each side's mixer over those 32 colour
 //! clocks, in exact integer arithmetic. A period boundary falling inside a
@@ -174,10 +174,9 @@
 //! The two sides are Chapter 5's wiring — **channels 0 and 3 are the left
 //! output, 1 and 2 the right** — and each side is `sample × volume` summed over
 //! its pair: an 8-bit signed sample and a volume of 0 to 64 (Chapter 5: 64, and
-//! any value with bit 6 set, are full level), twice over. A
-//! frame is therefore in ±16 384, which is the analogue sum and not a host
-//! sample; turning it into one is
-//! [`host::audio::amiga`](crate::host::audio::amiga)'s job.
+//! any value with bit 6 set, are full level), twice over. A frame is therefore
+//! in ±16 384, which is the analogue sum and not a host sample; turning it into
+//! one is [`host::audio::amiga`](crate::host::audio::amiga)'s job.
 //!
 //! Frames are produced only while `record` is set, bounded by
 //! [`AUDIO_RING_FRAMES`], and **derived state**: absent from the snapshot,

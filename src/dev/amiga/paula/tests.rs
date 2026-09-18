@@ -772,7 +772,11 @@ fn a_recorded_channel_produces_the_samples_the_period_formula_predicts() {
     rig.paula.advance_to(256 * 17);
     let frames = rig.paula.take_audio();
 
-    assert_eq!(frames.len(), 256 * 17 / 32, "one frame every 32 colour clocks");
+    assert_eq!(
+        frames.len(),
+        256 * 17 / 32,
+        "one frame every 32 colour clocks"
+    );
     for (i, frame) in frames.iter().enumerate() {
         // Nothing until the first word boundary at `per`: the channel is
         // playing but its output buffer has not been loaded yet.
@@ -811,7 +815,14 @@ fn a_boundary_inside_a_frame_is_weighted_rather_than_rounded() {
 fn volume_scales_the_sample_and_bit_six_is_full_level() {
     // Chapter 5: six bits, 0 to 64, and bit 6 — `$40` — is the 65th level
     // however the rest of the register reads.
-    for (written, level) in [(64u16, 64i16), (32, 32), (1, 1), (0x40, 64), (0x7f, 64), (0, 0)] {
+    for (written, level) in [
+        (64u16, 64i16),
+        (32, 32),
+        (1, 1),
+        (0x40, 64),
+        (0x7f, 64),
+        (0, 0),
+    ] {
         let rig = Rig::new();
         rig.paula.set_recording(true);
         square(&rig, 0, 256, written);
@@ -918,7 +929,10 @@ fn the_frames_do_not_depend_on_how_the_run_was_cut_up() {
         frames.extend(rig.paula.take_audio());
         frames
     };
-    assert_eq!(once, sliced, "the integration is not a function of the step");
+    assert_eq!(
+        once, sliced,
+        "the integration is not a function of the step"
+    );
 }
 
 #[test]

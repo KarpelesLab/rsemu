@@ -496,8 +496,7 @@ fn an_amiga_records_a_second_of_stereo_for_a_second_of_run() {
         .iter()
         .map(|s| i16::from_le_bytes(*s))
         .collect();
-    let (left, right): (Vec<i16>, Vec<i16>) =
-        samples.chunks_exact(2).map(|f| (f[0], f[1])).unzip();
+    let (left, right): (Vec<i16>, Vec<i16>) = samples.chunks_exact(2).map(|f| (f[0], f[1])).unzip();
     assert!(
         left.iter().any(|s| s.abs() > 1_000),
         "the guest played a full-volume square on channel 0"
