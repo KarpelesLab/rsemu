@@ -107,15 +107,38 @@ board rather than in the chip, they differ between models, the switchable one
 cannot be a fixed `Pole` in the audio seam, and the Hardware Reference Manual
 gives neither corner frequency. `src/dev/amiga/paula.rs` has the long form.
 
-One known limitation, and it is in the *chipset* rather than the stream: Agnus
-and Paula are lazily advanced and can be a millisecond apart, so an audio DMA
-slot sometimes arrives after Paula has crossed two word boundaries. `AUDxDR` is
-one flag rather than a count, so that word is fetched once and played twice,
-and the block's length counter — which counts boundaries — restarts early. A
-steady tone still comes out with the right level, the right side and the right
-fundamental — a 2 217 Hz square measured at 2.22 kHz — but about a fifth of its
-words are repeats, which puts energy below the fundamental. Fixing it belongs
-with the slot timing in `agnus/slots.rs`.
+**Every word of a block plays once, in order.** Agnus serves each channel one
+audio slot a line (chapter 6's time-slot allocation) and a word lasts at least
+248 colour clocks against a 227-count line, so a channel never has two words
+outstanding and a block is exactly `AUDxLEN` words; `tests/amiga_a500_audio_dma.rs`
+asserts both on a hand-assembled tone, sample by sample, with the guest counting
+its own block interrupts. It did not hold at first, and neither chip was the
+cause: a scheduler round that ended on Agnus's next line could leave the
+colour-clock domain a fraction of a tick short of it, and that line then went
+undelivered until the next quantum boundary. Measured under Kickstart 2.04,
+Agnus fell behind by more than a line 5 526 times in eight seconds, by up to a
+whole millisecond (3 547 colour clocks). Paula, caught up first, crossed two
+word boundaries before the slot came, and about a fifth of a steady tone's
+words played twice. `Scheduler::sync_lazy_devices` now delivers the event a
+round ended on; since then no device on this board is ever more than a line
+behind at a round boundary, and the same fix puts `VERTB`, the copper, the
+blitter's interrupt and the CIA timers back on their own counts rather than up
+to a millisecond late.
+
+What is left open is **starting**: Figure 5-8's diagram is not legible in the
+copy this was written from, and at a period shorter than a line the channel's
+first word boundary can come before its first slot. The model then plays the
+stale buffer for that boundary and counts it, so the first block is one word
+short. From the second block on the stream is exact at every period.
+
+**The 68000 runs at half its clock** — measured, not modelled: 6 204 233
+cycles executed in 1.74 virtual seconds, 50.2 % of what `clk / 4` owes. Paula
+is a runnable (it pumps the host serial port) on the processor's own crystal,
+and a round divides a crystal's span between the runnables on it
+(`Scheduler::tree_shares`), so Paula's pump consumes half of every round with
+nothing executing. The chips all keep time; only the processor is slow. That is
+a scheduler question with every board that has a pumping device on its CPU's
+crystal in its blast radius, and it is not fixed here.
 
 **A drive is its own device, on the CIA ports.** `amiga.floppy` takes `MTR*`,
 `SEL*`, `SIDE*`, `DIR` and `STEP*` as wires and answers on `RDY*`, `TK0*`,
@@ -353,8 +376,10 @@ in the dark, 640 pixels of high resolution, square since the fetch fix below.
 That leaves one AROS question, and it is still open: on that scratch board
 (extended ROM at `$E0_0000`, `-p chip-ram=1M`), with `amiga.keyboard` wired to
 CIA-A AROS stops at a plain grey screen (`COLOR00` `$AAA`, no bitplane DMA),
-and without it the picture appears. Its serial log ends at `romtaginit done`
-either way. The shipped board is no witness: without the extended ROM it draws
+and without it the picture appeared — until the scheduler started delivering
+the event a round ends on (the audio paragraph above has why), since when it
+stops there with or without the keyboard. Its serial log ends at
+`romtaginit done` either way. The shipped board is no witness: without the extended ROM it draws
 nothing with or without the keyboard. What is established:
 
 * **The keyboard's side of the wire checks out** against Appendix G and the
@@ -374,8 +399,14 @@ nothing with or without the keyboard. What is established:
 * **The wedge is a lost wake-up.** At 60 s nothing is ready: the Exec
   Bootstrap Task is waiting on signal `$00080000` and `input.device` on
   `$003F0000` (read through the RKRM's `ExecBase` and `Task` layouts).
-* **It is not speed.** A crystal four times faster wedges the same way, and a
-  keyboard clock 5 % off does too. Taking DF0 off the board, or only its `TK0*`
+* **It is not the crystal's speed, but it is the processor's.** A crystal four
+  times faster wedges the same way, and a keyboard clock 5 % off does too — but
+  both keep the 68000 at the half of its clock it gets on this board (see *The
+  68000 runs at half its clock* above). Given its whole clock instead (an
+  experiment with Paula's pump taken off the crystal, not a change in this
+  tree), AROS draws its eyes and its logo with the keyboard and without, before
+  the scheduler fix and after. So the keyboard, and the scheduler fix, are two
+  ways of moving an interrupt into a window a half-speed processor leaves open. Taking DF0 off the board, or only its `TK0*`
   wire, also avoids it (AROS's path then differs); taking the mouse off does
   not.
 * **Ruled out:** resetting the 8520's shift counter when `CRA` bit 6 flips,
