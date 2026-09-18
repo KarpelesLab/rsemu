@@ -109,9 +109,15 @@ fn seek(cylinder: u8, side: u8) -> Vec<u16> {
     let mut code = vec![
         0x13fc, 0x0001, 0x00bf, 0xe201, // move.b #$01,$BFE201   CIA-A DDRA: PA0 out
         0x13fc, 0x0000, 0x00bf, 0xe001, // move.b #$00,$BFE001   OVL off
-        0x13fc, 0x00ff, 0x00bf, 0xd300, // move.b #$FF,$BFD300   CIA-B DDRB: all out
     ];
+    // `PRB` before `DDRB`, which is the order every Kickstart writes them in:
+    // `PRB` is zero out of reset, so making port B an output first would pull
+    // `STEP*`, `SEL0*` and `MTR*` to ground, and releasing them again steps the
+    // head a cylinder nobody asked for.
     code.extend(to_prb(0xff));                   // all inactive
+    code.extend([
+        0x13fc, 0x00ff, 0x00bf, 0xd300,          // move.b #$FF,$BFD300  DDRB: all out
+    ]);
     code.extend(to_prb(0x7f));                   // MTR* low: the motor before the select
     code.extend(to_prb(0x77));                   // SEL0* low
     code.extend(to_prb(prb(0, true, true)));     // DIR low: inwards

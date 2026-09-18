@@ -149,6 +149,52 @@ fn stepping_moves_the_head_refuses_track_minus_one_and_clears_the_change_flop() 
     assert!(rig.low("chng"), "removing the disk sets it again");
 }
 
+/// The head moves on the **trailing** edge of `STEP*`, which is what makes a
+/// Kickstart 1.x step land at all.
+///
+/// A 1.3 `trackdisk` deselects the drive between pulses and then asserts
+/// `SEL0*`, `DIR` and `STEP*` in a single `PRB` write, so the drive sees the
+/// leading edge of `STEP*` on the very instant it is being selected — and the
+/// CIA hands its port-B pins over one at a time, `PB0` (`STEP*`) before `PB3`
+/// (`SEL0*`). A leading-edge model therefore drops the step, the head never
+/// leaves cylinder 0, the change flop is never reset, and `trackdisk` decides
+/// the drive is empty. Only the trailing edge is unambiguously inside the
+/// selected window, which is also what a Shugart-compatible mechanism does:
+/// "the access motion is initiated on the trailing edge of the step pulse".
+///
+/// The pins are set here in the order the CIA delivers them, which is the
+/// order that exposes it.
+#[test]
+fn a_step_asserted_in_the_same_write_as_select_still_moves_the_head() {
+    let rig = Rig::new();
+    rig.drive.insert(numbered());
+    rig.select(false);
+    rig.set("sel", true); // deselected, as 1.3 leaves it between pulses
+
+    // One PRB write: STEP* low, DIR low (inward), SEL0* low.
+    rig.set("step", false);
+    rig.set("dir", false);
+    rig.set("sel", false);
+    assert_eq!(rig.drive.cylinder(), 0, "the leading edge moves nothing");
+
+    // The next write raises STEP* alone.
+    rig.set("step", true);
+    assert_eq!(rig.drive.cylinder(), 1, "the trailing edge steps inward");
+    assert!(
+        !rig.low("chng"),
+        "the change flop is reset by a step with a disk in, which is how \
+         trackdisk knows there is one"
+    );
+
+    // And the same shape stepping back out: DIR high with STEP* low, then up.
+    rig.set("sel", true);
+    rig.set("step", false);
+    rig.set("dir", true);
+    rig.set("sel", false);
+    rig.set("step", true);
+    assert_eq!(rig.drive.cylinder(), 0, "and outward again");
+}
+
 #[test]
 fn ready_needs_the_motor_and_a_disk_and_protect_needs_the_tab() {
     let rig = Rig::new();

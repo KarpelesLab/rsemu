@@ -622,11 +622,15 @@ fn df0_answers_the_cia_lines_the_way_table_8_5_says() {
         "deselected: all pulled up"
     );
 
-    // Appendix F: "ddrb ... (set to 0xFF)". Then the motor, then the select —
-    // "software that selects drives must set up the motor signal before
-    // selecting any drives".
-    poke_byte(&m, CIAB_DDRB, 0xff);
+    // Appendix F: "ddrb ... (set to 0xFF)". `PRB` first and `DDRB` after,
+    // which is the order every Kickstart writes them in, and the only one that
+    // is safe: `PRB` is zero out of reset, so making port B an output first
+    // pulls `STEP*`, `SEL0*` and `MTR*` to ground, and releasing them again
+    // steps the head a cylinder. Then the motor, then the select — "software
+    // that selects drives must set up the motor signal before selecting any
+    // drives".
     poke_byte(&m, CIAB_PRB, 0xff);
+    poke_byte(&m, CIAB_DDRB, 0xff);
     poke_byte(&m, CIAB_PRB, 0x7f); // MTR* low
     poke_byte(&m, CIAB_PRB, 0x77); // SEL0* low
     assert_eq!(

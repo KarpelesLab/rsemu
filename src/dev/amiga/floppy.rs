@@ -53,6 +53,25 @@
 //!   DSKRDY* line to go low", so software that waits either way works.
 //! * **The identification word** is `$FFFF FFFF`, "Amiga standard 3.25
 //!   diskette" (sic).
+//! * **Which edge of `STEP*` moves the head.** Appendix E says only "Step the
+//!   selected drive's head one cylinder in the direction determined by DIRB":
+//!   it names no edge, because the edge is the *drive's*, and an Amiga's is an
+//!   ordinary Shugart-compatible 3.5-inch mechanism. That interface has said
+//!   the same thing since the SA400 minifloppy: a pulse on `STEP*` moves the
+//!   head one cylinder and **the access motion is initiated on the trailing
+//!   edge** — the Sony MP-F51W, Chinon FB-354 and Matsushita JU-253 OEM
+//!   manuals all repeat it. So this drive steps when `STEP*` goes back high
+//!   while the drive is selected, not when it goes low.
+//!
+//!   The distinction is not academic. Kickstart 2.04 asserts `SEL0*`, then
+//!   pulses `STEP*` inside the selected window, and either edge would do. But
+//!   Kickstart 1.3 deselects the drive between pulses and asserts `SEL0*`,
+//!   `DIR` and `STEP*` in **one** `PRB` write, so its leading edge is
+//!   simultaneous with being selected and only its trailing edge is
+//!   unambiguously inside the window. A leading-edge model drops every 1.x
+//!   step, the head never leaves cylinder 0, the change flop is never reset —
+//!   "reset when drive is selected and the head stepped" — and `trackdisk`
+//!   concludes the drive is empty and never starts the motor.
 //!
 //! # The disk
 //!
@@ -472,9 +491,14 @@ impl State {
             LINE_SIDE => self.side = level,
             LINE_DIR => self.dir = level,
             LINE_STEP => {
-                let falling = self.step && !level;
+                // The trailing edge, not the leading one. See the module docs:
+                // Kickstart 1.3 asserts `SEL0*` and `STEP*` in one `PRB` write,
+                // so the leading edge lands on the instant the drive is being
+                // selected and only the trailing edge is unambiguously inside
+                // the selected window.
+                let trailing = !self.step && level;
                 self.step = level;
-                if falling && self.selected {
+                if trailing && self.selected {
                     self.step_head();
                 }
             }
