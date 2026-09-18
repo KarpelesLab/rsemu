@@ -154,9 +154,10 @@ mod against_an_8520 {
             None
         }
 
-        /// A byte, acknowledged.
+        /// A byte, acknowledged. Long enough for two host movements to be
+        /// taken, one of which may send nothing.
         fn receive(&mut self) -> Option<u8> {
-            let got = self.wait_for_byte(2_000)?;
+            let got = self.wait_for_byte(2 * MOVEMENT_TICKS + 2_000)?;
             self.handshake();
             Some(got)
         }
@@ -223,7 +224,8 @@ mod against_an_8520 {
         rig.synchronise();
         rig.keyboard().press(0x35, true);
         rig.keyboard().press(0x35, false);
-        assert_eq!(rig.keyboard().queued(), 1, "the down is on the line");
+        assert_eq!(rig.keyboard().queued(), 0, "the down is on the line");
+        assert_eq!(rig.keyboard().backlog(), 1, "and the up is still a finger");
         assert_eq!(rig.receive(), Some(0x35));
         assert_eq!(rig.receive(), Some(0xb5));
         assert_eq!(rig.keyboard().acknowledged(), 4, "$FD, $FE, down, up");
@@ -299,11 +301,14 @@ mod against_an_8520 {
     fn ten_codes_wait_and_the_eleventh_is_an_overflow() {
         let mut rig = Rig::new();
         rig.synchronise();
-        // One on the line, ten waiting, and one too many.
+        // A computer that stops answering, and a person who keeps typing at a
+        // person's pace: one on the line, ten waiting, and one too many.
         for key in 0x10..=0x1b {
             rig.keyboard().press(key, true);
+            rig.run(MOVEMENT_TICKS);
         }
         assert_eq!(rig.keyboard().queued(), TYPE_AHEAD);
+        assert_eq!(rig.keyboard().backlog(), 0);
         let mut got = Vec::new();
         while let Some(b) = rig.receive() {
             got.push(b);
@@ -311,6 +316,51 @@ mod against_an_8520 {
         let mut want: Vec<u8> = (0x10..=0x1a).collect();
         want.push(code::BUFFER_OVERFLOW);
         assert_eq!(got, want, "$1B was lost, and the computer is told");
+    }
+
+    #[test]
+    fn a_burst_from_the_host_waits_for_the_controller_rather_than_overflowing() {
+        // Twelve keys down and up in one delivery — what a VNC client's paste,
+        // or a frontend that fell a slice behind, hands over. Taken straight
+        // into the type-ahead buffer the twelfth movement and every one after
+        // it were lost, a release among them, and Workbench repeated that key
+        // until another was pressed.
+        let mut rig = Rig::new();
+        rig.synchronise();
+        let mut want = Vec::new();
+        for key in 0x10..=0x1b {
+            rig.keyboard().press(key, true);
+            rig.keyboard().press(key, false);
+            want.extend([key, key | code::KEY_UP]);
+        }
+        assert_eq!(rig.keyboard().backlog(), 23, "one taken, the rest waiting");
+        let mut got = Vec::new();
+        while let Some(b) = rig.receive() {
+            got.push(b);
+        }
+        assert_eq!(got, want, "every movement, in order, and no $FA");
+        assert_eq!(rig.keyboard().backlog(), 0);
+        for key in 0x10..=0x1b {
+            assert!(!rig.keyboard().held(key), "nothing is left down");
+        }
+    }
+
+    #[test]
+    fn host_movements_enter_the_controller_one_interval_apart() {
+        let mut rig = Rig::new();
+        rig.synchronise();
+        let start = rig.now;
+        rig.keyboard().press(0x20, true);
+        rig.keyboard().press(0x21, true);
+        assert_eq!(rig.receive(), Some(0x20));
+        // The second waits out the interval from the first, not from the
+        // handshake.
+        assert_eq!(rig.wait_for_byte(2 * MOVEMENT_TICKS), Some(0x21));
+        let took = rig.now - start;
+        assert!(
+            (MOVEMENT_TICKS..MOVEMENT_TICKS + 600).contains(&took),
+            "taken one interval after the first, and on the wire 480 us later: {took}"
+        );
     }
 
     fn snapshot(device: &AmigaKeyboard) -> Vec<u8> {

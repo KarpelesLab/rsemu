@@ -83,6 +83,20 @@
 //! * **Overflow.** A movement that arrives with ten codes already waiting is
 //!   lost, and `$FA` is queued as soon as there is room. Which movement a real
 //!   keyboard drops is not documented.
+//! * **How fast a person moves keys.** A host has no timing of its own inside
+//!   a poll: a VNC client's burst, a paste, or a frontend that fell behind all
+//!   deliver many movements at one instant, and taken straight into the type-
+//!   ahead buffer everything after the first eleven — one on the line, ten
+//!   waiting — is lost exactly as if the Amiga had stopped listening. When
+//!   the first lost movement is a release the operating system repeats that
+//!   key until another arrives: a stuck key nobody is holding. So host
+//!   movements wait in a backlog in front of the controller and enter it at
+//!   most one every [`MOVEMENT_TICKS`], faster than anyone types and several
+//!   times slower than a code takes to cross the cable and be answered. The
+//!   ten-code buffer and `$FA` still mean what the manual says: a computer
+//!   that stops answering loses what arrives to a full buffer, whatever pace
+//!   it was typed at. A movement during power-up sync, which transmits
+//!   nothing, is taken at once.
 //! * **Keys moved while synchronising after power-up** are not queued: they
 //!   change what is held, and the power-up stream reports what is held.
 //!
@@ -132,7 +146,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "amiga.keyboard";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// The host keyboard port a keyboard opens when its `keys` property is not
 /// given.
@@ -154,6 +168,13 @@ pub const DATA_HOLD_TICKS: u64 = 20;
 pub const HANDSHAKE_TIMEOUT_TICKS: u64 = 143_000;
 /// How many codes the keyboard holds while the computer is not accepting them.
 pub const TYPE_AHEAD: usize = 10;
+/// Ticks between host key movements entering the controller: 5 ms, two hundred
+/// movements a second. Not the manual's — it gives no scan rate — but a host
+/// convention; see the module docs.
+pub const MOVEMENT_TICKS: u64 = 5_000;
+/// How many host movements wait in front of the controller before the newest
+/// is dropped (and `$FA` owed): twenty seconds of them at [`MOVEMENT_TICKS`].
+pub const HOST_BACKLOG: usize = 4_096;
 
 /// The codes Appendix G and chapter 8 name.
 pub mod code {
@@ -263,6 +284,12 @@ struct State {
     queue: VecDeque<u8>,
     /// A movement was dropped and `$FA` is owed.
     overflowed: bool,
+    /// Host movements not yet taken into the controller, oldest first.
+    pending: VecDeque<u8>,
+    /// The tick the oldest of `pending` is taken, or [`NO_EVENT`].
+    admit_at: u64,
+    /// The earliest tick the next host movement may be taken.
+    quiet_until: u64,
     /// Which keys are down, one bit per code.
     held: [u8; KEY_COUNT.div_ceil(8)],
     /// The Caps Lock LED.
@@ -288,6 +315,9 @@ impl State {
             lost: None,
             queue: VecDeque::new(),
             overflowed: false,
+            pending: VecDeque::new(),
+            admit_at: NO_EVENT,
+            quiet_until: 0,
             held: [0; KEY_COUNT.div_ceil(8)],
             // The LED is lit through self-test and "finally … shut off" at the
             // end of the start-up sequence.
@@ -480,13 +510,60 @@ impl State {
         self.send_next(at);
     }
 
-    /// One key movement from the host: `key` is the raw code, bit 7 set for a
-    /// release.
-    fn movement(&mut self, key: u8) {
+    /// One key movement from the host, as it arrives: taken now if the
+    /// controller is ready for one, otherwise put behind the others waiting.
+    fn arrive(&mut self, key: u8) {
+        if self.pending.is_empty() && (self.powering_up || self.ticks >= self.quiet_until) {
+            self.take(key);
+            return;
+        }
+        if self.pending.len() >= HOST_BACKLOG {
+            self.overflowed = true;
+            return;
+        }
+        self.pending.push_back(key);
+        if self.admit_at == NO_EVENT {
+            self.admit_at = self.quiet_until.max(self.ticks);
+        }
+    }
+
+    /// Take the oldest waiting host movement that is a transition, at
+    /// `admit_at`, which the caller has made `self.ticks`.
+    fn admit(&mut self) {
+        while let Some(key) = self.pending.pop_front() {
+            if self.take(key) {
+                break;
+            }
+        }
+        self.admit_at = if self.pending.is_empty() {
+            NO_EVENT
+        } else {
+            self.ticks + MOVEMENT_TICKS
+        };
+    }
+
+    /// Take `key` into the controller now. Returns whether it was a
+    /// transition; only a transition spends the interval.
+    fn take(&mut self, key: u8) -> bool {
+        let moved = self.movement(key);
+        if moved {
+            self.quiet_until = self.ticks + MOVEMENT_TICKS;
+        }
+        moved
+    }
+
+    /// The earlier of the protocol's next step and the next admission.
+    fn next_event(&self) -> u64 {
+        self.next.min(self.admit_at)
+    }
+
+    /// One key movement taken into the controller: `key` is the raw code, bit
+    /// 7 set for a release. Returns whether it changed what is held.
+    fn movement(&mut self, key: u8) -> bool {
         let up = key & code::KEY_UP != 0;
         let key = key & !code::KEY_UP;
         if key > code::LAST_KEY || self.is_held(key) != up {
-            return;
+            return false;
         }
         self.set_held(key, !up);
         let sent = if key == code::CAPS_LOCK {
@@ -494,7 +571,7 @@ impl State {
             // is released … When pushing the Caps Lock key turns on the Caps
             // Lock LED, the up/down bit will be 0."
             if up {
-                return;
+                return true;
             }
             self.caps = !self.caps;
             if self.caps { key } else { key | code::KEY_UP }
@@ -504,16 +581,17 @@ impl State {
             key
         };
         if self.powering_up {
-            return;
+            return true;
         }
         if self.queue.len() >= TYPE_AHEAD {
             self.overflowed = true;
-            return;
+            return true;
         }
         self.queue.push_back(sent);
         if self.phase == Phase::Idle {
             self.send_next(self.ticks);
         }
+        true
     }
 
     fn pins(&self) -> (bool, bool) {
@@ -567,7 +645,7 @@ impl Keyboard {
         let state = State::power_on(0);
         Keyboard {
             ticks: AtomicU64::new(0),
-            next_event: AtomicU64::new(state.next),
+            next_event: AtomicU64::new(state.next_event()),
             state: Mutex::with_rank(LockRank::DEVICE, state),
             out: Mutex::with_rank(LockRank::WIRE, Outputs::default()),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
@@ -583,7 +661,7 @@ impl Keyboard {
     pub fn key(&self, key: u8) {
         self.sync();
         self.update(|st| {
-            st.movement(key);
+            st.arrive(key);
             false
         });
     }
@@ -624,6 +702,12 @@ impl Keyboard {
         self.state.lock().queue.len()
     }
 
+    /// How many host movements are waiting to enter the controller.
+    #[must_use]
+    pub fn backlog(&self) -> usize {
+        self.state.lock().pending.len()
+    }
+
     /// Whether the keyboard is pulling `(KCLK, KDAT)` low.
     #[must_use]
     pub fn lines(&self) -> (bool, bool) {
@@ -645,10 +729,18 @@ impl Keyboard {
         loop {
             let stepped = {
                 let mut st = self.state.lock();
-                if st.next <= target && st.next != NO_EVENT {
-                    st.ticks = st.ticks.max(st.next);
+                if st.next_event() <= target && st.next_event() != NO_EVENT {
                     let before = st.pins();
-                    let released = st.step();
+                    // The protocol's step first when both fall on one tick:
+                    // a movement taken then queues behind whatever it does.
+                    let released = if st.next <= st.admit_at {
+                        st.ticks = st.ticks.max(st.next);
+                        st.step()
+                    } else {
+                        st.ticks = st.ticks.max(st.admit_at);
+                        st.admit();
+                        false
+                    };
                     self.publish(&st);
                     Some((before != st.pins(), released))
                 } else {
@@ -673,7 +765,7 @@ impl Keyboard {
 
     fn publish(&self, st: &State) {
         self.ticks.store(st.ticks, Ordering::Relaxed);
-        self.next_event.store(st.next, Ordering::Relaxed);
+        self.next_event.store(st.next_event(), Ordering::Relaxed);
     }
 
     /// Apply `f`, then drive whatever moved — outside the lock — and look at
@@ -942,7 +1034,10 @@ impl Device for AmigaKeyboard {
         w.write_u16(st.lost.map_or(0, |c| 0x100 | u16::from(c)))?;
         w.write_bytes(&st.queue.iter().copied().collect::<Vec<u8>>())?;
         w.write_bytes(&st.held)?;
-        w.write_u64(st.acknowledged)
+        w.write_u64(st.acknowledged)?;
+        w.write_bytes(&st.pending.iter().copied().collect::<Vec<u8>>())?;
+        w.write_u64(st.admit_at)?;
+        w.write_u64(st.quiet_until)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -993,9 +1088,21 @@ impl Device for AmigaKeyboard {
         }
         st.held.copy_from_slice(held);
         st.acknowledged = r.read_u64()?;
+        let pending = r.read_bytes()?;
+        if pending.len() > HOST_BACKLOG {
+            return Err(bad("a host backlog longer than the keyboard keeps"));
+        }
+        st.pending = pending.iter().copied().collect();
+        st.admit_at = r.read_u64()?;
+        st.quiet_until = r.read_u64()?;
         if st.next != NO_EVENT && st.next <= st.ticks && st.phase != Phase::Idle {
             // An event that is not in the future would stall catch-up.
             st.next = st.ticks + 1;
+        }
+        if st.pending.is_empty() {
+            st.admit_at = NO_EVENT;
+        } else if st.admit_at == NO_EVENT || st.admit_at <= st.ticks {
+            st.admit_at = st.ticks + 1;
         }
         self.keyboard.update(|now| {
             *now = st;

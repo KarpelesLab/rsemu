@@ -15,7 +15,9 @@
 //!    CIA-A's `ICR` for the serial flag, stores each `SDR` byte and pulses
 //!    `KDAT` low by turning the serial port to output and back — chapter 8's
 //!    "pulsing the SP line low then high". The keyboard sends nothing further
-//!    until it has, so a run of bytes in order *is* the handshake working.
+//!    until it has, so a run of bytes in order *is* the handshake working. A
+//!    whole line delivered in one poll arrives whole, rather than overflowing
+//!    the keyboard's ten-code buffer.
 //! 2. **Motion counts on `JOY0DAT` and a click shows on `PA6`.** The guest
 //!    samples both; the counters move by the deltas the pointer moved, spread
 //!    over time rather than written at once, and the button waits for them.
@@ -197,15 +199,17 @@ fn pointer(x: u32, y: u32, buttons: u8) -> [u8; input::EVENT_BYTES] {
 }
 
 /// The slice the pointer moves on.
-const MOVE: usize = 21;
+const MOVE: usize = 45;
 
 /// What happens before each slice.
 ///
 /// The keyboard synchronises first: the guest answers its first sync bit after
 /// a delay loop, and `$FD` and `$FE` are through by slice 8. A key moved before
-/// then is folded into the start-up stream, which is a different test.
+/// then is folded into the start-up stream, which is a different test. The six
+/// key movements enter the keyboard five milliseconds apart
+/// (`keyboard::MOVEMENT_TICKS`), so the last is taken at slice 35.
 fn script() -> Vec<Vec<u8>> {
-    let mut s = vec![Vec::new(); 32];
+    let mut s = vec![Vec::new(); MOVE + 11];
     // `b` pressed and released in one poll — two events, one post.
     s[10] = [
         key(Keysym::from_ascii(b'b'), true),
@@ -260,6 +264,50 @@ fn keys_reach_the_guest_as_raw_codes_one_handshake_at_a_time() {
             0x60 | code::KEY_UP,
         ],
         "$FD and $FE after the first handshake; B down and up; ! with its shift"
+    );
+}
+
+/// A whole line typed in one poll — a VNC client's paste, or a frontend a
+/// slice behind — reaches the guest whole and in order.
+///
+/// Before the keyboard kept a backlog of host movements this lost the twelfth
+/// movement and every one after it — one on the line and ten in the type-ahead
+/// buffer is all the keyboard holds — and the twelfth here is `,` *up*. On
+/// Workbench the shell went on repeating a key nobody was holding. The
+/// keyboard now takes a host movement every `keyboard::MOVEMENT_TICKS`; the
+/// ten-code buffer is still there for a guest that stops answering.
+#[test]
+fn a_line_typed_in_one_poll_arrives_whole_and_nothing_is_left_down() {
+    use rsemu::host::input::amiga::rawkey;
+    let recorder = Arc::new(Recorder::recording());
+    let mut m = board(&recorder);
+    let text = b"hello, amiga 500";
+    let mut s = vec![Vec::new(); 20 + 2 * text.len() * 5 + 10];
+    s[10] = text
+        .iter()
+        .flat_map(|c| {
+            [
+                key(Keysym::from_ascii(*c), true),
+                key(Keysym::from_ascii(*c), false),
+            ]
+        })
+        .flatten()
+        .collect();
+    drive(&mut m, &recorder, &s);
+
+    let mut want = vec![code::POWER_UP_STREAM, code::END_POWER_UP_STREAM];
+    for c in text {
+        let k = rawkey(Keysym::from_ascii(*c)).expect("a US key").code;
+        want.extend([k, k | code::KEY_UP]);
+    }
+    let got = received(&m);
+    assert!(
+        !got.contains(&code::BUFFER_OVERFLOW),
+        "no movement was lost: {got:02x?}"
+    );
+    assert_eq!(
+        got, want,
+        "every movement, in the order it was typed: each down has its up"
     );
 }
 
