@@ -1109,6 +1109,11 @@ fn a_machine_with_nothing_to_boot_parks_with_interrupts_on() {
 /// startup file. The assertions are deliberately about *the guest owning the
 /// machine* rather than about any particular version's wording, so a different
 /// FreeDOS build still passes.
+///
+/// This stops where the installer's first question is. `tests/pc_at_freedos.rs`
+/// answers it and the rest of them: it drives the installer through all six
+/// diskettes onto an IDE drive and then boots that drive with the diskette
+/// removed.
 #[test]
 fn freedos_boots_on_rsemus_own_firmware() {
     let Ok(path) = std::env::var("RSEMU_FREEDOS_FLOPPY") else {

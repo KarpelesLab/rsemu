@@ -165,14 +165,18 @@ readonly DEBIAN_PACKAGES="https://deb.debian.org/debian/dists/trixie/main/binary
 readonly BUSYBOX_X86_URL="https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
 readonly BUSYBOX_X86_SHA="6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348"
 
-# FreeDOS 1.3, floppy edition. `144m/x86BOOT.img` inside the archive is a
-# 1.44 MB FAT12 boot diskette: the FreeDOS kernel, FDCONFIG.SYS, COMMAND.COM
-# and the 1.3 installer. It is what `tests/pc_at_boot.rs` boots on rsemu's own
-# BIOS -- the ROADMAP.md phase 6a gate.
+# FreeDOS 1.3, floppy edition. The archive's `144m/` directory is a set of six
+# 1.44 MB FAT12 diskettes: `x86BOOT.img` is the boot diskette -- the FreeDOS
+# kernel, FDCONFIG.SYS, COMMAND.COM and the 1.3 installer -- and
+# `x86DSK01`..`x86DSK05` carry the 114 archive volumes the installer unpacks
+# onto a hard disk. `tests/pc_at_boot.rs` boots the first on rsemu's own BIOS,
+# which is the ROADMAP.md phase 6a gate, and `tests/pc_at_freedos.rs` drives
+# the installer through all six onto an IDE drive and boots what it wrote.
 #
-# The whole archive is 21 MiB and only one file of it is kept, which is still
-# the cheapest way in: the other editions are CD and USB images this board has
-# no way to boot from yet.
+# The whole archive is 21 MiB and only the 1.44 MB set is kept: the 720 KiB
+# and 1.2 MB sets are the same distribution cut for media this board's drive
+# is not, and the other editions are CD and USB images it has no way to boot
+# from yet.
 #
 # GPL-2.0 for the kernel; the distribution as a whole is a mix. FETCH-ONLY,
 # exactly like the RISC-V kernel above: booting it as an emulated guest is
@@ -182,8 +186,18 @@ readonly FREEDOS_ZIP="https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/d
 # From upstream's own verify.txt beside the archive. FreeDOS 1.3 is a released
 # version and is not rebuilt, so a mismatch means the wrong file. Fatal.
 readonly FREEDOS_ZIP_SHA="75a4e11a7fce6f124e20927b3022b4b715a2a3f7324c5f5bfea42d90d80eb072"
-readonly FREEDOS_MEMBER="144m/x86BOOT.img"
+# The members kept, and the SHA-256 of each as extracted. Upstream publishes a
+# checksum for the archive rather than for its members, so these were computed
+# from an archive that matched the published one -- which is the same claim one
+# step down, and it is what lets a re-run verify without downloading 21 MiB
+# again.
+readonly FREEDOS_MEMBERS="x86BOOT.img x86DSK01.img x86DSK02.img x86DSK03.img x86DSK04.img x86DSK05.img"
 readonly FREEDOS_IMG_SHA="3f7834ea4575ba05d106e4b8f59f886da7bfb1979ee386be2a2deba8df518925"
+readonly FREEDOS_DSK01_SHA="10200f4c194587075854b7347088db38faf585f14c246b2c980ee538d7213120"
+readonly FREEDOS_DSK02_SHA="e47a0eff21213b6fd4f399e04b28acaee4d84d2d9914627ec506f624d3be397b"
+readonly FREEDOS_DSK03_SHA="dd9aac3b44504d9e3121f4fe4cd1d75bbc2c0945089d9d06338d08f0e1ef8565"
+readonly FREEDOS_DSK04_SHA="3ebe8646e07efe7cabdab4e79c11c9df8ca7b2060eede7e43868f3b49ec1b64a"
+readonly FREEDOS_DSK05_SHA="0d47fbd310c968b86a5db6f2a412ea3246c8f6ed381ee5d3fef63e696821654c"
 
 # The level-3 third-party guests: real programs, written by people who have
 # never heard of this emulator, built for the architectures `src/usermode/`
@@ -615,28 +629,49 @@ Consumed by RSEMU_SMS_ZEXALL_DIR in src/dev/sms/conformance.rs."
 	note "      cargo test --release --all-features -- --nocapture sms::conformance"
 }
 
+# The SHA-256 expected of one member of the set, by file name.
+freedos_sha() {
+	case "$1" in
+	x86BOOT.img) printf '%s' "$FREEDOS_IMG_SHA" ;;
+	x86DSK01.img) printf '%s' "$FREEDOS_DSK01_SHA" ;;
+	x86DSK02.img) printf '%s' "$FREEDOS_DSK02_SHA" ;;
+	x86DSK03.img) printf '%s' "$FREEDOS_DSK03_SHA" ;;
+	x86DSK04.img) printf '%s' "$FREEDOS_DSK04_SHA" ;;
+	x86DSK05.img) printf '%s' "$FREEDOS_DSK05_SHA" ;;
+	esac
+}
+
 fetch_freedos() {
 	need curl
 	need unzip
 	local dest="${DEST_ROOT}/freedos"
 	local img="${dest}/x86BOOT.img"
 	local zip="${DEST_ROOT}/FD13-FloppyEdition.zip"
+	local member have=1
 
-	if [ "$FORCE" = 0 ] && [ -f "$img" ] \
-		&& [ "$(sha256_of "$img")" = "$FREEDOS_IMG_SHA" ]; then
-		ok "freedos already present and verified"
+	for member in $FREEDOS_MEMBERS; do
+		if [ ! -f "${dest}/${member}" ] \
+			|| [ "$(sha256_of "${dest}/${member}")" != "$(freedos_sha "$member")" ]; then
+			have=0
+		fi
+	done
+
+	if [ "$FORCE" = 0 ] && [ "$have" = 1 ]; then
+		ok "freedos already present and verified (6 diskettes)"
 	else
 		note "  downloading FD13-FloppyEdition.zip (21 MiB) ..."
 		download "$FREEDOS_ZIP" "$zip"
 		verify "$zip" "$FREEDOS_ZIP_SHA" fatal
 		mkdir -p "$dest"
-		unzip -q -o -j "$zip" "$FREEDOS_MEMBER" -d "$dest"
+		for member in $FREEDOS_MEMBERS; do
+			unzip -q -o -j "$zip" "144m/${member}" -d "$dest"
+			verify "${dest}/${member}" "$(freedos_sha "$member")" fatal
+		done
 		rm -f "$zip"
-		verify "$img" "$FREEDOS_IMG_SHA" fatal
-		ok "freedos: x86BOOT.img ($(wc -c <"$img" | tr -d ' ') bytes)"
+		ok "freedos: 6 diskettes ($(wc -c <"$img" | tr -d ' ') bytes each)"
 	fi
 
-	write_notice "$dest" "FreeDOS 1.3, floppy edition -- 144m/x86BOOT.img
+	write_notice "$dest" "FreeDOS 1.3, floppy edition -- the whole 144m/ diskette set
 from https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/official/
 
 Licence: GPL-2.0 for the kernel; the distribution as a whole is a mix and each
@@ -645,13 +680,20 @@ image, do not vendor it, do not attach it to a release. Booting it as an
 emulated guest is ordinary use; redistributing it is not ours to do, and its
 source was not read (ROADMAP.md 1).
 
-A 1.44 MB FAT12 diskette: the FreeDOS kernel, FDCONFIG.SYS, COMMAND.COM and
-the 1.3 installer. tests/pc_at_boot.rs boots it on rsemu's own BIOS."
+Six 1.44 MB FAT12 diskettes. x86BOOT.img is the boot diskette -- the FreeDOS
+kernel, FDCONFIG.SYS, COMMAND.COM and the 1.3 installer -- and x86DSK01..05
+carry the archive volumes the installer unpacks onto a hard disk.
+tests/pc_at_boot.rs boots the first on rsemu's own BIOS; tests/pc_at_freedos.rs
+installs the set onto an IDE drive and boots what it wrote."
 
 	note ""
 	note "  Then:"
 	note "      RSEMU_FREEDOS_FLOPPY=${img} \\"
 	note "      cargo test --release --all-features --test pc_at_boot -- --nocapture freedos"
+	note ""
+	note "  and the whole installation, which takes minutes:"
+	note "      RSEMU_FREEDOS_DIR=${dest} \\"
+	note "      cargo test --release --all-features --test pc_at_freedos -- --nocapture"
 }
 
 fetch_wozmon() {
