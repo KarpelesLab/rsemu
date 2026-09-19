@@ -33,9 +33,10 @@
 //! `VPOSR`'s**, and it is bit 1 of the Agnus identification the ROM tests:
 //! with Alice answering `$20`, `$21`, `$30` or `$31` it reads `$1B`, and with
 //! `$22`, `$23`, `$32` or `$33` it reads `$1F`. The 8375 swap moved nothing
-//! only because this tree's 8375 answers `$22` as well — see
-//! `src/dev/amiga/agnus/ecs.rs` — which is also why changing Alice's `$22` to
-//! `$23` moved nothing.
+//! only because this tree's 8375 then answered `$22` as well, and changing
+//! Alice's `$22` to `$23` moved nothing because both have the bit; the 8375
+//! answers `$21` now (`src/dev/amiga/agnus/ecs.rs`), and the A600 booting off
+//! its hard disk reads `$03` where it read `$07`.
 //!
 //! **What makes it an AA machine to the ROM beyond those bits is `LISAID` bits
 //! 9 and 8**, which `graphics.library` reads as the board's fetch bandwidth
@@ -416,6 +417,39 @@ fn the_ecs_board_beside_it_finds_neither_alice_nor_lisa() {
     assert_eq!(bits & HR_DENISE, HR_DENISE, "an 8373 is an ECS Denise");
     assert_eq!(bits & AA_ALICE, 0, "but an 8375 is not Alice");
     assert_eq!(bits & AA_LISA, 0, "and an 8373 is not Lisa");
+}
+
+/// The same control on the path that sets the AA pair on the A1200: the A600
+/// booting Workbench 3.1 off the same hard disk.
+///
+/// With a boot device the ROM runs its later chip test too, and that one reads
+/// bit 1 of `VPOSR`'s identification as Alice. While this tree's 8375 answered
+/// `$22` the A600 read **`$07`** here — `GFXF_AA_ALICE` on an ECS board. The
+/// 8375 answers `$21` now, the specification's own row, and it reads `$03`.
+#[cfg(feature = "machine-amiga-a600")]
+#[test]
+fn the_ecs_board_booting_workbench_still_finds_no_alice() {
+    let Some(mut b) = board_named(
+        "amiga-a600",
+        "amiga-os-310-a600.rom",
+        Disk::Hard("workbench-311.hdf"),
+    ) else {
+        return;
+    };
+    for _ in 0..15 {
+        b.machine
+            .run_for(GlobalTime::from_nanos(1_000_000_000))
+            .expect("it runs");
+    }
+    let bits = chip_rev_bits(&b);
+    println!("a600-310-wb311: ChipRevBits0 = {bits:#04x}");
+    assert_eq!(
+        bits & (HR_AGNUS | HR_DENISE),
+        HR_AGNUS | HR_DENISE,
+        "the ECS pair"
+    );
+    assert_eq!(bits & AA_ALICE, 0, "an 8375 is not Alice");
+    assert_eq!(bits & AA_LISA, 0, "an 8373 is not Lisa");
 }
 
 /// At 15 s, Kickstart 3.1 and Workbench 3.1 off the hard disk: the desktop.

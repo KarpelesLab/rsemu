@@ -22,15 +22,16 @@
 //! # The two parts
 //!
 //! Appendix C, *Determining Chip Revisions*, lists "8368 (hr) or 8372 (fat-hr)
-//! = 20 for PAL, 30 for NTSC" — the 1 MiB **8372A** of an A500 or A2000.
-//! Commodore's later register notes for the AA chip set carry the same table
-//! with a row more, "8372 (Fat-hr) (agnushr), rev 5 = 22 PAL, 31 NTSC"; the
+//! = 20 for PAL, 30 for NTSC" — the 1 MiB **8372A** of an A500 or A2000. The
+//! *Specification for the Advanced Amiga (AA) Chip Set* carries the same table
+//! with a row more, "8372(fat-hr) (agnushr), rev. 5 = 21 PAL, 31 NTSC"; the
 //! 2 MiB part an A500+ and an A600 carry is the **8375** (part 318069-10 PAL,
 //! -11 NTSC), the 2 MiB member of that family. That the 2 MiB part is the one
-//! that answers `$22`/`$31` is a reading of those two documents rather than a
-//! sentence in either; `graphics.library` tests only for "20 or 30" having bit
-//! 5 set ("A value of 20 or 30 indicates that the enhanced Hires Agnus is
-//! present"), which both values have.
+//! that answers `$21`/`$31` is a reading of those documents rather than a
+//! sentence in either. Appendix C's own test is for "20 or 30" having bit 5
+//! set ("A value of 20 or 30 indicates that the enhanced Hires Agnus is
+//! present"), which both values have — and Kickstart 3.1 tests one bit more,
+//! which is why the row's PAL value matters; see [`agnus_id`].
 //!
 //! # `BEAMCON0` out of reset
 //!
@@ -135,25 +136,28 @@ pub const MIB: u64 = 1 << 20;
 /// `VPOSR` bits 14–8 for this part and strap.
 ///
 /// Appendix C, *Determining Chip Revisions*, for the original parts and the
-/// 8372A; Commodore's AA register notes for the later row (see the module
-/// documentation for why the 8375 is that row). Alice's is the *Specification
-/// for the Advanced Amiga (AA) Chip Set* itself (§4, `VPOSR`): "8374(alice)
-/// = 22 PAL, 32 NTSC".
+/// 8372A; the *Specification for the Advanced Amiga (AA) Chip Set* for the
+/// later row (see the module documentation for why the 8375 is that row) and
+/// for Alice (§4, `VPOSR`): "8374(alice) = 22 PAL, 32 NTSC".
 ///
-/// **The two tables collide on `$22` for PAL**, and it is left as it stands.
-/// That specification's own copy of the list reads "8372(fat-hr) (agnushr),
-/// rev. 5 = 21 PAL, 31 NTSC", one less than the `$22` the 8375 answers here —
-/// so one of the two readings of the 8375's row is wrong, and which is not
-/// settled by any document at hand. Moving the 8375 would move four real-ROM
-/// goldens on a guess; Alice takes the value her own specification gives her,
-/// and `LISAID` (`$F8`) is what tells an AA board from an ECS one anyway.
+/// **The 8375 is `$21` on PAL, not `$22`.** A transcription of Commodore's
+/// register notes gives the row as "22 PAL, 31 NTSC", and this model used it
+/// until the A1200 showed which reading is wrong: Kickstart 3.1 sets
+/// `GFXF_AA_ALICE` from **bit 1** of this identification. Swept black-box on
+/// the A1200, `$20`, `$21`, `$30` and `$31` leave the bit clear and `$22`,
+/// `$23`, `$32` and `$33` set it; and with the 8375 at `$22`, the A600
+/// booting Workbench 3.1 off its hard disk read `ChipRevBits0 = $07`, an ECS
+/// board telling `graphics.library` it had Alice. The specification's own row,
+/// "rev. 5 = 21 PAL, 31 NTSC", has the bit clear, and it is also the only
+/// reading that keeps every row's PAL and NTSC values `$10` apart as `$00`/
+/// `$10`, `$20`/`$30` and Alice's `$22`/`$32` are.
 #[must_use]
 pub const fn agnus_id(rev: Revision, std: Standard) -> u8 {
     match (rev, std) {
         (Revision::Ocs, _) => std.agnus_id(),
         (Revision::Aga, Standard::Pal) => 0x22,
         (Revision::Aga, Standard::Ntsc) => 0x32,
-        (Revision::Ecs { reach }, Standard::Pal) if reach > MIB => 0x22,
+        (Revision::Ecs { reach }, Standard::Pal) if reach > MIB => 0x21,
         (Revision::Ecs { reach }, Standard::Ntsc) if reach > MIB => 0x31,
         (Revision::Ecs { .. }, Standard::Pal) => 0x20,
         (Revision::Ecs { .. }, Standard::Ntsc) => 0x30,
@@ -410,8 +414,33 @@ mod tests {
         assert_eq!(agnus_id(Revision::Ocs, Standard::Ntsc), 0x10);
         assert_eq!(agnus_id(one, Standard::Pal), 0x20);
         assert_eq!(agnus_id(one, Standard::Ntsc), 0x30);
-        assert_eq!(agnus_id(two, Standard::Pal), 0x22);
+        assert_eq!(agnus_id(two, Standard::Pal), 0x21);
         assert_eq!(agnus_id(two, Standard::Ntsc), 0x31);
+    }
+
+    /// Bit 1 of the identification is what Kickstart 3.1 sets
+    /// `GFXF_AA_ALICE` from (measured; see [`agnus_id`]), so it is Alice's
+    /// alone, and every PAL identification is its NTSC one less `$10`.
+    #[test]
+    fn only_alice_sets_the_bit_the_rom_reads_as_alice() {
+        let parts = [
+            Revision::Ocs,
+            Revision::Ecs { reach: MIB },
+            Revision::Ecs { reach: 2 * MIB },
+        ];
+        for rev in parts {
+            for std in [Standard::Pal, Standard::Ntsc] {
+                assert_eq!(agnus_id(rev, std) & 2, 0, "{rev:?} {std:?}");
+            }
+            assert_eq!(
+                agnus_id(rev, Standard::Pal) + 0x10,
+                agnus_id(rev, Standard::Ntsc),
+                "{rev:?}"
+            );
+        }
+        for std in [Standard::Pal, Standard::Ntsc] {
+            assert_eq!(agnus_id(Revision::Aga, std) & 2, 2, "Alice {std:?}");
+        }
     }
 
     #[test]

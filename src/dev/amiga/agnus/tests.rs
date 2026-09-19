@@ -1158,11 +1158,11 @@ fn ecs_board(std: Standard, reach: u64) -> Board {
 #[test]
 fn an_ecs_part_identifies_itself_in_vposr_with_lol_and_v10_v9() {
     // "8368 (hr) or 8372 (fat-hr) = 20 for PAL, 30 for NTSC", and the later
-    // 2 MiB part's 22 and 31.
+    // 2 MiB part's 21 and 31.
     for (std, reach, id) in [
         (Standard::Pal, ecs::MIB, 0x20),
         (Standard::Ntsc, ecs::MIB, 0x30),
-        (Standard::Pal, 2 * ecs::MIB, 0x22),
+        (Standard::Pal, 2 * ecs::MIB, 0x21),
         (Standard::Ntsc, 2 * ecs::MIB, 0x31),
     ] {
         let b = ecs_board(std, reach);

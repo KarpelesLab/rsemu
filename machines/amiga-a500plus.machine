@@ -100,7 +100,7 @@ machine "amiga-a500plus" {
   # -- Agnus: an 8375 --------------------------------------------------------
   #
   # See src/dev/amiga/agnus/ecs.rs. 2 MiB of reach, VPOSR's identification
-  # $22 (PAL) or $31 (NTSC), and a beam BEAMCON0 can reprogram.
+  # $21 (PAL) or $31 (NTSC), and a beam BEAMCON0 can reprogram.
   object agnus "amiga.agnus" {
     clock    = clk / 8
     custom   = custom

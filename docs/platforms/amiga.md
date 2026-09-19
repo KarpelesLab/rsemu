@@ -730,7 +730,7 @@ clock. Kickstart 2.04 is its own ROM.
 | Source | Covers |
 | --- | --- |
 | *Amiga Hardware Reference Manual*, 3rd edition, Appendix C ("Enhanced Chip Set") | Everything below unless a row says otherwise: *Determining Chip Revisions* (`VPOSR`'s layout and identifications, `DENISEID`), *SuperHires Mode* and its colour-register table, *SuperHires 70ns Sprite Positioning*, *Multi-Sync and Bi-Sync Monitors* (`HTOTAL`, `VTOTAL`, the sync and blank registers), *New BEAMCON0 Register*, *Display Window Specification* (`DIWHIGH`), *Genlock Extensions* (`BPLCON2`/`BPLCON3`), *Other ECS Modifications*, *Interpretational Differences* (`COPCON`), and the *ECS Registers* table |
-| Commodore's register notes for the AA chip set (the `VPOSR` identification table as transcribed at amiga-dev.wikidot.com) | "8372 (Fat-hr) (agnushr), rev 5 = 22 PAL, 31 NTSC" — the identification this model gives the 2 MiB part |
+| Commodore's register notes for the AA chip set (the `VPOSR` identification table as transcribed at amiga-dev.wikidot.com) | "8372 (Fat-hr) (agnushr), rev 5 = 22 PAL, 31 NTSC" — the identification this model gave the 2 MiB part until Kickstart 3.1 showed the PAL value is the AA specification's `$21`; see [the A1200](#the-guest-sees-aa-and-that-is-a-test-rather-than-a-claim) |
 | *MSM6242B* data sheet (Oki Semiconductor) | The battery-backed clock: register table, the functional description of every register, Tables 1 and 2 |
 | *ROM Kernel Reference Manual* structure layouts (`exec/execbase.h`, `exec/nodes.h`, `graphics/gfxbase.h`) | Where a test finds `GfxBase->ChipRevBits0` in guest RAM |
 
@@ -738,7 +738,7 @@ clock. Kickstart 2.04 is its own ROM.
 
 | | |
 | --- | --- |
-| `VPOSR` | "LOF I6 … I0 LOL -- -- -- -- v10 v9 V8": `$20` PAL / `$30` NTSC for an 8372A, `$22` / `$31` for an 8375; `LOL`; `V10`/`V9`. `VPOSW` writes `V10`–`V8` |
+| `VPOSR` | "LOF I6 … I0 LOL -- -- -- -- v10 v9 V8": `$20` PAL / `$30` NTSC for an 8372A, `$21` / `$31` for an 8375; `LOL`; `V10`/`V9`. `VPOSW` writes `V10`–`V8` |
 | `BEAMCON0` | Out of reset `PAL` follows the strap ("the chips from the US factory are configured for NTSC mode … reset the motherboard jumpers") and the rest is clear, so an ECS Agnus counts like its original until told otherwise. `PAL` switches the hardwired counts between 312/313 × 227 and 262/263 × 227/228; `LOLDIS` stops NTSC's long/short toggle |
 | Programmable beam | `VARBEAMEN`: `HTOTAL` is the highest count of a line and `VTOTAL` the highest line of a field ("VGA (525 lines, 114.0 colorclocks per scan line)" is `HTOTAL = 113`, `VTOTAL = 524`), with a long field one line longer under `LACE`. Counted, never timed: a field is an integer of colour clocks |
 | Sync pins | `VARHSYEN`/`VARVSYEN` move `hsync` to `HSSTRT`–`HSSTOP` and `vsync` to lines `VSSTRT`–`VSSTOP`, so the CIAs' TOD counters count a programmed beam's lines and fields |
@@ -1304,15 +1304,16 @@ Each is marked in `aga.rs` as an inference.
   bits the gate asks about are not there yet, and §2's note that "sprite
   vertical start and stop positions must be of the same parity" keeps a `VSTOP`
   line on the fetching side anyway.
-* **`VPOSR` collides with the 8375's.** The AA specification's own copy of the
-  identification list reads "8372(fat-hr) (agnushr), rev. 5 = 21 PAL, 31 NTSC",
-  one less than the `$22` this tree gives the 8375 (whose value was itself read
-  off a differently-transcribed copy of the same table). One of the two
-  readings is wrong and no document at hand settles which. Alice takes the
-  value her own specification gives her, `$22`/`$32`, and the 8375 keeps `$22`
-  rather than moving four real-ROM goldens on a guess. Nothing measured depends
-  on it: see the A1200's evidence below, where swapping Alice for an 8375
-  changed `ChipRevBits0` not at all.
+* **`VPOSR` used to collide with the 8375's.** The AA specification's own
+  copy of the identification list reads "8372(fat-hr) (agnushr), rev. 5 = 21
+  PAL, 31 NTSC", one less than the `$22` this tree gave the 8375 off a
+  differently-transcribed copy of the same table. The ROM settled which is
+  right: Kickstart 3.1 sets `GFXF_AA_ALICE` from bit 1 of the identification
+  ([the A1200](#the-guest-sees-aa-and-that-is-a-test-rather-than-a-claim)), so
+  at `$22` an A600 booting off its hard disk read `ChipRevBits0 = $07`, an ECS
+  board claiming Alice. The 8375 now answers the specification's `$21`, whose
+  bit 1 is clear and which keeps every row's PAL and NTSC `$10` apart; every
+  golden is unchanged, and that A600 reads `$03`.
 
 ### Tests
 
@@ -1414,8 +1415,13 @@ by sweeping each chip's identification word:
 So bit 3 (`GFXF_AA_LISA`) and bit 4 are `LISAID`'s, and **bit 2
 (`GFXF_AA_ALICE`) is bit 1 of `VPOSR`'s Agnus identification**. An earlier
 reading of the first three rows had it "not `VPOSR`", because the 8375 swap
-moved nothing and neither did Alice at `$23`; both have bit 1 set, and this
-tree's 8375 answers `$22` (`src/dev/amiga/agnus/ecs.rs`).
+moved nothing and neither did Alice at `$23`; both had bit 1 set, because this
+tree's 8375 answered `$22`. It answers the AA specification's `$21` now
+(`src/dev/amiga/agnus/ecs.rs`, `agnus_id`): at `$22` the A600 booting
+Workbench off its hard disk read `$07` — the ROM's later chip test, the one
+that sets the AA pair on the A1200, found "Alice" on an ECS board — and it
+reads `$03`, which `the_ecs_board_booting_workbench_still_finds_no_alice`
+holds.
 
 ### What `LISAID` bits 9 and 8 are
 

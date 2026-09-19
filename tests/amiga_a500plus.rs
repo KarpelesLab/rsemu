@@ -241,13 +241,15 @@ fn ids(m: &Machine) -> (u16, u16) {
 
 /// Appendix C, *Determining Chip Revisions*: an ECS Agnus's identification has
 /// bit 5 set ("A value of 20 or 30 indicates that the enhanced Hires Agnus is
-/// present"); the 500+'s 8375 is the 2 MiB part, `$22` on PAL. "The enhanced
-/// HighRes Denise (8373) will return $FC in the lower 8 bits."
+/// present"); the 500+'s 8375 is the 2 MiB part, `$21` on PAL — with bit 1
+/// clear, because Kickstart 3.1 reads that bit as Alice
+/// (`src/dev/amiga/agnus/ecs.rs`, `agnus_id`). "The enhanced HighRes Denise
+/// (8373) will return $FC in the lower 8 bits."
 #[test]
 fn the_500plus_identifies_an_ecs_agnus_and_an_8373() {
     let m = build("amiga-a500plus", Program::new().rom(0x0010_0000), &[]);
     let (agnus, denise) = ids(&m);
-    assert_eq!(agnus, 0x22, "an 8375 on PAL");
+    assert_eq!(agnus, 0x21, "an 8375 on PAL");
     assert_eq!(denise & 0xff, 0xfc, "an 8373");
     assert_eq!(denise, 0xfffc, "the reserved byte reads as ones here");
 }
