@@ -79,6 +79,18 @@
 //! line from the end of vertical blank, so a non-interlaced field is
 //! line-doubled and an interlaced frame weaves its two fields.
 //!
+//! That is the picture a hardwired beam gives. A programmable one — an ECS
+//! Agnus's — hands over a [`Raster`] with every field ([`Video::raster`]), and
+//! the field is laid out by it instead: its lines from the end of vertical
+//! blanking, its columns between the horizontal blanks, and one row a line
+//! rather than two for a 31 kHz line ([`DOUBLED_LINE`]). And while an 8373
+//! has SuperHires on screen, its columns are SuperHires pixels, four to a
+//! low-resolution one; the first SuperHires line of a field widens the picture
+//! there and then, and a field with none narrows it back. So the host's
+//! geometry — [`Video::geometry`] — is the field's, and can change at any
+//! field; `host::display::amiga` reads picture and size together with
+//! [`Video::copy_frame`].
+//!
 //! ## Why Denise is not a `Panel`
 //!
 //! [`dev::lcd::panel`](crate::dev::lcd::panel) is for a controller that
@@ -110,7 +122,13 @@
 //! | `DMACON` | latched only — the manual does not say what Denise does with it |
 //! | `BPL1DAT`–`BPL6DAT` | latched only; the bitplane words arrive through [`Video::line`] |
 //! | `STREQU`, `STRVBL`, `STRHOR`, `STRLONG` | accepted and ignored; [`Video::line`] and [`Video::field`] carry what they mean |
-//! | `BPLCON3`, `DIWHIGH`, `DENISEID` | ECS registers; this is the original 8362, so the first two latch and `DENISEID` reads the floating bus ("The original Denise (8362) does not have this register", Appendix C) |
+//! | `BPLCON3`, `DIWHIGH`, `DENISEID` | ECS registers. On an 8362 (`revision = "ocs"`, the default) the first two latch and `DENISEID` reads the floating bus ("The original Denise (8362) does not have this register", Appendix C). On an 8373 (`revision = "ecs"`) see the next rows |
+//! | `DENISEID` (8373) | [`ECS_DENISEID`]: "$FC in the lower 8 bits" |
+//! | `BPLCON0` (8373) | `SHRES` modelled: SuperHires, two pixels to a high-resolution one, colours through Appendix C's register encoding (`shr_colour`); `ENBPLCN3` modelled; `BPLHWRM`, `SPRHWRM` latched only |
+//! | `BPLCON2` (8373) | `KILLEHB` modelled; `ZDBPSEL`, `ZDBPEN`, `ZDCTEN` latched only — genlock, and there is no genlock |
+//! | `BPLCON3` (8373) | `BRDRBLNK` modelled: a black border; `BRDNTRAN` latched only, genlock again |
+//! | `DIWHIGH` (8373) | modelled: the window's `H8` and `V10`–`V8` directly, once written after `DIWSTRT`/`DIWSTOP` |
+//! | `SPRxCTL` (8373) | `SHSH1` modelled: a sprite half a low-resolution pixel later in SuperHires; `SHSH0` is "unimplemented" in the manual too |
 //!
 //! # What the manual leaves open, and what this model chose
 //!
@@ -131,6 +149,14 @@
 //! * **Interlaced field order.** A long field is woven into the even rows and a
 //!   short field into the odd ones.
 //! * **`CLXDAT` bit 15**, "not used", reads as zero.
+//! * **Where a SuperHires word is first shown.** Chapter 3's fetch arithmetic
+//!   puts the first pixel one fetch block and half a count after the fetch:
+//!   `2D + 17` in low resolution, `2D + 9` in high. SuperHires fetches a block
+//!   every two counts, so `2D + 5`. The manual gives no SuperHires formula.
+//! * **Which of a SuperHires pair takes a register's top bits** (see
+//!   `shr_colour`), and that a two-bit gun is shown repeated into four.
+//! * **SuperHires with dual playfields**, which Appendix C calls
+//!   "compatible": decoded as one playfield of the first two planes.
 //!
 //! # The mouse counters
 //!
@@ -198,7 +224,7 @@ use super::regs::{ChipId, Reg};
 pub const CLASS_NAME: &str = "amiga.denise";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// Columns in the picture, in high-resolution pixels.
 pub const WIDTH: u32 = 800;
@@ -216,9 +242,10 @@ pub const OUTPUT_LEFT: u16 = 64;
 /// How many words a line's fetch can carry per plane.
 ///
 /// Chapter 3, Table 3-14: 25 in low resolution and 49 in high resolution
-/// between the hardware limits. A few more are accepted and ignored past the
+/// between the hardware limits, and an 8373's SuperHires twice high
+/// resolution's (Appendix C). A few more are accepted and ignored past the
 /// line's end.
-pub const MAX_FETCH_WORDS: usize = 64;
+pub const MAX_FETCH_WORDS: usize = 128;
 
 /// Changes waiting for their pixel, past which the oldest is applied at once.
 ///
@@ -269,9 +296,49 @@ const HIRES: u16 = 1 << 15;
 const HOMOD: u16 = 1 << 11;
 const DBLPF: u16 = 1 << 10;
 const LACE: u16 = 1 << 2;
+// BPLCON0's ECS bits, Appendix C: "SHRES SuperHires 35ns pixel enable bit"
+// and "ENBPLCN3 Enable new BLPCON3 register".
+const SHRES: u16 = 1 << 6;
+const ENBPLCN3: u16 = 1 << 0;
+/// `BPLCON2` bit 9 on an ECS part: "KILLEHB Kill halfbrite" (Appendix C,
+/// *Genlock Extensions*).
+const KILLEHB: u16 = 1 << 9;
+/// `BPLCON3` bit 5: "BRDRBLNK Border blank".
+const BRDRBLNK: u16 = 1 << 5;
+/// `SPRxCTL` bit 4 on an ECS part: "SHSH1 Start horizontal (SHR mode) 70ns
+/// increment" (Appendix C, *SuperHires 70ns Sprite Positioning*).
+const SHSH1: u16 = 1 << 4;
 
 /// `SPRxCTL` bit 7, `ATT`: "Sprite attach control bit (odd sprites)".
 const ATTACH: u16 = 1 << 7;
+
+/// What an ECS Denise answers at `DENISEID`: "The enhanced HighRes Denise
+/// (8373) will return $FC in the lower 8 bits. The upper 8 bits are reserved"
+/// (Appendix C, *Determining Chip Revisions*). **Choice:** the reserved byte
+/// reads as ones.
+pub const ECS_DENISEID: u16 = 0xfffc;
+
+/// A line at least this long is a 15 kHz line, drawn twice when not
+/// interlaced so the picture keeps its shape; a shorter one — productivity
+/// mode's 114 counts — is drawn once. Midway between the two families.
+pub const DOUBLED_LINE: u16 = 170;
+
+/// The most lines a picture holds, so a programmed `VTOTAL` cannot ask for a
+/// frame buffer of absurd size. Twice the tallest real field.
+pub const MAX_LINES: u16 = 1024;
+
+/// Which Denise this is.
+///
+/// A closed set, so a real enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revision {
+    /// The original 8362.
+    Ocs,
+    /// The Enhanced Chip Set's 8373: `DENISEID`, `BPLCON3`, `DIWHIGH`,
+    /// SuperHires, 70 ns sprite positions and `KILLEHB`. Its picture is laid
+    /// out in SuperHires pixels, four to a low-resolution one.
+    Ecs,
+}
 
 // ---------------------------------------------------------------------------
 // the seam
@@ -374,6 +441,114 @@ impl Standard {
     }
 }
 
+/// The part of the beam's raster a monitor shows, as the chip that counts the
+/// beam reports it.
+///
+/// An original chip-set Agnus never reports one, and Denise lays its picture
+/// out from its [`Standard`] with [`Raster::standard`]. An ECS Agnus, whose
+/// beam is programmable, hands one over with [`Video::raster`] before every
+/// [`Video::field`], and the new field is laid out by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Raster {
+    /// The picture's first line: the end of vertical blanking.
+    pub first_line: u16,
+    /// How many lines the picture has.
+    pub lines: u16,
+    /// The beam count of the picture's first column.
+    pub first_clock: u16,
+    /// How many colour clocks across the picture is.
+    pub clocks: u16,
+    /// A short line's length in colour clocks, which says whether the lines
+    /// are 15 kHz ones or 31 kHz ones ([`DOUBLED_LINE`]).
+    pub line_clocks: u16,
+}
+
+impl Raster {
+    /// The original chip set's picture for `std`: from Table 3-13's end of
+    /// vertical blank to the end of a long field, and [`WIDTH`] high-resolution
+    /// pixels from [`OUTPUT_LEFT`].
+    #[must_use]
+    pub const fn standard(std: Standard) -> Raster {
+        Raster {
+            first_line: std.first_line(),
+            lines: std.lines(),
+            first_clock: OUTPUT_LEFT / 2,
+            clocks: (WIDTH / 4) as u16,
+            line_clocks: 227,
+        }
+    }
+
+    /// The same raster with its size held to what a frame buffer can be.
+    #[must_use]
+    const fn bounded(self) -> Raster {
+        let clocks = if self.clocks == 0 {
+            1
+        } else if self.clocks > 256 {
+            256
+        } else {
+            self.clocks
+        };
+        let lines = if self.lines == 0 {
+            1
+        } else if self.lines > MAX_LINES {
+            MAX_LINES
+        } else {
+            self.lines
+        };
+        Raster {
+            lines,
+            clocks,
+            ..self
+        }
+    }
+}
+
+/// How a field's picture is laid out: which lines and columns of the beam it
+/// shows, and at what size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    first_line: u16,
+    lines: u16,
+    /// The low-resolution `x` of the first column.
+    left: u16,
+    /// Low-resolution pixels across.
+    span: u16,
+    /// Columns per low-resolution pixel: two, a high-resolution pixel each,
+    /// or four, a SuperHires pixel each, while an 8373 has SuperHires on
+    /// screen.
+    scale: u16,
+    /// Rows per line: two when line-doubled or interlaced, one for a 31 kHz
+    /// line drawn as it is.
+    rows: u16,
+}
+
+impl Layout {
+    /// `superhires` is whether the picture needs SuperHires columns.
+    fn of(raster: Raster, superhires: bool, lace: bool) -> Layout {
+        let raster = raster.bounded();
+        Layout {
+            first_line: raster.first_line,
+            lines: raster.lines,
+            left: 2 * raster.first_clock,
+            span: 2 * raster.clocks,
+            scale: if superhires { 4 } else { 2 },
+            rows: if raster.line_clocks >= DOUBLED_LINE || lace {
+                2
+            } else {
+                1
+            },
+        }
+    }
+
+    fn width(&self) -> u32 {
+        u32::from(self.span) * u32::from(self.scale)
+    }
+
+    fn height(&self) -> u32 {
+        u32::from(self.lines) * u32::from(self.rows)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // state
 // ---------------------------------------------------------------------------
@@ -389,6 +564,11 @@ struct Regs {
     diwstrt: u16,
     diwstop: u16,
     diwhigh: u16,
+    /// `DIWHIGH` was written after the last `DIWSTRT` or `DIWSTOP`: on an
+    /// 8373 its top bits are in force (Appendix C, *Display Window
+    /// Specification*: "If this register is written last in a sequence of
+    /// setting the display window, it sets direct start and stop positions").
+    diwhigh_on: bool,
     clxcon: u16,
     bpldat: [u16; 6],
     spr_pos: [u16; 8],
@@ -427,9 +607,18 @@ impl Regs {
             BPLCON1 => self.bplcon1 = value,
             BPLCON2 => self.bplcon2 = value,
             BPLCON3 => self.bplcon3 = value,
-            DIWSTRT => self.diwstrt = value,
-            DIWSTOP => self.diwstop = value,
-            DIWHIGH => self.diwhigh = value,
+            DIWSTRT => {
+                self.diwstrt = value;
+                self.diwhigh_on = false;
+            }
+            DIWSTOP => {
+                self.diwstop = value;
+                self.diwhigh_on = false;
+            }
+            DIWHIGH => {
+                self.diwhigh = value;
+                self.diwhigh_on = true;
+            }
             CLXCON => self.clxcon = value,
             BPL1DAT..=BPL6DAT => self.bpldat[usize::from((offset - BPL1DAT) / 2)] = value,
             SPR0POS..=SPR7DATB => {
@@ -479,7 +668,8 @@ impl Regs {
                 w.write_u16(*v)?;
             }
         }
-        w.write_u8(self.armed)
+        w.write_u8(self.armed)?;
+        w.write_bool(self.diwhigh_on)
     }
 
     fn load(r: &mut ChunkReader<'_>) -> Result<Regs> {
@@ -513,6 +703,7 @@ impl Regs {
             }
         }
         regs.armed = r.read_u8()?;
+        regs.diwhigh_on = r.read_bool()?;
         Ok(regs)
     }
 }
@@ -553,7 +744,18 @@ struct State {
     clocks: u64,
     /// Colour clocks in the last complete field.
     last_field_clocks: u64,
-    /// The picture: `WIDTH × height` 12-bit RGB words.
+    /// The raster the current field is laid out by.
+    raster: Raster,
+    /// The raster the next field will be laid out by: the beam's last word.
+    raster_next: Raster,
+    /// The current field's layout: derived from `raster`, the revision and
+    /// `LACE` at the field's start, and saved because the last cannot be
+    /// derived afterwards.
+    layout: Layout,
+    /// A SuperHires line has been drawn in this field, so the next is laid
+    /// out in SuperHires columns too.
+    shres_seen: bool,
+    /// The picture: `layout.width() × layout.height()` 12-bit RGB words.
     frame: Vec<u16>,
 }
 
@@ -573,6 +775,8 @@ impl fmt::Debug for State {
 
 impl State {
     fn new(standard: Standard) -> State {
+        let raster = Raster::standard(standard);
+        let layout = Layout::of(raster, false, false);
         State {
             regs: Regs::default(),
             pending: VecDeque::new(),
@@ -585,8 +789,60 @@ impl State {
             lof: true,
             clocks: 0,
             last_field_clocks: 0,
-            frame: vec![0; WIDTH as usize * standard.height() as usize],
+            raster,
+            raster_next: raster,
+            layout,
+            shres_seen: false,
+            frame: vec![0; layout.width() as usize * layout.height() as usize],
         }
+    }
+
+    /// Lay the field that is starting out by `raster_next`: SuperHires
+    /// columns if the field just ended showed any SuperHires line or
+    /// `BPLCON0` asks for one now, high-resolution ones otherwise.
+    ///
+    /// A picture that only changes its columns is rescaled rather than
+    /// cleared, and one that keeps its size keeps its pixels, so an
+    /// interlaced frame still weaves; any other change starts a blank one.
+    fn relayout(&mut self, rev: Revision) {
+        self.raster = self.raster_next;
+        let superhires =
+            rev == Revision::Ecs && (self.shres_seen || self.regs.bplcon0 & SHRES != 0);
+        self.shres_seen = false;
+        let layout = Layout::of(self.raster, superhires, self.regs.bplcon0 & LACE != 0);
+        if layout == self.layout {
+            return;
+        }
+        let same_but_columns = Layout {
+            scale: self.layout.scale,
+            ..layout
+        } == self.layout;
+        if same_but_columns {
+            self.rescale(layout.scale);
+            return;
+        }
+        self.frame = vec![0; layout.width() as usize * layout.height() as usize];
+        self.layout = layout;
+    }
+
+    /// Change the picture's columns per low-resolution pixel to `scale`,
+    /// keeping every row: two columns become four by repeating each, and four
+    /// become two by keeping every other one.
+    fn rescale(&mut self, scale: u16) {
+        let old = self.layout;
+        let new = Layout { scale, ..old };
+        let (from, to) = (old.width() as usize, new.width() as usize);
+        let mut frame = vec![0; to * new.height() as usize];
+        for (dst, src) in frame
+            .chunks_exact_mut(to)
+            .zip(self.frame.chunks_exact(from))
+        {
+            for (i, px) in dst.iter_mut().enumerate() {
+                *px = src[i * from / to];
+            }
+        }
+        self.frame = frame;
+        self.layout = new;
     }
 
     /// Count whatever the mouse pins moved: each counter against its own low
@@ -647,34 +903,63 @@ struct Setup {
     /// Planes enabled, 0–6.
     planes: usize,
     hires: bool,
+    /// SuperHires, on an 8373: one bit per 35 ns quarter of a low-resolution
+    /// pixel.
+    shres: bool,
     dual: bool,
     ham: bool,
     ehb: bool,
-    /// Per plane, the high-resolution half-pixel of its first bit.
+    /// Per plane, the high-resolution half-pixel of its first bit — or, in
+    /// SuperHires, the quarter-pixel.
     start: [i32; 6],
     /// Inside the window vertically.
     inside_v: bool,
     hstart: u32,
     hstop: u32,
+    /// The border is black rather than `COLOR00`: `BRDRBLNK`.
+    blank: bool,
 }
 
 impl Setup {
-    fn of(regs: &Regs, fetch_start: u16, vpos: u16) -> Setup {
+    fn of(regs: &Regs, fetch_start: u16, vpos: u16, rev: Revision) -> Setup {
+        let ecs = rev == Revision::Ecs;
         let con0 = regs.bplcon0;
         // "111 not used" (Table 3-5). Six is the most there are.
         let planes = usize::from((con0 >> 12) & 7).min(6);
-        let hires = con0 & HIRES != 0;
+        // Appendix C: "HIRES Set it to zero if SHRES enabled". With both,
+        // SuperHires wins; the manual does not say what the silicon does.
+        let shres = ecs && con0 & SHRES != 0;
+        let hires = !shres && con0 & HIRES != 0;
         let dual = con0 & DBLPF != 0;
         // Chapter 3, "Hold-And-Modify Mode": HOMOD set, DBLPF clear, HIRES
-        // clear, and five or six planes, or it is not active.
-        let ham = con0 & HOMOD != 0 && !dual && !hires && planes >= 5;
+        // clear, and five or six planes, or it is not active. Appendix C: HAM
+        // is "Incompatible w/ SuperHires mode".
+        let ham = con0 & HOMOD != 0 && !dual && !hires && !shres && planes >= 5;
         // Appendix A, BPLCON0: "0 = Extra Half Brite (EHB) if HAM=0 and BPU=6
-        // and DBLPF=0".
-        let ehb = con0 & HOMOD == 0 && !dual && planes == 6;
+        // and DBLPF=0". An 8373's `KILLEHB` turns it off.
+        let ehb = con0 & HOMOD == 0
+            && !dual
+            && planes == 6
+            && !shres
+            && !(ecs && regs.bplcon2 & KILLEHB != 0);
 
         // Chapter 3: DIWSTRT at $81 goes with DDFSTRT at $38 in low resolution
-        // and $3C in high, "$81/2 - 8.5 = $38" and "$81/2 - 4.5 = $3C".
-        let lead: i32 = if hires { 9 } else { 17 };
+        // and $3C in high, "$81/2 - 8.5 = $38" and "$81/2 - 4.5 = $3C": the
+        // serializer starts one fetch block and half a count after the block
+        // began, eight counts in low resolution and four in high. SuperHires
+        // fetches a block every two counts (four words to high resolution's
+        // two), so by the same arithmetic its first pixel is 2.5 counts — five
+        // low-resolution pixels — after the fetch. **Inference:** the manual
+        // gives no SuperHires fetch formula.
+        let lead: i32 = if shres {
+            5
+        } else if hires {
+            9
+        } else {
+            17
+        };
+        // Half-pixels, or quarter-pixels in SuperHires.
+        let unit: i32 = if shres { 4 } else { 2 };
         let mut start = [0i32; 6];
         for (p, s) in start.iter_mut().enumerate() {
             // Odd planes (1, 3, 5, index 0, 2, 4) take playfield 1's delay in
@@ -686,28 +971,50 @@ impl Setup {
             } else {
                 (regs.bplcon1 >> 4) & 0xf
             };
-            *s = 2 * (2 * i32::from(fetch_start) + lead + i32::from(delay));
+            *s = unit * (2 * i32::from(fetch_start) + lead + i32::from(delay));
         }
 
-        // Appendix A, DIWSTRT/DIWSTOP: start is restricted to H8=0 and V8=0;
-        // stop to H8=1 and "V8=/=V7".
-        let vstart = regs.diwstrt >> 8;
-        let vstop_lo = regs.diwstop >> 8;
-        let vstop = vstop_lo | if vstop_lo & 0x80 == 0 { 0x100 } else { 0 };
+        let (vstart, vstop, hstart, hstop) = if ecs && regs.diwhigh_on {
+            // Appendix C, Display Window Specification: DIWHIGH's bits 10-8
+            // and 13 are the stop's V10-V8 and H8, bits 2-0 and 5 the start's.
+            let high = regs.diwhigh;
+            (
+                ((high & 7) << 8) | (regs.diwstrt >> 8),
+                (((high >> 8) & 7) << 8) | (regs.diwstop >> 8),
+                u32::from((high >> 5) & 1) << 8 | u32::from(regs.diwstrt & 0xff),
+                u32::from((high >> 13) & 1) << 8 | u32::from(regs.diwstop & 0xff),
+            )
+        } else {
+            // Appendix A, DIWSTRT/DIWSTOP: start is restricted to H8=0 and
+            // V8=0; stop to H8=1 and "V8=/=V7".
+            let vstop_lo = regs.diwstop >> 8;
+            (
+                regs.diwstrt >> 8,
+                vstop_lo | if vstop_lo & 0x80 == 0 { 0x100 } else { 0 },
+                u32::from(regs.diwstrt & 0xff),
+                0x100 | u32::from(regs.diwstop & 0xff),
+            )
+        };
+        // Appendix C, Genlock Extensions: BRDRBLNK, "Border blank", in the
+        // BPLCON3 that BPLCON0's ENBPLCN3 enables.
+        let blank = ecs && con0 & ENBPLCN3 != 0 && regs.bplcon3 & BRDRBLNK != 0;
         Setup {
             planes,
             hires,
+            shres,
             dual,
             ham,
             ehb,
             start,
             inside_v: vstart <= vpos && vpos < vstop,
-            hstart: u32::from(regs.diwstrt & 0xff),
-            hstop: 0x100 | u32::from(regs.diwstop & 0xff),
+            hstart,
+            hstop,
+            blank,
         }
     }
 
-    /// The six plane bits at high-resolution half-pixel `hx`, plane 1 in bit 0.
+    /// The six plane bits at high-resolution half-pixel `hx` — or, in
+    /// SuperHires, at quarter-pixel `hx` — plane 1 in bit 0.
     #[inline]
     fn bits(&self, fetch: &Fetch<'_>, hx: i32) -> u8 {
         let mut bits = 0u8;
@@ -716,7 +1023,11 @@ impl Setup {
             if rel < 0 {
                 continue;
             }
-            let bit = if self.hires { rel } else { rel >> 1 } as usize;
+            let bit = if self.hires || self.shres {
+                rel
+            } else {
+                rel >> 1
+            } as usize;
             let words = &fetch.planes[p][..fetch.planes[p].len().min(MAX_FETCH_WORDS)];
             if let Some(word) = words.get(bit / 16) {
                 bits |= (((word >> (15 - bit % 16)) & 1) as u8) << p;
@@ -805,8 +1116,33 @@ fn collisions(bits: u8, pixels: &[u8; 8], clxcon: u16) -> u16 {
     out
 }
 
+/// One SuperHires pixel's colour from a register: Appendix C, *SuperHires Mode
+/// and the Denise Color Registers*, "There are only two bits of red, green and
+/// blue color resolution per hires pixel". Register `n` holds, in the top two
+/// bits of each gun, the colour of pixel value `n & 3` and in the bottom two
+/// that of `n >> 2` — the table's `COLOR01` is `gh ab`, colour 1's red over
+/// colour 0's. So of a pair of SuperHires pixels (`left`, `right`), register
+/// `left | right << 2` shows the left one through its top bits and the right
+/// one through its bottom bits, and each shows its own colour.
+///
+/// **Choice:** which pixel of the pair takes the top bits. The manual gives
+/// the encoding and not the silicon's index, and the other assignment shows
+/// the same colours for any registers written as the table says. A two-bit
+/// gun goes to a four-bit one by repeating it, which is what the table's own
+/// `COLOR00`, `ab ab`, amounts to.
+#[inline]
+fn shr_colour(word: u16, top: bool) -> u16 {
+    let mut out = 0;
+    for shift in [8, 4, 0] {
+        let nibble = (word >> shift) & 0xf;
+        let gun = if top { nibble >> 2 } else { nibble & 3 };
+        out |= ((gun << 2) | gun) << shift;
+    }
+    out
+}
+
 /// Render one line into `st`. The heart of the chip.
-fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
+fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
     let field = st.fields;
     let vpos = line.vpos;
     st.apply_before(Stamp {
@@ -819,13 +1155,16 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
     // Which rows of the picture this line lands on. Interlace is decided at
     // the start of the line; a mid-line LACE change is not a picture anyone
     // has asked for.
-    let first = standard.first_line();
-    let rows: [Option<usize>; 2] = if vpos >= first && vpos - first < standard.lines() {
-        let base = 2 * usize::from(vpos - first);
-        if st.regs.bplcon0 & LACE != 0 {
-            [Some(base + usize::from(!st.lof)), None]
+    let layout = st.layout;
+    let first = layout.first_line;
+    let rows: [Option<usize>; 2] = if vpos >= first && vpos - first < layout.lines {
+        let at = usize::from(vpos - first);
+        if layout.rows == 1 {
+            [Some(at), None]
+        } else if st.regs.bplcon0 & LACE != 0 {
+            [Some(2 * at + usize::from(!st.lof)), None]
         } else {
-            [Some(base), Some(base + 1)]
+            [Some(2 * at), Some(2 * at + 1)]
         }
     } else {
         [None, None]
@@ -838,9 +1177,9 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
     // so a beam source that reports an absurd length cannot make a line cost
     // more than twice the longest real one.
     let span = (u32::from(line.clocks) * 2)
-        .max(u32::from(OUTPUT_LEFT) + WIDTH / 2)
+        .max(u32::from(layout.left) + u32::from(layout.span))
         .min(1024);
-    let mut setup = Setup::of(&st.regs, line.fetch.start, vpos);
+    let mut setup = Setup::of(&st.regs, line.fetch.start, vpos, rev);
 
     // A line with no rows in the picture, outside the window, and nothing
     // queued against it draws nothing and cannot collide: skip the pixels.
@@ -853,7 +1192,21 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
         return;
     }
 
+    // Columns in high-resolution half-pixels or SuperHires quarter-pixels, and
+    // where the picture's first one is. The first SuperHires line of a field
+    // laid out in half-pixels widens the picture there and then.
+    if setup.shres {
+        st.shres_seen = true;
+        if st.layout.scale == 2 {
+            st.rescale(4);
+        }
+    }
+    let mut width = st.layout.width() as i32;
+    let mut quarters = st.layout.scale == 4;
+    let mut left = i32::from(st.layout.left) * i32::from(st.layout.scale);
+
     let mut shifters = [Shifter::default(); 8];
+    let mut previous = [0u8; 8];
     let mut hold = st.regs.color[0];
     let mut clx = 0u16;
 
@@ -872,7 +1225,16 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
             changed = true;
         }
         if changed {
-            setup = Setup::of(&st.regs, line.fetch.start, vpos);
+            setup = Setup::of(&st.regs, line.fetch.start, vpos, rev);
+            if setup.shres {
+                st.shres_seen = true;
+                if st.layout.scale == 2 {
+                    st.rescale(4);
+                    width = st.layout.width() as i32;
+                    quarters = true;
+                    left = i32::from(st.layout.left) * 4;
+                }
+            }
         }
         let regs = &st.regs;
 
@@ -898,11 +1260,61 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
                 }
             }
         }
-        let sprite = front_sprite(&pixels, regs);
+        // An 8373 in SuperHires places a sprite with SHSH1 set 70 ns — half a
+        // low-resolution pixel — later (Appendix C, *SuperHires 70ns Sprite
+        // Positioning*): the first half of this pixel still shows its last.
+        let mut early = pixels;
+        if setup.shres {
+            for (i, px) in early.iter_mut().enumerate() {
+                if regs.spr_ctl[i] & SHSH1 != 0 {
+                    *px = previous[i];
+                }
+            }
+        }
+        previous = pixels;
         let inside = setup.inside_v && setup.hstart <= x && x < setup.hstop;
+        let border = if setup.blank { 0 } else { regs.color[0] };
 
         for sub in 0..2 {
             let hx = (2 * x + sub) as i32;
+            let pixels = if sub == 0 { &early } else { &pixels };
+            let sprite = front_sprite(pixels, regs);
+
+            if setup.shres {
+                // Two SuperHires pixels, whose colours come out of one register
+                // between them (`shr_colour`).
+                let q = 2 * hx;
+                let bits = [setup.bits(&line.fetch, q), setup.bits(&line.fetch, q + 1)];
+                let pair = usize::from(bits[0] & 3) | usize::from(bits[1] & 3) << 2;
+                for (half, &b) in bits.iter().enumerate() {
+                    let top = half == 0;
+                    let colour = if !inside {
+                        shr_colour(border, top)
+                    } else {
+                        clx |= collisions(b, pixels, regs.clxcon);
+                        let blocked =
+                            sprite.is_some_and(|s| u16::from(s.0) < (regs.bplcon2 >> 3) & 7);
+                        match sprite {
+                            Some((_, reg)) if b & 3 == 0 || blocked => {
+                                // A sprite's colour is in the upper sixteen
+                                // registers, encoded the same way, and both
+                                // halves of the pair are the sprite.
+                                let s = (reg - 16) & 3;
+                                shr_colour(regs.color[16 + (s | s << 2)], top)
+                            }
+                            _ => shr_colour(regs.color[pair], top),
+                        }
+                    };
+                    let col = q + half as i32 - left;
+                    if (0..width).contains(&col) {
+                        for row in rows.into_iter().flatten() {
+                            st.frame[row * width as usize + col as usize] = colour;
+                        }
+                    }
+                }
+                continue;
+            }
+
             let bits = setup.bits(&line.fetch, hx);
 
             // The hold register follows the serialized bits whether or not
@@ -918,9 +1330,9 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
             }
 
             let colour = if !inside {
-                regs.color[0]
+                border
             } else {
-                clx |= collisions(bits, &pixels, regs.clxcon);
+                clx |= collisions(bits, pixels, regs.clxcon);
                 let group = sprite.map(|s| u16::from(s.0));
                 let sprite_colour = sprite.map(|s| regs.color[s.1]);
                 // A playfield a sprite group is in front of is hidden at this
@@ -957,10 +1369,22 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
                 }
             };
 
-            let col = hx - 2 * i32::from(OUTPUT_LEFT);
-            if (0..WIDTH as i32).contains(&col) {
-                for row in rows.into_iter().flatten() {
-                    st.frame[row * WIDTH as usize + col as usize] = colour;
+            // One column per half-pixel on an 8362, two on an 8373.
+            if quarters {
+                for q in [2 * hx, 2 * hx + 1] {
+                    let col = q - left;
+                    if (0..width).contains(&col) {
+                        for row in rows.into_iter().flatten() {
+                            st.frame[row * width as usize + col as usize] = colour;
+                        }
+                    }
+                }
+            } else {
+                let col = hx - left;
+                if (0..width).contains(&col) {
+                    for row in rows.into_iter().flatten() {
+                        st.frame[row * width as usize + col as usize] = colour;
+                    }
                 }
             }
         }
@@ -987,6 +1411,7 @@ fn render(standard: Standard, st: &mut State, line: &Line<'_>) {
 /// the picture.
 pub struct Video {
     standard: Standard,
+    rev: Revision,
     /// LEAF: nothing is called while it is held. The beam is asked *before*
     /// taking it, because asking may make Agnus push lines in here.
     state: Mutex<State>,
@@ -1000,6 +1425,7 @@ impl fmt::Debug for Video {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Video")
             .field("standard", &self.standard)
+            .field("rev", &self.rev)
             .field("state", &*self.state.lock())
             .field("beam", &self.beam.lock().is_some())
             .finish_non_exhaustive()
@@ -1007,27 +1433,49 @@ impl fmt::Debug for Video {
 }
 
 impl Video {
-    /// A chip at power-on for `standard`.
+    /// An original 8362 at power-on for `standard`.
     #[must_use]
     pub fn new(standard: Standard) -> Video {
+        Video::with_revision(standard, Revision::Ocs)
+    }
+
+    /// Part `rev` at power-on for `standard`.
+    #[must_use]
+    pub fn with_revision(standard: Standard, rev: Revision) -> Video {
         Video {
             standard,
+            rev,
             state: Mutex::with_rank(LockRank::LEAF, State::new(standard)),
             beam: Mutex::with_rank(LockRank::LEAF, None),
             bus: Mutex::with_rank(LockRank::LEAF, Weak::new()),
         }
     }
 
-    /// The standard the picture is laid out for.
+    /// The standard the picture is laid out for until a beam says otherwise.
     #[must_use]
     pub fn standard(&self) -> Standard {
         self.standard
     }
 
-    /// The picture's size: `(WIDTH, standard.height())`.
+    /// Which part this is.
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.rev
+    }
+
+    /// The picture's size, `(width, height)`: `(WIDTH, standard.height())` for
+    /// an 8362 driven by an original Agnus, and whatever the current field's
+    /// [`Raster`] makes it otherwise.
     #[must_use]
     pub fn geometry(&self) -> (u32, u32) {
-        (WIDTH, self.standard.height())
+        let st = self.state.lock();
+        (st.layout.width(), st.layout.height())
+    }
+
+    /// The raster the current field is laid out by.
+    #[must_use]
+    pub fn current_raster(&self) -> Raster {
+        self.state.lock().raster
     }
 
     /// Give Denise the beam counter, so a mid-line write lands mid-line.
@@ -1035,10 +1483,17 @@ impl Video {
         *self.beam.lock() = Some(beam);
     }
 
+    /// The raster the next field is shown on. A beam whose raster can change
+    /// calls this before each [`field`](Self::field); one that never calls it
+    /// leaves the picture laid out by [`Raster::standard`].
+    pub fn raster(&self, raster: Raster) {
+        self.state.lock().raster_next = raster.bounded();
+    }
+
     /// Render one line. See the module documentation for the contract.
     pub fn line(&self, line: &Line<'_>) {
         let mut st = self.state.lock();
-        render(self.standard, &mut st, line);
+        render(self.rev, &mut st, line);
     }
 
     /// A new field begins; `lof` is its long-frame bit (`VPOSR` bit 15).
@@ -1048,6 +1503,7 @@ impl Video {
         st.last_field_clocks = st.clocks;
         st.clocks = 0;
         st.lof = lof;
+        st.relayout(self.rev);
     }
 
     /// Fields begun since reset.
@@ -1068,13 +1524,24 @@ impl Video {
     /// `dst` is filled as far as it and the row go; a `y` past the bottom
     /// leaves it alone.
     pub fn read_row(&self, y: u32, dst: &mut [u16]) {
-        if y >= self.standard.height() {
+        let st = self.state.lock();
+        let (width, height) = (st.layout.width(), st.layout.height());
+        if y >= height {
             return;
         }
-        let st = self.state.lock();
-        let at = y as usize * WIDTH as usize;
-        let n = dst.len().min(WIDTH as usize);
+        let at = y as usize * width as usize;
+        let n = dst.len().min(width as usize);
         dst[..n].copy_from_slice(&st.frame[at..at + n]);
+    }
+
+    /// The whole picture, as 12-bit `0RGB` words row after row, and its size
+    /// and field count — all as of one moment, which a host that reads row by
+    /// row while the geometry can change would not get. No side effects.
+    pub fn copy_frame(&self, dst: &mut Vec<u16>) -> (u32, u32, u64) {
+        let st = self.state.lock();
+        dst.clear();
+        dst.extend_from_slice(&st.frame);
+        (st.layout.width(), st.layout.height(), st.fields)
     }
 
     /// The collision register as it stands, without clearing it.
@@ -1138,6 +1605,17 @@ impl Video {
             w.write_u16(c.offset)?;
             w.write_u16(c.value)?;
         }
+        // The chip's own strap and part, so a snapshot of one is not restored
+        // into the other: the raster a beam handed over says how *this* field
+        // is laid out, not which chip it was.
+        w.write_bool(self.standard == Standard::Ntsc)?;
+        w.write_bool(self.rev == Revision::Ecs)?;
+        for raster in [st.raster, st.raster_next] {
+            save_raster(w, raster)?;
+        }
+        w.write_u16(st.layout.rows)?;
+        w.write_u16(st.layout.scale)?;
+        w.write_bool(st.shres_seen)?;
         // The picture is architectural state in the sense `dev::lcd::panel`
         // argues: nothing else saves it, and an interlaced frame keeps the
         // other field's rows from before the snapshot.
@@ -1177,13 +1655,40 @@ impl Video {
                 value: r.read_u16()?,
             });
         }
+        let ntsc = r.read_bool()?;
+        let ecs = r.read_bool()?;
+        if ntsc != (self.standard == Standard::Ntsc) || ecs != (self.rev == Revision::Ecs) {
+            return Err(Error::State(alloc::format!(
+                "{CLASS_NAME}: the snapshot is of a {} {} Denise and this is a {:?} {:?} one",
+                if ntsc { "NTSC" } else { "PAL" },
+                if ecs { "ECS" } else { "OCS" },
+                self.standard,
+                self.rev,
+            )));
+        }
+        let raster = load_raster(r)?;
+        let raster_next = load_raster(r)?;
+        let rows = r.read_u16()?;
+        let scale = r.read_u16()?;
+        let shres_seen = r.read_bool()?;
+        let widest = if self.rev == Revision::Ecs { 4 } else { 2 };
+        if !(1..=2).contains(&rows) || !(scale == 2 || scale == widest) {
+            return Err(Error::State(alloc::format!(
+                "{CLASS_NAME}: {rows} rows a line and {scale} columns a pixel; a {:?} Denise's \
+                 picture has one or two, and two or {widest}",
+                self.rev
+            )));
+        }
+        let layout = Layout {
+            rows,
+            ..Layout::of(raster, scale == 4, false)
+        };
         let bytes = r.read_bytes()?;
-        let expected = WIDTH as usize * self.standard.height() as usize;
+        let expected = layout.width() as usize * layout.height() as usize;
         if bytes.len() != expected * 2 {
             return Err(Error::State(alloc::format!(
-                "{CLASS_NAME}: the snapshot's picture is {} bytes and a {:?} Denise's is {}",
+                "{CLASS_NAME}: the snapshot's picture is {} bytes and its raster's is {}",
                 bytes.len(),
-                self.standard,
                 expected * 2
             )));
         }
@@ -1207,10 +1712,38 @@ impl Video {
             lof,
             clocks,
             last_field_clocks,
+            raster,
+            raster_next,
+            layout,
+            shres_seen,
             frame,
         };
         Ok(())
     }
+}
+
+fn save_raster(w: &mut ChunkWriter<'_>, raster: Raster) -> Result<()> {
+    for v in [
+        raster.first_line,
+        raster.lines,
+        raster.first_clock,
+        raster.clocks,
+        raster.line_clocks,
+    ] {
+        w.write_u16(v)?;
+    }
+    Ok(())
+}
+
+fn load_raster(r: &mut ChunkReader<'_>) -> Result<Raster> {
+    Ok(Raster {
+        first_line: r.read_u16()?,
+        lines: r.read_u16()?,
+        first_clock: r.read_u16()?,
+        clocks: r.read_u16()?,
+        line_clocks: r.read_u16()?,
+    }
+    .bounded())
 }
 
 impl CustomChip for Video {
@@ -1233,6 +1766,7 @@ impl CustomChip for Video {
             }
             JOY0DAT => self.state.lock().joy[0],
             JOY1DAT => self.state.lock().joy[1],
+            DENISEID if self.rev == Revision::Ecs => ECS_DENISEID,
             DENISEID => {
                 // "The original Denise (8362) does not have this register, so
                 // whatever value is left over on the bus from the last cycle
@@ -1340,7 +1874,8 @@ impl Denise {
     /// # Errors
     ///
     /// [`Error::Property`] if `custom` is missing, `standard` is not `"pal"`
-    /// or `"ntsc"`, or a property nothing here accepts was given.
+    /// or `"ntsc"`, `revision` is not `"ocs"` or `"ecs"`, or a property
+    /// nothing here accepts was given.
     pub fn new(props: &Props) -> Result<Denise> {
         let mut r = props.reader();
         let custom = r.require_link("custom")?.as_str().to_string();
@@ -1348,9 +1883,13 @@ impl Denise {
             "ntsc" => Standard::Ntsc,
             _ => Standard::Pal,
         };
+        let rev = match r.or_enum("revision", "ocs", &["ocs", "ecs"])? {
+            "ecs" => Revision::Ecs,
+            _ => Revision::Ocs,
+        };
         r.finish()?;
         Ok(Denise {
-            video: Arc::new(Video::new(standard)),
+            video: Arc::new(Video::with_revision(standard, rev)),
             custom,
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         })
@@ -1439,6 +1978,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "`pal` (default) or `ntsc`: how many lines the picture has",
         },
+        PropertySpec {
+            name: "revision",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "`ocs` (default, an 8362) or `ecs` (an 8373: DENISEID, BPLCON3, DIWHIGH, SuperHires, a picture in SuperHires pixels)",
+        },
     ],
     construct: |props| Ok(Box::new(Denise::new(props)?)),
 };
@@ -1466,7 +2011,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> ClassSchema {
     let mut schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("custom", ValueKind::Link).required())
-        .prop(PropSchema::new("standard", ValueKind::Str));
+        .prop(PropSchema::new("standard", ValueKind::Str))
+        .prop(PropSchema::new("revision", ValueKind::Str).values(&["ocs", "ecs"]));
     for pin in MOUSE_PINS {
         schema = schema.port(pin, PortDir::In);
     }

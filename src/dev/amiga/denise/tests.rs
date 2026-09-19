@@ -1046,3 +1046,267 @@ fn the_golden_field_renders_byte_identically() {
     assert_ne!(first.peek_clxdat(), 0);
     assert_eq!(first.peek_clxdat(), second.peek_clxdat());
 }
+
+// ---------------------------------------------------------------------------
+// the Enhanced Chip Set: an 8373
+// ---------------------------------------------------------------------------
+
+fn ecs() -> Video {
+    Video::with_revision(Standard::Pal, Revision::Ecs)
+}
+
+/// The picture at `(row, col)`, in whatever columns it is laid out in now.
+fn at(v: &Video, row: u32, col: usize) -> u16 {
+    let mut words = vec![0u16; v.geometry().0 as usize];
+    v.read_row(row, &mut words);
+    words[col]
+}
+
+/// The first row line `vpos` lands on in a PAL picture.
+fn row_of(vpos: u16) -> u32 {
+    2 * u32::from(vpos - Standard::Pal.first_line())
+}
+
+#[test]
+fn deniseid_on_an_8373_is_fc() {
+    let custom = Custom::new(&Props::new()).unwrap();
+    let v = Arc::new(ecs());
+    custom.bus().attach(v.clone()).unwrap();
+    *v.bus.lock() = Arc::downgrade(custom.bus());
+    custom.bus().write(COLOR00, 0x0abc, Origin::cpu());
+    // "The enhanced HighRes Denise (8373) will return $FC in the lower 8
+    // bits"; the reserved upper byte reads as ones here.
+    assert_eq!(custom.bus().read(DENISEID, Origin::cpu()), ECS_DENISEID);
+    assert_eq!(ECS_DENISEID & 0xff, 0xfc);
+}
+
+#[test]
+fn brdrblnk_blanks_the_border_once_enbplcn3_enables_bplcon3() {
+    for (v, blanks) in [(ecs(), true), (video(), false)] {
+        setup(&v, 0x1200);
+        w(&v, COLOR00, 0x0123);
+        w(&v, BPLCON3, BRDRBLNK);
+        fetched(&v, V, 0x38, [&[0x8000], &[], &[], &[], &[], &[]]);
+        assert_eq!(lores(&v, V, 0x80), 0x0123, "BPLCON3 is not enabled yet");
+        w(&v, BPLCON0, 0x1200 | ENBPLCN3);
+        fetched(&v, V + 1, 0x38, [&[0x8000], &[], &[], &[], &[], &[]]);
+        let border = if blanks { 0x0000 } else { 0x0123 };
+        assert_eq!(lores(&v, V + 1, 0x80), border, "{:?}", v.revision());
+        assert_eq!(lores(&v, V + 1, 0x81), 0x0101, "the window is not blanked");
+        assert_eq!(
+            lores(&v, V + 1, 0x82),
+            0x0123,
+            "and colour 0 inside it shows"
+        );
+    }
+}
+
+#[test]
+fn diwhigh_places_the_window_directly_on_an_8373_until_diwstrt_is_written() {
+    let words = [0xffffu16; 25];
+    for (v, direct) in [(ecs(), true), (video(), false)] {
+        setup(&v, 0x1200);
+        // Stop's H8 clear and V8 set: x = $0C1 rather than the old $1C1.
+        w(&v, DIWHIGH, 0x0100);
+        fetched(&v, V, 0x38, [&words, &[], &[], &[], &[], &[]]);
+        let at_d0 = if direct { 0x0100 } else { 0x0101 };
+        assert_eq!(lores(&v, V, 0xc0), 0x0101, "{:?}", v.revision());
+        assert_eq!(lores(&v, V, 0xd0), at_d0, "{:?}", v.revision());
+        // "If it is not written, the old scheme ... holds": a DIWSTRT write
+        // after it puts the old scheme back.
+        w(&v, DIWSTRT, PAL_DIWSTRT);
+        fetched(&v, V + 1, 0x38, [&words, &[], &[], &[], &[], &[]]);
+        assert_eq!(lores(&v, V + 1, 0xd0), 0x0101);
+    }
+}
+
+/// The four SuperHires colours of the productivity test, two bits a gun:
+/// dark blue, red, green, white.
+const SHR: [(u16, u16, u16); 4] = [(0, 0, 2), (3, 0, 0), (0, 3, 0), (3, 3, 3)];
+
+/// `COLORnn` encoded as Appendix C's table: colour `n & 3` in the top two
+/// bits of each gun, colour `n >> 2` in the bottom two.
+fn shr_register(n: usize) -> u16 {
+    let (top, bottom) = (SHR[n & 3], SHR[n >> 2]);
+    ((top.0 << 2 | bottom.0) << 8) | ((top.1 << 2 | bottom.1) << 4) | (top.2 << 2 | bottom.2)
+}
+
+/// Colour `n` as shown: each two-bit gun repeated into four.
+fn shr_shown(n: usize) -> u16 {
+    let (r, g, b) = SHR[n];
+    let four = |v: u16| (v << 2) | v;
+    (four(r) << 8) | (four(g) << 4) | four(b)
+}
+
+#[test]
+fn superhires_shows_two_pixels_per_high_resolution_pixel_through_the_encoded_registers() {
+    let v = ecs();
+    w(&v, DIWSTRT, PAL_DIWSTRT);
+    w(&v, DIWSTOP, PAL_DIWSTOP);
+    for n in 0..16 {
+        w(&v, color(n), shr_register(n as usize));
+    }
+    w(&v, BPLCON0, 0x2240); // two planes, COLOR, SHRES
+    assert_eq!(v.geometry(), (800, 568), "high-resolution columns until...");
+    // A SuperHires word fetched at D is shown from x = 2D + 5: $3E puts it
+    // at the window's $81. Planes 1010.. and 1100..: values 3, 2, 1, 0.
+    fetched(&v, V, 0x3e, [&[0xaaaa], &[0xcccc], &[], &[], &[], &[]]);
+    assert_eq!(v.geometry(), (1600, 568), "...the first SuperHires line");
+    let col = |x: usize| 4 * (x - usize::from(OUTPUT_LEFT));
+    let row = row_of(V);
+    assert_eq!(at(&v, row, col(0x81) - 1), shr_shown(0), "border");
+    for i in 0..16 {
+        assert_eq!(
+            at(&v, row, col(0x81) + i),
+            shr_shown(3 - i % 4),
+            "pixel {i}"
+        );
+    }
+    assert_eq!(at(&v, row, col(0x81) + 16), shr_shown(0), "one word only");
+
+    // The same line on an 8362: SHRES is a bit it does not have, so the word
+    // is sixteen low-resolution pixels from x = 2D + 17.
+    let o = video();
+    for n in 0..16 {
+        w(&o, color(n), shr_register(n as usize));
+    }
+    w(&o, DIWSTRT, PAL_DIWSTRT);
+    w(&o, DIWSTOP, PAL_DIWSTOP);
+    w(&o, BPLCON0, 0x2240);
+    fetched(&o, V, 0x3e, [&[0xaaaa], &[0xcccc], &[], &[], &[], &[]]);
+    assert_eq!(o.geometry(), (800, 568));
+    assert_eq!(lores(&o, V, 2 * 0x3e + 17), shr_register(3));
+    assert_eq!(lores(&o, V, 2 * 0x3e + 18), shr_register(2));
+}
+
+#[test]
+fn widening_to_superhires_keeps_what_was_drawn_and_a_quiet_field_narrows_back() {
+    let v = ecs();
+    setup(&v, 0x1200);
+    fetched(&v, V, 0x38, [&[0x8000], &[], &[], &[], &[], &[]]);
+    let before = lores(&v, V, 0x81);
+    w(&v, BPLCON0, 0x1240);
+    blank(&v, V + 1);
+    assert_eq!(v.geometry().0, 1600);
+    let col = 4 * (0x81 - usize::from(OUTPUT_LEFT));
+    for c in col..col + 4 {
+        assert_eq!(at(&v, row_of(V), c), before, "the earlier line, repeated");
+    }
+    // A field with SuperHires in it keeps the columns for the next one...
+    v.field(true);
+    assert_eq!(v.geometry().0, 1600);
+    // ...and one without gives them back, every other column kept.
+    w(&v, BPLCON0, 0x1200);
+    blank(&v, V + 2);
+    v.field(true);
+    assert_eq!(v.geometry().0, 800);
+    assert_eq!(lores(&v, V, 0x81), before);
+}
+
+#[test]
+fn a_shsh1_sprite_starts_half_a_low_resolution_pixel_later_in_superhires() {
+    let v = ecs();
+    w(&v, DIWSTRT, PAL_DIWSTRT);
+    w(&v, DIWSTOP, PAL_DIWSTOP);
+    w(&v, BPLCON0, 0x0240); // no planes, COLOR, SHRES
+    // Sprite value 1 shows through COLOR21, encoded with colour 1 twice.
+    w(&v, color(21), 0x0ff0);
+    let col = |x: usize| 4 * (x - usize::from(OUTPUT_LEFT));
+    sprite(&v, 0, 0xa1, 0x8000, 0x0000, 0);
+    blank(&v, V);
+    let row = row_of(V);
+    assert_eq!(at(&v, row, col(0xa1) - 1), 0x0000);
+    assert_eq!(at(&v, row, col(0xa1)), 0x0ff0, "on the 140 ns boundary");
+    // SHSH1: "Start horizontal (SHR mode) 70ns increment".
+    sprite(&v, 0, 0xa1, 0x8000, 0x0000, SHSH1);
+    blank(&v, V + 1);
+    let row = row_of(V + 1);
+    assert_eq!(at(&v, row, col(0xa1) + 1), 0x0000, "70 ns later");
+    assert_eq!(at(&v, row, col(0xa1) + 2), 0x0ff0);
+    assert_eq!(at(&v, row, col(0xa1) + 5), 0x0ff0, "a whole pixel wide");
+    assert_eq!(at(&v, row, col(0xa1) + 6), 0x0000);
+}
+
+#[test]
+fn killehb_makes_the_sixth_plane_an_ordinary_bit_on_an_8373() {
+    for (v, kills) in [(ecs(), true), (video(), false)] {
+        setup(&v, 0x6200);
+        w(&v, color(5), 0x0fa4);
+        w(&v, BPLCON2, KILLEHB);
+        let p1 = [0x4000u16];
+        let p3 = [0x4000u16];
+        let p6 = [0x4000u16];
+        fetched(&v, V, 0x38, [&p1, &[], &p3, &[], &[], &p6]);
+        // Bits 1, 3 and 6: register 5, halved unless KILLEHB.
+        let want = if kills { 0x0fa4 } else { 0x0752 };
+        assert_eq!(lores(&v, V, 0x82), want, "{:?}", v.revision());
+    }
+}
+
+#[test]
+fn a_raster_from_the_beam_lays_out_the_next_field() {
+    let raster = Raster {
+        first_line: 30,
+        lines: 480,
+        first_clock: 20,
+        clocks: 90,
+        line_clocks: 114,
+    };
+    let v = ecs();
+    v.raster(raster);
+    assert_eq!(v.geometry(), (800, 568), "not until the field starts");
+    v.field(true);
+    assert_eq!(v.current_raster(), raster);
+    // 90 counts of high-resolution columns, and one row a 31 kHz line.
+    assert_eq!(v.geometry(), (360, 480));
+    w(&v, COLOR00, 0x0f00);
+    v.line(&Line {
+        vpos: 30,
+        clocks: 114,
+        fetch: Fetch::default(),
+    });
+    assert_eq!(at(&v, 0, 0), 0x0f00, "line 30 is row 0");
+    assert_eq!(at(&v, 1, 0), 0x0000, "and it is drawn once");
+    // Interlaced, the rows double again and weave.
+    w(&v, BPLCON0, LACE);
+    v.field(true);
+    assert_eq!(v.geometry(), (360, 960));
+}
+
+#[test]
+fn an_ecs_snapshot_round_trips_with_its_raster_and_columns() {
+    let ecs_props = || props().with("revision", Value::from("ecs"));
+    let saved = Denise::new(&ecs_props()).unwrap();
+    let v = saved.video();
+    v.raster(Raster {
+        first_line: 30,
+        lines: 480,
+        first_clock: 20,
+        clocks: 90,
+        line_clocks: 114,
+    });
+    v.field(true);
+    w(v, DIWSTRT, 0x2c81);
+    w(v, DIWHIGH, 0x0100);
+    w(v, BPLCON0, 0x2240);
+    fetched(v, 0x40, 0x3e, [&[0xaaaa], &[0xcccc], &[], &[], &[], &[]]);
+    assert_eq!(v.geometry(), (720, 480));
+    let bytes = snapshot(&saved);
+
+    let restored = Denise::new(&ecs_props()).unwrap();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("denise", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+    assert_eq!(snapshot(&restored), bytes, "identical after a round trip");
+    assert_eq!(restored.video().geometry(), (720, 480));
+    assert_eq!(frame_hash(restored.video()), frame_hash(v));
+
+    // An 8362 does not take an 8373's snapshot.
+    let ocs = Denise::new(&props()).unwrap();
+    let chunk = reader
+        .load("denise", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    assert!(Device::load(&ocs, &mut chunk.reader()).is_err());
+}

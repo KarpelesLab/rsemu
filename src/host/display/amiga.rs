@@ -41,7 +41,7 @@
 //! every line of [`capture`] deletes.
 
 use alloc::sync::Arc;
-use alloc::vec;
+use alloc::vec::Vec;
 
 use super::{PixelFormat, Scanout, Surface, SurfaceInfo};
 use crate::dev::amiga::denise::Video;
@@ -106,18 +106,18 @@ impl Scanout for DeniseScanout {
     }
 
     fn capture(&self, dst: &mut Surface) -> u64 {
-        let info = self.info();
-        dst.reshape(dst.format(), info.width, info.height);
-        // The counter before the pixels, for the reason every adapter here
-        // gives: a serial never ahead of its pixels errs toward one extra
-        // redraw rather than a missed one.
-        let serial = self.video.fields();
-        let mut row = vec![0u16; info.width as usize];
-        for y in 0..info.height {
-            self.video.read_row(y, &mut row);
-            for (x, word) in row.iter().enumerate() {
-                dst.put(x as u32, y, rgb12_to_rgb888(*word));
-            }
+        // The picture, its size and its field count in one moment: an ECS
+        // beam can change the geometry at any field, and a size read before
+        // the rows could belong to a different field than the rows do. The
+        // serial is taken with the pixels, never after them, for the reason
+        // every adapter here gives: a serial never ahead of its pixels errs
+        // toward one extra redraw rather than a missed one.
+        let mut words = Vec::new();
+        let (width, height, serial) = self.video.copy_frame(&mut words);
+        dst.reshape(dst.format(), width, height);
+        for (i, word) in words.iter().enumerate() {
+            let (x, y) = (i as u32 % width, i as u32 / width);
+            dst.put(x, y, rgb12_to_rgb888(*word));
         }
         dst.set_serial(serial);
         serial
