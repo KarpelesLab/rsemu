@@ -342,7 +342,7 @@ use crate::jit::{
     Translation,
 };
 
-use super::exec::{Ex, Exec, Fault, State, VEC_SS};
+use super::exec::{Ex, Exec, Fault, Position, State, VEC_SS};
 #[cfg(test)]
 use super::isa::seg;
 use super::lift::{
@@ -1000,11 +1000,18 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64) -> Admit {
 /// `remaining` is what is left of the caller's budget, and it is not advisory
 /// — see the module docs.
 ///
+/// `position` is where this core publishes how far into its round it has got,
+/// carried into the one [`Exec`] every engine path below shares;
+/// `Exec::publish_position` has why only a bus access publishes it, and why
+/// that keeps the engines agreeing. The caller advances its origin by what
+/// this returns.
+///
 /// # Panics
 ///
 /// If a lifted block reaches an op the IR backend does not implement. That is
 /// this crate's own frontend emitting something its own backend cannot
 /// execute, and the architectural state at that point is not reconstructible.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn advance(
     jit: &mut Jit,
     state: &mut State,
@@ -1012,10 +1019,11 @@ pub(super) fn advance(
     io: Option<&AddressSpace>,
     cfg: &Config,
     lines: &Lines,
+    position: Option<&Position>,
     remaining: u64,
 ) -> u64 {
     let Jit { disp, at: bound } = jit;
-    let mut exec = Exec::new(state, mem, io, cfg, lines);
+    let mut exec = Exec::new(state, mem, io, cfg, lines).with_position(position);
     let pc = exec.state.regs.rip;
 
     // The entry work for the *first* block, done here rather than through

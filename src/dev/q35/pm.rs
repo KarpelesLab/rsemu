@@ -325,8 +325,38 @@ impl AcpiBlock {
     }
 
     /// Install the handle that catches this block up before an access.
+    ///
+    /// Also asks for this block's domain in every processor's read view
+    /// ([`LazyHandle::read_at_readers`]): `PM1_TMR` is a pure function of time,
+    /// so it is read where the reading processor stands rather than where the
+    /// block was last caught up to — see `AcpiBlock::reader_tick`.
     pub fn set_lazy(&self, handle: LazyHandle) {
+        handle.read_at_readers();
         *self.lazy.lock() = Some(handle);
+    }
+
+    /// Where the processor making this access stands in this block's domain,
+    /// or zero where there is no such answer — a debug access, or no handle.
+    ///
+    /// `PM1_TMR` is answered at `max(own tick, this)`. On a board whose two
+    /// processors share a crystal neither is given a live view, so catch-up
+    /// stops where the round began, and a guest spinning on the counter —
+    /// Linux's `acpi_pm` clocksource, a `udelay` calibrated against it — read
+    /// the same value for a whole round and then a jump of up to a round's
+    /// worth, 3 580 counts of the 3.579545 MHz crystal. A
+    /// read at the reader's own position moves nothing: no tick, no
+    /// `TMROF_STS`, no SCI. The overflow still sets its bit at this block's own
+    /// event, and a reader can never see past that event before it happens,
+    /// because the scheduler's read view is capped where the round closes and
+    /// the round closes no later than the block's next event
+    /// (`core::sched::TickCursor::tick_in`). Taken before the state lock, and
+    /// holding none, because it takes leaf locks of its own.
+    fn reader_tick(&self, attrs: MemAttrs) -> u64 {
+        if attrs.debug {
+            return 0;
+        }
+        let handle = self.lazy.lock().clone();
+        handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
     }
 
     /// The tick the counter stands at.
@@ -409,13 +439,14 @@ impl AcpiBlock {
         let _ = handle.sync(kind);
     }
 
-    /// The 32 bits a read of the dword containing `offset` sees.
-    fn dword(&self, aligned: u64) -> u32 {
+    /// The 32 bits a read of the dword containing `offset` sees, with
+    /// `PM1_TMR` taken at `reader` where that is past this block's own tick.
+    fn dword(&self, aligned: u64, reader: u64) -> u32 {
         let state = self.state.lock();
         match aligned {
             PM1_STS => u32::from(state.sts) | (u32::from(state.en) << 16),
             PM1_CNT => state.cnt,
-            PM1_TMR => self.timer(),
+            PM1_TMR => (self.tick().max(reader) % TIMER_MODULUS) as u32,
             GPE0_STS => state.gpe_sts as u32,
             v if v == GPE0_STS + 4 => (state.gpe_sts >> 32) as u32,
             GPE0_EN => state.gpe_en as u32,
@@ -527,7 +558,14 @@ impl MemOps for AcpiBlock {
             // express, and no `in` instruction issues one.
             return Err(BusError::BadAccess);
         }
-        let word = self.dword(aligned).to_le_bytes();
+        // Only the counter is read at the reader's position; nothing else in
+        // the block is a function of time, and the lookup costs a lock.
+        let reader = if aligned == PM1_TMR {
+            self.reader_tick(attrs)
+        } else {
+            0
+        };
+        let word = self.dword(aligned, reader).to_le_bytes();
         for (i, slot) in dst.iter_mut().enumerate() {
             *slot = word[(offset - aligned) as usize + i];
         }

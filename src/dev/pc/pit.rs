@@ -520,29 +520,56 @@ impl Counter {
         self.output = self.mode != 0;
     }
 
-    /// Freeze the counting element for a later read.
+    /// This counter as it would stand `delta` clocks on, **without moving it**
+    /// — a copy, stepped by exactly the arithmetic catch-up uses
+    /// ([`Counter::advance`], one event at a time), so the two cannot
+    /// disagree.
     ///
-    /// A second latch command before the first latched value has been read is
-    /// ignored, so a guest gets the value it asked for rather than a fresher
-    /// one (data sheet, counter-latch command).
-    fn latch_count(&mut self) {
+    /// What a processor that stands `delta` clocks past this chip's own tick
+    /// reads: the counting element and the status byte are pure functions of
+    /// the clock between two guest writes (82C54 data sheet, the mode
+    /// descriptions and "Read Operations"). Nothing is driven — the copy has
+    /// no pins — so no output edge happens here. The scheduler never lets a
+    /// reader stand past this chip's next event before that event is
+    /// delivered (`core::sched::TickCursor::tick_in`), so in a running machine
+    /// the loop turns once and reaches an edge only on the tick it is
+    /// delivered on.
+    fn at(&self, mut delta: u64) -> Counter {
+        let mut probe = self.clone();
+        while delta > 0 {
+            // `next_event` is never `Some(0)`, so every turn makes progress.
+            let step = probe.next_event().map_or(delta, |event| event.min(delta));
+            probe.advance(step);
+            delta -= step;
+        }
+        probe
+    }
+
+    /// Freeze the counting element, as `live` shows it, for a later read.
+    ///
+    /// `live` is this counter at the instant the command was written
+    /// ([`Counter::at`]). A second latch command before the first latched value
+    /// has been read is ignored, so a guest gets the value it asked for rather
+    /// than a fresher one (data sheet, counter-latch command).
+    fn latch_count(&mut self, live: &Counter) {
         if self.latched_count.is_none() {
-            self.latched_count = Some(self.element());
+            self.latched_count = Some(live.element());
         }
     }
 
-    /// Freeze the status byte for a later read, on the same terms.
-    fn latch_status(&mut self) {
+    /// Freeze the status byte, as `live` shows it, on the same terms.
+    fn latch_status(&mut self, live: &Counter) {
         if self.latched_status.is_none() {
-            self.latched_status = Some(self.status());
+            self.latched_status = Some(live.status());
         }
     }
 
-    /// Read one byte through this counter's port.
+    /// Read one byte through this counter's port, with `live` the counter at
+    /// the instant of the read ([`Counter::at`]).
     ///
     /// `debug` suppresses every side effect: a monitor must not consume the
     /// latch or step the byte toggle out from under the guest.
-    fn read(&mut self, debug: bool) -> u8 {
+    fn read(&mut self, debug: bool, live: &Counter) -> u8 {
         if let Some(status) = self.latched_status {
             // A latched status is returned before any latched count, so a
             // read-back that asked for both is unpacked in that order.
@@ -551,7 +578,7 @@ impl Counter {
             }
             return status;
         }
-        let value = self.latched_count.unwrap_or_else(|| self.element());
+        let value = self.latched_count.unwrap_or_else(|| live.element());
         match self.access {
             1 => {
                 if !debug {
@@ -695,16 +722,24 @@ impl State {
         ]
     }
 
-    /// Apply a write to the control port.
-    fn control(&mut self, word: u8) {
+    /// Apply a write to the control port, made `delta` clocks past this chip's
+    /// own tick.
+    ///
+    /// Only the two commands that *sample* the chip — the counter-latch and
+    /// the read-back — look at `delta`: they freeze what the counter shows at
+    /// the instant they are written, which is the writer's. A control word that
+    /// programs a counter changes when the chip next does something, so it
+    /// lands at the chip's own tick, as every write always has.
+    fn control(&mut self, word: u8, delta: u64) {
         let select = (word >> 6) as usize;
         if select == COUNTERS {
-            self.read_back(word);
+            self.read_back(word, delta);
             return;
         }
         let counter = &mut self.counters[select];
         if (word >> 4) & 3 == 0 {
-            counter.latch_count();
+            let live = counter.at(delta);
+            counter.latch_count(&live);
         } else {
             counter.program(word);
         }
@@ -715,18 +750,19 @@ impl State {
     /// Bits 1-3 select counters 0-2. Bit 5 clear latches their counts and bit 4
     /// clear latches their status bytes — both are active low, which catches
     /// every reader out once.
-    fn read_back(&mut self, word: u8) {
+    fn read_back(&mut self, word: u8, delta: u64) {
         let want_count = word & 0x20 == 0;
         let want_status = word & 0x10 == 0;
         for (i, counter) in self.counters.iter_mut().enumerate() {
             if word & (2 << i) == 0 {
                 continue;
             }
+            let live = counter.at(delta);
             if want_status {
-                counter.latch_status();
+                counter.latch_status(&live);
             }
             if want_count {
-                counter.latch_count();
+                counter.latch_count(&live);
             }
         }
     }
@@ -833,6 +869,25 @@ impl Registers {
         let _ = handle.sync(kind);
     }
 
+    /// Where the processor making this access stands in this chip's domain,
+    /// or zero where there is no such answer — a debug access, or no handle.
+    ///
+    /// A counter read, and the latch and read-back commands that freeze one,
+    /// are answered at `max(own tick, this)` ([`Counter::at`]). On a board
+    /// whose processors share a crystal neither is given a live view, so
+    /// catch-up stops where the round began, and a guest latching counter 0 in
+    /// a loop read the same count twice and then a jump of up to 1 193 — the
+    /// millisecond a round lasts, at 105/88 MHz. A read at the reader's own
+    /// position moves nothing: no count, no output, no IRQ 0. Taken before the
+    /// state lock, and holding none, because it takes leaf locks of its own.
+    fn reader_tick(&self, attrs: MemAttrs) -> u64 {
+        if attrs.debug {
+            return 0;
+        }
+        let handle = self.lazy.lock().clone();
+        handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
+    }
+
     /// Drive one counter's gate, catching the chip up first so the edge lands
     /// on the tick it happened on.
     fn set_gate(&self, counter: usize, level: bool) {
@@ -860,9 +915,13 @@ impl MemOps for Registers {
             *byte = OPEN_BUS;
             return Ok(());
         }
+        let reader = self.reader_tick(attrs);
         // A read latches at most; no output can move, so nothing is driven.
         let mut state = self.state.lock();
-        *byte = state.counters[index].read(attrs.debug);
+        let delta = reader.saturating_sub(state.tick);
+        let counter = &mut state.counters[index];
+        let live = counter.at(delta);
+        *byte = counter.read(attrs.debug, &live);
         Ok(())
     }
 
@@ -878,10 +937,18 @@ impl MemOps for Registers {
         }
         self.sync(attrs);
         let index = (offset & 3) as usize;
+        // Only the control port has commands that sample the chip; the
+        // lookup costs a lock, so a data write does not pay it.
+        let reader = if index == COUNTERS {
+            self.reader_tick(attrs)
+        } else {
+            0
+        };
         let levels = {
             let mut state = self.state.lock();
             if index == COUNTERS {
-                state.control(*value);
+                let delta = reader.saturating_sub(state.tick);
+                state.control(*value, delta);
             } else {
                 state.counters[index].write(*value);
             }
@@ -1135,7 +1202,11 @@ impl Device for Pit8254 {
         }
     }
 
+    /// Also asks for this chip's domain in every processor's read view: a
+    /// counter's value is a pure function of the clock between two writes —
+    /// see `Registers::reader_tick`.
     fn attach_lazy(&self, handle: LazyHandle) {
+        handle.read_at_readers();
         *self.regs.lazy.lock() = Some(handle);
     }
 
@@ -1355,6 +1426,57 @@ mod tests {
             out.push(pit.out(counter));
         }
         out
+    }
+
+    /// The chip caught up to `target` exactly as [`Registers::advance_to`]
+    /// does it — one event at a time, the soonest of the three — minus the
+    /// pins.
+    fn caught_up(state: &State, target: u64) -> State {
+        let mut s = state.clone();
+        while s.tick < target {
+            let span = target - s.tick;
+            s.step(s.next_event().unwrap_or(span).clamp(1, span));
+        }
+        s
+    }
+
+    /// A counter read at a processor's own position ([`Counter::at`]) is the
+    /// counter catch-up would leave there, field for field — output, null
+    /// count and all — in every mode, across reloads and terminal counts.
+    ///
+    /// It steps by *this* counter's own events where catch-up steps by the
+    /// soonest of all three, so the two only agree because a counter's
+    /// behaviour between two of its events composes; this is what says so.
+    #[test]
+    fn a_counter_read_ahead_is_the_counter_catch_up_would_leave_there() {
+        for mode in 0..=5u8 {
+            for (reload, bcd) in [
+                (2u16, false),
+                (3, false),
+                (5, false),
+                (7, false),
+                (0x10, true),
+            ] {
+                let pit = Pit8254::default_device();
+                poke(&pit, 3, control(0, 3, mode, bcd));
+                poke(&pit, 0, reload as u8);
+                poke(&pit, 0, (reload >> 8) as u8);
+                // Counter 1 on a different period, so that catch-up's steps
+                // are cut by events this counter does not have.
+                poke(&pit, 3, control(1, 3, 2, false));
+                poke(&pit, 1, 3);
+                poke(&pit, 1, 0);
+                let state = pit.regs.state.lock().clone();
+                for delta in 0..64 {
+                    let ahead = state.counters[0].at(delta);
+                    let there = caught_up(&state, state.tick + delta);
+                    assert_eq!(
+                        ahead, there.counters[0],
+                        "mode {mode}, reload {reload:#x}, {delta} ticks ahead"
+                    );
+                }
+            }
+        }
     }
 
     /// Wire `gate2` up so a test can drive it as the board would.

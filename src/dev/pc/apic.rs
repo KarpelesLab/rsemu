@@ -887,18 +887,6 @@ impl State {
         if field == 0b111 { 1 } else { 2 << field }
     }
 
-    /// The current count register, which counts in timer units rather than in
-    /// bus ticks.
-    ///
-    /// Rounded up, because a count is only spent once the divisor's last bus
-    /// tick has gone by: with a divisor of 16 and one bus tick elapsed, the
-    /// counter has not decremented yet and the guest must still read the count
-    /// it wrote.
-    fn timer_current(&self) -> u32 {
-        let divisor = self.timer_divisor();
-        u32::try_from(self.timer_remaining.div_ceil(divisor)).unwrap_or(u32::MAX)
-    }
-
     /// Whether the timer entry selects periodic mode.
     fn timer_periodic(&self) -> bool {
         self.lvt[LVT_TIMER] & LVT_TIMER_MODE == TIMER_PERIODIC
@@ -928,21 +916,54 @@ impl State {
     /// also what keeps a guest that ignores a fast periodic timer from costing
     /// one iteration per period here.
     fn timer_step(&mut self, span: u64) -> bool {
+        let (remaining, expired) = self.timer_after(span);
+        self.timer_remaining = remaining;
+        expired
+    }
+
+    /// What [`State::timer_step`] would leave in `timer_remaining` after `span`
+    /// bus ticks, and whether it would expire on the way — **without moving
+    /// anything**. One piece of arithmetic for both the step and a read of the
+    /// current count at a processor's own position
+    /// ([`State::timer_current_after`]), so the two cannot disagree.
+    fn timer_after(&self, span: u64) -> (u64, bool) {
         if self.timer_remaining == 0 || !self.timer_mode_runs() {
-            return false;
+            return (self.timer_remaining, false);
         }
         if span < self.timer_remaining {
-            self.timer_remaining -= span;
-            return false;
+            return (self.timer_remaining - span, false);
         }
         let rest = span - self.timer_remaining;
         let period = u64::from(self.timer_initial) * self.timer_divisor();
-        self.timer_remaining = if self.timer_periodic() && period > 0 {
+        let remaining = if self.timer_periodic() && period > 0 {
             period - (rest % period)
         } else {
             0
         };
-        true
+        (remaining, true)
+    }
+
+    /// The current count register as it reads `elapsed` bus ticks past this
+    /// APIC's own tick, without moving the timer. It counts in timer units
+    /// rather than in bus ticks.
+    ///
+    /// Rounded up, because a count is only spent once the divisor's last bus
+    /// tick has gone by: with a divisor of 16 and one bus tick elapsed, the
+    /// counter has not decremented yet and the guest must still read the count
+    /// it wrote.
+    ///
+    /// The register is a pure function of time between two writes — the
+    /// initial count and the divide configuration are the only inputs, and
+    /// "the current-count register ... is decremented" at the divided rate
+    /// (SDM Vol 3A §10.5.4) — so a processor reading it at its own position
+    /// reads what the timer would hold there. The expiry itself is not read
+    /// past: the scheduler caps a read view where the round closes, and a
+    /// round closes no later than this APIC's next event, which is the expiry
+    /// — so the crossing arm of [`State::timer_after`] is reached here only on
+    /// the tick the expiry is delivered on.
+    fn timer_current_after(&self, elapsed: u64) -> u32 {
+        let (remaining, _) = self.timer_after(elapsed);
+        u32::try_from(remaining.div_ceil(self.timer_divisor())).unwrap_or(u32::MAX)
     }
 
     /// Record an error for the next write to the error status register, and
@@ -1119,6 +1140,30 @@ impl Registers {
         let _ = handle.sync(kind);
     }
 
+    /// Where the processor making this access stands in this APIC's domain,
+    /// or zero where there is no such answer — a debug access, or no handle.
+    ///
+    /// The current-count register is read at `max(own tick, this)`. On a
+    /// board whose processors share a crystal neither is given a live view,
+    /// so catch-up stops where the round began and a guest polling its own
+    /// timer read the same count for a whole round and then a jump of up to
+    /// 100 000 — the millisecond a round lasts, on a 100 MHz bus clock. The
+    /// requester is the processor this APIC belongs to, because the shared
+    /// window picks the register page by it (`ApicWindow::target`), so the
+    /// position is that processor's own.
+    ///
+    /// A read moves nothing: no tick, no expiry, no request. The initial-count
+    /// write that starts the timer lands at this APIC's own tick, as every
+    /// write always has. Taken before the state lock, and holding none,
+    /// because it takes leaf locks of its own.
+    fn reader_tick(&self, attrs: MemAttrs) -> u64 {
+        if attrs.debug {
+            return 0;
+        }
+        let handle = self.lazy.lock().clone();
+        handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
+    }
+
     /// Advance to `target` of this APIC's own clock domain.
     fn advance_to(&self, target: u64) {
         let pending = {
@@ -1143,7 +1188,7 @@ impl Registers {
     }
 
     /// Read one register. `debug` suppresses every side effect.
-    fn read_register(&self, offset: u64, debug: bool) -> u32 {
+    fn read_register(&self, offset: u64, debug: bool, reader: u64) -> u32 {
         let mut state = self.state.lock();
         match offset {
             REG_ID => u32::from(state.id) << 24,
@@ -1166,7 +1211,7 @@ impl Registers {
             REG_ICR_LOW => state.icr_low,
             REG_ICR_HIGH => state.icr_high,
             REG_TIMER_INIT => state.timer_initial,
-            REG_TIMER_CUR => state.timer_current(),
+            REG_TIMER_CUR => state.timer_current_after(reader.saturating_sub(state.tick)),
             REG_TIMER_DIV => state.timer_divide,
             _ if (REG_ISR..REG_ISR + 8 * REG_STRIDE).contains(&offset) => {
                 state.isr[((offset - REG_ISR) / REG_STRIDE) as usize]
@@ -1514,7 +1559,14 @@ impl MemOps for Registers {
             // unclaimed cycle.
             return Err(BusError::BadAccess);
         }
-        let value = self.read_register(offset, attrs.debug);
+        // Only the current count is read at the reader's position; nothing
+        // else in the page is a function of time, and the lookup costs a lock.
+        let reader = if offset == REG_TIMER_CUR {
+            self.reader_tick(attrs)
+        } else {
+            0
+        };
+        let value = self.read_register(offset, attrs.debug, reader);
         let bytes = value.to_le_bytes();
         *a = bytes[0];
         *b = bytes[1];
@@ -2071,7 +2123,11 @@ impl Device for LocalApic {
         }
     }
 
+    /// Also asks for this APIC's domain in every processor's read view: the
+    /// timer's current count is a pure function of time between writes — see
+    /// `Registers::reader_tick`.
     fn attach_lazy(&self, handle: LazyHandle) {
+        handle.read_at_readers();
         *self.regs.lazy.lock() = Some(handle);
     }
 

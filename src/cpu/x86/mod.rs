@@ -339,7 +339,7 @@ use crate::core::device::{
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed};
+use crate::core::sched::{Budget, Consumed, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
@@ -349,7 +349,7 @@ use crate::core::wire::{
     WireId, WireSink,
 };
 
-use exec::{Exec, State};
+use exec::{Exec, Position, State};
 
 /// The flags register.
 ///
@@ -2165,6 +2165,20 @@ struct Session {
     state: State,
     memory: Option<Arc<AddressSpace>>,
     io: Option<Arc<AddressSpace>>,
+    /// Where this core publishes how far into its round it has got, so that a
+    /// lazily advanced device reached from an access sees the cycle the access
+    /// happens on rather than the cycle the round began at — and the number it
+    /// publishes from, which is the scheduler's rather than the TSC
+    /// (`exec::Position` says why).
+    ///
+    /// Wiring rather than architectural state: not in the snapshot, because
+    /// its origin is re-read from the scheduler at the top of every `run`
+    /// call. Held *inside* the session rather than beside it so that reaching
+    /// it costs no second lock on the step path — every route that builds an
+    /// [`Exec`] already holds this one — and a field of its own because a reset
+    /// replaces `state` and must not unplug the scheduler. See
+    /// [`X86::attach_cursor`].
+    position: Option<Position>,
     /// The translation state, built on the first block and thrown away by a
     /// reset or a restore. **Derived state in the strict sense**
     /// (`ROADMAP.md` section 4.5): it is not in the snapshot, which is what
@@ -2246,6 +2260,7 @@ impl X86 {
                     state: State::new(cfg.variant),
                     memory: None,
                     io: None,
+                    position: None,
                     #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
                     jit: None,
                 },
@@ -2860,6 +2875,7 @@ impl X86 {
             state,
             memory,
             io,
+            position,
             #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
             jit,
             ..
@@ -2873,21 +2889,28 @@ impl X86 {
         };
         let io = io.clone();
         #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
-        {
+        let used = {
             // One instruction, interpreted, and whatever it wrote handed to
             // the block cache. A core whose blocks were invalidated only by
             // `advance` would serve a stale one to anything that mixes this
             // entry point with the run loop -- a monitor stepping, a test
             // driving the core by hand.
-            let mut exec = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines);
+            let mut exec = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines)
+                .with_position(position.as_ref());
             let used = exec.step();
             if let Some(jit) = jit.as_mut() {
                 jit.note_writes(&mut exec);
             }
             used
-        }
+        };
         #[cfg(not(all(feature = "cpu-x86-lift", feature = "jit")))]
-        Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines).step()
+        let used = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines)
+            .with_position(position.as_ref())
+            .step();
+        if let Some(position) = position {
+            position.origin = position.origin.wrapping_add(used);
+        }
+        used
     }
 
     /// Advance the core by one *unit of the configured engine*: one
@@ -2928,6 +2951,7 @@ impl X86 {
                 state,
                 memory,
                 io,
+                position,
                 jit,
             } = &mut *session;
             let Some(memory) = memory.clone() else {
@@ -2935,15 +2959,20 @@ impl X86 {
             };
             let io = io.clone();
             let jit = jit.as_mut().expect("just installed");
-            return engine::advance(
+            let used = engine::advance(
                 jit,
                 state,
                 &memory,
                 io.as_deref(),
                 &cfg,
                 &self.lines,
+                position.as_ref(),
                 remaining,
             );
+            if let Some(position) = position {
+                position.origin = position.origin.wrapping_add(used);
+            }
+            return used;
         }
         self.step()
     }
@@ -2979,7 +3008,21 @@ impl X86 {
     /// A halted core, one that has shut down on a triple fault, or one with no
     /// address space consumes only the debt it owed plus whatever it managed.
     pub fn run_budget(&self, ticks: u64) -> u64 {
-        let owed = self.session.lock().state.debt;
+        let owed = {
+            let mut session = self.session.lock();
+            let owed = session.state.debt;
+            // Re-anchor the published position on the scheduler's count for
+            // this core's domain, plus the cycles this core has already
+            // executed beyond it. Every call, so neither a `HLT` that consumed
+            // a budget charging nothing nor a guest's `WRMSR` to the TSC can
+            // leave it anywhere but where the scheduler measures from
+            // (`exec::Position`). The same lock the debt is read under: this is
+            // once per round, not once per instruction.
+            if let Some(position) = session.position.as_mut() {
+                position.origin = position.cursor.anchor().wrapping_add(owed);
+            }
+            owed
+        };
         if owed >= ticks {
             // The last instruction was longer than this whole budget: charge
             // the budget against the debt and execute nothing.
@@ -3008,6 +3051,29 @@ impl X86 {
     #[must_use]
     pub fn cycle_debt(&self) -> u64 {
         self.session.lock().state.debt
+    }
+
+    /// Publish this core's position into `cursor` as it runs.
+    ///
+    /// A runnable reports what it consumed only when its `run` call returns,
+    /// so without this the clock forest stands where the round began for the
+    /// whole of it — and every lazily advanced device on the board, the 8254,
+    /// the HPET, the ACPI power-management timer and the local APIC's timer
+    /// among them, is caught up to the round boundary and no further. A guest
+    /// latching the 8254 twice a few dozen cycles apart read the same count,
+    /// and then a jump of a whole millisecond. With a cursor, every access
+    /// that reaches a device first says which cycle it is on
+    /// (`Exec::publish_position`), and the device is read or caught up there.
+    ///
+    /// Called once, by the machine layer, for every runnable device. The
+    /// exit flag the cursor also carries is not consulted: a stop reaches
+    /// this core at the end of its budget, which is legitimate
+    /// ([`SafePoint`](crate::core::sched::SafePoint)) and unchanged.
+    pub fn attach_cursor(&self, cursor: &TickCursor) {
+        self.session.lock().position = Some(Position {
+            cursor: cursor.clone(),
+            origin: cursor.anchor(),
+        });
     }
 
     /// Where a **linear** address lives, as a debugger asks it.
@@ -3373,6 +3439,10 @@ impl Device for X86 {
 
     fn run(&self, budget: Budget) -> Consumed {
         Consumed::new(self.run_budget(budget.ticks))
+    }
+
+    fn attach_cursor(&self, cursor: TickCursor) {
+        X86::attach_cursor(self, &cursor);
     }
 
     fn reset(&self, kind: ResetKind) {

@@ -275,6 +275,18 @@ impl State {
         self.conf & CONF_ENABLE != 0
     }
 
+    /// The main counter as it reads at `reader` of this part's own domain,
+    /// **without moving anything**: the counter free-runs at one count per
+    /// tick while `ENABLE_CNF` is set and stands still while it is clear
+    /// (§2.3.5, §2.3.7), so the value is a pure function of where the reader
+    /// stands. A reader behind this part's own tick sees the counter here.
+    fn counter_at(&self, reader: u64) -> u64 {
+        if !self.running() {
+            return self.counter;
+        }
+        self.counter.wrapping_add(reader.saturating_sub(self.tick))
+    }
+
     /// Ticks until the soonest comparator match, if the counter is running.
     fn next_event(&self) -> Option<u64> {
         if !self.running() {
@@ -494,6 +506,40 @@ impl Registers {
         }
     }
 
+    /// Where the processor making this access stands in this part's domain,
+    /// or zero where there is no such answer — a debug access, or no handle.
+    ///
+    /// The main counter is read at `max(own tick, this)`. On a board whose
+    /// processors share a crystal neither is given a live view, so catch-up
+    /// stops where the round began and a guest polling the counter read the
+    /// same value for a whole round and then a jump of up to 10 000 counts —
+    /// the millisecond a round lasts, at 10 MHz. A read at the reader's own
+    /// position moves nothing: no tick, no comparator, no line.
+    ///
+    /// **A comparator is never read past before it fires.** The scheduler's
+    /// read view is capped where the round closes (`TickCursor::tick_in`),
+    /// and a round closes no later than this part's next event
+    /// (`Scheduler::natural_target`), which is its soonest enabled comparator.
+    /// So the furthest a guest can read is the tick that comparator fires on,
+    /// and it fires there, at the part's own event, as it always has.
+    ///
+    /// Writes are not moved. A write of the counter lands at this part's own
+    /// tick, where every write landed before reads could be answered anywhere
+    /// else — moving a *running* counter's origin to the writer's position
+    /// would sweep it through values it never held and could fire a
+    /// comparator on the way. A halted counter — the state one is ordinarily
+    /// written in — reads the same at every position, so the two agree there.
+    ///
+    /// Taken before the state lock, and holding none, because it takes leaf
+    /// locks of its own.
+    fn reader_tick(&self, attrs: MemAttrs) -> u64 {
+        if attrs.debug {
+            return 0;
+        }
+        let handle = self.lazy.lock().clone();
+        handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
+    }
+
     /// Catch the part up before an access is dispatched to it (§4.2).
     fn sync(&self, attrs: MemAttrs) {
         let handle = self.lazy.lock().clone();
@@ -549,12 +595,23 @@ impl MemOps for Registers {
         if !attrs.debug {
             self.sync(attrs);
         }
-        let state = self.state.lock();
         // A 32-bit access reaches one half of a 64-bit register, which is how
         // every 32-bit driver reads the main counter (§2.4.7 recommends exactly
         // that sequence).
         let aligned = offset & !7;
-        let value = self.read_register(&state, aligned);
+        // Only the main counter is read at the reader's position; nothing else
+        // here is a function of time, and the lookup costs a lock.
+        let reader = if aligned == REG_COUNTER {
+            self.reader_tick(attrs)
+        } else {
+            0
+        };
+        let state = self.state.lock();
+        let value = if aligned == REG_COUNTER {
+            state.counter_at(reader)
+        } else {
+            self.read_register(&state, aligned)
+        };
         match dst.len() {
             4 => {
                 let half = if offset & 4 == 0 {
@@ -884,7 +941,10 @@ impl Device for Hpet {
         }
     }
 
+    /// Also asks for this part's domain in every processor's read view: the
+    /// main counter is a pure function of time — see `Registers::reader_tick`.
     fn attach_lazy(&self, handle: LazyHandle) {
+        handle.read_at_readers();
         *self.regs.lazy.lock() = Some(handle);
     }
 
@@ -1202,6 +1262,39 @@ mod tests {
         b.poke(REG_STATUS, 1);
         assert!(!b.probes[0].high());
         assert_eq!(b.peek(REG_STATUS), 0);
+    }
+
+    #[test]
+    fn a_counter_read_ahead_is_the_counter_a_step_would_leave_there() {
+        // `counter_at` is what a processor standing ahead of this part's own
+        // tick reads; it must be exactly what stepping there would leave,
+        // comparators or not, and nothing at all while the counter is halted.
+        let mut state = State {
+            counter: 0xffff_fff0,
+            tick: 7,
+            ..State::default()
+        };
+        state.timers[0].conf = TIMER_ENABLE | TIMER_32BIT;
+        state.timers[0].comp = 5;
+        for delta in [0u64, 1, 15, 16, 21, 1_000] {
+            assert_eq!(
+                state.counter_at(state.tick + delta),
+                state.counter,
+                "halted"
+            );
+        }
+        state.conf = CONF_ENABLE;
+        for delta in [0u64, 1, 15, 16, 21, 1_000] {
+            let mut stepped = state.clone();
+            stepped.step(delta);
+            assert_eq!(
+                state.counter_at(state.tick + delta),
+                stepped.counter,
+                "{delta} ticks ahead"
+            );
+        }
+        // A reader behind the part reads the part.
+        assert_eq!(state.counter_at(0), state.counter);
     }
 
     #[test]

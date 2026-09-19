@@ -314,6 +314,23 @@ the kernel's own NVMe driver binding to a controller it found by class code,
 taking its **level-triggered interrupt through the I/O APIC**, and building the
 queue it reads a disk with.
 
+Two clocks agreeing is not the same as two clocks being right, and for a while
+they agreed on the wrong number. Until `cpu.x86` published its position inside
+a scheduler round, the 8254, the HPET, the PM timer and the local APIC's count
+were all caught up at round boundaries only, so the kernel calibrated a
+100 MHz TSC against two staircases and got `tsc: Detected 99.641 MHz`; a few
+seconds later its clocksource watchdog saw the TSC skew against the HPET —
+−691 803 ns over 480 ms — marked it unstable and switched the whole system to
+the HPET.
+
+Driven the same way afterwards (the host's Gentoo `6.6.67` kernel,
+`rsemu run q35-linux … --for 150s`, one call) it reads `tsc: Detected
+100.004 MHz`, refines to `99.999 MHz`, and keeps the TSC. The figure is worth
+qualifying by its driving pattern: a run sliced into one-millisecond calls used
+to answer differently again, because a declined round aged this board's passive
+crystals through fragments the processor never executed.
+`docs/techniques/execution-budgets.md` has both defects and the whole matrix.
+
 **The two lines that matter most are the ones that are not there.** After
 `..TIMER: vector=0x30 apic1=0 pin1=2` there is no `..MP-BIOS bug: 8254 timer
 not connected to IO-APIC` and no `Kernel panic - not syncing: IO-APIC + timer

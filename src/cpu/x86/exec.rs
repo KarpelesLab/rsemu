@@ -93,6 +93,7 @@
 
 use alloc::vec::Vec;
 
+use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
@@ -438,6 +439,50 @@ pub(super) struct Exec<'a> {
     /// longer the whole truth and a translation cache must throw everything
     /// away rather than trust it.
     pub(super) wrote_over: bool,
+    /// Where the scheduler learns how far into its round this core has got,
+    /// or `None` on a core nothing scheduled. See [`Position`].
+    ///
+    /// Published from [`Exec::publish_position`], which the four bus entry
+    /// points call and nothing else does — see that method for why that is the
+    /// only place it may be published from if the three engines are to stay
+    /// indistinguishable.
+    ///
+    /// `Option<&_>` rather than an owned clone, and one borrow for the cursor
+    /// and the number published from: an [`Exec`] is built **per guest
+    /// instruction** under the interpreter, so every field it carries is copied
+    /// on every one of them, and a niche-optimised reference is one word.
+    pub(super) position: Option<&'a Position>,
+}
+
+/// Where this core publishes its position (`core::sched::TickCursor`), and
+/// the number it publishes from.
+///
+/// # Why not `State::cycles`
+///
+/// `State::cycles` is the time-stamp counter, and three things move it that
+/// the scheduler's accounting never sees: a guest's `WRMSR` to `IA32_TSC`
+/// (*Intel SDM* volume 3 §17.17.3), [`X86::set_cycles`](super::X86::set_cycles)
+/// handing a count over from another engine, and a `HLT` that consumes a whole
+/// budget while charging nothing. The scheduler measures a published position
+/// against where the forest stands in this core's domain
+/// ([`TickCursor::anchor`]), and a live position is not capped at the round, so
+/// publishing the TSC would let one guest `WRMSR` carry every lazily advanced
+/// device on the board arbitrarily far into the future, and one `HLT` would
+/// leave the core publishing behind its own domain for the rest of the run.
+///
+/// So the number published is the scheduler's own: `origin`, set at the top of
+/// every `run` call to the anchor plus the cycle debt this core carries into it
+/// ([`X86::run_budget`](super::X86::run_budget)), advanced by what each step
+/// reports, plus what the step in progress has charged ([`Exec::used`]).
+/// Nothing a guest executes can reach it.
+#[derive(Debug)]
+pub(super) struct Position {
+    /// The cursor the machine layer handed this core.
+    pub(super) cursor: TickCursor,
+    /// What is published when the step now executing has charged nothing:
+    /// the forest's count for this core's domain when the `run` call began,
+    /// plus the debt carried into it, plus every step's clocks since.
+    pub(super) origin: u64,
 }
 
 /// How many distinct written pages one borrow remembers before it gives up and
@@ -478,6 +523,71 @@ impl<'a> Exec<'a> {
             wrote: [0; WROTE_PAGES],
             wrote_n: 0,
             wrote_over: false,
+            position: None,
+        }
+    }
+
+    /// Lend this borrow the cursor the scheduler wired into this core, so that
+    /// a lazily advanced device reached from an access sees the cycle the
+    /// access happens on rather than the cycle the round began at
+    /// (`ROADMAP.md` §4.2, `core::sched::TickCursor`).
+    ///
+    /// A builder rather than a sixth constructor argument: it is wiring the
+    /// session owns and the interpreter merely borrows, and the helpers that
+    /// build an `Exec` to ask it one question — a disassembly, a debugger's
+    /// translation — have none.
+    pub(super) fn with_position(mut self, position: Option<&'a Position>) -> Exec<'a> {
+        self.position = position;
+        self
+    }
+
+    /// Tell the cursor where this core has got to, immediately before an
+    /// access leaves for the address space or the I/O space.
+    ///
+    /// # Why here, and not in `Exec::charge`
+    ///
+    /// The three engines must be indistinguishable to the guest, cycle counts
+    /// included (`ROADMAP.md` §0), so a *published position a device can read*
+    /// has to be published at points every engine reaches. The interpreter
+    /// steps an instruction at a time and a translated block runs a chain of
+    /// them, so publishing per step or per block would hand a mid-block `IN`
+    /// from the 8254 a different answer under `interp` than under `jit` — a
+    /// divergence in guest-visible state, not a resolution nit.
+    ///
+    /// This point is engine-independent by construction: every access that
+    /// reaches a *device* goes through [`Exec::phys_read`],
+    /// [`Exec::phys_write`], [`Exec::io_read`] or [`Exec::io_write`] under
+    /// every engine, because the compiled fast path covers plain RAM and
+    /// nothing else (`engine::FastMem`, whose `note_fast_load` says why it
+    /// needs no interrupt-pin check either).
+    ///
+    /// The value published is [`Position::origin`] plus [`Exec::used`]: the
+    /// clocks charged since the `run` call began, on the scheduler's origin.
+    /// Both engines charge the same clocks at the same accesses —
+    /// `cpu::x86::differential` asserts `State::cycles` identical at every
+    /// instruction boundary — and an interpreted step and a translated chain
+    /// both return exactly what they charged, so the value a device reads at
+    /// a given access is identical under every engine too.
+    ///
+    /// The inlined RAM accesses that skip this publish nothing, which costs
+    /// nothing: no lazily advanced device sits behind them. Nor does an
+    /// instruction fetch, for the same reason and one more
+    /// ([`Exec::fetch_read`]).
+    ///
+    /// What *does* differ between engines is where the cursor's own deadline
+    /// is noticed — [`TickCursor::set`] catches every watched device up when
+    /// the published position crosses the next event any of them has, and the
+    /// interpreter publishes at RAM accesses a translated block serves inline.
+    /// That cannot move an interrupt: the scheduler ends a round no later than
+    /// that event (`Scheduler::natural_target`), so the deadline lies at or past
+    /// the end of this core's budget and only the instruction that overruns it
+    /// can cross it, after which the core returns either way and takes the
+    /// interrupt at the same boundary. `tests/x86_engines.rs` holds the
+    /// engines' state hashes to each other on the shipped boards.
+    #[inline]
+    pub(super) fn publish_position(&self) {
+        if let Some(position) = self.position {
+            position.cursor.set(position.origin.wrapping_add(self.used));
         }
     }
 
@@ -751,6 +861,29 @@ impl<'a> Exec<'a> {
     /// the trace exactly as the corpus records it.
     pub(super) fn phys_read(&mut self, addr: u64, size: u8) -> u64 {
         self.charge(self.variant().bus_clocks());
+        self.publish_position();
+        self.bus_read(addr, size)
+    }
+
+    /// One byte of the instruction stream off the bus: charged exactly as
+    /// [`Exec::phys_read`] charges, and **not** published.
+    ///
+    /// No lazily advanced device answers a fetch — nothing executes out of a
+    /// timer's register page — so a position published here is one no device
+    /// ever reads. And a translated block does not fetch through here at all,
+    /// so publishing on a fetch would publish on the interpreter alone: pure
+    /// cost, and a difference between the engines besides. Measured on
+    /// `publishing_cost_workload` in `tests/x86_counter_resolution.rs`,
+    /// publishing on every fetch cost 6.4% of the interpreter's execution.
+    #[inline]
+    fn fetch_read(&mut self, addr: u64, size: u8) -> u64 {
+        self.charge(self.variant().bus_clocks());
+        self.bus_read(addr, size)
+    }
+
+    /// The transfer both kinds of read share, already charged for.
+    #[inline]
+    fn bus_read(&mut self, addr: u64, size: u8) -> u64 {
         let width = Self::width_of(size);
         let addr = self.masked(addr);
         match self.mem.read(addr, width, self.attrs) {
@@ -775,6 +908,7 @@ impl<'a> Exec<'a> {
     /// One physical bus write of one, two, four or eight bytes.
     pub(super) fn phys_write(&mut self, addr: u64, size: u8, value: u64) {
         self.charge(self.variant().bus_clocks());
+        self.publish_position();
         self.state.open_bus = (value >> ((size as u32 - 1) * 8)) as u8;
         let width = Self::width_of(size);
         let addr = self.masked(addr);
@@ -1015,6 +1149,7 @@ impl<'a> Exec<'a> {
     /// reads as ones — the same answer the corpus expects from a bare 8088.
     pub(super) fn io_read(&mut self, port: u16, size: u8) -> u32 {
         self.charge(self.variant().bus_clocks());
+        self.publish_position();
         let Some(io) = self.io else {
             return match size {
                 1 => 0xff,
@@ -1043,6 +1178,7 @@ impl<'a> Exec<'a> {
 
     pub(super) fn io_write(&mut self, port: u16, size: u8, value: u32) {
         self.charge(self.variant().bus_clocks());
+        self.publish_position();
         let Some(io) = self.io else {
             return;
         };
@@ -1130,7 +1266,7 @@ impl<'a> Exec<'a> {
     fn fetch_at(&mut self, offset: u64) -> Ex<u8> {
         if self.legacy() {
             let segment = self.state.regs.cs;
-            return Ok(self.phys_read(linear(segment, offset as u16), 1) as u8);
+            return Ok(self.fetch_read(linear(segment, offset as u16), 1) as u8);
         }
         let cs = self.state.sys.seg(seg::CS);
         let lin = if self.sixty_four() {
@@ -1148,12 +1284,12 @@ impl<'a> Exec<'a> {
         };
         let user = self.cpl() == 3;
         if !self.state.sys.paging() {
-            return Ok(self.phys_read(lin, 1) as u8);
+            return Ok(self.fetch_read(lin, 1) as u8);
         }
         // An instruction fetch is where the no-execute bit is consulted, and
         // the only place it is: a data read of the same page is fine.
         let phys = self.translate_access(lin, paging::Access::fetch(user))?;
-        Ok(self.phys_read(phys, 1) as u8)
+        Ok(self.fetch_read(phys, 1) as u8)
     }
 
     /// Top the prefetch queue up, as the bus interface unit does whenever the

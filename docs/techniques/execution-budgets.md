@@ -236,18 +236,127 @@ rule:
 | `riscv-virt`, `riscv-virt-smp` | the `time` CSR and `MTIME`, both the CLINT's `mtime` | now the reader's own position, on both |
 | `arm64-virt`, `arm64-virt-smp` | `CNTPCT_EL0`/`CNTVCT_EL0` | never affected: the generic timer is the core's own cycle counter divided by an integer, per processor, inside the core |
 | `pc-at-smp`, `pc-apic`, `q35-linux-smp` | the TSC | never affected: `State::cycles`, per processor |
-| the same three, and every other x86 board | the HPET, the ACPI PM timer, the 8254 and the local APIC's current count | still the position the round began at |
+| every x86 board | the HPET, the ACPI PM timer, the 8254 and the local APIC's current count | now the reader's own position, on one processor and on two |
 
-The last row is a *different* defect with a different cause, and it is worth
-separating: `cpu.x86` publishes no `TickCursor` position at all, so those
-devices are caught up to a round boundary on a one-processor `pc-at` exactly as
-they are on `pc-at-smp`. Measured with a guest that latches the 8254 in a loop:
-the same pair of identical counts and then a jump of 1 193 — one millisecond —
-on `pc-at`, `pc-at-smp` and `pc-apic` alike. Fixing it means the x86 core
-publishing its position where every engine reaches the same instruction, as
-`cpu.riscv`'s `Exec::publish_position` does, which moves what every x86 board's
-devices see inside a round and therefore every x86 golden. It is not the
-shared-crystal rule, and it wants a change of its own.
+The last row was a *different* defect with a different cause, and it is worth
+keeping separate: `cpu.x86` published no `TickCursor` position at all, so those
+devices were caught up to a round boundary on a one-processor board exactly as
+on a two-processor one. A guest latching the 8254 in a loop read the same pair
+of counts and then a jump of up to 1 193 — one millisecond — on `q35` and
+`pc-apic` alike, and the HPET, the PM timer and the APIC's current count stood
+still for a round and jumped the same way
+(`tests/x86_counter_resolution.rs`). It took two pieces, one per cause:
+
+* **The core publishes its position** (`cpu::x86::Exec::publish_position`),
+  at the four bus entry points every engine reaches, so a device reached from
+  an access is caught up to the cycle the access is on. That is what fixes a
+  one-processor board, through ordinary catch-up.
+* **The four devices answer a read at the reader's position**, through the read
+  view, because on a crystal two processors share catch-up stops at the round
+  boundary by design — the same rule that made `riscv-virt-smp`'s CLINT need
+  one.
+
+The number the core publishes is **not** its cycle counter, and that is the
+part most likely to be got wrong next time. x86's only cycle counter is the
+TSC, which a guest overwrites with `WRMSR`, a hypervisor hand-over replaces,
+and a `HLT` stops while the forest goes on counting the budget it consumed. A
+live position is not capped at the round, so publishing the TSC would let one
+`WRMSR` carry every device on the board arbitrarily far into the future. The
+scheduler therefore records where each runnable's domain stands before every
+`run` call (`TickCursor::anchor`), and the core publishes that plus the debt it
+carries plus what it has charged since — the scheduler's own accounting,
+re-anchored every call, which no guest instruction can reach
+(`cpu::x86::exec::Position`).
+
+Moving the published position moved something besides reads, and on purpose:
+on a one-processor board **a write** now lands at the writer's cycle too, so a
+timer armed mid-round starts counting where the instruction that armed it ran.
+Before, it started where the round began and fired up to a round early:
+measured from the arming instruction to the handler on `q35`, for a
+half-millisecond alarm (12 500 cycles), APIC 3 615 → 12 646, HPET 3 450 →
+12 646, 8254 3 532 → 12 662. On a crystal two processors share, nothing is
+caught up inside a round and a write still lands at the round's start —
+unchanged, and still up to a round early (`pc-apic`: 3 659, 3 494 and 3 565
+cycles, before and after). Answering the *arming* write at the writer's
+position there is the remaining piece; for the HPET and the 8254 it moves a
+comparator's origin, which a read never does, and it wants a change of its own.
+
+What a Linux guest made of it. **Every figure names its kernel and how the
+machine was driven**, because both change the answer and a figure without them
+is not a figure: `rsemu run … --for 150s` is one `run_for` call, and
+`tests/x86boot` — which is what `cargo test` runs — drives the same board in
+one-millisecond calls. `before` is the base of this work with neither change;
+`after` is both. Each board's core is declared at 100 MHz, so 100.000 is the
+right answer everywhere.
+
+| board | kernel | driven | before | after |
+| --- | --- | --- | --- | --- |
+| `pc64` | Debian installer (`testdata/x86/bzImage`) | `tests/pc64_linux.rs`, 1 ms calls | `tsc: Detected 99.470 MHz`, `lpj=397880` | **`100.002 MHz`**, `lpj=400008` |
+| `pc64` | Gentoo `6.6.67` | `tests/pc64_linux.rs`, 1 ms calls | `97.530 MHz`, `lpj=325100` | **`100.004 MHz`**, `lpj=333346` |
+| `pc64` | Debian installer | `rsemu run`, one call | `96.868 MHz`, `lpj=387472` | **`99.990 MHz`**, `lpj=399960` |
+| `pc64` | Gentoo `6.6.67` | `rsemu run`, one call | `96.780 MHz`, `lpj=322600` | **`100.004 MHz`**, `lpj=333346` |
+| `q35-linux` | Gentoo `6.6.67` | `rsemu run`, one call | `99.641 MHz`, `lpj=332136`, refined to `99.952 MHz`, then *"Marking TSC unstable due to clocksource watchdog"* — skewed −691 803 ns over the HPET's 480 ms — and `Switched to clocksource hpet` | **`100.004 MHz`**, `lpj=333346`, refined to `99.999 MHz`, and the TSC stays the clocksource |
+| `q35-linux-smp` | Gentoo `6.6.67` | `rsemu run`, one call | `97.915 MHz`, `lpj=326383` | **`99.999 MHz`**, `lpj=333330` |
+
+Two things in that table are worth naming rather than leaving to the reader.
+
+**The Gentoo kernel now reads the same under both driving patterns** —
+`100.004 MHz`, `lpj=333346`, to the digit — where before it read `97.530`
+sliced and `96.780` whole. That is the additivity §11.6 claims, arriving at the
+guest: how a caller cut its run had been worth 0.8% of the guest's idea of its
+own clock.
+
+**Each change alone was not enough, and one alone made a configuration worse.**
+Publishing the core's position without *"a declined round ages nobody"* left
+the sliced cells at `90.003` and `111.649` MHz — worse than the base, because
+live reads inside a round expose a passive crystal that had aged through the
+fragments at every call boundary, where the old round-grained reads had
+averaged it away. That is why the two land as separate commits with the
+scheduler one first.
+
+The watchdog line in the `q35-linux` row is the read defect seen from inside: a
+TSC that counts every cycle, checked against an HPET that moved once per round,
+disagrees, and the kernel believes the HPET. `q35-linux-smp` still marks
+`tsc-early` unstable at 7.5 s, before and after alike, skewed by about 100 ms
+in 508 ms — which is not a round's worth of anything, and is the open defect
+below rather than this one.
+
+## Open: a halted processor's time-stamp counter stops
+
+`X86::run_budget` consumes its whole budget when `HLT` has stopped the core —
+it must, or the scheduler never reaches the timer that would wake it — but it
+charges no cycles. `State::cycles` is what `RDTSC` reads, so a guest's TSC
+stands still while the board's clocks go on, and the *Intel SDM* volume 3B
+§17.17.1 says the opposite: an invariant TSC "will run at a constant rate in
+all ACPI P-, C-. and T-states".
+
+Measured on `pc-apic`, a guest halting twenty times and waking on the 8254:
+the HPET moved 199 744 ticks — 499 360 cycles of that board's 25 MHz core —
+while the guest's time-stamp counter moved **2 926**, under one per cent of
+them (`an_idle_processors_time_stamp_counter_stops_which_is_an_open_defect` in
+`tests/x86_counter_resolution.rs`, which asserts today's wrong answer as a
+ledger entry so that fixing it trips the test).
+
+It is plausibly behind the `tsc-early` watchdog skew on `q35-linux-smp` —
+same direction, same order — but that is **unproven**: charging the TSC
+through `HLT` as an experiment left that boot's console byte-identical, so
+whatever the kernel measured there did not include a halt. Neither change in
+this work caused it or cured it.
+
+The cost, measured under callgrind on `publishing_cost_workload` in
+`tests/x86_counter_resolution.rs` — an interpreted load/add/store loop on `q35`
+that reads no clock, so both builds execute the same guest instructions to the
+same state hash, `0xad8ee3eed4080384` — is 294 587 629 → 297 447 645 host
+instructions for the scheduled run, **+0.97%**: +0.72% in the core, publishing
+at the loop's two data accesses and advancing the origin once per step, and
++0.26% in the scheduler, which now builds read views because four devices ask
+for them. Instruction fetches do not publish (`Exec::fetch_read`); the first
+cut did, and cost +6.4%.
+
+*"A declined round ages nobody"* costs nothing measurable on the same
+workload — 294 589 389 host instructions at the base against 294 587 629 with
+it, which is noise — because it removes work rather than adding any: a
+declined round now converts no trees at all.
 
 Three things follow:
 

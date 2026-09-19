@@ -838,8 +838,10 @@ impl Consumed {
 /// rather than up to one block. Honouring it is a latency optimisation with a
 /// correctness consequence only for a machine whose quantum is long.
 ///
-/// The cores that consult it today are the ones the machine layer hands a
-/// [`TickCursor`] to and that keep it: **MOS 6502, SM83 and RISC-V**. A core
+/// The cores that consult it today are **MOS 6502, SM83 and RISC-V**. x86
+/// keeps the [`TickCursor`] the machine layer hands it, to publish its
+/// position, but does not ask it to stop: a stop reaches that core at the end
+/// of its budget, which is legitimate and a latency matter only. A core
 /// opts in by implementing
 /// [`Device::attach_cursor`](crate::core::device::Device::attach_cursor) — the
 /// hook is already called for every runnable device — and asking
@@ -1063,6 +1065,10 @@ struct CursorInner {
     /// none, which is what lets a device answering an access find the view of
     /// the runnable that made it. See [`Scheduler::bind_requester`].
     requester: AtomicU32,
+    /// Where the forest stood in the runnable's own domain when the current
+    /// `run` call began — the origin every view and every live position of
+    /// this call is measured from. See [`TickCursor::anchor`].
+    anchor: AtomicU64,
 }
 
 impl TickCursor {
@@ -1086,6 +1092,7 @@ impl TickCursor {
                 exit,
                 view: Mutex::new(None),
                 requester: AtomicU32::new(0),
+                anchor: AtomicU64::new(0),
             }),
         }
     }
@@ -1205,6 +1212,44 @@ impl TickCursor {
     /// Install or drop the read view for one `run` call.
     fn set_view(&self, view: Option<Arc<ReadView>>) {
         *self.inner.view.lock() = view;
+    }
+
+    /// Where the forest stood in this runnable's own domain when the current
+    /// `run` call began: the tick count every live position and every read
+    /// view of this call is measured from.
+    ///
+    /// # Why a core would need to be told
+    ///
+    /// What [`TickCursor::set`] publishes is compared against this number —
+    /// `published − anchor` is how far into the call the runnable has got, and
+    /// a core carrying cycle debt publishes ahead of it by exactly the debt.
+    /// A core whose own cycle counter *is* the forest's count plus its debt,
+    /// by construction — every bus access charged, nothing else — can publish
+    /// that counter and never look here.
+    ///
+    /// A core whose counter is architectural cannot, and x86 is one: its only
+    /// cycle counter is the time-stamp counter, which a guest overwrites with
+    /// `WRMSR` (*Intel SDM* volume 3 §17.17.3), a hypervisor hand-over
+    /// replaces wholesale, and which stops while `HLT` consumes a budget that
+    /// the forest still counts. Published raw, one `WRMSR` would carry every
+    /// lazily advanced device a guest's worth of arbitrary time into the
+    /// future — a live position is not capped at the round — and one `HLT`
+    /// would leave the core behind its own domain for the rest of the run.
+    /// Such a core reads this at the top of each `run` call, adds the debt it
+    /// carries, and publishes that plus what it has charged since: the
+    /// scheduler's own accounting, re-anchored every call, which no guest
+    /// write can reach.
+    ///
+    /// Zero outside a scheduled `run` call, and before the first.
+    #[must_use]
+    pub fn anchor(&self) -> u64 {
+        self.inner.anchor.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Record where this runnable's domain stands, immediately before a `run`
+    /// call. Written only while the runnable is not executing.
+    fn set_anchor(&self, ticks: u64) {
+        self.inner.anchor.store(ticks, AtomicOrdering::Relaxed);
     }
 
     /// The requester id this cursor's runnable was bound to, or zero.
@@ -3563,6 +3608,9 @@ impl Scheduler {
             // Everything sampled while this runnable executes must see where it
             // has got to, not where the quantum began (see [`TickCursor`]).
             let cursor = self.runnables[index].cursor.clone();
+            if let Ok(at) = self.forest.ticks(domain) {
+                cursor.set_anchor(at);
+            }
             self.arm_live_cursors(index, &cursor, &shared);
             cursor.set_view(self.read_view(index, target));
             let used = runnable.run(budget);
@@ -3865,6 +3913,9 @@ impl Scheduler {
         // why this — unlike the live views above — needs no rule about who
         // shares a crystal.
         for index in 0..count {
+            if let Ok(at) = self.forest.ticks(self.runnables[index].domain) {
+                self.runnables[index].cursor.set_anchor(at);
+            }
             let view = self.read_view(index, target);
             self.runnables[index].cursor.set_view(view);
         }
