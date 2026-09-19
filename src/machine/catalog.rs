@@ -744,6 +744,27 @@ pub static AMIGA_A1200: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/amiga-a1200.machine"),
 };
 
+/// A Commodore Amiga CD32, when this build has the board classes and Akiko.
+///
+/// The A1200's AA chip set and 68EC020 with 2 MiB of chip RAM, no floppy, no
+/// IDE port and no keyboard: a CD32 has none of the three. Akiko at
+/// `$B80000` carries the chunky-to-planar corner turn, the CD-ROM
+/// controller and the EEPROM's two wires; the drive takes a disc on the `cd0`
+/// slot and the joypad sits on the second controller port. The ROM comes in
+/// two halves — the `kickstart` slot for Kickstart 3.1 and `ext` for the part
+/// holding `cd.device` and the boot animation — and with an empty tray the
+/// machine runs that animation. `machines/amiga-cd32.machine` carries the
+/// wiring, and `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-cd32")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-cd32")))]
+pub static AMIGA_CD32: CatalogEntry = CatalogEntry {
+    name: "amiga-cd32",
+    summary: "an Amiga CD32: the AA chip set and a 68EC020 with 2 MiB of chip RAM, Akiko, a \
+              CD-ROM drive and a joypad",
+    media: &["kickstart", "ext", "cd0"],
+    source: include_str!("../../machines/amiga-cd32.machine"),
+};
+
 /// A Commodore Amiga 500+, when this build has the board classes.
 ///
 /// The A500 with the Enhanced Chip Set — an 8375 Agnus and an 8373 Denise —
@@ -865,6 +886,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&AMIGA_A1200);
     #[cfg(feature = "machine-amiga-a500plus")]
     out.push(&AMIGA_A500PLUS);
+    #[cfg(feature = "machine-amiga-cd32")]
+    out.push(&AMIGA_CD32);
     #[cfg(feature = "machine-mips-mini")]
     out.push(&MIPS_MINI);
     #[cfg(feature = "machine-ne2k-mini")]
@@ -2447,6 +2470,14 @@ mod tests {
                 0x00, 0x00, 0x00, 0x08, // PC  = $00000008
                 0x60, 0xfe, // BRA .
             ],
+            // The same, on the CD32, whose 2 MiB of chip RAM is soldered.
+            // `tests/amiga_cd32.rs` boots the user's two-part CD32 ROM on it.
+            #[cfg(feature = "machine-amiga-cd32")]
+            ("amiga-cd32", "kickstart") => &[
+                0x00, 0x20, 0x00, 0x00, // SSP = $00200000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             // The same, with the stack at the top of the 500+'s 1 MiB.
             // `tests/amiga_a500plus.rs` runs real programs on it.
             #[cfg(feature = "machine-amiga-a500plus")]
@@ -2548,6 +2579,12 @@ mod tests {
             // An A1200 with neither drive filled, for the same reason.
             #[cfg(feature = "machine-amiga-a1200")]
             ("amiga-a1200", "hd0" | "df0") => &[],
+            // A CD32 with no disc in the tray and no second ROM half: the
+            // boot screen, which is what the machine does on its own. The
+            // `ext` socket is a slot rather than a second image of the
+            // Kickstart because the two halves are two parts on the board.
+            #[cfg(feature = "machine-amiga-cd32")]
+            ("amiga-cd32", "cd0" | "ext") => &[],
             // The 500+'s drive, empty for the same reason.
             #[cfg(feature = "machine-amiga-a500plus")]
             ("amiga-a500plus", "df0") => &[],

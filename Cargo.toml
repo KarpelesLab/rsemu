@@ -2828,6 +2828,14 @@ machine-amiga-a600 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-am
 # Workbench 3.1 off an HDF with no floppy. Adds no dependencies.
 machine-amiga-a1200 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-mos8520", "dev-amiga-gayle", "dev-ata-disk"]
 
+# The `amiga-cd32` board (machines/amiga-cd32.machine): a Commodore Amiga
+# CD32 -- the A1200's AA chip set and 68EC020 with 2 MiB of chip RAM, a
+# two-part 3.1 ROM (the `kickstart` and `ext` slots), Akiko, a double-speed
+# CD-ROM drive on the `cd0` slot and the CD32 joypad on the second controller
+# port. No floppy, no IDE port and no keyboard: the machine has none. With an
+# empty tray the ROM runs its animated boot screen. Adds no dependencies.
+machine-amiga-cd32 = ["cpu-m68k", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-akiko", "dev-amiga-cdrom", "dev-amiga-cd32pad", "dev-amiga-mouse", "dev-mos8520"]
+
 # An A500+'s battery-backed clock (src/dev/amiga/rtc.rs): `amiga.rtc`, the Oki
 # MSM6242B the board decodes at $DC0000, a 4-bit register every four bytes --
 # BCD date and time counted from its own 32.768 kHz domain, HOLD/BUSY, the

@@ -1,0 +1,188 @@
+# amiga-cd32 - a Commodore Amiga CD32: the A1200's AA chip set with a CD-ROM
+# drive and Akiko in place of the floppy and the IDE port.
+#
+#   rsemu run amiga-cd32 --media kickstart=kickstart:amiga-os-310-cd32.rom \
+#       --media ext=kickstart:amiga-os-310-cd32-ext.rom
+#   rsemu run amiga-cd32 --media kickstart=kick.rom --media ext=ext.rom \
+#       --media cd0=game.iso --vnc :5900
+#
+# With nothing in `cd0` the machine runs its animated boot screen, which is
+# what a CD32 with an empty tray does.
+#
+# What changes from `amiga-a1200.machine`, and where each change comes from.
+# The *Amiga CD32 Developer Notes* (Revision 3, Commodore-Amiga Inc.) is the
+# document; it describes the machine to a game author and is quoted below.
+#
+# * **No floppy and no IDE port**, so no Gayle: "The Amiga CD 32 game machine
+#   is shipped with Chip RAM only" and its only drive is the CD-ROM. DF0 and
+#   `hd0` are simply not on this board.
+# * **2 MiB of chip RAM** - "2 Megabytes of 32-bit Chip RAM" - which is the
+#   A1200's soldered maximum and not a parameter here: a CD32 cannot be built
+#   with less.
+# * **A 68EC020**, "14MHz 68EC020 CPU", at half the master clock exactly as on
+#   the A1200.
+# * **The AA chip set**, "based on the Amiga AA chip set": Alice and Lisa, the
+#   same two objects the A1200 declares.
+# * **Akiko**, "a 160-pin PQFP surface-mounted device containing most of the
+#   remainder of the logic necessary in the Amiga CD 32. It includes the CD-ROM
+#   control logic and the system timers", plus the chunky-to-planar converter
+#   and the two wires of the EEPROM. `src/dev/amiga/akiko.rs` is the ledger and
+#   says plainly which of its registers is documented and which is black-box.
+# * **A two-part ROM.** The CD32's Kickstart is 3.1 in a 512 KiB part with a
+#   second 512 KiB part beside it holding `cd.device`, `lowlevel.library` and
+#   the boot animation. That is the same arrangement `amiga-a500.machine`'s
+#   `ext` socket already models for AROS - a window at $E0 0000 decoded by the
+#   board - so it is reused unchanged rather than reinvented.
+# * **A joypad on the controller port instead of a keyboard.** The Developer
+#   Notes: "It has six action buttons, one start button and four directional
+#   arrows", and `ReadJoyPort()` in `lowlevel.library` "is the only way to get
+#   Amiga CD 32 game controller information". There is no `amiga.keyboard` on
+#   this board - a CD32 has no keyboard connector at all.
+#
+# Written from the *Amiga CD32 Developer Notes* (Revision 3), the
+# *Specification for the Advanced Amiga (AA) Chip Set* (Commodore-Amiga,
+# 06/07/91), the *Amiga Hardware Reference Manual* (3rd edition), the
+# MC68020/MC68EC020 User's Manual, and black-box observation of the user's own
+# CD32 ROM. No Amiga emulator source, no FPGA reimplementation, no AROS source
+# and no Kickstart disassembly was consulted; they are all copyleft or derived
+# from the ROM (ROADMAP.md 1).
+
+machine "amiga-cd32" {
+  # A CD32's chip RAM is soldered and there is no second configuration of it;
+  # it is a parameter only so the memory map below can be written once.
+  param chip-ram = 2M
+
+  # Both halves of the ROM are 512 KiB parts.
+  param kickstart-size = 512K
+
+  # Whether Paula keeps stereo output frames for a host audio sink to drain.
+  param audio = false
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # PAL, as on the A1200: 28.37516 MHz. `-p master=28636360` with
+  # `standard = "ntsc"` on `agnus` and `denise` is the NTSC board.
+  param master = 28375160
+  osc   clk    = master Hz
+
+  space mem { width = 24, endian = "big", unassigned = open-bus }
+
+  object cpu "cpu.m68k" {
+    clock  = clk / 2
+    space  = mem
+    engine = "interp"
+    model  = "68ec020"
+  }
+
+  object chipram "ram" { size = chip-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+
+  object custom "amiga.custom" { }
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
+
+  # -- the AA chip set -------------------------------------------------------
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    revision = "aga"
+    paula    = paula
+    video    = denise
+  }
+  object denise "amiga.denise" { custom = custom, clock = clk / 4, revision = "aga" }
+
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  # -- Akiko and the drive ---------------------------------------------------
+  #
+  # The mechanism is declared before the controller, for the reason
+  # `amiga-a600.machine` gives about Gayle and its drive: `Machine::reset` runs
+  # devices in declaration order, and the controller's bind asks the mechanism
+  # whether there is a disc in it. No bytes bound to `cd0` is an empty tray,
+  # which is the machine at its boot screen.
+  object cd0 "amiga.cd" { image = "cd0" }
+
+  object akiko "amiga.akiko" { drive = cd0 }
+
+  # -- the overlay and the second ROM ----------------------------------------
+  #
+  # The same decoder the A500 uses: the ROM at zero while `ovl` is high, chip
+  # RAM after, and a window at $E0 0000 for the second half of the ROM. No
+  # `custom` (bank 6 is not the register space here) and no `slow-ram`.
+  object overlay "amiga.gary" {
+    space = mem
+    rom   = kick
+    ram   = chipram
+    size  = chip-ram
+    ext   = "ext"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  #   $000000  chip RAM, behind the overlay                     2 MiB
+  #   $B80000  Akiko                                            32 KiB
+  #   $BFD000  CIA-B, even byte addresses
+  #   $BFE000  CIA-A, odd byte addresses
+  #   $DFF000  the custom chip registers                        512 bytes
+  #   $E00000  the extended ROM                                 512 KiB
+  #   $F80000  Kickstart                                        512 KiB
+  map mem 0x000000 size chip-ram       = overlay.overlay { endian = "big" }
+  map mem 0xB80000 size 0x8000         = akiko           { endian = "big" }
+  map mem 0xBFD000 size 0x1000         = cia_b_decode    { endian = "big" }
+  map mem 0xBFE000 size 0x1000         = cia_a_decode    { endian = "big" }
+  map mem 0xDFF000 size 0x200          = custom
+  map mem 0xE00000 size 512K           = overlay.ext
+  map mem 0xF80000 size 512K           = mirror(kick)    { endian = "big" }
+
+  # -- wiring ----------------------------------------------------------------
+  wire cia_a.pa0 -> overlay.ovl
+
+  wire paula.ipl0 -> cpu.ipl0
+  wire paula.ipl1 -> cpu.ipl1
+  wire paula.ipl2 -> cpu.ipl2
+
+  wire cia_a.irq -> paula.int2
+  wire cia_b.irq -> paula.int6
+
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
+
+  # -- the controller ports --------------------------------------------------
+  #
+  # A CD32 has no keyboard connector at all, so `amiga.keyboard` is not on this
+  # board and CIA-A's serial port has nothing on it. What it has is two nine-pin
+  # game ports; the pad goes in the second one, which is the joystick port on
+  # every Amiga, and a mouse goes in the first.
+  #
+  # The pad's eight extra buttons come out of a shift register the machine
+  # clocks: `POTGO` drives pin 5 low to latch it (`paula.potrx-out`), CIA-A's
+  # PA7 is then the clock, and the bits arrive on pin 9, which is Paula's
+  # `potry`. `src/dev/amiga/cd32pad.rs` is the ledger, and says which of that
+  # is the hardware manual's and which is the pad's own arrangement.
+  osc periph = 1000000 Hz
+
+  object pad "amiga.cd32-pad" { }
+  wire pad.up    -> denise.m1v      { pull = "up" }   # pin 1, FORW*
+  wire pad.left  -> denise.m1vq     { pull = "up" }   # pin 3, LEFT*
+  wire pad.down  -> denise.m1h      { pull = "up" }   # pin 2, BACK*
+  wire pad.right -> denise.m1hq     { pull = "up" }   # pin 4, RIGH*
+  wire pad.fire  -> cia_a.pa7       { pull = "up" }   # pin 6, the red button
+  wire cia_a.pa7 -> pad.fire        { pull = "up" }   # pin 6, the clock back
+  wire pad.data  -> paula.potry     { pull = "up" }   # pin 9, blue, then the bits
+  wire paula.potrx-out -> pad.load  { pull = "up" }   # pin 5, the latch
+
+  # Port 0 takes a mouse, as it does on every other Amiga board here: the CD32
+  # has the connector and Workbench on a CD would want one.
+  object mouse "amiga.mouse" { clock = periph }
+  wire mouse.y      -> denise.m0v  { pull = "up" }
+  wire mouse.yq     -> denise.m0vq { pull = "up" }
+  wire mouse.x      -> denise.m0h  { pull = "up" }
+  wire mouse.xq     -> denise.m0hq { pull = "up" }
+  wire mouse.left   -> cia_a.pa6   { pull = "up" }
+  wire mouse.right  -> paula.potly { pull = "up" }
+  wire mouse.middle -> paula.potlx { pull = "up" }
+}

@@ -57,6 +57,9 @@ RUN OPTIONS:
     --hd0 <file>        Bind the `hd0` media slot: a raw hard disk image for
                         the first IDE bay. Unbound is an empty bay.
     --hd1 <file>        Bind the `hd1` media slot: the second IDE bay
+    --cd0 <file>        Bind the `cd0` media slot: a disc for the CD32's
+                        drive, as ISO 9660 user data or as raw 2352-byte
+                        frames. Unbound is an empty tray.
     --cdrom <file>      Bind the `cdrom` media slot: an ISO 9660 image for the
                         CD-ROM drive. Unbound is a drive with no disc in it.
     --flash0 <file>     Bind the `flash0` media slot: a NOR flash bank's
@@ -553,12 +556,18 @@ fn run(args: &[String]) -> ExitCode {
     // finds the slot, because the drive looks its medium up by the slot's name.
     // `ext` is the A500's extended-ROM window, which exists for AROS's second
     // ROM half and which a real A500 does not have: no bytes is no ROM there,
-    // and the board is exactly the one without the window. `cdrom` is the
+    // and the board is exactly the one without the window. On `amiga-cd32` the
+    // same slot is the *other half of the machine's own ROM* and a run without
+    // it gets a machine that halts early, which is a real configuration —
+    // a CD32 with one part missing — and not something to refuse to assemble.
+    // `cd0` is the CD32's tray, and the `df0` argument once more: no bytes is
+    // no disc, which is the console showing its boot animation, and it is what
+    // a CD32 does when you switch it on with nothing in it. `cdrom` is the
     // PC's CD-ROM drive: no bytes is an open tray, and the guest is told
     // `MEDIUM NOT PRESENT` rather than finding no drive.
     for slot in [
         "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0",
-        "ext", "cdrom",
+        "ext", "cd0", "cdrom",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
@@ -2609,7 +2618,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
             "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--flash0"
-            | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--cdrom" => {
+            | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--cd0" | "--cdrom" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));
