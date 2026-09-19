@@ -6,11 +6,12 @@ Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
 `tests/amiga_a500_board.rs`, `tests/amiga_denise_board.rs`,
 `tests/agnus_board.rs`, `tests/amiga_a500_chipset.rs`,
 `tests/amiga_a500_input.rs`, `tests/amiga_adf.rs`,
-`tests/amiga_a500_kickstart.rs`; and for the A600 (the last section),
+`tests/amiga_a500_kickstart.rs`; and for the A600 (its own section),
 `machines/amiga-a600.machine`, `src/dev/amiga/gayle.rs`,
 `tests/amiga_a600_board.rs`, `tests/amiga_a600_hdf.rs`; and for the ECS section,
 `machines/amiga-a500plus.machine`, `src/dev/amiga/rtc.rs` and
-`tests/amiga_a500plus.rs`.
+`tests/amiga_a500plus.rs`; and for the AA section, `src/dev/amiga/denise/aga.rs`
+and `tests/amiga_lisa.rs`.
 
 A 68000, 512 KiB of chip RAM, a Kickstart ROM, two 8520 CIAs and three custom
 chips — Agnus, Denise and Paula. **All of them are on the A500 board now**: the
@@ -31,6 +32,7 @@ decided, what it had to leave open, and where each chip meets the others.
 | *A500/A2000 Gary Specification* (Commodore; the copy in Dave Haynie's A2000 documents) | Gary's pins, its bank decode on `A17`–`A23`, `ERAM` (`$C0_0000`–`$C7_FFFF`, "expansion RAM") and the `NEXP` pin a trapdoor card grounds; `NROM` covering `$E0_0000`–`$E7_FFFF` |
 | A500 schematics #312511-02 rev. 5 and #312511-03 rev. 6A/7 (Commodore) | Sheet 2: the chip data bus buffers (`U10`–`U13`) and their shared enables; sheet 3: the ROM socket `U6` |
 | The same *Hardware Reference Manual*, for input | Appendix G, "Keyboard Interface" (pp. 357-364): the protocol, timing, handshake, resync, power-up sequence, special codes and the matrix table with every key's legend; chapter 8, "The Keyboard" (pp. 251-254) and "Reading Mouse/Trackball Controllers" and "Mouse Buttons" (pp. 229-233); Table 8-4 (`POTGO`); Appendix A, `JOY0DAT` and `JOYTEST` (pp. 281-282); Appendix E, CIA port assignments; Appendix F, the 8520's serial port and "Bidirectional Feature" |
+| *Specification for the Advanced Amiga (AA) Chip Set* (Commodore-Amiga; the typed-in AmigaGuide edition, "Pandora Chipset Documentation") | §1 the summary of new features, §2 their explanation (bitplanes, HAM8, EHB, dual playfields, sprites, the colour lookup table, collision, the horizontal comparators, compatibility), §3 the register list by address, §4 each new or changed register's bits (`BPLCON0`–`BPLCON4`, `CLXCON2`, `COLORx`, `DIWHIGH`, `FMODE`, `LISAID`, `SPRxPOS`/`CTL`/`DAT`, `BPLxDAT`), §5 Lisa's display and sprite modes and the scroll ranges — what Lisa (`revision = "aga"`) is written from. Fetched as the document alone |
 | [*Amiga ROM Kernel Reference Manual: Devices*, 3rd edition](http://amigadev.elowar.com/read/ADCD_2.1/Devices_Manual_guide/node015B.html) (Commodore-Amiga Inc.), Appendix C | The floppy's track and sector layout, the MFM encoding and its odd/even split, and the boot block's type and checksum — what `src/dev/amiga/adf.rs` and `src/host/media/adf.rs` are written from. See *Disks* below for the one thing it leaves out |
 
 **Nothing else.** Every Amiga emulator the project is aware of is copyleft and
@@ -1153,3 +1155,80 @@ any document at hand.
   SECTORS` through Gayle, waiting on the level 2 interrupt each time, and gets
   the image's bytes.
 * `tests/amiga_a600_hdf.rs` (the user's ROMs and HDFs): the four rows above.
+
+## AA: Lisa, the display half
+
+`amiga.denise` with `revision = "aga"` is **Lisa**, the AA chip set's video
+chip. There is no AA board yet — Alice, the AA Agnus, and the A1200 come
+next — so Lisa is driven by hand in `src/dev/amiga/denise/aga/tests.rs` and
+`tests/amiga_lisa.rs`, the way `amiga_denise_board.rs` drove Denise before
+Agnus existed. `src/dev/amiga/denise/aga.rs` is the ledger of what the AA
+specification settles and what it leaves open; this is the summary.
+
+**An 8362 and an 8373 are untouched, and that is checked, not asserted.**
+Every Amiga golden — `amiga_a500_kickstart`, `amiga_a500_workbench`,
+`amiga_a500plus`, `amiga_a600_hdf` against the user's ROMs, disks and hard
+disk, and `amiga_a500_chipset`, `amiga_denise_board`, `agnus_board` and
+Denise's own golden field without them — is the hash it was. The one change
+they share is that the picture is now eight bits a gun: the older parts'
+four-bit guns go into it as `n × 17`, the expansion the host adapter always
+made, so their host bytes and their twelve-bit `read_row`/`copy_frame` words
+are what they were.
+
+### What Lisa does
+
+| | |
+| --- | --- |
+| Eight bitplanes | `BPLCON0`'s `BPU3` (bit 4): "0000-1000 (none thru 8 inclusive)"; nine to fifteen are clamped to eight |
+| The colour table | 256 entries of 24 bits and a `T` bit, reached 32 at a time through `BPLCON3`'s `BANK`. A `LOCT = 0` write sets each gun to `n × 17` and the `T` bit; a `LOCT = 1` write sets the low nibbles only. `LISAID` is `$FFF8` |
+| HAM8, and HAM6 everywhere | Planes 1 and 2 control, planes 3–8 are the six high bits of the modified gun, and the two low bits are held; a base register is one of 64, the plane address with the control bits at `00`. HAM6 works in every resolution too |
+| `BPLCON4` | `BPLAM` XOR'ed with every bitplane colour address; `ESPRM`/`OSPRM` the high four bits of even, odd and attached sprites' colours, reset to `0001` |
+| Dual playfield, EHB | 4 + 4 planes, playfield 2 at `PF2OF`'s offset (reset 8). EHB only when `SHRES = HIRES = HAMEN = DPF = 0` and `BPU = 6`, and `KILLEHB` still kills it |
+| 35 ns everywhere | `BPLCON1`'s eight-bit scroll per playfield, `DIWHIGH`'s `H1`/`H0`, `SPRxCTL`'s `SH1`/`SH0`. The picture is always 35 ns columns: 1600 across for a standard PAL field |
+| Sprites | `SPRES` (the ECS default, 140, 70 or 35 ns, whatever the playfield's resolution), 16/32/64-bit data by `FMODE`'s `SPR32`/`SPAGEM`, attachment in every resolution, `BRDSPRT` behind `ECSENA`, and `SSCAN2` taking `SH10` out of the comparison |
+| `CLXCON2` | Planes 7 and 8 in collisions; a `CLXCON` write clears it |
+
+### The seam Alice needs
+
+1. **Bitplanes**: `denise::Fetch::planes` is eight streams now. A 32- or
+   64-bit fetch is that many consecutive pixels — "the parallel to serial
+   conversion is triggered whenever bit plane #1 is written, indicating the
+   completion of all bit planes for that word (16/32/64 pixels). The MSB is
+   output first" (§4, `BPLxDAT`) — so Alice puts one, two or four words a
+   fetch slot into the same stream, in shift order. `Fetch::start` is still
+   the colour clock of the first fetch; Lisa places its first pixel by the
+   3rd-edition arithmetic, which the AA document does not replace.
+2. **Sprites**: `Video::sprite_dma(sprite, b_buffer, bits)` for a 32- or
+   64-bit sprite fetch, left-justified in a `u64`. It is timed exactly as a
+   register write is — stamped with the `Beam`'s position and queued behind
+   the `SPRxPOS`/`SPRxCTL` writes the same DMA slot made — so the `CTL`
+   write that disarms a sprite cannot overtake the data that re-arms it. A
+   16-bit fetch may still go through the register bus; the two agree.
+3. **Registers**: `FMODE` (`$1FC`, `A D`) reaches both chips as an ordinary
+   write, as do `BPLCON4`, `CLXCON2` and the extended `BPLCON1`/`BPLCON3`/
+   `DIWHIGH`. `regs.rs` declares the Lisa rows; the Alice rows (bitplane 7 and
+   8 pointers) are Alice's to add.
+4. **Scan doubling**: `BSCAN2` is Alice's (it picks the modulus); Lisa only
+   latches it. `SSCAN2` is both chips': Lisa drops `SH10` from the compare and
+   Alice uses the bit as a per-sprite enable.
+
+### Where the document is silent
+
+Each is marked in `aga.rs` as an inference: where a fetch's first pixel lands
+(the 3rd-edition arithmetic, unchanged); that HAM6's four bits go to a gun's
+top four and its low four are held, as HAM8's are; that `BPLAM` masks every
+bitplane colour address including a zero pixel inside the window, and not the
+border; that five to seven planes with `HAMEN` are HAM6; that `PF2OF` is
+playfield 2's offset whatever `PF2PRI` says (§2 and §4 read differently); and
+that a scroll larger than §5's range for the fetch width is applied whole.
+`RDRAM`, genlock (`ZD`, `BRDNTRAN`, `ZDCLKEN`), `EXTBLKEN`, `BYPASS` and
+`UHRES` are latched only.
+
+### Pictures
+
+`tests/amiga_lisa.rs` paints three whole fields through the public API and the
+real host adapter, asserts their pixels, and writes `lisa-256.png`,
+`lisa-ham8.png` and `lisa-sprites.png` to `RSEMU_AMIGA_FRAME_DIR` when built
+with `display-png`: a 16 × 16 chart of 256 24-bit colours, a HAM8 gradient of
+some eight thousand colours with the HAM fringe at its left edge, and one
+64-pixel sprite at 140, 70 and 35 ns over a 256-colour background.
