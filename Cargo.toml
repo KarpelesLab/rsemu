@@ -2037,12 +2037,18 @@ dev-pc-hpet = ["dev-pc"]
 # reference), not from any emulator source. Needs `dev-pc`.
 dev-pc-debugcon = ["dev-pc"]
 
-# The PC's display side (src/dev/pc/video): an MC6845-derived CRTC, the
-# attribute-plus-character text buffer at 0xb8000, and the character generator
-# that turns the two into pixels on the `host::display` scanout seam — so a
-# `--screenshot` and the browser demo see the same picture the guest drew. Text
-# mode only, deliberately: it is what reaches a DOS prompt, and a graphics mode
-# nothing yet asks for would be untested code. Needs `dev-pc`.
+# The PC's display side (src/dev/pc/video): a display adapter in two register
+# files, picked by the `model` property. `6845` is an MC6845-derived CRTC with
+# the attribute-plus-character text buffer at 0xb8000 -- text mode only, which
+# is what reaches a DOS prompt. `vga` is the adapter proper: the VGA's own
+# twenty-five CRT controller registers, four 64 KiB planes behind the window at
+# 0xa0000 with the graphics controller's write modes, read modes and latches,
+# the graphics modes those make (12h, 13h, the unchained 256-colour modes), and
+# a linear mode behind extension registers documented in
+# docs/devices/pc-video.md. Either way the picture comes out on the
+# `host::display` scanout seam, so a `--screenshot` and the browser demo see
+# what the guest drew. Written from the IBM VGA Technical Reference and
+# FreeVGA; no emulator source was consulted (ROADMAP.md §1). Needs `dev-pc`.
 dev-pc-video = ["dev-pc"]
 
 # The PC's PCI host bridge (src/dev/pc/pmc): an Intel 82441FX, the north bridge
@@ -2063,9 +2069,12 @@ dev-pc-video = ["dev-pc"]
 # the console, and the **expansion ROM base address register** its video BIOS
 # arrives on. That is the only route to video on a 440FX board -- the firmware
 # turns 0xc0000-0xdffff into DRAM before it looks, so a legacy option ROM socket
-# there is invisible by the time anything scans it. Written from the PCI Local
-# Bus Specification Rev 2.1 §6.2.5.2 and Appendix D. Needs `bus-pci` and
-# `dev-pc`.
+# there is invisible by the time anything scans it. That card also carries the
+# **linear framebuffer** behind BAR0 when a machine file gives it a display
+# object to take one from: 16 MiB, prefetchable, decoding the display device's
+# own video memory, which is how a guest finds a framebuffer without knowing
+# anything about the board. Written from the PCI Local Bus Specification Rev
+# 2.1 §6.2.5.1, §6.2.5.2 and Appendix D. Needs `bus-pci` and `dev-pc`.
 dev-pc-pci = ["dev-pc", "bus-pci"]
 
 # The PC's floppy controller (src/dev/pc/fdc): a NEC uPD765A as the AT wires
