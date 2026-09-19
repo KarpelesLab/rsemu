@@ -10,6 +10,7 @@ use super::*;
 use crate::core::props::{Link, Value};
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use crate::dev::amiga::custom::Custom;
+use crate::dev::amiga::dma::ChipDataBus;
 use crate::dev::amiga::regs;
 
 /// A PAL line's length in colour clocks.
@@ -806,12 +807,22 @@ fn a_reset_keeps_the_pins_and_settles_the_counters_on_them() {
 
 #[test]
 fn deniseid_on_an_original_denise_is_whatever_was_on_the_bus() {
+    // "The original Denise (8362) does not have this register" (Appendix C,
+    // p. 299), so the answer is "whatever value is left over on the bus from
+    // the last cycle" — Agnus's last DMA cycle, which is what an 8362 board
+    // hands the register space at bind.
     let custom = Custom::new(&Props::new()).unwrap();
+    let data = Arc::new(ChipDataBus::new());
+    custom.bus().attach_data_bus(Arc::clone(&data));
     let v = Arc::new(video());
     custom.bus().attach(v.clone()).unwrap();
     *v.bus.lock() = Arc::downgrade(custom.bus());
-    custom.bus().write(COLOR00, 0x0abc, Origin::cpu());
+    data.drive(0x0abc);
     assert_eq!(custom.bus().read(DENISEID, Origin::cpu()), 0x0abc);
+    // And it moves with the DMA, which is what tells a guest it is not an
+    // 8373's steady `$FFFC`.
+    data.drive(0x7e10);
+    assert_eq!(custom.bus().read(DENISEID, Origin::cpu()), 0x7e10);
 }
 
 #[test]

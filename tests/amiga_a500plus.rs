@@ -46,6 +46,7 @@ use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ExportId;
 use rsemu::dev::amiga::custom::{CustomBus, Origin};
 use rsemu::dev::amiga::denise::Video;
+use rsemu::dev::amiga::dma::ChipDma;
 use rsemu::machine::{Machine, catalog};
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,18 @@ fn video(m: &Machine) -> Arc<Video> {
     Arc::clone(export.opaque().expect("opaque"))
         .downcast::<Video>()
         .expect("a Video")
+}
+
+fn chip_dma(m: &Machine) -> Arc<ChipDma> {
+    let export = m
+        .device("agnus")
+        .expect("the board has an agnus")
+        .device()
+        .export(ExportId::CHIP_DMA)
+        .expect("Agnus publishes its DMA handle");
+    Arc::clone(export.opaque().expect("opaque"))
+        .downcast::<ChipDma>()
+        .expect("a ChipDma")
 }
 
 fn custom_bus(m: &Machine) -> Arc<CustomBus> {
@@ -212,10 +225,15 @@ impl Program {
 
 /// `VPOSR` bits 14–8 and `DENISEID`, as the processor reads them, with a
 /// known word left on the chip bus first.
+///
+/// "Left on the bus" is a *DMA* cycle's word, not a register write's: chapter
+/// 6 gives Agnus every chip-memory slot the 68000 does not get, so a processor
+/// write's word never survives to the processor's next cycle. Rather than
+/// arrange a blit here — `tests/agnus_board.rs` does that — the word is put
+/// straight on `dma::ChipDataBus`, which is what a cycle would have left.
 fn ids(m: &Machine) -> (u16, u16) {
+    chip_dma(m).data_bus().drive(0x1234);
     let bus = custom_bus(m);
-    // Something on the bus for an 8362 to float: the last word written.
-    bus.write(reg::COLOR00, 0x1234, Origin::cpu());
     let deniseid = bus.read(reg::DENISEID, Origin::cpu());
     let vposr = bus.read(reg::VPOSR, Origin::cpu());
     ((vposr >> 8) & 0x7f, deniseid)
@@ -721,23 +739,29 @@ mod kickstart {
         );
     }
 
-    /// The control: the same ROM on the A500, whose 8371 is not an ECS
-    /// Agnus, and graphics.library does not find one.
+    /// The control: the same ROM on the A500, whose 8371 is not an ECS Agnus
+    /// and whose 8362 is not an ECS Denise, and graphics.library finds
+    /// **neither**.
     ///
-    /// **A finding, pinned rather than hidden.** It does set `GFXF_HR_DENISE`
-    /// there. Watched black-box, Kickstart 2.04 reads `DENISEID` seventeen
-    /// times and an 8362 answers with the floating chip bus, as Appendix C
-    /// says — but this model's floating word is `amiga.custom`'s documented
-    /// placeholder, the last word written, and it is `$8001` all seventeen
-    /// times: a stable answer, which is what an 8373 gives. The real bus holds
-    /// "whatever value is left over on the bus from the last cycle", which DMA
-    /// keeps changing. So the A500's ScreenMode lists SuperHires where a real
-    /// A500 would not (`screenmode` below). Replacing the placeholder with the
-    /// last DMA cycle's word is `custom.rs`'s to do, and would have to be
-    /// shown to leave the A500's goldens where they are.
+    /// This is the test the chip data bus exists for. Watched black-box,
+    /// Kickstart 2.04 reads `$DFF07C` seventeen times *in a row*, with no
+    /// other access between them: that is a stability test, and it is the one
+    /// Appendix C (p. 299) sets up when it says an 8362 "does not have this
+    /// register, so whatever value is left over on the bus from the last cycle
+    /// will be there". An 8373 answers `$FFFC` every time; an 8362 answers
+    /// with sixteen lines nobody is driving, and the second read does not
+    /// agree with the first.
+    ///
+    /// While `amiga.custom` kept a placeholder word — the last word *written*,
+    /// stable across all seventeen reads — graphics.library concluded there
+    /// was an 8373 and set `GFXF_HR_DENISE`, so this came out `$02` and the
+    /// A500's ScreenMode offered SuperHires modes a real A500 cannot do
+    /// (`screenmode` below). With the lines modelled, an unanswered read takes
+    /// what is on them and leaves them floating, the two reads differ, and
+    /// this is `$00`.
     #[cfg(feature = "machine-amiga-a500")]
     #[test]
-    fn on_the_a500_kickstart_2_04_finds_no_ecs_agnus() {
+    fn on_the_a500_kickstart_2_04_finds_neither_ecs_chip() {
         let Some(mut b) = board("amiga-a500", "amiga-os-204.rom", None) else {
             return;
         };
@@ -745,11 +769,7 @@ mod kickstart {
         let bits = chip_rev_bits(&b);
         println!("a500-204: ChipRevBits0 = {bits:#04x}");
         assert_eq!(bits & HR_AGNUS, 0, "an 8371 is not an ECS Agnus");
-        assert_eq!(
-            bits & HR_DENISE,
-            HR_DENISE,
-            "the floating-bus placeholder answers DENISEID stably; see above"
-        );
+        assert_eq!(bits & HR_DENISE, 0, "an 8362 is not an ECS Denise");
     }
 
     /// Kickstart 2.04 (37.175), the 500+'s own ROM: its insert-disk screen.
@@ -1031,10 +1051,12 @@ mod screenmode {
 
     /// The same on the A500. Its first picture is
     /// `tests/amiga_a500_workbench.rs`'s disk window, bit for bit, with
-    /// "287248 graphics mem"; its ScreenMode window differs from the 500+'s
-    /// in one line, **"Max Size 1008 x 1024"**, the original blitter's
-    /// limit. It lists the SuperHires modes too, which a real A500 would not:
-    /// see `on_the_a500_kickstart_2_04_finds_no_ecs_agnus` for why.
+    /// "287240 graphics mem"; its ScreenMode window lists **PAL:Hires and
+    /// PAL:Hires-Interlaced and nothing else** — no SuperHires, which an 8362
+    /// cannot produce — and **"Max Size 1008 x 1024"**, the original
+    /// blitter's limit where the 500+ has the ECS blitter's. Both follow from
+    /// `ChipRevBits0` being `$00` here and `$03` there; see
+    /// `on_the_a500_kickstart_2_04_finds_neither_ecs_chip`.
     #[cfg(feature = "machine-amiga-a500")]
     #[test]
     fn screenmode_on_the_500_keeps_the_original_blitters_sizes() {
@@ -1042,9 +1064,9 @@ mod screenmode {
             "amiga-a500",
             "a500-screenmode",
             [
-                0xb068_7a77_ca8e_2cad,
-                0x5726_f7b6_aa8a_56b9,
-                0x68b5_1ad7_1fc2_a745,
+                0x9726_197f_da42_1ecd,
+                0x5a7d_541a_c46d_ee51,
+                0x15a6_4bfa_7c1c_3511,
             ],
         );
     }

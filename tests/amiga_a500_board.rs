@@ -61,6 +61,12 @@ const PORTS: u16 = 0x0008;
 /// The word the firmware writes to `COLOR00`.
 const COLOUR: u16 = 0x0F00;
 
+/// The bits the firmware sets in `INTENA`, and so the word `INTENAR` answers
+/// with. `AUD1`, `AUD2`, `AUD3` and `RBF` (Appendix A) — four enables that
+/// nothing on an idle board ever requests, chosen because every nibble of
+/// `$0F00` is distinct and a byte-swapped board would answer `$008F`.
+const INTERRUPTS: u16 = 0x0F00;
+
 /// CIA-A's `PRA`, register 0: `$BFEr01` with `r` = 0 (Appendix F).
 const CIAA_PRA: u64 = 0xBF_E001;
 
@@ -79,8 +85,9 @@ const OVL: u8 = 0x01;
 /// ```text
 ///   000000: 0008 0000        dc.l  $00080000   ; the reset supervisor stack pointer
 ///   000004: 0000 000c        dc.l  $0000000c   ; the reset program counter
-///   00000c: 33fc 0f00 00df f180   move.w #$0f00, ($00dff180).l
-///   000014: 60fe             bra    *
+///   00000c: 33fc 0f00 00df f180   move.w #$0f00, ($00dff180).l   ; COLOR00
+///   000014: 33fc 8f00 00df f09a   move.w #$8f00, ($00dff09a).l   ; INTENA
+///   00001c: 60fe             bra    *
 /// ```
 ///
 /// The reset program counter is `$00000C` — an address in the **overlay**, not
@@ -92,9 +99,16 @@ const OVL: u8 = 0x01;
 /// `$0F00` rather than a round number because every nibble of it is distinct:
 /// a byte-swapped board writes `$000F` and this test fails instead of passing
 /// by coincidence.
+///
+/// `COLOR00` is Denise's and **write-only**, so what it latched cannot be read
+/// back — a read of it answers the chip data bus, which is Agnus's business
+/// and not this file's. The second store is to `INTENA`, Paula's, whose
+/// `INTENAR` reads the enables back: that is the word this file checks.
+#[rustfmt::skip]
 fn kickstart() -> Vec<u8> {
     image(&[
         0x33fc, COLOUR, 0x00df, 0xf180, // move.w #$0f00, ($00dff180).l
+        0x33fc, 0x8000 | INTERRUPTS, 0x00df, 0xf09a, // move.w #$8f00, ($00dff09a).l
         0x60fe, // bra *
     ])
 }
@@ -252,18 +266,22 @@ fn the_firmware_runs_out_of_the_overlay_and_reaches_the_custom_chip_space() {
 
     let bus = custom_bus(&m);
 
-    // The word reached the register space in the right byte order, and with
-    // Denise on the board it was claimed: nothing on this board falls through.
+    // The word reached the register space in the right byte order. `INTENAR`
+    // is Paula's read-back of the bits `INTENA` set, so this is the word the
+    // program wrote coming back out of a chip: a board that put a big-endian
+    // core on a little-endian map would answer `$008F` here.
     assert_eq!(
-        bus.floating(),
-        COLOUR,
-        "either the MOVE.W never ran, or the board put a big-endian core on a \
-         little-endian map and the word is swapped"
+        peek_word(&m, INTENAR),
+        INTERRUPTS,
+        "either the second MOVE.W never ran, or the word was byte-swapped on \
+         the way in"
     );
+    // And with Denise on the board the `COLOR00` store was claimed too:
+    // nothing on this board falls through.
     assert_eq!(
         bus.unclaimed(),
         0,
-        "COLOR00 is Denise's, and Denise is on the board"
+        "COLOR00 is Denise's and INTENA is Paula's, and both are on the board"
     );
 }
 
@@ -272,15 +290,21 @@ fn the_custom_space_decodes_words_and_refuses_everything_else() {
     let m = boot();
     let space = m.space("mem").expect("the memory space");
 
-    // A write-only register read back gives the floating chip data bus, which
-    // with no chipset attached is the last word written. Placeholder behaviour,
-    // documented as such in `src/dev/amiga/custom.rs`.
+    // A write-only register read back gives the chip data bus — the word the
+    // last chip-bus cycle left on `D15`-`D0`, which here is the write just
+    // made — and gives it exactly **once**: that read is itself a cycle in
+    // which nothing drives the lines, so the next one finds them floating.
+    // `src/dev/amiga/dma.rs` has the rule and `tests/agnus_board.rs` puts a
+    // real DMA cycle on them.
     poke_word(&m, COLOR00, 0x0123);
     assert_eq!(peek_word(&m, COLOR00), 0x0123);
+    assert_eq!(peek_word(&m, COLOR00), 0x0000, "and not a second time");
 
     // An offset the appendix leaves empty answers the same way rather than
     // inventing a value.
+    poke_word(&m, COLOR00, 0x0123);
     assert_eq!(peek_word(&m, CUSTOM + 0x068), 0x0123);
+    assert_eq!(peek_word(&m, CUSTOM + 0x068), 0x0000);
 
     // A readable register with its owner present answers from the chip:
     // Denise's `JOY0DAT` with no mouse moved, and `DMACONR`, which Agnus and
@@ -291,26 +315,29 @@ fn the_custom_space_decodes_words_and_refuses_everything_else() {
     // The appendix's registers are words, and a byte access is the word access
     // the chips see (`src/dev/amiga/custom.rs` has the sources): a read keeps
     // the half its strobe selects, and a write drives the byte onto both halves
-    // (MC68000UM Table 3-1). The `DMACONR` read above left its own word on
-    // the bus, so put a known one back first.
-    poke_word(&m, COLOR00, 0x0123);
+    // (MC68000UM Table 3-1). `INTENAR` is readable and Paula's, so the halves
+    // are a chip's own word rather than an undriven bus's.
+    poke_word(&m, INTENA, 0x8000 | INTERRUPTS);
     assert_eq!(
-        space.read(COLOR00, Width::U8, MemAttrs::DEFAULT),
-        Ok(0x01),
-        "UDS alone: the upper half of the floating word"
+        space.read(INTENAR, Width::U8, MemAttrs::DEFAULT),
+        Ok(u64::from(INTERRUPTS >> 8)),
+        "UDS alone: the upper half of the word the chip drove"
     );
     assert_eq!(
-        space.read(COLOR00 + 1, Width::U8, MemAttrs::DEFAULT),
-        Ok(0x23),
+        space.read(INTENAR + 1, Width::U8, MemAttrs::DEFAULT),
+        Ok(u64::from(INTERRUPTS & 0xff)),
         "LDS alone: the lower half"
     );
+    // A byte write at either address of `INTENA` drives the byte onto both
+    // halves, so `$7F` at the odd address is `$7F7F`: bit 15 clear, which
+    // *clears* every bit it names rather than setting the low ones.
     space
-        .write(COLOR00 + 1, Width::U8, 0x45, MemAttrs::DEFAULT)
+        .write(INTENA + 1, Width::U8, 0x7f, MemAttrs::DEFAULT)
         .expect("a byte write reaches the register");
     assert_eq!(
-        peek_word(&m, COLOR00),
-        0x4545,
-        "the byte in both halves, none kept"
+        peek_word(&m, INTENAR),
+        0x0000,
+        "the byte in both halves, none kept: $7F7F cleared them all"
     );
     assert!(
         space

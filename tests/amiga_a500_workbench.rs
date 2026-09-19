@@ -516,8 +516,18 @@ const GOLDEN_204_DESKTOP: u64 = 0x95a5_9a12_c942_e139;
 /// Five seconds after the double-click: the "Workbench2.0 94% full, 47K
 /// free, 790K in use" window open over the desktop with Shell, System,
 /// WBStartup, Monitors, Prefs, Utilities, Expansion and Trashcan, the screen
-/// title now "Amiga Workbench 287248 graphics mem 0 other mem".
-const GOLDEN_204_DISK_WINDOW: u64 = 0xb068_7a77_ca8e_2cad;
+/// title now "Amiga Workbench 287240 graphics mem 0 other mem".
+///
+/// **Moved when the chip data bus replaced `amiga.custom`'s placeholder**
+/// (`src/dev/amiga/dma.rs`). Every icon, every window and the pointer are
+/// where they were; the one difference is that figure, **287240** where it
+/// read 287248 — eight bytes. graphics.library now finds no ECS Denise on
+/// this 8362 board (`ChipRevBits0` is `$00`, not `$02`), builds a display
+/// database without the SuperHires modes, and its allocations come out eight
+/// bytes apart. `tests/amiga_a500plus.rs` is where that is the *point* rather
+/// than a side effect: the A500's ScreenMode window stops offering
+/// PAL:SuperHires.
+const GOLDEN_204_DISK_WINDOW: u64 = 0x9726_197f_da42_1ecd;
 /// Six seconds after the Shell's double-click: an "AmigaShell" window across
 /// the lower screen with the prompt `1.Workbench2.0:>` and a cursor, the
 /// screen title "Workbench Screen", the pointer on the Shell icon behind it.

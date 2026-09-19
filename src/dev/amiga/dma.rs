@@ -46,6 +46,14 @@
 //! | [`peek`](ChipDma::peek), [`poke`](ChipDma::poke) | chip RAM, ungated |
 //! | [`beam`](ChipDma::beam) | where Agnus's counters were at the last count it simulated |
 //!
+//! # The chip data bus
+//!
+//! Every one of those cycles leaves its word on `D15`–`D0`. [`ChipDataBus`] is
+//! that word, shared with `amiga.custom`, which drives it from the register
+//! side and answers a read of a write-only register out of it — the one thing
+//! on the board that can see an undriven bus. Its documentation has the whole
+//! rule, and marks what is inference and what is choice.
+//!
 //! Each gated call answers `None` (or `false`) when `DMACON` has the channel's
 //! enable bit or the master `DMAEN` clear — a disabled channel moves no data
 //! and **does not advance its pointer**.
@@ -142,6 +150,122 @@ pub struct BeamPosition {
     pub lof: bool,
 }
 
+/// `D15`–`D0`, the sixteen lines every chip on the board shares.
+///
+/// # What it is for
+///
+/// Two hundred of the custom registers are write-only, and Appendix B does not
+/// say what a read of one answers. On the board it is not a register that
+/// answers at all: no chip drives `D15`–`D0` during that cycle, so the
+/// processor latches the lines as they are. Appendix C (p. 299), explaining
+/// how to tell an 8362 from an 8373 by the `DENISEID` an 8362 does not have,
+/// calls that "whatever value is left over on the bus from the last cycle".
+///
+/// So this is the word the last cycle left, and the rule is which cycles
+/// leave one:
+///
+/// | cycle | drives `D15`–`D0`? |
+/// | --- | --- |
+/// | Agnus's DMA — bitplane, sprite, copper, blitter, disk, audio | **yes**, the word transferred ([`ChipDma::peek`], [`ChipDma::poke`]) |
+/// | a processor or copper **write** into `$DFF000` | **yes**, the word written |
+/// | a **read** of a register a chip answers | **yes**, the word that chip drove |
+/// | a **refresh** slot | no, and it leaves the word alone |
+/// | a **read nothing answers** | no, and the word does not survive it |
+///
+/// The first three are the board: chapter 6, *Blitter Operations and System
+/// DMA*, gives Agnus every chip-memory slot and hands the 68000 the rest, and
+/// the A500's schematic (#312511-02 sheet 2) puts the processor's own data on
+/// these same sixteen lines through `U10`/`U12` — `src/dev/amiga/custom.rs`
+/// cites both in full.
+///
+/// # What the manual does not say, and what is chosen here
+///
+/// It describes the arbitration, not the bus's electrical state, and it gives
+/// no value for an undriven bus. Three things below are therefore inference
+/// or choice, and are marked as such:
+///
+/// * **A refresh slot leaves the previous word.** Chapter 6 gives memory
+///   refresh its own slots at the start of every line and Appendix B gives it
+///   `REFPTR`, but a DRAM refresh is a `RAS`-only cycle: `CAS` stays high and
+///   the DRAMs never enable their data outputs (any 41256-class data sheet's
+///   "RAS-only refresh"). No data crosses the bus, so nothing there changes.
+///   In this model that is not a rule at all — a refresh slot simply never
+///   calls [`drive`](Self::drive).
+/// * **A cycle nothing drives does not leave the word behind.** This is the
+///   part that matters, and it is an *inference from the detection method
+///   Appendix C documents*: if an absent register answered with a dependable
+///   value, reading it twice would be indistinguishable from reading a real
+///   one, and Commodore's own test — which Kickstart 2.04 makes, seventeen
+///   reads of `$DFF07C` in a row, watched black-box — could not work. A read
+///   nothing answers opens the board's buffers onto sixteen undriven lines;
+///   the processor latches what was there and the lines are left floating.
+///   So [`take`](Self::take) answers with the word and clears it. This is
+///   different from a refresh slot, which never selects the data path at all.
+/// * **An undriven bus reads zero.** No manual gives a value, and a real one
+///   decays to something nobody specified. Zero is a choice, the same one
+///   `tests/amiga_a500_unassigned.rs` records for an empty address.
+///
+/// A board with no DMA engine at all has no [`ChipDataBus`] and reads zero
+/// throughout;
+/// [`CustomBus::unclaimed`](crate::dev::amiga::custom::CustomBus::unclaimed)
+/// counts every read that fell back to any of this.
+///
+/// # What is not modelled
+///
+/// **A processor access to chip RAM.** On the board it is a chip-bus cycle
+/// like any other — Agnus arbitrates it and the A500's `U10`/`U12` buffers put
+/// the word on these same lines — so on real hardware `MOVE.W $40000,D0`
+/// leaves that word here. In this model chip RAM is reached through the
+/// ordinary address space (`amiga.gary` and a `ram` object), which knows
+/// nothing about the custom chips, so those cycles pass without driving. The
+/// consequence is narrow: a guest that reads a write-only register straight
+/// after touching chip RAM gets the previous *register or DMA* word instead of
+/// that one. Closing it means a store on the hottest path in the machine —
+/// every processor access to chip RAM — for a value only an unanswered
+/// register read can see.
+#[derive(Debug, Default)]
+pub struct ChipDataBus {
+    word: AtomicU64,
+}
+
+impl ChipDataBus {
+    /// A bus nothing has driven yet.
+    #[must_use]
+    pub const fn new() -> ChipDataBus {
+        ChipDataBus {
+            word: AtomicU64::new(0),
+        }
+    }
+
+    /// A chip-bus cycle drove `word` onto `D15`–`D0`.
+    #[inline]
+    pub fn drive(&self, word: u16) {
+        self.word.store(u64::from(word), Ordering::Relaxed);
+    }
+
+    /// What is on the lines, without touching them: a debugger's look, and
+    /// what a test asserts on.
+    #[must_use]
+    #[inline]
+    pub fn word(&self) -> u16 {
+        self.word.load(Ordering::Relaxed) as u16
+    }
+
+    /// A cycle in which nothing drove: answer with what was on the lines and
+    /// leave them floating. See the type's documentation for why this is not
+    /// the same as a refresh slot.
+    #[must_use]
+    #[inline]
+    pub fn take(&self) -> u16 {
+        self.word.swap(0, Ordering::Relaxed) as u16
+    }
+
+    /// Back to power-on: nothing has been driven.
+    pub fn clear(&self) {
+        self.word.store(0, Ordering::Relaxed);
+    }
+}
+
 /// An audio channel's two addresses.
 #[derive(Debug, Default)]
 struct Audio {
@@ -177,6 +301,10 @@ pub struct ChipDma {
     refused: AtomicU64,
     /// Transfers that addressed something chip RAM did not answer.
     faults: AtomicU64,
+    /// `D15`–`D0`, as the last cycle left them. Shared with
+    /// [`CustomBus`](crate::dev::amiga::custom::CustomBus), which answers a
+    /// read of a write-only register out of it.
+    data: Arc<ChipDataBus>,
 }
 
 impl fmt::Debug for ChipDma {
@@ -187,6 +315,7 @@ impl fmt::Debug for ChipDma {
             .field("disk", &self.disk_pointer())
             .field("beam", &self.beam())
             .field("refused", &self.refused())
+            .field("data", &self.data.word())
             .finish_non_exhaustive()
     }
 }
@@ -213,7 +342,15 @@ impl ChipDma {
             field: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             faults: AtomicU64::new(0),
+            data: Arc::new(ChipDataBus::new()),
         }
+    }
+
+    /// The chip data bus these channels drive, for `amiga.custom` to answer a
+    /// read of a write-only register out of. Agnus hands it over at bind.
+    #[must_use]
+    pub fn data_bus(&self) -> Arc<ChipDataBus> {
+        Arc::clone(&self.data)
     }
 
     /// Point the channels at chip RAM. Agnus calls this from its bind.
@@ -261,6 +398,12 @@ impl ChipDma {
 
     /// Read one big-endian word of chip RAM at `addr`, masked to the bits Agnus
     /// drives. Unmapped chip addresses read as zero and are counted.
+    ///
+    /// This **is** a chip-bus cycle: the word read is left on
+    /// [`ChipDataBus`], where a read of a write-only custom register finds it.
+    /// A cycle that faulted transferred nothing and leaves the bus alone. A
+    /// debugger wanting to look at chip RAM without driving the bus reads the
+    /// address space with [`MemAttrs::DEBUG`] instead.
     #[must_use]
     pub fn peek(&self, space: Option<&AddressSpace>, addr: u32) -> u16 {
         let Some(space) = space else {
@@ -275,10 +418,13 @@ impl ChipDma {
             self.faults.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
-        u16::from_be_bytes(word)
+        let word = u16::from_be_bytes(word);
+        self.data.drive(word);
+        word
     }
 
-    /// Write one big-endian word of chip RAM, masked like [`peek`](Self::peek).
+    /// Write one big-endian word of chip RAM, masked like [`peek`](Self::peek),
+    /// and leave it on the chip data bus.
     pub fn poke(&self, space: Option<&AddressSpace>, addr: u32, value: u16) {
         let Some(space) = space else {
             return;
@@ -289,7 +435,9 @@ impl ChipDma {
             .is_err()
         {
             self.faults.fetch_add(1, Ordering::Relaxed);
+            return;
         }
+        self.data.drive(value);
     }
 
     /// Read a word for `channel`, or `None` if `DMACON` has it disabled.
@@ -455,20 +603,26 @@ impl ChipDma {
     // -- snapshot ------------------------------------------------------------
 
     /// The guest-visible part, for Agnus's snapshot: `DMACON`, the four audio
-    /// locations and pointers, and `DSKPT`.
-    pub fn state(&self) -> [u32; 10] {
-        let mut out = [0u32; 10];
+    /// locations and pointers, `DSKPT`, and the word on the chip data bus.
+    ///
+    /// The bus word is **state and not derived**: a guest can read it back
+    /// through any write-only custom register, and nothing else in the
+    /// snapshot determines it — it is a fact about a cycle that has already
+    /// happened.
+    pub fn state(&self) -> [u32; 11] {
+        let mut out = [0u32; 11];
         out[0] = self.dmacon() as u32;
         for (ch, audio) in self.audio.iter().enumerate() {
             out[1 + ch * 2] = audio.location.load(Ordering::Relaxed) as u32;
             out[2 + ch * 2] = audio.pointer.load(Ordering::Relaxed) as u32;
         }
         out[9] = self.disk_pointer();
+        out[10] = u32::from(self.data.word());
         out
     }
 
     /// Put back what [`state`](Self::state) took.
-    pub fn restore(&self, state: [u32; 10]) {
+    pub fn restore(&self, state: [u32; 11]) {
         self.set_dmacon(state[0] as u16);
         for (ch, audio) in self.audio.iter().enumerate() {
             audio
@@ -479,11 +633,13 @@ impl ChipDma {
                 .store(u64::from(state[2 + ch * 2]), Ordering::Relaxed);
         }
         self.disk.store(u64::from(state[9]), Ordering::Relaxed);
+        self.data.drive(state[10] as u16);
     }
 
-    /// Back to power-on: every channel disabled, every pointer zero.
+    /// Back to power-on: every channel disabled, every pointer zero, nothing
+    /// on the data bus.
     pub fn reset(&self) {
-        self.restore([0; 10]);
+        self.restore([0; 11]);
         self.refused.store(0, Ordering::Relaxed);
         self.faults.store(0, Ordering::Relaxed);
     }

@@ -183,7 +183,7 @@ byte lane. One decoder per chip, because the A12/A13 selects never pick both.
 
 | | Why it is open | What happens instead |
 | --- | --- | --- |
-| **Reading a write-only custom register** | The manual does not say | The last word driven onto the bus — **a placeholder** that Agnus's DMA cycles will replace; `CustomBus::unclaimed` counts every use |
+| **Reading a write-only custom register** | Appendix B says which registers are readable and nothing about the rest; chapter 6 describes the arbitration, not the bus's electrical state | The word the last chip-bus cycle left on `D15`–`D0` (`dma::ChipDataBus`), **once**: that read is itself a cycle nothing drove, so it takes the word and leaves the lines floating. Agnus's DMA, a register write and a register read a chip answers all drive them; a **refresh** slot is `RAS`-only and transfers no data, so it changes nothing. A board with no DMA engine reads zero. `CustomBus::unclaimed` counts every use. See `dma.rs` for which parts are inference and which are choice |
 | **`$DFF200`–`$DFFFFF`** | Appendix D gives a 4 KiB window, the table fills 512 bytes, and whether the rest mirrors is not stated | Only 512 bytes mapped; the rest floats like any empty address. `mirror(custom)` is a one-word change |
 | **A0–A7 in a CIA window** | The notation gives one hex digit of register select; nothing says whether the low byte is decoded | Not decoded — `$BFE003` is register 0 |
 
@@ -412,9 +412,10 @@ So, in `amiga.custom`:
 * **A byte read** is a full word read of the register, with all of a word
   read's side effects (the chip cannot know only half was wanted), and the
   processor keeps the upper byte at an even address or the lower at an odd one.
-  `$DF_F07D` on this board therefore answers the low half of the floating bus,
-  which is Appendix C's "whatever value is left over on the bus from the last
-  cycle" (p. 299).
+  `$DF_F07D` on this board therefore answers the low half of the chip data
+  bus, which is Appendix C's "whatever value is left over on the bus from the
+  last cycle" (p. 299) — Agnus's last DMA cycle, not the processor's own last
+  write.
 * **A byte write** stores **the same byte in both halves** of the register,
   at either address: `MOVE.B #$20,$DFF09B` writes `$2020`. No half is kept.
 * A word at an odd offset, and anything wider than a word, are still refused.
@@ -754,7 +755,7 @@ count or a pin this model has.
 
 | | |
 | --- | --- |
-| `DENISEID` | `$FFFC`: "$FC in the lower 8 bits"; the reserved upper byte reads as ones here. An 8362 still answers with the floating bus |
+| `DENISEID` | `$FFFC`: "$FC in the lower 8 bits"; the reserved upper byte reads as ones here. An 8362 still answers with the chip data bus, which moves with the DMA |
 | SuperHires | `SHRES`: 35 ns pixels, two to a high-resolution one. Colours through Appendix C's table: register *n* holds colour `n & 3` in the top two bits of each gun and colour `n >> 2` in the bottom two, so a pair of pixels (*a*, *b*) is register `a | b << 2`, *a* through the top bits and *b* through the bottom; a two-bit gun is shown repeated into four. Sprites the same way through the upper sixteen |
 | 70 ns sprites | `SPRxCTL`'s `SHSH1` places a sprite half a low-resolution pixel later in SuperHires |
 | `KILLEHB` | Six planes without half-brite |
@@ -825,21 +826,30 @@ mem" (the A500's "287248": Exec found the megabyte), and its ScreenMode window
 lists PAL:Hires, PAL:SuperHires, PAL:Hires-Interlaced and
 PAL:SuperHires-Interlaced with **"Max Size 16368 x 16384"** — the big blits,
 "provided for all graphics functions if the ECS Agnus is present". The A500's
-window is the same but for **"Max Size 1008 x 1024"**, the original blitter's.
-Productivity is not on either list; the session installs no monitor driver,
-and whether the stock disk would bring one up is not what it checks.
+window lists **PAL:Hires and PAL:Hires-Interlaced only**, and **"Max Size
+1008 x 1024"**, the original blitter's. Productivity is not on either list;
+the session installs no monitor driver, and whether the stock disk would bring
+one up is not what it checks.
 
-**A finding the A500's list exposes.** It offers SuperHires too, which a real
-A500 would not, and its `ChipRevBits0` is `$02`: `GFXF_HR_DENISE` without
-`GFXF_HR_AGNUS`. Watched black-box, Kickstart 2.04 reads `DENISEID` seventeen
-times; an 8362 answers with the floating chip bus, as Appendix C says, and
-`amiga.custom`'s floating word — its documented placeholder, the last word
-written — is `$8001` every time. A stable answer is what an 8373 gives. The
-real bus holds "whatever value is left over on the bus from the last cycle",
-which DMA keeps changing. Replacing the placeholder with the last DMA cycle's
-word is `custom.rs`'s job, and has to be shown to leave the A500's goldens
-alone; until then `tests/amiga_a500plus.rs` pins the `$02` with this
-explanation rather than hiding it.
+**How Kickstart tells the two Denises apart, and what it cost to get right.**
+Watched black-box, Kickstart 2.04 reads `$DFF07C` **seventeen times in a row**
+with no other access between them. That is a stability test, and it is the one
+Appendix C sets up: an 8373 answers `$FFFC` every time, while on an 8362 "the
+original Denise (8362) does not have this register, so whatever value is left
+over on the bus from the last cycle will be there" — sixteen lines nobody is
+driving, which do not read the same twice.
+
+While `amiga.custom` kept a placeholder word — the last word *written*, and so
+stable — graphics.library saw seventeen equal answers, concluded there was an
+8373, and set `GFXF_HR_DENISE`: the A500's `ChipRevBits0` came out `$02` and
+its ScreenMode offered SuperHires modes an 8362 cannot produce. Modelling the
+lines was not enough on its own, twice over: a word that only Agnus's DMA
+drove was still `$0000` at that point in the boot, seventeen times; and Denise
+*claimed* `$07C` and answered with the lines, which drove the same value
+straight back onto them. Both are fixed by saying what the hardware says — an
+8362 does not drive `$07C` at all (`CustomChip::drives`), and a read nothing
+drives takes the lines rather than leaving them. The A500 now reports `$00`,
+neither ECS chip; the A500+ still reports `$03`.
 
 And ROM-free, a hand-assembled program programs a productivity beam
 (`HTOTAL = 113`, `VTOTAL = 524`, blanking to 90 counts × 480 lines) and a

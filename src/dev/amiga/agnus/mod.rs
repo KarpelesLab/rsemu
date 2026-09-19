@@ -171,7 +171,7 @@ use super::regs::{ChipId, Reg};
 pub const CLASS_NAME: &str = "amiga.agnus";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// The vertical sync output.
 pub const VSYNC_PIN: &str = "vsync";
@@ -1425,6 +1425,10 @@ impl Agnus {
         bus.attach(Arc::new(Registers {
             shared: Arc::clone(&self.shared),
         }))?;
+        // Agnus is the chip that drives `D15`–`D0`, so it is the chip that
+        // answers a read of a write-only register: hand the register space the
+        // bus this chip's DMA cycles leave their words on (`dma::ChipDataBus`).
+        bus.attach_data_bus(self.shared.dma.data_bus());
         *self.shared.bus.lock() = Some(Arc::clone(bus));
         Ok(())
     }
@@ -1636,7 +1640,7 @@ impl Device for Agnus {
                 ..State::for_part(self.shared.rev, self.shared.std)
             };
             loaded.load(r)?;
-            let mut dma_state = [0u32; 10];
+            let mut dma_state = [0u32; 11];
             for v in &mut dma_state {
                 *v = r.read_u32()?;
             }

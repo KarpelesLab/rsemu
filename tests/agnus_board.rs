@@ -50,6 +50,9 @@ const BLTSIZE: u64 = CUSTOM + 0x058;
 const COP1LCH: u64 = CUSTOM + 0x080;
 const COPJMP1: u64 = CUSTOM + 0x088;
 const DMACON: u64 = CUSTOM + 0x096;
+/// `BPL1MOD`, at `$108`: Agnus's, and **write-only** (Appendix B). Reading it
+/// is the access that has nothing to answer it.
+const BPL1MOD: u64 = CUSTOM + 0x108;
 
 /// CIA-A answers at `$BFEr01` and CIA-B at `$BFDr00` (8520 appendix).
 const CIA_A: u64 = 0xBF_E001;
@@ -324,4 +327,137 @@ fn the_board_runs_the_same_in_one_span_or_many() {
         parts.state_hash().expect("hashable"),
         "run_for is additive on this board too (ROADMAP.md §11.6)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the chip data bus
+// ---------------------------------------------------------------------------
+
+/// Reading a write-only register answers with the word the last chip-bus cycle
+/// left on `D15`–`D0` — **once**.
+///
+/// Appendix B says which registers are readable and nothing about the rest;
+/// Appendix C (p. 299), describing an 8362's absent `DENISEID`, calls the
+/// answer "whatever value is left over on the bus from the last cycle" and
+/// makes reading it the way to tell an 8362 from an 8373. Chapter 6, *Blitter
+/// Operations and System DMA*, says whose cycles those are: Agnus arbitrates
+/// every access to chip memory and hands the 68000 what the channels do not
+/// want.
+///
+/// Here the last cycle is a **blitter D write of a word this test chose**, and
+/// `BPL1MOD` — Agnus's own, write-only, so the chip that owns it is present
+/// and still cannot answer — reads back exactly that word. The *second* read
+/// gets nothing: that read was itself a cycle in which nothing drove the
+/// lines, which is what makes Appendix C's test work.
+#[test]
+fn a_write_only_register_reads_back_the_last_cycles_word_once() {
+    let mut m = boot("agnus.floating");
+    clear_overlay(&m);
+    let bus = custom_bus(&m);
+
+    // Nothing has run a chip-bus cycle yet, so nothing is on the lines.
+    assert_eq!(bus.floating(), 0, "no cycle has happened");
+    assert_eq!(peek(&m, BPL1MOD), 0x0000);
+    assert_eq!(bus.unclaimed(), 1, "the read fell through and was counted");
+
+    // One word of source, and a one-word blit that copies it: A is read, D is
+    // written, and the D write is the last cycle of the blit. Every register
+    // write below puts its own word on the lines on the way past; the blit is
+    // what leaves the last one.
+    const WORD: u16 = 0xa55a;
+    poke(&m, 0x2000, WORD);
+    poke(&m, DMACON, SETCLR | DMAEN | BLTEN);
+    poke(&m, BLTCON0, 0x0900 | 0xf0); // USEA, USED, D = A
+    poke(&m, BLTCON1, 0);
+    poke(&m, BLTAFWM, 0xffff);
+    poke(&m, BLTALWM, 0xffff);
+    poke_long(&m, BLTAPTH, 0x2000);
+    poke_long(&m, BLTDPTH, 0x3000);
+    poke(&m, BLTSIZE, (1 << 6) | 1);
+    m.run_for(GlobalTime::from_nanos(1_000_000))
+        .expect("it runs");
+
+    // The word the blitter moved is what an unanswered read latches...
+    assert_eq!(bus.floating(), WORD, "the blitter's D write");
+    assert_eq!(peek(&m, BPL1MOD), WORD);
+    // ...and that read left the lines floating, so the next one gets nothing.
+    assert_eq!(peek(&m, BPL1MOD), 0x0000, "a second read is not the first");
+    assert_eq!(bus.unclaimed(), 3);
+
+    // A register a chip *does* answer drives the lines, so the next
+    // write-only read finds that chip's word. `DMACONR` is Agnus's here.
+    let dmaconr = peek(&m, DMACONR);
+    assert_eq!(dmaconr, DMAEN | BLTEN, "the channels this test enabled");
+    assert_eq!(peek(&m, BPL1MOD), dmaconr);
+    // And a byte read keeps the half its strobe selects of that whole word.
+    poke(&m, CUSTOM + 0x100, WORD); // BPLCON0: the write is the cycle
+    assert_eq!(peek_byte(&m, BPL1MOD), (WORD >> 8) as u8);
+    poke(&m, CUSTOM + 0x100, WORD);
+    assert_eq!(peek_byte(&m, BPL1MOD + 1), WORD as u8);
+
+    assert_eq!(peek(&m, 0x3000), WORD, "and the blit did copy it");
+}
+
+/// A refresh slot transfers no data, so the lines keep what the last cycle
+/// left, however long it goes on.
+///
+/// Chapter 6 gives memory refresh its own slots at the start of every line and
+/// Appendix B gives it `REFPTR`, but refresh is a `RAS`-only DRAM cycle: `CAS`
+/// is never asserted and the DRAMs never enable their outputs, so no data
+/// crosses the bus. With every `DMACON` channel off, refresh is the only DMA a
+/// real Agnus still runs — and after thirty PAL lines of it the lines still
+/// hold what the last cycle put there. (The manual does not say this; it is
+/// the DRAM cycle's own definition, and it is marked as an inference in
+/// `dev::amiga::dma::ChipDataBus`.)
+///
+/// This is the other half of the rule the test above shows: a cycle that
+/// drives nothing *and selects nothing* changes nothing, while a read that
+/// nothing answers opens the buffers onto the lines and leaves them floating.
+#[test]
+fn refresh_slots_transfer_no_data_and_leave_the_word_alone() {
+    let mut m = boot("agnus.refresh");
+    clear_overlay(&m);
+    let bus = custom_bus(&m);
+
+    const WORD: u16 = 0x3c0f;
+    poke(&m, 0x2000, WORD);
+    poke(&m, DMACON, SETCLR | DMAEN | BLTEN);
+    poke(&m, BLTCON0, 0x0900 | 0xf0);
+    poke(&m, BLTCON1, 0);
+    poke(&m, BLTAFWM, 0xffff);
+    poke(&m, BLTALWM, 0xffff);
+    poke_long(&m, BLTAPTH, 0x2000);
+    poke_long(&m, BLTDPTH, 0x3000);
+    poke(&m, BLTSIZE, (1 << 6) | 1);
+    m.run_for(GlobalTime::from_nanos(1_000_000))
+        .expect("it runs");
+    assert_eq!(bus.floating(), WORD);
+
+    // Every channel off. That write is itself a cycle and leaves its own word
+    // on the lines, which is what the rest of this test watches.
+    const OFF: u16 = DMAEN | BLTEN | COPEN;
+    poke(&m, DMACON, OFF);
+    assert_eq!(bus.floating(), OFF);
+
+    // Two milliseconds is thirty PAL lines, so a hundred and twenty refresh
+    // slots and nothing else.
+    m.run_for(GlobalTime::from_nanos(2_000_000))
+        .expect("it runs");
+    assert_eq!(bus.floating(), OFF, "refresh drove nothing");
+
+    // A debugger's read is not a cycle at all: it neither takes the word nor
+    // moves the counter, however many times it is made. A guest's read does
+    // both, which is the other half of the `MemAttrs::debug` contract.
+    let counted = bus.unclaimed();
+    let space = m.space("mem").expect("the memory space");
+    for _ in 0..3 {
+        let seen = space
+            .read(BPL1MOD, Width::U16, MemAttrs::DEBUG)
+            .expect("a word") as u16;
+        assert_eq!(seen, OFF, "a debugger sees what the guest would");
+    }
+    assert_eq!(bus.unclaimed(), counted, "and is not counted");
+    assert_eq!(peek(&m, BPL1MOD), OFF, "the guest's read gets it");
+    assert_eq!(bus.unclaimed(), counted + 1, "and is counted");
+    assert_eq!(bus.floating(), 0, "and left the lines floating");
 }

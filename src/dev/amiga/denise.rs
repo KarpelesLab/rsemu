@@ -122,7 +122,7 @@
 //! | `DMACON` | latched only — the manual does not say what Denise does with it |
 //! | `BPL1DAT`–`BPL6DAT` | latched only; the bitplane words arrive through [`Video::line`] |
 //! | `STREQU`, `STRVBL`, `STRHOR`, `STRLONG` | accepted and ignored; [`Video::line`] and [`Video::field`] carry what they mean |
-//! | `BPLCON3`, `DIWHIGH`, `DENISEID` | ECS registers. On an 8362 (`revision = "ocs"`, the default) the first two latch and `DENISEID` reads the floating bus ("The original Denise (8362) does not have this register", Appendix C). On an 8373 (`revision = "ecs"`) see the next rows |
+//! | `BPLCON3`, `DIWHIGH`, `DENISEID` | ECS registers. On an 8362 (`revision = "ocs"`, the default) the first two latch and `DENISEID` is not driven at all ("The original Denise (8362) does not have this register", Appendix C), so the bus answers off the chip data lines and leaves them floating — which is what makes Kickstart's seventeen-read stability test come out OCS. On an 8373 (`revision = "ecs"`) see the next rows |
 //! | `DENISEID` (8373) | [`ECS_DENISEID`]: "$FC in the lower 8 bits" |
 //! | `BPLCON0` (8373) | `SHRES` modelled: SuperHires, two pixels to a high-resolution one, colours through Appendix C's register encoding (`shr_colour`); `ENBPLCN3` modelled; `BPLHWRM`, `SPRHWRM` latched only |
 //! | `BPLCON2` (8373) | `KILLEHB` modelled; `ZDBPSEL`, `ZDBPEN`, `ZDCTEN` latched only — genlock, and there is no genlock |
@@ -1767,15 +1767,26 @@ impl CustomChip for Video {
             JOY0DAT => self.state.lock().joy[0],
             JOY1DAT => self.state.lock().joy[1],
             DENISEID if self.rev == Revision::Ecs => ECS_DENISEID,
-            DENISEID => {
-                // "The original Denise (8362) does not have this register, so
-                // whatever value is left over on the bus from the last cycle
-                // will be there" (Appendix C).
-                let bus = self.bus.lock().upgrade();
-                bus.map_or(0, |b| b.floating())
-            }
+            // An 8362 never gets here: `drives` below tells the bus this part
+            // has no such register, and the bus answers off the chip data
+            // lines instead.
+            DENISEID => 0,
             _ => 0,
         }
+    }
+
+    /// An 8362 does not drive `DENISEID`: "The original Denise (8362) does not
+    /// have this register, so whatever value is left over on the bus from the
+    /// last cycle will be there" (Appendix C, p. 299).
+    ///
+    /// Saying so here rather than answering with the bus is what makes that
+    /// sentence an *observable* difference. A chip's answer is driven back
+    /// onto the lines, so a part that read them and returned what it found
+    /// would hold them steady — and a steady answer is exactly what an 8373
+    /// gives. Not driving leaves the read a cycle nothing drove, which is what
+    /// Commodore's own detection relies on.
+    fn drives(&self, reg: &Reg) -> bool {
+        reg.offset != DENISEID || self.rev == Revision::Ecs
     }
 
     fn write(&self, reg: &Reg, value: u16, from: Origin) {

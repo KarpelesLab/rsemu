@@ -124,17 +124,31 @@
 //!
 //! # What a read of a write-only register answers
 //!
-//! **This is a placeholder and is the one piece of invented behaviour in this
-//! file.** The appendix says which registers are readable and does not say what
-//! the other two hundred do when read. On real hardware the answer is whatever
-//! Agnus last drove onto the chip data bus, which is a function of the DMA
-//! cycle that just happened — and there is no DMA here yet.
+//! The appendix says which registers are readable and does not say what the
+//! other two hundred do when read. Nothing answers: no chip drives `D15`–`D0`
+//! in that cycle, and the processor latches the lines as they are. Appendix C
+//! (p. 299) calls that "whatever value is left over on the bus from the last
+//! cycle", and makes it the documented way to tell an 8362 — which has no
+//! `DENISEID` — from an 8373, which does.
 //!
-//! So [`CustomBus`] keeps a single `floating` word, updated by every write that
-//! reaches it, and answers an unreadable or unclaimed address with that. It is
-//! deterministic, it is snapshot-carried, and it is wrong in a way that will
-//! only become visible once Agnus drives real cycles. [`CustomBus::unclaimed`]
-//! counts how often it has been relied on, so a board can assert it is zero.
+//! So [`CustomBus`] invents nothing and keeps nothing of its own. It holds the
+//! [`ChipDataBus`] Agnus's DMA drives, handed over at bind, drives it from
+//! this side too — every write, and every read a chip answers, is a cycle that
+//! puts a word on those sixteen lines — and answers an unreadable or unclaimed
+//! address out of it. A read **nothing** answers is a cycle nothing drove, so
+//! it takes the word rather than leaving it: the lines are floating
+//! afterwards, and a second such read in a row does *not* get the same answer.
+//! That is the whole point of Appendix C's test, and it is why a placeholder
+//! that answered stably made Kickstart 2.04 find an ECS Denise on an A500.
+//! [`ChipDataBus`]'s own documentation has the full rule and marks what in it
+//! is inference and what is choice.
+//!
+//! [`CustomBus::unclaimed`] counts how often that fall-through has been relied
+//! on, so a board can assert it is zero.
+//!
+//! A **debug** access is not a cycle: it drives nothing, takes nothing and is
+//! not counted. A debugger's read of a write-only register shows the guest
+//! exactly what it would have latched and leaves the lines as it found them.
 //!
 //! # Sources
 //!
@@ -166,13 +180,14 @@ use crate::core::value::{Endian, Width};
 use crate::machine::realize::Instance;
 use crate::machine::validate::ClassSchema;
 
+use super::dma::ChipDataBus;
 use super::regs::{self, ChipId, Reg, SPAN, copper_may_write, ecs_copper_may_write};
 
 /// The class name a machine file writes.
 pub const CLASS_NAME: &str = "amiga.custom";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // who is driving the access
@@ -284,11 +299,25 @@ pub trait CustomChip: Send + Sync + fmt::Debug {
 
     /// Read the register the appendix calls `reg.name`.
     ///
-    /// Only ever called for a register marked `R` that this chip owns. Where
-    /// two chips own one readable register the results are **or**ed, so a chip
-    /// must return zeroes in the bits it does not drive rather than a whole
-    /// word of its own guess.
+    /// Only ever called for a register marked `R` that this chip owns **and
+    /// [`drives`](Self::drives)**. Where two chips own one readable register
+    /// the results are **or**ed, so a chip must return zeroes in the bits it
+    /// does not drive rather than a whole word of its own guess.
     fn read(&self, reg: &Reg, from: Origin) -> u16;
+
+    /// Whether this part drives `D15`–`D0` at all when `reg` is read.
+    ///
+    /// The appendix's table is the same for every part; a *part* can be
+    /// missing a register the table gives its chip. An 8362 has no `DENISEID`
+    /// — "The original Denise (8362) does not have this register" (Appendix C,
+    /// p. 299) — so it answers by not driving, and the bus falls through to
+    /// the chip data lines, which is what makes Commodore's own test work.
+    ///
+    /// The default is `true`: a chip drives every readable register it owns.
+    /// Only consulted on a read.
+    fn drives(&self, _reg: &Reg) -> bool {
+        true
+    }
 
     /// Write the register the appendix calls `reg.name`.
     ///
@@ -307,30 +336,53 @@ pub trait CustomChip: Send + Sync + fmt::Debug {
 /// Held by `amiga.custom`, published as [`ExportId::CUSTOM_BUS`], and reached
 /// by the address space on one side and by the copper on the other.
 pub struct CustomBus {
-    /// The attached chips, at most one per [`ChipId`] bit.
+    /// The chips and the sixteen data lines, behind **one** lock.
     ///
-    /// A `Mutex` and not an `RwLock` because it is written once per machine at
-    /// bind and read on every access; the read path clones the handful of
-    /// `Arc`s it needs and releases the lock **before** calling into any chip,
+    /// Both are written once per machine at bind and read on every access, and
+    /// keeping them together is what holds an access to one lock acquisition:
+    /// [`wiring_for`](Self::wiring_for) takes it, clones out the handful of
+    /// `Arc`s the access needs, and releases it **before** any chip is called,
     /// which is the re-entrancy contract (`CLAUDE.md`, *Concurrency*) — a chip
     /// write can reach the copper, which writes here again.
-    chips: Mutex<Vec<Arc<dyn CustomChip>>>,
-    /// The last word driven onto the chip data bus, as far as this model knows
-    /// it. See the module documentation: a placeholder for Agnus's DMA.
-    floating: AtomicU64,
-    /// How many accesses have fallen through to [`floating`](Self::floating) —
-    /// an unclaimed offset, an unreadable register, or a register whose owner
-    /// is not in this build.
+    ///
+    /// A `Mutex` and not an `RwLock` because the critical section is a `Vec`
+    /// filter and two `Arc` clones.
+    wiring: Mutex<Wiring>,
+    /// How many accesses have fallen through to the chip data bus — an
+    /// unclaimed offset, an unreadable register, or a register whose owner is
+    /// not in this build.
     unclaimed: AtomicU64,
     /// How many copper writes the `*`/`~` columns have refused.
     refused: AtomicU64,
 }
 
+/// What a machine file wired into this bus: the chips, and the data lines they
+/// all share.
+///
+/// **Wiring, not guest state** ([`Device::export`]'s contract): it survives a
+/// reset and is not snapshotted. The *word* on those lines is guest state, and
+/// belongs to the chip that drives it.
+#[derive(Debug, Default)]
+struct Wiring {
+    /// The attached chips, at most one per [`ChipId`] bit, in Appendix B's
+    /// Agnus-Denise-Paula order.
+    chips: Vec<Arc<dyn CustomChip>>,
+    /// `D15`–`D0`, driven by Agnus's DMA and by this bus. `None` on a board
+    /// with no DMA engine, which runs no chip-bus cycles at all.
+    data: Option<Arc<ChipDataBus>>,
+}
+
 impl fmt::Debug for CustomBus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Taken and released *before* the builder, not inside it: a guard in a
+        // method chain lives to the end of the statement.
+        let (chips, floating) = {
+            let w = self.wiring.lock();
+            (w.chips.len(), w.data.as_ref().map_or(0, |d| d.word()))
+        };
         f.debug_struct("CustomBus")
-            .field("chips", &self.chips.lock().len())
-            .field("floating", &self.floating.load(Ordering::Relaxed))
+            .field("chips", &chips)
+            .field("floating", &floating)
             .field("unclaimed", &self.unclaimed.load(Ordering::Relaxed))
             .field("refused", &self.refused.load(Ordering::Relaxed))
             .finish()
@@ -343,8 +395,7 @@ impl CustomBus {
         CustomBus {
             // LEAF: taken inside an MMIO handler, released before any chip is
             // called, and holding nothing else.
-            chips: Mutex::with_rank(LockRank::LEAF, Vec::new()),
-            floating: AtomicU64::new(0),
+            wiring: Mutex::with_rank(LockRank::LEAF, Wiring::default()),
             unclaimed: AtomicU64::new(0),
             refused: AtomicU64::new(0),
         }
@@ -372,42 +423,58 @@ impl CustomBus {
                 ),
             });
         }
-        let mut chips = self.chips.lock();
-        if chips.iter().any(|c| c.which() == which) {
+        let mut wiring = self.wiring.lock();
+        if wiring.chips.iter().any(|c| c.which() == which) {
             return Err(Error::Config {
                 at: String::from(CLASS_NAME),
                 message: format!("{which} is already attached to this custom-chip space"),
             });
         }
-        chips.push(chip);
+        wiring.chips.push(chip);
         // Agnus, then Denise, then Paula — the appendix's own order, so a
         // register two chips latch is delivered in a fixed sequence rather than
         // in the order the machine file happened to declare them
         // (`CLAUDE.md`, *Determinism*).
-        chips.sort_by_key(|c| c.which());
+        wiring.chips.sort_by_key(|c| c.which());
         Ok(())
     }
 
     /// Which chips are attached, as a set.
     #[must_use]
     pub fn attached(&self) -> ChipId {
-        self.chips
+        self.wiring
             .lock()
+            .chips
             .iter()
             .fold(ChipId::NONE, |set, c| set.union(c.which()))
     }
 
-    /// The last word this model believes was driven on the chip data bus.
-    #[must_use]
-    pub fn floating(&self) -> u16 {
-        self.floating.load(Ordering::Relaxed) as u16
+    /// Give the register space the chip data bus a DMA engine drives.
+    ///
+    /// Agnus calls this from its own bind, with the bus its [`ChipDma`] holds.
+    /// It is **wiring, not guest state**: it survives a reset and is not
+    /// snapshotted, and the word itself belongs to the chip that drives it.
+    ///
+    /// [`ChipDma`]: super::dma::ChipDma
+    pub fn attach_data_bus(&self, data: Arc<ChipDataBus>) {
+        self.wiring.lock().data = Some(data);
     }
 
-    /// How many accesses have fallen through to the floating word.
+    /// The word on `D15`–`D0`, looked at without touching it: what a guest
+    /// read of a write-only register would be answered with, and what a
+    /// **debugger's** read is answered with. Zero on a board with no DMA
+    /// engine, which runs no chip-bus cycles.
+    #[must_use]
+    pub fn floating(&self) -> u16 {
+        self.wiring.lock().data.as_ref().map_or(0, |d| d.word())
+    }
+
+    /// How many accesses have fallen through to the chip data bus.
     ///
     /// A board with every chip present and a guest that only touches real
     /// registers leaves this at zero; anything else is a measurement of how
-    /// much of the chipset is still missing.
+    /// much of the chipset is still missing, or of a guest reading a
+    /// write-only register.
     #[must_use]
     pub fn unclaimed(&self) -> u64 {
         self.unclaimed.load(Ordering::Relaxed)
@@ -419,53 +486,83 @@ impl CustomBus {
         self.refused.load(Ordering::Relaxed)
     }
 
-    /// The owners of `reg` that are actually attached, cloned out so the lock
-    /// is released before any of them is called.
-    fn owners(&self, reg: &Reg) -> Vec<Arc<dyn CustomChip>> {
-        self.chips
-            .lock()
-            .iter()
-            .filter(|c| reg.chip.contains(c.which()))
-            .map(Arc::clone)
-            .collect()
+    /// One lock acquisition for a whole access: the owners of `reg` that are
+    /// actually attached, and the data lines, cloned out so the lock is
+    /// released before any chip is called or any word driven.
+    ///
+    /// `reg` is `None` for an offset the appendix does not list, which drives
+    /// no chip and still reaches the data lines.
+    fn wiring_for(
+        &self,
+        reg: Option<&Reg>,
+    ) -> (Vec<Arc<dyn CustomChip>>, Option<Arc<ChipDataBus>>) {
+        let wiring = self.wiring.lock();
+        let owners = match reg {
+            Some(reg) => wiring
+                .chips
+                .iter()
+                .filter(|c| reg.chip.contains(c.which()))
+                .map(Arc::clone)
+                .collect(),
+            None => Vec::new(),
+        };
+        (owners, wiring.data.clone())
     }
 
     /// Read the word register at `offset`.
     ///
-    /// `offset` is relative to the custom-chip base. Anything the appendix does
+    /// `offset` is relative to the custom-chip base. A register a chip answers
+    /// leaves that chip's word on the data lines. Anything the appendix does
     /// not declare readable — an unclaimed offset, a write-only register, a
-    /// register whose chip this build does not have — answers with the floating
-    /// word and moves [`unclaimed`](Self::unclaimed).
+    /// register whose chip this build does not have — is a cycle **nothing**
+    /// drives: it answers with what was on the lines, leaves them floating
+    /// ([`ChipDataBus::take`]), and moves [`unclaimed`](Self::unclaimed).
     pub fn read(&self, offset: u16, from: Origin) -> u16 {
-        let Some(reg) = regs::lookup(offset).filter(|r| r.readable()) else {
-            return self.fall_through(from);
+        let reg = regs::lookup(offset).filter(|r| r.readable());
+        let (owners, data) = self.wiring_for(reg);
+        // A part that owns the address but has not got the register drives
+        // nothing, and is not an owner for this purpose (`CustomChip::drives`).
+        let driving = reg.is_some_and(|reg| owners.iter().any(|c| c.drives(reg)));
+        let Some(reg) = reg.filter(|_| driving) else {
+            if !from.debug {
+                self.unclaimed.fetch_add(1, Ordering::Relaxed);
+            }
+            // A debugger looks at the lines; a guest's cycle takes them.
+            return data.map_or(0, |d| if from.debug { d.word() } else { d.take() });
         };
-        let owners = self.owners(reg);
-        if owners.is_empty() {
-            return self.fall_through(from);
-        }
         // Wired-or, which is what several chips driving one 16-bit bus is. Each
         // owner returns zeroes in the bits it does not drive (`CustomChip::read`).
-        let value = owners.iter().fold(0u16, |acc, c| acc | c.read(reg, from));
-        if !from.debug {
-            self.floating.store(u64::from(value), Ordering::Relaxed);
+        let value = owners
+            .iter()
+            .filter(|c| c.drives(reg))
+            .fold(0u16, |acc, c| acc | c.read(reg, from));
+        if !from.debug
+            && let Some(data) = data
+        {
+            data.drive(value);
         }
         value
     }
 
     /// Write the word register at `offset`.
     ///
+    /// The word goes onto the chip data lines whatever happens to it
+    /// afterwards — the board's buffers put it there before any chip decides
+    /// to latch it (`src/dev/amiga/dma.rs`, [`ChipDataBus`]).
+    ///
     /// Returns whether anything took it: `false` for an unclaimed offset, a
     /// read-only register, a copper write the `*`/`~` columns refuse, a
     /// register whose chip this build does not have, or `NO-OP` — the one of
     /// those that is not counted as unclaimed.
     pub fn write(&self, offset: u16, value: u16, from: Origin) -> bool {
-        // The data bus carries the word whether or not anything latches it,
-        // which is the half of the floating-word model that is not a guess.
-        if !from.debug {
-            self.floating.store(u64::from(value), Ordering::Relaxed);
+        let reg = regs::lookup(offset);
+        let (owners, data) = self.wiring_for(reg);
+        if !from.debug
+            && let Some(data) = data
+        {
+            data.drive(value);
         }
-        let Some(reg) = regs::lookup(offset) else {
+        let Some(reg) = reg else {
             if !from.debug {
                 self.unclaimed.fetch_add(1, Ordering::Relaxed);
             }
@@ -495,7 +592,6 @@ impl CustomBus {
             }
             return false;
         }
-        let owners = self.owners(reg);
         if owners.is_empty() {
             if !from.debug {
                 self.unclaimed.fetch_add(1, Ordering::Relaxed);
@@ -508,20 +604,12 @@ impl CustomBus {
         true
     }
 
-    /// Answer with the floating word, counting it unless this is a debugger.
-    fn fall_through(&self, from: Origin) -> u16 {
-        if !from.debug {
-            self.unclaimed.fetch_add(1, Ordering::Relaxed);
-        }
-        self.floating()
-    }
-
-    /// Back to power-on: nothing driven, nothing counted.
+    /// Back to power-on: nothing counted.
     ///
-    /// The subscriber list is **wiring, not guest state**
-    /// ([`Device::export`]'s contract) and survives.
+    /// The subscriber list and the chip data bus are **wiring, not guest
+    /// state** ([`Device::export`]'s contract) and survive; the word on that
+    /// bus is the driving chip's to clear, and Agnus's reset does.
     fn reset(&self) {
-        self.floating.store(0, Ordering::Relaxed);
         self.unclaimed.store(0, Ordering::Relaxed);
         self.refused.store(0, Ordering::Relaxed);
     }
@@ -642,20 +730,21 @@ impl Device for Custom {
         self.bus.reset();
     }
 
+    /// The two counters and nothing else.
+    ///
+    /// The word on the chip data bus used to be written here. It is not this
+    /// device's: `amiga.custom` is the decode, it drives nothing, and the
+    /// chip that does — Agnus — carries the word in its own chunk. Writing it
+    /// in both would be two authorities for one value.
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        w.write_u16(self.bus.floating())?;
         w.write_u64(self.bus.unclaimed())?;
         w.write_u64(self.bus.refused_copper_writes())?;
         Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        let floating = r.read_u16()?;
         let unclaimed = r.read_u64()?;
         let refused = r.read_u64()?;
-        self.bus
-            .floating
-            .store(u64::from(floating), Ordering::Relaxed);
         self.bus.unclaimed.store(unclaimed, Ordering::Relaxed);
         self.bus.refused.store(refused, Ordering::Relaxed);
         Ok(())
@@ -780,6 +869,15 @@ mod tests {
         Custom::new(&Props::new()).expect("no properties to get wrong")
     }
 
+    /// The same, with a chip data bus attached: what Agnus's bind does, minus
+    /// Agnus. The handle is the caller's to drive a DMA cycle through.
+    fn custom_with_dma() -> (Custom, Arc<ChipDataBus>) {
+        let c = custom();
+        let data = Arc::new(ChipDataBus::new());
+        c.bus().attach_data_bus(Arc::clone(&data));
+        (c, data)
+    }
+
     /// `DMACONR`: readable, Agnus and Paula.
     const DMACONR: u16 = 0x002;
     /// `DMACON`: writable, all three.
@@ -841,28 +939,76 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_address_answers_with_the_floating_word() {
+    fn an_unreadable_address_answers_with_the_last_cycles_word_once() {
+        let (c, data) = custom_with_dma();
+        // A bitplane fetch, say: Agnus drove this word onto D15-D0.
+        data.drive(0xa55a);
+        // A write-only register answers with it...
+        assert_eq!(c.bus().read(COLOR00, Origin::cpu()), 0xa55a);
+        // ...and that read was itself a cycle nothing drove, so the lines are
+        // floating now and the next one gets nothing. A guest polling a
+        // write-only register therefore does *not* get a stable answer it
+        // could mistake for a real register's, which is exactly the test
+        // Appendix C documents.
+        assert_eq!(c.bus().read(COLOR00, Origin::cpu()), 0x0000);
+        assert_eq!(c.bus().unclaimed(), 2);
+
+        // An offset the appendix leaves blank, and `$1FE`, which it lists as
+        // `NO-OP` with no access letter, behave the same way.
+        data.drive(0x0ff0);
+        assert_eq!(c.bus().read(0x068, Origin::cpu()), 0x0ff0);
+        data.drive(0x0ff0);
+        assert_eq!(c.bus().read(0x1fe, Origin::cpu()), 0x0ff0);
+        assert_eq!(c.bus().unclaimed(), 4);
+    }
+
+    /// A register a chip answers *does* drive the lines, so the word a guest
+    /// finds at a write-only address afterwards is that chip's.
+    #[test]
+    fn a_read_and_a_write_both_drive_the_data_lines() {
+        let (c, data) = custom_with_dma();
+        c.bus().attach(Probe::new(ChipId::PAULA, 0x4321)).unwrap();
+        assert_eq!(c.bus().read(DMACONR, Origin::cpu()), 0x4321);
+        assert_eq!(data.word(), 0x4321, "the chip drove its answer");
+        assert_eq!(c.bus().read(COLOR00, Origin::cpu()), 0x4321);
+
+        // And a write puts its word there whether or not anything latches it:
+        // the board's buffers do that before any chip decides.
+        c.bus().write(COLOR00, 0x0765, Origin::cpu());
+        assert_eq!(data.word(), 0x0765, "no Denise, and still on the lines");
+        assert_eq!(c.bus().read(COLOR00, Origin::cpu()), 0x0765);
+    }
+
+    /// A board with no DMA engine has no chip-bus cycles at all. Nothing
+    /// drives `D15`–`D0`, the fall-through answers zero, and the counter says
+    /// how often that was relied on.
+    #[test]
+    fn a_board_with_no_dma_engine_reads_zero_and_counts_it() {
         let c = custom();
         assert!(!c.bus().write(COLOR00, 0x0abc, Origin::cpu()));
-        assert_eq!(c.bus().read(COLOR00, Origin::cpu()), 0x0abc);
-        // An offset the appendix leaves blank, and `$1FE`, which it lists as
-        // `NO-OP` with no access letter: neither is readable.
-        assert_eq!(c.bus().read(0x068, Origin::cpu()), 0x0abc);
-        assert_eq!(c.bus().read(0x1fe, Origin::cpu()), 0x0abc);
-        assert_eq!(c.bus().unclaimed(), 4);
+        assert_eq!(c.bus().read(COLOR00, Origin::cpu()), 0x0000);
+        assert_eq!(c.bus().read(0x068, Origin::cpu()), 0x0000);
+        assert_eq!(c.bus().floating(), 0x0000);
+        // The write to Denise's register with no Denise is a fall-through too.
+        assert_eq!(c.bus().unclaimed(), 3);
     }
 
     #[test]
     fn a_write_to_no_op_is_dropped_and_not_counted() {
         // The copper's padding address. A board with every chip present and a
         // copper list that pads with it must still read zero unclaimed.
-        let c = custom();
+        let (c, data) = custom_with_dma();
         c.bus().attach(Probe::new(ChipId::AGNUS, 0)).unwrap();
+        data.drive(0x5555);
         assert!(!c.bus().write(0x1fe, 0x0000, Origin::copper(false)));
         assert!(!c.bus().write(0x1fe, 0x1234, Origin::cpu()));
         assert_eq!(c.bus().unclaimed(), 0);
         assert_eq!(c.bus().refused_copper_writes(), 0);
-        assert_eq!(c.bus().floating(), 0x1234, "the word was still on the bus");
+        assert_eq!(
+            c.bus().floating(),
+            0x1234,
+            "nothing latched it, and the buffers put it on the lines anyway"
+        );
     }
 
     #[test]
@@ -908,14 +1054,21 @@ mod tests {
 
     #[test]
     fn a_debugger_moves_no_counter_and_disturbs_no_bus() {
-        let c = custom();
+        let (c, data) = custom_with_dma();
         let paula = Probe::new(ChipId::PAULA, 0x0010);
         c.bus().attach(paula.clone()).unwrap();
-        c.bus().write(COLOR00, 0x0555, Origin::cpu());
+        data.drive(0x0555);
         let unclaimed = c.bus().unclaimed();
 
+        // A debugger sees exactly what the guest would — the undriven lines
+        // are what the guest would latch, so hiding them would be the lie —
+        // and is not a cycle: it drives nothing, takes nothing, counts
+        // nothing. Reading the same write-only address three times over says
+        // so, where a guest's second read would already have got zero.
         let debug = Origin::cpu().for_debug(true);
-        assert_eq!(c.bus().read(COLOR00, debug), 0x0555);
+        for _ in 0..3 {
+            assert_eq!(c.bus().read(COLOR00, debug), 0x0555);
+        }
         assert_eq!(c.bus().read(DMACONR, debug), 0x0010);
         c.bus().write(COLOR00, 0x0999, debug);
 
@@ -942,16 +1095,22 @@ mod tests {
 
     #[test]
     fn the_window_takes_words_and_bytes_and_nothing_wider_or_odd() {
-        let c = custom();
+        let (c, data) = custom_with_dma();
         assert_eq!(c.region("").unwrap().len(), 0x200);
         let ops = Window {
             bus: Arc::clone(c.bus()),
         };
 
-        ops.write(0x180, &[0x0f, 0x00], MemAttrs::DEFAULT).unwrap();
+        // `JOY0DAT` at $00A, Denise's and readable, so the byte order on the
+        // wire is a register's answer rather than the undriven lines'.
+        c.bus().attach(Probe::new(ChipId::DENISE, 0x0f00)).unwrap();
         let mut word = [0u8; 2];
-        ops.read(0x180, &mut word, MemAttrs::DEFAULT).unwrap();
+        ops.read(0x00a, &mut word, MemAttrs::DEFAULT).unwrap();
         assert_eq!(word, [0x0f, 0x00], "big-endian on the wire");
+        // And a write-only register answers with the lines, big-endian too.
+        data.drive(0x0f00);
+        ops.read(0x180, &mut word, MemAttrs::DEFAULT).unwrap();
+        assert_eq!(word, [0x0f, 0x00]);
 
         let mut byte = [0u8; 1];
         assert!(ops.read(0x180, &mut byte, MemAttrs::DEFAULT).is_ok());
@@ -989,8 +1148,6 @@ mod tests {
         let seen = paula.seen();
         assert_eq!(seen.len(), 2);
         assert!(seen.iter().all(|s| s.0 == 0x002 && s.1.is_none()));
-        // And the bus carried the whole word, not just the half that was kept.
-        assert_eq!(c.bus().floating(), 0x1234);
     }
 
     #[test]
@@ -1018,25 +1175,31 @@ mod tests {
     fn a_byte_read_of_an_undriven_register_is_half_of_the_floating_bus() {
         // The access Kickstart 2.04 makes: `$DFF07D`, the low half of
         // `DENISEID`, on a board where nothing answers it. Appendix C (p. 299):
-        // "whatever value is left over on the bus from the last cycle".
-        let c = custom();
+        // "whatever value is left over on the bus from the last cycle" -- and
+        // the last cycle is Agnus's, not the processor's own previous write.
+        let (c, data) = custom_with_dma();
         let ops = Window {
             bus: Arc::clone(c.bus()),
         };
-        ops.write(0x180, &[0x0f, 0xc3], MemAttrs::DEFAULT).unwrap();
+        data.drive(0x0fc3);
         let mut byte = [0u8; 1];
         ops.read(0x07d, &mut byte, MemAttrs::DEFAULT).unwrap();
         assert_eq!(byte, [0xc3]);
+        // The whole word was taken, not half of it: the strobe selects which
+        // half the processor keeps, and the lines are floating either way.
+        data.drive(0x0fc3);
         ops.read(0x07c, &mut byte, MemAttrs::DEFAULT).unwrap();
         assert_eq!(byte, [0x0f]);
+        ops.read(0x07c, &mut byte, MemAttrs::DEFAULT).unwrap();
+        assert_eq!(byte, [0x00], "and a second read gets nothing");
     }
 
     #[test]
     fn a_debugger_byte_access_disturbs_nothing() {
-        let c = custom();
+        let (c, data) = custom_with_dma();
         let paula = Probe::new(ChipId::PAULA, 0x00ff);
         c.bus().attach(paula.clone()).unwrap();
-        c.bus().write(COLOR00, 0x0555, Origin::cpu());
+        data.drive(0x0555);
         let ops = Window {
             bus: Arc::clone(c.bus()),
         };
@@ -1066,14 +1229,21 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_clears_the_bus_and_keeps_the_subscribers() {
-        let c = custom();
+    fn a_reset_clears_the_counters_and_keeps_the_wiring() {
+        let (c, data) = custom_with_dma();
         c.bus().attach(Probe::new(ChipId::DENISE, 0)).unwrap();
         c.bus().write(0x068, 0x1234, Origin::cpu());
+        assert_eq!(c.bus().unclaimed(), 1);
+        data.drive(0x1234);
         Device::reset(&c, ResetKind::Cold);
-        assert_eq!(c.bus().floating(), 0);
         assert_eq!(c.bus().unclaimed(), 0);
         assert_eq!(c.bus().attached(), ChipId::DENISE, "wiring, not state");
+        // The chip data bus survives too: it is the attachment that is wiring,
+        // and the word on it belongs to the chip that drives it -- Agnus
+        // clears it in its own reset, and this device drives nothing.
+        assert_eq!(c.bus().floating(), 0x1234);
+        data.clear();
+        assert_eq!(c.bus().floating(), 0);
     }
 
     fn snapshot(c: &Custom) -> Vec<u8> {
@@ -1107,11 +1277,9 @@ mod tests {
             bytes,
             "identical state after a round trip"
         );
-        assert_eq!(
-            restored.bus().floating(),
-            0x0000,
-            "the copper's refused word"
-        );
+        // The word on the chip data bus is not in this chunk: it belongs to
+        // the chip that drives it, and a board with no Agnus never had one.
+        assert_eq!(restored.bus().floating(), 0x0000);
         assert_eq!(restored.bus().unclaimed(), 1);
         assert_eq!(restored.bus().refused_copper_writes(), 1);
     }
