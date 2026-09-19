@@ -59,6 +59,88 @@ fn hash_after(name: &str, pieces: u32) -> Option<u64> {
     Some(booted.machine.state_hash().expect("it hashes"))
 }
 
+/// Every clock domain's tick count after [`SPAN`], run in `pieces` pieces.
+///
+/// Finer than [`hash_after`], and it has to be: a state hash carries what a
+/// device *did*, and a crystal that gained time nothing executed against can
+/// move every domain without changing a single register. The Game Boy is the
+/// witness — `machines/gameboy.machine` puts the cartridge's real-time clock
+/// on `osc rtc`, a tree no runnable drives — and it is why this reads the
+/// forest rather than the devices.
+fn domains_after(name: &str, pieces: u32) -> Option<Vec<(String, u64, u64, u64)>> {
+    let w = workload::all().into_iter().find(|w| w.name == name)?;
+    let mut booted = w.boot();
+    let step = GlobalTime::from_raw(SPAN.raw() / u128::from(pieces));
+    for _ in 0..pieces {
+        booted.machine.run_for(step).expect("the machine runs");
+    }
+    let m = &booted.machine;
+    Some(
+        m.devices()
+            .iter()
+            .filter_map(|d| {
+                let domain = d.domain()?;
+                let ticks = m.clocks().ticks(domain).ok()?;
+                let hz = m.clocks().domain_frequency(domain).ok()?;
+                Some((d.path().to_string(), ticks, hz.num(), hz.den()))
+            })
+            .collect(),
+    )
+}
+
+/// **When a run returns, every crystal in the machine stands at the same
+/// instant** — however the caller sliced it.
+///
+/// A deadline inside a round declines it
+/// (`Scheduler::run_quantum_until`): nothing executes in that fragment. A
+/// crystal no runnable drives must not age through it either, or it drifts
+/// ahead of the processors by up to a round every time a caller stops — and a
+/// guest that reads such a counter against its own cycle count is told time
+/// passed while it did nothing.
+///
+/// The tolerance is **one tick of each of the two crystals compared**, which
+/// is the most either can be short of an instant it has not reached a whole
+/// tick of; the comparison itself is exact integer arithmetic on the declared
+/// rationals, with no floats and no rounding of its own. Before the fix,
+/// `riscv-virt` failed this by 1 ms — `cpu0` at 99 ms against a CLINT at
+/// 99.9999 ms — which is four orders of magnitude outside it.
+#[test]
+fn every_crystal_stands_at_the_same_instant_when_a_run_returns() {
+    let names: Vec<&'static str> = workload::all().into_iter().map(|w| w.name).collect();
+    if names.is_empty() {
+        eprintln!("no machine features enabled; nothing to compare");
+        return;
+    }
+    for name in names {
+        for pieces in SPLITS {
+            let domains = domains_after(name, pieces).expect("a known workload");
+            let Some((first, rest)) = domains.split_first() else {
+                continue;
+            };
+            for (path, ticks, num, den) in rest {
+                // `a` ticks at `fa` Hz and `b` ticks at `fb` Hz are the same
+                // instant when `a × fb == b × fa`. Integers throughout, so the
+                // comparison is exact; the slack is one tick of the slower of
+                // the two, which is the most a domain can be short of an
+                // instant it has not reached a whole tick of.
+                let (apath, a, anum, aden) = first;
+                let (lhs, rhs) = (
+                    u128::from(*a) * u128::from(*num) * u128::from(*aden),
+                    u128::from(*ticks) * u128::from(*anum) * u128::from(*den),
+                );
+                let slack =
+                    u128::from(*num) * u128::from(*aden) + u128::from(*anum) * u128::from(*den);
+                assert!(
+                    lhs.abs_diff(rhs) <= slack,
+                    "{name} in {pieces} piece(s): {apath} stands at {a} ticks of \
+                     {anum}/{aden} Hz and {path} at {ticks} of {num}/{den} Hz, \
+                     which are different instants"
+                );
+            }
+        }
+    }
+}
+
 /// The same span, taken whole and taken in pieces, reaches the same state.
 #[test]
 fn one_span_and_many_pieces_reach_the_same_state() {

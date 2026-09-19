@@ -3622,8 +3622,50 @@ impl Scheduler {
     /// handed out by the round that ends up owning them. No event can fall in
     /// the skipped interval either: one at or before `limit` would have been
     /// the natural target.
+    ///
+    /// # Nobody ran, so nobody ages
+    ///
+    /// Virtual time is the only thing that moves here, **on a machine that has
+    /// a runnable**. A crystal no runnable drives — a Game Boy cartridge's
+    /// real-time clock, a CLINT's `mtime`, a PC's 8254 — is then *not* carried
+    /// to the deadline, and that is the whole of the difference between this
+    /// and [`Scheduler::advance_idle_to`]. A machine with **no** runnable at
+    /// all keeps the old behaviour, and the body says why.
+    ///
+    /// Carrying it would age it through an interval no processor executed
+    /// through, so a guest that reads such a counter against its own cycle
+    /// count is told that time passed while it did nothing. It is repaid to
+    /// everyone together instead: the next round's close converts every
+    /// passive tree from absolute time
+    /// ([`Scheduler::advance_undriven_trees`]), so the tree lands on exactly
+    /// the tick it would have had anyway, and in between the machine's
+    /// crystals stay at one instant.
+    ///
+    /// Measured, before this rule: a 100 ms `riscv-virt` run left `cpu0` at
+    /// 99 ms and the CLINT at 99.9999 ms — a passive crystal a whole round
+    /// ahead of the processor whose `time` CSR is a view of it. On a PC driven
+    /// in one-millisecond calls, which is how `tests/x86boot` drives a kernel,
+    /// a guest measuring the 8254 against its own time-stamp counter saw
+    /// 20.418 cycles per tick where the two crystals fix 20.952 — 2.6%, and
+    /// worse the more finely the caller sliced. `tests/run_for_additive.rs`
+    /// holds both halves.
     fn decline_round(&mut self, from: GlobalTime, limit: GlobalTime) -> SchedResult<QuantumReport> {
-        self.advance_idle_to(limit)?;
+        if self.runnables.is_empty() {
+            // Nothing here has a processor to wait for, and a declined round is
+            // the only way a clock ever moves on such a machine: a bare device
+            // on a bench — `dev::stm32::tim`'s board is a timer and a RAM and
+            // asks for half a millisecond at a time — or a board whose cores
+            // have all been taken away. Carrying the passive trees is then not
+            // running ahead of anybody; it is the whole of time passing.
+            self.advance_idle_to(limit)?;
+        } else if limit > self.now {
+            self.now = limit;
+            // The positions are republished although no tree moved: a lazy
+            // slot's `present` is derived from its tree, so this is a no-op
+            // that keeps the "virtual time changed, so republish" rule in one
+            // piece rather than a special case to remember.
+            self.publish_lazy_positions();
+        }
         let mut fired = Vec::new();
         while let Some(e) = self.queue.pop_due(self.now) {
             fired.push(e);

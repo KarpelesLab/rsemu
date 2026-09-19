@@ -340,3 +340,58 @@ x86 workload's 2 800 timer interrupts become about 560, because the 8254 fires
 on guest time while the code rewrites and page-table walks it also counts fire
 per pass. `engine_longrun`'s `DEFAULT_QUANTA` is a fifth rather than a tenth of
 what it was for exactly that reason, and it is a trade rather than a wash.
+
+## A declined round ages nobody
+
+A caller's deadline that falls inside a round **declines** it rather than
+splitting it (`Scheduler::run_quantum_until`), because a boundary invented by
+how a caller sliced its run is a boundary the unsliced run never had — §11.6
+and `tests/run_for_additive.rs` are the long form. Nothing executes in that
+fragment.
+
+So nothing may *age* in it either, and that half was missing. Virtual time
+moved to the deadline and every **crystal no runnable drives** was carried
+along with it — a Game Boy cartridge's real-time clock, a CLINT's `mtime`, a
+PC's 8254 — while the processors stayed where the last whole round left them.
+A passive crystal therefore ran ahead of the processors by up to a round every
+time a caller stopped, and a guest that reads one of those counters against
+its own cycle count was told that time had passed while it did nothing.
+
+Measured before the rule changed:
+
+| | | |
+| --- | --- | --- |
+| `riscv-virt`, 100 ms, run whole | `cpu0` at 99 ms | the CLINT at 99.9999 ms |
+| `q35`, 20 ms in 1 ms calls | the 8254 at 20.000 ms | `cpu0` at 19.531 ms |
+
+The second row is what a guest sees: the same program measuring the 8254
+against its own time-stamp counter read **20.418 cycles per tick** where the
+two crystals fix 20.952 — 2.6% — and the error grew the more finely the caller
+sliced, because each call ends on a declined fragment. `tests/x86boot` drives
+a kernel in one-millisecond calls, so this reached every Linux boot the test
+suite runs: a calibration that measures across one such fragment is wrong by
+the fragment over its own window, which for a 5 ms calibration window is ten
+per cent.
+
+`decline_round` now moves virtual time and nothing else — on a machine that
+has a runnable. With **no** runnable at all it still carries the passive trees,
+because there is then no processor for them to run ahead of and a declined
+round is the only way any clock on such a machine ever moves: a bare device on
+a bench, like the timer-and-a-RAM board `dev::stm32::tim` asks for half a
+millisecond at a time, would otherwise stand still for ever.
+
+The fragment is repaid to everyone together, because the next round's close
+converts every passive tree from absolute time (`advance_undriven_trees`), so a
+tree lands on exactly the tick it would have had and no drift accumulates —
+`tests/run_for_additive.rs`'s
+`every_crystal_stands_at_the_same_instant_when_a_run_returns` is the
+assertion, exact integer arithmetic on the declared rationals with a tolerance
+of one tick of each crystal compared.
+
+Two Game Boy state hashes moved and no picture did
+(`tests/goldens/frame-hashes.txt`): `machines/gameboy.machine` is the only
+shipped board with a crystal nothing drives — `osc rtc = 32768 Hz`, the MBC3
+cartridge clock — and a domain's tick count is in the state hash, so the
+checkpoints at 15 and 60 frames record an RTC that no longer ages through the
+frame boundaries. The frame hashes at all four checkpoints are byte-identical,
+which is the right answer: the cartridge clock drives no pixel.
