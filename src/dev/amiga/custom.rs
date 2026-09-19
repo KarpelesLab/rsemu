@@ -166,7 +166,7 @@ use crate::core::value::{Endian, Width};
 use crate::machine::realize::Instance;
 use crate::machine::validate::ClassSchema;
 
-use super::regs::{self, ChipId, Reg, SPAN, copper_may_write};
+use super::regs::{self, ChipId, Reg, SPAN, copper_may_write, ecs_copper_may_write};
 
 /// The class name a machine file writes.
 pub const CLASS_NAME: &str = "amiga.custom";
@@ -193,6 +193,10 @@ pub enum Driver {
     Copper {
         /// Whether `COPCON`'s danger bit is set.
         danger: bool,
+        /// Whether the copper is an Enhanced Chip Set Agnus's, which Appendix
+        /// C holds to a wider rule than the `*`/`~` columns
+        /// ([`regs::ecs_copper_may_write`]).
+        ecs: bool,
     },
     /// A chip's own DMA channel, writing the register its transfer lands in.
     Dma,
@@ -226,7 +230,17 @@ impl Origin {
     #[must_use]
     pub const fn copper(danger: bool) -> Origin {
         Origin {
-            driver: Driver::Copper { danger },
+            driver: Driver::Copper { danger, ecs: false },
+            debug: false,
+        }
+    }
+
+    /// An Enhanced Chip Set Agnus's copper, with `COPCON`'s danger bit in the
+    /// state it is in.
+    #[must_use]
+    pub const fn ecs_copper(danger: bool) -> Origin {
+        Origin {
+            driver: Driver::Copper { danger, ecs: true },
             debug: false,
         }
     }
@@ -469,8 +483,12 @@ impl CustomBus {
             }
             return false;
         }
-        if let Driver::Copper { danger } = from.driver
-            && !copper_may_write(reg.access, danger)
+        if let Driver::Copper { danger, ecs } = from.driver
+            && !(if ecs {
+                ecs_copper_may_write(reg.offset, danger)
+            } else {
+                copper_may_write(reg.access, danger)
+            })
         {
             if !from.debug {
                 self.refused.fetch_add(1, Ordering::Relaxed);
@@ -865,6 +883,25 @@ mod tests {
         assert!(c.bus().write(COPCON, 2, Origin::cpu()));
 
         assert_eq!(c.bus().refused_copper_writes(), 3);
+        let offsets: Vec<u16> = agnus.seen().iter().map(|s| s.0).collect();
+        assert_eq!(offsets, vec![BLTCON0, 0x080, COPCON]);
+    }
+
+    #[test]
+    fn an_ecs_copper_is_held_to_appendix_c_instead() {
+        let c = custom();
+        let agnus = Probe::new(ChipId::AGNUS, 0);
+        c.bus().attach(agnus.clone()).unwrap();
+
+        // Danger clear: "$DFF03E through $DFF07E", the blitter block among
+        // them, and everything above; nothing below.
+        assert!(!c.bus().write(COPCON, 2, Origin::ecs_copper(false)));
+        assert!(c.bus().write(BLTCON0, 1, Origin::ecs_copper(false)));
+        assert!(c.bus().write(0x080, 0, Origin::ecs_copper(false)));
+        // Danger set: "all of the Amiga chip registers".
+        assert!(c.bus().write(COPCON, 2, Origin::ecs_copper(true)));
+
+        assert_eq!(c.bus().refused_copper_writes(), 1);
         let offsets: Vec<u16> = agnus.seen().iter().map(|s| s.0).collect();
         assert_eq!(offsets, vec![BLTCON0, 0x080, COPCON]);
     }

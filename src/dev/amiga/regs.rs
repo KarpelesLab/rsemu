@@ -217,6 +217,19 @@ pub const fn copper_may_write(access: Access, danger: bool) -> bool {
     }
 }
 
+/// The same question for an Enhanced Chip Set Agnus, whose copper answers to a
+/// wider rule than the `*`/`~` columns. Appendix C, *Interpretational
+/// Differences*: "in the ECS, if this bit is set, the Copper can access all of
+/// the Amiga chip registers. If this bit is clear, the Copper can access the
+/// address range from $DFF03E through $DFF07E, the same range as when the
+/// danger bit is set in the standard chip set" — and everything from `$080`
+/// up, as always.
+#[must_use]
+#[inline]
+pub const fn ecs_copper_may_write(offset: u16, danger: bool) -> bool {
+    danger || offset >= 0x03e
+}
+
 /// One row of the appendix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reg {

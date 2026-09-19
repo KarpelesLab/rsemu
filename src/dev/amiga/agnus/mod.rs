@@ -1,7 +1,8 @@
 //! Agnus: the beam counters, the copper, the blitter and chip-RAM DMA.
 //!
 //! One class, `amiga.agnus`, for the part an A500 calls the 8370 (NTSC) or
-//! 8371 (PAL) "Fat Agnus". It is the chip every other chip's timing hangs off:
+//! 8371 (PAL) "Fat Agnus" and, with `revision = "ecs"`, for the Enhanced Chip
+//! Set parts that replaced it ([`ecs`]). It is the chip every other chip's timing hangs off:
 //! the video beam's position is its counter, the vertical and horizontal sync a
 //! board feeds to the CIAs' `TOD` pins come out of it, the copper runs against
 //! that counter, and every direct memory access into chip RAM is scheduled by
@@ -74,15 +75,26 @@
 //!   `VERTB` and `BLIT` requested in Paula on their counts.
 //! * **The beam, for the other chips**: [`ChipDma::beam`] as atomics, and
 //!   [`BeamSource`], which catches Agnus up first.
+//! * **The Enhanced Chip Set** ([`ecs`]), with `revision = "ecs"`: an 8372A
+//!   (`reach = 1M`, the default) or an 8375 (`reach = 2M`) — `VPOSR`'s ECS
+//!   identification, `LOL` and `V10`/`V9`; `BEAMCON0` with the programmable
+//!   beam (`HTOTAL`, `VTOTAL`, the sync and blank positions) and PAL/NTSC
+//!   switching; `DIWHIGH`; the SuperHires fetch; the copper's wider `COPCON`
+//!   rule; and a [`Raster`](denise::Raster) handed to Denise every field so
+//!   her picture takes the programmed beam's shape.
 //!
 //! # What is register-only
 //!
 //! Written, held, snapshotted, and not acted on:
 //!
-//! * `REFPTR` ("writeable for test purposes only"), `COPINS`, and every ECS beam
-//!   register: `HTOTAL` through `VBSTOP`, `BEAMCON0`, `HSSTRT`, `VSSTRT`,
-//!   `HCENTER`, `DIWHIGH`, and `SPRHDAT`. An A500's Agnus is an original
-//!   chip-set part, and `VPOSR` says so.
+//! * `REFPTR` ("writeable for test purposes only"), `COPINS` and `SPRHDAT`.
+//! * On an original part (`revision = "ocs"`, the default and an A500's), every
+//!   ECS register: `HTOTAL` through `VBSTOP`, `BEAMCON0`, `HSSTRT`, `VSSTRT`,
+//!   `HCENTER` and `DIWHIGH`, and `BPLCON0`'s `SHRES`. `VPOSR` says so: an
+//!   8370 or 8371 does not have them.
+//! * On an ECS part, `HCENTER` and `BEAMCON0`'s polarity, redirection,
+//!   light-pen and `DUAL` bits: none of them changes a count or a pin this
+//!   model has.
 //!
 //! # The pins
 //!
@@ -100,7 +112,8 @@
 //! edges are on the counts the manual's counters wrap on, and the widths are
 //! the broadcast standards' nominal ones (about 2.5 lines, about 4.7 µs)
 //! rounded to whole lines and counts. Nothing a guest can read depends on
-//! either width.
+//! either width. On an ECS part `BEAMCON0`'s `VARHSYEN` and `VARVSYEN` move
+//! both edges to `HSSTRT`/`HSSTOP` and `VSSTRT`/`VSSTOP` ([`ecs::Sync`]).
 //!
 //! # Sources
 //!
@@ -116,6 +129,7 @@ pub mod beam;
 pub mod blitter;
 pub mod copper;
 pub mod display;
+pub mod ecs;
 pub mod slots;
 
 #[cfg(test)]
@@ -142,10 +156,11 @@ use crate::core::wire::{Level, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
-use self::beam::{Beam, Crossing, Standard};
+use self::beam::{Beam, Crossing, Standard, Timing};
 use self::blitter::{Blitter, Memory};
 use self::copper::{Copper, Move, Phase};
 use self::display::SpriteDma;
+use self::ecs::Revision;
 use super::custom::{CustomBus, CustomChip, Driver, Origin};
 use super::denise::{self, Video};
 use super::dma::{self, BeamPosition, ChipDma, DmaChannel, merge_half};
@@ -156,7 +171,7 @@ use super::regs::{ChipId, Reg};
 pub const CLASS_NAME: &str = "amiga.agnus";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// The vertical sync output.
 pub const VSYNC_PIN: &str = "vsync";
@@ -276,6 +291,12 @@ struct State {
     sprhdat: u16,
     copins: u16,
     ecs: [u16; ECS_REGS],
+    /// `DIWHIGH` was written after the last `DIWSTRT` or `DIWSTOP`, so its top
+    /// bits are in force. An ECS part only.
+    diwhigh_on: bool,
+    /// Which part this is. Configuration, not guest state: kept across a reset
+    /// and a load like the wiring below.
+    rev: Revision,
     /// Each sprite channel's place in its field.
     sprite: [SpriteDma; 8],
     /// `blit` is high on this count.
@@ -310,8 +331,12 @@ enum Outward {
         start: u16,
         planes: [Vec<u16>; 6],
     },
-    /// A new field, for the video chip.
-    Field { lof: bool },
+    /// A new field, for the video chip, and — from an ECS part — the raster
+    /// it will be shown on.
+    Field {
+        lof: bool,
+        raster: Option<denise::Raster>,
+    },
     /// Paula's disk and audio slots on this line.
     Slot { at: u64 },
     /// `INTREQ` bits for Paula.
@@ -342,6 +367,8 @@ impl State {
             sprhdat: 0,
             copins: 0,
             ecs: [0; ECS_REGS],
+            diwhigh_on: false,
+            rev: Revision::Ocs,
             sprite: [SpriteDma::Idle; 8],
             blit_pulse: false,
             connected: 0,
@@ -351,9 +378,30 @@ impl State {
         }
     }
 
+    /// A part at power-on: an ECS one with `BEAMCON0`'s strap in it.
+    fn for_part(rev: Revision, std: Standard) -> State {
+        let mut st = State::new();
+        st.rev = rev;
+        if rev.is_ecs() {
+            st.ecs[ecs::BEAMCON0] = ecs::beamcon0_at_reset(std);
+        }
+        st
+    }
+
     #[inline]
     fn lace(&self) -> bool {
         self.bplcon0 & LACE != 0
+    }
+
+    /// The raster the counters run through: the standard's, wired in, or
+    /// whatever an ECS part's `BEAMCON0` makes it.
+    #[inline]
+    fn timing(&self, std: Standard) -> Timing {
+        if self.rev.is_ecs() {
+            ecs::timing(&self.ecs, self.lace())
+        } else {
+            Timing::from(std)
+        }
     }
 
     #[inline]
@@ -370,11 +418,21 @@ impl State {
     /// The levels on the connected pins, as a bit set.
     fn pins(&self) -> u8 {
         let mut pins = 0;
-        if self.beam.vpos < VSYNC_LINES {
-            pins |= PIN_VSYNC;
-        }
-        if self.beam.hpos < HSYNC_COUNTS {
-            pins |= PIN_HSYNC;
+        if self.rev.is_ecs() {
+            let sync = ecs::Sync::of(&self.ecs);
+            if ecs::in_window(self.beam.vpos, sync.v_start, sync.v_stop) {
+                pins |= PIN_VSYNC;
+            }
+            if ecs::in_window(self.beam.hpos, sync.h_start, sync.h_stop) {
+                pins |= PIN_HSYNC;
+            }
+        } else {
+            if self.beam.vpos < VSYNC_LINES {
+                pins |= PIN_VSYNC;
+            }
+            if self.beam.hpos < HSYNC_COUNTS {
+                pins |= PIN_HSYNC;
+            }
         }
         if self.blit_pulse {
             pins |= PIN_BLIT;
@@ -413,8 +471,9 @@ impl State {
     /// until the blit ends, and a video chip takes finished lines whenever the
     /// chip is next caught up (it asks [`BeamSource`], which catches up first).
     fn horizon(&self, std: Standard, for_event: bool) -> u64 {
+        let t = self.timing(std);
         // A new field restarts the copper and raises `vsync`.
-        let mut horizon = self.beam.ticks_to_field(std);
+        let mut horizon = self.beam.ticks_to_field(t);
         if self.blit_pulse {
             return 1;
         }
@@ -433,39 +492,75 @@ impl State {
                     Phase::Fetch1 if for_event => 2,
                     _ => 1,
                 };
-                horizon = horizon.min(self.copper_cycles_ahead(std, cycles));
+                horizon = horizon.min(self.copper_cycles_ahead(t, cycles));
             } else if copper.waiting()
                 && !(copper.waits_for_blitter() && self.blitter.busy)
-                && let Some(t) =
-                    copper::ticks_until_reached(copper.ir1, copper.ir2, &self.beam, std)
+                && let Some(ticks) =
+                    copper::ticks_until_reached(copper.ir1, copper.ir2, &self.beam, t)
             {
-                horizon = horizon.min(t);
+                horizon = horizon.min(ticks);
             }
         }
-        if self.connected & PIN_HSYNC != 0 {
-            let edge = if self.beam.hpos < HSYNC_COUNTS {
-                u64::from(HSYNC_COUNTS - self.beam.hpos)
-            } else {
-                self.beam.ticks_to_line(std)
-            };
-            horizon = horizon.min(edge);
-        }
-        if self.connected & PIN_VSYNC != 0 && self.beam.vpos < VSYNC_LINES {
-            horizon = horizon.min(self.beam.ticks_to_line(std));
+        if self.rev.is_ecs() {
+            horizon = horizon.min(self.ecs_sync_horizon(t));
+        } else {
+            if self.connected & PIN_HSYNC != 0 {
+                let edge = if self.beam.hpos < HSYNC_COUNTS {
+                    u64::from(HSYNC_COUNTS - self.beam.hpos)
+                } else {
+                    self.beam.ticks_to_line(t)
+                };
+                horizon = horizon.min(edge);
+            }
+            if self.connected & PIN_VSYNC != 0 && self.beam.vpos < VSYNC_LINES {
+                horizon = horizon.min(self.beam.ticks_to_line(t));
+            }
         }
         if (!for_event && self.line_work()) || self.slots_on() {
-            horizon = horizon.min(self.beam.ticks_to_line(std));
+            horizon = horizon.min(self.beam.ticks_to_line(t));
         }
         horizon.max(1)
     }
 
+    /// Counts until the next edge on a connected sync pin of an ECS part,
+    /// whose windows `BEAMCON0` may have moved anywhere in the line or the
+    /// field. An edge the line never reaches is never coming.
+    fn ecs_sync_horizon(&self, t: Timing) -> u64 {
+        let mut horizon = u64::MAX;
+        let sync = ecs::Sync::of(&self.ecs);
+        let beam = &self.beam;
+        if self.connected & PIN_HSYNC != 0 {
+            let to_line = beam.ticks_to_line(t);
+            for edge in [sync.h_start, sync.h_stop] {
+                let ticks = if edge > beam.hpos && edge < beam.line_len(t) {
+                    u64::from(edge - beam.hpos)
+                } else if edge < t.line {
+                    to_line + u64::from(edge)
+                } else {
+                    continue;
+                };
+                horizon = horizon.min(ticks);
+            }
+        }
+        if self.connected & PIN_VSYNC != 0 {
+            // Whole lines: an edge is at the start of the line the level
+            // changes on. Line 0 of the next field is the field's own horizon.
+            let now = ecs::in_window(beam.vpos, sync.v_start, sync.v_stop);
+            let next = ecs::in_window(beam.vpos + 1, sync.v_start, sync.v_stop);
+            if now != next {
+                horizon = horizon.min(beam.ticks_to_line(t));
+            }
+        }
+        horizon
+    }
+
     /// Counts until the copper's `n`th cycle from now.
-    fn copper_cycles_ahead(&self, std: Standard, n: u32) -> u64 {
+    fn copper_cycles_ahead(&self, t: Timing, n: u32) -> u64 {
         let mut beam = self.beam;
         let mut seen = 0;
         let mut ticks = 0;
         while seen < n {
-            beam.advance(std, self.lace());
+            beam.advance(t, self.lace());
             ticks += 1;
             if beam.hpos & 1 == 0 {
                 seen += 1;
@@ -478,7 +573,7 @@ impl State {
     /// established that with [`horizon`](Self::horizon), so no field boundary
     /// is crossed.
     fn stride(&mut self, std: Standard, n: u64) {
-        self.beam = self.beam.ahead(std, self.lace(), n);
+        self.beam = self.beam.ahead(self.timing(std), self.lace(), n);
         self.ticks += n;
     }
 
@@ -488,15 +583,23 @@ impl State {
         self.ticks += 1;
         self.blit_pulse = false;
         let leaving = self.beam;
-        let crossing = self.beam.advance(std, self.lace());
+        let t = self.timing(std);
+        let crossing = self.beam.advance(t, self.lace());
         if crossing != Crossing::None {
-            self.end_of_line(std, &leaving, mem);
+            self.end_of_line(t, &leaving, mem);
             if crossing == Crossing::Field {
                 self.field += 1;
                 self.copper.jump(false);
                 self.sprite = [SpriteDma::Idle; 8];
                 if self.video {
-                    self.outbox.push(Outward::Field { lof: self.beam.lof });
+                    let raster = self
+                        .rev
+                        .is_ecs()
+                        .then(|| ecs::raster(&self.ecs, self.timing(std)));
+                    self.outbox.push(Outward::Field {
+                        lof: self.beam.lof,
+                        raster,
+                    });
                 }
                 if self.paula {
                     self.outbox.push(Outward::Request {
@@ -525,13 +628,18 @@ impl State {
                 self.copper.cycle(|addr| mem.read(addr), &self.beam, busy)
             {
                 let danger = self.copcon & CDANG != 0;
+                let ecs = self.rev.is_ecs();
                 // The bus still sees and counts the refused write; the copper
                 // stops behind it (`copper`'s module documentation).
-                self.copper.halt_if_refused(offset, danger);
+                self.copper.halt_if_refused(offset, danger, ecs);
                 self.outbox.push(Outward::Write {
                     offset,
                     value,
-                    from: Origin::copper(danger),
+                    from: if ecs {
+                        Origin::ecs_copper(danger)
+                    } else {
+                        Origin::copper(danger)
+                    },
                 });
             }
         }
@@ -563,7 +671,10 @@ impl State {
             REFPTR => self.refptr = value,
             VPOSW => {
                 self.beam.lof = value & 0x8000 != 0;
-                self.beam.vpos = (self.beam.vpos & 0xff) | ((value & 1) << 8);
+                // An ECS part's counter is eleven bits, and V10 and V9 are
+                // written beside V8 as they are read (`ecs`).
+                let high = if self.rev.is_ecs() { 7 } else { 1 };
+                self.beam.vpos = (self.beam.vpos & 0xff) | ((value & high) << 8);
             }
             VHPOSW => {
                 self.beam.vpos = (self.beam.vpos & 0x100) | (value >> 8);
@@ -605,8 +716,18 @@ impl State {
             COPJMP1 => self.copper.jump(false),
             COPJMP2 => self.copper.jump(true),
             COPINS => self.copins = value,
-            DIWSTRT => self.diwstrt = value,
-            DIWSTOP => self.diwstop = value,
+            // Appendix C: DIWHIGH "is written last in a sequence of setting the
+            // display window"; "if it is not written, the old scheme for
+            // DIWSTRT and DIWSTOP described above holds". So a write to either
+            // of these puts the old scheme back until DIWHIGH is written again.
+            DIWSTRT => {
+                self.diwstrt = value;
+                self.diwhigh_on = false;
+            }
+            DIWSTOP => {
+                self.diwstop = value;
+                self.diwhigh_on = false;
+            }
             DDFSTRT => self.ddfstrt = value,
             DDFSTOP => self.ddfstop = value,
             DMACON => {
@@ -648,7 +769,12 @@ impl State {
                 }
             }
             HTOTAL..=VBSTOP => self.ecs[usize::from((offset - HTOTAL) / 2)] = value,
-            BEAMCON0..=DIWHIGH => self.ecs[8 + usize::from((offset - BEAMCON0) / 2)] = value,
+            BEAMCON0..=DIWHIGH => {
+                self.ecs[8 + usize::from((offset - BEAMCON0) / 2)] = value;
+                if offset == DIWHIGH {
+                    self.diwhigh_on = self.rev.is_ecs();
+                }
+            }
             // Anything else the table sends here is an Agnus row this model
             // has no behaviour for and nothing to hold; there are none today.
             _ => {}
@@ -737,6 +863,7 @@ impl State {
             w.write_u8(sprite.code())?;
         }
         w.write_bool(self.blit_pulse)?;
+        w.write_bool(self.diwhigh_on)?;
         Ok(())
     }
 
@@ -830,6 +957,7 @@ impl State {
             })?;
         }
         self.blit_pulse = r.read_bool()?;
+        self.diwhigh_on = r.read_bool()?;
         Ok(())
     }
 }
@@ -866,6 +994,8 @@ struct Outputs {
 
 struct Shared {
     std: Standard,
+    /// Which part: original or Enhanced Chip Set, and the latter's reach.
+    rev: Revision,
     /// `VPOSR` bits 14–8.
     id: u8,
     state: Mutex<State>,
@@ -1024,7 +1154,12 @@ impl Shared {
                                 ],
                             },
                         }),
-                        Outward::Field { lof } => video.field(*lof),
+                        Outward::Field { lof, raster } => {
+                            if let Some(raster) = raster {
+                                video.raster(*raster);
+                            }
+                            video.field(*lof);
+                        }
                         _ => {}
                     }
                 }
@@ -1086,6 +1221,15 @@ impl Shared {
         let st = self.state.lock();
         match offset {
             DMACONR => st.dmaconr(),
+            VPOSR if st.rev.is_ecs() => {
+                // Appendix C, Determining Chip Revisions: "LOF I6 I5 I4 I3 I2
+                // I1 I0 LOL -- -- -- -- v10 v9 V8".
+                let b = &st.beam;
+                (u16::from(b.lof) << 15)
+                    | (u16::from(self.id & 0x7f) << 8)
+                    | (u16::from(b.lol) << 7)
+                    | ((b.vpos >> 8) & 7)
+            }
             VPOSR => st.beam.vposr() | (u16::from(self.id & 0x7f) << 8),
             VHPOSR => st.beam.vhposr(),
             // The table sends only Agnus's readable rows, and those are all.
@@ -1180,8 +1324,9 @@ impl Agnus {
     /// # Errors
     ///
     /// [`Error::Property`] if `custom` or `ram` is missing, `paula` or `video` is
-    /// not a link, `standard` is not `"pal"` or `"ntsc"`, or a property nothing
-    /// here accepts was given.
+    /// not a link, `standard` is not `"pal"` or `"ntsc"`, `revision` is not
+    /// `"ocs"` or `"ecs"`, `reach` is given to an original part or is not 1M or
+    /// 2M, or a property nothing here accepts was given.
     pub fn new(props: &Props) -> Result<Agnus> {
         let mut r = props.reader();
         let custom_path = r.require_link("custom")?.as_str().to_string();
@@ -1189,9 +1334,33 @@ impl Agnus {
         let paula_path = r.optional_link("paula")?.map(|l| l.as_str().to_string());
         let video_path = r.optional_link("video")?.map(|l| l.as_str().to_string());
         let standard = r.or_enum("standard", "pal", &["pal", "ntsc"])?;
+        let revision = r.or_enum("revision", "ocs", &["ocs", "ecs"])?;
+        let reach = if r.props().contains("reach") {
+            Some(r.require_size("reach")?)
+        } else {
+            None
+        };
         r.finish()?;
         let std = Standard::parse(standard).expect("or_enum checked it");
-        let mut agnus = Agnus::bare(std);
+        let rev = match (revision, reach) {
+            ("ocs", None) => Revision::Ocs,
+            ("ocs", Some(_)) => {
+                return Err(Error::Property(String::from(
+                    "amiga.agnus: `reach` chooses between the ECS parts, 8372A (1M) and 8375 (2M); \
+                     an original part addresses the chip RAM it is given",
+                )));
+            }
+            (_, None) => Revision::Ecs { reach: ecs::MIB },
+            (_, Some(reach)) if reach == ecs::MIB || reach == 2 * ecs::MIB => {
+                Revision::Ecs { reach }
+            }
+            (_, Some(reach)) => {
+                return Err(Error::Property(format!(
+                    "amiga.agnus: `reach` is 1M (an 8372A) or 2M (an 8375), not {reach} bytes"
+                )));
+            }
+        };
+        let mut agnus = Agnus::part(rev, std);
         agnus.custom_path = custom_path;
         agnus.ram_path = ram_path;
         agnus.paula_path = paula_path;
@@ -1199,13 +1368,21 @@ impl Agnus {
         Ok(agnus)
     }
 
-    /// A chip with nothing attached: no bus, no chip RAM, no wires.
+    /// An original chip-set part with nothing attached: no bus, no chip RAM,
+    /// no wires.
     #[must_use]
     pub fn bare(std: Standard) -> Agnus {
+        Agnus::part(Revision::Ocs, std)
+    }
+
+    /// Part `rev` strapped for `std`, with nothing attached.
+    #[must_use]
+    pub fn part(rev: Revision, std: Standard) -> Agnus {
         let shared = Arc::new(Shared {
             std,
-            id: std.agnus_id(),
-            state: Mutex::with_rank(LockRank::DEVICE, State::new()),
+            rev,
+            id: ecs::agnus_id(rev, std),
+            state: Mutex::with_rank(LockRank::DEVICE, State::for_part(rev, std)),
             ticks: AtomicU64::new(0),
             next_event: AtomicU64::new(NO_EVENT),
             dma: Arc::new(ChipDma::new()),
@@ -1252,12 +1429,37 @@ impl Agnus {
         Ok(())
     }
 
+    /// Which part this is.
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.shared.rev
+    }
+
     /// Give the DMA channels chip RAM, in a private space at address zero.
+    ///
+    /// An original part drives as many address bits as the RAM needs. An ECS
+    /// part drives its own: the pointers' high words have "five bits, was 3
+    /// bits" (Appendix C, *Other ECS Modifications*), of which an 8372A wires
+    /// up enough for 1 MiB and an 8375 for 2 MiB — so a smaller RAM repeats
+    /// through the part's reach as it does through an original part's, and a
+    /// larger one is a board that cannot be built.
     ///
     /// # Errors
     ///
-    /// If the region cannot be mapped.
+    /// If the region cannot be mapped, or is larger than an ECS part reaches.
     pub fn attach_ram(&self, region: &crate::core::space::RegionRef) -> Result<()> {
+        if let Revision::Ecs { reach } = self.shared.rev
+            && region.len() > reach
+        {
+            return Err(Error::Config {
+                at: String::from(CLASS_NAME),
+                message: format!(
+                    "{} bytes of chip RAM is more than this ECS Agnus reaches ({reach}); \
+                     `reach = 2M` is the 8375",
+                    region.len()
+                ),
+            });
+        }
         let space = AddressSpace::new(format!("{CLASS_NAME}.chip-ram"), 32);
         {
             let mut topo = space.topology();
@@ -1406,7 +1608,7 @@ impl Device for Agnus {
                     st.beam
                 },
                 field: if kind == ResetKind::Cold { 0 } else { st.field },
-                ..State::new()
+                ..State::for_part(self.shared.rev, self.shared.std)
             };
             *st = fresh;
             self.shared.dma.reset();
@@ -1431,7 +1633,7 @@ impl Device for Agnus {
                 connected: st.connected,
                 video: st.video,
                 paula: st.paula,
-                ..State::new()
+                ..State::for_part(self.shared.rev, self.shared.std)
             };
             loaded.load(r)?;
             let mut dma_state = [0u32; 10];
@@ -1548,6 +1750,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "\"pal\" (the default) or \"ntsc\": line counts, line lengths, VPOSR's identification",
         },
         PropertySpec {
+            name: "revision",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "\"ocs\" (the default: an 8370/8371) or \"ecs\" (an Enhanced Chip Set part: BEAMCON0, the programmable beam, SuperHires fetch, DIWHIGH)",
+        },
+        PropertySpec {
+            name: "reach",
+            kind: ValueKind::Size,
+            required: false,
+            summary: "an ECS part's chip-RAM reach: 1M (the default, an 8372A) or 2M (an 8375)",
+        },
+        PropertySpec {
             name: "paula",
             kind: ValueKind::Link,
             required: false,
@@ -1588,6 +1802,8 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("custom", ValueKind::Link))
         .prop(PropSchema::new("ram", ValueKind::Link))
         .prop(PropSchema::new("standard", ValueKind::Str).values(&["pal", "ntsc"]))
+        .prop(PropSchema::new("revision", ValueKind::Str).values(&["ocs", "ecs"]))
+        .prop(PropSchema::new("reach", ValueKind::Size))
         .prop(PropSchema::new("paula", ValueKind::Link))
         .prop(PropSchema::new("video", ValueKind::Link))
         .port(VSYNC_PIN, PortDir::Out)

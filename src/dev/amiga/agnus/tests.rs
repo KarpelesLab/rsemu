@@ -91,7 +91,10 @@ struct Board {
 
 impl Board {
     fn new(std: Standard) -> Board {
-        let agnus = Agnus::bare(std);
+        Board::on(Agnus::bare(std))
+    }
+
+    fn on(agnus: Agnus) -> Board {
         let custom = Custom::new(&Props::new()).unwrap();
         agnus.attach_bus(custom.bus()).unwrap();
         let ram = Arc::new(RamStore::new(CHIP));
@@ -1120,4 +1123,323 @@ fn a_disk_write_takes_its_words_from_dskpt() {
         0,
         "and Paula finished the block"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the Enhanced Chip Set
+// ---------------------------------------------------------------------------
+
+// Appendix C's ECS register table, the rows this file has no name for yet.
+const E_HTOTAL: u16 = 0x1c0;
+const E_HSSTOP: u16 = 0x1c2;
+const E_HBSTRT: u16 = 0x1c4;
+const E_HBSTOP: u16 = 0x1c6;
+const E_VTOTAL: u16 = 0x1c8;
+const E_VSSTOP: u16 = 0x1ca;
+const E_VBSTRT: u16 = 0x1cc;
+const E_VBSTOP: u16 = 0x1ce;
+const E_HSSTRT: u16 = 0x1de;
+const E_VSSTRT: u16 = 0x1e0;
+
+/// An 8372A (1 MiB) or an 8375 (2 MiB).
+fn ecs_board(std: Standard, reach: u64) -> Board {
+    Board::on(Agnus::part(Revision::Ecs { reach }, std))
+}
+
+#[test]
+fn an_ecs_part_identifies_itself_in_vposr_with_lol_and_v10_v9() {
+    // "8368 (hr) or 8372 (fat-hr) = 20 for PAL, 30 for NTSC", and the later
+    // 2 MiB part's 22 and 31.
+    for (std, reach, id) in [
+        (Standard::Pal, ecs::MIB, 0x20),
+        (Standard::Ntsc, ecs::MIB, 0x30),
+        (Standard::Pal, 2 * ecs::MIB, 0x22),
+        (Standard::Ntsc, 2 * ecs::MIB, 0x31),
+    ] {
+        let b = ecs_board(std, reach);
+        assert_eq!(b.peek(VPOSR), 0x8000 | (id << 8), "{std:?} {reach}");
+    }
+    // "LOF I6-I0 LOL -- -- -- -- v10 v9 V8": NTSC's second line is long.
+    let b = ecs_board(Standard::Ntsc, ecs::MIB);
+    b.run(227);
+    assert_eq!(b.peek(VPOSR), 0xb080, "LOL on the long line");
+    // VPOSW writes V10-V8 on an ECS part, V8 alone on the original.
+    b.poke(VPOSW, 0x8006);
+    assert_eq!(b.peek(VPOSR) & 7, 6);
+    let ocs = Board::new(Standard::Ntsc);
+    ocs.poke(VPOSW, 0x8006);
+    assert_eq!(ocs.peek(VPOSR) & 7, 0, "V10 and V9 are not there to write");
+}
+
+#[test]
+fn beamcon0_comes_out_of_reset_with_the_strap_and_switches_the_standard() {
+    let b = ecs_board(Standard::Pal, ecs::MIB);
+    assert_eq!(b.agnus.next_event_tick(), Some(PAL_FIELD), "a PAL field");
+    // PAL clear: 263 lines, alternating 227 and 228 from a short first line.
+    b.poke(BEAMCON0, 0);
+    assert_eq!(b.agnus.next_event_tick(), Some(263 * 227 + 131));
+    b.poke(BEAMCON0, ecs::LOLDIS);
+    assert_eq!(
+        b.agnus.next_event_tick(),
+        Some(263 * 227),
+        "LOLDIS stops the toggle"
+    );
+    assert_eq!(b.peek(VPOSR) >> 8 & 0x7f, 0x20, "the strap is still PAL");
+    b.poke(BEAMCON0, ecs::PAL);
+    assert_eq!(b.agnus.next_event_tick(), Some(PAL_FIELD));
+}
+
+#[test]
+fn varbeamen_builds_productivity_modes_beam_from_htotal_and_vtotal() {
+    let b = ecs_board(Standard::Pal, ecs::MIB);
+    b.poke(E_HTOTAL, 113);
+    b.poke(E_VTOTAL, 524);
+    b.poke(BEAMCON0, ecs::PAL | ecs::VARBEAMEN | ecs::LOLDIS);
+    assert_eq!(b.agnus.next_event_tick(), Some(525 * 114));
+    b.run(520 * 114 + 3);
+    assert_eq!(b.peek(VHPOSR), 0x0803, "line 520 = $208, count 3");
+    assert_eq!(b.peek(VPOSR) & 7, 2, "V9 of line $208");
+    b.run(5 * 114 - 3);
+    assert_eq!((b.agnus.beam().vpos, b.agnus.beam().field), (0, 1));
+    // Interlaced, the long field is VTOTAL + 2 lines and the short one + 1.
+    b.poke(BPLCON0, LACE);
+    assert_eq!(b.agnus.next_event_tick(), Some(b.agnus.ticks() + 526 * 114));
+}
+
+#[test]
+fn an_original_part_holds_the_ecs_registers_and_counts_as_it_always_did() {
+    let b = Board::pal();
+    for (offset, value) in [
+        (E_HTOTAL, 113),
+        (E_VTOTAL, 524),
+        (E_HSSTRT, 100),
+        (E_HSSTOP, 110),
+        (BEAMCON0, 0x1ba0),
+        (DIWHIGH, 0x0100),
+    ] {
+        b.poke(offset, value);
+    }
+    assert_eq!(b.agnus.next_event_tick(), Some(PAL_FIELD));
+    assert_eq!(b.peek(VPOSR), 0x8000, "an 8371 still");
+    let st = b.agnus.shared.state.lock();
+    assert_eq!(st.ecs[ecs::BEAMCON0], 0x1ba0, "held, for a snapshot");
+    assert!(!st.diwhigh_on, "and not acted on");
+}
+
+#[test]
+fn programmed_sync_moves_both_pins() {
+    let b = ecs_board(Standard::Pal, ecs::MIB);
+    b.poke(E_HSSTRT, 100);
+    b.poke(E_HSSTOP, 110);
+    b.poke(E_VSSTRT, 10);
+    b.poke(E_VSSTOP, 12);
+    b.poke(BEAMCON0, ecs::PAL | ecs::VARHSYEN | ecs::VARVSYEN);
+    // Wired now: out of reset the hardwired windows hold both pins high at
+    // count 0 of line 0, and those would be edges of their own.
+    let hsync = b.wire(HSYNC_PIN, 1);
+    let vsync = b.wire(VSYNC_PIN, 2);
+    assert!(
+        !hsync.level() && !vsync.level(),
+        "count 0 of line 0 is outside both"
+    );
+    b.run(100);
+    assert!(hsync.level(), "HSSTRT");
+    b.run(10);
+    assert!(!hsync.level(), "HSSTOP");
+    b.run(10 * 227 - 110);
+    assert!(vsync.level(), "VSSTRT");
+    b.run(2 * 227);
+    assert!(!vsync.level(), "VSSTOP");
+    b.run(PAL_FIELD - 12 * 227);
+    assert_eq!((hsync.rises(), vsync.rises()), (313, 1), "a field of each");
+}
+
+#[test]
+fn superhires_fetches_four_words_a_block_on_an_ecs_part_only() {
+    for (board, words) in [(ecs_board(Standard::Pal, ecs::MIB), 40), (Board::pal(), 10)] {
+        board.poke(DDFSTRT, 0x18);
+        board.poke(DDFSTOP, 0x60);
+        board.poke(BPLCON0, 0x2240); // two planes, COLOR, SHRES
+        assert_eq!(
+            board.agnus.shared.state.lock().fetch_window(),
+            Some((0x18, words))
+        );
+    }
+}
+
+#[test]
+fn diwhigh_moves_the_vertical_fetch_window_until_diwstrt_or_diwstop_is_written() {
+    let window = |b: &Board, v| b.agnus.shared.state.lock().in_vertical_window(v);
+    let b = ecs_board(Standard::Pal, ecs::MIB);
+    b.poke(DIWSTRT, 0x1e35);
+    b.poke(DIWSTOP, 0xfed5);
+    assert!(
+        !window(&b, 0x1fd),
+        "the old scheme: $FE has V7 set, so V8 is clear"
+    );
+    b.poke(DIWHIGH, 0x0100);
+    assert!(
+        window(&b, 0x1fd) && !window(&b, 0x1fe),
+        "stop V8 from DIWHIGH"
+    );
+    b.poke(DIWSTRT, 0x1e35);
+    assert!(!window(&b, 0x1fd), "written again: the old scheme");
+
+    let ocs = Board::pal();
+    ocs.poke(DIWSTRT, 0x1e35);
+    ocs.poke(DIWSTOP, 0xfed5);
+    ocs.poke(DIWHIGH, 0x0100);
+    assert!(!window(&ocs, 0x1fd), "an 8371 has no DIWHIGH");
+}
+
+#[test]
+fn an_ecs_copper_has_appendix_cs_permission() {
+    let b = ecs_board(Standard::Pal, ecs::MIB);
+    // Without CDANG the blitter block is open, and $3E down is not.
+    b.store(0x5000, &[BLTCON0, 0x09f0, COPCON, 0x0002, 0xffff, 0xfffe]);
+    b.start_copper(0x5000);
+    b.run(100);
+    assert_eq!(
+        b.agnus.shared.state.lock().blitter.con0,
+        0x09f0,
+        "BLTCON0 without CDANG"
+    );
+    assert_eq!(
+        b.agnus.shared.state.lock().copper.phase,
+        Phase::Halted,
+        "and COPCON halts it"
+    );
+    assert_eq!(b.custom.bus().refused_copper_writes(), 1);
+    // With it, "all of the Amiga chip registers": DSKPTH among them.
+    b.store(0x5100, &[DSKPTH, 0x0001, 0xffff, 0xfffe]);
+    b.poke(COPCON, CDANG);
+    b.poke(COP1LCL, 0x5100);
+    b.poke(COPJMP1, 0);
+    b.run(100);
+    assert_eq!(b.agnus.dma().disk_pointer(), 0x0001_0000);
+    assert_eq!(
+        b.custom.bus().refused_copper_writes(),
+        1,
+        "nothing more refused"
+    );
+}
+
+#[test]
+fn the_reach_is_the_parts_and_a_bigger_ram_is_refused() {
+    use crate::core::props::{Link, Value};
+    let props = |rev: &str| {
+        Props::new()
+            .with("custom", Value::Link(Link::new("custom").unwrap()))
+            .with("ram", Value::Link(Link::new("chipram").unwrap()))
+            .with("revision", Value::from(rev))
+    };
+    assert_eq!(
+        Agnus::new(&props("ecs")).unwrap().revision(),
+        Revision::Ecs { reach: ecs::MIB },
+        "an 8372A unless told otherwise"
+    );
+    let two = props("ecs").with("reach", Value::Size(2 * ecs::MIB));
+    assert_eq!(
+        Agnus::new(&two).unwrap().revision(),
+        Revision::Ecs {
+            reach: 2 * ecs::MIB
+        }
+    );
+    assert!(Agnus::new(&props("ecs").with("reach", Value::Size(4 * ecs::MIB))).is_err());
+    assert!(Agnus::new(&props("ocs").with("reach", Value::Size(ecs::MIB))).is_err());
+    assert!(Agnus::new(&props("aga")).is_err());
+
+    let agnus = Agnus::part(Revision::Ecs { reach: ecs::MIB }, Standard::Pal);
+    let ram: RegionRef = Arc::new(Region::ram("chip", Arc::new(RamStore::new(2 * ecs::MIB))));
+    assert!(agnus.attach_ram(&ram).is_err(), "2 MiB on an 8372A");
+}
+
+#[test]
+fn an_ecs_snapshot_round_trips_with_its_beam_and_window() {
+    let setup = |b: &Board| {
+        b.poke(E_HTOTAL, 113);
+        b.poke(E_VTOTAL, 524);
+        b.poke(E_HBSTRT, 110);
+        b.poke(E_HBSTOP, 20);
+        b.poke(E_VBSTRT, 510);
+        b.poke(E_VSSTOP, 5);
+        b.poke(BEAMCON0, ecs::PAL | ecs::VARBEAMEN | ecs::LOLDIS);
+        b.poke(DIWSTRT, 0x1e35);
+        b.poke(DIWSTOP, 0xfed5);
+        b.poke(DIWHIGH, 0x0100);
+    };
+    let saved = ecs_board(Standard::Pal, 2 * ecs::MIB);
+    setup(&saved);
+    saved.run(300 * 114 + 7);
+    let bytes = snapshot(&saved.agnus);
+
+    let restored = ecs_board(Standard::Pal, 2 * ecs::MIB);
+    restore(&restored.agnus, &bytes);
+    assert_eq!(
+        snapshot(&restored.agnus),
+        bytes,
+        "identical after a round trip"
+    );
+    assert!(restored.agnus.shared.state.lock().diwhigh_on);
+    assert_eq!(
+        restored.agnus.next_event_tick(),
+        saved.agnus.next_event_tick(),
+        "the programmed field survives"
+    );
+    saved.run(1000);
+    restored.run(1000);
+    assert_eq!(snapshot(&restored.agnus), snapshot(&saved.agnus));
+}
+
+#[test]
+fn an_ecs_part_hands_denise_the_raster_it_programmed() {
+    use crate::dev::amiga::denise::Raster;
+    let agnus = Agnus::part(Revision::Ecs { reach: ecs::MIB }, Standard::Pal);
+    let custom = Custom::new(&Props::new()).unwrap();
+    agnus.attach_bus(custom.bus()).unwrap();
+    let ram: RegionRef = Arc::new(Region::ram("chip", Arc::new(RamStore::new(CHIP))));
+    agnus.attach_ram(&ram).unwrap();
+    let video = Arc::new(Video::with_revision(
+        denise::Standard::Pal,
+        denise::Revision::Ecs,
+    ));
+    custom
+        .bus()
+        .attach(Arc::clone(&video) as Arc<dyn CustomChip>)
+        .unwrap();
+    agnus.attach_video(Arc::clone(&video));
+    let poke = |o: u16, v: u16| assert!(custom.bus().write(o, v, Origin::cpu()));
+
+    // Out of reset: the original chip set's picture exactly.
+    agnus.advance_to(PAL_FIELD);
+    assert_eq!(
+        video.current_raster(),
+        Raster::standard(denise::Standard::Pal)
+    );
+    assert_eq!(video.geometry(), (800, 568));
+
+    poke(E_HTOTAL, 113);
+    poke(E_VTOTAL, 524);
+    poke(E_HBSTRT, 110);
+    poke(E_HBSTOP, 20);
+    poke(E_VBSTRT, 510);
+    poke(E_VBSTOP, 30);
+    poke(
+        BEAMCON0,
+        ecs::PAL | ecs::VARBEAMEN | ecs::VARVBEN | ecs::HARDDIS | ecs::LOLDIS,
+    );
+    // The rest of this PAL field, then one programmed one.
+    agnus.advance_to(2 * PAL_FIELD + 525 * 114);
+    let raster = video.current_raster();
+    assert_eq!(
+        (
+            raster.first_line,
+            raster.lines,
+            raster.first_clock,
+            raster.clocks
+        ),
+        (30, 480, 20, 90)
+    );
+    assert_eq!(video.geometry(), (2 * 180, 480), "high-resolution columns");
+    assert_eq!(video.field_clocks(), 525 * 114);
 }

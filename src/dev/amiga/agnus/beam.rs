@@ -111,6 +111,41 @@ impl Standard {
 /// How many counts a short line has.
 pub const SHORT_LINE: u16 = 227;
 
+/// The shape of the raster the counters run through: how long a line is, how
+/// many lines a field has, and whether either alternates.
+///
+/// An original chip-set Agnus has one per [`Standard`], wired in. An ECS Agnus
+/// derives it from `BEAMCON0` and, with `VARBEAMEN`, from `HTOTAL` and
+/// `VTOTAL` (see [`ecs`](super::ecs)), which is how productivity mode's 31 kHz
+/// lines are built. Everything that counts the beam takes one of these, and
+/// `Timing::from(std)` is exactly the original chip set's numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// Counts in a short line.
+    pub line: u16,
+    /// Lines alternate between short and one count longer (NTSC's 227/228).
+    pub alternate: bool,
+    /// Lines in a short field.
+    pub field: u16,
+    /// A long field (`LOF` set) is one line longer. Always, for the hardwired
+    /// counters, which is why a non-interlaced display runs 313-line fields;
+    /// for a programmed `VTOTAL`, only while `LACE` is set (Appendix C, *Multi-
+    /// Sync and Bi-Sync Monitors*: "the number of lines in a field(+1). The
+    /// exception is if the INTERLACE bit is set").
+    pub long_field: bool,
+}
+
+impl From<Standard> for Timing {
+    fn from(std: Standard) -> Timing {
+        Timing {
+            line: SHORT_LINE,
+            alternate: std.long_lines(),
+            field: std.short_field(),
+            long_field: true,
+        }
+    }
+}
+
 /// What crossing a count boundary did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Crossing {
@@ -156,19 +191,21 @@ impl Beam {
     /// Counts on the current line.
     #[must_use]
     #[inline]
-    pub const fn line_len(&self, std: Standard) -> u16 {
-        if std.long_lines() && self.lol {
-            SHORT_LINE + 1
+    pub fn line_len(&self, t: impl Into<Timing>) -> u16 {
+        let t = t.into();
+        if t.alternate && self.lol {
+            t.line + 1
         } else {
-            SHORT_LINE
+            t.line
         }
     }
 
     /// Lines in the current field.
     #[must_use]
     #[inline]
-    pub const fn field_len(&self, std: Standard) -> u16 {
-        std.short_field() + self.lof as u16
+    pub fn field_len(&self, t: impl Into<Timing>) -> u16 {
+        let t = t.into();
+        t.field + (self.lof && t.long_field) as u16
     }
 
     /// Move one count. `lace` is `BPLCON0`'s interlace bit, which decides
@@ -179,17 +216,18 @@ impl Beam {
     /// silicon does there, and wrapping at the first boundary it reaches is the
     /// choice that cannot run a counter away.
     #[inline]
-    pub fn advance(&mut self, std: Standard, lace: bool) -> Crossing {
+    pub fn advance(&mut self, t: impl Into<Timing>, lace: bool) -> Crossing {
+        let t = t.into();
         self.hpos += 1;
-        if self.hpos < self.line_len(std) {
+        if self.hpos < self.line_len(t) {
             return Crossing::None;
         }
         self.hpos = 0;
-        if std.long_lines() {
+        if t.alternate {
             self.lol = !self.lol;
         }
         self.vpos += 1;
-        if self.vpos < self.field_len(std) {
+        if self.vpos < self.field_len(t) {
             return Crossing::Line;
         }
         self.vpos = 0;
@@ -203,8 +241,8 @@ impl Beam {
     ///
     /// Always at least one.
     #[must_use]
-    pub fn ticks_to_line(&self, std: Standard) -> u64 {
-        u64::from(self.line_len(std).saturating_sub(self.hpos).max(1))
+    pub fn ticks_to_line(&self, t: impl Into<Timing>) -> u64 {
+        u64::from(self.line_len(t).saturating_sub(self.hpos).max(1))
     }
 
     /// Counts from here until the beam arrives at line 0 of the next field.
@@ -212,15 +250,16 @@ impl Beam {
     /// Always at least one. Does not know whether `LOF` will toggle — it
     /// cannot matter, because the field the beam is in is already sized.
     #[must_use]
-    pub fn ticks_to_field(&self, std: Standard) -> u64 {
-        let mut ticks = self.ticks_to_line(std);
+    pub fn ticks_to_field(&self, t: impl Into<Timing>) -> u64 {
+        let t = t.into();
+        let mut ticks = self.ticks_to_line(t);
         let remaining = self
-            .field_len(std)
+            .field_len(t)
             .saturating_sub(self.vpos)
             .saturating_sub(1);
         let lines = u64::from(remaining);
-        ticks += lines * u64::from(SHORT_LINE);
-        if std.long_lines() {
+        ticks += lines * u64::from(t.line);
+        if t.alternate {
             // The lines after this one alternate, starting with the opposite of
             // this one's length.
             let longs = if self.lol {
@@ -236,19 +275,20 @@ impl Beam {
     /// Where the beam is `n` counts from now, and whether it crossed into a new
     /// field on the way (and so which `LOF` it holds depends on `lace`).
     #[must_use]
-    pub fn ahead(&self, std: Standard, lace: bool, n: u64) -> Beam {
+    pub fn ahead(&self, t: impl Into<Timing>, lace: bool, n: u64) -> Beam {
+        let t = t.into();
         let mut b = *self;
         let mut n = n;
         while n > 0 {
-            let to_line = b.ticks_to_line(std);
+            let to_line = b.ticks_to_line(t);
             if n < to_line {
                 b.hpos += n as u16;
                 break;
             }
             // Land on the last count of the line, then take the boundary.
-            b.hpos = b.line_len(std) - 1;
+            b.hpos = b.line_len(t).saturating_sub(1);
             n -= to_line;
-            b.advance(std, lace);
+            b.advance(t, lace);
         }
         b
     }

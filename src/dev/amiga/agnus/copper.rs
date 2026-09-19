@@ -233,9 +233,15 @@ impl Copper {
     /// register the copper may not write with `danger` in the state it is in.
     ///
     /// Returns whether it stopped. The ranges are chapter 2's: `$00`–`$3E`
-    /// never, `$40`–`$7E` only with `CDANG`.
-    pub fn halt_if_refused(&mut self, offset: u16, danger: bool) -> bool {
-        let refused = offset < 0x40 || (offset < 0x80 && !danger);
+    /// never, `$40`–`$7E` only with `CDANG`. An Enhanced Chip Set copper
+    /// (`ecs`) has Appendix C's instead: with `CDANG` everything, and without it
+    /// everything from `$3E` up (`regs::ecs_copper_may_write`).
+    pub fn halt_if_refused(&mut self, offset: u16, danger: bool, ecs: bool) -> bool {
+        let refused = if ecs {
+            !crate::dev::amiga::regs::ecs_copper_may_write(offset, danger)
+        } else {
+            offset < 0x40 || (offset < 0x80 && !danger)
+        };
         if refused {
             self.phase = Phase::Halted;
         }
@@ -298,16 +304,17 @@ pub fn ticks_until_reached(
     ir1: u16,
     ir2: u16,
     beam: &Beam,
-    std: super::beam::Standard,
+    timing: impl Into<super::beam::Timing>,
 ) -> Option<u64> {
+    let t = timing.into();
     let (_, target) = masked(ir1, ir2, 0, 0);
     let mask = (ir2 & 0x7ffe) | 0x8000;
     let target_v = target & 0xff00;
-    let field_len = beam.field_len(std);
+    let field_len = beam.field_len(t);
 
     // The rest of this line, after the count the beam is on.
     let mut ticks = 0u64;
-    let len = beam.line_len(std);
+    let len = beam.line_len(t);
     if beam.vpos < field_len {
         for h in beam.hpos.saturating_add(1)..len {
             ticks += 1;
@@ -316,7 +323,7 @@ pub fn ticks_until_reached(
             }
         }
     }
-    ticks = beam.ticks_to_line(std);
+    ticks = beam.ticks_to_line(t);
 
     let mut lol = beam.lol;
     let mut v = beam.vpos;
@@ -325,13 +332,13 @@ pub fn ticks_until_reached(
         if v >= field_len {
             return None;
         }
-        if std.long_lines() {
+        if t.alternate {
             lol = !lol;
         }
-        let len = if std.long_lines() && lol {
-            super::beam::SHORT_LINE + 1
+        let len = if t.alternate && lol {
+            t.line + 1
         } else {
-            super::beam::SHORT_LINE
+            t.line
         };
         let position_v = ((v & 0xff) << 8) & mask;
         if position_v > target_v {

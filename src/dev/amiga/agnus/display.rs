@@ -41,6 +41,12 @@
 //!   "the modulo is added to the bitplane pointers" — `BPL1MOD` for the odd
 //!   planes, `BPL2MOD` for the even.
 //!
+//! On an ECS part three things change, all from Appendix C: `DIWHIGH`, once
+//! written after `DIWSTRT`/`DIWSTOP`, gives the vertical window its `V10`–`V8`
+//! directly; `BPLCON0`'s `SHRES` fetches four words a block; and a line the
+//! programmable beam has made shorter than `DDFSTOP` fetches only the blocks
+//! that start before it ends.
+//!
 //! Only `BPLEN` with `DMAEN` fetches. The pointers advance whether or not a
 //! video chip is attached, so the guest-visible state of a board does not
 //! depend on its wiring; the words are only read when somebody will look at
@@ -100,8 +106,9 @@
 
 use alloc::vec::Vec;
 
-use super::beam::{Beam, Standard};
+use super::beam::{Beam, Standard, Timing};
 use super::blitter::Memory;
+use super::ecs;
 use super::{Chip, DmaChannel, Origin, Outward, State};
 
 /// Where a sprite channel is in its field.
@@ -140,6 +147,8 @@ impl SpriteDma {
 
 /// `BPLCON0` bit 15: high resolution.
 const HIRES: u16 = 1 << 15;
+/// `BPLCON0` bit 6 on an ECS part: SuperHires (Appendix C, *SuperHires Mode*).
+const SHRES: u16 = 1 << 6;
 /// `DDFSTRT`/`DDFSTOP` use H8–H3.
 const DDF_BITS: u16 = 0x00fc;
 /// Table 3-14's hardware limits.
@@ -172,16 +181,36 @@ impl State {
         // an inference from Kickstart 2.04 and AROS, which contradicts table
         // 3-14's "49 words"; see the module documentation.
         let blocks = ((stop & !7) - (start & !7)) / 8 + 1;
-        let words = if self.bplcon0 & HIRES != 0 {
-            blocks * 2
+        Some((start, blocks * self.words_per_block()))
+    }
+
+    /// Words fetched per plane in each eight-count block: one in low
+    /// resolution, two in high, and four in SuperHires — Appendix C,
+    /// *SuperHires Mode*: a "35ns pixel display rate - twice the horizontal
+    /// resolution of Hires mode", two planes of which "saturate DMA bandwidth
+    /// as much as four Hires bitplanes".
+    fn words_per_block(&self) -> u16 {
+        if self.shres() {
+            4
+        } else if self.bplcon0 & HIRES != 0 {
+            2
         } else {
-            blocks
-        };
-        Some((start, words))
+            1
+        }
+    }
+
+    /// `BPLCON0` bit 6, `SHRES`, on a part that has it.
+    pub(super) fn shres(&self) -> bool {
+        self.rev.is_ecs() && self.bplcon0 & SHRES != 0
     }
 
     /// Whether line `vpos` is inside the display window vertically.
     pub(super) fn in_vertical_window(&self, vpos: u16) -> bool {
+        if self.diwhigh_on {
+            let (vstart, vstop) =
+                ecs::window_lines(self.diwstrt, self.diwstop, self.ecs[ecs::DIWHIGH]);
+            return (vstart..vstop).contains(&vpos);
+        }
         let vstart = self.diwstrt >> 8;
         let raw = self.diwstop >> 8;
         let vstop = if raw & 0x80 == 0 { raw | 0x100 } else { raw };
@@ -196,9 +225,20 @@ impl State {
 
     /// The beam is leaving `leaving`: fetch its bitplane words and, if a video
     /// chip is attached, queue the line for it.
-    pub(super) fn end_of_line(&mut self, std: Standard, leaving: &Beam, mem: &mut Chip<'_>) {
+    pub(super) fn end_of_line(&mut self, t: Timing, leaving: &Beam, mem: &mut Chip<'_>) {
         let mut planes: [Vec<u16>; 6] = Default::default();
-        let window = self.fetch_window();
+        let clocks = leaving.line_len(t);
+        let mut window = self.fetch_window();
+        if self.rev.is_ecs()
+            && let Some((start, words)) = window
+        {
+            // A programmed line can end before `DDFSTOP` does, and a fetch does
+            // not outlive the line it is on: the blocks that start before the
+            // counter wraps. (A hardwired line is 227 counts, past the `$D8`
+            // limit, so this never shortens one.)
+            let blocks = clocks.saturating_sub(start & !7).div_ceil(8);
+            window = Some((start, words.min(blocks * self.words_per_block())));
+        }
         let start = window.map_or(self.ddfstrt & DDF_BITS, |(s, _)| s);
         if self.dma_on(DmaChannel::BITPLANE)
             && self.in_vertical_window(leaving.vpos)
@@ -223,7 +263,7 @@ impl State {
         if self.video {
             self.outbox.push(Outward::Line {
                 vpos: leaving.vpos,
-                clocks: leaving.line_len(std),
+                clocks,
                 start,
                 planes,
             });
@@ -237,10 +277,15 @@ impl State {
             return;
         }
         let vpos = self.beam.vpos;
+        let first = if self.rev.is_ecs() {
+            ecs::vblank_end(&self.ecs)
+        } else {
+            vblank_stop(std)
+        };
         for x in 0..8 {
             match self.sprite[x] {
                 SpriteDma::Idle => {
-                    if vpos == vblank_stop(std) {
+                    if vpos == first {
                         self.sprite_control(x, mem);
                     }
                 }
