@@ -39,13 +39,15 @@
 //! * The same drive would hang off a CompactFlash socket, a PCMCIA adapter or a
 //!   PCI IDE controller with no change, because none of those change the cable.
 //!
-//! # ATAPI is out of scope
+//! # This is not the packet device
 //!
-//! There is no packet interface here. `IDENTIFY PACKET DEVICE` is aborted,
-//! which is the specified behaviour of a device that is not a packet device and
-//! is how a driver distinguishes the two. A half-built CD-ROM that answered
-//! `IDENTIFY PACKET DEVICE` and then failed on the first `PACKET` would be
-//! worse than an honest refusal.
+//! There is no packet interface in this file, and there is not going to be one:
+//! `IDENTIFY PACKET DEVICE` is aborted, which is the specified behaviour of a
+//! device that is not a packet device (ATA/ATAPI-6 §8.16) and is how a driver
+//! distinguishes the two. The packet device is [`super::atapi`], it is a
+//! separate object that shares this one's *cable* through
+//! [`AtaDevice`](super::AtaDevice), and it shares no command dispatch with it
+//! at all — a `PACKET` command is not a flag on `READ SECTOR(S)`.
 //!
 //! # Time
 //!
@@ -220,7 +222,7 @@ pub const DEV_LBA: u8 = 0x40;
 /// The head number, or LBA bits 27:24.
 pub const DEV_HEAD: u8 = 0x0f;
 /// Bits 7 and 5 are obsolete and read back as ones.
-const DEV_OBSOLETE: u8 = 0xa0;
+pub(super) const DEV_OBSOLETE: u8 = 0xa0;
 
 // ---------------------------------------------------------------------------
 // The Device Control register
@@ -1559,8 +1561,9 @@ impl AtaDisk {
                 self.one_block(state, block);
             }
             cmd::IDENTIFY_PACKET => {
-                // Not a packet device. Aborting is how a driver finds out, and
-                // is the only honest answer while ATAPI is out of scope.
+                // Not a packet device (ATA/ATAPI-6 §8.16). Aborting is how a
+                // driver finds out, and it is what `ata.cdrom` does with
+                // `IDENTIFY DEVICE` in the other direction.
                 self.abort(state);
             }
             cmd::READ_SECTORS | cmd::READ_SECTORS_NORETRY => {
@@ -2126,8 +2129,48 @@ impl AtaDisk {
     }
 }
 
+impl super::AtaDevice for AtaDisk {
+    fn is_selected(&self) -> bool {
+        AtaDisk::is_selected(self)
+    }
+
+    fn write_reg(&self, reg: Reg, value: u16) {
+        AtaDisk::write_reg(self, reg, value);
+    }
+
+    fn read_reg(&self, reg: Reg, debug: bool) -> u16 {
+        AtaDisk::read_reg(self, reg, debug)
+    }
+
+    fn write_device_control(&self, value: u8) {
+        AtaDisk::write_device_control(self, value);
+    }
+
+    fn read_alt_status(&self) -> u8 {
+        AtaDisk::read_alt_status(self)
+    }
+
+    fn irq_asserted(&self) -> bool {
+        AtaDisk::irq_asserted(self)
+    }
+
+    fn power_on_reset(&self) {
+        AtaDisk::power_on_reset(self);
+    }
+
+    fn as_disk(self: Arc<Self>) -> Option<Arc<AtaDisk>> {
+        Some(self)
+    }
+}
+
 /// Put `text` into an ATA ASCII field, space padded and byte-swapped in pairs.
-fn put_string(words: &mut [u16], text: &str) {
+///
+/// `pub(super)` because a packet device's `IDENTIFY PACKET DEVICE` lays its
+/// model, serial and firmware strings out the same way — that is a property of
+/// the *register file*, which the two command sets do share, rather than of
+/// either command set (ATA/ATAPI-6 §8.15.29 and §8.16, which say the same
+/// thing twice for exactly that reason).
+pub(super) fn put_string(words: &mut [u16], text: &str) {
     let bytes = text.as_bytes();
     for (i, word) in words.iter_mut().enumerate() {
         let hi = bytes.get(i * 2).copied().unwrap_or(b' ');

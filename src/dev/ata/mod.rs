@@ -33,10 +33,24 @@
 //! adapters stop working. `dev/ahci` is the second caller and it did not need a
 //! line of `pc/ide` to change.
 //!
-//! **ATAPI is out of scope.** There is no packet interface here, no SCSI
-//! command descriptor block and no CD-ROM: `IDENTIFY PACKET DEVICE` is aborted,
-//! which is exactly what a non-packet device does and exactly how a driver
-//! finds out. Half a CD-ROM would be worse than none.
+//! # Two command sets, one cable
+//!
+//! [`disk`] is a non-packet device and [`atapi`] is a packet one, and the two
+//! share the cable and **nothing else**. What they share is [`AtaDevice`] —
+//! the six calls above, written down as a trait so that a [`bays::Bay`] is a
+//! cable position rather than a hard-disk holder. What they do not share is a
+//! single command opcode: `ata.disk` decodes `READ SECTOR(S)` against a CHS or
+//! LBA address in its own registers, and `ata.cdrom` decodes nothing at all
+//! until a twelve-byte SCSI command descriptor block has arrived through the
+//! data register.
+//!
+//! The falsifiable form: **`disk.rs` and `atapi.rs` share no command dispatch
+//! and no `Volatile`**, and the only names `atapi.rs` imports from `disk` are
+//! the ones that belong to the *register file* — [`Reg`], the two status bits
+//! whose meaning is the same on both kinds of device, and `put_string`, which
+//! is how ATA lays an ASCII field into a word array whatever the device is.
+//! A driver tells them apart by the reset signature, which is the mechanism
+//! ATA/ATAPI-6 §9.1 provides for exactly this and which both devices leave.
 //!
 //! # Finding each other
 //!
@@ -74,10 +88,68 @@
 //! **No emulator source of any licence was consulted, and no operating
 //! system's ATA driver was opened** (`CLAUDE.md`, provenance).
 
+#[cfg(feature = "dev-ata-atapi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-ata-atapi")))]
+pub mod atapi;
 pub mod disk;
 
+#[cfg(feature = "dev-ata-atapi")]
+pub use atapi::{AtapiDrive, CdromDevice};
 pub use disk::taskfile::{Phase, Registers, Taskfile};
 pub use disk::{Address, AtaDisk, Geometry, Identity, Position, Reg};
+
+/// What a host adapter can say to whatever is plugged into a cable position.
+///
+/// The ribbon cable, as a trait. `disk`'s module documentation argues that the
+/// honest seam between a drive and a host adapter is the cable, and lists the
+/// six calls it carries; this is that list, and it exists because there is now
+/// more than one kind of thing on the far end of it. A [`crate::dev::pc::ide`]
+/// channel drives an `ata.disk` and an `ata.cdrom` through the same code
+/// because on a real board it drives them through the same eight ports.
+///
+/// **There is no command here.** Every method names a register or a signal;
+/// what a device does when the Command register is written is the device's own
+/// business, which is the whole content of the split.
+pub trait AtaDevice: Send + Sync + core::fmt::Debug {
+    /// Whether the Device register's `DEV` bit currently names this device.
+    fn is_selected(&self) -> bool;
+
+    /// Write one command block register. **Every device on the cable sees
+    /// every write** — selection is decided by the device, not the adapter.
+    fn write_reg(&self, reg: Reg, value: u16);
+
+    /// Read one command block register. `debug` suppresses every side effect.
+    fn read_reg(&self, reg: Reg, debug: bool) -> u16;
+
+    /// Write the Device Control register, which every device on the cable
+    /// sees: `HOB`, `nIEN` and `SRST`.
+    fn write_device_control(&self, value: u8);
+
+    /// The Status register **without** clearing the pending interrupt — the
+    /// Alternate Status register, and what makes a debugger read safe.
+    fn read_alt_status(&self) -> u8;
+
+    /// Whether `INTRQ` is asserted: an interrupt is pending *and* `nIEN` is not
+    /// holding it off.
+    fn irq_asserted(&self) -> bool;
+
+    /// A power-on or hardware reset. The medium survives; the protocol state
+    /// does not.
+    fn power_on_reset(&self);
+
+    /// The non-packet drive this is, if it is one.
+    ///
+    /// Not a downcast in disguise and not an escape hatch for an adapter: the
+    /// callers are the ones that genuinely need an `AtaDisk` and cannot work
+    /// with anything else — `dev/ahci`, whose command engine speaks the
+    /// taskfile seam, and `dev/amiga/gayle`, whose board never had a CD-ROM on
+    /// its IDE port. A packet device takes the default and answers `None`,
+    /// which those two read as an empty bay, which is the truthful answer to
+    /// "is there a hard disk here".
+    fn as_disk(self: alloc::sync::Arc<Self>) -> Option<alloc::sync::Arc<AtaDisk>> {
+        None
+    }
+}
 
 /// The bay name a drive and an adapter get when neither says.
 pub const DEFAULT_BAY: &str = "ata0";
@@ -94,6 +166,7 @@ pub mod bays {
     use alloc::vec::Vec;
     use core::fmt;
 
+    use super::AtaDevice;
     use super::disk::AtaDisk;
     use crate::core::error::Result;
     use crate::core::hosts::{HostKind, HostObjects};
@@ -124,17 +197,19 @@ pub mod bays {
 
     /// One position on a cable.
     ///
-    /// Holds at most one drive. `Mutex` rather than an atomic because the
-    /// contents are an `Arc` and this is a cold path — a drive is fitted once,
+    /// Holds at most one device, of either kind: a bay is a *connector*, and a
+    /// connector does not care whether the thing in it answers `READ
+    /// SECTOR(S)` or `PACKET`. `Mutex` rather than an atomic because the
+    /// contents are an `Arc` and this is a cold path — a device is fitted once,
     /// during construction, and looked at once per register access afterwards.
     pub struct Bay {
-        drive: Mutex<Option<Arc<AtaDisk>>>,
+        device: Mutex<Option<Arc<dyn AtaDevice>>>,
     }
 
     impl fmt::Debug for Bay {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("Bay")
-                .field("occupied", &self.drive.lock().is_some())
+                .field("occupied", &self.device.lock().is_some())
                 .finish()
         }
     }
@@ -144,7 +219,7 @@ pub mod bays {
         #[must_use]
         pub fn new() -> Bay {
             Bay {
-                drive: Mutex::with_rank(BAY_RANK, None),
+                device: Mutex::with_rank(BAY_RANK, None),
             }
         }
 
@@ -155,29 +230,53 @@ pub mod bays {
         /// The drive back, unchanged, if something is already fitted. The
         /// caller has the names and makes the message.
         pub fn fit(&self, drive: Arc<AtaDisk>) -> core::result::Result<(), Arc<AtaDisk>> {
-            let mut bay = self.drive.lock();
+            self.fit_device(drive)
+                .map_err(|back| back.as_disk().expect("it went in as a disk"))
+        }
+
+        /// Fit anything that speaks the cable, if the bay is empty.
+        ///
+        /// # Errors
+        ///
+        /// The device back, unchanged, if something is already fitted.
+        pub fn fit_device(
+            &self,
+            device: Arc<dyn AtaDevice>,
+        ) -> core::result::Result<(), Arc<dyn AtaDevice>> {
+            let mut bay = self.device.lock();
             if bay.is_some() {
-                return Err(drive);
+                return Err(device);
             }
-            *bay = Some(drive);
+            *bay = Some(device);
             Ok(())
         }
 
-        /// Take the drive out, if there is one.
-        pub fn remove(&self) -> Option<Arc<AtaDisk>> {
-            self.drive.lock().take()
+        /// Take whatever is in the bay out, if there is anything.
+        pub fn remove(&self) -> Option<Arc<dyn AtaDevice>> {
+            self.device.lock().take()
         }
 
-        /// The drive in the bay, if any.
+        /// The **hard disk** in the bay, if what is in it is one.
+        ///
+        /// `None` for an empty bay *and* for a bay with a packet device in it,
+        /// which is the truthful answer to a caller that can only drive a
+        /// non-packet drive. [`Bay::device`] is the question a host adapter
+        /// asks.
         #[must_use]
         pub fn drive(&self) -> Option<Arc<AtaDisk>> {
-            self.drive.lock().clone()
+            self.device.lock().clone()?.as_disk()
         }
 
-        /// Whether there is a drive in it.
+        /// Whatever is in the bay, if anything.
+        #[must_use]
+        pub fn device(&self) -> Option<Arc<dyn AtaDevice>> {
+            self.device.lock().clone()
+        }
+
+        /// Whether there is anything in it.
         #[must_use]
         pub fn is_occupied(&self) -> bool {
-            self.drive.lock().is_some()
+            self.device.lock().is_some()
         }
     }
 
@@ -242,7 +341,10 @@ pub mod bays {
 ///
 /// [`crate::Error::Config`] if something already claimed one of the names.
 pub fn register(registry: &mut crate::core::Registry) -> crate::core::error::Result<()> {
-    disk::register(registry)
+    disk::register(registry)?;
+    #[cfg(feature = "dev-ata-atapi")]
+    atapi::register(registry)?;
+    Ok(())
 }
 
 /// Bind every `ata` class into the machine graph.
@@ -251,11 +353,18 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::core::error::Res
 ///
 /// [`crate::Error::Config`] if a class is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::core::error::Result<()> {
-    disk::bind(bindings)
+    disk::bind(bindings)?;
+    #[cfg(feature = "dev-ata-atapi")]
+    atapi::bind(bindings)?;
+    Ok(())
 }
 
 /// What the validator should know about the `ata` classes.
 #[must_use]
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
-    alloc::vec![disk::schema()]
+    #[allow(unused_mut)]
+    let mut out = alloc::vec![disk::schema()];
+    #[cfg(feature = "dev-ata-atapi")]
+    out.push(atapi::schema());
+    out
 }

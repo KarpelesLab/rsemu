@@ -107,7 +107,8 @@ use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 use crate::dev::ata::bays::{self, Bay};
-use crate::dev::ata::disk::{AtaDisk, Reg};
+use crate::dev::ata::disk::AtaDisk;
+use crate::dev::ata::{AtaDevice, Reg};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -181,14 +182,18 @@ impl fmt::Debug for Channel {
 }
 
 impl Channel {
-    /// Both drives, looked up and the bay locks released — nothing outward
+    /// Both devices, looked up and the bay locks released — nothing outward
     /// happens while a bay is held.
-    fn drives(&self) -> [Option<Arc<AtaDisk>>; 2] {
-        [self.bays[0].drive(), self.bays[1].drive()]
+    ///
+    /// `AtaDevice` rather than `AtaDisk`, because a cable position holds
+    /// whatever is plugged into it: this channel drives an `ata.disk` and an
+    /// `ata.cdrom` through the same eight ports, which is what the cable does.
+    fn drives(&self) -> [Option<Arc<dyn AtaDevice>>; 2] {
+        [self.bays[0].device(), self.bays[1].device()]
     }
 
-    /// The drive that answers a read, if any.
-    fn answering(drives: &[Option<Arc<AtaDisk>>; 2]) -> Option<&Arc<AtaDisk>> {
+    /// The device that answers a read, if any.
+    fn answering(drives: &[Option<Arc<dyn AtaDevice>>; 2]) -> Option<&Arc<dyn AtaDevice>> {
         drives.iter().flatten().find(|drive| drive.is_selected())
     }
 
@@ -251,7 +256,7 @@ impl Channel {
 /// tells a driver there is nothing at that address; ones if the cable is empty
 /// altogether, because then nothing is driving it and the ISA bus's pull-ups
 /// win.
-fn nobody_home(drives: &[Option<Arc<AtaDisk>>; 2]) -> u16 {
+fn nobody_home(drives: &[Option<Arc<dyn AtaDevice>>; 2]) -> u16 {
     if drives.iter().any(Option::is_some) {
         0x0000
     } else {

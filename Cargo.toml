@@ -2123,8 +2123,9 @@ dev-q35 = ["dev-pc", "bus-pci"]
 # DEVICE and its 256 words, READ/WRITE SECTOR(S) and READ/WRITE MULTIPLE in
 # CHS, LBA28 and LBA48, SET MULTIPLE MODE, INITIALIZE DEVICE PARAMETERS -- the
 # command a BIOS uses to make its CHS translation and the drive's agree -- and
-# the software reset protocol. **ATAPI is out of scope**: IDENTIFY PACKET
-# DEVICE aborts, which is what a non-packet device does.
+# the software reset protocol. This is the **non-packet** device: IDENTIFY
+# PACKET DEVICE aborts, which is what a non-packet device does, and the packet
+# device is `dev-ata-atapi` below.
 #
 # Two front doors, one command set. The eight registers are the ribbon cable,
 # and `dev/ata/disk/taskfile` is the same command block as a **struct** for a
@@ -2140,6 +2141,33 @@ dev-q35 = ["dev-pc", "bus-pci"]
 # system's ATA driver was opened (ROADMAP.md §1). `no_std + alloc`, no
 # `unsafe`, no dependencies.
 dev-ata-disk = ["dev-medium"]
+
+# An ATAPI CD-ROM (src/dev/ata/atapi.rs): the packet device that shares
+# `dev-ata-disk`'s cable and none of its command set. `PACKET` and its byte
+# count limit, the C/D + I/O interrupt reason handshake of ATA/ATAPI-6 §9.10,
+# IDENTIFY PACKET DEVICE with the 0xEB14 signature a driver detects the device
+# by, DEVICE RESET, and the sense/REQUEST SENSE mechanism that reports a failed
+# packet command. On top of that the SFF-8020i command subset a boot and an
+# install need: TEST UNIT READY, REQUEST SENSE, INQUIRY, READ CD-ROM CAPACITY,
+# READ(10), READ(12), SEEK(10), READ TOC formats 0 and 1, MODE SENSE(6) and
+# MODE SENSE(10) with pages 01h/0Dh/2Ah, START/STOP UNIT and PREVENT/ALLOW
+# MEDIUM REMOVAL. Everything else answers ILLEGAL REQUEST, which is how a
+# driver finds out what a drive has.
+#
+# The disc is a media slot of 2048-byte logical blocks -- an ISO 9660 image,
+# `--media cdrom=disc.iso`, or a host file through `dev-blk`. A 2352-byte raw
+# rip is **refused by name** rather than read as though it were cooked, and
+# audio tracks are not modelled at all: there is no READ CD and no audio play,
+# because half of either would be worse than an honest refusal.
+#
+# Implies `dev-ata-disk`, and that implication is the design rather than an
+# accident: the register file, the reset signature, the drive bay rendezvous
+# and the `AtaDevice` cable trait all live there, because they belong to the
+# *cable* and not to either command set. Written from T13's ATA/ATAPI-6 and
+# SFF-8020i, cited by clause; no emulator source and no operating system's
+# ATAPI or SCSI driver was opened (ROADMAP.md §1). `no_std + alloc`, no
+# `unsafe`, no dependencies.
+dev-ata-atapi = ["dev-ata-disk"]
 
 # Entering a Linux/x86 kernel with no firmware in between (src/dev/linuxboot.rs):
 # the Linux/x86 boot protocol as a device. It parses a `bzImage`'s setup header,
@@ -2409,6 +2437,7 @@ machine-pc-at = [
   "dev-pc-floppy",
   "dev-pc-ide",
   "dev-ata-disk",
+  "dev-ata-atapi",
 ]
 
 # The same board with **two processors** (machines/pc-at-smp.machine): every
@@ -2459,6 +2488,7 @@ machine-q35 = [
   "dev-pc-video",
   "dev-pc-ide",
   "dev-ata-disk",
+  "dev-ata-atapi",
 ]
 
 # The q35-linux board (machines/q35-linux.machine): the q35 chipset with a

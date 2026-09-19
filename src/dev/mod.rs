@@ -16,6 +16,7 @@
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`arm`] | `dev-arm` | the AArch64 `virt` board: a GICv2, a PL011, PSCI's landing place, and the device tree generator |
 //! | [`ata`] | `dev-ata-disk` | an ATA hard disk: the command block, the command set, CHS and LBA |
+//! | `ata::atapi` | `dev-ata-atapi` | an ATAPI CD-ROM: the packet interface and the MMC subset a boot needs |
 //! | [`atmel`] | `dev-at24c`, `dev-atecc` | Atmel/Microchip I²C parts: the AT24C EEPROM and the ATECC508A/608 secure element |
 //! | [`mos`] | `dev-mos8520` | MOS Technology peripherals: the 8520 CIA an Amiga has two of |
 //! | [`medium`] | `dev-medium` | what a drive's platter *is*: the storage seam every block device stores its bytes behind |
