@@ -16,6 +16,7 @@
 //! | `denise` | `dev-amiga-denise`: Denise — the colour table, playfields, sprites and collisions, driven a line at a time by whatever counts the beam |
 //! | `keyboard` | `dev-amiga-keyboard`: the keyboard — Appendix G's `KCLK`/`KDAT` protocol, keyed from the host through the record/replay seam |
 //! | `mouse` | `dev-amiga-mouse`: the mouse — host motion as quadrature transitions for Denise's counters, and three buttons |
+//! | `rtc` | `dev-amiga-rtc`: an A500+'s battery-backed clock, the Oki MSM6242B at `$DC_0000` |
 //!
 //! plus [`regs`], which is Appendix B of the hardware manual as data and is
 //! what makes the first of those a decode rather than three scattered ones, and
@@ -84,6 +85,9 @@ pub mod keyboard;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-mouse")))]
 pub mod mouse;
 pub mod regs;
+#[cfg(feature = "dev-amiga-rtc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-rtc")))]
+pub mod rtc;
 
 #[cfg(feature = "dev-amiga-paula")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-paula")))]
@@ -118,6 +122,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     floppy::register(registry)?;
     #[cfg(feature = "dev-amiga-agnus")]
     agnus::register(registry)?;
+    #[cfg(feature = "dev-amiga-rtc")]
+    rtc::register(registry)?;
     #[cfg(feature = "dev-amiga-keyboard")]
     keyboard::register(registry)?;
     #[cfg(feature = "dev-amiga-mouse")]
@@ -144,6 +150,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     floppy::bind(bindings)?;
     #[cfg(feature = "dev-amiga-agnus")]
     agnus::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-rtc")]
+    rtc::bind(bindings)?;
     #[cfg(feature = "dev-amiga-keyboard")]
     keyboard::bind(bindings)?;
     #[cfg(feature = "dev-amiga-mouse")]
@@ -166,6 +174,8 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     schemas.push(denise::schema());
     #[cfg(feature = "dev-amiga-agnus")]
     schemas.push(agnus::schema());
+    #[cfg(feature = "dev-amiga-rtc")]
+    schemas.push(rtc::schema());
     #[cfg(feature = "dev-amiga-keyboard")]
     schemas.push(keyboard::schema());
     #[cfg(feature = "dev-amiga-mouse")]

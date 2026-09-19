@@ -724,6 +724,24 @@ pub static AMIGA_A600: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/amiga-a600.machine"),
 };
 
+/// A Commodore Amiga 500+, when this build has the board classes.
+///
+/// The A500 with the Enhanced Chip Set — an 8375 Agnus and an 8373 Denise —
+/// and 1 MiB of chip RAM on the board; `-p chip-ram=2M` is the trapdoor card
+/// that makes it 2 MiB. The `kickstart` slot takes a 512 KiB ROM: 2.04 is the
+/// 500+'s own. No `ext` window: a real 500+ has none.
+/// `machines/amiga-a500plus.machine` carries the wiring, and the *ECS* section
+/// of `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-a500plus")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a500plus")))]
+pub static AMIGA_A500PLUS: CatalogEntry = CatalogEntry {
+    name: "amiga-a500plus",
+    summary: "an Amiga 500+: the A500 with the Enhanced Chip Set (8375 Agnus, 8373 Denise) and \
+              1 MiB of chip RAM",
+    media: &["kickstart", "df0"],
+    source: include_str!("../../machines/amiga-a500plus.machine"),
+};
+
 /// A minimal R3000A board, when this build has a MIPS core.
 ///
 /// A synthetic board rather than a product: a 32-bit **physical** space, a
@@ -823,6 +841,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&AMIGA_A500);
     #[cfg(feature = "machine-amiga-a600")]
     out.push(&AMIGA_A600);
+    #[cfg(feature = "machine-amiga-a500plus")]
+    out.push(&AMIGA_A500PLUS);
     #[cfg(feature = "machine-mips-mini")]
     out.push(&MIPS_MINI);
     #[cfg(feature = "machine-ne2k-mini")]
@@ -2396,6 +2416,14 @@ mod tests {
                 0x00, 0x00, 0x00, 0x08, // PC  = $00000008
                 0x60, 0xfe, // BRA .
             ],
+            // The same, with the stack at the top of the 500+'s 1 MiB.
+            // `tests/amiga_a500plus.rs` runs real programs on it.
+            #[cfg(feature = "machine-amiga-a500plus")]
+            ("amiga-a500plus", "kickstart") => &[
+                0x00, 0x10, 0x00, 0x00, // SSP = $00100000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             #[cfg(feature = "machine-m68k-mini")]
             ("m68k-mini", "firmware") => &[
                 0x00, 0x20, 0x00, 0x00, // SSP = $00200000
@@ -2477,6 +2505,9 @@ mod tests {
             // and an empty DF0, the insert-disk screen.
             #[cfg(feature = "machine-amiga-a600")]
             ("amiga-a600", "hd0" | "df0") => &[],
+            // The 500+'s drive, empty for the same reason.
+            #[cfg(feature = "machine-amiga-a500plus")]
+            ("amiga-a500plus", "df0") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

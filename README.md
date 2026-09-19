@@ -459,7 +459,11 @@ client drives, a test double-clicks the disk icon, opens a Shell and types
 `.wav` in stereo, 0 and 3 left and 1 and 2 right, the way the machine is wired.
 **AROS boots its own boot disk to the Workbook desktop** as well, given the
 extended-ROM socket the board offers and more memory than Commodore ever sold
-in one — the machine file says so where it offers it.
+in one — the machine file says so where it offers it. `amiga-a500plus` is the
+same board with the **Enhanced Chip Set** — an ECS Agnus with `BEAMCON0` and a
+programmable beam, an 8373 Denise with SuperHires — 1 MiB of chip RAM and the
+battery-backed clock; Kickstart 2.04 and 3.1 find the ECS chips there, and
+Workbench 2.04 boots on it.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's

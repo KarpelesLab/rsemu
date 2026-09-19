@@ -1,0 +1,198 @@
+# amiga-a500plus - a Commodore Amiga 500+: the A500 with the Enhanced Chip Set,
+# 1 MiB of chip RAM on the board, and Kickstart 2.04 in its socket.
+#
+#   rsemu run amiga-a500plus --media kickstart=kick.rom
+#   rsemu run amiga-a500plus --media kickstart=kick.rom --media df0=adf:wb204.adf --vnc :5900
+#   rsemu run amiga-a500plus -p chip-ram=2M --media kickstart=kick.rom
+#
+# Everything this file shares with `amiga-a500.machine` - the map and its
+# decoders, the two 8520s, Paula, the drive, the keyboard and the mouse - is
+# wired exactly as there, and that file is where each line of it is argued
+# from the manual. What is argued here is what makes a 500+ a 500+.
+#
+# ---------------------------------------------------------------------------
+# The Enhanced Chip Set
+# ---------------------------------------------------------------------------
+#
+# The Amiga Hardware Reference Manual, 3rd edition, Appendix C: "The Enhanced
+# Chip Set consists of the Agnus (8372-R3) and Denise (8373-R3) custom Amiga
+# chips ... plug-compatible replacements for the originals in the A500". A 500+
+# has them on the board. Its Agnus is the 8375 (part 318069-10 PAL, -11 NTSC),
+# the 2 MiB member of the ECS Agnus family, so `reach = 2M`; its Denise is the
+# 8373. Both are `revision = "ecs"` below, and src/dev/amiga/agnus/ecs.rs and
+# src/dev/amiga/denise.rs say what that turns on: VPOSR's ECS identification,
+# DENISEID, BEAMCON0 and the programmable beam productivity mode is built from,
+# SuperHires, DIWHIGH, BPLCON3, and the copper's wider COPCON rule.
+#
+# Kickstart 2.04's graphics.library looks for exactly those two
+# identifications - "A value of 20 or 30 indicates that the enhanced Hires
+# Agnus is present", and "The enhanced HighRes Denise (8373) will return $FC"
+# (Appendix C, Determining Chip Revisions) - and only then offers the
+# productivity and SuperHires screen modes. `tests/amiga_a500plus.rs` reads
+# GfxBase->ChipRevBits0 out of guest RAM to show that it found them.
+#
+# ---------------------------------------------------------------------------
+# Chip RAM
+# ---------------------------------------------------------------------------
+#
+# 1 MiB on the board, $00 0000 - $0F FFFF (Appendix D's two halves). The
+# trapdoor takes a card that makes it 2 MiB, which the 8375 reaches:
+# `-p chip-ram=2M`. There is no slow RAM at $C0 0000 on a stock 500+, so bank 6
+# is the chip registers again, as on an A500 with its trapdoor empty.
+#
+# ---------------------------------------------------------------------------
+# What is not here
+# ---------------------------------------------------------------------------
+#
+# $E0 0000 - $E7 FFFF   no extended-ROM window: `amiga-a500` has one only for
+#                       AROS's second ROM half, and a real 500+ has none
+#
+# The battery-backed clock at $DC 0000, which an A500 has only on an A501
+# card, is on the 500+'s board and is below (`rtc`).
+#
+# Written from the Amiga Hardware Reference Manual (Commodore-Amiga Inc., 3rd
+# edition), Appendix C for the chip set. No Amiga emulator source was
+# consulted; they are all copyleft (ROADMAP.md 1).
+
+machine "amiga-a500plus" {
+  # -- how much of each memory -----------------------------------------------
+  param chip-ram = 1M
+
+  # 2.04 is a 512 KiB ROM, and so is every Kickstart that runs on a 500+.
+  param kickstart-size = 512K
+
+  # A trapdoor card's slow RAM, for the board that has one: `0` is a stock 500+.
+  param slow-ram = 0
+
+  # Whether Paula keeps stereo output frames for a host audio sink to drain.
+  param audio = false
+
+  # The date the battery-backed clock starts at. Never the host's: a device
+  # may not read the host clock (CLAUDE.md, determinism), so it is declared,
+  # and two runs of this file see the same day. `-p time=...` to change it.
+  param time = "2026-01-01T00:00:00"
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # PAL: 28.37516 MHz. `-p master=28636360` gives the NTSC machine, which also
+  # needs `standard = "ntsc"` on `agnus` and `denise`: the ECS Agnus's
+  # BEAMCON0 comes out of reset with its PAL bit following that strap.
+  param master = 28375160
+  osc   clk    = master Hz
+
+  space mem { width = 24, endian = "big", unassigned = open-bus }
+
+  object cpu "cpu.m68k" {
+    clock  = clk / 4
+    space  = mem
+    engine = "interp"
+  }
+
+  object chipram "ram" { size = chip-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+
+  object custom "amiga.custom" { }
+
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
+
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
+
+  # -- Agnus: an 8375 --------------------------------------------------------
+  #
+  # See src/dev/amiga/agnus/ecs.rs. 2 MiB of reach, VPOSR's identification
+  # $22 (PAL) or $31 (NTSC), and a beam BEAMCON0 can reprogram.
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    revision = "ecs"
+    reach    = 2M
+    paula    = paula
+    video    = denise
+  }
+
+  # -- Denise: an 8373 -------------------------------------------------------
+  #
+  # See src/dev/amiga/denise.rs. Its picture is in SuperHires pixels, four to
+  # a low-resolution one, so a 1280-pixel line fits it; and it is laid out by
+  # the raster Agnus hands over each field, so a productivity-mode beam gives a
+  # picture of productivity mode's shape.
+  object denise "amiga.denise" { custom = custom, clock = clk / 4, revision = "ecs" }
+
+  object gary "amiga.gary" {
+    space    = mem
+    rom      = kick
+    ram      = chipram
+    size     = chip-ram
+    custom   = custom
+    slow-ram = slow-ram
+  }
+
+  # -- the battery-backed clock ----------------------------------------------
+  #
+  # See src/dev/amiga/rtc.rs. An Oki MSM6242B on its own 32.768 kHz watch
+  # crystal - a second oscillator tree, because it is a second can - at the
+  # address Appendix D gives the clock, $DC 0000 - $DC FFFF. Its four address
+  # pins are on A2-A5 and its four data pins on D0-D3, so the sixteen 4-bit
+  # registers are four bytes apart on the low byte lane and the 64-byte block
+  # repeats through the window.
+  osc rtcclk = 32768 Hz
+  object rtc "amiga.rtc" { clock = rtcclk, time = time }
+
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  map mem 0x000000 size chip-ram       = gary.overlay { endian = "big" }
+  map mem 0xDFF000 size 0x200          = custom
+  map mem 0xF80000 size 512K           = mirror(kick) { endian = "big" }
+  map mem 0xBFE000 size 0x1000         = cia_a_decode { endian = "big" }
+  map mem 0xBFD000 size 0x1000         = cia_b_decode { endian = "big" }
+  map mem 0xC00000 size 0x180000       = gary.bank6
+  map mem 0xDC0000 size 0x10000        = mirror(rtc) { endian = "big" }
+
+  wire cia_a.pa0 -> gary.ovl
+
+  wire paula.ipl0 -> cpu.ipl0
+  wire paula.ipl1 -> cpu.ipl1
+  wire paula.ipl2 -> cpu.ipl2
+
+  wire cia_a.irq -> paula.int2
+  wire cia_b.irq -> paula.int6
+
+  wire cia_b.pb7 -> df0.mtr   { pull = "up" }
+  wire cia_b.pb3 -> df0.sel   { pull = "up" }
+  wire cia_b.pb2 -> df0.side  { pull = "up" }
+  wire cia_b.pb1 -> df0.dir   { pull = "up" }
+  wire cia_b.pb0 -> df0.step  { pull = "up" }
+  wire df0.rdy   -> cia_a.pa5 { pull = "up" }
+  wire df0.tk0   -> cia_a.pa4 { pull = "up" }
+  wire df0.wpro  -> cia_a.pa3 { pull = "up" }
+  wire df0.chng  -> cia_a.pa2 { pull = "up" }
+  wire df0.index -> cia_b.flag { pull = "up" }
+
+  # Under BEAMCON0's VARVSYEN and VARHSYEN these follow VSSTRT/VSSTOP and
+  # HSSTRT/HSSTOP, so the TOD counters keep counting fields and lines whatever
+  # rate the beam is programmed to.
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
+
+  osc periph = 1000000 Hz
+
+  object kbd "amiga.keyboard" { clock = periph }
+  wire kbd.kclk  -> cia_a.cnt { pull = "up" }
+  wire cia_a.sp  -> kbd.kdat  { pull = "up" }
+  wire kbd.kdat  -> cia_a.sp
+
+  object mouse "amiga.mouse" { clock = periph }
+  wire mouse.y      -> denise.m0v  { pull = "up" }
+  wire mouse.yq     -> denise.m0vq { pull = "up" }
+  wire mouse.x      -> denise.m0h  { pull = "up" }
+  wire mouse.xq     -> denise.m0hq { pull = "up" }
+  wire mouse.left   -> cia_a.pa6   { pull = "up" }
+  wire mouse.right  -> paula.potly { pull = "up" }
+  wire mouse.middle -> paula.potlx { pull = "up" }
+}
