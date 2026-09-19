@@ -195,13 +195,13 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.call(l.putc);
     a.jmp(done);
 
-    // AH=0Fh: AL is the mode, AH the column count, BH the active page.
     // AH=4Fh, VBE. The subfunction is in AL and `vbe` answers every one of
     // them in the caller's saved AX.
     a.bind(vbe_call);
     a.call(v.entry);
     a.jmp(done);
 
+    // AH=0Fh: AL is the mode, AH the column count, BH the active page.
     a.bind(get_mode);
     a.mov8(AL, Mem::abs(BDA_VIDEO_MODE));
     a.movto8(Mem::bp(F_AX), AL);
