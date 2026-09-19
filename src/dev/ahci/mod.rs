@@ -35,12 +35,21 @@
 //! # PIO and DMA
 //!
 //! Both, because the drive says which and the adapter does not guess. A PIO
-//! command is announced to the driver by a PIO Setup FIS before each data block
-//! and ends by latching that FIS's ending status — `PxIS.PSS`. A DMA command
-//! moves its data and ends with a Register - Device to Host FIS — `PxIS.DHRS`.
-//! Getting that backwards is the kind of thing that works with one driver and
-//! hangs another, which is why [`Phase`](crate::dev::ata::Phase) carries it out
-//! of the drive rather than the adapter deriving it from an opcode.
+//! command is announced to the driver by a PIO Setup FIS before each data
+//! block. A PIO **read** ends by latching the last one's ending status —
+//! `PxIS.PSS` — and no Register FIS follows (Serial ATA 2.6 §11.7, AHCI 1.3.1
+//! §5.6.3.3). A PIO **write** ends with a Register - Device to Host FIS once the
+//! device has taken its last block — `PxIS.DHRS` (§11.8, AHCI §5.6.3.1). A DMA
+//! command moves its data and ends with a Register - Device to Host FIS —
+//! `PxIS.DHRS`. Getting that backwards is the kind of thing that works with one
+//! driver and hangs another, which is why [`Phase`](crate::dev::ata::Phase)
+//! carries it out of the drive rather than the adapter deriving it from an
+//! opcode.
+//!
+//! Every FIS's `I` bit is the drive's own interrupt state at the moment the FIS
+//! would be sent, which is why the drive has one interrupt model and not one
+//! per door: a PIO Setup FIS's is taken *before* its block moves, because that
+//! is when the device sends it.
 //!
 //! A drive only answers the DMA command family when its `dma` property is set,
 //! and the default is off — an AT-class IDE cable has no bus master on it, and

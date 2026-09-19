@@ -435,6 +435,145 @@ fn a_pio_command_and_a_dma_command_move_the_same_bytes_by_different_protocols() 
     assert_eq!(by_pio, stamp(42));
 }
 
+/// `PxIS` bits, named, for the two protocol tests below.
+const IS_DHRS: u32 = 1 << 0;
+const IS_PSS: u32 = 1 << 1;
+
+#[test]
+fn a_multi_block_pio_read_completes_on_its_last_pio_setup_fis() {
+    // Serial ATA 2.6 §11.7: a PIO Setup FIS before every block, each with "The
+    // Interrupt bit shall be set", the last one's ending status "BSY bit
+    // cleared to zero and DRQ bit cleared to zero", and then Device_idle — no
+    // Register FIS. AHCI 1.3.1 §5.6.3.3 and §5.3.9: the HBA completes the slot on
+    // PIO:ClearCI and raises `PxIS.PSS` off that FIS's `I` bit.
+    //
+    // The adapter used to take the `I` bit *after* each block, which on the
+    // last block of a read is the drive's completion interrupt — the one ATA
+    // does not have (ATA/ATAPI-6 §9.5, DPIOI1:DI1). Sampled before the block,
+    // where the FIS is sent, it is the one that announced the block.
+    let rig = rig();
+    rig.start();
+    rig.set(P_IS, 0xffff_ffff);
+    rig.poke(FB, &[0u8; 256]);
+    rig.issue(
+        &Rig::fis(0x20, 3, 10, 0x40), // READ SECTOR(S), three
+        false,
+        &[prd(DATA, 3 * SECTOR, false)],
+    );
+    assert_eq!(rig.prdbc(), 3 * SECTOR as u32);
+    assert_eq!(rig.peek(DATA + 2 * SECTOR, SECTOR), stamp(12));
+    assert_eq!(rig.reg(P_CI), 0, "the slot completed");
+    assert_eq!(
+        rig.reg(P_IS) & (IS_PSS | IS_DHRS),
+        IS_PSS,
+        "PSS, and no DHRS"
+    );
+    assert_eq!(rig.reg(P_TFD) & 0xff, 0x50, "the last E_Status: DRDY | DSC");
+
+    let psfis = rig.peek(FB + 0x20, 20);
+    assert_eq!(psfis[0], 0x5f);
+    assert_eq!(psfis[1] & 0x40, 0x40, "I, on the last block's FIS too");
+    assert_eq!(psfis[15], 0x50, "E_Status: BSY and DRQ clear");
+    assert_eq!(
+        rig.peek(FB + 0x40, 1),
+        alloc::vec![0],
+        "and no Register FIS was posted"
+    );
+    assert!(
+        !rig.drive.taskfile_acknowledge(),
+        "nothing left pending in the drive"
+    );
+}
+
+#[test]
+fn a_pio_write_ends_on_a_register_fis_with_its_interrupt() {
+    // Serial ATA 2.6 §11.8: the first PIO Setup FIS has "the Interrupt bit ...
+    // cleared to zero", every later one set, and after the last block the
+    // device sends a Register - Device to Host FIS "with ... the Interrupt bit
+    // set to one" (DPIOO3). AHCI 1.3.1 §5.6.3.1: "the device shall next send a
+    // D2H Register FIS", and §5.3.8.4 raises `PxIS.DHRS` for it.
+    let rig = rig();
+    rig.start();
+
+    // One block: its only PIO Setup FIS is the first, so `PSS` stays clear and
+    // the command's one interrupt is the D2H FIS's.
+    rig.set(P_IS, 0xffff_ffff);
+    rig.poke(FB, &[0u8; 256]);
+    rig.poke(DATA, &stamp(200));
+    rig.issue(
+        &Rig::fis(0x30, 1, 120, 0x40), // WRITE SECTOR(S)
+        true,
+        &[prd(DATA, SECTOR, false)],
+    );
+    assert_eq!(rig.reg(P_CI), 0);
+    assert_eq!(rig.reg(P_IS) & (IS_PSS | IS_DHRS), IS_DHRS, "DHRS, not PSS");
+    assert_eq!(
+        rig.peek(FB + 0x20, 2),
+        alloc::vec![0x5f, 0x00],
+        "I and D clear"
+    );
+    let rfis = rig.peek(FB + 0x40, 20);
+    assert_eq!(rfis[0], 0x34, "a D2H Register FIS");
+    assert_eq!(rfis[1] & 0x40, 0x40, "with I set");
+    assert_eq!(rfis[2], 0x50, "and the ending status");
+    let mut got = alloc::vec![0u8; SECTOR as usize];
+    Medium::read_at(&*rig.store, 120 * SECTOR, &mut got).expect("the medium reads");
+    assert_eq!(got, stamp(200));
+
+    // Three blocks: the second and third PIO Setup FISes carry `I`, so `PSS`
+    // is raised as well — and the command still ends on the D2H FIS.
+    rig.set(P_IS, 0xffff_ffff);
+    rig.poke(FB, &[0u8; 256]);
+    rig.issue(
+        &Rig::fis(0x30, 3, 130, 0x40),
+        true,
+        &[prd(DATA, 3 * SECTOR, false)],
+    );
+    assert_eq!(rig.reg(P_IS) & (IS_PSS | IS_DHRS), IS_PSS | IS_DHRS);
+    assert_eq!(
+        rig.peek(FB + 0x20, 2),
+        alloc::vec![0x5f, 0x40],
+        "the last FIS has I"
+    );
+    assert_eq!(rig.peek(FB + 0x40, 2), alloc::vec![0x34, 0x40]);
+    assert!(
+        !rig.drive.taskfile_acknowledge(),
+        "the completion was taken"
+    );
+}
+
+#[test]
+fn a_pio_read_that_overflows_its_prd_table_still_ends_as_a_pio_read() {
+    // AHCI 1.3.1 §6.1.5: on a read overflow the HBA "shall make a best effort
+    // to continue", so the rest of the data is taken and dropped. The device
+    // does not know, and sends what Serial ATA 2.6 §11.7 has it send: a PIO
+    // Setup FIS with `I` set before every block and no Register FIS at the
+    // end. `PxIS.PSS` is raised "even if the data transfer resulted in an
+    // error" (§3.3.5).
+    let rig = rig();
+    rig.start();
+    rig.set(P_IS, 0xffff_ffff);
+    rig.poke(FB, &[0u8; 256]);
+    rig.issue(
+        &Rig::fis(0x20, 3, 60, 0x40), // READ SECTOR(S), three
+        false,
+        // Room for half of the first block: the overflow is inside the first
+        // PIO Setup FIS's data, before one has ever completed.
+        &[prd(DATA, SECTOR / 2, false)],
+    );
+    assert_eq!(rig.prdbc(), (SECTOR / 2) as u32, "PRDBC: what landed");
+    assert_eq!(rig.peek(DATA, SECTOR / 2), stamp(60)[..256].to_vec());
+    assert_eq!(rig.reg(P_CI), 0, "not fatal: the slot completed");
+    let is = rig.reg(P_IS);
+    assert_eq!(is & (1 << 24), 1 << 24, "PxIS.OFS");
+    assert_eq!(is & (IS_PSS | IS_DHRS), IS_PSS, "PSS, and no D2H FIS");
+    assert_eq!(rig.peek(FB + 0x40, 1), alloc::vec![0], "none was posted");
+    assert!(
+        !rig.drive.taskfile_acknowledge(),
+        "and the drive is idle with nothing pending"
+    );
+}
+
 #[test]
 fn a_port_that_is_not_receiving_fises_posts_none() {
     // §3.3.7: with `FRE` clear, "received FISes are not accepted by the HBA

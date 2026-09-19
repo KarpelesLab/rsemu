@@ -539,6 +539,108 @@ fn irq_14_reaches_the_processor_and_acknowledges_to_its_vector() {
     assert!(!cpu.intr_asserted());
 }
 
+/// Program both 8259As as a driver that sleeps on IRQ 14 does: vector bases
+/// 0x08 and 0x70, the slave on IR2, and only the cascade and IR6 unmasked.
+fn program_pics(m: &rsemu::machine::Machine) {
+    outb(m, 0x20, 0x11);
+    outb(m, 0x21, 0x08);
+    outb(m, 0x21, 0x04);
+    outb(m, 0x21, 0x01);
+    outb(m, 0x21, 0xfb);
+    outb(m, 0xa0, 0x11);
+    outb(m, 0xa1, 0x70);
+    outb(m, 0xa1, 0x02);
+    outb(m, 0xa1, 0x01);
+    outb(m, 0xa1, 0xbf);
+}
+
+/// Take IRQ 14 if the processor's pin says there is one, the way an interrupt
+/// handler does: acknowledge to the vector, read the drive's Status register
+/// (which is what clears its interrupt pending), and send both EOIs.
+fn take_irq_14(m: &rsemu::machine::Machine, cpu: &X86) -> bool {
+    if !cpu.intr_asserted() {
+        return false;
+    }
+    assert_eq!(cpu.acknowledge(), 0x76, "IRQ 14 and nothing else");
+    let _ = inb(m, CMD + STATUS);
+    outb(m, 0xa0, 0x20);
+    outb(m, 0x20, 0x20);
+    true
+}
+
+#[test]
+fn a_multi_sector_read_takes_one_irq_14_per_sector_and_none_at_the_end() {
+    // T13 ATA/ATAPI-6 §9.5 (Figure 26): a PIO data-in command interrupts when
+    // each DRQ block is ready — before it is read — and the transition out of
+    // the last block "does not set" interrupt pending (DPIOI1:DI1). §6.3 says
+    // it once more: every command completion interrupts "except a PIO data-in
+    // command". So four sectors are four IRQ 14s, each taken before its block,
+    // and the handler that reads the last block has nothing left to wake for.
+    let (m, cpu, _drive) = board();
+    program_pics(&m);
+
+    outb(&m, CMD + DEVICE, 0xe0);
+    outb(&m, CMD + COUNT, 4);
+    outb(&m, CMD + LBA_LOW, 12);
+    outb(&m, CMD + LBA_MID, 0);
+    outb(&m, CMD + LBA_HIGH, 0);
+    outb(&m, CMD + STATUS, 0x20); // READ SECTOR(S)
+
+    let mut taken = Vec::new();
+    for sector in 0..4u64 {
+        // The driver sleeps until IRQ 14, then empties one block.
+        assert!(take_irq_14(&m, &cpu), "IRQ 14 before sector {sector}");
+        taken.push(sector);
+        let mut got = Vec::with_capacity(512);
+        for _ in 0..256 {
+            got.extend_from_slice(&inw(&m).to_le_bytes());
+            assert!(
+                !cpu.intr_asserted() || got.len() == 512,
+                "an interrupt in the middle of a block"
+            );
+        }
+        assert_eq!(got, stamp(12 + sector));
+    }
+    assert_eq!(taken.len(), 4, "one IRQ 14 per sector");
+    assert!(
+        !take_irq_14(&m, &cpu),
+        "a fifth IRQ 14 after the last block — the completion interrupt ATA does not have"
+    );
+    assert_eq!(inb(&m, CTL), ST_DRDY | ST_DSC, "and the command is over");
+}
+
+#[test]
+fn a_multi_sector_write_takes_one_irq_14_after_each_sector() {
+    // §9.6 (Figure 28), the other way round: no interrupt before the first
+    // block (DPIOO0a:DPIOO1), one after each block including the last, which
+    // is the command's completion (DPIOO0:DI0).
+    let (m, cpu, drive) = board();
+    program_pics(&m);
+
+    outb(&m, CMD + DEVICE, 0xe0);
+    outb(&m, CMD + COUNT, 3);
+    outb(&m, CMD + LBA_LOW, 40);
+    outb(&m, CMD + LBA_MID, 0);
+    outb(&m, CMD + LBA_HIGH, 0);
+    outb(&m, CMD + STATUS, 0x30); // WRITE SECTOR(S)
+    assert!(!take_irq_14(&m, &cpu), "no IRQ 14 for the first block");
+
+    let mut count = 0;
+    for sector in 0..3u64 {
+        wait_for_drq(&m);
+        for pair in stamp(90 + sector).chunks(2) {
+            outw(&m, u16::from_le_bytes([pair[0], pair[1]]));
+        }
+        assert!(take_irq_14(&m, &cpu), "IRQ 14 after sector {sector}");
+        count += 1;
+    }
+    assert_eq!(count, 3);
+    assert!(!take_irq_14(&m, &cpu));
+    let mut got = vec![0u8; 512];
+    drive.read_media(42 * 512, &mut got).expect("in range");
+    assert_eq!(got, stamp(92), "the last sector reached the medium");
+}
+
 #[test]
 fn nien_keeps_the_line_down_without_losing_the_transfer() {
     // Every BIOS that polls rather than sleeping sets nIEN first, and a model

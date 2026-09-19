@@ -252,8 +252,16 @@ impl AtaDisk {
     /// takes the completion; the drive's own line drops at that point, and a
     /// model that left it up would hand the *next* command a stale interrupt.
     ///
-    /// Returns whether there was one — the `I` bit a Register - Device to Host
-    /// FIS carries.
+    /// Returns whether there was one — the `I` bit of the FIS the device would
+    /// send at this moment. Serial ATA Revision 2.6 §10.3.10 defines the PIO
+    /// Setup FIS's `I` as reflecting "the interrupt bit line of the device",
+    /// and §11.7/§11.8 set it exactly where ATA/ATAPI-6 §6.3 sets interrupt
+    /// pending, so **when** the caller asks is the whole of the protocol: a PIO
+    /// Setup FIS goes out *before* its block, so its `I` bit is taken before
+    /// the block moves; a Register - Device to Host FIS goes out when the
+    /// command has ended, so its `I` bit is taken then. Nothing here knows
+    /// which FIS is being built, and nothing needs to — the drive's interrupt
+    /// state is the same on both doors.
     pub fn taskfile_acknowledge(&self) -> bool {
         let mut state = self.state.lock();
         let had = state.irq;
@@ -659,6 +667,111 @@ mod tests {
         });
         assert!(disk.taskfile_acknowledge(), "the command completed");
         assert!(!disk.taskfile_acknowledge(), "and the line dropped");
+    }
+
+    /// Run `tf` as a Serial ATA device's transport would, and report the `I`
+    /// bit of every FIS it sends: one per DRQ block, taken **before** the block
+    /// moves because the PIO Setup FIS goes out "just before each and every
+    /// data transfer FIS" (Serial ATA 2.6 §10.3.10.1), and then whatever is
+    /// pending once the command is over — the `I` bit of a Register - Device
+    /// to Host FIS, if the device sends one.
+    fn i_bits(disk: &AtaDisk, tf: &Taskfile, payload: u8) -> (Vec<bool>, bool) {
+        let mut blocks = Vec::new();
+        let mut phase = disk.taskfile_start(tf);
+        while let Phase::Data { out, block, .. } = phase {
+            blocks.push(disk.taskfile_acknowledge());
+            let mut buf = vec![payload; block as usize];
+            let moved = if out {
+                disk.taskfile_write(&buf)
+            } else {
+                disk.taskfile_read(&mut buf)
+            };
+            assert_eq!(moved, block, "a whole block at once");
+            phase = disk.taskfile_phase();
+        }
+        (blocks, disk.taskfile_acknowledge())
+    }
+
+    fn tf(command: u8, count: u16, lba: u64) -> Taskfile {
+        Taskfile {
+            command,
+            count,
+            lba,
+            device: 0x40,
+            ..Taskfile::default()
+        }
+    }
+
+    #[test]
+    fn the_taskfile_door_raises_the_interrupts_the_register_door_does() {
+        // One interrupt model behind both doors, and it is ATA/ATAPI-6 §6.3's.
+        // Serial ATA 2.6 §11 then says which FIS carries each of them, and the
+        // expectations here are §11's own words.
+        let (disk, _store) = drive(true);
+
+        // §11.7 DPIOI1: every data-in PIO Setup FIS has "The Interrupt bit
+        // shall be set", and DPIOI2:1 goes idle after the last Data FIS with no
+        // Register FIS — so nothing is pending at the end.
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::READ_SECTORS, 1, 4), 0),
+            (vec![true], false)
+        );
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::READ_SECTORS, 3, 4), 0),
+            (vec![true, true, true], false)
+        );
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::IDENTIFY, 0, 0), 0),
+            (vec![true], false),
+            "IDENTIFY DEVICE is on §11.7's list"
+        );
+
+        // READ MULTIPLE: one DRQ block, and so one PIO Setup FIS, per four.
+        disk.taskfile_start(&tf(cmd::SET_MULTIPLE, 4, 0));
+        assert!(disk.taskfile_acknowledge(), "SET MULTIPLE MODE completes");
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::READ_MULTIPLE, 6, 8), 0),
+            (vec![true, true], false)
+        );
+
+        // §11.8 DPIOO1: "If this is the first DRQ data block for this command,
+        // the Interrupt bit shall be cleared to zero. If this is not the first
+        // DRQ data block ... set to one", and DPIOO3 ends on a Register FIS
+        // "with ... the Interrupt bit set to one".
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::WRITE_SECTORS, 1, 30), 0x11),
+            (vec![false], true)
+        );
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::WRITE_SECTORS, 3, 30), 0x22),
+            (vec![false, true, true], true)
+        );
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::WRITE_MULTIPLE, 6, 40), 0x33),
+            (vec![false, true], true)
+        );
+
+        // §11.9 DMA data-in: Data FISes with nothing around them, and one
+        // Register FIS with the interrupt at the end (DDMAI2). ATA/ATAPI-6 §9.7
+        // likewise interrupts a DMA command once, at completion.
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::READ_DMA_EXT, 3, 4), 0),
+            (vec![false, false, false], true)
+        );
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::WRITE_DMA_EXT, 2, 50), 0x44),
+            (vec![false, false], true)
+        );
+
+        // §11.6 non-data (DND1), and an error before any data (DPIOI3).
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::FLUSH_CACHE, 0, 0), 0),
+            (vec![], true)
+        );
+        assert_eq!(
+            i_bits(&disk, &tf(cmd::READ_SECTORS, 1, SECTORS + 5), 0),
+            (vec![], true)
+        );
     }
 
     #[test]

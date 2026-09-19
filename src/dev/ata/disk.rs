@@ -77,6 +77,17 @@
 //! block of a write is announced by `DRQ` alone and a driver that waits for an
 //! interrupt before writing it deadlocks on real hardware too.
 //!
+//! Counted, which is how the tests state it: a PIO read of *n* DRQ blocks
+//! interrupts *n* times and a PIO write of *n* blocks interrupts *n* times, but
+//! not at the same places. A read has **no completion interrupt** — emptying
+//! the last block leaves the drive idle with nothing pending (ATA/ATAPI-6 §9.5,
+//! DPIOI1:DI1, "The interrupt pending is not set on this transition") — and a
+//! write's last interrupt *is* its completion (§9.6, DPIOO0:DI0). §6.3 lists
+//! every event that enters the interrupt pending state, and this device enters
+//! it on exactly those: a PIO data-in block ready, a PIO data-out block after
+//! the first ready, and the completion of any other command, successful or not.
+//! A DMA command has no DRQ blocks and interrupts once, at completion (§9.7).
+//!
 //! Making the durations real is the other correct choice: this device would
 //! take a clock domain and post its completion as a scheduler event
 //! (`ROADMAP.md` §4.2). Nothing above [`AtaDisk`]'s five methods would change,
@@ -1287,7 +1298,15 @@ impl AtaDisk {
             return;
         };
         if xfer.left == 0 {
-            self.complete(state, xfer.last, xfer.mode);
+            // ATA/ATAPI-6 §9.5, transition DPIOI1:DI1: the host has read the
+            // last word of the last block and the device goes idle — "The
+            // interrupt pending is not set on this transition." §6.3 says the
+            // same from the other side: every command enters interrupt pending
+            // when it completes *except a PIO data-in command*, whose last
+            // interrupt was the one that announced its last block. A DMA
+            // data-in command is the other kind: §6.3 item 1, one interrupt,
+            // at completion.
+            self.complete(state, xfer.last, xfer.mode, xfer.dma);
             return;
         }
         self.fill_block(state);
@@ -1312,14 +1331,22 @@ impl AtaDisk {
         xfer.next += count;
         state.xfer = Some(xfer.clone());
         if xfer.left == 0 {
-            self.complete(state, xfer.last, xfer.mode);
+            // ATA/ATAPI-6 §9.6, DPIOO0:DI0 — all data transferred: set the
+            // interrupt pending. For a write this *is* the last block's
+            // interrupt, which is why a data-out command has one more of them
+            // than a data-in command of the same length has.
+            self.complete(state, xfer.last, xfer.mode, true);
         } else {
             self.open_block(state);
+            // ATA/ATAPI-6 §9.6, DPIOO0:DPIOO2 and §6.3 item 4: ready to accept
+            // a block *after the first* — set the interrupt pending. This is
+            // here and not in `open_block` because the first block of a write
+            // gets DRQ and no interrupt (DPIOO0a:DPIOO1). A DMA command has no
+            // DRQ blocks at all and interrupts only when it completes (§9.7).
+            if !xfer.dma {
+                state.irq = true;
+            }
         }
-        // A PIO data-out block is acknowledged at its *end*, which is why this
-        // is here and not in `open_block`: the first block of a write gets DRQ
-        // and no interrupt.
-        state.irq = true;
     }
 
     /// Load the next block of a read into the buffer and raise DRQ and INTRQ.
@@ -1338,12 +1365,17 @@ impl AtaDisk {
         xfer.last = xfer.next + count - 1;
         xfer.next += count;
         xfer.left -= count;
+        let dma = xfer.dma;
         state.xfer = Some(xfer);
         state.buf = buf;
         state.pos = 0;
         state.status = ST_IDLE | ST_DRQ;
-        // A PIO data-in block is announced at its *start*.
-        state.irq = true;
+        // A PIO data-in block is announced at its *start*: ATA/ATAPI-6 §6.3
+        // item 3 and §9.5, DPIOI0:DPIOI2. A DMA command's blocks are not
+        // announced at all — it interrupts once, at completion (§9.7).
+        if !dma {
+            state.irq = true;
+        }
     }
 
     /// Open the next block of a write: DRQ, and deliberately no interrupt.
@@ -1371,7 +1403,14 @@ impl AtaDisk {
 
     // -- completion --------------------------------------------------------
 
-    fn complete(&self, state: &mut Volatile, last: u64, mode: Mode) {
+    /// End a command successfully, leaving the address write-back.
+    ///
+    /// `interrupt` is whether completion enters the interrupt pending state,
+    /// and it is a parameter because ATA/ATAPI-6 §6.3 makes it one: item 1
+    /// is "any command *except a PIO data-in command* reaches command
+    /// completion successfully". Every caller but the last block of a PIO read
+    /// passes `true`.
+    fn complete(&self, state: &mut Volatile, last: u64, mode: Mode, interrupt: bool) {
         state.status = ST_IDLE;
         state.error = 0;
         state.xfer = None;
@@ -1379,7 +1418,9 @@ impl AtaDisk {
         state.pos = 0;
         state.count.load(0, 0);
         self.store_address(state, last, mode);
-        state.irq = true;
+        if interrupt {
+            state.irq = true;
+        }
     }
 
     fn fail(&self, state: &mut Volatile, error: u8, at: u64, mode: Mode) {
@@ -1691,7 +1732,7 @@ impl AtaDisk {
             return;
         }
         let last = lba + count - 1;
-        self.complete(state, last, mode);
+        self.complete(state, last, mode, true);
     }
 
     fn seek(&self, state: &mut Volatile) {

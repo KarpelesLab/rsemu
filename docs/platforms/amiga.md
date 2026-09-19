@@ -1080,17 +1080,21 @@ with it.
 | Kickstart 3.1 looping in its first second, nothing on screen | The overlay was dropped only by a write to CIA-B, as the draft says ("the first write to CIA1 (address range of $BFD000 to $BFDFFF)"). Kickstart's first CIA write is to CIA-A (`$BFE001`), and it uses chip RAM at zero long before it first writes CIA-B (`$BFD200`); with the ROM still over the vector table it never got further. On an A600 the CIA-A write can only reach the overlay through Gayle, so the shipped part must negate it there | Either CIA's first write drops it. Test: `the_overlay_is_up_out_of_reset_and_the_first_write_to_either_cia_drops_it` |
 | The insert-disk screen, `$DA0000` never touched | Kickstart writes `$DE1000`, reads it four times, and uses the IDE port only if bit 7 reads 1, 1, 0, 1. Tried against `$0`, `$5`, `$8`, `$9`, `$A`, `$C`, `$E`, `$F` (3.1) and `$0` (2.05): all skip the port; the next four bits (`$D0`, `$D1`, `$DF`) change nothing | The register shifts out `$D0`. Test: `the_id_register_shifts_out_d_msb_first_after_a_write` |
 
-**Found, not fixed — the drive's, not Gayle's.** `ata.disk` raises `INTRQ`
-again when the host empties the last block of a PIO read (`complete()` from
-`block_consumed`). ATA's PIO data-in protocol announces each block with an
-interrupt *before* it is transferred and has no completion interrupt, and
-`disk.rs`'s own module documentation says the same ("a read asserts INTRQ at
-the start of every block"). On the A600 it costs one extra level 2 interrupt
-per read, which `scsi.device` handles — its handler finds the drive idle and
-lets go — so nothing here stops. It is left alone because `pc.ide` and `ahci`
-share the drive and `ahci` takes the pending interrupt as a FIS's `I` bit;
-`tests/amiga_a600_board.rs` asserts "at least two" interrupts rather than
-three so it survives the fix.
+**Found here, fixed in the drive — the drive's, not Gayle's.** `ata.disk`
+used to raise `INTRQ` again when the host emptied the last block of a PIO read.
+ATA's PIO data-in protocol announces each block with an interrupt *before* it
+is transferred and has no completion interrupt (T13 ATA/ATAPI-6 §9.5,
+DPIOI1:DI1, and §6.3's "except a PIO data-in command"). On the A600 it cost one
+extra level 2 interrupt per read, which `scsi.device` handled — its handler
+found the drive idle and let go — so nothing here stopped. It had been left
+because `ahci` read that interrupt as the last PIO Setup FIS's `I` bit; the
+adapter now samples the bit before each block, where Serial ATA 2.6 §10.3.10
+sends the FIS, and the drive raises exactly §6.3's interrupts on both doors.
+`tests/amiga_a600_board.rs` asserts exactly two interrupts for its
+`IDENTIFY DEVICE` and one-sector read (three before the fix). None of the four
+`tests/amiga_a600_hdf.rs` goldens moved, and each frame was looked at again:
+the two Workbench desktops, Workbench 1.3 and the insert-disk screen, as the
+table below describes them.
 
 ### How far each disk gets
 

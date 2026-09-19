@@ -234,10 +234,12 @@ fn a_68000_program_reads_identify_and_a_sector_through_gayle_on_its_interrupt() 
     );
     // Both waits ended on an interrupt, and every interrupt the handler took
     // had Gayle's IDE change bit set: it came through Gayle's latch, not from
-    // anywhere else on INT2. (The drive also raises INTRQ once a read's last
-    // block is emptied, so a third may have arrived after the copy; the count
-    // is at least the two the program waited for.)
-    assert!(read(&m, COUNT, Width::U16) >= 2);
+    // anywhere else on INT2. Exactly two, one per command: both are PIO
+    // data-in commands of a single DRQ block, and T13 ATA/ATAPI-6 §9.5 has the
+    // drive interrupt when that block is ready and *not* when the host has
+    // emptied it (DPIOI1:DI1, "The interrupt pending is not set on this
+    // transition"). A third would be a completion interrupt ATA does not have.
+    assert_eq!(read(&m, COUNT, Width::U16), 2);
     assert_eq!(read(&m, SEEN, Width::U8) & 0x80, 0x80);
     // INTREQ's PORTS is clear again: the handler cleared it, and Gayle let go.
     assert_eq!(read(&m, 0xDF_F01E, Width::U16) & 0x0008, 0);

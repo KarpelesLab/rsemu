@@ -134,6 +134,12 @@
 //!   §8.5.2 the Register - Host to Device FIS layout, §8.5.3 the
 //!   Register - Device to Host FIS, §8.5.8 the PIO Setup FIS. AHCI §4.2.3.1
 //!   defers to it for the FIS formats and does not repeat them.
+//! * **Serial ATA Revision 2.6** — §10.3.10 the PIO Setup FIS and what its
+//!   `I` bit reflects, §10.4.9 the host transport's handling of one, and the
+//!   device command protocols of §11.6-§11.10, which say which FIS ends each
+//!   class of command and with which `I` bit. Read with AHCI §3.3.5
+//!   (`PxIS.PSS`, `PxIS.DHRS`), §5.3.8/§5.3.9 (the D2H and PIO Setup receive
+//!   states) and §5.6.3 (the PIO read and write flows).
 //! * T13's ATA/ATAPI-6 for the command block itself, through
 //!   [`crate::dev::ata`].
 //!
@@ -1543,6 +1549,10 @@ impl Hba {
         let mut blocks: u64 = 0;
         let mut pio = false;
         let mut trouble: u32 = 0;
+        // A PIO Setup FIS whose `I` bit was set and whose data did not all
+        // move. AHCI 1.3.1 §3.3.5: `PxIS.PSS` "shall be set even if the data
+        // transfer resulted in an error".
+        let mut pss_owed = false;
 
         while let Phase::Data { out, dma, block } = phase {
             blocks += 1;
@@ -1553,6 +1563,28 @@ impl Hba {
                 break;
             }
             let before = drive.taskfile_registers().status;
+            // Serial ATA 2.6 §10.3.10.1: the device sends a PIO Setup FIS "just
+            // before each and every data transfer FIS", and its `I` bit is the
+            // device's interrupt line *then*. So it is sampled here, before a
+            // byte moves — which is what makes the count come out as §11.7 and
+            // §11.8 say: every data-in block's FIS has `I` set (DPIOI1), a
+            // data-out command's first has it clear and the rest set (DPIOO1).
+            // Sampling it after the block instead reads the *next* event's
+            // interrupt, and on the last block of a read there is none
+            // (ATA/ATAPI-6 §9.5, DPIOI1:DI1).
+            //
+            // A DMA command has no PIO Setup FIS and the drive raises nothing
+            // per block, so there is nothing to take.
+            let interrupt = if dma {
+                false
+            } else {
+                drive.taskfile_acknowledge()
+            };
+            pss_owed = interrupt;
+            // Known from the first block, not from the first *finished* one: a
+            // PIO command cut short in its first block still ends the way a PIO
+            // command does, below.
+            pio |= !dma;
             let mut left = block;
             while left > 0 {
                 let want = core::cmp::min(left as usize, CHUNK);
@@ -1601,9 +1633,13 @@ impl Hba {
             if !dma {
                 // §5.6.3: a PIO command's data phase is announced by a PIO
                 // Setup FIS carrying the status to show while the block moves
-                // and the status to latch when it has.
-                pio = true;
-                let interrupt = drive.taskfile_acknowledge();
+                // and the status to latch when it has. It is posted here, after
+                // the data, only because this model moves the block inside one
+                // call: `E_Status` is the status the drive reached when the
+                // block had gone, and §5.3.9 sets `PxIS.PSS` at that point
+                // (PIO:Update, then PIO:SetIntr) — "the data related to that
+                // FIS has been transferred" (§3.3.5).
+                pss_owed = false;
                 if job.receiving {
                     self.post_fis(
                         job.fb + PSFIS_AT,
@@ -1640,14 +1676,34 @@ impl Hba {
         let mut write_overflow = false;
         if trouble & IS_OFS != 0 {
             match drive.taskfile_phase() {
-                Phase::Data { out: false, .. } => self.discard(drive),
+                Phase::Data { out: false, .. } => pss_owed |= self.discard(drive),
                 Phase::Data { out: true, .. } => write_overflow = true,
                 Phase::Done => {}
             }
         }
 
+        // The data phase is over, and whatever the drive has pending now is
+        // what it would put in the `I` bit of a Register - Device to Host FIS.
+        //
+        // Whether it sends one is the protocol's, and Serial ATA 2.6 §11 gives
+        // every case: a non-data command ends on one (§11.6, DND1), a DMA
+        // command ends on one (§11.9/§11.10), a PIO data-out command ends on
+        // one after its last block (§11.8, DPIOO3), and *any* command that
+        // fails ends on one (DPIOI3, DPIOO3) — each "with the Interrupt bit set
+        // to one". The single exception is a PIO data-in command that ran to
+        // the end: its last PIO Setup FIS already carried the ending status and
+        // the device goes straight to idle (§11.7, DPIOI2:1). AHCI 1.3.1 §5.6.3.3
+        // is the same fact from the HBA's side — a PIO read completes on
+        // `PIO:ClearCI` and `PxIS.PSS`, with no D2H FIS.
+        //
+        // Those are exactly ATA/ATAPI-6 §6.3's events, so the drive's interrupt
+        // pending state already says which case this is: a PIO command that
+        // left an interrupt pending is a write that completed or a command
+        // that failed, and one that left none is a read that finished. The
+        // adapter reads no opcode to tell them apart.
         let regs = drive.taskfile_registers();
         let interrupt = drive.taskfile_acknowledge();
+        let register_fis = !pio || interrupt;
         // §5.4.1: `PRDBC` is the byte count that actually transferred, and
         // software reads it to find a short transfer.
         let mut prdbc = [0u8; 4];
@@ -1656,11 +1712,7 @@ impl Hba {
         if space.write_bytes(bc_at, &prdbc, self.attrs()).is_err() {
             trouble |= IS_HBFS;
         }
-        if !pio && job.receiving {
-            // §5.6.2: a DMA or non-data command ends with a D2H Register FIS.
-            // A PIO one does not — its last PIO Setup FIS carried the ending
-            // status, which is why `PxIS.PSS` rather than `PxIS.DHRS` is what
-            // a driver waits on there.
+        if register_fis && job.receiving {
             self.post_fis(job.fb + RFIS_AT, &d2h_fis(&regs, interrupt));
         }
 
@@ -1676,8 +1728,11 @@ impl Hba {
         if prdt.fired {
             port.is |= IS_DPS;
         }
-        if !pio && interrupt {
+        if register_fis && interrupt {
             port.is |= IS_DHRS;
+        }
+        if pss_owed {
+            port.is |= IS_PSS;
         }
         port.is |= raised;
         if raised & FATAL != 0 || write_overflow {
@@ -1702,18 +1757,33 @@ impl Hba {
     ///
     /// Bounded by `MAX_BLOCKS` for the reason every walk here is bounded: the
     /// drive is a sibling device and this loop must terminate on its own terms.
-    fn discard(&self, drive: &Arc<AtaDisk>) {
+    ///
+    /// Each PIO block still arrives behind its PIO Setup FIS, so its interrupt
+    /// is taken as `command_fis` takes it; returns whether any of them had the
+    /// `I` bit set, which `PxIS.PSS` reports whatever became of the data
+    /// (AHCI 1.3.1 §3.3.5).
+    fn discard(&self, drive: &Arc<AtaDisk>) -> bool {
         let mut scratch = [0u8; CHUNK];
+        let mut interrupt = false;
         for _ in 0..MAX_BLOCKS {
             match drive.taskfile_phase() {
-                Phase::Data { out: false, .. } => {
+                Phase::Data {
+                    out: false, dma, ..
+                } => {
+                    // Taken before every piece, not only at a block's start:
+                    // the drive sets interrupt pending only when a block
+                    // opens, so asking again part way through finds nothing.
+                    if !dma {
+                        interrupt |= drive.taskfile_acknowledge();
+                    }
                     if drive.taskfile_read(&mut scratch) == 0 {
-                        return;
+                        return interrupt;
                     }
                 }
-                _ => return,
+                _ => return interrupt,
             }
         }
+        interrupt
     }
 }
 

@@ -580,6 +580,266 @@ fn write_multiple_puts_a_whole_block_on_the_medium() {
 }
 
 // ---------------------------------------------------------------------------
+// counting interrupts
+// ---------------------------------------------------------------------------
+//
+// The tests above say *that* an interrupt is up at a given moment. These count
+// them — every rising edge of the line, and the word of the transfer it rose
+// at — because the defect they guard against is one interrupt too many, and a
+// line that is up when it should be passes a test that never asks whether it
+// came back up again.
+//
+// The authority is T13 ATA/ATAPI-6 (T13/1410D revision 3b): §6.3 lists every
+// event that enters the interrupt pending state, and the PIO data-in (§9.5,
+// Figures 25 and 26) and data-out (§9.6, Figures 27 and 28) protocols place
+// them. The host side is driven exactly as Figures 25 and 27 drive it.
+
+/// The interrupt line as a scope on the cable sees it.
+///
+/// `sample` after every register access, with how many data words have moved
+/// so far; `edges` is where the line rose.
+#[derive(Debug, Default)]
+struct Scope {
+    up: bool,
+    edges: Vec<usize>,
+}
+
+impl Scope {
+    fn sample(&mut self, disk: &AtaDisk, words: usize) {
+        let now = disk.irq_asserted();
+        if now && !self.up {
+            self.edges.push(words);
+        }
+        self.up = now;
+    }
+}
+
+/// Issue a PIO data-in command, then be the host of ATA/ATAPI-6 Figure 25 with
+/// nIEN cleared: wait for INTRQ (HPIOI0), read the Status register
+/// (HPIOI1), read one DRQ block (HPIOI2), and go back to waiting until the
+/// data is all in. Returns the bytes and where the line rose.
+fn pio_in(disk: &AtaDisk, command: u8, words: usize, block_words: usize) -> (Vec<u8>, Scope) {
+    let mut scope = Scope::default();
+    disk.write_reg(Reg::Command, u16::from(command));
+    scope.sample(disk, 0);
+    let mut out = Vec::new();
+    let mut moved = 0;
+    while moved < words {
+        assert!(
+            disk.irq_asserted(),
+            "HPIOI0: INTRQ before the block at word {moved}"
+        );
+        let st = status(disk);
+        scope.sample(disk, moved);
+        assert_eq!(st & (ST_BSY | ST_DRQ), ST_DRQ, "HPIOI1: BSY=0, DRQ=1");
+        for _ in 0..block_words.min(words - moved) {
+            let word = disk.read_reg(Reg::Data, false);
+            out.push(word as u8);
+            out.push((word >> 8) as u8);
+            moved += 1;
+            scope.sample(disk, moved);
+        }
+    }
+    // HPIOI2:HI0 — "all blocks for the command have been transferred": the host
+    // is idle and *may* read the Status register. It is not waiting for
+    // anything, and nothing comes.
+    (out, scope)
+}
+
+/// Issue a PIO data-out command and be the host of ATA/ATAPI-6 Figure 27 with
+/// nIEN cleared: check status (HPIOO0), write one DRQ block (HPIOO1), wait for
+/// INTRQ (HPIOO2), and around again until the device reports BSY=0, DRQ=0.
+fn pio_out(disk: &AtaDisk, command: u8, bytes: &[u8], block_words: usize) -> Scope {
+    let mut scope = Scope::default();
+    disk.write_reg(Reg::Command, u16::from(command));
+    scope.sample(disk, 0);
+    let words = bytes.len() / 2;
+    let mut moved = 0;
+    loop {
+        let st = status(disk);
+        scope.sample(disk, moved);
+        if st & (ST_BSY | ST_DRQ) == 0 {
+            break;
+        }
+        assert_eq!(st & (ST_BSY | ST_DRQ), ST_DRQ, "HPIOO0: BSY=0, DRQ=1");
+        for _ in 0..block_words.min(words - moved) {
+            let at = moved * 2;
+            disk.write_reg(
+                Reg::Data,
+                u16::from(bytes[at]) | (u16::from(bytes[at + 1]) << 8),
+            );
+            moved += 1;
+            scope.sample(disk, moved);
+        }
+        assert!(
+            disk.irq_asserted(),
+            "HPIOO2: INTRQ after the block ending at word {moved}"
+        );
+    }
+    assert_eq!(moved, words, "the device asked for every word");
+    scope
+}
+
+/// Point the command block at `count` sectors from `lba`, LBA mode.
+fn aim(disk: &AtaDisk, lba: u8, count: u8) {
+    select_lba(disk, 0);
+    disk.write_reg(Reg::SectorCount, u16::from(count));
+    disk.write_reg(Reg::LbaLow, u16::from(lba));
+    disk.write_reg(Reg::LbaMid, 0);
+    disk.write_reg(Reg::LbaHigh, 0);
+}
+
+#[test]
+fn read_sectors_of_one_sector_interrupts_once_and_not_at_completion() {
+    // §6.3 item 3: "the device is ready to send a data block during a PIO
+    // data-in command"; item 1: "any command *except a PIO data-in command*
+    // reaches command completion successfully". §9.5, DPIOI1:DI1: "The
+    // interrupt pending is not set on this transition."
+    let disk = stamped(4096);
+    aim(&disk, 5, 1);
+    let (bytes, mut scope) = pio_in(&disk, cmd::READ_SECTORS, 256, 256);
+    assert_eq!(bytes, stamp(5));
+    assert_eq!(disk.read_alt_status(), ST_DRDY | ST_DSC, "complete");
+    scope.sample(&disk, 256);
+    assert_eq!(scope.edges, [0], "one interrupt, before the block");
+    assert!(!disk.irq_asserted(), "and none pending at completion");
+}
+
+#[test]
+fn read_sectors_of_n_sectors_interrupts_once_per_block_at_its_start() {
+    let disk = stamped(4096);
+    aim(&disk, 20, 5);
+    let (bytes, mut scope) = pio_in(&disk, cmd::READ_SECTORS, 5 * 256, 256);
+    for (i, sector) in bytes.chunks(SECTOR as usize).enumerate() {
+        assert_eq!(sector, &stamp(20 + i as u64)[..]);
+    }
+    // A driver that never read the Status register at all (polling the
+    // alternate status instead) would find the line still up from the last
+    // block; one that followed Figure 25 finds it down, and it stays down.
+    assert_eq!(status(&disk), ST_DRDY | ST_DSC);
+    scope.sample(&disk, 5 * 256);
+    assert_eq!(
+        scope.edges,
+        [0, 256, 512, 768, 1024],
+        "five blocks, five interrupts"
+    );
+}
+
+#[test]
+fn read_multiple_interrupts_once_per_drq_block_of_n_sectors() {
+    // §9.5 applies unchanged; READ MULTIPLE only makes the DRQ block bigger
+    // (the SET MULTIPLE MODE count), with a short last block for the residue.
+    let disk = stamped(4096);
+    disk.write_reg(Reg::SectorCount, 4);
+    disk.write_reg(Reg::Command, u16::from(cmd::SET_MULTIPLE));
+    assert_eq!(status(&disk) & ST_ERR, 0);
+    aim(&disk, 30, 10);
+    let (bytes, mut scope) = pio_in(&disk, cmd::READ_MULTIPLE, 10 * 256, 4 * 256);
+    assert_eq!(&bytes[9 * 512..], &stamp(39)[..]);
+    scope.sample(&disk, 10 * 256);
+    assert_eq!(
+        scope.edges,
+        [0, 1024, 2048],
+        "4 + 4 + 2 sectors: three blocks"
+    );
+    assert!(!disk.irq_asserted());
+}
+
+#[test]
+fn identify_device_interrupts_once_before_its_block() {
+    // IDENTIFY DEVICE is in §9.5's own list of PIO data-in commands, and its
+    // command description says the same: "sets the DRQ bit to one, clears the
+    // BSY bit to zero, and asserts INTRQ if nIEN is cleared to zero".
+    let disk = drive(4096);
+    let (bytes, mut scope) = pio_in(&disk, cmd::IDENTIFY, 256, 256);
+    assert_eq!(bytes[510], 0xa5, "the signature byte of word 255");
+    scope.sample(&disk, 256);
+    assert_eq!(scope.edges, [0]);
+    assert!(!disk.irq_asserted());
+}
+
+#[test]
+fn write_sectors_interrupts_after_every_block_including_the_last() {
+    // §6.3 item 4: "ready to accept a data block *after the first* data block
+    // during a PIO data-out command"; item 1: completion. §9.6: DPIOO0a:DPIOO1
+    // opens the first block with no interrupt, DPIOO0:DPIOO2 sets it for each
+    // later one, DPIOO0:DI0 for "all data for command transferred".
+    let disk = drive(4096);
+    let mut payload = Vec::new();
+    for lba in 50..53 {
+        payload.extend_from_slice(&stamp(lba));
+    }
+    aim(&disk, 50, 3);
+    let scope = pio_out(&disk, cmd::WRITE_SECTORS, &payload, 256);
+    assert_eq!(
+        scope.edges,
+        [256, 512, 768],
+        "none before the first block, one after each"
+    );
+    let mut got = alloc::vec![0u8; payload.len()];
+    disk.read_media(50 * SECTOR, &mut got).expect("in range");
+    assert_eq!(got, payload);
+
+    // One sector: the one interrupt is the completion.
+    aim(&disk, 60, 1);
+    let scope = pio_out(&disk, cmd::WRITE_SECTORS, &stamp(60), 256);
+    assert_eq!(scope.edges, [256]);
+}
+
+#[test]
+fn write_multiple_interrupts_once_per_drq_block_of_n_sectors() {
+    let disk = drive(4096);
+    disk.write_reg(Reg::SectorCount, 4);
+    disk.write_reg(Reg::Command, u16::from(cmd::SET_MULTIPLE));
+    assert_eq!(status(&disk) & ST_ERR, 0);
+    let payload = alloc::vec![0x6bu8; 6 * SECTOR as usize];
+    aim(&disk, 70, 6);
+    let scope = pio_out(&disk, cmd::WRITE_MULTIPLE, &payload, 4 * 256);
+    assert_eq!(scope.edges, [1024, 1536], "4 + 2 sectors: two blocks");
+}
+
+#[test]
+fn nien_keeps_the_line_down_for_a_whole_transfer_and_leaves_nothing_behind() {
+    // §5.2.9: "When the nIEN bit is set to one ... the INTRQ signal shall be
+    // released." The host of Figures 25 and 27 then takes the nIEN = 1 branches:
+    // it reads the Status register before every block instead of waiting.
+    let disk = stamped(4096);
+    disk.write_device_control(CTL_NIEN);
+    aim(&disk, 3, 3);
+    disk.write_reg(Reg::Command, u16::from(cmd::READ_SECTORS));
+    let mut scope = Scope::default();
+    for block in 0..3 {
+        scope.sample(&disk, block * 256);
+        assert_eq!(status(&disk) & (ST_BSY | ST_DRQ), ST_DRQ, "HPIOI1");
+        assert_eq!(drain(&disk, 256), stamp(3 + block as u64));
+        scope.sample(&disk, (block + 1) * 256);
+    }
+    assert!(
+        scope.edges.is_empty(),
+        "nIEN held the line down: {:?}",
+        scope.edges
+    );
+    // Letting the line go afterwards finds nothing pending: each block's
+    // interrupt was acknowledged by the status read before it, and the end of
+    // a PIO read sets none.
+    disk.write_device_control(0);
+    assert!(
+        !disk.irq_asserted(),
+        "no completion interrupt was being held back"
+    );
+
+    // A write's completion *is* an interrupt, so nIEN holds it rather than
+    // losing it — and releasing nIEN before reading the status shows it.
+    disk.write_device_control(CTL_NIEN);
+    aim(&disk, 9, 1);
+    disk.write_reg(Reg::Command, u16::from(cmd::WRITE_SECTORS));
+    fill(&disk, &stamp(9));
+    assert!(!disk.irq_asserted());
+    disk.write_device_control(0);
+    assert!(disk.irq_asserted(), "the completion was pending all along");
+}
+
+// ---------------------------------------------------------------------------
 // MemAttrs::debug
 // ---------------------------------------------------------------------------
 
