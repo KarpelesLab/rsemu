@@ -43,11 +43,14 @@ ids do not match, the firmware finds the card, maps the ROM, and silently
 declines to run it; measured, both ways, in the section below.
 
 `--bios` and `--vgabios` are conveniences over `--media bios=…`, and so are
-`--hd0` and `--hd1`, which fill the two drive bays on the primary IDE channel;
+`--hd0` and `--hd1`, which fill the two drive bays on the primary IDE channel,
+and `--cdrom`, which puts a disc in the CD-ROM drive on the secondary channel;
 the mechanism is the media table and nothing else. An unbound `hd0` or `hd1` is
-an **empty bay**, not an error — a PC with no hard disk is an ordinary PC, and a
-drive bound that way costs its whole capacity in host memory the moment it
-exists, because the media table is bytes.
+an **empty bay**, not an error — a PC with no hard disk is an ordinary PC — and
+an unbound `cdrom` is an **open tray**: the drive is still on the cable and
+still answers, with `MEDIUM NOT PRESENT`. A medium bound this way costs its
+whole size in host memory the moment it exists, because the media table is
+bytes, which for a disc matters more than it does for a small disk.
 
 A build with `dev-blk` has the other option, which is the one you want for a
 disk of any size:
