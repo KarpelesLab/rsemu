@@ -557,11 +557,11 @@ fn board(name: &str, text: &str, socket: Socket, pm_timer: bool, mode: Threading
 fn board_with(name: &str, text: &str, image: Vec<u8>, mode: ThreadingMode) -> Machine {
     let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
     options.realize.media.insert("bios", image);
-    // `q35` declares a video option-ROM socket and a hard disk and refuses to
-    // realize with nothing bound to either. An empty image is an empty socket
-    // and a drive with no platter, which is what this test wants: it reads
-    // clocks and nothing else.
-    for slot in ["vgabios", "hd0", "hd1", "floppy"] {
+    // `q35` declares a video option-ROM socket, two hard disks and a CD-ROM,
+    // and refuses to realize with nothing bound to any of them. No bytes is an
+    // empty socket, a drive with no platter and an open tray, which is what
+    // this test wants: it reads clocks and nothing else.
+    for slot in ["vgabios", "hd0", "hd1", "floppy", "cdrom"] {
         options.realize.media.insert(slot, Vec::new());
     }
     options.realize.threading = Some(mode);
