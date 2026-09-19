@@ -811,8 +811,54 @@ fn the_hard_wired_flag_bits_cannot_be_written() {
     m.cpu.step();
     m.cpu.step();
     assert_eq!(m.regs().eflags, flags::RESERVED_SET);
-    assert_eq!(Regs::normalise_flags(Variant::I8088, 0x0000), 0xf002);
-    assert_eq!(Regs::normalise_flags(Variant::I8088, 0xffff), 0xffd7);
+    assert_eq!(Regs::normalise_flags(Config::I8088, 0x0000), 0xf002);
+    assert_eq!(Regs::normalise_flags(Config::I8088, 0xffff), 0xffd7);
+}
+
+#[test]
+fn the_identification_flag_is_writable_on_a_part_that_has_cpuid() {
+    // The probe every x86 startup path opens with, in the sixteen-bit real
+    // mode a processor comes out of `RESET` and out of a Start-Up in: push the
+    // flags, flip bit 21, pop them back, push again, and see whether it moved.
+    // "The ability of a program to set or clear this flag is one way to
+    // determine whether a processor supports the `CPUID` instruction" — *Intel
+    // SDM* Vol 1 §3.4.3.3 — so a core that answers *no* here is telling a
+    // guest it is a pre-1993 part whatever `CPUID` would have said.
+    let m = Machine::new(Config::X86_64);
+    m.load(
+        0x0000,
+        0x0100,
+        &[
+            0x66, 0x9c, // pushfd
+            0x66, 0x58, // pop eax
+            0x66, 0x35, 0x00, 0x00, 0x20, 0x00, // xor eax, 0x00200000
+            0x66, 0x50, // push eax
+            0x66, 0x9d, // popfd
+            0x66, 0x9c, // pushfd
+            0x66, 0x5b, // pop ebx
+        ],
+    );
+    m.set_regs(|r| {
+        r.ss = 0x2000;
+        r.rsp = 0x0100;
+    });
+    for _ in 0..7 {
+        m.cpu.step();
+    }
+    assert_eq!(
+        m.regs().rbx as u32 & flags::ID,
+        flags::ID,
+        "the flag went in and did not come back out"
+    );
+
+    // And the part that has no `CPUID` to announce keeps none of it. The two
+    // are the same fact: `Config::flag_mask`.
+    let mut features = Config::I80486.features;
+    features.extras_486 = false;
+    assert_eq!(
+        Regs::normalise_flags(Config::I80486.with_features(features), flags::ID) & flags::ID,
+        0
+    );
 }
 
 #[test]

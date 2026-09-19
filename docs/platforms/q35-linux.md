@@ -666,6 +666,10 @@ list of what acceleration still costs.
 and `nproc` in the initramfs says `2`. On the board's own command line, in
 about **1.7 seconds of wall clock** to that line and 2.8 to the shell.
 
+**Interpreted, it says the same**, and took three separate defects to get
+there; the third is [below](#and-a-third-one-which-only-the-interpreter-could-show)
+and was a single bit of the flags register.
+
 The board is six lines different from this one, five of them
 `machines/pc-at-smp.machine`'s: a second `cpu.x86`, a second `pc.lapic` that
 names it with `cpu = cpu1`, the I/O APIC moved to id 2 out of `lapic1`'s way,
@@ -708,6 +712,115 @@ now discriminates and it did not before**, and the reason it did not is that a
 machine whose clocks stand still never gets either mapping as far as
 `smpboot`. Two facts, one behind the other; the outer one had to go first, and
 while it was there the inner one was untestable rather than absent.
+
+### And a third one, which only the interpreter could show
+
+Both paragraphs above are about `--accel kvm`. **Interpreted, the same board
+brought up one processor** long after it worked on host silicon, and printed
+the same sentence the negative control prints:
+
+```text
+[   25.047530] smpboot: x86: Booting SMP configuration:
+[   35.056901] CPU1 failed to report alive state
+[   35.067278] smpboot: Total of 1 processors activated (199.98 BogoMIPS)
+```
+
+Same tables, same APIC addresses, same kernel, same firmware-less loader. What
+made it tractable was that the accelerated run was *right*, so the difference
+had to be in `cpu::x86` and nowhere else.
+
+Watching the second processor's architectural state once per virtual
+millisecond placed it in one line. It did leave wait-for-SIPI; it did reach the
+page the Start-Up named — `CS` at `0x9800`, so physical `0x98000`, the
+kernel's own real-mode trampoline — and then it stopped, 4 172 bytes in, on a
+`HLT` followed by a jump back to it, with `CR0` still zero. It never got as far
+as protected mode, let alone long mode. The registers at that halt said the
+rest: `EAX = 1`, `EBX = 2`, `EFLAGS = 2`.
+
+**`EBX = 2` is a copy of the flags register, and `EFLAGS = 2` is the flags
+register.** That pair is the middle of the probe *Intel SDM* Vol 1 §3.4.3.3
+describes: `PUSHFD`, save the word, flip bit 21 — the identification flag —
+`POPFD`, `PUSHFD`, and compare. The two were equal, so the flag had not moved,
+so the trampoline concluded the processor predates `CPUID` and returned its
+no-long-mode code in `EAX`.
+
+It had not moved because `Regs::normalise_flags` masked it away: `EFLAGS.ID`
+had no storage in this core at all.
+
+Nothing had ever noticed, and the asymmetry is the interesting part. The
+**bootstrap** processor's path over this flag does not depend on it — it has
+been booting this kernel to a shell on this board for months, and it enters
+through `x86.linuxboot` at the kernel's 32-bit entry point, already in
+protected mode. The **application** processor's does: a Start-Up leaves a
+processor in sixteen-bit real mode (SDM Vol 3A §8.4.3), and the trampoline
+waiting for it there opens by asking whether the part has `CPUID` at all. One
+flag bit, on a path only the processor that boots second ever takes — which is
+why a board with one processor, and the same board with two under KVM, both
+look perfectly healthy.
+
+The fix is `Config::flag_mask`: `ID` has storage exactly where `CPUID` is an
+instruction, because announcing `CPUID` is the only thing the flag does. The
+regression test is ROM-free and in `tests/pc_apic_smp.rs` —
+`the_started_processor_finds_its_own_cpuid_and_long_mode` hand-assembles the
+§B.4 sequence in full, has the started processor run the same probe in the same
+real mode and write one of three sentinels, and has the *bootstrap* processor
+spin on that word in guest code rather than letting the harness poll it. With
+the flag masked away again it fails with `0xdead0001`, which is its name for
+"the probe said this part predates `CPUID`".
+
+Interpreted, the board now says:
+
+```text
+[   24.985411] smp: Bringing up secondary CPUs ...
+[   25.047530] smpboot: x86: Booting SMP configuration:
+[   25.048792] .... node  #0, CPUs:      #1
+[   25.153857] smp: Brought up 1 node, 2 CPUs
+[   25.155426] smpboot: Total of 2 processors activated (398.19 BogoMIPS)
+```
+
+and it reaches userspace on both. `nproc`, `/proc/interrupts` and `/proc/stat`
+at the initramfs shell, on the board's own command line, after 304 seconds of
+guest time:
+
+```text
+rsemu# nproc; cat /proc/interrupts; head -3 /proc/stat
+2
+           CPU0       CPU1
+  0:       2168          0   IO-APIC   2-edge      timer
+  4:          0        119   IO-APIC   4-edge      ttyS0
+  8:          1          0   IO-APIC   8-edge      rtc0
+  9:          0          0   IO-APIC   9-fasteoi   acpi
+NMI:          0          0   Non-maskable interrupts
+LOC:      35657      22860   Local timer interrupts
+RES:         68         18   Rescheduling interrupts
+CAL:        154        346   Function call interrupts
+cpu  34 0 21592 54514 0 0 9 0 0 0
+cpu0 0 0 13375 46163 0 0 0 0 0 0
+cpu1 34 0 8217 8350 0 0 9 0 0 0
+```
+
+Both columns move, in both directions: the second processor took the serial
+port's interrupts, both sent the other rescheduling and function-call IPIs, and
+`/proc/stat` gives `cpu1` user time of its own. That is the same standard
+`riscv-virt-smp` and `arm64-virt-smp` are held to.
+
+### One line in that boot is new and is not this defect
+
+`Measured 22 cycles TSC warp between CPUs, turning off TSC clock`, and then
+`Marking TSC unstable due to check_tsc_sync_source failed`. The two counters
+are a couple of dozen cycles apart when the second processor starts: a parked
+processor is charged its budget exactly, while a running one is charged whole
+instructions and carries the overshoot as `State::debt`, so its `RDTSC` stands
+ahead of its clock domain by however much the instruction in flight overran.
+The kernel compares the two, disbelieves the counter, and uses the HPET.
+
+It could not appear before, because nothing ever ran on the second processor
+for the kernel to compare against. It costs a **clocksource**, not a processor
+— the boot above is with it — and one cosmetic thing worth knowing so nobody
+hunts it twice: `printk` timestamps stop advancing at the switch, because an
+unstable TSC takes `sched_clock` off it too. The fix belongs with
+`State::debt` rather than with anything in this file, and it is a separate
+piece of work.
 
 ### Selecting acceleration
 

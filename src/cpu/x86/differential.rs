@@ -744,7 +744,7 @@ impl Case {
     }
 
     fn start_eflags(&self) -> u32 {
-        Regs::normalise_flags(self.variant, self.eflags)
+        Regs::normalise_flags(config(self), self.eflags)
     }
 }
 

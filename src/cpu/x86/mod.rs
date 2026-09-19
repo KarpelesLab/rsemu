@@ -391,6 +391,31 @@ pub mod flags {
     pub const VM: u32 = 0x0002_0000;
     /// Alignment check, bit 18 (80486).
     pub const AC: u32 = 0x0004_0000;
+    /// Identification, bit 21 (late 80486 and later).
+    ///
+    /// The one flag that means nothing by itself: it controls nothing, it is
+    /// set and cleared by nothing the processor does, and its whole purpose is
+    /// that software can *write* it. "The ability of a program to set or clear
+    /// this flag is one way to determine whether a processor supports the
+    /// `CPUID` instruction" — *Intel SDM* Vol 1 §3.4.3.3, and Vol 2A's `CPUID`
+    /// entry says the same from the other side.
+    ///
+    /// So a core with `CPUID` and no storage here answers the standard probe —
+    /// `PUSHFD`, flip bit 21, `POPFD`, `PUSHFD`, compare — with *no processor
+    /// identification*, and the guest concludes it is on a pre-`CPUID` part.
+    /// Which is what a Linux application-processor trampoline concluded on
+    /// `q35-linux-smp`: a Start-Up leaves a processor in sixteen-bit real mode
+    /// (Vol 3A §8.4.3), the code waiting for it there opens with that probe,
+    /// it read the flag back unchanged, and it halted rather than entering
+    /// long mode. The bootstrap processor's own path never asks, which is why
+    /// a one-processor board looked healthy for months.
+    ///
+    /// Bits 19 and 20 — `VIF` and `VIP` — are deliberately *not* here. They
+    /// are storage only where `CR4.VME` or `CR4.PVI` gives the processor
+    /// virtual interrupts to keep, which this core does not model at all
+    /// (§3.4.3.3 again); a guest that finds them writable would be told a
+    /// mechanism exists behind them.
+    pub const ID: u32 = 0x0020_0000;
 
     /// Every bit that has storage on an 8086.
     pub const DEFINED: u32 = CF | PF | AF | ZF | SF | TF | IF | DF | OF;
@@ -773,7 +798,11 @@ impl Variant {
         }
     }
 
-    /// The bits the flags register has storage for.
+    /// The bits the flags register has storage for on the *generation*.
+    ///
+    /// [`Config::flag_mask`] is what a running core asks: one bit — `ID` —
+    /// belongs to an extension rather than to a generation, and this does not
+    /// know which extensions the instance was built with.
     #[must_use]
     pub const fn flag_mask(self) -> u32 {
         match self {
@@ -923,6 +952,25 @@ impl Config {
         self.features = features;
         self
     }
+
+    /// The bits the flags register has storage for on **this instance**.
+    ///
+    /// [`Variant::flag_mask`] plus the one bit that is not a property of the
+    /// generation: `ID` has storage exactly where `CPUID` exists, because the
+    /// flag's only function is to detect that instruction (*Intel SDM* Vol 1
+    /// §3.4.3.3). A machine file that writes `cpuid = false` to model an early
+    /// 80486 therefore loses both together, which is the pair real silicon
+    /// shipped — and the alternative, a flag that toggles in front of an
+    /// instruction that raises `#UD`, is a part that never existed.
+    #[must_use]
+    pub const fn flag_mask(self) -> u32 {
+        let id = if self.features.extras_486 {
+            flags::ID
+        } else {
+            0
+        };
+        self.variant.flag_mask() | id
+    }
 }
 
 impl Default for Config {
@@ -1067,11 +1115,13 @@ impl Regs {
     /// Applied on every write to the flags register, not only on
     /// `POPF`/`IRET`: the bits have no storage, so a value that has been
     /// through this is the only value the register can ever hold. The part
-    /// matters because bits 12-15 have storage on a 386 and none on an 8086.
+    /// matters because bits 12-15 have storage on a 386 and none on an 8086 —
+    /// and the whole [`Config`] rather than the [`Variant`] because bit 21
+    /// answers to an extension instead ([`Config::flag_mask`]).
     #[inline]
     #[must_use]
-    pub const fn normalise_flags(variant: Variant, value: u32) -> u32 {
-        (value & variant.flag_mask()) | variant.flag_fixed()
+    pub const fn normalise_flags(cfg: Config, value: u32) -> u32 {
+        (value & cfg.flag_mask()) | cfg.variant.flag_fixed()
     }
 
     /// Whether a flag is set.
@@ -2516,7 +2566,7 @@ impl X86 {
     pub fn set_regs(&self, regs: Regs) {
         let mut session = self.session.lock();
         session.state.regs = regs;
-        session.state.regs.eflags = Regs::normalise_flags(self.cfg.variant, regs.eflags);
+        session.state.regs.eflags = Regs::normalise_flags(self.cfg, regs.eflags);
         if !session.state.sys.protected() {
             for index in 0..isa::seg::COUNT as u8 {
                 let selector = session.state.regs.segment(index);
@@ -2587,7 +2637,7 @@ impl X86 {
         reg.set(&mut session.state.regs, value);
         if matches!(reg, Reg::Eflags | Reg::Flags) {
             let value = session.state.regs.eflags;
-            session.state.regs.eflags = Regs::normalise_flags(self.cfg.variant, value);
+            session.state.regs.eflags = Regs::normalise_flags(self.cfg, value);
         }
         if matches!(reg, Reg::Cs | Reg::Eip | Reg::Ip) {
             if reg == Reg::Cs && !session.state.sys.protected() {

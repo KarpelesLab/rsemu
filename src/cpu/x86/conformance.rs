@@ -681,7 +681,7 @@ fn run_file(path: &Path, cfg: Config, check_bus: bool) -> (usize, Vec<Failure>) 
         // every single vector would "fail" on a bit neither processor lets
         // software set.
         if cfg.variant.is_32bit() {
-            initial.eflags = Regs::normalise_flags(cfg.variant, initial.eflags);
+            initial.eflags = Regs::normalise_flags(cfg, initial.eflags);
         }
         {
             // The vectors start mid-program: no reset sequence, and the
@@ -712,7 +712,7 @@ fn run_file(path: &Path, cfg: Config, check_bus: bool) -> (usize, Vec<Failure>) 
         let got = cpu.regs();
         let mut want = regs_from(initial, &vector.expected.regs);
         if cfg.variant.is_32bit() {
-            want.eflags = Regs::normalise_flags(cfg.variant, want.eflags);
+            want.eflags = Regs::normalise_flags(cfg, want.eflags);
         }
         if got != want {
             detail.push_str(&format!("  regs want {want}\n       got  {got}\n"));

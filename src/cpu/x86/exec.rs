@@ -1365,7 +1365,7 @@ impl<'a> Exec<'a> {
 
     /// Write the whole flags register, forcing the hard-wired bits into shape.
     pub(super) fn set_flags(&mut self, value: u32) {
-        self.state.regs.eflags = Regs::normalise_flags(self.variant(), value);
+        self.state.regs.eflags = Regs::normalise_flags(*self.cfg, value);
     }
 
     /// Even parity of the low eight bits — the only parity x86 computes.

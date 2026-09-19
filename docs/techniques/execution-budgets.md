@@ -493,18 +493,26 @@ call, the halted-TSC change the only difference:
 
 The skew is the halt, to the fraction. The marking lands at 7.5 s of guest
 time, two lines after `smpboot: x86: Booting SMP configuration: #1` — the
-bootstrap processor is waiting for an application processor to report alive,
-which on this board it never does — and −105 ms in 507 ms is a processor that
-was halted 21% of that window. The Debian kernel idles harder in the same
-window and lost 343 ms of 479.
+bootstrap processor was, at the time these runs were made, waiting for an
+application processor that never reported alive — and −105 ms in 507 ms is a
+processor that was halted 21% of that window. The Debian kernel idles harder
+in the same window and lost 343 ms of 479.
 
-One thing those runs print that is **not** this and not fixed by it:
+One thing those runs print that is **not** this and was not fixed by it:
 `CPU1 failed to report alive state`, ten seconds later, identically before and
-after. `tests/kvm_q35_linux_smp.rs` brings both processors up on this board
-under `--accel kvm` and `ThreadingMode::Accel`; an interpreted, deterministic
-`rsemu run q35-linux-smp` does not, on either kernel, with or without this
-change. It is recorded here because these runs are where it was seen, not
-because it belongs to this section.
+after. It was recorded here because these runs are where it was seen, not
+because it belongs to this section — and it has since been **found and fixed
+somewhere else entirely**: `EFLAGS.ID`, bit 21, had no storage in `cpu::x86`,
+so the identification probe of *Intel SDM* Vol 1 §3.4.3.3 — push the flags,
+flip bit 21, pop, push, compare — answered *this part has no `CPUID`*. A Linux
+application-processor trampoline asks that question in the real mode a Start-Up
+leaves a processor in, and the bootstrap processor's own path never asks, so
+one processor booted fine and the second halted four kilobytes into its own
+trampoline with `EAX` holding a no-long-mode return. The board
+now prints `smp: Brought up 1 node, 2 CPUs` interpreted;
+`tests/pc_apic_smp.rs`'s
+`the_started_processor_finds_its_own_cpuid_and_long_mode` is the ROM-free
+statement of it and `docs/platforms/q35-linux.md` has the hunt.
 
 `pc64` is byte-identical before and after, to a shell prompt and 400 seconds of
 guest time idling at it, on both kernels — for the reason above, not for want

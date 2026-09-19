@@ -13,6 +13,20 @@
 //! started by the guest's own instructions, which is what `ROADMAP.md` Phase
 //! 7's "≥ 2 vCPUs" gate needs to be true.
 //!
+//! # And what it can find out once it is running
+//!
+//! Starting a processor is half the job. The tests at the bottom of this file
+//! are the other half, and they exist because every test above them passed
+//! while a real kernel still brought up one processor: the application
+//! processor started, ran the identification probe of *Intel SDM* Vol 1
+//! §3.4.3.3 in the real mode a Start-Up leaves it in, could not make
+//! `EFLAGS.ID` hold a bit, concluded the part predates `CPUID`, and halted.
+//! So `the_started_processor_finds_its_own_cpuid_and_long_mode` runs the §B.4
+//! sequence **in full** — including the second Start-Up — and then has the
+//! *bootstrap* processor spin in guest code on a word the other one writes,
+//! which is the shape of what a kernel is waiting for when it says a processor
+//! failed to report alive.
+//!
 //! # No scaffolding
 //!
 //! A processor asks its own local interrupt controller what it has once per
@@ -63,7 +77,7 @@ use rsemu::core::value::Width;
 use rsemu::core::wire::{LocalController, Wire, WireIdAllocator, WireSource};
 use rsemu::cpu::x86::isa::seg;
 use rsemu::cpu::x86::prot::{SegReg, ar};
-use rsemu::cpu::x86::{Variant, X86};
+use rsemu::cpu::x86::{Config, Regs, Variant, X86, flags};
 use rsemu::dev::pc::apic::{ApicBus, LocalApic};
 
 /// Where the bootstrap processor's program sits.
@@ -222,6 +236,12 @@ impl Rig {
         self.mem
             .read(u64::from(at), Width::U16, MemAttrs::DEFAULT)
             .expect("a mapped word") as u16
+    }
+
+    fn peek32(&self, at: u32) -> u32 {
+        self.mem
+            .read(u64::from(at), Width::U32, MemAttrs::DEFAULT)
+            .expect("a mapped dword") as u32
     }
 }
 
@@ -504,4 +524,243 @@ fn one_processor_interrupts_another() {
         .expect("a local APIC answers the acknowledge")
         .acknowledge(rsemu::core::wire::IntAckCycle::vector_only());
     assert_eq!(vector, rsemu::core::wire::IntAckResponse::Vector(0x42));
+}
+
+// ---------------------------------------------------------------------------
+// what the processor that was started can find out about itself
+// ---------------------------------------------------------------------------
+
+/// Where the application processor leaves its verdict.
+///
+/// A dword rather than [`MARKER`]'s word, because the bootstrap processor
+/// waits on it with a 32-bit compare — and three distinct sentinels rather
+/// than a flag, because "never executed" (the zero the RAM comes up with),
+/// "executed and could not find `CPUID`" and "executed and `CPUID` says no
+/// long mode" are three different failures and the assertion should say which
+/// one it saw.
+const VERDICT: u32 = 0x4010;
+const HAS_CPUID_AND_LONG: u32 = 0x600d_c0de;
+const NO_CPUID: u32 = 0xdead_0001;
+const NO_LONG: u32 = 0xdead_0002;
+/// Where the bootstrap processor records that its **own** wait ended.
+const BSP_SAW: u32 = 0x4014;
+const SAW: u32 = 0x5a0f_5a0f;
+
+/// `mov dword [disp32], imm32` — an absolute store from a flat segment.
+fn store_abs(out: &mut Vec<u8>, at: u32, value: u32) {
+    out.extend_from_slice(&[0xc7, 0x05]);
+    dw(out, at);
+    dw(out, value);
+}
+
+/// `mov dword [disp16], imm32` — the same store in a 16-bit address size.
+///
+/// `66` widens the *operand* to thirty-two bits and leaves the address at
+/// sixteen, which is what a real-mode program writing a dword emits — and what
+/// the application processor below is stuck with, because a Start-Up leaves it
+/// in real mode (*Intel SDM* Vol 3A §8.4.3).
+fn store_abs16(out: &mut Vec<u8>, at: u16, value: u32) {
+    out.extend_from_slice(&[0x66, 0xc7, 0x06]);
+    out.extend_from_slice(&at.to_le_bytes());
+    dw(out, value);
+}
+
+/// The application processor's program: find out whether this part has
+/// `CPUID`, and whether it has long mode, and say so.
+///
+/// That is the whole of what a real bring-up trampoline establishes before it
+/// switches modes, and it is done here in the **sixteen-bit real mode** a
+/// Start-Up leaves a processor in — which is the half of it that had never
+/// been exercised anywhere in this tree.
+///
+/// 1. `PUSHFD`, flip bit 21, `POPFD`, `PUSHFD`, compare. "The ability of a
+///    program to set or clear this flag is one way to determine whether a
+///    processor supports the `CPUID` instruction" (*Intel SDM* Vol 1
+///    §3.4.3.3). A part that answers *no* has no `CPUID` to ask anything else
+///    of, so the program stops there.
+/// 2. `CPUID` leaf `8000_0001`, `EDX` bit 29 — `LM` (*AMD64 Architecture
+///    Programmer's Manual* Vol 3, `CPUID Fn8000_0001_EDX[29]`).
+///
+/// Both answers are yes on the part this rig builds, so a run that writes
+/// anything but [`HAS_CPUID_AND_LONG`] has found a defect rather than a
+/// configuration.
+fn ap_identifies_itself() -> Vec<u8> {
+    let mut code: Vec<u8> = Vec::new();
+    code.push(0xfa); // cli
+    code.extend_from_slice(&[0x31, 0xc0]); // xor ax, ax
+    code.extend_from_slice(&[0x8e, 0xd8]); // mov ds, ax
+    code.extend_from_slice(&[0x8e, 0xd0]); // mov ss, ax
+    code.extend_from_slice(&[0xbc, 0x00, 0x20]); // mov sp, 0x2000
+
+    // The identification flag, toggled and read back.
+    code.extend_from_slice(&[0x66, 0x9c]); // pushfd
+    code.extend_from_slice(&[0x66, 0x58]); // pop eax
+    code.extend_from_slice(&[0x66, 0x89, 0xc3]); // mov ebx, eax
+    code.extend_from_slice(&[0x66, 0x35]); // xor eax, imm32
+    dw(&mut code, flags::ID);
+    code.extend_from_slice(&[0x66, 0x50]); // push eax
+    code.extend_from_slice(&[0x66, 0x9d]); // popfd
+    code.extend_from_slice(&[0x66, 0x9c]); // pushfd
+    code.extend_from_slice(&[0x66, 0x58]); // pop eax
+    code.extend_from_slice(&[0x66, 0x31, 0xd8]); // xor eax, ebx
+    code.extend_from_slice(&[0x66, 0x25]); // and eax, imm32
+    dw(&mut code, flags::ID);
+    let to_no_cpuid = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // jz no_cpuid
+
+    // It moved, so there is a `CPUID` here to ask about long mode.
+    code.extend_from_slice(&[0x66, 0xb8]); // mov eax, imm32
+    dw(&mut code, 0x8000_0001);
+    code.extend_from_slice(&[0x0f, 0xa2]); // cpuid
+    code.extend_from_slice(&[0x66, 0x81, 0xe2]); // and edx, imm32
+    dw(&mut code, 1 << 29);
+    let to_no_long = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // jz no_long
+
+    store_abs16(&mut code, VERDICT as u16, HAS_CPUID_AND_LONG);
+    code.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+
+    // A `rel8` is measured from the byte after the displacement.
+    let here = code.len();
+    code[to_no_cpuid + 1] = (here - (to_no_cpuid + 2)) as u8;
+    store_abs16(&mut code, VERDICT as u16, NO_CPUID);
+    code.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+
+    let here = code.len();
+    code[to_no_long + 1] = (here - (to_no_long + 2)) as u8;
+    store_abs16(&mut code, VERDICT as u16, NO_LONG);
+    code.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+    code
+}
+
+/// The bootstrap processor's program: the *MultiProcessor Specification* §B.4
+/// universal algorithm in full — `INIT` assert, `INIT` de-assert, **two**
+/// Start-Ups — and then a spin on the word the other processor is to write.
+///
+/// The second Start-Up is what [`bsp_program`] leaves out. The specification
+/// sends it because a processor that has already left wait-for-SIPI ignores
+/// it; that it is ignored here rather than restarting the processor is what
+/// `a_start_up_to_a_processor_that_is_not_waiting_is_ignored` asserts.
+///
+/// The spin is the point of this one. A test that polled the marker from
+/// outside would be asserting that the *harness* can see the write; a
+/// bootstrap processor that leaves its own loop has seen it through the memory
+/// system the guest uses, which is what a kernel's "failed to report alive
+/// state" is waiting for and what this file had never made a guest wait on.
+fn bsp_starts_and_waits() -> Vec<u8> {
+    let mut code: Vec<u8> = Vec::new();
+    code.push(0xbf); // mov edi, LAPIC0_BASE
+    dw(&mut code, LAPIC0_BASE as u32);
+    // Nothing an APIC delivers is reliable until it is software-enabled
+    // (*Intel SDM* Vol 3A §10.4.7.2), an interprocessor interrupt included.
+    store_at(&mut code, 0x0f0, 0x1ff);
+    store_at(&mut code, 0x310, 1 << 24); // destination: APIC ID 1
+    store_at(&mut code, 0x300, 0x0000_c500); // INIT, level, assert
+    store_at(&mut code, 0x300, 0x0000_8500); // INIT, level, de-assert
+    store_at(&mut code, 0x300, 0x0000_0600 | u32::from(AP_PAGE)); // Start-Up
+    store_at(&mut code, 0x300, 0x0000_0600 | u32::from(AP_PAGE)); // and again
+
+    let spin = code.len();
+    code.extend_from_slice(&[0x81, 0x3d]); // cmp dword [VERDICT], imm32
+    dw(&mut code, VERDICT);
+    dw(&mut code, HAS_CPUID_AND_LONG);
+    code.push(0x75); // jne spin
+    let from = code.len() + 1;
+    code.push((spin as isize - from as isize) as u8);
+
+    store_abs(&mut code, BSP_SAW, SAW);
+    code.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+    code
+}
+
+/// **The processor a Start-Up starts can identify itself.**
+///
+/// The regression test for a defect that let every assertion above pass and
+/// still left a real operating system with one processor: `EFLAGS.ID` had no
+/// storage, so step 1 of [`ap_identifies_itself`] answered *this part predates
+/// `CPUID`* — and a Linux application-processor trampoline, which asks that
+/// question in the real mode a Start-Up leaves it in, halted instead of
+/// entering long mode. `q35-linux-smp` printed `CPU1 failed to report alive
+/// state` with the second processor sitting on a `HLT` four kilobytes into its
+/// own trampoline, `EAX` holding a failure code and `EFLAGS` reading `0x2`.
+/// The bootstrap processor's path never asks, so one processor was fine.
+///
+/// Nothing else in this file could see it: the other tests start a processor
+/// and look at *where* it started, and the flags register is not part of that.
+#[test]
+fn the_started_processor_finds_its_own_cpuid_and_long_mode() {
+    let rig = rig_of(Variant::X86_64);
+    rig.load(BSP_CODE, &bsp_starts_and_waits());
+    rig.load(u32::from(AP_PAGE) << 12, &ap_identifies_itself());
+    rig.enter_flat_protected(0, BSP_CODE);
+
+    // Round-robin, a few cycles each: the deterministic threading mode in
+    // miniature. Neither processor is stepped by hand and neither is run to
+    // completion before the other starts.
+    for _ in 0..20_000 {
+        rig.cpus[0].run(8);
+        rig.cpus[1].run(8);
+        if rig.peek32(BSP_SAW) == SAW {
+            break;
+        }
+    }
+
+    let verdict = rig.peek32(VERDICT);
+    assert_eq!(
+        verdict,
+        HAS_CPUID_AND_LONG,
+        "the application processor reported {verdict:#010x}: {}",
+        match verdict {
+            0 => "it never executed at all",
+            NO_CPUID =>
+                "EFLAGS.ID would not hold the bit it was given, so the \
+                         probe of SDM Vol 1 3.4.3.3 concluded this part predates CPUID",
+            NO_LONG => "CPUID 8000_0001 reported no long mode",
+            _ => "something else entirely",
+        }
+    );
+    assert_eq!(
+        rig.peek32(BSP_SAW),
+        SAW,
+        "the bootstrap processor never came out of its own wait"
+    );
+    assert!(
+        !rig.cpus[1].is_waiting_for_startup(),
+        "and the processor that wrote the word had left wait-for-SIPI"
+    );
+}
+
+/// The flag on its own, at the core's seam.
+///
+/// [`the_started_processor_finds_its_own_cpuid_and_long_mode`] is why it
+/// matters; this is the one-line statement of what was wrong, and of the tie
+/// that keeps it honest — the bit is storage exactly where `CPUID` is an
+/// instruction, because announcing `CPUID` is the only thing it does.
+#[test]
+fn the_identification_flag_has_storage_exactly_where_cpuid_does() {
+    for cfg in [Config::I80486, Config::X86_64] {
+        assert_eq!(
+            Regs::normalise_flags(cfg, flags::ID) & flags::ID,
+            flags::ID,
+            "{:?} has CPUID, so a program can set EFLAGS.ID and read it back",
+            cfg.variant
+        );
+    }
+    // The same part with the instruction taken away — an early 80486, which a
+    // machine file spells `cpuid = false`. The flag goes with it: one that
+    // toggled in front of an instruction raising `#UD` would be a part that
+    // never shipped.
+    let mut features = Config::I80486.features;
+    features.extras_486 = false;
+    let early = Config::I80486.with_features(features);
+    assert_eq!(
+        Regs::normalise_flags(early, flags::ID) & flags::ID,
+        0,
+        "a part with no CPUID has nothing for EFLAGS.ID to announce"
+    );
+    // And nothing below the 80486 ever had either.
+    assert_eq!(
+        Regs::normalise_flags(Config::I80386, flags::ID) & flags::ID,
+        0
+    );
 }

@@ -126,7 +126,8 @@ There are eight, on four architectures — counting a board and its
 two-processor twin as one, which is what they are: an `-smp` file is the same
 board with a second `cpu` object and a table told about it. **Four of those
 twins exist** — `riscv-virt-smp`, `arm64-virt-smp`, `q35-linux-smp` and
-`pc-at-smp` — and **three of them boot a real kernel onto both processors**; the
+`pc-at-smp` — and **three of them boot a real kernel onto both processors, with
+no accelerator**; the
 fourth, `pc-at`'s, runs rsemu's own boot sector and no operating system, though
 the single-processor `pc-at` installs FreeDOS 1.3 onto a hard disk and boots
 off it.
@@ -375,8 +376,16 @@ one of them was hiding a defect here.
 the one SMP board here on which a real kernel does real SMP work: the same stock
 Gentoo kernel prints `smp: Brought up 1 node, 2 CPUs` **1.7 seconds** into a
 `--accel kvm` run and `nproc` says `2` at a shell **2.8 seconds** in, on the
-board's own command line. Read it with the SMP caveat above — under KVM the
-atomics are the host's silicon, so that boot says nothing about rsemu's.
+board's own command line. Read that number with the SMP caveat above — under
+KVM the atomics are the host's silicon, so that boot says nothing about
+rsemu's. **The interpreted boot does**, and it now happens: the same board with
+no accelerator prints the same line, reaches a shell, and answers `nproc` with
+`2` and `/proc/interrupts` with a column of live counts per processor. It took
+one flag bit to get there — `EFLAGS.ID`, which has no job other than letting
+software discover `CPUID`, and which only ever mattered to the processor that
+boots second, because a Start-Up leaves that one in real mode and the code
+waiting for it there asks.
+`docs/platforms/q35-linux.md` has the hunt.
 
 `q35-uefi` is the same chipset with the ROM socket replaced by **two banks of
 parallel NOR flash** below 4 GiB, which is the layout every split OVMF build is
