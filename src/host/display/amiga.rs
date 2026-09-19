@@ -18,12 +18,24 @@
 //!
 //! A field lasts as many colour clocks as the beam source pushed in it
 //! ([`Video::field_clocks`]) — 227 or 228 per line, times the field's lines,
-//! both of which are Agnus's business. A colour clock is two ticks of 7M, and
+//! both of which are Agnus's business, and both of which an ECS Agnus's
+//! programmable beam can change at any field (productivity mode's 114-count
+//! lines, 525 to a field). Counting what was pushed rather than assuming a
+//! standard is what keeps the period exact through that. A colour clock is two ticks of 7M, and
 //! Denise's `clock` domain is its 7M pin (Appendix J: pin 35 `7M`, pin 36
 //! `CCK`). So the period is `2 × clocks` ticks of that domain, converted to
 //! virtual nanoseconds with the domain's exact rational frequency
 //! (`CLAUDE.md`, determinism). A board that gives Denise no `clock`, or a
 //! machine in which no field has finished yet, reports `0`.
+//!
+//! # The geometry
+//!
+//! Whatever Denise's current field is laid out as ([`Video::geometry`]):
+//! 800 × 568 for a PAL A500 always, and for an ECS machine whatever its beam
+//! and SuperHires make it, which can change between two fields. So
+//! [`Scanout::capture`] takes the picture, its size and its field count from
+//! Denise in one call ([`Video::copy_frame`]) and reshapes the host's surface
+//! to it.
 //!
 //! # Getting hold of the chip
 //!
@@ -183,6 +195,52 @@ pub mod capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A programmable beam changes both the picture's shape and the field's
+    /// length; the adapter follows both, and the period stays the exact
+    /// rational of colour clocks over the 7M rate.
+    #[test]
+    fn a_programmed_raster_changes_the_geometry_and_the_period_stays_exact() {
+        use crate::dev::amiga::denise::{Fetch, Line, Raster, Revision, Standard};
+
+        let video = Arc::new(Video::with_revision(Standard::Pal, Revision::Ecs));
+        // An A500's crystal over four.
+        let scanout = DeniseScanout::new(Arc::clone(&video), Some((28_375_160, 4)));
+        let field = |lines: u16, clocks: u16| {
+            for vpos in 0..lines {
+                video.line(&Line {
+                    vpos,
+                    clocks,
+                    fetch: Fetch::default(),
+                });
+            }
+            video.field(true);
+        };
+        field(313, 227);
+        let info = scanout.info();
+        assert_eq!((info.width, info.height), (800, 568));
+        // 313 × 227 counts × 2 ticks of 7 093 790 Hz.
+        assert_eq!(scanout.frame_period_ns(), 20_031_887);
+
+        video.raster(Raster {
+            first_line: 30,
+            lines: 480,
+            first_clock: 20,
+            clocks: 90,
+            line_clocks: 114,
+        });
+        field(525, 114);
+        let info = scanout.info();
+        assert_eq!((info.width, info.height), (360, 480));
+        assert_eq!(scanout.frame_period_ns(), 16_873_913);
+        let mut surface = Surface::new(PixelFormat::RGB888, 1, 1);
+        scanout.capture(&mut surface);
+        assert_eq!(
+            (surface.info().width, surface.info().height),
+            (360, 480),
+            "capture reshapes to the field's picture"
+        );
+    }
 
     #[test]
     fn four_bits_a_gun_stretch_to_the_full_byte() {
