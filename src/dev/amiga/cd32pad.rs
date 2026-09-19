@@ -806,18 +806,27 @@ mod tests {
         assert_eq!(snapshot(&restored), snapshot(&saved));
     }
 
+    /// A button this pad does not have cannot be true, so a snapshot carrying
+    /// one is refused rather than masked.
     #[test]
     fn a_button_this_pad_does_not_have_is_refused_on_load() {
-        let pad = Cd32Pad::with(Arc::new(Pad::new()));
-        let mut bytes = snapshot(&pad);
-        let at = bytes.len() - 6;
-        bytes[at] = 0xFF;
-        bytes[at + 1] = 0xFF;
-        if let Ok(reader) = StateReader::new(&bytes)
-            && let Ok(chunk) = reader.load("pad", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        let mut shape = MachineShape::new();
+        shape.add_device("pad", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
         {
-            assert!(Device::load(&pad, &mut chunk.reader()).is_err());
+            let mut chunk = w.chunk("pad", CLASS_NAME, STATE_VERSION).unwrap();
+            chunk.write_u16(0xFFFF).unwrap();
+            chunk.write_bool(true).unwrap();
+            chunk.write_bool(true).unwrap();
+            chunk.write_u16(0).unwrap();
         }
+        let bytes = w.to_vec().unwrap();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("pad", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        let pad = Cd32Pad::with(Arc::new(Pad::new()));
+        assert!(Device::load(&pad, &mut chunk.reader()).is_err());
     }
 
     /// A report the host sends is the mask and nothing else.

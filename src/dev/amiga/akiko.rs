@@ -1399,6 +1399,34 @@ mod tests {
         assert_eq!(snapshot(&restored), snapshot(&saved));
     }
 
+    /// A corner-turn pointer past its matrix is derived state that cannot be
+    /// true, so a snapshot carrying one is refused rather than clamped.
+    #[test]
+    fn a_pointer_past_the_matrix_is_refused_on_load() {
+        let mut shape = MachineShape::new();
+        shape.add_device("akiko", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("akiko", CLASS_NAME, STATE_VERSION).unwrap();
+            for _ in 0..16 {
+                chunk.write_u32(0).unwrap();
+            }
+            for _ in 0..C2P_PIXELS {
+                chunk.write_u8(0).unwrap();
+            }
+            chunk.write_u8(C2P_PIXELS as u8).unwrap();
+            for _ in 0..NVRAM_BYTES {
+                chunk.write_u8(0xFF).unwrap();
+            }
+        }
+        let bytes = w.to_vec().unwrap();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("akiko", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        assert!(Device::load(&akiko(), &mut chunk.reader()).is_err());
+    }
+
     /// A reset clears the registers and the converter and leaves the cells
     /// alone, which is the whole point of the part.
     #[test]
