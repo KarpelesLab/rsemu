@@ -856,6 +856,12 @@ counts and the picture at 800 × 568, and shows the planes in low resolution.
 * `HCENTER`'s half-line vertical sync in an interlaced field.
 * The A2024 and the light pen.
 * ECS sprite vertical positions beyond line 511 (the manual gives no `SV9`).
+* The host pointer's scale on a SuperHires or a 31 kHz picture.
+  `host::input::amiga` moves the mouse a count per framebuffer pixel, which is
+  one high-resolution pixel on every picture an A500 draws; on a SuperHires
+  picture a framebuffer pixel is half of one, so the guest's pointer moves
+  twice as far as the host's cursor there. A Workbench in high resolution — an
+  A500+'s default — is unaffected.
 
 ## Keyboard and mouse
 
