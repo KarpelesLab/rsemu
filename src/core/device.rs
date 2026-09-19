@@ -254,6 +254,16 @@ impl ExportId {
     /// allocated on branches of their own in the same round.
     pub const CHIP_DMA: ExportId = ExportId(9);
 
+    /// A CD-ROM mechanism as its controller sees it: whether a disc is in the
+    /// tray, how many sectors it has, and a sector read. Transported as
+    /// [`Export::Opaque`].
+    ///
+    /// `amiga.cd` publishes it and `amiga.akiko` holds it. A drive is not an
+    /// address space and not a wire — a controller asks it questions and gets
+    /// bytes back — and the handle's type is a contract between those two
+    /// classes, which is what `Opaque` is for.
+    pub const CD_DRIVE: ExportId = ExportId(10);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -270,6 +280,7 @@ impl ExportId {
             ExportId::PAULA => Some("Paula's DMA and disk seam"),
             ExportId::AMIGA_VIDEO => Some("Amiga video line input"),
             ExportId::CHIP_DMA => Some("chip-RAM DMA"),
+            ExportId::CD_DRIVE => Some("CD-ROM drive"),
             _ => None,
         }
     }

@@ -2746,6 +2746,18 @@ dev-amiga-keyboard = ["dev-amiga"]
 # consulted. Implies `dev-amiga`. `no_std + alloc`, no dependencies.
 dev-amiga-mouse = ["dev-amiga"]
 
+# The CD32's CD-ROM drive (src/dev/amiga/cdrom.rs): `amiga.cd`, the
+# double-speed mechanism Akiko's controller talks to. A disc is an image on a
+# media slot -- 2048-byte Mode 1 user data, which is what an ISO 9660 image
+# is, and 2352-byte raw sectors, whose Mode 1 user data this file lifts out of
+# the frame. The table of contents is synthesised from the image: one data
+# track. No audio track, no subcode, no CD+G. Written from ECMA-130 (the Red
+# Book's sector and frame layout as ECMA restates it), ECMA-119 (ISO 9660) and
+# the *Amiga CD32 Developer Notes*; no emulator source consulted. Implies
+# `dev-amiga` and `dev-medium`, the media seam. `no_std + alloc`, no
+# dependencies.
+dev-amiga-cdrom = ["dev-amiga", "dev-medium"]
+
 # Gayle (src/dev/amiga/gayle.rs), the A600's gate array: `amiga.gayle`, the
 # IDE port as the A600 wires it -- two chip selects decoded on A12 at $DA0000,
 # the drive's three address lines on A2-A4, and the data bus byte-swapped, so
