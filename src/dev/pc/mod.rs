@@ -425,9 +425,10 @@ mod tests {
 
     #[test]
     fn the_board_names_exactly_the_media_slots_it_documents() {
-        // Two firmware sockets and three removable-or-fitted media. None of
-        // them is required: the disks default to an empty bay and the floppy to
-        // an empty drive, so the only slot a user *has* to fill is `bios`.
+        // Two firmware sockets and four removable-or-fitted media. None of
+        // them is required: the disks default to an empty bay, the floppy to an
+        // empty drive and the CD-ROM to an open tray, so the only slot a user
+        // *has* to fill is `bios`.
         //
         // Deduplicated, because `vgabios` is named **twice** and on purpose:
         // the legacy socket at 0xc0000 and the PCI card's expansion ROM are two
@@ -444,6 +445,6 @@ mod tests {
             .collect();
         slots.sort();
         slots.dedup();
-        assert_eq!(slots, ["bios", "floppy", "hd0", "hd1", "vgabios"]);
+        assert_eq!(slots, ["bios", "cdrom", "floppy", "hd0", "hd1", "vgabios"]);
     }
 }

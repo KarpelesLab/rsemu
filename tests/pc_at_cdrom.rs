@@ -31,7 +31,11 @@
     feature = "dev-pc-floppy",
     feature = "dev-pc-ide",
     feature = "dev-ata-atapi",
-    feature = "machine-pc-at"
+    feature = "machine-pc-at",
+    // Not for the firmware — there is none in this test — but for `asm16`,
+    // which is what the guest below is written with and which lives behind
+    // the same feature the firmware does.
+    feature = "fw-pcbios"
 ))]
 
 use std::sync::Arc;

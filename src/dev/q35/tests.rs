@@ -60,8 +60,10 @@ fn the_board_names_exactly_the_media_slots_it_documents() {
     slots.sort();
     slots.dedup();
     // No floppy: a q35 has no diskette controller on the board, and a machine
-    // file that declared one would be describing a card nobody fitted.
-    assert_eq!(slots, ["bios", "hd0", "hd1", "vgabios"]);
+    // file that declared one would be describing a card nobody fitted. There is
+    // a `cdrom`, because the secondary IDE channel carries one exactly as
+    // `pc-at`'s does.
+    assert_eq!(slots, ["bios", "cdrom", "hd0", "hd1", "vgabios"]);
 }
 
 /// The region names [`acpi`] looks devices up by are those devices' own class
