@@ -810,13 +810,36 @@ fast count is not modelled.
 `gb_ChipRevBits0` at `$EC` — after every ROM run. It is `$03`,
 `GFXF_HR_AGNUS | GFXF_HR_DENISE`, for all three. Kickstart 2.04 also writes
 `BEAMCON0 = $0020` (PAL, nothing variable) and a `DIWHIGH` into every field's
-copper list, which an A500 never sees.
+copper list (watched black-box).
 
 | ROM, on the A500+ | Reaches | `ChipRevBits0` | What is on screen |
 | --- | --- | --- | --- |
 | Kickstart 2.04 (37.175) | its insert-disk screen, 28 s | `$03` | The purple screen, the rainbow check mark, "2.0 Roms (37.175) / Copyright © 1985-1991 / Commodore-Amiga, Inc. / All Rights Reserved", the salmon drive and the blue disk mid-animation. **Bit for bit the A500's picture**: the explicit window graphics.library sets through `DIWHIGH` is the one the original scheme gave |
 | Kickstart 3.1 (40.063) | its insert-disk screen, 12 s | `$03` | The same with "3.1 ROM 40.063 / Copyright © 1985-1993"; bit for bit the A500's |
 | Kickstart 2.04 + Workbench 2.04 | the desktop, 45 s | `$03` | The grey 640-pixel desktop, the copyright in the screen title bar under the red pointer, the "Workbench" window with the Ram Disk and Workbench2.0 icons; bit for bit the A500's. The clock was read on the way |
+
+**ScreenMode, through a person's hands.** The same test file opens the
+Workbench2.0 disk, the Prefs drawer and ScreenMode on both boards, through the
+input seam a VNC client drives. The 500+'s screen title reads "811288 graphics
+mem" (the A500's "287248": Exec found the megabyte), and its ScreenMode window
+lists PAL:Hires, PAL:SuperHires, PAL:Hires-Interlaced and
+PAL:SuperHires-Interlaced with **"Max Size 16368 x 16384"** — the big blits,
+"provided for all graphics functions if the ECS Agnus is present". The A500's
+window is the same but for **"Max Size 1008 x 1024"**, the original blitter's.
+Productivity is not on either list; the session installs no monitor driver,
+and whether the stock disk would bring one up is not what it checks.
+
+**A finding the A500's list exposes.** It offers SuperHires too, which a real
+A500 would not, and its `ChipRevBits0` is `$02`: `GFXF_HR_DENISE` without
+`GFXF_HR_AGNUS`. Watched black-box, Kickstart 2.04 reads `DENISEID` seventeen
+times; an 8362 answers with the floating chip bus, as Appendix C says, and
+`amiga.custom`'s floating word — its documented placeholder, the last word
+written — is `$8001` every time. A stable answer is what an 8373 gives. The
+real bus holds "whatever value is left over on the bus from the last cycle",
+which DMA keeps changing. Replacing the placeholder with the last DMA cycle's
+word is `custom.rs`'s job, and has to be shown to leave the A500's goldens
+alone; until then `tests/amiga_a500plus.rs` pins the `$02` with this
+explanation rather than hiding it.
 
 And ROM-free, a hand-assembled program programs a productivity beam
 (`HTOTAL = 113`, `VTOTAL = 524`, blanking to 90 counts × 480 lines) and a

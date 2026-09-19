@@ -28,8 +28,11 @@
 //! location in the system", HRM Appendix D), each node's `ln_Name`, and
 //! `gb_ChipRevBits0` at offset `$EC` of the library base, whose
 //! `GFXF_HR_AGNUS` (bit 0) and `GFXF_HR_DENISE` (bit 1) Appendix C, *Determining
-//! Chip Revisions*, defines. `RSEMU_AMIGA_FRAME_DIR` receives a PNG of every
-//! frame checked, in a build with `display-png`.
+//! Chip Revisions*, defines. And a person at the Workbench, through the same
+//! input seam a VNC client drives, opens ScreenMode preferences on both
+//! boards: the 500+'s lists the SuperHires modes and a maximum size of 16368 ×
+//! 16384, the ECS blitter's; the A500's 1008 × 1024. `RSEMU_AMIGA_FRAME_DIR`
+//! receives a PNG of every frame checked, in a build with `display-png`.
 //!
 //! **No byte of any ROM or disk is in this file**; what is asserted is this
 //! emulator's rendering and the guest's own bookkeeping. No Amiga emulator
@@ -560,7 +563,7 @@ mod kickstart {
 
     /// The 500+ with `rom` in its socket and `adf` (if any) in DF0, both read
     /// in place; `None`, having said why, if either is not there.
-    fn board(rom: &str, adf: Option<&str>) -> Option<Board> {
+    fn board(name: &str, rom: &str, adf: Option<&str>) -> Option<Board> {
         let path = user_file("RSEMU_AMIGA_ROM_DIR", rom, "Shared/rom")?;
         let image = rsemu::host::media::kickstart::open(&path.to_string_lossy())
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -583,11 +586,12 @@ mod kickstart {
         capture::install(&mut options).expect("a capture table");
         options.realize.media.insert("kickstart", image.bytes);
         options.realize.media.insert("df0", disk);
+        options.realize.media.insert("ext", Vec::new());
         let registry = catalog::registry().expect("a registry");
-        let source = catalog::machine("amiga-a500plus")
-            .expect("this build ships amiga-a500plus")
+        let source = catalog::machine(name)
+            .expect("this build ships the board")
             .source;
-        let machine = rsemu::machine::build("amiga-a500plus", source, &registry, &options)
+        let machine = rsemu::machine::build(name, source, &registry, &options)
             .unwrap_or_else(|e| panic!("{rom}: the board does not realize: {e}"));
         let cpu = cores.last().expect("the binding captured the processor");
         let scanout = capture::take(&options.realize.hosts, &machine).expect("a Denise");
@@ -692,7 +696,7 @@ mod kickstart {
     /// Run `rom` (with `adf` in DF0) for `seconds` and check what every run
     /// must: running, no fault, fields, ECS found — and the golden.
     fn reaches(rom: &str, adf: Option<&str>, label: &str, seconds: u64, golden: u64) {
-        let Some(mut b) = board(rom, adf) else {
+        let Some(mut b) = board("amiga-a500plus", rom, adf) else {
             return;
         };
         advance(&mut b, label, seconds);
@@ -714,6 +718,37 @@ mod kickstart {
             hash, golden,
             "{label}: the frame at {seconds}s moved; look at it (RSEMU_AMIGA_FRAME_DIR) before \
              accepting the new hash"
+        );
+    }
+
+    /// The control: the same ROM on the A500, whose 8371 is not an ECS
+    /// Agnus, and graphics.library does not find one.
+    ///
+    /// **A finding, pinned rather than hidden.** It does set `GFXF_HR_DENISE`
+    /// there. Watched black-box, Kickstart 2.04 reads `DENISEID` seventeen
+    /// times and an 8362 answers with the floating chip bus, as Appendix C
+    /// says — but this model's floating word is `amiga.custom`'s documented
+    /// placeholder, the last word written, and it is `$8001` all seventeen
+    /// times: a stable answer, which is what an 8373 gives. The real bus holds
+    /// "whatever value is left over on the bus from the last cycle", which DMA
+    /// keeps changing. So the A500's ScreenMode lists SuperHires where a real
+    /// A500 would not (`screenmode` below). Replacing the placeholder with the
+    /// last DMA cycle's word is `custom.rs`'s to do, and would have to be
+    /// shown to leave the A500's goldens where they are.
+    #[cfg(feature = "machine-amiga-a500")]
+    #[test]
+    fn on_the_a500_kickstart_2_04_finds_no_ecs_agnus() {
+        let Some(mut b) = board("amiga-a500", "amiga-os-204.rom", None) else {
+            return;
+        };
+        advance(&mut b, "a500-204", 28);
+        let bits = chip_rev_bits(&b);
+        println!("a500-204: ChipRevBits0 = {bits:#04x}");
+        assert_eq!(bits & HR_AGNUS, 0, "an 8371 is not an ECS Agnus");
+        assert_eq!(
+            bits & HR_DENISE,
+            HR_DENISE,
+            "the floating-bus placeholder answers DENISEID stably; see above"
         );
     }
 
@@ -766,4 +801,251 @@ mod kickstart {
     const GOLDEN_204: u64 = 0xcfa0_61a4_23d3_703d;
     const GOLDEN_310: u64 = 0x26cc_b705_6fbc_7ba9;
     const GOLDEN_WB204: u64 = 0x95a5_9a12_c942_e139;
+}
+
+// ---------------------------------------------------------------------------
+// a person at the 500+'s Workbench, asking for its screen modes
+// ---------------------------------------------------------------------------
+
+/// Workbench 2.04's ScreenMode preferences on the 500+ and on the A500: the
+/// list of modes graphics.library offers, which is the other half of the
+/// evidence that it found the ECS chips.
+///
+/// Every input goes in where a VNC client's does, through the recorder's
+/// frontend channel into the keyboard and mouse sinks, as
+/// `tests/amiga_a500_workbench.rs` drives the A500; nothing writes guest
+/// memory. The positions are framebuffer pixels on the 800 × 568 picture both
+/// boards draw for this screen.
+#[cfg(feature = "media-kickstart")]
+mod screenmode {
+    use std::sync::Arc;
+
+    use rsemu::core::Captured;
+    use rsemu::core::clock::GlobalTime;
+    use rsemu::core::record::{Channel, Recorder};
+    use rsemu::cpu::m68k::M68k;
+    use rsemu::host::display::amiga::{DeniseScanout, capture};
+    use rsemu::host::display::{PixelFormat, Scanout, Surface};
+    use rsemu::host::input::amiga::{AmigaKeyboardSink, AmigaMouseSink};
+    use rsemu::host::input::{self, Feed, InputEvent};
+    use rsemu::machine::{Machine, catalog};
+
+    struct Desk {
+        machine: Machine,
+        cpu: Arc<M68k>,
+        scanout: DeniseScanout,
+        recorder: Arc<Recorder>,
+        channel: Channel,
+        tag: &'static str,
+    }
+
+    fn user_file(var: &str, name: &str) -> Option<std::path::PathBuf> {
+        let Ok(dir) = std::env::var(var) else {
+            println!("amiga-a500plus: set {var} to run this; skipped");
+            return None;
+        };
+        let path = std::path::Path::new(&dir).join(name);
+        if !path.exists() {
+            println!("amiga-a500plus: {} is not there; skipped", path.display());
+            return None;
+        }
+        Some(path)
+    }
+
+    fn desk(board: &str, tag: &'static str) -> Option<Desk> {
+        let rom = user_file("RSEMU_AMIGA_ROM_DIR", "amiga-os-204.rom")?;
+        let adf = user_file("RSEMU_AMIGA_ADF_DIR", "amiga-os-204-workbench.adf")?;
+        let image = rsemu::host::media::kickstart::open(&rom.to_string_lossy())
+            .unwrap_or_else(|e| panic!("{}: {e}", rom.display()));
+        let disk = std::fs::read(&adf).expect("the disk reads");
+
+        let cores: Arc<Captured<M68k>> = Arc::new(Captured::new());
+        let kept = Arc::clone(&cores);
+        let mut options = catalog::build_options().expect("the catalog agrees with itself");
+        options.bindings.replace("cpu.m68k", move |props| {
+            let cpu = Arc::new(M68k::from_props(props)?);
+            kept.push(&cpu);
+            Ok(cpu)
+        });
+        capture::install(&mut options).expect("a capture table");
+        options.realize.media.insert("kickstart", image.bytes);
+        options.realize.media.insert("df0", disk);
+        options.realize.media.insert("ext", Vec::new());
+        let recorder = Arc::new(Recorder::recording());
+        options.realize.recorder = Some(Arc::clone(&recorder));
+        let registry = catalog::registry().expect("a registry");
+        let source = catalog::machine(board)
+            .expect("this build ships the board")
+            .source;
+        let machine = rsemu::machine::build(board, source, &registry, &options)
+            .unwrap_or_else(|e| panic!("{board}: the board does not realize: {e}"));
+
+        let hosts = &options.realize.hosts;
+        let feed = Arc::new(Feed::new());
+        feed.attach(Arc::new(
+            AmigaKeyboardSink::open(hosts).expect("the board has a keyboard"),
+        ));
+        feed.attach(Arc::new(
+            AmigaMouseSink::open(hosts).expect("the board has a mouse"),
+        ));
+        let channel = input::channel(input::DEFAULT_STREAM);
+        recorder
+            .register(channel.clone(), input::sink(&feed))
+            .expect("the channel list is open until the first round");
+        let cpu = cores.last().expect("the binding captured the processor");
+        let scanout = capture::take(hosts, &machine).expect("a Denise");
+        Some(Desk {
+            machine,
+            cpu,
+            scanout,
+            recorder,
+            channel,
+            tag,
+        })
+    }
+
+    /// Three PAL fields, as the A500 Workbench test holds a button.
+    const HOLD_MS: u64 = 60;
+    /// The screen's top-left pixel in the framebuffer.
+    const SCREEN_LEFT: u32 = 130;
+    const SCREEN_TOP: u32 = 30;
+    /// The Workbench2.0 disk icon, the Prefs drawer in its window, and the
+    /// ScreenMode icon in the Prefs window.
+    const DISK_ICON: (u32, u32) = (188, 178);
+    const PREFS_DRAWER: (u32, u32) = (252, 190);
+    const SCREENMODE_ICON: (u32, u32) = (415, 262);
+
+    impl Desk {
+        fn run_ms(&mut self, ms: u64) {
+            self.machine
+                .run_for(GlobalTime::from_nanos(ms * 1_000_000))
+                .expect("it runs");
+        }
+
+        fn pointer(&self, x: u32, y: u32, buttons: u8) {
+            let event = InputEvent::Pointer { x, y, buttons };
+            self.recorder
+                .post(&self.channel, &event.encode())
+                .expect("a registered channel");
+        }
+
+        fn home(&mut self) {
+            self.pointer(799, 567, 0);
+            self.run_ms(20);
+            self.pointer(SCREEN_LEFT, SCREEN_TOP, 0);
+            self.run_ms(300);
+        }
+
+        fn double_click(&mut self, (x, y): (u32, u32)) {
+            self.pointer(x, y, 0);
+            self.run_ms(300);
+            for _ in 0..2 {
+                self.pointer(x, y, 1);
+                self.run_ms(HOLD_MS);
+                self.pointer(x, y, 0);
+                self.run_ms(HOLD_MS);
+            }
+        }
+
+        fn look(&self, name: &str) -> u64 {
+            let info = self.scanout.info();
+            let mut surface = Surface::new(PixelFormat::RGB888, info.width, info.height);
+            self.scanout.capture(&mut surface);
+            let hash = surface
+                .pixels()
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+                });
+            if let Ok(dir) = std::env::var("RSEMU_AMIGA_FRAME_DIR") {
+                #[cfg(feature = "display-png")]
+                {
+                    let png = rsemu::host::display::png::encode(&surface).expect("a PNG");
+                    std::fs::write(
+                        std::path::Path::new(&dir).join(format!("{}-{name}.png", self.tag)),
+                        png,
+                    )
+                    .expect("the frame directory is writable");
+                }
+                #[cfg(not(feature = "display-png"))]
+                let _ = dir;
+            }
+            println!("{} {name}: frame {hash:#018x}", self.tag);
+            hash
+        }
+    }
+
+    /// Open the disk, the Prefs drawer and ScreenMode, and hold each picture
+    /// to its golden.
+    fn session(board: &str, tag: &'static str, goldens: [u64; 3]) {
+        let Some(mut d) = desk(board, tag) else {
+            return;
+        };
+        d.run_ms(45_000);
+        d.home();
+        d.double_click(DISK_ICON);
+        d.run_ms(5_000);
+        let window = d.look("1-disk-window");
+        d.double_click(PREFS_DRAWER);
+        d.run_ms(15_000);
+        let prefs = d.look("2-prefs");
+        d.double_click(SCREENMODE_ICON);
+        d.run_ms(10_000);
+        let modes = d.look("3-screenmode");
+        assert!(!d.cpu.is_halted(), "{tag}: the processor double-faulted");
+        assert_eq!(d.cpu.bus_faults().0, 0, "{tag}: an access faulted");
+        assert_eq!(
+            [window, prefs, modes],
+            goldens,
+            "{tag}: a picture moved; look at them (RSEMU_AMIGA_FRAME_DIR) before accepting \
+             the new hashes"
+        );
+    }
+
+    /// The 500+. Looked at:
+    ///
+    /// 1. The Workbench2.0 window open over the desktop, the screen title
+    ///    reading "Amiga Workbench 811288 graphics mem" — Exec found the whole
+    ///    megabyte of chip RAM.
+    /// 2. The Prefs drawer: Input, Palette, Font, ScreenMode, Printer, Serial,
+    ///    IControl, WBPattern, Pointer, Overscan, PrinterGfx, Time and the
+    ///    Presets drawer.
+    /// 3. "ScreenMode Preferences": the display modes PAL:Hires,
+    ///    PAL:SuperHires, PAL:Hires-Interlaced and PAL:SuperHires-Interlaced;
+    ///    PAL:Hires selected, "Visible Size 640 x 256", "Min Size 640 x 200",
+    ///    **"Max Size 16368 x 16384"** — the big blits: "Support for big
+    ///    blits (up to 32k x 32k) is provided for all graphics functions if
+    ///    the ECS Agnus is present" (Appendix C) — and "Max Colors 16".
+    #[test]
+    fn screenmode_on_the_500plus_offers_superhires_and_the_ecs_blitters_sizes() {
+        session(
+            "amiga-a500plus",
+            "a500plus-screenmode",
+            [
+                0x46b5_110a_3fee_cf49,
+                0x154e_5ec9_9621_eb55,
+                0xca31_c7c2_6fe3_3f89,
+            ],
+        );
+    }
+
+    /// The same on the A500. Its first picture is
+    /// `tests/amiga_a500_workbench.rs`'s disk window, bit for bit, with
+    /// "287248 graphics mem"; its ScreenMode window differs from the 500+'s
+    /// in one line, **"Max Size 1008 x 1024"**, the original blitter's
+    /// limit. It lists the SuperHires modes too, which a real A500 would not:
+    /// see `on_the_a500_kickstart_2_04_finds_no_ecs_agnus` for why.
+    #[cfg(feature = "machine-amiga-a500")]
+    #[test]
+    fn screenmode_on_the_500_keeps_the_original_blitters_sizes() {
+        session(
+            "amiga-a500",
+            "a500-screenmode",
+            [
+                0xb068_7a77_ca8e_2cad,
+                0x5726_f7b6_aa8a_56b9,
+                0x68b5_1ad7_1fc2_a745,
+            ],
+        );
+    }
 }
