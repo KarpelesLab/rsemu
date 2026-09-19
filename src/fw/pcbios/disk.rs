@@ -53,8 +53,11 @@ const FDC_DOR: u16 = 0x03f2;
 const FDC_MSR: u16 = 0x03f4;
 /// Its data register: parameters in, results out.
 const FDC_DATA: u16 = 0x03f5;
-/// Its configuration control register, which selects the data rate.
+/// Its configuration control register, which selects the data rate. The same
+/// address read back is the digital input register, whose bit 7 is `DSKCHG`.
 const FDC_CCR: u16 = 0x03f7;
+/// That register read rather than written.
+const FDC_DIR: u16 = 0x03f7;
 
 /// The `GPL` a `FORMAT A TRACK` command is given: the gap written between
 /// sectors while formatting, which is longer than the one a read steps over.
@@ -91,6 +94,8 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     let kind = a.label();
     let ext_check = a.label();
     let ext_read = a.label();
+    let ext_write = a.label();
+    let ext_params = a.label();
     let done = a.label();
 
     a.mov8(DL, Mem::bp(F_DX));
@@ -114,6 +119,10 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
         (0x15, kind),
         (0x41, ext_check),
         (0x42, ext_read),
+        (0x43, ext_write),
+        (0x44, l.disk_ok), // extended verify: nothing to compare against
+        (0x47, l.disk_ok), // extended seek: there is no head to move
+        (0x48, ext_params),
     ] {
         a.alui8(Alu::CMP, AH, function);
         a.jcc(Cc::E, target);
@@ -127,6 +136,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     let fd_write = a.label();
     let fd_params = a.label();
     let fd_kind = a.label();
+    let fd_changed = a.label();
     let fd_format = a.label();
     a.alui8(Alu::CMP, DL, 0x00);
     a.jcc(Cc::NE, l.disk_fail);
@@ -139,6 +149,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
         (0x05, fd_format),
         (0x08, fd_params),
         (0x15, fd_kind),
+        (0x16, fd_changed),
     ] {
         a.alui8(Alu::CMP, AH, function);
         a.jcc(Cc::E, target);
@@ -162,10 +173,40 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.movmi8(Mem::bp(F_BX), 0x04);
     a.jmp(l.disk_ok);
 
-    // AH=15h: type 1 is "diskette, no change line", which is what this drive
-    // reports because nothing here ejects.
+    // AH=15h: type 2 is "diskette, with change line". The drive has one — the
+    // diskette adapter's digital input register drives `DSKCHG` on bit 7
+    // (*IBM Personal Computer AT Technical Reference*, the diskette adapter) —
+    // and `pc.fdc` models it: the line goes active when the door opens and
+    // stays active until a step pulse with a diskette in the drive.
+    //
+    // It used to answer type 1, "no change line", on the reasoning that
+    // nothing could eject. Something can now: a host that swaps the medium
+    // between two disks of an installation set does exactly what opening the
+    // door does. Type 1 tells a DOS that it must guess whether its cached
+    // directory is still the right one; type 2 plus AH=16h below tells it.
     a.bind(fd_kind);
-    a.movmi8(Mem::bp(F_AX + 1), 0x01);
+    a.movmi8(Mem::bp(F_AX + 1), 0x02);
+    clear_cf(a);
+    a.jmp(done);
+
+    // AH=16h, detect disk change. `06h` with carry set means the line is
+    // active — the diskette may not be the one the caller last read — and
+    // `00h` with carry clear means it is the same one. The line itself is
+    // bit 7 of the digital input register, and reading it has no side effect:
+    // what clears it is the seek every read does, which is the AT's own
+    // arrangement and the reason a program can ask this question as often as
+    // it likes.
+    a.bind(fd_changed);
+    a.movi(DX, FDC_DIR);
+    a.in_al_dx();
+    a.testi8(AL, 0x80);
+    let fd_same = a.label();
+    a.jcc(Cc::E, fd_same);
+    a.movmi8(Mem::bp(F_AX + 1), 0x06);
+    set_cf(a);
+    a.jmp(done);
+    a.bind(fd_same);
+    a.movmi8(Mem::bp(F_AX + 1), 0x00);
     clear_cf(a);
     a.jmp(done);
 
@@ -362,9 +403,12 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.jmp(done);
 
     // AH=41h, the EDD installation check. BX must arrive as 0x55AA and comes
-    // back byte-swapped; CX's bit 0 claims the fixed-disk subset, which is
-    // exactly AH=42h and AH=48h — and only 42h is here, so nothing more is
-    // claimed.
+    // back byte-swapped; CX's bit 0 claims the *fixed disk access subset*,
+    // which EDD 1.1 defines as exactly five functions — 42h extended read,
+    // 43h extended write, 44h verify, 47h seek and 48h get drive parameters —
+    // and all five are here. It was once claimed with only 42h behind it,
+    // and FreeDOS's `FDISK` believed it: it saw the bit, called 48h for the
+    // disk's size, got carry, and reported "No fixed disks present".
     a.bind(ext_check);
     a.mov(AX, Mem::bp(F_BX));
     a.alui(Alu::CMP, AX, 0x55aa);
@@ -375,11 +419,27 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     clear_cf(a);
     a.jmp(done);
 
-    // AH=42h, extended read. DS:SI points at a sixteen-byte disk address
-    // packet: a size byte, a reserved byte, a block count, a far buffer
-    // pointer, and a 64-bit LBA of which the low 32 bits are all this drive
-    // has.
+    // AH=42h, extended read, and AH=43h, extended write. DS:SI points at a
+    // sixteen-byte disk address packet: a size byte, a reserved byte, a block
+    // count, a far buffer pointer, and a 64-bit LBA of which the low 32 bits
+    // are all this drive has. The two differ only in the ATA command, which
+    // is parked where `ata_read` keeps it while the packet is unpacked. A
+    // write's `AL` asks for verify-after-write or not; a drive that completes
+    // a write inside the port access that finished it has nothing to verify
+    // against, so both are the same write.
+    //
+    // A block count of zero moves nothing and succeeds, and one above 127 is
+    // refused, as EDD 1.1 limits it — and as it must be here, because the
+    // count reaches the drive through an eight-bit register where zero means
+    // 256.
+    a.bind(ext_write);
+    a.movi8(AL, 0x30); // WRITE SECTOR(S), T13/1410D §8.45
+    let ext_xfer = a.label();
+    a.jmp(ext_xfer);
     a.bind(ext_read);
+    a.movi8(AL, 0x20); // READ SECTOR(S), §8.27
+    a.bind(ext_xfer);
+    a.movto8(Mem::abs(EBDA_COMMAND), AL);
     a.pushs(DS);
     a.movsr(DS, Mem::bp(F_DS));
     a.mov(SI, Mem::bp(F_SI));
@@ -393,9 +453,50 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.movto(Mem::abs(EBDA_LBA_HIGH), DX);
     a.movsr(ES, AX);
     a.mov(BX, DI);
-    a.movi8(AL, 0x20);
+    a.alui(Alu::CMP, CX, 0);
+    a.jcc(Cc::E, l.disk_ok);
+    a.alui(Alu::CMP, CX, 0x7f);
+    a.jcc(Cc::A, l.disk_fail);
+    a.mov8(AL, Mem::abs(EBDA_COMMAND));
     a.call(l.ata_read);
     a.jcc(Cc::B, l.disk_fail);
+    a.jmp(l.disk_ok);
+
+    // AH=48h, get drive parameters, into the caller's buffer at DS:SI. The
+    // buffer's first word is its size on the way in; EDD 1.1's result is
+    // 1Ah bytes, so anything smaller is refused rather than overrun, and the
+    // word comes back as the size actually filled:
+    //
+    //   00h  word   buffer size          (1Ah)
+    //   02h  word   information flags    (bit 1: the CHS geometry is valid)
+    //   04h  dword  cylinders
+    //   08h  dword  heads
+    //   0Ch  dword  sectors per track
+    //   10h  qword  total sectors
+    //   18h  word   bytes per sector
+    //
+    // The geometry is the one POST read out of `IDENTIFY DEVICE` and AH=08h
+    // reports; the total is the drive's own addressable count, which is what
+    // a partitioner sizes the disk by — the CHS product can be short of it.
+    a.bind(ext_params);
+    a.movsr(ES, Mem::bp(F_DS));
+    a.mov(DI, Mem::bp(F_SI));
+    a.mov(AX, Mem::di(0).seg(ES));
+    a.alui(Alu::CMP, AX, 0x1a);
+    a.jcc(Cc::B, l.disk_fail);
+    a.movmi(Mem::di(0).seg(ES), 0x1a);
+    a.movmi(Mem::di(2).seg(ES), 0x0002);
+    a.movi32(AX, 0);
+    a.mov(AX, Mem::abs(EBDA_HD_CYLINDERS));
+    a.movto32(Mem::di(4).seg(ES), AX);
+    a.mov(AX, Mem::abs(EBDA_HD_HEADS));
+    a.movto32(Mem::di(8).seg(ES), AX);
+    a.mov(AX, Mem::abs(EBDA_HD_SECTORS));
+    a.movto32(Mem::di(0x0c).seg(ES), AX);
+    a.mov32(AX, Mem::abs(EBDA_HD_CAPACITY));
+    a.movto32(Mem::di(0x10).seg(ES), AX);
+    a.movmi32(Mem::di(0x14).seg(ES), 0);
+    a.movmi(Mem::di(0x18).seg(ES), 512);
     a.jmp(l.disk_ok);
 
     // The two exits. `AH` is the status byte every caller reads after the carry

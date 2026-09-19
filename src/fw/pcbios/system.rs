@@ -426,10 +426,21 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
 
     // -- INT 19h, the bootstrap ---------------------------------------------
     //
-    // The fixed disk first, then the diskette. A boot sector is one sector at
-    // cylinder 0, head 0, sector 1, and it is a boot sector because its last
-    // two bytes are 0x55 0xAA — the whole of the test, which is why a disk
-    // full of anything else is politely declined rather than executed.
+    // The diskette first, then the fixed disk — the AT's own order (*IBM
+    // Personal Computer AT Technical Reference*, the BIOS's bootstrap loader:
+    // the boot record is read from diskette drive A, and only when there is
+    // no diskette to read does control pass to the fixed disk). A boot sector
+    // is one sector at cylinder 0, head 0, sector 1, and it is a boot sector
+    // because its last two bytes are 0x55 0xAA — the whole of the test, which
+    // is why a disk full of anything else is politely declined rather than
+    // executed, and a blank diskette left in the drive falls through to the
+    // fixed disk rather than stopping the boot.
+    //
+    // The order used to be the other way round, and nothing noticed until an
+    // installer needed it: FreeDOS's partitions the fixed disk, writes a
+    // master boot record — which carries the signature — and reboots *off
+    // the diskette* to format the partition it just made. Fixed disk first,
+    // that reboot ran the new MBR over a partition with nothing in it.
     a.bind(l.int19);
     a.cli();
     a.movi(AX, 0);
@@ -439,9 +450,9 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.movi(SP, POST_STACK);
     a.sti();
     let try_boot = a.label();
-    a.movi8(DL, 0x80);
-    a.call(try_boot);
     a.movi8(DL, 0x00);
+    a.call(try_boot);
+    a.movi8(DL, 0x80);
     a.call(try_boot);
     a.int(0x18);
 
