@@ -127,6 +127,7 @@ use alloc::vec::Vec;
 
 use crate::fw::asm16::{AX, Asm, DS, Label, Mem, R16, SP, Sreg};
 
+mod cdrom;
 mod disk;
 mod keyboard;
 mod pci;
@@ -335,6 +336,70 @@ const EBDA_PCI_MODE: u16 = EBDA_PCI_STEP + 1;
 /// here.
 const EBDA_FD_LENGTH: u16 = EBDA_PCI_MODE + 2;
 
+// -- the CD-ROM's own scratch ------------------------------------------------
+//
+// POST writes [`EBDA_CD_FLAGS`] and [`EBDA_CD_DRIVE`]; `cdrom`'s El Torito
+// bootstrap writes the rest and `INT 13h` reads them for the rest of the run.
+// They live here rather than on the stack for the reason every other block
+// does: the transfer loops hold their cursors in registers and there is
+// nowhere else to put a state that outlives a call.
+
+/// The CD-ROM: bit 0 set if one answered the probe, bit 1 set while a disk
+/// emulation started by El Torito is active.
+const EBDA_CD_FLAGS: u16 = EBDA_FD_LENGTH + 2;
+/// The `INT 13h` drive number the CD-ROM was given.
+const EBDA_CD_DRIVE: u16 = EBDA_CD_FLAGS + 1;
+/// The 2048-byte logical block a `READ(10)` is aimed at (dword).
+const EBDA_CD_LBA: u16 = EBDA_CD_DRIVE + 1;
+/// A twelve-byte SCSI command descriptor block, on its way to the drive.
+const EBDA_CD_CDB: u16 = EBDA_CD_LBA + 4;
+/// How many more data blocks a drain may take before it gives up (word).
+const EBDA_CD_GUARD: u16 = EBDA_CD_CDB + 12;
+/// The nineteen-byte El Torito specification packet `INT 13h AH=4Bh` reports.
+///
+/// Built by the bootstrap and never touched afterwards, which is what makes it
+/// answerable at any point in the run: a no-emulation loader asks for it to
+/// find out which drive it came off and where on the disc its image is.
+const EBDA_CD_SPEC: u16 = EBDA_CD_GUARD + 2;
+/// Emulated-diskette geometry: sectors per track.
+const EBDA_CD_SPT: u16 = EBDA_CD_SPEC + 0x13;
+/// Emulated-diskette geometry: heads.
+const EBDA_CD_HEADS: u16 = EBDA_CD_SPT + 1;
+/// Emulated-diskette geometry: cylinders.
+const EBDA_CD_CYLS: u16 = EBDA_CD_HEADS + 1;
+/// Emulated-diskette scratch: the 512-byte virtual sector a transfer is at.
+const EBDA_CD_VLBA: u16 = EBDA_CD_CYLS + 2;
+/// Emulated-diskette scratch: virtual sectors still to move.
+const EBDA_CD_LEFT: u16 = EBDA_CD_VLBA + 2;
+/// Emulated-diskette scratch: virtual sectors moved so far, which is what `AL`
+/// reports back whether the transfer finished or stopped short.
+const EBDA_CD_DONE: u16 = EBDA_CD_LEFT + 1;
+/// The eight-byte `READ CD-ROM CAPACITY` response, big-endian as SCSI leaves
+/// it: the last logical block, then the block length.
+const EBDA_CD_CAPACITY: u16 = EBDA_CD_DONE + 1;
+/// The eighteen-byte `REQUEST SENSE` response, which is the only way to find
+/// out *why* a packet command answered `CHECK CONDITION`.
+const EBDA_CD_SENSE: u16 = EBDA_CD_CAPACITY + 8;
+/// How many more times the spin-up loop will ask whether the drive is ready.
+const EBDA_CD_TRIES: u16 = EBDA_CD_SENSE + 18;
+
+/// Where the El Torito bootstrap stages a 2048-byte logical block.
+///
+/// The same address POST's `IDENTIFY DEVICE` buffer uses, and deliberately:
+/// POST is over before `INT 19h` runs, nothing in conventional memory below
+/// `0x7C00` belongs to anyone yet, and a 2 KiB buffer is more than the EBDA's
+/// whole kilobyte. It is used only by the bootstrap — every `INT 13h` path
+/// reads straight into the caller's buffer, so nothing here is live once a
+/// guest is running and an operating system that relocates a master boot
+/// record to `0x0600` finds nothing of ours underneath it.
+const EL_TORITO_BUFFER: u16 = 0x0600;
+
+/// How many bytes one CD-ROM logical block holds.
+const CD_BLOCK: u16 = 2048;
+
+/// How many bytes one `INT 13h` diskette sector holds.
+const EMULATED_SECTOR: u16 = 512;
+
 /// How many bytes one `E820` entry occupies: base, length, type.
 const E820_ENTRY: u16 = 20;
 
@@ -444,6 +509,20 @@ pub(crate) struct Labels {
     pub chs_to_lba: Label,
     pub disk_ok: Label,
     pub disk_fail: Label,
+    pub disk_done: Label,
+
+    // the CD-ROM and El Torito
+    pub cd_detect: Label,
+    pub cd_boot: Label,
+    pub cd_int13: Label,
+    pub cd_emu_int13: Label,
+    pub cd_read: Label,
+    pub cd_read_sector: Label,
+    pub cd_packet: Label,
+    pub cd_wait_ready: Label,
+    pub cd_capacity: Label,
+    pub cd_chs: Label,
+    pub cd_ready: Label,
 
     // diskette primitives
     pub fd_out: Label,
@@ -506,6 +585,18 @@ impl Labels {
             chs_to_lba: a.label(),
             disk_ok: a.label(),
             disk_fail: a.label(),
+            disk_done: a.label(),
+            cd_detect: a.label(),
+            cd_boot: a.label(),
+            cd_int13: a.label(),
+            cd_emu_int13: a.label(),
+            cd_read: a.label(),
+            cd_read_sector: a.label(),
+            cd_packet: a.label(),
+            cd_wait_ready: a.label(),
+            cd_capacity: a.label(),
+            cd_chs: a.label(),
+            cd_ready: a.label(),
             fd_out: a.label(),
             fd_in: a.label(),
             fd_drain: a.label(),
@@ -640,6 +731,7 @@ pub fn image_for(platform: &Platform) -> Vec<u8> {
     video::emit(&mut a, &l);
     keyboard::emit(&mut a, &l);
     disk::emit(&mut a, &l);
+    cdrom::emit(&mut a, &l);
     system::emit(&mut a, &l);
     pci::emit(&mut a, &l);
 

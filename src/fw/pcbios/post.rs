@@ -361,6 +361,14 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // -- the fixed disk ------------------------------------------------------
     detect_hd(a, l);
 
+    // -- the CD-ROM ----------------------------------------------------------
+    //
+    // After the fixed disk and not before, because the drive number a CD-ROM
+    // gets is the one left over: `0x80` on a board with no hard disk and
+    // `0x81` on one with the disk just found. `cdrom.rs` is where the probe
+    // and that arithmetic live.
+    a.call(l.cd_detect);
+
     a.movi_label(SI, end_msg);
     a.call(l.puts);
 

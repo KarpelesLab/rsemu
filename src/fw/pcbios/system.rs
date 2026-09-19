@@ -441,6 +441,11 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // master boot record — which carries the signature — and reboots *off
     // the diskette* to format the partition it just made. Fixed disk first,
     // that reboot ran the new MBR over a partition with nothing in it.
+    //
+    // The CD-ROM is third and last, and that is the same argument made once
+    // more: an installer running off a disc writes a boot record to the disk
+    // it is installing onto and reboots, and a CD-ROM ahead of the fixed disk
+    // would run the installer again for ever.
     a.bind(l.int19);
     a.cli();
     a.movi(AX, 0);
@@ -454,6 +459,13 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.call(try_boot);
     a.movi8(DL, 0x80);
     a.call(try_boot);
+    // Then the CD-ROM, which is a bootstrap of its own rather than a third
+    // drive number: El Torito's boot record, catalog and media type decide
+    // both what is loaded and what `INT 13h` drive it becomes. It goes
+    // **last**, which keeps every existing order intact — a diskette in the
+    // drive still wins, and so does a fixed disk with a boot record on it, so
+    // an installer that has just written one and rebooted still runs it.
+    a.call(l.cd_boot);
     a.int(0x18);
 
     a.bind(try_boot);

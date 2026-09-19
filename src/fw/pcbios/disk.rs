@@ -34,10 +34,11 @@
 //! caller's buffer from the disk and leaves the disk untouched.
 
 use super::{
-    EBDA_COMMAND, EBDA_FD_CMD, EBDA_FD_COUNT, EBDA_FD_CYLINDER, EBDA_FD_DONE, EBDA_FD_HEAD,
-    EBDA_FD_LENGTH, EBDA_FD_RESULT, EBDA_FD_SECTOR, EBDA_FD_SPT, EBDA_HD_CAPACITY,
-    EBDA_HD_CYLINDERS, EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS, EBDA_LBA_HIGH, EBDA_LBA_LOW,
-    F_AX, F_BX, F_CX, F_DS, F_DX, F_ES, F_SI, Labels, clear_cf, ds_ebda, enter, leave, set_cf,
+    EBDA_CD_DRIVE, EBDA_CD_FLAGS, EBDA_COMMAND, EBDA_FD_CMD, EBDA_FD_COUNT, EBDA_FD_CYLINDER,
+    EBDA_FD_DONE, EBDA_FD_HEAD, EBDA_FD_LENGTH, EBDA_FD_RESULT, EBDA_FD_SECTOR, EBDA_FD_SPT,
+    EBDA_HD_CAPACITY, EBDA_HD_CYLINDERS, EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS,
+    EBDA_LBA_HIGH, EBDA_LBA_LOW, F_AX, F_BX, F_CX, F_DS, F_DX, F_ES, F_SI, Labels, clear_cf,
+    ds_ebda, enter, leave, set_cf,
 };
 use crate::fw::asm16::{
     AH, AL, AX, Alu, Asm, BH, BL, BX, CH, CL, CS, CX, Cc, DH, DI, DL, DS, DX, ES, Mem, SI, Shift,
@@ -100,6 +101,19 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
 
     a.mov8(DL, Mem::bp(F_DX));
     a.mov8(AH, Mem::bp(F_AX + 1));
+
+    // The CD-ROM first, because its drive number is whichever one POST had
+    // left over and that is not a range this dispatch can carve out: 0x80 on a
+    // board with no fixed disk, 0x81 on one with the fixed disk below. The
+    // comparison is against the number itself, guarded by the flag, so a board
+    // with no CD-ROM never reaches it (`cdrom.rs`).
+    let cd = a.label();
+    a.testi8(Mem::abs(EBDA_CD_FLAGS), 0x01);
+    a.jcc(Cc::E, cd);
+    a.alu8(Alu::CMP, DL, Mem::abs(EBDA_CD_DRIVE));
+    a.jcc(Cc::E, l.cd_int13);
+    a.bind(cd);
+
     a.testi8(DL, 0x80);
     a.jcc(Cc::E, floppy);
 
@@ -143,6 +157,20 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // with no diskette controller, take millions of cycles to decline a
     // diskette it does not have.
     a.bind(floppy);
+    // While an El Torito diskette emulation is running, drive 00h is the image
+    // inside the disc and the board's own diskette has moved to 01h — which is
+    // what the specification's boot procedure says happens to it, and is why
+    // this test comes before the adapter probe: a board with no µPD765 at all
+    // still has an emulated A: while one is mounted.
+    let real_floppy = a.label();
+    a.testi8(Mem::abs(EBDA_CD_FLAGS), 0x02);
+    a.jcc(Cc::E, real_floppy);
+    a.alui8(Alu::CMP, DL, 0x00);
+    a.jcc(Cc::E, l.cd_emu_int13);
+    a.alui8(Alu::CMP, DL, 0x01);
+    a.jcc(Cc::NE, l.disk_fail);
+    a.movi8(DL, 0x00);
+    a.bind(real_floppy);
     a.push(DX);
     a.movi(DX, FDC_MSR);
     a.in_al_dx();
@@ -527,6 +555,10 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.movmi8(Mem::bp(F_AX + 1), 0x01);
     set_cf(a);
     a.bind(done);
+    // The same epilogue under a shared name, for the paths in `cdrom.rs` that
+    // end with a status byte of their own — `03h`, write protected — rather
+    // than with either of the two above.
+    a.bind(l.disk_done);
     leave(a);
 
     // -- chs_to_lba ----------------------------------------------------------
