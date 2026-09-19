@@ -179,10 +179,19 @@ fn the_map_is_the_a600s() {
     // Out of reset the ROM is at zero as well as at $F80000.
     assert_eq!(read(&m, 0, Width::U16), 0x0010);
     assert_eq!(read(&m, ROM + 4, Width::U16), 0x00F8);
-    // No trapdoor RAM and no register mirror in bank 6, no clock at $DC0000,
-    // no second ROM at $E00000: every one of them floats, and none faults.
+    // Gayle's ROM select repeats the Kickstart at $E00000 and through
+    // $A80000-$B7FFFF (Gayle Specification section 2.0).
+    for mirror in [0xE0_0000u64, 0xA8_0000, 0xB0_0000] {
+        assert_eq!(
+            read(&m, mirror + 4, Width::U16),
+            0x00F8,
+            "{mirror:#x} should repeat the Kickstart"
+        );
+    }
+    // No trapdoor RAM and no register mirror in bank 6, and no clock at
+    // $DC0000: every one of them floats, and none faults.
     let space = m.space("mem").expect("the memory space");
-    for addr in [0xC0_0000u64, 0xC0_F01C, 0xD0_0000, 0xDC_0000, 0xE0_0000] {
+    for addr in [0xC0_0000u64, 0xC0_F01C, 0xD0_0000, 0xDC_0000] {
         let floated = MemAttrs::DEBUG.with_bus(0x5A);
         assert_eq!(
             space.read(addr, Width::U8, floated),

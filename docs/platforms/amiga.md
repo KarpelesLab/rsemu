@@ -899,17 +899,16 @@ logic. The card's windows at `$600000`–`$A5FFFF` are not decoded and float.
 | Chip RAM | 512 KiB | 1 MiB (p. 1-1: "512KB or 1MB internal"; the A600 sold with 1 MiB) |
 | Bank 6 (`$C00000`–`$D7FFFF`) | an A501, or the chip registers repeating | floats: no trapdoor slow RAM exists for the A600, and Gayle selects the chip registers at `$DFF000`–`$DFF1FF` only (section 4.0) |
 | `$DC0000` | floats (the clock comes on the A501) | floats: the RTC select goes to the expansion header, where an A601 puts a clock |
-| `$E00000` | the AROS-only `ext` window | nothing — see below |
+| `$E00000` | the AROS-only `ext` window | the Kickstart again — see below |
 | IDE, Gayle registers, ID | — | `$DA0000`, `$DA8000`, `$DE1000` |
 
-**The ROM is mapped at `$F80000` only**, and one
-thing about that is open. The draft specification's ROM select also covers
-`$E00000`–`$E7FFFF` and `$A80000`–`$B7FFFF` (section 2.0, and 17.0's map), and
-the A600's ROM is a 256K×16 part with no pin for `A19`, so on the real board
-the Kickstart would most likely repeat in both. Black-box, it makes no
-difference to anything tested here: with both mirrors mapped, Kickstart 3.1
-boots Workbench 3.1 to a bit-identical frame at the same moment. Adding them
-is two `map` lines.
+**The ROM answers at `$F80000`, `$E00000` and `$A80000`–`$B7FFFF`.** The
+draft specification's ROM select covers all three (section 2.0, and 17.0's
+map), and the A600's ROM is a 256K×16 part with no pin for `A19`, so the
+Kickstart repeats through each. Black-box it changes nothing tested here:
+Kickstart 3.1 boots Workbench 3.1 to a bit-identical frame at the same moment
+with the two mirrors mapped or without them. They are mapped because the chip
+decodes them, not because anything was seen to need them.
 
 **The chips are OCS.** The A600 has the ECS 8375 Agnus and 8373 Denise; the
 board moves to them when the ECS models land, and every golden below moves

@@ -149,6 +149,7 @@ machine "amiga-a600" {
   #   $DE1000  Gayle's identification register                  4 KiB
   #   $DFF000  the custom chip registers                        512 bytes
   #   $F80000  Kickstart                                        512 KiB
+  #   $E00000  Kickstart again, and at $A80000 twice over          (Gayle's ROM select)
   map mem 0x000000 size chip-ram       = overlay.overlay { endian = "big" }
   map mem 0xBFD000 size 0x1000         = gayle.cia-even  { endian = "big" }
   map mem 0xBFE000 size 0x1000         = gayle.cia-odd   { endian = "big" }
@@ -157,6 +158,12 @@ machine "amiga-a600" {
   map mem 0xDE1000 size 0x1000         = gayle.id        { endian = "big" }
   map mem 0xDFF000 size 0x200          = custom
   map mem 0xF80000 size 512K           = mirror(kick)    { endian = "big" }
+  # Gayle's ROM select covers these two ranges as well (Gayle Specification
+  # section 2.0, and section 17.0's map), and the A600's Kickstart is a 256Kx16
+  # part with no pin for A19, so the ROM repeats in both. Nothing tested here
+  # reads them; they are here because the chip decodes them.
+  map mem 0xE00000 size 512K           = mirror(kick)    { endian = "big" }
+  map mem 0xA80000 size 1M             = mirror(kick)    { endian = "big" }
 
   # -- wiring ----------------------------------------------------------------
   #
