@@ -27,7 +27,6 @@ use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ExportId;
 use rsemu::dev::amiga::custom::CustomBus;
 use rsemu::dev::amiga::denise::Video;
-use rsemu::host::display::{PixelFormat, Surface};
 use rsemu::machine::{Machine, catalog};
 
 // Register addresses, as §3 orders them.
@@ -400,7 +399,7 @@ fn write_png(scanout: &rsemu::host::display::amiga::DeniseScanout, name: &str) {
     };
     #[cfg(feature = "display-png")]
     {
-        use rsemu::host::display::Scanout;
+        use rsemu::host::display::{PixelFormat, Scanout, Surface};
         let info = scanout.info();
         let mut surface = Surface::new(PixelFormat::RGB888, info.width, info.height);
         scanout.capture(&mut surface);
