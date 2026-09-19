@@ -385,10 +385,11 @@ struct Placed {
 ///
 /// # Locks
 ///
-/// Three, all at [`LockRank::LEAF`] and none ever held across another: the
-/// latches, where the windows went, and the stale flag. A `LEAF` lock may not
-/// be taken while another is held (`core::sync`), so every method below reads
-/// what it needs, drops the guard, and only then does the outward thing.
+/// Four, all at [`LockRank::LEAF`] and none ever held across another: the
+/// latches, where the windows went, the stale flag, and the regions supplied
+/// after construction. A `LEAF` lock may not be taken while another is held
+/// (`core::sync`), so every method below reads what it needs, drops the guard,
+/// and only then does the outward thing.
 pub struct Bars {
     /// What the function declared, keyed by register index. Index 6 is the
     /// expansion ROM; a 64-bit BAR's upper half occupies the following index
@@ -402,6 +403,9 @@ pub struct Bars {
     /// Set when a retopology could not happen at the instant it was asked for.
     /// Derived state: never serialized, and a load re-applies unconditionally.
     stale: Mutex<bool>,
+    /// What [`Bars::supply`] put behind a register that was declared without a
+    /// region. Configuration rather than state: written once, at bind.
+    supplied: Mutex<BTreeMap<u8, RegionRef>>,
 }
 
 impl fmt::Debug for Bars {
@@ -445,7 +449,59 @@ impl Bars {
             values: Mutex::with_rank(LockRank::LEAF, [0; Bars::COUNT as usize]),
             placed: Mutex::with_rank(LockRank::LEAF, None),
             stale: Mutex::with_rank(LockRank::LEAF, false),
+            supplied: Mutex::with_rank(LockRank::LEAF, BTreeMap::new()),
         }
+    }
+
+    /// Put `region` behind register `index`, which was declared without one.
+    ///
+    /// For the window whose contents belong to **another object**: a display
+    /// adapter's linear framebuffer is the display device's memory, and a
+    /// machine graph only introduces two objects to each other at
+    /// [`Instance::bind`](crate::machine::realize::Instance::bind) — long
+    /// after the function declared how wide its window is. The size is the
+    /// declaration's, because that is what firmware sizes the register for;
+    /// the region may be smaller, and then the rest of the window decodes
+    /// nothing, exactly as a card with half its memory sockets filled does.
+    ///
+    /// Legal only before [`Bars::install`], which is where bind places the
+    /// windows.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if no register was declared at `index`, if one was
+    /// declared with a region already, or if the region is larger than the
+    /// window it would sit in.
+    pub fn supply(&self, index: u8, region: RegionRef) -> Result<()> {
+        let at = |message: String| Error::Config {
+            at: alloc::format!("BAR{index}"),
+            message,
+        };
+        let Some(bar) = self.specs.get(&index) else {
+            return Err(at(String::from(
+                "nothing was declared at this register, so there is no window to fill",
+            )));
+        };
+        if bar.region.is_some() {
+            return Err(at(String::from(
+                "this register already decodes a region of its own",
+            )));
+        }
+        if bar.kind == BarKind::Io {
+            return Err(at(String::from(
+                "an I/O BAR cannot carry a region yet — see this module's docs, which say why \
+                 the order-exempt try-lock cannot serve one",
+            )));
+        }
+        if region.len() > bar.len {
+            return Err(at(alloc::format!(
+                "the region is {} bytes and the window is {}",
+                region.len(),
+                bar.len
+            )));
+        }
+        self.supplied.lock().insert(index, region);
+        Ok(())
     }
 
     /// Declare `bar` at register `index`, or [`Bars::ROM`] for the expansion
@@ -696,11 +752,17 @@ impl Bars {
             return true;
         };
         // Everything the registers ask for, computed before any guard is held.
+        // The supplied table is read out and its lock dropped first: it is a
+        // `LEAF` and so is the one `window` takes below.
+        let supplied = self.supplied.lock().clone();
         let wanted: Vec<(u8, RegionRef, u64, Perms)> = self
             .specs
             .iter()
             .filter_map(|(index, bar)| {
-                let region = bar.region.clone()?;
+                let region = bar
+                    .region
+                    .clone()
+                    .or_else(|| supplied.get(index).cloned())?;
                 let (base, decoding) = self.window(*index, command)?;
                 decoding.then_some((*index, region, base, bar.perms))
             })

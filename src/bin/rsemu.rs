@@ -1319,8 +1319,10 @@ fn take_scanout(
     hosts: &HostObjects,
     machine: &Machine,
 ) -> Option<Box<dyn rsemu::host::display::Scanout>> {
+    // `take_clocked` rather than `take`: a VGA's frame period is its own
+    // clock domain's, and the guest changes it with every mode set.
     #[cfg(feature = "dev-pc-video")]
-    if let Some(s) = rsemu::host::display::pc::capture::take(hosts) {
+    if let Some(s) = rsemu::host::display::pc::capture::take_clocked(hosts, machine) {
         return Some(Box::new(s));
     }
     #[cfg(feature = "dev-nes-ppu")]

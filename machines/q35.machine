@@ -390,12 +390,21 @@ machine "q35" {
 
   # -- video ------------------------------------------------------------------
 
-  object vga     "pc.video"    { clock = dot / 9, dot-clock = 28322000 }
+  # The VGA register file rather than the text-only 6845 one, and the card's
+  # BAR0 decoding the same memory linearly — `machines/pc-at.machine` has the
+  # argument at length.
+  object vga     "pc.video"    {
+    clock     = dot / 9
+    dot-clock = 28322000
+    model     = "vga"
+    vram-size = 4M
+  }
   object vgacard "pc.vga-pci"  {
-    space  = mem
-    bus    = "pci0"
-    device = 2
-    image  = "vgabios"
+    space       = mem
+    bus         = "pci0"
+    device      = 2
+    image       = "vgabios"
+    framebuffer = vga
   }
 
   # -- the hard disks and the IDE channels ------------------------------------
@@ -428,7 +437,7 @@ machine "q35" {
   # -- the memory map ---------------------------------------------------------
   #
   # 0x00000    base RAM, up to the video hole
-  # 0xb8000    the colour text page
+  # 0xa0000    display memory (the text page is at 0xb8000 inside it)
   # 0xc0000    the video option ROM
   # 0xe0000    the ACPI tables
   # 0xf0000    the system BIOS
@@ -439,7 +448,7 @@ machine "q35" {
   # The ECAM window is **not** here, and that is the point of it: `PCIEXBAR`
   # places it, and a firmware that moves the register moves the window.
   map mem 0x00000000 size basemem  = ram_low
-  map mem 0x000b8000 size 0x8000   = vga.vram
+  map mem 0x000a0000 size 0x20000  = vga.window
   map mem vgabase    size vgasize  = vgarom
   map mem acpibase   size acpisize = acpi.tables
   map mem biosbase   size biossize = bios

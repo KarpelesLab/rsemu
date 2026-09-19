@@ -373,7 +373,19 @@ machine "pc-at" {
   # crystal's rate to do it, and `BindCtx` carries a clock domain but not the
   # forest's picture of what that domain is rated at. Written twice, like the
   # RTC's memory sizes and for the same reason — a seam to close, not a design.
-  object vga "pc.video" { clock = dot / 9, dot-clock = 28322000 }
+  #
+  # `model = "vga"` is the adapter proper rather than the text-only 6845
+  # register file: the VGA's own CRT controller, four planes behind the window
+  # at 0xa0000, the graphics modes every DOS program and every Windows setup
+  # asks for, and the linear mode `src/fw/pcbios`'s VBE services drive.
+  # `vram-size` is the card's memory, and the framebuffer BAR below shows it to
+  # the bus.
+  object vga "pc.video" {
+    clock     = dot / 9
+    dot-clock = 28322000
+    model     = "vga"
+    vram-size = 4M
+  }
 
   # The PCI face of that same adapter, and the reason a firmware written this
   # century puts anything on the screen at all.
@@ -400,11 +412,16 @@ machine "pc-at" {
   # that loads a ROM off a BAR checks them; a BIOS built for an ISA card carries
   # none and cannot be loaded this way at all. The defaults match the common
   # PCI-VGA image, and a different image wants different numbers here.
+  # `framebuffer` is the other half of the split: the card's BAR0 decodes the
+  # display object's `lfb` region, which is that object's video memory seen
+  # linearly. A driver — or our own VBE — maps it and writes pixels straight
+  # into the memory the scanout reads.
   object vgacard "pc.vga-pci" {
-    space  = mem
-    bus    = "pci0"
-    device = 2
-    image  = "vgabios"
+    space       = mem
+    bus         = "pci0"
+    device      = 2
+    image       = "vgabios"
+    framebuffer = vga
   }
 
   # -- the floppy controller --------------------------------------------------
@@ -467,7 +484,7 @@ machine "pc-at" {
   # 0x100000 extended memory
   # 0xfffe0000 the system BIOS again — see below
   map mem 0x00000000 size basemem  = ram_low
-  map mem 0x000b8000 size 0x8000   = vga.vram      # the colour text page
+  map mem 0x000a0000 size 0x20000  = vga.window    # display memory, A0000-BFFFF
   map mem vgabase    size vgasize  = vgarom
   map mem biosbase   size biossize = bios
   map mem 0x00100000 size extmem   = ram_high

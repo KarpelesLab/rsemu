@@ -103,6 +103,22 @@ const MIN_ROM_LEN: u64 = 2048;
 /// video BIOS is tens of kilobytes; 16 MiB is four hundred times that.
 const MAX_ROM_LEN: u64 = 16 * 1024 * 1024;
 
+/// How wide the linear framebuffer window is.
+///
+/// A constant rather than a property, and larger than any `pc.video` this
+/// crate will build: a BAR is a power of two and firmware sizes it before it
+/// knows anything about the card, so the window is the card's aperture and the
+/// display device's memory is whatever sits at the bottom of it — which is how
+/// a real card with half its memory sockets filled behaves. 16 MiB is
+/// `pc.video`'s own maximum, so no configuration can overflow it.
+pub const FRAMEBUFFER_LEN: u64 = 16 * 1024 * 1024;
+
+/// Which base address register the framebuffer answers at.
+///
+/// Zero, because that is where every display adapter since the first SVGA has
+/// put its aperture and where a driver that has to guess will look.
+pub const FRAMEBUFFER_BAR: u8 = 0;
+
 /// What an unprogrammed cell of the ROM window reads as.
 ///
 /// `0xff`, an erased EPROM byte, for the same reason
@@ -274,6 +290,10 @@ pub struct VgaPci {
     /// The bytes behind the expansion ROM window, for a test that wants to see
     /// what the firmware will read. `None` where no image was bound.
     rom: Option<Arc<RomStore>>,
+    /// The object whose `lfb` region BAR0 decodes, if a machine file named
+    /// one. Resolved at [`Instance::bind`], because that is the first moment
+    /// this card can be introduced to another object.
+    framebuffer: Mutex<Option<String>>,
 }
 
 impl VgaPci {
@@ -303,17 +323,23 @@ impl VgaPci {
         let device = r.or_range("device-id", 0x1111u64, 0..=0xffff)?;
         let revision = r.or_range("revision", 0u64, 0..=255)?;
         let image = r.require_media("image")?.to_bytes();
+        let framebuffer = r
+            .optional_link("framebuffer")?
+            .map(|l| String::from(l.as_str()));
         r.finish()?;
         let bus = buses::attach(props, &bus_name)?;
         let at = Bdf::new(0, device_no as u8, function_no as u8)?;
-        VgaPci::with_bus(
+        let card = VgaPci::with_bus(
             bus,
             at,
             vendor as u16,
             device as u16,
             revision as u8,
             &image,
-        )
+            framebuffer.is_some(),
+        )?;
+        *card.framebuffer.lock() = framebuffer;
+        Ok(card)
     }
 
     /// The same card, built from a fabric handle a test already has.
@@ -333,8 +359,16 @@ impl VgaPci {
         device: u16,
         revision: u8,
         image: &[u8],
+        framebuffer: bool,
     ) -> Result<VgaPci> {
         let mut bars = Bars::new();
+        if framebuffer {
+            // Prefetchable, because a linear framebuffer is exactly what
+            // §6.2.5.1's bit 3 describes: reading it has no side effects and a
+            // bridge may merge writes and read ahead. A driver that maps it
+            // write-combining relies on this bit.
+            bars = bars.with(FRAMEBUFFER_BAR, Bar::memory(FRAMEBUFFER_LEN).prefetchable())?;
+        }
         let mut rom = None;
         if !image.is_empty() {
             let len = image.len() as u64;
@@ -378,7 +412,19 @@ impl VgaPci {
             device,
             revision,
             rom,
+            framebuffer: Mutex::with_rank(LockRank::LEAF, None),
         })
+    }
+
+    /// Put `region` behind the framebuffer BAR, which `new` declared because a
+    /// machine file named an object to take it from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if no framebuffer BAR was declared, or if the region
+    /// does not fit the window.
+    pub fn attach_framebuffer(&self, region: RegionRef) -> Result<()> {
+        self.regs.bars.supply(FRAMEBUFFER_BAR, region)
     }
 
     /// Where this card sits on its fabric.
@@ -469,6 +515,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: true,
             summary: "the media slot the video BIOS is bound to; empty fits no expansion ROM",
         },
+        PropertySpec {
+            name: "framebuffer",
+            kind: ValueKind::Link,
+            required: false,
+            summary: "the display object whose `lfb` region BAR0 decodes (default: no BAR0)",
+        },
     ],
     construct: |props| Ok(Box::new(VgaPci::new(props)?)),
 };
@@ -537,6 +589,15 @@ impl Instance for VgaPci {
                  the space they are placed in: add `space = mem` to the object that declares it",
             ),
         })?;
+        // The framebuffer before the windows are placed: `install` maps
+        // whatever decodes, and out of reset that is nothing — but a card
+        // whose registers a snapshot has already filled in would otherwise
+        // place an empty window.
+        let wanted = self.framebuffer.lock().clone();
+        if let Some(path) = wanted {
+            let region = ctx.region(&path, "lfb")?;
+            self.attach_framebuffer(region)?;
+        }
         self.attach_space(space)
     }
 }
@@ -577,6 +638,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("device-id", ValueKind::Uint).range(0, 0xffff))
         .prop(PropSchema::new("revision", ValueKind::Uint).range(0, 255))
         .prop(PropSchema::new("image", ValueKind::Media).required())
+        .prop(PropSchema::new("framebuffer", ValueKind::Link))
 }
 
 #[cfg(test)]

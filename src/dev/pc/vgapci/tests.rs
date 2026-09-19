@@ -47,7 +47,7 @@ impl Rig {
 
     fn with_image(bytes: &[u8]) -> Rig {
         let bus = Arc::new(PciBus::new());
-        let card = VgaPci::with_bus(Arc::clone(&bus), AT, 0x1234, 0x1111, 0x02, bytes)
+        let card = VgaPci::with_bus(Arc::clone(&bus), AT, 0x1234, 0x1111, 0x02, bytes, false)
             .expect("a legal card");
 
         let mem = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
@@ -333,5 +333,98 @@ fn the_rom_window_is_read_only_and_swallows_a_write() {
             .spec(Bars::ROM)
             .map(crate::bus::pci::Bar::len),
         Some(0x4000)
+    );
+}
+
+/// A card whose BAR0 decodes memory that belongs to another object, which is
+/// what a display adapter's linear framebuffer is.
+fn framebuffer_rig(len: u64) -> (Rig, Arc<crate::core::space::RamStore>) {
+    let bus = Arc::new(PciBus::new());
+    let card = VgaPci::with_bus(Arc::clone(&bus), AT, 0x1234, 0x1111, 0x02, &image(), true)
+        .expect("a legal card");
+    let store = Arc::new(crate::core::space::RamStore::new(len));
+    card.attach_framebuffer(Arc::new(Region::ram("lfb", Arc::clone(&store))))
+        .expect("the region fits the window");
+
+    let mem = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let port = Arc::new(AddressSpace::new("port", 16).with_unassigned(UnassignedPolicy::ONES));
+    let ports = Arc::new(ConfigPorts::new(Arc::clone(&bus)));
+    port.topology()
+        .map(
+            Region::io(
+                "config",
+                CONFIG_PORT_WINDOW_LEN,
+                Arc::clone(&ports) as Arc<dyn crate::core::space::MemOps>,
+            ),
+            0xcf8,
+        )
+        .expect("0xcf8 is free");
+    let mut deferred = Deferred::new();
+    let hosts = HostObjects::new();
+    let mut ctx = RealizeCtx::new("vga", RequesterId::ANONYMOUS, &mut deferred, &hosts);
+    card.realize(&mut ctx)
+        .expect("it announces onto the fabric");
+    deferred.drain();
+    card.attach_space(&mem).expect("the windows go in");
+    card.reset(ResetKind::Cold);
+    (Rig { mem, port, card }, store)
+}
+
+#[test]
+fn the_framebuffer_bar_sizes_as_the_aperture_and_decodes_the_display_memory() {
+    let (rig, store) = framebuffer_rig(4 * 1024 * 1024);
+    // §6.2.5.1's sizing: all ones in, the window's mask out, with bit 3 set
+    // because a framebuffer is prefetchable.
+    rig.write_u32(0x10, 0xffff_ffff);
+    let mask = rig.read_u32(0x10);
+    assert_eq!(mask, 0xff00_0008, "16 MiB, prefetchable, 32-bit");
+    assert_eq!(!(mask & 0xffff_fff0) + 1, FRAMEBUFFER_LEN as u32);
+
+    store.write_u8(0, 0x5a).expect("inside the store");
+    store
+        .write_u8(store.len() - 1, 0xa5)
+        .expect("inside the store");
+
+    rig.write_u32(0x10, 0xfd00_0000);
+    assert_eq!(rig.peek(0xfd00_0000), 0xff, "COMMAND[1] is still clear");
+    rig.write_u16(config::COMMAND, config::COMMAND_MEMORY);
+    assert_eq!(rig.peek(0xfd00_0000), 0x5a);
+    assert_eq!(rig.peek(0xfd00_0000 + store.len() - 1), 0xa5);
+    // The card's memory is smaller than its aperture, so the top of the window
+    // decodes nothing — which is what a card with empty memory sockets does.
+    assert_eq!(rig.peek(0xfd00_0000 + store.len()), 0xff);
+
+    // And a guest writing the aperture writes the display's memory, which is
+    // the whole point: this is the same store the scanout reads.
+    rig.mem
+        .write(0xfd00_0010, Width::U8, 0x42, MemAttrs::DEFAULT)
+        .expect("the window is writable");
+    assert_eq!(store.read_u8(0x10).expect("inside the store"), 0x42);
+}
+
+#[test]
+fn a_card_without_a_framebuffer_has_no_base_address_register_0() {
+    let rig = Rig::new();
+    rig.write_u32(0x10, 0xffff_ffff);
+    assert_eq!(rig.read_u32(0x10), 0);
+    // And supplying one where none was declared is a configuration error
+    // rather than a window that silently never appears.
+    let store = Arc::new(crate::core::space::RamStore::new(65536));
+    assert!(
+        rig.card
+            .attach_framebuffer(Arc::new(Region::ram("lfb", store)))
+            .is_err()
+    );
+}
+
+#[test]
+fn a_framebuffer_larger_than_the_aperture_is_refused() {
+    let bus = Arc::new(PciBus::new());
+    let card = VgaPci::with_bus(Arc::clone(&bus), AT, 0x1234, 0x1111, 0x02, &image(), true)
+        .expect("a legal card");
+    let store = Arc::new(crate::core::space::RamStore::new(FRAMEBUFFER_LEN * 2));
+    assert!(
+        card.attach_framebuffer(Arc::new(Region::ram("lfb", store)))
+            .is_err()
     );
 }

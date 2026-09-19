@@ -2299,6 +2299,7 @@ impl Video {
     pub fn scanout(&self) -> VideoScanout {
         VideoScanout {
             shared: Arc::clone(&self.shared),
+            rate: None,
         }
     }
 
@@ -2680,6 +2681,11 @@ pub fn schema() -> ClassSchema {
 #[derive(Debug, Clone)]
 pub struct VideoScanout {
     shared: Arc<Shared>,
+    /// The frequency of the device's clock domain as `(numerator,
+    /// denominator)` hertz, when a host resolved it out of the machine's clock
+    /// forest ([`crate::host::display::pc::capture`]). `None` falls back to
+    /// the `dot-clock` property.
+    rate: Option<(u64, u64)>,
 }
 
 impl VideoScanout {
@@ -2687,6 +2693,20 @@ impl VideoScanout {
     #[must_use]
     pub fn new(video: &Video) -> VideoScanout {
         video.scanout()
+    }
+
+    /// The same view, with the character clock's exact rational frequency.
+    ///
+    /// The frame period is *ticks of this device's clock domain*, and the
+    /// device cannot reach the clock forest from `&self` — the same seam
+    /// [`amiga`](crate::host::display::amiga) and [`lcd`](crate::host::display::lcd)
+    /// have. With the rate, the period is exact for every mode the guest sets;
+    /// without it, it is computed from the `dot-clock` property, which is the
+    /// same number a board writes into both places.
+    #[must_use]
+    pub fn with_rate(mut self, rate: Option<(u64, u64)>) -> VideoScanout {
+        self.rate = rate;
+        self
     }
 }
 
@@ -2760,6 +2780,16 @@ impl Scanout for VideoScanout {
         let per = state.ticks_per_frame();
         if per == 0 {
             return 0;
+        }
+        // A host that resolved the clock forest's own answer: the frame is
+        // this many ticks of the domain the scheduler advances, so the period
+        // is exact whatever the mode — and it stays exact when the guest
+        // changes the mode, because only `per` moved.
+        if let Some((num, den)) = self.rate
+            && num != 0
+        {
+            let ns = u128::from(per) * u128::from(den) * 1_000_000_000 / u128::from(num);
+            return u64::try_from(ns).unwrap_or(u64::MAX);
         }
         match state.model {
             Model::Mc6845 => {

@@ -889,7 +889,7 @@ fn boot_with(index: u32, media: Media) -> u32 {
         // the page resizes its canvas from that.
         #[cfg(feature = "dev-pc-video")]
         if state.scanout.is_none()
-            && let Some(scanout) = crate::host::display::pc::capture::take(&hosts)
+            && let Some(scanout) = crate::host::display::pc::capture::take_clocked(&hosts, &machine)
         {
             state.attach_scanout(alloc::boxed::Box::new(scanout));
         }
