@@ -724,6 +724,26 @@ pub static AMIGA_A600: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/amiga-a600.machine"),
 };
 
+/// A Commodore Amiga 1200, when this build has the board classes and Gayle.
+///
+/// The AA chip set — Alice (`revision = "aga"` on `amiga.agnus`) and Lisa (the
+/// same on `amiga.denise`) — around a 68EC020 at 14.19 MHz, with 2 MiB of chip
+/// RAM and the A600's Gayle: an IDE drive on the `hd0` slot, the overlay Gayle
+/// keeps for itself, no trapdoor RAM and no clock. Eight bitplanes, a
+/// 256-entry 24-bit colour table and HAM8. The `kickstart` slot takes the ROM,
+/// `hd0` a whole-disk image with a Rigid Disk Block, `df0` a floppy; both
+/// drives may be empty. `machines/amiga-a1200.machine` carries the wiring, and
+/// `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-a1200")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a1200")))]
+pub static AMIGA_A1200: CatalogEntry = CatalogEntry {
+    name: "amiga-a1200",
+    summary: "an Amiga 1200: the AA chip set (Alice, Lisa) around a 68EC020, with 2 MiB of chip \
+              RAM, Gayle, and an IDE hard disk",
+    media: &["kickstart", "hd0", "df0"],
+    source: include_str!("../../machines/amiga-a1200.machine"),
+};
+
 /// A Commodore Amiga 500+, when this build has the board classes.
 ///
 /// The A500 with the Enhanced Chip Set — an 8375 Agnus and an 8373 Denise —
@@ -841,6 +861,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&AMIGA_A500);
     #[cfg(feature = "machine-amiga-a600")]
     out.push(&AMIGA_A600);
+    #[cfg(feature = "machine-amiga-a1200")]
+    out.push(&AMIGA_A1200);
     #[cfg(feature = "machine-amiga-a500plus")]
     out.push(&AMIGA_A500PLUS);
     #[cfg(feature = "machine-mips-mini")]
@@ -2416,6 +2438,15 @@ mod tests {
                 0x00, 0x00, 0x00, 0x08, // PC  = $00000008
                 0x60, 0xfe, // BRA .
             ],
+            // The same, on the A1200, whose stack pointer is the top of its
+            // 2 MiB of chip RAM. `tests/amiga_a1200.rs` boots the user's ROM
+            // on it; `tests/amiga_alice.rs` drives the chip set without one.
+            #[cfg(feature = "machine-amiga-a1200")]
+            ("amiga-a1200", "kickstart") => &[
+                0x00, 0x20, 0x00, 0x00, // SSP = $00200000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             // The same, with the stack at the top of the 500+'s 1 MiB.
             // `tests/amiga_a500plus.rs` runs real programs on it.
             #[cfg(feature = "machine-amiga-a500plus")]
@@ -2505,6 +2536,9 @@ mod tests {
             // and an empty DF0, the insert-disk screen.
             #[cfg(feature = "machine-amiga-a600")]
             ("amiga-a600", "hd0" | "df0") => &[],
+            // An A1200 with neither drive filled, for the same reason.
+            #[cfg(feature = "machine-amiga-a1200")]
+            ("amiga-a1200", "hd0" | "df0") => &[],
             // The 500+'s drive, empty for the same reason.
             #[cfg(feature = "machine-amiga-a500plus")]
             ("amiga-a500plus", "df0") => &[],

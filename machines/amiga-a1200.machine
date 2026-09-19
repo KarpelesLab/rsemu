@@ -1,0 +1,220 @@
+# amiga-a1200 - a Commodore Amiga 1200: the AA chip set around Gayle, with a
+# 68EC020 and 2 MiB of chip RAM.
+#
+#   rsemu run amiga-a1200 --media kickstart=kickstart:amiga-os-310-a1200.rom \
+#       --media hd0=workbench-311.hdf
+#   rsemu run amiga-a1200 --media kickstart=kick.rom --drive hd0=disk.hdf
+#   rsemu run amiga-a1200 --media kickstart=kick.rom --media df0=disk.adf --vnc :5900
+#
+# `hd0` is a whole disk with a Rigid Disk Block, as on `amiga-a600`; `--media`
+# copies it into memory and the guest's writes stay there, `--drive` writes
+# them back to the file.
+#
+# What changes from `amiga-a600.machine`, and where each change comes from:
+#
+# * **The AA chip set.** `agnus` is **Alice**, the 8374, and `denise` is
+#   **Lisa**, the AA video chip; both take `revision = "aga"`. The A1200
+#   schematics name them: "ALICE (AA AGNUS)" and "LISA (AA DENISE)" on the
+#   parts list. Eight bitplanes, a 256-entry 24-bit colour
+#   table, HAM8, `FMODE`'s 32- and 64-bit fetches and 35 ns everywhere -
+#   `src/dev/amiga/agnus/aga.rs` and `src/dev/amiga/denise/aga.rs` are the
+#   ledgers, both written from the *Specification for the Advanced Amiga (AA)
+#   Chip Set*.
+# * **A 68EC020 at half the master clock.** The A1200's processor is the
+#   MC68EC020, which is the 68020 with 24 address pins and no dynamic bus
+#   sizing (MC68020/MC68EC020 User's Manual, §1). PAL: 28.37516 / 2 =
+#   14.18758 MHz, which is exactly twice an A600's 68000. `mem` is 24 bits
+#   wide because that is how many address pins the part has, so the 32-bit
+#   local bus at $08000000 - the trapdoor card's fast RAM - is off this map by
+#   construction, as it is on a machine with an empty trapdoor.
+# * **2 MiB of chip RAM.** Four 256K x 16 DRAMs on a 32-bit bus (the
+#   schematics' "DRAM 256KX16. 80NS" and its "OPTIONAL" pair); Alice's
+#   pointers are twenty bits and reach exactly that much (AA specification,
+#   §3). `-p chip-ram=1M` is the half-populated board.
+# * **No trapdoor slow RAM and no clock**, as on the A600: bank 6 and
+#   $DC0000 float. A real A1200's trapdoor takes a processor card, not an
+#   A501.
+#
+# Everything else - Gayle and its IDE port, the CIAs and their decode, Paula,
+# DF0, the keyboard and the mouse, the overlay - is `amiga-a600.machine`'s,
+# because it is the same Gayle doing the same decoding: "the Gayle array
+# handles all the address decoding and processor control functions" on both
+# boards. `machines/amiga-a600.machine` and `src/dev/amiga/gayle.rs` carry the
+# long comments for that half.
+#
+# Written from the *Specification for the Advanced Amiga (AA) Chip Set*
+# (Commodore-Amiga, 06/07/91), the GAYLE specification (Commodore, July 10
+# 1991), the A1200 System Schematics Service Addendum (Commodore, 1992), the
+# A600 System Schematics (#315987 rev. C), the MC68020/MC68EC020 User's Manual
+# and the Amiga Hardware Reference Manual (3rd edition). No Amiga emulator
+# source and no FPGA reimplementation was consulted; they are all copyleft
+# (ROADMAP.md 1).
+#
+# Empty addresses float rather than fault, for the reason the A500 and A600
+# files give: Gayle generates /DTACK for "any address ranges not covered in
+# other sections" (section 14.0).
+
+machine "amiga-a1200" {
+  # -- how much of each memory -----------------------------------------------
+  param chip-ram = 2M
+
+  # A 3.1 Kickstart is 512 KiB. `-p kickstart-size=256K` repeats a smaller one.
+  param kickstart-size = 512K
+
+  # Whether Paula keeps stereo output frames for a host audio sink to drain.
+  param audio = false
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # PAL: 28.37516 MHz (the schematics' "TTL 28-37512 MHZ PAL"; the A600's
+  # sheet 2 prints the same rate to one more digit and that is the one used,
+  # so the two boards share an oscillator tree). `-p master=28636360` is the
+  # NTSC board, and `standard = "ntsc"` on `agnus` and `denise` with it.
+  param master = 28375160
+  osc   clk    = master Hz
+
+  space mem { width = 24, endian = "big", unassigned = open-bus }
+
+  # The 68EC020 runs at clk / 2 - 14.18758 MHz PAL - which is an exact integer
+  # ratio inside the one oscillator tree, like every other rate here.
+  object cpu "cpu.m68k" {
+    clock  = clk / 2
+    space  = mem
+    engine = "interp"
+    model  = "68ec020"
+  }
+
+  object chipram "ram" { size = chip-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+
+  object custom "amiga.custom" { }
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
+
+  # -- the AA chip set -------------------------------------------------------
+  #
+  # Alice counts the beam on the colour clock and does every DMA transfer;
+  # Lisa turns the lines Alice hands her into a picture. `reach` is not a
+  # property of Alice's: her pointers are twenty bits, which is 2 MiB.
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    revision = "aga"
+    paula    = paula
+    video    = denise
+  }
+  object denise "amiga.denise" { custom = custom, clock = clk / 4, revision = "aga" }
+
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  # -- the hard disk ---------------------------------------------------------
+  #
+  # Declared *before* Gayle, for the reason `amiga-a600.machine` gives:
+  # `Machine::reset` runs devices in declaration order and Gayle's reset reads
+  # the drive's interrupt line. No bytes bound to `hd0` is an empty bay, which
+  # is an A1200 without "HD".
+  object hd0 "ata.disk" { image = "hd0", bay = "ide-master" }
+
+  # -- Gayle -----------------------------------------------------------------
+  object gayle "amiga.gayle" {
+    master   = "ide-master"
+    slave    = "ide-slave"
+    cia-odd  = cia_a_decode
+    cia-even = cia_b_decode
+  }
+
+  # -- the overlay -----------------------------------------------------------
+  #
+  # The ROM at zero while `ovl` is high, chip RAM after; the level is Gayle's,
+  # not a CIA pin's. No `custom` (bank 6 does not repeat the registers), no
+  # `slow-ram`, no `ext`.
+  object overlay "amiga.gary" {
+    space = mem
+    rom   = kick
+    ram   = chipram
+    size  = chip-ram
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  #   $000000  chip RAM, behind the overlay                     2 MiB
+  #   $BFD000  CIA-B, through Gayle's even-CIA select
+  #   $BFE000  CIA-A, through Gayle's odd-CIA select
+  #   $DA0000  the IDE drive: CS1FX on A12 low, CS3FX high      16 KiB
+  #   $DA8000  Gayle's status/change/enable/config registers    32 KiB
+  #   $DE1000  Gayle's identification register                  4 KiB
+  #   $DFF000  the custom chip registers                        512 bytes
+  #   $F80000  Kickstart                                        512 KiB
+  #   $E00000  Kickstart again, and at $A80000 twice over          (Gayle's ROM select)
+  map mem 0x000000 size chip-ram       = overlay.overlay { endian = "big" }
+  map mem 0xBFD000 size 0x1000         = gayle.cia-even  { endian = "big" }
+  map mem 0xBFE000 size 0x1000         = gayle.cia-odd   { endian = "big" }
+  map mem 0xDA0000 size 0x4000         = gayle.ide       { endian = "big" }
+  map mem 0xDA8000 size 0x8000         = gayle.regs      { endian = "big" }
+  map mem 0xDE1000 size 0x1000         = gayle.id        { endian = "big" }
+  map mem 0xDFF000 size 0x200          = custom
+  map mem 0xF80000 size 512K           = mirror(kick)    { endian = "big" }
+  # Gayle's ROM select covers these two ranges as well (Gayle specification
+  # section 2.0, and section 17.0's map). Nothing tested here reads them; they
+  # are mapped because the chip decodes them.
+  map mem 0xE00000 size 512K           = mirror(kick)    { endian = "big" }
+  map mem 0xA80000 size 1M             = mirror(kick)    { endian = "big" }
+
+  # -- wiring ----------------------------------------------------------------
+  #
+  # Gayle's internal overlay signal to the decoder at zero.
+  wire gayle.ovl -> overlay.ovl
+
+  wire paula.ipl0 -> cpu.ipl0
+  wire paula.ipl1 -> cpu.ipl1
+  wire paula.ipl2 -> cpu.ipl2
+
+  # INT2 and INT6 are open-collector nets, as on the A600: CIA-A and Gayle both
+  # pull `_INT2`, CIA-B and Gayle both pull `_INT6`. The drive's interrupt
+  # reaches the processor through Gayle's change latch and enable, then
+  # `_INT2`, then Paula's PORTS - level 2.
+  wire cia_a.irq -> paula.int2
+  wire gayle.int2 -> paula.int2
+  wire cia_b.irq -> paula.int6
+  wire gayle.int6 -> paula.int6
+
+  # The floppy lines (Appendix E; chapter 8, Table 8-5).
+  wire cia_b.pb7 -> df0.mtr   { pull = "up" }    # MTR*
+  wire cia_b.pb3 -> df0.sel   { pull = "up" }    # SEL0*
+  wire cia_b.pb2 -> df0.side  { pull = "up" }    # SIDE*
+  wire cia_b.pb1 -> df0.dir   { pull = "up" }    # DIR
+  wire cia_b.pb0 -> df0.step  { pull = "up" }    # STEP*
+  wire df0.rdy   -> cia_a.pa5 { pull = "up" }    # RDY*
+  wire df0.tk0   -> cia_a.pa4 { pull = "up" }    # TK0*
+  wire df0.wpro  -> cia_a.pa3 { pull = "up" }    # WPRO*
+  wire df0.chng  -> cia_a.pa2 { pull = "up" }    # CHNG*
+  wire df0.index -> cia_b.flag { pull = "up" }   # INDEX*
+
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
+
+  # -- the keyboard and the mouse --------------------------------------------
+  #
+  # The A1200's keyboard is a membrane matrix scanned by the 6570 on the main
+  # board, and what reaches CIA-A is the same KCLK/KDAT protocol as an A500's.
+  osc periph = 1000000 Hz
+
+  object kbd "amiga.keyboard" { clock = periph }
+  wire kbd.kclk  -> cia_a.cnt { pull = "up" }
+  wire cia_a.sp  -> kbd.kdat  { pull = "up" }
+  wire kbd.kdat  -> cia_a.sp
+
+  object mouse "amiga.mouse" { clock = periph }
+  wire mouse.y      -> denise.m0v  { pull = "up" }
+  wire mouse.yq     -> denise.m0vq { pull = "up" }
+  wire mouse.x      -> denise.m0h  { pull = "up" }
+  wire mouse.xq     -> denise.m0hq { pull = "up" }
+  wire mouse.left   -> cia_a.pa6   { pull = "up" }
+  wire mouse.right  -> paula.potly { pull = "up" }
+  wire mouse.middle -> paula.potlx { pull = "up" }
+}
