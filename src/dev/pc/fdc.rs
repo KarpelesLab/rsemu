@@ -1433,8 +1433,8 @@ pub mod drives {
     use alloc::vec::Vec;
     use core::fmt;
 
-    use super::Registers;
-    use crate::core::error::Result;
+    use super::{Geometry, Registers, parse_geometry};
+    use crate::core::error::{Error, Result};
     use crate::core::hosts::{HostKind, HostObjects};
     use crate::core::props::Props;
     use crate::core::sync::{LockRank, Mutex};
@@ -1521,6 +1521,52 @@ pub mod drives {
             let regs = self.fdc.lock().clone()?;
             let g = regs.state.lock().geom;
             Some((g.cylinders, g.heads, g.sectors))
+        }
+
+        /// Take the diskette out and put `image` in — what a person does
+        /// between two disks of an installation set. An empty `image` is a
+        /// drive left empty.
+        ///
+        /// The drive's geometry is inferred from the new image's length, as
+        /// the controller's `geometry = "auto"` does at construction. Opening
+        /// the door is what raises `DSKCHG` (*IBM PC/AT Technical Reference*,
+        /// diskette adapter: the digital input register's bit 7 is set when
+        /// the door is opened and cleared by a step pulse with a diskette in
+        /// the drive), so the line reads "changed" until the guest next
+        /// seeks — which is how a DOS learns to throw away its cached FAT.
+        /// The head does not move, and no interrupt is raised: the change
+        /// line is a level the program polls, not a request.
+        ///
+        /// Host-side, like [`Drive::contents`]: the caller decides when, and
+        /// a test that swaps at a fixed virtual instant stays deterministic.
+        /// The medium is not machine state (see the controller's `save`), so
+        /// a snapshot taken after a swap restores against whatever the host
+        /// has in the drive then.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::Config`] if no controller is filed here, and
+        /// [`Error::Property`] if the image's length is no diskette format.
+        pub fn insert(&self, name: &str, image: Vec<u8>) -> Result<()> {
+            let regs = self.fdc.lock().clone().ok_or_else(|| Error::Config {
+                at: String::from(name),
+                message: String::from("no floppy controller is filed in this drive"),
+            })?;
+            let geom = if image.is_empty() {
+                Geometry {
+                    cylinders: 0,
+                    heads: 0,
+                    sectors: 0,
+                }
+            } else {
+                parse_geometry("auto", name, image.len() as u64)?
+            };
+            let mut state = regs.state.lock();
+            state.image = image;
+            state.geom = geom;
+            state.dirty = false;
+            state.changed[0] = true;
+            Ok(())
         }
     }
 
