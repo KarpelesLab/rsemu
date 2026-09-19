@@ -1,5 +1,6 @@
 //! Lisa — `amiga.denise` with `revision = "aga"` — painting whole fields a
-//! person can look at: 256 colours of 24 bits, and a HAM8 gradient.
+//! person can look at: 256 colours of 24 bits, a HAM8 gradient, and AA
+//! sprites.
 //!
 //! `src/dev/amiga/denise/aga/tests.rs` has the pixel-level tests. These build
 //! the same kind of field at full size through only the public API — register
@@ -8,7 +9,7 @@
 //! the real host adapter, `host::display::amiga`, the way a window would.
 //!
 //! `RSEMU_AMIGA_FRAME_DIR`, when set and built with `display-png`, receives a
-//! PNG of each field: `lisa-256.png` and `lisa-ham8.png`.
+//! PNG of each field: `lisa-256.png`, `lisa-ham8.png` and `lisa-sprites.png`.
 //! Every expected value is the *Specification for the Advanced Amiga (AA) Chip
 //! Set*'s (Commodore-Amiga), cited by section. Nothing from any Kickstart,
 //! and no board: there is no AA board yet.
@@ -25,10 +26,14 @@ use rsemu::host::display::amiga::DeniseScanout;
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
 
 const BPLCON0: u16 = 0x100;
+const BPLCON2: u16 = 0x104;
 const BPLCON3: u16 = 0x106;
+const BPLCON4: u16 = 0x10c;
 const DIWSTRT: u16 = 0x08e;
 const DIWSTOP: u16 = 0x090;
+const FMODE: u16 = 0x1fc;
 const COLOR00: u16 = 0x180;
+const SPR0POS: u16 = 0x140;
 
 /// `BPLCON3`'s reset `PF2OF = 011` and its `LOCT` bit (§4, `BPLCON3`).
 const PF2OF: u16 = 0b011 << 10;
@@ -225,4 +230,98 @@ fn ham8_paints_a_gradient_no_palette_could_hold() {
     println!("lisa-ham8: {} distinct colours", seen.len());
     assert!(seen.len() > 4096, "{} colours on one screen", seen.len());
     dump("lisa-ham8", &s);
+}
+
+#[test]
+fn aa_sprites_are_as_wide_and_as_fine_as_fmode_and_spres_say() {
+    let v = lisa();
+    // A dim 256-colour background, and eight bright sprite colours at the top
+    // of the table, where BPLCON4 moves them.
+    for n in 0..256 {
+        set_rgb(&v, n, chart(n) >> 2 & 0x003f_3f3f);
+    }
+    for (i, c) in [0x00ff_ffff, 0x00ff_4040, 0x0040_ff40, 0x0040_40ff]
+        .into_iter()
+        .enumerate()
+    {
+        set_rgb(&v, 0xf0 + i, c);
+    }
+    w(&v, BPLCON0, 0x0010);
+    // PF2P = 4, which in a single playfield puts every sprite group in front:
+    // the 3rd-edition priority rules, unchanged by AA.
+    w(&v, BPLCON2, 4 << 3);
+    // "ESPRM … OSPRM … the 4 high order color table address bits" (§4,
+    // BPLCON4): both at $F, so sprite colours are $F1-$FF.
+    w(&v, BPLCON4, 0x00ff);
+    // "Sprites are either 16, 32, or 64 bits wide" (§5): 64, by SPAGEM and
+    // SPR32 (FMODE bits 3 and 2).
+    w(&v, FMODE, 0x000c);
+    // Three bands of the window, the same 64-pixel sprite at 140 ns, 70 ns and
+    // 35 ns — SPRES 01, 10, 11 (§4, BPLCON3) — and so 256, 128 and 64 quarters
+    // wide: "35 ns sprites on a lores screen".
+    let sprite = [0xffff_0000_ff00_f0f0u64, 0xf0f0_ff00_0000_ffffu64];
+    for vpos in 0..313u16 {
+        let band = if (TOP..TOP + HEIGHT).contains(&vpos) {
+            usize::from(vpos - TOP) * 3 / usize::from(HEIGHT)
+        } else {
+            0
+        };
+        w(&v, BPLCON3, PF2OF | (band as u16 + 1) << 6);
+        w(&v, SPR0POS, 0x0060);
+        w(&v, SPR0POS + 2, 0);
+        v.sprite_dma(0, true, sprite[1]);
+        v.sprite_dma(0, false, sprite[0]);
+        let values: Vec<u8> = if (TOP..TOP + HEIGHT).contains(&vpos) {
+            // The chart again, kept out of bank $F0-$FF, which is the
+            // sprites': its last row repeats the one above.
+            let y = usize::from(vpos - TOP);
+            let cell = |k: usize| (y / 16) * 16 + k / 20;
+            (0..WIDTH)
+                .map(|k| if cell(k) >= 0xf0 { cell(k) - 16 } else { cell(k) } as u8)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let s = streams(&values);
+        v.line(&Line {
+            vpos,
+            clocks: 227,
+            fetch: Fetch {
+                start: 0x38,
+                planes: [&s[0], &s[1], &s[2], &s[3], &s[4], &s[5], &s[6], &s[7]],
+            },
+        });
+    }
+    v.field(true);
+
+    let s = capture(&v);
+    // Sprite pixel 0 is DATA 1, DATB 1 → value 3 → colour $F3; pixel 16 is
+    // DATA 0, DATB 1 → 2 → $F2. The sprite starts at $60 << 3 = 768 quarters.
+    let colour = |q: u32, vpos: u16| {
+        let y = 2 * u32::from(vpos - 0x1d);
+        let [r, g, b] = s.get(q - 256, y).expect("inside");
+        u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    };
+    for (band, step) in [(0u16, 4u32), (1, 2), (2, 1)] {
+        let vpos = TOP + band * HEIGHT / 3 + 10;
+        assert_eq!(colour(768, vpos), 0x0040_40ff, "band {band}: pixel 0");
+        assert_eq!(
+            colour(768 + 16 * step, vpos),
+            0x0040_ff40,
+            "band {band}: pixel 16"
+        );
+        // The last of 64 pixels is DATA 0, DATB 1: $F2, and then the sprite is
+        // done.
+        assert_eq!(
+            colour(768 + 63 * step, vpos),
+            0x0040_ff40,
+            "band {band}: pixel 63"
+        );
+        assert_ne!(
+            colour(768 + 64 * step, vpos) >> 16,
+            0x40,
+            "band {band}: past the end"
+        );
+    }
+    dump("lisa-sprites", &s);
 }

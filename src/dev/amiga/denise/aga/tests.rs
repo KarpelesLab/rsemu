@@ -44,6 +44,10 @@ fn color(i: u16) -> u16 {
     COLOR00 + 2 * i
 }
 
+fn spr_pos(n: u16) -> u16 {
+    SPR0POS + 8 * n
+}
+
 /// Palette entry `n` loaded with a whole 24-bit colour the way the
 /// specification says to: "Loading the MSB always loads the LSB as well for
 /// compatibility, so when 24 bit colors are desired load LSB after MSB" (§2,
@@ -500,6 +504,369 @@ fn each_fmode_width_is_the_same_bit_stream() {
 }
 
 // ---------------------------------------------------------------------------
+// sprites
+// ---------------------------------------------------------------------------
+
+/// Sprite `n` at `pos`/`ctl` with sixteen-bit `data`/`datb` through the
+/// register bus, `CTL` before `DATA` so it ends up armed.
+fn sprite(v: &Video, n: u16, pos: u16, ctl: u16, data: u16, datb: u16) {
+    w(v, spr_pos(n), pos);
+    w(v, spr_pos(n) + 2, ctl);
+    w(v, spr_pos(n) + 6, datb);
+    w(v, spr_pos(n) + 4, data);
+}
+
+/// A window and a palette, no bitplanes: inside the window every pixel is
+/// either colour 0 or a sprite.
+fn sprites_only(v: &Video) {
+    setup(v, 0x0000);
+}
+
+#[test]
+fn a_sprite_is_positioned_to_the_35ns_quarter() {
+    let v = lisa();
+    sprites_only(&v);
+    // SH10-SH3 = $40 (SPRxPOS 7-0), SH2 = 1 (CTL 0), SH1 = 1 (CTL 4), SH0 = 1
+    // (CTL 3): 512 + 4 + 2 + 1 = 519 quarters (§4, SPRxPOS and SPRxCTL).
+    sprite(&v, 0, 0x0040, 0x0019, 0x8000, 0);
+    line(&v, V, 0x38, Default::default());
+    // "ESPRM … Default value is 0001": sprite 0, value 1, is colour 17.
+    assert_eq!(quarter(&v, V, 518), distinct(0));
+    for q in 519..523 {
+        assert_eq!(quarter(&v, V, q), distinct(17), "quarter {q}");
+    }
+    assert_eq!(quarter(&v, V, 523), distinct(0));
+}
+
+#[test]
+fn spres_sets_the_sprite_pixel_width_whatever_the_playfield() {
+    // A sprite whose pixels go 1, 0, 1: the width of each is the resolution.
+    let width_of = |bplcon0: u16, bplcon3: u16| {
+        let v = lisa();
+        sprites_only(&v);
+        w(&v, BPLCON0, bplcon0);
+        w(&v, BPLCON3, bplcon3 | PF2OF_DEFAULT);
+        sprite(&v, 0, 0x0050, 0, 0xa000, 0);
+        line(&v, V, 0x38, Default::default());
+        let at = 0x50 << 3;
+        let lit: Vec<bool> = (0..16)
+            .map(|i| quarter(&v, V, at + i) == distinct(17))
+            .collect();
+        let first_gap = lit.iter().position(|l| !l).expect("a gap");
+        assert!(lit[..first_gap].iter().all(|l| *l));
+        first_gap
+    };
+    // "SPRES … 00 ECS defaults (LORES, HIRES = 140ns, SHRES = 70ns); 01 LORES
+    // (140ns); 10 HIRES (70ns); 11 SHRES (35ns)" (§4, BPLCON3).
+    assert_eq!(width_of(0x0000, 0), 4, "lores, ECS default");
+    assert_eq!(width_of(0x8000, 0), 4, "hires, ECS default");
+    assert_eq!(width_of(0x0040, 0), 2, "superhires, ECS default");
+    assert_eq!(
+        width_of(0x0040, 1 << 6),
+        4,
+        "140 ns sprites on a superhires screen"
+    );
+    assert_eq!(width_of(0x0000, 2 << 6), 2, "70 ns");
+    assert_eq!(
+        width_of(0x0000, 3 << 6),
+        1,
+        "35 ns sprites on a lores screen"
+    );
+}
+
+#[test]
+fn fmode_makes_a_sprite_16_32_or_64_pixels_wide() {
+    // "Sprites are either 16, 32, or 64 bits wide" (§5); SPAGEM and SPR32 are
+    // FMODE bits 3 and 2, "By 2 bytes / 4 bytes / 4 bytes / 8 bytes" (§4).
+    for (fmode, pixels) in [(0x0u16, 16i32), (0x4, 32), (0x8, 32), (0xc, 64)] {
+        let v = lisa();
+        sprites_only(&v);
+        w(&v, FMODE, fmode);
+        w(&v, spr_pos(0), 0x0048);
+        w(&v, spr_pos(0) + 2, 0);
+        // The wide data comes from Alice in one transfer.
+        v.sprite_dma(0, true, 0);
+        v.sprite_dma(0, false, u64::MAX);
+        line(&v, V, 0x38, Default::default());
+        let start = 0x48 << 3;
+        let lit = |k: i32| quarter(&v, V, start + 4 * k) == distinct(17);
+        assert!(
+            (0..pixels).all(lit),
+            "FMODE {fmode:#x}: {pixels} pixels lit"
+        );
+        assert!(!lit(pixels), "FMODE {fmode:#x}: and no more");
+    }
+}
+
+#[test]
+fn a_sixteen_bit_register_write_is_the_top_of_a_wide_buffer() {
+    // A processor write still reaches SPRxDATA "at any time" (§4, SPRxDAT);
+    // with a 32-bit sprite its word is the first sixteen pixels and the rest
+    // are whatever the buffer's low bits hold — zero after the write.
+    let v = lisa();
+    sprites_only(&v);
+    w(&v, FMODE, 0x4);
+    sprite(&v, 0, 0x0048, 0, 0xffff, 0);
+    line(&v, V, 0x38, Default::default());
+    let start = 0x48 << 3;
+    assert_eq!(quarter(&v, V, start + 4 * 15), distinct(17));
+    assert_eq!(quarter(&v, V, start + 4 * 16), distinct(0));
+}
+
+#[test]
+fn esprm_and_osprm_relocate_the_sprite_colours() {
+    let v = lisa();
+    sprites_only(&v);
+    // ESPRM = 5, OSPRM = 3: "the 4 high order color table address bits" for
+    // even and odd sprites (§4, BPLCON4).
+    w(&v, BPLCON4, 0x0053);
+    sprite(&v, 0, 0x0048, 0, 0x8000, 0); // even, value 1
+    sprite(&v, 1, 0x004a, 0, 0, 0x8000); // odd, value 2
+    // Pair 2/3 attached: "In the case of attached sprites OSPRM bits are
+    // used." Value %1011: sprite 3 gives the high two bits.
+    sprite(&v, 2, 0x004c, 0, 0x8000, 0x8000);
+    sprite(&v, 3, 0x004c, ATTACH, 0, 0x8000);
+    line(&v, V, 0x38, Default::default());
+    assert_eq!(quarter(&v, V, 0x48 << 3), distinct(0x51));
+    assert_eq!(quarter(&v, V, 0x4a << 3), distinct(0x32));
+    assert_eq!(quarter(&v, V, 0x4c << 3), distinct(0x3b));
+}
+
+#[test]
+fn attached_sprites_work_in_superhires() {
+    // "Sprites can be attatched in any mode (formerly could not attach
+    // sprites in the ECS SHRES 35ns resolution mode)" (§5).
+    let v = lisa();
+    sprites_only(&v);
+    w(&v, BPLCON0, SHRES);
+    w(&v, BPLCON3, PF2OF_DEFAULT | 3 << 6); // 35 ns sprites
+    sprite(&v, 0, 0x0048, 0, 0x8000, 0x4000);
+    sprite(&v, 1, 0x0048, ATTACH, 0x4000, 0x8000);
+    line(&v, V, 0x38, Default::default());
+    // Pixel 0: even %01, odd %10 → %1001 = 9; pixel 1: even %10, odd %01 → 6.
+    assert_eq!(quarter(&v, V, 0x48 << 3), distinct(16 | 9));
+    assert_eq!(quarter(&v, V, (0x48 << 3) + 1), distinct(16 | 6));
+    assert_eq!(quarter(&v, V, (0x48 << 3) + 2), distinct(0));
+}
+
+#[test]
+fn brdsprt_shows_sprites_in_the_border_once_ecsena_is_set() {
+    let v = lisa();
+    sprites_only(&v);
+    // A sprite at $70, left of the window at $81.
+    let border_sprite = |v: &Video| {
+        sprite(v, 0, 0x0038, 0, 0x8000, 0);
+        line(v, V, 0x38, Default::default());
+        quarter(v, V, 0x38 << 3)
+    };
+    assert_eq!(border_sprite(&v), distinct(0), "outside the window: border");
+    // BRDSPRT is "disabled when ESCENA low" (§4, BPLCON3).
+    w(&v, BPLCON3, PF2OF_DEFAULT | BRDSPRT);
+    assert_eq!(border_sprite(&v), distinct(0));
+    w(&v, BPLCON0, ENBPLCN3);
+    assert_eq!(border_sprite(&v), distinct(17));
+    // And BRDRBLNK blanks the border under the same gate.
+    w(&v, BPLCON3, PF2OF_DEFAULT | BRDRBLNK);
+    line(&v, V, 0x38, Default::default());
+    assert_eq!(quarter(&v, V, X81 - 8), 0);
+}
+
+#[test]
+fn sscan2_takes_sh10_out_of_the_comparison() {
+    // SH10 (SPRxPOS bit 7) set: HSTART = $A0 << 3 = 1280 quarters.
+    let at = |fmode: u16, q: i32| {
+        let v = lisa();
+        sprites_only(&v);
+        // Sprites in the border, so the first match shows too.
+        w(&v, BPLCON0, ENBPLCN3);
+        w(&v, BPLCON3, PF2OF_DEFAULT | BRDSPRT);
+        w(&v, FMODE, fmode);
+        sprite(&v, 0, 0x00a0, 0, 0x8000, 0);
+        line(&v, V, 0x38, Default::default());
+        quarter(&v, V, q) == distinct(17)
+    };
+    assert!(at(0, 1280), "the sprite is where SH10 says");
+    assert!(!at(0, 256), "and only there");
+    // "If SSCAN2 bit in FMODE is set, then disable SH10 horizontal coincidence
+    // detect" (§4, SPRxPOS): the other ten bits match at 256 as well.
+    assert!(at(SSCAN2, 256));
+    assert!(at(SSCAN2, 1280));
+}
+
+/// A beam that stays where a test puts it.
+#[derive(Debug)]
+struct Fixed(Mutex<BeamPosition>);
+
+impl Beam for Fixed {
+    fn position(&self) -> BeamPosition {
+        *self.0.lock()
+    }
+}
+
+#[test]
+fn a_wide_sprite_transfer_keeps_its_place_behind_the_ctl_write_before_it() {
+    // What Alice's sprite DMA does in one slot: POS and CTL through the
+    // register bus — the CTL write disarms the sprite — and then the wide
+    // data, which arms it again. With a beam connected all three are timed,
+    // and the data must land after the CTL write, not before it.
+    let d = Denise::new(&props()).unwrap();
+    let v = &**d.video();
+    sprites_only(v);
+    w(v, FMODE, 0xc);
+    let beam = Arc::new(Fixed(Mutex::new(BeamPosition {
+        vpos: V,
+        hpos: 0x10,
+    })));
+    v.connect_beam(beam.clone());
+    w(v, spr_pos(0), 0x0048);
+    w(v, spr_pos(0) + 2, 0);
+    v.sprite_dma(0, true, 0);
+    v.sprite_dma(0, false, u64::MAX);
+    line(v, V, 0x38, Default::default());
+    let start = 0x48 << 3;
+    assert_eq!(
+        quarter(v, V, start),
+        distinct(17),
+        "armed, and 64 pixels wide"
+    );
+    assert_eq!(quarter(v, V, start + 4 * 63), distinct(17));
+
+    // And a queued wide transfer survives a snapshot, in its place.
+    *beam.0.lock() = BeamPosition {
+        vpos: V + 1,
+        hpos: 0x10,
+    };
+    w(v, spr_pos(0) + 2, 0);
+    v.sprite_dma(0, false, 0x8000_0000_0000_0001);
+    assert!(
+        v.state.lock().pending.iter().any(|c| c.offset & WIDE != 0),
+        "queued, not applied"
+    );
+    round_trip(&d);
+}
+
+#[test]
+fn clxcon2_brings_planes_7_and_8_in_and_a_clxcon_write_clears_it() {
+    let clxdat = |v: &Video| CustomChip::read(v, reg(CLXDAT), Origin::cpu());
+    let v = lisa();
+    setup(&v, EIGHT);
+    // Sprite 0 over a pixel whose value is %0100_0001: planes 1 and 7.
+    sprite(&v, 0, 0x0040, 1, 0x8000, 0);
+    let frame = |v: &Video| show(v, V, 0x38, &[0x41]);
+
+    // Plane 1 enabled, match 1 (CLXCON bits 6 and 0).
+    w(&v, CLXCON, 0x0041);
+    clxdat(&v);
+    frame(&v);
+    assert_ne!(clxdat(&v) & 1 << 1, 0, "playfield 1 to sprite 0");
+
+    // ENBP7 with MVBP7 = 0: plane 7 is 1, so playfield 1 no longer matches.
+    w(&v, CLXCON2, 0x0040);
+    frame(&v);
+    assert_eq!(clxdat(&v) & 1 << 1, 0);
+
+    // MVBP7 = 1: it matches again.
+    w(&v, CLXCON2, 0x0041);
+    frame(&v);
+    assert_ne!(clxdat(&v) & 1 << 1, 0);
+
+    // "Contents of this register are reset by a write to CLXCON."
+    w(&v, CLXCON2, 0x0040);
+    w(&v, CLXCON, 0x0041);
+    frame(&v);
+    assert_ne!(clxdat(&v) & 1 << 1, 0);
+}
+
+// ---------------------------------------------------------------------------
+// an old program on a new chip
+// ---------------------------------------------------------------------------
+
+/// The same register writes and lines, to an 8362 and to Lisa, and both
+/// pictures back: the 8362's as 12-bit words, Lisa's as 24-bit ones.
+fn both(scene: impl Fn(&Video)) -> (Vec<Vec<u16>>, Vec<Vec<u32>>) {
+    let ocs = Video::new(Standard::Pal);
+    let aga = lisa();
+    scene(&ocs);
+    scene(&aga);
+    let mut old = Vec::new();
+    let mut new = Vec::new();
+    for y in 0..Standard::Pal.height() {
+        let mut row = vec![0u16; WIDTH as usize];
+        ocs.read_row(y, &mut row);
+        old.push(row);
+        let mut row = vec![0u32; 2 * WIDTH as usize];
+        aga.read_row_rgb(y, &mut row);
+        new.push(row);
+    }
+    (old, new)
+}
+
+/// An old program: only 3rd-edition registers, 12-bit colours.
+fn old_program(v: &Video, bplcon0: u16) {
+    w(v, DIWSTRT, 0x2c81);
+    w(v, DIWSTOP, 0x2cc1);
+    for i in 0..32 {
+        w(v, color(i), 0x0100 + 0x0111 * (i % 8) + (i / 8));
+    }
+    w(v, BPLCON0, bplcon0);
+    w(v, BPLCON2, 0x0024);
+    sprite(v, 0, 0x0060, 0, 0xf0f0, 0xff00);
+    sprite(v, 2, 0x0070, 0, 0xffff, 0x0f0f);
+    sprite(v, 3, 0x0070, ATTACH, 0x3333, 0x5555);
+    let planes: [&[u16]; 8] = [
+        &[0xff00, 0x0ff0, 0xf00f, 0x1234],
+        &[0xf0f0, 0xcccc, 0xaaaa, 0x5678],
+        &[0xcccc, 0xffff, 0x0000, 0x9abc],
+        &[0xaaaa, 0x00ff, 0xff00, 0xdef0],
+        &[0x5555, 0xf0f0, 0x0f0f, 0x1357],
+        &[],
+        &[],
+        &[],
+    ];
+    for vpos in 0..313 {
+        line(v, vpos, 0x38, planes);
+    }
+}
+
+#[test]
+fn an_old_program_shows_the_8362s_colours_on_lisa() {
+    // The two resets that make this work are the specification's own: PF2OF
+    // defaults to 8 and ESPRM/OSPRM to 0001, "so that old copper lists" keep
+    // their colours. Five planes, and then dual playfields.
+    for bplcon0 in [0x5000u16, 0x6400] {
+        let (old, new) = both(|v| old_program(v, bplcon0));
+        for (y, (a, b)) in old.iter().zip(&new).enumerate() {
+            for (c, px) in a.iter().enumerate() {
+                // An 8362's column is a high-resolution half pixel: two
+                // quarters.
+                let want = rgb12(*px);
+                assert_eq!(
+                    b[2 * c],
+                    want,
+                    "BPLCON0 {bplcon0:#06x}, row {y}, column {c}"
+                );
+                assert_eq!(b[2 * c + 1], want);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_old_ham6_or_ehb_picture_is_the_same_on_the_twelve_old_pins() {
+    // HAM6 holds the low nibble and EHB halves eight-bit guns, so the low
+    // halves differ from an 8362's n × 17; the top four bits of each gun —
+    // what the 8362's twelve pins carried — do not.
+    for bplcon0 in [0x5800u16, 0x6800, 0x6000] {
+        let (old, new) = both(|v| old_program(v, bplcon0));
+        for (a, b) in old.iter().zip(&new) {
+            for (c, px) in a.iter().enumerate() {
+                assert_eq!(rgb12_of(b[2 * c]), *px, "BPLCON0 {bplcon0:#06x}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the device
 // ---------------------------------------------------------------------------
 
@@ -594,6 +961,18 @@ fn a_lisa_snapshot_round_trips_to_identical_state() {
     w(v, COLOR00, 0x8abc);
     show(v, V, 0x38, &(0..32).collect::<Vec<u8>>());
     v.field(false);
+    round_trip(&saved);
+}
+
+#[test]
+fn a_lisa_snapshot_keeps_the_wide_sprite_buffers() {
+    let saved = Denise::new(&props()).unwrap();
+    let v = saved.video();
+    setup(v, EIGHT | HOMOD);
+    w(v, FMODE, 0x000c);
+    v.sprite_dma(5, false, 0x0123_4567_89ab_cdef);
+    v.sprite_dma(5, true, 0xfedc_ba98_7654_3210);
+    show(v, V, 0x38, &(0..=255).collect::<Vec<u8>>());
     round_trip(&saved);
 }
 

@@ -25,7 +25,8 @@
 //!
 //! # What Lisa takes from Alice
 //!
-//! The seam is [`super::Fetch`], documented where it is declared. In short:
+//! The seam is [`super::Fetch`] and [`Video::sprite_dma`](super::Video::sprite_dma),
+//! and both are documented where they are declared. In short:
 //!
 //! * **Bitplanes**: eight word streams, unchanged in shape. A wider `FMODE`
 //!   needs nothing new, because "the parallel to serial conversion is
@@ -34,6 +35,8 @@
 //!   and is therefore always on the left" (§4, `BPLxDAT`) — a fetch of any
 //!   width is that many consecutive pixels, so the stream is the same stream
 //!   with more words per fetch slot.
+//! * **Sprites**: [`Video::sprite_dma`](super::Video::sprite_dma), because a
+//!   32- or 64-bit sprite fetch does not fit the sixteen-bit register bus.
 //! * **`FMODE` and `BPLCON4`** arrive as ordinary register writes; `FMODE` is
 //!   Alice's register as well as Lisa's (§3: `FMODE 1FC W A D`).
 //!
@@ -44,14 +47,17 @@
 //! | eight bitplanes, `BPU3` | modelled: `BPLCON0` bit 4, so `BPU` is "0000-1000 (none thru 8 inclusive)" |
 //! | the 256-entry 24-bit colour table | modelled: `BANK`, `LOCT`, and the automatic four-to-eight-bit extension |
 //! | HAM8 and HAM6 in every resolution | modelled, §2 *Bitplanes* and its two control tables |
-//! | `BPLCON4`'s `BPLAM` | modelled; `ESPRM` and `OSPRM` latched, until there are sprites |
-//! | `BPLCON3`'s `BANK`, `PF2OF`, `LOCT`, `BRDRBLNK` | modelled; `SPRES` and `BRDSPRT` latched, until there are sprites |
+//! | `BPLCON4`'s `BPLAM`, `ESPRM`, `OSPRM` | modelled |
+//! | `BPLCON3`'s `BANK`, `PF2OF`, `LOCT`, `SPRES`, `BRDRBLNK`, `BRDSPRT` | modelled |
 //! | `BPLCON0`'s `ECSENA` gate | modelled: it inhibits `BRDRBLNK`, `BRDNTRAN`, `ZDCLKEN`, `BRDSPRT` and `EXTBLKEN` |
 //! | `BPLCON1`'s eight-bit scroll | modelled, both playfields, 35 ns granularity |
 //! | 4+4 dual playfield with `PF2OF` | modelled |
 //! | EHB, and `KILLEHB` | modelled: "EHB is invoked whenever SHRES = HIRES = HAMEN = DPF = 0 and BPU = 6" |
 //! | `DIWHIGH`'s 70 ns and 35 ns window bits | modelled |
-//! | sprites, collisions, `CLXCON2`, `FMODE`'s sprite bits | not yet: an AA part shows no sprites and detects no collisions |
+//! | sprites: `SPRES`, 16/32/64-bit data, `ESPRM`/`OSPRM`, attachment in every resolution | modelled |
+//! | `SPRxCTL`'s `SH1` and `SH0` | modelled: a sprite positioned to the quarter-pixel |
+//! | `FMODE`'s `SSCAN2` | modelled: `SH10` leaves the horizontal comparison, because Alice is using it |
+//! | `CLXCON2` | modelled: bitplanes 7 and 8 in collisions, and a `CLXCON` write clears it |
 //! | `FMODE`'s `BPL32`, `BPAGEM` | latched only, and deliberately: see [below](#what-fmodes-bitplane-bits-do-not-change) |
 //! | `FMODE`'s `BSCAN2` | latched only — it selects between `BPL1MOD` and `BPL2MOD`, which is Alice's |
 //! | `BPLCON2`'s `RDRAM`, `ZDBPEN`, `ZDBPSEL`, `ZDCTEN`, `SOGEN` | latched only: genlock, and reading the colour table back through a write-only address |
@@ -107,6 +113,9 @@
 //!   can have up to 4 bitplanes". §2's reading is taken: it is playfield 2's
 //!   offset, always. The other reading would make a playfield's colours depend
 //!   on `PF2PRI`, which nothing else in the document suggests.
+//! * **Sprite priority and collision grouping** are the 3rd-edition manual's,
+//!   unchanged: `CLXDAT`'s bit assignments are reprinted identically in §4 and
+//!   §2 says "CLXDAT is unchanged".
 //!
 //! # `BPU` out of range
 //!
@@ -115,8 +124,8 @@
 //! there are only eight planes to fetch, so eight is what the data can fill.
 
 use super::{
-    BPU3, BRDRBLNK, DBLPF, ENBPLCN3 as ECSENA, Fetch, HIRES, HOMOD, KILLEHB, LACE, Line,
-    MAX_FETCH_WORDS, Revision, SHRES, Stamp, State,
+    ATTACH, BPU3, BRDRBLNK, BRDSPRT, DBLPF, ENBPLCN3 as ECSENA, Fetch, HIRES, HOMOD, KILLEHB, LACE,
+    Line, MAX_FETCH_WORDS, Revision, SHRES, SSCAN2, Stamp, State,
 };
 
 /// Quarters — 35 ns pixels — in one low-resolution pixel.
@@ -124,6 +133,19 @@ const QUARTERS: i32 = 4;
 
 /// Playfield 2's colour-table offset for each `PF2OF` code (§4, `BPLCON3`).
 const PF2_OFFSET: [u8; 8] = [0, 2, 4, 8, 16, 32, 64, 128];
+
+/// A sprite's data width in pixels for `FMODE`'s `SPAGEM` and `SPR32`, which
+/// §4 tabulates as a fetch "By 2 bytes", "By 4 bytes" or "By 8 bytes".
+#[inline]
+const fn sprite_pixels(fmode: u16) -> u8 {
+    match (fmode >> 2) & 3 {
+        0 => 16,
+        3 => 64,
+        // `SPR32` alone is a 32-bit bus; `SPAGEM` alone is two 16-bit cycles.
+        // Both move four bytes, so both give a 32-pixel sprite.
+        _ => 32,
+    }
+}
 
 /// One playfield's eight-bit `BPLCON1` scroll, in quarters.
 ///
@@ -164,10 +186,18 @@ struct Setup {
     hstop: i32,
     /// `BRDRBLNK` and `ECSENA`: the border is black rather than colour 0.
     blank: bool,
+    /// `BRDSPRT` and `ECSENA`: sprites show outside the window.
+    border_sprites: bool,
     /// The `BPLAM` mask, already in place.
     bplam: u8,
     /// Playfield 2's colour-table offset, from `PF2OF`.
     pf2_offset: u8,
+    /// Quarters per sprite pixel, from `SPRES`.
+    sprite_step: i32,
+    /// A sprite's data width in pixels, from `FMODE`.
+    sprite_pixels: u8,
+    /// `SSCAN2`: `SH10` is Alice's scan-double flag, not part of the compare.
+    sscan2: bool,
 }
 
 impl Setup {
@@ -254,7 +284,14 @@ impl Setup {
         // "ECSENA … forces the following bits to their default low settings:
         // BRDRBLNK, BRDNTRAN, ZDCLKEN, EXTBLKEN, and BRDRSPRT" (§2).
         let enabled = con0 & ECSENA != 0;
-
+        // "SPRES1 and SPRES0 control sprite resolution": 00 the ECS defaults,
+        // "LORES,HIRES=140ns, SHRES=70ns"; then 140 ns, 70 ns and 35 ns.
+        let sprite_step = match (regs.bplcon3 >> 6) & 3 {
+            0 if shres => 2,
+            0 | 1 => QUARTERS,
+            2 => 2,
+            _ => 1,
+        };
         Setup {
             planes,
             step,
@@ -267,8 +304,12 @@ impl Setup {
             hstart,
             hstop,
             blank: enabled && regs.bplcon3 & BRDRBLNK != 0,
+            border_sprites: enabled && regs.bplcon3 & BRDSPRT != 0,
             bplam: (regs.bplcon4 >> 8) as u8,
             pf2_offset: PF2_OFFSET[usize::from((regs.bplcon3 >> 10) & 7)],
+            sprite_step,
+            sprite_pixels: sprite_pixels(regs.fmode),
+            sscan2: regs.fmode & SSCAN2 != 0,
         }
     }
 
@@ -295,6 +336,96 @@ impl Setup {
     fn address(&self, index: u8) -> usize {
         usize::from(index ^ self.bplam)
     }
+}
+
+/// A sprite's serializer. Sixty-four bits because an AA sprite's data is up to
+/// that wide, and left-justified because it shifts out "MSB first on the
+/// left".
+#[derive(Debug, Clone, Copy, Default)]
+struct Shifter {
+    a: u64,
+    b: u64,
+    /// Pixels still to shift out.
+    left: u8,
+    /// Quarters spent on the pixel being shown, against `sprite_step`.
+    phase: i32,
+}
+
+/// The frontmost sprite pixel: its group (0–3) and colour-table address.
+///
+/// The pairing and the "lower-numbered sprites are always in front" rule are
+/// the 3rd-edition manual's, unchanged. What AA adds is where the four-bit
+/// value lands in a 256-entry table: "ESPRM7 thru ESPRM4 allow relocation of
+/// the even sprite color map. OSPRM7 thru OSPRN4 allow relocation of the odd
+/// sprite color map. In the case of attached sprites OSPRM bits are used."
+/// (§2, *Sprites*.) With both fields at their reset value of `0001` the
+/// addresses are 16–31 — the 8362's fixed ones.
+#[inline]
+fn front_sprite(pixels: &[u8; 8], regs: &super::Regs) -> Option<(u8, usize)> {
+    let esprm = usize::from((regs.bplcon4 >> 4) & 0xf) << 4;
+    let osprm = usize::from(regs.bplcon4 & 0xf) << 4;
+    for k in 0..4 {
+        let even = pixels[2 * k];
+        let odd = pixels[2 * k + 1];
+        if regs.spr_ctl[2 * k + 1] & ATTACH != 0 {
+            let value = (odd << 2) | even;
+            if value != 0 {
+                return Some((k as u8, osprm | usize::from(value)));
+            }
+        } else if even != 0 {
+            return Some((k as u8, esprm | (4 * k + usize::from(even))));
+        } else if odd != 0 {
+            return Some((k as u8, osprm | (4 * k + usize::from(odd))));
+        }
+    }
+    None
+}
+
+/// The collision bits one pixel raises.
+///
+/// `CLXDAT`'s assignments and `CLXCON`'s are reprinted unchanged in §4, and §2
+/// says "CLXDAT is unchanged". What AA adds is `CLXCON2`: "ENBP8 and ENBP7 are
+/// the enable bits for bitplanes 8 and 7[;] MVBP8 and MVBP7 are their match
+/// value bits", at bits 7, 6, 1 and 0. Its own note repeats the older one:
+/// "Disable[d] bit planes cannot prevent collisions."
+#[inline]
+fn collisions(bits: u8, pixels: &[u8; 8], clxcon: u16, clxcon2: u16) -> u16 {
+    let enabled = (clxcon >> 6) & 0x3f | ((clxcon2 >> 6) & 3) << 6;
+    let match_value = clxcon & 0x3f | (clxcon2 & 3) << 6;
+    let mismatch = (u16::from(bits) ^ match_value) & enabled;
+    // "Playfield 1 is all odd numbered enabled bit planes. Playfield 2 is all
+    // even numbered enabled bit planes" — now four of each.
+    let odd = mismatch & 0b0101_0101 == 0;
+    let even = mismatch & 0b1010_1010 == 0;
+
+    let mut groups = 0u8;
+    for k in 0..4 {
+        let include_odd = clxcon & (1 << (12 + k)) != 0;
+        if pixels[2 * k] != 0 || (include_odd && pixels[2 * k + 1] != 0) {
+            groups |= 1 << k;
+        }
+    }
+
+    let mut out = u16::from(odd && even);
+    for k in 0..4 {
+        if groups & (1 << k) != 0 {
+            if odd {
+                out |= 1 << (1 + k);
+            }
+            if even {
+                out |= 1 << (5 + k);
+            }
+        }
+    }
+    for (bit, (a, b)) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+        .into_iter()
+        .enumerate()
+    {
+        if groups & (1 << a) != 0 && groups & (1 << b) != 0 {
+            out |= 1 << (9 + bit);
+        }
+    }
+    out
 }
 
 /// Half intensity on eight-bit guns, for EHB: "The color register output
@@ -356,7 +487,9 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
     let width = layout.width() as i32;
     let left = i32::from(layout.left) * QUARTERS;
 
+    let mut shifters = [Shifter::default(); 8];
     let mut hold = st.regs.palette[0];
+    let mut clx = 0u16;
 
     for q in 0..span {
         let mut changed = false;
@@ -370,7 +503,7 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
                 break;
             }
             st.pending.pop_front();
-            st.regs.apply(Revision::Aga, change.offset, change.value);
+            change.apply_to(&mut st.regs, Revision::Aga);
             changed = true;
         }
         if changed {
@@ -378,7 +511,44 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
         }
         let regs = &st.regs;
 
+        // The horizontal comparators. `SH10-SH3` are `SPRxPOS` bits 7-0 and
+        // `SH2`, `SH1`, `SH0` are `SPRxCTL` bits 0, 4 and 3 — "Start horiz.
+        // value, 140nS / 70nS / 35nS increment" (§4, SPRxCTL) — so the whole
+        // comparison is in quarters. "If SSCAN2 bit in FMODE is set, then
+        // disable SH10 horizontal coincidence detect. This bit is then free to
+        // be used by ALICE as an individual scan double enable" (§4, SPRxPOS).
+        let mut pixels = [0u8; 8];
+        if regs.armed != 0 || shifters.iter().any(|s| s.left != 0) {
+            for (i, s) in shifters.iter_mut().enumerate() {
+                let hstart = i32::from(regs.spr_pos[i] & 0xff) << 3
+                    | i32::from(regs.spr_ctl[i] & 1) << 2
+                    | i32::from((regs.spr_ctl[i] >> 4) & 1) << 1
+                    | i32::from((regs.spr_ctl[i] >> 3) & 1);
+                // With SH10 out of the comparison, the comparator matches
+                // wherever the other ten bits do — once every 1024 quarters.
+                let hit = if setup.sscan2 {
+                    q & 0x3ff == hstart & 0x3ff
+                } else {
+                    q == hstart
+                };
+                if regs.armed & (1 << i) != 0 && hit {
+                    *s = Shifter {
+                        a: regs.spr_data[i],
+                        b: regs.spr_datb[i],
+                        left: setup.sprite_pixels,
+                        phase: 0,
+                    };
+                }
+                if s.left != 0 {
+                    // "The DATB bits are the 2SBs (worth 2) for the color
+                    // registers[,] DATA bits are LSBs of the pixels."
+                    pixels[i] = (((s.b >> 63) & 1) << 1 | ((s.a >> 63) & 1)) as u8;
+                }
+            }
+        }
+
         let inside = setup.inside_v && setup.hstart <= q && q < setup.hstop;
+        let sprite = front_sprite(&pixels, regs);
         let border = if setup.blank { 0 } else { regs.palette[0] };
 
         let bits = setup.bits(&line.fetch, q);
@@ -411,11 +581,20 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
         }
 
         let colour = if !inside {
-            border
+            // "BRDRSPRT, when high, allows sprites to be visible in border
+            // areas" (§2, *Sprites*).
+            match sprite {
+                Some((_, reg)) if setup.border_sprites => regs.palette[reg],
+                _ => border,
+            }
         } else {
+            clx |= collisions(bits, &pixels, regs.clxcon, regs.clxcon2);
             // A playfield pixel of value zero is still a bitplane colour
             // address, so `BPLAM` moves it too; the border is not one.
             let background = regs.palette[setup.address(0)];
+            let group = sprite.map(|s| u16::from(s.0));
+            let sprite_colour = sprite.map(|s| regs.palette[s.1]);
+            let blocked = |code: u16| group.is_some_and(|g| g < code);
             if setup.dual {
                 // "4+4 bitplane dualplayfield is available in all 3
                 // resolutions": playfield 1 is planes 1, 3, 5, 7 and
@@ -423,17 +602,17 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
                 let odd = (bits & 1) | ((bits >> 1) & 2) | ((bits >> 2) & 4) | ((bits >> 3) & 8);
                 let even =
                     ((bits >> 1) & 1) | ((bits >> 2) & 2) | ((bits >> 3) & 4) | ((bits >> 4) & 8);
-                let show1 = odd != 0;
-                let show2 = even != 0;
+                let show1 = odd != 0 && !blocked(regs.bplcon2 & 7);
+                let show2 = even != 0 && !blocked((regs.bplcon2 >> 3) & 7);
                 let pf2_first = regs.bplcon2 & (1 << 6) != 0;
                 let pf2 = || regs.palette[setup.address(setup.pf2_offset.wrapping_add(even))];
                 match (show1, show2) {
                     (true, true) if pf2_first => pf2(),
                     (true, _) => regs.palette[setup.address(odd)],
                     (false, true) => pf2(),
-                    (false, false) => background,
+                    (false, false) => sprite_colour.unwrap_or(background),
                 }
-            } else if bits != 0 {
+            } else if bits != 0 && !blocked((regs.bplcon2 >> 3) & 7) {
                 if setup.ham8 || setup.ham6 {
                     hold
                 } else if setup.ehb && bits & 0x20 != 0 {
@@ -442,7 +621,7 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
                     regs.palette[setup.address(bits)]
                 }
             } else {
-                background
+                sprite_colour.unwrap_or(background)
             }
         };
 
@@ -455,7 +634,20 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
                 st.frame[row * width as usize + col as usize] = colour;
             }
         }
+
+        for s in &mut shifters {
+            if s.left != 0 {
+                s.phase += 1;
+                if s.phase >= setup.sprite_step {
+                    s.a <<= 1;
+                    s.b <<= 1;
+                    s.left -= 1;
+                    s.phase = 0;
+                }
+            }
+        }
     }
+    st.clxdat |= clx;
 }
 
 #[cfg(test)]

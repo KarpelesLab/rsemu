@@ -186,19 +186,22 @@
 //! # The AA chip set: Lisa
 //!
 //! `revision = "aga"` is **Lisa**, the A1200's and A4000's video chip. The
-//! display half is modelled here a piece at a time — so far eight bitplanes,
-//! the 256-entry 24-bit colour table with `BANK` and `LOCT`, HAM8,
-//! `BPLCON4`'s bitplane mask, `FMODE`, and the 35 ns scroll and window — and
-//! `denise/aga.rs` has what the *Specification for the Advanced Amiga (AA) Chip
+//! display half is modelled here — eight bitplanes, the 256-entry 24-bit
+//! colour table with `BANK` and `LOCT`, HAM8, `BPLCON4`, the 35 ns scroll,
+//! window and sprite positions, `SPRES`, 16/32/64-bit sprites and `CLXCON2`
+//! — and `denise/aga.rs` has what the *Specification for the Advanced Amiga (AA) Chip
 //! Set* settles, what it leaves open and what was chosen there. An 8362 and an
 //! 8373 do not go near that module, and everything above this section is
 //! still exactly what they do.
 //!
 //! What Lisa shares with the older parts is the seam: the same [`Line`] a
 //! line, the same register writes, the same [`Beam`]. What she adds to it is
-//! documented where it is declared: [`Fetch::planes`] carries **eight**
-//! streams, and a 32- or 64-bit `FMODE` needs nothing more — a wider fetch is
-//! more words in the same stream.
+//! two things, both documented where they are declared:
+//!
+//! * [`Fetch::planes`] carries **eight** streams. A 32- or 64-bit `FMODE`
+//!   needs nothing more — a wider fetch is more words in the same stream.
+//! * [`Video::sprite_dma`] takes a sprite-data transfer too wide for the
+//!   sixteen-bit register bus.
 //!
 //! The picture is **eight bits a gun** for every part ([`Video::copy_frame_rgb`]),
 //! because Lisa's is; an 8362's and an 8373's guns reach it as `n × 17`, the
@@ -368,6 +371,13 @@ const BPU3: u16 = 1 << 4;
 /// will be written to a second 12-bit color palette, constituting the RGB low
 /// order bits".
 const LOCT: u16 = 1 << 9;
+
+/// `BPLCON3` bit 1, `BRDSPRT`: "Enables sprites outside the display window.
+/// disabled when ECSENA low."
+const BRDSPRT: u16 = 1 << 1;
+
+/// `FMODE` bit 15, `SSCAN2`: "Global enable for sprite scan-doubling."
+const SSCAN2: u16 = 1 << 15;
 
 /// What an ECS Denise answers at `DENISEID`: "The enhanced HighRes Denise
 /// (8373) will return $FC in the lower 8 bits. The upper 8 bits are reserved"
@@ -685,8 +695,14 @@ struct Regs {
     bpldat: [u16; 8],
     spr_pos: [u16; 8],
     spr_ctl: [u16; 8],
-    spr_data: [u16; 8],
-    spr_datb: [u16; 8],
+    /// The A buffers. Sixty-four bits wide because `FMODE`'s `SPR32` and
+    /// `SPAGEM` make an AA sprite fetch 16, 32 or 64 bits ("Sprites are
+    /// either 16, 32, or 64 bits wide", AA specification, §5). A 16-bit write
+    /// through the register bus lands in the top of the word, which is where
+    /// the shifter starts: "MSB first on the left".
+    spr_data: [u64; 8],
+    /// The B buffers, the same width.
+    spr_datb: [u64; 8],
     /// One bit per sprite: its horizontal comparator is enabled.
     armed: u8,
 }
@@ -825,12 +841,31 @@ impl Regs {
                     }
                     4 => {
                         // "Writing to the A buffer enables (arms) the sprite."
-                        self.spr_data[i] = value;
+                        // A word through the register bus is the top of the
+                        // buffer, because the shifter runs from the most
+                        // significant bit: see `spr_data`.
+                        self.spr_data[i] = u64::from(value) << 48;
                         self.armed |= 1 << i;
                     }
-                    _ => self.spr_datb[i] = value,
+                    _ => self.spr_datb[i] = u64::from(value) << 48,
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// A whole sprite buffer from a wide transfer: `offset` is the `SPRxDATA`
+    /// or `SPRxDATB` it loads, and `bits` the data, first pixel in bit 63.
+    /// Loading the A buffer arms the sprite, as a register write to it does.
+    fn load_sprite(&mut self, offset: u16, bits: u64) {
+        let rel = offset.wrapping_sub(SPR0POS);
+        let i = usize::from(rel / 8);
+        match rel % 8 {
+            4 if i < 8 => {
+                self.spr_data[i] = bits;
+                self.armed |= 1 << i;
+            }
+            6 if i < 8 => self.spr_datb[i] = bits,
             _ => {}
         }
     }
@@ -900,9 +935,14 @@ impl Regs {
         for v in self.bpldat {
             w.write_u16(v)?;
         }
-        for table in [&self.spr_pos, &self.spr_ctl, &self.spr_data, &self.spr_datb] {
+        for table in [&self.spr_pos, &self.spr_ctl] {
             for v in table {
                 w.write_u16(*v)?;
+            }
+        }
+        for table in [&self.spr_data, &self.spr_datb] {
+            for v in table {
+                w.write_u64(*v)?;
             }
         }
         w.write_u8(self.armed)?;
@@ -937,14 +977,14 @@ impl Regs {
         for v in &mut regs.bpldat {
             *v = r.read_u16()?;
         }
-        for table in [
-            &mut regs.spr_pos,
-            &mut regs.spr_ctl,
-            &mut regs.spr_data,
-            &mut regs.spr_datb,
-        ] {
+        for table in [&mut regs.spr_pos, &mut regs.spr_ctl] {
             for v in table.iter_mut() {
                 *v = r.read_u16()?;
+            }
+        }
+        for table in [&mut regs.spr_data, &mut regs.spr_datb] {
+            for v in table.iter_mut() {
+                *v = r.read_u64()?;
             }
         }
         regs.armed = r.read_u8()?;
@@ -956,7 +996,7 @@ impl Regs {
 /// When a change happened: the field it was made in, and the beam position.
 ///
 /// Ordered field first, so a sorted queue stays sorted across a field wrap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Stamp {
     field: u64,
     vpos: u16,
@@ -964,11 +1004,31 @@ struct Stamp {
 }
 
 /// A register write waiting for its pixel.
+///
+/// `value` is sixty-four bits for one kind of change only: a wide sprite
+/// transfer from [`Video::sprite_dma`], marked by [`WIDE`] in `offset`. Every
+/// other change is a register word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Change {
     at: Stamp,
     offset: u16,
-    value: u16,
+    value: u64,
+}
+
+/// The mark in a [`Change`]'s offset for a wide sprite transfer: the rest of
+/// the offset is the `SPRxDATA` or `SPRxDATB` it loads. Register offsets stop
+/// at `$1FE`, so the bit is free.
+const WIDE: u16 = 0x8000;
+
+impl Change {
+    /// Put this change into `regs`.
+    fn apply_to(self, regs: &mut Regs, rev: Revision) {
+        if self.offset & WIDE != 0 {
+            regs.load_sprite(self.offset & !WIDE, self.value);
+        } else {
+            regs.apply(rev, self.offset, self.value as u16);
+        }
+    }
 }
 
 /// Everything behind the lock.
@@ -1142,7 +1202,7 @@ impl State {
                 break;
             }
             self.pending.pop_front();
-            self.regs.apply(rev, change.offset, change.value);
+            change.apply_to(&mut self.regs, rev);
         }
     }
 }
@@ -1513,7 +1573,7 @@ fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
                 break;
             }
             st.pending.pop_front();
-            st.regs.apply(rev, change.offset, change.value);
+            change.apply_to(&mut st.regs, rev);
             changed = true;
         }
         if changed {
@@ -1539,9 +1599,12 @@ fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
                 let hstart =
                     (u32::from(regs.spr_pos[i] & 0xff) << 1) | u32::from(regs.spr_ctl[i] & 1);
                 if regs.armed & (1 << i) != 0 && x == hstart {
+                    // An 8362's and an 8373's buffers are sixteen bits: the
+                    // top of the wide ones, which is where a register write
+                    // puts its word.
                     *s = Shifter {
-                        a: regs.spr_data[i],
-                        b: regs.spr_datb[i],
+                        a: (regs.spr_data[i] >> 48) as u16,
+                        b: (regs.spr_datb[i] >> 48) as u16,
                         left: 16,
                     };
                 }
@@ -1869,6 +1932,74 @@ impl Video {
         (st.layout.width(), st.layout.height(), st.fields)
     }
 
+    /// One AA sprite-data DMA transfer, of the width `FMODE` selects.
+    ///
+    /// # The seam Alice needs
+    ///
+    /// `SPRxDATA` and `SPRxDATB` are sixteen-bit addresses on the register
+    /// bus, and a processor write through [`CustomChip::write`] still reaches
+    /// them — "they may be loaded by either processor at any time" (AA
+    /// specification, §4, `SPRxDAT`). But with `FMODE`'s `SPR32` or `SPAGEM`
+    /// set a sprite fetch is 32 or 64 bits and all of it arrives in one
+    /// transfer, which no `u16` on that bus can carry. Alice makes that
+    /// transfer here instead.
+    ///
+    /// `sprite` is 0–7, `b_buffer` picks `SPRxDATB` over `SPRxDATA`, and
+    /// `bits` is the fetched data **left-justified**: the first pixel in bit
+    /// 63, because "the MSB is output first on the left". A 16-bit `FMODE`
+    /// therefore puts its word in bits 63–48, which is exactly what a
+    /// register write does, so Alice may use either path at that width and get
+    /// the same picture. Writing the A buffer arms the sprite and writing
+    /// `SPRxCTL` disarms it, here as on the register bus.
+    ///
+    /// The transfer is timed exactly as a register write is: with a [`Beam`]
+    /// connected it lands at the pixel the beam is at, in order with the
+    /// `SPRxPOS` and `SPRxCTL` writes the same DMA slot made through the
+    /// register bus — so a `CTL` write that disarms the sprite is followed,
+    /// not overtaken, by the data that arms it again.
+    ///
+    /// Bitplane data needs nothing like this: a fetch of any width is that
+    /// many consecutive pixels in [`Fetch::planes`].
+    pub fn sprite_dma(&self, sprite: usize, b_buffer: bool, bits: u64) {
+        if sprite >= 8 {
+            return;
+        }
+        let offset = SPR0POS + 8 * sprite as u16 + if b_buffer { 6 } else { 4 };
+        self.schedule(self.now(), offset | WIDE, bits);
+    }
+
+    /// Put a change in force now (no beam, or a debugger's write) or queue it
+    /// for the pixel `now` names. The caller asks the beam with nothing
+    /// locked, because asking may make Agnus push lines into this very chip.
+    fn schedule(&self, now: Option<BeamPosition>, offset: u16, value: u64) {
+        let mut st = self.state.lock();
+        let st = &mut *st;
+        let change = |at| Change { at, offset, value };
+        match now {
+            None => {
+                // The change is in force from the next line rendered. Anything
+                // already queued goes first so the order of writes is kept.
+                for c in st.pending.drain(..) {
+                    c.apply_to(&mut st.regs, self.rev);
+                }
+                change(Stamp::default()).apply_to(&mut st.regs, self.rev);
+            }
+            Some(pos) => {
+                let at = Stamp {
+                    field: st.fields,
+                    vpos: pos.vpos,
+                    hpos: pos.hpos,
+                };
+                st.pending.push_back(change(at));
+                while st.pending.len() > MAX_PENDING {
+                    if let Some(c) = st.pending.pop_front() {
+                        c.apply_to(&mut st.regs, self.rev);
+                    }
+                }
+            }
+        }
+    }
+
     /// The collision register as it stands, without clearing it.
     #[must_use]
     pub fn peek_clxdat(&self) -> u16 {
@@ -1928,7 +2059,7 @@ impl Video {
             w.write_u16(c.at.vpos)?;
             w.write_u16(c.at.hpos)?;
             w.write_u16(c.offset)?;
-            w.write_u16(c.value)?;
+            w.write_u64(c.value)?;
         }
         // The chip's own strap and part, so a snapshot of one is not restored
         // into the other: the raster a beam handed over says how *this* field
@@ -1964,7 +2095,7 @@ impl Video {
         let lof = r.read_bool()?;
         let clocks = r.read_u64()?;
         let last_field_clocks = r.read_u64()?;
-        let count = r.read_seq_len(16)?;
+        let count = r.read_seq_len(22)?;
         if count > MAX_PENDING as u64 {
             return Err(Error::State(alloc::format!(
                 "{CLASS_NAME}: {count} queued register changes, more than the {MAX_PENDING} a \
@@ -1978,11 +2109,22 @@ impl Video {
                 vpos: r.read_u16()?,
                 hpos: r.read_u16()?,
             };
-            pending.push_back(Change {
-                at,
-                offset: r.read_u16()?,
-                value: r.read_u16()?,
-            });
+            let (offset, value) = (r.read_u16()?, r.read_u64()?);
+            // A register word, or a wide load of a sprite data buffer: nothing
+            // else is ever queued.
+            let sprite_data = matches!(offset & !WIDE, SPR0POS..=SPR7DATB)
+                && ((offset & !WIDE) - SPR0POS) % 8 >= 4;
+            let fits = if offset & WIDE != 0 {
+                sprite_data
+            } else {
+                value <= 0xffff && offset < 0x200
+            };
+            if !fits {
+                return Err(Error::State(alloc::format!(
+                    "{CLASS_NAME}: a queued change of {value:#x} at {offset:#06x}"
+                )));
+            }
+            pending.push_back(Change { at, offset, value });
         }
         let ntsc = r.read_bool()?;
         let rev = match r.read_u8()? {
@@ -2137,34 +2279,10 @@ impl CustomChip for Video {
         let offset = reg.offset;
         if Regs::timed(self.rev, offset) {
             // Ask the beam first, with nothing locked: asking may make Agnus
-            // catch up and push lines into this very chip.
+            // catch up and push lines into this very chip. A debugger's write
+            // is in force at once.
             let now = if from.debug { None } else { self.now() };
-            let mut st = self.state.lock();
-            match now {
-                None => {
-                    // No beam source (or a debugger): the change is in force
-                    // from the next line rendered. Anything already queued
-                    // goes first so the order of writes is kept.
-                    let queued: Vec<Change> = st.pending.drain(..).collect();
-                    for c in queued {
-                        st.regs.apply(self.rev, c.offset, c.value);
-                    }
-                    st.regs.apply(self.rev, offset, value);
-                }
-                Some(pos) => {
-                    let at = Stamp {
-                        field: st.fields,
-                        vpos: pos.vpos,
-                        hpos: pos.hpos,
-                    };
-                    st.pending.push_back(Change { at, offset, value });
-                    while st.pending.len() > MAX_PENDING {
-                        if let Some(c) = st.pending.pop_front() {
-                            st.regs.apply(self.rev, c.offset, c.value);
-                        }
-                    }
-                }
-            }
+            self.schedule(now, offset, u64::from(value));
             return;
         }
         match offset {
