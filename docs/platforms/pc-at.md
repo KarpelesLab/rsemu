@@ -89,13 +89,13 @@ address; every one of them is written once, in that file.
 | System control ports | `pc.sysctl` | 0x61, 0x92, 0xcf9 | AT Technical Reference, Intel chipset data sheets |
 | RTC and CMOS | `pc.rtc` | 0x70-0x71 | Motorola MC146818 data sheet |
 | DMA (2, byte and word) | `pc.dma` | 0x00-0x0f, 0xc0-0xdf, pages at 0x80 | Intel 8237A data sheet |
-| Display | `pc.video` | 0x3b4/0x3d4, 0x3c0-0x3cf, 0x3da | MC6845 data sheet, VGA register set |
+| Display | `pc.video` (`model = "vga"`) | 0x3b4/0x3d4, 0x3c0-0x3cf, 0x3da, and 0xa0000-0xbffff | IBM VGA Technical Reference, FreeVGA; [`../devices/pc-video.md`](../devices/pc-video.md) for the extension registers |
 | Floppy controller | `pc.fdc` | 0x3f0-0x3f5, 0x3f7 | NEC µPD765A data sheet |
 | IDE channels (2) | `pc.ide` | 0x1f0-0x1f7 + 0x3f6, 0x170-0x177 + 0x376 | AT Technical Reference, fixed-disk adapter |
 | Hard disks (2 bays) | `ata.disk` | — (on the cable) | T13 ATA/ATAPI-6 |
 | Firmware sockets | `pc.rom` | 0xc0000, 0xe0000 (+ a high alias) | — |
 | PCI host bridge, and RAM shadowing | `pc.pmc` | 0xcf8-0xcff | Intel 82441FX data sheet |
-| PCI display adapter, and its video BIOS | `pc.vga-pci` | 00:02.0, expansion ROM BAR | PCI Local Bus Spec Rev 2.1 §6.2.5.2 |
+| PCI display adapter, its video BIOS and the linear framebuffer | `pc.vga-pci` | 00:02.0, expansion ROM BAR, BAR0 | PCI Local Bus Spec Rev 2.1 §6.2.5.1, §6.2.5.2 |
 
 Six oscillators, because the board has six cans: the CPU clock, the 8254's
 105/88 MHz — not an integer number of hertz, which is why the description
@@ -301,15 +301,20 @@ gives up — "cirrus init / Failed to initialize VGA hardware" — because the c
 is not a Cirrus. So `vendor-id` and `device-id` on the `vgacard` object are
 load-bearing, and the machine file says so.
 
-### What is still not there
+### What a third-party video BIOS does and does not find
 
-**A graphics mode.** `pc.video` is text-mode only and says so, and the video
-BIOS agrees: it reports "No VBE DISPI interface detected, falling back to
-stdvga" and sets mode 3. A Cirrus image, whose ids the machine file can be told
-to match, gets as far as `cirrus init` and then correctly refuses — "Failed to
-initialize VGA hardware" — because the card is not a Cirrus. Which is the right
-answer, and a good demonstration that the id fields are load-bearing rather
-than decoration.
+`pc.video` is a full VGA now — planar memory, the graphics modes, a linear
+mode — so a video BIOS built for a generic PCI VGA drives the register file it
+expects and reaches a text console as before. What it reports is "No VBE DISPI
+interface detected, falling back to stdvga", and that is correct: the linear
+framebuffer on this card is set up through **rsemu's own extension registers**
+(`../devices/pc-video.md`), which that image was not built for, and the Bochs
+DISPI ports it looks for are an interface with no specification outside a GPL
+program's source. rsemu's own BIOS implements VBE 2.0 over the registers that
+*are* here. A Cirrus image, whose ids the machine file can be told to match,
+gets as far as `cirrus init` and then correctly refuses — "Failed to initialize
+VGA hardware" — because the card is not a Cirrus, which is a good demonstration
+that the id fields are load-bearing rather than decoration.
 
 ## The in-house BIOS
 
@@ -594,6 +599,38 @@ Two things the boot taught the firmware, neither predicted:
   run here and block move is the service it asks for; it is exercised by the
   hermetic test's own boot sector rather than by FreeDOS.
 
+### The graphics modes, and VBE
+
+`tests/pc_video_modes.rs` is the evidence, and it is four hand-assembled
+real-mode guests on this board with nothing downloaded:
+
+| Guest | What it asks for | What the host's frame is |
+| --- | --- | --- |
+| `INT 10h AX=0012h` | 640x480 in sixteen colours | 640x480, sixteen horizontal bands in the sixteen EGA colours, drawn through the graphics controller's write mode 2 |
+| `INT 10h AX=0013h` | 320x200 in 256 colours | **640x400**, every pixel a 2x2 block, a diagonal ramp over the whole palette |
+| mode X | 320x240 unchained, programmed by the guest itself | **640x480**, four greys repeating every four pixels — one plane each |
+| `AX=4F02h, BX=4112h` | 640x480 at 32 bits a pixel, linear | 640x480, four 64 KiB banks of colour painted through the window at A000h and a line drawn through `PhysBasePtr` |
+
+The frames are asserted pixel by pixel against the DAC read back through the
+card's own ports, so a wrong palette or a wrong plane order fails rather than
+being hashed over; `RSEMU_SCREENSHOT_DIR=… cargo test --all-features
+pc_video_modes` writes each one out as a PNG.
+
+Two things worth knowing about the geometry, because they surprise people:
+**the host's frame is the raster, not the mode's pixel count.** A VGA in mode
+13h emits 640x400 and doubles every pixel in both directions, and an unchained
+320x240 emits 640x480; this adapter reports what the registers say it emits,
+which is why `--screenshot` of a DOS game is 640x400 rather than 320x200. And
+the **frame period** follows the mode: 70 Hz at 720x400 and 60 Hz at 640x480,
+computed from the CRT controller's registers over the adapter's clock domain
+(`src/host/display/pc.rs`).
+
+The fourth guest is also the check that the linear framebuffer is where the
+card says: it takes `PhysBasePtr` out of the mode information block, and the
+*test* — not the guest, which is in real mode and cannot reach it — writes a
+line through that physical address. Both the guest's banks and the test's line
+are in the same frame, which means the aperture and the window are one memory.
+
 ### The PCI BIOS interface
 
 `INT 1Ah AH=B1h`, the last of phase 6a's firmware list, and the service a
@@ -650,8 +687,16 @@ POST, and nothing in the tree models one.
   screen, which is a worse answer than carry, and it would put a font's
   provenance inside the firmware where `pc.video`'s original one is already
   argued. FreeDOS calls it once while booting and does not mind.
-- **Text mode only**, because `pc.video` is a text-mode CRTC. `INT 10h AH=00h`
-  records a graphics mode and changes nothing.
+- **`INT 10h AH=00h` sets modes 03h, 0Dh, 0Eh, 10h, 12h and 13h**, each from a
+  register table in the ROM, with the DAC loaded and display memory cleared;
+  and `AX=4F00h`-`4F03h` and `4F05h` are VBE 2.0 over the card's extension
+  registers, with `PhysBasePtr` read out of its PCI base address register.
+  Text modes 00h-02h and 07h are *not* programmed — 40-column text and the
+  monochrome adapter are modes nothing this board runs asks for — and neither
+  are the CGA graphics modes 04h-06h, whose shift-register arrangement the
+  scanout models but no mode table sets. Every one of them still records its
+  number, as it always did. `../devices/pc-video.md` lists the VBE functions
+  that answer and the four that say `AH=01h` rather than pretending.
 - **`INT 10h AH=06h` scrolls the whole screen** when the line count is
   non-zero; the rectangle is honoured for a clear (`AL=0`), which is what
   programs use it for.
@@ -742,12 +787,22 @@ a firmware bug:
   interface rather than requiring it, so the fallback path exists — and it is
   now measured: with nothing there the image falls back to the CMOS for its
   memory map and keeps going.
-- **A graphics mode.** Setting mode 3 writes the sequencer, the graphics
-  controller, the attribute controller and the DAC, and `pc.video` implements
-  that register file — a real video BIOS drives all of it and reaches a text
-  console. What it does *not* implement is any graphics mode, deliberately, so
-  a guest that asks for one gets a register file that latches and a screen that
-  does not change.
+- **A hardware cursor, and the CGA graphics modes.** The graphics modes are
+  here — `pc.video`'s `model = "vga"` is four planes behind the window at
+  0xa0000 with the graphics controller's write modes, read modes and latches,
+  the CRT controller's own address sequence over them, and a linear mode behind
+  the extension registers `../devices/pc-video.md` specifies; `tests/pc_video_modes.rs`
+  draws through mode 12h, mode 13h, mode X and a VBE linear mode and checks the
+  host's pixels. What is not here is a *hardware* cursor or blitter, because a
+  VGA has neither; and modes 04h-06h have no mode table in the firmware, so a
+  program that wants CGA graphics has to program the registers itself, which
+  the device models.
+- **A font in display memory.** A text mode draws with the adapter's own
+  8x16 font rather than reading plane 2, so a guest that loads a soft font
+  through `INT 10h AH=11h` — which this firmware does not implement either —
+  sees the built-in glyphs. `src/dev/pc/video.rs` argues the font's
+  provenance; the plane is there and a character generator that reads it is a
+  contained change.
 - **The keyboard takes raw set-2 scan codes** on a character port. Mapping a
   terminal's keystrokes to scan codes is a host concern and belongs in `host/`.
 - **No serial port, no parallel port, no APIC, no ACPI.** The firmware finds

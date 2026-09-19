@@ -41,8 +41,8 @@
 //!   `RamStore` and no pipeline.
 //! * **`vga`** is the adapter proper — the VGA's own twenty-five CRT
 //!   controller registers, four 64 KiB planes behind the A0000 window with the
-//!   graphics controller's write modes, read modes and latches ([`vga`]), the
-//!   graphics modes those make ([`scan`]), and a **linear mode** behind
+//!   graphics controller's write modes, read modes and latches (`video/vga.rs`),
+//!   the graphics modes those make (`video/scan.rs`), and a **linear mode** behind
 //!   extension registers of our own (`docs/devices/pc-video.md`) that a VBE
 //!   firmware drives. `machines/pc-at.machine` and `machines/q35.machine` both
 //!   ask for it.

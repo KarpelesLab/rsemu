@@ -9,12 +9,17 @@ are separate (`ROADMAP.md` §8); this file is about the emulated hardware.
 | --- | --- |
 | MDA / CGA / EGA / VGA | IBM PC and PS/2 Technical References ([bitsavers](https://bitsavers.org/)) — original register-level documentation |
 | VGA registers | [OSDev: VGA Hardware](https://wiki.osdev.org/VGA_Hardware) — consolidated register reference |
-| VBE / Bochs VBE extension | [OSDev: Bochs VBE Extensions](https://wiki.osdev.org/Bochs_VBE_Extensions) — the de-facto simple framebuffer interface every guest supports. This is an **interface specification**, documented independently of any implementation |
+| VBE | The VESA BIOS Extension Core Functions Standard 2.0 — an interface standard: what a *caller* sees, and nothing about how a card is driven |
+| The card's own linear-mode registers | [`pc-video.md`](pc-video.md) — **ours**. Not Bochs' "DISPI" ports, whose only specification is a GPL program's source (`../../CLAUDE.md`, provenance) |
 | virtio-gpu | [`../buses/virtio.md`](../buses/virtio.md) |
 
-A plain linear framebuffer plus the VBE interface gets a modern guest to a
-usable display quickly; full VGA register emulation (planar modes, the
-attribute controller, CRTC timing) is needed for DOS-era software.
+Both halves are implemented and the order above is the order it happened in
+reverse: `pc.video`'s VGA model is the full register emulation — planar
+memory, the four write modes, the attribute controller, the CRT controller's
+own address sequence — and the linear framebuffer sits behind it for the
+guests that want one, through a PCI BAR and rsemu's own extension registers.
+[`pc-video.md`](pc-video.md) specifies the latter; `docs/platforms/pc-at.md`
+records what has been measured running both.
 
 ## Console video
 

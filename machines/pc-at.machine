@@ -114,9 +114,11 @@ machine "pc-at" {
   # 640x480 modes and 28.322 MHz for the 720x400 text mode — and the
   # miscellaneous output register's clock-select bits choose between them at
   # runtime. A clock domain has one parent, so the board wires the device to the
-  # text-mode crystal, which is what it comes out of reset selecting and the
-  # only one that matters until a graphics mode exists. Divided by 9 for the
-  # nine-pixel character cell; the device counts character clocks.
+  # text-mode crystal, which is what it comes out of reset selecting. Divided
+  # by 9 for the nine-pixel character cell; the device counts character clocks,
+  # and a graphics mode's eight-dot cell on the other crystal is the same line
+  # rate to four parts in a million — which is why IBM chose those two numbers
+  # and why one domain serves every mode (`src/dev/pc/video.rs`, `line_ticks`).
   osc dot = 28322000 Hz
 
   # The 8042's own crystal. Divided down to a byte rate: an AT keyboard's serial
@@ -365,8 +367,8 @@ machine "pc-at" {
 
   # -- video ------------------------------------------------------------------
   #
-  # A CRTC, a character buffer and a character generator. Text mode only, which
-  # is what reaches a prompt; the picture comes out through the `host::display`
+  # The display adapter: a CRT controller, four planes of display memory and a
+  # character generator. The picture comes out through the `host::display`
   # scanout seam, so `--screenshot` and the browser see what the guest drew.
   # `dot-clock` says the same number the domain above does, and has to: the
   # device derives its frame period from its own registers and needs the

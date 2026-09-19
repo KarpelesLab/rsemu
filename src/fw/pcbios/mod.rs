@@ -109,8 +109,14 @@
 //! * **`INT 10h AH=06h` scrolls the whole screen** rather than the requested
 //!   rectangle when the line count is non-zero; the rectangle *is* honoured for
 //!   a clear (`AL=0`), which is the case programs actually use it for.
-//! * **Text mode only**, because `pc.video` is a text-mode CRTC. Setting a
-//!   graphics mode records the number and changes nothing.
+//! * **Six video modes have register tables** — 03h, 0Dh, 0Eh, 10h, 12h and
+//!   13h — and `AX=4F00h`-`4F03h` and `4F05h` are VBE 2.0 over the display
+//!   adapter's extension registers (`pcbios/vbe.rs`, `docs/devices/pc-video.md`).
+//!   Modes 00h-02h, 04h-06h and 07h record their number and change nothing,
+//!   as every mode used to: 40-column text, CGA graphics and the monochrome
+//!   adapter are not what anything this board runs asks for. On a board whose
+//!   display is not ours — `pc.video`'s 6845 model, or a third-party card —
+//!   the detection fails and every mode behaves the old way.
 //! * **No serial, parallel, or PS/2 mouse services** (`INT 14h`, `INT 17h`,
 //!   `INT 15h AH=C2h`): the board has none of those devices.
 //! * **The keyboard is US-layout and set 1**, decoded from the translated codes
