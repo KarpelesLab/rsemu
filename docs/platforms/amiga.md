@@ -6,7 +6,9 @@ Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
 `tests/amiga_a500_board.rs`, `tests/amiga_denise_board.rs`,
 `tests/agnus_board.rs`, `tests/amiga_a500_chipset.rs`,
 `tests/amiga_a500_input.rs`, `tests/amiga_adf.rs`,
-`tests/amiga_a500_kickstart.rs`.
+`tests/amiga_a500_kickstart.rs`; and for the A600 (the last section),
+`machines/amiga-a600.machine`, `src/dev/amiga/gayle.rs`,
+`tests/amiga_a600_board.rs`, `tests/amiga_a600_hdf.rs`.
 
 A 68000, 512 KiB of chip RAM, a Kickstart ROM, two 8520 CIAs and three custom
 chips — Agnus, Denise and Paula. **All of them are on the A500 board now**: the
@@ -826,3 +828,151 @@ and is answered — so the buffer and `$FA` keep their Appendix G meaning for a
 computer that stops answering. Double-click, the right-button menus, dragging
 icons, screens and windows, Caps Lock and the operating system's key repeat all
 worked without a change.
+
+## A600
+
+`machines/amiga-a600.machine` is the A500's chipset around **Gayle**
+(`amiga.gayle`, `src/dev/amiga/gayle.rs`, feature `dev-amiga-gayle`) with an
+IDE hard disk, and it boots Workbench from that disk with no floppy:
+
+```
+rsemu run amiga-a600 --media kickstart=kickstart:<rom dir>/amiga-os-310-a600.rom \
+    --media hd0=<hdf dir>/workbench-311.hdf --vnc :5900
+```
+
+`hd0` takes a whole disk — an HDF that begins `RDSK`, with its Rigid Disk
+Block — which is what Kickstart's `scsi.device` looks for. `--media` copies it
+into the drive; `--drive hd0=` (a `dev-blk` build) writes the guest's changes
+back to the file. The drive is `ata.disk`, the same object `pc-at` hangs off
+`pc.ide`, unchanged: Gayle is the host adapter, and the split
+`src/dev/ata/mod.rs` states holds — `gayle.rs` contains no ATA opcode, no
+`IDENTIFY` word index and no status bit, and the drive no register offset.
+
+### Sources
+
+| Source | Covers |
+| --- | --- |
+| *GAYLE — Gate array for A300/A500+ — Specification*, Commodore, July 10 1991 (a draft; the copy on amigawiki.org) | The pin list (section 1.3: no address pin below `A12`, eight data pins); the ROM and overlay (2.0); the CIA selects (5.0); the RTC select (6.0); the IDE chip selects against `A12`/`A13` (7.0) and the drive address lines on `A2`–`A4` (7.3); reset clears every register (10.0); the four registers at `$DA8000`–`$DAB000` bit by bit (19.0); the memory map (17.0) |
+| *A600 System Schematics*, Commodore, schematic #315987 rev. C | Sheet 2: Gayle's data pins on `D15`–`D8`; sheet 7: CIA-A's `PA0` unconnected; sheet 12: the IDE connector `CN16` — `_IDE_CS(1)`/`(2)` on pins 37/38, `A2`/`A3`/`A4` on `DA0`/`DA1`/`DA2`, `_IDE_IRQ` on 31, and the data bus marked "WARNING: BYTE SWAPPED"; `_RTC_CS` on the expansion header; p. 1-1, the A600's parts |
+| *A1200/A1200HD Advanced Amiga 1200 System Functional Specification* rev. 1.6, Commodore-Amiga | The 44-pin IDE header's pin names (A3.1), the memory map (5.0) |
+| MC68000 User's Manual (M68000UM/AD rev. 8), Table 3-1 | A byte write drives both halves of the data bus |
+| Black-box: Kickstart 3.1 (40.063) and 2.05 (37.350) | What they read and write at `$DA0000`–`$DAFFFF` and `$DE1000`, and what they wait on — the identification register, and which CIA write drops the overlay |
+
+No emulator source, no AROS source and no Kickstart disassembly was consulted.
+
+### Gayle's register map, as modelled
+
+| Address | What | Notes |
+| --- | --- | --- |
+| `$DA0000`–`$DA0FFF`, `$DA2000`–`$DA2FFF` | the drive's command block (`CS1FX-`) | register *n* at `+4n`: data `$DA2000` (16 bits), error/features `$DA2004`, sector count `$DA2008`, sector/LBA low `$DA200C`, cylinder/LBA mid `$DA2010`, cylinder/LBA high `$DA2014`, device/head `$DA2018`, status/command `$DA201C`. `A13` is timing only; `A1` is not decoded |
+| `$DA1000`–`$DA1FFF`, `$DA3000`–`$DA3FFF` | the control block (`CS3FX-`) | `$DA3018`: alternate status / device control. The rest floats |
+| `$DA4000`–`$DA7FFF` | nothing selected (7.0, "None") | floats |
+| `$DA8000` | status | 7 IDE `INTRQ`, 6 card detect, 5 BVD2, 4 BVD1, 3 write enable, 2 BSY/IRQ — each readable, and forced high by writing a 1; 1 digital audio enable, 0 card disable, plain |
+| `$DA9000` | change | bits 7–2 latch a change of the matching status line and hold until a 0 is written (a 1 leaves them); 1–0 plain |
+| `$DAA000` | enable | 7 IDE → `INT2`, 6 card detect → `INT6`, 5/4 BVD, 3 WR → `INT2`, 2 BSY; 1 and 0 choose `INT6` over `INT2` for BVD and BSY |
+| `$DAB000` | configuration | bits 3–0 read back; 7–4, the page registers the draft calls unimplemented, read 0 |
+| `$DE1000` | identification | a write restarts it; each read returns the next bit of `$D0` in bit 7 |
+| `$BFD000`, `$BFE000` | the two CIA selects | passed through to `amiga.cia-decode`; the first write to either drops the overlay |
+
+Every register is on the even byte (Gayle's eight data pins are the 68000's
+`D15`–`D8`) and fills a 4 KiB page, because Gayle sees nothing below `A12`;
+the odd byte floats. The IDE port's eight-bit registers are on the even byte
+too, and its data word arrives low byte first — the schematic's byte swap —
+so an HDF's sectors are in memory in the order the file holds them.
+
+**The IDE interrupt** is Gayle's change latch: `INTRQ` rises, bit 7 of
+`$DA9000` latches, and with bit 7 of `$DAA000` set Gayle pulls `INT2`, the net
+CIA-A's `/IRQ` is on, and Paula raises `PORTS`. Kickstart's handler reads
+`$DA9000`, reads the drive's status (which drops `INTRQ` — a second change,
+latched in the same bit), and writes `$7C` to `$DA9000` to let go.
+
+**PCMCIA is out of scope.** With no card, every card line reads negated, which
+is what the specification says an empty slot looks like; forcing one through
+`$DA8000` still latches a change and interrupts, because that is Gayle's own
+logic. The card's windows at `$600000`–`$A5FFFF` are not decoded and float.
+
+### What the board changes from the A500
+
+| | A500 | A600, and why |
+| --- | --- | --- |
+| Overlay | CIA-A `PA0` into Gary | Gayle's own, dropped by the first CIA write: `PA0` is not connected on the A600 (sheet 7) |
+| Chip RAM | 512 KiB | 1 MiB (p. 1-1: "512KB or 1MB internal"; the A600 sold with 1 MiB) |
+| Bank 6 (`$C00000`–`$D7FFFF`) | an A501, or the chip registers repeating | floats: no trapdoor slow RAM exists for the A600, and Gayle selects the chip registers at `$DFF000`–`$DFF1FF` only (section 4.0) |
+| `$DC0000` | floats (the clock comes on the A501) | floats: the RTC select goes to the expansion header, where an A601 puts a clock |
+| `$E00000` | the AROS-only `ext` window | nothing — see below |
+| IDE, Gayle registers, ID | — | `$DA0000`, `$DA8000`, `$DE1000` |
+
+**The ROM is mapped at `$F80000` only**, and one
+thing about that is open. The draft specification's ROM select also covers
+`$E00000`–`$E7FFFF` and `$A80000`–`$B7FFFF` (section 2.0, and 17.0's map), and
+the A600's ROM is a 256K×16 part with no pin for `A19`, so on the real board
+the Kickstart would most likely repeat in both. Black-box, it makes no
+difference to anything tested here: with both mirrors mapped, Kickstart 3.1
+boots Workbench 3.1 to a bit-identical frame at the same moment. Adding them
+is two `map` lines.
+
+**The chips are OCS.** The A600 has the ECS 8375 Agnus and 8373 Denise; the
+board moves to them when the ECS models land, and every golden below moves
+with it.
+
+### Defects found on the way
+
+| Stopped at | Why | Fix |
+| --- | --- | --- |
+| Kickstart 3.1 looping in its first second, nothing on screen | The overlay was dropped only by a write to CIA-B, as the draft says ("the first write to CIA1 (address range of $BFD000 to $BFDFFF)"). Kickstart's first CIA write is to CIA-A (`$BFE001`), and it uses chip RAM at zero long before it first writes CIA-B (`$BFD200`); with the ROM still over the vector table it never got further. On an A600 the CIA-A write can only reach the overlay through Gayle, so the shipped part must negate it there | Either CIA's first write drops it. Test: `the_overlay_is_up_out_of_reset_and_the_first_write_to_either_cia_drops_it` |
+| The insert-disk screen, `$DA0000` never touched | Kickstart writes `$DE1000`, reads it four times, and uses the IDE port only if bit 7 reads 1, 1, 0, 1. Tried against `$0`, `$5`, `$8`, `$9`, `$A`, `$C`, `$E`, `$F` (3.1) and `$0` (2.05): all skip the port; the next four bits (`$D0`, `$D1`, `$DF`) change nothing | The register shifts out `$D0`. Test: `the_id_register_shifts_out_d_msb_first_after_a_write` |
+
+**Found, not fixed — the drive's, not Gayle's.** `ata.disk` raises `INTRQ`
+again when the host empties the last block of a PIO read (`complete()` from
+`block_consumed`). ATA's PIO data-in protocol announces each block with an
+interrupt *before* it is transferred and has no completion interrupt, and
+`disk.rs`'s own module documentation says the same ("a read asserts INTRQ at
+the start of every block"). On the A600 it costs one extra level 2 interrupt
+per read, which `scsi.device` handles — its handler finds the drive idle and
+lets go — so nothing here stops. It is left alone because `pc.ide` and `ahci`
+share the drive and `ahci` takes the pending interrupt as a FIS's `I` bit;
+`tests/amiga_a600_board.rs` asserts "at least two" interrupts rather than
+three so it survives the fix.
+
+### How far each disk gets
+
+`tests/amiga_a600_hdf.rs`, behind `RSEMU_AMIGA_ROM_DIR` and
+`RSEMU_AMIGA_HDF_DIR` (Amiga Forever's `Shared/rom` and `Shared/hdf`), boots
+the user's files in place and checks a frame hash; each frame was looked at.
+
+| ROM + disk | Reaches | What is on screen |
+| --- | --- | --- |
+| Kickstart 3.1 (40.063) + `workbench-311.hdf` | the Workbench 3.1 desktop, 12 s | Black while the ROM finds Gayle and the drive and AmigaDOS runs the startup-sequence; then the grey 640-pixel Workbench screen, "Copyright © 1985-1993 Commodore-Amiga, Inc. All Rights Reserved." in its title bar, the blue-framed "Workbench" window with the Ram Disk icon and the hard-disk icon "Workbench3.1", and the red pointer |
+| Kickstart 2.05 (37.350, the A600's own) + `workbench-211.hdf` | the Workbench 2.1 desktop, 13 s | White while the ROM boots; at 9 s the AmigaDOS shell window, "Amiga Release 2.1.1. Kickstart 37.350, Workbench 38.36"; then the grey desktop with "Copyright © 1985-1992 …" in a black title bar, the "Workbench" window, Ram Disk and "Workbench2.1" |
+| Kickstart 3.1 + `workbench-135.hdf` | the Workbench 1.3 desktop, 12 s | A blue screen, the 3.1 copyright in the title bar, Ram Disk and the "Workbench1.3" icon, no window |
+| Kickstart 3.1, empty bay | its insert-disk screen, 20 s | Black for 19 s while `scsi.device` keeps selecting a drive that is not there and reading a status nothing drives; then the A500's insert-disk animation, bit for bit its frame |
+
+Kickstart's probe, as traced: it writes `$00` then `$A0` to device/head, runs
+an echo test on the cylinder-low register (`$12`, `$34`), writes device control
+at `$DA3018`, issues `RECALIBRATE`, `IDENTIFY DEVICE`, `INITIALIZE DEVICE
+PARAMETERS` (16 heads, 63 sectors), `SET MULTIPLE MODE` (16), and reads with
+`READ SECTORS` and `READ MULTIPLE` in CHS mode; it also selects device 1 once,
+and reads zeroes from the empty position, as a drive answers for its absent
+slave.
+
+**The empty-bay delay is open.** What an A600 with no drive reads from its IDE
+status register is whatever its unbuffered data bus floats to; the board here
+floats like every other empty address (the last value on the bus). Whether a
+real machine without "HD" waits as long before the insert-disk screen is not in
+any document at hand.
+
+### Tests
+
+* `src/dev/amiga/gayle/tests.rs` (ROM-free): the decode; the byte swap on
+  `IDENTIFY` (the model string reads pairwise swapped at the 68000's
+  addresses) and on `READ SECTORS` and `WRITE SECTORS` (an `RDSK` image lands
+  in memory, and memory lands on the medium, in order); the interrupt through
+  the status, change and enable registers onto `INT2`, and `nIEN`; the empty
+  card slot, forced lines, and the `INT2`/`INT6` level bits; the
+  identification sequence; the overlay on either CIA; `MemAttrs::debug`
+  popping nothing; a snapshot round trip.
+* `tests/amiga_a600_board.rs` (ROM-free): the board realizes, its map is the
+  A600's, and a hand-assembled 68000 program sends `IDENTIFY DEVICE` and `READ
+  SECTORS` through Gayle, waiting on the level 2 interrupt each time, and gets
+  the image's bytes.
+* `tests/amiga_a600_hdf.rs` (the user's ROMs and HDFs): the four rows above.
