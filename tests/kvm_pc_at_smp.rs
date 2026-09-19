@@ -493,7 +493,7 @@ fn options(text: &str) -> BuildOptions {
     options.realize.media.insert("vgabios", Vec::new());
     options.realize.media.insert("optionrom", vec![0u8; 65536]);
     options.realize.media.insert("floppy", bootable_diskette());
-    for slot in ["disk", "hd0", "hd1", "hd2", "hd3", "cd0", "cd1"] {
+    for slot in ["disk", "hd0", "hd1", "cdrom", "hd2", "hd3", "cd0", "cd1"] {
         options.realize.media.insert(slot, Vec::new());
     }
     options

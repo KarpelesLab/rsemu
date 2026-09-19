@@ -117,6 +117,8 @@ fn board() -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>) {
     options.realize.media.insert("floppy", floppy);
     options.realize.media.insert("hd0", Vec::new());
     options.realize.media.insert("hd1", Vec::new());
+    // The CD-ROM drive with no disc in it, which is what no bytes bound means.
+    options.realize.media.insert("cdrom", Vec::new());
 
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     let mut m = build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options)

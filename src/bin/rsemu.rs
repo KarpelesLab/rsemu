@@ -57,6 +57,8 @@ RUN OPTIONS:
     --hd0 <file>        Bind the `hd0` media slot: a raw hard disk image for
                         the first IDE bay. Unbound is an empty bay.
     --hd1 <file>        Bind the `hd1` media slot: the second IDE bay
+    --cdrom <file>      Bind the `cdrom` media slot: an ISO 9660 image for the
+                        CD-ROM drive. Unbound is a drive with no disc in it.
     --flash0 <file>     Bind the `flash0` media slot: a NOR flash bank's
                         contents. `riscv-virt` boots UEFI out of it.
     --flash1 <file>     Bind the `flash1` media slot: the second NOR bank,
@@ -551,10 +553,12 @@ fn run(args: &[String]) -> ExitCode {
     // finds the slot, because the drive looks its medium up by the slot's name.
     // `ext` is the A500's extended-ROM window, which exists for AROS's second
     // ROM half and which a real A500 does not have: no bytes is no ROM there,
-    // and the board is exactly the one without the window.
+    // and the board is exactly the one without the window. `cdrom` is the
+    // PC's CD-ROM drive: no bytes is an open tray, and the guest is told
+    // `MEDIUM NOT PRESENT` rather than finding no drive.
     for slot in [
         "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0",
-        "ext",
+        "ext", "cdrom",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
@@ -2605,7 +2609,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
             "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--flash0"
-            | "--flash1" | "--initrd" | "--hd0" | "--hd1" => {
+            | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--cdrom" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));

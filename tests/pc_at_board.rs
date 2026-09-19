@@ -139,6 +139,8 @@ fn board_with_display() -> (
     // is only that a board with an unpopulated cable still realizes.
     options.realize.media.insert("hd0", Vec::new());
     options.realize.media.insert("hd1", Vec::new());
+    // The CD-ROM drive with no disc in it, which is what no bytes bound means.
+    options.realize.media.insert("cdrom", Vec::new());
     // Intercept the display's constructor so a test can look at the picture,
     // exactly as `rsemu run --screenshot` does.
     rsemu::host::display::pc::capture::install(&mut options).expect("one display class");
@@ -180,6 +182,8 @@ fn board_with_hosts() -> (
     // is only that a board with an unpopulated cable still realizes.
     options.realize.media.insert("hd0", Vec::new());
     options.realize.media.insert("hd1", Vec::new());
+    // The CD-ROM drive with no disc in it, which is what no bytes bound means.
+    options.realize.media.insert("cdrom", Vec::new());
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     let machine = match build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options) {
         Ok(m) => m,
@@ -237,6 +241,8 @@ fn the_catalog_realizes_this_board_with_its_own_bindings() {
     // is only that a board with an unpopulated cable still realizes.
     options.realize.media.insert("hd0", Vec::new());
     options.realize.media.insert("hd1", Vec::new());
+    // The CD-ROM drive with no disc in it, which is what no bytes bound means.
+    options.realize.media.insert("cdrom", Vec::new());
     rsemu::host::display::pc::capture::install(&mut options).expect("one display class");
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     let mut m = match build(entry.name, entry.source, &registry, &options) {
@@ -260,7 +266,7 @@ fn the_board_realizes_with_every_chip_mapped_and_wired() {
     assert_eq!(m.name(), "pc-at");
     for path in [
         "cpu0", "ram_low", "ram_high", "pic1", "pic2", "pit0", "cmos", "kbc", "sysctl", "dma1",
-        "dma2", "vga", "fdc", "hd0", "hd1", "ide0", "ide1", "bios", "vgarom",
+        "dma2", "vga", "fdc", "hd0", "hd1", "cd0", "ide0", "ide1", "bios", "vgarom",
     ] {
         assert!(
             m.device(path).is_some(),

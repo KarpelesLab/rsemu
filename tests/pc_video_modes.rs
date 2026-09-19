@@ -133,7 +133,7 @@ fn run(name: &str, program: impl FnOnce(&mut Asm)) -> (Machine, VideoScanout) {
         .insert("bios", rsemu::fw::pcbios::image());
     options.realize.media.insert("vgabios", Vec::new());
     options.realize.media.insert("floppy", diskette(sector));
-    for slot in ["hd0", "hd1"] {
+    for slot in ["hd0", "hd1", "cdrom"] {
         options.realize.media.insert(slot, Vec::new());
     }
     rsemu::host::display::pc::capture::install(&mut options).expect("one display class");

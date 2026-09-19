@@ -297,7 +297,7 @@ pub static ARM926: CatalogEntry = CatalogEntry {
 pub static PC_AT: CatalogEntry = CatalogEntry {
     name: "pc-at",
     summary: "IBM PC/AT-class board: x86, 8259As, 8254, MC146818, 8042, 8237s, VGA, floppy, IDE",
-    media: &["bios", "vgabios", "floppy", "hd0", "hd1"],
+    media: &["bios", "vgabios", "floppy", "hd0", "hd1", "cdrom"],
     source: include_str!("../../machines/pc-at.machine"),
 };
 
@@ -329,7 +329,7 @@ pub static PC_AT: CatalogEntry = CatalogEntry {
 pub static PC_AT_SMP: CatalogEntry = CatalogEntry {
     name: "pc-at-smp",
     summary: "the PC/AT board with two processors, each reaching its own local APIC at 0xfee00000",
-    media: &["bios", "vgabios", "floppy", "hd0", "hd1"],
+    media: &["bios", "vgabios", "floppy", "hd0", "hd1", "cdrom"],
     source: include_str!("../../machines/pc-at-smp.machine"),
 };
 
@@ -380,7 +380,7 @@ pub static PC_APIC: CatalogEntry = CatalogEntry {
 pub static Q35: CatalogEntry = CatalogEntry {
     name: "q35",
     summary: "q35-class board: x86, 82Q35 MCH with ECAM, ICH9 LPC, APICs, HPET, VGA, IDE, ACPI",
-    media: &["bios", "vgabios", "hd0", "hd1"],
+    media: &["bios", "vgabios", "hd0", "hd1", "cdrom"],
     source: include_str!("../../machines/q35.machine"),
 };
 
@@ -2477,6 +2477,11 @@ mod tests {
             // where a populated bay is exercised.
             #[cfg(feature = "machine-pc-at")]
             ("pc-at", "hd0" | "hd1") => &[],
+            // And no disc in the CD-ROM drive, which is an open tray rather
+            // than an absent drive: the guest finds the drive and is told
+            // `MEDIUM NOT PRESENT`. `tests/pc_at_cdrom` puts an ISO in it.
+            #[cfg(feature = "machine-pc-at")]
+            ("pc-at", "cdrom") => &[],
             // The two-processor board takes the same sockets, for the same
             // reasons: it is `pc-at` with a second processor on it.
             #[cfg(feature = "machine-pc-at-smp")]
@@ -2487,6 +2492,8 @@ mod tests {
             ("pc-at-smp", "floppy") => blank(1_474_560),
             #[cfg(feature = "machine-pc-at-smp")]
             ("pc-at-smp", "hd0" | "hd1") => &[],
+            #[cfg(feature = "machine-pc-at-smp")]
+            ("pc-at-smp", "cdrom") => &[],
             #[cfg(feature = "machine-pc-apic")]
             ("pc-apic", "bios") => blank(128 * 1024),
             // The q35 board's BIOS socket is 64 KiB rather than `pc-at`'s 128,
@@ -2497,6 +2504,8 @@ mod tests {
             ("q35", "vgabios") => blank(32 * 1024),
             #[cfg(feature = "machine-q35")]
             ("q35", "hd0" | "hd1") => &[],
+            #[cfg(feature = "machine-q35")]
+            ("q35", "cdrom") => &[],
             // No kernel and no ramdisk. An unbound `kernel` slot is a machine
             // with nothing to boot, which the loader treats as nothing to do
             // rather than as an error — so this proves the board realizes

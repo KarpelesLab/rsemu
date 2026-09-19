@@ -170,7 +170,7 @@ fn board() -> Machine {
         .insert("bios", rsemu::fw::pcbios::image());
     options.realize.media.insert("vgabios", Vec::new());
     options.realize.media.insert("floppy", diskette());
-    for slot in ["disk", "hd0", "hd1", "cd0", "cd1"] {
+    for slot in ["disk", "hd0", "hd1", "cdrom", "cd0", "cd1"] {
         options.realize.media.insert(slot, Vec::new());
     }
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");

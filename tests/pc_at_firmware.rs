@@ -168,6 +168,8 @@ fn board(bios: Vec<u8>, vgabios: Option<Vec<u8>>) -> (Machine, Arc<X86>) {
     options.realize.media.insert("floppy", floppy);
     options.realize.media.insert("hd0", Vec::new());
     options.realize.media.insert("hd1", Vec::new());
+    // The CD-ROM drive with no disc in it, which is what no bytes bound means.
+    options.realize.media.insert("cdrom", Vec::new());
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     let mut m = match build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options) {
         Ok(m) => m,

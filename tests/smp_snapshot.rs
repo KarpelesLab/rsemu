@@ -363,7 +363,9 @@ mod pcat {
         );
         options.realize.media.insert("vgabios", Vec::new());
         options.realize.media.insert("optionrom", vec![0u8; 65536]);
-        for slot in ["floppy", "disk", "hd0", "hd1", "hd2", "hd3", "cd0", "cd1"] {
+        for slot in [
+            "floppy", "disk", "hd0", "hd1", "hd2", "hd3", "cd0", "cd1", "cdrom",
+        ] {
             options.realize.media.insert(slot, Vec::new());
         }
         options
@@ -413,7 +415,8 @@ mod q35 {
         options.realize.media.insert("vgabios", Vec::new());
         options.realize.media.insert("optionrom", vec![0u8; 65536]);
         for slot in [
-            "disk", "hd0", "hd1", "hd2", "hd3", "cd0", "cd1", "floppy", "kernel", "initrd", "nvme0",
+            "disk", "hd0", "hd1", "hd2", "hd3", "cd0", "cd1", "cdrom", "floppy", "kernel",
+            "initrd", "nvme0",
         ] {
             options.realize.media.insert(slot, Vec::new());
         }

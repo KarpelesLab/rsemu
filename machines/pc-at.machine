@@ -78,9 +78,10 @@ machine "pc-at" {
   #   rsemu run pc-at --bios bios.bin --media hd0=disk.img
   #   rsemu run pc-at --bios bios.bin --param hd0size=64M
   #
-  # The secondary channel is wired below and both of its bays are empty. A
-  # machine file that wants a drive there copies `hd0` and says
-  # `bay = "ide1-master"`.
+  # The secondary channel carries the CD-ROM on its master position, which is
+  # where a PC of the period put one, and its slave bay is empty. A machine
+  # file that wants a second hard disk there copies `hd0` and says
+  # `bay = "ide1-slave"`.
   param hd0size = 0
   param hd1size = 0
 
@@ -450,6 +451,25 @@ machine "pc-at" {
   # whether the line is in the right place.
   object hd0 "ata.disk" { image = "hd0", size = hd0size, bay = "ide0-master" }
   object hd1 "ata.disk" { image = "hd1", size = hd1size, bay = "ide0-slave" }
+
+  # The CD-ROM, on the secondary channel's master position — where a PC of the
+  # period put one, and deliberately not on the primary cable, where it would
+  # share a channel with the disk an operating system is being installed onto.
+  #
+  # It is the *third* kind of object, and the reason it is a third kind rather
+  # than a property on `ata.disk` is that ATAPI is a different command set: a
+  # CD-ROM answers `PACKET` and carries SCSI command descriptor blocks, and it
+  # shares with the hard disk exactly what the ribbon cable carries. `pc.ide`
+  # cannot tell them apart, which is the proof that the line is in the right
+  # place.
+  #
+  # The drive is always there and the *disc* is what is optional: an unbound
+  # `cdrom` media slot is a drive with an open tray, which answers
+  # `MEDIUM NOT PRESENT` rather than not existing.
+  #
+  #   rsemu run pc-at --media cdrom=disc.iso
+  #   rsemu run pc-at --drive cdrom=disc.iso      # file-backed, not in RAM
+  object cd0 "ata.cdrom" { image = "cdrom", bay = "ide1-master" }
 
   object ide0 "pc.ide" { master = "ide0-master", slave = "ide0-slave" }
   object ide1 "pc.ide" { master = "ide1-master", slave = "ide1-slave" }

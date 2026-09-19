@@ -151,6 +151,8 @@ impl Pc {
         options.realize.media.insert("floppy", floppy);
         options.realize.media.insert("hd0", hd0);
         options.realize.media.insert("hd1", Vec::new());
+        // The CD-ROM drive with no disc in it, which is what no bytes bound means.
+        options.realize.media.insert("cdrom", Vec::new());
         // The record/replay seam, as `rsemu run --record-input` engages it:
         // every keystroke below crosses into the machine through it.
         let recorder = Arc::new(Recorder::recording());

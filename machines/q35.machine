@@ -111,7 +111,8 @@ machine "q35" {
   # these can run in one process without writing over each other.
   param console = "console"
 
-  # The two drive bays on the primary IDE channel. Zero is an empty bay.
+  # The two drive bays on the primary IDE channel. Zero is an empty bay. The
+  # secondary channel's master position carries the CD-ROM, below.
   param hd0size = 0
   param hd1size = 0
 
@@ -411,6 +412,10 @@ machine "q35" {
 
   object hd0 "ata.disk" { image = "hd0", size = hd0size, bay = "ide0-master" }
   object hd1 "ata.disk" { image = "hd1", size = hd1size, bay = "ide0-slave" }
+
+  # The CD-ROM, on the secondary channel's master position, exactly as `pc-at`
+  # carries one: an unbound `cdrom` media slot is a drive with no disc in it.
+  object cd0 "ata.cdrom" { image = "cdrom", bay = "ide1-master" }
 
   object ide0 "pc.ide" { master = "ide0-master", slave = "ide0-slave" }
   object ide1 "pc.ide" { master = "ide1-master", slave = "ide1-slave" }

@@ -115,6 +115,8 @@ fn board() -> (rsemu::machine::Machine, Arc<X86>, Arc<AtaDisk>) {
     options.realize.media.insert("hd0", disk_image());
     // The second bay is empty, which is what most PCs of the period had.
     options.realize.media.insert("hd1", Vec::new());
+    // The CD-ROM drive with no disc in it, which is what no bytes bound means.
+    options.realize.media.insert("cdrom", Vec::new());
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     let mut machine = match build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options) {
         Ok(m) => m,
@@ -279,10 +281,25 @@ fn the_board_decodes_both_channels_and_leaves_the_floppy_where_it_was() {
         "the master did not answer at 0x1f7"
     );
 
-    // The secondary channel has nothing on its cable at all, so nothing drives
-    // the bus and the ISA pull-ups win.
-    assert_eq!(inb(&m, 0x177), 0xff, "an empty channel must read as ones");
-    assert_eq!(inb(&m, 0x376), 0xff);
+    // The secondary channel carries the board's CD-ROM on its master position,
+    // and a packet device's resting Status register is **zero** — DRDY is not
+    // a bit it has (ATA/ATAPI-6 §7.15.6.3). So a status read alone cannot tell
+    // this apart from an empty cable, which is exactly why the signature
+    // exists and why every driver uses it: 0xEB14 in the two cylinder bytes.
+    outb(&m, 0x176, 0xa0);
+    assert_eq!(inb(&m, 0x177), 0x00, "a packet device rests at zero");
+    assert_eq!(inb(&m, 0x376), 0x00);
+    assert_eq!(inb(&m, 0x174), 0x14, "the ATAPI signature, low");
+    assert_eq!(inb(&m, 0x175), 0xeb, "the ATAPI signature, high");
+
+    // The slave position on that cable really is empty, and the drive that is
+    // there answers for the one that is not — which is zero, not ones.
+    outb(&m, 0x176, 0xb0);
+    assert_eq!(
+        inb(&m, 0x177),
+        0x00,
+        "an empty position beside an occupied one"
+    );
 
     // And the floppy controller still answers on both sides of the hole its
     // window now has at 0x3f6.
