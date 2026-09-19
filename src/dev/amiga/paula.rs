@@ -248,6 +248,15 @@
 //! circuit's capacitor on an input that the same switch discharges. An
 //! unwired pin is an unpressed button. The proportional counters (`POT0DAT`,
 //! `POT1DAT`) read zero and `START` does nothing.
+//!
+//! A pin set as an output also **drives a wire of its own** — `potlx-out`,
+//! `potly-out`, `potrx-out`, `potry-out` ([`POT_OUT_PINS`]) — because
+//! something on the far end may need to see the level rather than only the
+//! chip reading it back. The CD32's joypad is the case: it latches its shift
+//! register when the machine pulls pin 5 low, and that is the whole of how
+//! `ReadJoyPort()` tells a pad from a joystick. A pin `POTGO` does not drive
+//! is released and the source says so by driving high, leaving the net's pull
+//! to decide.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -295,6 +304,21 @@ pub const INT6_PIN: &str = "int6";
 /// The four pot pins, in `POTGO` order from bit 8 up: port 0's pin 5 and pin 9,
 /// then port 1's. Each is an input a switch to ground pulls low.
 pub const POT_PINS: [&str; 4] = ["potlx", "potly", "potrx", "potry"];
+
+/// The same four pins as **outputs**, in the same order.
+///
+/// A game port's pin 5 and pin 9 are bidirectional: `POTGO`'s `OUT…` bit makes
+/// one an output and its `DAT…` bit is then the level Paula puts on it
+/// (hardware manual, Table 8-4 and chapter 8's pot description). Something on
+/// the far end may need to see that — a CD32 joypad latches its shift register
+/// when the machine pulls pin 5 low, which is exactly how `ReadJoyPort()`
+/// tells a pad from a joystick — so the level is published on a wire of its
+/// own rather than only being readable back through `POTGOR`.
+///
+/// A pin `POTGO` does not drive is **released**, and this source says so by
+/// driving high: the net's pull decides, which for a switch-to-ground port is
+/// a pull-up. That is the same open-collector shape [`POT_PINS`] reads.
+pub const POT_OUT_PINS: [&str; 4] = ["potlx-out", "potly-out", "potrx-out", "potry-out"];
 
 /// A tick no event is scheduled for.
 const NO_EVENT: u64 = u64::MAX;
@@ -1297,6 +1321,22 @@ impl State {
 
     // -- registers ----------------------------------------------------------
 
+    /// The levels `POTGO` is putting on the four pot pins, one bit each in
+    /// [`POT_OUT_PINS`] order. A pin it does not drive is released, which is a
+    /// one here.
+    fn pot_out(&self) -> u8 {
+        let mut bits = 0u8;
+        for pin in 0..4 {
+            let out = 1 << (9 + 2 * pin);
+            let dat = 1 << (8 + 2 * pin);
+            let high = self.potgo & out == 0 || self.potgo & dat != 0;
+            if high {
+                bits |= 1 << pin;
+            }
+        }
+        bits
+    }
+
     fn potgor(&self) -> u16 {
         let mut value = 0;
         for pin in 0..4 {
@@ -1324,6 +1364,8 @@ impl State {
 #[derive(Debug, Clone, Default)]
 struct Outputs {
     ipl: [Option<WireSource>; 3],
+    /// The four pot pins as outputs, in [`POT_OUT_PINS`] order.
+    pots: [Option<WireSource>; 4],
 }
 
 /// What the register block, the pins, the export and the device all hold.
@@ -1403,6 +1445,17 @@ impl Shared {
         }
     }
 
+    /// Drive the four pot pins from `POTGO`, holding no lock while they move.
+    fn refresh_pots(&self) {
+        let bits = self.state.lock().pot_out();
+        let out = self.out.lock().clone();
+        for (pin, src) in out.pots.iter().enumerate() {
+            if let Some(src) = src {
+                src.set(Level::from_bool(bits >> pin & 1 != 0));
+            }
+        }
+    }
+
     /// Hand finished bytes to the host, keeping what it refuses.
     fn flush_host(&self, bytes: Vec<u8>) {
         let mut backlog = self.backlog.lock();
@@ -1462,15 +1515,19 @@ impl Shared {
 
     /// Mutate the state at the current tick, then republish and re-drive.
     fn with_state<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let (r, moved) = {
+        let (r, moved, pots) = {
             let mut state = self.state.lock();
             let before = state.ipl();
+            let pots = state.pot_out();
             let r = f(&mut state);
             self.publish(&state);
-            (r, before != state.ipl())
+            (r, before != state.ipl(), pots != state.pot_out())
         };
         if moved {
             self.refresh();
+        }
+        if pots {
+            self.refresh_pots();
         }
         r
     }
@@ -2122,12 +2179,18 @@ impl Device for Paula {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        if let Some(pin) = POT_OUT_PINS.iter().position(|p| *p == port) {
+            self.shared.out.lock().pots[pin] = Some(source);
+            self.shared.refresh_pots();
+            return Ok(());
+        }
         let Some(bit) = IPL_PINS.iter().position(|p| *p == port) else {
             return Err(Error::Config {
                 at: port.to_string(),
                 message: String::from(
-                    "Paula drives three pins, `ipl0`, `ipl1` and `ipl2`: the encoded \
-                     interrupt level",
+                    "Paula drives three pins, `ipl0`, `ipl1` and `ipl2` -- the encoded \
+                     interrupt level -- and the four pot pins as outputs, `potlx-out`, \
+                     `potly-out`, `potrx-out` and `potry-out`",
                 ),
             });
         };
@@ -2138,6 +2201,7 @@ impl Device for Paula {
 
     fn announce(&self, _port: &str) {
         self.shared.refresh();
+        self.shared.refresh_pots();
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
@@ -2268,6 +2332,9 @@ pub fn schema() -> ClassSchema {
         schema = schema.port(pin, PortDir::In);
     }
     for pin in IPL_PINS {
+        schema = schema.port(pin, PortDir::Out);
+    }
+    for pin in POT_OUT_PINS {
         schema = schema.port(pin, PortDir::Out);
     }
     schema

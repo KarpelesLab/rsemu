@@ -2769,6 +2769,17 @@ dev-amiga-akiko = ["dev-amiga"]
 # dependencies.
 dev-amiga-cdrom = ["dev-amiga", "dev-medium"]
 
+# The CD32 joypad (src/dev/amiga/cd32pad.rs): `amiga.cd32-pad`, the eleven
+# button controller on a nine-pin port. Held as an ordinary two-button
+# joystick it is one; when the machine pulls pin 5 low the pad's shift
+# register latches its buttons and clocks them out of pin 9, one per rising
+# edge on pin 6, which is how `ReadJoyPort()` in `lowlevel.library` tells a
+# pad from a joystick. Host buttons arrive through the record/replay seam.
+# Written from the *Amiga CD32 Developer Notes* and the *Amiga Hardware
+# Reference Manual* (3rd ed.) chapter 8 and Appendix A; no emulator source
+# consulted. Implies `dev-amiga`. `no_std + alloc`, no dependencies.
+dev-amiga-cd32pad = ["dev-amiga"]
+
 # Gayle (src/dev/amiga/gayle.rs), the A600's gate array: `amiga.gayle`, the
 # IDE port as the A600 wires it -- two chip selects decoded on A12 at $DA0000,
 # the drive's three address lines on A2-A4, and the data bus byte-swapped, so

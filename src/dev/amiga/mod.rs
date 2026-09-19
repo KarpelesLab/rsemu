@@ -10,6 +10,7 @@
 //! | `gayle` | `dev-amiga-gayle`: the A600's gate array — the IDE port's chip selects and byte swap in front of an `ata.disk`, the card and IDE interrupt registers at `$DA8000`, the identification register, and the overlay it clears on the first CIA write |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
 //! | `akiko` | `dev-amiga-akiko`: Akiko — the CD32's gate array: the chunky-to-planar corner turn, the CD-ROM controller and the serial EEPROM's two wires, at `$B80000` |
+//! | `cd32pad` | `dev-amiga-cd32pad`: the CD32's eleven-button controller — four switches to ground, two buttons, and a shift register the machine clocks for the other seven |
 //! | `cdrom` | `dev-amiga-cdrom`: the CD32's CD-ROM drive — a disc of 2048-byte user data or 2352-byte frames, and a one-track table of contents |
 //! | `agnus` | `dev-amiga-agnus`: Agnus — the beam counters and sync, `DMACON`, the copper, the blitter, and every DMA transfer |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
@@ -73,6 +74,9 @@ pub mod agnus;
 #[cfg(feature = "dev-amiga-akiko")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-akiko")))]
 pub mod akiko;
+#[cfg(feature = "dev-amiga-cd32pad")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-cd32pad")))]
+pub mod cd32pad;
 #[cfg(feature = "dev-amiga-cdrom")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-cdrom")))]
 pub mod cdrom;
@@ -119,6 +123,8 @@ use crate::core::error::Result;
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     #[cfg(feature = "dev-amiga-akiko")]
     akiko::register(registry)?;
+    #[cfg(feature = "dev-amiga-cd32pad")]
+    cd32pad::register(registry)?;
     #[cfg(feature = "dev-amiga-cdrom")]
     cdrom::register(registry)?;
     cia_decode::register(registry)?;
@@ -151,6 +157,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     #[cfg(feature = "dev-amiga-akiko")]
     akiko::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-cd32pad")]
+    cd32pad::bind(bindings)?;
     #[cfg(feature = "dev-amiga-cdrom")]
     cdrom::bind(bindings)?;
     cia_decode::bind(bindings)?;
@@ -182,6 +190,8 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     let mut schemas = alloc::vec![cia_decode::schema(), custom::schema(), gary::schema()];
     #[cfg(feature = "dev-amiga-akiko")]
     schemas.push(akiko::schema());
+    #[cfg(feature = "dev-amiga-cd32pad")]
+    schemas.push(cd32pad::schema());
     #[cfg(feature = "dev-amiga-cdrom")]
     schemas.push(cdrom::schema());
     #[cfg(feature = "dev-amiga-gayle")]

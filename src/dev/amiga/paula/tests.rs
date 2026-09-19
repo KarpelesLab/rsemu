@@ -1199,3 +1199,59 @@ fn the_class_needs_its_register_space_and_says_what_it_has() {
     assert!(p.export(ExportId::PAULA).is_some());
     assert!(p.export(ExportId::CUSTOM_BUS).is_none());
 }
+
+/// `POTGO`'s `OUT…` bits make a pot pin an output, and what it then drives is
+/// published on a wire as well as read back through `POTGOR`.
+///
+/// A CD32 joypad is the reason: it latches its shift register when the machine
+/// pulls pin 5 low, and pin 5 is `potrx`. A released pin drives high, so the
+/// net's pull decides — which for a port whose buttons are switches to ground
+/// is a pull-up.
+#[test]
+fn a_pot_pin_set_as_an_output_drives_its_level_onto_a_wire() {
+    let rig = Rig::new();
+    let watch = Arc::new(IplWatch::new());
+    for (bit, name) in POT_OUT_PINS.iter().enumerate() {
+        let src = WireId::new(300 + bit as u64);
+        let wire = Wire::builder()
+            .source(src)
+            .sink(Arc::clone(&watch) as Arc<dyn WireSink>, bit as u32)
+            .build_shared();
+        rig.paula
+            .connect(name, WireSource::new(wire, src))
+            .expect("a pot output pin");
+    }
+    // Connecting drove every pin once: all four released, so all four high.
+    assert_eq!(*watch.bits.lock(), 0b1111);
+
+    // `OUTRX` with `DATRX` low: pin 5 of port 1 goes low and the other three
+    // stay where they were. Bit 12 is `OUTRX`, bit 13 `DATRX` — the pins are
+    // `POTGO` bits 8 up, two apart, in `POT_PINS` order.
+    let _ = watch.take();
+    rig.poke(POTGO, 1 << 13);
+    assert_eq!(*watch.bits.lock(), 0b1011, "potrx alone went low");
+    assert_eq!(rig.peek(POTGOR) & (1 << 12), 0, "and POTGOR agrees");
+
+    // Driving it high again, and then releasing it, both leave it high.
+    rig.poke(POTGO, (1 << 13) | (1 << 12));
+    assert_eq!(*watch.bits.lock(), 0b1111);
+    rig.poke(POTGO, 0);
+    assert_eq!(*watch.bits.lock(), 0b1111);
+
+    // All four OUT bits (9, 11, 13, 15) with every DAT bit low.
+    rig.poke(POTGO, 0xaa00);
+    assert_eq!(*watch.bits.lock(), 0b0000, "every pin driven low");
+
+    assert!(
+        rig.paula
+            .connect(
+                "potrx",
+                WireSource::new(
+                    Wire::builder().source(WireId::new(399)).build_shared(),
+                    WireId::new(399)
+                )
+            )
+            .is_err(),
+        "the input pin is not an output"
+    );
+}
