@@ -90,14 +90,42 @@ pub enum Revision {
         /// How much chip RAM the part's address lines reach.
         reach: u64,
     },
+    /// **Alice**, the 8374: the AA chip set's Agnus ([`super::aga`]).
+    ///
+    /// Everything an Enhanced Chip Set part does and the AA additions on top,
+    /// so [`is_ecs`](Self::is_ecs) is true of it. Her reach is not a choice:
+    /// the AA specification's §3 preamble prints "PTL,PTH=20 bit Pointer that
+    /// addresses DMA data … (old chips- 18 bits)", and a pair that carries
+    /// address bits 1–20 reaches 2 MiB.
+    Aga,
 }
 
 impl Revision {
-    /// Whether this is an Enhanced Chip Set part.
+    /// Whether this part has the Enhanced Chip Set's registers and behaviour.
+    /// True of Alice, who has all of them and more.
     #[must_use]
     #[inline]
     pub const fn is_ecs(self) -> bool {
-        matches!(self, Revision::Ecs { .. })
+        matches!(self, Revision::Ecs { .. } | Revision::Aga)
+    }
+
+    /// Whether this is Alice.
+    #[must_use]
+    #[inline]
+    pub const fn is_aga(self) -> bool {
+        matches!(self, Revision::Aga)
+    }
+
+    /// How much chip RAM this part's address lines reach, or [`u64::MAX`] for
+    /// an original part, which drives as many bits as the board gives it.
+    #[must_use]
+    #[inline]
+    pub const fn reach(self) -> u64 {
+        match self {
+            Revision::Ocs => u64::MAX,
+            Revision::Ecs { reach } => reach,
+            Revision::Aga => 2 * MIB,
+        }
     }
 }
 
@@ -108,11 +136,23 @@ pub const MIB: u64 = 1 << 20;
 ///
 /// Appendix C, *Determining Chip Revisions*, for the original parts and the
 /// 8372A; Commodore's AA register notes for the later row (see the module
-/// documentation for why the 8375 is that row).
+/// documentation for why the 8375 is that row). Alice's is the *Specification
+/// for the Advanced Amiga (AA) Chip Set* itself (§4, `VPOSR`): "8374(alice)
+/// = 22 PAL, 32 NTSC".
+///
+/// **The two tables collide on `$22` for PAL**, and it is left as it stands.
+/// That specification's own copy of the list reads "8372(fat-hr) (agnushr),
+/// rev. 5 = 21 PAL, 31 NTSC", one less than the `$22` the 8375 answers here —
+/// so one of the two readings of the 8375's row is wrong, and which is not
+/// settled by any document at hand. Moving the 8375 would move four real-ROM
+/// goldens on a guess; Alice takes the value her own specification gives her,
+/// and `LISAID` (`$F8`) is what tells an AA board from an ECS one anyway.
 #[must_use]
 pub const fn agnus_id(rev: Revision, std: Standard) -> u8 {
     match (rev, std) {
         (Revision::Ocs, _) => std.agnus_id(),
+        (Revision::Aga, Standard::Pal) => 0x22,
+        (Revision::Aga, Standard::Ntsc) => 0x32,
         (Revision::Ecs { reach }, Standard::Pal) if reach > MIB => 0x22,
         (Revision::Ecs { reach }, Standard::Ntsc) if reach > MIB => 0x31,
         (Revision::Ecs { .. }, Standard::Pal) => 0x20,

@@ -55,9 +55,16 @@
 //!   is the part's business. An 8362 or an 8373 ignores all five.
 //!   `CLXCON2`'s own page in that specification misprints its address as
 //!   `$10C`, which is `BPLCON4`'s; the register list has `$10e` and that is
-//!   what is declared here. The AA rows **Alice** answers — the bitplane 7 and
-//!   8 pointers, and the AA beam registers — are not here yet; they belong
-//!   with the part that acts on them.
+//!   what is declared here.
+//!
+//! * **The AA rows Alice answers.** The same list adds the **bitplane 7 and 8
+//!   pointers** — `BPL7PTH` `$0F8`, `BPL7PTL` `$0FA`, `BPL8PTH` `$0FC`,
+//!   `BPL8PTL` `$0FE` (`W`, `+`, `A`; the list prints `P` in the `rev` column
+//!   beside `0F8`…`0FE` on the `BPLxPTH`/`BPLxPTL` pages). They carry
+//!   [`Access::AGA`] and are declared unconditionally, for the reason above;
+//!   an 8370, 8371, 8372A or 8375 ignores them. Every other Alice row —
+//!   `FMODE`, the `DIWHIGH` bits she reads, `BPL1MOD`/`BPL2MOD` under
+//!   `BSCAN2` — is at an address the table already carries.
 //!
 //! # `$1FE`, `SPRHDAT`, and the copy this was checked against
 //!
@@ -466,6 +473,10 @@ static DECLARED: &[Reg] = &[
     reg(0x0f2, "BPL5PTL",  &[A],       &[W, PAIR]),
     reg(0x0f4, "BPL6PTH",  &[A],       &[W, PAIR]),
     reg(0x0f6, "BPL6PTL",  &[A],       &[W, PAIR]),
+    reg(0x0f8, "BPL7PTH",  &[A],       &[W, PAIR, AGA]),
+    reg(0x0fa, "BPL7PTL",  &[A],       &[W, PAIR, AGA]),
+    reg(0x0fc, "BPL8PTH",  &[A],       &[W, PAIR, AGA]),
+    reg(0x0fe, "BPL8PTL",  &[A],       &[W, PAIR, AGA]),
     reg(0x100, "BPLCON0",  &[A, D],    &[W, ECS]),
     reg(0x102, "BPLCON1",  &[D],       &[W]),
     reg(0x104, "BPLCON2",  &[D],       &[W, ECS]),

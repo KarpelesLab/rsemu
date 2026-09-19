@@ -1,8 +1,9 @@
 //! Agnus: the beam counters, the copper, the blitter and chip-RAM DMA.
 //!
 //! One class, `amiga.agnus`, for the part an A500 calls the 8370 (NTSC) or
-//! 8371 (PAL) "Fat Agnus" and, with `revision = "ecs"`, for the Enhanced Chip
-//! Set parts that replaced it ([`ecs`]). It is the chip every other chip's timing hangs off:
+//! 8371 (PAL) "Fat Agnus", with `revision = "ecs"` for the Enhanced Chip Set
+//! parts that replaced it ([`ecs`]), and with `revision = "aga"` for **Alice**,
+//! the AA chip set's 8374 ([`aga`]). It is the chip every other chip's timing hangs off:
 //! the video beam's position is its counter, the vertical and horizontal sync a
 //! board feeds to the CIAs' `TOD` pins come out of it, the copper runs against
 //! that counter, and every direct memory access into chip RAM is scheduled by
@@ -82,6 +83,13 @@
 //!   switching; `DIWHIGH`; the SuperHires fetch; the copper's wider `COPCON`
 //!   rule; and a [`Raster`](denise::Raster) handed to Denise every field so
 //!   her picture takes the programmed beam's shape.
+//! * **Alice** ([`aga`]), with `revision = "aga"`: the 8374, everything an
+//!   8375 does and the AA additions on top — eight bitplanes with `BPL7PT` and
+//!   `BPL8PT`, `FMODE`'s 16/32/64-bit fetch widths for bitplanes and sprites,
+//!   `BSCAN2` and `SSCAN2` scan doubling, `DDFSTRT`/`DDFSTOP`'s extra `H2`
+//!   bit, 2 MiB of chip RAM, and `VPOSR`'s `$22`/`$32`. The blitter and the
+//!   copper are unchanged; [`aga`]'s own documentation says how that was
+//!   established.
 //!
 //! # What is register-only
 //!
@@ -125,6 +133,7 @@
 //! source of any licence was consulted** — every Amiga emulator is GPL, and
 //! AROS is MPL-derived (`ROADMAP.md` §1).
 
+pub mod aga;
 pub mod beam;
 pub mod blitter;
 pub mod copper;
@@ -171,7 +180,7 @@ use super::regs::{ChipId, Reg};
 pub const CLASS_NAME: &str = "amiga.agnus";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 
 /// The vertical sync output.
 pub const VSYNC_PIN: &str = "vsync";
@@ -240,7 +249,7 @@ const DMACON: u16 = 0x096;
 const AUD0LCH: u16 = 0x0a0;
 const AUD3LCL: u16 = 0x0d2;
 const BPL1PTH: u16 = 0x0e0;
-const BPL6PTL: u16 = 0x0f6;
+const BPL8PTL: u16 = 0x0fe;
 const BPLCON0: u16 = 0x100;
 const BPL1MOD: u16 = 0x108;
 const BPL2MOD: u16 = 0x10a;
@@ -252,6 +261,7 @@ const HTOTAL: u16 = 0x1c0;
 const VBSTOP: u16 = 0x1ce;
 const BEAMCON0: u16 = 0x1dc;
 const DIWHIGH: u16 = 0x1e4;
+const FMODE: u16 = 0x1fc;
 
 /// How many ECS beam registers are held: `HTOTAL`…`VBSTOP` and
 /// `BEAMCON0`…`DIWHIGH`.
@@ -282,7 +292,7 @@ struct State {
     diwstop: u16,
     ddfstrt: u16,
     ddfstop: u16,
-    bplpt: [u32; 6],
+    bplpt: [u32; 8],
     bplmod: [u16; 2],
     sprpt: [u32; 8],
     sprpos: [u16; 8],
@@ -291,6 +301,9 @@ struct State {
     sprhdat: u16,
     copins: u16,
     ecs: [u16; ECS_REGS],
+    /// `FMODE` (`$1FC`): the fetch widths and the two scan-double enables.
+    /// Lisa's register as well as Alice's, and held by both ([`aga`]).
+    fmode: u16,
     /// `DIWHIGH` was written after the last `DIWSTRT` or `DIWSTOP`, so its top
     /// bits are in force. An ECS part only.
     diwhigh_on: bool,
@@ -329,13 +342,22 @@ enum Outward {
         vpos: u16,
         clocks: u16,
         start: u16,
-        planes: [Vec<u16>; 6],
+        planes: [Vec<u16>; 8],
     },
     /// A new field, for the video chip, and — from an ECS part — the raster
     /// it will be shown on.
     Field {
         lof: bool,
         raster: Option<denise::Raster>,
+    },
+    /// One sprite data transfer of the width `FMODE` selects, for the video
+    /// chip's [`Video::sprite_dma`]. Queued in the outbox beside the
+    /// [`Outward::Write`]s of the same DMA slot so the `SPRxPOS`/`SPRxCTL`
+    /// writes that disarm a sprite cannot overtake the data that re-arms it.
+    SpriteData {
+        sprite: usize,
+        b_buffer: bool,
+        bits: u64,
     },
     /// Paula's disk and audio slots on this line.
     Slot { at: u64 },
@@ -358,7 +380,7 @@ impl State {
             diwstop: 0,
             ddfstrt: 0,
             ddfstop: 0,
-            bplpt: [0; 6],
+            bplpt: [0; 8],
             bplmod: [0; 2],
             sprpt: [0; 8],
             sprpos: [0; 8],
@@ -367,6 +389,7 @@ impl State {
             sprhdat: 0,
             copins: 0,
             ecs: [0; ECS_REGS],
+            fmode: 0,
             diwhigh_on: false,
             rev: Revision::Ocs,
             sprite: [SpriteDma::Idle; 8],
@@ -746,10 +769,15 @@ impl State {
                     dma.set_audio_location(ch, within == 0, value);
                 }
             }
-            BPL1PTH..=BPL6PTL => {
+            // Planes 7 and 8 are Alice's: "BPL7PTH 0F8 … BPL8PTL 0FE" with
+            // `P` in the specification's `rev` column (§3). An older part has
+            // no register at those four addresses and nothing to hold.
+            BPL1PTH..=BPL8PTL => {
                 let plane = usize::from((offset - BPL1PTH) / 4);
-                let high = (offset - BPL1PTH).is_multiple_of(4);
-                self.bplpt[plane] = merge_half(self.bplpt[plane], high, value);
+                if plane < 6 || self.rev.is_aga() {
+                    let high = (offset - BPL1PTH).is_multiple_of(4);
+                    self.bplpt[plane] = merge_half(self.bplpt[plane], high, value);
+                }
             }
             BPLCON0 => self.bplcon0 = value,
             BPL1MOD => self.bplmod[0] = value,
@@ -769,6 +797,10 @@ impl State {
                 }
             }
             HTOTAL..=VBSTOP => self.ecs[usize::from((offset - HTOTAL) / 2)] = value,
+            // `FMODE p 1FC W A D` (§3): Alice's register and Lisa's both.
+            // Held whatever the part, so a snapshot carries it; only an AA
+            // part acts on it.
+            FMODE => self.fmode = value,
             BEAMCON0..=DIWHIGH => {
                 self.ecs[8 + usize::from((offset - BEAMCON0) / 2)] = value;
                 if offset == DIWHIGH {
@@ -839,6 +871,7 @@ impl State {
             self.refptr,
             self.sprhdat,
             self.copins,
+            self.fmode,
         ] {
             w.write_u16(v)?;
         }
@@ -931,6 +964,7 @@ impl State {
             &mut self.refptr,
             &mut self.sprhdat,
             &mut self.copins,
+            &mut self.fmode,
         ] {
             *slot = r.read_u16()?;
         }
@@ -1148,11 +1182,9 @@ impl Shared {
                             clocks: *clocks,
                             fetch: denise::Fetch {
                                 start: *start,
-                                // Six planes are all an OCS or ECS Agnus fetches;
-                                // bitplanes 7 and 8 are Alice's, and empty here.
-                                planes: core::array::from_fn(|i| {
-                                    planes.get(i).map_or(&[][..], Vec::as_slice)
-                                }),
+                                // Eight streams. Planes 7 and 8 are Alice's,
+                                // and an OCS or ECS part leaves them empty.
+                                planes: core::array::from_fn(|i| planes[i].as_slice()),
                             },
                         }),
                         Outward::Field { lof, raster } => {
@@ -1186,18 +1218,36 @@ impl Shared {
                 }
             }
         }
-        if actions.iter().any(|a| matches!(a, Outward::Write { .. })) {
+        if actions
+            .iter()
+            .any(|a| matches!(a, Outward::Write { .. } | Outward::SpriteData { .. }))
+        {
             let bus = self.bus.lock().clone();
-            if let Some(bus) = bus {
-                for action in actions {
-                    if let Outward::Write {
+            let video = self.video.lock().clone();
+            // In outbox order, because a wide sprite fetch and the
+            // `SPRxPOS`/`SPRxCTL` writes of the same slot are one sequence:
+            // the `CTL` write disarms the sprite and the data re-arms it.
+            for action in actions {
+                match action {
+                    Outward::Write {
                         offset,
                         value,
                         from,
-                    } = action
-                    {
-                        bus.write(offset, value, from);
+                    } => {
+                        if let Some(bus) = &bus {
+                            bus.write(offset, value, from);
+                        }
                     }
+                    Outward::SpriteData {
+                        sprite,
+                        b_buffer,
+                        bits,
+                    } => {
+                        if let Some(video) = &video {
+                            video.sprite_dma(sprite, b_buffer, bits);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1335,7 +1385,7 @@ impl Agnus {
         let paula_path = r.optional_link("paula")?.map(|l| l.as_str().to_string());
         let video_path = r.optional_link("video")?.map(|l| l.as_str().to_string());
         let standard = r.or_enum("standard", "pal", &["pal", "ntsc"])?;
-        let revision = r.or_enum("revision", "ocs", &["ocs", "ecs"])?;
+        let revision = r.or_enum("revision", "ocs", &["ocs", "ecs", "aga"])?;
         let reach = if r.props().contains("reach") {
             Some(r.require_size("reach")?)
         } else {
@@ -1345,10 +1395,13 @@ impl Agnus {
         let std = Standard::parse(standard).expect("or_enum checked it");
         let rev = match (revision, reach) {
             ("ocs", None) => Revision::Ocs,
-            ("ocs", Some(_)) => {
+            ("aga", None) => Revision::Aga,
+            ("aga", Some(reach)) if reach == 2 * ecs::MIB => Revision::Aga,
+            ("ocs" | "aga", Some(_)) => {
                 return Err(Error::Property(String::from(
                     "amiga.agnus: `reach` chooses between the ECS parts, 8372A (1M) and 8375 (2M); \
-                     an original part addresses the chip RAM it is given",
+                     an original part addresses the chip RAM it is given, and Alice's pointers are \
+                     twenty bits, which is 2M and not a choice",
                 )));
             }
             (_, None) => Revision::Ecs { reach: ecs::MIB },
@@ -1453,14 +1506,13 @@ impl Agnus {
     ///
     /// If the region cannot be mapped, or is larger than an ECS part reaches.
     pub fn attach_ram(&self, region: &crate::core::space::RegionRef) -> Result<()> {
-        if let Revision::Ecs { reach } = self.shared.rev
-            && region.len() > reach
-        {
+        let reach = self.shared.rev.reach();
+        if region.len() > reach {
             return Err(Error::Config {
                 at: String::from(CLASS_NAME),
                 message: format!(
-                    "{} bytes of chip RAM is more than this ECS Agnus reaches ({reach}); \
-                     `reach = 2M` is the 8375",
+                    "{} bytes of chip RAM is more than this Agnus reaches ({reach}); \
+                     `reach = 2M` is the 8375, and Alice reaches 2M",
                     region.len()
                 ),
             });
@@ -1758,13 +1810,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "revision",
             kind: ValueKind::Str,
             required: false,
-            summary: "\"ocs\" (the default: an 8370/8371) or \"ecs\" (an Enhanced Chip Set part: BEAMCON0, the programmable beam, SuperHires fetch, DIWHIGH)",
+            summary: "\"ocs\" (the default: an 8370/8371), \"ecs\" (an Enhanced Chip Set part: BEAMCON0, the programmable beam, SuperHires fetch, DIWHIGH) or \"aga\" (Alice, the 8374: eight bitplanes, FMODE's fetch widths, scan doubling, 2 MiB)",
         },
         PropertySpec {
             name: "reach",
             kind: ValueKind::Size,
             required: false,
-            summary: "an ECS part's chip-RAM reach: 1M (the default, an 8372A) or 2M (an 8375)",
+            summary: "an ECS part's chip-RAM reach: 1M (the default, an 8372A) or 2M (an 8375). Alice reaches 2M and takes no other value",
         },
         PropertySpec {
             name: "paula",
@@ -1807,7 +1859,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("custom", ValueKind::Link))
         .prop(PropSchema::new("ram", ValueKind::Link))
         .prop(PropSchema::new("standard", ValueKind::Str).values(&["pal", "ntsc"]))
-        .prop(PropSchema::new("revision", ValueKind::Str).values(&["ocs", "ecs"]))
+        .prop(PropSchema::new("revision", ValueKind::Str).values(&["ocs", "ecs", "aga"]))
         .prop(PropSchema::new("reach", ValueKind::Size))
         .prop(PropSchema::new("paula", ValueKind::Link))
         .prop(PropSchema::new("video", ValueKind::Link))

@@ -747,14 +747,23 @@ struct Chipset {
 
 impl Chipset {
     fn pal() -> Chipset {
-        let agnus = Agnus::bare(Standard::Pal);
+        Chipset::part(Revision::Ocs, denise::Revision::Ocs, CHIP)
+    }
+
+    /// Alice and Lisa on one bus, with `ram` bytes of chip RAM.
+    fn aga(ram: u64) -> Chipset {
+        Chipset::part(Revision::Aga, denise::Revision::Aga, ram)
+    }
+
+    fn part(rev: Revision, dev: denise::Revision, len: u64) -> Chipset {
+        let agnus = Agnus::part(rev, Standard::Pal);
         let custom = Custom::new(&Props::new()).unwrap();
         agnus.attach_bus(custom.bus()).unwrap();
-        let ram = Arc::new(RamStore::new(CHIP));
+        let ram = Arc::new(RamStore::new(len));
         let region: RegionRef = Arc::new(Region::ram("chip", Arc::clone(&ram)));
         agnus.attach_ram(&region).unwrap();
 
-        let video = Arc::new(Video::new(denise::Standard::Pal));
+        let video = Arc::new(Video::with_revision(denise::Standard::Pal, dev));
         custom
             .bus()
             .attach(Arc::clone(&video) as Arc<dyn CustomChip>)
@@ -1347,11 +1356,32 @@ fn the_reach_is_the_parts_and_a_bigger_ram_is_refused() {
     );
     assert!(Agnus::new(&props("ecs").with("reach", Value::Size(4 * ecs::MIB))).is_err());
     assert!(Agnus::new(&props("ocs").with("reach", Value::Size(ecs::MIB))).is_err());
-    assert!(Agnus::new(&props("aga")).is_err());
+
+    // Alice's pointers are twenty bits, so her reach is 2 MiB and is not a
+    // property: the value may be written, and only that value.
+    assert_eq!(Agnus::new(&props("aga")).unwrap().revision(), Revision::Aga);
+    assert_eq!(
+        Agnus::new(&props("aga").with("reach", Value::Size(2 * ecs::MIB)))
+            .unwrap()
+            .revision(),
+        Revision::Aga
+    );
+    assert!(Agnus::new(&props("aga").with("reach", Value::Size(ecs::MIB))).is_err());
+    assert_eq!(Revision::Aga.reach(), 2 * ecs::MIB);
 
     let agnus = Agnus::part(Revision::Ecs { reach: ecs::MIB }, Standard::Pal);
     let ram: RegionRef = Arc::new(Region::ram("chip", Arc::new(RamStore::new(2 * ecs::MIB))));
     assert!(agnus.attach_ram(&ram).is_err(), "2 MiB on an 8372A");
+    // Alice takes it.
+    let alice = Agnus::part(Revision::Aga, Standard::Pal);
+    assert!(alice.attach_ram(&ram).is_ok());
+    let four: RegionRef = Arc::new(Region::ram("chip", Arc::new(RamStore::new(4 * ecs::MIB))));
+    assert!(
+        Agnus::part(Revision::Aga, Standard::Pal)
+            .attach_ram(&four)
+            .is_err(),
+        "4 MiB is past twenty bits of pointer"
+    );
 }
 
 #[test]
@@ -1442,4 +1472,436 @@ fn an_ecs_part_hands_denise_the_raster_it_programmed() {
     );
     assert_eq!(video.geometry(), (2 * 180, 480), "high-resolution columns");
     assert_eq!(video.field_clocks(), 525 * 114);
+}
+
+// ---------------------------------------------------------------------------
+// Alice: the AA chip set's Agnus
+//
+// Every expectation is the *Specification for the Advanced Amiga (AA) Chip
+// Set*'s (Commodore-Amiga), cited by section. `aga`'s own unit tests cover the
+// arithmetic; these drive the whole chip, and the ones with a picture drive it
+// into a real Lisa.
+// ---------------------------------------------------------------------------
+
+/// `FMODE`, Alice's and Lisa's both (§3: "FMODE p 1FC W A D").
+const E_FMODE: u16 = 0x1fc;
+const BPL7PTH: u16 = 0x0f8;
+const BPL8PTH: u16 = 0x0fc;
+const SPR0PTR: u16 = 0x120;
+/// `BPLCON3`, whose `BANK` and `PF2OF` the colour-table setup below writes.
+const BPLCON3: u16 = 0x106;
+/// `BPLCON3`'s reset `PF2OF = 011` (§4).
+const PF2OF: u16 = 0b011 << 10;
+
+fn alice(std: Standard) -> Board {
+    Board::on(Agnus::part(Revision::Aga, std))
+}
+
+#[test]
+fn alice_identifies_herself_in_vposr() {
+    // §4, VPOSR: "8374(alice) = 22 PAL, 32 NTSC".
+    assert_eq!(alice(Standard::Pal).peek(VPOSR), 0x8000 | 0x22 << 8);
+    assert_eq!(alice(Standard::Ntsc).peek(VPOSR), 0x8000 | 0x32 << 8);
+    // And she has everything an ECS part has: V10 and V9 beside V8.
+    let b = alice(Standard::Pal);
+    b.poke(VPOSW, 0x0007);
+    assert_eq!(b.peek(VPOSR) & 0x0007, 0x0007, "V10-V8 all written");
+}
+
+#[test]
+fn the_bitplane_seven_and_eight_pointers_are_alices_alone() {
+    // §3: BPL7PTH $0F8 … BPL8PTL $0FE, with `P` in the rev column. An older
+    // part has no register there, so the write is held nowhere.
+    let aga = alice(Standard::Pal);
+    let ecs = ecs_board(Standard::Pal, 2 * ecs::MIB);
+    for b in [&aga, &ecs] {
+        b.poke(BPL7PTH, 0x0002);
+        b.poke(BPL7PTH + 2, 0x0000);
+        b.poke(BPL8PTH, 0x0003);
+        b.poke(BPL8PTH + 2, 0x0000);
+    }
+    assert_eq!(
+        aga.agnus.shared.state.lock().bplpt[6..],
+        [0x2_0000, 0x3_0000],
+        "Alice holds them"
+    );
+    assert_eq!(
+        ecs.agnus.shared.state.lock().bplpt[6..],
+        [0, 0],
+        "an 8375 does not"
+    );
+}
+
+#[test]
+fn eight_planes_are_fetched_with_their_own_pointers_and_the_two_modulos() {
+    let c = Chipset::aga(CHIP);
+    // One word a line for each of eight planes, each plane's data marked with
+    // its own number so the streams cannot be confused.
+    for p in 0..8u32 {
+        let base = 0x1_0000 + 0x1000 * p;
+        c.store(base, &[0x1000 + p as u16, 0x2000 + p as u16]);
+        c.poke(BPL1PTH + 4 * p as u16, (base >> 16) as u16);
+        c.poke(BPL1PTH + 4 * p as u16 + 2, base as u16);
+    }
+    c.poke(DIWSTRT, 0x2c81);
+    c.poke(DIWSTOP, 0x2cc1);
+    c.poke(DDFSTRT, 0x38);
+    c.poke(DDFSTOP, 0x38); // one eight-count block: one word a line
+    c.poke(BPL1MOD, 0u16.wrapping_sub(2)); // odd planes stay put
+    c.poke(BPL2MOD, 0); // even planes walk forward
+    // BPU = 8: BPU2-BPU0 are zero and BPU3 is bit 4 (§4, BPLCON0).
+    c.poke(BPLCON0, 1 << 4);
+    c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::BITPLANE.0);
+    c.run(PAL_FIELD);
+
+    let st = c.agnus.shared.state.lock();
+    for p in 0..8usize {
+        let base = 0x1_0000 + 0x1000 * p as u32;
+        // 256 lines of one word. An odd plane (1, 3, 5, 7 — index 0, 2, 4, 6)
+        // adds BPL1MOD = −2 after each two-byte word and comes back to where
+        // it started; an even one adds nothing and has walked 512 bytes.
+        let want = if p % 2 == 0 { base } else { base + 2 * 256 };
+        assert_eq!(st.bplpt[p], want, "plane {}", p + 1);
+    }
+}
+
+#[test]
+fn bpu_eight_puts_both_new_planes_in_the_picture() {
+    let c = Chipset::aga(CHIP);
+    // Planes 1-7 all zero, plane 8 all ones: colour 128 everywhere in the
+    // window, which is the 256-entry table's second half (§2, *Bitplanes*).
+    for p in 0..8u32 {
+        let base = 0x1_0000 + 0x2000 * p;
+        c.store(base, &vec![if p == 7 { 0xffff } else { 0 }; 32 * 256]);
+        c.poke(BPL1PTH + 4 * p as u16, (base >> 16) as u16);
+        c.poke(BPL1PTH + 4 * p as u16 + 2, base as u16);
+    }
+    c.poke(DIWSTRT, 0x2c81);
+    c.poke(DIWSTOP, 0x2cc1);
+    c.poke(DDFSTRT, 0x38);
+    c.poke(DDFSTOP, 0xd0);
+    c.poke(BPL1MOD, 0);
+    c.poke(BPL2MOD, 0);
+    // COLOR00 black, and colour 128 — bank 4, entry 0 — red.
+    c.poke(BPLCON3, PF2OF);
+    c.poke(COLOR00, 0x0000);
+    c.poke(BPLCON3, 4 << 13 | PF2OF);
+    c.poke(COLOR00, 0x0f00);
+    c.poke(BPLCON3, PF2OF);
+    c.poke(BPLCON0, 1 << 4);
+    c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::BITPLANE.0);
+    c.run(PAL_FIELD);
+
+    // Lisa's picture is 35 ns quarters: the window's first pixel is at
+    // (0x81 − 64) × 4.
+    let mut row = vec![0u32; 1600];
+    c.video.read_row_rgb(2 * (0x2c - 0x1d), &mut row);
+    let at = (0x81 - 64) * 4;
+    assert_eq!(row[at - 1], 0x0000_0000, "the border is colour 0");
+    assert!(
+        row[at..at + 320 * 4].iter().all(|&p| p == 0x00ff_0000),
+        "plane 8 alone selects colour 128"
+    );
+}
+
+#[test]
+fn each_fmode_width_moves_that_many_words_a_transfer() {
+    // §4's FMODE table, and `aga`'s rounding inference: the word count a line
+    // is the window's, rounded up to a whole transfer.
+    for (fmode, f) in [
+        (0u16, 1u16),
+        (aga::BPL32, 2),
+        (aga::BPAGEM, 2),
+        (aga::BPAGEM | aga::BPL32, 4),
+    ] {
+        let b = alice(Standard::Pal);
+        b.poke(E_FMODE, fmode);
+        b.poke(DDFSTRT, 0x38);
+        b.poke(DDFSTOP, 0xd0); // twenty eight-count blocks: 20 words in LORES
+        let st = b.agnus.shared.state.lock();
+        assert_eq!(st.fetch_words(), f, "FMODE ${fmode:04x}");
+        let (_, words) = st.fetch_window().expect("a window");
+        assert_eq!(words, 20u16.div_ceil(f) * f, "FMODE ${fmode:04x}");
+        assert_eq!(words % f, 0, "a transfer is indivisible");
+    }
+    // A window that does not divide: 21 blocks with a four-word transfer is
+    // 24 words, six transfers.
+    let b = alice(Standard::Pal);
+    b.poke(E_FMODE, aga::BPAGEM | aga::BPL32);
+    b.poke(DDFSTRT, 0x38);
+    b.poke(DDFSTOP, 0xd8);
+    assert_eq!(b.agnus.shared.state.lock().fetch_window(), Some((0x38, 24)));
+}
+
+#[test]
+fn a_wide_fetch_is_the_same_stream_and_moves_the_pointer_by_the_words() {
+    // §4, BPLxDAT: a fetch of any width is that many consecutive pixels, "MSB
+    // … always on the left". So a 64-bit fetch of four words shows exactly
+    // what four 16-bit fetches of the same words show.
+    let narrow = Chipset::aga(CHIP);
+    let wide = Chipset::aga(CHIP);
+    let row = |c: &Chipset| {
+        let mut row = vec![0u32; 1600];
+        c.video.read_row_rgb(2 * (0x2c - 0x1d), &mut row);
+        row
+    };
+    for (c, fmode) in [(&narrow, 0u16), (&wide, aga::BPAGEM | aga::BPL32)] {
+        c.store(0x1_0000, &vec![0xf0f0u16; 8 * 256]);
+        c.poke(BPL1PTH, 0x0001);
+        c.poke(BPL1PTH + 2, 0x0000);
+        c.poke(DIWSTRT, 0x2c81);
+        c.poke(DIWSTOP, 0x2cc1);
+        c.poke(DDFSTRT, 0x38);
+        c.poke(DDFSTOP, 0x50); // four eight-count blocks: four words
+        c.poke(BPL1MOD, 0);
+        c.poke(BPLCON3, PF2OF);
+        c.poke(COLOR00, 0x0000);
+        c.poke(COLOR01, 0x0f00);
+        c.poke(BPLCON0, 1 << 12);
+        c.poke(E_FMODE, fmode);
+        c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::BITPLANE.0);
+        c.run(PAL_FIELD);
+    }
+    assert_eq!(
+        row(&narrow),
+        row(&wide),
+        "one transfer or four, same pixels"
+    );
+    // And both pointers have walked the same four words a line. Read one at a
+    // time: two `DEVICE`-ranked locks at once is a rank violation, and the
+    // rank check is half of why these tests are unit tests.
+    let one = narrow.agnus.shared.state.lock().bplpt[0];
+    let two = wide.agnus.shared.state.lock().bplpt[0];
+    assert_eq!(one, two);
+}
+
+#[test]
+fn an_older_part_has_no_fmode_and_fetches_as_it_always_did() {
+    // The register decodes on every part — it is in the address map — but only
+    // Alice acts on it. This is the regression gate for every OCS and ECS
+    // golden.
+    let all = aga::BPAGEM | aga::BPL32 | aga::BSCAN2 | aga::SSCAN2;
+    for b in [Board::pal(), ecs_board(Standard::Pal, 2 * ecs::MIB)] {
+        b.poke(E_FMODE, all);
+        b.poke(DDFSTRT, 0x3a);
+        b.poke(DDFSTOP, 0xd8);
+        b.poke(BPLCON0, 7 << 12 | 1 << 4);
+        let st = b.agnus.shared.state.lock();
+        assert_eq!(st.fetch_words(), 1);
+        assert_eq!(st.fetch_window(), Some((0x38, 21)), "H8-H3, 21 words");
+        assert_eq!(st.planes(), 6, "BPU3 is not a bit this part has");
+        assert_eq!(st.fmode, all, "held, so a snapshot carries it");
+    }
+}
+
+#[test]
+fn an_aa_fetch_window_decodes_h2() {
+    // §4, DDFSTRT: "H8 H7 H6 H5 H4 H3 H2 X" against bits 7-0, one further
+    // down than the Enhanced Chip Set's. H2 is two colour clocks.
+    let b = alice(Standard::Pal);
+    b.poke(DDFSTRT, 0x3a);
+    b.poke(DDFSTOP, 0xd0);
+    assert_eq!(b.agnus.shared.state.lock().fetch_window(), Some((0x3a, 20)));
+}
+
+#[test]
+fn bscan2_takes_the_modulus_from_the_lines_parity() {
+    // §2: "When V0 bit of DIWSTRT matches V0 of vertical beam counter, BPL1MOD
+    // contains the modulus for the display line, else BPL2MOD is used. When
+    // scan-doubled both odd and even bitplanes use the same modulus."
+    let c = Chipset::aga(CHIP);
+    for p in 0..2u32 {
+        let base = 0x1_0000 + 0x4000 * p;
+        c.store(base, &vec![0u16; 4096]);
+        c.poke(BPL1PTH + 4 * p as u16, (base >> 16) as u16);
+        c.poke(BPL1PTH + 4 * p as u16 + 2, base as u16);
+    }
+    c.poke(DIWSTRT, 0x2c81); // V0 of $2C is 0: even lines are primary
+    c.poke(DIWSTOP, 0x2ec1);
+    // DIWSTOP's ninth bit is the complement of its eighth, so $2E alone would
+    // mean line $12E; DIWHIGH written last gives V10-V8 directly (Appendix C),
+    // and two display lines, $2C and $2D.
+    c.poke(DIWHIGH, 0x0000);
+    c.poke(DDFSTRT, 0x38);
+    c.poke(DDFSTOP, 0x38); // one word a line
+    c.poke(BPL1MOD, 0u16.wrapping_sub(2)); // primary: stay put
+    c.poke(BPL2MOD, 30); // alternate: skip on
+    c.poke(E_FMODE, aga::BSCAN2);
+    c.poke(BPLCON0, 2 << 12);
+    c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::BITPLANE.0);
+    c.run(PAL_FIELD);
+
+    let st = c.agnus.shared.state.lock();
+    for p in 0..2usize {
+        let base = 0x1_0000 + 0x4000 * p as u32;
+        // Line $2C is primary (−2 after a two-byte word: no movement); line
+        // $2D is alternate (+30 after two bytes: 32 on). Both planes alike.
+        assert_eq!(st.bplpt[p], base + 32, "plane {}", p + 1);
+    }
+}
+
+#[test]
+fn without_bscan2_the_modulus_is_still_the_planes_own() {
+    let c = Chipset::aga(CHIP);
+    for p in 0..2u32 {
+        let base = 0x1_0000 + 0x4000 * p;
+        c.store(base, &vec![0u16; 4096]);
+        c.poke(BPL1PTH + 4 * p as u16, (base >> 16) as u16);
+        c.poke(BPL1PTH + 4 * p as u16 + 2, base as u16);
+    }
+    c.poke(DIWSTRT, 0x2c81);
+    c.poke(DIWSTOP, 0x2ec1);
+    c.poke(DIWHIGH, 0x0000); // lines $2C and $2D, as above
+    c.poke(DDFSTRT, 0x38);
+    c.poke(DDFSTOP, 0x38);
+    c.poke(BPL1MOD, 0u16.wrapping_sub(2));
+    c.poke(BPL2MOD, 30);
+    c.poke(BPLCON0, 2 << 12);
+    c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::BITPLANE.0);
+    c.run(PAL_FIELD);
+    let st = c.agnus.shared.state.lock();
+    assert_eq!(st.bplpt[0], 0x1_0000, "plane 1: BPL1MOD twice over");
+    assert_eq!(st.bplpt[1], 0x1_4000 + 64, "plane 2: BPL2MOD twice over");
+}
+
+#[test]
+fn a_wide_sprite_is_fetched_whole_and_reaches_lisa_left_justified() {
+    // §4, FMODE: a sprite fetch moves 2, 4 or 8 bytes, and §5: "Sprites are
+    // either 16, 32, or 64 bits wide". The words go to Lisa through
+    // `Video::sprite_dma`, "MSB first on the left" (§4, SPRxDATA).
+    for (fmode, f) in [
+        (0u16, 1usize),
+        (aga::SPR32, 2),
+        (aga::SPAGEM, 2),
+        (aga::SPAGEM | aga::SPR32, 4),
+    ] {
+        let c = Chipset::aga(CHIP);
+        let base = 0x2_0000u32;
+        // Control words for one line at $2C, then one line of data: `f` words
+        // of A and `f` words of B, each marked so the order is visible.
+        let mut words = vec![0u16; 2 * f];
+        words[0] = 0x2c40; // SPRxPOS: VSTART $2C, HSTART $40
+        words[f] = 0x2d00; // SPRxCTL: VSTOP $2D
+        let mut data = vec![0u16; 2 * f];
+        for i in 0..f {
+            data[i] = 0xa000 + i as u16;
+            data[f + i] = 0xb000 + i as u16;
+        }
+        c.store(base, &words);
+        c.store(base + 4 * f as u32, &data);
+        c.poke(E_FMODE, fmode);
+        c.poke(SPR0PTR, (base >> 16) as u16);
+        c.poke(SPR0PTR + 2, base as u16);
+        c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::SPRITE.0);
+        c.run(PAL_FIELD);
+
+        // Six transfers: the control pair at vertical blank's end, the data
+        // pair on line $2C, and the control pair again on the VSTOP line.
+        assert_eq!(
+            c.agnus.shared.state.lock().sprpt[0],
+            base + 12 * f as u32,
+            "FMODE ${fmode:04x}: six transfers of {f} words"
+        );
+    }
+}
+
+#[test]
+fn sscan2_skips_a_sprite_fetch_on_a_line_of_the_wrong_parity() {
+    // §2, *Sprites*: "When V0 bit of SPRxPOS register matches V0 bit of
+    // vertical beam counter, the given sprite's DMA is allowed to proceed as
+    // before. If they don't match, then sprite DMA is disabled and LISA reuses
+    // the sprite data from the previous line."
+    for (fmode, sh10, lines) in [
+        (aga::SSCAN2, 1u16, 2u32), // doubled: four lines, two fetches
+        (aga::SSCAN2, 0, 4),       // SH10 clear: this sprite is not doubled
+        (0, 1, 4),                 // SSCAN2 clear: nor is any
+    ] {
+        let c = Chipset::aga(CHIP);
+        let base = 0x2_0000u32;
+        // VSTART $2C, VSTOP $30 — four display lines, same parity (§2's note).
+        c.store(base, &[0x2c40 | sh10, 0x3000]);
+        c.store(base + 4, &[0u16; 64]);
+        c.poke(E_FMODE, fmode);
+        c.poke(SPR0PTR, (base >> 16) as u16);
+        c.poke(SPR0PTR + 2, base as u16);
+        c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::SPRITE.0);
+        c.run(PAL_FIELD);
+        // One control pair at each end plus one data pair per fetching line,
+        // four bytes each.
+        assert_eq!(
+            c.agnus.shared.state.lock().sprpt[0],
+            base + 8 + 4 * lines,
+            "FMODE ${fmode:04x}, SH10 {sh10}"
+        );
+    }
+}
+
+#[test]
+fn two_mib_of_chip_ram_is_addressed_by_twenty_bit_pointers() {
+    // §3's preamble: "PTL,PTH=20 bit Pointer that addresses DMA data … (old
+    // chips- 18 bits)", so the pair carries address bits 1-20 and reaches
+    // 2 MiB.
+    let c = Chipset::aga(2 * ecs::MIB);
+    let base = 0x1f_0000u32;
+    c.store(base, &[0xffffu16; 64]);
+    c.poke(BPL1PTH, (base >> 16) as u16);
+    c.poke(BPL1PTH + 2, base as u16);
+    c.poke(DIWSTRT, 0x2c81);
+    c.poke(DIWSTOP, 0x2cc1);
+    c.poke(DDFSTRT, 0x38);
+    c.poke(DDFSTOP, 0x38);
+    c.poke(BPL1MOD, 0u16.wrapping_sub(2));
+    c.poke(BPLCON3, PF2OF);
+    c.poke(COLOR00, 0x0000);
+    c.poke(COLOR01, 0x0f00);
+    c.poke(BPLCON0, 1 << 12);
+    c.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::BITPLANE.0);
+    c.run(PAL_FIELD);
+    let mut row = vec![0u32; 1600];
+    c.video.read_row_rgb(2 * (0x2c - 0x1d), &mut row);
+    let at = (0x81 - 64) * 4;
+    assert!(
+        row[at..at + 16 * 4].iter().all(|&p| p == 0x00ff_0000),
+        "a word fetched from $1F0000 is on the screen"
+    );
+}
+
+#[test]
+fn an_alice_snapshot_round_trips_with_fmode_and_eight_pointers() {
+    let setup = |b: &Board| {
+        b.poke(
+            E_FMODE,
+            aga::BPAGEM | aga::BPL32 | aga::BSCAN2 | aga::SSCAN2,
+        );
+        for p in 0..8u16 {
+            b.poke(BPL1PTH + 4 * p, 0x0001);
+            b.poke(BPL1PTH + 4 * p + 2, 0x1000 + 0x100 * p);
+        }
+        b.poke(DIWSTRT, 0x2c81);
+        b.poke(DIWSTOP, 0x2cc1);
+        b.poke(BPLCON0, 1 << 4);
+        b.poke(DMACON, dma::SETCLR | dma::DMAEN | DmaChannel::BITPLANE.0);
+    };
+    let saved = alice(Standard::Pal);
+    setup(&saved);
+    saved.run(300 * 227 + 11);
+    let bytes = snapshot(&saved.agnus);
+
+    let restored = alice(Standard::Pal);
+    restore(&restored.agnus, &bytes);
+    assert_eq!(snapshot(&restored.agnus), bytes, "identical state");
+    {
+        let st = restored.agnus.shared.state.lock();
+        assert_eq!(
+            st.fmode,
+            aga::BPAGEM | aga::BPL32 | aga::BSCAN2 | aga::SSCAN2
+        );
+        for p in 0..8usize {
+            assert_eq!(st.bplpt[p], 0x1_1000 + 0x100 * p as u32, "plane {p}");
+        }
+    }
+    // And the two run on identically from there.
+    saved.run(2 * PAL_FIELD);
+    restored.run(2 * PAL_FIELD);
+    assert_eq!(snapshot(&restored.agnus), snapshot(&saved.agnus));
 }

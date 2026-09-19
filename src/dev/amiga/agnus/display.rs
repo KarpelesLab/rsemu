@@ -47,6 +47,16 @@
 //! programmable beam has made shorter than `DDFSTOP` fetches only the blocks
 //! that start before it ends.
 //!
+//! On an AA part ([`aga`]) four more do: `BPLCON0`'s `BPU3` counts to eight
+//! planes, which are fetched through `BPL7PT` and `BPL8PT`; `DDFSTRT` and
+//! `DDFSTOP` decode `H2` as well, so a fetch starts on an even count rather
+//! than a multiple of four; `FMODE` moves one, two or four words a transfer,
+//! and the word count is rounded up to a whole one; and `BSCAN2` makes the
+//! modulus the line's rather than the plane's. The sprite channel gains the
+//! same widths, and `SSCAN2` skips its data fetch on a line of the wrong
+//! parity — [`aga`]'s documentation quotes the sentences all of that comes
+//! from.
+//!
 //! Only `BPLEN` with `DMAEN` fetches. The pointers advance whether or not a
 //! video chip is attached, so the guest-visible state of a board does not
 //! depend on its wiring; the words are only read when somebody will look at
@@ -108,8 +118,7 @@ use alloc::vec::Vec;
 
 use super::beam::{Beam, Standard, Timing};
 use super::blitter::Memory;
-use super::ecs;
-use super::{Chip, DmaChannel, Origin, Outward, State};
+use super::{Chip, DmaChannel, Origin, Outward, State, aga, ecs};
 
 /// Where a sprite channel is in its field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,15 +174,33 @@ pub const fn vblank_stop(std: Standard) -> u16 {
 }
 
 impl State {
-    /// How many bitplanes `BPLCON0` enables.
+    /// How many bitplanes `BPLCON0` enables: six on an original or Enhanced
+    /// Chip Set part, eight on Alice ([`aga::planes`]).
     pub(super) fn planes(&self) -> usize {
-        usize::from((self.bplcon0 >> 12) & 7).min(6)
+        aga::planes(self.rev, self.bplcon0)
+    }
+
+    /// Words moved by one bitplane transfer: one, always, until `FMODE`
+    /// ([`aga::bitplane_words`]).
+    pub(super) fn fetch_words(&self) -> u16 {
+        if self.rev.is_aga() {
+            aga::bitplane_words(self.fmode)
+        } else {
+            1
+        }
     }
 
     /// The horizontal fetch: the count it starts on and how many words.
     pub(super) fn fetch_window(&self) -> Option<(u16, u16)> {
-        let start = (self.ddfstrt & DDF_BITS).max(DDF_MIN);
-        let stop = (self.ddfstop & DDF_BITS).min(DDF_MAX);
+        // An AA part decodes one bit more of both registers, `H2` — two
+        // colour clocks rather than four (`aga::DDF_BITS`).
+        let bits = if self.rev.is_aga() {
+            aga::DDF_BITS
+        } else {
+            DDF_BITS
+        };
+        let start = (self.ddfstrt & bits).max(DDF_MIN);
+        let stop = (self.ddfstop & bits).min(DDF_MAX);
         if stop < start {
             return None;
         }
@@ -181,7 +208,12 @@ impl State {
         // an inference from Kickstart 2.04 and AROS, which contradicts table
         // 3-14's "49 words"; see the module documentation.
         let blocks = ((stop & !7) - (start & !7)) / 8 + 1;
-        Some((start, blocks * self.words_per_block()))
+        // A transfer is indivisible, so a window that does not divide by
+        // `FMODE`'s width still moves the last one whole (`aga`, *`FMODE` and
+        // the fetch*). Without `FMODE` this is the word count itself.
+        let words = blocks * self.words_per_block();
+        let f = self.fetch_words();
+        Some((start, words.div_ceil(f) * f))
     }
 
     /// Words fetched per plane in each eight-count block: one in low
@@ -226,7 +258,7 @@ impl State {
     /// The beam is leaving `leaving`: fetch its bitplane words and, if a video
     /// chip is attached, queue the line for it.
     pub(super) fn end_of_line(&mut self, t: Timing, leaving: &Beam, mem: &mut Chip<'_>) {
-        let mut planes: [Vec<u16>; 6] = Default::default();
+        let mut planes: [Vec<u16>; 8] = Default::default();
         let clocks = leaving.line_len(t);
         let mut window = self.fetch_window();
         if self.rev.is_ecs()
@@ -244,6 +276,11 @@ impl State {
             && self.in_vertical_window(leaving.vpos)
             && let Some((_, words)) = window
         {
+            // `BSCAN2`: the modulus is the line's rather than the plane's -
+            // "when scan-doubled both odd and even bitplanes use the same
+            // modulus on a given line" (Â§2, *Bitplanes*).
+            let scan2 = self.rev.is_aga() && self.fmode & aga::BSCAN2 != 0;
+            let line_modulo = aga::scan_double_modulo(leaving.vpos, self.diwstrt);
             for (plane, out) in planes.iter_mut().enumerate().take(self.planes()) {
                 let mut pointer = self.bplpt[plane];
                 if self.video {
@@ -255,8 +292,9 @@ impl State {
                 } else {
                     pointer = pointer.wrapping_add(2 * u32::from(words));
                 }
-                // BPL1MOD for planes 1, 3, 5; BPL2MOD for 2, 4, 6.
-                let modulo = i32::from(self.bplmod[plane % 2] as i16) as u32;
+                // BPL1MOD for planes 1, 3, 5, 7; BPL2MOD for 2, 4, 6, 8.
+                let which = if scan2 { line_modulo } else { plane % 2 };
+                let modulo = i32::from(self.bplmod[which] as i16) as u32;
                 self.bplpt[plane] = pointer.wrapping_add(modulo);
             }
         }
@@ -295,18 +333,39 @@ impl State {
                             self.sprite_control(x, mem);
                         } else {
                             self.sprite[x] = SpriteDma::Active;
-                            self.sprite_data(x, mem);
+                            if self.sprite_fetches_now(x, vpos) {
+                                self.sprite_data(x, mem);
+                            }
                         }
                     }
                 }
                 SpriteDma::Active => {
                     if vpos == self.sprite_vstop(x) {
                         self.sprite_control(x, mem);
-                    } else {
+                    } else if self.sprite_fetches_now(x, vpos) {
                         self.sprite_data(x, mem);
                     }
                 }
             }
+        }
+    }
+
+    /// Whether sprite `x` moves data on this line: always, unless `SSCAN2`
+    /// and its own `SH10` scan-double it and the parities disagree
+    /// ([`aga::sprite_fetches_on`]). Only the *data* fetch is gated: a control
+    /// fetch is what loads `SPRxPOS`, so the bits this asks about are not
+    /// there yet, and the specification's parity note keeps a `VSTOP` line on
+    /// the fetching side anyway.
+    fn sprite_fetches_now(&self, x: usize, vpos: u16) -> bool {
+        !self.rev.is_aga() || aga::sprite_fetches_on(self.fmode, self.sprpos[x], vpos)
+    }
+
+    /// Words moved by one sprite transfer ([`aga::sprite_words`]).
+    fn sprite_transfer_words(&self) -> u16 {
+        if self.rev.is_aga() {
+            aga::sprite_words(self.fmode)
+        } else {
+            1
         }
     }
 
@@ -320,9 +379,17 @@ impl State {
         (self.sprctl[x] >> 8) | ((self.sprctl[x] >> 1) & 1) << 8
     }
 
-    /// Fetch the next two words into `SPRxPOS` and `SPRxCTL`.
+    /// Fetch the next two transfers into `SPRxPOS` and `SPRxCTL`.
+    ///
+    /// A wide `FMODE` widens these two as it widens the data pair — §4's
+    /// table is the sprite channel's fetch increment and names no exception —
+    /// so the control words are the first word of each transfer and the rest
+    /// of it is skipped. **An inference**, and the one a sprite structure
+    /// padded to the fetch width expects.
     fn sprite_control(&mut self, x: usize, mem: &mut Chip<'_>) {
-        let (pos, ctl) = self.sprite_pair(x, mem);
+        let f = self.sprite_transfer_words();
+        let pos = self.sprite_transfer(x, f, mem)[0];
+        let ctl = self.sprite_transfer(x, f, mem)[0];
         self.sprpos[x] = pos;
         self.sprctl[x] = ctl;
         self.sprite[x] = SpriteDma::Waiting;
@@ -331,20 +398,41 @@ impl State {
         self.queue_dma_write(base + 2, ctl);
     }
 
-    /// Fetch the next two words into `SPRxDATA` and `SPRxDATB`.
+    /// Fetch the next two transfers into `SPRxDATA` and `SPRxDATB`.
+    ///
+    /// Sixteen bits go through the register bus, as they always have. A wider
+    /// transfer does not fit a `u16`, so it goes through
+    /// [`Video::sprite_dma`](crate::dev::amiga::denise::Video::sprite_dma)
+    /// instead — left-justified, and queued in the outbox behind whatever this
+    /// slot wrote through the bus.
     fn sprite_data(&mut self, x: usize, mem: &mut Chip<'_>) {
-        let (data, datb) = self.sprite_pair(x, mem);
+        let f = self.sprite_transfer_words();
         let base = 0x140 + 8 * x as u16;
-        self.queue_dma_write(base + 4, data);
-        self.queue_dma_write(base + 6, datb);
+        for (b_buffer, offset) in [(false, base + 4), (true, base + 6)] {
+            let words = self.sprite_transfer(x, f, mem);
+            if f == 1 {
+                self.queue_dma_write(offset, words[0]);
+            } else {
+                self.outbox.push(Outward::SpriteData {
+                    sprite: x,
+                    b_buffer,
+                    bits: aga::sprite_bits(&words[..usize::from(f)]),
+                });
+            }
+        }
     }
 
-    fn sprite_pair(&mut self, x: usize, mem: &mut Chip<'_>) -> (u16, u16) {
-        let pointer = self.sprpt[x];
-        let first = mem.read(pointer);
-        let second = mem.read(pointer.wrapping_add(2));
-        self.sprpt[x] = pointer.wrapping_add(4);
-        (first, second)
+    /// One sprite DMA transfer: `words` consecutive words from the channel's
+    /// pointer, which then advances by that many.
+    fn sprite_transfer(&mut self, x: usize, words: u16, mem: &mut Chip<'_>) -> [u16; 4] {
+        let mut pointer = self.sprpt[x];
+        let mut out = [0u16; 4];
+        for slot in out.iter_mut().take(usize::from(words)) {
+            *slot = mem.read(pointer);
+            pointer = pointer.wrapping_add(2);
+        }
+        self.sprpt[x] = pointer;
+        out
     }
 
     fn queue_dma_write(&mut self, offset: u16, value: u16) {
