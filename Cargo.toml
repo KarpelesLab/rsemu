@@ -2746,6 +2746,17 @@ dev-amiga-keyboard = ["dev-amiga"]
 # consulted. Implies `dev-amiga`. `no_std + alloc`, no dependencies.
 dev-amiga-mouse = ["dev-amiga"]
 
+# Akiko (src/dev/amiga/akiko.rs), the CD32's gate array: `amiga.akiko`, the
+# register file at $B80000 -- the identification longword, the chunky-to-planar
+# corner-turn memory (32 chunky pixels in, eight planar longwords out), the
+# CD-ROM controller's command and status registers in front of an
+# `amiga.cd` drive, and the two wires of the machine's 1 KiB serial EEPROM.
+# Written from the *Amiga CD32 Developer Notes* (Revision 3), the I2C
+# specification and the 24C08 data sheet, and black-box observation of the
+# user's own CD32 ROM; no emulator source and no FPGA reimplementation was
+# consulted. Implies `dev-amiga`. `no_std + alloc`, no dependencies.
+dev-amiga-akiko = ["dev-amiga"]
+
 # The CD32's CD-ROM drive (src/dev/amiga/cdrom.rs): `amiga.cd`, the
 # double-speed mechanism Akiko's controller talks to. A disc is an image on a
 # media slot -- 2048-byte Mode 1 user data, which is what an ISO 9660 image

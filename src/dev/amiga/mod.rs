@@ -9,6 +9,7 @@
 //! | [`gary`] | the address decode: the `OVL` overlay at zero, bank 6 (an A501's slow RAM or the chip registers again) and a window at `$E0_0000` for AROS's second ROM half |
 //! | `gayle` | `dev-amiga-gayle`: the A600's gate array — the IDE port's chip selects and byte swap in front of an `ata.disk`, the card and IDE interrupt registers at `$DA8000`, the identification register, and the overlay it clears on the first CIA write |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
+//! | `akiko` | `dev-amiga-akiko`: Akiko — the CD32's gate array: the chunky-to-planar corner turn, the CD-ROM controller and the serial EEPROM's two wires, at `$B80000` |
 //! | `cdrom` | `dev-amiga-cdrom`: the CD32's CD-ROM drive — a disc of 2048-byte user data or 2352-byte frames, and a one-track table of contents |
 //! | `agnus` | `dev-amiga-agnus`: Agnus — the beam counters and sync, `DMACON`, the copper, the blitter, and every DMA transfer |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
@@ -69,6 +70,9 @@
 #[cfg(feature = "dev-amiga-agnus")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-agnus")))]
 pub mod agnus;
+#[cfg(feature = "dev-amiga-akiko")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-akiko")))]
+pub mod akiko;
 #[cfg(feature = "dev-amiga-cdrom")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-cdrom")))]
 pub mod cdrom;
@@ -113,6 +117,8 @@ use crate::core::error::Result;
 ///
 /// If something already claimed one of the names.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
+    #[cfg(feature = "dev-amiga-akiko")]
+    akiko::register(registry)?;
     #[cfg(feature = "dev-amiga-cdrom")]
     cdrom::register(registry)?;
     cia_decode::register(registry)?;
@@ -143,6 +149,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// If one of the classes is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    #[cfg(feature = "dev-amiga-akiko")]
+    akiko::bind(bindings)?;
     #[cfg(feature = "dev-amiga-cdrom")]
     cdrom::bind(bindings)?;
     cia_decode::bind(bindings)?;
@@ -172,6 +180,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     #[allow(unused_mut)]
     let mut schemas = alloc::vec![cia_decode::schema(), custom::schema(), gary::schema()];
+    #[cfg(feature = "dev-amiga-akiko")]
+    schemas.push(akiko::schema());
     #[cfg(feature = "dev-amiga-cdrom")]
     schemas.push(cdrom::schema());
     #[cfg(feature = "dev-amiga-gayle")]
