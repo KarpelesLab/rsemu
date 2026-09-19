@@ -1538,3 +1538,163 @@ Colors slider's knob, which is narrower because the slider now runs to 256.
 * **The empty-bay delay**, as on the A600: what a real machine without a drive
   reads from its IDE status register is whatever its unbuffered bus floats to,
   and how long a real A1200 waits is not in any document at hand.
+
+## CD32
+
+`machines/amiga-cd32.machine` is the A1200's AA chip set and 68EC020 with the
+floppy and the IDE port taken away, **Akiko** in their place, a CD-ROM drive
+behind it and a joypad on the second controller port. It runs the animated boot
+screen a real CD32 shows with nothing in the tray:
+
+```
+rsemu run amiga-cd32 --media kickstart=kickstart:<rom dir>/amiga-os-310-cd32.rom \
+    --media ext=kickstart:<rom dir>/amiga-os-310-cd32-ext.rom --vnc :5900
+```
+
+### Sources
+
+| Source | Covers |
+| --- | --- |
+| *Amiga CD32 Developer Notes*, Revision 3, Commodore-Amiga Inc. | Everything Commodore published about this machine: "2 Megabytes of 32-bit Chip RAM", "14MHz 68EC020 CPU", "Top loading double speed CD-ROM drive", "Akiko is a 160-pin PQFP … It includes the CD-ROM control logic and the system timers", "very fast chunky-to-planar conversion hardware", "The EEPROM is 8K bits", the pad's "six action buttons, one start button and four directional arrows", and `ReadJoyPort()`, `CD_READ` and `nonvolatile.library` as the ways to reach all three |
+| *Functional Specification for the Advanced Amiga Chip Set (AA)*, Commodore-Amiga, 06/07/91 | Alice and Lisa, as on the A1200 |
+| *Amiga Hardware Reference Manual*, 3rd ed. | The nine-pin game port: pins 1–4 on Denise's counters, pin 6 on CIA-A's `PA7`, pins 5 and 9 on `POTGO`, and `OUT…`/`DAT…` making the last two outputs |
+| ECMA-130 (CD-ROM frames) and ECMA-119 (ISO 9660) | What a disc image is: the 2352-byte frame, its sync pattern and its Mode 1 and Mode 2 Form 1 layouts, the 2048-byte logical sector a file system sees, the 150-frame lead-in |
+| NXP UM10204 (I²C) and the 24C08 data sheet | What the part on Akiko's two wires does with them |
+| Black-box: the user's own CD32 ROM, 40.60 and its extended half | Akiko's whole register file — see below |
+
+**Commodore published no hardware reference for Akiko**, so every register
+address and bit below came from watching what the ROM does on the bus. No
+Amiga emulator source, no FPGA reimplementation, no AROS source and no
+Kickstart disassembly was consulted.
+
+### What the board changes from the A1200
+
+| | A1200 | CD32 |
+| --- | --- | --- |
+| Storage | Gayle's IDE port and DF0 | **neither**; a CD-ROM drive behind Akiko |
+| ROM | one 512 KiB part | **two**: `kickstart` at `$F8_0000` and `ext` at `$E0_0000`, through the same `amiga.gary` window the A500 board has for AROS |
+| Chip RAM | 2 MiB, half-populated optional | 2 MiB, soldered |
+| Input | keyboard and mouse | **no keyboard connector at all**; a joypad on port 1, a mouse on port 0 |
+| New | — | `amiga.akiko` at `$B8_0000`, `amiga.cd`, `amiga.cd32-pad` |
+
+Everything else — the crystal, the processor's divisor, Alice, Lisa, Paula, the
+CIAs and their decode, the `OVL` overlay — is the A1200's.
+
+### Akiko, measured
+
+`src/dev/amiga/akiko.rs` is the ledger. With an empty tray the ROM touches
+sixty-four bytes at `$B8_0000` and nothing else:
+
+| | What | How it is known |
+| --- | --- | --- |
+| `$00` | `$C0CACAFE` | Black-box: the ROM reads the word at `$B8_0002` once and `$CAFE` is what lets it go on |
+| `$04`, `$08` | interrupt request and enable, bits 31–24 | Black-box: written once, then read as a pair for ever |
+| `$10`, `$14` | two pointers into chip RAM (`$0001_0000`, `$001F_E400`) | Black-box; **their layout is not known** and this model stores them and walks nothing |
+| `$18`, `$1C` | ring indices, the chip's and software's | Black-box |
+| `$24`, `$25` | configuration; `$25` is written and read back as a presence test | Black-box |
+| `$30` | the EEPROM's two wires: bit 31 SCL, bit 30 SDA, bit 15 drive SCL, bit 14 drive SDA | **Derived**: the ROM's first four writes are a textbook I²C start condition and the eight bits after it are `$A0`, a 24Cxx's write address, under that reading and under no other |
+| `$38` | the chunky-to-planar corner turn | **Measured**, below |
+
+The EEPROM is the check on all of it. With nothing answering on the wires, the
+ROM's five virtual seconds of boot contain **207 005** accesses to this
+register file, almost all of them retries of a transfer that never completes.
+With a 24C08 on them it is **311**: the transfer happens once and the boot goes
+on.
+
+### The corner turn, and why its orientation is not a guess
+
+Thirty-two 8-bit chunky pixels in, eight 32-bit planar longwords out — a square
+bit matrix written by rows and read by columns:
+
+```
+plane[p] bit (31 - i)  =  (chunky[i] >> p) & 1        i = 0..31, p = 0..7
+```
+
+Which end of the longword is the first pixel, and which plane comes out first,
+would be inferences — except that **the CD32's ROM proves the converter on its
+way up** and will not go on if it is wrong. It writes eight longwords of
+`$5555_0000` and reads the result back:
+
+| The model | What the ROM does |
+| --- | --- |
+| Pixel 0 in the most significant byte, plane 0 first | reads **four** longwords — `$CCCCCCCC`, 0, `$CCCCCCCC`, 0 — and goes on to the next thing it does, which is to write `$80` into `$25` |
+| Plane 7 first | reads **one** longword, the 0 that is plane 7, and stops; `$25` is never touched |
+| Pixel 0 in the least significant bit | reads **one** longword of `$33333333` and stops in the same place |
+
+So the transform, its pixel order and its plane order are all measured. The one
+inference left is that a single byte pointer serves both sides and wraps at
+thirty-two, which the trace cannot distinguish from two pointers that both
+start at zero.
+
+### What does not work yet, and why it is written down rather than guessed
+
+**No disc reaches the guest.** `amiga.cd` is a complete mechanism — it finds
+its sectors, tells 2048-byte ISO 9660 user data from 2352-byte raw frames by
+the frame's sync pattern, lifts Mode 1 and Mode 2 Form 1 user data out of a
+frame, and answers a one-track table of contents — and Akiko holds it and can
+say whether a disc is in the tray. What is missing is the road between them:
+the message format `cd.device` and the controller pass commands through is in
+no Commodore document, and **with an empty tray the ROM never sends one**, so
+there was nothing to watch. A plausible invention would agree with no real disc
+and no real game, so there is none here.
+
+For the same reason Akiko has **no interrupt pin**: which of the processor's
+levels a CD interrupt reaches was not determined either, and the ROM polls
+`$04` regardless, so the boot does not depend on it.
+
+Also not modelled: Akiko's system timers (named in one sentence of the
+Developer Notes, touched by nothing), CD audio, subcode and so CD+G, multi
+session, and Mode 2 Form 2's 2324-byte sectors.
+
+### The joypad
+
+`src/dev/amiga/cd32pad.rs`. Held still it is an ordinary two-button joystick —
+four switches to ground on pins 1–4, red on pin 6, blue on pin 9. When the
+machine drives **pin 5 low** (`POTGO`'s `OUTRX`, published on Paula's new
+`potrx-out` wire) the pad's shift register latches, the pad lets go of pin 6,
+and the machine clocks the other seven buttons out of pin 9 one per rising
+edge: blue, red, yellow, green, forward, reverse, play, then a one and then
+zeros for ever. That terminating low is how `ReadJoyPort()` tells a pad from a
+joystick.
+
+The pins are the hardware manual's. **The shift register, its bit order and the
+terminating one-then-zeros are in no Commodore document** and are marked as
+such in the module: they are the pad's known behaviour, and the CD32's own ROM
+could not settle them because the boot screen never reads a pad.
+
+Paula gained four output wires for this — `potlx-out`, `potly-out`,
+`potrx-out`, `potry-out` — because `POTGO` could already make a pot pin an
+output and nothing could see the level. A pin it does not drive is released and
+the source drives high, leaving the net's pull to decide.
+
+**No front end presses it yet.** The pad is a named host object with a
+record/replay door of its own (`amiga-cd32-pad:pad0`), so a recorded payload
+replays and a test drives it directly; what is not written is a mapping from a
+person's keyboard or gamepad to eleven buttons, the way `host::input::amiga`
+maps keys to an `amiga.keyboard` and a pointer to an `amiga.mouse`. That
+mapping is a choice about a host's controls rather than a fact about the
+machine, and it is left until somebody has a control to map.
+
+### How far it gets
+
+`tests/amiga_cd32.rs`, behind `RSEMU_AMIGA_ROM_DIR`, boots the user's two ROM
+halves in place and checks a frame hash; each frame was looked at.
+
+| ROM + disc | Reaches | What is on screen |
+| --- | --- | --- |
+| Kickstart 3.1 (40.60) + its extended half, empty tray | **the animated boot screen**, 4 s | Black for three seconds while Kickstart sizes memory, builds exec's lists, and `cd.device` finds Akiko, proves the corner turn, talks to the EEPROM and finds the drive empty. At 6 s: a starfield on black and, across the middle, a grey compact disc seen almost edge-on with a black hub, a white ring and four rainbow diffraction streaks. At 12 s: a band of deep purple sky across the top third with "AMIGA CD" over it in dark red and silver serif capitals, a rainbow highlight through the "CD", and "32" raised to its right with a small "TM". The disc turns and the sky's colours cycle, both copper work, so a golden is one exact virtual instant |
+| The same with a disc in the tray | the same frame, hash for hash | Nothing changes, for the reason above |
+
+The processor is **stopped** from 6 s on: the animation is copper and blitter
+work with the processor waiting on the interrupt that drives it, which is what
+an idle Amiga looks like.
+
+`GfxBase->ChipRevBits0` reads **`$1F`** from 4 s — `GFXF_HR_AGNUS`,
+`GFXF_HR_DENISE`, `GFXF_AA_ALICE`, `GFXF_AA_LISA` and bit 4 — so the guest's
+own `graphics.library` found Alice and Lisa. Both ROM halves identify
+themselves as **40.60** through their header words at `$F8_000C` and
+`$E0_000C`, and `ExecBase`'s `lib_Version` is 40.
+
+Amiga Forever ships no CD32-bootable disc image: its `Shared` directories hold
+ROMs, ADFs and HDFs, and the only ISO in the product is its own installer DVD.
+Nothing here went looking for a game.

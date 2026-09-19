@@ -488,6 +488,12 @@ eight bitplanes, a 256-entry 24-bit colour table, HAM8 — around a 68EC020 with
 2 MiB of chip RAM: **Kickstart 3.1 boots Workbench 3.1 on it off the hard disk
 and off a floppy**, and `graphics.library` reads back the AA bits in
 `GfxBase->ChipRevBits0` where the A600 beside it reads only the ECS pair.
+`amiga-cd32` is the **CD32**: the same AA chip set and 68EC020 with no floppy,
+no IDE port and no keyboard, a two-part 3.1 ROM, **Akiko** at `$B80000` — its
+chunky-to-planar corner turn, the CD-ROM controller's registers and the two
+wires of the machine's EEPROM — a CD-ROM drive on the `cd0` slot and the
+eleven-button joypad on a controller port. With nothing in the tray it runs
+the animated boot screen, which is what a real one does.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's
