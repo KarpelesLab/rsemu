@@ -10,11 +10,12 @@
 //!
 //! The falsifiable form of that claim, which is the point of stating it:
 //!
-//! * `src/dev/ata/disk.rs` contains **no I/O port address and no register
-//!   offset**. A register is named ([`Reg`]), never numbered.
-//! * `src/dev/pc/ide.rs` contains **no ATA command opcode, no `IDENTIFY` word
-//!   index and no status- or error-register bit**. It knows eight register
-//!   names, two chip selects and an interrupt line.
+//! * `src/dev/ata/disk.rs` and `src/dev/ata/atapi.rs` contain **no I/O port
+//!   address and no register offset**. A register is named ([`Reg`]), never
+//!   numbered.
+//! * `src/dev/pc/ide.rs` contains **no ATA command opcode, no SCSI one, no
+//!   `IDENTIFY` word index and no status- or error-register bit**. It knows
+//!   eight register names, two chip selects and an interrupt line.
 //!
 //! If either grep starts returning hits, the split has rotted.
 //!
@@ -45,12 +46,15 @@
 //! data register.
 //!
 //! The falsifiable form: **`disk.rs` and `atapi.rs` share no command dispatch
-//! and no `Volatile`**, and the only names `atapi.rs` imports from `disk` are
-//! the ones that belong to the *register file* — [`Reg`], the two status bits
+//! and no `Volatile`**, and every name `atapi.rs` imports from `disk` belongs
+//! to the *register file* rather than to either command set — [`Reg`],
+//! [`Position`], the Device, Device Control and Error bits, the two Status bits
 //! whose meaning is the same on both kinds of device, and `put_string`, which
 //! is how ATA lays an ASCII field into a word array whatever the device is.
-//! A driver tells them apart by the reset signature, which is the mechanism
-//! ATA/ATAPI-6 §9.1 provides for exactly this and which both devices leave.
+//! ([`AtaDisk`] comes with them as the return type of [`AtaDevice::as_disk`],
+//! and is never constructed or called there.) A driver tells the two apart by
+//! the reset signature, which is the mechanism ATA/ATAPI-6 §9.1 provides for
+//! exactly this and which both devices leave.
 //!
 //! # Finding each other
 //!
