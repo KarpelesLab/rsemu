@@ -804,23 +804,80 @@ port's interrupts, both sent the other rescheduling and function-call IPIs, and
 `/proc/stat` gives `cpu1` user time of its own. That is the same standard
 `riscv-virt-smp` and `arm64-virt-smp` are held to.
 
-### One line in that boot is new and is not this defect
+### And a fourth: the two counters did not agree
 
-`Measured 22 cycles TSC warp between CPUs, turning off TSC clock`, and then
-`Marking TSC unstable due to check_tsc_sync_source failed`. The two counters
-are a couple of dozen cycles apart when the second processor starts: a parked
-processor is charged its budget exactly, while a running one is charged whole
-instructions and carries the overshoot as `State::debt`, so its `RDTSC` stands
-ahead of its clock domain by however much the instruction in flight overran.
-The kernel compares the two, disbelieves the counter, and uses the HPET.
+The first boot with both processors running printed one line the
+one-processor board never could:
 
-It could not appear before, because nothing ever ran on the second processor
-for the kernel to compare against. It costs a **clocksource**, not a processor
-— the boot above is with it — and one cosmetic thing worth knowing so nobody
-hunts it twice: `printk` timestamps stop advancing at the switch, because an
-unstable TSC takes `sched_clock` off it too. The fix belongs with
-`State::debt` rather than with anything in this file, and it is a separate
-piece of work.
+```text
+[   25.059111] TSC synchronization [CPU#0 -> CPU#1]:
+[   25.059111] Measured 22 cycles TSC warp between CPUs, turning off TSC clock.
+[   25.059653] tsc: Marking TSC unstable due to check_tsc_sync_source failed
+[   37.056250] clocksource: Switched to clocksource hpet
+```
+
+A kernel will not use the time-stamp counter until it has watched its
+processors read it against each other under a lock (`check_tsc_warp`), and
+*Intel SDM* volume 3B §17.17.1 is why it is entitled to: an invariant TSC is
+driven by the crystal and "synchronized across all processors". One cycle
+backwards and the counter is gone, and with it `sched_clock` — which is why
+`printk` timestamps freeze at the switch.
+
+**Two causes, and each is the scheduler's rather than the guest's.** Both were
+found by logging every `RDTSC` this board executes in the twelve milliseconds
+either side of that line and looking at which processor read what:
+
+* A processor is charged **whole instructions**. The last one of a round runs
+  past the end of its grant, the scheduler is told the grant was spent, and the
+  overrun is carried into the next round as `State::debt` — while `RDTSC` read
+  a counter that had it. So a processor stood up to one instruction ahead of
+  its own clock domain, and a parked one, charged its budget exactly, stood
+  where the domain did. That is the 22.
+* Two runnables on one crystal **take turns**. Each is offered the whole round
+  from its own position and executes it before the next one starts
+  (`Scheduler::advance_runnable`), so the one that goes second spends its turn
+  at positions the first has already read the counter at — while its guest code
+  runs *after* the first's, takes the lock the first released, and reads a
+  counter that has gone backwards by up to a whole round. The same log has
+  those: 24 170, 47 116, 80 455 cycles, which is one round of this board each.
+
+The first is a counter that is not its processor's position; the second is a
+position that is not a time. The fix is both halves:
+
+* `RDTSC` reads **where the processor stands in its clock domain** — its charge
+  count less the debt, and capped where the round's grant ends, so neither end
+  of an instruction that overran shows (`cpu::x86::exec::State::tsc`).
+* A crystal has **one counter**, and a read of it never returns less than the
+  last value it gave anybody on that crystal
+  (`core::sched::TickCursor::shared_counter`). A processor that is behind reads
+  what its neighbour read; nothing but a guest reading the counter moves the
+  mark, and it cannot pass the end of the round, so what it distorts is bounded
+  by what the guest itself has looked at.
+
+Interpreted, the same command now prints no synchronisation line at all, and
+the counter survives the watchdog and its own refinement:
+
+```text
+[   25.043483] smpboot: x86: Booting SMP configuration:
+[   25.044744] .... node  #0, CPUs:      #1
+[   25.071819] smp: Brought up 1 node, 2 CPUs
+[   25.073234] smpboot: Total of 2 processors activated (400.00 BogoMIPS)
+[   36.933769] clocksource: Switched to clocksource tsc-early
+[   62.696178] tsc: Refined TSC clocksource calibration: 100.000 MHz
+[   62.701934] clocksource: Switched to clocksource tsc
+```
+
+The last two are past the end of a `--for 150s` run — this board spends about
+four guest seconds per kernel second with both processors interpreted, so the
+refinement lands at 400 s of `--for` — and `--for 150s` is enough to see the
+two lines that mattered disappear.
+
+`tests/x86_counter_resolution.rs`'s
+`two_processors_on_one_crystal_read_one_time_stamp_counter` is the ROM-free
+statement of it: the same check, hand-assembled, on `pc-apic` — both processors
+take a spinlock, read `RDTSC`, and compare with what the last holder read. It
+reports the worst backward step as **24 188 cycles** without the fix and **0**
+with it, on a run where the lock changes hands twenty-eight times.
 
 ### Selecting acceleration
 

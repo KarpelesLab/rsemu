@@ -1069,6 +1069,11 @@ struct CursorInner {
     /// `run` call began — the origin every view and every live position of
     /// this call is measured from. See [`TickCursor::anchor`].
     anchor: AtomicU64,
+    /// The furthest any runnable **on this crystal** has read its
+    /// free-running counter at. Shared by every cursor whose domain counts the
+    /// same thing (`Scheduler::ticks_alike`); see
+    /// [`TickCursor::shared_counter`].
+    counter: Arc<AtomicU64>,
 }
 
 impl TickCursor {
@@ -1084,6 +1089,14 @@ impl TickCursor {
     /// machine sees the same world stop.
     #[must_use]
     pub fn with_exit(exit: ExitFlag) -> TickCursor {
+        TickCursor::with_exit_on(exit, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// The same, reading the free-running counter `counter` rather than one of
+    /// its own — which is what makes two runnables on one crystal share it
+    /// ([`TickCursor::shared_counter`]).
+    #[must_use]
+    pub(crate) fn with_exit_on(exit: ExitFlag, counter: Arc<AtomicU64>) -> TickCursor {
         TickCursor {
             inner: Arc::new(CursorInner {
                 ticks: AtomicU64::new(0),
@@ -1093,8 +1106,52 @@ impl TickCursor {
                 view: Mutex::new(None),
                 requester: AtomicU32::new(0),
                 anchor: AtomicU64::new(0),
+                counter,
             }),
         }
+    }
+
+    /// The counter this cursor shares with the rest of its crystal.
+    pub(crate) fn counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.inner.counter)
+    }
+
+    /// Read the crystal's **own** free-running counter, at the position `at`
+    /// this runnable stands at in its domain, and never below the last value
+    /// it gave anybody on that crystal.
+    ///
+    /// # Why a shared number, when every runnable has a position of its own
+    ///
+    /// A crystal has one counter and every chip on it reads the same one. Two
+    /// runnables on one crystal take turns here, and each executes a whole
+    /// round from its start before the next one does
+    /// (`Scheduler::advance_runnable`), so the one that goes second spends its
+    /// whole turn at positions the first has already passed. Each reading at
+    /// its own position is right in isolation and wrong between them: the
+    /// second runnable's guest code runs *after* the first's — it sees its
+    /// stores, takes its locks — and would read a counter that had gone
+    /// backwards since.
+    ///
+    /// That is not a rounding artefact, it is a guest-visible one. An x86
+    /// kernel measures exactly this across its processors before it will trust
+    /// the time-stamp counter (*Intel SDM* vol. 3B §17.17.1, an invariant TSC
+    /// "synchronized across all processors in a system"), and one cycle of it
+    /// costs the guest its clocksource.
+    ///
+    /// So the counter is a high-water mark: a reader that stands behind it is
+    /// told what the crystal last said instead of what its own position says.
+    /// Which readers that reaches is bounded by the guest's own curiosity —
+    /// nothing but a read moves it — and the value is bounded above by where
+    /// the round ends, because every reader caps its own position there.
+    ///
+    /// **A read moves no device and arms nothing.** This is the counter's own
+    /// value, exactly as [`TickCursor::tick_in`] is a lazily advanced device's.
+    #[must_use]
+    pub fn shared_counter(&self, at: u64) -> u64 {
+        self.inner
+            .counter
+            .fetch_max(at, AtomicOrdering::Relaxed)
+            .max(at)
     }
 
     /// Whether this runnable has been asked to unwind to the scheduler.
@@ -3112,7 +3169,18 @@ impl Scheduler {
     /// Registers something to hand budgets to, running in `domain`.
     pub fn add_runnable(&mut self, domain: DomainId, runnable: Box<dyn Runnable>) -> RunnableId {
         let id = RunnableId(self.runnables.len() as u32);
-        let cursor = TickCursor::with_exit(self.safe.flag());
+        // One free-running counter per crystal: a runnable that ticks at the
+        // same rate off the same oscillator as one already registered reads
+        // the counter that one reads (`TickCursor::shared_counter`). Two
+        // processors of a multiprocessor board are exactly that, and they have
+        // a *domain* each — a position of their own on one crystal — which is
+        // why this is not simply keyed on the domain.
+        let counter = self
+            .runnables
+            .iter()
+            .find(|slot| self.ticks_alike(slot.domain, domain))
+            .map_or_else(|| Arc::new(AtomicU64::new(0)), |slot| slot.cursor.counter());
+        let cursor = TickCursor::with_exit_on(self.safe.flag(), counter);
         self.readers.cursors.lock().push(cursor.clone());
         self.runnables.push(RunnableSlot {
             domain,
@@ -4767,6 +4835,28 @@ impl Scheduler {
         shared
     }
 
+    /// Whether two domains count the same thing: the same oscillator at the
+    /// same rate, so that a tick of one is a tick of the other and a position
+    /// in one is a position in the other.
+    ///
+    /// What [`TickCursor::shared_counter`] is shared by. Fixed when a runnable
+    /// is registered, as a domain's root is; a board that re-rated one of two
+    /// processors after realize would leave them sharing a counter they no
+    /// longer both count, and no board does that — a divider between a
+    /// processor and its crystal is a property of the package.
+    fn ticks_alike(&self, a: DomainId, b: DomainId) -> bool {
+        let (Ok(ra), Ok(rb)) = (self.forest.root_of(a), self.forest.root_of(b)) else {
+            return false;
+        };
+        let (Ok(fa), Ok(fb)) = (
+            self.forest.domain_frequency(a),
+            self.forest.domain_frequency(b),
+        ) else {
+            return false;
+        };
+        ra == rb && fa == fb
+    }
+
     /// The crystal a runnable's domain is on, when the domain is running.
     fn active_root(&self, domain: DomainId) -> Option<OscillatorId> {
         if self.forest.is_gated(domain).unwrap_or(true) {
@@ -5271,6 +5361,53 @@ mod tests {
 
     fn osc_of(sched: &Scheduler, d: DomainId) -> OscillatorId {
         sched.forest().root_of(d).unwrap()
+    }
+
+    /// Two runnables on one crystal read **one** free-running counter, and a
+    /// third on a crystal of its own reads another.
+    ///
+    /// The number is a high-water mark, so a runnable that is behind — which
+    /// on a shared crystal is whichever one takes the second turn, for the
+    /// whole of it — is told what the crystal last said rather than what its
+    /// own position says. `cpu::x86` reads its time-stamp counter through
+    /// this, and a guest comparing two processors' counters is what it is for
+    /// (`TickCursor::shared_counter`).
+    #[test]
+    fn two_runnables_on_one_crystal_read_one_free_running_counter() {
+        let mut forest = ClockForest::new();
+        let core = forest
+            .add_oscillator("core", Rational::integer(1_000_000_000))
+            .unwrap();
+        let other = forest
+            .add_oscillator("other", Rational::integer(1_000_000_000))
+            .unwrap();
+        let a = forest.add_domain("a", core, 1, 1).unwrap();
+        let b = forest.add_domain("b", core, 1, 1).unwrap();
+        // The same crystal, half the rate: a tick of it is not a tick of `a`,
+        // so its positions are not comparable and it counts separately.
+        let half = forest.add_domain("half", core, 1, 2).unwrap();
+        let far = forest.add_domain("far", other, 1, 1).unwrap();
+        let mut sched = Scheduler::new(forest, SchedulerConfig::default());
+        for domain in [a, b, half, far] {
+            sched.add_runnable(domain, Box::new(Cpu::default()));
+        }
+        let cursor = |i: usize| sched.runnables[i].cursor.clone();
+
+        // `a` reads at 900, then `b` reads at 100 — the position it really
+        // stands at, taking the second turn in the same round.
+        assert_eq!(cursor(0).shared_counter(900), 900);
+        assert_eq!(
+            cursor(1).shared_counter(100),
+            900,
+            "the second runnable on the crystal read a counter that had gone \
+             backwards since the first read it"
+        );
+        // Past the mark, each reads its own position again.
+        assert_eq!(cursor(1).shared_counter(1_000), 1_000);
+        assert_eq!(cursor(0).shared_counter(1_100), 1_100);
+        // Neither the half-rate domain nor the other crystal is dragged along.
+        assert_eq!(cursor(2).shared_counter(10), 10);
+        assert_eq!(cursor(3).shared_counter(20), 20);
     }
 
     /// The crystal stands at the slower of its runnables, and the faster keeps

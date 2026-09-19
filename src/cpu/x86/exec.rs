@@ -311,10 +311,18 @@ pub(super) struct State {
     pub sse: Sse,
     /// The translation-lookaside buffer. Derived state: never serialized.
     pub tlb: Tlb,
-    /// Clock cycles elapsed since power-on: what `RDTSC` reads.
+    /// Clock cycles elapsed since power-on — the charge side of the
+    /// time-stamp counter.
     ///
     /// Elapsed rather than executed — a halted processor's counter counts the
     /// halt (`X86::run_budget`, *Intel SDM* vol. 3B §17.17.1).
+    ///
+    /// **Not what `RDTSC` reads.** This counter is charged whole instructions,
+    /// so it runs ahead of the processor's position in its clock domain by
+    /// whatever the instruction in flight overran the scheduler's grant by,
+    /// and that overrun is [`State::debt`]. [`State::tsc`] takes it back off
+    /// again; this field is the raw count every other consumer — the cycle
+    /// tables, the differential harness, `X86::cycles` — measures against.
     pub cycles: u64,
     /// Set by `HLT`; cleared by any interrupt or reset.
     pub halted: bool,
@@ -360,6 +368,49 @@ pub(super) struct State {
 }
 
 impl State {
+    /// The time-stamp counter as the guest reads it (`RDTSC`, `RDMSR`
+    /// `IA32_TIME_STAMP_COUNTER`): **where this processor stands in its clock
+    /// domain**, which is what the *Intel SDM* volume 3B §17.17.1 calls an
+    /// invariant TSC — a counter driven by the crystal at a constant rate, the
+    /// same one for every processor on it, whatever any of them is executing.
+    ///
+    /// [`State::cycles`] is not that number on its own, and `bias` is the
+    /// difference ([`Position::counter_bias`], zero on a core no scheduler is
+    /// driving). Two things pull the two apart, and both are the scheduler's
+    /// business rather than the guest's:
+    ///
+    /// * **The overrun.** An instruction cannot be stopped part-way, so the
+    ///   last one of a round charges past the end of the grant. The scheduler
+    ///   is told the grant was spent and the rest is carried as
+    ///   [`State::debt`], so the counter is read without it at both ends: the
+    ///   debt comes off here, and what was charged past the grant comes off
+    ///   through the bias. A counter that showed either would stand ahead of
+    ///   this processor's own clock domain, and so ahead of every other
+    ///   processor on the crystal.
+    /// * **The turn.** Two processors on one crystal each execute a whole
+    ///   round from its start, one after the other, so the one that goes
+    ///   second spends its turn at positions the first has already read the
+    ///   counter at — while its guest code runs *after* the first's and can
+    ///   order the two reads through memory. A crystal has one counter
+    ///   (`TickCursor::shared_counter`), and the bias carries how far behind it
+    ///   this reader stands.
+    #[inline]
+    #[must_use]
+    pub(super) fn tsc(&self, bias: u64) -> u64 {
+        self.cycles.wrapping_sub(self.debt).wrapping_add(bias)
+    }
+
+    /// Move the counter to `value`, as `WRMSR IA32_TIME_STAMP_COUNTER` and an
+    /// engine hand-over do (*Intel SDM* volume 3 §17.17.3).
+    ///
+    /// Through the same bias a read applies, so that the very next `RDTSC`
+    /// reads `value` back wherever in the round this processor stands — and so
+    /// that counting goes on from there at the crystal's rate, because what a
+    /// write moves is the counter and not the processor.
+    pub(super) fn set_tsc(&mut self, value: u64, bias: u64) {
+        self.cycles = value.wrapping_add(self.debt).wrapping_sub(bias);
+    }
+
     /// Power-on state, before the reset sequence has run.
     pub(super) fn new(variant: Variant) -> State {
         let (regs, sys) = if variant.is_32bit() {
@@ -462,22 +513,29 @@ pub(super) struct Exec<'a> {
 ///
 /// # Why not `State::cycles`
 ///
-/// `State::cycles` is the time-stamp counter, and three things move it that
-/// the scheduler's accounting never sees: a guest's `WRMSR` to `IA32_TSC`
-/// (*Intel SDM* volume 3 §17.17.3), [`X86::set_cycles`](super::X86::set_cycles)
-/// handing a count over from another engine, and a `HLT` that consumes a whole
-/// budget while charging nothing. The scheduler measures a published position
-/// against where the forest stands in this core's domain
-/// ([`TickCursor::anchor`]), and a live position is not capped at the round, so
-/// publishing the TSC would let one guest `WRMSR` carry every lazily advanced
-/// device on the board arbitrarily far into the future, and one `HLT` would
-/// leave the core publishing behind its own domain for the rest of the run.
+/// `State::cycles` is what the time-stamp counter is read off, and three
+/// things move it that the scheduler's accounting never sees: a guest's
+/// `WRMSR` to `IA32_TSC` (*Intel SDM* volume 3 §17.17.3),
+/// [`X86::set_cycles`](super::X86::set_cycles) handing a count over from
+/// another engine, and a `HLT` that consumes a whole budget while charging
+/// nothing. The scheduler measures a published position against where the
+/// forest stands in this core's domain ([`TickCursor::anchor`]), and a live
+/// position is not capped at the round, so publishing that count would let one
+/// guest `WRMSR` carry every lazily advanced device on the board arbitrarily
+/// far into the future, and one `HLT` would leave the core publishing behind
+/// its own domain for the rest of the run.
 ///
 /// So the number published is the scheduler's own: `origin`, set at the top of
 /// every `run` call to the anchor plus the cycle debt this core carries into it
 /// ([`X86::run_budget`](super::X86::run_budget)), advanced by what each step
 /// reports, plus what the step in progress has charged ([`Exec::used`]).
 /// Nothing a guest executes can reach it.
+///
+/// It is also what the counter a guest reads is measured *against*
+/// ([`Position::counter_bias`], [`State::tsc`]): the position without the
+/// debt, and capped at [`Position::ceiling`], is where this processor stands
+/// in its clock domain, which is the quantity two processors on one crystal
+/// have to agree on.
 #[derive(Debug)]
 pub(super) struct Position {
     /// The cursor the machine layer handed this core.
@@ -486,6 +544,41 @@ pub(super) struct Position {
     /// the forest's count for this core's domain when the `run` call began,
     /// plus the debt carried into it, plus every step's clocks since.
     pub(super) origin: u64,
+    /// The position this round's grant ends at — the forest's count when the
+    /// `run` call began, plus the ticks it was handed — or `u64::MAX` before
+    /// the first grant.
+    ///
+    /// Where the *time-stamp counter* stops (`State::tsc`), not where
+    /// execution does: an instruction that overruns the budget is executed in
+    /// full and charged in full, and the scheduler carries the overrun into
+    /// the next round rather than letting this core's domain run past the
+    /// timeline. A counter read past here would say the opposite to every
+    /// other processor on the crystal.
+    pub(super) ceiling: u64,
+}
+
+impl Position {
+    /// What this core's clock domain adds to its own charge count to make the
+    /// counter a guest reads: `lag − overrun`, as a wrapping delta
+    /// ([`State::tsc`]).
+    ///
+    /// `used` is what the step in progress has charged and `debt` the overrun
+    /// carried into this round, so `origin + used − debt` is where this core
+    /// stands in the domain — the published position without the part the
+    /// scheduler has not handed out. Capped at the grant, raised to the
+    /// crystal's own counter, and the difference from the uncapped position is
+    /// what the counter is read through.
+    ///
+    /// **This is the one place a `TickCursor`'s shared counter is moved**, so
+    /// nothing but a guest reading the time-stamp counter moves it.
+    #[inline]
+    #[must_use]
+    pub(super) fn counter_bias(&self, used: u64, debt: u64) -> u64 {
+        let own = self.origin.wrapping_add(used).wrapping_sub(debt);
+        self.cursor
+            .shared_counter(own.min(self.ceiling))
+            .wrapping_sub(own)
+    }
 }
 
 /// How many distinct written pages one borrow remembers before it gives up and
@@ -592,6 +685,28 @@ impl<'a> Exec<'a> {
         if let Some(position) = self.position {
             position.cursor.set(position.origin.wrapping_add(self.used));
         }
+    }
+
+    /// The time-stamp counter this core's guest reads, here and now.
+    ///
+    /// [`State::tsc`] through [`Position::counter_bias`] — and on a core no
+    /// scheduler is driving, which has neither a cursor nor a grant, the plain
+    /// charge count less the debt.
+    #[inline]
+    pub(super) fn tsc(&self) -> u64 {
+        let bias = self
+            .position
+            .map_or(0, |at| at.counter_bias(self.used, self.state.debt));
+        self.state.tsc(bias)
+    }
+
+    /// Move the counter, as `WRMSR IA32_TIME_STAMP_COUNTER` does, through the
+    /// same bias [`Exec::tsc`] reads it through.
+    pub(super) fn set_tsc(&mut self, value: u64) {
+        let bias = self
+            .position
+            .map_or(0, |at| at.counter_bias(self.used, self.state.debt));
+        self.state.set_tsc(value, bias);
     }
 
     /// Remember the guest-physical page a write landed on.

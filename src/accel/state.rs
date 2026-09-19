@@ -947,7 +947,7 @@ pub fn load_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
 /// if this host refuses `IA32_TSC`.
 pub fn restore_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
     load_into_vcpu(cpu, vcpu)?;
-    vcpu.set_msrs([(msr::TSC, cpu.cycles())])
+    vcpu.set_msrs([(msr::TSC, cpu.tsc())])
 }
 
 /// Copy a vCPU's architectural state into the interpreter.
@@ -1181,7 +1181,7 @@ impl ArchState {
                 },
                 ..Default::default()
             },
-            tsc: cpu.cycles(),
+            tsc: cpu.tsc(),
         }
     }
 
@@ -1548,7 +1548,7 @@ mod tests {
         let far = X86::new(crate::cpu::x86::Config::X86_64);
         state.into_interpreter(&far);
         assert_eq!(
-            far.cycles(),
+            far.tsc(),
             0x0000_4200_0000_0000,
             "and it lands where this core's RDTSC reads from"
         );

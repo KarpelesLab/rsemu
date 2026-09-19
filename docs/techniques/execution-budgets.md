@@ -235,7 +235,7 @@ rule:
 | --- | --- | --- |
 | `riscv-virt`, `riscv-virt-smp` | the `time` CSR and `MTIME`, both the CLINT's `mtime` | now the reader's own position, on both |
 | `arm64-virt`, `arm64-virt-smp` | `CNTPCT_EL0`/`CNTVCT_EL0` | never affected: the generic timer is the core's own cycle counter divided by an integer, per processor, inside the core |
-| `pc-at-smp`, `pc-apic`, `q35-linux-smp` | the TSC | never affected: `State::cycles`, per processor |
+| `pc-at-smp`, `pc-apic`, `q35-linux-smp` | the TSC | the reader's own position all along, and since *[Two processors, one counter](#two-processors-one-counter)* the position rather than the charge count — which is what made two of them agree |
 | every x86 board | the HPET, the ACPI PM timer, the 8254 and the local APIC's current count | now the reader's own position, on one processor and on two |
 
 The last row was a *different* defect with a different cause, and it is worth
@@ -538,6 +538,125 @@ guest itself doing about 1% different work: the console is byte-identical, but
 a loop counter in the final register dump reads `0x23284` before and `0x22ce4`
 after. A guest whose clock no longer stops while it idles does not idle
 identically, which is the point of the change rather than a cost of it.
+
+## Two processors, one counter
+
+The row above says the time-stamp counter was "never affected" by the reads
+defect, and that was true of *resolution*: `State::cycles` moved with every
+charge, so a guest reading it twice a few cycles apart saw it move. It was not
+true of **agreement**. The first `q35-linux-smp` boot that brought both
+processors up interpreted printed:
+
+```text
+[   25.059111] TSC synchronization [CPU#0 -> CPU#1]:
+[   25.059111] Measured 22 cycles TSC warp between CPUs, turning off TSC clock.
+[   25.059653] tsc: Marking TSC unstable due to check_tsc_sync_source failed
+[   37.056250] clocksource: Switched to clocksource hpet
+```
+
+A kernel will not use the counter until its processors have read it against
+each other under a lock, and *Intel SDM* volume 3B §17.17.1 is what entitles it
+to expect them to agree: an invariant TSC is driven by the crystal and
+"synchronized across all processors". One cycle backwards costs the
+clocksource, and `sched_clock` with it — which is why `printk` timestamps
+freeze at the switch.
+
+### The two causes are both the scheduler's
+
+**The overrun.** A processor is charged whole instructions, so the last one of
+a round runs past the end of its grant. The scheduler is told the grant was
+spent and carries the rest into the next round as `State::debt` — but `RDTSC`
+read the raw charge count, which had it. A running processor therefore stood
+up to one instruction ahead of its own clock domain while a parked one, charged
+its budget exactly, stood where the domain did. That is the 22.
+
+**The turn.** Two runnables on one crystal take turns: each is offered the
+whole round *from its own position* and executes it before the next one starts
+(*[Each runnable has a position of its own](#each-runnable-has-a-position-of-its-own)*),
+so the one that goes second spends its turn at positions the first has already
+passed. Its guest code runs after the first's — it sees its stores and takes
+the lock it released — and read a counter that had gone backwards since, by up
+to a whole round. Logging every `RDTSC` this board executes around that line
+shows both sizes in the same twelve milliseconds: 5, 4, 3, 22, 1 and 20 cycles
+from the first cause, 24 170, 47 116 and 80 455 from the second.
+
+The first is a counter that is not its processor's position. The second is a
+position that is not a time — the guest ordered two reads that virtual time
+does not order the same way, which no per-processor counter can answer.
+
+### What the counter is now
+
+```text
+RDTSC = max(own position, the crystal's counter) + what a WRMSR moved it by
+```
+
+* **Own position** is where this processor stands in its clock domain: its
+  charge count less the debt it carries, capped where the round's grant ends
+  (`cpu::x86::exec::State::tsc`, `Position::ceiling`). Neither end of an
+  instruction that overran shows, so at every round boundary the counter reads
+  the domain's own count and two processors on one crystal are equal by
+  construction. A halted processor is unchanged: it is charged the budget it
+  did not execute, exactly as before, so its counter counts the halt
+  (§17.17.1).
+* **The crystal's counter** is one number per crystal, shared by every runnable
+  that ticks at the same rate off the same oscillator
+  (`core::sched::TickCursor::shared_counter`, `Scheduler::ticks_alike`). A read
+  never returns less than the last value that counter gave anybody on it, so
+  the processor that is behind reads what its neighbour read. Nothing but a
+  guest reading the counter moves the mark and no read can pass the end of the
+  round, so what this distorts is bounded by what the guest has looked at and
+  by one round — and a processor's own reads stay monotone, since the mark only
+  grows.
+* **A `WRMSR`** (§17.17.3) and an engine hand-over (`X86::set_cycles`) move the
+  counter and not the processor: both go through the same position, so the
+  value written is the value read back and counting goes on from there at the
+  crystal's rate.
+
+`State::cycles` keeps its old meaning — clocks charged — because that is what
+the cycle tables, the differential harness and `X86::cycles` measure against.
+The counter a guest reads is now a function of it rather than it.
+
+### What it cost, and what moved
+
+`rsemu run q35-linux-smp --media kernel=… --media initrd=… --for 150s`, Gentoo
+`6.6.67`, one call, this change the only difference:
+
+| | before | after |
+| --- | --- | --- |
+| synchronisation | `Measured 22 cycles TSC warp between CPUs, turning off TSC clock`, `Marking TSC unstable due to check_tsc_sync_source failed` | no line at all |
+| clocksource | `Switched to clocksource hpet` | `Switched to clocksource tsc-early`, and at `--for 400s` — where this board's refinement lands, four guest seconds to the kernel's one — `Refined TSC clocksource calibration: 100.000 MHz` and `Switched to clocksource tsc` |
+
+`tests/x86_counter_resolution.rs`'s
+`two_processors_on_one_crystal_read_one_time_stamp_counter` is the ROM-free
+version of the kernel's own check, hand-assembled on `pc-apic`: both processors
+take a spinlock, read `RDTSC` and compare with what the last holder read. The
+worst backward step is **24 188 cycles** without the change and **0** with it,
+over a run in which the lock changes hands twenty-eight times, and neither
+processor's own reads ever move backwards.
+
+Under callgrind, on workloads that retire identical guest work:
+
+| workload | before | after | |
+| --- | --- | --- | --- |
+| `publishing_cost_workload` — a load/add/store loop that reads no clock, same state hash `0xb8ce224db26ec796` on both | 1 568 218 174 | 1 568 509 522 | **+0.019 %** |
+| `counter_read_cost_workload` — two million `RDTSC`s and nothing else | 10 805 670 240 | 10 867 859 481 | **+0.58 %**, 31 host instructions a read |
+
+The first is the hot path, and nothing in the change is on it: what an
+instruction which is neither `RDTSC` nor `RDMSR` pays is one more store per
+scheduler round. The second is the counter path itself, paying for the cap, the
+subtraction and one `fetch_max` on the crystal's counter.
+
+One measured figure in the tests moved. The alarm table — cycles from the
+instruction that arms a timer to the handler's `RDTSC`, against 12 500
+programmed — had a *spinning* processor reading seven to nine cycles more than
+a *halted* one, and the two now agree to the cycle: `q35` APIC 12 646 → 12 639
+against 12 639 halted, HPET 12 646 → 12 637 against 12 637, 8254 12 662 →
+12 654 against 12 654, and the same on `pc-apic`. The interrupt ends the round
+it is delivered in and the spinning processor is inside a `jmp $` when it
+arrives; the cycles of that jump charged past the grant used to show in its
+counter and no longer do. `ONE_JUMP` is still the slack the test asserts
+within — it is the bound on what a spinning processor can be inside, not a
+number that was measured.
 
 ## What publishing a position cost
 

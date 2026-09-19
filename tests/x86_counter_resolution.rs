@@ -62,6 +62,18 @@
 //!   tests at the bottom of this file are what it cost a guest. The alarm
 //!   program waits either way ([`Wait`]), so every arming measurement is taken
 //!   twice and the two must agree.
+//! * **Two processors agree on the time-stamp counter.** A crystal has one
+//!   counter and *Intel SDM* volume 3B §17.17.1 has an invariant TSC
+//!   "synchronized across all processors", so a guest is entitled to compare
+//!   two of them — and a Linux kernel does, under a lock, before it will use
+//!   the counter as a clocksource. That was a third defect with a third cause,
+//!   or rather two: a counter read off the charge count stood ahead of its own
+//!   clock domain by the instruction that overran the round, and the processor
+//!   that takes the second turn in a round reads at positions the first has
+//!   already been past. `q35-linux-smp` answered `Measured 22 cycles TSC warp
+//!   between CPUs, turning off TSC clock` and fell back to the HPET;
+//!   `two_processors_on_one_crystal_read_one_time_stamp_counter` is that check
+//!   written out in guest code, and it asserts **zero**.
 //! * **Determinism.** The same program gives the same samples under
 //!   [`ThreadingMode::Parallel`], because a read at one's own position
 //!   involves nobody else.
@@ -250,15 +262,21 @@ fn boot(socket: Socket) -> (Vec<u8>, Vec<u8>) {
     dw(&mut gdt_ptr, lin(OFF_GDT));
     put(&mut rom, socket, OFF_GDT_PTR, &gdt_ptr);
 
-    // -- protected mode -----------------------------------------------------
+    (rom, pm_prologue(0xf000))
+}
+
+/// The first instructions of protected mode: the flat data segments and a
+/// stack. A processor started by a Start-Up runs the same ones, off a stack of
+/// its own.
+fn pm_prologue(esp: u32) -> Vec<u8> {
     let mut pm: Vec<u8> = Vec::new();
     pm.extend_from_slice(&[0xb8, 0x10, 0x00, 0x00, 0x00]); // mov eax, 0x10
     pm.extend_from_slice(&[0x8e, 0xd8]); // mov ds, ax
     pm.extend_from_slice(&[0x8e, 0xc0]); // mov es, ax
     pm.extend_from_slice(&[0x8e, 0xd0]); // mov ss, ax
-    pm.push(0xbc); // mov esp, 0xf000
-    dw(&mut pm, 0xf000);
-    (rom, pm)
+    pm.push(0xbc); // mov esp, imm32
+    dw(&mut pm, esp);
+    pm
 }
 
 /// The sampling program proper, appended to [`boot`]'s protected-mode entry.
@@ -905,7 +923,12 @@ const SHARED_SPINS: [u32; 6] = [1_380, 3_463, 5_546, 7_630, 9_713, 11_796];
 /// there: the timer started up to a round before the instruction that armed
 /// it and fired that much early. Measured on this board with this program,
 /// from the arming access to the handler against a 12 500 floor: APIC 3 659 →
-/// 12 646, HPET 3 494 → 12 646, 8254 3 565 → 12 651. The write now carries the
+/// 12 639, HPET 3 494 → 12 638, 8254 3 565 → 12 656, at the first of the six
+/// spins below and within nine cycles of that at the others — where the whole
+/// set used to read one figure, 12 646, because the counter carried the
+/// overrun of the jump the processor was inside and the clamp at the grant
+/// now takes it off wherever in the round the interrupt lands
+/// (`cpu::x86::exec::State::tsc`). The write now carries the
 /// writer's position into the device (`LazyHandle::writer_tick`) without
 /// moving the device there, and the device's event is then an absolute
 /// instant a later round ends on.
@@ -1180,6 +1203,64 @@ fn publishing_cost_workload() {
     println!("state hash {:#018x}", m.state_hash().expect("a hash"));
 }
 
+/// Where the guest that reads the counter says it has finished.
+#[cfg(feature = "dev-q35")]
+const READ_DONE: u32 = 0x5400;
+/// How many times it reads it: enough to dominate the run, few enough that
+/// both builds certainly finish inside the window.
+#[cfg(feature = "dev-q35")]
+const READS: u32 = 2_000_000;
+
+/// The same measurement for the *counter* path: a loop that does nothing but
+/// `RDTSC`, on `q35`, with a fixed count so that both builds retire exactly
+/// the same guest instructions — six million of them — and the sentinel at
+/// [`READ_DONE`] says both reached the end.
+///
+/// This is where reading the counter through the clock domain rather than off
+/// the charge count is paid for: a cap, a subtraction and the crystal's own
+/// counter (`TickCursor::shared_counter`, one `fetch_max`) per read, against a
+/// load of `State::cycles`. Nothing else in that change is on a path an
+/// instruction which is neither `RDTSC` nor `RDMSR` reaches, which is what
+/// [`publishing_cost_workload`] is here to show. Taken the same way:
+///
+/// ```text
+/// valgrind --tool=callgrind <this test binary> --ignored --exact \
+///     counter_read_cost_workload
+/// ```
+#[cfg(feature = "dev-q35")]
+#[test]
+#[ignore = "a measurement: run it under callgrind"]
+fn counter_read_cost_workload() {
+    let (mut rom, mut pm) = boot(Q35_SOCKET);
+    pm.push(0xb9); // mov ecx, READS
+    dw(&mut pm, READS);
+    let top = pm.len();
+    pm.extend_from_slice(&[0x0f, 0x31]); // rdtsc
+    pm.push(0x49); // dec ecx
+    let back = top as i32 - (pm.len() as i32 + 2);
+    pm.extend_from_slice(&[0x75, back as i8 as u8]); // jnz top
+    pm.extend_from_slice(&[0xc7, 0x05]); // mov dword [READ_DONE], sentinel
+    dw(&mut pm, READ_DONE);
+    dw(&mut pm, 0x00d0_0e00);
+    pm.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+    put(&mut rom, Q35_SOCKET, OFF_PM, &pm);
+
+    let mut m = board_with("q35.machine", Q35, rom, ThreadingMode::Deterministic);
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    m.run_for(GlobalTime::from_nanos(2_000_000_000))
+        .expect("the machine runs");
+    let mem = m.space("mem").expect("the memory space");
+    let done = mem
+        .read(u64::from(READ_DONE), Width::U32, MemAttrs::DEBUG)
+        .expect("a mapped word");
+    assert_eq!(
+        done, 0x00d0_0e00,
+        "the loop did not finish, so the two builds did not retire the same work"
+    );
+    println!("{READS} reads, done {done:#x}");
+}
+
 /// **The rate a guest measures is the rate the machine file declares** — on
 /// one processor and on two, and whether the caller ran the machine in one
 /// call or in one-millisecond ones.
@@ -1270,19 +1351,31 @@ const ONE_JUMP: u64 = 16;
 /// because it charges every cycle by executing it.
 ///
 /// Measured, cycles from the arming access to the handler, spinning against
-/// halted, 12 500 of them programmed. The middle column is what a counter
-/// that stopped with its processor showed; the parenthesised figures in the
+/// halted, 12 500 of them programmed. The third column is what a counter that
+/// stopped with its processor showed; the parenthesised figures in the
 /// `pc-apic` rows are what both columns read before *the other* defect in
 /// this file was fixed, and the paragraph below says what that one was:
 ///
 /// | board | source | spinning | halted, counter stopped | halted, now |
 /// | --- | --- | --- | --- | --- |
-/// | `q35` | APIC | 12 646 | 143 | 12 639 |
-/// | `q35` | HPET | 12 646 | 143 | 12 637 |
-/// | `q35` | 8254 | 12 662 | 137 | 12 654 |
-/// | `pc-apic` | APIC | 12 646 (was 3 659) | 143 | 12 639 (was 3 650) |
-/// | `pc-apic` | HPET | 12 646 (was 3 494) | 143 | 12 638 (was 3 487) |
-/// | `pc-apic` | 8254 | 12 651 (was 3 565) | 137 | 12 650 (was 3 562) |
+/// | `q35` | APIC | 12 639 (was 12 646) | 143 | 12 639 |
+/// | `q35` | HPET | 12 637 (was 12 646) | 143 | 12 637 |
+/// | `q35` | 8254 | 12 654 (was 12 662) | 137 | 12 654 |
+/// | `pc-apic` | APIC | 12 639 (was 12 646, and 3 659) | 143 | 12 639 (was 3 650) |
+/// | `pc-apic` | HPET | 12 638 (was 12 646, and 3 494) | 143 | 12 638 (was 3 487) |
+/// | `pc-apic` | 8254 | 12 650 (was 12 651, and 3 565) | 137 | 12 650 (was 3 562) |
+///
+/// **The two columns now agree to the cycle**, where the spinning one used to
+/// read seven to nine cycles more, and that is the counter no longer showing
+/// the overrun. The interrupt ends the round it is delivered in; the spinning
+/// processor is inside the `jmp $` when it arrives and charges the rest of
+/// that jump past the end of its grant, which the scheduler carries as
+/// `State::debt` and hands back out of the next round. Its counter used to
+/// show those cycles and now stops where the grant does
+/// (`cpu::x86::exec::State::tsc`), so halting costs the counter exactly
+/// nothing rather than nothing to within one instruction. [`ONE_JUMP`] is
+/// still the slack this asserts within, because it is the bound on what a
+/// spinning processor can be inside, not a figure that was measured.
 ///
 /// Before, `X86::run_budget` consumed a halted processor's budget and charged
 /// the counter none of it, so the handler saw only the arming store and its
@@ -1578,4 +1671,259 @@ fn idle(mode: ThreadingMode, wait: Wait) -> (u64, u64, u64) {
         word(IDLE_AFTER).wrapping_sub(word(IDLE_BEFORE)) & 0xffff_ffff,
         word(IDLE_AFTER + 4).wrapping_sub(word(IDLE_BEFORE + 4)) & 0xffff_ffff,
     )
+}
+
+// ---------------------------------------------------------------------------
+// two processors on one crystal, reading one counter
+// ---------------------------------------------------------------------------
+
+/// The shared block the warp check keeps its state in, in low RAM.
+const W_LOCK: u32 = 0x6000;
+/// The last counter value either processor read, and which of them read it.
+const W_LAST: u32 = 0x6004;
+const W_LASTCPU: u32 = 0x6008;
+/// The largest backward step between one processor's read and the next one's.
+const W_WARP: u32 = 0x600c;
+/// How many times the processors changed places inside the lock.
+const W_HANDOFF: u32 = 0x6010;
+/// Per processor: turns taken, its own last read, and backward steps in it.
+const W_TURNS: [u32; 2] = [0x6014, 0x6018];
+const W_OWN: [u32; 2] = [0x601c, 0x6020];
+const W_BACK: [u32; 2] = [0x6024, 0x6028];
+
+/// Turns each processor is asked for: more than it can take in the time the
+/// test runs, so both are still going when the run ends and neither leaves the
+/// other alone in the lock.
+const W_TURNS_ASKED: u32 = 10_000_000;
+
+/// The Start-Up vector for this program: page `0xe1`, in `pc-apic`'s socket.
+const W_PAGE: u8 = 0xe1;
+/// Where the application processor's protected-mode half sits.
+const OFF_AP_PM: usize = 0x0800;
+
+/// The real-mode stub a Start-Up lands on: the same three steps
+/// [`boot`] takes — a flat GDT, `CR0.PE`, a far jump — into `target`.
+fn ap_entry(target: u32) -> Vec<u8> {
+    let mut entry: Vec<u8> = Vec::new();
+    entry.push(0xfa); // cli
+    entry.extend_from_slice(&[0xb8, 0x00, 0xf0]); // mov ax, 0xf000
+    entry.extend_from_slice(&[0x8e, 0xd8]); // mov ds, ax
+    entry.extend_from_slice(&[0x0f, 0x01, 0x16]); // lgdt [OFF_GDT_PTR]
+    entry.extend_from_slice(&(OFF_GDT_PTR as u16).to_le_bytes());
+    entry.extend_from_slice(&[0x0f, 0x20, 0xc0]); // mov eax, cr0
+    entry.extend_from_slice(&[0x0c, 0x01]); // or al, 1
+    entry.extend_from_slice(&[0x0f, 0x22, 0xc0]); // mov cr0, eax
+    entry.extend_from_slice(&[0x66, 0xea]); // jmp far 0x08:target
+    dw(&mut entry, target);
+    entry.extend_from_slice(&[0x08, 0x00]);
+    entry
+}
+
+/// Two processors on one crystal agree on the time-stamp counter, in the order
+/// the guest itself can put their reads in.
+///
+/// # What this is a regression against
+///
+/// An invariant TSC is a counter driven by the crystal, one per package, and
+/// *Intel SDM* volume 3B §17.17.1 has it "synchronized across all processors":
+/// a guest is entitled to compare two of them. Linux does, before it will use
+/// the TSC as a clocksource, and on `q35-linux-smp` it used to answer
+/// `Measured 22 cycles TSC warp between CPUs, turning off TSC clock` —
+/// `check_tsc_sync_source failed`, `Marking TSC unstable`, the HPET instead,
+/// and `printk` timestamps frozen with `sched_clock` taken off the counter.
+///
+/// Two causes, both of them the scheduler's rather than the guest's, and this
+/// program is the shape of the check that finds them:
+///
+/// * A processor is charged **whole instructions**, so the last one of a round
+///   runs past the end of its grant and the overrun is carried as
+///   `State::debt`. Its counter stood that far ahead of its own clock domain —
+///   and so of a processor parked beside it, which is charged its budget
+///   exactly.
+/// * Two runnables on one crystal **take turns**, each executing a whole round
+///   from its start (`Scheduler::advance_runnable`), so the one that goes
+///   second spends its turn at positions the first has already read the
+///   counter at. Its guest code runs after the first's — it takes the lock the
+///   first released — and read a counter that had gone backwards since, by up
+///   to a whole round.
+///
+/// # What it asserts
+///
+/// Both processors run the same loop: take a spinlock, read `RDTSC`, compare
+/// it with what the last holder of the lock read, record the largest backward
+/// step, release. The lock is what orders the reads, and the handoff count is
+/// what says the two processors really did interleave inside it rather than
+/// the test measuring one processor against itself.
+///
+/// * **No warp at all.** Not "small": this core has one crystal, no per-core
+///   offset and nothing that models one, so the SDM's synchronised counter is
+///   an exact statement here.
+/// * **Monotonic per processor**, which is the property the fix must not buy
+///   the first one with: a counter clamped up to its neighbour's must still
+///   never step back for its own reader.
+#[test]
+fn two_processors_on_one_crystal_read_one_time_stamp_counter() {
+    let (mut rom, mut pm) = boot(PC_APIC_SOCKET);
+    // The local APIC, software-enabled, and the Start-Up that brings the other
+    // processor out of the wait an INIT left it in (SDM vol. 3A §8.4.3). No
+    // INIT first: `pc-apic` parks its second processor at reset.
+    pm.push(0xbf); // mov edi, 0xfee00000
+    dw(&mut pm, 0xfee0_0000);
+    store_at(&mut pm, 0x0f0, 0x1ff);
+    store_at(&mut pm, 0x310, 1 << 24);
+    store_at(&mut pm, 0x300, 0x0000_4600 | u32::from(W_PAGE));
+    pm.extend_from_slice(&warp_check(0, W_TURNS_ASKED));
+    put(&mut rom, PC_APIC_SOCKET, OFF_PM, &pm);
+
+    let mut ap = pm_prologue(0xe000);
+    ap.extend_from_slice(&warp_check(1, W_TURNS_ASKED));
+    put(&mut rom, PC_APIC_SOCKET, OFF_AP_PM, &ap);
+    let stub = ap_entry(lin(OFF_AP_PM));
+    let at = ((u32::from(W_PAGE) << 12) - PC_APIC_SOCKET.base) as usize;
+    rom[at..at + stub.len()].copy_from_slice(&stub);
+
+    for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+        let mut m = board_with("pc-apic.machine", PC_APIC, rom.clone(), mode);
+        m.reset(ResetKind::Cold);
+        m.sweep();
+        m.run_for(GlobalTime::from_nanos(60_000_000))
+            .expect("the machine runs");
+        let mem = m.space("mem").expect("the memory space");
+        let word = |at: u32| {
+            mem.read(u64::from(at), Width::U32, MemAttrs::DEBUG)
+                .expect("a mapped word") as u32
+        };
+        let (turns, backs) = (
+            [word(W_TURNS[0]), word(W_TURNS[1])],
+            [word(W_BACK[0]), word(W_BACK[1])],
+        );
+        let (handoffs, warp) = (word(W_HANDOFF), word(W_WARP));
+        println!(
+            "-- {mode:?}: turns {turns:?}, handoffs {handoffs}, worst warp {warp}, \
+             backward steps {backs:?}"
+        );
+        // The measurement is only worth anything if both processors took turns
+        // in the lock. Sixty milliseconds of this board is sixty rounds; the
+        // second processor is started a few of them in, and the lock changes
+        // hands at least once in every round after that — twenty-eight, the
+        // run this was written against.
+        for (cpu, count) in turns.iter().enumerate() {
+            assert!(
+                *count > 1_000,
+                "{mode:?}: processor {cpu} took {count} turns in the lock, too \
+                 few for the comparison to have happened"
+            );
+        }
+        assert!(
+            handoffs > 20,
+            "{mode:?}: the processors changed places in the lock {handoffs} \
+             times in sixty rounds — the two never read the counter against \
+             each other, so a warp could not have shown"
+        );
+        assert_eq!(
+            warp, 0,
+            "{mode:?}: one processor read the counter {warp} cycles behind what \
+             the other had already read from it, in an order the guest imposed \
+             with a lock. Two processors on one crystal read one counter \
+             (*Intel SDM* vol. 3B §17.17.1)"
+        );
+        assert_eq!(
+            backs,
+            [0, 0],
+            "{mode:?}: a processor's own reads went backwards"
+        );
+    }
+}
+
+/// The warp check itself, as a Linux kernel writes it (`check_tsc_warp`):
+/// take a lock, read the counter, compare it with what the last holder read,
+/// record any backward step, release.
+///
+/// `which` is the processor's index, which picks its counters apart; the code
+/// is otherwise identical on both, so nothing but position can make them
+/// differ. `esi` counts the turns down and no other register survives a turn.
+fn warp_check(which: usize, turns: u32) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.push(0xbe); // mov esi, turns
+    dw(&mut out, turns);
+    let top = out.len();
+
+    // -- acquire ------------------------------------------------------------
+    let acquire = out.len();
+    out.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+    out.extend_from_slice(&[0x87, 0x05]); // xchg [W_LOCK], eax
+    dw(&mut out, W_LOCK);
+    out.extend_from_slice(&[0x85, 0xc0]); // test eax, eax
+    out.extend_from_slice(&[0x75, 0]); // jnz acquire
+    let back = acquire as i64 - out.len() as i64;
+    *out.last_mut().expect("just pushed") = back as u8;
+
+    // -- prev, then this processor's own read -------------------------------
+    out.extend_from_slice(&[0x8b, 0x1d]); // mov ebx, [W_LAST]
+    dw(&mut out, W_LAST);
+    out.extend_from_slice(&[0x0f, 0x31]); // rdtsc
+    out.push(0xa3); // mov [W_LAST], eax
+    dw(&mut out, W_LAST);
+
+    // -- the warp: prev > now, between two processors -----------------------
+    out.extend_from_slice(&[0x39, 0xd8]); // cmp eax, ebx
+    let skip_warp = patch_jcc(&mut out, 0x73); // jae past the record
+    out.extend_from_slice(&[0x89, 0xd9]); // mov ecx, ebx
+    out.extend_from_slice(&[0x29, 0xc1]); // sub ecx, eax
+    out.extend_from_slice(&[0x3b, 0x0d]); // cmp ecx, [W_WARP]
+    dw(&mut out, W_WARP);
+    let skip_max = patch_jcc(&mut out, 0x76); // jbe past the store
+    out.extend_from_slice(&[0x89, 0x0d]); // mov [W_WARP], ecx
+    dw(&mut out, W_WARP);
+    land(&mut out, skip_warp);
+    land(&mut out, skip_max);
+
+    // -- this processor's own monotonicity ----------------------------------
+    out.extend_from_slice(&[0x3b, 0x05]); // cmp eax, [W_OWN[which]]
+    dw(&mut out, W_OWN[which]);
+    let skip_back = patch_jcc(&mut out, 0x73); // jae past the count
+    out.extend_from_slice(&[0xff, 0x05]); // inc dword [W_BACK[which]]
+    dw(&mut out, W_BACK[which]);
+    land(&mut out, skip_back);
+    out.push(0xa3); // mov [W_OWN[which]], eax
+    dw(&mut out, W_OWN[which]);
+
+    // -- did the processors change places? ----------------------------------
+    out.extend_from_slice(&[0x83, 0x3d]); // cmp dword [W_LASTCPU], which
+    dw(&mut out, W_LASTCPU);
+    out.push(which as u8);
+    let same = patch_jcc(&mut out, 0x74); // je past the count
+    out.extend_from_slice(&[0xff, 0x05]); // inc dword [W_HANDOFF]
+    dw(&mut out, W_HANDOFF);
+    out.extend_from_slice(&[0xc7, 0x05]); // mov dword [W_LASTCPU], which
+    dw(&mut out, W_LASTCPU);
+    dw(&mut out, which as u32);
+    land(&mut out, same);
+
+    out.extend_from_slice(&[0xff, 0x05]); // inc dword [W_TURNS[which]]
+    dw(&mut out, W_TURNS[which]);
+
+    // -- release, and round again -------------------------------------------
+    out.extend_from_slice(&[0xc7, 0x05]); // mov dword [W_LOCK], 0
+    dw(&mut out, W_LOCK);
+    dw(&mut out, 0);
+    out.push(0x4e); // dec esi
+    out.extend_from_slice(&[0x0f, 0x85]); // jnz top — the body is long
+    let back = top as i64 - (out.len() + 4) as i64;
+    dw(&mut out, back as u32);
+    out.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+    out
+}
+
+/// Emit a short conditional jump with its displacement left blank, and hand
+/// back where to patch it.
+fn patch_jcc(out: &mut Vec<u8>, opcode: u8) -> usize {
+    out.extend_from_slice(&[opcode, 0]);
+    out.len() - 1
+}
+
+/// Point a jump left by [`patch_jcc`] at here.
+fn land(out: &mut [u8], at: usize) {
+    let rel = out.len() - at - 1;
+    out[at] = u8::try_from(rel).expect("a short jump");
 }

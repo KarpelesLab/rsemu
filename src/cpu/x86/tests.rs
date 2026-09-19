@@ -3502,6 +3502,46 @@ fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
     );
 }
 
+/// And the counter a guest reads carries none of that debt.
+///
+/// `State::cycles` is charged whole instructions, so a core that stopped
+/// part-way through a budget has charged cycles its clock domain has not
+/// handed out yet — and a guest reading them stands ahead of its own domain,
+/// and so ahead of a processor beside it on the same crystal, which is what a
+/// kernel's time-stamp synchronisation check measures (*Intel SDM* vol. 3B
+/// §17.17.1). `X86::tsc` is the counter without it: after every budget, it has
+/// advanced by exactly the ticks that were granted.
+#[test]
+fn the_counter_a_guest_reads_advances_by_the_budget_and_not_by_the_debt() {
+    let pc = pc386();
+    pc.start_protected();
+    // Increments and a jump: three, four and seven clocks, so a budget of five
+    // lands inside an instruction most rounds and the debt is rarely zero.
+    pc.write(at::CODE0, &[0x40, 0x40, 0x40, 0xeb, 0xfb]);
+    let before = pc.cpu.tsc();
+    let mut granted = 0u64;
+    let mut saw_debt = false;
+    for _ in 0..64 {
+        granted += pc.cpu.run_budget(5);
+        saw_debt |= pc.cpu.cycle_debt() > 0;
+        assert_eq!(
+            pc.cpu.tsc(),
+            before + granted,
+            "the counter is the ticks this core's domain has handed it"
+        );
+        assert_eq!(
+            pc.cpu.tsc() + pc.cpu.cycle_debt(),
+            pc.cpu.cycles(),
+            "and the difference from the charge count is exactly the debt"
+        );
+    }
+    assert_eq!(granted, 320, "every tick of every budget was granted");
+    assert!(
+        saw_debt,
+        "no budget ever ended inside an instruction, so this asserted nothing"
+    );
+}
+
 // ===========================================================================
 // Long mode
 // ===========================================================================

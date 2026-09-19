@@ -2650,7 +2650,8 @@ impl X86 {
         }
     }
 
-    /// Clock cycles elapsed since power-on — the time-stamp counter.
+    /// Clock cycles elapsed since power-on — the charge side of the
+    /// time-stamp counter, which [`tsc`](X86::tsc) is the guest's side of.
     ///
     /// Four per bus cycle plus the manual's internal execution figures. This
     /// is documented timing rather than measured timing: the bus interface
@@ -2670,10 +2671,35 @@ impl X86 {
         self.session.lock().state.cycles
     }
 
+    /// The time-stamp counter as the guest reads it: where this processor
+    /// stands in its clock domain.
+    ///
+    /// [`cycles`](X86::cycles) less the overrun the scheduler has not handed
+    /// out yet ([`cycle_debt`](X86::cycle_debt)) — `exec::State::tsc` says why
+    /// the two are different numbers and why a guest comparing two processors
+    /// needs this one. They differ by at most one instruction, and never at a
+    /// round boundary.
+    #[must_use]
+    pub fn tsc(&self) -> u64 {
+        let session = self.session.lock();
+        let bias = Self::counter_bias(&session);
+        session.state.tsc(bias)
+    }
+
+    /// What this core's clock domain adds to its charge count to make the
+    /// counter, between steps — [`Position::counter_bias`] with nothing
+    /// charged since the last one.
+    fn counter_bias(session: &Session) -> u64 {
+        session
+            .position
+            .as_ref()
+            .map_or(0, |at| at.counter_bias(0, session.state.debt))
+    }
+
     /// Overwrite the counter — which is to say, overwrite `IA32_TSC`.
     ///
     /// **This is a time-stamp counter setter, not a performance counter's.**
-    /// [`cycles`](X86::cycles) is what `RDTSC` reads on this core
+    /// [`tsc`](X86::tsc) is what `RDTSC` reads on this core
     /// (`prot::Exec::rdmsr`, [`msr::TSC`](prot::msr::TSC)), so it is the one
     /// piece of architectural state that a second engine can hand over: what a
     /// hypervisor reports for `IA32_TSC` and what this core reports for it are
@@ -2687,8 +2713,15 @@ impl X86 {
     /// timekeeping is not — see the module documentation of
     /// [`accel::state`](crate::accel::state) for what an engine switch does to
     /// a calibrated TSC.
+    ///
+    /// The value lands where [`tsc`](X86::tsc) will read it back, not on the
+    /// raw charge count: a hand-over that arrived while this core carried an
+    /// overrun would otherwise move the guest's counter by that overrun
+    /// (`exec::State::set_tsc`).
     pub fn set_cycles(&self, cycles: u64) {
-        self.session.lock().state.cycles = cycles;
+        let mut session = self.session.lock();
+        let bias = Self::counter_bias(&session);
+        session.state.set_tsc(cycles, bias);
     }
 
     /// Whether a `HLT` has stopped the core.
@@ -3044,6 +3077,12 @@ impl X86 {
     /// [`run_budget`](X86::run_budget) is the same loop with the overshoot
     /// carried forward instead, which is what the scheduler needs.
     pub fn run(&self, budget: u64) -> u64 {
+        // No scheduler grant is in force here — this entry point carries no
+        // overshoot into a next round and reports what it charged — so the
+        // counter is read with no ceiling on it (`exec::Position::ceiling`).
+        if let Some(position) = self.session.lock().position.as_mut() {
+            position.ceiling = u64::MAX;
+        }
         let mut used = 0;
         while used < budget {
             let n = self.advance(budget - used);
@@ -3079,7 +3118,16 @@ impl X86 {
             // (`exec::Position`). The same lock the debt is read under: this is
             // once per round, not once per instruction.
             if let Some(position) = session.position.as_mut() {
-                position.origin = position.cursor.anchor().wrapping_add(owed);
+                let anchor = position.cursor.anchor();
+                position.origin = anchor.wrapping_add(owed);
+                // And where the grant ends, which is what the guest's
+                // time-stamp counter is read through for the length of it
+                // (`exec::Position::ceiling`, `exec::State::tsc`): the
+                // instruction that overruns the budget charges past it, and
+                // the counter holds here while it does, because the scheduler
+                // has told every other processor on the crystal that this one
+                // stopped where the round did.
+                position.ceiling = anchor.wrapping_add(ticks);
             }
             owed
         };
@@ -3101,7 +3149,7 @@ impl X86 {
                 // that would wake it.
                 //
                 // **And the time-stamp counter goes on counting through it.**
-                // `State::cycles` is what `RDTSC` reads, and the processor
+                // The counter is read off this charge count, and the processor
                 // stands at the end of this budget whether it executed to it
                 // or waited for it, so the rest of the allowance is charged to
                 // the counter in one addition rather than one idle clock at a
@@ -3114,13 +3162,23 @@ impl X86 {
                 // a processor started half a second into a boot would
                 // otherwise read a TSC half a second behind its neighbour's.
                 //
-                // Nothing here is the *published* position: the scheduler's
-                // anchor still carries that, so a counter that a guest
-                // `WRMSR` or an accel hand-over moved counts on from wherever
-                // it was put, and the budget reported is `ticks` as before.
+                // Nothing here is the *published* position in the sense that
+                // could move a device: a guest's `WRMSR` or an accel hand-over
+                // moves the counter and not the position, and the budget
+                // reported is `ticks` as before. The position does move,
+                // because the processor really is at the end of this budget,
+                // and the two are kept in step so that
+                // `exec::Position::counter_bias` measures the counter against
+                // where this core stands rather than where it stopped
+                // executing — the next call re-anchors it either way, but
+                // `X86::tsc` and `X86::set_cycles` read it between rounds.
                 let mut session = self.session.lock();
+                let idle = allowance - used;
                 session.state.debt = 0;
-                session.state.cycles = session.state.cycles.wrapping_add(allowance - used);
+                session.state.cycles = session.state.cycles.wrapping_add(idle);
+                if let Some(position) = session.position.as_mut() {
+                    position.origin = position.origin.wrapping_add(idle);
+                }
                 return ticks;
             }
             used += n;
@@ -3155,6 +3213,7 @@ impl X86 {
         self.session.lock().position = Some(Position {
             cursor: cursor.clone(),
             origin: cursor.anchor(),
+            ceiling: u64::MAX,
         });
     }
 

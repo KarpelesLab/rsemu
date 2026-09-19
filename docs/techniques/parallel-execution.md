@@ -287,6 +287,22 @@ Before it, every printk timestamp Linux wrote on `riscv-virt-smp` was a whole
 millisecond — the length of a round — because `time` could not move inside
 one.
 
+**One counter needs more than the reader's own position, and it is the one the
+guest compares between processors.** An x86 time-stamp counter is inside the
+processor rather than on the bus, so each reads its own — and a kernel checks
+the two against each other under a lock before it will trust either (*Intel
+SDM* vol. 3B §17.17.1, an invariant TSC "synchronized across all processors").
+The processor that takes the second turn in a round reads at positions the
+first has already been past, while its guest code runs *after* the first's and
+can order the two reads; each reading at its own position is right in isolation
+and a warp between them. So the crystal keeps one counter
+(`TickCursor::shared_counter`) and a read never returns less than the last
+value it gave anybody on that crystal. It is raised by nothing but a guest
+reading the counter, and no read may pass the end of the round, so a reader
+that is behind is told what its neighbour read and nothing else changes: no
+device moves, no comparator fires, and every other counter above is still a
+function of the reader's position alone.
+
 **A write that arms a comparator is the other half, and it needs more care.**
 A read moves nothing; a write schedules a future event, and the interval it
 names starts at the instruction that made it. Applied where the device stands

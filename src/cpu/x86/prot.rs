@@ -3157,12 +3157,18 @@ impl Exec<'_> {
 
     /// `RDTSC`: the time-stamp counter into `EDX:EAX`.
     ///
-    /// The counter is [`State::cycles`](super::exec::State::cycles), which is
-    /// this core's own clock count — documented timing rather than measured
+    /// The counter is [`State::tsc`](super::exec::State::tsc), this core's
+    /// position in its clock domain — documented timing rather than measured
     /// timing, as the module documentation says of every cycle figure here.
     /// `CPUID` has always reported the `TSC` bit alongside `MSR`; until this
     /// existed that claim was a lie, and a guest that calibrated against it got
     /// an invalid-opcode exception.
+    ///
+    /// **Not [`State::cycles`](super::exec::State::cycles) raw.** That count
+    /// includes the part of the instruction in flight that ran past the
+    /// scheduler's grant, and a processor reading it stands ahead of every
+    /// other processor on its crystal by that much — which a guest checking
+    /// its processors against each other measures and calls a warp.
     ///
     /// # Errors
     ///
@@ -3175,7 +3181,7 @@ impl Exec<'_> {
         if self.state.sys.cr4 & cr4::TSD != 0 {
             self.require_ring0()?;
         }
-        let tsc = self.state.cycles;
+        let tsc = self.tsc();
         self.state.regs.set_dword(0, tsc as u32);
         self.state.regs.set_dword(2, (tsc >> 32) as u32);
         Ok(())
@@ -3185,7 +3191,7 @@ impl Exec<'_> {
         // The two registers whose state is not in `Sys`, first: the counter,
         // and the one that lives in this core's own interrupt controller.
         match index {
-            msr::TSC => return Ok(self.state.cycles),
+            msr::TSC => return Ok(self.tsc()),
             // `#GP` rather than a plausible zero when no local controller is
             // wired: a core with no APIC does not have this register, and a
             // guest that read zero would conclude its APIC was disabled rather
@@ -3229,9 +3235,11 @@ impl Exec<'_> {
             // Writing the counter is what a hypervisor or a firmware
             // synchronising two processors does (*Intel SDM* volume 3 §17.17.3).
             // It moves the count this core charges against, which is the same
-            // counter `RDTSC` reads, so the two cannot disagree.
+            // counter `RDTSC` reads, so the two cannot disagree — and it moves
+            // the counter rather than the processor, so what is left of this
+            // round's grant is untouched (`State::set_tsc`).
             msr::TSC => {
-                self.state.cycles = value;
+                self.set_tsc(value);
                 Ok(())
             }
             // The base-address field is stored and reported but does not move

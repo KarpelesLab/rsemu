@@ -895,7 +895,7 @@ fn the_time_stamp_counter_crosses_in_both_directions() {
     cpu.attach_io_space(Arc::clone(&guest.io));
     state::store_from_vcpu(&vcpu, &cpu).expect("hardware to the interpreter");
     assert!(
-        cpu.cycles() >= from_hardware.tsc,
+        cpu.tsc() >= from_hardware.tsc,
         "the shell's counter is the guest's, not its own retired-cycle count"
     );
 
