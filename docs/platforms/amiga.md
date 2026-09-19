@@ -8,7 +8,9 @@ Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
 `tests/amiga_a500_input.rs`, `tests/amiga_adf.rs`,
 `tests/amiga_a500_kickstart.rs`; and for the A600 (the last section),
 `machines/amiga-a600.machine`, `src/dev/amiga/gayle.rs`,
-`tests/amiga_a600_board.rs`, `tests/amiga_a600_hdf.rs`.
+`tests/amiga_a600_board.rs`, `tests/amiga_a600_hdf.rs`; and for the ECS section,
+`machines/amiga-a500plus.machine`, `src/dev/amiga/rtc.rs` and
+`tests/amiga_a500plus.rs`.
 
 A 68000, 512 KiB of chip RAM, a Kickstart ROM, two 8520 CIAs and three custom
 chips — Agnus, Denise and Paula. **All of them are on the A500 board now**: the
@@ -702,7 +704,135 @@ sync placement is not in the manual.
 | Bitplane fetch | All of a line's words as it ends | Pointer changes mid-fetch apply to the whole line |
 | How many words a high-resolution line fetches | Eight-count blocks, two words each — 42 for `$38`–`$D8`, where chapter 3's formula says 41 | Kickstart 2.04's Workbench screen and AROS both display square only this way; see *Real Kickstarts* |
 | Contention | None: no slot is lent or stolen, `BLTPRI` is stored only | The arbitration figure is a sketch, not a timing |
-| The copper's write permission | Appendix B's `*`/`~` columns, the original chip set's rule | Appendix C gives ECS a wider one; an A500 Agnus is not ECS |
+| The copper's write permission | Appendix B's `*`/`~` columns, the original chip set's rule | Appendix C gives ECS a wider one, which `revision = "ecs"` follows; an A500 Agnus is not ECS. See *ECS* below |
+
+## ECS: the Enhanced Chip Set, and the A500+
+
+The A500+, the A600 and the A3000 carry the **Enhanced Chip Set**: an ECS
+Agnus (the 1 MiB 8372A, or the 2 MiB 8375) and the 8373 Denise. Both classes
+take a `revision` property, `"ocs"` (the default, and every board that existed
+before) or `"ecs"`; the Agnus also takes `reach = 1M` (an 8372A, the default)
+or `2M` (an 8375). With `ocs` nothing changed: every A500 golden — the
+Kickstart, Workbench and AROS screens of `tests/amiga_a500_kickstart.rs`, both
+sessions of `tests/amiga_a500_workbench.rs`, the chipset and Denise board
+hashes and Denise's own golden field — is the same hash it was.
+
+`machines/amiga-a500plus.machine` (feature `machine-amiga-a500plus`) is the
+A500 with an 8375 and an 8373, 1 MiB of chip RAM (`-p chip-ram=2M` is the
+trapdoor card that makes it 2 MiB), no `ext` window, and its battery-backed
+clock. Kickstart 2.04 is its own ROM.
+
+### Sources
+
+| Source | Covers |
+| --- | --- |
+| *Amiga Hardware Reference Manual*, 3rd edition, Appendix C ("Enhanced Chip Set") | Everything below unless a row says otherwise: *Determining Chip Revisions* (`VPOSR`'s layout and identifications, `DENISEID`), *SuperHires Mode* and its colour-register table, *SuperHires 70ns Sprite Positioning*, *Multi-Sync and Bi-Sync Monitors* (`HTOTAL`, `VTOTAL`, the sync and blank registers), *New BEAMCON0 Register*, *Display Window Specification* (`DIWHIGH`), *Genlock Extensions* (`BPLCON2`/`BPLCON3`), *Other ECS Modifications*, *Interpretational Differences* (`COPCON`), and the *ECS Registers* table |
+| Commodore's register notes for the AA chip set (the `VPOSR` identification table as transcribed at amiga-dev.wikidot.com) | "8372 (Fat-hr) (agnushr), rev 5 = 22 PAL, 31 NTSC" — the identification this model gives the 2 MiB part |
+| *MSM6242B* data sheet (Oki Semiconductor) | The battery-backed clock: register table, the functional description of every register, Tables 1 and 2 |
+| *ROM Kernel Reference Manual* structure layouts (`exec/execbase.h`, `exec/nodes.h`, `graphics/gfxbase.h`) | Where a test finds `GfxBase->ChipRevBits0` in guest RAM |
+
+### What an ECS Agnus does (`src/dev/amiga/agnus/ecs.rs`)
+
+| | |
+| --- | --- |
+| `VPOSR` | "LOF I6 … I0 LOL -- -- -- -- v10 v9 V8": `$20` PAL / `$30` NTSC for an 8372A, `$22` / `$31` for an 8375; `LOL`; `V10`/`V9`. `VPOSW` writes `V10`–`V8` |
+| `BEAMCON0` | Out of reset `PAL` follows the strap ("the chips from the US factory are configured for NTSC mode … reset the motherboard jumpers") and the rest is clear, so an ECS Agnus counts like its original until told otherwise. `PAL` switches the hardwired counts between 312/313 × 227 and 262/263 × 227/228; `LOLDIS` stops NTSC's long/short toggle |
+| Programmable beam | `VARBEAMEN`: `HTOTAL` is the highest count of a line and `VTOTAL` the highest line of a field ("VGA (525 lines, 114.0 colorclocks per scan line)" is `HTOTAL = 113`, `VTOTAL = 524`), with a long field one line longer under `LACE`. Counted, never timed: a field is an integer of colour clocks |
+| Sync pins | `VARHSYEN`/`VARVSYEN` move `hsync` to `HSSTRT`–`HSSTOP` and `vsync` to lines `VSSTRT`–`VSSTOP`, so the CIAs' TOD counters count a programmed beam's lines and fields |
+| Blanking | `VARVBEN`: sprite DMA starts at `VBSTOP` instead of Table 3-13's line |
+| `DIWHIGH` | The vertical fetch window's `V10`–`V8`, once written after `DIWSTRT`/`DIWSTOP` ("If this register is written last in a sequence …"); a later `DIWSTRT`/`DIWSTOP` puts the old scheme back |
+| SuperHires fetch | `SHRES` fetches four words per eight-count block, twice high resolution's |
+| `COPCON` | "In the ECS, if this bit is set, the Copper can access all of the Amiga chip registers. If this bit is clear, the Copper can access the address range from $DFF03E through $DFF07E" — a second rule in `regs`, and an `ecs` flag on the copper's `Origin` |
+| Chip RAM | The pointers' five high bits: an 8372A reaches 1 MiB and an 8375 2 MiB. A smaller RAM repeats through the reach as it does on an original part; a larger one is a build error |
+| The raster | Every field, a `denise::Raster`: the first line after vertical blanking and the last before it, and the counts between `HBSTOP` and `HBSTRT` under `VARBEAMEN` (the whole line if those are not in order). Hardwired, it is exactly the original picture |
+
+Held and not acted on: `HCENTER`; `BEAMCON0`'s `HARDDIS`, `LPENDIS`, `CSCBEN`,
+`DUAL`, `VARCSYEN`, `BLANKEN` and the three polarity bits. None of them moves a
+count or a pin this model has.
+
+### What an 8373 does (`src/dev/amiga/denise.rs`)
+
+| | |
+| --- | --- |
+| `DENISEID` | `$FFFC`: "$FC in the lower 8 bits"; the reserved upper byte reads as ones here. An 8362 still answers with the floating bus |
+| SuperHires | `SHRES`: 35 ns pixels, two to a high-resolution one. Colours through Appendix C's table: register *n* holds colour `n & 3` in the top two bits of each gun and colour `n >> 2` in the bottom two, so a pair of pixels (*a*, *b*) is register `a | b << 2`, *a* through the top bits and *b* through the bottom; a two-bit gun is shown repeated into four. Sprites the same way through the upper sixteen |
+| 70 ns sprites | `SPRxCTL`'s `SHSH1` places a sprite half a low-resolution pixel later in SuperHires |
+| `KILLEHB` | Six planes without half-brite |
+| `BPLCON3` | `BRDRBLNK`, once `BPLCON0`'s `ENBPLCN3` enables the register: a black border |
+| `DIWHIGH` | The window's `H8` and `V10`–`V8` directly, on the same written-last rule as Agnus |
+| Genlock | `ZDBPSEL`, `ZDBPEN`, `ZDCTEN`, `BRDNTRAN`: latched only. There is no genlock |
+
+### The picture follows the beam
+
+A hardwired beam's picture is what it always was: 800 high-resolution columns
+from `x = 64`, two rows a line from Table 3-13's end of blanking. An ECS
+Agnus's `Raster` lays each field out instead, and the host adapter follows:
+
+* **Rows**: two a line (line-doubled, or woven when interlaced) for a 15 kHz
+  line; one for a 31 kHz one. The boundary is `denise::DOUBLED_LINE`, 170
+  counts, midway between the two families.
+* **Columns**: high-resolution pixels, or — while an 8373 has SuperHires on
+  screen — SuperHires pixels, four to a low-resolution one. The first
+  SuperHires line of a field widens the picture there and then (the rows
+  already drawn are repeated, not lost); a field with none narrows it back.
+  So a Workbench on an A500+ is 800 × 568, like an A500's, and a SuperHires
+  screen is 1600 wide.
+* **The frame period** is still the last field's colour clocks × 2 ticks of
+  Denise's 7M domain, an exact rational: a productivity field of 525 × 114
+  counts on a PAL crystal is 16 873 913 ns. `Video::copy_frame` gives the host
+  the picture, its size and its field count in one moment, because the size
+  can now change between fields.
+
+Choices, where Appendix C gives the registers and not the picture: the
+columns shown under `VARBEAMEN` are the unblanked ones (`HBSTOP`–`HBSTRT`); the
+first pixel of a SuperHires word fetched at `D` is at `x = 2D + 5`, chapter 3's
+fetch arithmetic (one block and half a count) carried to a two-count block;
+SuperHires with dual playfields is decoded as one playfield of two planes.
+
+### The battery-backed clock (`src/dev/amiga/rtc.rs`, `dev-amiga-rtc`)
+
+An Oki MSM6242B at `$DC_0000`, which Appendix D gives the clock and which an
+A500 has only on an A501 card. Its address pins are on `A2`–`A5` and its data
+pins on `D0`–`D3`, so register *n* is the byte at `$DC_0003 + 4n` and the
+64-byte block repeats through the window — confirmed black-box: booting
+Workbench 2.04, Kickstart reads `CF`, sets `HOLD`, reads `S1`…`W` a byte each
+at exactly those addresses, and clears `HOLD`, the data sheet's own protocol.
+BCD date and time with leap years, `HOLD`/`BUSY`, the 30-second adjust, the
+interrupt flag and its four periods, `REST`, `STOP` and 12/24 hours. It
+starts at `-p time` (default `2026-01-01T00:00:00`) and counts only its own
+32 768 Hz crystal, never the host's clock. `STD.P` is not wired; `TEST`'s
+fast count is not modelled.
+
+### Kickstart finds the ECS chips
+
+`tests/amiga_a500plus.rs` reads `GfxBase->ChipRevBits0` out of guest RAM —
+`ExecBase` at 4, `LibList` at `$17A`, each node's `ln_Name` at 10, and
+`gb_ChipRevBits0` at `$EC` — after every ROM run. It is `$03`,
+`GFXF_HR_AGNUS | GFXF_HR_DENISE`, for all three. Kickstart 2.04 also writes
+`BEAMCON0 = $0020` (PAL, nothing variable) and a `DIWHIGH` into every field's
+copper list, which an A500 never sees.
+
+| ROM, on the A500+ | Reaches | `ChipRevBits0` | What is on screen |
+| --- | --- | --- | --- |
+| Kickstart 2.04 (37.175) | its insert-disk screen, 28 s | `$03` | The purple screen, the rainbow check mark, "2.0 Roms (37.175) / Copyright © 1985-1991 / Commodore-Amiga, Inc. / All Rights Reserved", the salmon drive and the blue disk mid-animation. **Bit for bit the A500's picture**: the explicit window graphics.library sets through `DIWHIGH` is the one the original scheme gave |
+| Kickstart 3.1 (40.063) | its insert-disk screen, 12 s | `$03` | The same with "3.1 ROM 40.063 / Copyright © 1985-1993"; bit for bit the A500's |
+| Kickstart 2.04 + Workbench 2.04 | the desktop, 45 s | `$03` | The grey 640-pixel desktop, the copyright in the screen title bar under the red pointer, the "Workbench" window with the Ram Disk and Workbench2.0 icons; bit for bit the A500's. The clock was read on the way |
+
+And ROM-free, a hand-assembled program programs a productivity beam
+(`HTOTAL = 113`, `VTOTAL = 524`, blanking to 90 counts × 480 lines) and a
+two-plane SuperHires window with `DIWHIGH`: the host frame is 720 × 480, the
+pixels are the four colours the encoded registers give (white, green, red,
+dark blue, repeating a SuperHires pixel each), and the frame period is
+16 873 913 ns. The same program on the A500 leaves the field at 313 × 227
+counts and the picture at 800 × 568, and shows the planes in low resolution.
+
+### Not modelled
+
+* Genlock, and so `BRDNTRAN`, `ZDBPSEL`/`ZDBPEN`/`ZDCTEN` and `BEAMCON0`'s
+  redirection and polarity bits.
+* `HCENTER`'s half-line vertical sync in an interlaced field.
+* The A2024 and the light pen.
+* ECS sprite vertical positions beyond line 511 (the manual gives no `SV9`).
 
 ## Keyboard and mouse
 
