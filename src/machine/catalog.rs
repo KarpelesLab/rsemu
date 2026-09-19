@@ -705,6 +705,25 @@ pub static AMIGA_A500: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/amiga-a500.machine"),
 };
 
+/// A Commodore Amiga 600, when this build has the board classes and Gayle.
+///
+/// The A500's 68000 and chipset with 1 MiB of chip RAM and Gayle in Gary's
+/// place: an IDE drive on the `hd0` slot behind Gayle's chip selects, its
+/// interrupt on `INT2`, the overlay Gayle keeps for itself, and no trapdoor
+/// RAM, clock or extended-ROM window. The `kickstart` slot takes the ROM,
+/// `hd0` a whole-disk image with a Rigid Disk Block, `df0` a floppy; both
+/// drives may be empty. `machines/amiga-a600.machine` carries the wiring, and
+/// `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-a600")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a600")))]
+pub static AMIGA_A600: CatalogEntry = CatalogEntry {
+    name: "amiga-a600",
+    summary: "an Amiga 600: the A500's chipset with 1 MiB of chip RAM, Gayle, and an IDE hard \
+              disk",
+    media: &["kickstart", "hd0", "df0"],
+    source: include_str!("../../machines/amiga-a600.machine"),
+};
+
 /// A minimal R3000A board, when this build has a MIPS core.
 ///
 /// A synthetic board rather than a product: a 32-bit **physical** space, a
@@ -802,6 +821,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&M68K_MINI);
     #[cfg(feature = "machine-amiga-a500")]
     out.push(&AMIGA_A500);
+    #[cfg(feature = "machine-amiga-a600")]
+    out.push(&AMIGA_A600);
     #[cfg(feature = "machine-mips-mini")]
     out.push(&MIPS_MINI);
     #[cfg(feature = "machine-ne2k-mini")]
@@ -2366,6 +2387,15 @@ mod tests {
                 0x00, 0x00, 0x00, 0x08, // PC  = $00000008
                 0x60, 0xfe, // BRA .
             ],
+            // The same, on the A600, whose stack pointer is the top of its
+            // 1 MiB of chip RAM. `tests/amiga_a600_board.rs` is where Gayle is
+            // exercised.
+            #[cfg(feature = "machine-amiga-a600")]
+            ("amiga-a600", "kickstart") => &[
+                0x00, 0x10, 0x00, 0x00, // SSP = $00100000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             #[cfg(feature = "machine-m68k-mini")]
             ("m68k-mini", "firmware") => &[
                 0x00, 0x20, 0x00, 0x00, // SSP = $00200000
@@ -2443,6 +2473,10 @@ mod tests {
             // only AROS brings a second ROM half.
             #[cfg(feature = "machine-amiga-a500")]
             ("amiga-a500", "ext") => &[],
+            // An A600 with neither drive filled: no bytes is an empty IDE bay
+            // and an empty DF0, the insert-disk screen.
+            #[cfg(feature = "machine-amiga-a600")]
+            ("amiga-a600", "hd0" | "df0") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

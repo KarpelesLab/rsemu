@@ -1,0 +1,215 @@
+# amiga-a600 - a Commodore Amiga 600: the A500's chipset around Gayle, with an
+# IDE hard disk.
+#
+#   rsemu run amiga-a600 --media kickstart=kickstart:kick31-a600.rom \
+#       --media hd0=workbench-311.hdf
+#   rsemu run amiga-a600 --media kickstart=kick.rom --drive hd0=disk.hdf
+#   rsemu run amiga-a600 --media kickstart=kick.rom --media df0=disk.adf --vnc :5900
+#
+# `hd0` is a whole disk: an Amiga hard-disk image with a Rigid Disk Block in
+# its first sectors (an HDF that begins `RDSK`), which is what Kickstart's
+# `scsi.device` looks for. `--media` copies it into memory and the guest's
+# writes stay there; `--drive` writes them back to the file.
+#
+# What changes from `amiga-a500.machine`, and where each change comes from:
+#
+# * **Gayle in place of Gary.** "The A600 will use an enhanced version of the
+#   5719 Gary chip called Gayle, which supports the memory, I/O card interface
+#   and the IDE Hard Drive interface" (A600 System Schematics, p. 1-1). See
+#   `src/dev/amiga/gayle.rs` for the IDE port, the registers, the
+#   identification register, and the overlay, which on this board is Gayle's
+#   own: CIA-A's PA0 is not connected (schematic sheet 7), and the overlay
+#   drops on the first write to a CIA (Gayle specification, section 2.0, which
+#   says CIA-B's; Kickstart's own boot shows CIA-A's has to count too - see
+#   gayle.rs).
+# * **1 MiB of chip RAM**, "512KB or 1MB internal" (p. 1-1); the A600 in
+#   the shops had 1 MiB.
+# * **No trapdoor RAM, and bank 6 floats.** The A600's expansion header takes
+#   the A601, which is *chip* RAM and a clock; nothing answers at $C00000
+#   with no card. Gary repeated the chip registers through bank 6 on an A500;
+#   Gayle selects them at "$DFF000 to $DFF1FF" and nowhere else (section 4.0).
+# * **No real-time clock.** The RTC select at $DC0000 goes to the expansion
+#   header (schematic sheet 12, `_RTC_CS` on P9), where the A601 puts one.
+#   With nothing there, the range floats, as it does on a stock A500.
+# * **The ROM at $F80000**, and no extended-ROM window at $E00000: the A500
+#   board's `ext` socket exists only for AROS. (Gayle's ROM select also covers
+#   $E00000 and $A80000 - section 2.0 - where the real board most likely
+#   repeats the Kickstart. Nothing tested depends on it either way;
+#   `docs/platforms/amiga.md`, "A600", has the black-box result.)
+# * **ECS.** The A600 has the 8375 Agnus and the 8373 Denise (p. 1-1). The
+#   chip models here are the A500's OCS parts until the ECS ones land; the
+#   board switches to them then.
+#
+# Everything else - the crystal, the CIAs and their decode, Paula, Agnus,
+# Denise, DF0, the keyboard and the mouse - is `amiga-a500.machine`'s, and
+# that file carries the long comments for it.
+#
+# Written from the Gayle specification (Commodore, July 10 1991), the A600
+# System Schematics (#315987 rev. C), the A1200 functional specification and
+# the Amiga Hardware Reference Manual (3rd edition). No Amiga emulator source
+# was consulted; they are all copyleft (ROADMAP.md 1).
+#
+# Empty addresses float rather than fault, for the reasons the A500 file
+# gives: Gayle, like Gary, generates /DTACK for "any address ranges not
+# covered in other sections" (section 14.0).
+
+machine "amiga-a600" {
+  # -- how much of each memory -----------------------------------------------
+  param chip-ram = 1M
+
+  # A 2.05 or 3.1 Kickstart is 512 KiB, and the A600's socket is a 256K x 16
+  # part (schematic, U6); `-p kickstart-size=256K` repeats a smaller one.
+  param kickstart-size = 512K
+
+  # Whether Paula keeps stereo output frames for a host audio sink to drain.
+  param audio = false
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # PAL: 28.37516 MHz ("NOTE: PAL USES 28.37516 MHZ", schematic sheet 2),
+  # processor at a quarter of it. `-p master=28636360` is the NTSC board, and
+  # `standard = "ntsc"` on `agnus` and `denise` with it.
+  param master = 28375160
+  osc   clk    = master Hz
+
+  space mem { width = 24, endian = "big", unassigned = open-bus }
+
+  object cpu "cpu.m68k" {
+    clock  = clk / 4
+    space  = mem
+    engine = "interp"
+  }
+
+  object chipram "ram" { size = chip-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+
+  object custom "amiga.custom" { }
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    paula    = paula
+    video    = denise
+  }
+  object denise "amiga.denise" { custom = custom, clock = clk / 4 }
+
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  # -- the hard disk -----------------------------------------------------------
+  #
+  # The drive is declared *before* Gayle, for the reason `pc-at.machine` gives:
+  # `Machine::reset` runs devices in declaration order, and Gayle's reset reads
+  # the drive's interrupt line, which is only quiet once the drive has reset.
+  #
+  # `ata.disk` is the whole drive - command set, registers, geometry - and
+  # `gayle` is what the board contributes: chip selects, a byte swap and an
+  # interrupt input. The same drive hangs off `pc.ide` on `pc-at`. No bytes
+  # bound to `hd0` is an empty bay, which is the A600 without "HD".
+  object hd0 "ata.disk" { image = "hd0", bay = "ide-master" }
+
+  # -- Gayle -----------------------------------------------------------------
+  #
+  # `cia-odd` and `cia-even` are the two CIAs' decodes: Gayle generates both
+  # chips' selects itself (section 5.0), passes every access through its
+  # `cia-odd` and `cia-even` regions, and drops the overlay on the first write
+  # to either.
+  object gayle "amiga.gayle" {
+    master   = "ide-master"
+    slave    = "ide-slave"
+    cia-odd  = cia_a_decode
+    cia-even = cia_b_decode
+  }
+
+  # -- the overlay -----------------------------------------------------------
+  #
+  # Gary's overlay decoder, used for exactly that and nothing else: the ROM at
+  # zero while `ovl` is high, chip RAM after. On this board the level comes
+  # from Gayle, not from a CIA pin. No `custom` (bank 6 does not repeat the
+  # registers), no `slow-ram`, no `ext`.
+  object overlay "amiga.gary" {
+    space = mem
+    rom   = kick
+    ram   = chipram
+    size  = chip-ram
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  #   $000000  chip RAM, behind the overlay                     1 MiB
+  #   $BFD000  CIA-B, through Gayle's even-CIA select
+  #   $BFE000  CIA-A, through Gayle's odd-CIA select
+  #   $DA0000  the IDE drive: CS1FX on A12 low, CS3FX high      16 KiB
+  #   $DA8000  Gayle's status/change/enable/config registers    32 KiB
+  #   $DE1000  Gayle's identification register                  4 KiB
+  #   $DFF000  the custom chip registers                        512 bytes
+  #   $F80000  Kickstart                                        512 KiB
+  map mem 0x000000 size chip-ram       = overlay.overlay { endian = "big" }
+  map mem 0xBFD000 size 0x1000         = gayle.cia-even  { endian = "big" }
+  map mem 0xBFE000 size 0x1000         = gayle.cia-odd   { endian = "big" }
+  map mem 0xDA0000 size 0x4000         = gayle.ide       { endian = "big" }
+  map mem 0xDA8000 size 0x8000         = gayle.regs      { endian = "big" }
+  map mem 0xDE1000 size 0x1000         = gayle.id        { endian = "big" }
+  map mem 0xDFF000 size 0x200          = custom
+  map mem 0xF80000 size 512K           = mirror(kick)    { endian = "big" }
+
+  # -- wiring ----------------------------------------------------------------
+  #
+  # Gayle's internal overlay signal to the decoder at zero.
+  wire gayle.ovl -> overlay.ovl
+
+  wire paula.ipl0 -> cpu.ipl0
+  wire paula.ipl1 -> cpu.ipl1
+  wire paula.ipl2 -> cpu.ipl2
+
+  # INT2 and INT6 are open-collector nets: CIA-A (schematic sheet 7) and Gayle
+  # (its pin 84, specification section 1.3) both pull `_INT2`; CIA-B and Gayle
+  # (pin 83) both pull `_INT6`. The drive's interrupt reaches the processor
+  # through Gayle's change latch and enable, then `_INT2`, then Paula's PORTS -
+  # level 2.
+  wire cia_a.irq -> paula.int2
+  wire gayle.int2 -> paula.int2
+  wire cia_b.irq -> paula.int6
+  wire gayle.int6 -> paula.int6
+
+  # The floppy lines, exactly as on the A500 (Appendix E; chapter 8, Table 8-5).
+  wire cia_b.pb7 -> df0.mtr   { pull = "up" }    # MTR*
+  wire cia_b.pb3 -> df0.sel   { pull = "up" }    # SEL0*
+  wire cia_b.pb2 -> df0.side  { pull = "up" }    # SIDE*
+  wire cia_b.pb1 -> df0.dir   { pull = "up" }    # DIR
+  wire cia_b.pb0 -> df0.step  { pull = "up" }    # STEP*
+  wire df0.rdy   -> cia_a.pa5 { pull = "up" }    # RDY*
+  wire df0.tk0   -> cia_a.pa4 { pull = "up" }    # TK0*
+  wire df0.wpro  -> cia_a.pa3 { pull = "up" }    # WPRO*
+  wire df0.chng  -> cia_a.pa2 { pull = "up" }    # CHNG*
+  wire df0.index -> cia_b.flag { pull = "up" }   # INDEX*
+
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
+
+  # -- the keyboard and the mouse --------------------------------------------
+  #
+  # As on the A500: the A600's keyboard is a membrane matrix scanned by the
+  # 6570 on the main board (U13), and what reaches CIA-A is the same KCLK/KDAT
+  # protocol.
+  osc periph = 1000000 Hz
+
+  object kbd "amiga.keyboard" { clock = periph }
+  wire kbd.kclk  -> cia_a.cnt { pull = "up" }
+  wire cia_a.sp  -> kbd.kdat  { pull = "up" }
+  wire kbd.kdat  -> cia_a.sp
+
+  object mouse "amiga.mouse" { clock = periph }
+  wire mouse.y      -> denise.m0v  { pull = "up" }
+  wire mouse.yq     -> denise.m0vq { pull = "up" }
+  wire mouse.x      -> denise.m0h  { pull = "up" }
+  wire mouse.xq     -> denise.m0hq { pull = "up" }
+  wire mouse.left   -> cia_a.pa6   { pull = "up" }
+  wire mouse.right  -> paula.potly { pull = "up" }
+  wire mouse.middle -> paula.potlx { pull = "up" }
+}

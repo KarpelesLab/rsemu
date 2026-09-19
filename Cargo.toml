@@ -2738,6 +2738,15 @@ dev-amiga-gayle = ["dev-amiga", "dev-ata-disk"]
 # dependencies.
 machine-amiga-a500 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-mos8520"]
 
+# The `amiga-a600` board (machines/amiga-a600.machine): the A500's 68000 and
+# chipset -- Agnus, Denise, Paula, both CIAs, DF0, the keyboard and the mouse
+# -- with 1 MiB of chip RAM and Gayle in Gary's place: the IDE port with one
+# `ata.disk` on the `hd0` media slot, the IDE interrupt on INT2, the overlay
+# Gayle keeps for itself, no trapdoor RAM, no clock and no extended-ROM socket.
+# Kickstart 3.1 boots Workbench 3.1 off an HDF with no floppy. Adds no
+# dependencies.
+machine-amiga-a600 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-mos8520", "dev-amiga-gayle", "dev-ata-disk"]
+
 # The network seam (src/dev/net/link.rs): what a NIC model is attached to --
 # frames out, frames in **against a virtual tick**, carrier, and a station
 # address -- plus `NetPort`, the deterministic in-memory backend every test uses
