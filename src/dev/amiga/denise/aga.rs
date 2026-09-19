@@ -1,5 +1,4 @@
-//! Lisa: the AA chip set's video chip, the display half — the colour table
-//! first.
+//! Lisa: the AA chip set's video chip, the display half.
 //!
 //! The 8362 and the 8373 are rendered by [`super::render`]; this is the whole
 //! of `revision = "aga"`. It is a separate function rather than more branches
@@ -18,41 +17,129 @@
 //! Set*, cited by its section: §1 *Summary of new features for AA*, §2
 //! *Explanation of new features*, §3 the register list, §4 the per-register
 //! pages, §5 *New LISA Display & Sprite Modes*. Where it is silent, the
-//! comment says so and says what was chosen instead. **No emulator source of
-//! any licence was consulted**, and the same is true of every FPGA
-//! reimplementation: the document was fetched on its own.
+//! comment says so and says what was chosen instead — there is nothing here
+//! that the document does not state or that a marked inference does not
+//! explain. **No emulator source of any licence was consulted**, and the same
+//! is true of every FPGA reimplementation: the document was fetched on its
+//! own.
 //!
-//! # What is modelled so far
+//! # What Lisa takes from Alice
+//!
+//! The seam is [`super::Fetch`], documented where it is declared. In short:
+//!
+//! * **Bitplanes**: eight word streams, unchanged in shape. A wider `FMODE`
+//!   needs nothing new, because "the parallel to serial conversion is
+//!   triggered whenever bit plane #1 is written, indicating the completion of
+//!   all bit planes for that word (16/32/64 pixels). The MSB is output first,
+//!   and is therefore always on the left" (§4, `BPLxDAT`) — a fetch of any
+//!   width is that many consecutive pixels, so the stream is the same stream
+//!   with more words per fetch slot.
+//! * **`FMODE` and `BPLCON4`** arrive as ordinary register writes; `FMODE` is
+//!   Alice's register as well as Lisa's (§3: `FMODE 1FC W A D`).
+//!
+//! # What is modelled, and what is latched only
 //!
 //! | | |
 //! | --- | --- |
+//! | eight bitplanes, `BPU3` | modelled: `BPLCON0` bit 4, so `BPU` is "0000-1000 (none thru 8 inclusive)" |
 //! | the 256-entry 24-bit colour table | modelled: `BANK`, `LOCT`, and the automatic four-to-eight-bit extension |
-//! | an 8362's playfields through it | modelled: up to six planes, single and 3 + 3 dual playfield (playfield 2 at colour 8, as before), the old four-bit scroll, the window, `DIWHIGH` as on an 8373 |
+//! | HAM8, HAM6 | not yet: `HAMEN` is ignored |
+//! | `BPLCON4`'s `BPLAM` | modelled; `ESPRM` and `OSPRM` latched, until there are sprites |
+//! | `BPLCON3`'s `BANK`, `PF2OF`, `LOCT`, `BRDRBLNK` | modelled; `SPRES` and `BRDSPRT` latched, until there are sprites |
+//! | `BPLCON0`'s `ECSENA` gate | modelled: it inhibits `BRDRBLNK`, `BRDNTRAN`, `ZDCLKEN`, `BRDSPRT` and `EXTBLKEN` |
+//! | `BPLCON1`'s eight-bit scroll | modelled, both playfields, 35 ns granularity |
+//! | 4+4 dual playfield with `PF2OF` | modelled |
 //! | EHB, and `KILLEHB` | modelled: "EHB is invoked whenever SHRES = HIRES = HAMEN = DPF = 0 and BPU = 6" |
-//! | `BPLCON0`'s `ECSENA` gate | modelled: it inhibits `BRDRBLNK` |
-//! | `BPU3`, `BPLCON4`, `FMODE`, the eight-bit scroll, `PF2OF` | latched only, for now |
-//! | HAM | not yet: `HAMEN` is ignored |
-//! | sprites, collisions, `CLXCON2` | not yet: an AA part shows no sprites and detects no collisions |
+//! | `DIWHIGH`'s 70 ns and 35 ns window bits | modelled |
+//! | sprites, collisions, `CLXCON2`, `FMODE`'s sprite bits | not yet: an AA part shows no sprites and detects no collisions |
+//! | `FMODE`'s `BPL32`, `BPAGEM` | latched only, and deliberately: see [below](#what-fmodes-bitplane-bits-do-not-change) |
+//! | `FMODE`'s `BSCAN2` | latched only — it selects between `BPL1MOD` and `BPL2MOD`, which is Alice's |
+//! | `BPLCON2`'s `RDRAM`, `ZDBPEN`, `ZDBPSEL`, `ZDCTEN`, `SOGEN` | latched only: genlock, and reading the colour table back through a write-only address |
+//! | `BPLCON3`'s `BRDNTRAN`, `ZDCLKEN`, `EXTBLKEN` | latched only: genlock and the `BLANK` pin, neither of which leaves the chip here |
+//! | `BPLCON0`'s `BYPASS`, `UHRES` | latched only: eight-bit direct video out, and the external-logic pointers |
+//! | the colour table's `T` bit | kept, so a snapshot round-trips it; nothing reads it, because nothing models the `ZD` pin |
 //!
-//! # Where a fetch's first pixel lands
+//! # What `FMODE`'s bitplane bits do not change
 //!
-//! As for the 8373: the document gives no formula, so the 3rd-edition
-//! manual's arithmetic is kept — one fetch block and half a colour clock after
-//! the fetch. [`super::Setup`] has the derivation. That is an inference.
+//! `BPL32` and `BPAGEM` say how many bytes one bitplane fetch moves and
+//! whether it is a double-`CAS` cycle (§4, `FMODE`, the first table). Both
+//! facts are about the memory cycle Alice makes, and neither changes what Lisa
+//! does with the result, for the reason `BPLxDAT` gives above. So Lisa latches
+//! them — a snapshot has to carry them, and Alice reads the same register —
+//! and the bit stream is the bit stream.
+//!
+//! The one place the width is visible from here is the **scroll range**: §5's
+//! table gives 0–15 low-resolution pixels of scroll in `LORES` at 1× bandwidth
+//! and 0–63 at 4×, which is exactly one fetch's worth each time. The document
+//! gives ranges and no rule for a larger value, so **this model applies the
+//! whole eight-bit delay** whatever `FMODE` says and shows whatever data is
+//! there. That is an inference; a program that stays inside the table's range
+//! cannot tell.
+//!
+//! # The other inferences, in one place
+//!
+//! * **Where a fetch's first pixel lands.** As for the 8373: the document
+//!   gives no formula, so the 3rd-edition manual's arithmetic is kept — one
+//!   fetch block and half a colour clock after the fetch — and the scroll runs
+//!   from there. [`super::Setup`] has the derivation.
+//! * **What `BPLAM` masks.** "Bits 15 thru 8 of `BPLCON4` comprise an 8 bit
+//!   mask for the 8 bitplane address, XOR'ing the individual bits" (§2). The
+//!   address that reaches the table is masked, in every mode: single
+//!   playfield, either playfield of a dual one and EHB's five-bit address —
+//!   and a playfield pixel whose value is zero, which is
+//!   as much a bitplane colour address as any other, so inside the window the
+//!   background is `COLOR(BPLAM)`. The border is not a bitplane pixel and
+//!   stays colour 0. The document names no exception, and the register exists
+//!   so "the copper [can] exchange color maps with a single instruction",
+//!   which wants the mask to reach all of them.
+//! * **`PF2OF` when playfield 1 has priority.** §4's `BPLCON3` page says the
+//!   field determines the offset "when playfield 2 has priority in dual
+//!   playfield mode", while §2 says flatly that it determines "second
+//!   playfield's offset into the color table … since playfields in DPF mode
+//!   can have up to 4 bitplanes". §2's reading is taken: it is playfield 2's
+//!   offset, always. The other reading would make a playfield's colours depend
+//!   on `PF2PRI`, which nothing else in the document suggests.
+//!
+//! # `BPU` out of range
+//!
+//! `BPU` is four bits and the document defines nine of the sixteen values.
+//! Nine through fifteen are clamped to eight rather than blanking the display:
+//! there are only eight planes to fetch, so eight is what the data can fill.
 
 use super::{
-    BRDRBLNK, DBLPF, ENBPLCN3 as ECSENA, Fetch, HIRES, HOMOD, KILLEHB, LACE, Line, MAX_FETCH_WORDS,
-    Revision, SHRES, Stamp, State,
+    BPU3, BRDRBLNK, DBLPF, ENBPLCN3 as ECSENA, Fetch, HIRES, HOMOD, KILLEHB, LACE, Line,
+    MAX_FETCH_WORDS, Revision, SHRES, Stamp, State,
 };
 
 /// Quarters — 35 ns pixels — in one low-resolution pixel.
 const QUARTERS: i32 = 4;
 
+/// Playfield 2's colour-table offset for each `PF2OF` code (§4, `BPLCON3`).
+const PF2_OFFSET: [u8; 8] = [0, 2, 4, 8, 16, 32, 64, 128];
+
+/// One playfield's eight-bit `BPLCON1` scroll, in quarters.
+///
+/// §4's `BPLCON1` page scatters the field: for playfield 1, `PF1H7` and
+/// `PF1H6` are bits 11 and 10, `PF1H5`–`PF1H2` are bits 3–0, and `PF1H1` and
+/// `PF1H0` are bits 9 and 8. Playfield 2's three groups sit four bits up in
+/// each case. `PFyH0` is "LSB = 35ns SHRES pixel", so the assembled value is
+/// already in quarters — and the old four-bit field, which the page renames
+/// `PFyH5`–`PFyH2`, keeps its meaning of whole low-resolution pixels because
+/// it now lands two bits up.
+#[inline]
+const fn scroll(bplcon1: u16, playfield2: bool) -> i32 {
+    let v = if playfield2 { bplcon1 >> 4 } else { bplcon1 };
+    let high = (v >> 10) & 3;
+    let mid = v & 0xf;
+    let low = (v >> 8) & 3;
+    (high << 6 | mid << 2 | low) as i32
+}
+
 /// The per-line decisions, recomputed whenever a register that shapes them
 /// changes.
 #[derive(Debug, Clone, Copy)]
 struct Setup {
-    /// Planes enabled, 0–6.
+    /// Planes enabled, 0–8.
     planes: usize,
     /// Quarters per bitplane pixel: 4 in `LORES`, 2 in `HIRES`, 1 in `SHRES`.
     step: i32,
@@ -67,14 +154,19 @@ struct Setup {
     hstop: i32,
     /// `BRDRBLNK` and `ECSENA`: the border is black rather than colour 0.
     blank: bool,
+    /// The `BPLAM` mask, already in place.
+    bplam: u8,
+    /// Playfield 2's colour-table offset, from `PF2OF`.
+    pf2_offset: u8,
 }
 
 impl Setup {
     fn of(regs: &super::Regs, fetch_start: u16, vpos: u16) -> Setup {
         let con0 = regs.bplcon0;
-        // The 3rd-edition BPU: three bits and "111 not used". Six is the most
-        // an 8362's playfield has.
-        let planes = usize::from((con0 >> 12) & 7).min(6);
+        // "BPU2/1/0" at bits 14-12 and "BPU3" at bit 4, counting "0000-1000
+        // (none thru 8 inclusive)". Nine and up cannot be fetched, so they are
+        // eight.
+        let planes = (usize::from((con0 >> 12) & 7) | usize::from(con0 & BPU3 != 0) << 3).min(8);
         // "SHRES Super hi-res mode (35ns pixel width)"; with both set
         // SuperHires wins, as on an 8373.
         let shres = con0 & SHRES != 0;
@@ -108,26 +200,30 @@ impl Setup {
             17
         };
         let base = QUARTERS * (2 * i32::from(fetch_start) + lead);
-        // The 3rd-edition four-bit delays, whole low-resolution pixels: odd
-        // planes take playfield 1's, even planes playfield 2's.
-        let delay = [
-            QUARTERS * i32::from(regs.bplcon1 & 0xf),
-            QUARTERS * i32::from((regs.bplcon1 >> 4) & 0xf),
-        ];
+        // "PFI = odd, FP2 = even bit planes" (§4, BPLCON0): planes 1, 3, 5 and
+        // 7 — indices 0, 2, 4 and 6 — take playfield 1's scroll.
+        let delay = [scroll(regs.bplcon1, false), scroll(regs.bplcon1, true)];
         let mut start = [0i32; 8];
         for (p, s) in start.iter_mut().enumerate() {
             *s = base + delay[p % 2];
         }
 
-        // `DIWHIGH` as an 8373 reads it: start V10-V8 at bits 2-0 and H10 at 5,
-        // stop V10-V8 at 10-8 and H10 at 13.
+        // "If this register is written, direct start & stop positions anywhere
+        // on the screen" (§4, DIWHIGH), whose bits are: start V10-V8 at 2-0,
+        // H0 at 3, H1 at 4, H10 at 5; stop V10-V8 at 10-8, H0 at 11, H1 at 12,
+        // H10 at 13. An 8373's page gave the same H10 and V bits and left the
+        // two sub-pixel ones "don't care", so an ECS program's window is
+        // unchanged.
         let (vstart, vstop, hstart, hstop) = if regs.diwhigh_on {
             let high = regs.diwhigh;
+            let quarter = |bits: u16| i32::from((bits >> 1) & 1) * 2 + i32::from(bits & 1);
             (
                 ((high & 7) << 8) | (regs.diwstrt >> 8),
                 (((high >> 8) & 7) << 8) | (regs.diwstop >> 8),
-                QUARTERS * (i32::from((high >> 5) & 1) << 8 | i32::from(regs.diwstrt & 0xff)),
-                QUARTERS * (i32::from((high >> 13) & 1) << 8 | i32::from(regs.diwstop & 0xff)),
+                QUARTERS * (i32::from((high >> 5) & 1) << 8 | i32::from(regs.diwstrt & 0xff))
+                    + quarter(high >> 3),
+                QUARTERS * (i32::from((high >> 13) & 1) << 8 | i32::from(regs.diwstop & 0xff))
+                    + quarter(high >> 11),
             )
         } else {
             let vstop_lo = regs.diwstop >> 8;
@@ -153,6 +249,8 @@ impl Setup {
             hstart,
             hstop,
             blank: enabled && regs.bplcon3 & BRDRBLNK != 0,
+            bplam: (regs.bplcon4 >> 8) as u8,
+            pf2_offset: PF2_OFFSET[usize::from((regs.bplcon3 >> 10) & 7)],
         }
     }
 
@@ -172,6 +270,12 @@ impl Setup {
             }
         }
         bits
+    }
+
+    /// The colour-table address a bitplane value selects, `BPLAM` applied.
+    #[inline]
+    fn address(&self, index: u8) -> usize {
+        usize::from(index ^ self.bplam)
     }
 }
 
@@ -262,28 +366,31 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
         let colour = if !inside {
             border
         } else {
-            let background = regs.palette[0];
+            // A playfield pixel of value zero is still a bitplane colour
+            // address, so `BPLAM` moves it too; the border is not one.
+            let background = regs.palette[setup.address(0)];
             if setup.dual {
-                // As on an 8362: playfield 1 is planes 1, 3, 5 and playfield
-                // 2 is planes 2, 4, 6, at colour 8.
+                // "4+4 bitplane dualplayfield is available in all 3
+                // resolutions": playfield 1 is planes 1, 3, 5, 7 and
+                // playfield 2 is planes 2, 4, 6, 8.
                 let odd = (bits & 1) | ((bits >> 1) & 2) | ((bits >> 2) & 4) | ((bits >> 3) & 8);
                 let even =
                     ((bits >> 1) & 1) | ((bits >> 2) & 2) | ((bits >> 3) & 4) | ((bits >> 4) & 8);
                 let show1 = odd != 0;
                 let show2 = even != 0;
                 let pf2_first = regs.bplcon2 & (1 << 6) != 0;
-                let pf2 = || regs.palette[8 + usize::from(even)];
+                let pf2 = || regs.palette[setup.address(setup.pf2_offset.wrapping_add(even))];
                 match (show1, show2) {
                     (true, true) if pf2_first => pf2(),
-                    (true, _) => regs.palette[usize::from(odd)],
+                    (true, _) => regs.palette[setup.address(odd)],
                     (false, true) => pf2(),
                     (false, false) => background,
                 }
             } else if bits != 0 {
                 if setup.ehb && bits & 0x20 != 0 {
-                    half(regs.palette[usize::from(bits & 0x1f)])
+                    half(regs.palette[setup.address(bits & 0x1f)])
                 } else {
-                    regs.palette[usize::from(bits)]
+                    regs.palette[setup.address(bits)]
                 }
             } else {
                 background

@@ -136,6 +136,9 @@ fn lores(v: &Video, vpos: u16, k: i32) -> u32 {
     first
 }
 
+/// `BPU = 8`: the three low bits in 14–12 and `BPU3` in bit 4 (§4, `BPLCON0`).
+const EIGHT: u16 = 0x0010;
+
 // ---------------------------------------------------------------------------
 // the colour table
 // ---------------------------------------------------------------------------
@@ -228,9 +231,91 @@ fn bank_picks_which_32_entries_the_colour_registers_reach() {
     );
 }
 
+#[test]
+fn bank_reaches_all_256_entries_and_eight_planes_select_them() {
+    let v = lisa();
+    setup(&v, EIGHT);
+    // "BANK2,1,0 [select one] of 8 32 address banks": COLOR00-1F, 20-3F, …
+    // E0-FF. Each entry was loaded through its own bank and shows as itself.
+    let values: Vec<u8> = (0..=255).collect();
+    show(&v, V, 0x38, &values);
+    for k in 1..256 {
+        assert_eq!(lores(&v, V, k), distinct(k as usize), "colour {k:#04x}");
+    }
+    // Value zero inside the window is colour 0 with no mask.
+    assert_eq!(lores(&v, V, 0), distinct(0));
+}
+
+#[test]
+fn bpu3_is_the_fourth_bit_and_seven_planes_leave_the_eighth_unseen() {
+    let v = lisa();
+    setup(&v, EIGHT);
+    // Plane 8 alone: colour $80.
+    show(&v, V, 0x38, &[0x80, 0xff]);
+    assert_eq!(lores(&v, V, 0), distinct(0x80));
+    assert_eq!(lores(&v, V, 1), distinct(0xff));
+
+    // BPU = 7: plane 8's bit is not fetched into the address.
+    w(&v, BPLCON0, 0x7000);
+    show(&v, V, 0x38, &[0x80, 0xff]);
+    assert_eq!(lores(&v, V, 0), distinct(0), "plane 8 is off: value zero");
+    assert_eq!(lores(&v, V, 1), distinct(0x7f));
+
+    // BPU = 15 is not a value the specification defines; eight is all there
+    // is to fetch.
+    w(&v, BPLCON0, 0x7010);
+    show(&v, V, 0x38, &[0xff]);
+    assert_eq!(lores(&v, V, 0), distinct(0xff));
+}
+
+#[test]
+fn bplam_xors_the_bitplane_address_and_leaves_the_border_alone() {
+    let v = lisa();
+    setup(&v, 0x1000);
+    // "This 8 bit field is XOR'ed with the 8 bit plane color address" (§4,
+    // BPLCON4); ESPRM/OSPRM stay at their reset 0001.
+    w(&v, BPLCON4, 0x8011);
+    show(&v, V, 0x38, &[1, 0]);
+    assert_eq!(lores(&v, V, 0), distinct(0x81));
+    assert_eq!(
+        lores(&v, V, 1),
+        distinct(0x80),
+        "a zero pixel is an address too"
+    );
+    assert_eq!(
+        quarter(&v, V, X81 - 4),
+        distinct(0),
+        "the border is colour 0"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // playfield modes
 // ---------------------------------------------------------------------------
+
+#[test]
+fn dual_playfields_have_four_planes_each_and_pf2of_moves_the_second() {
+    let v = lisa();
+    // Lores, BPU = 8, DPF.
+    setup(&v, EIGHT | DBLPF);
+    // Pixel 0: planes 1 and 7, playfield 1 value %1001. Pixel 1: plane 8,
+    // playfield 2 value %1000. "PFI = odd, FP2 = even bit planes".
+    show(&v, V, 0x38, &[0x41, 0x80]);
+    assert_eq!(lores(&v, V, 0), distinct(9), "playfield 1 has no offset");
+    // "PF2OF … 011 … 8 (default)" (§4, BPLCON3).
+    assert_eq!(lores(&v, V, 1), distinct(16));
+
+    // PF2OF = 101: 32.
+    w(&v, BPLCON3, 0b101 << 10);
+    show(&v, V, 0x38, &[0x41, 0x80]);
+    assert_eq!(lores(&v, V, 0), distinct(9));
+    assert_eq!(lores(&v, V, 1), distinct(40));
+
+    // PF2OF = 000: none — and playfield 2 then lands on playfield 1's colours.
+    w(&v, BPLCON3, 0);
+    show(&v, V, 0x38, &[0x41, 0x80]);
+    assert_eq!(lores(&v, V, 1), distinct(8));
+}
 
 #[test]
 fn extra_half_brite_needs_low_resolution_on_lisa() {
@@ -257,6 +342,93 @@ fn extra_half_brite_needs_low_resolution_on_lisa() {
     w(&v, BPLCON2, KILLEHB);
     show(&v, V, 0x38, &[0x21]);
     assert_eq!(lores(&v, V, 0), 0x0012_3456);
+}
+
+// ---------------------------------------------------------------------------
+// scroll and fetch width
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bplcon1_scrolls_in_35ns_steps() {
+    let v = lisa();
+    setup(&v, 0x1000);
+    let one = |v: &Video| show(v, V, 0x38, &[1]);
+    let lit = |v: &Video, q: i32| quarter(v, V, q) == distinct(1);
+
+    one(&v);
+    assert!(!lit(&v, X81 - 1) && lit(&v, X81) && lit(&v, X81 + 3) && !lit(&v, X81 + 4));
+
+    // PF1H0, bit 8: "PFyH0 = LSB = 35ns SHRES pixel" (§4, BPLCON1).
+    w(&v, BPLCON1, 0x0100);
+    one(&v);
+    assert!(!lit(&v, X81) && lit(&v, X81 + 1) && lit(&v, X81 + 4) && !lit(&v, X81 + 5));
+
+    // PF1H1, bit 9: two quarters.
+    w(&v, BPLCON1, 0x0200);
+    one(&v);
+    assert!(!lit(&v, X81 + 1) && lit(&v, X81 + 2) && !lit(&v, X81 + 6));
+
+    // The old field in bits 3-0, "old PFyH0 now PFyH2": whole lores pixels, as
+    // on an 8362.
+    w(&v, BPLCON1, 0x0003);
+    one(&v);
+    assert_eq!(lores(&v, V, 3), distinct(1));
+    assert_eq!(lores(&v, V, 2), distinct(0));
+
+    // Playfield 2's bits — 15-12 and 7-4 — leave playfield 1 where it was.
+    w(&v, BPLCON1, 0xf0f0);
+    one(&v);
+    assert_eq!(lores(&v, V, 0), distinct(1));
+}
+
+#[test]
+fn a_64_bit_fetch_scrolls_through_all_63_pixels() {
+    // §5's table: at 4× bandwidth a LORES playfield scrolls "0-63" pixels. PF1H7
+    // and PF1H6, bits 11 and 10, are 32 and 16 low-resolution pixels.
+    let v = lisa();
+    setup(&v, 0x1000);
+    w(&v, FMODE, 0x0003);
+    w(&v, BPLCON1, 0x0c0f);
+    // A 64-bit fetch: four words, the lit pixel the very first.
+    line(
+        &v,
+        V,
+        0x38,
+        [&[0x8000, 0, 0, 0], &[], &[], &[], &[], &[], &[], &[]],
+    );
+    assert_eq!(lores(&v, V, 32 + 16 + 15), distinct(1));
+    assert_eq!(lores(&v, V, 32 + 16 + 14), distinct(0));
+    assert_eq!(lores(&v, V, 32 + 16 + 16), distinct(0));
+}
+
+#[test]
+fn each_fmode_width_is_the_same_bit_stream() {
+    // "the parallel to serial conversion is triggered whenever bit plane #1 is
+    // written, indicating the completion of all bit planes for that word
+    // (16/32/64 pixels). The MSB is output first" (§4, BPLxDAT): a 16-, 32- or
+    // 64-bit fetch is that many consecutive pixels, so the stream Alice hands
+    // over is one or two or four words a fetch slot, and Lisa shows the same
+    // picture for all three.
+    let words = [0xa5a5, 0x0ff0, 0xffff, 0x8001];
+    let mut pictures = Vec::new();
+    // FMODE's BPL32/BPAGEM: 00 is 16 bits, 01 and 10 are 32, 11 is 64 (§4,
+    // FMODE, "Bitplane Fetch … By 2 bytes / 4 bytes / 4 bytes / 8 bytes").
+    for (fmode, per_fetch) in [(0u16, 1usize), (1, 2), (2, 2), (3, 4)] {
+        let v = lisa();
+        setup(&v, 0x1000);
+        w(&v, FMODE, fmode);
+        line(&v, V, 0x38, [&words, &[], &[], &[], &[], &[], &[], &[]]);
+        // The first fetch slot's pixels: 16 × the words it carried, in order.
+        for k in 0..16 * per_fetch {
+            let bit = words[k / 16] >> (15 - k % 16) & 1;
+            let expect = if bit != 0 { distinct(1) } else { distinct(0) };
+            assert_eq!(lores(&v, V, k as i32), expect, "FMODE {fmode}, pixel {k}");
+        }
+        let mut row = vec![0u32; v.geometry().0 as usize];
+        v.read_row_rgb(2 * u32::from(V - 0x1d), &mut row);
+        pictures.push(row);
+    }
+    assert!(pictures.windows(2).all(|p| p[0] == p[1]));
 }
 
 // ---------------------------------------------------------------------------

@@ -185,19 +185,20 @@
 //!
 //! # The AA chip set: Lisa
 //!
-//! `revision = "aga"` is **Lisa**, the A1200's and A4000's video chip. Her
-//! display half is being modelled a piece at a time; so far she has the
-//! 256-entry 24-bit colour table, reached 32 entries at a time through
-//! `BPLCON3`'s `BANK` and a nibble per gun at a time through `LOCT`, and she
-//! shows an 8362's playfields through it on a 35 ns grid. `denise/aga.rs` has
-//! what the *Specification for the Advanced Amiga (AA) Chip Set* settles,
-//! what it leaves open and what was chosen there. An 8362 and an 8373 do not
-//! go near that module, and everything above this section is still exactly
-//! what they do.
+//! `revision = "aga"` is **Lisa**, the A1200's and A4000's video chip. The
+//! display half is modelled here a piece at a time — so far eight bitplanes,
+//! the 256-entry 24-bit colour table with `BANK` and `LOCT`, `BPLCON4`'s
+//! bitplane mask, `FMODE`, and the 35 ns scroll and window — and
+//! `denise/aga.rs` has what the *Specification for the Advanced Amiga (AA) Chip
+//! Set* settles, what it leaves open and what was chosen there. An 8362 and an
+//! 8373 do not go near that module, and everything above this section is
+//! still exactly what they do.
 //!
 //! What Lisa shares with the older parts is the seam: the same [`Line`] a
-//! line, the same register writes, the same [`Beam`]. [`Fetch::planes`]
-//! already carries eight streams for her.
+//! line, the same register writes, the same [`Beam`]. What she adds to it is
+//! documented where it is declared: [`Fetch::planes`] carries **eight**
+//! streams, and a 32- or 64-bit `FMODE` needs nothing more — a wider fetch is
+//! more words in the same stream.
 //!
 //! The picture is **eight bits a gun** for every part ([`Video::copy_frame_rgb`]),
 //! because Lisa's is; an 8362's and an 8373's guns reach it as `n × 17`, the
@@ -359,6 +360,10 @@ const ATTACH: u16 = 1 << 7;
 // from an 8362 or an 8373.
 // ---------------------------------------------------------------------------
 
+/// `BPLCON0` bit 4, `BPU3`: the fourth bitplane-use bit, so `BPU` counts
+/// "0000-1000 (none thru 8 inclusive)" (AA specification, `BPLCON0`).
+const BPU3: u16 = 1 << 4;
+
 /// `BPLCON3` bit 9, `LOCT`: "Dictates that subsequent color palette values
 /// will be written to a second 12-bit color palette, constituting the RGB low
 /// order bits".
@@ -396,10 +401,10 @@ pub enum Revision {
     /// SuperHires, 70 ns sprite positions and `KILLEHB`. Its picture is laid
     /// out in SuperHires pixels, four to a low-resolution one.
     Ecs,
-    /// The AA chip set's **Lisa**: a 256-entry 24-bit colour table, reached
-    /// through `BANK` and `LOCT`. Its picture is always laid out in 35 ns
-    /// columns, four to a low-resolution pixel. See
-    /// [the AA section](self#the-aa-chip-set-lisa).
+    /// The AA chip set's **Lisa**: eight bitplanes, a 256-entry 24-bit colour
+    /// table, `FMODE`, `BPLCON4` and 35 ns positioning throughout. Its
+    /// picture is always laid out in 35 ns columns, four to a low-resolution
+    /// pixel. See [the AA section](self#the-aa-chip-set-lisa).
     Aga,
 }
 
