@@ -7,6 +7,210 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/rsemu/compare/v0.0.5...v0.0.6) - 2026-09-19
+
+### Added
+
+- *(dev-pc)* a diskette the host can swap under a running guest
+- *(fw-pcbios)* the VGA graphics modes, and VBE 2.0 over our own registers
+- *(dev-pc-video)* a linear framebuffer behind the display adapter's BAR0
+- *(dev-pc-video)* a VGA model with planar memory and a scanout from the registers
+- *(machine)* the A1200, and Kickstart 3.1 booting Workbench 3.1 on it
+- *(dev-amiga-agnus)* Alice, the AA chip set's Agnus
+- *(dev-amiga-denise)* AA sprites, their wide DMA seam, and CLXCON2
+- *(dev-amiga-denise)* HAM8, and HAM6 in every resolution
+- *(dev-amiga-denise)* eight bitplanes, FMODE, the 35 ns scroll and BPLCON4's bitplane mask
+- *(dev-amiga-denise)* Lisa, the AA video chip, and her 256-entry colour table
+- *(machine)* [**breaking**] the A600's chips are the Enhanced Chip Set, because they are
+- *(machine)* the A500+ board, its ECS chips and its battery-backed clock
+- *(dev-amiga-agnus)* the Enhanced Chip Set Agnus, BEAMCON0 and the programmable beam
+- *(dev-amiga-denise)* the 8373 Enhanced Chip Set Denise and a picture laid out by the beam
+- *(machine)* the A600's Kickstart repeats wherever Gayle's ROM select reaches
+- *(machine)* an amiga-a600 board with an IDE hard disk on Gayle
+- *(dev-amiga-gayle)* Gayle, the A600's IDE port and interrupt registers
+- *(cpu-m68k)* the 68020's stack frames, master stack and timing
+- *(cpu-m68k)* the 68020's instructions
+- *(cpu-m68k)* the 68020's addressing modes
+- *(cpu-m68k)* [**breaking**] a model property, and the 68010
+- *(dev-amiga-gary)* [**breaking**] decode bank 6, fit an A501, and give AROS an extended-ROM window
+- *(host)* --record-audio and a browser tab can hear an Amiga
+- *(dev-amiga-paula)* the four audio channels produce stereo frames for a host
+- *(dev-atecc)* the SWI front end, on the same packet layer as I2C
+- *(bus-swi)* a single-wire link whose unit is a UART frame
+- *(machine)* [**breaking**] the A500's ROM socket is a 512 KiB mirror, so a Kickstart 1.x fits
+- *(machine)* DF0 on the A500 takes a disk
+- *(dev-amiga-floppy)* ADF disks, encoded into the MFM tracks trackdisk reads
+- *(machine)* an A500 you can see, type at and point at
+- *(dev-amiga)* the keyboard's protocol and the mouse's quadrature, through the seam
+- *(dev-amiga-paula)* the four pot pins read on POTGOR
+- *(dev-amiga-denise)* the mouse pins clock JOY0DAT and JOY1DAT
+- *(dev-amiga-agnus)* Agnus, and the whole A500 chipset running together
+- *(dev-amiga-denise)* Denise -- colour, playfields, HAM, sprites and collisions
+- *(dev-amiga)* the A500's internal floppy drive on the CIA ports
+- *(dev-amiga)* Paula, and both CIAs interrupting the A500 through it
+- *(machine)* put the two 8520s on the A500, with CIA-A's PA0 driving OVL
+- *(dev-amiga)* the A500 memory map, the OVL overlay and the custom-chip seam
+- *(machine)* reach a named neighbour's region from bind
+- *(dev-cia)* the MOS 8520 CIA
+- *(media)* read an Amiga Kickstart from the media the user already owns
+- *(dev-atecc)* the ATECC508A/608 secure element on I²C, and the crypto it needs
+- *(machine)* put the ST25DV64K on the stm32f407 board
+- *(dev-st25dv)* the ST25DV dynamic NFC tag, with the RF reader as a host door
+- *(gdb)* [**breaking**] `load` into flash, through the door the device opened
+- *(dev-stm32-flash)* describe the array's sectors, so a loader can program it
+- *(space)* a device can publish the erase geometry a loader programs it through
+- *(dev-flash)* enforce PCROP and RDP rather than store them
+- *(dev-stm32)* sixteen peripherals honour their clock gate
+- *(dev-stm32-rcc)* the clock interrupt, so a ready bit can raise IRQ 5
+- *(dev-stm32)* a clock gate a peripheral can receive, and a USART that honours it
+- *(dev-stm32-i2c)* [**breaking**] slave mode on both links, and v2's `SBC`
+- *(bus-i2c)* one pin pair carries both roles, so a controller can be addressed
+- *(dev-psram-qspi)* an APS6404L-class QSPI pseudo-static RAM
+- *(dev-stm32-octospi)* [**breaking**] pass CCR's widths through, and count the chip select low
+- *(bus-spi)* carry the line width of a phase with the word
+- *(dev-st77xx)* the ST7789/ST7735, whose commands are addressed rather than counted
+- *(dev-ssd1306)* the SSD1306/SH1106, and the seam a device-owned framebuffer needs
+- *(dev-dfuse)* DfuSe (.dfu, UM0391) images, each element at its own address
+- *(dev-sdio)* the SDIO answers as a DMA flow controller
+- *(machine)* wire the F407's DMA request matrix from RM0090 Tables 43/44
+- *(dev-dmamux)* the STM32 DMA request multiplexer
+- *(dev-dma)* [**breaking**] CHSEL gates the request, and PFCTRL ends the transfer
+- *(wire)* let a DMA peripheral say which item is its last
+- *(dev-keypad)* a GPIO matrix keypad, and the stm32f407 gets one on PE0-PE7
+- *(wire)* [**breaking**] a third driver state, and a net that resolves itself
+- *(dev-stm32)* the HASH processor, context swap included
+- *(dev-stm32-firewall)* [**breaking**] the interrupt case, and the call gate is three words
+- *(cli)* `--spin-detect`, so a hung board says why
+- *(cpu-riscv)* wire the hart interpreter to the spin detector
+- *(cpu-arm)* wire the ARMv7-M interpreter to the spin detector
+- *(spin)* catch a processor stuck on a load whose value never changes
+- *(dev-stm32-dbgmcu)* st.dbgmcu, with a real output pin per freeze bit
+- *(cpu-arm)* [**breaking**] the external PPB's vendor window belongs to the board
+- *(device)* a debugger's halt reaches a device through `Device::debug_halt`
+- *(dev-stm32-firewall)* the STM32L4 Firewall, and FWDIS becomes load-bearing
+- *(dev-stm32-exti)* [**breaking**] SYSCFG.MEMRMP moves what answers at address zero
+- *(machine)* chain the F407's timers through the internal trigger matrix
+- *(dev-stm32-tim)* [**breaking**] input capture, the slave-mode controller and the DMA burst window
+- *(dev-i2c-v2)* st.i2c-v2, the block every STM32 since the F0 carries
+- *(machine)* the SDIO on the F407, and the first request line anything drives
+- *(dev-sdio)* the F2/F4/F7 SDIO, as a sibling of the H7 SDMMC rather than a variant of it
+- *(dev-stm32)* [**breaking**] the F0/F3/F7/L4/G4/WB SPI, as a variant with its FIFO
+- *(dev-stm32-rng)* the STM32 RNG, from a stream the machine seeds
+- *(dev-rcc)* st.rcc drives sysclk, hclk, pclk1, pclk2 and the timer clocks
+- *(clock)* a device can re-rate a clock domain, at a scheduling boundary
+- *(machine)* the F407 carries its flash interface and its real-time clock
+- *(dev-rtc)* the STM32 real-time clock, its BCD calendar and its backup domain
+- *(dev-stm32)* an `st.flash` that owns the array it programs
+- *(cpu-arm-v7m)* [**breaking**] the DWT cycle counter, and the bit-band alias windows
+- *(gdb)* qXfer:memory-map:read, built from the machine's own address space
+- *(gdb)* [**breaking**] a target description is a list of features, and ARMv7-M has two
+- *(machine)* the F407's nine peripherals, at their Table 62 vectors and behind a bus matrix
+
+### Fixed
+
+- *(sched)* [**breaking**] arm a comparator where the writing processor stands
+- *(fw-pcbios)* probe for a diskette adapter before talking to one
+- *(fw-pcbios)* [**breaking**] the three disk services an installation needs
+- *(cpu-x86)* [**breaking**] count the time-stamp counter through a halt
+- *(dev-amiga-agnus)* an 8375 answers $21 on PAL, leaving bit 1 to Alice
+- *(dev-amiga-denise)* LISAID bits 9-8 say the A1200 fetches four times wide
+- *(cpu-x86)* [**breaking**] publish the core's position, and read x86 timers where the reader stands
+- *(sched)* [**breaking**] a declined round ages nobody, not even a passive crystal
+- *(dev-amiga)* [**breaking**] the chip data bus, not a floating-word placeholder
+- *(sched)* [**breaking**] read a free-running counter at the reading runnable's position
+- *(dev-ata)* [**breaking**] no completion interrupt after the last block of a PIO read
+- *(dev-amiga-keyboard)* [**breaking**] a host's burst of keys waits instead of sticking one down
+- *(input)* move the Amiga pointer one count per framebuffer pixel
+- *(sched)* [**breaking**] every runnable on a crystal executes the crystal's whole rate
+- *(dev-amiga-paula)* [**breaking**] poll the host port on catch-up, not as a runnable
+- *(sched)* deliver the lazy event a round ends on, even a tick short of it
+- *(dev-amiga-paula)* write the level pins low-first so they never show seven
+- *(dev-amiga-floppy)* step the head on the trailing edge of STEP*
+- *(cli)* --for bounds a console session rather than the idle guess doing it
+- *(dev-cia)* the start a timer-high write makes raises a toggle output too
+- *(dev-amiga-agnus)* count a high-resolution bitplane fetch in eight-count blocks
+- *(dev-amiga-agnus)* a copper MOVE to a protected register halts the copper
+- *(dev-amiga-agnus)* a blitter line steps its D pointer by BLTCMOD
+- *(dev-amiga)* repeat a 256 KiB Kickstart through Gary's overlay window
+- *(dev-amiga)* a byte access to a custom register is the word access the chips see
+- *(dev-cia)* a write to a one-shot timer's high byte starts it
+- *(dev-amiga-paula)* no disk word is lost between Agnus's slots
+- *(dev-cia)* SP and CNT are open drain, and SP's output latch resets low
+- *(dev-amiga)* route DIWSTRT and DIWSTOP to Denise as well as Agnus
+- *(dev-cia)* release the output table before driving a pin
+- *(machine)* restore the brace a union merge ate
+- *(dev-flash)* an F4 comes back from a reset with its option register locked
+- *(machine)* hand a sink the drivers wired to it, not its whole net
+- *(dev-stm32)* OTYPER and PUPDR decide what a pad presents, and IDR reads the pin
+- *(dev-stm32)* a feature has to compile its own tests, alone
+- *(machine)* the F407's two watchdog resets stop sharing one net
+- *(machine)* register st.tim in a build that enables only dev-stm32-tim
+- *(cpu-x86)* the inlined-path tests need a host that generates code
+- *(cpu-riscv)* gate `has_shadow` on what its callers are gated on
+- *(sched)* a share that rounds to nothing still gets one tick
+- *(sched)* [**breaking**] a budget is a share of the round, not ten thousand ticks
+
+### Other
+
+- *(machine)* pc-at installs FreeDOS and boots off the disk it wrote
+- *(machine)* install FreeDOS 1.3 onto a hard disk and boot off it
+- *(dev-pc)* four scan codes, four interrupts, and no firmware
+- *(fw-pcbios)* put AH=0Fh's comment back above AH=0Fh
+- say in the manifest what dev-pc-video and dev-pc-pci now get you
+- *(dev-pc-video)* strike "a graphics mode" from what pc-at is missing
+- *(machine)* build amiga_alice without display-png
+- *(machine)* say that the A1200's trace prints ChipRevBits0
+- *(dev-amiga-agnus)* a section sign a shell mangled on its way in
+- Alice, the A1200, and the one thing the AA board does not yet show
+- record Lisa, the seam Alice needs from her, and what the AA document left open
+- *(dev-amiga-denise)* [**breaking**] eight planes in the seam and a picture eight bits a gun
+- note that the host pointer's scale assumes a high-resolution picture
+- *(dev-amiga-rtc)* say the leap-year rule with is_multiple_of
+- *(machine)* ScreenMode on the A500+ and the A500, and the DENISEID finding it exposes
+- *(dev-amiga-denise)* the scanout follows a programmed raster and its period stays exact
+- record the Enhanced Chip Set, the A500+ and what Kickstart found
+- *(machine)* an A600 section in the Amiga ledger
+- *(machine)* Kickstart boots Workbench off an HDF on the A600
+- the 68010 and 68020 get a row of the core table, and say what stands in for a corpus
+- *(cpu-m68k)* say which processors each row of the table is on
+- *(cpu-m68k)* a machine file may name the processor
+- the A500 belongs in the list of boards that boot foreign software
+- *(amiga)* what using the Workbench proved, and the two input defects it found
+- *(amiga)* a person opens the disk, starts a Shell and types, on 2.04 and 1.3
+- *(amiga)* what the audio handshake guarantees now, and the half-speed 68000
+- *(amiga)* record what the AROS keyboard wedge is and is not
+- drop the Paula test constants nothing reads, and chunk by `as_chunks`
+- say what a recorded Amiga tone actually measures
+- rustfmt the Amiga audio additions and rewrap two paragraphs
+- what the Amiga's audio stream is, and the DMA skew it exposes
+- *(machine)* Kickstart 1.3 boots the Workbench 1.3 disk to its desktop
+- *(machine)* the ADF tests reach the custom bus itself, not a byte-tolerant window
+- *(machine)* Kickstart 1.3, 2.04 and 3.1 draw their insert-disk screens
+- *(machine)* the A500 tests bind DF0 now the board names its slot
+- *(machine)* an A500's empty addresses float, and Kickstart needs them to
+- *(dev-amiga)* gate the CIA-only sink with the test that uses it
+- *(dev-cia)* two 8520s on a 68000 test board
+- name the Amiga emulators and AROS in the provenance exclusion table
+- *(dev-stm32)* the gate link resolves on its own, and one that pointed at a private type
+- *(machine)* a board that wires its clock gates, and the docs for why it is not the F407
+- *(dev-flash)* the link text already resolves
+- *(dev-stm32-hash)* a board for the hash processor, not a part that lacks one
+- *(dev-sdio)* prove PFCTRL against a real card, both ways
+- bound fstool below the release that demands a filesystem feature
+- *(spin)* the detector on a whole board, and what it costs
+- *(machine)* the F407's watchdog reset path, end to end
+- ignore the per-agent CARGO_TARGET_DIR
+- *(dev-sdio)* a guest moves blocks over DMA2 without ever reading the FIFO
+- *(machine)* the F407's flash guarantee is no silent modification, not a fault
+- *(dev-stm32)* the two flash bases, and that nothing writes the array back
+- *(dev-stm32)* link the flash module header at items rustdoc can reach
+- *(dev-stm32)* say which SNB field width the F4 flash decodes
+- declare the `dev-stm32-flash` feature
+- *(gdb-v7m)* the four M-profile behaviours a debugger gets wrong
+- Merge branch 'worktree-agent-a2b16c84daee86067'
+- Merge branch 'worktree-agent-a4af39317f2a25f0b'
+- *(sched)* what the budget change measured, end to end
+
 ## [0.0.5](https://github.com/KarpelesLab/rsemu/compare/v0.0.4...v0.0.5) - 2026-09-11
 
 ### Added
