@@ -86,15 +86,20 @@ machine "amiga-a600" {
   object custom "amiga.custom" { }
   object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
   object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
+  # The A600's chips are the Enhanced Chip Set: an 8375 Agnus, which is the
+  # 2 MiB part whatever is fitted, and an 8373 Super Denise. `reach` is what
+  # the chip can address, `chip-ram` what the board has soldered on it.
   object agnus "amiga.agnus" {
     clock    = clk / 8
     custom   = custom
     ram      = chipram
     standard = "pal"
+    revision = "ecs"
+    reach    = 2M
     paula    = paula
     video    = denise
   }
-  object denise "amiga.denise" { custom = custom, clock = clk / 4 }
+  object denise "amiga.denise" { custom = custom, clock = clk / 4, revision = "ecs" }
 
   object cia_a "mos.8520" { clock = clk / 40 }
   object cia_b "mos.8520" { clock = clk / 40 }

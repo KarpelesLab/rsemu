@@ -268,6 +268,6 @@ const GOLDEN_310_WB311: u64 = 0xa06f_52db_6660_b2a5;
 /// At 15 s, Kickstart 2.05 and Workbench 2.1: the desktop.
 const GOLDEN_205_WB211: u64 = 0x2462_09c0_df29_6a49;
 /// At 15 s, Kickstart 3.1 and Workbench 1.3.5: the desktop.
-const GOLDEN_310_WB135: u64 = 0x4450_4249_16a7_ca59;
+const GOLDEN_310_WB135: u64 = 0x9846_59c4_5469_1329;
 /// At 27 s, Kickstart 3.1 with no disk anywhere: the insert-disk screen.
-const GOLDEN_310_EMPTY: u64 = 0x26cc_b705_6fbc_7ba9;
+const GOLDEN_310_EMPTY: u64 = 0xb0e3_ceb0_63d8_207d;

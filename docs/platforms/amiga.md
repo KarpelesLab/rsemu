@@ -1079,9 +1079,14 @@ Kickstart 3.1 boots Workbench 3.1 to a bit-identical frame at the same moment
 with the two mirrors mapped or without them. They are mapped because the chip
 decodes them, not because anything was seen to need them.
 
-**The chips are OCS.** The A600 has the ECS 8375 Agnus and 8373 Denise; the
-board moves to them when the ECS models land, and every golden below moves
-with it.
+**The chips are ECS**, as a real A600's are: an 8375 Agnus (`reach = 2M`, the
+part, whatever the board has soldered on it — an A600 has 1 MiB) and an 8373
+Super Denise. The board was built on the OCS models because the ECS ones did
+not exist yet, and moved when they landed. Two of its four goldens moved with
+it and both pictures were looked at: the insert-disk screen is the same screen
+with the disk at a different point of its slide, and the Workbench 1.3 hard
+disk draws the same desktop. The Workbench 3.1 and 2.1 desktops did not move
+at all.
 
 ### Defects found on the way
 
