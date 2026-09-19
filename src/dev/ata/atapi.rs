@@ -746,6 +746,14 @@ impl AtapiDrive {
         if state.status & ST_DRQ == 0 {
             return 0;
         }
+        // `DRQ` is up during the *command packet* phase too, and that block is
+        // the host's to fill rather than the drive's to hand back: the
+        // Interrupt Reason register says `I/O = 0` and a host that read anyway
+        // would get its own half-written command descriptor block. Zero is what
+        // a drain loop expects to stop on.
+        if state.stage == Stage::Cdb {
+            return 0;
+        }
         let at = state.pos;
         if at >= state.buf.len() {
             return 0;

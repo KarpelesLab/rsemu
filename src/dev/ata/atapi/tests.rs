@@ -314,6 +314,31 @@ fn a_debug_read_of_the_data_register_does_not_advance_the_buffer() {
 }
 
 #[test]
+fn the_data_register_hands_back_nothing_during_the_command_packet_phase() {
+    // `DRQ` is up while the drive is waiting for a command descriptor block,
+    // and that block is the host's to fill: the Interrupt Reason register says
+    // `I/O = 0`. A drive that handed it back would return a host its own
+    // half-written packet.
+    let cd = drive(4);
+    clear_attention(&cd);
+    select(&cd);
+    cd.write_reg(Reg::LbaMid, 0);
+    cd.write_reg(Reg::LbaHigh, 8);
+    cd.write_reg(Reg::Command, u16::from(cmd::PACKET));
+    assert_eq!(cd.read_alt_status() & ST_DRQ, ST_DRQ);
+    assert_eq!(cd.read_reg(Reg::SectorCount, true) as u8 & IR_IO, 0);
+    assert_eq!(cd.read_reg(Reg::Data, false), 0);
+    // And the phase is undisturbed: the packet still goes in and still runs.
+    let mut cdb = cdb_read10(1, 1);
+    cdb.resize(PACKET_BYTES, 0);
+    for pair in cdb.chunks(2) {
+        cd.write_reg(Reg::Data, u16::from(pair[0]) | (u16::from(pair[1]) << 8));
+    }
+    assert_eq!(cd.read_alt_status() & ST_CHK, 0);
+    assert_eq!(cd.read_reg(Reg::SectorCount, true) as u8 & IR_IO, IR_IO);
+}
+
+#[test]
 fn a_debug_read_of_the_status_register_does_not_acknowledge() {
     let cd = drive(4);
     clear_attention(&cd);
