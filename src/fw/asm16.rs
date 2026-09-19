@@ -989,6 +989,12 @@ impl Asm {
         self.db(&[0x6d]);
     }
 
+    /// `OUTSB` — a byte from `DS:SI` to the port in `DX` (80186 and later).
+    /// With a `REP` prefix this is how a palette reaches a DAC.
+    pub fn outsb(&mut self) {
+        self.db(&[0x6e]);
+    }
+
     /// `OUTSW` — a word from `DS:SI` to the port in `DX`.
     pub fn outsw(&mut self) {
         self.db(&[0x6f]);

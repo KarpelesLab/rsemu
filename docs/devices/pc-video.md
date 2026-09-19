@@ -1,7 +1,7 @@
 # `pc.video` — the VGA, and rsemu's display extension registers
 
 Consumed by `src/dev/pc/video.rs`, `src/dev/pc/video/vga.rs`,
-`src/dev/pc/video/scan.rs` and `src/fw/pcbios/video.rs`. The *hardware* this
+`src/dev/pc/video/scan.rs` and `src/fw/pcbios/vbe.rs`. The *hardware* this
 models is IBM's, and the sources for it are listed in each of those files; this
 page is the part that is **ours** — the small register interface a linear
 framebuffer is set up through, and the VBE services the in-house BIOS builds on
@@ -112,7 +112,7 @@ configuration space. Nothing in the device hardwires an address.
 
 ## The VBE services
 
-`src/fw/pcbios/video.rs` implements, over the registers above:
+`src/fw/pcbios/vbe.rs` implements, over the registers above:
 
 | Function | What it does |
 | --- | --- |
@@ -121,8 +121,15 @@ configuration space. Nothing in the device hardwires an address.
 | `AX=4F02h` | set mode: a VGA mode number goes to `INT 10h AH=00h`; a VBE mode programs the CRT controller for the timing and the extension registers for the picture |
 | `AX=4F03h` | the current mode |
 | `AX=4F05h` | the window position, in 64 KiB banks (`SR EEh`) |
-| `AX=4F06h` | the scan line length — the pitch, in pixels or in bytes |
-| `AX=4F07h` | the display start, for page flipping and panning |
 
-The mode list is generated from a table in the ROM; `docs/platforms/pc-at.md`
-lists the modes it offers and what has been measured running them.
+**Not implemented, and they return `AH=01h` rather than pretending:**
+`AX=4F04h` (save and restore state), `AX=4F06h` (the scan line length),
+`AX=4F07h` (the display start) and `AX=4F08h` (the DAC width). The registers
+they would move are all there — pitch, start and bank are `SR E9h`-`EEh` — so
+each is a short routine; none is written on a guess, and the first guest that
+needs one is the reason to add it.
+
+The mode list is generated from a table in the ROM: 640x480, 800x600 and
+1024x768, each at 8, 16 (5:6:5) and 32 bits a pixel, which is 3 MiB at the
+largest and fits the 4 MiB the boards give the adapter.
+`docs/platforms/pc-at.md` records what has been measured running them.

@@ -45,7 +45,13 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     let teletype = a.label();
     let get_mode = a.label();
     let write_str = a.label();
+    let vbe_call = a.label();
     let done = a.label();
+
+    // The graphics modes and VBE, which are `vbe`'s: its labels are made here
+    // because the dispatch below names them, and its code is emitted at the
+    // end of this function.
+    let v = super::vbe::Vbe::new(a);
 
     a.mov8(AH, Mem::bp(F_AX + 1));
     for (function, target) in [
@@ -60,6 +66,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
         (0x0e, teletype),
         (0x0f, get_mode),
         (0x13, write_str),
+        (0x4f, vbe_call),
     ] {
         a.alui8(Alu::CMP, AH, function);
         a.jcc(Cc::E, target);
@@ -76,6 +83,13 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.mov8(AH, AL);
     a.alui8(Alu::AND, AL, 0x7f);
     a.movto8(Mem::abs(BDA_VIDEO_MODE), AL);
+    // The card first, if it is ours and knows this mode: it programs the whole
+    // register file, loads the DAC, fills in the BIOS Data Area from its own
+    // table and clears the picture. Carry set means it did none of that — a
+    // 6845-model adapter, somebody else's card, or a mode nothing here has a
+    // register set for — and the text-mode fallback below runs instead.
+    a.call(v.set_mode);
+    a.jcc(Cc::AE, done);
     a.movmi(Mem::abs(BDA_COLUMNS), 80);
     a.movmi(Mem::abs(BDA_PAGE_SIZE), 0x1000);
     a.movmi(Mem::abs(BDA_PAGE_OFFSET), 0);
@@ -182,6 +196,12 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.jmp(done);
 
     // AH=0Fh: AL is the mode, AH the column count, BH the active page.
+    // AH=4Fh, VBE. The subfunction is in AL and `vbe` answers every one of
+    // them in the caller's saved AX.
+    a.bind(vbe_call);
+    a.call(v.entry);
+    a.jmp(done);
+
     a.bind(get_mode);
     a.mov8(AL, Mem::abs(BDA_VIDEO_MODE));
     a.movto8(Mem::bp(F_AX), AL);
@@ -223,6 +243,8 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
 
     a.bind(done);
     leave(a);
+
+    super::vbe::emit(a, l, &v);
 
     // -- putc ---------------------------------------------------------------
     //

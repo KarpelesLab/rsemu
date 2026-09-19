@@ -128,6 +128,7 @@ pub mod platform;
 mod post;
 mod system;
 pub mod tables;
+mod vbe;
 mod video;
 
 pub use platform::Platform;
@@ -236,6 +237,12 @@ const BDA_CHAR_HEIGHT: u16 = 0x85;
 
 /// How many bytes of keyboard buffer the BDA holds: sixteen two-byte entries.
 const KBBUF_BYTES: u16 = 32;
+
+/// The VBE mode in force, or zero. Not a field the BIOS Data Area defines —
+/// `0040:008A` onward is the "display combination code" area no program this
+/// board runs uses — but a VBE mode number is fourteen bits and will not fit
+/// the byte at `0040:0049`, and `AX=4F03h` has to answer with it.
+const BDA_VBE_MODE: u16 = 0x8a;
 
 // -- our own tables, in the EBDA --------------------------------------------
 
