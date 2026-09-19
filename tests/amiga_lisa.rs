@@ -1,5 +1,5 @@
-//! Lisa — `amiga.denise` with `revision = "aga"` — painting a whole field a
-//! person can look at: 256 colours of 24 bits.
+//! Lisa — `amiga.denise` with `revision = "aga"` — painting whole fields a
+//! person can look at: 256 colours of 24 bits, and a HAM8 gradient.
 //!
 //! `src/dev/amiga/denise/aga/tests.rs` has the pixel-level tests. These build
 //! the same kind of field at full size through only the public API — register
@@ -8,7 +8,7 @@
 //! the real host adapter, `host::display::amiga`, the way a window would.
 //!
 //! `RSEMU_AMIGA_FRAME_DIR`, when set and built with `display-png`, receives a
-//! PNG of the field: `lisa-256.png`.
+//! PNG of each field: `lisa-256.png` and `lisa-ham8.png`.
 //! Every expected value is the *Specification for the Advanced Amiga (AA) Chip
 //! Set*'s (Commodore-Amiga), cited by section. Nothing from any Kickstart,
 //! and no board: there is no AA board yet.
@@ -176,4 +176,53 @@ fn eight_planes_show_all_256_twenty_four_bit_colours() {
     assert_eq!(seen.len(), 256);
     assert!(seen.iter().any(|c| c >> 16 & 0xf != c >> 20 & 0xf));
     dump("lisa-256", &s);
+}
+
+/// The HAM8 field's pixel `k` on window line `y`: red, green and blue modified
+/// in turn, red from how far across, green from how far down, blue from how
+/// far across again, backwards.
+fn ham8_value(k: usize, y: usize) -> u8 {
+    // "BP2 BP1: 01 modify blue, 10 modify red, 11 modify green" (§2).
+    let (data, control) = match k % 3 {
+        0 => ((k * 63 / (WIDTH - 1)) as u8, 0b10),
+        1 => ((y * 63 / usize::from(HEIGHT - 1)) as u8, 0b11),
+        _ => (63 - (k * 63 / (WIDTH - 1)) as u8, 0b01),
+    };
+    data << 2 | control
+}
+
+#[test]
+fn ham8_paints_a_gradient_no_palette_could_hold() {
+    let v = lisa();
+    // Colour 0 black, so the hold register starts every line at black and
+    // the two low bits of each gun stay 00.
+    set_rgb(&v, 0, 0);
+    // BPU = 8 and HAM: "invoked when BPU field in BPLCON0 is set to 8, and
+    // HAMEN is set" (§2).
+    w(&v, BPLCON0, 0x0810);
+    field(&v, |vpos| {
+        let y = usize::from(vpos - TOP);
+        (0..WIDTH).map(|k| ham8_value(k, y)).collect()
+    });
+
+    let s = capture(&v);
+    // After a whole R, G, B triple, the pixel is exactly the three modifies:
+    // "the data is placed in 6 MSB" of each gun.
+    for vpos in [TOP, TOP + 100, TOP + HEIGHT - 1] {
+        let y = usize::from(vpos - TOP);
+        for k in [2usize, 158, 317] {
+            let gun = |k: usize| u32::from(ham8_value(k, y) >> 2) << 2;
+            let want = gun(k - 2) << 16 | gun(k - 1) << 8 | gun(k);
+            assert_eq!(rgb(&s, at(k, vpos)), want, "pixel {k}, line {vpos:#x}");
+        }
+    }
+    let seen: BTreeSet<u32> = (TOP..TOP + HEIGHT)
+        .flat_map(|vpos| (0..WIDTH).map(move |k| (k, vpos)))
+        .map(|(k, vpos)| rgb(&s, at(k, vpos)))
+        .collect();
+    // More than a table of 256 can hold — and more than the 4096 colours a
+    // twelve-bit part can make at all.
+    println!("lisa-ham8: {} distinct colours", seen.len());
+    assert!(seen.len() > 4096, "{} colours on one screen", seen.len());
+    dump("lisa-ham8", &s);
 }

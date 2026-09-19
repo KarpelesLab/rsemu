@@ -43,7 +43,7 @@
 //! | --- | --- |
 //! | eight bitplanes, `BPU3` | modelled: `BPLCON0` bit 4, so `BPU` is "0000-1000 (none thru 8 inclusive)" |
 //! | the 256-entry 24-bit colour table | modelled: `BANK`, `LOCT`, and the automatic four-to-eight-bit extension |
-//! | HAM8, HAM6 | not yet: `HAMEN` is ignored |
+//! | HAM8 and HAM6 in every resolution | modelled, §2 *Bitplanes* and its two control tables |
 //! | `BPLCON4`'s `BPLAM` | modelled; `ESPRM` and `OSPRM` latched, until there are sprites |
 //! | `BPLCON3`'s `BANK`, `PF2OF`, `LOCT`, `BRDRBLNK` | modelled; `SPRES` and `BRDSPRT` latched, until there are sprites |
 //! | `BPLCON0`'s `ECSENA` gate | modelled: it inhibits `BRDRBLNK`, `BRDNTRAN`, `ZDCLKEN`, `BRDSPRT` and `EXTBLKEN` |
@@ -82,16 +82,24 @@
 //!   gives no formula, so the 3rd-edition manual's arithmetic is kept — one
 //!   fetch block and half a colour clock after the fetch — and the scroll runs
 //!   from there. [`super::Setup`] has the derivation.
+//! * **HAM6's low bits on an eight-bit gun.** §2 says of HAM8 that "the data
+//!   is placed in 6 MSB. The 2 LSB are left unmodified"; it says nothing about
+//!   HAM6, whose four bits are half of a gun. The same rule is applied — four
+//!   bits into the four most significant, the rest held — because it is the
+//!   rule the document states for the mode it describes.
 //! * **What `BPLAM` masks.** "Bits 15 thru 8 of `BPLCON4` comprise an 8 bit
 //!   mask for the 8 bitplane address, XOR'ing the individual bits" (§2). The
 //!   address that reaches the table is masked, in every mode: single
-//!   playfield, either playfield of a dual one and EHB's five-bit address —
-//!   and a playfield pixel whose value is zero, which is
+//!   playfield, either playfield of a dual one, EHB's five-bit address and a
+//!   HAM base register — and a playfield pixel whose value is zero, which is
 //!   as much a bitplane colour address as any other, so inside the window the
 //!   background is `COLOR(BPLAM)`. The border is not a bitplane pixel and
 //!   stays colour 0. The document names no exception, and the register exists
 //!   so "the copper [can] exchange color maps with a single instruction",
 //!   which wants the mask to reach all of them.
+//! * **HAM with seven planes.** §2 defines HAM8 at `BPU = 8` and HAM6 "as
+//!   before"; `BPU = 7` with `HAMEN` is not described. Five, six or seven
+//!   planes are taken as HAM6 here, and eight as HAM8.
 //! * **`PF2OF` when playfield 1 has priority.** §4's `BPLCON3` page says the
 //!   field determines the offset "when playfield 2 has priority in dual
 //!   playfield mode", while §2 says flatly that it determines "second
@@ -144,6 +152,8 @@ struct Setup {
     /// Quarters per bitplane pixel: 4 in `LORES`, 2 in `HIRES`, 1 in `SHRES`.
     step: i32,
     dual: bool,
+    ham6: bool,
+    ham8: bool,
     ehb: bool,
     /// Per plane, the quarter its first bit is displayed at.
     start: [i32; 8],
@@ -179,6 +189,12 @@ impl Setup {
         } else {
             QUARTERS
         };
+        // "This mode is invoked when BPU field in BPLCON0 is set to 8, and
+        // HAMEN is set" (§2). The six-plane mode is "as before" — and now
+        // "works in HIRES and SHRES resolutions" too.
+        let ham = con0 & HOMOD != 0 && !dual;
+        let ham8 = ham && planes == 8;
+        let ham6 = ham && !ham8 && planes >= 5;
         // "As before, EHB is invoked whenever SHRES = HIRES = HAMEN = DPF = 0
         // and BPU = 6. Please note that starting with ECS DENISE there is a
         // bit in BPLCON2 which disables this mode (KILLEHB)."
@@ -243,6 +259,8 @@ impl Setup {
             planes,
             step,
             dual,
+            ham6,
+            ham8,
             ehb,
             start,
             inside_v: vstart <= vpos && vpos < vstop,
@@ -338,6 +356,8 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
     let width = layout.width() as i32;
     let left = i32::from(layout.left) * QUARTERS;
 
+    let mut hold = st.regs.palette[0];
+
     for q in 0..span {
         let mut changed = false;
         while let Some(change) = st.pending.front().copied() {
@@ -363,6 +383,33 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
 
         let bits = setup.bits(&line.fetch, q);
 
+        // The hold register follows the serialized bits whether or not
+        // anything is displayed over them, as on the older parts.
+        if setup.ham8 {
+            // "Bitplanes 1 and 2 are used as control bits analagous to the
+            // function of bitplanes 5 and 6 in 6 bitplane HAM mode … Since
+            // only 6 bitplanes are available for modify data, the data is
+            // placed in 6 MSB. The 2 LSB are left unmodified" (§2).
+            let data = u32::from(bits >> 2) << 2;
+            hold = match bits & 3 {
+                0 => regs.palette[setup.address(bits)],
+                1 => (hold & 0x00ff_ff03) | data,
+                2 => (hold & 0x0003_ffff) | data << 16,
+                _ => (hold & 0x00ff_03ff) | data << 8,
+            };
+        } else if setup.ham6 {
+            // The 3rd-edition table, reprinted in §2: planes 5 and 6 control,
+            // planes 1-4 the data. Four bits into a gun's four most
+            // significant, the rest held — see the module docs.
+            let data = u32::from(bits & 0xf) << 4;
+            hold = match (bits >> 4) & 3 {
+                0 => regs.palette[setup.address(bits & 0xf)],
+                1 => (hold & 0x00ff_ff0f) | data,
+                2 => (hold & 0x000f_ffff) | data << 16,
+                _ => (hold & 0x00ff_0fff) | data << 8,
+            };
+        }
+
         let colour = if !inside {
             border
         } else {
@@ -387,7 +434,9 @@ pub(super) fn render(st: &mut State, line: &Line<'_>) {
                     (false, false) => background,
                 }
             } else if bits != 0 {
-                if setup.ehb && bits & 0x20 != 0 {
+                if setup.ham8 || setup.ham6 {
+                    hold
+                } else if setup.ehb && bits & 0x20 != 0 {
                     half(regs.palette[setup.address(bits & 0x1f)])
                 } else {
                     regs.palette[setup.address(bits)]

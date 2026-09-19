@@ -344,6 +344,74 @@ fn extra_half_brite_needs_low_resolution_on_lisa() {
     assert_eq!(lores(&v, V, 0), 0x0012_3456);
 }
 
+#[test]
+fn ham8_selects_one_of_64_bases_and_modifies_the_six_high_bits_of_a_gun() {
+    let v = lisa();
+    setup(&v, EIGHT | HOMOD);
+    // Base registers are the 8-bit plane address with the control bits (planes
+    // 1 and 2) at 00: data 5 is register 5 << 2 = 20. The two low bits of
+    // every gun here are 11, so a modify that "left [them] unmodified" shows.
+    set_rgb(&v, 20, 0x0013_2333);
+    set_rgb(&v, 4, 0x00ab_cdef);
+    let values = [
+        0b0001_0100, // 00: base register 20
+        0b1111_1101, // 01: blue  = %111111 << 2 | 11
+        0b0000_0010, // 10: red   = %000000 << 2 | 11
+        0b1000_0011, // 11: green = %100000 << 2 | 11
+        0b0000_0100, // 00: base register 4
+    ];
+    show(&v, V, 0x38, &values);
+    // "BP2 BP1 = 00 select new base register (1 of 64)".
+    assert_eq!(lores(&v, V, 0), 0x0013_2333);
+    // "01 hold hold modify": blue.
+    assert_eq!(lores(&v, V, 1), 0x0013_23ff);
+    // "10 modify hold hold": red.
+    assert_eq!(lores(&v, V, 2), 0x0003_23ff);
+    // "11 hold modify hold": green.
+    assert_eq!(lores(&v, V, 3), 0x0003_83ff);
+    assert_eq!(lores(&v, V, 4), 0x00ab_cdef);
+}
+
+#[test]
+fn ham8_shows_colours_no_palette_holds() {
+    // "allows creation of all 16,777,216 colors simultaneously": a ramp of
+    // blue across a line, each step a colour that is not in the table.
+    let v = lisa();
+    setup(&v, EIGHT | HOMOD);
+    set_rgb(&v, 0, 0);
+    let values: Vec<u8> = (0..64u8).map(|b| b << 2 | 0b01).collect();
+    show(&v, V, 0x38, &values);
+    for (k, b) in (0..64u32).enumerate() {
+        // Blue's two low bits come from colour 0's, which are 00.
+        assert_eq!(lores(&v, V, k as i32), b << 2, "step {k}");
+    }
+}
+
+#[test]
+fn ham6_works_in_hires_on_lisa_and_holds_the_low_nibble() {
+    let v = lisa();
+    // HIRES, BPU = 6, HAM: "The old 6 bitplane HAM mode, unlike before, works
+    // in HIRES and SHRES resolutions" (§2).
+    setup(&v, 0xe800);
+    set_rgb(&v, 3, 0x001a_2b3c);
+    let values = [
+        0b00_0011, // 00: base register 3
+        0b01_1111, // 01: blue = $F in the high nibble
+        0b10_0000, // 10: red = $0 in the high nibble
+    ];
+    // A high-resolution word fetched at $3C lands at $81, two quarters a pixel.
+    show(&v, V, 0x3c, &values);
+    let hires = |k: i32| {
+        let a = quarter(&v, V, X81 + 2 * k);
+        assert_eq!(quarter(&v, V, X81 + 2 * k + 1), a);
+        a
+    };
+    assert_eq!(hires(0), 0x001a_2b3c);
+    // The inference: four bits into the four most significant, the rest held.
+    assert_eq!(hires(1), 0x001a_2bfc);
+    assert_eq!(hires(2), 0x000a_2bfc);
+}
+
 // ---------------------------------------------------------------------------
 // scroll and fetch width
 // ---------------------------------------------------------------------------

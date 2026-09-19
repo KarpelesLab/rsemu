@@ -187,8 +187,8 @@
 //!
 //! `revision = "aga"` is **Lisa**, the A1200's and A4000's video chip. The
 //! display half is modelled here a piece at a time — so far eight bitplanes,
-//! the 256-entry 24-bit colour table with `BANK` and `LOCT`, `BPLCON4`'s
-//! bitplane mask, `FMODE`, and the 35 ns scroll and window — and
+//! the 256-entry 24-bit colour table with `BANK` and `LOCT`, HAM8,
+//! `BPLCON4`'s bitplane mask, `FMODE`, and the 35 ns scroll and window — and
 //! `denise/aga.rs` has what the *Specification for the Advanced Amiga (AA) Chip
 //! Set* settles, what it leaves open and what was chosen there. An 8362 and an
 //! 8373 do not go near that module, and everything above this section is
@@ -402,7 +402,7 @@ pub enum Revision {
     /// out in SuperHires pixels, four to a low-resolution one.
     Ecs,
     /// The AA chip set's **Lisa**: eight bitplanes, a 256-entry 24-bit colour
-    /// table, `FMODE`, `BPLCON4` and 35 ns positioning throughout. Its
+    /// table, HAM8, `FMODE`, `BPLCON4` and 35 ns positioning throughout. Its
     /// picture is always laid out in 35 ns columns, four to a low-resolution
     /// pixel. See [the AA section](self#the-aa-chip-set-lisa).
     Aga,
