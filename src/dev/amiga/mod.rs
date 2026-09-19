@@ -7,6 +7,7 @@
 //! | --- | --- |
 //! | [`custom`] | the register window at `$DFF000`, the appendix's table, and the subscription seam a chip attaches through |
 //! | [`gary`] | the address decode: the `OVL` overlay at zero, bank 6 (an A501's slow RAM or the chip registers again) and a window at `$E0_0000` for AROS's second ROM half |
+//! | `gayle` | `dev-amiga-gayle`: the A600's gate array — the IDE port's chip selects and byte swap in front of an `ata.disk`, the card and IDE interrupt registers at `$DA8000`, the identification register, and the overlay it clears on the first CIA write |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
 //! | `agnus` | `dev-amiga-agnus`: Agnus — the beam counters and sync, `DMACON`, the copper, the blitter, and every DMA transfer |
 //! | [`paula`] | `dev-amiga-paula`: Paula — interrupts onto the 68000's levels, the disk controller, the UART, the four audio channels |
@@ -73,6 +74,9 @@ pub mod custom;
 pub mod denise;
 pub mod dma;
 pub mod gary;
+#[cfg(feature = "dev-amiga-gayle")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-gayle")))]
+pub mod gayle;
 #[cfg(feature = "dev-amiga-keyboard")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-keyboard")))]
 pub mod keyboard;
@@ -106,6 +110,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     #[cfg(feature = "dev-amiga-denise")]
     denise::register(registry)?;
     gary::register(registry)?;
+    #[cfg(feature = "dev-amiga-gayle")]
+    gayle::register(registry)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::register(registry)?;
     #[cfg(feature = "dev-amiga-floppy")]
@@ -130,6 +136,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     #[cfg(feature = "dev-amiga-denise")]
     denise::bind(bindings)?;
     gary::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-gayle")]
+    gayle::bind(bindings)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::bind(bindings)?;
     #[cfg(feature = "dev-amiga-floppy")]
@@ -148,6 +156,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     #[allow(unused_mut)]
     let mut schemas = alloc::vec![cia_decode::schema(), custom::schema(), gary::schema()];
+    #[cfg(feature = "dev-amiga-gayle")]
+    schemas.push(gayle::schema());
     #[cfg(feature = "dev-amiga-paula")]
     schemas.push(paula::schema());
     #[cfg(feature = "dev-amiga-floppy")]
