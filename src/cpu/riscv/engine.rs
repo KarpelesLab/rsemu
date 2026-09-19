@@ -178,9 +178,11 @@
 //! CSR write, an `MRET`, a `WFI` and an `SFENCE.VMA` are all outside the
 //! lifted subset and end the block; a **store** no longer ends the block
 //! ([`Smc::HostGuard`]) and so asks the question itself, in [`IrHost::store`];
-//! and the platform timer is a value another runnable publishes between
-//! quanta. What is left is a **load** from a device that raises an interrupt
-//! as a side effect of being read.
+//! and the platform timer raises nothing when it is read — `time` is computed
+//! at this hart's own position out of what the CLINT published
+//! (`core::sched::LiveCounter`) and advances no device, and a CSR instruction
+//! is outside the lifted subset in any case. What is left is a **load** from a
+//! device that raises an interrupt as a side effect of being read.
 //!
 //! **That last sentence used to end "which nothing on a `virt` board does",
 //! and it was wrong.** The CLINT does exactly that, and by design: it is a
@@ -282,9 +284,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 
+use super::Timing;
 use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitMask};
-use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
 use crate::core::spin::Watch;
 use crate::core::value::Width;
@@ -855,7 +857,7 @@ pub(super) fn advance(
     lines: &Lines,
     exits: ExitMask,
     monitor: Option<&MonitorSlot>,
-    cursor: Option<&TickCursor>,
+    timing: &Timing,
     spin: &mut Watch,
     remaining: u64,
 ) -> (u64, Option<Exit>) {
@@ -867,7 +869,7 @@ pub(super) fn advance(
         smc,
     } = jit;
     let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor)
-        .with_cursor(cursor)
+        .with_timing(timing)
         .with_spin(spin);
     let pc = exec.st.pc;
 
@@ -2622,7 +2624,7 @@ mod tests {
                 lines,
                 ExitMask::NONE,
                 None,
-                None,
+                &Timing::default(),
                 // Nothing is watching in a bench: `Watch::default()` is
                 // disarmed, which is the same shape an unarmed machine has.
                 &mut Watch::default(),

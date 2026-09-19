@@ -1020,6 +1020,45 @@ impl ClockForest {
         Ok(d.ticks_at(d.position(units.max(tree))))
     }
 
+    /// [`ClockForest::ticks_at_units`] as a line rather than a point: the
+    /// domain's tick count at `units` and at every position after it, for as
+    /// long as nothing re-rates or gates the domain.
+    ///
+    /// Returned as `(whole, rem, per)`, meaning that with the tree at
+    /// `units + x` the domain reads `whole + (rem + x) / per` ticks — the same
+    /// floor [`ClockForest::ticks_at_units`] computes, with its remainder kept
+    /// rather than thrown away. Keeping it is the point. A caller that stores
+    /// only `whole` and adds `x / per` later rounds twice, and a count
+    /// assembled from two floors can come out one tick short of the one the
+    /// forest reports at the same position — so a reader that re-anchors
+    /// between two reads could see the second one go backwards.
+    ///
+    /// `per` is zero for a line that is flat from here: a gated domain, or one
+    /// that stands on its own ahead of `units`
+    /// ([`ClockForest::advance_alone`]), whose count does not move until the
+    /// tree passes it. Exact intra-tree arithmetic, like everything else on
+    /// this side of the forest.
+    ///
+    /// # Errors
+    ///
+    /// [`ClockError::UnknownDomain`] if the handle is not from this forest.
+    pub fn tick_line(&self, id: DomainId, units: u64) -> ClockResult<(u64, u64, u64)> {
+        let d = self.domain(id)?;
+        let tree = self.oscillators[d.root.index()].units;
+        let at = d.position(units.max(tree));
+        if d.gated || at != units {
+            return Ok((d.ticks_at(at), 0, 0));
+        }
+        // `at` is at or past the tree, and the tree is never behind the unit
+        // this domain was last rebased at.
+        let from = at.saturating_sub(d.base_unit);
+        Ok((
+            d.base_ticks + from / d.units_per_tick,
+            from % d.units_per_tick,
+            d.units_per_tick,
+        ))
+    }
+
     /// The tree's position, in that tree's unit ticks.
     ///
     /// Exposed for snapshots and diagnostics: it is the exact common

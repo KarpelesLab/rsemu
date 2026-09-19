@@ -28,8 +28,8 @@
 //! priority order, and the NaN-boxing rule for single-precision values held in
 //! double-precision registers.
 
+use super::Timing;
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::sched::TickCursor;
 use crate::core::space::{AccessPurpose, AddressSpace, BusLockGuard, MemAttrs, MonitorSlot};
 use crate::core::spin::Watch;
 use crate::core::sync;
@@ -190,8 +190,10 @@ pub(super) struct Exec<'a> {
     /// Published from [`Exec::publish_position`], which [`Exec::read_at`] and
     /// [`Exec::write_once`] call and nothing else does — see that method for
     /// why that is the only place it may be published from if the three
-    /// engines are to stay indistinguishable.
-    cursor: Option<&'a TickCursor>,
+    /// engines are to stay indistinguishable — and the platform timer, which
+    /// only an instruction that reads `time` consults ([`Exec::csr_access`]).
+    /// One borrow for both: see [`Timing`].
+    timing: &'a Timing,
 }
 
 /// Physical memory as the page-table walker sees it.
@@ -245,6 +247,14 @@ pub(super) fn debug_translate(
     mmu::translate_debug(&st.csrs, &mut walker, va, st.csrs.priv_mode).ok()
 }
 
+/// The wiring a hart nobody scheduled has: no cursor to publish into and no
+/// platform timer to read. A borrow of this rather than an `Option` keeps
+/// [`Exec`] one word smaller, which is a word copied per guest instruction.
+static NOTHING_SCHEDULED: Timing = Timing {
+    cursor: None,
+    counter: None,
+};
+
 impl<'a> Exec<'a> {
     /// Borrow a hart for one step.
     pub(super) fn new(
@@ -275,18 +285,22 @@ impl<'a> Exec<'a> {
             wrote: [0; 2],
             wrote_n: 0,
             wrote_instret: false,
-            cursor: None,
+            timing: &NOTHING_SCHEDULED,
         }
     }
 
-    /// Publish this hart's bus-access counter to `cursor` as it runs.
+    /// Lend this borrow the scheduler's wiring: the cursor this hart
+    /// publishes its bus-access counter into as it runs, and the platform
+    /// timer it answers `time` from.
     ///
-    /// The scheduler converts what is published here into every lazily
-    /// advanced device's own domain, so a guest load of a timer is answered
-    /// at the instant the load happens rather than at the instant the quantum
-    /// began (`ROADMAP.md` §4.2, `core::sched::TickCursor`).
-    pub(super) fn with_cursor(mut self, cursor: Option<&'a TickCursor>) -> Exec<'a> {
-        self.cursor = cursor;
+    /// The scheduler converts what is published into every lazily advanced
+    /// device's own domain, so a guest load of a timer is answered at the
+    /// instant the load happens rather than at the instant the quantum began
+    /// (`ROADMAP.md` §4.2, `core::sched::TickCursor`); the same conversion at
+    /// this hart's own position is what a read of `time` uses
+    /// ([`Exec::refresh_time`]).
+    pub(super) fn with_timing(mut self, timing: &'a Timing) -> Exec<'a> {
+        self.timing = timing;
         self
     }
 
@@ -327,7 +341,7 @@ impl<'a> Exec<'a> {
     /// nothing: no lazily advanced device sits behind them.
     #[inline]
     fn publish_position(&self) {
-        if let Some(cursor) = self.cursor {
+        if let Some(cursor) = &self.timing.cursor {
             cursor.set(self.st.cycles);
         }
     }
@@ -1893,6 +1907,20 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
+    /// Bring `Csrs::mtime` to the platform timer's value at this hart's own
+    /// position, for an instruction that is about to read `time`.
+    ///
+    /// A no-op without a counter (a board that wired only a cell, or none) or
+    /// without a cursor (a hart nobody scheduled): the per-step sample is then
+    /// all there is, exactly as before. See `core::sched::LiveCounter` for why
+    /// the value can neither run ahead of the device's comparators nor behind
+    /// an earlier read.
+    fn refresh_time(&mut self) {
+        if let (Some(counter), Some(cursor)) = (&self.timing.counter, &self.timing.cursor) {
+            self.st.csrs.mtime = counter.read_at(cursor, self.st.cycles);
+        }
+    }
+
     /// A CSR read-modify-write.
     ///
     /// Volume I, "CSR Instructions": the *read* side effect is skipped when
@@ -1901,22 +1929,31 @@ impl<'a> Exec<'a> {
     /// makes `csrr` and `csrw` safe on registers with read or write side
     /// effects.
     ///
-    /// # `time` is read out of a per-step sample, and that is load-bearing
+    /// # Where `time` comes from
     ///
     /// `Csrs::mtime` is not a counter this hart owns. It is a copy of the cell
-    /// the CLINT publishes, taken once per [`Hart::step`](super::Hart::step)
-    /// — never inside this function, which has no route to a device. The
-    /// freshness of `time` is therefore exactly the freshness of that sample,
-    /// and the sample is per *instruction* only because `Op::Csrrs` is outside
-    /// the lifted subset (`super::lift` admits no CSR instruction, so a block
-    /// always ends before one and `engine::advance` resamples on re-entry).
+    /// the CLINT publishes — `mtime` at the CLINT's own tick — taken once per
+    /// [`Hart::step`](super::Hart::step). That sample is only as fresh as the
+    /// CLINT, which is caught up when somebody touches it and at a scheduler
+    /// round's close, and on a crystal two harts share not even when this
+    /// hart touches it. So on a board that wired a counter
+    /// (`Hart::attach_counter`), an instruction that *reads* `time` first
+    /// replaces the sample with `mtime` at this hart's own position
+    /// ([`Exec::refresh_time`]), and only then reads the register. The
+    /// position is `State::cycles`, which every engine agrees on at every
+    /// instruction boundary, so the value is engine-independent as well as
+    /// current.
     ///
-    /// Lift a CSR read one day and `time` silently freezes for the length of a
-    /// block, which a guest can observe by storing to the memory-mapped
-    /// `mtime` and reading `time` in the next instruction. That is what
+    /// The sample is still taken per step, because a CSR instruction is
+    /// outside the lifted subset (`super::lift` admits none, so a block always
+    /// ends before one and `engine::advance` resamples on re-entry) — the
+    /// refresh above is what keeps `time` moving *within* a round, the sample
+    /// what keeps `csrs.mtime` level at a snapshot. Lift a CSR read one day and
+    /// both have to move with it: a guest can observe a stale one by storing
+    /// to the memory-mapped `mtime` and reading `time` in the next
+    /// instruction, which is what
     /// `dev::riscv::tests::a_guest_write_to_mtime_is_visible_to_the_very_next_rdtime`
-    /// asserts, on every engine the build has, so the day it changes is the
-    /// day the suite says so.
+    /// asserts on every engine the build has.
     fn csr_access(&mut self, op: Op, word: u32, encoding: u64) -> Result<(), Trap> {
         let num = isa::csr(word);
         let rd = isa::rd(word);
@@ -1931,6 +1968,9 @@ impl<'a> Exec<'a> {
         let will_write = write_form || rs1 != 0;
         let will_read = !write_form || rd != 0;
 
+        if will_read && matches!(num, csr::num::TIME | csr::num::TIMEH) {
+            self.refresh_time();
+        }
         let pending = self.lines.pending();
         let old = if will_read {
             Some(

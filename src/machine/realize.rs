@@ -1309,6 +1309,13 @@ impl<'a> Realizer<'a> {
                     sched.add_runnable(domain, Box::new(RunAdapter::new(Arc::clone(instance))));
                 let cursor = sched
                     .runnable_cursor(id)
+                    .and_then(|cursor| {
+                        // So a device answering one of this runnable's
+                        // accesses can find where it stands
+                        // (`LazyHandle::reader_tick`).
+                        sched.bind_requester(id, built.requester.0)?;
+                        Ok(cursor)
+                    })
                     .map_err(|e| config(built.path.clone(), e.to_string()))?;
                 built.device.attach_cursor(cursor);
                 runnable = Some(id);

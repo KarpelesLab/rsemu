@@ -34,11 +34,38 @@
 //! its next comparator fires on so the run loop stops the harts there rather
 //! than thousands of cycles past it.
 //!
-//! The second half of that is what does the work on `riscv-virt` today. The
-//! first half is still inert *there* and the resolution still comes from the
-//! round boundary — but for one remaining reason rather than two, and the
-//! reason is the board's, not this device's. See *`rdtime` and a load of
-//! `mtime` return the same number* below, which is where the measurement is.
+//! # `mtime` is read where the reader stands, and that is not a catch-up
+//!
+//! Catch-up alone cannot answer a read of `mtime` on `riscv-virt-smp`. Two
+//! harts on one crystal each execute a whole round from a position of their
+//! own, so the scheduler arms neither of them a live view of any
+//! lazily-advanced device (`core::sched`'s `arm_live_cursors`, *Not on a shared
+//! crystal*): the hart that runs first would otherwise carry this block —
+//! comparators and all — into the future of the hart that runs second. The
+//! block therefore stands where the round began for the whole of the round,
+//! and a `sync` before an access moves it nowhere.
+//!
+//! `mtime` does not need it moved. Its value is a pure function of time,
+//! `tick + offset`, with no state behind it that a read could disturb, so this
+//! block answers a read **at the reader's own position** instead:
+//! [`LazyHandle::reader_tick`] converts the position of whichever processor
+//! made the access into this block's domain, exactly, through the oscillator
+//! forest, and the answer is `max(this block's tick, that) + offset`. Nothing
+//! is advanced, no comparator is evaluated anywhere but at this block's own
+//! tick, and no interrupt can be raised early: a comparator still fires on the
+//! event the scheduler ends a round on. A write to `mtime` moves the origin at
+//! the writer's position for the same reason — the value it stores is the
+//! value it reads back.
+//!
+//! That is `ROADMAP.md` §4.2's sampled behaviour restored to a shared crystal
+//! without the thing the shared-crystal rule exists to prevent. What it does
+//! not do is make two harts read the *same* number at the same moment of one
+//! round: each reads the counter at its own position, which is what two
+//! processors reading one free-running counter on real silicon do, and what
+//! Volume I's `Zicntr` note requires is that software observe time across
+//! harts to be monotonically nondecreasing — which it does, since every
+//! reader's answer is a non-decreasing function of its own position and of
+//! this block's tick.
 //!
 //! # The hart's `time` CSR reads this counter
 //!
@@ -46,7 +73,8 @@
 //! of the memory-mapped `mtime` that lives here, not a counter the hart owns.
 //! So this block publishes `mtime` as
 //! [`ExportId::TIMEBASE`](crate::core::device::ExportId::TIMEBASE) and a hart
-//! that names it — `timer = clint` in the machine file — holds the same cell.
+//! that names it — `timer = clint` in the machine file — holds the same
+//! counter.
 //!
 //! That wiring was missing until the [`Device::export`] seam existed, and the
 //! symptom was not subtle: an operating system taking its clocksource from
@@ -56,8 +84,21 @@
 //! the clocksource is first used. `src/dev/riscv/tests.rs` boots a kernel far
 //! enough to have shown it.
 //!
-//! [`Clint::mtime_cell`] is still the direct route, for a hand-wired machine
-//! and for tests. [`Hart::set_time`](crate::cpu::riscv::Hart::set_time) remains
+//! The handle is a [`LiveCounter`] rather than a plain cell, and the difference
+//! is the whole of what a CSR read can be. A cell can only hold the value this
+//! block was last caught up to; a CSR read never reaches the bus, so nothing
+//! catches this block up for it, and `time` therefore moved once per scheduler
+//! round — a whole millisecond, a million instructions at 1 GHz — on *both*
+//! boards. Linux reads `time` for every printk timestamp and every
+//! `sched_clock`, so every timestamp it wrote on `riscv-virt-smp` was a whole
+//! millisecond. A counter carries this block's tick and offset as well as the
+//! value, and the hart combines them with its own position
+//! (`Hart::attach_counter`, `LiveCounter::read_at`) when an instruction reads
+//! `time` — the same number a load of `mtime` at that instant returns.
+//!
+//! [`Clint::mtime_cell`] is still the direct route to the value at this
+//! block's own tick, for a hand-wired machine and for tests.
+//! [`Hart::set_time`](crate::cpu::riscv::Hart::set_time) remains
 //! for a board with no CLINT at all; a hart with a timer attached overwrites it
 //! on the next step, which is the right precedence.
 //!
@@ -65,73 +106,26 @@
 //!
 //! The two answers reach the guest by completely different routes and the
 //! obvious worry is that they part company. A load enters [`MemOps::read`],
-//! which calls `Registers::sync` and catches this block up first. A CSR read
-//! goes nowhere near the bus: the hart samples `Registers::mtime_cell` once
-//! per [`Hart::step`](crate::cpu::riscv::Hart::step), and that cell is written
-//! only by `Registers::republish` — on an advance or on a guest write.
+//! which converts the requester's position into this block's domain; a CSR read
+//! goes nowhere near the bus and converts the hart's own cycle counter through
+//! the same forest arithmetic. Both are `max(block tick, reader position) +
+//! offset`, so they agree by construction — to within the ticks that really
+//! pass between the two instructions.
 //!
-//! They agree exactly on `riscv-virt`, and the reason is that on *that* board
-//! there is currently nothing for `sync` to catch up *to*. There were two
-//! reasons for that and there is now one:
-//!
-//! * the hart used to publish no
-//!   [`TickCursor`](crate::core::sched::TickCursor) position, on the argument
-//!   that nothing on a RISC-V board is sampled inside an instruction the way a
-//!   PPU is. This device is the counter-example and it always was, so
-//!   `Hart::attach_cursor` keeps both halves now and `Exec::publish_position`
-//!   publishes the hart's bus-access counter before every access that leaves
-//!   for the address space;
-//! * `machines/riscv-virt.machine` hangs `mtime` off its own `rtc` crystal, a
-//!   separate oscillator tree from the core clock, and
-//!   `Scheduler::arm_live_cursors` arms a live view only across slots that
-//!   share a root. **This is the one that still bites.** It is a scheduler
-//!   change, not a device one: `ROADMAP.md` §4.2's cross-tree path — a
-//!   reciprocal multiply against a per-root residual — is exactly what a
-//!   nominal ratio between two crystals is supposed to use, and it is the
-//!   *intra*-tree relationships that may never be routed through absolute
-//!   time. `tests/engine_longrun.rs`'s
-//!   `the_clint_advances_while_the_hart_is_running` is the reproduction and
-//!   carries the specification.
-//!
-//! So on that board both routes still read, within a round, the value
-//! `Scheduler::sync_lazy_devices` published when the previous round closed.
-//! `mtime` is a staircase to the guest, one step per scheduler round: 10 000
-//! `rtc` ticks — one millisecond — when nothing else shortens the round, and
-//! as fine as the next armed comparator when a guest has programmed one, since
-//! `Scheduler::natural_target` ends a round on it.
-//!
-//! A board that puts `mtime` on the core's own tree gets the fine-grained
-//! answer today, because the hart's position is published and the intra-tree
-//! ratio is exact. `riscv-virt` deliberately does not: an RTC that is a
-//! divider off the core clock changes rate whenever the core's does, and
-//! `mtime` is architecturally a counter that "increments at a constant rate"
-//! whatever the core is doing.
-//!
-//! That is licensed rather than tolerated. Volume II: *"When `mtime` changes,
-//! it is guaranteed to be reflected in `time` and `timeh` eventually, but not
-//! necessarily immediately."* And the `Zicntr` note in Volume I says the same
-//! about the staircase itself — an implementation may "only update the
-//! real-time clock at, say, a frequency of 100 MHz with increments of 10
-//! ticks", and stays compliant "as long as software cannot observe this
-//! seeming violation … and software always observes time across harts to be
-//! monotonically nondecreasing".
-//!
-//! Monotonicity is therefore the property that matters, and it is the one
-//! that holds by construction: both routes read one cell, `republish` only
-//! ever stores `tick + offset` for a `tick` the scheduler refuses to move
-//! backwards, and the cell is published at round close.
 //! `rdtime_and_a_memory_mapped_mtime_read_agree` in `super::tests` is the
-//! regression test; it compares the two routes 125 000 times and checks that
-//! `time` never goes backwards.
+//! regression test: it compares the two routes 125 000 times, keeps the largest
+//! gap and counts every occasion `time` went backwards. The gap is at most one
+//! `rtc` tick — 100 ns of guest time, the load being one instruction later than
+//! the CSR read — and `time` never moves backwards. Monotonicity is the
+//! property the architecture actually requires, and it holds by construction:
+//! this block's tick never moves backwards, a hart's own position never moves
+//! backwards, and a read is the maximum of the two plus an offset only a guest
+//! store changes.
 //!
-//! What that test may *not* assert any more is that the gap is always zero.
-//! Once the CLINT is caught up to the hart's live position, a `csrr time`
-//! and the `ld` of `mtime` one instruction later are separated by real ticks
-//! of the counter, and the load — which syncs — legitimately answers with a
-//! later one. Measured with the cross-tree arming applied: the largest gap
-//! over 125 000 round trips is **one** `rtc` tick, 100 ns of guest time, and
-//! `time` never moves backwards. That is the quantity the assertion is
-//! written around.
+//! Volume II licenses the rest: *"When `mtime` changes, it is guaranteed to be
+//! reflected in `time` and `timeh` eventually, but not necessarily
+//! immediately."*
+//!
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -145,7 +139,7 @@ use crate::core::device::{
 };
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::sched::{AccessKind, LazyHandle};
+use crate::core::sched::{AccessKind, LazyHandle, LiveCounter};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
@@ -232,10 +226,12 @@ struct Registers {
     /// The next tick some comparator fires on, or [`u64::MAX`] for none. Same
     /// no-lock rule.
     next_event: AtomicU64,
-    /// `mtime` as anything outside this device would read it, published on
-    /// every change. See the module docs: this is what a hart's `time` CSR
-    /// should be reading, and the half of that wiring this module can supply.
-    mtime_cell: Arc<AtomicU64>,
+    /// `mtime` as anything outside this device reads it: this block's tick and
+    /// offset, published on every change, which a hart combines with its own
+    /// position to answer `time` (see the module docs). Its cell is `mtime`
+    /// at this block's own tick, the number a plain
+    /// [`Export::Cell`](crate::core::device::Export::Cell) consumer samples.
+    counter: Arc<LiveCounter>,
     harts: usize,
     timebase_hz: u32,
 }
@@ -303,7 +299,7 @@ impl Clint {
             lazy: Mutex::with_rank(LockRank::LEAF, None),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
-            mtime_cell: Arc::new(AtomicU64::new(0)),
+            counter: Arc::new(LiveCounter::new()),
             harts,
             timebase_hz,
         });
@@ -335,7 +331,14 @@ impl Clint {
     /// [`mtime`](Clint::mtime) does, without taking the device's lock.
     #[must_use]
     pub fn mtime_cell(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.regs.mtime_cell)
+        self.regs.counter.cell()
+    }
+
+    /// `mtime` as a counter a hart reads at its own position — what this
+    /// block exports as its timebase. See the module docs.
+    #[must_use]
+    pub fn mtime_counter(&self) -> Arc<LiveCounter> {
+        Arc::clone(&self.regs.counter)
     }
 
     /// `mtime` as the guest would read it.
@@ -390,7 +393,7 @@ impl Registers {
     fn republish(&self, state: &State) -> Vec<bool> {
         self.tick.store(state.tick, Ordering::Relaxed);
         let now = Self::now(state);
-        self.mtime_cell.store(now, Ordering::Relaxed);
+        self.counter.publish(state.tick, state.offset);
         let mut pending = Vec::with_capacity(self.harts);
         let mut soonest = u64::MAX;
         for cmp in &state.mtimecmp {
@@ -456,11 +459,30 @@ impl Registers {
         let _ = handle.sync(kind);
     }
 
-    /// Read one 64-bit register value for `offset`, in register coordinates.
-    fn read_reg(&self, offset: u64) -> Option<u64> {
+    /// Where the processor making this access stands in this block's domain,
+    /// or zero when nobody can say — a debugger, an access from outside a
+    /// scheduled run, a board with no scheduler.
+    ///
+    /// `mtime` is read here rather than at this block's own tick. On a crystal
+    /// two harts share neither has a live view, so the block is caught up only
+    /// to where the round began; reading the counter at the reader's own
+    /// position moves nothing — no comparator, no line — and is what makes a
+    /// load of `mtime` agree with the same hart's `time` CSR. Taken before the
+    /// state lock, and holding none, because it takes leaf locks of its own.
+    fn reader_tick(&self, attrs: MemAttrs) -> u64 {
+        if attrs.debug {
+            return 0;
+        }
+        let handle = self.lazy.lock().clone();
+        handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
+    }
+
+    /// Read one 64-bit register value for `offset`, in register coordinates,
+    /// with `mtime` taken at `reader` if that is past this block's own tick.
+    fn read_reg(&self, offset: u64, reader: u64) -> Option<u64> {
         let state = self.state.lock();
         if offset == MTIME_OFFSET {
-            return Some(Self::now(&state));
+            return Some(state.tick.max(reader).wrapping_add(state.offset));
         }
         if offset >= MTIMECMP_BASE {
             let index = (offset - MTIMECMP_BASE) / 8;
@@ -480,7 +502,12 @@ impl MemOps for Registers {
             self.sync(attrs);
         }
         let (width, aligned) = decode(offset, dst.len())?;
-        let Some(value) = self.read_reg(aligned) else {
+        let reader = if aligned == MTIME_OFFSET {
+            self.reader_tick(attrs)
+        } else {
+            0
+        };
+        let Some(value) = self.read_reg(aligned, reader) else {
             // Inside the window but past the last hart: reads as zero, which
             // is what an unimplemented register in a decoded block does.
             dst.fill(0);
@@ -536,14 +563,21 @@ impl MemOps for Registers {
             return Ok(());
         }
 
+        let reader = if aligned == MTIME_OFFSET {
+            self.reader_tick(attrs)
+        } else {
+            0
+        };
         let pending = {
             let mut state = self.state.lock();
             if aligned == MTIME_OFFSET {
                 // Writing `mtime` moves the origin. The clock domain keeps
                 // counting at its own rate, which is the only rate there is.
-                let now = Registers::now(&state);
-                let wanted = merge(now, incoming, width, half);
-                state.offset = wanted.wrapping_sub(state.tick);
+                // The write happens where the writer stands, as a read does:
+                // the value it stores is the value it reads back.
+                let at = state.tick.max(reader);
+                let wanted = merge(at.wrapping_add(state.offset), incoming, width, half);
+                state.offset = wanted.wrapping_sub(at);
             } else {
                 let index = ((aligned - MTIMECMP_BASE) / 8) as usize;
                 let Some(slot) = state.mtimecmp.get(index).copied() else {
@@ -689,7 +723,7 @@ impl Device for Clint {
     /// this is answerable from construction and a hart holding it keeps
     /// holding it across a reset — the handle is wiring, not guest state.
     fn export(&self, which: ExportId) -> Option<Export> {
-        (which == ExportId::TIMEBASE).then(|| Export::Cell(self.mtime_cell()))
+        (which == ExportId::TIMEBASE).then(|| Export::Counter(self.mtime_counter()))
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
@@ -749,6 +783,10 @@ impl Device for Clint {
     }
 
     fn attach_lazy(&self, handle: LazyHandle) {
+        // `mtime` is a pure function of time, so it is read where each reader
+        // stands (`LiveCounter`, `Registers::reader_tick`).
+        handle.read_at_readers();
+        self.regs.counter.attach(&handle);
         *self.regs.lazy.lock() = Some(handle);
     }
 
@@ -863,6 +901,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
 mod tests {
     use super::*;
     use crate::core::props::Value;
+    use crate::core::sched::TickCursor;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
     use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSink};
 
@@ -927,9 +966,8 @@ mod tests {
 
     #[test]
     fn the_published_cell_tracks_mtime() {
-        // Half of the fix for the gap in the module docs. The other half is a
-        // hart that reads this instead of its own untouched CSR field; until
-        // that exists, at least the number is correct and reachable.
+        // What a hart holding only the cell — a board with no scheduler, a
+        // test — sees: `mtime` at this block's own tick, on every change.
         let c = clint();
         let cell = c.mtime_cell();
         assert_eq!(cell.load(Ordering::Relaxed), 0);
@@ -938,6 +976,30 @@ mod tests {
         write64(&c, MTIME_OFFSET, 9_000);
         assert_eq!(cell.load(Ordering::Relaxed), 9_000);
         assert_eq!(cell.load(Ordering::Relaxed), c.mtime());
+    }
+
+    /// The timebase travels as a counter, and a hart with no view of its own
+    /// position reads the same number the cell holds.
+    ///
+    /// That is the fallback the whole read path rests on: `LiveCounter` is
+    /// `max(this block's tick, the reader's) + offset`, so a reader that
+    /// cannot be placed — outside a scheduled run, a board with no
+    /// scheduler — gets exactly what it got before the counter existed.
+    #[test]
+    fn the_timebase_is_a_counter_and_falls_back_to_the_cell() {
+        let c = clint();
+        let export = Device::export(&c, ExportId::TIMEBASE).expect("a timebase");
+        let counter = export.counter().expect("as a counter").clone();
+        assert!(export.cell().is_some(), "and still as a cell");
+        c.advance_to(77);
+        write64(&c, MTIME_OFFSET, 9_000);
+        c.advance_to(100);
+        assert_eq!(counter.value(), 9_023);
+        assert_eq!(
+            counter.read_at(&TickCursor::new(), 12_345),
+            9_023,
+            "a cursor with no view is the value at this block's own tick"
+        );
     }
 
     #[test]

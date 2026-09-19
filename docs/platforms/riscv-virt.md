@@ -54,7 +54,10 @@ hidden convention to reverse-engineer.
   — which every kernel that takes its clocksource from it turns into an
   immediately-expired deadline and a live-lock. The wiring is
   [`Device::export`](../../src/core/device.rs), and it is named explicitly
-  rather than searched for.
+  rather than searched for. What travels along it is a
+  `core::sched::LiveCounter` rather than a bare cell, so the hart reads
+  `mtime` **at its own position** when an instruction reads `time` — see
+  *`rdtime` and a load of `mtime` return the same number* below.
 
 ## Choosing an execution engine
 
@@ -673,22 +676,76 @@ harts to be monotonically nondecreasing, then this implementation is
 compliant." What the spec does *not* forgive is time going backwards, and that
 is the assertion the test is built around.
 
-Cross-hart agreement comes free on `riscv-virt-smp`:
-`Scheduler::publish_lazy_positions` runs at round close and nowhere else, so
-both harts in a round read one cell holding one value — identical rather than
-merely within a tick.
+Cross-hart agreement on `riscv-virt-smp` is monotonicity rather than equality,
+which is what the architecture asks for. Each hart reads the counter at its own
+position, so two harts a few thousand cycles apart inside one round read
+numbers a few tens of ticks apart — as two processors reading one free-running
+counter on silicon do. What Volume I's `Zicntr` note requires is that "software
+always observes time across harts to be monotonically nondecreasing", and every
+reader's answer is a non-decreasing function of its own position and of the
+CLINT's tick, neither of which ever goes backwards.
 
-**Nothing was changed in the CSR path, deliberately.** The obvious repair —
-have the CSR read sync the device the way a load does — would put a device
-catch-up on the instruction Linux runs most often, since `rdtime` is the
-userspace clocksource through the vDSO. While the CLINT was stranded on its own crystal it also bought nothing, the sync
-it would perform being one that advanced nothing. Now that the cross-tree
-arming has landed it would buy exactly **one tick** of freshness — the gap
-`rdtime_and_a_memory_mapped_mtime_read_agree` measures — at the price of a
-lazy-device catch-up on the instruction Linux runs most often. That is the
-trade, and it is still not worth taking: one tick of a 10 MHz counter is 100 ns,
-below anything the vDSO's callers can act on, and the architecture licenses
-exactly this lag.
+**The CSR path reads at the hart's own position.** It used to be left alone
+deliberately, and the argument was that the obvious repair — have the CSR read
+*sync* the device the way a load does — would put a lazy-device catch-up on the
+instruction Linux runs most often, since `rdtime` is the userspace clocksource
+through the vDSO, to buy one tick of freshness. That argument still holds, and
+nothing here syncs anything. What was wrong was the premise that one tick was
+all that was at stake.
+
+A CSR read never reaches the bus, so nothing catches the CLINT up *for* it. On
+`riscv-virt` the cell it read was therefore only as fresh as the last access
+some instruction made to the CLINT, and on `riscv-virt-smp` — two harts on one
+crystal, where nothing may catch a shared device up mid-round at all — the cell
+did not move inside a round under any circumstances. A guest that reads `time`
+and never touches the CLINT saw one value per scheduler round. Linux is exactly
+that guest: `sched_clock` and every printk timestamp go through `rdtime` and
+nothing else, so every timestamp it wrote on the two-hart board was a whole
+millisecond — `[    0.045000]`, `[    0.048000]` — and a `udelay` spun to the
+next round.
+
+The repair is a read path rather than a catch-up. `mtime` is `tick + offset`,
+a pure function of time, so an instruction that reads `time` computes
+`max(CLINT tick, this hart's position in the CLINT's domain) + offset` from
+`core::sched::LiveCounter`, which the CLINT publishes as its
+[`ExportId::TIMEBASE`](../../src/core/device.rs) and the hart holds through
+`Hart::attach_counter`. The hart's position comes from the read view the
+scheduler arms for the length of every `run` call
+(`TickCursor::tick_in`), converted through the oscillator forest exactly —
+`rem` and all — and bounded by where the `rtc` crystal will stand when the round
+closes, so a reader's last value in one round is never above its first in the
+next. Nothing is advanced, so no comparator can fire early and the two-hart
+rule is untouched: what it forbids is carrying a *device* past a runnable, and
+a read carries nothing.
+
+The cost is a lock and a hundred-odd host instructions on an instruction that
+reads `time`, and nothing at all on any other instruction: the per-step sample
+of the cell is exactly what it was, and the live value is computed in
+`Exec::csr_access` only when the register being read is `time` or `timeh`.
+Measured where a wall clock cannot resolve it — callgrind over
+`benches/frame_time --only riscv-virt`, whose workload never reads a timer at
+all and whose state hash is the committed one on both sides, so the guest work
+is identical to the instruction — the whole change is **491 265 275 294 ->
+488 600 407 037 host instructions, −0.54%**. It is *negative* because the
+platform timer travels with the cursor in one borrow (`cpu::riscv::Timing`)
+where the cursor alone was an `Option`; the first cut, with a second reference
+beside it, was +0.72% and every instruction of that was in `Hart::step_to_exit`
+building the borrow.
+
+**Both boards' timestamps moved, and the one-hart board's were a surprise.**
+The premise going in was that a lone runnable was already fine, because it has
+a live view of the CLINT and a *load* of `mtime` really is current. Its `time`
+CSR was not, for the reason above, and the printk clock is what showed it:
+
+| board | before | after |
+| --- | --- | --- |
+| `riscv-virt` | `[    0.008000]`, `[    0.024000]`, `[    0.043000]` | `[    0.007205]`, `[    0.023854]`, `[    0.041716]` |
+| `riscv-virt-smp` | `[    0.007000]`, `[    0.025000]`, `[    0.045000]` | `[    0.007225]`, `[    0.024811]`, `[    0.045152]` |
+
+Both boards also get *further* in the same 1.2 s of virtual time — the
+one-hart board to a printk clock of 0.759 against 0.501, the two-hart board to
+0.698 against 0.401 — because a busy-wait against a staircase clock waits for
+the next step of it.
 
 **The one latent hazard, and the second one it turned into.** `Csrs::mtime` is
 sampled once per `Hart::advance`, which is once per *block* under a translating

@@ -263,6 +263,27 @@ The price is resolution inside a round for the devices those processors reach:
 on `riscv-virt-smp` the CLINT is caught up at round boundaries and at its own
 events, not at each hart's cycle.
 
+**A read of a free-running counter does not pay that price**, and it is worth
+being exact about why not. Catch-up is what the rule above restricts, because
+catch-up *moves* a device: a comparator crossed, a FIFO drained, a line raised
+somewhere a processor that has not reached that instant can see it. A register
+whose value is a pure function of time — RISC-V's `mtime` and the `time` CSR
+that shadows it, and the same shape wherever else it turns up — moves nothing
+when it is read, and the answer at a reader's own position is a function of
+that reader's position alone. So every runnable carries a **read view** for the
+length of a `run` call (`Scheduler::read_view`, `TickCursor::tick_in`,
+`LazyHandle::reader_tick`): the exact tick count its own position corresponds
+to in each such device's domain, built before anything runs and from nobody
+else's position. Two harts on one crystal each read their own `mtime`; neither
+can see the other's future, no comparator fires early, and the numbers are the
+same in both threading modes because a read at one's own position is not an
+interleaving. `tests/smp_counter_resolution.rs` is the proof, and
+`core::sched`'s own tests carry the arithmetic.
+
+Before it, every printk timestamp Linux wrote on `riscv-virt-smp` was a whole
+millisecond — the length of a round — because `time` could not move inside
+one.
+
 What the counter still cannot say is a runnable that returns *nothing* for
 ever: the tree stands at the slowest runnable, so such a runnable holds its
 crystal back, exactly as a lone runnable that stops holds back its own. Every

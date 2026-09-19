@@ -211,6 +211,44 @@ two modes agree on it. What it costs is resolution inside a round for the
 devices those processors reach — `riscv-virt-smp`'s CLINT is caught up at
 round boundaries and at its own events rather than at each hart's cycle.
 
+It does **not** cost resolution in a register that is a pure function of time.
+Catch-up is what the rule restricts, because catch-up moves a device; reading a
+free-running counter moves nothing, and the answer at a reader's own position
+depends on that reader alone. So every runnable also carries a *read view* for
+the length of a `run` call — the exact tick its own position corresponds to in
+each such device's domain (`Scheduler::read_view`, `TickCursor::tick_in`,
+`LazyHandle::reader_tick`) — and `mtime`, the `time` CSR that shadows it, and
+anything else of that shape are read there. Comparators and interrupts are
+untouched: they still fire at the device's own events, where the scheduler
+delivers them.
+
+That was not an optimisation. Without it every printk timestamp Linux wrote on
+`riscv-virt-smp` was a whole millisecond, the length of a round, because a
+guest's clock could not move inside one; a `udelay` spun to the next round and
+anything that measured an interval between two nearby reads measured zero.
+
+**Which boards that reaches, and which were never affected.** A guest's clock
+is the board's, so the answer is per architecture rather than per scheduler
+rule:
+
+| board | what a guest reads time from | inside a round |
+| --- | --- | --- |
+| `riscv-virt`, `riscv-virt-smp` | the `time` CSR and `MTIME`, both the CLINT's `mtime` | now the reader's own position, on both |
+| `arm64-virt`, `arm64-virt-smp` | `CNTPCT_EL0`/`CNTVCT_EL0` | never affected: the generic timer is the core's own cycle counter divided by an integer, per processor, inside the core |
+| `pc-at-smp`, `pc-apic`, `q35-linux-smp` | the TSC | never affected: `State::cycles`, per processor |
+| the same three, and every other x86 board | the HPET, the ACPI PM timer, the 8254 and the local APIC's current count | still the position the round began at |
+
+The last row is a *different* defect with a different cause, and it is worth
+separating: `cpu.x86` publishes no `TickCursor` position at all, so those
+devices are caught up to a round boundary on a one-processor `pc-at` exactly as
+they are on `pc-at-smp`. Measured with a guest that latches the 8254 in a loop:
+the same pair of identical counts and then a jump of 1 193 — one millisecond —
+on `pc-at`, `pc-at-smp` and `pc-apic` alike. Fixing it means the x86 core
+publishing its position where every engine reaches the same instruction, as
+`cpu.riscv`'s `Exec::publish_position` does, which moves what every x86 board's
+devices see inside a round and therefore every x86 golden. It is not the
+shared-crystal rule, and it wants a change of its own.
+
 Three things follow:
 
 * **Every runnable executes the rate its board declares**, on every board,

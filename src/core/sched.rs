@@ -151,7 +151,9 @@ use crate::core::clock::{
     ClockControl, ClockError, ClockForest, DomainId, GlobalTime, OscillatorId, RateRequest,
     Rational,
 };
-use crate::core::sync::{AtomicBool, AtomicU64, Handle, Mutex, Ordering as AtomicOrdering, Pool};
+use crate::core::sync::{
+    AtomicBool, AtomicU32, AtomicU64, Handle, Mutex, Ordering as AtomicOrdering, Pool,
+};
 
 // ---------------------------------------------------------------------------
 // errors
@@ -1046,6 +1048,21 @@ struct CursorInner {
     /// rather than on [`Budget`] because every runnable device is already
     /// handed a cursor and no core's signature has to change to consult one.
     exit: ExitFlag,
+    /// Where this runnable stands in every lazily-advanced device's domain
+    /// that asked to be read at its readers' positions, for the length of one
+    /// `run` call. See [`TickCursor::tick_in`].
+    ///
+    /// Written by the scheduler only while the runnable is not executing, and
+    /// read only from the runnable's own execution — its own `time` CSR, or a
+    /// device answering one of its own accesses — so the lock is never
+    /// contended. It is a lock rather than something cleverer because it is
+    /// taken once per *read of a timer*, not once per instruction.
+    view: Mutex<Option<Arc<ReadView>>>,
+    /// The requester id this runnable's accesses carry
+    /// ([`MemAttrs::requester`](crate::core::space::MemAttrs)), or zero for
+    /// none, which is what lets a device answering an access find the view of
+    /// the runnable that made it. See [`Scheduler::bind_requester`].
+    requester: AtomicU32,
 }
 
 impl TickCursor {
@@ -1067,6 +1084,8 @@ impl TickCursor {
                 deadline: AtomicU64::new(u64::MAX),
                 slots: Mutex::new(None),
                 exit,
+                view: Mutex::new(None),
+                requester: AtomicU32::new(0),
             }),
         }
     }
@@ -1145,6 +1164,52 @@ impl TickCursor {
             }
         }
         self.inner.deadline.store(next, AtomicOrdering::Relaxed);
+    }
+
+    /// Where this runnable stands in `lazy`'s clock domain when its own tick
+    /// counter reads `ticks` — **without moving the device**.
+    ///
+    /// The read path for a register whose value is a pure function of time: a
+    /// free-running counter such as RISC-V's `mtime`, which is what a hart's
+    /// `time` CSR and a load of the CLINT's `MTIME` both return. Reading one at
+    /// the reader's own position changes nothing and cannot show the reader
+    /// anything from another runnable's future, so it needs none of the care a
+    /// live *catch-up* needs — which is why it is available to every runnable,
+    /// including two that share a crystal, where the scheduler gives out no
+    /// live view at all (`Scheduler::arm_live_cursors`, *Not on a shared
+    /// crystal*).
+    ///
+    /// What it deliberately does not do is advance the device. A comparator
+    /// still fires at the device's own event, delivered where the scheduler
+    /// delivers it, and never because somebody read the counter early.
+    ///
+    /// The answer is exact integer arithmetic through the oscillator forest
+    /// (`ROADMAP.md` §4.2): within one crystal it is the forest's own tick
+    /// count at the runnable's position, remainder and all; across two it is
+    /// the nominal ratio of the two declared frequencies, bounded by where the
+    /// device's crystal will stand when the round closes, so that a reader's
+    /// last value in one round is never above its first in the next.
+    ///
+    /// `None` outside a `run` call, and for a device that did not ask to be
+    /// read this way ([`LazyHandle::read_at_readers`]) or whose crystal
+    /// another runnable drives — each of which the caller answers from where
+    /// the device stands instead, which is what every read did before this
+    /// existed.
+    #[must_use]
+    pub fn tick_in(&self, lazy: LazyId, ticks: u64) -> Option<u64> {
+        let view = self.inner.view.lock().clone()?;
+        let line = view.lines.get(lazy.index()).copied().flatten()?;
+        Some(line.at(ticks.saturating_sub(view.base_cursor)))
+    }
+
+    /// Install or drop the read view for one `run` call.
+    fn set_view(&self, view: Option<Arc<ReadView>>) {
+        *self.inner.view.lock() = view;
+    }
+
+    /// The requester id this cursor's runnable was bound to, or zero.
+    fn requester(&self) -> u32 {
+        self.inner.requester.load(AtomicOrdering::Relaxed)
     }
 
     /// Point the cursor at the devices it should keep in step, and recompute
@@ -1267,6 +1332,105 @@ impl Live {
     fn present(&self) -> u64 {
         let elapsed = self.cursor.get().saturating_sub(self.base_cursor);
         self.base_tick.saturating_add(self.ratio.forward(elapsed))
+    }
+}
+
+/// One runnable's position, expressed in one lazily-advanced slot's ticks, for
+/// the length of one `run` call: the slot tick is
+/// `min(base + (rem + elapsed × num) / den, cap)`, where `elapsed` is how many
+/// ticks the runnable has executed since the call began.
+///
+/// The same shape as [`Live`] with two additions, and each exists to keep one
+/// reader's successive values in order across the boundary where the scheduler
+/// re-anchors the line at the top of the next round:
+///
+/// * `rem` carries the remainder the anchor's floor dropped. Within one crystal
+///   the line is then exactly the forest's own count at the runnable's
+///   position ([`ClockForest::tick_line`]), so the next round's anchor — the
+///   same function, one round on — can never land below a value this one
+///   produced.
+/// * `cap` bounds a line across two crystals, where there is no exact
+///   relationship to preserve: nothing a reader sees this round exceeds where
+///   the slot's crystal will stand when the round closes, and that is where
+///   the next round's line starts. Without it a reader that ran a few cycles
+///   past its budget — every core finishes the instruction it is in — could
+///   see a value in one round a tick above its first in the next.
+#[derive(Debug, Clone, Copy)]
+struct ReadLine {
+    base: u64,
+    /// `< den`.
+    rem: u64,
+    num: u64,
+    /// Never zero.
+    den: u64,
+    cap: u64,
+}
+
+impl ReadLine {
+    /// A line that does not move: the slot is gated, or stands on its own
+    /// ahead of the reader.
+    const fn flat(at: u64) -> ReadLine {
+        ReadLine {
+            base: at,
+            rem: 0,
+            num: 0,
+            den: 1,
+            cap: at,
+        }
+    }
+
+    /// The slot tick `elapsed` runnable ticks along the line.
+    ///
+    /// `u128` in the middle: this runs once per *timer read*, not once per bus
+    /// access, so there is nothing to buy with [`Ratio::forward`]'s saturating
+    /// shortcut here.
+    #[inline]
+    fn at(self, elapsed: u64) -> u64 {
+        let whole = (u128::from(self.rem) + u128::from(elapsed) * u128::from(self.num))
+            / u128::from(self.den);
+        u64::try_from(whole)
+            .map_or(u64::MAX, |w| self.base.saturating_add(w))
+            .min(self.cap)
+    }
+}
+
+/// Every line one runnable carries for one `run` call, indexed by [`LazyId`].
+#[derive(Debug)]
+struct ReadView {
+    /// The runnable's tick counter the lines are measured from: the forest's
+    /// position for its domain, exactly as [`Scheduler::arm_live_cursors`]
+    /// anchors a [`Live`] view, so that a core carrying cycle debt is placed
+    /// at the cycles it has really executed.
+    base_cursor: u64,
+    lines: Vec<Option<ReadLine>>,
+}
+
+/// Every runnable's cursor, so a device answering an access can find the
+/// runnable that made it by the requester id the access carries.
+///
+/// Shared by the scheduler and every lazy slot. Filled at registration and
+/// never shrunk; a lookup is a scan of a handful of entries under a leaf lock,
+/// once per timer read.
+#[derive(Debug, Default)]
+struct Readers {
+    cursors: Mutex<Vec<TickCursor>>,
+}
+
+impl Readers {
+    /// The cursor of the runnable bound to `requester`, if any.
+    ///
+    /// Cloned out, so that nothing is held while the caller takes the cursor's
+    /// own view lock — two leaves at once is the order violation `core::sync`
+    /// exists to catch.
+    fn cursor_of(&self, requester: u32) -> Option<TickCursor> {
+        if requester == 0 {
+            return None;
+        }
+        self.cursors
+            .lock()
+            .iter()
+            .find(|c| c.requester() == requester)
+            .cloned()
     }
 }
 
@@ -1826,6 +1990,13 @@ struct LazySlot {
     /// [`SchedError::LazyDeviceBusy`] has always said — so this stays false
     /// there and that path keeps its exact behaviour, error and all.
     contended: AtomicBool,
+    /// Whether the device reads some register at its readers' own positions
+    /// ([`LazyHandle::read_at_readers`]), and so needs a line in every
+    /// runnable's read view. Set at realize and never cleared, so a machine
+    /// rebuilt from a snapshot asks for exactly the same views.
+    read_at_readers: AtomicBool,
+    /// Every runnable's cursor, for [`LazyHandle::reader_tick`].
+    readers: Arc<Readers>,
 }
 
 /// How many spins a contended catch-up gives another thread before it decides
@@ -2121,6 +2292,160 @@ impl LazyHandle {
     pub fn present_tick(&self) -> u64 {
         self.slot.state.lock().present
     }
+
+    /// Ask for this device's domain to be in every runnable's read view, so
+    /// that [`LazyHandle::reader_tick`] and [`TickCursor::tick_in`] can answer
+    /// for it.
+    ///
+    /// A device calls this from
+    /// [`Device::attach_lazy`](crate::core::device::Device::attach_lazy) when it
+    /// has a register whose value is a pure function of time — a free-running
+    /// counter — and wants it read where the reader stands rather than where
+    /// the device was last caught up to. Opt-in rather than universal because
+    /// a line costs a little per runnable per round, and a board with no such
+    /// register should not pay it. Asked at realize, so a machine rebuilt to
+    /// take a snapshot asks for exactly what the saved one did.
+    pub fn read_at_readers(&self) {
+        self.slot
+            .read_at_readers
+            .store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Where the runnable whose accesses carry `requester` stands in this
+    /// device's domain, **without moving the device** — or where the scheduler
+    /// last published the device, when that is further or when no runnable can
+    /// answer.
+    ///
+    /// For a register that is a pure function of time, read through an access:
+    /// `MTIME` in the CLINT's window is the case it exists for. The device
+    /// answers from `max(its own tick, this)` and changes nothing, so two
+    /// processors on one crystal each read the counter at their own position
+    /// and neither can drag the device — or its comparators — into the other's
+    /// future. [`TickCursor::tick_in`] has how the position is computed and
+    /// why it never runs backwards from one round to the next.
+    ///
+    /// `requester` is the raw value of
+    /// [`MemAttrs::requester`](crate::core::space::MemAttrs): this module stays
+    /// independent of `core::space`, as [`AccessKind`] does. Zero — an
+    /// anonymous access — finds nobody.
+    pub fn reader_tick(&self, requester: u32) -> u64 {
+        let present = self.slot.state.lock().present;
+        self.slot
+            .readers
+            .cursor_of(requester)
+            .and_then(|cursor| cursor.tick_in(self.id, cursor.get()))
+            .map_or(present, |seen| seen.max(present))
+    }
+}
+
+/// A free-running counter that a lazily-advanced device keeps as **its own
+/// tick plus an offset**, and that a runnable reads at its own position.
+///
+/// RISC-V's `mtime` is the case it exists for. The CLINT counts it, and a
+/// hart's `time` CSR is architecturally a read-only view of it (*RISC-V
+/// Privileged Architecture*, "Machine Timer Registers"). A CSR read never
+/// reaches the bus, so the device cannot answer it the way it answers a load;
+/// the hart answers it instead, from this: the device publishes its tick and
+/// its offset here whenever either changes, and the hart combines them with
+/// where *it* stands in the device's domain ([`TickCursor::tick_in`]).
+///
+/// The value is `max(device tick, reader's tick) + offset`. The `max` is what
+/// keeps a reader that has no view — outside a `run` call, or on a crystal
+/// whose position cannot be converted — on the value the device last
+/// published, which is what `time` read before this existed; and it keeps
+/// the counter monotonic for one reader, since neither half ever goes
+/// backwards on its own.
+///
+/// Nothing here moves the device. A guest's comparator still fires at the
+/// device's own event, delivered where the scheduler delivers it: a read of
+/// the counter is not an access to anything that has side effects.
+///
+/// # The cell
+///
+/// [`LiveCounter::cell`] is the same number at the device's own tick, in the
+/// shape [`Export::Cell`](crate::core::device::Export::Cell) consumers already
+/// sample. A consumer that holds only the cell sees exactly what it saw before
+/// this type existed.
+///
+/// # Parallel rounds
+///
+/// Two relaxed loads, not one, so a read that races a guest *write* of the
+/// counter on another processor can pair the new offset with the old tick.
+/// That is a race the guest wrote — two processors disagreeing about when the
+/// other's store happened — and it can only arise under
+/// [`ThreadingMode::Parallel`], which promises no ordering between them. The
+/// device's own advances do not race a reader in either mode: a slot is caught
+/// up only to its published position during a round on a shared crystal, and
+/// that is where it already stands.
+#[derive(Debug, Default)]
+pub struct LiveCounter {
+    /// `tick + offset`: the counter at the device's own tick.
+    cell: Arc<AtomicU64>,
+    tick: AtomicU64,
+    offset: AtomicU64,
+    /// The device's slot, plus one; zero until the device is registered.
+    lazy: AtomicU32,
+}
+
+impl LiveCounter {
+    /// A counter at zero, belonging to no device yet.
+    #[must_use]
+    pub fn new() -> LiveCounter {
+        LiveCounter::default()
+    }
+
+    /// The counter at the device's own tick, as a shared cell.
+    #[must_use]
+    pub fn cell(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.cell)
+    }
+
+    /// The same cell, borrowed — for [`Export::cell`](crate::core::device::Export::cell).
+    pub(crate) fn cell_ref(&self) -> &Arc<AtomicU64> {
+        &self.cell
+    }
+
+    /// Say which lazily-advanced device keeps this counter. The device calls
+    /// this from `attach_lazy`, along with [`LazyHandle::read_at_readers`].
+    pub fn attach(&self, lazy: &LazyHandle) {
+        self.lazy
+            .store(lazy.id().0.saturating_add(1), AtomicOrdering::Relaxed);
+    }
+
+    /// The device has moved: the counter now reads `tick + offset` at its
+    /// tick `tick`. Wrapping, because a guest may write the counter anywhere.
+    pub fn publish(&self, tick: u64, offset: u64) {
+        self.tick.store(tick, AtomicOrdering::Relaxed);
+        self.offset.store(offset, AtomicOrdering::Relaxed);
+        self.cell
+            .store(tick.wrapping_add(offset), AtomicOrdering::Relaxed);
+    }
+
+    /// The counter at the device's own tick.
+    #[inline]
+    #[must_use]
+    pub fn value(&self) -> u64 {
+        self.cell.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The counter as the runnable holding `reader` sees it with its own tick
+    /// counter at `ticks`.
+    ///
+    /// Not inlined, and not meant for a per-instruction path: it takes the
+    /// cursor's view lock. A hart calls it when an instruction actually reads
+    /// `time`.
+    #[must_use]
+    pub fn read_at(&self, reader: &TickCursor, ticks: u64) -> u64 {
+        let tick = self.tick.load(AtomicOrdering::Relaxed);
+        let offset = self.offset.load(AtomicOrdering::Relaxed);
+        let at = match self.lazy.load(AtomicOrdering::Relaxed) {
+            0 => tick,
+            n => reader
+                .tick_in(LazyId(n - 1), ticks)
+                .map_or(tick, |seen| seen.max(tick)),
+        };
+        at.wrapping_add(offset)
+    }
 }
 
 /// Everything about a [`Scheduler`] that a snapshot has to carry
@@ -2385,6 +2710,9 @@ pub struct Scheduler {
     /// [`Scheduler::apply_clock_requests`] for the rule and
     /// [`ClockControl`] for why a device cannot simply call the forest.
     clocks: Arc<ClockControl>,
+    /// Every runnable's cursor, shared with every lazy slot so a device can
+    /// find the runnable an access came from ([`LazyHandle::reader_tick`]).
+    readers: Arc<Readers>,
 }
 
 impl fmt::Debug for Scheduler {
@@ -2430,6 +2758,7 @@ impl Scheduler {
             host_clock: None,
             accel_anchor: None,
             clocks: Arc::new(ClockControl::new()),
+            readers: Arc::new(Readers::default()),
         }
     }
 
@@ -2658,10 +2987,12 @@ impl Scheduler {
     /// Registers something to hand budgets to, running in `domain`.
     pub fn add_runnable(&mut self, domain: DomainId, runnable: Box<dyn Runnable>) -> RunnableId {
         let id = RunnableId(self.runnables.len() as u32);
+        let cursor = TickCursor::with_exit(self.safe.flag());
+        self.readers.cursors.lock().push(cursor.clone());
         self.runnables.push(RunnableSlot {
             domain,
             inner: Some(runnable),
-            cursor: TickCursor::with_exit(self.safe.flag()),
+            cursor,
         });
         self.tree_slots = None;
         self.clock_epoch = self.clock_epoch.wrapping_add(1);
@@ -2685,6 +3016,8 @@ impl Scheduler {
                 present,
             }),
             contended: AtomicBool::new(contended),
+            read_at_readers: AtomicBool::new(false),
+            readers: Arc::clone(&self.readers),
         }));
         self.lazy_snapshot = None;
         self.tree_slots = None;
@@ -2729,6 +3062,30 @@ impl Scheduler {
             .get(id.index())
             .map(|slot| slot.cursor.clone())
             .ok_or(SchedError::UnknownRunnable(id))
+    }
+
+    /// Say which requester id a runnable's accesses carry, so that a device
+    /// answering one can find where that runnable stands
+    /// ([`LazyHandle::reader_tick`]).
+    ///
+    /// The machine layer allocates one per object and calls this when it
+    /// registers a runnable; `requester` is the raw value of
+    /// [`MemAttrs::requester`](crate::core::space::MemAttrs). Zero unbinds.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::UnknownRunnable`] if the handle is not from this
+    /// scheduler.
+    pub fn bind_requester(&self, id: RunnableId, requester: u32) -> SchedResult<()> {
+        let slot = self
+            .runnables
+            .get(id.index())
+            .ok_or(SchedError::UnknownRunnable(id))?;
+        slot.cursor
+            .inner
+            .requester
+            .store(requester, AtomicOrdering::Relaxed);
+        Ok(())
     }
 
     /// The clock domain a lazily-advanced device is registered in.
@@ -3207,7 +3564,9 @@ impl Scheduler {
             // has got to, not where the quantum began (see [`TickCursor`]).
             let cursor = self.runnables[index].cursor.clone();
             self.arm_live_cursors(index, &cursor, &shared);
+            cursor.set_view(self.read_view(index, target));
             let used = runnable.run(budget);
+            cursor.set_view(None);
             self.disarm_live_cursors(&cursor);
             self.runnables[index].inner = Some(runnable);
             if used.ticks > allowed {
@@ -3458,6 +3817,15 @@ impl Scheduler {
         };
 
         self.arm_parallel_cursors();
+        // Every runnable's read view, built before any of them runs, from the
+        // same forest the deterministic round builds them from: a read of a
+        // counter at the reader's own position involves nobody else, which is
+        // why this — unlike the live views above — needs no rule about who
+        // shares a crystal.
+        for index in 0..count {
+            let view = self.read_view(index, target);
+            self.runnables[index].cursor.set_view(view);
+        }
 
         let mut used_by: Vec<Option<Consumed>> = alloc::vec![None; count];
 
@@ -3803,6 +4171,7 @@ impl Scheduler {
     fn disarm_parallel_cursors(&self) {
         for slot in &self.runnables {
             slot.cursor.watch(None);
+            slot.cursor.set_view(None);
         }
         for slot in &self.lazy {
             slot.disarm();
@@ -3955,6 +4324,14 @@ impl Scheduler {
     /// ([`Scheduler::natural_target`]) and are delivered at its end. That is
     /// the rule [`Scheduler::arm_parallel_cursors`] has always applied to a
     /// tree driven by more than one runnable, so the two modes agree on it.
+    ///
+    /// What that rule costs is *resolution*, and for a register that is a pure
+    /// function of time it need not cost even that: a **read** at the reader's
+    /// own position advances nothing and can show it nothing from the other
+    /// runnable's future. [`Scheduler::read_view`] is that path, and every
+    /// runnable gets one whatever crystal it is on — see [`TickCursor::tick_in`]
+    /// and [`LazyHandle::reader_tick`]. Catch-up is what this method arms, and
+    /// catch-up is what stays off a shared crystal.
     fn arm_live_cursors(&mut self, index: usize, cursor: &TickCursor, shared: &[OscillatorId]) {
         if self.lazy_snapshot.is_none() {
             self.lazy_snapshot = Some(self.lazy.iter().cloned().collect());
@@ -4009,6 +4386,130 @@ impl Scheduler {
         // runnable's own ticks — which is what the cursor needs in order to
         // catch them up from inside a cycle.
         cursor.watch(self.lazy_snapshot.clone());
+    }
+
+    /// The read view runnable `index` carries through a `run` call that ends
+    /// at `target` — what [`TickCursor::tick_in`] answers from.
+    ///
+    /// `None`, with nothing allocated, when no lazily-advanced device asked to
+    /// be read this way ([`LazyHandle::read_at_readers`]), which is every board
+    /// without a free-running counter on a lazily-advanced device.
+    ///
+    /// # Why every runnable gets one, shared crystal or not
+    ///
+    /// [`Scheduler::arm_live_cursors`] gives a runnable on a shared crystal no
+    /// live view, and that rule stands: a live view *catches devices up*, and
+    /// the runnable that executes a round first would drag a device past the
+    /// one that executes it second. A read view catches nothing up. It answers
+    /// one question — where does *this* runnable stand in that domain — whose
+    /// answer depends on nobody else's position, so it cannot show a runnable
+    /// anything from another's future, and it is built for every runnable from
+    /// the forest as it stood when the round began. That also makes it the
+    /// same in both threading modes: the parallel round builds all of them
+    /// before anything runs, and the deterministic round builds each one
+    /// before its runnable runs, from positions the runnables before it did
+    /// not move — a runnable moves only its own domain and its crystal's
+    /// counter, and a crystal's counter stands at its slowest runnable.
+    ///
+    /// # One line per device, and topology decides its shape
+    ///
+    /// `ROADMAP.md` §4.2's rule, as [`Scheduler::ratio_for`] applies it:
+    ///
+    /// * **The runnable's own crystal**: the forest's exact tick count at the
+    ///   runnable's own position ([`ClockForest::tick_line`]), lead included —
+    ///   a runnable on a shared crystal may stand ahead of the crystal's
+    ///   counter, and a counter on that crystal read by it is where *it* is.
+    /// * **A crystal no runnable drives** — an RTC can, a timer's own
+    ///   oscillator: the nominal ratio of the two declared frequencies from
+    ///   where that tree stands, capped where it will stand at `target`, so
+    ///   nothing a reader sees in this round is ahead of where the next round
+    ///   starts it.
+    /// * **A crystal another runnable drives**: no line. Where that tree ends
+    ///   the round depends on a runnable that may not have run yet, so there
+    ///   is no cap that is both honest and a bound, and the device is read
+    ///   where it was last published — what every read was before this
+    ///   existed.
+    fn read_view(&mut self, index: usize, target: GlobalTime) -> Option<Arc<ReadView>> {
+        if !self
+            .lazy
+            .iter()
+            .any(|slot| slot.read_at_readers.load(AtomicOrdering::Relaxed))
+        {
+            return None;
+        }
+        self.build_ratios();
+        let domain = self.runnables[index].domain;
+        let osc = self.forest.root_of(domain).ok()?;
+        let base_cursor = self.forest.ticks(domain).ok()?;
+        let here = self.forest.position(domain).ok()?;
+        let mul = self.forest.domain(domain).ok()?.units_per_tick();
+        let ratios = self.ratios_of(index);
+        let lines = self
+            .lazy
+            .iter()
+            .enumerate()
+            .map(|(j, slot)| {
+                if !slot.read_at_readers.load(AtomicOrdering::Relaxed) {
+                    return None;
+                }
+                let ratio = ratios.get(j).copied().flatten();
+                self.read_line(slot.domain, osc, here, mul, ratio, target)
+            })
+            .collect();
+        Some(Arc::new(ReadView { base_cursor, lines }))
+    }
+
+    /// One device's line in a runnable's read view. See
+    /// [`Scheduler::read_view`] for the three cases.
+    ///
+    /// `osc`, `here` and `mul` are the runnable's crystal, its position in
+    /// that crystal's units and its units per tick; `ratio` is its row of the
+    /// cached cross-tree table for this device.
+    fn read_line(
+        &self,
+        slot: DomainId,
+        osc: OscillatorId,
+        here: u64,
+        mul: u64,
+        ratio: Option<Ratio>,
+        target: GlobalTime,
+    ) -> Option<ReadLine> {
+        let slot_osc = self.forest.root_of(slot).ok()?;
+        if slot_osc == osc {
+            let (base, rem, per) = self.forest.tick_line(slot, here).ok()?;
+            if per == 0 || mul == 0 {
+                return Some(ReadLine::flat(base));
+            }
+            return Some(ReadLine {
+                base,
+                rem,
+                num: mul,
+                den: per,
+                cap: u64::MAX,
+            });
+        }
+        // The same test [`Scheduler::advance_undriven_trees`] makes, so that
+        // a tree this calls undriven is one the round's close really does
+        // carry to `target`.
+        if !self.forest.is_active(slot_osc).unwrap_or(false)
+            || self
+                .runnables
+                .iter()
+                .any(|r| self.forest.root_of(r.domain) == Ok(slot_osc))
+        {
+            return None;
+        }
+        let ratio = ratio?;
+        let base = self.forest.ticks(slot).ok()?;
+        let end = self.forest.units_at_global(slot_osc, target).ok()?;
+        let cap = self.forest.ticks_at_units(slot, end).ok()?.max(base);
+        Some(ReadLine {
+            base,
+            rem: 0,
+            num: ratio.num,
+            den: ratio.den,
+            cap,
+        })
     }
 
     /// Drop every live view. Between runnables the published position is the
@@ -5342,6 +5843,263 @@ mod tests {
             sched.sync_for_access(dev, AccessKind::Guest).unwrap(),
             sched.forest().ticks(ppu).unwrap()
         );
+    }
+
+    // -- reading a counter at the reader's own position --------------------
+
+    /// What a run of [`CounterReader`]s records: `(requester, its own tick,
+    /// the counter's tick it read, where the device itself stood)` per step.
+    type Seen = Arc<Mutex<Vec<(u32, u64, u64, u64)>>>;
+
+    /// A processor that reads a free-running counter as it goes, the way a
+    /// hart reads `time`, and overruns every budget a little, the way every
+    /// core finishes the instruction it is in.
+    ///
+    /// It records a [`Seen`] row at every step.
+    #[derive(Debug)]
+    struct CounterReader {
+        cursor: Arc<Mutex<Option<TickCursor>>>,
+        handle: Arc<Mutex<Option<LazyHandle>>>,
+        requester: u32,
+        /// Ticks per step; not a divisor of any budget, so there is debt.
+        step: u64,
+        executed: u64,
+        charged: u64,
+        seen: Seen,
+    }
+
+    impl Runnable for CounterReader {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            let cursor = self.cursor.lock().clone().expect("wired");
+            let handle = self.handle.lock().clone().expect("wired");
+            let goal = self.charged + budget.ticks;
+            while self.executed < goal {
+                self.executed += self.step;
+                cursor.set(self.executed);
+                let read = handle.reader_tick(self.requester);
+                let device = handle.current_tick().expect("not busy");
+                self.seen
+                    .lock()
+                    .push((self.requester, self.executed, read, device));
+            }
+            self.charged = goal;
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    /// Two readers on `domains`, requesters 1 and 2, reading `dev`.
+    fn counter_readers(sched: &mut Scheduler, domains: [DomainId; 2], dev: LazyId) -> Seen {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let handle = sched.lazy_handle(dev).unwrap();
+        handle.read_at_readers();
+        for (n, domain) in domains.into_iter().enumerate() {
+            let cursor = Arc::new(Mutex::new(None));
+            let id = sched.add_runnable(
+                domain,
+                Box::new(CounterReader {
+                    cursor: Arc::clone(&cursor),
+                    handle: Arc::new(Mutex::new(Some(handle.clone()))),
+                    requester: n as u32 + 1,
+                    step: 37,
+                    executed: 0,
+                    charged: 0,
+                    seen: Arc::clone(&seen),
+                }),
+            );
+            sched.bind_requester(id, n as u32 + 1).unwrap();
+            *cursor.lock() = Some(sched.runnable_cursor(id).unwrap());
+        }
+        seen
+    }
+
+    /// Two harts on one 1 GHz crystal and `mtime` on a 10 MHz can of its own:
+    /// `riscv-virt-smp`'s clocks.
+    fn two_harts_and_a_can(mode: ThreadingMode) -> (Scheduler, Seen, DomainId, DomainId) {
+        let mut forest = ClockForest::new();
+        let core = forest
+            .add_oscillator("core", Rational::integer(1_000_000_000))
+            .unwrap();
+        let can = forest
+            .add_oscillator("rtc", Rational::integer(10_000_000))
+            .unwrap();
+        let hart0 = forest.add_domain("hart0", core, 1, 1).unwrap();
+        let hart1 = forest.add_domain("hart1", core, 1, 1).unwrap();
+        let mtime = forest.add_domain("mtime", can, 1, 1).unwrap();
+        let mut sched = Scheduler::new(
+            forest,
+            SchedulerConfig {
+                mode,
+                workers: 2,
+                ..SchedulerConfig::default()
+            },
+        );
+        let dev = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+        let seen = counter_readers(&mut sched, [hart0, hart1], dev);
+        (sched, seen, hart0, mtime)
+    }
+
+    /// Each of two runnables on one crystal reads a counter on another crystal
+    /// at **its own** position — one tick of the counter per hundred of its
+    /// own — while the device itself stays where the round began, and neither
+    /// reader's values ever go backwards across a round.
+    ///
+    /// The rounds here are a millisecond, so the two crystals are level at
+    /// every boundary and the expected value is exact: the counter tick at a
+    /// runnable tick `t` is `t / 100`, except past the end of a budget, where
+    /// the runnable is finishing a step it began inside it and the read is
+    /// held at the round's end — the value the next round starts from.
+    #[test]
+    fn a_counter_is_read_at_each_readers_own_position_on_a_shared_crystal() {
+        for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+            let (mut sched, seen, hart, mtime) = two_harts_and_a_can(mode);
+            for _ in 0..4 {
+                let before = seen.lock().len();
+                let rtc = sched.forest().ticks(mtime).unwrap();
+                sched.run_quantum().unwrap();
+                sched.sync_lazy_devices().unwrap();
+                let goal = sched.forest().ticks(hart).unwrap();
+                for &(who, own, read, device) in &seen.lock()[before..] {
+                    assert_eq!(
+                        read,
+                        own.min(goal) / 100,
+                        "{mode:?}: reader {who} at its tick {own} read the counter at {read}"
+                    );
+                    assert_eq!(
+                        device, rtc,
+                        "{mode:?}: reading the counter moved the device"
+                    );
+                }
+            }
+            let seen = seen.lock();
+            for who in [1, 2] {
+                let mine: Vec<u64> = seen.iter().filter(|s| s.0 == who).map(|s| s.2).collect();
+                assert!(mine.len() > 100_000, "{mode:?}: reader {who} barely ran");
+                assert!(
+                    mine.windows(2).all(|w| w[0] <= w[1]),
+                    "{mode:?}: reader {who}'s counter went backwards"
+                );
+                assert_eq!(*mine.last().unwrap(), 40_000, "{mode:?}: four milliseconds");
+            }
+        }
+    }
+
+    /// On the runnable's own crystal the read is the forest's exact count at
+    /// the runnable's position, for each of two runnables on one crystal,
+    /// whichever runs first.
+    ///
+    /// The device divides the crystal by five and the processors by twelve,
+    /// so a processor's position is almost never on a whole device tick: the
+    /// read is right only if the line keeps the remainder its anchor's floor
+    /// dropped (`ReadLine::rem`), which a line built the way [`Live`] is —
+    /// a floor at the anchor, another along the ratio — does not.
+    #[test]
+    fn a_counter_on_the_readers_own_crystal_is_exact() {
+        for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+            let mut forest = ClockForest::new();
+            let master = forest
+                .add_oscillator("master", Rational::new(236_250_000, 11).unwrap())
+                .unwrap();
+            let cpu0 = forest.add_domain("cpu0", master, 1, 12).unwrap();
+            let cpu1 = forest.add_domain("cpu1", master, 1, 12).unwrap();
+            let fifth = forest.add_domain("fifth", master, 1, 5).unwrap();
+            let mut sched = Scheduler::new(
+                forest,
+                SchedulerConfig {
+                    mode,
+                    workers: 2,
+                    ..SchedulerConfig::default()
+                },
+            );
+            let dev = sched.add_lazy_device(fifth, Box::new(Ppu::default()));
+            let seen = counter_readers(&mut sched, [cpu0, cpu1], dev);
+            for _ in 0..3 {
+                sched.run_quantum().unwrap();
+                sched.sync_lazy_devices().unwrap();
+            }
+            let seen = seen.lock();
+            assert!(seen.len() > 200, "{mode:?}: the readers barely ran");
+            for &(who, own, read, _) in seen.iter() {
+                assert_eq!(read, own * 12 / 5, "{mode:?}: reader {who} at cycle {own}");
+            }
+        }
+    }
+
+    /// A device that did not ask to be read this way, a requester nobody is
+    /// bound to, and a read between rounds all get the published position —
+    /// what every read got before read views existed.
+    #[test]
+    fn nobody_is_answered_from_a_view_they_do_not_have() {
+        let (mut sched, seen, _, mtime) = two_harts_and_a_can(ThreadingMode::Deterministic);
+        let quiet = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+        sched.run_quantum().unwrap();
+        sched.sync_lazy_devices().unwrap();
+        assert!(!seen.lock().is_empty());
+        let loud = sched.lazy_handle(LazyId(0)).unwrap();
+        let quiet = sched.lazy_handle(quiet).unwrap();
+        let present = loud.present_tick();
+        assert_eq!(present, 10_000);
+        // Between rounds: no view is armed.
+        assert_eq!(loud.reader_tick(1), present);
+        assert_eq!(loud.reader_tick(0), present);
+        assert_eq!(loud.reader_tick(99), present);
+        assert_eq!(quiet.reader_tick(1), quiet.present_tick());
+        let cursor = sched.runnable_cursor(RunnableId(0)).unwrap();
+        assert_eq!(cursor.tick_in(LazyId(0), 1_234_567), None);
+    }
+
+    /// A reader that runs past its budget sees the counter held at the round's
+    /// end rather than a tick past where the next round will start it — the
+    /// cross-crystal cap. With rates that do not divide one another the
+    /// uncapped line reaches a tick the next round's anchor has not, and the
+    /// reader's next value would be lower than its last.
+    #[test]
+    fn a_counter_read_across_crystals_never_runs_backwards_at_a_round_boundary() {
+        let mut forest = ClockForest::new();
+        let core = forest
+            .add_oscillator("core", Rational::new(1_000_000_007, 3).unwrap())
+            .unwrap();
+        let can = forest
+            .add_oscillator("rtc", Rational::new(10_000_019, 7).unwrap())
+            .unwrap();
+        let hart0 = forest.add_domain("hart0", core, 1, 1).unwrap();
+        let hart1 = forest.add_domain("hart1", core, 1, 1).unwrap();
+        let mtime = forest.add_domain("mtime", can, 1, 1).unwrap();
+        let mut sched = Scheduler::new(
+            forest,
+            SchedulerConfig {
+                // Chosen so the counter crystal gains 1000.93 ticks a round:
+                // the fraction left at each boundary walks round the unit
+                // interval, and a reader's last read of a round — past its
+                // budget, finishing a step — lands on both sides of the next
+                // round's anchor.
+                quantum: GlobalTime::from_nanos(700_650),
+                ..SchedulerConfig::default()
+            },
+        );
+        let dev = sched.add_lazy_device(mtime, Box::new(Ppu::default()));
+        let seen = counter_readers(&mut sched, [hart0, hart1], dev);
+        for _ in 0..200 {
+            sched.run_quantum().unwrap();
+            sched.sync_lazy_devices().unwrap();
+        }
+        let seen = seen.lock();
+        for who in [1, 2] {
+            let mine: Vec<(u64, u64)> = seen
+                .iter()
+                .filter(|s| s.0 == who)
+                .map(|s| (s.1, s.2))
+                .collect();
+            for w in mine.windows(2) {
+                assert!(
+                    w[0].1 <= w[1].1,
+                    "reader {who}: {} at its tick {}, then {} at {}",
+                    w[0].1,
+                    w[0].0,
+                    w[1].1,
+                    w[1].0
+                );
+            }
+        }
     }
 
     // -- why a round ended --------------------------------------------------

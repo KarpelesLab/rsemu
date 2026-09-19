@@ -38,7 +38,7 @@ use crate::core::clock::ClockControl;
 use crate::core::error::{Error, Result};
 use crate::core::hosts::HostObjects;
 use crate::core::props::{Props, ValueKind};
-use crate::core::sched::{Budget, Consumed, LazyHandle, TickCursor};
+use crate::core::sched::{Budget, Consumed, LazyHandle, LiveCounter, TickCursor};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::spin::Detector as SpinDetector;
 use crate::core::state::{ChunkReader, ChunkWriter};
@@ -159,7 +159,9 @@ pub struct ExportId(pub u16);
 
 impl ExportId {
     /// The publisher's free-running time counter, counted in the publisher's
-    /// own timebase. Transported as [`Export::Cell`].
+    /// own timebase. Transported as [`Export::Cell`], or as
+    /// [`Export::Counter`] by a publisher whose counter a consumer can read at
+    /// its own position — which [`Export::cell`] still answers for.
     ///
     /// The RISC-V case is the motivating one: `mtime` belongs to the CLINT, and
     /// a hart's `time` CSR is architecturally a *view of the platform timer*
@@ -337,6 +339,18 @@ pub enum Export {
     /// cycles. Typed, because [`CycleGate`] is `core`'s own trait.
     Gate(Arc<dyn CycleGate>),
 
+    /// A free-running counter the consumer reads **at its own position**
+    /// rather than at the publisher's.
+    ///
+    /// What a lazily-advanced device publishes as
+    /// [`TIMEBASE`](ExportId::TIMEBASE) when the consumer is a processor that
+    /// reads the counter without an access — RISC-V's `time` CSR against the
+    /// CLINT's `mtime`. A [`Cell`](Export::Cell) can only carry the value the
+    /// publisher was last caught up to, and on a crystal two processors share
+    /// that is where the round began. [`Export::cell`] still answers for this
+    /// shape, with the same number the cell always held.
+    Counter(Arc<LiveCounter>),
+
     /// A handle whose type is a contract between the two device classes and
     /// not `core`'s business.
     ///
@@ -369,11 +383,23 @@ impl Export {
         }
     }
 
-    /// The cell, if that is the shape this handle came back in.
+    /// The cell, if that is the shape this handle came back in — or the
+    /// cell behind a [`Counter`](Export::Counter), which holds the same
+    /// number at the publisher's own tick.
     #[must_use]
     pub fn cell(&self) -> Option<&Arc<AtomicU64>> {
         match self {
             Export::Cell(cell) => Some(cell),
+            Export::Counter(counter) => Some(counter.cell_ref()),
+            _ => None,
+        }
+    }
+
+    /// The live counter, if that is the shape this handle came back in.
+    #[must_use]
+    pub fn counter(&self) -> Option<&Arc<LiveCounter>> {
+        match self {
+            Export::Counter(counter) => Some(counter),
             _ => None,
         }
     }
@@ -383,6 +409,7 @@ impl Export {
     pub fn shape(&self) -> &'static str {
         match self {
             Export::Cell(_) => "a 64-bit cell",
+            Export::Counter(_) => "a live counter",
             Export::Gate(_) => "a cycle gate",
             Export::Opaque(_) => "an opaque handle",
         }
@@ -1285,6 +1312,27 @@ mod tests {
         d.reset(ResetKind::Cold);
         d.cell.store(7, Ordering::Relaxed);
         assert_eq!(held.load(Ordering::Relaxed), 7);
+    }
+
+    /// A counter is a cell to anybody who only wanted one, which is what lets
+    /// a publisher move from one shape to the other without its consumers
+    /// noticing — `riscv.clint` did exactly that.
+    #[test]
+    fn a_live_counter_still_answers_as_a_cell() {
+        let counter = Arc::new(LiveCounter::new());
+        let export = Export::Counter(Arc::clone(&counter));
+        assert_eq!(export.shape(), "a live counter");
+        let held = export.cell().expect("a counter is a cell too").clone();
+        assert!(export.counter().is_some());
+        counter.publish(40, 2);
+        assert_eq!(held.load(Ordering::Relaxed), 42);
+        assert_eq!(counter.value(), 42);
+        assert!(
+            Export::Cell(Arc::new(AtomicU64::new(0)))
+                .counter()
+                .is_none(),
+            "and a cell is not a counter, because it cannot be read at a position"
+        );
     }
 
     #[test]

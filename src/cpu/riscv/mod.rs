@@ -122,7 +122,7 @@ use crate::core::error::{Error, Result};
 use crate::core::exec::{Exit, ExitMask, ExitingCore, Run};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed, ExitFlag, TickCursor};
+use crate::core::sched::{Budget, Consumed, ExitFlag, LiveCounter, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot, RequesterId};
 use crate::core::spin;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
@@ -375,6 +375,30 @@ impl Engine {
     }
 }
 
+/// What the scheduler wired into this hart, as one borrow.
+///
+/// A [`TickCursor`] to publish this hart's position into, and the platform
+/// timer it answers `time` from ([`LiveCounter`]) — one struct rather than two
+/// fields because [`Exec`] is built **per guest instruction** under the
+/// interpreter, and every reference it carries is a word copied on every one
+/// of them. Measured on `benches/frame_time --only riscv-virt` under
+/// callgrind — same workload, same state hash, so the guest work is identical
+/// to the instruction — a second reference beside the cursor cost 3.56 G host
+/// instructions, **+0.72%** of the whole program, all of it in
+/// `Hart::step_to_exit` where the borrow is built. Through one borrow the same
+/// program runs 488 600 407 037 against master's 491 265 275 294: **−0.54%**,
+/// because the borrow is a pointer where the cursor alone was an `Option`.
+#[derive(Debug, Default)]
+pub(crate) struct Timing {
+    /// Where this hart publishes how far into its round it has got, or `None`
+    /// on a hart nothing scheduled.
+    pub(crate) cursor: Option<TickCursor>,
+    /// The platform timer, when its owner lets a hart read it at the hart's
+    /// own position ([`Hart::attach_counter`]). `Session::time_src` is then
+    /// this counter's cell.
+    pub(crate) counter: Option<Arc<LiveCounter>>,
+}
+
 /// Everything the interpreter mutates, behind one lock.
 #[derive(Debug)]
 struct Session {
@@ -396,15 +420,15 @@ struct Session {
     /// state, so it lives here beside `space` instead of in `state`: `reset`
     /// replaces `state`, and a reset must not unplug the clock.
     time_src: Option<Arc<AtomicU64>>,
-    /// Where this hart publishes how far into its quantum it has got, so that
-    /// a lazily advanced device reached from an access sees the instant the
-    /// access happens rather than the instant the round began.
+    /// The scheduler-side wiring an execution borrow needs: where this hart
+    /// publishes how far into its round it has got, and the platform timer it
+    /// answers `time` from. See [`Timing`].
     ///
     /// Wiring, like `time_src` and for the same reason. Held inside the
     /// session rather than beside it so that reaching it costs no second lock
     /// on the step path: every route that builds an [`Exec`] already holds
     /// this one. See [`Hart::attach_cursor`].
-    cursor: Option<TickCursor>,
+    timing: Timing,
     /// The spin detector's per-hart state (`core::spin`).
     ///
     /// Wiring, like `cursor` and `time_src` above: a reset replaces `state`
@@ -504,7 +528,7 @@ impl Hart {
                     space: None,
                     monitor: None,
                     time_src: None,
-                    cursor: None,
+                    timing: Timing::default(),
                     spin: spin::Watch::new(cfg.requester),
                     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
                     jit: None,
@@ -868,7 +892,37 @@ impl Hart {
     /// The value is sampled once per [`step`](Hart::step), which is as often
     /// as a guest can observe it: reading `time` takes an instruction.
     pub fn attach_time(&self, timer: Arc<AtomicU64>) {
-        self.session.lock().time_src = Some(timer);
+        let mut session = self.session.lock();
+        session.time_src = Some(timer);
+        session.timing.counter = None;
+    }
+
+    /// Attach the platform timer as a counter this hart reads **at its own
+    /// position**.
+    ///
+    /// What [`attach_time`](Hart::attach_time) cannot do. A cell holds `mtime`
+    /// at the CLINT's own tick, and the CLINT is caught up to a hart's live
+    /// position only when the hart touches it — and, on a crystal two harts
+    /// share, not even then, since neither may drag a shared device into the
+    /// other's future. Linux reads `time` for every printk timestamp and
+    /// every `sched_clock`, never touches the CLINT to do it, and so saw a
+    /// clock that moved once per scheduler round: a millisecond, a million
+    /// instructions at 1 GHz.
+    ///
+    /// With a counter, an instruction that reads `time` gets
+    /// `max(CLINT tick, this hart's position in the CLINT's domain) + offset`
+    /// (`core::sched::LiveCounter`), computed when the instruction executes
+    /// and nowhere else. That is not a relaxation of Volume II's "`time` …
+    /// reflects `mtime`": it is the value `mtime` holds at the instant this
+    /// hart reads it, which is the value a load of `mtime` returns too.
+    ///
+    /// The per-step sample of the cell stays exactly as it was, so the
+    /// snapshot's `csrs.mtime` is the same number on every engine
+    /// ([`run_budget`](Hart::run_budget) has why that matters).
+    pub fn attach_counter(&self, counter: Arc<LiveCounter>) {
+        let mut session = self.session.lock();
+        session.time_src = Some(counter.cell());
+        session.timing.counter = Some(counter);
     }
 
     /// Execute one instruction, one trap entry, or one stalled `WFI` cycle.
@@ -899,7 +953,7 @@ impl Hart {
             space,
             monitor,
             time_src,
-            cursor,
+            timing,
             spin,
             ..
         } = &mut *session;
@@ -920,7 +974,7 @@ impl Hart {
             exits,
             monitor.as_ref(),
         )
-        .with_cursor(cursor.as_ref())
+        .with_timing(timing)
         .with_spin(spin);
         let used = exec.step();
         (used, exec.take_exit())
@@ -969,7 +1023,7 @@ impl Hart {
                 space,
                 monitor,
                 time_src,
-                cursor,
+                timing,
                 spin,
                 jit,
             } = &mut *session;
@@ -989,7 +1043,7 @@ impl Hart {
                 &self.lines,
                 exits,
                 monitor.as_ref(),
-                cursor.as_ref(),
+                timing,
                 spin,
                 remaining,
             );
@@ -1048,10 +1102,14 @@ impl Hart {
     /// per round rather than once per instruction, which is why it is here
     /// rather than beside the other one.
     ///
-    /// It is a no-op on every board in this tree today, where `mtime` moves
-    /// only at round close and both ends of a budget read the same number. It
-    /// is written now because the change that lets `mtime` move inside a round
-    /// would otherwise land as a state-hash divergence with no obvious cause.
+    /// It is load-bearing on every board with a CLINT: `mtime` moves inside a
+    /// round wherever a hart's own access catches the block up, and the cache
+    /// would otherwise hold the cell as of a different guest instruction on
+    /// each engine. What a guest *reads* from `time` does not come from this
+    /// cache any more — [`attach_counter`](Hart::attach_counter) computes that
+    /// at the hart's own position when the instruction executes — so this
+    /// sample's only consumer is the snapshot, which is exactly what it is
+    /// for.
     pub fn run_budget(&self, ticks: u64) -> u64 {
         let owed = {
             let mut session = self.session.lock();
@@ -1124,7 +1182,7 @@ impl Hart {
     /// the reproduction.
     pub fn attach_cursor(&self, cursor: &TickCursor) {
         *self.exit.lock() = Some(cursor.exit_flag());
-        self.session.lock().cursor = Some(cursor.clone());
+        self.session.lock().timing.cursor = Some(cursor.clone());
     }
 
     /// Accesses owed to the next budget — see [`run_budget`](Hart::run_budget).
@@ -1645,7 +1703,10 @@ impl crate::machine::Instance for Hart {
         // whatever `set_time` last left, which is what a machine with no timer
         // at all wants.
         if let Some(path) = &self.timer {
-            self.attach_time(ctx.export_cell(path, ExportId::TIMEBASE)?);
+            match ctx.export(path, ExportId::TIMEBASE)?.counter() {
+                Some(counter) => self.attach_counter(Arc::clone(counter)),
+                None => self.attach_time(ctx.export_cell(path, ExportId::TIMEBASE)?),
+            }
         }
         Ok(())
     }
