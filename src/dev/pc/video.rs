@@ -29,21 +29,28 @@
 //! **No emulator source was consulted for any of it** (`CLAUDE.md`,
 //! provenance). The font below is original — see `FONT_ASCII`.
 //!
-//! # Scope: text mode, deliberately
+//! # Two models, and which one a board picks
 //!
-//! This models **an 80x25 colour text mode** and nothing else: enough to watch
-//! firmware talk and to use a DOS prompt. There is no graphics mode, no planar
-//! memory, no latch/ALU path through the graphics controller, no CPU-visible
-//! DAC-driven pixel pipeline. A mode nothing yet asks for would be untested
-//! code, and this file is expected to grow: the character generator, the CRTC
-//! timing and the scanout seam are all in place for a graphics mode to be added
-//! *with* the guest that exercises it.
+//! The `model` property picks the register file:
 //!
-//! The register files that exist but drive nothing yet — the sequencer, the
-//! graphics controller, most of the attribute controller — are modelled as
-//! honest latches, because firmware writes them all before it writes a single
-//! character and a device that faulted on any of them would never get as far as
-//! showing one.
+//! * **`6845`** (the default) is what this file always was: the MC6845's
+//!   eighteen registers with the VGA's colour path bolted on, **an 80x25
+//!   colour text mode and nothing else**, and a flat 32 KiB character buffer
+//!   mapped at 0xb8000. Enough to watch firmware talk and to use a DOS prompt,
+//!   and it is what a board that wants nothing more should keep: it is one
+//!   `RamStore` and no pipeline.
+//! * **`vga`** is the adapter proper — the VGA's own twenty-five CRT
+//!   controller registers, four 64 KiB planes behind the A0000 window with the
+//!   graphics controller's write modes, read modes and latches ([`vga`]), the
+//!   graphics modes those make ([`scan`]), and a **linear mode** behind
+//!   extension registers of our own (`docs/devices/pc-video.md`) that a VBE
+//!   firmware drives. `machines/pc-at.machine` and `machines/q35.machine` both
+//!   ask for it.
+//!
+//! The VGA model's text mode is the 6845 model's **pixel for pixel** — that is
+//! asserted, in `scan`'s tests — because every PC test in the tree looks at a
+//! text console and none of them should have to know which register file drew
+//! it.
 //!
 //! # The windows a machine file maps
 //!
@@ -52,7 +59,9 @@
 //!   status       1 byte    0x3da: display enable, vertical sync
 //!   mode         2 bytes   0x3d8 mode control, 0x3d9 colour select
 //!   vga         16 bytes   0x3c0-0x3cf: attribute, misc, sequencer, DAC, GC
-//!   vram        32 KiB     RAM, mapped at 0xb8000
+//!   vram        32 KiB     RAM at 0xb8000          — the 6845 model
+//!   window     128 KiB     display memory at 0xa0000 — the VGA model
+//!   lfb        vram-size   video memory, linear    — the VGA model, for a BAR
 //! ```
 //!
 //! `crtc` answers at whichever pair the board decodes it at, because a board
@@ -93,6 +102,11 @@ use crate::host::display::{PixelFormat, Scanout, Surface, SurfaceInfo};
 use crate::machine::realize::Instance;
 use crate::machine::validate::ClassSchema;
 
+mod scan;
+mod vga;
+
+use vga::{CRTC_REGISTERS as VGA_CRTC_REGISTERS, EXT_BASE, EXT_REGISTERS, PLANAR_LEN};
+
 /// The class name a machine description writes.
 pub const CLASS_NAME: &str = "pc.video";
 
@@ -104,7 +118,13 @@ pub const CLASS_NAME: &str = "pc.video";
 /// `ram` instance, so 32 KiB of guest-writable memory went missing on restore.
 ///
 /// [`Machine::save`]: crate::machine::Machine::save
-const STATE_VERSION: u32 = 2;
+///
+/// v3 added the VGA model: the CRT controller's file grew to the VGA's
+/// twenty-five registers, and the latches, the extension registers and the
+/// model itself are recorded. The character buffer is the whole of video
+/// memory now — 32 KiB for the 6845 model, the planes and everything a linear
+/// mode reaches for the VGA one.
+const STATE_VERSION: u32 = 3;
 
 /// The CRTC's address and data registers: two bytes.
 pub const CRTC_WINDOW_LEN: u64 = 2;
@@ -120,6 +140,46 @@ pub const VGA_WINDOW_LEN: u64 = 16;
 
 /// The character buffer: 32 KiB, which is the colour adapter's four text pages.
 pub const VRAM_LEN: u64 = 32 * 1024;
+
+/// The VGA's legacy memory window: 128 KiB, mapped at A0000-BFFFF, of which
+/// the graphics controller's memory map select decodes some or all.
+pub const WINDOW_LEN: u64 = 128 * 1024;
+
+/// How much video memory the VGA model has unless `vram-size` says otherwise:
+/// enough for 1024x768 at 32 bits a pixel, which is the largest mode rsemu's
+/// own VBE firmware offers.
+pub const DEFAULT_VGA_VRAM: u64 = 4 * 1024 * 1024;
+
+/// The most video memory the VGA model will allocate: what the display
+/// adapter's 16 MiB linear-framebuffer BAR can show.
+pub const MAX_VGA_VRAM: u64 = 16 * 1024 * 1024;
+
+/// Which adapter this is.
+///
+/// A real enum rather than an extensible constant set, because each arm is a
+/// whole register-file interpretation and a `match` that forgot one would be a
+/// device that scans out nonsense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Model {
+    /// The MC6845 register file with the VGA's colour path bolted on: text
+    /// mode only, a flat 32 KiB character buffer. What `pc.video` always was,
+    /// and still the default.
+    Mc6845,
+    /// The VGA: its own twenty-five-register CRT controller, four planes behind
+    /// the A0000 window, graphics modes, and the linear mode rsemu's VBE
+    /// firmware drives.
+    Vga,
+}
+
+impl Model {
+    /// The byte a snapshot records it as.
+    fn code(self) -> u8 {
+        match self {
+            Model::Mc6845 => 0,
+            Model::Vga => 1,
+        }
+    }
+}
 
 /// How many registers an MC6845 has.
 const CRTC_REGISTERS: usize = 18;
@@ -1015,8 +1075,46 @@ struct Vga {
 
 impl Vga {
     /// The state firmware would leave behind after setting an 80x25 colour text
-    /// mode, for the same reason [`CRTC_DEFAULTS`] exists.
-    fn new() -> Vga {
+    /// mode on `model`, for the same reason [`CRTC_DEFAULTS`] exists.
+    fn new(model: Model) -> Vga {
+        match model {
+            Model::Mc6845 => Vga::new_6845(),
+            Model::Vga => Vga::new_vga(),
+        }
+    }
+
+    /// IBM's mode 03h, EGA palette and all ([`vga::MODE3_ATTR`]). The sixteen
+    /// text colours come out the same as [`Vga::new_6845`]'s, by a different
+    /// route: palette register 6 is `0x14` and DAC entry `0x14` is brown.
+    fn new_vga() -> Vga {
+        let mut dac = [[0u8; 3]; DAC_ENTRIES];
+        for (i, entry) in dac.iter_mut().enumerate().take(64) {
+            *entry = vga::ega_dac(i as u8);
+        }
+        let mut attr = [0u8; ATTR_REGISTERS];
+        attr.copy_from_slice(&vga::MODE3_ATTR);
+        Vga {
+            misc: vga::MODE3_MISC,
+            enable: 0x01,
+            attr_index: 0x20,
+            attr_data_next: false,
+            attr,
+            seq_index: 0,
+            seq: vga::MODE3_SEQ,
+            gc_index: 0,
+            gc: vga::MODE3_GC,
+            dac_mask: 0xff,
+            dac_read: 0,
+            dac_write: 0,
+            dac_read_sub: 0,
+            dac_write_sub: 0,
+            dac_reading: false,
+            dac,
+        }
+    }
+
+    /// What the 6845 model has always come up in.
+    fn new_6845() -> Vga {
         let mut attr = [0u8; ATTR_REGISTERS];
         // The palette registers default to the identity, so an attribute's
         // colour number is a DAC index until firmware says otherwise.
@@ -1065,6 +1163,9 @@ impl Vga {
 /// Everything the guest can see or change.
 #[derive(Debug, Clone)]
 struct State {
+    /// Which register file this is. Configuration, not guest state: it comes
+    /// from the `model` property and a snapshot only checks it.
+    model: Model,
     /// Character clocks simulated. The authoritative copy; the atomic mirrors
     /// it for the scheduler's lock-free question.
     ticks: u64,
@@ -1075,27 +1176,44 @@ struct State {
     frames: u64,
     /// The CRTC's address register.
     crtc_index: u8,
-    crtc: [u8; CRTC_REGISTERS],
+    /// The CRT controller's registers. The 6845 model uses the first
+    /// [`CRTC_REGISTERS`]; the VGA model all [`VGA_CRTC_REGISTERS`].
+    crtc: [u8; VGA_CRTC_REGISTERS],
     /// The CGA mode control register at 0x3d8.
     mode: u8,
     /// The CGA colour select register at 0x3d9.
     colour: u8,
     vga: Vga,
+    /// The graphics controller's four latches, one byte a plane: loaded by
+    /// every processor read of video memory, and the second operand of every
+    /// write (FreeVGA, *Reading from Display Memory*). The VGA model only.
+    latch: [u8; 4],
+    /// rsemu's extension registers, `SR E0h`-`EFh` (see [`vga::EXT_BASE`]).
+    /// The VGA model only.
+    ext: [u8; EXT_REGISTERS],
 }
 
 impl State {
-    fn new() -> State {
+    fn new(model: Model) -> State {
+        let mut crtc = [0u8; VGA_CRTC_REGISTERS];
+        match model {
+            Model::Mc6845 => crtc[..CRTC_REGISTERS].copy_from_slice(&CRTC_DEFAULTS),
+            Model::Vga => crtc = vga::MODE3_CRTC,
+        }
         State {
+            model,
             ticks: 0,
             frame_start: 0,
             frames: 0,
             crtc_index: 0,
-            crtc: CRTC_DEFAULTS,
+            crtc,
             // Bit 0 (80 columns), bit 3 (video on) and bit 5 (blink), which is
             // what the BIOS writes at 0x3d8 for an 80x25 colour text mode.
             mode: 0x29,
             colour: 0x00,
-            vga: Vga::new(),
+            vga: Vga::new(model),
+            latch: [0; 4],
+            ext: [0; EXT_REGISTERS],
         }
     }
 
@@ -1109,24 +1227,113 @@ impl State {
         u64::from(self.crtc[0]) + 1
     }
 
-    /// Scan lines in one frame: whole character rows plus R5's adjust.
+    /// Scan lines in one frame.
+    ///
+    /// The 6845 counts whole character rows plus R5's adjust. The VGA counts
+    /// scan lines directly in a ten-bit vertical total split across registers
+    /// 06h and 07h, which holds the total less two — 449 for mode 03h, 525 for
+    /// mode 12h (FreeVGA, *Vertical Total Register* and *Overflow Register*).
     fn lines_per_frame(&self) -> u64 {
-        (u64::from(self.crtc[4] & 0x7f) + 1) * self.cell_height() + u64::from(self.crtc[5] & 0x1f)
+        match self.model {
+            Model::Mc6845 => {
+                (u64::from(self.crtc[4] & 0x7f) + 1) * self.cell_height()
+                    + u64::from(self.crtc[5] & 0x1f)
+            }
+            Model::Vga => self.vga_ten_bits(6, 0, 5) + 2,
+        }
+    }
+
+    /// A VGA vertical count: eight bits in `low`, bit 8 and bit 9 in the
+    /// overflow register's bits `bit8` and `bit9`.
+    fn vga_ten_bits(&self, low: usize, bit8: u8, bit9: u8) -> u64 {
+        let overflow = self.crtc[7];
+        u64::from(self.crtc[low])
+            | (u64::from((overflow >> bit8) & 1) << 8)
+            | (u64::from((overflow >> bit9) & 1) << 9)
+    }
+
+    /// Whether the sequencer halves the dot clock (clocking mode bit 3), which
+    /// makes every character clock last two ticks. FreeVGA, *Clocking Mode
+    /// Register*: "the dot clock divided by 2 is used for 320 and 360
+    /// horizontal PEL modes". The VGA model only.
+    fn clock_halved(&self) -> bool {
+        self.model == Model::Vga && self.vga.seq[1] & 0x08 != 0
+    }
+
+    /// Ticks in one scan line.
+    ///
+    /// The device's tick is the character clock of the 28.322 MHz crystal and
+    /// a nine-dot cell: that is its clock domain's rate in every board file.
+    /// A VGA mode on the other crystal with an eight-dot cell — every graphics
+    /// mode — runs a character clock 25.175 / 8 = 3.146875 MHz against the
+    /// domain's 28.322 / 9 = 3.146889 MHz: the same line rate to 4.5 parts per
+    /// million, which is why IBM chose the two crystals. So a line is the
+    /// horizontal total in ticks, doubled when the sequencer halves the dot
+    /// clock, and the 4.5 ppm is the one approximation in the timing.
+    fn line_ticks(&self) -> u64 {
+        match self.model {
+            Model::Mc6845 => self.chars_per_line(),
+            Model::Vga => {
+                // Register 00h holds the total less five.
+                let chars = u64::from(self.crtc[0]) + 5;
+                if self.clock_halved() {
+                    chars * 2
+                } else {
+                    chars
+                }
+            }
+        }
     }
 
     /// Character clocks in one frame — the period everything below is modulo.
     fn ticks_per_frame(&self) -> u64 {
-        self.chars_per_line() * self.lines_per_frame()
+        self.line_ticks() * self.lines_per_frame()
     }
 
-    /// Displayed character columns (R1).
+    /// Displayed character columns: R1 on the 6845, register 01h plus one on
+    /// the VGA ("horizontal display end" counts from zero).
     fn columns(&self) -> u64 {
-        u64::from(self.crtc[1])
+        match self.model {
+            Model::Mc6845 => u64::from(self.crtc[1]),
+            Model::Vga => u64::from(self.crtc[1]) + 1,
+        }
     }
 
-    /// Displayed character rows (R6).
+    /// Ticks of a line that are displayed.
+    fn display_ticks(&self) -> u64 {
+        if self.clock_halved() {
+            self.columns() * 2
+        } else {
+            self.columns()
+        }
+    }
+
+    /// Displayed character rows (R6), on the 6845. On the VGA, the displayed
+    /// lines over the cell height, which is what a text mode shows.
     fn rows(&self) -> u64 {
-        u64::from(self.crtc[6] & 0x7f)
+        match self.model {
+            Model::Mc6845 => u64::from(self.crtc[6] & 0x7f),
+            Model::Vga => self.display_lines() / self.cell_height(),
+        }
+    }
+
+    /// Displayed scan lines. The VGA's vertical display end is the line
+    /// *after* the last displayed one (FreeVGA, *Vertical Display End
+    /// Register*), so it is the count.
+    fn display_lines(&self) -> u64 {
+        match self.model {
+            Model::Mc6845 => self.rows() * self.cell_height(),
+            Model::Vga => self.vga_ten_bits(0x12, 1, 6) + 1,
+        }
+    }
+
+    /// The scan line the split screen starts on: ten bits across registers
+    /// 18h, 07h bit 4 and 09h bit 6 (FreeVGA, *Line Compare Register*). The
+    /// VGA model only.
+    fn line_compare(&self) -> u64 {
+        u64::from(self.crtc[0x18])
+            | (u64::from((self.crtc[7] >> 4) & 1) << 8)
+            | (u64::from((self.crtc[9] >> 6) & 1) << 9)
     }
 
     /// The first scan line of the vertical sync pulse (R7, in character rows).
@@ -1134,14 +1341,51 @@ impl State {
         u64::from(self.crtc[7] & 0x7f) * self.cell_height()
     }
 
-    /// The 14-bit refresh address the top left character comes from (R12/R13).
-    fn start_address(&self) -> u64 {
-        (u64::from(self.crtc[12] & 0x3f) << 8) | u64::from(self.crtc[13])
+    /// The vertical sync pulse as a tick range within the frame.
+    ///
+    /// The 6845's is sixteen lines from R7's row. The VGA's starts at the
+    /// ten-bit vertical retrace start and ends on the first line whose low four
+    /// bits equal register 11h's (FreeVGA, *Vertical Retrace End Register*),
+    /// so one to sixteen lines long.
+    fn vsync_window(&self) -> (u64, u64) {
+        let per = self.ticks_per_frame();
+        let line = self.line_ticks();
+        match self.model {
+            Model::Mc6845 => {
+                let start = (self.vsync_start_line() * line).min(per);
+                let end = (start + VSYNC_LINES * line).min(per);
+                (start, end)
+            }
+            Model::Vga => {
+                let first = self.vga_ten_bits(0x10, 2, 7);
+                let width = match (u64::from(self.crtc[0x11]) & 0x0f).wrapping_sub(first) & 0x0f {
+                    0 => 16,
+                    n => n,
+                };
+                let start = (first * line).min(per);
+                let end = ((first + width) * line).min(per);
+                (start, end)
+            }
+        }
     }
 
-    /// The 14-bit address the cursor sits on (R14/R15).
+    /// The refresh address the top left character comes from: 14 bits across
+    /// R12/R13 on the 6845, 16 across 0Ch/0Dh on the VGA.
+    fn start_address(&self) -> u64 {
+        let high = match self.model {
+            Model::Mc6845 => self.crtc[12] & 0x3f,
+            Model::Vga => self.crtc[12],
+        };
+        (u64::from(high) << 8) | u64::from(self.crtc[13])
+    }
+
+    /// The address the cursor sits on (R14/R15), 14 or 16 bits likewise.
     fn cursor_address(&self) -> u64 {
-        (u64::from(self.crtc[14] & 0x3f) << 8) | u64::from(self.crtc[15])
+        let high = match self.model {
+            Model::Mc6845 => self.crtc[14] & 0x3f,
+            Model::Vga => self.crtc[14],
+        };
+        (u64::from(high) << 8) | u64::from(self.crtc[15])
     }
 
     /// How many dots wide a character cell is.
@@ -1182,9 +1426,7 @@ impl State {
         if per == 0 {
             return false;
         }
-        let chars = self.chars_per_line();
-        let start = (self.vsync_start_line() * chars).min(per);
-        let end = (start + VSYNC_LINES * chars).min(per);
+        let (start, end) = self.vsync_window();
         let pos = self.position();
         pos >= start && pos < end
     }
@@ -1202,12 +1444,12 @@ impl State {
             // and pretending otherwise would hide that.
             return 0;
         }
-        let chars = self.chars_per_line();
+        let chars = self.line_ticks();
         let pos = self.position();
         let line = pos / chars;
         let column = pos % chars;
         let mut value = 0;
-        if column >= self.columns() || line >= self.rows() * self.cell_height() {
+        if column >= self.display_ticks() || line >= self.display_lines() {
             value |= STATUS_DISPLAY_ENABLE;
         }
         if self.in_vsync() {
@@ -1226,9 +1468,7 @@ impl State {
         if per == 0 {
             return NO_EVENT;
         }
-        let chars = self.chars_per_line();
-        let start = (self.vsync_start_line() * chars).min(per);
-        let end = (start + VSYNC_LINES * chars).min(per);
+        let (start, end) = self.vsync_window();
         let pos = self.position();
         for candidate in [start, end, per] {
             if candidate > pos {
@@ -1261,8 +1501,11 @@ impl State {
     /// CGA mode register's bit 3, the sequencer's screen-off bit, and the
     /// attribute controller's palette address source — which is clear exactly
     /// while the palette is being programmed.
+    ///
+    /// A VGA has no CGA mode register — 0x3d8 is not one of its ports — so the
+    /// VGA model listens to the other two only.
     fn video_enabled(&self) -> bool {
-        self.mode & MODE_VIDEO_ENABLE != 0
+        (self.model == Model::Vga || self.mode & MODE_VIDEO_ENABLE != 0)
             && self.vga.seq[1] & 0x20 == 0
             && self.vga.attr_index & 0x20 != 0
     }
@@ -1273,7 +1516,8 @@ impl State {
     /// programs the adapter as a CGA, and the attribute controller's mode
     /// control bit 3 for firmware that only touches the VGA side.
     fn blink_enabled(&self) -> bool {
-        self.mode & MODE_BLINK != 0 || self.vga.attr[16] & 0x08 != 0
+        (self.model == Model::Mc6845 && self.mode & MODE_BLINK != 0)
+            || self.vga.attr[16] & 0x08 != 0
     }
 
     /// An attribute's colour number, through the attribute controller's palette
@@ -1470,6 +1714,16 @@ impl Port {
                 // CRTC index reads back, and firmware saves and restores it, so
                 // the latch is returned rather than open bus.
                 0 => state.crtc_index,
+                _ if state.model == Model::Vga => {
+                    // Every VGA CRT controller register reads back (FreeVGA,
+                    // *CRT Controller Registers*); an index past 18h is not a
+                    // register and reads as zero.
+                    state
+                        .crtc
+                        .get(usize::from(state.crtc_index))
+                        .copied()
+                        .unwrap_or(0)
+                }
                 _ => {
                     let index = (state.crtc_index & 0x1f) as usize;
                     // R0-R11 are write-only; R12-R17 read. R16/R17 are the
@@ -1497,12 +1751,12 @@ impl Port {
                 0 => state.mode,
                 _ => state.colour,
             },
-            Window::Vga => Self::read_vga(&mut state, offset, debug),
+            Window::Vga => Self::read_vga(&mut state, offset, debug, self.shared.vram.len()),
         }
     }
 
     /// The VGA register file's read side.
-    fn read_vga(state: &mut State, offset: u64, debug: bool) -> u8 {
+    fn read_vga(state: &mut State, offset: u64, debug: bool, vram_len: u64) -> u8 {
         match offset & 0x0f {
             // The attribute controller's index, palette address source and all.
             0x0 => state.vga.attr_index,
@@ -1524,6 +1778,8 @@ impl Port {
                 let index = state.vga.seq_index as usize;
                 if index < SEQ_REGISTERS {
                     state.vga.seq[index]
+                } else if state.model == Model::Vga && state.vga.seq_index >= EXT_BASE {
+                    state.ext_read(index - usize::from(EXT_BASE), vram_len)
                 } else {
                     0
                 }
@@ -1576,7 +1832,23 @@ impl Port {
         }
         match self.window {
             Window::Crtc | Window::CrtcColour | Window::CrtcMono => match offset & 1 {
+                0 if state.model == Model::Vga => state.crtc_index = value,
                 0 => state.crtc_index = value & 0x1f,
+                _ if state.model == Model::Vga => {
+                    let index = usize::from(state.crtc_index);
+                    if index < VGA_CRTC_REGISTERS {
+                        // Register 11h bit 7 write-protects 00h-07h, except
+                        // the line compare's bit 8 in 07h bit 4 (FreeVGA,
+                        // *Vertical Retrace End Register*).
+                        let protect = state.crtc[0x11] & 0x80 != 0;
+                        state.crtc[index] = match index {
+                            0..=6 if protect => state.crtc[index],
+                            7 if protect => (state.crtc[7] & !0x10) | (value & 0x10),
+                            _ => value,
+                        };
+                        self.shared.touched(&mut state);
+                    }
+                }
                 _ => {
                     let index = (state.crtc_index & 0x1f) as usize;
                     if index < CRTC_REGISTERS {
@@ -1618,11 +1890,17 @@ impl Port {
             0x1 => {}
             0x2 => state.vga.misc = value,
             0x3 => state.vga.enable = value & 0x01,
+            // The VGA model decodes the whole index byte, because rsemu's
+            // extension registers live at E0h-EFh; the 6845 model keeps the
+            // three bits it always had.
+            0x4 if state.model == Model::Vga => state.vga.seq_index = value,
             0x4 => state.vga.seq_index = value & 0x07,
             0x5 => {
                 let index = state.vga.seq_index as usize;
                 if index < SEQ_REGISTERS {
                     state.vga.seq[index] = value;
+                } else if state.model == Model::Vga && state.vga.seq_index >= EXT_BASE {
+                    state.ext_write(index - usize::from(EXT_BASE), value);
                 }
             }
             0x6 => state.vga.dac_mask = value,
@@ -1733,6 +2011,133 @@ impl MemOps for Port {
     }
 }
 
+/// The VGA model's A0000-BFFFF window: display memory as the processor sees
+/// it, through the graphics controller.
+///
+/// Not a RAM region, because nothing about it is RAM-like: which bytes an
+/// address reaches depends on four registers, a read changes state (the
+/// latches), and a write combines the data with that state. [`vga`] has the
+/// rules; this is the bus face.
+#[derive(Debug)]
+struct VramWindow {
+    shared: Arc<Shared>,
+}
+
+/// The size of one bank of the linear mode's A0000 window.
+const BANK_LEN: u64 = 64 * 1024;
+
+impl VramWindow {
+    /// The byte of video memory the linear mode's banked window shows at
+    /// window offset `offset`, or `None` past the 64 KiB bank or past the end
+    /// of memory.
+    #[inline]
+    fn banked(&self, state: &State, offset: u64) -> Option<u64> {
+        if offset >= BANK_LEN {
+            return None;
+        }
+        let at = u64::from(state.ext[vga::EXT_BANK]) * BANK_LEN + offset;
+        (at < self.shared.vram.len()).then_some(at)
+    }
+
+    /// Where `offset` falls in the map the graphics controller decodes: the
+    /// map-relative address and whether the map is the 128 KiB one. `None`
+    /// when this part of the window is not decoded, or when the
+    /// miscellaneous output's RAM enable bit (bit 1) has display memory
+    /// switched off — both of which leave the bus to whatever else answers,
+    /// and on a PC nothing does.
+    #[inline]
+    fn decode(state: &State, offset: u64) -> Option<(u64, bool)> {
+        if state.vga.misc & 0x02 == 0 {
+            return None;
+        }
+        let (first, len) = vga::map_range(state.vga.gc[6]);
+        (offset >= first && offset < first + len).then(|| (offset - first, len == WINDOW_LEN))
+    }
+
+    /// One byte, read. `debug` reads without loading the latches — a debugger
+    /// that looked at the screen must not change what the guest's next write
+    /// combines with (`ROADMAP.md` §15, invariant 5).
+    fn read_byte(&self, state: &mut State, offset: u64, debug: bool) -> u8 {
+        let vram = &self.shared.vram;
+        if state.linear_enabled() {
+            return self
+                .banked(state, offset)
+                .and_then(|at| vram.read_u8(at).ok())
+                .unwrap_or(0xff);
+        }
+        let Some((a, map_128k)) = Self::decode(state, offset) else {
+            return 0xff;
+        };
+        let (plane_offset, plane) = state.pipeline_read(a, map_128k);
+        let mut planes = [0u8; 4];
+        let _ = vram.read_at(plane_offset * 4, &mut planes);
+        if !debug {
+            state.latch = planes;
+        }
+        if state.vga.gc[5] & 0x08 == 0 {
+            planes[plane]
+        } else {
+            state.colour_compare(planes)
+        }
+    }
+
+    /// One byte, written through the pipeline.
+    fn write_byte(&self, state: &State, offset: u64, value: u8) {
+        let vram = &self.shared.vram;
+        if state.linear_enabled() {
+            if let Some(at) = self.banked(state, offset) {
+                let _ = vram.write_u8(at, value);
+            }
+            return;
+        }
+        let Some((a, map_128k)) = Self::decode(state, offset) else {
+            return;
+        };
+        let (plane_offset, planes, bytes) = state.pipeline_write(a, value, map_128k);
+        for (p, byte) in bytes.iter().enumerate() {
+            if planes & (1 << p) != 0 {
+                let _ = vram.write_u8(plane_offset * 4 + p as u64, *byte);
+            }
+        }
+    }
+}
+
+impl MemOps for VramWindow {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        if offset.saturating_add(dst.len() as u64) > WINDOW_LEN {
+            return Err(BusError::BadAccess);
+        }
+        // One lock for the whole access: a sixteen-bit read is two byte cycles
+        // on the VGA's bus, each loading the latches, and the second one's
+        // load is what a following write sees.
+        let mut state = self.shared.state.lock();
+        for (i, byte) in dst.iter_mut().enumerate() {
+            *byte = self.read_byte(&mut state, offset + i as u64, attrs.debug);
+        }
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, src: &[u8], _attrs: MemAttrs) -> MemResult {
+        if offset.saturating_add(src.len() as u64) > WINDOW_LEN {
+            return Err(BusError::BadAccess);
+        }
+        // A debug write goes through the pipeline like any other: it changes
+        // video memory, which is what it was asked to do, and nothing else —
+        // a write never loads the latches.
+        let state = self.shared.state.lock();
+        for (i, value) in src.iter().enumerate() {
+            self.write_byte(&state, offset + i as u64, *value);
+        }
+        Ok(())
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        // Memory: any width, any alignment, and bursts — a `REP MOVSD` into
+        // the text page is what a DOS program's screen update is.
+        AccessConstraints::ANY
+    }
+}
+
 /// An MC6845-derived CRTC with a character generator and a VGA register file.
 #[derive(Debug)]
 pub struct Video {
@@ -1743,7 +2148,13 @@ pub struct Video {
     status: RegionRef,
     mode: RegionRef,
     vga: RegionRef,
-    vram: RegionRef,
+    /// The 6845 model's flat character buffer.
+    vram: Option<RegionRef>,
+    /// The VGA model's A0000 window.
+    window: Option<RegionRef>,
+    /// The VGA model's whole video memory as plain RAM: the linear
+    /// framebuffer a display adapter's BAR decodes.
+    lfb: Option<RegionRef>,
 }
 
 /// The whole of a store, as bytes a chunk can carry.
@@ -1767,8 +2178,27 @@ impl Video {
     pub fn new(props: &Props) -> Result<Video> {
         let mut r = props.reader();
         let dot_clock = r.or_range("dot-clock", 0, 0..=1_000_000_000)?;
+        let model = r.or_enum("model", "6845", &["6845", "vga"])?;
+        // Zero is "not given": no video memory is zero bytes long.
+        let vram_size = r.or_size("vram-size", 0)?;
         r.finish()?;
-        Ok(Video::with_dot_clock(dot_clock))
+        match (model, vram_size) {
+            ("vga", size) => {
+                let size = if size == 0 { DEFAULT_VGA_VRAM } else { size };
+                if !(PLANAR_LEN..=MAX_VGA_VRAM).contains(&size) || size % PLANAR_LEN != 0 {
+                    return Err(Error::Property(alloc::format!(
+                        "property `vram-size`: a VGA has at least its four 64 KiB planes and \
+                         at most {MAX_VGA_VRAM} bytes, in whole 256 KiB steps; {size} is not that"
+                    )));
+                }
+                Ok(Video::vga(size, dot_clock))
+            }
+            (_, 1..) => Err(Error::Property(String::from(
+                "property `vram-size`: the 6845 model's character buffer is 32 KiB and not \
+                 configurable; `vram-size` belongs with `model = \"vga\"`",
+            ))),
+            _ => Ok(Video::with_dot_clock(dot_clock)),
+        }
     }
 
     /// One with default properties.
@@ -1777,13 +2207,26 @@ impl Video {
         Video::with_dot_clock(0)
     }
 
-    /// One whose pixel clock is `dot_clock_hz` rather than whichever crystal
-    /// the miscellaneous output selects. `0` follows the register.
+    /// The 6845 model, whose pixel clock is `dot_clock_hz` rather than
+    /// whichever crystal the miscellaneous output selects. `0` follows the
+    /// register.
     #[must_use]
     pub fn with_dot_clock(dot_clock_hz: u64) -> Video {
+        Video::build(Model::Mc6845, VRAM_LEN, dot_clock_hz)
+    }
+
+    /// The VGA model, with `vram_len` bytes of video memory — a whole number
+    /// of 256 KiB, as [`Video::new`] checks — on a board whose clock domain is
+    /// `dot_clock_hz` over nine (`0`: the 28.322 MHz crystal).
+    #[must_use]
+    pub fn vga(vram_len: u64, dot_clock_hz: u64) -> Video {
+        Video::build(Model::Vga, vram_len, dot_clock_hz)
+    }
+
+    fn build(model: Model, vram_len: u64, dot_clock_hz: u64) -> Video {
         let shared = Arc::new(Shared {
-            state: Mutex::with_rank(LockRank::DEVICE, State::new()),
-            vram: Arc::new(RamStore::new(VRAM_LEN)),
+            state: Mutex::with_rank(LockRank::DEVICE, State::new(model)),
+            vram: Arc::new(RamStore::new(vram_len)),
             ticks: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             next_event: AtomicU64::new(NO_EVENT),
@@ -1803,7 +2246,24 @@ impl Video {
                 }) as Arc<dyn MemOps>,
             ))
         };
-        let vram = Arc::new(Region::ram("pc.video.vram", Arc::clone(&shared.vram)));
+        let (vram, window, lfb) = match model {
+            Model::Mc6845 => (
+                Some(Arc::new(Region::ram("pc.video.vram", Arc::clone(&shared.vram))) as RegionRef),
+                None,
+                None,
+            ),
+            Model::Vga => (
+                None,
+                Some(Arc::new(Region::io(
+                    "pc.video.window",
+                    WINDOW_LEN,
+                    Arc::new(VramWindow {
+                        shared: Arc::clone(&shared),
+                    }) as Arc<dyn MemOps>,
+                )) as RegionRef),
+                Some(Arc::new(Region::ram("pc.video.lfb", Arc::clone(&shared.vram))) as RegionRef),
+            ),
+        };
         Video {
             crtc: port(Window::Crtc, CRTC_WINDOW_LEN),
             crtc_colour: port(Window::CrtcColour, CRTC_WINDOW_LEN),
@@ -1812,15 +2272,25 @@ impl Video {
             mode: port(Window::Mode, MODE_WINDOW_LEN),
             vga: port(Window::Vga, VGA_WINDOW_LEN),
             vram,
+            window,
+            lfb,
             shared,
         }
     }
 
-    /// The character buffer, for a host or a test that wants to write into it
-    /// without going through a bus.
+    /// Video memory, for a host or a test that wants to reach it without going
+    /// through a bus: the flat character buffer on the 6845 model, and on the
+    /// VGA model the whole of display memory, planes interleaved (plane `p`'s
+    /// byte `o` at `o × 4 + p`) and linear beyond them.
     #[must_use]
     pub fn vram(&self) -> &Arc<RamStore> {
         &self.shared.vram
+    }
+
+    /// Whether this is the VGA model.
+    #[must_use]
+    pub fn is_vga(&self) -> bool {
+        self.shared.state.lock().model == Model::Vga
     }
 
     /// A [`Scanout`] over this device, for a host that holds the concrete
@@ -1867,13 +2337,29 @@ impl Video {
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "MC6845 CRTC with a text-mode character generator and a VGA register file",
-    properties: &[PropertySpec {
-        name: "dot-clock",
-        kind: ValueKind::Uint,
-        required: false,
-        summary: "the pixel clock in Hz, overriding the clock select bits (default: follow them)",
-    }],
+    summary: "a PC display adapter: an MC6845 text CRTC, or a VGA with planar memory, graphics \
+              modes and a linear mode",
+    properties: &[
+        PropertySpec {
+            name: "dot-clock",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "the 6845 model's pixel clock in Hz, overriding the clock select bits; the \
+                      VGA model's clock domain is this crystal over nine (default: 28.322 MHz)",
+        },
+        PropertySpec {
+            name: "model",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "`6845` (text only, the default) or `vga`",
+        },
+        PropertySpec {
+            name: "vram-size",
+            kind: ValueKind::Size,
+            required: false,
+            summary: "the VGA model's video memory in bytes, 256 KiB to 16 MiB (default 4 MiB)",
+        },
+    ],
     construct: |props| Ok(Box::new(Video::new(props)?)),
 };
 
@@ -1904,7 +2390,7 @@ impl Device for Video {
         let level = {
             let mut state = self.shared.state.lock();
             let tick = state.ticks;
-            *state = State::new();
+            *state = State::new(state.model);
             state.ticks = tick;
             state.frame_start = tick;
             self.shared.publish(&state);
@@ -1924,7 +2410,9 @@ impl Device for Video {
             "status" => &self.status,
             "mode" => &self.mode,
             "vga" => &self.vga,
-            "vram" => &self.vram,
+            "vram" => self.vram.as_ref()?,
+            "window" => self.window.as_ref()?,
+            "lfb" => self.lfb.as_ref()?,
             _ => return None,
         };
         Some(Arc::clone(region))
@@ -1977,6 +2465,7 @@ impl Device for Video {
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let state = self.shared.state.lock();
+        w.write_u8(state.model.code())?;
         w.write_u64(state.ticks)?;
         w.write_u64(state.frame_start)?;
         w.write_u64(state.frames)?;
@@ -2012,6 +2501,12 @@ impl Device for Video {
                 w.write_u8(component)?;
             }
         }
+        for byte in state.latch {
+            w.write_u8(byte)?;
+        }
+        for byte in state.ext {
+            w.write_u8(byte)?;
+        }
         // The character buffer. This *is* architectural state and it has to be
         // here: `Machine::save` walks devices, not regions, so the only RAM a
         // machine snapshots by itself is a `ram` device instance. This adapter's
@@ -2022,18 +2517,29 @@ impl Device for Video {
         // hash could see it, because it was absent from both sides.
         //
         // The rendered pixels stay out: those are derived from this buffer on
-        // every capture.
+        // every capture. On the VGA model this is all of video memory — the
+        // four planes and whatever a linear mode reached — which is the same
+        // argument at a larger size.
         w.write_bytes(&read_store(&self.shared.vram)?)?;
         Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        let mut state = State::new();
+        let model = self.shared.state.lock().model;
+        let recorded = r.read_u8()?;
+        if recorded != model.code() {
+            return Err(Error::State(alloc::format!(
+                "snapshot is of a `{CLASS_NAME}` with model code {recorded}, and this one is \
+                 {model:?} (code {}): the machine files disagree",
+                model.code()
+            )));
+        }
+        let mut state = State::new(model);
         state.ticks = r.read_u64()?;
         state.frame_start = r.read_u64()?;
         state.frames = r.read_u64()?;
         state.crtc_index = r.read_u8()?;
-        for i in 0..CRTC_REGISTERS {
+        for i in 0..VGA_CRTC_REGISTERS {
             state.crtc[i] = r.read_u8()?;
         }
         state.mode = r.read_u8()?;
@@ -2064,10 +2570,17 @@ impl Device for Video {
                 state.vga.dac[i][c] = r.read_u8()?;
             }
         }
+        for slot in &mut state.latch {
+            *slot = r.read_u8()?;
+        }
+        for slot in &mut state.ext {
+            *slot = r.read_u8()?;
+        }
         let vram = r.read_bytes()?;
-        if vram.len() as u64 != VRAM_LEN {
+        let len = self.shared.vram.len();
+        if vram.len() as u64 != len {
             return Err(Error::State(alloc::format!(
-                "snapshot has {} byte(s) of character buffer, this adapter has {VRAM_LEN}",
+                "snapshot has {} byte(s) of video memory, this adapter has {len}",
                 vram.len()
             )));
         }
@@ -2135,6 +2648,8 @@ pub fn schema() -> ClassSchema {
     use crate::machine::validate::{PortDir, PropSchema};
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("dot-clock", ValueKind::Uint).range(0, 1_000_000_000))
+        .prop(PropSchema::new("model", ValueKind::Str).values(&["6845", "vga"]))
+        .prop(PropSchema::new("vram-size", ValueKind::Size))
         .region("")
         .region("regs")
         .region("crtc")
@@ -2144,6 +2659,8 @@ pub fn schema() -> ClassSchema {
         .region("mode")
         .region("vga")
         .region("vram")
+        .region("window")
+        .region("lfb")
         .port("vsync", PortDir::Out)
 }
 
@@ -2184,11 +2701,53 @@ const CURSOR_BLINK_FRAMES: u64 = 8;
 /// rate.
 const TEXT_BLINK_FRAMES: u64 = 16;
 
+/// The register file at 0x3c0-0x3cf as a [`MemOps`], for a test in a child
+/// module that wants to program the adapter the way a guest does.
+#[cfg(test)]
+fn test_port(video: &Video) -> Port {
+    Port {
+        shared: Arc::clone(&video.shared),
+        window: Window::Vga,
+        len: VGA_WINDOW_LEN,
+    }
+}
+
+/// The status register at 0x3da, which a guest reads to put the attribute
+/// controller's flip-flop back in its index state.
+#[cfg(test)]
+fn test_status_port(video: &Video) -> Port {
+    Port {
+        shared: Arc::clone(&video.shared),
+        window: Window::Status,
+        len: STATUS_WINDOW_LEN,
+    }
+}
+
+/// The CRT controller's index and data pair, likewise.
+#[cfg(test)]
+fn test_crtc_port(video: &Video) -> Port {
+    Port {
+        shared: Arc::clone(&video.shared),
+        window: Window::Crtc,
+        len: CRTC_WINDOW_LEN,
+    }
+}
+
+/// The picture's shape, in host pixels, for whichever model this is.
+fn geometry(state: &State) -> (u32, u32) {
+    match state.model {
+        Model::Mc6845 => (
+            state.columns() as u32 * state.char_width(),
+            (state.rows() * state.cell_height()) as u32,
+        ),
+        Model::Vga => scan::geometry(state),
+    }
+}
+
 impl Scanout for VideoScanout {
     fn info(&self) -> SurfaceInfo {
         let state = self.shared.state.lock();
-        let width = state.columns() as u32 * state.char_width();
-        let height = (state.rows() * state.cell_height()) as u32;
+        let (width, height) = geometry(&state);
         SurfaceInfo::new(width, height, PixelFormat::RGBA8888)
     }
 
@@ -2199,17 +2758,36 @@ impl Scanout for VideoScanout {
     fn frame_period_ns(&self) -> u64 {
         let state = self.shared.state.lock();
         let per = state.ticks_per_frame();
-        let dot_hz = state.dot_clock_hz(self.shared.dot_clock_hz);
-        if per == 0 || dot_hz == 0 {
+        if per == 0 {
             return 0;
         }
-        // characters per frame x dots per character x 1e9 / dots per second.
-        // Exact integer arithmetic from the chip's own timing registers and its
-        // own clock — never a wall-clock measurement, never a float
-        // (`CLAUDE.md`, determinism).
-        per.saturating_mul(u64::from(state.char_width()))
-            .saturating_mul(1_000_000_000)
-            / dot_hz
+        match state.model {
+            Model::Mc6845 => {
+                let dot_hz = state.dot_clock_hz(self.shared.dot_clock_hz);
+                if dot_hz == 0 {
+                    return 0;
+                }
+                // characters per frame x dots per character x 1e9 / dots per
+                // second. Exact integer arithmetic from the chip's own timing
+                // registers and its own clock — never a wall-clock
+                // measurement, never a float (`CLAUDE.md`, determinism).
+                per.saturating_mul(u64::from(state.char_width()))
+                    .saturating_mul(1_000_000_000)
+                    / dot_hz
+            }
+            // The VGA model counts its frames in ticks of its clock domain,
+            // which every board files as the 28.322 MHz crystal over nine, so
+            // that is what a frame lasts in. `State::line_ticks` says why the
+            // mode's own crystal does not enter into it.
+            Model::Vga => {
+                let dot_hz = if self.shared.dot_clock_hz != 0 {
+                    self.shared.dot_clock_hz
+                } else {
+                    DOT_CLOCK_28MHZ
+                };
+                per.saturating_mul(9).saturating_mul(1_000_000_000) / dot_hz
+            }
+        }
     }
 
     fn capture(&self, dst: &mut Surface) -> u64 {
@@ -2218,13 +2796,18 @@ impl Scanout for VideoScanout {
         // painting. The buffer itself is read afterwards, cell by cell: it is a
         // `RamStore`, which is atomic per byte and needs no lock at all.
         let state = self.shared.state.lock().clone();
-        let width = state.columns() as u32 * state.char_width();
-        let height = (state.rows() * state.cell_height()) as u32;
+        let (width, height) = geometry(&state);
         dst.reshape(dst.format(), width, height);
         let serial = state.frames;
 
         if !state.video_enabled() {
             dst.fill([0, 0, 0]);
+            dst.set_serial(serial);
+            return serial;
+        }
+
+        if state.model == Model::Vga {
+            scan::capture(&state, &self.shared.vram, dst);
             dst.set_serial(serial);
             return serial;
         }
@@ -2848,6 +3431,130 @@ mod tests {
         assert_eq!(restored.vram().read_u8(0).unwrap(), b'r');
         assert_eq!(restored.vram().read_u8(1).unwrap(), 0x0f);
         assert_eq!(restored.vram().read_u8(VRAM_LEN - 1).unwrap(), 0xa5);
+    }
+
+    #[test]
+    fn a_vga_snapshot_carries_the_planes_the_latches_and_the_extension_file() {
+        // The VGA model's state is the 6845 model's plus three things a
+        // restore has to bring back: the four planes, the graphics
+        // controller's latches — which decide what the *next* write combines
+        // with — and the extension registers, which decide what is on the
+        // screen at all.
+        let image = |video: &Video| {
+            let mut shape = MachineShape::new();
+            shape.add_device("vga", CLASS.name).unwrap();
+            let mut w = StateWriter::new(shape);
+            {
+                let mut chunk = w.chunk("vga", CLASS.name, CLASS.version).unwrap();
+                video.save(&mut chunk).unwrap();
+            }
+            w.to_vec().unwrap()
+        };
+
+        let saved = Video::vga(PLANAR_LEN, 0);
+        {
+            let mut state = saved.shared.state.lock();
+            state.latch = [0xde, 0xad, 0xbe, 0xef];
+            state.ext[vga::EXT_LOCK] = 1;
+            state.ext[vga::EXT_WIDTH] = 0x80;
+            state.ext[vga::EXT_BPP] = 32;
+            state.ext[vga::EXT_CONTROL] = vga::EXT_CONTROL_LINEAR;
+        }
+        saved.vram().write_u8(0, b'V').unwrap();
+        saved.vram().write_u8(PLANAR_LEN - 1, 0xa5).unwrap();
+        crtc(&saved, 0x18, 0x5a);
+        saved.advance_to(9_999);
+
+        let bytes = image(&saved);
+        let restored = Video::vga(PLANAR_LEN, 0);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("vga", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        restored.load(&mut chunk.reader()).unwrap();
+        assert_eq!(image(&restored), bytes, "the two save images agree");
+        assert_eq!(restored.vram().read_u8(0).unwrap(), b'V');
+        assert_eq!(restored.vram().read_u8(PLANAR_LEN - 1).unwrap(), 0xa5);
+        {
+            let state = restored.shared.state.lock();
+            assert_eq!(state.latch, [0xde, 0xad, 0xbe, 0xef]);
+            assert_eq!(state.crtc[0x18], 0x5a);
+            assert!(state.linear_enabled());
+        }
+
+        // A snapshot of the other model does not load here: the register file
+        // it describes is a different one.
+        let other = device();
+        let mut shape = MachineShape::new();
+        shape.add_device("vga", CLASS.name).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("vga", CLASS.name, CLASS.version).unwrap();
+            other.save(&mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("vga", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        assert!(restored.load(&mut chunk.reader()).is_err());
+    }
+
+    #[test]
+    fn the_vga_model_comes_up_in_the_text_mode_and_the_other_one_does_not_know_it() {
+        let video = Video::vga(PLANAR_LEN, 0);
+        assert!(video.is_vga());
+        let scanout = video.scanout();
+        let info = scanout.info();
+        assert_eq!((info.width, info.height), (720, 400), "mode 03h");
+        // 100 character clocks by 449 lines, the 70 Hz timing every VGA comes
+        // up in, in ticks of the 28.322 MHz crystal over nine.
+        assert_eq!(
+            scanout.frame_period_ns(),
+            100 * 449 * 9 * 1_000_000_000 / DOT_CLOCK_28MHZ
+        );
+        assert_eq!(
+            video.region("window").expect("the A0000 window").len(),
+            WINDOW_LEN
+        );
+        assert_eq!(
+            video.region("lfb").expect("the linear aperture").len(),
+            PLANAR_LEN
+        );
+        assert!(video.region("vram").is_none(), "that is the 6845 model's");
+
+        // And the 6845 model has neither of the VGA's regions.
+        let old = device();
+        assert!(!old.is_vga());
+        assert!(old.region("window").is_none());
+        assert!(old.region("lfb").is_none());
+    }
+
+    #[test]
+    fn a_vga_model_property_set_is_checked() {
+        assert!(Video::new(&Props::new().with("model", "vga")).is_ok());
+        assert!(Video::new(&Props::new().with("model", "ega")).is_err());
+        assert!(
+            Video::new(
+                &Props::new()
+                    .with("model", "vga")
+                    .with("vram-size", 1024u64 * 1024)
+            )
+            .is_ok()
+        );
+        assert!(
+            Video::new(
+                &Props::new()
+                    .with("model", "vga")
+                    .with("vram-size", 1000u64 * 1000)
+            )
+            .is_err(),
+            "not a whole number of 256 KiB"
+        );
+        assert!(
+            Video::new(&Props::new().with("vram-size", 1024u64 * 1024)).is_err(),
+            "the 6845 model has a fixed 32 KiB character buffer"
+        );
     }
 
     #[test]
