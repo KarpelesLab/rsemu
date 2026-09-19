@@ -104,7 +104,10 @@ that the two cases are distinguishable.
 
 The **rate**. An accelerated guest's counter advances at `KVM_GET_TSC_KHZ`,
 roughly the host's; the emulated core's advances at four ticks per bus cycle
-plus the manual's execution figures. A guest that has calibrated its counter
+plus the manual's execution figures — and through a halt, which is not an
+exception to that rate but the reason it can be called one (*Intel SDM* volume
+3B §17.17.1, and `docs/techniques/execution-budgets.md` for what a stopped one
+cost a Linux guest). A guest that has calibrated its counter
 against a periodic timer — Linux does, against the PIT or the HPET — and is then
 restored under the other engine will find its calibration wrong, and will
 recalibrate or mark the clocksource unstable.

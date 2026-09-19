@@ -2600,7 +2600,7 @@ impl X86 {
         }
     }
 
-    /// Clock cycles executed since power-on.
+    /// Clock cycles elapsed since power-on — the time-stamp counter.
     ///
     /// Four per bus cycle plus the manual's internal execution figures. This
     /// is documented timing rather than measured timing: the bus interface
@@ -2608,6 +2608,13 @@ impl X86 {
     /// taken over a long run is an upper bound rather than the number a
     /// logic analyser would show. The module documentation says why that
     /// trade was made.
+    ///
+    /// *Elapsed*, not executed: a processor halted by `HLT`, waiting for a
+    /// Start-Up or held in INIT is charged the rest of its budget by
+    /// [`run_budget`](X86::run_budget), because the counter of the part this
+    /// core reports itself as "increments at a constant rate" whatever state
+    /// the processor is in (*Intel SDM* vol. 3B §17.17, and §17.17.1 for the
+    /// invariant TSC this core answers `CPUID.80000007H:EDX[8]` with).
     #[must_use]
     pub fn cycles(&self) -> u64 {
         self.session.lock().state.cycles
@@ -3005,8 +3012,11 @@ impl X86 {
     /// budget through `State::debt` — which keeps the core's cycle count exact
     /// while never letting its clock domain run ahead of the timeline.
     ///
-    /// A halted core, one that has shut down on a triple fault, or one with no
-    /// address space consumes only the debt it owed plus whatever it managed.
+    /// A halted core, one waiting for a Start-Up, one that has shut down on a
+    /// triple fault, or one with no address space consumes the whole budget —
+    /// it has to, or the scheduler never reaches the timer that would wake it
+    /// — and its **time-stamp counter is charged the part it did not execute**
+    /// (*Intel SDM* vol. 3B §17.17.1): one addition per round, never a spin.
     pub fn run_budget(&self, ticks: u64) -> u64 {
         let owed = {
             let mut session = self.session.lock();
@@ -3034,11 +3044,33 @@ impl X86 {
         while used < allowance {
             let n = self.advance(allowance - used);
             if n == 0 {
-                // Halted with nothing pending, shut down, or no address space.
-                // Either way retrying would spin — but the budget is still
-                // consumed, or the scheduler never advances past a `HLT`
-                // waiting for the timer that would wake it.
-                self.session.lock().state.debt = 0;
+                // Halted with nothing pending, waiting for a Start-Up, held in
+                // INIT, shut down, or no address space. Either way retrying
+                // would spin — but the budget is still consumed, or the
+                // scheduler never advances past a `HLT` waiting for the timer
+                // that would wake it.
+                //
+                // **And the time-stamp counter goes on counting through it.**
+                // `State::cycles` is what `RDTSC` reads, and the processor
+                // stands at the end of this budget whether it executed to it
+                // or waited for it, so the rest of the allowance is charged to
+                // the counter in one addition rather than one idle clock at a
+                // time: *Intel SDM* Vol 3B §17.17 gives this part's family (06H,
+                // model 0FH) a TSC that "increments at a constant rate", and
+                // §17.17.1 a TSC that "will run at a constant rate in all ACPI
+                // P-, C-. and T-states" — `HLT` is C1. Table 9-1 of Vol 3A has
+                // INIT leave the counter "unchanged", which is a counter that
+                // runs on through wait-for-SIPI rather than one frozen by it;
+                // a processor started half a second into a boot would
+                // otherwise read a TSC half a second behind its neighbour's.
+                //
+                // Nothing here is the *published* position: the scheduler's
+                // anchor still carries that, so a counter that a guest
+                // `WRMSR` or an accel hand-over moved counts on from wherever
+                // it was put, and the budget reported is `ticks` as before.
+                let mut session = self.session.lock();
+                session.state.debt = 0;
+                session.state.cycles = session.state.cycles.wrapping_add(allowance - used);
                 return ticks;
             }
             used += n;

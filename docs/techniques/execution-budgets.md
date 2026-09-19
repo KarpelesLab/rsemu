@@ -316,32 +316,142 @@ scheduler one first.
 
 The watchdog line in the `q35-linux` row is the read defect seen from inside: a
 TSC that counts every cycle, checked against an HPET that moved once per round,
-disagrees, and the kernel believes the HPET. `q35-linux-smp` still marks
-`tsc-early` unstable at 7.5 s, before and after alike, skewed by about 100 ms
-in 508 ms — which is not a round's worth of anything, and is the open defect
-below rather than this one.
+disagrees, and the kernel believes the HPET. `q35-linux-smp` still marked
+`tsc-early` unstable at 7.5 s after both changes, skewed by about 100 ms in
+508 ms — which is not a round's worth of anything, and was a different defect:
+the halted counter the section below is about, now fixed.
 
-## Open: a halted processor's time-stamp counter stops
+## A halted processor's time-stamp counter counts the halt
 
 `X86::run_budget` consumes its whole budget when `HLT` has stopped the core —
-it must, or the scheduler never reaches the timer that would wake it — but it
-charges no cycles. `State::cycles` is what `RDTSC` reads, so a guest's TSC
-stands still while the board's clocks go on, and the *Intel SDM* volume 3B
+it must, or the scheduler never reaches the timer that would wake it — and it
+used to charge no cycles. `State::cycles` is what `RDTSC` reads, so a guest's
+TSC stood still while the board's clocks went on, and the *Intel SDM* volume 3B
 §17.17.1 says the opposite: an invariant TSC "will run at a constant rate in
-all ACPI P-, C-. and T-states".
+all ACPI P-, C-. and T-states", and `HLT` is C1. §17.17 gives this core's
+family — 06H, model 0FH, which is what leaf 1 reports — a counter that
+"increments at a constant rate" whatever the core is doing.
+
+**The counter is charged the rest of the budget in one addition, where the
+processor stopped executing.** A halted processor is not made to spin: the
+value is computed from where the processor stands in time rather than
+incremented an idle clock at a time, which is one `wrapping_add` per round that
+ends halted. The same addition covers every other state that charges nothing —
+wait-for-SIPI, INIT held, a shutdown after a triple fault, a core with no
+address space — because Vol 3A Table 9-1 has an INIT leave the counter
+"unchanged", and a counter that runs at a constant rate goes on running while
+an application processor waits to be started. It is *not* the published
+position: the scheduler's anchor still carries that, so a counter a guest's
+`WRMSR` (§17.17.3) or an accel hand-over has moved counts on from wherever it
+was put, and the budget reported to the scheduler is unchanged.
+
+`CPUID.80000007H:EDX[8]` says so as of the same commit. It had answered zero —
+the leaf did not exist — and now reports the invariant-TSC bit on any
+long-mode configuration, because the claim the bit makes is one this core keeps
+in every state it models. What a Linux guest on `pc64` makes of it, from its
+own `/proc/cpuinfo` at a shell prompt, before and after:
+
+```text
+flags : … lm constant_tsc rep_good nopl cpuid pti
+flags : … lm constant_tsc rep_good nopl nonstop_tsc cpuid pti
+```
+
+`constant_tsc` was already there — the kernel infers that from the family and
+model in leaf 1 — and `nonstop_tsc` is the bit, which is the guest saying back
+exactly what was fixed.
 
 Measured on `pc-apic`, a guest halting twenty times and waking on the 8254:
 the HPET moved 199 744 ticks — 499 360 cycles of that board's 25 MHz core —
-while the guest's time-stamp counter moved **2 926**, under one per cent of
-them (`an_idle_processors_time_stamp_counter_stops_which_is_an_open_defect` in
-`tests/x86_counter_resolution.rs`, which asserts today's wrong answer as a
-ledger entry so that fixing it trips the test).
+while the guest's time-stamp counter moved **2 926** before and **499 481**
+after. Against a timer armed for a known interval, cycles from the arming
+access to the handler, 12 500 of them programmed:
 
-It is plausibly behind the `tsc-early` watchdog skew on `q35-linux-smp` —
-same direction, same order — but that is **unproven**: charging the TSC
-through `HLT` as an experiment left that boot's console byte-identical, so
-whatever the kernel measured there did not include a halt. Neither change in
-this work caused it or cured it.
+| board | source | spinning | halted, before | halted, after |
+| --- | --- | --- | --- | --- |
+| `q35` | APIC | 12 646 | 143 | 12 639 |
+| `q35` | HPET | 12 646 | 143 | 12 637 |
+| `q35` | 8254 | 12 662 | 137 | 12 654 |
+| `pc-apic` | APIC | 3 659 | 143 | 3 650 |
+| `pc-apic` | HPET | 3 494 | 143 | 3 487 |
+| `pc-apic` | 8254 | 3 565 | 137 | 3 562 |
+
+The spinning column is the reference: a processor that spins through the wait
+charges every cycle by executing it, and a halted one now agrees with it to
+within the one `jmp $` the spinning processor is in when the interrupt arrives.
+`pc-apic`'s short intervals are the shared crystal's arming write landing at
+the round's start, which is the section above's remaining piece; it moves the
+interrupt, not the counter. An application processor's first `RDTSC` after its
+Start-Up read **28** before and 1 220 717 against the bootstrap processor's
+1 200 272 after. All three are in `tests/x86_counter_resolution.rs`; the ledger
+entry that asserted the old answer is gone with them.
+
+### The `tsc-early` watchdog skew was this, and it is gone
+
+The previous section left this as *plausible but unproven*, on the evidence
+that charging the TSC through `HLT` left one `pc64` boot byte-identical. That
+evidence was sound and the conclusion drawn from it was too narrow: **`pc64`
+is the one board here that cannot show the defect**, because it is the one
+board with no HPET. Its watchdog is `refined-jiffies`, which counts the
+guest's own timer ticks — a reference the guest derives from inside itself,
+and one that a tickless guest reconstructs on waking rather than being
+interrupted for. A board with an HPET gives the kernel a counter *outside* the
+processor to check against, and there the halt shows at once.
+
+What was measured is that division, not a mechanism: the skew appears on
+`q35-linux-smp` and not on `pc64`, on the same kernel, with only this change
+between the two columns. Why the jiffies reference moves with a stopped TSC
+rather than against it is an inference from that; no kernel source was read
+(`ROADMAP.md` §1).
+
+`rsemu run q35-linux-smp --media kernel=… --media initrd=… --for 150s`, one
+call, the halted-TSC change the only difference:
+
+| kernel | before | after |
+| --- | --- | --- |
+| Gentoo `6.6.67` | `Clocksource 'tsc-early' skewed -105614925 ns (-105 ms) over watchdog 'hpet' interval of 507122600 ns (507 ms)`, `Marking TSC unstable due to clocksource watchdog`, `Switched to clocksource hpet` | no watchdog line; `Refined TSC clocksource calibration: 99.999 MHz`, `Switched to clocksource tsc` |
+| Debian `6.12.94` | `skewed -343554052 ns (-343 ms) over watchdog 'hpet' interval of 479135700 ns (479 ms)`, TSC marked unstable | no watchdog line |
+
+The skew is the halt, to the fraction. The marking lands at 7.5 s of guest
+time, two lines after `smpboot: x86: Booting SMP configuration: #1` — the
+bootstrap processor is waiting for an application processor to report alive,
+which on this board it never does — and −105 ms in 507 ms is a processor that
+was halted 21% of that window. The Debian kernel idles harder in the same
+window and lost 343 ms of 479.
+
+One thing those runs print that is **not** this and not fixed by it:
+`CPU1 failed to report alive state`, ten seconds later, identically before and
+after. `tests/kvm_q35_linux_smp.rs` brings both processors up on this board
+under `--accel kvm` and `ThreadingMode::Accel`; an interpreted, deterministic
+`rsemu run q35-linux-smp` does not, on either kernel, with or without this
+change. It is recorded here because these runs are where it was seen, not
+because it belongs to this section.
+
+`pc64` is byte-identical before and after, to a shell prompt and 400 seconds of
+guest time idling at it, on both kernels — for the reason above, not for want
+of halting: the register dump at the end shows a TSC-derived register holding
+`0x1d498c8f00` before and `0x42e4e42b00` after, which is the idle time the
+counter had been dropping.
+
+### What counting the halt cost
+
+**On a workload that never halts, nothing.** `publishing_cost_workload` on
+`q35` under callgrind, the interpreted load/add/store loop that reaches no
+clock and runs to the same state hash `0xad8ee3eed4080384` on both builds:
+1 552 215 024 → 1 552 786 417 host instructions, **+0.04%** — the halted branch
+is never reached and what is left is where the compiler put the code.
+
+**On one that halts constantly, it is not separable from the guest.** `pc64`
+with the Gentoo kernel to a shell prompt and 400 guest seconds idling at it,
+the two builds run side by side so they share the host: 237.7 s → 240.2 s of
+user CPU in one pair and 229.6 s → 232.1 s in the second, **+1.1%** both times.
+The addition is one `wrapping_add` per idle round — a round is a millisecond of
+guest time, so that is nowhere near 1% of anything — and the same runs show the
+guest itself doing about 1% different work: the console is byte-identical, but
+a loop counter in the final register dump reads `0x23284` before and `0x22ce4`
+after. A guest whose clock no longer stops while it idles does not idle
+identically, which is the point of the change rather than a cost of it.
+
+## What publishing a position cost
 
 The cost, measured under callgrind on `publishing_cost_workload` in
 `tests/x86_counter_resolution.rs` — an interpreted load/add/store loop on `q35`

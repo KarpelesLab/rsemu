@@ -51,6 +51,12 @@
 //!   before it started at the round's beginning and fired up to a round early.
 //!   On a crystal two processors share, a write still lands where the round
 //!   began, exactly as before; the alarm tests pin both.
+//! * **A halted processor's own counter counts the halt.** `HLT`, and the
+//!   wait-for-SIPI an INIT leaves an application processor in, stop the
+//!   *processor*, not its time-stamp counter (*Intel SDM* vol. 3B §17.17.1).
+//!   That was a separate defect with a separate cause — `X86::run_budget`
+//!   consumed a halted core's budget and charged it nothing — and the three
+//!   tests at the bottom of this file are what it cost a guest.
 //! * **Determinism.** The same program gives the same samples under
 //!   [`ThreadingMode::Parallel`], because a read at one's own position
 //!   involves nobody else.
@@ -393,6 +399,16 @@ enum Alarm {
     Pit,
 }
 
+/// What the processor does between arming its timer and taking the interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// `jmp $`: it executes, and charges, every cycle of the wait.
+    Spin,
+    /// `hlt`: it executes nothing until the interrupt arrives, which is where
+    /// a time-stamp counter that stopped with it would show.
+    Halt,
+}
+
 /// A program that arms one timer after a spin and records, with `RDTSC`, the
 /// cycle it armed on and the cycle its interrupt handler first ran.
 ///
@@ -401,7 +417,7 @@ enum Alarm {
 /// (MultiProcessor Specification 1.4 §3.6.2.1); the program selects symmetric
 /// I/O mode through it first, or the 8254's edge would reach an unprogrammed
 /// 8259A and arrive on a vector nothing handles.
-fn alarm(socket: Socket, source: Alarm, imcr: bool) -> Vec<u8> {
+fn alarm(socket: Socket, source: Alarm, imcr: bool, wait: Wait) -> Vec<u8> {
     let (mut rom, mut pm) = boot(socket);
     if imcr {
         outb(&mut pm, 0x22, 0x70); // select the IMCR
@@ -489,6 +505,9 @@ fn alarm(socket: Socket, source: Alarm, imcr: bool) -> Vec<u8> {
         Alarm::Apic => store_at(&mut pm, 0x380, APIC_ALARM),
         Alarm::Hpet(_) => store_at(&mut pm, 0x010, 1),
         Alarm::Pit => outb(&mut pm, 0x40, (PIT_ALARM >> 8) as u8),
+    }
+    if wait == Wait::Halt {
+        pm.push(0xf4); // hlt
     }
     pm.extend_from_slice(&[0xeb, 0xfe]); // jmp $
     put(&mut rom, socket, OFF_PM, &pm);
@@ -745,11 +764,18 @@ fn the_same_program_reads_the_same_counters_under_a_dispatched_round() {
 
 /// Run the alarm program for `source` and report `(interrupts taken, cycles
 /// from the arming access to the handler)`.
-fn alarm_latency(name: &str, text: &str, socket: Socket, source: Alarm, imcr: bool) -> (u32, u64) {
+fn alarm_latency(
+    name: &str,
+    text: &str,
+    socket: Socket,
+    source: Alarm,
+    imcr: bool,
+    wait: Wait,
+) -> (u32, u64) {
     let mut m = board_with(
         name,
         text,
-        alarm(socket, source, imcr),
+        alarm(socket, source, imcr, wait),
         ThreadingMode::Deterministic,
     );
     m.reset(ResetKind::Cold);
@@ -763,7 +789,7 @@ fn alarm_latency(name: &str, text: &str, socket: Socket, source: Alarm, imcr: bo
     };
     let taken = peek(TAKEN) as u32;
     let latency = peek(SEEN_AT).wrapping_sub(peek(ARMED_AT));
-    println!("-- {name:<16} {source:?}: taken {taken}, {latency} cycles after arming");
+    println!("-- {name:<16} {source:?}, {wait:?}: taken {taken}, {latency} cycles after arming");
     (taken, latency)
 }
 
@@ -791,7 +817,8 @@ fn alarms(hpet_input: u8) -> [(Alarm, u64); 3] {
 #[test]
 fn a_timer_armed_on_one_processor_fires_its_whole_interval_after_the_arming_instruction() {
     for (source, floor) in alarms(16) {
-        let (taken, latency) = alarm_latency("q35.machine", Q35, Q35_SOCKET, source, true);
+        let (taken, latency) =
+            alarm_latency("q35.machine", Q35, Q35_SOCKET, source, true, Wait::Spin);
         assert_eq!(taken, 1, "{source:?} interrupted exactly once");
         assert!(
             latency >= floor,
@@ -816,8 +843,14 @@ fn a_timer_armed_on_a_shared_crystal_fires_where_it_always_has() {
     // One round of the 25 MHz core.
     const ROUND_CYCLES: u64 = 25_000;
     for (source, floor) in alarms(20) {
-        let (taken, latency) =
-            alarm_latency("pc-apic.machine", PC_APIC, PC_APIC_SOCKET, source, false);
+        let (taken, latency) = alarm_latency(
+            "pc-apic.machine",
+            PC_APIC,
+            PC_APIC_SOCKET,
+            source,
+            false,
+            Wait::Spin,
+        );
         assert_eq!(taken, 1, "{source:?} interrupted exactly once");
         assert!(
             latency + ROUND_CYCLES >= floor,
@@ -1112,35 +1145,227 @@ const IDLE_HALTS: u32 = 20;
 /// The 8254 divisor that wakes it: 1 193 of 105/88 MHz is a millisecond.
 const IDLE_TICK: u16 = 1_193;
 
-/// Does a processor's time-stamp counter keep counting while it is halted?
+/// A `jmp $` on this core: seven clocks and the bus cycles that refetch it. A
+/// processor spinning on one notices an interrupt at the end of the jump it is
+/// in, so it may take the interrupt up to this much later than one that was
+/// halted — and that is the whole of the difference halting is allowed to make.
+const ONE_JUMP: u64 = 16;
+
+/// A halted processor wakes to a time-stamp counter that counted the wait.
 ///
-/// **On this core it does not, and the *Intel SDM* volume 3B §17.17.1 says an
-/// invariant TSC "will run at a constant rate in all ACPI P-, C-. and
-/// T-states".** `X86::run_budget` consumes the whole budget when `HLT` has
-/// stopped the core — it must, or the scheduler never reaches the timer that
-/// would wake it — but it charges no cycles, so `State::cycles`, which is what
-/// `RDTSC` reads, stands still while the board's clocks go on.
+/// *Intel SDM* volume 3B §17.17 gives this core's family (06H, model 0FH) a
+/// counter that "increments at a constant rate", and §17.17.1 an invariant one
+/// that "will run at a constant rate in all ACPI P-, C-. and T-states"; `HLT`
+/// is C1. So a timer armed for a known interval and waited for with `HLT` must
+/// show the handler's `RDTSC` that interval later, exactly as a processor
+/// that spun through the same wait does — the spinning one is the reference,
+/// because it charges every cycle by executing it.
 ///
-/// This is **not** the round-resolution defect the rest of this file is about,
-/// and publishing a position neither caused it nor cured it. The guest halts
-/// [`IDLE_HALTS`] times, each time until the 8254's next tick, and compares
-/// what its own TSC did against what the HPET — a clock outside the processor
-/// — did over the same stretch. Measured: the HPET moved 199 744 ticks,
-/// 499 360 cycles of this board's 25 MHz core, while the guest's TSC moved
-/// **2 926**, under one per cent.
+/// Measured, cycles from the arming access to the handler, spinning against
+/// halted, 12 500 of them programmed:
 ///
-/// # This test asserts the defect, deliberately
+/// | board | source | spinning | halted, before | halted, after |
+/// | --- | --- | --- | --- | --- |
+/// | `q35` | APIC | 12 646 | 143 | 12 639 |
+/// | `q35` | HPET | 12 646 | 143 | 12 637 |
+/// | `q35` | 8254 | 12 662 | 137 | 12 654 |
+/// | `pc-apic` | APIC | 3 659 | 143 | 3 650 |
+/// | `pc-apic` | HPET | 3 494 | 143 | 3 487 |
+/// | `pc-apic` | 8254 | 3 565 | 137 | 3 562 |
 ///
-/// It is a ledger entry (`CLAUDE.md`, a known-failures ledger that only ever
-/// shrinks), not an endorsement. A test that merely printed would protect
-/// nothing and nobody would read it; one that asserted the *right* answer
-/// would fail today and be muted within a week. So it pins the wrong answer
-/// with a wide bound, and whoever makes the TSC count through `HLT` will see
-/// it fail, which is the moment to delete it and put the correct assertion
-/// here. `docs/techniques/execution-budgets.md` carries the defect and the
-/// section reference.
+/// Before, `X86::run_budget` consumed a halted processor's budget and charged
+/// the counter none of it, so the handler saw only the arming store and its
+/// own entry. (`pc-apic`'s short intervals are the shared crystal's arming
+/// write landing at the round's start, which
+/// `a_timer_armed_on_a_shared_crystal_fires_where_it_always_has` pins; it
+/// moves the interrupt, not the counter, and halting agrees with spinning
+/// there as everywhere.)
 #[test]
-fn an_idle_processors_time_stamp_counter_stops_which_is_an_open_defect() {
+fn a_halted_processor_wakes_to_a_time_stamp_counter_that_counted_the_wait() {
+    #[cfg(feature = "dev-q35")]
+    halted_against_spinning("q35.machine", Q35, Q35_SOCKET, true, 16);
+    halted_against_spinning("pc-apic.machine", PC_APIC, PC_APIC_SOCKET, false, 20);
+}
+
+/// Every alarm source on one board, waited for spinning and then halted.
+fn halted_against_spinning(name: &str, text: &str, socket: Socket, imcr: bool, hpet: u8) {
+    for (source, _) in alarms(hpet) {
+        let (spun, spin) = alarm_latency(name, text, socket, source, imcr, Wait::Spin);
+        let (halted, halt) = alarm_latency(name, text, socket, source, imcr, Wait::Halt);
+        assert_eq!((spun, halted), (1, 1), "{name} {source:?} interrupted once");
+        assert!(
+            halt <= spin && spin - halt <= ONE_JUMP,
+            "{name} {source:?}: the handler read the TSC {halt} cycles after \
+             arming when the processor halted and {spin} when it spun — a \
+             halted processor's counter must count the wait (SDM vol. 3B \
+             §17.17), so the two may differ by the one `jmp` the spinning \
+             processor was in, and no more"
+        );
+    }
+}
+
+/// Twenty halts in a row cost the counter nothing against a clock outside the
+/// processor.
+///
+/// The guest halts [`IDLE_HALTS`] times, each until the 8254's next
+/// millisecond tick, and compares its TSC with the HPET's main counter across
+/// the whole stretch; then does the same wait by spinning on the handler's
+/// count instead. Before, the HPET moved 199 744 ticks — 499 360 cycles of
+/// this board's 25 MHz core — while the halted guest's TSC moved **2 926**.
+/// Now it moves 499 481, and the spinning run 499 497 against 199 751.
+///
+/// Both runs sit about 120 cycles above the HPET's figure, and that is not a
+/// rate: 45 halts sit the same 120 cycles above it (1 124 386 against 449 706
+/// ticks). It is a fixed offset between the program's two samples of a clock
+/// on another crystal, and halting leaves it exactly where spinning does, which
+/// is what this asserts. Deterministic and dispatched rounds agree to the
+/// cycle.
+#[test]
+fn a_halted_processors_time_stamp_counter_keeps_pace_with_the_hpet() {
+    let halted = idle(ThreadingMode::Deterministic, Wait::Halt);
+    assert_eq!(
+        halted,
+        idle(ThreadingMode::Parallel, Wait::Halt),
+        "a dispatched round read different counters"
+    );
+    let spun = idle(ThreadingMode::Deterministic, Wait::Spin);
+    for (how, (taken, _, _)) in [("halted", halted), ("spinning", spun)] {
+        assert!(
+            taken > u64::from(IDLE_HALTS),
+            "{how}: the guest woke {taken} times, so it never reached the end of \
+             the stretch this measures"
+        );
+    }
+    assert!(
+        halted.2 > 100_000,
+        "the HPET moved {} ticks, too little idle time to measure against",
+        halted.2
+    );
+    // This board's core is 25 MHz and its HPET 10 MHz: a tick is owed two and
+    // a half cycles, so everything is kept doubled to stay in integers.
+    let excess = |(_, tsc, hpet): (u64, u64, u64)| 2 * tsc as i64 - 5 * hpet as i64;
+    let (halt, spin) = (excess(halted), excess(spun));
+    assert!(
+        (halt - spin).abs() <= 2 * ONE_JUMP as i64,
+        "halted, the TSC moved {} cycles over {} HPET ticks; spinning, {} over \
+         {}. Halting must cost the counter nothing, so the two stand the same \
+         distance from the HPET's figure to within one instruction",
+        halted.1,
+        halted.2,
+        spun.1,
+        spun.2
+    );
+    assert!(
+        halt.abs() * 1_000 <= 5 * halted.2 as i64,
+        "halted, the TSC moved {} cycles against the {} the HPET's {} ticks are \
+         worth — more than a thousandth apart",
+        halted.1,
+        halted.2 * 5 / 2,
+        halted.2
+    );
+}
+
+/// Where the bootstrap processor records the `RDTSC` it takes just before
+/// sending the Start-Up, and the application processor its first.
+const SIPI_SENT: u32 = 0x5300;
+const AP_FIRST: u32 = 0x5308;
+/// How long the bootstrap processor spins before it starts the other one, in
+/// turns of `dec eax; jnz`: about thirty milliseconds of the 25 MHz core, during
+/// which the application processor waits for a Start-Up.
+const SIPI_SPIN: u32 = 100_000;
+/// The Start-Up vector: page `0xe0`, the bottom of `pc-apic`'s socket.
+const SIPI_PAGE: u8 = 0xe0;
+
+/// An application processor's counter ran while it waited for its Start-Up.
+///
+/// *Intel SDM* volume 3A Table 9-1 has an INIT leave the time-stamp counter
+/// "unchanged", and a counter that runs at a constant rate (vol. 3B §17.17)
+/// goes on running through the wait-for-SIPI state that INIT leaves a
+/// processor in, as through `HLT`. `pc-apic` parks its second processor at
+/// reset; the first spins, reads its TSC, and starts the second, whose first
+/// instruction reads its own. Both count from the same cold reset on one
+/// crystal, so the second must read about what the first did — later by the
+/// Start-Up's delivery, which on a crystal two processors share is at most a
+/// round. Before, it read a counter that had stood still since the INIT.
+#[test]
+fn an_application_processor_starts_with_a_time_stamp_counter_that_counted_the_wait() {
+    // One round of the 25 MHz core.
+    const ROUND_CYCLES: u64 = 25_000;
+    let (mut rom, mut pm) = boot(PC_APIC_SOCKET);
+    // The local APIC, software-enabled.
+    pm.push(0xbf); // mov edi, 0xfee00000
+    dw(&mut pm, 0xfee0_0000);
+    store_at(&mut pm, 0x0f0, 0x1ff);
+    pm.push(0xb8); // mov eax, SIPI_SPIN
+    dw(&mut pm, SIPI_SPIN);
+    pm.push(0x48); // dec eax
+    pm.extend_from_slice(&[0x75, 0xfd]); // jnz -3
+    // The destination, APIC 1, first: the low half is what sends (SDM vol. 3A
+    // §10.6.1).
+    store_at(&mut pm, 0x310, 1 << 24);
+    pm.extend_from_slice(&[0x0f, 0x31]); // rdtsc
+    pm.push(0xa3); // mov [SIPI_SENT], eax
+    dw(&mut pm, SIPI_SENT);
+    pm.extend_from_slice(&[0x89, 0x15]); // mov [SIPI_SENT+4], edx
+    dw(&mut pm, SIPI_SENT + 4);
+    // Start-Up (delivery mode 110b), level asserted, to page SIPI_PAGE.
+    store_at(&mut pm, 0x300, 0x0000_4600 | u32::from(SIPI_PAGE));
+    pm.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+    put(&mut rom, PC_APIC_SOCKET, OFF_PM, &pm);
+
+    // The application processor, in real mode at `SIPI_PAGE:0000` with the
+    // data segment the INIT left at zero.
+    let mut ap: Vec<u8> = Vec::new();
+    ap.extend_from_slice(&[0x0f, 0x31]); // rdtsc
+    ap.extend_from_slice(&[0x66, 0xa3]); // mov [AP_FIRST], eax
+    ap.extend_from_slice(&(AP_FIRST as u16).to_le_bytes());
+    ap.extend_from_slice(&[0x66, 0x89, 0x16]); // mov [AP_FIRST+4], edx
+    ap.extend_from_slice(&((AP_FIRST + 4) as u16).to_le_bytes());
+    ap.push(0xf4); // hlt
+    ap.extend_from_slice(&[0xeb, 0xfd]); // jmp hlt
+    let at = ((u32::from(SIPI_PAGE) << 12) - PC_APIC_SOCKET.base) as usize;
+    rom[at..at + ap.len()].copy_from_slice(&ap);
+
+    let mut m = board_with(
+        "pc-apic.machine",
+        PC_APIC,
+        rom,
+        ThreadingMode::Deterministic,
+    );
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    m.run_for(GlobalTime::from_nanos(60_000_000))
+        .expect("the machine runs");
+    let mem = m.space("mem").expect("the memory space");
+    let peek = |at: u32| {
+        mem.read(u64::from(at), Width::U64, MemAttrs::DEBUG)
+            .expect("a mapped word")
+    };
+    let (sent, first) = (peek(SIPI_SENT), peek(AP_FIRST));
+    println!("-- pc-apic: Start-Up sent at TSC {sent}, the AP's first RDTSC {first}");
+    assert!(
+        sent > 500_000,
+        "the bootstrap processor read {sent}: it never spun long enough for a \
+         stopped counter to show"
+    );
+    assert!(
+        first >= sent && first - sent <= ROUND_CYCLES,
+        "the application processor's first RDTSC read {first}, and the \
+         bootstrap processor's just before the Start-Up read {sent}: a counter \
+         that ran through wait-for-SIPI reads the other's value, later by at \
+         most the round the Start-Up is delivered in"
+    );
+}
+
+/// Wait out [`IDLE_HALTS`] of the 8254's millisecond ticks on `pc-apic`, and
+/// report `(interrupts taken, TSC moved, HPET moved)` across the whole
+/// stretch.
+///
+/// [`Wait::Halt`] waits with `hlt` and counts the ticks by counting the
+/// wakeups; [`Wait::Spin`] waits for the handler's own count to reach the same
+/// number, executing all the way. The two differ in nothing else, which is
+/// what makes the second the first's control.
+fn idle(mode: ThreadingMode, wait: Wait) -> (u64, u64, u64) {
     let (mut rom, mut pm) = boot(PC_APIC_SOCKET);
     // A gate for the 8254's interrupt, and the tables.
     pm.push(0xbf); // mov edi, gate
@@ -1188,11 +1413,24 @@ fn an_idle_processors_time_stamp_counter_stops_which_is_an_open_defect() {
     }
 
     snapshot(&mut pm, IDLE_BEFORE);
-    pm.push(0xb9); // mov ecx, IDLE_HALTS
-    dw(&mut pm, IDLE_HALTS);
-    pm.push(0xf4); // hlt
-    pm.push(0x49); // dec ecx
-    pm.extend_from_slice(&[0x75, 0xfc]); // jnz hlt
+    match wait {
+        Wait::Halt => {
+            pm.push(0xb9); // mov ecx, IDLE_HALTS
+            dw(&mut pm, IDLE_HALTS);
+            pm.push(0xf4); // hlt
+            pm.push(0x49); // dec ecx
+            pm.extend_from_slice(&[0x75, 0xfc]); // jnz hlt
+        }
+        Wait::Spin => {
+            pm.extend_from_slice(&[0x8b, 0x1d]); // mov ebx, [TAKEN]
+            dw(&mut pm, TAKEN);
+            pm.extend_from_slice(&[0x81, 0xc3]); // add ebx, IDLE_HALTS
+            dw(&mut pm, IDLE_HALTS);
+            pm.extend_from_slice(&[0x39, 0x1d]); // cmp [TAKEN], ebx
+            dw(&mut pm, TAKEN);
+            pm.extend_from_slice(&[0x72, 0xf8]); // jb cmp
+        }
+    }
     snapshot(&mut pm, IDLE_AFTER);
     pm.extend_from_slice(&[0xeb, 0xfe]); // jmp $
     put(&mut rom, PC_APIC_SOCKET, OFF_PM, &pm);
@@ -1211,12 +1449,7 @@ fn an_idle_processors_time_stamp_counter_stops_which_is_an_open_defect() {
     h.push(0xcf); // iret
     put(&mut rom, PC_APIC_SOCKET, OFF_HANDLER, &h);
 
-    let mut m = board_with(
-        "pc-apic.machine",
-        PC_APIC,
-        rom,
-        ThreadingMode::Deterministic,
-    );
+    let mut m = board_with("pc-apic.machine", PC_APIC, rom, mode);
     m.reset(ResetKind::Cold);
     m.sweep();
     m.run_for(GlobalTime::from_nanos(60_000_000))
@@ -1226,30 +1459,9 @@ fn an_idle_processors_time_stamp_counter_stops_which_is_an_open_defect() {
         mem.read(u64::from(at), Width::U32, MemAttrs::DEBUG)
             .expect("a mapped word")
     };
-    let (taken, cycles, hpet) = (
+    (
         word(TAKEN),
-        word(IDLE_AFTER).wrapping_sub(word(IDLE_BEFORE)),
-        word(IDLE_AFTER + 4).wrapping_sub(word(IDLE_BEFORE + 4)),
-    );
-    // This board's core is 25 MHz and its HPET 10 MHz, so one HPET tick is
-    // owed two and a half cycles.
-    let owed = hpet * 5 / 2;
-    assert!(
-        taken >= IDLE_HALTS as u64,
-        "the guest woke {taken} times for {IDLE_HALTS} halts, so it never \
-         reached the idle stretch this measures"
-    );
-    assert!(
-        owed > 100_000,
-        "the HPET moved {hpet} ticks, too little idle time to measure against"
-    );
-    assert!(
-        cycles * 10 < owed,
-        "the guest's time-stamp counter gained {cycles} cycles against the \
-         {owed} the HPET says passed — more than a tenth, so `HLT` no longer \
-         stops the TSC. That is the *Intel SDM* volume 3B §17.17.1 behaviour \
-         and this ledger entry has been overtaken: delete it and assert the \
-         real thing, and strike the defect from \
-         docs/techniques/execution-budgets.md"
-    );
+        word(IDLE_AFTER).wrapping_sub(word(IDLE_BEFORE)) & 0xffff_ffff,
+        word(IDLE_AFTER + 4).wrapping_sub(word(IDLE_BEFORE + 4)) & 0xffff_ffff,
+    )
 }

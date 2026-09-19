@@ -311,7 +311,10 @@ pub(super) struct State {
     pub sse: Sse,
     /// The translation-lookaside buffer. Derived state: never serialized.
     pub tlb: Tlb,
-    /// Clock cycles executed since power-on.
+    /// Clock cycles elapsed since power-on: what `RDTSC` reads.
+    ///
+    /// Elapsed rather than executed — a halted processor's counter counts the
+    /// halt (`X86::run_budget`, *Intel SDM* vol. 3B §17.17.1).
     pub cycles: u64,
     /// Set by `HLT`; cleared by any interrupt or reset.
     pub halted: bool,
@@ -3646,6 +3649,11 @@ impl<'a> Exec<'a> {
     /// counter exists, but no performance-monitoring leaf is; and every bit
     /// above leaf 1, which is why leaf 0 reports a maximum of one.
     ///
+    /// The one thing said about that counter beyond its existence is the
+    /// **invariant-TSC bit** in leaf `8000_0007`, and it is said for the same
+    /// reason as everything else here: the counter runs at the board's rate
+    /// whatever state the processor is in, `HLT` included.
+    ///
     /// `FPU`, `FXSR`, `SSE`, `SSE2` and `CX8` **are** reported now, and each
     /// is reported because the instructions behind it execute. They follow
     /// [`Features`](super::Features) rather than the variant, so an instance
@@ -3748,6 +3756,30 @@ impl<'a> Exec<'a> {
                     edx |= 1 << 11; // SYSCALL/SYSRET
                 }
                 set(signature, 0, 0, edx);
+            }
+            0x8000_0007 if features.long => {
+                // `TscInvariant`, EDX[8], and nothing else in this leaf: the
+                // rest of it is thermal and power management — `TS`, `FID`,
+                // `VID`, `HwPstate` — none of which this core has.
+                //
+                // The bit says the counter "will run at a constant rate in all
+                // ACPI P-, C-. and T-states" (*Intel SDM* volume 3B §17.17.1;
+                // the *AMD64 APM* volume 3, `CPUID Fn8000_0007_EDX[8]`, words
+                // it the same way). This core has no P- or T-states and one
+                // C-state — `HLT` — and since `X86::run_budget` charges a
+                // halted processor's whole budget to [`State::cycles`] the
+                // counter runs at the board's declared rate through it, and
+                // through the wait-for-SIPI an INIT leaves an application
+                // processor in. So the claim is one this core keeps, which is
+                // the rule the rest of this function follows.
+                //
+                // It is not free of consequence, which is why it is stated
+                // here: a guest that reads it clear is entitled to stop
+                // trusting the counter the moment it idles, and a Linux guest
+                // that did exactly that — its clocksource watchdog measuring
+                // an idle-heavy second against the HPET — is what the halted
+                // counter used to cost (`docs/techniques/execution-budgets.md`).
+                set(0, 0, 0, 1 << 8);
             }
             0x8000_0008 if features.long => {
                 // Physical and linear address widths: 40 and 48. The linear
