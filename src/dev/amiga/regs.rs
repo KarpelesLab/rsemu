@@ -43,6 +43,22 @@
 //!   taken. A table that routed these writes to Agnus alone would leave Denise
 //!   no way to learn its own window.
 //!
+//! * **The AA rows Lisa answers.** Appendix B is an ECS-era table and stops
+//!   short of the AA (AGA) chip set. The *Specification for the Advanced Amiga
+//!   (AA) Chip Set* (Commodore-Amiga; §3, "List of Registers ordered by
+//!   address") adds, among others, five rows the video chip answers at:
+//!   `BPLCON4` `$10C` (`W`, `D`), `CLXCON2` `$10E` (`W`, `D`), `BPL7DAT`
+//!   `$11C` and `BPL8DAT` `$11E` (`W`, `&`, `D`), and `FMODE` `$1FC` (`W`,
+//!   `A` and `D` both). They carry [`Access::AGA`], and they are declared
+//!   unconditionally for the same reason every ECS row is: the *decode* is a
+//!   property of the address map, and which behaviour a part has at an address
+//!   is the part's business. An 8362 or an 8373 ignores all five.
+//!   `CLXCON2`'s own page in that specification misprints its address as
+//!   `$10C`, which is `BPLCON4`'s; the register list has `$10e` and that is
+//!   what is declared here. The AA rows **Alice** answers — the bitplane 7 and
+//!   8 pointers, and the AA beam registers — are not here yet; they belong
+//!   with the part that acts on them.
+//!
 //! # `$1FE`, `SPRHDAT`, and the copy this was checked against
 //!
 //! The table was first transcribed through a summarising tool and has since
@@ -175,6 +191,10 @@ impl Access {
     pub const COPPER_DANGER: Access = Access(1 << 8);
     /// `(E)` — changed or new in the Enhanced Chip Set.
     pub const ECS: Access = Access(1 << 9);
+    /// `p` — changed or new in the AA (AGA) chip set. The *Specification for
+    /// the Advanced Amiga (AA) Chip Set* prints `p`, for *Pandora*, in the
+    /// `rev` column of its register list where Appendix B prints `(E)`.
+    pub const AGA: Access = Access(1 << 10);
 
     /// Whether every flag in `other` is set here.
     #[must_use]
@@ -305,6 +325,7 @@ const PAIR: Access = Access::PAIR;
 const COP_NEVER: Access = Access::COPPER_NEVER;
 const COP_DANGER: Access = Access::COPPER_DANGER;
 const ECS: Access = Access::ECS;
+const AGA: Access = Access::AGA;
 
 /// One row, in the appendix's column order: offset, name, the chips in its
 /// chip column, and the letters and symbols in its access and symbol columns.
@@ -451,12 +472,16 @@ static DECLARED: &[Reg] = &[
     reg(0x106, "BPLCON3",  &[D],       &[W, ECS]),
     reg(0x108, "BPL1MOD",  &[A],       &[W]),
     reg(0x10a, "BPL2MOD",  &[A],       &[W]),
+    reg(0x10c, "BPLCON4",  &[D],       &[W, AGA]),
+    reg(0x10e, "CLXCON2",  &[D],       &[W, AGA]),
     reg(0x110, "BPL1DAT",  &[D],       &[W, DMA_ONLY]),
     reg(0x112, "BPL2DAT",  &[D],       &[W, DMA_ONLY]),
     reg(0x114, "BPL3DAT",  &[D],       &[W, DMA_ONLY]),
     reg(0x116, "BPL4DAT",  &[D],       &[W, DMA_ONLY]),
     reg(0x118, "BPL5DAT",  &[D],       &[W, DMA_ONLY]),
     reg(0x11a, "BPL6DAT",  &[D],       &[W, DMA_ONLY]),
+    reg(0x11c, "BPL7DAT",  &[D],       &[W, DMA_ONLY, AGA]),
+    reg(0x11e, "BPL8DAT",  &[D],       &[W, DMA_ONLY, AGA]),
     reg(0x120, "SPR0PTH",  &[A],       &[W, PAIR]),
     reg(0x122, "SPR0PTL",  &[A],       &[W, PAIR]),
     reg(0x124, "SPR1PTH",  &[A],       &[W, PAIR]),
@@ -550,6 +575,7 @@ static DECLARED: &[Reg] = &[
     reg(0x1e0, "VSSTRT",   &[A],       &[W, ECS]),
     reg(0x1e2, "HCENTER",  &[A],       &[W, ECS]),
     reg(0x1e4, "DIWHIGH",  &[A, D],    &[W, ECS]),
+    reg(0x1fc, "FMODE",    &[A, D],    &[W, AGA]),
     reg(0x1fe, "NO-OP",    &[],        &[]),
 ];
 
@@ -668,11 +694,16 @@ mod tests {
             assert!(reg.chip.contains(ChipId::AGNUS), "{}", reg.name);
             assert!(reg.chip.contains(ChipId::DENISE), "{}", reg.name);
         }
+        // Appendix B's own rows: the AA specification's are counted apart.
         let shared = declared()
             .iter()
-            .filter(|r| r.chip.0.count_ones() > 1)
+            .filter(|r| r.chip.0.count_ones() > 1 && !r.access.contains(Access::AGA))
             .count();
         assert_eq!(shared, 23, "the count the ChipId documentation quotes");
+        // And the one AA row two chips answer: "FMODE p 1FC W A D".
+        let fmode = lookup(0x1fc).expect("FMODE");
+        assert!(fmode.access.contains(Access::AGA));
+        assert!(fmode.chip.contains(ChipId::AGNUS) && fmode.chip.contains(ChipId::DENISE));
     }
 
     #[test]

@@ -183,6 +183,28 @@
 //! order the far end re-drives its pins in, the count comes back to the saved
 //! value.
 //!
+//! # The AA chip set: Lisa
+//!
+//! `revision = "aga"` is **Lisa**, the A1200's and A4000's video chip. Her
+//! display half is being modelled a piece at a time; so far she has the
+//! 256-entry 24-bit colour table, reached 32 entries at a time through
+//! `BPLCON3`'s `BANK` and a nibble per gun at a time through `LOCT`, and she
+//! shows an 8362's playfields through it on a 35 ns grid. `denise/aga.rs` has
+//! what the *Specification for the Advanced Amiga (AA) Chip Set* settles,
+//! what it leaves open and what was chosen there. An 8362 and an 8373 do not
+//! go near that module, and everything above this section is still exactly
+//! what they do.
+//!
+//! What Lisa shares with the older parts is the seam: the same [`Line`] a
+//! line, the same register writes, the same [`Beam`]. [`Fetch::planes`]
+//! already carries eight streams for her.
+//!
+//! The picture is **eight bits a gun** for every part ([`Video::copy_frame_rgb`]),
+//! because Lisa's is; an 8362's and an 8373's guns reach it as `n × 17`, the
+//! expansion the host adapter always made, so their pictures are unchanged
+//! byte for byte and [`Video::read_row`] and [`Video::copy_frame`] still hand
+//! out the twelve-bit words they always did.
+//!
 //! # Sources
 //!
 //! *Amiga Hardware Reference Manual*, Commodore-Amiga Inc., 3rd edition:
@@ -194,9 +216,12 @@
 //! ("System Control Hardware") for video priorities (Table 7-2) and collision
 //! detection (Tables 7-3 and 7-4); Appendix A for each register's bits;
 //! Appendix B for the register table; Appendix C for the ECS register notes;
-//! Appendix J for Denise's pins. **No emulator source of any licence was
-//! consulted** (`ROADMAP.md` §1): every Amiga emulator the author is aware of is
-//! GPL, and AROS is MPL-derived.
+//! Appendix J for Denise's pins. For Lisa, the *Specification for the Advanced
+//! Amiga (AA) Chip Set* (Commodore-Amiga), whose sections `denise/aga.rs`
+//! cites. **No
+//! emulator source of any licence was consulted** (`ROADMAP.md` §1): every
+//! Amiga emulator the author is aware of is GPL, and AROS is MPL-derived; nor
+//! was any FPGA reimplementation of the chip set.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -219,6 +244,8 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
 use super::custom::{CustomBus, CustomChip, Origin};
 use super::regs::{ChipId, Reg};
+
+mod aga;
 
 /// The class name a machine file writes.
 pub const CLASS_NAME: &str = "amiga.denise";
@@ -283,13 +310,27 @@ const BPLCON0: u16 = 0x100;
 const BPLCON1: u16 = 0x102;
 const BPLCON2: u16 = 0x104;
 const BPLCON3: u16 = 0x106;
+/// `BPLCON4`, "Bit plane control reg. (display masks)": AA only (AA
+/// specification, §4, `BPLCON4`).
+const BPLCON4: u16 = 0x10c;
+/// `CLXCON2`, "Extended collision control": AA only. The specification's own
+/// page for it misprints the address as `$10C`; its register list has `$10e`.
+const CLXCON2: u16 = 0x10e;
 const BPL1DAT: u16 = 0x110;
 const BPL6DAT: u16 = 0x11a;
+/// `BPL7DAT`: bitplane 7's parallel-to-serial buffer, AA only.
+const BPL7DAT: u16 = 0x11c;
+/// `BPL8DAT`: the last of the eight parallel-to-serial buffers an AA part has
+/// (AA specification, §4, `BPLxDAT`).
+const BPL8DAT: u16 = 0x11e;
 const SPR0POS: u16 = 0x140;
 const SPR7DATB: u16 = 0x17e;
 const COLOR00: u16 = 0x180;
 const COLOR31: u16 = 0x1be;
 const DIWHIGH: u16 = 0x1e4;
+/// `FMODE`, "Memory Fetch Mode": AA only, and Alice's register as much as
+/// Lisa's (AA specification, §4, `FMODE`).
+const FMODE: u16 = 0x1fc;
 
 // BPLCON0 bits, Appendix A.
 const HIRES: u16 = 1 << 15;
@@ -312,11 +353,28 @@ const SHSH1: u16 = 1 << 4;
 /// `SPRxCTL` bit 7, `ATT`: "Sprite attach control bit (odd sprites)".
 const ATTACH: u16 = 1 << 7;
 
+// ---------------------------------------------------------------------------
+// AA bit definitions — *Specification for the Advanced Amiga (AA) Chip Set*
+// (Commodore-Amiga), §4, the per-register pages. Nothing below is reachable
+// from an 8362 or an 8373.
+// ---------------------------------------------------------------------------
+
+/// `BPLCON3` bit 9, `LOCT`: "Dictates that subsequent color palette values
+/// will be written to a second 12-bit color palette, constituting the RGB low
+/// order bits".
+const LOCT: u16 = 1 << 9;
+
 /// What an ECS Denise answers at `DENISEID`: "The enhanced HighRes Denise
 /// (8373) will return $FC in the lower 8 bits. The upper 8 bits are reserved"
 /// (Appendix C, *Determining Chip Revisions*). **Choice:** the reserved byte
 /// reads as ones.
 pub const ECS_DENISEID: u16 = 0xfffc;
+
+/// What an AA part answers at `DENISEID`, which the AA specification calls
+/// `LISAID`: "Lisa returns hex (f8). The upper 8 bits of this [register are
+/// reserved]" (AA specification, §4, `LISAID`). **Choice:** the reserved byte
+/// reads as ones, as for [`ECS_DENISEID`].
+pub const LISA_ID: u16 = 0xfff8;
 
 /// A line at least this long is a 15 kHz line, drawn twice when not
 /// interlaced so the picture keeps its shape; a shorter one — productivity
@@ -338,6 +396,28 @@ pub enum Revision {
     /// SuperHires, 70 ns sprite positions and `KILLEHB`. Its picture is laid
     /// out in SuperHires pixels, four to a low-resolution one.
     Ecs,
+    /// The AA chip set's **Lisa**: a 256-entry 24-bit colour table, reached
+    /// through `BANK` and `LOCT`. Its picture is always laid out in 35 ns
+    /// columns, four to a low-resolution pixel. See
+    /// [the AA section](self#the-aa-chip-set-lisa).
+    Aga,
+}
+
+impl Revision {
+    /// Whether this part has the AA chip set's behaviour.
+    #[must_use]
+    #[inline]
+    pub const fn is_aga(self) -> bool {
+        matches!(self, Revision::Aga)
+    }
+
+    /// Whether this part has at least the Enhanced Chip Set's registers —
+    /// `BPLCON3`, `DIWHIGH` and a driven `DENISEID`. Lisa has all of them.
+    #[must_use]
+    #[inline]
+    pub const fn is_ecs(self) -> bool {
+        matches!(self, Revision::Ecs | Revision::Aga)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,13 +644,30 @@ impl Layout {
 // ---------------------------------------------------------------------------
 
 /// Every register that shapes the picture, as of the pixel being drawn.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `color` is the 32 colour registers as an 8362 or an 8373 holds them —
+/// twelve bits, four a gun. `palette` is Lisa's 256-entry table, which the
+/// same 32 addresses reach a bank at a time; only an AA part maintains it, and
+/// only an AA part reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Regs {
     color: [u16; 32],
+    /// Lisa's colour table: 256 entries of `0x00RR_GGBB`, with the genlock
+    /// `T` bit in bit 24 (AA specification, §4, `COLORx`).
+    palette: [u32; 256],
     bplcon0: u16,
     bplcon1: u16,
     bplcon2: u16,
     bplcon3: u16,
+    /// `BPLCON4`: `BPLAM` in the high byte, `ESPRM` and `OSPRM` in the low.
+    /// AA only.
+    bplcon4: u16,
+    /// `CLXCON2`: bitplanes 7 and 8's collision enables and match values.
+    /// AA only.
+    clxcon2: u16,
+    /// `FMODE`: the bitplane and sprite fetch widths and the scan-double
+    /// enables. AA only, and Alice's register too.
+    fmode: u16,
     diwstrt: u16,
     diwstop: u16,
     diwhigh: u16,
@@ -580,7 +677,7 @@ struct Regs {
     /// setting the display window, it sets direct start and stop positions").
     diwhigh_on: bool,
     clxcon: u16,
-    bpldat: [u16; 6],
+    bpldat: [u16; 8],
     spr_pos: [u16; 8],
     spr_ctl: [u16; 8],
     spr_data: [u16; 8],
@@ -589,10 +686,75 @@ struct Regs {
     armed: u8,
 }
 
+impl Default for Regs {
+    /// Everything zero — a hand-written `Default` only because `[u32; 256]`
+    /// has none. An AA part's non-zero reset values are put on afterwards by
+    /// [`Regs::power_on`]; an 8362 and an 8373 start at zero as they always
+    /// did.
+    fn default() -> Regs {
+        Regs {
+            color: [0; 32],
+            palette: [0; 256],
+            bplcon0: 0,
+            bplcon1: 0,
+            bplcon2: 0,
+            bplcon3: 0,
+            bplcon4: 0,
+            clxcon2: 0,
+            fmode: 0,
+            diwstrt: 0,
+            diwstop: 0,
+            diwhigh: 0,
+            diwhigh_on: false,
+            clxcon: 0,
+            bpldat: [0; 8],
+            spr_pos: [0; 8],
+            spr_ctl: [0; 8],
+            spr_data: [0; 8],
+            spr_datb: [0; 8],
+            armed: 0,
+        }
+    }
+}
+
+/// `BPLCON3`'s AA reset value: `PF2OF1 = PF2OF0 = 1`, playfield 2's colour
+/// offset 8 — which is where an 8362's second playfield already is, so an old
+/// copper list that never writes `BPLCON3` keeps its colours.
+const PF2OF_DEFAULT: u16 = 0b011 << 10;
+
+/// `BPLCON4`'s AA reset value: `ESPRM4 = OSPRM4 = 1`, so a sprite's colours
+/// are at 16–31 — again the 8362's fixed behaviour, made the default on
+/// purpose.
+const SPRM_DEFAULT: u16 = 0x11;
+
 impl Regs {
+    /// The register file an AA part comes out of reset with.
+    ///
+    /// "A RST_input pin has been added, which resets all the bits contained in
+    /// registers that were new for ECS or LISA" (AA specification, §1), and
+    /// the per-register pages print each new field's reset value beside it.
+    /// The two that are not zero are [`PF2OF_DEFAULT`] and [`SPRM_DEFAULT`].
+    fn power_on(rev: Revision) -> Regs {
+        let mut regs = Regs::default();
+        if rev.is_aga() {
+            regs.bplcon3 = PF2OF_DEFAULT;
+            regs.bplcon4 = SPRM_DEFAULT;
+        }
+        regs
+    }
+
     /// Whether a write to `offset` changes what a pixel looks like, and so has
     /// to land at a beam position rather than at once.
-    fn timed(offset: u16) -> bool {
+    ///
+    /// The AA-only registers are timed on an AA part and nothing at all on the
+    /// older two, which have no such registers: the address map declares them
+    /// because the decode is the map's, but an 8362 and an 8373 drop the
+    /// write the way they drop every other address they own no behaviour at.
+    fn timed(rev: Revision, offset: u16) -> bool {
+        let aga_only = matches!(offset, BPLCON4 | CLXCON2 | FMODE | BPL7DAT..=BPL8DAT);
+        if aga_only {
+            return rev.is_aga();
+        }
         matches!(
             offset,
             DIWSTRT
@@ -606,8 +768,12 @@ impl Regs {
         )
     }
 
-    fn apply(&mut self, offset: u16, value: u16) {
+    /// Apply one register write. `rev` decides only what a `COLORxx` write
+    /// means: an 8362 or an 8373 has one twelve-bit register per address,
+    /// Lisa has a 256-entry table those addresses reach a bank at a time.
+    fn apply(&mut self, rev: Revision, offset: u16, value: u16) {
         match offset {
+            COLOR00..=COLOR31 if rev.is_aga() => self.write_palette(offset, value),
             COLOR00..=COLOR31 => {
                 // "Bits 15 - 12 Unused" (Table 3-3): Denise has twelve RGB
                 // pins and nothing to put the top nibble on.
@@ -617,6 +783,9 @@ impl Regs {
             BPLCON1 => self.bplcon1 = value,
             BPLCON2 => self.bplcon2 = value,
             BPLCON3 => self.bplcon3 = value,
+            BPLCON4 => self.bplcon4 = value,
+            CLXCON2 => self.clxcon2 = value,
+            FMODE => self.fmode = value,
             DIWSTRT => {
                 self.diwstrt = value;
                 self.diwhigh_on = false;
@@ -629,8 +798,15 @@ impl Regs {
                 self.diwhigh = value;
                 self.diwhigh_on = true;
             }
-            CLXCON => self.clxcon = value,
-            BPL1DAT..=BPL6DAT => self.bpldat[usize::from((offset - BPL1DAT) / 2)] = value,
+            CLXCON => {
+                self.clxcon = value;
+                // "Contents of this register are reset by a write to CLXCON"
+                // (AA specification, §4, `CLXCON2`), "so that old game
+                // programs will be able to correctly detect collisions"
+                // (§2, *Compatibility*).
+                self.clxcon2 = 0;
+            }
+            BPL1DAT..=BPL8DAT => self.bpldat[usize::from((offset - BPL1DAT) / 2)] = value,
             SPR0POS..=SPR7DATB => {
                 let rel = offset - SPR0POS;
                 let i = usize::from(rel / 8);
@@ -654,15 +830,61 @@ impl Regs {
         }
     }
 
+    /// One `COLORxx` write to Lisa's 256-entry table.
+    ///
+    /// "There are 32 of these registers (xx=00-31) and together with the
+    /// banking bits they address the 256 locations in the color palette …
+    /// When LOCT = 0 the 4 MSB of red, green and blue video data are selected
+    /// along with the T bit for genlocks[;] the low order set of registers is
+    /// also selected as well, so that the 4 bit values are automatically
+    /// extended to 8 bits. This provides compatibility with old software. If
+    /// the full range of palette values are desired, then LOCT can be set high
+    /// and independant values for the 4 LSB of red, green and blue can be
+    /// written. The low order color registers do not contain a transparency
+    /// (T) bit." (AA specification, §4, `COLORx`.)
+    ///
+    /// So a `LOCT = 0` write of nibble `n` to a gun gives `n × 17`, which is
+    /// the same expansion [`crate::host::display::amiga::rgb12_to_rgb888`]
+    /// makes for an 8362 — an AA part loaded from an old copper list shows
+    /// exactly the 8362's colours.
+    fn write_palette(&mut self, offset: u16, value: u16) {
+        // "BANK2,1,0 [select one] of 8 32 address banks", bits 15-13.
+        let bank = usize::from(self.bplcon3 >> 13);
+        let at = bank * 32 + usize::from((offset - COLOR00) / 2);
+        let entry = &mut self.palette[at];
+        let mut out = 0u32;
+        if self.bplcon3 & LOCT != 0 {
+            for shift in [16, 8, 0] {
+                let nibble = u32::from((value >> (shift / 2)) & 0xf);
+                out |= ((*entry >> shift) & 0xf0 | nibble) << shift;
+            }
+            // The low-order registers have no T bit, so the one already
+            // latched stays.
+            *entry = out | (*entry & (1 << 24));
+        } else {
+            for shift in [16, 8, 0] {
+                let nibble = u32::from((value >> (shift / 2)) & 0xf);
+                out |= (nibble << 4 | nibble) << shift;
+            }
+            *entry = out | (u32::from((value >> 15) & 1) << 24);
+        }
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         for c in self.color {
             w.write_u16(c)?;
+        }
+        for c in self.palette {
+            w.write_u32(c)?;
         }
         for v in [
             self.bplcon0,
             self.bplcon1,
             self.bplcon2,
             self.bplcon3,
+            self.bplcon4,
+            self.clxcon2,
+            self.fmode,
             self.diwstrt,
             self.diwstop,
             self.diwhigh,
@@ -687,11 +909,19 @@ impl Regs {
         for c in &mut regs.color {
             *c = r.read_u16()? & 0x0fff;
         }
+        for c in &mut regs.palette {
+            // Twenty-four bits of colour and the genlock T bit; nothing is
+            // defined above them.
+            *c = r.read_u32()? & 0x01ff_ffff;
+        }
         for v in [
             &mut regs.bplcon0,
             &mut regs.bplcon1,
             &mut regs.bplcon2,
             &mut regs.bplcon3,
+            &mut regs.bplcon4,
+            &mut regs.clxcon2,
+            &mut regs.fmode,
             &mut regs.diwstrt,
             &mut regs.diwstop,
             &mut regs.diwhigh,
@@ -790,11 +1020,11 @@ impl fmt::Debug for State {
 }
 
 impl State {
-    fn new(standard: Standard) -> State {
+    fn new(standard: Standard, rev: Revision) -> State {
         let raster = Raster::standard(standard);
-        let layout = Layout::of(raster, false, false);
+        let layout = Layout::of(raster, rev.is_aga(), false);
         State {
-            regs: Regs::default(),
+            regs: Regs::power_on(rev),
             pending: VecDeque::new(),
             clxdat: 0,
             joy: [0; 2],
@@ -822,8 +1052,12 @@ impl State {
     /// interlaced frame still weaves; any other change starts a blank one.
     fn relayout(&mut self, rev: Revision) {
         self.raster = self.raster_next;
-        let superhires =
-            rev == Revision::Ecs && (self.shres_seen || self.regs.bplcon0 & SHRES != 0);
+        // Lisa positions everything — scroll, window, sprites — on a 35 ns
+        // grid in every resolution (AA specification, §2, *Horizontal
+        // Comparators*), so its picture is always in 35 ns columns and never
+        // rescales. An 8373 widens only while SuperHires is on screen.
+        let superhires = rev.is_aga()
+            || (rev == Revision::Ecs && (self.shres_seen || self.regs.bplcon0 & SHRES != 0));
         self.shres_seen = false;
         let layout = Layout::of(self.raster, superhires, self.regs.bplcon0 & LACE != 0);
         if layout == self.layout {
@@ -897,13 +1131,13 @@ impl State {
     }
 
     /// Apply every queued change stamped before `at`.
-    fn apply_before(&mut self, at: Stamp) {
+    fn apply_before(&mut self, rev: Revision, at: Stamp) {
         while let Some(change) = self.pending.front().copied() {
             if change.at >= at {
                 break;
             }
             self.pending.pop_front();
-            self.regs.apply(change.offset, change.value);
+            self.regs.apply(rev, change.offset, change.value);
         }
     }
 }
@@ -1189,13 +1423,20 @@ const fn rgb12_of(pixel: u32) -> u16 {
 
 /// Render one line into `st`. The heart of the chip.
 fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
+    if rev.is_aga() {
+        aga::render(st, line);
+        return;
+    }
     let field = st.fields;
     let vpos = line.vpos;
-    st.apply_before(Stamp {
-        field,
-        vpos,
-        hpos: 0,
-    });
+    st.apply_before(
+        rev,
+        Stamp {
+            field,
+            vpos,
+            hpos: 0,
+        },
+    );
     st.clocks = st.clocks.wrapping_add(u64::from(line.clocks));
 
     // Which rows of the picture this line lands on. Interlace is decided at
@@ -1267,7 +1508,7 @@ fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
                 break;
             }
             st.pending.pop_front();
-            st.regs.apply(change.offset, change.value);
+            st.regs.apply(rev, change.offset, change.value);
             changed = true;
         }
         if changed {
@@ -1491,7 +1732,7 @@ impl Video {
         Video {
             standard,
             rev,
-            state: Mutex::with_rank(LockRank::LEAF, State::new(standard)),
+            state: Mutex::with_rank(LockRank::LEAF, State::new(standard, rev)),
             beam: Mutex::with_rank(LockRank::LEAF, None),
             bus: Mutex::with_rank(LockRank::LEAF, Weak::new()),
         }
@@ -1632,7 +1873,7 @@ impl Video {
     fn reset(&self) {
         let mut st = self.state.lock();
         let pins = st.mouse_pins;
-        *st = State::new(self.standard);
+        *st = State::new(self.standard, self.rev);
         st.mouse_pins = pins;
         st.settle_counters();
     }
@@ -1688,7 +1929,11 @@ impl Video {
         // into the other: the raster a beam handed over says how *this* field
         // is laid out, not which chip it was.
         w.write_bool(self.standard == Standard::Ntsc)?;
-        w.write_bool(self.rev == Revision::Ecs)?;
+        w.write_u8(match self.rev {
+            Revision::Ocs => 0,
+            Revision::Ecs => 1,
+            Revision::Aga => 2,
+        })?;
         for raster in [st.raster, st.raster_next] {
             save_raster(w, raster)?;
         }
@@ -1735,12 +1980,20 @@ impl Video {
             });
         }
         let ntsc = r.read_bool()?;
-        let ecs = r.read_bool()?;
-        if ntsc != (self.standard == Standard::Ntsc) || ecs != (self.rev == Revision::Ecs) {
+        let rev = match r.read_u8()? {
+            0 => Revision::Ocs,
+            1 => Revision::Ecs,
+            2 => Revision::Aga,
+            other => {
+                return Err(Error::State(alloc::format!(
+                    "{CLASS_NAME}: revision {other} is not one this chip has"
+                )));
+            }
+        };
+        if ntsc != (self.standard == Standard::Ntsc) || rev != self.rev {
             return Err(Error::State(alloc::format!(
-                "{CLASS_NAME}: the snapshot is of a {} {} Denise and this is a {:?} {:?} one",
+                "{CLASS_NAME}: the snapshot is of a {} {rev:?} Denise and this is a {:?} {:?} one",
                 if ntsc { "NTSC" } else { "PAL" },
-                if ecs { "ECS" } else { "OCS" },
                 self.standard,
                 self.rev,
             )));
@@ -1750,11 +2003,17 @@ impl Video {
         let rows = r.read_u16()?;
         let scale = r.read_u16()?;
         let shres_seen = r.read_bool()?;
-        let widest = if self.rev == Revision::Ecs { 4 } else { 2 };
-        if !(1..=2).contains(&rows) || !(scale == 2 || scale == widest) {
+        // Lisa's picture is always in 35 ns columns; an 8373's is in them
+        // only while SuperHires is on screen; an 8362 has none.
+        let scales: &[u16] = match self.rev {
+            Revision::Ocs => &[2],
+            Revision::Ecs => &[2, 4],
+            Revision::Aga => &[4],
+        };
+        if !(1..=2).contains(&rows) || !scales.contains(&scale) {
             return Err(Error::State(alloc::format!(
                 "{CLASS_NAME}: {rows} rows a line and {scale} columns a pixel; a {:?} Denise's \
-                 picture has one or two, and two or {widest}",
+                 picture has one or two, and one of {scales:?}",
                 self.rev
             )));
         }
@@ -1846,6 +2105,7 @@ impl CustomChip for Video {
             JOY0DAT => self.state.lock().joy[0],
             JOY1DAT => self.state.lock().joy[1],
             DENISEID if self.rev == Revision::Ecs => ECS_DENISEID,
+            DENISEID if self.rev.is_aga() => LISA_ID,
             // An 8362 never gets here: `drives` below tells the bus this part
             // has no such register, and the bus answers off the chip data
             // lines instead.
@@ -1865,12 +2125,12 @@ impl CustomChip for Video {
     /// gives. Not driving leaves the read a cycle nothing drove, which is what
     /// Commodore's own detection relies on.
     fn drives(&self, reg: &Reg) -> bool {
-        reg.offset != DENISEID || self.rev == Revision::Ecs
+        reg.offset != DENISEID || self.rev.is_ecs()
     }
 
     fn write(&self, reg: &Reg, value: u16, from: Origin) {
         let offset = reg.offset;
-        if Regs::timed(offset) {
+        if Regs::timed(self.rev, offset) {
             // Ask the beam first, with nothing locked: asking may make Agnus
             // catch up and push lines into this very chip.
             let now = if from.debug { None } else { self.now() };
@@ -1882,9 +2142,9 @@ impl CustomChip for Video {
                     // goes first so the order of writes is kept.
                     let queued: Vec<Change> = st.pending.drain(..).collect();
                     for c in queued {
-                        st.regs.apply(c.offset, c.value);
+                        st.regs.apply(self.rev, c.offset, c.value);
                     }
-                    st.regs.apply(offset, value);
+                    st.regs.apply(self.rev, offset, value);
                 }
                 Some(pos) => {
                     let at = Stamp {
@@ -1895,7 +2155,7 @@ impl CustomChip for Video {
                     st.pending.push_back(Change { at, offset, value });
                     while st.pending.len() > MAX_PENDING {
                         if let Some(c) = st.pending.pop_front() {
-                            st.regs.apply(c.offset, c.value);
+                            st.regs.apply(self.rev, c.offset, c.value);
                         }
                     }
                 }
@@ -1964,8 +2224,8 @@ impl Denise {
     /// # Errors
     ///
     /// [`Error::Property`] if `custom` is missing, `standard` is not `"pal"`
-    /// or `"ntsc"`, `revision` is not `"ocs"` or `"ecs"`, or a property
-    /// nothing here accepts was given.
+    /// or `"ntsc"`, `revision` is not `"ocs"`, `"ecs"` or `"aga"`, or a
+    /// property nothing here accepts was given.
     pub fn new(props: &Props) -> Result<Denise> {
         let mut r = props.reader();
         let custom = r.require_link("custom")?.as_str().to_string();
@@ -1973,7 +2233,8 @@ impl Denise {
             "ntsc" => Standard::Ntsc,
             _ => Standard::Pal,
         };
-        let rev = match r.or_enum("revision", "ocs", &["ocs", "ecs"])? {
+        let rev = match r.or_enum("revision", "ocs", &["ocs", "ecs", "aga"])? {
+            "aga" => Revision::Aga,
             "ecs" => Revision::Ecs,
             _ => Revision::Ocs,
         };
@@ -2054,7 +2315,7 @@ impl Instance for Denise {
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "the Amiga's Denise video chip: colour table, playfields, sprites, collisions",
+    summary: "the Amiga's Denise/Lisa video chip: colour table, playfields, sprites, collisions",
     properties: &[
         PropertySpec {
             name: "custom",
@@ -2072,7 +2333,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "revision",
             kind: ValueKind::Str,
             required: false,
-            summary: "`ocs` (default, an 8362) or `ecs` (an 8373: DENISEID, BPLCON3, DIWHIGH, SuperHires, a picture in SuperHires pixels)",
+            summary: "`ocs` (default, an 8362), `ecs` (an 8373: DENISEID, BPLCON3, DIWHIGH, SuperHires) or `aga` (Lisa: eight bitplanes, 256 24-bit colours, HAM8, FMODE, BPLCON4)",
         },
     ],
     construct: |props| Ok(Box::new(Denise::new(props)?)),
@@ -2102,7 +2363,7 @@ pub fn schema() -> ClassSchema {
     let mut schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("custom", ValueKind::Link).required())
         .prop(PropSchema::new("standard", ValueKind::Str))
-        .prop(PropSchema::new("revision", ValueKind::Str).values(&["ocs", "ecs"]));
+        .prop(PropSchema::new("revision", ValueKind::Str).values(&["ocs", "ecs", "aga"]));
     for pin in MOUSE_PINS {
         schema = schema.port(pin, PortDir::In);
     }
