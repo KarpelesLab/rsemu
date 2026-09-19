@@ -1159,11 +1159,11 @@ any document at hand.
 ## AA: Lisa, the display half
 
 `amiga.denise` with `revision = "aga"` is **Lisa**, the AA chip set's video
-chip. There is no AA board yet — Alice, the AA Agnus, and the A1200 come
-next — so Lisa is driven by hand in `src/dev/amiga/denise/aga/tests.rs` and
-`tests/amiga_lisa.rs`, the way `amiga_denise_board.rs` drove Denise before
-Agnus existed. `src/dev/amiga/denise/aga.rs` is the ledger of what the AA
-specification settles and what it leaves open; this is the summary.
+chip. She is driven by hand in `src/dev/amiga/denise/aga/tests.rs` and
+`tests/amiga_lisa.rs` — written before Alice existed, the way
+`amiga_denise_board.rs` drove Denise before Agnus did — and by Alice on the
+[A1200](#a1200) below. `src/dev/amiga/denise/aga.rs` is the ledger of what the
+AA specification settles and what it leaves open; this is the summary.
 
 **An 8362 and an 8373 are untouched, and that is checked, not asserted.**
 Every Amiga golden — `amiga_a500_kickstart`, `amiga_a500_workbench`,
@@ -1188,7 +1188,12 @@ are what they were.
 | Sprites | `SPRES` (the ECS default, 140, 70 or 35 ns, whatever the playfield's resolution), 16/32/64-bit data by `FMODE`'s `SPR32`/`SPAGEM`, attachment in every resolution, `BRDSPRT` behind `ECSENA`, and `SSCAN2` taking `SH10` out of the comparison |
 | `CLXCON2` | Planes 7 and 8 in collisions; a `CLXCON` write clears it |
 
-### The seam Alice needs
+### The seam Alice needs, and what she does with it
+
+Alice landed on the other side of it and needed nothing changed; the four
+points below are as they were written, and `src/dev/amiga/agnus/aga.rs` is her
+half.
+
 
 1. **Bitplanes**: `denise::Fetch::planes` is eight streams now. A 32- or
    64-bit fetch is that many consecutive pixels — "the parallel to serial
@@ -1232,3 +1237,192 @@ real host adapter, asserts their pixels, and writes `lisa-256.png`,
 with `display-png`: a 16 × 16 chart of 256 24-bit colours, a HAM8 gradient of
 some eight thousand colours with the HAM fringe at its left edge, and one
 64-pixel sprite at 140, 70 and 35 ns over a 256-colour background.
+
+## AA: Alice, the DMA half
+
+`amiga.agnus` with `revision = "aga"` is **Alice**, the 8374: everything an
+8375 does ([*ECS*](#ecs-the-enhanced-chip-set-and-the-a500)) and the AA
+additions on top. `src/dev/amiga/agnus/aga.rs` is the ledger — what the
+*Specification for the Advanced Amiga (AA) Chip Set* settles, what it leaves
+open, and which sentence each behaviour comes from; this is the summary.
+
+**An 8370, an 8371, an 8372A and an 8375 are untouched, and that is checked,
+not asserted.** `FMODE` is decoded on every part, because the decode is a
+property of the address map, and acted on by none but Alice; the bitplane 7 and
+8 pointers are held by Alice alone; and `BPLCON0`'s `BPU3` is a bit only she
+has. Two unit tests say so by name, and all eight Amiga goldens —
+`amiga_a500_kickstart`, `amiga_a500_workbench`, `amiga_a500plus` and
+`amiga_a600_hdf` against the user's ROMs and disks, and `amiga_a500_chipset`,
+`amiga_denise_board`, `agnus_board` and `amiga_lisa` without them — are the
+hashes they were.
+
+### What Alice does
+
+| | |
+| --- | --- |
+| Eight bitplanes | `BPL7PT` `$0F8`/`$0FA` and `BPL8PT` `$0FC`/`$0FE` (§3), fetched when `BPLCON0`'s `BPU3` at bit 4 counts past six: "0000-1000 (NONE thru 8 inclusive)" (§4) |
+| `FMODE`'s fetch widths | §4's table: a bitplane or sprite transfer moves 2, 4 or 8 bytes, "normal CAS" or "double CAS", on a 16- or 32-bit bus. One, two or four words a transfer for each |
+| The sprite seam | 16 bits still go through the register bus; 32 and 64 go to Lisa through `Video::sprite_dma`, left-justified, queued behind the `SPRxPOS`/`SPRxCTL` writes of the same DMA slot |
+| `BSCAN2` | The modulus becomes the *line's* rather than the plane's: `BPL1MOD` when `DIWSTRT`'s `V0` matches the beam counter's, `BPL2MOD` when it does not (§2, *Bitplanes*) |
+| `SSCAN2` | With a sprite's own `SH10` set, its data fetch is skipped on a line of the wrong parity and "LISA reuses the sprite data from the previous line" (§2, *Sprites*) |
+| 2 MiB of chip RAM | "PTL,PTH=20 bit Pointer that addresses DMA data … (old chips- 18 bits)" (§3) — twenty bits of address from bit 1 is 2 MiB, so Alice's reach is not a property: `reach = 2M` may be written and nothing else |
+| `DDFSTRT`, `DDFSTOP` | One bit more, `H2` — "H8 H7 H6 H5 H4 H3 H2 X" against bits 7–0 (§4) — so a fetch starts on an even colour clock rather than a multiple of four |
+| `VPOSR` | `$22` PAL and `$32` NTSC: "8374(alice)" (§4) |
+
+**The blitter and the copper are unchanged**, and that is a finding rather than
+an omission: §4's `BLTxPT`, `BLTxMOD`, `BLTAFWM`/`BLTALWM`, `BLTxDAT`,
+`BLTCON0`, `BLTCON1`, `BLTSIZE`, `BLTSIZH`/`BLTSIZV`, `COPCON`, `COPxLC`,
+`COPJMP1`/`COPJMP2` and `COPINS` pages are the Enhanced Chip Set's pages word
+for word — `BLTCON0L`, `BLTSIZV` and `BLTSIZH` still carry `h`, "new for HiRes
+chip set", and `COPCON`'s rule is still "if 0, access to RGA>7E". Both engines
+gain the wider pointer and nothing else. `UHRES` — `BPLHPT`, `SPRHPT`,
+`BPLHMOD`, `SPRHSTRT` and the rest — is held and not acted on, as on an 8375:
+it drives external logic no board here has.
+
+### Where the document is silent
+
+Each is marked in `aga.rs` as an inference.
+
+* **How many words a line a wide `FMODE` fetches.** §5's key says a mode "needs
+  1x / 2x / 4x Bandwidth" and its scroll table gives one fetch's worth of
+  pixels — 16, 32 or 64 bitplane pixels — so `FMODE` buys bus cycles, not
+  picture, and the word count a line is the window's. What the document does
+  not give is the rounding: a transfer is indivisible, so the count is rounded
+  **up** to a multiple of the width here, and the pointer advances by twice
+  that before the modulo. Truncating instead would fetch fewer pixels than the
+  window displays. A program whose window is a whole number of transfers wide
+  cannot tell.
+* **The width of a sprite's *control* fetch.** §4's table is the sprite
+  channel's fetch increment and names no exception, so `SPRxPOS` and `SPRxCTL`
+  are each the first word of a transfer of the same width and the rest of it is
+  skipped — which is what a sprite structure padded to the fetch width expects.
+* **What a scan-doubled sprite does at the ends of its run.** Only the *data*
+  fetch is gated by the parity: a control fetch is what loads `SPRxPOS`, so the
+  bits the gate asks about are not there yet, and §2's note that "sprite
+  vertical start and stop positions must be of the same parity" keeps a `VSTOP`
+  line on the fetching side anyway.
+* **`VPOSR` collides with the 8375's.** The AA specification's own copy of the
+  identification list reads "8372(fat-hr) (agnushr), rev. 5 = 21 PAL, 31 NTSC",
+  one less than the `$22` this tree gives the 8375 (whose value was itself read
+  off a differently-transcribed copy of the same table). One of the two
+  readings is wrong and no document at hand settles which. Alice takes the
+  value her own specification gives her, `$22`/`$32`, and the 8375 keeps `$22`
+  rather than moving four real-ROM goldens on a guess. Nothing measured depends
+  on it: see the A1200's evidence below, where swapping Alice for an 8375
+  changed `ChipRevBits0` not at all.
+
+### Tests
+
+* `src/dev/amiga/agnus/aga.rs` (ROM-free): the four `FMODE` widths for
+  bitplanes and for sprites, `BSCAN2`'s modulus choice, `SSCAN2`'s parity gate,
+  a transfer left-justified in a `u64`, and `BPU3`.
+* `src/dev/amiga/agnus/tests.rs` (ROM-free): Alice's `VPOSR`; the bitplane 7
+  and 8 pointers held by her and by no older part; eight planes fetched with
+  their own pointers and both modulos; `BPU = 8` putting colour 128 on a real
+  Lisa's screen; each `FMODE` width's word count and the rounding; a 64-bit
+  fetch drawing what four 16-bit fetches draw; `H2` in `DDFSTRT`; `BSCAN2` with
+  and without; a wide sprite's six transfers; `SSCAN2` skipping half of them;
+  2 MiB addressed through a twenty-bit pointer; and a snapshot round trip.
+* `tests/amiga_alice.rs` (ROM-free, on the shipped A1200): a hand-assembled
+  68EC020 program and a copper list put eight bitplanes out of the **second**
+  megabyte on screen as twenty sawtooth ramps of colours 128–143, draw the
+  identical picture at all three `FMODE` widths, and place a 64-pixel sprite
+  Alice fetched four words a transfer. `alice-256.png` and `alice-sprite.png`
+  in `RSEMU_AMIGA_FRAME_DIR`.
+
+## A1200
+
+`machines/amiga-a1200.machine` is the A600's Gayle, CIAs, Paula and DF0 around
+the AA chip set, with a **68EC020 at 14.19 MHz** and **2 MiB of chip RAM**, and
+it boots Workbench 3.1 off the hard disk:
+
+```
+rsemu run amiga-a1200 --media kickstart=kickstart:<rom dir>/amiga-os-310-a1200.rom \
+    --media hd0=<hdf dir>/workbench-311.hdf --vnc :5900
+```
+
+### Sources
+
+| Source | Covers |
+| --- | --- |
+| *Functional Specification for the Advanced Amiga Chip Set (AA)*, Commodore-Amiga, 06/07/91, ed. R. Raible | Everything both AA chips do: §1 the summary, §2 the explanations, §3 the register list, §4 the per-register pages, §5 the new Lisa modes |
+| *A1200 System Schematics Service Addendum*, Commodore, 1992 | The parts: "ALICE (AA AGNUS)", "LISA (AA DENISE)", "BUDGIE (ASIC)", "ROM 512KX16", "DRAM 256KX16" and its "OPTIONAL" pair, "TTL 28-37512 MHZ PAL" |
+| *GAYLE — Gate array for A300/A500+ — Specification*, Commodore, July 10 1991 | The same chip as the A600's, doing the same decoding: see the A600 section |
+| MC68020/MC68EC020 User's Manual | The EC020: the 68020 with twenty-four address pins and no dynamic bus sizing |
+| Black-box: Kickstart 3.1 (40.068, the A1200's own) | What it reads, writes and waits on; `GfxBase->ChipRevBits0`; how far each disk gets |
+
+No Amiga emulator source, no FPGA reimplementation of any Amiga chip, no AROS
+source and no Kickstart disassembly was consulted. The AA specification was
+fetched on its own, from a document archive rather than from any project's
+repository.
+
+### What the board changes from the A600
+
+| | A600 | A1200 |
+| --- | --- | --- |
+| Processor | 68000 at `clk / 4` | **68EC020** at `clk / 2` — 14.18758 MHz PAL, exactly twice the A600's |
+| Chips | 8375 Agnus, 8373 Denise | **Alice** and **Lisa**, `revision = "aga"` on both |
+| Chip RAM | 1 MiB | **2 MiB**, which is exactly what a twenty-bit pointer reaches |
+| Everything else | — | unchanged: the same Gayle object, the same decode, the same CIAs, Paula, DF0, keyboard and mouse |
+
+`mem` is 24 bits wide because that is how many address pins the part has, so
+the trapdoor's 32-bit local bus at `$08000000` is off the map by construction,
+as it is on a machine with an empty trapdoor. Bank 6 and `$DC0000` float, as
+on the A600.
+
+### How far each disk gets
+
+`tests/amiga_a1200.rs`, behind `RSEMU_AMIGA_ROM_DIR`, `RSEMU_AMIGA_HDF_DIR` and
+`RSEMU_AMIGA_ADF_DIR`, boots the user's files in place and checks a frame hash;
+each frame was looked at.
+
+| ROM + disk | Reaches | What is on screen |
+| --- | --- | --- |
+| Kickstart 3.1 (40.068) + `workbench-311.hdf` | the Workbench 3.1 desktop, 12 s | Black while the ROM finds Gayle and the drive and AmigaDOS runs the startup-sequence; then the grey 640-pixel Workbench screen — **1280 of Lisa's 35 ns columns** — "Copyright © 1985-1993 Commodore-Amiga, Inc. All Rights Reserved." in its title bar, the blue-framed "Workbench" window with the Ram Disk icon and the hard-disk icon "Workbench3.1", and the red pointer |
+| Kickstart 3.1 + `amiga-os-310-workbench.adf` in DF0, bay empty | the same desktop, about 70 s | Black while `trackdisk.device` reads the disk track by track; then the same screen and window with a **floppy** icon labelled "Workbench3.1" |
+| Kickstart 3.1, both drives empty | its insert-disk screen, 45 s | The processor is *stopped* for thirty-one seconds while `scsi.device` waits on a drive that is not there; then the purple screen, the gradient check mark, "3.1 ROM 40.068", and the drive with the disk part-way into the slot. Bit for bit the A600's screen at twice the width, so the picture is not by itself evidence of the chip set — the ROM version is |
+
+### The guest sees AA, and that is a test rather than a claim
+
+`GfxBase->ChipRevBits0`, read out of guest memory the way
+`tests/amiga_a500plus.rs` reads it for the Enhanced Chip Set — exec's library
+list walked from `ExecBase` by name, `gb_ChipRevBits0` at offset `$EC` of the
+library base:
+
+| Board | `ChipRevBits0` |
+| --- | --- |
+| A1200, once the ROM has a boot device | **`$1F`** — `GFXF_HR_AGNUS`, `GFXF_HR_DENISE`, `GFXF_AA_ALICE`, `GFXF_AA_LISA` and bit 4 |
+| A1200 with no boot device at all | `$13` — the AA pair is never set; the ROM sets it at 2 s on a board that boots, ten seconds before AmigaDOS mounts anything |
+| A600, same ROM family, same Gayle and CIAs and Paula | `$03` |
+
+**Which chip each bit comes from was measured**, by running the A1200's own
+machine source with one chip swapped for its Enhanced Chip Set part:
+
+| Board | `ChipRevBits0` |
+| --- | --- |
+| Alice + Lisa | `$13` → `$1F` |
+| Alice + 8373 Denise | `$03` → `$07` |
+| 8375 Agnus + Lisa | `$13` → `$1F` |
+
+So bit 3 (`GFXF_AA_LISA`) and bit 4 are `LISAID`'s, and **bit 2
+(`GFXF_AA_ALICE`) is not read off `VPOSR`**: an 8375 answering `$22` gets it
+too, and changing Alice's identification to `$23` moved nothing. What sets it
+is not settled.
+
+### Open, and not guessed at
+
+* **ScreenMode Preferences offers the A600's modes.** Driven through the input
+  seam — the volume window, the Prefs drawer, ScreenMode — the A1200 produces
+  the A600's window in every word: the same display-mode list, the same
+  "Maximum Size 16368 x 16384", and **"Maximum Colors: 16"** for PAL:High Res
+  where an AA machine should offer 256. Sixteen is 1× bandwidth's answer for
+  `HIRES`, which §5 says needs 2× for five bitplanes and up. It is not a boot
+  defect — Workbench opens, draws and is usable — but it is the open end of the
+  AA work. The ECS control is a test beside it (`the_same_session_on_the_ecs_board`)
+  so the finding cannot rot, and the two are `a1200-screenmode-*.png` and
+  `a600-screenmode-*.png` in `RSEMU_AMIGA_FRAME_DIR`. What has been ruled out:
+  Alice's `VPOSR` value, which changes nothing either way.
+* **What sets `GFXF_AA_ALICE`** — see the table above. Not `VPOSR`.
+* **The empty-bay delay**, as on the A600: what a real machine without a drive
+  reads from its IDE status register is whatever its unbuffered bus floats to,
+  and how long a real A1200 waits is not in any document at hand.

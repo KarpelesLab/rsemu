@@ -57,7 +57,7 @@ the question never arises.
 ### Machines
 | | |
 | --- | --- |
-| [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500: the memory map, the `OVL` overlay, the custom-chip register seam, the two CIAs, Paula's interrupts, disk, UART and audio, the floppy drive, the keyboard protocol and the mouse counters, ADF disks and their MFM tracks, and what the manual leaves open |
+| [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500, 500+, 600 and **1200**: the memory map, the `OVL` overlay, the custom-chip register seam, the two CIAs, Paula's interrupts, disk, UART and audio, the floppy drive, the keyboard protocol and the mouse counters, ADF disks and their MFM tracks, Gayle and its IDE port, the Enhanced Chip Set, the **AA chip set** (Alice and Lisa), and what each document leaves open |
 | [`platforms/apple1.md`](platforms/apple1.md) | Apple 1: the MC6821, the clock, and the monitor-ROM licence question |
 | [`platforms/nes.md`](platforms/nes.md) | NES / Famicom |
 | [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |
@@ -245,7 +245,7 @@ resource an emulator author would reach for by reflex, and each is off limits:
 | Bochs, DOSBox, MAME, VICE, Dolphin, PCSX2, Nestopia, higan | GPL/LGPL | Copyleft |
 | **Linux kernel source and in-tree `Documentation/`** | GPLv2 | See below — this one catches people |
 | SeaBIOS, coreboot | GPL | Use EDK II (BSD-2-Clause-Patent) instead |
-| UAE, WinUAE, FS-UAE, vAmiga, Hatari, and every other Amiga or 68k-machine emulator | GPL / copyleft | Use the *Amiga Hardware Reference Manual* ([`platforms/amiga.md`](platforms/amiga.md)) |
+| UAE, WinUAE, FS-UAE, vAmiga, Hatari, and every other Amiga or 68k-machine emulator; **minimig, MiST and MiSTer's Amiga cores**, which are reimplementations of the same chips under the same licences | GPL / copyleft | Use the *Amiga Hardware Reference Manual*, Commodore's *GAYLE* specification and its *Functional Specification for the Advanced Amiga Chip Set (AA)* ([`platforms/amiga.md`](platforms/amiga.md)). Note that a Commodore document is Commodore's whatever server it sits on — but fetch the document, not a copyleft project's copy of it inside its repository |
 | **AROS** source | AROS Public License (MPL-derived, weak copyleft) | A binary a board may *run* — a fine black-box fixture — never a source to read |
 
 ### The Linux kernel trap

@@ -463,7 +463,12 @@ in one — the machine file says so where it offers it. `amiga-a500plus` is the
 same board with the **Enhanced Chip Set** — an ECS Agnus with `BEAMCON0` and a
 programmable beam, an 8373 Denise with SuperHires — 1 MiB of chip RAM and the
 battery-backed clock; Kickstart 2.04 and 3.1 find the ECS chips there, and
-Workbench 2.04 boots on it.
+Workbench 2.04 boots on it. `amiga-a600` puts **Gayle** and an IDE hard disk
+in Gary's place, and `amiga-a1200` puts the **AA chip set** — Alice and Lisa,
+eight bitplanes, a 256-entry 24-bit colour table, HAM8 — around a 68EC020 with
+2 MiB of chip RAM: **Kickstart 3.1 boots Workbench 3.1 on it off the hard disk
+and off a floppy**, and `graphics.library` reads back the AA bits in
+`GfxBase->ChipRevBits0` where the A600 beside it reads only the ECS pair.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's
