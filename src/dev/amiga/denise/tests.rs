@@ -52,10 +52,14 @@ fn blank(v: &Video, vpos: u16) {
 
 /// A line whose fetch began at `start` with `planes` words.
 fn fetched(v: &Video, vpos: u16, start: u16, planes: [&[u16]; 6]) {
+    let [p1, p2, p3, p4, p5, p6] = planes;
     v.line(&Line {
         vpos,
         clocks: CLOCKS,
-        fetch: Fetch { start, planes },
+        fetch: Fetch {
+            start,
+            planes: [p1, p2, p3, p4, p5, p6, &[], &[]],
+        },
     });
 }
 

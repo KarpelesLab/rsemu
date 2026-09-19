@@ -131,7 +131,7 @@ fn push_field(v: &Video) {
             clocks: CLOCKS,
             fetch: Fetch {
                 start: 0x38,
-                planes: [&words, &[], &[], &[], &[], &[]],
+                planes: [&words, &[], &[], &[], &[], &[], &[], &[]],
             },
         });
     }

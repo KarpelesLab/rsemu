@@ -1,9 +1,15 @@
 //! The Amiga side of the scanout seam: Denise's picture as host pixels.
 //!
 //! [`DeniseScanout`] holds an `Arc<Video>` and does the two things Denise
-//! deliberately does not: expand its 12-bit `0RGB` words — four bits a gun,
-//! the colour register's encoding and what the chip's twelve RGB pins carry —
-//! to eight bits a channel, and turn a field's length into a frame period.
+//! deliberately does not: lay its `0x00RR_GGBB` picture words out as host
+//! bytes, and turn a field's length into a frame period.
+//!
+//! The picture is eight bits a gun because Lisa's is (the AA chip set's
+//! "256 colors deep and 25 bits wide (8 RED, 8 GREEN, 8 BLUE, 1 GENLOCK)",
+//! *Specification for the Advanced Amiga (AA) Chip Set*, §1). An 8362's or an
+//! 8373's four-bit guns reach it already expanded by [`rgb12_to_rgb888`]'s
+//! `n × 17` — the expansion this adapter used to make itself — so their host
+//! bytes are what they always were.
 //!
 //! # Why this is not `host::display::panel`
 //!
@@ -34,7 +40,7 @@
 //! 800 × 568 for a PAL A500 always, and for an ECS machine whatever its beam
 //! and SuperHires make it, which can change between two fields. So
 //! [`Scanout::capture`] takes the picture, its size and its field count from
-//! Denise in one call ([`Video::copy_frame`]) and reshapes the host's surface
+//! Denise in one call ([`Video::copy_frame_rgb`]) and reshapes the host's surface
 //! to it.
 //!
 //! # Getting hold of the chip
@@ -68,6 +74,13 @@ pub const fn rgb12_to_rgb888(word: u16) -> [u8; 3] {
         ((word >> 4) & 0xf) as u8 * 17,
         (word & 0xf) as u8 * 17,
     ]
+}
+
+/// A picture word, `0x00RR_GGBB`, as host bytes.
+#[must_use]
+#[inline]
+pub const fn rgb24_to_rgb888(word: u32) -> [u8; 3] {
+    [(word >> 16) as u8, (word >> 8) as u8, word as u8]
 }
 
 /// A [`Scanout`] over a Denise.
@@ -125,11 +138,11 @@ impl Scanout for DeniseScanout {
         // every adapter here gives: a serial never ahead of its pixels errs
         // toward one extra redraw rather than a missed one.
         let mut words = Vec::new();
-        let (width, height, serial) = self.video.copy_frame(&mut words);
+        let (width, height, serial) = self.video.copy_frame_rgb(&mut words);
         dst.reshape(dst.format(), width, height);
         for (i, word) in words.iter().enumerate() {
             let (x, y) = (i as u32 % width, i as u32 / width);
-            dst.put(x, y, rgb12_to_rgb888(*word));
+            dst.put(x, y, rgb24_to_rgb888(*word));
         }
         dst.set_serial(serial);
         serial
@@ -240,6 +253,39 @@ mod tests {
             (360, 480),
             "capture reshapes to the field's picture"
         );
+    }
+
+    /// An 8362's picture reaches the host as it always did: the chip now
+    /// expands its four-bit guns itself, and the adapter's old expansion of the
+    /// same colour register gives the same bytes.
+    #[test]
+    fn an_ocs_picture_comes_out_byte_for_byte_as_before() {
+        use crate::dev::amiga::denise::{Fetch, Line, Standard};
+
+        let video = Arc::new(Video::new(Standard::Pal));
+        let scanout = DeniseScanout::new(Arc::clone(&video), None);
+        // A colour written the way a copper would write it, then one pixel's
+        // bytes compared against the adapter's old expansion of it.
+        let custom = crate::dev::amiga::regs::lookup(0x180).expect("COLOR00");
+        crate::dev::amiga::custom::CustomChip::write(
+            &*video,
+            custom,
+            0x0f80,
+            crate::dev::amiga::custom::Origin::cpu(),
+        );
+        for vpos in 0..313 {
+            video.line(&Line {
+                vpos,
+                clocks: 227,
+                fetch: Fetch::default(),
+            });
+        }
+        let mut surface = Surface::new(PixelFormat::RGB888, 1, 1);
+        scanout.capture(&mut surface);
+        let mut row = [0u16; 1];
+        video.read_row(100, &mut row);
+        assert_eq!(row[0], 0x0f80, "the twelve-bit view is the register");
+        assert_eq!(surface.get(0, 100), Some(rgb12_to_rgb888(0x0f80)));
     }
 
     #[test]

@@ -224,7 +224,7 @@ use super::regs::{ChipId, Reg};
 pub const CLASS_NAME: &str = "amiga.denise";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// Columns in the picture, in high-resolution pixels.
 pub const WIDTH: u32 = 800;
@@ -381,12 +381,22 @@ pub struct Fetch<'a> {
     /// The horizontal beam position, in colour clocks, at which the first word
     /// was fetched — `DDFSTRT` on a line where the fetch started on time.
     pub start: u16,
-    /// The words fetched for bitplanes 1–6, in fetch order, leftmost first.
+    /// The words fetched for bitplanes 1–8, in fetch order, leftmost first.
     ///
     /// A plane `BPLCON0` does not enable is ignored whatever is here, and so is
     /// anything past [`MAX_FETCH_WORDS`]. An empty slice is a plane with no data
     /// on this line: its pixels are zero.
-    pub planes: [&'a [u16]; 6],
+    ///
+    /// Planes 7 and 8 are Lisa's, and an 8362 or 8373 ignores them whatever
+    /// `BPU` says. **A wider `FMODE` needs nothing new here**: a fetch of 16,
+    /// 32 or 64 bits is that many consecutive pixels, most significant bit
+    /// first — "the parallel to serial conversion is triggered whenever bit
+    /// plane #1 is written, indicating the completion of all bit planes for
+    /// that word (16/32/64 pixels). The MSB is output first, and is therefore
+    /// always on the left" (AA specification, §4, `BPLxDAT`). So the wider
+    /// fetch is the same word stream with more words per slot, and Alice puts
+    /// each fetch's words here in the order the chip shifts them out.
+    pub planes: [&'a [u16]; 8],
 }
 
 /// One line, from the chip that counts the beam.
@@ -755,8 +765,14 @@ struct State {
     /// A SuperHires line has been drawn in this field, so the next is laid
     /// out in SuperHires columns too.
     shres_seen: bool,
-    /// The picture: `layout.width() × layout.height()` 12-bit RGB words.
-    frame: Vec<u16>,
+    /// The picture: `layout.width() × layout.height()` words of `0x00RR_GGBB`.
+    ///
+    /// Twenty-four bits because Lisa's guns are eight bits each. An 8362 and
+    /// an 8373 put `n × 17` of each four-bit gun here, which is the exact
+    /// expansion the host adapter used to make from the twelve-bit word, so
+    /// their pictures come out byte for byte what they were —
+    /// [`Video::read_row`] still hands out the twelve-bit form.
+    frame: Vec<u32>,
 }
 
 impl fmt::Debug for State {
@@ -1141,6 +1157,36 @@ fn shr_colour(word: u16, top: bool) -> u16 {
     out
 }
 
+/// A twelve-bit `0RGB` colour register as the picture holds it: each four-bit
+/// gun repeated into eight, `n × 17`.
+///
+/// The same expansion the host adapter always made from an 8362's word, moved
+/// one step earlier so one picture buffer serves every part. It is also what
+/// Lisa's own hardware does with a `LOCT = 0` write (AA specification, §4,
+/// `COLORx`: "the 4 bit values are automatically extended to 8 bits"), so the
+/// two paths agree by construction rather than by coincidence.
+#[inline]
+const fn rgb12(word: u16) -> u32 {
+    let mut out = 0u32;
+    let mut shift = 0;
+    while shift < 24 {
+        let nibble = ((word as u32) >> (shift / 2)) & 0xf;
+        out |= (nibble << 4 | nibble) << shift;
+        shift += 8;
+    }
+    out
+}
+
+/// The twelve-bit form of a picture word: the top nibble of each gun.
+///
+/// Exactly inverts [`rgb12`], so an 8362's or 8373's picture reads back as the
+/// colour register that drew it. On Lisa it is the four most significant bits
+/// of each eight, which is all twelve RGB pins ever carried.
+#[inline]
+const fn rgb12_of(pixel: u32) -> u16 {
+    (((pixel >> 20) & 0xf) << 8 | ((pixel >> 12) & 0xf) << 4 | ((pixel >> 4) & 0xf)) as u16
+}
+
 /// Render one line into `st`. The heart of the chip.
 fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
     let field = st.fields;
@@ -1308,7 +1354,7 @@ fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
                     let col = q + half as i32 - left;
                     if (0..width).contains(&col) {
                         for row in rows.into_iter().flatten() {
-                            st.frame[row * width as usize + col as usize] = colour;
+                            st.frame[row * width as usize + col as usize] = rgb12(colour);
                         }
                     }
                 }
@@ -1375,7 +1421,7 @@ fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
                     let col = q - left;
                     if (0..width).contains(&col) {
                         for row in rows.into_iter().flatten() {
-                            st.frame[row * width as usize + col as usize] = colour;
+                            st.frame[row * width as usize + col as usize] = rgb12(colour);
                         }
                     }
                 }
@@ -1383,7 +1429,7 @@ fn render(rev: Revision, st: &mut State, line: &Line<'_>) {
                 let col = hx - left;
                 if (0..width).contains(&col) {
                     for row in rows.into_iter().flatten() {
-                        st.frame[row * width as usize + col as usize] = colour;
+                        st.frame[row * width as usize + col as usize] = rgb12(colour);
                     }
                 }
             }
@@ -1523,7 +1569,27 @@ impl Video {
     ///
     /// `dst` is filled as far as it and the row go; a `y` past the bottom
     /// leaves it alone.
+    ///
+    /// Twelve bits is an 8362's and an 8373's whole colour register, so for
+    /// those two this is the picture exactly. On Lisa it is the top four bits
+    /// of each eight-bit gun — the twelve pins the older parts had — and
+    /// [`read_row_rgb`](Self::read_row_rgb) is the full picture.
     pub fn read_row(&self, y: u32, dst: &mut [u16]) {
+        let st = self.state.lock();
+        let (width, height) = (st.layout.width(), st.layout.height());
+        if y >= height {
+            return;
+        }
+        let at = y as usize * width as usize;
+        let n = dst.len().min(width as usize);
+        for (out, px) in dst[..n].iter_mut().zip(&st.frame[at..at + n]) {
+            *out = rgb12_of(*px);
+        }
+    }
+
+    /// Row `y` of the picture as `0x00RR_GGBB` words, eight bits a gun. No
+    /// side effects.
+    pub fn read_row_rgb(&self, y: u32, dst: &mut [u32]) {
         let st = self.state.lock();
         let (width, height) = (st.layout.width(), st.layout.height());
         if y >= height {
@@ -1537,7 +1603,20 @@ impl Video {
     /// The whole picture, as 12-bit `0RGB` words row after row, and its size
     /// and field count — all as of one moment, which a host that reads row by
     /// row while the geometry can change would not get. No side effects.
+    ///
+    /// Twelve bits for the reason [`read_row`](Self::read_row) gives;
+    /// [`copy_frame_rgb`](Self::copy_frame_rgb) is the full picture.
     pub fn copy_frame(&self, dst: &mut Vec<u16>) -> (u32, u32, u64) {
+        let st = self.state.lock();
+        dst.clear();
+        dst.extend(st.frame.iter().map(|px| rgb12_of(*px)));
+        (st.layout.width(), st.layout.height(), st.fields)
+    }
+
+    /// The whole picture as `0x00RR_GGBB` words, eight bits a gun, with its
+    /// size and field count, all as of one moment. No side effects. What a
+    /// host shows.
+    pub fn copy_frame_rgb(&self, dst: &mut Vec<u32>) -> (u32, u32, u64) {
         let st = self.state.lock();
         dst.clear();
         dst.extend_from_slice(&st.frame);
@@ -1619,7 +1698,7 @@ impl Video {
         // The picture is architectural state in the sense `dev::lcd::panel`
         // argues: nothing else saves it, and an interlaced frame keeps the
         // other field's rows from before the snapshot.
-        let mut bytes = Vec::with_capacity(st.frame.len() * 2);
+        let mut bytes = Vec::with_capacity(st.frame.len() * 4);
         for px in &st.frame {
             bytes.extend_from_slice(&px.to_le_bytes());
         }
@@ -1685,18 +1764,18 @@ impl Video {
         };
         let bytes = r.read_bytes()?;
         let expected = layout.width() as usize * layout.height() as usize;
-        if bytes.len() != expected * 2 {
+        if bytes.len() != expected * 4 {
             return Err(Error::State(alloc::format!(
                 "{CLASS_NAME}: the snapshot's picture is {} bytes and its raster's is {}",
                 bytes.len(),
-                expected * 2
+                expected * 4
             )));
         }
         let frame = bytes
-            .as_chunks::<2>()
+            .as_chunks::<4>()
             .0
             .iter()
-            .map(|b| u16::from_le_bytes(*b) & 0x0fff)
+            .map(|b| u32::from_le_bytes(*b) & 0x00ff_ffff)
             .collect();
 
         let mut st = self.state.lock();

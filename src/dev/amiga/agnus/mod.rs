@@ -1148,10 +1148,11 @@ impl Shared {
                             clocks: *clocks,
                             fetch: denise::Fetch {
                                 start: *start,
-                                planes: [
-                                    &planes[0], &planes[1], &planes[2], &planes[3], &planes[4],
-                                    &planes[5],
-                                ],
+                                // Six planes are all an OCS or ECS Agnus fetches;
+                                // bitplanes 7 and 8 are Alice's, and empty here.
+                                planes: core::array::from_fn(|i| {
+                                    planes.get(i).map_or(&[][..], Vec::as_slice)
+                                }),
                             },
                         }),
                         Outward::Field { lof, raster } => {
