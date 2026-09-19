@@ -1252,6 +1252,12 @@ impl TickCursor {
         self.inner.anchor.store(ticks, AtomicOrdering::Relaxed);
     }
 
+    /// Whether `other` is this very cursor rather than another with the same
+    /// reading.
+    fn is_same(&self, other: &TickCursor) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// The requester id this cursor's runnable was bound to, or zero.
     fn requester(&self) -> u32 {
         self.inner.requester.load(AtomicOrdering::Relaxed)
@@ -2380,6 +2386,80 @@ impl LazyHandle {
             .cursor_of(requester)
             .and_then(|cursor| cursor.tick_in(self.id, cursor.get()))
             .map_or(present, |seen| seen.max(present))
+    }
+
+    /// Where a **write** from the runnable whose accesses carry `requester`
+    /// happens in this device's domain, when that is somewhere catch-up could
+    /// not put the device — or `None` when the write happens where the device
+    /// already stands, which is where every write used to be applied.
+    ///
+    /// # What it is for
+    ///
+    /// A write that *arms* something — a local APIC's initial count, an 8254
+    /// count, an HPET's enable bit — starts an interval, and an interval
+    /// starts at the instruction that wrote it. On a crystal two runnables
+    /// share, neither has a live view (`Scheduler::arm_live_cursors`, *Not on a
+    /// shared crystal*), so the device stands where the round began while
+    /// the writer may be most of a round further on, and a timer applied at
+    /// the device's own tick fires up to a round **early** against the
+    /// instruction that armed it. Measured from the arming instruction to the
+    /// handler on `pc-apic`, a 12 500-cycle alarm arrived after 3 659 (APIC),
+    /// 3 494 (HPET) and 3 565 (8254) cycles.
+    ///
+    /// # What a device does with it, and what it must not
+    ///
+    /// **Fold it into the arithmetic; never advance to it.** The answer is
+    /// usually ahead of the device, and nothing may carry a device past a
+    /// runnable that has not reached that point — the other processor on the
+    /// crystal may still be executing the start of this round. So a device
+    /// keeps its own tick and records that the interval *begins* at the
+    /// writer's tick: the APIC adds the distance to its countdown, the 8254
+    /// delays the clock pulse that loads the count, the HPET holds a counter
+    /// it was told to start until then. The device's next event is then an
+    /// absolute tick in the future of everyone — the writer's position plus
+    /// the interval — which the scheduler already knows how to wait for: it
+    /// bounds a later round there (`Scheduler::natural_target`) and
+    /// delivers the event when that round closes, with every runnable at the
+    /// instant. Nothing fires early for anyone, because nothing fires before
+    /// the round that ends on its instant; and nothing moved in between.
+    ///
+    /// # When it is `None`
+    ///
+    /// * The device is live-armed with **this writer's own** cursor: catch-up
+    ///   before the access already put it at the writer's cycle, which is how
+    ///   a one-processor board has always applied a write. Answering there
+    ///   too would round the same position a second way (the read line keeps
+    ///   a remainder the live view drops) and could move an arming by a tick — on
+    ///   exactly the boards whose arming was already exact.
+    /// * The requester is anonymous or bound to nobody, there is no `run` call
+    ///   in progress, or the device did not ask for read views
+    ///   ([`LazyHandle::read_at_readers`]): nothing can say where the writer
+    ///   stands, and the write lands where the device is.
+    ///
+    /// Otherwise it is the writer's position as [`LazyHandle::reader_tick`]
+    /// computes it — the same line, the same cap at the round's end — and
+    /// never below where the scheduler last published the device. The
+    /// device may still stand a tick further than that (an event delivered at
+    /// a round's close lands ahead of its tree by less than a tick), so it
+    /// takes the larger of this and its own tick.
+    ///
+    /// The number depends on the writer's own position and nothing else, so it
+    /// is the same in the deterministic and the dispatched round.
+    pub fn writer_tick(&self, requester: u32) -> Option<u64> {
+        let cursor = self.slot.readers.cursor_of(requester)?;
+        let present = {
+            let state = self.slot.state.lock();
+            if state
+                .live
+                .as_ref()
+                .is_some_and(|live| live.cursor.is_same(&cursor))
+            {
+                return None;
+            }
+            state.present
+        };
+        let seen = cursor.tick_in(self.id, cursor.get())?;
+        Some(seen.max(present))
     }
 }
 
@@ -4425,6 +4505,13 @@ impl Scheduler {
     /// runnable gets one whatever crystal it is on — see [`TickCursor::tick_in`]
     /// and [`LazyHandle::reader_tick`]. Catch-up is what this method arms, and
     /// catch-up is what stays off a shared crystal.
+    ///
+    /// A **write** that arms a comparator reads the same line, for the same
+    /// reason and with the same restraint: [`LazyHandle::writer_tick`] says
+    /// where the writer stands and the device folds that into the interval it
+    /// is starting, keeping its own tick. The event that comes out is at an
+    /// absolute instant ahead of every runnable, so nothing is carried past
+    /// anybody and nothing fires early.
     fn arm_live_cursors(&mut self, index: usize, cursor: &TickCursor, shared: &[OscillatorId]) {
         if self.lazy_snapshot.is_none() {
             self.lazy_snapshot = Some(self.lazy.iter().cloned().collect());
@@ -6138,6 +6225,264 @@ mod tests {
         assert_eq!(quiet.reader_tick(1), quiet.present_tick());
         let cursor = sched.runnable_cursor(RunnableId(0)).unwrap();
         assert_eq!(cursor.tick_in(LazyId(0), 1_234_567), None);
+    }
+
+    // -- arming a comparator from where the writer stands ------------------
+
+    /// A one-shot alarm: a lazily-advanced device with a deadline a runnable
+    /// writes, and a record of the tick it fired on.
+    ///
+    /// Atomics rather than a lock, as a real device's published position is
+    /// and for the same reason: [`LazyDevice::current_tick`] and
+    /// [`LazyDevice::next_event_tick`] are asked with the scheduler's slot
+    /// held at [`LockRank::LEAF`], so neither may take a lock. `u64::MAX`
+    /// stands for *none* in both of the optional fields.
+    #[derive(Debug, Default)]
+    struct AlarmState {
+        tick: AtomicU64,
+        deadline: AtomicU64,
+        fired_at: AtomicU64,
+    }
+
+    impl AlarmState {
+        fn deadline(&self) -> Option<u64> {
+            match self.deadline.load(AtomicOrdering::Relaxed) {
+                u64::MAX => None,
+                at => Some(at),
+            }
+        }
+        fn fired_at(&self) -> Option<u64> {
+            match self.fired_at.load(AtomicOrdering::Relaxed) {
+                u64::MAX => None,
+                at => Some(at),
+            }
+        }
+    }
+
+    /// The device half of it. The runnable half holds the same `Arc`, which is
+    /// how a `MemOps::write` reaches a device's state in a real machine.
+    #[derive(Debug, Clone)]
+    struct Alarm(Arc<AlarmState>);
+
+    impl Default for Alarm {
+        fn default() -> Alarm {
+            Alarm(Arc::new(AlarmState {
+                tick: AtomicU64::new(0),
+                deadline: AtomicU64::new(u64::MAX),
+                fired_at: AtomicU64::new(u64::MAX),
+            }))
+        }
+    }
+
+    impl LazyDevice for Alarm {
+        fn current_tick(&self) -> u64 {
+            self.0.tick.load(AtomicOrdering::Relaxed)
+        }
+        fn advance_to(&mut self, tick: u64) {
+            assert!(
+                tick >= self.current_tick(),
+                "advance_to never goes backwards"
+            );
+            self.0.tick.store(tick, AtomicOrdering::Relaxed);
+            if self.0.deadline().is_some_and(|at| at <= tick) && self.0.fired_at().is_none() {
+                self.0.fired_at.store(tick, AtomicOrdering::Relaxed);
+            }
+        }
+        fn next_event_tick(&self) -> Option<u64> {
+            self.0.deadline().filter(|at| *at > self.current_tick())
+        }
+    }
+
+    /// The interval the alarm is armed for, in the device's own ticks.
+    const ALARM_INTERVAL: u64 = 1_500;
+
+    /// A processor that arms that alarm once, [`ALARM_INTERVAL`] of the
+    /// device's ticks after the instruction that arms it, and otherwise just
+    /// runs.
+    #[derive(Debug)]
+    struct Armer {
+        cursor: Arc<Mutex<Option<TickCursor>>>,
+        handle: Arc<Mutex<Option<LazyHandle>>>,
+        alarm: Alarm,
+        requester: u32,
+        /// The tick of its own to arm on, and what the arming write saw.
+        arm_at: u64,
+        armed: Option<u64>,
+        executed: u64,
+        charged: u64,
+    }
+
+    impl Runnable for Armer {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            let cursor = self.cursor.lock().clone().expect("wired");
+            let handle = self.handle.lock().clone().expect("wired");
+            let goal = self.charged + budget.ticks;
+            while self.executed < goal {
+                // A hundred of this processor's ticks are one of the device's,
+                // so an arming instant converts exactly.
+                self.executed += 100;
+                cursor.set(self.executed);
+                if self.armed.is_none() && self.executed >= self.arm_at {
+                    // What a device's write path does: catch up, ask where the
+                    // writer stands, fall back to the device's own tick, and
+                    // arm from there without moving the device.
+                    let _ = handle.sync(AccessKind::Guest);
+                    let at = handle
+                        .writer_tick(self.requester)
+                        .unwrap_or(0)
+                        .max(self.alarm.0.tick.load(AtomicOrdering::Relaxed));
+                    self.alarm
+                        .0
+                        .deadline
+                        .store(at + ALARM_INTERVAL, AtomicOrdering::Relaxed);
+                    self.armed = Some(at);
+                }
+            }
+            self.charged = goal;
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    /// `harts` processors on one 1 GHz crystal and an alarm on a 10 MHz can of
+    /// its own — `riscv-virt-smp`'s clocks, and the shape of every PC board's
+    /// timers. The **last** registered processor is the one that arms, on the
+    /// tick `arm_at` of its own clock.
+    fn armed_alarm(mode: ThreadingMode, arm_at: u64, harts: usize) -> (Scheduler, Alarm) {
+        let mut forest = ClockForest::new();
+        let core = forest
+            .add_oscillator("core", Rational::integer(1_000_000_000))
+            .unwrap();
+        let can = forest
+            .add_oscillator("rtc", Rational::integer(10_000_000))
+            .unwrap();
+        let domains: Vec<DomainId> = (0..harts)
+            .map(|n| {
+                forest
+                    .add_domain(&alloc::format!("cpu{n}"), core, 1, 1)
+                    .unwrap()
+            })
+            .collect();
+        let dev_domain = forest.add_domain("alarm", can, 1, 1).unwrap();
+        let mut sched = Scheduler::new(
+            forest,
+            SchedulerConfig {
+                mode,
+                workers: 2,
+                ..SchedulerConfig::default()
+            },
+        );
+        let alarm = Alarm::default();
+        let dev = sched.add_lazy_device(dev_domain, Box::new(alarm.clone()));
+        let handle = sched.lazy_handle(dev).unwrap();
+        handle.read_at_readers();
+        for (n, domain) in domains.iter().enumerate() {
+            let cursor = Arc::new(Mutex::new(None));
+            let id = if n + 1 == harts {
+                sched.add_runnable(
+                    *domain,
+                    Box::new(Armer {
+                        cursor: Arc::clone(&cursor),
+                        handle: Arc::new(Mutex::new(Some(handle.clone()))),
+                        alarm: alarm.clone(),
+                        requester: n as u32 + 1,
+                        arm_at,
+                        armed: None,
+                        executed: 0,
+                        charged: 0,
+                    }),
+                )
+            } else {
+                sched.add_runnable(*domain, Box::new(Cpu::default()))
+            };
+            sched.bind_requester(id, n as u32 + 1).unwrap();
+            *cursor.lock() = Some(sched.runnable_cursor(id).unwrap());
+        }
+        (sched, alarm)
+    }
+
+    /// An alarm armed mid-round by one of two processors on a crystal fires
+    /// exactly its interval after the instruction that armed it — and not
+    /// before, for either processor.
+    ///
+    /// The write happens where the writing processor stands, which on a shared
+    /// crystal is up to a round past where the device was last published
+    /// ([`LazyHandle::writer_tick`]), since nothing on such a crystal is
+    /// caught up inside a round. The device is **not** carried there: it keeps
+    /// its own tick and takes the writer's position as the *origin* of the
+    /// interval, so its next event is an absolute instant in the future of
+    /// every runnable on the board. The round that ends on that instant is
+    /// where it is delivered (`Scheduler::natural_target`), by which time both
+    /// processors have executed to it. Armed at the device's own tick instead
+    /// — which is what a write did before this — it would fire as much as a
+    /// whole round early against the instruction that armed it, and the
+    /// assertion on the deadline is that difference.
+    ///
+    /// Both orders are covered, because the round-robin rotates: the writer
+    /// executes its round **before** the other processor in the round at 1.9
+    /// ms and **after** it in the round at 2.9 ms.
+    #[test]
+    fn an_alarm_armed_on_a_shared_crystal_fires_its_whole_interval_after_the_write() {
+        for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+            for (arm_at, round_of_delivery) in [(1_900_000u64, 2), (2_900_000, 3)] {
+                let (mut sched, alarm) = armed_alarm(mode, arm_at, 2);
+                let mut delivered = None;
+                for round in 0..8 {
+                    sched.run_quantum().unwrap();
+                    sched.sync_lazy_devices().unwrap();
+                    let fired = alarm.0.fired_at();
+                    if let (Some(at), None) = (fired, delivered) {
+                        delivered = Some(round);
+                        // Nobody saw it early: every runnable on the crystal
+                        // has executed to the instant it fired on.
+                        for id in [RunnableId(0), RunnableId(1)] {
+                            let domain = sched.runnable_domain(id).unwrap();
+                            let stands = sched.forest().ticks(domain).unwrap();
+                            assert!(
+                                stands >= at * 100,
+                                "{mode:?}, armed at {arm_at}: the alarm fired at the \
+                                 device's tick {at} with a processor still at {stands}"
+                            );
+                        }
+                    }
+                }
+                // The writer's own tick converts exactly: a hundred of its
+                // ticks to one of the device's.
+                let origin = arm_at / 100;
+                assert_eq!(
+                    alarm.0.deadline(),
+                    Some(origin + ALARM_INTERVAL),
+                    "{mode:?}, armed at {arm_at}: armed from somewhere other than the \
+                     writer's position"
+                );
+                assert_eq!(
+                    alarm.0.fired_at(),
+                    alarm.0.deadline(),
+                    "{mode:?}, armed at {arm_at}: the alarm did not fire on the tick it \
+                     was armed for"
+                );
+                assert_eq!(
+                    delivered,
+                    Some(round_of_delivery),
+                    "{mode:?}, armed at {arm_at}: delivered in another round"
+                );
+            }
+        }
+    }
+
+    /// The control: one processor on the crystal has a live view, so catch-up
+    /// before the write has already put the device at the writer's cycle and
+    /// there is nothing to carry. [`LazyHandle::writer_tick`] says so with
+    /// `None`, and the arming is bit for bit what it was before write views
+    /// existed — which is why a one-processor board's timing does not move.
+    #[test]
+    fn a_writer_with_a_live_view_of_the_device_is_told_nothing_to_carry() {
+        let (mut sched, alarm) = armed_alarm(ThreadingMode::Deterministic, 1_900_000, 1);
+        for _ in 0..4 {
+            sched.run_quantum().unwrap();
+            sched.sync_lazy_devices().unwrap();
+        }
+        assert_eq!(alarm.0.deadline(), Some(1_900_000 / 100 + ALARM_INTERVAL));
+        assert_eq!(alarm.0.fired_at(), alarm.0.deadline());
     }
 
     /// A reader that runs past its budget sees the counter held at the round's

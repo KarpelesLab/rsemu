@@ -1152,16 +1152,31 @@ impl Registers {
     /// window picks the register page by it (`ApicWindow::target`), so the
     /// position is that processor's own.
     ///
-    /// A read moves nothing: no tick, no expiry, no request. The initial-count
-    /// write that starts the timer lands at this APIC's own tick, as every
-    /// write always has. Taken before the state lock, and holding none,
-    /// because it takes leaf locks of its own.
+    /// A read moves nothing: no tick, no expiry, no request. Taken before the
+    /// state lock, and holding none, because it takes leaf locks of its own.
     fn reader_tick(&self, attrs: MemAttrs) -> u64 {
         if attrs.debug {
             return 0;
         }
         let handle = self.lazy.lock().clone();
         handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
+    }
+
+    /// Where the processor writing the initial count stands in this APIC's
+    /// domain, when that is ahead of anywhere catch-up could put the APIC —
+    /// see [`LazyHandle::writer_tick`] — or `None` when the write lands at
+    /// this APIC's own tick, which is every write on a board whose processor
+    /// has the crystal to itself.
+    ///
+    /// "Writing to the initial count register starts the timer" (SDM Vol 3A
+    /// §10.5.4), so the countdown begins at the instruction that wrote it.
+    /// On a crystal two processors share the APIC stands where the round
+    /// began, and a count started there fired up to a round early: 3 659
+    /// cycles from the arming instruction to the handler for a 12 500-cycle
+    /// alarm on `pc-apic`. Same locking rule as [`Registers::reader_tick`].
+    fn writer_tick(&self, attrs: MemAttrs) -> Option<u64> {
+        let handle = self.lazy.lock().clone();
+        handle?.writer_tick(attrs.requester.0)
     }
 
     /// Advance to `target` of this APIC's own clock domain.
@@ -1239,7 +1254,11 @@ impl Registers {
 
     /// Write one register, reporting what has to happen once the lock is out of
     /// the way.
-    fn write_register(&self, offset: u64, value: u32) {
+    ///
+    /// `writer` is where the writing processor stands in this APIC's domain,
+    /// if that is not this APIC's own tick ([`Registers::writer_tick`]). Only
+    /// the initial count looks at it.
+    fn write_register(&self, offset: u64, value: u32, writer: Option<u64>) {
         let pending = {
             let mut state = self.state.lock();
             let mut pending = Pending::default();
@@ -1304,7 +1323,19 @@ impl Registers {
                     state.timer_initial = value;
                     // "Writing to the initial count register starts the timer"
                     // and writing zero stops it (SDM Vol 3A §10.5.4).
-                    state.timer_remaining = u64::from(value) * state.timer_divisor();
+                    let period = u64::from(value) * state.timer_divisor();
+                    // From the writer's instruction rather than from this
+                    // APIC's own tick, which on a shared crystal is where the
+                    // round began: the countdown is lengthened by the distance
+                    // between the two, so that it expires `period` after the
+                    // write and never before. Nothing is advanced — the other
+                    // processor may not have reached the writer's instant yet
+                    // (`LazyHandle::writer_tick`). No other processor reads
+                    // this page (`ApicWindow`), and every read by this one is
+                    // at or past the write, so nobody sees the count before
+                    // it starts.
+                    let late = writer.map_or(0, |at| at.saturating_sub(state.tick));
+                    state.timer_remaining = if period == 0 { 0 } else { period + late };
                 }
                 REG_TIMER_DIV => state.timer_divide = value & 0b1011,
                 _ if (REG_LVT_BASE..REG_LVT_BASE + LVT_COUNT as u64 * REG_STRIDE)
@@ -1593,7 +1624,14 @@ impl MemOps for Registers {
         if !self.state.lock().hardware_enabled() {
             return Err(BusError::BadAccess);
         }
-        self.write_register(offset, u32::from_le_bytes([*a, *b, *c, *d]));
+        // Only the initial count starts an interval, and the lookup costs a
+        // lock.
+        let writer = if offset == REG_TIMER_INIT {
+            self.writer_tick(attrs)
+        } else {
+            None
+        };
+        self.write_register(offset, u32::from_le_bytes([*a, *b, *c, *d]), writer);
         Ok(())
     }
 

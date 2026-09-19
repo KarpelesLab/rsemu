@@ -171,6 +171,21 @@ struct Counter {
     null_count: bool,
     /// The next clock pulse loads the counting element.
     pending_load: bool,
+    /// How many clocks go by before that pulse is the *next* one: nonzero
+    /// only when the count was written by a processor standing that far past
+    /// this chip's own tick (`LazyHandle::writer_tick`).
+    ///
+    /// The data sheet loads a written count "on the next CLK pulse" after the
+    /// write, and on a crystal two processors share the chip stands where the
+    /// round began while the writer may be most of a round on. Loading at the
+    /// chip's own tick started the count up to a round before the `OUT`
+    /// instruction that wrote it — a mode-0 alarm of 597 clocks interrupted
+    /// 3 565 cycles after that instruction on `pc-apic`, against 12 508.
+    /// Delaying the pulse puts the load where the writer was without
+    /// carrying the chip there, which the other processor may not have
+    /// reached. Until the pulse the counter is between a write and its load,
+    /// exactly as it is for the one clock of an ordinary write.
+    load_delay: u64,
     /// An output transition is still to come.
     armed: bool,
     /// A count frozen by the counter-latch or read-back command.
@@ -208,6 +223,7 @@ impl Default for Counter {
             loaded: false,
             null_count: true,
             pending_load: false,
+            load_delay: 0,
             armed: false,
             latched_count: None,
             latched_status: None,
@@ -309,7 +325,7 @@ impl Counter {
     /// intervenes. Never `Some(0)` — catch-up that cannot move is a stall.
     fn next_event(&self) -> Option<u64> {
         if self.pending_load {
-            return Some(1);
+            return Some(self.load_delay.saturating_add(1));
         }
         if !self.loaded || !self.counting() {
             return None;
@@ -348,6 +364,7 @@ impl Counter {
     /// reports the absence of.
     fn load(&mut self) {
         self.pending_load = false;
+        self.load_delay = 0;
         self.count = self.initial();
         self.null_count = false;
         self.loaded = true;
@@ -444,8 +461,14 @@ impl Counter {
             return;
         }
         if self.pending_load {
-            // A load takes the whole clock pulse. The caller gave us exactly
-            // the one tick `next_event` asked for.
+            // The clocks before a delayed load go by with the counter between
+            // a write and its load, as the one clock of an ordinary write does.
+            if ticks <= self.load_delay {
+                self.load_delay -= ticks;
+                return;
+            }
+            // A load takes the whole clock pulse. The caller gave us no more
+            // than the ticks `next_event` asked for, so this is that pulse.
             self.load();
             return;
         }
@@ -471,6 +494,7 @@ impl Counter {
             1 | 5 => {
                 if level {
                     self.pending_load = true;
+                    self.load_delay = 0;
                 }
             }
             2 | 3 => {
@@ -479,6 +503,7 @@ impl Counter {
                     // after the speaker is enabled is a whole period long.
                     if self.loaded {
                         self.pending_load = true;
+                        self.load_delay = 0;
                     }
                 } else {
                     // A low gate stops the count *and* forces OUT high, which
@@ -506,6 +531,7 @@ impl Counter {
         self.loaded = false;
         self.armed = false;
         self.pending_load = false;
+        self.load_delay = 0;
         // The data sheet: writing a control word sets the null-count bit, and
         // only the clock pulse that loads the counting element clears it.
         self.null_count = true;
@@ -609,8 +635,14 @@ impl Counter {
         }
     }
 
-    /// Write one byte through this counter's port.
-    fn write(&mut self, value: u8) {
+    /// Write one byte through this counter's port, made `delta` clocks past
+    /// this chip's own tick.
+    ///
+    /// `delta` is where a count written by a processor ahead of the chip
+    /// really starts ([`Counter::load_delay`]); it is zero for every write on
+    /// a board whose processor has its crystal to itself, which catch-up has
+    /// already brought the chip to.
+    fn write(&mut self, value: u8, delta: u64) {
         let complete = match self.access {
             1 => Some(u16::from(value)),
             2 => Some(u16::from(value) << 8),
@@ -628,6 +660,7 @@ impl Counter {
                         self.loaded = false;
                         self.armed = false;
                         self.pending_load = false;
+                        self.load_delay = 0;
                     }
                     None
                 }
@@ -645,12 +678,19 @@ impl Counter {
             0 => {
                 self.output = false;
                 self.pending_load = true;
+                self.load_delay = delta;
             }
-            4 => self.pending_load = true,
+            4 => {
+                self.pending_load = true;
+                self.load_delay = delta;
+            }
             // The periodic modes, first count after a control word: it starts
             // the counter on the next clock pulse, like the software-triggered
             // modes above.
-            2 | 3 if !self.loaded => self.pending_load = true,
+            2 | 3 if !self.loaded => {
+                self.pending_load = true;
+                self.load_delay = delta;
+            }
             // Everything else waits. A count written to a mode-2 or mode-3
             // counter that is already running does not disturb the current
             // period — the reload at the end of it picks the new value up,
@@ -888,6 +928,15 @@ impl Registers {
         handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
     }
 
+    /// Where the processor writing a count stands in this chip's domain, when
+    /// catch-up could not put the chip there — see `LazyHandle::writer_tick`
+    /// and [`Counter::load_delay`] — or `None` when the write lands at the
+    /// chip's own tick. Same locking rule as [`Registers::reader_tick`].
+    fn writer_tick(&self, attrs: MemAttrs) -> Option<u64> {
+        let handle = self.lazy.lock().clone();
+        handle?.writer_tick(attrs.requester.0)
+    }
+
     /// Drive one counter's gate, catching the chip up first so the edge lands
     /// on the tick it happened on.
     fn set_gate(&self, counter: usize, level: bool) {
@@ -937,12 +986,13 @@ impl MemOps for Registers {
         }
         self.sync(attrs);
         let index = (offset & 3) as usize;
-        // Only the control port has commands that sample the chip; the
-        // lookup costs a lock, so a data write does not pay it.
-        let reader = if index == COUNTERS {
-            self.reader_tick(attrs)
+        // The control port has commands that sample the chip, at the
+        // writer's position as a read is; a data port write may start a
+        // count, which starts where the writer stands.
+        let (reader, writer) = if index == COUNTERS {
+            (self.reader_tick(attrs), None)
         } else {
-            0
+            (0, self.writer_tick(attrs))
         };
         let levels = {
             let mut state = self.state.lock();
@@ -950,7 +1000,8 @@ impl MemOps for Registers {
                 let delta = reader.saturating_sub(state.tick);
                 state.control(*value, delta);
             } else {
-                state.counters[index].write(*value);
+                let delta = writer.map_or(0, |at| at.saturating_sub(state.tick));
+                state.counters[index].write(*value, delta);
             }
             self.publish(&state);
             state.levels()
@@ -1253,8 +1304,17 @@ impl Device for Pit8254 {
         // The chip's own position in its domain. The scheduler restores the
         // domain; without this the two would disagree and the chip would stand
         // still until the domain caught up with it.
-        w.write_u64(state.tick)
+        w.write_u64(state.tick)?;
+        // A delayed load, only while one is pending: between two rounds of a
+        // board whose chip is on a crystal of its own there never is one, and
+        // the bytes are exactly what they always were.
+        if state.counters.iter().any(|c| c.load_delay != 0) {
+            for c in &state.counters {
+                w.write_u64(c.load_delay)?;
+            }
+        }
         // The wire handles are the machine's wiring, not the chip's state.
+        Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1304,6 +1364,16 @@ impl Device for Pit8254 {
             }
         }
         state.tick = r.read_u64()?;
+        if r.remaining() > 0 {
+            for c in &mut state.counters {
+                c.load_delay = r.read_u64()?;
+                if c.load_delay != 0 && !c.pending_load {
+                    return Err(Error::State(
+                        "snapshot has an 8254 load delay with no load pending".to_string(),
+                    ));
+                }
+            }
+        }
         let levels = {
             let mut live = self.regs.state.lock();
             *live = state;
@@ -1725,6 +1795,77 @@ mod tests {
         assert!(pit.region("").is_some());
         assert!(pit.region("regs").is_some());
         assert!(pit.region("nope").is_none());
+    }
+
+    /// A count written by a processor standing five clocks past this chip's
+    /// own tick is loaded on the clock after *that*, not on the next one here.
+    ///
+    /// The data sheet loads a written count on the next CLK pulse after the
+    /// write; on a crystal two processors share the chip stands where the
+    /// round began, so the write's own instant is where the pulse belongs.
+    /// Loading it here instead starts the count — and so the terminal count
+    /// that raises IRQ 0 — that many clocks early.
+    #[test]
+    fn a_count_written_ahead_of_the_chip_loads_where_it_was_written() {
+        let mut ahead = State::default();
+        ahead.counters[0].program(control(0, 3, 0, false));
+        ahead.counters[0].write(16, 0);
+        ahead.counters[0].write(0, 5);
+        assert_eq!(
+            ahead.next_event(),
+            Some(6),
+            "five clocks to the write, then the pulse that loads"
+        );
+        ahead.step(6);
+        assert!(ahead.counters[0].loaded, "loaded on that pulse");
+        assert_eq!(ahead.counters[0].load_delay, 0, "and the delay is spent");
+        assert_eq!(
+            ahead.next_event(),
+            Some(16),
+            "terminal count a whole count after the load"
+        );
+
+        // The same write made where the chip stands: everything five clocks
+        // earlier, which is the whole of the difference.
+        let mut here = State::default();
+        here.counters[0].program(control(0, 3, 0, false));
+        here.counters[0].write(16, 0);
+        here.counters[0].write(0, 0);
+        assert_eq!(here.next_event(), Some(1));
+        here.step(1);
+        assert!(here.counters[0].loaded);
+        assert_eq!(here.next_event(), Some(16));
+        assert_eq!(ahead.tick, here.tick + 5);
+    }
+
+    /// A delayed load is state: a snapshot taken before the pulse has to carry
+    /// it, and one taken with no delay writes the bytes it always did.
+    #[test]
+    fn a_snapshot_carries_a_delayed_load() {
+        let saved = Pit8254::default_device();
+        poke(&saved, 3, control(0, 3, 0, false));
+        poke(&saved, 0, 0x10);
+        poke(&saved, 0, 0x00);
+        let plain = save_bytes(&saved);
+        saved.regs.state.lock().counters[0].load_delay = 7;
+        let bytes = save_bytes(&saved);
+        assert!(
+            bytes.len() > plain.len(),
+            "a chip with a delayed load says so, one without writes what it always did"
+        );
+
+        let restored = Pit8254::default_device();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("pit", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        restored.load(&mut chunk.reader()).unwrap();
+        assert_eq!(
+            restored.regs.state.lock().counters[0].load_delay,
+            7,
+            "the delay came back"
+        );
+        assert_eq!(save_bytes(&restored), bytes);
     }
 
     #[test]

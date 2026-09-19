@@ -181,6 +181,18 @@ struct Timer {
     /// The output level, for a level-triggered timer. An edge-triggered one
     /// pulses instead and leaves this low.
     output: bool,
+    /// The first tick of this part's domain at which the comparator may
+    /// match, or zero when that is any tick at all.
+    ///
+    /// Set when a processor standing *ahead* of this part writes the timer
+    /// while the counter runs (`LazyHandle::writer_tick`). A comparator is
+    /// evaluated on each increment of the counter (§2.3.8), so one written at
+    /// the writer's instant can only match on an increment after it; a value
+    /// the counter has already passed there waits for the counter to wrap.
+    /// This part still stands where the round began, and without this it
+    /// would match on the way from there to the writer — an interrupt the
+    /// hardware never raises, before the instruction that armed it.
+    from: u64,
 }
 
 impl Timer {
@@ -266,6 +278,17 @@ struct State {
     timers: [Timer; TIMERS],
     /// The tick, in this part's own clock domain, it has been advanced to.
     tick: u64,
+    /// The tick a running counter counts from, when that is ahead of
+    /// [`State::tick`]; zero, or anything not ahead of it, otherwise.
+    ///
+    /// A processor that sets `ENABLE_CNF`, or writes the counter while it
+    /// runs, does it at its own position (`LazyHandle::writer_tick`), and on
+    /// a crystal two processors share that is up to a round past where this
+    /// part stands — which it may not be carried to, since the other
+    /// processor may not have got there yet. So the counter holds its value
+    /// until this tick and counts from there, which is what the part did at
+    /// the instant it was written.
+    start: u64,
 }
 
 impl State {
@@ -284,7 +307,31 @@ impl State {
         if !self.running() {
             return self.counter;
         }
-        self.counter.wrapping_add(reader.saturating_sub(self.tick))
+        self.counter
+            .wrapping_add(reader.saturating_sub(self.origin()))
+    }
+
+    /// The tick the counter's next increment is counted from: this part's own
+    /// tick, or later when a writer ahead of it started the counter
+    /// ([`State::start`]).
+    fn origin(&self) -> u64 {
+        self.tick.max(self.start)
+    }
+
+    /// The absolute tick of `timer`'s next match, if the counter reaches it:
+    /// the tick the counter next equals the comparator on, counted from
+    /// [`State::origin`], or a whole wrap later if that one falls before the
+    /// comparator was written ([`Timer::from`]). A 64-bit wrap is past
+    /// anything the domain can count to, so such a timer never matches.
+    fn match_tick(&self, timer: &Timer) -> Option<u64> {
+        let at = self.origin().saturating_add(timer.until(self.counter));
+        if at >= timer.from {
+            Some(at)
+        } else if timer.narrow() {
+            Some(at.saturating_add(1 << 32)).filter(|t| *t >= timer.from)
+        } else {
+            None
+        }
     }
 
     /// Ticks until the soonest comparator match, if the counter is running.
@@ -295,36 +342,60 @@ impl State {
         self.timers
             .iter()
             .filter(|t| t.conf & TIMER_ENABLE != 0)
-            .map(|t| t.until(self.counter))
+            .filter_map(|t| self.match_tick(t))
+            .map(|at| at.saturating_sub(self.tick))
             .min()
     }
 
-    /// Advance the counter by `span`, reporting which timers expired.
+    /// Advance the part by `span` ticks, reporting which timers expired.
     ///
     /// Several periods inside one span collapse into one interrupt, which is
     /// what the hardware does too: a level-triggered timer's status bit is
     /// already set and an edge-triggered one's pulse has already been sent.
     fn step(&mut self, span: u64) -> [bool; TIMERS] {
         let mut fired = [false; TIMERS];
-        if !self.running() || span == 0 {
-            return fired;
+        let end = self.tick.saturating_add(span);
+        let counting = end.saturating_sub(self.origin());
+        if self.running() && counting > 0 {
+            let counter = self.counter;
+            let after = counter.wrapping_add(counting);
+            // A copy, so that asking where a comparator matches — which reads
+            // the whole state — and reloading a periodic one are not a shared
+            // and an exclusive borrow of the same thing.
+            let timers = self.timers;
+            for (index, timer) in timers.iter().enumerate() {
+                if timer.conf & TIMER_ENABLE == 0 {
+                    continue;
+                }
+                if self.match_tick(timer).is_none_or(|at| at > end) {
+                    continue;
+                }
+                fired[index] = true;
+                if timer.conf & TIMER_PERIODIC != 0 {
+                    self.timers[index].reload(after);
+                }
+            }
+            self.counter = after;
         }
-        let counter = self.counter;
-        let after = counter.wrapping_add(span);
-        for (index, timer) in self.timers.iter_mut().enumerate() {
-            if timer.conf & TIMER_ENABLE == 0 {
-                continue;
-            }
-            if timer.until(counter) > span {
-                continue;
-            }
-            fired[index] = true;
-            if timer.conf & TIMER_PERIODIC != 0 {
-                timer.reload(after);
+        self.tick = end;
+        // Both hold-offs are spent once the part has reached them; clearing
+        // them keeps the state of a part that has none exactly what it was
+        // before they existed, snapshot bytes included.
+        if self.start <= end {
+            self.start = 0;
+        }
+        for timer in &mut self.timers {
+            if timer.from <= end {
+                timer.from = 0;
             }
         }
-        self.counter = after;
         fired
+    }
+
+    /// Whether some hold-off is still ahead of this part, which is what
+    /// decides whether a snapshot carries them.
+    fn holds(&self) -> bool {
+        self.start > self.tick || self.timers.iter().any(|t| t.from > self.tick)
     }
 }
 
@@ -450,9 +521,36 @@ impl Registers {
     }
 
     /// Write one 64-bit register.
-    fn write_register(&self, state: &mut State, offset: u64, value: u64) {
+    ///
+    /// `at` is where the writing processor stands in this part's domain when
+    /// catch-up could not put the part there (`Registers::writer_tick`), and a
+    /// write that starts, stops or re-aims something takes effect there: a
+    /// counter started or rewritten counts from it, a halted one stops at the
+    /// value it reads there, and a comparator written or enabled cannot match
+    /// before it. Nothing is advanced to it. `None` is the part's own tick,
+    /// which is every write on a board whose processor has its crystal to
+    /// itself.
+    fn write_register(&self, state: &mut State, offset: u64, value: u64, at: Option<u64>) {
+        let ahead = at.filter(|at| *at > state.tick);
         match offset {
-            REG_CONF => state.conf = value & (CONF_ENABLE | CONF_LEGACY),
+            REG_CONF => {
+                let was = state.running();
+                let now = value & CONF_ENABLE != 0;
+                if was && !now {
+                    // Halted where the writer stands, so the value it last
+                    // read is the value it goes on reading.
+                    state.counter = state.counter_at(ahead.unwrap_or(state.tick));
+                    state.start = 0;
+                } else if !was
+                    && now
+                    && let Some(at) = ahead
+                {
+                    // "1 = allow main counter to run" (§2.3.5), from the
+                    // instruction that set it.
+                    state.start = at;
+                }
+                state.conf = value & (CONF_ENABLE | CONF_LEGACY);
+            }
             REG_STATUS => {
                 // Write one to clear, per bit (§2.3.6). A level-triggered
                 // timer's output follows the bit, which is what makes the
@@ -467,14 +565,28 @@ impl Registers {
             // "Writes to this register should only be done when the counter is
             // halted" (§2.3.7). Accepted whenever it comes, because refusing
             // would be inventing a fault the part does not raise.
-            REG_COUNTER => state.counter = value,
+            REG_COUNTER => {
+                state.counter = value;
+                if state.running()
+                    && let Some(at) = ahead
+                {
+                    state.start = at;
+                }
+            }
             _ if offset >= REG_TIMER_BASE => {
                 let index = ((offset - REG_TIMER_BASE) / REG_TIMER_STRIDE) as usize;
                 let within = (offset - REG_TIMER_BASE) % REG_TIMER_STRIDE;
                 let counter = state.counter;
+                let running = state.running();
                 let Some(timer) = state.timers.get_mut(index) else {
                     return;
                 };
+                if running && let Some(at) = ahead {
+                    // A comparator is evaluated on each increment (§2.3.8),
+                    // so one written at `at` first matches on the increment
+                    // after it.
+                    timer.from = at.saturating_add(1);
+                }
                 match within {
                     0x00 => timer.conf = value & TIMER_WRITABLE,
                     0x08 => {
@@ -523,12 +635,7 @@ impl Registers {
     /// So the furthest a guest can read is the tick that comparator fires on,
     /// and it fires there, at the part's own event, as it always has.
     ///
-    /// Writes are not moved. A write of the counter lands at this part's own
-    /// tick, where every write landed before reads could be answered anywhere
-    /// else — moving a *running* counter's origin to the writer's position
-    /// would sweep it through values it never held and could fire a
-    /// comparator on the way. A halted counter — the state one is ordinarily
-    /// written in — reads the same at every position, so the two agree there.
+    /// Writes are the other half, [`Registers::writer_tick`].
     ///
     /// Taken before the state lock, and holding none, because it takes leaf
     /// locks of its own.
@@ -538,6 +645,26 @@ impl Registers {
         }
         let handle = self.lazy.lock().clone();
         handle.map_or(0, |h| h.reader_tick(attrs.requester.0))
+    }
+
+    /// Where the processor making this write stands in this part's domain,
+    /// when catch-up could not put the part there — see
+    /// `LazyHandle::writer_tick` — or `None` when the write lands at the
+    /// part's own tick.
+    ///
+    /// On a crystal two processors share this part stands where the round
+    /// began, and a write applied there started the main counter up to a
+    /// round before the instruction that set `ENABLE_CNF`: a comparator 5 000
+    /// ticks out fired 3 494 cycles after the arming instruction on
+    /// `pc-apic`, against the 12 500 it names. The writer's position is folded
+    /// into the state instead ([`Registers::write_register`]) — never by
+    /// moving the part's own tick, since the other processor may not have
+    /// reached it — rather than by sweeping a running counter's origin back
+    /// through values it never held, which could fire a comparator on the
+    /// way. Same locking rule as [`Registers::reader_tick`].
+    fn writer_tick(&self, attrs: MemAttrs) -> Option<u64> {
+        let handle = self.lazy.lock().clone();
+        handle?.writer_tick(attrs.requester.0)
     }
 
     /// Catch the part up before an access is dispatched to it (§4.2).
@@ -566,7 +693,6 @@ impl Registers {
                 return;
             }
             let span = target - state.tick;
-            state.tick = target;
             let fired = state.step(span);
             let mut pulse = [false; TIMERS];
             for (index, fired) in fired.into_iter().enumerate() {
@@ -640,6 +766,10 @@ impl MemOps for Registers {
         }
         self.sync(attrs);
         let aligned = offset & !7;
+        // Every register here but the status and capability ones decides when
+        // something next happens, so every write asks; the lookup costs a
+        // lock, and HPET writes are rare next to counter reads.
+        let writer = self.writer_tick(attrs);
         let (levels, drive, legacy) = {
             let mut state = self.state.lock();
             let old = self.read_register(&state, aligned);
@@ -657,7 +787,7 @@ impl MemOps for Registers {
                 ]),
                 _ => return Err(BusError::BadAccess),
             };
-            self.write_register(&mut state, aligned, value);
+            self.write_register(&mut state, aligned, value, writer);
             self.publish(&state);
             // Only the status register can lower an output, and only from
             // inside this critical section, so the pins are re-driven for it
@@ -963,8 +1093,19 @@ impl Device for Hpet {
         // The part's own position in its domain, for the reason the 8254's
         // `save` gives: the scheduler restores the domain, and without this the
         // two would disagree.
-        w.write_u64(state.tick)
+        w.write_u64(state.tick)?;
+        // The hold-offs a writer ahead of the part left, only while one is
+        // still ahead: a part that has none — every part between two rounds
+        // of a board whose timers are on a crystal of their own — writes
+        // exactly the bytes it always did.
+        if state.holds() {
+            w.write_u64(state.start)?;
+            for timer in &state.timers {
+                w.write_u64(timer.from)?;
+            }
+        }
         // The routing is the board's wiring, not this part's state.
+        Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -988,6 +1129,12 @@ impl Device for Hpet {
             timer.route = route;
         }
         state.tick = r.read_u64()?;
+        if r.remaining() > 0 {
+            state.start = r.read_u64()?;
+            for timer in &mut state.timers {
+                timer.from = r.read_u64()?;
+            }
+        }
         let levels = {
             let mut current = self.regs.state.lock();
             *current = state;
@@ -1423,6 +1570,112 @@ mod tests {
                 .is_err(),
             "and there is no harmless write on this part"
         );
+    }
+
+    /// A counter a processor ahead of this part started holds its value until
+    /// that processor's tick and counts from there.
+    ///
+    /// What `ENABLE_CNF` does at the instruction that sets it (§2.3.5), on a
+    /// board where this part may not be carried to the writer because another
+    /// processor has not reached it.
+    #[test]
+    fn a_counter_started_by_a_writer_ahead_counts_from_there() {
+        let b = bench();
+        b.enable();
+        {
+            let mut state = b.hpet.regs.state.lock();
+            state.start = 100;
+            b.hpet.regs.publish(&state);
+        }
+        b.hpet.advance_to(50);
+        assert_eq!(b.peek(REG_COUNTER), 0, "it has not started yet");
+        assert_eq!(
+            b.hpet.regs.state.lock().counter_at(60),
+            0,
+            "nor for a reader"
+        );
+        b.hpet.advance_to(150);
+        assert_eq!(b.peek(REG_COUNTER), 50, "fifty ticks since it did");
+        assert_eq!(
+            b.hpet.regs.state.lock().start,
+            0,
+            "and the hold-off is spent"
+        );
+    }
+
+    /// A comparator written by a processor ahead of this part does not match
+    /// on the way from here to there.
+    ///
+    /// The comparison is made on each increment of the counter (§2.3.8), so a
+    /// comparator the counter has already passed at the instant it was
+    /// written waits for a wrap — it does not fire on the increments this part
+    /// has yet to make, which all happened before the write.
+    #[test]
+    fn a_comparator_written_ahead_does_not_match_on_the_way_there() {
+        let b = bench();
+        b.enable();
+        b.poke(b.timer(0), TIMER_ENABLE | TIMER_LEVEL | TIMER_32BIT);
+        b.poke(b.timer(0) + 8, 10);
+        {
+            let mut state = b.hpet.regs.state.lock();
+            // Written where the counter already reads 20.
+            state.timers[0].from = 21;
+            b.hpet.regs.publish(&state);
+        }
+        assert_eq!(
+            Device::next_event_tick(&b.hpet),
+            Some(10 + (1 << 32)),
+            "the next equality is a whole 32-bit wrap away"
+        );
+        b.hpet.advance_to(30);
+        assert!(!b.probes[0].high(), "no interrupt on the way to the write");
+        assert_eq!(b.peek(REG_STATUS), 0);
+    }
+
+    /// Both hold-offs are state: a snapshot taken while one is still ahead of
+    /// this part has to carry it, and one taken with none writes the bytes it
+    /// always did.
+    #[test]
+    fn a_snapshot_carries_a_hold_off_a_writer_ahead_left() {
+        let saved = bench();
+        saved.enable();
+        saved.poke(saved.timer(0), TIMER_ENABLE | TIMER_LEVEL);
+        saved.poke(saved.timer(0) + 8, 5_000);
+        let plain = save_bytes(&saved.hpet);
+        {
+            let mut state = saved.hpet.regs.state.lock();
+            state.start = 900;
+            state.timers[0].from = 901;
+            saved.hpet.regs.publish(&state);
+        }
+        let bytes = save_bytes(&saved.hpet);
+        assert!(
+            bytes.len() > plain.len(),
+            "a part with a hold-off says so, one without writes what it always did"
+        );
+
+        let restored = bench();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("hpet", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        restored.hpet.load(&mut chunk.reader()).unwrap();
+        let after = restored.hpet.regs.state.lock().clone();
+        let before = saved.hpet.regs.state.lock().clone();
+        assert_eq!(after, before, "every field came back, hold-offs included");
+        assert_eq!(save_bytes(&restored.hpet), bytes);
+    }
+
+    /// One part's snapshot chunk, as bytes.
+    fn save_bytes(hpet: &Hpet) -> alloc::vec::Vec<u8> {
+        let mut shape = MachineShape::new();
+        shape.add_device("hpet", CLASS.name).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("hpet", CLASS.name, CLASS.version).unwrap();
+            hpet.save(&mut chunk).unwrap();
+        }
+        w.to_vec().unwrap()
     }
 
     #[test]

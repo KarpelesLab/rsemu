@@ -275,11 +275,88 @@ Before, it started where the round began and fired up to a round early:
 measured from the arming instruction to the handler on `q35`, for a
 half-millisecond alarm (12 500 cycles), APIC 3 615 → 12 646, HPET 3 450 →
 12 646, 8254 3 532 → 12 662. On a crystal two processors share, nothing is
-caught up inside a round and a write still lands at the round's start —
-unchanged, and still up to a round early (`pc-apic`: 3 659, 3 494 and 3 565
-cycles, before and after). Answering the *arming* write at the writer's
-position there is the remaining piece; for the HPET and the 8254 it moves a
-comparator's origin, which a read never does, and it wants a change of its own.
+caught up inside a round, so that left the arming write landing at the round's
+start and the timer still firing up to a round early — `pc-apic`: 3 659, 3 494
+and 3 565 cycles. *A write view* below is what closed that.
+
+### A write view: arming from where the writer stands
+
+A **read** at the reader's own position moves nothing, which is why it is
+allowed on a shared crystal. A **write that arms a comparator** is a different
+thing: it schedules a future event, and the interval it names starts at the
+instruction that wrote it. Applied at the device's own tick — the round's
+start, on a shared crystal — a half-millisecond alarm fired a third of the way
+into its interval.
+
+The device may not be *moved* to the writer, and that rule is not negotiable:
+the other processor on the crystal may still be at the round's beginning, and
+carrying the device past it is exactly what
+[`parallel-execution.md`](parallel-execution.md) forbids. So the writer's
+position is carried **into** the device instead, by the same read line the
+reader uses (`LazyHandle::writer_tick`, `TickCursor::tick_in`), and each device
+folds it into its own arithmetic while keeping its own tick:
+
+* the local APIC lengthens the countdown by the distance from its tick to the
+  writer's, so the count expires `initial × divisor` ticks after the write
+  (*Intel SDM* vol. 3A §10.5.4: "writing to the initial count register starts
+  the timer");
+* the 8254 delays the clock pulse that loads the counting element until the
+  writer's tick, which is the "next CLK pulse" the datasheet loads a written
+  count on;
+* the HPET holds a counter it was told to start (`ENABLE_CNF`, §2.3.5) at its
+  value until the writer's tick and counts from there, stops one it was told to
+  halt at the value the writer reads, and refuses a comparator match before the
+  tick the comparator was written on — a comparator is evaluated on each
+  increment (§2.3.8), so one written into the counter's past waits for a wrap
+  rather than matching on the way from the round's start to the writer.
+
+What comes out is an event at an **absolute instant** ahead of every runnable
+on the board, which the scheduler already knows how to wait for: a later round
+ends exactly there (`Scheduler::natural_target`), every runnable executes to
+it, and the round's close delivers it. Nothing fires early for anybody, because
+nothing is delivered before the round that ends on its instant, and nothing was
+moved in between. `writer_tick` answers `None` — the write lands at the
+device's own tick, as it always did — when the writer's *own* live view is
+armed on the device, which is every write on a board whose processor has its
+crystal to itself; that is what keeps a one-processor board bit for bit
+unchanged rather than rounding the same position a second way.
+
+From the arming instruction to the handler on `pc-apic`, both processors on one
+crystal, a 12 500-cycle alarm, before → after: **APIC 3 659 → 12 646, HPET
+3 494 → 12 646, 8254 3 565 → 12 651**, which is `q35`'s one-processor column to
+within the phase of the 8254's own crystal. The deterministic and the
+dispatched round agree to the cycle, and `q35`'s own numbers do not move
+(`tests/x86_counter_resolution.rs`, and `core::sched`'s
+`an_alarm_armed_on_a_shared_crystal_fires_its_whole_interval_after_the_write`
+for the arithmetic). The same program waiting for its interrupt **halted**
+rather than spinning reads 12 639, 12 638 and 12 650, so the two ways of
+waiting still agree to within the one `jmp $` a spinning processor is inside —
+this moves where the interrupt lands, not what the counter says about it (*[A
+halted processor's time-stamp counter counts the
+halt](#a-halted-processors-time-stamp-counter-counts-the-halt)*).
+
+**Which timers this was about, and which never were.** A *relative* arm is the
+shape that has the defect: a countdown, a count, a `TVAL`. An *absolute*
+comparator does not, because the instant it names is computed by the guest from
+a counter it read at its own position, and comparing it against a counter is
+the same answer wherever it is evaluated.
+
+| board | timer | armed how | affected |
+| --- | --- | --- | --- |
+| `pc-apic`, `pc-at-smp`, `q35-linux-smp` | local APIC timer | initial count, relative | yes — fixed here |
+| the same | 8254 counters | a count, loaded on the next clock | yes — fixed here |
+| the same | HPET | comparator absolute, but `ENABLE_CNF` starts the counter | yes — fixed here |
+| `riscv-virt-smp` | CLINT `mtimecmp` | absolute against `mtime` | **no**: never fired early, and `tests/smp_counter_resolution.rs` measures a mid-round arm landing on its own tick |
+| `arm64-virt-smp` | generic timer `TVAL`/`CVAL` | relative, but `CNTPCT_EL0` is the core's own tick counter | **no**: the comparator lives inside the core and is evaluated against the core's own count, so an arm is at the writer's position by construction and no shared-crystal device is involved |
+
+One bound is unchanged and is worth stating, because it is a property of rounds
+rather than of writes: **an interval that expires inside the round it was armed
+in is delivered when that round closes**, on one processor as on two. The
+round's target was fixed before the write, a device may not be caught up past a
+runnable that has not reached the instant, and no core publishes a position
+while it spins without touching the bus. `tests/smp_counter_resolution.rs` has
+said so since the read view landed, and the alarm tests arm intervals that
+cross a round boundary for that reason.
 
 What a Linux guest made of it. **Every figure names its kernel and how the
 machine was driven**, because both change the answer and a figure without them
@@ -371,18 +448,21 @@ access to the handler, 12 500 of them programmed:
 | `q35` | APIC | 12 646 | 143 | 12 639 |
 | `q35` | HPET | 12 646 | 143 | 12 637 |
 | `q35` | 8254 | 12 662 | 137 | 12 654 |
-| `pc-apic` | APIC | 3 659 | 143 | 3 650 |
-| `pc-apic` | HPET | 3 494 | 143 | 3 487 |
-| `pc-apic` | 8254 | 3 565 | 137 | 3 562 |
+| `pc-apic` | APIC | 12 646 | 143 | 12 639 |
+| `pc-apic` | HPET | 12 646 | 143 | 12 638 |
+| `pc-apic` | 8254 | 12 651 | 137 | 12 650 |
 
 The spinning column is the reference: a processor that spins through the wait
 charges every cycle by executing it, and a halted one now agrees with it to
 within the one `jmp $` the spinning processor is in when the interrupt arrives.
-`pc-apic`'s short intervals are the shared crystal's arming write landing at
-the round's start, which is the section above's remaining piece; it moves the
-interrupt, not the counter. An application processor's first `RDTSC` after its
-Start-Up read **28** before and 1 220 717 against the bootstrap processor's
-1 200 272 after. All three are in `tests/x86_counter_resolution.rs`; the ledger
+**`pc-apic`'s two columns were 3 659, 3 494, 3 565 and 3 650, 3 487, 3 562 when
+this was measured**, and both moved for the reason *[A write view](#a-write-view-arming-from-where-the-writer-stands)*
+above gives: on a crystal two processors share the arming write used to land
+where the round began, so the interval was short by wherever in its round it
+was armed. That moved the interrupt rather than the counter, which is why
+halting agreed with spinning on those rows before and agrees with it now. An
+application processor's first `RDTSC` after its Start-Up read **28** before and
+1 220 717 against the bootstrap processor's 1 200 272 after. All three are in `tests/x86_counter_resolution.rs`; the ledger
 entry that asserted the old answer is gone with them.
 
 ### The `tsc-early` watchdog skew was this, and it is gone

@@ -287,6 +287,40 @@ Before it, every printk timestamp Linux wrote on `riscv-virt-smp` was a whole
 millisecond — the length of a round — because `time` could not move inside
 one.
 
+**A write that arms a comparator is the other half, and it needs more care.**
+A read moves nothing; a write schedules a future event, and the interval it
+names starts at the instruction that made it. Applied where the device stands
+— the round's start, since nothing on a shared crystal is caught up inside a
+round — a timer fires up to a round *early* against its own arming
+instruction: a 12 500-cycle alarm on `pc-apic` interrupted after 3 659 cycles
+(local APIC), 3 494 (HPET) and 3 565 (8254).
+
+The repair is **not** to catch the device up to the writer, which is the one
+thing the invariant above forbids. `LazyHandle::writer_tick` hands the device
+the writer's position — the same line a read is answered from, computed from
+nobody else's position, so it is the same in both threading modes — and the
+device folds it into its own arithmetic while keeping its own tick: the APIC
+lengthens its countdown by the distance, the 8254 delays the clock pulse that
+loads a count, the HPET holds a counter it was told to start until then and
+refuses a comparator match before the tick the comparator was written on. The
+device's next event is then an absolute instant ahead of *every* runnable on
+the board, a later round ends exactly there
+(`Scheduler::natural_target`), and the round's close delivers it with both
+processors standing at the instant. Nothing fires early for either of them and
+no device moved past either of them; the measurements above become 12 646,
+12 646 and 12 651, which is the one-processor board's own column.
+`writer_tick` answers `None` when the writer's own live view is armed on the
+device, so a one-processor board applies a write exactly where it always did.
+
+Which timers needed it is a property of how they are armed rather than of the
+board: a *relative* arm (an APIC initial count, an 8254 count, ARM's `TVAL`)
+starts an interval at the write, an *absolute* comparator names an instant the
+guest computed from a counter it read at its own position. So `riscv-virt-smp`'s
+CLINT never had the defect — `mtimecmp` is compared against `mtime` — and
+`arm64-virt-smp`'s generic timer never had it either, because its comparator
+lives inside the core and is evaluated against the core's own cycle count,
+with no lazily-advanced device in the path at all.
+
 What the counter still cannot say is a runnable that returns *nothing* for
 ever: the tree stands at the slowest runnable, so such a runnable holds its
 crystal back, exactly as a lone runnable that stops holds back its own. Every

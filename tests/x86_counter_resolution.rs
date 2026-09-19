@@ -45,18 +45,23 @@
 //!   APIC timer's expiry still arrive on the tick the scheduler delivers them
 //!   on; and a guest polling a counter sees it climb to its comparator and no
 //!   further until the interrupt has been taken.
-//! * **A timer starts where it was armed.** On one processor a write, like a
-//!   read, now lands at the cycle of the instruction that made it, so a timer
-//!   fires its whole interval after the instruction that armed it — where
-//!   before it started at the round's beginning and fired up to a round early.
-//!   On a crystal two processors share, a write still lands where the round
-//!   began, exactly as before; the alarm tests pin both.
+//! * **A timer starts where it was armed**, on one processor and on two. A
+//!   write, like a read, lands at the cycle of the instruction that made it,
+//!   so a timer fires its whole interval after the instruction that armed it
+//!   — where before it started at the round's beginning and fired up to a
+//!   round early. On a crystal two processors share nothing may be *caught up*
+//!   inside a round, so the write carries the writer's position into the
+//!   device instead (`LazyHandle::writer_tick`) and the device holds its own
+//!   tick; the alarm tests pin both boards, and the shared-crystal one pins
+//!   the dispatched round against the deterministic one as well.
 //! * **A halted processor's own counter counts the halt.** `HLT`, and the
 //!   wait-for-SIPI an INIT leaves an application processor in, stop the
 //!   *processor*, not its time-stamp counter (*Intel SDM* vol. 3B §17.17.1).
 //!   That was a separate defect with a separate cause — `X86::run_budget`
 //!   consumed a halted core's budget and charged it nothing — and the three
-//!   tests at the bottom of this file are what it cost a guest.
+//!   tests at the bottom of this file are what it cost a guest. The alarm
+//!   program waits either way ([`Wait`]), so every arming measurement is taken
+//!   twice and the two must agree.
 //! * **Determinism.** The same program gives the same samples under
 //!   [`ThreadingMode::Parallel`], because a read at one's own position
 //!   involves nobody else.
@@ -417,7 +422,7 @@ enum Wait {
 /// (MultiProcessor Specification 1.4 §3.6.2.1); the program selects symmetric
 /// I/O mode through it first, or the 8254's edge would reach an unprogrammed
 /// 8259A and arrive on a vector nothing handles.
-fn alarm(socket: Socket, source: Alarm, imcr: bool, wait: Wait) -> Vec<u8> {
+fn alarm(socket: Socket, source: Alarm, imcr: bool, wait: Wait, spin: u32) -> Vec<u8> {
     let (mut rom, mut pm) = boot(socket);
     if imcr {
         outb(&mut pm, 0x22, 0x70); // select the IMCR
@@ -490,8 +495,8 @@ fn alarm(socket: Socket, source: Alarm, imcr: bool, wait: Wait) -> Vec<u8> {
     }
 
     // Land the arming access mid-round.
-    pm.push(0xb8); // mov eax, ARM_SPIN
-    dw(&mut pm, ARM_SPIN);
+    pm.push(0xb8); // mov eax, spin
+    dw(&mut pm, spin);
     pm.push(0x48); // dec eax
     pm.extend_from_slice(&[0x75, 0xfd]); // jnz -3
 
@@ -762,35 +767,91 @@ fn the_same_program_reads_the_same_counters_under_a_dispatched_round() {
 // comparators: where they fire, against the instruction that armed them
 // ---------------------------------------------------------------------------
 
-/// Run the alarm program for `source` and report `(interrupts taken, cycles
-/// from the arming access to the handler)`.
-fn alarm_latency(
-    name: &str,
-    text: &str,
+/// A board the alarm program can be assembled for: the machine file, the BIOS
+/// socket it is laid out in, and whether it has an interrupt mode
+/// configuration register to switch out of PIC mode through.
+#[derive(Debug, Clone, Copy)]
+struct AlarmBoard {
+    name: &'static str,
+    text: &'static str,
     socket: Socket,
-    source: Alarm,
     imcr: bool,
+}
+
+/// The two-processor board, whose processors share a crystal.
+const PC_APIC_ALARM: AlarmBoard = AlarmBoard {
+    name: "pc-apic.machine",
+    text: PC_APIC,
+    socket: PC_APIC_SOCKET,
+    imcr: false,
+};
+
+/// The one-processor board, the control.
+#[cfg(feature = "dev-q35")]
+const Q35_ALARM: AlarmBoard = AlarmBoard {
+    name: "q35.machine",
+    text: Q35,
+    socket: Q35_SOCKET,
+    imcr: true,
+};
+
+/// What one run of the alarm program recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fired {
+    /// How many times the handler ran.
+    taken: u32,
+    /// The time-stamp counter just before the arming access.
+    armed_at: u64,
+    /// Cycles from there to the handler's first instruction.
+    latency: u64,
+}
+
+/// Run the alarm program for `source` and report what it recorded: `spin`
+/// turns of the loop before it arms — which decides where in its round the
+/// arming access lands — and `wait` what it does between arming and the
+/// interrupt.
+fn alarm_run(
+    board: AlarmBoard,
+    source: Alarm,
     wait: Wait,
-) -> (u32, u64) {
-    let mut m = board_with(
+    spin: u32,
+    mode: ThreadingMode,
+) -> Fired {
+    let AlarmBoard {
         name,
         text,
-        alarm(socket, source, imcr, wait),
-        ThreadingMode::Deterministic,
-    );
+        socket,
+        imcr,
+    } = board;
+    let mut m = board_with(name, text, alarm(socket, source, imcr, wait, spin), mode);
     m.reset(ResetKind::Cold);
     m.sweep();
-    m.run_for(GlobalTime::from_nanos(5_000_000))
+    m.run_for(GlobalTime::from_nanos(10_000_000))
         .expect("the machine runs");
     let mem = m.space("mem").expect("the memory space");
     let peek = |at: u32| {
         mem.read(u64::from(at), Width::U64, MemAttrs::DEBUG)
             .expect("a mapped word")
     };
-    let taken = peek(TAKEN) as u32;
-    let latency = peek(SEEN_AT).wrapping_sub(peek(ARMED_AT));
-    println!("-- {name:<16} {source:?}, {wait:?}: taken {taken}, {latency} cycles after arming");
-    (taken, latency)
+    let armed_at = peek(ARMED_AT);
+    let fired = Fired {
+        taken: peek(TAKEN) as u32,
+        armed_at,
+        latency: peek(SEEN_AT).wrapping_sub(armed_at),
+    };
+    println!(
+        "-- {name:<16} {source:?} {wait:?} {mode:?} spin {spin}: taken {}, armed at cycle {}, \
+         {} cycles after arming",
+        fired.taken, fired.armed_at, fired.latency
+    );
+    fired
+}
+
+/// The alarm program with the usual spin, deterministically: `(interrupts
+/// taken, cycles from the arming access to the handler)`.
+fn alarm_latency(board: AlarmBoard, source: Alarm, wait: Wait) -> (u32, u64) {
+    let fired = alarm_run(board, source, wait, ARM_SPIN, ThreadingMode::Deterministic);
+    (fired.taken, fired.latency)
 }
 
 /// Every source, with the shortest interval after the arming access at which
@@ -817,8 +878,7 @@ fn alarms(hpet_input: u8) -> [(Alarm, u64); 3] {
 #[test]
 fn a_timer_armed_on_one_processor_fires_its_whole_interval_after_the_arming_instruction() {
     for (source, floor) in alarms(16) {
-        let (taken, latency) =
-            alarm_latency("q35.machine", Q35, Q35_SOCKET, source, true, Wait::Spin);
+        let (taken, latency) = alarm_latency(Q35_ALARM, source, Wait::Spin);
         assert_eq!(taken, 1, "{source:?} interrupted exactly once");
         assert!(
             latency >= floor,
@@ -832,30 +892,78 @@ fn a_timer_armed_on_one_processor_fires_its_whole_interval_after_the_arming_inst
     }
 }
 
-/// On a crystal two processors share, nothing is caught up inside a round, so
-/// an arming write still lands where the round began — as it did before this
-/// file existed. The read path changed; the write path did not, and the
-/// measured instants are the same to the cycle: APIC 3 659, HPET 3 494, 8254
-/// 3 565, before and after. What is asserted is the bound that arrangement
-/// keeps, and that the dispatched round agrees with the deterministic one.
+/// Spins before arming for the shared-crystal test: each lands the arming
+/// access in a different round, and in a different place in it.
+const SHARED_SPINS: [u32; 6] = [1_380, 3_463, 5_546, 7_630, 9_713, 11_796];
+
+/// The whole interval on a crystal two processors share, too — whichever of
+/// them executes the round first.
+///
+/// Nothing on such a crystal is caught up inside a round
+/// (`Scheduler::arm_live_cursors`, *Not on a shared crystal*), so the devices
+/// stand where the round began, and the arming write used to be applied
+/// there: the timer started up to a round before the instruction that armed
+/// it and fired that much early. Measured on this board with this program,
+/// from the arming access to the handler against a 12 500 floor: APIC 3 659 →
+/// 12 646, HPET 3 494 → 12 646, 8254 3 565 → 12 651. The write now carries the
+/// writer's position into the device (`LazyHandle::writer_tick`) without
+/// moving the device there, and the device's event is then an absolute
+/// instant a later round ends on.
+///
+/// The spins land the arming access in six different rounds, a millisecond
+/// apart, and the scheduler's round-robin changes which runnable goes first
+/// every round. The other processor — halted, waiting for a start-up IPI that
+/// never comes, and consuming its whole budget while it waits — therefore ran
+/// the round to its end **before** the arming processor started it in two of
+/// these six, and after it in the other four; the arming instant is the same
+/// distance from the interrupt either way, which is the point. The dispatched
+/// round is asserted to agree with the deterministic one to the cycle.
 #[test]
-fn a_timer_armed_on_a_shared_crystal_fires_where_it_always_has() {
-    // One round of the 25 MHz core.
+fn a_timer_armed_on_a_shared_crystal_fires_its_whole_interval_after_the_arming_instruction() {
+    // One millisecond round of the 25 MHz core, for saying which round an
+    // arming access fell in.
     const ROUND_CYCLES: u64 = 25_000;
     for (source, floor) in alarms(20) {
-        let (taken, latency) = alarm_latency(
-            "pc-apic.machine",
-            PC_APIC,
-            PC_APIC_SOCKET,
-            source,
-            false,
-            Wait::Spin,
-        );
-        assert_eq!(taken, 1, "{source:?} interrupted exactly once");
-        assert!(
-            latency + ROUND_CYCLES >= floor,
-            "{source:?} fired {latency} cycles after arming: more than a round \
-             short of {floor}"
+        let mut rounds = Vec::new();
+        for spin in SHARED_SPINS {
+            let fired = alarm_run(
+                PC_APIC_ALARM,
+                source,
+                Wait::Spin,
+                spin,
+                ThreadingMode::Deterministic,
+            );
+            assert_eq!(fired.taken, 1, "{source:?} interrupted exactly once");
+            assert!(
+                fired.latency >= floor,
+                "{source:?}, spin {spin}: fired {} cycles after the instruction \
+                 that armed it, short of the {floor} it was programmed for",
+                fired.latency
+            );
+            assert!(
+                fired.latency <= floor + 400,
+                "{source:?}, spin {spin}: fired {} cycles after arming, far past \
+                 {floor}",
+                fired.latency
+            );
+            let parallel = alarm_run(
+                PC_APIC_ALARM,
+                source,
+                Wait::Spin,
+                spin,
+                ThreadingMode::Parallel,
+            );
+            assert_eq!(
+                parallel, fired,
+                "{source:?}, spin {spin}: the dispatched round fired elsewhere"
+            );
+            rounds.push(fired.armed_at / ROUND_CYCLES);
+        }
+        rounds.dedup();
+        assert_eq!(
+            rounds.len(),
+            SHARED_SPINS.len(),
+            "{source:?}: the spins were meant to arm in six different rounds"
         );
     }
 }
@@ -1162,36 +1270,42 @@ const ONE_JUMP: u64 = 16;
 /// because it charges every cycle by executing it.
 ///
 /// Measured, cycles from the arming access to the handler, spinning against
-/// halted, 12 500 of them programmed:
+/// halted, 12 500 of them programmed. The middle column is what a counter
+/// that stopped with its processor showed; the parenthesised figures in the
+/// `pc-apic` rows are what both columns read before *the other* defect in
+/// this file was fixed, and the paragraph below says what that one was:
 ///
-/// | board | source | spinning | halted, before | halted, after |
+/// | board | source | spinning | halted, counter stopped | halted, now |
 /// | --- | --- | --- | --- | --- |
 /// | `q35` | APIC | 12 646 | 143 | 12 639 |
 /// | `q35` | HPET | 12 646 | 143 | 12 637 |
 /// | `q35` | 8254 | 12 662 | 137 | 12 654 |
-/// | `pc-apic` | APIC | 3 659 | 143 | 3 650 |
-/// | `pc-apic` | HPET | 3 494 | 143 | 3 487 |
-/// | `pc-apic` | 8254 | 3 565 | 137 | 3 562 |
+/// | `pc-apic` | APIC | 12 646 (was 3 659) | 143 | 12 639 (was 3 650) |
+/// | `pc-apic` | HPET | 12 646 (was 3 494) | 143 | 12 638 (was 3 487) |
+/// | `pc-apic` | 8254 | 12 651 (was 3 565) | 137 | 12 650 (was 3 562) |
 ///
 /// Before, `X86::run_budget` consumed a halted processor's budget and charged
 /// the counter none of it, so the handler saw only the arming store and its
-/// own entry. (`pc-apic`'s short intervals are the shared crystal's arming
-/// write landing at the round's start, which
-/// `a_timer_armed_on_a_shared_crystal_fires_where_it_always_has` pins; it
-/// moves the interrupt, not the counter, and halting agrees with spinning
-/// there as everywhere.)
+/// own entry. (`pc-apic`'s parenthesised figures are the *other* defect, and
+/// it moved the interrupt rather than the counter: on a crystal two
+/// processors share the arming write used to land where the round began, so
+/// every interval was short by where in its round it was armed.
+/// `a_timer_armed_on_a_shared_crystal_fires_its_whole_interval_after_the_arming_instruction`
+/// pins that. Halting agreed with spinning before it and agrees with it
+/// after, which is what this test is about.)
 #[test]
 fn a_halted_processor_wakes_to_a_time_stamp_counter_that_counted_the_wait() {
     #[cfg(feature = "dev-q35")]
-    halted_against_spinning("q35.machine", Q35, Q35_SOCKET, true, 16);
-    halted_against_spinning("pc-apic.machine", PC_APIC, PC_APIC_SOCKET, false, 20);
+    halted_against_spinning(Q35_ALARM, 16);
+    halted_against_spinning(PC_APIC_ALARM, 20);
 }
 
 /// Every alarm source on one board, waited for spinning and then halted.
-fn halted_against_spinning(name: &str, text: &str, socket: Socket, imcr: bool, hpet: u8) {
+fn halted_against_spinning(board: AlarmBoard, hpet: u8) {
+    let name = board.name;
     for (source, _) in alarms(hpet) {
-        let (spun, spin) = alarm_latency(name, text, socket, source, imcr, Wait::Spin);
-        let (halted, halt) = alarm_latency(name, text, socket, source, imcr, Wait::Halt);
+        let (spun, spin) = alarm_latency(board, source, Wait::Spin);
+        let (halted, halt) = alarm_latency(board, source, Wait::Halt);
         assert_eq!((spun, halted), (1, 1), "{name} {source:?} interrupted once");
         assert!(
             halt <= spin && spin - halt <= ONE_JUMP,

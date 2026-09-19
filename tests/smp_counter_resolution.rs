@@ -31,7 +31,15 @@
 //!   involves nobody else;
 //! * a comparator still fires where it always did: never before `mtime`
 //!   reaches it, and — once it is armed beyond the round in which it was
-//!   written — on the tick it names.
+//!   written — on the tick it names;
+//! * **a comparator armed mid-round lands on its tick too**, which is the
+//!   answer to whether this block needs what the x86 timers needed when an
+//!   arming write was made to take effect at the writer's position
+//!   (`LazyHandle::writer_tick`). It does not: `mtimecmp` names an *instant*
+//!   rather than an interval, and the instant a guest computes from a `time`
+//!   it read at its own position is the same wherever it is compared. A
+//!   relative arm — an APIC initial count, an 8254 count, ARM's `TVAL` — is
+//!   the shape that fired early.
 //!
 //! The single-hart board is the control. Its hart has a live view of the
 //! CLINT, so a load of `mtime` was already current; `time` was not, because a
@@ -460,7 +468,7 @@ const HANDLER: usize = 128;
 ///
 /// `CMP_LAST` is therefore the last value this hart read before it took the
 /// interrupt, and `CMP_TRAP` the first one after.
-fn comparator(delay: u32) -> Vec<u32> {
+fn comparator(delay: u32, spin: u32) -> Vec<u32> {
     let mut c = Vec::new();
     c.extend(li(S0, BUF as u32));
     c.push(slli(T1, A0, STRIDE.trailing_zeros()));
@@ -472,6 +480,14 @@ fn comparator(delay: u32) -> Vec<u32> {
     c.push(csrw(MTVEC, T0));
     c.extend(li(T0, 1 << 7));
     c.push(csrw(MIE, T0));
+    // Turns of a two-instruction loop before the comparator is written, so
+    // that the write lands where the caller wants it inside a round.
+    if spin > 0 {
+        c.extend(li(A6, spin));
+        let at = c.len();
+        c.push(addi(A6, A6, -1));
+        c.push(bne(A6, 0, back(c.len(), at)));
+    }
     c.extend(li(T1, delay));
     c.push(csrr(T0, TIME));
     c.push(add(T0, T0, T1));
@@ -494,7 +510,19 @@ fn comparator(delay: u32) -> Vec<u32> {
 
 /// `(armed for, last read before, first read after, mcause)`.
 fn fired(name: &str, delay: u32, hart: u64) -> (u64, u64, u64, u64) {
-    let mut m = board(name, &comparator(delay), ThreadingMode::Deterministic);
+    fired_after(name, delay, 0, hart, ThreadingMode::Deterministic)
+}
+
+/// The same, with `spin` turns of a two-instruction loop before the write and
+/// a threading mode of the caller's choosing.
+fn fired_after(
+    name: &str,
+    delay: u32,
+    spin: u32,
+    hart: u64,
+    mode: ThreadingMode,
+) -> (u64, u64, u64, u64) {
+    let mut m = board(name, &comparator(delay, spin), mode);
     m.run_for(GlobalTime::from_nanos(6_000_000))
         .expect("the board runs");
     let base = BUF + hart * STRIDE;
@@ -556,6 +584,49 @@ fn check_comparator(name: &str, harts: u64) {
 #[test]
 fn a_comparator_on_a_shared_crystal_never_fires_early() {
     check_comparator("riscv-virt-smp", 2);
+}
+
+/// **`mtimecmp` is an absolute compare, so arming it mid-round is already
+/// exact** — the answer to "does the CLINT have the early-arming defect the
+/// x86 timers had?", which is no.
+///
+/// A relative arm — the local APIC's initial count, an 8254 count, ARM's
+/// `TVAL` — starts an interval *where the write happens*, so a write applied
+/// at the device's own tick, which on a shared crystal is where the round
+/// began, fires up to a round early. `mtimecmp` names an instant instead:
+/// "a machine timer interrupt becomes pending whenever `mtime` >= `mtimecmp`"
+/// (*RISC-V Privileged Architecture*, "Machine Timer Registers"). The guest
+/// computes that instant from a `time` it reads at its own position, and the
+/// CLINT compares it against `mtime`, which is the same function of time
+/// wherever it is evaluated. Nothing the block does with the write can move
+/// it.
+///
+/// So this asserts the end-to-end property on the two-hart board with the
+/// write deliberately mid-round: the interrupt arrives on the tick the
+/// comparator names, within the one `mtime` tick a hart's own step can
+/// straddle, whichever hart armed it and whichever of them executed its round
+/// first. The spins are a few hundred microseconds of a 1 GHz hart, so the
+/// writes land at different points of their rounds and the other hart has run
+/// the round to its end before some of them and not others.
+#[test]
+fn a_comparator_armed_mid_round_on_a_shared_crystal_lands_on_its_tick() {
+    for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+        for spin in [60_000u32, 150_000, 240_000] {
+            for hart in 0..2 {
+                let (at, last, trap, _) = fired_after("riscv-virt-smp", 15_000, spin, hart, mode);
+                assert!(
+                    last < at,
+                    "{mode:?} spin {spin}, hart {hart} read {last}, at or past its \
+                     comparator {at}, before the interrupt"
+                );
+                assert!(
+                    trap >= at && trap - at <= 1,
+                    "{mode:?} spin {spin}, hart {hart}'s interrupt, armed for {at}, \
+                     arrived at {trap}"
+                );
+            }
+        }
+    }
 }
 
 /// The control. Before the read path the lone hart took these two interrupts
