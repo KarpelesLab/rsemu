@@ -278,7 +278,7 @@ impl State {
         {
             // `BSCAN2`: the modulus is the line's rather than the plane's -
             // "when scan-doubled both odd and even bitplanes use the same
-            // modulus on a given line" (Â§2, *Bitplanes*).
+            // modulus on a given line" (§2, *Bitplanes*).
             let scan2 = self.rev.is_aga() && self.fmode & aga::BSCAN2 != 0;
             let line_modulo = aga::scan_double_modulo(leaving.vpos, self.diwstrt);
             for (plane, out) in planes.iter_mut().enumerate().take(self.planes()) {

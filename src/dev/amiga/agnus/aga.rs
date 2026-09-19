@@ -14,8 +14,9 @@
 //! is silent the comment says so and says what was chosen instead. **No
 //! emulator source of any licence was consulted**, nor any FPGA
 //! reimplementation; the document was fetched on its own. Lisa's half of the
-//! same document is read in [`crate::dev::amiga::denise::aga`], and that
-//! module's ledger is worth reading beside this one.
+//! same document is read in `crate::dev::amiga::denise`'s `aga` module —
+//! private, so this cannot link to it — and that module's ledger is worth
+//! reading beside this one.
 //!
 //! # What Alice does that an 8375 does not
 //!
