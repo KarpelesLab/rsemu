@@ -129,8 +129,26 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     }
     a.jmp(l.disk_fail);
 
-    // The diskette. Only unit 0 exists on this board.
+    // The diskette. Only unit 0 exists on this board — and on some boards this
+    // firmware runs on there is no diskette adapter at all.
+    //
+    // **The adapter is probed before anything is asked of it.** An unterminated
+    // ISA bus reads as ones, so a main status register of `0xFF` is a board
+    // with nothing at `0x3F4`: `RQM`, `DIO`, `NDM` and `CB` all set at once
+    // with all four drives seeking is not a state the µPD765 data sheet's
+    // handshake ever reaches in this firmware's use of it, because every
+    // command here drains its own result phase and its own seek senses. Without
+    // the probe each call spins its bounded polls out against a port that never
+    // answers — which is slow rather than fatal, but it made `q35`, a board
+    // with no diskette controller, take millions of cycles to decline a
+    // diskette it does not have.
     a.bind(floppy);
+    a.push(DX);
+    a.movi(DX, FDC_MSR);
+    a.in_al_dx();
+    a.pop(DX);
+    a.alui8(Alu::CMP, AL, 0xff);
+    a.jcc(Cc::E, l.disk_fail);
     let fd_reset = a.label();
     let fd_read = a.label();
     let fd_write = a.label();
