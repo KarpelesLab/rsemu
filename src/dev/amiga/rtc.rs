@@ -209,7 +209,7 @@ impl State {
         let month = self.pair(MO10, MO1, 1);
         let year = self.pair(Y10, Y1, 0xf);
         match month {
-            2 if year % 4 == 0 => 29,
+            2 if year.is_multiple_of(4) => 29,
             2 => 28,
             4 | 6 | 9 | 11 => 30,
             _ => 31,
@@ -413,7 +413,7 @@ fn parse_time(text: &str) -> Result<State> {
     };
     let (year, month, day) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
     let (hour, minute, second) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let days = match month {
         2 if leap => 29,
         2 => 28,
@@ -795,7 +795,7 @@ mod tests {
         assert_eq!(hms(&c), (23, 59, 59));
         c.advance_to(TICKS_PER_SECOND);
         assert_eq!(hms(&c), (0, 0, 0));
-        assert_eq!(date(&c), (0, 1, 1, (4 + 1) % 7), "Thursday to Friday");
+        assert_eq!(date(&c), (0, 1, 1, 5), "Thursday to Friday: 5");
 
         let c = rtc("2028-02-28T23:59:59");
         c.advance_to(TICKS_PER_SECOND);
