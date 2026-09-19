@@ -3,7 +3,7 @@
 //! **This models the drive, not a host adapter**, on exactly the terms
 //! [`super::disk`] states: nothing here knows what `0x170` is, and nothing here
 //! has a register *offset*. It reaches a cable through
-//! [`AtaDevice`](super::AtaDevice), the same six calls a hard disk answers, and
+//! [`AtaDevice`], the same six calls a hard disk answers, and
 //! [`crate::dev::pc::ide`] cannot tell which of the two it is talking to —
 //! which is the truth about the ribbon cable and the reason ATAPI exists at
 //! all.
@@ -19,7 +19,7 @@
 //! layer neither knows nor cares what they say.
 //!
 //! That is why this is a sibling of `disk.rs` and not a flag on it. The two
-//! share the register file — [`Reg`](super::Reg) is the same eight names, the
+//! share the register file — [`Reg`] is the same eight names, the
 //! reset signature lands in the same four registers, `BSY` and `DRQ` are the
 //! same two bits — and they share **not one line of command dispatch**. Delete
 //! this file and `ata.disk` is unchanged; delete `disk.rs` and this one loses

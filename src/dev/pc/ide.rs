@@ -15,8 +15,13 @@
 //!   `IDENTIFY`, no `READ SECTORS`.
 //! * **There is not one `IDENTIFY` word index, and not one status- or
 //!   error-register bit.** This file cannot tell you what `BSY` is worth.
-//! * Symmetrically, `src/dev/ata/disk.rs` contains no I/O port address and no
-//!   register offset.
+//! * Symmetrically, `src/dev/ata/disk.rs` and `src/dev/ata/atapi.rs` contain no
+//!   I/O port address and no register offset.
+//! * **This file cannot tell a hard disk from a CD-ROM.** Both are
+//!   [`AtaDevice`]s and both are driven through the same sixteen accesses,
+//!   because on a real cable they are. Which one is in a bay is decided by the
+//!   machine description and discovered by the *driver*, from the reset
+//!   signature — never by the adapter.
 //!
 //! What is left is the table in [`register_at`] — eight offsets to eight
 //! register *names* — and the rules of a cable with two drives on it.
@@ -64,19 +69,25 @@
 //! a command and a write to device control resets the drives, and neither can be
 //! made harmless.
 //!
-//! # Two drives on one cable
+//! # Two devices on one cable
 //!
-//! A write to any command block register goes to **both** drives; each decides
+//! A write to any command block register goes to **both** devices; each decides
 //! whether it is being addressed by comparing the Device register's DEV bit with
-//! the position it is jumpered to. A read is answered by whichever drive says it
-//! is selected. Three cases, and the third is how a driver probes:
+//! the position it is jumpered to. A read is answered by whichever says it is
+//! selected. Three cases, and the third is how a driver probes:
 //!
-//! * the selected drive is there — it answers;
+//! * the selected device is there — it answers;
 //! * the selected position is empty but the other is occupied — **zero**,
-//!   because the drive that is there answers for the one that is not, and a
+//!   because the device that is there answers for the one that is not, and a
 //!   status register of zero is what tells a driver "nothing here";
 //! * both empty — ones, because nothing is driving the bus at all and an ISA
 //!   bus with nothing driving it reads as ones.
+//!
+//! The second case has a wrinkle the third does not, and it is not this file's
+//! to fix: an ATAPI device's Status register reads zero *while it is there*
+//! (ATA/ATAPI-6 §7.15.6.3), so a driver that probed with a status read alone
+//! would miss a CD-ROM. The signature in the two cylinder bytes is what the
+//! standard provides instead, and both the firmware and the tests use it.
 //!
 //! # Interrupts
 //!
