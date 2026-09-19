@@ -127,7 +127,9 @@ two-processor twin as one, which is what they are: an `-smp` file is the same
 board with a second `cpu` object and a table told about it. **Four of those
 twins exist** — `riscv-virt-smp`, `arm64-virt-smp`, `q35-linux-smp` and
 `pc-at-smp` — and **three of them boot a real kernel onto both processors**; the
-fourth, `pc-at`'s, runs rsemu's own boot sector and no operating system.
+fourth, `pc-at`'s, runs rsemu's own boot sector and no operating system, though
+the single-processor `pc-at` installs FreeDOS 1.3 onto a hard disk and boots
+off it.
 [`docs/README.md`](docs/README.md) has a table comparing them and a page per
 board behind it, and those pages record **where each one stops** rather than
 where it gets to. That is the useful half: `docs/platforms/q35-linux.md` has
@@ -330,14 +332,22 @@ because FreeDOS, Windows 95 and Windows XP all need a *legacy* BIOS and every
 one anybody could reach for is GPL. There is no assembler in this repository
 and Rust cannot target 16-bit x86, so the ROM is **emitted**: `src/fw/asm16` is
 a 16-bit x86 assembler in Rust and the firmware is a Rust program that calls
-it, which makes `cargo build` the whole build. On that firmware `pc-at` **boots
-FreeDOS 1.3 to its installer prompt** — the board sizes 16 MiB of RAM, shadows
-itself out of ROM into RAM through the 82441FX's PAM registers, enumerates PCI,
-maps and runs a video card's option ROM off an expansion-ROM BAR, reads a
-diskette through the µPD765 and the 8237, and jumps to `0000:7c00`, where
-FreeDOS's own boot sector takes over. Where it stops is written down: the
-installer cannot be driven past its first keystroke, because `pc.kbc` delivers
-one and then goes silent (`docs/platforms/pc-at.md`).
+it, which makes `cargo build` the whole build. On that firmware `pc-at`
+**installs FreeDOS 1.3 onto a hard disk and boots off it** — the board sizes
+16 MiB of RAM, shadows itself out of ROM into RAM through the 82441FX's PAM
+registers, enumerates PCI, maps and runs a video card's option ROM off an
+expansion-ROM BAR, reads a diskette through the µPD765 and the 8237, and jumps
+to `0000:7c00`, where FreeDOS's own boot sector takes over. From there a person
+answers the installer: `FDISK` partitions a blank IDE drive, the machine
+reboots off the diskette, `FORMAT` writes FAT16, and the installer unpacks 114
+archive volumes off five diskettes that are swapped under the running guest.
+The diskette then comes out, and the disk image the install wrote boots on its
+own to `C:\>`, where `VER` answers `FreeDOS 1.3`. Every keystroke goes in
+through the VNC input seam as set-2 scan codes on the 8042's port, and every
+answer is read off the guest's own text page; nothing is vendored, and the
+diskettes are fetched. What that took is written down, including the three
+`INT 13h` defects it found — the boot order, the EDD subset and the diskette's
+change line (`docs/platforms/pc-at.md`).
 
 The other four x86 boards are modern. `q35` is the chipset — an 82Q35 (G)MCH
 with **ECAM** as well as the `0xcf8` pair, an ICH9 with the `PIRQ[A-H]` routers,

@@ -132,15 +132,18 @@ something a person can actually run (§2).
 > `ACPI: Using ACPI (MADT) for SMP configuration information` and `APIC: Switch
 > to symmetric I/O mode setup` where it used to fall back to virtual wire mode.
 >
-> `pc-at` is in the catalog and **boots FreeDOS 1.3 to its installer prompt on
-> firmware this repository assembles from source** — phase 6a's gate. It sizes
-> 16 MiB of RAM, shadows itself out of ROM into RAM through an 82441FX host
-> bridge's PAM registers, enumerates PCI, maps a video card's option ROM off an
-> expansion-ROM BAR and runs it, sets an 80×25 text mode, reads a diskette
-> through the µPD765 and the 8237, and jumps to `0000:7c00` — where FreeDOS's
-> own boot sector loads a compressed kernel a sector at a time, decompresses it,
-> runs `FDCONFIG.SYS` and `COMMAND.COM`, and reaches a live prompt with `INT 21h`
-> and `INT 2Fh` now DOS's.
+> `pc-at` is in the catalog and **installs FreeDOS 1.3 onto a hard disk and
+> boots off it, on firmware this repository assembles from source** — past
+> phase 6a's gate, which was the boot. It sizes 16 MiB of RAM, shadows itself
+> out of ROM into RAM through an 82441FX host bridge's PAM registers,
+> enumerates PCI, maps a video card's option ROM off an expansion-ROM BAR and
+> runs it, sets an 80×25 text mode, reads a diskette through the µPD765 and the
+> 8237, and jumps to `0000:7c00` — where FreeDOS's own boot sector loads a
+> compressed kernel a sector at a time, decompresses it, runs `FDCONFIG.SYS`
+> and `COMMAND.COM`, and reaches a live prompt with `INT 21h` and `INT 2Fh` now
+> DOS's. From there the Floppy Edition's installer is driven through the VNC
+> input seam, with its five diskettes swapped under the running guest, and what
+> it writes boots on its own to `C:\>`.
 >
 > Two firmwares reach that board and the distinction matters. A **user-supplied
 > image** — SeaBIOS, say — still works and is what `RSEMU_BIOS` binds; running a

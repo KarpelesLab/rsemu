@@ -554,12 +554,14 @@ need, and a board that stopped mapping it would simply stop having one. What
 the window cannot do is obey a `WRMSR` that moves the page, and what it costs is
 one line in every multiprocessor board file. That is the trade, written down.
 
-### FreeDOS boots
+### FreeDOS boots, installs itself onto the hard disk, and boots off that
 
-`ROADMAP.md` phase 6a's gate, and it is met. `tests/pc_at_boot.rs` boots a
-**FreeDOS 1.3 diskette** on this board with rsemu's own firmware in the socket,
-gated on `RSEMU_FREEDOS_FLOPPY` so an ordinary `cargo test` stays hermetic;
-`scripts/fetch-testdata.sh freedos` fetches one into the ignored corpus
+`ROADMAP.md` phase 6a's gate was "FreeDOS boots", and it is met twice over.
+
+**The diskette**, in `tests/pc_at_boot.rs`: a FreeDOS 1.3 Floppy Edition boot
+diskette on this board with rsemu's own firmware in the socket, gated on
+`RSEMU_FREEDOS_FLOPPY` so an ordinary `cargo test` stays hermetic.
+`scripts/fetch-testdata.sh freedos` fetches the set into the ignored corpus
 directory. **Nothing is vendored** — FreeDOS is GPL-2.0, running it as an
 emulated guest is ordinary use, shipping it here would not be, and its source
 was not read (`ROADMAP.md` §1). Quoted from a run:
@@ -568,23 +570,121 @@ was not read (`ROADMAP.md` §1). Quoted from a run:
   |FreeCom version 0.85a - WATCOMC - XMS_Swap [Jul 10 2021 19:28:06]|
   |Welcome to the FreeDOS 1.3 installation program.|
   |Do you want to proceed [Y,N]?|
-  pc-at freedos: 5.8s of host time; stopped at 2241:0000375f, halted=true
-  pc-at freedos: vectors 08->0070:000f 10->f000:047f 13->f000:09c9 21->00d8:129a
+  pc-at freedos: 7.3s of host time; stopped at 2241:0000375f, halted=true
+  pc-at freedos: vectors 08->0070:000f 10->f000:0482 13->f000:09cc 21->00d8:129a
+  pc-at freedos: 0 unanswered bus access(es)
 ```
 
-Sixty seconds of virtual time end to end, six of host time: FreeDOS's own boot
-sector loads a compressed kernel a sector at a time through `INT 13h AH=02h`,
-printing a dot as it goes; the kernel decompresses and initialises,
-`FDCONFIG.SYS` runs, `COMMAND.COM` prints its banner, and the installer draws a
-screen and waits at a prompt. Feeding one scan code to the 8042 at that point
-puts an `N` on the line after the prompt, so it is a live prompt rather than a
-picture; the committed test does not do that, because a second keystroke does
-not arrive (see the `pc.kbc` note in `tests/pc_at_boot.rs`) and half a
-conversation is not worth asserting. `INT 21h` moving out of segment `0xf000`
-is the assertion that says a kernel installed itself, and it is independent of
-which DOS.
+Sixty seconds of virtual time end to end: FreeDOS's own boot sector loads a
+compressed kernel a sector at a time through `INT 13h AH=02h`, printing a dot
+as it goes; the kernel decompresses and initialises, `FDCONFIG.SYS` runs,
+`COMMAND.COM` prints its banner, and the installer draws a screen and waits at
+a prompt. `INT 21h` moving out of segment `0xf000` is the assertion that says
+a kernel installed itself, and it is independent of which DOS.
 
-Two things the boot taught the firmware, neither predicted:
+**The installation**, in `tests/pc_at_freedos.rs`, is the rest of the
+conversation, and it is what turned three defects up. A person answers the
+installer's questions and swaps its diskettes; nothing else crosses into the
+machine. Every keystroke is an X11 keysym posted on the machine's `Recorder`
+and turned into set-2 scan codes by `host::input::KeyboardSink` on the 8042's
+character port — the same path `rsemu run --vnc` uses — and every answer is
+read off the guest's own text page at `0xb8000`. The person is a state machine
+over that page, sampled every 500 ms of virtual time, which answers whatever
+is on the **last line**: the earlier lines are questions already answered,
+scrolling up.
+
+The sequence, with the guest instants the run reports:
+
+| At | What the screen says, and what is typed |
+| --- | --- |
+| 60 s | `Do you want to proceed [Y,N]?` — `Y` |
+| 65 s | `FDISK` partitions drive C, and `You must reboot ... [Y,N]?` — `Y` |
+| 91 s | rebooted **off the diskette**, and asked to proceed again — `Y` |
+| 93 s | `Drive C: does not appear to be formatted. ... [Y,N]?` — `Y` |
+| 103 s | `QuickFormat complete. 67,060,224 bytes total disk space`, FAT16 |
+| 103 s | `We are now ready to install FreeDOS 1.3 ... [Y,N]?` — `Y` |
+| 206 s | system files, the MBR, the active partition, `FDCONFIG.SYS` — then `Insert diskette #2 (x86-DSK1)` |
+| 206-2374 s | the five archive diskettes, swapped as each is asked for: `FREEDOS.024` is on the second, `.048` on the third, `.072` on the fourth, `.096` on the fifth |
+| ~4000 s | `FreeDOS 1.3 file extraction. Success.` and `The installation of FreeDOS 1.3 has completed.` |
+
+The diskette swap is the host action a person's hand is: `pc.fdc`'s drive host
+object grew an `insert`, which changes the medium, infers the new geometry from
+its length and raises `DSKCHG` — the line the *IBM PC/AT Technical Reference*
+says the digital input register's bit 7 carries, active from the moment the
+door opens until a step pulse with a diskette in the drive. The test picks
+which image to put in by reading the FAT root directory of each and finding
+the file the installer asked for, which is what the labels on the diskettes are
+for.
+
+What it ends at — at 2,779.6 guest seconds, for 945 of host time — is a hard
+disk with FreeDOS on it. The test then throws the machine away, writes the
+drive's medium back to the image file it came from, **builds a second machine
+around that file with nothing in the diskette drive**, and uses what boots.
+Quoted from the run, at sixty guest seconds and then at the two commands:
+
+```text
+  |CD-ROM not configured|
+  |Done processing startup files C:\FDCONFIG.SYS and C:\FDAUTO.BAT|
+  |Welcome to the FreeDOS 1.3 operating system (http://www.freedos.org)|
+  |C:\>ver|
+  |FreeCom version 0.85a - WATCOMC - XMS_Swap [Jul 10 2021 19:28:06]|
+  |C:\>dir c:\|
+  | Volume in drive C is FREEDOS2022|
+  | Directory of C:\|
+  |FREEDOS              <DIR>  01-01-2026 12:02a|
+  |COMMAND  COM        85,480  07-10-2021 11:28p|
+  |FDAUTO   BAT         1,740  01-01-2026 12:02a|
+  |FDCONFIG SYS           319  01-01-2026 12:02a|
+  |KERNEL   SYS        46,485  05-14-2021  3:32a|
+  |         2 dir(s)      51,421,184 bytes free|
+```
+
+The dates are the machine's: `01-01-2026` is the RTC the machine file starts
+at, so the files the install wrote are stamped with it while the ones it
+copied off the diskettes keep 2021's. The **same instants twice** — two runs
+of this file reported the install complete at 2,779,599 ms to the millisecond,
+which is the determinism claim made rather than asserted.
+
+Four things the installation taught the firmware, none of them predicted; the
+first three have a hermetic test each in `tests/pc_at_disk_services.rs`:
+
+- **The bootstrap tried the fixed disk before the diskette.** The AT's own
+  order is the other way round — the *IBM PC/AT Technical Reference*'s
+  bootstrap loader reads the boot record from diskette drive A and only then
+  from the fixed disk — and nothing noticed until an installer needed it:
+  `FDISK` writes a master boot record, which carries the `0x55 0xAA`
+  signature, and reboots to format the partition it has just made. Fixed disk
+  first, that reboot ran the new MBR over an empty partition and stopped. A
+  diskette that is in the drive but not bootable still falls through, which is
+  the other half of the rule and is tested too.
+- **The EDD fixed-disk subset was claimed and not implemented.** `INT 13h
+  AH=41h` sets bit 0 of `CX`, which EDD 1.1 defines as functions 42h, 43h,
+  44h, 47h *and 48h*; only 42h was there. FreeDOS's `FDISK` believed the bit,
+  called `AH=48h` for the disk's size, got carry back and printed `No fixed
+  disks present` on a board with a 64 MiB drive in it. All five are
+  implemented now: 48h fills EDD 1.1's 26-byte table out of the geometry POST
+  read from `IDENTIFY DEVICE` and the drive's own addressable sector count,
+  and 43h is 42h with the other ATA command. The hermetic test checks the
+  table against what `AH=08h` reports and moves a sector out with 43h and back
+  with 42h.
+- **The diskette had no change line.** `AH=15h` answered type 1, "no change
+  line", on the reasoning that nothing could eject — which stopped being true
+  the moment a host could swap the medium. It answers type 2 now, and `AH=16h`
+  reports the line: `06h` while it is active, `00h` once the seek every read
+  performs has cleared it. That is how a DOS finds out that the diskette under
+  its cached directory is not the one it cached.
+- **A board with no diskette adapter paid for every attempt.** Trying the
+  diskette first means trying it on `q35` too, which has no µPD765 — and each
+  handshake in the diskette path polls a bounded 65,536 times for a main
+  status register that never answers, eight times over in `fd_start` alone.
+  Bounded is not cheap: `tests/q35_board.rs`'s boot stopped reaching its boot
+  sector. The adapter is now probed once, at the top of the diskette path — an
+  unterminated ISA bus reads as ones, and `0xFF` in the main status register
+  is a board with nothing at `0x3F4`, because `RQM`, `DIO`, `NDM` and `CB` all
+  set with four drives seeking is not a state this firmware's own use of the
+  chip reaches. That board is the test.
+
+Two things the *boot* taught it earlier, neither predicted:
 
 - **`INT 10h AH=08h`, read the character and attribute under the cursor, is
   called over four hundred times in the first twenty virtual seconds** — and
@@ -598,6 +698,11 @@ Two things the boot taught the firmware, neither predicted:
   `AH=87h` was implemented anyway, because a DOS extender is the next thing to
   run here and block move is the service it asks for; it is exercised by the
   hermetic test's own boot sector rather than by FreeDOS.
+
+**What the installation costs**: about seventy minutes of guest time and
+twenty of host time in `--release`, which is what unpacking 114 archive
+volumes off five diskettes onto a 64 MiB disk costs. It is gated on
+`RSEMU_FREEDOS_DIR` and skips with a printed reason without it.
 
 ### The graphics modes, and VBE
 
@@ -748,27 +853,45 @@ diskette does not use, so a bug there cannot destroy the boot sector the test is
 running from — and reads the same sector before and after: zeros become the
 `0xF6` filler, which nothing but a format that reached the drive can do.
 
-### Two things the board does that the firmware found
+### Two things the board did that the firmware found, and both are fixed
 
-Both are device-side, both are measured by `tests/pc_at_boot.rs`, and neither is
-a firmware bug:
+Kept because the shape of each is worth having written down, and because the
+tests that hold them fixed are named here:
 
-- **A PAM window with nothing under it faults instead of reading as ones.**
-  `pc.pmc` maps thirteen shadow windows across `0xc0000-0xfffff`. Where a
-  window has no permission and no region beneath it — `0xd0000-0xdffff` on this
-  board — a read returns `Err(Protected)` rather than falling through to the
+- **A PAM window with nothing under it faulted instead of reading as ones.**
+  `pc.pmc` maps thirteen shadow windows across `0xc0000-0xfffff`, and where a
+  window had no permission and no region beneath it — `0xd0000-0xdffff` on this
+  board — a read returned `Err(Protected)` rather than falling through to the
   space's `unassigned = read-as-ones`. An option-ROM scan walks exactly that
-  range, so the CPU's bus-fault counter climbs by 32 during a normal POST. A
-  440FX with a window set to "ROM read" and no ROM there is an ISA bus with
-  pull-ups, which reads as ones.
-- **`pc.kbc` delivers one keystroke and then goes quiet.** `read_data` clears
-  `OBF` and immediately refills the output buffer from the keyboard's queue
-  without re-driving `IRQ1`, so the line never falls between two bytes and the
-  edge-triggered 8259A never sees a second edge. Measured: after one key the
-  status port reads `0x05` (a byte waiting) with the master's `IRR` at `0x00`.
-  On real hardware the line drops when the buffer is read and rises when the
-  next byte arrives a serial frame later. The fix is a `refresh()` after the
-  clear and a deferred refill.
+  range, so the CPU's bus-fault counter climbed by 32 during a normal POST. A
+  440FX window set to "ROM read" with no ROM there is an ISA bus with pull-ups,
+  which reads as ones; the 82441FX datasheet's §3.2.18 *Disabled* encoding
+  directs both read and write cycles to the expansion bus, so a disabled window
+  is now **not mapped at all** rather than mapped without permissions. POST
+  takes zero bus faults. `tests/pc_at_shadow.rs` walks every 2 KiB boundary of
+  the scan window and counts them.
+- **`pc.kbc` delivered one keystroke and then went quiet.** `read_data` cleared
+  `OBF` and refilled the output buffer from the keyboard's queue in the same
+  access, so `IRQ1` — a level derived from `OBF` — never fell between two scan
+  codes and the edge-triggered 8259A never saw a second edge. The refill now
+  waits for a tick of the chip's own clock domain, which is what a real 8042
+  does anyway: the next code has to be clocked in over an eleven-bit serial
+  frame at 10-16.7 kHz, and `machines/pc-at.machine` divides the 8042's crystal
+  by 12,000 to give the device one tick per byte-time. Three tests hold it:
+  `tests/pc_at_kbc_irq.rs` (four bytes, four acknowledge cycles, the status
+  port polled between them and a debug read popping nothing — two chips and a
+  wire, no firmware), `tests/pc_at_typing.rs` (two keys through the whole board
+  into the BIOS type-ahead ring) and `src/dev/pc/kbc.rs`'s own unit tests.
+
+There is **no pending-refill event to snapshot**, which is the question a
+deferred refill raises and is worth answering explicitly: the refill is the
+scheduler's tick of this device's clock domain, and the scheduler's own state
+carries it. What the device saves is the architectural state the data sheet
+describes — the output buffer, `OBF`, the command byte, the output port and the
+keyboard's queue — so a machine restored with a byte waiting and three more in
+the keyboard goes on delivering those three a byte-time apart, which
+`tests/pc_at_kbc_irq.rs` asserts by draining the original and the restored
+machine and comparing the sequences.
 
 ## What is known to be missing
 
