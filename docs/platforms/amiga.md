@@ -1682,18 +1682,20 @@ halves in place and checks a frame hash; each frame was looked at.
 
 | ROM + disc | Reaches | What is on screen |
 | --- | --- | --- |
-| Kickstart 3.1 (40.60) + its extended half, empty tray | **the animated boot screen**, 4 s | Black for three seconds while Kickstart sizes memory, builds exec's lists, and `cd.device` finds Akiko, proves the corner turn, talks to the EEPROM and finds the drive empty. At 6 s: a starfield on black and, across the middle, a grey compact disc seen almost edge-on with a black hub, a white ring and four rainbow diffraction streaks. At 12 s: a band of deep purple sky across the top third with "AMIGA CD" over it in dark red and silver serif capitals, a rainbow highlight through the "CD", and "32" raised to its right with a small "TM". The disc turns and the sky's colours cycle, both copper work, so a golden is one exact virtual instant |
+| Kickstart 3.1 (40.60) + its extended half (40.60), empty tray | **the animated boot screen**, 6 s | Black for five seconds while Kickstart sizes memory, builds exec's lists, and `cd.device` finds Akiko, proves the corner turn, talks to the EEPROM and finds the drive empty — a *different* black from 4 s, where the frame hash moves and `ChipRevBits0` reaches `$1F`. At 6 s: a starfield on black and, across the middle, a grey compact disc seen almost edge-on with a black hub, a white ring and four rainbow diffraction streaks. At 12 s: a band of deep purple sky across the top third with "AMIGA CD" over it in dark red and silver serif capitals, a rainbow highlight through the "CD", and "32" raised to its right with a small "TM". The disc turns, and the sky is a ribbon that sweeps down behind it and back up as its colours cycle — at 14 s it is a teal and green aurora along the bottom — so a golden is one exact virtual instant |
 | The same with a disc in the tray | the same frame, hash for hash | Nothing changes, for the reason above |
 
 The processor is **stopped** from 6 s on: the animation is copper and blitter
 work with the processor waiting on the interrupt that drives it, which is what
 an idle Amiga looks like.
 
-`GfxBase->ChipRevBits0` reads **`$1F`** from 4 s — `GFXF_HR_AGNUS`,
+`GfxBase->ChipRevBits0` reads **`$1F`** from 4 s, two seconds before anything
+is drawn — `GFXF_HR_AGNUS`,
 `GFXF_HR_DENISE`, `GFXF_AA_ALICE`, `GFXF_AA_LISA` and bit 4 — so the guest's
 own `graphics.library` found Alice and Lisa. Both ROM halves identify
 themselves as **40.60** through their header words at `$F8_000C` and
-`$E0_000C`, and `ExecBase`'s `lib_Version` is 40.
+`$E0_000C` — both halves carry the same version and revision — and
+`ExecBase`'s `lib_Version` is 40.
 
 Amiga Forever ships no CD32-bootable disc image: its `Shared` directories hold
 ROMs, ADFs and HDFs, and the only ISO in the product is its own installer DVD.

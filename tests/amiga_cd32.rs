@@ -16,7 +16,7 @@
 //! list walked from `ExecBase` by name, and `gb_ChipRevBits0` at offset `$EC`
 //! of the library base. On this board it reads **`$1F`** — `GFXF_HR_AGNUS`,
 //! `GFXF_HR_DENISE`, `GFXF_AA_ALICE`, `GFXF_AA_LISA` and bit 4 — and it gets
-//! there at 4 s, before the logo is drawn.
+//! there at 4 s, two seconds before anything is drawn.
 //!
 //! **The evidence that this is the CD32's ROM and not another** is the ROM
 //! identifying itself: both halves' header words are read out of the map at
@@ -262,10 +262,13 @@ const GOLDEN_BOOT_6S: u64 = 0x8f94_08ce_732f_5637;
 /// The animated boot screen, **and this is the milestone the board exists
 /// for**: the picture a real CD32 shows with nothing in the tray.
 ///
-/// The screen is black for the first three virtual seconds while Kickstart
-/// sizes memory and builds exec's lists, and the extended ROM's `cd.device`
-/// finds Akiko, proves its chunky-to-planar converter, talks to the EEPROM
-/// and finds the drive empty. At 4 s the animation is running.
+/// The screen is black for five virtual seconds while Kickstart sizes memory
+/// and builds exec's lists, and the extended ROM's `cd.device` finds Akiko,
+/// proves its chunky-to-planar converter, talks to the EEPROM and finds the
+/// drive empty. It is a *different* black from 4 s — the frame hash moves
+/// there, which is the ROM's own screen opening, and it is where
+/// `ChipRevBits0` reaches `$1F` — and the first thing drawn into it appears
+/// at 6 s.
 ///
 /// **12 s**: a 1600 x 568 field — 320 of Lisa's low-resolution pixels across a
 /// PAL overscan window, so the capture is five 35 ns columns per pixel —
@@ -275,9 +278,11 @@ const GOLDEN_BOOT_6S: u64 = 0x8f94_08ce_732f_5637;
 /// its right in the same red with a small "TM" beside it. Below the middle,
 /// drawn in perspective and seen almost edge-on, a compact disc: a grey
 /// ellipse with a black hub, a white ring around the hub and four rainbow
-/// diffraction streaks crossing it. The disc turns and the sky's colours cycle
-/// from frame to frame — both are copper work — so the hash is of one exact
-/// virtual instant and moves if anything about the timing does.
+/// diffraction streaks crossing it. The disc turns, and the sky is a ribbon
+/// that sweeps down behind the disc and back up again as its colours cycle —
+/// two seconds later it is a teal and green aurora along the bottom instead —
+/// so the hash is of one exact virtual instant and moves if anything about
+/// the timing does.
 #[test]
 fn the_boot_screen_with_an_empty_tray() {
     let Some(b) = boots_to(Vec::new(), "cd32-boot", 12, GOLDEN_BOOT_12S) else {
@@ -311,9 +316,9 @@ fn the_boot_screen_with_an_empty_tray() {
 ///
 /// **6 s**: black, a field of small white stars, and the same grey compact
 /// disc seen almost edge-on across the middle with its black hub, white ring
-/// and four rainbow streaks. No sky band and no lettering yet — the animation
-/// brings them in over the next few seconds, and this golden catches it part
-/// way.
+/// and four rainbow streaks. No sky ribbon and no lettering yet — the
+/// animation brings them in over the next few seconds, and this golden catches
+/// it part way. The two seconds before it are black.
 #[test]
 fn the_animation_is_part_way_at_six_seconds() {
     let _ = boots_to(Vec::new(), "cd32-boot", 6, GOLDEN_BOOT_6S);
