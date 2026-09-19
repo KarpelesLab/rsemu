@@ -47,7 +47,8 @@
 //! each checked frame (in a build with `display-png`); each golden below was
 //! looked at before it was accepted, and is described beside its test.
 //!
-//! `RSEMU_AMIGA_TRACE=1` prints the processor's state once a virtual second.
+//! `RSEMU_AMIGA_TRACE=1` prints the processor's state and `ChipRevBits0` once
+//! a virtual second, which is how the timings above were established.
 //!
 //! The board is the shipped `machines/amiga-a1200.machine`, unchanged.
 //! Images are bound with `--media`'s semantics — copied into the drive — so
