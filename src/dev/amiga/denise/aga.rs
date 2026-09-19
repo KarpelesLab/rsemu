@@ -29,12 +29,13 @@
 //! and both are documented where they are declared. In short:
 //!
 //! * **Bitplanes**: eight word streams, unchanged in shape. A wider `FMODE`
-//!   needs nothing new, because "the parallel to serial conversion is
+//!   needs no new seam, because "the parallel to serial conversion is
 //!   triggered whenever bit plane #1 is written, indicating the completion of
 //!   all bit planes for that word (16/32/64 pixels). The MSB is output first,
 //!   and is therefore always on the left" (§4, `BPLxDAT`) — a fetch of any
 //!   width is that many consecutive pixels, so the stream is the same stream
-//!   with more words per fetch slot.
+//!   with more words per fetch slot. What the width does move is *when* that
+//!   conversion starts; see [below](#what-fmodes-bitplane-bits-change).
 //! * **Sprites**: [`Video::sprite_dma`](super::Video::sprite_dma), because a
 //!   32- or 64-bit sprite fetch does not fit the sixteen-bit register bus.
 //! * **`FMODE` and `BPLCON4`** arrive as ordinary register writes; `FMODE` is
@@ -58,21 +59,35 @@
 //! | `SPRxCTL`'s `SH1` and `SH0` | modelled: a sprite positioned to the quarter-pixel |
 //! | `FMODE`'s `SSCAN2` | modelled: `SH10` leaves the horizontal comparison, because Alice is using it |
 //! | `CLXCON2` | modelled: bitplanes 7 and 8 in collisions, and a `CLXCON` write clears it |
-//! | `FMODE`'s `BPL32`, `BPAGEM` | latched only, and deliberately: see [below](#what-fmodes-bitplane-bits-do-not-change) |
+//! | `FMODE`'s `BPL32`, `BPAGEM` | modelled where Lisa can see them: the delay from a fetch to its first pixel ([below](#what-fmodes-bitplane-bits-change)) |
 //! | `FMODE`'s `BSCAN2` | latched only — it selects between `BPL1MOD` and `BPL2MOD`, which is Alice's |
 //! | `BPLCON2`'s `RDRAM`, `ZDBPEN`, `ZDBPSEL`, `ZDCTEN`, `SOGEN` | latched only: genlock, and reading the colour table back through a write-only address |
 //! | `BPLCON3`'s `BRDNTRAN`, `ZDCLKEN`, `EXTBLKEN` | latched only: genlock and the `BLANK` pin, neither of which leaves the chip here |
 //! | `BPLCON0`'s `BYPASS`, `UHRES` | latched only: eight-bit direct video out, and the external-logic pointers |
 //! | the colour table's `T` bit | kept, so a snapshot round-trips it; nothing reads it, because nothing models the `ZD` pin |
 //!
-//! # What `FMODE`'s bitplane bits do not change
+//! # What `FMODE`'s bitplane bits change
 //!
 //! `BPL32` and `BPAGEM` say how many bytes one bitplane fetch moves and
 //! whether it is a double-`CAS` cycle (§4, `FMODE`, the first table). Both
-//! facts are about the memory cycle Alice makes, and neither changes what Lisa
-//! does with the result, for the reason `BPLxDAT` gives above. So Lisa latches
-//! them — a snapshot has to carry them, and Alice reads the same register —
-//! and the bit stream is the bit stream.
+//! facts are about the memory cycle Alice makes, and the bit stream is the bit
+//! stream whatever the width, for the reason `BPLxDAT` gives above.
+//!
+//! **Where that stream starts on the screen is not the same.** The load that
+//! starts the serializer waits for "the completion of all bit planes for that
+//! word (16/32/64 pixels)", and a wider fetch completes its group later: the
+//! first pixel lands one fetch block and half a count after the fetch, and a
+//! block is the one-times block stretched by `FMODE`'s factor up to eight
+//! counts. The document says the direction and not the amount; the amount was
+//! read off the user's Kickstart 3.1, which programs its own screens for the
+//! silicon's delay — [`fetch_block`] has the nine screens and the one
+//! alternative reading they leave open.
+//!
+//! This was "latched only" until `LISAID` told that ROM it had four times the
+//! bandwidth (`super::LISA_ID`): at one times it never writes a wide `FMODE`,
+//! and the first 4× Workbench came out sixteen high-resolution pixels to the
+//! left, with the start of the next plane-row's data showing at its right
+//! edge.
 //!
 //! The one place the width is visible from here is the **scroll range**: §5's
 //! table gives 0–15 low-resolution pixels of scroll in `LORES` at 1× bandwidth
@@ -84,10 +99,12 @@
 //!
 //! # The other inferences, in one place
 //!
-//! * **Where a fetch's first pixel lands.** As for the 8373: the document
-//!   gives no formula, so the 3rd-edition manual's arithmetic is kept — one
-//!   fetch block and half a colour clock after the fetch — and the scroll runs
-//!   from there. [`super::Setup`] has the derivation.
+//! * **Where a fetch's first pixel lands.** The document gives no formula,
+//!   so the 3rd-edition manual's arithmetic is kept — one fetch block and half
+//!   a colour clock after the fetch, [`super::Setup`] has the derivation — and
+//!   the scroll runs from there. How long a block is under a wide `FMODE` is
+//!   measured off the ROM rather than read, and bounded at eight counts; see
+//!   [`fetch_block`].
 //! * **HAM6's low bits on an eight-bit gun.** §2 says of HAM8 that "the data
 //!   is placed in 6 MSB. The 2 LSB are left unmodified"; it says nothing about
 //!   HAM6, whose four bits are half of a gun. The same rule is applied — four
@@ -145,6 +162,63 @@ const fn sprite_pixels(fmode: u16) -> u8 {
         // Both move four bytes, so both give a 32-pixel sprite.
         _ => 32,
     }
+}
+
+/// The colour clocks from the start of a bitplane fetch to the block boundary
+/// the serializer waits for, in this resolution and `FMODE`.
+///
+/// At one times it is the 3rd-edition manual's block — eight counts in low
+/// resolution and four in high ("$81/2 - 8.5 = $38" and "$81/2 - 4.5 = $3C",
+/// chapter 3; `super::Setup` has the derivation) and two in SuperHires. A
+/// wider `FMODE` stretches it: "the parallel to serial conversion is triggered
+/// whenever bit plane #1 is written, indicating the completion of all bit
+/// planes for that word (16/32/64 pixels)" (§4, `BPLxDAT`), so the same pixels
+/// arrive in `f` times fewer, `f` times wider transfers and the group that
+/// triggers the load completes later.
+///
+/// **By how much is measured, not read**: the document gives no number. The
+/// user's Kickstart 3.1 (40.68) was made to open its Workbench screen in low,
+/// high and super-high resolution at each bandwidth — the bandwidth set
+/// through `LISAID` bits 9–8, which it reads to choose `FMODE`; see
+/// [`super::LISA_ID`] — and its copper lists were read out of chip RAM. All
+/// nine keep `DDFSTRT $38`, `DIWSTRT $xx81` and `BPLCON1 0` and instead move
+/// the bitplane pointer so that the bitmap's first pixel is at the window's
+/// edge, and what the pointer makes up gives the delay the ROM expects of the
+/// silicon:
+///
+/// | | `FMODE 0` | `FMODE 1` or `2` | `FMODE 3` |
+/// | --- | --- | --- | --- |
+/// | low | 8 counts (pointer +0) | 8 (+0) | 8 (+0) |
+/// | high | 4 (pointer back a word) | 8 (+0) | 8 (+0) |
+/// | super-high | 2 (back three words) | 4 (back two) | 8 (+0) |
+///
+/// The one-times column is the manual's own and this model's earlier
+/// SuperHires inference, which is how the method is checked. The rest is the
+/// one-times block times `FMODE`'s factor, **no longer than eight counts**:
+/// that bound is what the ROM's numbers say, and why it holds is not in any
+/// document at hand. Every sample has `DDFSTRT` a multiple of eight, so a
+/// second reading fits the same nine — a block of the full stretched length
+/// on a grid aligned to it, the fetch rounding `DDFSTRT` down to that grid —
+/// and the two part only for a `DDFSTRT` off the grid, which no screen the ROM
+/// opens has. The bound is taken because it changes nothing but the delay.
+#[inline]
+const fn fetch_block(shres: bool, hires: bool, fmode: u16) -> i32 {
+    let one = if shres {
+        2
+    } else if hires {
+        4
+    } else {
+        8
+    };
+    // `BPAGEM`/`BPL32`, §4's first `FMODE` table: 16, 32, 32 or 64 bits a
+    // transfer.
+    let factor = match fmode & 3 {
+        0 => 1,
+        3 => 4,
+        _ => 2,
+    };
+    let block = one * factor;
+    if block > 8 { 8 } else { block }
 }
 
 /// One playfield's eight-bit `BPLCON1` scroll, in quarters.
@@ -235,16 +309,10 @@ impl Setup {
             && planes == 6
             && regs.bplcon2 & KILLEHB == 0;
 
-        // Where the first fetched bit is displayed: the 3rd-edition manual's
-        // arithmetic, in quarters, because the AA document gives no formula of
-        // its own. See `super::Setup`.
-        let lead: i32 = if shres {
-            5
-        } else if hires {
-            9
-        } else {
-            17
-        };
+        // Where the first fetched bit is displayed: one fetch block and half a
+        // count after the fetch began, a block being what `FMODE` makes it
+        // ([`fetch_block`]).
+        let lead = 2 * fetch_block(shres, hires, regs.fmode) + 1;
         let base = QUARTERS * (2 * i32::from(fetch_start) + lead);
         // "PFI = odd, FP2 = even bit planes" (§4, BPLCON0): planes 1, 3, 5 and
         // 7 — indices 0, 2, 4 and 6 — take playfield 1's scroll.

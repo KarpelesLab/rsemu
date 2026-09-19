@@ -27,12 +27,22 @@
 //!
 //! **Which of the two chips each bit comes from was measured**, by running
 //! this board's own source with one chip swapped for its Enhanced Chip Set
-//! part: with an 8373 in Lisa's place it reads `$07` — bits 3 and 4 gone — and
-//! with an 8375 in Alice's place it reads `$1F`, unchanged. So bit 3
-//! (`GFXF_AA_LISA`) and bit 4 are `LISAID`'s, and **bit 2 (`GFXF_AA_ALICE`) is
-//! not read off `VPOSR`**: Alice's identification (`$22` PAL, §4) is the value
-//! the 8375 already answers here, and changing it to `$23` moved nothing. What
-//! sets bit 2 is not settled; `docs/platforms/amiga.md` carries it as open.
+//! part, and then by sweeping each chip's identification: with an 8373 in
+//! Lisa's place it reads `$07` — bits 3 and 4 gone — so bit 3
+//! (`GFXF_AA_LISA`) and bit 4 are `LISAID`'s. **Bit 2 (`GFXF_AA_ALICE`) is
+//! `VPOSR`'s**, and it is bit 1 of the Agnus identification the ROM tests:
+//! with Alice answering `$20`, `$21`, `$30` or `$31` it reads `$1B`, and with
+//! `$22`, `$23`, `$32` or `$33` it reads `$1F`. The 8375 swap moved nothing
+//! only because this tree's 8375 answers `$22` as well — see
+//! `src/dev/amiga/agnus/ecs.rs` — which is also why changing Alice's `$22` to
+//! `$23` moved nothing.
+//!
+//! **What makes it an AA machine to the ROM beyond those bits is `LISAID` bits
+//! 9 and 8**, which `graphics.library` reads as the board's fetch bandwidth
+//! and sizes its whole display database from: `MaxDepth` 8 in every
+//! resolution at four times, the Enhanced Chip Set's 5/4/2 at one. The
+//! `screenmode` session below is the evidence, and `src/dev/amiga/denise.rs`'s
+//! `LISA_ID` the measurement.
 //!
 //! # What is in this file, and what is not
 //!
@@ -292,6 +302,14 @@ fn boots_to(disk: Disk, label: &str, seconds: u64, golden: u64) -> Option<Board>
 /// "Ram Disk" icon and the hard-disk icon labelled "Workbench3.1", the window's
 /// scroll bars and gadgets down its right edge and along its bottom, and the
 /// red pointer at the top left over the copyright line.
+///
+/// **The same hash at one and at four times the bandwidth.** This screen is
+/// fetched with `FMODE $0003` since `LISAID` reports the A1200's 64-bit fetch,
+/// where it was `FMODE $0000` before; the ROM moves the bitplane pointer and
+/// the modulo to suit, and Lisa's delay from fetch to first pixel is what it
+/// counts on (`src/dev/amiga/denise/aga.rs`, `fetch_block`). Getting that delay
+/// wrong put the whole desktop sixteen high-resolution pixels to the left;
+/// getting it right is this frame, pixel for pixel.
 #[test]
 fn kickstart_3_1_boots_workbench_3_1_from_the_hard_disk() {
     let Some(b) = boots_to(
@@ -408,13 +426,23 @@ const GOLDEN_WB311_DF0: u64 = 0xf0fe_2791_b81a_72ed;
 const GOLDEN_EMPTY: u64 = 0x83bd_b5da_233c_4551;
 
 /// ScreenMode Preferences, opened by a person at the Workbench: what the
-/// A1200's `graphics.library` *offers*.
+/// A1200's `graphics.library` *offers*, and the other half of the evidence
+/// that the board is AA.
 ///
-/// This was meant to be the other half of the evidence that the board is AA,
-/// and it is not: the window it produces is the A600's window, and its
-/// "Maximum Colors" is 16 where an AA machine should offer 256. The session
-/// stays as a golden — it drives Workbench through the input seam and holds
-/// four pictures — and the finding is written down beside the two tests.
+/// **"Maximum Colors: 256"** here against the A600's 16, in the same window
+/// over the same mode. It was 16 on both until `LISAID` answered `$00F8`: the
+/// ROM had found Lisa by the low byte and built every AA `DisplayInfo` — the
+/// 24-bit palette, eight bits a gun, high-resolution HAM and EHB — and then
+/// sized every `DimensionInfo` from bits 9 and 8, which read as ones said one
+/// times the bandwidth, the Enhanced Chip Set's 5/4/2. `docs/platforms/amiga.md`,
+/// "What `LISAID` bits 9 and 8 are", has how that was found. The mode *list*
+/// is the A600's, and should be: it holds the modes Workbench may open on
+/// (`DIPF_IS_WB`), and none of the thirty-six modes the A1200's database has
+/// beyond the A600's — HAM and EHB in high and super-high resolution among
+/// them — carries that flag. More would come from monitor drivers, and this
+/// install's `Devs/Monitors` holds only `PAL` and `NTSC`; DblPAL, Multiscan
+/// and the rest sit unused in `Storage/Monitors`, where Workbench 3.1 puts
+/// them.
 ///
 /// The session is `tests/amiga_a500plus.rs`'s, moved to the hard disk: boot
 /// Workbench 3.1 off the HDF, open the "Workbench3.1" volume, open its Prefs
@@ -609,47 +637,49 @@ mod screenmode {
     /// 2. The "Workbench3.1" window open over it, "73% full, 1,661K free,
     ///    4,450K in", holding Prefs, Utilities, System, Devs, Expansion,
     ///    Tools, WBStartup and Storage; the screen title reads "Amiga
-    ///    Workbench 1,822,912 graphics mem 0 other mem" — Exec found the whole
+    ///    Workbench 1,822,400 graphics mem 0 other mem" — Exec found the whole
     ///    2 MiB of chip RAM, which is what Alice reaches and an 8372A does
     ///    not.
     /// 3. The Prefs window: Font, Locale, Pointer, PrinterPS, Sound, IControl,
     ///    Overscan, Printer, ScreenMode, Time, Input, Palette, PrinterGfx,
-    ///    Serial and WBPattern.
+    ///    Serial and WBPattern, under "1,799,048 graphics mem".
     /// 4. "ScreenMode Preferences": the display-mode list, "PAL:High Res"
     ///    selected, "Visible Size 640 x 256", "Minimum Size 640 x 200",
-    ///    "Maximum Size 16368 x 16384", **"Maximum Colors: 16"**, "Supports
-    ///    genlock / Draggable / 50Hz, 15.60kHz", and Colors at 4.
+    ///    "Maximum Size 16368 x 16384", **"Maximum Colors: 256"**, "Supports
+    ///    genlock / Draggable / 50Hz, 15.60kHz", and Colors at 4 on a slider
+    ///    that now runs to 256.
     ///
-    /// **`Maximum Colors` is `16`, and it should be `256`** — 1× bandwidth's
-    /// answer for `HIRES`, which §5 of the AA specification says needs 2×
-    /// bandwidth for five bitplanes and up. `the_same_session_on_the_ecs_board`
-    /// shows the A600 producing the identical window, so nothing in this
-    /// picture is yet a statement about the chip set. It is not a boot defect
-    /// — Workbench opens, draws and is usable — but it is the open end of the
-    /// AA work, and `docs/platforms/amiga.md` carries what was measured.
+    /// When `LISAID` moved from `$FFF8` to `$00F8` the last three moved, and a
+    /// pixel diff of each against the frame before says exactly where: in 2
+    /// and 3 only the digits of the title bar's free-memory figure, which was
+    /// 1,822,912 — the four-times screen takes 512 bytes more of chip RAM — and
+    /// in 4 only the "Maximum Colors" number and the Colors slider's knob,
+    /// which is narrower because its range is now 256. The desktop in 1 did
+    /// not move, though it is now fetched sixty-four bits at a time.
     #[test]
-    fn screenmode_lists_what_the_rom_offers() {
+    fn screenmode_offers_256_colours() {
         session(
             "amiga-a1200",
             super::ROM,
             "a1200",
             [
                 0xb360_d7a3_0bf0_bc7d,
-                0x8224_e259_cd1f_fcdd,
-                0xfc05_e25b_47e2_a0c9,
-                0xeee4_1aa4_9abe_abc9,
+                0x5eda_c751_851b_78f1,
+                0xc665_2a73_fd36_3605,
+                0x2551_7f0b_e6fa_8209,
             ],
         );
     }
 
     /// The same four clicks on the A600, whose chips are an 8375 and an 8373:
-    /// the control for the test above, and the reason its finding is stated as
-    /// a finding.
+    /// the control for the test above.
     ///
-    /// Its fourth picture is the A1200's window in every word — the same mode
-    /// list, the same "Maximum Size 16368 x 16384" and the same "Maximum
-    /// Colors: 16" — at half the horizontal resolution, because an 8373's
-    /// picture is 70 ns columns where Lisa's are 35 ns ones.
+    /// Its fourth picture is the A1200's window in every word but one — the
+    /// same mode list, the same "Maximum Size 16368 x 16384" — with
+    /// **"Maximum Colors: 16"**, at half the horizontal resolution, because an
+    /// 8373's picture is 70 ns columns where Lisa's are 35 ns ones. An 8373
+    /// drives none of `DENISEID`'s upper byte, so bits 9 and 8 read as ones,
+    /// one times the bandwidth, and the ROM offers what an ECS machine has.
     #[cfg(feature = "machine-amiga-a600")]
     #[test]
     fn the_same_session_on_the_ecs_board() {

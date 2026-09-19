@@ -1180,7 +1180,8 @@ are what they were.
 | | |
 | --- | --- |
 | Eight bitplanes | `BPLCON0`'s `BPU3` (bit 4): "0000-1000 (none thru 8 inclusive)"; nine to fifteen are clamped to eight |
-| The colour table | 256 entries of 24 bits and a `T` bit, reached 32 at a time through `BPLCON3`'s `BANK`. A `LOCT = 0` write sets each gun to `n × 17` and the `T` bit; a `LOCT = 1` write sets the low nibbles only. `LISAID` is `$FFF8` |
+| The colour table | 256 entries of 24 bits and a `T` bit, reached 32 at a time through `BPLCON3`'s `BANK`. A `LOCT = 0` write sets each gun to `n × 17` and the `T` bit; a `LOCT = 1` write sets the low nibbles only |
+| `LISAID` | `$00F8`: the specification's `$F8`, and bits 9–8 low — the board's fetch is four times wide. Those two bits are what `graphics.library` sizes its display database from; see [the A1200](#what-lisaid-bits-9-and-8-are) |
 | HAM8, and HAM6 everywhere | Planes 1 and 2 control, planes 3–8 are the six high bits of the modified gun, and the two low bits are held; a base register is one of 64, the plane address with the control bits at `00`. HAM6 works in every resolution too |
 | `BPLCON4` | `BPLAM` XOR'ed with every bitplane colour address; `ESPRM`/`OSPRM` the high four bits of even, odd and attached sprites' colours, reset to `0001` |
 | Dual playfield, EHB | 4 + 4 planes, playfield 2 at `PF2OF`'s offset (reset 8). EHB only when `SHRES = HIRES = HAMEN = DPF = 0` and `BPU = 6`, and `KILLEHB` still kills it |
@@ -1202,7 +1203,8 @@ half.
    output first" (§4, `BPLxDAT`) — so Alice puts one, two or four words a
    fetch slot into the same stream, in shift order. `Fetch::start` is still
    the colour clock of the first fetch; Lisa places its first pixel by the
-   3rd-edition arithmetic, which the AA document does not replace.
+   3rd-edition arithmetic — one fetch block and half a count later — with the
+   block stretched by a wide `FMODE`, [below](#where-a-wide-fetch-is-first-shown).
 2. **Sprites**: `Video::sprite_dma(sprite, b_buffer, bits)` for a 32- or
    64-bit sprite fetch, left-justified in a `u64`. It is timed exactly as a
    register write is — stamped with the `Beam`'s position and queued behind
@@ -1220,7 +1222,8 @@ half.
 ### Where the document is silent
 
 Each is marked in `aga.rs` as an inference: where a fetch's first pixel lands
-(the 3rd-edition arithmetic, unchanged); that HAM6's four bits go to a gun's
+(the 3rd-edition arithmetic, with the block a wide `FMODE` stretches measured
+off Kickstart 3.1 — [below](#where-a-wide-fetch-is-first-shown)); that HAM6's four bits go to a gun's
 top four and its low four are held, as HAM8's are; that `BPLAM` masks every
 bitplane colour address including a zero pixel inside the window, and not the
 border; that five to seven planes with `HAMEN` are HAM6; that `PF2OF` is
@@ -1349,7 +1352,8 @@ rsemu run amiga-a1200 --media kickstart=kickstart:<rom dir>/amiga-os-310-a1200.r
 | *A1200 System Schematics Service Addendum*, Commodore, 1992 | The parts: "ALICE (AA AGNUS)", "LISA (AA DENISE)", "BUDGIE (ASIC)", "ROM 512KX16", "DRAM 256KX16" and its "OPTIONAL" pair, "TTL 28-37512 MHZ PAL" |
 | *GAYLE — Gate array for A300/A500+ — Specification*, Commodore, July 10 1991 | The same chip as the A600's, doing the same decoding: see the A600 section |
 | MC68020/MC68EC020 User's Manual | The EC020: the 68020 with twenty-four address pins and no dynamic bus sizing |
-| Black-box: Kickstart 3.1 (40.068, the A1200's own) | What it reads, writes and waits on; `GfxBase->ChipRevBits0`; how far each disk gets |
+| *Amiga ROM Kernel Reference Manual: Libraries*, 3rd ed. | The structure layouts read out of guest memory: `ExecBase`'s library list, `GfxBase` (`ChipRevBits0`, `ActiView`, the copper lists), `View`, `ViewPort`, `RasInfo`, `BitMap`, and the display database's `QueryHeader`, `DisplayInfo` and `DimensionInfo` with their `DTAG_` identifiers, `DIPF_` flags and `ModeID` keys |
+| Black-box: Kickstart 3.1 (40.068, the A1200's own) | What it reads, writes and waits on; `GfxBase->ChipRevBits0`; how far each disk gets; the display database it builds for each `LISAID`, and the copper lists it programs for each resolution and bandwidth |
 
 No Amiga emulator source, no FPGA reimplementation of any Amiga chip, no AROS
 source and no Kickstart disassembly was consulted. The AA specification was
@@ -1392,37 +1396,139 @@ library base:
 | Board | `ChipRevBits0` |
 | --- | --- |
 | A1200, once the ROM has a boot device | **`$1F`** — `GFXF_HR_AGNUS`, `GFXF_HR_DENISE`, `GFXF_AA_ALICE`, `GFXF_AA_LISA` and bit 4 |
-| A1200 with no boot device at all | `$13` — the AA pair is never set; the ROM sets it at 2 s on a board that boots, ten seconds before AmigaDOS mounts anything |
+| A1200 with no boot device at all | `$13` — the AA pair is never set; the ROM sets it at 1.3 s on a board that boots, ten seconds before AmigaDOS mounts anything |
 | A600, same ROM family, same Gayle and CIAs and Paula | `$03` |
 
 **Which chip each bit comes from was measured**, by running the A1200's own
-machine source with one chip swapped for its Enhanced Chip Set part:
+machine source with one chip swapped for its Enhanced Chip Set part, and then
+by sweeping each chip's identification word:
 
 | Board | `ChipRevBits0` |
 | --- | --- |
 | Alice + Lisa | `$13` → `$1F` |
 | Alice + 8373 Denise | `$03` → `$07` |
 | 8375 Agnus + Lisa | `$13` → `$1F` |
+| Alice answering `$20`, `$21`, `$30` or `$31` in `VPOSR` | `$1B` |
+| Alice answering `$22`, `$23`, `$32` or `$33` | `$1F` |
 
 So bit 3 (`GFXF_AA_LISA`) and bit 4 are `LISAID`'s, and **bit 2
-(`GFXF_AA_ALICE`) is not read off `VPOSR`**: an 8375 answering `$22` gets it
-too, and changing Alice's identification to `$23` moved nothing. What sets it
-is not settled.
+(`GFXF_AA_ALICE`) is bit 1 of `VPOSR`'s Agnus identification**. An earlier
+reading of the first three rows had it "not `VPOSR`", because the 8375 swap
+moved nothing and neither did Alice at `$23`; both have bit 1 set, and this
+tree's 8375 answers `$22` (`src/dev/amiga/agnus/ecs.rs`).
+
+### What `LISAID` bits 9 and 8 are
+
+`ChipRevBits0` at `$1F` did not make the machine an AA machine to
+`graphics.library`. Driven through the input seam, ScreenMode Preferences on
+the A1200 offered **"Maximum Colors: 16"** for PAL:High Res, the A600's
+answer, where an AA machine offers 256. What decides it was found black-box,
+in this order:
+
+1. **The display database, read out of chip RAM.** The *ROM Kernel Reference
+   Manual: Libraries* gives `DisplayInfo` and `DimensionInfo` a `QueryHeader`
+   whose `StructID` is `DTAG_DISP` (`$80000000`) or `DTAG_DIMS`
+   (`$80001000`), so a scan of guest memory finds every record. The A1200's
+   `DisplayInfo` records were already AA — `PaletteRange` 65535, eight bits a
+   gun, thirty-six modes the A600 lacks (HAM and EHB in high and super-high
+   resolution; none carries `DIPF_IS_WB`, so Workbench's list is unchanged by
+   them) — but **every `DimensionInfo` was the Enhanced Chip Set's**:
+   `MaxDepth` 5 in low resolution, 4 in high and 2 in super-high, the same
+   records the A600 has. ScreenMode's "Maximum Colors" is `1 << MaxDepth`.
+2. **What the processor reads.** A recorder on the custom-register bus showed
+   that while the database is built (0.78–0.80 s) the processor reads only
+   `VPOSR`, `VHPOSR`, `INTENAR` and `INTREQR`, and before it nothing of the
+   chips but those, `DMACONR`, `JOY0DAT` and **nineteen reads of `LISAID`**.
+   Swapping Alice for an 8375, halving chip RAM, a 68000 in the EC020's place,
+   every `VPOSR` identification above, and writing `$1F` into
+   `ChipRevBits0` before the database is built all left `MaxDepth` where it
+   was. Kickstart 3.0 for the A1200 and the CD32's 3.1 behave the same.
+3. **`LISAID`, swept.** This model answered `$FFF8`: the specification's `$F8`
+   and "the upper 8 bits of this register are reserved", read as ones, as for
+   an 8373. Answering other words and reading the database back:
+
+| `LISAID` | bits 9–8 | `MaxDepth` lores / hires / shres |
+| --- | --- | --- |
+| `$FFF8`, `$0FF8`, `$07F8`, `$03F8` | `11` | 5 / 4 / 2 |
+| `$FEF8`, `$05F8`, `$01F8` | `01` | 8 / 8 / 4 |
+| `$06F8`, `$02F8` | `10` | 8 / 8 / 4 |
+| `$00F8`, `$04F8`, `$08F8` … `$80F8`, `$F8F8` | `00` | 8 / 8 / 8 |
+
+**Bits 9 and 8 are the board's fetch bandwidth, and nothing else in the upper
+byte matters.** They are §4's `FMODE` pair `BPAGEM`/`BPL32` read active low:
+`11` is one times, a 16-bit bus with normal `CAS`; `01` and `10` two times;
+`00` four, 32 bits and double `CAS`. The depths are §5's "needs 1x / 2x / 4x
+Bandwidth" key. The ROM also chooses its `FMODE` from them — `$0000`, `$0002`
+for `01`, `$0001` for `10`, `$0003` for `00` — so they are the whole of how it
+learns what the board can fetch.
+
+An A1200 is four 256K × 16 DRAMs on a 32-bit bus with page mode, which is
+`FMODE $000F`'s four times, so **Lisa answers `$00F8`**. An 8373 drives none of
+its upper byte and answers `11`, one times, which is right for a chip without
+`FMODE`: the ECS constant was right because its reserved byte reads as ones,
+and Lisa's was wrong for the same reason. Bits 15–10 move nothing and are zero.
+`src/dev/amiga/denise.rs`, `LISA_ID`, carries the table;
+`lisaids_upper_bits_say_the_fetch_is_four_times_and_an_8373s_say_one` is the
+ROM-free test.
+
+ScreenMode now offers **"Maximum Colors: 256"** on the A1200 and still 16 on
+the A600 beside it. The mode list is the A600's on both, as it should be:
+this install's `Devs/Monitors` holds only `PAL` and `NTSC`, and DblPAL,
+Multiscan and the rest sit unused in `Storage/Monitors`, where Workbench 3.1
+puts them.
+
+### Where a wide fetch is first shown
+
+Answering four times made the ROM fetch its Workbench screen with
+`FMODE $0003`, which it had never done here, and the desktop came out sixteen
+high-resolution pixels to the left with the start of the next plane-row's
+data at its right edge. Lisa placed a fetch's first pixel by the 3rd-edition
+manual's arithmetic — one fetch block and half a count after the fetch, eight
+counts in low resolution, four in high — whatever `FMODE` said.
+
+The AA specification says which way that must move — "the parallel to serial
+conversion is triggered whenever bit plane #1 is written, indicating the
+completion of all bit planes for that word (16/32/64 pixels)" (§4, `BPLxDAT`),
+and a wider group completes later — but not by how much. **The ROM knows**,
+because it programs its screens for the silicon's delay. With `LISAID` set to
+each bandwidth, ScreenMode's "Use" reopened the Workbench in low, high and
+super-high resolution, and each copper list was read out of chip RAM beside the
+screen's `BitMap` (through `GfxBase->ActiView`, its `ViewPort` and `RasInfo`).
+All nine keep `DDFSTRT $38`, `DIWSTRT $xx81` and `BPLCON1 0`, and set the
+bitplane pointer some words before the bitmap so that its first pixel is at
+the window's edge:
+
+| | `FMODE 0` | `FMODE 1` or `2` | `FMODE 3` |
+| --- | --- | --- | --- |
+| lores | pointer +0: block 8 | +0: 8 | +0: 8 |
+| hires | back 1 word: block 4 | +0: 8 | +0: 8 |
+| shres | back 3 words: block 2 | back 2: 4 | +0: 8 |
+
+The one-times column is the manual's arithmetic and this model's own earlier
+SuperHires inference, which is how the method was checked; every modulo the ROM
+chose also matches the word counts Alice already fetched. The rest is **the
+one-times block times `FMODE`'s factor, no longer than eight counts**, which is
+what `denise/aga.rs`'s `fetch_block` now does. With it, the four-times
+desktop is the one-times desktop to the pixel — `GOLDEN_WB311_HD` and
+`GOLDEN_WB311_DF0` did not move — and
+`a_wide_fmode_delays_the_first_pixel_by_what_kickstart_3_1_programs_for` holds
+Lisa to all twelve cells without a ROM.
+
+What moved: the ScreenMode session's volume, Prefs and ScreenMode pictures. A
+pixel diff of each against the frame before puts every changed pixel in the
+title bar's free-memory figure (1,822,912 → 1,822,400 graphics mem: the
+four-times screen takes 512 bytes more), the "Maximum Colors" number, and the
+Colors slider's knob, which is narrower because the slider now runs to 256.
 
 ### Open, and not guessed at
 
-* **ScreenMode Preferences offers the A600's modes.** Driven through the input
-  seam — the volume window, the Prefs drawer, ScreenMode — the A1200 produces
-  the A600's window in every word: the same display-mode list, the same
-  "Maximum Size 16368 x 16384", and **"Maximum Colors: 16"** for PAL:High Res
-  where an AA machine should offer 256. Sixteen is 1× bandwidth's answer for
-  `HIRES`, which §5 says needs 2× for five bitplanes and up. It is not a boot
-  defect — Workbench opens, draws and is usable — but it is the open end of the
-  AA work. The ECS control is a test beside it (`the_same_session_on_the_ecs_board`)
-  so the finding cannot rot, and the two are `a1200-screenmode-*.png` and
-  `a600-screenmode-*.png` in `RSEMU_AMIGA_FRAME_DIR`. What has been ruled out:
-  Alice's `VPOSR` value, which changes nothing either way.
-* **What sets `GFXF_AA_ALICE`** — see the table above. Not `VPOSR`.
+* **Why the block stops at eight counts.** Every screen the ROM opens has
+  `DDFSTRT` a multiple of eight, and a second reading fits the same nine: a
+  block of the full stretched length on a grid aligned to it, with the fetch
+  rounding `DDFSTRT` down to that grid. The two differ only for a `DDFSTRT`
+  off the grid, which the ROM never programs. The bound is taken because it
+  changes nothing but the delay; a program that fetches wide from an unaligned
+  `DDFSTRT` is the test that would settle it.
 * **The empty-bay delay**, as on the A600: what a real machine without a drive
   reads from its IDE status register is whatever its unbuffered bus floats to,
   and how long a real A1200 waits is not in any document at hand.

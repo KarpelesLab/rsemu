@@ -387,9 +387,37 @@ pub const ECS_DENISEID: u16 = 0xfffc;
 
 /// What an AA part answers at `DENISEID`, which the AA specification calls
 /// `LISAID`: "Lisa returns hex (f8). The upper 8 bits of this [register are
-/// reserved]" (AA specification, §4, `LISAID`). **Choice:** the reserved byte
-/// reads as ones, as for [`ECS_DENISEID`].
-pub const LISA_ID: u16 = 0xfff8;
+/// reserved]" (AA specification, §4, `LISAID`).
+///
+/// The low byte is the specification's. **Bits 9 and 8 are not spare**, and
+/// [`ECS_DENISEID`]'s "reads as ones" cannot be carried over to them: they are
+/// the board's *fetch capability*, and Kickstart 3.1's `graphics.library`
+/// sizes its whole display database from them. Measured black-box on the
+/// user's 40.68 A1200 ROM by sweeping this word and reading the guest's
+/// `DimensionInfo` records out of chip RAM — `docs/platforms/amiga.md`, "What
+/// `LISAID` bits 9 and 8 are", has the table — the two bits are §4's `FMODE`
+/// pair `BPAGEM`/`BPL32` **active low**, and the `MaxDepth` the ROM then
+/// publishes for low, high and super-high resolution is:
+///
+/// | bits 9–8 | bandwidth | `MaxDepth` lores / hires / shres |
+/// | --- | --- | --- |
+/// | `11` | 1× — 16-bit bus, normal CAS | 5 / 4 / 2 — the Enhanced Chip Set's own |
+/// | `10`, `01` | 2× — 32 bits *or* double CAS | 8 / 8 / 4 |
+/// | `00` | 4× — 32 bits *and* double CAS | 8 / 8 / 8 |
+///
+/// which is §5's "needs 1x / 2x / 4x Bandwidth" key, one row per mode, read
+/// back off the silicon. An 8373 drives none of the byte and so answers `11`,
+/// one times, which is exactly right for a chip that has no `FMODE` at all —
+/// so the ECS constant above is right *because* it reads as ones, and this one
+/// was wrong for the same reason.
+///
+/// An A1200 is four 256K × 16 DRAMs on a 32-bit bus with page mode
+/// (`machines/amiga-a1200.machine`; the A1200 schematics' "DRAM 256KX16.
+/// 80NS"), which is `FMODE = $000F`'s four times, so both bits are low. Bits
+/// 15–10 move nothing the ROM does — swept the same way — and are zero here
+/// because "reserved" with no evidence either way is better read as undriven
+/// on the chip's side of a register it does drive.
+pub const LISA_ID: u16 = 0x00f8;
 
 /// A line at least this long is a 15 kHz line, drawn twice when not
 /// interlaced so the picture keeps its shape; a shorter one — productivity

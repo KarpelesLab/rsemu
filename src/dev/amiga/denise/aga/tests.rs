@@ -149,11 +149,39 @@ const EIGHT: u16 = 0x0010;
 
 #[test]
 fn lisaid_is_f8_and_lisa_drives_it() {
-    // "Lisa returns hex (f8)" (§4, LISAID); the reserved byte reads as ones.
+    // "Lisa returns hex (f8)" (§4, LISAID).
     let v = lisa();
     assert!(CustomChip::drives(&v, reg(DENISEID)));
-    assert_eq!(CustomChip::read(&v, reg(DENISEID), Origin::cpu()), 0xfff8);
+    assert_eq!(CustomChip::read(&v, reg(DENISEID), Origin::cpu()), 0x00f8);
     assert_eq!(v.revision(), Revision::Aga);
+}
+
+/// `LISAID` bits 9 and 8 are the board's fetch capability, and this board's is
+/// four times: both bits low.
+///
+/// Not a spare-bits convention but a measurement — `docs/platforms/amiga.md`,
+/// "What `LISAID` bits 9 and 8 are": Kickstart 3.1's `graphics.library` reads
+/// exactly this pair and publishes `MaxDepth` 8 for low, high *and* super-high
+/// resolution when it is `00`, and the Enhanced Chip Set's 5/4/2 when it is
+/// `11`. The two bits are §4's `FMODE` pair `BPAGEM`/`BPL32` read active low,
+/// so `00` is "double CAS, 32 bits wide" — an A1200's four 256K × 16 DRAMs —
+/// which is `FMODE`'s four times the bandwidth.
+///
+/// The 8373 beside it drives none of the byte, answers `11`, and gets the
+/// Enhanced Chip Set's depths, which is the control: the ECS constant is right
+/// *because* its reserved byte reads as ones, and Lisa's was wrong for exactly
+/// that reason.
+#[test]
+fn lisaids_upper_bits_say_the_fetch_is_four_times_and_an_8373s_say_one() {
+    let lisa = lisa();
+    let id = CustomChip::read(&lisa, reg(DENISEID), Origin::cpu());
+    assert_eq!(id & 0x00ff, 0xf8, "the low byte is the specification's");
+    assert_eq!(id >> 8 & 3, 0, "BPAGEM and BPL32 active low: four times");
+
+    let ecs = Video::with_revision(Standard::Pal, Revision::Ecs);
+    let ecs_id = CustomChip::read(&ecs, reg(DENISEID), Origin::cpu());
+    assert_eq!(ecs_id & 0x00ff, 0xfc, "\"$FC in the lower 8 bits\"");
+    assert_eq!(ecs_id >> 8 & 3, 3, "an 8373 drives neither: one times");
 }
 
 #[test]
@@ -419,6 +447,72 @@ fn ham6_works_in_hires_on_lisa_and_holds_the_low_nibble() {
 // ---------------------------------------------------------------------------
 // scroll and fetch width
 // ---------------------------------------------------------------------------
+
+/// Where a fetch's first pixel lands, at every bandwidth, as Kickstart 3.1
+/// programs its own screens for it (`fetch_block` has the measurement).
+///
+/// Each row is one screen the ROM opened: `DDFSTRT $38`, `DIWSTRT $2C81`,
+/// `BPLCON1 0`, and the bitplane pointer set `back` words before the bitmap's
+/// first pixel. That pixel must land on the window's first quarter — which is
+/// what the ROM arranged, and what a real A1200 shows.
+#[test]
+fn a_wide_fmode_delays_the_first_pixel_by_what_kickstart_3_1_programs_for() {
+    const LORES: u16 = 0x1000;
+    const HIRES_1: u16 = 0x9000;
+    const SHRES_1: u16 = 0x1040;
+    #[rustfmt::skip]
+    let screens: [(&str, u16, u16, usize); 12] = [
+        // resolution, BPLCON0, FMODE, words the ROM backs the pointer up
+        ("lores", LORES, 0, 0),   ("lores", LORES, 1, 0),
+        ("lores", LORES, 2, 0),   ("lores", LORES, 3, 0),
+        ("hires", HIRES_1, 0, 1), ("hires", HIRES_1, 1, 0),
+        ("hires", HIRES_1, 2, 0), ("hires", HIRES_1, 3, 0),
+        ("shres", SHRES_1, 0, 3), ("shres", SHRES_1, 1, 2),
+        ("shres", SHRES_1, 2, 2), ("shres", SHRES_1, 3, 0),
+    ];
+    for (name, bplcon0, fmode, back) in screens {
+        let v = lisa();
+        setup(&v, bplcon0);
+        w(&v, FMODE, fmode);
+        // `back` whole words of what precedes the bitmap, then its first
+        // pixel lit.
+        let mut values = vec![0u8; 16 * back];
+        values.push(1);
+        show(&v, V, 0x38, &values);
+        let first = (X81 - 128..X81 + 128)
+            .find(|&q| quarter(&v, V, q) == distinct(1))
+            .unwrap_or_else(|| panic!("{name} FMODE {fmode}: the pixel is nowhere"));
+        assert_eq!(
+            first - X81,
+            0,
+            "{name} at FMODE {fmode}: the bitmap's first pixel is {} quarters from the window's \
+             edge",
+            first - X81
+        );
+    }
+}
+
+/// The block itself, against the table `fetch_block` documents.
+#[test]
+fn a_fetch_block_is_the_one_times_block_stretched_up_to_eight_counts() {
+    // (SHRES, HIRES) -> blocks at FMODE 0, 1, 2, 3.
+    let table = [
+        ((false, false), [8, 8, 8, 8]),
+        ((false, true), [4, 8, 8, 8]),
+        ((true, false), [2, 4, 4, 8]),
+    ];
+    for ((shres, hires), blocks) in table {
+        for (fmode, want) in blocks.into_iter().enumerate() {
+            assert_eq!(
+                super::fetch_block(shres, hires, fmode as u16),
+                want,
+                "shres={shres} hires={hires} FMODE={fmode}"
+            );
+        }
+    }
+    // Only BPL32 and BPAGEM count; the sprite and scan-double bits do not.
+    assert_eq!(super::fetch_block(false, true, 0xc00c), 4);
+}
 
 #[test]
 fn bplcon1_scrolls_in_35ns_steps() {
