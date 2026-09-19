@@ -115,9 +115,22 @@
 //!   how a driver is supposed to find out.
 //! * **MSI and MSI-X**, because `src/bus/pci` has no capability list yet. The
 //!   adapter is pin-based, which AHCI permits.
-//! * **ATAPI.** The `A` bit in a command header is accepted and ignored: the
-//!   drive behind the port is not a packet device and aborts the command, which
-//!   is exactly how a driver finds out.
+//! * **ATAPI.** The `A` bit in a command header is accepted and ignored, and a
+//!   packet device in a SATA bay reads as an **empty port** — `Bay::drive()`
+//!   means "the hard disk, if what is in the bay is one", and this engine can
+//!   only drive one.
+//!
+//!   That is a decision rather than an oversight, and it is a larger piece of
+//!   work than it looks. An AHCI port does not deliver a command packet the
+//!   way a cable does: the twelve or sixteen bytes live in the command table's
+//!   own `ACMD` field at offset 0x40 (AHCI 1.3.1 §4.2.3) and the adapter hands
+//!   them over as the first data phase, `PxCMD.ATAPI` selects which commands
+//!   drive the activity LED, and `PxSIG` has to report `0xEB140101` rather than
+//!   `0x00000101`. Underneath that, `ata::disk::taskfile` — the seam this whole
+//!   engine speaks — is typed on `AtaDisk` and would have to become a trait
+//!   before a second kind of device could answer it. `dev/pc/ide` needed none
+//!   of that, because a cable carries whatever is plugged into it; this
+//!   adapter is not a cable.
 //!
 //! # Sources
 //!

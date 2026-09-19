@@ -93,6 +93,7 @@ address; every one of them is written once, in that file.
 | Floppy controller | `pc.fdc` | 0x3f0-0x3f5, 0x3f7 | NEC µPD765A data sheet |
 | IDE channels (2) | `pc.ide` | 0x1f0-0x1f7 + 0x3f6, 0x170-0x177 + 0x376 | AT Technical Reference, fixed-disk adapter |
 | Hard disks (2 bays) | `ata.disk` | — (on the cable) | T13 ATA/ATAPI-6 |
+| CD-ROM (secondary master) | `ata.cdrom` | — (on the cable) | T13 ATA/ATAPI-6, SFF-8020i |
 | Firmware sockets | `pc.rom` | 0xc0000, 0xe0000 (+ a high alias) | — |
 | PCI host bridge, and RAM shadowing | `pc.pmc` | 0xcf8-0xcff | Intel 82441FX data sheet |
 | PCI display adapter, its video BIOS and the linear framebuffer | `pc.vga-pci` | 00:02.0, expansion ROM BAR, BAR0 | PCI Local Bus Spec Rev 2.1 §6.2.5.1, §6.2.5.2 |
@@ -704,6 +705,111 @@ twenty of host time in `--release`, which is what unpacking 114 archive
 volumes off five diskettes onto a 64 MiB disk costs. It is gated on
 `RSEMU_FREEDOS_DIR` and skips with a printed reason without it.
 
+### A CD-ROM, and booting off one
+
+The secondary IDE channel's master position carries an `ata.cdrom`, which is a
+**packet device**: it shares the ribbon cable with `ata.disk` and not one line
+of its command set. `pc.ide` cannot tell the two apart, which is the proof that
+the split is in the right place — the adapter decodes eight ports and the
+meaning of what goes through them is the drive's.
+
+A driver cannot tell them apart from the Status register either, and that is
+worth stating because it is the thing a model gets wrong: ATA/ATAPI-6 §7.15.6.3
+makes `DRDY` a bit a packet device does not have, so a CD-ROM at rest reads
+`0x00` — exactly what an empty cable reads. The **signature** is the mechanism
+§9.1 provides for this, `0x14` and `0xEB` in the two cylinder bytes, and it is
+what both POST and `tests/pc_at_ide.rs` now use.
+
+**What the drive answers.** `IDENTIFY PACKET DEVICE`, `PACKET` with its byte
+count limit, `DEVICE RESET`, and the SFF-8020i subset a boot and an install
+need: `TEST UNIT READY`, `REQUEST SENSE`, `INQUIRY`, `READ CD-ROM CAPACITY`,
+`READ(10)`, `READ(12)`, `SEEK(10)`, `READ TOC` formats 0 and 1, `MODE SENSE(6)`
+and `MODE SENSE(10)` with pages 01h, 0Dh and 2Ah, `START/STOP UNIT` and
+`PREVENT/ALLOW MEDIUM REMOVAL`. Everything else answers `ILLEGAL REQUEST` /
+`INVALID COMMAND OPERATION CODE`, which is how a driver discovers what a drive
+has rather than by guessing.
+
+Two details of the handshake are asserted rather than described, because they
+are where a plausible model diverges:
+
+- **The packet phase does not interrupt.** `IDENTIFY PACKET DEVICE` word 0 bits
+  6:5 report microprocessor DRQ, which is the promise that a host may poll for
+  it; a device that claimed interrupt DRQ and then did not interrupt would hang
+  its driver.
+- **A packet data-in command interrupts once *more* than an ATA one.** §9.5's
+  PIO data-in has no completion interrupt — the last block's was the last word
+  on the subject — and §9.10's packet protocol announces its completion. Counted
+  in the tests: *n* blocks give *n* interrupts for an ATA read and *n + 1* for a
+  packet one.
+
+**The disc** is a media slot of 2048-byte logical blocks, empty by default: an
+unbound `cdrom` slot is a drive with an open tray, which answers
+`MEDIUM NOT PRESENT` and is a perfectly ordinary CD-ROM drive. Two spellings
+fill it, and they are the two every other drive on this board already had:
+
+```
+  rsemu run pc-at --media cdrom=disc.iso    # read into host memory
+  rsemu run pc-at --drive cdrom=disc.iso    # backed by the host file
+```
+
+**What boots.** `src/fw/pcbios/cdrom.rs` implements El Torito 1.0's boot record
+volume descriptor at logical block 17, the boot catalog it points at, and two of
+the four media types: **no emulation**, where the image is loaded at the
+catalog's load segment and entered with `DL` holding the drive number POST
+assigned the CD, and **diskette emulation** for 1.2, 1.44 and 2.88 MB, where the
+image inside the disc becomes `INT 13h` drive `00h` and the board's own diskette
+moves to `01h`. Hard-disk emulation is declined; "What is known to be missing"
+says why.
+
+`tests/pc_at_eltorito.rs` builds a bootable ISO in a temporary directory —
+nothing vendored, nothing fetched, and the boot image is sixteen-bit code the
+test assembles with `rsemu::fw::asm16` — and boots it. Quoted from the two runs:
+
+```text
+  |rsemu BIOS, 639K base, 15360K extended|
+  |Booting.|
+  |Booting from CD-ROM|
+  |NOEMU BOOTED|
+  |RSEMU_TEST|
+```
+
+```text
+  |rsemu BIOS, 639K base, 15360K extended|
+  |Booting.|
+  |Booting from CD-ROM|
+  |FLOPPY BOOTED|
+  |SECTOR 0/1/5|
+```
+
+Both last lines are the ones that matter. `RSEMU_TEST` is the volume identifier
+the *loaded program* read back off its own disc through `INT 13h AH=42h` after
+finding its drive number with `AH=4Bh` — so the no-emulation case proves not
+only that something was loaded and entered but that what was loaded can still
+reach the medium, which is the whole difference between booting a disc and
+installing from one. `SECTOR 0/1/5` is the contents of cylinder 0, head 1,
+sector 5 of the emulated diskette, fetched with an ordinary CHS `AH=02h`: that
+is virtual sector 22, which is the third quarter of the sixth logical block, so
+an implementation that got either half of the four-sectors-to-a-block
+arithmetic wrong fails here rather than passing on sector 1.
+
+**The CD-ROM is tried last**, after the diskette and the fixed disk. That is the
+same argument the existing order was fixed for and it is tested: an installer
+running off a disc writes a boot record to the disk it is installing onto and
+reboots, and a CD ahead of the other two would run the installer again for ever.
+
+**Three things are declined rather than half-done**, each with a test: a catalog
+entry not marked bootable, a media type the firmware does not implement, and an
+empty tray. All three fall through to `INT 18h` and say `No bootable device.`
+
+`tests/pc_at_cdrom.rs` is the other half of the evidence and has **no firmware
+in it at all**: the image in the ROM socket is a hand-assembled program that
+does nothing but drive `0x170-0x177`, so what it proves is the device rather
+than the pair. It issues `IDENTIFY PACKET DEVICE`, collects the power-on unit
+attention, reads it with `REQUEST SENSE`, and then runs `INQUIRY`,
+`READ CD-ROM CAPACITY` and two `READ(10)`s — one of them with a 512-byte byte
+count limit, so a 2048-byte block arrives in four goes and a model that handed
+over a block per DRQ fails.
+
 ### The graphics modes, and VBE
 
 `tests/pc_video_modes.rs` is the evidence, and it is four hand-assembled
@@ -930,9 +1036,19 @@ machine and comparing the sequences.
   terminal's keystrokes to scan codes is a host concern and belongs in `host/`.
 - **No serial port, no parallel port, no APIC, no ACPI.** The firmware finds
   and reports all four absences and carries on.
-- **No ATAPI.** The IDE channels carry `ata.disk` and nothing else; `IDENTIFY
-  PACKET DEVICE` aborts, which is what a non-packet device does. A CD-ROM is a
-  separate command set on the same transport, not a flag on this one.
+- **No CD writing, no audio and no raw sectors.** The CD-ROM below is
+  read-only by construction — there is no `WRITE(10)` and no `MODE SELECT` in
+  its command set, so the read-only-ness is structural rather than a flag that
+  could be got wrong — and it does not model audio tracks, `READ CD`, sub-channel
+  data or a changer. A 2352-byte raw image is refused by name rather than read
+  as though its sectors were cooked, because that failure is sixteen bytes of
+  sync pattern where a boot record should be, with no error anywhere.
+- **No El Torito hard-disk emulation.** Media type 4 is declined and the
+  bootstrap falls through to `INT 18h`. Loading the image and then having no
+  `INT 13h` drive 80h behind it would be worse than not loading it. Of the
+  `INT 13h` extensions El Torito adds only `AH=4Bh` is implemented — get
+  emulation status — because `4Ah`, `4Ch`, `4Dh` and `4Eh` exist for a loader
+  that wants to *start* an emulation, and nothing this board boots does.
 - **No busmastering IDE DMA.** PIO only, which is what an AT's cable does; the
   DMA modes arrived with PCI and would need a busmaster on a fabric this board
   does not have.

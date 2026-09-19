@@ -8,7 +8,9 @@ controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 
 | Transport | Source | Access |
 | --- | --- | --- |
-| ATA / ATAPI | [T13](https://www.t13.org/) — the ATA/ATAPI Command Set standards; ATA/ATAPI-6 (T13/1410D) is what `dev/ata/disk` was written from | Drafts historically free; final standards via INCITS |
+| ATA / ATAPI | [T13](https://www.t13.org/) — the ATA/ATAPI Command Set standards; ATA/ATAPI-6 (T13/1410D) is what `dev/ata/disk` and `dev/ata/atapi` were written from | Drafts historically free; final standards via INCITS |
+| ATAPI packet commands | SFF-8020i, *ATA Packet Interface for CD-ROMs*, and SCSI MMC — the command set `dev/ata/atapi` carries inside `PACKET` | Widely published; MMC via INCITS |
+| Bootable CD-ROM | *"El Torito" Bootable CD-ROM Format Specification, Version 1.0* (Phoenix/IBM, 1995), with ISO 9660 underneath it — what `fw/pcbios/cdrom` implements | Freely published |
 | AT IDE interface | *IBM Personal Computer AT Technical Reference* (1984), the fixed-disk adapter; Ralf Brown's Interrupt List for the `0x3f6`/`0x3f7` split with the diskette adapter | **Free** |
 | AHCI | Serial ATA AHCI Specification 1.3.1 (Intel), and *Serial ATA: High Speed Serialized AT Attachment* Rev 1.0 for the FIS layouts it defers to | intel.com **[browser]** — see the note below; the SATA revision is an open download from seagate.com |
 | NVMe | [NVM Express specifications](https://nvmexpress.org/specifications/) | **Free** |
@@ -56,10 +58,28 @@ no status bit. The same drive would hang off a PCI IDE controller, a
 CompactFlash socket or a PCMCIA adapter without changing, because none of those
 change the cable.
 
-**ATAPI is deliberately absent.** `IDENTIFY PACKET DEVICE` is aborted, which is
-the specified behaviour of a device that is not a packet device and is how a
-driver finds out. A CD-ROM is a packet command set on top of this transport and
-is a separate piece of work, not a flag on this one.
+**ATAPI is a second device, not a flag on this one.** `dev/ata/atapi` is the
+packet device: `PACKET` carries a twelve-byte SCSI command descriptor block
+through the data register and the meaning of those twelve bytes is SFF-8020i's,
+so the two command sets share the *cable* and nothing else. `ata.disk` aborts
+`IDENTIFY PACKET DEVICE` and `ata.cdrom` aborts `IDENTIFY DEVICE`, which is the
+symmetric pair ATA/ATAPI-6 §8.15 and §8.16 define and is how a driver tells them
+apart along with the `0xEB14` reset signature.
+
+What that cost the transport is one trait. `AtaDevice` is the six calls
+`dev/ata/disk`'s module documentation always listed — the ribbon cable, written
+down — and a drive bay holds one of those rather than an `AtaDisk`. `pc/ide`
+cannot tell which kind is in it, which is the falsifiable form of the claim that
+the seam is the cable. `Bay::drive()` still means "the hard disk, if what is in
+the bay is one", so `dev/ahci` and `dev/amiga/gayle`, neither of which can drive
+a packet device, read a CD-ROM as an empty bay — the truthful answer rather than
+a silent misdrive.
+
+**AHCI does not carry a packet device yet.** An AHCI port delivers the command
+packet as the sixteen-byte `ACMD` field of its command table with `CMD.A` set in
+the command header, and its taskfile seam is typed on `AtaDisk`; both are real
+work and neither is a line of this one. A machine file that put an `ata.cdrom`
+in a SATA bay gets an empty port.
 
 ### The taskfile seam
 
