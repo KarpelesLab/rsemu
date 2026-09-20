@@ -9,10 +9,18 @@
 //! roadmap actually wrote down:
 //!
 //! * The same board, the same firmware, the same number of quanta, under
-//!   `engine = "interp"`, `engine = "jit"` and `engine = "jit-host"`, hashes to
-//!   the same number at every checkpoint — not at the end only, because a
-//!   divergence that shows up at the last checkpoint is a different bug from
-//!   one that shows up at the first.
+//!   `engine = "interp"`, `engine = "jit"`, `engine = "jit-host"` and
+//!   `engine = "jit-wasm"`, hashes to the same number at every checkpoint —
+//!   not at the end only, because a divergence that shows up at the last
+//!   checkpoint is a different bug from one that shows up at the first.
+//!
+//!   `jit-wasm` is the one whose presence here is load-bearing rather than
+//!   symmetric. The other two backends execute the same IR the same way; that
+//!   one lowers every block to a **WebAssembly module** and runs the module
+//!   (`ROADMAP.md` §11.4), so it is a genuinely different execution of the
+//!   same guest, and this file is where the claim that it is the same guest
+//!   is checked. On a build without `jit-wasm` the name falls back to the
+//!   portable backend and the assertion still holds, trivially.
 //! * A snapshot taken under one engine restores under the other and carries on
 //!   to the same hash. That is half of phase 7's gate, and it is a property of
 //!   the snapshot rather than of the engines: nothing engine-specific is in it.
@@ -117,7 +125,7 @@ fn every_engine_hashes_to_the_same_machine_at_every_checkpoint() {
         10,
         "the checkpoint arithmetic changed and the test stopped checking"
     );
-    for engine in ["jit", "jit-host"] {
+    for engine in ["jit", "jit-host", "jit-wasm"] {
         let mut board = board(engine, &format!("hash.{engine}"));
         let got = hashes(&mut board, 40, 4);
         for (n, (want, got)) in want.iter().zip(&got).enumerate() {
@@ -164,18 +172,27 @@ fn the_engine_property_is_read_rather_than_accepted_and_ignored() {
         "the refusal has to name the property and what it will take: {text}"
     );
 
-    // And the two that are implemented reach different backends, which the
+    // And the three that are implemented reach different backends, which the
     // hashes above cannot show because they are supposed to be equal.
     let mut plain = board("jit", "prop.jit");
     let mut host = board("jit-host", "prop.host");
+    let mut wasm = board("jit-wasm", "prop.wasm");
     for _ in 0..8 {
         plain.run_quantum().expect("advances");
         host.run_quantum().expect("advances");
+        wasm.run_quantum().expect("advances");
     }
+    let want = plain.state_hash().expect("hashes");
     assert_eq!(
-        plain.state_hash().expect("hashes"),
+        want,
         host.state_hash().expect("hashes"),
-        "the two JIT engines are the same guest and a different backend"
+        "the JIT engines are the same guest and a different backend"
+    );
+    assert_eq!(
+        want,
+        wasm.state_hash().expect("hashes"),
+        "a block lowered to a WebAssembly module and one lowered to IR are the \
+         same guest (ROADMAP.md §11.4)"
     );
 }
 
@@ -201,6 +218,12 @@ fn a_snapshot_crosses_from_one_engine_to_the_other_and_carries_on_the_same() {
     let want = hashes(&mut interp, 20, 5);
     let got = hashes(&mut jit, 20, 5);
     assert_eq!(want, got, "the two diverged after the restore");
+
+    // And across the wasm backend too, which holds a second derived cache —
+    // the module table — that the snapshot must likewise carry none of.
+    let mut wasm = board("jit-wasm", "snap.wasm");
+    wasm.load(&taken).expect("the wasm board takes it");
+    assert_eq!(hashes(&mut wasm, 20, 5), want);
 
     // And the other direction, which is the one that finds derived state a
     // restore forgot to invalidate: the JIT board's block cache was filled from
