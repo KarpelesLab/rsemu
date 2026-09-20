@@ -47,22 +47,28 @@ machine "riscv-virt" {
   # these can run in one process without stopping each other.
   param power = "power"
 
-  # Which execution engine the hart runs on: `interp`, `jit`, or `jit-host`.
+  # Which execution engine the hart runs on: `interp`, `jit`, `jit-host` or
+  # `jit-wasm`.
   #
   #   rsemu run riscv-virt --media firmware=fw.bin -p engine=jit
   #
-  # A parameter rather than a fixed property because the three are supposed to
+  # A parameter rather than a fixed property because the four are supposed to
   # be *indistinguishable to the guest* — same registers, same memory, same
   # cycle counts, same scheduler debt (ROADMAP.md §0) — and the only way to
-  # keep a claim like that honest is for one board file to run all three and
+  # keep a claim like that honest is for one board file to run all four and
   # for the state hashes to be compared. `tests/riscv_virt_engines.rs` does
   # exactly that; docs/platforms/riscv-virt.md has what each one costs.
   #
   # `interp` is the default because it is the oracle. `jit` is the translation
-  # runtime and `jit-host` is the same runtime with the host code generator
-  # attached; both need a build with `cpu-riscv-lift` and `jit`, and a build
-  # without them refuses the property with a message saying so rather than
-  # quietly interpreting.
+  # runtime; `jit-host` is the same runtime with the host code generator
+  # attached; `jit-wasm` is the same runtime lowering each block to a
+  # WebAssembly module instead (ROADMAP.md §11.4), which on a native host is
+  # the slowest of the four and is here so the translation is *executed* and
+  # hashed rather than only encoded. All three need a build with
+  # `cpu-riscv-lift` and `jit`, and a build without them refuses the property
+  # with a message saying so rather than quietly interpreting; a build without
+  # the particular backend falls back to the portable one, which is a
+  # portability property rather than a configuration error.
   param engine = "interp"
 
   # The virtio disk's size. Whatever is bound to the `disk` media slot is the

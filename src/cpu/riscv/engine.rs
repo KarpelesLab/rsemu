@@ -406,6 +406,15 @@ const UNLIFTED_SLOTS: usize = 65536;
 ))]
 const CODE_BUFFER: u64 = 256 << 20;
 
+/// How many wasm modules `engine = "jit-wasm"` keeps resident.
+///
+/// A module per block, bounded with eviction because `ROADMAP.md` §11.4 asks
+/// for that and because an embedder's module table is not free memory. Sized
+/// well below [`BLOCKS`] deliberately: this is the *compiled* working set, and
+/// a block that falls out of it costs one recompile and no wrong answer.
+#[cfg(feature = "jit-wasm")]
+const MODULES: usize = 8192;
+
 // ---------------------------------------------------------------------------
 // What a hart keeps between blocks
 // ---------------------------------------------------------------------------
@@ -477,23 +486,34 @@ pub struct Stats {
 impl Jit {
     /// A fresh engine.
     ///
-    /// `host_code` asks for the host code generator; a build or a host without
-    /// one gets the portable backend instead, which is not a failure and not a
-    /// different guest (`ROADMAP.md` §9, "Backends").
-    pub(super) fn new(host_code: bool) -> Jit {
+    /// `engine` says which backend to attach. A build or a host without the
+    /// one asked for gets the portable backend instead, which is not a failure
+    /// and not a different guest (`ROADMAP.md` §9, "Backends") — the same
+    /// fallback for all three, so a machine file is portable and a
+    /// measurement is not silently of something else.
+    pub(super) fn new(engine: super::Engine) -> Jit {
         let disp = Dispatcher::with_cache(BlockCache::with_capacity(BLOCKS));
         #[cfg(any(
             all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
             all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
         ))]
-        let disp = match host_code
+        let disp = match (engine == super::Engine::JitHost)
             .then(|| crate::jit::host::Engine::with_capacity(CODE_BUFFER))
             .flatten()
         {
-            Some(engine) => disp.with_backend(engine),
+            Some(host) => disp.with_backend(host),
             None => disp,
         };
-        let _ = host_code;
+        // Not gated on a target: `jit::wasm` emits bytes and executes them in
+        // safe Rust, so it is available wherever the feature is (`jit::wasm`,
+        // "The five files").
+        #[cfg(feature = "jit-wasm")]
+        let disp = if engine == super::Engine::JitWasm {
+            disp.with_wasm(crate::jit::wasm::Engine::with_capacity(MODULES))
+        } else {
+            disp
+        };
+        let _ = engine;
         Jit {
             disp,
             unlifted: Unlifted::new(),
@@ -2100,6 +2120,13 @@ mod tests {
     fn agree(program: &[u32], budget: u64, quanta: usize) -> (Hart, Hart) {
         let out = agree_on(Engine::Jit, program, budget, quanta);
         agree_on(Engine::JitHost, program, budget, quanta);
+        // Every backend this build has, over every fixture in this file. The
+        // wasm one lowers each block to a `WebAssembly.Module` and runs the
+        // module, so it is a genuinely different execution of the same guest
+        // and the cheapest place to find out it is not the same guest is here
+        // — a dozen fixtures, rather than one state hash at the machine level.
+        #[cfg(feature = "jit-wasm")]
+        agree_on(Engine::JitWasm, program, budget, quanta);
         out
     }
 
@@ -2407,7 +2434,7 @@ mod tests {
                 cfg,
                 tlb: mmu::Tlb::new(),
                 lines: Lines::default(),
-                jit: Jit::new(false),
+                jit: Jit::new(Engine::Jit),
             }
         }
 
@@ -2493,7 +2520,7 @@ mod tests {
         /// backend never reads a shadow and the code generator can only reach
         /// one that this hart's own TLB is keeping in lockstep.
         fn with_host_code(mut self) -> Bench {
-            self.jit = Jit::new(true);
+            self.jit = Jit::new(Engine::JitHost);
             if self.jit.wants_shadow() {
                 self.tlb.attach_shadow(Arc::clone(&self.space));
             }
@@ -3065,6 +3092,26 @@ mod tests {
             all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
         )))]
         assert_eq!(compiled, 0, "no backend on this host, so nothing compiles");
+    }
+
+    #[test]
+    #[cfg(feature = "jit-wasm")]
+    fn the_wasm_backend_really_lowers_this_guests_blocks_and_agrees_about_them() {
+        // `tests/riscv_virt_engines.rs` compares state hashes across the
+        // engines, and that comparison passes trivially if `jit-wasm` refused
+        // every block and quietly interpreted. This is the assertion that it
+        // did not — the same shape, and for the same reason, as the
+        // `jit-host` one above.
+        let (interp, wasm) = agree_on(Engine::JitWasm, &LOOP, 1000, 16);
+        assert!(interp.cycles() > 1000, "the run was too short to mean much");
+        let Stats {
+            blocks, compiled, ..
+        } = wasm.jit_stats().expect("statistics");
+        assert!(blocks > 0, "the wasm hart executed no block at all");
+        assert!(
+            compiled > 0,
+            "`jit-wasm` must lower this guest's blocks to modules, not refuse them"
+        );
     }
 
     #[test]

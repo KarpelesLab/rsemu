@@ -722,6 +722,16 @@ pub struct Dispatcher {
         all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
     ))]
     backend: Option<Engine>,
+    /// The WebAssembly code generator, when one has been given.
+    ///
+    /// A second `Option` rather than a variant of the first, because the two
+    /// are not the same kind of thing: a native backend exists only where its
+    /// host does, and this one exists wherever the feature is on. They are
+    /// still **alternatives** — see [`Dispatcher::with_wasm`], which clears
+    /// the other — because a [`CodeRef`](crate::jit::CodeRef) means something
+    /// different to each and the block cache holds one per block.
+    #[cfg(feature = "jit-wasm")]
+    wasm: Option<crate::jit::wasm::Engine>,
     exit: Option<ExitFlag>,
     stats: DispatchStats,
 }
@@ -744,6 +754,8 @@ impl Dispatcher {
                 all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
             ))]
             backend: None,
+            #[cfg(feature = "jit-wasm")]
+            wasm: None,
             exit: None,
             stats: DispatchStats::default(),
         }
@@ -777,6 +789,43 @@ impl Dispatcher {
     #[must_use]
     pub fn backend(&self) -> Option<&Engine> {
         self.backend.as_ref()
+    }
+
+    /// The same dispatcher, compiling blocks to WebAssembly with `engine`.
+    ///
+    /// An alternative to [`Dispatcher::with_backend`] and not an addition:
+    /// a block's [`CodeRef`](crate::jit::CodeRef) is stored once in the block
+    /// cache and means something different to each backend, so attaching this
+    /// one **clears** a native one that was already there rather than leaving
+    /// two readers of the same handle. A caller that wants a native backend
+    /// should not have asked for this one.
+    ///
+    /// A block the engine refuses runs on [`Interp`](crate::ir::Interp), and
+    /// the two are indistinguishable to the guest — same registers, same
+    /// memory, same faults, same ticks, in the same order — which is the claim
+    /// `tests/riscv_virt_engines.rs` checks across all four engines.
+    #[cfg(feature = "jit-wasm")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jit-wasm")))]
+    #[must_use]
+    pub fn with_wasm(mut self, engine: crate::jit::wasm::Engine) -> Dispatcher {
+        #[cfg(any(
+            all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+            all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+        ))]
+        {
+            self.backend = None;
+        }
+        self.wasm = Some(engine);
+        self
+    }
+
+    /// The WebAssembly code generator, if this dispatcher has one.
+    #[cfg(feature = "jit-wasm")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jit-wasm")))]
+    #[inline]
+    #[must_use]
+    pub fn wasm(&self) -> Option<&crate::jit::wasm::Engine> {
+        self.wasm.as_ref()
     }
 
     /// The same dispatcher, unwinding when `flag` is raised.
@@ -1143,12 +1192,54 @@ impl Dispatcher {
                 }
             }
         }
+        #[cfg(feature = "jit-wasm")]
+        {
+            // The wasm backend has no chain and no link: an instantiated
+            // module's branches cannot be patched, so every exit returns here
+            // (`ROADMAP.md` §11.4). That makes this arm a drop-in for the
+            // interpreter below rather than a second copy of the one above —
+            // one block, one outcome, `closed: false`.
+            let Dispatcher {
+                cache, wasm, stats, ..
+            } = self;
+            if let Some(engine) = wasm.as_mut() {
+                let code = {
+                    let block = cache
+                        .block(id)
+                        .expect("a block just found or just inserted is resident");
+                    match cache.code(id).filter(|c| engine.is_live(*c)) {
+                        Some(code) => Some(code),
+                        // A refusal is not an error and is not recorded
+                        // against the block: the engine counts it, and the
+                        // next time this block is reached it is refused again
+                        // for the same reason, which costs a compile attempt
+                        // and nothing else.
+                        None => engine.compile(block).ok(),
+                    }
+                };
+                if let Some(code) = code {
+                    cache.set_code(id, code);
+                    let block = cache.block(id).expect("still resident");
+                    if let Some(outcome) = engine.run(block, code, host) {
+                        stats.compiled += 1;
+                        return Ok(Ran {
+                            outcome: outcome?,
+                            blocks: 1,
+                            insns: engine.boundaries().saturating_sub(1) as usize,
+                            closed: false,
+                            resumed: None,
+                            stopped: None,
+                        });
+                    }
+                }
+            }
+        }
         #[cfg(not(any(
             all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
             all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
         )))]
-        // No backend on this target, so nothing chains and nothing links:
-        // these three describe a chain and there is none to describe.
+        // No native backend on this target, so nothing chains and nothing
+        // links: these three describe a chain and there is none to describe.
         let _ = (&*front, pc_slot, remaining);
         let block = self
             .cache

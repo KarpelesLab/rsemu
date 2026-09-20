@@ -365,13 +365,34 @@ pub enum Engine {
     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-riscv-lift", feature = "jit"))))]
     JitHost,
+    /// [`Jit`](Engine::Jit), with the **WebAssembly** code generator attached:
+    /// the same blocks from the same cache, lowered to a `WebAssembly.Module`
+    /// by `jit::wasm` (`ROADMAP.md` §11.4).
+    ///
+    /// Falls back rather than refusing, exactly as
+    /// [`JitHost`](Engine::JitHost) does and for the same reason: a build
+    /// without `jit-wasm` runs the same blocks on the portable backend and
+    /// gets the same answers.
+    ///
+    /// **Slower than both other JIT engines on a native host, and selectable
+    /// anyway.** With no embedder there is nothing to execute a module but
+    /// `jit::wasm::exec`, so a block is interpreted twice over. What it buys
+    /// is that the translation is *executed* rather than merely encoded on
+    /// every target — which is what lets `tests/riscv_virt_engines.rs` assert
+    /// the state hash across it on the runner that gates every commit, a
+    /// claim `jit::arm64` cannot make. In a browser the same modules would go
+    /// to the embedder instead; `docs/techniques/wasm-jit.md` says what that
+    /// takes and what is not yet measured.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-riscv-lift", feature = "jit"))))]
+    JitWasm,
 }
 
 #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
 impl Engine {
     /// Whether this engine runs blocks through the translation runtime.
     fn translates(self) -> bool {
-        matches!(self, Engine::Jit | Engine::JitHost)
+        matches!(self, Engine::Jit | Engine::JitHost | Engine::JitWasm)
     }
 }
 
@@ -565,7 +586,11 @@ impl Hart {
         // Both values are named in every build, so a machine file validates
         // the same everywhere and a build that cannot run one says *why*
         // rather than "expected one of `interp`".
-        let want = r.or_enum("engine", "interp", &["interp", "jit", "jit-host"])?;
+        let want = r.or_enum(
+            "engine",
+            "interp",
+            &["interp", "jit", "jit-host", "jit-wasm"],
+        )?;
         let want_jit = want != "interp";
         // Validated here, resolved at bind: `new` allocates and checks, and
         // performs no outward action at all (`ROADMAP.md` §4.4).
@@ -621,10 +646,10 @@ impl Hart {
                      (`cpu::riscv::lift`). Use `engine = \"interp\"` for an RV32 hart",
                 )));
             }
-            if want == "jit-host" {
-                Engine::JitHost
-            } else {
-                Engine::Jit
+            match want {
+                "jit-host" => Engine::JitHost,
+                "jit-wasm" => Engine::JitWasm,
+                _ => Engine::Jit,
             }
         } else {
             Engine::Interp
@@ -1003,7 +1028,7 @@ impl Hart {
                 }
             }
             if session.jit.is_none() {
-                session.jit = Some(Box::new(engine::Jit::new(self.engine == Engine::JitHost)));
+                session.jit = Some(Box::new(engine::Jit::new(self.engine)));
             }
             // The shadow the compiled fast path probes, over the space this
             // hart is on. It lives inside the hart's own TLB
@@ -1734,7 +1759,10 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("misaligned", ValueKind::Bool))
         .prop(PropSchema::new("supervisor", ValueKind::Bool))
         .prop(PropSchema::new("user", ValueKind::Bool))
-        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp", "jit", "jit-host"]))
+        .prop(
+            PropSchema::new("engine", ValueKind::Str)
+                .values(&["interp", "jit", "jit-host", "jit-wasm"]),
+        )
         .prop(PropSchema::new("timer", ValueKind::Link))
         // Inputs only: a hart drives no line this core models.
         .port("meip", PortDir::In)
