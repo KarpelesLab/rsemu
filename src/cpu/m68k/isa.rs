@@ -90,11 +90,28 @@ pub enum Model {
     /// The MC68EC020: a 68020 with only 24 address pins (MC68020UM §1:
     /// "the MC68EC020 ... 24-bit address bus"). Same instruction set.
     M68EC020,
+    /// The MC68030: the 68020's instruction set without `CALLM`/`RTM`, plus
+    /// an on-chip paged memory management unit and its four instructions
+    /// (MC68030UM §1.1, §9).
+    M68030,
+    /// The MC68EC030: a 68030 with **no paged MMU** — the two transparent
+    /// translation registers survive as `AC0`/`AC1` and the MMU status
+    /// register as `ACUSR`, and `PLOAD`, `PFLUSH` and `PMOVE` to `TC`, `CRP`
+    /// or `SRP` are unimplemented F-line instructions (MC68EC030UM §9,
+    /// Appendix A). The address bus is the 68030's full 32 bits.
+    M68EC030,
 }
 
 impl Model {
     /// Every model, in order of introduction.
-    pub const ALL: [Model; 4] = [Model::M68000, Model::M68010, Model::M68020, Model::M68EC020];
+    pub const ALL: [Model; 6] = [
+        Model::M68000,
+        Model::M68010,
+        Model::M68020,
+        Model::M68EC020,
+        Model::M68030,
+        Model::M68EC030,
+    ];
 
     /// The name the `model` property spells it with.
     #[must_use]
@@ -104,6 +121,8 @@ impl Model {
             Model::M68010 => "68010",
             Model::M68020 => "68020",
             Model::M68EC020 => "68ec020",
+            Model::M68030 => "68030",
+            Model::M68EC030 => "68ec030",
         }
     }
 
@@ -115,13 +134,15 @@ impl Model {
 
     /// Which bits of an address reach the pins.
     ///
-    /// 24 on everything but the full 68020, whose 32 address lines are the
-    /// whole point of it. Applied to the address *after* it is computed in 32
-    /// bits, which is where the wrap happens on the real part too.
+    /// 24 on the 68000, the 68010 and the 68EC020; 32 on the full 68020 and
+    /// on both 68030 packages — the MC68EC030 keeps the whole address bus and
+    /// drops only the MMU (MC68EC030UM §1). Applied to the address *after* it
+    /// is computed in 32 bits, which is where the wrap happens on the real
+    /// part too.
     #[must_use]
     pub const fn address_mask(self) -> u32 {
         match self {
-            Model::M68020 => 0xffff_ffff,
+            Model::M68020 | Model::M68030 | Model::M68EC030 => 0xffff_ffff,
             _ => 0x00ff_ffff,
         }
     }
@@ -133,11 +154,37 @@ impl Model {
         !matches!(self, Model::M68000)
     }
 
-    /// The 68020's architecture: either package.
+    /// The 68020's architecture or later: either package of either part.
     #[inline]
     #[must_use]
     pub const fn has_020(self) -> bool {
-        matches!(self, Model::M68020 | Model::M68EC020)
+        matches!(
+            self,
+            Model::M68020 | Model::M68EC020 | Model::M68030 | Model::M68EC030
+        )
+    }
+
+    /// The 68030's architecture: either package.
+    #[inline]
+    #[must_use]
+    pub const fn has_030(self) -> bool {
+        matches!(self, Model::M68030 | Model::M68EC030)
+    }
+
+    /// Whether this part has the paged memory management unit — the one thing
+    /// the MC68EC030 leaves out (MC68EC030UM §1.1).
+    #[inline]
+    #[must_use]
+    pub const fn has_mmu(self) -> bool {
+        matches!(self, Model::M68030)
+    }
+
+    /// Whether a coprocessor may be attached through the F-line interface,
+    /// which arrived with the 68020 (MC68020UM §7).
+    #[inline]
+    #[must_use]
+    pub const fn has_coprocessor_interface(self) -> bool {
+        self.has_020()
     }
 
     /// This model's bit in a [`Models`] set.
@@ -147,6 +194,8 @@ impl Model {
             Model::M68000 => 1,
             Model::M68010 => 2,
             Model::M68020 | Model::M68EC020 => 4,
+            Model::M68030 => 8,
+            Model::M68EC030 => 16,
         }
     }
 }
@@ -167,13 +216,20 @@ pub struct Models(pub u8);
 
 impl Models {
     /// Every processor.
-    pub const ALL: Models = Models(7);
+    pub const ALL: Models = Models(31);
     /// The 68000 alone — a behaviour the 68010 changed.
     pub const M68000: Models = Models(1);
-    /// The 68010 and the 68020.
-    pub const FROM_010: Models = Models(6);
-    /// The 68020 alone.
+    /// The 68010 and everything after it.
+    pub const FROM_010: Models = Models(30);
+    /// The 68020 alone — `CALLM` and `RTM`, which the 68030 dropped
+    /// (MC68030UM §1.1: the module support instructions are not implemented).
     pub const M68020: Models = Models(4);
+    /// The 68020 and everything after it.
+    pub const FROM_020: Models = Models(28);
+    /// Both 68030 packages.
+    pub const FROM_030: Models = Models(24);
+    /// The full MC68030 alone — the encodings that need the paged MMU.
+    pub const M68030: Models = Models(8);
     /// The 68000 and the 68010 — a behaviour the 68020 changed.
     pub const UNTIL_010: Models = Models(3);
 
@@ -731,6 +787,7 @@ define_ops! {
     Rtm = "RTM", "return from a module";
     Trapcc = "TRAP", "take a trap if a condition holds";
     Unpk = "UNPK", "unpack a BCD byte into two digits, with an adjustment";
+    Pgen = "P", "a memory management instruction: PMOVE, PTEST, PLOAD, PFLUSH";
 }
 
 impl Op {
@@ -748,7 +805,7 @@ impl Op {
     /// 32-bit dividend and a remainder register distinct from the quotient
     /// (M68000PRM, *DIVS*, *MULS*, *CHK2*).
     #[must_use]
-    pub const fn mnemonic_with(self, ext: u16) -> &'static str {
+    pub fn mnemonic_with(self, ext: u16) -> &'static str {
         let signed = ext & 0x0800 != 0;
         match self {
             Op::Mull => {
@@ -775,6 +832,9 @@ impl Op {
                     "CMP2"
                 }
             }
+            // The coprocessor command word carries the operation, exactly as
+            // `MULS.L`'s extension word carries its signedness.
+            Op::Pgen => pmmu::mnemonic(ext),
             other => other.mnemonic(),
         }
     }
@@ -858,6 +918,13 @@ pub struct Insn {
     /// a bit field's offset and width. `PACK` and `UNPK`, which have no
     /// effective address, count their adjustment word here too.
     pub ext: u8,
+    /// Whether the row needs a floating-point coprocessor to exist at all.
+    ///
+    /// Not a [`Models`] bit, because the FPU is a *property* of the board and
+    /// not of the part: a 68020 with no 68881 sees every one of these
+    /// encodings as the line-F exception, and a 68020 with one sees an
+    /// instruction. [`decode_with`] is where the two part company.
+    pub fpu: bool,
 }
 
 impl Insn {
@@ -872,6 +939,7 @@ impl Insn {
         privileged: false,
         models: Models::ALL,
         ext: 0,
+        fpu: false,
     };
 
     const fn new(op: Op, size: SizeSpec, src: Arg, dst: Arg) -> Insn {
@@ -885,6 +953,7 @@ impl Insn {
             privileged: false,
             models: Models::ALL,
             ext: 0,
+            fpu: false,
         }
     }
 
@@ -899,6 +968,14 @@ impl Insn {
 
     const fn only_020(self) -> Insn {
         self.models(Models::M68020)
+    }
+
+    const fn since_020(self) -> Insn {
+        self.models(Models::FROM_020)
+    }
+
+    const fn since_030(self) -> Insn {
+        self.models(Models::FROM_030)
     }
 
     const fn with_ext(mut self, words: u8) -> Insn {
@@ -983,21 +1060,21 @@ table! {
     // (M68000PRM §8, *Instruction Format Summary*). CAS2 is CAS with an
     // immediate "effective address", and is matched before CAS for the same
     // reason.
-    0xffff 0x0cfc => Insn::new(Op::Cas2, Fixed(Word), Arg::None, Arg::None).with_ext(2).only_020();
-    0xffff 0x0efc => Insn::new(Op::Cas2, Fixed(Long), Arg::None, Arg::None).with_ext(2).only_020();
+    0xffff 0x0cfc => Insn::new(Op::Cas2, Fixed(Word), Arg::None, Arg::None).with_ext(2).since_020();
+    0xffff 0x0efc => Insn::new(Op::Cas2, Fixed(Long), Arg::None, Arg::None).with_ext(2).since_020();
     0xffc0 0x0ac0 => Insn::new(Op::Cas,  Fixed(Byte), Arg::None, Ea)
-                        .dst_ea(EaSet::MEM_ALT).with_ext(1).only_020();
+                        .dst_ea(EaSet::MEM_ALT).with_ext(1).since_020();
     0xffc0 0x0cc0 => Insn::new(Op::Cas,  Fixed(Word), Arg::None, Ea)
-                        .dst_ea(EaSet::MEM_ALT).with_ext(1).only_020();
+                        .dst_ea(EaSet::MEM_ALT).with_ext(1).since_020();
     0xffc0 0x0ec0 => Insn::new(Op::Cas,  Fixed(Long), Arg::None, Ea)
-                        .dst_ea(EaSet::MEM_ALT).with_ext(1).only_020();
+                        .dst_ea(EaSet::MEM_ALT).with_ext(1).since_020();
     // RTM's register field sits where CALLM's effective address would name a
     // register, which CALLM does not accept.
     0xfff0 0x06c0 => Insn::new(Op::Rtm,   SizeSpec::None, Arg::None, Arg::None).only_020();
     0xffc0 0x06c0 => Insn::new(Op::Callm, SizeSpec::None, Ea, Arg::None)
                         .src_ea(EaSet::CONTROL).with_ext(1).only_020();
     0xf9c0 0x00c0 => Insn::new(Op::Cmp2,  Bits109, Ea, ExtReg)
-                        .src_ea(EaSet::CONTROL).with_ext(1).only_020();
+                        .src_ea(EaSet::CONTROL).with_ext(1).since_020();
     // MOVEP shares bit 8 with the dynamic bit instructions and is told apart
     // by its mode field being 001, which those forbid. Bit 7 is the direction,
     // and it gets a row of its own rather than a runtime test, so the
@@ -1018,7 +1095,7 @@ table! {
     // and 68010 do not (M68000PRM, *CMPI*: "PC relative addressing modes do
     // not apply to MC68000").
     0xff00 0x0c00 => Insn::new(Op::Cmpi,      Bits76, Imm, Ea)
-                        .dst_ea(EaSet::DATA.without(Mode::Imm)).only_020();
+                        .dst_ea(EaSet::DATA.without(Mode::Imm)).since_020();
     0xff00 0x0c00 => Insn::new(Op::Cmpi,      Bits76, Imm, Ea)
                         .dst_ea(EaSet::DATA_ALT).models(Models::UNTIL_010);
     // MOVES carries its direction in its extension word, not its opcode.
@@ -1069,8 +1146,8 @@ table! {
     0xfff8 0x4848 => Insn::new(Op::Bkpt,    SizeSpec::None, Vector3, Arg::None).since_010();
     // LINK.L is NBCD's address-register form, and EXTB.L is LEA's
     // data-register form; both reject those.
-    0xfff8 0x4808 => Insn::new(Op::Link,    Fixed(Long), AnLo, Disp32).only_020();
-    0xfff8 0x49c0 => Insn::new(Op::Extb,    Fixed(Long), DnLo, Arg::None).only_020();
+    0xfff8 0x4808 => Insn::new(Op::Link,    Fixed(Long), AnLo, Disp32).since_020();
+    0xfff8 0x49c0 => Insn::new(Op::Extb,    Fixed(Long), DnLo, Arg::None).since_020();
     0xfff8 0x4880 => Insn::new(Op::Ext,     Bit6, DnLo, Arg::None);
     0xfff8 0x48c0 => Insn::new(Op::Ext,     Bit6, DnLo, Arg::None);
     // MOVE from SR is privileged from the 68010 on — the change that let a
@@ -1094,9 +1171,9 @@ table! {
     // The 32-bit multiply and divide sit below MOVEM's memory-to-register
     // encoding, in space the 68000 left empty.
     0xffc0 0x4c00 => Insn::new(Op::Mull, Fixed(Long), Ea, Arg::None)
-                        .src_ea(EaSet::DATA).with_ext(1).only_020();
+                        .src_ea(EaSet::DATA).with_ext(1).since_020();
     0xffc0 0x4c40 => Insn::new(Op::Divl, Fixed(Long), Ea, Arg::None)
-                        .src_ea(EaSet::DATA).with_ext(1).only_020();
+                        .src_ea(EaSet::DATA).with_ext(1).since_020();
     0xff80 0x4880 => Insn::new(Op::Movem, Bit6, RegList, Ea).dst_ea(EaSet::MOVEM_TO_MEM);
     0xff80 0x4c80 => Insn::new(Op::Movem, Bit6, Ea, RegList).src_ea(EaSet::MOVEM_TO_REG);
     0xff00 0x4000 => Insn::new(Op::Negx, Bits76, Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
@@ -1105,10 +1182,10 @@ table! {
     0xff00 0x4600 => Insn::new(Op::Not,  Bits76, Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
     // TST reaches every mode on a 68020 — an address register as a word or a
     // long, the PC-relative modes and an immediate (M68000PRM, *TST*).
-    0xff00 0x4a00 => Insn::new(Op::Tst,  Bits76, Ea, Arg::None).src_ea(EaSet::ALL).only_020();
+    0xff00 0x4a00 => Insn::new(Op::Tst,  Bits76, Ea, Arg::None).src_ea(EaSet::ALL).since_020();
     0xff00 0x4a00 => Insn::new(Op::Tst,  Bits76, Ea, Arg::None)
                         .src_ea(EaSet::DATA_ALT).models(Models::UNTIL_010);
-    0xf1c0 0x4100 => Insn::new(Op::Chk,  Fixed(Long), Ea, DnHi).src_ea(EaSet::DATA).only_020();
+    0xf1c0 0x4100 => Insn::new(Op::Chk,  Fixed(Long), Ea, DnHi).src_ea(EaSet::DATA).since_020();
     0xf1c0 0x4180 => Insn::new(Op::Chk,  Fixed(Word), Ea, DnHi).src_ea(EaSet::DATA);
     0xf1c0 0x41c0 => Insn::new(Op::Lea,  Fixed(Long), Ea, AnHi).src_ea(EaSet::CONTROL);
 
@@ -1116,9 +1193,9 @@ table! {
     0xf0f8 0x50c8 => Insn::new(Op::Dbcc, Fixed(Word), DnLo, Disp16);
     // TRAPcc is Scc with an immediate or PC-relative "destination", which
     // Scc rejects. Bits 2-0 say how many operand words follow.
-    0xf0ff 0x50fa => Insn::new(Op::Trapcc, Fixed(Word), TrapData, Arg::None).only_020();
-    0xf0ff 0x50fb => Insn::new(Op::Trapcc, Fixed(Long), TrapData, Arg::None).only_020();
-    0xf0ff 0x50fc => Insn::new(Op::Trapcc, SizeSpec::None, Arg::None, Arg::None).only_020();
+    0xf0ff 0x50fa => Insn::new(Op::Trapcc, Fixed(Word), TrapData, Arg::None).since_020();
+    0xf0ff 0x50fb => Insn::new(Op::Trapcc, Fixed(Long), TrapData, Arg::None).since_020();
+    0xf0ff 0x50fc => Insn::new(Op::Trapcc, SizeSpec::None, Arg::None, Arg::None).since_020();
     0xf0c0 0x50c0 => Insn::new(Op::Scc,  Fixed(Byte), Arg::None, Ea).dst_ea(EaSet::DATA_ALT);
     0xf100 0x5000 => Insn::new(Op::Addq, Bits76, Quick, Ea).dst_ea(EaSet::ALTERABLE);
     0xf100 0x5100 => Insn::new(Op::Subq, Bits76, Quick, Ea).dst_ea(EaSet::ALTERABLE);
@@ -1126,9 +1203,9 @@ table! {
     // ---- line 6: branches -----------------------------------------------
     // A displacement byte of $ff means a 32-bit displacement follows on a
     // 68020; on a 68000 it is a branch by -1, to an odd address.
-    0xffff 0x60ff => Insn::new(Op::Bra, SizeSpec::None, Disp32, Arg::None).only_020();
-    0xffff 0x61ff => Insn::new(Op::Bsr, SizeSpec::None, Disp32, Arg::None).only_020();
-    0xf0ff 0x60ff => Insn::new(Op::Bcc, SizeSpec::None, Disp32, Arg::None).only_020();
+    0xffff 0x60ff => Insn::new(Op::Bra, SizeSpec::None, Disp32, Arg::None).since_020();
+    0xffff 0x61ff => Insn::new(Op::Bsr, SizeSpec::None, Disp32, Arg::None).since_020();
+    0xf0ff 0x60ff => Insn::new(Op::Bcc, SizeSpec::None, Disp32, Arg::None).since_020();
     0xff00 0x6000 => Insn::new(Op::Bra, SizeSpec::None, Disp8, Arg::None);
     0xff00 0x6100 => Insn::new(Op::Bsr, SizeSpec::None, Disp8, Arg::None);
     0xf000 0x6000 => Insn::new(Op::Bcc, SizeSpec::None, Disp8, Arg::None);
@@ -1139,8 +1216,8 @@ table! {
     // ---- line 8: OR, DIV, SBCD, PACK, UNPK ------------------------------
     0xf1f0 0x8100 => Insn::new(Op::Sbcd, Fixed(Byte), RmLo, RmHi);
     // PACK and UNPK are OR's register-destination forms, which OR rejects.
-    0xf1f0 0x8140 => Insn::new(Op::Pack, SizeSpec::None, RmLo, RmHi).with_ext(1).only_020();
-    0xf1f0 0x8180 => Insn::new(Op::Unpk, SizeSpec::None, RmLo, RmHi).with_ext(1).only_020();
+    0xf1f0 0x8140 => Insn::new(Op::Pack, SizeSpec::None, RmLo, RmHi).with_ext(1).since_020();
+    0xf1f0 0x8180 => Insn::new(Op::Unpk, SizeSpec::None, RmLo, RmHi).with_ext(1).since_020();
     0xf1c0 0x80c0 => Insn::new(Op::Divu, Fixed(Word), Ea, DnHi).src_ea(EaSet::DATA);
     0xf1c0 0x81c0 => Insn::new(Op::Divs, Fixed(Word), Ea, DnHi).src_ea(EaSet::DATA);
     0xf100 0x8000 => Insn::new(Op::Or,   Bits76, Ea, DnHi).src_ea(EaSet::DATA);
@@ -1182,21 +1259,21 @@ table! {
     // register shifts, so they are matched first. Unsized: the field is
     // whatever the extension word says.
     0xffc0 0xe8c0 => Insn::new(Op::Bftst,  SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD).with_ext(1).since_020();
     0xffc0 0xe9c0 => Insn::new(Op::Bfextu, SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD).with_ext(1).since_020();
     0xffc0 0xeac0 => Insn::new(Op::Bfchg,  SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).since_020();
     0xffc0 0xebc0 => Insn::new(Op::Bfexts, SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD).with_ext(1).since_020();
     0xffc0 0xecc0 => Insn::new(Op::Bfclr,  SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).since_020();
     0xffc0 0xedc0 => Insn::new(Op::Bfffo,  SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD).with_ext(1).since_020();
     0xffc0 0xeec0 => Insn::new(Op::Bfset,  SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).since_020();
     0xffc0 0xefc0 => Insn::new(Op::Bfins,  SizeSpec::None, Ea, Arg::None)
-                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).only_020();
+                        .src_ea(EaSet::BITFIELD_ALT).with_ext(1).since_020();
     // The memory forms shift one bit of one word and must be matched first:
     // they occupy the bits-7-6 = 11 encoding the register forms leave unused.
     0xffc0 0xe0c0 => Insn::new(Op::Asr,  Fixed(Word), Arg::None, Ea).dst_ea(EaSet::MEM_ALT);
@@ -1216,16 +1293,25 @@ table! {
     0xf118 0xe018 => Insn::new(Op::Ror,  Bits76, ShiftCount, DnLo);
     0xf118 0xe118 => Insn::new(Op::Rol,  Bits76, ShiftCount, DnLo);
 
-    // ---- line f: unimplemented, the $F line coprocessor escape ------------
+    // ---- line f: the coprocessor escape ----------------------------------
+    // Coprocessor id 0 is the 68030's on-chip memory management unit, which
+    // answers only the `000` instruction class — PMOVE, PTEST, PLOAD and
+    // PFLUSH, told apart by their command word (`pmmu::decode`). The 68851's
+    // other classes (PBcc, PScc, PDBcc, PTRAPcc, PSAVE, PRESTORE) are *not*
+    // implemented by a 68030 and stay line F (MC68030UM §9.6). The effective
+    // address is left unconstrained here because PFLUSHA has none and encodes
+    // `000000` in the field; `pmmu::decode` carries each form's own rule.
+    0xffc0 0xf000 => Insn::new(Op::Pgen, SizeSpec::None, Ea, Arg::None)
+                        .with_ext(1).privileged().since_030();
     // With no coprocessor present every F-line word takes the line-F
     // exception — except cpSAVE and cpRESTORE, which a 68020 checks for
     // privilege before it tries to talk to any coprocessor, so user code gets
     // a privilege violation instead (MC68020UM §7.5.2.3). Bits 11-9 are the
     // coprocessor id and do not matter to that check.
     0xf1c0 0xf100 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None)
-                        .privileged().only_020();
+                        .privileged().since_020();
     0xf1c0 0xf140 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None)
-                        .privileged().only_020();
+                        .privileged().since_020();
     0xf000 0xf000 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None);
 }
 
@@ -1261,6 +1347,25 @@ pub fn decode(opcode: u16) -> Insn {
     decode_for(Model::M68000, opcode)
 }
 
+/// Which optional coprocessors answer the F line.
+///
+/// Separate from [`Models`] because a coprocessor is a property of the
+/// *board*: the same 68020 is a 68020 with a 68881 and a 68020 without one,
+/// and the difference is visible in the opcode map rather than in the part
+/// number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Copro {
+    /// A 68881 or 68882 answers coprocessor id 1.
+    pub fpu: bool,
+}
+
+impl Copro {
+    /// No coprocessor: every F-line word is the line-F exception.
+    pub const NONE: Copro = Copro { fpu: false };
+    /// A floating-point coprocessor on id 1.
+    pub const FPU: Copro = Copro { fpu: true };
+}
+
 /// Decode an opcode word into its table row, for a given processor.
 ///
 /// Rows the processor does not implement are skipped rather than matched, so
@@ -1269,11 +1374,25 @@ pub fn decode(opcode: u16) -> Insn {
 #[inline]
 #[must_use]
 pub fn decode_for(model: Model, opcode: u16) -> Insn {
+    decode_with(model, Copro::NONE, opcode)
+}
+
+/// Decode an opcode word for a given processor *and* its coprocessors.
+///
+/// The only rows this reaches that [`decode_for`] does not are the
+/// floating-point ones, which exist when a 68881 or 68882 is attached and are
+/// the line-F exception when it is not.
+#[inline]
+#[must_use]
+pub fn decode_with(model: Model, copro: Copro, opcode: u16) -> Insn {
     let (start, end) = NIBBLE[(opcode >> 12) as usize];
     let mut i = start as usize;
     while i < end as usize {
         let pattern = &TABLE[i];
-        if pattern.insn.models.contains(model) && pattern.matches(opcode) {
+        if (copro.fpu || !pattern.insn.fpu)
+            && pattern.insn.models.contains(model)
+            && pattern.matches(opcode)
+        {
             let insn = pattern.insn;
             return if legal(insn, opcode) {
                 insn
@@ -1515,6 +1634,317 @@ impl FieldSpec {
     }
 }
 
+/// The 68030's memory management command word, described **once**.
+///
+/// `PMOVE`, `PTEST`, `PLOAD` and `PFLUSH` share the opcode word
+/// `1111 000 000 <ea>` and are told apart entirely by this word (M68000PRM
+/// §6; MC68030UM §9.7). As with the instruction table above, both the
+/// interpreter and the disassembler read the description here, so a listing
+/// cannot print an operation the interpreter does not perform.
+pub mod pmmu {
+    use core::fmt;
+
+    /// Where a function code operand comes from (M68000PRM §6, *PFLUSH*'s
+    /// **FC field**).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum FcSource {
+        /// `10XXX` — the three bits are the function code.
+        Immediate(u8),
+        /// `01DDD` — bits 2–0 of a data register.
+        DataReg(u8),
+        /// `00000` — the source function code register.
+        Sfc,
+        /// `00001` — the destination function code register.
+        Dfc,
+    }
+
+    impl FcSource {
+        /// Decode a five-bit field, or `None` for an undefined encoding.
+        #[must_use]
+        pub const fn decode(bits: u16) -> Option<FcSource> {
+            let bits = (bits & 0x1f) as u8;
+            Some(match bits >> 3 {
+                0b10 | 0b11 => FcSource::Immediate(bits & 7),
+                0b01 => FcSource::DataReg(bits & 7),
+                _ => match bits {
+                    0 => FcSource::Sfc,
+                    1 => FcSource::Dfc,
+                    _ => return None,
+                },
+            })
+        }
+    }
+
+    impl fmt::Display for FcSource {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                FcSource::Immediate(fc) => write!(f, "#{fc}"),
+                FcSource::DataReg(n) => write!(f, "d{n}"),
+                FcSource::Sfc => f.write_str("sfc"),
+                FcSource::Dfc => f.write_str("dfc"),
+            }
+        }
+    }
+
+    /// Which register a `PMOVE` names.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum PReg {
+        /// The translation control register, a long word. Full 68030 only.
+        Tc,
+        /// The supervisor root pointer, a quad word. Full 68030 only.
+        Srp,
+        /// The CPU root pointer, a quad word. Full 68030 only.
+        Crp,
+        /// Transparent translation register 0 — `AC0` on an EC030. A long
+        /// word.
+        Tt0,
+        /// Transparent translation register 1 — `AC1`. A long word.
+        Tt1,
+        /// The MMU status register — `ACUSR` on an EC030. A word.
+        Mmusr,
+    }
+
+    impl PReg {
+        /// How many bytes the transfer moves (M68000PRM §6, *PMOVE*: quad for
+        /// the root pointers, long for `TC` and the `TTx`, word for `MMUSR`).
+        #[must_use]
+        pub const fn bytes(self) -> u32 {
+            match self {
+                PReg::Tc | PReg::Tt0 | PReg::Tt1 => 4,
+                PReg::Srp | PReg::Crp => 8,
+                PReg::Mmusr => 2,
+            }
+        }
+
+        /// Whether the register exists only on a part with the paged MMU.
+        #[must_use]
+        pub const fn needs_mmu(self) -> bool {
+            matches!(self, PReg::Tc | PReg::Srp | PReg::Crp)
+        }
+
+        /// The assembler name.
+        #[must_use]
+        pub const fn name(self) -> &'static str {
+            match self {
+                PReg::Tc => "tc",
+                PReg::Srp => "srp",
+                PReg::Crp => "crp",
+                PReg::Tt0 => "tt0",
+                PReg::Tt1 => "tt1",
+                PReg::Mmusr => "mmusr",
+            }
+        }
+    }
+
+    impl fmt::Display for PReg {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.name())
+        }
+    }
+
+    /// What a `PFLUSH` flushes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Flush {
+        /// `PFLUSHA` — every entry. Mode `001`.
+        All,
+        /// `PFLUSH fc,mask` — every entry whose function code matches. Mode
+        /// `100`.
+        ByFc(FcSource, u8),
+        /// `PFLUSH fc,mask,<ea>` — the entry for one address in each matching
+        /// function code. Mode `110`.
+        ByFcAndAddress(FcSource, u8),
+    }
+
+    /// What a command word means.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Class {
+        /// `PMOVE` or `PMOVEFD`.
+        Move {
+            /// Which register.
+            reg: PReg,
+            /// Whether the register is the *source* — `PMOVE MRn,<ea>`.
+            from_reg: bool,
+            /// Whether the ATC is left alone (the **FD** bit).
+            no_flush: bool,
+        },
+        /// `PFLUSH`, in one of its three forms.
+        Flush(Flush),
+        /// `PLOAD`, which walks the tree and writes an ATC entry.
+        Load {
+            /// Where the function code comes from.
+            fc: FcSource,
+            /// Whether the walk simulates a read (`PLOADR`) or a write.
+            read: bool,
+        },
+        /// `PTEST`, which walks and reports into `MMUSR`.
+        Test {
+            /// Where the function code comes from.
+            fc: FcSource,
+            /// The highest table level to search; zero searches the ATC.
+            level: u8,
+            /// Whether the walk simulates a read (`PTESTR`) or a write.
+            read: bool,
+            /// The address register the last descriptor's address goes to.
+            areg: Option<u8>,
+        },
+    }
+
+    /// Decode a command word, or `None` for an encoding the 68030 does not
+    /// implement — which is the line-F exception (MC68030UM §9.6).
+    #[must_use]
+    pub const fn decode(word: u16) -> Option<Class> {
+        match word >> 13 {
+            // 000 — the transparent translation registers.
+            0b000 => {
+                if word & 0x00ff != 0 {
+                    return None;
+                }
+                let reg = match (word >> 10) & 7 {
+                    0b010 => PReg::Tt0,
+                    0b011 => PReg::Tt1,
+                    _ => return None,
+                };
+                Some(Class::Move {
+                    reg,
+                    from_reg: word & 0x0200 != 0,
+                    no_flush: word & 0x0100 != 0,
+                })
+            }
+            // 010 — TC and the two root pointers.
+            0b010 => {
+                if word & 0x00ff != 0 {
+                    return None;
+                }
+                let reg = match (word >> 10) & 7 {
+                    0b000 => PReg::Tc,
+                    0b010 => PReg::Srp,
+                    0b011 => PReg::Crp,
+                    _ => return None,
+                };
+                Some(Class::Move {
+                    reg,
+                    from_reg: word & 0x0200 != 0,
+                    no_flush: word & 0x0100 != 0,
+                })
+            }
+            // 011 — the MMU status register.
+            0b011 => {
+                if word & 0x1dff != 0 {
+                    return None;
+                }
+                Some(Class::Move {
+                    reg: PReg::Mmusr,
+                    from_reg: word & 0x0200 != 0,
+                    no_flush: true,
+                })
+            }
+            // 001 — PFLUSH, and PLOAD in the mode field PFLUSH leaves empty.
+            0b001 => {
+                if word & 0x0100 != 0 {
+                    return None;
+                }
+                let mask = ((word >> 5) & 7) as u8;
+                match (word >> 10) & 7 {
+                    // PLOAD is the only form in this class that uses bit 9,
+                    // which is its read/write flag rather than part of a
+                    // mode (M68000PRM §6, *PLOAD*).
+                    0b000 => {
+                        if mask != 0 {
+                            return None;
+                        }
+                        match FcSource::decode(word) {
+                            Some(fc) => Some(Class::Load {
+                                fc,
+                                read: word & 0x0200 != 0,
+                            }),
+                            None => None,
+                        }
+                    }
+                    0b001 => {
+                        if word & 0x02ff != 0 {
+                            return None;
+                        }
+                        Some(Class::Flush(Flush::All))
+                    }
+                    0b100 => {
+                        if word & 0x0200 != 0 {
+                            return None;
+                        }
+                        match FcSource::decode(word) {
+                            Some(fc) => Some(Class::Flush(Flush::ByFc(fc, mask))),
+                            None => None,
+                        }
+                    }
+                    0b110 => {
+                        if word & 0x0200 != 0 {
+                            return None;
+                        }
+                        match FcSource::decode(word) {
+                            Some(fc) => Some(Class::Flush(Flush::ByFcAndAddress(fc, mask))),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            // 100 — PTEST, or PLOAD when the level field is zero and the
+            // low bits mark it.
+            0b100 => {
+                let level = ((word >> 10) & 7) as u8;
+                let read = word & 0x0200 != 0;
+                let areg_bit = word & 0x0100 != 0;
+                let areg = ((word >> 5) & 7) as u8;
+                if !areg_bit && areg != 0 {
+                    return None;
+                }
+                if level == 0 && areg_bit {
+                    // "The instruction takes an F-line exception when the
+                    // level field is 0 and the A field is not 0"
+                    // (M68000PRM §6, *PTEST*).
+                    return None;
+                }
+                match FcSource::decode(word) {
+                    Some(fc) => Some(Class::Test {
+                        fc,
+                        level,
+                        read,
+                        areg: if areg_bit { Some(areg) } else { None },
+                    }),
+                    None => None,
+                }
+            }
+            // 101, 110 and 111 are the 68851's — PVALID, PSAVE and the
+            // access-level instructions — and are not implemented by a 68030.
+            _ => None,
+        }
+    }
+
+    /// The mnemonic a command word names, for the disassembler.
+    #[must_use]
+    pub const fn mnemonic(word: u16) -> &'static str {
+        match decode(word) {
+            Some(Class::Move { .. }) => "PMOVE",
+            Some(Class::Flush(Flush::All)) => "PFLUSHA",
+            Some(Class::Flush(_)) => "PFLUSH",
+            Some(Class::Load { read, .. }) => {
+                if read {
+                    "PLOADR"
+                } else {
+                    "PLOADW"
+                }
+            }
+            Some(Class::Test { read, .. }) => {
+                if read {
+                    "PTESTR"
+                } else {
+                    "PTESTW"
+                }
+            }
+            None => "P???",
+        }
+    }
+}
+
 /// `MOVEC`'s control-register codes (M68000PRM, *MOVEC*).
 pub mod ctrl {
     /// Source function code.
@@ -1662,10 +2092,20 @@ mod tests {
         // the 68000's in particular is the number it was before the table
         // learned about any other processor.
         let mut reached: alloc::vec::Vec<Op> = alloc::vec::Vec::new();
-        for (model, expected) in [
-            (Model::M68000, 45_815usize),
-            (Model::M68010, 46_002),
-            (Model::M68020, 47_419),
+        for (model, expected, f_line) in [
+            (Model::M68000, 45_815usize, 0x1000usize),
+            (Model::M68010, 46_002, 0x1000),
+            (Model::M68020, 47_419, 0x1000),
+            // The 68030 is the 68020 less `CALLM` and `RTM`, which it does
+            // not implement — sixteen `RTM` encodings and twenty-eight legal
+            // `CALLM` ones (MC68030UM §12.1.3) — plus the sixty-one F-line
+            // words on coprocessor id 0 its memory management unit answers.
+            // Sixty-four encodings share that opcode and none of them is
+            // line F any more; the three whose effective-address field names
+            // no mode at all are illegal, and the rest are sorted out by
+            // their command word.
+            (Model::M68030, 47_436, 0x1000 - 64),
+            (Model::M68EC030, 47_436, 0x1000 - 64),
         ] {
             let mut legal = 0usize;
             let mut line_a = 0usize;
@@ -1684,7 +2124,7 @@ mod tests {
                 }
             }
             assert_eq!(line_a, 0x1000, "{model}: the whole $A line traps");
-            assert_eq!(line_f, 0x1000, "{model}: and the whole $F line");
+            assert_eq!(line_f, f_line, "{model}: the $F line");
             assert_eq!(legal, expected, "{model}");
         }
         // Every operation in the table is reachable from some encoding on
@@ -1708,6 +2148,53 @@ mod tests {
             assert_eq!(
                 decode_for(Model::M68020, opcode),
                 decode_for(Model::M68EC020, opcode),
+                "{opcode:04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_68030_is_the_68020_without_callm_and_rtm() {
+        // MC68030UM §12.1.3: "the MC68030 does not support the CALLM and RTM
+        // instructions of the MC68020. If code is executed on the MC68030
+        // using either ... an unimplemented instruction exception is taken."
+        // Everything else in the map is identical — the MMU instructions live
+        // in the F line, which the 68020 leaves to a coprocessor.
+        for opcode in 0..=u16::MAX {
+            let twenty = decode_for(Model::M68020, opcode);
+            let thirty = decode_for(Model::M68030, opcode);
+            if matches!(twenty.op, Op::Callm | Op::Rtm) {
+                assert_eq!(thirty.op, Op::Illegal, "{opcode:04x}");
+                continue;
+            }
+            if opcode & 0xffc0 == 0xf000 {
+                // The one thing the 68030 adds: coprocessor id 0's general
+                // instruction class, which the 68020 leaves to an MC68851 it
+                // has no way of knowing is there. The three encodings whose
+                // effective-address field names no mode are illegal rather
+                // than line F, because the row matched and its operand did
+                // not.
+                assert_eq!(twenty.op, Op::LineF, "{opcode:04x}");
+                assert!(
+                    matches!(thirty.op, Op::Pgen | Op::Illegal),
+                    "{opcode:04x} is {:?}",
+                    thirty.op
+                );
+                continue;
+            }
+            assert_eq!(twenty, thirty, "{opcode:04x}");
+        }
+    }
+
+    #[test]
+    fn the_68ec030_decodes_exactly_as_the_68030_does_outside_the_mmu() {
+        // The two parts share an instruction set; what the MC68EC030 lacks is
+        // the paged MMU itself, which shows up in the command word of an
+        // F-line instruction rather than in the opcode map (MC68EC030UM §9.4).
+        for opcode in 0..=u16::MAX {
+            assert_eq!(
+                decode_for(Model::M68030, opcode),
+                decode_for(Model::M68EC030, opcode),
                 "{opcode:04x}"
             );
         }

@@ -76,6 +76,40 @@
 //! what every region this framework maps accepts — and are not what its time
 //! is built from.
 //!
+//! # The 68030
+//!
+//! The 68020 with the differences MC68030UM records, in both packages:
+//!
+//! - **`CALLM` and `RTM` are gone.** A 68030 takes an unimplemented
+//!   instruction exception on either (MC68030UM §12.1.3), which for their
+//!   line-0 encodings is vector 4. Nothing else was removed, and nothing
+//!   outside the F line was added.
+//! - **32 address pins on both parts.** The MC68EC030 drops the MMU, not the
+//!   address bus (MC68EC030UM §1), so unlike the 68EC020 it is *not* a 24-bit
+//!   machine.
+//! - **`CACR` grew a data cache.** **EI**, **FI**, **IBE**, **ED**, **FD**,
+//!   **DBE** and **WA** have storage; the four clear bits — **CEI**, **CI**,
+//!   **CED** and **CD** — act on contents and read back as zero (MC68030UM
+//!   §6.3.1, Figure 6-14). As on the 68020 the caches themselves are state
+//!   only: every access goes to memory and nothing here is a cache hit.
+//! - **The stack frames and the special status word are the 68020's**, format
+//!   for format and bit for bit (MC68030UM §8.2.1 and Table 8-6), so bus and
+//!   address faults behave exactly as they do on a 68020 — including this
+//!   core's restart-instead-of-continue reading of `RTE`.
+//! - **The paged memory management unit**, on the full 68030 only —
+//!   `PMOVE`, `PTEST`, `PLOAD` and `PFLUSH`, the translation tree, the
+//!   twenty-two-entry address translation cache and the two transparent
+//!   translation registers. `mmu.rs` is the whole of it and says where each
+//!   piece comes from. An MC68EC030 keeps `TT0`, `TT1` and `MMUSR` under
+//!   their other names — `AC0`, `AC1` and `ACUSR` — and takes the line-F
+//!   exception on everything else in that class (MC68EC030UM §9.4).
+//! - Its time is the 68020's table, which is stated as an approximation
+//!   rather than measured — `timing.rs` says exactly how far that goes.
+//!
+//! What a 68030 does **not** have here, beyond the caches above: `CIOUT` and
+//! `MMUDIS` have no pins to drive or be driven, and the burst fills `CACR`'s
+//! **IBE** and **DBE** enable have nothing to fill.
+//!
 //! # What "bus-accurate" means here
 //!
 //! A 68000 bus cycle is four clocks, and every published instruction time is a
@@ -198,6 +232,7 @@
 //! | [`disasm`] | the disassembler generated from that description |
 //! | `exec` (private) | the interpreter, the prefetch queue and exception processing |
 //! | `timing` (private) | the 68020's cache-case instruction times |
+//! | `mmu` (private) | the 68030's translation tree, cache and registers |
 //!
 //! # Sources
 //!
@@ -206,13 +241,17 @@
 //! set, encodings and condition codes; the *M68000 8-/16-/32-Bit
 //! Microprocessors User's Manual* (MC68000UM) for the 68000's and the 68010's
 //! exception processing, stack frames, signals and timing tables; and the
-//! *MC68020 User's Manual* (MC68020UM) for the 68020's. All are listed in
-//! `docs/cpu/m68k.md`. No copyleft emulator was consulted, and no emulator
-//! source of any licence was used for the instruction semantics.
+//! *MC68020 User's Manual* (MC68020UM) for the 68020's; and the *MC68030
+//! User's Manual* (MC68030UM) and the *MC68EC030 User's Manual* for the two
+//! 68030 packages, Section 9 of each being the memory management unit and the
+//! access control unit respectively. All are listed in `docs/cpu/m68k.md`. No
+//! copyleft emulator was consulted, and no emulator source of any licence was
+//! used for the instruction semantics.
 
 pub mod disasm;
 mod exec;
 pub mod isa;
+mod mmu;
 mod timing;
 
 #[cfg(test)]
@@ -221,6 +260,8 @@ mod tests;
 mod tests_68010;
 #[cfg(test)]
 mod tests_68020;
+#[cfg(test)]
+mod tests_68030;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).
@@ -253,11 +294,13 @@ use exec::{Bank, Exec, State};
 pub use isa::Model;
 
 /// The values the `model` property accepts, in [`Model::ALL`] order.
-const MODEL_NAMES: [&str; 4] = [
+const MODEL_NAMES: [&str; 6] = [
     Model::M68000.name(),
     Model::M68010.name(),
     Model::M68020.name(),
     Model::M68EC020.name(),
+    Model::M68030.name(),
+    Model::M68EC030.name(),
 ];
 
 /// The 24 address pins.
@@ -364,6 +407,13 @@ pub mod vector {
     pub const AUTOVECTOR_BASE: u8 = 24;
     /// Vectors 32–47: the `TRAP #0`–`TRAP #15` family.
     pub const TRAP_BASE: u8 = 32;
+    /// Vectors 48–54: the floating-point coprocessor's, in the order
+    /// `BSUN`, `INEX`, `DZ`, `UNFL`, `OPERR`, `OVFL`, `SNAN` (MC68030UM
+    /// Table 8-1).
+    pub const FP_BASE: u8 = 48;
+    /// Vector 56: an MMU configuration error — a `PMOVE` that loaded `TC`,
+    /// `CRP` or `SRP` with a value the unit cannot use (MC68030UM §9.7.5.3).
+    pub const MMU_CONFIG: u8 = 56;
 }
 
 /// The architectural register file, as a debugger or a test vector sees it.
@@ -404,6 +454,17 @@ pub struct Regs {
     pub cacr: u32,
     /// The 68020's cache address register.
     pub caar: u32,
+    /// The 68030's translation control register.
+    pub tc: u32,
+    /// The 68030's CPU root pointer, all sixty-four bits.
+    pub crp: u64,
+    /// The 68030's supervisor root pointer.
+    pub srp: u64,
+    /// The 68030's transparent translation registers, `TT0` then `TT1` —
+    /// `AC0` and `AC1` on an MC68EC030.
+    pub tt: [u32; 2],
+    /// The 68030's MMU status register — `ACUSR` on an MC68EC030.
+    pub mmusr: u16,
 }
 
 impl Regs {
@@ -492,6 +553,26 @@ pub enum Reg {
     Cacr,
     /// The 68020's cache address register.
     Caar,
+    /// The 68030's translation control register.
+    Tc,
+    /// Transparent translation register 0 — `AC0` on an MC68EC030.
+    Tt0,
+    /// Transparent translation register 1 — `AC1`.
+    Tt1,
+    /// The MMU status register — `ACUSR` on an MC68EC030.
+    Mmusr,
+    /// The high half of the CPU root pointer: **L/U**, **LIMIT** and **DT**.
+    ///
+    /// Two names for one register because a root pointer is sixty-four bits
+    /// wide and [`Reg`] hands out thirty-two; [`Regs::crp`] is the whole
+    /// thing, and this is what a debugger that works in machine words sees.
+    CrpHi,
+    /// The low half of the CPU root pointer: the table address.
+    CrpLo,
+    /// The high half of the supervisor root pointer.
+    SrpHi,
+    /// The low half of the supervisor root pointer.
+    SrpLo,
 }
 
 impl Reg {
@@ -525,6 +606,15 @@ impl Reg {
     /// The 68020's additions to the 68010's.
     pub const M68020: &'static [Reg] = &[Reg::Msp, Reg::Cacr, Reg::Caar];
 
+    /// The MC68EC030's additions to the 68020's: the access control unit,
+    /// which is the 68030's transparent translation registers under another
+    /// name (MC68EC030UM §9.3).
+    pub const M68EC030: &'static [Reg] = &[Reg::Tt0, Reg::Tt1, Reg::Mmusr];
+
+    /// The full MC68030's additions to those: the paged unit's own
+    /// registers.
+    pub const M68030: &'static [Reg] = &[Reg::Tc, Reg::CrpHi, Reg::CrpLo, Reg::SrpHi, Reg::SrpLo];
+
     /// Every register `model` has, in the order a debugger should list them.
     #[must_use]
     pub fn all_for(model: Model) -> Vec<Reg> {
@@ -535,6 +625,12 @@ impl Reg {
         if model.has_020() {
             out.extend_from_slice(Reg::M68020);
         }
+        if model.has_030() {
+            out.extend_from_slice(Reg::M68EC030);
+        }
+        if model.has_mmu() {
+            out.extend_from_slice(Reg::M68030);
+        }
         out
     }
 
@@ -542,7 +638,7 @@ impl Reg {
     #[must_use]
     pub const fn width(self) -> Width {
         match self {
-            Reg::Sr => Width::U16,
+            Reg::Sr | Reg::Mmusr => Width::U16,
             Reg::Sfc | Reg::Dfc => Width::U8,
             _ => Width::U32,
         }
@@ -564,6 +660,14 @@ impl Reg {
             Reg::Dfc => regs.dfc as u32,
             Reg::Cacr => regs.cacr,
             Reg::Caar => regs.caar,
+            Reg::Tc => regs.tc,
+            Reg::Tt0 => regs.tt[0],
+            Reg::Tt1 => regs.tt[1],
+            Reg::Mmusr => regs.mmusr as u32,
+            Reg::CrpHi => (regs.crp >> 32) as u32,
+            Reg::CrpLo => regs.crp as u32,
+            Reg::SrpHi => (regs.srp >> 32) as u32,
+            Reg::SrpLo => regs.srp as u32,
         }
     }
 
@@ -613,6 +717,14 @@ impl Reg {
             Reg::Dfc => regs.dfc = (value & 7) as u8,
             Reg::Cacr => regs.cacr = value,
             Reg::Caar => regs.caar = value,
+            Reg::Tc => regs.tc = value,
+            Reg::Tt0 => regs.tt[0] = value,
+            Reg::Tt1 => regs.tt[1] = value,
+            Reg::Mmusr => regs.mmusr = value as u16,
+            Reg::CrpHi => regs.crp = (regs.crp & 0xffff_ffff) | ((value as u64) << 32),
+            Reg::CrpLo => regs.crp = (regs.crp & 0xffff_ffff_0000_0000) | value as u64,
+            Reg::SrpHi => regs.srp = (regs.srp & 0xffff_ffff) | ((value as u64) << 32),
+            Reg::SrpLo => regs.srp = (regs.srp & 0xffff_ffff_0000_0000) | value as u64,
         }
     }
 
@@ -638,6 +750,14 @@ impl Reg {
                 "dfc" => Some(Reg::Dfc),
                 "cacr" => Some(Reg::Cacr),
                 "caar" => Some(Reg::Caar),
+                "tc" => Some(Reg::Tc),
+                "tt0" | "ac0" => Some(Reg::Tt0),
+                "tt1" | "ac1" => Some(Reg::Tt1),
+                "mmusr" | "acusr" => Some(Reg::Mmusr),
+                "crph" => Some(Reg::CrpHi),
+                "crpl" => Some(Reg::CrpLo),
+                "srph" => Some(Reg::SrpHi),
+                "srpl" => Some(Reg::SrpLo),
                 _ => None,
             },
         }
@@ -659,6 +779,14 @@ impl fmt::Display for Reg {
             Reg::Dfc => f.write_str("dfc"),
             Reg::Cacr => f.write_str("cacr"),
             Reg::Caar => f.write_str("caar"),
+            Reg::Tc => f.write_str("tc"),
+            Reg::Tt0 => f.write_str("tt0"),
+            Reg::Tt1 => f.write_str("tt1"),
+            Reg::Mmusr => f.write_str("mmusr"),
+            Reg::CrpHi => f.write_str("crph"),
+            Reg::CrpLo => f.write_str("crpl"),
+            Reg::SrpHi => f.write_str("srph"),
+            Reg::SrpLo => f.write_str("srpl"),
         }
     }
 }
@@ -691,6 +819,12 @@ impl Config {
 
     /// An MC68EC020: a 68020 with 24 address pins.
     pub const MC68EC020: Config = Config::MC68000.with_model(Model::M68EC020);
+
+    /// An MC68030.
+    pub const MC68030: Config = Config::MC68000.with_model(Model::M68030);
+
+    /// An MC68EC030: a 68030 with no paged memory management unit.
+    pub const MC68EC030: Config = Config::MC68000.with_model(Model::M68EC030);
 
     /// Same configuration, with a different requester id.
     #[must_use]
@@ -1039,6 +1173,11 @@ impl M68k {
             dfc: state.dfc,
             cacr: state.cacr,
             caar: state.caar,
+            tc: state.mmu.tc,
+            crp: state.mmu.crp,
+            srp: state.mmu.srp,
+            tt: state.mmu.tt,
+            mmusr: state.mmu.mmusr,
         }
     }
 
@@ -1067,10 +1206,32 @@ impl M68k {
             state.dfc = regs.dfc & 7;
         }
         if self.model.has_020() {
-            state.cacr = regs.cacr & 3;
+            state.cacr = regs.cacr & state.cacr_mask();
             state.caar = regs.caar;
         } else {
             state.banks[Bank::Master as usize] = 0;
+        }
+        if self.model.has_030() {
+            // The address translation cache is derived state, so it is never
+            // placed from outside — but it *describes* the registers below,
+            // and an entry made under one mapping would answer wrongly under
+            // another. So a register that actually changes empties it, and a
+            // register file put back unchanged leaves it alone.
+            let changed = state.mmu.tt != regs.tt
+                || (self.model.has_mmu()
+                    && (state.mmu.tc != regs.tc
+                        || state.mmu.crp != regs.crp
+                        || state.mmu.srp != regs.srp));
+            if changed {
+                state.mmu.flush_all();
+            }
+            state.mmu.tt = regs.tt;
+            state.mmu.mmusr = regs.mmusr;
+            if self.model.has_mmu() {
+                state.mmu.tc = regs.tc;
+                state.mmu.crp = regs.crp;
+                state.mmu.srp = regs.srp;
+            }
         }
     }
 
@@ -1319,9 +1480,13 @@ impl M68k {
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.m68k",
     // 2: the chunk gained the scheduler debt, without which a restored core
-    // runs one instruction free.
-    version: 2,
-    summary: "Motorola MC68000/68010/68020 32-bit CPU core, interpreter",
+    //    runs one instruction free.
+    // 3: and the 68030's memory management registers. The address
+    //    translation cache is *not* in it — it is derived state, and a
+    //    restored core rebuilds it with a table search (CLAUDE.md,
+    //    *Devices*).
+    version: 3,
+    summary: "Motorola MC68000/68010/68020/68030 32-bit CPU core, interpreter",
     properties: &[
         PropertySpec {
             name: "requester",
@@ -1339,7 +1504,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "model",
             kind: ValueKind::Str,
             required: false,
-            summary: "which processor: `68000` (the default), `68010`, `68020` or `68ec020`",
+            summary: "which processor: `68000` (the default), `68010`, `68020`, \
+`68ec020`, `68030` or `68ec030`",
         },
     ],
     construct: |props| Ok(Box::new(M68k::from_props(props)?)),
@@ -1529,6 +1695,19 @@ impl Device for M68k {
             w.write_bool(slot.is_some())?;
             w.write_u32(slot.unwrap_or(0))?;
         }
+        if !self.model.has_030() {
+            return Ok(());
+        }
+        // Both 68030 packages have the transparent translation registers and
+        // the status register; only the full part has the paged unit's.
+        w.write_u32(state.mmu.tt[0])?;
+        w.write_u32(state.mmu.tt[1])?;
+        w.write_u16(state.mmu.mmusr)?;
+        if self.model.has_mmu() {
+            w.write_u32(state.mmu.tc)?;
+            w.write_u64(state.mmu.crp)?;
+            w.write_u64(state.mmu.srp)?;
+        }
         Ok(())
     }
 
@@ -1596,7 +1775,7 @@ impl Device for M68k {
             state.vbr = r.read_u32()?;
             state.sfc = r.read_u8()? & 7;
             state.dfc = r.read_u8()? & 7;
-            state.cacr = r.read_u32()? & 3;
+            state.cacr = r.read_u32()? & state.cacr_mask();
             state.caar = r.read_u32()?;
             let has_replay = r.read_bool()?;
             let replay = exec::Replay {
@@ -1610,6 +1789,16 @@ impl Device for M68k {
                 let poisoned = r.read_bool()?;
                 let addr = r.read_u32()?;
                 *slot = poisoned.then_some(addr);
+            }
+        }
+        if self.model.has_030() {
+            state.mmu.tt[0] = r.read_u32()?;
+            state.mmu.tt[1] = r.read_u32()?;
+            state.mmu.mmusr = r.read_u16()?;
+            if self.model.has_mmu() {
+                state.mmu.tc = r.read_u32()?;
+                state.mmu.crp = r.read_u64()?;
+                state.mmu.srp = r.read_u64()?;
             }
         }
         self.session.lock().state = state;
@@ -1858,7 +2047,10 @@ pub fn describe_isa() -> String {
         let models = match insn.models {
             m if m == isa::Models::ALL => "all   ",
             m if m == isa::Models::FROM_010 => "010+  ",
+            m if m == isa::Models::FROM_020 => "020+  ",
+            m if m == isa::Models::FROM_030 => "030+  ",
             m if m == isa::Models::M68020 => "020   ",
+            m if m == isa::Models::M68030 => "030   ",
             m if m == isa::Models::UNTIL_010 => "000010",
             _ => "000   ",
         };

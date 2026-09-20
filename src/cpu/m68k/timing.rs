@@ -1,5 +1,16 @@
 //! The 68020's instruction times, from the tables in MC68020UM Section 8.
 //!
+//! # And the 68030's, which are not its own
+//!
+//! The 68030 runs through this table too, and that is an approximation stated
+//! as one. MC68030UM §11 gives the 68030 its own cache-case column, and it is
+//! not the 68020's: the 68030 has a data cache and a wider internal bus, so a
+//! `MOVE.L (An),(An)` that costs the 68020 ten clocks costs a 68030 fewer.
+//! Charging the 68020's numbers keeps every instruction's *relative* cost and
+//! overstates the absolute one; what it cannot do is claim to be measured.
+//! A 68030 column belongs here, and until it is here the deviation is in the
+//! conformance ledger rather than hidden.
+//!
 //! # Which column, and why
 //!
 //! The manual gives three times for everything (MC68020UM §8.2): *best case*,
@@ -574,6 +585,12 @@ pub(super) fn instruction(insn: Insn, opcode: u16, size: Size, f: &Facts) -> u32
         }
         Op::Callm => 30 + fetch_imm(src, false),
         Op::Rtm => 19,
+        // The memory management instructions. MC68030UM §11 tables them;
+        // this charges the effective-address calculation the operand needs
+        // plus eight clocks for the unit itself, and a table search's own
+        // bus cycles are added where they happen (`Exec::search_cycles`).
+        // Recorded in the conformance ledger as the approximation it is.
+        Op::Pgen => calc(f.eas[0] as usize) + 8,
         Op::Trapcc => match opcode & 7 {
             2 => 6,
             3 => 8,

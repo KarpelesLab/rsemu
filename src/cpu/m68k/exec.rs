@@ -61,10 +61,12 @@
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
+use super::isa::pmmu;
 use super::isa::{
-    Arg, Cond, FieldSpec, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl, decode_for, ea_of,
-    is_full_format,
+    Arg, Cond, EaSet, FieldSpec, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl, decode_for,
+    ea_of, is_full_format,
 };
+use super::mmu::{self, Entry, Mmu, mmusr, tc, tt};
 use super::timing;
 use super::{Config, Lines, flags, vector};
 
@@ -154,6 +156,12 @@ pub(super) struct State {
     /// The vector of the most recent exception taken, for tests that need to
     /// know *which* exception a step ended in. Never saved.
     pub last_vector: Option<u8>,
+    /// The 68030's memory management unit: six registers and a cache.
+    ///
+    /// Present on every model, because [`State`] is one type; a part without
+    /// an MMU never reaches it, and nothing can write its registers because
+    /// the instructions that do are not in that model's opcode map.
+    pub mmu: Mmu,
 }
 
 /// The three stack-pointer banks.
@@ -218,6 +226,7 @@ impl State {
             replay: None,
             poison: [None, None],
             last_vector: None,
+            mmu: Mmu::RESET,
         }
     }
 
@@ -280,6 +289,18 @@ impl State {
     #[inline]
     pub(super) const fn sr_mask(&self) -> u16 {
         flags::implemented(self.model)
+    }
+
+    /// The `CACR` bits this model has storage for.
+    #[inline]
+    pub(super) const fn cacr_mask(&self) -> u32 {
+        if self.model.has_030() {
+            CACR_STORED_030
+        } else if self.model.has_020() {
+            CACR_STORED_020
+        } else {
+            0
+        }
     }
 
     /// Write the status register, swapping stack pointers if **S** or **M**
@@ -521,6 +542,11 @@ pub(super) struct Exec<'a> {
     deferred_postincrement: Option<(u8, u32)>,
     /// Internal cycles the next exception spends before it pushes anything.
     prologue: u32,
+    /// Whether address translation is switched on: a part with the paged
+    /// MMU, and `TC`'s **E** bit set. Recomputed whenever a `PMOVE` changes
+    /// it; a transparent block needs no check here, because with translation
+    /// off every address is already its own.
+    mmu_on: bool,
     /// Slides an instruction deferred past its operand write.
     ///
     /// `MOVE <ea>,(xxx).L` performs its write *before* the last instruction
@@ -539,6 +565,7 @@ impl<'a> Exec<'a> {
         lines: &'a Lines,
     ) -> Exec<'a> {
         let model = state.model;
+        let state_enables_mmu = state.mmu.enabled();
         Exec {
             state,
             space,
@@ -558,6 +585,7 @@ impl<'a> Exec<'a> {
             prologue: 4,
             source_was_memory: false,
             deferred_postincrement: None,
+            mmu_on: model.has_mmu() && state_enables_mmu,
             deferred_slides: 0,
         }
     }
@@ -665,6 +693,160 @@ impl<'a> Exec<'a> {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Address translation
+    // ------------------------------------------------------------------
+
+    /// The physical address an access reaches, or `Err` when the memory
+    /// management unit refuses it.
+    ///
+    /// Called from the four leaf accesses — a byte and a word in each
+    /// direction — because everything wider is built out of those, and the
+    /// 68030 translates each bus cycle rather than each operand. On any other
+    /// model, and on a 68030 with `TC`'s **E** bit clear, this is the
+    /// identity and costs one predictable branch.
+    #[inline]
+    fn bus_addr(&mut self, addr: u32, fc: u8, write: bool) -> Result<u64, ()> {
+        if !self.mmu_on {
+            return Ok(u64::from(addr & self.mask));
+        }
+        self.translate(addr, fc, write)
+            .map(|pa| u64::from(pa & self.mask))
+    }
+
+    /// Translate one logical address (MC68030UM Figure 9-8).
+    fn translate(&mut self, la: u32, fc: u8, write: bool) -> Result<u32, ()> {
+        // A transparently translated block is used as a physical address
+        // "without modification and without protection checking" (§9.3), and
+        // the TTx registers work whatever the E bit says.
+        if self.state.mmu.transparent(la, fc, write).is_some() {
+            return Ok(la);
+        }
+        let mut entry = match self.state.mmu.lookup(la, fc) {
+            Some(entry) => entry,
+            None => {
+                // "When a table search is required, the CPU suspends
+                // instruction execution activity and, at the end of a
+                // successful table search, stores the address mapping in the
+                // ATC and retries the access" (§9.5.2).
+                let found = self.walk(la, fc, write, 7);
+                self.state.mmu.install(found.entry);
+                found.entry
+            }
+        };
+        if entry.data & Entry::BERR != 0 {
+            return Err(());
+        }
+        if write && entry.data & Entry::WP != 0 {
+            return Err(());
+        }
+        if write && entry.data & Entry::M == 0 {
+            // The first write to a page a read brought in: "the MC68030
+            // aborts the access and initiates a table search, setting the M
+            // bit in the page descriptor, invalidating the old ATC entry, and
+            // creating a new entry with the M bit set" (§9.4, **M**).
+            let found = self.walk(la, fc, true, 7);
+            self.state.mmu.install(found.entry);
+            entry = found.entry;
+            if entry.data & (Entry::BERR | Entry::WP) != 0 {
+                return Err(());
+            }
+        }
+        Ok(self.state.mmu.physical(entry, la))
+    }
+
+    /// Run one table search, driving the real bus for every descriptor.
+    ///
+    /// The registers are copied out first so the search cannot see the entry
+    /// it is about to create, and so the closure below is free to borrow the
+    /// whole core.
+    fn walk(&mut self, la: u32, fc: u8, write: bool, levels: u8) -> mmu::Found {
+        let registers = self.state.mmu;
+        let mut bus = |at: u32, value: Option<u32>| -> Option<u32> {
+            match value {
+                None => self.phys_read_long(at),
+                Some(word) => self.phys_write_long(at, word).then_some(0),
+            }
+        };
+        mmu::search(&registers, la, fc, write, levels, &mut bus)
+    }
+
+    /// Charge a table search's bus cycles.
+    ///
+    /// They are real cycles on a real bus, so they are charged like any
+    /// other — and on a model whose time comes from `timing.rs` they are
+    /// *added* to the table entry rather than replaced by it, because the
+    /// 68020 tables this core borrows have no table search in them.
+    fn search_cycles(&mut self, cycles: u32) {
+        self.internal(cycles);
+        if self.model.has_020() {
+            self.table = self.table.saturating_add(cycles);
+        }
+    }
+
+    /// One word read at a physical address, for a descriptor fetch.
+    ///
+    /// Straight to the space: a table search is already physical, and
+    /// translating it would be a loop. `MemAttrs` carries no function code,
+    /// so the only thing it can say about a search is that the MMU made it,
+    /// which is a supervisor access.
+    fn phys_read_word(&mut self, at: u32) -> Option<u16> {
+        self.search_cycles(4);
+        let attrs = MemAttrs::DEFAULT
+            .with_requester(self.cfg.requester)
+            .with_privileged(true);
+        match self
+            .space
+            .read(u64::from(at & self.mask), Width::U16, attrs)
+        {
+            Ok(value) => Some(value as u16),
+            Err(_) => {
+                self.state.faults = self.state.faults.wrapping_add(1);
+                self.state.last_fault = at;
+                None
+            }
+        }
+    }
+
+    /// One word write at a physical address, for a history-bit update.
+    fn phys_write_word(&mut self, at: u32, value: u16) -> bool {
+        self.search_cycles(4);
+        let attrs = MemAttrs::DEFAULT
+            .with_requester(self.cfg.requester)
+            .with_privileged(true);
+        match self.space.write(
+            u64::from(at & self.mask),
+            Width::U16,
+            u64::from(value),
+            attrs,
+        ) {
+            Ok(()) => true,
+            Err(_) => {
+                self.state.faults = self.state.faults.wrapping_add(1);
+                self.state.last_fault = at;
+                false
+            }
+        }
+    }
+
+    /// One long read at a physical address: two word cycles, high word
+    /// first, as every other long access on this bus is.
+    fn phys_read_long(&mut self, at: u32) -> Option<u32> {
+        let hi = self.phys_read_word(at)?;
+        let lo = self.phys_read_word(at.wrapping_add(2))?;
+        Some((u32::from(hi) << 16) | u32::from(lo))
+    }
+
+    /// One long write at a physical address.
+    fn phys_write_long(&mut self, at: u32, value: u32) -> bool {
+        self.phys_write_word(at, (value >> 16) as u16)
+            && self.phys_write_word(at.wrapping_add(2), value as u16)
+    }
+
+    // ------------------------------------------------------------------
+    // Memory accesses
+    // ------------------------------------------------------------------
+
     /// One byte read. Byte accesses have no alignment rule.
     fn read_byte(&mut self, addr: u32) -> Result<u8, Trap> {
         if self.state.replay.is_some()
@@ -672,12 +854,12 @@ impl<'a> Exec<'a> {
         {
             return Ok(data as u8);
         }
-        self.internal(4);
         let fc = self.data_fc();
-        match self
-            .space
-            .read(u64::from(addr & self.mask), Width::U8, self.attrs())
-        {
+        let Ok(at) = self.bus_addr(addr, fc, false) else {
+            return Err(self.bus_fault(addr, true, fc, 1, 0));
+        };
+        self.internal(4);
+        match self.space.read(at, Width::U8, self.attrs()) {
             Ok(v) => Ok(v as u8),
             Err(_) => Err(self.bus_fault(addr, true, fc, 1, 0)),
         }
@@ -723,11 +905,11 @@ impl<'a> Exec<'a> {
             let lo = self.read_byte(addr.wrapping_add(1))?;
             return Ok((u16::from(hi) << 8) | u16::from(lo));
         }
+        let Ok(at) = self.bus_addr(addr, fc, false) else {
+            return Err(self.bus_fault(addr, true, fc, 2, 0));
+        };
         self.internal(4);
-        match self
-            .space
-            .read(u64::from(addr & self.mask), Width::U16, self.attrs())
-        {
+        match self.space.read(at, Width::U16, self.attrs()) {
             Ok(v) => Ok(v as u16),
             Err(_) => Err(self.bus_fault(addr, true, fc, 2, 0)),
         }
@@ -756,14 +938,15 @@ impl<'a> Exec<'a> {
         if self.state.replay.is_some() && self.replayed(addr, false, 1).is_some() {
             return Ok(());
         }
-        self.internal(4);
         let fc = self.data_fc();
-        match self.space.write(
-            u64::from(addr & self.mask),
-            Width::U8,
-            u64::from(value),
-            self.attrs(),
-        ) {
+        let Ok(at) = self.bus_addr(addr, fc, true) else {
+            return Err(self.bus_fault(addr, false, fc, 1, u32::from(value)));
+        };
+        self.internal(4);
+        match self
+            .space
+            .write(at, Width::U8, u64::from(value), self.attrs())
+        {
             Ok(()) => Ok(()),
             Err(_) => Err(self.bus_fault(addr, false, fc, 1, u32::from(value))),
         }
@@ -789,13 +972,14 @@ impl<'a> Exec<'a> {
             self.write_byte(addr, (value >> 8) as u8)?;
             return self.write_byte(addr.wrapping_add(1), value as u8);
         }
+        let Ok(at) = self.bus_addr(addr, fc, true) else {
+            return Err(self.bus_fault(addr, false, fc, 2, u32::from(value)));
+        };
         self.internal(4);
-        match self.space.write(
-            u64::from(addr & self.mask),
-            Width::U16,
-            u64::from(value),
-            self.attrs(),
-        ) {
+        match self
+            .space
+            .write(at, Width::U16, u64::from(value), self.attrs())
+        {
             Ok(()) => Ok(()),
             Err(_) => Err(self.bus_fault(addr, false, fc, 2, u32::from(value))),
         }
@@ -1019,6 +1203,12 @@ impl<'a> Exec<'a> {
         self.state.vbr = 0;
         self.state.cacr = 0;
         self.state.replay = None;
+        // "The assertion of RESET disables translations by clearing the E
+        // bits of the TC and TTx registers, but it does not flush the ATC"
+        // (MC68030UM §9.2.2) — which is why an operating system has to flush
+        // it itself before turning translation back on.
+        self.state.mmu.reset_pin();
+        self.mmu_on = false;
         self.internal(4);
         let outcome = (|| -> Result<(), Trap> {
             let ssp = self.read_long(0)?;
@@ -1829,6 +2019,7 @@ impl<'a> Exec<'a> {
             Op::Pack => self.op_pack(),
             Op::Unpk => self.op_unpk(),
             Op::Trapcc => self.op_trapcc(),
+            Op::Pgen => self.op_pgen(),
         }
     }
 
@@ -3460,7 +3651,7 @@ impl<'a> Exec<'a> {
                 // Only E and F have storage. C and CE act on the cache's
                 // contents, which are not modelled, and read as zero
                 // (MC68020UM §4.3.1).
-                ctrl::CACR => self.state.cacr = value & CACR_STORED,
+                ctrl::CACR => self.state.cacr = value & self.state.cacr_mask(),
                 ctrl::CAAR => self.state.caar = value,
                 ctrl::MSP => self.state.set_sp(Bank::Master, value),
                 _ => self.state.set_sp(Bank::Interrupt, value),
@@ -3484,6 +3675,248 @@ impl<'a> Exec<'a> {
             self.internal(4);
         }
         self.settle()
+    }
+
+    // ------------------------------------------------------------------
+    // The memory management instructions
+    // ------------------------------------------------------------------
+
+    /// The logical address an MMU instruction names.
+    ///
+    /// "Only control-alterable addressing modes are allowed for MMU
+    /// instructions on the MC68030" (MC68030UM §12.1.3), and the address is
+    /// the one the mode *computes* rather than the operand at it — which is
+    /// why `PFLUSH (SP)` flushes the stack's own page and the manual tells
+    /// you to write `PFLUSH [(SP)]` when you meant the address on it.
+    fn pmmu_address(&mut self) -> Result<u32, Trap> {
+        match ea_of(Arg::Ea, self.opcode) {
+            Some((mode, _)) if EaSet::CONTROL_ALT.contains(mode) => {}
+            _ => return Err(Trap::at(vector::LINE_F, self.pc0)),
+        }
+        match self.resolve_control(Arg::Ea, ExtraCycles::Operand)? {
+            Loc::Mem(addr) => Ok(addr),
+            _ => Err(Trap::at(vector::LINE_F, self.pc0)),
+        }
+    }
+
+    /// Resolve a function-code operand (M68000PRM §6, *PFLUSH*'s **FC**
+    /// field).
+    fn pmmu_fc(&self, source: pmmu::FcSource) -> u8 {
+        match source {
+            pmmu::FcSource::Immediate(fc) => fc & 7,
+            pmmu::FcSource::DataReg(n) => (self.state.d[(n & 7) as usize] & 7) as u8,
+            pmmu::FcSource::Sfc => self.state.sfc & 7,
+            pmmu::FcSource::Dfc => self.state.dfc & 7,
+        }
+    }
+
+    /// `PMOVE`, `PTEST`, `PLOAD` and `PFLUSH`, told apart by the command word
+    /// (M68000PRM §6; MC68030UM §9.7).
+    fn op_pgen(&mut self) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let line_f = Trap::at(vector::LINE_F, pc0);
+        let command = self.ext(0)?;
+        let Some(class) = pmmu::decode(command) else {
+            return Err(line_f);
+        };
+        // An MC68EC030 has the two transparent translation registers and the
+        // status register and nothing else; everything the paged unit adds is
+        // an unimplemented F-line instruction there (MC68EC030UM §9.4).
+        let paged = self.model.has_mmu();
+        match class {
+            pmmu::Class::Move {
+                reg,
+                from_reg,
+                no_flush,
+            } => {
+                if reg.needs_mmu() && !paged {
+                    return Err(line_f);
+                }
+                self.op_pmove(reg, from_reg, no_flush, pc0)
+            }
+            pmmu::Class::Flush(what) => {
+                if !paged {
+                    return Err(line_f);
+                }
+                match what {
+                    pmmu::Flush::All => self.state.mmu.flush_all(),
+                    pmmu::Flush::ByFc(source, mask) => {
+                        let fc = self.pmmu_fc(source);
+                        self.state.mmu.flush_fc(fc, mask);
+                    }
+                    pmmu::Flush::ByFcAndAddress(source, mask) => {
+                        let fc = self.pmmu_fc(source);
+                        let la = self.pmmu_address()?;
+                        self.state.mmu.flush_fc_address(fc, mask, la);
+                    }
+                }
+                self.settle()
+            }
+            pmmu::Class::Load { fc, read } => {
+                if !paged {
+                    return Err(line_f);
+                }
+                let fc = self.pmmu_fc(fc);
+                let la = self.pmmu_address()?;
+                // "PLOAD performs a table search operation ... and loads the
+                // entry into the ATC" — for a read or a write, which decides
+                // whether the search sets the modified bit.
+                let found = self.walk(la, fc, !read, 7);
+                self.state.mmu.install(found.entry);
+                self.settle()
+            }
+            pmmu::Class::Test {
+                fc,
+                level,
+                read,
+                areg,
+            } => {
+                // An MC68EC030's PTEST searches only the access control
+                // registers, so a level above zero has nothing to search.
+                if !paged && level != 0 {
+                    return Err(line_f);
+                }
+                let fc = self.pmmu_fc(fc);
+                let la = self.pmmu_address()?;
+                self.op_ptest(la, fc, level, read, areg);
+                self.settle()
+            }
+        }
+    }
+
+    /// `PMOVE` to or from one memory management register, with the side
+    /// effects §9.7.5.1 and §9.7.5.3 give it.
+    fn op_pmove(
+        &mut self,
+        reg: pmmu::PReg,
+        from_reg: bool,
+        no_flush: bool,
+        pc0: u32,
+    ) -> Result<(), Trap> {
+        let at = self.pmmu_address()?;
+        if from_reg {
+            match reg {
+                pmmu::PReg::Tc => self.write_long(at, self.state.mmu.tc)?,
+                pmmu::PReg::Tt0 => self.write_long(at, self.state.mmu.tt[0])?,
+                pmmu::PReg::Tt1 => self.write_long(at, self.state.mmu.tt[1])?,
+                pmmu::PReg::Mmusr => self.write_word(at, self.state.mmu.mmusr)?,
+                pmmu::PReg::Srp | pmmu::PReg::Crp => {
+                    let value = if reg == pmmu::PReg::Srp {
+                        self.state.mmu.srp
+                    } else {
+                        self.state.mmu.crp
+                    };
+                    self.write_long(at, (value >> 32) as u32)?;
+                    self.write_long(at.wrapping_add(4), value as u32)?;
+                }
+            }
+            return self.settle();
+        }
+        // Into the register. The flush comes first because a new mapping
+        // makes the old entries wrong the instant it lands (§9.7.5.1).
+        let mut misconfigured = false;
+        match reg {
+            pmmu::PReg::Mmusr => {
+                let value = self.read_word(at)?;
+                self.state.mmu.mmusr = value & mmusr::IMPLEMENTED;
+            }
+            pmmu::PReg::Tc => {
+                let value = self.read_long(at)? & tc::IMPLEMENTED;
+                if !no_flush {
+                    self.state.mmu.flush_all();
+                }
+                // "When written with the E bit set ... a consistency check is
+                // performed on the values of PS, IS, and Tlx ... If an MMU
+                // configuration exception occurs, the TC register is updated
+                // with the data, and the E bit is cleared" (§9.7.2).
+                if value & tc::E != 0 && !Mmu::tc_is_consistent(value) {
+                    self.state.mmu.tc = value & !tc::E;
+                    misconfigured = true;
+                } else {
+                    self.state.mmu.tc = value;
+                }
+            }
+            pmmu::PReg::Tt0 | pmmu::PReg::Tt1 => {
+                let value = self.read_long(at)? & tt::IMPLEMENTED;
+                if !no_flush {
+                    self.state.mmu.flush_all();
+                }
+                self.state.mmu.tt[usize::from(reg == pmmu::PReg::Tt1)] = value;
+            }
+            pmmu::PReg::Srp | pmmu::PReg::Crp => {
+                let hi = self.read_long(at)?;
+                let lo = self.read_long(at.wrapping_add(4))?;
+                let value = ((u64::from(hi) << 32) | u64::from(lo)) & ROOT_POINTER_BITS;
+                if !no_flush {
+                    self.state.mmu.flush_all();
+                }
+                if reg == pmmu::PReg::Srp {
+                    self.state.mmu.srp = value;
+                } else {
+                    self.state.mmu.crp = value;
+                }
+                // "A PMOVE instruction that loads either the CRP or the SRP
+                // causes an MMU configuration exception if the new value of
+                // the DT field is zero (invalid). In this case, the register
+                // is loaded with the new value before the exception is taken"
+                // (§9.7.5.3).
+                misconfigured = (hi & 3) == 0;
+            }
+        }
+        self.mmu_on = self.model.has_mmu() && self.state.mmu.enabled();
+        self.settle()?;
+        if misconfigured {
+            // Vector 56, and a format $2 frame carrying the address of the
+            // PMOVE that did it (MC68030UM Table 8-1, Table 8-6).
+            let pc = self.state.pc;
+            return Err(Trap::six(vector::MMU_CONFIG, pc, pc0));
+        }
+        Ok(())
+    }
+
+    /// `PTEST`: report on one logical address through `MMUSR` (Table 9-3).
+    fn op_ptest(&mut self, la: u32, fc: u8, level: u8, read: bool, areg: Option<u8>) {
+        // "This bit is set if a match occurred in either (or both) of the
+        // transparent translation registers. If the T bit is set, all
+        // remaining MMUSR bits are undefined" — and for a level of one to
+        // seven "this bit is set to zero".
+        if level == 0 {
+            if self.state.mmu.transparent(la, fc, !read).is_some() {
+                self.state.mmu.mmusr = mmusr::T;
+                return;
+            }
+            let mut out = 0u16;
+            match self.state.mmu.lookup(la, fc) {
+                None => out |= mmusr::I,
+                Some(entry) => {
+                    if entry.data & Entry::BERR != 0 {
+                        out |= mmusr::B | mmusr::I;
+                    }
+                    if entry.data & Entry::WP != 0 {
+                        out |= mmusr::W;
+                    }
+                    if entry.data & Entry::M != 0 {
+                        out |= mmusr::M;
+                    }
+                }
+            }
+            self.state.mmu.mmusr = out;
+            return;
+        }
+        let found = self.walk(la, fc, !read, level);
+        self.state.mmu.mmusr = found.mmusr();
+        // A table search creates an ATC entry whatever it found (Figure
+        // 9-27), and `PTEST`'s operation is "logical address status → MMU
+        // status register; entry → ATC" (M68000PRM §6). A search the level
+        // field cut short reached no descriptor worth caching.
+        if !found.capped {
+            self.state.mmu.install(found.entry);
+        }
+        if let Some(reg) = areg {
+            // "Return the address of the last descriptor searched in the
+            // address register specified in the register field."
+            self.set_register(8 + u32::from(reg & 7), found.last_descriptor);
+        }
     }
 
     /// `MOVES`: an operand in the address space `SFC` or `DFC` names
@@ -4451,12 +4884,25 @@ const SSW_RB: u16 = 0x1000;
 /// Data fault: rerun the data cycle.
 const SSW_DF: u16 = 0x0100;
 
+/// The bits a root pointer descriptor has storage for: **L/U** (63), the
+/// fifteen-bit **LIMIT** (62–48), **DT** (33–32) and the table address
+/// (31–4). "All other unused bits must always be zeros ... In the root
+/// pointers, these bits are not alterable" (MC68030UM §9.5.1.1).
+const ROOT_POINTER_BITS: u64 = 0xffff_0003_ffff_fff0;
+
 /// The size of a `CALLM` module frame, arguments not included (MC68020UM
 /// Figure 9-12).
 const MODULE_FRAME: u32 = 24;
 
-/// The `CACR` bits with storage: **E** and **F** (MC68020UM Figure 4-2).
-const CACR_STORED: u32 = 0x3;
+/// The 68020's `CACR` bits with storage: **E** and **F** (MC68020UM Figure
+/// 4-2). **C** and **CE** act on contents and always read back as zero.
+const CACR_STORED_020: u32 = 0x0003;
+
+/// The 68030's: it has a data cache as well, so **EI** (0), **FI** (1),
+/// **IBE** (4), **ED** (8), **FD** (9), **DBE** (12) and **WA** (13) have
+/// storage, and the four clear bits — **CEI** (2), **CI** (3), **CED** (10)
+/// and **CD** (11) — do not (MC68030UM §6.3.1, Figure 6-14).
+const CACR_STORED_030: u32 = 0x3313;
 
 /// How many throwaway frames one `RTE` follows before calling the stack
 /// corrupt. See `op_rte_formatted`.

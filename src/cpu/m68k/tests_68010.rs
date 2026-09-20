@@ -29,7 +29,11 @@ impl Board {
     pub(super) fn new(model: Model) -> Board {
         let ram = Arc::new(RamStore::new(0x1_0000));
         let guarded = Arc::new(RamStore::new(0x1000));
-        let bits = if model == Model::M68020 { 32 } else { 24 };
+        let bits = if model.address_mask() == u32::MAX {
+            32
+        } else {
+            24
+        };
         let space = AddressSpace::new("cpu", bits).with_endian(Endian::Big);
         space
             .topology()
@@ -95,6 +99,24 @@ impl Board {
         self.poke_word(u64::from(handler), 0x4e71);
     }
 
+    /// Start executing at `addr`.
+    ///
+    /// The prefetch queue is part of the register file, so moving the program
+    /// counter alone would leave the core about to execute whatever two words
+    /// it last fetched. The queue's invariant is that `prefetch[0]` is the
+    /// word at `pc`, so this places both.
+    pub(super) fn at(&self, addr: u32) {
+        let queue = [
+            self.peek_word(u64::from(addr)),
+            self.peek_word(u64::from(addr) + 2),
+        ];
+        self.with_regs(|r| {
+            r.pc = addr;
+            r.prefetch = queue;
+        });
+        self.cpu.set_reset_pending(false);
+    }
+
     pub(super) fn with_regs(&self, edit: impl FnOnce(&mut Regs)) {
         let mut regs = self.cpu.regs();
         edit(&mut regs);
@@ -111,6 +133,8 @@ fn the_model_property_chooses_the_processor() {
         ("68010", Model::M68010),
         ("68020", Model::M68020),
         ("68ec020", Model::M68EC020),
+        ("68030", Model::M68030),
+        ("68ec030", Model::M68EC030),
     ] {
         let cpu = M68k::from_props(&Props::new().with("model", name)).unwrap();
         assert_eq!(cpu.model(), model);
@@ -121,7 +145,7 @@ fn the_model_property_chooses_the_processor() {
         Model::M68000
     );
     assert!(
-        M68k::from_props(&Props::new().with("model", "68030")).is_err(),
+        M68k::from_props(&Props::new().with("model", "68040")).is_err(),
         "a processor this core does not model is an error, not a 68000"
     );
     // The validator knows the same list.

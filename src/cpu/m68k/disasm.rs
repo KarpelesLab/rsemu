@@ -32,6 +32,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use super::isa::pmmu;
 use super::isa::{
     Arg, Cond, FieldSpec, FullExt, ILLEGAL_OPCODE, Indirect, Insn, Mode, Model, Op, Size, SizeSpec,
     ctrl, decode_for, ea_of, is_full_format,
@@ -323,6 +324,53 @@ impl Disassembled {
                 }
             }
             Op::Extb => write!(f, " D{}", self.opcode & 7),
+            // The memory management instructions carry their whole operand
+            // list in the command word, which `isa::pmmu` decodes once for
+            // the interpreter and for this.
+            Op::Pgen => {
+                let Some(class) = pmmu::decode(word) else {
+                    return Some(write!(f, " ${word:04x}"));
+                };
+                match class {
+                    pmmu::Class::Move { reg, from_reg, .. } => {
+                        let Some(ea) = ea(self) else {
+                            return Some(Ok(()));
+                        };
+                        if from_reg {
+                            write!(f, " {reg},{ea}")
+                        } else {
+                            write!(f, " {ea},{reg}")
+                        }
+                    }
+                    pmmu::Class::Flush(pmmu::Flush::All) => Ok(()),
+                    pmmu::Class::Flush(pmmu::Flush::ByFc(fc, mask)) => {
+                        write!(f, " {fc},#${mask:x}")
+                    }
+                    pmmu::Class::Flush(pmmu::Flush::ByFcAndAddress(fc, mask)) => {
+                        let Some(ea) = ea(self) else {
+                            return Some(Ok(()));
+                        };
+                        write!(f, " {fc},#${mask:x},{ea}")
+                    }
+                    pmmu::Class::Load { fc, .. } => {
+                        let Some(ea) = ea(self) else {
+                            return Some(Ok(()));
+                        };
+                        write!(f, " {fc},{ea}")
+                    }
+                    pmmu::Class::Test {
+                        fc, level, areg, ..
+                    } => {
+                        let Some(ea) = ea(self) else {
+                            return Some(Ok(()));
+                        };
+                        match areg {
+                            Some(reg) => write!(f, " {fc},{ea},#{level},A{reg}"),
+                            None => write!(f, " {fc},{ea},#{level}"),
+                        }
+                    }
+                }
+            }
             _ => return None,
         };
         Some(result)

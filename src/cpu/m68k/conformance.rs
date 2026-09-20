@@ -109,13 +109,24 @@ use super::{ADDRESS_MASK, Config, M68k, Model, Regs, flags};
 /// vector. See `exec.rs`'s `divu_cycles`.
 ///
 /// This list may only ever shrink.
-pub(super) static LEDGER: &[(&str, &str)] = &[(
-    "STOP",
-    "settles the prefetch queue before stopping, so it costs two bus cycles \
-     and eight clocks where hardware makes those cycles on the way out and \
-     bills four. Deliberate: the alternative leaves the resume address two \
-     bytes inside the instruction. Not in the corpus.",
-)];
+pub(super) static LEDGER: &[(&str, &str)] = &[
+    (
+        "STOP",
+        "settles the prefetch queue before stopping, so it costs two bus cycles \
+         and eight clocks where hardware makes those cycles on the way out and \
+         bills four. Deliberate: the alternative leaves the resume address two \
+         bytes inside the instruction. Not in the corpus.",
+    ),
+    (
+        "68030 instruction time",
+        "every instruction is charged the 68020's cache-case cycle count \
+         (MC68020UM §8.2) rather than the 68030's own (MC68030UM §11), which \
+         is smaller for the operand-heavy rows because the 68030 caches data \
+         and moves a long word in one bus cycle. Relative costs hold; the \
+         absolute number is an overstatement, not a measurement. Not in the \
+         corpus, which is the 68000's.",
+    ),
+];
 
 /// Vectors skipped because the *corpus* is wrong about them.
 ///
@@ -853,16 +864,21 @@ struct Rig {
 impl Rig {
     fn new(model: Model) -> Rig {
         let bus = alloc::sync::Arc::new(Bus::new());
-        let space = AddressSpace::new("cpu", 24)
+        // A part with 32 address pins gets a 32-bit space with the same 16
+        // MiB of memory mirrored through it — `Bus` masks every access to 24
+        // bits — so the high address bits a 68000 never drove land back where
+        // the vector put them. Without the mirror a 68030 would fault on
+        // every `(xxx).L` whose high byte the corpus left set, which is the
+        // address bus talking rather than anything the differential is for.
+        let pins = model.address_mask();
+        let bits = if pins == u32::MAX { 32 } else { 24 };
+        let space = AddressSpace::new("cpu", bits)
             .with_endian(Endian::Big)
             .with_unassigned(UnassignedPolicy::FAULT);
         space
             .topology()
-            .map(
-                Region::io("ram", u64::from(ADDRESS_MASK) + 1, bus.clone()),
-                0,
-            )
-            .expect("16 MiB fits in 24 bits");
+            .map(Region::io("ram", u64::from(pins) + 1, bus.clone()), 0)
+            .expect("the whole address space fits in its own pins");
         let cpu = M68k::new(Config::default().with_model(model));
         cpu.attach_space(alloc::sync::Arc::new(space));
         Rig { bus, cpu }
@@ -1318,7 +1334,8 @@ fn differential_against_the_68000() {
     let Ok(dir) = std::env::var("RSEMU_680X0_DIR") else {
         println!(
             "differential: set RSEMU_680X0_DIR to a decompressed SingleStepTests/680x0 \
-             68000/v1 directory to run the 68000 corpus through the 68010 and 68020."
+             68000/v1 directory to run the 68000 corpus through the 68010, the 68020 \
+             and the 68030."
         );
         return;
     };
@@ -1339,7 +1356,7 @@ fn differential_against_the_68000() {
         .collect();
     names.sort();
     let mut failed = Vec::new();
-    for model in [Model::M68010, Model::M68EC020] {
+    for model in [Model::M68010, Model::M68EC020, Model::M68030] {
         let mut out = Differential::default();
         for name in &names {
             if let Some(only) = &only
