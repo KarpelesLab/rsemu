@@ -862,6 +862,54 @@ fn the_coprocessors_registers_can_be_named() {
 }
 
 #[test]
+fn a_coprocessor_instruction_is_as_long_as_the_disassembler_says() {
+    // The same property the integer sweep asserts: for every encoding that
+    // decodes and runs, the bytes the disassembler claims are the bytes the
+    // program counter moved. It matters more here than anywhere else,
+    // because a floating-point immediate is as wide as its *format* and no
+    // `Size` can name twelve bytes.
+    use super::disasm::disassemble_with;
+    use super::isa::Copro;
+    let b = board(&[0x4e71]);
+    b.with_regs(|r| {
+        r.a[0] = 0x2100;
+        r.a[1] = 0x2200;
+    });
+    let cases: &[&[u16]] = &[
+        &[0xf200, reg_op(1, 0, 0x22)],                   // FADD.X FP1,FP0
+        &[0xf210, mem_op(2, 0, 0x00)],                   // FMOVE.X (A0),FP0
+        &[0xf228, mem_op(5, 0, 0x22), 0x0010],           // FADD.D $10(A0),FP0
+        &[0xf239, mem_op(1, 0, 0x22), 0, 0x2100],        // FADD.S ($2100).L,FP0
+        &[0xf23c, mem_op(6, 0, 0x22), 0x0002],           // FADD.B #2,FP0
+        &[0xf23c, mem_op(0, 0, 0x22), 0, 2],             // FADD.L #2,FP0
+        &[0xf23c, mem_op(5, 0, 0x22), 0, 0, 0, 0],       // FADD.D #..,FP0
+        &[0xf23c, mem_op(2, 0, 0x22), 0, 0, 0, 0, 0, 0], // FADD.X #..,FP0
+        &[0xf200, 0x5c0c],                               // FMOVECR #$c,FP0
+        &[0xf210, 0x6800],                               // FMOVE.X FP0,(A0)
+        &[0xf210, 0x9000],                               // FMOVE.L (A0),FPCR
+        &[0xf211, 0xbc00],                               // FMOVEM.L FPCR/FPSR/FPIAR,(A1)
+        &[0xf210, 0xd0ff],                               // FMOVEM.X (A0),FP0-FP7
+        &[0xf240, 0x0001],                               // FSEQ D0
+        &[0xf281, 0x0002],                               // FBEQ.W
+        &[0xf2c1, 0x0000, 0x0004],                       // FBEQ.L
+        &[0xf249, 0x0001, 0x0002],                       // FDBEQ D1
+        &[0xf27a, 0x0001, 0x1234],                       // FTRAPEQ.W #$1234
+        &[0xf27b, 0x0001, 0x1234, 0x5678],               // FTRAPEQ.L
+        &[0xf27c, 0x0001],                               // FTRAPEQ
+    ];
+    for words in cases {
+        let claimed = disassemble_with(Model::M68030, Copro::FPU, 0x500, words).len;
+        run(&b, words);
+        let moved = b.cpu.regs().pc.wrapping_sub(0x500);
+        assert_eq!(
+            moved,
+            u32::from(claimed),
+            "{words:04x?}: moved {moved}, disassembler said {claimed}"
+        );
+    }
+}
+
+#[test]
 fn the_disassembler_speaks_the_coprocessor() {
     use super::disasm::disassemble_with;
     use super::isa::Copro;
