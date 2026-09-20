@@ -79,7 +79,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::ir::{Block, Cond, Inst, MemOp, MemSpace, Opcode, Sign, Temp, Type, bitfield_parts};
+use crate::ir::{Block, Cond, Inst, MemOp, Opcode, Sign, Temp, Type, bitfield_parts};
 
 use super::abi::{self, LOCAL_CTX, LOCAL_FRAME, LOCAL_TEMPS, func, name, status, temp_offset};
 use super::emit::{Func, FuncType, module, op, ty};
@@ -308,15 +308,16 @@ struct Compiler<'a> {
 impl<'a> Compiler<'a> {
     fn new(block: &'a Block) -> Result<Compiler<'a>, Refusal> {
         let temps = block.temp_count();
-        // Two scratch i64 locals and one i32 on top of the temporaries. The
-        // ceiling is the index space a `u32` local index affords, minus what
-        // this function already spends.
-        let locals = u32::try_from(temps)
+        // One local per temporary, plus two scratch `i64` and one scratch
+        // `i32`, plus the two parameters. A local index is a `u32` (core
+        // specification §5.4.3), so a block that would not fit that index
+        // space is refused rather than wrapped — which is also the only thing
+        // this arithmetic is for, so its result is the count itself.
+        let highest = u32::try_from(temps)
             .ok()
             .and_then(|t| t.checked_add(LOCAL_TEMPS + 3))
             .ok_or(Refusal::TooManyTemps)?;
-        let _ = locals;
-        let temps32 = temps as u32;
+        let temps32 = highest - LOCAL_TEMPS - 3;
 
         // Which temporaries the Rust side must be able to read. A boundary's
         // live map is the whole answer: nothing else can observe a temporary.
@@ -968,11 +969,15 @@ impl<'a> Compiler<'a> {
     }
 
     /// The index of `mem` in the side table, interning equal descriptors.
+    ///
+    /// Every field of the descriptor is carried rather than checked — the
+    /// segment, the byte order, the misalignment policy, the address space —
+    /// because the import hands the whole thing to `IrHost::load` and
+    /// `IrHost::store`, which is the same path the interpreter takes. A
+    /// backend that inlined an access would have to start caring; this one
+    /// does not, which is why an `IO`-space access or a big-endian region
+    /// costs nothing extra here.
     fn mem_slot(&mut self, mem: MemOp) -> i32 {
-        // An address space this backend has no business inlining still goes
-        // through the import, so the space is carried rather than checked —
-        // the host resolves it exactly as it does for the interpreter.
-        let _ = MemSpace::MEM;
         if let Some(i) = self.mems.iter().position(|m| *m == mem) {
             return i as i32;
         }
