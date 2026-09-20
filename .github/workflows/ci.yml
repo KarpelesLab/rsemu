@@ -273,6 +273,17 @@ jobs:
       # (wasm32-wasip1-threads, under wasmer).
       - name: build library
         run: cargo build --target ${{ matrix.target }} --no-default-features --features wasm
+      # The wasm *backend* (ROADMAP.md §11.4) is the one subsystem whose whole
+      # reason to exist is this target, and `wasm` alone does not turn it on —
+      # there is no embedder yet, so the browser build would only be paying for
+      # a reference executor it cannot beat the interpreter with. Built here
+      # anyway, with the frontend that reaches it, because "the wasm backend
+      # stopped compiling for wasm" is exactly the regression nothing else in
+      # the matrix would catch.
+      - name: build the wasm JIT backend for this target
+        run: |
+          cargo build --target ${{ matrix.target }} --no-default-features \
+            --features wasm,jit-wasm,cpu-riscv-lift
       - name: build browser cdylib
         if: matrix.target == 'wasm32-unknown-unknown'
         run: |

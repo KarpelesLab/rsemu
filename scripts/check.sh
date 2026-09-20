@@ -176,6 +176,11 @@ stage_wasm() {
       continue
     fi
     run "wasm $t" cargo build --target "$t" --no-default-features --features wasm
+    # The wasm *backend* (ROADMAP.md §11.4). `wasm` alone does not turn it on —
+    # there is no embedder yet — so without this line the one subsystem whose
+    # reason to exist is this target would never be built for it.
+    run "wasm $t +jit-wasm" cargo build --target "$t" --no-default-features \
+      --features wasm,jit-wasm,cpu-riscv-lift
   done
   # The threaded wasm configuration is a *feature*, not a target: `wasm32-wasip1`
   # and `wasm32-wasip1-threads` are `cfg`-identical on stable, so `core::sync`
