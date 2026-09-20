@@ -4,7 +4,7 @@
 //! Not a side project: gdb's `disassemble`, the monitor's single-step display
 //! and any trace log need it, and CLAUDE.md forbids describing the instruction
 //! set twice. Everything here reads [`isa::TABLE`](super::isa::TABLE) through
-//! [`decode_for`]; there is no second opcode list to keep in step, and the
+//! [`decode_with`]; there is no second opcode list to keep in step, and the
 //! extension words are walked in the order the interpreter consumes them.
 //!
 //! Motorola syntax, which is what every 68000 assembler and every listing in
@@ -32,10 +32,11 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use super::isa::fp;
 use super::isa::pmmu;
 use super::isa::{
-    Arg, Cond, FieldSpec, FullExt, ILLEGAL_OPCODE, Indirect, Insn, Mode, Model, Op, Size, SizeSpec,
-    ctrl, decode_for, ea_of, is_full_format,
+    Arg, Cond, Copro, FieldSpec, FullExt, ILLEGAL_OPCODE, Indirect, Insn, Mode, Model, Op, Size,
+    SizeSpec, ctrl, decode_with, ea_of, is_full_format,
 };
 
 /// The most extension words any instruction can carry.
@@ -55,7 +56,7 @@ pub struct Disassembled {
     pub pc: u32,
     /// The opcode word.
     pub opcode: u16,
-    /// The row [`decode_for`] returned for [`Disassembled::opcode`].
+    /// The row [`decode_with`] returned for [`Disassembled::opcode`].
     pub insn: Insn,
     /// The resolved operand size, if the row has one.
     pub size: Option<Size>,
@@ -112,6 +113,28 @@ impl Disassembled {
         }
     }
 
+    /// The floating-point predicate this instruction tests, if it tests one.
+    #[must_use]
+    pub fn fp_predicate(&self) -> Option<fp::Pred> {
+        match self.insn.op {
+            Op::Fbcc => Some(fp::Pred((self.opcode & 0x3f) as u8)),
+            Op::Fdbcc | Op::Fscc | Op::Ftrapcc => Some(fp::Pred((self.ext[0] & 0x3f) as u8)),
+            _ => None,
+        }
+    }
+
+    /// The external operand format a floating-point instruction names, if it
+    /// has one.
+    #[must_use]
+    pub fn fp_format(&self) -> Option<fp::Fmt> {
+        match fp::decode(self.ext[0])? {
+            fp::Class::MemOp { fmt, .. } | fp::Class::Store { fmt, .. } => Some(fmt),
+            fp::Class::RegOp { .. } | fp::Class::MoveCr { .. } => Some(fp::Fmt::Extended),
+            fp::Class::Control { .. } => Some(fp::Fmt::Long),
+            fp::Class::MoveM { .. } => Some(fp::Fmt::Extended),
+        }
+    }
+
     /// The mnemonic with its condition and size suffixes, as an assembler
     /// would write it.
     #[must_use]
@@ -132,6 +155,27 @@ impl fmt::Display for MnemonicOf<'_> {
             // Bcc with cc = T or F is BRA or BSR, which have their own rows,
             // so a condition printed here is always a real one.
             f.write_str(cond.name())?;
+        }
+        // The floating-point conditionals take one of thirty-two predicates
+        // from their own table, in the opcode for `FBcc` and in the extension
+        // word for the other three (M68000PRM Table 3-23).
+        if let Some(pred) = d.fp_predicate() {
+            match pred.name() {
+                Some(name) => f.write_str(name)?,
+                None => write!(f, "?{:02x}", pred.0)?,
+            }
+            if d.insn.op == Op::Fbcc {
+                return f.write_str(if d.opcode & 0x40 != 0 { ".L" } else { ".W" });
+            }
+            return Ok(());
+        }
+        // A floating-point operand's format is its own suffix, and it is not
+        // one of the three `Size` names.
+        if d.insn.op == Op::Fpgen {
+            if let Some(fmt) = d.fp_format() {
+                write!(f, ".{}", fmt.suffix().to_ascii_uppercase())?;
+            }
+            return Ok(());
         }
         // The size suffix is noise on instructions that have exactly one —
         // but the 68020 gave several of those a second size, and the long
@@ -371,9 +415,133 @@ impl Disassembled {
                     }
                 }
             }
+            Op::Fbcc => {
+                let displacement = if self.opcode & 0x40 != 0 {
+                    (u32::from(self.ext[0]) << 16) | u32::from(self.ext[1])
+                } else {
+                    i32::from(self.ext[0] as i16) as u32
+                };
+                write!(
+                    f,
+                    " ${:x}",
+                    self.pc.wrapping_add(2).wrapping_add(displacement)
+                )
+            }
+            Op::Fdbcc => {
+                let target = self
+                    .pc
+                    .wrapping_add(4)
+                    .wrapping_add(i32::from(self.ext[1] as i16) as u32);
+                write!(f, " D{},${target:x}", self.opcode & 7)
+            }
+            Op::Fscc | Op::Fsave | Op::Frestore => match ea(self) {
+                Some(ea) => write!(f, " {ea}"),
+                None => Ok(()),
+            },
+            Op::Ftrapcc => match self.opcode & 7 {
+                2 => write!(f, " #${:x}", self.ext[1]),
+                3 => write!(
+                    f,
+                    " #${:x}",
+                    (u32::from(self.ext[1]) << 16) | u32::from(self.ext[2])
+                ),
+                _ => Ok(()),
+            },
+            Op::Fpgen => {
+                let Some(class) = fp::decode(word) else {
+                    return Some(write!(f, " ${word:04x}"));
+                };
+                match class {
+                    fp::Class::RegOp { src, dst, op, .. } => {
+                        if op.is_dyadic() || src != dst {
+                            write!(f, " FP{src},FP{dst}")
+                        } else {
+                            write!(f, " FP{dst}")
+                        }
+                    }
+                    fp::Class::MemOp { dst, .. } => match ea(self) {
+                        Some(ea) => write!(f, " {ea},FP{dst}"),
+                        None => Ok(()),
+                    },
+                    fp::Class::MoveCr { offset, dst } => write!(f, " #${offset:x},FP{dst}"),
+                    fp::Class::Store { src, .. } => match ea(self) {
+                        Some(ea) => write!(f, " FP{src},{ea}"),
+                        None => Ok(()),
+                    },
+                    fp::Class::Control { to_fpu, regs } => {
+                        let names = ControlList(regs);
+                        match ea(self) {
+                            Some(ea) if to_fpu => write!(f, " {ea},{names}"),
+                            Some(ea) => write!(f, " {names},{ea}"),
+                            None => Ok(()),
+                        }
+                    }
+                    fp::Class::MoveM { to_fpu, mode, list } => {
+                        let registers = RegisterList(mode, list);
+                        match ea(self) {
+                            Some(ea) if to_fpu => write!(f, " {ea},{registers}"),
+                            Some(ea) => write!(f, " {registers},{ea}"),
+                            None => Ok(()),
+                        }
+                    }
+                }
+            }
             _ => return None,
         };
         Some(result)
+    }
+}
+
+/// The `FPCR`/`FPSR`/`FPIAR` selection of a control-register move.
+struct ControlList(u8);
+
+impl fmt::Display for ControlList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (bit, name) in [
+            (fp::CTRL_FPCR, "FPCR"),
+            (fp::CTRL_FPSR, "FPSR"),
+            (fp::CTRL_FPIAR, "FPIAR"),
+        ] {
+            if self.0 & bit == 0 {
+                continue;
+            }
+            if !first {
+                f.write_str("/")?;
+            }
+            first = false;
+            f.write_str(name)?;
+        }
+        if first { f.write_str("#0") } else { Ok(()) }
+    }
+}
+
+/// An `FMOVEM` register list, printed in register order whichever way the
+/// mask numbers its bits.
+struct RegisterList(fp::ListMode, u8);
+
+impl fmt::Display for RegisterList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.dynamic() {
+            return write!(f, "D{}", self.1 & 7);
+        }
+        let mut first = true;
+        for index in 0..8u8 {
+            let bit = if self.0.predecrement_order() {
+                index
+            } else {
+                7 - index
+            };
+            if self.1 & (1 << bit) == 0 {
+                continue;
+            }
+            if !first {
+                f.write_str("/")?;
+            }
+            first = false;
+            write!(f, "FP{index}")?;
+        }
+        if first { f.write_str("#0") } else { Ok(()) }
     }
 }
 
@@ -821,8 +989,18 @@ pub fn disassemble(pc: u32, words: &[u16]) -> Disassembled {
 /// Disassemble one instruction from a slice of words, for a given processor.
 #[must_use]
 pub fn disassemble_for(model: Model, pc: u32, words: &[u16]) -> Disassembled {
+    disassemble_with(model, Copro::NONE, pc, words)
+}
+
+/// [`disassemble_for`] for a core with a coprocessor attached.
+///
+/// Without one every F-line word is the line-F trap and is printed as such;
+/// with one, coprocessor id 1's encodings are instructions. The listing
+/// follows the machine's configuration for the same reason decode does.
+#[must_use]
+pub fn disassemble_with(model: Model, copro: Copro, pc: u32, words: &[u16]) -> Disassembled {
     let opcode = words.first().copied().unwrap_or(0);
-    let insn = decode_for(model, opcode);
+    let insn = decode_with(model, copro, opcode);
     let size = insn.size.resolve(opcode);
     let word_at = |i: usize| words.get(i + 1).copied().unwrap_or(0);
     let needed = ext_words(model, insn, opcode, size.unwrap_or(Size::Word), word_at);
@@ -860,6 +1038,15 @@ fn ext_words(
     size: Size,
     word_at: impl Fn(usize) -> u16,
 ) -> usize {
+    // A floating-point operand's immediate is as wide as its format, and an
+    // `FBcc` displacement is one word or two by a bit in the opcode; neither
+    // is anything `Size` can name.
+    if insn.op == Op::Fpgen {
+        return fp_ext_words(model, opcode, word_at);
+    }
+    if insn.op == Op::Fbcc {
+        return 1 + usize::from(opcode & 0x40 != 0);
+    }
     let mut count = usize::from(insn.ext);
     let order = if insn.op == Op::Movem && insn.dst == Arg::RegList {
         [insn.dst, insn.src]
@@ -899,6 +1086,32 @@ fn ext_words(
     count.min(MAX_EXT_WORDS)
 }
 
+/// How many words a coprocessor general instruction carries: the command
+/// word, then whatever its effective address needs for an operand of the
+/// format that word names.
+fn fp_ext_words(model: Model, opcode: u16, word_at: impl Fn(usize) -> u16) -> usize {
+    let Some(class) = fp::decode(word_at(0)) else {
+        return 1;
+    };
+    let bytes = match class {
+        fp::Class::MemOp { fmt, .. } | fp::Class::Store { fmt, .. } => fmt.bytes(),
+        fp::Class::Control { regs, .. } => 4 * regs.count_ones().max(1),
+        fp::Class::MoveM { .. } => 12,
+        // Neither of these has an effective address at all.
+        fp::Class::RegOp { .. } | fp::Class::MoveCr { .. } => return 1,
+    };
+    let operand = match ea_of(Arg::Ea, opcode) {
+        Some((Mode::Index8 | Mode::PcIndex8, _)) => {
+            super::isa::index_ext_words(model, word_at(1)).unwrap_or(1) as usize
+        }
+        // A byte immediate still occupies a whole word.
+        Some((Mode::Imm, _)) => (bytes.max(2) / 2) as usize,
+        Some((mode, _)) => mode.ext_words(Size::Long) as usize,
+        None => 0,
+    };
+    (1 + operand).min(MAX_EXT_WORDS)
+}
+
 /// Disassemble `count` instructions starting at `pc`, reading guest memory
 /// through `read_word`, for a 68000.
 ///
@@ -915,6 +1128,17 @@ pub fn disassemble_run(
 /// [`disassemble_run`] for a given processor.
 pub fn disassemble_run_for(
     model: Model,
+    pc: u32,
+    count: usize,
+    read_word: impl FnMut(u32) -> Option<u16>,
+) -> Vec<Disassembled> {
+    disassemble_run_with(model, Copro::NONE, pc, count, read_word)
+}
+
+/// [`disassemble_run_for`] for a core with a coprocessor attached.
+pub fn disassemble_run_with(
+    model: Model,
+    copro: Copro,
     pc: u32,
     count: usize,
     mut read_word: impl FnMut(u32) -> Option<u16>,
@@ -936,7 +1160,7 @@ pub fn disassemble_run_for(
         if have == 0 {
             break;
         }
-        let d = disassemble_for(model, at, &words[..have]);
+        let d = disassemble_with(model, copro, at, &words[..have]);
         at = at.wrapping_add(u32::from(d.len));
         out.push(d);
     }

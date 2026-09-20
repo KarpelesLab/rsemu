@@ -27,6 +27,11 @@ pub(super) struct Board {
 
 impl Board {
     pub(super) fn new(model: Model) -> Board {
+        Board::with_fpu(model, super::Coprocessor::None)
+    }
+
+    /// The same board with a floating-point coprocessor attached.
+    pub(super) fn with_fpu(model: Model, fpu: super::Coprocessor) -> Board {
         let ram = Arc::new(RamStore::new(0x1_0000));
         let guarded = Arc::new(RamStore::new(0x1000));
         let bits = if model.address_mask() == u32::MAX {
@@ -52,7 +57,7 @@ impl Board {
                 0x1_0000,
             )
             .expect("4 KiB fits");
-        let cpu = Arc::new(M68k::new(Config::default().with_model(model)));
+        let cpu = Arc::new(M68k::new(Config::default().with_model(model).with_fpu(fpu)));
         cpu.attach_space(Arc::new(space));
         Board { cpu, ram, guarded }
     }

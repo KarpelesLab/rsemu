@@ -44,6 +44,13 @@ pub struct F80 {
     pub sig: u64,
 }
 
+impl Default for F80 {
+    /// Positive zero, which is what a cleared register holds.
+    fn default() -> F80 {
+        F80::ZERO
+    }
+}
+
 /// The exponent bias (SDM Volume 1, Table 4-3).
 const BIAS: i32 = 16383;
 /// The largest exponent of a finite number.
@@ -364,7 +371,7 @@ fn encode(out: Outcome, env: Env) -> F80 {
 fn binop(
     a: F80,
     b: F80,
-    pc: Precision,
+    spec: Spec,
     env: Env,
     op: fn(Parts, Parts, Spec, Env) -> (Outcome, Flags),
 ) -> (F80, Flags) {
@@ -373,38 +380,102 @@ fn binop(
     let (Some(pa), Some(pb)) = (pa, pb) else {
         return (encode(Outcome::DefaultNan, env), Flags::INVALID | fa | fb);
     };
-    let (out, f) = op(pa, pb, pc.spec(), env);
+    let (out, f) = op(pa, pb, spec, env);
     (encode(out, env), f | fa | fb)
 }
 
 /// `a + b` at the given precision control.
 pub fn add(a: F80, b: F80, pc: Precision, env: Env) -> (F80, Flags) {
-    binop(a, b, pc, env, |x, y, s, e| kernel::add(x, y, false, s, e))
+    add_to(a, b, pc.spec(), env)
 }
 
 /// `a - b`.
 pub fn sub(a: F80, b: F80, pc: Precision, env: Env) -> (F80, Flags) {
-    binop(a, b, pc, env, |x, y, s, e| kernel::add(x, y, true, s, e))
+    sub_to(a, b, pc.spec(), env)
 }
 
 /// `a * b`.
 pub fn mul(a: F80, b: F80, pc: Precision, env: Env) -> (F80, Flags) {
-    binop(a, b, pc, env, kernel::mul)
+    mul_to(a, b, pc.spec(), env)
 }
 
 /// `a / b`.
 pub fn div(a: F80, b: F80, pc: Precision, env: Env) -> (F80, Flags) {
-    binop(a, b, pc, env, kernel::div)
+    div_to(a, b, pc.spec(), env)
 }
 
 /// The square root of `a`.
 pub fn sqrt(a: F80, pc: Precision, env: Env) -> (F80, Flags) {
+    sqrt_to(a, pc.spec(), env)
+}
+
+// ---------------------------------------------------------------------------
+// The same five, rounded to an arbitrary set of format parameters
+// ---------------------------------------------------------------------------
+//
+// x87's precision control shortens the significand and leaves the exponent
+// range alone, which is what [`Precision`] expresses and why `PC = 53` is not
+// binary64. Not every 80-bit unit made that choice: the MC68881's `FPCR`
+// rounding precision shortens *both*, so a single-precision `FMUL` overflows
+// to infinity above `2^128` and underflows below `2^-126` while the result is
+// still stored in the 80-bit format (M68881UM §2.2.2). Expressing that needs
+// the parameters directly rather than through `PC`, so these take a [`Spec`];
+// the five above are these with `pc.spec()`.
+
+/// `a + b`, rounded to `spec`.
+pub fn add_to(a: F80, b: F80, spec: Spec, env: Env) -> (F80, Flags) {
+    binop(a, b, spec, env, |x, y, s, e| kernel::add(x, y, false, s, e))
+}
+
+/// `a - b`, rounded to `spec`.
+pub fn sub_to(a: F80, b: F80, spec: Spec, env: Env) -> (F80, Flags) {
+    binop(a, b, spec, env, |x, y, s, e| kernel::add(x, y, true, s, e))
+}
+
+/// `a * b`, rounded to `spec`.
+pub fn mul_to(a: F80, b: F80, spec: Spec, env: Env) -> (F80, Flags) {
+    binop(a, b, spec, env, kernel::mul)
+}
+
+/// `a / b`, rounded to `spec`.
+pub fn div_to(a: F80, b: F80, spec: Spec, env: Env) -> (F80, Flags) {
+    binop(a, b, spec, env, kernel::div)
+}
+
+/// The square root of `a`, rounded to `spec`.
+pub fn sqrt_to(a: F80, spec: Spec, env: Env) -> (F80, Flags) {
     let (pa, fa) = unpack(a, env);
     let Some(pa) = pa else {
         return (encode(Outcome::DefaultNan, env), Flags::INVALID | fa);
     };
-    let (out, f) = kernel::sqrt(pa, pc.spec(), env);
+    let (out, f) = kernel::sqrt(pa, spec, env);
     (encode(out, env), f | fa)
+}
+
+/// Round a value to `spec`, delivering it in the 80-bit format.
+///
+/// IEEE 754-2019 §5.4.2's `convertFormat` when the destination is this format
+/// at a shortened precision: the significand is rounded once, overflow and
+/// underflow are decided against `spec`'s exponent range, and the result is
+/// then stored in the wider encoding. Nothing else here does that on its own,
+/// because on x87 every path to it goes through an arithmetic operation.
+pub fn round_to(v: F80, spec: Spec, env: Env) -> (F80, Flags) {
+    let (p, fin) = unpack(v, env);
+    let Some(p) = p else {
+        return (encode(Outcome::DefaultNan, env), Flags::INVALID);
+    };
+    match p.class {
+        Class::Nan => {
+            let flags = if p.snan { Flags::INVALID } else { Flags::NONE };
+            (encode(quiet_nan(p, env), env), flags | fin)
+        }
+        Class::Inf => (encode(Outcome::Num(p.sign, Rounded::Inf), env), fin),
+        Class::Zero => (encode(Outcome::Num(p.sign, Rounded::Zero), env), fin),
+        Class::Finite => {
+            let (out, f) = kernel::round_exact(p.sign, p.exp, u128::from(p.frac), spec, env);
+            (encode(out, env), f | fin)
+        }
+    }
 }
 
 /// `a * b + c`, rounded once.

@@ -250,6 +250,7 @@
 
 pub mod disasm;
 mod exec;
+mod fpu;
 pub mod isa;
 mod mmu;
 mod timing;
@@ -262,6 +263,8 @@ mod tests_68010;
 mod tests_68020;
 #[cfg(test)]
 mod tests_68030;
+#[cfg(test)]
+mod tests_fpu;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).
@@ -288,10 +291,19 @@ use crate::core::value::Width;
 use crate::core::wire::{
     FanIn, IntAck, IntAckCycle, IntAckHandlers, IntAckResponse, Level, Resolve, WireId, WireSink,
 };
+use crate::float::x87::F80;
 
 use exec::{Bank, Exec, State};
 
+pub use fpu::Coprocessor;
 pub use isa::Model;
+
+/// The values the `fpu` property accepts, in [`Coprocessor::ALL`] order.
+const FPU_NAMES: [&str; 3] = [
+    Coprocessor::None.name(),
+    Coprocessor::M68881.name(),
+    Coprocessor::M68882.name(),
+];
 
 /// The values the `model` property accepts, in [`Model::ALL`] order.
 const MODEL_NAMES: [&str; 6] = [
@@ -407,10 +419,21 @@ pub mod vector {
     pub const AUTOVECTOR_BASE: u8 = 24;
     /// Vectors 32–47: the `TRAP #0`–`TRAP #15` family.
     pub const TRAP_BASE: u8 = 32;
-    /// Vectors 48–54: the floating-point coprocessor's, in the order
-    /// `BSUN`, `INEX`, `DZ`, `UNFL`, `OPERR`, `OVFL`, `SNAN` (MC68030UM
-    /// Table 8-1).
-    pub const FP_BASE: u8 = 48;
+    /// Vector 48: the coprocessor branched or set on an unordered condition
+    /// (MC68030UM Table 8-1).
+    pub const FP_BSUN: u8 = 48;
+    /// Vector 49: an inexact floating-point result.
+    pub const FP_INEXACT: u8 = 49;
+    /// Vector 50: a floating-point divide by zero.
+    pub const FP_DIVIDE_BY_ZERO: u8 = 50;
+    /// Vector 51: floating-point underflow.
+    pub const FP_UNDERFLOW: u8 = 51;
+    /// Vector 52: a floating-point operand error.
+    pub const FP_OPERAND_ERROR: u8 = 52;
+    /// Vector 53: floating-point overflow.
+    pub const FP_OVERFLOW: u8 = 53;
+    /// Vector 54: a signalling not-a-number was an operand.
+    pub const FP_SIGNALING_NAN: u8 = 54;
     /// Vector 56: an MMU configuration error — a `PMOVE` that loaded `TC`,
     /// `CRP` or `SRP` with a value the unit cannot use (MC68030UM §9.7.5.3).
     pub const MMU_CONFIG: u8 = 56;
@@ -465,6 +488,20 @@ pub struct Regs {
     pub tt: [u32; 2],
     /// The 68030's MMU status register — `ACUSR` on an MC68EC030.
     pub mmusr: u16,
+    /// The coprocessor's eight floating-point data registers, always in the
+    /// extended format.
+    ///
+    /// Eighty bits each, so they are here rather than in [`Reg`], which
+    /// hands out at most thirty-two.
+    pub fp: [F80; 8],
+    /// The floating-point control register: an enable byte and a mode byte.
+    pub fpcr: u32,
+    /// The floating-point status register: condition codes, a quotient byte,
+    /// an exception byte and an accrued byte.
+    pub fpsr: u32,
+    /// The address of the floating-point instruction a trap handler should
+    /// look at.
+    pub fpiar: u32,
 }
 
 impl Regs {
@@ -573,6 +610,12 @@ pub enum Reg {
     SrpHi,
     /// The low half of the supervisor root pointer.
     SrpLo,
+    /// The floating-point control register.
+    Fpcr,
+    /// The floating-point status register.
+    Fpsr,
+    /// The floating-point instruction address register.
+    Fpiar,
 }
 
 impl Reg {
@@ -611,6 +654,10 @@ impl Reg {
     /// name (MC68EC030UM §9.3).
     pub const M68EC030: &'static [Reg] = &[Reg::Tt0, Reg::Tt1, Reg::Mmusr];
 
+    /// A floating-point coprocessor's three control registers. The eight
+    /// data registers are eighty bits wide and live in [`Regs::fp`].
+    pub const FPU: &'static [Reg] = &[Reg::Fpcr, Reg::Fpsr, Reg::Fpiar];
+
     /// The full MC68030's additions to those: the paged unit's own
     /// registers.
     pub const M68030: &'static [Reg] = &[Reg::Tc, Reg::CrpHi, Reg::CrpLo, Reg::SrpHi, Reg::SrpLo];
@@ -630,6 +677,20 @@ impl Reg {
         }
         if model.has_mmu() {
             out.extend_from_slice(Reg::M68030);
+        }
+        out
+    }
+
+    /// Every register a core with this configuration has.
+    ///
+    /// The three floating-point control registers are only there when a
+    /// coprocessor is; the eight data registers are eighty bits wide and are
+    /// in [`Regs::fp`] rather than here.
+    #[must_use]
+    pub fn all_for_config(cfg: Config) -> Vec<Reg> {
+        let mut out = Reg::all_for(cfg.model);
+        if cfg.fpu.present() {
+            out.extend_from_slice(Reg::FPU);
         }
         out
     }
@@ -668,6 +729,9 @@ impl Reg {
             Reg::CrpLo => regs.crp as u32,
             Reg::SrpHi => (regs.srp >> 32) as u32,
             Reg::SrpLo => regs.srp as u32,
+            Reg::Fpcr => regs.fpcr,
+            Reg::Fpsr => regs.fpsr,
+            Reg::Fpiar => regs.fpiar,
         }
     }
 
@@ -725,6 +789,9 @@ impl Reg {
             Reg::CrpLo => regs.crp = (regs.crp & 0xffff_ffff_0000_0000) | value as u64,
             Reg::SrpHi => regs.srp = (regs.srp & 0xffff_ffff) | ((value as u64) << 32),
             Reg::SrpLo => regs.srp = (regs.srp & 0xffff_ffff_0000_0000) | value as u64,
+            Reg::Fpcr => regs.fpcr = value,
+            Reg::Fpsr => regs.fpsr = value,
+            Reg::Fpiar => regs.fpiar = value,
         }
     }
 
@@ -758,6 +825,9 @@ impl Reg {
                 "crpl" => Some(Reg::CrpLo),
                 "srph" => Some(Reg::SrpHi),
                 "srpl" => Some(Reg::SrpLo),
+                "fpcr" => Some(Reg::Fpcr),
+                "fpsr" => Some(Reg::Fpsr),
+                "fpiar" => Some(Reg::Fpiar),
                 _ => None,
             },
         }
@@ -787,6 +857,9 @@ impl fmt::Display for Reg {
             Reg::CrpLo => f.write_str("crpl"),
             Reg::SrpHi => f.write_str("srph"),
             Reg::SrpLo => f.write_str("srpl"),
+            Reg::Fpcr => f.write_str("fpcr"),
+            Reg::Fpsr => f.write_str("fpsr"),
+            Reg::Fpiar => f.write_str("fpiar"),
         }
     }
 }
@@ -802,6 +875,14 @@ pub struct Config {
     pub requester: RequesterId,
     /// Which member of the family this is.
     pub model: Model,
+    /// Which floating-point coprocessor is attached, if any.
+    ///
+    /// A property of the *board* rather than of the part: the same 68020 is
+    /// a 68020 with a 68881 and a 68020 without one, and the difference is
+    /// visible in the opcode map. Only a processor with the F-line
+    /// coprocessor interface can have one, which begins at the 68020
+    /// (MC68020UM §7).
+    pub fpu: Coprocessor,
 }
 
 impl Config {
@@ -809,6 +890,7 @@ impl Config {
     pub const MC68000: Config = Config {
         requester: RequesterId::ANONYMOUS,
         model: Model::M68000,
+        fpu: Coprocessor::None,
     };
 
     /// An MC68010.
@@ -837,6 +919,13 @@ impl Config {
     #[must_use]
     pub const fn with_model(mut self, model: Model) -> Self {
         self.model = model;
+        self
+    }
+
+    /// Same configuration, with a floating-point coprocessor attached.
+    #[must_use]
+    pub const fn with_fpu(mut self, fpu: Coprocessor) -> Self {
+        self.fpu = fpu;
         self
     }
 }
@@ -1047,6 +1136,8 @@ pub struct M68k {
     requester: AtomicU32,
     /// Which processor this is. Fixed at construction.
     model: Model,
+    /// Which coprocessor answers the F line. Fixed at construction.
+    fpu: Coprocessor,
     session: sync::Mutex<Session>,
     /// The strong end of every pin this core has handed to a wire.
     ///
@@ -1081,6 +1172,7 @@ impl M68k {
             lines: Arc::new(Lines::default()),
             requester: AtomicU32::new(cfg.requester.0),
             model: cfg.model,
+            fpu: cfg.fpu,
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -1106,12 +1198,28 @@ impl M68k {
         // one lands.
         let _engine = r.or_enum("engine", "interp", &["interp"])?;
         let model = r.or_enum("model", Model::M68000.name(), &MODEL_NAMES)?;
+        let fpu = r.or_enum("fpu", Coprocessor::None.name(), &FPU_NAMES)?;
         r.finish()?;
         let model = Model::from_name(model).unwrap_or_default();
+        let fpu = Coprocessor::from_name(fpu).unwrap_or_default();
+        // A coprocessor answers the F line, and the F-line coprocessor
+        // interface arrived with the 68020 (MC68020UM §7). A 68881 can be
+        // wired to a 68000 as an ordinary peripheral, but then it is not a
+        // coprocessor and its instructions do not exist.
+        if fpu.present() && !model.has_coprocessor_interface() {
+            return Err(Error::Config {
+                at: String::from("cpu.m68k"),
+                message: alloc::format!(
+                    "a {fpu} is a coprocessor and a {model} has no coprocessor interface; \
+                     the F-line interface starts at the 68020"
+                ),
+            });
+        }
         Ok(M68k::new(
             Config::default()
                 .with_requester(RequesterId(requester as u32))
-                .with_model(model),
+                .with_model(model)
+                .with_fpu(fpu),
         ))
     }
 
@@ -1124,6 +1232,7 @@ impl M68k {
         Config {
             requester: RequesterId(self.requester.load(Ordering::Relaxed)),
             model: self.model,
+            fpu: self.fpu,
         }
     }
 
@@ -1178,6 +1287,10 @@ impl M68k {
             srp: state.mmu.srp,
             tt: state.mmu.tt,
             mmusr: state.mmu.mmusr,
+            fp: state.fpu.fp,
+            fpcr: state.fpu.fpcr,
+            fpsr: state.fpu.fpsr,
+            fpiar: state.fpu.fpiar,
         }
     }
 
@@ -1232,6 +1345,21 @@ impl M68k {
                 state.mmu.crp = regs.crp;
                 state.mmu.srp = regs.srp;
             }
+        }
+        if self.fpu.present() {
+            state.fpu.fp = regs.fp;
+            state.fpu.fpcr = regs.fpcr & fpu::bits::FPCR_IMPLEMENTED;
+            state.fpu.fpsr = regs.fpsr & fpu::bits::FPSR_IMPLEMENTED;
+            state.fpu.fpiar = regs.fpiar;
+            // `FSAVE` reports the null state for a unit "not modified since
+            // the last hardware reset" (M68881UM §4), so a register file
+            // placed from outside leaves it null exactly when what was placed
+            // *is* the reset state.
+            let reset = fpu::Fpu::RESET;
+            state.fpu.null = state.fpu.fp == reset.fp
+                && state.fpu.fpcr == reset.fpcr
+                && state.fpu.fpsr == reset.fpsr
+                && state.fpu.fpiar == reset.fpiar;
         }
     }
 
@@ -1467,7 +1595,12 @@ impl M68k {
             return Vec::new();
         };
         let mask = self.model.address_mask();
-        disasm::disassemble_run_for(self.model, pc, count, |addr| {
+        let copro = if self.fpu.present() {
+            isa::Copro::FPU
+        } else {
+            isa::Copro::NONE
+        };
+        disasm::disassemble_run_with(self.model, copro, pc, count, |addr| {
             space
                 .read(u64::from(addr & mask), Width::U16, MemAttrs::DEBUG)
                 .ok()
@@ -1506,6 +1639,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "which processor: `68000` (the default), `68010`, `68020`, \
 `68ec020`, `68030` or `68ec030`",
+        },
+        PropertySpec {
+            name: "fpu",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which floating-point coprocessor: `none` (the default), \
+`68881` or `68882`; needs a 68020 or later",
         },
     ],
     construct: |props| Ok(Box::new(M68k::from_props(props)?)),
@@ -1708,6 +1848,17 @@ impl Device for M68k {
             w.write_u64(state.mmu.crp)?;
             w.write_u64(state.mmu.srp)?;
         }
+        if !self.fpu.present() {
+            return Ok(());
+        }
+        for value in state.fpu.fp {
+            w.write_u16(value.sign_exp)?;
+            w.write_u64(value.sig)?;
+        }
+        w.write_u32(state.fpu.fpcr)?;
+        w.write_u32(state.fpu.fpsr)?;
+        w.write_u32(state.fpu.fpiar)?;
+        w.write_bool(state.fpu.null)?;
         Ok(())
     }
 
@@ -1801,6 +1952,17 @@ impl Device for M68k {
                 state.mmu.srp = r.read_u64()?;
             }
         }
+        if self.fpu.present() {
+            for slot in &mut state.fpu.fp {
+                let sign_exp = r.read_u16()?;
+                let sig = r.read_u64()?;
+                *slot = F80::new(sign_exp, sig);
+            }
+            state.fpu.fpcr = r.read_u32()? & fpu::bits::FPCR_IMPLEMENTED;
+            state.fpu.fpsr = r.read_u32()? & fpu::bits::FPSR_IMPLEMENTED;
+            state.fpu.fpiar = r.read_u32()?;
+            state.fpu.null = r.read_bool()?;
+        }
         self.session.lock().state = state;
         self.lines.restore((ipl, vector, level_seven, resets));
         Ok(())
@@ -1858,6 +2020,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("requester", ValueKind::Uint))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
         .prop(PropSchema::new("model", ValueKind::Str).values(&MODEL_NAMES))
+        .prop(PropSchema::new("fpu", ValueKind::Str).values(&FPU_NAMES))
         // Inputs only. `BERR`, `HALT`, `BR`/`BG` and `VPA` are real pins with
         // no model behind them: a bus error is reported through the address
         // space's result rather than a wire, and `VPA` is what *not* answering

@@ -591,6 +591,23 @@ pub(super) fn instruction(insn: Insn, opcode: u16, size: Size, f: &Facts) -> u32
         // bus cycles are added where they happen (`Exec::search_cycles`).
         // Recorded in the conformance ledger as the approximation it is.
         Op::Pgen => calc(f.eas[0] as usize) + 8,
+        // The coprocessor's instructions. MC68020UM §8.2 has no rows for
+        // them — a coprocessor's execution time is the coprocessor's, and
+        // M68881UM §8 tables it separately in *its* clocks, which need not be
+        // the main processor's. What is charged is the main processor's own
+        // work: the effective-address time the operand needs plus the
+        // transfer. In the conformance ledger.
+        Op::Fpgen => fetch(f.eas[0] as usize) + 4 * f.registers.max(1),
+        Op::Fbcc | Op::Fdbcc => {
+            if f.taken {
+                10
+            } else {
+                6
+            }
+        }
+        Op::Fscc => fetch(f.eas[0] as usize) + 6,
+        Op::Ftrapcc => 6,
+        Op::Fsave | Op::Frestore => calc(f.eas[0] as usize) + 8,
         Op::Trapcc => match opcode & 7 {
             2 => 6,
             3 => 8,

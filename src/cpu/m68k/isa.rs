@@ -788,6 +788,13 @@ define_ops! {
     Trapcc = "TRAP", "take a trap if a condition holds";
     Unpk = "UNPK", "unpack a BCD byte into two digits, with an adjustment";
     Pgen = "P", "a memory management instruction: PMOVE, PTEST, PLOAD, PFLUSH";
+    Fpgen = "F", "a floating-point instruction: the coprocessor command word says which";
+    Fbcc = "FB", "branch on a floating-point condition";
+    Fdbcc = "FDB", "test a floating-point condition, decrement and branch";
+    Fscc = "FS", "set a byte on a floating-point condition";
+    Ftrapcc = "FTRAP", "take a trap if a floating-point condition holds";
+    Fsave = "FSAVE", "save the coprocessor's internal state (privileged)";
+    Frestore = "FRESTORE", "restore the coprocessor's internal state (privileged)";
 }
 
 impl Op {
@@ -834,6 +841,7 @@ impl Op {
             }
             // The coprocessor command word carries the operation, exactly as
             // `MULS.L`'s extension word carries its signedness.
+            Op::Fpgen => fp::mnemonic(ext),
             Op::Pgen => pmmu::mnemonic(ext),
             other => other.mnemonic(),
         }
@@ -976,6 +984,12 @@ impl Insn {
 
     const fn since_030(self) -> Insn {
         self.models(Models::FROM_030)
+    }
+
+    /// The row exists only when a floating-point coprocessor is attached.
+    const fn needs_fpu(mut self) -> Insn {
+        self.fpu = true;
+        self
     }
 
     const fn with_ext(mut self, words: u8) -> Insn {
@@ -1303,6 +1317,38 @@ table! {
     // `000000` in the field; `pmmu::decode` carries each form's own rule.
     0xffc0 0xf000 => Insn::new(Op::Pgen, SizeSpec::None, Ea, Arg::None)
                         .with_ext(1).privileged().since_030();
+    // Coprocessor id 1 is the 68881/68882. Every row here exists only when
+    // one is attached; without it the encoding falls through to the line-F
+    // rows below, which is exactly what a 68020 with no coprocessor does.
+    0xfff8 0xf248 => Insn::new(Op::Fdbcc, Fixed(Word), DnLo, Disp16)
+                        .with_ext(1).since_020().needs_fpu();
+    0xffff 0xf27a => Insn::new(Op::Ftrapcc, Fixed(Word), TrapData, Arg::None)
+                        .with_ext(1).since_020().needs_fpu();
+    0xffff 0xf27b => Insn::new(Op::Ftrapcc, Fixed(Long), TrapData, Arg::None)
+                        .with_ext(1).since_020().needs_fpu();
+    0xffff 0xf27c => Insn::new(Op::Ftrapcc, SizeSpec::None, Arg::None, Arg::None)
+                        .with_ext(1).since_020().needs_fpu();
+    0xffc0 0xf240 => Insn::new(Op::Fscc, Fixed(Byte), Arg::None, Ea)
+                        .dst_ea(EaSet::DATA_ALT).with_ext(1).since_020().needs_fpu();
+    0xff80 0xf280 => Insn::new(Op::Fbcc, SizeSpec::None, Arg::None, Arg::None)
+                        .since_020().needs_fpu();
+    // FSAVE writes its frame to control alterable memory or `-(An)`, and
+    // FRESTORE reads one from control memory or `(An)+` — the same two sets
+    // `MOVEM` uses, and for the same reason (M68881UM §4, *FSAVE*,
+    // *FRESTORE*).
+    0xffc0 0xf300 => Insn::new(Op::Fsave, SizeSpec::None, Arg::None, Ea)
+                        .dst_ea(EaSet::MOVEM_TO_MEM)
+                        .privileged().since_020().needs_fpu();
+    0xffc0 0xf340 => Insn::new(Op::Frestore, SizeSpec::None, Ea, Arg::None)
+                        .src_ea(EaSet::MOVEM_TO_REG)
+                        .privileged().since_020().needs_fpu();
+    // The general class: FMOVE, FMOVEM, FMOVECR and every arithmetic and
+    // transcendental operation share one opcode word and differ only in the
+    // command word (M68881UM §4; `fp::decode`). The effective address is
+    // unconstrained for the same reason as the MMU's: with R/M = 0 the field
+    // is unused and encoded as `000000`.
+    0xffc0 0xf200 => Insn::new(Op::Fpgen, SizeSpec::None, Ea, Arg::None)
+                        .with_ext(1).since_020().needs_fpu();
     // With no coprocessor present every F-line word takes the line-F
     // exception — except cpSAVE and cpRESTORE, which a 68020 checks for
     // privilege before it tries to talk to any coprocessor, so user code gets
@@ -1630,6 +1676,572 @@ impl FieldSpec {
                 (word & 0x1f) as u8
             },
             reg: ((word >> 12) & 7) as u8,
+        }
+    }
+}
+
+/// The 68881/68882's command word, described **once**.
+///
+/// An F-line instruction on coprocessor id 1 carries its operation in a
+/// second word rather than in the opcode, so the table above has one row for
+/// the whole general class and this module is the rest of the description:
+/// the interpreter and the disassembler both decode through [`decode`], and
+/// the mnemonic a listing prints is by construction the operation the
+/// interpreter performed.
+///
+/// Sources: *MC68881/MC68882 Floating-Point Coprocessor User's Manual*
+/// (M68881UM) §4 for every encoding, and M68000PRM §5 for the same
+/// instructions as the family manual states them.
+pub mod fp {
+    use core::fmt;
+
+    /// Declare the floating-point operation enum, its mnemonics, its
+    /// summaries and its opmode encodings in one list.
+    macro_rules! define_fp_ops {
+        ($($name:ident = $opmode:literal, $mnemonic:literal, $summary:literal;)*) => {
+            /// One floating-point operation, as the command word's opmode
+            /// field (bits 6–0) names it.
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+            #[non_exhaustive]
+            pub enum FpOp {
+                $(
+                    #[doc = $summary]
+                    $name,
+                )*
+                /// `FSINCOS`: sine and cosine at once, into two registers.
+                ///
+                /// Not in the list above because its opmode is a *range*,
+                /// `0110xxx`, whose low three bits name the cosine's
+                /// destination register (M68881UM §4, *FSINCOS*).
+                SinCos,
+            }
+
+            impl FpOp {
+                /// The assembler mnemonic, without a rounding prefix.
+                #[must_use]
+                pub const fn mnemonic(self) -> &'static str {
+                    match self {
+                        $(FpOp::$name => $mnemonic,)*
+                        FpOp::SinCos => "FSINCOS",
+                    }
+                }
+
+                /// A one-line description, for `rsemu describe` and the
+                /// monitor.
+                #[must_use]
+                pub const fn summary(self) -> &'static str {
+                    match self {
+                        $(FpOp::$name => $summary,)*
+                        FpOp::SinCos => "sine and cosine of the source, into two registers",
+                    }
+                }
+
+                /// The operation an opmode field names, or `None` for one of
+                /// the encodings the manual leaves undefined.
+                #[must_use]
+                pub const fn from_opmode(opmode: u8) -> Option<FpOp> {
+                    // The sine/cosine pair occupies eight opmodes.
+                    if opmode & 0x78 == 0x30 {
+                        return Some(FpOp::SinCos);
+                    }
+                    match opmode {
+                        $($opmode => Some(FpOp::$name),)*
+                        _ => None,
+                    }
+                }
+
+                /// Every operation, in opmode order.
+                pub const ALL: &'static [FpOp] = &[$(FpOp::$name,)* FpOp::SinCos];
+            }
+        };
+    }
+
+    define_fp_ops! {
+        Move    = 0x00, "FMOVE",    "move the source to a floating-point register";
+        Int     = 0x01, "FINT",     "round the source to an integer, by the current mode";
+        Sinh    = 0x02, "FSINH",    "hyperbolic sine";
+        IntRz   = 0x03, "FINTRZ",   "round the source to an integer, toward zero";
+        Sqrt    = 0x04, "FSQRT",    "square root";
+        LognP1  = 0x06, "FLOGNP1",  "natural logarithm of one plus the source";
+        EtoxM1  = 0x08, "FETOXM1",  "e to the source, less one";
+        Tanh    = 0x09, "FTANH",    "hyperbolic tangent";
+        Atan    = 0x0a, "FATAN",    "arc tangent";
+        Asin    = 0x0c, "FASIN",    "arc sine";
+        Atanh   = 0x0d, "FATANH",   "hyperbolic arc tangent";
+        Sin     = 0x0e, "FSIN",     "sine";
+        Tan     = 0x0f, "FTAN",     "tangent";
+        Etox    = 0x10, "FETOX",    "e to the source";
+        TwoToX  = 0x11, "FTWOTOX",  "two to the source";
+        TenToX  = 0x12, "FTENTOX",  "ten to the source";
+        Logn    = 0x14, "FLOGN",    "natural logarithm";
+        Log10   = 0x15, "FLOG10",   "base-ten logarithm";
+        Log2    = 0x16, "FLOG2",    "base-two logarithm";
+        Abs     = 0x18, "FABS",     "absolute value";
+        Cosh    = 0x19, "FCOSH",    "hyperbolic cosine";
+        Neg     = 0x1a, "FNEG",     "negate";
+        Acos    = 0x1c, "FACOS",    "arc cosine";
+        Cos     = 0x1d, "FCOS",     "cosine";
+        GetExp  = 0x1e, "FGETEXP",  "the source's exponent, as a number";
+        GetMan  = 0x1f, "FGETMAN",  "the source's mantissa, in [1,2)";
+        Div     = 0x20, "FDIV",     "divide the destination by the source";
+        Mod     = 0x21, "FMOD",     "modulo remainder, truncating the quotient";
+        Add     = 0x22, "FADD",     "add";
+        Mul     = 0x23, "FMUL",     "multiply";
+        SglDiv  = 0x24, "FSGLDIV",  "divide, rounding the mantissa to single precision";
+        Rem     = 0x25, "FREM",     "IEEE remainder, rounding the quotient to nearest";
+        Scale   = 0x26, "FSCALE",   "scale the destination by two to the source";
+        SglMul  = 0x27, "FSGLMUL",  "multiply, rounding the mantissa to single precision";
+        Sub     = 0x28, "FSUB",     "subtract the source from the destination";
+        Cmp     = 0x38, "FCMP",     "compare, setting only the condition codes";
+        Tst     = 0x3a, "FTST",     "set the condition codes from the source";
+    }
+
+    impl fmt::Display for FpOp {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.mnemonic())
+        }
+    }
+
+    impl FpOp {
+        /// Whether the operation reads the destination register as well as
+        /// the source — the dyadic ones (M68881UM §4.2.2).
+        #[must_use]
+        pub const fn is_dyadic(self) -> bool {
+            matches!(
+                self,
+                FpOp::Div
+                    | FpOp::Mod
+                    | FpOp::Add
+                    | FpOp::Mul
+                    | FpOp::SglDiv
+                    | FpOp::Rem
+                    | FpOp::Scale
+                    | FpOp::SglMul
+                    | FpOp::Sub
+                    | FpOp::Cmp
+            )
+        }
+
+        /// Whether the operation writes its destination register at all.
+        ///
+        /// `FCMP` and `FTST` set only the condition codes (M68881UM §4.5.5).
+        #[must_use]
+        pub const fn writes_destination(self) -> bool {
+            !matches!(self, FpOp::Cmp | FpOp::Tst)
+        }
+    }
+
+    /// An external operand's data format, from a source-specifier or
+    /// destination-format field (M68881UM §4, *Source Specifier Field*).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Fmt {
+        /// `000` — long-word integer.
+        Long,
+        /// `001` — single-precision real.
+        Single,
+        /// `010` — extended-precision real, ninety-six bits in memory.
+        Extended,
+        /// `011` — packed-decimal real, ninety-six bits in memory.
+        Packed,
+        /// `100` — word integer.
+        Word,
+        /// `101` — double-precision real.
+        Double,
+        /// `110` — byte integer.
+        Byte,
+    }
+
+    impl Fmt {
+        /// The format a three-bit field names, or `None` for `111`, which is
+        /// not a format: it means `FMOVECR` in a source specifier and a
+        /// dynamic k-factor in a destination format.
+        #[must_use]
+        pub const fn decode(bits: u16) -> Option<Fmt> {
+            Some(match bits & 7 {
+                0 => Fmt::Long,
+                1 => Fmt::Single,
+                2 => Fmt::Extended,
+                3 => Fmt::Packed,
+                4 => Fmt::Word,
+                5 => Fmt::Double,
+                6 => Fmt::Byte,
+                _ => return None,
+            })
+        }
+
+        /// How many bytes the operand occupies in memory.
+        #[must_use]
+        pub const fn bytes(self) -> u32 {
+            match self {
+                Fmt::Byte => 1,
+                Fmt::Word => 2,
+                Fmt::Long | Fmt::Single => 4,
+                Fmt::Double => 8,
+                Fmt::Extended | Fmt::Packed => 12,
+            }
+        }
+
+        /// The assembler suffix.
+        #[must_use]
+        pub const fn suffix(self) -> &'static str {
+            match self {
+                Fmt::Long => "l",
+                Fmt::Single => "s",
+                Fmt::Extended => "x",
+                Fmt::Packed => "p",
+                Fmt::Word => "w",
+                Fmt::Double => "d",
+                Fmt::Byte => "b",
+            }
+        }
+
+        /// Whether a data register can hold the whole operand — which is the
+        /// manual's footnote "only if `<fmt>` is byte, word, long or single".
+        #[must_use]
+        pub const fn fits_in_a_register(self) -> bool {
+            matches!(self, Fmt::Byte | Fmt::Word | Fmt::Long | Fmt::Single)
+        }
+    }
+
+    impl fmt::Display for Fmt {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.suffix())
+        }
+    }
+
+    /// The rounding precision a command word forces, over `FPCR`'s.
+    ///
+    /// The 68881 has no such override — every one of its operations rounds to
+    /// the precision `FPCR` names. The 68040 added `FSxxx` and `FDxxx` forms
+    /// in bit 6 of the opmode (M68000PRM §5, *FABS*), which this core decodes
+    /// so a listing is right but rejects as unimplemented on a 6888x.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Forced {
+        /// The precision in `FPCR`.
+        Control,
+        /// Single, whatever `FPCR` says — 68040 only.
+        Single,
+        /// Double, whatever `FPCR` says — 68040 only.
+        Double,
+    }
+
+    /// Which `FMOVEM` register list, and in which order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum ListMode {
+        /// `00` — a static list, `-(An)` order (FP7 first in the word).
+        StaticPreDec,
+        /// `01` — a dynamic list in a data register, `-(An)` order.
+        DynamicPreDec,
+        /// `10` — a static list, `(An)+` or control order (FP0 first).
+        StaticPostInc,
+        /// `11` — a dynamic list, `(An)+` or control order.
+        DynamicPostInc,
+    }
+
+    impl ListMode {
+        /// Whether the register number comes from a data register.
+        #[must_use]
+        pub const fn dynamic(self) -> bool {
+            matches!(self, ListMode::DynamicPreDec | ListMode::DynamicPostInc)
+        }
+
+        /// Whether bit 7 of the mask means `FP7` (predecrement order) rather
+        /// than `FP0`.
+        #[must_use]
+        pub const fn predecrement_order(self) -> bool {
+            matches!(self, ListMode::StaticPreDec | ListMode::DynamicPreDec)
+        }
+    }
+
+    /// Bit 12 of an `FMOVEM`-to-control-register word: `FPCR`.
+    pub const CTRL_FPCR: u8 = 4;
+    /// Bit 11: `FPSR`.
+    pub const CTRL_FPSR: u8 = 2;
+    /// Bit 10: `FPIAR`.
+    pub const CTRL_FPIAR: u8 = 1;
+
+    /// What a command word means.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Class {
+        /// An arithmetic or transcendental operation with a register source.
+        RegOp {
+            /// The source floating-point register.
+            src: u8,
+            /// The destination floating-point register.
+            dst: u8,
+            /// Which operation.
+            op: FpOp,
+            /// A forced rounding precision, 68040 only.
+            forced: Forced,
+            /// `FSINCOS`'s second destination, the cosine's register.
+            cos: u8,
+        },
+        /// The same with an effective-address source.
+        MemOp {
+            /// The source operand's format.
+            fmt: Fmt,
+            /// The destination floating-point register.
+            dst: u8,
+            /// Which operation.
+            op: FpOp,
+            /// A forced rounding precision, 68040 only.
+            forced: Forced,
+            /// `FSINCOS`'s second destination.
+            cos: u8,
+        },
+        /// `FMOVECR`: a constant from the coprocessor's on-chip ROM.
+        MoveCr {
+            /// The ROM offset, seven bits.
+            offset: u8,
+            /// The destination floating-point register.
+            dst: u8,
+        },
+        /// `FMOVE FPm,<ea>`: one register out, converted.
+        Store {
+            /// The destination format.
+            fmt: Fmt,
+            /// The source floating-point register.
+            src: u8,
+            /// The packed-decimal k-factor, a signed seven-bit immediate.
+            k: i8,
+            /// The data register holding the k-factor, when it is dynamic.
+            k_reg: Option<u8>,
+        },
+        /// `FMOVE(M)` to or from `FPCR`, `FPSR` and `FPIAR`.
+        Control {
+            /// Whether the transfer is into the coprocessor.
+            to_fpu: bool,
+            /// Which registers, as [`CTRL_FPCR`] | [`CTRL_FPSR`] |
+            /// [`CTRL_FPIAR`].
+            regs: u8,
+        },
+        /// `FMOVEM` of the eight floating-point data registers.
+        MoveM {
+            /// Whether the transfer is into the coprocessor.
+            to_fpu: bool,
+            /// Which list, and in which order.
+            mode: ListMode,
+            /// The static list mask, or the data register for a dynamic one.
+            list: u8,
+        },
+    }
+
+    /// Decode a command word, or `None` if it encodes nothing.
+    ///
+    /// A `None` is the line-F exception: the 68881 answers an unrecognised
+    /// command word with a protocol violation and the main processor takes
+    /// the F-line vector (M68881UM §6.2.2).
+    #[must_use]
+    pub fn decode(word: u16) -> Option<Class> {
+        let class = word >> 13;
+        let dst = ((word >> 7) & 7) as u8;
+        match class {
+            // 000 register-to-register, 010 memory-to-register.
+            0b000 | 0b010 => {
+                // Source specifier 111 with R/M set is FMOVECR, whose low
+                // seven bits are a ROM offset rather than an opmode — so it
+                // is recognised *before* the opmode is decoded, or half of
+                // the ROM's offsets would look like undefined operations.
+                if class == 0b010 && (word >> 10) & 7 == 7 {
+                    return Some(Class::MoveCr {
+                        offset: (word & 0x7f) as u8,
+                        dst,
+                    });
+                }
+                let opmode = (word & 0x7f) as u8;
+                // Bit 6 of the opmode is the 68040's forced precision, and
+                // only for the arithmetic operations it added.
+                let (base, forced) = match opmode & 0x40 {
+                    0 => (opmode, Forced::Control),
+                    _ => (
+                        opmode & 0x3b,
+                        if opmode & 0x04 == 0 {
+                            Forced::Single
+                        } else {
+                            Forced::Double
+                        },
+                    ),
+                };
+                let op = FpOp::from_opmode(base)?;
+                let cos = (word & 7) as u8;
+                if class == 0b000 {
+                    Some(Class::RegOp {
+                        src: ((word >> 10) & 7) as u8,
+                        dst,
+                        op,
+                        forced,
+                        cos,
+                    })
+                } else {
+                    Some(Class::MemOp {
+                        fmt: Fmt::decode(word >> 10)?,
+                        dst,
+                        op,
+                        forced,
+                        cos,
+                    })
+                }
+            }
+            // 011 FMOVE FPm,<ea>.
+            0b011 => {
+                let src = dst;
+                if (word >> 10) & 7 == 7 {
+                    // A dynamic k-factor: the data register is in bits 6-4
+                    // and the format is packed decimal (M68881UM §4, *FMOVE*).
+                    Some(Class::Store {
+                        fmt: Fmt::Packed,
+                        src,
+                        k: 0,
+                        k_reg: Some(((word >> 4) & 7) as u8),
+                    })
+                } else {
+                    // The k-factor is a signed seven-bit immediate, and is
+                    // meaningful only for a packed destination.
+                    let k = ((word & 0x7f) as u8) << 1;
+                    Some(Class::Store {
+                        fmt: Fmt::decode(word >> 10)?,
+                        src,
+                        k: (k as i8) >> 1,
+                        k_reg: None,
+                    })
+                }
+            }
+            // 100/101 the system control registers.
+            0b100 | 0b101 => Some(Class::Control {
+                to_fpu: class == 0b100,
+                regs: ((word >> 10) & 7) as u8,
+            }),
+            // 110/111 the data registers.
+            _ => {
+                if word & 0x0400 != 0 {
+                    // Bit 10 is defined as zero.
+                    return None;
+                }
+                let mode = match (word >> 11) & 3 {
+                    0 => ListMode::StaticPreDec,
+                    1 => ListMode::DynamicPreDec,
+                    2 => ListMode::StaticPostInc,
+                    _ => ListMode::DynamicPostInc,
+                };
+                let list = if mode.dynamic() {
+                    ((word >> 4) & 7) as u8
+                } else {
+                    (word & 0xff) as u8
+                };
+                Some(Class::MoveM {
+                    to_fpu: class == 0b110,
+                    mode,
+                    list,
+                })
+            }
+        }
+    }
+
+    /// The mnemonic a command word names, for the disassembler.
+    #[must_use]
+    pub fn mnemonic(word: u16) -> &'static str {
+        match decode(word) {
+            Some(Class::RegOp { op, .. } | Class::MemOp { op, .. }) => op.mnemonic(),
+            Some(Class::MoveCr { .. }) => "FMOVECR",
+            Some(Class::Store { .. } | Class::Control { .. }) => "FMOVE",
+            Some(Class::MoveM { .. }) => "FMOVEM",
+            None => "F???",
+        }
+    }
+
+    /// One of the thirty-two floating-point conditional predicates.
+    ///
+    /// Six bits, in the low half of the word after an `FBcc`'s opcode or an
+    /// `FScc`'s, `FDBcc`'s or `FTRAPcc`'s extension word (M68000PRM Table
+    /// 3-23).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Pred(pub u8);
+
+    impl Pred {
+        /// The assembler suffix, or `None` for one of the thirty-two
+        /// encodings the manual does not define.
+        #[must_use]
+        pub const fn name(self) -> Option<&'static str> {
+            Some(match self.0 {
+                0x00 => "F",
+                0x01 => "EQ",
+                0x02 => "OGT",
+                0x03 => "OGE",
+                0x04 => "OLT",
+                0x05 => "OLE",
+                0x06 => "OGL",
+                0x07 => "OR",
+                0x08 => "UN",
+                0x09 => "UEQ",
+                0x0a => "UGT",
+                0x0b => "UGE",
+                0x0c => "ULT",
+                0x0d => "ULE",
+                0x0e => "NE",
+                0x0f => "T",
+                0x10 => "SF",
+                0x11 => "SEQ",
+                0x12 => "GT",
+                0x13 => "GE",
+                0x14 => "LT",
+                0x15 => "LE",
+                0x16 => "GL",
+                0x17 => "GLE",
+                0x18 => "NGLE",
+                0x19 => "NGL",
+                0x1a => "NLE",
+                0x1b => "NLT",
+                0x1c => "NGE",
+                0x1d => "NGT",
+                0x1e => "SNE",
+                0x1f => "ST",
+                _ => return None,
+            })
+        }
+
+        /// Whether an unordered result sets `BSUN` — every predicate in the
+        /// IEEE-nonaware and signalling halves, which is exactly bit 4
+        /// (M68000PRM Table 3-23's *BSUN Bit Set* column).
+        #[must_use]
+        pub const fn signals_unordered(self) -> bool {
+            self.0 & 0x10 != 0
+        }
+
+        /// Evaluate the predicate against the four `FPCC` bits.
+        ///
+        /// The equations are Table 3-23's, written out rather than derived:
+        /// the upper sixteen predicates repeat the lower sixteen's tests and
+        /// differ only in whether they signal, which is why this masks bit 4
+        /// off before testing.
+        #[must_use]
+        pub const fn test(self, n: bool, z: bool, nan: bool) -> bool {
+            match self.0 & 0x0f {
+                0x0 => false,
+                0x1 => z,
+                0x2 => !(nan || z || n),
+                0x3 => z || !(nan || n),
+                0x4 => n && !(nan || z),
+                0x5 => z || (n && !nan),
+                0x6 => !(nan || z),
+                0x7 => !nan,
+                0x8 => nan,
+                0x9 => nan || z,
+                0xa => nan || !(n || z),
+                0xb => nan || z || !n,
+                0xc => nan || (n && !z),
+                0xd => nan || z || n,
+                0xe => !z,
+                _ => true,
+            }
+        }
+    }
+
+    impl fmt::Display for Pred {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self.name() {
+                Some(name) => f.write_str(name),
+                None => write!(f, "?{:02x}", self.0),
+            }
         }
     }
 }
@@ -2127,6 +2739,16 @@ mod tests {
             assert_eq!(line_f, f_line, "{model}: the $F line");
             assert_eq!(legal, expected, "{model}");
         }
+        // The coprocessor's rows exist only with one attached, so the sweep
+        // that proves every operation reachable has to run both ways.
+        for model in [Model::M68020, Model::M68030] {
+            for opcode in 0..=u16::MAX {
+                let op = decode_with(model, Copro::FPU, opcode).op;
+                if !matches!(op, Op::Illegal | Op::LineA | Op::LineF) && !reached.contains(&op) {
+                    reached.push(op);
+                }
+            }
+        }
         // Every operation in the table is reachable from some encoding on
         // some processor.
         for op in Op::ALL {
@@ -2139,6 +2761,42 @@ mod tests {
                 reached.contains(op),
                 "{op:?} is in the table but no encoding reaches it"
             );
+        }
+    }
+
+    #[test]
+    fn a_coprocessor_only_adds_to_the_f_line() {
+        // Without one the F line is the line-F exception, with the two
+        // privileged rows cpSAVE and cpRESTORE occupy; with one, coprocessor
+        // id 1's encodings become instructions and nothing else moves.
+        for model in [Model::M68020, Model::M68030] {
+            let mut gained = 0usize;
+            for opcode in 0..=u16::MAX {
+                let without = decode_with(model, Copro::NONE, opcode);
+                let with = decode_with(model, Copro::FPU, opcode);
+                if without == with {
+                    continue;
+                }
+                gained += 1;
+                assert_eq!(
+                    without.op,
+                    Op::LineF,
+                    "{opcode:04x} was not line F without a coprocessor"
+                );
+                assert_eq!(opcode >> 9, 0b111_1001, "{opcode:04x} is not on id 1");
+                // A row that matched and then rejected its operand is
+                // illegal rather than line F, which is the same thing a
+                // reserved effective-address field does anywhere else.
+                assert!(
+                    with.fpu || with.op == Op::Illegal,
+                    "{opcode:04x} is not marked as needing one"
+                );
+            }
+            // The general class, FScc and its three neighbours, FBcc's two
+            // sizes, FSAVE and FRESTORE — 64 + 64 + 128 + 64 + 64, less the
+            // encodings whose effective address names no mode or that the
+            // row's mode set rejects.
+            assert!(gained > 300, "{model}: only {gained} encodings gained");
         }
     }
 

@@ -61,14 +61,18 @@
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
+use super::fpu::{self, Fpu, bits as fpbits};
+use super::isa::fp::{self, Fmt, Forced, FpOp, ListMode, Pred};
 use super::isa::pmmu;
 use super::isa::{
-    Arg, Cond, EaSet, FieldSpec, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl, decode_for,
-    ea_of, is_full_format,
+    Arg, Cond, Copro, EaSet, FieldSpec, FullExt, Indirect, Insn, Mode, Model, Op, Size, ctrl,
+    decode_for, decode_with, ea_of, is_full_format,
 };
 use super::mmu::{self, Entry, Mmu, mmusr, tc, tt};
 use super::timing;
 use super::{Config, Lines, flags, vector};
+use crate::float::x87::{self, F80};
+use crate::float::{Flags, Spec};
 
 /// Function codes, as they appear on FC0–FC2 and in a group-0 stack frame's
 /// special status word (MC68000UM §3.1.1).
@@ -156,6 +160,12 @@ pub(super) struct State {
     /// The vector of the most recent exception taken, for tests that need to
     /// know *which* exception a step ended in. Never saved.
     pub last_vector: Option<u8>,
+    /// The floating-point coprocessor's registers.
+    ///
+    /// Present on every model for the same reason the MMU is: [`State`] is
+    /// one type. A core with no coprocessor never reaches them, because the
+    /// instructions that name them are not in its opcode map.
+    pub fpu: Fpu,
     /// The 68030's memory management unit: six registers and a cache.
     ///
     /// Present on every model, because [`State`] is one type; a part without
@@ -226,6 +236,7 @@ impl State {
             replay: None,
             poison: [None, None],
             last_vector: None,
+            fpu: Fpu::RESET,
             mmu: Mmu::RESET,
         }
     }
@@ -542,6 +553,9 @@ pub(super) struct Exec<'a> {
     deferred_postincrement: Option<(u8, u32)>,
     /// Internal cycles the next exception spends before it pushes anything.
     prologue: u32,
+    /// Which coprocessor answers the F line, copied out of the
+    /// configuration because decode asks on every instruction.
+    copro: Copro,
     /// Whether address translation is switched on: a part with the paged
     /// MMU, and `TC`'s **E** bit set. Recomputed whenever a `PMOVE` changes
     /// it; a transparent block needs no check here, because with translation
@@ -585,6 +599,11 @@ impl<'a> Exec<'a> {
             prologue: 4,
             source_was_memory: false,
             deferred_postincrement: None,
+            copro: if cfg.fpu.present() {
+                Copro::FPU
+            } else {
+                Copro::NONE
+            },
             mmu_on: model.has_mmu() && state_enables_mmu,
             deferred_slides: 0,
         }
@@ -1209,6 +1228,10 @@ impl<'a> Exec<'a> {
         // it itself before turning translation back on.
         self.state.mmu.reset_pin();
         self.mmu_on = false;
+        // "A reset function ... sets FP0-FP7 to positive non-signaling
+        // not-a-numbers" and clears FPCR, FPSR and FPIAR (M68881UM §2.1,
+        // §2.2, §2.4).
+        self.state.fpu = Fpu::RESET;
         self.internal(4);
         let outcome = (|| -> Result<(), Trap> {
             let ssp = self.read_long(0)?;
@@ -1706,7 +1729,7 @@ impl<'a> Exec<'a> {
             self.fault_at_boundary(addr);
             return;
         }
-        let insn = decode_for(self.model, self.opcode);
+        let insn = decode_with(self.model, self.copro, self.opcode);
         let restarted = self.state.replay.is_some();
         self.facts = timing::Facts::default();
 
@@ -2020,6 +2043,13 @@ impl<'a> Exec<'a> {
             Op::Unpk => self.op_unpk(),
             Op::Trapcc => self.op_trapcc(),
             Op::Pgen => self.op_pgen(),
+            Op::Fpgen => self.op_fpgen(),
+            Op::Fbcc => self.op_fbcc(),
+            Op::Fdbcc => self.op_fdbcc(),
+            Op::Fscc => self.op_fscc(),
+            Op::Ftrapcc => self.op_ftrapcc(),
+            Op::Fsave => self.op_fsave(),
+            Op::Frestore => self.op_frestore(),
         }
     }
 
@@ -3919,6 +3949,739 @@ impl<'a> Exec<'a> {
         }
     }
 
+    // ------------------------------------------------------------------
+    // The floating-point coprocessor
+    // ------------------------------------------------------------------
+
+    /// The line-F exception, which is what a main processor takes when no
+    /// coprocessor answers (MC68020UM §7.5.2) and therefore what this core
+    /// takes for a command word it does not implement.
+    fn fp_line_f(&self) -> Trap {
+        Trap::at(vector::LINE_F, self.pc0)
+    }
+
+    /// Whether this core computes an operation with this source format.
+    fn fp_ready(op: FpOp, forced: Forced, fmt: Option<Fmt>) -> bool {
+        // The 68040 added `FSxxx`/`FDxxx` forms that force a rounding
+        // precision; a 6888x has none, and the encoding is not a command word
+        // it recognises.
+        forced == Forced::Control && fpu::implemented(op) && !matches!(fmt, Some(Fmt::Packed))
+    }
+
+    /// Start a floating-point operation: the instruction address a trap
+    /// handler reads, and a clean exception byte.
+    ///
+    /// "The 32-bit floating-point instruction address (FPIAR) register is
+    /// loaded with the logical address of an instruction before the
+    /// instruction is executed (unless all arithmetic exceptions are
+    /// disabled)" (M68881UM §2.4). The parenthesis is honoured: with no trap
+    /// enabled the register keeps whatever it held, which is what a handler
+    /// that enables a trap and then reads it expects.
+    fn fp_begin(&mut self) {
+        if self.state.fpu.fpcr & 0x0000_ff00 != 0 {
+            self.state.fpu.fpiar = self.pc0;
+        }
+        // "This byte is cleared by the FPCP at the start of most operations"
+        // (§2.3.3).
+        self.state.fpu.clear_exceptions();
+    }
+
+    /// Finish one: the condition codes, the exception byte, the accrued byte,
+    /// the destination, and the trap if one is enabled.
+    ///
+    /// The destination register is withheld only for the three exceptions
+    /// whose trap-enabled paragraph says so — "the destination floating-point
+    /// data register is not modified" for `SNAN` (§6.1.2), `OPERR` (§6.1.3)
+    /// and `DZ` (§6.1.6). An enabled `OVFL`, `UNFL` or `INEX` stores "the
+    /// same as the result stored when the trap is disabled" (§6.1.4, §6.1.5,
+    /// §6.1.7).
+    fn fp_complete(&mut self, out: FpResult, dst: u8) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let f = &mut self.state.fpu;
+        f.raise(out.exc);
+        if out.condition {
+            f.set_condition(out.value);
+        }
+        f.accrue();
+        let withheld = u32::from(fpbits::SNAN | fpbits::OPERR | fpbits::DZ);
+        let blocked = f.fpsr & f.fpcr & withheld & 0x0000_ff00 != 0;
+        if out.store && !blocked {
+            f.fp[(dst & 7) as usize] = out.value;
+        }
+        f.null = false;
+        let trap = f.pending_trap();
+        self.settle()?;
+        match trap {
+            // A 68881 reports this as a *pre-instruction* exception on the
+            // next floating-point instruction, because it runs concurrently
+            // with the main processor and has not finished when the main
+            // processor moves on (§6.1.3). Nothing runs concurrently here, so
+            // it is reported as a post-instruction exception on the
+            // instruction that caused it: the same vector, the same `FPIAR`,
+            // the same `FPSR`, and a stacked program counter one instruction
+            // earlier than hardware's. In the conformance ledger.
+            Some(vector) => {
+                let pc = self.state.pc;
+                Err(Trap::six(vector, pc, pc0))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The general instruction class: every arithmetic and transcendental
+    /// operation, `FMOVE` both ways, `FMOVECR` and the two `FMOVEM`s, told
+    /// apart by the command word (M68881UM §4; `isa::fp`).
+    fn op_fpgen(&mut self) -> Result<(), Trap> {
+        let command = self.ext(0)?;
+        let Some(class) = fp::decode(command) else {
+            return Err(self.fp_line_f());
+        };
+        match class {
+            fp::Class::Control { to_fpu, regs } => self.op_fmove_control(to_fpu, regs),
+            fp::Class::MoveM { to_fpu, mode, list } => self.op_fmovem(to_fpu, mode, list),
+            fp::Class::MoveCr { offset, dst } => self.op_fmovecr(offset, dst),
+            fp::Class::Store {
+                fmt, src, k, k_reg, ..
+            } => self.op_fstore(fmt, src, k, k_reg),
+            fp::Class::RegOp {
+                src,
+                dst,
+                op,
+                forced,
+                ..
+            } => {
+                if !Self::fp_ready(op, forced, None) {
+                    return Err(self.fp_line_f());
+                }
+                self.fp_begin();
+                let value = fpu::canonical(self.state.fpu.fp[(src & 7) as usize]);
+                self.fp_operate(op, value, Flags::NONE, dst)
+            }
+            fp::Class::MemOp {
+                fmt,
+                dst,
+                op,
+                forced,
+                ..
+            } => {
+                if !Self::fp_ready(op, forced, Some(fmt)) {
+                    return Err(self.fp_line_f());
+                }
+                self.fp_begin();
+                let (value, flags) = self.fp_load(fmt)?;
+                self.fp_operate(op, value, flags, dst)
+            }
+        }
+    }
+
+    /// Compute one operation and finish it.
+    fn fp_operate(&mut self, op: FpOp, src: F80, load_flags: Flags, dst: u8) -> Result<(), Trap> {
+        let dst = dst & 7;
+        let env = self.state.fpu.env();
+        let spec = self.state.fpu.spec();
+        let dest = fpu::canonical(self.state.fpu.fp[dst as usize]);
+        let snan = fpu::is_snan(src) || (op.is_dyadic() && fpu::is_snan(dest));
+
+        let computed = fpu::operate(op, dest, src, spec, env);
+        let mut out = FpResult {
+            value: computed.value,
+            store: computed.store && op.writes_destination(),
+            condition: true,
+            exc: computed.exc,
+        };
+        out.exc |= fpu::exceptions_from(load_flags, snan);
+        if out.store && fpu::is_tiny(out.value, computed.tininess) {
+            // `src/float` reports underflow only for a result that is both
+            // tiny *and* inexact, which is IEEE's rule for the flag; the
+            // 68881's exception bit is tininess alone and the AND with
+            // `INEX2` happens on the way into the accrued byte (M68881UM
+            // §6.1.5's note).
+            out.exc |= fpbits::UNFL;
+        }
+        if snan {
+            // "the SNAN is converted to a non-signaling NAN (by setting the
+            // SNAN bit in the operand to a one), and the operation continues"
+            // (§4.5.4.2) — which `fpu::operate` has already done.
+            out.exc |= fpbits::SNAN;
+        }
+        if let Some((negative, magnitude)) = computed.quotient {
+            self.state.fpu.set_quotient(negative, magnitude);
+        }
+        self.fp_complete(out, dst)
+    }
+
+    /// `FMOVECR`: one of the constants in the coprocessor's on-chip ROM.
+    fn op_fmovecr(&mut self, offset: u8, dst: u8) -> Result<(), Trap> {
+        self.fp_begin();
+        let spec = self.state.fpu.spec();
+        let env = self.state.fpu.env();
+        let (value, flags) = x87::round_to(fpu::constant(offset), spec, env);
+        let out = FpResult::stored(value, flags, spec);
+        self.fp_complete(out, dst)
+    }
+
+    /// `FMOVE FPm,<ea>`: one register out, converted to `fmt`.
+    ///
+    /// "Condition Codes: Not affected" (M68881UM §4, *FMOVE*,
+    /// register-to-memory), which §2.3.1 states as a rule: the register-to-
+    /// memory `FMOVE`, `FMOVEM` and the control-register moves leave the
+    /// `FPCC` alone.
+    fn op_fstore(&mut self, fmt: Fmt, src: u8, k: i8, k_reg: Option<u8>) -> Result<(), Trap> {
+        if matches!(fmt, Fmt::Packed) {
+            // Packed decimal is not implemented; see `fpu.rs`.
+            let _ = (k, k_reg);
+            return Err(self.fp_line_f());
+        }
+        self.fp_begin();
+        let env = self.state.fpu.env();
+        let value = fpu::canonical(self.state.fpu.fp[(src & 7) as usize]);
+        let (raw, words, flags) = fpu::narrow(fmt, value, env);
+        let snan = fpu::is_snan(value);
+        let mut exc = fpu::exceptions_from(flags, snan);
+        if snan {
+            exc |= fpbits::SNAN;
+        }
+        match fmt {
+            // "<fmt> is B, W, or L: OPERR — set if the source operand is
+            // infinity, or if the destination size is exceeded after
+            // conversion and rounding; OVFL cleared, UNFL cleared."
+            Fmt::Byte | Fmt::Word | Fmt::Long => exc &= !(fpbits::OVFL | fpbits::UNFL),
+            // "<fmt> is S, D, or X: OPERR cleared; OVFL and UNFL refer to
+            // 6.1.4 and 6.1.5." Underflow is measured against the
+            // *destination* format, not the rounding precision.
+            _ => {
+                exc &= !fpbits::OPERR;
+                let target = match fmt {
+                    Fmt::Single => Spec::interchange(24, 127),
+                    Fmt::Double => Spec::interchange(53, 1023),
+                    _ => F80::SPEC,
+                };
+                if fpu::is_tiny(value, target) {
+                    exc |= fpbits::UNFL;
+                }
+            }
+        }
+        self.fp_store(fmt, raw, words)?;
+        let out = FpResult {
+            value,
+            store: false,
+            condition: false,
+            exc,
+        };
+        self.fp_complete(out, 0)
+    }
+
+    /// `FMOVE`/`FMOVEM` for `FPCR`, `FPSR` and `FPIAR`.
+    ///
+    /// "Since the FPCP FMOVE to/from the FPCR, FPSR, or FPIAR and FMOVEM
+    /// instructions cannot generate floating-point exceptions, these
+    /// instructions do not modify the FPIAR" (§2.4), do not clear the
+    /// exception byte (§2.3.3) and do not touch the condition codes (§2.3.1).
+    fn op_fmove_control(&mut self, to_fpu: bool, regs: u8) -> Result<(), Trap> {
+        const SELECTED: [u8; 3] = [fp::CTRL_FPCR, fp::CTRL_FPSR, fp::CTRL_FPIAR];
+        let count = SELECTED.iter().filter(|bit| regs & *bit != 0).count();
+        let Some((mode, reg)) = ea_of(Arg::Ea, self.opcode) else {
+            return Err(self.fp_line_f());
+        };
+        let reg = reg as usize;
+        // One register may go to or from a data register, and `FPIAR` may use
+        // an address register because it holds an address. More than one needs
+        // memory, since they do not all fit (M68000PRM §5, *FMOVE* to and from
+        // the control registers).
+        if matches!(mode, Mode::DataReg | Mode::AddrReg) {
+            if count != 1 || (mode == Mode::AddrReg && regs != fp::CTRL_FPIAR) {
+                return Err(self.fp_line_f());
+            }
+            let index = if mode == Mode::DataReg { reg } else { 8 + reg } as u32;
+            self.facts.ea(timing::DN);
+            if to_fpu {
+                let value = self.register(index);
+                self.fp_set_control(regs, value);
+            } else {
+                let value = self.fp_get_control(regs);
+                self.set_register(index, value);
+            }
+            return self.settle();
+        }
+        if mode == Mode::Imm {
+            if !to_fpu || count != 1 {
+                return Err(self.fp_line_f());
+            }
+            self.facts.ea(timing::IMM_L);
+            let hi = self.ext(0)?;
+            let lo = self.ext(0)?;
+            self.fp_set_control(regs, (u32::from(hi) << 16) | u32::from(lo));
+            return self.settle();
+        }
+        let Loc::Mem(addr) = self.fp_address(4 * count as u32, to_fpu)? else {
+            return Err(self.fp_line_f());
+        };
+        let mut at = addr;
+        for bit in SELECTED {
+            if regs & bit == 0 {
+                continue;
+            }
+            if to_fpu {
+                let value = self.read_long(at)?;
+                self.fp_set_control(bit, value);
+            } else {
+                let value = self.fp_get_control(bit);
+                self.write_long(at, value)?;
+            }
+            at = at.wrapping_add(4);
+        }
+        self.settle()
+    }
+
+    /// One control register's value.
+    fn fp_get_control(&self, which: u8) -> u32 {
+        match which {
+            fp::CTRL_FPCR => self.state.fpu.fpcr,
+            fp::CTRL_FPSR => self.state.fpu.fpsr,
+            _ => self.state.fpu.fpiar,
+        }
+    }
+
+    /// Load one control register.
+    fn fp_set_control(&mut self, which: u8, value: u32) {
+        match which {
+            fp::CTRL_FPCR => self.state.fpu.fpcr = value & fpbits::FPCR_IMPLEMENTED,
+            fp::CTRL_FPSR => self.state.fpu.fpsr = value & fpbits::FPSR_IMPLEMENTED,
+            _ => self.state.fpu.fpiar = value,
+        }
+        self.state.fpu.null = false;
+    }
+
+    /// `FMOVEM` of the eight data registers.
+    ///
+    /// The mask's bit numbering is reversed between the two list formats —
+    /// bit 7 is `FP7` in predecrement order and `FP0` in postincrement or
+    /// control order (M68000PRM §5, *FMOVEM*, *Register List field*) — and
+    /// the transfer runs from bit 0 in both, exactly as an integer `MOVEM`
+    /// does. The two reversals cancel: whichever form was used, the selected
+    /// registers appear in memory in decreasing register order, `FP7` at the
+    /// lowest address.
+    fn op_fmovem(&mut self, to_fpu: bool, mode: ListMode, list: u8) -> Result<(), Trap> {
+        let Some((ea, _)) = ea_of(Arg::Ea, self.opcode) else {
+            return Err(self.fp_line_f());
+        };
+        // "Only control addressing modes or the postincrement addressing
+        // mode" into the unit, "only control alterable addressing modes or
+        // the predecrement addressing mode" out of it.
+        let allowed = if to_fpu {
+            EaSet::MOVEM_TO_REG
+        } else {
+            EaSet::MOVEM_TO_MEM
+        };
+        if !allowed.contains(ea) {
+            return Err(self.fp_line_f());
+        }
+        let mask = if mode.dynamic() {
+            (self.state.d[(list & 7) as usize] & 0xff) as u8
+        } else {
+            list
+        };
+        let count = mask.count_ones();
+        let Loc::Mem(addr) = self.fp_address(12 * count, to_fpu)? else {
+            return Err(self.fp_line_f());
+        };
+        self.facts.registers = mask.count_ones();
+        let mut at = addr;
+        for index in (0..8u8).rev() {
+            let bit = if mode.predecrement_order() {
+                index
+            } else {
+                7 - index
+            };
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            if to_fpu {
+                let hi = self.read_long(at)?;
+                let mid = self.read_long(at.wrapping_add(4))?;
+                let lo = self.read_long(at.wrapping_add(8))?;
+                self.state.fpu.fp[index as usize] = fpu::read_extended(hi, mid, lo);
+            } else {
+                let words = fpu::write_extended(self.state.fpu.fp[index as usize]);
+                self.write_long(at, words[0])?;
+                self.write_long(at.wrapping_add(4), words[1])?;
+                self.write_long(at.wrapping_add(8), words[2])?;
+            }
+            at = at.wrapping_add(12);
+        }
+        self.state.fpu.null = false;
+        self.settle()
+    }
+
+    /// The effective address a floating-point operand of `bytes` bytes uses.
+    ///
+    /// Separate from [`Exec::resolve_ea`] because the auto-adjusting modes
+    /// step by the *operand's* size, and a floating-point operand can be
+    /// twelve bytes, which `Size` cannot name.
+    fn fp_address(&mut self, bytes: u32, read: bool) -> Result<Loc, Trap> {
+        let Some((mode, reg)) = ea_of(Arg::Ea, self.opcode) else {
+            return Err(self.fp_line_f());
+        };
+        let reg = reg as usize;
+        match mode {
+            Mode::PostInc if read => {
+                let addr = self.state.a[reg];
+                self.state.a[reg] = addr.wrapping_add(bytes);
+                self.facts.ea(3);
+                Ok(Loc::Mem(addr))
+            }
+            Mode::PreDec if !read => {
+                let addr = self.state.a[reg].wrapping_sub(bytes);
+                self.state.a[reg] = addr;
+                self.facts.ea(4);
+                Ok(Loc::Mem(addr))
+            }
+            Mode::DataReg | Mode::AddrReg | Mode::Imm | Mode::PostInc | Mode::PreDec => {
+                Err(self.fp_line_f())
+            }
+            // Every other mode computes an address without a size, so the
+            // ordinary resolver gives the right answer and reads the right
+            // number of extension words.
+            _ => self.resolve_ea(Arg::Ea, Size::Long, ExtraCycles::Operand),
+        }
+    }
+
+    /// Read a floating-point source operand of `fmt`.
+    fn fp_load(&mut self, fmt: Fmt) -> Result<(F80, Flags), Trap> {
+        let env = self.state.fpu.env();
+        let Some((mode, reg)) = ea_of(Arg::Ea, self.opcode) else {
+            return Err(self.fp_line_f());
+        };
+        let reg = reg as usize;
+        match mode {
+            Mode::DataReg => {
+                // "Only if <fmt> is byte, word, long, or single" — the
+                // footnote under every operand table in M68881UM §4.
+                if !fmt.fits_in_a_register() {
+                    return Err(self.fp_line_f());
+                }
+                self.facts.ea(timing::DN);
+                Ok(fpu::widen(
+                    fmt,
+                    u64::from(self.state.d[reg]),
+                    F80::ZERO,
+                    env,
+                ))
+            }
+            Mode::AddrReg => Err(self.fp_line_f()),
+            Mode::Imm => {
+                // The operand follows the command word in the instruction
+                // stream, a word at a time; a byte one occupies a whole word.
+                let words = (fmt.bytes().max(2) / 2) as usize;
+                self.facts.ea(if words > 2 {
+                    timing::IMM_L
+                } else {
+                    timing::IMM_W
+                });
+                let mut buffer = [0u16; 6];
+                for slot in buffer.iter_mut().take(words) {
+                    *slot = self.ext(0)?;
+                }
+                let long = |a: u16, b: u16| (u32::from(a) << 16) | u32::from(b);
+                let raw = match fmt {
+                    Fmt::Byte => u64::from(buffer[0] & 0xff),
+                    Fmt::Word => u64::from(buffer[0]),
+                    Fmt::Long | Fmt::Single => u64::from(long(buffer[0], buffer[1])),
+                    Fmt::Double => {
+                        (u64::from(long(buffer[0], buffer[1])) << 32)
+                            | u64::from(long(buffer[2], buffer[3]))
+                    }
+                    Fmt::Extended | Fmt::Packed => 0,
+                };
+                let extended = fpu::read_extended(
+                    long(buffer[0], buffer[1]),
+                    long(buffer[2], buffer[3]),
+                    long(buffer[4], buffer[5]),
+                );
+                Ok(fpu::widen(fmt, raw, extended, env))
+            }
+            _ => {
+                let Loc::Mem(addr) = self.fp_address(fmt.bytes(), true)? else {
+                    return Err(self.fp_line_f());
+                };
+                let (raw, extended) = match fmt {
+                    Fmt::Byte => (u64::from(self.read_byte(addr)?), F80::ZERO),
+                    Fmt::Word => (u64::from(self.read_word(addr)?), F80::ZERO),
+                    Fmt::Long | Fmt::Single => (u64::from(self.read_long(addr)?), F80::ZERO),
+                    Fmt::Double => {
+                        let hi = self.read_long(addr)?;
+                        let lo = self.read_long(addr.wrapping_add(4))?;
+                        ((u64::from(hi) << 32) | u64::from(lo), F80::ZERO)
+                    }
+                    Fmt::Extended | Fmt::Packed => {
+                        let hi = self.read_long(addr)?;
+                        let mid = self.read_long(addr.wrapping_add(4))?;
+                        let lo = self.read_long(addr.wrapping_add(8))?;
+                        (0, fpu::read_extended(hi, mid, lo))
+                    }
+                };
+                Ok(fpu::widen(fmt, raw, extended, env))
+            }
+        }
+    }
+
+    /// Write a floating-point destination operand of `fmt`.
+    fn fp_store(&mut self, fmt: Fmt, raw: u64, words: [u32; 3]) -> Result<(), Trap> {
+        let Some((mode, reg)) = ea_of(Arg::Ea, self.opcode) else {
+            return Err(self.fp_line_f());
+        };
+        let reg = reg as usize;
+        if mode == Mode::DataReg {
+            if !fmt.fits_in_a_register() {
+                return Err(self.fp_line_f());
+            }
+            self.facts.ea(timing::DN);
+            let size = match fmt {
+                Fmt::Byte => Size::Byte,
+                Fmt::Word => Size::Word,
+                _ => Size::Long,
+            };
+            self.state.d[reg] = merge(self.state.d[reg], raw as u32, size);
+            return Ok(());
+        }
+        let Loc::Mem(addr) = self.fp_address(fmt.bytes(), false)? else {
+            return Err(self.fp_line_f());
+        };
+        match fmt {
+            Fmt::Byte => self.write_byte(addr, raw as u8),
+            Fmt::Word => self.write_word(addr, raw as u16),
+            Fmt::Long | Fmt::Single => self.write_long(addr, raw as u32),
+            Fmt::Double => {
+                self.write_long(addr, (raw >> 32) as u32)?;
+                self.write_long(addr.wrapping_add(4), raw as u32)
+            }
+            Fmt::Extended | Fmt::Packed => {
+                self.write_long(addr, words[0])?;
+                self.write_long(addr.wrapping_add(4), words[1])?;
+                self.write_long(addr.wrapping_add(8), words[2])
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The conditional instructions
+    // ------------------------------------------------------------------
+
+    /// Evaluate a predicate, raising `BSUN` if it is one that signals and the
+    /// condition codes say unordered.
+    ///
+    /// Returns `Err` when the `BSUN` trap is enabled, which is a
+    /// **pre-instruction** exception: the stacked program counter is the
+    /// conditional instruction's own address, so an `RTE` that changes
+    /// nothing runs into it again — which is exactly what the note under
+    /// every conditional's page warns about (M68881UM §4, *FBcc*).
+    fn fp_test(&mut self, pred: Pred) -> Result<bool, Trap> {
+        let (n, z, _, nan) = self.state.fpu.condition();
+        if nan && pred.signals_unordered() {
+            self.state.fpu.raise(fpbits::BSUN);
+            self.state.fpu.accrue();
+            self.state.fpu.null = false;
+            if self.state.fpu.fpcr & u32::from(fpbits::BSUN) != 0 {
+                let pc0 = self.pc0;
+                return Err(Trap::at(vector::FP_BSUN, pc0));
+            }
+        }
+        Ok(pred.test(n, z, nan))
+    }
+
+    /// The predicate an extension word carries, or the line-F exception for
+    /// one of the thirty-two encodings the manual does not define.
+    fn fp_predicate(&mut self, word: u16) -> Result<Pred, Trap> {
+        let pred = Pred((word & 0x3f) as u8);
+        if pred.name().is_none() || word & 0xffc0 != 0 {
+            return Err(self.fp_line_f());
+        }
+        Ok(pred)
+    }
+
+    /// `FBcc`: the predicate is in the opcode and the displacement follows.
+    ///
+    /// `FNOP` is this instruction with the predicate `F` and a zero
+    /// displacement (M68881UM §4, *FNOP*), so it needs no code of its own.
+    fn op_fbcc(&mut self) -> Result<(), Trap> {
+        let pred = Pred((self.opcode & 0x3f) as u8);
+        if pred.name().is_none() {
+            return Err(self.fp_line_f());
+        }
+        // The displacement is measured from the word after the opcode.
+        let base = self.state.pc.wrapping_add(2);
+        let long = self.opcode & 0x40 != 0;
+        let taken = self.fp_test(pred)?;
+        if long {
+            let hi = self.ext(0)?;
+            let lo = self.queued()?;
+            if taken {
+                self.facts.taken = true;
+                let offset = (u32::from(hi) << 16) | u32::from(lo);
+                return self.refill(base.wrapping_add(offset), 0);
+            }
+            self.ext(0)?;
+            return self.settle();
+        }
+        let word = self.queued()?;
+        if taken {
+            self.facts.taken = true;
+            let offset = i32::from(word as i16) as u32;
+            return self.refill(base.wrapping_add(offset), 0);
+        }
+        self.ext(0)?;
+        self.settle()
+    }
+
+    /// `FDBcc`: the predicate is in the extension word, then a displacement.
+    fn op_fdbcc(&mut self) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let pred = self.fp_predicate(word)?;
+        let base = self.state.pc.wrapping_add(2);
+        let n = reg_lo(self.opcode);
+        if self.fp_test(pred)? {
+            self.ext(0)?;
+            return self.settle();
+        }
+        let counter = (self.state.d[n] as u16).wrapping_sub(1);
+        self.state.d[n] = merge(self.state.d[n], u32::from(counter), Size::Word);
+        if counter == 0xffff {
+            self.facts.expired = true;
+            self.ext(0)?;
+            return self.settle();
+        }
+        let word = self.queued()?;
+        self.facts.taken = true;
+        let target = base.wrapping_add(i32::from(word as i16) as u32);
+        self.refill(target, 0)
+    }
+
+    /// `FScc`: a byte of all ones or all zeros.
+    fn op_fscc(&mut self) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let pred = self.fp_predicate(word)?;
+        let set = self.fp_test(pred)?;
+        let dst = self.resolve(Arg::Ea, Size::Byte)?;
+        let value = if set { 0xff } else { 0x00 };
+        if matches!(dst, Loc::D(_)) {
+            self.write_loc(dst, Size::Byte, value)?;
+            self.settle()
+        } else {
+            self.settle()?;
+            self.write_back(dst, Size::Byte, value)
+        }
+    }
+
+    /// `FTRAPcc`: the `TRAPcc` exception on a floating-point condition, with
+    /// an optional operand nothing reads.
+    fn op_ftrapcc(&mut self) -> Result<(), Trap> {
+        let word = self.ext(0)?;
+        let pred = self.fp_predicate(word)?;
+        let pc0 = self.pc0;
+        let taken = self.fp_test(pred)?;
+        match self.opcode & 7 {
+            2 => {
+                self.ext(0)?;
+            }
+            3 => {
+                self.ext(0)?;
+                self.ext(0)?;
+            }
+            _ => {}
+        }
+        self.settle()?;
+        if taken {
+            let pc = self.state.pc;
+            return Err(Trap::six(vector::TRAPV, pc, pc0));
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Context switching
+    // ------------------------------------------------------------------
+
+    /// `FSAVE`: the coprocessor's internal state.
+    ///
+    /// Two frames are written. A unit that has not been touched since its
+    /// reset writes the **null** frame, four bytes of zeros, which is what
+    /// tells an operating system there is nothing to save (M68881UM §4,
+    /// *FSAVE*). Anything else writes the **idle** frame, whose length is the
+    /// coprocessor's — twenty-eight bytes on a 68881, sixty on a 68882 — with
+    /// a format word carrying a version number and the length of what follows
+    /// it.
+    ///
+    /// The body of an idle frame is "the user invisible portion of the
+    /// machine", which on hardware is microcode state. This core has none, so
+    /// it writes the one thing the frame is documented to carry that is
+    /// architectural — the pending exception byte, which `FSAVE` then clears
+    /// internally — and zeros for the rest. The version number is therefore
+    /// **this core's own**, and `FRESTORE` refuses a frame written by
+    /// anything else rather than reading somebody's microcode as its own.
+    fn op_fsave(&mut self) -> Result<(), Trap> {
+        let coprocessor = self.cfg.fpu;
+        if self.state.fpu.null {
+            let Loc::Mem(addr) = self.fp_address(4, false)? else {
+                return Err(self.fp_line_f());
+            };
+            self.write_long(addr, 0)?;
+            return self.settle();
+        }
+        let size = coprocessor.idle_frame();
+        let Loc::Mem(addr) = self.fp_address(size, false)? else {
+            return Err(self.fp_line_f());
+        };
+        let format = (u32::from(FP_STATE_VERSION) << 24) | ((size - 4) << 16);
+        self.write_long(addr, format)?;
+        let pending = self.state.fpu.fpsr & 0x0000_ff00;
+        self.write_long(addr.wrapping_add(4), pending)?;
+        for offset in (8..size).step_by(4) {
+            self.write_long(addr.wrapping_add(offset), 0)?;
+        }
+        // "Any exceptions that were pending are saved in the frame and are
+        // then cleared internally."
+        self.state.fpu.clear_exceptions();
+        self.settle()
+    }
+
+    /// `FRESTORE`: the other half.
+    ///
+    /// A null frame "is equivalent to a hardware reset of the FPCP"; a format
+    /// word this core did not write is a format error, which is what the main
+    /// processor does with one the coprocessor rejects (M68881UM §4,
+    /// *FRESTORE*).
+    fn op_frestore(&mut self) -> Result<(), Trap> {
+        let coprocessor = self.cfg.fpu;
+        let Loc::Mem(addr) = self.fp_address(4, true)? else {
+            return Err(self.fp_line_f());
+        };
+        let format = self.read_long(addr)?;
+        if format >> 16 == 0 {
+            self.state.fpu = Fpu::RESET;
+            return self.settle();
+        }
+        let version = (format >> 24) as u8;
+        let size = ((format >> 16) & 0xff) + 4;
+        if version != FP_STATE_VERSION || size != coprocessor.idle_frame() {
+            self.settle()?;
+            let pc = self.state.pc;
+            return Err(Trap::raised(vector::FORMAT_ERROR, pc));
+        }
+        let pending = self.read_long(addr.wrapping_add(4))?;
+        for offset in (8..size).step_by(4) {
+            self.read_long(addr.wrapping_add(offset))?;
+        }
+        self.state.fpu.raise((pending & 0x0000_ff00) as u16);
+        self.state.fpu.null = false;
+        // `(An)+` stepped by four for the format word; the rest of the frame
+        // follows it.
+        if let Some((Mode::PostInc, reg)) = ea_of(Arg::Ea, self.opcode) {
+            let reg = reg as usize;
+            self.state.a[reg] = self.state.a[reg].wrapping_add(size - 4);
+        }
+        self.settle()
+    }
+
     /// `MOVES`: an operand in the address space `SFC` or `DFC` names
     /// (M68000PRM, *MOVES*).
     ///
@@ -4883,6 +5646,46 @@ const SSW_RC: u16 = 0x2000;
 const SSW_RB: u16 = 0x1000;
 /// Data fault: rerun the data cycle.
 const SSW_DF: u16 = 0x0100;
+
+/// What one floating-point operation produced.
+struct FpResult {
+    /// The value, which is also what sets the condition codes.
+    value: F80,
+    /// Whether it is written to the destination register.
+    store: bool,
+    /// Whether it sets the condition codes.
+    condition: bool,
+    /// The `FPSR` exception bits it raised.
+    exc: u16,
+}
+
+impl FpResult {
+    /// A result that is stored, with the exceptions `src/float` reported and
+    /// the 68881's own tininess on top.
+    fn stored(value: F80, flags: Flags, spec: Spec) -> FpResult {
+        let mut exc = fpu::exceptions_from(flags, false);
+        // `src/float` reports underflow only for a result that is both tiny
+        // *and* inexact, which is IEEE's rule for the flag; the 68881's
+        // exception bit is tininess alone and the AND with INEX2 happens on
+        // the way into the accrued byte (M68881UM §6.1.5's note).
+        if fpu::is_tiny(value, spec) {
+            exc |= fpbits::UNFL;
+        }
+        FpResult {
+            value,
+            store: true,
+            condition: true,
+            exc,
+        }
+    }
+}
+
+/// The version number this core writes in an `FSAVE` state frame.
+///
+/// The frame's body is microcode state on hardware and this core's own here,
+/// so it carries a version of its own and `FRESTORE` refuses anybody else's
+/// — the same bargain the 68010's long bus-fault frame makes.
+const FP_STATE_VERSION: u8 = 0x40;
 
 /// The bits a root pointer descriptor has storage for: **L/U** (63), the
 /// fifteen-bit **LIMIT** (62–48), **DT** (33–32) and the table address
