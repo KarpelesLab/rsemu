@@ -159,6 +159,19 @@ pub mod x86;
 #[cfg_attr(docsrs, doc(cfg(feature = "jit-arm64")))]
 pub mod arm64;
 
+/// The WebAssembly backend.
+///
+/// Gated on the **feature alone**, like [`arm64`] and for a stronger version
+/// of the same reason: not one of its five files needs a particular host.
+/// Encoding a module and lowering a block are arithmetic, and *executing* the
+/// result is [`wasm::exec`], a wasm interpreter in safe Rust — so unlike the
+/// two native backends, this one is not the `jit::host` of anything. It is
+/// a backend a build can hold *alongside* a native one, and
+/// [`Dispatcher::with_wasm`] is the seam it attaches at.
+#[cfg(feature = "jit-wasm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-wasm")))]
+pub mod wasm;
+
 /// Whichever host code generator this build actually has, under one name.
 ///
 /// There are two backends now — [`x86`] and [`arm64`] — and at most one of

@@ -897,6 +897,38 @@ jit-x86 = ["jit", "std"]
 # and its own piece of work.
 jit-arm64 = ["jit", "std"]
 
+# The WebAssembly code generator (src/jit/wasm): ROADMAP.md §11.4, "The JIT
+# without `mmap`". wasm has no writable-then-executable memory, so an IR block
+# becomes a *wasm module* — one function, guest state and helpers reached
+# through imports, the temporary frame in the embedder's own linear memory so
+# it can live in a `SharedArrayBuffer` — instead of machine code in a W^X
+# buffer. Every constant in it comes from the WebAssembly Core Specification
+# §5 (binary format) and §4 (execution), which is an open standard.
+#
+# Three ways it differs from the two native backends, all of them consequences
+# of the target rather than choices:
+#
+#   * **No `unsafe`, and no host gate.** A module is a byte vector and entering
+#     one is a safe call, so this adds no new sanctioned `unsafe` site and does
+#     not touch the existing seven; and nothing in it executes host
+#     instructions, so every file compiles and is tested on every target,
+#     including `no_std` — this is the only JIT backend that does not imply
+#     `std`.
+#   * **No block chaining.** An instantiated module's branches cannot be
+#     patched, so every exit returns to the dispatcher (§11.4 says so, and says
+#     what it costs). The block cache's own chaining is untouched.
+#   * **A reference executor.** With no embedder there is nothing to run a
+#     module but a small wasm interpreter, which ships here so that
+#     `engine = "jit-wasm"` executes — and joins the determinism gate — on
+#     every host rather than only in a browser. It is correctness evidence, not
+#     a speed path, and it is slower than the IR interpreter; see
+#     docs/techniques/wasm-jit.md.
+#
+# A block carrying an op this backend does not lower is refused and runs on
+# `ir::Interp`, exactly as with the native backends. Adds no dependencies.
+# Needs `jit`.
+jit-wasm = ["jit"]
+
 # Level-3 execution (src/usermode): running a program with no guest kernel
 # under it, `qemu-user`/gVisor-shaped (ROADMAP.md §2, phase 5b). The four
 # things a syscall kernel cannot build for itself and rsemu owns because they
