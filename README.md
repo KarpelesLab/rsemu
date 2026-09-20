@@ -64,10 +64,16 @@ one snapshot format, one debugger, shared by every machine ever added.
   a `parallel` machine for a state hash is an error rather than a number.
 - **Runs in the browser.** `wasm32-unknown-unknown` with *and* without threads
   is a CI target from the first commit, and no `mmap`, signals, or host clock
-  appear anywhere in the core. The whole demo below runs interpreted: the JIT
-  has one host backend and it is x86-64, so a **wasm backend is designed and not
-  written** (`ROADMAP.md` §11.4) — wasm has no writable-then-executable memory
-  and needs a different mechanism from the other two.
+  appear anywhere in the core. wasm has no writable-then-executable memory, so
+  it needs a different mechanism from the other two backends, and it has one:
+  the **wasm backend** (`ROADMAP.md` §11.4) lowers an IR block to a
+  `WebAssembly.Module` rather than to machine code, needs no `unsafe` at all,
+  and reaches the same state hash as the interpreter on the same guest. **The
+  demo below still runs interpreted** — what is missing is the four lines of
+  browser glue that hand a module to the embedder, and
+  [`docs/techniques/wasm-jit.md`](docs/techniques/wasm-jit.md) is the design
+  note that says exactly what they are and why the arithmetic says a per-block
+  module may not pay off in a browser anyway.
 - **One crate, one feature per component.** A NES build links a 6502 and
   nothing else.
 
@@ -707,11 +713,16 @@ dead-code elimination, and a portable interpreter backend that needs no `unsafe`
 and runs on every target including bare metal. **Three architectures have
 frontends now** — RISC-V, x86 and AArch64 — and each of those cores takes an
 `engine` property with three values: `interp`, `jit` (the portable backend), and
-`jit-host` (native code).
+`jit-host` (native code). RISC-V takes a fourth, `jit-wasm`, which lowers each
+block to a WebAssembly module instead.
 
-There is still **one host backend and it is x86-64 Linux**; "AArch64 has a
-frontend" means an AArch64 *guest* is lowered to x86-64 host code, not that
-there is an aarch64 code generator. Each row below is the median of interleaved
+**AArch64 has a frontend** means an AArch64 *guest* is lowered to host code —
+which is not the same claim as having an aarch64 code generator. There are
+three backends: `jit::x86` (x86-64 Linux), `jit::arm64` (aarch64 Linux, written
+on an x86-64 machine and therefore never yet executed) and `jit::wasm`
+(`engine = "jit-wasm"`, a `WebAssembly.Module` per block). **Every number in the
+table below was taken on x86-64 Linux under `jit-host`**, so it says nothing
+about the other two. Each row below is the median of interleaved
 runs of a real Linux boot on that board, and every run in a row finished on one
 state hash:
 
@@ -746,8 +757,21 @@ measured against got **1.27× faster** (155.1 s → 122.3 s) and the control mov
 the numbers and that argument are in
 [`docs/platforms/riscv-virt.md`](docs/platforms/riscv-virt.md),
 [`docs/platforms/pc64.md`](docs/platforms/pc64.md) and
-[`docs/platforms/arm64-virt.md`](docs/platforms/arm64-virt.md). No aarch64 host
-backend, and **no wasm backend** — the browser runs interpreted.
+[`docs/platforms/arm64-virt.md`](docs/platforms/arm64-virt.md).
+
+**There is a wasm backend now, and the browser still runs interpreted** — which
+is two statements rather than a contradiction. `engine = "jit-wasm"` lowers each
+IR block to a WebAssembly module and executes it, on every target, and reaches
+the same state hash as the interpreter at every checkpoint of
+`tests/riscv_virt_engines.rs`. On a native host it executes those modules with a
+reference interpreter, which makes it the *slowest* of the four engines and is
+the point: the translation is executed and hashed everywhere rather than only
+where a browser is. Handing a module to a real `WebAssembly.Module` is the
+embedder's job, it is specified down to the import names in
+[`docs/techniques/wasm-jit.md`](docs/techniques/wasm-jit.md), and it is not
+written — so no number here says whether a wasm module beats the IR interpreter
+in a browser, and `ROADMAP.md` §11.4's own arithmetic suggests it may not
+without superblocks.
 
 Two caveats on all of the above. `engine` is a `param` on the seven boards that
 run third-party system software — `riscv-virt`, `arm64-virt`, `arm64-virt-smp`,

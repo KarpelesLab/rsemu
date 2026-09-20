@@ -35,12 +35,20 @@ and documented on MDN. Two constraints drive the whole design:
 ## Implementation notes
 
 - **No `mmap` means no native code path.** The JIT emits wasm modules instead;
-  synchronous `new WebAssembly.Module()` is permitted inside a worker.
+  synchronous `new WebAssembly.Module()` is permitted inside a worker. That
+  backend now exists — `src/jit/wasm`, `engine = "jit-wasm"` — and
+  [`wasm-jit.md`](wasm-jit.md) is its design note. Everything in the three
+  points below is revisited there against what was actually built; two of them
+  changed.
 - Per-module instantiation cost means only superblocks are worth compiling.
   Measure this at and cut the backend if the numbers say so — the IR
-  interpreter is always the fallback.
+  interpreter is always the fallback. *Still the open question, and the cost
+  model is now written down rather than asserted.*
 - Guest RAM lives in the shared linear memory, so generated code addresses it
-  with plain loads and stores.
+  with plain loads and stores. *Not yet:* the address a block holds is
+  guest-physical, and turning one into a linear-memory offset is the software
+  TLB's job. Generated code calls the host for every access and imports linear
+  memory only for its temporary frame.
 - Virtual time is computed internally, so a browser session replays
   bit-identically under a native debugger.
 

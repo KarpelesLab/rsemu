@@ -228,8 +228,10 @@ something a person can actually run (§2).
 > a translated block (97.3% one round ago and 84.5% two before that), **99.4%**
 > of the AArch64 guest's, and 99.8% of compiled RISC-V stores writing guest RAM
 > inline. What is *not*
-> done: the aarch64 *host* backend, the **wasm backend** (§11.4), and the
-> tier-2 pipeline — the browser still runs interpreted. Nor is the ≥100 MIPS
+> done: the tier-2 pipeline, and the browser *embedder* for the wasm backend —
+> `jit::wasm` emits the modules and `engine = "jit-wasm"` executes them
+> everywhere through a reference executor (§11.4), but nothing yet hands one to
+> a `WebAssembly.Module`, so the browser still runs interpreted. Nor is the ≥100 MIPS
 > half of the gate claimed: `docs/bench-host.md` now names the reference host
 > and its versus-QEMU row is measured, but its CPU-throughput row — `coremark`
 > on RV64GC — has not been run, and this project's own rule is that a gate
@@ -1905,7 +1907,8 @@ then **`wasm`** (§11.4) for the browser, plus a **portable IR interpreter
 backend** so an unsupported host degrades in speed rather than failing to run.
 Native code buffers are W^X: `mmap` RW → emit → `mprotect` RX, via raw syscalls,
 no libc — the `purestd`/`kataan::jit` pattern. The wasm backend has no such
-buffer; it emits a module and instantiates it.
+buffer; it emits a module and instantiates it, which is why it is the one
+backend with no `unsafe` in it (§11.4).
 
 **Compilation runs off the emulation thread.** Translation is submitted to the
 `core::sync` task pool (§4.7) while the interpreter keeps executing the same
@@ -2095,12 +2098,65 @@ so the wasm backend only tiers up superblocks; module count is bounded with an
 LRU eviction of cold code; and the portable IR interpreter is always the
 fallback, so a browser with no `WebAssembly.Module` budget still runs.
 
+**Built** — `src/jit/wasm`, `engine = "jit-wasm"`, feature `jit-wasm`, and
+`docs/techniques/wasm-jit.md` is the design note. Every clause above was kept
+except two, and both changes are argued there rather than here: guest RAM is
+reached through an *import* rather than by loading from the imported memory
+(the software TLB's answer is what makes a guest-physical address an offset, and
+inlining that probe is worth doing only once an embedder can say what the call
+it avoids costs); and the `call_indirect` table is the *embedder's* re-entry,
+which this build does not use because `jit::dispatch` re-enters in Rust. The
+tiering heuristic is deliberately absent: the cost model is written down, and
+the input it needs is a number nobody has taken.
+
+Three things about it are worth recording because they were not obvious from
+the plan:
+
+* **It needs no `unsafe`, and no host gate.** A module is a byte vector and
+  entering one is a safe call, so this backend adds no sanctioned site and
+  touches none of the seven; and nothing in it executes host instructions, so
+  every file compiles and is tested on every target. It is the only JIT backend
+  that does not imply `std`.
+* **It skips the register allocator.** wasm functions declare arbitrarily many
+  locals and the engine allocates registers for them, so `ir::linear_scan` —
+  shared by both native backends — is not used at all. One `i64` local per IR
+  temporary, and a write-through to a frame in linear memory for the
+  temporaries a boundary names, which is what publishes architectural state.
+* **Invalidation is simpler without patchable code, not harder.** A module is
+  only reachable through the block cache, so a guest store into its page, a
+  topology bump or an eviction from the module table each make it unreachable
+  and there is no jump to unpatch.
+
+A **reference executor** — a wasm interpreter over the emitted subset, in safe
+Rust — ships with it, so the backend executes everywhere rather than only where
+an embedder exists. That is the opposite trade from `jit::arm64`, whose
+functional tests run on one runner: `jit-wasm` joins
+`tests/riscv_virt_engines.rs`'s state-hash gate on the x86-64 runner that gates
+every commit. It is slower than the IR interpreter, by construction, and it is
+correctness evidence rather than a speed path. `tests/wasm_jit_v8.rs` hands the
+same modules to V8 through `node` where one is available, so the *encoding* is
+checked against a real engine and the *semantics* against `ir::Interp`.
+
 ### 11.5 Host imports
 
 Follows `purecrypto`'s browser convention — an embedder-supplied import object,
 not a bundled JS runtime: `rsemu.now`, `rsemu.random_get`, `rsemu.compile`
 (bytes → module handle), `rsemu.log`. Under WASI the same functions bind to
 preview-1 imports instead. Nothing else crosses the boundary.
+
+**One correction, and it matters for §11.4.** The last sentence but one is true
+of `rsemu.now` and `rsemu.random_get` — `clock_time_get` and `random_get` — and
+**false of `rsemu.compile`**: WASI preview 1 has no interface for compiling or
+instantiating a module, and neither does preview 2, where instantiation is a
+component-model concern rather than something a command module asks its host
+for. There is no preview-1 import to bind to. So the supported embedder for the
+wasm JIT is the **browser**, on `wasm32-unknown-unknown`; a `wasm32-wasip1`
+build falls back to the portable backend, which is §9's rule and costs nothing
+but speed. A particular WASI runtime could supply a non-standard import —
+rsemu's side of it is unchanged — but that is a runtime extension, and calling
+it WASI support would be a lie. `docs/techniques/wasm-jit.md` has the exact
+export and import list an embedder wires: four imports, three exports, and no
+JavaScript logic at all.
 
 ### 11.6 What determinism buys here
 
@@ -2524,12 +2580,12 @@ a single repetition of the arm64 leg can flatter rsemu by nearly 2×.
    allocation is the item that gains most from where chaining stopped, because
    a boundary is now one call into Rust rather than two frames and a dispatcher
    round trip. Tier-2 stays last: a feedback tier re-optimises the 8%.
-6. **`aarch64` + `riscv64` host backends.** Unchanged and unmoved — this is
-   reach rather than speed. There is one host backend, x86-64 Linux, and the
-   browser runs interpreted, so what a second backend buys is that a host which
-   is not this one gets a JIT at all. For the same reason, no number this
-   project has published says anything about how fast rsemu is on an ARM
-   laptop.
+6. **`riscv64` host backend.** Unchanged and unmoved — this is reach rather
+   than speed. There are three backends now — x86-64 Linux, aarch64 Linux
+   (`jit::arm64`) and WebAssembly (`jit::wasm`) — so what a fourth buys is that
+   a host which is none of those gets a JIT at all. No number this project has
+   published says anything about how fast rsemu is on an ARM laptop: the
+   aarch64 backend has never been executed on one.
 7. **SMP emulation on native threads and wasm workers, with a correct memory
    model.** Unchanged, and it is a *correctness* deliverable that happens to
    live in the performance phase — its gate below is litmus tests and a stress
@@ -2665,7 +2721,13 @@ Recorded here because each will be tempting to violate around phase 5–6.
 - **wasm JIT economics.** Per-module instantiation cost means the wasm backend
   only pays off on superblocks; if measurement says otherwise, the honest
   outcome is that the browser ships the IR interpreter and the wasm backend is
-  cut. Decide with numbers at phase 5, not with hope at phase 0.
+  cut. Decide with numbers at phase 5, not with hope at phase 0. *Still open,
+  and now specific:* the backend exists and the cost model is written down
+  (`docs/techniques/wasm-jit.md`), and the one input it needs — what
+  instantiating a small module costs in the engine the page runs on — cannot be
+  taken without the browser embedder. The arithmetic as it stands says a block
+  must run in the thousands of times before a per-block module pays, which is an
+  argument for the superblock and against shipping this as a default.
 - **Guest memory models.** A TSO guest on a weakly-ordered host is where
   parallel emulation goes wrong, and the failures are load-dependent and
   host-specific. This is why the barrier responsibility is pinned to the
