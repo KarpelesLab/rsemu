@@ -110,15 +110,35 @@ pub struct Registers {
 
 /// Where a command has got to.
 ///
-/// Returned by [`AtaDisk::taskfile_start`] and by
-/// [`AtaDisk::taskfile_phase`] afterwards. A caller moves data while it says
-/// [`Phase::Data`] and reads [`AtaDisk::taskfile_registers`] when it says
-/// [`Phase::Done`] — including when a command that never had a data phase
-/// says it immediately.
+/// Returned by [`TaskfileDevice::taskfile_start`] and by
+/// [`TaskfileDevice::taskfile_phase`] afterwards. A caller moves data while it
+/// says [`Phase::Data`] and reads [`TaskfileDevice::taskfile_registers`] when
+/// it says [`Phase::Done`] — including when a command that never had a data
+/// phase says it immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// Nothing more to move. The command is over, successfully or not.
     Done,
+    /// The device is waiting for a **command packet** and nothing else will
+    /// happen until it has one.
+    ///
+    /// A packet device only. ATA/ATAPI-6 §9.10 step 3: `PACKET` opens a phase
+    /// in which the register block says `C/D = 1`, `I/O = 0` — *give me a
+    /// command descriptor block* — and the twelve or sixteen bytes that follow
+    /// are the command, not data.
+    ///
+    /// It is a variant of its own rather than a `Data { out: true }` because
+    /// the two come from different places and the adapter has to know which.
+    /// A data block comes from the scatter/gather list a driver built; a
+    /// command packet does not exist there at all — on a cable it is written
+    /// through the data register, and on a Serial ATA port it is the command
+    /// table's own `ACMD` field (AHCI 1.3.1 §4.2.3). An adapter that fed this
+    /// phase from the PRDT would consume a descriptor that belongs to the data
+    /// and misalign everything after it.
+    Packet {
+        /// How many bytes of command packet the device is still waiting for.
+        bytes: u64,
+    },
     /// The drive is holding `DRQ` up over a block.
     Data {
         /// Host to device. A read is `false`.
@@ -136,8 +156,8 @@ pub enum Phase {
         /// How many bytes are left in the block the drive currently has open.
         ///
         /// The size a PIO Setup FIS's Transfer Count reports, and the most a
-        /// single [`AtaDisk::taskfile_read`] or [`AtaDisk::taskfile_write`]
-        /// will move.
+        /// single [`TaskfileDevice::taskfile_read`] or
+        /// [`TaskfileDevice::taskfile_write`] will move.
         block: u64,
     },
 }
@@ -148,6 +168,65 @@ impl Phase {
     pub fn is_data(self) -> bool {
         matches!(self, Phase::Data { .. })
     }
+}
+
+// ---------------------------------------------------------------------------
+// the seam itself
+// ---------------------------------------------------------------------------
+
+/// A device that answers a whole command block at once.
+///
+/// The struct door, written down as a trait so that more than one kind of
+/// device can stand behind it. That is not speculation: an AHCI port carries a
+/// packet device as readily as a hard disk, the two differ in their command
+/// *set* and not in their transport, and an engine typed on [`AtaDisk`] could
+/// only ever drive one of them. The cable's trait is
+/// [`AtaDevice`](crate::dev::ata::AtaDevice) and this is its supertrait
+/// relationship spelled the honest way round: everything that answers a
+/// taskfile also answers the eight registers, because the taskfile *is* those
+/// registers arriving all at once.
+///
+/// **There is still no second command set.** Both implementations load the
+/// struct into the very same command block registers a port write would have
+/// left and then run the very same dispatch; see this module's documentation.
+/// What the trait adds is a second *caller*, not a second decode.
+///
+/// # What a caller does
+///
+/// 1. [`taskfile_start`](TaskfileDevice::taskfile_start) with the command.
+/// 2. While the answer is [`Phase::Packet`], hand over the command packet with
+///    [`taskfile_write`](TaskfileDevice::taskfile_write) — from wherever the
+///    transport keeps one, which is never the data path.
+/// 3. While the answer is [`Phase::Data`], move the block with
+///    [`taskfile_read`](TaskfileDevice::taskfile_read) or
+///    [`taskfile_write`](TaskfileDevice::taskfile_write), looping because one
+///    call moves at most the rest of the block, and ask
+///    [`taskfile_phase`](TaskfileDevice::taskfile_phase) again.
+/// 4. On [`Phase::Done`], report
+///    [`taskfile_registers`](TaskfileDevice::taskfile_registers).
+pub trait TaskfileDevice: crate::dev::ata::AtaDevice {
+    /// Run `tf`, and say where the command got to.
+    fn taskfile_start(&self, tf: &Taskfile) -> Phase;
+
+    /// Where the command in flight has got to.
+    fn taskfile_phase(&self) -> Phase;
+
+    /// The command block, for the completion a host adapter reports. No side
+    /// effect — the Alternate Status register's promise.
+    fn taskfile_registers(&self) -> Registers;
+
+    /// Take the pending `INTRQ`, as reading the Status register does, and say
+    /// whether there was one: the `I` bit of the FIS the device would send at
+    /// this moment.
+    fn taskfile_acknowledge(&self) -> bool;
+
+    /// Copy out of the block the device is holding under `DRQ`, device to
+    /// host. Returns how many bytes moved; zero when there is no such block.
+    fn taskfile_read(&self, dst: &mut [u8]) -> u64;
+
+    /// Fill the block the device is holding under `DRQ`, host to device —
+    /// including a [`Phase::Packet`] one. Returns how many bytes moved.
+    fn taskfile_write(&self, src: &[u8]) -> u64;
 }
 
 impl AtaDisk {
@@ -331,6 +410,37 @@ impl AtaDisk {
     #[must_use]
     pub fn sector_bytes(&self) -> u64 {
         SECTOR
+    }
+}
+
+/// The inherent methods above, as the trait an adapter is written against.
+///
+/// Forwarding and nothing else: `pc/ide` and every test reach an `AtaDisk`
+/// directly and keep the inherent names, and an adapter that can drive either
+/// kind of device reaches the same code through the trait.
+impl TaskfileDevice for AtaDisk {
+    fn taskfile_start(&self, tf: &Taskfile) -> Phase {
+        AtaDisk::taskfile_start(self, tf)
+    }
+
+    fn taskfile_phase(&self) -> Phase {
+        AtaDisk::taskfile_phase(self)
+    }
+
+    fn taskfile_registers(&self) -> Registers {
+        AtaDisk::taskfile_registers(self)
+    }
+
+    fn taskfile_acknowledge(&self) -> bool {
+        AtaDisk::taskfile_acknowledge(self)
+    }
+
+    fn taskfile_read(&self, dst: &mut [u8]) -> u64 {
+        AtaDisk::taskfile_read(self, dst)
+    }
+
+    fn taskfile_write(&self, src: &[u8]) -> u64 {
+        AtaDisk::taskfile_write(self, src)
     }
 }
 

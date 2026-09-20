@@ -38,14 +38,49 @@
 //!
 //! # There is one command set, and it is not here
 //!
-//! Not a single ATA opcode appears in this file. A command reaches the drive as
-//! a [`Taskfile`] — six named fields — and comes back as
-//! [`Registers`]; the decode, the addressing, the media access and the
-//! busy/DRQ handshake are all [`crate::dev::ata::disk`]'s, shared byte for byte
-//! with the AT's IDE channel. What this file contributes is the *transport*: a
-//! FIS is a byte layout, a PRD is a byte layout, and byte layouts belong to the
+//! Not a single ATA opcode appears in this file, and not a single SCSI one. A
+//! command reaches the device as a [`Taskfile`] — six named fields — and comes
+//! back as [`Registers`]; the decode, the addressing, the media access and the
+//! busy/DRQ handshake are all [`crate::dev::ata`]'s, shared byte for byte with
+//! the AT's IDE channel. What this file contributes is the *transport*: a FIS
+//! is a byte layout, a PRD is a byte layout, and byte layouts belong to the
 //! adapter that receives them, exactly as a port number belongs to the adapter
 //! that decodes it.
+//!
+//! # Two kinds of device, and how a packet reaches one
+//!
+//! A port carries an `ata.disk` or an `ata.cdrom`, and the engine below cannot
+//! tell which — the seam is [`TaskfileDevice`], not `AtaDisk`. What a packet
+//! device needs that a hard disk does not is a way to be handed its
+//! **command packet**, and a Serial ATA port has no data register to write one
+//! through. So the twelve or sixteen bytes live in the command table's own
+//! `ACMD` field at offset `40h` (§4.2.3), the command header's `A` bit says
+//! they are there (§4.2.2), and the adapter transmits them itself when the
+//! device asks — which is [`Phase::Packet`], out of the drive, so that nothing
+//! here reads an opcode to find out that a command has a packet in it.
+//!
+//! ```text
+//!   command table                              the device
+//!   -------------                              ----------
+//!   CFIS  = PACKET, byte count limit ────────►  Phase::Packet { bytes }
+//!   ACMD  = READ(10), INQUIRY, …     ────────►  taskfile_write
+//!   PRDT  ◄──────── the data, and only the data ── Phase::Data
+//! ```
+//!
+//! The `ACMD` field is **not** part of the transfer: no PRD is spent on it,
+//! `PRDBC` does not count it, and no PIO Setup FIS announces it — the device
+//! raises no interrupt for that phase (ATA/ATAPI-6 §9.10 step 2), so there
+//! would be nothing to report. `PxCMD.ATAPI` is a separate thing again: §3.3.7
+//! gives it one consequence, the activity LED, and gating the `ACMD` path on it
+//! would break `IDENTIFY PACKET DEVICE`, which the same port answers between
+//! two `PACKET`s with no packet in it at all.
+//!
+//! The completion rules are the ones the drive already carried. A packet
+//! data-in command ends on a Register - Device to Host FIS *after* its last
+//! data block — Serial ATA 2.6 §11.7's single exception does not apply to it —
+//! so it raises `PxIS.PSS` per block and `PxIS.DHRS` once at the end, where an
+//! ATA PIO read raises only `PSS`. This adapter does not decide that: the drive
+//! leaves an interrupt pending or does not, and the rule below reads it.
 //!
 //! # Locks, and the order they go in
 //!
@@ -115,22 +150,12 @@
 //!   how a driver is supposed to find out.
 //! * **MSI and MSI-X**, because `src/bus/pci` has no capability list yet. The
 //!   adapter is pin-based, which AHCI permits.
-//! * **ATAPI.** The `A` bit in a command header is accepted and ignored, and a
-//!   packet device in a SATA bay reads as an **empty port** — `Bay::drive()`
-//!   means "the hard disk, if what is in the bay is one", and this engine can
-//!   only drive one.
-//!
-//!   That is a decision rather than an oversight, and it is a larger piece of
-//!   work than it looks. An AHCI port does not deliver a command packet the
-//!   way a cable does: the twelve or sixteen bytes live in the command table's
-//!   own `ACMD` field at offset 0x40 (AHCI 1.3.1 §4.2.3) and the adapter hands
-//!   them over as the first data phase, `PxCMD.ATAPI` selects which commands
-//!   drive the activity LED, and `PxSIG` has to report `0xEB140101` rather than
-//!   `0x00000101`. Underneath that, `ata::disk::taskfile` — the seam this whole
-//!   engine speaks — is typed on `AtaDisk` and would have to become a trait
-//!   before a second kind of device could answer it. `dev/pc/ide` needed none
-//!   of that, because a cable carries whatever is plugged into it; this
-//!   adapter is not a cable.
+//! * **Everything a packet device can do that this one cannot.** ATAPI works
+//!   (above), but the drive on the far end is `ata.cdrom`, which is read-only
+//!   by construction and models no audio track, no `READ CD`, no sub-channel
+//!   and no changer. `ACMD` is read as sixteen bytes and a twelve-byte packet
+//!   is what this drive takes; a device wanting more than the field holds is an
+//!   interface error rather than a guess.
 //!
 //! # Sources
 //!
@@ -175,7 +200,7 @@ use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 use crate::dev::ata::bays::Bay;
 use crate::dev::ata::disk::{CTL_SRST, ST_BSY, ST_DRQ, ST_ERR};
-use crate::dev::ata::{AtaDisk, Phase, Registers, Taskfile};
+use crate::dev::ata::{Phase, Registers, Taskfile, TaskfileDevice};
 
 // ---------------------------------------------------------------------------
 // shape
@@ -225,6 +250,20 @@ const RECEIVED_FIS_LEN: u64 = 256;
 /// Where the PRDT starts inside a command table (§4.2.3): after the 64-byte
 /// command FIS, the 16-byte ATAPI command and 48 reserved bytes.
 const PRDT_OFFSET: u64 = 0x80;
+
+/// Where the `ACMD` field sits inside a command table (§4.2.3): straight after
+/// the 64-byte command FIS.
+///
+/// The command packet a packet device is waiting for, and the whole reason an
+/// AHCI port can carry one at all. A ribbon cable has a data register the host
+/// writes the twelve bytes through; a Serial ATA port has neither, so the
+/// bytes live *here*, in the command table the driver already built, and the
+/// adapter hands them over itself when the command header's `A` bit says to.
+const ACMD_OFFSET: u64 = 0x40;
+
+/// How many bytes the `ACMD` field holds (§4.2.3): sixteen, which covers both
+/// legal command packet lengths.
+const ACMD_LEN: usize = 16;
 
 /// Bytes in one Physical Region Descriptor (§4.2.3.3): four dwords.
 const PRD_LEN: u64 = 16;
@@ -352,9 +391,20 @@ const CMD_FR: u32 = 1 << 14;
 /// what resets `PxCI` — and then back to one. A model that made `CR` follow `ST`
 /// would leave a driver's recovery sequence with nothing to wait on.
 const CMD_CR: u32 = 1 << 15;
-/// `PxCMD.ATAPI` and `PxCMD.DLAE`: which commands drive the activity LED. There
-/// is no LED, so they are storage and nothing else (§3.3.7).
-const CMD_WRITABLE: u32 = CMD_ST | CMD_CLO | CMD_FRE | (1 << 24) | (1 << 25);
+/// `PxCMD.ATAPI`: a device on this port is a packet device (§3.3.7).
+///
+/// A driver sets it when it finds `EB140101h` in `PxSIG`, and §3.3.7 gives it
+/// exactly one consequence — with `PxCMD.DLAE`, which commands drive the
+/// activity LED. There is no LED here, so the bit is storage. It is **not**
+/// what decides whether a command carries a packet: that is the command
+/// header's `A` bit (§4.2.2), which is per command rather than per port,
+/// because the same port answers `IDENTIFY PACKET DEVICE` — an ordinary PIO
+/// command with no packet in it — between two `PACKET`s. Gating the `ACMD`
+/// path on `PxCMD.ATAPI` would break exactly that.
+const CMD_ATAPI: u32 = 1 << 24;
+/// `PxCMD.DLAE`, Drive LED on ATAPI Enable (§3.3.7). Storage, as above.
+const CMD_DLAE: u32 = 1 << 25;
+const CMD_WRITABLE: u32 = CMD_ST | CMD_CLO | CMD_FRE | CMD_ATAPI | CMD_DLAE;
 /// `PxCMD.CCS`, the slot the adapter is issuing from (§3.3.7).
 const CMD_CCS_SHIFT: u32 = 8;
 const CMD_CCS_MASK: u32 = 0x1f << CMD_CCS_SHIFT;
@@ -409,6 +459,10 @@ const D2H_I: u8 = 1 << 6;
 
 /// The `D` bit of a PIO Setup FIS: set when the device is writing host memory.
 const PIO_D: u8 = 1 << 5;
+
+/// `A`, bit 5 of a command header's first dword (§4.2.2): this command carries
+/// an ATAPI command packet in the command table's `ACMD` field.
+const HEADER_A: u32 = 1 << 5;
 
 // ---------------------------------------------------------------------------
 // state
@@ -686,10 +740,15 @@ impl Hba {
         MemAttrs::DEFAULT.with_requester(RequesterId(self.requester.load(Ordering::Relaxed)))
     }
 
-    /// The drive on port `index`, with the bay lock released before anything
+    /// The device on port `index`, with the bay lock released before anything
     /// outward happens.
-    fn drive(&self, index: usize) -> Option<Arc<AtaDisk>> {
-        self.ports.get(index).and_then(|p| p.bay.drive())
+    ///
+    /// [`Bay::taskfile`](crate::dev::ata::bays::Bay::taskfile) and not
+    /// `Bay::drive`: a Serial ATA port carries a packet device as readily as a
+    /// hard disk, and `Bay::drive` means "the hard disk, if what is in the bay
+    /// is one" — which made a CD-ROM in a SATA bay read as an empty port.
+    fn device(&self, index: usize) -> Option<Arc<dyn TaskfileDevice>> {
+        self.ports.get(index).and_then(|p| p.bay.taskfile())
     }
 
     /// Whether port `index` has a device on it.
@@ -771,8 +830,8 @@ impl Hba {
         // as the port's signature, and the ordering between this device's reset
         // and the drive's own would become guest-visible.
         for index in 0..self.ports.len() {
-            if let Some(drive) = self.drive(index) {
-                drive.power_on_reset();
+            if let Some(device) = self.device(index) {
+                device.power_on_reset();
             }
         }
         // The drives are read *before* the state lock is taken: a bay and a
@@ -787,7 +846,7 @@ impl Hba {
         // the drive. An empty port receives no FIS and keeps `7Fh` and
         // `FFFFFFFFh`.
         let answered: Vec<Option<Registers>> = (0..self.ports.len())
-            .map(|index| self.drive(index).map(|d| d.taskfile_registers()))
+            .map(|index| self.device(index).map(|d| d.taskfile_registers()))
             .collect();
         let mut state = self.state.lock();
         *state = State::new();
@@ -1097,7 +1156,7 @@ impl Hba {
     /// how a driver learns what is on the port.
     fn comreset(&self, index: usize) {
         let det = self.state.lock().ports[index].sctl & DET_MASK;
-        let drive = self.drive(index);
+        let drive = self.device(index);
         if det == DET_INIT {
             // The lock is released before the drive is touched: the drive's own
             // lock ranks above this one.
@@ -1251,6 +1310,9 @@ struct Header {
     prdtl: u32,
     /// `C`: clear `BSY` and the command's `PxCI` bit once the FIS has gone.
     clear_busy: bool,
+    /// `A`: the command table's `ACMD` field holds a command packet for a
+    /// packet device (§4.2.2).
+    atapi: bool,
     /// The command table's base, already 128-byte aligned.
     ctba: u64,
 }
@@ -1442,6 +1504,7 @@ impl Hba {
             cfl: u64::from(dw0 & 0x1f),
             prdtl: dw0 >> 16,
             clear_busy: dw0 & (1 << 10) != 0,
+            atapi: dw0 & HEADER_A != 0,
             // §4.2.2: bits 06:00 of `CTBA` are reserved — 128-byte alignment.
             ctba: (u64::from(le32(&raw[8..12])) & !0x7f) | (u64::from(le32(&raw[12..16])) << 32),
         };
@@ -1468,7 +1531,7 @@ impl Hba {
             self.port_fatal(job.port, IS_IFS);
             return;
         }
-        let Some(drive) = self.drive(job.port) else {
+        let Some(drive) = self.device(job.port) else {
             // A running port with nothing on it. There is no device to answer,
             // which is what §6.1.2's interface error covers.
             self.port_fatal(job.port, IS_IFS);
@@ -1489,7 +1552,13 @@ impl Hba {
     /// asymmetry is the whole subtlety: while `SRST` is asserted the device is
     /// busy and answers nothing, so only the command header's `C` bit can clear
     /// `PxCI` for that slot.
-    fn control_fis(&self, job: &Job, drive: &Arc<AtaDisk>, header: &Header, control: u8) {
+    fn control_fis(
+        &self,
+        job: &Job,
+        drive: &Arc<dyn TaskfileDevice>,
+        header: &Header,
+        control: u8,
+    ) {
         let previous = self.state.lock().ports[job.port].ctl;
         drive.write_device_control(control);
         let released = previous & CTL_SRST != 0 && control & CTL_SRST == 0;
@@ -1527,12 +1596,65 @@ impl Hba {
         }
     }
 
+    /// Hand a packet device the command packet it is waiting for.
+    ///
+    /// AHCI 1.3.1 §4.2.3: the twelve or sixteen bytes live in the command
+    /// table's `ACMD` field at offset `40h`, and §4.2.2's `A` bit in the
+    /// command header is what says they are there. **`A` clear is an interface
+    /// error and not a shrug**: the device has raised `DRQ` over a block it
+    /// will not proceed without, and the adapter has nowhere else to get one
+    /// from — a real link would sit there until the host timed the command out,
+    /// and §6.1.2's `IFS` is the nearest honest report of "this port cannot
+    /// complete the exchange".
+    ///
+    /// The loop is the contract [`TaskfileDevice::taskfile_write`] states: one
+    /// call moves at most the rest of the block, so a device that asked for
+    /// sixteen bytes and one that asked for twelve are both served without this
+    /// function knowing which.
+    ///
+    /// # Errors
+    ///
+    /// The `PxIS` bit to raise: `IFS` when there is no packet to send,
+    /// `HBFS` when the command table cannot be read.
+    fn deliver_packet(
+        &self,
+        space: &AddressSpace,
+        drive: &Arc<dyn TaskfileDevice>,
+        header: &Header,
+    ) -> core::result::Result<(), u32> {
+        if !header.atapi {
+            return Err(IS_IFS);
+        }
+        let mut acmd = [0u8; ACMD_LEN];
+        if space
+            .read_bytes(header.ctba + ACMD_OFFSET, &mut acmd, self.attrs())
+            .is_err()
+        {
+            return Err(IS_HBFS);
+        }
+        let mut at = 0usize;
+        while let Phase::Packet { bytes } = drive.taskfile_phase() {
+            if bytes == 0 || at >= ACMD_LEN {
+                // A device asking for more than the field holds is one this
+                // adapter cannot serve; §6.1.2 again.
+                return Err(IS_IFS);
+            }
+            let want = core::cmp::min(bytes as usize, ACMD_LEN - at);
+            let did = drive.taskfile_write(&acmd[at..at + want]) as usize;
+            if did == 0 {
+                return Err(IS_IFS);
+            }
+            at += did;
+        }
+        Ok(())
+    }
+
     /// A Register - Host to Device FIS with `C` set: an ATA command.
     fn command_fis(
         &self,
         job: &Job,
         space: &AddressSpace,
-        drive: &Arc<AtaDisk>,
+        drive: &Arc<dyn TaskfileDevice>,
         header: &Header,
         cfis: &[u8; 64],
     ) {
@@ -1556,6 +1678,23 @@ impl Hba {
             state.ports[job.port].tfd |= u32::from(ST_BSY);
         }
         let mut phase = drive.taskfile_start(&tf);
+        // §5.6.4: a packet device answers `PACKET` by asking for the command
+        // packet, and on a Serial ATA link there is no data register to write
+        // it through — the adapter transmits it, out of the command table's own
+        // `ACMD` field, before any data moves. It is not part of the transfer:
+        // no PRD is consumed, `PRDBC` does not count it, and no PIO Setup FIS
+        // is posted for it, because the drive raises no interrupt for this
+        // phase (ATA/ATAPI-6 §9.10 step 2 — `IDENTIFY PACKET DEVICE` word 0
+        // bits 6:5 report microprocessor DRQ, so a host polls for it).
+        if let Phase::Packet { .. } = phase {
+            match self.deliver_packet(space, drive, header) {
+                Ok(()) => phase = drive.taskfile_phase(),
+                Err(bit) => {
+                    self.port_fatal(job.port, bit);
+                    return;
+                }
+            }
+        }
         let mut prdt = Prdt::new(header.ctba + PRDT_OFFSET, header.prdtl);
         let mut scratch = [0u8; CHUNK];
         let mut moved: u64 = 0;
@@ -1691,7 +1830,10 @@ impl Hba {
             match drive.taskfile_phase() {
                 Phase::Data { out: false, .. } => pss_owed |= self.discard(drive),
                 Phase::Data { out: true, .. } => write_overflow = true,
-                Phase::Done => {}
+                // A device asking for another command packet after its data
+                // phase is a state no command set here reaches; there is
+                // nothing to discard and nothing to feed it.
+                Phase::Packet { .. } | Phase::Done => {}
             }
         }
 
@@ -1775,7 +1917,7 @@ impl Hba {
     /// is taken as `command_fis` takes it; returns whether any of them had the
     /// `I` bit set, which `PxIS.PSS` reports whatever became of the data
     /// (AHCI 1.3.1 §3.3.5).
-    fn discard(&self, drive: &Arc<AtaDisk>) -> bool {
+    fn discard(&self, drive: &Arc<dyn TaskfileDevice>) -> bool {
         let mut scratch = [0u8; CHUNK];
         let mut interrupt = false;
         for _ in 0..MAX_BLOCKS {

@@ -779,3 +779,263 @@ fn a_snapshot_carries_the_sense_and_the_tray_lock() {
     );
     assert_eq!(ended.status & ST_CHK, ST_CHK);
 }
+
+// ---------------------------------------------------------------------------
+// the taskfile door
+// ---------------------------------------------------------------------------
+//
+// The second way in, which a Serial ATA adapter uses because it has no
+// registers to write in order. The claim being tested is that it is the *same*
+// drive underneath: every assertion below compares what the struct door
+// produces against what the cable produces, so a second command set would show
+// up as a difference rather than as a second set of green tests.
+
+/// Run a packet command through the taskfile seam, the way `dev/ahci` does, and
+/// hand back what came out and how many interrupts were taken.
+fn taskfile_packet(cd: &AtapiDrive, command: &[u8], limit: u16, dma: bool) -> (Vec<u8>, u32, u8) {
+    let tf = Taskfile {
+        command: cmd::PACKET,
+        feature: u16::from(dma),
+        // The byte count limit is LBA Mid and LBA High, which is bits 23:8 of
+        // the address a Register FIS carries (ATA/ATAPI-6 §8.21.4).
+        lba: u64::from(limit) << 8,
+        count: 0,
+        device: 0,
+    };
+    let mut phase = TaskfileDevice::taskfile_start(cd, &tf);
+    // §9.10 step 2: `DRQ` up over a command packet, and no interrupt for it.
+    assert!(
+        matches!(phase, Phase::Packet { bytes } if bytes == PACKET_BYTES as u64),
+        "{phase:?}"
+    );
+    assert!(
+        !TaskfileDevice::taskfile_acknowledge(cd),
+        "PACKET does not interrupt"
+    );
+
+    // Sixteen bytes, as an AHCI command table's `ACMD` field is, of which this
+    // drive takes twelve.
+    let mut acmd = [0u8; 16];
+    acmd[..command.len()].copy_from_slice(command);
+    let mut at = 0usize;
+    while let Phase::Packet { bytes } = phase {
+        let want = core::cmp::min(bytes as usize, acmd.len() - at);
+        let did = TaskfileDevice::taskfile_write(cd, &acmd[at..at + want]) as usize;
+        assert!(did > 0);
+        at += did;
+        phase = TaskfileDevice::taskfile_phase(cd);
+    }
+    assert_eq!(at, PACKET_BYTES, "the drive took a twelve-byte packet");
+
+    let mut out = Vec::new();
+    let mut interrupts = 0;
+    while let Phase::Data {
+        out: o,
+        dma: d,
+        block,
+    } = phase
+    {
+        assert!(!o, "this command set has no data-out phase");
+        assert_eq!(
+            d, dma,
+            "the drive reports the protocol the PACKET asked for"
+        );
+        assert!(block <= u64::from(limit.max(1)) || limit == 0);
+        if TaskfileDevice::taskfile_acknowledge(cd) {
+            interrupts += 1;
+        }
+        let mut chunk = alloc::vec![0u8; block as usize];
+        let got = TaskfileDevice::taskfile_read(cd, &mut chunk) as usize;
+        out.extend_from_slice(&chunk[..got]);
+        phase = TaskfileDevice::taskfile_phase(cd);
+    }
+    assert_eq!(phase, Phase::Done);
+    if TaskfileDevice::taskfile_acknowledge(cd) {
+        interrupts += 1;
+    }
+    (
+        out,
+        interrupts,
+        TaskfileDevice::taskfile_registers(cd).status,
+    )
+}
+
+/// The signature a Serial ATA port latches into `PxSIG` is the same four
+/// registers a cable-driven host reads one at a time. `EB140101h` is how a
+/// driver on either transport learns this is a packet device.
+#[test]
+fn the_taskfile_registers_carry_the_packet_signature() {
+    let cd = empty();
+    let regs = TaskfileDevice::taskfile_registers(&cd);
+    assert_eq!(regs.status, 0, "DRDY is not a bit a packet device has");
+    assert_eq!(regs.count & 0xff, 0x01);
+    assert_eq!(regs.lba & 0xff, 0x01);
+    assert_eq!((regs.lba >> 8) & 0xff, u64::from(SIGNATURE_MID));
+    assert_eq!((regs.lba >> 16) & 0xff, u64::from(SIGNATURE_HIGH));
+    // Which is exactly what the cable reports, register for register.
+    select(&cd);
+    assert_eq!(cd.read_reg(Reg::LbaMid, true), u16::from(SIGNATURE_MID));
+    assert_eq!(cd.read_reg(Reg::LbaHigh, true), u16::from(SIGNATURE_HIGH));
+}
+
+/// One command, two doors, one answer. If the struct door were a second decode
+/// this is where it would show.
+#[test]
+fn the_two_doors_give_the_same_answer_to_the_same_command() {
+    let cable = drive(8);
+    clear_attention(&cable);
+    let (_, by_cable) = packet_command_in(&cable, &cdb_read10(3, 2), 512);
+
+    let seam = drive(8);
+    // The unit attention has to be taken on this drive too — through the seam,
+    // which is the driver's first exchange on a Serial ATA port.
+    let (_, _, status) = taskfile_packet(&seam, &cdb_test_unit_ready(), 512, false);
+    assert_eq!(status & ST_CHK, ST_CHK, "the reset is reported once");
+    let (_, _, _) = taskfile_packet(&seam, &cdb_request_sense(18), 512, false);
+    let (by_seam, _, status) = taskfile_packet(&seam, &cdb_read10(3, 2), 512, false);
+
+    assert_eq!(status & ST_CHK, 0);
+    assert_eq!(by_seam.len(), 2 * BLOCK as usize);
+    assert_eq!(by_seam, by_cable);
+    assert_eq!(&by_seam[..BLOCK as usize], &stamp(3)[..]);
+}
+
+/// The interrupt count is the packet protocol's and not the transport's: a
+/// packet data-in command of *n* blocks interrupts *n + 1* times, because its
+/// completion is announced and an ATA PIO read's is not (§9.10 against §9.5).
+/// Counted through the struct door, it has to come out the same.
+#[test]
+fn the_taskfile_door_takes_the_same_n_plus_one_interrupts() {
+    let cd = drive(8);
+    let _ = taskfile_packet(&cd, &cdb_test_unit_ready(), 512, false);
+    let _ = taskfile_packet(&cd, &cdb_request_sense(18), 512, false);
+    // One 2048-byte block at a 512-byte limit is four blocks on the link.
+    let (data, interrupts, status) = taskfile_packet(&cd, &cdb_read10(1, 1), 512, false);
+    assert_eq!(status & ST_CHK, 0);
+    assert_eq!(data.len(), BLOCK as usize);
+    assert_eq!(interrupts, 5, "four data blocks and one completion");
+}
+
+/// `PACKET` with the Features register's DMA bit is refused unless the drive
+/// was configured for it, and accepted — reporting the DMA protocol per data
+/// block — when it was. The adapter never reads an opcode to find this out.
+#[test]
+fn the_dma_bit_decides_the_protocol_the_drive_reports() {
+    let store = RamStore::new(4 * BLOCK);
+    let mut id = Identity::new();
+    id.dma = true;
+    let cd =
+        AtapiDrive::with_disc(id, Position::Device0, Some(Arc::new(store))).expect("whole blocks");
+    let _ = taskfile_packet(&cd, &cdb_test_unit_ready(), 512, true);
+    let _ = taskfile_packet(&cd, &cdb_request_sense(18), 512, true);
+    let (data, _, status) = taskfile_packet(&cd, &cdb_read10(0, 1), 2048, true);
+    assert_eq!(status & ST_CHK, 0);
+    assert_eq!(data.len(), BLOCK as usize);
+
+    // A drive that was not configured for DMA aborts the command instead, which
+    // is what keeps a driver from programming an engine that is not there.
+    let plain = drive(4);
+    let tf = Taskfile {
+        command: cmd::PACKET,
+        feature: 1,
+        lba: 2048 << 8,
+        count: 0,
+        device: 0,
+    };
+    assert_eq!(TaskfileDevice::taskfile_start(&plain, &tf), Phase::Done);
+    assert_ne!(
+        TaskfileDevice::taskfile_registers(&plain).status & ST_CHK,
+        0,
+        "an unsupported DMA request is aborted"
+    );
+}
+
+/// `IDENTIFY PACKET DEVICE` is an ATA command and never asks for a packet, so a
+/// transport must not go looking for one.
+#[test]
+fn identify_packet_device_opens_a_data_phase_and_not_a_packet_one() {
+    let cd = drive(4);
+    let tf = Taskfile {
+        command: cmd::IDENTIFY_PACKET,
+        ..Taskfile::default()
+    };
+    let phase = TaskfileDevice::taskfile_start(&cd, &tf);
+    assert_eq!(
+        phase,
+        Phase::Data {
+            out: false,
+            dma: false,
+            block: 512,
+        }
+    );
+    let mut block = alloc::vec![0u8; 512];
+    assert_eq!(TaskfileDevice::taskfile_read(&cd, &mut block), 512);
+    assert_eq!(TaskfileDevice::taskfile_phase(&cd), Phase::Done);
+    let word0 = u16::from(block[0]) | (u16::from(block[1]) << 8);
+    assert_eq!(word0 & 0xc000, 0x8000);
+}
+
+/// A command packet half delivered is state, and a snapshot taken there has to
+/// carry it — along with whether the `PACKET` asked for DMA, which is the field
+/// the chunk version was bumped for.
+#[test]
+fn a_snapshot_carries_a_half_delivered_packet_and_its_protocol() {
+    let store = RamStore::new(4 * BLOCK);
+    let mut id = Identity::new();
+    id.dma = true;
+    let saved = AtapiDrive::with_disc(id.clone(), Position::Device0, Some(Arc::new(store)))
+        .expect("whole blocks");
+    // Take the power-on unit attention first: it is owed to the first command
+    // that is neither `INQUIRY` nor `REQUEST SENSE`, and a `READ(10)` that
+    // collected it would end in `CHECK CONDITION` with no data phase at all.
+    let _ = taskfile_packet(&saved, &cdb_test_unit_ready(), 512, true);
+    let _ = taskfile_packet(&saved, &cdb_request_sense(18), 512, true);
+    let tf = Taskfile {
+        command: cmd::PACKET,
+        feature: 1,
+        lba: 2048 << 8,
+        count: 0,
+        device: 0,
+    };
+    assert!(matches!(
+        TaskfileDevice::taskfile_start(&saved, &tf),
+        Phase::Packet { .. }
+    ));
+    // Four of the twelve bytes. A `READ(10)` descriptor block is ten bytes
+    // long and a twelve-byte packet carries it padded, which is what an
+    // adapter reads out of a sixteen-byte `ACMD` field.
+    let mut command = cdb_read10(1, 1);
+    command.resize(PACKET_BYTES, 0);
+    assert_eq!(TaskfileDevice::taskfile_write(&saved, &command[..4]), 4);
+    let image = save_of(&saved);
+
+    let store = RamStore::new(4 * BLOCK);
+    let restored =
+        AtapiDrive::with_disc(id, Position::Device0, Some(Arc::new(store))).expect("whole blocks");
+    // Nothing is done to this one first: the snapshot carries the fact that the
+    // attention has already been reported, which is part of what is being
+    // checked.
+    let reader = StateReader::new(&image).expect("a snapshot we just wrote");
+    let chunk = reader
+        .load("cd", CLASS.name, CLASS.version, &Migrations::new())
+        .expect("the chunk");
+    restored.load(&mut chunk.reader()).expect("it loads");
+    assert_eq!(image, save_of(&restored));
+
+    // It is still waiting for the other eight bytes, in the same phase.
+    assert_eq!(
+        TaskfileDevice::taskfile_phase(&restored),
+        Phase::Packet { bytes: 8 }
+    );
+    assert_eq!(TaskfileDevice::taskfile_write(&restored, &command[4..]), 8);
+    // And the DMA bit survived with it: the data phase reports the protocol the
+    // `PACKET` before the snapshot asked for.
+    assert_eq!(
+        TaskfileDevice::taskfile_phase(&restored),
+        Phase::Data {
+            out: false,
+            dma: true,
+            block: BLOCK,
+        }
+    );
+}

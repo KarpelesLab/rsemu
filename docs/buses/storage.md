@@ -71,15 +71,45 @@ What that cost the transport is one trait. `AtaDevice` is the six calls
 down — and a drive bay holds one of those rather than an `AtaDisk`. `pc/ide`
 cannot tell which kind is in it, which is the falsifiable form of the claim that
 the seam is the cable. `Bay::drive()` still means "the hard disk, if what is in
-the bay is one", so `dev/ahci` and `dev/amiga/gayle`, neither of which can drive
-a packet device, read a CD-ROM as an empty bay — the truthful answer rather than
-a silent misdrive.
+the bay is one", so `dev/amiga/gayle` — whose board never had a CD-ROM on its
+IDE port — reads a CD-ROM as an empty bay, which is the truthful answer rather
+than a silent misdrive.
 
-**AHCI does not carry a packet device yet.** An AHCI port delivers the command
-packet as the sixteen-byte `ACMD` field of its command table with `CMD.A` set in
-the command header, and its taskfile seam is typed on `AtaDisk`; both are real
-work and neither is a line of this one. A machine file that put an `ata.cdrom`
-in a SATA bay gets an empty port.
+**AHCI carries a packet device too.** It did not, and what it took was named
+here before it was done, so here is the same list with what each item turned
+into:
+
+| what a packet device needs | what it became |
+| --- | --- |
+| `PxSIG` reporting `EB140101h` rather than `00000101h` | nothing. `PxSIG` was already derived from the *device's* command block after reset, so a packet device leaves its own signature there (ATA/ATAPI-6 §9.1) and the adapter has no table of what an ATA drive answers |
+| the command packet out of the command table's `ACMD` field with `A` set | `Phase::Packet`, a variant of the phase the drive already reported |
+| `PxCMD.ATAPI` | a named bit, and nothing more: §3.3.7 gives it one consequence and it is an activity LED |
+| a taskfile seam not typed on `AtaDisk` | `TaskfileDevice`, six methods, with `AtaDevice` as its supertrait |
+
+The interesting one is the third. `PxCMD.ATAPI` is a *port* property and whether
+a command carries a packet is a *command* property — the same port answers
+`IDENTIFY PACKET DEVICE`, an ordinary PIO command with no packet in it, between
+two `PACKET`s. So the `ACMD` path is gated on the command header's `A` bit
+(§4.2.2) and not on `PxCMD.ATAPI`, and a model that had it the other way round
+would work until the first `IDENTIFY`.
+
+The second is where the split shows. A cable hands over a command packet through
+the data register; a Serial ATA port has no data register, so the twelve or
+sixteen bytes sit in the command table the driver already built and the adapter
+transmits them itself. The *drive* says it is waiting for one, because that is
+ATA/ATAPI-6 §9.10's `C/D = 1, I/O = 0` and belongs to the packet protocol; the
+*adapter* knows they live at offset `40h`, because that is AHCI §4.2.3 and
+belongs to the transport. Neither file gained a line of the other's standard.
+`ACMD` is not part of the transfer: no PRD is spent on it, `PRDBC` does not
+count it, and no PIO Setup FIS announces it — the device raises no interrupt for
+that phase, so there is nothing to announce.
+
+`tests/ahci_cdrom.rs` is the proof, with no firmware, no processor and no
+machine file: an ISO the test builds, `IDENTIFY PACKET DEVICE`, `INQUIRY`,
+`READ CD-ROM CAPACITY` and `READ(10)` through a real command list, the
+power-on unit attention stopping the port and §6.2.2's recovery restarting it,
+and a `PACKET` whose header has `A` clear reported as an interface error rather
+than hanging the engine.
 
 ### The taskfile seam
 

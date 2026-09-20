@@ -129,11 +129,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::AtaDevice;
 use super::disk::{
     AtaDisk, CTL_NIEN, CTL_SRST, DEV_OBSOLETE, DEV_SELECT, ERR_ABRT, Position, Reg, ST_BSY, ST_DRQ,
     put_string,
 };
+use super::{AtaDevice, Phase, Registers, Taskfile, TaskfileDevice};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -149,7 +149,11 @@ use crate::machine::validate::{ClassSchema, PropSchema};
 pub const CLASS_NAME: &str = "ata.cdrom";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// 2 since the drive remembers whether the `PACKET` in flight asked for the
+/// DMA data transfer protocol, which a Serial ATA adapter has to know and a
+/// cable-driven one never asked.
+const STATE_VERSION: u32 = 2;
 
 /// How many bytes one logical block of a data CD holds.
 ///
@@ -451,6 +455,15 @@ struct Volatile {
     attention: Option<Sense>,
     /// `PREVENT/ALLOW MEDIUM REMOVAL` has locked the tray.
     locked: bool,
+    /// The `PACKET` in flight was issued with the Features register's DMA bit.
+    ///
+    /// State and not a derived value: the bit is in the Features register when
+    /// `PACKET` is written and the register is the host's to overwrite before
+    /// the data has moved. A Serial ATA adapter needs it per data block —
+    /// a PIO transfer is announced by a PIO Setup FIS and a DMA one is not —
+    /// which is why [`Phase::Data`] carries it out of the drive instead of an
+    /// adapter guessing from an opcode it deliberately cannot see.
+    dma: bool,
     /// The buffer under `DRQ`, and how far through it the host has got.
     buf: Vec<u8>,
     pos: usize,
@@ -475,6 +488,7 @@ impl Volatile {
             sense: Sense::NONE,
             attention: Some(Sense::new(sense_key::UNIT_ATTENTION, asc::RESET_OCCURRED)),
             locked: false,
+            dma: false,
             buf: Vec::new(),
             pos: 0,
             stage: Stage::Idle,
@@ -503,6 +517,7 @@ impl Volatile {
         self.pos = 0;
         self.stage = Stage::Idle;
         self.xfer = None;
+        self.dma = false;
     }
 }
 
@@ -989,6 +1004,7 @@ impl AtapiDrive {
             self.abort(state);
             return;
         }
+        state.dma = state.features & 0x01 != 0;
         state.buf = alloc::vec![0u8; PACKET_BYTES];
         state.pos = 0;
         state.stage = Stage::Cdb;
@@ -1396,6 +1412,7 @@ impl AtapiDrive {
             }
         }
         w.write_bool(state.locked)?;
+        w.write_bool(state.dma)?;
         w.write_bytes(&state.buf)?;
         w.write_u64(state.pos as u64)?;
         w.write_u8(match state.stage {
@@ -1499,6 +1516,7 @@ impl AtapiDrive {
             None
         };
         let locked = r.read_bool()?;
+        let dma = r.read_bool()?;
         let buf = r.read_bytes()?.to_vec();
         let pos = r.read_u64()?;
         if pos > buf.len() as u64 {
@@ -1554,11 +1572,161 @@ impl AtapiDrive {
         state.sense = sense;
         state.attention = attention;
         state.locked = locked;
+        state.dma = dma;
         state.buf = buf;
         state.pos = pos as usize;
         state.stage = stage;
         state.xfer = xfer;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The taskfile door
+// ---------------------------------------------------------------------------
+
+/// The same command block, arriving all at once.
+///
+/// A Serial ATA port has no registers to write in order: it receives a
+/// Register - Host to Device FIS carrying the whole command block and hands it
+/// over as one value. This is that door, and it is the *same* handshake
+/// underneath — the command block below is loaded from the struct and then the
+/// very same `AtapiDrive::command` dispatch runs, which is exactly what
+/// [`super::disk::taskfile`] does for a hard disk. Delete this impl and
+/// `pc.ide` drives a CD-ROM as it always has.
+///
+/// The one thing a cable has that a port does not is a way to *hand over the
+/// command packet*: on a ribbon cable the host writes six words through the
+/// data register, and there is no data register on a serial link. So
+/// [`Phase::Packet`] says so and the adapter supplies the bytes from wherever
+/// its transport keeps them — for AHCI, the command table's `ACMD` field
+/// (AHCI 1.3.1 §4.2.3). Nothing here knows that.
+impl AtapiDrive {
+    /// The phase `state` is in.
+    fn phase_of(state: &Volatile) -> Phase {
+        if state.status & ST_DRQ == 0 {
+            return Phase::Done;
+        }
+        let left = (state.buf.len() - state.pos) as u64;
+        match state.stage {
+            // `C/D = 1`, `I/O = 0`: the block under `DRQ` is the host's to
+            // fill with a command descriptor block (ATA/ATAPI-6 §9.10).
+            Stage::Cdb => Phase::Packet { bytes: left },
+            Stage::DataIn => Phase::Data {
+                out: false,
+                dma: state.dma,
+                block: left,
+            },
+            // `IDENTIFY PACKET DEVICE` is an ordinary PIO data-in command and
+            // not a packet one, so it is PIO whatever the last `PACKET` asked
+            // for — there is no DMA form of it in this command set.
+            Stage::Identify => Phase::Data {
+                out: false,
+                dma: false,
+                block: left,
+            },
+            Stage::Idle => Phase::Done,
+        }
+    }
+}
+
+impl TaskfileDevice for AtapiDrive {
+    fn taskfile_start(&self, tf: &Taskfile) -> Phase {
+        let mut state = self.state.lock();
+        state.device = tf.device;
+        // A Serial ATA port has exactly one device on it, so the `DEV` bit in
+        // the FIS is data the command carries rather than a selection between
+        // two listeners — the argument `AtaDisk::taskfile_start` makes, and it
+        // does not change for a packet device.
+        state.selected = true;
+        if state.in_reset {
+            return AtapiDrive::phase_of(&state);
+        }
+        state.features = tf.feature as u8;
+        // ATA/ATAPI-6 §8.21.4: the **byte count limit** is the LBA Mid and LBA
+        // High registers wearing their packet names, which is bits 23:8 of the
+        // address a Register FIS carries.
+        state.byte_count = (tf.lba >> 8) as u16;
+        state.lba_low = tf.lba as u8;
+        self.command(&mut state, tf.command);
+        AtapiDrive::phase_of(&state)
+    }
+
+    fn taskfile_phase(&self) -> Phase {
+        AtapiDrive::phase_of(&self.state.lock())
+    }
+
+    fn taskfile_registers(&self) -> Registers {
+        let state = self.state.lock();
+        Registers {
+            status: state.status,
+            error: state.error,
+            // The Sector Count register is the Interrupt Reason register, and
+            // its low byte is what a D2H Register FIS reports — which is also
+            // the low byte of the `EB140101h` signature a driver reads out of
+            // `PxSIG` to find out that this is a packet device at all
+            // (ATA/ATAPI-6 §9.1).
+            count: u16::from(state.reason),
+            lba: u64::from(state.lba_low) | (u64::from(state.byte_count) << 8),
+            device: state.device | DEV_OBSOLETE,
+        }
+    }
+
+    fn taskfile_acknowledge(&self) -> bool {
+        let mut state = self.state.lock();
+        let had = state.irq;
+        state.irq = false;
+        had
+    }
+
+    fn taskfile_read(&self, dst: &mut [u8]) -> u64 {
+        let mut state = self.state.lock();
+        if state.status & ST_DRQ == 0 {
+            return 0;
+        }
+        // The command-packet block is the host's to fill; reading it would hand
+        // the caller its own half-written descriptor block.
+        if state.stage == Stage::Cdb {
+            return 0;
+        }
+        let at = state.pos;
+        let n = core::cmp::min(dst.len(), state.buf.len().saturating_sub(at));
+        if n == 0 {
+            return 0;
+        }
+        dst[..n].copy_from_slice(&state.buf[at..at + n]);
+        state.pos = at + n;
+        if state.pos >= state.buf.len() {
+            // The same completion path a word-at-a-time drain runs: the next
+            // block is built, or the command completes.
+            self.block_consumed(&mut state);
+        }
+        n as u64
+    }
+
+    fn taskfile_write(&self, src: &[u8]) -> u64 {
+        let mut state = self.state.lock();
+        if state.status & ST_DRQ == 0 || state.stage != Stage::Cdb {
+            // There is no host-to-device *data* phase in this command set —
+            // no `WRITE(10)`, no `MODE SELECT` — so the only block a host ever
+            // fills is a command packet.
+            return 0;
+        }
+        let at = state.pos;
+        let n = core::cmp::min(src.len(), state.buf.len().saturating_sub(at));
+        if n == 0 {
+            return 0;
+        }
+        state.buf[at..at + n].copy_from_slice(&src[..n]);
+        state.pos = at + n;
+        if state.pos >= state.buf.len() {
+            let cdb = core::mem::take(&mut state.buf);
+            state.pos = 0;
+            state.status &= !ST_DRQ;
+            state.stage = Stage::Idle;
+            self.execute(&mut state, &cdb);
+        }
+        n as u64
     }
 }
 
@@ -1596,6 +1764,12 @@ impl AtaDevice for AtapiDrive {
         // A packet device is not a hard disk, and the two callers that ask this
         // question cannot drive one. Saying so is the point.
         None
+    }
+
+    fn as_taskfile(self: Arc<Self>) -> Arc<dyn TaskfileDevice> {
+        // Unlike `as_disk`, this one answers: a Serial ATA port carries a
+        // packet device and `dev/ahci` drives it through exactly this door.
+        self
     }
 }
 

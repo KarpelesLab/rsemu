@@ -2161,6 +2161,10 @@ impl super::AtaDevice for AtaDisk {
     fn as_disk(self: Arc<Self>) -> Option<Arc<AtaDisk>> {
         Some(self)
     }
+
+    fn as_taskfile(self: Arc<Self>) -> Arc<dyn super::TaskfileDevice> {
+        self
+    }
 }
 
 /// Put `text` into an ATA ASCII field, space padded and byte-swapped in pairs.

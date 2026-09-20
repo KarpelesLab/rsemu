@@ -716,6 +716,14 @@ of its command set. `pc.ide` cannot tell the two apart, which is the proof that
 the split is in the right place — the adapter decodes eight ports and the
 meaning of what goes through them is the drive's.
 
+The same drive hangs off a **Serial ATA** port unchanged, which is the other
+half of that proof: `dev/ahci` drives it through `TaskfileDevice`, hands it its
+command packet out of the command table's `ACMD` field because a serial link has
+no data register to write one through, and reads no opcode to find out that it
+is talking to a CD-ROM (`docs/buses/storage.md`, and `tests/ahci_cdrom.rs`).
+This board has no AHCI adapter on it, so what that buys the AT is the
+confidence that the command set above is the drive's and not the cable's.
+
 A driver cannot tell them apart from the Status register either, and that is
 worth stating because it is the thing a model gets wrong: ATA/ATAPI-6 §7.15.6.3
 makes `DRDY` a bit a packet device does not have, so a CD-ROM at rest reads

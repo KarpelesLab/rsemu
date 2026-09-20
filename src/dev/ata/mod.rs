@@ -34,6 +34,12 @@
 //! adapters stop working. `dev/ahci` is the second caller and it did not need a
 //! line of `pc/ide` to change.
 //!
+//! [`TaskfileDevice`] is that door written as a trait, because a Serial ATA
+//! port carries a *packet* device as readily as a hard disk and an engine typed
+//! on [`AtaDisk`] could only ever drive one of them. Both implementations load
+//! the struct into the same command block registers and run the same dispatch,
+//! so the trait adds a second **caller** and not a second command set.
+//!
 //! # Two command sets, one cable
 //!
 //! [`disk`] is a non-packet device and [`atapi`] is a packet one, and the two
@@ -99,7 +105,7 @@ pub mod disk;
 
 #[cfg(feature = "dev-ata-atapi")]
 pub use atapi::{AtapiDrive, CdromDevice};
-pub use disk::taskfile::{Phase, Registers, Taskfile};
+pub use disk::taskfile::{Phase, Registers, Taskfile, TaskfileDevice};
 pub use disk::{Address, AtaDisk, Geometry, Identity, Position, Reg};
 
 /// What a host adapter can say to whatever is plugged into a cable position.
@@ -153,6 +159,15 @@ pub trait AtaDevice: Send + Sync + core::fmt::Debug {
     fn as_disk(self: alloc::sync::Arc<Self>) -> Option<alloc::sync::Arc<AtaDisk>> {
         None
     }
+
+    /// This device as something that answers a whole command block at once.
+    ///
+    /// The **second** door, and the one a Serial ATA adapter speaks: see
+    /// [`TaskfileDevice`]. Required rather than defaulted, because a default of
+    /// `None` would let a device that simply forgot to write this line read as
+    /// an empty port on every AHCI board in the tree, and an empty port is
+    /// indistinguishable from a working one that has nothing in it.
+    fn as_taskfile(self: alloc::sync::Arc<Self>) -> alloc::sync::Arc<dyn TaskfileDevice>;
 }
 
 /// The bay name a drive and an adapter get when neither says.
@@ -170,8 +185,8 @@ pub mod bays {
     use alloc::vec::Vec;
     use core::fmt;
 
-    use super::AtaDevice;
     use super::disk::AtaDisk;
+    use super::{AtaDevice, TaskfileDevice};
     use crate::core::error::Result;
     use crate::core::hosts::{HostKind, HostObjects};
     use crate::core::props::Props;
@@ -275,6 +290,17 @@ pub mod bays {
         #[must_use]
         pub fn device(&self) -> Option<Arc<dyn AtaDevice>> {
             self.device.lock().clone()
+        }
+
+        /// Whatever is in the bay, as the taskfile door a Serial ATA adapter
+        /// speaks.
+        ///
+        /// Unlike [`Bay::drive`] this does **not** narrow to a hard disk: a
+        /// packet device answers a taskfile too, and `dev/ahci` drives both
+        /// through it.
+        #[must_use]
+        pub fn taskfile(&self) -> Option<Arc<dyn TaskfileDevice>> {
+            Some(self.device.lock().clone()?.as_taskfile())
         }
 
         /// Whether there is anything in it.
