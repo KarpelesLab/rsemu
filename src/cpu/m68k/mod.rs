@@ -254,6 +254,7 @@ mod fpu;
 pub mod isa;
 mod mmu;
 mod timing;
+mod transcend;
 
 #[cfg(test)]
 mod tests;
@@ -265,6 +266,8 @@ mod tests_68020;
 mod tests_68030;
 #[cfg(test)]
 mod tests_fpu;
+#[cfg(test)]
+mod tests_transcend;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).

@@ -118,6 +118,15 @@ pub(super) static LEDGER: &[(&str, &str)] = &[
          bytes inside the instruction. Not in the corpus.",
     ),
     (
+        "68881/68882 instruction time",
+        "a coprocessor instruction is charged the main processor's own work — \
+         the effective-address time plus the transfer — and nothing for the \
+         coprocessor's execution, which M68881UM §8 tables separately in its \
+         own clocks. A 68881 runs concurrently with the main processor \
+         anyway, so the figure a program observes depends on when it next \
+         looks. Not in the corpus, which has no coprocessor.",
+    ),
+    (
         "68030 instruction time",
         "every instruction is charged the 68020's cache-case cycle count \
          (MC68020UM §8.2) rather than the 68030's own (MC68030UM §11), which \

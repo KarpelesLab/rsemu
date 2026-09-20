@@ -4019,7 +4019,7 @@ impl<'a> Exec<'a> {
             // it is reported as a post-instruction exception on the
             // instruction that caused it: the same vector, the same `FPIAR`,
             // the same `FPSR`, and a stacked program counter one instruction
-            // earlier than hardware's. In the conformance ledger.
+            // earlier than hardware's. `docs/cpu/m68k.md` records it.
             Some(vector) => {
                 let pc = self.state.pc;
                 Err(Trap::six(vector, pc, pc0))
@@ -4048,34 +4048,41 @@ impl<'a> Exec<'a> {
                 dst,
                 op,
                 forced,
-                ..
+                cos,
             } => {
                 if !Self::fp_ready(op, forced, None) {
                     return Err(self.fp_line_f());
                 }
                 self.fp_begin();
                 let value = fpu::canonical(self.state.fpu.fp[(src & 7) as usize]);
-                self.fp_operate(op, value, Flags::NONE, dst)
+                self.fp_operate(op, value, Flags::NONE, dst, cos)
             }
             fp::Class::MemOp {
                 fmt,
                 dst,
                 op,
                 forced,
-                ..
+                cos,
             } => {
                 if !Self::fp_ready(op, forced, Some(fmt)) {
                     return Err(self.fp_line_f());
                 }
                 self.fp_begin();
                 let (value, flags) = self.fp_load(fmt)?;
-                self.fp_operate(op, value, flags, dst)
+                self.fp_operate(op, value, flags, dst, cos)
             }
         }
     }
 
     /// Compute one operation and finish it.
-    fn fp_operate(&mut self, op: FpOp, src: F80, load_flags: Flags, dst: u8) -> Result<(), Trap> {
+    fn fp_operate(
+        &mut self,
+        op: FpOp,
+        src: F80,
+        load_flags: Flags,
+        dst: u8,
+        cos: u8,
+    ) -> Result<(), Trap> {
         let dst = dst & 7;
         let env = self.state.fpu.env();
         let spec = self.state.fpu.spec();
@@ -4106,6 +4113,16 @@ impl<'a> Exec<'a> {
         }
         if let Some((negative, magnitude)) = computed.quotient {
             self.state.fpu.set_quotient(negative, magnitude);
+        }
+        if let Some(cosine) = computed.second
+            && out.store
+        {
+            // `FSINCOS` writes the cosine first, so "if FPc and FPs specify
+            // the same floating-point data register, the sine result is
+            // stored in the register and the cosine result is discarded"
+            // (M68881UM §4, *FSINCOS*). The condition codes come from the
+            // sine, which `fp_complete` sets.
+            self.state.fpu.fp[(cos & 7) as usize] = cosine;
         }
         self.fp_complete(out, dst)
     }

@@ -93,6 +93,7 @@ use crate::float::{
 };
 
 use super::isa::fp::{Fmt, FpOp};
+use super::transcend;
 
 /// Which coprocessor is attached, if any.
 ///
@@ -775,6 +776,8 @@ pub(super) struct Computed {
     pub exc: u16,
     /// The sign and magnitude `FMOD` and `FREM` put in the quotient byte.
     pub quotient: Option<(bool, u8)>,
+    /// `FSINCOS`'s cosine, for the second destination register.
+    pub second: Option<F80>,
     /// Which format's exponent range decides tininess: the rounding
     /// precision for most operations, the extended range for the two single
     /// ones (M68881UM §6.1.5's note).
@@ -788,6 +791,7 @@ impl Computed {
             store: true,
             exc: exceptions_from(flags, false),
             quotient: None,
+            second: None,
             tininess: spec,
         }
     }
@@ -809,6 +813,7 @@ fn operand_error(spec: Spec) -> Computed {
         store: true,
         exc: bits::OPERR,
         quotient: None,
+        second: None,
         tininess: spec,
     }
 }
@@ -844,6 +849,9 @@ pub(super) fn operate(op: FpOp, dest: F80, src: F80, spec: Spec, env: Env) -> Co
             store: op.writes_destination(),
             exc: 0,
             quotient: None,
+            // Every operation with two destinations is monadic, so a NaN
+            // reaches both of them.
+            second: (op == FpOp::SinCos).then_some(quiet),
             tininess: spec,
         };
     }
@@ -874,6 +882,7 @@ pub(super) fn operate(op: FpOp, dest: F80, src: F80, spec: Spec, env: Env) -> Co
             store: false,
             exc: 0,
             quotient: None,
+            second: None,
             tininess: spec,
         },
         FpOp::Cmp => Computed {
@@ -881,6 +890,7 @@ pub(super) fn operate(op: FpOp, dest: F80, src: F80, spec: Spec, env: Env) -> Co
             store: false,
             exc: 0,
             quotient: None,
+            second: None,
             tininess: spec,
         },
         FpOp::Sqrt => {
@@ -996,9 +1006,23 @@ pub(super) fn operate(op: FpOp, dest: F80, src: F80, spec: Spec, env: Env) -> Co
             out.quotient = Some((negative, magnitude));
             out
         }
-        // Every transcendental, which this core does not compute yet; the
-        // caller has already refused them through `implemented`.
-        _ => operand_error(spec),
+        // The transcendentals, which are `transcend.rs` — the one place
+        // where the arithmetic is carried at twice the destination's
+        // precision, because a chain of forty operations cannot be rounded
+        // forty times and still be right.
+        _ => match transcend::compute(op, src, spec, env) {
+            Some(out) => Computed {
+                value: generated_nan(out.value, &[src]),
+                store: true,
+                exc: out.exc | exceptions_from(out.flags, false),
+                quotient: None,
+                second: out.second,
+                tininess: spec,
+            },
+            // Nothing else is an opmode, and `implemented` has already
+            // refused it.
+            None => operand_error(spec),
+        },
     }
 }
 
@@ -1153,6 +1177,25 @@ pub(super) const fn implemented(op: FpOp) -> bool {
             | FpOp::Scale
             | FpOp::Mod
             | FpOp::Rem
+            | FpOp::Sin
+            | FpOp::Cos
+            | FpOp::Tan
+            | FpOp::SinCos
+            | FpOp::Asin
+            | FpOp::Acos
+            | FpOp::Atan
+            | FpOp::Sinh
+            | FpOp::Cosh
+            | FpOp::Tanh
+            | FpOp::Atanh
+            | FpOp::Etox
+            | FpOp::EtoxM1
+            | FpOp::TwoToX
+            | FpOp::TenToX
+            | FpOp::Logn
+            | FpOp::LognP1
+            | FpOp::Log2
+            | FpOp::Log10
     )
 }
 
