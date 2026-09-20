@@ -213,6 +213,34 @@ fn fmove_narrows_every_external_format() {
 }
 
 #[test]
+fn the_walking_modes_step_by_the_operands_own_width() {
+    // M68881UM §4, *FMOVE*: both `(An)+` and `-(An)` are legal in both
+    // directions, and each steps by the *format's* size — twelve bytes for
+    // an extended operand, which no integer `Size` can name.
+    let b = board(&[0x4e71]);
+    b.with_regs(|r| r.a[0] = 0x2100);
+    set_fp(&b, 0, THREE);
+    run(&b, &[0xf218, 0x6800]); // FMOVE.X FP0,(A0)+
+    assert_eq!(b.cpu.regs().a[0], 0x2100 + 12);
+    run(&b, &[0xf220, 0x6800]); // FMOVE.X FP0,-(A0)
+    assert_eq!(b.cpu.regs().a[0], 0x2100);
+    set_fp(&b, 0, ZERO);
+    run(&b, &[0xf218, mem_op(2, 0, 0x00)]); // FMOVE.X (A0)+,FP0
+    assert_eq!(fp(&b, 0), THREE);
+    assert_eq!(b.cpu.regs().a[0], 0x2100 + 12);
+    run(&b, &[0xf220, mem_op(5, 1, 0x00)]); // FMOVE.D -(A0),FP1
+    assert_eq!(b.cpu.regs().a[0], 0x2100 + 4, "a double is eight bytes");
+    // A byte steps by one, a word by two, a long by four.
+    b.with_regs(|r| r.a[0] = 0x2100);
+    run(&b, &[0xf218, mem_op(6, 0, 0x00)]); // FMOVE.B (A0)+,FP0
+    assert_eq!(b.cpu.regs().a[0], 0x2101);
+    run(&b, &[0xf218, mem_op(4, 0, 0x00)]); // FMOVE.W (A0)+,FP0
+    assert_eq!(b.cpu.regs().a[0], 0x2103);
+    run(&b, &[0xf218, mem_op(0, 0, 0x00)]); // FMOVE.L (A0)+,FP0
+    assert_eq!(b.cpu.regs().a[0], 0x2107);
+}
+
+#[test]
 fn an_integer_store_that_does_not_fit_is_an_operand_error() {
     // §6.1.3, Table 6-2: "FMOVE to B, W, or L — Integer
     // Overflow/Underflow, Source is Non-Signaling NAN, or Source is

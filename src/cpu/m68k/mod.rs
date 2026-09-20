@@ -176,6 +176,56 @@
 //! assert_eq!(cpu.regs().d[0], 0x42);
 //! ```
 //!
+//! # The floating-point coprocessor
+//!
+//! The `fpu` property attaches an **MC68881** or **MC68882** to any part
+//! with the F-line coprocessor interface — a 68020 or later — and `none`,
+//! the default, leaves every existing board exactly what it was. With one
+//! attached, coprocessor id 1's encodings become instructions; without one
+//! they are the line-F exception, which is what a main processor takes when
+//! nothing answers.
+//!
+//! Implemented (M68881UM; `fpu.rs` and `transcend.rs`):
+//!
+//! - the eight 80-bit data registers, `FPCR`, `FPSR` and `FPIAR`, every
+//!   field and every rule the manual gives them — the condition codes by
+//!   result *data type* (Table 2-1), the eight exception bits, the five
+//!   accrued equations (§2.3.4), and `FPIAR` loaded before an instruction
+//!   that can trap;
+//! - six of the seven external formats: byte, word and long integers,
+//!   single, double and extended. **Packed decimal is not implemented** and
+//!   takes the line-F exception, which is what a 68040 does for that format;
+//! - `FMOVE` in both directions, `FMOVEM` in both list orders and both
+//!   dynamic forms, `FMOVECR`'s whole constant ROM, and `FMOVE(M)` for the
+//!   three control registers;
+//! - `FBcc`, `FScc`, `FDBcc`, `FTRAPcc` and `FNOP`, all thirty-two
+//!   predicates, with `BSUN` raised by the sixteen that signal and taken as
+//!   a **pre-instruction** exception so an `RTE` that changes nothing runs
+//!   into it again;
+//! - the arithmetic — `FADD`, `FSUB`, `FMUL`, `FDIV`, `FSGLMUL`, `FSGLDIV`,
+//!   `FABS`, `FNEG`, `FSQRT`, `FINT`, `FINTRZ`, `FGETEXP`, `FGETMAN`,
+//!   `FSCALE`, `FMOD`, `FREM`, `FCMP`, `FTST` — and all eighteen
+//!   transcendentals;
+//! - `FSAVE` and `FRESTORE`, with the null frame for an untouched unit and
+//!   an idle frame of the coprocessor's own length.
+//!
+//! **Every value goes through `src/float`**, which is integer arithmetic
+//! rounded exactly once, so a guest's floating point is identical on every
+//! host and in a browser (`ROADMAP.md` §9.1). The 68881's extended format is
+//! x87's value encoding with four differences — a ninety-six-bit memory
+//! layout, unnormalized numbers as values, pseudo-infinities and pseudo-NaNs
+//! as ordinary ones, and its own created NaN — and `fpu.rs` says what each
+//! one costs.
+//!
+//! The transcendentals are computed at **twice** the destination's precision
+//! and rounded once, and their argument reduction is exact for every
+//! representable argument. That is *more* accurate than the part, whose own
+//! manual allows it 4096 units in the last place (§4.3.2) and which "loses
+//! all accuracy" for trigonometric arguments above about 10^20; a hundred
+//! and thirty-three values checked against GNU `bc` at ninety digits come
+//! back correctly rounded. `docs/cpu/m68k.md` lists that and the rest of
+//! what differs from the part.
+//!
 //! # How accurate, measured
 //!
 //! `ROADMAP.md` §0: accuracy is measured, never asserted. Against
@@ -223,6 +273,18 @@
 //! - **A 68020 on a 32-bit port.** The bus is driven sixteen bits at a time
 //!   whatever the region; the 68020's dynamic bus sizing to a wider port is
 //!   not modelled.
+//! - **The coprocessor interface itself.** A 68881 is a device in CPU space
+//!   and the main processor talks to it through coprocessor interface
+//!   registers (M68881UM §7); with no function code on the bus nothing can
+//!   answer one, so the instructions are executed directly. The bus trace of
+//!   a floating-point instruction is therefore not the hardware's, and
+//!   neither is its time. Nor is the *concurrency*: a real coprocessor runs
+//!   beside the main processor, so an arithmetic trap arrives
+//!   pre-instruction on the *next* floating-point instruction, where this
+//!   core reports it post-instruction on the one that caused it. `FPIAR`,
+//!   `FPSR` and the vector are the same either way.
+//! - **Packed decimal.** The `011` and `111` source and destination formats
+//!   take the line-F exception.
 //!
 //! # Modules
 //!
@@ -233,6 +295,8 @@
 //! | `exec` (private) | the interpreter, the prefetch queue and exception processing |
 //! | `timing` (private) | the 68020's cache-case instruction times |
 //! | `mmu` (private) | the 68030's translation tree, cache and registers |
+//! | `fpu` (private) | the coprocessor's registers, formats and arithmetic |
+//! | `transcend` (private) | its transcendentals, at 128-bit precision |
 //!
 //! # Sources
 //!
@@ -244,9 +308,11 @@
 //! *MC68020 User's Manual* (MC68020UM) for the 68020's; and the *MC68030
 //! User's Manual* (MC68030UM) and the *MC68EC030 User's Manual* for the two
 //! 68030 packages, Section 9 of each being the memory management unit and the
-//! access control unit respectively. All are listed in `docs/cpu/m68k.md`. No
-//! copyleft emulator was consulted, and no emulator source of any licence was
-//! used for the instruction semantics.
+//! access control unit respectively; and the *MC68881/MC68882 Floating-Point
+//! Coprocessor User's Manual* (M68881UM) for the coprocessor. All are listed
+//! in `docs/cpu/m68k.md`. No copyleft emulator was consulted, and no emulator
+//! source of any licence was used for the instruction semantics or for the
+//! transcendental algorithms.
 
 pub mod disasm;
 mod exec;

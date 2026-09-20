@@ -4230,7 +4230,7 @@ impl<'a> Exec<'a> {
             self.fp_set_control(regs, (u32::from(hi) << 16) | u32::from(lo));
             return self.settle();
         }
-        let Loc::Mem(addr) = self.fp_address(4 * count as u32, to_fpu)? else {
+        let Loc::Mem(addr) = self.fp_address(4 * count as u32)? else {
             return Err(self.fp_line_f());
         };
         let mut at = addr;
@@ -4299,7 +4299,7 @@ impl<'a> Exec<'a> {
             list
         };
         let count = mask.count_ones();
-        let Loc::Mem(addr) = self.fp_address(12 * count, to_fpu)? else {
+        let Loc::Mem(addr) = self.fp_address(12 * count)? else {
             return Err(self.fp_line_f());
         };
         self.facts.registers = mask.count_ones();
@@ -4335,27 +4335,30 @@ impl<'a> Exec<'a> {
     /// Separate from [`Exec::resolve_ea`] because the auto-adjusting modes
     /// step by the *operand's* size, and a floating-point operand can be
     /// twelve bytes, which `Size` cannot name.
-    fn fp_address(&mut self, bytes: u32, read: bool) -> Result<Loc, Trap> {
+    ///
+    /// Both walking modes are accepted in both directions: `FMOVE` reaches
+    /// `(An)+` and `-(An)` either way round (M68881UM §4, *FMOVE*), and the
+    /// instructions that do restrict them — `FMOVEM`, `FSAVE`, `FRESTORE` —
+    /// check their own mode sets before they get here.
+    fn fp_address(&mut self, bytes: u32) -> Result<Loc, Trap> {
         let Some((mode, reg)) = ea_of(Arg::Ea, self.opcode) else {
             return Err(self.fp_line_f());
         };
         let reg = reg as usize;
         match mode {
-            Mode::PostInc if read => {
+            Mode::PostInc => {
                 let addr = self.state.a[reg];
                 self.state.a[reg] = addr.wrapping_add(bytes);
                 self.facts.ea(3);
                 Ok(Loc::Mem(addr))
             }
-            Mode::PreDec if !read => {
+            Mode::PreDec => {
                 let addr = self.state.a[reg].wrapping_sub(bytes);
                 self.state.a[reg] = addr;
                 self.facts.ea(4);
                 Ok(Loc::Mem(addr))
             }
-            Mode::DataReg | Mode::AddrReg | Mode::Imm | Mode::PostInc | Mode::PreDec => {
-                Err(self.fp_line_f())
-            }
+            Mode::DataReg | Mode::AddrReg | Mode::Imm => Err(self.fp_line_f()),
             // Every other mode computes an address without a size, so the
             // ordinary resolver gives the right answer and reads the right
             // number of extension words.
@@ -4418,7 +4421,7 @@ impl<'a> Exec<'a> {
                 Ok(fpu::widen(fmt, raw, extended, env))
             }
             _ => {
-                let Loc::Mem(addr) = self.fp_address(fmt.bytes(), true)? else {
+                let Loc::Mem(addr) = self.fp_address(fmt.bytes())? else {
                     return Err(self.fp_line_f());
                 };
                 let (raw, extended) = match fmt {
@@ -4461,7 +4464,7 @@ impl<'a> Exec<'a> {
             self.state.d[reg] = merge(self.state.d[reg], raw as u32, size);
             return Ok(());
         }
-        let Loc::Mem(addr) = self.fp_address(fmt.bytes(), false)? else {
+        let Loc::Mem(addr) = self.fp_address(fmt.bytes())? else {
             return Err(self.fp_line_f());
         };
         match fmt {
@@ -4638,14 +4641,14 @@ impl<'a> Exec<'a> {
     fn op_fsave(&mut self) -> Result<(), Trap> {
         let coprocessor = self.cfg.fpu;
         if self.state.fpu.null {
-            let Loc::Mem(addr) = self.fp_address(4, false)? else {
+            let Loc::Mem(addr) = self.fp_address(4)? else {
                 return Err(self.fp_line_f());
             };
             self.write_long(addr, 0)?;
             return self.settle();
         }
         let size = coprocessor.idle_frame();
-        let Loc::Mem(addr) = self.fp_address(size, false)? else {
+        let Loc::Mem(addr) = self.fp_address(size)? else {
             return Err(self.fp_line_f());
         };
         let format = (u32::from(FP_STATE_VERSION) << 24) | ((size - 4) << 16);
@@ -4669,7 +4672,7 @@ impl<'a> Exec<'a> {
     /// *FRESTORE*).
     fn op_frestore(&mut self) -> Result<(), Trap> {
         let coprocessor = self.cfg.fpu;
-        let Loc::Mem(addr) = self.fp_address(4, true)? else {
+        let Loc::Mem(addr) = self.fp_address(4)? else {
             return Err(self.fp_line_f());
         };
         let format = self.read_long(addr)?;
@@ -4934,7 +4937,7 @@ impl<'a> Exec<'a> {
                 .read(u64::from(at), Width::U16, MemAttrs::DEBUG)
                 .map_or(0, |v| v as u16);
         }
-        u32::from(super::disasm::disassemble_for(self.model, pc, &words).len)
+        u32::from(super::disasm::disassemble_with(self.model, self.copro, pc, &words).len)
     }
 
     // ------------------------------------------------------------------

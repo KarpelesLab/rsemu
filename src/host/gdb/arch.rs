@@ -2055,13 +2055,26 @@ fn m68k_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 ///
 /// `org.gnu.gdb.m68k.core` with `<architecture>m68k</architecture>`, kept
 /// exactly: gdb's m68k gdbarch wants `d0`-`d7`, `a0`-`a5`, `fp`, `sp`, `ps` and
-/// `pc` in that feature, which is the eighteen above. The floating-point file
-/// (`org.gnu.gdb.m68k.fp`) is optional and there is nothing to put in it — a
-/// bare 68000 has no FPU, and this core models none.
+/// `pc` in that feature, which is the eighteen above.
+///
+/// The floating-point file (`org.gnu.gdb.m68k.fp`) is optional and is **not**
+/// published, although the core now models a 68881. Two reasons rather than
+/// one: gdb declares `fp0`-`fp7` as ninety-six-bit `i387_ext`, which is the
+/// *x87* image — ten little-endian bytes and two of padding — and not the
+/// 68881's ninety-six-bit one, so the bytes would need transposing through a
+/// computed hook; and the chunk stores each register as a sign-and-exponent
+/// halfword beside its significand, which is neither layout. Publishing it
+/// means writing that hook and checking it against a real gdb, and a
+/// description that is subtly wrong is worse than one that is absent.
+/// `M68k::regs` reaches the whole file meanwhile.
 #[cfg(feature = "cpu-m68k")]
 pub static M68K: Arch = Arch {
     class: &crate::cpu::m68k::CLASS,
-    verified_version: 2,
+    // 3 re-read against the chunk that gained the 68030's memory management
+    // registers and the coprocessor's. Both go on the *end*, after the
+    // 68010-and-later tail, so every offset below is where version 2 left
+    // it — and on a 68000 the chunk still stops where it always did.
+    verified_version: 3,
     features: &[Feature::whole("org.gnu.gdb.m68k.core")],
     architecture: Some("m68k"),
     regs: &M68K_REGS,
