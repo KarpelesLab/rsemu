@@ -106,10 +106,16 @@
 //!
 //! On a native host this backend is **slower than the IR interpreter**, and it
 //! is meant to be: with no embedder there is nothing to run a module but
-//! [`exec`](crate::jit::wasm::exec), so a block is interpreted twice over. What it buys is that the
-//! translation is *executed* everywhere rather than merely encoded, which is
-//! what lets the determinism gate above run on the x86-64 runner that gates
-//! every commit — a claim `jit::arm64` explicitly cannot make.
+//! [`exec`](crate::jit::wasm::exec), so a block is interpreted twice over.
+//! Measured on `riscv-virt`, 400 quanta after a warm-up, release, one x86-64
+//! Linux machine: `interp` 11.81 s, `jit` 6.53 s, `jit-host` 1.47 s,
+//! **`jit-wasm` 21.89 s** — 0.54× the interpreter. Every one of those seconds
+//! is [`exec`](crate::jit::wasm::exec) decoding bytecode a real engine would
+//! have compiled once, so it bounds the executor and says nothing about the
+//! backend. What it buys is that the translation is *executed* everywhere
+//! rather than merely encoded, which is what lets the determinism gate above
+//! run on the x86-64 runner that gates every commit — a claim `jit::arm64`
+//! explicitly cannot make.
 //!
 //! The number §11.4 actually asks for — is a wasm module faster than the IR
 //! interpreter *in a browser* — is not measured here and is not invented

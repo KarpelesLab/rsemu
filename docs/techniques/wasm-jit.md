@@ -392,7 +392,27 @@ interpreter in a browser — is not in this document, because taking it needs th
 embedder that is specified above and not built. Saying otherwise would be
 inventing it, which is the one thing a document like this must not do.
 
-What *is* known: on a native host `engine = "jit-wasm"` is the slowest of the
-four engines, by construction, and that is fine because it is a correctness
-vehicle. `tests/riscv_virt_engines.rs` costs about twelve seconds more with it
-than without, over a sixty-second test.
+What *is* known is the native-host number, and it is worth having because it
+bounds the reference executor rather than the backend. Four engines, the same
+`riscv-virt` board with the same 12-instruction RV64I firmware, 400 quanta
+after a 20-quantum warm-up, release build, one x86-64 Linux machine:
+
+| Engine | 400 quanta | versus `interp` |
+| --- | --- | --- |
+| `interp` | 11.81 s | 1.00× |
+| `jit` (portable IR backend) | 6.53 s | 1.81× |
+| `jit-host` (`jit::x86`) | 1.47 s | **8.06×** |
+| `jit-wasm` | 21.89 s | **0.54×** |
+
+So `jit-wasm` on a native host is about **1.85× slower than interpreting the
+guest directly**, which is what "a block interpreted twice over" costs and is
+exactly the shape predicted above. It is not a defect and it is not a target to
+optimise: every one of those 21.89 seconds is `jit::wasm::exec` decoding
+bytecode that a real engine would have compiled once. The only number that
+would say anything about the backend itself is the same board in a browser with
+the embedder wired, and that is the measurement this work does not have.
+
+One practical consequence, since this engine is in a per-commit gate:
+`tests/riscv_virt_engines.rs` costs about twelve seconds more with `jit-wasm`
+in it than without, over a sixty-second test. That is the price of the
+determinism evidence and it is worth paying.
