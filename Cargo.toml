@@ -2199,7 +2199,7 @@ dev-ata-disk = ["dev-medium"]
 # SFF-8020i, cited by clause; no emulator source and no operating system's
 # ATAPI or SCSI driver was opened (ROADMAP.md §1). `no_std + alloc`, no
 # `unsafe`, no dependencies.
-dev-ata-atapi = ["dev-ata-disk"]
+dev-ata-atapi = ["dev-ata-disk", "dev-disc"]
 
 # Entering a Linux/x86 kernel with no firmware in between (src/dev/linuxboot.rs):
 # the Linux/x86 boot protocol as a device. It parses a `bzImage`'s setup header,
@@ -2247,6 +2247,26 @@ dev-dfuse = []
 # `std` half -- a host file through `fstool` -- is `dev-blk`, on the other side of
 # this seam, which is the arrangement that keeps the devices `no_std`.
 dev-medium = []
+
+# What a **CD** is (src/dev/disc.rs): the disc, one level above `dev-medium`'s
+# bytes-by-offset. Sector layout (2048-byte user data and 2352-byte raw frames,
+# told apart by ECMA-130 §14.1's sync pattern rather than by a modulus -- 2048
+# and 2352 share a factor of 16, so a length can divide evenly by both), Mode 1
+# and Mode 2 Form 1 user-data extraction, the LBA-to-minute/second/frame
+# conversion with §20's 150-frame lead-in, and a one-data-track table of
+# contents synthesised from an image that carries none.
+#
+# Its own feature, beside `dev-medium` rather than inside it, because the two
+# answer different questions: `medium` is where the bytes come from and every
+# block device in the tree has one, `disc` is what those bytes *are* and only a
+# CD needs it. A `riscv-virt` build has a `virtio.blk` and no business compiling
+# the Red Book. Two devices use it and share no bus -- `dev-ata-atapi`, a packet
+# device on an ATA cable or a Serial ATA port, and `dev-amiga-cdrom`, the CD32's
+# mechanism behind Akiko -- so neither may own it and neither depends on the
+# other. Written from ECMA-130 and ECMA-119, cited by clause; no emulator source
+# consulted. Implies `dev-medium`. `no_std + alloc`, no `unsafe`, no
+# dependencies.
+dev-disc = ["dev-medium"]
 
 # Real disk-image backing (src/dev/blk): a guest drive whose bytes are a host
 # *file* rather than a buffer, so a sparse 16 GiB disk costs no RAM and a
@@ -2797,9 +2817,10 @@ dev-amiga-akiko = ["dev-amiga"]
 # track. No audio track, no subcode, no CD+G. Written from ECMA-130 (the Red
 # Book's sector and frame layout as ECMA restates it), ECMA-119 (ISO 9660) and
 # the *Amiga CD32 Developer Notes*; no emulator source consulted. Implies
-# `dev-amiga` and `dev-medium`, the media seam. `no_std + alloc`, no
+# `dev-amiga` and `dev-disc`, the bus-neutral disc model (and with it
+# `dev-medium`, the media seam). `no_std + alloc`, no
 # dependencies.
-dev-amiga-cdrom = ["dev-amiga", "dev-medium"]
+dev-amiga-cdrom = ["dev-amiga", "dev-disc"]
 
 # The CD32 joypad (src/dev/amiga/cd32pad.rs): `amiga.cd32-pad`, the eleven
 # button controller on a nine-pin port. Held as an ordinary two-button

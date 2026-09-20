@@ -747,8 +747,13 @@ are where a plausible model diverges:
 
 **The disc** is a media slot of 2048-byte logical blocks, empty by default: an
 unbound `cdrom` slot is a drive with an open tray, which answers
-`MEDIUM NOT PRESENT` and is a perfectly ordinary CD-ROM drive. Two spellings
-fill it, and they are the two every other drive on this board already had:
+`MEDIUM NOT PRESENT` and is a perfectly ordinary CD-ROM drive. What a disc *is*
+— the sector layout, the user-data extraction, the minute/second/frame
+arithmetic and the synthesised one-track table of contents — is `src/dev/disc.rs`
+and not the drive's, because the CD32's mechanism needs exactly the same four
+things on a bus with no ATA anywhere near it (`docs/buses/storage.md`). Two
+spellings fill the slot, and they are the two every other drive on this board
+already had:
 
 ```
   rsemu run pc-at --media cdrom=disc.iso    # read into host memory
@@ -1045,7 +1050,14 @@ machine and comparing the sequences.
   could be got wrong — and it does not model audio tracks, `READ CD`, sub-channel
   data or a changer. A 2352-byte raw image is refused by name rather than read
   as though its sectors were cooked, because that failure is sixteen bytes of
-  sync pattern where a boot record should be, with no error anywhere.
+  sync pattern where a boot record should be, with no error anywhere. Two things
+  give one away and both are checked, because neither alone is enough: ECMA-130
+  §14.1's sync pattern, and a length that divides by 2352 and not by 2048. The
+  pattern is the one that matters — 2048 and 2352 share a factor of 16, so an
+  image of 301 056 bytes divides evenly by both and a modulus cannot say which
+  it is. `src/dev/disc.rs` *can* read frames, and this drive declines the
+  capability rather than lacking it: the rest of what a raw rip is — a cue
+  sheet, several tracks, audio among them — is not modelled.
 - **No El Torito hard-disk emulation.** Media type 4 is declined and the
   bootstrap falls through to `INT 18h`. Loading the image and then having no
   `INT 13h` drive 80h behind it would be worse than not loading it. Of the

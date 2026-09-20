@@ -1,67 +1,42 @@
-//! The CD32's CD-ROM drive: the disc, the frame layout its sectors are in,
-//! and a table of contents.
+//! The CD32's CD-ROM drive: the disc in the tray and where the head is.
 //!
-//! One class, `amiga.cd`. It is the *mechanism* — a disc, its sectors and
-//! where a track starts — and not a controller: [`super::akiko`] is the
-//! CD32's controller and is what a guest talks to. The split is `ata.disk`'s
-//! and `pc.ide`'s and it holds for the same reason: this file contains no
-//! register offset and no interrupt, and Akiko contains no sector layout.
+//! One class, `amiga.cd`. It is the *mechanism* — a drive holding a disc — and
+//! not a controller: [`super::akiko`] is the CD32's controller and is what a
+//! guest talks to. The split is `ata.disk`'s and `pc.ide`'s and it holds for
+//! the same reason: this file contains no register offset and no interrupt,
+//! and Akiko contains no sector layout.
 //!
 //! The Developer Notes (*Amiga CD32 Developer Notes*, Revision 3,
 //! Commodore-Amiga Inc.) describe the drive in one line each — "Top loading
 //! double speed CD-ROM drive", 300 KB/s, and "Create an ISO-9660 image file
 //! suitable for making the gold (master) disc" — and say nothing about its
-//! interface. So the *disc* is modelled here, from the disc standards, and
-//! the interface is where [`super::akiko`] stops.
+//! interface. So the *disc* is modelled from the disc standards and the
+//! interface is where [`super::akiko`] stops.
 //!
-//! # What a disc image is, and which ones this reads
+//! # What a disc is, and which images this reads
 //!
-//! A CD's physical unit is a 2352-byte **frame** (ECMA-130, *Data interchange
-//! on read-only 120 mm optical data disks (CD-ROM)*, §14: 12 bytes of sync,
-//! 4 of header, then 2336 of the mode's own arrangement). What a file system
-//! actually wants out of it is the 2048 bytes of user data a Mode 1 or Mode 2
-//! Form 1 sector carries. Two file layouts follow, and this class reads both:
+//! [`crate::dev::disc`], and not one line of it is here. Sector layout — 2048
+//! bytes of user data or 2352-byte raw frames, told apart by ECMA-130 §14.1's
+//! sync pattern — Mode 1 and Mode 2 Form 1 user-data extraction, the
+//! minute/second/frame conversion with §20's 150-frame lead-in, and the
+//! synthesised one-data-track table of contents are all bus-neutral facts
+//! about a compact disc, and an ATAPI drive on a completely different cable
+//! needs every one of them. That module's documentation argues each; this file
+//! adds the *drive*: a tray, a head position, and the two-phase construction
+//! and snapshot contract a machine object owes.
 //!
-//! * **2048 bytes a sector** — the user data and nothing else, which is what
-//!   an ISO 9660 image is (ECMA-119 describes the *file system* in those
-//!   2048-byte logical sectors and is silent about frames, which is exactly
-//!   why the layout exists). This is what a CD32 master is delivered as and
-//!   what the Developer Notes tell an author to produce.
-//! * **2352 bytes a sector** — whole frames. The user data is lifted out:
-//!   bytes 16–2063 for Mode 1, and 24–2071 for Mode 2 Form 1, whose eight-byte
-//!   sub-header sits between the header and the data (ECMA-130 §§14.2–14.3).
-//!
-//! **Which one a file is, is decided by looking rather than by the extension
-//! or by arithmetic.** A frame begins with the sync pattern `00` then ten
-//! `FF` then `00` (§14.1), and a file whose first twelve bytes are that is
-//! frames; anything else is user data. Sizes cannot settle it on their own —
-//! 2048 and 2352 share a factor of 16, so an image of 301 056 bytes divides
-//! evenly by both — and the sync pattern is definitive where a modulus is a
-//! guess.
-//!
-//! Nothing else is read. **No audio track**, no `.cue` sheet, no subchannel
-//! and so no CD+G, no multi-session and no Mode 2 Form 2 (2324-byte) data:
-//! a disc here is one data track. The Developer Notes list "ISO-9660 CD-ROM,
-//! Audio CD, CD+G" as the drive's formats and the other two are simply not
-//! done, rather than half done.
-//!
-//! # The table of contents
-//!
-//! Synthesised, because a bare image carries none: **one track**, number 1,
-//! a data track (control `$4`, "data track, digital copy prohibited" —
-//! ECMA-130 §22.3.1), starting at logical block 0, with the lead-out at the
-//! block after the last. [`Toc`] is that, and [`msf`] converts a logical
-//! block to the minute/second/frame a drive reports, which is the block plus
-//! the 150-frame (two-second) lead-in every disc begins with (§20).
+//! **No audio track**, no `.cue` sheet, no subchannel and so no CD+G, no
+//! multi-session and no Mode 2 Form 2 data. The Developer Notes list
+//! "ISO-9660 CD-ROM, Audio CD, CD+G" as the drive's formats and the other two
+//! are simply not done, rather than half done.
 //!
 //! # Speed
 //!
 //! "Double speed", 150 frames a second doubled, is recorded in
-//! [`FRAMES_PER_SECOND`] and used by nothing: no command reaches this drive
-//! (see [`super::akiko`]), so there is no transfer whose duration it could
-//! set. It is here because a rate that is a fact about the machine belongs
-//! written down next to the machine, and because the first command that ever
-//! arrives will want it.
+//! [`FRAMES_PER_SECOND`](crate::dev::disc::FRAMES_PER_SECOND) and used by
+//! nothing: no command reaches this drive (see [`super::akiko`]), so there is
+//! no transfer whose duration it could set. It is written down next to the
+//! machine because the first command that ever arrives will want it.
 //!
 //! # `MemAttrs::debug`
 //!
@@ -73,8 +48,6 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
-use alloc::vec::Vec;
 
 use crate::core::device::{
     Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
@@ -84,6 +57,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
+use crate::dev::disc::{Disc, Layout, Toc, USER_BYTES};
 use crate::dev::medium::{self, Medium};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
@@ -93,142 +67,6 @@ pub const CLASS_NAME: &str = "amiga.cd";
 
 /// Snapshot version for this class's chunk encoding.
 const STATE_VERSION: u32 = 1;
-
-/// A whole frame, sync and parity and all (ECMA-130 §14).
-pub const FRAME_BYTES: u64 = 2352;
-
-/// The user data a Mode 1 or Mode 2 Form 1 sector carries.
-pub const USER_BYTES: u64 = 2048;
-
-/// Where the user data starts in a Mode 1 frame: past sync and header.
-const MODE1_AT: usize = 16;
-
-/// Where it starts in a Mode 2 Form 1 frame: past the eight-byte sub-header
-/// as well.
-const MODE2_AT: usize = 24;
-
-/// The byte of a frame's header that says which mode it is (§14.2).
-const MODE_BYTE: usize = 15;
-
-/// A frame's twelve-byte sync pattern (§14.1).
-pub const SYNC: [u8; 12] = [
-    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
-];
-
-/// The lead-in every disc begins with, in frames: two seconds (§20).
-pub const LEAD_IN_FRAMES: u64 = 150;
-
-/// Frames a second at single speed; the CD32's drive is twice this.
-pub const FRAMES_PER_SECOND: u64 = 75;
-
-/// How the sectors of an image are laid out in the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
-    /// 2048 bytes a sector: user data only, which is what an ISO image is.
-    UserData,
-    /// 2352 bytes a sector: whole frames, user data lifted out of each.
-    Frames,
-}
-
-impl Layout {
-    /// How many bytes one sector takes in the file.
-    #[must_use]
-    pub fn stride(self) -> u64 {
-        match self {
-            Layout::UserData => USER_BYTES,
-            Layout::Frames => FRAME_BYTES,
-        }
-    }
-
-    /// Which layout `head` — the first bytes of the image — is in.
-    ///
-    /// The sync pattern decides it; see the module documentation for why a
-    /// size cannot.
-    #[must_use]
-    pub fn of(head: &[u8]) -> Layout {
-        if head.len() >= SYNC.len() && head[..SYNC.len()] == SYNC {
-            Layout::Frames
-        } else {
-            Layout::UserData
-        }
-    }
-}
-
-/// A disc's table of contents, as this class synthesises it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Toc {
-    /// The first track number; always 1 here.
-    pub first: u8,
-    /// The last track number; always 1 here.
-    pub last: u8,
-    /// The track's control nibble: `$4`, a data track.
-    pub control: u8,
-    /// Where the track starts, in logical blocks.
-    pub start: u64,
-    /// Where the lead-out starts: the block after the last.
-    pub lead_out: u64,
-}
-
-/// A logical block as the minute, second and frame a drive reports.
-///
-/// Block zero is two seconds in, because the lead-in is 150 frames long
-/// (ECMA-130 §20).
-#[must_use]
-pub fn msf(block: u64) -> (u8, u8, u8) {
-    let f = block + LEAD_IN_FRAMES;
-    (
-        (f / (FRAMES_PER_SECOND * 60)) as u8,
-        (f / FRAMES_PER_SECOND % 60) as u8,
-        (f % FRAMES_PER_SECOND) as u8,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// the disc
-// ---------------------------------------------------------------------------
-
-/// A disc in the tray.
-#[derive(Debug)]
-struct Disc {
-    bytes: Arc<dyn Medium>,
-    layout: Layout,
-    sectors: u64,
-}
-
-impl Disc {
-    /// The user data of logical block `lba`.
-    fn read(&self, lba: u64, dst: &mut [u8; USER_BYTES as usize]) -> Result<()> {
-        if lba >= self.sectors {
-            return Err(Error::State(format!(
-                "amiga.cd: block {lba} is past the disc's {} blocks",
-                self.sectors
-            )));
-        }
-        let at = lba * self.layout.stride();
-        match self.layout {
-            Layout::UserData => self
-                .bytes
-                .read_at(at, dst)
-                .map_err(|e| medium::error_at(at, e)),
-            Layout::Frames => {
-                let mut frame = [0u8; FRAME_BYTES as usize];
-                self.bytes
-                    .read_at(at, &mut frame)
-                    .map_err(|e| medium::error_at(at, e))?;
-                // Mode 2's sub-header pushes the user data eight bytes along;
-                // any other mode byte is read as Mode 1, which is what a
-                // drive handed a frame it cannot classify does with it.
-                let from = if frame[MODE_BYTE] == 2 {
-                    MODE2_AT
-                } else {
-                    MODE1_AT
-                };
-                dst.copy_from_slice(&frame[from..from + USER_BYTES as usize]);
-                Ok(())
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // the seam Akiko holds
@@ -253,25 +91,19 @@ impl DrivePort {
     /// How many logical blocks that disc has, or zero with an empty tray.
     #[must_use]
     pub fn sectors(&self) -> u64 {
-        self.inner.disc.as_ref().map_or(0, |d| d.sectors)
+        self.inner.disc.as_ref().map_or(0, Disc::sectors)
     }
 
     /// How its sectors are laid out in the image, or `None` with no disc.
     #[must_use]
     pub fn layout(&self) -> Option<Layout> {
-        self.inner.disc.as_ref().map(|d| d.layout)
+        self.inner.disc.as_ref().map(Disc::layout)
     }
 
     /// The disc's table of contents, or `None` with no disc.
     #[must_use]
     pub fn toc(&self) -> Option<Toc> {
-        self.inner.disc.as_ref().map(|d| Toc {
-            first: 1,
-            last: 1,
-            control: 0x4,
-            start: 0,
-            lead_out: d.sectors,
-        })
+        self.inner.disc.as_ref().map(Disc::toc)
     }
 
     /// Read logical block `lba`'s 2048 bytes of user data, and leave the head
@@ -285,7 +117,7 @@ impl DrivePort {
         let Some(disc) = self.inner.disc.as_ref() else {
             return Err(Error::State(String::from("amiga.cd: no disc in the tray")));
         };
-        disc.read(lba, dst)?;
+        disc.read_block(CLASS_NAME, lba, dst)?;
         *self.inner.at.lock() = lba;
         Ok(())
     }
@@ -356,31 +188,11 @@ impl CdRom {
     pub fn holding(medium: Option<Arc<dyn Medium>>) -> Result<CdRom> {
         let disc = match medium {
             None => None,
-            Some(bytes) => {
-                let mut head = [0u8; SYNC.len()];
-                let capacity = bytes.capacity();
-                if capacity >= SYNC.len() as u64 {
-                    bytes
-                        .read_at(0, &mut head)
-                        .map_err(|e| medium::error_at(0, e))?;
-                }
-                let layout = Layout::of(&head);
-                let stride = layout.stride();
-                if capacity == 0 || capacity % stride != 0 {
-                    return Err(Error::Config {
-                        at: String::from(CLASS_NAME),
-                        message: format!(
-                            "a disc image of {capacity} bytes is not a whole number of \
-                             {stride}-byte sectors"
-                        ),
-                    });
-                }
-                Some(Disc {
-                    bytes,
-                    layout,
-                    sectors: capacity / stride,
-                })
-            }
+            // Both layouts, because a CD32 master is delivered as an ISO and a
+            // rip of one is raw frames, and `dev::disc` reads either. Which it
+            // is, is decided by the sync pattern rather than by the length —
+            // see that module for why a modulus cannot settle it.
+            Some(bytes) => Some(Disc::open(CLASS_NAME, bytes)?),
         };
         Ok(CdRom {
             inner: Arc::new(Inner {
@@ -426,7 +238,7 @@ impl Device for CdRom {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let at = r.read_u64()?;
-        let sectors = self.inner.disc.as_ref().map_or(0, |d| d.sectors);
+        let sectors = self.inner.disc.as_ref().map_or(0, Disc::sectors);
         if at != 0 && at >= sectors {
             return Err(Error::State(format!(
                 "amiga.cd: a head at block {at} on a disc of {sectors} blocks"
@@ -486,46 +298,15 @@ fn store(bytes: &[u8]) -> Arc<dyn Medium> {
     Arc::new(ram) as Arc<dyn Medium>
 }
 
-/// A disc image of `sectors` 2352-byte Mode 1 frames, each carrying `fill` of
-/// its own index, for a test that needs whole frames rather than user data.
-#[must_use]
-#[doc(hidden)]
-pub fn mode1_image(sectors: u64) -> Vec<u8> {
-    let mut out = vec![0u8; (sectors * FRAME_BYTES) as usize];
-    for lba in 0..sectors {
-        let at = (lba * FRAME_BYTES) as usize;
-        out[at..at + SYNC.len()].copy_from_slice(&SYNC);
-        let (m, s, f) = msf(lba);
-        out[at + 12] = m;
-        out[at + 13] = s;
-        out[at + 14] = f;
-        out[at + MODE_BYTE] = 1;
-        for i in 0..USER_BYTES as usize {
-            out[at + MODE1_AT + i] = (lba as u8).wrapping_add(i as u8);
-        }
-    }
-    out
-}
-
-/// The same content as [`mode1_image`], as an ISO image: user data only.
-#[must_use]
-#[doc(hidden)]
-pub fn iso_image(sectors: u64) -> Vec<u8> {
-    let mut out = vec![0u8; (sectors * USER_BYTES) as usize];
-    for lba in 0..sectors {
-        let at = (lba * USER_BYTES) as usize;
-        for i in 0..USER_BYTES as usize {
-            out[at + i] = (lba as u8).wrapping_add(i as u8);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+    use crate::dev::disc::{iso_image, mode1_image};
 
     fn disc(bytes: Vec<u8>) -> Arc<dyn Medium> {
         super::store(&bytes)
@@ -585,19 +366,6 @@ mod tests {
         }
     }
 
-    /// Mode 2 Form 1's sub-header pushes the user data eight bytes along.
-    #[test]
-    fn mode_2_form_1_user_data_starts_eight_bytes_later() {
-        let mut image = mode1_image(1);
-        image[MODE_BYTE] = 2;
-        // Put a recognisable byte where Mode 2's data begins.
-        image[MODE2_AT] = 0x5A;
-        let drive = CdRom::holding(Some(disc(image))).expect("frames realize");
-        let mut buf = [0u8; USER_BYTES as usize];
-        drive.port().read(0, &mut buf).expect("it reads");
-        assert_eq!(buf[0], 0x5A);
-    }
-
     #[test]
     fn a_disc_that_is_not_whole_sectors_is_refused() {
         assert!(CdRom::holding(Some(disc(vec![0u8; 2047]))).is_err());
@@ -607,31 +375,11 @@ mod tests {
         assert!(CdRom::holding(Some(disc(short))).is_err());
     }
 
-    /// The lead-in is two seconds, so block zero is 00:02:00 and block 75 is
-    /// 00:03:00 (ECMA-130 §20).
-    #[test]
-    fn a_block_is_reported_two_seconds_in() {
-        assert_eq!(msf(0), (0, 2, 0));
-        assert_eq!(msf(74), (0, 2, 74));
-        assert_eq!(msf(75), (0, 3, 0));
-        assert_eq!(msf(75 * 60 - 151), (0, 59, 74));
-        assert_eq!(msf(75 * 60 - 150), (1, 0, 0));
-    }
-
     #[test]
     fn the_table_of_contents_is_one_data_track() {
         let drive = CdRom::holding(Some(disc(iso_image(10)))).expect("an ISO realizes");
         let toc = drive.port().toc().expect("a disc has one");
-        assert_eq!(
-            toc,
-            Toc {
-                first: 1,
-                last: 1,
-                control: 0x4,
-                start: 0,
-                lead_out: 10,
-            }
-        );
+        assert_eq!(toc, Toc::one_data_track(10));
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! | [`atmel`] | `dev-at24c`, `dev-atecc` | Atmel/Microchip I²C parts: the AT24C EEPROM and the ATECC508A/608 secure element |
 //! | [`mos`] | `dev-mos8520` | MOS Technology peripherals: the 8520 CIA an Amiga has two of |
 //! | [`medium`] | `dev-medium` | what a drive's platter *is*: the storage seam every block device stores its bytes behind |
+//! | [`disc`] | `dev-disc` | what a **CD** is: frame layout, user-data extraction, MSF and a synthesised table of contents, for both drives that hold one |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
 //! | [`dfuse`] | `dev-dfuse` | DfuSe (`.dfu`, UM0391) firmware images: the container that carries an address per element, and the loader that honours it |
@@ -87,6 +88,10 @@ pub mod fdt;
 #[cfg(feature = "dev-medium")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-medium")))]
 pub mod medium;
+
+#[cfg(feature = "dev-disc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-disc")))]
+pub mod disc;
 
 #[cfg(feature = "dev-blk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-blk")))]

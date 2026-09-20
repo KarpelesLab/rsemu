@@ -181,7 +181,8 @@ buffer for it had been allocated. The seam does not fix the last one by itself
 chunks — but it is what made the check expressible.
 
 The seam has its own home: `src/dev/medium.rs`, feature `dev-medium`, which
-`dev-ata-disk`, `dev-nvme`, `dev-virtio` and `dev-blk` each depend on. It lived
+`dev-ata-disk`, `dev-nvme`, `dev-virtio`, `dev-blk` and `dev-disc` each depend
+on. It lived
 in `src/dev/ata/` for as long as ATA was the only device that wanted it, and
 the cost of leaving it there was a `riscv-virt` build linking an ATA command set
 it will never issue in order to name a trait, a slot and a three-valued enum —
@@ -190,6 +191,38 @@ and dependency-free, but the shape rule is explicit that a NES build links a
 6502 and nothing else. The one thing that stayed behind is
 `dev::ata::disk::error_bit`, the translation from a medium's three-way answer to
 the ATA Error register, because that half belongs to the command set.
+
+**A CD is a second seam, one level up** (`src/dev/disc.rs`, feature `dev-disc`).
+`medium` answers *where do the bytes come from*; `disc` answers *what are those
+bytes*, and a compact disc is the only place in this tree where the second
+question has a non-trivial answer — a hard disk's sector is its bytes, and a
+CD's 2048 bytes of user data are buried in a 2352-byte frame at an offset that
+depends on the mode. Two devices hold a CD and they share no bus, no register
+file and no command set: `ata.cdrom` behind SFF-8020i packet commands, and
+`amiga.cd` behind Akiko's message ring on a machine with no ATA anywhere near
+it. Both were carrying their own copy of the same four things, so the four
+things moved:
+
+| what | where it is stated |
+| --- | --- |
+| sector layout, 2048-byte user data or 2352-byte raw frames | ECMA-130 §14 |
+| which layout an image is in — **the sync pattern, not the length** | §14.1 |
+| Mode 1 and Mode 2 Form 1 user-data extraction | §§14.2-14.3 |
+| LBA to minute/second/frame, with the 150-frame lead-in | §20 |
+| a synthesised one-data-track table of contents, `ADR` and control | §22.3.1 |
+
+The sync pattern deciding it is the part a modulus gets wrong: 2048 and 2352
+share a factor of 16, so an image of 301 056 bytes is a whole number of sectors
+in *both* layouts and a length alone cannot say which. A raw rip of exactly that
+size used to be read as 147 logical blocks of sync pattern and error-correction
+codes; it is now refused by name.
+
+Not shared, because they are not the same question: `ata.cdrom` opens a disc
+through `Disc::open_user_data`, which refuses raw frames — there is no `READ CD`
+in its command set and no model of an audio track, so reading one would be worse
+than declining it — while `amiga.cd` opens through `Disc::open`, which takes
+either, because a CD32 master is delivered as an ISO and a rip of one is frames.
+The capability is the disc's; the policy is each drive's.
 
 `machines/riscv-virt.machine` did not change to get any of this, which is the
 test of whether the media-slot design held: the board still says

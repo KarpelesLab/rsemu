@@ -81,22 +81,29 @@
 //!
 //! # The disc
 //!
-//! A [`Medium`], 2048 bytes to the logical block, and the drive never writes to
-//! it — there is no `WRITE(10)` and no `MODE SELECT` in the command set below,
-//! so the read-only-ness is structural rather than a flag that could be got
-//! wrong. An empty [`medium::MediumSlot`] or an unbound media slot is a drive
-//! with **no disc in it**, which is an ordinary CD-ROM drive and answers
-//! `NOT READY`/`MEDIUM NOT PRESENT` rather than failing to exist.
+//! A [`Disc`], which is
+//! [`crate::dev::disc`]'s and not this file's: the sector layout, the
+//! 150-frame lead-in an MSF address carries and the synthesised one-track
+//! table of contents are facts about a compact disc rather than about a command
+//! set, and the CD32's drive — on a bus with no ATA anywhere near it — needs
+//! every one of them. What is left here is what SFF-8020i says about them.
 //!
-//! **2352-byte raw images are refused, not guessed at.** A `.bin`/`.cue` pair
-//! carries the sync pattern, the header and the error-correction codes as well
-//! as the user data, so its user area is at a stride this device does not
-//! model; audio tracks have no user data at all and no `READ(10)` reaches them.
-//! A file whose length is a multiple of 2352 and not of 2048 is therefore
-//! rejected at construction with a message that says which format it looks like
-//! — the alternative, reading it as though the sectors were 2048 bytes, would
-//! hand a guest sixteen bytes of sync pattern where its boot record should be
-//! and no error anywhere.
+//! The drive never writes: there is no `WRITE(10)` and no `MODE SELECT` in the
+//! command set below, so the read-only-ness is structural rather than a flag
+//! that could be got wrong. An empty [`medium::MediumSlot`] or an unbound media
+//! slot is a drive with **no disc in it**, which is an ordinary CD-ROM drive
+//! and answers `NOT READY`/`MEDIUM NOT PRESENT` rather than failing to exist.
+//!
+//! **2352-byte raw images are refused, not guessed at** — `Disc::open_user_data`
+//! is the door this drive opens and it is the door that refuses them. A
+//! `.bin`/`.cue` pair carries the sync pattern, the header and the
+//! error-correction codes as well as the user data, and its audio tracks have no
+//! user data at all for a `READ(10)` to reach; a drive that read one as though
+//! its sectors were 2048 bytes would hand a guest sixteen bytes of sync pattern
+//! where its boot record should be, with no error anywhere. `dev::disc` *can*
+//! read frames — `amiga.cd` holds exactly such an image — and this drive
+//! declines the capability rather than lacking it, because the rest of what a
+//! raw rip is (a cue sheet, several tracks, audio among them) is not modelled.
 //!
 //! # Sources
 //!
@@ -133,6 +140,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source as _};
 use crate::core::sync::{LockRank, Mutex};
+use crate::dev::disc::{self, Disc};
 use crate::dev::medium::{self, Medium, Snapshot};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
@@ -146,13 +154,14 @@ const STATE_VERSION: u32 = 1;
 /// How many bytes one logical block of a data CD holds.
 ///
 /// 2048, which is Mode 1 and Mode 2 Form 1 user data (ISO 9660's own unit).
-pub const BLOCK: u64 = 2048;
+/// [`disc::USER_BYTES`] under the name the command set uses for it.
+pub const BLOCK: u64 = disc::USER_BYTES;
 
 /// How many bytes one *raw* CD sector holds, sync pattern and ECC included.
 ///
-/// Named only so that [`AtapiDrive::new`] can recognise a raw image and refuse
-/// it by name rather than reading it as though it were cooked.
-pub const RAW_BLOCK: u64 = 2352;
+/// [`disc::FRAME_BYTES`], named here only because a `READ CD` that does not
+/// exist is the reason this drive refuses an image in that layout.
+pub const RAW_BLOCK: u64 = disc::FRAME_BYTES;
 
 /// How many bytes the command descriptor block of an ATAPI CD-ROM is.
 ///
@@ -505,8 +514,8 @@ pub struct AtapiDrive {
     id: Identity,
     position: Position,
     /// The disc, if there is one in the drive. `None` is an empty tray.
-    disc: Option<Arc<dyn Medium>>,
-    /// How many 2048-byte logical blocks the disc holds.
+    disc: Option<Disc>,
+    /// How many [`BLOCK`]-byte logical blocks the disc holds.
     blocks: u64,
     state: Mutex<Volatile>,
 }
@@ -602,38 +611,15 @@ impl AtapiDrive {
         position: Position,
         disc: Option<Arc<dyn Medium>>,
     ) -> Result<AtapiDrive> {
-        let blocks = match &disc {
-            None => 0,
-            Some(medium) => {
-                let bytes = medium.capacity();
-                if bytes == 0 {
-                    return Err(config(String::from(
-                        "a disc of zero bytes is an empty drive; leave the media slot unbound",
-                    )));
-                }
-                if !bytes.is_multiple_of(BLOCK) {
-                    // The common way to get here is a raw `.bin` rip, and
-                    // saying so is worth the branch: the failure mode of
-                    // reading one as though it were cooked is sixteen bytes of
-                    // sync pattern where the boot record should be, with no
-                    // error anywhere.
-                    if bytes.is_multiple_of(RAW_BLOCK) {
-                        return Err(config(format!(
-                            "{bytes} bytes is {} raw {RAW_BLOCK}-byte CD sectors; this drive \
-                             reads {BLOCK}-byte logical blocks and does not model the sync \
-                             pattern, the header or the error-correction codes a raw image \
-                             carries. Convert it to a 2048-byte-per-sector image first",
-                            bytes / RAW_BLOCK
-                        )));
-                    }
-                    return Err(config(format!(
-                        "a disc holds a whole number of {BLOCK}-byte logical blocks, and \
-                         {bytes} bytes is not a whole number of them"
-                    )));
-                }
-                bytes / BLOCK
-            }
+        // `open_user_data` and not `open`: this drive models `BLOCK`-byte
+        // logical blocks and nothing else, so a raw image is refused by name
+        // there rather than read as though it were cooked. See the module
+        // documentation for why the capability exists and is declined.
+        let disc = match disc {
+            None => None,
+            Some(medium) => Some(Disc::open_user_data(CLASS_NAME, medium)?),
         };
+        let blocks = disc.as_ref().map_or(0, Disc::sectors);
         Ok(AtapiDrive {
             id,
             position,
@@ -663,8 +649,13 @@ impl AtapiDrive {
 
     /// The disc, for a host that wants to look at it directly.
     #[must_use]
-    pub fn disc(&self) -> Option<&Arc<dyn Medium>> {
+    pub fn disc(&self) -> Option<&Disc> {
         self.disc.as_ref()
+    }
+
+    /// The storage the disc's bytes come from, for a snapshot.
+    fn medium(&self) -> Option<&Arc<dyn Medium>> {
+        self.disc.as_ref().map(Disc::medium)
     }
 
     // -- the cable ---------------------------------------------------------
@@ -842,8 +833,12 @@ impl AtapiDrive {
                 buf.copy_from_slice(&bytes[at..at + n as usize]);
                 true
             }
+            // The offset is a *user-data* one — `lba * BLOCK + n` — and
+            // turning it into a file offset is the disc's job, not this
+            // drive's: a byte-count limit cuts a multi-block transfer wherever
+            // it likes and nothing here has to know what a frame is.
             Origin::Disc(base) => match &self.disc {
-                Some(disc) => disc.read_at(base + taken, &mut buf).is_ok(),
+                Some(disc) => disc.read_user_at(base + taken, &mut buf).is_ok(),
                 None => false,
             },
         };
@@ -1207,24 +1202,35 @@ impl AtapiDrive {
             self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
             return;
         }
-        let lead_out = self.blocks;
+        // The table of contents is synthesised by `dev::disc` — one data
+        // track, and the lead-out at the block after the last — because that
+        // is a fact about a bare disc image rather than about `READ TOC`.
+        let Some(toc) = self.disc.as_ref().map(Disc::toc) else {
+            self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
+            return;
+        };
         match format {
             0 => {
                 // A track number above the last one, and above the lead-out's
                 // 0xAA, is an invalid field.
-                if start > 1 && start != 0xaa {
+                if start > toc.last && start != disc::LEAD_OUT_TRACK {
                     self.check(state, sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD);
                     return;
                 }
                 let mut body: Vec<u8> = Vec::new();
-                if start <= 1 {
-                    body.extend_from_slice(&track_descriptor(1, 0, msf));
+                if start <= toc.first {
+                    body.extend_from_slice(&track_descriptor(&toc, toc.first, toc.start, msf));
                 }
-                body.extend_from_slice(&track_descriptor(0xaa, lead_out, msf));
+                body.extend_from_slice(&track_descriptor(
+                    &toc,
+                    disc::LEAD_OUT_TRACK,
+                    toc.lead_out,
+                    msf,
+                ));
                 let mut out: Vec<u8> = Vec::new();
                 out.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
-                out.push(1); // first track
-                out.push(1); // last track
+                out.push(toc.first);
+                out.push(toc.last);
                 out.extend_from_slice(&body);
                 self.data_in(state, out, alloc_len);
             }
@@ -1235,7 +1241,7 @@ impl AtapiDrive {
                 out.extend_from_slice(&10u16.to_be_bytes());
                 out.push(1); // first session
                 out.push(1); // last session
-                out.extend_from_slice(&track_descriptor(1, 0, msf));
+                out.extend_from_slice(&track_descriptor(&toc, toc.first, toc.start, msf));
                 self.data_in(state, out, alloc_len);
             }
             _ => self.check(state, sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD),
@@ -1344,7 +1350,7 @@ impl AtapiDrive {
     // -- snapshots ---------------------------------------------------------
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        match &self.disc {
+        match self.medium() {
             None => w.write_bool(false)?,
             Some(disc) => {
                 w.write_bool(true)?;
@@ -1421,7 +1427,7 @@ impl AtapiDrive {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let had_disc = r.read_bool()?;
-        match (&self.disc, had_disc) {
+        match (self.medium(), had_disc) {
             (Some(disc), true) => {
                 let bytes: &[u8] = r.read_bytes()?;
                 match disc.snapshot() {
@@ -1664,14 +1670,16 @@ fn capabilities_page() -> [u8; 22] {
 }
 
 /// One eight-byte TOC track descriptor.
-fn track_descriptor(track: u8, lba: u64, msf: bool) -> [u8; 8] {
+///
+/// The `ADR`/control byte and the MSF arithmetic are the disc's
+/// ([`disc::Toc::adr_control`], [`disc::msf`]); what is this file's is where
+/// SFF-8020i's `READ TOC` puts them in the eight bytes.
+fn track_descriptor(toc: &disc::Toc, track: u8, lba: u64, msf: bool) -> [u8; 8] {
     let mut out = [0u8; 8];
-    // ADR 1 (the address is a position), control 4 (a data track, no
-    // pre-emphasis, digital copy prohibited).
-    out[1] = 0x14;
+    out[1] = toc.adr_control();
     out[2] = track;
     if msf {
-        let (m, s, f) = to_msf(lba);
+        let (m, s, f) = disc::msf(lba);
         out[5] = m;
         out[6] = s;
         out[7] = f;
@@ -1679,18 +1687,6 @@ fn track_descriptor(track: u8, lba: u64, msf: bool) -> [u8; 8] {
         out[4..8].copy_from_slice(&(lba as u32).to_be_bytes());
     }
     out
-}
-
-/// Turn a logical block address into minutes, seconds and frames.
-///
-/// The Red Book's two-second lead-in is the 150 frames added here, and it is
-/// why `READ TOC` in MSF reports 00:02:00 for a track that starts at block 0.
-fn to_msf(lba: u64) -> (u8, u8, u8) {
-    let total = lba + 150;
-    let frame = total % 75;
-    let seconds = (total / 75) % 60;
-    let minutes = total / (75 * 60);
-    (minutes as u8, seconds as u8, frame as u8)
 }
 
 /// Lay `text` into a SCSI ASCII field: space padded, not NUL terminated, and
