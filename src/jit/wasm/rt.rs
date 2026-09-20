@@ -309,13 +309,23 @@ impl Engine {
         }
         mem[..frame].fill(0);
 
+        // The frame starts at zero: this engine's linear memory holds nothing
+        // else. An embedder's would, which is why the offset is a parameter of
+        // the generated function rather than baked into it.
+        const FRAME: u32 = 0;
         let mut env = Thunks {
             state,
             host,
             block,
             mems: resident.compiled.mem_ops(),
+            frame: FRAME,
         };
-        let outcome = exec::run(&resident.program, &[0, 0], mem.as_mut_slice(), &mut env);
+        let outcome = exec::run(
+            &resident.program,
+            &[0, i64::from(FRAME)],
+            mem.as_mut_slice(),
+            &mut env,
+        );
 
         let out = match outcome {
             Err(e) => Err(Error::Ir(format!(
@@ -410,6 +420,13 @@ struct Thunks<'a, H: ?Sized> {
     host: &'a mut H,
     block: &'a Block,
     mems: &'a [MemOp],
+    /// Where the frame this block was entered with starts.
+    ///
+    /// Carried rather than assumed, because a load leaves its value in the
+    /// frame's *out word* and generated code reads it back from there: the two
+    /// have to agree about where the frame is, and an agreement that holds
+    /// only because both happen to say zero is one edit from being wrong.
+    frame: u32,
 }
 
 impl<H: IrHost + ?Sized> Thunks<'_, H> {
@@ -425,6 +442,7 @@ impl<H: IrHost + ?Sized> Thunks<'_, H> {
 
     /// `Engine::publish`, reachable from inside a run.
     fn publish(&mut self, mem: &[u8]) {
+        let base = self.frame as usize;
         if self.state.published {
             return;
         }
@@ -437,7 +455,7 @@ impl<H: IrHost + ?Sized> Thunks<'_, H> {
             return;
         };
         for &(slot, temp) in &mark.live {
-            let at = temp_offset(temp.0) as usize;
+            let at = base + temp_offset(temp.0) as usize;
             if let Some(bytes) = mem.get(at..at + 8) {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(bytes);
@@ -495,7 +513,8 @@ impl<H: IrHost + ?Sized> Env for Thunks<'_, H> {
                 }
                 match self.host.load(&mem_op, args[2] as u64) {
                     Ok(v) => {
-                        mem[..8].copy_from_slice(&v.to_le_bytes());
+                        let out = self.frame as usize;
+                        mem[out..out + 8].copy_from_slice(&v.to_le_bytes());
                         i64::from(answer::OK)
                     }
                     Err(e) => self.fault(at, e),
