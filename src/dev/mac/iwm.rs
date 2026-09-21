@@ -67,26 +67,49 @@
 //!    1   1   eject            (no-op)
 //! ```
 //!
+//! # The read data path
+//!
+//! A disk goes in as an image ([`super::disk`]), becomes a cylinder of bit
+//! cells ([`super::gcr`]), and is shifted past the head one cell per tick of
+//! this device's clock — so **one tick is one bit cell**, and a board gives it
+//! 500 kHz, the rate the IWM's own cell time works out at. A different rate is
+//! not refused; a device cannot see its domain's frequency.
+//!
+//! The shifter is the IWM's own and there is only one rule to it: the register
+//! shifts left, and a byte is complete when a one reaches bit 7. Leading zeros
+//! are skipped rather than counted, which is what makes a self-sync run —
+//! `$FF` in ten cells instead of eight — resynchronise a shifter that came into
+//! it on the wrong boundary. Reading the data register takes the byte and
+//! leaves zero behind, so a guest polls until bit 7 is set, which is what a
+//! ROM does.
+//!
+//! **Which head** is the one thing in this path the Guide settles only by
+//! implication. Its drive-register table names status lines 8 and 9 `RDDATA0`
+//! and `RDDATA1`, and those two addresses differ *only* in `SEL` — so
+//! addressing one of them is how the computer says which head's data line it
+//! wants, and this model latches the side there.
+//!
 //! # What is modelled, and what is not
 //!
 //! The switches, the mode and status registers, the write handshake, the
-//! drive's status lines, stepping, the motor, and a disk that can be present,
-//! absent or write protected. **The data path is not here**: `RDDATA` reads as
-//! a line that never changes, so a guest sees a drive that spins and steps and
-//! never delivers a sector. That is enough for a ROM to find no bootable disk
-//! and say so, and it is what `docs/platforms/mac-plus.md` records as the next
-//! thing to build.
+//! drive's status lines, stepping, the motor, a disk that can be present,
+//! absent or write protected, and the **read** data path above. **Writing is
+//! not here**: a byte written to the data register is kept and goes nowhere, so
+//! a disk is read-only however its tab is set.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use super::disk::Disk;
+use super::gcr::Track;
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
+use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 use crate::machine::realize::Instance;
@@ -96,7 +119,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.iwm";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 /// How many bytes of address space the sixteen switches occupy: the board puts
 /// the register selects on A9-A12, so `16 * 512`.
@@ -154,6 +177,18 @@ struct Mechanism {
     /// The "a disk has been swapped" line, set when a disk appears or goes and
     /// cleared by the drive's own reset register.
     switched: bool,
+    /// Which head the computer last asked for, by addressing `RDDATA0` or
+    /// `RDDATA1`.
+    side: bool,
+    /// The tachometer's output now.
+    tach: bool,
+    /// The bit under the head now.
+    read_line: bool,
+    /// How far round the cylinder the head is, in bit cells.
+    bit: u64,
+    /// The read shift register: shifts left, and latches when a one reaches
+    /// bit 7.
+    rsr: u8,
 }
 
 impl Mechanism {
@@ -167,6 +202,11 @@ impl Mechanism {
             outward: false,
             motor: false,
             switched: false,
+            side: false,
+            tach: false,
+            read_line: false,
+            bit: 0,
+            rsr: 0,
         }
     }
 
@@ -195,11 +235,15 @@ impl Mechanism {
             5 => self.track != 0,
             // SWITCHED: high once a disk has been changed.
             6 => self.switched,
-            // TACH: the tachometer. A line that never moves is a drive that
-            // reports no rotation, which is what a stopped motor looks like.
-            7 => false,
-            // RDDATA0 and RDDATA1, the two heads. No data path yet.
-            8 | 9 => false,
+            // TACH: the tachometer, sixty pulses a revolution. A line that
+            // never moves is a drive that reports no rotation, which is what a
+            // stopped motor looks like.
+            7 => self.tach,
+            // RDDATA0 and RDDATA1: the two heads' raw read lines. These two
+            // addresses differ only in `SEL`, which is how the computer says
+            // which head it wants, so addressing one of them selects the side
+            // as well as reading it.
+            8 | 9 => self.read_line,
             // SIDES: high on a double-sided mechanism.
             10 => self.double_sided,
             // /READY: low once the motor is up to speed, which here is as soon
@@ -250,8 +294,12 @@ struct State {
     switches: u8,
     /// The mode register, loaded by a write while `Q7:Q6` is `11`.
     mode: u8,
-    /// The data register. Nothing fills it while there is no data path.
+    /// The data register: the byte the shifter last latched, or zero once the
+    /// guest has taken it. Bit 7 is set in every byte a disk can carry, so a
+    /// zero here is "nothing yet" and that is what a guest polls on.
     data: u8,
+    /// Bit cells simulated. One tick of this device's clock is one cell.
+    ticks: u64,
     /// The two mechanisms the chip's `SELECT` line picks between.
     drives: [Mechanism; 2],
     /// `SEL`, which the VIA drives and the drive register file uses as its
@@ -269,6 +317,7 @@ impl State {
             switches: 0,
             mode: 0,
             data: 0,
+            ticks: 0,
             drives: [
                 Mechanism::fresh(installed[0]),
                 Mechanism::fresh(installed[1]),
@@ -334,6 +383,13 @@ impl State {
         }
         // `LSTRB` going high is what latches a drive control register; the
         // address and the data are the `CA` lines as they stand at that moment.
+        // Addressing `RDDATA0` or `RDDATA1` is how the computer picks a head:
+        // the two are the same drive-register address but for `SEL`.
+        let addr = self.drive_address();
+        if addr & 0xe == 0x8 {
+            let which = self.selected();
+            self.drives[which].side = addr & 1 != 0;
+        }
         if bit == SW_LSTRB && on && before & SW_LSTRB == 0 {
             let s = self.switches;
             let addr = (u8::from(s & SW_CA1 != 0) << 1) | u8::from(s & SW_CA0 != 0);
@@ -344,9 +400,112 @@ impl State {
     }
 }
 
+/// The disks in the two mechanisms, and the cylinder under the head.
+///
+/// One lock for both because the second is built out of the first, and because
+/// it sits **below** the chip's own state lock: `advance_to` holds `State` and
+/// reaches in here, which is `DEVICE` then `LEAF` and is the ranked order.
+///
+/// `bits` is **derived state**: never serialized, and thrown away whenever the
+/// head moves, the side changes or a disk comes or goes (`CLAUDE.md`,
+/// *Devices*).
+#[derive(Debug, Default)]
+struct Media {
+    disks: [Option<Disk>; 2],
+    /// Which mechanism, cylinder and side `bits` holds, or `None` when nothing
+    /// has been built.
+    under: Option<(usize, u8, bool)>,
+    bits: Track,
+}
+
 /// The chip, as something an address space can dispatch to.
 struct Shared {
     state: Mutex<State>,
+    /// The disks and the cylinder under the head. See [`Media`].
+    media: Mutex<Media>,
+    /// Published without a lock for the scheduler.
+    ticks: AtomicU64,
+    /// The catch-up handle a register access syncs through (§4.2).
+    lazy: Mutex<Option<LazyHandle>>,
+}
+
+impl Shared {
+    /// Bring the chip up to date before a register access.
+    ///
+    /// A debug access advances nothing (`ROADMAP.md` §15, invariant 5).
+    fn sync(&self, debug: bool) {
+        if debug {
+            return;
+        }
+        let handle = self.lazy.lock().clone();
+        if let Some(handle) = handle {
+            // A refusal means catch-up for this chip is already running further
+            // up the stack; the access still has to be answered from where the
+            // head stands.
+            let _ = handle.sync(AccessKind::Guest);
+        }
+    }
+
+    /// Shift the disk past the head until `target` bit cells have gone by.
+    fn advance_to(&self, target: u64) {
+        let mut state = self.state.lock();
+        if target <= state.ticks {
+            return;
+        }
+        let cells = target - state.ticks;
+        state.ticks = target;
+        self.ticks.store(target, Ordering::Relaxed);
+        let which = state.selected();
+        let drive = state.drives[which];
+        // A motor that is not turning moves no medium past the head, and a
+        // drive with nothing in it has none to move.
+        if !drive.motor || !drive.disk {
+            return;
+        }
+        let mut media = self.media.lock();
+        let want = (which, drive.track, drive.side);
+        if media.under != Some(want) {
+            media.bits = match &media.disks[which] {
+                Some(disk) => disk.track(drive.track, drive.side),
+                None => Track::new(),
+            };
+            media.under = Some(want);
+        }
+        let len = media.bits.len() as u64;
+        if len == 0 {
+            // An unformatted cylinder: the head sees nothing and the shifter
+            // stays where it is.
+            return;
+        }
+        // A whole revolution is the same bits again, so anything beyond one
+        // lands in the same place; only the remainder has to be walked.
+        let steps = if cells >= len { len + cells % len } else { cells };
+        let (mut bit, mut rsr, mut data) = (drive.bit, drive.rsr, state.data);
+        let (mut line, mut tach) = (drive.read_line, drive.tach);
+        for _ in 0..steps {
+            line = media.bits.bit(bit as usize);
+            rsr = (rsr << 1) | u8::from(line);
+            if rsr & 0x80 != 0 {
+                data = rsr;
+                rsr = 0;
+            }
+            bit = (bit + 1) % len;
+            // Sixty tachometer pulses a revolution: a hundred and twenty half
+            // cycles, so the line is which of them the head is in.
+            tach = (bit * 120 / len) % 2 == 1;
+        }
+        state.data = data;
+        let drive = &mut state.drives[which];
+        drive.bit = bit;
+        drive.rsr = rsr;
+        drive.read_line = line;
+        drive.tach = tach;
+    }
+
+    /// Throw the cached cylinder away.
+    fn invalidate(&self) {
+        self.media.lock().under = None;
+    }
 }
 
 impl core::fmt::Debug for Shared {
@@ -365,16 +524,24 @@ impl MemOps for Shared {
             return Err(BusError::BadAccess);
         };
         let index = ((offset / REGISTER_STRIDE) & 0xf) as u8;
+        self.sync(attrs.debug);
         let mut state = self.state.lock();
         if attrs.debug {
             // A debugger must be able to look without moving a switch, and
             // every address here moves one. So a debug read answers from the
-            // state as it stands and changes nothing (invariant 5).
+            // state as it stands, changes nothing, and does not take the byte
+            // out of the data register (invariant 5).
             *byte = state.read_value();
             return Ok(());
         }
         state.switch(index);
         *byte = state.read_value();
+        if state.switches & (SW_Q7 | SW_Q6) == 0 {
+            // Reading the data register takes the byte: a guest polls it until
+            // bit 7 is set, and every byte a disk can carry has bit 7 set, so
+            // zero is the "nothing yet" this leaves behind.
+            state.data = 0;
+        }
         Ok(())
     }
 
@@ -387,13 +554,14 @@ impl MemOps for Shared {
             return Err(BusError::BadAccess);
         }
         let index = ((offset / REGISTER_STRIDE) & 0xf) as u8;
+        self.sync(false);
         let mut state = self.state.lock();
         state.switch(index);
         match (state.switches & SW_Q7 != 0, state.switches & SW_Q6 != 0) {
             // The mode register.
             (true, true) => state.mode = *value & 0x7f,
-            // The data register, which starts a write to the disk. There is no
-            // data path yet, so the byte is kept and goes nowhere.
+            // The data register, which starts a write to the disk. Writing is
+            // not modelled, so the byte is kept and goes nowhere.
             (true, false) => state.data = *value,
             _ => {}
         }
@@ -445,13 +613,21 @@ impl Iwm {
     pub fn new(props: &Props) -> Result<Iwm> {
         let mut r = props.reader();
         let drives = r.or("drives", 1u64)?;
+        let image = r.optional_media("image")?.map(|m| m.bytes().to_vec());
         r.finish()?;
         if drives == 0 || drives > 2 {
             return Err(Error::Property(alloc::format!(
                 "property `drives`: an IWM's cable takes one or two mechanisms, not {drives}"
             )));
         }
-        Ok(Iwm::with_drives([true, drives == 2]))
+        let iwm = Iwm::with_drives([true, drives == 2]);
+        // An empty slot is an empty drive rather than a bad image: a Macintosh
+        // with no disk in it is the ordinary case and the one the ROM draws a
+        // picture for.
+        if let Some(bytes) = image.filter(|b| !b.is_empty()) {
+            iwm.insert(0, Disk::from_image(&bytes)?);
+        }
+        Ok(iwm)
     }
 
     /// The same, saying exactly which cable positions are occupied.
@@ -459,6 +635,9 @@ impl Iwm {
     pub fn with_drives(installed: [bool; 2]) -> Iwm {
         let shared = Arc::new(Shared {
             state: Mutex::with_rank(LockRank::DEVICE, State::fresh(installed)),
+            media: Mutex::with_rank(LockRank::LEAF, Media::default()),
+            ticks: AtomicU64::new(0),
+            lazy: Mutex::with_rank(LockRank::LEAF, None),
         });
         let region = Arc::new(Region::io(
             CLASS_NAME,
@@ -518,15 +697,74 @@ impl Iwm {
         self.shared.state.lock().drives[which & 1].disk
     }
 
-    /// Put a disk in drive `which`, or take one out.
-    pub fn set_disk(&self, which: usize, present: bool, write_protect: bool) {
-        let mut state = self.shared.state.lock();
-        let drive = &mut state.drives[which & 1];
-        if drive.disk != present {
+    /// Put `disk` in drive `which`, taking out whatever was there.
+    pub fn insert(&self, which: usize, disk: Disk) {
+        let which = which & 1;
+        {
+            let mut state = self.shared.state.lock();
+            let protect = disk.write_protected();
+            let drive = &mut state.drives[which];
             drive.switched = true;
+            drive.disk = true;
+            drive.write_protect = protect;
+            drive.bit = 0;
+            drive.rsr = 0;
         }
-        drive.disk = present;
-        drive.write_protect = write_protect;
+        let mut media = self.shared.media.lock();
+        media.disks[which] = Some(disk);
+        media.under = None;
+    }
+
+    /// Take the disk out of drive `which`.
+    pub fn eject(&self, which: usize) {
+        let which = which & 1;
+        {
+            let mut state = self.shared.state.lock();
+            let drive = &mut state.drives[which];
+            if drive.disk {
+                drive.switched = true;
+            }
+            drive.disk = false;
+            drive.write_protect = false;
+        }
+        let mut media = self.shared.media.lock();
+        media.disks[which] = None;
+        media.under = None;
+    }
+
+    /// Put a blank disk in drive `which`, or take one out — the short form a
+    /// test uses when what is on the disk does not matter.
+    pub fn set_disk(&self, which: usize, present: bool, write_protect: bool) {
+        if !present {
+            self.eject(which);
+            return;
+        }
+        let mut disk = Disk::blank(2);
+        disk.set_write_protected(write_protect);
+        self.insert(which, disk);
+    }
+
+    /// The disk in drive `which`, if there is one.
+    #[must_use]
+    pub fn disk(&self, which: usize) -> Option<Disk> {
+        self.shared.media.lock().disks[which & 1].clone()
+    }
+
+    /// The byte the shifter last latched and the guest has not taken.
+    #[must_use]
+    pub fn latched(&self) -> u8 {
+        self.shared.state.lock().data
+    }
+
+    /// Bit cells shifted past the head.
+    #[must_use]
+    pub fn ticks(&self) -> u64 {
+        self.shared.ticks.load(Ordering::Relaxed)
+    }
+
+    /// Shift the disk past the head until `target` bit cells have gone by.
+    pub fn advance_to(&self, target: u64) {
+        self.shared.advance_to(target);
     }
 
     /// The soft switches, for a test that wants to see what a ROM set.
@@ -554,8 +792,10 @@ impl Device for Iwm {
     }
 
     fn reset(&self, _kind: ResetKind) {
+        self.shared.invalidate();
         let mut state = self.shared.state.lock();
         let sel = state.sel;
+        let ticks = state.ticks;
         // A disk stays in the drive across a reset: it is a thing in a slot,
         // not a register. The chip's switches and the mechanism's motor and
         // head position do come back.
@@ -565,6 +805,7 @@ impl Device for Iwm {
         ];
         *state = State::fresh(self.installed);
         state.sel = sel;
+        state.ticks = ticks;
         for (drive, (disk, wp)) in state.drives.iter_mut().zip(disks) {
             drive.disk = disk;
             drive.write_protect = wp;
@@ -576,6 +817,7 @@ impl Device for Iwm {
         w.write_u8(state.switches)?;
         w.write_u8(state.mode)?;
         w.write_u8(state.data)?;
+        w.write_u64(state.ticks)?;
         for drive in &state.drives {
             w.write_bool(drive.installed)?;
             w.write_bool(drive.disk)?;
@@ -585,6 +827,11 @@ impl Device for Iwm {
             w.write_bool(drive.outward)?;
             w.write_bool(drive.motor)?;
             w.write_bool(drive.switched)?;
+            w.write_bool(drive.side)?;
+            w.write_bool(drive.tach)?;
+            w.write_bool(drive.read_line)?;
+            w.write_u64(drive.bit)?;
+            w.write_u8(drive.rsr)?;
         }
         w.write_bool(state.sel)
     }
@@ -595,6 +842,7 @@ impl Device for Iwm {
         next.switches = r.read_u8()?;
         next.mode = r.read_u8()? & 0x7f;
         next.data = r.read_u8()?;
+        next.ticks = r.read_u64()?;
         for drive in &mut next.drives {
             drive.installed = r.read_bool()?;
             drive.disk = r.read_bool()?;
@@ -604,14 +852,51 @@ impl Device for Iwm {
             drive.outward = r.read_bool()?;
             drive.motor = r.read_bool()?;
             drive.switched = r.read_bool()?;
+            drive.side = r.read_bool()?;
+            drive.tach = r.read_bool()?;
+            drive.read_line = r.read_bool()?;
+            drive.bit = r.read_u64()?;
+            drive.rsr = r.read_u8()?;
         }
         next.sel = r.read_bool()?;
         *state = next;
+        drop(state);
+        // The cylinder under the head is derived and is rebuilt from wherever
+        // the restored head turns out to be.
+        self.shared.invalidate();
         Ok(())
     }
 
     fn region(&self, name: &str) -> Option<RegionRef> {
         matches!(name, "" | "regs").then(|| Arc::clone(&self.region))
+    }
+
+    // -- lazily advanced (`ROADMAP.md` §4.2) ---------------------------------
+
+    /// Yes. The head is where it is at the cycle the guest looks, and a guest
+    /// polling the data register is asking exactly that.
+    fn is_lazy(&self) -> bool {
+        true
+    }
+
+    fn current_tick(&self) -> u64 {
+        self.shared.ticks.load(Ordering::Relaxed)
+    }
+
+    fn advance_to(&self, tick: u64) {
+        Iwm::advance_to(self, tick);
+    }
+
+    /// None: nothing inside this chip changes at an instant it could name, and
+    /// everything that reads it syncs on the access. Naming a per-byte event
+    /// would wake the scheduler fifty thousand times a second to compute what
+    /// the next read computes anyway.
+    fn next_event_tick(&self) -> Option<u64> {
+        None
+    }
+
+    fn attach_lazy(&self, handle: LazyHandle) {
+        *self.shared.lazy.lock() = Some(handle);
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
@@ -635,12 +920,20 @@ pub static IWM_CLASS: DeviceClass = DeviceClass {
     version: STATE_VERSION,
     summary: "an Integrated Woz Machine: sixteen soft switches, and the 400K/800K drive on its \
               cable",
-    properties: &[PropertySpec {
-        name: "drives",
-        kind: ValueKind::Uint,
-        required: false,
-        summary: "how many mechanisms are on the cable, 1 or 2 (default 1)",
-    }],
+    properties: &[
+        PropertySpec {
+            name: "drives",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "how many mechanisms are on the cable, 1 or 2 (default 1)",
+        },
+        PropertySpec {
+            name: "image",
+            kind: ValueKind::Media,
+            required: false,
+            summary: "the media slot holding the disk in the internal drive; empty is no disk",
+        },
+    ],
     construct: |props| Ok(Box::new(Iwm::new(props)?)),
 };
 
@@ -667,6 +960,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("drives", ValueKind::Uint).range(1, 2))
+        .prop(PropSchema::new("image", ValueKind::Media))
         .region("")
         .region("regs")
         .port(SEL_PIN, PortDir::In)

@@ -278,3 +278,190 @@ fn the_class_is_registrable_and_its_schema_matches() {
     assert!(iwm.sink("ca0", &[]).is_none(), "CA0 is a switch, not a pin");
     assert!(schema().port_named(SEL_PIN).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// the read data path
+// ---------------------------------------------------------------------------
+
+/// Spin the drive up: motor on, `Q7:Q6` at `00` so reads answer from the data
+/// register, and the head over `track` on `side`.
+fn spin_up(iwm: &Iwm, track: u8, side: bool) {
+    // The motor: drive register 2 with CA2 clear is "motor on", latched by
+    // LSTRB going high.
+    address(iwm, 0b0100);
+    touch(iwm, 7); // LSTRB on
+    touch(iwm, 6); // and off again
+    touch(iwm, 9); // ENABLE on
+    assert!(iwm.motor(0), "the motor is running");
+
+    while iwm.track(0) < track {
+        address(iwm, 0b0000); // step inward
+        touch(iwm, 7);
+        touch(iwm, 6);
+        address(iwm, 0b0010); // issue the step
+        touch(iwm, 7);
+        touch(iwm, 6);
+    }
+    assert_eq!(iwm.track(0), track);
+
+    // Pick the head by addressing RDDATA0 or RDDATA1, which differ only in SEL.
+    address(iwm, 0b1000 | u8::from(side));
+    // And put Q7:Q6 back to 00, which is the data register.
+    touch(iwm, 12);
+    touch(iwm, 14);
+}
+
+/// Shift the drive round and collect every byte the guest would have read,
+/// polling the data register the way a ROM does.
+fn read_bytes(iwm: &Iwm, cells: u64) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    let start = iwm.ticks();
+    // Two cells at a time is four times as often as a byte can appear, which
+    // is the margin a real poll loop has.
+    for n in 1..=cells / 2 {
+        iwm.advance_to(start + n * 2);
+        let byte = touch(iwm, 0); // switch 0 is CA0 off; the read is the point
+        if byte & 0x80 != 0 {
+            out.push(byte);
+        }
+    }
+    out
+}
+
+/// The whole path with a real drive in it: a disk goes in, the head goes over
+/// a cylinder, the motor turns, and the bytes that come out of the shifter are
+/// the sectors that went on.
+///
+/// This is the test `docs/platforms/mac-plus.md` calls for in the absence of a
+/// real 800K image: the encoder and the drive are checked against each other
+/// through the chip, rather than either against itself.
+#[test]
+fn a_disk_in_the_drive_shifts_its_sectors_out_of_the_data_register() {
+    use crate::dev::mac::disk::Disk;
+    use crate::dev::mac::gcr::{self, DATA_BYTES, TAG_BYTES};
+
+    // A disk whose every block says which block it is.
+    let mut image = alloc::vec![0u8; 1600 * DATA_BYTES];
+    for (block, chunk) in image.chunks_mut(DATA_BYTES).enumerate() {
+        for (i, byte) in chunk.iter_mut().enumerate() {
+            *byte = (block as u8).wrapping_mul(7).wrapping_add(i as u8);
+        }
+    }
+    let disk = Disk::from_image(&image).expect("an 800K image");
+
+    for (track, side) in [(0u8, false), (0, true), (17, false), (MAX_TRACK, true)] {
+        let iwm = Iwm::with_drives([true, false]);
+        iwm.insert(0, disk.clone());
+        spin_up(&iwm, track, side);
+
+        // Two revolutions, so that a sector straddling the start is seen whole.
+        let bits = disk.track(track, side);
+        let bytes = read_bytes(&iwm, bits.len() as u64 * 2);
+
+        // Rebuild the track from what the chip handed over and read it back
+        // with the codec, which is the only way to say the bytes are the right
+        // bytes in the right order.
+        let mut seen = gcr::Track::new();
+        for byte in &bytes {
+            seen.push_byte(*byte);
+        }
+        let (sectors, _) = gcr::decode_track(&seen);
+        assert_eq!(
+            sectors.len(),
+            usize::from(gcr::sectors_on(track)),
+            "cylinder {track} side {side}: {} sectors came out",
+            sectors.len()
+        );
+        for sector in &sectors {
+            assert_eq!(sector.track, track);
+            assert_eq!(sector.side, side);
+            let block = disk.block_of(track, side, sector.sector).expect("a block");
+            assert_eq!(
+                sector.data(),
+                disk.block(block).expect("a block"),
+                "cylinder {track} side {side} sector {}",
+                sector.sector
+            );
+            assert_eq!(sector.tag(), &[0u8; TAG_BYTES][..]);
+        }
+    }
+}
+
+/// A drive with the motor off delivers nothing, however long it is left.
+#[test]
+fn a_stopped_motor_shifts_nothing_past_the_head() {
+    use crate::dev::mac::disk::Disk;
+    let iwm = Iwm::with_drives([true, false]);
+    iwm.insert(0, Disk::blank(2));
+    touch(&iwm, 12);
+    touch(&iwm, 14); // Q7:Q6 = 00
+    iwm.advance_to(200_000);
+    assert_eq!(iwm.latched(), 0, "a stopped disk moves no medium");
+    assert!(!sense(&iwm, 7), "and the tachometer does not turn");
+}
+
+/// The tachometer turns once the motor does, sixty pulses a revolution.
+#[test]
+fn the_tachometer_turns_with_the_motor() {
+    use crate::dev::mac::disk::Disk;
+    let iwm = Iwm::with_drives([true, false]);
+    iwm.insert(0, Disk::blank(2));
+    spin_up(&iwm, 0, false);
+    let len = iwm.disk(0).expect("a disk").track(0, false).len() as u64;
+
+    // Count the edges over one revolution: a hundred and twenty half cycles.
+    let mut edges = 0;
+    let mut was = sense(&iwm, 7);
+    let start = iwm.ticks();
+    for n in 1..=len {
+        iwm.advance_to(start + n);
+        let now = sense(&iwm, 7);
+        if now != was {
+            edges += 1;
+        }
+        was = now;
+    }
+    assert_eq!(edges, 120, "sixty pulses is a hundred and twenty edges");
+}
+
+/// Taking the byte out of the data register leaves zero, which is what a guest
+/// polls on — and a debug read does not take it.
+#[test]
+fn reading_the_data_register_takes_the_byte_and_a_debug_read_does_not() {
+    use crate::dev::mac::disk::Disk;
+    let iwm = Iwm::with_drives([true, false]);
+    iwm.insert(0, Disk::blank(2));
+    spin_up(&iwm, 0, false);
+    // Far enough for a byte to have been latched: a self-sync run is first.
+    iwm.advance_to(iwm.ticks() + 64);
+    let latched = iwm.latched();
+    assert!(latched & 0x80 != 0, "something came off the disk");
+
+    // A debug read leaves it where it is.
+    let mut byte = [0u8; 1];
+    iwm.shared
+        .read(0, &mut byte, MemAttrs::DEBUG)
+        .expect("a debug read");
+    assert_eq!(byte[0], latched);
+    assert_eq!(iwm.latched(), latched, "a debugger took nothing");
+
+    // A real one takes it.
+    assert_eq!(touch(&iwm, 0), latched);
+    assert_eq!(iwm.latched(), 0);
+}
+
+/// A disk that is not there, and one whose second head has nothing on it.
+#[test]
+fn an_empty_drive_and_a_single_sided_disk_deliver_nothing() {
+    use crate::dev::mac::disk::Disk;
+    let iwm = Iwm::with_drives([true, false]);
+    spin_up(&iwm, 0, false);
+    iwm.advance_to(iwm.ticks() + 100_000);
+    assert_eq!(iwm.latched(), 0, "no disk, no data");
+
+    let iwm = Iwm::with_drives([true, false]);
+    iwm.insert(0, Disk::blank(1));
+    spin_up(&iwm, 0, true);
+    iwm.advance_to(iwm.ticks() + 100_000);
+    assert_eq!(iwm.latched(), 0, "a single-sided disk has one head");
+}
