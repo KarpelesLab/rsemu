@@ -225,6 +225,97 @@ fn a_damaged_sector_is_refused_rather_than_returned() {
     assert!(!bad.is_empty(), "and nothing was reported");
 }
 
+/// **A cylinder is one [`SECTOR_CELLS`] slot per sector**, gaps included, and
+/// that is what decides how fast the disk turns.
+///
+/// The sectors themselves are shorter than their slots; the difference is the
+/// gap a formatter leaves, and leaving it out used to make every cylinder
+/// 2.5 % short and the spindle 2.5 % fast — far enough outside the window a
+/// Macintosh Plus ROM accepts that it would not read the disk at all. See
+/// [`SECTOR_CELLS`] for the measurement, and `docs/platforms/mac-plus.md` for
+/// how it was made.
+#[test]
+fn a_cylinder_is_one_slot_per_sector_and_turns_at_the_speed_that_implies() {
+    // The IWM's own cell time in fast mode, which is what the board clocks
+    // this at: two microseconds a cell.
+    const CELLS_PER_SECOND: usize = 500_000;
+
+    let sector = Sector::new(
+        0,
+        false,
+        0,
+        FORMAT_800K,
+        &[0; TAG_BYTES],
+        &[0x5a; DATA_BYTES],
+    );
+    let bare = {
+        let mut t = Track::new();
+        t.push_sector(&sector);
+        t.len()
+    };
+    assert!(
+        bare < SECTOR_CELLS,
+        "a sector must fit in its slot with room for a gap: {bare} of {SECTOR_CELLS}"
+    );
+
+    for (zone, &sectors) in ZONE_SECTORS.iter().enumerate() {
+        let track = (zone as u8) * ZONE_TRACKS;
+        assert_eq!(sectors_on(track), sectors);
+        let sectors_here: Vec<Sector> = (0..sectors)
+            .map(|s| {
+                Sector::new(
+                    track,
+                    false,
+                    s,
+                    FORMAT_800K,
+                    &[0; TAG_BYTES],
+                    &[0x5a; DATA_BYTES],
+                )
+            })
+            .collect();
+        let cells = encode_track(&sectors_here).len();
+        assert_eq!(
+            cells,
+            usize::from(sectors) * SECTOR_CELLS,
+            "cylinder {track} is not a whole number of sector slots"
+        );
+        // And the speed that implies, to a tenth of a revolution a minute.
+        let rpm_tenths = (CELLS_PER_SECOND * 60 * 10 + cells / 2) / cells;
+        let want = [3940, 4298, 4728, 5253, 5910][zone];
+        assert_eq!(
+            rpm_tenths,
+            want,
+            "cylinder {track} turns at {} rpm, not {}",
+            rpm_tenths as f64 / 10.0,
+            want as f64 / 10.0
+        );
+    }
+}
+
+/// The gap is written rather than erased, bar the cells that will not take
+/// another self-sync byte.
+#[test]
+fn padding_lays_down_self_sync_and_then_bare_medium() {
+    let mut track = Track::new();
+    track.push_byte(0xd5);
+    track.pad_to(8 + 25);
+    assert_eq!(track.len(), 8 + 25);
+    // Two whole self-sync bytes (ten cells each) and then five bare cells.
+    for n in 8..8 + 8 {
+        assert!(track.bit(n), "cell {n} should be a one");
+    }
+    for n in 8 + 8..8 + 10 {
+        assert!(!track.bit(n), "cell {n} should be a zero");
+    }
+    for n in 8 + 20..8 + 25 {
+        assert!(!track.bit(n), "cell {n} is the splice and carries nothing");
+    }
+    // A track already long enough is left exactly as it was.
+    let before = track.clone();
+    track.pad_to(4);
+    assert_eq!(track, before);
+}
+
 /// A track with nothing on it reads as nothing rather than as noise.
 #[test]
 fn an_unformatted_cylinder_reads_as_empty() {

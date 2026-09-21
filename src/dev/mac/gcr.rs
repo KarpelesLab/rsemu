@@ -6,6 +6,11 @@
 //! the two are each other's test. `mac.iwm` shifts a [`Track`] past its read
 //! head and `mac.disk` says which sectors go on it.
 //!
+//! A cylinder is **exactly [`SECTOR_CELLS`] cells per sector**, gaps and all,
+//! which is what decides how fast the disk turns under a fixed bit clock — and
+//! a Macintosh Plus ROM refuses to read a disk whose spindle is outside a
+//! narrow window. That constant carries the measurement.
+//!
 //! # Sources
 //!
 //! * *Guide to the Macintosh Family Hardware*, 2nd edition, chapter 9, for
@@ -108,6 +113,39 @@ pub const ZONE_SECTORS: [u8; 5] = [12, 11, 10, 9, 8];
 
 /// How many cylinders one speed zone covers.
 pub const ZONE_TRACKS: u8 = 16;
+
+/// How many bit cells one sector occupies on the medium, its gap included.
+///
+/// **This is the number that decides how fast the disk turns**, and it was
+/// measured off Apple's own ROM rather than recalled from a table. The IWM
+/// shifts a cell every two microseconds in fast mode — 500,000 cells a second
+/// — so a cylinder of `n` sectors is `n * SECTOR_CELLS` cells round and takes
+/// `n * SECTOR_CELLS / 500000` seconds to pass the head. The sectors
+/// themselves are shorter than that; the rest is the gap a formatter
+/// leaves, and leaving it out is what used to make this disk turn 2.5 % fast.
+///
+/// # How 6,345 was arrived at
+///
+/// A Macintosh Plus ROM will not read a disk whose spindle is running at the
+/// wrong speed. After it starts the motor it spends its time in a loop that
+/// counts thirty-two tachometer transitions and measures how long they took,
+/// three samples at a time, against a retry count that starts at eight and
+/// walks down — and the cross through the floppy on this board's screen was
+/// that count reaching the end. Sweeping the rate the model turns at and watching for the ROM to leave
+/// that loop and start reading the data register puts the window it accepts
+/// for a twelve-sector cylinder at **386.0 to 401.0 revolutions a minute**:
+/// 385.0 and 401.5 are refused, everything between is read. That is a window
+/// two per cent either side of **394 rpm**, the figure quoted for an 800K
+/// mechanism's outermost zone — so the ROM confirms the number rather than
+/// this file asserting it. `docs/platforms/mac-plus.md` has the measurement.
+///
+/// 394 rpm on twelve sectors is `500000 * 60 / 394 / 12` = 6,345.2 cells a
+/// sector; 6,345 puts the outer zone at 394.01 rpm, and the other four zones
+/// follow from [`ZONE_SECTORS`] with no second number to get wrong — 429.8,
+/// 472.8, 525.3 and 591.0 rpm, which are the speeds quoted for them. That is
+/// the whole point of a zoned disk: one linear density, one cell time, and a
+/// spindle that turns as fast as the track is short.
+pub const SECTOR_CELLS: usize = 6345;
 
 /// How many sectors cylinder `track` holds.
 #[must_use]
@@ -477,6 +515,25 @@ impl Track {
         }
         self.push_byte(0xff);
     }
+
+    /// Pad out to `cells` with the gap a formatter leaves.
+    ///
+    /// Self-sync bytes while there is room for one — a gap is written, not
+    /// erased, and a shifter coming out of it is aligned however it went in —
+    /// and then the nine cells or fewer that will not take another as bare
+    /// medium with no transition on it, which is what the splice at the end of
+    /// a write really looks like. Nothing before `cells` is touched, and a
+    /// track already that long or longer is left alone.
+    pub fn pad_to(&mut self, cells: usize) {
+        while self.len + 10 <= cells {
+            self.push_byte(0xff);
+            self.push_bit(false);
+            self.push_bit(false);
+        }
+        while self.len < cells {
+            self.push_bit(false);
+        }
+    }
 }
 
 /// One sector, as it goes onto a track or comes off it.
@@ -532,11 +589,17 @@ impl Sector {
 /// them, and nothing here or in the drive depends on which order they are in,
 /// because a sector is found by reading its address field rather than by
 /// counting.
+///
+/// Each one gets a whole [`SECTOR_CELLS`] slot, so a cylinder is exactly as
+/// many cells round as its sector count says and turns at the speed that
+/// implies. See [`SECTOR_CELLS`] for why that number and not the length of the
+/// sectors themselves.
 #[must_use]
 pub fn encode_track(sectors: &[Sector]) -> Track {
     let mut track = Track::new();
-    for sector in sectors {
+    for (n, sector) in sectors.iter().enumerate() {
         track.push_sector(sector);
+        track.pad_to((n + 1) * SECTOR_CELLS);
     }
     track
 }
