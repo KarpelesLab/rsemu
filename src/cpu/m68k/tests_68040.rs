@@ -309,10 +309,13 @@ fn the_68040_movec_table_is_not_a_superset_of_the_68030s() {
         movec_round_trip(Model::M68030, ctrl::CAAR, 0x1234_5678),
         Some(0x1234_5678)
     );
-    // TC is sixteen bits with two of them implemented (Figure 3-4).
+    // TC is sixteen bits with two of them implemented (Figure 3-4). The
+    // value written here leaves **E** clear, because this board has no
+    // translation tables and the instruction after the `MOVEC` still has to
+    // be fetched; that **E** has storage is what every test below shows.
     assert_eq!(
-        movec_round_trip(Model::M68040, ctrl::TC, 0xffff_ffff),
-        Some(0xc000)
+        movec_round_trip(Model::M68040, ctrl::TC, 0xffff_7fff),
+        Some(0x4000)
     );
     // "Bits 8–0 of an address loaded into the URP or the SRP must be zero"
     // (§3.1.1).
@@ -794,4 +797,729 @@ fn an_ec040_snapshot_carries_only_the_registers_it_has() -> Result<()> {
     restore(&other, &bytes)?;
     assert_eq!(other.regs(), after);
     Ok(())
+}
+// ----------------------------------------------------------------------
+// The memory management unit
+// ----------------------------------------------------------------------
+
+/// Where the translation tables go in the 64 KiB board: a root table at
+/// `$3000`, a pointer table at `$3200` and a page table at `$3400`.
+const ROOT: u32 = 0x3000;
+const POINTER: u32 = 0x3200;
+const PAGE: u32 = 0x3400;
+
+/// Build a three-level table that maps the low 256 KiB to itself.
+///
+/// The root index is logical address bits 31–25, the pointer index bits
+/// 24–18 and the page index bits 17–12 for 4 KiB pages or 17–13 for 8 KiB
+/// ones (M68040UM §3.2.1), each scaled by four — so one root entry, one
+/// pointer entry and a full page table cover `$00000000`–`$0003FFFF`, which
+/// is where the vectors, the code and the stack all are. Translation applies
+/// to instruction fetches too, and a test that mapped only its own page
+/// would fault on its first prefetch.
+fn identity_tables(board: &Board, page_bits: u32) {
+    board.poke_long(0, 0x2000);
+    board.poke_long(4, 0x0400);
+    // A resident table descriptor is UDT = 10 or 11; U is bit 3 and W bit 2.
+    board.poke_long(u64::from(ROOT), POINTER | 0b10);
+    board.poke_long(u64::from(POINTER), PAGE | 0b10);
+    let entries = 1u32 << (18 - page_bits);
+    for i in 0..entries {
+        // A resident page descriptor is PDT = 01 or 11, with the physical
+        // address in bits 31-12 or 31-13.
+        board.poke_long(u64::from(PAGE) + u64::from(i) * 4, (i << page_bits) | 0b01);
+    }
+}
+
+/// A 68040 board with that table, and one page replaced by `page_descriptor`.
+fn mapped(la: u32, page_descriptor: u32) -> Board {
+    let board = Board::new(Model::M68040);
+    identity_tables(&board, 12);
+    board.poke_long(
+        u64::from(PAGE) + u64::from((la >> 12) & 0x3f) * 4,
+        page_descriptor,
+    );
+    board.cpu.step();
+    board
+}
+
+/// Load `URP`, `SRP` and `TC`, then run `words` from `$400` with paged
+/// translation live.
+fn translate_on(board: &Board, words: &[u16]) {
+    board.load(0x400, words);
+    board.with_regs(|r| {
+        r.urp = ROOT;
+        r.srp = u64::from(ROOT);
+        // TC: E set, P clear — 4 KiB pages (Figure 3-4).
+        r.tc = 0x8000;
+    });
+    board.at(0x400);
+}
+
+#[test]
+fn the_manuals_translation_table_example_indexes_the_three_levels() {
+    // M68040UM Figure 3-13: "$76543210 ... the RI field of the logical
+    // address, $3B, is mapped into bits 8-2 of the SRP value ... the PI
+    // field, $15 ... the PGI field, $1", with 8 KiB pages.
+    let la = 0x7654_3210u32;
+    assert_eq!(la >> 25, 0x3b, "root index");
+    assert_eq!((la >> 18) & 0x7f, 0x15, "pointer index");
+    assert_eq!((la >> 13) & 0x1f, 0x01, "page index with 8 KiB pages");
+    // And with 4 KiB pages the page index is one bit wider.
+    assert_eq!((la >> 12) & 0x3f, 0x03);
+}
+
+#[test]
+fn a_resident_page_translates_and_the_history_bits_are_written_back() {
+    // A page descriptor: physical address $5000, CM = 01 (copyback),
+    // PDT = 01 resident, U and M clear so the search has to set them
+    // (M68040UM Table 3-1).
+    let board = mapped(0x0001_0000, 0x0000_5000 | (1 << 5) | 0b01);
+    // MOVE.W #$1234,($00010000).L
+    translate_on(&board, &[0x33fc, 0x1234, 0x0001, 0x0000, 0x4e71]);
+    board.cpu.step();
+    assert_eq!(
+        board.peek_word(0x5000),
+        0x1234,
+        "the write landed at the physical address"
+    );
+    let descriptor = board.peek_long(u64::from(PAGE) + 0x10 * 4);
+    assert_eq!(descriptor & 0x08, 0x08, "U set by the search");
+    assert_eq!(descriptor & 0x10, 0x10, "M set by a write to a clear M");
+    // The two table descriptors get their U bits too.
+    assert_eq!(board.peek_long(u64::from(ROOT)) & 0x08, 0x08);
+    assert_eq!(board.peek_long(u64::from(POINTER)) & 0x08, 0x08);
+}
+
+#[test]
+fn a_read_does_not_set_the_modified_bit() {
+    // Table 3-1, the read rows: U goes to 1, M is left alone.
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b01);
+    board.poke_word(0x5000, 0xbeef);
+    translate_on(&board, &[0x3039, 0x0001, 0x0000, 0x4e71]); // MOVE.W ($10000).L,D0
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().d[0] & 0xffff, 0xbeef);
+    let descriptor = board.peek_long(u64::from(PAGE) + 0x10 * 4);
+    assert_eq!(descriptor & 0x18, 0x08, "U set, M still clear");
+}
+
+#[test]
+fn a_write_to_a_write_protected_page_is_an_access_error_with_the_atc_bit() {
+    // §3.2.6.3: "an ATC descriptor corresponding to the logical address is
+    // created with the W-bit set ... the subsequent retry of the write
+    // access results in an access error exception being taken", and
+    // §8.4.6.2 says the SSW's ATC bit is set "for an ATC fault due to ...
+    // privilege violation (write protected or supervisor only)".
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b100 | 0b01);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    translate_on(&board, &[0x33fc, 0x1234, 0x0001, 0x0000, 0x4e71]);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::BUS_ERROR));
+    assert_eq!(board.peek_word(0x5000), 0, "nothing was written");
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x7008, "format $7");
+    let ssw = board.peek_word(sp + 0x0c);
+    assert_eq!(ssw & 0x0400, 0x0400, "ATC: a translation failure");
+    assert_eq!(ssw & 0x0100, 0, "RW clear: a write");
+    assert_eq!(
+        board.peek_long(sp + 0x14),
+        0x0001_0000,
+        "the logical address faulted"
+    );
+    // And M is not set on a write-protected page (Table 3-1's WP = 1 rows).
+    assert_eq!(board.peek_long(u64::from(PAGE) + 0x10 * 4) & 0x10, 0);
+}
+
+#[test]
+fn a_read_of_a_write_protected_page_is_allowed() {
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b100 | 0b01);
+    board.poke_word(0x5000, 0x4321);
+    translate_on(&board, &[0x3039, 0x0001, 0x0000, 0x4e71]);
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().d[0] & 0xffff, 0x4321);
+    assert_eq!(board.cpu.last_exception(), None);
+}
+
+#[test]
+fn the_table_search_faults_where_the_manual_says_it_faults() {
+    // "00 or 01 = Invalid. These codes indicate that the table at the next
+    // level is not resident or that the logical address is out of bounds"
+    // (§3.2.2.3, **UDT**), and the same for **PDT** = 00 at the page level.
+    // One case per level: an invalid descriptor, and a table that is not
+    // there at all.
+    // Each case reaches its level through a branch of the tree the identity
+    // map does not use — root entry 2 rather than 0 — so the code and the
+    // stack stay mapped and the fault is the only thing that goes wrong.
+    // `$04000000` has root index 2 and pointer index 0; `$04040000` has root
+    // index 2 and pointer index 1.
+    for (la, prepare, what) in [
+        (0x0400_0000u32, None, "root"),
+        (0x0404_0000, Some(POINTER | 0b10), "pointer"),
+        (0x0001_0000, None, "page"),
+    ] {
+        let board = mapped(0x0001_0000, if what == "page" { 0 } else { 0x5000 | 0b01 });
+        if let Some(descriptor) = prepare {
+            board.poke_long(u64::from(ROOT) + 2 * 4, descriptor);
+        }
+        board.handler(0, vector::BUS_ERROR, 0x0800);
+        translate_on(
+            &board,
+            &[0x3039, (la >> 16) as u16, la as u16, 0x4e71], // MOVE.W (la).L,D0
+        );
+        board.cpu.step();
+        assert_eq!(
+            board.cpu.last_exception(),
+            Some(vector::BUS_ERROR),
+            "an invalid {what} descriptor"
+        );
+        let sp = u64::from(board.cpu.regs().a[7]);
+        assert_eq!(board.peek_word(sp + 6), 0x7008, "{what}: format $7");
+        assert_eq!(
+            board.peek_word(sp + 0x0c) & 0x0400,
+            0x0400,
+            "{what}: the ATC bit"
+        );
+        assert_eq!(
+            board.peek_long(sp + 0x14),
+            la,
+            "{what}: the logical address"
+        );
+    }
+}
+
+#[test]
+fn a_bus_error_during_a_table_search_is_an_atc_fault() {
+    // §8.4.6.2: the ATC bit is "set for an ATC fault due to a nonresident
+    // entry (**bus error during table search** or invalid descriptor
+    // encountered)". A descriptor fetch the address space refuses is that
+    // first case: the entry the search creates has R clear, and the retried
+    // access is what takes the exception (§3.5).
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b01);
+    // Root entry 2, pointing at a pointer table nothing answers for.
+    board.poke_long(u64::from(ROOT) + 2 * 4, 0x0100_0000 | 0b10);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    translate_on(&board, &[0x3039, 0x0400, 0x0000, 0x4e71]);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::BUS_ERROR));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 0x0c) & 0x0400, 0x0400);
+    // What tells the two apart afterwards is the MMUSR a PTEST reports,
+    // which carries B for the transfer error and not for a merely invalid
+    // descriptor — see `ptest_reports_a_transfer_error_with_b_and_nothing_else`.
+}
+
+#[test]
+fn an_indirect_descriptor_is_followed_to_the_real_page() {
+    // §3.2.4.1: "the address contained in the highest order 30 bits of the
+    // descriptor is a pointer to the page descriptor that is to be used to
+    // map the logical address".
+    let board = mapped(0x0001_0000, 0x0000_3800 | 0b10); // PDT = 10, indirect
+    board.poke_long(0x3800, 0x0000_5000 | 0b01);
+    translate_on(&board, &[0x33fc, 0x1234, 0x0001, 0x0000, 0x4e71]);
+    board.cpu.step();
+    assert_eq!(board.peek_word(0x5000), 0x1234);
+    // "the modified indication is maintained only in the single descriptor":
+    // the history bits go to the descriptor the indirection names, not to
+    // the indirect descriptor itself.
+    assert_eq!(board.peek_long(0x3800) & 0x18, 0x18, "U and M there");
+    assert_eq!(
+        board.peek_long(u64::from(PAGE) + 0x10 * 4) & 0x18,
+        0,
+        "and not in the indirect descriptor"
+    );
+}
+
+#[test]
+fn an_indirect_descriptor_pointing_at_another_is_invalid() {
+    // "This encoding is invalid for a page descriptor pointed to by an
+    // indirect descriptor" (§3.2.2.3, **PDT**).
+    let board = mapped(0x0001_0000, 0x0000_3800 | 0b10);
+    board.poke_long(0x3800, 0x0000_3900 | 0b10);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    translate_on(&board, &[0x3039, 0x0001, 0x0000, 0x4e71]);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::BUS_ERROR));
+}
+
+#[test]
+fn a_supervisor_only_page_refuses_a_user_access() {
+    // §3.2.6.2: "when a table search for a user access encounters an S-bit
+    // set in a page descriptor, the table search ends, and an ATC descriptor
+    // ... is created with the S-bit set. A subsequent retry of the user
+    // access results in an access error exception being taken."
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b1000_0000 | 0b01);
+    board.poke_word(0x5000, 0xcafe);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    translate_on(&board, &[0x3039, 0x0001, 0x0000, 0x4e71]);
+    // A supervisor read is fine.
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().d[0] & 0xffff, 0xcafe);
+    assert_eq!(board.cpu.last_exception(), None);
+
+    // The same page from user state is not. Both root pointers name the
+    // same table, which is what §3.2.6.2 says the S bit is for.
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b1000_0000 | 0b01);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    translate_on(&board, &[0x3039, 0x0001, 0x0000, 0x4e71]);
+    board.with_regs(|r| {
+        r.sr &= !flags::S;
+        r.usp = 0x1f00;
+        r.ssp = 0x2000;
+        r.a[7] = 0x1f00;
+    });
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::BUS_ERROR));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 0x0c) & 0x0400, 0x0400, "an ATC fault");
+}
+
+#[test]
+fn a_transparent_translation_register_works_with_translation_disabled() {
+    // §3.1.3: "the TTRs operate independently of the E-bit in the TCR".
+    // A data TTR covering $00xxxxxx with write protection, S = 1x.
+    let board = Board::new(Model::M68040);
+    board.boot(&[0x33fc, 0x1234, 0x0000, 0x5000, 0x4e71]);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.with_regs(|r| {
+        // Base $00, mask $00 — sixteen megabytes from zero — enabled, S = 1x
+        // so both privilege modes match, and write protected.
+        r.dtt[0] = 0x8000 | (2 << 13) | 0x0004;
+    });
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.last_exception(),
+        Some(vector::BUS_ERROR),
+        "a write to a write-protected block is aborted"
+    );
+    assert_eq!(board.peek_word(0x5000), 0, "and nothing landed");
+}
+
+#[test]
+fn an_instruction_ttr_does_not_answer_for_a_data_access() {
+    // §3.4: the instruction memory unit's registers are "only used for
+    // instruction prefetches", which is the one place the 68040's merged
+    // address space is not merged.
+    let board = Board::new(Model::M68040);
+    board.boot(&[0x33fc, 0x1234, 0x0000, 0x5000, 0x4e71]);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.with_regs(|r| {
+        // Write-protect everything, but only for instruction accesses.
+        r.itt[0] = 0x8000 | (2 << 13) | 0x0004;
+    });
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.last_exception(),
+        None,
+        "a data write is untouched"
+    );
+    assert_eq!(board.peek_word(0x5000), 0x1234);
+}
+
+#[test]
+fn the_first_transparent_register_wins_when_both_match() {
+    // §3.4: "If both registers match, the TT0 status bits are used for the
+    // access." TT0 permits the write, TT1 would have refused it.
+    let board = Board::new(Model::M68040);
+    board.boot(&[0x33fc, 0x1234, 0x0000, 0x5000, 0x4e71]);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.with_regs(|r| {
+        r.dtt[0] = 0x8000 | (2 << 13);
+        r.dtt[1] = 0x8000 | (2 << 13) | 0x0004;
+    });
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), None);
+    assert_eq!(board.peek_word(0x5000), 0x1234);
+}
+
+#[test]
+fn the_s_field_selects_which_privilege_mode_a_block_answers_for() {
+    // §3.1.3: 00 matches user only, 01 supervisor only, 1x both.
+    for (s, supervisor_aborts, user_aborts) in [
+        (0u32, false, true),
+        (1, true, false),
+        (2, true, true),
+        (3, true, true),
+    ] {
+        for user in [false, true] {
+            let board = Board::new(Model::M68040);
+            board.boot(&[0x33fc, 0x1234, 0x0000, 0x5000, 0x4e71]);
+            board.handler(0, vector::BUS_ERROR, 0x0800);
+            board.with_regs(|r| {
+                r.dtt[0] = 0x8000 | (s << 13) | 0x0004;
+                if user {
+                    r.sr &= !flags::S;
+                    r.usp = 0x1f00;
+                    r.ssp = 0x2000;
+                    r.a[7] = 0x1f00;
+                }
+            });
+            board.cpu.step();
+            let aborted = board.cpu.last_exception() == Some(vector::BUS_ERROR);
+            let expected = if user { user_aborts } else { supervisor_aborts };
+            assert_eq!(aborted, expected, "S = {s}, user = {user}");
+        }
+    }
+}
+
+#[test]
+fn eight_kilobyte_pages_use_a_five_bit_page_index() {
+    // Figure 3-12's 8 KiB page descriptor: the physical address is bits
+    // 31-13, and §3.2.1 gives the page index five bits. The pointer table
+    // descriptor's page-table address then reaches down to bit 7, because
+    // a 32-entry page table is 128-byte aligned (Figure 3-11).
+    let la = 0x0001_0000u32;
+    let board = Board::new(Model::M68040);
+    identity_tables(&board, 13);
+    // Two entries of the 4 KiB table become one of the 8 KiB table, so the
+    // page this replaces covers $10000-$11FFF.
+    board.poke_long(
+        u64::from(PAGE) + u64::from((la >> 13) & 0x1f) * 4,
+        0x0000_6000 | 0b01,
+    );
+    board.cpu.step();
+    board.load(0x400, &[0x33fc, 0x1234, 0x0001, 0x0000, 0x4e71]);
+    board.with_regs(|r| {
+        r.urp = ROOT;
+        r.srp = u64::from(ROOT);
+        r.tc = 0xc000; // E and P: 8 KiB pages
+    });
+    board.at(0x400);
+    board.cpu.step();
+    assert_eq!(board.peek_word(0x6000), 0x1234);
+}
+
+#[test]
+fn ptest_reports_what_the_search_found() {
+    // M68000PRM §6, *PTEST* (MC68040), and M68040UM Figure 3-6: the
+    // physical address in bits 31-12, then G, U1, U0, S, CM, M, W, T, R.
+    // The page descriptor here has G, U1, CM = 11 and S set.
+    let descriptor = 0x0000_5000 | (1 << 10) | (1 << 9) | (3 << 5) | (1 << 7) | 0b01;
+    let board = mapped(0x0001_0000, descriptor);
+    board.load(
+        0x400,
+        &[
+            0x203c, 0x0000, 0x0005, // MOVE.L #5,D0   (supervisor data)
+            0x4e7b, 0x0001, // MOVEC D0,DFC
+            0x207c, 0x0001, 0x0000, // MOVEA.L #$10000,A0
+            0xf568, // PTESTR (A0)
+            0x4e7a, 0x1805, // MOVEC MMUSR,D1
+            0x4e71,
+        ],
+    );
+    board.with_regs(|r| {
+        r.urp = ROOT;
+        r.srp = u64::from(ROOT);
+        r.tc = 0x8000;
+    });
+    board.at(0x400);
+    for _ in 0..5 {
+        board.cpu.step();
+    }
+    let mmusr = board.cpu.regs().d[1];
+    assert_eq!(mmusr & 0xffff_f000, 0x0000_5000, "physical address");
+    assert_eq!(mmusr & 1, 1, "R: resident");
+    assert_eq!(mmusr & 0x0400, 0x0400, "G");
+    assert_eq!(mmusr & 0x0200, 0x0200, "U1");
+    assert_eq!(mmusr & 0x0100, 0, "U0 clear");
+    assert_eq!(mmusr & 0x0080, 0x0080, "S");
+    assert_eq!((mmusr >> 5) & 3, 3, "CM");
+    assert_eq!(mmusr & 0x0010, 0, "M clear: PTESTR simulates a read");
+    assert_eq!(mmusr & 0x0004, 0, "W clear");
+    assert_eq!(mmusr & 0x0002, 0, "T clear: not a transparent block");
+}
+
+#[test]
+fn ptestw_sets_the_modified_bit_and_ptestr_does_not() {
+    // "PTESTR simulates a read access and sets the U-bit in each descriptor
+    // during table searches; PTESTW simulates a write access and also sets
+    // the M-bit in the descriptors, the address translation cache entry, and
+    // the MMU status register" (M68000PRM §6).
+    for (opcode, modified) in [(0xf568u16, false), (0xf548, true)] {
+        let board = mapped(0x0001_0000, 0x0000_5000 | 0b01);
+        board.load(
+            0x400,
+            &[
+                0x203c, 0x0000, 0x0005, 0x4e7b, 0x0001, // DFC = 5
+                0x207c, 0x0001, 0x0000, // MOVEA.L #$10000,A0
+                opcode, 0x4e7a, 0x1805, 0x4e71,
+            ],
+        );
+        board.with_regs(|r| {
+            r.urp = ROOT;
+            r.srp = u64::from(ROOT);
+            r.tc = 0x8000;
+        });
+        board.at(0x400);
+        for _ in 0..5 {
+            board.cpu.step();
+        }
+        assert_eq!(
+            board.cpu.regs().d[1] & 0x10 != 0,
+            modified,
+            "${opcode:04x} MMUSR M"
+        );
+        assert_eq!(
+            board.peek_long(u64::from(PAGE) + 0x10 * 4) & 0x10 != 0,
+            modified,
+            "${opcode:04x} descriptor M"
+        );
+    }
+}
+
+#[test]
+fn ptest_on_an_invalid_page_clears_the_resident_bit() {
+    let board = mapped(0x0001_0000, 0);
+    board.load(
+        0x400,
+        &[
+            0x203c, 0x0000, 0x0005, 0x4e7b, 0x0001, 0x207c, 0x0001, 0x0000, 0xf568, 0x4e7a, 0x1805,
+            0x4e71,
+        ],
+    );
+    board.with_regs(|r| {
+        r.urp = ROOT;
+        r.srp = u64::from(ROOT);
+        r.tc = 0x8000;
+    });
+    board.at(0x400);
+    for _ in 0..5 {
+        board.cpu.step();
+    }
+    assert_eq!(board.cpu.regs().d[1] & 1, 0, "R clear");
+}
+
+#[test]
+fn ptest_on_a_transparently_translated_address_reports_t_and_r_alone() {
+    // §3.1.4, **T**: "If the T-bit is set, then the PTEST address matches an
+    // instruction or data TTR, the R-bit is set, and all other bits are
+    // zero."
+    let board = Board::new(Model::M68040);
+    board.boot(&[0x4e71]);
+    board.load(
+        0x400,
+        &[
+            0x203c, 0x0000, 0x0005, 0x4e7b, 0x0001, 0x207c, 0x0001, 0x0000, 0xf568, 0x4e7a, 0x1805,
+            0x4e71,
+        ],
+    );
+    board.with_regs(|r| {
+        r.dtt[0] = 0x8000 | (2 << 13);
+    });
+    board.at(0x400);
+    for _ in 0..5 {
+        board.cpu.step();
+    }
+    assert_eq!(board.cpu.regs().d[1], 0b11, "T and R, nothing else");
+}
+
+#[test]
+fn ptest_reports_a_transfer_error_with_b_and_nothing_else() {
+    // §3.1.4, **B**: "set if a transfer error is encountered during the
+    // table search for the PTEST instruction. If the B-bit is set, all other
+    // bits are zero."
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b01);
+    // Root entry 2 — a branch the identity map does not use — pointing at a
+    // pointer table nothing answers for; `$04000000` reaches it.
+    board.poke_long(u64::from(ROOT) + 2 * 4, 0x0100_0000 | 0b10);
+    board.load(
+        0x400,
+        &[
+            0x203c, 0x0000, 0x0005, 0x4e7b, 0x0001, // DFC = 5
+            0x207c, 0x0400, 0x0000, // MOVEA.L #$04000000,A0
+            0xf568, // PTESTR (A0)
+            0x4e7a, 0x1805, 0x4e71,
+        ],
+    );
+    board.with_regs(|r| {
+        r.urp = ROOT;
+        r.srp = u64::from(ROOT);
+        r.tc = 0x8000;
+    });
+    board.at(0x400);
+    for _ in 0..5 {
+        board.cpu.step();
+    }
+    assert_eq!(board.cpu.regs().d[1], 0x0800, "B alone");
+}
+
+#[test]
+fn pflush_drops_the_entry_and_the_next_access_searches_again() {
+    // The translation is cached, so a page descriptor changed behind the
+    // unit's back is not seen until the entry is flushed — which is the
+    // whole reason PFLUSH exists (§3.6.1: "a PFLUSH instruction must be
+    // executed to flush all existing valid entries from the ATCs").
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b01);
+    board.poke_word(0x5000, 0x1111);
+    board.poke_word(0x6000, 0x2222);
+    board.load(
+        0x400,
+        &[
+            0x3039, 0x0001, 0x0000, // MOVE.W ($10000).L,D0
+            0x3039, 0x0001, 0x0000, // again
+            0xf518, // PFLUSHA
+            0x3039, 0x0001, 0x0000, // and again
+            0x4e71,
+        ],
+    );
+    board.with_regs(|r| {
+        r.urp = ROOT;
+        r.srp = u64::from(ROOT);
+        r.tc = 0x8000;
+    });
+    board.at(0x400);
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().d[0] & 0xffff, 0x1111);
+    // Repoint the page without flushing: the cached entry still answers.
+    board.poke_long(u64::from(PAGE) + 0x10 * 4, 0x0000_6000 | 0b01);
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.regs().d[0] & 0xffff,
+        0x1111,
+        "the cache still answers"
+    );
+    board.cpu.step(); // PFLUSHA
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.regs().d[0] & 0xffff,
+        0x2222,
+        "and now the search runs again"
+    );
+}
+
+#[test]
+fn pflushan_spares_a_global_entry_and_pflusha_does_not() {
+    // M68000PRM §6, *PFLUSH* (MC68040): "the PFLUSHN and PFLUSHAN
+    // instructions have a global option specified and invalidate only
+    // nonglobal entries."
+    for (opcode, survives) in [(0xf510u16, true), (0xf518, false)] {
+        let board = mapped(0x0001_0000, 0x0000_5000 | (1 << 10) | 0b01);
+        board.poke_word(0x5000, 0x1111);
+        board.poke_word(0x6000, 0x2222);
+        board.load(
+            0x400,
+            &[
+                0x3039, 0x0001, 0x0000, opcode, 0x3039, 0x0001, 0x0000, 0x4e71,
+            ],
+        );
+        board.with_regs(|r| {
+            r.urp = ROOT;
+            r.srp = u64::from(ROOT);
+            r.tc = 0x8000;
+        });
+        board.at(0x400);
+        board.cpu.step();
+        board.poke_long(u64::from(PAGE) + 0x10 * 4, 0x0000_6000 | 0b01);
+        board.cpu.step(); // the flush
+        board.cpu.step();
+        let seen = board.cpu.regs().d[0] & 0xffff;
+        assert_eq!(
+            seen,
+            if survives { 0x1111 } else { 0x2222 },
+            "${opcode:04x}"
+        );
+    }
+}
+
+#[test]
+fn pflush_by_page_only_drops_the_page_it_names() {
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b01);
+    // A second page at $00011000, through the same tables.
+    board.poke_long(u64::from(PAGE) + 0x11 * 4, 0x0000_7000 | 0b01);
+    board.poke_word(0x5000, 0x1111);
+    board.poke_word(0x7000, 0x3333);
+    board.load(
+        0x400,
+        &[
+            0x203c, 0x0000, 0x0005, 0x4e7b, 0x0001, // DFC = 5
+            0x3039, 0x0001, 0x0000, // touch $10000
+            0x3039, 0x0001, 0x1000, // touch $11000
+            0x207c, 0x0001, 0x1000, // MOVEA.L #$11000,A0
+            0xf508, // PFLUSH (A0)
+            0x3039, 0x0001, 0x0000, // $10000 again
+            0x4e71,
+        ],
+    );
+    board.with_regs(|r| {
+        r.urp = ROOT;
+        r.srp = u64::from(ROOT);
+        r.tc = 0x8000;
+    });
+    board.at(0x400);
+    for _ in 0..4 {
+        board.cpu.step();
+    }
+    // Repoint both pages; only the flushed one is searched again.
+    board.poke_long(u64::from(PAGE) + 0x10 * 4, 0x0000_6000 | 0b01);
+    board.poke_word(0x6000, 0x2222);
+    for _ in 0..3 {
+        board.cpu.step();
+    }
+    assert_eq!(
+        board.cpu.regs().d[0] & 0xffff,
+        0x1111,
+        "$10000's entry was not the one flushed"
+    );
+}
+
+#[test]
+fn an_ec040_has_no_ptest_and_a_pflush_that_does_nothing() {
+    // M68000PRM §6: *PTEST* is given for the MC68040 and MC68LC040 only,
+    // and *PFLUSH* (MC68EC040) "should not be executed ... suspends
+    // operation ... and subsequently continues with no adverse effects".
+    assert_eq!(
+        isa::decode_for(Model::M68EC040, 0xf568).op,
+        isa::Op::LineF,
+        "no PTEST on an MC68EC040"
+    );
+    assert_eq!(
+        isa::decode_for(Model::M68EC040, 0xf518).op,
+        isa::Op::Pflusha,
+        "but PFLUSH decodes"
+    );
+    let board = Board::new(Model::M68EC040);
+    board.boot(&[0xf518, 0x4e71]);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), None);
+    assert_eq!(board.cpu.regs().pc, 0x402);
+}
+
+#[test]
+fn the_mmu_instructions_are_privileged() {
+    for opcode in [0xf500u16, 0xf508, 0xf510, 0xf518, 0xf548, 0xf568] {
+        assert!(
+            isa::decode_for(Model::M68040, opcode).privileged,
+            "${opcode:04x}"
+        );
+    }
+}
+
+#[test]
+fn the_disassembler_prints_the_68040s_mmu_instructions() {
+    for (opcode, text) in [
+        (0xf500u16, "PFLUSHN (A0)"),
+        (0xf50b, "PFLUSH (A3)"),
+        (0xf510, "PFLUSHAN"),
+        (0xf518, "PFLUSHA"),
+        (0xf54a, "PTESTW (A2)"),
+        (0xf56d, "PTESTR (A5)"),
+    ] {
+        let d = super::disasm::disassemble_for(Model::M68040, 0x400, &[opcode]);
+        assert_eq!(alloc::format!("{d}"), text);
+    }
+}
+
+#[test]
+fn a_snapshot_does_not_carry_the_address_translation_cache() {
+    // CLAUDE.md, *Devices*: derived state is never serialized. A restored
+    // core rebuilds its translations with a table search, and gets the same
+    // answers.
+    let board = mapped(0x0001_0000, 0x0000_5000 | 0b01);
+    board.poke_word(0x5000, 0x1111);
+    translate_on(&board, &[0x3039, 0x0001, 0x0000, 0x4e71]);
+    board.cpu.step();
+    let bytes = snapshot(&board.cpu).expect("a snapshot");
+    let other = M68k::new(Config::MC68040);
+    restore(&other, &bytes).expect("a restore");
+    assert_eq!(other.regs(), board.cpu.regs());
+    assert_eq!(snapshot(&other).expect("again"), bytes);
 }

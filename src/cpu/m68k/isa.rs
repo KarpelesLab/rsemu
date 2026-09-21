@@ -877,6 +877,12 @@ define_ops! {
     Cpushl = "CPUSHL", "push and invalidate one cache line (privileged)";
     Cpushp = "CPUSHP", "push and invalidate every cache line in one page (privileged)";
     Cpusha = "CPUSHA", "push and invalidate a whole cache (privileged)";
+    Pflush = "PFLUSH", "invalidate the ATC entry for one page (privileged)";
+    Pflushn = "PFLUSHN", "invalidate the ATC entry for one page unless it is global (privileged)";
+    Pflusha = "PFLUSHA", "invalidate every ATC entry (privileged)";
+    Pflushan = "PFLUSHAN", "invalidate every non-global ATC entry (privileged)";
+    Ptestr = "PTESTR", "search the translation tables as a read would (privileged)";
+    Ptestw = "PTESTW", "search the translation tables as a write would (privileged)";
 }
 
 impl Op {
@@ -1430,6 +1436,23 @@ table! {
                         .privileged().since_040();
     0xff38 0xf438 => Insn::new(Op::Cpusha, SizeSpec::None, Arg::None, Arg::None)
                         .privileged().since_040();
+    // PFLUSH and PTEST, the 68040's forms: no command word, everything in
+    // the opcode, and the function code in `DFC` rather than an operand
+    // (M68000PRM §6, *PFLUSH* (MC68040), *PTEST* (MC68040)). The MC68EC040
+    // decodes `PFLUSH` and does nothing with it — it is in `Models::FROM_040`
+    // for that reason — and has no `PTEST` at all.
+    0xfff8 0xf500 => Insn::new(Op::Pflushn, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xfff8 0xf508 => Insn::new(Op::Pflush, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xfff8 0xf510 => Insn::new(Op::Pflushan, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xfff8 0xf518 => Insn::new(Op::Pflusha, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xfff8 0xf548 => Insn::new(Op::Ptestw, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().models(Models::M68040);
+    0xfff8 0xf568 => Insn::new(Op::Ptestr, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().models(Models::M68040);
     // MOVE16, in its two formats: the postincrement pair carries a second
     // opcode word naming the destination register, and the absolute form
     // carries a 32-bit address in two extension words (M68000PRM §4,
@@ -2882,9 +2905,11 @@ mod tests {
             // of which the sixty-four with scope `00` are an illegal
             // instruction rather than an operation, and `MOVE16` over the
             // forty encodings of `$F600`-`$F61F` and `$F620`-`$F627`.
-            (Model::M68040, 47_607, 0x1000 - 296),
-            (Model::M68LC040, 47_607, 0x1000 - 296),
-            (Model::M68EC040, 47_607, 0x1000 - 296),
+            // It also adds its own `PFLUSH` — thirty-two encodings — and
+            // `PTEST`, sixteen more, which the MC68EC040 does not have.
+            (Model::M68040, 47_655, 0x1000 - 344),
+            (Model::M68LC040, 47_655, 0x1000 - 344),
+            (Model::M68EC040, 47_639, 0x1000 - 328),
         ] {
             let mut legal = 0usize;
             let mut line_a = 0usize;

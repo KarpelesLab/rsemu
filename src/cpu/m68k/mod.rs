@@ -1535,6 +1535,19 @@ impl M68k {
             }
         }
         if self.model.has_040() {
+            // As on the 68030: the address translation cache is derived
+            // state and is never placed from outside, but it *describes*
+            // these registers, so a register that actually changes empties
+            // it and a register file put back unchanged leaves it alone.
+            let changed = state.mmu040.itt != regs.itt
+                || state.mmu040.dtt != regs.dtt
+                || (self.model.has_mmu_040()
+                    && (state.mmu040.tcr != regs.tc as u16
+                        || state.mmu040.urp != regs.urp
+                        || state.mmu040.srp != regs.srp as u32));
+            if changed {
+                state.mmu040.flush_all();
+            }
             state.mmu040.itt = regs.itt;
             state.mmu040.dtt = regs.dtt;
             if self.model.has_mmu_040() {

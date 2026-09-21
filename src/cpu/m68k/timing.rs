@@ -633,6 +633,14 @@ pub(super) fn instruction(insn: Insn, opcode: u16, size: Size, f: &Facts) -> u32
         Op::Cinvp => 266,
         Op::Cpushl => 6,
         Op::Cpushp | Op::Cpusha => 267,
+        // M68040UM §10 tables no time for the memory management
+        // instructions at all — a `PFLUSH` is cache bookkeeping and a
+        // `PTEST` is a table search whose length depends on the tables. What
+        // is charged is eight clocks for the unit itself, as the 68030's
+        // `Pgen` row does, plus a table search's own bus cycles where they
+        // happen (`Exec::search_cycles`). In the conformance ledger as the
+        // approximation it is.
+        Op::Pflush | Op::Pflushn | Op::Pflusha | Op::Pflushan | Op::Ptestr | Op::Ptestw => 8,
     }
 }
 

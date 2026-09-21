@@ -365,6 +365,13 @@ impl Disassembled {
             Op::Cinvl | Op::Cinvp | Op::Cpushl | Op::Cpushp => {
                 write!(f, " #{},(A{})", (self.opcode >> 6) & 3, self.opcode & 7)
             }
+            // The 68040's PFLUSH and PTEST take the address in a register
+            // and the function code in `DFC`, so there is nothing else to
+            // print (M68000PRM §6).
+            Op::Pflusha | Op::Pflushan => Ok(()),
+            Op::Pflush | Op::Pflushn | Op::Ptestr | Op::Ptestw => {
+                write!(f, " (A{})", self.opcode & 7)
+            }
             // `MOVE16` in its two formats: the postincrement pair names its
             // destination register in a second opcode word, and the absolute
             // form carries a long address and says in bits 4-3 which side it

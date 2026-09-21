@@ -69,7 +69,7 @@ use super::isa::{
     decode_for, decode_with, ea_of, is_full_format,
 };
 use super::mmu::{self, Entry, Mmu, mmusr, tc, tt};
-use super::mmu040::{Regs040 as Mmu040, mmusr as mmusr040, tcr, ttr};
+use super::mmu040::{self, Regs040 as Mmu040, mmusr as mmusr040, tcr, ttr};
 use super::timing;
 use super::{Config, Lines, flags, vector};
 use crate::float::x87::{self, F80};
@@ -597,7 +597,7 @@ impl<'a> Exec<'a> {
     ) -> Exec<'a> {
         let model = state.model;
         let state_enables_mmu = state.mmu.enabled();
-        let state_enables_mmu040 = state.mmu040.enabled();
+        let state_enables_mmu040 = state.mmu040.active();
         Exec {
             state,
             space,
@@ -623,7 +623,7 @@ impl<'a> Exec<'a> {
                 Copro::NONE
             },
             mmu_on: model.has_mmu() && state_enables_mmu,
-            mmu040_on: model.has_mmu_040() && state_enables_mmu040,
+            mmu040_on: model.has_040() && state_enables_mmu040,
             atc_fault: false,
             fault_alternate: false,
             deferred_slides: 0,
@@ -747,11 +747,118 @@ impl<'a> Exec<'a> {
     /// identity and costs one predictable branch.
     #[inline]
     fn bus_addr(&mut self, addr: u32, fc: u8, write: bool) -> Result<u64, ()> {
+        if self.mmu040_on {
+            return self
+                .translate_040(addr, fc, write)
+                .map(|pa| u64::from(pa & self.mask));
+        }
         if !self.mmu_on {
             return Ok(u64::from(addr & self.mask));
         }
         self.translate(addr, fc, write)
             .map(|pa| u64::from(pa & self.mask))
+    }
+
+    /// Translate one logical address on a 68040 (M68040UM Figure 3-22).
+    ///
+    /// The flowchart's four branches, in its order: a transparent
+    /// translation register answers, or the cache does, or the cache misses
+    /// and a table search fills it, or the entry says the access may not
+    /// happen.
+    ///
+    /// Everything that aborts sets [`Exec::atc_fault`], which is the `ATC`
+    /// bit of the format `$7` frame's special status word: "set for an ATC
+    /// fault due to a nonresident entry ... or privilege violation (write
+    /// protected or supervisor only) ... cleared for a bus-errored
+    /// instruction, data, or cache line-push access" (§8.4.6.2). A
+    /// transparently translated block's write protection is counted with
+    /// them: it is not a bus error, and the manual's flowchart takes the
+    /// same "abort cycle, take access error exception" exit for it.
+    fn translate_040(&mut self, la: u32, fc: u8, write: bool) -> Result<u32, ()> {
+        self.atc_fault = false;
+        let supervisor = fc & 4 != 0;
+        // "The TTRs operate independently of the E-bit in the TCR and the
+        // state of the MDIS signal" (§3.1.3), so this comes first and happens
+        // whether or not paged translation is switched on.
+        let program = fc & 3 == 2;
+        let pair = *self.state.mmu040.ttr_pair(program);
+        if let Some(block) = mmu040::transparent(&pair, la, supervisor) {
+            if write && block.write_protected {
+                self.atc_fault = true;
+                return Err(());
+            }
+            return Ok(la);
+        }
+        if !self.state.mmu040.enabled() {
+            // Translation off: "logical addresses are used as physical
+            // addresses" with the default attributes (§3.1.2, **E**).
+            return Ok(la);
+        }
+        let mut entry = match self.state.mmu040.lookup(la, supervisor) {
+            Some(entry) => entry,
+            None => {
+                // "When a table search is required, the processor suspends
+                // instruction execution activity and, at the end of a
+                // successful table search, stores the address mapping in the
+                // appropriate ATC and retries the access" (§3.5).
+                let found = self.walk_040(la, supervisor, write);
+                self.state.mmu040.install(found.entry);
+                found.entry
+            }
+        };
+        if entry.data & mmusr040::R == 0 {
+            // "If an access hits in the ATC but an access error or invalid
+            // page descriptor was detected during the table search that
+            // created the ATC entry, the access is aborted" (§3.5).
+            self.atc_fault = true;
+            return Err(());
+        }
+        if entry.data & mmusr040::S != 0 && !supervisor {
+            // §3.2.6.2: the entry is created with the S bit set, and "a
+            // subsequent retry of the user access results in an access error
+            // exception being taken".
+            self.atc_fault = true;
+            return Err(());
+        }
+        if write && entry.data & mmusr040::W != 0 {
+            self.atc_fault = true;
+            return Err(());
+        }
+        if write && entry.data & mmusr040::M == 0 {
+            // "If the M-bit is clear and a write access to this logical
+            // address is attempted, the M68040 suspends the access, initiates
+            // a table search to set the M-bit in the page descriptor, and
+            // writes over the old ATC entry" (§3.3, **M**).
+            let found = self.walk_040(la, supervisor, true);
+            self.state.mmu040.install(found.entry);
+            entry = found.entry;
+            if entry.data & (mmusr040::R | mmusr040::W) != mmusr040::R {
+                self.atc_fault = true;
+                return Err(());
+            }
+        }
+        Ok(self.state.mmu040.physical(entry, la))
+    }
+
+    /// Run one 68040 table search, driving the real bus for every descriptor.
+    ///
+    /// Only the registers are copied out, not the cache: the search cannot
+    /// see the entry it is about to create, and the closure below is free to
+    /// borrow the whole core.
+    fn walk_040(&mut self, la: u32, supervisor: bool, write: bool) -> mmu040::Found040 {
+        let registers = mmu040::Regs040 {
+            tcr: self.state.mmu040.tcr,
+            urp: self.state.mmu040.urp,
+            srp: self.state.mmu040.srp,
+            ..mmu040::Regs040::RESET
+        };
+        let mut bus = |at: u32, value: Option<u32>| -> Option<u32> {
+            match value {
+                None => self.phys_read_long(at),
+                Some(word) => self.phys_write_long(at, word).then_some(0),
+            }
+        };
+        mmu040::search(&registers, la, supervisor, write, &mut bus)
     }
 
     /// Translate one logical address (MC68030UM Figure 9-8).
@@ -2246,6 +2353,9 @@ impl<'a> Exec<'a> {
             Op::Cinvl | Op::Cinvp | Op::Cinva | Op::Cpushl | Op::Cpushp | Op::Cpusha => {
                 self.op_cache()
             }
+            Op::Pflush | Op::Pflushn | Op::Pflusha | Op::Pflushan => self.op_pflush(insn.op),
+            Op::Ptestr => self.op_ptest_040(true),
+            Op::Ptestw => self.op_ptest_040(false),
         }
     }
 
@@ -3887,7 +3997,7 @@ impl<'a> Exec<'a> {
                 // `PMOVE`, none of these touches the cache.
                 ctrl::TC => {
                     self.state.mmu040.tcr = (value as u16) & tcr::IMPLEMENTED;
-                    self.mmu040_on = self.state.mmu040.enabled();
+                    self.mmu040_on = self.state.mmu040.active();
                 }
                 // "Bits 8–0 of an address loaded into the URP or the SRP must
                 // be zero" (§3.1.1). The manual states it as a requirement on
@@ -3896,10 +4006,15 @@ impl<'a> Exec<'a> {
                 // which is what a register drawn with nine zeros does.
                 ctrl::URP => self.state.mmu040.urp = value & !0x1ff,
                 ctrl::SRP => self.state.mmu040.srp = value & !0x1ff,
-                ctrl::ITT0 => self.state.mmu040.itt[0] = value & ttr::IMPLEMENTED,
-                ctrl::ITT1 => self.state.mmu040.itt[1] = value & ttr::IMPLEMENTED,
-                ctrl::DTT0 => self.state.mmu040.dtt[0] = value & ttr::IMPLEMENTED,
-                ctrl::DTT1 => self.state.mmu040.dtt[1] = value & ttr::IMPLEMENTED,
+                ctrl::ITT0 | ctrl::ITT1 | ctrl::DTT0 | ctrl::DTT1 => {
+                    let pair = if code < ctrl::DTT0 {
+                        &mut self.state.mmu040.itt
+                    } else {
+                        &mut self.state.mmu040.dtt
+                    };
+                    pair[usize::from(code & 1 != 0)] = value & ttr::IMPLEMENTED;
+                    self.mmu040_on = self.state.mmu040.active();
+                }
                 ctrl::MMUSR => self.state.mmu040.mmusr = value & mmusr040::IMPLEMENTED,
                 _ => self.state.set_sp(Bank::Interrupt, value),
             }
@@ -4040,6 +4155,80 @@ impl<'a> Exec<'a> {
     /// **physical** address and makes no bus cycle, so nothing here can
     /// fault.
     fn op_cache(&mut self) -> Result<(), Trap> {
+        self.settle()
+    }
+
+    /// `PFLUSH`, `PFLUSHN`, `PFLUSHA` and `PFLUSHAN` (M68000PRM §6,
+    /// *PFLUSH* (MC68040)).
+    ///
+    /// The function code comes from `DFC` and only its top bit is compared,
+    /// because that is all an entry's tag holds: "destination function code
+    /// values of 1 or 2 will result in flushing of user address translation
+    /// cache entries ... whereas values of 5 or 6 will result in flushing of
+    /// supervisor" ones, and the other four values are "undefined and may
+    /// cause flushing of an unexpected entry". The address the page form
+    /// names is the *contents* of the address register, not an effective
+    /// address: the syntax is `PFLUSH (An)` and there is no other mode.
+    ///
+    /// "PFLUSH can be executed even if the E-bit is cleared" (§3.6.1), which
+    /// is why this does not check it — an operating system is told to flush
+    /// before enabling translation, so refusing here would break the
+    /// sequence the manual prescribes.
+    ///
+    /// On an MC68EC040 there is no cache to flush. The manual's account of
+    /// what the encoding does there is "suspends operation ... for an
+    /// indefinite period of time and subsequently continues with no adverse
+    /// effects", so it is a no-op that costs nothing.
+    fn op_pflush(&mut self, op: Op) -> Result<(), Trap> {
+        if self.model.has_mmu_040() {
+            let supervisor = self.state.dfc & 4 != 0;
+            match op {
+                Op::Pflusha => self.state.mmu040.flush_all(),
+                Op::Pflushan => self.state.mmu040.flush_non_global(),
+                _ => {
+                    let la = self.state.a[reg_lo(self.opcode)];
+                    self.state
+                        .mmu040
+                        .flush_page(la, supervisor, op == Op::Pflush);
+                }
+            }
+        }
+        self.settle()
+    }
+
+    /// `PTESTR` and `PTESTW` (M68000PRM §6, *PTEST* (MC68040); M68040UM
+    /// §3.1.4).
+    ///
+    /// "This instruction searches the translation tables for the page
+    /// descriptor corresponding to the test address in An and sets the bits
+    /// of the MMU status register according to the status of the descriptors
+    /// ... PTESTR simulates a read access and sets the U-bit in each
+    /// descriptor during table searches; PTESTW simulates a write access and
+    /// also sets the M-bit". The search is the real one, on the real bus,
+    /// with the real history write-backs.
+    ///
+    /// "A matching entry in the address translation cache ... will be flushed
+    /// by PTEST. Completion of PTEST results in the creation of a new address
+    /// translation cache entry."
+    fn op_ptest_040(&mut self, read: bool) -> Result<(), Trap> {
+        let la = self.state.a[reg_lo(self.opcode)];
+        let supervisor = self.state.dfc & 4 != 0;
+        // "Execution of the instruction continues until one of the following
+        // conditions occurs: match with one of the two transparent
+        // translation registers ..." — and then "the T-bit is set ... the
+        // R-bit is set, and all other bits are zero" (§3.1.4, **T**). A
+        // `PTEST` goes through the *data* unit, so it is the data pair.
+        let pair = self.state.mmu040.dtt;
+        if mmu040::transparent(&pair, la, supervisor).is_some() {
+            self.state.mmu040.mmusr = mmusr040::T | mmusr040::R;
+            return self.settle();
+        }
+        self.state.mmu040.flush_page(la, supervisor, true);
+        let found = self.walk_040(la, supervisor, !read);
+        self.state.mmu040.mmusr = found.mmusr();
+        if !found.bus_error {
+            self.state.mmu040.install(found.entry);
+        }
         self.settle()
     }
 
