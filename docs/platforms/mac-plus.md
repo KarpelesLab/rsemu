@@ -36,7 +36,7 @@ of the ROM:
   stored there. So the ROM starts at offset zero, is 128 KiB long, and is the
   last Plus revision — `$4D1F8172` is the published identifier for it.
 * The remaining 7,504 bytes fail to be a continuation of anything. They are
-  **83 % zero**; what is not zero is a sparse table of 58-byte records holding
+  **84 % zero** — 6,276 of 7,504; what is not zero is a sparse table of 58-byte records holding
   small 32-bit values, a hexadecimal-digit lookup table
   (`ABCDEFabcdef9876543210` against `0a 0b 0c 0d 0e 0f …`), a character
   classification table, and a ramp that walks `0f00, 0f10, 0f20 … 0fff` up and
