@@ -115,6 +115,15 @@
 //! leaves zero behind, so a guest polls until bit 7 is set, which is what a
 //! ROM does.
 //!
+//! **The chip names each latch as an event** ([`Device::next_event_tick`]),
+//! and that is what makes the polling work. The scheduler bounds a round by
+//! the earliest event any lazily-advanced device names, and an access is
+//! answered at the position the round has reached — a 68000 publishes no live
+//! cursor of its own. With no event named, a round ran on past two byte times
+//! at a stretch and the guest was handed the *last* byte of it; a real
+//! Macintosh Plus ROM lost one byte in three that way, which is every sector
+//! it tried.
+//!
 //! **Which head** is decided by the two read lines above: they differ only in
 //! `SEL`, and the note says reading one of them *configures the drive* to do
 //! its I/O with that head. So addressing one is how the computer says which
@@ -483,6 +492,33 @@ impl State {
     }
 }
 
+/// How many cells go by before the shifter latches its next byte, given the
+/// cylinder, where the head is on it and what is in the register.
+///
+/// The shifter's one rule is that a byte is complete when a one reaches bit 7
+/// (see the module docs), so the answer is arithmetic rather than a
+/// simulation: a register already holding a one needs only the shifts that
+/// carry its highest one up to bit 7, and an empty one waits for the next one
+/// on the medium and then eight more cells. `None` is a cylinder with no one
+/// on it at all — an erased track, which never latches anything.
+fn cells_to_latch(bits: &Track, len: u64, bit: u64, rsr: u8) -> Option<u64> {
+    if len == 0 {
+        // An unformatted cylinder shifts nothing past the head, so whatever is
+        // in the register stays there. Answering from `rsr` here would name an
+        // event a cell or two out that then never happens, over and over.
+        return None;
+    }
+    if rsr != 0 {
+        // `leading_zeros` counts from bit 7, so it *is* the number of shifts
+        // the highest one still owes. A latched byte clears the register, so
+        // bit 7 is never already set here.
+        return Some(u64::from(rsr.leading_zeros()));
+    }
+    (0..len)
+        .find(|d| bits.bit((bit + d) as usize))
+        .map(|d| d + 8)
+}
+
 /// The disks in the two mechanisms, and the cylinder under the head.
 ///
 /// One lock for both because the second is built out of the first, and because
@@ -508,6 +544,11 @@ struct Shared {
     media: Mutex<Media>,
     /// Published without a lock for the scheduler.
     ticks: AtomicU64,
+    /// The cell at which the shifter will next latch a byte, or [`u64::MAX`]
+    /// when nothing is turning. Published for [`LazyDevice::next_event_tick`],
+    /// which is asked under the scheduler's own leaf lock and so may not take
+    /// one of ours.
+    next_latch: AtomicU64,
     /// The catch-up handle a register access syncs through (§4.2).
     lazy: Mutex<Option<LazyHandle>>,
 }
@@ -532,9 +573,14 @@ impl Shared {
     /// Shift the disk past the head until `target` bit cells have gone by.
     fn advance_to(&self, target: u64) {
         let mut state = self.state.lock();
-        if target <= state.ticks {
-            return;
+        if target > state.ticks {
+            self.shift(&mut state, target);
         }
+        self.publish_latch(&state);
+    }
+
+    /// Shift `target - state.ticks` cells past the head.
+    fn shift(&self, state: &mut State, target: u64) {
         let cells = target - state.ticks;
         state.ticks = target;
         self.ticks.store(target, Ordering::Relaxed);
@@ -546,15 +592,7 @@ impl Shared {
             return;
         }
         let mut media = self.media.lock();
-        let want = (which, drive.track, drive.side);
-        if media.under != Some(want) {
-            media.bits = match &media.disks[which] {
-                Some(disk) => disk.track(drive.track, drive.side),
-                None => Track::new(),
-            };
-            media.under = Some(want);
-        }
-        let len = media.bits.len() as u64;
+        let len = Shared::cylinder(&mut media, which, drive.track, drive.side);
         if len == 0 {
             // An unformatted cylinder: the head sees nothing and the shifter
             // stays where it is.
@@ -589,9 +627,59 @@ impl Shared {
         drive.tach = tach;
     }
 
-    /// Throw the cached cylinder away.
+    /// Put the cylinder under the head into `media.bits` and say how long it
+    /// is. Derived state: rebuilt whenever the head, the side or the disk
+    /// moves, never serialized.
+    fn cylinder(media: &mut Media, which: usize, track: u8, side: bool) -> u64 {
+        let want = (which, track, side);
+        if media.under != Some(want) {
+            media.bits = match &media.disks[which] {
+                Some(disk) => disk.track(track, side),
+                None => Track::new(),
+            };
+            media.under = Some(want);
+        }
+        media.bits.len() as u64
+    }
+
+    /// Publish the cell at which the shifter will next latch a byte.
+    ///
+    /// **This is what makes a read land on the right byte.** The scheduler
+    /// bounds a round by the earliest event any lazily-advanced device names
+    /// (`Scheduler::lazy_deadline`), and an access is answered at the position
+    /// the round has reached — a 68000 publishes no live cursor of its own, so
+    /// without an event here the chip stands still for a whole round and a
+    /// round longer than a byte hands the guest the *last* byte of it and
+    /// loses the rest. A real Macintosh ROM reading a track drops one byte in
+    /// three that way, which is every sector it tries.
+    ///
+    /// So the latch is named as what it is: an internal event, past which a
+    /// read of the data register answers differently. It costs a round per
+    /// byte — about fifty thousand a second — and only while a disk is
+    /// actually turning under the head.
+    fn publish_latch(&self, state: &State) {
+        let which = state.selected();
+        let drive = state.drives[which];
+        if !drive.motor || !drive.disk {
+            self.next_latch.store(u64::MAX, Ordering::Relaxed);
+            return;
+        }
+        let mut media = self.media.lock();
+        let len = Shared::cylinder(&mut media, which, drive.track, drive.side);
+        let ahead = cells_to_latch(&media.bits, len, drive.bit, drive.rsr);
+        drop(media);
+        self.next_latch.store(
+            ahead.map_or(u64::MAX, |n| state.ticks.saturating_add(n)),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Throw the cached cylinder away and say when the next byte lands from
+    /// wherever the head now stands.
     fn invalidate(&self) {
         self.media.lock().under = None;
+        let state = self.state.lock();
+        self.publish_latch(&state);
     }
 }
 
@@ -634,6 +722,9 @@ impl MemOps for Shared {
             // zero is the "nothing yet" this leaves behind.
             state.data = 0;
         }
+        // A read is how the motor gets turned on and how a head is picked, so
+        // the next latch is re-announced from where this access left things.
+        self.publish_latch(&state);
         Ok(())
     }
 
@@ -657,6 +748,9 @@ impl MemOps for Shared {
             (true, false) => state.data = *value,
             _ => {}
         }
+        // A write moves `LSTRB`, which is how the motor and the stepper are
+        // driven; both change when the next byte arrives.
+        self.publish_latch(&state);
         Ok(())
     }
 
@@ -729,6 +823,7 @@ impl Iwm {
             state: Mutex::with_rank(LockRank::DEVICE, State::fresh(installed)),
             media: Mutex::with_rank(LockRank::LEAF, Media::default()),
             ticks: AtomicU64::new(0),
+            next_latch: AtomicU64::new(u64::MAX),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
         });
         let region = Arc::new(Region::io(
@@ -767,6 +862,10 @@ impl Iwm {
 
     /// Set the level the VIA is driving onto `SEL`, for a test with no wire
     /// graph.
+    ///
+    /// It is an address bit into the drive's register file and nothing else:
+    /// it does not move the head, the medium or the shifter, so the cell the
+    /// next byte lands on is none of its business.
     pub fn set_sel(&self, high: bool) {
         self.shared.state.lock().sel = high;
     }
@@ -801,9 +900,12 @@ impl Iwm {
             drive.bit = 0;
             drive.rsr = 0;
         }
-        let mut media = self.shared.media.lock();
-        media.disks[which] = Some(disk);
-        media.under = None;
+        {
+            let mut media = self.shared.media.lock();
+            media.disks[which] = Some(disk);
+            media.under = None;
+        }
+        self.shared.invalidate();
     }
 
     /// Take the disk out of drive `which`.
@@ -818,9 +920,12 @@ impl Iwm {
             drive.disk = false;
             drive.write_protect = false;
         }
-        let mut media = self.shared.media.lock();
-        media.disks[which] = None;
-        media.under = None;
+        {
+            let mut media = self.shared.media.lock();
+            media.disks[which] = None;
+            media.under = None;
+        }
+        self.shared.invalidate();
     }
 
     /// Put a blank disk in drive `which`, or take one out — the short form a
@@ -883,24 +988,26 @@ impl Device for Iwm {
     }
 
     fn reset(&self, _kind: ResetKind) {
-        self.shared.invalidate();
-        let mut state = self.shared.state.lock();
-        let sel = state.sel;
-        let ticks = state.ticks;
-        // A disk stays in the drive across a reset: it is a thing in a slot,
-        // not a register. The chip's switches and the mechanism's motor and
-        // head position do come back.
-        let disks = [
-            (state.drives[0].disk, state.drives[0].write_protect),
-            (state.drives[1].disk, state.drives[1].write_protect),
-        ];
-        *state = State::fresh(self.installed);
-        state.sel = sel;
-        state.ticks = ticks;
-        for (drive, (disk, wp)) in state.drives.iter_mut().zip(disks) {
-            drive.disk = disk;
-            drive.write_protect = wp;
+        {
+            let mut state = self.shared.state.lock();
+            let ticks = state.ticks;
+            let sel = state.sel;
+            // A disk stays in the drive across a reset: it is a thing in a
+            // slot, not a register. The chip's switches and the mechanism's
+            // motor and head position do come back.
+            let disks = [
+                (state.drives[0].disk, state.drives[0].write_protect),
+                (state.drives[1].disk, state.drives[1].write_protect),
+            ];
+            *state = State::fresh(self.installed);
+            state.sel = sel;
+            state.ticks = ticks;
+            for (drive, (disk, wp)) in state.drives.iter_mut().zip(disks) {
+                drive.disk = disk;
+                drive.write_protect = wp;
+            }
         }
+        self.shared.invalidate();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -951,9 +1058,13 @@ impl Device for Iwm {
         }
         next.sel = r.read_bool()?;
         *state = next;
+        // The published tick is not in the chunk and it is what the scheduler
+        // reads: a restore that left it at zero would have the head advanced
+        // from the wrong cell, or not at all.
+        self.shared.ticks.store(next.ticks, Ordering::Relaxed);
         drop(state);
         // The cylinder under the head is derived and is rebuilt from wherever
-        // the restored head turns out to be.
+        // the restored head turns out to be, and the next byte's cell with it.
         self.shared.invalidate();
         Ok(())
     }
@@ -978,12 +1089,19 @@ impl Device for Iwm {
         Iwm::advance_to(self, tick);
     }
 
-    /// None: nothing inside this chip changes at an instant it could name, and
-    /// everything that reads it syncs on the access. Naming a per-byte event
-    /// would wake the scheduler fifty thousand times a second to compute what
-    /// the next read computes anyway.
+    /// The cell the shifter will next latch a byte on, while a disk is
+    /// turning under the head; `None` when none is.
+    ///
+    /// This used to be `None`, on the argument that a read syncs the chip
+    /// anyway. It does — but only to where the *round* has reached, because a
+    /// 68000 publishes no live cursor, so a round longer than a byte time
+    /// delivered the last byte of the round and lost the rest.
+    /// `Shared::publish_latch` has the measurement.
     fn next_event_tick(&self) -> Option<u64> {
-        None
+        match self.shared.next_latch.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            tick => Some(tick),
+        }
     }
 
     fn attach_lazy(&self, handle: LazyHandle) {

@@ -468,6 +468,67 @@ fn the_tachometer_turns_with_the_motor() {
     assert_eq!(edges, 120, "sixty pulses is a hundred and twenty edges");
 }
 
+/// **The chip names the cell its next byte lands on**, and stepping to that
+/// cell latches exactly one.
+///
+/// This is not decoration: the scheduler bounds a round by the earliest event
+/// any lazily-advanced device names, and an access is answered at the position
+/// the round reached — a 68000 publishes no live cursor. While this said
+/// `None` a round ran on for two byte times at a stretch and a guest polling
+/// the data register was handed the *last* byte of the round and lost the
+/// rest. A real Macintosh Plus ROM dropped one byte in three that way, which
+/// is every sector it tried: `docs/platforms/mac-plus.md`.
+///
+/// Walking a whole revolution one event at a time is therefore the same thing
+/// as walking it one cell at a time, and this asserts exactly that.
+#[test]
+fn the_next_byte_is_named_as_an_event_and_lands_on_the_cell_it_names() {
+    use crate::core::device::Device;
+    use crate::dev::mac::disk::Disk;
+    let iwm = Iwm::with_drives([true, false]);
+    iwm.insert(0, Disk::blank(2));
+
+    // A stopped spindle moves no medium, so there is nothing to name.
+    assert_eq!(Device::next_event_tick(&iwm), None);
+    spin_up(&iwm, 0, false);
+    let len = iwm.disk(0).expect("a disk").track(0, false).len() as u64;
+
+    // Every byte of one revolution, taken at the cell the chip named for it.
+    let start = iwm.ticks();
+    let end = start + len;
+    let mut by_event = Vec::new();
+    while let Some(at) = Device::next_event_tick(&iwm) {
+        if at > end {
+            break;
+        }
+        assert!(at > iwm.ticks(), "an event must be in the future");
+        iwm.advance_to(at);
+        let byte = iwm.latched();
+        assert!(byte & 0x80 != 0, "the named cell latched nothing");
+        by_event.push((at, byte));
+    }
+    assert!(
+        by_event.len() > 600,
+        "a twelve-sector cylinder carries more than that: {}",
+        by_event.len()
+    );
+
+    // And against the shifter's one rule, applied to the same cylinder here:
+    // shift left, latch when a one reaches bit 7. Every byte of the
+    // revolution, on the cell it completes on.
+    let track = iwm.disk(0).expect("a disk").track(0, false);
+    let mut want = Vec::new();
+    let mut rsr = 0u8;
+    for n in 0..len {
+        rsr = (rsr << 1) | u8::from(track.bit(n as usize));
+        if rsr & 0x80 != 0 {
+            want.push((start + n + 1, rsr));
+            rsr = 0;
+        }
+    }
+    assert_eq!(by_event, want, "the events do not fall where the bytes do");
+}
+
 /// Taking the byte out of the data register leaves zero, which is what a guest
 /// polls on — and a debug read does not take it.
 #[test]
