@@ -559,8 +559,9 @@ two runs at reading it and puts it back out with the unreadable-disk cross. The
 drive reads: an image becomes cylinders of 6-and-2 GCR bit cells and the IWM
 shifts them past its head, which `src/dev/mac/iwm/tests.rs` checks through the
 chip. What it does **not** do yet is get a track off a disk with the ROM
-driving — the ROM runs the 400K drive's speed servo against a mechanism whose
-speed nothing here changes, and never converges.
+driving: after the motor starts the ROM reads the drive's tachometer in a tight
+loop for six virtual seconds, reads a trickle of data bytes rather than a
+track, and gives up. What that loop wants is ledger item 1.
 `docs/platforms/mac-plus.md` has the ledger and the black-box traces that got
 it this far — including the one that found the ROM drawing that icon through a
 pointer near the top of the four-megabyte window, which is how it was settled

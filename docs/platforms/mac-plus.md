@@ -428,8 +428,8 @@ The ROM now gets *close enough to ask*. It probes the drive, starts the motor,
 and takes two runs at the disk before it ejects it — but in those runs it reads
 only forty to a hundred bytes a second out of the data register, where a head
 over a spinning 800K disk delivers sixty-two thousand. It is not reading the
-track. It is in a **speed servo** instead, and that is the thing now standing
-between this board and a boot: see ledger item 1.
+track — it is in the tachometer loop instead, and what that loop wants is the
+thing now standing between this board and a boot: see ledger item 1.
 
 ```sh
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
@@ -456,47 +456,59 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **The drive's speed, and the PWM servo the ROM runs against it.** This is
-   what stands between the board and a boot, and it is the successor to "why
-   the insert-disk screen never ends" — that one is answered and fixed.
+1. **What the ROM waits on after it starts the motor.** This is what stands
+   between the board and a boot, and it is the successor to "why the
+   insert-disk screen never ends" — that one is answered and fixed.
 
    With the register file right the ROM probes the drive, starts the motor and
    then spends five to six virtual seconds reading **one** status line in a
    tight loop: the tachometer, at `CA2:CA1:CA0:SEL = 0111`, a hundred and
    forty-seven thousand times a second, from a twelve-instruction loop at
    `$418B0E`-`$418B36` running at interrupt level 3. Between bursts it reads
-   the data register forty to a hundred times a second — a trickle, not a track
-   read — and after two attempts it ejects the disk and draws the cross.
+   the data register forty to a hundred times a second — a trickle, where a
+   head over a turning 800K disk delivers sixty-two thousand. It is not reading
+   the track. After two attempts it ejects the disk and draws the cross.
 
-   **It is servoing the speed.** The low byte of each word in the sound buffer
-   is the 400K drive's PWM speed control, and watching `MemTop - $300` through
-   the wait shows it moving: `ff ff ff …` before the motor starts, then
-   `36 2d 2d 36 2d 36 2d 2d`, then `01 20 20 20 20 01 20 20`, then flat `20`.
-   The ROM measures, corrects, measures again — and this drive's speed is a
-   property of how many bit cells our encoder put on the cylinder, so nothing
-   it writes changes anything and the loop never converges.
+   What it *is* doing is not settled, and the following is the evidence rather
+   than a conclusion.
 
-   **The tachometer rate is not the answer**, which is worth recording because
-   it is the obvious first guess. The model turns track 0 at 404 rpm where a
-   real 800K mechanism turns it at 394, and both were tried, along with a sweep
-   of the whole apparent range from 101 rpm to 1,616 rpm. Every rate behaves
-   the same: the only thing that changes is how long the timeout takes, because
-   the timeout is counted in tachometer transitions. At no rate does the ROM
-   read more than about eighty-five bytes a second.
+   **The disk-speed PWM moves through the wait.** The low-order byte of each
+   word in the first sound buffer is the disk-speed control (the *Guide*,
+   chapter 2, "Disk-speed control"), and watching `MemTop - $300` shows it
+   going `ff ff ff …` before the motor starts, then `36 2d 2d 36 2d 36 2d 2d`,
+   then `01 20 20 20 20 01 20 20`, then flat `20`. The sound byte beside it
+   never moves, so this really is the disk half of the word.
 
-   So the next question is **why a Macintosh Plus ROM runs the 400K servo
-   against a drive that reports itself double-sided**. Telling it single-sided
-   (the "number of sides" line low) changes nothing, and neither does moving
-   the unassigned `CA2:CA1:CA0 = 101` line. Two shapes are worth testing next:
-   that the Plus ROM always runs the servo and a real 800K drive simply reads
-   in range on the first measurement — in which case the target rate is the
-   whole of it and the sweep above was measuring the wrong quantity — or that
-   something else the ROM reads before it starts (`$401A`-something in low
-   memory, or the parameter RAM the clock chip hands back) is what picks the
-   400K path.
+   **But that is probably not what it is waiting for**, and the same page of
+   the *Guide* is why: "The double-sided disk drives have internal speed
+   control circuitry and do not use the disk-speed control signal." On a real
+   Plus with an 800K mechanism those bytes go to a motor that ignores them, so
+   the ROM writing them is housekeeping rather than a servo waiting to
+   converge. Recording it because it is the obvious reading and it is wrong.
 
-   The alternative, if that turns out to be a dead end, is to make the cylinder
-   the right *length*. A cylinder here is exactly as long as the sectors on it
+   **The tachometer rate is not the answer either.** The model turns track 0 at
+   404 rpm; a sweep of the apparent rate from 101 rpm to 1,616 rpm — including
+   394, which is the figure quoted for a real outer zone — changes only how
+   long the timeout takes, because the timeout is counted in tachometer
+   transitions. At no rate does the ROM read more than about eighty-five bytes
+   a second.
+
+   **Things that changed nothing**, each measured rather than argued: telling
+   it the drive is single-sided ("number of sides" low); driving the
+   unassigned `CA2:CA1:CA0 = 101` line low; holding "disk ready for reading"
+   high, which it does not read at this stage at all.
+
+   So the question for the next person is narrow and well posed: **what is the
+   loop at `$418B0E` waiting for?** It reads the tachometer and nothing else,
+   at interrupt level 3, and gives up after a fixed number of transitions. Two
+   instruments that have not been tried on it: a per-access record of how many
+   tachometer polls separate one data-register read from the next — which would
+   say whether the loop is timing the data or timing the spindle — and a watch
+   on the low-memory bytes the loop writes, the way the PWM buffer was found.
+
+   Separately, and true whatever the loop turns out to want: **this board's
+   cylinders are the wrong length.** A cylinder here is exactly as long as the
+   sectors on it
    — `src/dev/mac/gcr.rs` lays down twelve sectors of 6,186 bit cells and
    stops — with no trailing gap before sector 0 comes round again, which a real
    formatter leaves. So this disk's revolution is 74,232 cells and its rotation
@@ -512,8 +524,12 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
    those figures and neither does Apple's IWM note, and writing a table of five
    numbers into `gcr.rs` on the strength of recollection is **exactly** the
    mistake that cost this board the drive's register file. Find the figures in
-   a document first. Until then the tachometer reports the rotation the model
-   actually has, which is at least not a lie.
+   a document first — and while looking, settle the bit rate too: the machine
+   file uses 500,000 cells a second, which is the IWM's documented 2 µs cell
+   time for a 3.5-inch drive, but the figure quoted for the Macintosh's
+   *sustained* rate is 489.6 kbit/s and the difference is 2.1 %, the same order
+   as everything else here. Until then the tachometer reports the rotation the
+   model actually has, which is at least not a lie.
 2. **The mouse.** Now buildable: a carrier-detect transition no longer locks
    the machine up, `MTemp` at `$828` moves on both axes — `(15,15)` to
    `(15,14)` for channel A and to `(16,15)` for channel B — and the machine
@@ -531,9 +547,10 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 5. **A host keymap.** `mac.keyboard` takes the Guide's own transition codes and
    nothing turns a keysym into one. Figure 7-6 has the table; the OCR of it in
    circulation is not reliable enough to transcribe and it wants a clean scan.
-6. **The sound**, the last thing on the board with nothing behind it — and now
-   also the thing the disk's speed servo writes into, so a `mac.sound` that
-   reads the PWM buffer would have a second reason to exist.
+6. **The sound**, the last thing on the board with nothing behind it. The
+   buffer it would read is also where the ROM writes the disk-speed byte, so a
+   `mac.sound` would put an instrument on ledger item 1 as well as make a
+   noise.
 
 ## How the ambiguities were settled
 
