@@ -7,6 +7,8 @@
 //! | --- | --- |
 //! | [`custom`] | the register window at `$DFF000`, the appendix's table, and the subscription seam a chip attaches through |
 //! | [`gary`] | the address decode: the `OVL` overlay at zero, bank 6 (an A501's slow RAM or the chip registers again) and a window at `$E0_0000` for AROS's second ROM half |
+//! | `ramsey` | `dev-amiga-ramsey`: the A3000's memory controller, as software can see it — the control register Kickstart's memory sizing spins on, and the version register |
+//! | `sdmac` | `dev-amiga-sdmac`: the A3000's Super DMAC — the SCSI data path into 32-bit memory, and the two addresses the `wd.33c93` sits behind |
 //! | `gayle` | `dev-amiga-gayle`: the A600's gate array — the IDE port's chip selects and byte swap in front of an `ata.disk`, the card and IDE interrupt registers at `$DA8000`, the identification register, and the overlay it clears on the first CIA write |
 //! | [`cia_decode`] | one 8520's decode — register select on A8–A11, one byte lane of the data bus |
 //! | `akiko` | `dev-amiga-akiko`: Akiko — the CD32's gate array: the chunky-to-planar corner turn, the CD-ROM controller and the serial EEPROM's two wires, at `$B80000` |
@@ -103,6 +105,9 @@ pub mod regs;
 #[cfg(feature = "dev-amiga-rtc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-rtc")))]
 pub mod rtc;
+#[cfg(feature = "dev-amiga-sdmac")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-sdmac")))]
+pub mod sdmac;
 
 #[cfg(feature = "dev-amiga-paula")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-paula")))]
@@ -139,6 +144,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     gayle::register(registry)?;
     #[cfg(feature = "dev-amiga-ramsey")]
     ramsey::register(registry)?;
+    #[cfg(feature = "dev-amiga-sdmac")]
+    sdmac::register(registry)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::register(registry)?;
     #[cfg(feature = "dev-amiga-floppy")]
@@ -175,6 +182,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     gayle::bind(bindings)?;
     #[cfg(feature = "dev-amiga-ramsey")]
     ramsey::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-sdmac")]
+    sdmac::bind(bindings)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::bind(bindings)?;
     #[cfg(feature = "dev-amiga-floppy")]
@@ -205,6 +214,8 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     schemas.push(gayle::schema());
     #[cfg(feature = "dev-amiga-ramsey")]
     schemas.push(ramsey::schema());
+    #[cfg(feature = "dev-amiga-sdmac")]
+    schemas.push(sdmac::schema());
     #[cfg(feature = "dev-amiga-paula")]
     schemas.push(paula::schema());
     #[cfg(feature = "dev-amiga-floppy")]

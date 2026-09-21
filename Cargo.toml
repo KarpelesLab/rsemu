@@ -2917,6 +2917,24 @@ dev-amiga-gayle = ["dev-amiga", "dev-ata-disk"]
 # `dev-amiga`. `no_std + alloc`, no dependencies.
 dev-amiga-ramsey = ["dev-amiga"]
 
+# The A3000's Super DMAC (src/dev/amiga/sdmac.rs): the board's half of its SCSI
+# port, which is the half that is not the WD33C93A. Commodore mapped the SCSI
+# chip's two registers *inside* the DMA controller's own register space, so one
+# window at $DD0000 covers both parts: the DMAC's longword registers -- WTC,
+# CONTR, ACR, ISTR and the four strobes ST_DMA, SP_DMA, FLUSH and CLR_INT --
+# and, at $DD0040/$DD0047/$DD0049, the controller's Address and indirect
+# registers passed straight through. The DMA path is a bus master: a data phase
+# moves between the SCSI chip and 32-bit memory at ACR, in the direction
+# CONTR's DMADIR bit picks, and ISTR is a live view of the WD33C93's interrupt
+# line gated by INTENA. The FIFO is not modelled -- every byte reaches memory in
+# the call that carried it -- so FE reads 1, FF reads 0 and FLUSH has nothing to
+# do; the module documentation argues why that is safe. Written from *The A3000+
+# System Specification* §2.4 (Tables 2-5 and 2-6); no emulator source, no AROS
+# source and no Kickstart disassembly was consulted (ROADMAP.md §1). Implies
+# `dev-amiga` and `dev-wd33c93`, the chip behind its window. `no_std + alloc`,
+# no dependencies.
+dev-amiga-sdmac = ["dev-amiga", "dev-wd33c93"]
+
 # The `amiga-a500` board (machines/amiga-a500.machine plus the classes it
 # names): a big-endian 24-bit space, chip RAM at zero behind the `OVL`
 # overlay, the custom chip registers at $DFF000, and a 512 KiB Kickstart socket
