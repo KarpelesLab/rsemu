@@ -2203,6 +2203,31 @@ dev-ata-disk = ["dev-medium"]
 # `unsafe`, no dependencies.
 dev-ata-atapi = ["dev-ata-disk", "dev-disc"]
 
+# A SCSI bus, and a direct-access target on it (src/dev/scsi). The same split
+# `dev-ata-disk` draws, drawn again for a bus that genuinely has two parts: an
+# initiator and a target speaking a defined protocol over a shared cable. The
+# `Target` trait *is* the cable -- select me, tell me which phase you are
+# requesting, move these bytes, let go -- and it names no command opcode, so a
+# CD-ROM target added later is a new target rather than a new controller. `Bus`
+# is the cable itself: eight addresses, a rendezvous under a name
+# (`bus = "scsi0"`) exactly as `dev-ata-disk`'s drive bays are.
+#
+# `scsi.disk` is the one target this feature ships: the phase machine
+# (arbitration through message in), fixed-format sense data, and the
+# direct-access command set an operating system of 1990 issues -- TEST UNIT
+# READY, REQUEST SENSE, INQUIRY with vital product data pages 00h and 80h,
+# MODE SENSE(6) and (10) with pages 01h/03h/04h, MODE SELECT(6) and (10),
+# READ CAPACITY, READ(6)/(10), WRITE(6)/(10), SEEK, VERIFY, SYNCHRONIZE CACHE,
+# READ DEFECT DATA, START STOP UNIT, RESERVE/RELEASE, SEND DIAGNOSTIC and
+# PREVENT ALLOW MEDIUM REMOVAL. Everything else answers ILLEGAL REQUEST, which
+# is how a driver finds out what a drive has. Disconnection is deliberately not
+# modelled and the module documentation says so and says why. Backed by
+# `dev-medium`, so `--media hd0=disk.hdf` and `--drive hd0=disk.qcow2` both
+# work. Written from X3.131-1994 (SCSI-2), cited by clause; no emulator source
+# and no operating system's SCSI driver was opened (ROADMAP.md §1).
+# `no_std + alloc`, no `unsafe`, no dependencies.
+dev-scsi = ["dev-medium"]
+
 # Entering a Linux/x86 kernel with no firmware in between (src/dev/linuxboot.rs):
 # the Linux/x86 boot protocol as a device. It parses a `bzImage`'s setup header,
 # writes the protected-mode kernel to its own `code32_start`, builds the zero

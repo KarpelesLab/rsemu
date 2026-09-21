@@ -1099,6 +1099,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::keypad::register(&mut reg)?;
     #[cfg(feature = "dev-ata-disk")]
     crate::dev::ata::register(&mut reg)?;
+    #[cfg(feature = "dev-scsi")]
+    crate::dev::scsi::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
     #[cfg(feature = "dev-mos8520")]
@@ -1243,6 +1245,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::keypad::bind(&mut b)?;
     #[cfg(feature = "dev-ata-disk")]
     crate::dev::ata::bind(&mut b)?;
+    #[cfg(feature = "dev-scsi")]
+    crate::dev::scsi::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "dev-mos8520")]
@@ -1400,6 +1404,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::keypad::schema());
     #[cfg(feature = "dev-ata-disk")]
     for schema in crate::dev::ata::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-scsi")]
+    for schema in crate::dev::scsi::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-wdc")]
