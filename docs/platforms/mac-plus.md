@@ -138,81 +138,173 @@ read/write pin for it and decodes the direction from the address instead.
 | Class | What it models | What it does not |
 | --- | --- | --- |
 | `mac.glue` | the overlay at zero, the `$600000` window, and memory that answers only where it is | nothing else; it has no registers |
-| `mac.via` | a whole 6522: both ports pin by pin, both timers with the one-shot, free-run and PB7 modes, `ACR`/`PCR`, and the interrupt flag/enable pair with its read-to-clear and its SET/CLEAR write | **the shift register does not shift.** `SR` is stored and read back, and `IFR` bit 2 never sets — which is the keyboard path |
+| `mac.via` | a whole 6522: both ports pin by pin, both timers with the one-shot, free-run and PB7 modes, all eight shift-register modes, `ACR`/`PCR`, and the interrupt flag/enable pair with its read-to-clear and its SET/CLEAR write | PCR's pulse and handshake output modes on `CA2`/`CB2`, which nothing on a Macintosh uses |
 | `mac.video` | 512 × 342 one-bit pixels read out of main memory at capture time, the screen buffer hanging below the top of memory with `PAGE2` picking which of the two, and the vertical and horizontal blanking outputs | the cycles it steals from the processor: this board's 68000 runs at its full rate |
+| `mac.keyboard` | the Guide's clock/data protocol, its bit timing, the four commands of Table 7-4 and a type-ahead buffer | a host keymap — `Keyboard::key` takes the Guide's own transition code — and the separate keypad's `$79` prefix |
+| `mac.rtc` | the four-byte second counter, twenty bytes of parameter RAM, the write-protect and test registers, the three-wire serial interface and the one-second interrupt | the battery: parameter RAM lives and dies with the machine. The 256-byte chip of later models, and its two-byte extended command |
 | `mac.scc` | the register pointer and all thirty-two registers, `RR0`-`RR3`, the reset commands, and the two carrier detects | any serial traffic, the baud-rate generator, the DPLL, `/WREQ` |
-| `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, and the drive's own sixteen status lines and four controls | **the data path.** `RDDATA` is a line that never moves, so the drive spins and steps and never delivers a sector |
+| `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and four controls, and the **read** data path: a disk shifted past the head a bit cell at a time | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set |
+| `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum and the five speed zones | the 400K drive's PWM speed control, which an 800K mechanism ignores |
+| `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
 
-Not modelled at all: the **clock chip** (the real-time clock and PRAM on the
-VIA's `PB0`-`PB2`, and the one-second interrupt on `CA2`), the **keyboard**,
-the **mouse**, the **sound** (the PWM buffer the VIA's `PB7` gates), and
-**SCSI** (the NCR 5380 at `$580000`).
+Not modelled at all: the **mouse** (two quadrature phases on the SCC's carrier
+detects and two more on the VIA's `PB4`/`PB5`), the **sound** (the PWM buffer
+the VIA's `PB7` gates), and **SCSI** (the NCR 5380 at `$580000`).
 
 ## How far a real ROM gets
 
-`tests/mac_plus.rs`, on the stock 1 MiB board with the user's own ROM:
+`tests/mac_plus.rs`, on the stock 1 MiB board with the user's own ROM and
+nothing in the drive:
 
 | Virtual time | What happens |
 | --- | --- |
-| 0 – 25 ms | the VIA is set up: `DDRA = $7F`, `DDRB = $87`, `PCR = 0`, `IER = $82` — vertical blanking enabled — and `PA4` is driven low, so the overlay goes and memory is at zero |
+| 0 – 25 ms | the VIA is set up: `DDRA = $7F`, `DDRB = $87`, `PCR = 0`, `IER = $82` — vertical blanking enabled — and `PA4` is driven low, so the overlay goes and memory is at zero. The clock chip is asked for parameter RAM `$10` before any of that, 131 φ2 ticks in |
 | 25 – 725 ms | the sound buffer is filled a byte per word and `/SNDENB` is asserted: **the startup chime**, 43 frames long, timed by polling `IFR` for the blanking flag some 6,600 times per 25 ms |
 | 0.7 – 6 s | the memory test: alternating write and read passes over the whole megabyte, several patterns deep |
-| ~6 s | the ROM finds 1 MiB, writes `MemTop`, `BufPtr` and `ScrnBase`, initialises the SCC (32 register writes), exercises the IWM (all sixteen switches, including a mode-register load), and talks to the clock chip |
-| 7 s onward | **steady state**: the picture stops changing and the machine idles, with the 60.15 Hz tick chain running — `Ticks` at `$16A` counting up, `IFR` cleared 60 times a second — the keyboard retried two or three times a second on the VIA's shift register, and the drive polled once every half second |
+| ~6 s | the ROM finds 1 MiB, writes `MemTop`, `BufPtr` and `ScrnBase`, initialises the SCC (32 register writes), exercises the IWM (all sixteen switches, including a mode-register load), reads all twenty bytes of parameter RAM and the clock twice over, finds the battery flat, and **writes its own defaults back** — unlocking the write-protect register with `$55` and locking it again with `$D5` around them |
+| 6.9 s | the first keyboard transaction: `ACR = $18`, `SR = $00` to pull the data line low, then `ACR = $1C`, `SR = $16` — Model Number. The keyboard answers `$03` |
+| 7 s onward | **steady state**: the 60.15 Hz tick chain runs, `Ticks` at `$16A` counts up, `IFR` is cleared 60 times a second, and the keyboard is asked `$10` — Inquiry — every 0.25 second and answers `$7B`, Null. Which is exactly the cadence chapter 7 describes |
+
+`Time` at `$20C` holds the date the clock chip was given plus however long the
+machine has been on, which is the check that the counter's byte order is right:
+with `time = "2026-01-01T00:00:00"` it reads `$E57B698D` twelve seconds in.
 
 **What the picture shows at that point**: the Macintosh's **50 % grey
 desktop** — a one-pixel checkerboard, exactly 87,585 black pixels of 175,104 —
 with the **arrow cursor** drawn over it about fifteen pixels in from the left
 and fourteen down, and a small solid wedge in the corner above it. Nothing
-else is on it, and it does not change again in thirty virtual seconds: every
-row is plain grey except the top thirty, which hold the cursor, and the bottom
-five.
+else is on it, and it does not change again in thirty virtual seconds.
 
 No access faults, the processor never double-faults, and the video circuit
 produces 60 frames a virtual second throughout.
 
-### What it is not
+### What it is not, and what is now known about why
 
 It is **not the insert-disk screen**. The floppy-with-a-question-mark, and the
-happy Macintosh before it, are not drawn. The machine is idle rather than
-stuck in a loop of its own — the main thread is parked in a two-byte loop at
-`$4006E8` and everything that happens, happens in the blanking interrupt — so
-the ROM is *waiting* for something this board does not give it.
+happy Macintosh before it, are not drawn.
+
+The processor lives at **`$4006E8`**, in a two-byte loop, for 99.4 % of sampled
+instants over two virtual seconds. `SR = $2004`: supervisor, and the interrupt
+mask is **zero**, so it is waiting rather than blocked. Everything else that
+happens, happens in the blanking interrupt, at `$401A`-`$401B` and `$4025`.
+
+Four things were ruled out by measurement rather than by argument, and each one
+cost a device to rule out:
+
+* **The keyboard is not it.** It now completes the Guide's whole handshake —
+  Model Number answered, then Inquiry every quarter second — and the picture
+  did not move by one pixel.
+* **The clock chip is not it.** Parameter RAM is read, found invalid, written
+  with the ROM's own defaults and read back; the date reaches `Time`. The
+  picture did not move.
+* **The ROM is not looking for a disk.** With a blank 800K disk in the drive,
+  sampling the IWM's soft switches every millisecond for two virtual seconds
+  finds them **moving zero times**: the motor is never started, the head never
+  leaves cylinder 0, and the chip stays at `switches = $25`, `mode = $1F` where
+  the startup sequence left it. So the ROM is nowhere near its boot loop, and
+  the disk path — now built and tested — is not what it is waiting for.
+* **SCSI is not it either.** Counting stubs over every window this board does
+  not claim show **three writes and no reads** at `$580000` in twelve seconds,
+  and nineteen reads at `$F80000` in the phase space. A ROM waiting on a 5380
+  would be reading it.
+
+So the ROM is waiting on something that is not the keyboard, not the clock, not
+the drive and not SCSI, and it is waiting with interrupts open in a loop that
+makes no bus access at all — which is why it took a counting stub to find the
+last one of these, and will take another to find this one.
+
+A counting stub has to be **transparent** or it changes what it measures. The
+first one here filled a read with `$FF` instead of `attrs.bus`, which is what
+the space's `open-bus` policy delivers, and the ROM went off the rails into
+floating memory within a second. The value on a floating bus is load-bearing on
+this board.
+
+## Booting a disk
+
+The path is there and is tested end to end without one: an image becomes
+cylinders of bit cells, the cells are shifted past the drive's head, and the
+bytes the IWM's data register hands over decode back into the sectors that went
+on. `src/dev/mac/iwm/tests.rs` does exactly that *through the chip* — cylinders
+0, 17 and 79, both heads, motor and stepper and all — and
+`src/dev/mac/disk/tests.rs` does it for all 1,600 blocks of an 800K image
+without the chip.
+
+**What is unproven without a real 800K image** is whether Apple's ROM agrees
+with this encoder about the low-level bit assignments: which two bits of each
+byte go where in a 6-and-2 group, and which of the three sums scrambles which
+byte. The encoder and the decoder here are each other's oracle, so they would
+agree with each other even if both were wrong in the same way. The only thing
+that settles it is a ROM reading a track this encoder wrote — and the ROM does
+not look at the drive yet, so even with an image in hand that test cannot run.
+Both halves of that are honest and both are recorded here.
+
+```sh
+rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
+```
+
+takes a raw 400K or 800K image or a DiskCopy 4.2 container. A **1.44 MB image
+is refused by name**:
+
+```text
+mac.disk: `System Startup` is a DiskCopy 4.2 container of a 1.44 MB disk
+(diskFormat 3, dataSize 1474560); a Macintosh Plus has an IWM and an 800K
+double-density drive, and 1.44 MB needs the SWIM controller and high-density
+media that arrived with the Macintosh SE FDHD in 1989. Give it a 400K or 800K
+image instead
+```
+
+That is the hardware, not a limitation of this board: chapter 9 of the Guide
+lists the 800K drive interface and the FDHD interface as two different
+interfaces with two different controllers, and a board that read a 1.44 MB disk
+would not be a Plus. The two images this was developed against are both
+`diskFormat = 3`; `RSEMU_MAC_DISK_DIR` points `src/dev/mac/disk/tests.rs` at a
+directory of them, and it prints what it makes of each and checks the
+container's own `dataChecksum` — arithmetic over bytes it never keeps.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **The VIA's shift register, and a keyboard.** The only thing the idle
-   machine does repeatedly that is not the tick chain is a keyboard
-   transaction: six writes to `SR` and eight to `ACR` a second, for ever. A
-   Macintosh Plus keyboard is a synchronous serial device that supplies its own
-   clock on `CB1` and its data on `CB2`, and the VIA shifts against it. The
-   model here does not shift at all, so `IFR` bit 2 never sets and every
-   transaction times out. This is the most likely thing the ROM is waiting for
-   and the cheapest to test.
-2. **The clock chip.** The real-time clock and its twenty bytes of PRAM hang
-   off `PB0`-`PB2` as a bit-banged three-wire interface, and its one-second
-   output is the VIA's `CA2`. The ROM does talk to it during startup — 1,828
-   VIA writes in one 25 ms window, which is the bit-banging — and gets nothing
-   back. Driving `CA2` at 1 Hz from a test changed nothing, so the one-second
-   interrupt alone is not the blocker; PRAM's contents may still be.
-3. **The IWM's data path**, which is what makes a disk readable at all: the
-   400K/800K format is Apple's 6-and-2 GCR, 80 tracks in five speed zones of
-   12, 11, 10, 9 and 8 sectors, 524 bytes a sector (512 of data and 12 of tag),
-   with an address field of `D5 AA 96` and a data field of `D5 AA AD`. The
-   drive's registers and the head position are already here; what is missing is
-   the bit stream and the encoder.
-4. **The NCR 5380**, so the ROM's SCSI probe finds a bus rather than a floating
-   one. `src/dev/scsi` already has the bus, the `Target` trait and a disk.
-5. **Sound**, which is 370 bytes a frame out of the same buffer the disk-speed
-   byte lives in, and the mouse, which arrives as two quadrature phases on the
-   SCC's carrier detects and two more on the VIA's `PB4`/`PB5`.
+1. **Find what `$4006E8` is waiting for.** Everything else on this list is
+   guesswork until that is known. The tools are the two that found the last
+   hang: a counting stub over a window, and a program-counter histogram. What
+   is left unmodelled and reachable is the **sound circuit** — 370 bytes a
+   frame out of a buffer below the screen, gated by the VIA's `PB7`, with the
+   disk-speed byte sharing it — the **mouse**, and **SCSI**. A loop that makes
+   no bus access is waiting on a *variable*, so the other half of the tool is
+   watching low memory change: the ROM's own data structures are fair game and
+   `MemTop`, `ScrnBase` and `Time` have all been read out that way already.
+2. **The NCR 5380**, so the ROM's SCSI probe finds a bus rather than a floating
+   one. `src/dev/scsi` already has the bus, the `Target` trait and a disk, and
+   the ROM's three writes say it is at least trying.
+3. **Writing to a disk.** The read path is here; the write path is the same
+   machinery backwards, plus the IWM's write handshake meaning something and a
+   way to get the bytes back into the image.
+4. **A host keymap.** `mac.keyboard` takes the Guide's own transition codes and
+   nothing turns a keysym into one. Figure 7-6 has the table; the OCR of it in
+   circulation is not reliable enough to transcribe and it wants a clean scan.
+5. **The mouse and the sound**, which are the last two things on the board with
+   nothing behind them.
 
 ## How the ambiguities were settled
 
 Black-box tracing, which is the tool `CLAUDE.md` names and the only one
 available: which addresses the ROM touches, in what order, what it writes, what
-it reads back, what it waits on. Three things came out of it that no document
+it reads back, what it waits on. Five things came out of it that no document
 stated plainly.
+
+* **The clock chip's whole command encoding.** The Guide gives the three wires
+  and sends the reader to *Inside Macintosh* for the rest, which is not a
+  hardware document. Reconstructing the serial interface from what the ROM
+  writes to `ORB` and `DDRB` gives frames of one command byte and one data
+  byte, and the command bytes fall out as a direction in bit 7, an address in
+  bits 6-2 and a constant `01` below. The addresses that appear are `$10`-`$1F`
+  and `$08`-`$0B` — **twenty bytes**, which is the number the Guide gives for
+  this chip's parameter RAM, and nothing else about the trace would have
+  produced exactly twenty. `src/dev/mac/rtc.rs` has the whole argument.
+* **Which shift-register mode the keyboard uses.** Six of the 6522's eight are
+  ruled out by one sentence of chapter 7 — the clock line "is driven only by
+  the keyboard" — and the ROM confirms the remaining two by writing `ACR = $1C`
+  and then `ACR = $0C`, which are shift-out and shift-in under the external CB1
+  clock.
 
 * **Memory must not repeat** (above). Found by reading back `MemTop` — a
   data structure the ROM builds in memory, which is data rather than code — and
@@ -231,55 +323,19 @@ stated plainly.
   deliver the level, so the restored machine and the built one disagreed about
   one bit of `IFR`.
 
-## Booting the user's disk images, and why this machine cannot
-
-The two images in question are **DiskCopy 4.2** containers: an 84-byte header
-(a 64-byte Pascal name — `System Startup` — then `dataSize`, `tagSize`, two
-checksums, `diskFormat`, `formatByte` and the magic `$0100`) followed by the
-data fork. Both read `dataSize = $00168000` — **1,474,560 bytes** — with
-`diskFormat = 3`, which is 1.44 MB, and `formatByte = $22`. The file length,
-1,474,644, is exactly the header plus the data, so nothing is being
-mis-identified.
-
-**A Macintosh Plus cannot read them, and that is the hardware.** A Plus has an
-IWM and an 800K double-density drive. 1.44 MB needs the **SWIM** controller and
-high-density media, both of which arrived with the Macintosh SE FDHD in 1989 —
-three years after this machine. No amount of work on this board makes a Plus
-read a 1.44 MB disk; a board that did would not be a Plus.
-
-There are three real options, and they are not equally good.
-
-1. **Find or make an 800K image of the same system, and finish the IWM.**
-   System 6.0.8 shipped on 800K disks and those images exist; a 1.44 MB image
-   can also be re-laid-out onto 800K media if what is on it fits, which for a
-   *System Startup* disk it does. This is the option that finishes the machine
-   the user asked for, and the work is item 3 in the ledger above — the 6-and-2
-   GCR encoder and the drive's bit stream — plus items 1 and 2 to get the ROM
-   as far as looking for a disk at all. **This is the recommendation.**
-2. **Build a Macintosh SE FDHD or a Classic** and boot the images there. The
-   user has `Classic.ROM` (512 KiB) in the same directory, and a Macintosh
-   Classic is a 68000 machine with the same video, the same VIA and a SWIM —
-   so most of `dev/mac` is reused and the new work is the SWIM and the ASC.
-   The SWIM's IWM-compatible mode is the same sixteen switches this board
-   already has; its MFM mode is new. It is more work than option 1 and it
-   ends with a different machine than the one that was asked for.
-3. **Neither**: go on with the Plus and read nothing. The insert-disk screen is
-   a real milestone and it needs no disk at all.
-
-The other ROMs in that directory — `LC.ROM`, `LC-II.ROM`, `Mac-IIcx.ROM`,
-`Color-Classic.ROM` and the rest — are all 68020/68030 machines with slots,
-different video and a different glue chip. They are a *third* board, not a
-variation on this one.
-
 ## Running it
 
 ```sh
 rsemu run mac-plus --media macrom=Mac-Plus.ROM
 rsemu run mac-plus -p ram=4M --media macrom=Mac-Plus.ROM
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --vnc :5900
+rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
+rsemu run mac-plus --media macrom=Mac-Plus.ROM -p rtcdate=1986-01-16T09:00:00
 ```
 
 The ROM image must be exactly 128 KiB; trim a longer file first (see above).
+The drive takes a raw 400K or 800K image or a DiskCopy 4.2 container, and an
+empty or unbound `floppy` slot is an empty drive.
 
 The tests read the user's own ROM in place and skip, printing why, when it is
 not there:
@@ -291,6 +347,8 @@ RSEMU_MAC_FRAME_DIR=/tmp/frames \
 ```
 
 `RSEMU_MAC_TRACE=1` prints the processor's state once a virtual second, which
-is how to find where a ROM stopped. `tests/mac_plus_board.rs` needs nothing of
-anybody's: it assembles the board around rsemu's own ten-byte stub and checks
-that every chip answers where the Guide puts it.
+is how to find where a ROM stopped. `RSEMU_MAC_DISK_DIR` points
+`src/dev/mac/disk/tests.rs` at a directory of disk images and it says what it
+makes of each one. `tests/mac_plus_board.rs` needs nothing of anybody's: it
+assembles the board around rsemu's own ten-byte stub and checks that every chip
+answers where the Guide puts it.

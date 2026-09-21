@@ -20,17 +20,22 @@
 //!
 //! The ROM chimes (the sound buffer is filled and `/SNDENB` is asserted for 43
 //! frames), sizes memory, runs its memory test, initialises the SCC and the
-//! IWM, reads the clock chip, and settles into its interrupt-driven idle loop
-//! with the 60.15 Hz tick chain running. **The picture at that point is the
+//! IWM, reads the clock chip and writes its parameter RAM back, finishes the
+//! keyboard's Model Number handshake and settles into asking it for a key
+//! every quarter second, and runs its interrupt-driven idle loop with the
+//! 60.15 Hz tick chain going. **The picture at that point is the
 //! Macintosh's 50 % grey desktop — a one-pixel checkerboard, 87,585 black
 //! pixels of 175,104 — with the arrow cursor drawn over it about fifteen
 //! pixels in from the left and fourteen down, and a small solid wedge in the
 //! corner above it.** It does not change again.
 //!
 //! It is *not* the insert-disk screen: the floppy-with-a-question-mark, and
-//! the happy Macintosh before it, are not drawn. What is still missing is in
-//! `docs/platforms/mac-plus.md`; the shortest description is that the ROM is
-//! idle and waiting for something this board does not yet give it.
+//! the happy Macintosh before it, are not drawn. The ROM is parked in a
+//! two-byte loop at `$4006E8` with its interrupt mask at zero, and with a disk
+//! in the drive it never once moves the IWM's soft switches — so it is not
+//! looking for a disk and the disk path is not what it is waiting for.
+//! `docs/platforms/mac-plus.md` has the whole ledger, including what has been
+//! ruled out and how.
 //!
 //! # The ROM file
 //!
@@ -316,4 +321,76 @@ fn the_rom_sizes_a_four_megabyte_board_and_moves_its_screen() {
     assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
     assert_eq!(peek(&b, 0x108), 0x0040_0000, "MemTop: a 4 MiB machine");
     assert_eq!(peek(&b, 0x824), 0x003f_a700, "ScrnBase: MemTop - $5900");
+}
+
+/// A synthetic 800K disk: every block says which block it is, so nothing of
+/// anybody's is needed and nothing of anybody's is committed.
+fn synthetic_800k() -> Vec<u8> {
+    let mut image = vec![0u8; 819_200];
+    for (block, chunk) in image.chunks_mut(512).enumerate() {
+        for (i, byte) in chunk.iter_mut().enumerate() {
+            *byte = (block as u8).wrapping_mul(7).wrapping_add(i as u8);
+        }
+    }
+    image
+}
+
+/// The board assembles with a disk in the drive and runs exactly as it does
+/// without one — which is the current state of affairs and worth an assertion
+/// rather than a paragraph: the ROM does not look at the drive.
+///
+/// When it starts looking, this is the test that changes: the frame will move
+/// and the assertion below will be what says so.
+#[test]
+fn a_disk_in_the_drive_changes_nothing_yet() {
+    let Some(image) = rom_image("Mac-Plus.ROM") else {
+        return;
+    };
+    let mut b = board_with_disk(image, &[], synthetic_800k());
+    advance(&mut b, "mac-plus-disk", 12);
+    let hash = picture(&b, "mac-plus-disk", 12);
+
+    assert!(!b.cpu.is_halted(), "the processor double-faulted");
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    assert_eq!(
+        hash, GOLDEN_1M,
+        "the picture moved with a disk in the drive. If the ROM has started \
+         looking at it, that is the insert-disk work landing and this golden \
+         should move; look at it (RSEMU_MAC_FRAME_DIR) first."
+    );
+}
+
+/// A 1.44 MB image is refused when the board is assembled, by name, with a
+/// message that says why — rather than being handed to a drive that cannot read
+/// it and failing somewhere further down.
+///
+/// The image here is 1,474,560 zero bytes built on the spot. Nobody's disk is
+/// in this repository and this test needs none.
+#[test]
+fn a_1440k_image_is_refused_when_the_board_is_built() {
+    let Some(image) = rom_image("Mac-Plus.ROM") else {
+        return;
+    };
+    let cores: Arc<Captured<M68k>> = Arc::new(Captured::new());
+    let kept = Arc::clone(&cores);
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.bindings.replace("cpu.m68k", move |props| {
+        let cpu = Arc::new(M68k::from_props(props)?);
+        kept.push(&cpu);
+        Ok(cpu)
+    });
+    options.realize.media.insert("macrom", image);
+    options.realize.media.insert("floppy", vec![0u8; 1_474_560]);
+    let registry = catalog::registry().expect("a registry");
+    let source = catalog::machine("mac-plus")
+        .expect("this build ships mac-plus")
+        .source;
+    let err = rsemu::machine::build("mac-plus", source, &registry, &options)
+        .err()
+        .expect("a Macintosh Plus cannot read a 1.44 MB disk");
+    let text = err.to_string();
+    println!("mac-plus: {text}");
+    for want in ["1.44 MB", "IWM", "SWIM", "800K"] {
+        assert!(text.contains(want), "the refusal does not say `{want}`: {text}");
+    }
 }
