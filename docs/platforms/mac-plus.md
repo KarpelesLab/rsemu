@@ -10,10 +10,10 @@ counter rather than owned by a video chip. rsemu's first Apple machine, and the
 first board here whose framebuffer is somebody else's RAM.
 
 A real ROM runs it to the **blinking insert-disk icon**, polling the drive six
-to eight times a second; put an 800K image in and it spins the drive up, takes
-two runs at reading it, and puts it back out with the unreadable-disk cross.
-What it does not do yet is get a track off the disk — the last piece is ledger
-item 1.
+to eight times a second; put an 800K image in and it spins the drive up,
+**reads the track**, decodes the two boot blocks out of it, finds no system on
+them and puts the disk back out. What it cannot do yet is boot, and that wants
+Apple system software on an 800K image — ledger item 1.
 
 ## Primary sources
 
@@ -171,8 +171,8 @@ read/write pin for it and decodes the direction from the address instead.
 | `mac.keyboard` | the Guide's clock/data protocol, its bit timing, the four commands of Table 7-4 and a type-ahead buffer | a host keymap — `Keyboard::key` takes the Guide's own transition code — and the separate keypad's `$79` prefix |
 | `mac.rtc` | the four-byte second counter, twenty bytes of parameter RAM, the write-protect and test registers, the three-wire serial interface and the one-second interrupt | the battery: parameter RAM lives and dies with the machine. The 256-byte chip of later models, and its two-byte extended command |
 | `mac.scc` | the register pointer and all thirty-two registers, `RR0`-`RR3`, the reset commands, `WR9`'s master interrupt enable, and the two carrier detects | any serial traffic, the baud-rate generator, the DPLL, `/WREQ` |
-| `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and its control registers, and the **read** data path: a disk shifted past the head a bit cell at a time | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set. The 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it |
-| `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum and the five speed zones | the 400K drive's PWM speed control, which an 800K mechanism ignores |
+| `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and its control registers, and the **read** data path: a disk shifted past the head a bit cell at a time, with each byte the shifter latches named as a scheduler event so a guest polling the data register cannot miss one | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set. The 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it |
+| `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum, the five speed zones and the **gap a formatter leaves**, which is what decides how fast the disk turns (`SECTOR_CELLS`) | the 400K drive's PWM speed control, which an 800K mechanism ignores |
 | `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
 
 Not modelled at all: the **mouse** (two quadrature phases on the SCC's carrier
@@ -193,7 +193,7 @@ nothing in the drive:
 | ~6 s | the ROM finds 1 MiB, writes `MemTop`, `BufPtr` and `ScrnBase`, initialises the SCC (32 register writes), exercises the IWM (all sixteen switches, including a mode-register load), reads all twenty bytes of parameter RAM and the clock twice over, finds the battery flat, and **writes its own defaults back** — unlocking the write-protect register with `$55` and locking it again with `$D5` around them |
 | 6.9 s | the first keyboard transaction: `ACR = $18`, `SR = $00` to pull the data line low, then `ACR = $1C`, `SR = $16` — Model Number. The keyboard answers `$03` |
 | 7.3 s onward | the desktop is painted grey, `_HideCursor` runs, the **insert-disk icon** is drawn in the middle of the screen, `_ShowCursor` puts the arrow back. The 60.15 Hz tick chain runs, `Ticks` at `$16A` counts up, `IFR` is cleared 60 times a second, and the keyboard is asked `$10` — Inquiry — every 0.25 second and answers `$7B`, Null. Which is exactly the cadence chapter 7 describes |
-| 7 s onward | the ROM **probes the drive**: the drive-installed line, the number of sides, then the motor on. With a disk in the slot it spins up, and at about 14 s it gives up on it, **puts it back out** and draws the floppy with a **cross** through it — the unreadable-disk icon. With nothing in the slot it goes straight to the insert-disk loop |
+| 7 s onward | the ROM **probes the drive**: the drive-installed line, the number of sides, then the motor on. With a disk in the slot it spins up, checks the spindle speed against the tachometer, **reads cylinder 0** and decodes blocks 0 and 1 out of it — they are in memory by about 10 s — finds no system on them and at about 13 s **puts the disk back out**. With nothing in the slot it goes straight to the insert-disk loop |
 | 13 s onward | **the icon blinks** — the floppy with the question mark alternating with the plain floppy, about a second each way — and the drive's *disk in place* line is read six to eight times a second, for ever. That is the loop that notices a disk, and it is the thing that was missing |
 
 `Time` at `$20C` holds the date the clock chip was given plus however long the
@@ -215,10 +215,12 @@ desktop would be exactly half. Both phases are goldens in `tests/mac_plus.rs`
 and `the_insert_disk_icon_blinks` is the test that asserts the alternation
 rather than either picture.
 
-Put an 800K image in the drive and a third picture appears: the floppy with a
-**cross** through it (739 white), the Macintosh's unreadable-disk icon, drawn
-at about 14 s after the ROM has spun the drive up, failed to get anything off
-it and ejected it.
+A third picture — the floppy with a **cross** through it (739 white), the
+Macintosh's unreadable-disk icon — is what an 800K image in the drive used to
+produce, and it is now a *fault indication* rather than the ordinary case: the
+ROM draws it when it cannot get a track off the disk. A disk this board reads
+and finds no system on goes back to the blinking question mark instead, which
+is what a real Macintosh does with one.
 
 The 4 MiB board reaches the same pictures about twenty-six seconds in, because
 its memory test is four times as long.
@@ -361,6 +363,166 @@ side on the switch movement, so a ROM walking the sixteen switches on its way
 to somewhere else left the drive on the upper head. It now latches on a read of
 the status register at that address, and a debug read still changes nothing.
 
+### The tachometer loop and the 2.5 %
+
+The last two defects in the read path, and they were two rather than one.
+
+For three sessions the ROM started the motor and then spent five or six virtual
+seconds reading **one** status line — the tachometer, at
+`CA2:CA1:CA0:SEL = 0111` — a hundred and forty-seven thousand times a second
+from a twelve-instruction loop at `$418B0E`-`$418B36` at interrupt level 3,
+reading the data register only forty to a hundred times a second where a
+turning 800K disk delivers sixty-two thousand. Then it ejected the disk and
+drew the floppy with a cross through it.
+
+**What the loop is** came out of one instrument: a transparent tap over the
+controller recording every access as `(cell, switch, value)` and then collapsing
+runs of the same switch into one line. The whole thing is one shape, repeated
+about a hundred times:
+
+```text
+  t=3866333 idx= 1 R val=fe          set CA0
+  t=3866333 idx= 3 R val=00          set CA1
+  t=3866333 idx= 4 R val=00          clear CA2   — the tachometer's address
+  t=3866333 idx=13 R val=bf          set Q6      — read the status register
+  t=3866356 idx=14 x5688  cells=19248  senseflips=32
+  t=3885610 idx=12 R val=cf          clear Q6
+  t=3885671 idx= 1 R val=b3          and round again
+```
+
+The reads at switches 1, 3, 4 and 12 are what the "forty to a hundred data
+register reads a second" were: every IWM address is a soft switch, so *setting*
+`CA0` is a read, and with `Q7:Q6` at `00` it returns the data register as a side
+effect. The ROM is not reading the disk in them and never was. The loop is
+reads of switch 14 — `Q7` off, with `Q6` already on, so the status register —
+and it ends on the **thirty-second transition** of the tachometer, every single
+time, having polled about 5,814 times to see them.
+
+**What it is doing with that** came out of the second instrument: diffing the
+whole megabyte every forty milliseconds, which is one pass of the loop. In the
+steady state exactly three things move — a 24-bit accumulator at `$07FB31`
+climbing by `$716E` a pass, a counter beside it at `$07FB37` going 3, 2, 1, 0,
+and a retry count at `$001803` walking 8, 7, 6, 5, 4 as the accumulator resets.
+That is a **speed measurement, averaged over three samples**, against a count
+that starts at eight and walks down; where it stops was not watched all the way,
+but the ROM gives up a second or so later. The tachometer is both the thing being measured and the clock the
+measurement is timed against, which is why sweeping its rate "only changed how
+long the timeout took": it changes both ends at once.
+
+**So it is a speed check with a tolerance**, and the previous session's
+retraction was half right and half wrong. The *Guide* is right that "the
+double-sided disk drives have internal speed control circuitry and do not use
+the disk-speed control signal", so the PWM bytes the ROM writes into the sound
+buffer go nowhere — but the ROM still measures, and on real hardware it passes
+because the drive's own control holds it at the right speed. Here it failed
+because the model's disk turned at the wrong speed and no amount of PWM was
+ever going to move it.
+
+**The window, measured.** Sweeping the rate the model turns at and watching for
+the ROM to leave the loop and start reading the data register in earnest — the
+metric is the longest unbroken run of data-register reads, which goes from 23
+to seventy thousand — puts the acceptance window for a twelve-sector cylinder
+at:
+
+```text
+  385.0 rpm   refused
+  386.0 rpm   read
+  ...
+  401.0 rpm   read
+  401.5 rpm   refused
+```
+
+That is two per cent either side of a centre of about 393.5, and **394 rpm** is
+the figure quoted everywhere for an 800K mechanism's outermost zone. The number
+is no longer a recollection: Apple's ROM is what says it.
+
+**And that is what the 2.5 % was.** The IWM shifts a cell every two
+microseconds in fast mode, so 500,000 cells a second, and 394 rpm on twelve
+sectors is `500000 * 60 / 394 / 12` = 6,345 cells a sector. This encoder laid
+down 6,186 — exactly as long as the sector itself, with **no gap** — so every
+cylinder was 2.5 % short and every spindle 2.5 % fast, at 404 rpm, three
+revolutions a minute outside the window. `gcr::SECTOR_CELLS` is now 6,345 and
+`Track::pad_to` fills the difference with the self-sync a formatter writes.
+
+The other four zones follow from that one number with nothing else to get
+wrong, because constant linear density is the whole point of a zoned disk:
+a cylinder is its sector count times one slot, so it turns at 394 × 12 / *n*.
+
+```text
+  zone   cylinders   sectors   cells a revolution   rpm
+    0      0 - 15       12           76,140         394.0
+    1     16 - 31       11           69,795         429.8
+    2     32 - 47       10           63,450         472.8
+    3     48 - 63        9           57,105         525.3
+    4     64 - 79        8           50,760         591.0
+```
+
+which are the speeds quoted for an 800K mechanism, arrived at rather than
+copied. **They are derived, not measured**: only zone 0's was put to the ROM,
+because a ROM that cannot boot a disk never steps off cylinder 0. Ledger item 1.
+
+### The chip named no event, so the ROM lost one byte in three
+
+Fixing the speed got the ROM into its read loop and no further: it found ten
+address-field prologues on the track and could not decode a sector out of any
+of them. Recording the bytes the data register actually handed over says why.
+Cylinder 0's first address field is eleven bytes on the medium — the `$D5 $AA
+$96` prologue, five disk bytes, the `$DE $AA` epilogue and an `$FF` — and for
+sector 0 of a double-sided disk those five are `96 96 96 d9 d9`, since
+`DISK_BYTES[0]` is `$96` and the format byte `$22` encodes as `$D9`. What the
+ROM was handed was
+
+```text
+  d5 aa 96  96 d9 d9  aa ff
+```
+
+— the prologue, and then one byte in three missing: two of the three `$96`s
+and the `$DE`.
+
+The cause is not in the disk and not in the ROM. Recording the chip's own cell
+counter against each access shows it advancing in jumps of **0, 6 or 16 cells**
+and nothing in between, where a byte is eight cells: 86 % of the ROM's polls
+saw no time pass at all and then sixteen cells went by at once, taking two
+bytes with them and leaving the second.
+
+`LazyDevice` is exact when the access can be answered at the cycle it happened,
+and §4.2 gives two ways to get there: the runnable publishes a live cursor, or
+the device **names its next internal event** so the scheduler cuts the round
+there (`Scheduler::lazy_deadline` → `natural_target`). The 68000 core does
+neither for it — `M68k::run_budget` steps instructions and touches no
+`TickCursor` — and `mac.iwm` returned `None`, on the reasoning, written into
+the source, that "naming a per-byte event would wake the scheduler fifty
+thousand times a second to compute what the next read computes anyway". The
+next read computes it *at the position the round reached*, which is the whole
+defect.
+
+So the latch is now named as what it is: an internal event, past which a read of
+the data register answers differently. `Shared::publish_latch` works out the
+cell the shifter will next complete a byte on — arithmetic, not simulation: a
+register already holding a one needs only the shifts that carry its highest one
+up to bit 7, and an empty one waits for the next one on the medium and then
+eight more cells — and publishes it in an atomic, because `next_event_tick` is
+asked under the scheduler's own leaf lock and may not take one of ours. It
+costs a round per byte, about fifty thousand a second, and only while a disk is
+actually turning under a head; the whole `mac_plus` suite still runs in about
+five seconds of wall clock in a release build.
+
+With both fixed the same field comes back whole — a later trace caught
+`d5 aa 96 96 9b 96 d9 d7 de aa`, prologue, five nibbles and epilogue, for
+whichever sector happened to be under the head — and the ROM reads the track
+and hands back blocks 0 and 1.
+
+### Two smaller defects found on the way
+
+* **A restored snapshot put the head in the wrong place.** `Iwm::load` wrote
+  the restored cell counter into the chip's state and not into the atomic the
+  scheduler reads, so a restore left `current_tick` at zero with the state
+  somewhere else entirely. It was invisible while the chip named no events; it
+  is not invisible now.
+* **`insert`, `eject` and `set_sel` changed the medium under the head without
+  saying so.** Each now goes through `Shared::invalidate`, which throws the
+  cached cylinder away *and* re-announces the next byte's cell.
+
 ### The defects this turned up
 
 * **The window fold.** Above. Fixed, and it is what put the icon on screen.
@@ -418,18 +580,38 @@ on. `src/dev/mac/iwm/tests.rs` does exactly that *through the chip* — cylinder
 `src/dev/mac/disk/tests.rs` does it for all 1,600 blocks of an 800K image
 without the chip.
 
-**What is unproven without a real 800K image** is whether Apple's ROM agrees
-with this encoder about the low-level bit assignments: which two bits of each
-byte go where in a 6-and-2 group, and which of the three sums scrambles which
-byte. The encoder and the decoder here are each other's oracle, so they would
-agree with each other even if both were wrong in the same way.
+That used to be everything, and it was not enough: the encoder and the decoder
+here are each other's oracle, so they would agree with each other even if both
+were wrong in the same way about which two bits of a byte go where in a 6-and-2
+group or about which of the three sums scrambles which byte.
 
-The ROM now gets *close enough to ask*. It probes the drive, starts the motor,
-and takes two runs at the disk before it ejects it — but in those runs it reads
-only forty to a hundred bytes a second out of the data register, where a head
-over a spinning 800K disk delivers sixty-two thousand. It is not reading the
-track — it is in the tachometer loop instead, and what that loop wants is the
-thing now standing between this board and a boot: see ledger item 1.
+**Apple's ROM now settles it.** Put an 800K image of 1,600 numbered blocks in
+the drive, leave the ROM alone for twelve virtual seconds, and **blocks 0 and 1
+of the image are sitting whole in the machine's memory** — the boot blocks,
+which is what a Macintosh reads first and all it needs in order to decide there
+is no system on the disk. Those 512 bytes cannot be there unless Apple's own
+code found the address field, found the data field, denibblized it and checked
+the patent's three-byte checksum over it.
+`tests/mac_plus.rs::the_rom_reads_a_track_and_decodes_a_sector` is the
+assertion; it names the blocks it found so a failure says *which*.
+
+The board **does not boot** and cannot without Apple system software on an
+800K image. Nothing of the kind is in this repository and nothing of the kind
+will be: the two images this was developed against are 1.44 MB and a Plus
+refuses them by name, correctly.
+
+Forging a signature is enough to watch the ROM take a disk seriously. Set bytes
+0 and 1 of block 0 to `LK` — the boot block's identifier — and the ROM stops
+ejecting: the disk stays in and the motor stays on for at least another twenty
+virtual seconds, where a disk without it is put back out at about thirteen.
+What it does with the rest of that block is somebody's operating system's
+business, so this is an observation about the read path rather than a test, and
+it is not one of them.
+
+One consequence, and it is the honest limit on the section above: the ROM only
+ever reads **cylinder 0** of a disk it cannot boot, so the four inner zones'
+rotation speeds are *derived* rather than measured. "The tachometer loop and
+the 2.5 %", above, says from what.
 
 ```sh
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
@@ -456,79 +638,19 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **What the ROM waits on after it starts the motor.** This is what stands
-   between the board and a boot, and it is the successor to "why the
-   insert-disk screen never ends" — that one is answered and fixed.
+1. **Booting one.** The board reads a disk and cannot yet start from one, and
+   the only thing missing is an 800K image with Apple system software on it.
+   That cannot come from here: the two images this was developed against are
+   1.44 MB, which a Plus refuses by name and correctly, and no byte of anybody's
+   disk goes in this repository. What *is* here is everything under it — see
+   "The tachometer loop and the 2.5 %", above, for how the last two defects in
+   the read path were found and what they were.
 
-   With the register file right the ROM probes the drive, starts the motor and
-   then spends five to six virtual seconds reading **one** status line in a
-   tight loop: the tachometer, at `CA2:CA1:CA0:SEL = 0111`, a hundred and
-   forty-seven thousand times a second, from a twelve-instruction loop at
-   `$418B0E`-`$418B36` running at interrupt level 3. Between bursts it reads
-   the data register forty to a hundred times a second — a trickle, where a
-   head over a turning 800K disk delivers sixty-two thousand. It is not reading
-   the track. After two attempts it ejects the disk and draws the cross.
-
-   What it *is* doing is not settled, and the following is the evidence rather
-   than a conclusion.
-
-   **The disk-speed PWM moves through the wait.** The low-order byte of each
-   word in the first sound buffer is the disk-speed control (the *Guide*,
-   chapter 2, "Disk-speed control"), and watching `MemTop - $300` shows it
-   going `ff ff ff …` before the motor starts, then `36 2d 2d 36 2d 36 2d 2d`,
-   then `01 20 20 20 20 01 20 20`, then flat `20`. The sound byte beside it
-   never moves, so this really is the disk half of the word.
-
-   **But that is probably not what it is waiting for**, and the same page of
-   the *Guide* is why: "The double-sided disk drives have internal speed
-   control circuitry and do not use the disk-speed control signal." On a real
-   Plus with an 800K mechanism those bytes go to a motor that ignores them, so
-   the ROM writing them is housekeeping rather than a servo waiting to
-   converge. Recording it because it is the obvious reading and it is wrong.
-
-   **The tachometer rate is not the answer either.** The model turns track 0 at
-   404 rpm; a sweep of the apparent rate from 101 rpm to 1,616 rpm — including
-   394, which is the figure quoted for a real outer zone — changes only how
-   long the timeout takes, because the timeout is counted in tachometer
-   transitions. At no rate does the ROM read more than about eighty-five bytes
-   a second.
-
-   **Things that changed nothing**, each measured rather than argued: telling
-   it the drive is single-sided ("number of sides" low); driving the
-   unassigned `CA2:CA1:CA0 = 101` line low; holding "disk ready for reading"
-   high, which it does not read at this stage at all.
-
-   So the question for the next person is narrow and well posed: **what is the
-   loop at `$418B0E` waiting for?** It reads the tachometer and nothing else,
-   at interrupt level 3, and gives up after a fixed number of transitions. Two
-   instruments that have not been tried on it: a per-access record of how many
-   tachometer polls separate one data-register read from the next — which would
-   say whether the loop is timing the data or timing the spindle — and a watch
-   on the low-memory bytes the loop writes, the way the PWM buffer was found.
-
-   Separately, and true whatever the loop turns out to want: **this board's
-   cylinders are the wrong length.** A cylinder here is exactly as long as the
-   sectors on it — `src/dev/mac/gcr.rs` lays down twelve sectors of 6,186 bit
-   cells and stops — with no trailing gap before sector 0 comes round again,
-   which a real formatter leaves. So this disk's revolution is 74,232 cells and its rotation
-   rate is whatever that works out at against the bit clock, rather than the
-   drive's actual speed.
-
-   **Doing that needs a source this board does not yet have.** The zone
-   rotation speeds for an Apple 800K mechanism are quoted in various places as
-   394, 429, 472, 525 and 590 rpm, and at 500 kbit/s those give revolutions of
-   76,142 / 69,930 / 63,559 / 57,143 / 50,847 cells — each about 2.5 % longer
-   than what this encoder produces, which is a suspiciously consistent gap and
-   is the right shape for an answer. But chapter 9 of the *Guide* does not give
-   those figures and neither does Apple's IWM note, and writing a table of five
-   numbers into `gcr.rs` on the strength of recollection is **exactly** the
-   mistake that cost this board the drive's register file. Find the figures in
-   a document first — and while looking, settle the bit rate too: the machine
-   file uses 500,000 cells a second, which is the IWM's documented 2 µs cell
-   time for a 3.5-inch drive, but the figure quoted for the Macintosh's
-   *sustained* rate is 489.6 kbit/s and the difference is 2.1 %, the same order
-   as everything else here. Until then the tachometer reports the rotation the
-   model actually has, which is at least not a lie.
+   The next thing a person with a real 800K system disk would find out is
+   whether the **inner zones** turn at the right speed. Cylinder 0's rotation
+   is measured against the ROM; the other four are derived from it, and a ROM
+   that cannot boot never steps off cylinder 0, so nothing has exercised them
+   against Apple's code. A disk that boots would.
 2. **The mouse.** Now buildable: a carrier-detect transition no longer locks
    the machine up, `MTemp` at `$828` moves on both axes — `(15,15)` to
    `(15,14)` for channel A and to `(16,15)` for channel B — and the machine
@@ -547,16 +669,16 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
    nothing turns a keysym into one. Figure 7-6 has the table; the OCR of it in
    circulation is not reliable enough to transcribe and it wants a clean scan.
 6. **The sound**, the last thing on the board with nothing behind it. The
-   buffer it would read is also where the ROM writes the disk-speed byte, so a
-   `mac.sound` would put an instrument on ledger item 1 as well as make a
-   noise.
+   buffer it would read is also where the ROM writes the disk-speed byte —
+   which goes nowhere on an 800K mechanism, so a `mac.sound` would now be for
+   the noise rather than for the instrument.
 
 ## How the ambiguities were settled
 
 Black-box tracing, which is the tool `CLAUDE.md` names and the only one
 available: which addresses the ROM touches, in what order, what it writes, what
-it reads back, what it waits on. Five things came out of it that no document
-stated plainly.
+it reads back, what it waits on. Everything below came out of it, and no
+document states any of it plainly.
 
 * **The clock chip's whole command encoding.** The Guide gives the three wires
   and sends the reader to *Inside Macintosh* for the rest, which is not a
@@ -614,6 +736,19 @@ stated plainly.
   lock-up was invisible to every register-level test because every register was
   right. A device that publishes through a wire needs at least one test that
   reads the wire.
+* **What the ROM *accepts*, swept finely.** The spindle speed was settled by
+  running the machine at one rate after another and watching a single number —
+  the longest unbroken run of data-register reads — go from 23 to seventy
+  thousand. A previous sweep of the same parameter found nothing because it
+  doubled each time and the window it was looking for is four per cent wide.
+  When a ROM is checking a quantity against a tolerance, the step size is the
+  experiment.
+* **Collapse the trace before reading it.** Half a million register accesses is
+  not a trace anybody can read. Folding runs of the same switch into one line
+  with a count, a cell span and how many times the sensed bit flipped turned
+  the tachometer storm into eight lines that said what the loop was — and the
+  five accesses on either side of it, which had been dismissed as "a trickle of
+  data-register reads", turned out to be the loop setting up the `CA` lines.
 
 ## Running it
 

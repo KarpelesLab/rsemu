@@ -14,11 +14,12 @@
 # in the middle of the screen, with the 60.15 Hz tick chain running. From about
 # thirteen seconds on the icon **blinks** and the ROM polls the drive's
 # disk-in-place line six to eight times a second; with an 800K image in the
-# drive it spins the motor up, takes two runs at reading it and then puts it
-# back out with the unreadable-disk cross. What it does not do yet is get a
-# track off the disk - `docs/platforms/mac-plus.md` has the ledger of what is
-# missing and of what has been ruled out. The picture reaches a person through
-# `--vnc`, which serves the video circuit's scanout.
+# drive it spins the motor up, **reads the track**, decodes the two boot
+# blocks off it, finds no system on them and puts the disk back out. What it
+# cannot do yet is boot, which wants Apple system software on the image -
+# `docs/platforms/mac-plus.md` has the ledger of what is missing and of what is
+# ruled out. The picture reaches a person through `--vnc`, which serves the
+# video circuit's scanout.
 #
 # Written from *Guide to the Macintosh Family Hardware* (Apple Computer, 2nd
 # edition) - chapter 3 for the address map, the overlay and the clock chip,
@@ -182,6 +183,15 @@ machine "mac-plus" {
   # rate a disk was written at is a property of the disk, not of the computer
   # reading it - and routing it through the 15.6672 MHz tree would be an
   # inexact ratio pretending to be an exact one (ROADMAP.md 4.2).
+  #
+  # **How fast the disk turns is not this number.** It is this number divided
+  # by how many cells a cylinder is round, and a cylinder is
+  # `gcr::SECTOR_CELLS` per sector: 394 rpm on a twelve-sector outer cylinder,
+  # 591 on an eight-sector inner one. A Macintosh Plus ROM checks the spindle
+  # speed against the drive's tachometer before it will read a byte and refuses
+  # anything outside 386 to 401 rpm on the outer zone, so a cylinder of the
+  # wrong length is the same thing as an unreadable disk. `src/dev/mac/gcr.rs`
+  # carries that measurement.
   #
   # `image` names the `floppy` media slot: `--floppy disk.dsk` or
   # `--media floppy=disk.dsk`, a raw 400K/800K image or a DiskCopy 4.2

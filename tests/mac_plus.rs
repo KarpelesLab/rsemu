@@ -36,9 +36,12 @@
 //!
 //! From about thirteen seconds on the icon **blinks** and the ROM polls the
 //! drive's disk-in-place line six to eight times a second. Put an 800K image
-//! in the drive and it starts the motor, tries to read the disk, and puts it
-//! back out when there is no system on it. `docs/platforms/mac-plus.md` has
-//! the whole ledger, including what is still open and how it was measured.
+//! in the drive and it starts the motor, **reads the track**, decodes the two
+//! boot blocks out of it, finds no system on them and puts the disk back out.
+//! `the_rom_reads_a_track_and_decodes_a_sector` is the assertion that Apple's
+//! own code agrees with this encoder about the low-level format, and
+//! `docs/platforms/mac-plus.md` has the whole ledger, including what is still
+//! open and how it was measured.
 //!
 //! # The ROM file
 //!
@@ -415,18 +418,94 @@ fn the_rom_sizes_a_four_megabyte_board_and_moves_its_screen() {
 
 /// A synthetic 800K disk: every block says which block it is, so nothing of
 /// anybody's is needed and nothing of anybody's is committed.
+///
+/// The block number goes in the first four bytes so that a block found in
+/// guest memory can be *named*, and the rest is a fill keyed on it so that no
+/// two blocks are alike. There is no system on it and no boot block, which is
+/// why the ROM puts it back out again.
 fn synthetic_800k() -> Vec<u8> {
     let mut image = vec![0u8; 819_200];
     for (block, chunk) in image.chunks_mut(512).enumerate() {
-        for (i, byte) in chunk.iter_mut().enumerate() {
+        chunk[..4].copy_from_slice(&(block as u32).to_be_bytes());
+        for (i, byte) in chunk.iter_mut().enumerate().skip(4) {
             *byte = (block as u8).wrapping_mul(7).wrapping_add(i as u8);
         }
     }
     image
 }
 
-/// **The ROM spins the drive up and tries to read it**, and when what is in
-/// there is not a system disk it puts it back out and goes on asking.
+/// Which blocks of `image` are sitting whole in the machine's memory.
+///
+/// Every block of [`synthetic_800k`] begins with its own number, so a
+/// candidate is found by that longword and then confirmed against all 512
+/// bytes — nothing is claimed on four bytes alone.
+fn blocks_in_memory(b: &Board, image: &[u8]) -> Vec<u32> {
+    let space = b.machine.space("mem").expect("the board has `mem`");
+    let size = 0x10_0000usize;
+    let mut ram = vec![0u8; size];
+    for (a, byte) in ram.iter_mut().enumerate() {
+        *byte = space
+            .read(a as u64, Width::U8, MemAttrs::DEBUG)
+            .unwrap_or(0) as u8;
+    }
+    let blocks = (image.len() / 512) as u32;
+    let mut found = Vec::new();
+    for at in 0..ram.len().saturating_sub(512) {
+        let n = u32::from_be_bytes([ram[at], ram[at + 1], ram[at + 2], ram[at + 3]]);
+        if n >= blocks {
+            continue;
+        }
+        let want = &image[n as usize * 512..(n as usize + 1) * 512];
+        if &ram[at..at + 512] == want && !found.contains(&n) {
+            found.push(n);
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// **Apple's ROM reads a track this encoder wrote and decodes sectors out of
+/// it**, and that is the only thing that can settle the low-level format.
+///
+/// `src/dev/mac/gcr.rs` and its decoder are each other's oracle: they would
+/// agree with each other about which two bits of a byte go where in a 6-and-2
+/// group, and about which of the three sums scrambles which byte, even if both
+/// were wrong in the same way. A real ROM would not. So the disk goes in as
+/// 1,600 numbered blocks, the ROM is left to read it, and the assertion is
+/// that **the 512 bytes of a block of the image turn up whole in the
+/// machine's memory** — which cannot happen unless Apple's own code found the
+/// address field, found the data field, denibblized it, and checked the
+/// patent's three-byte checksum over it.
+///
+/// It reads **blocks 0 and 1**: the boot blocks, which is what a Macintosh
+/// reads first and all it needs to read to decide this disk has no system on
+/// it.
+///
+/// This was ledger item 1 and it needed two things. The cylinders were 2.5 %
+/// short, so the spindle turned 2.5 % fast and the ROM's own speed check threw
+/// the disk out before it would read a byte (`gcr::SECTOR_CELLS`); and the
+/// chip named no event, so a scheduler round ran on past a byte boundary and
+/// the ROM was handed one byte in three (`Iwm::next_event_tick`).
+/// `docs/platforms/mac-plus.md` has both measurements.
+#[test]
+fn the_rom_reads_a_track_and_decodes_a_sector() {
+    let Some(image) = rom_image("Mac-Plus.ROM") else {
+        return;
+    };
+    let disk = synthetic_800k();
+    let mut b = board_with_disk(image, &[], disk.clone());
+    advance(&mut b, "mac-plus-read", 12);
+    let found = blocks_in_memory(&b, &disk);
+    println!("mac-plus: blocks of the image found whole in memory: {found:?}");
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    assert!(
+        found.contains(&0) && found.contains(&1),
+        "the ROM did not decode the two boot blocks off the disk; it found {found:?}"
+    );
+}
+
+/// **The ROM spins the drive up and reads it**, and when what is on it is not
+/// a system disk it puts it back out and goes on asking.
 ///
 /// This is what the drive-register table being right buys, and it is the
 /// assertion that would fail if it went wrong again: the ROM tests the
@@ -437,6 +516,13 @@ fn synthetic_800k() -> Vec<u8> {
 /// The disk here is 800K of numbered blocks — no boot blocks, no System file —
 /// so being put back out is the right answer. What is asserted is the
 /// *mechanism*: the motor turned, and the disk came out again.
+///
+/// It used to come out with the **cross** through it, the unreadable-disk
+/// icon, because the ROM could not get a track off it. It now comes out with
+/// the blinking question mark, which is a disk that was read and had no system
+/// on it — a different picture for a different reason.
+/// `the_rom_reads_a_track_and_decodes_a_sector` is the one that asserts the
+/// reading.
 #[test]
 fn the_rom_spins_the_drive_up_and_rejects_a_disk_with_no_system_on_it() {
     let Some(image) = rom_image("Mac-Plus.ROM") else {
