@@ -551,11 +551,16 @@ Point it at a real Plus ROM and it chimes, sizes its megabyte, runs its memory
 test, finds its clock chip's battery flat and writes twenty bytes of parameter
 RAM back, finishes the keyboard's Model Number handshake and settles into
 asking it for a key every quarter second, draws the **grey Macintosh desktop
-with the arrow cursor**, and puts the **insert-disk icon** in the middle of it,
-with the 60.15 Hz tick chain running and nothing faulting. The drive reads: an
-image becomes cylinders of 6-and-2 GCR bit cells and the IWM shifts them past
-its head, which `src/dev/mac/iwm/tests.rs` checks through the chip. What it
-does **not** do yet is notice a disk once one is there.
+with the arrow cursor**, and puts the **blinking insert-disk icon** in the
+middle of it, with the 60.15 Hz tick chain running and nothing faulting — and
+from there it **polls the drive** six to eight times a second, which is the
+loop that notices a disk. Put an 800K image in and it starts the motor, takes
+two runs at reading it and puts it back out with the unreadable-disk cross. The
+drive reads: an image becomes cylinders of 6-and-2 GCR bit cells and the IWM
+shifts them past its head, which `src/dev/mac/iwm/tests.rs` checks through the
+chip. What it does **not** do yet is get a track off a disk with the ROM
+driving — the ROM runs the 400K drive's speed servo against a mechanism whose
+speed nothing here changes, and never converges.
 `docs/platforms/mac-plus.md` has the ledger and the black-box traces that got
 it this far — including the one that found the ROM drawing that icon through a
 pointer near the top of the four-megabyte window, which is how it was settled
