@@ -293,7 +293,7 @@ Two tests hold it:
   reads `$D010` four times through the console and asserts `$D011` still has its
   flag — then reads `$D010` once with ordinary attributes and asserts the flag
   clears, so the first half is about a bit that really would have moved.
-* `looking_at_a_machine_does_not_change_it` (`tests/cli_monitor.rs`) runs sixteen
+* `looking_at_a_machine_does_not_change_it` (`tests/cli_monitor.rs`) runs fifteen
   commands' worth of inspection between two `hash` commands and asserts the two
   numbers are identical — with `a_write_through_the_console_does_change_it`
   beside it, so the assertion is not about a number that never moves.
