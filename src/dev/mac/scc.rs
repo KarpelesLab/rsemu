@@ -50,6 +50,23 @@
 //!   write registers read back where the manual says they are.
 //! * **`DCD` external/status interrupts**, which is the mouse path.
 //!
+//! # `/INT` is a pin, and the pin is what matters
+//!
+//! The chip pulls `/INT` when a channel has an interrupt pending, that
+//! channel's `WR1` enables the condition, **and** `WR9`'s Master Interrupt
+//! Enable is set. All three, and `WR9` is the one register the two channels
+//! share, so MIE is a property of the chip rather than of a channel.
+//!
+//! Software lets go of it by writing `Reset Ext/Status Interrupts` — command 2
+//! in bits 5-3 of a control write with the register pointer at zero. That
+//! command has to move the *wire*, not just the state behind it. It did not
+//! once, and the cost was the whole machine: a Macintosh runs `/INT` straight
+//! into `IPL1`, so a handler that did everything the manual asks returned to
+//! an interrupt that was still there and was entered again, for ever, the
+//! first time anything moved a carrier detect. Every path out of
+//! `Shared::write` ends at `Shared::refresh` for that reason, and
+//! `src/dev/mac/scc/tests.rs` watches the net rather than the registers.
+//!
 //! **Not modelled**: any actual serial traffic, the baud-rate generator, the
 //! DPLL, SDLC, and `/WREQ` — a Macintosh wires that last to the VIA's `PA7`,
 //! and with no DMA and no transmission in progress it sits where the VIA's
@@ -106,6 +123,9 @@ const WR1_EXT_IE: u8 = 1 << 0;
 const WR15_DCD_IE: u8 = 1 << 3;
 /// `WR9` bit 1: the interrupt vector includes a status code.
 const WR9_VIS: u8 = 1 << 1;
+/// `WR9` bit 3: the master interrupt enable. With it clear the chip keeps its
+/// interrupt-pending bits but never pulls `/INT`.
+const WR9_MIE: u8 = 1 << 3;
 /// `WR9` bit 4: the status code occupies bits 6-4 rather than 3-1.
 const WR9_STATUS_HIGH: u8 = 1 << 4;
 /// `WR9` bits 7-6: the reset command.
@@ -179,6 +199,16 @@ impl State {
         self.ch[0].asserting() || self.ch[1].asserting()
     }
 
+    /// Whether `/INT` is pulled.
+    ///
+    /// The manual gates the pin on `WR9`'s Master Interrupt Enable, and that
+    /// bit is *not* per channel — `WR9` is the one register both channels
+    /// share. An interrupt-pending bit still sets and `RR3` still shows it;
+    /// what MIE decides is whether the chip asks anyone.
+    fn irq(&self) -> bool {
+        self.ch[0].wr[9] & WR9_MIE != 0 && self.asserting()
+    }
+
     /// The vector `RR2` returns on channel B, modified by status when `WR9`
     /// says to.
     ///
@@ -236,7 +266,7 @@ impl core::fmt::Debug for Shared {
 impl Shared {
     /// Drive `/INT` to whatever the state now says, with no lock held.
     fn refresh(&self) {
-        let asserting = self.state.lock().asserting();
+        let asserting = self.state.lock().irq();
         let out = self.out.lock().clone();
         if let Some(src) = &out {
             src.set(Level::from(asserting));
@@ -321,65 +351,80 @@ impl Shared {
         value
     }
 
-    /// One write, decoded. Returns whether `/INT` may have moved.
+    /// One write, decoded.
+    ///
+    /// **Every** path out of the critical section falls through to
+    /// [`Shared::refresh`], and that is not tidiness. A `Reset Ext/Status
+    /// Interrupts` command is a *control* write with the pointer at zero, so
+    /// an early `return` from that branch left the chip's own state saying it
+    /// had stopped asking while `/INT` stayed where it was — and a Macintosh
+    /// wires `/INT` straight to `IPL1`, so the processor re-entered the
+    /// handler for ever, having done everything the manual asks of it. That
+    /// is what a carrier-detect transition used to do to this board
+    /// (`docs/platforms/mac-plus.md`).
     fn write(&self, c: usize, data: bool, value: u8) {
         {
             let mut state = self.state.lock();
-            if data {
-                // A character handed to a transmitter nothing is listening to.
-                // It leaves immediately, which is why `RR0` never clears its
-                // Tx Buffer Empty bit.
-                state.ch[c].wr[8] = value;
-                return;
-            }
-            let pointer = state.pointer;
-            if pointer == 0 {
-                // The manual: with the pointer at zero, bits 2-0 are the next
-                // register, and bits 5-3 a command. `Point High` (command 1)
-                // adds eight.
-                let command = (value >> 3) & 7;
-                let mut next = value & 7;
-                if command == 1 {
-                    next += 8;
-                }
-                state.pointer = next;
-                match command {
-                    // "Reset Ext/Status Interrupts": unlatch `RR0` and drop
-                    // the pending bit.
-                    2 => {
-                        state.ch[c].dcd_latched = state.ch[c].dcd;
-                        state.ch[c].ext_ip = false;
-                    }
-                    // "Reset Highest IUS" — nothing here nests, so it is the
-                    // same as clearing this channel's pending bit.
-                    5 => state.ch[c].ext_ip = false,
-                    _ => {}
-                }
-                return;
-            }
-            state.pointer = 0;
-            state.ch[c].wr[pointer as usize] = value;
-            if pointer == 9 {
-                // `WR9` is the one register both channels share, and its top
-                // two bits are the reset command.
-                state.ch[0].wr[9] = value;
-                state.ch[1].wr[9] = value;
-                match value & WR9_RESET {
-                    0x40 => reset_channel(&mut state.ch[1]),
-                    0x80 => reset_channel(&mut state.ch[0]),
-                    0xc0 => {
-                        let dcd = [state.ch[0].dcd, state.ch[1].dcd];
-                        *state = State::fresh();
-                        for (ch, level) in state.ch.iter_mut().zip(dcd) {
-                            ch.dcd = level;
-                            ch.dcd_latched = level;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            self.write_locked(&mut state, c, data, value);
         }
         self.refresh();
+    }
+
+    /// The register side of [`Shared::write`], with the lock held.
+    fn write_locked(&self, state: &mut State, c: usize, data: bool, value: u8) {
+        if data {
+            // A character handed to a transmitter nothing is listening to.
+            // It leaves immediately, which is why `RR0` never clears its
+            // Tx Buffer Empty bit.
+            state.ch[c].wr[8] = value;
+            return;
+        }
+        let pointer = state.pointer;
+        if pointer == 0 {
+            // The manual: with the pointer at zero, bits 2-0 are the next
+            // register, and bits 5-3 a command. `Point High` (command 1)
+            // adds eight.
+            let command = (value >> 3) & 7;
+            let mut next = value & 7;
+            if command == 1 {
+                next += 8;
+            }
+            state.pointer = next;
+            match command {
+                // "Reset Ext/Status Interrupts": unlatch `RR0` and drop
+                // the pending bit.
+                2 => {
+                    state.ch[c].dcd_latched = state.ch[c].dcd;
+                    state.ch[c].ext_ip = false;
+                }
+                // "Reset Highest IUS" — nothing here nests, so it is the
+                // same as clearing this channel's pending bit.
+                5 => state.ch[c].ext_ip = false,
+                _ => {}
+            }
+            return;
+        }
+        state.pointer = 0;
+        state.ch[c].wr[pointer as usize] = value;
+        if pointer == 9 {
+            // `WR9` is the one register both channels share, and its top
+            // two bits are the reset command.
+            state.ch[0].wr[9] = value;
+            state.ch[1].wr[9] = value;
+            match value & WR9_RESET {
+                0x40 => reset_channel(&mut state.ch[1]),
+                0x80 => reset_channel(&mut state.ch[0]),
+                0xc0 => {
+                    let dcd = [state.ch[0].dcd, state.ch[1].dcd];
+                    *state = State::fresh();
+                    for (ch, level) in state.ch.iter_mut().zip(dcd) {
+                        ch.dcd = level;
+                        ch.dcd_latched = level;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -496,9 +541,15 @@ impl Scc {
     }
 
     /// Whether the chip is asserting its interrupt output.
+    ///
+    /// This is the **pin**, which is `WR9`'s Master Interrupt Enable and the
+    /// pending bits together — not just the pending bits. A test that asks
+    /// the state instead of the pin cannot see the defect that made a
+    /// carrier-detect transition lock a Macintosh Plus up, because the state
+    /// was right the whole time and the wire was not.
     #[must_use]
     pub fn irq(&self) -> bool {
-        self.shared.state.lock().asserting()
+        self.shared.state.lock().irq()
     }
 
     /// The register pointer, which the whole chip shares.

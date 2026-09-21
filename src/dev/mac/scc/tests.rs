@@ -109,17 +109,26 @@ fn the_status_register_reports_an_idle_transmitter() {
     assert_eq!(scc.peek(A, true), 0, "and nothing ever arrives");
 }
 
+/// Arm a channel the way a Macintosh Plus ROM leaves the chip: `WR15 = $08`
+/// so a `DCD` transition counts as an external status change, `WR1 = $01` so
+/// the channel asks for one, and `WR9 = $0A` so the chip is allowed to pull
+/// `/INT` at all.
+fn arm(scc: &Scc, c: usize) {
+    scc.poke(c, false, 0x08 | 7); // point high, 7 -> WR15
+    scc.poke(c, false, WR15_DCD_IE);
+    scc.poke(c, false, 1);
+    scc.poke(c, false, WR1_EXT_IE);
+    scc.poke(c, false, 0x08 | 1); // point high, 1 -> WR9
+    scc.poke(c, false, WR9_MIE | WR9_VIS);
+}
+
 /// A carrier-detect transition is an external status change: it latches `RR0`
-/// and raises the interrupt while `WR15` and `WR1` enable it, and `Reset
-/// Ext/Status Interrupts` releases both.
+/// and raises the interrupt while `WR15`, `WR1` and `WR9` enable it, and
+/// `Reset Ext/Status Interrupts` releases both.
 #[test]
 fn a_carrier_transition_raises_an_external_status_interrupt() {
     let scc = Scc::build();
-    // WR15 bit 3, then WR1 bit 0.
-    scc.poke(A, false, 0x08 | 7); // point high, 7 -> WR15
-    scc.poke(A, false, WR15_DCD_IE);
-    scc.poke(A, false, 1);
-    scc.poke(A, false, WR1_EXT_IE);
+    arm(&scc, A);
     assert!(!scc.irq());
 
     scc.set_dcd(A, false); // the far end asserts /DCD
@@ -131,6 +140,78 @@ fn a_carrier_transition_raises_an_external_status_interrupt() {
 
     scc.poke(A, false, 2 << 3); // Reset Ext/Status Interrupts
     assert!(!scc.irq());
+}
+
+/// **The `/INT` pin follows the reset command, not only the state behind it.**
+///
+/// This is the regression for the defect that locked a Macintosh Plus up the
+/// moment anything drove a carrier detect: `Reset Ext/Status Interrupts` is a
+/// control write with the register pointer at zero, and that branch of the
+/// write path returned before the chip re-announced its output. Every
+/// register the ROM could read said the interrupt was gone; the wire into
+/// `IPL1` still said it was there, so the handler ran, did exactly what the
+/// manual asks, returned, and was entered again for ever.
+///
+/// So this test watches the **net**, which is the only place the fault was
+/// visible. `Scc::irq` reads the same thing now, but a device that publishes
+/// its output through a wire is only correct if the wire moves.
+#[test]
+fn the_interrupt_pin_drops_when_the_reset_command_is_written() {
+    let scc = Scc::build();
+    let ids = crate::core::wire::WireIdAllocator::new();
+    let id = ids.alloc();
+    let wire = crate::core::wire::Wire::builder().source(id).build_shared();
+    Device::connect(
+        &scc,
+        IRQ_PIN,
+        WireSource::new(alloc::sync::Arc::clone(&wire), id),
+    )
+    .expect("the chip has an `irq` output");
+    assert_eq!(
+        wire.level_of(id).expect("the source is on the net"),
+        Level::Low,
+        "nothing is asking yet"
+    );
+
+    arm(&scc, B);
+    scc.set_dcd(B, false);
+    assert_eq!(
+        wire.level_of(id).expect("the source is on the net"),
+        Level::High,
+        "a carrier change pulls /INT"
+    );
+
+    // Exactly what the ROM's handler does: read RR0, then issue command 2.
+    let rr0 = scc.peek(B, false);
+    assert_eq!(rr0 & RR0_DCD, RR0_DCD, "RR0 latched the new level");
+    scc.poke(B, false, 2 << 3);
+    assert_eq!(
+        wire.level_of(id).expect("the source is on the net"),
+        Level::Low,
+        "and /INT lets go, or the processor never leaves the handler"
+    );
+}
+
+/// `WR9`'s Master Interrupt Enable gates the pin and nothing else: with it
+/// clear the pending bit still sets and `RR3` still shows it, but the chip
+/// does not ask.
+#[test]
+fn the_master_interrupt_enable_gates_the_pin() {
+    let scc = Scc::build();
+    // Everything but `WR9`.
+    scc.poke(A, false, 0x08 | 7);
+    scc.poke(A, false, WR15_DCD_IE);
+    scc.poke(A, false, 1);
+    scc.poke(A, false, WR1_EXT_IE);
+
+    scc.set_dcd(A, false);
+    assert!(!scc.irq(), "MIE is clear, so /INT stays put");
+    scc.poke(A, false, 3);
+    assert_eq!(scc.peek(A, false), 1 << 3, "but the pending bit is set");
+
+    scc.poke(A, false, 0x08 | 1); // point high, 1 -> WR9
+    scc.poke(A, false, WR9_MIE);
+    assert!(scc.irq(), "and enabling it asks straight away");
 }
 
 /// `RR2` read on channel B carries the status code; on channel A it is the
