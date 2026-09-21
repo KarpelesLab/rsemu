@@ -1015,17 +1015,80 @@ the keyboard goes on delivering those three a byte-time apart, which
 `tests/pc_at_kbc_irq.rs` asserts by draining the original and the restored
 machine and comparing the sequences.
 
+## An I/O BAR that decodes, and the ordering problem it was blocked on
+
+This section used to be a bullet under *what is known to be missing*. The
+register was complete — firmware could size and place one — and `Bars::install`
+refused to map it, with an error saying why. The reason is worth keeping even
+though the refusal is gone, because it is the sharpest instance of the
+re-entrancy contract this tree has.
+
+**The ordering problem.** A configuration write on this board is an `OUT` to
+`0xcfc`. It travels through the I/O space, so that space's topology lock is
+already held *for reading* by the access in flight, with the processor's
+`BUS`-ranked execution mutex above it. An I/O base address register moves a
+window **in that same space**. So:
+
+- `AddressSpace::topology`, the blocking write guard, is `TOPOLOGY` acquired
+  while `TOPOLOGY` is held — `core::sync`'s ladder panics on it in a debug build
+  and the `single` backend's lock deadlocks on it in a release one;
+- `AddressSpace::try_topology`, which is order-exempt because a try-lock cannot
+  join a deadlock cycle, is safe to *call* and cannot *succeed*: a write guard
+  is not available while a read guard is alive;
+- and "retry at the next configuration access" — which is what rescues a
+  **memory** BAR on this board, since that access is in the other space — never
+  lands, because the next configuration access is another `OUT` to `0xcfc`.
+
+That is the same dead end a q35's ECAM produces for a memory BAR, arrived at
+from the opposite side. What decides is not the kind of register but whether the
+access and the window are in the same space, and `docs/buses/pci.md` has the
+two-by-two table.
+
+**The escape.** The deferred action the contract names, and the one the fabric
+already had for q35: the function reports `PciFunction::retopology_owed`,
+`PciBus` keeps a lock-free flag saying something on the fabric owes a
+retopology, and a device with a clock domain drains it from `Device::advance_to`
+— which the run loop calls with no access in flight, the one moment a topology
+guard is actually available. On a q35 that device is the (G)MCH. On this board
+it is now `pc.pmc`, which takes the front-side bus as its clock domain for that
+reason and no other: it counts nothing, `next_event_tick` returns `None` unless
+something is owed, and an idle bridge costs the scheduler nothing.
+
+**What a guest sees in between.** The configuration write completes — it is not
+retried and not faulted — and the register reads back the new value at once. The
+window stays at its old address until the drain runs, up to the remainder of the
+scheduler round. The old mapping is never torn down before the new one is put
+in, so there is no instant at which neither base decodes. A second write
+arriving before the drain does not queue: what is deferred is "make the map
+agree with the registers", so two moves in one round collapse into one
+retopology at the second base and the intermediate base never decodes at all.
+This is honestly *not* what hardware does, and the only thing that would close
+the gap is a deferred queue on the access path, which `core::space` describes
+and nothing in this tree provides.
+
+**What exercises it.** `pc.ide-pci` (`src/dev/pc/idepci.rs`): a PCI IDE
+controller in **native mode**, class `01h`/`01h` with programming interface
+`05h`, whose four base address registers name each channel's command block (8
+bytes) and control block (4 bytes, with the Device Control / Alternate Status
+register at offset 2, per the *PCI IDE Controller Specification* revision 1.0).
+It contains no ATA: it hands `pc.ide`'s own two regions to base address
+registers instead of to a `map` statement, which is the whole of what native
+mode means. It is not on the shipped board — a 1984-lineage AT's IDE ports are
+at `0x1f0` and `0x3f6` by definition — but `tests/pc_at_io_bar.rs` builds a
+`pc-at` with the secondary channel taken off the fixed decoder and put behind
+one, and a boot sector then finds it with `INT 1Ah AX=B103h`, sizes and places
+its register with `B10Ah`/`B10Dh`, polls until the window appears, drives the
+drive at the address it chose, **moves the register**, and drives it again at
+the new one.
+
 ## What is known to be missing
 
-- **PCI I/O BARs that decode.** The register is complete — firmware can size
-  and place one — but `Bars::install` refuses to *map* one, and says why: a
-  configuration cycle travels through the I/O space, so the order-exempt
-  try-lock that makes a memory BAR move from inside a configuration write
-  cannot help there. Nothing in the tree has an I/O BAR yet, so the deferred
-  action that would be the escape is not written on a guess.
-- **Everything else on the bus.** A host bridge and a display adapter. No
-  south bridge, so no PCI IDE, no PCI interrupt routing and no `PIRQ` swizzle;
-  no bridges, so no bus but bus 0.
+- **Everything else on the bus.** A host bridge, a display adapter, and — if a
+  machine file asks for one — a native-mode IDE controller. No south bridge, so
+  no PCI interrupt routing and no `PIRQ` swizzle; no bridges, so no bus but bus
+  0. The IDE function's channels therefore still reach the 8259A by a board
+  wire rather than over `INTA#`, and its Interrupt Pin register reads zero,
+  which is Rev 2.1 §6.2.4's own encoding for a function with no pin.
 - **`0x510`/`0x511`.** A firmware built for another emulator reads its whole
   configuration — memory map, boot order, SMBIOS and ACPI tables — from a
   paravirtual interface at those ports. Its strings show it *detects* the

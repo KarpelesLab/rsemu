@@ -120,6 +120,10 @@ pub mod fdc;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-ide")))]
 pub mod ide;
 
+#[cfg(feature = "dev-pc-ide-pci")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-ide-pci")))]
+pub mod idepci;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -192,6 +196,8 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     fdc::register(reg)?;
     #[cfg(feature = "dev-pc-ide")]
     ide::register(reg)?;
+    #[cfg(feature = "dev-pc-ide-pci")]
+    idepci::register(reg)?;
     Ok(())
 }
 
@@ -228,6 +234,8 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
     fdc::bind(b)?;
     #[cfg(feature = "dev-pc-ide")]
     ide::bind(b)?;
+    #[cfg(feature = "dev-pc-ide-pci")]
+    idepci::bind(b)?;
     Ok(())
 }
 
@@ -264,6 +272,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(fdc::schema());
     #[cfg(feature = "dev-pc-ide")]
     out.push(ide::schema());
+    #[cfg(feature = "dev-pc-ide-pci")]
+    out.push(idepci::schema());
     out
 }
 

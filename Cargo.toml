@@ -2446,6 +2446,26 @@ media-adf = ["std", "dep:fstool"]
 # it is that board's decode.
 dev-pc-ide = ["dev-pc", "dev-ata-disk"]
 
+# The same IDE channel behind a **PCI function in native mode**
+# (src/dev/pc/idepci.rs): base address registers 0-3 name each channel's
+# command and control blocks instead of the board's decoder fixing them at
+# 0x1f0/0x3f6, and firmware puts them wherever it likes. The class code is
+# 01h/01h with programming interface 05h -- native on both channels, switchable
+# on neither, no bus master -- per PCI Local Bus Specification Rev 2.1 Appendix
+# D, and the control block's window is four bytes with the register at offset 2
+# per the PCI IDE Controller Specification revision 1.0. There is no ATA in the
+# file: it hands `dev-pc-ide`'s own two regions to base address registers
+# instead of to a `map` statement.
+#
+# It is also **the tree's first I/O base address register**, which is the
+# interesting part: moving one moves a window in the very space the `OUT` to
+# 0xcfc that moves it is travelling through, so the order-exempt try-lock cannot
+# succeed and the retry cannot be another configuration cycle. What places the
+# window is the host bridge's scheduler drain (src/dev/pc/pmc.rs), and
+# src/bus/pci/bar.rs carries the argument. Needs `dev-pc-ide` for the channel
+# and `bus-pci` for the function. Adds no dependencies.
+dev-pc-ide-pci = ["dev-pc-ide", "bus-pci", "dev-pc-pci"]
+
 # A Serial ATA host bus adapter as a PCI function (src/dev/ahci): the AHCI
 # 1.3.1 register block behind ABAR (base address register five), and -- the
 # part that matters -- a **bus master** that reads its own work out of guest
