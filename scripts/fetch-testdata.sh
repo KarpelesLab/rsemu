@@ -104,6 +104,7 @@ readonly LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/instal
 # in it, and supplying one would mean unpacking a libc too.
 readonly BUSYBOX_DEB="https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b8_riscv64.deb"
 readonly BUSYBOX_DEB_SHA="1a41dc2cb6c45f2d9a3dd1dcd027d888400c8f51e958a9b9b9fd2922f8735b86"
+readonly BUSYBOX_DEB_SNAPSHOT="06ae0fe7afc78c92404777da475eda8b492da647"
 readonly BUSYBOX_MEMBER="./usr/bin/busybox"
 
 # The arm64 half of the same two fixtures, for machines/arm64-virt.machine.
@@ -127,11 +128,40 @@ readonly X86_LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/in
 
 readonly BUSYBOX_ARM64_DEB="https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b8_arm64.deb"
 readonly BUSYBOX_ARM64_SHA="6d144e5012d47ec3a6f2102ba6fac644ad34c989373fed30c1bb7264f5cd3616"
+readonly BUSYBOX_ARM64_SNAPSHOT="46f11bd08b89588cbf6199dd82ab637a6efcf08d"
+
+# Where a pinned .deb goes when the pool has moved on.
+#
+# Debian's pool keeps only the *current* build of a binary package, so every
+# pool URL above is a dangling reference in waiting: `busybox-static` went
+# 1.37.0-6+b8 -> +b9 and both pinned URLs started answering 404, which took the
+# `arm64-initramfs` fixture -- and with it the whole `Long run` workflow -- down
+# for a week.
+#
+# snapshot.debian.org is the archive of record for exactly this. It keeps every
+# file the archive has ever carried and serves it **content-addressed**:
+# `/file/<sha1>` is the file with that SHA-1 and can never become a different
+# one. So the fallback is not "a newer build of roughly the same thing", it is
+# *the pinned build*, byte for byte, which is what reproducibility means here --
+# the `sha256` beside each URL still matches, and is therefore checked `fatal`
+# rather than advisory.
+#
+# The SHA-1s come from snapshot's own machine-readable interface, which is also
+# where to get one for a new pin:
+#
+#     curl -s 'https://snapshot.debian.org/mr/binary/<package>/<version>/binfiles?fileinfo=1'
+#
+# It is slower and less reliable than the CDN, so it stays the fallback rather
+# than becoming the primary: the pool answers in the ordinary case.
+readonly SNAPSHOT_FILE="https://snapshot.debian.org/file"
+
+# The `Packages` indexes, which are *not* how a pinned .deb is recovered -- see
+# the note above; looking a package up by name gives whatever build is current
+# today, which is a fixture that changes underneath the tests. They are here for
+# the one job that genuinely needs today's archive: finding the kernel package
+# whose modules match the `linux` image `current/` just handed us, for
+# `initramfs-virtio` and `arm64-rootfs` below.
 readonly DEBIAN_PACKAGES_ARM64="https://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.gz"
-# Debian's pool keeps only the current build of a binary package, so the URL
-# above stops resolving the next time busybox is rebuilt. This is where the
-# name is looked up when that happens — and it is also how the kernel package
-# matching the fetched `linux` image is found, for `initramfs-virtio` below.
 readonly DEBIAN_PACKAGES="https://deb.debian.org/debian/dists/trixie/main/binary-riscv64/Packages.gz"
 
 # The same job for x86-64, and from a different place, which is the whole
@@ -243,10 +273,16 @@ readonly SBASE_COMMIT="c546c3a5724c81cee9a11d816a38ccdf17472129"
 # redistribution (CLAUDE.md, Provenance). Nothing under testdata/ is committed,
 # and PROVENANCE.txt says which build this was.
 readonly DEBIAN_CROSS_POOL="https://deb.debian.org/debian/pool/main/c/cross-toolchain-base"
+
+# Pool-pinned like the busybox packages above, and going stale on the same
+# schedule -- `cross8` becomes `cross9` and the URL 404s -- so each carries a
+# snapshot.debian.org SHA-1 for the same reason and is fetched the same way.
 readonly LDSO_DEB_riscv64="libc6-riscv64-cross_2.43-3cross8_all.deb"
 readonly LDSO_DEB_SHA_riscv64="4db8853722995b2f5218d9001811d8e55209038f37ede41ff9c07761704d3230"
+readonly LDSO_SNAPSHOT_riscv64="a6ca848146e604fffa4f9c273f62485e0eed3afe"
 readonly LDSO_DEB_aarch64="libc6-arm64-cross_2.43-3cross8_all.deb"
 readonly LDSO_DEB_SHA_aarch64="1192c1a3de7c48169235ff137c6b6f81ad7af93b0f26b48fbe39b8030388c43a"
+readonly LDSO_SNAPSHOT_aarch64="18a003c49cd732f112e2e05ae8f60f4057a3854c"
 
 # ---------------------------------------------------------------------------
 # Output
@@ -335,6 +371,72 @@ fetch_verified() {
 	download "$url" "$dest"
 	verify "$dest" "$want" "$mode"
 	ok "$(basename -- "$dest") ($(wc -c <"$dest" | tr -d ' ') bytes)"
+}
+
+# fetch_pinned_deb <pool url> <snapshot sha1> <dest> <sha256>
+#
+# A Debian package pinned to one exact build. The pool is tried first because it
+# is a CDN; when it has rotated the build away -- which it eventually does to
+# every one of them -- snapshot.debian.org serves the same file by content hash.
+# See SNAPSHOT_FILE above for why that keeps the fixture reproducible instead of
+# quietly substituting a newer build.
+#
+# The checksum is `fatal` in both cases, which it can only be *because* of the
+# fallback: both routes hand back the same bytes, so a mismatch is the wrong
+# file rather than a rebuild.
+fetch_pinned_deb() {
+	local url="$1" snapshot="$2" dest="$3" want="$4"
+	if [ "$FORCE" = 0 ] && [ -f "$dest" ] && [ "$(sha256_of "$dest")" = "$want" ]; then
+		ok "$(basename -- "$dest") already present and verified"
+		return 0
+	fi
+	note "  downloading $(basename -- "$url") ..."
+	mkdir -p "$(dirname -- "$dest")"
+	# `--silent` rather than `--show-error`: a 404 here is the expected end of a
+	# pin's life, not a fault, and it is reported in our own words below.
+	if ! curl --fail --silent --location --retry 3 --retry-delay 2 \
+		--output "${dest}.part" "$url"
+	then
+		rm -f "${dest}.part"
+		warn "$(basename -- "$url") has rotated out of the Debian pool"
+		[ -n "$snapshot" ] || die "no snapshot.debian.org hash pinned beside $(basename -- "$url")
+  Get one with:
+    curl -s 'https://snapshot.debian.org/mr/binary/<package>/<version>/binfiles?fileinfo=1'"
+		note "  falling back to snapshot.debian.org (${snapshot}) ..."
+		download "${SNAPSHOT_FILE}/${snapshot}" "$dest"
+	else
+		mv -f "${dest}.part" "$dest"
+	fi
+	verify "$dest" "$want" fatal
+	ok "$(basename -- "$dest") ($(wc -c <"$dest" | tr -d ' ') bytes)"
+}
+
+# index_field <index url> <awk program> [awk options ...]
+#
+# Read one field out of a gzipped Debian `Packages` index.
+#
+# Written as three steps through a scratch file rather than as
+# `curl | gzip -cd | awk '…; exit'`, and that is the whole point of the
+# function: `awk`'s `exit` closes the pipe while `gzip` is still writing, `gzip`
+# takes SIGPIPE, and `set -o pipefail` at the top of this script turns that into
+# a failed assignment that `set -e` then makes fatal. It only bites when the
+# match is *early* in the index -- which is why looking `busybox-static` up died
+# with `gzip: stdout: Broken pipe` while `linux-image-…`, near the end of an
+# alphabetical index, survived on luck.
+index_field() {
+	local index="$1" program="$2"
+	shift 2
+	need gzip
+	local gz="${DEST_ROOT}/.index-$$.gz" txt="${DEST_ROOT}/.index-$$" out
+	mkdir -p "$DEST_ROOT"
+	curl --fail --silent --show-error --location "$index" >"$gz" || {
+		rm -f "$gz"
+		die "could not download $index"
+	}
+	gzip -cd <"$gz" >"$txt" || { rm -f "$gz" "$txt"; die "$index is not gzip"; }
+	out="$(awk "$@" "$program" "$txt")"
+	rm -f "$gz" "$txt"
+	printf '%s' "$out"
 }
 
 # Written beside every corpus so its terms travel with it.
@@ -1480,23 +1582,9 @@ is what RSEMU_ARM64_INITRD wants." \
 # The arm64 busybox binary, unpacked into <scratch dir>. Sets BUSYBOX_BIN, as
 # `busybox_binary` does and for the same reason.
 busybox_arm64_binary() {
-	local work="$1" url="$BUSYBOX_ARM64_DEB"
-	if ! curl --fail --silent --head --location "$url" >/dev/null 2>&1; then
-		need gzip
-		warn "the pinned arm64 busybox-static build is gone from the pool; asking the index"
-		local filename
-		filename="$(curl --fail --silent --location "$DEBIAN_PACKAGES_ARM64" | gzip -cd |
-			awk '/^Package: busybox-static$/ { found = 1 }
-			     found && /^Filename: / { print $2; exit }')"
-		[ -n "$filename" ] || die "busybox-static is not in ${DEBIAN_PACKAGES_ARM64}"
-		url="https://deb.debian.org/debian/${filename}"
-		note "  downloading $(basename -- "$url") ..."
-		download "$url" "${work}/busybox.deb"
-	else
-		# Advisory rather than fatal: Debian rebuilds busybox, and a rebuild
-		# under the same file name is a new binary rather than a wrong one.
-		fetch_verified "$url" "${work}/busybox.deb" "$BUSYBOX_ARM64_SHA" advisory
-	fi
+	local work="$1"
+	fetch_pinned_deb "$BUSYBOX_ARM64_DEB" "$BUSYBOX_ARM64_SNAPSHOT" \
+		"${work}/busybox.deb" "$BUSYBOX_ARM64_SHA"
 	( cd "$work" && ar x busybox.deb data.tar.xz ) || die "that .deb is not an ar archive"
 	tar -xf "${work}/data.tar.xz" -C "$work" "$BUSYBOX_MEMBER" 2>/dev/null ||
 		die "no ${BUSYBOX_MEMBER} in the package; upstream may have moved it"
@@ -1584,37 +1672,14 @@ cpio_file() {
 	cpio_pad "$size"
 }
 
-# Where busybox actually comes from today, since the pool URL goes stale.
-busybox_url() {
-	if curl --fail --silent --head --location "$BUSYBOX_DEB" >/dev/null 2>&1; then
-		printf '%s' "$BUSYBOX_DEB"
-		return 0
-	fi
-	need gzip
-	warn "the pinned busybox-static build is gone from the pool; asking the index"
-	local filename
-	filename="$(curl --fail --silent --location "$index" | gzip -cd |
-		awk '/^Package: busybox-static$/ { found = 1 }
-		     found && /^Filename: / { print $2; exit }')"
-	[ -n "$filename" ] || die "busybox-static is not in ${DEBIAN_PACKAGES}"
-	printf 'https://deb.debian.org/debian/%s' "$filename"
-}
-
 # The riscv64 busybox binary, unpacked into <scratch dir>. Sets BUSYBOX_BIN
 # rather than echoing the path, because the fetch it does prints as it goes and
 # a command substitution would swallow that into the answer.
 BUSYBOX_BIN=""
 busybox_binary() {
-	local work="$1" url
-	url="$(busybox_url)"
-	if [ "$url" = "$BUSYBOX_DEB" ]; then
-		# Advisory rather than fatal: Debian rebuilds busybox, and a rebuild
-		# under the same file name is a new binary rather than a wrong one.
-		fetch_verified "$url" "${work}/busybox.deb" "$BUSYBOX_DEB_SHA" advisory
-	else
-		note "  downloading $(basename -- "$url") ..."
-		download "$url" "${work}/busybox.deb"
-	fi
+	local work="$1"
+	fetch_pinned_deb "$BUSYBOX_DEB" "$BUSYBOX_DEB_SNAPSHOT" \
+		"${work}/busybox.deb" "$BUSYBOX_DEB_SHA"
 	( cd "$work" && ar x busybox.deb data.tar.xz ) || die "that .deb is not an ar archive"
 	tar -xf "${work}/data.tar.xz" -C "$work" "$BUSYBOX_MEMBER" 2>/dev/null ||
 		die "no ${BUSYBOX_MEMBER} in the package; upstream may have moved it"
@@ -1767,12 +1832,11 @@ kernel_module_deb() {
 	version="$(grep -ao 'Linux version [^ ]*' "$image" | head -1 | cut -d' ' -f3)"
 	[ -n "$version" ] || die "no Linux version banner in ${image}"
 	note "  the fetched kernel is ${version}" >&2
-	need gzip
 	local filename
-	filename="$(curl --fail --silent --location "$index" | gzip -cd |
-		awk -v want="linux-image-${version}" '
+	filename="$(index_field "$index" '
 			$1 == "Package:" { pkg = $2 }
-			pkg == want && $1 == "Filename:" { print $2; exit }')"
+			pkg == want && $1 == "Filename:" { print $2; exit }' \
+		-v "want=linux-image-${version}")"
 	[ -n "$filename" ] || die "no linux-image-${version} in ${index}
   Its modules are what initramfs-virtio needs, and only the build that matches
   the kernel will load. Re-fetch the linux suite and try again."
@@ -2758,9 +2822,10 @@ usermode_ldso() {
 # inside a command substitution whose stdout is the answer.
 usermode_fetch_sysroot() {
 	local arch="$1" name="$2"
-	local deb sha root found
+	local deb sha snapshot root found
 	eval "deb=\${LDSO_DEB_${arch}:-}"
 	eval "sha=\${LDSO_DEB_SHA_${arch}:-}"
+	eval "snapshot=\${LDSO_SNAPSHOT_${arch}:-}"
 	[ -n "$deb" ] || return 1
 	command -v curl >/dev/null 2>&1 || return 1
 	command -v ar >/dev/null 2>&1 || return 1
@@ -2777,7 +2842,8 @@ usermode_fetch_sysroot() {
 
 	note "  no ${name} on this host; fetching ${deb} ..." >&2
 	mkdir -p "$root"
-	fetch_verified "${DEBIAN_CROSS_POOL}/${deb}" "${root}/${deb}" "$sha" fatal >&2 || return 1
+	fetch_pinned_deb "${DEBIAN_CROSS_POOL}/${deb}" "$snapshot" \
+		"${root}/${deb}" "$sha" >&2 || return 1
 	(cd "$root" && ar x "$deb" && tar xf data.tar.* &&
 		rm -f data.tar.* control.tar.* debian-binary) >&2 || return 1
 	write_notice "$root" "A Debian cross runtime sysroot, fetched and never committed.
