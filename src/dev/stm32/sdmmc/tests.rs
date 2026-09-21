@@ -59,7 +59,7 @@ fn rig_with(card: Option<Arc<SdCard>>) -> Rig {
         .topology()
         .map(Arc::new(Region::ram("ram", ram)), RAM_BASE)
         .expect("ram maps");
-    dev.attach_bus(Arc::clone(&space), RequesterId::ANONYMOUS);
+    dev.attach_bus(&space, RequesterId::ANONYMOUS);
     Rig {
         dev,
         card: card.unwrap_or_else(|| card_of(64 * 1024, false)),
@@ -1135,5 +1135,50 @@ fn a_reset_level_that_did_not_move_is_not_an_edge() {
         peek(&rig.dev, R_POWER),
         power,
         "a low that was already low resets nothing"
+    );
+}
+
+/// The cycle `virtio.mmio` was found to have, in the shape this file had it.
+///
+/// A cycle is invisible to `Drop` — nothing runs, which is the defect — but it
+/// is exactly visible as a `Weak` that still upgrades after the last strong
+/// handle is gone. Both halves have to be present for the loop to close, so
+/// this fixture adds the one `rig` leaves out: the controller's register block
+/// mapped into the very space its IDMA masters, which is what
+/// `tests/stm32_sdmmc.rs`'s machine file does with `map mem 0x52007000`.
+#[test]
+fn the_controller_does_not_keep_the_space_it_masters_alive() {
+    const REGS_BASE: u64 = 0x5200_7000;
+    let rig = rig();
+    rig.space
+        .topology()
+        .map(rig.dev.region("").expect("a register block"), REGS_BASE)
+        .expect("the window fits");
+
+    let Rig { dev, card, space } = rig;
+    let watch = Arc::downgrade(&space);
+    drop(space);
+    assert!(
+        watch.upgrade().is_none(),
+        "the address space outlived its last owner: the controller holds it strongly"
+    );
+
+    // And the controller is still a controller. A space that has gone is the
+    // same situation as one a machine file never bound, and the part already
+    // has a flag for it: `STA.IDMATE`, rather than a panic or a silent
+    // transfer into nothing.
+    card.write_media(2 * BLOCK, &pattern(0x5a)).expect("inside");
+    bring_up(&dev);
+    poke(&dev, R_IDMABASE0R, (RAM_BASE + 0x400) as u32);
+    poke(&dev, R_IDMACTRLR, IDMA_EN);
+    // The command first and `DTEN` second, which is the older of the two
+    // orders the part accepts — and the one that matters here, because
+    // `CMDR`'s `ICR` write would otherwise clear the very flag being asserted.
+    command(&dev, 17, 2, WAITRESP_SHORT);
+    arm_data(&dev, BLOCK as u32, true);
+    assert_ne!(
+        peek(&dev, R_STAR) & STA_IDMATE,
+        0,
+        "an IDMA with no space must raise IDMATE rather than pretend it moved data"
     );
 }

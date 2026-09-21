@@ -130,7 +130,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::fmt;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
@@ -574,7 +574,22 @@ struct Shared {
     /// The address space the internal DMA traverses, and who we are on it.
     /// `None` until `bind`, and legitimately `None` forever on a board that
     /// only uses the FIFO path.
-    bus: Mutex<Option<Arc<AddressSpace>>>,
+    ///
+    /// **Weak.** The register block is mapped into the very space the IDMA
+    /// masters (`map mem 0x52007000 size 1K = sdmmc`, with `space = mem`), so
+    /// a strong handle closes a reference cycle: the space owns the mapping,
+    /// the mapping owns [`Port`] as its [`MemOps`], `Port` owns this `Shared`,
+    /// and `Shared` would own the space. Nothing in this tree breaks such a
+    /// cycle — there is no unbind — so every byte of guest RAM outlives the
+    /// machine that was torn down. `virtio.mmio` had the same defect and its
+    /// fuzz target measured it at 6.5 MB an iteration under LeakSanitizer.
+    ///
+    /// Every other bus master here already holds a `Weak` — `ahci::hba`,
+    /// `nvme::ctrl`, `usb::xhci`, `usb::ehci`, `ncr53c710`, `pc::dma`,
+    /// `stm32::dma` — and `CLAUDE.md` states the rule for the analogous case,
+    /// that a wire's sinks are weak refs. A controller whose space has gone
+    /// does no DMA rather than keeping it alive.
+    bus: Mutex<Option<Weak<AddressSpace>>>,
     requester: Mutex<RequesterId>,
     /// `RCC_AHB3ENR.SDMMC1EN` and `RCC_AHB3RSTR.SDMMC1RST`, as a board's wires
     /// deliver them. Wiring rather than chip state, so it sits beside `regs`
@@ -643,8 +658,12 @@ impl Sdmmc {
     }
 
     /// Give the internal DMA an address space to master, and an identity on it.
-    pub fn attach_bus(&self, space: Arc<AddressSpace>, requester: RequesterId) {
-        *self.shared.bus.lock() = Some(space);
+    ///
+    /// The reference is **weak**: the space maps this controller's own
+    /// register block, so holding it strongly would be a cycle that leaks the
+    /// whole machine. See the `bus` field on this device's shared state.
+    pub fn attach_bus(&self, space: &Arc<AddressSpace>, requester: RequesterId) {
+        *self.shared.bus.lock() = Some(Arc::downgrade(space));
         *self.shared.requester.lock() = requester;
     }
 
@@ -927,8 +946,11 @@ impl Shared {
     /// [`RequesterId`], exactly as any other DMA engine in this tree does.
     fn run_idma(&self, regs: &mut Regs, card: &SdCard) {
         let Some(dpsm) = regs.dpsm else { return };
+        // Upgraded once per transfer and held across it: the machine that
+        // owns the space cannot go away mid-burst, and this is one atomic pair
+        // against a whole IDMA run rather than one per access.
         let space = self.bus.lock().clone();
-        let Some(space) = space else {
+        let Some(space) = space.as_ref().and_then(Weak::upgrade) else {
             // IDMAEN with no address space bound is a machine-file mistake, and
             // the flag that says so already exists.
             Self::finish(regs);
@@ -1366,7 +1388,9 @@ impl Instance for Sdmmc {
         // IDMAEN without one is told so through STA.IDMATE, which is the flag
         // the part already has for it.
         if let Some(space) = ctx.space() {
-            *self.shared.bus.lock() = Some(Arc::clone(space));
+            // Weak: this controller's registers are mapped into that same
+            // space, so a strong handle closes a cycle. See `Shared::bus`.
+            *self.shared.bus.lock() = Some(Arc::downgrade(space));
             *self.shared.requester.lock() = ctx.requester();
         }
         Ok(())
