@@ -256,6 +256,14 @@ device or a probe:
 ### The defects this turned up, and the one still open
 
 * **The window fold.** Above. Fixed, and it is what put the icon on screen.
+* **`--screenshot` and `--vnc` never worked on this board.** `mac.video` was in
+  neither of the two lists the `rsemu` binary keeps — `install_capture` and
+  `take_scanout` — so every `rsemu run mac-plus --screenshot` answered "this
+  machine has no display" while `machines/mac-plus.machine` advertised
+  `--vnc :5900`. The library tests could not see it, because they install the
+  capture table themselves. Fixed, with a case in `tests/cli_screenshot.rs`
+  that runs the shipped binary against rsemu's own ten-byte stub ROM — the
+  second board that file's reason for existing has caught.
 * **A carrier-detect transition locks the machine up.** With the SCC configured
   as the ROM leaves it, driving either `DCD` input makes the chip assert, the
   processor takes vector 26 or 27, and it never comes back: sampling 200 000

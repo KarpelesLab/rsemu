@@ -213,6 +213,54 @@ fn a_console_does_not_swallow_the_screenshot() {
     let _ = std::fs::remove_file(&png);
 }
 
+/// A Macintosh Plus gets its screenshot, which is the second board this file's
+/// reason for existing has caught.
+///
+/// `mac.video` was in neither of the binary's two lists, so every
+/// `rsemu run mac-plus --screenshot` since the board landed answered "this
+/// machine has no display" — and so did `--vnc`, which serves the same scanout,
+/// although `machines/mac-plus.machine` advertised it. The library-level test
+/// could not see it: `tests/mac_plus.rs` installs the capture table itself.
+///
+/// No Apple ROM is needed or used. The image here is rsemu's own ten bytes —
+/// a stack pointer, a program counter and `BRA .` — padded out to the 128 KiB
+/// the socket takes, which is enough for the video circuit to scan the screen
+/// buffer out of memory while the processor sits in its loop.
+#[cfg(feature = "machine-mac-plus")]
+#[test]
+fn a_macintosh_gets_its_screenshot() {
+    let mut image = vec![0u8; 128 * 1024];
+    image[..10].copy_from_slice(&[
+        0x00, 0x10, 0x00, 0x00, // SSP = $00100000
+        0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+        0x60, 0xfe, // BRA .
+    ]);
+    let rom = scratch("mac-plus.rom");
+    std::fs::write(&rom, &image).expect("the scratch directory is writable");
+    let png = scratch("mac-plus.png");
+    let _ = std::fs::remove_file(&png);
+
+    let (ok, stderr) = run(&[
+        "run",
+        "mac-plus",
+        "--media",
+        &format!("macrom={}", rom.display()),
+        "--screenshot",
+        png.to_str().expect("a UTF-8 scratch path"),
+        "--for",
+        "50ms",
+        "-q",
+    ]);
+    assert!(ok, "rsemu run mac-plus --screenshot failed: {stderr}");
+    let bytes = std::fs::read(&png).expect("--screenshot wrote a file");
+    // 512 x 342, which is the raster the Guide's video chapter gives and what
+    // `mac.video` reads out of main memory.
+    assert_eq!(png_geometry(&bytes), (512, 342));
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&rom);
+}
+
 /// A machine with a console and **no** display refuses the flag, before the run
 /// rather than after it.
 ///

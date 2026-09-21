@@ -1309,6 +1309,8 @@ fn install_capture(
     rsemu::host::display::lcd::capture::install(options)?;
     #[cfg(feature = "dev-amiga-denise")]
     rsemu::host::display::amiga::capture::install(options)?;
+    #[cfg(feature = "dev-mac")]
+    rsemu::host::display::mac::capture::install(options)?;
     // The pointer. Unconditional for the same reason a display is: the
     // interception constructs the same device from the same properties and
     // keeps an `Arc`, so whether a frontend is listening cannot change what was
@@ -1419,6 +1421,13 @@ fn take_scanout(
     // clock forest's to say.
     #[cfg(feature = "dev-amiga-denise")]
     if let Some(s) = rsemu::host::display::amiga::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
+    // The Macintosh's video circuit needs the machine for the same reason: its
+    // frame period is 370 scan lines of its dot clock, and the clock forest is
+    // what knows what that is in nanoseconds.
+    #[cfg(feature = "dev-mac")]
+    if let Some(s) = rsemu::host::display::mac::capture::take(hosts, machine) {
         return Some(Box::new(s));
     }
     // Last, because it is the generic one: a board with a console's own video
