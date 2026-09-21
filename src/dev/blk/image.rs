@@ -24,6 +24,30 @@ use crate::dev::medium::{Medium, Snapshot};
 /// has a tail no guest can reach.
 const SECTOR: u64 = 512;
 
+/// The largest medium [`Snapshot::Capture`] is allowed to materialise, in
+/// bytes.
+///
+/// A capture chunk is the whole drive, first in host memory and then in the
+/// snapshot file. For a **flat** image that number is bounded by the file
+/// itself — the capacity *is* the file length. For a **sparse container** it is
+/// bounded by nothing the file can contradict: qcow2 keeps the guest-visible
+/// size in a header field (the qcow2 specification, header offset 24, `size`)
+/// and is allocate-on-write by design, so a two-kilobyte file may perfectly
+/// legitimately declare 2^46 bytes. Honouring `Capture` for that one means a
+/// 64 TiB zeroed allocation before a single byte has been read, which is an
+/// abort under a sanitizer and the OOM killer everywhere else. It was found by
+/// `fuzz/fuzz_targets/blk_image.rs`, which is what that target is for.
+///
+/// The check therefore happens at [`Image::open`], where there is a person to
+/// tell, rather than in whichever device later asks the medium for its bytes.
+///
+/// 256 MiB: comfortably above every fixture that genuinely wants its bytes
+/// inside the snapshot — a floppy, a CF card, a small test disk — and far below
+/// any drive for which [`Snapshot::Reference`] is not the honest answer anyway.
+/// It is a policy limit, not a host limit, so it is the same number on every
+/// target.
+const MAX_CAPTURE: u64 = 256 << 20;
+
 use super::{config_error, media_error};
 
 /// How to open an image.
@@ -39,7 +63,9 @@ pub struct ImageOptions {
     pub read_only: bool,
     /// What a machine snapshot does about the bytes. See [`Snapshot`];
     /// [`Snapshot::Reference`] is the default and the only one that is honest
-    /// about a large image.
+    /// about a large image. [`Snapshot::Capture`] is refused outright above
+    /// 256 MiB, because a sparse container's declared size is a header field
+    /// and capturing it is an allocation.
     pub snapshot: Snapshot,
     /// Create the image instead of opening it, with this capacity in bytes.
     ///
@@ -159,7 +185,10 @@ impl Image {
     /// be opened, the format is one `fstool` refuses (an encrypted image with
     /// no passphrase, a qcow2 whose backing file is missing), the image is
     /// empty, or its capacity is not a whole number of 512-byte sectors — which
-    /// is not a drive an ATA host could address.
+    /// is not a drive an ATA host could address. Also if the caller asked for
+    /// [`Snapshot::Capture`] and the image declares more than 256 MiB, because
+    /// a capture of it would be an allocation the header chose — see the
+    /// `MAX_CAPTURE` note in this module.
     pub fn open(path: &Path, opts: &ImageOptions) -> Result<Image> {
         let shown = path.display().to_string();
         let device = open_device(path, opts).map_err(|e| config_error(&shown, &e))?;
@@ -211,6 +240,19 @@ impl Image {
                 &describe,
                 &fstool::Error::InvalidArgument(alloc::format!(
                     "{capacity} bytes is not a whole number of 512-byte sectors"
+                )),
+            ));
+        }
+        // Validate before anything allocates on it. See `MAX_CAPTURE`: the
+        // capacity came out of a header field in a file nobody wrote, and
+        // `Capture` is the one policy that turns it into an allocation.
+        if opts.snapshot == Snapshot::Capture && capacity > MAX_CAPTURE {
+            return Err(config_error(
+                &describe,
+                &fstool::Error::InvalidArgument(alloc::format!(
+                    "a {capacity}-byte image is too large to capture into a snapshot chunk \
+                     (the limit is {MAX_CAPTURE} bytes); use the `reference` snapshot policy, \
+                     which is the default and the only honest answer for a drive this size"
                 )),
             ));
         }

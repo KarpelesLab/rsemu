@@ -188,6 +188,11 @@ so what is on disk matches the moment the snapshot was taken, and `load` refuses
 a chunk that names a different image. `snapshot=capture` puts the bytes in the
 chunk for an image small enough to want that, and `snapshot=refuse` says no.
 What is not on offer is silently writing sixteen gigabytes into a snapshot.
+"Small enough" is **256 MiB**, checked at open and refused with a message
+naming `reference`: a sparse container keeps its guest-visible size in a header
+field a stranger wrote, so without that limit `snapshot=capture` on a
+two-kilobyte qcow2 declaring 2^46 bytes is a 64 TiB allocation — which is how
+`fuzz/fuzz_targets/blk_image.rs` found it.
 Closing the remaining gap — the guest that writes to the image *after* the
 snapshot — is a copy-on-write overlay, and per §7.1 that is `fstool` work.
 

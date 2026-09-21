@@ -119,6 +119,50 @@ fn the_snapshot_policy_is_the_caller_s_and_reference_is_the_default() {
 }
 
 #[test]
+fn a_sparse_container_cannot_declare_a_capture_bigger_than_this_host() {
+    // The defect `fuzz/fuzz_targets/blk_image.rs` found, as a unit test.
+    //
+    // A qcow2's guest-visible size is a header field and the container is
+    // allocate-on-write, so the file on disk says nothing about it: this one is
+    // a few hundred kilobytes and declares 64 TiB. Under `Snapshot::Capture`
+    // the drive's `save` materialises the whole medium, so that header field
+    // reached `vec![0u8; 1 << 46]` — a sanitizer abort, and an OOM kill on a
+    // real run. It has to be refused where there is a person to tell.
+    let path = scratch("enormous.qcow2");
+    let huge = 1u64 << 46;
+    {
+        let image =
+            Image::open(&path, &ImageOptions::new().create(huge)).expect("a sparse 64 TiB qcow2");
+        assert_eq!(image.capacity(), huge);
+    }
+    let on_disk = std::fs::metadata(&path).expect("stat").len();
+    assert!(on_disk < (16 << 20), "{on_disk} bytes for a 64 TiB disk");
+
+    let capture = ImageOptions::new().snapshot(Snapshot::Capture);
+    let err = Image::open(&path, &capture).expect_err("64 TiB is not a snapshot chunk");
+    let shown = alloc::format!("{err}");
+    assert!(shown.contains("too large to capture"), "{shown}");
+    assert!(shown.contains("reference"), "{shown}");
+
+    // The same file with the default policy is a perfectly ordinary drive:
+    // the refusal is about the *policy*, not about the image.
+    let referenced = Image::open(&path, &ImageOptions::new()).expect("reference is fine");
+    assert_eq!(referenced.capacity(), huge);
+    assert_eq!(referenced.snapshot(), Snapshot::Reference);
+
+    // And the limit is a limit rather than a ban: a small image still captures.
+    let small = scratch("modest.qcow2");
+    {
+        let _ = Image::open(&small, &ImageOptions::new().create(1 << 20)).expect("created");
+    }
+    let captured = Image::open(&small, &capture).expect("1 MiB is capturable");
+    assert_eq!(captured.snapshot(), Snapshot::Capture);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&small);
+}
+
+#[test]
 fn a_raw_file_round_trips_and_says_what_it_is() {
     let path = scratch("raw.img");
     create_raw(&path, 8 * 512).expect("a sparse file");
