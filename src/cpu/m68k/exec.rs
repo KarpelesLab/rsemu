@@ -454,6 +454,11 @@ pub(super) enum Kind {
     /// `TRAPV`, a zero divide (MC68020UM Table 6-5). A four-word frame on
     /// earlier parts.
     Six(u32),
+    /// The 68040's floating-point **post-instruction** exception: a format
+    /// `$3` frame, the same six words as [`Kind::Six`] but with the
+    /// *effective address* in the last two and a format code that says so
+    /// (M68040UM §8.4.4).
+    Post(u32),
 }
 
 impl Trap {
@@ -483,6 +488,16 @@ impl Trap {
             vector,
             pc,
             kind: Kind::Six(insn),
+        }
+    }
+
+    /// A 68040 floating-point post-instruction exception, whose format `$3`
+    /// frame carries the effective address the instruction calculated.
+    const fn post_instruction(vector: u8, pc: u32, ea: u32) -> Trap {
+        Trap::Vectored {
+            vector,
+            pc,
+            kind: Kind::Post(ea),
         }
     }
 }
@@ -578,6 +593,11 @@ pub(super) struct Exec<'a> {
     /// Whether the fault in progress was a `MOVES` through `SFC` or `DFC`,
     /// which the 68040 reports as an *alternate logical* transfer type.
     fault_alternate: bool,
+    /// The effective address the floating-point instruction in progress
+    /// calculated, for the 68040's format `$2` unimplemented-instruction
+    /// frame. Zero when the operand came from a register or the instruction
+    /// stream.
+    fp_last_address: u32,
     /// Slides an instruction deferred past its operand write.
     ///
     /// `MOVE <ea>,(xxx).L` performs its write *before* the last instruction
@@ -626,6 +646,7 @@ impl<'a> Exec<'a> {
             mmu040_on: model.has_040() && state_enables_mmu040,
             atc_fault: false,
             fault_alternate: false,
+            fp_last_address: 0,
             deferred_slides: 0,
         }
     }
@@ -1622,6 +1643,12 @@ impl<'a> Exec<'a> {
                         let mut image = FrameImage::new(2);
                         image.push((insn >> 16) as u16);
                         image.push(insn as u16);
+                        Frame::Format(image)
+                    }
+                    (model, Kind::Post(ea)) if model.has_040() => {
+                        let mut image = FrameImage::new(3);
+                        image.push((ea >> 16) as u16);
+                        image.push(ea as u16);
                         Frame::Format(image)
                     }
                     _ => Frame::format(0),
@@ -4485,12 +4512,36 @@ impl<'a> Exec<'a> {
         Trap::at(vector::LINE_F, self.pc0)
     }
 
-    /// Whether this core computes an operation with this source format.
-    fn fp_ready(op: FpOp, forced: Forced, fmt: Option<Fmt>) -> bool {
+    /// What this unit does with an operation and a source format.
+    ///
+    /// The two parts answer differently, and the difference is the whole of
+    /// the 68040's floating-point story: a 6888x implements everything and
+    /// this core computes it, while a 68040 implements ten operations in
+    /// hardware and traps for the rest so software can emulate them
+    /// (M68040UM §9.6, Table 9-10).
+    fn fp_availability(&self, op: FpOp, forced: Forced, fmt: Option<Fmt>) -> Availability {
+        let packed = matches!(fmt, Some(Fmt::Packed));
+        if self.cfg.fpu.is_onchip_040() {
+            // "An unsupported data type exception occurs when ... either the
+            // source or destination data format is packed decimal real"
+            // (§9.6.2), and it takes precedence over nothing — the
+            // unimplemented *instruction* exception does, for the
+            // instructions that have one.
+            if !fpu::implemented_040(op) {
+                return Availability::Unimplemented;
+            }
+            if packed {
+                return Availability::UnsupportedType;
+            }
+            return Availability::Hardware;
+        }
         // The 68040 added `FSxxx`/`FDxxx` forms that force a rounding
-        // precision; a 6888x has none, and the encoding is not a command word
-        // it recognises.
-        forced == Forced::Control && fpu::implemented(op) && !matches!(fmt, Some(Fmt::Packed))
+        // precision; a 6888x has none, and the encoding is not a command
+        // word it recognises.
+        if forced != Forced::Control || !fpu::implemented(op) || packed {
+            return Availability::LineF;
+        }
+        Availability::Hardware
     }
 
     /// Start a floating-point operation: the instruction address a trap
@@ -4564,10 +4615,27 @@ impl<'a> Exec<'a> {
         match class {
             fp::Class::Control { to_fpu, regs } => self.op_fmove_control(to_fpu, regs),
             fp::Class::MoveM { to_fpu, mode, list } => self.op_fmovem(to_fpu, mode, list),
-            fp::Class::MoveCr { offset, dst } => self.op_fmovecr(offset, dst),
+            fp::Class::MoveCr { offset, dst } => {
+                // M68040UM Table 9-10 lists `FMOVECR` among the monadic
+                // operations the 68040 does not implement: the constant ROM
+                // belongs to the software package, and the handler reads the
+                // offset out of `CMDREG1B` for itself. There is no source
+                // operand to put in `ETEMP`, and no effective address.
+                if self.cfg.fpu.is_onchip_040() {
+                    return self.fp_trap_040(
+                        Availability::Unimplemented,
+                        command,
+                        FpOp::Move,
+                        F80::ZERO,
+                        dst,
+                        0,
+                    );
+                }
+                self.op_fmovecr(offset, dst)
+            }
             fp::Class::Store {
                 fmt, src, k, k_reg, ..
-            } => self.op_fstore(fmt, src, k, k_reg),
+            } => self.op_fstore(fmt, src, k, k_reg, command),
             fp::Class::RegOp {
                 src,
                 dst,
@@ -4575,12 +4643,28 @@ impl<'a> Exec<'a> {
                 forced,
                 cos,
             } => {
-                if !Self::fp_ready(op, forced, None) {
-                    return Err(self.fp_line_f());
+                let raw = self.state.fpu.fp[(src & 7) as usize];
+                match self.fp_availability(op, forced, None) {
+                    Availability::LineF => Err(self.fp_line_f()),
+                    Availability::Hardware => {
+                        self.fp_begin();
+                        let value = fpu::canonical(raw);
+                        self.fp_operate(op, value, Flags::NONE, dst, cos, forced)
+                    }
+                    // No effective address: "the effective address field
+                    // contains the calculated effective address determined
+                    // by the effective address field of the unimplemented
+                    // instruction" (M68040UM §8.4.6.2, **CU**), and a
+                    // register-to-register instruction has none.
+                    // Raw, not canonicalised: "a denormalized or
+                    // unnormalized extended-precision source or destination
+                    // operand is copied directly **without modification** to
+                    // ETEMP or FPTEMP" (M68040UM §9.6.2), because "the
+                    // floating-point instruction emulation routine must
+                    // detect the unsupported data type" (§9.6.1) and cannot
+                    // if the unit has already normalized it away.
+                    outcome => self.fp_trap_040(outcome, command, op, raw, dst, 0),
                 }
-                self.fp_begin();
-                let value = fpu::canonical(self.state.fpu.fp[(src & 7) as usize]);
-                self.fp_operate(op, value, Flags::NONE, dst, cos)
             }
             fp::Class::MemOp {
                 fmt,
@@ -4589,13 +4673,79 @@ impl<'a> Exec<'a> {
                 forced,
                 cos,
             } => {
-                if !Self::fp_ready(op, forced, Some(fmt)) {
+                let outcome = self.fp_availability(op, forced, Some(fmt));
+                if outcome == Availability::LineF {
                     return Err(self.fp_line_f());
                 }
+                // "Next, the instruction is partially decoded to allow
+                // fetching of the memory source operand ... the fetched
+                // source operand is passed to the FPU, which converts the
+                // operand to extended precision and saves the intermediate
+                // result" (§9.6.1). So the effective address is calculated
+                // and the operand is read even when the instruction traps,
+                // and a postincrement has happened by the time it does.
                 self.fp_begin();
                 let (value, flags) = self.fp_load(fmt)?;
-                self.fp_operate(op, value, flags, dst, cos)
+                if outcome == Availability::Hardware {
+                    return self.fp_operate(op, value, flags, dst, cos, forced);
+                }
+                let ea = self.fp_last_address;
+                self.fp_trap_040(outcome, command, op, value, dst, ea)
             }
+        }
+    }
+
+    /// Take one of the 68040's two non-arithmetic floating-point exceptions.
+    ///
+    /// Both leave the same thing behind for the handler's `FSAVE`: the
+    /// instruction's command word and both operands, converted to extended
+    /// precision (M68040UM Table 9-16). They differ in the vector and in the
+    /// frame the *integer* unit stacks.
+    ///
+    /// - **Unimplemented instruction**, vector 11: "the processor creates a
+    ///   format $2 stack frame and saves the vector offset, PC, internal copy
+    ///   of the SR, and calculated effective address ... The saved PC value
+    ///   is the logical address of the instruction that **follows** the
+    ///   unimplemented floating-point instruction" (§9.6.1). That last part
+    ///   is what lets an emulation handler `RTE` straight back into the
+    ///   program once it has produced the result, and it is what separates
+    ///   this from an F-line *illegal* instruction, which shares the vector
+    ///   and stacks a format `$0` frame.
+    /// - **Unsupported data type**, vector 55: "a format $0 (for the
+    ///   pre-instruction exception) or format $3 (for the post-instruction
+    ///   exception) stack frame is saved" (§9.6.2). Opclass 000 and 010 are
+    ///   pre-instruction; only opclass 011, `FMOVE` out, is post-instruction,
+    ///   and that one is raised from `op_fstore`.
+    fn fp_trap_040(
+        &mut self,
+        outcome: Availability,
+        command: u16,
+        op: FpOp,
+        src: F80,
+        dst: u8,
+        ea: u32,
+    ) -> Result<(), Trap> {
+        let dest = self.state.fpu.fp[(dst & 7) as usize];
+        self.state.fpu.pending_040 = Some(fpu::State040 {
+            command,
+            etemp: src,
+            stag: fpu::data_tag(src),
+            // "Destination operand, if any, is converted to extended
+            // precision" — there is one only for a dyadic operation.
+            fptemp: if op.is_dyadic() { dest } else { F80::ZERO },
+            dtag: if op.is_dyadic() {
+                fpu::data_tag(dest)
+            } else {
+                0
+            },
+            post_instruction: false,
+        });
+        self.state.fpu.null = false;
+        self.settle()?;
+        let pc = self.state.pc;
+        match outcome {
+            Availability::Unimplemented => Err(Trap::six(vector::LINE_F, pc, ea)),
+            _ => Err(Trap::raised(vector::FP_UNSUPPORTED_TYPE, self.pc0)),
         }
     }
 
@@ -4607,10 +4757,22 @@ impl<'a> Exec<'a> {
         load_flags: Flags,
         dst: u8,
         cos: u8,
+        forced: Forced,
     ) -> Result<(), Trap> {
         let dst = dst & 7;
         let env = self.state.fpu.env();
-        let spec = self.state.fpu.spec();
+        // "FSADD and FDADD specify single- and double-precision rounding
+        // regardless of the precision specified in the FPCR PREC bits"
+        // (M68040UM §9.4.2). Like `PREC` itself, the forced precision
+        // shortens the exponent range as well as the significand, because
+        // the point of it is to "produce the same results as any other
+        // device that conforms to the IEEE 754 standard but does not support
+        // extended precision" (§9.4).
+        let spec = match forced {
+            Forced::Control => self.state.fpu.spec(),
+            Forced::Single => Spec::interchange(24, 127),
+            Forced::Double => Spec::interchange(53, 1023),
+        };
         let dest = fpu::canonical(self.state.fpu.fp[dst as usize]);
         let snan = fpu::is_snan(src) || (op.is_dyadic() && fpu::is_snan(dest));
 
@@ -4668,11 +4830,49 @@ impl<'a> Exec<'a> {
     /// register-to-memory), which §2.3.1 states as a rule: the register-to-
     /// memory `FMOVE`, `FMOVEM` and the control-register moves leave the
     /// `FPCC` alone.
-    fn op_fstore(&mut self, fmt: Fmt, src: u8, k: i8, k_reg: Option<u8>) -> Result<(), Trap> {
+    fn op_fstore(
+        &mut self,
+        fmt: Fmt,
+        src: u8,
+        k: i8,
+        k_reg: Option<u8>,
+        command: u16,
+    ) -> Result<(), Trap> {
         if matches!(fmt, Fmt::Packed) {
-            // Packed decimal is not implemented; see `fpu.rs`.
             let _ = (k, k_reg);
-            return Err(self.fp_line_f());
+            if !self.cfg.fpu.is_onchip_040() {
+                // Packed decimal is not implemented; see `fpu.rs`.
+                return Err(self.fp_line_f());
+            }
+            // "When an unsupported data type is detected for opclass 011
+            // (register-to-memory) instructions, a post-instruction
+            // exception is generated immediately. A format ... $3 (for the
+            // post-instruction exception) stack frame is saved, and vector
+            // number 55 is fetched" (M68040UM §9.6.2). The effective address
+            // is calculated first, so the handler knows where to put the
+            // digits it produces, and `T` is set in the state frame because
+            // "only an opclass 3 instruction can indicate a post-instruction
+            // exception" (§9.7, **T**).
+            let value = self.state.fpu.fp[(src & 7) as usize];
+            let Loc::Mem(addr) = self.fp_address(fmt.bytes())? else {
+                return Err(self.fp_line_f());
+            };
+            self.state.fpu.pending_040 = Some(fpu::State040 {
+                command,
+                etemp: value,
+                stag: fpu::data_tag(value),
+                fptemp: F80::ZERO,
+                dtag: 0,
+                post_instruction: true,
+            });
+            self.state.fpu.null = false;
+            self.settle()?;
+            let pc = self.state.pc;
+            return Err(Trap::post_instruction(
+                vector::FP_UNSUPPORTED_TYPE,
+                pc,
+                addr,
+            ));
         }
         self.fp_begin();
         let env = self.state.fpu.env();
@@ -4949,6 +5149,11 @@ impl<'a> Exec<'a> {
                 let Loc::Mem(addr) = self.fp_address(fmt.bytes())? else {
                     return Err(self.fp_line_f());
                 };
+                // Kept for the 68040's format $2 frame, whose address field
+                // is "the calculated effective address determined by the
+                // effective address field of the unimplemented instruction"
+                // (M68040UM §9.6.1).
+                self.fp_last_address = addr;
                 let (raw, extended) = match fmt {
                     Fmt::Byte => (u64::from(self.read_byte(addr)?), F80::ZERO),
                     Fmt::Word => (u64::from(self.read_word(addr)?), F80::ZERO),
@@ -5172,11 +5377,27 @@ impl<'a> Exec<'a> {
             self.write_long(addr, 0)?;
             return self.settle();
         }
+        if let Some(state) = self.state.fpu.pending_040 {
+            return self.fsave_unimplemented_040(state);
+        }
         let size = coprocessor.idle_frame();
+        if size == 4 {
+            // A 68040's idle frame is the format long word and nothing else
+            // (M68040UM Figure 9-10(c)), so there is no body to write and
+            // no pending exception to clear out of one: this core reports
+            // every arithmetic exception at the instruction that caused it
+            // and never leaves the unit busy.
+            let Loc::Mem(addr) = self.fp_address(size)? else {
+                return Err(self.fp_line_f());
+            };
+            let format = (u32::from(coprocessor.state_version()) << 24) | ((size - 4) << 16);
+            self.write_long(addr, format)?;
+            return self.settle();
+        }
         let Loc::Mem(addr) = self.fp_address(size)? else {
             return Err(self.fp_line_f());
         };
-        let format = (u32::from(FP_STATE_VERSION) << 24) | ((size - 4) << 16);
+        let format = (u32::from(coprocessor.state_version()) << 24) | ((size - 4) << 16);
         self.write_long(addr, format)?;
         let pending = self.state.fpu.fpsr & 0x0000_ff00;
         self.write_long(addr.wrapping_add(4), pending)?;
@@ -5207,7 +5428,15 @@ impl<'a> Exec<'a> {
         }
         let version = (format >> 24) as u8;
         let size = ((format >> 16) & 0xff) + 4;
-        if version != FP_STATE_VERSION || size != coprocessor.idle_frame() {
+        if version != coprocessor.state_version() {
+            self.settle()?;
+            let pc = self.state.pc;
+            return Err(Trap::raised(vector::FORMAT_ERROR, pc));
+        }
+        if coprocessor.is_onchip_040() {
+            return self.frestore_040(addr, size);
+        }
+        if size != coprocessor.idle_frame() {
             self.settle()?;
             let pc = self.state.pc;
             return Err(Trap::raised(vector::FORMAT_ERROR, pc));
@@ -5220,6 +5449,101 @@ impl<'a> Exec<'a> {
         self.state.fpu.null = false;
         // `(An)+` stepped by four for the format word; the rest of the frame
         // follows it.
+        if let Some((Mode::PostInc, reg)) = ea_of(Arg::Ea, self.opcode) {
+            let reg = reg as usize;
+            self.state.a[reg] = self.state.a[reg].wrapping_add(size - 4);
+        }
+        self.settle()
+    }
+
+    /// The MC68040's twenty-six-word unimplemented-instruction state frame
+    /// (M68040UM Figure 9-10(d)).
+    ///
+    /// This is the frame the emulation handler reads, and the reason the
+    /// unimplemented-instruction exception is worth taking faithfully: "the
+    /// exception handler uses the information provided in the state frame to
+    /// determine the instruction that it needs to emulate and the input
+    /// operands to that instruction" (§9.6.1). Table 9-16 names the fields
+    /// that matter — `CMDREG1B`, `ETEMP`, `STAG`, `FPTEMP`, `DTAG`, `E1`
+    /// and `T` — and every other field belongs to the arithmetic exceptions
+    /// this core reports at the instruction that caused them, so it is
+    /// written as zero.
+    ///
+    /// `ETEMP` and `FPTEMP` are the extended format laid out as the figure
+    /// draws it: sign in bit 31 of the first long word, the fifteen-bit
+    /// exponent in bits 30–16, then the sixty-four-bit significand. That is
+    /// the 96-bit extended memory format with its reserved word in the
+    /// middle, which is what an operand in memory already looks like.
+    fn fsave_unimplemented_040(&mut self, state: fpu::State040) -> Result<(), Trap> {
+        const SIZE: u32 = 0x34;
+        let Loc::Mem(addr) = self.fp_address(SIZE)? else {
+            return Err(self.fp_line_f());
+        };
+        let extended = |v: F80| -> (u32, u32, u32) {
+            (
+                u32::from(v.sign_exp) << 16,
+                (v.sig >> 32) as u32,
+                v.sig as u32,
+            )
+        };
+        let (fpts_fpte, fptm_hi, fptm_lo) = extended(state.fptemp);
+        let (ets_ete, etm_hi, etm_lo) = extended(state.etemp);
+        let words: [(u32, u32); 13] = [
+            // +$00 version $41 in bits 31-24, the length of the body in
+            // 23-16.
+            (0x00, (0x41 << 24) | ((SIZE - 4) << 16)),
+            (0x04, 0), // CMDREG3B, bits 26-16: an E3 exception only
+            (0x08, 0), // reserved in this frame
+            (0x0c, u32::from(state.stag & 7) << 29), // STAG in bits 31-29
+            (0x10, u32::from(state.command) << 16), // CMDREG1B in 31-16
+            (0x14, u32::from(state.dtag & 7) << 29), // DTAG in bits 31-29
+            // +$18 E1 is bit 26, E3 bit 25, T bit 20. "E1 — Always 1" and
+            // "T — Always 0" for an unimplemented instruction; `T` is 1 for
+            // the post-instruction case (Table 9-16).
+            (0x18, (1 << 26) | (u32::from(state.post_instruction) << 20)),
+            (0x1c, fpts_fpte),
+            (0x20, fptm_hi),
+            (0x24, fptm_lo),
+            (0x28, ets_ete),
+            (0x2c, etm_hi),
+            (0x30, etm_lo),
+        ];
+        for (offset, value) in words {
+            self.write_long(addr.wrapping_add(offset), value)?;
+        }
+        // The state has been handed over; the unit is idle again.
+        self.state.fpu.pending_040 = None;
+        self.settle()
+    }
+
+    /// `FRESTORE` on a 68040 (M68040UM §9.7).
+    ///
+    /// Three frames exist here: the null frame, handled by the caller; the
+    /// idle frame, four bytes; and the twenty-six-word unimplemented
+    /// instruction frame, which an emulation handler pops after it has
+    /// produced the result. The fifty-word busy frame is pipeline state this
+    /// core never produces, so a frame claiming to be one is a format error
+    /// rather than a guess.
+    fn frestore_040(&mut self, addr: u32, size: u32) -> Result<(), Trap> {
+        match size {
+            4 => {}
+            0x34 => {
+                // Touch the whole frame, so an unreadable one faults before
+                // anything is committed, and drop it: this core has nothing
+                // to put back, and the handler has already done the work the
+                // frame described.
+                for offset in (4..size).step_by(4) {
+                    self.read_long(addr.wrapping_add(offset))?;
+                }
+            }
+            _ => {
+                self.settle()?;
+                let pc = self.state.pc;
+                return Err(Trap::raised(vector::FORMAT_ERROR, pc));
+            }
+        }
+        self.state.fpu.pending_040 = None;
+        self.state.fpu.null = false;
         if let Some((Mode::PostInc, reg)) = ea_of(Arg::Ea, self.opcode) {
             let reg = reg as usize;
             self.state.a[reg] = self.state.a[reg].wrapping_add(size - 4);
@@ -6275,6 +6599,23 @@ const SSW_DF: u16 = 0x0100;
 /// and `CM`, bits 15–12 (M68040UM Figure 8-7).
 const SSW_040_CONTINUE: u16 = 0xf000;
 
+/// What the floating-point unit does with an instruction it has decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Availability {
+    /// It computes it.
+    Hardware,
+    /// Nothing answers the F line: the line-F exception, vector 11, with a
+    /// format `$0` frame.
+    LineF,
+    /// The 68040 recognises it as a floating-point instruction but does not
+    /// implement it: vector 11 with a format `$2` frame, which is how an
+    /// emulation handler tells the two apart (M68040UM §9.6.1).
+    Unimplemented,
+    /// The operand's data format is one the 68040 leaves to software:
+    /// vector 55 (§9.6.2).
+    UnsupportedType,
+}
+
 /// What one floating-point operation produced.
 struct FpResult {
     /// The value, which is also what sets the condition codes.
@@ -6313,7 +6654,7 @@ impl FpResult {
 /// The frame's body is microcode state on hardware and this core's own here,
 /// so it carries a version of its own and `FRESTORE` refuses anybody else's
 /// — the same bargain the 68010's long bus-fault frame makes.
-const FP_STATE_VERSION: u8 = 0x40;
+pub(super) const FP_STATE_VERSION: u8 = 0x40;
 
 /// The bits a root pointer descriptor has storage for: **L/U** (63), the
 /// fifteen-bit **LIMIT** (62–48), **DT** (33–32) and the table address

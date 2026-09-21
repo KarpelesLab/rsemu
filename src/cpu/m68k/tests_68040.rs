@@ -1523,3 +1523,488 @@ fn a_snapshot_does_not_carry_the_address_translation_cache() {
     assert_eq!(other.regs(), board.cpu.regs());
     assert_eq!(snapshot(&other).expect("again"), bytes);
 }
+
+// ----------------------------------------------------------------------
+// The on-chip floating-point unit
+// ----------------------------------------------------------------------
+
+use crate::float::x87::F80;
+
+/// `1.0` and a few neighbours, in the extended format.
+const FP_ONE: F80 = F80::new(0x3fff, 1 << 63);
+const FP_THREE: F80 = F80::new(0x4000, 0xc000_0000_0000_0000);
+
+/// A 68040 with its on-chip unit, running `words` at `$500`.
+fn fpu_board(words: &[u16]) -> Board {
+    let board = Board::new(Model::M68040);
+    board.boot(&[0x4e71]);
+    board.load(0x500, words);
+    board.at(0x500);
+    board
+}
+
+#[test]
+fn the_on_chip_unit_comes_with_the_part() {
+    use crate::core::props::Props;
+
+    // An MC68040 has one and cannot be told not to; an MC68LC040 and an
+    // MC68EC040 do not have one (M68040UM Appendices A and B).
+    let cpu = M68k::from_props(&Props::new().with("model", "68040")).unwrap();
+    assert!(cpu.config().fpu.present(), "the default follows the part");
+    assert!(cpu.config().fpu.is_onchip_040());
+    for model in ["68lc040", "68ec040"] {
+        let cpu = M68k::from_props(&Props::new().with("model", model)).unwrap();
+        assert!(!cpu.config().fpu.present(), "{model}");
+    }
+    let err = M68k::from_props(&Props::new().with("model", "68040").with("fpu", "none"))
+        .expect_err("a 68040's unit cannot be switched off");
+    assert!(alloc::format!("{err}").contains("68lc040"), "{err}");
+    let err = M68k::from_props(&Props::new().with("model", "68030").with("fpu", "68040"))
+        .expect_err("a 68030 has no on-chip unit");
+    assert!(alloc::format!("{err}").contains("own chip"), "{err}");
+}
+
+#[test]
+fn the_hardware_subset_is_computed() {
+    // M68040UM Table 9-10 and M68000PRM Table A-1: FABS, FADD, FCMP, FDIV,
+    // FMOVE, FMUL, FNEG, FSQRT, FSUB and FTST are hardware; everything else
+    // traps. FADD FP1,FP0 with FP0 = 1.0 and FP1 = 3.0 is 4.0.
+    let board = fpu_board(&[0xf200, 0x0422, 0x4e71]); // FADD.X FP1,FP0
+    board.with_regs(|r| {
+        r.fp[0] = FP_ONE;
+        r.fp[1] = FP_THREE;
+    });
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), None, "no trap");
+    assert_eq!(board.cpu.regs().fp[0], F80::new(0x4001, 1 << 63), "4.0");
+}
+
+/// The opmodes of the instructions the 68040 leaves to software, with their
+/// mnemonics, from M68040UM Table 9-10 and M68000PRM Table A-1.
+const UNIMPLEMENTED_OPMODES: [(u16, &str); 29] = [
+    (0x01, "FINT"),
+    (0x02, "FSINH"),
+    (0x03, "FINTRZ"),
+    (0x06, "FLOGNP1"),
+    (0x08, "FETOXM1"),
+    (0x09, "FTANH"),
+    (0x0a, "FATAN"),
+    (0x0c, "FASIN"),
+    (0x0d, "FATANH"),
+    (0x0e, "FSIN"),
+    (0x0f, "FTAN"),
+    (0x10, "FETOX"),
+    (0x11, "FTWOTOX"),
+    (0x12, "FTENTOX"),
+    (0x14, "FLOGN"),
+    (0x15, "FLOG10"),
+    (0x16, "FLOG2"),
+    (0x19, "FCOSH"),
+    (0x1c, "FACOS"),
+    (0x1d, "FCOS"),
+    (0x1e, "FGETEXP"),
+    (0x1f, "FGETMAN"),
+    (0x21, "FMOD"),
+    (0x24, "FSGLDIV"),
+    (0x25, "FREM"),
+    (0x26, "FSCALE"),
+    (0x27, "FSGLMUL"),
+    (0x30, "FSINCOS"),
+    (0x00, "FMOVECR"), // by its own encoding, below
+];
+
+#[test]
+fn every_unimplemented_instruction_takes_vector_11_with_a_format_2_frame() {
+    // M68040UM §9.6.1: "the processor creates a format $2 stack frame ...
+    // The saved PC value is the logical address of the instruction that
+    // follows the unimplemented floating-point instruction. The processor
+    // generates exception vector number 11". §9.6.1 again: the handler
+    // "checks for the format $2 stack frame to distinguish an unimplemented
+    // floating-point instruction from other F-line unimplemented
+    // instructions", which stack format $0.
+    for (opmode, what) in UNIMPLEMENTED_OPMODES {
+        if what == "FMOVECR" {
+            continue;
+        }
+        // FxxxX FP1,FP0: opclass 000, source FP1, destination FP0.
+        let command = 0x0400 | opmode;
+        let board = fpu_board(&[0xf200, command, 0x4e71]);
+        board.handler(0, vector::LINE_F, 0x0c00);
+        let sr = board.cpu.regs().sr;
+        board.cpu.step();
+        assert_eq!(board.cpu.last_exception(), Some(vector::LINE_F), "{what}");
+        let sp = u64::from(board.cpu.regs().a[7]);
+        assert_eq!(board.peek_word(sp), sr, "{what}: +$00 SR");
+        assert_eq!(
+            board.peek_long(sp + 2),
+            0x504,
+            "{what}: +$02 the *next* instruction"
+        );
+        assert_eq!(
+            board.peek_word(sp + 6),
+            0x202c,
+            "{what}: +$06 format $2, the line-F vector offset"
+        );
+    }
+}
+
+#[test]
+fn fmovecr_is_unimplemented_on_a_68040() {
+    // Table 9-10 lists FMOVECR among the monadic operations the 68040 does
+    // not implement: the constant ROM is the software package's.
+    let board = fpu_board(&[0xf200, 0x5c00, 0x4e71]); // FMOVECR #$00,FP0
+    board.handler(0, vector::LINE_F, 0x0c00);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::LINE_F));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x202c, "format $2");
+}
+
+#[test]
+fn an_f_line_word_that_is_not_an_instruction_stacks_format_0() {
+    // §9.6.1: "If the processor encounters an F-line instruction and the
+    // instruction patterns do not match either of the above two cases, the
+    // processor takes an F-line illegal exception ... and pushes a four-word
+    // stack frame format $0 on the system stack. Since the unimplemented
+    // floating-point exception and the F-line illegal instruction share the
+    // same vector, the exception handler uses the stack frame format ($0 or
+    // $2) to distinguish between the two."
+    let board = fpu_board(&[0xfa00, 0x0000, 0x4e71]); // coprocessor id 5
+    board.handler(0, vector::LINE_F, 0x0c00);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::LINE_F));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x002c, "format $0");
+    assert_eq!(board.peek_long(sp + 2), 0x500, "the instruction itself");
+}
+
+#[test]
+fn the_effective_address_is_calculated_and_the_operand_fetched_before_the_trap() {
+    // §9.6.1: "the instruction is partially decoded to allow fetching of the
+    // memory source operand ... The fetched source operand is passed to the
+    // FPU, which converts the operand to extended precision and saves the
+    // intermediate result", and §8.4.6.2 says the format $2 frame's address
+    // field is "the calculated effective address determined by the effective
+    // address field of the unimplemented instruction".
+    let board = fpu_board(&[0xf218, 0x418e, 0x4e71]); // FSIN.L (A0)+,FP3
+    board.with_regs(|r| r.a[0] = 0x1000);
+    board.poke_long(0x1000, 7);
+    board.handler(0, vector::LINE_F, 0x0c00);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::LINE_F));
+    assert_eq!(board.cpu.regs().a[0], 0x1004, "the postincrement happened");
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x202c, "format $2");
+    assert_eq!(board.peek_long(sp + 8), 0x1000, "+$08 the calculated <ea>");
+}
+
+#[test]
+fn fsave_after_an_unimplemented_instruction_writes_the_26_word_frame() {
+    // M68040UM Figure 9-10(d) and Table 9-16, field by field. FSIN.X FP1,FP0
+    // with FP1 = 3.0 and FP0 = 1.0: a monadic operation, so FPTEMP has no
+    // destination operand in it and DTAG is zero.
+    let board = fpu_board(&[0xf200, 0x040e, 0x4e71]); // FSIN.X FP1,FP0
+    board.with_regs(|r| {
+        r.fp[0] = FP_ONE;
+        r.fp[1] = FP_THREE;
+    });
+    board.handler(0, vector::LINE_F, 0x0c00);
+    // The handler saves the frame at $1000 and stops.
+    board.load(0x0c00, &[0xf310, 0x4e71]); // FSAVE (A0)
+    board.with_regs(|r| r.a[0] = 0x1000);
+    board.cpu.step(); // the FSIN traps
+    assert_eq!(board.cpu.last_exception(), Some(vector::LINE_F));
+    board.cpu.step(); // the FSAVE
+    assert_eq!(
+        board.peek_long(0x1000),
+        0x4130_0000,
+        "+$00 version $41, a $30-byte body"
+    );
+    assert_eq!(board.peek_long(0x1004), 0, "+$04 CMDREG3B: an E3 field");
+    assert_eq!(board.peek_long(0x1008), 0, "+$08 reserved");
+    assert_eq!(
+        board.peek_long(0x100c) >> 29,
+        0b000,
+        "+$0C STAG: a normalized source"
+    );
+    assert_eq!(
+        board.peek_long(0x1010),
+        0x040e_0000,
+        "+$10 CMDREG1B: the command word"
+    );
+    assert_eq!(board.peek_long(0x1014) >> 29, 0, "+$14 DTAG");
+    assert_eq!(
+        board.peek_long(0x1018),
+        1 << 26,
+        "+$18 E1 set, E3 clear, T clear"
+    );
+    // ETEMP is the source, 3.0, in the 96-bit extended layout.
+    assert_eq!(board.peek_long(0x1028), 0x4000_0000, "+$28 ETS and ETE");
+    assert_eq!(board.peek_long(0x102c), 0xc000_0000, "+$2C ETM[63-32]");
+    assert_eq!(board.peek_long(0x1030), 0, "+$30 ETM[31-00]");
+    // A monadic operation leaves FPTEMP alone.
+    assert_eq!(board.peek_long(0x101c), 0, "+$1C FPTS and FPTE");
+}
+
+#[test]
+fn a_dyadic_unimplemented_instruction_saves_both_operands() {
+    // Table 9-16: "FPTEMP — Destination operand, if any, is converted to
+    // extended precision" and "DTAG — Destination operand tag, if any".
+    // FREM is dyadic and unimplemented.
+    let board = fpu_board(&[0xf200, 0x0425, 0x4e71]); // FREM.X FP1,FP0
+    board.with_regs(|r| {
+        r.fp[0] = FP_ONE;
+        r.fp[1] = FP_THREE;
+    });
+    board.handler(0, vector::LINE_F, 0x0c00);
+    board.load(0x0c00, &[0xf310, 0x4e71]); // FSAVE (A0)
+    board.with_regs(|r| r.a[0] = 0x1000);
+    board.cpu.step();
+    board.cpu.step();
+    assert_eq!(board.peek_long(0x101c), 0x3fff_0000, "FPTEMP is 1.0");
+    assert_eq!(board.peek_long(0x1020), 0x8000_0000);
+    assert_eq!(board.peek_long(0x1028), 0x4000_0000, "ETEMP is 3.0");
+    assert_eq!(board.peek_long(0x1014) >> 29, 0b000, "DTAG: normalized");
+}
+
+#[test]
+fn the_data_tags_name_the_operand_type() {
+    // §9.7, *STAG, DTAG*: 000 normalized, 001 zero, 010 infinity, 011 NaN,
+    // 100 an extended denormal or unnormal.
+    for (value, tag, what) in [
+        (FP_ONE, 0b000u32, "normalized"),
+        (F80::ZERO, 0b001, "zero"),
+        (F80::new(0x7fff, 1 << 63), 0b010, "infinity"),
+        (F80::new(0x7fff, u64::MAX), 0b011, "NaN"),
+        (F80::new(0x0000, 1), 0b100, "denormalized"),
+        (F80::new(0x4000, 1), 0b100, "unnormalized"),
+    ] {
+        let board = fpu_board(&[0xf200, 0x040e, 0x4e71]); // FSIN.X FP1,FP0
+        board.with_regs(|r| r.fp[1] = value);
+        board.handler(0, vector::LINE_F, 0x0c00);
+        board.load(0x0c00, &[0xf310, 0x4e71]);
+        board.with_regs(|r| r.a[0] = 0x1000);
+        board.cpu.step();
+        board.cpu.step();
+        assert_eq!(board.peek_long(0x100c) >> 29, tag, "STAG for {what}");
+    }
+}
+
+#[test]
+fn frestore_of_an_unimplemented_frame_leaves_the_unit_idle() {
+    // The emulation handler pops the frame once it has produced the result,
+    // and a following FSAVE reports an idle unit (M68040UM §9.7).
+    let board = fpu_board(&[0xf200, 0x040e, 0x4e71]);
+    board.handler(0, vector::LINE_F, 0x0c00);
+    board.load(
+        0x0c00,
+        &[
+            0xf310, // FSAVE (A0)
+            0xf350, // FRESTORE (A0)
+            0xf311, // FSAVE (A1)
+            0x4e71,
+        ],
+    );
+    board.with_regs(|r| {
+        r.a[0] = 0x1000;
+        r.a[1] = 0x1400;
+    });
+    board.cpu.step(); // the trap
+    for _ in 0..3 {
+        board.cpu.step();
+    }
+    assert_eq!(board.peek_long(0x1400), 0x4100_0000, "an idle frame");
+}
+
+#[test]
+fn an_untouched_unit_saves_a_null_frame_and_a_used_one_saves_the_idle_frame() {
+    // M68040UM Figure 9-10(b) and (c): the null frame is a zero long word,
+    // and the idle frame is version $41 with a zero-length body — the whole
+    // frame is the format long word.
+    let board = fpu_board(&[0xf310, 0x4e71]); // FSAVE (A0)
+    board.with_regs(|r| r.a[0] = 0x1000);
+    board.cpu.step();
+    assert_eq!(board.peek_long(0x1000), 0, "null");
+
+    let board = fpu_board(&[0xf200, 0x0422, 0xf310, 0x4e71]); // FADD, then FSAVE
+    board.with_regs(|r| r.a[0] = 0x1000);
+    board.cpu.step();
+    board.cpu.step();
+    assert_eq!(board.peek_long(0x1000), 0x4100_0000, "idle");
+}
+
+#[test]
+fn packed_decimal_is_an_unsupported_data_type_rather_than_line_f() {
+    // §9.6.2: "an unsupported data type exception occurs when ... either the
+    // source or destination data format is packed decimal real ...
+    // Unsupported data types with operands that have opclass 010 or 000
+    // ... cause a pre-instruction exception ... A format $0 ... stack frame
+    // is saved, and vector number 55 is fetched."
+    let board = fpu_board(&[0xf210, 0x4c00, 0x4e71]); // FMOVE.P (A0),FP0
+    board.with_regs(|r| r.a[0] = 0x1000);
+    board.handler(0, vector::FP_UNSUPPORTED_TYPE, 0x0c00);
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.last_exception(),
+        Some(vector::FP_UNSUPPORTED_TYPE)
+    );
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x00dc, "format $0, offset $0DC");
+    assert_eq!(board.peek_long(sp + 2), 0x500, "the instruction itself");
+
+    // A 68881 has no such exception: packed decimal is simply not
+    // implemented there, and the encoding is line F.
+    let b881 = Board::with_fpu(Model::M68030, super::Coprocessor::M68881);
+    b881.boot(&[0xf210, 0x4c00, 0x4e71]);
+    b881.handler(0, vector::LINE_F, 0x0c00);
+    b881.cpu.step();
+    assert_eq!(b881.cpu.last_exception(), Some(vector::LINE_F));
+}
+
+#[test]
+fn a_packed_decimal_store_is_a_post_instruction_exception() {
+    // §9.6.2: "when an unsupported data type is detected for opclass 011
+    // (register-to-memory) instructions, a post-instruction exception is
+    // generated immediately ... a format $3 ... stack frame is saved".
+    let board = fpu_board(&[0xf210, 0x6c00, 0x4e71]); // FMOVE.P FP0,(A0){#0}
+    board.with_regs(|r| {
+        r.a[0] = 0x1000;
+        r.fp[0] = FP_THREE;
+    });
+    board.handler(0, vector::FP_UNSUPPORTED_TYPE, 0x0c00);
+    board.load(0x0c00, &[0xf311, 0x4e71]); // FSAVE (A1)
+    board.with_regs(|r| r.a[1] = 0x1400);
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.last_exception(),
+        Some(vector::FP_UNSUPPORTED_TYPE)
+    );
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x30dc, "format $3, offset $0DC");
+    assert_eq!(board.peek_long(sp + 2), 0x504, "the next instruction");
+    assert_eq!(
+        board.peek_long(sp + 8),
+        0x1000,
+        "+$08 the effective address"
+    );
+    // And the state frame says so: T is set for an opclass 3 exception
+    // (§9.7, **T**; Table 9-16).
+    board.cpu.step();
+    assert_eq!(
+        board.peek_long(0x1418),
+        (1 << 26) | (1 << 20),
+        "E1 and T set"
+    );
+}
+
+#[test]
+fn the_forced_precision_forms_round_where_they_say() {
+    // M68040UM §9.4.2: "FSADD and FDADD specify single- and double-precision
+    // rounding regardless of the precision specified in the FPCR PREC bits".
+    // 1.0 + 2^-40 is exact in extended and in double, and rounds back to 1.0
+    // in single, which has only 24 significand bits.
+    let epsilon = F80::new(0x3fff - 40, 1 << 63);
+    for (opmode, expected, what) in [
+        (0x22u16, F80::new(0x3fff, (1u64 << 63) | (1 << 23)), "FADD"),
+        (0x62, FP_ONE, "FSADD"),
+        (0x66, F80::new(0x3fff, (1u64 << 63) | (1 << 23)), "FDADD"),
+    ] {
+        let board = fpu_board(&[0xf200, 0x0400 | opmode, 0x4e71]);
+        board.with_regs(|r| {
+            r.fp[0] = FP_ONE;
+            r.fp[1] = epsilon;
+        });
+        board.cpu.step();
+        assert_eq!(board.cpu.last_exception(), None, "{what}");
+        assert_eq!(board.cpu.regs().fp[0], expected, "{what}");
+    }
+}
+
+#[test]
+fn the_sixteen_forced_precision_opmodes_are_the_only_ones_with_bit_6_set() {
+    // M68000PRM §5 gives an `FSxxx`/`FDxxx` form to exactly eight
+    // operations. Every other opmode with bit 6 set encodes nothing, and
+    // "the processor takes an F-line illegal exception" (M68040UM §9.6.1) —
+    // which here means the command word decodes to nothing at all.
+    let valid: [u16; 16] = [
+        0x40, 0x44, 0x41, 0x45, 0x58, 0x5c, 0x5a, 0x5e, 0x60, 0x64, 0x62, 0x66, 0x63, 0x67, 0x68,
+        0x6c,
+    ];
+    for opmode in 0x40u16..=0x7f {
+        // Opclass 000, source FP0, destination FP0: only the opmode varies.
+        let decoded = super::isa::fp::decode(opmode).is_some();
+        assert_eq!(decoded, valid.contains(&opmode), "opmode ${opmode:02x}");
+    }
+    // And the pairs map to the right operations — the mask that fits the
+    // other fourteen would have put FSSQRT on FINT.
+    for (opmode, mnemonic) in [
+        (0x40u16, "FSMOVE"),
+        (0x44, "FDMOVE"),
+        (0x41, "FSSQRT"),
+        (0x45, "FDSQRT"),
+        (0x58, "FSABS"),
+        (0x5c, "FDABS"),
+        (0x5a, "FSNEG"),
+        (0x5e, "FDNEG"),
+        (0x60, "FSDIV"),
+        (0x64, "FDDIV"),
+        (0x62, "FSADD"),
+        (0x66, "FDADD"),
+        (0x63, "FSMUL"),
+        (0x67, "FDMUL"),
+        (0x68, "FSSUB"),
+        (0x6c, "FDSUB"),
+    ] {
+        assert_eq!(super::isa::fp::mnemonic(opmode), mnemonic, "${opmode:02x}");
+    }
+}
+
+#[test]
+fn the_conditionals_and_the_moves_are_all_hardware() {
+    // Table A-1 gives FBcc, FDBcc, FScc, FTRAPcc, FNOP, FMOVE, FMOVEM,
+    // FSAVE and FRESTORE to the 68040 without a footnote. FMOVEM of two
+    // registers through memory is the one that touches the most of them.
+    let board = fpu_board(&[
+        0xf210, 0xf0c0, // FMOVEM.X FP0-FP1,(A0)
+        0xf210, 0xd030, // FMOVEM.X (A0),FP2-FP3
+        0x4e71,
+    ]);
+    board.with_regs(|r| {
+        r.a[0] = 0x1100;
+        r.fp[0] = FP_ONE;
+        r.fp[1] = FP_THREE;
+    });
+    board.cpu.step();
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(board.cpu.last_exception(), None);
+    assert_eq!((r.fp[2], r.fp[3]), (FP_ONE, FP_THREE));
+}
+
+#[test]
+fn a_68040_floating_point_snapshot_carries_what_an_fsave_still_owes() -> Result<()> {
+    let board = fpu_board(&[0xf200, 0x040e, 0x4e71]); // FSIN: unimplemented
+    board.with_regs(|r| r.fp[1] = FP_THREE);
+    board.handler(0, vector::LINE_F, 0x0c00);
+    board.cpu.step();
+    let bytes = snapshot(&board.cpu)?;
+    let other = M68k::new(Config::MC68040);
+    restore(&other, &bytes)?;
+    assert_eq!(other.regs(), board.cpu.regs());
+    assert_eq!(snapshot(&other)?, bytes, "a round trip is a fixed point");
+    Ok(())
+}
+
+#[test]
+fn an_lc040_takes_the_exception_for_every_floating_point_instruction() {
+    // M68040UM Appendix A: "the MC68LC040 does not contain an FPU, causing
+    // unimplemented floating-point exceptions". With no unit at all the
+    // F-line encodings are not instructions, so the frame is format $0.
+    let board = Board::new(Model::M68LC040);
+    board.boot(&[0xf200, 0x0422, 0x4e71]); // FADD.X FP1,FP0
+    board.handler(0, vector::LINE_F, 0x0c00);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::LINE_F));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x002c, "format $0");
+}

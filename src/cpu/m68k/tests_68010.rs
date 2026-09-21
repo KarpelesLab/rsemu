@@ -27,7 +27,16 @@ pub(super) struct Board {
 
 impl Board {
     pub(super) fn new(model: Model) -> Board {
-        Board::with_fpu(model, super::Coprocessor::None)
+        // A 68040's floating-point unit is on the chip, so a board that says
+        // "a 68040" has one whether it asked or not.
+        Board::with_fpu(
+            model,
+            if model.has_onchip_fpu() {
+                super::Coprocessor::M68040
+            } else {
+                super::Coprocessor::None
+            },
+        )
     }
 
     /// The same board with a floating-point coprocessor attached.

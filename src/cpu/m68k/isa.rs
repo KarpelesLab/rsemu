@@ -2194,17 +2194,37 @@ pub mod fp {
                 }
                 let opmode = (word & 0x7f) as u8;
                 // Bit 6 of the opmode is the 68040's forced precision, and
-                // only for the arithmetic operations it added.
-                let (base, forced) = match opmode & 0x40 {
-                    0 => (opmode, Forced::Control),
-                    _ => (
-                        opmode & 0x3b,
-                        if opmode & 0x04 == 0 {
-                            Forced::Single
-                        } else {
-                            Forced::Double
-                        },
-                    ),
+                // it exists for exactly sixteen encodings — the eight
+                // hardware operations that produce a result, each in a
+                // single- and a double-rounding form (M68000PRM §5, the
+                // *Instruction Format* of `FABS`, `FADD`, `FDIV`, `FMOVE`,
+                // `FMUL`, `FNEG`, `FSQRT` and `FSUB`). The table is written
+                // out rather than masked, because the mask that fits the
+                // other fourteen puts `FSSQRT` on `FINT`.
+                let (base, forced) = match opmode {
+                    0x40 => (0x00, Forced::Single), // FSMOVE
+                    0x44 => (0x00, Forced::Double), // FDMOVE
+                    0x41 => (0x04, Forced::Single), // FSSQRT
+                    0x45 => (0x04, Forced::Double), // FDSQRT
+                    0x58 => (0x18, Forced::Single), // FSABS
+                    0x5c => (0x18, Forced::Double), // FDABS
+                    0x5a => (0x1a, Forced::Single), // FSNEG
+                    0x5e => (0x1a, Forced::Double), // FDNEG
+                    0x60 => (0x20, Forced::Single), // FSDIV
+                    0x64 => (0x20, Forced::Double), // FDDIV
+                    0x62 => (0x22, Forced::Single), // FSADD
+                    0x66 => (0x22, Forced::Double), // FDADD
+                    0x63 => (0x23, Forced::Single), // FSMUL
+                    0x67 => (0x23, Forced::Double), // FDMUL
+                    0x68 => (0x28, Forced::Single), // FSSUB
+                    0x6c => (0x28, Forced::Double), // FDSUB
+                    // Every other opmode with bit 6 set encodes nothing:
+                    // "if the processor encounters an F-line instruction and
+                    // the instruction patterns do not match either of the
+                    // above two cases, the processor takes an F-line illegal
+                    // exception" (M68040UM §9.6.1).
+                    _ if opmode & 0x40 != 0 => return None,
+                    _ => (opmode, Forced::Control),
                 };
                 let op = FpOp::from_opmode(base)?;
                 let cos = (word & 7) as u8;
@@ -2285,6 +2305,51 @@ pub mod fp {
     #[must_use]
     pub fn mnemonic(word: u16) -> &'static str {
         match decode(word) {
+            // The 68040's forced-precision forms are spelled with an `S` or
+            // a `D` after the `F`: `FSADD`, `FDADD` (M68000PRM §5, *FADD*).
+            Some(
+                Class::RegOp {
+                    op,
+                    forced: Forced::Single | Forced::Double,
+                    ..
+                }
+                | Class::MemOp {
+                    op,
+                    forced: Forced::Single | Forced::Double,
+                    ..
+                },
+            ) => {
+                let double = matches!(
+                    decode(word),
+                    Some(
+                        Class::RegOp {
+                            forced: Forced::Double,
+                            ..
+                        } | Class::MemOp {
+                            forced: Forced::Double,
+                            ..
+                        }
+                    )
+                );
+                match (op, double) {
+                    (FpOp::Move, false) => "FSMOVE",
+                    (FpOp::Move, true) => "FDMOVE",
+                    (FpOp::Sqrt, false) => "FSSQRT",
+                    (FpOp::Sqrt, true) => "FDSQRT",
+                    (FpOp::Abs, false) => "FSABS",
+                    (FpOp::Abs, true) => "FDABS",
+                    (FpOp::Neg, false) => "FSNEG",
+                    (FpOp::Neg, true) => "FDNEG",
+                    (FpOp::Div, false) => "FSDIV",
+                    (FpOp::Div, true) => "FDDIV",
+                    (FpOp::Add, false) => "FSADD",
+                    (FpOp::Add, true) => "FDADD",
+                    (FpOp::Mul, false) => "FSMUL",
+                    (FpOp::Mul, true) => "FDMUL",
+                    (FpOp::Sub, false) => "FSSUB",
+                    (_, _) => "FDSUB",
+                }
+            }
             Some(Class::RegOp { op, .. } | Class::MemOp { op, .. }) => op.mnemonic(),
             Some(Class::MoveCr { .. }) => "FMOVECR",
             Some(Class::Store { .. } | Class::Control { .. }) => "FMOVE",

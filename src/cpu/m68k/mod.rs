@@ -371,10 +371,11 @@ pub use fpu::Coprocessor;
 pub use isa::Model;
 
 /// The values the `fpu` property accepts, in [`Coprocessor::ALL`] order.
-const FPU_NAMES: [&str; 3] = [
+const FPU_NAMES: [&str; 4] = [
     Coprocessor::None.name(),
     Coprocessor::M68881.name(),
     Coprocessor::M68882.name(),
+    Coprocessor::M68040.name(),
 ];
 
 /// The values the `model` property accepts, in [`Model::ALL`] order.
@@ -509,6 +510,10 @@ pub mod vector {
     pub const FP_OVERFLOW: u8 = 53;
     /// Vector 54: a signalling not-a-number was an operand.
     pub const FP_SIGNALING_NAN: u8 = 54;
+    /// Vector 55: an operand whose data format the 68040 leaves to software
+    /// — a denormalized or unnormalized number, or packed decimal
+    /// (M68040UM Table 9-9, §9.6.2).
+    pub const FP_UNSUPPORTED_TYPE: u8 = 55;
     /// Vector 56: an MMU configuration error — a `PMOVE` that loaded `TC`,
     /// `CRP` or `SRP` with a value the unit cannot use (MC68030UM §9.7.5.3).
     pub const MMU_CONFIG: u8 = 56;
@@ -1062,8 +1067,10 @@ impl Config {
     /// An MC68EC030: a 68030 with no paged memory management unit.
     pub const MC68EC030: Config = Config::MC68000.with_model(Model::M68EC030);
 
-    /// An MC68040.
-    pub const MC68040: Config = Config::MC68000.with_model(Model::M68040);
+    /// An MC68040, whose floating-point unit is on the chip.
+    pub const MC68040: Config = Config::MC68000
+        .with_model(Model::M68040)
+        .with_fpu(Coprocessor::M68040);
 
     /// An MC68LC040: a 68040 with no floating-point unit.
     pub const MC68LC040: Config = Config::MC68000.with_model(Model::M68LC040);
@@ -1362,15 +1369,42 @@ impl M68k {
         // one lands.
         let _engine = r.or_enum("engine", "interp", &["interp"])?;
         let model = r.or_enum("model", Model::M68000.name(), &MODEL_NAMES)?;
-        let fpu = r.or_enum("fpu", Coprocessor::None.name(), &FPU_NAMES)?;
+        // A 68040's floating-point unit is part of the *part*, not of the
+        // board: an MC68040 has one and an MC68LC040 does not, and those are
+        // different order codes. So the property's default follows the model
+        // rather than being `none` everywhere.
+        let default_fpu = if Model::from_name(model).is_some_and(Model::has_onchip_fpu) {
+            Coprocessor::M68040.name()
+        } else {
+            Coprocessor::None.name()
+        };
+        let fpu = r.or_enum("fpu", default_fpu, &FPU_NAMES)?;
         r.finish()?;
         let model = Model::from_name(model).unwrap_or_default();
         let fpu = Coprocessor::from_name(fpu).unwrap_or_default();
+        if fpu.is_onchip_040() && !model.has_onchip_fpu() {
+            return Err(Error::Config {
+                at: String::from("cpu.m68k"),
+                message: alloc::format!(
+                    "the `68040` floating-point unit is on the MC68040's own chip; \
+                     a {model} does not have one"
+                ),
+            });
+        }
+        if model.has_onchip_fpu() && !fpu.present() {
+            return Err(Error::Config {
+                at: String::from("cpu.m68k"),
+                message: String::from(
+                    "an MC68040 has a floating-point unit on the chip and no way to \
+                     switch it off; the part without one is the `68lc040`",
+                ),
+            });
+        }
         // A coprocessor answers the F line, and the F-line coprocessor
         // interface arrived with the 68020 (MC68020UM §7). A 68881 can be
         // wired to a 68000 as an ordinary peripheral, but then it is not a
         // coprocessor and its instructions do not exist.
-        if fpu.present() && !model.has_coprocessor_interface() {
+        if fpu.present() && !fpu.is_onchip_040() && !model.has_coprocessor_interface() {
             let why = if model.has_040() {
                 "the 68040 dropped it and answers the F line itself"
             } else {
@@ -1829,8 +1863,9 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    translation cache is *not* in it — it is derived state, and a
     //    restored core rebuilds it with a table search (CLAUDE.md,
     //    *Devices*).
-    // 4: and the 68040's, which are different registers rather than wider
-    //    ones and so take their own chunk.
+    // 4: and the 68040's memory management registers, which are different
+    //    registers rather than wider ones and so take their own chunk, plus
+    //    what its floating-point unit still owes an `FSAVE`.
     version: 4,
     summary: "Motorola MC68000/68010/68020/68030/68040 32-bit CPU core, interpreter",
     properties: &[
@@ -1857,8 +1892,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "fpu",
             kind: ValueKind::Str,
             required: false,
-            summary: "which floating-point coprocessor: `none` (the default), \
-`68881` or `68882`; needs a 68020 or later",
+            summary: "which floating-point unit: `none`, `68881` or `68882` on a 68020 \
+or 68030, and `68040` — the on-chip one, and the default — on a 68040",
         },
     ],
     construct: |props| Ok(Box::new(M68k::from_props(props)?)),
@@ -2089,6 +2124,30 @@ impl Device for M68k {
         w.write_u32(state.fpu.fpsr)?;
         w.write_u32(state.fpu.fpiar)?;
         w.write_bool(state.fpu.null)?;
+        if !self.fpu.is_onchip_040() {
+            return Ok(());
+        }
+        // What a 68040's `FSAVE` still owes an emulation handler. It is
+        // architectural state — the handler will read it — so it travels,
+        // unlike the address translation cache beside it, which is derived.
+        let pending = state.fpu.pending_040;
+        w.write_bool(pending.is_some())?;
+        let pending = pending.unwrap_or(fpu::State040 {
+            command: 0,
+            etemp: F80::ZERO,
+            stag: 0,
+            fptemp: F80::ZERO,
+            dtag: 0,
+            post_instruction: false,
+        });
+        w.write_u16(pending.command)?;
+        for value in [pending.etemp, pending.fptemp] {
+            w.write_u16(value.sign_exp)?;
+            w.write_u64(value.sig)?;
+        }
+        w.write_u8(pending.stag)?;
+        w.write_u8(pending.dtag)?;
+        w.write_bool(pending.post_instruction)?;
         Ok(())
     }
 
@@ -2206,6 +2265,25 @@ impl Device for M68k {
             state.fpu.fpsr = r.read_u32()? & fpu::bits::FPSR_IMPLEMENTED;
             state.fpu.fpiar = r.read_u32()?;
             state.fpu.null = r.read_bool()?;
+            if self.fpu.is_onchip_040() {
+                let present = r.read_bool()?;
+                let command = r.read_u16()?;
+                let mut operand = [F80::ZERO; 2];
+                for slot in &mut operand {
+                    let sign_exp = r.read_u16()?;
+                    let sig = r.read_u64()?;
+                    *slot = F80::new(sign_exp, sig);
+                }
+                let state040 = fpu::State040 {
+                    command,
+                    etemp: operand[0],
+                    fptemp: operand[1],
+                    stag: r.read_u8()? & 7,
+                    dtag: r.read_u8()? & 7,
+                    post_instruction: r.read_bool()?,
+                };
+                state.fpu.pending_040 = present.then_some(state040);
+            }
         }
         self.session.lock().state = state;
         self.lines.restore((ipl, vector, level_seven, resets));

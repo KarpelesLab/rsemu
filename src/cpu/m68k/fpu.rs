@@ -110,11 +110,24 @@ pub enum Coprocessor {
     M68881,
     /// An MC68882.
     M68882,
+    /// The MC68040's on-chip unit.
+    ///
+    /// Not a coprocessor: the 68040 has no coprocessor interface and answers
+    /// the F line itself (M68040UM §1.1, §9). It is a property of the *part*
+    /// rather than of the board, so the `fpu` property derives it from
+    /// `model` — an MC68040 has one, an MC68LC040 and an MC68EC040 do not,
+    /// and those are different part numbers rather than different boards.
+    M68040,
 }
 
 impl Coprocessor {
     /// Every value the `fpu` property accepts, in order.
-    pub const ALL: [Coprocessor; 3] = [Coprocessor::None, Coprocessor::M68881, Coprocessor::M68882];
+    pub const ALL: [Coprocessor; 4] = [
+        Coprocessor::None,
+        Coprocessor::M68881,
+        Coprocessor::M68882,
+        Coprocessor::M68040,
+    ];
 
     /// The name the property spells it with.
     #[must_use]
@@ -123,7 +136,16 @@ impl Coprocessor {
             Coprocessor::None => "none",
             Coprocessor::M68881 => "68881",
             Coprocessor::M68882 => "68882",
+            Coprocessor::M68040 => "68040",
         }
+    }
+
+    /// Whether this unit is the 68040's, which implements a *subset* of the
+    /// 6888x instruction set in hardware and traps for the rest.
+    #[inline]
+    #[must_use]
+    pub const fn is_onchip_040(self) -> bool {
+        matches!(self, Coprocessor::M68040)
     }
 
     /// The coprocessor a property value names.
@@ -140,12 +162,29 @@ impl Coprocessor {
     }
 
     /// How many bytes an `FSAVE` idle frame occupies, the format long word
-    /// included: 28 on a 68881 and 60 on a 68882 (M68881UM §4, *FSAVE*).
+    /// included: 28 on a 68881 and 60 on a 68882 (M68881UM §4, *FSAVE*), and
+    /// **four** on a 68040, whose idle frame is the format long word and
+    /// nothing else (M68040UM Figure 9-10(c)).
     #[must_use]
     pub const fn idle_frame(self) -> u32 {
         match self {
             Coprocessor::M68882 => 60,
+            Coprocessor::M68040 => 4,
             _ => 28,
+        }
+    }
+
+    /// The version byte an `FSAVE` frame carries.
+    ///
+    /// The 68040's is the real one, `$41` (Figure 9-10), because its idle
+    /// frame has no body to be this core's own — it *is* the format long
+    /// word. The 6888x frames carry microcode state, so those get a version
+    /// of this core's own and `FRESTORE` refuses anybody else's.
+    #[must_use]
+    pub const fn state_version(self) -> u8 {
+        match self {
+            Coprocessor::M68040 => 0x41,
+            _ => super::exec::FP_STATE_VERSION,
         }
     }
 }
@@ -239,6 +278,37 @@ pub(super) struct Fpu {
     /// which is what decides whether `FSAVE` writes a null frame
     /// (M68881UM §4, *FSAVE*).
     pub null: bool,
+    /// What the last 68040 unimplemented-instruction or unsupported-data-type
+    /// exception left for an `FSAVE` to hand its emulation handler.
+    pub pending_040: Option<State040>,
+}
+
+/// The body of an MC68040 unimplemented-instruction `FSAVE` state frame
+/// (M68040UM Figure 9-10(d) and Table 9-16).
+///
+/// The frame is how Motorola's software package learns what to emulate: it
+/// carries the instruction's own command word and both operands, already
+/// converted to extended precision. Everything else in the frame is pipeline
+/// state for the *arithmetic* exceptions, which this core reports at the
+/// instruction that caused them and never leaves pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct State040 {
+    /// `CMDREG1B`: "the command word of the exceptional floating-point
+    /// instruction ... identical to the second word of a floating-point
+    /// arithmetic instruction opcode".
+    pub command: u16,
+    /// `ETEMP`: the source operand, converted to extended precision.
+    pub etemp: F80,
+    /// `STAG`: the source operand's data type, three bits.
+    pub stag: u8,
+    /// `FPTEMP`: "the destination operand for dyadic operations converted to
+    /// extended precision".
+    pub fptemp: F80,
+    /// `DTAG`: the destination operand's data type.
+    pub dtag: u8,
+    /// `T`: set for a post-instruction exception, which "only an opclass 3
+    /// instruction can indicate ... an FMOVE OUT instruction".
+    pub post_instruction: bool,
 }
 
 /// The NaN a reset leaves in every data register.
@@ -262,6 +332,7 @@ impl Fpu {
         fpsr: 0,
         fpiar: 0,
         null: true,
+        pending_040: None,
     };
 
     /// The rounding direction `FPCR`'s **RND** field names (§2.2.2).
@@ -525,6 +596,40 @@ pub(super) const fn is_infinity(v: F80) -> bool {
 #[must_use]
 pub(super) const fn is_zero(v: F80) -> bool {
     v.exp_field() == 0 && v.sig == 0
+}
+
+/// The `STAG`/`DTAG` encoding for an operand, as an MC68040 `FSAVE` frame
+/// reports it (M68040UM §9.7, *STAG, DTAG*).
+///
+/// ```text
+/// 000 = Normalized                 011 = NAN
+/// 001 = Zero                       100 = Extended-Precision Denormalized
+/// 010 = Infinity                         or Unnormalized Input
+///                                  101 = Single- or Double-Precision
+///                                        Denormalized Input
+/// ```
+///
+/// `101` is never produced here, and that is not an omission: §9.4 says the
+/// unit converts a denormalized single or double operand to a *normalized*
+/// extended value before use, and that conversion is what this core does on
+/// the way in — so by the time an operand reaches the frame it is normal.
+/// `100` still happens, for an operand that is denormal in the extended
+/// format itself.
+#[must_use]
+pub(super) const fn data_tag(v: F80) -> u8 {
+    if is_nan(v) {
+        0b011
+    } else if is_infinity(v) {
+        0b010
+    } else if is_zero(v) {
+        0b001
+    } else if v.exp_field() == 0 || v.sig & (1 << 63) == 0 {
+        // A zero exponent is a denormal, and a non-zero exponent with the
+        // integer bit clear is the 68881's unnormalized number (§3.5.1).
+        0b100
+    } else {
+        0b000
+    }
 }
 
 /// Whether a finite value is below the smallest normal of `spec` — the
@@ -1196,6 +1301,42 @@ pub(super) const fn implemented(op: FpOp) -> bool {
             | FpOp::LognP1
             | FpOp::Log2
             | FpOp::Log10
+    )
+}
+
+/// Whether the MC68040 computes an operation **in hardware**.
+///
+/// Everything else on the list above takes the unimplemented floating-point
+/// instruction exception, vector 11, and Motorola's software package
+/// emulates it (M68040UM §9.6.1, Table 9-10). What this core keeps is the
+/// hardware set: `FABS`, `FADD`, `FCMP`, `FDIV`, `FMOVE`, `FMUL`, `FNEG`,
+/// `FSQRT`, `FSUB` and `FTST`, plus the `FSxxx`/`FDxxx` forms of the first
+/// nine, which the 68040 added.
+///
+/// # Two lists, and which one this follows
+///
+/// M68040UM Table 9-10 and M68000PRM Table A-1 disagree. The table in the
+/// user's manual omits `FLOG2`, `FSGLMUL` and `FSGLDIV`; the cross-reference
+/// in the programmer's manual marks all three "2,3" — the footnote for an
+/// instruction the 68040 emulates in software — exactly as it marks the
+/// twenty-six the other table does list. Since Table A-1 is a superset that
+/// is consistent with itself, and since `FLOG2` is no more implementable in
+/// the 68040's hardware than `FLOGN` beside it, **this follows Table A-1**
+/// and the three take the exception too.
+#[must_use]
+pub(super) const fn implemented_040(op: FpOp) -> bool {
+    matches!(
+        op,
+        FpOp::Move
+            | FpOp::Tst
+            | FpOp::Cmp
+            | FpOp::Abs
+            | FpOp::Neg
+            | FpOp::Sqrt
+            | FpOp::Add
+            | FpOp::Sub
+            | FpOp::Mul
+            | FpOp::Div
     )
 }
 
