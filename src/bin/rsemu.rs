@@ -32,6 +32,7 @@ USAGE:
 COMMANDS:
     run <machine>       Run a machine description
     debug <machine>     Run it under a debugger, stopped, on :1234
+    monitor <machine>   Run it under the monitor console, stopped, at a prompt
     machines            List machines this build can emulate
     devices             List registered device classes
     describe <class>    Show a device class: properties, defaults, buses
@@ -238,6 +239,21 @@ RUN OPTIONS:
                         `5900`, `:5900` and `host:5900` all work; a bare port
                         binds the loopback interface only, because there is no
                         authentication. The machine runs at wall-clock speed
+    --mon               Drop into the monitor console: the machine is held
+                        stopped at a prompt that answers what a debugger has no
+                        packet for -- the device tree and one device's whole
+                        current state, the memory map, every clock domain's rate
+                        and position, the wire graph, the scheduler's queue,
+                        guest memory read and written through MemAttrs::debug so
+                        an inspection never pops a FIFO, snapshots, rewind, and
+                        the --trace counters live rather than at the end.
+                        `help` at the prompt lists them. `rsemu monitor` implies
+                        it. Spelled `--mon` because `--monitor <name>` above is
+                        a guest ROM image and means something else entirely.
+                        The console takes this terminal's keyboard, so the
+                        guest's own console is not attached to it -- one
+                        keyboard, one reader; use --capture to watch what the
+                        guest writes. Needs a build with `monitor`
     -q, --quiet         Only print the summary
 
 OPTIONS:
@@ -269,6 +285,10 @@ fn main() -> ExitCode {
         "run" => run(&args[1..]),
         #[cfg(feature = "gdb")]
         "debug" => debug(&args[1..]),
+        // Matched whatever the build, so that a binary without the feature
+        // says which feature to rebuild with rather than "unknown command" —
+        // the same rule `--trace` and `host::media`'s missing schemes follow.
+        "monitor" => monitor_command(&args[1..]),
         "convert" => {
             eprintln!(
                 "rsemu: {}",
@@ -451,6 +471,15 @@ struct RunArgs {
     /// and say why it cannot honour it, rather than answering "unknown
     /// option".
     accel: Option<String>,
+    /// Whether `--mon` was given: the monitor console owns when this machine
+    /// advances.
+    ///
+    /// A `bool` and not an address, unlike `gdb` and `vnc`: the console is this
+    /// process's own terminal rather than a socket, so there is nothing to bind
+    /// and nothing to choose. Not feature-gated, because a build without
+    /// `monitor` still has to recognise the flag and say which feature would
+    /// have honoured it.
+    mon: bool,
     /// Where to listen for a debugger, if `--gdb` was given.
     #[cfg(feature = "gdb")]
     gdb: Option<String>,
@@ -785,7 +814,12 @@ fn run(args: &[String]) -> ExitCode {
     // to none of them. It wires a keyboard, a pad and a pointer; a board's
     // *serial* console is nobody's in that loop, so it is drained and discarded
     // like any other unwatched port rather than left to fill.
-    let console = if serving_vnc(&parsed) {
+    // A monitor session owns this terminal's keyboard, so the guest's console
+    // is not attached to it: a `CharPort` hands each byte to whoever asks
+    // first, and a prompt and a guest reading one stdin would each get half of
+    // what was typed. The port is drained and discarded like any other
+    // unwatched one, or captured with `--capture`.
+    let console = if serving_vnc(&parsed) || parsed.mon {
         None
     } else {
         match console_port(&parsed, &options.realize.hosts) {
@@ -820,6 +854,30 @@ fn run(args: &[String]) -> ExitCode {
         traces: &traces,
         hosts: &options.realize.hosts,
     };
+
+    // The monitor console owns when the machine advances, for the same reason a
+    // debugger does — so it goes ahead of the console loop, which would
+    // otherwise own that. `parse_run` has already refused `--mon` together with
+    // `--gdb` or `--vnc`, so at most one of these three branches is ever live.
+    #[cfg(feature = "monitor")]
+    if parsed.mon {
+        let status = monitor_session(
+            &mut machine,
+            &parsed,
+            &options.realize.hosts,
+            audio.as_mut(),
+            &mut drains,
+        );
+        return deliver(
+            &machine,
+            &parsed,
+            scanout.as_deref(),
+            audio.as_ref(),
+            &mut drains,
+            traced,
+            status,
+        );
+    }
 
     // A debugger, if one was asked for, owns when the machine advances — so it
     // is checked before the console loop, which would otherwise own that.
@@ -1598,6 +1656,168 @@ fn write_recording(args: &RunArgs, stream: Option<&rsemu::host::audio::AudioStre
     }
 }
 
+/// `rsemu monitor <machine>`: `run` with the console in charge.
+///
+/// A subcommand as well as a flag, and for the same reason `debug` is one:
+/// "run this board and let me steer it" is a thing people do often enough to
+/// deserve a word rather than an option. The word is `monitor` because
+/// `ROADMAP.md` §8 and `src/lib.rs` have both called it that all along — and
+/// the *flag* is `--mon`, because `rsemu run --monitor <name>` was already
+/// taken, by the built-in ROM images a 6502 board can boot (`rsmon`, `wozmon`).
+/// Two meanings of one word on one command line is a bug waiting for somebody
+/// to type it, so the run flag gets the shorter spelling and this gets the
+/// longer one.
+///
+/// Not feature-gated: a build without `monitor` reaches `parse_run`, which says
+/// which feature would have honoured it. "Unknown command" would be the wrong
+/// sentence.
+fn monitor_command(args: &[String]) -> ExitCode {
+    let mut args = args.to_vec();
+    if !args.iter().any(|a| a == "--mon") {
+        args.push(String::from("--mon"));
+    }
+    run(&args)
+}
+
+/// Run a machine with the monitor console in charge of when it advances.
+///
+/// The machine starts stopped, at a prompt, exactly as `rsemu debug` starts it
+/// stopped waiting for a debugger — for the same reason, too: a console that
+/// had to race a free-running guest to look at it would be answering questions
+/// about a machine that had already moved on.
+///
+/// # What drives the machine
+///
+/// Only `Monitor::advance`, and only through `Machine::run_until` in
+/// ten-millisecond slices — the same call and the same slice `run_headless`
+/// uses, and the same place `drains.pump()` goes. The scheduler still owns
+/// time: nothing here sleeps, nothing reads the wall clock, and the machine
+/// advances exactly as far as a command asked it to.
+///
+/// # Why stdin is read cooked
+///
+/// The console wants lines, not keystrokes, and `Terminal` exists to put stdin
+/// in *raw* mode so a guest can have the keystrokes. Using it here would mean
+/// re-implementing line editing to undo it. So the prompt reads `std::io::stdin`
+/// as it comes, which also makes `printf 'devices\nquit\n' | rsemu monitor …` a
+/// session — which is how `tests/cli_monitor.rs` drives one, with no TTY
+/// anywhere.
+#[cfg(feature = "monitor")]
+fn monitor_session(
+    machine: &mut Machine,
+    args: &RunArgs,
+    hosts: &HostObjects,
+    mut audio: Option<&mut rsemu::host::audio::AudioStream>,
+    drains: &mut Drains,
+) -> ExitCode {
+    use std::io::{BufRead, Write};
+
+    use rsemu::host::gdb::DebugTarget;
+    use rsemu::host::monitor::{Env, Flow, Monitor};
+    use rsemu::machine::Timeline;
+
+    // Rewind is periodic snapshot plus replay (§4.5), so it needs a recorder on
+    // the machine and a timeline holding the keyframes. Both are attached here
+    // rather than on demand, because a timeline started at the moment somebody
+    // typed `rewind` would have no history to reach back through.
+    //
+    // Only under deterministic threading: `Machine::set_recorder` refuses
+    // anything else, and it is right to — a parallel or accelerated run cannot
+    // be replayed, so a keyframe would restore to a machine that then diverged.
+    // A session without one says so when `rewind` is typed.
+    let mut timeline = match machine.recorder() {
+        Some(recorder) => Some(Timeline::with_default_cadence(Arc::clone(recorder))),
+        None if machine.threading_mode().is_deterministic() => {
+            let recorder = Arc::new(Recorder::recording());
+            match machine.set_recorder(Arc::clone(&recorder)) {
+                Ok(()) => Some(Timeline::with_default_cadence(recorder)),
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+
+    let mut monitor = Monitor::new();
+    let mut target = rsemu::host::gdb::MachineTarget::new(machine);
+    // The devices are told, exactly as a debugger tells them: a board's debug
+    // unit turns this into the freeze lines that stop a watchdog resetting the
+    // machine while somebody is reading it.
+    target.set_debug_halted(true);
+    let deadline = args
+        .span_given
+        .then(|| target.machine().now().saturating_add(args.span));
+    let mut env = Env {
+        hosts: Some(hosts),
+        timeline: timeline.as_mut(),
+        deadline,
+    };
+
+    if !args.quiet {
+        eprint!("{}", monitor.banner(&target));
+        if let Some(end) = deadline {
+            eprintln!("  --for bounds this session at {} ns", end.as_nanos());
+        }
+        eprintln!();
+    }
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+    let mut status = ExitCode::SUCCESS;
+    loop {
+        if interrupted(target.machine()) {
+            break;
+        }
+        if !args.quiet {
+            print!("{}", monitor.prompt());
+            let _ = std::io::stdout().flush();
+        }
+        line.clear();
+        match input.read_line(&mut line) {
+            // End of input is `quit`. A piped script that forgot to say so
+            // still ends its session rather than hanging on a closed pipe.
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("rsemu: cannot read a command: {e}");
+                status = ExitCode::FAILURE;
+                break;
+            }
+        }
+        let response = monitor.execute(&mut target, &mut env, &line);
+        print!("{}", response.text);
+        let _ = std::io::stdout().flush();
+        match response.flow {
+            Flow::Stay => {}
+            Flow::Quit => break,
+            Flow::Advance(span) => {
+                let text = monitor.advance(&mut target, &mut env, span, |m| {
+                    if interrupted(m) {
+                        return false;
+                    }
+                    // Once a slice, as in every other loop and for the sharper
+                    // of the two reasons: a character port nobody is draining
+                    // fills at 64 KiB and then stalls the guest.
+                    if let Some(stream) = audio.as_mut() {
+                        stream.pull();
+                    }
+                    drains.pump();
+                    true
+                });
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+    target.set_debug_halted(false);
+
+    if !args.quiet {
+        println!();
+        summarise(target.machine());
+    }
+    status
+}
+
 /// `rsemu debug <machine>`: `run` with a debugger attached (`ROADMAP.md` §2).
 ///
 /// The only difference from `run --gdb` is the default: `debug` with no
@@ -2048,6 +2268,21 @@ impl Traces {
         use rsemu::core::trace::Channel;
 
         let mut out = Traces::default();
+        // A monitor session turns every channel on with no destination: its
+        // `trace` command reads the counters where they stand, so the run needs
+        // them *counting* from the first instant, and it needs nothing written
+        // at the end. Enabling them here rather than at the prompt is what
+        // makes the numbers cover the whole session instead of the part after
+        // somebody asked. It costs the run what `--trace all` costs it and
+        // changes nothing the guest does — `tests/cli_trace.rs` is the
+        // standing proof of that, and `tests/cli_monitor.rs` checks the same
+        // hash through this path.
+        if args.mon && rsemu::host::trace::available() {
+            out.channels = Channel::ALL.to_vec();
+            if args.accel.is_some() {
+                out.channels.retain(|ch| *ch != Channel::CPU);
+            }
+        }
         if args.trace.is_empty() {
             return Ok(out);
         }
@@ -2581,6 +2816,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         record_audio: None,
         audio_rate: 44_100,
         monitor: None,
+        mon: false,
         params: Vec::new(),
         // One second of virtual time: long enough to prove a machine runs,
         // short enough that a broken one does not hang a terminal. There is no
@@ -2652,6 +2888,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 out.span_given = true;
             }
             "--monitor" => out.monitor = Some(value(arg)?),
+            "--mon" => out.mon = true,
             #[cfg(feature = "gdb")]
             "--gdb" => out.gdb = Some(value(arg)?),
             #[cfg(feature = "vnc")]
@@ -2762,6 +2999,28 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         return Err(format!(
             "--console {console} and --capture {console} are two listeners on one port, and a              port gives each byte to whichever asks first; capture a different port, or drop              --console"
         ));
+    }
+    // Three things that each own when the machine advances, and only one of
+    // them can. Refused here rather than silently ranked, because a person who
+    // asked for both would have no way to tell which one they got.
+    if out.mon {
+        if !cfg!(feature = "monitor") {
+            return Err(String::from(
+                "--mon needs a build with the `monitor` feature; this one has no monitor console",
+            ));
+        }
+        #[cfg(feature = "gdb")]
+        if out.gdb.is_some() {
+            return Err(String::from(
+                "--mon and --gdb both own when the machine advances; run one or the other",
+            ));
+        }
+        #[cfg(feature = "vnc")]
+        if out.vnc.is_some() {
+            return Err(String::from(
+                "--mon and --vnc both own when the machine advances; run one or the other",
+            ));
+        }
     }
     if out.accel.is_some() {
         if out.threading_given && out.threading.0 != ThreadingMode::Accel {
