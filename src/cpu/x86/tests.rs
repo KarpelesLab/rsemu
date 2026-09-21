@@ -1611,6 +1611,155 @@ fn entering_protected_mode_reloads_the_cached_descriptor() {
 }
 
 #[test]
+fn the_window_between_setting_pe_and_the_far_jump_is_ring_zero() {
+    // *Intel SDM* Vol 3A §9.9.1 puts the far jump that reloads `CS` **after**
+    // the `MOV CR0` that sets `PE`. Between the two the processor is already
+    // in protected mode with `CS` still holding the real-address-mode segment
+    // it had — and the low two bits of a real-mode segment are part of an
+    // address, not a privilege level. Real-address mode is privilege 0
+    // (Vol 3A §20.1, which is why `ar::REAL_CODE` has no `DPL` bits), and so
+    // is that window: the level lives in the cached descriptor, and nothing
+    // has reloaded it yet.
+    //
+    // The instructions a memory manager runs in there are the reason this is
+    // not academic. JemmEx, loaded by FreeDOS at `CS = 0x029e`, sets `PE` and
+    // then executes `LLDT AX` with `AX` zero before it jumps — invalidating
+    // the local table, which Vol 2A's `LLDT` entry says a null selector does
+    // rather than faulting. A core that read the level out of the selector saw
+    // ring 2 there, raised `#GP(0)` on that `LLDT`, and — the interrupt
+    // descriptor table register still holding the real-mode vector table —
+    // escalated to a double fault and then to shutdown.
+    let pc = pc386();
+    pc.gdt(0, (0, 0));
+    pc.gdt(1, descriptor(0, 0xffff_ffff, rights::CODE32));
+    pc.gdt(2, descriptor(0, 0xffff_ffff, rights::DATA32));
+
+    // `CS = DS = 0x029e`, JemmEx's own, so the selector's low two bits are
+    // `10` and a core that mistook them for a level would find ring 2.
+    const SEG: u16 = 0x029e;
+    let base = u64::from(SEG) << 4;
+    // The six-byte pseudo-descriptor, at `DS:0x40`.
+    pc.write(base + 0x40, &[0x17, 0x00]);
+    pc.write32(base + 0x42, at::GDT);
+
+    pc.start_real(SEG, 0);
+    // `DS` alongside it, the way a `.COM`-style driver image is entered; in
+    // real mode `set_regs` recomputes the cached bases from the selectors.
+    let mut regs = pc.regs();
+    regs.ds = SEG;
+    regs.ss = SEG;
+    regs.rsp = 0x100;
+    pc.cpu.set_regs(regs);
+    pc.write(
+        base,
+        &[
+            0xfa, // cli
+            0x0f, 0x01, 0x16, 0x40, 0x00, // lgdt [0x40]
+            0x0f, 0x20, 0xc0, // mov eax, cr0
+            0x0c, 0x01, // or al, 1          — PE, and nothing else
+            0x0f, 0x22, 0xc0, // mov cr0, eax
+            0x31, 0xc0, // xor ax, ax
+            0x0f, 0x00, 0xd0, // lldt ax     — ring 0 only, and a null selector
+            0x0f, 0x22, 0xd8, // mov cr3, eax — ring 0 only
+            0xc7, 0x06, 0x50, 0x00, 0x34, 0x12, // mov word [0x50], 0x1234
+            0xf4, // hlt
+        ],
+    );
+
+    let steps = pc.run(20);
+    assert!(steps < 20, "the sequence should have reached its hlt");
+    let sys = pc.cpu.sys();
+    assert!(sys.protected(), "`PE` is set");
+    assert_eq!(
+        pc.regs().rip,
+        0x1d,
+        "every instruction after `MOV CR0` ran: nothing faulted"
+    );
+    assert!(
+        !sys.ldtr.present(),
+        "`LLDT` with a null selector marks the local table invalid"
+    );
+    assert_eq!(sys.cr3, 0, "`MOV CR3` was allowed too");
+    assert_eq!(
+        pc.read32(base + 0x50) & 0xffff,
+        0x1234,
+        "the store after them landed"
+    );
+    // And the negative half: with the level read out of the selector instead,
+    // the first of those three would have faulted into the real-mode vector
+    // table and shut the processor down.
+    assert!(!pc.cpu.is_halted() || steps < 20);
+}
+
+#[test]
+fn a_conforming_code_segment_does_not_hand_its_caller_ring_zero() {
+    // The level is kept in the `CS` descriptor cache, so the thing cached
+    // there has to be the level and not the table's `DPL`. A **conforming**
+    // code segment is where the two part company: a transfer to one does not
+    // change privilege (*Intel SDM* Vol 3A §5.8.1.2), so a ring-3 program may
+    // jump into a `DPL` 0 conforming segment and keeps running at ring 3.
+    // Caching the descriptor's own `DPL` there would promote it.
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(3, descriptor(0, 0xffff_ffff, rights::CODE32 | rights::DPL3));
+    pc.gdt(4, descriptor(0, 0xffff_ffff, rights::DATA32 | rights::DPL3));
+    pc.gdt(
+        5,
+        descriptor(
+            at::TSS,
+            0x67,
+            ar::PRESENT | (u32::from(sys_type::TSS32_AVAIL) << 8),
+        ),
+    );
+    // Conforming, readable, and at privilege 0 — the combination that is
+    // reachable from anywhere.
+    pc.gdt(6, descriptor(0, 0xffff_ffff, rights::CODE32 | ar::DC));
+    pc.write32(at::TSS + tss32::ESP0, at::STACK0);
+    pc.write32(at::TSS + tss32::SS0, 0x10);
+    pc.idt(13, gate(0x08, 0x3100, sys_type::INT_GATE32, 0));
+    pc.write(0x3100, &[0xf4]);
+
+    pc.write(
+        at::CODE0,
+        &[
+            0xb8, 0x28, 0x00, 0x00, 0x00, 0x0f, 0x00, 0xd8, // ltr 0x28
+            0x6a, 0x23, 0x68, 0x00, 0xa0, 0x00, 0x00, 0x6a, 0x02, 0x6a, 0x1b, 0x68, 0x00, 0x40,
+            0x00, 0x00, 0xcf, // iretd into ring 3 at CODE3
+        ],
+    );
+    // Ring 3 jumps into the conforming segment and tries to halt from inside
+    // it. `RPL` 3 on the selector, because that is what ring 3 has to write.
+    pc.write(
+        at::CODE3,
+        &[
+            0xea, 0x00, 0x50, 0x00, 0x00, 0x33, 0x00, // jmp 0x0033:0x00005000
+        ],
+    );
+    pc.write(0x5000, &[0xf4]); // hlt
+
+    for _ in 0..8 {
+        pc.cpu.step();
+    }
+    assert_eq!(pc.regs().cs, 0x1b, "the iret entered ring 3");
+    pc.cpu.step(); // the far jump
+    let regs = pc.regs();
+    assert_eq!(regs.rip, 0x5000, "the jump was allowed: conforming");
+    assert_eq!(
+        regs.cs & 3,
+        3,
+        "and it did not change the privilege level (§5.8.1.2)"
+    );
+    assert_eq!(
+        pc.cpu.sys().seg(isa::seg::CS).dpl(),
+        3,
+        "the cached descriptor holds the level, not the table's DPL"
+    );
+    pc.cpu.step(); // hlt, from ring 3
+    assert_eq!(pc.regs().rip, 0x3100, "hlt at ring 3 is still #GP");
+    assert!(!pc.cpu.is_halted());
+}
+
+#[test]
 fn a_segment_limit_violation_raises_general_protection() {
     let pc = pc386();
     pc.start_protected();

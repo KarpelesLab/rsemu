@@ -919,6 +919,27 @@ pub const fn canonical(addr: u64) -> bool {
     ((addr << 16) as i64 >> 16) as u64 == addr
 }
 
+/// A code segment about to be cached in `CS`, with the privilege level the
+/// processor will be *running at* written into the cached `DPL`.
+///
+/// The privilege level is processor state rather than a property of the
+/// descriptor, and the cached descriptor is where the processor keeps it —
+/// which is why [`Exec::cpl`](super::exec) reads it from here. Writing the
+/// level rather than the table's `DPL` is the difference that matters for a
+/// **conforming** code segment: a transfer to one does not change privilege,
+/// so its `DPL` is at or below the level the caller keeps running at (*Intel
+/// SDM* Vol 3A §5.8.1.2), and caching the table's value would hand a ring-3
+/// caller ring 0.
+///
+/// Every other cached field is the descriptor's own.
+#[must_use]
+const fn running_at(seg: SegReg, cpl: u8) -> SegReg {
+    SegReg {
+        ar: (seg.ar & !ar::DPL) | (((cpl & 3) as u32) << ar::DPL_SHIFT),
+        ..seg
+    }
+}
+
 /// The system-register file: everything that is architectural state but is not
 /// a general register.
 ///
@@ -1674,7 +1695,8 @@ impl Exec<'_> {
     /// Load `CS` from an already-validated descriptor, at a given privilege.
     fn commit_cs(&mut self, selector: u16, desc: RawDesc, cpl: u8) {
         let selector = Selector(selector).with_rpl(cpl).0;
-        *self.state.sys.seg_mut(seg::CS) = desc.to_seg(selector);
+        let seg = running_at(desc.to_seg(selector), cpl);
+        *self.state.sys.seg_mut(seg::CS) = seg;
         self.state.regs.cs = selector;
         self.state.queue.flush();
     }
@@ -2596,7 +2618,9 @@ impl Exec<'_> {
         if !cs_desc.is_app() || cs_desc.high & ar::CODE == 0 {
             return Err(Fault::coded(VEC_TS, u32::from(cs_sel & 0xfffc)));
         }
-        *self.state.sys.seg_mut(seg::CS) = cs_desc.to_seg(cs_sel);
+        // The new task runs at the level its own `CS` selector names, and that
+        // level goes into the cached descriptor with it.
+        *self.state.sys.seg_mut(seg::CS) = running_at(cs_desc.to_seg(cs_sel), (cs_sel & 3) as u8);
         self.state.regs.cs = cs_sel;
         self.state.queue.flush();
 
@@ -3376,6 +3400,12 @@ impl Exec<'_> {
         } else {
             ar |= ar::DB;
         }
+        // The `DPL` the architecture fixes is the level the instruction lands
+        // at, which the selector already carries: `SYSCALL` forces `RPL` 0 and
+        // `SYSRET` forces 3, and *Intel SDM* Vol 2B gives each synthesised
+        // descriptor the matching `DPL`. `Exec::cpl` reads it back out of
+        // here, so the two cannot be written separately and drift.
+        ar |= ((selector & 3) as u32) << ar::DPL_SHIFT;
         SegReg {
             selector,
             base: 0,

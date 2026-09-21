@@ -748,13 +748,28 @@ impl<'a> Exec<'a> {
 
     /// The current privilege level.
     ///
-    /// The low two bits of the `CS` selector in protected mode; zero in real
-    /// mode, which is not a special case so much as the only level real mode
-    /// has.
+    /// Out of the code segment's **cached descriptor**, not out of the
+    /// selector. The two agree everywhere the selector was written by a
+    /// protected-mode `CS` load, because [`Prot::commit_cs`](super::prot) puts
+    /// the level into the selector's low two bits on the way past — that is
+    /// what makes `PUSH CS` and an exception frame carry it, which is the
+    /// property *Intel SDM* Vol 3A §5.5 describes.
+    ///
+    /// They disagree in exactly one window, and it is a window real software
+    /// runs code in: between the `MOV CR0` that sets `PE` and the far jump
+    /// that must follow it (§9.9.1), `CS` still holds the real-address-mode
+    /// segment it held before, whose low two bits are part of an *address* and
+    /// mean nothing. Real-address mode is privilege 0 (§20.1, and
+    /// [`ar::REAL_CODE`](super::prot::ar::REAL_CODE) is built that way), and so
+    /// is that window — which is what lets a memory manager run `LLDT`, `LTR`
+    /// or a `MOV` to `CR3` between the two, as JemmEx does.
+    ///
+    /// Zero in real mode, which is not a special case so much as the only
+    /// level real mode has.
     #[inline]
     pub(super) fn cpl(&self) -> u8 {
         if self.protected() {
-            (self.state.regs.cs & 3) as u8
+            self.state.sys.seg(seg::CS).dpl()
         } else {
             0
         }
