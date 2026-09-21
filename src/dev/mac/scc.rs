@@ -523,6 +523,17 @@ impl Scc {
     pub fn set_dcd(&self, channel: usize, level: bool) {
         self.shared.dcd((channel & 1) as u32, level);
     }
+
+    /// One write register as the chip holds it, for a test.
+    ///
+    /// Most of them are *not* readable through [`Scc::peek`] — the read and
+    /// write register files are different files, and `RR1`, for one, is a
+    /// computed status byte that has nothing to do with `WR1`. A test that
+    /// wants to know how software configured the chip has to come in this way.
+    #[must_use]
+    pub fn write_register(&self, channel: usize, index: usize) -> u8 {
+        self.shared.state.lock().ch[channel & 1].wr[index & 15]
+    }
 }
 
 impl Device for Scc {

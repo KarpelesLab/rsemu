@@ -62,6 +62,25 @@ fn the_register_pointer_is_set_then_consumed() {
     assert_eq!(scc.peek(A, false), 0x5a, "RR12 mirrors WR12");
 }
 
+/// The read and the write register files are **different files**, and
+/// [`Scc::write_register`] is the only way to see the second one.
+///
+/// `RR1` is a computed status byte with nothing to do with `WR1`, so a test
+/// that read it back through [`Scc::peek`] would be reading a constant and
+/// calling it configuration — which is exactly the mistake that made this
+/// accessor necessary.
+#[test]
+fn the_write_registers_are_not_what_the_read_side_answers() {
+    let scc = Scc::build();
+    scc.poke(A, false, 1); // point at WR1
+    scc.poke(A, false, 0x01); // external/status interrupts on
+    assert_eq!(scc.write_register(A, 1), 0x01);
+    scc.poke(A, false, 1);
+    assert_eq!(scc.peek(A, false), 0x06, "RR1 is `All Sent`, not WR1");
+    // And the two channels keep their own copies of everything but `WR9`.
+    assert_eq!(scc.write_register(B, 1), 0x00);
+}
+
 /// `Point High` — command 1 — adds eight to the register number, which is how
 /// the top half of the register file is reached at all.
 #[test]
