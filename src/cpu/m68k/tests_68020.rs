@@ -1460,3 +1460,128 @@ fn a_68020_snapshot_round_trips_every_stack_pointer_and_control_register()
     assert!(restore(&M68k::new(Config::MC68EC020), &bytes).is_err());
     Ok(())
 }
+
+#[test]
+fn chk_l_is_a_signed_comparison_across_the_whole_range() {
+    // M68000PRM, *CHK*: "If Dn < 0 or Dn > Source then TRAP", with
+    // "N — Set if Dn < 0; cleared if Dn > upper bound; undefined otherwise".
+    // `CHK.L` is the 68020's, so nothing in the 68000 corpus reaches it, and
+    // the sign boundary is where a comparison written in the wrong width
+    // shows.
+    let run = |value: u32, bound: u32| {
+        // CHK.L D1,D0
+        let board = m68020(&[0x4101], |r| {
+            r.d[0] = value;
+            r.d[1] = bound;
+        });
+        board.handler(0, vector::CHK, 0x0900);
+        board.cpu.step();
+        (board.cpu.regs().pc == 0x900, ccr(&board.cpu.regs()) & N)
+    };
+    assert_eq!(run(0, 0x7fff_ffff), (false, 0), "zero is in bounds");
+    assert_eq!(
+        run(0x7fff_ffff, 0x7fff_ffff),
+        (false, 0),
+        "equal to the bound is in bounds"
+    );
+    assert_eq!(
+        run(0x8000_0000, 0x7fff_ffff),
+        (true, N),
+        "the most negative long is negative, not the largest"
+    );
+    assert_eq!(run(0xffff_ffff, 0x7fff_ffff), (true, N), "-1 traps");
+    assert_eq!(
+        run(5, 2),
+        (true, 0),
+        "above the bound sets N clear, not set"
+    );
+    assert_eq!(
+        run(0x0001_0000, 0x8000_0000),
+        (true, 0),
+        "a negative *bound* leaves everything positive above it"
+    );
+}
+
+#[test]
+fn chk2_l_compares_all_32_bits_of_both_bounds() {
+    // M68000PRM, *CHK2*: the bounds are two operands of the instruction's
+    // size, in memory, the lower one first. Only the byte and word forms
+    // were covered; the long form is the one an operating system uses on a
+    // pointer.
+    let run = |value: u32| {
+        // CHK2.L (A0),D1 — `0000 0100 1101 0000`, then `0001 1000 0000 0000`.
+        let board = m68020(&[0x04d0, 0x1800], |r| {
+            r.a[0] = 0x1000;
+            r.d[1] = value;
+        });
+        board.poke_long(0x1000, 0x0001_0000);
+        board.poke_long(0x1004, 0x0002_0000);
+        board.handler(0, vector::CHK, 0x0900);
+        board.cpu.step();
+        let r = board.cpu.regs();
+        (r.pc == 0x900, ccr(&r) & (Z | C))
+    };
+    assert_eq!(run(0x0001_8000), (false, 0), "between the bounds");
+    assert_eq!(run(0x0001_0000), (false, Z), "equal to the lower bound");
+    assert_eq!(run(0x0002_0000), (false, Z), "equal to the upper bound");
+    assert_eq!(run(0x0000_ffff), (true, C), "below");
+    assert_eq!(run(0x0002_0001), (true, C), "above");
+}
+
+#[test]
+fn the_68030_checks_bounds_exactly_as_the_68020_does() {
+    // MC68030UM §12.1.3 lists what the 68030 dropped from the 68020, and
+    // neither `CHK` nor `CHK2` is on it. This is the assertion rather than
+    // the assumption: the same encodings, the same operands, the same
+    // outcome and the same frame on both parts.
+    let cases: [(&[u16], u32, u32, bool); 6] = [
+        (&[0x4101], 0x0000_0005, 0x0000_0002, true), // CHK.L above
+        (&[0x4101], 0x8000_0000, 0x7fff_ffff, true), // CHK.L negative
+        (&[0x4101], 0x0000_0001, 0x0000_0002, false), // CHK.L in bounds
+        (&[0x4181], 0x0000_0005, 0x0000_0002, true), // CHK.W above
+        (&[0x4181], 0x0000_ffff, 0x0000_0002, true), // CHK.W -1
+        (&[0x4181], 0x0000_0001, 0x0000_0002, false), // CHK.W in bounds
+    ];
+    for (words, value, bound, traps) in cases {
+        let mut seen = alloc::vec::Vec::new();
+        for model in [Model::M68020, Model::M68030] {
+            let board = Board::new(model);
+            board.boot(words);
+            board.with_regs(|r| {
+                r.d[0] = value;
+                r.d[1] = bound;
+            });
+            board.handler(0, vector::CHK, 0x0900);
+            board.cpu.step();
+            let r = board.cpu.regs();
+            let sp = u64::from(r.a[7]);
+            seen.push((
+                r.pc,
+                ccr(&r),
+                board.cpu.last_exception(),
+                if r.pc == 0x900 {
+                    (board.peek_word(sp + 6), board.peek_long(sp + 8))
+                } else {
+                    (0, 0)
+                },
+            ));
+        }
+        assert_eq!(
+            seen[0], seen[1],
+            "${:04x} with {value:#x} against {bound:#x}",
+            words[0]
+        );
+        assert_eq!(
+            seen[0].2 == Some(vector::CHK),
+            traps,
+            "${:04x} with {value:#x} against {bound:#x}",
+            words[0]
+        );
+        if traps {
+            // MC68020UM Table 6-5: `CHK` takes the six-word format $2 frame,
+            // whose last long word is the address of the instruction that
+            // raised it. Vector 6 is offset $018.
+            assert_eq!(seen[0].3, (0x2018, 0x400));
+        }
+    }
+}
