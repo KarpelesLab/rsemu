@@ -3,16 +3,18 @@
 Consumed by: `dev/mac`, `machines/mac-plus.machine`, `host/display/mac.rs`.
 
 A 68000 at 7.8336 MHz, one to four megabytes of memory, 128 KiB of ROM, a 6522
-VIA, a Z8530 SCC, an IWM and its 800K drive, an NCR 5380 for SCSI, and a
-512 × 342 one-bit screen that is **read out of main memory** by a counter
-rather than owned by a video chip. rsemu's first Apple machine, and the first
-board here whose framebuffer is somebody else's RAM.
+VIA, a Z8530 SCC, an IWM and its 800K drive, a clock chip with twenty bytes of
+battery-backed RAM, a keyboard on the VIA's shift register, an NCR 5380 for
+SCSI, and a 512 × 342 one-bit screen that is **read out of main memory** by a
+counter rather than owned by a video chip. rsemu's first Apple machine, and the
+first board here whose framebuffer is somebody else's RAM.
 
 ## Primary sources
 
 | Source | Covers |
 | --- | --- |
-| *Guide to the Macintosh Family Hardware*, 2nd edition (Apple Computer, Addison-Wesley 1990) | The whole machine: chapter 3 for the address map and the overlay, the VIA chapter's port-assignment tables, the video raster, the disk interface and the drive's register file |
+| *Guide to the Macintosh Family Hardware*, 2nd edition (Apple Computer, Addison-Wesley 1990) | The whole machine: chapter 3 for the address map, the overlay and the clock chip's three wires, chapter 7 for the keyboard's protocol and its four commands, chapter 9 for GCR and the disk interface, the VIA chapter's port-assignment tables, the video raster, and the drive's register file |
+| US patent **4,564,941**, "Error detection system", Apple Computer Inc. (filed 1983, granted 1986) | The three-byte interleaved checksum on a 400K/800K disk sector: the rotation, the carry chain, and the scrambling of the data with it |
 | *Synertek SY6522 / Rockwell R6522 Versatile Interface Adapter* data sheet | The chip: sixteen registers, two ports, two timers, the shift register, the interrupt flag/enable pair |
 | *Zilog Z8030/Z8530 SCC* technical manual | The one register pointer, the thirty-two registers per channel, `RR0`-`RR3`, the reset commands |
 | Apple, *IWM Specification* (1982) | The sixteen soft switches, the four register pairs `Q7:Q6` selects, the mode register, the write handshake |

@@ -2824,11 +2824,20 @@ machine-m68k-mini = ["cpu-m68k"]
 # and the vertical and horizontal blanking signals that come back off the
 # beam. `mac.scc` is a Z8530 -- the register pointer, all thirty-two
 # registers, `RR0`/`RR1`/`RR2`/`RR3` and the two carrier detects a mouse's
-# quadrature arrives on -- and no serial traffic. Written from Guide to the
-# Macintosh Family Hardware (2nd edition), the SY6522 and Z8530 data sheets,
-# and black-box register traces; no Macintosh emulator source was consulted
-# and no ROM was disassembled (ROADMAP.md 1). Adds no dependencies and is
-# `no_std + alloc`.
+# quadrature arrives on -- and no serial traffic. `mac.rtc` is the clock chip:
+# a four-byte second counter, twenty bytes of battery-backed parameter RAM and
+# the one-second interrupt, on a three-wire serial interface hanging off three
+# of the VIA's port B pins. `mac.keyboard` is the keyboard at the end of the
+# coiled cable, speaking the Guide's request/response protocol on the VIA's
+# shift register: the four commands of Table 7-4, their responses, and the bit
+# timing. `mac.gcr` and `mac.disk` are the disk: Apple's 6-and-2 group-code
+# recording, the 524-byte sector, the five speed zones, and a 400K or 800K
+# image raw or in a DiskCopy 4.2 container -- which `mac.iwm` shifts past its
+# read head a bit cell at a time. Written from Guide to the Macintosh Family
+# Hardware (2nd edition), the SY6522 and Z8530 data sheets, Apple's patent
+# 4,564,941 for the disk checksum, and black-box register traces; no Macintosh
+# emulator source was consulted and no ROM was disassembled (ROADMAP.md 1).
+# Adds no dependencies and is `no_std + alloc`.
 dev-mac = []
 
 # The Amiga board classes (src/dev/amiga): the custom-chip register space at
@@ -3178,10 +3187,14 @@ net-pktkit = ["dev-net", "std", "dep:pktkit"]
 # a Macintosh Plus. A 7.8336 MHz 68000 on a big-endian 24-bit space, RAM at
 # zero behind the ROM overlay, the 128 KiB ROM socket at $400000, the VIA at
 # $EFE1FE, the SCC's two windows at $9FFFF8 and $BFFFF9, and the video circuit
-# reading a 512x342 one-bit screen out of the top of main memory. The `macrom`
-# slot takes the ROM image; `-p ram=4M` gives the fully expanded machine. It
-# reaches the ROM's insert-disk screen. `docs/platforms/mac-plus.md` carries
-# the ledger. Adds no dependencies.
+# reading a 512x342 one-bit screen out of the top of main memory, plus the
+# clock chip, the keyboard and the disk drive. The `macrom` slot takes the ROM
+# image and `floppy` takes a 400K or 800K disk -- a 1.44 MB one is refused by
+# name, because a Plus has an IWM and needs a SWIM for that; `-p ram=4M` gives
+# the fully expanded machine. The ROM chimes, sizes memory, sets its parameter
+# RAM, talks to the keyboard and draws the grey desktop; it does **not** reach
+# the insert-disk screen, and `docs/platforms/mac-plus.md` carries the ledger
+# of what has been ruled out and what is left. Adds no dependencies.
 machine-mac-plus = ["cpu-m68k", "dev-mac"]
 
 machine-ne2k-mini = ["cpu-z80", "dev-ne2000"]

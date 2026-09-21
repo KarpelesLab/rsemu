@@ -548,12 +548,18 @@ video chip behind it at all — a counter walks main memory in step with the
 beam, and the screen buffer hangs a fixed distance below the top of *installed*
 memory, which is why the ROM has to size memory before it can draw anything.
 Point it at a real Plus ROM and it chimes, sizes its megabyte, runs its memory
-test and settles on the **grey Macintosh desktop with the arrow cursor**, with
-the 60.15 Hz tick chain running and nothing faulting. It does **not** reach the
-insert-disk screen yet; `docs/platforms/mac-plus.md` has the ledger, the
-black-box traces that got it this far — including the decoder bug that made a
-1 MiB machine size itself as 4 MiB and loop in its memory test for ever — and
-why a Plus cannot read a 1.44 MB disk whatever else is built.
+test, finds its clock chip's battery flat and writes twenty bytes of parameter
+RAM back, finishes the keyboard's Model Number handshake and settles into
+asking it for a key every quarter second, and draws the **grey Macintosh
+desktop with the arrow cursor**, with the 60.15 Hz tick chain running and
+nothing faulting. The drive reads: an image becomes cylinders of 6-and-2 GCR
+bit cells and the IWM shifts them past its head, which
+`src/dev/mac/iwm/tests.rs` checks through the chip. It does **not** reach the
+insert-disk screen; `docs/platforms/mac-plus.md` has the ledger, the black-box
+traces that got it this far — including the decoder bug that made a 1 MiB
+machine size itself as 4 MiB and loop in its memory test for ever, and the
+clock chip's whole undocumented command encoding read off the wire — and why a
+Plus cannot read a 1.44 MB disk whatever else is built.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's, Workbench is Commodore's and the Macintosh ROM is
