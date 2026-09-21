@@ -83,6 +83,10 @@ fn script(machine: &mut Machine, hosts: &HostObjects, lines: &[&str]) -> String 
 }
 
 /// The byte a one-byte `x` dump reported.
+///
+/// Both callers need a machine to dump memory from, so this follows them
+/// behind the board they use: `--features monitor` alone builds neither.
+#[cfg(feature = "machine-apple1")]
 fn dumped_byte(text: &str) -> u8 {
     let field = text
         .split_whitespace()
