@@ -1923,6 +1923,46 @@ impl<'a> Exec<'a> {
         )
     }
 
+    /// Whether the memory management unit can translate `addr` for an
+    /// instruction fetch.
+    ///
+    /// This is how a **deferred** prefetch fault gets its `ATC` bit right.
+    /// [`Exec::atc_fault`] is set where the translation fails, but a 68040
+    /// prefetch failure is not reported there — "bus errors that occur during
+    /// instruction prefetches are deferred until the processor attempts to
+    /// use the information" (M68040UM §8.2.1), and by then the flag belongs
+    /// to a later access, in a later `Exec` that has never seen it. So the
+    /// answer is re-derived from the cache instead, which costs a lookup and
+    /// no table search: a failed translation has already installed an entry
+    /// with **R** clear, and a translation that succeeded before the *bus*
+    /// refused the cycle has left one with **R** set.
+    ///
+    /// The privilege mode read here is the one at the instruction boundary
+    /// rather than the one the prefetch ran under. The two differ only when
+    /// the instruction between them changed `SR`, and an entry is tagged by
+    /// `FC2`, so the worst case is an `ATC` bit that reports the wrong *kind*
+    /// of fault for one instruction after a privilege change.
+    fn fetch_translates_040(&self, addr: u32) -> bool {
+        if !self.mmu040_on {
+            return true;
+        }
+        let supervisor = self.state.supervisor();
+        // The instruction pair, because this is a prefetch (§3.4).
+        let pair = self.state.mmu040.ttr_pair(true);
+        if mmu040::transparent(pair, addr, supervisor).is_some() {
+            return true;
+        }
+        if !self.state.mmu040.enabled() {
+            return true;
+        }
+        match self.state.mmu040.lookup(addr, supervisor) {
+            Some(entry) => {
+                entry.data & mmusr040::R != 0 && (supervisor || entry.data & mmusr040::S == 0)
+            }
+            None => false,
+        }
+    }
+
     /// The address registers and stack pointers the faulting instruction has
     /// moved, with the values they had when it started, most important first.
     ///
@@ -2111,11 +2151,9 @@ impl<'a> Exec<'a> {
         // time on every model, where a 68040 fetches a long word or a line.
         // That is the dynamic-bus-sizing approximation the 68020 notes in
         // the ledger already, showing through into the frame.
-        let ssw = (u16::from(self.atc_fault) << 10)
-            | (1 << 8)
-            | (0b10 << 5)
-            | (u16::from(tt) << 3)
-            | u16::from(tm);
+        let atc = !self.fetch_translates_040(addr);
+        let ssw =
+            (u16::from(atc) << 10) | (1 << 8) | (0b10 << 5) | (u16::from(tt) << 3) | u16::from(tm);
         let mut image = FrameImage::new(7);
         image.push(0); // +$08 effective address: no continuation pending
         image.push(0);

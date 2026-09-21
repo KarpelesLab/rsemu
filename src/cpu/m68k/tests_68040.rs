@@ -2008,3 +2008,104 @@ fn an_lc040_takes_the_exception_for_every_floating_point_instruction() {
     let sp = u64::from(board.cpu.regs().a[7]);
     assert_eq!(board.peek_word(sp + 6), 0x002c, "format $0");
 }
+
+#[test]
+fn a_deferred_prefetch_fault_says_whether_the_page_was_missing() {
+    // M68040UM §8.2.1 defers a prefetch fault "until the processor attempts
+    // to use the information", and §8.4.6.2's `ATC` bit still has to say
+    // which kind of fault it was: set for "a nonresident entry ... or
+    // privilege violation", clear for "a bus-errored instruction ... access".
+    // The two cases below differ only in why the fetch failed.
+    //
+    // A page that is not resident: the search installs an entry with R
+    // clear, the fetch of the word at $11000 fails, and the fault arrives
+    // when the NOP at $10FFE has run and the next word is wanted.
+    let board = mapped(0x0001_0000, 0x0001_0000 | 0b01);
+    board.poke_long(u64::from(PAGE) + 0x11 * 4, 0); // $11000 is invalid
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    translate_on(&board, &[0x4ef9, 0x0001, 0x0ffe]); // JMP $10FFE
+    board.guarded.write_u8(0xffe, 0x4e).unwrap();
+    board.guarded.write_u8(0xfff, 0x71).unwrap(); // NOP
+    board.cpu.step(); // the JMP
+    board.cpu.step(); // the NOP, whose refill poisons
+    board.cpu.step(); // and the fault arrives
+    assert_eq!(board.cpu.last_exception(), Some(vector::BUS_ERROR));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 6), 0x7008, "format $7");
+    assert_eq!(
+        board.peek_word(sp + 0x0c) & 0x0400,
+        0x0400,
+        "ATC: the page was not resident"
+    );
+    assert_eq!(board.peek_long(sp + 0x14), 0x1_1000, "the fetch address");
+
+    // A page that *is* resident, mapped to physical memory nothing answers
+    // for: the same deferred fault, but a physical bus error.
+    let board = mapped(0x0001_0000, 0x0001_0000 | 0b01);
+    board.poke_long(u64::from(PAGE) + 0x11 * 4, 0x0100_0000 | 0b01);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    translate_on(&board, &[0x4ef9, 0x0001, 0x0ffe]);
+    board.guarded.write_u8(0xffe, 0x4e).unwrap();
+    board.guarded.write_u8(0xfff, 0x71).unwrap();
+    board.cpu.step();
+    board.cpu.step();
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::BUS_ERROR));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(
+        board.peek_word(sp + 0x0c) & 0x0400,
+        0,
+        "no ATC: the translation worked and the bus refused"
+    );
+}
+
+#[test]
+fn the_hardware_subset_agrees_with_the_68881_operation_by_operation() {
+    // The 68040's ten hardware operations are the same arithmetic the 68881
+    // does, computed by the same `src/float` code — so the strongest cheap
+    // evidence that the 68040 path is right is that it gives the 68881's
+    // answers, which `tests_fpu.rs` checks against M68881UM §4's operation
+    // tables and against IEEE 754.
+    let cases: [(u16, F80, F80, &str); 10] = [
+        (0x22, FP_ONE, FP_THREE, "FADD"),
+        (0x28, FP_ONE, FP_THREE, "FSUB"),
+        (0x23, FP_THREE, FP_THREE, "FMUL"),
+        (0x20, FP_THREE, FP_ONE, "FDIV"),
+        (
+            0x18,
+            F80::new(0xc000, 0xc000_0000_0000_0000),
+            FP_ONE,
+            "FABS",
+        ),
+        (0x1a, FP_THREE, FP_ONE, "FNEG"),
+        (0x04, F80::new(0x4001, 1 << 63), FP_ONE, "FSQRT"),
+        (0x00, FP_THREE, FP_ONE, "FMOVE"),
+        (0x38, FP_ONE, FP_THREE, "FCMP"),
+        (0x3a, FP_THREE, FP_ONE, "FTST"),
+    ];
+    for (opmode, src, dst, what) in cases {
+        let words = [0xf200u16, 0x0400 | opmode, 0x4e71];
+        let forty = fpu_board(&words);
+        forty.with_regs(|r| {
+            r.fp[0] = dst;
+            r.fp[1] = src;
+        });
+        forty.cpu.step();
+        assert_eq!(forty.cpu.last_exception(), None, "{what} is hardware");
+
+        let eighty_one = Board::with_fpu(Model::M68030, super::Coprocessor::M68881);
+        eighty_one.boot(&[0x4e71]);
+        eighty_one.load(0x500, &words);
+        eighty_one.at(0x500);
+        eighty_one.with_regs(|r| {
+            r.fp[0] = dst;
+            r.fp[1] = src;
+        });
+        eighty_one.cpu.step();
+
+        let a = forty.cpu.regs();
+        let b = eighty_one.cpu.regs();
+        assert_eq!(a.fp[0], b.fp[0], "{what}: the result");
+        assert_eq!(a.fpsr, b.fpsr, "{what}: FPSR");
+    }
+}

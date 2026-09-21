@@ -2998,7 +2998,7 @@ mod tests {
         }
         // The coprocessor's rows exist only with one attached, so the sweep
         // that proves every operation reachable has to run both ways.
-        for model in [Model::M68020, Model::M68030] {
+        for model in [Model::M68020, Model::M68030, Model::M68040] {
             for opcode in 0..=u16::MAX {
                 let op = decode_with(model, Copro::FPU, opcode).op;
                 if !matches!(op, Op::Illegal | Op::LineA | Op::LineF) && !reached.contains(&op) {
@@ -3026,7 +3026,7 @@ mod tests {
         // Without one the F line is the line-F exception, with the two
         // privileged rows cpSAVE and cpRESTORE occupy; with one, coprocessor
         // id 1's encodings become instructions and nothing else moves.
-        for model in [Model::M68020, Model::M68030] {
+        for model in [Model::M68020, Model::M68030, Model::M68040] {
             let mut gained = 0usize;
             for opcode in 0..=u16::MAX {
                 let without = decode_with(model, Copro::NONE, opcode);
