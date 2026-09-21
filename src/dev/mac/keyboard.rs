@@ -177,8 +177,8 @@ pub const TX_LOW_TICKS: u64 = 180;
 /// How long after the rising edge the keyboard reads the data bit: "80 µs".
 ///
 /// Recorded because it is the Guide's, and *not* used as an instant to sample
-/// at — see [`State::command_step`] for why the bit is frozen while the clock
-/// is low instead.
+/// at: the command bit is frozen while the clock is low instead, for the
+/// reason the command step spells out.
 pub const TX_SAMPLE_TICKS: u64 = 80;
 
 /// A keyboard-to-computer clock cycle: "eight cycles of 330 µs each".
@@ -236,9 +236,10 @@ pub mod code {
     /// between are the key.
     pub const ALWAYS: u8 = 0x01;
 
-    /// The Model Number response, built from Table 7-4's four fields: "Bit 0:
-    /// 1. Bits 1-3: keyboard model number, 1-8. Bits 4-6: next device number,
-    /// 1-8. Bit 7: 1 if another device connected."
+    /// The Model Number response, built from Table 7-4's four fields.
+    ///
+    /// "Bit 0: 1. Bits 1-3: keyboard model number, 1-8. Bits 4-6: next device
+    /// number, 1-8. Bit 7: 1 if another device connected."
     ///
     /// `model` and `next` are the *numbers*, 1 to 8, not the encoded fields.
     #[must_use]
@@ -536,12 +537,20 @@ impl State {
             0 => {
                 // Open collector: a zero pulls the line down, a one lets go.
                 self.data_low = bits & 0x80 == 0;
-                self.phase = Phase::Response { bits, left, step: 1 };
+                self.phase = Phase::Response {
+                    bits,
+                    left,
+                    step: 1,
+                };
                 self.next = self.ticks + RX_SETUP_TICKS;
             }
             1 => {
                 self.clk_low = true;
-                self.phase = Phase::Response { bits, left, step: 2 };
+                self.phase = Phase::Response {
+                    bits,
+                    left,
+                    step: 2,
+                };
                 self.next = self.ticks + RX_LOW_TICKS;
             }
             _ => {
@@ -1153,7 +1162,7 @@ pub static CLASS: DeviceClass = DeviceClass {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if something already claimed
+/// [`crate::core::Error::Config`] if something already claimed
 /// the name.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     registry.add(&CLASS)
@@ -1163,7 +1172,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the class is already bound.
+/// [`crate::core::Error::Config`] if the class is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     bindings.bind(CLASS_NAME, |props| Ok(Arc::new(MacKeyboard::new(props)?)))
 }

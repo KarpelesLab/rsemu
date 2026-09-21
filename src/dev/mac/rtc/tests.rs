@@ -197,11 +197,20 @@ fn a_date_becomes_seconds_since_1904() {
     assert_eq!(parse_time("1904-02-29T00:00:00").unwrap(), 59 * 86_400);
     // And the Unix epoch is the constant this file names.
     assert_eq!(unix_of(parse_time("1970-01-01T00:00:00").unwrap()), 0);
-    assert_eq!(unix_of(parse_time("2026-01-01T00:00:00").unwrap()), 1_767_225_600);
+    assert_eq!(
+        unix_of(parse_time("2026-01-01T00:00:00").unwrap()),
+        1_767_225_600
+    );
 
     for bad in [
-        "", "2026-01-01", "2026-13-01T00:00:00", "2026-02-30T00:00:00", "1899-01-01T00:00:00",
-        "2026-01-01T24:00:00", "2026-01-01T00:60:00", "xxxx-01-01T00:00:00",
+        "",
+        "2026-01-01",
+        "2026-13-01T00:00:00",
+        "2026-02-30T00:00:00",
+        "1899-01-01T00:00:00",
+        "2026-01-01T24:00:00",
+        "2026-01-01T00:60:00",
+        "xxxx-01-01T00:00:00",
     ] {
         assert!(parse_time(bad).is_err(), "{bad} should not parse");
     }

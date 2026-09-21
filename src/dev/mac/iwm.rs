@@ -479,7 +479,11 @@ impl Shared {
         }
         // A whole revolution is the same bits again, so anything beyond one
         // lands in the same place; only the remainder has to be walked.
-        let steps = if cells >= len { len + cells % len } else { cells };
+        let steps = if cells >= len {
+            len + cells % len
+        } else {
+            cells
+        };
         let (mut bit, mut rsr, mut data) = (drive.bit, drive.rsr, state.data);
         let (mut line, mut tach) = (drive.read_line, drive.tach);
         for _ in 0..steps {

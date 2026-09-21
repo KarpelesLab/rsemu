@@ -288,7 +288,7 @@ impl Disk {
             return None;
         }
         let mut block = 0usize;
-        for t in 0..u8::from(track) {
+        for t in 0..track {
             block += usize::from(gcr::sectors_on(t)) * usize::from(self.sides);
         }
         if side {
@@ -382,7 +382,13 @@ impl Dc42 {
         let len = usize::from(bytes[0]).min(63);
         let name = bytes[1..1 + len]
             .iter()
-            .map(|&c| if (0x20..0x7f).contains(&c) { c as char } else { '.' })
+            .map(|&c| {
+                if (0x20..0x7f).contains(&c) {
+                    c as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         Ok(Some(Dc42 {
             name,
@@ -404,7 +410,7 @@ impl Dc42 {
     #[must_use]
     pub fn checksum(section: &[u8]) -> u32 {
         let mut acc = 0u32;
-        for word in section.chunks_exact(2) {
+        for word in section.as_chunks::<2>().0 {
             acc = acc.wrapping_add(u32::from(u16::from_be_bytes([word[0], word[1]])));
             acc = acc.rotate_right(1);
         }

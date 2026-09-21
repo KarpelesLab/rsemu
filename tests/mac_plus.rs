@@ -385,12 +385,15 @@ fn a_1440k_image_is_refused_when_the_board_is_built() {
     let source = catalog::machine("mac-plus")
         .expect("this build ships mac-plus")
         .source;
-    let err = rsemu::machine::build("mac-plus", source, &registry, &options)
-        .err()
-        .expect("a Macintosh Plus cannot read a 1.44 MB disk");
+    let Err(err) = rsemu::machine::build("mac-plus", source, &registry, &options) else {
+        panic!("a Macintosh Plus cannot read a 1.44 MB disk");
+    };
     let text = err.to_string();
     println!("mac-plus: {text}");
     for want in ["1.44 MB", "IWM", "SWIM", "800K"] {
-        assert!(text.contains(want), "the refusal does not say `{want}`: {text}");
+        assert!(
+            text.contains(want),
+            "the refusal does not say `{want}`: {text}"
+        );
     }
 }

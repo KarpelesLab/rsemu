@@ -55,8 +55,9 @@
 //! 4. **At least two ones in a row somewhere below bit 7.**
 //!
 //! Those four leave exactly sixty-four patterns — [`DISK_BYTES`] is generated
-//! from them and [`tests`] asserts the count — and they leave out `$D5` and
-//! `$AA` precisely because those two alternate. That is not a coincidence: it
+//! from them and this module's tests assert the count — and they leave out
+//! `$D5` and `$AA` precisely because those two alternate. That is not a
+//! coincidence: it
 //! is why the two marks a track is searched for can be those two bytes and can
 //! never be mistaken for payload.
 
@@ -320,7 +321,7 @@ impl Checksum {
 /// one value, and then the low six of each — so nothing is lost and no value
 /// is wider than six bits. A trailing group of one or two bytes yields two or
 /// three values, which is how 524 bytes become
-/// [`SECTOR_NIBBLES`](self::SECTOR_NIBBLES) rather than 700.
+/// [`SECTOR_NIBBLES`] rather than 700.
 #[must_use]
 pub fn nibblize(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -403,7 +404,7 @@ impl Track {
 
     /// Append one bit.
     pub fn push_bit(&mut self, bit: bool) {
-        if self.len % 8 == 0 {
+        if self.len.is_multiple_of(8) {
             self.bits.push(0);
         }
         if bit {
@@ -584,7 +585,11 @@ pub fn decode_track(track: &Track) -> (Vec<Sector>, Vec<BadSector>) {
             let Some(fields) = window.get(3..8) else {
                 break;
             };
-            let Some(v) = fields.iter().map(|&b| payload_of(b)).collect::<Option<Vec<u8>>>() else {
+            let Some(v) = fields
+                .iter()
+                .map(|&b| payload_of(b))
+                .collect::<Option<Vec<u8>>>()
+            else {
                 bad.push(BadSector::NotADiskByte);
                 i += 3;
                 continue;
@@ -610,7 +615,11 @@ pub fn decode_track(track: &Track) -> (Vec<Sector>, Vec<BadSector>) {
                 bad.push(BadSector::Truncated);
                 break;
             };
-            let Some(v) = field.iter().map(|&b| payload_of(b)).collect::<Option<Vec<u8>>>() else {
+            let Some(v) = field
+                .iter()
+                .map(|&b| payload_of(b))
+                .collect::<Option<Vec<u8>>>()
+            else {
                 bad.push(BadSector::NotADiskByte);
                 i += 3;
                 continue;

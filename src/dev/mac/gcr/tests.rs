@@ -91,7 +91,12 @@ fn the_checksum_scrambles_and_catches_a_changed_byte() {
 /// The checksum's four six-bit values carry all twenty-four bits.
 #[test]
 fn the_checksum_round_trips_through_its_four_nibbles() {
-    for sums in [[0, 0, 0], [0xff, 0xff, 0xff], [0x12, 0x34, 0x56], [0xc0, 0x3f, 0x80]] {
+    for sums in [
+        [0, 0, 0],
+        [0xff, 0xff, 0xff],
+        [0x12, 0x34, 0x56],
+        [0xc0, 0x3f, 0x80],
+    ] {
         let sum = Checksum { sums };
         let n = sum.nibbles();
         assert!(n.iter().all(|&v| v < 64));
@@ -119,7 +124,11 @@ fn the_five_speed_zones_make_four_hundred_kilobytes_a_side() {
 fn a_self_sync_byte_is_ten_bits() {
     let mut track = Track::new();
     track.push_sync(36);
-    assert_eq!(track.len(), 360, "36 sync bytes are 45 octets of bit stream");
+    assert_eq!(
+        track.len(),
+        360,
+        "36 sync bytes are 45 octets of bit stream"
+    );
     // And a shifter comes out of it aligned, whatever it was doing going in:
     // every ten bits it throws two away.
     assert_eq!(shift_bytes(&track, 1), vec![0xff; 36]);
@@ -195,7 +204,14 @@ fn the_seventh_track_bit_rides_with_the_side() {
 /// A bit flipped in the data is caught by the checksum rather than handed back.
 #[test]
 fn a_damaged_sector_is_refused_rather_than_returned() {
-    let sector = Sector::new(3, false, 2, FORMAT_800K, &[1; TAG_BYTES], &[0x5a; DATA_BYTES]);
+    let sector = Sector::new(
+        3,
+        false,
+        2,
+        FORMAT_800K,
+        &[1; TAG_BYTES],
+        &[0x5a; DATA_BYTES],
+    );
     let good = encode_track(core::slice::from_ref(&sector));
 
     // Flip one bit well inside the data field. The address field is 8 bytes

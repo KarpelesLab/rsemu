@@ -24,7 +24,9 @@ fn dc42(name: &str, disk_format: u8, format_byte: u8, data: &[u8], tags: &[u8]) 
 
 /// A raw 800K image with a recognisable pattern in it.
 fn raw(bytes: usize) -> Vec<u8> {
-    (0..bytes).map(|i| (i / DATA_BYTES) as u8 ^ (i % 251) as u8).collect()
+    (0..bytes)
+        .map(|i| (i / DATA_BYTES) as u8 ^ (i % 251) as u8)
+        .collect()
 }
 
 /// The two sizes a raw image may be, and what each becomes.
@@ -81,7 +83,9 @@ fn a_diskcopy_container_is_read_with_its_tags() {
     let tags: Vec<u8> = (0..1600 * TAG_BYTES).map(|i| (i * 3) as u8).collect();
     let image = dc42("System Startup", DISK_FORMAT_800K, 0x22, &data, &tags);
 
-    let header = Dc42::parse(&image).expect("a header").expect("one is there");
+    let header = Dc42::parse(&image)
+        .expect("a header")
+        .expect("one is there");
     assert_eq!(header.name, "System Startup");
     assert_eq!(header.data_size, BYTES_800K as u32);
     assert_eq!(header.tag_size, (1600 * TAG_BYTES) as u32);
@@ -156,8 +160,8 @@ fn a_block_sits_where_the_speed_zones_put_it() {
 fn every_block_of_an_image_survives_the_journey_to_bits_and_back() {
     let data = raw(BYTES_800K);
     let tags: Vec<u8> = (0..1600 * TAG_BYTES).map(|i| (i * 7 + 1) as u8).collect();
-    let disk = Disk::from_image(&dc42("t", DISK_FORMAT_800K, 0x22, &data, &tags))
-        .expect("it reads");
+    let disk =
+        Disk::from_image(&dc42("t", DISK_FORMAT_800K, 0x22, &data, &tags)).expect("it reads");
 
     let mut seen = 0usize;
     for track in 0..=MAX_TRACK {

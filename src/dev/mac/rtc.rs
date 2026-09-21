@@ -297,8 +297,7 @@ impl State {
             _ if self.protected() => {}
             0x00..=0x07 => {
                 let shift = 8 * u32::from(addr & 3);
-                self.seconds =
-                    (self.seconds & !(0xffu32 << shift)) | (u32::from(value) << shift);
+                self.seconds = (self.seconds & !(0xffu32 << shift)) | (u32::from(value) << shift);
             }
             0x08..=0x0b => self.pram[usize::from(addr - 0x08)] = value,
             0x10..=0x1f => self.pram[usize::from(addr - 0x10) + 4] = value,
@@ -402,7 +401,7 @@ impl State {
         if self.irq_low {
             self.seconds = self.seconds.wrapping_add(1);
         }
-        self.next = self.next + TICKS_PER_SECOND / 2;
+        self.next += TICKS_PER_SECOND / 2;
     }
 
     fn next_event(&self) -> u64 {
@@ -627,7 +626,7 @@ impl Rtc {
                     hex.len()
                 )));
             }
-            for (byte, pair) in bytes.iter_mut().zip(hex.chunks_exact(2)) {
+            for (byte, pair) in bytes.iter_mut().zip(hex.as_chunks::<2>().0) {
                 let digit = |c: u8| -> Result<u8> {
                     (c as char).to_digit(16).map(|d| d as u8).ok_or_else(|| {
                         Error::Property(format!(
@@ -739,7 +738,8 @@ impl Device for Rtc {
             return;
         }
         let (seconds, pram) = self.initial;
-        self.shared.update(|st| *st = State::power_on(seconds, pram));
+        self.shared
+            .update(|st| *st = State::power_on(seconds, pram));
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -838,7 +838,9 @@ impl Device for Rtc {
                 _ => {
                     return Err(Error::Config {
                         at: port.to_string(),
-                        message: format!("a Macintosh clock chip drives `{DATA_PIN}` and `{IRQ_PIN}`"),
+                        message: format!(
+                            "a Macintosh clock chip drives `{DATA_PIN}` and `{IRQ_PIN}`"
+                        ),
                     });
                 }
             }
@@ -923,7 +925,7 @@ pub static CLASS: DeviceClass = DeviceClass {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if something already claimed
+/// [`crate::core::Error::Config`] if something already claimed
 /// the name.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     registry.add(&CLASS)
@@ -933,7 +935,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the class is already bound.
+/// [`crate::core::Error::Config`] if the class is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     bindings.bind(CLASS_NAME, |props| Ok(Arc::new(Rtc::new(props)?)))
 }

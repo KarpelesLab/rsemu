@@ -513,7 +513,10 @@ impl State {
             let places = (shifts % u64::from(SR_BITS)) as u32;
             // The bit the last shift pushed out is the one that was `shifts`
             // places below the top before the run started.
-            self.sr_out = self.sr.rotate_left(places.wrapping_sub(1) % u32::from(SR_BITS)) & 0x80
+            self.sr_out = self
+                .sr
+                .rotate_left(places.wrapping_sub(1) % u32::from(SR_BITS))
+                & 0x80
                 != 0;
             self.sr = self.sr.rotate_left(places);
             self.sr_due += shifts * period;
@@ -972,9 +975,7 @@ impl Shared {
                         // The free-running mode has no counter to run out, so
                         // it owes itself an event whether or not SR has been
                         // touched since.
-                        Some(period)
-                            if state.sr_count > 0 || state.sr_mode() == SR_OUT_FREE =>
-                        {
+                        Some(period) if state.sr_count > 0 || state.sr_mode() == SR_OUT_FREE => {
                             ticks + period
                         }
                         _ => NO_EVENT,
