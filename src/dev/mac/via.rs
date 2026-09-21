@@ -101,7 +101,7 @@ use crate::machine::realize::Instance;
 pub const CLASS_NAME: &str = "mac.via";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 /// How many bytes of address space the register block occupies: sixteen
 /// registers on A9-A12, so `16 * 512`.
@@ -154,6 +154,40 @@ const IRQ_ANY: u8 = 1 << 7;
 /// The six real sources; bit 7 is derived and never stored.
 const IRQ_SOURCES: u8 = 0x7f;
 
+// -- the shift register's eight modes ----------------------------------------
+//
+// ACR bits 4-2, from the data sheet's "Shift Register Modes" table. The three
+// bits are two questions: which direction, and where the shift clock comes
+// from. Only the direction is visible in the numbering — modes 4 to 7 shift
+// out — so the constants are named rather than computed.
+
+/// `000`: disabled. CB1 and CB2 belong to PCR.
+const SR_DISABLED: u8 = 0;
+/// `001`: shift in, clocked by timer 2's low-order counter.
+const SR_IN_T2: u8 = 1;
+/// `010`: shift in, clocked by φ2.
+const SR_IN_PHI2: u8 = 2;
+/// `011`: shift in, clocked by an external signal on CB1.
+const SR_IN_EXT: u8 = 3;
+/// `100`: shift out at timer 2's rate, free-running — the counter is disabled,
+/// the register recirculates for ever and the interrupt flag never sets.
+const SR_OUT_FREE: u8 = 4;
+/// `101`: shift out, clocked by timer 2's low-order counter.
+const SR_OUT_T2: u8 = 5;
+/// `110`: shift out, clocked by φ2.
+const SR_OUT_PHI2: u8 = 6;
+/// `111`: shift out, clocked by an external signal on CB1.
+const SR_OUT_EXT: u8 = 7;
+
+/// Whether `mode` shifts out of CB2 rather than into the register from it.
+#[inline]
+const fn sr_shifts_out(mode: u8) -> bool {
+    mode >= SR_OUT_FREE
+}
+
+/// How many shifts one transfer is.
+const SR_BITS: u8 = 8;
+
 // -- pin lines ---------------------------------------------------------------
 
 const LINE_PA: u32 = 0;
@@ -199,6 +233,30 @@ struct State {
     pcr: u8,
     ifr: u8,
     ier: u8,
+
+    /// How many of the eight shifts of the current transfer are left.
+    ///
+    /// The data sheet's shift-register counter. It reloads on any access to
+    /// SR and counts down one per shift clock; the transfer stops and the
+    /// interrupt flag sets when it reaches zero. [`SR_OUT_FREE`] disables it,
+    /// which is the whole difference between modes `100` and `101`.
+    sr_count: u8,
+    /// The tick the next *internally* generated shift falls on, or
+    /// [`NO_EVENT`].
+    ///
+    /// The φ2 and T2 modes make their own shift clock, so the chip owes itself
+    /// an event; the two external modes take theirs from CB1 and the edge
+    /// arrives through the pin instead.
+    sr_due: u64,
+    /// What the shift register's output stage is holding.
+    ///
+    /// A shift-out mode puts this on CB2. It survives a mode change, because
+    /// the stage is a flip-flop rather than a combinational tap on bit 7 — and
+    /// that matters here: the Macintosh's ROM pulls the keyboard's data line
+    /// low by shifting a zero out under φ2, disables the shift register, and
+    /// then re-enables it in the external mode expecting the line to still be
+    /// low.
+    sr_out: bool,
 
     /// PB7 as the timer drives it, when ACR bit 7 says it does.
     pb7_timer: bool,
@@ -250,6 +308,11 @@ impl State {
             pcr: 0,
             ifr: 0,
             ier: 0,
+            sr_count: 0,
+            sr_due: NO_EVENT,
+            // The output stage idles high, which is what CB2 reads with
+            // nothing driving it on a board full of pull-ups.
+            sr_out: true,
             pb7_timer: false,
             // Every pin pulled high, which is what an input with nothing
             // driving it reads on a board full of pull-ups. A wire that has a
@@ -340,9 +403,166 @@ impl State {
         out
     }
 
+    // -- the shift register --------------------------------------------------
+
+    /// Which of the eight shift-register modes ACR bits 4-2 select.
+    #[inline]
+    fn sr_mode(&self) -> u8 {
+        (self.acr >> 2) & 7
+    }
+
+    /// How many φ2 ticks apart the shift clock the *chip* generates is, or
+    /// `None` in the two modes where CB1 supplies it and in the disabled one.
+    ///
+    /// The data sheet gives the T2 modes' rate as the low-order latch of timer
+    /// 2, and a timer period on this chip is always `N + 2` φ2 cycles — the
+    /// same arithmetic `advance_to` uses for T1's free-run.
+    fn sr_internal_period(&self) -> Option<u64> {
+        match self.sr_mode() {
+            SR_IN_PHI2 | SR_OUT_PHI2 => Some(1),
+            SR_IN_T2 | SR_OUT_FREE | SR_OUT_T2 => Some(u64::from(self.t2_latch_low) + 2),
+            _ => None,
+        }
+    }
+
+    /// Reload the shift counter and schedule the first internally clocked
+    /// shift.
+    ///
+    /// Reading or writing SR does this: the data sheet has an access to the
+    /// register clear the interrupt flag *and* enable the register for another
+    /// eight shifts, which is what makes a stream of bytes work at all.
+    fn sr_begin(&mut self) {
+        self.sr_count = SR_BITS;
+        self.sr_due = match self.sr_internal_period() {
+            Some(period) => self.ticks + period,
+            None => NO_EVENT,
+        };
+    }
+
+    /// Whether the register still owes the transfer a shift.
+    fn sr_running(&self) -> bool {
+        let mode = self.sr_mode();
+        mode != SR_DISABLED && (mode == SR_OUT_FREE || self.sr_count > 0)
+    }
+
+    /// Put the next bit on the output stage.
+    ///
+    /// Bit 7 goes out and round into bit 0: a 6522 *recirculates* on a shift
+    /// out, so eight shifts leave the guest's byte back where it was. That is
+    /// observable — the Macintosh's ROM reads SR back after a keyboard command
+    /// and finds the command still in it.
+    fn sr_present(&mut self) {
+        if !self.sr_running() {
+            return;
+        }
+        self.sr_out = self.sr & 0x80 != 0;
+        self.sr = self.sr.rotate_left(1);
+    }
+
+    /// Take one bit off the data pin.
+    fn sr_take(&mut self, cb2: bool) {
+        if !self.sr_running() {
+            return;
+        }
+        self.sr = (self.sr << 1) | u8::from(cb2);
+        self.sr_count_down();
+    }
+
+    /// One bit of the transfer is done.
+    ///
+    /// Mode `100` disables the counter, so it never runs out and the interrupt
+    /// flag is never set; that is the only thing separating it from mode `101`.
+    fn sr_count_down(&mut self) {
+        if self.sr_mode() == SR_OUT_FREE || self.sr_count == 0 {
+            return;
+        }
+        self.sr_count -= 1;
+        if self.sr_count == 0 {
+            self.ifr |= IRQ_SR;
+            self.sr_due = NO_EVENT;
+        }
+    }
+
+    /// A whole shift on an internally generated clock, where there is only one
+    /// edge to hang both halves off.
+    fn sr_shift(&mut self, cb2: bool) {
+        if sr_shifts_out(self.sr_mode()) {
+            self.sr_present();
+            self.sr_count_down();
+        } else {
+            self.sr_take(cb2);
+        }
+    }
+
+    /// Run the internally clocked shift modes up to `target`.
+    ///
+    /// A counted transfer is at most eight shifts, so the loop is bounded by
+    /// the hardware. The free-running mode has no counter and would otherwise
+    /// be bounded by how long the scheduler stayed away, so it jumps: over `k`
+    /// shifts the register rotates `k` places and the output stage ends up
+    /// holding the bit the last one pushed out.
+    fn sr_advance_to(&mut self, target: u64) {
+        if self.sr_mode() == SR_OUT_FREE {
+            let Some(period) = self.sr_internal_period() else {
+                return;
+            };
+            if self.sr_due == NO_EVENT || self.sr_due > target {
+                return;
+            }
+            let shifts = (target - self.sr_due) / period + 1;
+            let places = (shifts % u64::from(SR_BITS)) as u32;
+            // The bit the last shift pushed out is the one that was `shifts`
+            // places below the top before the run started.
+            self.sr_out = self.sr.rotate_left(places.wrapping_sub(1) % u32::from(SR_BITS)) & 0x80
+                != 0;
+            self.sr = self.sr.rotate_left(places);
+            self.sr_due += shifts * period;
+            return;
+        }
+        while self.sr_due != NO_EVENT && self.sr_due <= target {
+            let Some(period) = self.sr_internal_period() else {
+                self.sr_due = NO_EVENT;
+                return;
+            };
+            let cb2 = self.inputs[LINE_CB2 as usize];
+            self.sr_shift(cb2);
+            if self.sr_due != NO_EVENT {
+                self.sr_due = self.sr_due.saturating_add(period);
+            }
+        }
+    }
+
+    /// What CB2's pin is driving.
+    ///
+    /// A shift-out mode owns the pin; otherwise PCR bits 7-5 do. `0xx` are the
+    /// two input modes and leave it alone, `110` and `111` are the manual
+    /// output modes. The handshake and pulse output modes (`100`, `101`) are
+    /// **not modelled** — nothing on a Macintosh uses them and inventing their
+    /// one-cycle pulse would be guessing — and are treated as the high they
+    /// idle at between pulses.
+    fn drive_cb2(&self) -> Drive {
+        if sr_shifts_out(self.sr_mode()) {
+            return Level::from(self.sr_out).into();
+        }
+        match self.pcr >> 5 {
+            0..=3 => Drive::HiZ,
+            6 => Drive::Low,
+            _ => Drive::High,
+        }
+    }
+
+    /// The same for CA2, whose modes are PCR bits 3-1 in the same order.
+    fn drive_ca2(&self) -> Drive {
+        match (self.pcr >> 1) & 7 {
+            0..=3 => Drive::HiZ,
+            6 => Drive::Low,
+            _ => Drive::High,
+        }
+    }
+
     /// The tick at which something will next happen, or `NO_EVENT`.
     fn next_event(&self) -> u64 {
-        self.t1_due.min(self.t2_due)
+        self.t1_due.min(self.t2_due).min(self.sr_due)
     }
 
     /// Where T1 stands at `ticks`, given when it was last reloaded.
@@ -379,6 +599,7 @@ impl State {
         if target <= self.ticks {
             return;
         }
+        self.sr_advance_to(target);
         if self.t1_due <= target {
             self.ifr |= IRQ_T1;
             if self.acr & 0x40 != 0 {
@@ -481,9 +702,10 @@ impl Shared {
             let mut state = self.state.lock();
             let before = state.asserting();
             let pb7 = state.pb7_timer;
+            let cb2 = state.drive_cb2();
             state.advance_to(target);
             self.publish(&state);
-            before != state.asserting() || pb7 != state.pb7_timer
+            before != state.asserting() || pb7 != state.pb7_timer || cb2 != state.drive_cb2()
         };
         if changed {
             self.refresh();
@@ -496,13 +718,29 @@ impl Shared {
     /// inside the critical section would run the far end's sink under this
     /// chip's lock. Mutate, release, *then* call outward (`CLAUDE.md`).
     fn refresh(&self) {
-        let (irq, pa, pb) = {
+        let (irq, pa, pb, ca2, cb2) = {
             let state = self.state.lock();
-            (state.asserting(), state.drive_pa(), state.drive_pb())
+            (
+                state.asserting(),
+                state.drive_pa(),
+                state.drive_pb(),
+                state.drive_ca2(),
+                state.drive_cb2(),
+            )
         };
         let out = self.out.lock().clone();
         if let Some(src) = &out.irq {
             src.set(Level::from(irq));
+        }
+        // The two handshake pins are outputs only while PCR says so, or —
+        // for CB2 — while a shift-out mode owns it; the rest of the time they
+        // let go and the net's pull decides, which is how the Macintosh's
+        // keyboard data line is shared with the keyboard at the other end.
+        if let Some(src) = &out.ca2 {
+            src.drive(ca2);
+        }
+        if let Some(src) = &out.cb2 {
+            src.drive(cb2);
         }
         for (src, drive) in out.pa.iter().zip(pa) {
             if let Some(src) = src {
@@ -526,6 +764,7 @@ impl Shared {
                 false
             } else {
                 let before = state.asserting();
+                let cb2_before = state.drive_cb2();
                 // The four handshake pins latch an interrupt on the edge PCR
                 // selects. PCR bit 0 picks CA1's edge, bit 4 picks CB1's; for
                 // CA2 and CB2 the input modes are bits 1-2 and 5-6, whose low
@@ -545,6 +784,30 @@ impl Shared {
                         if level == (state.pcr & 0x10 != 0) {
                             state.ifr |= IRQ_CB1;
                         }
+                        // CB1 is also the shift clock in the two external
+                        // modes, and which edge shifts depends on the
+                        // direction. The Guide's keyboard chapter states both
+                        // ends of it for this exact link: the VIA "latches the
+                        // data bit into its Shift register on the rising edge
+                        // of the Keyboard Clock signal", and "on the falling
+                        // edge of each keyboard clock cycle, the Macintosh Plus
+                        // places a data bit on the data line".
+                        //
+                        // Shifting out therefore straddles the pulse: the bit
+                        // goes on the pin at the leading edge and the count
+                        // completes at the trailing one, so a transfer is not
+                        // over until the clock pulse that carried its last bit
+                        // is. Doing both at the leading edge would raise the
+                        // interrupt with the last bit still on the wire, and a
+                        // guest that answered it promptly would take the pin
+                        // back before the far end had read it.
+                        let cb2 = state.inputs[LINE_CB2 as usize];
+                        match state.sr_mode() {
+                            SR_IN_EXT if level => state.sr_take(cb2),
+                            SR_OUT_EXT if !level => state.sr_present(),
+                            SR_OUT_EXT => state.sr_count_down(),
+                            _ => {}
+                        }
                     }
                     LINE_CB2 if state.pcr & 0x80 == 0 && level == (state.pcr & 0x40 != 0) => {
                         state.ifr |= IRQ_CB2;
@@ -552,7 +815,10 @@ impl Shared {
                     _ => {}
                 }
                 self.publish(&state);
-                before != state.asserting()
+                // A shift out moves CB2, and the far end of that net is
+                // watching it: an edge on CB1 is an output change as well as
+                // an input one.
+                before != state.asserting() || cb2_before != state.drive_cb2()
             }
         };
         if changed {
@@ -566,6 +832,7 @@ impl Shared {
         let (value, changed) = {
             let mut state = self.state.lock();
             let before = state.asserting();
+            let cb2_before = state.drive_cb2();
             let ticks = state.ticks;
             let value = match index {
                 R_ORB => {
@@ -611,7 +878,12 @@ impl Shared {
                 R_T2CH => (state.t2_count_at(ticks) >> 8) as u8,
                 R_SR => {
                     if !debug {
+                        // An access to SR clears the flag *and* re-enables the
+                        // register for another eight shifts. A debug read must
+                        // do neither: re-arming the counter would make the next
+                        // clock edge shift a byte the guest never asked for.
                         state.ifr &= !IRQ_SR;
+                        state.sr_begin();
                     }
                     state.sr
                 }
@@ -624,7 +896,10 @@ impl Shared {
             if !debug {
                 self.publish(&state);
             }
-            (value, before != state.asserting())
+            (
+                value,
+                before != state.asserting() || cb2_before != state.drive_cb2(),
+            )
         };
         if changed {
             self.refresh();
@@ -684,8 +959,27 @@ impl Shared {
                 R_SR => {
                     state.sr = value;
                     state.ifr &= !IRQ_SR;
+                    state.sr_begin();
                 }
-                R_ACR => state.acr = value,
+                R_ACR => {
+                    state.acr = value;
+                    // The mode chooses where the shift clock comes from, so
+                    // changing it moves the chip's own event: a mode with an
+                    // internal clock and a transfer still owed needs one
+                    // scheduled, and a mode without one — disabled, or waiting
+                    // on CB1 — has nothing to schedule.
+                    state.sr_due = match state.sr_internal_period() {
+                        // The free-running mode has no counter to run out, so
+                        // it owes itself an event whether or not SR has been
+                        // touched since.
+                        Some(period)
+                            if state.sr_count > 0 || state.sr_mode() == SR_OUT_FREE =>
+                        {
+                            ticks + period
+                        }
+                        _ => NO_EVENT,
+                    };
+                }
                 R_PCR => state.pcr = value,
                 // A one clears a flag; bit 7 is derived and is ignored.
                 R_IFR => state.ifr &= !(value & IRQ_SOURCES),
@@ -968,6 +1262,9 @@ impl Device for Via {
         w.write_u8(state.pcr)?;
         w.write_u8(state.ifr)?;
         w.write_u8(state.ier)?;
+        w.write_u8(state.sr_count)?;
+        w.write_u64(state.sr_due)?;
+        w.write_bool(state.sr_out)?;
         w.write_bool(state.pb7_timer)?;
         // And the pin levels — see the field's own comment for why.
         let mut pins = 0u32;
@@ -1000,6 +1297,11 @@ impl Device for Via {
             next.pcr = r.read_u8()?;
             next.ifr = r.read_u8()? & IRQ_SOURCES;
             next.ier = r.read_u8()? & IRQ_SOURCES;
+            // A counter past eight would let a restored chip shift for ever,
+            // so it is clamped rather than trusted.
+            next.sr_count = r.read_u8()?.min(SR_BITS);
+            next.sr_due = r.read_u64()?;
+            next.sr_out = r.read_bool()?;
             next.pb7_timer = r.read_bool()?;
             // The pin levels, which this chip does keep — see the field's own
             // comment. They are overwritten rather than kept from the live
