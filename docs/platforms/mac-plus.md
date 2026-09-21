@@ -9,11 +9,18 @@ SCSI, and a 512 × 342 one-bit screen that is **read out of main memory** by a
 counter rather than owned by a video chip. rsemu's first Apple machine, and the
 first board here whose framebuffer is somebody else's RAM.
 
+A real ROM runs it to the **blinking insert-disk icon**, polling the drive six
+to eight times a second; put an 800K image in and it spins the drive up, takes
+two runs at reading it, and puts it back out with the unreadable-disk cross.
+What it does not do yet is get a track off the disk — the last piece is ledger
+item 1.
+
 ## Primary sources
 
 | Source | Covers |
 | --- | --- |
-| *Guide to the Macintosh Family Hardware*, 2nd edition (Apple Computer, Addison-Wesley 1990) | The whole machine: chapter 3 for the address map, the overlay and the clock chip's three wires, chapter 7 for the keyboard's protocol and its four commands, chapter 9 for GCR and the disk interface, the VIA chapter's port-assignment tables, the video raster, and the drive's register file |
+| *Guide to the Macintosh Family Hardware*, 2nd edition (Apple Computer, Addison-Wesley 1990) | The whole machine: chapter 3 for the address map, the overlay and the clock chip's three wires, chapter 7 for the keyboard's protocol and its four commands, chapter 9 for GCR and the disk interface, the VIA chapter's port-assignment tables, and the video raster. **It does not carry the drive's register file** — chapter 9's tables are connector signal assignments and circuit diagrams, nothing more, and an earlier draft of this file said otherwise at some cost |
+| Neil Parker, *Controlling the 3.5 Drive Hardware on the Apple IIGS*, version 1.00 (February 1994) | The Sony mechanism's **sixteen one-bit status registers** and its control registers, addressed by `CA2`, `CA1`, `CA0` and `SEL`, with the polarity of each. The same mechanism hangs off a Macintosh Plus, and this is the only published listing of it. Its own summary of the polarities is the thing to remember: "the settings of most of these bits are *backwards*: 0 means yes and 1 means no" |
 | US patent **4,564,941**, "Error detection system", Apple Computer Inc. (filed 1983, granted 1986) | The three-byte interleaved checksum on a 400K/800K disk sector: the rotation, the carry chain, and the scrambling of the data with it |
 | *Synertek SY6522 / Rockwell R6522 Versatile Interface Adapter* data sheet | The chip: sixteen registers, two ports, two timers, the shift register, the interrupt flag/enable pair |
 | *Zilog Z8030/Z8530 SCC* technical manual | The one register pointer, the thirty-two registers per channel, `RR0`-`RR3`, the reset commands |
@@ -163,14 +170,15 @@ read/write pin for it and decodes the direction from the address instead.
 | `mac.video` | 512 × 342 one-bit pixels read out of main memory at capture time, the screen buffer hanging below the top of memory with `PAGE2` picking which of the two, and the vertical and horizontal blanking outputs | the cycles it steals from the processor: this board's 68000 runs at its full rate |
 | `mac.keyboard` | the Guide's clock/data protocol, its bit timing, the four commands of Table 7-4 and a type-ahead buffer | a host keymap — `Keyboard::key` takes the Guide's own transition code — and the separate keypad's `$79` prefix |
 | `mac.rtc` | the four-byte second counter, twenty bytes of parameter RAM, the write-protect and test registers, the three-wire serial interface and the one-second interrupt | the battery: parameter RAM lives and dies with the machine. The 256-byte chip of later models, and its two-byte extended command |
-| `mac.scc` | the register pointer and all thirty-two registers, `RR0`-`RR3`, the reset commands, and the two carrier detects | any serial traffic, the baud-rate generator, the DPLL, `/WREQ` |
-| `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and four controls, and the **read** data path: a disk shifted past the head a bit cell at a time | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set |
+| `mac.scc` | the register pointer and all thirty-two registers, `RR0`-`RR3`, the reset commands, `WR9`'s master interrupt enable, and the two carrier detects | any serial traffic, the baud-rate generator, the DPLL, `/WREQ` |
+| `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and its control registers, and the **read** data path: a disk shifted past the head a bit cell at a time | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set. The 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it |
 | `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum and the five speed zones | the 400K drive's PWM speed control, which an 800K mechanism ignores |
 | `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
 
 Not modelled at all: the **mouse** (two quadrature phases on the SCC's carrier
-detects and two more on the VIA's `PB4`/`PB5`), the **sound** (the PWM buffer
-the VIA's `PB7` gates), and **SCSI** (the NCR 5380 at `$580000`).
+detects and two more on the VIA's `PB4`/`PB5`) — buildable now, see the ledger
+— the **sound** (the PWM buffer the VIA's `PB7` gates), and **SCSI** (the NCR
+5380 at `$580000`).
 
 ## How far a real ROM gets
 
@@ -184,24 +192,36 @@ nothing in the drive:
 | 0.7 – 6 s | the memory test: alternating write and read passes over the whole megabyte, several patterns deep |
 | ~6 s | the ROM finds 1 MiB, writes `MemTop`, `BufPtr` and `ScrnBase`, initialises the SCC (32 register writes), exercises the IWM (all sixteen switches, including a mode-register load), reads all twenty bytes of parameter RAM and the clock twice over, finds the battery flat, and **writes its own defaults back** — unlocking the write-protect register with `$55` and locking it again with `$D5` around them |
 | 6.9 s | the first keyboard transaction: `ACR = $18`, `SR = $00` to pull the data line low, then `ACR = $1C`, `SR = $16` — Model Number. The keyboard answers `$03` |
-| 7.3 s onward | the desktop is painted grey, `_HideCursor` runs, the **insert-disk icon** is drawn in the middle of the screen, `_ShowCursor` puts the arrow back, and the processor parks in a two-byte loop at `$4006E8`. From then on it is **steady state**: the 60.15 Hz tick chain runs, `Ticks` at `$16A` counts up, `IFR` is cleared 60 times a second, and the keyboard is asked `$10` — Inquiry — every 0.25 second and answers `$7B`, Null. Which is exactly the cadence chapter 7 describes |
+| 7.3 s onward | the desktop is painted grey, `_HideCursor` runs, the **insert-disk icon** is drawn in the middle of the screen, `_ShowCursor` puts the arrow back. The 60.15 Hz tick chain runs, `Ticks` at `$16A` counts up, `IFR` is cleared 60 times a second, and the keyboard is asked `$10` — Inquiry — every 0.25 second and answers `$7B`, Null. Which is exactly the cadence chapter 7 describes |
+| 7 s onward | the ROM **probes the drive**: the drive-installed line, the number of sides, then the motor on. With a disk in the slot it spins up, and at about 14 s it gives up on it, **puts it back out** and draws the floppy with a **cross** through it — the unreadable-disk icon. With nothing in the slot it goes straight to the insert-disk loop |
+| 13 s onward | **the icon blinks** — the floppy with the question mark alternating with the plain floppy, about a second each way — and the drive's *disk in place* line is read six to eight times a second, for ever. That is the loop that notices a disk, and it is the thing that was missing |
 
 `Time` at `$20C` holds the date the clock chip was given plus however long the
 machine has been on, which is the check that the counter's byte order is right:
 with `time = "2026-01-01T00:00:00"` it reads `$E57B698D` twelve seconds in.
 
-**What the picture shows at that point**: the Macintosh's **50 % grey
-desktop** — a one-pixel checkerboard, 87,337 black pixels of 175,104 — with the
+**What the picture shows**: the Macintosh's **50 % grey desktop** — a
+one-pixel checkerboard, about 87,300 black pixels of 175,104 — with the
 **arrow cursor** drawn over it about fifteen pixels in from the left and
 fourteen down, and the **insert-disk icon** in the middle: a white floppy disk
-with a black outline, a shutter across its top with a small oval in it, and a
-large `?` in a box on its face, in a 32 × 32 area whose top left corner is
-pixel (240, 145) and whose outline runs from row 145 to row 176. Seven hundred
-and sixty of those 1,024 pixels are white, where the bare desktop would be
-exactly half. Nothing else is on it, and it does not change again in thirty
-virtual seconds. The 4 MiB board reaches the identical picture — same frame
-hash — about twenty-six seconds in, because its memory test is four times as
-long.
+with a black outline and a shutter across its top with a small oval in it, in a
+32 × 32 area whose top left corner is pixel (240, 145) and whose outline runs
+from row 145 to row 176.
+
+It **blinks**, which it did not use to. The icon alternates between the plain
+floppy (799 of those 1,024 pixels white) and the same floppy with a large `?`
+in a box on its face (760 white), about a second each way, where the bare
+desktop would be exactly half. Both phases are goldens in `tests/mac_plus.rs`
+and `the_insert_disk_icon_blinks` is the test that asserts the alternation
+rather than either picture.
+
+Put an 800K image in the drive and a third picture appears: the floppy with a
+**cross** through it (739 white), the Macintosh's unreadable-disk icon, drawn
+at about 14 s after the ROM has spun the drive up, failed to get anything off
+it and ejected it.
+
+The 4 MiB board reaches the same pictures about twenty-six seconds in, because
+its memory test is four times as long.
 
 No access faults, the processor never double-faults, and the video circuit
 produces 60 frames a virtual second throughout.
@@ -251,10 +271,97 @@ device or a probe:
   *has* armed the path — channel A and B both have `WR1 = $01` (external/status
   interrupts on), `WR9 = $0A` (master interrupt enable on) and `WR15 = $08`
   (carrier detect among the external statuses) — but it reads the chip exactly
-  twice in eight seconds and never again, and moving a carrier detect does not
-  get the processor out of the loop. It does something worse; see below.
+  twice in eight seconds and never again, and moving a carrier detect did not
+  get the processor out of the loop. It did something worse; see below.
 
-### The defects this turned up, and the one still open
+**And the answer, in the end, was the drive.** The processor was not parked
+because the boot had finished; it was parked because the ROM had asked the
+drive whether a drive was there, been told no, and had nothing left to do. See
+"The drive's register file was invented", below. `$4006E8` is now a loop the
+ROM passes through rather than one it stays in.
+
+### The drive's register file was invented
+
+The one that mattered, and the reason the machine sat on the insert-disk screen
+for three agents' worth of investigation.
+
+`src/dev/mac/iwm.rs` used to cite the *Guide to the Macintosh Family Hardware*,
+chapter 9, for "the drive's own register file: sixteen readable status lines
+and four writable controls". **Chapter 9 has no such table.** Its tables are
+signal assignments for the twenty-pin and DB-19 connectors and its figures are
+circuit diagrams; the mechanism's internal registers are not in the book. The
+eight low addresses in that invented table happened to be right, because they
+are the classic 400K drive's lines and are widely quoted; the eight high ones
+were not.
+
+What settles it is Apple's own note — Neil Parker, *Controlling the 3.5 Drive
+Hardware on the Apple IIGS* (1994), "Accessing Disk Drive Status and Control
+Bits". The same Sony mechanism hangs off a Macintosh Plus. Its table, as
+`CA2:CA1:CA0:SEL`:
+
+```text
+   0   0   0   0   step direction          1 = outward, toward track 0
+   0   0   0   1   disk in place           0 = a disk is in the drive
+   0   0   1   0   disk is stepping        0 = the head is moving
+   0   0   1   1   disk locked             0 = write protected
+   0   1   0   0   motor on                0 = the spindle is turning
+   0   1   0   1   track 0                 0 = the head is over track 0
+   0   1   1   0   disk switched           0 = the user ejected a disk
+   0   1   1   1   tachometer              60 pulses a revolution
+   1   0   0   0   lower head's read line  and selects that head
+   1   0   0   1   upper head's read line  and selects that head
+   1   0   1   x   (unassigned)
+   1   1   0   0   number of sides         1 = double sided
+   1   1   0   1   disk ready for reading  0 = ready
+   1   1   1   x   drive installed         0 = a drive is connected
+```
+
+and the control registers, addressed by `CA1:CA0:SEL` with `CA2` as the data:
+
+```text
+   0   0   0   CA2 = 0 step inward,  CA2 = 1 step outward
+   0   0   1                         CA2 = 1 reset the disk-switched flag
+   0   1   0   CA2 = 0 one step
+   1   0   0   CA2 = 0 motor on,     CA2 = 1 motor off
+   1   1   0                         CA2 = 1 eject
+```
+
+Four things in the old model were wrong, and the measurements that say so:
+
+* **Drive installed**, `CA2:CA1:CA0 = 111`, was unassigned, so it answered the
+  cable's pull-up — which is "no drive". A transparent tap over the controller
+  counts the ROM reading that one address **82 times** while it works out what
+  is on the cable, more than every other status line put together. Answering it
+  asserted low is the single change that starts the motor. That is also why a
+  previous agent found that reporting "no drive at all" changed nothing: the
+  board was *already* reporting no drive, at the address the ROM uses.
+* **Number of sides** and **disk ready** were at 10 and 11; they are at 12 and
+  13. With them moved, the ROM reads 12 during its probe and waits on 13 before
+  it will look for a sector's address field, which is exactly what the note
+  says the firmware does.
+* **Disk switched** was inverted: the line reads *low* once a disk has been
+  ejected, not high. `Iwm::insert` also used to set the flag, which made a
+  machine that powered on with a disk already in the drive report that the user
+  had just ejected one.
+* **Eject** fired on `CA2 = 0`; it is `CA2 = 1`. And the control address is
+  `CA1:CA0:SEL`, not `CA1:CA0` — `SEL` is what separates "set the step
+  direction" from "reset the disk-switched flag". With the old decode the four
+  eject strobes the ROM issues during its probe did nothing at all.
+
+The note's table puts *drive installed* at `SEL` on (address 15) and the
+Macintosh Plus ROM reads it at `SEL` off (address 14). The mechanism has one
+such line and no way to make it depend on `SEL`, so both halves answer it here.
+That is the one place the model goes beyond what the note says, and it is
+written down rather than buried.
+
+A fifth defect came out of the same reading. Apple's note says that *reading*
+the lower or upper head's line is what configures the drive to use that head —
+not merely having the `CA` lines sitting at that address. The model latched the
+side on the switch movement, so a ROM walking the sixteen switches on its way
+to somewhere else left the drive on the upper head. It now latches on a read of
+the status register at that address, and a debug read still changes nothing.
+
+### The defects this turned up
 
 * **The window fold.** Above. Fixed, and it is what put the icon on screen.
 * **`--screenshot` and `--vnc` never worked on this board.** `mac.video` was in
@@ -265,19 +372,34 @@ device or a probe:
   capture table themselves. Fixed, with a case in `tests/cli_screenshot.rs`
   that runs the shipped binary against rsemu's own ten-byte stub ROM — the
   second board that file's reason for existing has caught.
-* **A carrier-detect transition locks the machine up.** With the SCC configured
-  as the ROM leaves it, driving either `DCD` input makes the chip assert, the
-  processor takes vector 26 or 27, and it never comes back: sampling 200 000
-  instants afterwards finds **every one** of them at `$401A84` or `$401AB4`, the
-  level-2 and level-3 handler entries, and none in the idle loop. The handler
-  reads `RR0` on channel B about 740 times in the 200 ms after a single
-  transition — no other register, and a transparent tap over both SCC windows
-  catches no write in the first two dozen accesses, so it is not obvious that
-  anything issues *Reset Ext/Status Interrupts*. `MTemp` at `$828` does move, from
-  `(15,15)` to `(16,14)`, so the quadrature is being decoded; the machine simply
-  never leaves interrupt level again. Whether the fault is in `mac.scc`'s latch
-  or in what the board does with `/INT` is not yet settled, and it is the thing
-  to settle before `mac.mouse` is written.
+* **A carrier-detect transition locked the machine up.** Fixed, and it was
+  neither the latch nor the board: it was an early `return`.
+
+  `Reset Ext/Status Interrupts` is command 2 in bits 5-3 of a control write
+  with the register pointer at zero. `Shared::write` handled it inside the
+  `if pointer == 0` branch and then returned from the function — *before* the
+  line at the bottom that re-announces `/INT` on its wire. So the chip's own
+  state said it had stopped asking and the wire said it had not, and a
+  Macintosh runs `/INT` straight into `IPL1`: the handler did everything the
+  Z8530 manual asks of it, returned, and was entered again, for ever.
+
+  A trace of the seven accesses the handler makes says it plainly. Read `RR0`;
+  write `WR0 = $02` (Reset Ext/Status); read `RR2` — **`$02`, the status code
+  for "channel B external/status change"**, so the vector was right; read `RR0`
+  again; `WR0 = $0F` (point high to `WR15`); read `RR15`; `WR0 = $10` (Reset
+  Ext/Status again, which is the manual's own advice). After that the chip's
+  `ext_ip` is clear and `RR2` reads `$06`, "no interrupt pending". Everything
+  the ROM could see was right; only the pin was wrong.
+
+  Every path out of the write now falls through to the refresh, and the
+  regression watches the **net** rather than the registers — which is the
+  point, because `Scc::irq` used to read the state and so could not see it.
+  The old test passed the whole time.
+* **The SCC ignored `WR9`'s master interrupt enable.** Found while fixing the
+  above: the chip pulled `/INT` whenever a channel had a pending bit and `WR1`
+  enabled the condition, with no reference to MIE. The manual gates the pin on
+  all three, and `WR9` is the one register the two channels share.
+  `Scc::irq` now reports the pin rather than the pending bits.
 
 A counting stub has to be **transparent** or it changes what it measures. The
 first one here filled a read with `$FF` instead of `attrs.bus`, which is what
@@ -300,11 +422,14 @@ without the chip.
 with this encoder about the low-level bit assignments: which two bits of each
 byte go where in a 6-and-2 group, and which of the three sums scrambles which
 byte. The encoder and the decoder here are each other's oracle, so they would
-agree with each other even if both were wrong in the same way. The only thing
-that settles it is a ROM reading a track this encoder wrote — and the ROM stops
-at the insert-disk icon without ever asking whether a disk is there, so even
-with an image in hand that test cannot run. Both halves of that are honest and
-both are recorded here.
+agree with each other even if both were wrong in the same way.
+
+The ROM now gets *close enough to ask*. It probes the drive, starts the motor,
+and takes two runs at the disk before it ejects it — but in those runs it reads
+only forty to a hundred bytes a second out of the data register, where a head
+over a spinning 800K disk delivers sixty-two thousand. It is not reading the
+track. It is in a **speed servo** instead, and that is the thing now standing
+between this board and a boot: see ledger item 1.
 
 ```sh
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
@@ -331,23 +456,59 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **Why the insert-disk screen never ends.** The icon is up, and the ROM then
-   sits at `$4006E8` for ever: it does not blink the icon, it does not poll the
-   drive for a disk, and putting one in changes nothing. While it waits, the
-   only thing it says to the controller is one read of the `ENABLE off` switch
-   twice a second — and the chip is left at `switches = $25`, `Q7:Q6 = 00`, so
-   that read returns the data register rather than any status line and the ROM
-   is not asking whether a disk is there. A transparent tap over the
-   controller's whole window records the identical eight accesses in four
-   virtual seconds with a disk in the drive and without one. Something is
-   supposed to take
-   it out of that loop and nothing does. The `$17D6` element on `VBLQueue` is
-   walked every blanking interval and its count at `$17E0` is read and written
-   back unchanged, which is a task that is never armed: what arms it is the
-   next thing to find.
-2. **The carrier-detect lock-up** (above). A `DCD` transition puts the machine
-   into the level-2/3 handlers permanently. Settle that before writing
-   `mac.mouse`, because the mouse is the thing that will drive those pins.
+1. **The drive's speed, and the PWM servo the ROM runs against it.** This is
+   what stands between the board and a boot, and it is the successor to "why
+   the insert-disk screen never ends" — that one is answered and fixed.
+
+   With the register file right the ROM probes the drive, starts the motor and
+   then spends five to six virtual seconds reading **one** status line in a
+   tight loop: the tachometer, at `CA2:CA1:CA0:SEL = 0111`, a hundred and
+   forty-seven thousand times a second, from a twelve-instruction loop at
+   `$418B0E`-`$418B36` running at interrupt level 3. Between bursts it reads
+   the data register forty to a hundred times a second — a trickle, not a track
+   read — and after two attempts it ejects the disk and draws the cross.
+
+   **It is servoing the speed.** The low byte of each word in the sound buffer
+   is the 400K drive's PWM speed control, and watching `MemTop - $300` through
+   the wait shows it moving: `ff ff ff …` before the motor starts, then
+   `36 2d 2d 36 2d 36 2d 2d`, then `01 20 20 20 20 01 20 20`, then flat `20`.
+   The ROM measures, corrects, measures again — and this drive's speed is a
+   property of how many bit cells our encoder put on the cylinder, so nothing
+   it writes changes anything and the loop never converges.
+
+   **The tachometer rate is not the answer**, which is worth recording because
+   it is the obvious first guess. The model turns track 0 at 404 rpm where a
+   real 800K mechanism turns it at 394, and both were tried, along with a sweep
+   of the whole apparent range from 101 rpm to 1,616 rpm. Every rate behaves
+   the same: the only thing that changes is how long the timeout takes, because
+   the timeout is counted in tachometer transitions. At no rate does the ROM
+   read more than about eighty-five bytes a second.
+
+   So the next question is **why a Macintosh Plus ROM runs the 400K servo
+   against a drive that reports itself double-sided**. Telling it single-sided
+   (the "number of sides" line low) changes nothing, and neither does moving
+   the unassigned `CA2:CA1:CA0 = 101` line. Two shapes are worth testing next:
+   that the Plus ROM always runs the servo and a real 800K drive simply reads
+   in range on the first measurement — in which case the target rate is the
+   whole of it and the sweep above was measuring the wrong quantity — or that
+   something else the ROM reads before it starts (`$401A`-something in low
+   memory, or the parameter RAM the clock chip hands back) is what picks the
+   400K path.
+
+   The honest alternative, if that turns out to be a dead end, is to make the
+   cylinder the right *length*: a real 800K track at 500 kbit/s and 394 rpm
+   holds 76,142 bit cells and ours holds 74,232, the difference being trailing
+   gap a real formatter leaves and this encoder does not. Padding each zone to
+   its documented length would make the rotation rate come out right by
+   construction rather than by a tachometer fudge, which is the model this
+   board should have either way.
+2. **The mouse.** Now buildable: a carrier-detect transition no longer locks
+   the machine up, `MTemp` at `$828` moves on both axes — `(15,15)` to
+   `(15,14)` for channel A and to `(16,15)` for channel B — and the machine
+   goes straight back to its idle loop and keeps counting `Ticks`.
+   `tests/mac_plus.rs` asserts exactly that. What is left is a `mac.mouse`
+   device driving two phases onto the SCC's carrier detects and two onto the
+   VIA's `PB4`/`PB5`, plus the button on `PB3`.
 3. **The NCR 5380.** Lower down the list than it was: the ROM makes **zero**
    accesses to `$580000` in eight virtual seconds, so nothing is waiting on it.
    `src/dev/scsi` has the bus, the `Target` trait and a disk when the ROM gets
@@ -358,8 +519,9 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 5. **A host keymap.** `mac.keyboard` takes the Guide's own transition codes and
    nothing turns a keysym into one. Figure 7-6 has the table; the OCR of it in
    circulation is not reliable enough to transcribe and it wants a clean scan.
-6. **The mouse and the sound**, which are the last two things on the board with
-   nothing behind them.
+6. **The sound**, the last thing on the board with nothing behind it — and now
+   also the thing the disk's speed servo writes into, so a `mac.sound` that
+   reads the PWM buffer would have a second reason to exist.
 
 ## How the ambiguities were settled
 
@@ -408,6 +570,22 @@ stated plainly.
   with nothing wired to it. A snapshot round trip found it: a restore *does*
   deliver the level, so the restored machine and the built one disagreed about
   one bit of `IFR`.
+* **Which address the ROM tests for "is there a drive".** Counting the drive
+  register addresses a real ROM reads is what found it: one address, read
+  eighty-two times during the startup probe, against twenty-four and twelve for
+  the next two and nothing at all for the other thirteen. A histogram of
+  *which register* is asked for is a much better instrument on this chip than a
+  count of accesses, because every one of the IWM's sixteen addresses is a soft
+  switch and the ROM walks through addresses it does not mean to read.
+
+  The general lesson is the one this file keeps relearning: **check what the
+  cited source actually says.** The drive register table had a chapter
+  reference attached to it and the chapter does not contain a table. Three
+  agents worked around the consequences without going back to look.
+* **Whether a device's *pin* moved, not just its state.** The carrier-detect
+  lock-up was invisible to every register-level test because every register was
+  right. A device that publishes through a wire needs at least one test that
+  reads the wire.
 
 ## Running it
 

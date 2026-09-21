@@ -11,11 +11,14 @@
 # keyboard's Model Number handshake and settles into asking it for a key every
 # quarter second, draws the Macintosh's grey desktop with the arrow cursor over
 # it, and then puts the **insert-disk icon** - the floppy with a question mark -
-# in the middle of the screen, with the 60.15 Hz tick chain running. What it
-# does not do yet is notice a disk once one is in the drive;
-# `docs/platforms/mac-plus.md` has the ledger of what is missing and of what has
-# been ruled out. The picture reaches a person through `--vnc`, which serves the
-# video circuit's scanout.
+# in the middle of the screen, with the 60.15 Hz tick chain running. From about
+# thirteen seconds on the icon **blinks** and the ROM polls the drive's
+# disk-in-place line six to eight times a second; with an 800K image in the
+# drive it spins the motor up, takes two runs at reading it and then puts it
+# back out with the unreadable-disk cross. What it does not do yet is get a
+# track off the disk - `docs/platforms/mac-plus.md` has the ledger of what is
+# missing and of what has been ruled out. The picture reaches a person through
+# `--vnc`, which serves the video circuit's scanout.
 #
 # Written from *Guide to the Macintosh Family Hardware* (Apple Computer, 2nd
 # edition) - chapter 3 for the address map, the overlay and the clock chip,
@@ -256,6 +259,8 @@ machine "mac-plus" {
   # Interrupts. A Macintosh has no priority encoder: the VIA's /IRQ goes
   # straight to IPL0 and the SCC's /INT straight to IPL1, so the VIA alone is
   # level 1, the SCC alone is level 2, and both at once really is level 3.
+  # Which is why the SCC letting go of /INT is load-bearing rather than
+  # cosmetic: nothing between the chip and the processor can mask it.
   # That is the hardware, not a simplification. (IPL2 is the programmer's
   # switch, which is a button this board does not have.)
   wire via.irq -> cpu.ipl0
