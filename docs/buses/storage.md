@@ -58,6 +58,15 @@ no status bit. The same drive would hang off a PCI IDE controller, a
 CompactFlash socket or a PCMCIA adapter without changing, because none of those
 change the cable.
 
+**And that claim is now load-bearing rather than rhetorical.** `dev/pc/idepci`
+is a PCI IDE controller in **native mode**: the four base address registers of
+the *PCI IDE Controller Specification* revision 1.0, class `01h`/`01h` with
+programming interface `05h`, and it hands `dev/pc/ide`'s own two regions to
+those registers instead of to a `map` statement. It contains no ATA either, and
+the drive on the other side of the cable is the same object with the same
+contents — the only thing that changed is which address the decoder answers at,
+which is the entire difference between compatibility mode and native mode.
+
 **ATAPI is a second device, not a flag on this one.** `dev/ata/atapi` is the
 packet device: `PACKET` carries a twelve-byte SCSI command descriptor block
 through the data register and the meaning of those twelve bytes is SFF-8020i's,
