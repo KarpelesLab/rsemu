@@ -116,7 +116,7 @@ fn build() -> Fixture {
         topo.map(device.region("").expect("a register window"), REGS)
             .expect("the map fits");
     }
-    device.attach_space(Arc::clone(&space), RequesterId(7));
+    device.attach_space(&space, RequesterId(7));
 
     let ids = WireIdAllocator::new();
     let id = ids.alloc();

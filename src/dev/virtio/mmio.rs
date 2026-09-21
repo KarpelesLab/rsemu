@@ -49,7 +49,7 @@
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{self, AtomicBool, AtomicU64};
@@ -173,7 +173,23 @@ const MAX_QUEUES: usize = u64::BITS as usize;
 #[derive(Debug, Default)]
 struct Links {
     out: Option<WireSource>,
-    space: Option<Arc<AddressSpace>>,
+    /// The space this device masters, held **weakly**.
+    ///
+    /// Strongly would be a reference cycle, and the leak is the whole machine:
+    /// the space owns the mapping, the mapping owns
+    /// [`Registers`](struct@Registers) as its [`MemOps`], and the registers
+    /// would own the space. Nothing in the tree breaks such a cycle — there is
+    /// no unbind — so every byte of guest RAM in that space outlives the
+    /// machine that was torn down. The `virtio_mmio` fuzz target reported it
+    /// as 6.5 MB leaked per iteration under LeakSanitizer, which is the
+    /// fixture's RAM store exactly.
+    ///
+    /// Every other bus master here already does this — `ahci::hba`,
+    /// `nvme::ctrl`, `usb::xhci`, `usb::ehci`, `ncr53c710`, `pc::dma` — and
+    /// `CLAUDE.md` states the rule for the analogous case: a wire's sinks are
+    /// weak refs for exactly this reason. The device does not keep its bus
+    /// alive; the machine does.
+    space: Option<Weak<AddressSpace>>,
     requester: RequesterId,
     /// The net the interrupt pin drives, so a board's device tree can look
     /// its number up in its own interrupt controller's pin table. See the
@@ -245,10 +261,13 @@ impl VirtioMmio {
     /// Give the device the address space its DMA traverses.
     ///
     /// A realized machine does this through [`Instance::bind`]; a test that
-    /// wires one by hand calls it directly.
-    pub fn attach_space(&self, space: Arc<AddressSpace>, requester: RequesterId) {
+    /// wires one by hand calls it directly. The reference is **weak**: the
+    /// space owns the mapping that owns this device, so holding it strongly
+    /// would be a cycle that leaks the whole machine. A device whose space has
+    /// been dropped simply does no DMA.
+    pub fn attach_space(&self, space: &Arc<AddressSpace>, requester: RequesterId) {
         let mut links = self.regs.links.lock();
-        links.space = Some(space);
+        links.space = Some(Arc::downgrade(space));
         links.requester = requester;
     }
 
@@ -372,7 +391,10 @@ impl Registers {
             let links = self.links.lock();
             (links.space.clone(), links.requester)
         };
-        let Some(space) = space else {
+        // Upgraded once per pass and held across it: the machine that owns the
+        // space cannot go away mid-transfer, and a `None` here is a device
+        // that outlived its bus and has nothing to master.
+        let Some(space) = space.as_ref().and_then(Weak::upgrade) else {
             return false;
         };
         let Some(queue) = self.live_queue(index) else {
@@ -830,7 +852,7 @@ impl Instance for VirtioMmio {
                  descriptors live in (`space = mem`)",
             ),
         })?;
-        self.attach_space(Arc::clone(space), ctx.requester());
+        self.attach_space(space, ctx.requester());
         Ok(())
     }
 }
@@ -907,7 +929,7 @@ mod tests {
                 .map(CoreRegion::ram("ram", Arc::new(RamStore::new(0x1_0000))), 0)
                 .unwrap();
             let space = Arc::new(space);
-            device.attach_space(Arc::clone(&space), RequesterId(2));
+            device.attach_space(&space, RequesterId(2));
             Fixture {
                 device,
                 space,
@@ -975,6 +997,39 @@ mod tests {
             self.poke(AVAIL + 4, W::U16, 0);
             self.poke(AVAIL + 2, W::U16, u64::from(idx));
         }
+    }
+
+    /// The `virtio_mmio` fuzz target's finding, as something the ordinary
+    /// suite can see without a sanitizer.
+    ///
+    /// LeakSanitizer reported 6.5 MB a run, every allocation under
+    /// `RamStore::new` — the fixture's guest RAM, kept alive by a cycle of
+    /// `Arc`s: the space owns the mapping, the mapping owns the register block
+    /// as its `MemOps`, and the register block owned the space. A cycle is not
+    /// visible as a leak from inside a `Drop`, but it is exactly visible as a
+    /// `Weak` that still upgrades after the last strong handle is gone.
+    #[test]
+    fn the_device_does_not_keep_the_space_it_masters_alive() {
+        let device = VirtioMmio::new(Arc::new(Echo::default()) as Arc<dyn Backend>, &ECHO_CLASS);
+        let space = Arc::new(AddressSpace::new("mem", 64));
+        // The cycle needs both halves: the device in the space's map, and the
+        // space in the device's links. Either alone is harmless.
+        space
+            .topology()
+            .map(device.region("").expect("a register window"), 0x1000)
+            .unwrap();
+        device.attach_space(&space, RequesterId(4));
+
+        let watch = Arc::downgrade(&space);
+        drop(space);
+        assert!(
+            watch.upgrade().is_none(),
+            "the address space outlived its last owner: the device holds it strongly"
+        );
+        // And the device is still a device — a dropped space means no DMA,
+        // not a panic.
+        assert_eq!(device.status(), 0);
+        device.notify(0);
     }
 
     #[test]
@@ -1176,7 +1231,7 @@ mod tests {
             .map(device.region("").expect("a register window"), SELF)
             .unwrap();
         let space = Arc::new(space);
-        device.attach_space(Arc::clone(&space), RequesterId(3));
+        device.attach_space(&space, RequesterId(3));
 
         let poke = |at: u64, width: W, value: u64| {
             space.write(at, width, value, MemAttrs::DEFAULT).unwrap();
