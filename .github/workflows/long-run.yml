@@ -115,3 +115,54 @@ jobs:
           name: long-run-log
           path: long-run.log
           if-no-files-found: warn
+
+  # FreeDOS installs itself from five diskettes onto an IDE disk and then boots
+  # that disk — 46 minutes of guest time, about 16 of host. It is gated on
+  # `RSEMU_FREEDOS_DIR` and therefore **skipped by every per-commit job**, which
+  # is how a regression in it survived a week: `fix(cpu-x86)!: give EFLAGS.ID
+  # storage wherever CPUID exists` moved `JEMMEX.EXE` a couple of paragraphs in
+  # low memory, and a privilege-level defect that had been under this board all
+  # along started biting. Nightly is the right cadence: it would have caught
+  # that in a day, and it costs a runner a quarter of an hour.
+  #
+  # Deliberately *not* cached. Caching a pre-installed image would make CI store
+  # a FreeDOS install — GPL-2.0, a private cache rather than redistribution, but
+  # a licensing decision somebody should take on purpose rather than inherit
+  # from a speed optimisation. Sixteen minutes a night is cheaper than that
+  # conversation.
+  freedos:
+    name: FreeDOS installs to a disk and boots off it (pc-at)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: long-run-freedos
+      # Fetched, never vendored, checksummed by the script (CLAUDE.md, Testing).
+      - name: fetch the FreeDOS diskettes
+        run: ./scripts/fetch-testdata.sh freedos
+      - name: install and boot
+        env:
+          RSEMU_FREEDOS_DIR: testdata/freedos
+        run: |
+          set -uo pipefail
+          rc=0
+          cargo test --release --all-features --test pc_at_freedos -- --nocapture \
+            2>&1 | tee freedos.log || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            # The harness prints the guest's own last console line when it gives
+            # up, which is the whole diagnosis — put it in the checks list.
+            grep -E 'the last line is' freedos.log | while IFS= read -r line; do
+              echo "::error title=freedos::$line"
+            done
+          fi
+          exit "$rc"
+      - name: keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freedos-log
+          path: freedos.log
+          if-no-files-found: warn
