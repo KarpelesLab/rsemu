@@ -24,9 +24,13 @@
 //!   may not master the bus is asked to; nothing it reads may come from guest
 //!   memory. This is checked by construction — the engine's space handle is
 //!   gated — and observed here by ringing every doorbell with mastering off.
-//! * **The window and the registers agree.** Whatever the stream did, a guest
-//!   read of the window either faults or answers `CAPLENGTH`, and never
-//!   something in between.
+//! * **The window and the registers agree.** Whatever the stream did, the
+//!   window is in the map only where `COMMAND[1]` and BAR0 between them put
+//!   it, and a guest read of wherever it landed answers `CAPLENGTH` — never
+//!   something in between. With `COMMAND[1]` clear nothing of the function is
+//!   in the map at all, whatever BAR0 still holds (Rev 3.0 §6.2.2): the base
+//!   address register means nothing until the space-enable bit is set, and the
+//!   `0xff` a guest reads at it is the bus, not the card.
 //! * **A debug read has no side effects and a debug write is refused**, on both
 //!   surfaces.
 //! * **The snapshot loader is a parser on untrusted bytes.** A round trip must
@@ -126,11 +130,29 @@ fn build() -> Fixture {
 
 impl Fixture {
     /// Where the window currently decodes, if the Command register lets it.
+    ///
+    /// The second half of `Bars::window`'s answer is **not** optional: Rev 3.0
+    /// §6.2.2's Memory Space Enable is what decides whether the function
+    /// responds to a memory address at all, and §6.2.5.1's base only says
+    /// *where* once it does. Out of `PCIRST#` the Command register is zero, so
+    /// dropping the flag made this report a window at whatever the BAR latch
+    /// held — address zero — where the fixture's space decodes nothing and
+    /// `UnassignedPolicy::ONES` answers `0xff`. That is what a bus with nobody
+    /// driving it does, and reading it as the controller's `CAPLENGTH` is what
+    /// this target was doing wrong.
     fn window(&self) -> Option<u64> {
-        self.function
-            .bars()
-            .window(0, self.function.command())
-            .map(|(base, _)| base)
+        match self.function.bars().window(0, self.function.command()) {
+            Some((base, true)) => Some(base),
+            _ => None,
+        }
+    }
+
+    /// Where the window **actually is in the map**, which is not always where
+    /// the register asks for it: a base that does not fit the space, or that
+    /// collides with the RAM in it, is a card decoding an address the machine
+    /// cannot drive, and `Bars::sync` leaves it out.
+    fn placed(&self) -> Option<u64> {
+        self.function.bars().placement(0)
     }
 }
 
@@ -288,9 +310,39 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Whatever the stream did, the two halves still agree: either the window is
-    // out of the map, or the first dword of it is the capability register file.
-    if let Some(base) = f.window()
+    // A configuration write takes the order-exempt try-lock, so the stream may
+    // have left a retopology owed; a board drains it from a moment with no
+    // access in flight, which is what `q35::mch` calls this for. Do what the
+    // board does before asking the two halves to agree, or the window is
+    // legitimately still at the base the *previous* write named.
+    f.bus.settle();
+
+    // Whatever the stream did, the window and the registers agree.
+    //
+    // Rev 3.0 §6.2.2: with Memory Space Enable clear the function responds to
+    // no memory address at all, so nothing of it may be in the map — whatever
+    // §6.2.5.1's base address register still holds.
+    match (
+        f.function.bars().window(0, f.function.command()),
+        f.placed(),
+    ) {
+        (Some((base, true)), Some(at)) => assert_eq!(
+            at, base,
+            "the window is in the map at an address its register does not name"
+        ),
+        // The base did not fit the space, or collided with the guest RAM in
+        // it. A card decoding an address the machine cannot drive decodes
+        // nothing, which is the modelling decision `Bars::sync_one` documents.
+        (Some((_, true)), None) => {}
+        (window, placed) => assert_eq!(
+            placed, None,
+            "a window decodes with COMMAND[1] clear: {window:?}"
+        ),
+    }
+
+    // And wherever it is in the map, the first dword of it is this
+    // controller's capability register file and not something else's.
+    if let Some(base) = f.placed()
         && let Ok(value) = f.space.read(base, Width::U32, MemAttrs::DEFAULT)
     {
         assert_eq!(

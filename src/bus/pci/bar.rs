@@ -865,6 +865,37 @@ impl Bars {
         Some((base, decoding))
     }
 
+    /// Where register `index`'s window **actually is in the map**, as opposed
+    /// to where its register asks for it.
+    ///
+    /// The two agree in every settled state, and the three ways they can
+    /// differ are the whole reason this exists beside
+    /// [`window`](Bars::window):
+    ///
+    /// * `COMMAND`'s space-enable bit is clear, so the function does not
+    ///   respond to any address at all (Rev 3.0 §6.2.2) and nothing is mapped
+    ///   — while the base address register still holds whatever firmware last
+    ///   wrote there;
+    /// * the base firmware wrote does not fit the space, or collides with
+    ///   something else the board decodes, so [`sync`](Bars::sync) could not
+    ///   place it — a card decoding an address the machine cannot drive, which
+    ///   decodes nothing;
+    /// * a retopology is [owed](Bars::is_stale) because the try-lock failed,
+    ///   and the window is still at the base the *previous* write named.
+    ///
+    /// Returned as a base rather than a `MappingId` because the identifier is
+    /// the address space's business; this answers "what would a guest read
+    /// find there", which is what a monitor, a test and the `xhci_pci` fuzz
+    /// target all want. It is the **mapping's** base, so for a register
+    /// declared with [`Bar::at_offset`] it is the register's base plus that
+    /// offset — which is exactly where the region begins, and is not the same
+    /// number [`window`](Bars::window) reports.
+    #[must_use]
+    pub fn placement(&self, index: u8) -> Option<u64> {
+        let placed = self.placed.lock();
+        Some(placed.as_ref()?.windows.get(&index)?.base)
+    }
+
     /// Adopt `spaces` as where this function's windows go, and place whatever
     /// currently decodes. **Retopology**, and legal only where nothing is in
     /// flight: [`Instance::bind`](crate::machine::realize::Instance::bind),

@@ -537,6 +537,72 @@ fn a_window_moves_when_its_register_does() {
     );
 }
 
+/// The `xhci_pci` fuzz target's finding, as a property of `Bars` rather than
+/// of that fixture.
+///
+/// The target asked `window` where BAR0 was and read a dword there, expecting
+/// the controller's `CAPLENGTH` — and threw away the second half of the
+/// answer. Out of reset `COMMAND` is zero, so the window decodes *nothing*
+/// while the register still reads whatever was last written to it; the read
+/// landed on unassigned space and got `0xff`. Rev 3.0 §6.2.2 is what makes
+/// that right and the assertion wrong: Memory Space Enable decides whether the
+/// function responds at all, and §6.2.5.1's base only says where once it does.
+///
+/// `placement` is the accessor that cannot be misread this way: it answers
+/// where the window *is*, not where its register points.
+#[test]
+fn a_base_address_register_points_somewhere_the_window_is_not() {
+    let space = Arc::new(AddressSpace::new("mem", 20).with_unassigned(UnassignedPolicy::ONES));
+    let bars = Bars::new()
+        .with(
+            0,
+            Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free");
+    bars.install(&BarSpaces::new().memory(&space), 0)
+        .expect("nothing is there yet");
+    set_bar(&bars, config::BAR0, 0x000f_f000);
+    bars.sync(0, true);
+
+    // §6.2.2: the register holds the base firmware wrote, and the function
+    // responds to nothing, so the two disagree on purpose.
+    assert_eq!(
+        bars.window(0, 0),
+        Some((0xf_f000, false)),
+        "the register remembers where it was told to decode"
+    );
+    assert_eq!(bars.placement(0), None, "and nothing of it is in the map");
+    assert_eq!(
+        space.read(0xf_f000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "what a guest reads there is the bus, not the card"
+    );
+
+    // Set the bit and they agree.
+    bars.sync(config::COMMAND_MEMORY, true);
+    assert_eq!(bars.placement(0), Some(0xf_f000));
+    assert_eq!(space.read(0xf_f000, Width::U8, MemAttrs::DEFAULT), Ok(0x5a));
+
+    // A base the space cannot hold is the other way the two legitimately
+    // differ: the register names it, `sync` could not place it, and a guest
+    // reads the bus wherever it looks.
+    set_bar(&bars, config::BAR0, 0x0010_0000);
+    bars.sync(config::COMMAND_MEMORY, true);
+    assert_eq!(
+        bars.window(0, config::COMMAND_MEMORY),
+        Some((0x10_0000, true))
+    );
+    assert_eq!(
+        bars.placement(0),
+        None,
+        "one page past the end of a 1 MiB space does not fit"
+    );
+
+    // A register with no window behind it has no placement either, whatever
+    // COMMAND says.
+    assert_eq!(bars.placement(1), None);
+}
+
 #[test]
 fn a_retopology_that_cannot_happen_now_happens_later() {
     // The whole reason the try-lock exists: a configuration write may arrive
