@@ -34,11 +34,11 @@
 //! the argument; before the fold the icon went into the floating half of the
 //! window and the screen stayed empty.
 //!
-//! What the board still does not do is notice a disk once one is there: the ROM
-//! sits in a two-byte loop at `$4006E8` with its interrupt mask at zero and
-//! never moves the drive's soft switches, so `--floppy` changes nothing yet.
-//! `docs/platforms/mac-plus.md` has the whole ledger, including what has been
-//! ruled out and how.
+//! From about thirteen seconds on the icon **blinks** and the ROM polls the
+//! drive's disk-in-place line six to eight times a second. Put an 800K image
+//! in the drive and it starts the motor, tries to read the disk, and puts it
+//! back out when there is no system on it. `docs/platforms/mac-plus.md` has
+//! the whole ledger, including what is still open and how it was measured.
 //!
 //! # The ROM file
 //!
@@ -69,6 +69,8 @@ use rsemu::core::clock::GlobalTime;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
 use rsemu::cpu::m68k::M68k;
+use rsemu::dev::mac::iwm::Iwm;
+use rsemu::dev::mac::scc::Scc;
 use rsemu::host::display::mac::{MacScanout, capture};
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
 use rsemu::machine::{Machine, catalog};
@@ -76,8 +78,17 @@ use rsemu::machine::{Machine, catalog};
 /// How long a Macintosh Plus ROM is. The socket is a 128 KiB part.
 const ROM_LEN: usize = 128 * 1024;
 
-/// The picture at 12 virtual seconds on the stock 1 MiB board.
-const GOLDEN_1M: u64 = 0xfbc9_cfa0_9b09_a5da;
+/// The picture at 12 virtual seconds on the stock 1 MiB board, with nothing
+/// in the drive.
+///
+/// The icon **blinks** once the ROM is in its insert-disk loop, so this is a
+/// golden of one *phase* of that blink at one fixed virtual instant. Virtual
+/// time is exact, so it is stable — but if it moves, check whether the other
+/// phase (`0xfbc9_cfa0_9b09_a5da`, the same screen with the icon's inner
+/// question mark the other way) is what came out before deciding anything is
+/// wrong. `the_insert_disk_icon_blinks` is the test that asserts the blink
+/// itself.
+const GOLDEN_1M: u64 = 0x63dd_d76c_9468_dfa7;
 
 /// Where the insert-disk icon lands: a 32 × 32 box a little above the middle
 /// of the 512 × 342 screen, found by watching which addresses the ROM draws it
@@ -89,6 +100,8 @@ struct Board {
     machine: Machine,
     cpu: Arc<M68k>,
     scanout: MacScanout,
+    iwm: Arc<Iwm>,
+    scc: Arc<Scc>,
 }
 
 /// Read the ROM out of `RSEMU_MAC_ROM_DIR`; `None` (having said why) if the
@@ -163,6 +176,23 @@ fn board_with_disk(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Bo
         kept.push(&cpu);
         Ok(cpu)
     });
+    // The disk controller and the SCC, caught as they are built: a test that
+    // asks whether the motor is running or whether the chip let go of `/INT`
+    // is asking about the *device*, and there is no other handle to it.
+    let iwms: Arc<Captured<Iwm>> = Arc::new(Captured::new());
+    let keep_iwm = Arc::clone(&iwms);
+    options.bindings.replace("mac.iwm", move |props| {
+        let iwm = Arc::new(Iwm::new(props)?);
+        keep_iwm.push(&iwm);
+        Ok(iwm)
+    });
+    let sccs: Arc<Captured<Scc>> = Arc::new(Captured::new());
+    let keep_scc = Arc::clone(&sccs);
+    options.bindings.replace("mac.scc", move |props| {
+        let scc = Arc::new(Scc::new(props)?);
+        keep_scc.push(&scc);
+        Ok(scc)
+    });
     capture::install(&mut options).expect("a capture table");
     for &(name, value) in params {
         options
@@ -187,6 +217,8 @@ fn board_with_disk(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Bo
         machine,
         cpu,
         scanout,
+        iwm: iwms.last().expect("the binding captured the controller"),
+        scc: sccs.last().expect("the binding captured the SCC"),
     }
 }
 
@@ -393,33 +425,133 @@ fn synthetic_800k() -> Vec<u8> {
     image
 }
 
-/// The board assembles with a disk in the drive and runs exactly as it does
-/// without one — which is the current state of affairs and worth an assertion
-/// rather than a paragraph: the ROM does not look at the drive.
+/// **The ROM spins the drive up and tries to read it**, and when what is in
+/// there is not a system disk it puts it back out and goes on asking.
 ///
-/// It gets as far as the insert-disk icon either way, and then stays there:
-/// the icon is what the ROM draws when it has *not* found a disk, so a board
-/// that noticed one would leave this screen rather than keep it.
+/// This is what the drive-register table being right buys, and it is the
+/// assertion that would fail if it went wrong again: the ROM tests the
+/// drive-installed line before it will touch the mechanism at all, and while
+/// that line said "no drive" it drew the insert-disk icon and never turned the
+/// motor, whatever was in the slot (`docs/platforms/mac-plus.md`).
 ///
-/// When it starts looking, this is the test that changes: the frame will move
-/// and the assertion below will be what says so.
+/// The disk here is 800K of numbered blocks — no boot blocks, no System file —
+/// so being put back out is the right answer. What is asserted is the
+/// *mechanism*: the motor turned, and the disk came out again.
 #[test]
-fn a_disk_in_the_drive_changes_nothing_yet() {
+fn the_rom_spins_the_drive_up_and_rejects_a_disk_with_no_system_on_it() {
     let Some(image) = rom_image("Mac-Plus.ROM") else {
         return;
     };
     let mut b = board_with_disk(image, &[], synthetic_800k());
-    advance(&mut b, "mac-plus-disk", 12);
-    let hash = picture(&b, "mac-plus-disk", 12);
+    assert!(b.iwm.has_disk(0), "the image went into the drive");
+
+    // Up to the point where the ROM has finished with the drive: the motor
+    // starts at about eight virtual seconds and the eject is at about
+    // fourteen.
+    let mut ran = false;
+    for _ in 1..=13 {
+        advance(&mut b, "mac-plus-disk", 1);
+        ran |= b.iwm.motor(0);
+    }
+    assert!(ran, "the ROM never started the drive's motor");
+    advance(&mut b, "mac-plus-disk", 3);
+    let _ = picture(&b, "mac-plus-disk", 16);
 
     assert!(!b.cpu.is_halted(), "the processor double-faulted");
     assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
-    assert_eq!(
-        hash, GOLDEN_1M,
-        "the picture moved with a disk in the drive. If the ROM has started \
-         looking at it, that is the insert-disk work landing and this golden \
-         should move; look at it (RSEMU_MAC_FRAME_DIR) first."
+    assert!(
+        !b.iwm.has_disk(0),
+        "the ROM found no system on the disk and left it in the drive"
     );
+    assert!(!b.iwm.motor(0), "and stopped the motor after it");
+}
+
+/// And then it **polls the drive**, which it did not do before.
+///
+/// While the insert-disk icon is up the ROM asks the drive's disk-in-place
+/// line six to eight times a second. That is what ledger item 1 was about: the
+/// machine used to draw "insert a disk" and then never look.
+///
+/// Asserted through the picture rather than through a count of register
+/// accesses, because a count of accesses is only a count of accesses: the icon
+/// **blinks**, and an icon that blinks is a live insert-disk loop rather than a
+/// processor parked in a two-byte one.
+#[test]
+fn the_insert_disk_icon_blinks() {
+    let Some(image) = rom_image("Mac-Plus.ROM") else {
+        return;
+    };
+    let mut b = board(image, &[]);
+    advance(&mut b, "mac-plus-blink", 14);
+    let mut seen = Vec::new();
+    for s in 15..=20 {
+        advance(&mut b, "mac-plus-blink", 1);
+        seen.push(icon_white(&b));
+        let _ = picture(&b, "mac-plus-blink", s);
+    }
+    println!("mac-plus: icon white counts second by second: {seen:?}");
+    assert!(
+        seen.iter().any(|&n| n != seen[0]),
+        "the insert-disk icon does not blink: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|&n| n > 700),
+        "and it is an icon throughout, not a bare desktop: {seen:?}"
+    );
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+}
+
+/// **A carrier-detect transition does not lock the machine up.**
+///
+/// A Macintosh Plus's mouse drives the SCC's two carrier detects, and the ROM
+/// leaves them armed — `WR1 = $01`, `WR9 = $0A`, `WR15 = $08`. Moving one used
+/// to put the processor into the level-2/3 handler and keep it there for ever:
+/// `Reset Ext/Status Interrupts` cleared the chip's state but never
+/// re-announced `/INT`, so the handler did everything the Z8530 manual asks of
+/// it and was entered again immediately. `src/dev/mac/scc.rs` has the
+/// argument.
+///
+/// This is the machine-level half of it: drive both carrier detects and check
+/// that the ROM is back in its idle loop with the tick chain still counting.
+#[test]
+fn a_carrier_detect_transition_does_not_lock_the_machine_up() {
+    let Some(image) = rom_image("Mac-Plus.ROM") else {
+        return;
+    };
+    let mut b = board(image, &[]);
+    advance(&mut b, "mac-plus-mouse", 16);
+    let before = peek(&b, 0x16a);
+    // `MTemp` is where the ROM accumulates the mouse's position. It moving is
+    // what says the quadrature reached the handler and was decoded, rather
+    // than merely survived.
+    let rest = peek(&b, 0x828);
+
+    // Both of them, one after the other — the two axes of a mouse. Each axis
+    // goes down and comes back, and with the other phase of its quadrature
+    // (the VIA's `PB4`/`PB5`) standing still the ROM counts a step each way,
+    // so `MTemp` moves and then moves back. What is asserted is that it moved
+    // at all *and* that the machine kept running through it.
+    let mut moved = false;
+    for channel in [0usize, 1] {
+        for level in [false, true] {
+            b.scc.set_dcd(channel, level);
+            advance(&mut b, "mac-plus-mouse", 1);
+            let mtemp = peek(&b, 0x828);
+            println!("mac-plus: channel {channel} to {level}: MTemp = {mtemp:#010x}");
+            moved |= mtemp != rest;
+        }
+    }
+
+    let ticks = peek(&b, 0x16a);
+    assert!(
+        ticks > before + 200,
+        "the 60 Hz tick chain stopped: {before} to {ticks}. The processor is \
+         stuck in the SCC's interrupt handler."
+    );
+    assert!(!b.cpu.is_halted(), "the processor double-faulted");
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    assert!(moved, "MTemp never moved: the transitions reached nothing");
+    let _ = picture(&b, "mac-plus-mouse", 20);
 }
 
 /// A 1.44 MB image is refused when the board is assembled, by name, with a
