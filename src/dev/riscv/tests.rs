@@ -1701,3 +1701,32 @@ fn prop_bytes<'a>(dtb: &'a [u8], name: &str, prop: &str) -> Option<&'a [u8]> {
     }
     None
 }
+
+/// A whole machine must not outlive the handle to it.
+///
+/// `riscv.boot` held the address space it describes strongly while that same
+/// space mapped the ROM's window, which is a reference cycle: the space owns
+/// the mapping, the mapping owns the ROM as its `MemOps`, and the ROM owned
+/// the space. Nothing in this tree breaks such a cycle — there is no unbind —
+/// so a torn-down machine kept its whole address space, every mapping in it
+/// and every byte of guest RAM. The same defect in `virtio.mmio` was 6.5 MB an
+/// iteration under LeakSanitizer.
+///
+/// A cycle is not observable from a `Drop` that never runs. It is exactly
+/// observable as a `Weak` that still upgrades once the last strong handle is
+/// gone, which is what this asserts — for the whole board, so any *other*
+/// device on it that grows the same defect fails here too.
+#[test]
+fn dropping_the_machine_drops_its_address_space() {
+    let mut b = board("drop", &[]);
+    // Run first: a machine that has executed has its derived caches populated
+    // (the TLB, the block cache, the boot ROM's generated tree), and those are
+    // where a stray handle to the space is likeliest to be parked.
+    b.run(4);
+    let watch = Arc::downgrade(b.machine.space("mem").expect("the board has one"));
+    drop(b);
+    assert!(
+        watch.upgrade().is_none(),
+        "the address space outlived the machine: something on this board holds it strongly"
+    );
+}
