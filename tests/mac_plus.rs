@@ -22,18 +22,21 @@
 //! frames), sizes memory, runs its memory test, initialises the SCC and the
 //! IWM, reads the clock chip and writes its parameter RAM back, finishes the
 //! keyboard's Model Number handshake and settles into asking it for a key
-//! every quarter second, and runs its interrupt-driven idle loop with the
-//! 60.15 Hz tick chain going. **The picture at that point is the
-//! Macintosh's 50 % grey desktop — a one-pixel checkerboard, 87,585 black
-//! pixels of 175,104 — with the arrow cursor drawn over it about fifteen
-//! pixels in from the left and fourteen down, and a small solid wedge in the
-//! corner above it.** It does not change again.
+//! every quarter second, and draws the Macintosh's 50 % grey desktop with the
+//! arrow cursor in the top left corner. **It then draws the insert-disk icon —
+//! the floppy with a question mark — in the middle of the screen** and waits
+//! there with the 60.15 Hz tick chain going.
 //!
-//! It is *not* the insert-disk screen: the floppy-with-a-question-mark, and
-//! the happy Macintosh before it, are not drawn. The ROM is parked in a
-//! two-byte loop at `$4006E8` with its interrupt mask at zero, and with a disk
-//! in the drive it never once moves the IWM's soft switches — so it is not
-//! looking for a disk and the disk path is not what it is waiting for.
+//! The icon reaches the screen only because main memory **repeats** through its
+//! four-megabyte window. The ROM draws it through a pointer near the top of
+//! that window rather than through `ScrnBase`, and the fold is what puts that
+//! on the middle of a 1 MiB machine's screen buffer. `src/dev/mac/glue.rs` has
+//! the argument; before the fold the icon went into the floating half of the
+//! window and the screen stayed empty.
+//!
+//! What the board still does not do is notice a disk once one is there: the ROM
+//! sits in a two-byte loop at `$4006E8` with its interrupt mask at zero and
+//! never moves the drive's soft switches, so `--floppy` changes nothing yet.
 //! `docs/platforms/mac-plus.md` has the whole ledger, including what has been
 //! ruled out and how.
 //!
@@ -74,7 +77,12 @@ use rsemu::machine::{Machine, catalog};
 const ROM_LEN: usize = 128 * 1024;
 
 /// The picture at 12 virtual seconds on the stock 1 MiB board.
-const GOLDEN_1M: u64 = 0x1a32_ac88_338a_80c6;
+const GOLDEN_1M: u64 = 0xfbc9_cfa0_9b09_a5da;
+
+/// Where the insert-disk icon lands: a 32 × 32 box a little above the middle
+/// of the 512 × 342 screen, found by watching which addresses the ROM draws it
+/// through. Left, top, width, height.
+const ICON: (u32, u32, u32, u32) = (240, 145, 32, 32);
 
 /// One running board and the handles a test needs.
 struct Board {
@@ -246,6 +254,31 @@ fn picture(b: &Board, label: &str, seconds: u64) -> u64 {
     hash
 }
 
+/// How many of the pixels in [`ICON`] are white.
+///
+/// The desktop behind it is a one-pixel checkerboard, so an empty box is
+/// exactly half white; the icon is a solid white floppy with a black outline,
+/// so a drawn one is most of the way to all of it. That is a description of
+/// the picture rather than a second hash, and it is what tells a person
+/// *which* picture moved when the golden does.
+fn icon_white(b: &Board) -> usize {
+    let info = b.scanout.info();
+    let mut surface = Surface::new(PixelFormat::RGB888, info.width, info.height);
+    b.scanout.capture(&mut surface);
+    let pixels = surface.pixels();
+    let (left, top, w, h) = ICON;
+    let mut white = 0;
+    for y in top..top + h {
+        for x in left..left + w {
+            let at = ((y * info.width + x) * 3) as usize;
+            if pixels.get(at).is_some_and(|&p| p != 0) {
+                white += 1;
+            }
+        }
+    }
+    white
+}
+
 /// One longword of guest memory, read the way a debugger reads it.
 fn peek(b: &Board, addr: u64) -> u32 {
     b.machine
@@ -255,15 +288,16 @@ fn peek(b: &Board, addr: u64) -> u32 {
         .unwrap_or(0) as u32
 }
 
-/// The ROM on the stock 1 MiB board: it runs, sizes memory, and draws the
-/// Macintosh's grey desktop with the arrow cursor in the top left corner.
+/// The ROM on the stock 1 MiB board: it runs, sizes memory, draws the
+/// Macintosh's grey desktop with the arrow cursor in the top left corner, and
+/// puts the insert-disk icon in the middle of it.
 ///
 /// The picture is described in the module docs and in
 /// `docs/platforms/mac-plus.md`. Twelve virtual seconds is well past the point
 /// where it stops changing — the memory test finishes at about six and the
-/// picture is settled by seven.
+/// picture is settled by eight.
 #[test]
-fn the_rom_boots_to_the_macintosh_desktop() {
+fn the_rom_boots_to_the_insert_disk_screen() {
     let Some(image) = rom_image("Mac-Plus.ROM") else {
         return;
     };
@@ -296,6 +330,19 @@ fn the_rom_boots_to_the_macintosh_desktop() {
         "Ticks is counting vertical blanking: {ticks}"
     );
 
+    // The insert-disk icon really is on the screen, and not merely a hash that
+    // happens to match: the box the ROM draws it in is mostly white, where the
+    // grey desktop alone would be exactly half.
+    let white = icon_white(&b);
+    println!("mac-plus: {white} of {} icon pixels are white", 32 * 32);
+    assert!(
+        white > 700,
+        "the insert-disk icon is not on the screen: {white} of {} pixels white, and an empty \
+         desktop is {}",
+        32 * 32,
+        32 * 32 / 2
+    );
+
     assert_eq!(
         hash, GOLDEN_1M,
         "the frame at 12s moved; look at it (RSEMU_MAC_FRAME_DIR) before accepting the new hash"
@@ -305,22 +352,33 @@ fn the_rom_boots_to_the_macintosh_desktop() {
 /// The same ROM on a 4 MiB board: it sizes the expansion and moves its screen
 /// buffer with it, which is the whole of what `-p ram=4M` has to do.
 ///
-/// No golden: the picture is the same desktop and the point of the test is the
-/// two numbers the ROM worked out for itself. Thirty seconds, because a memory
-/// test of four megabytes takes four times as long as one of one.
+/// No golden: the picture is the same screen and the point of the test is the
+/// two numbers the ROM worked out for itself. Thirty-five seconds, because a
+/// memory test of four megabytes takes four times as long as one of one — the
+/// icon is not up until about twenty-six.
 #[test]
 fn the_rom_sizes_a_four_megabyte_board_and_moves_its_screen() {
     let Some(image) = rom_image("Mac-Plus.ROM") else {
         return;
     };
     let mut b = board(image, &[("ram", "4M")]);
-    advance(&mut b, "mac-plus-4m", 30);
-    let _ = picture(&b, "mac-plus-4m", 30);
+    advance(&mut b, "mac-plus-4m", 35);
+    let _ = picture(&b, "mac-plus-4m", 35);
 
     assert!(!b.cpu.is_halted(), "the processor double-faulted");
     assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
     assert_eq!(peek(&b, 0x108), 0x0040_0000, "MemTop: a 4 MiB machine");
     assert_eq!(peek(&b, 0x824), 0x003f_a700, "ScrnBase: MemTop - $5900");
+    // The icon lands in the same place on the screen whatever the memory size,
+    // which is the whole point of the window folding: the ROM's pointer is a
+    // constant near the top of the window and the top of the window is the top
+    // of memory on every board.
+    let white = icon_white(&b);
+    assert!(
+        white > 700,
+        "the insert-disk icon is not on a 4 MiB board's screen either: {white} of {} white",
+        32 * 32
+    );
 }
 
 /// A synthetic 800K disk: every block says which block it is, so nothing of
@@ -338,6 +396,10 @@ fn synthetic_800k() -> Vec<u8> {
 /// The board assembles with a disk in the drive and runs exactly as it does
 /// without one — which is the current state of affairs and worth an assertion
 /// rather than a paragraph: the ROM does not look at the drive.
+///
+/// It gets as far as the insert-disk icon either way, and then stays there:
+/// the icon is what the ROM draws when it has *not* found a disk, so a board
+/// that noticed one would leave this screen rather than keep it.
 ///
 /// When it starts looking, this is the test that changes: the frame will move
 /// and the assertion below will be what says so.

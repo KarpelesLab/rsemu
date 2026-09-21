@@ -57,7 +57,7 @@ contents.
 ## The memory map
 
 ```text
-  $00 0000 - $3F FFFF   memory, or the ROM while the overlay is up
+  $00 0000 - $3F FFFF   memory, repeating; or the ROM while the overlay is up
   $40 0000 - $4F FFFF   ROM, repeating every 128 KiB
   $50 0000 - $57 FFFF   nothing
   $58 0000 - $5F FFFF   SCSI (an NCR 5380) — not modelled; floats
@@ -101,19 +101,37 @@ arrives *through* the address space, so calling `AddressSpace::topology` from
 inside it would deadlock against the read guard the access already holds, and
 deferring it would apply a whole quantum late.
 
-### Main memory does not repeat — and that is load-bearing
+### Main memory repeats — and *that* is load-bearing
 
-**The one thing in this map that had to be found rather than read.** The ROM
-sizes memory by writing at the top of each candidate size and reading it back;
-a decoder that folded the address so that a 1 MiB machine answered at
-`$100000` made *every* machine look like a 4 MiB one. The ROM then put its
-screen buffer at `$3FA700`, where there is no memory, and looped in its memory
-test for ever — a write pass of 1.7 virtual seconds followed by a read pass of
-1.1, over and over, with nothing else happening on the board.
+**The one thing in this map that had to be found rather than read**, and it was
+got backwards once. Main memory answers again every `ram` bytes all the way to
+`$3F FFFF`, because the DRAM is given only the address lines its own depth
+needs and a board with less than four megabytes on it leaves `A20`/`A21` out of
+the decode.
 
-With memory answering only where it is and the rest of its window floating, the
-same ROM writes `MemTop = $00100000` and `ScrnBase = $000FA700` on the stock
-board, and `$00400000` / `$003FA700` with `-p ram=4M`. Both are asserted in
+The evidence is the boot screen. The ROM draws the insert-disk icon through a
+pointer of **`$3F CB5E`** — a constant near the top of the four-megabyte
+window, not a number derived from `ScrnBase`. A register trace catches `A2`
+becoming `$3FCB5E` at `$4007DE`, with `A4` holding `$400FA2` — a pointer into
+the ROM — and with no register and no word of low memory holding anything it
+could have been computed from, so the number comes out of the ROM itself and
+not out of the machine. Folded, that
+address is `MemTop - $5900 + $245E` on **every** power-of-two size — `$0F CB5E`
+on a 1 MiB board, `$1F CB5E` on 2 MiB, `$3F CB5E` on 4 MiB — which is the
+middle of the screen, every time. Unfolded it is in nothing at all on anything
+but a 4 MiB machine, and the ROM draws its icon into the void.
+
+That was this board's hang. The picture was the bare grey desktop and the
+processor sat in a two-byte loop at `$4006E8`; it had in fact drawn the whole
+insert-disk screen, into memory that was not there.
+
+The worry that put the opposite claim here to begin with — that a folded window
+makes every machine look like a 4 MiB one, because the ROM sizes memory by
+writing at the top of each candidate size and reading it back — does not
+survive contact with the ROM. It still writes `MemTop = $00100000` and
+`ScrnBase = $000FA700` on the stock board, and `$00400000` / `$003FA700` with
+`-p ram=4M`: its sizing pass writes markers at two addresses and compares them,
+which is exactly the test an alias fails. Both numbers are asserted in
 `tests/mac_plus.rs`, because they are the decoder's behaviour reported back by
 the guest.
 
@@ -139,7 +157,7 @@ read/write pin for it and decodes the direction from the address instead.
 
 | Class | What it models | What it does not |
 | --- | --- | --- |
-| `mac.glue` | the overlay at zero, the `$600000` window, and memory that answers only where it is | nothing else; it has no registers |
+| `mac.glue` | the overlay at zero, the `$600000` window, and memory repeating through the whole four-megabyte window | nothing else; it has no registers |
 | `mac.via` | a whole 6522: both ports pin by pin, both timers with the one-shot, free-run and PB7 modes, all eight shift-register modes, `ACR`/`PCR`, and the interrupt flag/enable pair with its read-to-clear and its SET/CLEAR write | PCR's pulse and handshake output modes on `CA2`/`CB2`, which nothing on a Macintosh uses |
 | `mac.video` | 512 × 342 one-bit pixels read out of main memory at capture time, the screen buffer hanging below the top of memory with `PAGE2` picking which of the two, and the vertical and horizontal blanking outputs | the cycles it steals from the processor: this board's 68000 runs at its full rate |
 | `mac.keyboard` | the Guide's clock/data protocol, its bit timing, the four commands of Table 7-4 and a type-ahead buffer | a host keymap — `Keyboard::key` takes the Guide's own transition code — and the separate keypad's `$79` prefix |
@@ -165,61 +183,99 @@ nothing in the drive:
 | 0.7 – 6 s | the memory test: alternating write and read passes over the whole megabyte, several patterns deep |
 | ~6 s | the ROM finds 1 MiB, writes `MemTop`, `BufPtr` and `ScrnBase`, initialises the SCC (32 register writes), exercises the IWM (all sixteen switches, including a mode-register load), reads all twenty bytes of parameter RAM and the clock twice over, finds the battery flat, and **writes its own defaults back** — unlocking the write-protect register with `$55` and locking it again with `$D5` around them |
 | 6.9 s | the first keyboard transaction: `ACR = $18`, `SR = $00` to pull the data line low, then `ACR = $1C`, `SR = $16` — Model Number. The keyboard answers `$03` |
-| 7 s onward | **steady state**: the 60.15 Hz tick chain runs, `Ticks` at `$16A` counts up, `IFR` is cleared 60 times a second, and the keyboard is asked `$10` — Inquiry — every 0.25 second and answers `$7B`, Null. Which is exactly the cadence chapter 7 describes |
+| 7.3 s onward | the desktop is painted grey, `_HideCursor` runs, the **insert-disk icon** is drawn in the middle of the screen, `_ShowCursor` puts the arrow back, and the processor parks in a two-byte loop at `$4006E8`. From then on it is **steady state**: the 60.15 Hz tick chain runs, `Ticks` at `$16A` counts up, `IFR` is cleared 60 times a second, and the keyboard is asked `$10` — Inquiry — every 0.25 second and answers `$7B`, Null. Which is exactly the cadence chapter 7 describes |
 
 `Time` at `$20C` holds the date the clock chip was given plus however long the
 machine has been on, which is the check that the counter's byte order is right:
 with `time = "2026-01-01T00:00:00"` it reads `$E57B698D` twelve seconds in.
 
 **What the picture shows at that point**: the Macintosh's **50 % grey
-desktop** — a one-pixel checkerboard, exactly 87,585 black pixels of 175,104 —
-with the **arrow cursor** drawn over it about fifteen pixels in from the left
-and fourteen down, and a small solid wedge in the corner above it. Nothing
-else is on it, and it does not change again in thirty virtual seconds.
+desktop** — a one-pixel checkerboard, 87,337 black pixels of 175,104 — with the
+**arrow cursor** drawn over it about fifteen pixels in from the left and
+fourteen down, and the **insert-disk icon** in the middle: a white floppy disk
+with a black outline, a shutter across its top with a small oval in it, and a
+large `?` in a box on its face, in a 32 × 32 area whose top left corner is
+pixel (240, 145) and whose outline runs from row 145 to row 176. Seven hundred
+and sixty of those 1,024 pixels are white, where the bare desktop would be
+exactly half. Nothing else is on it, and it does not change again in thirty
+virtual seconds. The 4 MiB board reaches the identical picture — same frame
+hash — about twenty-six seconds in, because its memory test is four times as
+long.
 
 No access faults, the processor never double-faults, and the video circuit
 produces 60 frames a virtual second throughout.
 
-### What it is not, and what is now known about why
+### `$4006E8`, and what it turned out to be
 
-It is **not the insert-disk screen**. The floppy-with-a-question-mark, and the
-happy Macintosh before it, are not drawn.
+For a long time the picture was the bare grey desktop and this section said the
+ROM was *waiting* for something. It was not. It had **already drawn the
+insert-disk screen**, into memory that was not there.
 
-The processor lives at **`$4006E8`**, in a two-byte loop, for 99.4 % of sampled
-instants over two virtual seconds. `SR = $2004`: supervisor, and the interrupt
-mask is **zero**, so it is waiting rather than blocked. Everything else that
-happens, happens in the blanking interrupt, at `$401A`-`$401B` and `$4025`.
+The processor lives at `$4006E8`, in a two-byte loop, for 99.2 % of sampled
+instants. `SR = $2004`: supervisor, interrupt mask zero. Stepping the machine
+200 ns at a time for a virtual second finds **exactly one** vector ever taken —
+25, the level-1 autovector, at `$401A42`, about seventy times a second (sixty
+vertical blankings plus the keyboard's shift register and the clock chip's
+one-second interrupt). Vector 26, the SCC's, is never taken; nor is any other.
+The loop itself makes no bus access at all, so nothing can release it but a
+handler rewriting its return address, and no handler does: over three virtual
+seconds the only bytes that change anywhere in the megabyte are `Ticks`, the low
+byte of `Time`, and one keyboard variable.
 
-Four things were ruled out by measurement rather than by argument, and each one
-cost a device to rule out:
+What it is, is the end of the boot sequence. A ring buffer of the last few
+thousand program counters before it settles gives the run-up: a delay loop
+polling `Ticks` at `$4007D4`, `_HideCursor` (trap `$A852`, found by looking the
+handler address up in the dispatch table the ROM built in RAM at `$C00`), the
+icon drawn a row at a time, `_ShowCursor` (`$A853`), two returns, and the loop.
+The icon's pointer is `$3FCB5E` — see "Main memory repeats", above — and with
+the window folded that is the middle of the screen.
 
-* **The keyboard is not it.** It now completes the Guide's whole handshake —
-  Model Number answered, then Inquiry every quarter second — and the picture
-  did not move by one pixel.
+Things ruled out by measurement rather than by argument, each of which cost a
+device or a probe:
+
+* **The keyboard is not it.** It completes the Guide's whole handshake — Model
+  Number answered, then Inquiry every quarter second.
 * **The clock chip is not it.** Parameter RAM is read, found invalid, written
-  with the ROM's own defaults and read back; the date reaches `Time`. The
-  picture did not move.
-* **The ROM is not looking for a disk.** With a blank 800K disk in the drive,
-  sampling the IWM's soft switches every millisecond for two virtual seconds
-  finds them **moving zero times**: the motor is never started, the head never
-  leaves cylinder 0, and the chip stays at `switches = $25`, `mode = $1F` where
-  the startup sequence left it. So the ROM is nowhere near its boot loop, and
-  the disk path — now built and tested — is not what it is waiting for.
-* **SCSI is not it either.** Counting stubs over every window this board does
-  not claim show **three writes and no reads** at `$580000` in twelve seconds,
-  and nineteen reads at `$F80000` in the phase space. A ROM waiting on a 5380
-  would be reading it.
+  with the ROM's own defaults and read back — `03 88 00 4c a8 00 00 00 cc 0a cc
+  0a 00 00 00 00 00 02 63 00` — and the date reaches `Time`.
+* **SCSI is not it.** The space's own unassigned-access counter records
+  **zero** accesses to `$500000`, `$580000` or `$F00000` in eight virtual
+  seconds. Not three writes: none — the "three writes" this file used to record
+  is not reproducible. A ROM waiting on a 5380 would be reading one.
+* **The sound is not it.** After the chime the VIA's `ACR` is `$0C` — timer 1 in
+  one-shot mode, not free-running — both timers read zero, and `IER = $87`
+  enables `CA2`, `CA1` and the shift register and nothing else. There is no
+  timer interrupt to wait for and `/SNDENB` is off.
+* **The mouse is not it either**, though it is closer than it looks: the ROM
+  *has* armed the path — channel A and B both have `WR1 = $01` (external/status
+  interrupts on), `WR9 = $0A` (master interrupt enable on) and `WR15 = $08`
+  (carrier detect among the external statuses) — but it reads the chip exactly
+  twice in eight seconds and never again, and moving a carrier detect does not
+  get the processor out of the loop. It does something worse; see below.
 
-So the ROM is waiting on something that is not the keyboard, not the clock, not
-the drive and not SCSI, and it is waiting with interrupts open in a loop that
-makes no bus access at all — which is why it took a counting stub to find the
-last one of these, and will take another to find this one.
+### The defects this turned up, and the one still open
+
+* **The window fold.** Above. Fixed, and it is what put the icon on screen.
+* **A carrier-detect transition locks the machine up.** With the SCC configured
+  as the ROM leaves it, driving either `DCD` input makes the chip assert, the
+  processor takes vector 26 or 27, and it never comes back: sampling 200 000
+  instants afterwards finds **every one** of them at `$401A84` or `$401AB4`, the
+  level-2 and level-3 handler entries, and none in the idle loop. The handler
+  reads `RR0` on channel B about 740 times in the 200 ms after a single
+  transition — no other register, and a transparent tap over both SCC windows
+  catches no write in the first two dozen accesses, so it is not obvious that
+  anything issues *Reset Ext/Status Interrupts*. `MTemp` at `$828` does move, from
+  `(15,15)` to `(16,14)`, so the quadrature is being decoded; the machine simply
+  never leaves interrupt level again. Whether the fault is in `mac.scc`'s latch
+  or in what the board does with `/INT` is not yet settled, and it is the thing
+  to settle before `mac.mouse` is written.
 
 A counting stub has to be **transparent** or it changes what it measures. The
 first one here filled a read with `$FF` instead of `attrs.bus`, which is what
 the space's `open-bus` policy delivers, and the ROM went off the rails into
 floating memory within a second. The value on a floating bus is load-bearing on
-this board.
+this board. The probes that found the fold wrap the decoder's own `MemOps` and
+forward every access unchanged, which is the only kind worth writing.
 
 ## Booting a disk
 
@@ -236,9 +292,10 @@ with this encoder about the low-level bit assignments: which two bits of each
 byte go where in a 6-and-2 group, and which of the three sums scrambles which
 byte. The encoder and the decoder here are each other's oracle, so they would
 agree with each other even if both were wrong in the same way. The only thing
-that settles it is a ROM reading a track this encoder wrote — and the ROM does
-not look at the drive yet, so even with an image in hand that test cannot run.
-Both halves of that are honest and both are recorded here.
+that settles it is a ROM reading a track this encoder wrote — and the ROM stops
+at the insert-disk icon without ever asking whether a disk is there, so even
+with an image in hand that test cannot run. Both halves of that are honest and
+both are recorded here.
 
 ```sh
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
@@ -265,25 +322,34 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **Find what `$4006E8` is waiting for.** Everything else on this list is
-   guesswork until that is known. The tools are the two that found the last
-   hang: a counting stub over a window, and a program-counter histogram. What
-   is left unmodelled and reachable is the **sound circuit** — 370 bytes a
-   frame out of a buffer below the screen, gated by the VIA's `PB7`, with the
-   disk-speed byte sharing it — the **mouse**, and **SCSI**. A loop that makes
-   no bus access is waiting on a *variable*, so the other half of the tool is
-   watching low memory change: the ROM's own data structures are fair game and
-   `MemTop`, `ScrnBase` and `Time` have all been read out that way already.
-2. **The NCR 5380**, so the ROM's SCSI probe finds a bus rather than a floating
-   one. `src/dev/scsi` already has the bus, the `Target` trait and a disk, and
-   the ROM's three writes say it is at least trying.
-3. **Writing to a disk.** The read path is here; the write path is the same
+1. **Why the insert-disk screen never ends.** The icon is up, and the ROM then
+   sits at `$4006E8` for ever: it does not blink the icon, it does not poll the
+   drive for a disk, and putting one in changes nothing. While it waits, the
+   only thing it says to the controller is one read of the `ENABLE off` switch
+   twice a second — and the chip is left at `switches = $25`, `Q7:Q6 = 00`, so
+   that read returns the data register rather than any status line and the ROM
+   is not asking whether a disk is there. A transparent tap over the
+   controller's whole window records the identical eight accesses in four
+   virtual seconds with a disk in the drive and without one. Something is
+   supposed to take
+   it out of that loop and nothing does. The `$17D6` element on `VBLQueue` is
+   walked every blanking interval and its count at `$17E0` is read and written
+   back unchanged, which is a task that is never armed: what arms it is the
+   next thing to find.
+2. **The carrier-detect lock-up** (above). A `DCD` transition puts the machine
+   into the level-2/3 handlers permanently. Settle that before writing
+   `mac.mouse`, because the mouse is the thing that will drive those pins.
+3. **The NCR 5380.** Lower down the list than it was: the ROM makes **zero**
+   accesses to `$580000` in eight virtual seconds, so nothing is waiting on it.
+   `src/dev/scsi` has the bus, the `Target` trait and a disk when the ROM gets
+   far enough to look.
+4. **Writing to a disk.** The read path is here; the write path is the same
    machinery backwards, plus the IWM's write handshake meaning something and a
    way to get the bytes back into the image.
-4. **A host keymap.** `mac.keyboard` takes the Guide's own transition codes and
+5. **A host keymap.** `mac.keyboard` takes the Guide's own transition codes and
    nothing turns a keysym into one. Figure 7-6 has the table; the OCR of it in
    circulation is not reliable enough to transcribe and it wants a clean scan.
-5. **The mouse and the sound**, which are the last two things on the board with
+6. **The mouse and the sound**, which are the last two things on the board with
    nothing behind them.
 
 ## How the ambiguities were settled
@@ -308,9 +374,18 @@ stated plainly.
   and then `ACR = $0C`, which are shift-out and shift-in under the external CB1
   clock.
 
-* **Memory must not repeat** (above). Found by reading back `MemTop` — a
-  data structure the ROM builds in memory, which is data rather than code — and
-  seeing `$00400000` on a machine with a megabyte in it.
+* **Memory repeats through its window** (above). This one was settled **twice**,
+  and the first answer was wrong. It was first read off `MemTop` — a data
+  structure the ROM builds in memory, which is data rather than code — and an
+  early folding decoder that made a 1 MiB machine report `$00400000` was taken
+  as proof that the hardware cannot fold. What that really showed was that
+  *that* decoder folded wrongly. The second pass watched the address registers
+  instead of low memory, caught the ROM loading `$3FCB5E` into `A2` at
+  `$4007DE` and drawing its boot icon through it, and the fold fell out of the
+  arithmetic: that constant is the middle of the screen on every power-of-two
+  memory size **only** if the window wraps. The lesson worth keeping is that a
+  low-memory global says what the ROM *decided*, and a register trace says what
+  it is about to *do*; the second is the stronger evidence when they disagree.
 * **The hang after the chime was the IWM.** With `$C00000` unmapped the ROM
   polled it 119,109 times and then sat in a ten-instruction loop at `$400104`
   for ever, touching nothing. Per-region access counters (`Channel::MMIO`) were

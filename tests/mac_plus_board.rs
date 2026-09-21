@@ -202,12 +202,14 @@ fn an_address_nothing_claims_floats() {
     assert_eq!(cpu.bus_faults().0, 0);
 }
 
-/// `-p ram=4M` is a board with four megabytes, and memory still answers only
-/// where it is: the address above the last one must not alias the first, or
-/// the ROM's memory sizing reads every machine as a 4 MiB one.
+/// `-p ram=4M` is a board with four megabytes, and on anything smaller memory
+/// **repeats** through the four-megabyte window: the DRAM is given only the
+/// address lines its own depth needs, so the top of the window is the top of
+/// memory on every board. The ROM's boot icon depends on it —
+/// `docs/platforms/mac-plus.md`.
 #[test]
-fn memory_answers_only_where_it_is() {
-    for (param, len) in [("1M", 0x10_0000u64), ("4M", 0x40_0000)] {
+fn memory_repeats_through_the_four_megabyte_window() {
+    for (param, len) in [("1M", 0x10_0000u64), ("2M", 0x20_0000), ("4M", 0x40_0000)] {
         let (machine, _cpu) = build(&[("ram", param)]);
         // Drop the overlay so the low window is memory.
         write8(&machine, VIA + 3 * 0x200, 0x7f);
@@ -215,14 +217,24 @@ fn memory_answers_only_where_it_is() {
 
         write8(&machine, 0, 0x5a);
         assert_eq!(read8(&machine, 0), 0x5a);
-        assert_eq!(read8(&machine, len - 1), 0x00, "the last installed byte");
-        if len < 0x40_0000 {
-            assert_ne!(
-                read8(&machine, len),
+        write8(&machine, len - 1, 0xa5);
+        assert_eq!(read8(&machine, len - 1), 0xa5, "the last installed byte");
+        // Every copy of the first byte, and the last byte of the window, which
+        // is where the ROM draws its screen through.
+        let mut at = len;
+        while at < 0x40_0000 {
+            assert_eq!(
+                read8(&machine, at),
                 0x5a,
-                "{param}: the first address above memory must not alias it"
+                "{param}: the copy at {at:#08x} must alias the first byte"
             );
+            at += len;
         }
+        assert_eq!(
+            read8(&machine, 0x40_0000 - 1),
+            0xa5,
+            "{param}: the top of the window is the top of memory"
+        );
     }
 }
 

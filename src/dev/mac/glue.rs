@@ -16,10 +16,10 @@
 //! ```text
 //!   overlay asserted (the state at power-on)
 //!     $00_0000 - $3F_FFFF   the ROM, repeating every 128 KiB
-//!     $60_0000 - $7F_FFFF   main memory, and nothing above it
+//!     $60_0000 - $7F_FFFF   main memory, repeating every `ram` bytes
 //!
 //!   overlay cleared (what software does once it has sized memory)
-//!     $00_0000 - $3F_FFFF   main memory, and nothing above it
+//!     $00_0000 - $3F_FFFF   main memory, repeating every `ram` bytes
 //!     $60_0000 - $7F_FFFF   nothing at all
 //! ```
 //!
@@ -28,18 +28,33 @@
 //! overlaid ROM and points into `$40_xxxx`, where the same ROM answers after
 //! the overlay is gone.
 //!
-//! # The ROM repeats and memory does not, and that is the load-bearing part
+//! # Both the ROM *and* main memory repeat, and the memory's fold is
+//! load-bearing
 //!
 //! The ROM socket carries no address line above its own, so a 128 KiB part
-//! answers all through the megabyte its select decodes. **Main memory is the
-//! opposite**: it answers where it is and the rest of its window floats, and
-//! that is the mechanism the ROM sizes memory by — it writes at the top of
-//! each candidate size and reads it back, and a decoder that folded the
-//! address so a 1 MiB machine answered at `$100000` makes *every* machine look
-//! like a 4 MiB one. This is not a guess. With the fold in place a real Plus
-//! ROM wrote `MemTop = $00400000` on a board with a megabyte in it, put its
-//! screen buffer where there was no memory, and then looped in its memory test
-//! for ever.
+//! answers all through the megabyte its select decodes. **Main memory does the
+//! same thing** for the same reason: the DRAM is given only the address lines
+//! its own depth needs, so a board with less than four megabytes on it leaves
+//! `A20`/`A21` out of the decode and the memory answers again every `len`
+//! bytes right up to `$3F_FFFF`.
+//!
+//! That fold is what makes the boot screen work, and it is a *measurement*
+//! rather than a reading of the schematic. The Plus ROM draws the
+//! insert-disk icon through a pointer of `$3F_CB5E` — a constant near the top
+//! of the four-megabyte window, not a number derived from `ScrnBase`. Folded,
+//! that address lands on `MemTop - $5900 + $245E` on **every** power-of-two
+//! size: `$0F_CB5E` on a 1 MiB board, `$1F_CB5E` on a 2 MiB one, `$3F_CB5E` on
+//! a 4 MiB one — the middle of the screen, every time. Unfolded it lands in
+//! nothing on anything but a 4 MiB machine, the icon is written into the void,
+//! and the ROM parks in its `$4006E8` idle loop having drawn a screen nobody
+//! can see. That was this board's long-standing hang.
+//!
+//! The fold does *not* cost the ROM its memory sizing, which was the worry
+//! that put the opposite claim here to begin with: the ROM still writes
+//! `MemTop = $00100000` and `ScrnBase = $000FA700` on the stock board, because
+//! its sizing pass writes markers at two addresses and compares, which is
+//! exactly the test an alias fails. `tests/mac_plus.rs` asserts both numbers
+//! on 1 MiB and on 4 MiB.
 //!
 //! # Why a decoder and not two mappings swapped
 //!
@@ -303,15 +318,21 @@ impl Glue {
                         ),
                     });
                 }
+            } else if region.len() < LOW_WINDOW && LOW_WINDOW.is_multiple_of(region.len()) {
+                // **Main memory repeats through its whole window**, and that
+                // is load-bearing — see the module docs. The DRAM gets only
+                // the address lines its own depth needs, so a board with less
+                // than four megabytes in it leaves `A20`/`A21` undecoded and
+                // the memory answers again every `len` bytes.
+                let mirror = Region::mirror(
+                    format!("{CLASS_NAME}.ram-mirror"),
+                    Arc::clone(region),
+                    LOW_WINDOW,
+                )?;
+                space.topology().map(Arc::new(mirror), 0)?;
             } else {
-                // **Main memory does not repeat.** It answers where it is and
-                // the rest of the window floats, which is exactly how the ROM
-                // finds out how much is fitted: it writes at the top of each
-                // candidate size and reads it back, and a machine whose RAM
-                // wrapped would answer every probe and be taken for a 4 MiB
-                // one. That is not a guess — a decoder that folded the address
-                // made this ROM size a 1 MiB machine as 4 MiB and then loop in
-                // its memory test for ever.
+                // Four megabytes, or a size that does not divide the window:
+                // it answers where it is and the rest floats.
                 space.topology().map(Arc::clone(region), 0)?;
             }
             let source: Source_ = Arc::new(space);

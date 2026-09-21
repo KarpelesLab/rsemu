@@ -1,5 +1,5 @@
-//! The address decoder's own tests: which side answers, and the one rule the
-//! ROM's memory sizing depends on.
+//! The address decoder's own tests: which side answers, and how both the ROM
+//! and main memory repeat through the window their select decodes.
 
 use super::*;
 use crate::core::props::{Link, Value};
@@ -86,12 +86,15 @@ fn clearing_the_overlay_puts_memory_at_zero() {
     );
 }
 
-/// **Main memory does not repeat.** This is the rule the ROM's memory sizing
-/// depends on: a 1 MiB machine must *not* answer at `$100000`, or it is taken
-/// for a 4 MiB one — which is exactly what happened while this decoder folded
-/// the address, and the ROM then looped in its memory test for ever.
+/// **Main memory repeats through the whole window**, because a board with less
+/// than four megabytes on it leaves `A20`/`A21` out of the DRAM's decode.
+///
+/// The ROM's boot screen depends on it: the Plus ROM draws the insert-disk
+/// icon through a pointer near the top of the four-megabyte window, and only
+/// the fold puts that on the middle of a 1 MiB machine's screen buffer.
+/// `src/dev/mac/glue.rs` has the argument and `tests/mac_plus.rs` the picture.
 #[test]
-fn memory_answers_where_it_is_and_the_rest_of_the_window_floats() {
+fn memory_repeats_through_its_whole_window() {
     let (glue, ram) = wired();
     ram.write_at(0, &[0x11, 0x22, 0x33, 0x44]).unwrap();
     clear_overlay(&glue);
@@ -99,10 +102,21 @@ fn memory_answers_where_it_is_and_the_rest_of_the_window_floats() {
         read(&glue, LOW_REGION, RAM_LEN - 4).is_ok(),
         "the last word"
     );
-    assert_ne!(
-        read(&glue, LOW_REGION, RAM_LEN).unwrap(),
-        [0x11, 0x22, 0x33, 0x44],
-        "the first address above the installed memory must not alias it"
+    for copy in [RAM_LEN, 2 * RAM_LEN, 3 * RAM_LEN] {
+        assert_eq!(
+            read(&glue, LOW_REGION, copy).unwrap(),
+            [0x11, 0x22, 0x33, 0x44],
+            "the copy at {copy:#x}"
+        );
+    }
+    // And the fold is by the installed size, so the top of the window is the
+    // top of memory — which is the property the screen buffer's address needs.
+    ram.write_at(RAM_LEN - 4, &[0x55, 0x66, 0x77, 0x88])
+        .unwrap();
+    assert_eq!(
+        read(&glue, LOW_REGION, LOW_WINDOW - 4).unwrap(),
+        [0x55, 0x66, 0x77, 0x88],
+        "the last word of the window is the last word of memory"
     );
 }
 

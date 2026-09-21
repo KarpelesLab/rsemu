@@ -9,11 +9,13 @@
 # The ROM chimes, sizes memory, runs its memory test, initialises the SCC and
 # the IWM, reads the clock chip and writes its parameter RAM back, finishes the
 # keyboard's Model Number handshake and settles into asking it for a key every
-# quarter second - and draws the Macintosh's grey desktop with the arrow cursor
-# over it, with the 60.15 Hz tick chain running. It does **not** reach the
-# insert-disk screen; `docs/platforms/mac-plus.md` has the ledger of what is
-# missing and of what has been ruled out. The picture reaches a person through
-# `--vnc`, which serves the video circuit's scanout.
+# quarter second, draws the Macintosh's grey desktop with the arrow cursor over
+# it, and then puts the **insert-disk icon** - the floppy with a question mark -
+# in the middle of the screen, with the 60.15 Hz tick chain running. What it
+# does not do yet is notice a disk once one is in the drive;
+# `docs/platforms/mac-plus.md` has the ledger of what is missing and of what has
+# been ruled out. The picture reaches a person through `--vnc`, which serves the
+# video circuit's scanout.
 #
 # Written from *Guide to the Macintosh Family Hardware* (Apple Computer, 2nd
 # edition) - chapter 3 for the address map, the overlay and the clock chip,
@@ -40,7 +42,7 @@
 # The address map
 # ---------------------------------------------------------------------------
 #
-#   $00 0000 - $3F FFFF   memory - or the ROM while the overlay is up
+#   $00 0000 - $3F FFFF   memory, repeating - or the ROM while the overlay is up
 #   $40 0000 - $4F FFFF   ROM, repeating every 128 KiB
 #   $58 0000 - $5F FFFF   SCSI (an NCR 5380) - not modelled; floats
 #   $60 0000 - $7F FFFF   memory while the overlay is up; nothing afterwards
@@ -57,15 +59,16 @@
 # because the overlay puts the ROM under the vector table, and only keeps going
 # because the same ROM answers at its own address as well.
 #
-# **Main memory does not repeat, and the ROM does.** A 128 KiB ROM answers all
-# through the megabyte its select decodes, because the socket carries no
-# address line above its own. Memory is the opposite: it answers where it is
-# and the rest of its 4 MiB window floats. That is the mechanism the ROM sizes
-# memory by - it writes at the top of each candidate size and reads it back -
-# and it is not a guess: a decoder that folded the address made this ROM write
-# `MemTop = $00400000` on a board with a megabyte in it, put its screen buffer
-# where there was no memory, and loop in its memory test for ever.
-# `src/dev/mac/glue.rs` has the detail.
+# **Both the ROM and main memory repeat.** A 128 KiB ROM answers all through
+# the megabyte its select decodes, because the socket carries no address line
+# above its own; memory does the same because the DRAM is given only the
+# address lines its own depth needs, so a board with less than 4 MiB on it
+# leaves A20/A21 out of the decode. That fold is what makes the boot screen
+# work: the ROM draws the insert-disk icon through a pointer near the top of
+# the 4 MiB window rather than through `ScrnBase`, and folded that lands on the
+# middle of the screen buffer whatever the memory size. Unfolded it lands in
+# nothing on anything but a 4 MiB machine. `src/dev/mac/glue.rs` has the
+# argument, which is a measurement rather than a reading of the schematic.
 #
 # ---------------------------------------------------------------------------
 # What is deliberately not mapped, and what an access to it does
@@ -88,10 +91,10 @@ machine "mac-plus" {
   # -- how much memory -------------------------------------------------------
   #
   # A Plus shipped with 1 MiB in four SIMM sockets and took 2 MiB or 4 MiB.
-  # Whatever this is, it answers only where it is, the rest of the 4 MiB window
-  # floats, and the video circuit hangs the screen buffer below the *top of
-  # what is fitted* - so `-p ram=4M` moves the screen as a real expansion
-  # does, and the ROM finds the size for itself.
+  # Whatever this is, it repeats through the 4 MiB window, and the video
+  # circuit hangs the screen buffer below the *top of what is fitted* - so
+  # `-p ram=4M` moves the screen as a real expansion does, and the ROM finds
+  # the size for itself.
   param ram = 1M
 
   # How many mechanisms are on the disk cable: 1 is a Plus with its internal
