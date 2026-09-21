@@ -3071,6 +3071,19 @@ machine-amiga-a3000 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-a
 # boots off Gayle's port, with no floppy. Adds no dependencies.
 machine-amiga-a4000 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-amiga-rtc", "dev-amiga-ramsey", "dev-amiga-ide", "dev-mos8520", "dev-ata-disk"]
 
+# The `amiga-a4000t` board (machines/amiga-a4000t.machine): a Commodore Amiga
+# 4000T -- the A4000's board in a tower, with an NCR 53C710 SCSI I/O processor
+# on the motherboard at $00DD0040 beside the IDE port at $00DD2020. Two drive
+# slots, because the machine has two ports: `scsi0` for the SCSI cable's
+# address 0 and `hd0` for the IDE master, both taking an RDB whole disk and
+# both allowed to be empty. `amiga-os-310-a4000t.rom` boots Workbench 3.1 off
+# the SCSI disk, which no other board here can do -- that ROM finds the IDE
+# drive on an `amiga-a4000` and then stops, because it wants this chip and that
+# board has not got one. Where the chip is and which way round its byte lanes
+# are was settled by recording what the ROM touches; the machine file has the
+# trace and docs/platforms/amiga.md has the long form. Adds no dependencies.
+machine-amiga-a4000t = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-amiga-rtc", "dev-amiga-ramsey", "dev-amiga-ide", "dev-mos8520", "dev-ata-disk", "dev-ncr53c710", "dev-scsi"]
+
 # The `amiga-cd32` board (machines/amiga-cd32.machine): a Commodore Amiga
 # CD32 -- the A1200's AA chip set and 68EC020 with 2 MiB of chip RAM, a
 # two-part 3.1 ROM (the `kickstart` and `ext` slots), Akiko, a double-speed

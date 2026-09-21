@@ -58,6 +58,9 @@ RUN OPTIONS:
     --hd0 <file>        Bind the `hd0` media slot: a raw hard disk image for
                         the first IDE bay. Unbound is an empty bay.
     --hd1 <file>        Bind the `hd1` media slot: the second IDE bay
+    --scsi0 <file>      Bind the `scsi0` media slot: a raw hard disk image for
+                        address 0 of an A4000T's SCSI cable. Unbound is a cable
+                        with nothing on it.
     --cd0 <file>        Bind the `cd0` media slot: a disc for the CD32's
                         drive, as ISO 9660 user data or as raw 2352-byte
                         frames. Unbound is an empty tray.
@@ -594,9 +597,12 @@ fn run(args: &[String]) -> ExitCode {
     // a CD32 does when you switch it on with nothing in it. `cdrom` is the
     // PC's CD-ROM drive: no bytes is an open tray, and the guest is told
     // `MEDIUM NOT PRESENT` rather than finding no drive.
+    // `scsi0` is an A4000T's SCSI cable at address 0, and the `hd0` argument
+    // on a different port: no bytes is an address nobody answers at, which is
+    // that machine with its SCSI drive taken out — it still has its IDE one.
     for slot in [
-        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0",
-        "ext", "cd0", "cdrom",
+        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "scsi0", "floppy", "vgabios", "nvme0",
+        "df0", "ext", "cd0", "cdrom",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
@@ -2854,7 +2860,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
             "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--flash0"
-            | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--cd0" | "--cdrom" => {
+            | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--scsi0" | "--cd0" | "--cdrom" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));

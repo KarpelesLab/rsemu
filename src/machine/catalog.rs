@@ -763,6 +763,27 @@ pub static AMIGA_A4000: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/amiga-a4000.machine"),
 };
 
+/// A Commodore Amiga 4000T, when this build has the board classes, its IDE
+/// port and an NCR 53C710.
+///
+/// The A4000's board in a tower, with a SCSI I/O processor on the motherboard
+/// beside the IDE port: an `ncr.53c710` at `$00DD0040`, its register file
+/// mirrored three times because the board decodes six address lines, with a
+/// `scsi.disk` on the `scsi0` slot and an `ata.disk` on `hd0`. Both drives may
+/// be empty. This is the board `amiga-os-310-a4000t.rom` is for — on an
+/// `amiga-a4000` that ROM finds the IDE drive and then stops, looking for this
+/// chip. `machines/amiga-a4000t.machine` carries the wiring, and
+/// `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-a4000t")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a4000t")))]
+pub static AMIGA_A4000T: CatalogEntry = CatalogEntry {
+    name: "amiga-a4000t",
+    summary: "an Amiga 4000T: the A4000's 68040 and AA chip set with an NCR 53C710 SCSI I/O \
+              processor on the motherboard as well as the IDE port",
+    media: &["kickstart", "scsi0", "hd0", "df0"],
+    source: include_str!("../../machines/amiga-a4000t.machine"),
+};
+
 /// A Commodore Amiga 1200, when this build has the board classes and Gayle.
 ///
 /// The AA chip set — Alice (`revision = "aga"` on `amiga.agnus`) and Lisa (the
@@ -927,6 +948,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&AMIGA_A3000);
     #[cfg(feature = "machine-amiga-a4000")]
     out.push(&AMIGA_A4000);
+    #[cfg(feature = "machine-amiga-a4000t")]
+    out.push(&AMIGA_A4000T);
     #[cfg(feature = "machine-amiga-a500plus")]
     out.push(&AMIGA_A500PLUS);
     #[cfg(feature = "machine-amiga-cd32")]
@@ -2545,6 +2568,15 @@ mod tests {
                 0x00, 0x00, 0x00, 0x08, // PC  = $00000008
                 0x60, 0xfe, // BRA .
             ],
+            // And on the A4000T, which is that board with a SCSI I/O processor
+            // on it. `tests/amiga_a4000t_board.rs` drives that processor
+            // without a ROM; `tests/amiga_a4000t.rs` boots the user's.
+            #[cfg(feature = "machine-amiga-a4000t")]
+            ("amiga-a4000t", "kickstart") => &[
+                0x00, 0x20, 0x00, 0x00, // SSP = $00200000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             #[cfg(feature = "machine-amiga-a1200")]
             ("amiga-a1200", "kickstart") => &[
                 0x00, 0x20, 0x00, 0x00, // SSP = $00200000
@@ -2668,6 +2700,11 @@ mod tests {
             // empty IDE bay, which is the machine with its disk taken out.
             #[cfg(feature = "machine-amiga-a4000")]
             ("amiga-a4000", "hd0" | "df0") => &[],
+            // An A4000T with none of its three drives filled: no bytes on
+            // `scsi0` is an empty cable address, on `hd0` an empty IDE bay, and
+            // the board realizes with both ports fitted and nothing on them.
+            #[cfg(feature = "machine-amiga-a4000t")]
+            ("amiga-a4000t", "scsi0" | "hd0" | "df0") => &[],
             // A CD32 with no disc in the tray and no second ROM half: the
             // boot screen, which is what the machine does on its own. The
             // `ext` socket is a slot rather than a second image of the

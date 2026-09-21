@@ -519,7 +519,17 @@ and the A4000's own **IDE port**, which is not Gayle's and is at an address
 Commodore's published documentation does not print, so it was found by
 recording what the ROM touches on a board that answers nowhere else.
 **Kickstart 3.1 boots Workbench 3.1 on it off the hard disk**, with the guest
-reporting AA chips and a 68040.
+reporting AA chips and a 68040. `amiga-a4000t` is that board in a **tower**,
+with an **NCR 53C710 SCSI I/O Processor** on the motherboard beside the IDE
+port — a chip that is a *processor*, fetching its own SCRIPTS instructions out
+of guest memory and mastering the bus for them, so the board needs no DMA
+controller between it and the memory at all. It is what
+`amiga-os-310-a4000t.rom` has been asking for: on an `amiga-a4000` that ROM
+finds the IDE drive and then stops, and here it **boots Workbench 3.1 off a
+SCSI disk** — and off the IDE port too, because a real A4000T has both. Where
+the chip is, which way round its byte lanes are, which byte of `DSP` starts it
+and how a selection spells an address were all settled by recording what the
+ROM touches; `docs/platforms/amiga.md`, "A4000T", has the traces.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's

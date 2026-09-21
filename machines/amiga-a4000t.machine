@@ -1,0 +1,285 @@
+# amiga-a4000t - a Commodore Amiga 4000T: the A4000's board in a tower, with an
+# NCR 53C710 SCSI I/O processor on the motherboard beside the IDE port.
+#
+#   rsemu run amiga-a4000t --media kickstart=kickstart:amiga-os-310-a4000t.rom \
+#       --media scsi0=workbench-311.hdf
+#   rsemu run amiga-a4000t --media kickstart=kick.rom --drive scsi0=disk.hdf
+#   rsemu run amiga-a4000t --media kickstart=kick.rom --media hd0=disk.hdf
+#
+# **Two drive slots, because a real A4000T has two ports.** `scsi0` is the SCSI
+# cable's address 1 and `hd0` is the IDE port's master; both take a whole disk
+# with a Rigid Disk Block, the same image every other Amiga board here boots
+# from, and either may be empty. `--media` copies an image into memory and the
+# guest's writes stay there; `--drive` writes them back to the file.
+#
+# Everything that is not the SCSI port is `machines/amiga-a4000.machine`, and
+# that file carries the long comments for it: a 68040 at 25 MHz with its
+# on-chip FPU, the AA chip set with 2 MiB of chip RAM, 16 MiB of motherboard
+# fast RAM behind Ramsey filled from the top of the `$07000000` window, the
+# battery-backed clock, the two CIAs, DF0, and the A4000's own IDE decode at
+# `$00DD2020` with its interrupt register at `$00DD3020`.
+#
+# ## The SCSI port
+#
+# An A4000T has an **NCR 53C710 SCSI I/O Processor** on the motherboard where
+# an A4000 has nothing. It is not a WD33C93A behind a DMA controller the way an
+# A3000's is: the 53C710 is a processor in its own right, with a SCRIPTS
+# instruction set it fetches out of host memory and masters the bus for, so
+# this board needs no DMA controller between the chip and the memory at all.
+# `src/dev/ncr53c710.rs` is the model and its header is the ledger.
+#
+# ### Where it is, and which way up
+#
+# **Black-box observation**, because the A4000T documentation the author has
+# does not print the address: the shipped `amiga-os-310-a4000t.rom` was booted
+# on `machines/amiga-a4000.machine` with the whole of `$00DD0000`-`$00DD0FFF`
+# answered by a recorder and nothing else, and what it touched is what is
+# modelled here. `docs/platforms/amiga.md`, "A4000T", has the trace. No
+# Kickstart was disassembled to get it.
+#
+# The ROM's first four accesses to that page are `$00DD0078`, then
+# `$00DD0062`, and then the sequence `$00DD0062 := $80`, `:= $40`, `:= $00`.
+# That is a 53C710's `DCNTL`, and then `ISTAT`'s `ABRT` followed by `RST`
+# asserted and released - the abort-then-software-reset every driver for the
+# part opens with. It fixes both unknowns at once:
+#
+# * **The base is `$00DD0040`.** `ISTAT` is register `21` Hex in the data
+#   manual's numbering, and the chip's **big-endian mode** - which is what a
+#   68000-family board wires it into - swaps the four byte lanes of every row,
+#   so register *n* answers at *n* XOR 3. `$00DD0040 + (0x21 XOR 3)` is
+#   `$00DD0062`, which is the address the ROM then polls several hundred times
+#   waiting for an interrupt.
+# * **The register file repeats every 64 bytes.** The ROM's 68040 code writes
+#   `DSA` at `$00DD00D0` and `DSP` at `$00DD00EC` - `$80` above `$00DD0050`
+#   and `$00DD006C`, which is where the same two registers are in the first
+#   copy - and the SCRIPTS program the ROM then runs writes `DSA` at
+#   `$00DD0050`. Both have to reach the same register, so the board decodes
+#   `A5`-`A0` and leaves `A7`-`A6` alone. `mirror()` over `$C0` bytes is
+#   exactly that, three copies.
+#
+# ### Which address the adapter is at
+#
+# Address **0**, which is also black-box. `SCID` takes the chip's own address as
+# a bus line rather than a number - the same encoding a selection uses
+# (X3.131-1994 SS5.1.3.2) - and the ROM writes `$01` to it and then scans
+# `$02` through `$80`, seven addresses rather than eight. So the drive goes at
+# 1 to 7; `scsi-id` below defaults to 1 and says why.
+#
+# What the ROM does with the chip, in order: `DCNTL := $21`, `ISTAT` abort and
+# software reset, `CTEST7 := $80`, `CTEST0 := $54`, `SCNTL0 := $04`, then
+# `SCNTL1 := $08` and `:= $00` - which is `RST/` asserted and released, a SCSI
+# bus reset - then `SCID`, `SXFER := $80` (asynchronous), the synchronous clock
+# divisor through `SBCL`, `DMODE := $E0`, `DCNTL := $21`, `SIEN := $AF` and
+# `DIEN := $3D`. `SIEN := $AF` is the one worth writing down: it enables every
+# SCSI condition **except** `FCMP` and `SEL`, which is what an initiator wants
+# and what pins those two bits' positions in the register.
+#
+# ### The interrupt
+#
+# `IRQ/` joins `INT2`, the level Paula reports as `PORTS`, which is where
+# Commodore's `scsi.device` puts its handler and where the IDE port's `INTRQ`
+# and CIA-A's interrupt already are. `INT2` is an open-collector net and this
+# is its third puller.
+#
+# ### What is not here
+#
+# No Zorro II or Zorro III cards, so `$00E80000` and `$40000000` upwards float;
+# no Gayle, so no PCMCIA slot and none of its Kickstart mirrors. A real A4000T
+# has a Buster for its Zorro III slots and a second serial port on its tower
+# back panel; neither is modelled, and neither ROM tested looks for them.
+#
+# Written from the *NCR 53C710 SCSI I/O Processor Data Manual*, SCSI-2
+# (X3.131-1994), the *Specification for the Advanced Amiga (AA) Chip Set*
+# (Commodore-Amiga, 06/07/91), the *Amiga Hardware Reference Manual* 3rd
+# edition (Appendix D, the memory map), *The A3000+ System Specification*
+# (SS2.2, Ramsey), the *MC68040 User's Manual* and ATA-1 (X3.221-1994). No
+# Amiga emulator source, no FPGA reimplementation, no AROS source and no
+# Kickstart disassembly was consulted (ROADMAP.md SS1).
+#
+# Empty addresses float rather than fault, for the reason the A500, A600, A3000
+# and A4000 files give: Gary acknowledges every range no other chip claims.
+
+machine "amiga-a4000t" {
+  # -- how much of each memory -----------------------------------------------
+  param chip-ram = 2M
+
+  # The four SIMM sockets, full. The window is filled from the *top*: read
+  # `machines/amiga-a4000.machine`'s note before shrinking it.
+  param fast-ram = 16M
+
+  # Every Kickstart that runs on a 4000 is 512 KiB.
+  param kickstart-size = 512K
+
+  # Whether Paula keeps stereo output frames for a host audio sink to drain.
+  param audio = false
+
+  # The date the battery-backed clock starts at. Never the host's: a device may
+  # not read the host clock (CLAUDE.md, determinism), so it is declared, and two
+  # runs of this file see the same day.
+  param time = "2026-01-01T00:00:00"
+
+  # -- the crystals ----------------------------------------------------------
+  param master = 28375160
+  param cpu-clock = 25000000
+
+  # Which 68040: `-p processor=68lc040` has no FPU and `-p processor=68ec040`
+  # has neither FPU nor MMU. The A4000T's own is the full part.
+  param processor = "68040"
+
+  # Where the drive sits on the cable, 1 to 7.
+  #
+  # **Not 0**, and that is this board rather than a preference. The ROM writes
+  # `SCID := $01` and then selects the seven addresses whose *bus lines* are
+  # `$02`, `$04`, `$08`, `$10`, `$20`, `$40` and `$80` - which is a host adapter
+  # at address 0 scanning the other seven and skipping itself. A drive put at 0
+  # is a drive at the adapter's own address, and nothing ever selects it.
+  param scsi-id = 1
+
+  osc clk    = master Hz
+  osc cpuclk = cpu-clock Hz
+
+  space mem { width = 32, endian = "big", unassigned = open-bus }
+
+  # -- the processor ---------------------------------------------------------
+  object cpu "cpu.m68k" {
+    clock  = cpuclk
+    space  = mem
+    engine = "interp"
+    model  = processor
+  }
+
+  object chipram "ram" { size = chip-ram }
+  object fastram "ram" { size = fast-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+
+  object custom "amiga.custom" { }
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
+
+  # -- the AA chip set -------------------------------------------------------
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    revision = "aga"
+    paula    = paula
+    video    = denise
+  }
+  object denise "amiga.denise" { custom = custom, clock = clk / 4, revision = "aga" }
+
+  # -- the battery-backed clock ----------------------------------------------
+  osc rtcclk = 32768 Hz
+  object rtc "amiga.rtc" { clock = rtcclk, time = time }
+
+  # -- Ramsey ----------------------------------------------------------------
+  object ramsey "amiga.ramsey" { version = 15 }
+
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  # -- the two disk ports ----------------------------------------------------
+  #
+  # Both drives are declared *before* their ports, for the reason
+  # `amiga-a600.machine` and `amiga-a3000.machine` give: `Machine::reset` runs
+  # devices in declaration order, the IDE port's reset reads the drive's
+  # interrupt line, and a SCSI controller's reset pulls `RST` on the cable,
+  # which the targets must already be there to hear. No bytes bound to either
+  # slot is an empty bay or an empty cable address.
+  object sd0 "scsi.disk" {
+    image    = "scsi0"
+    bus      = "scsi0"
+    id       = scsi-id
+    vendor   = "RSEMU"
+    product  = "SCSI HARDDISK"
+    revision = "1.0"
+  }
+
+  object hd0 "ata.disk" { image = "hd0", bay = "ide-master" }
+
+  # The SCSI I/O processor. `space = mem` is not decoration: it fetches its own
+  # instructions out of guest memory and masters the bus for every byte it
+  # moves, so the memory it can see *is* the machine's.
+  object ncr "ncr.53c710" { bus = "scsi0", id = 7, byte-order = "big", space = mem }
+
+  object ide "amiga.ide" { master = "ide-master", slave = "ide-slave" }
+
+  # -- the overlay -----------------------------------------------------------
+  object overlay "amiga.gary" {
+    space = mem
+    rom   = kick
+    ram   = chipram
+    size  = chip-ram
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  #   $00000000  chip RAM, behind the overlay                   2 MiB
+  #   $00BFD000  CIA-B, even byte lane
+  #   $00BFE000  CIA-A, odd byte lane
+  #   $00DC0000  the battery-backed clock                       64 KiB
+  #   $00DD0040  the 53C710's 64 registers, three times over    192 bytes
+  #   $00DD2000  the IDE port: the task file and its interrupt  8 KiB
+  #   $00DE0000  Ramsey: the control and version registers      256 bytes
+  #   $00DFF000  the custom chip registers                      512 bytes
+  #   $00F80000  Kickstart                                      512 KiB
+  #   $07000000  motherboard fast RAM                           16 MiB
+  map mem 0x00000000 size chip-ram = overlay.overlay { endian = "big" }
+  map mem 0x00BFD000 size 0x1000   = cia_b_decode    { endian = "big" }
+  map mem 0x00BFE000 size 0x1000   = cia_a_decode    { endian = "big" }
+  map mem 0x00DC0000 size 0x10000  = mirror(rtc)     { endian = "big" }
+  map mem 0x00DD0040 size 0xC0     = mirror(ncr.regs) { endian = "big" }
+  map mem 0x00DD2000 size 0x2000   = ide.ide         { endian = "big" }
+  map mem 0x00DE0000 size 0x100    = ramsey.regs     { endian = "big" }
+  map mem 0x00DFF000 size 0x200    = custom
+  map mem 0x00F80000 size 512K     = mirror(kick)    { endian = "big" }
+  map mem 0x07000000 size fast-ram = fastram         { endian = "big" }
+
+  # -- wiring ----------------------------------------------------------------
+  wire cia_a.pa0 -> overlay.ovl
+
+  wire paula.ipl0 -> cpu.ipl0
+  wire paula.ipl1 -> cpu.ipl1
+  wire paula.ipl2 -> cpu.ipl2
+
+  # INT2 is an open-collector net with three pullers on this board: CIA-A, the
+  # IDE port, and the 53C710's `IRQ/`.
+  wire cia_a.irq  -> paula.int2
+  wire ide.int2   -> paula.int2
+  wire ncr.irq    -> paula.int2
+  wire cia_b.irq  -> paula.int6
+
+  # The floppy lines (Appendix E; chapter 8, Table 8-5).
+  wire cia_b.pb7 -> df0.mtr   { pull = "up" }    # MTR*
+  wire cia_b.pb3 -> df0.sel   { pull = "up" }    # SEL0*
+  wire cia_b.pb2 -> df0.side  { pull = "up" }    # SIDE*
+  wire cia_b.pb1 -> df0.dir   { pull = "up" }    # DIR
+  wire cia_b.pb0 -> df0.step  { pull = "up" }    # STEP*
+  wire df0.rdy   -> cia_a.pa5 { pull = "up" }    # RDY*
+  wire df0.tk0   -> cia_a.pa4 { pull = "up" }    # TK0*
+  wire df0.wpro  -> cia_a.pa3 { pull = "up" }    # WPRO*
+  wire df0.chng  -> cia_a.pa2 { pull = "up" }    # CHNG*
+  wire df0.index -> cia_b.flag { pull = "up" }   # INDEX*
+
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
+
+  # -- the keyboard and the mouse --------------------------------------------
+  osc periph = 1000000 Hz
+
+  object kbd "amiga.keyboard" { clock = periph }
+  wire kbd.kclk  -> cia_a.cnt { pull = "up" }
+  wire cia_a.sp  -> kbd.kdat  { pull = "up" }
+  wire kbd.kdat  -> cia_a.sp
+
+  object mouse "amiga.mouse" { clock = periph }
+  wire mouse.y      -> denise.m0v  { pull = "up" }
+  wire mouse.yq     -> denise.m0vq { pull = "up" }
+  wire mouse.x      -> denise.m0h  { pull = "up" }
+  wire mouse.xq     -> denise.m0hq { pull = "up" }
+  wire mouse.left   -> cia_a.pa6   { pull = "up" }
+  wire mouse.right  -> paula.potly { pull = "up" }
+  wire mouse.middle -> paula.potlx { pull = "up" }
+}

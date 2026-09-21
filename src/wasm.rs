@@ -689,9 +689,12 @@ const KEYBOARD_PORT: &str = "keyboard";
 /// and which had parted from the CLI's list the same way `nvme0` once did, so
 /// a `demo,machine-amiga-cd32` module refused to assemble the very board whose
 /// whole point is that it boots with nothing in the tray.
+/// `scsi0` is an A4000T's SCSI cable at address 0: empty is an address nobody
+/// answers at, which is that board with its SCSI drive taken out and its IDE
+/// one still in.
 const EMPTY_BAYS: &[&str] = &[
-    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0", "ext",
-    "cd0", "cdrom",
+    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "scsi0", "floppy", "vgabios", "nvme0",
+    "df0", "ext", "cd0", "cdrom",
 ];
 
 /// Where the media image a boot binds comes from.

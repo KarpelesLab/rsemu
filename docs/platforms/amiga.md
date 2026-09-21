@@ -13,7 +13,9 @@ own section), `machines/amiga-a3000.machine`, `src/dev/scsi/`,
 `src/dev/wd33c93.rs`, `src/dev/amiga/sdmac.rs`, `src/dev/amiga/ramsey.rs`,
 `tests/amiga_a3000_board.rs`, `tests/amiga_a3000.rs`; and for the A4000 (its
 own section), `machines/amiga-a4000.machine`, `src/dev/amiga/ide.rs`,
-`tests/amiga_a4000_board.rs`, `tests/amiga_a4000.rs`; and for the ECS section,
+`tests/amiga_a4000_board.rs`, `tests/amiga_a4000.rs`; and for the A4000T (its
+own section), `machines/amiga-a4000t.machine`, `src/dev/ncr53c710.rs`,
+`tests/amiga_a4000t_board.rs`, `tests/amiga_a4000t.rs`; and for the ECS section,
 `machines/amiga-a500plus.machine`, `src/dev/amiga/rtc.rs` and
 `tests/amiga_a500plus.rs`; and for the AA section, `src/dev/amiga/denise/aga.rs`
 and `tests/amiga_lisa.rs`.
@@ -2299,9 +2301,13 @@ nor Ramsey's — and then reads `$00DD_0062` 388 times and gives up. An A4000T h
 an **NCR 53C710** SCSI controller on the motherboard in exactly that space,
 where an A3000 has its DMAC and WD33C93A, and this board has nothing there. So
 that row is the board being honest about what it is: the same disk, the same
-port and the same drive boot under both of the other two ROMs. A machine file
-for an A4000T would need that controller, which is a separate part and a
-separate job.
+port and the same drive boot under both of the other two ROMs.
+
+**That machine file now exists.** `machines/amiga-a4000t.machine` is this board
+with an `ncr.53c710` at `$00DD_0040`, and that ROM boots Workbench 3.1 off a
+SCSI disk on it — and off the IDE port too, because a real A4000T has both. The
+"A4000T" section below is where the chip, its address and its byte order were
+settled.
 
 ### Open, and not guessed at
 
@@ -2312,9 +2318,301 @@ separate job.
 * **What the port does with a byte access at an odd address.** The ROM never
   makes one. The model puts `D7`–`D0` there, which is Gayle's rule and the
   A600's schematic's.
-* **The 53C710 at `$00DD_0040`.** Identified by what the A4000T's ROM does with
-  it and by what Commodore put on that board, not by a register table; nothing
-  here models it.
+* **The 53C710 at `$00DD_0040`.** Identified here by what the A4000T's ROM does
+  with it and by what Commodore put on that board; `src/dev/ncr53c710.rs` now
+  models it and the "A4000T" section below is its ledger. It stays out of *this*
+  board, which has not got one.
 * **Whether the A3000's `CHK` was ever the board's.** It does not reproduce, and
   the sweep above is as far as this work can take it without the A3000's own
   file, which belongs to that section.
+
+## A4000T
+
+`machines/amiga-a4000t.machine` is `machines/amiga-a4000.machine` in a tower,
+with an **NCR 53C710 SCSI I/O Processor** on the motherboard beside the IDE
+port. It boots Workbench 3.1 off a Rigid Disk Block whole disk on the SCSI
+cable, which is what `amiga-os-310-a4000t.rom` has been asking for since it was
+first tried here — the A4000 section above records that ROM finding the IDE
+drive and then stopping, and this section is what it was stopping for.
+
+### Primary sources
+
+| Source | Covers |
+| --- | --- |
+| *NCR 53C710 SCSI I/O Processor Data Manual* | the sixty-four registers, the interrupt model (`ISTAT` over `DSTAT`/`DIEN` and `SSTAT0`/`SIEN`), the four SCRIPTS instruction types, the big-endian mode |
+| SCSI-2, X3.131-1994 | the bus phases (§5.1), the messages (§6.6), `MODE SENSE` and its page codes (§8.2.10), a selection's addressing (§5.1.3.2) |
+| everything the A4000 section lists | the board this one is: the AA chip set, Ramsey, the 68040, the IDE port |
+| Black-box: Kickstart 3.1 (40.070) and 3.X, both A4000T images | **where the chip is**, which way round its byte lanes are, which byte of `DSP` starts it, and how a selection spells an address |
+
+The last row is the important one. No Kickstart was disassembled: what follows
+is rsemu's own recorder printing the bus cycles a running machine made, and
+then — once the chip answered — the chip's own instruction trace, which is the
+guest handing the model a program to run rather than the model reading the
+guest's code.
+
+### Finding the chip, and which way up it is
+
+The A4000T documentation to hand prints no address for it. So
+`machines/amiga-a4000.machine` was built with the whole of
+`$00DD_0000`–`$00DD_0FFF` given to a recorder that answers zero and writes down
+every cycle, and `amiga-os-310-a4000t.rom` booted on it. Besides the IDE port it
+made 631 accesses to that page in forty seconds, and the first two dozen are the
+whole answer:
+
+```text
+  W.B  $00DD_0078  $21        R.B  $00DD_0062             ; ×1
+  W.B  $00DD_0062  $80        R.B  $00DD_0062             ; ×2
+  W.B  $00DD_0062  $40        W.B  $00DD_0062  $00
+  R.B  $00DD_0058  …  W.B  $00DD_0058  $80
+  W.B  $00DD_0057  $54
+  R.B  $00DD_0043  …  W.B  $00DD_0043  $04
+  W.B  $00DD_0042  $08        W.B  $00DD_0042  $00
+  W.B  $00DD_0047  $01        W.B  $00DD_0042  $20
+  W.B  $00DD_0046  $80        W.B  $00DD_0048  $03
+  W.B  $00DD_007B  $E0        W.B  $00DD_0078  $21
+  W.B  $00DD_0040  $AF        W.B  $00DD_007A  $3D
+  R.B  $00DD_0062  ×570                                    ; and then nothing
+```
+
+`$80`, `$40`, `$00` into one register, with reads either side, is a 53C710's
+`ISTAT`: `ABRT`, then `RST` asserted and released — the abort-then-software-reset
+every driver for the part opens with. `ISTAT` is register `21` Hex in the data
+manual's numbering, which would put the base at `$00DD_0041`, and that is wrong
+by one. The one is the second half of the answer:
+
+* **The chip is in its big-endian mode**, which is what a 68000-family board
+  wires it into. The four byte lanes of every row of the register file swap, so
+  the register the manual numbers *n* answers at *n* XOR 3 — and a
+  thirty-two-bit register reads as a natural big-endian longword.
+  `$00DD_0040 + (0x21 XOR 3)` is `$00DD_0062`. **The base is `$00DD_0040`.**
+
+With that, every other address in the trace names a register, and the sequence
+reads as an initialisation:
+
+| address | register | written | what it is |
+| --- | --- | --- | --- |
+| `$00DD_0078` | `DCNTL` | `$21` | the clock divisor and 53C710 mode |
+| `$00DD_0062` | `ISTAT` | `$80`, `$40`, `$00` | abort, then software reset |
+| `$00DD_0058` | `CTEST7` | `$80` | cache disable |
+| `$00DD_0057` | `CTEST0` | `$54` | a general-purpose latch |
+| `$00DD_0043` | `SCNTL0` | `$04` | the parity enables |
+| `$00DD_0042` | `SCNTL1` | `$08` then `$00` | `RST/` asserted and released: a SCSI bus reset |
+| `$00DD_0047` | `SCID` | `$01` | the chip's own address — see below |
+| `$00DD_0046` | `SXFER` | `$80` | asynchronous, no offset |
+| `$00DD_0048` | `SBCL` | `$03` | the synchronous clock divisor a *write* here sets |
+| `$00DD_007B` | `DMODE` | `$E0` | burst length and function code, with `MAN` clear |
+| `$00DD_0040` | `SIEN` | `$AF` | every SCSI interrupt **but** `FCMP` and `SEL` |
+| `$00DD_007A` | `DIEN` | `$3D` | every DMA interrupt but `MDPE` and the watchdog |
+
+`SIEN := $AF` is worth writing down on its own: it pins the positions of `FCMP`
+and `SEL` in that register, because those two are exactly the ones an initiator
+does not want. A chip that raised `FCMP` on every successful selection *and* was
+allowed to interrupt about it would stop its own SCRIPTS program one instruction
+in.
+
+### The register file answers three times over
+
+Later in the same trace the ROM writes two longwords, as four word accesses:
+
+```text
+  W.W  $00DD_00D0  $0700      W.W  $00DD_00D2  $C830      ; DSA := $0700C830
+  W.W  $00DD_00EC  $0700      W.W  $00DD_00EE  $B3D8      ; DSP := $0700B3D8
+```
+
+`$00DD_00D0` is `$80` above `$00DD_0050`, and `$00DD_00EC` is `$80` above
+`$00DD_006C`, which is where `DSA` and `DSP` are in the copy at `$00DD_0040`.
+And the SCRIPTS program the ROM then runs contains a Memory Move whose
+destination is `$00DD_0050` — `DSA` in the *first* copy. Both have to reach the
+same register, so the board decodes `A5`–`A0` and leaves `A7`–`A6` alone: the
+sixty-four registers repeat every sixty-four bytes. `mirror()` over `$C0` bytes
+is exactly that, and `tests/amiga_a4000t_board.rs` asserts all three copies.
+
+### Which byte of `DSP` starts the processor
+
+Writing `DSP` is what sets a 53C710 going, unless `DMODE`'s `MAN` bit says to
+wait for `DCNTL`'s `STD`. *Which* byte finishes the write is not a detail: the
+ROM writes `DSP` as two words, high half first, so the last byte to arrive is
+the one at the **highest address** — which in big-endian lane order is the
+register the manual numbers `2C`, the longword's *least* significant byte, and
+not `2F`.
+
+Started on register `2F`, the model set the chip going with three quarters of
+the address still missing and it ran from `$0700_0000`. The trace says so in one
+line: `step 07000000: 00001000 07000952`, an instruction fetched out of the
+bottom of fast RAM. Deciding the trigger from the *address* rather than the
+register number is the fix, and `tests/amiga_a4000t_board.rs` pins it by halves.
+
+### A selection's address is a bus line
+
+The ROM's SCRIPTS program selects with the table-indirect form, and the entries
+it walks the cable with are
+
+```text
+  $0002_0000  $0004_0000  $0008_0000  $0010_0000
+  $0020_0000  $0040_0000  $0080_0000
+```
+
+— one bit walking up bits 23–16, and **seven** of them rather than eight. That
+is the SCSI data line a selection asserts (X3.131-1994 §5.1.3.2), not a number,
+and seven of them is a host adapter skipping itself. `SCID := $01` reads the
+same way, so **this board's adapter is at address 0** and a drive goes at 1 to 7;
+`machines/amiga-a4000t.machine` defaults `scsi-id` to 1 and says why.
+
+Read as an encoded number instead, all seven entries select address 0. The
+machine then finds the same drive seven times, `scsi.device` configures seven
+units, AmigaDOS mounts seven partitions all called `Workbench3.1`, and the boot
+ends at a `System Request` asking for the volume back. That requester is what
+the model showed until the trace was read properly.
+
+### Which half of a compare is the data
+
+A transfer control instruction can compare `SFBR` against an eight-bit value
+under an eight-bit mask, and the two live in bits 15–8 and 7–0 of the
+instruction. Which is which was settled by the ROM's own idle loop:
+
+```text
+  74 16 40 00   SFBR := CTEST2 AND $40        ; SIGP?
+  80 0c 00 40   Jump $0700B3D8 if <compare>   ; yes: go and take the work
+```
+
+The pair is only coherent if `$40` — bits 7–0 — is the value compared. Read the
+other way round the comparison is "`SFBR`, ignoring bit 6, is zero", which is
+true whichever way the test went, and every comparison in that driver becomes
+vacuous. `src/dev/ncr53c710.rs` takes the data from bits 7–0 and the mask from
+bits 15–8, and says so where it does it. The mask half is zero in everything
+this ROM writes, so what a non-zero mask means is the manual's word and not
+established here.
+
+### `SIP` and `DIP` are levels
+
+`ISTAT`'s two summary bits are computed from `SSTAT0 & SIEN` and `DSTAT & DIEN`,
+not latched when something happens. The difference is the whole boot. The ROM
+asserts `RST/` through `SCNTL1` and only *then* writes `SIEN`, and it is waiting
+for the interrupt that unmasking the `RST` already sitting in `SSTAT0` produces.
+Latch the summary bit at the moment of the event and that interrupt never comes:
+the driver polls `ISTAT` for ever and the machine never gets a boot device.
+
+`DSTAT`'s `DFE` is deliberately outside that: `DIEN` has no bit opposite it,
+which is the manual's own way of saying a level is not an interrupt.
+
+### `SIGP` is cleared by reading `CTEST2`, and by nothing else
+
+`Wait Reselect` leaves by its alternate address when `SIGP` is set — and does
+not clear it. Commodore's driver relies on that: the instruction after the wait
+is `SFBR := CTEST2 AND $40`, the program asking *why* it woke up. A model that
+consumed the signal in the wait hands it `$00`, the program concludes nothing
+happened and interrupts with its "woken for nothing" vector, and the driver
+resets the chip and starts the whole initialisation again — forever.
+
+### `MODE SENSE` page `00`
+
+One defect this work found is not the controller's at all. `scsi.disk` refused
+`MODE SENSE` with page code `00`, and Commodore's 53C710 `scsi.device` issues
+`1A 00 00 00 04 00` while it configures a unit — four bytes, the mode parameter
+header alone, which is the classic "what medium is this and is it write
+protected" probe. An `ILLEGAL REQUEST` there sends the driver round the whole bus
+scan again, seven times, and then the unit is left half-configured.
+
+Page code `00` is "vendor specific (does not require the page format)"
+(X3.131-1994 §8.2.10, Table 90). A drive with no vendor-specific page can return
+the header and the block descriptor and nothing after them, which is a complete
+mode parameter list (§8.3.3) rather than an error — and is what the drives of
+the era did. `src/dev/scsi/disk.rs` now does that. No other board's driver asks
+for page `00`, and no golden moved.
+
+### Two objects, not three
+
+An A3000's SCSI port is three objects — a target, an initiator and a DMA
+controller. This one is **two**, and the missing one is the point:
+
+| Object | Class | Feature | What it is |
+| --- | --- | --- | --- |
+| `sd0` | `scsi.disk` | `dev-scsi` | the target: a phase machine and a SCSI command set, backed by `dev::medium` — the very same class the A3000 uses |
+| `ncr` | `ncr.53c710` | `dev-ncr53c710` | the initiator, which masters memory itself |
+
+There is no DMA controller because a 53C710 *is* one. `space = mem` on the
+object is not decoration: the chip fetches its own instructions out of guest
+memory and moves every byte of data through the same space, so the memory it
+can see is the machine's.
+
+The falsifiable form of `dev/scsi`'s split holds for this initiator as it does
+for the other: `src/dev/ncr53c710.rs` contains no SCSI command opcode — no
+`INQUIRY`, no `READ(10)`, no sense key, no mode page — and `src/dev/scsi/`
+contains no controller register name. The command descriptor block in
+`src/dev/ncr53c710/tests.rs` is the test's, and that file says so.
+
+### The map
+
+Every row of `machines/amiga-a4000.machine`'s map, and one more:
+
+| address | what |
+| --- | --- |
+| `$00DD_0040`–`$00DD_00FF` | the 53C710's sixty-four registers, three times over |
+
+`IRQ/` joins `INT2`, the level Paula reports as `PORTS`, where the IDE port's
+`INTRQ` and CIA-A's interrupt already are. `INT2` is an open-collector net and
+this is its third puller.
+
+### How far each ROM gets
+
+`tests/amiga_a4000t.rs`, behind `RSEMU_AMIGA_ROM_DIR` and `RSEMU_AMIGA_HDF_DIR`,
+boots the user's files in place and checks a frame hash; each frame was looked
+at.
+
+| ROM + disk | Reaches | What is on screen |
+| --- | --- | --- |
+| Kickstart 3.1 (40.070) A4000T + `workbench-311.hdf` on **`scsi0`** | **the Workbench 3.1 desktop**, 60 s | 1600×568 in AGA. A light grey backdrop; along the top, "Copyright © 1985-1993 Commodore-Amiga, Inc. All Rights Reserved." with the screen's depth gadgets at the right; below it the open "Workbench" window in its blue bordering, holding the "Ram Disk" icon and, under it, the "Workbench3.1" hard-disk icon; scroll bars and arrows down the right and along the bottom; the red arrow pointer at the top left, where the mouse has not moved |
+| `amiga-os-3x0-a4000t.rom` + the same disk on `scsi0` | the same desktop | Identical but for the title bar, which reads "Copyright © 1985-2017 Cloanto Corporation and its licensors." |
+| Kickstart 3.1 A4000T + the same disk on **`hd0`** | the same desktop, 45 s | Identical, pixel for pixel — the same hash `tests/amiga_a4000.rs` pins for an A4000. The picture does not know which cable the blocks came down |
+| Kickstart 3.1 A4000T, both ports empty | its insert-disk screen, 60 s | A dark purple field; the Amiga check-mark in its blue-to-red gradient above four lines of orange text — "3.1 ROM   40.070 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." — and, to the right, the drive slot with nothing under it |
+
+The SCSI boot takes about twice as long to reach the desktop as the IDE one, and
+that is the ROM rather than the model: it scans seven cable addresses with an
+eight-`LUN` sweep at each before it has a boot device at all.
+
+`GfxBase->ChipRevBits0` reads **`$1F`** on all three booted runs —
+`GFXF_HR_AGNUS`, `GFXF_HR_DENISE`, `GFXF_AA_ALICE`, `GFXF_AA_LISA` and bit 4 —
+and `$13` at the insert-disk screen, the same "the AA pair appears only once the
+ROM has a boot device" the A1200 and A4000 sections record.
+`ExecBase->AttnFlags` reads **`$807F`** — `AFF_68010 | AFF_68020 | AFF_68030 |
+AFF_68040 | AFF_68881 | AFF_68882 | AFF_FPU40` — and `ExecBase` itself is in
+the motherboard fast RAM: `$0700_0810` under Kickstart 3.1 and at the
+insert-disk screen, `$0700_0864` under the 3.X build, which puts one more thing
+below it. A task called **`DH0`** is on exec's list on every booted run, which
+exists only if a driver read the Rigid Disk Block, found a partition in it and
+`dos.library` mounted what it found.
+
+### What the model implements, and what it does not
+
+All four SCRIPTS instruction types: Block Move in all three addressing forms
+(immediate, indirect, table indirect) with the manual's phase-mismatch ending;
+the I/O instructions `Select`, `Wait Disconnect`, `Wait Reselect`, `Set` and
+`Clear`, and the register read/write ALU with its carry; `Jump`, `Call`,
+`Return` and `Interrupt`, conditional on the phase, on `SFBR` under a mask or on
+the carry, absolute or relative; and Memory Move, whose destination may be the
+chip's own register file — which is why no lock of the chip's may be held across
+a bus tenure.
+
+Not implemented, and `src/dev/ncr53c710.rs`'s header says so: the target role,
+reselection from the cable (no target in this tree disconnects, so `Wait
+Reselect` only ever leaves by `SIGP`), synchronous transfer, parity, the DMA
+FIFO and the watchdog timer.
+
+### Open, and not guessed at
+
+* **What `CTEST0 := $54` and `SBCL := $03` mean.** Both are stored and reported
+  back. The first is a general-purpose latch as far as anything here can tell;
+  the second is the synchronous clock divisor a *write* to `SBCL` sets, and this
+  model has no transfer rate for it to divide.
+* **The mask half of a compare.** Zero in everything this ROM writes; taken from
+  the manual as the bits *not* compared, and not established here.
+* **The other three bytes of a table-indirect `Select` entry.** Zero in
+  everything this ROM writes. Nothing is taken from them, so in particular
+  `SXFER` is left as the host set it.
+* **Whether a real A4000T decodes `$00DD_0080`–`$00DD_00BF`.** The ROM uses the
+  copies at `$00DD_0040` and `$00DD_00C0`. The middle one follows from `A7`–`A6`
+  being undecoded, which is the simplest decode that answers both, and nothing
+  tested here can tell whether the board really is that simple.
+* **Where Commodore put the internal drive.** The adapter is at address 0, so
+  the drive is somewhere in 1 to 7; which one is a jumper on a machine nobody
+  here has. `scsi-id` defaults to 1 and `scsi.device` scans them all.
