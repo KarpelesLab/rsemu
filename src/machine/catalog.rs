@@ -681,6 +681,27 @@ pub static M68K_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/m68k-mini.machine"),
 };
 
+/// A Macintosh Plus, when this build has the board classes.
+///
+/// A 7.8336 MHz 68000 on a big-endian 24-bit space, main memory at zero behind
+/// the ROM overlay and repeating through its window, the 128 KiB ROM socket at
+/// `$40_0000`, a 6522 VIA at `$EF_E1FE`, a Z8530 in two windows at `$9F_FFF8`
+/// and `$BF_FFF9`, and the video circuit reading a 512 x 342 one-bit screen out
+/// of the top of main memory. The `macrom` slot takes the ROM image, which must
+/// be exactly 128 KiB. `-p ram=4M` gives the fully expanded machine. With no
+/// disk it reaches the ROM's insert-disk screen.
+/// `machines/mac-plus.machine` carries the wiring, and
+/// `docs/platforms/mac-plus.md` the ledger.
+#[cfg(feature = "machine-mac-plus")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-mac-plus")))]
+pub static MAC_PLUS: CatalogEntry = CatalogEntry {
+    name: "mac-plus",
+    summary: "a Macintosh Plus: a 7.83 MHz 68000, the ROM overlay at zero, a 6522 at $EFE1FE, \
+              and 512x342 one-bit video read out of main memory",
+    media: &["macrom"],
+    source: include_str!("../../machines/mac-plus.machine"),
+};
+
 /// A Commodore Amiga 500, when this build has the board classes.
 ///
 /// A 68000, chip RAM at zero behind the `OVL` overlay, both 8520 CIAs, Agnus,
@@ -938,6 +959,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&GAMEBOY);
     #[cfg(feature = "machine-m68k-mini")]
     out.push(&M68K_MINI);
+    #[cfg(feature = "machine-mac-plus")]
+    out.push(&MAC_PLUS);
     #[cfg(feature = "machine-amiga-a500")]
     out.push(&AMIGA_A500);
     #[cfg(feature = "machine-amiga-a600")]
@@ -1133,6 +1156,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::apple1::register(&mut reg)?;
     #[cfg(feature = "dev-amiga")]
     crate::dev::amiga::register(&mut reg)?;
+    #[cfg(feature = "dev-mac")]
+    crate::dev::mac::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-a64")]
     crate::cpu::arm::a64::register(&mut reg)?;
     #[cfg(feature = "dev-arm")]
@@ -1283,6 +1308,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::apple1::bind(&mut b)?;
     #[cfg(feature = "dev-amiga")]
     crate::dev::amiga::bind(&mut b)?;
+    #[cfg(feature = "dev-mac")]
+    crate::dev::mac::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-a64")]
     crate::cpu::arm::a64::bind(&mut b)?;
     #[cfg(feature = "dev-arm")]
@@ -1424,6 +1451,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::st25dv::schema());
     #[cfg(feature = "dev-amiga")]
     for schema in crate::dev::amiga::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-mac")]
+    for schema in crate::dev::mac::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-apple1")]
@@ -2532,6 +2563,19 @@ mod tests {
             // is the top of the default 512 KiB of chip RAM.
             // `tests/amiga_a500_board.rs` is where the overlay is made to
             // flip and the custom register space is made to answer.
+            // The same three things for a Macintosh, out of the overlay rather
+            // than out of a ROM mapped at zero: at reset the ROM socket is
+            // what answers at $000000, so the two reset longwords are the
+            // first eight bytes of the *ROM image*. The stack pointer is the
+            // top of the default 1 MiB of RAM. `tests/mac_plus_board.rs` is
+            // where the overlay is made to flip and the VIA made to answer;
+            // `tests/mac_plus.rs` boots the user's own ROM.
+            #[cfg(feature = "machine-mac-plus")]
+            ("mac-plus", "macrom") => &[
+                0x00, 0x10, 0x00, 0x00, // SSP = $00100000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             #[cfg(feature = "machine-amiga-a500")]
             ("amiga-a500", "kickstart") => &[
                 0x00, 0x08, 0x00, 0x00, // SSP = $00080000

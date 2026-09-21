@@ -2808,6 +2808,29 @@ machine-mips-mini = ["cpu-mips"]
 # to wire. Adds no dependencies.
 machine-m68k-mini = ["cpu-m68k"]
 
+# The Macintosh board classes (src/dev/mac): the four parts a compact
+# Macintosh needs before it can draw anything. `mac.glue` is the address
+# decode -- the ROM overlay that answers at zero until the VIA's `ROMOVERLAY`
+# bit clears it, and the RAM window at $600000 that only exists while it is
+# asserted -- with main memory *repeating* through its window, because that
+# wraparound is the mechanism the ROM sizes memory by. `mac.via` is a 6522
+# with the board's A9-A12 register select: two ports every pin of which is a
+# wire, both counter/timers with the free-run and one-shot modes and the PB7
+# square wave, the shift register, and the interrupt flag/enable pair with its
+# read-to-clear and its SET/CLEAR write. `mac.video` is the video circuit,
+# which is a bus master with no registers at all: 512x342 one-bit pixels read
+# straight out of main memory at capture time, a screen buffer that hangs a
+# fixed distance below the top of RAM with `PAGE2` picking which of the two,
+# and the vertical and horizontal blanking signals that come back off the
+# beam. `mac.scc` is a Z8530 -- the register pointer, all thirty-two
+# registers, `RR0`/`RR1`/`RR2`/`RR3` and the two carrier detects a mouse's
+# quadrature arrives on -- and no serial traffic. Written from Guide to the
+# Macintosh Family Hardware (2nd edition), the SY6522 and Z8530 data sheets,
+# and black-box register traces; no Macintosh emulator source was consulted
+# and no ROM was disassembled (ROADMAP.md 1). Adds no dependencies and is
+# `no_std + alloc`.
+dev-mac = []
+
 # The Amiga board classes (src/dev/amiga): the custom-chip register space at
 # $DFF000, the `OVL` overlay, and the 8520 address decode, and nothing else.
 # `amiga.custom` owns the decode -- 256 word registers in 512 bytes, transcribed
@@ -3151,6 +3174,16 @@ net-pktkit = ["dev-net", "std", "dep:pktkit"]
 # has a machine a *real driver* can be run on -- `tests/ne2000_board.rs` boots
 # Z80 firmware that initialises the card, transmits a frame and takes the
 # receive interrupt in mode 1. Adds no dependencies.
+# The `mac-plus` board (machines/mac-plus.machine plus the classes it names):
+# a Macintosh Plus. A 7.8336 MHz 68000 on a big-endian 24-bit space, RAM at
+# zero behind the ROM overlay, the 128 KiB ROM socket at $400000, the VIA at
+# $EFE1FE, the SCC's two windows at $9FFFF8 and $BFFFF9, and the video circuit
+# reading a 512x342 one-bit screen out of the top of main memory. The `macrom`
+# slot takes the ROM image; `-p ram=4M` gives the fully expanded machine. It
+# reaches the ROM's insert-disk screen. `docs/platforms/mac-plus.md` carries
+# the ledger. Adds no dependencies.
+machine-mac-plus = ["cpu-m68k", "dev-mac"]
+
 machine-ne2k-mini = ["cpu-z80", "dev-ne2000"]
 
 [[bench]]

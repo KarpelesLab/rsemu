@@ -13,6 +13,7 @@
 //! | --- | --- | --- |
 //! | [`ahci`] | `dev-ahci` | a Serial ATA host bus adapter: a PCI function that DMA-walks its own command lists |
 //! | [`amiga`] | `dev-amiga`, `dev-amiga-denise` | the Amiga board: the `$DFF000` custom-chip decode and the seam the chips attach to, the `OVL` overlay at address zero, the 8520 address decode, and Denise |
+//! | [`mac`] | `dev-mac` | the Macintosh board: the ROM overlay at address zero, a 6522 VIA, the video circuit that reads main memory, and a Z8530 |
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`arm`] | `dev-arm` | the AArch64 `virt` board: a GICv2, a PL011, PSCI's landing place, and the device tree generator |
 //! | [`ata`] | `dev-ata-disk` | an ATA hard disk: the command block, the command set, CHS and LBA |
@@ -63,6 +64,10 @@ pub mod atmel;
 #[cfg(feature = "dev-amiga")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga")))]
 pub mod amiga;
+
+#[cfg(feature = "dev-mac")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-mac")))]
+pub mod mac;
 
 #[cfg(feature = "dev-apple1")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-apple1")))]

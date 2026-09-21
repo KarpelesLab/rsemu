@@ -90,6 +90,10 @@ pub mod gb;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-lcdc")))]
 pub mod lcd;
 
+#[cfg(feature = "dev-mac")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-mac")))]
+pub mod mac;
+
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
 pub mod nes;
