@@ -69,6 +69,7 @@ use super::isa::{
     decode_for, decode_with, ea_of, is_full_format,
 };
 use super::mmu::{self, Entry, Mmu, mmusr, tc, tt};
+use super::mmu040::{Regs040 as Mmu040, mmusr as mmusr040, tcr, ttr};
 use super::timing;
 use super::{Config, Lines, flags, vector};
 use crate::float::x87::{self, F80};
@@ -172,6 +173,9 @@ pub(super) struct State {
     /// an MMU never reaches it, and nothing can write its registers because
     /// the instructions that do are not in that model's opcode map.
     pub mmu: Mmu,
+    /// The 68040's memory management unit, which shares nothing with the
+    /// 68030's but the job — see `mmu040.rs` for the table of differences.
+    pub mmu040: Mmu040,
 }
 
 /// The three stack-pointer banks.
@@ -238,6 +242,7 @@ impl State {
             last_vector: None,
             fpu: Fpu::RESET,
             mmu: Mmu::RESET,
+            mmu040: Mmu040::RESET,
         }
     }
 
@@ -305,7 +310,9 @@ impl State {
     /// The `CACR` bits this model has storage for.
     #[inline]
     pub(super) const fn cacr_mask(&self) -> u32 {
-        if self.model.has_030() {
+        if self.model.has_040() {
+            CACR_STORED_040
+        } else if self.model.has_030() {
             CACR_STORED_030
         } else if self.model.has_020() {
             CACR_STORED_020
@@ -561,6 +568,16 @@ pub(super) struct Exec<'a> {
     /// it; a transparent block needs no check here, because with translation
     /// off every address is already its own.
     mmu_on: bool,
+    /// The same for the 68040's unit: a part with it, and `TC`'s **E** bit
+    /// set. The two are never both true — a core is one model.
+    mmu040_on: bool,
+    /// Whether the fault in progress came from the memory management unit
+    /// rather than from the address space refusing the cycle — the 68040's
+    /// `ATC` bit in the special status word (M68040UM §8.4.6.2).
+    atc_fault: bool,
+    /// Whether the fault in progress was a `MOVES` through `SFC` or `DFC`,
+    /// which the 68040 reports as an *alternate logical* transfer type.
+    fault_alternate: bool,
     /// Slides an instruction deferred past its operand write.
     ///
     /// `MOVE <ea>,(xxx).L` performs its write *before* the last instruction
@@ -580,6 +597,7 @@ impl<'a> Exec<'a> {
     ) -> Exec<'a> {
         let model = state.model;
         let state_enables_mmu = state.mmu.enabled();
+        let state_enables_mmu040 = state.mmu040.enabled();
         Exec {
             state,
             space,
@@ -605,6 +623,9 @@ impl<'a> Exec<'a> {
                 Copro::NONE
             },
             mmu_on: model.has_mmu() && state_enables_mmu,
+            mmu040_on: model.has_mmu_040() && state_enables_mmu040,
+            atc_fault: false,
+            fault_alternate: false,
             deferred_slides: 0,
         }
     }
@@ -1048,6 +1069,11 @@ impl<'a> Exec<'a> {
     fn bus_fault(&mut self, addr: u32, read: bool, fc: u8, width: u8, data: u32) -> Trap {
         self.state.faults = self.state.faults.wrapping_add(1);
         self.state.last_fault = addr;
+        // Captured here rather than read back when the frame is built: a
+        // `MOVES` clears its function-code override before the trap has
+        // propagated out of it, and the 68040's special status word needs to
+        // know which kind of access this was (M68040UM Table 3-2).
+        self.fault_alternate = self.fc_override.is_some();
         Trap::Bus {
             addr,
             read,
@@ -1228,6 +1254,11 @@ impl<'a> Exec<'a> {
         // it itself before turning translation back on.
         self.state.mmu.reset_pin();
         self.mmu_on = false;
+        // The 68040's unit says the same in its own words, and adds that
+        // `TC`'s **P** bit — the page size — is *not* affected and "must be
+        // initialized after a reset" (M68040UM §3.1.2, §3.6.1).
+        self.state.mmu040.reset_pin();
+        self.mmu040_on = false;
         // "A reset function ... sets FP0-FP7 to positive non-signaling
         // not-a-numbers" and clears FPCR, FPSR and FPIAR (M68881UM §2.1,
         // §2.2, §2.4).
@@ -1535,6 +1566,10 @@ impl<'a> Exec<'a> {
         let program = fc & 3 == 2;
         let sr = self.state.sr;
         let undo = self.undo_list();
+        if self.model.has_040() {
+            self.fault_040(vector, addr, read, fc, width, sr, &undo);
+            return;
+        }
         if self.model == Model::M68010 {
             // Format $8, twenty-nine words, twenty-six of them written: the
             // three marked "unused, reserved" are skipped, and the note under
@@ -1640,6 +1675,118 @@ impl<'a> Exec<'a> {
         image.push_undo(&undo, 6); // +$38..+$5B
         let pc0 = self.pc0;
         self.enter_exception(vector, pc0, sr, Frame::Format(image));
+    }
+
+    /// A bus or address error on a 68040 (M68040UM §8.2.1, §8.2.2, §8.4.6).
+    ///
+    /// # Two frames, not one
+    ///
+    /// The 68040 splits what the 68020 put in formats `$A` and `$B`:
+    ///
+    /// - An **address error** — "the processor attempts to prefetch an
+    ///   instruction from an odd address" (§8.2.2) — takes a **format `$2`**
+    ///   frame carrying the instruction's address in the `PC` field and the
+    ///   referenced address, with bit 0 cleared, in the address field.
+    /// - Everything else takes the **format `$7`** access error frame, thirty
+    ///   words, laid out in §8.4.6 and written here field by field.
+    ///
+    /// # No pending write-backs, and why that is a legal frame
+    ///
+    /// The 68040's frame exists to let a handler finish what the pipeline had
+    /// half-done: up to three write-backs, plus a cache line to push. This
+    /// interpreter has neither a write-back pipeline nor a cache, so there is
+    /// never anything pending, and all three write-back status bytes are
+    /// written **invalid** (`V = 0`). That is not an evasion — it is the
+    /// first row of M68040UM Table 8-6, "All Read Access Errors ... WB1S 0,
+    /// WB2S 0, WB3S 0, Easy Cleanup: None", and a conforming handler that
+    /// checks the `V` bits does nothing and returns.
+    ///
+    /// `RTE` then **restarts the instruction**, which is the same bargain
+    /// this core already makes on the 68010 and the 68020, and is what
+    /// §8.2.1 describes anyway: "The saved PC value is the logical address of
+    /// the instruction executing at the time the fault was detected". The
+    /// registers the partly executed instruction had stepped are put back
+    /// from the frame's unused write-back fields, which a handler ignores
+    /// because the status bytes say they are invalid.
+    #[allow(clippy::too_many_arguments)]
+    fn fault_040(
+        &mut self,
+        vector: u8,
+        addr: u32,
+        read: bool,
+        fc: u8,
+        width: u8,
+        sr: u16,
+        undo: &UndoList,
+    ) {
+        if vector == vector::ADDRESS_ERROR {
+            // Format $2: "the address of the instruction that caused the
+            // address error as well as the actual address referenced ... bit
+            // 0 of the referenced address is cleared" (§8.2.2, §8.4.3).
+            let referenced = addr & !1;
+            let mut image = FrameImage::new(2);
+            image.push((referenced >> 16) as u16);
+            image.push(referenced as u16);
+            let pc0 = self.pc0;
+            self.enter_exception(vector, pc0, sr, Frame::Format(image));
+            return;
+        }
+        let ssw = self.ssw_040(read, fc, width);
+        let mut image = FrameImage::new(7);
+        // +$08 effective address. Only meaningful when one of the four
+        // continuation flags is set in the SSW, and none ever is here: this
+        // core takes a floating-point post-instruction, unimplemented or
+        // trace exception at the instruction boundary, never stacked behind
+        // an access error (§8.4.6.1).
+        image.push(0);
+        image.push(0);
+        image.push(ssw); // +$0C special status word
+        image.push(0); // +$0E write-back 3 status: $00, then V=0
+        image.push(0); // +$10 write-back 2 status
+        image.push(0); // +$12 write-back 1 status
+        image.push((addr >> 16) as u16); // +$14 fault address
+        image.push(addr as u16);
+        // +$18 .. +$3B: three write-back address/data pairs and four long
+        // words of push data, all ignored because the status bytes above say
+        // the write-backs are invalid and the SSW says this was not a push.
+        // The register undo list this core's `RTE` needs goes here, in the
+        // same spirit as the 68010's and 68020's "internal" words.
+        image.push_undo(undo, 6); // +$18..+$3B, six slots of three words
+        let pc0 = self.pc0;
+        self.enter_exception(vector, pc0, sr, Frame::Format(image));
+    }
+
+    /// The 68040's special status word (M68040UM Figure 8-7).
+    ///
+    /// `CP`, `CU`, `CT` and `CM` are the four continuation flags and are
+    /// always clear here (see [`Exec::fault_040`]). `MA` is for the second
+    /// page of an access that spans two, which this core never reports
+    /// separately. `ATC` distinguishes a translation failure from a physical
+    /// bus error, and the caller says which through `fc`'s companion — see
+    /// [`Exec::atc_fault`].
+    fn ssw_040(&self, read: bool, fc: u8, width: u8) -> u16 {
+        let size = match width {
+            1 => 0b01,
+            2 => 0b10,
+            16 => 0b11, // a line, which only `MOVE16` and a push produce
+            _ => 0b00,
+        };
+        let (tt, tm) = ssw_transfer(fc, self.fault_alternate);
+        (u16::from(self.atc_fault) << 10)
+            | (u16::from(self.locked_transfer()) << 9)
+            | (u16::from(read) << 8)
+            | (size << 5)
+            | (u16::from(tt) << 3)
+            | u16::from(tm)
+    }
+
+    /// Whether the faulted access was part of a read-modify-write, which the
+    /// 68040's `LK` bit reports (M68040UM §8.4.6.2).
+    fn locked_transfer(&self) -> bool {
+        matches!(
+            decode_for(self.model, self.opcode).op,
+            Op::Tas | Op::Cas | Op::Cas2
+        )
     }
 
     /// The address registers and stack pointers the faulting instruction has
@@ -1792,6 +1939,9 @@ impl<'a> Exec<'a> {
     /// reaches it: format $A, "at instruction boundary", both pipe stages to
     /// be rerun (MC68020UM §6.2.1).
     fn fault_at_boundary(&mut self, addr: u32) {
+        if self.model.has_040() {
+            return self.fault_at_boundary_040(addr);
+        }
         let mut image = FrameImage::new(0xa);
         image.push(0); // +$08 internal register
         image.push(SSW_FC | SSW_RC | SSW_RB); // +$0A
@@ -1807,6 +1957,48 @@ impl<'a> Exec<'a> {
         let sr = self.state.sr;
         self.enter_exception(vector::BUS_ERROR, pc, sr, Frame::Format(image));
     }
+
+    /// The same, on a 68040: format `$7` with the instruction's own
+    /// transfer modifier (M68040UM §8.2.1, §8.4.6).
+    ///
+    /// "Bus errors that occur during instruction prefetches are deferred
+    /// until the processor attempts to use the information", and when the
+    /// exception does arrive "the stacked PC points to the exceptional
+    /// instruction, and the stacked FA points to the first longword in the
+    /// missing page" (§3.5). "Since the processor allows all pending
+    /// accesses to complete before reporting an instruction fault, the stack
+    /// frame for an instruction fault will not contain any pending
+    /// write-backs" — which is the frame this core builds for every fault
+    /// anyway.
+    fn fault_at_boundary_040(&mut self, addr: u32) {
+        let fc = self.program_fc();
+        let (tt, tm) = ssw_transfer(fc, false);
+        // Read, word wide: this core fetches instructions sixteen bits at a
+        // time on every model, where a 68040 fetches a long word or a line.
+        // That is the dynamic-bus-sizing approximation the 68020 notes in
+        // the ledger already, showing through into the frame.
+        let ssw = (u16::from(self.atc_fault) << 10)
+            | (1 << 8)
+            | (0b10 << 5)
+            | (u16::from(tt) << 3)
+            | u16::from(tm);
+        let mut image = FrameImage::new(7);
+        image.push(0); // +$08 effective address: no continuation pending
+        image.push(0);
+        image.push(ssw); // +$0C
+        image.push(0); // +$0E write-back 3 status
+        image.push(0); // +$10 write-back 2 status
+        image.push(0); // +$12 write-back 1 status
+        image.push((addr >> 16) as u16); // +$14 fault address
+        image.push(addr as u16);
+        for _ in 0..18 {
+            image.push(0); // +$18..+$3B write-back and push data
+        }
+        let pc = self.state.pc;
+        let sr = self.state.sr;
+        self.enter_exception(vector::BUS_ERROR, pc, sr, Frame::Format(image));
+    }
+
     /// Execute one decoded instruction.
     ///
     /// `pc0` is the address of the opcode word, which several exceptions push.
@@ -2050,6 +2242,10 @@ impl<'a> Exec<'a> {
             Op::Ftrapcc => self.op_ftrapcc(),
             Op::Fsave => self.op_fsave(),
             Op::Frestore => self.op_frestore(),
+            Op::Move16 => self.op_move16(),
+            Op::Cinvl | Op::Cinvp | Op::Cinva | Op::Cpushl | Op::Cpushp | Op::Cpusha => {
+                self.op_cache()
+            }
         }
     }
 
@@ -3684,6 +3880,27 @@ impl<'a> Exec<'a> {
                 ctrl::CACR => self.state.cacr = value & self.state.cacr_mask(),
                 ctrl::CAAR => self.state.caar = value,
                 ctrl::MSP => self.state.set_sp(Bank::Master, value),
+                // The 68040's memory management registers. "The operating
+                // system must flush the ATCs before enabling address
+                // translation since the TCR accesses and reset do not flush
+                // the ATCs" (M68040UM §3.1.2) — so, unlike the 68030's
+                // `PMOVE`, none of these touches the cache.
+                ctrl::TC => {
+                    self.state.mmu040.tcr = (value as u16) & tcr::IMPLEMENTED;
+                    self.mmu040_on = self.state.mmu040.enabled();
+                }
+                // "Bits 8–0 of an address loaded into the URP or the SRP must
+                // be zero" (§3.1.1). The manual states it as a requirement on
+                // software rather than as a register with nine dead bits, and
+                // gives no exception for breaking it; the bits are dropped,
+                // which is what a register drawn with nine zeros does.
+                ctrl::URP => self.state.mmu040.urp = value & !0x1ff,
+                ctrl::SRP => self.state.mmu040.srp = value & !0x1ff,
+                ctrl::ITT0 => self.state.mmu040.itt[0] = value & ttr::IMPLEMENTED,
+                ctrl::ITT1 => self.state.mmu040.itt[1] = value & ttr::IMPLEMENTED,
+                ctrl::DTT0 => self.state.mmu040.dtt[0] = value & ttr::IMPLEMENTED,
+                ctrl::DTT1 => self.state.mmu040.dtt[1] = value & ttr::IMPLEMENTED,
+                ctrl::MMUSR => self.state.mmu040.mmusr = value & mmusr040::IMPLEMENTED,
                 _ => self.state.set_sp(Bank::Interrupt, value),
             }
             // 10(2/0) against the ext word and the prefetch (MC68000UM Table
@@ -3698,12 +3915,131 @@ impl<'a> Exec<'a> {
                 ctrl::CACR => self.state.cacr,
                 ctrl::CAAR => self.state.caar,
                 ctrl::MSP => self.state.sp(Bank::Master),
+                ctrl::TC => u32::from(self.state.mmu040.tcr),
+                ctrl::URP => self.state.mmu040.urp,
+                ctrl::SRP => self.state.mmu040.srp,
+                ctrl::ITT0 => self.state.mmu040.itt[0],
+                ctrl::ITT1 => self.state.mmu040.itt[1],
+                ctrl::DTT0 => self.state.mmu040.dtt[0],
+                ctrl::DTT1 => self.state.mmu040.dtt[1],
+                ctrl::MMUSR => self.state.mmu040.mmusr,
                 _ => self.state.sp(Bank::Interrupt),
             };
             self.set_register(u32::from(word >> 12), value);
             // 12(2/0), "Source → Register".
             self.internal(4);
         }
+        self.settle()
+    }
+
+    // ------------------------------------------------------------------
+    // The 68040's own instructions
+    // ------------------------------------------------------------------
+
+    /// `MOVE16`: copy one aligned sixteen-byte line (M68000PRM §4,
+    /// *MOVE16*).
+    ///
+    /// # What the manual settles and what it leaves to the bus
+    ///
+    /// Both addresses are used with their low four bits ignored — "the lines
+    /// are aligned to 16-byte boundaries" — and the worked example is
+    /// explicit that `A0 = $1400F` reads the line at `$14000`. An address
+    /// register used in the postincrement mode steps by **16 from the value
+    /// it held**, so that example leaves `$1401F` behind, not `$14010`.
+    ///
+    /// On hardware the transfer is a burst that starts at the long word the
+    /// effective address actually names and wraps within the line. This core
+    /// has no burst: it reads the four long words in ascending order from the
+    /// aligned base and writes them the same way. The sixteen bytes that end
+    /// up at the destination are the same either way; the order they cross
+    /// the bus in is not, and that is in the ledger.
+    ///
+    /// The postincrement-to-postincrement form with one register named twice
+    /// increments it **once** and "the line is copied over itself rather than
+    /// to the next line" (M68040UM Table 1-4, note 7).
+    fn op_move16(&mut self) -> Result<(), Trap> {
+        let opcode = self.opcode;
+        let (src, dst, steps): (u32, u32, [Option<(usize, u32)>; 2]) = if opcode & 0x20 != 0 {
+            // `MOVE16 (Ax)+,(Ay)+`: a second opcode word names the
+            // destination register in bits 14-12.
+            let word = self.ext(0)?;
+            let x = reg_lo(opcode);
+            let y = ((word >> 12) & 7) as usize;
+            let src = self.state.a[x];
+            let dst = self.state.a[y];
+            // Wrapping: an address register that steps off the top of the
+            // address space wraps, like every other postincrement.
+            let steps = if x == y {
+                [Some((x, src.wrapping_add(16))), None]
+            } else {
+                [
+                    Some((x, src.wrapping_add(16))),
+                    Some((y, dst.wrapping_add(16))),
+                ]
+            };
+            (src, dst, steps)
+        } else {
+            // The absolute form: bits 4-3 say which side is `(xxx).L`, and
+            // whether the register side postincrements.
+            let hi = self.ext(0)?;
+            let lo = self.ext(0)?;
+            let absolute = (u32::from(hi) << 16) | u32::from(lo);
+            let y = reg_lo(opcode);
+            let reg = self.state.a[y];
+            let post = matches!((opcode >> 3) & 3, 0 | 1);
+            let step = post.then(|| (y, reg.wrapping_add(16)));
+            match (opcode >> 3) & 3 {
+                0 | 2 => (reg, absolute, [step, None]),
+                _ => (absolute, reg, [step, None]),
+            }
+        };
+        let src = src & !0xf;
+        let dst = dst & !0xf;
+        let mut line = [0u32; 4];
+        for (i, word) in line.iter_mut().enumerate() {
+            // Wrapping on the offset: the line is aligned, so `+12` cannot
+            // leave it, but the base itself may sit at the top of the space.
+            *word = self.read_long(src.wrapping_add(i as u32 * 4))?;
+        }
+        for (i, word) in line.into_iter().enumerate() {
+            self.write_long(dst.wrapping_add(i as u32 * 4), word)?;
+        }
+        for (reg, value) in steps.into_iter().flatten() {
+            // `a[7]` is the active bank and `banks` is reconciled when the
+            // status register changes, so writing the array is enough — the
+            // same thing every postincrement mode does.
+            self.state.a[reg] = value;
+        }
+        self.settle()
+    }
+
+    /// `CINV` and `CPUSH` (M68000PRM §6; M68040UM §4.2).
+    ///
+    /// # The cache model, stated rather than implied
+    ///
+    /// This core has no instruction or data cache: every access goes to
+    /// memory, and nothing is ever held. That is a *copyback cache that never
+    /// holds a dirty line*, which is a legal state for the hardware to be in
+    /// and the one these two instructions are defined against:
+    ///
+    /// - `CINV` "invalidates selected cache lines"; there are none, so there
+    ///   is nothing to invalidate. "Any dirty data in data cache lines that
+    ///   invalidate are lost" — there is none to lose.
+    /// - `CPUSH` pushes dirty lines and then invalidates; with no dirty line
+    ///   anywhere, its best case in M68040UM Table 10-4 — "a cache containing
+    ///   no dirty entries" — is what happens, every time.
+    ///
+    /// So both are no-ops that cost time, and the *guest-visible* behaviour
+    /// is right: memory already holds everything a push would have written,
+    /// and a later read already sees everything an invalidate would have
+    /// exposed. What is not modelled is the cache's effect on *timing* and on
+    /// the bus trace, which is the same thing already recorded for the
+    /// 68020's and the 68030's caches.
+    ///
+    /// The address register a line or page operation names is read as a
+    /// **physical** address and makes no bus cycle, so nothing here can
+    /// fault.
+    fn op_cache(&mut self) -> Result<(), Trap> {
         self.settle()
     }
 
@@ -4793,8 +5129,16 @@ impl<'a> Exec<'a> {
                     continue;
                 }
                 (0x2, true) => 12,
-                (0xa, true) => 32,
-                (0xb, true) => return self.rte_long_020(sp, sr, pc),
+                // The 68040's floating-point post-instruction frame, which
+                // carries an effective address where format $2 carries an
+                // instruction address; `RTE` pops both the same way
+                // (M68040UM §8.4.4).
+                (0x3, _) if self.model.has_040() => 12,
+                (0x7, _) if self.model.has_040() => return self.rte_access_040(sp, sr, pc),
+                // Formats $A and $B are the 68020's and the 68030's; a 68040
+                // does not recognise either (M68040UM §8.4).
+                (0xa, true) if !self.model.has_040() => 32,
+                (0xb, true) if !self.model.has_040() => return self.rte_long_020(sp, sr, pc),
                 // Format $9 is the coprocessor mid-instruction frame. With no
                 // coprocessor on the bus there is nothing to resume the
                 // instruction with, so it is treated as a format this
@@ -4888,6 +5232,42 @@ impl<'a> Exec<'a> {
                 data,
             });
         }
+        self.refill(pc, 0)
+    }
+
+    /// `RTE` from a 68040 format `$7` access error frame (M68040UM §8.4.6.7).
+    ///
+    /// "The processor restores the SR and PC values from the stack and checks
+    /// the four continuation status bits in the SSW on the stack. If these
+    /// bits are not set, the processor increments the active supervisor stack
+    /// pointer by 30 words and resumes normal instruction execution."
+    ///
+    /// This core never sets a continuation bit, and a handler that sets one
+    /// is documented to leave the processor undefined ("If the access error
+    /// exception handler sets multiple bits, operation of the RTE instruction
+    /// is undefined") — so the continuation cases are a format error here
+    /// rather than a guess. What it does do is put back the address
+    /// registers the faulted instruction had stepped, from the write-back
+    /// fields the invalid status bytes told the handler to ignore, and
+    /// restart the instruction the `PC` field names.
+    ///
+    /// The whole frame is touched before the stack pointer moves, so a frame
+    /// that is not fully readable faults with the stack intact — "if a format
+    /// error or access fault exception occurs during the frame validation
+    /// sequence of the RTE instruction ... the illegal stack frame remains
+    /// intact".
+    fn rte_access_040(&mut self, sp: u32, sr: u16, pc: u32) -> Result<(), Trap> {
+        let pc0 = self.pc0;
+        let ssw = self.read_word(sp.wrapping_add(0x0c))?;
+        // The last word of the frame, for accessibility.
+        self.read_word(sp.wrapping_add(0x3a))?;
+        if ssw & SSW_040_CONTINUE != 0 {
+            return Err(Trap::raised(vector::FORMAT_ERROR, pc0));
+        }
+        let undo = self.read_undo(sp.wrapping_add(0x18), 6)?;
+        self.state.a[7] = sp.wrapping_add(60);
+        self.state.set_sr(sr);
+        self.apply_undo(&undo);
         self.refill(pc, 0)
     }
 
@@ -5656,6 +6036,41 @@ pub(super) const VERSION_68010: u16 = 0x1;
 /// `SP + $36` (MC68020UM §6.1.12).
 pub(super) const VERSION_68020: u16 = 0x1;
 
+/// The 68040 special status word's `TT` and `TM` fields, from a function
+/// code (M68040UM Tables 3-2, 5-2 and 5-3).
+///
+/// Two things happen here that a 68020's `FC2`–`FC0` field does not do.
+///
+/// First, "the integer unit translates `MOVES` accesses to instruction
+/// address spaces (SFC/DFC = $6 or $2) into data references (SFC/DFC = $5 or
+/// $1) ... the resulting access error stack frame contains the **converted**
+/// function code in the TM field" (§3.2.5). So a `MOVES` to program space
+/// reports as a data access.
+///
+/// Second, the function codes that are not one of the four ordinary ones —
+/// `$0`, `$3`, `$4` and `$7` — are *alternate logical* accesses, `TT = 10`,
+/// and carry the function code itself in `TM`. Only `MOVES` can produce one,
+/// which is why `alternate` is the caller's "this access came from an
+/// `SFC`/`DFC` override" rather than a property of `fc` alone.
+const fn ssw_transfer(fc: u8, alternate: bool) -> (u8, u8) {
+    if !alternate {
+        // An ordinary access drives its own function code: Table 5-3 is the
+        // function code numbering, so user code stays `$2` and supervisor
+        // code stays `$6`. §8.4.6 leans on exactly that — "for user and
+        // supervisor instruction faults, the TM field contains $2 and $6".
+        return (0b00, fc & 7);
+    }
+    match fc & 7 {
+        // Table 3-2's four ordinary rows, with program space folded onto
+        // data because the data memory unit is what carries the access.
+        1 | 2 => (0b00, 0b001),
+        5 | 6 => (0b00, 0b101),
+        // The other four are alternate accesses, and only reachable through
+        // an `SFC`/`DFC` that names one.
+        other => (0b10, other),
+    }
+}
+
 /// 68020 special status word bits (MC68020UM Figure 6-8).
 const SSW_FC: u16 = 0x8000;
 /// Fault on pipe stage B.
@@ -5666,6 +6081,10 @@ const SSW_RC: u16 = 0x2000;
 const SSW_RB: u16 = 0x1000;
 /// Data fault: rerun the data cycle.
 const SSW_DF: u16 = 0x0100;
+
+/// The 68040 special status word's four continuation flags: `CP`, `CU`, `CT`
+/// and `CM`, bits 15–12 (M68040UM Figure 8-7).
+const SSW_040_CONTINUE: u16 = 0xf000;
 
 /// What one floating-point operation produced.
 struct FpResult {
@@ -5726,6 +6145,12 @@ const CACR_STORED_020: u32 = 0x0003;
 /// storage, and the four clear bits — **CEI** (2), **CI** (3), **CED** (10)
 /// and **CD** (11) — do not (MC68030UM §6.3.1, Figure 6-14).
 const CACR_STORED_030: u32 = 0x3313;
+
+/// The 68040's: two enable bits and nothing else. **DE** is bit 31 and **IE**
+/// is bit 15; everything between and below them is drawn "UNDEFINED"
+/// (M68040UM Figure 4-4). The 68020's and 68030's clear-the-cache bits are
+/// gone — `CINV` and `CPUSH` do that job, and they are instructions.
+const CACR_STORED_040: u32 = 0x8000_8000;
 
 /// How many throwaway frames one `RTE` follows before calling the stack
 /// corrupt. See `op_rte_formatted`.

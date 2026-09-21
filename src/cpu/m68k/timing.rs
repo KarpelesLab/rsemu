@@ -616,6 +616,23 @@ pub(super) fn instruction(insn: Insn, opcode: u16, size: Size, f: &Facts) -> u32
         Op::Trapv => 4,
         Op::Bkpt => 10,
         Op::Trap | Op::Illegal | Op::LineA | Op::LineF => 0,
+        // The 68040's own instructions, and the one place this file charges
+        // an M68040UM number rather than an MC68020UM one — there is no
+        // 68020 row to borrow, because there is no 68020 instruction.
+        //
+        // `MOVE16` is eight long-word bus cycles here rather than the two
+        // bursts hardware makes; M68040UM §10 gives no row for it at all, so
+        // what is charged is the accesses this core actually drives, counted
+        // where they happen, plus nothing.
+        Op::Move16 => 0,
+        // M68040UM Tables 10-3 and 10-4, with `Idle` zero — nothing is
+        // pending, because this core has no write-back pipeline — and the
+        // CPUSH *best* case, which is the manual's "cache containing no dirty
+        // entries" and is the only state this core's cache is ever in.
+        Op::Cinvl | Op::Cinva => 9,
+        Op::Cinvp => 266,
+        Op::Cpushl => 6,
+        Op::Cpushp | Op::Cpusha => 267,
     }
 }
 

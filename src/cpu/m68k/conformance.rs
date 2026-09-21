@@ -1166,13 +1166,24 @@ fn explain(
         // Each frame runs from its stack pointer up by its own size: the
         // 68000's six or fourteen bytes, and the later model's by format
         // (MC68000UM Figs. 6-6, 6-8; MC68020UM Table 6-5).
-        let other_size = match (model.has_020(), a) {
-            (false, 0..=3) => 58,
-            (false, _) => 8,
-            (true, 2) => 92,
-            (true, 3) => 32,
-            (true, 5..=7 | 9) => 12,
-            (true, _) => 8,
+        let other_size = if model.has_040() {
+            // M68040UM §8.4: format $7 for an access fault, format $2 for
+            // an address error and for the six-word group, format $0 for
+            // the rest.
+            match a {
+                2 => 60,
+                3 | 5..=7 | 9 => 12,
+                _ => 8,
+            }
+        } else {
+            match (model.has_020(), a) {
+                (false, 0..=3) => 58,
+                (false, _) => 8,
+                (true, 2) => 92,
+                (true, 3) => 32,
+                (true, 5..=7 | 9) => 12,
+                (true, _) => 8,
+            }
         };
         let low = r_sp.min(o_sp);
         let high = r_sp
@@ -1365,7 +1376,7 @@ fn differential_against_the_68000() {
         .collect();
     names.sort();
     let mut failed = Vec::new();
-    for model in [Model::M68010, Model::M68EC020, Model::M68030] {
+    for model in [Model::M68010, Model::M68EC020, Model::M68030, Model::M68040] {
         let mut out = Differential::default();
         for name in &names {
             if let Some(only) = &only

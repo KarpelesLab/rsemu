@@ -319,6 +319,7 @@ mod exec;
 mod fpu;
 pub mod isa;
 mod mmu;
+mod mmu040;
 mod timing;
 mod transcend;
 
@@ -330,6 +331,8 @@ mod tests_68010;
 mod tests_68020;
 #[cfg(test)]
 mod tests_68030;
+#[cfg(test)]
+mod tests_68040;
 #[cfg(test)]
 mod tests_fpu;
 #[cfg(test)]
@@ -375,13 +378,16 @@ const FPU_NAMES: [&str; 3] = [
 ];
 
 /// The values the `model` property accepts, in [`Model::ALL`] order.
-const MODEL_NAMES: [&str; 6] = [
+const MODEL_NAMES: [&str; 9] = [
     Model::M68000.name(),
     Model::M68010.name(),
     Model::M68020.name(),
     Model::M68EC020.name(),
     Model::M68030.name(),
     Model::M68EC030.name(),
+    Model::M68040.name(),
+    Model::M68LC040.name(),
+    Model::M68EC040.name(),
 ];
 
 /// The 24 address pins.
@@ -546,17 +552,35 @@ pub struct Regs {
     pub cacr: u32,
     /// The 68020's cache address register.
     pub caar: u32,
-    /// The 68030's translation control register.
+    /// The translation control register: thirty-two bits on a 68030
+    /// (MC68030UM Figure 9-36), sixteen on a 68040, where only **E** and
+    /// **P** exist and the rest read as zero (M68040UM Figure 3-4).
     pub tc: u32,
-    /// The 68030's CPU root pointer, all sixty-four bits.
+    /// The 68030's CPU root pointer, all sixty-four bits. The 68040's
+    /// user-mode root pointer is [`Regs::urp`], which is a plain address.
     pub crp: u64,
-    /// The 68030's supervisor root pointer.
+    /// The supervisor root pointer: a 64-bit descriptor on a 68030, and on a
+    /// 68040 a 32-bit address in the low half (M68040UM Figure 3-3).
     pub srp: u64,
+    /// The 68040's user root pointer, the translation table root for user
+    /// accesses (M68040UM §3.1.1). Bits 8–0 must be zero.
+    pub urp: u32,
     /// The 68030's transparent translation registers, `TT0` then `TT1` —
     /// `AC0` and `AC1` on an MC68EC030.
     pub tt: [u32; 2],
-    /// The 68030's MMU status register — `ACUSR` on an MC68EC030.
-    pub mmusr: u16,
+    /// The 68040's *instruction* transparent translation registers, `ITT0`
+    /// then `ITT1` — `IACR0`/`IACR1` on an MC68EC040. A different layout from
+    /// the 68030's (M68040UM Figure 3-5).
+    pub itt: [u32; 2],
+    /// The 68040's *data* transparent translation registers, `DTT0` then
+    /// `DTT1` — `DACR0`/`DACR1` on an MC68EC040.
+    pub dtt: [u32; 2],
+    /// The MMU status register — `ACUSR` on an MC68EC030.
+    ///
+    /// Sixteen bits on a 68030, where the top half is always zero, and
+    /// thirty-two on a 68040, where the top twenty carry a physical address
+    /// (M68040UM Figure 3-6).
+    pub mmusr: u32,
     /// The coprocessor's eight floating-point data registers, always in the
     /// extended format.
     ///
@@ -665,6 +689,21 @@ pub enum Reg {
     Tt0,
     /// Transparent translation register 1 — `AC1`.
     Tt1,
+    /// The 68040's instruction transparent translation register 0 — `IACR0`
+    /// on an MC68EC040.
+    Itt0,
+    /// The 68040's instruction transparent translation register 1 — `IACR1`.
+    Itt1,
+    /// The 68040's data transparent translation register 0 — `DACR0` on an
+    /// MC68EC040.
+    Dtt0,
+    /// The 68040's data transparent translation register 1 — `DACR1`.
+    Dtt1,
+    /// The 68040's user root pointer.
+    Urp,
+    /// The 68040's supervisor root pointer, which unlike the 68030's is a
+    /// plain 32-bit address.
+    Srp,
     /// The MMU status register — `ACUSR` on an MC68EC030.
     Mmusr,
     /// The high half of the CPU root pointer: **L/U**, **LIMIT** and **DT**.
@@ -731,6 +770,14 @@ impl Reg {
     /// registers.
     pub const M68030: &'static [Reg] = &[Reg::Tc, Reg::CrpHi, Reg::CrpLo, Reg::SrpHi, Reg::SrpLo];
 
+    /// Every 68040 package's additions to the 68020's: the four transparent
+    /// translation registers, which on an MC68EC040 are the access control
+    /// registers and are all it has (M68040UM Appendix B).
+    pub const M68EC040: &'static [Reg] = &[Reg::Itt0, Reg::Itt1, Reg::Dtt0, Reg::Dtt1];
+
+    /// What the parts with the 68040's paged unit add to those.
+    pub const M68040: &'static [Reg] = &[Reg::Tc, Reg::Urp, Reg::Srp, Reg::Mmusr];
+
     /// Every register `model` has, in the order a debugger should list them.
     #[must_use]
     pub fn all_for(model: Model) -> Vec<Reg> {
@@ -740,12 +787,23 @@ impl Reg {
         }
         if model.has_020() {
             out.extend_from_slice(Reg::M68020);
+            if model.has_040() {
+                // The 68040 has no cache address register (M68000PRM §6,
+                // *MOVEC*: `$802` is "for the MC68020 and MC68030 only").
+                out.retain(|reg| *reg != Reg::Caar);
+            }
         }
         if model.has_030() {
             out.extend_from_slice(Reg::M68EC030);
         }
         if model.has_mmu() {
             out.extend_from_slice(Reg::M68030);
+        }
+        if model.has_040() {
+            out.extend_from_slice(Reg::M68EC040);
+        }
+        if model.has_mmu_040() {
+            out.extend_from_slice(Reg::M68040);
         }
         out
     }
@@ -766,9 +824,12 @@ impl Reg {
 
     /// How wide the register is.
     #[must_use]
+    /// The 68030's `MMUSR` is sixteen bits and the 68040's is thirty-two
+    /// (MC68030UM Figure 9-38; M68040UM Figure 3-6). One name, so one width:
+    /// the wider, whose top half is always zero on the narrower part.
     pub const fn width(self) -> Width {
         match self {
-            Reg::Sr | Reg::Mmusr => Width::U16,
+            Reg::Sr => Width::U16,
             Reg::Sfc | Reg::Dfc => Width::U8,
             _ => Width::U32,
         }
@@ -793,7 +854,13 @@ impl Reg {
             Reg::Tc => regs.tc,
             Reg::Tt0 => regs.tt[0],
             Reg::Tt1 => regs.tt[1],
-            Reg::Mmusr => regs.mmusr as u32,
+            Reg::Itt0 => regs.itt[0],
+            Reg::Itt1 => regs.itt[1],
+            Reg::Dtt0 => regs.dtt[0],
+            Reg::Dtt1 => regs.dtt[1],
+            Reg::Urp => regs.urp,
+            Reg::Srp => regs.srp as u32,
+            Reg::Mmusr => regs.mmusr,
             Reg::CrpHi => (regs.crp >> 32) as u32,
             Reg::CrpLo => regs.crp as u32,
             Reg::SrpHi => (regs.srp >> 32) as u32,
@@ -853,7 +920,13 @@ impl Reg {
             Reg::Tc => regs.tc = value,
             Reg::Tt0 => regs.tt[0] = value,
             Reg::Tt1 => regs.tt[1] = value,
-            Reg::Mmusr => regs.mmusr = value as u16,
+            Reg::Itt0 => regs.itt[0] = value,
+            Reg::Itt1 => regs.itt[1] = value,
+            Reg::Dtt0 => regs.dtt[0] = value,
+            Reg::Dtt1 => regs.dtt[1] = value,
+            Reg::Urp => regs.urp = value,
+            Reg::Srp => regs.srp = (regs.srp & 0xffff_ffff_0000_0000) | value as u64,
+            Reg::Mmusr => regs.mmusr = value,
             Reg::CrpHi => regs.crp = (regs.crp & 0xffff_ffff) | ((value as u64) << 32),
             Reg::CrpLo => regs.crp = (regs.crp & 0xffff_ffff_0000_0000) | value as u64,
             Reg::SrpHi => regs.srp = (regs.srp & 0xffff_ffff) | ((value as u64) << 32),
@@ -889,6 +962,12 @@ impl Reg {
                 "tc" => Some(Reg::Tc),
                 "tt0" | "ac0" => Some(Reg::Tt0),
                 "tt1" | "ac1" => Some(Reg::Tt1),
+                "itt0" | "iacr0" => Some(Reg::Itt0),
+                "itt1" | "iacr1" => Some(Reg::Itt1),
+                "dtt0" | "dacr0" => Some(Reg::Dtt0),
+                "dtt1" | "dacr1" => Some(Reg::Dtt1),
+                "urp" => Some(Reg::Urp),
+                "srp" => Some(Reg::Srp),
                 "mmusr" | "acusr" => Some(Reg::Mmusr),
                 "crph" => Some(Reg::CrpHi),
                 "crpl" => Some(Reg::CrpLo),
@@ -921,6 +1000,12 @@ impl fmt::Display for Reg {
             Reg::Tc => f.write_str("tc"),
             Reg::Tt0 => f.write_str("tt0"),
             Reg::Tt1 => f.write_str("tt1"),
+            Reg::Itt0 => f.write_str("itt0"),
+            Reg::Itt1 => f.write_str("itt1"),
+            Reg::Dtt0 => f.write_str("dtt0"),
+            Reg::Dtt1 => f.write_str("dtt1"),
+            Reg::Urp => f.write_str("urp"),
+            Reg::Srp => f.write_str("srp"),
             Reg::Mmusr => f.write_str("mmusr"),
             Reg::CrpHi => f.write_str("crph"),
             Reg::CrpLo => f.write_str("crpl"),
@@ -976,6 +1061,16 @@ impl Config {
 
     /// An MC68EC030: a 68030 with no paged memory management unit.
     pub const MC68EC030: Config = Config::MC68000.with_model(Model::M68EC030);
+
+    /// An MC68040.
+    pub const MC68040: Config = Config::MC68000.with_model(Model::M68040);
+
+    /// An MC68LC040: a 68040 with no floating-point unit.
+    pub const MC68LC040: Config = Config::MC68000.with_model(Model::M68LC040);
+
+    /// An MC68EC040: a 68040 with neither a floating-point unit nor a paged
+    /// memory management unit.
+    pub const MC68EC040: Config = Config::MC68000.with_model(Model::M68EC040);
 
     /// Same configuration, with a different requester id.
     #[must_use]
@@ -1276,11 +1371,15 @@ impl M68k {
         // wired to a 68000 as an ordinary peripheral, but then it is not a
         // coprocessor and its instructions do not exist.
         if fpu.present() && !model.has_coprocessor_interface() {
+            let why = if model.has_040() {
+                "the 68040 dropped it and answers the F line itself"
+            } else {
+                "the F-line interface starts at the 68020"
+            };
             return Err(Error::Config {
                 at: String::from("cpu.m68k"),
                 message: alloc::format!(
-                    "a {fpu} is a coprocessor and a {model} has no coprocessor interface; \
-                     the F-line interface starts at the 68020"
+                    "a {fpu} is a coprocessor and a {model} has no coprocessor interface; {why}"
                 ),
             });
         }
@@ -1351,11 +1450,31 @@ impl M68k {
             dfc: state.dfc,
             cacr: state.cacr,
             caar: state.caar,
-            tc: state.mmu.tc,
+            // Three names are shared between the two memory management
+            // units because the registers are: `TC`, `SRP` and `MMUSR` exist
+            // on both parts, with different widths and completely different
+            // layouts. A core is one model, so only one of the two can ever
+            // have written them.
+            tc: if state.model.has_040() {
+                u32::from(state.mmu040.tcr)
+            } else {
+                state.mmu.tc
+            },
             crp: state.mmu.crp,
-            srp: state.mmu.srp,
+            srp: if state.model.has_040() {
+                u64::from(state.mmu040.srp)
+            } else {
+                state.mmu.srp
+            },
+            urp: state.mmu040.urp,
             tt: state.mmu.tt,
-            mmusr: state.mmu.mmusr,
+            itt: state.mmu040.itt,
+            dtt: state.mmu040.dtt,
+            mmusr: if state.model.has_040() {
+                state.mmu040.mmusr
+            } else {
+                u32::from(state.mmu.mmusr)
+            },
             fp: state.fpu.fp,
             fpcr: state.fpu.fpcr,
             fpsr: state.fpu.fpsr,
@@ -1408,11 +1527,21 @@ impl M68k {
                 state.mmu.flush_all();
             }
             state.mmu.tt = regs.tt;
-            state.mmu.mmusr = regs.mmusr;
+            state.mmu.mmusr = regs.mmusr as u16;
             if self.model.has_mmu() {
                 state.mmu.tc = regs.tc;
                 state.mmu.crp = regs.crp;
                 state.mmu.srp = regs.srp;
+            }
+        }
+        if self.model.has_040() {
+            state.mmu040.itt = regs.itt;
+            state.mmu040.dtt = regs.dtt;
+            if self.model.has_mmu_040() {
+                state.mmu040.tcr = regs.tc as u16;
+                state.mmu040.urp = regs.urp;
+                state.mmu040.srp = regs.srp as u32;
+                state.mmu040.mmusr = regs.mmusr;
             }
         }
         if self.fpu.present() {
@@ -1687,8 +1816,10 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    translation cache is *not* in it — it is derived state, and a
     //    restored core rebuilds it with a table search (CLAUDE.md,
     //    *Devices*).
-    version: 3,
-    summary: "Motorola MC68000/68010/68020/68030 32-bit CPU core, interpreter",
+    // 4: and the 68040's, which are different registers rather than wider
+    //    ones and so take their own chunk.
+    version: 4,
+    summary: "Motorola MC68000/68010/68020/68030/68040 32-bit CPU core, interpreter",
     properties: &[
         PropertySpec {
             name: "requester",
@@ -1707,7 +1838,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "which processor: `68000` (the default), `68010`, `68020`, \
-`68ec020`, `68030` or `68ec030`",
+`68ec020`, `68030`, `68ec030`, `68040`, `68lc040` or `68ec040`",
         },
         PropertySpec {
             name: "fpu",
@@ -1904,14 +2035,31 @@ impl Device for M68k {
             w.write_bool(slot.is_some())?;
             w.write_u32(slot.unwrap_or(0))?;
         }
-        if !self.model.has_030() {
-            return Ok(());
+        // Every 68040 package has the four transparent translation
+        // registers; only the parts with the paged unit have the rest. The
+        // 68030 branch below is skipped on a 68040 — `has_030` is false,
+        // because a 68040 is not a 68030 with extras.
+        if self.model.has_040() {
+            for value in state.mmu040.itt {
+                w.write_u32(value)?;
+            }
+            for value in state.mmu040.dtt {
+                w.write_u32(value)?;
+            }
+            if self.model.has_mmu_040() {
+                w.write_u16(state.mmu040.tcr)?;
+                w.write_u32(state.mmu040.urp)?;
+                w.write_u32(state.mmu040.srp)?;
+                w.write_u32(state.mmu040.mmusr)?;
+            }
         }
         // Both 68030 packages have the transparent translation registers and
         // the status register; only the full part has the paged unit's.
-        w.write_u32(state.mmu.tt[0])?;
-        w.write_u32(state.mmu.tt[1])?;
-        w.write_u16(state.mmu.mmusr)?;
+        if self.model.has_030() {
+            w.write_u32(state.mmu.tt[0])?;
+            w.write_u32(state.mmu.tt[1])?;
+            w.write_u16(state.mmu.mmusr)?;
+        }
         if self.model.has_mmu() {
             w.write_u32(state.mmu.tc)?;
             w.write_u64(state.mmu.crp)?;
@@ -2009,6 +2157,20 @@ impl Device for M68k {
                 let poisoned = r.read_bool()?;
                 let addr = r.read_u32()?;
                 *slot = poisoned.then_some(addr);
+            }
+        }
+        if self.model.has_040() {
+            for slot in &mut state.mmu040.itt {
+                *slot = r.read_u32()? & mmu040::ttr::IMPLEMENTED;
+            }
+            for slot in &mut state.mmu040.dtt {
+                *slot = r.read_u32()? & mmu040::ttr::IMPLEMENTED;
+            }
+            if self.model.has_mmu_040() {
+                state.mmu040.tcr = r.read_u16()? & mmu040::tcr::IMPLEMENTED;
+                state.mmu040.urp = r.read_u32()? & !0x1ff;
+                state.mmu040.srp = r.read_u32()? & !0x1ff;
+                state.mmu040.mmusr = r.read_u32()? & mmu040::mmusr::IMPLEMENTED;
             }
         }
         if self.model.has_030() {

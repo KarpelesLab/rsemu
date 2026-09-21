@@ -100,17 +100,36 @@ pub enum Model {
     /// or `SRP` are unimplemented F-line instructions (MC68EC030UM §9,
     /// Appendix A). The address bus is the 68030's full 32 bits.
     M68EC030,
+    /// The MC68040: the 68030's instruction set less the external
+    /// coprocessor interface, plus `MOVE16`, `CINV`/`CPUSH`, an on-chip
+    /// floating-point unit and a **different** memory management unit — fixed
+    /// 4K/8K pages, a three-level table and its own registers, reached
+    /// through `MOVEC` rather than `PMOVE` (M68040UM §1.1, §3, §4, §9).
+    M68040,
+    /// The MC68LC040: an MC68040 with **no floating-point unit**. Every
+    /// floating-point instruction takes the unimplemented floating-point
+    /// instruction exception, vector 11 (M68040UM Appendix A).
+    M68LC040,
+    /// The MC68EC040: an MC68LC040 with **no paged MMU** either. The four
+    /// transparent translation registers survive as `IACR0`/`IACR1` and
+    /// `DACR0`/`DACR1`, and `TC`, `URP`, `SRP` and `MMUSR` are gone —
+    /// a `MOVEC` naming one is an illegal instruction (M68040UM Appendix B;
+    /// M68000PRM §6, *MOVEC*'s control register table).
+    M68EC040,
 }
 
 impl Model {
     /// Every model, in order of introduction.
-    pub const ALL: [Model; 6] = [
+    pub const ALL: [Model; 9] = [
         Model::M68000,
         Model::M68010,
         Model::M68020,
         Model::M68EC020,
         Model::M68030,
         Model::M68EC030,
+        Model::M68040,
+        Model::M68LC040,
+        Model::M68EC040,
     ];
 
     /// The name the `model` property spells it with.
@@ -123,6 +142,9 @@ impl Model {
             Model::M68EC020 => "68ec020",
             Model::M68030 => "68030",
             Model::M68EC030 => "68ec030",
+            Model::M68040 => "68040",
+            Model::M68LC040 => "68lc040",
+            Model::M68EC040 => "68ec040",
         }
     }
 
@@ -134,16 +156,17 @@ impl Model {
 
     /// Which bits of an address reach the pins.
     ///
-    /// 24 on the 68000, the 68010 and the 68EC020; 32 on the full 68020 and
-    /// on both 68030 packages — the MC68EC030 keeps the whole address bus and
-    /// drops only the MMU (MC68EC030UM §1). Applied to the address *after* it
-    /// is computed in 32 bits, which is where the wrap happens on the real
-    /// part too.
+    /// 24 on the 68000, the 68010 and the 68EC020; 32 on the full 68020, on
+    /// both 68030 packages and on all three 68040 packages — the MC68EC030
+    /// keeps the whole address bus and drops only the MMU (MC68EC030UM §1),
+    /// and so do the MC68LC040 and the MC68EC040 (M68040UM Appendices A and
+    /// B). Applied to the address *after* it is computed in 32 bits, which is
+    /// where the wrap happens on the real part too.
     #[must_use]
     pub const fn address_mask(self) -> u32 {
         match self {
-            Model::M68020 | Model::M68030 | Model::M68EC030 => 0xffff_ffff,
-            _ => 0x00ff_ffff,
+            Model::M68000 | Model::M68010 | Model::M68EC020 => 0x00ff_ffff,
+            _ => 0xffff_ffff,
         }
     }
 
@@ -158,36 +181,73 @@ impl Model {
     #[inline]
     #[must_use]
     pub const fn has_020(self) -> bool {
-        matches!(
-            self,
-            Model::M68020 | Model::M68EC020 | Model::M68030 | Model::M68EC030
-        )
+        !matches!(self, Model::M68000 | Model::M68010)
     }
 
     /// The 68030's architecture: either package.
+    ///
+    /// **False on a 68040**, which is not a superset: the 68030's `PMOVE`,
+    /// `PLOAD` and `PTEST` encodings are gone, and so is the coprocessor
+    /// interface they travel over (M68040UM §1.1).
     #[inline]
     #[must_use]
     pub const fn has_030(self) -> bool {
         matches!(self, Model::M68030 | Model::M68EC030)
     }
 
-    /// Whether this part has the paged memory management unit — the one thing
-    /// the MC68EC030 leaves out (MC68EC030UM §1.1).
+    /// The 68040's architecture: any of its three packages.
+    #[inline]
+    #[must_use]
+    pub const fn has_040(self) -> bool {
+        matches!(self, Model::M68040 | Model::M68LC040 | Model::M68EC040)
+    }
+
+    /// Whether this part has the 68030's paged memory management unit — the
+    /// one thing the MC68EC030 leaves out (MC68EC030UM §1.1).
+    ///
+    /// A 68040 has *a* memory management unit but not *this* one; see
+    /// [`Model::has_mmu_040`].
     #[inline]
     #[must_use]
     pub const fn has_mmu(self) -> bool {
         matches!(self, Model::M68030)
     }
 
-    /// Whether a coprocessor may be attached through the F-line interface,
-    /// which arrived with the 68020 (MC68020UM §7).
+    /// Whether this part has the 68040's memory management unit: the full
+    /// MC68040 and the MC68LC040, but not the MC68EC040, which keeps only the
+    /// four transparent translation registers (M68040UM Appendix B).
+    #[inline]
+    #[must_use]
+    pub const fn has_mmu_040(self) -> bool {
+        matches!(self, Model::M68040 | Model::M68LC040)
+    }
+
+    /// Whether the part has an on-chip floating-point unit: the full MC68040
+    /// alone (M68040UM §9; Appendices A and B).
+    #[inline]
+    #[must_use]
+    pub const fn has_onchip_fpu(self) -> bool {
+        matches!(self, Model::M68040)
+    }
+
+    /// Whether a coprocessor may be attached through the F-line interface.
+    ///
+    /// It arrived with the 68020 (MC68020UM §7) and left with the 68040,
+    /// which has no coprocessor interface at all: its own floating-point unit
+    /// is on the chip and answers coprocessor id 1 directly, and every other
+    /// id is an F-line exception (M68040UM §9.6.1).
     #[inline]
     #[must_use]
     pub const fn has_coprocessor_interface(self) -> bool {
-        self.has_020()
+        self.has_020() && !self.has_040()
     }
 
     /// This model's bit in a [`Models`] set.
+    ///
+    /// The three 68040 packages share two bits rather than three: the
+    /// MC68LC040 differs from the MC68040 only in *having no FPU*, which is a
+    /// property of the coprocessor rather than of the opcode map, while the
+    /// MC68EC040 drops the MMU instructions and so needs a bit of its own.
     #[must_use]
     pub const fn bit(self) -> u8 {
         match self {
@@ -196,6 +256,8 @@ impl Model {
             Model::M68020 | Model::M68EC020 => 4,
             Model::M68030 => 8,
             Model::M68EC030 => 16,
+            Model::M68040 | Model::M68LC040 => 32,
+            Model::M68EC040 => 64,
         }
     }
 }
@@ -216,22 +278,35 @@ pub struct Models(pub u8);
 
 impl Models {
     /// Every processor.
-    pub const ALL: Models = Models(31);
+    pub const ALL: Models = Models(127);
     /// The 68000 alone — a behaviour the 68010 changed.
     pub const M68000: Models = Models(1);
     /// The 68010 and everything after it.
-    pub const FROM_010: Models = Models(30);
+    pub const FROM_010: Models = Models(126);
     /// The 68020 alone — `CALLM` and `RTM`, which the 68030 dropped
     /// (MC68030UM §1.1: the module support instructions are not implemented).
     pub const M68020: Models = Models(4);
     /// The 68020 and everything after it.
-    pub const FROM_020: Models = Models(28);
-    /// Both 68030 packages.
-    pub const FROM_030: Models = Models(24);
+    pub const FROM_020: Models = Models(124);
+    /// Both 68030 packages **and** the three 68040 ones.
+    pub const FROM_030: Models = Models(120);
+    /// Both 68030 packages and no 68040 — the 68030's own `PMOVE`/`PTEST`
+    /// encodings, which the 68040 replaced (M68040UM §1.1).
+    pub const ONLY_030: Models = Models(24);
+    /// Every part with the F-line coprocessor interface: the 68020 and the
+    /// 68030, and no 68040 (MC68020UM §7; M68040UM §1.1).
+    pub const COPROCESSOR: Models = Models(28);
     /// The full MC68030 alone — the encodings that need the paged MMU.
     pub const M68030: Models = Models(8);
     /// The 68000 and the 68010 — a behaviour the 68020 changed.
     pub const UNTIL_010: Models = Models(3);
+    /// Every 68040 package: `MOVE16`, `CINV` and `CPUSH`.
+    pub const FROM_040: Models = Models(96);
+    /// The MC68040 and MC68LC040 — the parts with the paged MMU, which is
+    /// what `PFLUSH` and `PTEST` need. The MC68EC040 decodes `PFLUSH` and
+    /// does nothing with it (M68000PRM §6, *PFLUSH* (MC68EC040)), which is
+    /// handled in `exec.rs` rather than by leaving the row out.
+    pub const M68040: Models = Models(32);
 
     /// Whether `model` implements the row.
     #[inline]
@@ -795,6 +870,13 @@ define_ops! {
     Ftrapcc = "FTRAP", "take a trap if a floating-point condition holds";
     Fsave = "FSAVE", "save the coprocessor's internal state (privileged)";
     Frestore = "FRESTORE", "restore the coprocessor's internal state (privileged)";
+    Move16 = "MOVE16", "move an aligned sixteen-byte block";
+    Cinvl = "CINVL", "invalidate one cache line (privileged)";
+    Cinvp = "CINVP", "invalidate every cache line in one page (privileged)";
+    Cinva = "CINVA", "invalidate a whole cache (privileged)";
+    Cpushl = "CPUSHL", "push and invalidate one cache line (privileged)";
+    Cpushp = "CPUSHP", "push and invalidate every cache line in one page (privileged)";
+    Cpusha = "CPUSHA", "push and invalidate a whole cache (privileged)";
 }
 
 impl Op {
@@ -982,8 +1064,12 @@ impl Insn {
         self.models(Models::FROM_020)
     }
 
-    const fn since_030(self) -> Insn {
-        self.models(Models::FROM_030)
+    const fn only_030(self) -> Insn {
+        self.models(Models::ONLY_030)
+    }
+
+    const fn since_040(self) -> Insn {
+        self.models(Models::FROM_040)
     }
 
     /// The row exists only when a floating-point coprocessor is attached.
@@ -1316,7 +1402,42 @@ table! {
     // address is left unconstrained here because PFLUSHA has none and encodes
     // `000000` in the field; `pmmu::decode` carries each form's own rule.
     0xffc0 0xf000 => Insn::new(Op::Pgen, SizeSpec::None, Ea, Arg::None)
-                        .with_ext(1).privileged().since_030();
+                        .with_ext(1).privileged().only_030();
+    // ---- the 68040's own F-line instructions ----------------------------
+    // None of these is a coprocessor instruction: the 68040 has no
+    // coprocessor interface, and these encodings are decoded by the
+    // processor itself (M68040UM §1.1). They are matched before the
+    // coprocessor rows because `$F4xx` and `$F5xx` would otherwise reach the
+    // line-F catch-all.
+    //
+    // CINV and CPUSH: `1111 0100 CC P SS RRR`, cache in 7-6, push in 5,
+    // scope in 4-3, register in 2-0 (M68000PRM §6, *CINV*, *CPUSH*). Scope
+    // `00` "causes illegal instruction trap" — vector 4, not the line-F
+    // vector — so it gets rows of its own rather than falling through.
+    0xff38 0xf400 => Insn::new(Op::Illegal, SizeSpec::None, Arg::None, Arg::None)
+                        .since_040();
+    0xff38 0xf408 => Insn::new(Op::Cinvl, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xff38 0xf410 => Insn::new(Op::Cinvp, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xff38 0xf418 => Insn::new(Op::Cinva, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xff38 0xf420 => Insn::new(Op::Illegal, SizeSpec::None, Arg::None, Arg::None)
+                        .since_040();
+    0xff38 0xf428 => Insn::new(Op::Cpushl, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xff38 0xf430 => Insn::new(Op::Cpushp, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    0xff38 0xf438 => Insn::new(Op::Cpusha, SizeSpec::None, Arg::None, Arg::None)
+                        .privileged().since_040();
+    // MOVE16, in its two formats: the postincrement pair carries a second
+    // opcode word naming the destination register, and the absolute form
+    // carries a 32-bit address in two extension words (M68000PRM §4,
+    // *MOVE16*). Unprivileged, and the only 68040 addition that is.
+    0xfff8 0xf620 => Insn::new(Op::Move16, SizeSpec::None, Arg::None, Arg::None)
+                        .with_ext(1).since_040();
+    0xffe0 0xf600 => Insn::new(Op::Move16, SizeSpec::None, Arg::None, Arg::None)
+                        .with_ext(2).since_040();
     // Coprocessor id 1 is the 68881/68882. Every row here exists only when
     // one is attached; without it the encoding falls through to the line-F
     // rows below, which is exactly what a 68020 with no coprocessor does.
@@ -1355,9 +1476,9 @@ table! {
     // a privilege violation instead (MC68020UM §7.5.2.3). Bits 11-9 are the
     // coprocessor id and do not matter to that check.
     0xf1c0 0xf100 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None)
-                        .privileged().since_020();
+                        .privileged().models(Models::COPROCESSOR);
     0xf1c0 0xf140 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None)
-                        .privileged().since_020();
+                        .privileged().models(Models::COPROCESSOR);
     0xf000 0xf000 => Insn::new(Op::LineF, SizeSpec::None, Arg::None, Arg::None);
 }
 
@@ -2575,19 +2696,47 @@ pub mod ctrl {
     pub const MSP: u16 = 0x803;
     /// Interrupt stack pointer (68020).
     pub const ISP: u16 = 0x804;
+    /// The 68040's translation control register.
+    pub const TC: u16 = 0x003;
+    /// Instruction transparent translation register 0 — `IACR0` on an
+    /// MC68EC040.
+    pub const ITT0: u16 = 0x004;
+    /// Instruction transparent translation register 1 — `IACR1`.
+    pub const ITT1: u16 = 0x005;
+    /// Data transparent translation register 0 — `DACR0`.
+    pub const DTT0: u16 = 0x006;
+    /// Data transparent translation register 1 — `DACR1`.
+    pub const DTT1: u16 = 0x007;
+    /// The 68040's MMU status register.
+    pub const MMUSR: u16 = 0x805;
+    /// The 68040's user root pointer.
+    pub const URP: u16 = 0x806;
+    /// The 68040's supervisor root pointer.
+    pub const SRP: u16 = 0x807;
 
     /// Whether `model` has the control register `code` — anything else is an
     /// illegal instruction (M68000PRM, *MOVEC*, note 1).
+    ///
+    /// The 68040's table is not a superset: `CAAR` is "for the MC68020 and
+    /// MC68030 only" (note 2), and the MC68EC040 has the four access control
+    /// registers at `$004`–`$007` but none of the paged unit's.
     #[must_use]
     pub const fn exists(model: super::Model, code: u16) -> bool {
         match code {
             SFC | DFC | USP | VBR => model.has_010(),
-            CACR | CAAR | MSP | ISP => model.has_020(),
+            CACR | MSP | ISP => model.has_020(),
+            CAAR => model.has_020() && !model.has_040(),
+            ITT0 | ITT1 | DTT0 | DTT1 => model.has_040(),
+            TC | MMUSR | URP | SRP => model.has_mmu_040(),
             _ => false,
         }
     }
 
     /// The assembler name of a control register.
+    ///
+    /// The MC68EC040 spells `$004`–`$007` `IACR0`, `IACR1`, `DACR0` and
+    /// `DACR1`; they are the same four registers and the 68040 names are
+    /// used here, the way `AC0` is printed as `TT0`.
     #[must_use]
     pub const fn name(code: u16) -> Option<&'static str> {
         Some(match code {
@@ -2599,6 +2748,14 @@ pub mod ctrl {
             CAAR => "CAAR",
             MSP => "MSP",
             ISP => "ISP",
+            TC => "TC",
+            ITT0 => "ITT0",
+            ITT1 => "ITT1",
+            DTT0 => "DTT0",
+            DTT1 => "DTT1",
+            MMUSR => "MMUSR",
+            URP => "URP",
+            SRP => "SRP",
             _ => return None,
         })
     }
@@ -2718,6 +2875,16 @@ mod tests {
             // their command word.
             (Model::M68030, 47_436, 0x1000 - 64),
             (Model::M68EC030, 47_436, 0x1000 - 64),
+            // The 68040 drops `CALLM` and `RTM` as the 68030 did, and drops
+            // the 68030's memory management encodings with the coprocessor
+            // interface they travel over — so all sixty-four of those are
+            // line F again. It adds `CINV` and `CPUSH` over `$F400`-`$F4FF`,
+            // of which the sixty-four with scope `00` are an illegal
+            // instruction rather than an operation, and `MOVE16` over the
+            // forty encodings of `$F600`-`$F61F` and `$F620`-`$F627`.
+            (Model::M68040, 47_607, 0x1000 - 296),
+            (Model::M68LC040, 47_607, 0x1000 - 296),
+            (Model::M68EC040, 47_607, 0x1000 - 296),
         ] {
             let mut legal = 0usize;
             let mut line_a = 0usize;

@@ -1,0 +1,797 @@
+//! Hand-written tests for the MC68040, MC68LC040 and MC68EC040 models.
+//!
+//! There is no 68040 corpus either, so every expectation here is computed
+//! from the manuals: M68040UM §3.1 for the memory management registers, §4.2
+//! for `CACR`, §8.4 for the stack frames and the special status word, §10.3
+//! for the cache instructions' time, and M68000PRM §4 and §6 for the
+//! encodings of `MOVE16`, `CINV`, `CPUSH` and the 68040's `MOVEC` table.
+//! `conformance.rs` replays the whole 68000 corpus through the 68040 on top
+//! of these.
+
+use crate::core::error::Result;
+
+use super::tests_68010::{Board, restore, snapshot};
+use super::{Config, M68k, Model, Reg, flags, isa, vector};
+
+/// A 68040 board running `words` from `$400`.
+fn m68040(words: &[u16], edit: impl FnOnce(&mut super::Regs)) -> Board {
+    let board = Board::new(Model::M68040);
+    board.boot(words);
+    board.with_regs(edit);
+    board
+}
+
+#[test]
+fn the_model_property_names_all_three_packages() {
+    use crate::core::props::Props;
+
+    for (name, model) in [
+        ("68040", Model::M68040),
+        ("68lc040", Model::M68LC040),
+        ("68ec040", Model::M68EC040),
+    ] {
+        let cpu = M68k::from_props(&Props::new().with("model", name)).unwrap();
+        assert_eq!(cpu.model(), model);
+    }
+    // A 68040 has no coprocessor interface at all: its floating-point unit
+    // is on the chip (M68040UM §1.1), so a 68881 cannot be attached.
+    let err = M68k::from_props(&Props::new().with("model", "68040").with("fpu", "68881"))
+        .expect_err("a 68881 cannot be wired to a 68040");
+    assert!(
+        alloc::format!("{err}").contains("no coprocessor interface"),
+        "{err}"
+    );
+}
+
+#[test]
+fn every_68040_package_drives_all_32_address_lines() {
+    // M68040UM Appendices A and B: the MC68LC040 drops the FPU and the
+    // MC68EC040 drops the FPU and the MMU. Neither drops address pins, so
+    // unlike the 68EC020 none of the three is a 24-bit part.
+    for model in [Model::M68040, Model::M68LC040, Model::M68EC040] {
+        assert_eq!(model.address_mask(), u32::MAX, "{model}");
+    }
+}
+
+// ----------------------------------------------------------------------
+// MOVE16
+// ----------------------------------------------------------------------
+
+/// Fill sixteen bytes at `at` with a recognisable pattern.
+fn fill_line(board: &Board, at: u64) {
+    for i in 0..4u64 {
+        board.poke_long(at + i * 4, 0x1111_1111 * (i as u32 + 1));
+    }
+}
+
+fn line(board: &Board, at: u64) -> [u32; 4] {
+    [
+        board.peek_long(at),
+        board.peek_long(at + 4),
+        board.peek_long(at + 8),
+        board.peek_long(at + 12),
+    ]
+}
+
+#[test]
+fn move16_copies_a_line_between_two_postincrement_registers() {
+    // M68000PRM §4, *MOVE16*: `1111 0110 0010 0AAA` then `1BBB 0000 0000
+    // 0000`. A0 -> A1.
+    let board = m68040(&[0xf620, 0x9000, 0x4e71], |r| {
+        r.a[0] = 0x1000;
+        r.a[1] = 0x1800;
+    });
+    fill_line(&board, 0x1000);
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(
+        line(&board, 0x1800),
+        [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+    );
+    assert_eq!((r.a[0], r.a[1]), (0x1010, 0x1810), "both step by sixteen");
+}
+
+#[test]
+fn move16_ignores_the_low_four_bits_and_still_steps_by_sixteen() {
+    // The manual's own worked example, scaled into this board's memory:
+    // "MOVE16 (A0)+,$FE802 with A0 = $1400F ... the line at address $14000 is
+    // read ... the line is then written to the line at address $FE800 ...
+    // after the instruction A0 contains $1401F".
+    let board = m68040(&[0xf600, 0x0000, 0x1802, 0x4e71], |r| r.a[0] = 0x100f);
+    fill_line(&board, 0x1000);
+    board.cpu.step();
+    assert_eq!(
+        line(&board, 0x1800),
+        [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444],
+        "both addresses aligned down"
+    );
+    assert_eq!(board.cpu.regs().a[0], 0x101f, "$100F + 16");
+    assert_eq!(board.peek_long(0x1810), 0, "nothing past the line");
+}
+
+#[test]
+fn move16_to_one_register_named_twice_steps_it_once() {
+    // M68040UM Table 1-4, note 7: "MOVE16 (ax)+,(ay)+ is functionally the
+    // same as MOVE16 (ax),(ay)+ when ax = ay. The address register is only
+    // incremented once, and the line is copied over itself rather than to
+    // the next line."
+    let board = m68040(&[0xf622, 0xa000, 0x4e71], |r| r.a[2] = 0x1000);
+    fill_line(&board, 0x1000);
+    board.poke_long(0x1010, 0xdead_beef);
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().a[2], 0x1010, "once, not twice");
+    assert_eq!(board.peek_long(0x1010), 0xdead_beef, "the next line is not");
+    assert_eq!(
+        line(&board, 0x1000),
+        [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444],
+        "copied over itself"
+    );
+}
+
+#[test]
+fn the_four_absolute_move16_opmodes_pick_their_sides() {
+    // M68000PRM §4, *MOVE16*, the opmode table: 00 (Ay)+ -> (xxx).L,
+    // 01 (xxx).L -> (Ay)+, 10 (Ay) -> (xxx).L, 11 (xxx).L -> (Ay).
+    for (opmode, from_register, steps) in [
+        (0u16, true, true),
+        (1, false, true),
+        (2, true, false),
+        (3, false, false),
+    ] {
+        let opcode = 0xf600 | (opmode << 3) | 3; // A3
+        let board = m68040(&[opcode, 0x0000, 0x1800, 0x4e71], |r| r.a[3] = 0x1000);
+        let (src, dst) = if from_register {
+            (0x1000u64, 0x1800u64)
+        } else {
+            (0x1800, 0x1000)
+        };
+        fill_line(&board, src);
+        board.cpu.step();
+        assert_eq!(
+            line(&board, dst),
+            [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444],
+            "opmode {opmode}"
+        );
+        assert_eq!(
+            board.cpu.regs().a[3],
+            if steps { 0x1010 } else { 0x1000 },
+            "opmode {opmode} postincrement"
+        );
+    }
+}
+
+#[test]
+fn move16_is_not_privileged_and_does_not_exist_before_the_68040() {
+    // M68000PRM Table A-1 gives MOVE16 to the 68040 alone, and *MOVE16* has
+    // no "If Supervisor State" clause, unlike CINV and CPUSH.
+    assert!(!isa::decode_for(Model::M68040, 0xf620).privileged);
+    assert_eq!(isa::decode_for(Model::M68040, 0xf620).op, isa::Op::Move16);
+    for model in [Model::M68020, Model::M68030, Model::M68EC030] {
+        assert_eq!(
+            isa::decode_for(model, 0xf620).op,
+            isa::Op::LineF,
+            "{model} has no MOVE16"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// The caches
+// ----------------------------------------------------------------------
+
+#[test]
+fn the_cache_control_register_keeps_only_the_two_enables() {
+    // M68040UM Figure 4-4: DE is bit 31, IE is bit 15, and everything else
+    // is undefined. The 68020's and 68030's clear-the-cache bits are gone —
+    // CINV and CPUSH do that job.
+    let board = m68040(
+        &[0x203c, 0xffff, 0xffff, 0x4e7b, 0x0002, 0x4e7a, 0x1002],
+        |_| {},
+    );
+    for _ in 0..3 {
+        board.cpu.step();
+    }
+    assert_eq!(board.cpu.regs().cacr, 0x8000_8000);
+    assert_eq!(board.cpu.regs().d[1], 0x8000_8000);
+}
+
+#[test]
+fn cinv_and_cpush_decode_their_cache_and_scope_fields() {
+    // M68000PRM §6, *CINV* and *CPUSH*: `1111 0100 CC P SS RRR`, with P
+    // clear for CINV and set for CPUSH, and scope 01 line, 10 page, 11 all.
+    // Scope 00 "causes illegal instruction trap" — vector 4, not line F.
+    use isa::Op;
+    let cases: [(u16, Op); 6] = [
+        (0x08, Op::Cinvl),
+        (0x10, Op::Cinvp),
+        (0x18, Op::Cinva),
+        (0x28, Op::Cpushl),
+        (0x30, Op::Cpushp),
+        (0x38, Op::Cpusha),
+    ];
+    for (bits, op) in cases {
+        for cache in 0..4u16 {
+            let opcode = 0xf400 | (cache << 6) | bits | 5;
+            let insn = isa::decode_for(Model::M68040, opcode);
+            assert_eq!(insn.op, op, "${opcode:04x}");
+            assert!(insn.privileged, "${opcode:04x} is supervisor only");
+        }
+    }
+    for bits in [0x00u16, 0x20] {
+        assert_eq!(
+            isa::decode_for(Model::M68040, 0xf400 | bits).op,
+            Op::Illegal,
+            "scope 00"
+        );
+    }
+    // And nothing before the 68040 has them at all.
+    assert_eq!(isa::decode_for(Model::M68030, 0xf418).op, Op::LineF);
+}
+
+#[test]
+fn a_cache_instruction_in_user_state_is_a_privilege_violation() {
+    let board = m68040(&[0xf418, 0x4e71], |r| {
+        r.sr &= !flags::S;
+        r.usp = 0x1f00;
+        r.ssp = 0x2000;
+        r.a[7] = 0x1f00;
+    });
+    board.handler(0, vector::PRIVILEGE, 0x0c00);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::PRIVILEGE));
+}
+
+#[test]
+fn cinv_and_cpush_cost_the_manuals_time_and_change_nothing() {
+    // M68040UM Tables 10-3 and 10-4, with Idle zero and the CPUSH best case
+    // — "a cache containing no dirty entries", which is the only state this
+    // core's cache is ever in, because it has none.
+    for (opcode, clocks, what) in [
+        (0xf4c8u16, 9u64, "CINVL"),
+        (0xf4d0, 266, "CINVP"),
+        (0xf4d8, 9, "CINVA"),
+        (0xf4e8, 6, "CPUSHL"),
+        (0xf4f0, 267, "CPUSHP"),
+        (0xf4f8, 267, "CPUSHA"),
+    ] {
+        let board = m68040(&[opcode, 0x4e71], |r| r.a[0] = 0x1000);
+        let before = board.cpu.regs();
+        let used = board.cpu.step();
+        let after = board.cpu.regs();
+        assert_eq!(used, clocks, "{what}");
+        assert_eq!(after.d, before.d, "{what} touches no register");
+        assert_eq!(after.a, before.a, "{what} touches no register");
+        assert_eq!(after.pc, before.pc + 2, "{what} is one word");
+    }
+}
+
+// ----------------------------------------------------------------------
+// MOVEC
+// ----------------------------------------------------------------------
+
+/// Run `MOVE.L #value,D0 ; MOVEC D0,Rc ; MOVEC Rc,D1` and give back `D1`.
+fn movec_round_trip(model: Model, code: u16, value: u32) -> Option<u32> {
+    let board = Board::new(model);
+    board.boot(&[
+        0x203c,
+        (value >> 16) as u16,
+        value as u16,
+        0x4e7b,
+        code,
+        0x4e7a,
+        0x1000 | code,
+        0x4e71,
+    ]);
+    board.handler(0, vector::ILLEGAL, 0x0c00);
+    board.cpu.step(); // MOVE.L #value,D0
+    board.cpu.step(); // MOVEC D0,Rc
+    // "An illegal instruction exception can also be a MOVEC instruction with
+    // an undefined register specification field" (M68040UM §8.2.4), and the
+    // exception has to be looked for before the next step overwrites it.
+    if board.cpu.last_exception() == Some(vector::ILLEGAL) {
+        return None;
+    }
+    board.cpu.step(); // MOVEC Rc,D1
+    Some(board.cpu.regs().d[1])
+}
+
+#[test]
+fn the_68040_movec_table_is_not_a_superset_of_the_68030s() {
+    use isa::ctrl;
+    // M68000PRM §6, *MOVEC*: the 68040 adds TC, ITT0/1, DTT0/1, MMUSR, URP
+    // and SRP, and note 2 takes CAAR away — it is "for the MC68020 and
+    // MC68030 only".
+    assert_eq!(
+        movec_round_trip(Model::M68040, ctrl::CAAR, 0x1234_5678),
+        None
+    );
+    assert_eq!(
+        movec_round_trip(Model::M68030, ctrl::CAAR, 0x1234_5678),
+        Some(0x1234_5678)
+    );
+    // TC is sixteen bits with two of them implemented (Figure 3-4).
+    assert_eq!(
+        movec_round_trip(Model::M68040, ctrl::TC, 0xffff_ffff),
+        Some(0xc000)
+    );
+    // "Bits 8–0 of an address loaded into the URP or the SRP must be zero"
+    // (§3.1.1).
+    for code in [ctrl::URP, ctrl::SRP] {
+        assert_eq!(
+            movec_round_trip(Model::M68040, code, 0xffff_ffff),
+            Some(0xffff_fe00)
+        );
+    }
+    // A transparent translation register: bits 12-10, 7, 4, 3, 1 and 0
+    // always read as zero (Figure 3-5).
+    for code in [ctrl::ITT0, ctrl::ITT1, ctrl::DTT0, ctrl::DTT1] {
+        assert_eq!(
+            movec_round_trip(Model::M68040, code, 0xffff_ffff),
+            Some(0xffff_e364)
+        );
+    }
+    // MMUSR: bits 31-12 and B, G, U1, U0, S, CM, M, W, T, R (Figure 3-6).
+    assert_eq!(
+        movec_round_trip(Model::M68040, ctrl::MMUSR, 0xffff_ffff),
+        Some(0xffff_fff7)
+    );
+    // And the 68030 has none of them.
+    for code in [ctrl::TC, ctrl::ITT0, ctrl::MMUSR, ctrl::URP, ctrl::SRP] {
+        assert_eq!(
+            movec_round_trip(Model::M68030, code, 0),
+            None,
+            "${code:03x} on a 68030"
+        );
+    }
+}
+
+#[test]
+fn the_ec040_keeps_the_access_control_registers_and_nothing_else() {
+    use isa::ctrl;
+    // M68040UM Appendix B and M68000PRM §6, *MOVEC*: `$004`-`$007` are the
+    // MC68EC040's IACR0/1 and DACR0/1, and TC, MMUSR, URP and SRP are gone.
+    for code in [ctrl::ITT0, ctrl::ITT1, ctrl::DTT0, ctrl::DTT1] {
+        assert_eq!(
+            movec_round_trip(Model::M68EC040, code, 0xffff_ffff),
+            Some(0xffff_e364),
+            "${code:03x}"
+        );
+    }
+    for code in [ctrl::TC, ctrl::MMUSR, ctrl::URP, ctrl::SRP] {
+        assert_eq!(
+            movec_round_trip(Model::M68EC040, code, 0),
+            None,
+            "${code:03x} on an MC68EC040"
+        );
+    }
+    // The MC68LC040 has the paged unit, and so has all of them.
+    assert_eq!(
+        movec_round_trip(Model::M68LC040, ctrl::URP, 0x0001_2000),
+        Some(0x0001_2000)
+    );
+}
+
+#[test]
+fn the_registers_a_debugger_lists_follow_the_package() {
+    let names = |model| {
+        Reg::all_for(model)
+            .into_iter()
+            .map(|r| alloc::format!("{r}"))
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let full = names(Model::M68040);
+    for expected in ["tc", "urp", "srp", "mmusr", "itt0", "itt1", "dtt0", "dtt1"] {
+        assert!(full.iter().any(|n| n == expected), "{expected}");
+    }
+    assert!(!full.iter().any(|n| n == "caar"), "no CAAR on a 68040");
+    let embedded = names(Model::M68EC040);
+    assert!(embedded.iter().any(|n| n == "itt0"));
+    assert!(!embedded.iter().any(|n| n == "urp"));
+}
+
+// ----------------------------------------------------------------------
+// Exception frames
+// ----------------------------------------------------------------------
+
+#[test]
+fn an_odd_instruction_fetch_pushes_the_six_word_format_2_frame() {
+    // M68040UM §8.2.2: an address error is "the processor attempts to
+    // prefetch an instruction from an odd address ... the stack frame is
+    // generated containing the address of the instruction that caused the
+    // address error and the address itself (A0 is cleared)", and §8.4.3
+    // makes it format $2. A 68020 would have pushed format $A here.
+    let board = m68040(&[0x4ed0], |r| r.a[0] = 0x0701);
+    board.handler(0, vector::ADDRESS_ERROR, 0x0800);
+    let sr = board.cpu.regs().sr;
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x800);
+    let sp = u64::from(r.a[7]);
+    assert_eq!(sp, 0x2000 - 12, "six words");
+    assert_eq!(board.peek_word(sp), sr, "+$00 SR");
+    assert_eq!(
+        board.peek_long(sp + 2),
+        0x400,
+        "+$02 the instruction that caused it"
+    );
+    assert_eq!(
+        board.peek_word(sp + 6),
+        0x200c,
+        "+$06 format $2, offset $00C"
+    );
+    assert_eq!(
+        board.peek_long(sp + 8),
+        0x0700,
+        "+$08 the referenced address, bit 0 cleared"
+    );
+}
+
+#[test]
+fn a_data_bus_error_pushes_the_thirty_word_format_7_frame() {
+    // M68040UM §8.4.6, field by field. MOVE.W D0,($01002000).L: nothing
+    // answers there.
+    let board = m68040(&[0x33c0, 0x0100, 0x2000, 0x4e71], |r| r.d[0] = 0xbeef);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    let sr = board.cpu.regs().sr;
+    board.cpu.step();
+    let r = board.cpu.regs();
+    assert_eq!(r.pc, 0x800);
+    let sp = u64::from(r.a[7]);
+    assert_eq!(sp, 0x2000 - 60, "thirty words");
+    assert_eq!(board.peek_word(sp), sr | flags::N, "+$00 SR");
+    assert_eq!(
+        board.peek_long(sp + 2),
+        0x400,
+        "+$02 the faulted instruction"
+    );
+    assert_eq!(
+        board.peek_word(sp + 6),
+        0x7008,
+        "+$06 format $7, offset $008"
+    );
+    assert_eq!(
+        board.peek_long(sp + 8),
+        0,
+        "+$08 effective address: no continuation pending"
+    );
+    // Figure 8-7: CP/CU/CT/CM clear, MA clear, ATC clear (a physical bus
+    // error, not a translation failure), LK clear, RW clear (a write), SIZE
+    // 10 for a word, TT 00 normal, TM 101 supervisor data.
+    assert_eq!(board.peek_word(sp + 0x0c), 0x0045, "+$0C SSW");
+    for (at, what) in [
+        (0x0eu64, "write-back 3 status"),
+        (0x10, "write-back 2 status"),
+        (0x12, "write-back 1 status"),
+    ] {
+        assert_eq!(board.peek_word(sp + at), 0, "+${at:02X} {what} invalid");
+    }
+    assert_eq!(
+        board.peek_long(sp + 0x14),
+        0x0100_2000,
+        "+$14 fault address"
+    );
+}
+
+#[test]
+fn the_special_status_word_reports_size_direction_and_transfer_modifier() {
+    // Figure 8-7 and Table 5-3, one case per field that varies.
+    // A user-state byte read of the supervisor-only region: RW set, SIZE 01,
+    // TM 001 (user data).
+    let board = m68040(&[0x1039, 0x0001, 0x0000, 0x4e71], |r| {
+        r.sr &= !flags::S;
+        r.usp = 0x1f00;
+        r.ssp = 0x2000;
+        r.a[7] = 0x1f00;
+    });
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.cpu.step();
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 0x0c), 0x0121, "RW, SIZE=01, TM=001");
+    assert_eq!(board.peek_long(sp + 0x14), 0x0001_0000, "fault address");
+
+    // A long write in supervisor state: RW clear, SIZE 00, TM 101. This core
+    // drives a long as two words, so the size reported is the word the bus
+    // refused.
+    let board = m68040(&[0x23c0, 0x0100, 0x2000, 0x4e71], |_| {});
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.cpu.step();
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(board.peek_word(sp + 0x0c), 0x0045, "SIZE=10, TM=101");
+
+    // A read-modify-write sets LK (bit 9): TAS on the unmapped address.
+    let board = m68040(&[0x4af9, 0x0100, 0x2000, 0x4e71], |_| {});
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.cpu.step();
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(
+        board.peek_word(sp + 0x0c) & 0x0200,
+        0x0200,
+        "LK on a locked transfer"
+    );
+}
+
+#[test]
+fn a_moves_to_program_space_reports_as_a_data_access() {
+    // M68040UM §3.2.5: "the integer unit translates MOVES accesses to
+    // instruction address spaces (SFC/DFC = $6 or $2) into data references
+    // (SFC/DFC = $5 or $1) ... the resulting access error stack frame
+    // contains the converted function code in the TM field".
+    let board = m68040(
+        &[
+            0x203c, 0x0000, 0x0006, // MOVE.L #6,D0
+            0x4e7b, 0x0001, // MOVEC D0,DFC
+            0x0eb9, 0x1800, 0x0100, 0x2000, // MOVES.L D1,($01002000).L
+            0x4e71,
+        ],
+        |_| {},
+    );
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    for _ in 0..3 {
+        board.cpu.step();
+    }
+    let sp = u64::from(board.cpu.regs().a[7]);
+    let ssw = board.peek_word(sp + 0x0c);
+    assert_eq!(ssw & 7, 0b101, "TM is the converted code, not $6");
+    assert_eq!((ssw >> 3) & 3, 0b00, "TT is a normal access");
+
+    // And a function code that is not one of the four ordinary ones is an
+    // alternate logical access, TT = 10, carrying the code itself
+    // (Table 3-2).
+    let board = m68040(
+        &[
+            0x203c, 0x0000, 0x0003, // MOVE.L #3,D0
+            0x4e7b, 0x0001, // MOVEC D0,DFC
+            0x0eb9, 0x1800, 0x0100, 0x2000, // MOVES.L D1,($01002000).L
+            0x4e71,
+        ],
+        |_| {},
+    );
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    for _ in 0..3 {
+        board.cpu.step();
+    }
+    let sp = u64::from(board.cpu.regs().a[7]);
+    let ssw = board.peek_word(sp + 0x0c);
+    assert_eq!((ssw >> 3) & 3, 0b10, "TT is an alternate access");
+    assert_eq!(ssw & 7, 3, "TM is the function code");
+}
+
+#[test]
+fn rte_from_the_access_error_frame_restarts_the_instruction() {
+    // M68040UM §8.4.6.7: with no continuation bit set, "the processor
+    // increments the active supervisor stack pointer by 30 words and resumes
+    // normal instruction execution" at the stacked PC, which §8.2.1 says is
+    // "the logical address of the instruction executing at the time the
+    // fault was detected". This core has no write-back pipeline, so every
+    // write-back status is invalid and the handler has nothing to complete.
+    let board = m68040(&[0x33c0, 0x0100, 0x2000, 0x4e71], |r| r.d[0] = 0xbeef);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.poke_word(0x0800, 0x4e73); // RTE
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().a[7], 0x2000 - 60);
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().pc, 0x400, "restarted from its first word");
+    assert_eq!(board.cpu.regs().a[7], 0x2000, "and the frame is gone");
+}
+
+#[test]
+fn rte_puts_back_an_address_register_the_faulted_instruction_had_stepped() {
+    // MOVE.L (A0)+,($01002000).L: the postincrement happens, then the write
+    // faults. The handler sees A0 stepped, as it would on hardware, and RTE
+    // restores it so the restarted instruction steps it again exactly once.
+    let board = m68040(&[0x23d8, 0x0100, 0x2000, 0x4e71], |r| r.a[0] = 0x1000);
+    board.poke_long(0x1000, 0x1234_5678);
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.poke_word(0x0800, 0x4e73); // RTE
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().a[0], 0x1004, "the handler sees it stepped");
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().a[0], 0x1000, "RTE puts it back");
+    assert_eq!(board.cpu.regs().pc, 0x400);
+}
+
+#[test]
+fn rte_refuses_a_frame_with_a_continuation_bit_set() {
+    // §8.4.6.7 hands the continuation cases to microcode this core does not
+    // have, and says explicitly that a handler which sets more than one
+    // leaves `RTE` undefined. A format error is the honest answer.
+    let board = m68040(&[0x4e73], |r| {
+        r.ssp = 0x1f00;
+        r.a[7] = 0x1f00;
+    });
+    board.handler(0, vector::FORMAT_ERROR, 0x0c00);
+    // A format $7 frame with CT (bit 13) set in the SSW.
+    board.poke_word(0x1f00, 0x2700);
+    board.poke_long(0x1f02, 0x0500);
+    board.poke_word(0x1f06, 0x7008);
+    board.poke_word(0x1f0c, 0x2000);
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::FORMAT_ERROR));
+    assert_eq!(board.cpu.regs().a[7], 0x1f00 - 8, "the bad frame is intact");
+}
+
+#[test]
+fn the_68040_does_not_recognise_the_68020s_bus_fault_frames() {
+    // M68040UM §8.4 lists formats $0, $1, $2, $3, $4 and $7 and no others.
+    for format in [0xau16, 0xb, 0x8, 0x9] {
+        let board = m68040(&[0x4e73], |r| {
+            r.ssp = 0x1f00;
+            r.a[7] = 0x1f00;
+        });
+        board.handler(0, vector::FORMAT_ERROR, 0x0c00);
+        board.poke_word(0x1f00, 0x2700);
+        board.poke_long(0x1f02, 0x0500);
+        board.poke_word(0x1f06, (format << 12) | 0x008);
+        board.cpu.step();
+        assert_eq!(
+            board.cpu.last_exception(),
+            Some(vector::FORMAT_ERROR),
+            "format ${format:x}"
+        );
+    }
+}
+
+#[test]
+fn a_deferred_prefetch_fault_reports_the_instruction_transfer_modifier() {
+    // M68040UM §8.2.1: a bus error on a prefetch is "deferred until the
+    // processor attempts to use the information", and §8.4.6 says the TM
+    // field then "contains $2 and $6" for user and supervisor instruction
+    // faults — the one place a program-space access is *not* folded onto
+    // data. The guarded region ends at $11000 and nothing follows it.
+    let board = m68040(&[0x4ef9, 0x0001, 0x0ffe], |_| {}); // JMP $10FFE
+    board.guarded.write_u8(0xffe, 0x4e).unwrap();
+    board.guarded.write_u8(0xfff, 0x71).unwrap(); // NOP
+    board.handler(0, vector::BUS_ERROR, 0x0800);
+    board.cpu.step(); // the JMP; the prefetch past the end does not fault
+    assert_eq!(board.cpu.regs().pc, 0x1_0ffe);
+    board.cpu.step(); // the NOP runs, and the next fetch is used
+    board.cpu.step();
+    assert_eq!(board.cpu.last_exception(), Some(vector::BUS_ERROR));
+    let sp = u64::from(board.cpu.regs().a[7]);
+    assert_eq!(
+        board.peek_word(sp + 6),
+        0x7008,
+        "format $7, the bus error vector"
+    );
+    let ssw = board.peek_word(sp + 0x0c);
+    assert_eq!(ssw & 7, 0b110, "TM $6: a supervisor code access");
+    assert_eq!((ssw >> 8) & 1, 1, "RW: a read");
+    assert_eq!(board.peek_long(sp + 0x14), 0x1_1000, "the prefetch address");
+}
+
+// ----------------------------------------------------------------------
+// What the 68040 does not have
+// ----------------------------------------------------------------------
+
+#[test]
+fn the_68040_has_no_coprocessor_interface() {
+    // MC68020UM §7.5.2.3 makes `cpSAVE` in user state a privilege violation
+    // *before* the processor talks to a coprocessor. A 68040 has no
+    // coprocessor interface at all (M68040UM §1.1), so the same word is
+    // simply an F-line instruction and the privilege check never happens.
+    let cpsave = 0xf500u16 | (4 << 9); // coprocessor id 2, cpSAVE
+    assert!(isa::decode_for(Model::M68030, cpsave).privileged);
+    let insn = isa::decode_for(Model::M68040, cpsave);
+    assert_eq!(insn.op, isa::Op::LineF);
+    assert!(!insn.privileged);
+}
+
+#[test]
+fn the_68030s_mmu_instructions_are_gone() {
+    // M68040UM §1.1: the 68030's PMOVE/PLOAD/PTEST/PFLUSH travel over the
+    // coprocessor interface, which the 68040 does not have. Their encodings
+    // fall back to the line-F exception.
+    for opcode in [0xf000u16, 0xf008, 0xf010, 0xf018] {
+        assert_eq!(isa::decode_for(Model::M68030, opcode).op, isa::Op::Pgen);
+        assert_eq!(isa::decode_for(Model::M68040, opcode).op, isa::Op::LineF);
+    }
+}
+
+#[test]
+fn callm_and_rtm_are_still_unimplemented() {
+    // Gone at the 68030 (MC68030UM §12.1.3) and not back.
+    for opcode in [0x06d0u16, 0x06c3] {
+        assert_eq!(isa::decode_for(Model::M68040, opcode).op, isa::Op::Illegal);
+    }
+}
+
+// ----------------------------------------------------------------------
+// The disassembler
+// ----------------------------------------------------------------------
+
+#[test]
+fn the_disassembler_speaks_68040() {
+    for (words, text) in [
+        (&[0xf620u16, 0x9000][..], "MOVE16 (A0)+,(A1)+"),
+        (&[0xf600, 0x000f, 0xe802][..], "MOVE16 (A0)+,$fe802"),
+        (&[0xf61b, 0x000f, 0xe802][..], "MOVE16 $fe802,(A3)"),
+        (&[0xf4c8][..], "CINVL #3,(A0)"),
+        (&[0xf491][..], "CINVP #2,(A1)"),
+        (&[0xf458][..], "CINVA #1"),
+        (&[0xf4ea][..], "CPUSHL #3,(A2)"),
+        (&[0xf4f8][..], "CPUSHA #3"),
+        (&[0x4e7b, 0x0806][..], "MOVEC D0,URP"),
+        (&[0x4e7a, 0x1003][..], "MOVEC TC,D1"),
+    ] {
+        let d = super::disasm::disassemble_for(Model::M68040, 0x400, words);
+        assert_eq!(alloc::format!("{d}"), text);
+        assert_eq!(
+            usize::from(d.len) / 2,
+            words.len(),
+            "{text} is {} words",
+            words.len()
+        );
+    }
+}
+
+#[test]
+fn the_disassembler_and_the_68040_agree_on_every_new_encoding() {
+    // The generator emits both, so a length the disassembler reports and a
+    // length the interpreter consumes must be the same one (CLAUDE.md,
+    // *CPU cores*).
+    let mut checked = 0;
+    for opcode in 0xf400u32..=0xf6ff {
+        let opcode = opcode as u16;
+        let insn = isa::decode_for(Model::M68040, opcode);
+        if matches!(insn.op, isa::Op::LineF | isa::Op::Illegal) {
+            continue;
+        }
+        let words = [opcode, 0x9000, 0x0000, 0x0000];
+        let d = super::disasm::disassemble_for(Model::M68040, 0x400, &words);
+        assert_eq!(
+            usize::from(d.len),
+            2 + 2 * usize::from(insn.ext),
+            "${opcode:04x} {}",
+            insn.op
+        );
+        checked += 1;
+    }
+    assert!(checked > 100, "only {checked} encodings reached");
+}
+
+// ----------------------------------------------------------------------
+// Snapshots
+// ----------------------------------------------------------------------
+
+#[test]
+fn a_68040_snapshot_round_trips_its_control_registers() -> Result<()> {
+    let board = Board::new(Model::M68040);
+    board.boot(&[0x7001, 0x4e71]);
+    board.with_regs(|r| {
+        r.tc = 0xc000;
+        r.urp = 0x0001_2000;
+        r.srp = 0x0003_4000;
+        r.itt = [0x00ff_c040, 0x0100_8000];
+        r.dtt = [0x4000_e000, 0x0000_0000];
+        r.mmusr = 0x1234_5041;
+        r.cacr = 0x8000_8000;
+        r.vbr = 0x0000_8000;
+    });
+    let bytes = snapshot(&board.cpu)?;
+    let other = M68k::new(Config::MC68040);
+    restore(&other, &bytes)?;
+    assert_eq!(other.regs(), board.cpu.regs());
+    assert_eq!(snapshot(&other)?, bytes, "a round trip is a fixed point");
+    Ok(())
+}
+
+#[test]
+fn an_ec040_snapshot_carries_only_the_registers_it_has() -> Result<()> {
+    let board = Board::new(Model::M68EC040);
+    board.boot(&[0x7001, 0x4e71]);
+    board.with_regs(|r| {
+        r.itt = [0x00ff_c040, 0x0100_8000];
+        r.dtt = [0x4000_e000, 0x0000_0000];
+        // No paged unit, so these are dropped on the way in.
+        r.urp = 0x0001_2000;
+        r.mmusr = 0xffff_ffff;
+    });
+    let after = board.cpu.regs();
+    assert_eq!(after.urp, 0, "an MC68EC040 has no URP");
+    assert_eq!(after.mmusr, 0, "nor an MMUSR");
+    let bytes = snapshot(&board.cpu)?;
+    let other = M68k::new(Config::MC68EC040);
+    restore(&other, &bytes)?;
+    assert_eq!(other.regs(), after);
+    Ok(())
+}

@@ -140,6 +140,9 @@ fn the_model_property_chooses_the_processor() {
         ("68ec020", Model::M68EC020),
         ("68030", Model::M68030),
         ("68ec030", Model::M68EC030),
+        ("68040", Model::M68040),
+        ("68lc040", Model::M68LC040),
+        ("68ec040", Model::M68EC040),
     ] {
         let cpu = M68k::from_props(&Props::new().with("model", name)).unwrap();
         assert_eq!(cpu.model(), model);
@@ -150,7 +153,7 @@ fn the_model_property_chooses_the_processor() {
         Model::M68000
     );
     assert!(
-        M68k::from_props(&Props::new().with("model", "68040")).is_err(),
+        M68k::from_props(&Props::new().with("model", "68060")).is_err(),
         "a processor this core does not model is an error, not a 68000"
     );
     // The validator knows the same list.
@@ -763,7 +766,7 @@ fn a_machine_file_can_ask_for_a_later_processor() {
         .expect("a 68020 board builds");
     assert_eq!(cores.last().expect("the core").model(), Model::M68020);
 
-    let err = crate::machine::build("t.machine", &board("68040"), &registry, &options)
+    let err = crate::machine::build("t.machine", &board("68060"), &registry, &options)
         .expect_err("a processor this core does not model");
     assert!(alloc::format!("{err}").contains("model"), "{err}");
 }

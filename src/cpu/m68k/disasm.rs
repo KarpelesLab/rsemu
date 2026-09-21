@@ -358,6 +358,30 @@ impl Disassembled {
                 write!(f, " #${:x},{ea}", word & 0xff)
             }
             Op::Rtm => write!(f, " {}", Operand::general(self.opcode & 0xf)),
+            // The 68040's cache instructions take a two-bit cache selector
+            // and, for the line and page scopes, an address register
+            // (M68000PRM §6, *CINV*, *CPUSH*).
+            Op::Cinva | Op::Cpusha => write!(f, " #{}", (self.opcode >> 6) & 3),
+            Op::Cinvl | Op::Cinvp | Op::Cpushl | Op::Cpushp => {
+                write!(f, " #{},(A{})", (self.opcode >> 6) & 3, self.opcode & 7)
+            }
+            // `MOVE16` in its two formats: the postincrement pair names its
+            // destination register in a second opcode word, and the absolute
+            // form carries a long address and says in bits 4-3 which side it
+            // is on (M68000PRM §4, *MOVE16*).
+            Op::Move16 if self.opcode & 0x20 != 0 => {
+                write!(f, " (A{})+,(A{})+", self.opcode & 7, (word >> 12) & 7)
+            }
+            Op::Move16 => {
+                let absolute = (u32::from(word) << 16) | u32::from(self.ext[1]);
+                let reg = self.opcode & 7;
+                match (self.opcode >> 3) & 3 {
+                    0 => write!(f, " (A{reg})+,${absolute:x}"),
+                    1 => write!(f, " ${absolute:x},(A{reg})+"),
+                    2 => write!(f, " (A{reg}),${absolute:x}"),
+                    _ => write!(f, " ${absolute:x},(A{reg})"),
+                }
+            }
             Op::Pack | Op::Unpk => {
                 let memory = self.opcode & 8 != 0;
                 let (src, dst) = ((self.opcode & 7) as u8, ((self.opcode >> 9) & 7) as u8);
