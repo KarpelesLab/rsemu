@@ -2109,3 +2109,34 @@ fn the_hardware_subset_agrees_with_the_68881_operation_by_operation() {
         assert_eq!(a.fpsr, b.fpsr, "{what}: FPSR");
     }
 }
+
+#[test]
+fn move16_is_charged_its_accesses_even_when_a_table_search_runs_inside_it() {
+    // `MOVE16` has no row in the timing tables, so what it costs is the
+    // accesses it drives — and `Exec::step` replaces the per-access count
+    // with the table entry whenever the table is non-zero, which a table
+    // search makes it. The search's cycles must therefore be *added* to the
+    // transfers, never substituted for them.
+    let plain = m68040(&[0xf620, 0x9000, 0x4e71], |r| {
+        r.a[0] = 0x1000;
+        r.a[1] = 0x1800;
+    });
+    let without = plain.cpu.step();
+    assert!(without > 60, "eight long words on a 16-bit bus: {without}");
+
+    // The same instruction with paged translation on, both lines in pages
+    // the cache has never seen: three descriptor reads per page, plus the
+    // history write-backs.
+    let board = mapped(0x0002_0000, 0x0002_0000 | 0b01);
+    translate_on(&board, &[0xf620, 0x9000, 0x4e71]);
+    board.with_regs(|r| {
+        r.a[0] = 0x1000;
+        r.a[1] = 0x1800;
+    });
+    let with = board.cpu.step();
+    assert!(
+        with > without,
+        "a table search adds to the transfers rather than replacing them: \
+         {with} with, {without} without"
+    );
+}

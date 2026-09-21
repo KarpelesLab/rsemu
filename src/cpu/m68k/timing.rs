@@ -620,10 +620,11 @@ pub(super) fn instruction(insn: Insn, opcode: u16, size: Size, f: &Facts) -> u32
         // an M68040UM number rather than an MC68020UM one — there is no
         // 68020 row to borrow, because there is no 68020 instruction.
         //
-        // `MOVE16` is eight long-word bus cycles here rather than the two
-        // bursts hardware makes; M68040UM §10 gives no row for it at all, so
-        // what is charged is the accesses this core actually drives, counted
-        // where they happen, plus nothing.
+        // `MOVE16` has no row in either manual, so what is charged is the
+        // accesses this core actually drives — eight long-word bus cycles
+        // here, rather than the two bursts hardware makes. `Exec::op_move16`
+        // adds them to the table itself, because a zero row and a nested
+        // table search interact badly; see `Exec::charge_move16`.
         Op::Move16 => 0,
         // M68040UM Tables 10-3 and 10-4, with `Idle` zero — nothing is
         // pending, because this core has no write-back pipeline — and the

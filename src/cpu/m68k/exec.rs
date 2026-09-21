@@ -4139,6 +4139,7 @@ impl<'a> Exec<'a> {
     /// to the next line" (M68040UM Table 1-4, note 7).
     fn op_move16(&mut self) -> Result<(), Trap> {
         let opcode = self.opcode;
+        let spent_before = (self.used, self.table);
         let (src, dst, steps): (u32, u32, [Option<(usize, u32)>; 2]) = if opcode & 0x20 != 0 {
             // `MOVE16 (Ax)+,(Ay)+`: a second opcode word names the
             // destination register in bits 14-12.
@@ -4190,7 +4191,29 @@ impl<'a> Exec<'a> {
             // same thing every postincrement mode does.
             self.state.a[reg] = value;
         }
-        self.settle()
+        let done = self.settle();
+        self.charge_move16(spent_before);
+        done
+    }
+
+    /// Charge `MOVE16` the accesses it actually drove, as a table entry.
+    ///
+    /// Neither the MC68020UM tables this core borrows nor M68040UM §10 has a
+    /// `MOVE16` row, so the time is the bus cycles rather than a published
+    /// number. Those cycles are already in `used` — but [`Exec::step`]
+    /// *replaces* `used` with `table` whenever the table is non-zero, and a
+    /// table search nested inside this instruction makes it so
+    /// ([`Exec::search_cycles`]). Leaving the row at zero therefore threw
+    /// the sixteen bytes' worth of transfers away exactly when the
+    /// instruction had done the most work. So they go into the table too,
+    /// less whatever a search has already put there.
+    fn charge_move16(&mut self, before: (u64, u32)) {
+        if !self.model.has_020() {
+            return;
+        }
+        let spent = self.used.saturating_sub(before.0) as u32;
+        let searched = self.table.saturating_sub(before.1);
+        self.table = self.table.saturating_add(spent.saturating_sub(searched));
     }
 
     /// `CINV` and `CPUSH` (M68000PRM §6; M68040UM §4.2).
