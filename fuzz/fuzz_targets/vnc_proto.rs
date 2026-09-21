@@ -27,6 +27,11 @@
 //! > **A pixel format survives its own encoding**, for every one of the 2^128
 //! > the wire can carry, and packing a colour into a supported one never
 //! > panics on a shift the peer chose.
+//! >
+//! > **A format that parses is one §7.4 permits.** The RFC's `bits-per-pixel`
+//! > is 8, 16 or 32 and nothing else, which is what makes a pixel at most four
+//! > bytes — a server that took the peer's byte for it sized a buffer from a
+//! > stranger's arithmetic.
 //!
 //! The version handshake goes in too: `Version::parse` reads twelve bytes of
 //! whatever a peer sends first, and its digit loop is arithmetic on them.
@@ -46,6 +51,12 @@ fuzz_target!(|data: &[u8]| {
             Some(format),
             "a pixel format must survive its own encoding"
         );
+        assert!(
+            format.is_well_formed(),
+            "the parse handed back a format §7.4 forbids"
+        );
+        // §7.4: bits-per-pixel is 8, 16 or 32, so a pixel is at most four
+        // bytes. Anything else and a length from the socket is sizing buffers.
         assert!(format.bytes_per_pixel() <= 4);
         if format.is_supported() {
             let mut out = Vec::new();
@@ -63,7 +74,9 @@ fuzz_target!(|data: &[u8]| {
     while budget > 0 {
         budget -= 1;
         match proto::parse_client(rest) {
-            Parsed::Incomplete | Parsed::Unknown(_) => break,
+            // `Malformed` is as fatal as `Unknown`: the session closes the
+            // connection rather than waiting for bytes that cannot help.
+            Parsed::Incomplete | Parsed::Unknown(_) | Parsed::Malformed => break,
             Parsed::Message(message, used) => {
                 assert!(used > 0, "a message must consume something");
                 assert!(used <= rest.len(), "a message consumed bytes it was not given");

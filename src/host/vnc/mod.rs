@@ -454,7 +454,11 @@ impl VncServer {
                 }
                 Phase::Ready => match proto::parse_client(&conn.inbox) {
                     Parsed::Incomplete => return true,
-                    Parsed::Unknown(_) => return false,
+                    // Both fatal: RFB has no way for a server to answer a
+                    // client message with an error, so a stream it cannot
+                    // resynchronise and a message the RFC does not permit both
+                    // end the connection. See `Parsed`.
+                    Parsed::Unknown(_) | Parsed::Malformed => return false,
                     Parsed::Message(message, used) => {
                         conn.inbox.drain(..used);
                         Self::apply(conn, message, events);
@@ -468,10 +472,12 @@ impl VncServer {
     fn apply(conn: &mut Conn, message: ClientMessage, events: &mut Vec<InputEvent>) {
         match message {
             ClientMessage::SetPixelFormat(format) => {
-                // §7.5.1 lets a client ask for anything. One this server cannot
-                // produce is ignored rather than obeyed badly: the client keeps
-                // getting the format it was offered in ServerInit, which it
-                // said it could decode by connecting.
+                // Well formed by construction — `parse_client` refuses a
+                // PIXEL_FORMAT §7.4 does not permit — but §7.4 permits more
+                // than this server can produce, a colour-map format above all.
+                // One it cannot produce is ignored rather than obeyed badly:
+                // the client keeps getting the format it was offered in
+                // ServerInit, which it said it could decode by connecting.
                 if format.is_supported() {
                     conn.encoder.set_format(format);
                 }

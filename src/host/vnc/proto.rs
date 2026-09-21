@@ -161,6 +161,24 @@ pub fn security_result_failed(reason: &str) -> Vec<u8> {
 /// How many bytes a PIXEL_FORMAT occupies on the wire (§7.4).
 pub const PIXEL_FORMAT_LEN: usize = 16;
 
+/// Whether one colour channel of §7.4 is one the RFC describes.
+///
+/// `max` "is (2^N)-1, where N is the number of bits used for" the channel, so
+/// every set bit is contiguous from bit zero; `shift` is "the number of shifts
+/// needed to get the *channel* value in a pixel to the least significant bit",
+/// so `shift + N` has to land inside the pixel. A channel of zero bits is
+/// legal — `max` of 0 is `2^0 - 1` — and means the client wants none of it.
+const fn channel_fits(max: u16, shift: u8, bits_per_pixel: u8) -> bool {
+    // A mask of contiguous low bits is exactly the value for which adding one
+    // carries all the way out. `wrapping_add` because `0xffff + 1` is that
+    // case and is legal at 32 bits per pixel.
+    if max & max.wrapping_add(1) != 0 {
+        return false;
+    }
+    let width = u16::BITS - max.leading_zeros();
+    shift as u32 + width <= bits_per_pixel as u32
+}
+
 /// The RFB PIXEL_FORMAT structure (§7.4).
 ///
 /// Distinct from [`display::PixelFormat`](crate::host::display::PixelFormat),
@@ -213,13 +231,27 @@ impl PixelFormat {
         blue_shift: 0,
     };
 
-    /// Parse the sixteen bytes of §7.4.
+    /// Parse the sixteen bytes of §7.4, **rejecting one the RFC does not
+    /// permit**.
+    ///
+    /// `None` means "these bytes are not a PIXEL_FORMAT": either there are
+    /// fewer than [`PIXEL_FORMAT_LEN`] of them, or they decode to something
+    /// [`is_well_formed`](PixelFormat::is_well_formed) refuses. Both callers
+    /// already know which — [`parse_client`] has checked the length before it
+    /// asks — so the one `Option` carries both without ambiguity.
+    ///
+    /// Validating here rather than at the point of use is deliberate: these
+    /// bytes arrive from an unauthenticated peer on a socket, and the fields
+    /// are `pub`, so the parse is the only place that sees every one of them
+    /// at once. A `bits-per-pixel` of 255 got as far as
+    /// [`bytes_per_pixel`](PixelFormat::bytes_per_pixel) answering 32 before
+    /// this check existed.
     #[must_use]
     pub fn parse(bytes: &[u8]) -> Option<PixelFormat> {
         if bytes.len() < PIXEL_FORMAT_LEN {
             return None;
         }
-        Some(PixelFormat {
+        let format = PixelFormat {
             bits_per_pixel: bytes[0],
             depth: bytes[1],
             big_endian: bytes[2] != 0,
@@ -231,7 +263,45 @@ impl PixelFormat {
             green_shift: bytes[11],
             blue_shift: bytes[12],
             // Bytes 13..16 are padding.
-        })
+        };
+        format.is_well_formed().then_some(format)
+    }
+
+    /// Whether this is a PIXEL_FORMAT §7.4 permits **at all**.
+    ///
+    /// Distinct from [`is_supported`](PixelFormat::is_supported), which asks
+    /// the narrower question of whether *this* server can produce it: a
+    /// colour-map format is well formed and unsupported, and the two answers
+    /// mean different things to a session — one closes the connection, the
+    /// other keeps sending the format ServerInit offered.
+    ///
+    /// Every clause is a "must" in §7.4:
+    ///
+    /// * bits-per-pixel "must be 8, 16, or 32";
+    /// * depth "must be less than or equal to bits-per-pixel";
+    /// * each maximum "is (2^N)-1, where N is the number of bits used for"
+    ///   that channel — so it is a mask of contiguous bits from bit zero;
+    /// * each shift is "the number of shifts needed to get the *channel* value
+    ///   in a pixel to the least significant bit", so the channel it names has
+    ///   to land inside the pixel.
+    ///
+    /// The last two clauses apply only when `true-colour-flag` is set: §7.4
+    /// gives the six colour fields meaning only in that case, so a colour-map
+    /// format's are not read and are not checked.
+    #[must_use]
+    pub const fn is_well_formed(self) -> bool {
+        if !matches!(self.bits_per_pixel, 8 | 16 | 32) {
+            return false;
+        }
+        if self.depth > self.bits_per_pixel {
+            return false;
+        }
+        if !self.true_colour {
+            return true;
+        }
+        channel_fits(self.red_max, self.red_shift, self.bits_per_pixel)
+            && channel_fits(self.green_max, self.green_shift, self.bits_per_pixel)
+            && channel_fits(self.blue_max, self.blue_shift, self.bits_per_pixel)
     }
 
     /// The sixteen bytes of §7.4.
@@ -261,6 +331,9 @@ impl PixelFormat {
     }
 
     /// How many bytes one pixel occupies.
+    ///
+    /// At most four for anything [`parse`](PixelFormat::parse) produced: §7.4
+    /// caps `bits-per-pixel` at 32 and the parse enforces it.
     #[inline]
     #[must_use]
     pub const fn bytes_per_pixel(self) -> usize {
@@ -289,13 +362,22 @@ impl PixelFormat {
     /// the RFC's own description implies. Integer arithmetic throughout — the
     /// determinism rule is about the *time* path, but a frame hash is compared
     /// too, and a float here would make it host-dependent.
+    ///
+    /// The shift is `checked_shl` rather than `<<`. A format that came through
+    /// [`parse`](PixelFormat::parse) can never shift a channel out of the word
+    /// — [`is_well_formed`](PixelFormat::is_well_formed) bounds `shift + N` by
+    /// `bits-per-pixel`, which §7.4 caps at 32 — but the fields are `pub` and
+    /// every one of them is a byte a peer chose, so a shift past the word
+    /// drops that channel rather than panicking in a debug build.
     #[inline]
     #[must_use]
     pub fn pack(self, rgb: [u8; 3]) -> u32 {
         let scale = |v: u8, max: u16| -> u32 { (u32::from(v) * u32::from(max) + 127) / 255 };
-        (scale(rgb[0], self.red_max) << self.red_shift)
-            | (scale(rgb[1], self.green_max) << self.green_shift)
-            | (scale(rgb[2], self.blue_max) << self.blue_shift)
+        let place =
+            |v: u32, shift: u8| -> u32 { v.checked_shl(u32::from(shift)).unwrap_or_default() };
+        place(scale(rgb[0], self.red_max), self.red_shift)
+            | place(scale(rgb[1], self.green_max), self.green_shift)
+            | place(scale(rgb[2], self.blue_max), self.blue_shift)
     }
 
     /// Append one packed pixel to `out` in this format's byte order.
@@ -440,6 +522,17 @@ pub enum Parsed {
     /// there is no way to know where the next message starts. Closing the
     /// connection is the only honest response.
     Unknown(u8),
+    /// A message whose type and length are known, whose bytes are all here,
+    /// and whose *contents* are not something the RFC permits — so far only a
+    /// SetPixelFormat carrying a PIXEL_FORMAT that violates §7.4.
+    ///
+    /// Fatal for the same reason [`Unknown`](Parsed::Unknown) is, by a
+    /// different route: RFB gives a server no way to answer a client message
+    /// with an error, so there is nothing to send and nothing to negotiate.
+    /// Distinct from `Incomplete` because the bytes will never become valid by
+    /// waiting for more of them — reporting one as the other is a connection
+    /// that stalls forever with a full buffer.
+    Malformed,
 }
 
 /// Decode one client message from the front of `bytes` (§7.5).
@@ -456,7 +549,10 @@ pub fn parse_client(bytes: &[u8]) -> Parsed {
             }
             match PixelFormat::parse(&bytes[4..20]) {
                 Some(format) => Parsed::Message(ClientMessage::SetPixelFormat(format), 20),
-                None => Parsed::Incomplete,
+                // All sixteen bytes are here — `need(20)` said so — so this is
+                // not a short read but a PIXEL_FORMAT §7.4 does not permit.
+                // Waiting for more bytes would never resolve it.
+                None => Parsed::Malformed,
             }
         }
         client_msg::SET_ENCODINGS => {
@@ -525,7 +621,14 @@ pub fn parse_client(bytes: &[u8]) -> Parsed {
                 return Parsed::Incomplete;
             }
             let len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-            let total = 8 + len;
+            // `checked_add` because `usize` is 32 bits on both wasm targets,
+            // where a peer's length of 0xffff_ffff would wrap the header away
+            // and make a 4 GiB message look like a 7-byte one. On a 64-bit
+            // host it cannot overflow; the branch costs nothing and the
+            // alternative is a panic reachable from the socket.
+            let Some(total) = 8usize.checked_add(len) else {
+                return Parsed::Incomplete;
+            };
             if !need(total) {
                 return Parsed::Incomplete;
             }
@@ -620,6 +723,141 @@ mod tests {
         let mut format = PixelFormat::DEFAULT;
         format.bits_per_pixel = 24;
         assert!(!format.is_supported(), "24bpp is not one of 8, 16, 32");
+    }
+
+    /// The `vnc_proto` fuzz target's first finding: sixteen bytes of `0xff`
+    /// parsed into a PIXEL_FORMAT claiming 255 bits per pixel, and
+    /// `bytes_per_pixel` answered 32. Every clause of §7.4 is checked here,
+    /// because every one of these bytes arrives from an unauthenticated peer.
+    #[test]
+    fn a_pixel_format_the_rfc_forbids_is_refused_at_the_parse() {
+        // The crash itself: `ff * 15, 01`, which is 255 bits per pixel.
+        assert_eq!(PixelFormat::parse(&[0xff; PIXEL_FORMAT_LEN]), None);
+
+        let legal = PixelFormat::DEFAULT.encode();
+        assert!(PixelFormat::parse(&legal).is_some(), "the control");
+
+        let with = |edit: &dyn Fn(&mut [u8; PIXEL_FORMAT_LEN])| {
+            let mut bytes = legal;
+            edit(&mut bytes);
+            PixelFormat::parse(&bytes)
+        };
+
+        // "bits-per-pixel ... must be 8, 16, or 32."
+        for bpp in [0u8, 1, 4, 24, 33, 64, 255] {
+            assert_eq!(
+                with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[0] = bpp),
+                None,
+                "{bpp} bits per pixel"
+            );
+        }
+        for bpp in [8u8, 16, 32] {
+            // Depth follows, or the next clause rejects it instead.
+            assert!(
+                with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| {
+                    b[0] = bpp;
+                    b[1] = bpp;
+                    // Eight bits of each channel do not fit in eight bits of
+                    // pixel, so narrow the channels to nothing as well.
+                    b[4..10].fill(0);
+                    b[10..13].fill(0);
+                })
+                .is_some(),
+                "{bpp} bits per pixel is one of the three"
+            );
+        }
+
+        // "depth ... must be less than or equal to bits-per-pixel."
+        assert_eq!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[1] = 33),
+            None,
+            "depth past bits-per-pixel"
+        );
+        assert!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[1] = 32).is_some(),
+            "depth may equal it"
+        );
+
+        // "red-max is the maximum red value. This value is (2^N)-1" — so a
+        // mask with a hole in it is not one.
+        assert_eq!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[4..6].copy_from_slice(&[0x00, 0xfe])),
+            None
+        );
+        assert_eq!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[6..8].copy_from_slice(&[0x01, 0x00])),
+            None
+        );
+        assert_eq!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[8..10].copy_from_slice(&[0x00, 0x7e])),
+            None
+        );
+
+        // "red-shift is the number of shifts needed to get the red value in a
+        // pixel to the least significant bit" — so the channel has to land
+        // inside the pixel. Eight bits of red shifted by 25 do not.
+        assert_eq!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[10] = 25),
+            None,
+            "red past the word"
+        );
+        assert_eq!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[11] = 255),
+            None,
+            "green past the word"
+        );
+        assert!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| b[12] = 24).is_some(),
+            "blue exactly fills the word"
+        );
+
+        // §7.4 gives the six colour fields meaning only under true-colour, so
+        // a colour-map format's nonsense shifts are not a protocol violation.
+        assert!(
+            with(&|b: &mut [u8; PIXEL_FORMAT_LEN]| {
+                b[3] = 0;
+                b[10] = 255;
+            })
+            .is_some(),
+            "a colour-map format is well formed whatever its colour fields say"
+        );
+
+        // And the property the fuzz target asserts, for every format that can
+        // now come off the wire.
+        for bpp in [8u8, 16, 32] {
+            let mut bytes = legal;
+            bytes[0] = bpp;
+            bytes[1] = bpp;
+            bytes[4..13].fill(0);
+            let format = PixelFormat::parse(&bytes).expect("well formed");
+            assert!(format.bytes_per_pixel() <= 4);
+        }
+    }
+
+    /// The same finding one level up: a SetPixelFormat whose twenty bytes are
+    /// all present but whose format is illegal is *fatal*, not `Incomplete`.
+    /// Answering `Incomplete` would leave the session waiting for bytes that
+    /// can never make the message valid.
+    #[test]
+    fn a_forbidden_pixel_format_ends_the_connection() {
+        let mut message = [0u8; 20];
+        message[0] = client_msg::SET_PIXEL_FORMAT;
+        message[4..20].copy_from_slice(&PixelFormat::DEFAULT.encode());
+        assert!(matches!(parse_client(&message), Parsed::Message(..)));
+
+        message[4] = 255; // bits-per-pixel
+        assert_eq!(parse_client(&message), Parsed::Malformed);
+        // Still incomplete while it is short, so framing is unchanged.
+        assert_eq!(parse_client(&message[..19]), Parsed::Incomplete);
+    }
+
+    /// A shift a peer chose must never panic, whatever it is — the fields are
+    /// public, so `pack` cannot lean on the parse having run.
+    #[test]
+    fn packing_survives_a_shift_off_the_end_of_the_word() {
+        let mut format = PixelFormat::DEFAULT;
+        format.red_shift = 200;
+        assert_eq!(format.pack([0xff, 0, 0]), 0, "the channel is dropped");
     }
 
     #[test]
@@ -821,7 +1059,7 @@ mod tests {
                 });
             }
             match parse_client(&bytes) {
-                Parsed::Incomplete | Parsed::Unknown(_) => {}
+                Parsed::Incomplete | Parsed::Unknown(_) | Parsed::Malformed => {}
                 Parsed::Message(message, used) => {
                     assert!(used > 0 && used <= bytes.len(), "{used} of {len}");
                     // Exactly its own bytes parse to exactly itself.
