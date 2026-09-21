@@ -237,7 +237,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -412,7 +412,25 @@ struct Shared {
     ///
     /// Cloned out and the lock released before the forwarded access: that
     /// access takes a [`LockRank::TOPOLOGY`] guard and this is a leaf.
-    downstream: Mutex<Option<Arc<AddressSpace>>>,
+    ///
+    /// **Weak.** The register block is behind the filter by construction — the
+    /// processor reaches the block only through `fw.bus`, so the registers
+    /// have to live in the downstream map, and
+    /// `machines/tests/stm32l4-firewall.machine` maps them there. A strong
+    /// handle therefore closes a reference cycle: the space owns the mapping,
+    /// the mapping owns [`Registers`] as its [`MemOps`], `Registers` owns this
+    /// `Shared`, and `Shared` would own the space. Nothing in this tree breaks
+    /// such a cycle — there is no unbind — so every byte behind the filter
+    /// outlives the machine that was torn down. `virtio.mmio` had the same
+    /// defect and its fuzz target measured it at 6.5 MB an iteration under
+    /// LeakSanitizer; `CLAUDE.md` states the rule for the analogous case, that
+    /// a wire's sinks are weak refs.
+    ///
+    /// The upgrade costs nothing measurable here: the forwarding path already
+    /// takes this lock and clones an `Arc` out of it on every access, and an
+    /// upgrade is the same atomic increment against a count that is certainly
+    /// non-zero.
+    downstream: Mutex<Option<Weak<AddressSpace>>>,
     /// The reset output, pulsed on an illegal access.
     reset_out: Mutex<Option<WireSource>>,
     /// Whether a board drew a `clken` wire.
@@ -635,7 +653,11 @@ impl Shared {
 
     /// The space the filter forwards to.
     fn downstream(&self) -> Option<Arc<AddressSpace>> {
-        self.downstream.lock().clone()
+        // Upgraded here and held for the one forwarded access: a filter whose
+        // map has gone forwards nothing, which is what a torn-down machine
+        // wants. See the field.
+        let weak = self.downstream.lock().clone();
+        weak.as_ref().and_then(Weak::upgrade)
     }
 
     /// Judge a processor access, and reset if that is the answer.
@@ -906,8 +928,12 @@ impl Firewall {
     ///
     /// Normally done by [`Instance::bind`] from the object's `space =`
     /// property; a test that builds its own space calls this.
+    ///
+    /// The reference is **weak**: the register block is mapped into the very
+    /// map it fences, so holding it strongly would be a cycle that leaks
+    /// everything behind the filter. See the `downstream` field on `Shared`.
     pub fn attach_bus(&self, space: &Arc<AddressSpace>) {
-        *self.shared.downstream.lock() = Some(Arc::clone(space));
+        *self.shared.downstream.lock() = Some(Arc::downgrade(space));
     }
 
     /// Whether `SYSCFG_CFGR1.FWDIS` still has the firewall switched off.

@@ -54,6 +54,15 @@ impl WireSink for ResetProbe {
 /// A firewall in front of a flash and an SRAM, with its reset line watched.
 struct Rig {
     fw: Arc<Firewall>,
+    /// The map the filter fences, and what the registers are mapped into.
+    ///
+    /// Held here because **the rig is this device's machine**, and the machine
+    /// is what owns an address space. The filter itself keeps only a `Weak` to
+    /// it — a strong one would be a reference cycle, since this space maps the
+    /// register block that owns the filter — so if nothing here held it, it
+    /// would be dropped at the end of `Rig::new` and every access through
+    /// `cpu` would find an empty map.
+    mem: Arc<AddressSpace>,
     /// What the processor sees: nothing but the filter.
     cpu: Arc<AddressSpace>,
     /// What a bus master sees — the *other* filter, because a master is not
@@ -114,6 +123,7 @@ impl Rig {
 
         Rig {
             fw,
+            mem,
             cpu,
             dma,
             resets,
@@ -975,4 +985,38 @@ fn the_schema_and_the_device_agree_about_pins_and_regions() {
         assert!(Device::region(&fw, name).is_some(), "{name}");
     }
     assert!(Device::region(&fw, "code").is_none());
+}
+
+/// The cycle `virtio.mmio` was found to have, in the shape this file had it.
+///
+/// A cycle is invisible to `Drop` — nothing runs, which is the defect — but it
+/// is exactly visible as a `Weak` that still upgrades after the last strong
+/// handle is gone. Both halves are already in the rig: the register block is
+/// mapped into `mem`, because the processor reaches it only through the
+/// filter, and the filter forwards to `mem`.
+#[test]
+fn the_filter_does_not_keep_the_map_it_fences_alive() {
+    let rig = Rig::new();
+    rig.arm();
+    // The rig is this device's machine, so its handle must be the only strong
+    // one: the filter, the register block and both windows are all reachable
+    // from the map, and none of them may own it back.
+    let mem = rig.mem;
+    assert_eq!(
+        Arc::strong_count(&mem),
+        1,
+        "something else holds the fenced map: the filter keeps it strongly"
+    );
+    let watch = Arc::downgrade(&mem);
+    drop(mem);
+    assert!(
+        watch.upgrade().is_none(),
+        "the fenced map outlived its last owner"
+    );
+    // And the filter is still a filter: a map that has gone answers nothing
+    // rather than panicking or inventing a value.
+    assert!(
+        rig.cpu.read(SRAM, Width::U32, MemAttrs::DEFAULT).is_err(),
+        "a filter with no downstream must refuse"
+    );
 }
