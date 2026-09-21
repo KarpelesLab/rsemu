@@ -798,3 +798,42 @@ fn every_class_publishes_the_regions_its_schema_promises() {
         assert!(mapper.region(name).is_some(), "sms.mapper has no `{name}`");
     }
 }
+
+/// The cycle `virtio.mmio` was found to have, in the shape the mapper had it.
+///
+/// A cycle is invisible to `Drop` — nothing runs, which is the defect — but it
+/// is exactly visible as a `Weak` that still upgrades after the last strong
+/// handle is gone. Both halves have to be present for the loop to close, so
+/// the fixture builds both, as `machines/sms-ntsc.machine` does: the mapper's
+/// two apertures in the space's map, and the space in the mapper's `Shared`.
+#[test]
+fn the_mapper_does_not_keep_the_space_its_windows_live_in_alive() {
+    let mapper = SegaMapper::new(&image(4), 0x8000).expect("a board");
+    let space = Arc::new(crate::core::space::AddressSpace::new("mem", 16));
+    {
+        let mut topo = space.topology();
+        topo.map(mapper.region("rom").expect("the cartridge"), 0x0000)
+            .expect("the cartridge maps");
+        topo.map(mapper.region("regs").expect("the registers"), 0xfffc)
+            .expect("the registers map");
+    }
+    mapper.attach_space(&space);
+    // The board is what owns the space; the mapper holds it only to slide its
+    // own windows in it.
+    assert_eq!(
+        Arc::strong_count(&space),
+        1,
+        "the mapper holds the space it slides windows in strongly"
+    );
+
+    let watch = Arc::downgrade(&space);
+    drop(space);
+    assert!(
+        watch.upgrade().is_none(),
+        "the address space outlived its last owner"
+    );
+    // And the mapper is still a mapper: a space that has gone means the
+    // registers still latch, the windows simply do not move.
+    mapper.write_register(2, 3);
+    assert_eq!(mapper.bank(1), 3);
+}

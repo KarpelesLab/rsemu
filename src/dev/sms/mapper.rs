@@ -77,7 +77,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -163,7 +163,20 @@ impl Registers {
 
 struct Shared {
     regs: Mutex<Registers>,
-    space: Mutex<Option<Arc<AddressSpace>>>,
+    /// The space the two sliding windows are mapped into, held **weakly**.
+    ///
+    /// The mapper's own regions live in that same space — `map mem 0x0000
+    /// size 0xc000 = cart.rom` and `map mem 0xfffc size 4 = cart.regs` — so a
+    /// strong handle closes a reference cycle: the space owns the mappings,
+    /// the mappings own [`Slot2`] and [`MapperRegs`] as their [`MemOps`],
+    /// those own this `Shared`, and `Shared` would own the space. Nothing in
+    /// this tree breaks such a cycle — there is no unbind — so the whole
+    /// cartridge and every byte of the console's RAM outlive the machine that
+    /// was torn down. `virtio.mmio` had the same defect and its fuzz target
+    /// measured it at 6.5 MB an iteration under LeakSanitizer; `CLAUDE.md`
+    /// states the rule for the analogous case, that a wire's sinks are weak
+    /// refs.
+    space: Mutex<Option<Weak<AddressSpace>>>,
     rom: Arc<RomStore>,
     ram: Arc<RamStore>,
     /// How many 16 KiB banks the padded image has. A bank register is taken
@@ -190,8 +203,12 @@ impl Shared {
     /// address space, and the re-entrancy contract says an outward call happens
     /// after the critical section, not inside it (`ROADMAP.md` §4.4).
     fn apply(&self, regs: Registers) {
+        // Upgraded once per bank switch, which is as often as a guest writes
+        // `$FFFE`/`$FFFF` and nowhere near a memory access. A mapper whose
+        // space has gone slides nothing, which is what a torn-down machine
+        // wants.
         let space = self.space.lock().clone();
-        let Some(space) = space else {
+        let Some(space) = space.as_ref().and_then(Weak::upgrade) else {
             return;
         };
         let bank0 = u64::from(regs.bank[0]) % self.banks;
@@ -359,8 +376,12 @@ impl SegaMapper {
     }
 
     /// Connect the address space the windows live in.
-    pub fn attach_space(&self, space: Arc<AddressSpace>) {
-        *self.shared.space.lock() = Some(space);
+    ///
+    /// The reference is **weak**: the mapper's own windows are mapped into
+    /// that space, so holding it strongly would be a cycle that leaks the
+    /// whole machine. See the `space` field on this device's shared state.
+    pub fn attach_space(&self, space: &Arc<AddressSpace>) {
+        *self.shared.space.lock() = Some(Arc::downgrade(space));
         let regs = *self.shared.regs.lock();
         self.shared.apply(regs);
     }
@@ -612,7 +633,7 @@ impl crate::machine::Instance for SegaMapper {
                  bank switch slides them: add `space = mem` to the object",
             ),
         })?;
-        self.attach_space(Arc::clone(space));
+        self.attach_space(space);
         Ok(())
     }
 }
