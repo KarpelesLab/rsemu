@@ -57,12 +57,25 @@
 //! Anything else is skipped, which keeps a mutated corpus productive rather
 //! than mostly rejected.
 //!
-//! # Known finding: this target currently reproduces an upstream panic
+//! # Findings
 //!
-//! It found one within a few minutes of its first run, which is the argument
-//! for its existence:
+//! Two, which is the argument for this target's existence. One was ours and is
+//! fixed; one is upstream's and is still open.
 //!
-//! > `fstool` 0.4.23, `src/block/qcow2/mod.rs:952` — `ensure_mapping` indexes
+//! ## Fixed: a header field reached an allocator (`qcow2-huge-virtual-size`)
+//!
+//! A qcow2 keeps its guest-visible size in a header field (the qcow2
+//! specification, header offset 24) and is allocate-on-write, so the file says
+//! nothing about it: a two-kilobyte image may legitimately declare 2^46 bytes.
+//! Under `Snapshot::Capture` the drive's `save` materialises the whole medium,
+//! so that field reached `vec![0u8; 1 << 46]` in `AtaDisk::contents` before a
+//! byte had been read — `allocation-size-too-big` under ASan, an OOM kill on a
+//! real run. `MAX_CAPTURE` in `dev::blk::image` now refuses the policy at open,
+//! where there is a person to tell. The seed of that name is the reproducer.
+//!
+//! ## Open upstream: `ensure_mapping` indexes the L1 table unchecked
+//!
+//! > `fstool` 0.4.27, `src/block/qcow2/mod.rs:952` — `ensure_mapping` indexes
 //! > `self.l1l2.l1[l1_idx]` without a bounds check. `l1l2.rs` deliberately does
 //! > **not** require the header's `l1_size` to cover the image's virtual size
 //! > (its comment says so), so a qcow2 declaring a non-zero `size` and
@@ -72,11 +85,20 @@
 //!
 //! It is not fixable from here: guarding it in rsemu would mean parsing the
 //! qcow2 header, which is exactly the parallel implementation `ROADMAP.md` §7.1
-//! forbids. It is an `fstool` fix. Until it lands, `blk_image` is deliberately
-//! **not** in `.github/workflows/fuzz.yml`'s smoke list — the list is curated,
-//! not automatic — while `cargo fuzz build` still builds it, so the target
-//! keeps doing its other job of catching an API drift. Adding one word to that
-//! list is what turns it back on.
+//! forbids, and `fstool` is a sibling repository this project does not commit
+//! to. It is written down instead, as `docs/upstream/fstool-qcow2-l1-bounds.md`,
+//! with the reproducing bytes.
+//!
+//! So that the rest of this target keeps earning its place in
+//! `.github/workflows/fuzz.yml` rather than being excluded whole, a **qcow2 is
+//! opened read-only** whatever the input asked for. `Image::write_at` then
+//! answers `Protected` before anything reaches the backend, which closes the
+//! WRITE opcode and the write-back a `Capture` load performs in one place. The
+//! header parse, the refcount walk, the L1/L2 lookup, every read, the bounds
+//! check and both snapshot paths still run against a qcow2; writes still run
+//! against every other backend. Delete that gate the moment the upstream fix
+//! lands — it is the known-failures ledger for this target, and it only ever
+//! shrinks.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -133,7 +155,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let options = ImageOptions::new()
+    let mut options = ImageOptions::new()
         .read_only(flags & 1 != 0)
         .snapshot(match (flags >> 1) & 3 {
             0 => Snapshot::Reference,
@@ -144,6 +166,25 @@ fuzz_target!(|data: &[u8]| {
     // Property 1: arbitrary bytes are a drive or an error, never a panic.
     let Ok(image) = Image::open(&path, &options) else {
         return;
+    };
+
+    // The upstream gate, and the whole of it (see "Open upstream" above). A
+    // qcow2 is reopened read-only whatever the input asked for, so that no
+    // guest write — neither the WRITE opcode nor the write-back a `Capture`
+    // load performs — can reach `fstool`'s `ensure_mapping`. `Image::write_at`
+    // answers `Protected` first, which is rsemu's own check and not a second
+    // parse of the header: `Image::describe` leads with the format `fstool`'s
+    // own probe picked, so nothing here reads a qcow2 field (ROADMAP.md §7.1).
+    // Delete this block when the upstream fix lands.
+    let image = if !options.read_only && image.describe().starts_with("qcow2 ") {
+        drop(image);
+        options = options.read_only(true);
+        let Ok(reopened) = Image::open(&path, &options) else {
+            return;
+        };
+        reopened
+    } else {
+        image
     };
     let capacity = image.capacity();
     // `Image::open` promises a non-zero whole number of sectors, whatever the

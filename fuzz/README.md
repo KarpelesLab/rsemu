@@ -294,16 +294,24 @@ Then, in order:
    inside a `fuzz_targets/` frame is a harness bug — the input decoder running
    off the end of a short input is the classic one — and fixing the harness is
    not fixing the crash. A panic inside a **dependency** is the third case, and
-   it is the awkward one: rsemu cannot fix it, and the nightly job stays red
-   until upstream does. Write it down here rather than rediscovering it, and
-   say what a fix needs.
+   it is the awkward one: rsemu cannot fix it. Write it down — in
+   `docs/upstream/` as a specification somebody can carry across, and under
+   "Known upstream crashes" below — then find the narrowest gate in the
+   *harness* that keeps the rest of the target running. A drift detector that
+   is expected to be red detects nothing, which is exactly the trap this job
+   fell into for a week.
+2. **Turn it into a unit test** in the module that owns the code, beside the
+   rest of its tests (`CLAUDE.md`, Testing). The fuzz corpus is not a
+   regression suite; a `#[test]` is.
+3. **Commit the minimised input** as a corpus seed, so the mutator keeps that
+   region of the input space warm.
 
 ### Known upstream crashes
 
 **`blk_image`, `fstool`'s qcow2 writer — open, as of `fstool` 0.4.27.**
 
 ```
-thread '<unnamed>' panicked at fstool-0.4.26/src/block/qcow2/mod.rs:952:36:
+thread '<unnamed>' panicked at fstool-0.4.27/src/block/qcow2/mod.rs:952:36:
 index out of bounds: the len is 0 but the index is 0
 ```
 
@@ -319,24 +327,24 @@ and indexes the L1 table without checking its length. A header whose
 executions from the seed corpus — leaves `l1` empty, and the first write to
 any virtual offset panics on `l1[0]`.
 
-A fix is upstream and small: `split_addr` already has the arithmetic, so
-`ensure_mapping` wants a bounds check returning the crate's own
-"image is malformed" error rather than indexing. **0.4.27 has the same
-unguarded line**, so bumping does not help; this entry names the version it
-was last checked against and should be re-checked on the next bump.
+`docs/upstream/fstool-qcow2-l1-bounds.md` is the written specification, with
+the reproducing header and what a fix has to do; the bytes are
+`corpus/blk_image/qcow2-l1-size-zero`. **0.4.27 has the same unguarded line**,
+so bumping does not help on its own; re-check it on the next bump.
 
-What rsemu can do about it in the meantime is nothing honest. `dev::blk`
-hands guest-supplied image bytes to `fstool` by design, `MemResult` has no
-variant for "the parser aborted", and `catch_unwind` is not available on every
-target this crate builds for (`panic = "abort"` on wasm). The nightly `Fuzz`
-workflow is therefore expected to be red on `blk_image` until this is fixed
-upstream — which is exactly why it is written here, so that a *second*,
-unrelated crash in the same target is still visible as news.
-2. **Turn it into a unit test** in the module that owns the code, beside the
-   rest of its tests (`CLAUDE.md`, Testing). The fuzz corpus is not a
-   regression suite; a `#[test]` is.
-3. **Commit the minimised input** as a corpus seed, so the mutator keeps that
-   region of the input space warm.
+What rsemu can do about it is nothing honest: `dev::blk` hands guest-supplied
+image bytes to `fstool` by design, guarding it here would mean parsing the
+qcow2 header (the parallel implementation `ROADMAP.md` §7.1 forbids),
+`MemResult` has no variant for "the parser aborted", and `catch_unwind` is not
+available on every target this crate builds for (`panic = "abort"` on wasm).
+
+What the **harness** does instead is open a qcow2 read-only whatever the input
+asked for, so `Image::write_at` answers `Protected` before anything reaches the
+backend. The header parse, the refcount walk, the L1/L2 lookup, every read and
+both snapshot paths still run against a qcow2, and writes still run against
+every other backend — so the job is green and a *second*, unrelated crash in
+this target is visible as news again. The gate is one marked block at the top
+of `fuzz_targets/blk_image.rs`; delete it with this entry when the fix lands.
 
 ## Adding a target
 
