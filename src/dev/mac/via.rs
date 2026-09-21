@@ -982,7 +982,6 @@ impl Device for Via {
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         {
             let mut state = self.shared.state.lock();
-            let inputs = state.inputs;
             let mut next = State::fresh(r.read_u64()?);
             next.ora = r.read_u8()?;
             next.orb = r.read_u8()?;
@@ -1002,11 +1001,14 @@ impl Device for Via {
             next.ifr = r.read_u8()? & IRQ_SOURCES;
             next.ier = r.read_u8()? & IRQ_SOURCES;
             next.pb7_timer = r.read_bool()?;
+            // The pin levels, which this chip does keep — see the field's own
+            // comment. They are overwritten rather than kept from the live
+            // state, because a sweep that re-announces the same level is what
+            // makes the round trip exact.
             let pins = r.read_u32()?;
             for (bit, high) in next.inputs.iter_mut().enumerate() {
                 *high = pins & (1 << bit) != 0;
             }
-            let _ = inputs;
             *state = next;
             self.shared.publish(&state);
         }
