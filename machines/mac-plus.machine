@@ -191,7 +191,8 @@ machine "mac-plus" {
   # The VIA's four register selects are on A9-A12 and nothing above them, so
   # its 8 KiB block repeats sixty-four times through $E80000-$EFFFFF. $EFE1FE,
   # the address every published Macintosh equate is written against, is
-  # register 0 of the last copy but one.
+  # register 0 of the last copy, the one at $EFE000; $EFFFFE is register 15 of
+  # it, which is `vBufA`.
   map mem 0xE80000 size 0x80000 = mirror(via) { endian = "big" }
 
   # The same decode for the IWM, over the two megabytes its own select covers.
