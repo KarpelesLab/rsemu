@@ -227,11 +227,11 @@ something a person can actually run (§2).
 > 1.27× faster — with **99.3%** of the x86 guest's instructions retiring inside
 > a translated block (97.3% one round ago and 84.5% two before that), **99.4%**
 > of the AArch64 guest's, and 99.8% of compiled RISC-V stores writing guest RAM
-> inline. What is *not*
-> done: the tier-2 pipeline, and the browser *embedder* for the wasm backend —
-> `jit::wasm` emits the modules and `engine = "jit-wasm"` executes them
-> everywhere through a reference executor (§11.4), but nothing yet hands one to
-> a `WebAssembly.Module`, so the browser still runs interpreted. Nor is the ≥100 MIPS
+> inline. **The browser embedder for the wasm backend is built and measured**:
+> a generated block is instantiated by the page's own engine and runs at
+> **1.50×** the IR interpreter in V8 — per basic block, with no chaining and
+> no superblocks, which is better than §11.4 expected. What is *not*
+> done: the tier-2 pipeline. Nor is the ≥100 MIPS
 > half of the gate claimed: `docs/bench-host.md` now names the reference host
 > and its versus-QEMU row is measured, but its CPU-throughput row — `coremark`
 > on RV64GC — has not been run, and this project's own rule is that a gate
@@ -2137,6 +2137,41 @@ correctness evidence rather than a speed path. `tests/wasm_jit_v8.rs` hands the
 same modules to V8 through `node` where one is available, so the *encoding* is
 checked against a real engine and the *semantics* against `ir::Interp`.
 
+**The embedder is built, and the number is in.** `jit::wasm::embed::Embedder`
+is the seam a host instantiates modules through; `src/wasm.rs` implements it
+for `wasm32-unknown-unknown` over three imports (`rsemu.jit_compile`,
+`jit_enter`, `jit_release`) and four exports, and `web/src/jit.js` is the page's
+forty lines of wiring. On the same RV64I guest for the same span, one engine,
+best of three:
+
+| | native (`jit::wasm::exec`) | in V8 (node 26) |
+| --- | --- | --- |
+| `interp` | 1064 ms, 1.00× | 922 ms, 1.00× |
+| `jit` | 517 ms, 2.06× | 840 ms, 1.10× |
+| `jit-host` | 85 ms, 12.50× | — (no `mmap`) |
+| `jit-wasm` | 1392 ms, **0.76×** | 613 ms, **1.50×** |
+
+So the paragraph above — *"the realistic expectation is that the wasm backend
+wins only on long-running superblocks, and may not win at all"* — is answered:
+it wins, per *basic block*, without superblocks and without chaining, by about
+half again over the interpreter and by a little over the portable IR backend.
+The native column is the same code with a wasm interpreter behind it and is the
+floor rather than the backend. `benches/wasm_jit_embedder.rs` and
+`web/check.mjs` §1c take the two columns by calling one function, so they
+cannot drift into being two workloads with one name.
+
+That is a smaller multiplier than `jit-host`'s 12.5× and it is what the target
+costs: no chaining, a return to the dispatcher per block, and every guest
+access an import call. The three mechanisms that would move it are written down
+in `docs/techniques/wasm-jit.md` and none of them was worth building before
+this number existed.
+
+**The determinism gate reaches the browser.** `web/check.mjs` §1c runs that
+guest under `engine = "interp"` and `engine = "jit-wasm"` inside node's V8 and
+asserts one hash, with the count of blocks entered inside host-compiled modules
+beside it — because a hash that matched by falling back to the interpreter
+would prove nothing. CI's `wasm` job runs it every commit.
+
 ### 11.5 Host imports
 
 Follows `purecrypto`'s browser convention — an embedder-supplied import object,
@@ -2155,8 +2190,23 @@ build falls back to the portable backend, which is §9's rule and costs nothing
 but speed. A particular WASI runtime could supply a non-standard import —
 rsemu's side of it is unchanged — but that is a runtime extension, and calling
 it WASI support would be a lie. `docs/techniques/wasm-jit.md` has the exact
-export and import list an embedder wires: four imports, three exports, and no
-JavaScript logic at all.
+export and import list an embedder wires.
+
+**Built, for the JIT's half.** `rsemu.jit_compile`, `rsemu.jit_enter` and
+`rsemu.jit_release` are what `rsemu.compile` above turned out to be — three
+rather than one, because a handle has to be entered and released as well as
+minted — and `web/src/jit.js` supplies them. `web/check.mjs` asserts the module
+imports **exactly** those three and nothing else, which is the check that keeps
+"an embedder-supplied import object, not a bundled JS runtime" true as the
+boundary grows. `rsemu.now`, `rsemu.random_get` and `rsemu.log` are still
+unbuilt; nothing in the tree reads a host clock from wasm yet.
+
+The four exports going the other way (`rsemu_jit_slot`, `_load`, `_store`,
+`_note`) carry **no semantics in JavaScript at all** — every one routes
+straight back into `jit::wasm::rt`'s `Thunks`, which is a transcription of
+`ir::interp`. That is not tidiness: it is the reason a browser run can be
+asserted to hash identically to an interpreted one, because there is one
+implementation of the IR's meaning and the browser does not get its own.
 
 ### 11.6 What determinism buys here
 

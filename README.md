@@ -67,13 +67,14 @@ one snapshot format, one debugger, shared by every machine ever added.
   appear anywhere in the core. wasm has no writable-then-executable memory, so
   it needs a different mechanism from the other two backends, and it has one:
   the **wasm backend** (`ROADMAP.md` §11.4) lowers an IR block to a
-  `WebAssembly.Module` rather than to machine code, needs no `unsafe` at all,
-  and reaches the same state hash as the interpreter on the same guest. **The
-  demo below still runs interpreted** — what is missing is the four lines of
-  browser glue that hand a module to the embedder, and
+  `WebAssembly.Module` rather than to machine code and reaches the same state
+  hash as the interpreter on the same guest. **The browser embedder is built**:
+  three imports, four exports and forty lines in
+  [`web/src/jit.js`](web/src/jit.js), measured at **1.50× the IR interpreter**
+  in V8 on an RV64I guest — per basic block, with no chaining and no
+  superblocks, which is more than `ROADMAP.md` §11.4 expected.
   [`docs/techniques/wasm-jit.md`](docs/techniques/wasm-jit.md) is the design
-  note that says exactly what they are and why the arithmetic says a per-block
-  module may not pay off in a browser anyway.
+  note.
 - **One crate, one feature per component.** A NES build links a 6502 and
   nothing else.
 
@@ -759,19 +760,32 @@ the numbers and that argument are in
 [`docs/platforms/pc64.md`](docs/platforms/pc64.md) and
 [`docs/platforms/arm64-virt.md`](docs/platforms/arm64-virt.md).
 
-**There is a wasm backend now, and the browser still runs interpreted** — which
-is two statements rather than a contradiction. `engine = "jit-wasm"` lowers each
-IR block to a WebAssembly module and executes it, on every target, and reaches
-the same state hash as the interpreter at every checkpoint of
-`tests/riscv_virt_engines.rs`. On a native host it executes those modules with a
-reference interpreter, which makes it the *slowest* of the four engines and is
-the point: the translation is executed and hashed everywhere rather than only
-where a browser is. Handing a module to a real `WebAssembly.Module` is the
-embedder's job, it is specified down to the import names in
-[`docs/techniques/wasm-jit.md`](docs/techniques/wasm-jit.md), and it is not
-written — so no number here says whether a wasm module beats the IR interpreter
-in a browser, and `ROADMAP.md` §11.4's own arithmetic suggests it may not
-without superblocks.
+**The wasm backend runs in a browser engine now, and it wins.** `engine =
+"jit-wasm"` lowers each IR block to a WebAssembly module and executes it, on
+every target, reaching the same state hash as the interpreter at every
+checkpoint of `tests/riscv_virt_engines.rs`. On a native host the only thing
+that can run one of those modules is a reference wasm interpreter, which makes
+`jit-wasm` the *slowest* of the four engines there and is the point: the
+translation is executed and hashed everywhere rather than only where a browser
+is. On `wasm32-unknown-unknown` the page's own engine compiles them, through
+three imports and four exports ([`web/src/jit.js`](web/src/jit.js)), and the
+same guest for the same span comes out:
+
+| Engine | native (reference executor) | in V8 (node 26) |
+| --- | --- | --- |
+| `interp` | 1064 ms, 1.00× | 922 ms, 1.00× |
+| `jit` | 517 ms, 2.06× | 840 ms, 1.10× |
+| `jit-host` | **85 ms, 12.50×** | — (there is no `mmap` in a browser) |
+| `jit-wasm` | 1392 ms, 0.76× | **613 ms, 1.50×** |
+
+`ROADMAP.md` §11.4 expected the backend to win "only on long-running
+superblocks, and may not win at all"; it wins per *basic block*, with no
+chaining and no superblocks. It is well short of `jit-host`'s 12.5×, and
+`docs/techniques/wasm-jit.md` says which three mechanisms would move it and why
+none was worth building before this number existed. Both columns come from one
+function — `benches/wasm_jit_embedder.rs` and `web/check.mjs` §1c call it — so
+they are one workload rather than two with one name, and the browser column is
+asserted to hash identically to the interpreter's on every commit.
 
 Two caveats on all of the above. `engine` is a `param` on the seven boards that
 run third-party system software — `riscv-virt`, `arm64-virt`, `arm64-virt-smp`,

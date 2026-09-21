@@ -23,6 +23,7 @@ It is a **Vue 3 application built by Vite**, published to
 | `src/App.vue` | the chrome — picker, transport, media, save states, prose |
 | `src/session.js` | the frame loop, the canvas, the keyboard: **no Vue in here** |
 | `src/rsemu.js` | the entire JavaScript side of the wasm boundary — one class |
+| `src/jit.js` | the WebAssembly JIT's embedder: three imports, no semantics |
 | `src/components/` | `ScreenView`, `TerminalView`, `StatGrid`, `PadLegend` |
 | `src/styles.css` | the design tokens and the handful of shared primitives |
 | `public/rsemu.wasm` | *not committed* — a cargo build product you copy in |
@@ -71,14 +72,18 @@ local `http.server`; a relative base is the only one correct in both places.
 ## Verify without a browser
 
 ```sh
-node web/check.mjs web/dist/rsemu.wasm --site web/dist
+node web/check.mjs web/dist/rsemu.wasm --site web/dist \
+  --jit target/wasm32-unknown-unknown/release/rsemu-jit.wasm
 ```
 
-Three layers, and it is what gates the Pages deploy:
+Four layers, and it is what gates the Pages deploy:
 
 1. **The module.** Parses the export section and checks it against the
    functions `src/rsemu.js` actually calls, and asserts the module imports
-   nothing.
+   nothing — or, for a `jit-wasm` build, *exactly* the three `rsemu.jit_*` the
+   embedder needs and nothing else, which is what keeps `ROADMAP.md` §11.5's
+   "an embedder-supplied import object, not a bundled JS runtime" true as the
+   boundary grows.
 2. **The built site.** `dist/index.html` has the mount point, is built rather
    than the raw Vite entry, and references only *relative* assets that exist;
    `rsemu.wasm` sits beside it byte-identical to the module under test and with
@@ -121,6 +126,19 @@ Three layers, and it is what gates the Pages deploy:
    ABI, a key this keyboard has not got putting *nothing* on the wire, and then
    the session's rule that keys reach a PC only while the picture has focus —
    and that losing the window releases every key still down.
+4. **The WebAssembly JIT, under this engine** (`--jit PATH`, §1c). `jit::wasm`
+   lowers an IR block to a complete `WebAssembly.Module`; everywhere else in
+   the tree the only thing that runs one is `jit::wasm::exec`, a wasm
+   interpreter, so every other test of that backend proves the modules are
+   *correct* and none proves they are worth emitting. Here the module is
+   instantiated against `src/jit.js` and a RISC-V guest is run under
+   `engine = "interp"` and `engine = "jit-wasm"` for the same span: one state
+   hash, with the count of blocks entered inside host-compiled modules beside
+   it — because a hash that matched by falling back to the interpreter would
+   prove nothing. Then all three engines are timed and the multiplier printed.
+   The JIT build is a **second module** (`--features wasm,jit-wasm,cpu-riscv-lift`),
+   not the demo: the demo has no RISC-V board and the harness has no console.
+   Without `--jit` the section skips, loudly.
 
 Everything except the DOM, in other words. It does **not** prove Vue renders,
 that the layout works, or that anything is legible — nothing in this repository

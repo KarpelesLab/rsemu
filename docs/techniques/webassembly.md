@@ -42,8 +42,12 @@ and documented on MDN. Two constraints drive the whole design:
   changed.
 - Per-module instantiation cost means only superblocks are worth compiling.
   Measure this at and cut the backend if the numbers say so — the IR
-  interpreter is always the fallback. *Still the open question, and the cost
-  model is now written down rather than asserted.*
+  interpreter is always the fallback. *Measured, and the backend stays.* The
+  browser embedder is built (`src/wasm.rs`, `web/src/jit.js`) and a guest run
+  inside V8-compiled modules is **1.50×** the IR interpreter — per basic block,
+  with no superblocks and no chaining, which is earlier than this bullet
+  expected it to pay. The superblock is still the next thing to try rather than
+  the thing that made it work.
 - Guest RAM lives in the shared linear memory, so generated code addresses it
   with plain loads and stores. *Not yet:* the address a block holds is
   guest-physical, and turning one into a linear-memory offset is the software
