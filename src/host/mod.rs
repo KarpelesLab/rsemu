@@ -17,6 +17,7 @@
 //! | [`signal`] | yes | `SIGINT`, `SIGTERM` and `SIGHUP`, turned into a flag a run loop reads |
 //! | `listen` | yes | where a remote frontend binds, and the loopback-by-default rule |
 //! | `gdb` | yes | the GDB remote serial protocol over TCP (§8) |
+//! | `monitor` | yes | the console: a stopped machine, asked questions and steered (§8) |
 //! | `vnc` | yes | the RFB protocol over TCP: a screen and a keyboard (§8) |
 //!
 //! # Why the trait is not itself `std`
@@ -63,6 +64,10 @@ pub mod trace;
 #[cfg(feature = "gdb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "gdb")))]
 pub mod gdb;
+
+#[cfg(feature = "monitor")]
+#[cfg_attr(docsrs, doc(cfg(feature = "monitor")))]
+pub mod monitor;
 
 #[cfg(feature = "vnc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "vnc")))]

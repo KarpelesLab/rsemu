@@ -47,6 +47,12 @@
 //! With `gdb`, [`host::gdb`] speaks the GDB remote serial protocol over TCP, so
 //! `rsemu debug apple1 --gdb :1234` is a guest a debugger can step through.
 //!
+//! With `monitor`, [`host::monitor`] is the console `ROADMAP.md` §8 asks for:
+//! `rsemu monitor apple1` stops the machine at a prompt that answers what a
+//! debugger has no packet for — the device tree and one device's whole current
+//! state, the clock forest's rates and positions, the wire graph, the
+//! scheduler's queue, the `--trace` counters live, and `rewind`.
+//!
 //! With `vnc`, [`host::vnc`] speaks RFB (RFC 6143) over TCP, so
 //! `rsemu run pc-at --vnc :5900` is a guest anybody with a viewer can watch and
 //! type at. What they type reaches the machine through [`host::input`], at a
@@ -84,8 +90,7 @@
 //! GUI/audio dependency the policy forbids or a seventh `unsafe` subsystem the
 //! ceiling forbids; the JIT's *host code generators*, so everything is still
 //! interpreted — the translation IR they lower from is under [`ir`] and the
-//! runtime they slot into is under [`jit`]; and the rest of the host layer
-//! (VNC, an interactive monitor console).
+//! runtime they slot into is under [`jit`].
 //!
 //! # `no_std`
 //!
@@ -164,6 +169,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "gdb") {
         features.push("gdb");
+    }
+    if cfg!(feature = "monitor") {
+        features.push("monitor");
     }
     if cfg!(feature = "vnc") {
         features.push("vnc");

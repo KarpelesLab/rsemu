@@ -154,6 +154,25 @@ gdb = ["std"]
 # a display device to have anything to show.
 vnc = ["std"]
 
+# The monitor console (src/host/monitor): an interactive prompt on a stopped
+# machine — the device tree and one device's whole current state, the memory
+# map, the clock forest's rates and positions, the wire graph, the scheduler's
+# queue, guest memory read and written through `MemAttrs::debug`, snapshots,
+# rewind, and the `--trace` counters live rather than at the end of a run.
+# `rsemu monitor <machine>`, or `rsemu run <machine> --mon`
+# (docs/system/monitor.md; `ROADMAP.md` §8 "Console/monitor", phase 9).
+#
+# **Implies `gdb`, and that is the point.** A monitor needs the same three
+# things a debugger does — a register map per CPU class, an MMU-aware read that
+# sets `MemAttrs::debug`, and a stepper — and `host::gdb::target` already has
+# all three behind `MachineTarget`. A second copy would be a second register
+# table to keep honest against every core's snapshot layout, and the drift would
+# be invisible until somebody compared the two. So the console builds on that
+# target and *forwards* the eight commands GDB's `qRcmd` packet already answers,
+# which is why `monitor map` inside gdb and `map` at this prompt are one answer
+# and not two. Needs `std` for a terminal and a file; adds no dependency.
+monitor = ["std", "gdb"]
+
 # Tracing and profiling output (src/core/trace.rs, src/host/trace.rs): what a
 # run *did*, as a two-column table of named counters — scheduler rounds and how
 # long each was, per-processor block entries, chaining, translations and
