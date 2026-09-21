@@ -76,6 +76,10 @@ struct Board {
     scanout: DeniseScanout,
     /// The keyboard's host end, which a test types on as a person would.
     keyboard: Arc<Keyboard>,
+    /// DF0 itself, captured the way the processor is, so a test can see where
+    /// the head is — which is how the guest's reaction to a disk change is
+    /// observed without asking it anything.
+    drive: Arc<rsemu::dev::amiga::floppy::Floppy>,
 }
 
 /// What goes into the board: the ROM files, the disk, and any parameters.
@@ -162,6 +166,13 @@ fn board(setup: Setup<'_>) -> Option<Board> {
         kept.push(&cpu);
         Ok(cpu)
     });
+    let drives: Arc<Captured<rsemu::dev::amiga::floppy::Floppy>> = Arc::new(Captured::new());
+    let kept_drives = Arc::clone(&drives);
+    options.bindings.replace("amiga.floppy", move |props| {
+        let drive = Arc::new(rsemu::dev::amiga::floppy::Floppy::new(props)?);
+        kept_drives.push(&drive);
+        Ok(drive)
+    });
     capture::install(&mut options).expect("a capture table");
     options
         .resolve
@@ -190,11 +201,13 @@ fn board(setup: Setup<'_>) -> Option<Board> {
     let keyboard = keys::get(&options.realize.hosts, DEFAULT_KEYBOARD_PORT)
         .expect("a keyboard")
         .expect("the board has a keyboard");
+    let drive = drives.last().expect("the binding captured DF0");
     Some(Board {
         machine,
         cpu,
         scanout,
         keyboard,
+        drive,
     })
 }
 
@@ -479,3 +492,171 @@ const GOLDEN_130_A501_WORKBENCH: u64 = 0xf4d8_f443_2659_d621;
 const GOLDEN_AROS_REQUESTER: u64 = 0x5b3d_e1c5_deeb_bd01;
 /// At 80 s, AROS, the requester cancelled: the `Workbook` desktop.
 const GOLDEN_AROS_DESKTOP: u64 = 0x8650_0fcf_a147_a5cd;
+
+// ---------------------------------------------------------------------------
+// changing the disk under a running guest
+// ---------------------------------------------------------------------------
+
+/// The drive's door, as a host reaches it on a machine it did not build.
+///
+/// Nothing in this section names `amiga.floppy` to find it: the point of
+/// `ExportId::REMOVABLE_MEDIA` is that a front end asks the *machine* which of
+/// its devices has a door, and gets its answer on this board the same way it
+/// gets it on a PC/AT. (`Board::drive` is a different thing and is captured at
+/// build time — a test may look inside the drive; a front end may not.)
+fn door(b: &Board) -> rsemu::dev::medium::MediaPort {
+    let doors = rsemu::dev::medium::attached(&b.machine);
+    let paths: Vec<&str> = doors.iter().map(|d| d.path.as_str()).collect();
+    assert_eq!(paths, ["df0"], "the A500 has exactly one removable bay");
+    rsemu::dev::medium::attached_at(&b.machine, "df0").expect("df0 has a door")
+}
+
+/// Whether the drive says something is in it.
+fn loaded(b: &Board) -> bool {
+    door(b).bays()[0].medium.is_some()
+}
+
+/// Where the head is at the end of each of the next `seconds` seconds.
+fn head_track(b: &mut Board, label: &str, from: u64, seconds: u64) -> Vec<u8> {
+    (from + 1..=from + seconds)
+        .map(|t| {
+            advance(b, label, t - 1, t);
+            let at = b.drive.cylinder();
+            println!("{label} {t}s: head on cylinder {at}");
+            at
+        })
+        .collect()
+}
+
+/// Kickstart 1.3 at its Workbench 1.3 desktop, with the disk taken out from
+/// under it.
+///
+/// The end-to-end claim for the removable-media seam, and the one no unit test
+/// can make: a *real* operating system, which has the volume mounted and its
+/// root block cached, has to find out. It finds out through `CHNG*` — the
+/// drive's change flop, pulled low on the drive connector and read at CIA-A
+/// `PRA` bit 2 — which `dev::medium::Removable` sets when the door opens.
+///
+/// **What the guest does about it is the assertion, and it is the drive
+/// click.** `trackdisk`'s disk-change procedure is to select the drive and
+/// step the head, because Appendix E says the flop "is reset when drive is
+/// selected and the head stepped, but only if a disk is installed" — so with
+/// an empty drive it never resets, and the ROM tries again, and again. That is
+/// the noise every A500 owner knows. Measured here:
+///
+/// ```text
+///   with the disk in     head on cylinder 45, for ten seconds, motionless
+///   with it taken out    45 → 4 within a second (a recalibrate), then
+///                        4 → 3 → 4 → 3, about every two and a half seconds
+/// ```
+///
+/// The motionless leg is what makes the moving one mean something: the head
+/// rests wherever the last read left it, and nothing but the change flop makes
+/// the ROM go and look.
+///
+/// The *picture* does not move, and this test deliberately does not pretend it
+/// does: Workbench 1.3 leaves the disk's icon on the desktop until something
+/// asks the volume for a block. That is what a real 1.3 does too — the icon
+/// goes when you click it, not when you pop the disk out — and asserting a
+/// frame hash here would be asserting a thing that is not true.
+#[test]
+fn ejecting_the_boot_disk_sets_the_drive_clicking() {
+    let Some(disk) = adf("amiga-os-134-workbench.adf") else {
+        return;
+    };
+    let setup = || Setup {
+        df0: disk.clone(),
+        label: "eject-130-workbench",
+        ..Setup::rom("amiga-os-130.rom")
+    };
+
+    // The control leg first, so a failure says which half broke.
+    let Some(mut steady) = board(setup()) else {
+        return;
+    };
+    advance(&mut steady, "steady", 0, 72);
+    let desktop = picture(&steady, "steady", 72);
+    assert_eq!(
+        desktop, GOLDEN_130_WORKBENCH,
+        "the desktop moved; this test is standing on that golden"
+    );
+    let resting = steady.drive.cylinder();
+    let steady_track = head_track(&mut steady, "steady", 72, 10);
+    assert!(
+        steady_track.iter().all(|&at| at == resting),
+        "left alone, the head rests where the last read left it: {steady_track:?}"
+    );
+
+    // And the same board with the disk taken out at 72 s.
+    let mut b = board(setup()).expect("the ROM was there a moment ago");
+    advance(&mut b, "ejected", 0, 72);
+    assert_eq!(picture(&b, "ejected", 72), desktop, "the same desktop");
+    assert!(loaded(&b), "the disk is in the drive");
+    let was = b.drive.cylinder();
+
+    door(&b).eject("disk").expect("the door opens");
+    assert!(!loaded(&b), "and it is out");
+
+    let track = head_track(&mut b, "ejected", 72, 10);
+    assert!(!b.cpu.is_halted(), "the processor double-faulted");
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    assert_ne!(
+        track[0], was,
+        "the ROM did not go looking: CHNG* never reached the guest"
+    );
+    let clicks = track.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(
+        clicks >= 2,
+        "the drive should keep clicking while it is empty: {track:?}"
+    );
+}
+
+/// Kickstart 1.3 at its insert-disk screen, given a disk.
+///
+/// The other direction, and the vivid one: the hand holding a disk is what an
+/// A500 shows with nothing in DF0, and putting one in is what makes it go
+/// away. Nothing here touches the machine except through the seam — no
+/// rebuild, no reset, and no `amiga.floppy` named anywhere.
+///
+/// The ROM is twelve seconds into its insert-disk animation when the disk
+/// arrives. Eighty seconds later the screen is something else, which on this
+/// board means `trackdisk` saw the change flop, read the boot block and
+/// AmigaDOS got as far as drawing over it.
+#[test]
+fn inserting_a_disk_at_the_insert_disk_screen_starts_the_boot() {
+    let Some(disk) = adf("amiga-os-134-workbench.adf") else {
+        return;
+    };
+    let Some(mut b) = board(Setup {
+        label: "insert-130",
+        ..Setup::rom("amiga-os-130.rom")
+    }) else {
+        return;
+    };
+
+    advance(&mut b, "insert-130", 0, 12);
+    assert_eq!(
+        picture(&b, "insert-130", 12),
+        GOLDEN_130,
+        "the hand and the disk: an A500 with an empty drive"
+    );
+    assert!(!loaded(&b), "and the drive says it is empty");
+
+    door(&b)
+        .insert("disk", rsemu::dev::medium::from_bytes(&disk), false)
+        .expect("an ADF of the right length");
+    assert!(loaded(&b), "the drive has it now");
+
+    advance(&mut b, "insert-130", 12, 92);
+    let after = picture(&b, "insert-130", 92);
+    assert!(!b.cpu.is_halted(), "the processor double-faulted");
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    assert_ne!(
+        after, GOLDEN_130,
+        "the insert-disk screen is still up: the guest never saw the disk arrive"
+    );
+    assert!(
+        b.drive.cylinder() > 0,
+        "and the head left cylinder 0 to read it"
+    );
+}
