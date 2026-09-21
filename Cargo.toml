@@ -2923,6 +2923,22 @@ dev-amiga-cd32pad = ["dev-amiga"]
 # drive it talks to. `no_std + alloc`, no dependencies.
 dev-amiga-gayle = ["dev-amiga", "dev-ata-disk"]
 
+# The A4000's IDE port (src/dev/amiga/ide.rs): `amiga.ide` -- the same decode
+# Gayle does for an A600, at the A4000's own address and with the A4000's own
+# interrupt. The chip select on A12 and the drive's three address lines on
+# A2-A4, so register n is four bytes on from register n-1; the data bus
+# byte-swapped, so the eight-bit registers are on the even byte and a sector
+# lands in memory in the order a PC wrote it; the `ata.disk` drive reused
+# unchanged; and one interrupt latch at $00DD3020 -- the control block's
+# register 0, which no ATA drive drives -- carrying the drive's INTRQ onto
+# INT2 and Paula's PORTS level. No PCMCIA slot, no identification register and
+# no overlay: an A4000 has no Gayle, so none of the three is on this board.
+# Where the registers are was established black-box, from the bus cycles
+# `amiga-os-310-a4000.rom` makes on a board that answers nowhere else; see the
+# file's header. Implies `dev-amiga` and `dev-ata-disk`, the drive it talks to.
+# `no_std + alloc`, no dependencies.
+dev-amiga-ide = ["dev-amiga", "dev-ata-disk"]
+
 # Ramsey, the A3000's memory controller (src/dev/amiga/ramsey.rs), as software
 # can see it: two registers, the control register at $DE0003 and the version
 # register at $DE0043. Everything the chip actually *does* -- DRAM refresh,
@@ -2997,6 +3013,15 @@ machine-amiga-a1200 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-a
 # RAM and no Zorro cards: both windows float, which is a machine Commodore
 # sold. Adds no dependencies.
 machine-amiga-a3000 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-amiga-rtc", "dev-amiga-ramsey", "dev-mos8520", "dev-amiga-sdmac", "dev-scsi"]
+
+# The `amiga-a4000` board (machines/amiga-a4000.machine): a Commodore Amiga
+# 4000 -- a 68040 with its on-chip FPU, the AA chip set (Alice and Lisa), 2 MiB
+# of chip RAM and motherboard fast RAM behind Ramsey in a 32-bit address space,
+# the battery-backed clock, DF0, both CIAs, the keyboard and the mouse -- and
+# the A4000's own IDE port at $00DD2020, with an `ata.disk` on the `hd0` media
+# slot. Kickstart 3.1 boots Workbench 3.1 off the same RDB whole disk the A600
+# boots off Gayle's port, with no floppy. Adds no dependencies.
+machine-amiga-a4000 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-amiga-rtc", "dev-amiga-ramsey", "dev-amiga-ide", "dev-mos8520", "dev-ata-disk"]
 
 # The `amiga-cd32` board (machines/amiga-cd32.machine): a Commodore Amiga
 # CD32 -- the A1200's AA chip set and 68EC020 with 2 MiB of chip RAM, a

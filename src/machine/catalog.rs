@@ -743,6 +743,26 @@ pub static AMIGA_A3000: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/amiga-a3000.machine"),
 };
 
+/// A Commodore Amiga 4000, when this build has the board classes and its IDE
+/// port.
+///
+/// A 68040 with its on-chip FPU, the AA chip set — Alice and Lisa — 2 MiB of
+/// chip RAM and motherboard fast RAM behind Ramsey in a 32-bit address space,
+/// the battery-backed clock, and the A4000's own IDE port with an `ata.disk`
+/// on the `hd0` slot. The `kickstart` slot takes the ROM, `hd0` a whole-disk
+/// image with a Rigid Disk Block, `df0` a floppy; both drives may be empty.
+/// `machines/amiga-a4000.machine` carries the wiring, and
+/// `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-a4000")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a4000")))]
+pub static AMIGA_A4000: CatalogEntry = CatalogEntry {
+    name: "amiga-a4000",
+    summary: "an Amiga 4000: a 68040, the AA chip set, 2 MiB of chip RAM with motherboard fast \
+              RAM, and an IDE hard disk",
+    media: &["kickstart", "hd0", "df0"],
+    source: include_str!("../../machines/amiga-a4000.machine"),
+};
+
 /// A Commodore Amiga 1200, when this build has the board classes and Gayle.
 ///
 /// The AA chip set — Alice (`revision = "aga"` on `amiga.agnus`) and Lisa (the
@@ -905,6 +925,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&AMIGA_A1200);
     #[cfg(feature = "machine-amiga-a3000")]
     out.push(&AMIGA_A3000);
+    #[cfg(feature = "machine-amiga-a4000")]
+    out.push(&AMIGA_A4000);
     #[cfg(feature = "machine-amiga-a500plus")]
     out.push(&AMIGA_A500PLUS);
     #[cfg(feature = "machine-amiga-cd32")]
@@ -2508,6 +2530,15 @@ mod tests {
                 0x00, 0x00, 0x00, 0x08, // PC  = $00000008
                 0x60, 0xfe, // BRA .
             ],
+            // The same, on the A4000, whose stack pointer is the top of its
+            // 2 MiB of chip RAM. `tests/amiga_a4000_board.rs` drives its IDE
+            // port without a ROM; `tests/amiga_a4000.rs` boots the user's.
+            #[cfg(feature = "machine-amiga-a4000")]
+            ("amiga-a4000", "kickstart") => &[
+                0x00, 0x20, 0x00, 0x00, // SSP = $00200000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             #[cfg(feature = "machine-amiga-a1200")]
             ("amiga-a1200", "kickstart") => &[
                 0x00, 0x20, 0x00, 0x00, // SSP = $00200000
@@ -2627,6 +2658,10 @@ mod tests {
             // empty SCSI address, which is the machine with its disk removed.
             #[cfg(feature = "machine-amiga-a3000")]
             ("amiga-a3000", "hd0" | "df0") => &[],
+            // An A4000 with neither drive filled: no bytes on `hd0` is an
+            // empty IDE bay, which is the machine with its disk taken out.
+            #[cfg(feature = "machine-amiga-a4000")]
+            ("amiga-a4000", "hd0" | "df0") => &[],
             // A CD32 with no disc in the tray and no second ROM half: the
             // boot screen, which is what the machine does on its own. The
             // `ext` socket is a slot rather than a second image of the
