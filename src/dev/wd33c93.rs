@@ -217,6 +217,20 @@ pub const INT_TERMINATED: u8 = 0x40;
 /// `1000 xxxx`: the bus needs service.
 pub const INT_SERVICE: u8 = 0x80;
 
+/// The bit that says the low three bits are an `MCI` field.
+///
+/// §6.2.19 writes every phase-carrying row of its four tables as `1MCI` in the
+/// *code* nibble — `0001 1MCI`, `0010 1MCI`, `0100 1MCI`, `1000 1MCI` — never
+/// as a bare `MCI`. The fourth bit is not decoration: dropping it does not make
+/// a near miss, it names a different row of the same table. A Message-Out
+/// service interrupt becomes `86` Hex, which the service-required table lists
+/// as "reserved for future use", and a `Transfer` completing into a `DATA IN`
+/// phase becomes `11` Hex, which the successful-completion table already
+/// spends on "a Select command completed successfully". Commodore's
+/// `scsi.device` reads `86` Hex, finds nothing it knows and never issues
+/// another command, which is what a driver should do with a reserved status.
+pub const INT_MCI: u8 = 0x08;
+
 /// `11` Hex: a `Select` completed; the chip is connected as an initiator.
 pub const INT_SELECT_DONE: u8 = 0x11;
 /// `16` Hex: a `Select-And-Transfer` completed.
@@ -319,6 +333,10 @@ impl ControllerPort {
     }
 
     /// Load the Address register — the `A0` low write.
+    ///
+    /// One of the two host accesses that do **not** let an interrupt the chip
+    /// has queued arrive: it is the host aiming rather than acting, and a host
+    /// issuing a command has to aim first (§6.2.2, §6.2.20).
     pub fn write_address(&self, value: u8) {
         self.chip.write_address(value);
     }
@@ -329,7 +347,10 @@ impl ControllerPort {
         self.chip.state.lock().address
     }
 
-    /// Auxiliary Status — the `A0` low read. Never a side effect.
+    /// Auxiliary Status — the `A0` low read. Never a side effect, and the other
+    /// access that does not let a queued interrupt arrive: §6.2.1 says this
+    /// register "may be accessed at any time", so a host polling it is not the
+    /// host having moved on.
     #[must_use]
     pub fn read_aux(&self) -> u8 {
         self.chip.read_aux()
@@ -344,6 +365,7 @@ impl ControllerPort {
     /// Write the register the Address register names — the `A0` high write.
     pub fn write_register(&self, value: u8) {
         self.chip.write_indirect(value);
+        self.chip.settle();
     }
 
     /// Assert `MR-`: the hardware reset of §6.3.1.
@@ -534,6 +556,15 @@ impl Chip {
     /// `A0` high, read.
     fn read_indirect(&self, debug: bool) -> u8 {
         let address = self.state.lock().address;
+        let value = self.read_indirect_at(address, debug);
+        if !debug && !matches!(address, SCSI_STATUS | AUX_STATUS) {
+            self.settle();
+        }
+        value
+    }
+
+    /// The register access itself, without the settle the caller applies.
+    fn read_indirect_at(&self, address: u8, debug: bool) -> u8 {
         match address {
             AUX_STATUS => self.read_aux(),
             DATA => self.read_data(debug),
@@ -558,6 +589,9 @@ impl Chip {
                 if !debug {
                     self.refresh();
                 }
+                // No settle: this *is* the read that cleared `INTRQ`, and
+                // §6.2.20 gives the host the access after it to put a command
+                // in. See [`Chip::poll_pending`].
                 value
             }
             reg if usize::from(reg) < REGS => {
@@ -633,7 +667,9 @@ impl Chip {
             (byte, left > 0)
         };
         if want_more {
-            self.stage_input();
+            if !self.stage_input() {
+                self.terminate_polled();
+            }
         } else {
             self.finish_polled();
         }
@@ -642,7 +678,7 @@ impl Chip {
 
     /// Write one byte into the FIFO and push it onto the bus.
     fn write_data(&self, value: u8) {
-        let (target, done) = {
+        let (target, left, was) = {
             let mut state = self.state.lock();
             let Some(p) = state.polled.as_mut() else {
                 return;
@@ -650,29 +686,95 @@ impl Chip {
             if p.input {
                 return;
             }
+            let was = p.phase;
             p.left = p.left.saturating_sub(1);
             let left = p.left;
             state.set_count(left);
-            (state.selected_id, left == 0)
+            (state.selected_id, left, was)
         };
-        if let Some(target) = self.bus.target(target) {
-            target.write(&[value]);
+        // The target refusing the byte is the phase having ended under us; put
+        // the count back before saying so, because §7.5.6's terminated
+        // interrupt promises "the number of bytes yet to be transferred".
+        let taken = self
+            .bus
+            .target(target)
+            .is_some_and(|t| t.phase() == was && t.write(&[value]) == 1);
+        if !taken {
+            let mut state = self.state.lock();
+            if let Some(p) = state.polled.as_mut() {
+                p.left = left.saturating_add(1);
+                let back = p.left;
+                state.set_count(back);
+            }
+            drop(state);
+            self.terminate_polled();
+            return;
         }
-        if done {
+        if left == 0 {
             self.finish_polled();
         }
     }
 
-    /// Pull the next input byte off the target into the staging slot.
-    fn stage_input(&self) {
-        let id = self.state.lock().selected_id;
-        let Some(target) = self.bus.target(id) else {
-            return;
+    /// Pull the next input byte off the target into the staging slot, and say
+    /// whether one came.
+    ///
+    /// `false` is the phase this transfer started in having ended, which §5.1
+    /// of X3.131 makes the *only* way a phase ends: there is no other signal.
+    /// The caller turns that into §7.5.6's terminated interrupt.
+    ///
+    /// The phase is checked **before** the byte is taken, not after. A target
+    /// that has finished its `DATA IN` is already asking for `STATUS`, and its
+    /// status byte belongs to the transfer the host issues next — reading it
+    /// here would hand the host a data byte that is really a status byte and
+    /// then swallow the `COMMAND COMPLETE` behind it.
+    fn stage_input(&self) -> bool {
+        let (id, want) = {
+            let state = self.state.lock();
+            (state.selected_id, state.polled.map(|p| p.phase))
         };
+        let (Some(want), Some(target)) = (want, self.bus.target(id)) else {
+            return false;
+        };
+        if target.phase() != want {
+            return false;
+        }
         let mut byte = [0u8; 1];
         let got = target.read(&mut byte);
         let mut state = self.state.lock();
         state.data_in = (got == 1).then_some(byte[0]);
+        got == 1
+    }
+
+    /// §7.5.6: "a transition in the I/O-, C/D-, and/or MSG- pins during a
+    /// Transfer command will also terminate the command and generate a
+    /// 'terminated' interrupt".
+    ///
+    /// This is the phase ending before the Transfer Count did, which is the
+    /// ordinary way a SCSI-2 transfer ends whenever the initiator asked for
+    /// more than the target had — an `INQUIRY` with an allocation length of
+    /// `FE` Hex against a target with 36 bytes of it, which is exactly what
+    /// Commodore's `scsi.device` issues. Without it the host polls `DBR` for a
+    /// byte that is never coming.
+    fn terminate_polled(&self) {
+        let id = {
+            let mut state = self.state.lock();
+            if state.polled.take().is_none() {
+                return;
+            }
+            state.data_in = None;
+            state.selected_id
+        };
+        let phase = self.bus.target(id).map_or(Phase::BusFree, |t| t.phase());
+        let mut state = self.state.lock();
+        match phase.mci() {
+            Some(mci) => state.raise(&[INT_TERMINATED | INT_MCI | mci]),
+            None => {
+                state.disconnect();
+                state.raise(&[INT_UNEXPECTED_DISCONNECT]);
+            }
+        }
+        drop(state);
+        self.refresh();
     }
 
     /// A polled `Transfer Info` has moved its last byte: work out the
@@ -697,7 +799,7 @@ impl Chip {
             match phase.mci() {
                 // §7.5.6: for every other phase the completion interrupt comes
                 // with the *new* phase the target is asking for.
-                Some(mci) => state.raise(&[INT_DONE | mci]),
+                Some(mci) => state.raise(&[INT_DONE | INT_MCI | mci]),
                 None => {
                     state.disconnect();
                     state.raise(&[INT_DISCONNECTED]);
@@ -814,16 +916,24 @@ impl Chip {
 
     /// §7.4.2, in the initiator and disconnected states.
     fn abort(&self) {
-        let connected = {
+        let (connected, id) = {
             let mut state = self.state.lock();
             state.polled = None;
             state.data_in = None;
-            state.connected
+            (state.connected, state.selected_id)
         };
+        // §6.2.19: `0010 1MCI` — "A Transfer command was aborted. MCI define
+        // the new information type being requested", so the phase is read with
+        // nothing of this chip's held.
+        let mci = connected
+            .then(|| self.bus.target(id))
+            .flatten()
+            .and_then(|t| t.phase().mci())
+            .unwrap_or(0);
         let mut state = self.state.lock();
         if connected {
             // "A Transfer command was aborted" — the chip stays connected.
-            state.raise(&[INT_PAUSED | 0x08]);
+            state.raise(&[INT_PAUSED | INT_MCI | mci]);
         } else {
             // "A Select or Reselect command was aborted."
             state.raise(&[INT_PAUSED | 0x02]);
@@ -885,24 +995,16 @@ impl Chip {
         state.connected = true;
         state.selected_id = id;
         state.atn = atn;
-        // §7.5.1 then §7.5.6: the select completes, and the first `REQ` after
-        // connection is a "service required" interrupt naming the phase.
-        // §7.5.1 then §7.5.6: the select completes, and the first `REQ` after
-        // connection is a "service required" interrupt naming the phase. The
-        // second is *queued* rather than raised: a host that has just read the
-        // SCSI Status register to find out the selection succeeded must find
-        // `INT` clear afterwards, or it cannot issue the command that answers
-        // the phase (§6.2.20). It arrives on the host's next poll — see
-        // [`Chip::poll_pending`].
-        // §7.5.1 then §7.5.6: the select completes, and the first `REQ` after
-        // connection is a "service required" interrupt naming the phase. The
-        // second is *queued* rather than raised: a host that has just read the
-        // SCSI Status register to find out the selection succeeded must find
-        // `INT` clear afterwards, or it cannot issue the command that answers
-        // the phase (§6.2.20). It arrives on the host's next poll — see
+        // §7.5.1 then §7.5.6: the select completes, and "the first REQ-
+        // assertion following connection as an Initiator results in a 'service
+        // required' interrupt" naming the phase. The second is *queued* rather
+        // than raised: a host that has just read the SCSI Status register to
+        // find out the selection succeeded must find `INT` clear afterwards,
+        // or it cannot issue the command that answers the phase (§6.2.20). It
+        // arrives one host access later, on its own — see
         // [`Chip::poll_pending`].
         match phase.mci() {
-            Some(mci) => state.raise(&[INT_SELECT_DONE, INT_SERVICE | mci]),
+            Some(mci) => state.raise(&[INT_SELECT_DONE, INT_SERVICE | INT_MCI | mci]),
             None => state.raise(&[INT_SELECT_DONE]),
         }
         drop(state);
@@ -956,7 +1058,7 @@ impl Chip {
             let mut state = self.state.lock();
             state.set_count(count - moved);
             drop(state);
-            self.after_transfer(&target, phase);
+            self.after_transfer(&target, phase, moved == count);
             return;
         }
         // Polled: stage the first byte if one is coming in, and let the host
@@ -971,8 +1073,11 @@ impl Chip {
             state.set_count(count);
             state.data_in = None;
         }
-        if input {
-            self.stage_input();
+        if input && !self.stage_input() {
+            // The target asked for this phase and then had nothing in it: a
+            // zero-length data phase, which §7.5.6 terminates rather than
+            // leaving the host polling `DBR`.
+            self.terminate_polled();
         }
     }
 
@@ -989,8 +1094,14 @@ impl Chip {
         let Some(port) = self.dma.lock().clone() else {
             return 0;
         };
+        let was = target.phase();
         let mut moved = 0u32;
         while moved < count {
+            // §7.5.6: the transfer ends where the phase does, and the bytes of
+            // the next phase are not this transfer's to take.
+            if target.phase() != was {
+                break;
+            }
             let want = (count - moved).min(BURST as u32) as usize;
             let mut buf = alloc::vec![0u8; want];
             let n = if input {
@@ -1014,16 +1125,23 @@ impl Chip {
         moved
     }
 
-    /// The interrupt a completed DMA `Transfer Info` raises (§7.5.6).
-    fn after_transfer(&self, target: &Arc<dyn Target>, was: Phase) {
+    /// The interrupt a DMA `Transfer Info` raises (§7.5.6).
+    ///
+    /// `whole` is whether the Transfer Count reached zero. It did not when the
+    /// phase ended first — the target had less than the host asked for, or the
+    /// DMA controller stopped answering — and §6.2.19's `0100 1MCI` row is
+    /// exactly that: "an unexpected information phase was requested … typically
+    /// caused by a phase change before the Transfer Count has reached zero".
+    fn after_transfer(&self, target: &Arc<dyn Target>, was: Phase, whole: bool) {
         let phase = target.phase();
         let mut state = self.state.lock();
         if was == Phase::MessageIn {
             state.ack_held = true;
             state.raise(&[INT_MSG_IN_PAUSED]);
         } else {
+            let group = if whole { INT_DONE } else { INT_TERMINATED };
             match phase.mci() {
-                Some(mci) => state.raise(&[INT_DONE | mci]),
+                Some(mci) => state.raise(&[group | INT_MCI | mci]),
                 None => {
                     state.disconnect();
                     state.raise(&[INT_DISCONNECTED]);
@@ -1194,7 +1312,7 @@ impl Chip {
         match phase.mci() {
             Some(mci) => {
                 state.connected = true;
-                state.raise(&[INT_TERMINATED | mci]);
+                state.raise(&[INT_TERMINATED | INT_MCI | mci]);
             }
             None => {
                 state.disconnect();
@@ -1221,13 +1339,39 @@ impl Chip {
     /// phase interrupt. §6.2.20 forbids it from writing a command while `INT`
     /// is set, so a model that raises both at once — the status read clearing
     /// one interrupt and revealing the next in the same bus cycle — leaves the
-    /// driver with nowhere to go. Commodore's `scsi.device` does exactly this
-    /// and waits forever.
+    /// driver with nowhere to go.
     ///
-    /// So the second interrupt is delivered here, when the host **asks** —
-    /// which a board does by reading its own interrupt status register, and
-    /// which `amiga.sdmac`'s `ISTR` read does. That is the same "later" a real
-    /// chip has, expressed as the only ordering this model has.
+    /// # How long the gap is
+    ///
+    /// Until the host next *does* something. Three accesses are the host
+    /// looking rather than acting and pass without settling — the SCSI Status
+    /// read that cleared `INTRQ`, a load of the Address register (§6.2.2,
+    /// which is a host-side pointer and not a bus cycle the sequencer sees)
+    /// and a read of Auxiliary Status (§6.2.1: "may be accessed at any time",
+    /// and it is the register a host polls). Every other access settles the
+    /// queue through [`Chip::settle`], *after* that access has had its effect.
+    ///
+    /// So a host that answers an interrupt with `SASR := Command;
+    /// SCMD := cmd` — the shortest command there is, whether or not it checks
+    /// `INT` in Auxiliary Status on the way — gets its command accepted, and
+    /// the queued interrupt arrives behind it. A host that does anything else
+    /// gets the interrupt.
+    ///
+    /// That window is the datasheet's. §6.2.20: "a command should not be loaded
+    /// into the Command register within seven microseconds … from the last
+    /// SCSI Status read to avoid the command being ignored" — the real part
+    /// re-raises `INTRQ` a few microseconds after the status read whether or
+    /// not the host does anything, and the host is expected to have got its
+    /// command in first. This is that, expressed in bus cycles because a chip
+    /// with no clock property has no microseconds.
+    ///
+    /// Waiting instead for the host to *ask* — for a board to read its own
+    /// interrupt status register — deadlocks, and it is not a theoretical
+    /// deadlock: an `INTRQ` that only re-asserts when someone reads `ISTR`, and
+    /// an `ISTR` that is only read from an interrupt handler, is a cycle with
+    /// no entry. On an A3000 it survived on CIA-A's unrelated level-2
+    /// interrupts dragging the server chain through `ISTR`, and the boot
+    /// stopped the moment those went quiet.
     fn poll_pending(&self) -> bool {
         let raised = {
             let mut state = self.state.lock();
@@ -1241,6 +1385,18 @@ impl Chip {
         };
         self.refresh();
         raised
+    }
+
+    /// A host access has completed: let anything queued behind the interrupt
+    /// the host has just taken arrive. See [`Chip::poll_pending`].
+    fn settle(&self) {
+        let queued = {
+            let state = self.state.lock();
+            !state.intrq && !state.pending.is_empty()
+        };
+        if queued {
+            self.poll_pending();
+        }
     }
 
     /// Drive `INTRQ` from the registers, with nothing held while the net

@@ -501,7 +501,7 @@ fn a_debug_write_is_refused_and_a_debug_read_strobes_nothing() {
     r.sasr(wd33c93::SCSI_STATUS);
     assert_eq!(
         r.scmd_read(),
-        wd33c93::INT_SERVICE | 0b110,
+        wd33c93::INT_SERVICE | wd33c93::INT_MCI | 0b110,
         "§7.5.6's first REQ, naming the MESSAGE OUT phase"
     );
 }

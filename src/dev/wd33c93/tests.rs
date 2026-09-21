@@ -377,7 +377,7 @@ fn selecting_a_target_completes_and_then_asks_for_service() {
     assert_eq!(r.interrupt(), Some(INT_SELECT_DONE));
     assert_eq!(
         r.interrupt(),
-        Some(INT_SERVICE | Phase::MessageOut.mci().unwrap()),
+        Some(INT_SERVICE | INT_MCI | Phase::MessageOut.mci().unwrap()),
         "ATN was asserted, so the target wants a message"
     );
 
@@ -389,7 +389,7 @@ fn selecting_a_target_completes_and_then_asks_for_service() {
     assert_eq!(r.interrupt(), Some(INT_SELECT_DONE));
     assert_eq!(
         r.interrupt(),
-        Some(INT_SERVICE | Phase::Command.mci().unwrap())
+        Some(INT_SERVICE | INT_MCI | Phase::Command.mci().unwrap())
     );
 }
 
@@ -430,29 +430,35 @@ fn an_inquiry_driven_phase_by_phase_returns_the_targets_identity() {
     assert_eq!(r.interrupt(), Some(INT_SELECT_DONE));
     assert_eq!(
         r.interrupt(),
-        Some(INT_SERVICE | Phase::MessageOut.mci().unwrap())
+        Some(INT_SERVICE | INT_MCI | Phase::MessageOut.mci().unwrap())
     );
 
     // Message out: one `IDENTIFY` byte, and the target then wants the command.
     send(&r, &[0x80]);
     assert_eq!(
         r.interrupt(),
-        Some(INT_DONE | Phase::Command.mci().unwrap())
+        Some(INT_DONE | INT_MCI | Phase::Command.mci().unwrap())
     );
 
     // Command out: six bytes, and the target then has data.
     send(&r, &[0x12, 0, 0, 0, 36, 0]);
-    assert_eq!(r.interrupt(), Some(INT_DONE | Phase::DataIn.mci().unwrap()));
+    assert_eq!(
+        r.interrupt(),
+        Some(INT_DONE | INT_MCI | Phase::DataIn.mci().unwrap())
+    );
 
     let data = receive(&r, 36);
     assert_eq!(&data[8..13], b"RSEMU");
-    assert_eq!(r.interrupt(), Some(INT_DONE | Phase::Status.mci().unwrap()));
+    assert_eq!(
+        r.interrupt(),
+        Some(INT_DONE | INT_MCI | Phase::Status.mci().unwrap())
+    );
 
     let status = receive(&r, 1);
     assert_eq!(status[0], status::GOOD);
     assert_eq!(
         r.interrupt(),
-        Some(INT_DONE | Phase::MessageIn.mci().unwrap())
+        Some(INT_DONE | INT_MCI | Phase::MessageIn.mci().unwrap())
     );
 
     // §7.5.6: a Message-In transfer *pauses* with `ACK` asserted rather than
@@ -461,6 +467,110 @@ fn an_inquiry_driven_phase_by_phase_returns_the_targets_identity() {
     assert_eq!(msg[0], 0x00, "COMMAND COMPLETE");
     assert_eq!(r.interrupt(), Some(INT_MSG_IN_PAUSED));
     r.command(CMD_NEGATE_ACK);
+}
+
+#[test]
+fn every_phase_carrying_interrupt_has_the_mci_bit_the_status_table_writes() {
+    // §6.2.19 writes the code nibble of every phase-carrying row as `1MCI`,
+    // never a bare `MCI`: `0001 1MCI`, `0010 1MCI`, `0100 1MCI`, `1000 1MCI`.
+    // The bare form collides with rows that are already spoken for — `86` Hex
+    // is "reserved for future use" in the service-required table and `11` Hex
+    // is "a Select command completed successfully" in the other — and a driver
+    // reading one of those goes quiet, which is what Commodore's `scsi.device`
+    // did.
+    let r = rig();
+    let _ = r.interrupt();
+    r.set(CONTROL, 0x00);
+    r.set(DEST_ID, TARGET);
+    r.command(CMD_SELECT_ATN);
+    assert_eq!(r.interrupt(), Some(0x11), "select complete, no MCI in it");
+    assert_eq!(r.interrupt(), Some(0x8e), "service required, MESSAGE OUT");
+    send(&r, &[0x80]);
+    assert_eq!(r.interrupt(), Some(0x1a), "transfer done, COMMAND next");
+    send(&r, &[0x12, 0, 0, 0, 36, 0]);
+    assert_eq!(r.interrupt(), Some(0x19), "transfer done, DATA IN next");
+}
+
+#[test]
+fn a_transfer_longer_than_the_phase_terminates_instead_of_stalling() {
+    // §7.5.6: "a transition in the I/O-, C/D-, and/or MSG- pins during a
+    // Transfer command will also terminate the command and generate a
+    // 'terminated' interrupt", and §6.2.19's `0100 1MCI` row names it: "an
+    // unexpected information phase was requested … typically caused by a phase
+    // change before the Transfer Count has reached zero".
+    //
+    // This is the ordinary case, not an error one: an `INQUIRY` whose
+    // allocation length is larger than the target's data — `FE` Hex against 36
+    // bytes, which is exactly what `scsi.device` issues.
+    let r = rig();
+    let _ = r.interrupt();
+    r.set(CONTROL, 0x00);
+    r.set(DEST_ID, TARGET);
+    r.command(CMD_SELECT_ATN);
+    let _ = r.interrupt();
+    let _ = r.interrupt();
+    send(&r, &[0x80]);
+    let _ = r.interrupt();
+    send(&r, &[0x12, 0, 0, 0, 0xfe, 0]);
+    assert_eq!(
+        r.interrupt(),
+        Some(INT_DONE | INT_MCI | Phase::DataIn.mci().unwrap())
+    );
+
+    r.set_count(0xfe);
+    r.command(CMD_TRANSFER_INFO);
+    let mut got = Vec::new();
+    while r.aux() & AUX_DBR == AUX_DBR {
+        got.push(r.reg(DATA));
+    }
+    assert_eq!(got.len(), 36, "the target had 36 bytes of it");
+    assert_eq!(&got[8..13], b"RSEMU");
+    assert_eq!(
+        r.interrupt(),
+        Some(INT_TERMINATED | INT_MCI | Phase::Status.mci().unwrap()),
+        "the phase ended before the count did"
+    );
+    // §7.5.6: "the Transfer Count register will contain the number of bytes
+    // yet to be transferred".
+    assert_eq!(r.reg(COUNT_MSB), 0x00);
+    assert_eq!(r.get(), 0x00);
+    assert_eq!(r.get(), 0xfe - 36);
+    // And the status byte is still the target's to give, not swallowed by the
+    // data phase that ran past its end.
+    assert_eq!(receive(&r, 1), vec![status::GOOD]);
+}
+
+#[test]
+fn a_queued_interrupt_arrives_without_anyone_reading_a_board_register() {
+    // The service-required interrupt behind a `Select` is queued for exactly
+    // one host access, and then settles on its own — see `Chip::poll_pending`.
+    // A model that waited for the host to *ask* deadlocks: nothing re-asserts
+    // `INTRQ`, so no interrupt handler runs, so nobody asks.
+    let r = rig();
+    let _ = r.interrupt();
+    r.set(DEST_ID, TARGET);
+    r.command(CMD_SELECT_ATN);
+
+    // The board's own poll is not used at all here: the pin is read directly.
+    assert!(r.intrq.high());
+    r.sasr(SCSI_STATUS);
+    assert_eq!(r.get(), INT_SELECT_DONE);
+    assert!(!r.intrq.high(), "§6.2.19: reading it clears INTRQ");
+
+    // Aiming the Address register and looking at Auxiliary Status are the two
+    // accesses that leave the window open, so a host can still get a command in.
+    r.sasr(COMMAND);
+    assert_eq!(r.aux() & AUX_INT, 0, "still clear: the host may command");
+    assert!(!r.intrq.high());
+
+    // Anything else closes it, and the pin comes back up by itself.
+    assert_eq!(r.reg(COMMAND_PHASE), command_phase::IDLE);
+    assert!(r.intrq.high(), "the queued interrupt arrived unasked");
+    r.sasr(SCSI_STATUS);
+    assert_eq!(
+        r.get(),
+        INT_SERVICE | INT_MCI | Phase::MessageOut.mci().unwrap()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -566,7 +676,7 @@ fn an_unexpected_phase_terminates_the_combination_command_where_it_stands() {
     // §6.2.19's `0100 1MCI`, naming the phase the target actually wants.
     assert_eq!(
         r.interrupt(),
-        Some(INT_TERMINATED | Phase::Status.mci().unwrap())
+        Some(INT_TERMINATED | INT_MCI | Phase::Status.mci().unwrap())
     );
     assert_eq!(
         r.reg(COMMAND_PHASE) & 0xf0,
@@ -656,10 +766,13 @@ fn the_window_is_two_addresses_and_a_debug_read_moves_nothing() {
     assert_eq!(r.interrupt(), Some(INT_SELECT_DONE));
     assert_eq!(
         r.interrupt(),
-        Some(INT_SERVICE | Phase::Command.mci().unwrap())
+        Some(INT_SERVICE | INT_MCI | Phase::Command.mci().unwrap())
     );
     send(&r, &[0x12, 0, 0, 0, 36, 0]);
-    assert_eq!(r.interrupt(), Some(INT_DONE | Phase::DataIn.mci().unwrap()));
+    assert_eq!(
+        r.interrupt(),
+        Some(INT_DONE | INT_MCI | Phase::DataIn.mci().unwrap())
+    );
     r.set_count(36);
     r.command(CMD_TRANSFER_INFO);
 
@@ -681,7 +794,7 @@ fn the_window_is_two_addresses_and_a_debug_read_moves_nothing() {
     assert_eq!(&data[8..13], b"RSEMU");
     assert!(r.chip.port().poll_irq());
     r.sasr(SCSI_STATUS);
-    assert_eq!(r.peek(1), INT_DONE | Phase::Status.mci().unwrap());
+    assert_eq!(r.peek(1), INT_DONE | INT_MCI | Phase::Status.mci().unwrap());
     assert_eq!(r.aux() & AUX_INT, AUX_INT, "still pending");
     assert_eq!(r.chip.port().address(), SCSI_STATUS, "and it did not move");
 
@@ -739,12 +852,12 @@ fn a_snapshot_round_trips_to_identical_state() {
     assert_eq!(saved.interrupt(), Some(INT_SELECT_DONE));
     assert_eq!(
         saved.interrupt(),
-        Some(INT_SERVICE | Phase::Command.mci().unwrap())
+        Some(INT_SERVICE | INT_MCI | Phase::Command.mci().unwrap())
     );
     send(&saved, &[0x12, 0, 0, 0, 36, 0]);
     assert_eq!(
         saved.interrupt(),
-        Some(INT_DONE | Phase::DataIn.mci().unwrap())
+        Some(INT_DONE | INT_MCI | Phase::DataIn.mci().unwrap())
     );
     saved.set_count(36);
     saved.command(CMD_TRANSFER_INFO);
