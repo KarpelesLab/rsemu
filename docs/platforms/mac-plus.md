@@ -508,10 +508,9 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 
    Separately, and true whatever the loop turns out to want: **this board's
    cylinders are the wrong length.** A cylinder here is exactly as long as the
-   sectors on it
-   — `src/dev/mac/gcr.rs` lays down twelve sectors of 6,186 bit cells and
-   stops — with no trailing gap before sector 0 comes round again, which a real
-   formatter leaves. So this disk's revolution is 74,232 cells and its rotation
+   sectors on it — `src/dev/mac/gcr.rs` lays down twelve sectors of 6,186 bit
+   cells and stops — with no trailing gap before sector 0 comes round again,
+   which a real formatter leaves. So this disk's revolution is 74,232 cells and its rotation
    rate is whatever that works out at against the bit clock, rather than the
    drive's actual speed.
 
