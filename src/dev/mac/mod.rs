@@ -4,6 +4,8 @@
 //! | Module | Feature | What it is |
 //! | --- | --- | --- |
 //! | [`glue`] | `dev-mac` | the address decoder: the ROM overlay at zero and the RAM window above it |
+//! | [`disk`] | `dev-mac` | the disk in the drive: a 400K or 800K image, raw or in a DiskCopy 4.2 container |
+//! | [`gcr`] | `dev-mac` | Apple's 6-and-2 group-code recording: the bit stream on an 800K disk |
 //! | [`iwm`] | `dev-mac` | an Integrated Woz Machine and the 400K/800K drive on its cable |
 //! | [`keyboard`] | `dev-mac` | the keyboard on the VIA's shift register, and the four commands it answers |
 //! | [`via`] | `dev-mac` | a 6522 on the board's A9-A12 register select |
@@ -22,6 +24,8 @@
 //! `docs/platforms/mac-plus.md` has the memory map, the boot ledger and what
 //! is still missing.
 
+pub mod disk;
+pub mod gcr;
 pub mod glue;
 pub mod iwm;
 pub mod keyboard;
