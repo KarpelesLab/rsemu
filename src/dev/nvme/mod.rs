@@ -92,7 +92,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::bus::pci::{Bar, Bars, Bdf, ConfigSpace, PciBus, PciFunction, buses, config};
+use crate::bus::pci::{Bar, BarSpaces, Bars, Bdf, ConfigSpace, PciBus, PciFunction, buses, config};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -547,7 +547,9 @@ impl Nvme {
         requester: crate::core::space::RequesterId,
     ) -> Result<()> {
         self.ctrl.attach_space(space, requester);
-        self.regs.bars.install(space, self.regs.command())
+        self.regs
+            .bars
+            .install(&BarSpaces::new().memory(space), self.regs.command())
     }
 }
 

@@ -499,7 +499,8 @@ fn a_window_moves_when_its_register_does() {
             Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
         )
         .expect("BAR0 is free");
-    bars.install(&space, 0).expect("nothing is there yet");
+    bars.install(&BarSpaces::new().memory(&space), 0)
+        .expect("nothing is there yet");
     // Out of reset the window decodes nothing at all, wherever it nominally
     // sits: COMMAND[1] is clear.
     assert_eq!(
@@ -548,7 +549,8 @@ fn a_retopology_that_cannot_happen_now_happens_later() {
             Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
         )
         .expect("BAR0 is free");
-    bars.install(&space, 0).expect("nothing is there yet");
+    bars.install(&BarSpaces::new().memory(&space), 0)
+        .expect("nothing is there yet");
     set_bar(&bars, config::BAR0, 0x8000_0000);
     {
         let _held = space.topology();
@@ -582,7 +584,8 @@ fn a_window_off_the_end_of_the_space_decodes_nothing() {
             Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
         )
         .expect("BAR0 is free");
-    bars.install(&space, 0).expect("nothing is there yet");
+    bars.install(&BarSpaces::new().memory(&space), 0)
+        .expect("nothing is there yet");
     set_bar(&bars, config::BAR0, 0x000f_f000);
     assert!(bars.sync(config::COMMAND_MEMORY, true));
     assert_eq!(
@@ -634,23 +637,206 @@ fn a_malformed_declaration_is_refused_by_name() {
     );
 }
 
+/// An I/O space shaped like a PC's: sixteen bits, and ones where nothing
+/// decodes, because an ISA bus with pull-ups reads as ones.
+fn port_space() -> Arc<AddressSpace> {
+    Arc::new(AddressSpace::new("port", 16).with_unassigned(UnassignedPolicy::ONES))
+}
+
 #[test]
-fn an_io_bar_that_wants_a_region_is_refused_with_the_reason() {
-    // Not an oversight: a configuration cycle travels through the I/O space,
-    // so the try-lock that saves every other case cannot help. Better to say
-    // so at bind than to map a window that never moves again.
-    let space = Arc::new(AddressSpace::new("port", 16).with_unassigned(UnassignedPolicy::ONES));
+fn an_io_bar_sizes_places_and_moves_like_a_memory_one() {
+    // Rev 2.1 §6.2.5.1 gives an I/O register the same sizing protocol as a
+    // memory one, with bit 0 set to mark the space and bit 1 reserved. What
+    // used to be missing was not the register — it was the mapping.
+    let space = port_space();
     let bars = Bars::new()
         .with(
             0,
             Bar::io(0x10).decoding(window_region(0x10, 0x5a), Perms::RW),
         )
         .expect("BAR0 is free");
-    let e = bars
-        .install(&space, 0)
-        .expect_err("an I/O BAR cannot carry a region")
+    bars.install(&BarSpaces::new().io(&space), 0)
+        .expect("an I/O space was supplied");
+
+    set_bar(&bars, config::BAR0, 0xffff_ffff);
+    assert_eq!(
+        bar_dword(&bars, config::BAR0),
+        0xffff_fff1,
+        "a 16-byte window sizes to a 16-byte mask, with bit 0 marking I/O space"
+    );
+
+    // Out of reset nothing decodes, whatever the register says: COMMAND[0] is
+    // clear (§6.2.2).
+    set_bar(&bars, config::BAR0, 0x0000_1f00);
+    assert!(bars.sync(0, true));
+    assert_eq!(space.read(0x1f00, Width::U8, MemAttrs::DEFAULT), Ok(0xff));
+
+    assert!(bars.sync(config::COMMAND_IO, true));
+    assert_eq!(
+        space.read(0x1f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "I/O space enabled, and where the register says"
+    );
+
+    // A second move, which is the one that proves the mapping follows the
+    // register rather than having been placed once at install.
+    set_bar(&bars, config::BAR0, 0x0000_2f00);
+    assert!(bars.sync(config::COMMAND_IO, true));
+    assert_eq!(
+        space.read(0x1f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "it left"
+    );
+    assert_eq!(
+        space.read(0x2f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "and arrived"
+    );
+
+    // And the enable bit alone takes it out of the decode without moving it.
+    assert!(bars.sync(0, true));
+    assert_eq!(space.read(0x2f00, Width::U8, MemAttrs::DEFAULT), Ok(0xff));
+    assert!(bars.sync(config::COMMAND_MEMORY, true));
+    assert_eq!(
+        space.read(0x2f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "COMMAND[1] is the *memory* enable and gates nothing here (§6.2.2)"
+    );
+}
+
+#[test]
+fn a_function_with_a_window_in_each_space_places_both() {
+    // Two spaces, two topology guards, and `sync` opens them one at a time —
+    // two at once is the same-rank violation `core::space` names.
+    let mem = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let port = port_space();
+    let bars = Bars::new()
+        .with(
+            0,
+            Bar::io(0x10).decoding(window_region(0x10, 0x11), Perms::RW),
+        )
+        .expect("BAR0 is free")
+        .with(
+            1,
+            Bar::memory(0x1000).decoding(window_region(0x1000, 0x22), Perms::RW),
+        )
+        .expect("BAR1 is free");
+    bars.install(&BarSpaces::new().memory(&mem).io(&port), 0)
+        .expect("both spaces were supplied");
+
+    set_bar(&bars, config::BAR0, 0x0000_1f00);
+    set_bar(&bars, config::BAR0 + 4, 0x8000_0000);
+    assert!(bars.sync(config::COMMAND_IO | config::COMMAND_MEMORY, true));
+    assert_eq!(port.read(0x1f00, Width::U8, MemAttrs::DEFAULT), Ok(0x11));
+    assert_eq!(
+        mem.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x22)
+    );
+
+    // One space's guard held: that pass is deferred and the other still runs.
+    // The function is stale either way, because the flag says "some window
+    // disagrees with its register", not which one.
+    set_bar(&bars, config::BAR0, 0x0000_2f00);
+    set_bar(&bars, config::BAR0 + 4, 0x9000_0000);
+    {
+        let _held = port.topology();
+        assert!(!bars.sync(config::COMMAND_IO | config::COMMAND_MEMORY, false));
+        assert!(bars.is_stale());
+        assert_eq!(
+            mem.read(0x9000_0000, Width::U8, MemAttrs::DEFAULT),
+            Ok(0x22),
+            "the memory pass was not blocked by the I/O space being held"
+        );
+    }
+    assert_eq!(
+        port.read(0x1f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x11),
+        "and the I/O window is still at the base it was placed at"
+    );
+    assert!(bars.sync(config::COMMAND_IO | config::COMMAND_MEMORY, false));
+    assert!(!bars.is_stale());
+    assert_eq!(port.read(0x2f00, Width::U8, MemAttrs::DEFAULT), Ok(0x11));
+}
+
+#[test]
+fn install_refuses_a_register_with_no_space_to_decode_into() {
+    // A register firmware can size and place, behind which nothing ever
+    // answers, is the hardest kind of board bug to see. So it is refused by
+    // name at bind instead.
+    let mem = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let e = Bars::new()
+        .with(
+            0,
+            Bar::io(0x10).decoding(window_region(0x10, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free")
+        .install(&BarSpaces::new().memory(&mem), 0)
+        .expect_err("no I/O space was supplied")
         .to_string();
-    assert!(e.contains("I/O space"), "{e}");
+    assert!(e.contains("BAR0"), "{e}");
+    assert!(e.contains("an I/O space"), "{e}");
+
+    // And the same in the other direction, which is the case that used to be
+    // impossible to reach at all.
+    let port = port_space();
+    let e = Bars::new()
+        .with(
+            0,
+            Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free")
+        .install(&BarSpaces::new().io(&port), 0)
+        .expect_err("no memory space was supplied")
+        .to_string();
+    assert!(e.contains("a memory space"), "{e}");
+
+    // A register with no region is a register and nothing else, so it needs no
+    // space: firmware may size and place it and nothing is expected to answer.
+    Bars::new()
+        .with(0, Bar::io(0x10))
+        .expect("BAR0 is free")
+        .install(&BarSpaces::new(), 0)
+        .expect("a bare register decodes nothing and so needs nothing");
+}
+
+#[test]
+fn a_second_move_before_the_drain_collapses_into_one_retopology() {
+    // What is deferred is "make the map agree with the registers", not "apply
+    // this base". So two moves inside one round place the *second* base, and
+    // the intermediate one never decodes — which is why the mechanism is a
+    // flag and not a queue of actions.
+    let space = port_space();
+    let bars = Bars::new()
+        .with(
+            0,
+            Bar::io(0x10).decoding(window_region(0x10, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free");
+    bars.install(&BarSpaces::new().io(&space), 0)
+        .expect("an I/O space was supplied");
+    set_bar(&bars, config::BAR0, 0x0000_1f00);
+    assert!(bars.sync(config::COMMAND_IO, true));
+
+    {
+        let _held = space.topology();
+        set_bar(&bars, config::BAR0, 0x0000_2f00);
+        assert!(!bars.sync(config::COMMAND_IO, false));
+        set_bar(&bars, config::BAR0, 0x0000_3f00);
+        assert!(!bars.sync(config::COMMAND_IO, false));
+        assert!(bars.is_stale());
+    }
+    assert!(bars.sync(config::COMMAND_IO, false));
+    assert_eq!(
+        space.read(0x3f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "the base the registers name when the drain runs"
+    );
+    assert_eq!(
+        space.read(0x2f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "and the one they named in between never decoded at all"
+    );
+    assert_eq!(space.read(0x1f00, Width::U8, MemAttrs::DEFAULT), Ok(0xff));
 }
 
 #[test]
@@ -995,7 +1181,9 @@ fn a_function_that_could_not_place_its_window_says_so_and_the_fabric_settles_it(
     let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
     let bus = Arc::new(PciBus::new());
     let card = Carded::new();
-    card.bars.install(&space, 0).expect("nothing is there yet");
+    card.bars
+        .install(&BarSpaces::new().memory(&space), 0)
+        .expect("nothing is there yet");
     let at = Bdf::new(0, 4, 0).expect("a legal address");
     bus.attach(at, Arc::clone(&card) as Arc<dyn PciFunction>)
         .expect("the slot is empty");
@@ -1045,7 +1233,9 @@ fn a_sweep_that_still_cannot_have_the_space_leaves_the_fabric_owing() {
     let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
     let bus = Arc::new(PciBus::new());
     let card = Carded::new();
-    card.bars.install(&space, 0).expect("nothing is there yet");
+    card.bars
+        .install(&BarSpaces::new().memory(&space), 0)
+        .expect("nothing is there yet");
     let at = Bdf::new(0, 4, 0).expect("a legal address");
     bus.attach(at, Arc::clone(&card) as Arc<dyn PciFunction>)
         .expect("the slot is empty");
@@ -1090,7 +1280,9 @@ fn the_sizing_sweep_asks_nothing_of_the_address_space() {
     let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
     let bus = Arc::new(PciBus::new());
     let card = Carded::new();
-    card.bars.install(&space, 0).expect("nothing is there yet");
+    card.bars
+        .install(&BarSpaces::new().memory(&space), 0)
+        .expect("nothing is there yet");
     let at = Bdf::new(0, 4, 0).expect("a legal address");
     bus.attach(at, Arc::clone(&card) as Arc<dyn PciFunction>)
         .expect("the slot is empty");
@@ -1118,5 +1310,185 @@ fn the_sizing_sweep_asks_nothing_of_the_address_space() {
     assert!(
         !bus.retopology_owed(),
         "nothing decoded before or after, so nothing was owed at any point"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the re-entrancy hazard: a BAR that moves the space its own write is in
+// ---------------------------------------------------------------------------
+
+/// A card with one **I/O** BAR, which is the case the try-lock can never serve
+/// on a board whose configuration cycles are port cycles.
+#[derive(Debug)]
+struct IoCarded {
+    config: Mutex<ConfigSpace>,
+    bars: Bars,
+}
+
+impl IoCarded {
+    fn new() -> Arc<IoCarded> {
+        let mut config = ConfigSpace::new();
+        config.hardwire(config::VENDOR_ID, 0x1af4, 2);
+        config.hardwire(config::HEADER_TYPE, 0x00, 1);
+        config.allow(config::COMMAND, 2);
+        Arc::new(IoCarded {
+            config: Mutex::with_rank(LockRank::DEVICE, config),
+            bars: Bars::new()
+                .with(
+                    0,
+                    Bar::io(0x10).decoding(window_region(0x10, 0x5a), Perms::RW),
+                )
+                .expect("BAR0 is free"),
+        })
+    }
+
+    fn command(&self) -> u16 {
+        let c = self.config.lock();
+        u16::from(c.byte(config::COMMAND)) | u16::from(c.byte(config::COMMAND + 1)) << 8
+    }
+}
+
+impl PciFunction for IoCarded {
+    fn config_read(&self, offset: u16, dst: &mut [u8], _attrs: MemAttrs) {
+        self.config.lock().read(offset, dst);
+        self.bars.config_read(offset, dst);
+    }
+
+    fn config_write(&self, offset: u16, src: &[u8], _attrs: MemAttrs) {
+        let moved = self.bars.config_write(offset, src);
+        let changed = self.config.lock().write(offset, src);
+        if moved || changed || self.bars.is_stale() {
+            // Never the blocking guard. This runs inside an `OUT` to `0xcfc`,
+            // so the I/O space's read guard is alive and the window this is
+            // about to move is in that same space: `topology()` here is
+            // `TOPOLOGY` twice, which the ladder refuses, and on the `single`
+            // backend the `RwLock` itself would deadlock.
+            self.bars.sync(self.command(), false);
+        }
+    }
+
+    fn retopology_owed(&self) -> bool {
+        self.bars.is_stale()
+    }
+
+    fn settle(&self) {
+        self.bars.sync(self.command(), false);
+    }
+}
+
+/// **The test the mechanism exists for.**
+///
+/// Everything here is a real access through a real address space: the guest's
+/// `OUT` to `0xcfc` travels through the I/O space, reaches the card, and the
+/// card tries to move a window *in that same space*. There is no held guard
+/// standing in for the condition — the condition is the access itself.
+///
+/// Without the deferral this call cannot return. A blocking `topology()` from
+/// inside the handler is `TOPOLOGY` acquired while `TOPOLOGY` is held for
+/// reading: `core::sync`'s ladder panics on it in a debug build and the
+/// `single` backend's lock deadlocks on it in a release one. What makes the
+/// write complete is that the try-lock is allowed to *fail*, and that the
+/// failure is recorded rather than swallowed.
+#[test]
+fn an_io_bar_moved_by_its_own_configuration_write_does_not_deadlock() {
+    let bus = Arc::new(PciBus::new());
+    let card = IoCarded::new();
+    let at = Bdf::new(0, 4, 0).expect("a legal address");
+    bus.attach(at, Arc::clone(&card) as Arc<dyn PciFunction>)
+        .expect("the slot is empty");
+    let ports = Arc::new(ConfigPorts::new(Arc::clone(&bus)));
+    let space = port_space();
+    space
+        .topology()
+        .map(
+            Region::io(
+                "pci.config",
+                CONFIG_PORT_WINDOW_LEN,
+                ports as Arc<dyn MemOps>,
+            ),
+            0xcf8,
+        )
+        .expect("0xcf8 is free");
+    card.bars
+        .install(&BarSpaces::new().io(&space), 0)
+        .expect("the I/O space it decodes into");
+
+    // Place it and enable I/O decode, exactly as firmware does: two `OUT`s to
+    // `0xcfc`, each of which travels through the space the window lives in.
+    select(&space, at, config::BAR0);
+    space
+        .write(0xcfc, Width::U32, 0x0000_1f00, MemAttrs::DEFAULT)
+        .expect("the write completes — it is not retried and not faulted");
+    select(&space, at, config::COMMAND);
+    space
+        .write(
+            0xcfc,
+            Width::U16,
+            u64::from(config::COMMAND_IO),
+            MemAttrs::DEFAULT,
+        )
+        .expect("and so does this one");
+
+    // What the guest sees between the write and the drain: the register reads
+    // back what it wrote immediately...
+    select(&space, at, config::BAR0);
+    assert_eq!(
+        space.read(0xcfc, Width::U32, MemAttrs::DEFAULT),
+        Ok(0x0000_1f01),
+        "the latch moved at once — bit 0 is the I/O indicator (§6.2.5.1)"
+    );
+    // ...and the window has not.
+    assert_eq!(
+        space.read(0x1f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "nothing decodes there yet, which is the honest cost of the deferral"
+    );
+    assert!(
+        bus.retopology_owed(),
+        "but the fabric knows the function came out of a cycle owing one"
+    );
+
+    // The drain, which a host bridge with a clock domain runs from
+    // `Device::advance_to` with no access in flight.
+    assert!(
+        !bus.settle(),
+        "with no access in flight, one sweep is enough"
+    );
+    assert!(!bus.retopology_owed());
+    assert_eq!(
+        space.read(0x1f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "and now the card decodes where its register has said all along"
+    );
+
+    // A move from its new home, which is the same path again and the case that
+    // separates "placed once at install" from "the mapping follows".
+    select(&space, at, config::BAR0);
+    space
+        .write(0xcfc, Width::U32, 0x0000_2f00, MemAttrs::DEFAULT)
+        .expect("the write completes");
+    assert_eq!(
+        space.read(0x1f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "the old mapping stays until the deferred action runs"
+    );
+    assert!(bus.retopology_owed());
+    assert!(!bus.settle());
+    assert_eq!(space.read(0x1f00, Width::U8, MemAttrs::DEFAULT), Ok(0xff));
+    assert_eq!(space.read(0x2f00, Width::U8, MemAttrs::DEFAULT), Ok(0x5a));
+
+    // And clearing COMMAND[0] takes it out of the decode. That one is deferred
+    // by the same rule, because it is still a `0xcfc` write into the space the
+    // window is in.
+    select(&space, at, config::COMMAND);
+    space
+        .write(0xcfc, Width::U16, 0, MemAttrs::DEFAULT)
+        .expect("the write completes");
+    assert!(bus.retopology_owed());
+    assert!(!bus.settle());
+    assert_eq!(
+        space.read(0x2f00, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "§6.2.2: with the I/O space bit clear the function decodes nothing"
     );
 }

@@ -22,10 +22,12 @@
 //! [`Bars`] is the fifth, and it belongs to the function rather than to the
 //! fabric for the reason above: the six base address registers and the
 //! expansion ROM register are configuration space, but the windows they name
-//! are ordinary mappings in an ordinary address space, and a bridge never sees
-//! them. It is where the interesting problem lives — a BAR is a mapping that
-//! *moves*, from inside a configuration write — and [`bar`]'s module docs carry
-//! that argument.
+//! are ordinary mappings in an ordinary address space — two of them, since an
+//! I/O BAR's window is in the I/O space and a memory BAR's is not, which is
+//! what [`BarSpaces`] is for — and a bridge never sees them. It is where the
+//! interesting problem lives — a BAR is a mapping that *moves*, from inside a
+//! configuration write, sometimes in the very space that write is travelling
+//! through — and [`bar`]'s module docs carry that argument.
 //!
 //! [`Intx`] is the sixth: a function's `INTA#`-`INTD#` pin. It is split across
 //! three objects because the hardware is — the function owns the pin, the
@@ -46,10 +48,6 @@
 //!
 //! # What is deliberately not here yet
 //!
-//! * **I/O BARs that decode.** The register is complete and firmware can size
-//!   and place one; mapping it is refused, because a configuration cycle
-//!   travels through the I/O space and so the try-lock that saves every other
-//!   case cannot help. [`bar`]'s module docs spell it out.
 //! * **A board whose traces are not the standard rotation.** [`swizzle`] is the
 //!   PCI-to-PCI Bridge specification's, applied to every device number on the
 //!   bus. A board that wired its slots differently — and a real one may — has
@@ -89,7 +87,7 @@ pub mod bar;
 #[cfg(test)]
 mod tests;
 
-pub use bar::{Bar, BarKind, Bars};
+pub use bar::{Bar, BarKind, BarSpaces, Bars};
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;

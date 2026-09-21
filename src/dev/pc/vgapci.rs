@@ -77,7 +77,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::bus::pci::{Bar, Bars, Bdf, ConfigSpace, PciBus, PciFunction, buses, config};
+use crate::bus::pci::{Bar, BarSpaces, Bars, Bdf, ConfigSpace, PciBus, PciFunction, buses, config};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -463,7 +463,9 @@ impl VgaPci {
     /// Whatever the space refuses: a window that does not fit, or a nesting
     /// depth this space will not take.
     pub fn attach_space(&self, space: &Arc<AddressSpace>) -> Result<()> {
-        self.regs.bars.install(space, self.regs.command())
+        self.regs
+            .bars
+            .install(&BarSpaces::new().memory(space), self.regs.command())
     }
 }
 

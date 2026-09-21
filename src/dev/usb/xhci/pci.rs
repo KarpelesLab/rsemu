@@ -110,7 +110,9 @@ use core::fmt;
 
 use super::{MAX_SLOTS, Params, REGISTER_BYTES, STATE_VERSION, Xhci, register_region};
 
-use crate::bus::pci::{Bar, Bars, Bdf, ConfigSpace, Intx, IntxPin, PciBus, PciFunction, config};
+use crate::bus::pci::{
+    Bar, BarSpaces, Bars, Bdf, ConfigSpace, Intx, IntxPin, PciBus, PciFunction, config,
+};
 use crate::bus::usb::{MAX_PORTS, UsbBus};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
@@ -550,7 +552,9 @@ impl XhciPci {
         requester: crate::core::space::RequesterId,
     ) -> Result<()> {
         self.xhci.attach_space(space, requester);
-        self.regs.bars.install(space, self.regs.command())
+        self.regs
+            .bars
+            .install(&BarSpaces::new().memory(space), self.regs.command())
     }
 }
 

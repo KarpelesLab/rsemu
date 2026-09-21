@@ -136,16 +136,102 @@
 //!   snapshot is taken between rounds, and the fabric is settled at the end of
 //!   every round.
 //!
-//! # I/O BARs decode nothing here, and cannot yet
+//! # I/O BARs, and the space a configuration write is travelling through
 //!
-//! [`Bars`] models an I/O BAR's register completely — the indicator bit, the
-//! sizing read-back, the base — so firmware can size and place one. It refuses
-//! to *map* one, at [`Bars::install`], with an error saying why: an I/O BAR
-//! moves a window in the very space a `0xcfc` cycle is travelling through, so
-//! the try-lock cannot serve it, and the scheduler drain above would have to
-//! reach a second space. The drain does not care which space a window is in and
-//! would in fact serve an I/O BAR too, but nothing in this tree has one, so the
-//! refusal stays and this is the paragraph to argue with when something does.
+//! This paragraph used to say an I/O BAR could not decode, and invited an
+//! argument. Here it is.
+//!
+//! A function's windows do not all go in one space, so [`Bars`] is handed a
+//! [`BarSpaces`] rather than an `AddressSpace`: memory BARs and the expansion
+//! ROM go in the memory space, I/O BARs go in the I/O space. That much is
+//! bookkeeping. What is not bookkeeping is *when* an I/O window may be moved.
+//!
+//! On a 440FX board a configuration write is an `OUT` to `0xcfc`. It travels
+//! through the **I/O** space, so the I/O space's topology lock is already held
+//! for reading — and an I/O BAR moves a window *in that same space*. So:
+//!
+//! * the blocking guard is a lock-order violation (`TOPOLOGY` twice) and
+//!   `core::sync`'s ladder panics on it in debug builds;
+//! * the order-exempt [`try_topology`](AddressSpace::try_topology) cannot
+//!   succeed either, because a write guard cannot be had while a read guard is
+//!   alive. It *fails*, which is the important difference: failing is safe, and
+//!   it is what raises the flag;
+//! * and "retry at the next configuration access" — which is what saves a
+//!   *memory* BAR on this board — never lands, because the next configuration
+//!   access is another `0xcfc` cycle through the same space. This is the
+//!   identical dead end a q35's ECAM produces for a memory BAR, arrived at from
+//!   the other side.
+//!
+//! So an I/O BAR is **always** the deferred case on a port-mechanism board, and
+//! the deferred action is the one already built above: the function reports
+//! [`is_stale`](Bars::is_stale), [`PciBus`](super::PciBus) remembers that some
+//! function owes a retopology, and a device with a clock domain drains it from
+//! `Device::advance_to`. [`crate::dev::pc::pmc`] is that device on a 440FX
+//! board and [`crate::dev::q35::mch`] on a q35, for the same reason in both
+//! cases: the host bridge is the one object that knows every function on the
+//! fabric *and* has a moment with no access in flight.
+//!
+//! Through ECAM the two kinds swap places — a memory BAR is the deferred case
+//! and an I/O BAR's try-lock succeeds, because the access is travelling through
+//! the memory space and the window is going into the I/O space. Neither kind is
+//! privileged; what decides is whether the access and the window are in the
+//! same space.
+//!
+//! ## What a guest observes between the write and the remap
+//!
+//! The old decode, for the remainder of the scheduler round the write happened
+//! in. Specifically:
+//!
+//! * The configuration write **completes**. It is not retried, not faulted, and
+//!   the register reads back the value that was written immediately — the
+//!   latch and the map are two different things and only the map is late.
+//! * Until the drain runs, accesses to the *new* base fall through to whatever
+//!   else the board decodes there, and failing that to the space's unassigned
+//!   policy — `0xff` on a PC. Accesses to the *old* base still reach the
+//!   device, because the old mapping is not torn down until the new one is put
+//!   in: `sync` is a single pass that computes what the registers ask for and
+//!   then makes the map agree, so there is no window of time in which neither
+//!   base decodes.
+//! * A **second** write arriving before the drain is not a problem and does not
+//!   queue: what is deferred is "make the map agree with the registers", not
+//!   "apply this base". The drain reads the latches as they stand when it runs,
+//!   so two moves in one round collapse into one retopology at the second
+//!   base, and the intermediate base never decodes at all. That is also why the
+//!   mechanism is a *flag* rather than a queue of actions — a queue would
+//!   replay a base the registers no longer name.
+//! * A write that moves nothing costs nothing: `sync` compares what the
+//!   registers ask for against what is mapped and returns without opening a
+//!   guard or setting the flag, which is every write of a sizing sweep.
+//!
+//! The bound is one scheduler round, as above. A driver that programmed a BAR
+//! and touched the window in the next instruction would see the old decode; no
+//! real driver does, because the code that assigns resources and the code that
+//! drives the device are always different code. The honest way to state the
+//! cost is that this is *not* what hardware does — hardware's decode changes on
+//! the cycle after the write — and the only thing that would close the gap is a
+//! `Deferred` queue on the access path, which `core::space`'s module docs
+//! describe and nothing in this tree provides.
+//!
+//! ## Which locks, in which order
+//!
+//! A configuration write that moves an I/O BAR runs down this ladder, and every
+//! rung is released before the next is taken except where it says otherwise:
+//!
+//! ```text
+//!   BUS       the core's execution mutex, held across the access
+//!   TOPOLOGY  the read guard of the space the access travels through
+//!   DEVICE    PciBus::functions, cloned out and released
+//!   DEVICE    the function's own ConfigSpace, released
+//!   LEAF      Bars::values / placed / stale / supplied, one at a time
+//!   TOPOLOGY  try_topology on the window's space — order-exempt, may fail
+//! ```
+//!
+//! The drain runs the short version, from `Device::advance_to` with nothing
+//! held: `DEVICE` (released) then `LEAF` (released) then the guard. And when a
+//! function has windows in *both* spaces, [`Bars::sync`] opens the two guards
+//! **sequentially, never nested** — two `TOPOLOGY` acquisitions at once is the
+//! violation `core::space` names, so a cross-space placement is two steps and
+//! one of them may succeed while the other is deferred.
 //!
 //! [`AddressSpace::topology`]: crate::core::space::AddressSpace::topology
 //! [`AddressSpace::try_topology`]: crate::core::space::AddressSpace::try_topology
@@ -162,6 +248,18 @@ use super::config::{COMMAND_IO, COMMAND_MEMORY};
 use crate::core::error::{Error, Result};
 use crate::core::space::{AddressSpace, Mapping, MappingId, Perms, RegionRef};
 use crate::core::sync::{LockRank, Mutex};
+
+/// Which of a machine's two spaces a window goes in.
+///
+/// Not the same thing as [`BarKind`]: a memory BAR and the expansion ROM are
+/// two kinds of register and one space. This is the key [`Bars::sync`]
+/// partitions by, because a topology guard belongs to a space and the two
+/// guards are taken sequentially.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Where {
+    Memory,
+    Io,
+}
 
 /// Which space a base address register places its window in, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +288,9 @@ pub struct Bar {
     prefetchable: bool,
     /// What answers inside the window, if this crate maps it.
     region: Option<RegionRef>,
+    /// Where in the window the region sits. Zero for everything that does not
+    /// say otherwise; see [`Bar::at_offset`] for the part that does.
+    offset: u64,
     /// The terms it answers on while it is decoding.
     perms: Perms,
 }
@@ -202,6 +303,7 @@ impl fmt::Debug for Bar {
             .field("wide", &self.wide)
             .field("prefetchable", &self.prefetchable)
             .field("region", &self.region.as_ref().map(|r| r.name()))
+            .field("offset", &self.offset)
             .field("perms", &self.perms)
             .finish()
     }
@@ -217,6 +319,7 @@ impl Bar {
             wide: false,
             prefetchable: false,
             region: None,
+            offset: 0,
             perms: Perms::RW,
         }
     }
@@ -230,6 +333,7 @@ impl Bar {
             wide: false,
             prefetchable: false,
             region: None,
+            offset: 0,
             perms: Perms::RW,
         }
     }
@@ -246,6 +350,7 @@ impl Bar {
             wide: false,
             prefetchable: false,
             region: None,
+            offset: 0,
             perms: Perms::RX,
         }
     }
@@ -278,6 +383,25 @@ impl Bar {
         self
     }
 
+    /// Put the region at `offset` bytes into the window rather than at its
+    /// base, leaving the bytes below it decoding nothing.
+    ///
+    /// Not a convenience: it is what a real register looks like. A PCI IDE
+    /// controller in native mode declares a **four-byte** I/O window for each
+    /// channel's control block and decodes exactly one byte of it, at offset 2
+    /// — the Device Control / Alternate Status register (*PCI IDE Controller
+    /// Specification*, revision 1.0, the base address register table). A driver
+    /// computes `BAR1 + 2` and nothing else in the window answers, which is
+    /// precisely this.
+    ///
+    /// Ignored if the offset would push the region past the end of the window;
+    /// [`Bars::with`] refuses that rather than silently truncating.
+    #[must_use]
+    pub fn at_offset(mut self, offset: u64) -> Bar {
+        self.offset = offset;
+        self
+    }
+
     /// How many bytes the window covers.
     #[must_use]
     pub fn len(&self) -> u64 {
@@ -295,6 +419,14 @@ impl Bar {
     #[must_use]
     pub fn kind(&self) -> BarKind {
         self.kind
+    }
+
+    /// Which of the machine's two spaces this register's window goes in.
+    fn goes(&self) -> Where {
+        match self.kind {
+            BarKind::Memory | BarKind::ExpansionRom => Where::Memory,
+            BarKind::Io => Where::Io,
+        }
     }
 
     /// The low bits the guest cannot move: the format field (§6.2.5.1).
@@ -368,10 +500,57 @@ struct Window {
     perms: Perms,
 }
 
+/// Which address space each kind of window is placed in.
+///
+/// A function's windows do not all go in one space — that is the whole content
+/// of bit 0 of a base address register — so [`Bars::install`] takes this rather
+/// than an [`AddressSpace`]. A space left out is a space this function has no
+/// window in; declaring a BAR that decodes into one and not supplying it is
+/// refused by name at install, because the alternative is a register firmware
+/// can program and a window that never appears.
+///
+/// Cloned rather than borrowed, and the clone is two `Arc`s.
+#[derive(Debug, Clone, Default)]
+pub struct BarSpaces {
+    mem: Option<Arc<AddressSpace>>,
+    io: Option<Arc<AddressSpace>>,
+}
+
+impl BarSpaces {
+    /// A function with no space at all: legal, and it can carry no window.
+    #[must_use]
+    pub fn new() -> BarSpaces {
+        BarSpaces::default()
+    }
+
+    /// Where memory BARs and the expansion ROM go.
+    #[must_use]
+    pub fn memory(mut self, space: &Arc<AddressSpace>) -> BarSpaces {
+        self.mem = Some(Arc::clone(space));
+        self
+    }
+
+    /// Where I/O BARs go. On an x86 board this is the separate 64 KiB space the
+    /// processor drives with its own status lines, not a region of memory.
+    #[must_use]
+    pub fn io(mut self, space: &Arc<AddressSpace>) -> BarSpaces {
+        self.io = Some(Arc::clone(space));
+        self
+    }
+
+    /// The space a window of this kind goes in, if the caller supplied one.
+    fn at(&self, which: Where) -> Option<&Arc<AddressSpace>> {
+        match which {
+            Where::Memory => self.mem.as_ref(),
+            Where::Io => self.io.as_ref(),
+        }
+    }
+}
+
 /// Where the windows went.
 #[derive(Debug, Clone)]
 struct Placed {
-    space: Arc<AddressSpace>,
+    spaces: BarSpaces,
     windows: BTreeMap<u8, Window>,
 }
 
@@ -487,16 +666,11 @@ impl Bars {
                 "this register already decodes a region of its own",
             )));
         }
-        if bar.kind == BarKind::Io {
-            return Err(at(String::from(
-                "an I/O BAR cannot carry a region yet — see this module's docs, which say why \
-                 the order-exempt try-lock cannot serve one",
-            )));
-        }
-        if region.len() > bar.len {
+        if region.len().saturating_add(bar.offset) > bar.len {
             return Err(at(alloc::format!(
-                "the region is {} bytes and the window is {}",
+                "the region is {} bytes at offset {} of a {}-byte window",
                 region.len(),
+                bar.offset,
                 bar.len
             )));
         }
@@ -539,6 +713,14 @@ impl Bars {
             return Err(at(
                 "a window is a power of two, and no smaller than its kind's minimum: 16 bytes \
                  of memory, 4 of I/O, 2048 of expansion ROM (Rev 2.1 §6.2.5.1, §6.2.5.2)",
+            ));
+        }
+        if let Some(region) = bar.region.as_ref()
+            && region.len().saturating_add(bar.offset) > bar.len
+        {
+            return Err(at(
+                "the region this register decodes does not fit the window at the offset it was \
+                 given",
             ));
         }
         if bar.wide && index == 5 {
@@ -683,9 +865,9 @@ impl Bars {
         Some((base, decoding))
     }
 
-    /// Adopt `space` as where this function's memory windows go, and place
-    /// whatever currently decodes. **Retopology**, and legal only where nothing
-    /// is in flight: [`Instance::bind`](crate::machine::realize::Instance::bind),
+    /// Adopt `spaces` as where this function's windows go, and place whatever
+    /// currently decodes. **Retopology**, and legal only where nothing is in
+    /// flight: [`Instance::bind`](crate::machine::realize::Instance::bind),
     /// which is what calls it.
     ///
     /// Out of reset that is nothing at all — `COMMAND` is zero, so no window
@@ -701,23 +883,30 @@ impl Bars {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] if a declared I/O BAR carries a region — see the
-    /// module docs, which say why that cannot work yet.
-    pub fn install(&self, space: &Arc<AddressSpace>, command: u16) -> Result<()> {
+    /// [`Error::Config`] if a register that decodes something was declared and
+    /// `spaces` has no space for it to decode into. Silently never mapping the
+    /// window would be a register firmware can size and place, behind which
+    /// nothing ever answers — the hardest kind of board bug to see.
+    pub fn install(&self, spaces: &BarSpaces, command: u16) -> Result<()> {
+        let supplied = self.supplied.lock().clone();
         for (index, bar) in &self.specs {
-            if bar.region.is_some() && bar.kind == BarKind::Io {
+            let decodes = bar.region.is_some() || supplied.contains_key(index);
+            if decodes && spaces.at(bar.goes()).is_none() {
+                let missing = match bar.goes() {
+                    Where::Memory => "a memory space",
+                    Where::Io => "an I/O space",
+                };
                 return Err(Error::Config {
                     at: alloc::format!("BAR{index}"),
-                    message: String::from(
-                        "an I/O BAR cannot carry a region yet: a configuration cycle travels \
-                         through the I/O space, so retopologising it from inside one is the \
-                         case the order-exempt try-lock cannot serve",
+                    message: alloc::format!(
+                        "this register decodes a region and so needs {missing} to decode it in, \
+                         and none was supplied"
                     ),
                 });
             }
         }
         *self.placed.lock() = Some(Placed {
-            space: Arc::clone(space),
+            spaces: spaces.clone(),
             windows: BTreeMap::new(),
         });
         self.sync(command, true);
@@ -743,9 +932,21 @@ impl Bars {
     /// configuration write, and — since a `blocking: false` call that cannot
     /// have the guard marks the function stale — of a scheduler wake-up per
     /// configuration write with it.
+    ///
+    /// # Two spaces, two guards, never nested
+    ///
+    /// A function with both a memory BAR and an I/O BAR needs a topology guard
+    /// on each space, and holding two at once is the lock-order violation
+    /// `core::space` names — same rank twice. So this makes **one pass per
+    /// space**, each opening and dropping its own guard, and a pass that cannot
+    /// have its guard does not stop the other from running. That is not a
+    /// compromise hidden in an implementation: it is the reason a configuration
+    /// write that moves windows in both spaces can leave one placed and one
+    /// deferred, and why the flag means "some window disagrees with its
+    /// register" rather than naming which.
     pub fn sync(&self, command: u16, blocking: bool) -> bool {
         // Cloned out and the lock released: nothing of this device's is held
-        // while the space is retopologised, which is the re-entrancy contract.
+        // while a space is retopologised, which is the re-entrancy contract.
         let Some(placed) = self.placed.lock().clone() else {
             // Not installed yet. Not stale either: `install` places every
             // window with the right terms in the first place.
@@ -755,7 +956,7 @@ impl Bars {
         // The supplied table is read out and its lock dropped first: it is a
         // `LEAF` and so is the one `window` takes below.
         let supplied = self.supplied.lock().clone();
-        let wanted: Vec<(u8, RegionRef, u64, Perms)> = self
+        let wanted: Vec<(u8, Where, RegionRef, u64, Perms)> = self
             .specs
             .iter()
             .filter_map(|(index, bar)| {
@@ -764,43 +965,86 @@ impl Bars {
                     .clone()
                     .or_else(|| supplied.get(index).cloned())?;
                 let (base, decoding) = self.window(*index, command)?;
-                decoding.then_some((*index, region, base, bar.perms))
+                // The region sits at its declared offset into the window, not
+                // at the window's base: `Bar::at_offset` says why one would.
+                decoding.then_some((
+                    *index,
+                    bar.goes(),
+                    region,
+                    base.wrapping_add(bar.offset),
+                    bar.perms,
+                ))
             })
             .collect();
+        let mut windows = placed.windows.clone();
+        let mut settled = true;
+        for which in [Where::Memory, Where::Io] {
+            settled &= self.sync_one(&placed, which, &wanted, &mut windows, blocking);
+        }
+        *self.placed.lock() = Some(Placed {
+            spaces: placed.spaces.clone(),
+            windows,
+        });
+        *self.stale.lock() = !settled;
+        settled
+    }
+
+    /// One space's worth of [`sync`](Bars::sync): the guard is opened and
+    /// dropped inside this call, so the caller never holds two.
+    ///
+    /// `windows` is the whole map, of both spaces; only the entries belonging
+    /// to `which` are touched, so a deferred pass leaves the other space's
+    /// record exactly as it found it.
+    fn sync_one(
+        &self,
+        placed: &Placed,
+        which: Where,
+        wanted: &[(u8, Where, RegionRef, u64, Perms)],
+        windows: &mut BTreeMap<u8, Window>,
+        blocking: bool,
+    ) -> bool {
+        let mine = |index: &u8| self.specs.get(index).is_some_and(|b| b.goes() == which);
+        let want: Vec<&(u8, Where, RegionRef, u64, Perms)> = wanted
+            .iter()
+            .filter(|(_, goes, _, _, _)| *goes == which)
+            .collect();
+        let have = windows.keys().filter(|i| mine(i)).count();
         // Nothing to do is the common case: firmware writes all-ones to size a
         // register and the real base straight after, and neither write changes
         // what decodes while `COMMAND` still has the space bit clear. Answering
         // that without a guard is what keeps the sizing sweep from marking the
         // function stale once per configuration write and asking the scheduler
         // to come back each time.
-        if wanted.len() == placed.windows.len()
-            && wanted.iter().all(|(index, _, base, perms)| {
-                placed
-                    .windows
+        if want.len() == have
+            && want.iter().all(|(index, _, _, base, perms)| {
+                windows
                     .get(index)
                     .is_some_and(|w| w.base == *base && w.perms == *perms)
             })
         {
-            *self.stale.lock() = false;
             return true;
         }
+        let Some(space) = placed.spaces.at(which) else {
+            // No space for this kind. `install` refuses a register that decodes
+            // into a space it was not given, so reaching here means no window
+            // of this kind exists — and then the comparison above returned.
+            return true;
+        };
         let guard = if blocking {
-            Some(placed.space.topology())
+            Some(space.topology())
         } else {
-            placed.space.try_topology()
+            space.try_topology()
         };
         let Some(mut topo) = guard else {
-            *self.stale.lock() = true;
             return false;
         };
-        let mut windows = placed.windows.clone();
         // Whatever no longer decodes leaves the map entirely, before anything
         // that does is placed: a window that moved out of the way has to be
         // gone before the one moving in can claim its address.
         let gone: Vec<u8> = windows
             .keys()
             .copied()
-            .filter(|index| !wanted.iter().any(|(i, ..)| i == index))
+            .filter(|index| mine(index) && !want.iter().any(|(i, ..)| i == index))
             .collect();
         for index in gone {
             if let Some(w) = windows.remove(&index) {
@@ -809,33 +1053,34 @@ impl Bars {
                 let _ = topo.unmap(w.id);
             }
         }
-        for (index, region, base, perms) in wanted {
+        for (index, _, region, base, perms) in want {
             // Already in the map: move it. Out again if the base firmware wrote
             // does not fit the space — that is a card decoding an address the
             // machine cannot drive, which decodes nothing — or if the terms
             // changed, which `remap` cannot express.
-            if let Some(w) = windows.get(&index).copied() {
-                if w.perms == perms && topo.remap(w.id, base).is_ok() {
-                    windows.insert(index, Window { base, ..w });
+            if let Some(w) = windows.get(index).copied() {
+                if w.perms == *perms && topo.remap(w.id, *base).is_ok() {
+                    windows.insert(*index, Window { base: *base, ..w });
                     continue;
                 }
                 let _ = topo.unmap(w.id);
-                windows.remove(&index);
+                windows.remove(index);
             }
             if let Ok(id) = topo.map_with(
-                Mapping::new(region, base)
+                Mapping::new(region.clone(), *base)
                     .with_priority(BAR_PRIORITY)
-                    .with_perms(perms),
+                    .with_perms(*perms),
             ) {
-                windows.insert(index, Window { id, base, perms });
+                windows.insert(
+                    *index,
+                    Window {
+                        id,
+                        base: *base,
+                        perms: *perms,
+                    },
+                );
             }
         }
-        drop(topo);
-        *self.placed.lock() = Some(Placed {
-            space: Arc::clone(&placed.space),
-            windows,
-        });
-        *self.stale.lock() = false;
         true
     }
 
