@@ -357,6 +357,14 @@ diskettes are fetched. What that took is written down, including the three
 `INT 13h` defects it found — the boot order, the EDD subset and the diskette's
 change line (`docs/platforms/pc-at.md`).
 
+The boot off that disk loads **JemmEx**, the memory manager `FDCONFIG.SYS`
+names, and so it runs in **virtual-8086 mode under paging**: five drivers load
+high and `MEM` reports 173 KiB of upper memory free. The core did not have the
+mode, and getting there also turned up a privilege-level defect that had been
+sitting under this board since it existed — the window between `MOV CR0`
+setting `PE` and the far jump after it is privilege 0 whatever the `CS`
+selector's low two bits say, and this core read them.
+
 The other four x86 boards are modern. `q35` is the chipset — an 82Q35 (G)MCH
 with **ECAM** as well as the `0xcf8` pair, an ICH9 with the `PIRQ[A-H]` routers,
 the PAM file, and **ACPI tables generated from the realized machine** rather

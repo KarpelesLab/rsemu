@@ -1759,6 +1759,207 @@ fn a_conforming_code_segment_does_not_hand_its_caller_ring_zero() {
     assert!(!pc.cpu.is_halted());
 }
 
+/// Where a virtual-8086 task's own segments live in the 4 MiB these tests
+/// have. Paragraph numbers, because that is what a task loads.
+mod v86_at {
+    /// The task's code, at linear `0xb000`.
+    pub(super) const CODE: u16 = 0x0b00;
+    /// Its data, at `0xc000`.
+    pub(super) const DATA: u16 = 0x0c00;
+    /// Its stack, at `0xd000`.
+    pub(super) const STACK: u16 = 0x0d00;
+    /// The monitor's handler for the task's `INT 30h`.
+    pub(super) const RESUME: u32 = 0x3100;
+    /// And for its `INT 31h`, which stops the test.
+    pub(super) const STOP: u32 = 0x3200;
+}
+
+/// The ring-0 preamble every virtual-8086 test shares: load the task register
+/// and `IRET` into a task with `flags` as its flags image.
+fn enter_v86_code(flags: u32) -> Vec<u8> {
+    let mut code: Vec<u8> = Vec::new();
+    code.extend_from_slice(&[
+        0xb8, 0x28, 0x00, 0x00, 0x00, // mov eax, 0x28
+        0x0f, 0x00, 0xd8, // ltr ax
+    ]);
+    // The frame *Intel SDM* Vol 3A §20.2.1 prescribes, pushed from the top
+    // down so that it reads EIP, CS, EFLAGS, ESP, SS, ES, DS, FS, GS upwards.
+    for value in [
+        0u32,                     // GS
+        0,                        // FS
+        u32::from(v86_at::DATA),  // DS
+        u32::from(v86_at::DATA),  // ES
+        u32::from(v86_at::STACK), // SS
+        0x100,                    // ESP
+        flags,                    // EFLAGS, with VM
+        u32::from(v86_at::CODE),  // CS
+        0,                        // EIP
+    ] {
+        code.push(0x68); // push imm32
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    code.push(0xcf); // iretd
+    code
+}
+
+#[test]
+fn an_iret_with_vm_set_runs_an_8086_task_and_an_interrupt_brings_it_back() {
+    // The whole round trip *Intel SDM* Vol 3A §20.2 describes, and the reason
+    // it is here: JemmEx — the memory manager FreeDOS loads out of
+    // `FDCONFIG.SYS` — builds exactly this frame, and a core without the mode
+    // answered its `IRETD` with `#GP` because it read the 8086 segment value
+    // in the frame as a selector and went looking for it in the descriptor
+    // table.
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(
+        5,
+        descriptor(
+            at::TSS,
+            0x67,
+            ar::PRESENT | (u32::from(sys_type::TSS32_AVAIL) << 8),
+        ),
+    );
+    pc.write32(at::TSS + tss32::ESP0, at::STACK0);
+    pc.write32(at::TSS + tss32::SS0, 0x10);
+    // Both gates are at `DPL` 3, because the task is at privilege 3 and may
+    // not invoke a gate above itself.
+    pc.idt(0x30, gate(0x08, v86_at::RESUME, sys_type::INT_GATE32, 3));
+    pc.idt(0x31, gate(0x08, v86_at::STOP, sys_type::INT_GATE32, 3));
+    pc.write(u64::from(v86_at::RESUME), &[0xcf]); // iretd, back into the task
+    pc.write(u64::from(v86_at::STOP), &[0xf4]); // hlt, in the monitor
+
+    // `VM`, `IOPL` 3, and the bit that is always set. `IOPL` 3 is what a
+    // monitor gives a task that is allowed to run `CLI`, `STI` and `INT n`
+    // without a trap (§20.2.7).
+    const TASK_FLAGS: u32 = flags::VM | flags::IOPL | flags::ALWAYS_SET;
+    pc.write(at::CODE0, &enter_v86_code(TASK_FLAGS));
+
+    let base = u64::from(v86_at::CODE) << 4;
+    let data = u64::from(v86_at::DATA) << 4;
+    pc.write(
+        base,
+        &[
+            0xb8, 0x34, 0x12, // mov ax, 0x1234
+            0xa3, 0x10, 0x00, // mov [0x10], ax      — through DS
+            0x2e, 0xa3, 0x40, 0x00, // mov cs:[0x40], ax  — through CS
+            0xcd, 0x30, // int 0x30            — out to the monitor
+            0xb8, 0x78, 0x56, // mov ax, 0x5678
+            0xa3, 0x12, 0x00, // mov [0x12], ax      — and back again
+            0xcd, 0x31, // int 0x31            — stop
+        ],
+    );
+
+    // `mov eax` / `ltr` / nine pushes / `iretd`.
+    for _ in 0..12 {
+        pc.cpu.step();
+    }
+    let regs = pc.regs();
+    assert_ne!(regs.eflags & flags::VM, 0, "the IRET entered the task");
+    assert_eq!(regs.cs, v86_at::CODE, "CS is a segment, not a selector");
+    assert_eq!(regs.rip, 0, "at the task's first instruction");
+    let sys = pc.cpu.sys();
+    assert_eq!(sys.seg(isa::seg::CS).base, base, "shifted four bits");
+    assert_eq!(sys.seg(isa::seg::CS).limit, 0xffff, "and 64 KiB long");
+    assert_eq!(
+        sys.seg(isa::seg::CS).dpl(),
+        3,
+        "a virtual-8086 task runs at privilege 3 (§20.2.4)"
+    );
+    assert_eq!(regs.rsp & 0xffff, 0x100, "ESP came off the frame");
+
+    // The three instructions before the `INT`.
+    for _ in 0..4 {
+        pc.cpu.step();
+    }
+    assert_eq!(
+        pc.read32(data + 0x10) & 0xffff,
+        0x1234,
+        "the store through DS landed at DS << 4"
+    );
+    assert_eq!(
+        pc.read32(base + 0x40) & 0xffff,
+        0x1234,
+        "and the one through CS landed too: an 8086 task has no segment types \
+         to check (§20.2.2)"
+    );
+
+    // And the `INT 30h` is now in the monitor, on the ring-0 stack, with the
+    // nine-doubleword frame §20.3.1 describes under it.
+    let regs = pc.regs();
+    assert_eq!(regs.eflags & flags::VM, 0, "VM is cleared on the way out");
+    assert_eq!(regs.cs, 0x08, "in the monitor's code segment");
+    assert_eq!(regs.rip, u64::from(v86_at::RESUME));
+    assert_eq!(regs.ss, 0x10, "on the stack the TSS names");
+    assert_eq!(regs.rsp, at::STACK0 - 36, "nine doublewords of frame");
+    assert_eq!(pc.read32(at::STACK0 - 4), 0, "GS");
+    assert_eq!(pc.read32(at::STACK0 - 8), 0, "FS");
+    assert_eq!(pc.read32(at::STACK0 - 12), u64::from(v86_at::DATA), "DS");
+    assert_eq!(pc.read32(at::STACK0 - 16), u64::from(v86_at::DATA), "ES");
+    assert_eq!(pc.read32(at::STACK0 - 20), u64::from(v86_at::STACK), "SS");
+    assert_eq!(pc.read32(at::STACK0 - 24), 0x100, "ESP");
+    assert_eq!(
+        pc.read32(at::STACK0 - 28) as u32 & flags::VM,
+        flags::VM,
+        "the saved flags still have VM — it is how the IRET back in knows"
+    );
+    assert_eq!(pc.read32(at::STACK0 - 32), u64::from(v86_at::CODE), "CS");
+    assert_eq!(pc.read32(at::STACK0 - 36), 12, "EIP, after the INT");
+    assert_eq!(regs.ds, 0, "the task's data segments are not the handler's");
+    assert_eq!(regs.es, 0);
+
+    // The handler's `IRET` goes straight back in, and the task finishes.
+    let steps = pc.run(20);
+    assert!(steps < 20, "the task should have reached the monitor's hlt");
+    assert!(pc.cpu.is_halted());
+    assert_eq!(
+        pc.read32(data + 0x10),
+        0x5678_1234,
+        "the second store proves the monitor's IRET resumed the task"
+    );
+}
+
+#[test]
+fn a_virtual_8086_task_below_iopl_three_traps_on_the_six_sensitive_instructions() {
+    // *Intel SDM* Vol 3A §20.2.7: `CLI`, `STI`, `PUSHF`, `POPF`, `INT n` and
+    // `IRET` are `IOPL`-sensitive in virtual-8086 mode, and below `IOPL` 3
+    // each one is `#GP(0)` so that the monitor sees it. A `CLI` the task
+    // believed had worked would leave it running with interrupts it thinks it
+    // masked, which is the defect the mechanism exists to prevent.
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(
+        5,
+        descriptor(
+            at::TSS,
+            0x67,
+            ar::PRESENT | (u32::from(sys_type::TSS32_AVAIL) << 8),
+        ),
+    );
+    pc.write32(at::TSS + tss32::ESP0, at::STACK0);
+    pc.write32(at::TSS + tss32::SS0, 0x10);
+    pc.idt(13, gate(0x08, v86_at::STOP, sys_type::INT_GATE32, 0));
+    pc.write(u64::from(v86_at::STOP), &[0xf4]); // hlt
+
+    // The same entry, with `IOPL` 0 instead of 3.
+    pc.write(at::CODE0, &enter_v86_code(flags::VM | flags::ALWAYS_SET));
+    pc.write(u64::from(v86_at::CODE) << 4, &[0xfa]); // cli
+
+    for _ in 0..12 {
+        pc.cpu.step();
+    }
+    assert_ne!(pc.regs().eflags & flags::VM, 0, "the task is running");
+    pc.cpu.step(); // cli
+    let regs = pc.regs();
+    assert_eq!(regs.eflags & flags::VM, 0, "the fault left the task");
+    assert_eq!(
+        regs.rip,
+        u64::from(v86_at::STOP),
+        "CLI below IOPL 3 is #GP, not a silent success"
+    );
+    assert_eq!(pc.read32(at::STACK0 - 40), 0, "#GP's error code is zero");
+}
+
 #[test]
 fn a_segment_limit_violation_raises_general_protection() {
     let pc = pc386();

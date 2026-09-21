@@ -141,7 +141,15 @@
 //!   the 64-bit task state segment is read only for its stack pointers.
 //! - **No virtual-address width above 48 bits.** Five-level paging (`LA57`)
 //!   is not implemented, and `CPUID` leaf `8000_0008` reports 48.
-//! - **No virtual-8086 mode.** `EFLAGS.VM` has storage and nothing sets it.
+//! - **Virtual-8086 mode, but none of the extensions.** The mode is here: an
+//!   `IRET` from privilege 0 off a frame whose flags image has `VM` set enters
+//!   a task with an 8086's segmentation and no segment protection, the six
+//!   `IOPL`-sensitive instructions fault below `IOPL` 3, the I/O permission
+//!   bitmap is consulted whatever `IOPL` says, and an interrupt leaves through
+//!   the protected-mode table pushing the nine-doubleword frame (*Intel SDM*
+//!   Vol 3A §20.2, §20.3). `CR4.VME`, `CR4.PVI` and the interrupt-redirection
+//!   bitmap are **not**, so `EFLAGS.VIF` and `VIP` still have no storage; a
+//!   monitor that wanted them would be told a mechanism exists behind them.
 //! - **No debug breakpoints.** `DR0`-`DR7` round-trip; arming one fires
 //!   nothing. `TR6`/`TR7` likewise store and do nothing.
 //! - **No alignment check.** `CR0.AM` and `EFLAGS.AC` have storage; no `#AC`

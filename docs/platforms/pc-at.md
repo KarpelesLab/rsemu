@@ -627,7 +627,15 @@ around that file with nothing in the diskette drive**, and uses what boots.
 Quoted from the run, at sixty guest seconds and then at the two commands:
 
 ```text
-  |CD-ROM not configured|
+  |  Name           Total           Conventional       Upper Memory|
+  |  --------  ----------------   ----------------   ----------------|
+  |  SYSTEM      17,056   (17K)     10,752   (11K)      6,304    (6K)|
+  |  COMMAND      3,376    (3K)          0    (0K)      3,376    (3K)|
+  |  FDAPM          928    (1K)          0    (0K)        928    (1K)|
+  |  UDVD2        1,984    (2K)          0    (0K)      1,984    (2K)|
+  |  SHSUCDX      6,160    (6K)          0    (0K)      6,160    (6K)|
+  |  Free       820,496  (801K)    643,136  (628K)    177,360  (173K)|
+  |CD-ROM configured as D: drive (FDCDX001)|
   |Done processing startup files C:\FDCONFIG.SYS and C:\FDAUTO.BAT|
   |Welcome to the FreeDOS 1.3 operating system (http://www.freedos.org)|
   |C:\>ver|
@@ -635,19 +643,31 @@ Quoted from the run, at sixty guest seconds and then at the two commands:
   |C:\>dir c:\|
   | Volume in drive C is FREEDOS2022|
   | Directory of C:\|
-  |FREEDOS              <DIR>  01-01-2026 12:02a|
+  |FREEDOS              <DIR>  01-01-2026 12:03a|
+  |TEMP                 <DIR>  01-01-2026 12:01a|
   |COMMAND  COM        85,480  07-10-2021 11:28p|
   |FDAUTO   BAT         1,740  01-01-2026 12:02a|
-  |FDCONFIG SYS           319  01-01-2026 12:02a|
-  |KERNEL   SYS        46,485  05-14-2021  3:32a|
+  |FDCONFIG SYS           872  01-01-2026 12:03a|
+  |KERNEL   SYS        46,256  05-15-2021  2:38a|
   |         2 dir(s)      51,421,184 bytes free|
 ```
 
 The dates are the machine's: `01-01-2026` is the RTC the machine file starts
 at, so the files the install wrote are stamped with it while the ones it
 copied off the diskettes keep 2021's. The **same instants twice** — two runs
-of this file reported the install complete at 2,779,599 ms to the millisecond,
+of this file reported the install complete at 2,789,599 ms to the millisecond,
 which is the determinism claim made rather than asserted.
+
+**That `Upper Memory` column is a virtual-8086 monitor's**, and it was not
+there for the first year this test existed. `FDCONFIG.SYS`'s default menu
+entry loads **JemmEx**, which puts the machine into virtual-8086 mode under
+paging to lend the 384 KiB between `0xa0000` and `0xfffff` to drivers; the
+core had no such mode, and JemmEx's `IRETD` into it came back `#GP` with the
+8086 segment value as the error code, because the only thing a core without
+the mode can do with that frame is look the value up in a descriptor table.
+Five drivers now load high and 173 KiB of upper memory is free.
+
+It had to be found twice, which is [its own section](#two-modes-the-core-did-not-have-and-a-memory-manager-needed-both).
 
 Four things the installation taught the firmware, none of them predicted; the
 first three have a hermetic test each in `tests/pc_at_disk_services.rs`:
@@ -707,6 +727,59 @@ Two things the *boot* taught it earlier, neither predicted:
 twenty of host time in `--release`, which is what unpacking 114 archive
 volumes off five diskettes onto a 64 MiB disk costs. It is gated on
 `RSEMU_FREEDOS_DIR` and skips with a printed reason without it.
+
+### Two modes the core did not have, and a memory manager needed both
+
+The boot above stopped for a week with `JemmEx v5.79 [02/02/20]` as the last
+line on the screen and nothing after it, and the bisect landed on a commit
+that gave `EFLAGS.ID` storage — a change with no possible connection to a DOS
+memory manager. It had none: it moved where `JEMMEX.EXE` landed in low memory
+by a few paragraphs, and a defect that had been sitting under this board all
+along started depending on the low two bits of that address.
+
+**The first one is the privilege level.** A processor's current privilege
+level is not the low two bits of the `CS` *selector*; those carry it because
+every protected-mode `CS` load writes them, which is what makes `PUSH CS` and
+an exception frame report it (*Intel SDM* Vol 3A §5.5). It actually lives in
+the cached descriptor. The two disagree in exactly one window, and *Intel SDM*
+Vol 3A §9.9.1 is that window: the `MOV CR0` that sets `PE` and the far jump
+that reloads `CS` are separate instructions, and between them `CS` still holds
+a real-address-mode segment whose low two bits are part of an address.
+Real-address mode is privilege 0, and so is that window.
+
+JemmEx runs three instructions in it — `LLDT`, a `MOV` to a segment register,
+a `MOV` to `CR3` — before it jumps. Loaded at `CS = 0x029e`, it looked like
+ring 2; `LLDT` raised `#GP(0)`; `IDTR` still held the real-mode vector table,
+so the fault could not be delivered, the double fault could not either, and
+the processor shut down. Loaded four paragraphs lower it would have looked
+like ring 0 and nothing would have happened — which is why the symptom arrived
+with an unrelated commit and why the bisect pointed at the wrong one.
+
+**The second is virtual-8086 mode itself**, which is what the manager is for.
+`src/cpu/x86` now has it: `IRET` from privilege 0 off a frame whose flags
+image has `VM` set enters a task with an 8086's segmentation and an 8086's
+protection — which is none, so a `.COM` file may still write through `CS`
+(§20.2.2) — at privilege 3 (§20.2.4); `CLI`, `STI`, `PUSHF`, `POPF`, `INT n`
+and `IRET` fault below `IOPL` 3 (§20.2.7); the I/O permission bitmap decides
+every port whatever `IOPL` says (§20.2.8); and an interrupt or exception
+leaves through the protected-mode table with the nine-doubleword frame and a
+stack switch to ring 0 (§20.3.1). `CR4.VME`, `PVI` and the
+interrupt-redirection bitmap are still absent, and `EFLAGS.VIF`/`VIP` still
+have no storage, which is the honest pairing: nothing here claims a mechanism
+it does not have.
+
+Both are ROM-free tests in `src/cpu/x86/tests.rs` —
+`the_window_between_setting_pe_and_the_far_jump_is_ring_zero`,
+`a_conforming_code_segment_does_not_hand_its_caller_ring_zero` (the other side
+of where the level is kept), `an_iret_with_vm_set_runs_an_8086_task_and_an_interrupt_brings_it_back`
+and `a_virtual_8086_task_below_iopl_three_traps_on_the_six_sensitive_instructions`.
+
+**The reproduction is worth recording too.** The full test is sixteen minutes
+because it installs from five diskettes every time, and the failure is in the
+*second* half. It leaves the image it built in a temporary directory when it
+fails, so the second half on its own — build the board around that image, run
+sixty guest seconds, read the text page — is **three host seconds**, and that
+is what every iteration of this hunt actually cost.
 
 ### A CD-ROM, and booting off one
 

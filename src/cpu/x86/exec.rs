@@ -765,14 +765,30 @@ impl<'a> Exec<'a> {
     /// or a `MOV` to `CR3` between the two, as JemmEx does.
     ///
     /// Zero in real mode, which is not a special case so much as the only
-    /// level real mode has.
+    /// level real mode has, and three in a virtual-8086 task, where the
+    /// segment registers hold 8086 segment values and say nothing at all
+    /// (§20.2.4).
     #[inline]
     pub(super) fn cpl(&self) -> u8 {
-        if self.protected() {
-            self.state.sys.seg(seg::CS).dpl()
-        } else {
-            0
+        if !self.protected() {
+            return 0;
         }
+        if self.state.regs.eflags & flags::VM != 0 {
+            return 3;
+        }
+        self.state.sys.seg(seg::CS).dpl()
+    }
+
+    /// Whether the processor is in virtual-8086 mode.
+    ///
+    /// Protected mode with `EFLAGS.VM` set: an 8086's segmentation —
+    /// `selector << 4` with a 64 KiB limit and no descriptor anywhere — run
+    /// underneath protected mode's paging and protection at privilege 3, which
+    /// is how an operating system runs a real-mode program as an ordinary task
+    /// (*Intel SDM* Vol 3A §20.2).
+    #[inline]
+    pub(super) fn v86(&self) -> bool {
+        self.protected() && self.state.regs.eflags & flags::VM != 0
     }
 
     /// Whether this part can enter long mode at all.
@@ -1361,7 +1377,13 @@ impl<'a> Exec<'a> {
         if !self.protected() {
             return Ok(());
         }
-        if self.cpl() <= self.state.regs.iopl() {
+        // Inside a virtual-8086 task `IOPL` does not grant port access at all:
+        // the permission bitmap is consulted for every port, whatever `IOPL`
+        // says (*Intel SDM* Vol 3A §20.2.8). That separation is the point —
+        // the task needs `IOPL` 3 so that `CLI`, `STI` and `INT n` run without
+        // a trap, and the monitor still wants the ports it virtualises to come
+        // to it.
+        if !self.v86() && self.cpl() <= self.state.regs.iopl() {
             return Ok(());
         }
         let tss = self.state.sys.task;
@@ -2346,9 +2368,15 @@ impl<'a> Exec<'a> {
             }
             Op::PUSHF => {
                 // `VM` and `RF` are never stored: the image on the stack has to
-                // be one `POPF` could legally restore. (`PUSHF` is
-                // IOPL-sensitive only in virtual-8086 mode, which this core
-                // does not implement.)
+                // be one `POPF` could legally restore.
+                //
+                // `PUSHF` is `IOPL`-sensitive in a virtual-8086 task (*Intel
+                // SDM* Vol 3A §20.2.7): below `IOPL` 3 the monitor is meant to
+                // see it, because the task's idea of `IF` is not the
+                // processor's.
+                if self.v86() && self.state.regs.iopl() != 3 {
+                    return Err(Fault::gp(0));
+                }
                 let value = self.state.regs.eflags & !(flags::VM | flags::RF);
                 self.push(u64::from(value), f.opsize)?;
             }
@@ -2549,6 +2577,16 @@ impl<'a> Exec<'a> {
             }
             Op::IRET => self.iret(f.opsize)?,
             Op::INT => {
+                // `INT n` is one of the six instructions virtual-8086 mode
+                // makes `IOPL`-sensitive (*Intel SDM* Vol 3A §20.2.7). Below
+                // `IOPL` 3 it is `#GP(0)`, which the monitor uses to see and
+                // emulate the call; at 3 it goes through the protected-mode
+                // interrupt table like any other, not through the task's own
+                // vector table. `INT3` and `INTO` below are traps and are not
+                // on that list.
+                if self.v86() && self.state.regs.iopl() != 3 {
+                    return Err(Fault::gp(0));
+                }
                 let vector = f.imm as u8;
                 self.software_interrupt(vector)?;
             }
@@ -2916,6 +2954,12 @@ impl<'a> Exec<'a> {
         }
         let cpl = self.cpl();
         let iopl = self.state.regs.iopl();
+        // `POPF` is `IOPL`-sensitive in a virtual-8086 task rather than
+        // silently dropping `IF`, for the reason `PUSHF` is (*Intel SDM*
+        // Vol 3A §20.2.7).
+        if self.v86() && iopl != 3 {
+            return Err(Fault::gp(0));
+        }
         let mut keep = flags::POPF_FORBIDDEN;
         if self.protected() && cpl > iopl {
             keep |= flags::IF;

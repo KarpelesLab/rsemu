@@ -940,6 +940,24 @@ const fn running_at(seg: SegReg, cpl: u8) -> SegReg {
     }
 }
 
+/// A segment register as a **virtual-8086** task holds one.
+///
+/// No descriptor is read: the base is `selector << 4` and the limit is 64 KiB,
+/// which is an 8086's arithmetic and is the whole point of the mode (*Intel
+/// SDM* Vol 3A §20.2.2). The access rights are a real-mode segment's with
+/// `DPL` 3, because a virtual-8086 task runs at privilege 3 (§20.2.4) and this
+/// is where [`Exec::cpl`](super::exec) keeps the level.
+#[must_use]
+const fn v86_seg(selector: u16, code: bool) -> SegReg {
+    let rights = if code { ar::REAL_CODE } else { ar::REAL_DATA };
+    SegReg {
+        selector,
+        base: (selector as u64) << 4,
+        limit: 0xffff,
+        ar: rights | (3 << ar::DPL_SHIFT),
+    }
+}
+
 /// The system-register file: everything that is architectural state but is not
 /// a general register.
 ///
@@ -1471,7 +1489,13 @@ impl Exec<'_> {
             }
             return Ok(lin);
         }
-        if self.protected() {
+        // A virtual-8086 task gets an 8086's segmentation and an 8086's
+        // protection, which is none: the type and access-rights checks are not
+        // made at all (*Intel SDM* Vol 3A §20.2.2), so a program may write
+        // through `CS` the way a `.COM` file patches its own code. The limit
+        // check below stays, because the offset still may not leave the 64 KiB
+        // window, and paging still applies underneath.
+        if self.protected() && !self.v86() {
             // A null selector leaves the register unusable rather than
             // pointing at address zero, and using it is a fault — which is
             // what makes clearing `DS` on the way to user mode a safety
@@ -1586,6 +1610,20 @@ impl Exec<'_> {
     pub(super) fn load_segment(&mut self, index: u8, selector: u16) -> Ex<()> {
         if index >= seg::COUNT as u8 {
             return Err(Fault::bare(VEC_UD));
+        }
+        if self.v86() {
+            // A virtual-8086 task's segment registers are an 8086's: the
+            // value written is shifted, the limit is 64 KiB, and no descriptor
+            // table is consulted (*Intel SDM* Vol 3A §20.2.2). Unlike real
+            // mode this does **not** keep whatever was cached — there is no
+            // unreal mode inside a virtual-8086 task, because the mode was
+            // entered from protected mode and the caches were reloaded then.
+            *self.state.sys.seg_mut(index) = v86_seg(selector, index == seg::CS);
+            self.state.regs.set_segment(index, selector);
+            if index == seg::SS {
+                self.state.int_shadow = true;
+            }
+            return Ok(());
         }
         if !self.protected() {
             // Real mode recomputes the base and **leaves the limit and the
@@ -1712,7 +1750,10 @@ impl Exec<'_> {
         is_call: bool,
         opsize: u8,
     ) -> Ex<()> {
-        if !self.protected() {
+        // A virtual-8086 task's far transfers are an 8086's, because its
+        // segment registers are (*Intel SDM* Vol 3A §20.2.2) — the cached
+        // rights already say privilege 3, so the base is all that moves.
+        if !self.protected() || self.v86() {
             if is_call {
                 let cs = self.state.regs.cs;
                 let ip = self.state.regs.rip;
@@ -2002,7 +2043,7 @@ impl Exec<'_> {
     pub(super) fn return_far(&mut self, opsize: u8, extra: u64) -> Ex<()> {
         let ip = self.pop(opsize)?;
         let selector = self.pop(opsize)? as u16;
-        if !self.protected() {
+        if !self.protected() || self.v86() {
             let entry = self.state.sys.seg_mut(seg::CS);
             entry.selector = selector;
             entry.base = u64::from(selector) << 4;
@@ -2118,6 +2159,32 @@ impl Exec<'_> {
             self.state.queue.flush();
             return Ok(());
         }
+        if self.v86() {
+            // Inside the task. `IRET` is one of the six instructions
+            // virtual-8086 mode makes `IOPL`-sensitive (*Intel SDM* Vol 3A
+            // §20.2.7): at `IOPL` 3 it is the 8086's, and below that it is
+            // `#GP(0)` so that the monitor emulates it and can see what the
+            // task was doing.
+            if self.state.regs.iopl() != 3 {
+                return Err(Fault::gp(0));
+            }
+            let ip = self.pop(opsize)?;
+            let cs = self.pop(opsize)? as u16;
+            let fl = self.pop(opsize)? as u32;
+            *self.state.sys.seg_mut(seg::CS) = v86_seg(cs, true);
+            self.state.regs.cs = cs;
+            self.state.regs.rip = u64::from(ip as u16);
+            // `VM` and `IOPL` are the monitor's, not the task's; the task may
+            // not leave the mode or raise its own privilege by returning.
+            let mut keep = flags::VM | flags::IOPL;
+            if opsize == 2 {
+                keep |= 0xffff_0000;
+            }
+            let old = self.state.regs.eflags;
+            self.set_flags((fl & !keep) | (old & keep));
+            self.state.queue.flush();
+            return Ok(());
+        }
         if self.flag(flags::NT) {
             // A nested task returns to whoever called it, named by the back
             // link at offset zero of the current task state segment.
@@ -2130,6 +2197,17 @@ impl Exec<'_> {
         let selector = self.pop(opsize)? as u16;
         let fl = self.pop(opsize)?;
         let cpl = self.cpl();
+        // The way *into* virtual-8086 mode, and the only way there is: an
+        // `IRET` executed at privilege 0 off a frame whose flags image has
+        // `VM` set (*Intel SDM* Vol 3A §20.2.1, and Vol 2A's `IRET`
+        // pseudocode, `RETURN-TO-VIRTUAL-8086-MODE`). The popped selector is
+        // an 8086 segment rather than a selector, so this has to be decided
+        // before anything looks it up in a descriptor table — which is what a
+        // core without the mode does, and it answers `#GP` with the segment
+        // value as the error code.
+        if cpl == 0 && opsize == 4 && !self.state.sys.long_mode() && fl as u32 & flags::VM != 0 {
+            return self.enter_v86(ip, selector, fl as u32);
+        }
         let sel = Selector(selector);
         if sel.is_null() {
             return Err(Fault::gp(0));
@@ -2193,6 +2271,48 @@ impl Exec<'_> {
         if outward {
             self.drop_privileged_segments(sel.rpl());
         }
+        Ok(())
+    }
+
+    /// Finish the `IRET` that enters virtual-8086 mode.
+    ///
+    /// The frame is nine doublewords where an ordinary one is three: `EIP`,
+    /// `CS` and `EFLAGS` are followed by `ESP`, `SS`, `ES`, `DS`, `FS` and
+    /// `GS`, because the task being resumed has an 8086's six segment
+    /// registers and not one of them names a descriptor. The caller has
+    /// already popped the first three and hands them across.
+    ///
+    /// *Intel SDM* Vol 3A §20.2.1; the order is Vol 2A's `IRET` pseudocode.
+    fn enter_v86(&mut self, ip: u64, cs: u16, fl: u32) -> Ex<()> {
+        let sp = self.pop(4)?;
+        let ss = self.pop(4)? as u16;
+        let es = self.pop(4)? as u16;
+        let ds = self.pop(4)? as u16;
+        let fs = self.pop(4)? as u16;
+        let gs = self.pop(4)? as u16;
+        // The flags first, because `VM` is what makes everything below an
+        // 8086 load and what makes [`Exec::cpl`](super::exec) answer 3 from
+        // here on. `RF` is cleared by `IRET` rather than restored, as it is on
+        // every other path out of this instruction.
+        self.set_flags(fl & !flags::RF);
+        *self.state.sys.seg_mut(seg::CS) = v86_seg(cs, true);
+        self.state.regs.cs = cs;
+        self.state.regs.rip = u64::from(ip as u16);
+        for (index, selector) in [
+            (seg::SS, ss),
+            (seg::ES, es),
+            (seg::DS, ds),
+            (seg::FS, fs),
+            (seg::GS, gs),
+        ] {
+            *self.state.sys.seg_mut(index) = v86_seg(selector, false);
+            self.state.regs.set_segment(index, selector);
+        }
+        // `ESP` in full rather than through `set_sp`: the frame carries the
+        // whole register and the task's stack segment is sixteen-bit, so
+        // `set_sp` would write only `SP` and drop the rest.
+        self.state.regs.rsp = sp & 0xffff_ffff;
+        self.state.queue.flush();
         Ok(())
     }
 
@@ -2399,6 +2519,16 @@ impl Exec<'_> {
         if !target.is_app() || target.high & ar::CODE == 0 || target.dpl() > cpl {
             return Err(Fault::gp(u32::from(target_sel & 0xfffc)));
         }
+        // Leaving a virtual-8086 task is a jump to the *monitor*, and nowhere
+        // else: the gate has to be a 32-bit one and its code segment has to be
+        // at privilege 0, because a handler at any other level could not build
+        // the nine-doubleword frame this pushes or restore it (*Intel SDM*
+        // Vol 3A §20.3.1). A 16-bit gate or a `DPL` above zero is `#GP`, which
+        // is how an operating system that forgot finds out.
+        let from_v86 = self.flag(flags::VM);
+        if from_v86 && (!gate32 || target.dpl() != 0) {
+            return Err(Fault::gp(u32::from(target_sel & 0xfffc)));
+        }
         if !target.present() {
             return Err(Fault::coded(VEC_NP, u32::from(target_sel & 0xfffc)));
         }
@@ -2421,9 +2551,15 @@ impl Exec<'_> {
         // the stack it was interrupted on — the 32-bit design, which only
         // switched on a ring change, could not protect a ring-0 fault.
         let ist = if long { gate.gate_ist() } else { 0 };
-        let switching = (!conforming && target.dpl() < cpl) || ist != 0;
+        let switching = from_v86 || (!conforming && target.dpl() < cpl) || ist != 0;
         if switching {
-            let new_cpl = if conforming { cpl } else { target.dpl() };
+            let new_cpl = if from_v86 {
+                0
+            } else if conforming {
+                cpl
+            } else {
+                target.dpl()
+            };
             let (ss_sel, new_sp) = if ist != 0 {
                 (0u16, self.tss_ist(ist)?)
             } else if long {
@@ -2436,8 +2572,28 @@ impl Exec<'_> {
                 self.tss_stack(new_cpl)?
             };
             let old_ss = self.state.regs.ss;
-            let old_sp = self.sp();
+            // A virtual-8086 task's stack segment is sixteen-bit, so `sp()`
+            // would give back `SP` alone; the frame carries the whole `ESP`.
+            let old_sp = if from_v86 {
+                self.state.regs.rsp & 0xffff_ffff
+            } else {
+                self.sp()
+            };
+            let old_data = [
+                self.state.regs.gs,
+                self.state.regs.fs,
+                self.state.regs.ds,
+                self.state.regs.es,
+            ];
 
+            // `VM` goes out before anything else, because it is what decides
+            // whether the pushes below are a privilege-3 task's or the
+            // monitor's — and they are the monitor's. The *saved* flags word
+            // was taken above and still has the bit, which is what the
+            // matching `IRET` needs to find (§20.3.1).
+            if from_v86 {
+                self.state.regs.eflags &= !flags::VM;
+            }
             // `CS` is committed before the pushes so that the writes are made
             // at the *new* privilege level: a page marked supervisor-only is
             // exactly where a ring-0 stack lives.
@@ -2456,11 +2612,30 @@ impl Exec<'_> {
             self.state.regs.ss = ss_sel;
             self.set_sp(aligned_frame(new_sp, long));
 
+            if from_v86 {
+                // Four more doublewords under the ordinary five: the task's
+                // data segments, which the handler cannot reach any other way
+                // because they are about to be nulled. `GS`, `FS`, `DS`, `ES`,
+                // in that order, so that the frame reads `ES`, `DS`, `FS`,
+                // `GS` upwards from the stack pointer (§20.3.1).
+                for selector in old_data {
+                    self.push(u64::from(selector), 4)?;
+                }
+            }
             self.push(u64::from(old_ss), size)?;
             self.push(old_sp, size)?;
             self.push(old_flags, size)?;
             self.push(u64::from(old_cs), size)?;
             self.push(old_ip, size)?;
+            if from_v86 {
+                // And the handler starts with nothing loaded: an 8086 segment
+                // value in a protected-mode data segment register would name
+                // a descriptor nobody meant.
+                for index in [seg::ES, seg::DS, seg::FS, seg::GS] {
+                    *self.state.sys.seg_mut(index) = SegReg::null();
+                    self.state.regs.set_segment(index, 0);
+                }
+            }
         } else if long {
             let new_cpl = if conforming {
                 cpl
