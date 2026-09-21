@@ -8,7 +8,10 @@ Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
 `tests/amiga_a500_input.rs`, `tests/amiga_adf.rs`,
 `tests/amiga_a500_kickstart.rs`; and for the A600 (its own section),
 `machines/amiga-a600.machine`, `src/dev/amiga/gayle.rs`,
-`tests/amiga_a600_board.rs`, `tests/amiga_a600_hdf.rs`; and for the ECS section,
+`tests/amiga_a600_board.rs`, `tests/amiga_a600_hdf.rs`; and for the A3000 (its
+own section), `machines/amiga-a3000.machine`, `src/dev/scsi/`,
+`src/dev/wd33c93.rs`, `src/dev/amiga/sdmac.rs`, `src/dev/amiga/ramsey.rs`,
+`tests/amiga_a3000_board.rs`, `tests/amiga_a3000.rs`; and for the ECS section,
 `machines/amiga-a500plus.machine`, `src/dev/amiga/rtc.rs` and
 `tests/amiga_a500plus.rs`; and for the AA section, `src/dev/amiga/denise/aga.rs`
 and `tests/amiga_lisa.rs`.
@@ -1155,6 +1158,305 @@ any document at hand.
   SECTORS` through Gayle, waiting on the level 2 interrupt each time, and gets
   the image's bytes.
 * `tests/amiga_a600_hdf.rs` (the user's ROMs and HDFs): the four rows above.
+
+## A3000
+
+`machines/amiga-a3000.machine` is a 68030 at 25 MHz with a 68882 in the
+coprocessor socket, the Enhanced Chip Set, 2 MiB of chip RAM in a **32-bit**
+address space, the motherboard's battery-backed clock — and **SCSI** where the
+A600 has IDE:
+
+```
+rsemu run amiga-a3000 --media kickstart=kickstart:<rom dir>/amiga-os-310-a3000.rom \
+    --media hd0=<hdf dir>/workbench-311.hdf --vnc :5900
+```
+
+`hd0` is a whole disk with a Rigid Disk Block, the same image the A600 boots
+from its IDE port: the RDB is a partition table, not a cable.
+
+The port is **three objects**, because the machine has three things, and that
+split is the point of the work:
+
+| Object | Class | Feature | What it is |
+| --- | --- | --- | --- |
+| `hd0` | `scsi.disk` | `dev-scsi` | the target: a phase machine and a SCSI command set, backed by `dev::medium` |
+| `wd0` | `wd.33c93` | `dev-wd33c93` | the initiator: a Western Digital WD33C93A |
+| `sdmac` | `amiga.sdmac` | `dev-amiga-sdmac` | Commodore's DMA controller, which masters memory and which the SCSI chip's two registers are mapped *inside* |
+
+The first two meet on a named bus (`bus = "scsi0"`), the way an `ata.disk` and
+its adapter meet in a named drive bay, so **adding a CD-ROM later is a new
+target rather than a new controller**. The falsifiable form of the split is in
+`src/dev/scsi/mod.rs`: `dev/scsi` contains no controller register name and
+`dev/wd33c93.rs` contains no SCSI command opcode.
+
+### Sources
+
+| Source | Covers |
+| --- | --- |
+| *WD33C93A SCSI Bus Interface Controller — Data Sheet and Application Notes*, Western Digital, November 1990 | §6.1 the register map; §6.2 every register bit by bit; §6.2.1 Auxiliary Status; §6.2.2 the two addresses and the auto-increment; §6.2.19 the whole interrupt code table; §6.3 the two resets; §7.1 the command list; §7.4/§7.5 the Level I and simple Level II commands; §7.6.1 `Select-And-Transfer` and its Command Phase values |
+| *The A3000+ System Specification*, Commodore-Amiga | §2.1 Fat Gary's registers; §2.2 Ramsey (Table 2-2); §2.4 the DMAC, §2.4.1 its register map (Table 2-5) and control/interrupt bits (Table 2-6) |
+| *Small Computer System Interface-2*, X3.131-1994 | §5.1 the bus phases; §6.6 the messages; §7 the command structure, status byte and sense data; §8 and §9 the commands a direct-access device implements |
+| *Amiga Hardware Reference Manual*, 3rd edition, Appendix D | the memory map the board's other windows keep |
+| Black-box: Kickstart 3.1 (40.068) and 2.04 (37.175), both A3000 images | which addresses the ROM touches at `$00DD0000` and `$00DE0000`, in what order, and what it waits on |
+
+No emulator source, no FPGA core, no AROS source and no published Kickstart
+disassembly was consulted. The one place this page quotes guest instructions —
+Ramsey's spin loop, below — is rsemu's own disassembler printing what the guest
+was executing when it stopped.
+
+### The register map, as modelled
+
+| Address | What | Notes |
+| --- | --- | --- |
+| `$00000000`–`$001FFFFF` | chip RAM, behind the overlay | 2 MiB; `OVL` is CIA-A's `PA0` into Gary, as on an A500 |
+| `$00BFD000`, `$00BFE000` | CIA-B and CIA-A | the A500's decode, unchanged |
+| `$00DC0000` | the battery-backed clock | soldered on this board rather than on a trapdoor card |
+| `$00DD0000` | `DAWR` | the `DACK` width. Not in Table 2-5 — the enhanced part dropped it — but Kickstart writes `3` there before anything else, so the A3000's has it where its A2091 ancestor does |
+| `$00DD0004` | `WTC` | obsolete, and read/write, which is how software tells this part from the enhanced one |
+| `$00DD0008` | `CONTR` | bit 8 `DMAENA`, bit 4 `PREST`, bit 2 `INTENA`, bit 1 `DMADIR` |
+| `$00DD000C` | `ACR` | the DMA address, rounded down to an even word |
+| `$00DD0010`, `$00DD0014`, `$00DD0018`, `$00DD003C` | `ST_DMA`, `FLUSH`, `CLR_INT`, `SP_DMA` | strobes: they act on any access and drive no data |
+| `$00DD001C` | `ISTR` | bits 7/6/5 the controller's line, bit 4 the same gated by `INTENA`, bit 1 `FF`, bit 0 `FE` |
+| `$00DD0041`, `$00DD0049` | the WD33C93A's `SASR` | byte lane 1 |
+| `$00DD0043`, `$00DD0047` | the WD33C93A's `SCMD` | byte lane 3 |
+| `$00DE0003` | Ramsey control | the three mode bits Kickstart spins on |
+| `$00DE0043` | Ramsey version | `$0D`, the A3000's own part |
+| `$00DFF000` | the custom chip registers | |
+| `$00F80000` | Kickstart | 512 KiB |
+
+Everything else floats, for the reason the A500 file gives.
+
+**`CONTR`'s bits are bit numbers, not masks.** Table 2-6 lists `DMAENA` 8,
+`PREST` 4, `INTENA` 2 and `DMADIR` 1 in a column whose `ISTR` half is
+unambiguously bit *numbers* — 7, 6, 5, 4, 1, 0 for six bits. Reading the
+`CONTR` half as masks instead puts `PREST` where `INTENA` is, and Kickstart's
+"enable the interrupt now that the command is issued" becomes "reset the SCSI
+chip the instant it has been told to select". Which reading is right was
+settled by watching the ROM: it writes `$0C`, reads back `$04`, writes `$00`
+during setup, and writes `$04` again immediately after putting
+`Select-with-ATN` in the Command register.
+
+**`SASR` and `SCMD` are two byte lanes, not two longwords.** §2.4.1 calls the
+mapping "a little strangely … based on 68030 behavior, rather than 68030
+specifications, so properly designed 68040 cards could not access these
+registers as bytes", and every row of Table 2-5 falls out of one rule: lane 1
+(`$…1`, `D23`–`D16`) is `SASR` and lane 3 (`$…3`, `D7`–`D0`) is `SCMD`. That
+also explains `$00DD0043`, which the table does not list and which both A3000
+Kickstarts use for `SCMD`. Read as longwords instead, the table contradicts the
+ROM — `$00DD0040`–`$…43` would have to be `SASR` *and* `SCMD` at once.
+
+### What the controller implements, and what it does not
+
+All three levels of the datasheet's command set are there. **Level I**:
+`Reset`, `Abort`, `Assert ATN`, `Negate ACK`, `Disconnect`, `Set IDI`.
+**Simple Level II**: `Select-With-ATN`, `Select-Without-ATN` and
+`Transfer Info`, with the host walking the phases itself and reading the `MCI`
+field of each interrupt. **Combination Level II**: `Select-And-Transfer`, where
+the chip's own microprocessor runs selection, message out, command, data,
+status and message in and raises one interrupt, updating the Command Phase
+register at each step so that a termination says where it stopped. Both data
+paths: polled I/O through the Data register with `DBR` in Auxiliary Status, and
+a `DmaPort` seam the board's DMA controller fills in.
+
+Not implemented, and refused rather than faked: every **target-role** command
+(`Reselect`, `Reselect-And-Transfer`, `Wait-For-Select-And-Receive`,
+`Send-Status-And-Command-Complete`, `Send-Disconnect-Message`, the four
+`Receive` and four `Send` commands) and `Translate Address`, all of which
+answer the invalid-command interrupt. **Synchronous transfer** is not modelled:
+the Synchronous Transfer register reads back what was written and every
+transfer is asynchronous, because nothing here has a transfer *rate*.
+**Parity** is never reported, because no byte on this bus was carried by a
+wire.
+
+**Disconnection and reselection are not modelled**, and that is a decision
+rather than an omission: a SCSI-2 target need not implement disconnection
+(§6.6.10), so a target that completes every command in the connection the
+initiator opened is a conforming target. Nothing in this tree therefore ever
+reselects, and the controller's reselection paths are written from the
+datasheet and exercised against a synthetic target rather than against
+`scsi.disk`.
+
+`scsi.disk` implements the direct-access command set an operating system of
+1990 issues — `TEST UNIT READY`, `REQUEST SENSE` in the fixed format,
+`INQUIRY` with vital product data pages `00` and `80`, `MODE SELECT(6)`/`(10)`,
+`MODE SENSE(6)`/`(10)` with pages `01`, `03`, `04` and `3F`, `READ CAPACITY`,
+`READ(6)`/`(10)`, `WRITE(6)`/`(10)`, `SEEK`, `VERIFY`, `SYNCHRONIZE CACHE`,
+`READ DEFECT DATA`, `START STOP UNIT`, `RESERVE`/`RELEASE`, `SEND DIAGNOSTIC`
+and `PREVENT ALLOW MEDIUM REMOVAL`. Everything else is `CHECK CONDITION` with
+`ILLEGAL REQUEST` / *invalid command operation code*, which is how a driver
+finds out what a drive has. `FORMAT UNIT`, linked commands and tagged queueing
+are among the refusals.
+
+### Ramsey, and why a memory controller is on this board at all
+
+Everything Ramsey *does* — DRAM refresh, static-column page detection, 68030
+burst cycles — is invisible to an emulator whose RAM answers in no time. What
+is not invisible is that **Kickstart waits for its control register to read
+back what it wrote**:
+
+```text
+    LEA     $00DE0003.l,A4
+    LEA     $07F7FFF0.l,A3          ; the top of the Fast RAM window
+    MOVEQ   #$7,D2
+    CMPI.B  #$7F,$40(A4)            ; $00DE0043: no Ramsey?
+    BEQ     done
+    …
+    MOVE.B  D0,(A4)                 ; set WRAP | BURST | PAGE DETECT
+  wait:
+    MOVE.B  (A4),D1
+    AND.B   D2,D1
+    CMP.B   D2,D1
+    BNE     wait
+```
+
+With `$00DE0003` floating that loop never ends and the machine never reaches
+`exec`. `src/dev/amiga/ramsey.rs` is two registers and nothing else.
+
+### The ROM, and the "ROM tower"
+
+This board maps a 512 KiB Kickstart at `$00F80000` and **needs no ROM tower**:
+no second socket, no `$00E00000` window (that is the A500 board's, and only
+AROS fills it) and no write-enabled RAM shadow of `$00F80000`.
+
+The earliest A3000s shipped with a **bootstrap ROM** instead — Kickstart 1.4 or
+a 2.0 beta, "SuperKickstart" — which is not an operating system: it finds a
+Kickstart *partition* on the SCSI disk, copies the real Kickstart into RAM at
+`$00F80000` and jumps to it. `amiga-os-140-a3000.rom` is such an image. Booting
+one needs an HDF carrying that partition, which the Amiga Forever Workbench
+images do not have, so this board is not tested with it; a machine file for a
+bootstrap-ROM A3000 would need the RAM shadow. A shipped Kickstart — 2.04
+(37.175) or 3.1 (40.068), both 512 KiB — needs none of that machinery, and both
+are what the tests use.
+
+### No motherboard fast RAM, and why
+
+A real A3000 has 1 to 16 MiB of 32-bit RAM at `$07000000` behind Ramsey. This
+board has none, which is a machine Commodore sold (no SIMMs fitted) and is
+**not** what the board would ship with if fitting it worked. It does not:
+
+* With RAM mapped anywhere in that window, Kickstart 3.1 and 2.04 both relocate
+  `ExecBase` into it — `AttnFlags` grows `AFF_ADDR32` and `ExecBase` moves to
+  `$0700xxxx`, so the relocation itself works — and then, about half a second
+  later, take an **unexpected `CHK` exception** (`AT_DeadEnd | 6`, the
+  vector-6 stub) and reboot in a loop, forever.
+* The same crash happens with 4 MiB top-aligned and with the whole 16 MiB
+  window populated, and with `unassigned = read-as-ones` as well as
+  `open-bus`, so it is neither a partially-populated window nor phantom RAM
+  found by a blind probe on a floating bus.
+* It is independent of SCSI: an A3000 with fast RAM and an **empty** SCSI bus
+  crashes identically.
+
+That leaves the 68030 core, and `src/cpu/m68k/` is not this work's to change.
+Written down here so the next person starts from the evidence rather than from
+the beginning.
+
+### How far each ROM gets
+
+`tests/amiga_a3000.rs`, behind `RSEMU_AMIGA_ROM_DIR` and `RSEMU_AMIGA_HDF_DIR`,
+boots the user's files in place and checks a frame hash; each frame was looked
+at.
+
+| ROM + disk | Reaches | What is on screen |
+| --- | --- | --- |
+| Kickstart 3.1 (40.068), empty SCSI bus | its insert-disk screen | a dark purple field; the Amiga check-mark in its blue-to-red gradient, four lines of orange text — "3.1 ROM   40.068 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." — and, to the right, the diskette held below the drive slot, mid-animation |
+| Kickstart 2.04 (37.175), empty SCSI bus | the same screen | "2.0 Roms (37.175) / Copyright © 1985-1991 / …", the diskette a little further into the same slide |
+| Kickstart 3.1 + `workbench-311.hdf` | `scsi.device` finds the drive, and stops — see below | black |
+| Kickstart 2.04 + `workbench-211.hdf` | the same | white, 2.0's blank boot screen |
+
+The two empty-bus rows are the whole chain working: `scsi.device` initialises,
+resets the controller, scans all eight bus addresses and finds nothing, and the
+boot goes on through `intuition.library` and `console.device` to the screen the
+machine draws when it has no disk. `GfxBase->ChipRevBits0` reads `$03`
+(`GFXF_HR_AGNUS | GFXF_HR_DENISE`, and **not** `GFXB_AA_ALICE`) and
+`ExecBase->AttnFlags` reads `$8037` — `AFF_68010 | AFF_68020 | AFF_68030 |
+AFF_68881 | AFF_68882` — so the guest itself agrees this is an ECS board with a
+68030 and a 68882 in it. Both are asserted rather than described.
+
+### Where it stops, with a disk on the bus
+
+With `workbench-311.hdf` at SCSI address 0 the boot gets **as far as the bus
+scan finding the drive** and no further. Traced at the register level, what the
+ROM does is:
+
+1. `DAWR := 3`, `SP_DMA`, `CLR_INT`, the `WTC` read/write test (so it knows
+   which DMAC it has), `CONTR := INTENA`.
+2. `Own ID := $4F`, `Command := Reset` → interrupt `$01` (reset, advanced
+   features enabled); `Own ID := $47`, `Reset` again → `$00`.
+3. `Control := 0` (polled I/O), `Timeout := $2C`, `Synchronous Transfer :=
+   $40`, `Source ID := $80` (Enable Reselection).
+4. `Destination ID := n`, `Command := $06` (`Select-With-ATN`),
+   `CONTR := INTENA`, then poll `ISTR`.
+
+With nothing at address *n* the interrupt is `$42` — selection timeout — and
+the ROM moves to the next address and eventually finishes. With the drive
+there, the interrupt is `$11` (§6.2.19: "a Select command completed
+successfully"), then, on the next poll, `$86` (§7.5.6's service-required
+interrupt naming the `MESSAGE OUT` phase the target requests because `ATN` was
+asserted). The driver reads both, writes the Synchronous Transfer register
+again, and its bus-handler task goes to `Wait()` for a signal that never comes.
+**Nothing further is written to `$00DD0000` at all** — not in 30 seconds of
+guest time — so whatever it is waiting for is not an access this model could
+have answered differently.
+
+Ruled out by experiment, each one tried against both ROMs:
+
+| Tried | Result |
+| --- | --- |
+| No service-required interrupt after the select (only `$11`) | the same stall |
+| Command phase instead of message out (`$82`) | the same stall |
+| `ISTR` reporting only `INT_S` rather than `INT_F | INT_S | E_INT` | the same stall |
+| Delivering the queued interrupt 3 and 20 polls later | the same stall |
+| Not touching the Command Phase register on a plain `Select` | the same stall |
+| Releasing the bus on a `Reset` command (a real defect, and fixed) | the same stall |
+
+Kickstart 2.04 takes the same path and, on seeing `$11`, reads `Own ID`,
+re-initialises the chip and reconfigures it — and then stops at exactly the
+point where the empty-bus run issues its next `Select`. So both drivers reach
+"there is a device here" and stall in the per-unit bring-up that follows, which
+is software this work is not permitted to read.
+
+### Defects found on the way
+
+| Stopped at | Why | Fix |
+| --- | --- | --- |
+| A tight loop at `$670` in chip RAM, black screen, `exec` never reached | Kickstart's memory sizing sets three bits of Ramsey's control register at `$00DE0003` and spins until they read back. Nothing answered there | `src/dev/amiga/ramsey.rs`, and `machines/amiga-a3000.machine` maps it. Test: `the_control_register_reads_back_what_kickstart_spins_on` |
+| `scsi.device` writing register numbers and data to the same address | `SASR` and `SCMD` were decoded as whole longwords, following Table 2-5's addresses literally. They are two *byte lanes* | `scsi_lane` in `src/dev/amiga/sdmac.rs`. Test: `the_scsi_chips_two_registers_are_on_two_byte_lanes` |
+| The controller being reset the instant it was told to select | Table 2-6's second column read as masks rather than bit numbers, which put `PREST` at `$04` where `INTENA` is | the `CONTR` constants. Test: `every_dmac_register_is_the_longword_table_2_5_puts_it_at` |
+| The driver reading `$11` and finding `INT` still set, so unable to issue the next command (§6.2.20) | both the select's completion interrupt and the first `REQ`'s service interrupt were raised at once, and the status read revealed the second in the same bus cycle | `Chip::poll_pending`: the first is asserted when the chip decides it, the rest arrive when the host next asks — which a board does by reading its own interrupt status register |
+| A target left holding the bus after the controller was reset | §6.3.2's "all SCSI bus signals are reset to the negated state" was not modelled | `Chip::release_bus`. Test: `a_reset_lets_go_of_the_bus_so_the_next_selection_starts_clean` |
+
+### Tests
+
+* `src/dev/scsi/tests.rs` (ROM-free): the phase signals against X3.131 §5.1;
+  the group-code lengths of §7.1; `INQUIRY`, `READ(6)`, `READ(10)` across more
+  than one internal chunk, `WRITE(10)` read back off the medium,
+  `READ CAPACITY`, `MODE SENSE` with and without a block descriptor, an
+  allocation length truncating, an unsupported logical unit, sense data and
+  its clearing, a block past the end, a bus reset's unit attention, the bus
+  rendezvous, and a snapshot round trip.
+* `src/dev/wd33c93/tests.rs` (ROM-free): the address register's
+  auto-increment and its three exceptions; an unavailable register reading all
+  ones; both resets and what each keeps; a command ignored while `INT` is set;
+  a target-role command refused; selection and its timeout; **the same
+  `INQUIRY` driven phase by phase with `Transfer Info`** and **a `READ(10)`
+  driven in one go by `Select-And-Transfer` through the DMA seam**; an
+  unexpected phase terminating where it stands; `MemAttrs::debug` moving
+  nothing; and a snapshot round trip.
+* `src/dev/amiga/sdmac/tests.rs` (ROM-free): every longword of Table 2-5; a
+  narrow access behaving as a whole longword; the two byte lanes; `ISTR` as a
+  live view gated by `INTENA`; `CLR_INT`; a data phase reaching memory at the
+  address `ACR` named, and moving nothing while DMA is stopped; `debug`;
+  a snapshot round trip.
+* `src/dev/amiga/ramsey/tests.rs` (ROM-free): the two registers, the read-back
+  the ROM waits on, the read-only version, `debug`, and a snapshot.
+* `tests/amiga_a3000_board.rs` (ROM-free): the board realizes; it names
+  exactly the media slots it documents; and a hand-assembled 68030 program
+  resets the controller, issues a `READ(10)` with `Select-And-Transfer` and
+  gets the block into chip RAM by bus mastering, waiting on the level 2
+  interrupt the whole way — with an empty bus it gets the `$42` timeout
+  instead, which is a report rather than a hang.
+* `tests/amiga_a3000.rs` (the user's ROMs and HDFs): the four rows above, plus
+  `ChipRevBits0` and `AttnFlags` read out of guest RAM.
 
 ## AA: Lisa, the display half
 

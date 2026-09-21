@@ -500,7 +500,16 @@ no IDE port and no keyboard, a two-part 3.1 ROM, **Akiko** at `$B80000` — its
 chunky-to-planar corner turn, the CD-ROM controller's registers and the two
 wires of the machine's EEPROM — a CD-ROM drive on the `cd0` slot and the
 eleven-button joypad on a controller port. With nothing in the tray it runs
-the animated boot screen, which is what a real one does.
+the animated boot screen, which is what a real one does. `amiga-a3000` is the
+**68030** machine: a 25 MHz 68030 with its 68882, ECS, 2 MiB of chip RAM in a
+32-bit address space, **Ramsey** — the memory controller whose one readable
+register Kickstart spins on — and **SCSI** where the A600 has IDE: a
+`scsi.disk` target on a named bus, a Western Digital **WD33C93A** initiator,
+and Commodore's **Super DMAC**, which masters memory and which the SCSI chip's
+two registers are mapped inside. Kickstart 3.1 and 2.04 boot on it to the
+insert-disk screen with the SCSI bus empty, with the guest itself reporting an
+ECS chip set and a 68030 with a 68882; `docs/platforms/amiga.md` records
+exactly where a boot *from* the SCSI disk stops and what has been ruled out.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's
