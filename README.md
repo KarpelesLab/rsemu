@@ -501,15 +501,17 @@ chunky-to-planar corner turn, the CD-ROM controller's registers and the two
 wires of the machine's EEPROM — a CD-ROM drive on the `cd0` slot and the
 eleven-button joypad on a controller port. With nothing in the tray it runs
 the animated boot screen, which is what a real one does. `amiga-a3000` is the
-**68030** machine: a 25 MHz 68030 with its 68882, ECS, 2 MiB of chip RAM in a
-32-bit address space, **Ramsey** — the memory controller whose one readable
-register Kickstart spins on — and **SCSI** where the A600 has IDE: a
+**68030** machine: a 25 MHz 68030 with its 68882, ECS, 2 MiB of chip RAM and
+4 MiB of 32-bit motherboard fast RAM in a 32-bit address space, **Ramsey** —
+the memory controller whose one readable register Kickstart spins on, and whose
+window the fast RAM is top-aligned in — and **SCSI** where the A600 has IDE: a
 `scsi.disk` target on a named bus, a Western Digital **WD33C93A** initiator,
 and Commodore's **Super DMAC**, which masters memory and which the SCSI chip's
-two registers are mapped inside. Kickstart 3.1 and 2.04 boot on it to the
-insert-disk screen with the SCSI bus empty, with the guest itself reporting an
-ECS chip set and a 68030 with a 68882; `docs/platforms/amiga.md` records
-exactly where a boot *from* the SCSI disk stops and what has been ruled out.
+two registers are mapped inside. **Kickstart 3.1 boots Workbench 3.1 off the
+SCSI disk to its desktop, and 2.04 boots Workbench 2.1**, with the guest itself
+reporting an ECS chip set, a 68030 with a 68882, an `ExecBase` relocated into
+the fast RAM and a `DH0` handler task for the partition it found in the Rigid
+Disk Block; with the bus empty both reach the insert-disk screen instead.
 `amiga-a4000` is the **68040** machine: the AA chip set on the A3000's 32-bit
 board, a 25 MHz 68040 with its on-chip FPU, 2 MiB of chip RAM, **16 MiB of
 motherboard fast RAM** behind Ramsey — `exec` relocates `ExecBase` into it —

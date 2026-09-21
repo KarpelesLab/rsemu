@@ -737,8 +737,8 @@ pub static AMIGA_A600: CatalogEntry = CatalogEntry {
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a3000")))]
 pub static AMIGA_A3000: CatalogEntry = CatalogEntry {
     name: "amiga-a3000",
-    summary: "an Amiga 3000: a 68030 and a 68882, ECS, 2 MiB of chip RAM, and a WD33C93A SCSI \
-              hard disk",
+    summary: "an Amiga 3000: a 68030 and a 68882, ECS, 2 MiB of chip RAM and 4 MiB of fast, and \
+              a WD33C93A SCSI hard disk",
     media: &["kickstart", "hd0", "df0"],
     source: include_str!("../../machines/amiga-a3000.machine"),
 };

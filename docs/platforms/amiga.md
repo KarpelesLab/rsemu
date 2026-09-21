@@ -1164,9 +1164,9 @@ any document at hand.
 ## A3000
 
 `machines/amiga-a3000.machine` is a 68030 at 25 MHz with a 68882 in the
-coprocessor socket, the Enhanced Chip Set, 2 MiB of chip RAM in a **32-bit**
-address space, the motherboard's battery-backed clock — and **SCSI** where the
-A600 has IDE:
+coprocessor socket, the Enhanced Chip Set, 2 MiB of chip RAM and 4 MiB of
+motherboard fast RAM in a **32-bit** address space, the motherboard's
+battery-backed clock — and **SCSI** where the A600 has IDE:
 
 ```
 rsemu run amiga-a3000 --media kickstart=kickstart:<rom dir>/amiga-os-310-a3000.rom \
@@ -1225,6 +1225,7 @@ was executing when it stopped.
 | `$00DE0043` | Ramsey version | `$0D`, the A3000's own part |
 | `$00DFF000` | the custom chip registers | |
 | `$00F80000` | Kickstart | 512 KiB |
+| `$08000000 - fast-ram` | motherboard fast RAM, behind Ramsey | top-aligned at `$08000000`, §2.2 |
 
 Everything else floats, for the reason the A500 file gives.
 
@@ -1330,27 +1331,129 @@ bootstrap-ROM A3000 would need the RAM shadow. A shipped Kickstart — 2.04
 (37.175) or 3.1 (40.068), both 512 KiB — needs none of that machinery, and both
 are what the tests use.
 
-### No motherboard fast RAM, and why
+### Motherboard fast RAM, and where it goes
 
-A real A3000 has 1 to 16 MiB of 32-bit RAM at `$07000000` behind Ramsey. This
-board has none, which is a machine Commodore sold (no SIMMs fitted) and is
-**not** what the board would ship with if fitting it worked. It does not:
+§2.2 of the *A3000+ System Specification* places it exactly:
 
-* With RAM mapped anywhere in that window, Kickstart 3.1 and 2.04 both relocate
-  `ExecBase` into it — `AttnFlags` grows `AFF_ADDR32` and `ExecBase` moves to
-  `$0700xxxx`, so the relocation itself works — and then, about half a second
-  later, take an **unexpected `CHK` exception** (`AT_DeadEnd | 6`, the
-  vector-6 stub) and reboot in a loop, forever.
-* The same crash happens with 4 MiB top-aligned and with the whole 16 MiB
-  window populated, and with `unassigned = read-as-ones` as well as
-  `open-bus`, so it is neither a partially-populated window nor phantom RAM
-  found by a blind probe on a floating bus.
-* It is independent of SCSI: an A3000 with fast RAM and an **empty** SCSI bus
-  crashes identically.
+> RAMSEY controlled Fast RAM is located from `$07FFFFFF` building down toward
+> `$07000000`, as far as the populated memory will take it.
 
-That leaves the 68030 core, and `src/cpu/m68k/` is not this work's to change.
-Written down here so the next person starts from the evidence rather than from
-the beginning.
+So the window is **top-aligned at `$08000000`**, not based at `$07000000`: a
+half-populated board leaves the *bottom* of the window empty. `param fast-ram`
+is how much is in the sockets, 4 MiB by default, and the `map` statement
+subtracts it from `$08000000`. There is no way to say "no SIMMs at all",
+because a `ram` object cannot have no bytes.
+
+Kickstart sizes it and **relocates `ExecBase` into it**, which is exec moving
+into the fastest memory it has found: `ExecBase` goes from `$0000_07F8` to
+`$07C0_07F8`. `tests/amiga_a3000.rs` asserts that, on all four rows, out of
+guest RAM — a machine file can map anything, and only the guest can say it
+believed what it found.
+
+**This used to be recorded here as a known failure. It does not exist.** The
+previous round of work wrote down that fitting this RAM was impossible: both
+Kickstarts relocated `ExecBase` into it and then, about half a second later,
+took an unexpected `CHK` exception (`AT_DeadEnd | 6`) and rebooted for ever, at
+every size and alignment tried and with the SCSI bus empty. **None of that
+reproduces**, and the note has been struck rather than qualified — a documented
+bug that is not there costs the next person a day.
+
+Two independent measurements say so, and they bracket the SCSI fix below:
+
+* The A4000 section's [sweep](#motherboard-fast-ram-and-the-a3000s-chk) ran six
+  configurations on `master` at `ebaa03e4` — **before** any of the WD33C93A
+  work landed — including this board with both ROMs at 16 MiB and at 4 MiB
+  top-aligned. Every one relocated `ExecBase` into fast RAM with 0 resets and
+  0 bus faults.
+* On this tree, with the fix in, the four real-ROM rows pass with 4 MiB fitted
+  and every frame hashes to exactly what it hashed with no fast RAM at all; a
+  separate run with the full 16 MiB and an **empty** bus, watching `LastAlert`,
+  `ExecBase` and the processor's reset count every 10 ms for six seconds, sees
+  no alert and no reset.
+
+So the crash is not the SCSI defect wearing a different hat, and nothing here
+claims it was: it simply is not reproducible on either side of that change. The
+likely shape of the original report is the next paragraph.
+
+**Where a part-populated board goes matters, and it is the trap.** The
+memory-sizing routine quoted under Ramsey starts at `$07F7FFF0` and works
+*down*. RAM filled from the bottom of the window — 4 MiB at `$07000000`, say —
+has nothing at the address the ROM probes, so the ROM concludes there is none
+and `ExecBase` stays in chip RAM. That is not a crash and it is not a defect;
+it is §2.2 being taken literally. It is also the most likely shape of the
+original report.
+
+### The `MCI` field, and the bit that is not decoration
+
+Four of §6.2.19's rows carry the bus phase, and the datasheet writes every one
+of them as `1MCI` in the *code* nibble — never as a bare `MCI`:
+
+| Row | Code | What it says |
+| --- | --- | --- |
+| `0001 1MCI` | `18`+ | a `Transfer` (non-Message-In) completed; `MCI` is the phase now asked for |
+| `0010 1MCI` | `28`+ | a `Transfer` was aborted |
+| `0100 1MCI` | `48`+ | an unexpected information phase — "typically caused by a phase change before the Transfer Count has reached zero" |
+| `1000 1MCI` | `88`+ | `REQ` was asserted following connection, or with no command executing |
+
+Dropping that fourth bit does not produce a *near* miss, it produces a
+different row of the same tables. `86` Hex — service required with a bare
+`MESSAGE OUT` — is listed as **"reserved for future use"**, and `11` Hex is not
+a `Transfer` completion but "a Select command completed successfully".
+Commodore's `scsi.device` reads `86`, finds a status it has never heard of, and
+does the right thing with it: nothing. Its bus-handler task then waits for an
+interrupt that never comes, which is where this port stopped for two rounds of
+work. With the bit in place the same driver reads `8E`, answers it with
+`Transfer Info` and an `IDENTIFY` byte, and the boot goes on.
+
+### A transfer ends where the phase ends
+
+§7.5.6: "a transition in the `I/O-`, `C/D-`, and/or `MSG-` pins during a
+Transfer command will also terminate the command and generate a 'terminated'
+interrupt". That is not an error path. `scsi.device` issues `INQUIRY` with an
+allocation length of `FE` Hex against a drive with 36 bytes of inquiry data, so
+**every** `INQUIRY` ends this way: 36 bytes move, the target asks for `STATUS`,
+and the chip raises `4B` Hex — terminated, `MCI` = `011` — with `FE - 36` still
+in the Transfer Count, which §7.5.6 promises is "the number of bytes yet to be
+transferred".
+
+Two things follow, and both were wrong here:
+
+* A transfer that runs past its phase must **stop**, not keep pulling. X3.131
+  §5.1 gives a target no way to say "no more" other than by changing phase, so
+  `dev/scsi`'s `Target::read` answering short *is* the phase ending. Reading on
+  regardless handed the host the target's status byte as if it were inquiry
+  data and then swallowed the `COMMAND COMPLETE` behind it, after which the
+  connection looked like an unexpected disconnect (`41` Hex) and the driver
+  gave up on the unit. The phase is now checked before each byte, on the polled
+  path and on the DMA one.
+* A host polling `DBR` for a byte that is never coming has nothing to wake it.
+  Without the terminated interrupt Kickstart 3.1 sat in that loop reading
+  Auxiliary Status about four hundred thousand times.
+
+### A queued interrupt has to arrive on its own
+
+A `Select` raises two interrupts in this model where a real bus has two events
+in time: the selection completing, and the target's first `REQ`. §6.2.20
+forbids the host from writing a command while `INT` is set, so the second
+cannot be revealed in the same bus cycle as the status read of the first — and
+the original fix, holding it until the host *asked* by reading the board's
+`ISTR`, is a cycle with no entry. `INTRQ` only re-asserts when someone reads
+`ISTR`; `ISTR` is only read from an interrupt handler; no interrupt, no read.
+On an A3000 it survived on CIA-A's unrelated level-2 interrupts dragging the
+server chain through `ISTR`, and the boot froze the moment those went quiet —
+after 109 SCSI commands, with AmigaDOS already mounted.
+
+What the chip does instead is settle the queue after the host's next access to
+either of its two addresses, with three exceptions that are the host *looking*
+rather than acting: the SCSI Status read that cleared `INTRQ`, a load of the
+Address register (§6.2.2 — a host-side pointer) and a read of Auxiliary Status
+(§6.2.1: "may be accessed at any time"). So `SASR := Command; SCMD := cmd`, the
+shortest command there is, still lands. That window is the datasheet's own:
+§6.2.20 says a command must not be loaded "within seven microseconds … from the
+last SCSI Status read", which is the real part re-raising `INTRQ` a few
+microseconds later whether or not the host does anything. This is that,
+counted in bus cycles because a chip with no clock property has no
+microseconds.
 
 ### How far each ROM gets
 
@@ -1362,60 +1465,57 @@ at.
 | --- | --- | --- |
 | Kickstart 3.1 (40.068), empty SCSI bus | its insert-disk screen | a dark purple field; the Amiga check-mark in its blue-to-red gradient, four lines of orange text — "3.1 ROM   40.068 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." — and, to the right, the diskette held below the drive slot, mid-animation |
 | Kickstart 2.04 (37.175), empty SCSI bus | the same screen | "2.0 Roms (37.175) / Copyright © 1985-1991 / …", the diskette a little further into the same slide |
-| Kickstart 3.1 + `workbench-311.hdf` | `scsi.device` finds the drive, and stops — see below | black |
-| Kickstart 2.04 + `workbench-211.hdf` | the same | white, 2.0's blank boot screen |
+| Kickstart 3.1 + `workbench-311.hdf` | **the Workbench 3.1 desktop** | the grey backdrop, "Copyright © 1985-1993 Commodore-Amiga, Inc. All Rights Reserved." in the title bar, the Workbench window open across it, and in it "Ram Disk" and the hard-disk icon "Workbench3.1" |
+| Kickstart 2.04 + `workbench-211.hdf` | **the Workbench 2.1 desktop** | the same furniture in 2.0's wording — "Copyright © 1985-1991" — with "Ram Disk" and "Workbench2.1" |
 
 The two empty-bus rows are the whole chain working: `scsi.device` initialises,
 resets the controller, scans all eight bus addresses and finds nothing, and the
 boot goes on through `intuition.library` and `console.device` to the screen the
 machine draws when it has no disk. `GfxBase->ChipRevBits0` reads `$03`
 (`GFXF_HR_AGNUS | GFXF_HR_DENISE`, and **not** `GFXB_AA_ALICE`) and
-`ExecBase->AttnFlags` reads `$8037` — `AFF_68010 | AFF_68020 | AFF_68030 |
-AFF_68881 | AFF_68882` — so the guest itself agrees this is an ECS board with a
-68030 and a 68882 in it. Both are asserted rather than described.
+`ExecBase->AttnFlags` reads `$8037` under 3.1 and `$0077` under 2.04 — both
+carrying `AFF_68010 | AFF_68020 | AFF_68030 | AFF_68881 | AFF_68882` — so the
+guest itself agrees this is an ECS board with a 68030 and a 68882 in it. The
+bits are asserted rather than the word, because the two ROMs do not agree about
+the rest of them.
 
-### Where it stops, with a disk on the bus
+### What a boot off the disk does, register by register
 
-With `workbench-311.hdf` at SCSI address 0 the boot gets **as far as the bus
-scan finding the drive** and no further. Traced at the register level, what the
-ROM does is:
+With `workbench-311.hdf` at SCSI address 0, traced at the window:
 
-1. `DAWR := 3`, `SP_DMA`, `CLR_INT`, the `WTC` read/write test (so it knows
-   which DMAC it has), `CONTR := INTENA`.
-2. `Own ID := $4F`, `Command := Reset` → interrupt `$01` (reset, advanced
-   features enabled); `Own ID := $47`, `Reset` again → `$00`.
+1. `DAWR := 3`, `SP_DMA`, `CLR_INT`, the `WTC` read/write test (so the driver
+   knows which DMAC it has), `CONTR := $0C`, read back `$04`.
+2. `Own ID := $4F`, `Command := Reset` → interrupt `01` (reset, advanced
+   features enabled); `Own ID := $47`, `Reset` again → `00`. So it runs the
+   chip in **non-advanced** mode, at initiator ID 7.
 3. `Control := 0` (polled I/O), `Timeout := $2C`, `Synchronous Transfer :=
-   $40`, `Source ID := $80` (Enable Reselection).
-4. `Destination ID := n`, `Command := $06` (`Select-With-ATN`),
-   `CONTR := INTENA`, then poll `ISTR`.
+   $40` (offset 0 — asynchronous), `Source ID := $80` (Enable Reselection).
+4. For each of the eight bus addresses: `Destination ID := n`,
+   `Command := $06` (`Select-With-ATN`), `CONTR := INTENA`. An empty address
+   answers `42` — selection timeout — and the scan moves on.
+5. Where the drive is: `11` (select complete), then `8E` (service required,
+   `MESSAGE OUT`). The driver answers with `Command := $A0`
+   (`Transfer Info` + `SBT`) and one `IDENTIFY` byte, `C0`, through the Data
+   register.
+6. `1A` (transfer done, `COMMAND` next): six CDB bytes `12 00 00 00 FE 00` —
+   `INQUIRY`, allocation length 254 — again through the Data register.
+7. `19` (transfer done, `DATA IN` next): 36 bytes of inquiry data out of the
+   Data register, then `4B` — terminated, the target wants `STATUS` — with
+   `FE - 36` left in the Transfer Count.
+8. From there on every command is a `Select-And-Transfer`: CDB in registers
+   `03`.., `CONTR := $0C`, `ACR := <buffer>`, `ST_DMA`, Transfer Count `$200`,
+   `Control := $80` (burst DMA), `Command := $20`, and 512 bytes land in chip
+   RAM by bus mastering. `1B` says the data phase finished and `STATUS` is
+   next; the driver then writes **Command Phase := `$46`** and re-issues the
+   combination command, which is §7.6.1's resume, and gets `16` —
+   `Select-And-Transfer` completed — with the status byte in the Target LUN
+   register, followed by `85`, the disconnect.
 
-With nothing at address *n* the interrupt is `$42` — selection timeout — and
-the ROM moves to the next address and eventually finishes. With the drive
-there, the interrupt is `$11` (§6.2.19: "a Select command completed
-successfully"), then, on the next poll, `$86` (§7.5.6's service-required
-interrupt naming the `MESSAGE OUT` phase the target requests because `ATN` was
-asserted). The driver reads both, writes the Synchronous Transfer register
-again, and its bus-handler task goes to `Wait()` for a signal that never comes.
-**Nothing further is written to `$00DD0000` at all** — not in 30 seconds of
-guest time — so whatever it is waiting for is not an access this model could
-have answered differently.
-
-Ruled out by experiment, each one tried against both ROMs:
-
-| Tried | Result |
-| --- | --- |
-| No service-required interrupt after the select (only `$11`) | the same stall |
-| Command phase instead of message out (`$82`) | the same stall |
-| `ISTR` reporting only `INT_S` rather than `INT_F | INT_S | E_INT` | the same stall |
-| Delivering the queued interrupt 3 and 20 polls later | the same stall |
-| Not touching the Command Phase register on a plain `Select` | the same stall |
-| Releasing the bus on a `Reset` command (a real defect, and fixed) | the same stall |
-
-Kickstart 2.04 takes the same path and, on seeing `$11`, reads `Own ID`,
-re-initialises the chip and reconfigures it — and then stops at exactly the
-point where the empty-bus run issues its next `Select`. So both drivers reach
-"there is a device here" and stall in the per-unit bring-up that follows, which
-is software this work is not permitted to read.
+Block `$0003F1` is the first such read: `08 00 03 F1 01 00`, a `READ(6)` of one
+block, which is the Rigid Disk Block's partition list. AmigaDOS mounts what it
+finds there as `DH0` — which is what `tests/amiga_a3000.rs` asserts by name out
+of exec's task list, because a task called `DH0` exists only if the RDB was
+read, parsed and mounted, and that is a better witness than a frame hash.
 
 ### Defects found on the way
 
@@ -1424,8 +1524,11 @@ is software this work is not permitted to read.
 | A tight loop at `$670` in chip RAM, black screen, `exec` never reached | Kickstart's memory sizing sets three bits of Ramsey's control register at `$00DE0003` and spins until they read back. Nothing answered there | `src/dev/amiga/ramsey.rs`, and `machines/amiga-a3000.machine` maps it. Test: `the_control_register_reads_back_what_kickstart_spins_on` |
 | `scsi.device` writing register numbers and data to the same address | `SASR` and `SCMD` were decoded as whole longwords, following Table 2-5's addresses literally. They are two *byte lanes* | `scsi_lane` in `src/dev/amiga/sdmac.rs`. Test: `the_scsi_chips_two_registers_are_on_two_byte_lanes` |
 | The controller being reset the instant it was told to select | Table 2-6's second column read as masks rather than bit numbers, which put `PREST` at `$04` where `INTENA` is | the `CONTR` constants. Test: `every_dmac_register_is_the_longword_table_2_5_puts_it_at` |
-| The driver reading `$11` and finding `INT` still set, so unable to issue the next command (§6.2.20) | both the select's completion interrupt and the first `REQ`'s service interrupt were raised at once, and the status read revealed the second in the same bus cycle | `Chip::poll_pending`: the first is asserted when the chip decides it, the rest arrive when the host next asks — which a board does by reading its own interrupt status register |
+| The driver reading `$11` and finding `INT` still set, so unable to issue the next command (§6.2.20) | both the select's completion interrupt and the first `REQ`'s service interrupt were raised at once, and the status read revealed the second in the same bus cycle | `Chip::poll_pending`: the first is asserted when the chip decides it, the rest wait one host access and then arrive on their own |
 | A target left holding the bus after the controller was reset | §6.3.2's "all SCSI bus signals are reset to the negated state" was not modelled | `Chip::release_bus`. Test: `a_reset_lets_go_of_the_bus_so_the_next_selection_starts_clean` |
+| `scsi.device` finding the drive and then waiting for ever | every phase-carrying interrupt was built with a bare `MCI` instead of §6.2.19's `1MCI`, so the service-required interrupt for `MESSAGE OUT` was `86` Hex — a code the same table marks "reserved for future use" | `INT_MCI`. Test: `every_phase_carrying_interrupt_has_the_mci_bit_the_status_table_writes` |
+| An `INQUIRY` reading 36 bytes of data and then the target's status byte and `COMMAND COMPLETE` as if they were data, ending in an unexpected disconnect | a polled or DMA transfer kept pulling after the phase had ended; §7.5.6 terminates it there | the phase check in `Chip::stage_input`, `Chip::write_data` and `Chip::pump`, and `Chip::terminate_polled`. Test: `a_transfer_longer_than_the_phase_terminates_instead_of_stalling` |
+| The boot freezing after 109 successful SCSI commands, with `DH0` already mounted | the interrupt queued behind a `Select` was only delivered when the host read the board's `ISTR`, and only an interrupt makes a host read `ISTR` | `Chip::settle`, called from every host access but the three that are the host looking. Test: `a_queued_interrupt_arrives_without_anyone_reading_a_board_register` |
 
 ### Tests
 
@@ -1442,8 +1545,11 @@ is software this work is not permitted to read.
   a target-role command refused; selection and its timeout; **the same
   `INQUIRY` driven phase by phase with `Transfer Info`** and **a `READ(10)`
   driven in one go by `Select-And-Transfer` through the DMA seam**; an
-  unexpected phase terminating where it stands; `MemAttrs::debug` moving
-  nothing; and a snapshot round trip.
+  unexpected phase terminating where it stands; §6.2.19's `1MCI` bit in every
+  phase-carrying interrupt; a transfer longer than the phase terminating with
+  the count of what is left; a queued interrupt arriving without anyone reading
+  a board register; `MemAttrs::debug` moving nothing; and a snapshot round
+  trip.
 * `src/dev/amiga/sdmac/tests.rs` (ROM-free): every longword of Table 2-5; a
   narrow access behaving as a whole longword; the two byte lanes; `ISTR` as a
   live view gated by `INTENA`; `CLR_INT`; a data phase reaching memory at the
@@ -1458,7 +1564,10 @@ is software this work is not permitted to read.
   interrupt the whole way — with an empty bus it gets the `$42` timeout
   instead, which is a report rather than a hang.
 * `tests/amiga_a3000.rs` (the user's ROMs and HDFs): the four rows above, plus
-  `ChipRevBits0` and `AttnFlags` read out of guest RAM.
+  `ChipRevBits0`, `AttnFlags` and an `ExecBase` inside the motherboard fast RAM
+  read out of guest RAM, and — for the two that boot off the disk — a task
+  called `DH0` on one of exec's task lists, which is AmigaDOS saying it mounted
+  the Rigid Disk Block's partition.
 
 ## AA: Lisa, the display half
 
@@ -2120,12 +2229,14 @@ those holes, with a ROM built in the file.
 
 ### Motherboard fast RAM, and the A3000's `CHK`
 
-The A3000 section above records, as an open bug, that fitting RAM anywhere in
-the `$0700_0000` window makes both A3000 Kickstarts relocate `ExecBase` into it
-and then take an unexpected `CHK` exception about half a second later and
-reboot forever. **That does not reproduce on this tree.** Every row below was
-run on `master` at `ebaa03e4`, for 15 to 30 virtual seconds, watching the
-program counter, the reset-pulse count, the bus-fault count and `ExecBase`:
+The A3000 section above **used** to record, as an open bug, that fitting RAM
+anywhere in the `$0700_0000` window makes both A3000 Kickstarts relocate
+`ExecBase` into it and then take an unexpected `CHK` exception about half a
+second later and reboot forever. **That does not reproduce on this tree**, and
+the A3000 now ships with 4 MiB of that RAM fitted and boots Workbench off its
+SCSI disk with it. Every row below was run on `master` at `ebaa03e4`, for 15 to
+30 virtual seconds, watching the program counter, the reset-pulse count, the
+bus-fault count and `ExecBase`:
 
 | board | processor | ROM | fast RAM | result |
 | --- | --- | --- | --- | --- |

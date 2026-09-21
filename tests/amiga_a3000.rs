@@ -37,9 +37,12 @@
 //!
 //! Each test asserts the same four things the other Amiga suites do — the
 //! processor did not double fault, no access faulted, Denise produced fields,
-//! and the frame hashes to what it hashed before — and two more this board is
-//! for: `GfxBase->ChipRevBits0` says ECS, and `ExecBase->AttnFlags` says a
-//! 68030 with a 68882.
+//! and the frame hashes to what it hashed before — and three more this board is
+//! for, all read back out of guest RAM: `GfxBase->ChipRevBits0` says ECS,
+//! `ExecBase->AttnFlags` says a 68030 with a 68882, and `ExecBase` itself has
+//! moved into the motherboard fast RAM behind Ramsey. The two that boot off the
+//! disk add a fourth: a task called `DH0`, which exists only if `scsi.device`
+//! read the Rigid Disk Block and AmigaDOS mounted a partition out of it.
 //!
 //! The board is the shipped `machines/amiga-a3000.machine`, unchanged.
 //! `--media` copies an image into the drive and the guest's writes stay in
@@ -266,6 +269,56 @@ fn boots_to(rom: &str, hdf: Option<&str>, label: &str, seconds: u64, golden: u64
     Some(b)
 }
 
+/// Whether exec has a task called `want`, looking on both of its lists.
+///
+/// `exec/execbase.h`: `TaskReady` is the `struct List` at offset `$196` of
+/// `ExecBase` and `TaskWait` the one at `$1A4`; `exec/lists.h` puts `lh_Head`
+/// at the head of a list and `exec/nodes.h` `ln_Succ` at the head of a node,
+/// zero on the tail, with `ln_Name` at offset 10. The running task is not on
+/// either list, so `ThisTask` (`$114`) is checked as well.
+///
+/// This is the witness that a *disk* booted rather than a picture: AmigaDOS
+/// names a file-system handler task after the device it mounted, so a task
+/// called `DH0` exists only if `scsi.device` read the Rigid Disk Block, found
+/// a partition in it and `dos.library` mounted what it found.
+fn task_exists(b: &Board, want: &[u8]) -> bool {
+    let exec = peek(b, 4, Width::U32);
+    let named = |node: u32| -> bool {
+        if node == 0 {
+            return false;
+        }
+        let name = peek(b, node + 10, Width::U32);
+        if name == 0 {
+            return false;
+        }
+        (0..=want.len() as u32).all(|i| {
+            let c = peek(b, name + i, Width::U8) as u8;
+            if i as usize == want.len() {
+                c == 0
+            } else {
+                c == want[i as usize]
+            }
+        })
+    };
+    if named(peek(b, exec + 0x114, Width::U32)) {
+        return true;
+    }
+    for head in [0x196u32, 0x1a4] {
+        let mut node = peek(b, exec + head, Width::U32);
+        for _ in 0..64 {
+            let next = peek(b, node, Width::U32);
+            if next == 0 {
+                break;
+            }
+            if named(node) {
+                return true;
+            }
+            node = next;
+        }
+    }
+    false
+}
+
 /// The processor and the chip set the guest concludes it is running on.
 fn the_guest_sees_the_board(b: &Board, label: &str) {
     let bits = chip_rev_bits(b).expect("graphics.library is on exec's library list");
@@ -279,6 +332,19 @@ fn the_guest_sees_the_board(b: &Board, label: &str) {
         bits & AA_ALICE,
         0,
         "{label}: an 8372B is not Alice, and this board has no AA in it"
+    );
+
+    // The motherboard fast RAM, witnessed by the guest rather than by the
+    // machine file: exec relocates `ExecBase` into the fastest memory it has
+    // found, so an `ExecBase` above `$07000000` is Kickstart having sized
+    // Ramsey's window, believed it, and moved in. §2.2 of the A3000+ System
+    // Specification puts that window "from $07FFFFFF building down", so with
+    // the shipped 4 MiB it starts at `$07C00000`.
+    let exec = peek(b, 4, Width::U32);
+    println!("{label}: ExecBase = {exec:#010x}");
+    assert!(
+        (0x07C0_0000..0x0800_0000).contains(&exec),
+        "{label}: exec did not move into the motherboard fast RAM ({exec:#010x})"
     );
 
     let attn = attn_flags(b);
@@ -324,24 +390,38 @@ fn kickstart_2_04_asks_for_a_disk_with_an_empty_scsi_bus() {
 }
 
 #[test]
-fn kickstart_3_1_finds_the_workbench_3_1_disk_on_the_scsi_bus() {
-    boots_to(
+fn kickstart_3_1_boots_workbench_3_1_off_the_scsi_disk() {
+    let Some(b) = boots_to(
         "amiga-os-310-a3000.rom",
         Some("workbench-311.hdf"),
         "a3000-310-wb311",
         20,
         GOLDEN_310_WB311,
+    ) else {
+        return;
+    };
+    the_guest_sees_the_board(&b, "a3000-310-wb311");
+    assert!(
+        task_exists(&b, b"DH0"),
+        "a3000-310-wb311: AmigaDOS mounted the RDB partition off the SCSI disk"
     );
 }
 
 #[test]
-fn kickstart_2_04_finds_the_workbench_2_1_disk_on_the_scsi_bus() {
-    boots_to(
+fn kickstart_2_04_boots_workbench_2_1_off_the_scsi_disk() {
+    let Some(b) = boots_to(
         "amiga-os-204-a3000.rom",
         Some("workbench-211.hdf"),
         "a3000-204-wb211",
         20,
         GOLDEN_204_WB211,
+    ) else {
+        return;
+    };
+    the_guest_sees_the_board(&b, "a3000-204-wb211");
+    assert!(
+        task_exists(&b, b"DH0"),
+        "a3000-204-wb211: AmigaDOS mounted the RDB partition off the SCSI disk"
     );
 }
 
@@ -355,11 +435,15 @@ const GOLDEN_310_EMPTY: u64 = 0xdea0_a1a3_8da5_1b19;
 /// 2.0's wording — "2.0 Roms (37.175) / Copyright © 1985-1991 / …" — with the
 /// diskette at a different point of the same slide.
 const GOLDEN_204_EMPTY: u64 = 0x74ea_2a62_c231_b235;
-/// At 20 s, Kickstart 3.1 with `workbench-311.hdf` at SCSI address 0: **black**
-/// — `scsi.device` has found the drive and its bus-handler task is waiting.
-/// See `docs/platforms/amiga.md`, "A3000 — where it stops", for what is known
-/// about that and what has been ruled out. Pinned so it cannot silently change.
-const GOLDEN_310_WB311: u64 = 0x4a59_d164_6091_d425;
-/// At 20 s, Kickstart 2.04 with `workbench-211.hdf` at SCSI address 0: **white**
-/// — 2.0's blank boot screen, stopped at the same place for the same reason.
-const GOLDEN_204_WB211: u64 = 0x5fba_f9dd_14ce_9c25;
+/// At 20 s, Kickstart 3.1 with `workbench-311.hdf` at SCSI address 0: **the
+/// Workbench desktop**. The grey 3.1 backdrop under the title bar's "Copyright
+/// © 1985-1993 Commodore-Amiga, Inc. All Rights Reserved.", the Workbench
+/// window open across it with its scroll bars and sizing gadget, and two icons
+/// in it — "Ram Disk" and the hard-disk icon labelled "Workbench3.1", which is
+/// the volume name of the partition the Rigid Disk Block describes. The red
+/// arrow pointer sits at the top left where it starts.
+const GOLDEN_310_WB311: u64 = 0xa06f_52db_6660_b2a5;
+/// At 20 s, Kickstart 2.04 with `workbench-211.hdf` at SCSI address 0: the same
+/// desktop in 2.1's furniture — "Copyright © 1985-1991", the same Workbench
+/// window, "Ram Disk" and "Workbench2.1".
+const GOLDEN_204_WB211: u64 = 0xaa2b_caad_a888_cacd;

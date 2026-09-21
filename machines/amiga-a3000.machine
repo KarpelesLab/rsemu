@@ -24,8 +24,8 @@
 #   what keeps `$00DFF000` at `$00DFF000`; the space is wider so that a Zorro
 #   III address is an address rather than a wrap.
 # * **2 MiB of chip RAM at $000000.** The A3000's Agnus is the 2 MiB ECS part
-#   and the board fills it. Motherboard *fast* RAM lives at `$07000000` and is
-#   not fitted here - see the note below.
+#   and the board fills it. Motherboard *fast* RAM is Ramsey's, top-aligned at
+#   `$08000000` - see the note below.
 # * **The Enhanced Chip Set**: an 8372B Agnus and an 8373 Super Denise, the
 #   same parts `amiga-a500plus` has. `graphics.library` reports `$03` in
 #   `GfxBase->ChipRevBits0` for them, which `tests/amiga_a3000.rs` asserts.
@@ -63,18 +63,20 @@
 #
 # ## Motherboard fast RAM
 #
-# An A3000 has 1 to 16 MiB of 32-bit motherboard RAM at `$07000000`, behind
-# Ramsey. **It is not fitted here**, and that is a known limitation rather than
-# a choice: with RAM mapped anywhere in that window both Kickstarts relocate
-# `ExecBase` into it - which works, `AttnFlags` grows `AFF_ADDR32` - and then
-# take an unexpected CHK exception half a second later and reboot in a loop.
-# Identically with 4 MiB or with the whole 16 MiB, with either floating policy,
-# and with the SCSI bus empty, so it is neither a partly-populated window nor
-# phantom RAM found on a floating bus. `docs/platforms/amiga.md` has the
-# evidence. A machine with only chip RAM is one Commodore sold, so this board
-# is honest as it stands; `$07000000` floats, which is what an A3000 with no
-# SIMMs in it does, and `AddMem` finds nothing there. Zorro II autoconfig space
-# at `$00E80000` and Zorro III space likewise float: no cards.
+# An A3000 has 1 to 16 MiB of 32-bit motherboard RAM behind Ramsey, and this
+# board fits 4 MiB of it by default (`-p fast-ram=`). Section 2.2 of the
+# A3000+ System Specification places it "from $07FFFFFF building down toward
+# $07000000, as far as the populated memory will take it", so the `map`
+# statement below is top-aligned at `$08000000` rather than based at
+# `$07000000` - a half-populated board leaves the *bottom* of the window empty,
+# not the top. Kickstart finds it, relocates `ExecBase` into it and boots.
+#
+# This window is why the board needs `amiga.ramsey` at all: Kickstart's memory
+# sizing spins on `$00DE0003` reading back what it wrote before it will size
+# anything here.
+#
+# Zorro II autoconfig space at `$00E80000`, the unfitted bottom of the fast RAM
+# window and Zorro III space above `$08000000` all float: no cards.
 #
 # Written from the *Amiga Hardware Reference Manual* 3rd edition (Appendix D,
 # the memory map), *The A3000+ System Specification* (section 2.4, the DMAC and
@@ -88,6 +90,20 @@
 machine "amiga-a3000" {
   # -- how much of each memory -----------------------------------------------
   param chip-ram = 2M
+
+  # How much 32-bit motherboard RAM is in Ramsey's sockets, 1 to 16 MiB. "The
+  # RAMSEY chip directly manages 16MB of 32 bit wide Fast RAM ... RAMSEY
+  # controlled Fast RAM is located from $07FFFFFF building down toward
+  # $07000000, as far as the populated memory will take it" (The A3000+ System
+  # Specification section 2.2), so the window is **top-aligned** at $08000000
+  # and a smaller fitting starts higher up, which is what the `map` below
+  # computes. `-p fast-ram=16M` is a fully populated board.
+  #
+  # There is no way to say "no SIMMs at all" here, because a `ram` object
+  # cannot have no bytes; a board with none is the A500's story and not worth a
+  # second machine file. 4 MiB is four banks of 256Kx4 parts, which is what
+  # RAMSIZE low means (section 2.2.1).
+  param fast-ram = 4M
 
   # Every Kickstart that runs on a 3000 is 512 KiB.
   param kickstart-size = 512K
@@ -134,6 +150,7 @@ machine "amiga-a3000" {
   }
 
   object chipram "ram" { size = chip-ram }
+  object fastram "ram" { size = fast-ram }
   object kick    "rom" { size = kickstart-size, image = "kickstart" }
 
   object custom "amiga.custom" { }
@@ -226,9 +243,11 @@ machine "amiga-a3000" {
   #   $00DE0000  Ramsey: the control and version registers      256 bytes
   #   $00DFF000  the custom chip registers                      512 bytes
   #   $00F80000  Kickstart                                      512 KiB
+  #   $08000000-fast-ram  motherboard fast RAM, behind Ramsey
   #
-  # Everything else floats: Zorro II space, autoconfig at $00E80000, the
-  # motherboard fast RAM window at $07000000 and Zorro III space above it.
+  # Everything else floats: Zorro II space, autoconfig at $00E80000, the unfitted
+  # part of the fast RAM window below $08000000-fast-ram, and Zorro III space
+  # above $08000000.
   map mem 0x00000000 size chip-ram = overlay.overlay { endian = "big" }
   map mem 0x00BFD000 size 0x1000   = cia_b_decode    { endian = "big" }
   map mem 0x00BFE000 size 0x1000   = cia_a_decode    { endian = "big" }
@@ -237,6 +256,7 @@ machine "amiga-a3000" {
   map mem 0x00DE0000 size 0x100    = ramsey.regs     { endian = "big" }
   map mem 0x00DFF000 size 0x200    = custom
   map mem 0x00F80000 size 512K     = mirror(kick)    { endian = "big" }
+  map mem 0x08000000 - fast-ram size fast-ram = fastram { endian = "big" }
 
   # -- wiring ----------------------------------------------------------------
   wire cia_a.pa0 -> overlay.ovl
