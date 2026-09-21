@@ -205,6 +205,7 @@ would answer that the machine file does not.
 | [`system/firmware-boot.md`](system/firmware-boot.md) | BIOS, UEFI, ACPI, SMBIOS, device tree, boot protocols |
 | [`system/usermode-abi.md`](system/usermode-abi.md) | Level 3: ELF loading, the auxiliary vector, the syscall ABI, and the sandbox policy |
 | [`system/debug-protocols.md`](system/debug-protocols.md) | GDB remote serial protocol, DWARF |
+| [`system/monitor.md`](system/monitor.md) | The monitor console: an interactive prompt on a stopped machine — the device tree and one device's whole current state, the clock forest, the wire graph, the scheduler's queue, memory read through `MemAttrs::debug`, snapshots, rewind and the counters live. Why slicing an advance cannot move the state hash, why eight of its commands are answered by the gdbstub's code, and why media swapping is not in it yet |
 | [`system/remote-display.md`](system/remote-display.md) | RFB/VNC, SPICE |
 | [`system/kickstart-media.md`](system/kickstart-media.md) | Amiga Kickstart ROMs read from the user's own media: the header and checksum, Cloanto's `AMIROMTYPE1` wrapper, reading one out of an Amiga Forever disc image, and why a Kickstart is a media decode where a DfuSe file is a loader device |
 | [`system/cpu-state-model.md`](system/cpu-state-model.md) | The engine-independent architectural CPU state: what crosses between an interpreter, a JIT and a vCPU, and what a TSC is when the two engines count at different rates |

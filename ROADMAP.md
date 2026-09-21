@@ -510,6 +510,7 @@ $ rsemu convert nes.machine --json                  # tooling projection
 $ rsemu record session.trace -- run nes.machine --cart smb.nes
 $ rsemu replay session.trace                        # bit-identical, on any host
 $ rsemu debug q35.machine --gdb :1234               # gdbstub attached to the guest
+$ rsemu monitor nes.machine --cart smb.nes          # the console, at a prompt
 ```
 
 Save states, rewind, screenshots, VNC display, and the monitor console are
@@ -1836,9 +1837,22 @@ landed, and now registers with it instead.
 - **Audio** — mixer with resampling and a virtual-time-anchored clock; backends
   ALSA/PulseAudio/CoreAudio/WASAPI via raw syscalls where possible.
 - **Input** — keyboard/mouse/gamepad with guest-scancode translation tables.
-- **Console/monitor** — a `noroi` TUI: device tree, memory map dump (the
-  descendant of gones' `Bus::String()`), register views, breakpoints, trace
-  control.
+- **Console/monitor** — **built**, as a line-oriented console rather than a
+  TUI: `rsemu monitor <machine>`, or `run --mon`. The device tree and one
+  device's whole current state, the memory map, every clock domain's rate and
+  position, the wire graph, the scheduler's queue, guest memory read and written
+  through `MemAttrs::debug`, snapshots, `rewind` over a `Timeline`, and the
+  `--trace` counters live. `docs/system/monitor.md`.
+  A `noroi` TUI over the same command engine is what is still outstanding, and
+  the blocker is not design: **`noroi` is not published on crates.io** and a
+  repository dependency makes a published crate unpublishable (§14). So
+  `host::monitor::Monitor::execute` takes a line and returns text plus a flow,
+  and a full-screen frontend is additive behind a second feature the day the
+  crate ships to the registry. Not yet: breakpoints (the gdbstub has them, and a
+  monitor breakpoint would make `run` stop being additive), a media
+  insert/eject (no `Device`-level seam exists — `MediumSlot` is a construct-time
+  hand-off), and disassembly (the generator that §4.6 promises emits it is not
+  wired into either frontend).
 - **gdbstub** — the GDB remote serial protocol over TCP: registers, memory,
   breakpoints/watchpoints, multi-CPU as threads, `qXfer` target descriptions.
   Debugging a guest kernel is a headline feature, not a nicety.
@@ -2684,9 +2698,11 @@ taken on a loaded shared machine, so a re-measurement on a quiet host is the
 first thing to do when one is available.
 
 ### Phase 9 — Frontends, remote, and debugging depth
-VNC (then SPICE) server, local windowing backends, audio, gamepad, `noroi`
-monitor TUI, gdbstub, record/replay + rewind UI, tracing/profiling output,
-C ABI (`ffi`) so rsemu is embeddable the way `purecrypto` and `kataan` are.
+VNC (then SPICE) server, local windowing backends, audio, gamepad, the monitor
+console (built — line-oriented; the `noroi` TUI over the same command engine
+waits on that crate reaching crates.io), gdbstub, record/replay + rewind UI,
+tracing/profiling output, C ABI (`ffi`) so rsemu is embeddable the way
+`purecrypto` and `kataan` are.
 **Gate:** a guest debugged end-to-end over gdb; a recorded session replayed
 bit-identically on a different host; a rewind demo.
 
@@ -2706,7 +2722,7 @@ the known-failures ledger; and the machine library under `machines/`.
 | [`purecrypto`](https://github.com/KarpelesLab/purecrypto) | TLS for remote display; AES-XTS and PBKDF2/Argon2 as the **primitives** a disk-encryption layer is built from. It does **not** ship LUKS or qcow2 crypto — verified, zero hits — so those are rsemu-side work. On TPM: purecrypto has an external-*signer* seam; the actual TPM 2.0 stack is the separate `purecrypto-tpm` crate | yes |
 | [`puremp`](https://github.com/KarpelesLab/puremp) | Exact `Rational` over arbitrary-precision `Int`, for clock arithmetic if `u128` proves insufficient. **Not usable for guest FP**: MPFR-class with caller-chosen precision, no fixed binary32/64 format, no bounded exponent, no IEEE-754 status flags — see §9.1 | yes, and only if needed |
 | [`oxideav-png`](https://github.com/OxideAV/oxideav-png) | PNG and APNG encode/decode for framebuffer capture — headless CI screenshots, the frame-hash regression, and docs. With `default-features = false` it drops `oxideav-core` and its only remaining edge is `compcol`, already permitted. Beats hand-rolling a writer: real PNG, and APNG makes recorded sequences free | yes |
-| [`noroi`](https://github.com/KarpelesLab/noroi) | A generic curses-style TUI library; the monitor/debugger UI on top is entirely rsemu work. Least mature crate in the set (v0.1.0, Unix TTY only), and **its backend links `libc` directly** — which conflicts with §0's raw-syscall rule and will not link on `*-linux-fullrust`. Optional and non-blocking | yes |
+| [`noroi`](https://github.com/KarpelesLab/noroi) | A generic curses-style TUI library; the monitor/debugger UI on top is entirely rsemu work. MIT, zero external crate dependencies, with a `no_std + alloc` core and the TTY backend behind its own `std` feature — so the policy fit is better than this row used to claim, *except* that its raw-mode and window-size calls are `extern "C"` against the C library `std` already links, which conflicts with §0's raw-syscall rule and will not link on `*-linux-fullrust`. **The blocker is neither of those: it is not published on crates.io** (v0.1.0, repository only), and a non-registry dependency makes `rsemu` unpublishable. So the monitor console shipped without it — `host::monitor` is a command engine that takes a line and returns text, and a `noroi` frontend over it is additive behind a second feature once the crate is on the registry | not yet — see `docs/system/monitor.md` |
 | [`purestd`](https://github.com/KarpelesLab/purestd) / [`fullrust`](https://github.com/KarpelesLab/fullrust) | The raw-syscall **idiom**, and a libc-free build target. It has anonymous `mmap` but **no `mprotect`, no `ioctl`, no `PROT_EXEC`** (verified) — the JIT and KVM syscalls are ours to write. `kataan` is the crate that actually does raw-syscall W^X today | pattern + optional target |
 | `../gones` (Go) | Behavioural reference for the 6502/NES port and the clock-divider model | reference only |
 | `kataan` (Rust) | Reference for **raw-syscall W^X emission** — real, and the right thing to copy — and for snapshot/mmap design. Its "tiers" are type-specialization, not baseline→optimizing; a baseline tier, OSR and deopt are unstarted there, so it is *not* a precedent for §9's tiering. x86-64 Linux only | reference only |

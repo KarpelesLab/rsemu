@@ -635,8 +635,21 @@ processors are threads**: `pc-at-smp` answers `qfThreadInfo` with two, each with
 register file, address space and watchpoints. And a **debugger's write into
 guest code invalidates the compiled blocks over it**, so a patch you set through
 gdb is the code that runs — on x86 and RISC-V; `cpu.arm.a64` is the documented
-exception and `docs/system/debug-protocols.md` says so. There is also a
-**browser build** at <https://karpeleslab.github.io/rsemu/>.
+exception and `docs/system/debug-protocols.md` says so.
+
+Beside it there is a **monitor console** — `rsemu monitor apple1` — which
+answers the questions a debugger has no packet for: the device tree and one
+device's whole current state, every clock domain's exact rate and tick count,
+the wire graph and what each net settles at, the scheduler's event queue, the
+`--trace` counters *live*, and `rewind`. It advances the machine only through
+the same `Machine::run_until` a headless run uses, which is additive — so a
+session that types `run 2s` lands on the same state hash as
+`rsemu run apple1 --for 2s --headless`, and `tests/cli_monitor.rs` asserts it.
+Every read it makes sets `MemAttrs::debug`, so sixteen commands' worth of
+inspection leave that hash where they found it — the other half of the same
+test. [`docs/system/monitor.md`](docs/system/monitor.md).
+
+There is also a **browser build** at <https://karpeleslab.github.io/rsemu/>.
 
 That page is not a screenshot. Seven machines are in it — nine catalog entries,
 because the NES and the Master System each ship an NTSC and a PAL file — and
