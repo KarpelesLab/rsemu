@@ -27,10 +27,12 @@ fn sense(iwm: &Iwm, addr: u8) -> bool {
     touch(iwm, 14) & STATUS_SENSE != 0
 }
 
-/// Pulse `LSTRB` over the write register `addr` with `data` on `CA2`.
+/// Pulse `LSTRB` over the write register `addr` — `CA1:CA0:SEL` — with `data`
+/// on `CA2`.
 fn control(iwm: &Iwm, addr: u8, data: bool) {
-    touch(iwm, if addr & 1 != 0 { 1 } else { 0 }); // CA0
-    touch(iwm, if addr & 2 != 0 { 3 } else { 2 }); // CA1
+    iwm.set_sel(addr & 1 != 0);
+    touch(iwm, if addr & 2 != 0 { 1 } else { 0 }); // CA0
+    touch(iwm, if addr & 4 != 0 { 3 } else { 2 }); // CA1
     touch(iwm, if data { 5 } else { 4 }); // CA2 carries the data
     touch(iwm, 6); // LSTRB low
     touch(iwm, 7); // and the rising edge latches it
@@ -105,12 +107,15 @@ fn the_status_register_reports_the_drive_enable() {
 #[test]
 fn the_drive_reports_whether_a_disk_is_in_it() {
     let iwm = Iwm::with_drives([true, false]);
-    assert!(sense(&iwm, 1), "/CSTIN high: nothing in the drive");
+    assert!(
+        sense(&iwm, 1),
+        "disk in place is high: nothing in the drive"
+    );
     iwm.set_disk(0, true, false);
-    assert!(!sense(&iwm, 1), "/CSTIN low: a disk is in place");
-    assert!(sense(&iwm, 3), "/WRTPRT high: it is writable");
+    assert!(!sense(&iwm, 1), "disk in place is low: a disk is there");
+    assert!(sense(&iwm, 3), "disk locked is high: it is writable");
     iwm.set_disk(0, true, true);
-    assert!(!sense(&iwm, 3), "/WRTPRT low: it is protected");
+    assert!(!sense(&iwm, 3), "disk locked is low: it is protected");
 }
 
 /// A cable position with nothing on it lets go, and every line reads as the
@@ -133,23 +138,23 @@ fn an_empty_cable_position_reads_as_its_pull_ups() {
 fn the_head_steps_in_the_direction_the_drive_was_told() {
     let iwm = Iwm::with_drives([true, false]);
     assert_eq!(iwm.track(0), 0);
-    assert!(!sense(&iwm, 5), "/TK0 low: the head is at track 0");
+    assert!(!sense(&iwm, 5), "track 0 is low: the head is at track 0");
 
-    control(&iwm, 0, false); // toward track 79
+    control(&iwm, 0b000, false); // toward track 79
     for _ in 0..3 {
-        control(&iwm, 1, false);
+        control(&iwm, 0b010, false);
     }
     assert_eq!(iwm.track(0), 3);
-    assert!(sense(&iwm, 5), "/TK0 high: it has left track 0");
+    assert!(sense(&iwm, 5), "track 0 is high: it has left track 0");
 
-    control(&iwm, 0, true); // toward track 0
-    control(&iwm, 1, false);
+    control(&iwm, 0b000, true); // toward track 0
+    control(&iwm, 0b010, false);
     assert_eq!(iwm.track(0), 2);
 
     // And it stops at either end rather than walking off the mechanism.
-    control(&iwm, 0, false);
+    control(&iwm, 0b000, false);
     for _ in 0..200 {
-        control(&iwm, 1, false);
+        control(&iwm, 0b010, false);
     }
     assert_eq!(iwm.track(0), MAX_TRACK);
 }
@@ -160,16 +165,50 @@ fn the_motor_and_the_eject_are_write_registers() {
     let iwm = Iwm::with_drives([true, false]);
     iwm.set_disk(0, true, false);
     assert!(!iwm.motor(0));
-    control(&iwm, 2, false); // motor on
+    control(&iwm, 0b100, false); // motor on
     assert!(iwm.motor(0));
-    assert!(!sense(&iwm, 4), "MOTORON is asserted low while it runs");
-    assert!(!sense(&iwm, 11), "/READY: a spinning disk is ready");
-    control(&iwm, 2, true); // motor off
+    assert!(!sense(&iwm, 4), "motor on is asserted low while it runs");
+    assert!(
+        !sense(&iwm, 13),
+        "disk ready is low: a spinning disk is ready"
+    );
+    control(&iwm, 0b100, true); // motor off
     assert!(!iwm.motor(0));
 
-    control(&iwm, 3, false); // eject
+    // The disk-switched line reads high until a disk is ejected, and the
+    // drive's reset register is what puts it back.
+    assert!(sense(&iwm, 6), "disk switched is high: nothing was ejected");
+    control(&iwm, 0b110, true); // eject
     assert!(!iwm.has_disk(0));
-    assert!(sense(&iwm, 6), "SWITCHED: a disk has been changed");
+    assert!(
+        !sense(&iwm, 6),
+        "disk switched is low: the disk was ejected"
+    );
+    control(&iwm, 0b001, true); // reset the disk-switched flag
+    assert!(sense(&iwm, 6), "and the reset register clears it again");
+}
+
+/// The line a ROM tests before it will touch the drive at all: **drive
+/// installed**, asserted low, at `CA2:CA1:CA0 = 111`.
+///
+/// It is here on its own because answering it wrongly is invisible in every
+/// other test and fatal in the machine: a Macintosh Plus ROM that reads a one
+/// here draws the insert-disk icon and never turns the motor, whatever is in
+/// the drive. Both `SEL` halves answer; the ROM reads the `SEL`-off one and
+/// Apple's note documents the `SEL`-on one.
+#[test]
+fn the_drive_says_it_is_installed() {
+    let iwm = Iwm::with_drives([true, false]);
+    assert!(!sense(&iwm, 14), "drive installed is low with SEL off");
+    assert!(!sense(&iwm, 15), "drive installed is low with SEL on");
+    assert!(
+        sense(&iwm, 12),
+        "number of sides is high on an 800K mechanism"
+    );
+
+    touch(&iwm, 11); // the external position, which has nothing on it
+    assert!(sense(&iwm, 14), "and high where there is no drive");
+    assert!(sense(&iwm, 15), "and high where there is no drive");
 }
 
 /// Invariant 5: a debug read must not move a switch, and there is no harmless
@@ -205,9 +244,9 @@ fn only_byte_accesses_are_accepted() {
 fn reset_clears_the_chip_and_leaves_the_disk_in_the_drive() {
     let iwm = Iwm::with_drives([true, false]);
     iwm.set_disk(0, true, true);
-    control(&iwm, 0, false);
-    control(&iwm, 1, false);
-    control(&iwm, 2, false);
+    control(&iwm, 0b000, false);
+    control(&iwm, 0b010, false);
+    control(&iwm, 0b100, false);
     assert!(iwm.motor(0) && iwm.track(0) == 1);
 
     iwm.reset(ResetKind::Warm);
@@ -223,11 +262,11 @@ fn reset_clears_the_chip_and_leaves_the_disk_in_the_drive() {
 fn a_snapshot_round_trips_to_an_identical_state_hash() {
     let saved = Iwm::with_drives([true, true]);
     saved.set_disk(0, true, false);
-    control(&saved, 0, false);
+    control(&saved, 0b000, false);
     for _ in 0..17 {
-        control(&saved, 1, false);
+        control(&saved, 0b010, false);
     }
-    control(&saved, 2, false);
+    control(&saved, 0b100, false);
     touch(&saved, 13);
     saved.poke(15, 0x17);
 
@@ -265,7 +304,10 @@ fn the_class_is_registrable_and_its_schema_matches() {
     assert!(Iwm::new(&Props::new()).is_ok(), "one drive by default");
     let two = Iwm::new(&Props::new().with("drives", Value::Uint(2))).expect("two");
     touch(&two, 11);
-    assert!(!sense(&two, 12), "/DRVIN low: the external drive is there");
+    assert!(
+        !sense(&two, 14),
+        "drive installed is low: the external drive is there"
+    );
     let err = Iwm::new(&Props::new().with("drives", Value::Uint(3)))
         .expect_err("a cable takes two")
         .to_string();
@@ -304,8 +346,10 @@ fn spin_up(iwm: &Iwm, track: u8, side: bool) {
     }
     assert_eq!(iwm.track(0), track);
 
-    // Pick the head by addressing RDDATA0 or RDDATA1, which differ only in SEL.
-    address(iwm, 0b1000 | u8::from(side));
+    // Pick the head by *reading* RDDATA0 or RDDATA1 — the two differ only in
+    // `SEL`, and Apple's note is clear that it is the read that configures the
+    // drive, not merely having the lines there.
+    sense(iwm, 0b1000 | u8::from(side));
     // And put Q7:Q6 back to 00, which is the data register.
     touch(iwm, 12);
     touch(iwm, 14);

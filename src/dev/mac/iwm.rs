@@ -6,10 +6,15 @@
 //! * Apple's *IWM Specification* (Apple Computer, 1982), for the sixteen soft
 //!   switches, the four register pairs `Q6`/`Q7` select between, the mode
 //!   register's bits and the write handshake.
-//! * *Guide to the Macintosh Family Hardware*, 2nd edition, "Disk Interface"
-//!   — where the chip is decoded, and the drive's own register file: an
-//!   address made of `CA0`, `CA1`, `CA2` and the `SEL` line the VIA drives,
-//!   sixteen readable status lines and four writable controls.
+//! * *Guide to the Macintosh Family Hardware*, 2nd edition, chapter 9 — where
+//!   the chip is decoded and what is on the twenty-pin cable. It does **not**
+//!   carry the drive's register file; its chapter 9 tables are connector
+//!   signal assignments and nothing more.
+//! * Neil Parker, *Controlling the 3.5 Drive Hardware on the Apple IIGS*
+//!   (version 1.00, February 1994) — the published table of the Sony
+//!   mechanism's sixteen one-bit status registers and its control registers,
+//!   addressed by `CA2`, `CA1`, `CA0` and `SEL`. The same mechanism hangs off
+//!   a Macintosh Plus, and this is the document that settles the polarities.
 //!
 //! No emulator source was consulted and no ROM was disassembled
 //! (`ROADMAP.md` §1, `CLAUDE.md`); where the documents were ambiguous the
@@ -56,16 +61,43 @@
 //! The drive is addressed by `CA2:CA1:CA0` **and the `SEL` line**, which comes
 //! from the VIA's `PA5` rather than from the IWM: four bits, sixteen readable
 //! status lines, whose selected value appears as bit 7 of the IWM's status
-//! register (`SENSE`). Writing is four registers addressed by `CA1:CA0` with
-//! the data on `CA2`, latched when `LSTRB` goes high:
+//! register (`SENSE`).
 //!
 //! ```text
-//!   CA1 CA0  CA2=0            CA2=1
-//!    0   0   step toward 79   step toward 0
-//!    0   1   issue one step   (no-op)
-//!    1   0   motor on         motor off
-//!    1   1   eject            (no-op)
+//!   CA2 CA1 CA0 SEL                          asserted
+//!    0   0   0   0   step direction          1 = outward, toward track 0
+//!    0   0   0   1   disk in place           0 = a disk is in the drive
+//!    0   0   1   0   disk is stepping        0 = the head is moving
+//!    0   0   1   1   disk locked             0 = write protected
+//!    0   1   0   0   motor on                0 = the spindle is turning
+//!    0   1   0   1   track 0                 0 = the head is over track 0
+//!    0   1   1   0   disk switched           0 = the user ejected a disk
+//!    0   1   1   1   tachometer              60 pulses a revolution
+//!    1   0   0   0   lower head's read line  and selects that head
+//!    1   0   0   1   upper head's read line  and selects that head
+//!    1   0   1   x   (unassigned)
+//!    1   1   0   0   number of sides         1 = double sided
+//!    1   1   0   1   disk ready for reading  0 = ready
+//!    1   1   1   x   drive installed         0 = a drive is connected
 //! ```
+//!
+//! Writing is addressed by `CA1:CA0:SEL` — `SEL` is part of the address here
+//! too — with the data on `CA2`, latched when `LSTRB` goes high:
+//!
+//! ```text
+//!   CA1 CA0 SEL  CA2=0            CA2=1
+//!    0   0   0   step toward 79   step toward 0
+//!    0   0   1   —                reset the disk-switched flag
+//!    0   1   0   issue one step   —
+//!    1   0   0   motor on         motor off
+//!    1   1   0   —                eject
+//! ```
+//!
+//! Most of those lines are asserted **low**, and the table above is the whole
+//! of what this model knows about the mechanism. Getting it wrong is not a
+//! detail: a first version of it invented the four high addresses, answered
+//! the pull-up where the ROM looks for "drive installed", and the machine sat
+//! on the insert-disk screen for ever without once turning the motor.
 //!
 //! # The read data path
 //!
@@ -83,11 +115,10 @@
 //! leaves zero behind, so a guest polls until bit 7 is set, which is what a
 //! ROM does.
 //!
-//! **Which head** is the one thing in this path the Guide settles only by
-//! implication. Its drive-register table names status lines 8 and 9 `RDDATA0`
-//! and `RDDATA1`, and those two addresses differ *only* in `SEL` — so
-//! addressing one of them is how the computer says which head's data line it
-//! wants, and this model latches the side there.
+//! **Which head** is decided by the two read lines above: they differ only in
+//! `SEL`, and the note says reading one of them *configures the drive* to do
+//! its I/O with that head. So addressing one is how the computer says which
+//! head it wants, and this model latches the side there.
 //!
 //! # What is modelled, and what is not
 //!
@@ -159,7 +190,7 @@ const HANDSHAKE_READY: u8 = 1 << 7;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Mechanism {
     /// Whether a drive is plugged in at all. An external port with nothing on
-    /// it has this clear, and `/DRVIN` then reads high.
+    /// it has this clear, and the drive-installed line then reads high.
     installed: bool,
     /// Whether a disk is in it.
     disk: bool,
@@ -174,8 +205,12 @@ struct Mechanism {
     outward: bool,
     /// Whether the motor is running.
     motor: bool,
-    /// The "a disk has been swapped" line, set when a disk appears or goes and
-    /// cleared by the drive's own reset register.
+    /// The "the user ejected a disk" line, set when a disk leaves the drive
+    /// and cleared by the drive's own reset-disk-switched register.
+    ///
+    /// Not set when a disk goes *in*: the documented meaning of the line is
+    /// "0 = user ejected disk by pressing the eject button", so a machine that
+    /// came up with a disk already in the drive has not switched anything.
     switched: bool,
     /// Which head the computer last asked for, by addressing `RDDATA0` or
     /// `RDDATA1`.
@@ -212,60 +247,95 @@ impl Mechanism {
 
     /// The status line `addr` selects, where `addr` is `CA2:CA1:CA0:SEL`.
     ///
-    /// Every line is read *asserted low* except where the Guide's table names
-    /// it without a bar, which is why so many of these are negations. A drive
-    /// that is not installed lets go of the cable and every line reads as the
-    /// pull-up, which is `true`.
+    /// The table is Apple's, from Neil Parker's *Controlling the 3.5 Drive
+    /// Hardware on the Apple IIGS* (1994), "Accessing Disk Drive Status and
+    /// Control Bits" — the only published listing of the Sony mechanism's
+    /// sixteen one-bit registers. Chapter 9 of the *Guide to the Macintosh
+    /// Family Hardware* names the cable's signals but does **not** carry this
+    /// table, which is how the first version of this function came to invent
+    /// one; see `docs/platforms/mac-plus.md`.
+    ///
+    /// Its own summary of the polarities is the thing to keep in mind: "the
+    /// settings of most of these bits are *backwards*: 0 means yes and 1 means
+    /// no". A drive that is not installed lets go of the cable and every line
+    /// reads as the pull-up, which is `true` — which is the same thing as
+    /// answering "no" to all sixteen.
     fn sense(&self, addr: u8) -> bool {
         if !self.installed {
             return true;
         }
         match addr {
-            // DIRTN: which way a step will go.
+            // Step direction: 0 steps inward, toward higher-numbered tracks.
             0 => self.outward,
-            // /CSTIN: low while a disk is in place.
+            // Disk in place: 0 while a disk is in the drive.
             1 => !self.disk,
-            // /STEP: high once the step this model completed instantly is done.
+            // Disk is stepping: 0 while the head is moving. This model steps
+            // instantly, so it is never caught in between.
             2 => true,
-            // /WRTPRT: low while the disk is write protected.
+            // Disk locked: 0 while the disk is write protected.
             3 => !(self.disk && self.write_protect),
-            // MOTORON: low while the motor is running.
+            // Motor on: 0 while the spindle is turning.
             4 => !self.motor,
-            // /TK0: low while the head is over track 0.
+            // Track 0: 0 while the head is over track 0.
             5 => self.track != 0,
-            // SWITCHED: high once a disk has been changed.
-            6 => self.switched,
-            // TACH: the tachometer, sixty pulses a revolution. A line that
-            // never moves is a drive that reports no rotation, which is what a
-            // stopped motor looks like.
+            // Disk switched: 0 once the user has ejected a disk.
+            6 => !self.switched,
+            // Tachometer: sixty pulses a revolution. A line that never moves
+            // is a drive that reports no rotation, which is what a stopped
+            // motor looks like.
             7 => self.tach,
-            // RDDATA0 and RDDATA1: the two heads' raw read lines. These two
-            // addresses differ only in `SEL`, which is how the computer says
-            // which head it wants, so addressing one of them selects the side
-            // as well as reading it.
+            // The two heads' instantaneous read lines. These two addresses
+            // differ only in `SEL`, and the note says reading one of them
+            // *configures the drive* to do its I/O with that head — so
+            // addressing one selects the side as well as reading it.
             8 | 9 => self.read_line,
-            // SIDES: high on a double-sided mechanism.
-            10 => self.double_sided,
-            // /READY: low once the motor is up to speed, which here is as soon
-            // as it is running with a disk in place.
-            11 => !(self.motor && self.disk),
-            // /DRVIN: low while a drive is connected.
-            12 => false,
-            // The Guide leaves 13, 14 and 15 unassigned on this mechanism.
-            _ => true,
+            // The note leaves `CA2:CA1:CA0 = 101` unassigned. A Macintosh
+            // Plus ROM does read address 10 while it is working out what is on
+            // the cable; an 800K mechanism drives nothing there and it reads
+            // as the pull-up. (Later drives put the SuperDrive line here.)
+            10 | 11 => true,
+            // Number of sides: 1 on a double-sided mechanism. One of the two
+            // lines in this table that is *not* inverted.
+            12 => self.double_sided,
+            // Disk ready for reading: 0 once the drive will hand over data.
+            // The note is unsure of this one and says only that the firmware
+            // waits for it to go low before looking for a sector's address
+            // field; a Plus ROM does exactly that. Nothing here models
+            // spin-up, so a turning spindle with a disk on it is ready.
+            13 => !(self.motor && self.disk),
+            // Drive installed: 0 while a drive is connected. The note lists
+            // this at `SEL` on (address 15) and a Macintosh Plus ROM reads it
+            // at `SEL` off (address 14) — it is the line the ROM tests before
+            // it will touch the drive at all, and answering `true` at the
+            // address it uses is what kept this board on the insert-disk
+            // screen. Both halves answer, because the mechanism has one such
+            // line and no way to make it depend on `SEL`.
+            _ => !self.installed,
         }
     }
 
-    /// Apply the write register `CA1:CA0` addresses, with `CA2` as its data.
+    /// Apply the write register `CA1:CA0:SEL` addresses, with `CA2` as its
+    /// data.
+    ///
+    /// Same source as [`Mechanism::sense`], "The control functions are as
+    /// follows". Note that `SEL` is part of the *address* here as well, which
+    /// is what separates "set the step direction" from "reset the
+    /// disk-switched flag".
     fn control(&mut self, addr: u8, data: bool) {
         if !self.installed {
             return;
         }
         match addr {
-            // Step direction.
-            0 => self.outward = data,
-            // One step, on the zero.
-            1 => {
+            // Step direction: a one sets it outward, toward track 0.
+            0b000 => self.outward = data,
+            // Reset the disk-switched flag, on the one.
+            0b001 => {
+                if data {
+                    self.switched = false;
+                }
+            }
+            // One step in the current direction, on the zero.
+            0b010 => {
                 if !data {
                     if self.outward {
                         self.track = self.track.saturating_sub(1);
@@ -274,15 +344,15 @@ impl Mechanism {
                     }
                 }
             }
-            // The motor: on for a zero, off for a one.
-            2 => self.motor = !data,
-            // Eject, on the zero.
-            _ => {
-                if !data && self.disk {
-                    self.disk = false;
-                    self.switched = true;
-                }
+            // The spindle motor: on for a zero, off for a one.
+            0b100 => self.motor = !data,
+            // Eject, on the one.
+            0b110 if data && self.disk => {
+                self.disk = false;
+                self.switched = true;
             }
+            // The note lists no function for the other three addresses.
+            _ => {}
         }
     }
 }
@@ -340,6 +410,24 @@ impl State {
             | u8::from(self.sel)
     }
 
+    /// Pick the head, if the status register was just read at one of the two
+    /// addresses that does so.
+    ///
+    /// Apple's note is explicit that it is the *read* that configures the
+    /// drive — "Instantaneous data from lower head. Reading this bit
+    /// configures the drive to do I/O with the lower head" — not merely having
+    /// the `CA` lines sitting there. That distinction is load-bearing: a ROM
+    /// walking the sixteen switches passes through `CA2:CA1:CA0 = 100` on its
+    /// way to somewhere else, and a model that latched on the switch alone
+    /// came out of the ROM's startup sweep reading the upper head.
+    fn pick_head(&mut self) {
+        let addr = self.drive_address();
+        if addr & 0xe == 0x8 {
+            let which = self.selected();
+            self.drives[which].side = addr & 1 != 0;
+        }
+    }
+
     /// The status register as software reads it.
     ///
     /// The IWM specification: bits 0-4 mirror the mode register, bit 5 is the
@@ -383,16 +471,11 @@ impl State {
         }
         // `LSTRB` going high is what latches a drive control register; the
         // address and the data are the `CA` lines as they stand at that moment.
-        // Addressing `RDDATA0` or `RDDATA1` is how the computer picks a head:
-        // the two are the same drive-register address but for `SEL`.
-        let addr = self.drive_address();
-        if addr & 0xe == 0x8 {
-            let which = self.selected();
-            self.drives[which].side = addr & 1 != 0;
-        }
         if bit == SW_LSTRB && on && before & SW_LSTRB == 0 {
             let s = self.switches;
-            let addr = (u8::from(s & SW_CA1 != 0) << 1) | u8::from(s & SW_CA0 != 0);
+            let addr = (u8::from(s & SW_CA1 != 0) << 2)
+                | (u8::from(s & SW_CA0 != 0) << 1)
+                | u8::from(self.sel);
             let data = s & SW_CA2 != 0;
             let which = self.selected();
             self.drives[which].control(addr, data);
@@ -540,6 +623,11 @@ impl MemOps for Shared {
         }
         state.switch(index);
         *byte = state.read_value();
+        if state.switches & (SW_Q7 | SW_Q6) == SW_Q6 {
+            // A read of the status register at one of the two read-data
+            // addresses is what tells the drive which head to use.
+            state.pick_head();
+        }
         if state.switches & (SW_Q7 | SW_Q6) == 0 {
             // Reading the data register takes the byte: a guest polls it until
             // bit 7 is set, and every byte a disk can carry has bit 7 set, so
@@ -708,7 +796,6 @@ impl Iwm {
             let mut state = self.shared.state.lock();
             let protect = disk.write_protected();
             let drive = &mut state.drives[which];
-            drive.switched = true;
             drive.disk = true;
             drive.write_protect = protect;
             drive.bit = 0;
