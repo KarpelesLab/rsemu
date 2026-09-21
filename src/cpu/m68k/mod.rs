@@ -1,14 +1,16 @@
 //! The Motorola 680x0 — the 68000 as a bus-accurate interpreter with a
-//! modelled prefetch queue, and the 68010, 68020 and 68EC020 as models of it.
+//! modelled prefetch queue, and every later member of the family as a model
+//! of it.
 //!
 //! The plain 68000, as fitted to the Amiga, the Atari ST, the Mega Drive and
 //! the first Macintoshes: 32-bit registers, a 16-bit data bus, 24 address
 //! pins, two stack pointers and a supervisor/user split. And, chosen by the
 //! `model` property ([`Model`]), the 68010 some of those machines were
-//! upgraded with and the 68020 the later Amigas were built around — see
-//! *The 68010* and *The 68020* below. A 68000 is exactly what it was before
-//! the other models existed: the same bus cycles, the same times, the same
-//! snapshot bytes.
+//! upgraded with, the 68020 the later Amigas were built around, the 68030
+//! with its paged memory management unit, and the 68040 an A4000 needs — see
+//! the sections below. A 68000 is exactly what it was before the other
+//! models existed: the same bus cycles, the same times, the same snapshot
+//! bytes.
 //!
 //! # The 68010
 //!
@@ -110,6 +112,37 @@
 //! `MMUDIS` have no pins to drive or be driven, and the burst fills `CACR`'s
 //! **IBE** and **DBE** enable have nothing to fill.
 //!
+//! # The 68040
+//!
+//! Three packages — `68040`, `68lc040` without a floating-point unit, and
+//! `68ec040` without that or the paged memory management unit (M68040UM
+//! Appendices A and B) — and **not** a 68030 with additions. The coprocessor
+//! interface is gone (§1.1), and with it the 68030's `PMOVE`, `PLOAD`,
+//! `PTEST` and `PFLUSH`; `CAAR` is gone; and the memory management unit is a
+//! different design reached through `MOVEC` rather than the same one with
+//! more bits. [`Model::has_030`] is false on a 68040 for exactly that reason.
+//!
+//! - **`MOVE16`**, the sixteen-byte line move, in both its formats.
+//! - **`CINV` and `CPUSH`**, and a `CACR` with two bits. The caches are not
+//!   modelled, which for these two is a *defensible* model rather than a gap:
+//!   a cache that holds nothing is a copyback cache that never holds a dirty
+//!   line, so there is nothing to invalidate and nothing to push. See
+//!   `exec.rs`'s `op_cache`.
+//! - **The memory management unit** (§3), on the two packages that have one:
+//!   fixed 4 KiB or 8 KiB pages, a three-level table, the four transparent
+//!   translation registers split between the instruction and data units, a
+//!   64-entry four-way ATC, and the 68040's `PFLUSH` and `PTEST`. `mmu040.rs`
+//!   is that section and nothing else.
+//! - **The access error frame**, format `$7`, thirty words (§8.4.6) — where
+//!   an *address* error takes a format `$2` frame, not the 68020's `$A`.
+//! - **The on-chip floating-point unit**, which implements ten operations in
+//!   hardware and takes the unimplemented floating-point instruction
+//!   exception for the rest, as the part does. See *The floating-point unit*
+//!   below.
+//!
+//! Its time is the 68020's table, as the 68030's is, with M68040UM §10.3's
+//! own numbers for `CINV` and `CPUSH`.
+//!
 //! # What "bus-accurate" means here
 //!
 //! A 68000 bus cycle is four clocks, and every published instruction time is a
@@ -179,11 +212,23 @@
 //! # The floating-point coprocessor
 //!
 //! The `fpu` property attaches an **MC68881** or **MC68882** to any part
-//! with the F-line coprocessor interface — a 68020 or later — and `none`,
-//! the default, leaves every existing board exactly what it was. With one
-//! attached, coprocessor id 1's encodings become instructions; without one
-//! they are the line-F exception, which is what a main processor takes when
-//! nothing answers.
+//! with the F-line coprocessor interface — a 68020 or a 68030 — and `none`,
+//! the default there, leaves every existing board exactly what it was. With
+//! one attached, coprocessor id 1's encodings become instructions; without
+//! one they are the line-F exception, which is what a main processor takes
+//! when nothing answers.
+//!
+//! On a **68040** the unit is on the chip, so the property is derived from
+//! the model rather than chosen: `68040` on an MC68040, which is the default
+//! and the only legal value there, and `none` on an MC68LC040 or an
+//! MC68EC040. It implements `FABS`, `FADD`, `FCMP`, `FDIV`, `FMOVE`, `FMUL`,
+//! `FNEG`, `FSQRT`, `FSUB` and `FTST` — with the `FSxxx`/`FDxxx`
+//! forced-precision forms — and takes the **unimplemented floating-point
+//! instruction exception** for everything else, which is what the part does
+//! and what a guest's own software package is there to handle. `FSAVE` then
+//! writes the twenty-six-word state frame that package reads (M68040UM
+//! §9.6.1, Figure 9-10). `docs/cpu/m68k.md` records why that was chosen over
+//! computing them, which this core is perfectly able to do.
 //!
 //! Implemented (M68881UM; `fpu.rs` and `transcend.rs`):
 //!
@@ -240,7 +285,7 @@
 //! The corpus has no licence file, so it is fetched and run, never vendored.
 //! `src/cpu/m68k/conformance.rs` has the command.
 //!
-//! There is no such corpus for the 68010 or 68020. The same runner pushes every
+//! There is no such corpus for any later model. The same runner pushes every
 //! 68000 vector through each of them as well and fails on any difference from
 //! the 68000's result that is not one the manuals document; it prints each
 //! documented difference with the number of vectors that show it. The new
@@ -268,8 +313,9 @@
 //!   stopping, which costs two bus cycles hardware makes on the way out
 //!   instead. The state is identical; the trace and the four-cycle published
 //!   time are not.
-//! - **Continuing a faulted instruction.** `RTE` from a 68010 or 68020 long
-//!   bus-fault frame restarts the instruction instead; see `exec.rs`.
+//! - **Continuing a faulted instruction.** `RTE` from a 68010's or a 68020's
+//!   long bus-fault frame, or a 68040's format `$7` access error frame,
+//!   restarts the instruction instead; see `exec.rs`.
 //! - **A 68020 on a 32-bit port.** The bus is driven sixteen bits at a time
 //!   whatever the region; the 68020's dynamic bus sizing to a wider port is
 //!   not modelled.
@@ -284,7 +330,11 @@
 //!   core reports it post-instruction on the one that caused it. `FPIAR`,
 //!   `FPSR` and the vector are the same either way.
 //! - **Packed decimal.** The `011` and `111` source and destination formats
-//!   take the line-F exception.
+//!   take the line-F exception on a 6888x, and the 68040's unsupported data
+//!   type exception — vector 55, which is what the part does — on a 68040.
+//! - **The 68040's caches**, beyond what `CINV` and `CPUSH` need, and its
+//!   *two* address translation caches, which are merged into one because
+//!   nothing can tell (`mmu040.rs`).
 //!
 //! # Modules
 //!
@@ -295,6 +345,7 @@
 //! | `exec` (private) | the interpreter, the prefetch queue and exception processing |
 //! | `timing` (private) | the 68020's cache-case instruction times |
 //! | `mmu` (private) | the 68030's translation tree, cache and registers |
+//! | `mmu040` (private) | the 68040's, which shares none of that but the job |
 //! | `fpu` (private) | the coprocessor's registers, formats and arithmetic |
 //! | `transcend` (private) | its transcendentals, at 128-bit precision |
 //!
@@ -308,11 +359,15 @@
 //! *MC68020 User's Manual* (MC68020UM) for the 68020's; and the *MC68030
 //! User's Manual* (MC68030UM) and the *MC68EC030 User's Manual* for the two
 //! 68030 packages, Section 9 of each being the memory management unit and the
-//! access control unit respectively; and the *MC68881/MC68882 Floating-Point
-//! Coprocessor User's Manual* (M68881UM) for the coprocessor. All are listed
-//! in `docs/cpu/m68k.md`. No copyleft emulator was consulted, and no emulator
+//! access control unit respectively; the *M68040 User's Manual* (M68040UM)
+//! for all three 68040 packages, Section 3 being the memory management unit,
+//! Section 4 the caches, Section 8 the exception frames and Section 9 the
+//! floating-point unit; and the *MC68881/MC68882 Floating-Point Coprocessor
+//! User's Manual* (M68881UM) for the coprocessor. All are listed in
+//! `docs/cpu/m68k.md`. No copyleft emulator was consulted, and no emulator
 //! source of any licence was used for the instruction semantics or for the
-//! transcendental algorithms.
+//! transcendental algorithms — nor was Motorola's 68040 floating-point
+//! software package, whose assembly `docs/cpu/m68k.md` excludes by name.
 
 pub mod disasm;
 mod exec;

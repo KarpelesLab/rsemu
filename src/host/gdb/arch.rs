@@ -2071,10 +2071,11 @@ fn m68k_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 pub static M68K: Arch = Arch {
     class: &crate::cpu::m68k::CLASS,
     // 3 re-read against the chunk that gained the 68030's memory management
-    // registers and the coprocessor's. Both go on the *end*, after the
-    // 68010-and-later tail, so every offset below is where version 2 left
-    // it — and on a 68000 the chunk still stops where it always did.
-    verified_version: 3,
+    // registers and the coprocessor's, and 4 against the one that gained the
+    // 68040's. All of them go on the *end*, after the 68010-and-later tail,
+    // so every offset below is where version 2 left it — and on a 68000 the
+    // chunk still stops where it always did.
+    verified_version: 4,
     features: &[Feature::whole("org.gnu.gdb.m68k.core")],
     architecture: Some("m68k"),
     regs: &M68K_REGS,

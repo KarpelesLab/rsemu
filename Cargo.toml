@@ -2651,15 +2651,20 @@ fw-pcbios = []
 # error pushes. Its `model` property also makes it a 68010 (VBR, MOVEC/MOVES,
 # format-word frames), a 68020/68EC020 (the full extension-word addressing
 # modes, bit fields, 32-bit multiply and divide, CAS/CAS2, the master stack,
-# timed from the manual's cache-case tables), or a 68030/68EC030 (the same
+# timed from the manual's cache-case tables), a 68030/68EC030 (the same
 # less CALLM/RTM, plus the paged memory management unit — translation tree,
-# address translation cache, PMOVE/PTEST/PLOAD/PFLUSH — on the full part).
-# Its `fpu` property attaches an MC68881 or MC68882 floating-point
-# coprocessor, which is why this pulls in `float`: every bit of its
-# arithmetic is software IEEE-754 so a guest FPU is bit-reproducible across
-# hosts (ROADMAP.md §9.1), and `float` itself has no dependencies. Ships a
-# disassembler generated from the same instruction description. Adds no
-# dependencies and is `no_std + alloc`.
+# address translation cache, PMOVE/PTEST/PLOAD/PFLUSH — on the full part), or
+# a 68040/68LC040/68EC040 (MOVE16, CINV/CPUSH, a different memory management
+# unit with fixed 4K/8K pages and a three-level table reached through MOVEC,
+# and the thirty-word format $7 access error frame). Its `fpu` property
+# attaches an MC68881 or MC68882 floating-point coprocessor to a 68020 or
+# 68030, and is the 68040's own on-chip unit — ten operations in hardware and
+# the unimplemented-instruction exception for the rest, as the part does.
+# That is why this pulls in `float`: every bit of its arithmetic is software
+# IEEE-754 so a guest FPU is bit-reproducible across hosts (ROADMAP.md §9.1),
+# and `float` itself has no dependencies. Ships a disassembler generated from
+# the same instruction description. Adds no dependencies and is
+# `no_std + alloc`.
 cpu-m68k = ["float"]
 
 # The MIPS core (src/cpu/mips): an LSI/MIPS R3000A-compatible MIPS I
