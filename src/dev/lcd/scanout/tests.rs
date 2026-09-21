@@ -25,7 +25,7 @@ fn fixture(props: &[(&str, Value)]) -> (Scanout, Arc<AddressSpace>, Arc<RamStore
         .topology()
         .map(Arc::new(Region::ram("ram", Arc::clone(&ram))), 0)
         .expect("ram maps at 0");
-    *engine.shared.bus.lock() = Some(Arc::clone(&space));
+    *engine.shared.bus.lock() = Some(Arc::downgrade(&space));
     (engine, space, ram)
 }
 
@@ -427,7 +427,7 @@ fn the_engine_round_trips_through_a_snapshot() {
     let bytes = w.to_vec().unwrap();
 
     let (other, _space2, _ram2) = small();
-    *other.shared.bus.lock() = Some(Arc::clone(&space));
+    *other.shared.bus.lock() = Some(Arc::downgrade(&space));
     let reader = StateReader::new(&bytes).unwrap();
     let chunk = reader
         .load(
@@ -471,4 +471,41 @@ fn a_cold_reset_returns_the_registers_to_what_the_machine_file_said() {
     assert_eq!(engine.base(), 0x100, "the `base` property, not zero");
     assert_eq!(engine.geometry(), (4, 3));
     assert_eq!(engine.frame(), 0);
+}
+
+/// The cycle `virtio.mmio` was found to have, in the shape this file had it.
+///
+/// A cycle is invisible to `Drop` — nothing runs, which is the defect — but it
+/// is exactly visible as a `Weak` that still upgrades after the last strong
+/// handle is gone. `fixture` supplies one half; this adds the other, which is
+/// what `machines/spi-panel.machine` does when it maps `mirror(lcdc)` into the
+/// very space the object's `space = mem` names.
+#[test]
+fn the_engine_does_not_keep_the_bus_it_masters_alive() {
+    let (engine, space, _ram) = small();
+    space
+        .topology()
+        .map(engine.region("").expect("the register block"), 0xf000)
+        .expect("the window fits");
+    // The board is what owns the space; the engine holds it only to fetch
+    // scanlines through it.
+    assert_eq!(
+        Arc::strong_count(&space),
+        1,
+        "the engine holds the bus it masters strongly"
+    );
+
+    let watch = Arc::downgrade(&space);
+    drop(space);
+    assert!(
+        watch.upgrade().is_none(),
+        "the address space outlived its last owner"
+    );
+    // And the engine is still an engine: a bus that has gone scans out
+    // nothing rather than panicking.
+    let mut row = [[0u8; 3]; 4];
+    assert!(
+        !engine.read_row(0, &mut row),
+        "a scanout with no bus must report that it fetched nothing"
+    );
 }

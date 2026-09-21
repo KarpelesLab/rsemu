@@ -52,7 +52,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -212,7 +212,19 @@ struct Shared {
     frames: AtomicU64,
     /// The address space the framebuffer lives in, and who we are on it.
     /// **Derived from the machine graph, never serialized** (invariant 3).
-    bus: Mutex<Option<Arc<AddressSpace>>>,
+    ///
+    /// **Weak.** The controller's own register block is mapped into that same
+    /// space — `machines/spi-panel.machine` maps `mirror(lcdc)` into `mem`,
+    /// the space the object's `space = mem` names — so a strong handle closes
+    /// a reference cycle: the space owns the mapping, the mapping owns
+    /// [`ScanoutPort`] as its [`MemOps`], `ScanoutPort` owns this `Shared`,
+    /// and `Shared` would own the space. Nothing in this tree breaks such a
+    /// cycle — there is no unbind — so the framebuffer and every other byte
+    /// in that space outlive the machine that was torn down. `virtio.mmio`
+    /// had the same defect and its fuzz target measured it at 6.5 MB an
+    /// iteration under LeakSanitizer; `CLAUDE.md` states the rule for the
+    /// analogous case, that a wire's sinks are weak refs.
+    bus: Mutex<Option<Weak<AddressSpace>>>,
     requester: Mutex<RequesterId>,
     /// The catch-up handle the register block syncs through.
     lazy: Mutex<Option<LazyHandle>>,
@@ -438,8 +450,11 @@ impl Scanout {
         if !enabled || y >= height {
             return false;
         }
+        // Upgraded once per scanline, beside the one bulk read that fetches
+        // the whole row — not once per pixel. An engine whose space has gone
+        // scans out nothing, which is what a torn-down machine wants.
         let bus = self.shared.bus.lock().clone();
-        let Some(bus) = bus else {
+        let Some(bus) = bus.as_ref().and_then(Weak::upgrade) else {
             return false;
         };
         let requester = *self.shared.requester.lock();
@@ -716,7 +731,9 @@ impl Instance for Scanout {
                  lives in (`space = mem`)",
             ),
         })?;
-        *self.shared.bus.lock() = Some(Arc::clone(space));
+        // Weak: this controller's registers are mapped into that same space,
+        // so a strong handle closes a cycle. See `Shared::bus`.
+        *self.shared.bus.lock() = Some(Arc::downgrade(space));
         *self.shared.requester.lock() = ctx.requester();
         Ok(())
     }
