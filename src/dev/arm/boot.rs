@@ -54,7 +54,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
@@ -295,7 +295,22 @@ struct Contents {
     error: Option<String>,
     /// The size of the generated tree, for tests and diagnostics.
     dtb_len: usize,
-    space: Option<Arc<AddressSpace>>,
+    /// The space the tree describes, held **weakly**.
+    ///
+    /// Strongly it is a reference cycle that leaks the whole machine, and a
+    /// tighter one than most: the space owns the mapping, the mapping owns
+    /// [`Rom`] as its [`MemOps`], and `Rom` owns these `Contents`. The
+    /// [`BootRom`] device is not even on the loop, so dropping *it* frees
+    /// nothing — the space, every mapping in it and every byte of guest RAM
+    /// stay. `machines/arm64-virt.machine` maps `boot` into `mem` at zero,
+    /// which closes it.
+    ///
+    /// The same defect was found in `virtio.mmio` by its fuzz target, which
+    /// LeakSanitizer measured at 6.5 MB an iteration; `CLAUDE.md` states the
+    /// rule for the analogous case, that a wire's sinks are weak refs. A boot
+    /// ROM whose space has gone generates no tree, which is what a torn-down
+    /// machine wants.
+    space: Option<Weak<AddressSpace>>,
 }
 
 /// The ROM, as something an address space can dispatch to.
@@ -685,8 +700,12 @@ impl BootRom {
     /// Whatever [`dt::generate`](super::dt::generate) refuses, or a tree too
     /// large for the ROM window.
     pub fn regenerate(&self) -> Result<()> {
+        // Upgraded once, here, and held for the whole generation: a tree is
+        // built at reset and nowhere near a hot path, and the machine that
+        // owns the space cannot go away while we are describing it. `None` is
+        // either a ROM nothing bound or one that outlived its space.
         let space = self.rom.contents.lock().space.clone();
-        let Some(space) = space else {
+        let Some(space) = space.as_ref().and_then(Weak::upgrade) else {
             return Err(Error::Config {
                 at: CLASS_NAME.to_string(),
                 message: String::from(
@@ -857,7 +876,9 @@ impl Instance for BootRom {
             at: ctx.path().to_string(),
             message: String::from("a boot ROM needs an address space to describe (`space = mem`)"),
         })?;
-        self.rom.contents.lock().space = Some(Arc::clone(space));
+        // Weak: the space maps this ROM's own region, so a strong handle here
+        // closes a cycle. See `Contents::space`.
+        self.rom.contents.lock().space = Some(Arc::downgrade(space));
         Ok(())
     }
 }
@@ -1151,5 +1172,36 @@ mod tests {
         let e = rom.regenerate().expect_err("no space").to_string();
         assert!(e.contains("address space"), "{e}");
         assert!(rom.device_tree().is_empty());
+    }
+
+    /// The cycle `virtio.mmio` was found to have, in the shape this file had
+    /// it.
+    ///
+    /// A cycle is invisible to `Drop` — nothing runs, which is the defect —
+    /// but it is exactly visible as a `Weak` that still upgrades after the
+    /// last strong handle is gone. Both halves have to be present for the
+    /// loop to close, so the fixture builds both: the ROM's window in the
+    /// space's map, as `machines/arm64-virt.machine` maps `boot` at zero, and
+    /// the space in the ROM's contents, as `bind` puts it there.
+    #[test]
+    fn the_rom_does_not_keep_the_space_it_describes_alive() {
+        let rom = rom(0x4020_0000);
+        let space = Arc::new(AddressSpace::new("mem", 64));
+        space
+            .topology()
+            .map(rom.region("").expect("the ROM window"), 0)
+            .expect("a fresh space");
+        rom.rom.contents.lock().space = Some(Arc::downgrade(&space));
+
+        let watch = Arc::downgrade(&space);
+        drop(space);
+        assert!(
+            watch.upgrade().is_none(),
+            "the address space outlived its last owner: the boot ROM holds it strongly"
+        );
+        // And the ROM is still a ROM: a space that has gone means no tree
+        // rather than a panic.
+        let e = rom.regenerate().expect_err("the space is gone").to_string();
+        assert!(e.contains("address space"), "{e}");
     }
 }
