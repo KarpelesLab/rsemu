@@ -631,7 +631,22 @@ impl ScsiDisk {
         if all || page == 0x04 {
             out.extend_from_slice(&self.page_geometry());
         }
-        if out.is_empty() { None } else { Some(out) }
+        // Page code `00` is "vendor specific (does not require the page
+        // format)" (§8.2.10, Table 90). This drive has no vendor-specific page,
+        // so what it returns is the header and the block descriptor with
+        // nothing after them — a complete mode parameter list (§8.3.3) rather
+        // than an error, which is what a host asking for four bytes is after:
+        // the medium type and the write-protect bit in the header.
+        //
+        // Refusing it is what stops an A4000T booting. Commodore's 53C710
+        // `scsi.device` issues `1A 00 00 00 04 00` while it configures a unit,
+        // and an `ILLEGAL REQUEST` there sends it round the whole bus scan
+        // again — seven times, and then the unit is left half-configured and
+        // AmigaDOS asks for the volume back.
+        if out.is_empty() && page != 0x00 {
+            return None;
+        }
+        Some(out)
     }
 
     /// Page `01`, read-write error recovery (§9.3.3.6, Table 116).
