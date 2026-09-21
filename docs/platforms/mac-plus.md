@@ -115,10 +115,11 @@ window, not a number derived from `ScrnBase`. A register trace catches `A2`
 becoming `$3FCB5E` at `$4007DE`, with `A4` holding `$400FA2` — a pointer into
 the ROM — and with no register and no word of low memory holding anything it
 could have been computed from, so the number comes out of the ROM itself and
-not out of the machine. Folded, that
-address is `MemTop - $5900 + $245E` on **every** power-of-two size — `$0F CB5E`
+not out of the machine. Folded, that address is `MemTop - $5900 + $245E` on
+**every** power-of-two size — `$0F CB5E`
 on a 1 MiB board, `$1F CB5E` on 2 MiB, `$3F CB5E` on 4 MiB — which is the
-middle of the screen, every time. Unfolded it is in nothing at all on anything
+middle of the screen, every time, and 512K, 1 MiB, 2 MiB and 4 MiB boards all
+reach the same picture. Unfolded it is in nothing at all on anything
 but a 4 MiB machine, and the ROM draws its icon into the void.
 
 That was this board's hang. The picture was the bare grey desktop and the
