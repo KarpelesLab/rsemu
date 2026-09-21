@@ -684,10 +684,14 @@ const KEYBOARD_PORT: &str = "keyboard";
 /// is the A500 board's extended-ROM window, which only AROS fills: no bytes is
 /// no ROM, and the board is then exactly the machine without the window.
 /// `cdrom` is a PC's CD-ROM drive, where empty is an open tray: the drive is
-/// still on the cable and still answers, with `MEDIUM NOT PRESENT`.
+/// still on the cable and still answers, with `MEDIUM NOT PRESENT`. `cd0` is a
+/// CD32's tray, which is the same thing under the name that board gives it —
+/// and which had parted from the CLI's list the same way `nvme0` once did, so
+/// a `demo,machine-amiga-cd32` module refused to assemble the very board whose
+/// whole point is that it boots with nothing in the tray.
 const EMPTY_BAYS: &[&str] = &[
     "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0", "df0", "ext",
-    "cdrom",
+    "cd0", "cdrom",
 ];
 
 /// Where the media image a boot binds comes from.
