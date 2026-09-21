@@ -63,6 +63,7 @@ more about a machine than that, and none of it is reachable over GDB's wire:
 | `trace` | the `--trace` counters *now*, rather than at the end of a run |
 | `timeline`, `rewind` | the keyframes a session holds, and going back through them |
 | `save`, `load` | a machine snapshot, by hand, at an instant you chose |
+| `media`, `insert`, `eject` | what is in every drive on the board, and changing it while the guest runs |
 
 The half a debugger *does* have — memory, registers, stepping — is here too,
 because a console that could describe a board but not read a byte of it would
@@ -95,6 +96,11 @@ the machine
   clocks                every clock domain: rate, ticks, lead, gating
   wires                 every net, what drives it and what it settles at
 
+media
+  media                 every removable bay, and what is in it
+  insert <bay> <file>   put a disk, disc or card in; a trailing `ro` protects it
+  eject <bay>           take it out. Both raise the drive's disk-change signal
+
 memory
   x <addr> [len]        read at a VIRTUAL address, through the selected processor
   xp <addr> [len]       read at a PHYSICAL address, no translation
@@ -121,6 +127,74 @@ becomes a one-millisecond one.
 
 A blank line is nothing and a line starting with `#` is a comment, so a script
 piped into a session can explain itself.
+
+---
+
+## Media
+
+```
+(rsemu) media
+fdc          writable   floppy (80/2/18, 1474560 bytes)
+cd0          empty      the disc tray
+(rsemu) eject fdc
+fdc: empty
+the drive has raised its disk-change signal; the guest sees it at its own pace
+(rsemu) insert fdc disk2.img
+fdc: disk2.img
+the drive has raised its disk-change signal; the guest sees it at its own pace
+```
+
+A **bay** is named by the device path `devices` prints, or as `<path>:<bay>`
+when a device has more than one. Nothing in the tree has more than one yet; the
+second spelling exists so that the first drive to grow a second bay does not
+rename the first.
+
+`insert` takes the same file specifications `rsemu run --media` does, schemes
+included — `insert df0 adf:amiga-forever.iso,disk=Workbench` reaches inside a
+disc image — because it calls the same reader.
+
+### The guest is told
+
+A swap the guest does not see corrupts the filesystem it has mounted: its
+directory is cached in its own RAM and its next write goes to the wrong disk.
+So every implementation raises the signal *its own hardware* raises, and that
+is a requirement of the trait rather than a courtesy:
+
+| device | what it raises |
+| --- | --- |
+| `pc.fdc` | `DSKCHG`, bit 7 of the digital input register — what INT 13h AH=16h reports — set by the door and cleared by a step pulse with a diskette in the drive |
+| `amiga.floppy` | `CHNG*` on the drive connector, read at CIA-A `PRA` bit 2, cleared by a step with a disk in |
+| `ata.cdrom` | a pending UNIT ATTENTION with additional sense `28h 00h`, *medium may have changed*, reported once on the next command that is not INQUIRY or REQUEST SENSE |
+| `amiga.cd` | nothing: Akiko carries no disc-change message, and `src/dev/amiga/akiko.rs` says at length why one was not invented |
+| `sd.card` | no line of its own — the card comes back in the idle state with its published RCA gone, which is what a real hot swap does to a host |
+
+What the guest does about it takes as long as it takes.
+`tests/amiga_a500_kickstart.rs` measures the Amiga end of this against a real
+Kickstart 1.3 at its Workbench desktop: with the disk in, the head sits on
+cylinder 45 for ten seconds without moving; take it out through `eject` and
+`trackdisk` recalibrates within a second and then steps the head back and forth
+every couple of seconds for as long as the drive stays empty. That is the drive
+click, and it is the ROM trying to reset a change flop that an empty drive
+never resets.
+
+### Why this is still deterministic
+
+A media change is a host action crossing into the machine, and `CLAUDE.md` says
+such a thing goes through the record/replay seam or it is a determinism bug.
+It does not go through a channel, and `src/core/record.rs`'s table says why:
+both commands run **between scheduling rounds, with the machine stopped**, so a
+swap happens at the instant the previous `run` ended and a script replayed from
+the top swaps at the same virtual time every run. Nothing has to be logged for
+that to be reproducible, and
+`a_swap_at_a_fixed_instant_reaches_one_hash` asserts it in both directions:
+identical scripts reach one state hash, and a script that does not eject
+reaches a different one.
+
+What is *not* covered is which bytes were in the file — the same gap that
+row's neighbour, "host file I/O content", already names. The day a front end
+wants to swap from another thread while the guest runs is the day this needs a
+channel, and `dev::medium::Removable`'s contract says so rather than leaving it
+to be found out.
 
 ---
 
@@ -331,20 +405,6 @@ which is how `tests/cli_monitor.rs` drives one, with no TTY anywhere.
 
 ## What is deliberately not here
 
-**Media: what is in each slot, and swapping it.** Listed for a first version and
-left out, because there is no machine-wide seam to build it on and the commands
-that do exist are per-device. `dev::medium::MediumSlot` is a *hand-off*: a drive
-takes the medium out of the slot as it is constructed, so after realize every
-slot reads empty and a `media` command over it would list nothing for every
-machine in the catalog. The live doors that exist —
-`dev::pc::fdc::drives::Drive::insert`, the Amiga floppy's `insert(MfmDisk)`, the
-SD card's `insert`/`eject` — are host objects of three different types with no
-common trait, so a `media` command would work on one board and not the rest,
-which is the half-working row a first version is meant to avoid. The fix is a
-`Device`-level media seam: a way to ask any device what it is holding and to hand
-it something else. That is a change in `dev/`, not in `host/`, and it is the
-first thing to add here once it exists.
-
 **Breakpoints and watchpoints.** The gdbstub has them, implemented with a
 program-counter comparison after every tick and a polled shadow copy — and, more
 to the point, with a *stepper* behind them. A monitor `break` would have to
@@ -378,3 +438,4 @@ testable without a TTY, which is worth having either way.
 | `src/bin/rsemu.rs` | `monitor_command`, `monitor_session` — the loop, the prompt, the pipe |
 | `tests/cli_monitor.rs` | the binary, with a script on stdin: the determinism and debug-attribute gates |
 | `src/host/gdb/target.rs` | `MachineTarget`, and the eight commands both front ends share |
+| `src/dev/medium.rs` | `Removable`, `MediaPort`, `attached` — the seam `media`, `insert` and `eject` are built on |

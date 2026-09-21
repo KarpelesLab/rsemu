@@ -1841,18 +1841,21 @@ landed, and now registers with it instead.
   TUI: `rsemu monitor <machine>`, or `run --mon`. The device tree and one
   device's whole current state, the memory map, every clock domain's rate and
   position, the wire graph, the scheduler's queue, guest memory read and written
-  through `MemAttrs::debug`, snapshots, `rewind` over a `Timeline`, and the
-  `--trace` counters live. `docs/system/monitor.md`.
+  through `MemAttrs::debug`, snapshots, `rewind` over a `Timeline`, the
+  `--trace` counters live, and `media`/`insert`/`eject` over every removable
+  drive on the board. `docs/system/monitor.md`.
   A `noroi` TUI over the same command engine is what is still outstanding, and
   the blocker is not design: **`noroi` is not published on crates.io** and a
   repository dependency makes a published crate unpublishable (§14). So
   `host::monitor::Monitor::execute` takes a line and returns text plus a flow,
   and a full-screen frontend is additive behind a second feature the day the
   crate ships to the registry. Not yet: breakpoints (the gdbstub has them, and a
-  monitor breakpoint would make `run` stop being additive), a media
-  insert/eject (no `Device`-level seam exists — `MediumSlot` is a construct-time
-  hand-off), and disassembly (the generator that §4.6 promises emits it is not
-  wired into either frontend).
+  monitor breakpoint would make `run` stop being additive) and disassembly (the
+  generator that §4.6 promises emits it is not wired into either frontend).
+  Media *is* now here: `dev::medium::Removable`, published as
+  `ExportId::REMOVABLE_MEDIA`, is the `Device`-level seam the first version
+  lacked — `MediumSlot` stays the construct-time hand-off it always was, and
+  the door beside it stays open for as long as the machine runs.
 - **gdbstub** — the GDB remote serial protocol over TCP: registers, memory,
   breakpoints/watchpoints, multi-CPU as threads, `qXfer` target descriptions.
   Debugging a guest kernel is a headline feature, not a nicety.

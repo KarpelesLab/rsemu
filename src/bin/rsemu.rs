@@ -3183,7 +3183,48 @@ fn describe_machine(machine: &Machine) {
             device.class().name
         );
     }
+    describe_media(machine);
 }
+
+/// The removable bays a built machine has, and what is in each.
+///
+/// Printed beside the object list because it answers the question the object
+/// list raises and the `--media`/`--drive` flags cannot: *which* of these is a
+/// drive, what is the name to put a disk in it, and did the file the command
+/// line named actually land there. A board with nothing removable prints
+/// nothing, which is most of the catalog.
+///
+/// `rsemu monitor <machine>` has the same list as `media`, and `insert` and
+/// `eject` change it while the machine runs.
+#[cfg(feature = "dev-medium")]
+fn describe_media(machine: &Machine) {
+    for device in rsemu::dev::medium::attached(machine) {
+        let bays = device.port.bays();
+        let one = bays.len() == 1;
+        for bay in bays {
+            let name = if one {
+                device.path.clone()
+            } else {
+                format!("{}:{}", device.path, bay.name)
+            };
+            match bay.medium {
+                None => println!("  media  {name:<8} empty            {}", bay.summary),
+                Some(held) => println!(
+                    "  media  {name:<8} {:<16} {}",
+                    if held.write_protected {
+                        "write protected"
+                    } else {
+                        "writable"
+                    },
+                    held.describe
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "dev-medium"))]
+fn describe_media(_machine: &Machine) {}
 
 /// Where the machine got to.
 fn summarise(machine: &Machine) {

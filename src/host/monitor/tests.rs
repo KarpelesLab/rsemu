@@ -55,7 +55,13 @@ fn apple1_spinning() -> (Machine, std::sync::Arc<HostObjects>) {
 }
 
 /// A one-line convenience: run a script and hand back everything it printed.
-#[cfg(feature = "machine-apple1")]
+///
+/// Gated on either board its callers use: `--features monitor` alone builds
+/// no machine at all, and the media commands need one with a drive in it.
+#[cfg(any(
+    feature = "machine-apple1",
+    all(feature = "machine-pc-at", feature = "dev-medium")
+))]
 fn script(machine: &mut Machine, hosts: &HostObjects, lines: &[&str]) -> String {
     let mut monitor = Monitor::new();
     let mut target = MachineTarget::new(machine);
@@ -777,5 +783,137 @@ fn trace_renders_the_same_table_the_flag_writes() {
     assert!(
         wrong.contains("not a channel"),
         "a misspelled channel was accepted:\n{wrong}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// media
+// ---------------------------------------------------------------------------
+
+/// A 1.44 MiB diskette image whose every byte says where it is.
+#[cfg(all(feature = "machine-pc-at", feature = "dev-medium"))]
+fn diskette() -> Vec<u8> {
+    (0..1_474_560u32).map(|i| (i ^ (i >> 9)) as u8).collect()
+}
+
+/// A PC/AT with a diskette in the drive, an empty CD tray and empty IDE bays.
+///
+/// The board the media commands need, and `machine-apple1` — which every
+/// other test in this file uses — has no drive of any kind. Nothing about the
+/// commands is PC-specific; this is simply the smallest machine in the catalog
+/// that has two removable bays of *different* classes, which is the claim
+/// worth making about a seam whose whole point is that it does not care.
+#[cfg(all(feature = "machine-pc-at", feature = "dev-medium"))]
+fn pc_at_with_a_diskette() -> (Machine, std::sync::Arc<HostObjects>) {
+    let floppy = diskette();
+    // Not firmware, and it does not have to be: nothing here asks the guest to
+    // do anything. What the board needs is for the slots to be bound, because
+    // an unbound one is a build error rather than an empty drive.
+    let rom = alloc::vec![0x90u8; 128 * 1024];
+    let vga = alloc::vec![0x90u8; 32 * 1024];
+    crate::machine::catalog::build_catalog_with_hosts(
+        "pc-at",
+        &[
+            ("bios", &rom),
+            ("vgabios", &vga),
+            ("floppy", &floppy),
+            ("hd0", &[]),
+            ("hd1", &[]),
+            ("cdrom", &[]),
+        ],
+    )
+    .expect("this build has `machine-pc-at`, because the test is gated on it")
+}
+
+#[test]
+#[cfg(all(feature = "machine-pc-at", feature = "dev-medium"))]
+fn media_lists_every_removable_bay_whatever_class_it_belongs_to() {
+    let (mut machine, hosts) = pc_at_with_a_diskette();
+    let out = script(&mut machine, &hosts, &["media"]);
+    // The diskette controller and the CD-ROM drive are two unrelated classes
+    // with two unrelated host objects, and this one command answers for both
+    // — which is the entire reason the seam exists.
+    assert!(out.contains("fdc"), "{out}");
+    assert!(out.contains("1474560"), "the diskette's length: {out}");
+    assert!(out.contains("cd0"), "{out}");
+    assert!(out.contains("empty"), "the tray has no disc in it: {out}");
+    // A fixed disk is not removable and must not appear.
+    assert!(!out.contains("hd0"), "a hard disk has no door: {out}");
+}
+
+#[test]
+#[cfg(all(feature = "machine-pc-at", feature = "dev-medium"))]
+fn eject_empties_a_bay_and_media_says_so() {
+    let (mut machine, hosts) = pc_at_with_a_diskette();
+    let out = script(&mut machine, &hosts, &["eject fdc", "media"]);
+    assert!(out.contains("disk-change signal"), "{out}");
+    let listing = out.split("disk-change signal").nth(1).expect("the listing");
+    assert!(listing.contains("fdc"), "{listing}");
+    assert!(!listing.contains("1474560"), "the diskette left: {listing}");
+
+    // And the device's own view agrees with the listing, which is the other
+    // half of the claim: `media` is reading the drive rather than a cache of
+    // its own. The controller's `Debug` reports how long its image is, and
+    // after an eject that is nothing.
+    let state = script(&mut machine, &hosts, &["device fdc"]);
+    assert!(state.contains("image_len: 0"), "{state}");
+}
+
+#[test]
+#[cfg(all(feature = "machine-pc-at", feature = "dev-medium"))]
+fn the_media_commands_name_what_went_wrong_rather_than_shrugging() {
+    let (mut machine, hosts) = pc_at_with_a_diskette();
+    for (line, wanted) in [
+        ("eject", "eject <bay>"),
+        ("insert fdc", "insert <bay> <file>"),
+        ("eject nosuch", "no device at that path"),
+        ("eject cpu0", "has no removable media"),
+        ("eject fdc:platter", "no bay called"),
+        ("insert fdc /nonexistent/disk.img", "cannot be read"),
+    ] {
+        let out = script(&mut machine, &hosts, &[line]);
+        assert!(out.contains(wanted), "`{line}` said: {out}");
+    }
+}
+
+#[test]
+#[cfg(all(feature = "machine-pc-at", feature = "dev-medium"))]
+fn a_bay_can_be_named_with_its_device_or_with_both_halves() {
+    let (mut machine, hosts) = pc_at_with_a_diskette();
+    // The diskette controller has one bay, so both spellings reach it.
+    let out = script(&mut machine, &hosts, &["eject fdc:0", "media"]);
+    assert!(out.contains("disk-change signal"), "{out}");
+    let listing = out.split("disk-change signal").nth(1).expect("the listing");
+    assert!(!listing.contains("1474560"), "it went: {listing}");
+}
+
+#[test]
+#[cfg(all(feature = "machine-pc-at", feature = "dev-medium"))]
+fn a_swap_at_a_fixed_instant_reaches_one_hash() {
+    // `CLAUDE.md`'s determinism rule, applied to this seam. A media change is
+    // a host action crossing into the machine, and `core::record`'s table says
+    // why it needs no channel: the monitor runs it with the machine *stopped*,
+    // between scheduling rounds, so the instant is the one the previous `run`
+    // ended at and two runs of one script swap at the same virtual time.
+    //
+    // The assertion is in two halves, and the second is the one that makes the
+    // first mean anything: identical scripts land on one hash, and a script
+    // that does *not* eject lands on a different one — so the hash is watching
+    // the swap rather than being insensitive to everything.
+    let ejecting = &["run 2ms", "eject fdc", "run 2ms", "hash"][..];
+    let untouched = &["run 2ms", "run 2ms", "hash"][..];
+
+    let mut hashes = Vec::new();
+    for _ in 0..2 {
+        let (mut machine, hosts) = pc_at_with_a_diskette();
+        hashes.push(script(&mut machine, &hosts, ejecting));
+    }
+    assert_eq!(hashes[0], hashes[1], "the same script, the same state");
+
+    let (mut machine, hosts) = pc_at_with_a_diskette();
+    let without = script(&mut machine, &hosts, untouched);
+    assert_ne!(
+        hashes[0], without,
+        "and the hash notices whether the diskette left"
     );
 }

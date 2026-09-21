@@ -265,6 +265,9 @@ impl Monitor {
             "sched" => Response::stay(sched(target.machine())),
 
             "device" => Response::stay(device(target.machine(), args.first().copied())),
+            "media" => Response::stay(media(target.machine())),
+            "insert" => Response::stay(insert(target.machine(), &args)),
+            "eject" => Response::stay(eject(target.machine(), args.first().copied())),
             "clocks" => Response::stay(clocks(target.machine())),
             "wires" => Response::stay(wires(target.machine())),
 
@@ -655,6 +658,180 @@ fn device(machine: &Machine, path: Option<&str>) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// media: what is in the drives, and changing it
+// ---------------------------------------------------------------------------
+
+/// How a bay is named at this prompt.
+///
+/// `df0` when the device at that path has exactly one bay, which is every
+/// drive in the tree today; `df0:disk` always. Two spellings rather than one
+/// because "the disk in df0" is what a person means and `df0:disk` is what a
+/// machine with a two-bay drive would need, and neither is worth losing.
+///
+/// The device path is the *front* of it rather than the back on purpose: it is
+/// what `devices` already prints, so a session reads one listing and types out
+/// of it.
+#[cfg(feature = "dev-medium")]
+fn find_bay(
+    machine: &Machine,
+    spec: &str,
+) -> Result<(crate::dev::medium::MediaPort, String), String> {
+    use crate::dev::medium;
+
+    let (path, wanted) = match spec.split_once(':') {
+        Some((path, bay)) => (path, Some(bay)),
+        None => (spec, None),
+    };
+    let port = medium::attached_at(machine, path).map_err(|e| format!("{e}\n"))?;
+    let bays = port.bays();
+    match wanted {
+        Some(name) => {
+            if bays.iter().any(|b| b.name == name) {
+                Ok((port, String::from(name)))
+            } else {
+                Err(format!(
+                    "`{path}` has no bay called `{name}`; it has {}\n",
+                    names_of(&bays)
+                ))
+            }
+        }
+        None if bays.len() == 1 => Ok((port, bays[0].name.clone())),
+        None => Err(format!(
+            "`{path}` has {} bays ({}); name one as `{path}:<bay>`\n",
+            bays.len(),
+            names_of(&bays)
+        )),
+    }
+}
+
+/// The bay names of a device, for a message that has to list them.
+#[cfg(feature = "dev-medium")]
+fn names_of(bays: &[crate::dev::medium::MediaBay]) -> String {
+    bays.iter()
+        .map(|b| format!("`{}`", b.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `media` — every removable bay in the machine and what is in it.
+#[cfg(feature = "dev-medium")]
+fn media(machine: &Machine) -> String {
+    let attached = crate::dev::medium::attached(machine);
+    if attached.is_empty() {
+        return String::from(
+            "this machine has no removable media — no device in it publishes a bay\n",
+        );
+    }
+    let mut out = String::new();
+    for device in &attached {
+        let bays = device.port.bays();
+        let one = bays.len() == 1;
+        for bay in bays {
+            let name = if one {
+                device.path.clone()
+            } else {
+                format!("{}:{}", device.path, bay.name)
+            };
+            match bay.medium {
+                None => {
+                    let _ = writeln!(out, "{name:<12} empty      {}", bay.summary);
+                }
+                Some(held) => {
+                    let _ = writeln!(
+                        out,
+                        "{name:<12} {:<10} {} ({} bytes)",
+                        if held.write_protected {
+                            "protected"
+                        } else {
+                            "writable"
+                        },
+                        held.describe,
+                        held.capacity
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `insert <bay> <file> [ro]` — put a medium in, and let the guest know.
+#[cfg(feature = "dev-medium")]
+fn insert(machine: &Machine, args: &[&str]) -> String {
+    let (Some(spec), Some(file)) = (args.first().copied(), args.get(1).copied()) else {
+        return String::from("`insert <bay> <file> [ro]`; `media` lists the bays\n");
+    };
+    let protect = match args.get(2).copied() {
+        None => false,
+        Some("ro") => true,
+        Some(other) => return format!("`{other}` is not an insert option; the only one is `ro`\n"),
+    };
+    let (port, bay) = match find_bay(machine, spec) {
+        Ok(found) => found,
+        Err(e) => return e,
+    };
+    // The same reader `--media` uses, so a scheme works here too: `insert df0
+    // adf:/path/to/disks.iso,disk=Workbench` is the whole point of it being
+    // one function rather than a `std::fs::read`.
+    let loaded = match crate::host::media::read(file) {
+        Ok(loaded) => loaded,
+        Err(e) => return format!("{e}\n"),
+    };
+    let described = loaded.note.clone().unwrap_or_else(|| String::from(file));
+    let bytes = crate::dev::medium::from_bytes(&loaded.bytes);
+    match port.insert(&bay, bytes, protect) {
+        Ok(()) => format!(
+            "{spec}: {described}\n\
+             the drive has raised its disk-change signal; the guest sees it at its own pace\n"
+        ),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
+/// `eject <bay>` — take the medium out, and let the guest know.
+#[cfg(feature = "dev-medium")]
+fn eject(machine: &Machine, spec: Option<&str>) -> String {
+    let Some(spec) = spec else {
+        return String::from("`eject <bay>`; `media` lists the bays\n");
+    };
+    let (port, bay) = match find_bay(machine, spec) {
+        Ok(found) => found,
+        Err(e) => return e,
+    };
+    match port.eject(&bay) {
+        Ok(()) => format!(
+            "{spec}: empty\n\
+             the drive has raised its disk-change signal; the guest sees it at its own pace\n"
+        ),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
+/// What the three commands say in a build with no storage seam at all.
+///
+/// A NES build has no `dev-medium` and therefore no `Medium` to put anywhere,
+/// so the commands still answer rather than falling through to "unknown
+/// command" — which would send somebody looking for a typo.
+#[cfg(not(feature = "dev-medium"))]
+fn media(_machine: &Machine) -> String {
+    String::from(NO_MEDIUM)
+}
+
+#[cfg(not(feature = "dev-medium"))]
+fn insert(_machine: &Machine, _args: &[&str]) -> String {
+    String::from(NO_MEDIUM)
+}
+
+#[cfg(not(feature = "dev-medium"))]
+fn eject(_machine: &Machine, _spec: Option<&str>) -> String {
+    String::from(NO_MEDIUM)
+}
+
+#[cfg(not(feature = "dev-medium"))]
+const NO_MEDIUM: &str =
+    "this build has no storage seam at all; rebuild with the `dev-medium` feature\n";
+
 /// `clocks` — the forest, one line per domain.
 fn clocks(machine: &Machine) -> String {
     let forest = machine.clocks();
@@ -958,6 +1135,11 @@ the machine
   clocks                every clock domain: rate, ticks, lead, gating
   wires                 every net, what drives it and what it settles at
 
+media
+  media                 every removable bay, and what is in it
+  insert <bay> <file>   put a disk, disc or card in; a trailing `ro` protects it
+  eject <bay>           take it out. Both raise the drive's disk-change signal
+
 memory
   x <addr> [len]        read at a VIRTUAL address, through the selected processor
   xp <addr> [len]       read at a PHYSICAL address, no translation
@@ -1035,6 +1217,28 @@ trace renders the counters as `rsemu run --trace` would, but now rather than at
 the end of a run: two whitespace-separated columns sorted by name, under a #
 header, with no wall clock in it. Name channels to narrow it: sched, cpu, clock,
 mmio.
+"
+        }
+        "media" | "insert" | "eject" => {
+            "\
+media lists every bay a device in this machine publishes as removable, and
+insert and eject change what is in one. A bay is named by the device path
+`devices` prints -- `df0`, `fdc`, `cdrom` -- or as `<path>:<bay>` when a device
+has more than one.
+
+insert takes the same file specifications `rsemu run --media` does, schemes
+included: `insert df0 adf:disks.iso,disk=Workbench` reaches into an Amiga
+Forever disc image. A trailing `ro` write protects what goes in.
+
+**The guest is told.** Each drive raises the signal its own hardware raises --
+a PC's DSKCHG in the digital input register, an Amiga's CHNG* on the drive
+connector, an ATAPI unit attention with sense 28h/00h -- because a swap the
+guest does not see corrupts the filesystem it has mounted. What it does about
+it is its own business and may take a while.
+
+Both commands run with the machine stopped, between scheduling rounds, which is
+what keeps a session reproducible: a script that runs, ejects and runs again
+lands on one state hash every time.
 "
         }
         "x" | "xp" | "map" | "devices" | "spaces" | "translate" | "time" => {
