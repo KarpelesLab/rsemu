@@ -165,6 +165,28 @@ machine "mac-plus" {
   # One mechanism, the internal drive. `-p drives=2` adds the external one.
   object iwm "mac.iwm" { drives = drives }
 
+  # -- the clock chip --------------------------------------------------------
+  #
+  # See `src/dev/mac/rtc.rs`. A watch crystal beside it, and the date it starts
+  # at is a property rather than the host's clock: a device may never read real
+  # time (CLAUDE.md, Determinism), so two runs of this machine see the same
+  # date. `pram` is a flat battery by default - every byte $FF - which is what
+  # a real ROM finds when the battery has gone, and it writes its own defaults
+  # over the top.
+  param  rtcdate = "2026-01-01T00:00:00"
+  osc    rtcxtal = 32768 Hz
+  object rtc "mac.rtc" { clock = rtcxtal, time = rtcdate }
+
+  # -- the keyboard ----------------------------------------------------------
+  #
+  # See `src/dev/mac/keyboard.rs`. It has a crystal of its own rather than a
+  # division of the computer's, and one tick of it is one microsecond, because
+  # every interval the Guide gives for this link is in microseconds: 400 us a
+  # bit going out, 330 us coming back.
+  param  kbdrate = 1M
+  osc    kbdclk  = kbdrate Hz
+  object kbd "mac.keyboard" { clock = kbdclk }
+
   # -- the SCC ---------------------------------------------------------------
   #
   # See `src/dev/mac/scc.rs`. Two windows, because the board has no read/write
@@ -232,6 +254,35 @@ machine "mac-plus" {
   # "PA6  PAGE2": which of the two screen buffers the beam reads. Low selects
   # the alternate one.
   wire via.pa6 -> video.page2 { pull = "up" }
+
+  # The clock chip's three wires, from the Guide's Table 3-11: "bit 2 output
+  # rtcEnb, 0 = RTC is enabled; bit 1 output rtcClk, RTC's data-clock line;
+  # bit 0 in or out rtcData, RTC's serial data line". The data line is two
+  # statements because both ends drive it, exactly as the keyboard's is, and
+  # all three are open-collector with pull-ups.
+  #
+  # The one-second interrupt is CA2, and the Guide describes it as an interrupt
+  # request the VIA latches; the chip drives it as a square wave and the VIA
+  # takes one edge of it a second, which is the same thing.
+  wire via.pb2  -> rtc.enb  { pull = "up" }
+  wire via.pb1  -> rtc.clk  { pull = "up" }
+  wire via.pb0  -> rtc.data { pull = "up" }
+  wire rtc.data -> via.pb0
+  wire rtc.irq  -> via.ca2  { pull = "up" }
+
+  # The keyboard. "The Keyboard Data line is bidirectional, driven at some
+  # times by the computer, and at other times by the keyboard, but the Keyboard
+  # Clock line is driven only by the keyboard" - the Guide, chapter 7 - so the
+  # clock is one statement and the data line is two, one per driver, which is
+  # how a net with a driver at each end is written. Both are open-collector
+  # with pull-ups, which is what lets either end pull and neither end fight.
+  #
+  # The data line's pull is load-bearing for the same reason the blanking
+  # nets' are: the computer's "I am ready" signal is the line going *low*, and
+  # a line with no pull has no high to come back to.
+  wire kbd.clk  -> via.cb1 { pull = "up" }
+  wire kbd.data -> via.cb2 { pull = "up" }
+  wire via.cb2  -> kbd.data
 
   # "PA5  SEL": the fourth address bit of the disk drive's own register file.
   # It lives on the VIA rather than on the IWM because the IWM has only three
