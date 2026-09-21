@@ -348,6 +348,19 @@ jobs:
           set -euo pipefail
           cp target/wasm32-unknown-unknown/release/rsemu.wasm web/public/rsemu.wasm
           npm run build --prefix web
+      # The second module: the wasm JIT backend with a frontend that reaches
+      # it and the C ABI that lets a page drive it. Built *after* the site so
+      # it does not become the module the site ships — both are cdylibs from
+      # one crate and land on the same path — and kept under its own name so
+      # check.mjs can load both.
+      - name: build the wasm JIT cdylib
+        if: matrix.target == 'wasm32-unknown-unknown'
+        run: |
+          set -euo pipefail
+          cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
+            --no-default-features --features wasm,jit-wasm,cpu-riscv-lift --release
+          cp target/wasm32-unknown-unknown/release/rsemu.wasm \
+             target/wasm32-unknown-unknown/release/rsemu-jit.wasm
       - name: browser harness against the real module and the real site
         if: matrix.target == 'wasm32-unknown-unknown'
         # Instantiates the module and drives it: exports vs. what the glue
@@ -356,7 +369,16 @@ jobs:
         # save/restore hash equality, and the page's own frame loop under a
         # stub canvas. Not a DOM test -- nothing here has a browser -- but it
         # catches every drift that is not one.
-        run: node web/check.mjs web/dist/rsemu.wasm --site web/dist
+        #
+        # `--jit` adds §1c: the modules `jit::wasm` emits, compiled and run by
+        # V8, a guest run under `engine = "jit-wasm"` hashed against the same
+        # guest under `engine = "interp"`, and the multiplier the engine gives
+        # (ROADMAP.md §11.4). That is the one claim about this backend that
+        # cannot be made anywhere else in this workflow: every other test of it
+        # runs the modules on `jit::wasm::exec`, which is a wasm interpreter.
+        run: |
+          node web/check.mjs web/dist/rsemu.wasm --site web/dist \
+            --jit target/wasm32-unknown-unknown/release/rsemu-jit.wasm
       - uses: actions/upload-artifact@v5
         if: matrix.target == 'wasm32-unknown-unknown'
         with:

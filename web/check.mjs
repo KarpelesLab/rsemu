@@ -37,6 +37,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
 const siteFlag = argv.indexOf("--site");
 const siteArg = siteFlag >= 0 ? argv.splice(siteFlag, 2)[1] : null;
+// The `jit-wasm` build is a *different* module from the one the page ships:
+// the demo has no RISC-V board and no reason to carry a code generator, and
+// the JIT harness has no reason to carry six consoles. `scripts/check.sh wasm`
+// builds both and passes this one here.
+const jitFlag = argv.indexOf("--jit");
+const jitArg = jitFlag >= 0 ? argv.splice(jitFlag, 2)[1] : null;
 const positional = argv.filter((a) => !a.startsWith("--"));
 
 const wasmPath = positional[0] ?? "target/wasm32-unknown-unknown/release/rsemu.wasm";
@@ -89,6 +95,15 @@ function sections(bytes) {
         uleb(); // index
       }
     } else if (id === 2) {
+      // Every import, not just the first: the module used to import nothing,
+      // so a walk that stopped at one was enough to say so. A `jit-wasm` build
+      // imports three, and "which three" is the check that matters.
+      // Descriptors are core specification §5.5.5.
+      const limits = () => {
+        const flag = bytes[i++];
+        uleb(); // min
+        if (flag & 0x01) uleb(); // max
+      };
       for (let n = uleb(); n > 0; n--) {
         const ml = uleb();
         const module = bytes.subarray(i, i + ml).toString("utf8");
@@ -97,8 +112,15 @@ function sections(bytes) {
         const name = bytes.subarray(i, i + nl).toString("utf8");
         i += nl;
         imports.push(`${module}.${name}`);
-        i = end; // descriptors vary; the names are all we need
-        break;
+        const kind = bytes[i++];
+        if (kind === 0x00) uleb(); // typeidx
+        else if (kind === 0x01) (i++, limits()); // reftype, then limits
+        else if (kind === 0x02) limits();
+        else if (kind === 0x03) i += 2; // valtype, mutability
+        else {
+          i = end; // an import kind this walk does not know: stop cleanly
+          break;
+        }
       }
     }
     i = end;
@@ -121,7 +143,17 @@ check(
   [...wanted].every((n) => exports.has(n)),
   "every export the page calls exists",
 );
-check(imports.length === 0, "the module imports nothing (the page passes {})");
+// The page passes `{}`, so the demo module must ask for nothing. A `jit-wasm`
+// build is the one exception and it is an exact list: those three are the
+// browser embedder (§1c below), and anything else arriving here is a
+// dependency that crept in.
+const JIT_IMPORTS = ["rsemu.jit_compile", "rsemu.jit_enter", "rsemu.jit_release"];
+check(
+  imports.every((n) => JIT_IMPORTS.includes(n)),
+  imports.length === 0
+    ? "the module imports nothing (the page passes {})"
+    : `the module imports only the JIT embedder (${imports.join(", ")})`,
+);
 
 // ---------------------------------------------------------------------------
 // 1b. The built site
@@ -214,6 +246,147 @@ if (!sitePath) {
   check(css.length > 0, "the site ships a stylesheet");
   const bytes = refs.reduce((n, u) => n + statSync(join(site, u)).size, 0);
   console.log(`  ${refs.length} assets, ${(bytes / 1024).toFixed(1)} KiB before the module`);
+}
+
+// ---------------------------------------------------------------------------
+// 1c. The WebAssembly JIT, under this engine
+// ---------------------------------------------------------------------------
+//
+// `src/jit/wasm/` lowers an IR block to a complete `WebAssembly.Module`.
+// Everywhere else in the tree the only thing that runs one is
+// `jit::wasm::exec`, a wasm interpreter written from the core specification —
+// so every other test in this project proves the modules are *correct* and
+// none of them proves they are *worth emitting*. That needs an engine that
+// compiles them, and this is the only harness that has one.
+//
+// Three things are asked, in the order they can fail:
+//
+//   1. the module declares exactly the three `rsemu.jit_*` imports and the
+//      four `rsemu_jit_*` exports `docs/techniques/wasm-jit.md` specifies, and
+//      instantiates against `web/src/jit.js`;
+//   2. a guest run under `engine = "jit-wasm"` hashes identically to the same
+//      guest under `engine = "interp"` — with a count beside it saying blocks
+//      really did run inside modules this engine compiled, because a hash that
+//      matched by falling back to the interpreter would prove nothing;
+//   3. how long each took.
+//
+// Node rather than a headless browser. The difference is nil for what is
+// measured here: `WebAssembly.Module`, `Instance` and `Memory` are the *JS
+// API* recommendation, which node implements through the same V8 that Chrome
+// does, and nothing in this path touches the *Web* API half (no streaming
+// compilation, no `fetch`, no worker, no `SharedArrayBuffer`). What it does
+// not cover is a browser's own tiering policy and memory pressure, which are
+// exactly the things a synthetic loop would not measure honestly anyway.
+
+{
+  const jitPath = jitArg ?? (imports.includes("rsemu.jit_compile") ? wasmPath : null);
+  if (!jitPath) {
+    console.log(
+      "\n  SKIP the wasm JIT — pass --jit PATH to a build with `jit-wasm,cpu-riscv-lift`.\n" +
+        "       `scripts/check.sh wasm` and the CI `wasm` job always pass it.",
+    );
+  } else {
+    console.log(`\njit: ${jitPath}`);
+    const jitWasm = readFileSync(jitPath);
+    const jit = sections(jitWasm);
+
+    const wantImports = ["rsemu.jit_compile", "rsemu.jit_enter", "rsemu.jit_release"];
+    for (const name of wantImports) {
+      if (!jit.imports.includes(name)) bad(`the JIT build does not import ${name}`);
+    }
+    check(
+      wantImports.every((n) => jit.imports.includes(n)),
+      `it imports all three of ${wantImports.join(", ")}`,
+    );
+    check(
+      jit.imports.every((n) => wantImports.includes(n)),
+      `and nothing else (${jit.imports.join(", ") || "none"})`,
+    );
+    const wantExports = [
+      "rsemu_jit_enable",
+      "rsemu_jit_slot",
+      "rsemu_jit_load",
+      "rsemu_jit_store",
+      "rsemu_jit_note",
+      "rsemu_jit_guest_run",
+      "rsemu_jit_guest_stat",
+      "memory",
+    ];
+    for (const name of wantExports) {
+      if (!jit.exports.has(name)) bad(`the JIT build does not export ${name}`);
+    }
+    check(
+      wantExports.every((n) => jit.exports.has(n)),
+      `and exports all ${wantExports.length} the embedder needs`,
+    );
+
+    const { instantiateWithJit } = await import("./src/jit.js");
+    const jitInstance = await instantiateWithJit(jitWasm);
+    const j = jitInstance.exports;
+    check(j.rsemu_jit_enable() === 1, "the browser embedder installs");
+
+    // Three engines over the same guest and the same span. `interp` is the
+    // oracle; `jit` is the portable IR backend, here because a disagreement
+    // between it and `interp` would be a finding about the lifter rather than
+    // about this backend and it is worth being able to tell them apart.
+    const QUANTA = 2000;
+    const BUDGET = 20000n;
+    const run = (engine) => {
+      const started = process.hrtime.bigint();
+      const hash = j.rsemu_jit_guest_run(engine, QUANTA, BUDGET);
+      const ns = process.hrtime.bigint() - started;
+      return {
+        hash,
+        ms: Number(ns) / 1e6,
+        blocks: j.rsemu_jit_guest_stat(0),
+        compiled: j.rsemu_jit_guest_stat(1),
+        instantiated: j.rsemu_jit_guest_stat(3),
+        embedded: j.rsemu_jit_guest_stat(4),
+        retired: j.rsemu_jit_guest_stat(5),
+        instret: j.rsemu_jit_guest_stat(7),
+      };
+    };
+
+    // A warm-up of each, discarded: V8 tiers up rsemu's own module while this
+    // runs, and a first-call number would be a measurement of that rather than
+    // of the backend. Small enough to cost little and large enough to reach
+    // the optimising tier.
+    for (const engine of [0, 1, 3]) j.rsemu_jit_guest_run(engine, 200, 2000n);
+
+    const interp = run(0);
+    const portable = run(1);
+    const hosted = run(3);
+
+    check(hosted.hash === interp.hash, "jit-wasm hashes what the interpreter hashes");
+    check(portable.hash === interp.hash, "and so does the portable IR backend");
+    check(
+      hosted.instantiated > 0n,
+      `this engine compiled ${hosted.instantiated} of the modules it was offered`,
+    );
+    check(
+      hosted.embedded > 0n && hosted.embedded === hosted.compiled,
+      `and ran every one of ${hosted.compiled} compiled blocks inside one ` +
+        `(${hosted.embedded} entered)`,
+    );
+    check(interp.embedded === 0n, "while the interpreter entered none, as it must");
+
+    // The number ROADMAP.md §11.4 asks for. Printed rather than asserted: a
+    // gate on a wall-clock ratio is a gate on whoever's runner is busiest, and
+    // the determinism checks above are the ones that must not flake.
+    const rate = (r) => (Number(r.instret) / (r.ms * 1000)).toFixed(1);
+    console.log(
+      `  ${QUANTA} quanta x ${BUDGET} ticks, ${hosted.instret} guest instructions:`,
+    );
+    for (const [name, r] of [
+      ["interp  ", interp],
+      ["jit     ", portable],
+      ["jit-wasm", hosted],
+    ]) {
+      const x = (interp.ms / r.ms).toFixed(2);
+      console.log(`    ${name}  ${r.ms.toFixed(0).padStart(6)} ms   ${x}x   ${rate(r)} Minsn/s`);
+    }
+    ok(`jit-wasm is ${(interp.ms / hosted.ms).toFixed(2)}x the interpreter in this engine`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -536,10 +709,19 @@ if (pcat && pcbios) {
 // `B` of "Booting." on the line above it. No font table, at either end.
 
 if (pcat && pcbios) {
+  // By name and not by count. The count was five when this was written and is
+  // six since `feat(machine): give pc-at and q35 a CD-ROM on a media slot`, and
+  // a board gaining a bay is not a regression in the page — while a board
+  // losing the one this section fills is. So the assertion is the set this
+  // file actually depends on, and anything past it is reported rather than
+  // failed.
+  const need = ["bios", "vgabios", "floppy"];
+  const names = pcat.slots.map((s) => s.name);
   const floppy = pcat.slots.find((s) => s.name === "floppy");
   check(
-    Boolean(floppy) && pcat.slots.length === 5,
-    `pc-at declares ${pcat.slots.length} media slots, "floppy" among them`,
+    need.every((n) => names.includes(n)),
+    `pc-at declares ${names.length} media slots (${names.join(", ")}), ` +
+      `${need.join(", ")} among them`,
   );
 
   // 1.44 MB, and eleven bytes of real mode in the first sector: teletype a

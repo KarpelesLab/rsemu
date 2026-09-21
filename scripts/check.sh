@@ -194,10 +194,31 @@ stage_wasm() {
       --target wasm32-wasip1-threads --no-default-features --features wasm,wasm-threads
   fi
   if rustc --print target-libdir --target wasm32-unknown-unknown >/dev/null 2>&1; then
+    local dir="${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release"
     # The non-threaded browser build is a supported target, not a fallback
     # (ROADMAP.md §11), and `demo` is the only feature set the page loads.
     run "wasm demo cdylib" cargo rustc --crate-type cdylib \
       --target wasm32-unknown-unknown --no-default-features --features demo --release
+    cp -f "$dir/rsemu.wasm" "$dir/rsemu-demo.wasm" 2>/dev/null || true
+    # The JIT build is a *second* module and not a feature of the first: the
+    # demo has no RISC-V board and no reason to carry a code generator, and the
+    # embedder harness has no reason to carry six consoles. Both are cdylibs
+    # from one crate, so they land on the same path and the demo is copied
+    # aside first.
+    run "wasm jit cdylib" cargo rustc --crate-type cdylib \
+      --target wasm32-unknown-unknown --no-default-features \
+      --features wasm,jit-wasm,cpu-riscv-lift --release
+    cp -f "$dir/rsemu.wasm" "$dir/rsemu-jit.wasm" 2>/dev/null || true
+    # And the thing the two builds exist for: the modules `jit::wasm` emits,
+    # handed to a real engine, running a guest, hashed against the interpreter
+    # (ROADMAP.md §11.4). `web/check.mjs` §1c; node rather than a headless
+    # browser, and the file says what that costs and what it does not.
+    if command -v node >/dev/null 2>&1 && [ -f "$dir/rsemu-jit.wasm" ]; then
+      run "browser embedder + JIT determinism (node)" \
+        node web/check.mjs "$dir/rsemu-demo.wasm" --jit "$dir/rsemu-jit.wasm"
+    else
+      record "skip  browser embedder (no node; CI's wasm job has one)"
+    fi
   fi
 }
 
