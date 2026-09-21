@@ -698,7 +698,7 @@ pub static MAC_PLUS: CatalogEntry = CatalogEntry {
     name: "mac-plus",
     summary: "a Macintosh Plus: a 7.83 MHz 68000, the ROM overlay at zero, a 6522 at $EFE1FE, \
               and 512x342 one-bit video read out of main memory",
-    media: &["macrom"],
+    media: &["macrom", "floppy"],
     source: include_str!("../../machines/mac-plus.machine"),
 };
 
@@ -2758,6 +2758,11 @@ mod tests {
             // The 500+'s drive, empty for the same reason.
             #[cfg(feature = "machine-amiga-a500plus")]
             ("amiga-a500plus", "df0") => &[],
+            // And the Plus's, which is the state a Macintosh draws a picture
+            // for: an 800K image would be 819,200 bytes of fixture to say
+            // nothing this needs said.
+            #[cfg(feature = "machine-mac-plus")]
+            ("mac-plus", "floppy") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

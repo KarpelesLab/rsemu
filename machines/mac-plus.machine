@@ -163,7 +163,22 @@ machine "mac-plus" {
   # lane where the VIA sits on the high one.
   #
   # One mechanism, the internal drive. `-p drives=2` adds the external one.
-  object iwm "mac.iwm" { drives = drives }
+  #
+  # Its clock is the medium's rather than the board's: **one tick is one bit
+  # cell**, and 500 kHz is what the IWM's own cell time works out at. It is a
+  # separate oscillator because nothing on this board divides down to it - the
+  # rate a disk was written at is a property of the disk, not of the computer
+  # reading it - and routing it through the 15.6672 MHz tree would be an
+  # inexact ratio pretending to be an exact one (ROADMAP.md 4.2).
+  #
+  # `image` names the `floppy` media slot: `--floppy disk.dsk` or
+  # `--media floppy=disk.dsk`, a raw 400K/800K image or a DiskCopy 4.2
+  # container. An unbound or empty slot is an empty drive, which is the
+  # ordinary case. A 1.44 MB image is **refused by name**: a Plus has an IWM
+  # and an 800K drive, and 1.44 MB needs the SWIM (`src/dev/mac/disk.rs`).
+  param  bitrate = 500000
+  osc    diskbit = bitrate Hz
+  object iwm "mac.iwm" { drives = drives, clock = diskbit, image = "floppy" }
 
   # -- the clock chip --------------------------------------------------------
   #

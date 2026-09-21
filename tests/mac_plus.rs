@@ -133,8 +133,15 @@ fn rom_image(file: &str) -> Option<Vec<u8>> {
     Some(image)
 }
 
-/// Build the board around `image`, with `params` on top of the defaults.
+/// Build the board around `image`, with `params` on top of the defaults and
+/// nothing in the drive.
 fn board(image: Vec<u8>, params: &[(&str, &str)]) -> Board {
+    board_with_disk(image, params, Vec::new())
+}
+
+/// The same, with `disk` in the internal drive. An empty vector is an empty
+/// drive, which is what `rsemu run` binds when nobody says `--floppy`.
+fn board_with_disk(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Board {
     let cores: Arc<Captured<M68k>> = Arc::new(Captured::new());
     let kept = Arc::clone(&cores);
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
@@ -151,6 +158,10 @@ fn board(image: Vec<u8>, params: &[(&str, &str)]) -> Board {
             .push((name.to_string(), value.to_string()));
     }
     options.realize.media.insert("macrom", image);
+    // The drive's bay. `machine::realize` refuses a slot that is named and
+    // unbound, so a machine with an empty drive binds zero bytes for it —
+    // which is what the CLI's own empty-bay pass does.
+    options.realize.media.insert("floppy", disk);
     let registry = catalog::registry().expect("a registry");
     let source = catalog::machine("mac-plus")
         .expect("this build ships mac-plus")
