@@ -21,11 +21,29 @@ export class Rsemu {
    * @param {string} url where the .wasm lives
    */
   static async load(url) {
-    // No imports: the module is std-on-wasm32-unknown-unknown and asks the
-    // host for nothing yet. When it does (ROADMAP.md §11.5 — now, random_get,
-    // compile, log) they arrive as a second argument here and nowhere else.
-    const { instance } = await WebAssembly.instantiateStreaming(fetch(url), {});
-    return new Rsemu(instance);
+    // The imports are ROADMAP.md §11.5's: module `rsemu`, supplied by the
+    // embedder, no bundled JS runtime. Three of them exist today and they are
+    // the WebAssembly JIT's (`web/src/jit.js`); `now`, `random_get` and `log`
+    // will arrive the same way. A build without `jit-wasm` — which the demo
+    // this page ships is — declares none of them, and an import object with
+    // more properties than a module asks for is not an error, so one loader
+    // serves both.
+    const { instantiateWithJit } = await import("./jit.js");
+    const instance = await instantiateWithJit(fetch(url));
+    const emu = new Rsemu(instance);
+    // Opt in where there is something to opt into. Answers 0 on the demo
+    // build, and must happen before a machine is booted: an engine reads the
+    // installed embedder once, when it is built.
+    emu.enableHostJit();
+    return emu;
+  }
+
+  /**
+   * Route the wasm JIT's generated modules through this browser's engine.
+   * @returns {boolean} whether this build has anything to route
+   */
+  enableHostJit() {
+    return this.e.rsemu_jit_enable?.() === 1;
   }
 
   // -- memory ---------------------------------------------------------------

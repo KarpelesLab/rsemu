@@ -6,9 +6,12 @@
 //! it does not need a binding generator.
 //!
 //! The host supplies the JS glue: it instantiates the module, reads exported
-//! memory directly, and provides the imports rsemu needs (a clock, entropy,
-//! and — once the JIT lands — module compilation). See `ROADMAP.md` §11, and
-//! `web/` for the page that drives everything below.
+//! memory directly, and provides the imports rsemu needs. Three of those exist
+//! today and they are the **WebAssembly JIT's** — `rsemu.jit_compile`,
+//! `jit_enter`, `jit_release`, at the bottom of this file, with `web/src/jit.js`
+//! as the reference implementation; a clock and entropy will arrive the same
+//! way. See `ROADMAP.md` §11 and `docs/techniques/wasm-jit.md`, and `web/` for
+//! the page that drives everything below.
 //!
 //! # Build
 //!
@@ -90,12 +93,18 @@
 //! # `unsafe` in this module
 //!
 //! This is the **C ABI boundary**, one of the seven subsystems `ROADMAP.md` §0
-//! sanctions to opt back in. Two things here need it: `#[unsafe(no_mangle)]`,
+//! sanctions to opt back in. Three things here need it: `#[unsafe(no_mangle)]`,
 //! which edition 2024 classifies as an unsafe attribute because duplicate
-//! exported symbols are the linker's problem rather than the compiler's; and
-//! the private `leaked` helper, which rebuilds a `&'static str` from a
-//! pointer/length pair. The allow is module-scoped rather than crate-wide, and
-//! every genuine `unsafe` block below carries its own `// SAFETY:` argument.
+//! exported symbols are the linker's problem rather than the compiler's; the
+//! private `leaked` helper, which rebuilds a `&'static str` from a
+//! pointer/length pair; and the **wasm JIT's activation** at the bottom of the
+//! file, which turns a token a generated module handed back into the
+//! `&mut dyn Env` and `&mut [u8]` it names. `Activation`'s doc comment is that
+//! third one's whole argument, and it is the review CLAUDE.md asks for: no
+//! eighth site, because turning a foreign embedder's `i32` back into something
+//! typed is what this site has always been. The allow is module-scoped rather
+//! than crate-wide, and every genuine `unsafe` block below carries its own
+//! `// SAFETY:` argument.
 #![allow(unsafe_code)]
 
 use alloc::string::{String, ToString};
@@ -1531,9 +1540,680 @@ pub extern "C" fn rsemu_load(len: usize) -> u32 {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The wasm JIT's browser embedder
+// ---------------------------------------------------------------------------
+//
+// `ROADMAP.md` §11.4 and `docs/techniques/wasm-jit.md`. `jit::wasm` lowers an
+// IR block to a complete `WebAssembly.Module` and has, in `jit::wasm::exec`, a
+// reference executor that runs one anywhere — correctly, and more slowly than
+// interpreting the IR would be, because it is a wasm interpreter running wasm
+// generated from IR. The point of the backend is the *other* implementation of
+// `jit::wasm::embed::Embedder`: a host engine that compiles a module once and
+// runs it many times. This is that implementation, and it is the only place in
+// the crate that can be, because instantiating a module is something only an
+// embedder can do and rsemu's embedder is the page.
+//
+// Three imports out, four exports back, and `docs/techniques/wasm-jit.md` has
+// the table. The JavaScript is in `web/src/jit.js` and contains no semantics:
+// every observable thing a generated block does routes through `Thunks` in
+// `jit::wasm::rt`, which is a transcription of `ir::interp`. That is deliberate
+// and it is what makes the determinism claim checkable — there is one
+// implementation of the IR's meaning and a browser does not get its own.
+
+/// The activation a generated module was entered with, and the one `unsafe`
+/// question in this subsystem.
+///
+/// # What is handed to JavaScript
+///
+/// A **token**, not a pointer. `docs/techniques/wasm-jit.md` specified `ctx`
+/// as "a real pointer" and this is the one place the built thing differs from
+/// the written one, deliberately: a pointer handed to an embedder is a pointer
+/// the embedder can hand back wrong, and dereferencing a number JavaScript
+/// chose is unsound however carefully the JavaScript is written. A token is
+/// **checked** — it names a slot in this thread's activation stack and it
+/// carries a sequence number, so a value that is stale, forged, or simply
+/// wrong finds no activation and the import answers
+/// [`status::ERROR`](crate::jit::wasm::abi::status::ERROR), which the engine
+/// turns into an `Err` and the dispatcher into an interpreted block. Nothing a
+/// hostile or broken page can put in that argument is unsound.
+///
+/// The pointers are *inside*: `env` is the address of a `&mut dyn Env` living
+/// on [`Browser::enter`]'s own stack frame, and `frame`/`len` describe the
+/// engine's temporary-frame buffer. Neither ever leaves this module.
+///
+/// # What makes the round trip sound
+///
+/// One invariant, and it is structural rather than hoped for:
+///
+/// > An activation is reachable **exactly for the dynamic extent of the
+/// > `jit_enter` import call that pushed it**, during which the `&mut dyn Env`
+/// > and the `&mut [u8]` it describes are alive, unaliased and untouched by
+/// > the frame that owns them.
+///
+/// Every clause is upheld here rather than by the embedder:
+///
+/// * *Reachable exactly for that extent* — [`Browser::enter`] pushes before
+///   the call and an [`Activation`]-popping guard drops after it, on every
+///   path out including a panic.
+/// * *Alive* — both are locals of that same frame, which is blocked in the
+///   import call for the whole time.
+/// * *Unaliased and untouched* — `enter` derives a raw pointer from each and
+///   then does not name the reference again, so the `&mut` the export
+///   reconstitutes is the only live one. A reborrow through a raw pointer
+///   derived from the original is exactly the shape this is allowed in.
+/// * *This thread's* — the stack is a `thread_local!`, so an activation is
+///   never visible to a hart running on another worker. That is also why it is
+///   not a `core::sync::Global`: a lock would be taken on every guest memory
+///   access made from compiled code, and two harts on two workers would
+///   contend for a table neither can see the other's half of.
+///
+/// Re-entrancy is bounded by construction: a generated module never calls
+/// `jit_enter`, so an activation is never nested inside its own, and the four
+/// imports create their `&mut` inside one export call and drop it before
+/// returning. At most one exists at any instant.
+#[cfg(feature = "jit-wasm")]
+#[derive(Clone, Copy, Debug)]
+struct Activation {
+    /// The token this activation answers to. Never zero.
+    ctx: u32,
+    /// `*mut &mut dyn Env` as an integer: a thin pointer to the fat one.
+    ///
+    /// Thin because `ctx` has to cross a wasm `i32` in the general case and
+    /// because a fat pointer in a `static` would need a lifetime it does not
+    /// have. Pointing at the reference rather than at the `Env` keeps the
+    /// vtable with it and keeps this type free of generics.
+    env: usize,
+    /// The temporary frame's address in this module's linear memory.
+    frame: usize,
+    /// How many bytes of frame there are.
+    len: usize,
+}
+
+// The activation stack, per thread. Depth is one in practice: a generated
+// module never calls `jit_enter`, so the only way to nest one is a host that
+// re-enters rsemu from inside an import, which nothing does.
+#[cfg(feature = "jit-wasm")]
+std::thread_local! {
+    static ACTIVE: core::cell::RefCell<Vec<Activation>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The next token. Process-wide, so a token from one thread never names
+/// another thread's activation even by accident.
+///
+/// This and the three items after it are the *minting* half of the protocol,
+/// and nothing on a native host mints a token: a block is entered by
+/// `jit::wasm::exec` there, which needs no activation at all. So they are
+/// gated on the browser target **or `test`** — the tests are what exercise
+/// them everywhere else, and they are the reason the invariant is checkable
+/// on a runner that has no browser. The *checking* half below
+/// ([`jit_dispatch`] and the four exports) is not gated, because a token that
+/// names nothing has to be refused wherever somebody calls in with one.
+#[cfg(all(
+    feature = "jit-wasm",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+static NEXT_CTX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// Make `env` and `mem` reachable by token for the duration of `enter`.
+///
+/// The whole of the pointer discipline [`Activation`] documents, in one place
+/// so that the browser's `jit_enter` and the round-trip test below cannot
+/// implement it differently. `enter` is handed the token and the frame's wasm
+/// offset and is expected to do nothing but call into the module; everything
+/// it calls back reaches [`jit_dispatch`], which checks the token.
+#[cfg(all(
+    feature = "jit-wasm",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+fn with_activation<R>(
+    mem: &mut [u8],
+    env: &mut dyn crate::jit::wasm::Env,
+    enter: impl FnOnce(u32, u32) -> R,
+) -> R {
+    // Both references become raw addresses here and are not named again until
+    // `enter` returns — the clause of `Activation`'s invariant this function
+    // is responsible for, and the reason the reborrow in `jit_dispatch` is the
+    // only live `&mut` to either.
+    let mut env_ref: &mut dyn crate::jit::wasm::Env = env;
+    let env_at = (&raw mut env_ref) as usize;
+    let frame = mem.as_mut_ptr() as usize;
+    let len = mem.len();
+    let ctx = push_activation(env_at, frame, len);
+    let _pop = Pop(ctx);
+    // The frame's wasm offset *is* its address: a generated module imports
+    // rsemu's own exported memory, which is the arrangement that keeps guest
+    // RAM addressable by byte offset and the frame legal in a
+    // `SharedArrayBuffer` (CLAUDE.md, "Targets").
+    enter(ctx, frame as u32)
+}
+
+/// Pushes `env` and `frame` onto this thread's stack and returns its token.
+#[cfg(all(
+    feature = "jit-wasm",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+fn push_activation(env: usize, frame: usize, len: usize) -> u32 {
+    // Zero is "no activation", so skip it on the wrap. The counter wrapping at
+    // all needs 2^32 block entries in one process, and even then the worst a
+    // collision could do is name a *different live* activation — memory-safe,
+    // because every activation in the stack is valid by the invariant above.
+    let mut ctx = NEXT_CTX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if ctx == 0 {
+        ctx = NEXT_CTX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    ACTIVE.with_borrow_mut(|stack| {
+        stack.push(Activation {
+            ctx,
+            env,
+            frame,
+            len,
+        });
+    });
+    ctx
+}
+
+/// Pops the activation `ctx` names, whatever happened inside the call.
+#[cfg(all(
+    feature = "jit-wasm",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+struct Pop(u32);
+
+#[cfg(all(
+    feature = "jit-wasm",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+impl Drop for Pop {
+    fn drop(&mut self) {
+        ACTIVE.with_borrow_mut(|stack| {
+            if let Some(at) = stack.iter().rposition(|a| a.ctx == self.0) {
+                stack.remove(at);
+            }
+        });
+    }
+}
+
+/// Route one import call back into the [`Env`] that `ctx` names.
+///
+/// `args[0]` is `ctx` itself, because that is the first parameter generated
+/// code passes to every import (`jit::wasm::abi`) and `Thunks::call` reads its
+/// arguments at the positions the generated call site put them.
+#[cfg(feature = "jit-wasm")]
+fn jit_dispatch(ctx: u32, func: u32, args: &[i64]) -> i64 {
+    let Some(active) =
+        ACTIVE.with_borrow(|stack| stack.iter().rev().find(|a| a.ctx == ctx).copied())
+    else {
+        // A token naming no activation: a stale `ctx`, a forged one, or an
+        // import called after `jit_enter` returned. Not a panic and not a
+        // dereference — the block reports an error and the dispatcher
+        // interprets it.
+        return crate::jit::wasm::abi::status::ERROR;
+    };
+    // SAFETY: `active.env` is the address of a `&mut dyn Env` local to the
+    // `Browser::enter` frame that pushed this activation, and `active.frame`
+    // /`active.len` describe the `&mut [u8]` that frame was given. That frame
+    // is blocked inside the `jit_enter` import call for the whole time this
+    // activation is reachable (`Pop` removes it on every path out), so both
+    // are alive; it derived raw pointers from each and never names the
+    // references again, so these reborrows are the only live `&mut` to either;
+    // and the stack is thread-local, so no other thread can reach them. The
+    // two borrows do not overlap each other: the frame buffer is the engine's
+    // scratch memory and is not reachable from the `Env` except through the
+    // `mem` argument it is being passed as.
+    let (env, mem) = unsafe {
+        (
+            &mut *(active.env as *mut &mut dyn crate::jit::wasm::Env),
+            core::slice::from_raw_parts_mut(active.frame as *mut u8, active.len),
+        )
+    };
+    env.call(func, args, mem)
+}
+
+// The three imports a page supplies, and the whole of what the host does.
+//
+// `ROADMAP.md` §11.5's convention: module `rsemu`, no bundled JS runtime, the
+// embedder hands them in at instantiation. `web/src/jit.js` is the reference
+// implementation, and it has no semantics in it at all:
+//
+//   jit_compile(ptr, len) -> handle   `new WebAssembly.Module(bytes)`,
+//                                     instantiated; 0 if the engine refused
+//   jit_enter(handle, ctx, frame)     call that instance's `b` export
+//   jit_release(handle)               drop the instance, on eviction
+//
+// Declared only for `wasm32-unknown-unknown` because there is nothing to bind
+// them to anywhere else: WASI preview 1 and preview 2 have no interface for
+// compiling or instantiating a module, so a `wasm32-wasip1` build has no host
+// JIT and runs the reference executor. `docs/techniques/wasm-jit.md`, "What
+// WASI would need", is the long form.
+#[cfg(all(feature = "jit-wasm", target_arch = "wasm32", target_os = "unknown"))]
+#[link(wasm_import_module = "rsemu")]
+unsafe extern "C" {
+    fn jit_compile(ptr: *const u8, len: usize) -> u32;
+    fn jit_enter(handle: u32, ctx: u32, frame: u32) -> i64;
+    fn jit_release(handle: u32);
+}
+
+/// The embedder that hands modules to the page's `WebAssembly` engine.
+#[cfg(all(feature = "jit-wasm", target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Debug)]
+struct Browser;
+
+#[cfg(all(feature = "jit-wasm", target_arch = "wasm32", target_os = "unknown"))]
+impl crate::jit::wasm::Embedder for Browser {
+    fn compile(&self, module: &[u8]) -> u32 {
+        // SAFETY: the import is handed a pointer into this module's own linear
+        // memory and a length that matches it. `web/src/jit.js` reads exactly
+        // those bytes, synchronously, into a `WebAssembly.Module` and does not
+        // keep the pointer; `module` outlives the call because it is the
+        // engine's own resident module vector.
+        unsafe { jit_compile(module.as_ptr(), module.len()) }
+    }
+
+    fn enter(
+        &self,
+        handle: u32,
+        mem: &mut [u8],
+        env: &mut dyn crate::jit::wasm::Env,
+    ) -> Option<i64> {
+        let status = with_activation(mem, env, |ctx, frame| {
+            // SAFETY: `handle` came from this embedder's own `compile` and
+            // names a live instance until `release`; `ctx` names the
+            // activation `with_activation` pushed, which it removes before it
+            // returns. The import does nothing but call that instance's `b`
+            // export, whose only way back into Rust is the four exports below,
+            // each of which checks its token before it reconstitutes anything.
+            unsafe { jit_enter(handle, ctx, frame) }
+        });
+        // Negative is the host saying *this did not run* — a handle it has
+        // forgotten. Every [`status`] is non-negative, so the encoding is
+        // free, and the alternative for the page was throwing into a wasm
+        // frame, which traps and takes the emulator down rather than costing
+        // it one interpreted block.
+        (status >= 0).then_some(status)
+    }
+
+    fn release(&self, handle: u32) {
+        // SAFETY: `handle` is one this embedder's `compile` returned and which
+        // has not been released; the import drops the instance and returns.
+        unsafe { jit_release(handle) }
+    }
+}
+
+/// The installed browser embedder, as a `&'static`.
+#[cfg(all(feature = "jit-wasm", target_arch = "wasm32", target_os = "unknown"))]
+static BROWSER: Browser = Browser;
+
+/// Route the wasm JIT's generated modules through the page's engine.
+///
+/// Answers 1 if this build can do that and has now been told to, 0 otherwise —
+/// which is every build that is not `wasm32-unknown-unknown` with `jit-wasm`,
+/// including the demo the site ships. **Call it before booting**: an engine
+/// reads the installed embedder once, when it is built, so a machine already
+/// running keeps the reference executor.
+///
+/// Explicit rather than automatic because a page that calls this must also
+/// have supplied the three `rsemu.jit_*` imports, and a module that installed
+/// itself would fail at the first compiled block on a page that had not.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_jit_enable() -> u32 {
+    #[cfg(all(feature = "jit-wasm", target_arch = "wasm32", target_os = "unknown"))]
+    {
+        crate::jit::wasm::install(&BROWSER);
+        return 1;
+    }
+    #[cfg(not(all(feature = "jit-wasm", target_arch = "wasm32", target_os = "unknown")))]
+    0
+}
+
+/// `GET_SLOT`: `(ctx, slot) -> value`.
+#[cfg(feature = "jit-wasm")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_jit_slot(ctx: u32, slot: u32) -> i64 {
+    jit_dispatch(
+        ctx,
+        crate::jit::wasm::abi::func::SLOT,
+        &[i64::from(ctx), i64::from(slot)],
+    )
+}
+
+/// A guest load: `(ctx, memop, addr, at) -> answer`, the value in the frame.
+#[cfg(feature = "jit-wasm")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_jit_load(ctx: u32, memop: u32, addr: i64, at: u32) -> i32 {
+    jit_dispatch(
+        ctx,
+        crate::jit::wasm::abi::func::LOAD,
+        &[i64::from(ctx), i64::from(memop), addr, i64::from(at)],
+    ) as i32
+}
+
+/// A guest store: `(ctx, memop, addr, value, at) -> answer`.
+#[cfg(feature = "jit-wasm")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_jit_store(ctx: u32, memop: u32, addr: i64, value: i64, at: u32) -> i32 {
+    jit_dispatch(
+        ctx,
+        crate::jit::wasm::abi::func::STORE,
+        &[i64::from(ctx), i64::from(memop), addr, value, i64::from(at)],
+    ) as i32
+}
+
+/// A charge or a boundary: `(ctx, kind, arg) -> answer`.
+#[cfg(feature = "jit-wasm")]
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_jit_note(ctx: u32, kind: u32, arg: i64) -> i32 {
+    jit_dispatch(
+        ctx,
+        crate::jit::wasm::abi::func::NOTE,
+        &[i64::from(ctx), i64::from(kind), arg],
+    ) as i32
+}
+
+// ---------------------------------------------------------------------------
+// The guest the embedder is measured and compared on
+// ---------------------------------------------------------------------------
+//
+// Two questions need one guest, and neither can be answered from inside the
+// crate:
+//
+//   1. **Determinism.** `tests/riscv_virt_engines.rs` asserts one state hash
+//      across `interp`, `jit`, `jit-host` and `jit-wasm` — but only ever with
+//      `jit::wasm::exec` behind the last one, because a native test has no
+//      embedder. A browser run is a *fourth* execution of the same blocks and
+//      has to hash the same. `web/check.mjs` is where that is asserted, and
+//      this is what it calls.
+//   2. **Speed.** The whole reason §11.4 wants this backend is the multiplier
+//      a real engine gives over interpreting, and the only place to take it is
+//      in a browser.
+//
+// Both want the *same* guest run the *same* span under two engines, which is
+// why this is one function taking an engine rather than a benchmark and a test
+// that could drift apart. It is also callable from Rust, so the native numbers
+// in `docs/techniques/wasm-jit.md` are taken on this workload and not on a
+// different one.
+
+/// The guest: a seven-instruction RV64I loop with its scratch word on the page
+/// after its code.
+///
+/// Lifted from `cpu::riscv::engine`'s `FAR_LOOP`, and the separation matters:
+/// a loop that stores *into its own page* invalidates its block every pass, so
+/// nothing is ever chained, every pass re-lifts, and what gets measured is the
+/// lifter rather than the backend. `lui x7, 1` moves the scratch word to
+/// 0x1050 and the loop starts behaving like code — one block, compiled once,
+/// entered once per pass, which is exactly the shape an embedder's
+/// instantiation cost has to be amortised over.
+///
+/// Every instruction is in the lifted subset, so `jit-wasm` lowers the block
+/// to a module rather than refusing it — [`rsemu_jit_guest_stat`] answers with
+/// the counts that say so, because a benchmark of a backend that quietly
+/// refused everything would report the interpreter twice.
+#[cfg(all(feature = "jit-wasm", feature = "cpu-riscv-lift"))]
+const GUEST: [u32; 7] = [
+    0x0000_13b7, // lui   x7, 1        ; x7 = 0x1000, the next page
+    0x0000_0293, // addi  x5, x0, 0
+    0x0010_0313, // addi  x6, x0, 1
+    0x0062_82b3, // add   x5, x5, x6   ; the loop starts here
+    0x0453_b823, // sd    x5, 80(x7)
+    0x0503_be03, // ld    x28, 80(x7)
+    0xff5f_f06f, // jal   x0, -12
+];
+
+/// How much RAM the guest gets: two pages, code in the first, scratch in the
+/// second.
+#[cfg(all(feature = "jit-wasm", feature = "cpu-riscv-lift"))]
+const GUEST_RAM: u64 = 8192;
+
+/// What the last [`rsemu_jit_guest_run`] did, by the column indices
+/// [`rsemu_jit_guest_stat`] documents.
+///
+/// Atomics rather than a `Global<Stats>` because a `Global` wants a `const`
+/// initialiser and `Stats` grows a field whenever a backend learns to count
+/// something new; a fixed array of counters does not have to be rewritten each
+/// time.
+#[cfg(all(feature = "jit-wasm", feature = "cpu-riscv-lift"))]
+static GUEST_STATS: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Run the fixed RV64I guest for `quanta` budgets of `budget` ticks under
+/// `engine`, and
+/// answer with a hash of everything a guest can see afterwards.
+///
+/// `engine` is [`crate::cpu::riscv::Engine`]'s discriminant order: 0 `interp`,
+/// 1 `jit`, 2 `jit-host`, 3 `jit-wasm`. An engine this build does not have
+/// falls back to the portable backend, which is `Jit::new`'s own rule and not
+/// this function's — a machine file is portable and a measurement is never
+/// silently of something else.
+///
+/// The hash is FNV-1a over the thirty-two integer registers, the program
+/// counter, the cycle counter and `minstret`: the same columns
+/// `cpu::riscv::engine`'s `agree_built` compares one at a time, folded into one
+/// number because the thing on the other end of this is JavaScript. It is a
+/// comparison device and not a persisted format, so it is not
+/// `core::state`'s.
+#[cfg(all(feature = "jit-wasm", feature = "cpu-riscv-lift"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_jit_guest_run(engine: u32, quanta: u32, budget: u64) -> u64 {
+    use alloc::sync::Arc;
+
+    use crate::core::space::{AddressSpace, Perms, RamStore, Region};
+    use crate::cpu::riscv::{Config, Engine, Hart};
+
+    let engine = match engine {
+        1 => Engine::Jit,
+        2 => Engine::JitHost,
+        3 => Engine::JitWasm,
+        _ => Engine::Interp,
+    };
+
+    let ram = Arc::new(RamStore::new(GUEST_RAM));
+    for (i, word) in GUEST.iter().enumerate() {
+        for (j, byte) in word.to_le_bytes().iter().enumerate() {
+            ram.write_u8((i * 4 + j) as u64, *byte)
+                .expect("the program fits in the first page");
+        }
+    }
+    let space = AddressSpace::new("mem", 64);
+    space
+        .topology()
+        .map_with_perms(Region::ram("ram", ram), 0, Perms::RWX)
+        .expect("nothing else is mapped");
+    let hart = Hart::new(Config::rv64gc().with_reset_vector(0)).with_engine(engine);
+    hart.attach_space(Arc::new(space));
+
+    for _ in 0..quanta {
+        hart.run_budget(budget);
+    }
+
+    let s = hart.jit_stats().unwrap_or_default();
+    for (cell, value) in GUEST_STATS.iter().zip([
+        s.blocks,
+        s.compiled,
+        s.translated,
+        s.wasm_instantiated,
+        s.wasm_embedded,
+        s.retired,
+        s.interpreted,
+        // The one column every engine fills, because it is architectural and
+        // not a statistic: `interp` has no `Jit` at all, so a rate computed
+        // from `retired` would divide by zero for the very engine the others
+        // are measured against.
+        hart.instret(),
+    ]) {
+        cell.store(value, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // FNV-1a over the architectural columns, in a fixed order.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut fold = |v: u64| {
+        for byte in v.to_le_bytes() {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for n in 0..32 {
+        fold(hart.x(n));
+    }
+    fold(hart.pc());
+    fold(hart.cycles());
+    fold(hart.instret());
+    h
+}
+
+/// What the last [`rsemu_jit_guest_run`] counted, by column.
+///
+/// The gate `web/check.mjs` needs and a hash cannot give: a run whose
+/// `compiled` is zero produced the same hash as the interpreter because it
+/// *was* the interpreter, and a benchmark of that would be a benchmark of
+/// nothing. Column 4 is the one this work is about — blocks entered in a
+/// module the page's own engine compiled.
+///
+/// 0 blocks, 1 compiled, 2 translated, 3 instantiated, 4 embedded,
+/// 5 retired, 6 interpreted, 7 `minstret`. Anything else is 0.
+#[cfg(all(feature = "jit-wasm", feature = "cpu-riscv-lift"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_jit_guest_stat(column: u32) -> u64 {
+    GUEST_STATS
+        .get(column as usize)
+        .map_or(0, |c| c.load(core::sync::atomic::Ordering::Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // The wasm JIT's import round trip
+    // -----------------------------------------------------------------------
+    //
+    // The browser half of this is `unsafe` — a token minted here, handed to a
+    // wasm module, passed back through four exports, and turned into a `&mut
+    // dyn Env` and a `&mut [u8]`. The *engine* behind it is the only part that
+    // needs a browser, so the round trip is checked here on whatever host is
+    // running the suite: the closure below stands in for a generated module
+    // and calls the exports exactly as its imports do.
+    //
+    // What that leaves for `web/check.mjs` is the one thing it cannot do: a
+    // real `WebAssembly.Module`, compiled by a real engine, making the same
+    // calls.
+
+    #[cfg(feature = "jit-wasm")]
+    #[derive(Debug, Default)]
+    struct Recording {
+        calls: Vec<(u32, Vec<i64>)>,
+        frame_len: usize,
+    }
+
+    #[cfg(feature = "jit-wasm")]
+    impl crate::jit::wasm::Env for Recording {
+        fn call(&mut self, func: u32, args: &[i64], mem: &mut [u8]) -> i64 {
+            self.calls.push((func, args.to_vec()));
+            self.frame_len = mem.len();
+            // Write where a load's value goes, so the caller can prove this is
+            // the *engine's* frame and not a copy of it.
+            mem[..8].copy_from_slice(&0xfeed_face_u64.to_le_bytes());
+            0
+        }
+    }
+
+    #[cfg(feature = "jit-wasm")]
+    #[test]
+    fn an_import_reaches_the_env_its_token_names() {
+        use crate::jit::wasm::abi::func;
+
+        let mut frame = alloc::vec![0u8; 64];
+        let mut env = Recording::default();
+        let ctx_seen = with_activation(&mut frame, &mut env, |ctx, frame_at| {
+            // Standing in for a generated module: the four imports, with the
+            // argument positions `jit::wasm::compile` emits.
+            assert_ne!(ctx, 0, "zero is reserved for `no activation`");
+            assert_ne!(frame_at, 0, "the frame has an address in linear memory");
+            rsemu_jit_slot(ctx, 3);
+            rsemu_jit_load(ctx, 1, 0x2000, 4);
+            rsemu_jit_store(ctx, 2, 0x2008, 0x55, 5);
+            rsemu_jit_note(ctx, 0, 9);
+            ctx
+        });
+
+        assert_eq!(env.calls.len(), 4, "every import reached the env");
+        assert_eq!(env.frame_len, 64, "and saw the engine's own frame");
+        let want = [
+            (func::SLOT, alloc::vec![i64::from(ctx_seen), 3]),
+            (func::LOAD, alloc::vec![i64::from(ctx_seen), 1, 0x2000, 4]),
+            (
+                func::STORE,
+                alloc::vec![i64::from(ctx_seen), 2, 0x2008, 0x55, 5],
+            ),
+            (func::NOTE, alloc::vec![i64::from(ctx_seen), 0, 9]),
+        ];
+        assert_eq!(env.calls, want, "import index and argument positions");
+        // The frame the exports wrote into is the caller's buffer, which is
+        // the whole reason `$frame` crosses as an address rather than a copy.
+        assert_eq!(
+            u64::from_le_bytes(frame[..8].try_into().expect("eight bytes")),
+            0xfeed_face,
+        );
+    }
+
+    #[cfg(feature = "jit-wasm")]
+    #[test]
+    fn a_token_naming_no_activation_is_refused_rather_than_dereferenced() {
+        use crate::jit::wasm::abi::status;
+
+        // A stale token: one that named an activation which has since been
+        // popped. This is the case a *pointer* would have made unsound, and it
+        // is why `docs/techniques/wasm-jit.md`'s "ctx becomes a real pointer"
+        // is the one thing the built embedder does differently.
+        let mut frame = alloc::vec![0u8; 64];
+        let mut env = Recording::default();
+        let stale = with_activation(&mut frame, &mut env, |ctx, _| ctx);
+        assert_eq!(i64::from(rsemu_jit_load(stale, 0, 0, 0)), status::ERROR);
+        assert_eq!(i64::from(rsemu_jit_note(stale, 0, 0)), status::ERROR);
+        assert_eq!(rsemu_jit_slot(stale, 0), status::ERROR);
+
+        // And a token nothing ever minted, which is what a hostile page has.
+        assert_eq!(rsemu_jit_slot(0, 0), status::ERROR);
+        assert_eq!(rsemu_jit_slot(u32::MAX, 0), status::ERROR);
+        assert_eq!(env.calls.len(), 0, "none of it reached an env");
+    }
+
+    #[test]
+    fn enabling_the_host_jit_answers_for_this_build() {
+        // 1 only where there is something to enable: `wasm32-unknown-unknown`
+        // with `jit-wasm`. Everywhere else — the demo the site ships, every
+        // native build, both WASI targets — the answer is 0 and the reference
+        // executor stays, which is what `docs/techniques/wasm-jit.md`'s "What
+        // WASI would need" says and what a page has to be able to ask.
+        let want = u32::from(cfg!(all(
+            feature = "jit-wasm",
+            target_arch = "wasm32",
+            target_os = "unknown"
+        )));
+        assert_eq!(rsemu_jit_enable(), want);
+    }
+
+    #[cfg(all(feature = "jit-wasm", feature = "cpu-riscv-lift"))]
+    #[test]
+    fn the_measured_guest_hashes_the_same_under_every_engine_this_build_has() {
+        // The native half of what `web/check.mjs` asserts in a browser. There
+        // the fourth engine is V8 running a module it compiled; here it is
+        // `jit::wasm::exec` running the same module. Same blocks, same hash —
+        // and the counts below are what says the wasm backend was reached at
+        // all, because a hash that matched because nothing compiled would be
+        // the interpreter agreeing with itself.
+        let interp = rsemu_jit_guest_run(0, 16, 1000);
+        let jit = rsemu_jit_guest_run(1, 16, 1000);
+        let wasm = rsemu_jit_guest_run(3, 16, 1000);
+        assert_eq!(interp, jit, "the portable backend");
+        assert_eq!(interp, wasm, "the wasm backend");
+        assert!(rsemu_jit_guest_stat(1) > 0, "blocks ran compiled");
+        assert_eq!(
+            rsemu_jit_guest_stat(4),
+            0,
+            "and on a host with no embedder, none of them in a host module"
+        );
+    }
 
     /// Serialises the tests that boot a machine through the ABI.
     ///
