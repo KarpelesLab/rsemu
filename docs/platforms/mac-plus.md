@@ -495,13 +495,25 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
    memory, or the parameter RAM the clock chip hands back) is what picks the
    400K path.
 
-   The honest alternative, if that turns out to be a dead end, is to make the
-   cylinder the right *length*: a real 800K track at 500 kbit/s and 394 rpm
-   holds 76,142 bit cells and ours holds 74,232, the difference being trailing
-   gap a real formatter leaves and this encoder does not. Padding each zone to
-   its documented length would make the rotation rate come out right by
-   construction rather than by a tachometer fudge, which is the model this
-   board should have either way.
+   The alternative, if that turns out to be a dead end, is to make the cylinder
+   the right *length*. A cylinder here is exactly as long as the sectors on it
+   — `src/dev/mac/gcr.rs` lays down twelve sectors of 6,186 bit cells and
+   stops — with no trailing gap before sector 0 comes round again, which a real
+   formatter leaves. So this disk's revolution is 74,232 cells and its rotation
+   rate is whatever that works out at against the bit clock, rather than the
+   drive's actual speed.
+
+   **Doing that needs a source this board does not yet have.** The zone
+   rotation speeds for an Apple 800K mechanism are quoted in various places as
+   394, 429, 472, 525 and 590 rpm, and at 500 kbit/s those give revolutions of
+   76,142 / 69,930 / 63,559 / 57,143 / 50,847 cells — each about 2.5 % longer
+   than what this encoder produces, which is a suspiciously consistent gap and
+   is the right shape for an answer. But chapter 9 of the *Guide* does not give
+   those figures and neither does Apple's IWM note, and writing a table of five
+   numbers into `gcr.rs` on the strength of recollection is **exactly** the
+   mistake that cost this board the drive's register file. Find the figures in
+   a document first. Until then the tachometer reports the rotation the model
+   actually has, which is at least not a lie.
 2. **The mouse.** Now buildable: a carrier-detect transition no longer locks
    the machine up, `MTemp` at `$828` moves on both axes — `(15,15)` to
    `(15,14)` for channel A and to `(16,15)` for channel B — and the machine
