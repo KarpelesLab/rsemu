@@ -732,7 +732,7 @@ fn an_oam_transfer_copies_a_page_over_160_machine_cycles() {
         .topology()
         .map(Region::ram("ram", ram), 0)
         .expect("maps");
-    ppu.attach_space(space);
+    ppu.attach_space(&space);
 
     ppu.write_register(0x06, 0xc0);
     assert_eq!(ppu.read_register(0x06), 0xc0, "the register reads back");
@@ -778,7 +778,7 @@ fn object_memory_is_blocked_for_the_transfers_hundred_and_sixty_cycles() {
         .topology()
         .map(Region::ram("ram", ram), 0)
         .expect("maps");
-    ppu.attach_space(space);
+    ppu.attach_space(&space);
     let oam = Device::region(&ppu, super::ppu::OAM_REGION).expect("the region");
     let oam = io(&oam);
     let read = || {
@@ -820,7 +820,7 @@ fn restarting_a_transfer_leaves_no_readable_cycle_in_between() {
         .topology()
         .map(Region::ram("ram", ram), 0)
         .expect("maps");
-    ppu.attach_space(space);
+    ppu.attach_space(&space);
     let oam = Device::region(&ppu, super::ppu::OAM_REGION).expect("the region");
     let oam = io(&oam);
     let read = || {
@@ -1225,7 +1225,7 @@ fn a_transfer_from_above_dfff_reads_work_ram() {
         .topology()
         .map(Region::ram("wram", ram), 0xc000)
         .expect("maps");
-    ppu.attach_space(space);
+    ppu.attach_space(&space);
 
     // Page $FE, which is $DE with the fifteenth bit decoded away.
     ppu.write_register(0x00, 0); // LCD off, so only the transfer blocks
@@ -1273,4 +1273,48 @@ fn switching_the_lcd_on_lands_part_way_into_a_scan_that_reports_mode_zero() {
     // Every line after it is normal again.
     ppu.advance_by(ppu::MODE_VISIBLE_LAG);
     assert_eq!(read_mode(&ppu), Mode::OamScan.bits());
+}
+
+/// The cycle `virtio.mmio` was found to have, in the shape the PPU had it.
+///
+/// A cycle is invisible to `Drop` — nothing runs, which is the defect — but it
+/// is exactly visible as a `Weak` that still upgrades after the last strong
+/// handle is gone. Both halves have to be present for the loop to close, so
+/// the fixture builds both, as `machines/gameboy.machine` does: the PPU's
+/// three apertures in `cpubus`, and `cpubus` in the PPU's `Shared`.
+#[test]
+fn the_ppu_does_not_keep_the_bus_it_masters_alive() {
+    use crate::core::space::AddressSpace;
+
+    let ppu = GbPpu::new();
+    let space = Arc::new(AddressSpace::new("cpubus", 16));
+    {
+        let mut topo = space.topology();
+        topo.map(ppu.region("vram").expect("vram"), 0x8000)
+            .expect("vram maps");
+        topo.map(ppu.region("oam").expect("oam"), 0xfe00)
+            .expect("oam maps");
+        topo.map(ppu.region("regs").expect("regs"), 0xff40)
+            .expect("the registers map");
+    }
+    ppu.attach_space(&space);
+    // The board is what owns the bus; the PPU holds it only to run an OAM DMA
+    // through it.
+    assert_eq!(
+        Arc::strong_count(&space),
+        1,
+        "the PPU holds the bus it masters strongly"
+    );
+
+    let watch = Arc::downgrade(&space);
+    drop(space);
+    assert!(
+        watch.upgrade().is_none(),
+        "the address space outlived its last owner"
+    );
+    // And the PPU is still a PPU: a bus that has gone reads as an undriven one
+    // rather than panicking.
+    ppu.write_register(0x06, 0xc0);
+    ppu.advance_by(4 + 160 * 4);
+    assert_eq!(ppu.peek_oam(0), 0xff, "an undriven bus is all ones");
 }

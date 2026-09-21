@@ -98,7 +98,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -1047,7 +1047,19 @@ struct Shared {
     lazy: Mutex<Option<LazyHandle>>,
     /// The CPU's address space, for OAM DMA. A DMA reads through the *bus*, not
     /// through some private port, which is why this device is an initiator.
-    space: Mutex<Option<Arc<AddressSpace>>>,
+    ///
+    /// **Weak.** VRAM, OAM and the LCD registers are all mapped into that same
+    /// space (`machines/gameboy.machine` maps `ppu.vram`, `ppu.oam` and
+    /// `ppu.regs` into `cpubus`), so a strong handle closes a reference cycle
+    /// three times over: the space owns each mapping, each mapping owns
+    /// [`VideoRam`], [`ObjectRam`] or [`LcdPort`] as its [`MemOps`], those own
+    /// this `Shared`, and `Shared` would own the space. Nothing in this tree
+    /// breaks such a cycle — there is no unbind — so the whole console
+    /// outlives the machine that was torn down. `virtio.mmio` had the same
+    /// defect and its fuzz target measured it at 6.5 MB an iteration under
+    /// LeakSanitizer; `CLAUDE.md` states the rule for the analogous case, that
+    /// a wire's sinks are weak refs.
+    space: Mutex<Option<Weak<AddressSpace>>>,
     /// [`Engine::dots`], republished on every release of the engine lock.
     dots: AtomicU64,
     /// The tick of this device's own next event, republished alongside.
@@ -1199,8 +1211,12 @@ impl GbPpu {
     }
 
     /// Connect the CPU's address space, which an OAM DMA reads through.
-    pub fn attach_space(&self, space: Arc<AddressSpace>) {
-        *self.shared.space.lock() = Some(space);
+    ///
+    /// The reference is **weak**: VRAM, OAM and the registers are mapped into
+    /// that same space, so holding it strongly would be a cycle that leaks the
+    /// whole machine. See the `space` field on this device's shared state.
+    pub fn attach_space(&self, space: &Arc<AddressSpace>) {
+        *self.shared.space.lock() = Some(Arc::downgrade(space));
     }
 
     /// Connect the vertical-blank request line.
@@ -1367,7 +1383,12 @@ impl GbPpu {
             let first = DMA_BYTES - engine.dma_remaining;
             (engine.dma_page, first, count)
         };
+        // Upgraded once per batch of DMA byte-cycles rather than once per
+        // byte, and held across it: the machine that owns the bus cannot go
+        // away mid-transfer. A PPU that outlived its bus reads `0xff`, which
+        // is what an undriven bus gives anyway.
         let space = self.shared.space.lock().clone();
+        let space = space.as_ref().and_then(Weak::upgrade);
         let attrs = MemAttrs::DEFAULT
             .with_requester(RequesterId(self.shared.requester.load(Ordering::Relaxed)));
         let mut out = Vec::with_capacity(count as usize);
@@ -1783,7 +1804,7 @@ impl crate::machine::Instance for GbPpu {
                  add `space = cpubus` to the object",
             ),
         })?;
-        self.attach_space(Arc::clone(space));
+        self.attach_space(space);
         self.shared
             .requester
             .store(ctx.requester().0, Ordering::Relaxed);
