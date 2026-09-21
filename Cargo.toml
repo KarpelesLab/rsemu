@@ -2228,6 +2228,23 @@ dev-ata-atapi = ["dev-ata-disk", "dev-disc"]
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-scsi = ["dev-medium"]
 
+# A Western Digital WD33C93A SCSI Bus Interface Controller (src/dev/wd33c93.rs):
+# the initiator half. Two host addresses and twenty-six registers behind an
+# auto-incrementing Address register, the Auxiliary Status and SCSI Status
+# registers with the whole interrupt code table of datasheet §6.2.19, and three
+# levels of command: the Level I signal commands (Reset, Abort, Assert ATN,
+# Negate ACK, Disconnect, Set IDI), the simple Level II ones (Select with and
+# without ATN, Transfer Info) where the host walks the phases itself, and the
+# combination Select-And-Transfer, where the chip's own microprocessor runs the
+# entire SCSI operation and raises one interrupt, updating the Command Phase
+# register at each step so a termination says where it stopped. Both data paths:
+# polled I/O through the Data register with DBR in Auxiliary Status, and a
+# `DmaPort` seam a board's DMA controller fills in. Target-role commands answer
+# the invalid-command interrupt -- this chip is an initiator. Written from
+# Western Digital's WD33C93A data sheet and application notes (November 1990),
+# cited by section. `no_std + alloc`, no `unsafe`, no dependencies.
+dev-wd33c93 = ["dev-scsi"]
+
 # Entering a Linux/x86 kernel with no firmware in between (src/dev/linuxboot.rs):
 # the Linux/x86 boot protocol as a device. It parses a `bzImage`'s setup header,
 # writes the protected-mode kernel to its own `code32_start`, builds the zero

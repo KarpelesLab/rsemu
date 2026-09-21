@@ -264,6 +264,17 @@ impl ExportId {
     /// classes, which is what `Opaque` is for.
     pub const CD_DRIVE: ExportId = ExportId(10);
 
+    /// A SCSI bus interface controller as the board around it sees it: the
+    /// two register addresses, the interrupt line, and somewhere to attach a
+    /// DMA port. Transported as [`Export::Opaque`].
+    ///
+    /// `wd.33c93` publishes it and `amiga.sdmac` holds it. The controller's
+    /// registers are *inside* the DMA controller's address space on an A3000
+    /// (A3000+ System Specification, Table 2-5), so the two parts have to meet
+    /// as objects rather than as a map statement, and the handle's type is a
+    /// contract between those two classes — which is what `Opaque` is for.
+    pub const SCSI_CONTROLLER: ExportId = ExportId(11);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -281,6 +292,7 @@ impl ExportId {
             ExportId::AMIGA_VIDEO => Some("Amiga video line input"),
             ExportId::CHIP_DMA => Some("chip-RAM DMA"),
             ExportId::CD_DRIVE => Some("CD-ROM drive"),
+            ExportId::SCSI_CONTROLLER => Some("SCSI bus interface controller"),
             _ => None,
         }
     }
