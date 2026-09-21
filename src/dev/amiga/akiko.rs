@@ -900,6 +900,10 @@ impl Instance for Akiko {
         let Some(path) = self.drive_path.as_deref() else {
             return Ok(());
         };
+        // A build with no `amiga.cd` in it has nothing to bind the name to, and
+        // the property is still legal — the drive is simply absent.
+        #[cfg(not(feature = "dev-amiga-cdrom"))]
+        let _ = path;
         #[cfg(feature = "dev-amiga-cdrom")]
         {
             use crate::core::device::ExportId;
