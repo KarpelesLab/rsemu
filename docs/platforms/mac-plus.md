@@ -415,6 +415,7 @@ stated plainly.
 rsemu run mac-plus --media macrom=Mac-Plus.ROM
 rsemu run mac-plus -p ram=4M --media macrom=Mac-Plus.ROM
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --vnc :5900
+rsemu run mac-plus --media macrom=Mac-Plus.ROM --for 15s --screenshot boot.png
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
 rsemu run mac-plus --media macrom=Mac-Plus.ROM -p rtcdate=1986-01-16T09:00:00
 ```
