@@ -57,7 +57,7 @@ the question never arises.
 ### Machines
 | | |
 | --- | --- |
-| [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500, 500+, 600, **1200** and **CD32**: the memory map, the `OVL` overlay, the custom-chip register seam, the two CIAs, Paula's interrupts, disk, UART and audio, the floppy drive, the keyboard protocol and the mouse counters, ADF disks and their MFM tracks, Gayle and its IDE port, the Enhanced Chip Set, the **AA chip set** (Alice and Lisa), **Akiko** (the chunky-to-planar corner turn, the CD-ROM controller's registers and the EEPROM's two wires) with the CD-ROM drive and the joypad beside it, and what each document leaves open |
+| [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500, 500+, 600, **1200**, **CD32** and **3000**: the memory map, the `OVL` overlay, the custom-chip register seam, the two CIAs, Paula's interrupts, disk, UART and audio, the floppy drive, the keyboard protocol and the mouse counters, ADF disks and their MFM tracks, Gayle and its IDE port, the Enhanced Chip Set, the **AA chip set** (Alice and Lisa), **Akiko** (the chunky-to-planar corner turn, the CD-ROM controller's registers and the EEPROM's two wires) with the CD-ROM drive and the joypad beside it, the A3000's **SCSI port** — a bus, a `scsi.disk` target, a **WD33C93A** and Commodore's **Super DMAC** — and **Ramsey**, and what each document leaves open |
 | [`platforms/apple1.md`](platforms/apple1.md) | Apple 1: the MC6821, the clock, and the monitor-ROM licence question |
 | [`platforms/nes.md`](platforms/nes.md) | NES / Famicom |
 | [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |
