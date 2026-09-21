@@ -126,6 +126,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -134,12 +135,14 @@ use super::disk::{
     put_string,
 };
 use super::{AtaDevice, Phase, Registers, Taskfile, TaskfileDevice};
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source as _};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::dev::disc::{self, Disc};
 use crate::dev::medium::{self, Medium, Snapshot};
 use crate::machine::realize::Instance;
@@ -529,18 +532,35 @@ pub struct AtapiDrive {
     id: Identity,
     position: Position,
     /// The disc, if there is one in the drive. `None` is an empty tray.
-    disc: Option<Disc>,
+    ///
+    /// Behind a lock because the tray can be opened while the machine runs:
+    /// `dev::medium::Removable` is the door and the monitor console's
+    /// `insert` and `eject` are what knock on it.
+    disc: Mutex<Option<Disc>>,
     /// How many [`BLOCK`]-byte logical blocks the disc holds.
-    blocks: u64,
+    ///
+    /// An atomic and not a field of [`Volatile`] because it is a property of
+    /// the *disc* rather than of the protocol — a reset does not change it
+    /// and a swap does — and because `READ CAPACITY` and every bounds check
+    /// want it without taking the tray.
+    blocks: AtomicU64,
     state: Mutex<Volatile>,
 }
+
+/// Where the tray's lock sits in the ranked order.
+///
+/// Below [`LockRank::DEVICE`], because a command reads the disc with the
+/// drive's own state already held — `Origin::Disc` does exactly that — and
+/// nothing at all is taken while the tray is. [`LockRank::LEAF`] would do;
+/// a rank of its own says which leaf it is when the checker names one.
+pub const TRAY_RANK: LockRank = LockRank::new(0x5800);
 
 impl fmt::Debug for AtapiDrive {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AtapiDrive")
             .field("position", &self.position)
-            .field("blocks", &self.blocks)
-            .field("disc", &self.disc)
+            .field("blocks", &self.blocks.load(Ordering::Relaxed))
+            .field("disc", &self.disc.try_lock().map(|d| d.is_some()))
             .finish_non_exhaustive()
     }
 }
@@ -638,8 +658,8 @@ impl AtapiDrive {
         Ok(AtapiDrive {
             id,
             position,
-            disc,
-            blocks,
+            disc: Mutex::with_rank(TRAY_RANK, disc),
+            blocks: AtomicU64::new(blocks),
             state: Mutex::with_rank(LockRank::DEVICE, Volatile::power_on(position)),
         })
     }
@@ -659,18 +679,56 @@ impl AtapiDrive {
     /// How many 2048-byte logical blocks the disc holds; zero with no disc.
     #[must_use]
     pub fn blocks(&self) -> u64 {
-        self.blocks
+        self.blocks.load(Ordering::Relaxed)
     }
 
-    /// The disc, for a host that wants to look at it directly.
+    /// Whether there is a disc in the tray.
     #[must_use]
-    pub fn disc(&self) -> Option<&Disc> {
-        self.disc.as_ref()
+    pub fn has_disc(&self) -> bool {
+        self.disc.lock().is_some()
+    }
+
+    /// Put `disc` in the tray, or empty it, and raise the unit attention that
+    /// says so.
+    ///
+    /// The disc is opened **before** the tray is touched, so a medium that is
+    /// not a cooked image leaves the drive exactly as it was.
+    fn load_tray(&self, disc: Option<Arc<dyn Medium>>) -> Result<()> {
+        let disc = match disc {
+            None => None,
+            Some(medium) => Some(Disc::open_user_data(CLASS_NAME, medium)?),
+        };
+        let blocks = disc.as_ref().map_or(0, Disc::sectors);
+        {
+            let mut tray = self.disc.lock();
+            *tray = disc;
+            self.blocks.store(blocks, Ordering::Relaxed);
+        }
+        // The signal, and the tray lock is released before it is raised.
+        //
+        // SFF-8020i §9.3: a drive that has had its medium changed returns
+        // CHECK CONDITION with a UNIT ATTENTION sense key on the next command
+        // other than INQUIRY and REQUEST SENSE, and the additional sense is
+        // `28h 00h`, NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED. It
+        // is raised on the way *out* as well as on the way in: a guest whose
+        // filesystem is mounted has to be told the disc left, and 28h/00h is
+        // the condition SPC defines for a medium that may no longer be the
+        // one the guest was reading. `3Ah` follows it on every command that
+        // then needs a medium, which is where "empty tray" is said.
+        let mut state = self.state.lock();
+        state.attention = Some(Sense::new(sense_key::UNIT_ATTENTION, asc::MEDIUM_CHANGED));
+        Ok(())
+    }
+
+    /// The door a host changes the disc through.
+    #[must_use]
+    pub fn media(self: &Arc<Self>) -> medium::MediaPort {
+        medium::MediaPort::new(Arc::clone(self) as Arc<dyn medium::Removable>)
     }
 
     /// The storage the disc's bytes come from, for a snapshot.
-    fn medium(&self) -> Option<&Arc<dyn Medium>> {
-        self.disc.as_ref().map(Disc::medium)
+    fn medium(&self) -> Option<Arc<dyn Medium>> {
+        self.disc.lock().as_ref().map(|d| Arc::clone(d.medium()))
     }
 
     // -- the cable ---------------------------------------------------------
@@ -852,7 +910,7 @@ impl AtapiDrive {
             // turning it into a file offset is the disc's job, not this
             // drive's: a byte-count limit cuts a multi-block transfer wherever
             // it likes and nothing here has to know what a frame is.
-            Origin::Disc(base) => match &self.disc {
+            Origin::Disc(base) => match &*self.disc.lock() {
                 Some(disc) => disc.read_user_at(base + taken, &mut buf).is_ok(),
                 None => false,
             },
@@ -1031,7 +1089,7 @@ impl AtapiDrive {
         }
         match opcode {
             packet::TEST_UNIT_READY => {
-                if self.disc.is_none() {
+                if !self.has_disc() {
                     self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
                 } else {
                     state.sense = Sense::NONE;
@@ -1072,6 +1130,16 @@ impl AtapiDrive {
                     // the drive is the *host's* business, and a guest that
                     // could eject a disc the host cannot put back would be a
                     // worse model, not a better one.
+                    //
+                    // The host *can* put one back now — `dev::medium::
+                    // Removable` is that door, and `rsemu monitor`'s `insert`
+                    // knocks on it — so honouring `LoEj` here has become
+                    // possible rather than merely arguable. It is still not
+                    // done, and the reason has moved: a guest that ejects
+                    // during boot would take its own install medium away, and
+                    // nothing on this side can tell "the user asked" from "the
+                    // driver always does this". Wiring it up needs a policy
+                    // for that, which is a decision rather than a line.
                     self.good(state);
                 }
             }
@@ -1080,13 +1148,13 @@ impl AtapiDrive {
                 self.good(state);
             }
             packet::READ_CAPACITY => {
-                if self.disc.is_none() {
+                if !self.has_disc() {
                     self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
                     return;
                 }
                 let mut out = Vec::with_capacity(8);
                 // The address of the **last** block, not the count.
-                out.extend_from_slice(&((self.blocks - 1) as u32).to_be_bytes());
+                out.extend_from_slice(&((self.blocks() - 1) as u32).to_be_bytes());
                 out.extend_from_slice(&(BLOCK as u32).to_be_bytes());
                 self.data_in(state, out, 8);
             }
@@ -1101,12 +1169,12 @@ impl AtapiDrive {
                 self.read(state, lba, blocks);
             }
             packet::SEEK_10 => {
-                if self.disc.is_none() {
+                if !self.has_disc() {
                     self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
                     return;
                 }
                 let lba = u64::from(be32(&cdb[2..6]));
-                if lba >= self.blocks {
+                if lba >= self.blocks() {
                     self.check(state, sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE);
                 } else {
                     self.good(state);
@@ -1147,7 +1215,7 @@ impl AtapiDrive {
 
     /// `READ(10)` and `READ(12)`.
     fn read(&self, state: &mut Volatile, lba: u64, blocks: u64) {
-        if self.disc.is_none() {
+        if !self.has_disc() {
             self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
             return;
         }
@@ -1157,7 +1225,7 @@ impl AtapiDrive {
             self.good(state);
             return;
         }
-        if lba >= self.blocks || blocks > self.blocks - lba {
+        if lba >= self.blocks() || blocks > self.blocks() - lba {
             self.check(state, sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE);
             return;
         }
@@ -1214,14 +1282,14 @@ impl AtapiDrive {
     /// multi-session and raw sub-channel layouts that a single-track ISO image
     /// does not have, and are refused rather than invented.
     fn read_toc(&self, state: &mut Volatile, msf: bool, format: u8, start: u8, alloc_len: u64) {
-        if self.disc.is_none() {
+        if !self.has_disc() {
             self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
             return;
         }
         // The table of contents is synthesised by `dev::disc` — one data
         // track, and the lead-out at the block after the last — because that
         // is a fact about a bare disc image rather than about `READ TOC`.
-        let Some(toc) = self.disc.as_ref().map(Disc::toc) else {
+        let Some(toc) = self.disc.lock().as_ref().map(Disc::toc) else {
             self.check(state, sense_key::NOT_READY, asc::MEDIUM_NOT_PRESENT);
             return;
         };
@@ -1368,7 +1436,7 @@ impl AtapiDrive {
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         match self.medium() {
             None => w.write_bool(false)?,
-            Some(disc) => {
+            Some(ref disc) => {
                 w.write_bool(true)?;
                 match disc.snapshot() {
                     Snapshot::Capture => {
@@ -1445,7 +1513,7 @@ impl AtapiDrive {
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let had_disc = r.read_bool()?;
         match (self.medium(), had_disc) {
-            (Some(disc), true) => {
+            (Some(ref disc), true) => {
                 let bytes: &[u8] = r.read_bytes()?;
                 match disc.snapshot() {
                     Snapshot::Capture => {
@@ -2005,6 +2073,59 @@ impl CdromDevice {
     }
 }
 
+/// The one bay an ATAPI CD-ROM has.
+const BAY: &str = "tray";
+
+impl medium::Removable for AtapiDrive {
+    fn bays(&self) -> Vec<medium::MediaBay> {
+        let describe = self
+            .disc
+            .lock()
+            .as_ref()
+            .map(|d| (d.medium().describe(), d.sectors()));
+        vec![medium::MediaBay {
+            name: String::from(BAY),
+            summary: String::from("the disc tray"),
+            medium: describe.map(|(describe, sectors)| medium::MediumInfo {
+                describe: if describe.is_empty() {
+                    format!("a disc of {sectors} logical blocks, in memory")
+                } else {
+                    describe
+                },
+                capacity: sectors * BLOCK,
+                // A disc is read-only, whatever it is backed by. The command
+                // set has no write path here at all.
+                write_protected: true,
+            }),
+        }]
+    }
+
+    fn insert(&self, name: &str, disc: Arc<dyn Medium>, _write_protect: bool) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        // `write_protect` is ignored rather than refused: a disc is already
+        // write protected and a caller asking for that is asking for what it
+        // has.
+        self.load_tray(Some(disc))
+    }
+
+    fn eject(&self, name: &str) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        self.load_tray(None)
+    }
+}
+
+/// What this class says about a bay it does not have.
+fn no_such_bay(name: &str) -> Error {
+    Error::Config {
+        at: name.to_string(),
+        message: format!("{CLASS_NAME} has one bay, `{BAY}`"),
+    }
+}
+
 impl Device for CdromDevice {
     fn class(&self) -> &'static DeviceClass {
         &CLASS
@@ -2012,6 +2133,10 @@ impl Device for CdromDevice {
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
         Ok(())
+    }
+
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::REMOVABLE_MEDIA).then(|| self.drive.media().export())
     }
 
     fn reset(&self, _kind: ResetKind) {

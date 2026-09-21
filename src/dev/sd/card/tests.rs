@@ -806,3 +806,143 @@ fn two_cards_cannot_share_one_slot() {
     assert!(slot.eject().is_some());
     assert!(!slot.is_occupied());
 }
+
+// ---------------------------------------------------------------------------
+// the socket, opened from outside
+// ---------------------------------------------------------------------------
+
+/// A card device in a named socket of a build we can look into afterwards.
+fn socketed(
+    capacity: u64,
+) -> (
+    CardDevice,
+    alloc::sync::Arc<crate::core::hosts::HostObjects>,
+) {
+    let hosts = alloc::sync::Arc::new(crate::core::hosts::HostObjects::new());
+    let props = Props::new()
+        .with("size", Value::Size(capacity))
+        .with("high-capacity", Value::Bool(true))
+        .with("slot", Value::Str(String::from("sd0")))
+        .with_hosts(alloc::sync::Arc::clone(&hosts));
+    (CardDevice::new(&props).expect("a plausible card"), hosts)
+}
+
+/// Whether a controller looking in socket `sd0` would find anything.
+fn occupied(hosts: &crate::core::hosts::HostObjects) -> bool {
+    super::super::slots::get(hosts, "sd0")
+        .expect("no type collision")
+        .expect("it was opened")
+        .is_occupied()
+}
+
+#[test]
+fn a_card_comes_out_of_its_socket_and_goes_back_in() {
+    let (dev, hosts) = socketed(8 * 1024 * 1024);
+    let door = dev.media();
+
+    let bays = door.bays();
+    assert_eq!(bays.len(), 1);
+    assert_eq!(bays[0].name, "card");
+    let held = bays[0].medium.clone().expect("a card is in it");
+    assert_eq!(held.capacity, 8 * 1024 * 1024);
+    assert!(occupied(&hosts));
+
+    door.eject("card").expect("it comes out");
+    assert!(door.bays()[0].medium.is_none(), "the socket reads empty");
+    // The interface's own "no card" answer: a controller finds nothing in the
+    // socket, which is what every empty socket in this tree does.
+    assert!(!occupied(&hosts));
+
+    door.insert("card", medium::from_bytes(&[0xa5; 4096]), false)
+        .expect("it goes back in");
+    assert!(occupied(&hosts));
+    assert!(door.bays()[0].medium.is_some());
+
+    // And a bay this class does not have is named rather than ignored.
+    let e = door
+        .insert("tray", medium::from_bytes(&[0u8; 512]), false)
+        .expect_err("a card socket is not a tray");
+    assert!(alloc::format!("{e}").contains("card"), "{e}");
+}
+
+#[test]
+fn a_swap_puts_the_card_back_in_the_idle_state() {
+    // A card has no change line of its own. What a real hot swap does instead
+    // is exactly this: the new card is in the idle phase, the RCA the host
+    // published is gone, and nothing addressed to the old one answers until
+    // CMD0 and ACMD41 have run again.
+    let (dev, _hosts) = socketed(8 * 1024 * 1024);
+    bring_up(dev.card());
+    let rca = dev.card().rca();
+    assert_ne!(rca, 0, "the host published an address");
+    assert_ne!(dev.card().phase(), Phase::Idle);
+
+    dev.media()
+        .insert("card", medium::from_bytes(&[0x5a; 8192]), false)
+        .expect("a different card");
+    assert_eq!(
+        dev.card().phase(),
+        Phase::Idle,
+        "the guest has to start over"
+    );
+    assert_eq!(dev.card().rca(), 0, "and its old address is gone");
+
+    // The contents are the new card's, all the way to the end: whatever the
+    // last one had past the image is zero rather than showing through.
+    let mut got = [0u8; 512];
+    dev.card().read_media(0, &mut got).expect("inside");
+    assert_eq!(got, [0x5a; 512]);
+    let mut tail = [0u8; 512];
+    dev.card()
+        .read_media(8 * 1024 * 1024 - 512, &mut tail)
+        .expect("inside");
+    assert_eq!(tail, [0u8; 512], "and the rest is a fresh card");
+}
+
+#[test]
+fn an_image_bigger_than_the_card_is_refused_by_name() {
+    let (dev, _hosts) = socketed(8 * 1024 * 1024);
+    let e = dev
+        .media()
+        .insert("card", medium::from_bytes(&[0u8; 9 * 1024 * 1024]), false)
+        .expect_err("it does not fit");
+    assert!(alloc::format!("{e}").contains("8388608"), "{e}");
+}
+
+#[test]
+fn a_write_protect_tab_is_refused_rather_than_pretended() {
+    // The notch is a switch on the socket, not a thing the card knows about,
+    // and a model that quietly ignored the request would make a guest's
+    // successful write look as though it had been protected.
+    let (dev, _hosts) = socketed(8 * 1024 * 1024);
+    let e = dev
+        .media()
+        .insert("card", medium::from_bytes(&[0u8; 512]), true)
+        .expect_err("no tab");
+    assert!(alloc::format!("{e}").contains("write-protect"), "{e}");
+}
+
+#[test]
+fn a_snapshot_round_trips_with_a_card_in_the_socket_and_without_one() {
+    for present in [true, false] {
+        let (saved, hosts) = socketed(8 * 1024 * 1024);
+        saved
+            .media()
+            .insert("card", medium::from_bytes(&[0x33; 2048]), false)
+            .expect("it goes in");
+        if !present {
+            saved.media().eject("card").expect("it comes out");
+        }
+        let bytes = snapshot(&saved);
+        assert_eq!(occupied(&hosts), present);
+
+        let (restored, into) = socketed(8 * 1024 * 1024);
+        restore(&restored, &bytes);
+        assert_eq!(snapshot(&restored), bytes, "identical state");
+        assert_eq!(
+            occupied(&into),
+            present,
+            "and whether the socket is filled came back with it"
+        );
+    }
+}

@@ -93,10 +93,13 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
+};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
@@ -104,6 +107,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{DmaPeripheral, Level, WireSource};
+use crate::dev::medium::{self, Medium};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -523,6 +527,13 @@ struct State {
     image: Vec<u8>,
     geom: Geometry,
     readonly: bool,
+    /// One line naming what is in the drive, for a host that lists it.
+    ///
+    /// Host state beside the image and not serialized for the same reason: a
+    /// snapshot restores against whatever diskette the host has in the drive
+    /// then, so a label carried in the chunk would be describing a different
+    /// disk.
+    label: String,
 }
 
 impl fmt::Debug for State {
@@ -546,7 +557,7 @@ impl fmt::Debug for State {
 }
 
 impl State {
-    fn new(image: Vec<u8>, geom: Geometry, readonly: bool) -> State {
+    fn new(image: Vec<u8>, geom: Geometry, readonly: bool, label: String) -> State {
         State {
             phase: Phase::Idle,
             command: 0,
@@ -576,6 +587,7 @@ impl State {
             image,
             geom,
             readonly,
+            label,
         }
     }
 
@@ -1394,6 +1406,110 @@ impl DmaPeripheral for Registers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the door
+// ---------------------------------------------------------------------------
+
+/// The only bay this class has.
+///
+/// The 82077AA decodes four drive units and this model gives a medium to unit
+/// 0 alone ([`State::medium`]): a second physical drive is a second `pc.fdc`
+/// instance with its own `drive = "fd1"`, which is how the machine files in
+/// this tree already spell it. So the bay is named for the unit rather than
+/// for the controller, and a board that grows a second one will not have to
+/// rename the first.
+const BAY: &str = "0";
+
+impl Registers {
+    /// Put `image` in the drive, or empty it, and open the door.
+    ///
+    /// The geometry is parsed **before** anything is locked, so an image of a
+    /// length no diskette has leaves the drive exactly as it was — which is
+    /// what makes a refused `insert` at the monitor prompt safe to retry.
+    fn load_image(&self, at: &str, label: String, image: Vec<u8>, protect: bool) -> Result<()> {
+        let geom = if image.is_empty() {
+            Geometry {
+                cylinders: 0,
+                heads: 0,
+                sectors: 0,
+            }
+        } else {
+            parse_geometry("auto", at, image.len() as u64)?
+        };
+        let mut state = self.state.lock();
+        state.image = image;
+        state.geom = geom;
+        state.readonly = protect;
+        state.label = label;
+        state.dirty = false;
+        // `DSKCHG`. *IBM PC/AT Technical Reference*, diskette adapter: the
+        // digital input register's bit 7 is set when the door is opened and
+        // cleared by a step pulse with a diskette in the drive. Opening the
+        // door is what a swap is, whichever direction it goes, so `insert`
+        // and `eject` both land here. The line is a level the program polls —
+        // INT 13h AH=16h is the BIOS service that reads it — rather than a
+        // request, so no interrupt is raised and the head does not move.
+        state.changed[0] = true;
+        Ok(())
+    }
+}
+
+impl medium::Removable for Registers {
+    fn bays(&self) -> Vec<medium::MediaBay> {
+        let state = self.state.lock();
+        let g = state.geom;
+        vec![medium::MediaBay {
+            name: String::from(BAY),
+            summary: String::from("the diskette drive on unit 0 of this controller"),
+            medium: (!state.image.is_empty()).then(|| medium::MediumInfo {
+                describe: if state.label.is_empty() {
+                    format!("a diskette of {} bytes", state.image.len())
+                } else {
+                    format!(
+                        "{} ({}/{}/{}, {} bytes)",
+                        state.label,
+                        g.cylinders,
+                        g.heads,
+                        g.sectors,
+                        state.image.len()
+                    )
+                },
+                capacity: state.image.len() as u64,
+                write_protected: state.readonly,
+            }),
+        }]
+    }
+
+    fn insert(&self, name: &str, image: Arc<dyn Medium>, write_protect: bool) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        let protect = write_protect || image.is_read_only();
+        let label = image.describe();
+        // A diskette is addressed by cylinder, head and sector out of a flat
+        // buffer and a 1.44 MiB image is nothing to stream, so the whole
+        // medium comes in at once. A disc, which is the other shape a
+        // removable medium takes in this tree, keeps its handle instead.
+        let bytes = medium::slurp(name, &image)?;
+        self.load_image(name, label, bytes, protect)
+    }
+
+    fn eject(&self, name: &str) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        self.load_image(name, String::new(), Vec::new(), false)
+    }
+}
+
+/// What this class says about a bay it does not have.
+fn no_such_bay(name: &str) -> Error {
+    Error::Config {
+        at: name.to_string(),
+        message: format!("{CLASS_NAME} has one bay, `{BAY}`"),
+    }
+}
+
 /// The drive a controller's medium can be reached through.
 ///
 /// # Why this exists
@@ -1433,7 +1549,7 @@ pub mod drives {
     use alloc::vec::Vec;
     use core::fmt;
 
-    use super::{Geometry, Registers, parse_geometry};
+    use super::Registers;
     use crate::core::error::{Error, Result};
     use crate::core::hosts::{HostKind, HostObjects};
     use crate::core::props::Props;
@@ -1552,21 +1668,26 @@ pub mod drives {
                 at: String::from(name),
                 message: String::from("no floppy controller is filed in this drive"),
             })?;
-            let geom = if image.is_empty() {
-                Geometry {
-                    cylinders: 0,
-                    heads: 0,
-                    sectors: 0,
-                }
-            } else {
-                parse_geometry("auto", name, image.len() as u64)?
-            };
-            let mut state = regs.state.lock();
-            state.image = image;
-            state.geom = geom;
-            state.dirty = false;
-            state.changed[0] = true;
-            Ok(())
+            // The same door `dev::medium::Removable` opens, and deliberately
+            // the same code: two spellings of "put a diskette in" that raised
+            // `DSKCHG` differently would be a defect nobody could see from
+            // either side.
+            let protect = regs.state.lock().readonly;
+            regs.load_image(name, String::from(name), image, protect)
+        }
+
+        /// This drive's door, for a host that reaches every drive in a
+        /// machine the same way.
+        ///
+        /// `None` when no controller has filed itself here, because a bay
+        /// list nothing answers for would be a lie rather than an empty
+        /// drive.
+        #[must_use]
+        pub fn media(&self) -> Option<crate::dev::medium::MediaPort> {
+            let regs = self.fdc.lock().clone()?;
+            Some(crate::dev::medium::MediaPort::new(
+                regs as Arc<dyn crate::dev::medium::Removable>,
+            ))
         }
     }
 
@@ -1692,7 +1813,10 @@ impl Fdc765 {
             parse_geometry(geometry, &name, image.len() as u64)?
         };
         let regs = Arc::new(Registers {
-            state: Mutex::with_rank(LockRank::DEVICE, State::new(image, geom, readonly)),
+            state: Mutex::with_rank(
+                LockRank::DEVICE,
+                State::new(image, geom, readonly, name.clone()),
+            ),
             irq_out: Mutex::with_rank(LockRank::LEAF, None),
             drq_out: Mutex::with_rank(LockRank::LEAF, None),
         });
@@ -1792,6 +1916,12 @@ impl Device for Fdc765 {
         // Nothing outward: a `map` places the region and the realizer hands the
         // wires over, both after every device has been constructed.
         Ok(())
+    }
+
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::REMOVABLE_MEDIA).then(|| {
+            medium::MediaPort::new(Arc::clone(&self.regs) as Arc<dyn medium::Removable>).export()
+        })
     }
 
     fn reset(&self, _kind: ResetKind) {
@@ -2738,5 +2868,180 @@ mod tests {
         // The other drive's head position came back too.
         restored.command(&[CMD_SENSE_INTERRUPT]);
         assert_eq!(restored.results()[1], 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // the door
+    // -----------------------------------------------------------------------
+
+    /// The controller's door, as a host reaches it.
+    fn door(rig: &Rig) -> medium::MediaPort {
+        medium::MediaPort::new(Arc::clone(&rig.fdc.regs) as Arc<dyn medium::Removable>)
+    }
+
+    /// Read sector `lba` the way a driver does, through a DMA read, and hand
+    /// back what came off the medium.
+    fn read_sector(rig: &Rig, lba: usize) -> Vec<u8> {
+        // Cylinder 0, head 0, and the sector number is one-based.
+        rig.command(&[0x46, 0x00, 0, 0, (lba + 1) as u8, 2, 18, 0x1b, 0xff]);
+        let peer = rig.fdc.dma_peripheral("drq").expect("a peripheral on drq");
+        let mut out = Vec::new();
+        for _ in 0..512 {
+            out.push(peer.dma_read(false));
+        }
+        peer.dma_read(true);
+        let _ = rig.results();
+        out
+    }
+
+    /// Step the head with a disk in the drive, which is what clears `DSKCHG`.
+    fn step(rig: &Rig, cylinder: u8) {
+        rig.command(&[CMD_SEEK, 0x00, cylinder]);
+        rig.command(&[CMD_SENSE_INTERRUPT]);
+        let _ = rig.results();
+    }
+
+    #[test]
+    fn a_diskette_goes_in_and_comes_out_through_the_seam() {
+        let rig = rig_with(Vec::new(), false);
+        rig.power_on();
+        let door = door(&rig);
+
+        let bays = door.bays();
+        assert_eq!(bays.len(), 1);
+        assert_eq!(bays[0].name, "0");
+        assert!(bays[0].medium.is_none(), "an empty drive reads empty");
+
+        let image = image_1440k();
+        door.insert("0", medium::from_bytes(&image), false)
+            .expect("a 1.44M image fits a standard geometry");
+        let held = door.bays()[0].medium.clone().expect("a diskette is in it");
+        assert_eq!(held.capacity, 1_474_560);
+        assert!(!held.write_protected);
+        assert_eq!(read_sector(&rig, 3), sector_of(&image, 3), "and it reads");
+
+        door.eject("0").expect("it comes out");
+        assert!(door.bays()[0].medium.is_none());
+        // The interface's own "no medium" answer, unchanged: not ready in ST0
+        // rather than a fault, which is what the drive has always said.
+        rig.command(&[0x46, 0x00, 0, 0, 1, 2, 18, 0x1b, 0xff]);
+        let out = rig.results();
+        assert_eq!(out[0] & ST0_NR, ST0_NR);
+        assert_eq!(out[0] & 0xc0, ST0_ABNORMAL);
+
+        // And a bay this controller does not have is named rather than ignored.
+        let e = door
+            .insert("1", medium::from_bytes(&image), false)
+            .expect_err("unit 1 has no medium in this model");
+        assert!(format!("{e}").contains('0'), "{e}");
+    }
+
+    #[test]
+    fn a_swap_sets_dskchg_until_the_head_is_stepped() {
+        // *IBM PC/AT Technical Reference*, diskette adapter: the digital input
+        // register's bit 7 is set when the door is opened and cleared by a
+        // step pulse with a diskette in the drive. That is what INT 13h
+        // AH=16h reports, and what makes a DOS throw away its cached FAT.
+        let rig = rig();
+        rig.power_on();
+        step(&rig, 4);
+        assert_eq!(rig.peek(REG_DIR_CCR) & 0x80, 0, "settled before the swap");
+
+        let door = door(&rig);
+        door.insert("0", medium::from_bytes(&image_1440k()), false)
+            .expect("the same shape of diskette");
+        assert_eq!(
+            rig.peek(REG_DIR_CCR) & 0x80,
+            0x80,
+            "opening the door is what raises it"
+        );
+        // The head did not move and no interrupt was raised: the change line
+        // is a level the program polls, not a request.
+        assert!(!rig.irq.high(), "a swap is not an interrupt");
+
+        step(&rig, 5);
+        assert_eq!(rig.peek(REG_DIR_CCR) & 0x80, 0, "a step with a disk in it");
+
+        // An eject raises it too, and an empty drive never clears it: there is
+        // nothing to step against.
+        door.eject("0").expect("it comes out");
+        assert_eq!(rig.peek(REG_DIR_CCR) & 0x80, 0x80);
+        step(&rig, 6);
+        assert_eq!(rig.peek(REG_DIR_CCR) & 0x80, 0x80);
+    }
+
+    #[test]
+    fn an_inserted_diskette_can_be_write_protected() {
+        let rig = rig_with(Vec::new(), false);
+        rig.power_on();
+        let door = door(&rig);
+        door.insert("0", medium::from_bytes(&image_1440k()), true)
+            .expect("it goes in");
+        assert!(door.bays()[0].medium.clone().expect("held").write_protected);
+        // ST3 bit 6 is what a driver reads for the tab.
+        rig.command(&[CMD_SENSE_DRIVE, 0x00]);
+        assert_eq!(rig.results()[0] & ST3_WP, ST3_WP, "the tab is open");
+    }
+
+    #[test]
+    fn a_debug_read_of_the_change_line_leaves_it_where_it_was() {
+        // `MemAttrs::debug` is the rule every MMIO surface keeps, and the
+        // change line is exactly the kind of thing an inspection could
+        // plausibly clear. It does not, because nothing but a step does.
+        let rig = rig();
+        rig.power_on();
+        door(&rig)
+            .insert("0", medium::from_bytes(&image_1440k()), false)
+            .expect("it goes in");
+        let mut byte = [0u8; 1];
+        for _ in 0..4 {
+            rig.fdc
+                .regs
+                .read(REG_DIR_CCR, &mut byte, MemAttrs::DEBUG)
+                .expect("a debug byte read is legal");
+            assert_eq!(byte[0] & 0x80, 0x80);
+        }
+        assert_eq!(rig.peek(REG_DIR_CCR) & 0x80, 0x80, "and still set");
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_with_a_diskette_and_without_one() {
+        // The image itself is not in the chunk — see `Device::save` — so what
+        // this asserts is that the *controller* state either side of a swap
+        // saves and restores to the same bytes, with a medium and with none.
+        for present in [true, false] {
+            let saved = rig_with(Vec::new(), false);
+            saved.power_on();
+            let door = door(&saved);
+            door.insert("0", medium::from_bytes(&image_1440k()), false)
+                .expect("it goes in");
+            if !present {
+                door.eject("0").expect("it comes out");
+            }
+            let mut shape = MachineShape::new();
+            shape.add_device("fdc", CLASS.name).unwrap();
+            let mut w = StateWriter::new(shape);
+            {
+                let mut chunk = w.chunk("fdc", CLASS.name, CLASS.version).unwrap();
+                saved.fdc.save(&mut chunk).unwrap();
+            }
+            let first = w.to_vec().unwrap();
+
+            let restored = rig_with(Vec::new(), false);
+            let reader = StateReader::new(&first).expect("a snapshot we just wrote");
+            let chunk = reader
+                .load("fdc", CLASS.name, CLASS.version, &Migrations::new())
+                .expect("the chunk we just wrote");
+            restored.fdc.load(&mut chunk.reader()).unwrap();
+
+            let mut shape = MachineShape::new();
+            shape.add_device("fdc", CLASS.name).unwrap();
+            let mut w = StateWriter::new(shape);
+            {
+                let mut chunk = w.chunk("fdc", CLASS.name, CLASS.version).unwrap();
+                restored.fdc.save(&mut chunk).unwrap();
+            }
+            assert_eq!(first, w.to_vec().unwrap(), "present = {present}");
+        }
     }
 }

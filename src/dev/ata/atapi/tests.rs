@@ -1039,3 +1039,177 @@ fn a_snapshot_carries_a_half_delivered_packet_and_its_protocol() {
         }
     );
 }
+
+// ---------------------------------------------------------------------------
+// the tray, opened from outside
+// ---------------------------------------------------------------------------
+
+/// A stamped disc of `blocks` logical blocks, as a medium a host can insert.
+fn disc_medium(blocks: u64) -> Arc<dyn Medium> {
+    let store = RamStore::new(blocks * BLOCK);
+    for lba in 0..blocks {
+        store.write_at(lba * BLOCK, &stamp(lba)).expect("in range");
+    }
+    Arc::new(store)
+}
+
+/// The sense a `REQUEST SENSE` reports right now, as `(key, asc, ascq)`.
+fn sense_of(cd: &AtapiDrive) -> (u8, u8, u8) {
+    let (_, sense) = packet_command_in(cd, &cdb_request_sense(18), 512);
+    (sense[2] & 0x0f, sense[12], sense[13])
+}
+
+#[test]
+fn a_disc_goes_in_and_comes_out_and_the_drive_says_which() {
+    use crate::dev::medium::Removable;
+
+    let cd = empty();
+    assert_eq!(cd.bays().len(), 1, "one tray");
+    assert_eq!(cd.bays()[0].name, "tray");
+    assert!(cd.bays()[0].medium.is_none(), "an empty tray reads empty");
+
+    cd.insert("tray", disc_medium(8), false)
+        .expect("it goes in");
+    let held = cd.bays()[0].medium.clone().expect("a disc is in it");
+    assert_eq!(held.capacity, 8 * BLOCK);
+    assert!(held.write_protected, "a CD has no write path at all");
+    assert_eq!(cd.blocks(), 8);
+
+    cd.eject("tray").expect("it comes out");
+    assert!(cd.bays()[0].medium.is_none());
+    assert_eq!(cd.blocks(), 0, "an empty tray has no capacity");
+
+    // And a bay this drive does not have is named rather than ignored.
+    let e = cd
+        .insert("df0", disc_medium(8), false)
+        .expect_err("no such bay");
+    assert!(alloc::format!("{e}").contains("tray"), "{e}");
+}
+
+#[test]
+fn a_swap_raises_the_unit_attention_the_command_set_prescribes() {
+    use crate::dev::medium::Removable;
+
+    // SFF-8020i §9.3: a medium change is reported once, as UNIT ATTENTION
+    // with additional sense 28h/00h, on the next command that is neither
+    // INQUIRY nor REQUEST SENSE.
+    let cd = drive(8);
+    clear_attention(&cd);
+    assert_eq!(
+        packet_command(&cd, &cdb_test_unit_ready(), 0).status & ST_CHK,
+        0,
+        "settled before the swap"
+    );
+
+    cd.insert("tray", disc_medium(16), false)
+        .expect("a new disc");
+    let ended = packet_command(&cd, &cdb_test_unit_ready(), 0);
+    assert_eq!(ended.status & ST_CHK, ST_CHK, "the guest is told");
+    assert_eq!(
+        sense_of(&cd),
+        (
+            sense_key::UNIT_ATTENTION,
+            asc::MEDIUM_CHANGED.0,
+            asc::MEDIUM_CHANGED.1
+        )
+    );
+    // Once, and then the drive is ready again on the new disc.
+    assert_eq!(
+        packet_command(&cd, &cdb_test_unit_ready(), 0).status & ST_CHK,
+        0
+    );
+    let (_, data) = packet_command_in(&cd, &cdb_read10(15, 1), 2048);
+    assert_eq!(data, stamp(15), "the new disc, and it is bigger");
+}
+
+#[test]
+fn an_eject_is_told_the_same_way_and_then_the_medium_is_not_present() {
+    use crate::dev::medium::Removable;
+
+    let cd = drive(8);
+    clear_attention(&cd);
+    cd.eject("tray").expect("the tray opens");
+
+    // The change first — a guest with a filesystem mounted has to be told the
+    // disc left before it is told there is nothing there.
+    let ended = packet_command(&cd, &cdb_test_unit_ready(), 0);
+    assert_eq!(ended.status & ST_CHK, ST_CHK);
+    assert_eq!(
+        sense_of(&cd),
+        (
+            sense_key::UNIT_ATTENTION,
+            asc::MEDIUM_CHANGED.0,
+            asc::MEDIUM_CHANGED.1
+        )
+    );
+    // And from then on, the empty-tray answer this drive has always given.
+    for cdb in [cdb_test_unit_ready(), cdb_read10(0, 1)] {
+        assert_eq!(packet_command(&cd, &cdb, 2048).status & ST_CHK, ST_CHK);
+        assert_eq!(
+            sense_of(&cd),
+            (
+                sense_key::NOT_READY,
+                asc::MEDIUM_NOT_PRESENT.0,
+                asc::MEDIUM_NOT_PRESENT.1
+            )
+        );
+    }
+}
+
+#[test]
+fn a_snapshot_round_trips_with_a_disc_and_without_one() {
+    use crate::dev::medium::Removable;
+
+    // Present.
+    let cd = drive(8);
+    clear_attention(&cd);
+    let image = save_of(&cd);
+    let restored = drive(8);
+    let reader = StateReader::new(&image).expect("a snapshot we just wrote");
+    let chunk = reader
+        .load("cd", CLASS.name, CLASS.version, &Migrations::new())
+        .expect("the chunk we just wrote");
+    restored.load(&mut chunk.reader()).expect("it loads");
+    assert_eq!(image, save_of(&restored));
+
+    // Absent, and this one gets there by ejecting rather than by being built
+    // empty — which is the state a swap actually produces.
+    let opened = drive(8);
+    clear_attention(&opened);
+    opened.eject("tray").expect("the tray opens");
+    let image = save_of(&opened);
+    let target = drive(8);
+    clear_attention(&target);
+    target.eject("tray").expect("the tray opens");
+    let reader = StateReader::new(&image).expect("a snapshot we just wrote");
+    let chunk = reader
+        .load("cd", CLASS.name, CLASS.version, &Migrations::new())
+        .expect("the chunk we just wrote");
+    target.load(&mut chunk.reader()).expect("it loads");
+    assert_eq!(image, save_of(&target));
+}
+
+#[test]
+fn looking_at_the_drive_does_not_consume_what_the_guest_has_not_read() {
+    use crate::dev::medium::Removable;
+
+    // `{:?}` is what the monitor's `device` command prints and `bays()` is
+    // what its `media` command calls; neither may disturb the drive. The
+    // claim worth making is about the pending sense, because that is the one
+    // thing here a look could consume.
+    let cd = drive(8);
+    clear_attention(&cd);
+    cd.eject("tray").expect("the tray opens");
+    let _ = alloc::format!("{cd:?}");
+    let _ = cd.bays();
+    let ended = packet_command(&cd, &cdb_test_unit_ready(), 0);
+    assert_eq!(ended.status & ST_CHK, ST_CHK, "still pending after a look");
+    assert_eq!(
+        sense_of(&cd),
+        (
+            sense_key::UNIT_ATTENTION,
+            asc::MEDIUM_CHANGED.0,
+            asc::MEDIUM_CHANGED.1
+        )
+    );
+}

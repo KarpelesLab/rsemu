@@ -275,6 +275,28 @@ impl ExportId {
     /// contract between those two classes — which is what `Opaque` is for.
     pub const SCSI_CONTROLLER: ExportId = ExportId(11);
 
+    /// A drive whose medium a person can change while the machine runs: which
+    /// bays it has, what is in each, and the two commands that alter that.
+    /// Transported as [`Export::Opaque`].
+    ///
+    /// Unlike every id above it, the consumer is not another device — it is a
+    /// **host**: the monitor console's `media`, `insert` and `eject`, and the
+    /// listing `rsemu run --describe` prints. That is what makes it worth an
+    /// id at all. The three doors that existed before it were host objects of
+    /// three unrelated types (`dev::pc::fdc::drives::Drive`,
+    /// `dev::amiga::floppy::Floppy`, `dev::sd::slots::Slot`), so a `media`
+    /// command could work on one board and not the rest; asking every device
+    /// the same question is the whole point.
+    ///
+    /// The handle's type is [`dev::medium::MediaPort`](crate::dev::medium),
+    /// and it travels as `Opaque` for a reason this file cannot fix: it names
+    /// [`Medium`](crate::dev::medium::Medium), which lives behind the
+    /// `dev-medium` feature, and `core/` is never feature-gated
+    /// (`CLAUDE.md`, *Crate shape*). A typed variant here would drag a
+    /// device-layer trait into the framework to spare four downcasts on a
+    /// cold path.
+    pub const REMOVABLE_MEDIA: ExportId = ExportId(12);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -293,6 +315,7 @@ impl ExportId {
             ExportId::CHIP_DMA => Some("chip-RAM DMA"),
             ExportId::CD_DRIVE => Some("CD-ROM drive"),
             ExportId::SCSI_CONTROLLER => Some("SCSI bus interface controller"),
+            ExportId::REMOVABLE_MEDIA => Some("removable media"),
             _ => None,
         }
     }

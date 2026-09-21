@@ -120,7 +120,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    Device, DeviceClass, ExportId, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -636,6 +636,16 @@ impl Shared {
         }
     }
 
+    /// Hand a medium its written tracks and let go of it.
+    fn detach_medium(&self) {
+        if !self.backed.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let written = self.state.lock().take_written(true);
+        self.write_back(written);
+        let _ = self.medium.lock().take();
+    }
+
     /// Decode written tracks and put their sectors on the medium, with none of
     /// this drive's state locked.
     fn write_back(&self, written: Vec<(usize, Vec<u8>)>) {
@@ -823,16 +833,29 @@ impl Floppy {
         }
     }
 
-    /// Put a disk in. The change flop stays set until the head is stepped.
+    /// Put a disk in. The change flop is set, and stays set until the head is
+    /// stepped.
     ///
     /// A disk put in by hand is its own: a disk that was a medium goes out
     /// first, its written tracks handed back, and the medium with it.
     pub fn insert(&self, disk: MfmDisk) {
-        self.detach_medium();
+        self.shared.detach_medium();
         self.shared.update(|st| {
             st.disk = Some(disk);
             st.dirty = [0; 3];
+            // Putting a disk in means the door was opened, and a drive's
+            // change flop is set by the door rather than by the disk. Without
+            // this a swap under a running Workbench is invisible until
+            // something happens to step the head, which is the shape of bug
+            // that silently corrupts a mounted volume.
+            st.changed = true;
         });
+    }
+
+    /// The door a host reaches this drive's disk through.
+    #[must_use]
+    pub fn media(&self) -> medium::MediaPort {
+        medium::MediaPort::new(Arc::clone(&self.shared) as Arc<dyn medium::Removable>)
     }
 
     /// Take the disk out, which sets the change flop.
@@ -841,7 +864,7 @@ impl Floppy {
     /// the medium leaves with it; a failure to do that is kept for the next
     /// [`flush`](Device::flush) to report.
     pub fn eject(&self) -> Option<MfmDisk> {
-        self.detach_medium();
+        self.shared.detach_medium();
         let mut taken = None;
         self.shared.update(|st| {
             taken = st.disk.take();
@@ -849,16 +872,6 @@ impl Floppy {
             st.changed = true;
         });
         taken
-    }
-
-    /// Hand a medium its written tracks and let go of it.
-    fn detach_medium(&self) {
-        if !self.shared.backed.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        let written = self.shared.state.lock().take_written(true);
-        self.shared.write_back(written);
-        let _ = self.shared.medium.lock().take();
     }
 
     /// A copy of the disk in the drive, writes included.
@@ -910,6 +923,10 @@ impl Device for Floppy {
         // DRESB*: "Drives should reset their motor-on flip-flops." The head,
         // the disk and the change flop are mechanical and stay where they are.
         self.shared.update(|st| st.motor = false);
+    }
+
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::REMOVABLE_MEDIA).then(|| self.media().export())
     }
 
     fn flush(&self) -> Result<()> {
@@ -1076,6 +1093,89 @@ impl Instance for Floppy {
             })?;
         self.attach(PaulaPort::clone(&paula));
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the door
+// ---------------------------------------------------------------------------
+
+/// The one bay a drive has. `df0` is the *device*, so the bay inside it is
+/// just "the disk".
+const BAY: &str = "disk";
+
+impl medium::Removable for Shared {
+    fn bays(&self) -> Vec<medium::MediaBay> {
+        // `state` (MEDIA_RANK) outside `medium` (LEAF) is the ranked order,
+        // and it is the order every other path through this file takes.
+        let (present, protected) = {
+            let st = self.state.lock();
+            (
+                st.disk.is_some(),
+                st.disk.as_ref().is_some_and(|d| d.write_protected),
+            )
+        };
+        let describe = self.medium.lock().as_ref().map(|m| m.describe());
+        vec![medium::MediaBay {
+            name: String::from(BAY),
+            summary: String::from("a 3.5\" double-density disk, 880 KiB in 160 tracks"),
+            medium: present.then(|| medium::MediumInfo {
+                describe: match describe {
+                    Some(d) if !d.is_empty() => d,
+                    // A disk the run supplied as bytes, or one a snapshot
+                    // restored: there is no file behind it to name.
+                    _ => format!("an ADF of {} bytes, in memory", adf::ADF_BYTES),
+                },
+                capacity: adf::ADF_BYTES as u64,
+                write_protected: protected,
+            }),
+        }]
+    }
+
+    fn insert(&self, name: &str, medium: Arc<dyn Medium>, write_protect: bool) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        // Decoded before anything is disturbed: a medium that is not an ADF
+        // leaves the drive exactly as it was, which is what makes a failed
+        // `insert` at the monitor prompt safe to retry.
+        let mut disk = disk_on(&*medium, name)?;
+        disk.write_protected = write_protect || medium.is_read_only();
+        self.detach_medium();
+        *self.medium.lock() = Some(medium);
+        self.backed.store(true, Ordering::Relaxed);
+        self.update(|st| {
+            st.disk = Some(disk);
+            st.dirty = [0; 3];
+            // `CHNG*`. The *Amiga Hardware Reference Manual*'s disk
+            // connector: the change flop is set when the disk is removed or
+            // the drive is powered up, and cleared by a step pulse with a
+            // disk in the drive. A swap is a removal followed by an
+            // insertion, so the flop is set either way round.
+            st.changed = true;
+        });
+        Ok(())
+    }
+
+    fn eject(&self, name: &str) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        self.detach_medium();
+        self.update(|st| {
+            st.disk = None;
+            st.dirty = [0; 3];
+            st.changed = true;
+        });
+        Ok(())
+    }
+}
+
+/// What a drive says about a bay it does not have.
+fn no_such_bay(name: &str) -> Error {
+    Error::Config {
+        at: name.to_string(),
+        message: format!("{CLASS_NAME} has one bay, `{BAY}`"),
     }
 }
 

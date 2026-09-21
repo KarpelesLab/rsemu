@@ -81,15 +81,19 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
+use crate::dev::medium::{self, Medium};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
@@ -97,7 +101,7 @@ use crate::machine::validate::{ClassSchema, PropSchema};
 pub const CLASS_NAME: &str = "sd.card";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// The block a card reads and writes in, in bytes.
 ///
@@ -1889,8 +1893,21 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// controller in the same build picks it up from there.
 #[derive(Debug)]
 pub struct CardDevice {
+    socket: Arc<Socket>,
+}
+
+/// A card and the socket it sits in, as one object a host can hold.
+///
+/// Two things the class keeps apart are joined here because a swap needs
+/// both: the *card* carries the bytes and the protocol state, and the
+/// *socket* is what a controller looks in. Ejecting takes the card out of the
+/// socket and leaves the card itself alone, which is why a snapshot of an
+/// empty socket still has a card's registers to write.
+#[derive(Debug)]
+struct Socket {
     card: Arc<SdCard>,
-    slot: String,
+    holder: Arc<super::slots::Slot>,
+    name: String,
 }
 
 impl CardDevice {
@@ -1913,19 +1930,124 @@ impl CardDevice {
                 "two cards were put in the slot called `{slot}`; give one of them another `slot`"
             ))
         })?;
-        Ok(CardDevice { card, slot })
+        Ok(CardDevice {
+            socket: Arc::new(Socket {
+                card,
+                holder,
+                name: slot,
+            }),
+        })
     }
 
     /// The card behind this object.
     #[must_use]
     pub fn card(&self) -> &Arc<SdCard> {
-        &self.card
+        &self.socket.card
     }
 
     /// The slot it was put in.
     #[must_use]
     pub fn slot(&self) -> &str {
-        &self.slot
+        &self.socket.name
+    }
+
+    /// The door a host changes the card through.
+    #[must_use]
+    pub fn media(&self) -> medium::MediaPort {
+        medium::MediaPort::new(Arc::clone(&self.socket) as Arc<dyn medium::Removable>)
+    }
+}
+
+/// The one bay this class has: the socket the card is in.
+const BAY: &str = "card";
+
+impl medium::Removable for Socket {
+    fn bays(&self) -> Vec<medium::MediaBay> {
+        let id = self.card.identity();
+        vec![medium::MediaBay {
+            name: String::from(BAY),
+            summary: format!("the card socket called `{}`", self.name),
+            medium: self.holder.is_occupied().then(|| medium::MediumInfo {
+                describe: format!(
+                    "an SD{} card of {} bytes",
+                    if id.high_capacity { "HC" } else { "SC" },
+                    id.capacity
+                ),
+                capacity: id.capacity,
+                write_protected: false,
+            }),
+        }]
+    }
+
+    fn insert(&self, name: &str, image: Arc<dyn Medium>, write_protect: bool) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        if write_protect {
+            // The write-protect notch is a switch on the *socket*, read by
+            // the host controller's own GPIO; a card cannot tell a host about
+            // it and nothing in the command set carries it — the Physical
+            // Layer Simplified Specification's §4.3.6 write protection is two
+            // CSD bits a card is made with, not a tab somebody slides.
+            // Refusing is honest: pretending would make a guest's successful
+            // write look as though it had been protected.
+            return Err(config(String::from(
+                "an SD card has no write-protect tab a host can set: the notch is a switch on \
+                 the socket, and this model has no pin for it",
+            )));
+        }
+        let capacity = self.card.identity().capacity;
+        let bytes = medium::slurp(name, &image)?;
+        if bytes.len() as u64 > capacity {
+            return Err(config(format!(
+                "the image is {} byte(s) and this socket's card holds {capacity}",
+                bytes.len()
+            )));
+        }
+        // A fresh card is fresh all the way to the end of it, so whatever the
+        // last one had past the new image is zeroed rather than left showing
+        // through.
+        self.card.load_image(0, &bytes)?;
+        let tail = capacity - bytes.len() as u64;
+        if tail != 0 {
+            self.card
+                .write_media(bytes.len() as u64, &alloc::vec![0u8; tail as usize])?;
+        }
+        // The signal. A card has **no disk-change line of its own** — the
+        // socket may have a card-detect switch, and that is a board wire this
+        // class does not own — so what a guest sees is what a real hot swap
+        // does to it: the card comes up in the idle phase, the RCA it
+        // published is gone, and every command addressed to the old one is
+        // answered by nothing until the host runs CMD0 and ACMD41 again.
+        self.card.power_cycle();
+        let _ = self.holder.eject();
+        self.holder.insert(Arc::clone(&self.card)).map_err(|_| {
+            config(String::from(
+                "the socket was filled while this card went in",
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn eject(&self, name: &str) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        let _ = self.holder.eject();
+        // An empty socket is a controller that finds nothing and a firmware
+        // that concludes there is no card, which is what an empty socket
+        // does. Cycling the card on its way out is what makes putting it back
+        // a power-on rather than a resumption.
+        self.card.power_cycle();
+        Ok(())
+    }
+}
+
+/// What this class says about a bay it does not have.
+fn no_such_bay(name: &str) -> Error {
+    Error::Config {
+        at: name.to_string(),
+        message: format!("{CLASS_NAME} has one bay, `{BAY}`"),
     }
 }
 
@@ -1945,15 +2067,36 @@ impl Device for CardDevice {
         // Both kinds. A board reset cycles the card's power, which resets the
         // protocol state and leaves the contents alone — the same distinction
         // NOR flash draws, and for the same reason.
-        self.card.power_cycle();
+        self.socket.card.power_cycle();
+    }
+
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::REMOVABLE_MEDIA).then(|| self.media().export())
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        self.card.save(w)
+        // Whether the card is *in* the socket is machine state now that a
+        // host can take it out, and it is written first so a reader knows
+        // what the rest of the chunk describes. Version 2 is this bool.
+        w.write_bool(self.socket.holder.is_occupied())?;
+        self.socket.card.save(w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        self.card.load(r)
+        let present = r.read_bool()?;
+        self.socket.card.load(r)?;
+        let _ = self.socket.holder.eject();
+        if present {
+            self.socket
+                .holder
+                .insert(Arc::clone(&self.socket.card))
+                .map_err(|_| {
+                    config(String::from(
+                        "the socket was filled while a snapshot loaded",
+                    ))
+                })?;
+        }
+        Ok(())
     }
 }
 

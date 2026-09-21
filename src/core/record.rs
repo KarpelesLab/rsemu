@@ -32,6 +32,7 @@
 //! | The host wall clock | not guest-visible: `HostClock` is injected into the scheduler from above the `std` line and only feeds `Pace::Wait` |
 //! | Host file I/O **completion** | nothing to timestamp — every block backend completes inside the guest access that issued it. When one becomes asynchronous, its completion is a channel |
 //! | Host file I/O **content** | **not covered, and this is not a timing question.** A drive's bytes are host state outside the recording: a replay against an image the host has since edited diverges, and nothing checks that it is the same image. A medium snapshotted by *reference* compares an identity string, never contents — and the string is `dev::blk::Image`'s `format canonical-path capacity`, so it detects a *substituted* image and not an *edited* one (`machine::Timeline` has the rewind half of this) |
+//! | Changing a medium mid-run | **covered by construction, not by a channel.** `dev::medium::Removable` lets a host swap a disk, disc or card in a machine that has already been built, and the monitor console's `insert`/`eject` are the only callers. They run **between scheduling rounds, with the machine stopped**, so the instant of a swap is the instant the session's previous `run` ended, and a script replayed from the top swaps at the same virtual time every run without anything being logged — `a_swap_at_a_fixed_instant_reaches_one_hash` asserts it. A channel here would carry a *file path*, and re-reading it at replay would recover nothing the row below has not already lost. What is **not** covered is the same thing that row names: which bytes were in the file. A front end that wanted to swap from another thread while the guest runs would be the case that needs a channel, and that is precisely why no such caller exists — `Removable`'s docs say so rather than leaving it to be discovered |
 //! | A debugger writing guest state | **not covered** — `host::gdb` lets a TCP peer set registers and memory mid-run. It is a deliberate power rather than an oversight, but a session debugged and recorded at once is not replayable and nothing says so. `rsemu run --gdb` also pumps the console straight into the port between the debugger's turns, so those keystrokes miss the seam even though the board was sealed |
 //! | Constructor interception | **not covered** — `Bindings::replace` swaps a class for another at build time, which is how `accel` substitutes a KVM core. A build-time door parallel to the host-object table, and the reason an accelerated board is out of scope for replay twice over |
 //! | A frontend pressing a *captured* device | **covered sideways.** `host::input::MouseSink` reaches a concrete `HidMouse` out of a [`Captured`](crate::core::hosts::Captured) table and pushes reports into it. What it pushes is recorded — on `input:vnc`, the frontend's channel — but the capture table itself is a `HostKind::rendezvous` and the seal does not check it, so a *different* host doing the same thing without posting first would not be caught |
@@ -89,6 +90,17 @@
 //!   them at an instant, so no `(instant, payload)` log describes it. What that
 //!   needs is an identity check on the image, which is `dev::medium`'s
 //!   `Snapshot::Reference` — and a weak one, as the table above says.
+//!
+//!   `dev::medium::Removable` — changing what is in a drive rather than
+//!   reading it — looks at first like the `(instant, payload)` this paragraph
+//!   says does not exist, and it would be, if anything could call it while the
+//!   guest was running. Nothing may: the contract on that trait is that a swap
+//!   happens at a round boundary with the machine stopped, which is where the
+//!   monitor console calls it from and the only place a caller has been
+//!   allowed. An instant fixed by the session's own command order needs no log
+//!   to reproduce it. The day a front end wants to swap asynchronously is the
+//!   day this becomes a channel, and it will be a small one: a bay name and a
+//!   specification, replayed through `host::media::read`.
 //!
 //! Only the first group belongs to the seal, and it held all three, so sealing
 //! any board with a PCI or USB bus in it failed on an object that was never an

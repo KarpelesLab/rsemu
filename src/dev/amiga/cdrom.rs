@@ -46,8 +46,9 @@
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::core::device::{
     Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
@@ -85,25 +86,25 @@ impl DrivePort {
     /// Whether there is a disc in the tray.
     #[must_use]
     pub fn has_disc(&self) -> bool {
-        self.inner.disc.is_some()
+        self.inner.disc.lock().is_some()
     }
 
     /// How many logical blocks that disc has, or zero with an empty tray.
     #[must_use]
     pub fn sectors(&self) -> u64 {
-        self.inner.disc.as_ref().map_or(0, Disc::sectors)
+        self.inner.disc.lock().as_ref().map_or(0, Disc::sectors)
     }
 
     /// How its sectors are laid out in the image, or `None` with no disc.
     #[must_use]
     pub fn layout(&self) -> Option<Layout> {
-        self.inner.disc.as_ref().map(Disc::layout)
+        self.inner.disc.lock().as_ref().map(Disc::layout)
     }
 
     /// The disc's table of contents, or `None` with no disc.
     #[must_use]
     pub fn toc(&self) -> Option<Toc> {
-        self.inner.disc.as_ref().map(Disc::toc)
+        self.inner.disc.lock().as_ref().map(Disc::toc)
     }
 
     /// Read logical block `lba`'s 2048 bytes of user data, and leave the head
@@ -114,10 +115,13 @@ impl DrivePort {
     /// [`Error::State`] with no disc in the tray, past the last block, or
     /// when the image cannot be read.
     pub fn read(&self, lba: u64, dst: &mut [u8; USER_BYTES as usize]) -> Result<()> {
-        let Some(disc) = self.inner.disc.as_ref() else {
-            return Err(Error::State(String::from("amiga.cd: no disc in the tray")));
-        };
-        disc.read_block(CLASS_NAME, lba, dst)?;
+        {
+            let tray = self.inner.disc.lock();
+            let Some(disc) = tray.as_ref() else {
+                return Err(Error::State(String::from("amiga.cd: no disc in the tray")));
+            };
+            disc.read_block(CLASS_NAME, lba, dst)?;
+        }
         *self.inner.at.lock() = lba;
         Ok(())
     }
@@ -132,7 +136,9 @@ impl DrivePort {
 /// The drive's shared insides.
 #[derive(Debug)]
 struct Inner {
-    disc: Option<Disc>,
+    /// Behind a lock because the tray opens while the machine runs — see
+    /// this file's `Removable` impl.
+    disc: Mutex<Option<Disc>>,
     /// The block last read. A real mechanism's head is somewhere, and this is
     /// the only thing about the drive that moves.
     at: Mutex<u64>,
@@ -196,7 +202,7 @@ impl CdRom {
         };
         Ok(CdRom {
             inner: Arc::new(Inner {
-                disc,
+                disc: Mutex::with_rank(TRAY_RANK, disc),
                 at: Mutex::with_rank(LockRank::DEVICE, 0),
             }),
         })
@@ -208,6 +214,85 @@ impl CdRom {
         DrivePort {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    /// The door a host changes the disc through.
+    #[must_use]
+    pub fn media(&self) -> medium::MediaPort {
+        medium::MediaPort::new(Arc::clone(&self.inner) as Arc<dyn medium::Removable>)
+    }
+}
+
+/// Where the tray's lock sits in the ranked order.
+///
+/// Below the head position it is taken beside, and nothing is taken while it
+/// is held: a sector read reaches the medium and no further.
+pub const TRAY_RANK: LockRank = LockRank::new(0x5800);
+
+/// The one bay this class has.
+const BAY: &str = "tray";
+
+impl medium::Removable for Inner {
+    fn bays(&self) -> Vec<medium::MediaBay> {
+        let held = self
+            .disc
+            .lock()
+            .as_ref()
+            .map(|d| (d.medium().describe(), d.sectors()));
+        alloc::vec![medium::MediaBay {
+            name: String::from(BAY),
+            summary: String::from("the CD32's disc tray"),
+            medium: held.map(|(describe, sectors)| medium::MediumInfo {
+                describe: if describe.is_empty() {
+                    format!("a disc of {sectors} logical blocks, in memory")
+                } else {
+                    describe
+                },
+                capacity: sectors * USER_BYTES,
+                // A CD is read-only and this mechanism has no write path.
+                write_protected: true,
+            }),
+        }]
+    }
+
+    fn insert(&self, name: &str, disc: Arc<dyn Medium>, _write_protect: bool) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        // Opened before the tray is touched: a medium that is not a whole
+        // number of sectors leaves the drive as it was.
+        let disc = Disc::open(CLASS_NAME, disc)?;
+        *self.disc.lock() = Some(disc);
+        // The head goes back to the start of the disc, because the new disc
+        // is not the one the last block was read from.
+        //
+        // **What the guest is told: nothing.** `super::akiko` carries no
+        // disc-change message, because the message format `cd.device` uses
+        // could not be recovered from a boot with an empty tray and inventing
+        // one would be a fiction (that file says so at length). So a swap is
+        // visible to a host and to `DrivePort`, and a CD32 that has already
+        // decided the tray is empty stays decided. That is a gap in *Akiko*,
+        // and it is named here rather than papered over: this door is the
+        // half of the mechanism that does work.
+        *self.at.lock() = 0;
+        Ok(())
+    }
+
+    fn eject(&self, name: &str) -> Result<()> {
+        if name != BAY {
+            return Err(no_such_bay(name));
+        }
+        *self.disc.lock() = None;
+        *self.at.lock() = 0;
+        Ok(())
+    }
+}
+
+/// What this class says about a bay it does not have.
+fn no_such_bay(name: &str) -> Error {
+    Error::Config {
+        at: name.to_string(),
+        message: format!("{CLASS_NAME} has one bay, `{BAY}`"),
     }
 }
 
@@ -228,8 +313,13 @@ impl Device for CdRom {
     }
 
     fn export(&self, which: ExportId) -> Option<Export> {
-        (which == ExportId::CD_DRIVE)
-            .then(|| Export::Opaque(Arc::new(self.port()) as Arc<dyn core::any::Any + Send + Sync>))
+        match which {
+            ExportId::CD_DRIVE => Some(Export::Opaque(
+                Arc::new(self.port()) as Arc<dyn core::any::Any + Send + Sync>
+            )),
+            ExportId::REMOVABLE_MEDIA => Some(self.media().export()),
+            _ => None,
+        }
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -238,7 +328,7 @@ impl Device for CdRom {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let at = r.read_u64()?;
-        let sectors = self.inner.disc.as_ref().map_or(0, Disc::sectors);
+        let sectors = self.inner.disc.lock().as_ref().map_or(0, Disc::sectors);
         if at != 0 && at >= sectors {
             return Err(Error::State(format!(
                 "amiga.cd: a head at block {at} on a disc of {sectors} blocks"
@@ -431,5 +521,105 @@ mod tests {
         drive.reset(ResetKind::Cold);
         assert_eq!(drive.port().at(), 0);
         assert!(drive.port().has_disc());
+    }
+
+    #[test]
+    fn a_disc_goes_in_and_comes_out_through_the_seam() {
+        let drive = CdRom::holding(None).expect("an empty tray realizes");
+        let door = drive.media();
+
+        let bays = door.bays();
+        assert_eq!(bays.len(), 1);
+        assert_eq!(bays[0].name, "tray");
+        assert!(bays[0].medium.is_none(), "an empty tray reads empty");
+
+        door.insert("tray", disc(iso_image(8)), false)
+            .expect("an ISO goes in");
+        let held = door.bays()[0].medium.clone().expect("a disc is in it");
+        assert_eq!(held.capacity, 8 * USER_BYTES);
+        assert!(held.write_protected, "a CD has no write path");
+        assert!(drive.port().has_disc());
+        let mut buf = [0u8; USER_BYTES as usize];
+        drive.port().read(5, &mut buf).expect("it reads");
+
+        door.eject("tray").expect("it comes out");
+        assert!(door.bays()[0].medium.is_none());
+        assert!(!drive.port().has_disc());
+        assert_eq!(drive.port().sectors(), 0);
+        // The interface's own "no disc" answer, unchanged.
+        let e = drive.port().read(0, &mut buf).expect_err("nothing to read");
+        assert!(alloc::format!("{e}").contains("no disc in the tray"), "{e}");
+
+        let e = door
+            .insert("df0", disc(iso_image(4)), false)
+            .expect_err("one tray");
+        assert!(alloc::format!("{e}").contains("tray"), "{e}");
+    }
+
+    #[test]
+    fn a_swap_puts_the_head_back_at_the_start_of_the_new_disc() {
+        // The head is the only thing about this mechanism that moves, and the
+        // block it was last on is not a block of the disc that is in it now.
+        let drive = CdRom::holding(Some(disc(iso_image(64)))).expect("an ISO realizes");
+        let mut buf = [0u8; USER_BYTES as usize];
+        drive.port().read(40, &mut buf).expect("it reads");
+        assert_eq!(drive.port().at(), 40);
+
+        drive
+            .media()
+            .insert("tray", disc(iso_image(8)), false)
+            .expect("a smaller disc");
+        assert_eq!(drive.port().at(), 0);
+        assert_eq!(drive.port().sectors(), 8);
+        assert!(
+            drive.port().read(40, &mut buf).is_err(),
+            "and block 40 is off the end of what is in it now"
+        );
+    }
+
+    #[test]
+    fn a_medium_that_is_not_a_whole_disc_leaves_the_tray_as_it_was() {
+        let drive = CdRom::holding(Some(disc(iso_image(8)))).expect("an ISO realizes");
+        let e = drive
+            .media()
+            .insert("tray", super::store(&[0u8; 100]), false)
+            .expect_err("100 bytes is no disc");
+        assert!(!alloc::format!("{e}").is_empty());
+        assert_eq!(
+            drive.port().sectors(),
+            8,
+            "a refused insert changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_with_a_disc_and_without_one() {
+        for present in [true, false] {
+            let saved = CdRom::holding(Some(disc(iso_image(8)))).expect("an ISO realizes");
+            if !present {
+                saved.media().eject("tray").expect("it comes out");
+            }
+            let bytes = snapshot(&saved);
+
+            let fresh = CdRom::holding(Some(disc(iso_image(8)))).expect("an ISO realizes");
+            if !present {
+                fresh.media().eject("tray").expect("it comes out");
+            }
+            let reader = StateReader::new(&bytes).unwrap();
+            let chunk = reader
+                .load("cd0", CLASS_NAME, STATE_VERSION, &Migrations::new())
+                .unwrap();
+            Device::load(&fresh, &mut chunk.reader()).unwrap();
+            assert_eq!(snapshot(&fresh), bytes, "present = {present}");
+            assert_eq!(fresh.port().has_disc(), present);
+        }
+    }
+
+    #[test]
+    fn the_drive_publishes_both_of_its_handles_and_nothing_else() {
+        let drive = CdRom::holding(None).expect("an empty tray realizes");
+        assert!(drive.export(ExportId::CD_DRIVE).is_some());
+        assert!(drive.export(ExportId::REMOVABLE_MEDIA).is_some());
+        assert!(drive.export(ExportId::CUSTOM_BUS).is_none());
     }
 }

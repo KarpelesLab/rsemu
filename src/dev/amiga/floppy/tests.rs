@@ -619,3 +619,177 @@ fn a_snapshot_keeps_the_written_tracks_owed_and_a_backed_load_owes_them_all() {
         "every other track was written"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the door
+// ---------------------------------------------------------------------------
+
+/// An ADF whose every sector carries `mark`, so two of them can be told apart.
+fn adf_marked(mark: u8) -> Vec<u8> {
+    let mut bytes = adf_image();
+    for sector in bytes.chunks_mut(adf::SECTOR_BYTES) {
+        sector[1] = mark;
+    }
+    bytes
+}
+
+#[test]
+fn a_disk_goes_in_and_comes_out_through_the_seam() {
+    let rig = Rig::new();
+    let door = rig.drive.media();
+
+    let bays = door.bays();
+    assert_eq!(bays.len(), 1);
+    assert_eq!(bays[0].name, "disk");
+    assert!(bays[0].medium.is_none(), "an empty drive reads empty");
+
+    door.insert("disk", medium::from_bytes(&adf_marked(1)), false)
+        .expect("an ADF of the right length");
+    let held = door.bays()[0].medium.clone().expect("a disk is in it");
+    assert_eq!(held.capacity, adf::ADF_BYTES as u64);
+    assert!(!held.write_protected);
+    assert_eq!(rig.drive.disk().expect("a disk").to_adf().0, adf_marked(1));
+
+    // The interface's own "no disk" answer: `RDY*` is what a drive with its
+    // motor on pulls low when there is something to read, and it lets go.
+    door.eject("disk").expect("it comes out");
+    assert!(door.bays()[0].medium.is_none());
+    rig.select(true);
+    assert!(!rig.low("rdy"), "an empty drive is never ready");
+    assert!(rig.drive.disk().is_none());
+
+    // And a bay this drive does not have is named rather than ignored.
+    let e = door
+        .insert("df1", medium::from_bytes(&adf_marked(1)), false)
+        .expect_err("one drive, one bay");
+    assert!(format!("{e}").contains("disk"), "{e}");
+}
+
+#[test]
+fn a_swap_pulls_chng_low_until_the_head_is_stepped() {
+    // Appendix E: the change flop "is reset when drive is selected and the
+    // head stepped, but only if a disk is installed". A swap is a removal and
+    // an insertion, and the *door* is what sets the flop either way round —
+    // so a guest with a volume mounted is told, which is the whole point.
+    let rig = Rig::new();
+    let door = rig.drive.media();
+    door.insert("disk", medium::from_bytes(&adf_marked(1)), false)
+        .expect("it goes in");
+    rig.select(true);
+    rig.step(true);
+    assert!(!rig.low("chng"), "settled before the swap");
+
+    door.insert("disk", medium::from_bytes(&adf_marked(2)), false)
+        .expect("the other disk");
+    assert!(rig.low("chng"), "CHNG* is pulled low by the door");
+    rig.step(true);
+    assert!(!rig.low("chng"), "and a step with a disk in it clears it");
+
+    door.eject("disk").expect("it comes out");
+    assert!(rig.low("chng"), "so does taking one out");
+    rig.step(true);
+    assert!(
+        rig.low("chng"),
+        "and an empty drive never clears it: nothing to step against"
+    );
+}
+
+#[test]
+fn an_inserted_disk_can_be_write_protected() {
+    let rig = Rig::new();
+    let door = rig.drive.media();
+    door.insert("disk", medium::from_bytes(&adf_marked(1)), true)
+        .expect("it goes in");
+    assert!(door.bays()[0].medium.clone().expect("held").write_protected);
+    rig.select(true);
+    assert!(rig.low("wpro"), "WPRO* is the tab");
+}
+
+#[test]
+fn a_medium_of_the_wrong_length_leaves_the_drive_as_it_was() {
+    let rig = Rig::new();
+    let door = rig.drive.media();
+    door.insert("disk", medium::from_bytes(&adf_marked(7)), false)
+        .expect("it goes in");
+    let before = rig.drive.disk().expect("a disk");
+
+    let e = door
+        .insert("disk", medium::from_bytes(&[0u8; 1024]), false)
+        .expect_err("1 KiB is no ADF");
+    assert!(format!("{e}").contains("ADF"), "{e}");
+    assert_eq!(
+        rig.drive.disk().expect("still a disk"),
+        before,
+        "a refused insert changes nothing"
+    );
+}
+
+#[test]
+fn ejecting_hands_a_written_track_back_to_the_medium_it_came_from() {
+    // The write-back half. A disk that came in through this door *is* the
+    // medium — `--drive df0=` semantics — so taking it out has to hand its
+    // written tracks over before the handle is dropped, or a swap silently
+    // discards everything the guest wrote since the head last moved.
+    let image = adf_image();
+    let file = medium::from_bytes(&image);
+    let rig = Rig::new();
+    rig.drive
+        .media()
+        .insert("disk", Arc::clone(&file), false)
+        .expect("it goes in");
+    rig.select(true);
+
+    let new: Vec<u8> = image[..adf::TRACK_DATA].iter().map(|b| !b).collect();
+    write_track(&rig, &adf::encode_track(0, &new));
+    let mut back = vec![0u8; adf::ADF_BYTES];
+    Medium::read_at(&*file, 0, &mut back).unwrap();
+    assert_eq!(back, image, "the head has not left the track yet");
+
+    rig.drive.media().eject("disk").expect("it comes out");
+    Medium::read_at(&*file, 0, &mut back).unwrap();
+    assert_eq!(
+        &back[..adf::TRACK_DATA],
+        &new[..],
+        "the eject handed it back"
+    );
+    assert_eq!(&back[adf::TRACK_DATA..], &image[adf::TRACK_DATA..]);
+}
+
+#[test]
+fn a_snapshot_round_trips_with_a_disk_and_without_one() {
+    for present in [true, false] {
+        let saved = Rig::new();
+        let door = saved.drive.media();
+        door.insert("disk", medium::from_bytes(&adf_marked(3)), false)
+            .expect("it goes in");
+        if !present {
+            door.eject("disk").expect("it comes out");
+        }
+
+        let mut shape = MachineShape::new();
+        shape.add_device("df0", CLASS.name).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("df0", CLASS.name, CLASS.version).unwrap();
+            Device::save(&saved.drive, &mut chunk).unwrap();
+        }
+        let first = w.to_vec().unwrap();
+
+        let restored = Rig::new();
+        let reader = StateReader::new(&first).expect("a snapshot we just wrote");
+        let chunk = reader
+            .load("df0", CLASS.name, CLASS.version, &Migrations::new())
+            .expect("the chunk we just wrote");
+        Device::load(&restored.drive, &mut chunk.reader()).unwrap();
+        assert_eq!(restored.drive.disk().is_some(), present);
+
+        let mut shape = MachineShape::new();
+        shape.add_device("df0", CLASS.name).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("df0", CLASS.name, CLASS.version).unwrap();
+            Device::save(&restored.drive, &mut chunk).unwrap();
+        }
+        assert_eq!(first, w.to_vec().unwrap(), "present = {present}");
+    }
+}

@@ -1264,7 +1264,11 @@ dev-flash-cfi = ["dev-medium"]
 # media slot rather than `fstool`, for the same reason `dev-flash-cfi` is.
 # Written from the SD Association's freely published Physical Layer Simplified
 # Specification. `no_std + alloc`, no `unsafe`, no dependencies.
-dev-sd-card = []
+#
+# `dev-medium` because a card is removable: the socket publishes
+# `ExportId::REMOVABLE_MEDIA` so a host can change the card in it while the
+# machine runs, through the same seam every other drive uses.
+dev-sd-card = ["dev-medium"]
 
 # A GPIO matrix keypad (src/dev/keypad.rs): R row conductors, C column
 # conductors, and a switch contact at each crossing that -- while it is held --
@@ -2134,7 +2138,11 @@ dev-pc-pci = ["dev-pc", "bus-pci"]
 # it, with the command phases, the result phases, seek and interrupt handling,
 # and both DMA and non-DMA data transfer. Needs `dev-pc` for the DMA controller
 # it hands bytes to.
-dev-pc-floppy = ["dev-pc"]
+#
+# `dev-medium` because a diskette is removable: the drive publishes
+# `ExportId::REMOVABLE_MEDIA` so the monitor's `media`, `insert` and `eject`
+# reach it the same way they reach every other drive in the tree.
+dev-pc-floppy = ["dev-pc", "dev-medium"]
 
 # The q35 chipset (src/dev/q35): an Intel 82Q35 (G)MCH and an ICH9 LPC bridge,
 # which is what a machine needs before a firmware or an operating system written
