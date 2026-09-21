@@ -1,0 +1,286 @@
+# amiga-a3000 - a Commodore Amiga 3000: a 25 MHz 68030 with its 68882, the
+# Enhanced Chip Set, 2 MiB of chip RAM, and a WD33C93A SCSI port behind
+# Commodore's own DMA controller.
+#
+#   rsemu run amiga-a3000 --media kickstart=kickstart:amiga-os-310-a3000.rom \
+#       --media hd0=workbench-311.hdf
+#   rsemu run amiga-a3000 --media kickstart=kick.rom --drive hd0=disk.hdf
+#   rsemu run amiga-a3000 --media kickstart=kick.rom --media df0=disk.adf --vnc :5900
+#
+# `hd0` is a whole disk: an Amiga hard-disk image with a Rigid Disk Block in
+# its first blocks (an HDF that begins `RDSK`), which is what Kickstart's
+# `scsi.device` looks for. The very same image the A600 boots from its IDE
+# port - the RDB is a partition table, not a cable.
+#
+# What changes from `amiga-a500plus.machine`, and where each change comes from:
+#
+# * **A 68030 and a 68882.** "MC68030 32-bit microprocessor ... MC68882
+#   floating point coprocessor" running at 25 MHz on the A3000-25 (A3000
+#   Technical Reference, system overview). The processor is its own oscillator
+#   tree: it does not divide the chipset crystal the way a 68000 does on an
+#   A500, which is the whole reason the machine is faster than its chips.
+# * **A 32-bit address space**, because the processor has 32 address pins.
+#   Everything the chip set answers is still in the first 16 MiB, which is
+#   what keeps `$00DFF000` at `$00DFF000`; the space is wider so that a Zorro
+#   III address is an address rather than a wrap.
+# * **2 MiB of chip RAM at $000000.** The A3000's Agnus is the 2 MiB ECS part
+#   and the board fills it. Motherboard *fast* RAM lives at `$07000000` and is
+#   not fitted here - see the note below.
+# * **The Enhanced Chip Set**: an 8372B Agnus and an 8373 Super Denise, the
+#   same parts `amiga-a500plus` has. `graphics.library` reports `$03` in
+#   `GfxBase->ChipRevBits0` for them, which `tests/amiga_a3000.rs` asserts.
+# * **SCSI in place of nothing.** An A500+ has no hard disk at all and an A600
+#   has IDE behind Gayle. The A3000 has a **WD33C93A** and Commodore's **DMAC**,
+#   and the SCSI chip's two registers are mapped *inside* the DMA controller's
+#   register space (*The A3000+ System Specification* section 2.4.1), so one
+#   window at `$00DD0000` covers both parts. See `src/dev/amiga/sdmac.rs` for
+#   the register map and `src/dev/wd33c93.rs` for the controller.
+# * **A battery-backed clock** on the motherboard at `$00DC0000`, as on an
+#   A500 with an A501 - the A3000 has one soldered on.
+#
+# Everything else - the crystal, the CIAs and their decode, Paula, Agnus,
+# Denise, DF0, the keyboard and the mouse - is `amiga-a500plus.machine`'s, and
+# that file carries the long comments for it.
+#
+# ## The ROM, and the "ROM tower"
+#
+# This board maps a 512 KiB Kickstart at `$00F80000` and nothing else, which is
+# what an A3000 with a real Kickstart in its sockets is. Two things are worth
+# writing down because they are easy to get wrong:
+#
+# * The earliest A3000s shipped with a **bootstrap ROM** - Kickstart 1.4 or
+#   2.0 beta, "SuperKickstart" - which is not an operating system. It finds a
+#   Kickstart *partition* on the SCSI disk, copies the real Kickstart into RAM
+#   at `$00F80000` and jumps to it. `amiga-os-140-a3000.rom` is such an image.
+#   Booting one needs an HDF with that partition on it, which the Amiga Forever
+#   Workbench images do not have, so this board is not tested with it. A
+#   shipped Kickstart - 2.04 (37.175) or 3.1 (40.68), both 512 KiB - needs
+#   none of that machinery and is what the tests use.
+# * There is therefore **no ROM tower here**: no second ROM socket, no
+#   `$00E00000` extended-ROM window (that is the A500 board's, and only AROS
+#   fills it), and no write-enabled RAM shadow of `$00F80000`. A machine file
+#   for a bootstrap-ROM A3000 would need the last of those three.
+#
+# ## Motherboard fast RAM
+#
+# An A3000 has 1 to 16 MiB of 32-bit motherboard RAM at `$07000000`, behind
+# Ramsey. **It is not fitted here**, and that is a known limitation rather than
+# a choice: with RAM mapped anywhere in that window both Kickstarts relocate
+# `ExecBase` into it - which works, `AttnFlags` grows `AFF_ADDR32` - and then
+# take an unexpected CHK exception half a second later and reboot in a loop.
+# Identically with 4 MiB or with the whole 16 MiB, with either floating policy,
+# and with the SCSI bus empty, so it is neither a partly-populated window nor
+# phantom RAM found on a floating bus. `docs/platforms/amiga.md` has the
+# evidence. A machine with only chip RAM is one Commodore sold, so this board
+# is honest as it stands; `$07000000` floats, which is what an A3000 with no
+# SIMMs in it does, and `AddMem` finds nothing there. Zorro II autoconfig space
+# at `$00E80000` and Zorro III space likewise float: no cards.
+#
+# Written from the *Amiga Hardware Reference Manual* 3rd edition (Appendix D,
+# the memory map), *The A3000+ System Specification* (section 2.4, the DMAC and
+# its register table), the *WD33C93A SCSI Bus Interface Controller* data sheet
+# (November 1990) and X3.131-1994 for the bus. No Amiga emulator source, no
+# AROS source and no Kickstart disassembly was consulted (ROADMAP.md 1).
+#
+# Empty addresses float rather than fault, for the reasons the A500 file gives:
+# Gary generates /DTACK for every range no other chip claims.
+
+machine "amiga-a3000" {
+  # -- how much of each memory -----------------------------------------------
+  param chip-ram = 2M
+
+  # Every Kickstart that runs on a 3000 is 512 KiB.
+  param kickstart-size = 512K
+
+  # Whether Paula keeps stereo output frames for a host audio sink to drain.
+  param audio = false
+
+  # The date the battery-backed clock starts at. Never the host's: a device
+  # may not read the host clock (CLAUDE.md, determinism), so it is declared,
+  # and two runs of this file see the same day.
+  param time = "2026-01-01T00:00:00"
+
+  # -- the crystals ----------------------------------------------------------
+  #
+  # Two trees, because the A3000 has two. The chip set runs off the 28.37516
+  # MHz PAL crystal exactly as an A500's does; the processor runs off its own
+  # 50 MHz oscillator divided by two. `-p master=28636360` gives the NTSC
+  # chipset, which also needs `standard = "ntsc"` on `agnus` and `denise`;
+  # `-p cpu-clock=16666667` gives the A3000-16.
+  param master = 28375160
+  param cpu-clock = 25000000
+
+  # Which 68030: `-p processor=68ec030` is the part with no memory management
+  # unit, which Commodore fitted to the A3000's cost-reduced descendants. The
+  # A3000's own is the full one.
+  param processor = "68030"
+  osc   clk    = master Hz
+  osc   cpuclk = cpu-clock Hz
+
+  space mem { width = 32, endian = "big", unassigned = open-bus }
+
+  # -- the processor ---------------------------------------------------------
+  #
+  # A 68030 with its paged memory management unit and a 68882 in the
+  # coprocessor socket. `AttnFlags` in `ExecBase` is what the guest concludes
+  # from this: `tests/amiga_a3000.rs` reads it back and asserts the 68030 and
+  # 68882 bits are set.
+  object cpu "cpu.m68k" {
+    clock  = cpuclk
+    space  = mem
+    engine = "interp"
+    model  = processor
+    fpu    = "68882"
+  }
+
+  object chipram "ram" { size = chip-ram }
+  object kick    "rom" { size = kickstart-size, image = "kickstart" }
+
+  object custom "amiga.custom" { }
+  object paula "amiga.paula" { clock = clk / 8, custom = custom, port = "serial", record = audio }
+  object df0 "amiga.floppy" { clock = clk / 8, paula = paula, image = "df0" }
+
+  # -- Agnus: an 8372B, and Denise: an 8373 ----------------------------------
+  object agnus "amiga.agnus" {
+    clock    = clk / 8
+    custom   = custom
+    ram      = chipram
+    standard = "pal"
+    revision = "ecs"
+    reach    = 2M
+    paula    = paula
+    video    = denise
+  }
+  object denise "amiga.denise" { custom = custom, clock = clk / 4, revision = "ecs" }
+
+  # -- the battery-backed clock ----------------------------------------------
+  osc rtcclk = 32768 Hz
+  object rtc "amiga.rtc" { clock = rtcclk, time = time }
+
+  # -- Ramsey ----------------------------------------------------------------
+  #
+  # The memory controller, as software can see it: two registers, and the
+  # reason the board needs them is that Kickstart's memory-sizing routine
+  # writes the three mode bits of `$00DE0003` and *spins until they read back*.
+  # `version = 13` is `$0D`, "original A3000 versions of RAMSEY"
+  # (A3000+ System Specification section 2.2.2). See src/dev/amiga/ramsey.rs.
+  object ramsey "amiga.ramsey" { version = 13 }
+
+  object cia_a "mos.8520" { clock = clk / 40 }
+  object cia_b "mos.8520" { clock = clk / 40 }
+  object cia_a_decode "amiga.cia-decode" { chip = cia_a, lane = "odd"  }
+  object cia_b_decode "amiga.cia-decode" { chip = cia_b, lane = "even" }
+
+  # -- the SCSI port ---------------------------------------------------------
+  #
+  # Three objects, because the board has three things: a disk, a controller and
+  # a DMA path. They meet on a named bus (`scsi0`) the way an `ata.disk` and
+  # its adapter meet in a named drive bay.
+  #
+  # The drive is declared *first*, for the reason `pc-at.machine` gives:
+  # `Machine::reset` runs devices in declaration order, and a controller's
+  # reset pulls `RST` on the cable, which the targets must already be there to
+  # hear. No bytes bound to `hd0` is an empty cable position - an A3000 with
+  # its drive taken out, which is a machine that boots to the insert-disk
+  # screen.
+  #
+  # `id = 0` is where Commodore's own drives shipped; `scsi.device` scans every
+  # address, so any of the eight would be found.
+  object hd0 "scsi.disk" {
+    image    = "hd0"
+    bus      = "scsi0"
+    id       = 0
+    vendor   = "RSEMU"
+    product  = "SCSI HARDDISK"
+    revision = "1.0"
+  }
+
+  # The controller. `id = 7` is the initiator's own address, which is what
+  # Commodore straps and what `scsi.device` writes into the Own ID register
+  # before it issues a Reset command.
+  object wd0 "wd.33c93" { bus = "scsi0", id = 7 }
+
+  # The DMA controller, and the window both chips are behind.
+  object sdmac "amiga.sdmac" { scsi = wd0, space = mem }
+
+  # -- the overlay -----------------------------------------------------------
+  #
+  # Gary's overlay decoder, used for exactly that: the ROM at zero while `OVL`
+  # is high, chip RAM after. CIA-A's PA0 drives it, as on an A500. No `custom`
+  # (bank 6 does not repeat the registers on this board), no `slow-ram`, no
+  # `ext`.
+  object overlay "amiga.gary" {
+    space = mem
+    rom   = kick
+    ram   = chipram
+    size  = chip-ram
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  #   $00000000  chip RAM, behind the overlay                   2 MiB
+  #   $00BFD000  CIA-B, even byte lane
+  #   $00BFE000  CIA-A, odd byte lane
+  #   $00DC0000  the battery-backed clock                       64 KiB
+  #   $00DD0000  the Super DMAC, and the WD33C93A behind it     4 KiB
+  #   $00DE0000  Ramsey: the control and version registers      256 bytes
+  #   $00DFF000  the custom chip registers                      512 bytes
+  #   $00F80000  Kickstart                                      512 KiB
+  #
+  # Everything else floats: Zorro II space, autoconfig at $00E80000, the
+  # motherboard fast RAM window at $07000000 and Zorro III space above it.
+  map mem 0x00000000 size chip-ram = overlay.overlay { endian = "big" }
+  map mem 0x00BFD000 size 0x1000   = cia_b_decode    { endian = "big" }
+  map mem 0x00BFE000 size 0x1000   = cia_a_decode    { endian = "big" }
+  map mem 0x00DC0000 size 0x10000  = mirror(rtc)     { endian = "big" }
+  map mem 0x00DD0000 size 0x1000   = sdmac.regs      { endian = "big" }
+  map mem 0x00DE0000 size 0x100    = ramsey.regs     { endian = "big" }
+  map mem 0x00DFF000 size 0x200    = custom
+  map mem 0x00F80000 size 512K     = mirror(kick)    { endian = "big" }
+
+  # -- wiring ----------------------------------------------------------------
+  wire cia_a.pa0 -> overlay.ovl
+
+  wire paula.ipl0 -> cpu.ipl0
+  wire paula.ipl1 -> cpu.ipl1
+  wire paula.ipl2 -> cpu.ipl2
+
+  # INT2 is an open-collector net: CIA-A pulls it, and so does the SCSI port -
+  # the level Paula reports as PORTS, which is where `scsi.device` puts its
+  # handler. INT6 is CIA-B's, as everywhere.
+  wire cia_a.irq  -> paula.int2
+  wire sdmac.int  -> paula.int2
+  wire cia_b.irq  -> paula.int6
+
+  # The floppy lines, exactly as on the A500 (Appendix E; chapter 8, Table 8-5).
+  wire cia_b.pb7 -> df0.mtr   { pull = "up" }    # MTR*
+  wire cia_b.pb3 -> df0.sel   { pull = "up" }    # SEL0*
+  wire cia_b.pb2 -> df0.side  { pull = "up" }    # SIDE*
+  wire cia_b.pb1 -> df0.dir   { pull = "up" }    # DIR
+  wire cia_b.pb0 -> df0.step  { pull = "up" }    # STEP*
+  wire df0.rdy   -> cia_a.pa5 { pull = "up" }    # RDY*
+  wire df0.tk0   -> cia_a.pa4 { pull = "up" }    # TK0*
+  wire df0.wpro  -> cia_a.pa3 { pull = "up" }    # WPRO*
+  wire df0.chng  -> cia_a.pa2 { pull = "up" }    # CHNG*
+  wire df0.index -> cia_b.flag { pull = "up" }   # INDEX*
+
+  wire agnus.vsync -> cia_a.tod
+  wire agnus.hsync -> cia_b.tod
+
+  # -- the keyboard and the mouse --------------------------------------------
+  osc periph = 1000000 Hz
+
+  object kbd "amiga.keyboard" { clock = periph }
+  wire kbd.kclk  -> cia_a.cnt { pull = "up" }
+  wire cia_a.sp  -> kbd.kdat  { pull = "up" }
+  wire kbd.kdat  -> cia_a.sp
+
+  object mouse "amiga.mouse" { clock = periph }
+  wire mouse.y      -> denise.m0v  { pull = "up" }
+  wire mouse.yq     -> denise.m0vq { pull = "up" }
+  wire mouse.x      -> denise.m0h  { pull = "up" }
+  wire mouse.xq     -> denise.m0hq { pull = "up" }
+  wire mouse.left   -> cia_a.pa6   { pull = "up" }
+  wire mouse.right  -> paula.potly { pull = "up" }
+  wire mouse.middle -> paula.potlx { pull = "up" }
+}

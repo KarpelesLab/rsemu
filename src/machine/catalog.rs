@@ -724,6 +724,25 @@ pub static AMIGA_A600: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/amiga-a600.machine"),
 };
 
+/// A Commodore Amiga 3000, when this build has the board classes and SCSI.
+///
+/// A 68030 at 25 MHz with a 68882, the Enhanced Chip Set, 2 MiB of chip RAM in
+/// a 32-bit address space, the motherboard's battery-backed clock — and SCSI
+/// where the A600 has IDE: a `wd.33c93` behind an `amiga.sdmac`, with a
+/// `scsi.disk` on the `hd0` slot. The `kickstart` slot takes the ROM, `hd0` a
+/// whole-disk image with a Rigid Disk Block, `df0` a floppy; both drives may be
+/// empty. `machines/amiga-a3000.machine` carries the wiring, and
+/// `docs/platforms/amiga.md` the ledger.
+#[cfg(feature = "machine-amiga-a3000")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-amiga-a3000")))]
+pub static AMIGA_A3000: CatalogEntry = CatalogEntry {
+    name: "amiga-a3000",
+    summary: "an Amiga 3000: a 68030 and a 68882, ECS, 2 MiB of chip RAM, and a WD33C93A SCSI \
+              hard disk",
+    media: &["kickstart", "hd0", "df0"],
+    source: include_str!("../../machines/amiga-a3000.machine"),
+};
+
 /// A Commodore Amiga 1200, when this build has the board classes and Gayle.
 ///
 /// The AA chip set — Alice (`revision = "aga"` on `amiga.agnus`) and Lisa (the
@@ -884,6 +903,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&AMIGA_A600);
     #[cfg(feature = "machine-amiga-a1200")]
     out.push(&AMIGA_A1200);
+    #[cfg(feature = "machine-amiga-a3000")]
+    out.push(&AMIGA_A3000);
     #[cfg(feature = "machine-amiga-a500plus")]
     out.push(&AMIGA_A500PLUS);
     #[cfg(feature = "machine-amiga-cd32")]
@@ -2478,6 +2499,15 @@ mod tests {
             // The same, on the A1200, whose stack pointer is the top of its
             // 2 MiB of chip RAM. `tests/amiga_a1200.rs` boots the user's ROM
             // on it; `tests/amiga_alice.rs` drives the chip set without one.
+            // The same, on the A3000, whose stack pointer is the top of its
+            // 2 MiB of chip RAM. `tests/amiga_a3000_board.rs` drives its SCSI
+            // port without a ROM; `tests/amiga_a3000.rs` boots the user's.
+            #[cfg(feature = "machine-amiga-a3000")]
+            ("amiga-a3000", "kickstart") => &[
+                0x00, 0x20, 0x00, 0x00, // SSP = $00200000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             #[cfg(feature = "machine-amiga-a1200")]
             ("amiga-a1200", "kickstart") => &[
                 0x00, 0x20, 0x00, 0x00, // SSP = $00200000
@@ -2593,6 +2623,10 @@ mod tests {
             // An A1200 with neither drive filled, for the same reason.
             #[cfg(feature = "machine-amiga-a1200")]
             ("amiga-a1200", "hd0" | "df0") => &[],
+            // An A3000 with neither drive filled: no bytes on `hd0` is an
+            // empty SCSI address, which is the machine with its disk removed.
+            #[cfg(feature = "machine-amiga-a3000")]
+            ("amiga-a3000", "hd0" | "df0") => &[],
             // A CD32 with no disc in the tray and no second ROM half: the
             // boot screen, which is what the machine does on its own. The
             // `ext` socket is a slot rather than a second image of the

@@ -2967,6 +2967,18 @@ machine-amiga-a600 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-am
 # Workbench 3.1 off an HDF with no floppy. Adds no dependencies.
 machine-amiga-a1200 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-mos8520", "dev-amiga-gayle", "dev-ata-disk"]
 
+# The `amiga-a3000` board (machines/amiga-a3000.machine): a Commodore Amiga
+# 3000 -- a 68030 at 25 MHz with a 68882 in its coprocessor socket, the
+# Enhanced Chip Set (an 8372B Agnus and an 8373 Super Denise), 2 MiB of chip
+# RAM in a 32-bit address space, the motherboard's battery-backed clock, DF0,
+# both CIAs, the keyboard and the mouse -- and **SCSI** where the A600 has IDE:
+# a WD33C93A behind Commodore's own DMA controller, with a `scsi.disk` on the
+# `hd0` media slot. Kickstart 3.1 boots Workbench 3.1 off the same RDB whole
+# disk the A600 boots off its IDE port, with no floppy. No motherboard fast
+# RAM and no Zorro cards: both windows float, which is a machine Commodore
+# sold. Adds no dependencies.
+machine-amiga-a3000 = ["cpu-m68k", "dev-amiga-floppy", "dev-amiga-agnus", "dev-amiga-denise", "dev-amiga-keyboard", "dev-amiga-mouse", "dev-amiga-rtc", "dev-amiga-ramsey", "dev-mos8520", "dev-amiga-sdmac", "dev-scsi"]
+
 # The `amiga-cd32` board (machines/amiga-cd32.machine): a Commodore Amiga
 # CD32 -- the A1200's AA chip set and 68EC020 with 2 MiB of chip RAM, a
 # two-part 3.1 ROM (the `kickstart` and `ext` slots), Akiko, a double-speed
