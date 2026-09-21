@@ -160,10 +160,12 @@ the **mouse**, the **sound** (the PWM buffer the VIA's `PB7` gates), and
 | ~6 s | the ROM finds 1 MiB, writes `MemTop`, `BufPtr` and `ScrnBase`, initialises the SCC (32 register writes), exercises the IWM (all sixteen switches, including a mode-register load), and talks to the clock chip |
 | 7 s onward | **steady state**: the picture stops changing and the machine idles, with the 60.15 Hz tick chain running — `Ticks` at `$16A` counting up, `IFR` cleared 60 times a second — the keyboard retried two or three times a second on the VIA's shift register, and the drive polled once every half second |
 
-**What the picture shows at that point**: the Macintosh's **50 % grey desktop**,
-exactly 87,585 black pixels of 175,104, with the **arrow cursor drawn in the
-top left corner**. Nothing else is on it, and it does not change again in thirty
-virtual seconds. Every row is plain grey except the top thirty and the bottom
+**What the picture shows at that point**: the Macintosh's **50 % grey
+desktop** — a one-pixel checkerboard, exactly 87,585 black pixels of 175,104 —
+with the **arrow cursor** drawn over it about fifteen pixels in from the left
+and fourteen down, and a small solid wedge in the corner above it. Nothing
+else is on it, and it does not change again in thirty virtual seconds: every
+row is plain grey except the top thirty, which hold the cursor, and the bottom
 five.
 
 No access faults, the processor never double-faults, and the video circuit

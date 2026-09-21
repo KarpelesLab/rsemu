@@ -5,8 +5,8 @@
 #   rsemu run mac-plus --media macrom=Mac-Plus.ROM --vnc :5900
 #
 # With no disk the ROM chimes, sizes memory, runs its memory test and settles
-# on the Macintosh's grey desktop with the arrow cursor in the top left corner,
-# with its 60.15 Hz tick chain running. It does **not** reach the insert-disk
+# on the Macintosh's grey desktop with the arrow cursor drawn over it, and its
+# 60.15 Hz tick chain running. It does **not** reach the insert-disk
 # screen yet; `docs/platforms/mac-plus.md` has the ledger of what is missing.
 # The picture reaches a person through `--vnc`, which serves the video
 # circuit's scanout.

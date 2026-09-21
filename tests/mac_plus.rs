@@ -22,8 +22,10 @@
 //! frames), sizes memory, runs its memory test, initialises the SCC and the
 //! IWM, reads the clock chip, and settles into its interrupt-driven idle loop
 //! with the 60.15 Hz tick chain running. **The picture at that point is the
-//! Macintosh's 50 % grey desktop with the arrow cursor in the top left
-//! corner**, and it does not change again.
+//! Macintosh's 50 % grey desktop — a one-pixel checkerboard, 87,585 black
+//! pixels of 175,104 — with the arrow cursor drawn over it about fifteen
+//! pixels in from the left and fourteen down, and a small solid wedge in the
+//! corner above it.** It does not change again.
 //!
 //! It is *not* the insert-disk screen: the floppy-with-a-question-mark, and
 //! the happy Macintosh before it, are not drawn. What is still missing is in
