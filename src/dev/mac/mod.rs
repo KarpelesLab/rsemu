@@ -1,5 +1,5 @@
-//! The Macintosh board: the address decode, the VIA, the video circuit and the
-//! SCC.
+//! The Macintosh board: the address decode, the VIA, the video circuit, the
+//! SCC and the IWM.
 //!
 //! | Module | Feature | What it is |
 //! | --- | --- | --- |
@@ -11,8 +11,9 @@
 //!
 //! Everything here is written from *Guide to the Macintosh Family Hardware*
 //! (Apple Computer, 2nd edition) and the parts' own data sheets — Synertek's
-//! SY6522 and Zilog's Z8530 — and from black-box traces of what a real ROM
-//! touches. **No Macintosh emulator source was read, and the ROM was not
+//! SY6522, Zilog's Z8530 and Apple's own IWM specification — and from
+//! black-box traces of what a real ROM touches where those left a question
+//! open. **No Macintosh emulator source was read, and the ROM was not
 //! disassembled** (`ROADMAP.md` §1, `CLAUDE.md`). No byte of any Apple ROM is
 //! in this repository.
 //!
