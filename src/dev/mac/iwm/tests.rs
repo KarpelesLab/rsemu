@@ -2,9 +2,9 @@
 //! drive's own register file.
 
 use super::*;
-use alloc::string::ToString;
 use crate::core::props::Value;
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+use alloc::string::ToString;
 
 /// Set the switch `index` names and take whatever the read returns.
 fn touch(iwm: &Iwm, index: u8) -> u8 {

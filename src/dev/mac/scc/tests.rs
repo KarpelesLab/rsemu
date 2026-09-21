@@ -2,8 +2,8 @@
 //! chip with nothing plugged into it reports.
 
 use super::*;
-use alloc::string::ToString;
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+use alloc::string::ToString;
 
 /// Channel A is 0 and channel B is 1 throughout, which is the chip's own
 /// numbering; the *addresses* are the other way round and that is what the

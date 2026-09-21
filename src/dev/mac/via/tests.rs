@@ -6,8 +6,8 @@
 //! wiring rather than about the chip.
 
 use super::*;
-use alloc::string::ToString;
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 /// Read a register through the address space, at the offset the board's decode
