@@ -213,7 +213,20 @@ stage_wasm() {
     # handed to a real engine, running a guest, hashed against the interpreter
     # (ROADMAP.md §11.4). `web/check.mjs` §1c; node rather than a headless
     # browser, and the file says what that costs and what it does not.
+    # `check.mjs` is gated on the *built* site as well as on the module — it
+    # asserts the bundle still calls every export the glue declares — so the
+    # bundle has to be rebuilt first, exactly as CI's wasm job does it. Without
+    # this the stage reads whatever `web/dist` happens to hold: a bundle from
+    # some earlier month fails every "no longer calls" check, which reads as a
+    # regression and is not one, and a bundle that is stale in the *other*
+    # direction would pass while the real one would not.
     if command -v node >/dev/null 2>&1 && [ -f "$dir/rsemu-jit.wasm" ]; then
+      if [ -d web/node_modules ]; then
+        cp -f "$dir/rsemu-demo.wasm" web/public/rsemu.wasm 2>/dev/null || true
+        run "wasm site bundle" npm run build --prefix web
+      else
+        record "skip  wasm site bundle (no web/node_modules; run npm ci in web/)"
+      fi
       run "browser embedder + JIT determinism (node)" \
         node web/check.mjs "$dir/rsemu-demo.wasm" --jit "$dir/rsemu-jit.wasm"
     else
