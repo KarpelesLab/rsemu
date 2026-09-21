@@ -11,7 +11,9 @@ Consumed by: `dev/amiga`, `dev/mos`, `host/display/amiga.rs`,
 `tests/amiga_a600_board.rs`, `tests/amiga_a600_hdf.rs`; and for the A3000 (its
 own section), `machines/amiga-a3000.machine`, `src/dev/scsi/`,
 `src/dev/wd33c93.rs`, `src/dev/amiga/sdmac.rs`, `src/dev/amiga/ramsey.rs`,
-`tests/amiga_a3000_board.rs`, `tests/amiga_a3000.rs`; and for the ECS section,
+`tests/amiga_a3000_board.rs`, `tests/amiga_a3000.rs`; and for the A4000 (its
+own section), `machines/amiga-a4000.machine`, `src/dev/amiga/ide.rs`,
+`tests/amiga_a4000_board.rs`, `tests/amiga_a4000.rs`; and for the ECS section,
 `machines/amiga-a500plus.machine`, `src/dev/amiga/rtc.rs` and
 `tests/amiga_a500plus.rs`; and for the AA section, `src/dev/amiga/denise/aga.rs`
 and `tests/amiga_lisa.rs`.
@@ -2002,3 +2004,206 @@ themselves as **40.60** through their header words at `$F8_000C` and
 Amiga Forever ships no CD32-bootable disc image: its `Shared` directories hold
 ROMs, ADFs and HDFs, and the only ISO in the product is its own installer DVD.
 Nothing here went looking for a game.
+
+## A4000
+
+`machines/amiga-a4000.machine` is the A1200's AA chip set on the A3000's 32-bit
+board, with a **68040** on it, **16 MiB of motherboard fast RAM** behind Ramsey,
+and an IDE port that is not Gayle's. It boots Workbench 3.1 off the same Rigid
+Disk Block whole disk the A600 and the A1200 boot from.
+
+### Primary sources
+
+| Source | Covers |
+| --- | --- |
+| *Specification for the Advanced Amiga (AA) Chip Set*, Commodore-Amiga 06/07/91 | Alice and Lisa, as the AA sections above read it |
+| *Amiga Hardware Reference Manual*, 3rd ed., Appendix D (p. 315) | the 32-bit map: `$0400_0000`–`$07FF_FFFF` "Motherboard Fast RAM", `$0800_0000`–`$0FFF_FFFF` "Coprocessor Slot Expansion", `$FF00_0000` Zorro III configuration |
+| *The A3000+ System Specification*, §2.2 (Table 2-2) | Ramsey's two registers, and that version `$0E` or later is the enhanced part an A4000 has |
+| *MC68040 User's Manual* | the processor, its on-chip FPU and which instructions it traps rather than computes (`src/cpu/m68k/fpu.rs`) |
+| ATA-1 (X3.221-1994), §7 and §9 | the task file's register order, the drive-present probe, and `INTRQ`'s release on a Status read |
+| Black-box: Kickstart 3.1 (40.068), 3.X and the A4000T 3.1, all A4000 images | **where the IDE port is**, what the ROM polls, and what the A4000T's ROM wants that this board has not |
+
+The last row is the important one, and the next section is what it means. No
+Kickstart was disassembled: what follows is rsemu's own recorder printing the
+bus cycles a running machine made, which is the same instrument
+`src/dev/amiga/ramsey.rs` and the A600's Gayle identification register were
+settled with.
+
+### Finding the IDE port
+
+Commodore's A4000 documentation to hand prints no address for it. So the board
+was built with everything *but* the port — the chip set, the CIAs, Ramsey, the
+clock, the ROM — and the whole of `$00D8_0000`–`$00DB_FFFF`,
+`$00DD_0000`–`$00DD_FFFF` and `$00E8_0000`–`$00EF_FFFF` given to a recorder that
+answers zero and writes down every cycle. `amiga-os-310-a4000.rom` finished
+autoconfig (34 byte reads, at every even address from `$00E8_0000` to
+`$00E8_0042`, finding nothing) and then made exactly three accesses, four times
+over:
+
+```text
+  W.B  $00DD_203A      ; device 0, then device 1
+  R.B  $00DD_2032
+  R.B  $00DD_203E
+```
+
+That is ATA-1 §9.1's drive-present probe — Device/Head written, Cylinder Low
+and Status read — and it fixes the geometry: the three offsets from
+`$00DD_2020` are `$12`, `$1A` and `$1E`, which is `4n + 2` for *n* = 4, 6 and 7,
+the ATA-1 §7 register numbers of exactly those three. So **`A4`–`A2` are the
+drive's `DA2`–`DA0`** and **`A12` is the chip select**, which is the A600's
+wiring at a different base.
+
+With the task file modelled the ROM went two steps further and showed the rest:
+
+```text
+  W.B  $00DD_2032  $12   R.B $00DD_2032  $12    ; a scratch register, twice
+  W.B  $00DD_2032  $34   R.B $00DD_2032  $34
+  W.B  $00DD_303A  $00                          ; Device Control: nIEN clear
+  W.B  $00DD_203E  $10                          ; RECALIBRATE
+  R.W  $00DD_3020  $8000                        ; <- the interrupt register
+  R.B  $00DD_203E  $50
+  W.B  $00DD_203E  $EC                          ; IDENTIFY DEVICE
+  R.W  $00DD_3020  $8000
+  R.B  $00DD_203E  $58                          ; DRDY | DSC | DRQ
+  R.W  $00DD_2020  x256                         ; <- the data register
+```
+
+Three things fall out of those last lines, and two of them were wrong in the
+first model:
+
+* **The interrupt register is at `$00DD_3020`, read as a *word*, and only bit
+  15 matters.** That is the control block's register-0 slot, which ATA-1 §7.2
+  leaves to no drive at all.
+* **It is the drive's `INTRQ`, not a latch in front of it.** Modelled as a latch
+  that only a write clears, the boot stops dead: the ROM reads `$8000`, reads
+  Status — which releases `INTRQ` (ATA-1 §9.5) — and reads `$00DD_3020` again,
+  204 216 times in six seconds, because it never writes there. Made the line
+  itself, the same ROM reads it once, goes on to `IDENTIFY DEVICE`, and boots.
+* **`A1` is not decoded, and the port is byte-swapped.** The eight-bit registers
+  are read at the *even* addresses `$…32`, `$…3A`, `$…3E` and the sixteen-bit
+  data register as a word at `$00DD_2020` — four bytes lower in the same slot.
+  One decode covers both only if the four bytes of a slot are all the same
+  register and `A0` alone picks the half of the data bus, with `D15`–`D8`
+  carrying the drive's `DD7`–`DD0`. That is Gayle's arrangement exactly, and it
+  is also the arrangement that makes `RDSK` come back as `RDSK`: with the swap
+  the other way round the Rigid Disk Block would read `DRKS` and nothing would
+  mount.
+
+`src/dev/amiga/ide.rs` is the model. It is a class of its own rather than a
+property on `amiga.gayle` because an A4000 has no Gayle: a moved-base Gayle
+would still carry a PCMCIA slot this board has not, an identification register
+its ROM never reads, and — fatally — an interrupt that only arrives once
+software writes Gayle's enable register at `$00DA_A000`, which an A4000
+Kickstart never does. The decode itself is reproduced from `gayle.rs` rather
+than imported, so that an A4000 build links no PCMCIA model.
+
+### The map
+
+| address | what |
+| --- | --- |
+| `$0000_0000`–`$001F_FFFF` | chip RAM, and the Kickstart behind the overlay until CIA-A's `PA0` goes low |
+| `$00BF_D000` / `$00BF_E000` | CIA-B (even lane) and CIA-A (odd lane) |
+| `$00DC_0000` | the battery-backed clock, which an A1200 has not |
+| `$00DD_2020`–`$00DD_203F` | the IDE command block (`CS1FX-`) |
+| `$00DD_3020` | the port's interrupt register |
+| `$00DD_303A` | Alternate Status, and Device Control on a write (`CS3FX-`) |
+| `$00DE_0003` / `$00DE_0043` | Ramsey's control register and its version, which reads **`$0F`** here and `$0D` on an A3000 |
+| `$00DF_F000` | the custom chip registers |
+| `$00F8_0000` | Kickstart, 512 KiB, **and nowhere else**: no Gayle means none of its ROM-select mirrors at `$00E0_0000` or `$00A8_0000` |
+| `$0700_0000`–`$07FF_FFFF` | motherboard fast RAM, 16 MiB |
+
+Everything else floats: Zorro II space and its autoconfig at `$00E8_0000`, the
+coprocessor slot at `$0800_0000`, Zorro III space above `$4000_0000`, and
+Gayle's whole world — `$00DA_0000`, `$00DA_8000`, `$00DE_1000`.
+`tests/amiga_a4000_board.rs` asserts every row of that table and every one of
+those holes, with a ROM built in the file.
+
+### Motherboard fast RAM, and the A3000's `CHK`
+
+The A3000 section above records, as an open bug, that fitting RAM anywhere in
+the `$0700_0000` window makes both A3000 Kickstarts relocate `ExecBase` into it
+and then take an unexpected `CHK` exception about half a second later and
+reboot forever. **That does not reproduce on this tree.** Every row below was
+run on `master` at `ebaa03e4`, for 15 to 30 virtual seconds, watching the
+program counter, the reset-pulse count, the bus-fault count and `ExecBase`:
+
+| board | processor | ROM | fast RAM | result |
+| --- | --- | --- | --- | --- |
+| `amiga-a4000` | 68040 | 3.1 (40.068) A4000 | 16 MiB at `$0700_0000` | boots Workbench 3.1 off the IDE port; `ExecBase` `$0700_07F8` |
+| `amiga-a4000` | 68030 | 3.1 (40.068) A4000 | 16 MiB at `$0700_0000` | the same, idle at the same address |
+| `amiga-a3000` | 68030 + 68882 | 3.1 (40.068) A3000 | 16 MiB at `$0700_0000` | insert-disk screen; `ExecBase` `$0700_07F8`; 0 resets, 0 faults |
+| `amiga-a3000` | 68030 + 68882 | 3.1 (40.068) A3000 | 4 MiB at `$07C0_0000` | the same; `ExecBase` `$07C0_07F8` |
+| `amiga-a3000` | 68030 + 68882 | 2.04 (37.175) A3000 | 16 MiB at `$0700_0000` | the same |
+| `amiga-a3000` | 68030 + 68882 | 2.04 (37.175) A3000 | 4 MiB at `$0700_0000` | insert-disk screen, `ExecBase` **in chip RAM** — see below |
+
+The A3000 rows were run by taking `machines/amiga-a3000.machine`'s own shipped
+source, appending a `ram` object and one `map` statement to it, and building
+that; the shipped file is unchanged and that is its section's work to do, not
+this one's. What is recorded here is the evidence.
+
+The last row is not a failure: it is where the ROM looks. Kickstart's
+memory-sizing routine starts at **`$07F7_FFF0`** and works down — the listing is
+in `src/dev/amiga/ramsey.rs`, printed by rsemu's disassembler — so a window
+filled from the *bottom* with less than 16 MiB has nothing at the address the
+ROM probes, and the ROM concludes there is none. A part-populated board has to
+be mapped so that it **ends** at `$07FF_FFFF`. `machines/amiga-a4000.machine`
+defaults to the full 16 MiB for exactly that reason, and says so where
+`fast-ram` is declared.
+
+### How far each ROM gets
+
+`tests/amiga_a4000.rs`, behind `RSEMU_AMIGA_ROM_DIR` and `RSEMU_AMIGA_HDF_DIR`,
+boots the user's files in place and checks a frame hash; each frame was looked
+at.
+
+| ROM + disk | Reaches | What is on screen |
+| --- | --- | --- |
+| Kickstart 3.1 (40.068) + `workbench-311.hdf` | **the Workbench 3.1 desktop**, 30 s | 1600×568 in AGA. A light grey backdrop; along the top, "Copyright © 1985-1993 Commodore-Amiga, Inc. All Rights Reserved." with the screen's depth gadgets at the right; below it the open "Workbench" window in its blue bordering, holding the "Ram Disk" icon and, under it, the "Workbench3.1" hard-disk icon; scroll bars and arrows down the right and along the bottom; the red arrow pointer at the top left, where the mouse has not moved |
+| Kickstart 3.1, empty bay | its insert-disk screen, and it takes until about 35 s to draw it | A dark purple field; the Amiga check-mark in its blue-to-red gradient above four lines of orange text — "3.1 ROM   40.068 / Copyright © 1985-1993 / Commodore-Amiga, Inc. / All Rights Reserved." — and, to the right, the drive slot with the diskette below it, mid-animation |
+| `amiga-os-3x0-a4000.rom` + `workbench-311.hdf` | the same desktop | Identical but for the title bar, which reads "Copyright © 1985-2017 Cloanto Corporation and its licensors." |
+| `amiga-os-310-a4000t.rom` + `workbench-311.hdf` | finds the drive, identifies it, and stops | **black** — see below |
+
+`GfxBase->ChipRevBits0` reads **`$1F`** on both booted runs — `GFXF_HR_AGNUS`,
+`GFXF_HR_DENISE`, `GFXF_AA_ALICE`, `GFXF_AA_LISA` and bit 4 — and `$13` at the
+insert-disk screen, which is the same "the AA pair appears only once the ROM has
+a boot device" the A1200 section records, reproduced on a different board.
+`ExecBase->AttnFlags` reads **`$807F`** — `AFF_68010 | AFF_68020 | AFF_68030 |
+AFF_68040 | AFF_68881 | AFF_68882 | AFF_FPU40` — and `ExecBase` itself is at
+`$0700_07F8`, in the motherboard fast RAM. All three are asserted rather than
+described.
+
+### The A4000T's ROM wants a chip this board has not
+
+`amiga-os-310-a4000t.rom` gets as far as anything does on the IDE port: it
+probes both device positions, runs the scratch-register test, issues
+`RECALIBRATE` and then `IDENTIFY DEVICE`, reads all 256 words back — the
+identification says `RSEMU` where the model string is — and goes on polling the
+drive about eleven times a second for the rest of the run. Then it stops, with
+`ExecBase` in fast RAM at `$0700_0810` and a black screen, and it is still there
+at 75 s.
+
+The recorder says why. Besides the IDE port, that ROM writes and reads
+**`$00DD_0040`–`$00DD_00EE`** — a register file that is neither the IDE port's
+nor Ramsey's — and then reads `$00DD_0062` 388 times and gives up. An A4000T has
+an **NCR 53C710** SCSI controller on the motherboard in exactly that space,
+where an A3000 has its DMAC and WD33C93A, and this board has nothing there. So
+that row is the board being honest about what it is: the same disk, the same
+port and the same drive boot under both of the other two ROMs. A machine file
+for an A4000T would need that controller, which is a separate part and a
+separate job.
+
+### Open, and not guessed at
+
+* **How much of `$00DD_2000`–`$00DD_3FFF` the board really decodes.** The model
+  answers only where `A5` is high and `A11`–`A6` are low, because that is the
+  only place the ROM goes; whether a real A4000 aliases the task file across the
+  rest of each page is not established, and nothing tested here can tell.
+* **What the port does with a byte access at an odd address.** The ROM never
+  makes one. The model puts `D7`–`D0` there, which is Gayle's rule and the
+  A600's schematic's.
+* **The 53C710 at `$00DD_0040`.** Identified by what the A4000T's ROM does with
+  it and by what Commodore put on that board, not by a register table; nothing
+  here models it.
+* **Whether the A3000's `CHK` was ever the board's.** It does not reproduce, and
+  the sweep above is as far as this work can take it without the A3000's own
+  file, which belongs to that section.

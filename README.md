@@ -510,6 +510,14 @@ two registers are mapped inside. Kickstart 3.1 and 2.04 boot on it to the
 insert-disk screen with the SCSI bus empty, with the guest itself reporting an
 ECS chip set and a 68030 with a 68882; `docs/platforms/amiga.md` records
 exactly where a boot *from* the SCSI disk stops and what has been ruled out.
+`amiga-a4000` is the **68040** machine: the AA chip set on the A3000's 32-bit
+board, a 25 MHz 68040 with its on-chip FPU, 2 MiB of chip RAM, **16 MiB of
+motherboard fast RAM** behind Ramsey — `exec` relocates `ExecBase` into it —
+and the A4000's own **IDE port**, which is not Gayle's and is at an address
+Commodore's published documentation does not print, so it was found by
+recording what the ROM touches on a board that answers nowhere else.
+**Kickstart 3.1 boots Workbench 3.1 on it off the hard disk**, with the guest
+reporting AA chips and a 68040.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's
