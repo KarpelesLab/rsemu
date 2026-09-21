@@ -144,6 +144,22 @@
 //! snapshot load. Nothing on this board retopologises `mem` at all, so the path
 //! is exercised by a test rather than by the machine.
 //!
+//! # The one hard part a try-lock cannot solve at all
+//!
+//! Everything above works because a PAM window is in the **memory** space and
+//! the write that moves it is in the **I/O** space. Swap that round and the
+//! try-lock has nothing to offer: an *I/O* base address register on a card on
+//! this fabric moves a window in the very space the `OUT` to `0xcfc` is
+//! travelling through, so the try fails, and the retry at the next
+//! configuration access fails identically because that is another `OUT`.
+//!
+//! This bridge therefore takes a **clock domain** and drains the whole fabric
+//! from `Device::advance_to`, which the run loop calls with no access in
+//! flight. [`crate::dev::q35::mch`] does the same on a q35 for the
+//! mirror-image case — a *memory* BAR moved through ECAM — and
+//! `src/bus/pci/bar.rs` carries the argument for both. The comment on the
+//! `Device` methods below states what it costs and why nothing cheaper works.
+//!
 //! # What is not modelled
 //!
 //! Everything the 440FX has that shadowing does not need, and it is a long
@@ -167,6 +183,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bus::pci::{
     Bdf, CONFIG_PORT_WINDOW_LEN, ConfigPorts, ConfigSpace, PciBus, PciFunction, buses, config,
@@ -174,6 +191,7 @@ use crate::bus::pci::{
 use crate::core::device::{Device, DeviceClass, ExportId, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
+use crate::core::sched::LazyHandle;
 use crate::core::space::{AddressSpace, MappingId, MemAttrs, Perms, RamStore, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
@@ -358,7 +376,18 @@ struct Registers {
     /// Set when a retopology could not be performed at the instant it was
     /// asked for, so the next opportunity re-applies. Derived state: never
     /// serialized, and a load re-applies unconditionally anyway.
-    stale: Mutex<bool>,
+    ///
+    /// An atomic rather than a [`Mutex`], because
+    /// [`Device::next_event_tick`](crate::core::device::Device::next_event_tick)
+    /// reads it and the scheduler holds its own leaf lock across that call.
+    stale: AtomicBool,
+    /// The tick of this bridge's own clock domain it has been advanced to.
+    ///
+    /// The bridge counts nothing. This exists so that a retopology some
+    /// function on the fabric could not perform has a moment with no access in
+    /// flight to happen in — see
+    /// [`Device::advance_to`](crate::core::device::Device::advance_to).
+    tick: AtomicU64,
 }
 
 /// Where the windows went.
@@ -480,7 +509,7 @@ impl Registers {
             mapped.space.try_topology()
         };
         let Some(mut topo) = guard else {
-            *self.stale.lock() = true;
+            self.stale.store(true, Ordering::Relaxed);
             return false;
         };
         let mut ids = Vec::with_capacity(N);
@@ -518,7 +547,7 @@ impl Registers {
             space: Arc::clone(&mapped.space),
             ids,
         });
-        *self.stale.lock() = false;
+        self.stale.store(false, Ordering::Relaxed);
         true
     }
 
@@ -555,7 +584,7 @@ impl PciFunction for Registers {
         // already wrote changes nothing a debugger could observe, and leaving
         // the machine's memory map disagreeing with its own registers is worse
         // than either.
-        if *self.stale.lock() {
+        if self.stale.load(Ordering::Relaxed) {
             self.sync(false);
         }
     }
@@ -583,7 +612,7 @@ impl PciFunction for Registers {
         // that changed nothing is pure cost.
         let touches_pam =
             offset < PAM0 + PAM_COUNT && offset.saturating_add(src.len() as u16) > PAM0;
-        if (changed && touches_pam) || *self.stale.lock() {
+        if (changed && touches_pam) || self.stale.load(Ordering::Relaxed) {
             self.retopo(&perms, false);
         }
     }
@@ -684,7 +713,8 @@ impl Pmc {
                 dram,
                 windows,
                 mapped: Mutex::with_rank(LockRank::LEAF, None),
-                stale: Mutex::with_rank(LockRank::LEAF, false),
+                stale: AtomicBool::new(false),
+                tick: AtomicU64::new(0),
             }),
             ports,
             bus,
@@ -806,6 +836,78 @@ impl Device for Pmc {
             "" | "config" => Some(Arc::clone(&self.config_region)),
             _ => None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A moment with no access in flight
+    // -----------------------------------------------------------------------
+    //
+    // This bridge counts nothing and is a lazily advanced device. The clock
+    // domain is here for one reason, and it is the reason an **I/O** BAR can
+    // decode on this board at all.
+    //
+    // A 440FX has exactly one route to configuration space, the `0xcf8`/`0xcfc`
+    // pair, and that route is in the I/O space. For a window in the *memory*
+    // space — this bridge's own PAM shadow, or a card's memory BAR — that is
+    // the lucky case: the access is travelling through one space and the
+    // retopology is of another, so `try_topology` succeeds, and on the rare
+    // occasion it does not the retry lands on the next configuration access.
+    //
+    // An I/O BAR is the unlucky case, and it is unlucky *always*. The window it
+    // moves is in the very space the `OUT` to `0xcfc` is travelling through, so
+    // the blocking guard is `TOPOLOGY` twice and the try-lock cannot succeed —
+    // and neither can the retry, because the next configuration access is
+    // another cycle through the same space. This is the identical dead end a
+    // q35's ECAM produces for a memory BAR (`crate::dev::q35::mch`), reached
+    // from the other side, and it has the same answer: the retry needs
+    // somewhere to land that is not an access at all, and `core::device`'s
+    // answer to "act outward once the handler has returned" is the scheduler.
+    //
+    // So `next_event_tick` asks for the very next tick of this bridge's own
+    // domain **only while something is owed**, and `None` otherwise, so an idle
+    // bridge costs the scheduler nothing; `advance_to` runs from the run loop
+    // with no access in flight, which is precisely the moment a topology guard
+    // is available. It still uses the try-lock, because a sibling thread's
+    // access can hold the space and blocking there would invert the ladder.
+    //
+    // A board that gives this object no clock domain is not broken, it is
+    // narrower: its memory windows behave exactly as before, and
+    // `Bars::install` is what refuses a window with nowhere to be placed.
+
+    fn is_lazy(&self) -> bool {
+        true
+    }
+
+    fn current_tick(&self) -> u64 {
+        self.regs.tick.load(Ordering::Relaxed)
+    }
+
+    fn advance_to(&self, tick: u64) {
+        self.regs.tick.store(tick, Ordering::Relaxed);
+        if self.regs.stale.load(Ordering::Relaxed) {
+            self.regs.sync(false);
+        }
+        // And the same service for every function on the fabric, for the reason
+        // above: a card's I/O BAR is moved by a write that is travelling
+        // through the space the window is in, and this bridge is the one object
+        // on the board that both knows every function and has a moment with no
+        // access in flight.
+        if self.bus.retopology_owed() {
+            self.bus.settle();
+        }
+    }
+
+    fn next_event_tick(&self) -> Option<u64> {
+        // Strictly greater than `current_tick`, or catch-up makes no progress.
+        // Both are plain atomic loads, which `LazyDevice::next_event_tick`
+        // requires: the scheduler asks this under its own leaf lock.
+        (self.regs.stale.load(Ordering::Relaxed) || self.bus.retopology_owed())
+            .then(|| self.regs.tick.load(Ordering::Relaxed) + 1)
+    }
+
+    fn attach_lazy(&self, _handle: LazyHandle) {
+        // Nothing to keep: this device never syncs itself from inside its own
+        // access, because it has no counter an access could read stale.
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {

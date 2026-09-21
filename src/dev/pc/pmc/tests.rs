@@ -324,11 +324,23 @@ fn a_stale_retopology_is_re_applied_rather_than_lost() {
         let _held = rig.mem.topology();
         rig.config_write_u8(PAM0, (RE | WE) << 4);
         assert_eq!(rig.pmc.pam(0), Some(0x30), "the register still latched");
-        assert!(*rig.pmc.regs.stale.lock(), "and it noticed");
+        assert!(
+            rig.pmc
+                .regs
+                .stale
+                .load(core::sync::atomic::Ordering::Relaxed),
+            "and it noticed"
+        );
     }
     // Any later configuration access re-applies. A read is enough.
     let _ = rig.config_read_u8(config::VENDOR_ID);
-    assert!(!*rig.pmc.regs.stale.lock(), "and put it right");
+    assert!(
+        !rig.pmc
+            .regs
+            .stale
+            .load(core::sync::atomic::Ordering::Relaxed),
+        "and put it right"
+    );
     assert_eq!(rig.peek(0xf_0000), 0x00, "the DRAM is decoded now");
 }
 

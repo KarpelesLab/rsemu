@@ -93,7 +93,10 @@ machine "xhci-pci-mini" {
   # which is how anything reaches configuration space on a machine with an I/O
   # space. Its PAM shadow windows decode nothing until something programs them,
   # which nothing on this board does.
-  object hb "pc.pmc" { space = mem, bus = "pci0" }
+  # `clock` is what lets the bridge drain a retopology a configuration write
+  # could not perform from inside itself -- see machines/pc-at.machine, which
+  # spells the reason out.
+  object hb "pc.pmc" { clock = usbclk, space = mem, bus = "pci0" }
 
   # -- the interrupt controller ----------------------------------------------
   #

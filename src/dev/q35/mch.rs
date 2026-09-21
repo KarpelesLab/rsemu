@@ -124,8 +124,10 @@
 //! next configuration access.** A q35 firmware reaches configuration space
 //! through ECAM, so every one of its configuration accesses travels through the
 //! memory space and every retry fails for the same reason the first attempt
-//! did. A 440FX never met this, because it has only one route to configuration
-//! space and that route is in the other space. So this bridge takes a **clock
+//! did. A 440FX's *memory* windows never met this, because its one route to
+//! configuration space is in the other space — though its I/O windows meet it
+//! every time, which is why [`crate::dev::pc::pmc`] has grown the same clock
+//! domain for the same reason. So this bridge takes a **clock
 //! domain** and asks the scheduler for the next tick while — and only while —
 //! something is owed; `Device::advance_to` runs from the run loop with no
 //! access in flight, which is the moment a topology guard is actually
@@ -145,9 +147,12 @@
 //! [`PciBus::retopology_owed`](crate::bus::pci::PciBus::retopology_owed) is the
 //! lock-free flag that says whether it is worth running; this device is what
 //! calls them, because it is the one object on the board that both knows every
-//! function and holds a clock domain. A board with no q35 bridge is unaffected
-//! and needs to be: a 440FX has one route to configuration space, it is in the
-//! I/O space, and `bar.rs`'s original retry works there.
+//! function and holds a clock domain. [`crate::dev::pc::pmc`] does the same for
+//! a 440FX board, where the kinds swap over: a memory window placed through
+//! `0xcfc` is placed at once and an **I/O** window placed through `0xcfc` is
+//! always deferred, because that is the space the write is travelling through.
+//! What decides is never the kind of register, only whether the access and the
+//! window are in the same space.
 //!
 //! # What is not modelled
 //!
@@ -933,11 +938,12 @@ impl Device for Mch {
     // configuration access fails for exactly the same reason — for ever, if the
     // firmware only ever uses ECAM. Which a q35 firmware does.
     //
-    // `pmc` and `bar` never met this, because a 440FX has no second route to
-    // configuration space; their retry always eventually arrives through the
-    // other space. So the stale flag needs somewhere to land that is not an
-    // access at all, and `core::device`'s answer to "act outward once the
-    // handler has returned" is the scheduler.
+    // A 440FX's *memory* windows never meet this, because its one route to
+    // configuration space is in the other space and the retry always arrives
+    // through it. Its **I/O** windows meet it every time, for the mirror-image
+    // reason, and `dev::pc::pmc` runs the same drain. Either way the stale flag
+    // needs somewhere to land that is not an access at all, and `core::device`'s
+    // answer to "act outward once the handler has returned" is the scheduler.
     //
     // `next_event_tick` therefore asks for the very next tick of this bridge's
     // clock domain **only while something is owed**, and returns `None`

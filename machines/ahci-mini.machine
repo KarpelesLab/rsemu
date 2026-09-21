@@ -93,7 +93,10 @@ machine "ahci-mini" {
   # An 82441FX, here for one of its two jobs: `CONFADD`/`CONFDATA` at 0xcf8,
   # which is how anything reaches configuration space on a machine with an I/O
   # space.
-  object hb "pc.pmc" { space = mem, bus = "pci0" }
+  # `clock` is what lets the bridge drain a retopology a configuration write
+  # could not perform from inside itself -- see machines/pc-at.machine, which
+  # spells the reason out.
+  object hb "pc.pmc" { clock = clk, space = mem, bus = "pci0" }
 
   # -- the interrupt controller ----------------------------------------------
   #

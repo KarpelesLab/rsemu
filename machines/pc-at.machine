@@ -262,7 +262,18 @@ machine "pc-at" {
   # bridge is on that bus. `pc.sysctl` publishes those four bytes as it decodes
   # them, this names it as the source, and 0xcf9 is therefore *not* mapped
   # separately below.
-  object pmc "pc.pmc" { space = mem, bus = "pci0", passthrough = sysctl }
+  #
+  # `clock = bus` is not decoration. The bridge counts nothing; the domain
+  # exists so that a window some function on the fabric could not place from
+  # inside a configuration write has a moment with no access in flight to be
+  # placed in. That is every **I/O** base address register on this board: the
+  # `OUT` to 0xcfc that moves one is travelling through the very space the
+  # window is in, so neither the blocking topology guard nor the order-exempt
+  # try-lock can serve it and the retry cannot be another configuration cycle.
+  # `Device::advance_to` can, and `src/bus/pci/bar.rs` carries the argument.
+  # `next_event_tick` returns nothing unless something is owed, so an idle
+  # bridge costs the scheduler nothing.
+  object pmc "pc.pmc" { clock = bus, space = mem, bus = "pci0", passthrough = sysctl }
 
   # -- interrupts -------------------------------------------------------------
   #
