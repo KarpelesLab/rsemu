@@ -16,7 +16,16 @@
 //! bounded module table with eviction, and the interpreter as the fallback for
 //! any block this backend refuses.
 //!
-//! # The five files
+//! **There are two things that can run a generated module.** [`exec`](crate::jit::wasm::exec) is a
+//! wasm interpreter over the emitted subset and ships everywhere, so the
+//! backend executes — and is hashed against `ir::Interp` — on every target.
+//! [`Embedder`](crate::jit::wasm::embed::Embedder) is the seam a *host* engine plugs into, and
+//! [`crate::wasm`] implements it for `wasm32-unknown-unknown`, where the
+//! page's own `WebAssembly` compiles each module once. Which one ran is a
+//! statistic ([`EngineStats::embedded`](crate::jit::wasm::rt::EngineStats::embedded))
+//! and never a behaviour.
+//!
+//! # The six files
 //!
 //! | file | what it is | needs an embedder | `unsafe` |
 //! | --- | --- | --- | --- |
@@ -24,6 +33,7 @@
 //! | [`abi`](crate::jit::wasm::abi) | the contract generated code is compiled against | no | no |
 //! | [`compile`](mod@crate::jit::wasm::compile) | one IR block lowered to that encoder | no | no |
 //! | [`exec`](crate::jit::wasm::exec) | the reference executor: a wasm interpreter over the emitted subset | no | no |
+//! | [`embed`](crate::jit::wasm::embed) | the seam a host instantiates modules through | **it is one** | no |
 //! | [`rt`](crate::jit::wasm::rt) | the module table, the imports, and the run | no | no |
 //!
 //! **No `unsafe` anywhere, and no host gate anywhere.** Both are worth saying
@@ -37,6 +47,13 @@
 //! here executes host instructions, so unlike `jit::x86` — whose whole module
 //! is `cfg`-gated to x86-64 Linux — every file compiles, and is tested, on
 //! every target in the matrix.
+//!
+//! That survives the browser embedder. [`embed`](crate::jit::wasm::embed) is a
+//! trait whose arguments
+//! are a byte slice, a `&mut [u8]` and a `&mut dyn Env`; the raw pointer a
+//! browser needs to route an import back into that `Env` is minted and
+//! consumed entirely inside [`crate::wasm`], which is the `ffi` site CLAUDE.md
+//! already sanctions. Not an eighth site, and nothing in `jit/` names one.
 //!
 //! # What §11.4 predicted, and what is now measurable
 //!
@@ -100,30 +117,45 @@
 //! The evidence is `tests/riscv_virt_engines.rs`, which runs the same board
 //! under `engine = "interp"`, `"jit"`, `"jit-host"` and `"jit-wasm"` and
 //! asserts one hash at every checkpoint — including a snapshot taken under one
-//! engine and carried on under another.
+//! engine and carried on under another — and, since the embedder landed,
+//! `web/check.mjs` §1c, which asserts the same thing with the page's own
+//! engine running the modules. The first three only ever put
+//! [`exec`](crate::jit::wasm::exec) behind them, so on their own they check
+//! this project's reading of the core specification; the fourth is what
+//! removes that qualifier.
 //!
-//! # Speed, and the honest state of the question
+//! # Speed: two numbers, because there are two executors
 //!
 //! On a native host this backend is **slower than the IR interpreter**, and it
 //! is meant to be: with no embedder there is nothing to run a module but
-//! [`exec`](crate::jit::wasm::exec), so a block is interpreted twice over.
-//! Measured on `riscv-virt`, 400 quanta after a warm-up, release, one x86-64
-//! Linux machine: `interp` 11.81 s, `jit` 6.53 s, `jit-host` 1.47 s,
-//! **`jit-wasm` 21.89 s** — 0.54× the interpreter. Every one of those seconds
-//! is [`exec`](crate::jit::wasm::exec) decoding bytecode a real engine would
-//! have compiled once, so it bounds the executor and says nothing about the
-//! backend. What it buys is that the translation is *executed* everywhere
-//! rather than merely encoded, which is what lets the determinism gate above
-//! run on the x86-64 runner that gates every commit — a claim `jit::arm64`
-//! explicitly cannot make.
+//! [`exec`](crate::jit::wasm::exec), so a block is interpreted twice over. In
+//! a browser the page's own engine compiles each module once, which is what
+//! the backend is for. The same guest for the same span, both ways:
 //!
-//! The number §11.4 actually asks for — is a wasm module faster than the IR
-//! interpreter *in a browser* — is not measured here and is not invented
-//! here. It needs the embedder, and `docs/techniques/wasm-jit.md` says exactly
-//! what that is.
+//! | engine | native ([`exec`](crate::jit::wasm::exec)) | in V8 |
+//! | --- | --- | --- |
+//! | `interp` | 1064 ms, 1.00× | 922 ms, 1.00× |
+//! | `jit` | 517 ms, 2.06× | 840 ms, 1.10× |
+//! | `jit-host` | 85 ms, 12.50× | — no `mmap` |
+//! | `jit-wasm` | 1392 ms, **0.76×** | 613 ms, **1.50×** |
+//!
+//! So `ROADMAP.md` §11.4's question is answered: a wasm module *is* faster
+//! than the IR interpreter in a browser, per basic block, with no chaining and
+//! no superblocks — which is earlier than §11.4 expected it to pay off. The
+//! native column is the floor rather than the backend, and what it buys is
+//! that the translation is *executed* everywhere rather than merely encoded,
+//! which is what lets the determinism gate above run on the x86-64 runner that
+//! gates every commit — a claim `jit::arm64` explicitly cannot make.
+//!
+//! Both columns come from one function, [`crate::wasm::rsemu_jit_guest_run`],
+//! so they are one workload rather than two with one name:
+//! `benches/wasm_jit_embedder.rs` takes the left and `web/check.mjs` §1c takes
+//! the right. `docs/techniques/wasm-jit.md` has the fixture, the caveats and
+//! the three mechanisms that would move the number.
 
 pub mod abi;
 pub mod compile;
+pub mod embed;
 pub mod emit;
 pub mod exec;
 pub mod rt;
@@ -132,5 +164,6 @@ pub mod rt;
 mod tests;
 
 pub use compile::{Compiled, Refusal, compile, compiles};
+pub use embed::{Embedder, REFUSED, install, installed};
 pub use exec::{Env, ExecError, Program};
 pub use rt::{DEFAULT_MODULES, Engine, EngineStats};

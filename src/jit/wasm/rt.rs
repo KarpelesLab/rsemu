@@ -22,6 +22,23 @@
 //! win in this backend and it is worth stating in the file rather than only in
 //! a design note.
 //!
+//! It stays true now that there *is* an embedder. Crossing into a host engine
+//! is an [`Embedder`] call, whose arguments are a byte slice, a `&mut [u8]`
+//! and a `&mut dyn Env`; the raw pointer a browser needs to route an import
+//! back into this `Env` is minted and consumed entirely inside
+//! [`crate::wasm`], which is the `ffi` site CLAUDE.md already sanctions. Not
+//! an eighth site, and nothing in `jit/` names one.
+//!
+//! # Two ways to run a module
+//!
+//! [`Engine::run`] asks the [`Embedder`] first and falls back to
+//! [`exec`]. Which one ran is a *statistic*
+//! ([`EngineStats::embedded`]) and never a behaviour: a guest cannot tell,
+//! and `tests/riscv_virt_engines.rs` is what says so. The reference executor
+//! keeps its second job either way — it is the oracle a browser run is
+//! compared against, which is what `web/check.mjs`'s JIT section does with a
+//! whole guest and a state hash.
+//!
 //! # Bounded, with eviction
 //!
 //! `ROADMAP.md` §11.4: *"module count is bounded with an LRU eviction of cold
@@ -43,6 +60,7 @@ use crate::jit::cache::CodeRef;
 
 use super::abi::{answer, func, note, status, temp_offset};
 use super::compile::{Compiled, Refusal, compile};
+use super::embed::{Embedder, REFUSED};
 use super::exec::{self, Env, Program};
 
 /// How many modules an engine keeps by default.
@@ -67,6 +85,19 @@ pub struct EngineStats {
     pub evicted: u64,
     /// Bytes of wasm currently resident.
     pub bytes: u64,
+    /// Modules the host embedder took — `WebAssembly.Module`s, in a browser.
+    ///
+    /// Never larger than [`compiled`](EngineStats::compiled), and zero on a
+    /// host with no embedder. A host that *has* one and whose engine refuses
+    /// a module leaves the two apart, which is the only way that refusal is
+    /// visible: the block still runs, on the reference executor.
+    pub instantiated: u64,
+    /// Entries into a module the **host engine** compiled.
+    ///
+    /// The number this whole backend exists to make non-zero. The difference
+    /// between this and [`executed`](EngineStats::executed) is entries the
+    /// reference executor served, which on a native host is all of them.
+    pub embedded: u64,
 }
 
 /// One resident module.
@@ -74,6 +105,9 @@ pub struct EngineStats {
 struct Resident {
     program: Program,
     compiled: Compiled,
+    /// The host engine's handle for this module, or
+    /// [`REFUSED`] if there is no embedder or it would not take it.
+    handle: u32,
 }
 
 #[derive(Debug, Default)]
@@ -112,6 +146,15 @@ pub struct Engine {
     mem: Vec<u8>,
     state: RunState,
     stats: EngineStats,
+    /// The host that instantiates modules, read once at construction.
+    ///
+    /// Cached rather than looked up per block: [`embed::installed`] takes a
+    /// lock, and a lock per guest block is exactly the shape CLAUDE.md's
+    /// concurrency rules tell you to design out. A host installs its embedder
+    /// before it builds a machine, so an engine built afterwards has it and
+    /// one built before does not — which is the right answer either way,
+    /// because switching mid-run would leave instantiated handles behind.
+    embedder: Option<&'static dyn Embedder>,
 }
 
 impl Default for Engine {
@@ -127,9 +170,19 @@ impl Engine {
         Engine::with_capacity(DEFAULT_MODULES)
     }
 
-    /// An engine holding `modules` modules.
+    /// An engine holding `modules` modules, bound to the installed embedder.
     #[must_use]
     pub fn with_capacity(modules: usize) -> Engine {
+        Engine::with_embedder(modules, super::embed::installed())
+    }
+
+    /// An engine holding `modules` modules, bound to `embedder`.
+    ///
+    /// The explicit form, for a caller that has one to hand rather than one in
+    /// the `static` — a test double, and the only reason the routing below is
+    /// exercised on a host that has no browser.
+    #[must_use]
+    pub fn with_embedder(modules: usize, embedder: Option<&'static dyn Embedder>) -> Engine {
         let modules = modules.max(1);
         let mut slots = Vec::with_capacity(modules);
         slots.resize_with(modules, Slot::default);
@@ -141,7 +194,15 @@ impl Engine {
             mem: vec![0u8; 65536],
             state: RunState::default(),
             stats: EngineStats::default(),
+            embedder,
         }
+    }
+
+    /// Whether a host embedder is instantiating this engine's modules.
+    #[inline]
+    #[must_use]
+    pub fn embedded(&self) -> bool {
+        self.embedder.is_some()
     }
 
     /// What this engine has been asked to do.
@@ -220,19 +281,40 @@ impl Engine {
         let program = exec::parse(compiled.module())
             .map_err(|_| Refusal::Shape("the emitted module does not decode"))?;
 
+        // Handed to the host *before* the slot is taken, so a host engine that
+        // refuses the bytes costs an eviction of nothing.
+        let handle = match self.embedder {
+            Some(e) => e.compile(compiled.module()),
+            None => REFUSED,
+        };
+
         let index = self.evict();
         self.clock += 1;
         let bytes = compiled.module().len() as u64;
+        let embedder = self.embedder;
         let slot = &mut self.slots[index];
         if let Some(old) = slot.resident.take() {
             self.stats.bytes -= old.compiled.module().len() as u64;
             self.stats.evicted += 1;
             slot.generation += 1;
+            // The slot's generation has already been bumped, so nothing can
+            // reach the old module any more and the host may drop it. Told
+            // after the bump rather than before, for exactly that reason.
+            if let Some(e) = embedder.filter(|_| old.handle != REFUSED) {
+                e.release(old.handle);
+            }
         }
         slot.used = self.clock;
-        slot.resident = Some(Resident { program, compiled });
+        slot.resident = Some(Resident {
+            program,
+            compiled,
+            handle,
+        });
         self.stats.bytes += bytes;
         self.stats.compiled += 1;
+        if handle != REFUSED {
+            self.stats.instantiated += 1;
+        }
 
         Ok(CodeRef {
             index: index as u32,
@@ -295,8 +377,13 @@ impl Engine {
         };
 
         let Engine {
-            slots, mem, state, ..
+            slots,
+            mem,
+            state,
+            embedder,
+            ..
         } = self;
+        let embedder = *embedder;
         let resident = slots[index]
             .resident
             .as_ref()
@@ -309,9 +396,13 @@ impl Engine {
         }
         mem[..frame].fill(0);
 
-        // The frame starts at zero: this engine's linear memory holds nothing
-        // else. An embedder's would, which is why the offset is a parameter of
-        // the generated function rather than baked into it.
+        // The frame starts at index zero of the slice below, whoever runs the
+        // module. For the reference executor that slice *is* the linear
+        // memory, so `$frame` is literally zero; for a host embedder the slice
+        // sits somewhere inside a much larger memory and `$frame` is wherever
+        // that is — which is why the offset is a parameter of the generated
+        // function rather than baked into it, and why `Thunks::frame` is zero
+        // in both cases.
         const FRAME: u32 = 0;
         let mut env = Thunks {
             state,
@@ -320,12 +411,36 @@ impl Engine {
             mems: resident.compiled.mem_ops(),
             frame: FRAME,
         };
-        let outcome = exec::run(
-            &resident.program,
-            &[0, i64::from(FRAME)],
-            mem.as_mut_slice(),
-            &mut env,
-        );
+
+        // The host engine first, the reference executor as the fallback. A
+        // `None` from `enter` means the module did **not** run — the trait
+        // says so, because a fallback after an import had already charged
+        // ticks would charge them twice — so this is a plain choice of
+        // executor and not a retry.
+        let mut embedded = false;
+        let outcome = match embedder.filter(|_| resident.handle != REFUSED) {
+            Some(e) => match e.enter(resident.handle, mem.as_mut_slice(), &mut env) {
+                Some(code) => {
+                    embedded = true;
+                    Ok(code)
+                }
+                None => exec::run(
+                    &resident.program,
+                    &[0, i64::from(FRAME)],
+                    mem.as_mut_slice(),
+                    &mut env,
+                ),
+            },
+            None => exec::run(
+                &resident.program,
+                &[0, i64::from(FRAME)],
+                mem.as_mut_slice(),
+                &mut env,
+            ),
+        };
+        if embedded {
+            self.stats.embedded += 1;
+        }
 
         let out = match outcome {
             Err(e) => Err(Error::Ir(format!(
@@ -406,6 +521,26 @@ impl Engine {
         for &(slot, temp) in &mark.live {
             if let Some(value) = self.frame_read(temp.0) {
                 host.write_slot(slot, u128::from(value));
+            }
+        }
+    }
+}
+
+/// Every instantiated module this engine still holds is the host's to reclaim.
+///
+/// A browser's module table is not this crate's memory and a dropped `Engine`
+/// is the only signal it gets that a machine is gone. Eviction already tells
+/// the host about one module at a time (`Engine::compile`); this is the same
+/// message for the rest of them, and without it a page that tore a machine
+/// down and built another would accumulate instances for the tab's lifetime.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let Some(embedder) = self.embedder else {
+            return;
+        };
+        for slot in &mut self.slots {
+            if let Some(resident) = slot.resident.take().filter(|r| r.handle != REFUSED) {
+                embedder.release(resident.handle);
             }
         }
     }

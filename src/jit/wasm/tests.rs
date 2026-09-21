@@ -851,3 +851,219 @@ fn a_block_that_falls_off_its_end_is_an_error_and_not_a_trap() {
     let (want, _) = interpreted(&block, Host::new());
     assert!(want.error.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// The embedder seam
+// ---------------------------------------------------------------------------
+//
+// [`embed::Embedder`] is how a host engine — V8, in the browser — gets to
+// instantiate a generated module and be entered instead of [`exec`]. The host
+// call itself is `wasm32-unknown-unknown`-only and lives in [`crate::wasm`],
+// so what is checked here is the half that is not: that [`Engine`] routes to
+// the embedder when there is one, falls back when there is not, tells it about
+// every eviction and every drop, and produces a bit-identical run either way.
+//
+// The double below is not a mock. It keeps a table of decoded modules and runs
+// the one a handle names, which is structurally what a browser does with a
+// table of `WebAssembly.Instance` — only the engine behind it differs. So a
+// test that passes against it is a test of the routing, and `web/check.mjs`
+// is what puts a real engine behind the same seam.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use super::embed::{self, Embedder, REFUSED};
+
+#[derive(Debug)]
+struct Double {
+    /// Decoded modules, by handle minus one. `None` once released.
+    modules: crate::core::sync::Global<Vec<Option<exec::Program>>>,
+    compiles: AtomicU64,
+    enters: AtomicU64,
+    releases: AtomicU64,
+    /// Answer every `compile` with [`REFUSED`], as an engine out of memory
+    /// would.
+    refuse: bool,
+    /// Answer every `enter` with `None`, as a host that lost its table would.
+    forget: bool,
+}
+
+impl Double {
+    const fn new(refuse: bool, forget: bool) -> Double {
+        Double {
+            modules: crate::core::sync::Global::new(Vec::new()),
+            compiles: AtomicU64::new(0),
+            enters: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+            refuse,
+            forget,
+        }
+    }
+}
+
+impl Embedder for Double {
+    fn compile(&self, module: &[u8]) -> u32 {
+        self.compiles.fetch_add(1, Ordering::Relaxed);
+        if self.refuse {
+            return REFUSED;
+        }
+        let program = exec::parse(module).expect("the backend emits what it can decode");
+        let mut table = self.modules.lock();
+        table.push(Some(program));
+        table.len() as u32
+    }
+
+    fn enter(&self, handle: u32, mem: &mut [u8], env: &mut dyn exec::Env) -> Option<i64> {
+        self.enters.fetch_add(1, Ordering::Relaxed);
+        if self.forget {
+            return None;
+        }
+        // Cloned out and the lock dropped before the run: `Env::call` reaches
+        // a guest device, and holding a lock across an outward call is the one
+        // shape `core::sync`'s ranking exists to stop.
+        let program = self.modules.lock().get(handle as usize - 1)?.clone()?;
+        // The frame is at index 0 of `mem`, so `$frame` is 0 for this
+        // embedder. A browser's is the slice's address in linear memory, which
+        // is what `embed`'s "the frame is the embedder's to locate" is about.
+        Some(exec::run(&program, &[0, 0], mem, env).expect("a module this engine emitted runs"))
+    }
+
+    fn release(&self, handle: u32) {
+        self.releases.fetch_add(1, Ordering::Relaxed);
+        let mut table = self.modules.lock();
+        if let Some(slot) = table.get_mut(handle as usize - 1) {
+            *slot = None;
+        }
+    }
+}
+
+/// A double that behaves, for the routing test.
+static RUNS: Double = Double::new(false, false);
+/// A double whose engine will not take a module.
+static REFUSES: Double = Double::new(true, false);
+/// A double that forgets a handle between compiling it and entering it.
+static FORGETS: Double = Double::new(false, true);
+/// A double for the eviction test, which counts its own releases.
+static EVICTS: Double = Double::new(false, false);
+
+/// A block whose whole observable result is one published temporary.
+fn published_sum() -> Block {
+    let mut b = started();
+    let x = b.imm(Type::I64, Const::Int(0x1234));
+    let y = b.imm(Type::I64, Const::Int(0x5678));
+    let s = b.binary(Opcode::ADD, Type::I64, x, y);
+    wrap(b, &[(2, s)])
+}
+
+#[test]
+fn an_installed_embedder_runs_the_module_and_the_answer_is_unchanged() {
+    let block = published_sum();
+    let mut plain = Engine::with_embedder(4, None);
+    let mut embedded = Engine::with_embedder(4, Some(&RUNS));
+    assert!(!plain.embedded());
+    assert!(embedded.embedded());
+
+    let a = plain.compile(&block).expect("compiles");
+    let b = embedded.compile(&block).expect("compiles");
+    let mut host_a = Host::new();
+    let mut host_b = Host::new();
+    let out_a = plain.run(&block, a, &mut host_a).expect("live");
+    let out_b = embedded.run(&block, b, &mut host_b).expect("live");
+
+    assert_eq!(
+        out_a.ok(),
+        out_b.ok(),
+        "the outcome must not depend on who ran the module"
+    );
+    assert_eq!(host_a.slots, host_b.slots, "guest state");
+    assert_eq!(plain.ticks(), embedded.ticks(), "ticks");
+
+    // And the seam was actually used rather than quietly falling back, which
+    // is the failure mode a test of the *answer* alone cannot see.
+    assert_eq!(plain.stats().embedded, 0);
+    assert_eq!(plain.stats().instantiated, 0);
+    assert_eq!(embedded.stats().embedded, 1);
+    assert_eq!(embedded.stats().instantiated, 1);
+    assert!(RUNS.compiles.load(Ordering::Relaxed) >= 1);
+    assert!(RUNS.enters.load(Ordering::Relaxed) >= 1);
+}
+
+#[test]
+fn a_host_engine_that_refuses_a_module_leaves_the_block_running() {
+    let block = published_sum();
+    let mut engine = Engine::with_embedder(4, Some(&REFUSES));
+    let code = engine.compile(&block).expect("the backend still lowers it");
+    let mut host = Host::new();
+    let out = engine.run(&block, code, &mut host).expect("live");
+    assert!(
+        out.is_ok(),
+        "a refused instantiation is not a guest-visible event"
+    );
+    assert_eq!(engine.stats().instantiated, 0, "the host took nothing");
+    assert_eq!(engine.stats().embedded, 0, "so nothing ran through it");
+    assert_eq!(engine.stats().executed, 1, "the reference executor ran it");
+
+    // Byte for byte what a host with no embedder at all produces.
+    let mut plain = Engine::with_embedder(4, None);
+    let other = plain.compile(&block).expect("compiles");
+    let mut want = Host::new();
+    let _ = plain.run(&block, other, &mut want).expect("live");
+    assert_eq!(host.slots, want.slots);
+}
+
+#[test]
+fn a_forgotten_handle_falls_back_to_the_reference_executor() {
+    let block = published_sum();
+    let mut engine = Engine::with_embedder(4, Some(&FORGETS));
+    let code = engine.compile(&block).expect("compiles");
+    let mut host = Host::new();
+    let out = engine.run(&block, code, &mut host).expect("live");
+    assert!(out.is_ok());
+    assert_eq!(engine.stats().instantiated, 1, "the host took it");
+    assert_eq!(engine.stats().embedded, 0, "but did not run it");
+    assert_eq!(FORGETS.enters.load(Ordering::Relaxed), 1, "it was asked");
+    // The fallback is a *choice of executor*, not a retry: the block's ticks
+    // are charged once, which is the whole reason `enter` may only answer
+    // `None` before an import has run.
+    let mut plain = Engine::with_embedder(4, None);
+    let other = plain.compile(&block).expect("compiles");
+    let mut want = Host::new();
+    let _ = plain.run(&block, other, &mut want).expect("live");
+    assert_eq!(host.ticks, want.ticks);
+    assert_eq!(host.slots, want.slots);
+}
+
+#[test]
+fn eviction_and_drop_hand_every_handle_back() {
+    let block = published_sum();
+    let released = || EVICTS.releases.load(Ordering::Relaxed);
+    let before = released();
+    {
+        // One slot, three compiles: two evictions, and the third handle is
+        // still resident when the engine is dropped.
+        let mut engine = Engine::with_embedder(1, Some(&EVICTS));
+        for _ in 0..3 {
+            engine.compile(&block).expect("compiles");
+        }
+        assert_eq!(engine.stats().evicted, 2);
+        assert_eq!(released() - before, 2, "each eviction releases one handle");
+    }
+    assert_eq!(
+        released() - before,
+        3,
+        "and dropping the engine releases what was still resident — a \
+         browser's module table is not this crate's memory to leak"
+    );
+}
+
+#[test]
+fn install_is_what_an_engine_built_afterwards_picks_up() {
+    // The `static` is process-wide, so this puts it back the way it found it
+    // rather than assuming it ran alone.
+    let previous = embed::install(&RUNS);
+    assert!(Engine::new().embedded(), "a fresh engine reads the static");
+    embed::uninstall();
+    assert!(!Engine::new().embedded(), "and stops when it is cleared");
+    if let Some(back) = previous {
+        embed::install(back);
+    }
+}

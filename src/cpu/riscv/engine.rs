@@ -481,6 +481,20 @@ pub struct Stats {
     pub fast_loads: u64,
     /// Compiled stores served the same way.
     pub fast_stores: u64,
+    /// Under `engine = "jit-wasm"`: modules a **host** engine instantiated.
+    ///
+    /// Zero everywhere the reference executor is the only thing that can run
+    /// one, which is every native host — `jit::wasm::embed` has the argument.
+    /// Separate from [`compiled`](Stats::compiled) because a host engine may
+    /// refuse a module it is offered and the block still runs; the difference
+    /// is the only place that refusal is visible.
+    pub wasm_instantiated: u64,
+    /// Under `engine = "jit-wasm"`: blocks entered **in** one of those.
+    ///
+    /// The number `ROADMAP.md` §11.4 is ultimately about. A browser run whose
+    /// hash matches the interpreter's but whose count here is zero has proved
+    /// nothing about this backend, which is why `web/check.mjs` reads it.
+    pub wasm_embedded: u64,
 }
 
 impl Jit {
@@ -544,7 +558,22 @@ impl Jit {
             interpreted: self.interpreted,
             fast_loads: self.fast().0,
             fast_stores: self.fast().1,
+            wasm_instantiated: self.wasm().0,
+            wasm_embedded: self.wasm().1,
         }
+    }
+
+    /// What the wasm backend's host embedder took and ran, if there is one.
+    fn wasm(&self) -> (u64, u64) {
+        #[cfg(feature = "jit-wasm")]
+        {
+            self.disp
+                .wasm()
+                .map(crate::jit::wasm::Engine::stats)
+                .map_or((0, 0), |s| (s.instantiated, s.embedded))
+        }
+        #[cfg(not(feature = "jit-wasm"))]
+        (0, 0)
     }
 
     /// What the host code generator's inlined probes served, if there is one.
