@@ -2272,6 +2272,26 @@ dev-scsi = ["dev-medium"]
 # cited by section. `no_std + alloc`, no `unsafe`, no dependencies.
 dev-wd33c93 = ["dev-scsi"]
 
+# An NCR 53C710 SCSI I/O Processor (src/dev/ncr53c710.rs): the other initiator,
+# and a processor rather than a peripheral. The sixty-four-register file in the
+# data manual's own numbering, with the chip's big-endian mode as one property
+# so that a 68000-family board reads ISTAT where an Amiga's driver polls it; the
+# whole interrupt model (ISTAT's ABRT/RST/SIGP/CON/SIP/DIP over DSTAT masked by
+# DIEN and SSTAT0 masked by SIEN, each status register clearing its own summary
+# bit on a read); and a SCRIPTS processor that fetches its own instructions out
+# of guest memory and masters the bus for them -- Block Move in all three
+# addressing forms with the manual's phase-mismatch ending, the I/O instructions
+# (Select, Wait Disconnect, Wait Reselect, Set, Clear) and the register
+# read/write ALU with its carry, Jump/Call/Return/Interrupt conditional on
+# phase, on SFBR under a mask or on the carry, and Memory Move -- whose
+# destination may be this chip's own registers, which is what a driver that
+# patches its own program needs. Target role and synchronous transfer are not
+# modelled and the module documentation says so. Written from the NCR 53C710
+# Data Manual and X3.131-1994; no emulator source, no FPGA reimplementation and
+# no Kickstart disassembly (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no
+# dependencies.
+dev-ncr53c710 = ["dev-scsi"]
+
 # Entering a Linux/x86 kernel with no firmware in between (src/dev/linuxboot.rs):
 # the Linux/x86 boot protocol as a device. It parses a `bzImage`'s setup header,
 # writes the protected-mode kernel to its own `code32_start`, builds the zero
