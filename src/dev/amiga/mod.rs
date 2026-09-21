@@ -96,6 +96,9 @@ pub mod keyboard;
 #[cfg(feature = "dev-amiga-mouse")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-mouse")))]
 pub mod mouse;
+#[cfg(feature = "dev-amiga-ramsey")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-ramsey")))]
+pub mod ramsey;
 pub mod regs;
 #[cfg(feature = "dev-amiga-rtc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-amiga-rtc")))]
@@ -134,6 +137,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     gary::register(registry)?;
     #[cfg(feature = "dev-amiga-gayle")]
     gayle::register(registry)?;
+    #[cfg(feature = "dev-amiga-ramsey")]
+    ramsey::register(registry)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::register(registry)?;
     #[cfg(feature = "dev-amiga-floppy")]
@@ -168,6 +173,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     gary::bind(bindings)?;
     #[cfg(feature = "dev-amiga-gayle")]
     gayle::bind(bindings)?;
+    #[cfg(feature = "dev-amiga-ramsey")]
+    ramsey::bind(bindings)?;
     #[cfg(feature = "dev-amiga-paula")]
     paula::bind(bindings)?;
     #[cfg(feature = "dev-amiga-floppy")]
@@ -196,6 +203,8 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     schemas.push(cdrom::schema());
     #[cfg(feature = "dev-amiga-gayle")]
     schemas.push(gayle::schema());
+    #[cfg(feature = "dev-amiga-ramsey")]
+    schemas.push(ramsey::schema());
     #[cfg(feature = "dev-amiga-paula")]
     schemas.push(paula::schema());
     #[cfg(feature = "dev-amiga-floppy")]
