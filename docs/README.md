@@ -58,6 +58,7 @@ the question never arises.
 | | |
 | --- | --- |
 | [`platforms/amiga.md`](platforms/amiga.md) | Amiga 500, 500+, 600, **1200**, **CD32**, **3000** and **4000**: the memory map, the `OVL` overlay, the custom-chip register seam, the two CIAs, Paula's interrupts, disk, UART and audio, the floppy drive, the keyboard protocol and the mouse counters, ADF disks and their MFM tracks, Gayle and its IDE port, the Enhanced Chip Set, the **AA chip set** (Alice and Lisa), **Akiko** (the chunky-to-planar corner turn, the CD-ROM controller's registers and the EEPROM's two wires) with the CD-ROM drive and the joypad beside it, the A3000's **SCSI port** — a bus, a `scsi.disk` target, a **WD33C93A** and Commodore's **Super DMAC** — **Ramsey**, the A4000's **68040** with its motherboard fast RAM and its own **IDE port** at `$00DD2020` (found black-box, and how), and what each document leaves open |
+| [`platforms/mac-plus.md`](platforms/mac-plus.md) | Macintosh Plus: the memory map and the `ROMOVERLAY` overlay, why main memory must **not** repeat, the 6522 on its A9-A12 decode, the video circuit that reads main memory, the Z8530, the IWM and its 800K drive, how far a real ROM gets and what the screen shows, the ledger of what is missing, and why a Plus cannot read a 1.44 MB disk |
 | [`platforms/apple1.md`](platforms/apple1.md) | Apple 1: the MC6821, the clock, and the monitor-ROM licence question |
 | [`platforms/nes.md`](platforms/nes.md) | NES / Famicom |
 | [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |

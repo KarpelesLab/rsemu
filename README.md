@@ -539,8 +539,25 @@ the chip is, which way round its byte lanes are, which byte of `DSP` starts it
 and how a selection spells an address were all settled by recording what the
 ROM touches; `docs/platforms/amiga.md`, "A4000T", has the traces.
 
+`mac-plus` is the newest, and the first Apple machine here: a **Macintosh
+Plus**, a 68000 at 7.8336 MHz with the `ROMOVERLAY` overlay that puts the ROM
+under the vector table until the VIA's `PA4` drops it, a 6522 and an IWM on the
+same A9-A12 decode, a Z8530 in two windows because the board decodes the
+read/write direction from the address, and a 512 × 342 one-bit screen with no
+video chip behind it at all — a counter walks main memory in step with the
+beam, and the screen buffer hangs a fixed distance below the top of *installed*
+memory, which is why the ROM has to size memory before it can draw anything.
+Point it at a real Plus ROM and it chimes, sizes its megabyte, runs its memory
+test and settles on the **grey Macintosh desktop with the arrow cursor**, with
+the 60.15 Hz tick chain running and nothing faulting. It does **not** reach the
+insert-disk screen yet; `docs/platforms/mac-plus.md` has the ledger, the
+black-box traces that got it this far — including the decoder bug that made a
+1 MiB machine size itself as 4 MiB and loop in its memory test for ever — and
+why a Plus cannot read a 1.44 MB disk whatever else is built.
+
 **Not one byte of any of that is in this repository, and none ever will be.**
-Kickstart is Cloanto's and Workbench is Commodore's; the tests read the user's
+Kickstart is Cloanto's, Workbench is Commodore's and the Macintosh ROM is
+Apple's; the tests read the user's
 own **Amiga Forever** files in place, decoding its keyed `AMIROMTYPE1` images
 with the `rom.key` beside them, and **skip with a printed reason** when the
 environment variable naming that directory is unset — so `cargo test` passes for
