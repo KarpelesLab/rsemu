@@ -53,24 +53,49 @@ jobs:
         # never rewrites the curated seeds.
         #
         # `cargo fuzz list`, not a list written here. The hand-written one named
-        # five targets and the tree has twenty-three: eighteen of them were
-        # built by the step above and then never run, so the drift this job
-        # exists to detect was going undetected for exactly the targets added
-        # after somebody last edited this line. Thirty seconds each rather than
-        # sixty keeps the job about where it was (five minutes becomes roughly
-        # twelve) — neither number finds a bug a real campaign would, and
-        # `fuzz/README.md` has that command.
+        # five targets and the tree has twenty-nine: the rest were built by the
+        # step above and then never run, so the drift this job exists to detect
+        # was going undetected for exactly the targets added after somebody last
+        # edited this line. Thirty seconds each rather than sixty keeps the job
+        # about where it was (five minutes becomes roughly twelve) — neither
+        # number finds a bug a real campaign would, and `fuzz/README.md` has
+        # that command.
+        #
+        # **Every failure, not the first**, the way the feature sweep in
+        # `ci.yml` reports every broken feature. This loop used to be `set -e`,
+        # so it died on the first red target and never reached the ones after
+        # it — and `blk_image` is fourth of twenty-nine alphabetically. Three
+        # further targets were red behind it for weeks: `vnc_proto`,
+        # `virtio_mmio` and `xhci_pci`, one of which was a remotely reachable
+        # panic in the RFB server and one a reference cycle leaking a whole
+        # address space. A list of what is broken is the entire product of a
+        # sweep; stopping at the first entry turns it into a sample of one.
+        #
+        # `::error::` puts each name in the run's annotations at the top of the
+        # page, for the same reason the sweep does: a summary line at the end
+        # of a long log gets missed.
         run: |
-          set -euxo pipefail
+          set -uo pipefail
+          failed=""
           for t in $(cargo fuzz list); do
+            echo "::group::$t"
             mkdir -p "/tmp/corpus-$t"
-            # Twelve of the twenty-three have committed seeds; libFuzzer treats
-            # a missing input directory as an error rather than as an empty one.
+            # Not every target has committed seeds; libFuzzer treats a missing
+            # input directory as an error rather than as an empty one.
             seeds=""
             [ -d "fuzz/corpus/$t" ] && seeds="fuzz/corpus/$t"
             cargo fuzz run "$t" "/tmp/corpus-$t" $seeds -- \
-              -max_total_time=30 -timeout=10
+              -max_total_time=30 -timeout=10 || failed="$failed $t"
+            echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            for t in $failed; do
+              echo "::error title=fuzz smoke::$t FAILED"
+            done
+            echo "FUZZ SMOKE FAILED:$failed"
+            exit 1
+          fi
+          echo "every fuzz target survived its thirty seconds"
       - uses: actions/upload-artifact@v5
         if: failure()
         with:
