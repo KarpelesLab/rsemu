@@ -663,9 +663,13 @@ stage_long_m68k() {
   local seeds programs
   seeds="${RSEMU_M68K_DIFF_SEEDS:-2000}"
   programs="${RSEMU_M68K_DIFF_PROGRAMS:-2000}"
-  run "long m68k differential ($((seeds * programs)) cases)" \
+  # `jit` as well as the frontend. The sweep file is gated on **both**, so
+  # naming only `cpu-m68k-lift` compiles it to nothing and `cargo test` prints
+  # "running 0 tests" and exits 0 — a green leg that swept nothing. This leg
+  # and the nightly job both shipped that way for exactly one commit.
+  run "long m68k differential ($((seeds * programs)) cases × 2 engines)" \
     env RSEMU_M68K_DIFF_SEEDS="$seeds" RSEMU_M68K_DIFF_PROGRAMS="$programs" \
-    cargo test --release --features cpu-m68k-lift \
+    cargo test --release --features cpu-m68k-lift,jit \
       --test m68k_lift_differential -- --nocapture
 }
 

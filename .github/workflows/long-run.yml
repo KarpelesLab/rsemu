@@ -211,7 +211,12 @@ jobs:
         run: |
           set -uo pipefail
           rc=0
-          cargo test --release --features cpu-m68k-lift --test m68k_lift_differential \
+          # `jit` as well as the frontend: the sweep file is gated on both, and
+          # without it the whole thing compiles to nothing and `cargo test`
+          # reports "running 0 tests" as a **pass**. That is exactly what this
+          # job looked like on the day it was written, which is why the case
+          # count below is asserted rather than merely printed.
+          cargo test --release --features cpu-m68k-lift,jit --test m68k_lift_differential \
             -- --nocapture 2>&1 | tee m68k-differential.log || rc=$?
           # The rate is the result, so put it in the checks list either way: a
           # bare pass says nothing about how much was searched (CLAUDE.md, and
@@ -219,6 +224,13 @@ jobs:
           grep -E '[0-9]+ cases' m68k-differential.log | while IFS= read -r line; do
             echo "::notice title=m68k-differential::$line"
           done
+          # A sweep that ran nothing is a failure, not a pass. Eight lines: four
+          # sweeps over each of the two translated engines.
+          lines=$(grep -c -E '[0-9]+ cases, 0 disagreements|cases over [0-9]+ seeds, 0 disagreements' m68k-differential.log || true)
+          if [ "$rc" -eq 0 ] && [ "$lines" -lt 8 ]; then
+            echo "::error title=m68k-differential::only $lines sweep results in the log, expected 8 -- the sweep did not run"
+            rc=1
+          fi
           if [ "$rc" -ne 0 ]; then
             grep -E 'disagreement' m68k-differential.log | while IFS= read -r line; do
               echo "::error title=m68k-differential::$line"
