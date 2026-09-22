@@ -25,6 +25,8 @@ Apple system software on an 800K image — ledger item 1.
 | *Synertek SY6522 / Rockwell R6522 Versatile Interface Adapter* data sheet | The chip: sixteen registers, two ports, two timers, the shift register, the interrupt flag/enable pair |
 | *Zilog Z8030/Z8530 SCC* technical manual | The one register pointer, the thirty-two registers per channel, `RR0`-`RR3`, the reset commands |
 | Apple, *IWM Specification* (1982) | The sixteen soft switches, the four register pairs `Q7:Q6` selects, the mode register, the write handshake |
+| *NCR 5380 SCSI Interface Chip Design Manual*, NCR Microelectronics (May 1985) | The SCSI chip: §6 the eight registers bit by bit, §7 the on-chip hardware support, §8 the six interrupt conditions, §9 the three resets, §10 the four transfer modes. **The Guide does not carry the 5380's register addresses** — its chapter 11 is connector pinouts and circuit diagrams and has no "SCSI addresses" section where chapter 10 has "SCC addresses", so the decode came from tracing |
+| *Inside Macintosh: Devices*, chapter 3, "SCSI Manager" (Apple Computer) | The software side: `_SCSIDispatch` and every routine's selector, the TIB instruction record, and the result codes. Used to *call* the ROM's own SCSI Manager from a test rather than to model anything |
 | Black-box register traces of a real ROM | Everything the documents leave ambiguous — see "How the ambiguities were settled" |
 
 **No Macintosh emulator source was read and the ROM was never disassembled**
@@ -67,7 +69,7 @@ contents.
   $00 0000 - $3F FFFF   memory, repeating; or the ROM while the overlay is up
   $40 0000 - $4F FFFF   ROM, repeating every 128 KiB
   $50 0000 - $57 FFFF   nothing
-  $58 0000 - $5F FFFF   SCSI (an NCR 5380) — not modelled; floats
+  $58 0000 - $5F FFFF   SCSI: an NCR 5380, register selects on A6-A4
   $60 0000 - $7F FFFF   memory while the overlay is up; nothing afterwards
   $80 0000 - $9F FFFF   the SCC, read
   $A0 0000 - $BF FFFF   the SCC, written
@@ -176,8 +178,13 @@ read/write pin for it and decodes the direction from the address instead.
 | `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
 | `mac.mouse` | the one-button mouse: two quadrature pulse trains an axis, `X1`/`Y1` on the SCC's carrier detects and `X2`/`Y2` on the VIA's `PB4`/`PB5`, the switch on `PB3`, and the host seam and record/replay door a person moves it through | the second button a later mouse has; and acceleration, which is the *ROM*'s and is worked around rather than modelled (below) |
 | `mac.sound` | the pulse-width circuit: the high byte of each of 370 words in a buffer below the top of memory, one a scan line, the `SNDENB` gate, the three volume bits and `SNDPG2`'s two buffers | the reconstruction filter on the board, whose corner the Guide does not give; and the disk-speed byte beside each sample, which an 800K mechanism ignores |
+| `ncr.5380` | the SCSI chip: all eight registers, a latch per bus signal, arbitration, selection, programmed I/O and pseudo-DMA, and the phase-mismatch interrupt that ends a transfer. Bus-neutral — `src/dev/ncr5380.rs`, beside `wd33c93.rs`, with the board's register spacing as one property | the target role, parity, and `EOP` (this board ties the pin high) |
+| `scsi.disk` | the target: `INQUIRY`, `TEST UNIT READY`, `READ CAPACITY`, `READ(6)`/`READ(10)` and the rest of `src/dev/scsi`'s command set, over a media slot | nothing this board needs; it is shared with the Amiga boards |
 
-Not modelled at all: **SCSI** (the NCR 5380 at `$580000`).
+**Nothing on the board is unmodelled now.** The mouse, the sound and SCSI were
+the last three. What is missing is behind them rather than beside them —
+writing to a floppy, a host keymap, and a disk that anything could boot from —
+and the ledger, below, has those in the order they are likely to matter.
 
 ## How far a real ROM gets
 
@@ -260,10 +267,17 @@ device or a probe:
 * **The clock chip is not it.** Parameter RAM is read, found invalid, written
   with the ROM's own defaults and read back — `03 88 00 4c a8 00 00 00 cc 0a cc
   0a 00 00 00 00 00 02 63 00` — and the date reaches `Time`.
-* **SCSI is not it.** The space's own unassigned-access counter records
-  **zero** accesses to `$500000`, `$580000` or `$F00000` in eight virtual
-  seconds. Not three writes: none — the "three writes" this file used to record
-  is not reproducible. A ROM waiting on a 5380 would be reading one.
+* **SCSI is not it** — and this bullet was wrong twice before it was right.
+  It first said three writes, then said none, and **three writes is the
+  answer**: `$580011 := $80`, `$580011 := $00`, `$580021 := $00`, at about
+  seven virtual seconds and never again. The "none" came from reading
+  `AddressSpace::unassigned_log`, whose counter only moves when the policy asks
+  for logging (`UnassignedPolicy::log`) and this board's does not — so it reads
+  zero whatever happens. **A counter that is not armed is not evidence.** What
+  settled it was mapping a region that records every access, which is what
+  `tests/mac_plus_scsi.rs` now does for good. The conclusion is unchanged: the
+  ROM is not waiting on the 5380, because after those three writes it never
+  reads it.
 * **The sound is not it.** After the chime the VIA's `ACR` is `$0C` — timer 1 in
   one-shot mode, not free-running — both timers read zero, and `IER = $87`
   enables `CA2`, `CA1` and the shift register and nothing else. There is no
@@ -817,6 +831,144 @@ would not be a Plus. The two images this was developed against are both
 directory of them, and it prints what it makes of each and checks the
 container's own `dataChecksum` — arithmetic over bytes it never keeps.
 
+## SCSI
+
+`$580000` holds an NCR 5380, and the whole of what a Macintosh Plus puts around
+it is **nothing**: no DMA controller, no interrupt line, no handshake logic.
+
+> "Although the Macintosh Plus contains an NCR 5380 SCSI controller IC, the IRQ
+> and DRQ interrupt signals provided by that IC do not generate MC68000
+> interrupts in the Macintosh Plus. Software must poll the SCSI controller's Bus
+> and Status register to determine whether a SCSI interrupt is pending."
+> — *Guide to the Macintosh Family Hardware*, chapter 3
+
+Figure 11-4 draws it the same way: `DRQ`, `IRQ` and `RDY` are all `n.c.`, and
+`/EOP` goes to +5 V through 1 kΩ. So `machines/mac-plus.machine` has **no wire
+statement for this chip**, which is the hardware rather than a simplification —
+and chapter 11 adds that "this timeout does not occur in the Macintosh Plus,
+whose SCSI operations never wait for DRQ". `src/dev/ncr5380.rs` still has an
+`irq` pin, because every later Macintosh takes it to a VIA.
+
+### The address decode was measured, not read
+
+**The Guide has no table of the 5380's register addresses.** Chapter 10 has an
+"SCC addresses" section; chapter 11 has connector pinouts, circuit diagrams,
+"SCSI data transfers" and "Handshaking for SCSI data transfers", and no
+addresses at all. Given what happened with the drive's register file — see
+"The drive's register file was invented", below — nothing here is written from
+a table that cannot be quoted.
+
+What is quotable is chapter 1, on device address space: "In the Macintosh SE,
+for example, `$580000` selects a SCSI read, whereas `$580001` selects a SCSI
+write." The rest came from watching a real ROM:
+
+```text
+  W $580011 = $80     Initiator Command: ASSERT RST
+  W $580011 = $00     release it
+  W $580021 = $00     Mode: clear
+```
+
+Those are the Initiator Command and Mode registers **if and only if** the
+chip's three register selects are on `A6`-`A4`, sixteen bytes apart, with a
+write at an odd address — which is what `stride = 16` says in the machine file.
+Four address lines reach the chip, so its window is 128 bytes and repeats 4,096
+times through the half-megabyte the chip select decodes.
+
+Two things are **inferred** rather than quoted, and both are marked as such in
+`src/dev/ncr5380.rs`:
+
+* **`A0` is a don't-care for direction.** A decoder that took `/IOR` versus
+  `/IOW` from `A0` alone would drive `/IOR` during a processor *write* to an
+  even address, which is nonsense; so the model takes the direction from the bus
+  cycle and treats `A0` as a bit software sets to match. Nothing in this tree
+  reads a write address or writes a read address, so the two readings cannot be
+  told apart from outside.
+* **Pseudo-DMA goes through the data register.** §10.4 of the data sheet leaves
+  it to a board — "This MPU read/write is externally decoded to generate the
+  appropriate DACK and IOR or IOW signals" — and no document in hand says which
+  address a Plus decodes to `/DACK`. Apple's own SCSI Manager answers it by
+  behaviour: with `DMA MODE` set and Start DMA Initiator Receive written, it
+  polls `$580050` for `DRQ` and reads **`$580000`**, once per byte, and there is
+  no second address in the loop. So a read or write of the data register under a
+  started transfer moves a byte, with the chip driving `REQ`/`ACK` as §6.3 says
+  it does in DMA mode. No `/DACK` address was invented for the machine file.
+
+### What the ROM does with it: three writes, and no bus scan
+
+Measured over **two virtual minutes**, with and without a target fitted, with
+and without a floppy in the drive, on a 1 MiB and a 4 MiB board: the ROM makes
+the three writes above and **never touches the chip again**. It does not
+arbitrate, does not assert `SEL`, does not read a single register. The drive
+queue it builds at `$0308` holds one entry, the internal floppy (`dQDrive = 1`,
+`dQRefNum = $FFFB`), so no SCSI drive was ever added to it.
+
+Those three writes are not a bus scan that found nothing — they are
+`SCSIReset`. Calling the SCSI Manager's own `SCSIReset` through
+`_SCSIDispatch` produces **exactly the same three accesses**, which is what
+identifies them.
+
+Why the ROM stops there is not settled, and it is worth saying plainly rather
+than guessing: nothing was read, so no answer this emulator gave can be the
+reason, and the next step for anyone who wants to know is a run with system
+software on a disk. What *can* be said is that the insert-disk loop is reached
+with the SCSI bus untouched, and that is what a Plus with no bootable SCSI disk
+does anyway.
+
+### Apple's SCSI Manager, called from a test, does find the disk
+
+Since the ROM will not go looking, `tests/mac_plus_scsi.rs` asks it to. It
+writes sixty bytes of *its own* 68000 code into memory and calls
+`_SCSIDispatch` — a documented trap with documented selectors — for
+`SCSIReset`, `SCSIGet`, `SCSISelect(0)`, `SCSICmd(INQUIRY)`, `SCSIRead(tib)`
+and `SCSIComplete`. The ROM's own driver then drives the chip, and this is the
+phase sequence it drove, as the chip's window recorded it:
+
+```text
+  ODR := $80                      our own ID, bit 7
+  Mode := $01                     ARBITRATE
+  read ICR  -> $40                AIP: arbitration in progress
+  read $580000 -> $80             the data bus: who is arbitrating
+  ICR := $04                      ASSERT SEL, data bus not driven yet
+  TCR := $00
+  ODR := $81                      both IDs: ours and the target's
+  ICR := $0d                      ASSERT BSY + SEL + DATA BUS
+  Mode := $00                     arbitration over
+  Select Enable := $00
+  ICR := $05                      BSY released - the selection happens here
+  read CSR  -> $6b                BSY from the target, REQ, C/D: COMMAND phase
+  ICR := $00
+  TCR := $02                      the command phase's C/D
+  read CSR  -> $69, BSR -> $18    phase match
+  ODR := $12 ... x6               the six bytes of INQUIRY, each with
+  ICR := $01 / $11 / $00          ASSERT DATA, then ACK, then let go
+  TCR := $01                      the DATA IN phase
+  Mode := $02                     DMA MODE
+  $580071 := $00                  Start DMA Initiator Receive
+  read BSR -> $58                 DRQ: the chip has a byte
+  read $580000                    and that read is the byte: thirty-six times
+  ...                             SCSIComplete takes STATUS and MESSAGE IN
+```
+
+Every call returns `noErr` except `SCSIReset`, which returns **`-1`** — not one
+of the two result codes its own page lists — having reset the bus correctly.
+That is the ROM's answer, not this emulator's, and it is recorded rather than
+asserted. The status byte is `GOOD`, the message is `COMMAND COMPLETE`, and the
+thirty-six bytes Apple's code put in our buffer are the drive's `INQUIRY` data:
+`RSEMU`, `SCSI HARDDISK`, `1.0`.
+
+**That is what a working SCSI port on this board means today**: the chip is
+right enough for Apple's own driver to select a target, send a command block,
+move a data phase through pseudo-DMA and complete the transaction.
+
+### What it still cannot do
+
+**Boot.** Not because of anything here: a bootable volume needs a driver
+descriptor map, a partition map and an HFS volume with boot blocks, and the tool
+that writes HFS in this tree cannot write a resource fork
+(`docs/upstream/fstool-hfs-resource-fork-write.md`), so no bootable disk can be
+authored. A disk that answers `INQUIRY` is the finish line for now, and the
+ledger says what would move it.
+
 ## The ledger: what to build next, in the order it is likely to matter
 
 1. **Booting one.** The board reads a disk and cannot yet start from one, and
@@ -837,10 +989,17 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
    picture where the pointer was sent. See "The mouse", below — and note what
    building it turned up, which was a livelock in the board's interrupt
    wiring that had been latent since the board existed.
-3. **The NCR 5380.** Lower down the list than it was: the ROM makes **zero**
-   accesses to `$580000` in eight virtual seconds, so nothing is waiting on it.
-   `src/dev/scsi` has the bus, the `Target` trait and a disk when the ROM gets
-   far enough to look.
+3. **A bootable SCSI disk.** The chip is here, the target is here, and Apple's
+   own SCSI Manager reads `INQUIRY` data off it — see "SCSI", above. What is
+   missing is the same thing item 1 is missing, one layer up: a disk with a
+   driver descriptor map (`$4552` at block 0), a partition map and an HFS
+   volume with boot blocks on it. `fstool` cannot write the resource fork a
+   System file needs (`docs/upstream/fstool-hfs-resource-fork-write.md`), so
+   this waits on that spec being implemented upstream, not on anything here.
+   The open question underneath it is *why* the ROM never scans the bus by
+   itself: three writes and no reads, with or without a target. A run with
+   system software on a floppy would say whether the scan is in the ROM at all
+   or comes from the System file.
 4. **Writing to a disk.** The read path is here; the write path is the same
    machinery backwards, plus the IWM's write handshake meaning something and a
    way to get the bytes back into the image.
