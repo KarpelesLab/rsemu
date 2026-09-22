@@ -689,7 +689,9 @@ pub static M68K_MINI: CatalogEntry = CatalogEntry {
 /// and `$BF_FFF9`, and the video circuit reading a 512 x 342 one-bit screen out
 /// of the top of main memory. The `macrom` slot takes the ROM image, which must
 /// be exactly 128 KiB. `-p ram=4M` gives the fully expanded machine. With no
-/// disk it reaches the ROM's insert-disk screen.
+/// disk it reaches the ROM's insert-disk screen. The `floppy` slot takes a
+/// 400K or 800K image and `hd0` a SCSI disk for the NCR 5380 at `$58_0000`;
+/// no bytes in either is an empty drive and an empty cable.
 /// `machines/mac-plus.machine` carries the wiring, and
 /// `docs/platforms/mac-plus.md` the ledger.
 #[cfg(feature = "machine-mac-plus")]
@@ -698,7 +700,7 @@ pub static MAC_PLUS: CatalogEntry = CatalogEntry {
     name: "mac-plus",
     summary: "a Macintosh Plus: a 7.83 MHz 68000, the ROM overlay at zero, a 6522 at $EFE1FE, \
               and 512x342 one-bit video read out of main memory",
-    media: &["macrom", "floppy"],
+    media: &["macrom", "floppy", "hd0"],
     source: include_str!("../../machines/mac-plus.machine"),
 };
 
@@ -1218,6 +1220,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::wd33c93::register(&mut reg)?;
     #[cfg(feature = "dev-ncr53c710")]
     crate::dev::ncr53c710::register(&mut reg)?;
+    #[cfg(feature = "dev-ncr5380")]
+    crate::dev::ncr5380::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
     #[cfg(feature = "dev-mos8520")]
@@ -1370,6 +1374,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::wd33c93::bind(&mut b)?;
     #[cfg(feature = "dev-ncr53c710")]
     crate::dev::ncr53c710::bind(&mut b)?;
+    #[cfg(feature = "dev-ncr5380")]
+    crate::dev::ncr5380::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "dev-mos8520")]
@@ -1541,6 +1547,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::wd33c93::schema());
     #[cfg(feature = "dev-ncr53c710")]
     table.insert(crate::dev::ncr53c710::schema());
+    #[cfg(feature = "dev-ncr5380")]
+    table.insert(crate::dev::ncr5380::schema());
     #[cfg(feature = "dev-wdc")]
     for schema in crate::dev::wdc::schemas() {
         table.insert(schema);
@@ -2792,9 +2800,11 @@ mod tests {
             ("amiga-a500plus", "df0") => &[],
             // And the Plus's, which is the state a Macintosh draws a picture
             // for: an 800K image would be 819,200 bytes of fixture to say
-            // nothing this needs said.
+            // nothing this needs said. `hd0` is the SCSI cable and the same
+            // claim about it — no bytes is an address nobody answers at, which
+            // is a Plus with nothing plugged into the port on the back.
             #[cfg(feature = "machine-mac-plus")]
-            ("mac-plus", "floppy") => &[],
+            ("mac-plus", "floppy" | "hd0") => &[],
             // And the Classic's, for the same reason.
             #[cfg(feature = "machine-mac-classic")]
             ("mac-classic", "floppy") => &[],

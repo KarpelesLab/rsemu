@@ -44,6 +44,7 @@
 //! | [`uart`] | `dev-uart-ns16550` | serial ports that belong to no board: a National Semiconductor 16550 |
 //! | [`scsi`] | `dev-scsi` | a SCSI bus, the target seam, and a direct-access disk on it |
 //! | [`wd33c93`] | `dev-wd33c93` | a WD33C93A SCSI Bus Interface Controller: the register file and the initiator's phase sequence |
+//! | [`ncr5380`] | `dev-ncr5380` | an NCR 5380 SCSI Interface Device: eight registers, a latch per bus signal, and the protocol left in software |
 //! | [`ncr53c710`] | `dev-ncr53c710` | an NCR 53C710 SCSI I/O Processor: the register file, the interrupt model and a SCRIPTS processor |
 //! | [`sd`] | `dev-sd-card` | an SD memory card: the command set, the state machine, the registers |
 //! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — a HID mouse, and a mass storage device on a real medium |
@@ -221,6 +222,10 @@ pub mod riscv;
 #[cfg(feature = "dev-scsi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-scsi")))]
 pub mod scsi;
+
+#[cfg(feature = "dev-ncr5380")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-ncr5380")))]
+pub mod ncr5380;
 
 #[cfg(feature = "dev-wd33c93")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-wd33c93")))]

@@ -2292,6 +2292,28 @@ dev-wd33c93 = ["dev-scsi"]
 # dependencies.
 dev-ncr53c710 = ["dev-scsi"]
 
+# An NCR 5380 SCSI Interface Device (src/dev/ncr5380.rs): the third initiator,
+# and the simplest part of the three -- a bus transceiver with a register file
+# rather than a sequencer. Eight registers (Current SCSI Data / Output Data,
+# Initiator Command, Mode, Target Command, Current SCSI Bus Status / Select
+# Enable, Bus and Status / Start DMA Send, Input Data, and the Reset
+# Parity/Interrupt strobe), a latch per SCSI signal, and the initiator's whole
+# protocol left where the 5380 leaves it -- in software: arbitration through
+# ARBITRATE/AIP/LA, selection by asserting SEL with two IDs on the data bus,
+# and both transfer shapes, programmed I/O where the host asserts and releases
+# ACK itself and pseudo-DMA where each /DACK cycle moves a byte and the phase
+# mismatch of datasheet section 8.5 ends the transfer. Two properties describe
+# a board's address decode without naming a board: `stride`, how far apart the
+# board put the chip's three register selects, and `dack`, the address bit that
+# also asserts /DACK -- a Macintosh Plus is 16 and 0x100. Target role, parity
+# and EOP are not modelled and the module documentation says so and says why.
+# Written from the NCR 5380 SCSI Interface Chip Design Manual (NCR
+# Microelectronics, May 1985), quoted by section on the bits it justifies, and
+# X3.131 for the phases; no emulator source and no operating system's SCSI
+# driver was opened -- the Linux NCR5380.c is GPL-2.0 and off limits
+# (ROADMAP.md 1). `no_std + alloc`, no `unsafe`, no dependencies.
+dev-ncr5380 = ["dev-scsi"]
+
 # Entering a Linux/x86 kernel with no firmware in between (src/dev/linuxboot.rs):
 # the Linux/x86 boot protocol as a device. It parses a `bzImage`'s setup header,
 # writes the protected-mode kernel to its own `code32_start`, builds the zero
@@ -3233,7 +3255,7 @@ net-pktkit = ["dev-net", "std", "dep:pktkit"]
 # RAM, talks to the keyboard and draws the grey desktop; it does **not** reach
 # the insert-disk screen, and `docs/platforms/mac-plus.md` carries the ledger
 # of what has been ruled out and what is left. Adds no dependencies.
-machine-mac-plus = ["cpu-m68k", "dev-mac"]
+machine-mac-plus = ["cpu-m68k", "dev-mac", "dev-ncr5380", "dev-scsi"]
 
 # The `mac-classic` board (machines/mac-classic.machine plus the classes it
 # names): a Macintosh Classic (1990). The same compact-Macintosh shape as
