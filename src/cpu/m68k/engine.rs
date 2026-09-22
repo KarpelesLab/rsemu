@@ -273,7 +273,7 @@ pub struct Stats {
     /// [`StoreLog`].
     pub invalidated_in_block: u64,
     /// Translations a store from an **interpreted instruction** invalidated,
-    /// through [`drain`].
+    /// through `drain`.
     ///
     /// Separate from the row above because they are separate mechanisms on
     /// separate paths, and a single total lets either of them stop working
