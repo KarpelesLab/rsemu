@@ -26,10 +26,11 @@ the right answer to nothing to boot from.
 Getting there took **ISM mode**, which the previous session measured the
 request for and correctly refused to invent a register file behind. The
 register file is Apple's, and it is written down: the *SWIM Chip User's
-Reference*, revision 1.5. Two things then stood between the document and the
-Finder, and both were measurements rather than readings — a drive status line
-whose polarity decides which of two paths the ROM takes at all, and the way the
-separator locks onto a sync field. Both are below.
+Reference*, revision 1.5. Three things then stood between the document and the
+Finder, and all three were measurements rather than readings — which half of a
+drive status line says "SuperDrive", how the separator locks onto a sync field,
+and how the head gets chosen when the ROM never drives the chip's own
+head-select pin. All three are below, with what was measured.
 
 ## Primary sources
 
@@ -304,7 +305,7 @@ asking its controller for something a Plus's does not have, and it is the ISM
 mode switch. `tests/mac_classic.rs::the_rom_asks_the_swim_for_ism_mode` asserts
 the sequence so it cannot be lost.
 
-### ISM mode: the document, and the two things it does not say
+### ISM mode: the document, and the three things it does not say
 
 The register file is Apple's **SWIM Chip User's Reference, revision 1.5
 (11 January 1988)**, with the *SWIM Chip Specification* of 29 September 1987
