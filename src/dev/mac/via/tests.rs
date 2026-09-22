@@ -65,21 +65,34 @@ fn the_registers_are_five_hundred_and_twelve_bytes_apart() {
     assert_eq!(REGISTER_SPAN, 16 * REGISTER_STRIDE);
 }
 
-/// A 6522 is an eight-bit part on one byte lane. A word access is not a thing
-/// that can happen, and accepting one would invent a value for the other half.
+/// A 6522 is an eight-bit part on the **high** byte lane, and a word access to
+/// it **completes** — because a compact Macintosh has no bus-error timeout, so
+/// an access to a chip that is fitted cannot fault whatever its width.
+///
+/// The chip drives the even byte and the odd one is whatever the bus was
+/// holding, which is `attrs.bus` and not a value invented here. A Macintosh
+/// Classic ROM makes exactly one such access; `src/dev/mac/via.rs`'s
+/// `constraints` has the measurement. Anything wider than a word is still
+/// refused: a longword would cover two copies of the same register and reading
+/// one twice has side effects.
 #[test]
-fn only_byte_accesses_are_accepted() {
+fn a_word_access_completes_with_the_bus_in_its_odd_half() {
     let via = Via::build();
+    let mut word = [0u8; 2];
     assert_eq!(
-        via.shared.read(0, &mut [0u8; 2], MemAttrs::DEFAULT),
-        Err(BusError::BadAccess)
+        via.shared
+            .read(0, &mut word, MemAttrs::DEFAULT.with_bus(0x5a)),
+        Ok(())
     );
+    assert_eq!(word[0], peek(&via, R_ORB), "the chip drives the even byte");
+    assert_eq!(word[1], 0x5a, "and the odd one is the floating bus");
+    assert_eq!(via.shared.write(0, &[0, 0], MemAttrs::DEFAULT), Ok(()));
     assert_eq!(
-        via.shared.write(0, &[0, 0], MemAttrs::DEFAULT),
+        via.shared.read(0, &mut [0u8; 4], MemAttrs::DEFAULT),
         Err(BusError::BadAccess)
     );
     assert_eq!(via.shared.constraints().min, Width::U8);
-    assert_eq!(via.shared.constraints().max, Width::U8);
+    assert_eq!(via.shared.constraints().max, Width::U16);
 }
 
 // ---------------------------------------------------------------------------

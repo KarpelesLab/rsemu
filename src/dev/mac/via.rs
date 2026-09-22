@@ -1003,16 +1003,28 @@ impl Shared {
 
 impl MemOps for Shared {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-        let [byte] = dst else {
-            return Err(BusError::BadAccess);
-        };
-        *byte = self.read_register(register_of(offset), attrs.debug);
-        Ok(())
+        match dst {
+            [byte] => {
+                *byte = self.read_register(register_of(offset), attrs.debug);
+                Ok(())
+            }
+            // A **word** access. The chip is on the high lane, so it drives the
+            // even byte and the odd one is whatever the bus was holding — which
+            // is `attrs.bus`, the value the space's `open-bus` policy delivers,
+            // and not a value invented here. See [`Shared::constraints`].
+            [high, low] => {
+                *high = self.read_register(register_of(offset), attrs.debug);
+                *low = attrs.bus;
+                Ok(())
+            }
+            _ => Err(BusError::BadAccess),
+        }
     }
 
     fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-        let [value] = src else {
-            return Err(BusError::BadAccess);
+        let value = match src {
+            [value] | [value, _] => *value,
+            _ => return Err(BusError::BadAccess),
         };
         if attrs.debug {
             // A debug write to IFR would clear a flag the guest has not seen
@@ -1020,15 +1032,35 @@ impl MemOps for Shared {
             // so it is refused rather than guessed at (invariant 5).
             return Err(BusError::BadAccess);
         }
-        self.write_register(register_of(offset), *value);
+        self.write_register(register_of(offset), value);
         Ok(())
     }
 
     fn constraints(&self) -> AccessConstraints {
-        // A 6522 is an eight-bit part on one lane of the 68000's word bus: a
-        // word access would read the chip and the floating other half, which
-        // is not something to invent a value for.
-        AccessConstraints::word(Width::U8, Endian::Big)
+        // A 6522 is an eight-bit part on one lane of the 68000's word bus, and
+        // it sits on the **high** one: `$EFE1FE`, the published base, is even.
+        //
+        // A word access is nevertheless permitted, and that is a measurement
+        // rather than a generosity. **A compact Macintosh has no bus-error
+        // timeout** — `/DTACK` comes from the address decoder for everything
+        // the board claims and the MC68000 user's manual (§5.4) leaves `/BERR`
+        // to external circuitry a board may omit — so an access to a chip that
+        // *is* fitted cannot fault, whatever its width. A Macintosh Classic ROM
+        // makes exactly one such access, a word through a pointer of
+        // `$EF_E1FC`, five seconds into its startup; refusing it raised a bus
+        // error the ROM took through a vector table its own memory test had
+        // just overwritten, and the machine went off the rails into the ROM's
+        // header. `docs/platforms/mac-classic.md` has the trace.
+        //
+        // The odd half of such a word is not invented: it is `attrs.bus`.
+        AccessConstraints {
+            min: Width::U8,
+            max: Width::U16,
+            natural_alignment: true,
+            endian: Endian::Big,
+            allow_bulk: false,
+            ..AccessConstraints::ANY
+        }
     }
 }
 
