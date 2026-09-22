@@ -229,9 +229,15 @@ machine "mac-plus" {
   # date. `pram` is a flat battery by default - every byte $FF - which is what
   # a real ROM finds when the battery has gone, and it writes its own defaults
   # over the top.
+  # `pram` is twenty bytes as forty hexadecimal digits, or empty for a flat
+  # battery. A real ROM that finds parameter RAM invalid writes its own
+  # defaults over the top, so an empty slot is the ordinary case and a given
+  # one is how a person keeps a setting - the mouse tracking, the double-click
+  # time, the speaker volume - across two runs of the same machine.
   param  rtcdate = "2026-01-01T00:00:00"
+  param  pram    = ""
   osc    rtcxtal = 32768 Hz
-  object rtc "mac.rtc" { clock = rtcxtal, time = rtcdate }
+  object rtc "mac.rtc" { clock = rtcxtal, time = rtcdate, pram = pram }
 
   # -- the keyboard ----------------------------------------------------------
   #
@@ -242,6 +248,29 @@ machine "mac-plus" {
   param  kbdrate = 1M
   osc    kbdclk  = kbdrate Hz
   object kbd "mac.keyboard" { clock = kbdclk }
+
+  # -- the mouse -------------------------------------------------------------
+  #
+  # See `src/dev/mac/mouse.rs`. Its clock is nothing on this board: a mouse has
+  # no crystal, and what its rate really is is how fast a hand moves. One tick
+  # is one microsecond.
+  #
+  # The default of one quadrature transition every 2 400 of them - one *count*
+  # every 4.8 ms, 208 a second - is set by what the ROM does with the counts
+  # rather than by what a hand can do. Apple's mouse scaling **doubles a delta
+  # of six or more counts in one 60.15 Hz tick** (measured: 5 counts move
+  # MTemp by 5, 6 move it by 12), and a host with an absolute pointer and a
+  # guest with a relative one that accelerates disagree about where the
+  # pointer is and never agree again. Under the threshold one count is one
+  # pixel, which is what makes `--vnc` able to point at things.
+  #
+  # The cost is a pointer that crosses the screen in about two and a half
+  # seconds. `-p mousestep=200` gives back the speed and takes the
+  # acceleration with it, which is after all what a real Macintosh does to a
+  # real mouse. `src/dev/mac/mouse.rs` has both measurements.
+  param  mousestep = 2400
+  osc    mouseclk  = 1M Hz
+  object mouse "mac.mouse" { clock = mouseclk, step-ticks = mousestep }
 
   # -- the SCC ---------------------------------------------------------------
   #
@@ -352,6 +381,36 @@ machine "mac-plus" {
   wire kbd.clk  -> via.cb1 { pull = "up" }
   wire kbd.data -> via.cb2 { pull = "up" }
   wire via.cb2  -> kbd.data
+
+  # The mouse. Each wheel drives two pulse trains ninety degrees apart: X1 and
+  # Y1 go to the SCC's two carrier detects, where a transition either way is an
+  # external/status interrupt, and X2 and Y2 go to the VIA's PB4 and PB5, which
+  # the handler reads to tell which way the wheel turned. So a Macintosh counts
+  # *one* edge per two quadrature transitions and gets half the encoder's
+  # resolution - `src/dev/mac/mouse.rs` has the argument.
+  #
+  # Which axis is on which channel is a measurement rather than a reading:
+  # channel A moves the low word of `MTemp` and channel B the high one, and a
+  # QuickDraw Point is {vertical, horizontal}, so A is horizontal.
+  # `tests/mac_plus.rs` asserts it against a real ROM.
+  #
+  # The four quadrature lines are push-pull outputs of the mouse's own logic,
+  # and they carry a `pull` for the reason the blanking nets do rather than
+  # because a real board has a resistor there: the realize sweep refreshes a
+  # *resolved* net so every sink learns its idle level, and a per-sink net has
+  # no level of its own - so the SCC and the VIA came up holding the pull-ups
+  # their pins have with nothing wired to them, and a snapshot round trip
+  # caught it (`mac.scc`'s `dcd_latched` and `mac.via`'s pin bitmap differed
+  # between the built board and the restored one). "Down" is what phase zero
+  # drives.
+  #
+  # "PB3 mouse switch (0 = button down)" is the other kind: a switch to ground,
+  # so it needs its pull-up to have a high to come back to.
+  wire mouse.x1     -> scc.dcda { pull = "down" }
+  wire mouse.y1     -> scc.dcdb { pull = "down" }
+  wire mouse.x2     -> via.pb4  { pull = "down" }
+  wire mouse.y2     -> via.pb5  { pull = "down" }
+  wire mouse.button -> via.pb3  { pull = "up" }
 
   # The sound circuit's four gates, from the Guide's VIA port-assignment
   # tables: "PA0-PA2  sound volume", "PA3  SNDPG2, 0 = alternate sound buffer"

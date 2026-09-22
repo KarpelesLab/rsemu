@@ -2833,7 +2833,11 @@ machine-m68k-mini = ["cpu-m68k"]
 # timing. `mac.gcr` and `mac.disk` are the disk: Apple's 6-and-2 group-code
 # recording, the 524-byte sector, the five speed zones, and a 400K or 800K
 # image raw or in a DiskCopy 4.2 container -- which `mac.iwm` shifts past its
-# read head a bit cell at a time. `mac.sound` is the other bus master: the
+# read head a bit cell at a time. `mac.mouse` is the one-button mouse, as two
+# quadrature pulse trains an axis -- X1 and Y1 on the SCC's two carrier
+# detects, X2 and Y2 on the VIA's port B, the switch on PB3 -- with the host
+# seam and the record/replay door a person moves it through.
+# `mac.sound` is the other bus master: the
 # pulse-width modulator, fed the high byte of each of 370 words in a buffer in
 # main memory, one a scan line, gated by the VIA's `SNDENB` and attenuated by
 # its three volume bits -- which is the whole of a Macintosh Plus's sound.

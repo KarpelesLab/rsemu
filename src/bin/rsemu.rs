@@ -2653,6 +2653,13 @@ fn vnc_session(
     if let Some(mouse) = rsemu::host::input::amiga::AmigaMouseSink::open(hosts) {
         session = session.with_sink(Arc::new(mouse));
     }
+    // And a Macintosh's mouse, the same way. There is no keyboard half: nothing
+    // in this tree turns a keysym into one of the Guide's transition codes yet
+    // (`docs/platforms/mac-plus.md`'s ledger).
+    #[cfg(feature = "dev-mac")]
+    if let Some(mouse) = rsemu::host::input::mac::MacMouseSink::open(hosts) {
+        session = session.with_sink(Arc::new(mouse));
+    }
 
     // Recording and replaying are `core::record`'s, not this frontend's, and
     // the recorder is already attached: `run` opened it before the build so

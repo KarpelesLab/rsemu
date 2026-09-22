@@ -174,11 +174,10 @@ read/write pin for it and decodes the direction from the address instead.
 | `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and its control registers, and the **read** data path: a disk shifted past the head a bit cell at a time, with each byte the shifter latches named as a scheduler event so a guest polling the data register cannot miss one | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set. The 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it |
 | `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum, the five speed zones and the **gap a formatter leaves**, which is what decides how fast the disk turns (`SECTOR_CELLS`) | the 400K drive's PWM speed control, which an 800K mechanism ignores |
 | `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
+| `mac.mouse` | the one-button mouse: two quadrature pulse trains an axis, `X1`/`Y1` on the SCC's carrier detects and `X2`/`Y2` on the VIA's `PB4`/`PB5`, the switch on `PB3`, and the host seam and record/replay door a person moves it through | the second button a later mouse has; and acceleration, which is the *ROM*'s and is worked around rather than modelled (below) |
 | `mac.sound` | the pulse-width circuit: the high byte of each of 370 words in a buffer below the top of memory, one a scan line, the `SNDENB` gate, the three volume bits and `SNDPG2`'s two buffers | the reconstruction filter on the board, whose corner the Guide does not give; and the disk-speed byte beside each sample, which an 800K mechanism ignores |
 
-Not modelled at all: the **mouse** (two quadrature phases on the SCC's carrier
-detects and two more on the VIA's `PB4`/`PB5`) — buildable now, see the ledger
-— and **SCSI** (the NCR 5380 at `$580000`).
+Not modelled at all: **SCSI** (the NCR 5380 at `$580000`).
 
 ## How far a real ROM gets
 
@@ -595,6 +594,113 @@ costs 22 254 rounds a virtual second, a run with no listener pays none of it,
 and the recorded and unrecorded runs reach the same state hash — which is the
 check that the flag is not guest-visible.
 
+### The mouse
+
+Two quadrature pulse trains an axis and a switch to ground. The *Guide*'s VIA
+port-assignment tables give three of the five wires — "PB3 mouse switch
+(0 = button down)", "PB4 mouse X2", "PB5 mouse Y2" — and the other two are the
+SCC's carrier detects, which is what that chip's two spare inputs are for on
+this board.
+
+Everything else about it was measured, because no document says any of it:
+
+| Fact | How |
+| --- | --- |
+| **channel A is the horizontal axis**, channel B the vertical | a transition on `DCDA` moves the low word of `MTemp` at `$828` and one on `DCDB` moves the high word, and a QuickDraw `Point` is `{vertical, horizontal}` |
+| **one count is one X1 transition**, so a full quadrature cycle carries two counts and not four | the SCC's external/status condition is a change either way, and the ROM reads `X2` on the VIA for the direction; `MTemp` moves by one per `DCD` edge |
+| the sense of each pair — and **the two axes turn opposite ways** | the phase walking `00 → 01 → 11 → 10` counts `MTemp`'s horizontal coordinate *down* and its vertical coordinate *up*. Which way round a wheel's encoder is mounted is not in any book |
+| **one count is one pixel** | 39 counts to the right moved `Mouse` at `$830` from 15 to 54 and moved the arrow's mark in the picture from x = 15 to x = 54 |
+| the arrow's mark — the first four-pixel run of ink in its shape — sits at `(h, v + 3)` for a hot spot of `(h, v)` | the same measurement, and it is how the test finds the pointer |
+| `MBState` at `$172` is `$00` with the button down and `$80` with it up | pressing it |
+
+**One count is one pixel only because the device is deliberately slow**, and
+that is the interesting part. The ROM applies its own mouse scaling:
+
+```text
+  counts in one 60.15 Hz tick    1   3   5    6    7    8   16   32
+  MTemp moves by                 1   3   5   12   14   16   32   64
+```
+
+Six or more in one tick is doubled. A guest that accelerates cannot be pointed
+at anything by a host whose cursor is *absolute* — the guest's pointer runs
+ahead, pins at an edge, and the two never agree again — so `mac.mouse` delivers
+at 208 counts a second, which is 3.5 a tick. The same boundary shows up from
+the other side by sweeping the rate rather than the burst size: 100 counts at
+294 a second arrive as 118, and at 208 a second they arrive as 100.
+
+And it caps the **distance** rather than each axis's own rate: both axes moving
+step at half rate each, because the ROM's threshold is on the two together.
+Without that, 100 counts on one axis came through exactly and 100 on each came
+through as 180.
+
+The cost is a pointer that crosses the screen in about two and a half seconds.
+`-p mousestep=200` gives the speed back and takes the acceleration with it,
+which is what a real Macintosh does to a real mouse.
+
+**It is not exact to the count.** 400 counts on one axis move `Mouse` by 398,
+at every rate from 2 400 ticks a step down to 6 000 and not at all at 12 000:
+the guest counts *interrupts*, and an edge arriving while the processor is in
+the level-2 handler with the VIA also waiting is an edge nothing counts. One in
+two hundred, and it does not cancel. A sweep into a screen edge puts the two
+ends back together — the ROM clamps the pointer to the screen and the host's
+cursor stops at the same place — which is what a person does without thinking
+about it and what the test does deliberately before each placement.
+
+**What the picture shows.** The insert-disk screen with the arrow cursor
+wherever it was sent: send the pointer to (470, 100) and the arrow is drawn in
+the upper right, its mark at (469, 103). `RSEMU_MAC_FRAME_DIR` has it.
+
+### The interrupt wiring was a livelock, and the ROM is what says so
+
+The first mouse to move on this board stopped it dead, and the cause was not in
+the mouse.
+
+The machine file used to wire the VIA's `/IRQ` straight to `IPL0` and the SCC's
+`/INT` straight to `IPL1`, with a comment asserting that "both at once really is
+level 3. That is the hardware, not a simplification." Both at once *was* level
+3, and level 3 is fatal:
+
+* Vector 27, the level-3 autovector, is at `$6C` in the table the ROM builds in
+  RAM, and it points at `$401AB4`. The word there is `$4E73` — `RTE`, per the
+  MC68000 user's manual's instruction encodings. The whole handler is "return".
+* The level-2 handler, at `$401A84`, runs its entire length at `SR = $2200` —
+  mask 2 — which sampling `SR` through it shows. It never raises the mask.
+
+So: the SCC asks, the processor enters the level-2 handler at mask 2, the VIA
+asks while it is in there, `IPL` goes to 3, the level-3 exception is taken,
+`RTE` returns to mask 2 with level 3 still asserted, and it is taken again. For
+ever, with the same six bytes pushed and popped in place. Measured with a mouse
+moving: `PC` pinned at `$401AB4` across five thousand samples, `SR = $2300`,
+`A7` never moving off `$07FBD4`, the frame there reading `$2200 / $00401A88`,
+`Ticks` stopped, and the SCC still asserting. It took about 135 carrier-detect
+transitions at 4 ms intervals to hit, and toggling `DCD` directly — no mouse
+device involved — wedged it at four of seven rates tried.
+
+An `RTE` at that vector is only a safe thing for Apple to have shipped if level
+3 **cannot be asserted**. So the board priority-encodes, which is also what
+`cpu.m68k`'s own documentation expects of a board that drives more than one
+`IPL` pin:
+
+```text
+  SCC   VIA   IPL1  IPL0   level
+   -     -     0     0       0
+   -     x     0     1       1     the VIA
+   x     -     1     0       2     the SCC
+   x     x     1     0       2     the SCC, with the VIA still waiting
+```
+
+`mac.glue` does it, because that object *is* the board's glue. The VIA's
+request is not lost: it is still asserted when the level-2 handler clears the
+SCC, and the level falls to 1 rather than to 0. Nothing about the boot changes
+— with no mouse the SCC never asks — and every golden in `tests/mac_plus.rs`
+held across the change, which is the check that it did not.
+
+The lesson is the one this file keeps relearning, in a new place: **a claim
+about the hardware needs evidence, and the ROM is evidence.** "There is no
+priority encoder" was written down with confidence and nothing behind it, and
+it survived three agents because nothing on this board had ever raised two
+interrupts at once.
+
 ### The defects this turned up
 
 * **The window fold.** Above. Fixed, and it is what put the icon on screen.
@@ -606,6 +712,9 @@ check that the flag is not guest-visible.
   capture table themselves. Fixed, with a case in `tests/cli_screenshot.rs`
   that runs the shipped binary against rsemu's own ten-byte stub ROM — the
   second board that file's reason for existing has caught.
+* **Two interrupts at once locked the machine up**, which is the one above's
+  bigger brother and took a mouse to find. "The interrupt wiring was a
+  livelock", above.
 * **A carrier-detect transition locked the machine up.** Fixed, and it was
   neither the latch nor the board: it was an early `return`.
 
@@ -723,13 +832,11 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
    is measured against the ROM; the other four are derived from it, and a ROM
    that cannot boot never steps off cylinder 0, so nothing has exercised them
    against Apple's code. A disk that boots would.
-2. **The mouse.** Now buildable: a carrier-detect transition no longer locks
-   the machine up, `MTemp` at `$828` moves on both axes — `(15,15)` to
-   `(15,14)` for channel A and to `(16,15)` for channel B — and the machine
-   goes straight back to its idle loop and keeps counting `Ticks`.
-   `tests/mac_plus.rs` asserts exactly that. What is left is a `mac.mouse`
-   device driving two phases onto the SCC's carrier detects and two onto the
-   VIA's `PB4`/`PB5`, plus the button on `PB3`.
+2. ~~**The mouse.**~~ Built: `mac.mouse`, and
+   `tests/mac_plus.rs::the_pointer_goes_where_it_is_put` finds the arrow in the
+   picture where the pointer was sent. See "The mouse", below — and note what
+   building it turned up, which was a livelock in the board's interrupt
+   wiring that had been latent since the board existed.
 3. **The NCR 5380.** Lower down the list than it was: the ROM makes **zero**
    accesses to `$580000` in eight virtual seconds, so nothing is waiting on it.
    `src/dev/scsi` has the bus, the `Target` trait and a disk when the ROM gets
@@ -829,7 +936,7 @@ document states any of it plainly.
 ```sh
 rsemu run mac-plus --media macrom=Mac-Plus.ROM
 rsemu run mac-plus -p ram=4M --media macrom=Mac-Plus.ROM
-rsemu run mac-plus --media macrom=Mac-Plus.ROM --vnc :5900
+rsemu run mac-plus --media macrom=Mac-Plus.ROM --vnc :5900   # keyboard aside, the mouse works
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --for 15s --screenshot boot.png
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --for 2s --record-audio boot.wav
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk

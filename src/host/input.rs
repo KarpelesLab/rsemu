@@ -1205,6 +1205,10 @@ pub mod mouse {
 )]
 pub mod amiga;
 
+#[cfg(feature = "dev-mac")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-mac")))]
+pub mod mac;
+
 #[cfg(test)]
 mod tests {
     use super::*;

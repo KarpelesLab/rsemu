@@ -76,6 +76,8 @@ use rsemu::dev::mac::iwm::Iwm;
 use rsemu::dev::mac::scc::Scc;
 use rsemu::host::display::mac::{MacScanout, capture};
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
+use rsemu::host::input::mac::MacMouseSink;
+use rsemu::host::input::{InputEvent, InputSink};
 use rsemu::machine::{Machine, catalog};
 
 /// How long a Macintosh Plus ROM is. The socket is a 128 KiB part.
@@ -105,6 +107,10 @@ struct Board {
     scanout: MacScanout,
     iwm: Arc<Iwm>,
     scc: Arc<Scc>,
+    /// The pointer, as a person's own frontend reaches it: an `InputSink` that
+    /// takes absolute framebuffer positions, over the host object `mac.mouse`
+    /// opened for itself.
+    pointer: MacMouseSink,
 }
 
 /// Read the ROM out of `RSEMU_MAC_ROM_DIR`; `None` (having said why) if the
@@ -216,12 +222,15 @@ fn board_with_disk(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Bo
         .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
     let cpu = cores.last().expect("the binding captured the processor");
     let scanout = capture::take(&options.realize.hosts, &machine).expect("a video circuit");
+    let pointer =
+        MacMouseSink::open(&options.realize.hosts).expect("the board has a mouse on a host port");
     Board {
         machine,
         cpu,
         scanout,
         iwm: iwms.last().expect("the binding captured the controller"),
         scc: sccs.last().expect("the binding captured the SCC"),
+        pointer,
     }
 }
 
@@ -676,4 +685,153 @@ fn a_1440k_image_is_refused_when_the_board_is_built() {
             "the refusal does not say `{want}`: {text}"
         );
     }
+}
+
+/// How far in from each edge [`arrow_mark`] starts looking.
+///
+/// The Macintosh desktop has **rounded corners** — the four corners are solid
+/// ink, five or six pixels of it — and a run-of-ink detector walks straight
+/// into them. Eight pixels clears all four, and the cursor's own rest position
+/// is well inside.
+const DESKTOP_INSET: u32 = 8;
+
+/// The topmost, then leftmost, start of **four consecutive black pixels** in
+/// the picture, ignoring [`DESKTOP_INSET`] pixels of every edge.
+///
+/// The desktop is a one-pixel checkerboard, so no two horizontally adjacent
+/// pixels on it are both ink: a run of four is the cursor, or the insert-disk
+/// icon's outline a hundred rows further down. Searching from the top finds the
+/// cursor whenever it is above the icon, which is where these tests put it.
+///
+/// A better instrument than a whole-frame hash for this job, because it says
+/// *where* the pointer is rather than that the picture changed.
+fn arrow_mark(b: &Board) -> Option<(u32, u32)> {
+    let info = b.scanout.info();
+    let mut surface = Surface::new(PixelFormat::RGB888, info.width, info.height);
+    b.scanout.capture(&mut surface);
+    let pixels = surface.pixels();
+    let ink = |x: u32, y: u32| -> bool {
+        let at = ((y * info.width + x) * 3) as usize;
+        pixels.get(at).is_some_and(|&p| p == 0)
+    };
+    for y in DESKTOP_INSET..info.height - DESKTOP_INSET {
+        for x in DESKTOP_INSET..info.width - DESKTOP_INSET - 3 {
+            if (0..4).all(|d| ink(x + d, y)) {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+/// Post an absolute pointer position through the host seam and let the guest
+/// catch up: `ms` milliseconds of virtual time, a hundred at a time.
+fn point_at(b: &mut Board, x: u32, y: u32, buttons: u8, ms: u64) {
+    b.pointer.deliver(InputEvent::Pointer { x, y, buttons });
+    for _ in 0..ms / 100 {
+        b.machine
+            .run_for(GlobalTime::from_nanos(100_000_000))
+            .expect("it runs");
+    }
+}
+
+/// **The pointer goes where it is put.**
+///
+/// The acceptance test for `mac.mouse`, and it is about the *picture*: the
+/// arrow the ROM draws is found where the host sent the pointer, not merely
+/// somewhere else than it was.
+///
+/// How the two ends are made to agree, which is the whole difficulty with a
+/// relative mouse and an absolute host cursor:
+///
+/// 1. One event establishes where the host's cursor is and moves nothing
+///    (`host::input::mac`).
+/// 2. A sweep to the screen's top left corner **pins** the guest's pointer
+///    there — the ROM clamps it to the screen, so however far the sweep
+///    overshoots, both ends finish at `(0, 0)`. `amiga_a500_workbench.rs` uses
+///    the bottom right corner for the same reason.
+/// 3. From there a host position *is* the guest pointer's position, at
+///    `PIXELS_PER_COUNT` of one, and a placement is checked by finding the
+///    arrow in the frame.
+///
+/// The arrow's mark — the top-left of its first four-pixel run of ink — sits
+/// at `(h, v + 3)` for a hot spot of `(h, v)`, which is a fact about the
+/// cursor Apple's ROM draws and is asserted as one.
+///
+/// The second thing this asserts is that the machine is still *alive*
+/// afterwards, with the tick chain counting: the first mouse to move on this
+/// board livelocked it inside the SCC's interrupt handler, and
+/// `src/dev/mac/glue.rs` has what that was.
+#[test]
+fn the_pointer_goes_where_it_is_put() {
+    let Some(image) = rom_image("Mac-Plus.ROM") else {
+        return;
+    };
+    let mut b = board(image, &[]);
+    advance(&mut b, "mac-plus-pointer", 16);
+
+    // Where the ROM leaves the cursor at boot.
+    let rest = arrow_mark(&b).expect("the arrow is on the desktop");
+    println!("mac-plus: the arrow rests at {rest:?}");
+    assert_eq!(rest, (15, 18), "the boot cursor, hot spot (15, 15)");
+    let ticks_before = peek(&b, 0x16a);
+
+    // Every target is above the insert-disk icon's rows and inside
+    // `DESKTOP_INSET`, so the mark the search finds is the cursor's and nothing
+    // else's — and each one is reached from the corner rather than from the
+    // last, which is the part worth explaining.
+    //
+    // **The guest counts interrupts, and it misses about one in two hundred.**
+    // Measured: 400 counts on one axis move `Mouse` by 398, at every step rate
+    // from 2 400 up to 6 000 ticks and not at all at 12 000 — an edge arriving
+    // while the processor is inside the level-2 handler with the VIA also
+    // waiting is an edge that never gets counted, here and on a real
+    // Macintosh. That error does not cancel, so a run of placements measured
+    // from each other would drift a pixel every few hundred counts and the
+    // test would be asserting the drift rather than the tracking. Re-pinning
+    // on the corner is what a person does without thinking about it, and it is
+    // what `amiga_a500_workbench.rs` does with the *bottom* right one.
+    // One event to establish where the host's cursor is, which moves nothing.
+    point_at(&mut b, 400, 300, 0, 100);
+    for (x, y) in [(100u32, 80u32), (37, 121), (300, 40), (470, 100)] {
+        // Sweep off the top left corner: the ROM clamps the pointer to the
+        // screen, so however far the sweep overshoots both ends finish at
+        // (0, 0). Then place it, from a position the two agree on.
+        point_at(&mut b, 0, 0, 0, 4_000);
+        point_at(&mut b, x, y, 0, 3_000);
+        let at = arrow_mark(&b).expect("the arrow is drawn");
+        let m = peek(&b, 0x830);
+        println!(
+            "mac-plus: pointer sent to ({x}, {y}), the ROM has it at ({}, {}), the arrow is at {at:?}",
+            m as u16,
+            (m >> 16) as u16
+        );
+        assert!(
+            at.0.abs_diff(x) <= 1 && at.1.abs_diff(y + 3) <= 1,
+            "the pointer is not where it was sent: ({x}, {y}) should put the \
+             arrow's mark at ({x}, {}), and it is at {at:?}",
+            y + 3
+        );
+    }
+
+    // The button, which the ROM records in `MBState` at $172: $00 down, $80 up.
+    point_at(&mut b, 470, 100, 1, 500);
+
+    let down = peek(&b, 0x172) >> 24;
+    point_at(&mut b, 470, 100, 0, 500);
+    let up = peek(&b, 0x172) >> 24;
+    println!("mac-plus: MBState reads {down:#04x} with the button down, {up:#04x} with it up");
+    assert_ne!(down, up, "the ROM did not see the button");
+    assert_eq!(down, 0x00, "the Guide: PB3 low is the button down");
+    assert_eq!(up, 0x80);
+
+    // Still alive, which is the regression for the livelock.
+    let ticks = peek(&b, 0x16a);
+    assert!(
+        ticks > ticks_before + 600,
+        "the 60 Hz tick chain stopped: {ticks_before} to {ticks}. A moving mouse          used to park the processor in the level-3 handler for ever."
+    );
+    assert!(!b.cpu.is_halted(), "the processor double-faulted");
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    let _ = picture(&b, "mac-plus-pointer", 30);
 }

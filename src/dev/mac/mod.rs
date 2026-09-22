@@ -8,6 +8,7 @@
 //! | [`gcr`] | `dev-mac` | Apple's 6-and-2 group-code recording: the bit stream on an 800K disk |
 //! | [`iwm`] | `dev-mac` | an Integrated Woz Machine and the 400K/800K drive on its cable |
 //! | [`keyboard`] | `dev-mac` | the keyboard on the VIA's shift register, and the four commands it answers |
+//! | [`mouse`] | `dev-mac` | the one-button mouse: quadrature on the SCC's carrier detects and the VIA's port B |
 //! | [`via`] | `dev-mac` | a 6522 on the board's A9-A12 register select |
 //! | [`video`] | `dev-mac` | 512 × 342 one-bit pixels read straight out of main memory |
 //! | [`rtc`] | `dev-mac` | the clock chip: a second counter, twenty bytes of parameter RAM, and the one-second interrupt |
@@ -30,6 +31,7 @@ pub mod gcr;
 pub mod glue;
 pub mod iwm;
 pub mod keyboard;
+pub mod mouse;
 pub mod rtc;
 pub mod scc;
 pub mod sound;
@@ -48,6 +50,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     glue::register(registry)?;
     iwm::register(registry)?;
     keyboard::register(registry)?;
+    mouse::register(registry)?;
     rtc::register(registry)?;
     scc::register(registry)?;
     sound::register(registry)?;
@@ -64,6 +67,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     glue::bind(bindings)?;
     iwm::bind(bindings)?;
     keyboard::bind(bindings)?;
+    mouse::bind(bindings)?;
     rtc::bind(bindings)?;
     scc::bind(bindings)?;
     sound::bind(bindings)?;
@@ -78,6 +82,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
         glue::schema(),
         iwm::schema(),
         keyboard::schema(),
+        mouse::schema(),
         rtc::schema(),
         scc::schema(),
         sound::schema(),
