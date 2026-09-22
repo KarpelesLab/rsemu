@@ -49,7 +49,7 @@
 //!
 //! The rest — which state means what, and how many bytes each transaction is —
 //! was settled by answering the ROM and watching what it did next. Those
-//! findings are commented at [`Phase`] and [`State::state_changed`], each
+//! findings are commented in the source, at `Phase` and `State::state_changed`, each
 //! marked as a measurement rather than a citation.
 //!
 //! # The bus, and what is on it
@@ -496,12 +496,10 @@ impl State {
                 }
                 d.pending = !keys.is_empty();
             }
-            0 => {
-                if d.pending {
-                    self.reply = d.data;
-                    d.pending = false;
-                    self.answered = true;
-                }
+            0 if d.pending => {
+                self.reply = d.data;
+                d.pending = false;
+                self.answered = true;
             }
             _ => {}
         }
@@ -930,7 +928,7 @@ pub mod bus {
     pub fn sink(adb: &Arc<Adb>) -> Arc<dyn InputSink> {
         let adb = Arc::clone(adb);
         Arc::new(FnSink::new("mac-adb", move |payload: &[u8]| {
-            for event in payload.chunks_exact(RECORD_BYTES) {
+            for event in payload.as_chunks::<RECORD_BYTES>().0 {
                 match event[0] {
                     0 => adb.key(event[1]),
                     _ => adb.mouse(
