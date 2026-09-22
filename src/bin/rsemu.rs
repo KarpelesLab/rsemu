@@ -1340,6 +1340,14 @@ fn install_capture(
     if args.record_audio.is_some() {
         rsemu::host::audio::amiga::capture::install(options)?;
     }
+    // And the Macintosh's, for one reason more than the others: `mac.sound`
+    // names a scheduler event per sample while it is recording, so installing
+    // this on a run nobody is listening to would cost 22 254 rounds a second
+    // for a ring nobody drains.
+    #[cfg(feature = "dev-mac")]
+    if args.record_audio.is_some() {
+        rsemu::host::audio::mac::capture::install(options)?;
+    }
     Ok(())
 }
 
@@ -1527,6 +1535,13 @@ fn take_audio(
     }
     #[cfg(feature = "dev-amiga-paula")]
     if let Some(s) = rsemu::host::audio::amiga::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
+    // The Macintosh's sound circuit needs the machine for the same reason: one
+    // sample a scan line is `clk / 704`, and the clock forest is what knows
+    // what that is in hertz.
+    #[cfg(feature = "dev-mac")]
+    if let Some(s) = rsemu::host::audio::mac::capture::take(hosts, machine) {
         return Some(Box::new(s));
     }
     None

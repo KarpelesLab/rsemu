@@ -2833,7 +2833,11 @@ machine-m68k-mini = ["cpu-m68k"]
 # timing. `mac.gcr` and `mac.disk` are the disk: Apple's 6-and-2 group-code
 # recording, the 524-byte sector, the five speed zones, and a 400K or 800K
 # image raw or in a DiskCopy 4.2 container -- which `mac.iwm` shifts past its
-# read head a bit cell at a time. Written from Guide to the Macintosh Family
+# read head a bit cell at a time. `mac.sound` is the other bus master: the
+# pulse-width modulator, fed the high byte of each of 370 words in a buffer in
+# main memory, one a scan line, gated by the VIA's `SNDENB` and attenuated by
+# its three volume bits -- which is the whole of a Macintosh Plus's sound.
+# Written from Guide to the Macintosh Family
 # Hardware (2nd edition), the SY6522 and Z8530 data sheets, Apple's patent
 # 4,564,941 for the disk checksum, and black-box register traces; no Macintosh
 # emulator source was consulted and no ROM was disassembled (ROADMAP.md 1).

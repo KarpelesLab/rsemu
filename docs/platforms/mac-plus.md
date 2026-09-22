@@ -174,11 +174,11 @@ read/write pin for it and decodes the direction from the address instead.
 | `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and its control registers, and the **read** data path: a disk shifted past the head a bit cell at a time, with each byte the shifter latches named as a scheduler event so a guest polling the data register cannot miss one | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set. The 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it |
 | `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum, the five speed zones and the **gap a formatter leaves**, which is what decides how fast the disk turns (`SECTOR_CELLS`) | the 400K drive's PWM speed control, which an 800K mechanism ignores |
 | `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
+| `mac.sound` | the pulse-width circuit: the high byte of each of 370 words in a buffer below the top of memory, one a scan line, the `SNDENB` gate, the three volume bits and `SNDPG2`'s two buffers | the reconstruction filter on the board, whose corner the Guide does not give; and the disk-speed byte beside each sample, which an 800K mechanism ignores |
 
 Not modelled at all: the **mouse** (two quadrature phases on the SCC's carrier
 detects and two more on the VIA's `PB4`/`PB5`) — buildable now, see the ledger
-— the **sound** (the PWM buffer the VIA's `PB7` gates), and **SCSI** (the NCR
-5380 at `$580000`).
+— and **SCSI** (the NCR 5380 at `$580000`).
 
 ## How far a real ROM gets
 
@@ -188,7 +188,7 @@ nothing in the drive:
 | Virtual time | What happens |
 | --- | --- |
 | 0 – 25 ms | the VIA is set up: `DDRA = $7F`, `DDRB = $87`, `PCR = 0`, `IER = $82` — vertical blanking enabled — and `PA4` is driven low, so the overlay goes and memory is at zero. The clock chip is asked for parameter RAM `$10` before any of that, 131 φ2 ticks in |
-| 25 – 725 ms | the sound buffer is filled a byte per word and `/SNDENB` is asserted: **the startup chime**, 43 frames long, timed by polling `IFR` for the blanking flag some 6,600 times per 25 ms |
+| 25 – 725 ms | the sound buffer is filled a byte per word and `/SNDENB` is asserted: **the startup chime**, 43 frames long, timed by polling `IFR` for the blanking flag some 6,600 times per 25 ms. `mac.sound` plays it — 601.5 Hz, and `--record-audio` writes it out |
 | 0.7 – 6 s | the memory test: alternating write and read passes over the whole megabyte, several patterns deep |
 | ~6 s | the ROM finds 1 MiB, writes `MemTop`, `BufPtr` and `ScrnBase`, initialises the SCC (32 register writes), exercises the IWM (all sixteen switches, including a mode-register load), reads all twenty bytes of parameter RAM and the clock twice over, finds the battery flat, and **writes its own defaults back** — unlocking the write-protect register with `$55` and locking it again with `$D5` around them |
 | 6.9 s | the first keyboard transaction: `ACR = $18`, `SR = $00` to pull the data line low, then `ACR = $1C`, `SR = $16` — Model Number. The keyboard answers `$03` |
@@ -523,6 +523,78 @@ and hands back blocks 0 and 1.
   saying so.** Each now goes through `Shared::invalidate`, which throws the
   cached cylinder away *and* re-announces the next byte's cell.
 
+### The sound circuit, and the rate it runs at
+
+A Macintosh Plus has no sound chip. It has a **pulse-width modulator** fed one
+byte per horizontal scan line out of a buffer in main memory, so the whole
+device is a second bus master with no registers — the video circuit's shape
+exactly, and for the same reason.
+
+Everything about it that is a number was either read out of the *Guide* or
+measured through a real ROM:
+
+| Fact | Where from |
+| --- | --- |
+| one byte a scan line | the Guide's sound chapter |
+| the sound byte is the **high** half of each word, the disk-speed byte the low half | the Guide, same chapter; confirmed by the trace below, where the low halves stay `$00` right through the chime |
+| the main buffer is `MemTop - $0300`, the alternate `MemTop - $5F00` | the Guide's chapter 3 memory map — and the main one is corroborated by `mac.video`'s own arithmetic: the 896 bytes between the screen buffer's end at `MemTop - $0380` and the top of memory are exactly this buffer and its slack |
+| `PA0`-`PA2` volume, `PA3` `SNDPG2` (0 = alternate), `PB7` `SNDENB` (**0 = enabled**) | the Guide's VIA port-assignment tables |
+| `$80` is silence | **measured**: after the chime the ROM fills all 370 words with `$80` and leaves them there |
+| the volume ladder | **nowhere.** The Guide gives the three bits and not the resistors, so the model is linear in the setting, volume 0 being silence — which is what the Sound control panel does with it. It is written down rather than presented as a measurement |
+
+**The rate is the horizontal line rate**, which `mac.video` already defines:
+704 dot clocks of the board's one 15.6672 MHz crystal, so
+
+```text
+  15 667 200 / 704  =  244 800 / 11  =  22 254.5454… Hz
+```
+
+— not a whole number of hertz, which is what `StreamInfo`'s rational is for.
+The machine file gives the circuit `clk / 704`, so **one tick of its clock is
+one sample** and `host::audio::mac` reads the rate back out of the clock forest
+rather than writing it down twice. 370 samples is exactly one frame of the
+raster, which is why `ticks % 370` is the index into the buffer.
+
+**What the ROM puts in it.** A transparent dump of the buffer, frame by frame,
+through the chime:
+
+```text
+    16 ms  SNDENB=1  vol=7  all 370 words $00
+    32 ms  SNDENB=0  vol=7  bytes $06…$FA
+   400 ms  SNDENB=0  vol=7  bytes $0E…$C9   — decaying
+   688 ms  SNDENB=0  vol=7  bytes $20…$C8
+   704 ms  SNDENB=1  vol=7  all 370 words $80
+   928 ms  SNDENB=1          $6D $DB $B6 …  — the memory test's patterns
+```
+
+which is the gate doing its job twice over: the chime is 30 ms to 690 ms, and
+the memory test's patterns that follow are **not** played because `SNDENB` went
+back up. A model without the gate would screech through the whole memory test.
+
+And the waveform is periodic with a period of **37 samples**, ten of which fill
+the 370-word buffer exactly — which is the design: a waveform whose period
+divides 370 is seamless across a frame boundary, so the ROM never has to do
+anything at 60.15 Hz but refill. 22 254.5454 / 37 is **601.5 Hz**, and the
+recorded WAV measures 602.2 Hz by autocorrelation, which is the whole path —
+buffer, gate, volume, resampler, file — agreeing with the bytes in memory.
+
+```sh
+rsemu run mac-plus --media macrom=Mac-Plus.ROM --for 2s --record-audio boot.wav
+```
+
+`tests/cli_record_audio.rs::a_macintosh_records_its_startup_chime` is the
+assertion, and it measures the tone rather than hashing the file.
+
+**Nothing is produced unless somebody is listening.** `record` is off in the
+machine file and `--record-audio` switches it on, as `amiga.paula`'s is — with
+one reason more than Paula has. This circuit **names a scheduler event per
+sample**, because a byte has to be read at the tick its line scanned it and a
+round boundary anywhere else would read some of a frame's samples out of the
+next frame's waveform. That is the defect `mac.iwm` had, recorded above. It
+costs 22 254 rounds a virtual second, a run with no listener pays none of it,
+and the recorded and unrecorded runs reach the same state hash — which is the
+check that the flag is not guest-visible.
+
 ### The defects this turned up
 
 * **The window fold.** Above. Fixed, and it is what put the icon on screen.
@@ -668,10 +740,12 @@ container's own `dataChecksum` — arithmetic over bytes it never keeps.
 5. **A host keymap.** `mac.keyboard` takes the Guide's own transition codes and
    nothing turns a keysym into one. Figure 7-6 has the table; the OCR of it in
    circulation is not reliable enough to transcribe and it wants a clean scan.
-6. **The sound**, the last thing on the board with nothing behind it. The
-   buffer it would read is also where the ROM writes the disk-speed byte —
-   which goes nowhere on an 800K mechanism, so a `mac.sound` would now be for
-   the noise rather than for the instrument.
+6. ~~**The sound.**~~ Built: `mac.sound`, and the chime comes out of
+   `rsemu run mac-plus --record-audio boot.wav`. See "The sound circuit", above.
+   The buffer it reads is also where the ROM writes the disk-speed byte, which
+   goes nowhere on an 800K mechanism, so this is for the noise rather than for
+   the instrument — which is what it turned out to be worth, because the chime
+   is the one thing on this board a person can *hear* is right.
 
 ## How the ambiguities were settled
 
@@ -757,6 +831,7 @@ rsemu run mac-plus --media macrom=Mac-Plus.ROM
 rsemu run mac-plus -p ram=4M --media macrom=Mac-Plus.ROM
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --vnc :5900
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --for 15s --screenshot boot.png
+rsemu run mac-plus --media macrom=Mac-Plus.ROM --for 2s --record-audio boot.wav
 rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
 rsemu run mac-plus --media macrom=Mac-Plus.ROM -p rtcdate=1986-01-16T09:00:00
 ```

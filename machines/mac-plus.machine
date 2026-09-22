@@ -167,6 +167,25 @@ machine "mac-plus" {
   # nothing maps it. Its clock is the dot clock, one tick a pixel.
   object video "mac.video" { clock = clk, ram = dram }
 
+  # -- the sound circuit -----------------------------------------------------
+  #
+  # See `src/dev/mac/sound.rs`. Like the video circuit it has no registers and
+  # no memory of its own: it reads a buffer in main memory, which is why it
+  # names `dram`. The Guide's sound chapter gives one byte a horizontal scan
+  # line, so **its clock is the line rate** - `clk / 704`, one tick a sample -
+  # and 370 samples is one frame of the raster, which is why a waveform whose
+  # period divides 370 (the ROM's startup chime has a period of 37) is seamless
+  # across a frame boundary. 15 667 200 / 704 is 22 254.5454 Hz, not a whole
+  # number of hertz, which is why it is written as a division of the crystal
+  # rather than in hertz (ROADMAP.md 4.2).
+  #
+  # `record` is off here and the host's `--record-audio` switches it on, for
+  # the reason `amiga-a500.machine` leaves Paula's off: a machine nobody is
+  # listening to should not fill a ring - and here it should not pay for the
+  # 22 254 scheduler rounds a second that reading each byte at the tick its
+  # line scanned it costs, either.
+  object snd "mac.sound" { clock = clk / 704, ram = dram }
+
   # -- the disk controller ---------------------------------------------------
   #
   # See `src/dev/mac/iwm.rs`. Its sixteen soft switches are 512 bytes apart on
@@ -322,6 +341,18 @@ machine "mac-plus" {
   wire kbd.clk  -> via.cb1 { pull = "up" }
   wire kbd.data -> via.cb2 { pull = "up" }
   wire via.cb2  -> kbd.data
+
+  # The sound circuit's four gates, from the Guide's VIA port-assignment
+  # tables: "PA0-PA2  sound volume", "PA3  SNDPG2, 0 = alternate sound buffer"
+  # and "PB7  SNDENB, 0 = sound enabled". All four are plain VIA outputs, and
+  # all four idle at their pull-ups while port A and port B are still all
+  # inputs - which is a muted speaker reading the main buffer, exactly what a
+  # Macintosh does before any code has run.
+  wire via.pa0 -> snd.snd0   { pull = "up" }
+  wire via.pa1 -> snd.snd1   { pull = "up" }
+  wire via.pa2 -> snd.snd2   { pull = "up" }
+  wire via.pa3 -> snd.sndpg2 { pull = "up" }
+  wire via.pb7 -> snd.sndenb { pull = "up" }
 
   # "PA5  SEL": the fourth address bit of the disk drive's own register file.
   # It lives on the VIA rather than on the IWM because the IWM has only three

@@ -123,6 +123,10 @@ pub mod amiga;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]
 pub mod gb;
 
+#[cfg(feature = "dev-mac")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-mac")))]
+pub mod mac;
+
 #[cfg(feature = "dev-nes-apu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-apu")))]
 pub mod nes;
@@ -141,13 +145,14 @@ mod tests;
 /// host rate, and an unreduced 236 250 000 / 264 — or a Game Boy's
 /// 4 194 304 / 128, or an Amiga's 28 375 160 / 256 — would push that product
 /// further up the `u64` range for nothing. Here rather than in one adapter
-/// because four of them need it — and gated on those four, because a build with
+/// because five of them need it — and gated on those five, because a build with
 /// no sound chip in it has no rate to reduce.
 #[cfg(any(
     feature = "dev-nes-apu",
     feature = "dev-gb",
     feature = "dev-sms",
-    feature = "dev-amiga-paula"
+    feature = "dev-amiga-paula",
+    feature = "dev-mac"
 ))]
 pub(crate) const fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {

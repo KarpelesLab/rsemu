@@ -531,3 +531,184 @@ fn an_amiga_records_a_second_of_stereo_for_a_second_of_run() {
     let _ = std::fs::remove_file(&again);
     let _ = std::fs::remove_file(&rom);
 }
+
+// ---------------------------------------------------------------------------
+// The Macintosh Plus
+// ---------------------------------------------------------------------------
+
+/// The signed samples of a mono 16-bit WAV.
+#[cfg(feature = "machine-mac-plus")]
+fn samples(bytes: &[u8]) -> Vec<i16> {
+    bytes[44..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|w| i16::from_le_bytes(*w))
+        .collect()
+}
+
+/// The strongest period in `a`, in hertz, by autocorrelation over the lags a
+/// voice-band tone can have. A test's arithmetic, not a device's: floats are
+/// barred from the *time path*, and this is a measurement of a file.
+#[cfg(feature = "machine-mac-plus")]
+fn dominant_hz(a: &[i16], rate: f64) -> f64 {
+    let mean = a.iter().map(|&s| f64::from(s)).sum::<f64>() / a.len() as f64;
+    let a: Vec<f64> = a.iter().map(|&s| f64::from(s) - mean).collect();
+    // The same number of terms at every lag, so a longer lag is not favoured
+    // by having fewer of them averaged: normalising by the overlap is what
+    // made the first version of this answer 200.5 Hz, the third subharmonic.
+    let span = a.len() - 301;
+    let score = |lag: usize| -> f64 { (0..span).map(|i| a[i] * a[i + lag]).sum::<f64>() };
+    // 147 Hz to 2 205 Hz at 44 100: wide enough to find a wrong answer.
+    //
+    // The **shortest local maximum** that scores within a tenth of the best,
+    // not the best itself. The chime is very nearly perfectly periodic, so
+    // every multiple of its period scores within a thousandth of the period
+    // itself, and taking the global maximum picked lag 220 — one third of the
+    // pitch — by a margin of 0.06 %. Preferring the shortest is what makes
+    // this a pitch detector rather than a periodicity detector; insisting on a
+    // local maximum is what keeps the parabola below on a peak it can
+    // interpolate.
+    let peak = (20..300)
+        .map(score)
+        .max_by(f64::total_cmp)
+        .expect("a non-empty range");
+    let best = (21..299)
+        .find(|&lag| {
+            let here = score(lag);
+            here >= peak * 0.90 && here >= score(lag - 1) && here >= score(lag + 1)
+        })
+        .expect("the global maximum is itself such a lag");
+    // Quadratic interpolation around the peak, because the true period is
+    // 73.3 samples and the nearest integer lag is half a per cent away.
+    let (y0, y1, y2) = (score(best - 1), score(best), score(best + 1));
+    let shift = 0.5 * (y0 - y2) / (y0 - 2.0 * y1 + y2);
+    rate / (best as f64 + shift)
+}
+
+/// **`rsemu run mac-plus --record-audio boot.wav` produces the startup
+/// chime.**
+///
+/// The Macintosh Plus has no sound chip: it has a pulse-width modulator fed one
+/// byte a scan line out of a buffer in main memory, gated by the VIA's `SNDENB`
+/// and attenuated by three more of its pins. So what is asserted here is that a
+/// real ROM's own chime came out of that path — not that a synthetic program
+/// wrote a register, as every other case in this file does.
+///
+/// What is checked is what can be checked about a sound:
+///
+/// * **It starts and it stops.** Silence until the ROM asserts `SNDENB` a frame
+///   or two in, then a loud stretch, then silence again from about 0.7 s on. A
+///   model that ignored the gate would play the memory test's patterns for
+///   ever.
+/// * **Its pitch.** The ROM fills all 370 words of the buffer with ten periods
+///   of one waveform, so the period is 37 samples at the 22 254.5454 Hz line
+///   rate: **601.5 Hz**. Ten periods in 370 samples is also why the chime is
+///   seamless across a frame boundary, which is the design the buffer's length
+///   implies. That number is a measurement of Apple's ROM through this path
+///   rather than a figure from a document, and `docs/platforms/mac-plus.md`
+///   says how it was taken.
+/// * **It is loud.** The buffer's bytes reach `$06` and `$FA` around a rest of
+///   `$80` and the ROM chimes at volume 7, so it is very nearly full scale.
+///
+/// The ROM is the user's own, read in place from `RSEMU_MAC_ROM_DIR` and
+/// trimmed to the 128 KiB a socket holds in a scratch copy outside the
+/// repository. The test skips, saying why, when the variable is not set.
+#[cfg(feature = "machine-mac-plus")]
+#[test]
+fn a_macintosh_records_its_startup_chime() {
+    let Ok(dir) = std::env::var("RSEMU_MAC_ROM_DIR") else {
+        println!(
+            "cli_record_audio: set RSEMU_MAC_ROM_DIR to a directory holding Mac-Plus.ROM to \
+             record a real Macintosh's chime."
+        );
+        return;
+    };
+    let path = std::path::Path::new(&dir).join("Mac-Plus.ROM");
+    let Ok(image) = std::fs::read(&path) else {
+        println!("cli_record_audio: {} is not there; skipped", path.display());
+        return;
+    };
+    if image.len() < 128 * 1024 {
+        println!("cli_record_audio: {} is too short; skipped", path.display());
+        return;
+    }
+    // The socket takes exactly 128 KiB and files in circulation are longer.
+    let rom = scratch("mac-plus.rom");
+    std::fs::write(&rom, &image[..128 * 1024]).expect("the scratch directory is writable");
+
+    let wav_path = scratch("mac.wav");
+    let media = format!("macrom={}", rom.display());
+    let base = vec!["run", "mac-plus", "--media", &media, "--for", "2s"];
+    let wav_arg = wav_path.display().to_string();
+    let mut args = base.clone();
+    args.push("--record-audio");
+    args.push(&wav_arg);
+
+    let (ok, stdout, stderr) = run(&args);
+    assert!(ok, "rsemu run mac-plus --record-audio failed: {stderr}");
+    let bytes = std::fs::read(&wav_path).expect("a WAV was written");
+    let wav = parse_wav(&bytes);
+    assert_eq!(wav.channels, 1, "one modulator, one speaker");
+    assert_eq!(wav.rate, 44_100, "the default --audio-rate");
+    assert_eq!(wav.bits, 16);
+    assert_length(&wav, 2.0);
+
+    let s = samples(&bytes);
+    let rate = f64::from(wav.rate);
+    let peak = |from: f64, to: f64| -> i32 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (a, b) = ((from * rate) as usize, (to * rate) as usize);
+        s[a.min(s.len())..b.min(s.len())]
+            .iter()
+            .map(|&v| i32::from(v).abs())
+            .max()
+            .unwrap_or(0)
+    };
+    println!(
+        "mac-plus chime: peak 0-10 ms {}, 100-600 ms {}, 1.0-2.0 s {}",
+        peak(0.0, 0.010),
+        peak(0.1, 0.6),
+        peak(1.0, 2.0)
+    );
+    assert_eq!(
+        peak(0.0, 0.010),
+        0,
+        "the speaker is muted until the ROM asserts SNDENB"
+    );
+    assert!(
+        peak(0.1, 0.6) > 25_000,
+        "the chime is not loud: {}",
+        peak(0.1, 0.6)
+    );
+    assert_eq!(
+        peak(1.0, 2.0),
+        0,
+        "SNDENB was released and the speaker should be silent; the memory \
+         test's patterns are in the buffer by then"
+    );
+
+    // The pitch, over the middle of the chime.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (from, to) = ((0.15 * rate) as usize, (0.45 * rate) as usize);
+    let hz = dominant_hz(&s[from..to], rate);
+    // 22 254.5454… / 37, which is what the ROM writes into the buffer.
+    let want = 15_667_200.0 / 704.0 / 37.0;
+    println!("mac-plus chime: {hz:.1} Hz, and the ROM's waveform is {want:.1} Hz");
+    assert!(
+        (hz - want).abs() < want * 0.01,
+        "the chime is {hz:.1} Hz and the ROM's waveform is {want:.1} Hz"
+    );
+
+    // Listening did not move the machine.
+    let (ok, quiet_stdout, stderr) = run(&base);
+    assert!(ok, "the unrecorded run failed: {stderr}");
+    assert_eq!(
+        state_hash(&stdout),
+        state_hash(&quiet_stdout),
+        "draining the sound circuit changed where the machine ended up"
+    );
+
+    let _ = std::fs::remove_file(&wav_path);
+    let _ = std::fs::remove_file(&rom);
+}

@@ -12,6 +12,7 @@
 //! | [`video`] | `dev-mac` | 512 × 342 one-bit pixels read straight out of main memory |
 //! | [`rtc`] | `dev-mac` | the clock chip: a second counter, twenty bytes of parameter RAM, and the one-second interrupt |
 //! | [`scc`] | `dev-mac` | a Z8530, enough of it for a ROM to find no serial device |
+//! | [`sound`] | `dev-mac` | the pulse-width sound circuit: a byte a scan line out of main memory |
 //!
 //! Everything here is written from *Guide to the Macintosh Family Hardware*
 //! (Apple Computer, 2nd edition) and the parts' own data sheets — Synertek's
@@ -31,6 +32,7 @@ pub mod iwm;
 pub mod keyboard;
 pub mod rtc;
 pub mod scc;
+pub mod sound;
 pub mod via;
 pub mod video;
 
@@ -48,6 +50,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     keyboard::register(registry)?;
     rtc::register(registry)?;
     scc::register(registry)?;
+    sound::register(registry)?;
     via::register(registry)?;
     video::register(registry)
 }
@@ -63,6 +66,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     keyboard::bind(bindings)?;
     rtc::bind(bindings)?;
     scc::bind(bindings)?;
+    sound::bind(bindings)?;
     via::bind(bindings)?;
     video::bind(bindings)
 }
@@ -76,6 +80,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
         keyboard::schema(),
         rtc::schema(),
         scc::schema(),
+        sound::schema(),
         via::schema(),
         video::schema(),
     ]
