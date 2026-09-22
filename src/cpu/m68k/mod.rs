@@ -2,6 +2,14 @@
 //! modelled prefetch queue, and every later member of the family as a model
 //! of it.
 //!
+//! There are two execution engines and they are indistinguishable to the guest:
+//! the interpreter, and — on a 68000, behind `cpu-m68k-lift` and selected by
+//! `engine = "ir"` — a translated one that lifts guest instructions into the
+//! architecture-neutral IR and runs them on its portable backend, with the
+//! interpreter underneath everything it declines. [`lift`] has the subset and
+//! [`differential`] is the harness that keeps the two the same. The
+//! interpreter is the oracle (CLAUDE.md, "CPU cores").
+//!
 //! The plain 68000, as fitted to the Amiga, the Atari ST, the Mega Drive and
 //! the first Macintoshes: 32-bit registers, a 16-bit data bus, 24 address
 //! pins, two stack pointers and a supervisor/user split. And, chosen by the
@@ -348,6 +356,9 @@
 //! | `mmu040` (private) | the 68040's, which shares none of that but the job |
 //! | `fpu` (private) | the coprocessor's registers, formats and arithmetic |
 //! | `transcend` (private) | its transcendentals, at 128-bit precision |
+//! | [`lift`] | the IR frontend: MC68000 guest instructions into `ir::Block`s (`cpu-m68k-lift`) |
+//! | `engine` (private) | the translated engine `engine = "ir"` selects, and its block cache |
+//! | [`differential`] | the harness that holds the two to the interpreter's answer, forever |
 //!
 //! # Sources
 //!
@@ -377,6 +388,19 @@ mod mmu;
 mod mmu040;
 mod timing;
 mod transcend;
+
+// The IR frontend, the engine that runs what it lifts, and the harness that
+// holds the two to the interpreter's answer. All three are one feature, for the
+// reason `cpu::riscv` gives: an engine that is silently not the one you asked
+// for is how a translation path stays unmeasured for a year.
+#[cfg(feature = "cpu-m68k-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+pub mod lift;
+#[cfg(feature = "cpu-m68k-lift")]
+mod engine;
+#[cfg(feature = "cpu-m68k-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+pub mod differential;
 
 #[cfg(test)]
 mod tests;
@@ -1247,6 +1271,27 @@ impl Lines {
         self.ipl.load(Ordering::Acquire)
     }
 
+    /// Whether an interrupt would be taken under interrupt mask `mask`,
+    /// **without consuming** the level-seven latch.
+    ///
+    /// The non-destructive half of `Exec::pending_interrupt`, and the
+    /// distinction is load-bearing: that method *swaps* the latch out, so it
+    /// may be called exactly once per instruction boundary, by the code that
+    /// is about to take the interrupt. A translated block has to ask the same
+    /// question at every boundary it passes — `engine`'s `Host::spent` is
+    /// where — so it needs a question that leaves the latch where it found it.
+    /// A block that consumed the latch and then left without vectoring would
+    /// drop the edge, and the interrupt would arrive at some unrelated later
+    /// moment when the pins happened to read seven again.
+    #[cfg(feature = "cpu-m68k-lift")]
+    pub(crate) fn interrupt_pending(&self, mask: u8) -> bool {
+        if self.level_seven.load(Ordering::Acquire) {
+            return true;
+        }
+        let level = self.ipl();
+        level != 0 && level > mask
+    }
+
     fn set_vector(&self, vector: Option<u8>) {
         self.vector
             .store(vector.map_or(NO_VECTOR, u16::from), Ordering::Release);
@@ -1331,11 +1376,57 @@ impl Lines {
     }
 }
 
+/// Which execution engine a core runs on.
+///
+/// A construction property rather than a `#[cfg]`, exactly as [`Model`] is:
+/// one build of rsemu runs the same board both ways, which is what makes *"a
+/// bit-identical state hash across the interpreter and the JIT for the same
+/// guest"* (`ROADMAP.md` §0) a thing a test can assert rather than a claim
+/// about two builds.
+///
+/// Both are **indistinguishable to the guest** — same registers, same `SR`,
+/// same prefetch queue, same memory, same faults, same cycle counts, same
+/// scheduler debt — so this is a speed knob and never a semantic one. See
+/// [`engine`](self::engine) for what that costs to keep true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// The interpreter, and the oracle everything else is measured against
+    /// (CLAUDE.md, "CPU cores").
+    #[default]
+    Interp,
+    /// The translation runtime: guest instructions lifted into `ir::Block`s,
+    /// cached by entry PC, and executed by the **portable** IR backend.
+    ///
+    /// Named `ir` rather than `jit` because there is no host code generator
+    /// behind it: the blocks are *interpreted* by `ir::Interp`, which is why
+    /// the feature is `cpu-m68k-lift` alone and not `cpu-m68k-lift` plus
+    /// `jit`. `cpu::riscv`'s `Engine::Jit` is the same backend under the name
+    /// the core that also has host backends gave it.
+    ///
+    /// **The variant only exists in a build with `cpu-m68k-lift`**, so a build
+    /// that cannot run this engine cannot be asked to and quietly interpret
+    /// instead — [`from_props`](M68k::from_props) refuses the property with a
+    /// message naming the feature, and the Rust API does not compile. An
+    /// engine that silently is not the one you asked for is how a translation
+    /// path stays unmeasured for a year.
+    #[cfg(feature = "cpu-m68k-lift")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+    Ir,
+}
+
 /// Everything the interpreter needs to mutate, behind one lock.
 #[derive(Debug)]
 struct Session {
     state: State,
     space: Option<Arc<AddressSpace>>,
+    /// The translation cache and the backend that runs it, on a core whose
+    /// engine is [`Engine::Ir`].
+    ///
+    /// Boxed and lazily built so an interpreted core pays nothing for it, and
+    /// **derived state**: never snapshotted, and thrown away by a reset and by
+    /// a topology change (CLAUDE.md, "Devices").
+    #[cfg(feature = "cpu-m68k-lift")]
+    runtime: Option<Box<engine::Runtime>>,
 }
 
 /// A 680x0 core: a 68000, or the 68010 or 68020 its [`Model`] names.
@@ -1364,6 +1455,10 @@ pub struct M68k {
     model: Model,
     /// Which coprocessor answers the F line. Fixed at construction.
     fpu: Coprocessor,
+    /// Which execution engine this core runs on. Fixed at construction, and
+    /// deliberately *not* snapshotted: a snapshot taken under one engine must
+    /// restore under the other (`ROADMAP.md` §0).
+    engine: Engine,
     session: sync::Mutex<Session>,
     /// The strong end of every pin this core has handed to a wire.
     ///
@@ -1399,11 +1494,14 @@ impl M68k {
             requester: AtomicU32::new(cfg.requester.0),
             model: cfg.model,
             fpu: cfg.fpu,
+            engine: Engine::default(),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
                     state: State::new(cfg.model),
                     space: None,
+                    #[cfg(feature = "cpu-m68k-lift")]
+                    runtime: None,
                 },
             ),
             pins: sync::Mutex::new(Pins::default()),
@@ -1419,10 +1517,7 @@ impl M68k {
     pub fn from_props(props: &Props) -> Result<M68k> {
         let mut r = props.reader();
         let requester = r.or_range("requester", 0u64, 0..=u64::from(u32::MAX))?;
-        // Accepted and ignored: there is one engine until phase 5, and a
-        // machine file that names it should not need editing when the second
-        // one lands.
-        let _engine = r.or_enum("engine", "interp", &["interp"])?;
+        let engine = r.or_enum("engine", "interp", &["interp", "ir"])?;
         let model = r.or_enum("model", Model::M68000.name(), &MODEL_NAMES)?;
         // A 68040's floating-point unit is part of the *part*, not of the
         // board: an MC68040 has one and an MC68LC040 does not, and those are
@@ -1437,6 +1532,38 @@ impl M68k {
         r.finish()?;
         let model = Model::from_name(model).unwrap_or_default();
         let fpu = Coprocessor::from_name(fpu).unwrap_or_default();
+        // Refused rather than degraded, for the reason `Engine::Ir` gives: an
+        // engine that is not the one you asked for is worse than an error.
+        #[cfg(not(feature = "cpu-m68k-lift"))]
+        if engine == "ir" {
+            return Err(Error::Config {
+                at: String::from("cpu.m68k"),
+                message: String::from(
+                    "`engine = \"ir\"` needs a build with the `cpu-m68k-lift` feature; \
+                     refused rather than interpreted silently, because an engine that is \
+                     not the one you asked for is how a translation path stays unmeasured",
+                ),
+            });
+        }
+        #[cfg(feature = "cpu-m68k-lift")]
+        let engine = if engine == "ir" {
+            if model != Model::M68000 {
+                return Err(Error::Config {
+                    at: String::from("cpu.m68k"),
+                    message: alloc::format!(
+                        "`engine = \"ir\"` is MC68000 only: the IR frontend refuses a \
+                         {model}, whose timing comes from a per-instruction table the \
+                         frontend does not read (`cpu::m68k::lift`). Use \
+                         `engine = \"interp\"` for it"
+                    ),
+                });
+            }
+            Engine::Ir
+        } else {
+            Engine::Interp
+        };
+        #[cfg(not(feature = "cpu-m68k-lift"))]
+        let engine = Engine::Interp;
         if fpu.is_onchip_040() && !model.has_onchip_fpu() {
             return Err(Error::Config {
                 at: String::from("cpu.m68k"),
@@ -1477,7 +1604,8 @@ impl M68k {
                 .with_requester(RequesterId(requester as u32))
                 .with_model(model)
                 .with_fpu(fpu),
-        ))
+        )
+        .with_engine(engine))
     }
 
     /// This core's configuration.
@@ -1804,15 +1932,65 @@ impl M68k {
         self.session.lock().state.reset_pending = true;
     }
 
+    /// Which execution engine this core runs on.
+    #[must_use]
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// The same core, running on `engine`.
+    ///
+    /// A consuming builder because an engine is chosen when a core is built:
+    /// a machine file reaches the same place through `engine = "ir"`.
+    #[must_use]
+    pub fn with_engine(mut self, engine: Engine) -> M68k {
+        self.engine = engine;
+        self
+    }
+
+    /// What this core's translated engine has done, or `None` on a core that
+    /// is not running one or has not run yet.
+    ///
+    /// A statistic and never a behaviour — the engines are indistinguishable
+    /// to the guest — so nothing here is in a snapshot.
+    #[cfg(feature = "cpu-m68k-lift")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+    #[must_use]
+    pub fn ir_stats(&self) -> Option<engine::Stats> {
+        self.session.lock().runtime.as_ref().map(|rt| rt.stats())
+    }
+
     /// Execute one reset sequence, exception sequence, or instruction.
     ///
     /// Returns the cycles charged: zero if the core is halted or has no
     /// address space, which the caller must treat as "stop", not "retry".
+    ///
+    /// On [`Engine::Ir`] the unit is **one translation block** rather than one
+    /// instruction — the same reading `cpu::riscv`'s `Hart::step` takes. Where
+    /// that matters is the *budget*, and it is handled where the budget is:
+    /// [`run_budget`](M68k::run_budget) hands the engine what is left of the
+    /// allowance, so a block leaves at the same guest instruction an
+    /// interpreted core would have stopped at.
     pub fn step(&self) -> u64 {
+        self.step_within(u64::MAX)
+    }
+
+    /// One unit of the configured engine, bounded by `allowance` ticks.
+    fn step_within(&self, allowance: u64) -> u64 {
+        // Read by the translated engine alone: the interpreter cannot be
+        // stopped mid-instruction, so an allowance is nothing it can act on.
+        let _ = allowance;
         let reset = self.lines.take_reset_request();
         let cfg = self.config();
         let mut session = self.session.lock();
-        let Session { state, space } = &mut *session;
+        #[cfg(feature = "cpu-m68k-lift")]
+        let translates = self.engine == Engine::Ir;
+        let Session {
+            state,
+            space,
+            #[cfg(feature = "cpu-m68k-lift")]
+            runtime,
+        } = &mut *session;
         // The `reset` pin latches outside the lock; this is where the latch
         // becomes execution state, before the step, so a pulse is honoured at
         // the very next instruction boundary.
@@ -1820,6 +1998,17 @@ impl M68k {
         let Some(space) = space.clone() else {
             return 0;
         };
+        #[cfg(feature = "cpu-m68k-lift")]
+        if translates {
+            // A reset re-reads vectors 0 and 1 and can remap the world, so the
+            // translations it invalidates are thrown away here rather than
+            // being re-validated one entry at a time.
+            let rt = runtime.get_or_insert_with(|| Box::new(engine::Runtime::new()));
+            if state.reset_pending {
+                rt.flush();
+            }
+            return engine::advance(rt, state, &space, &cfg, &self.lines, allowance);
+        }
         Exec::new(state, &space, &cfg, &self.lines).step()
     }
 
@@ -1835,7 +2024,10 @@ impl M68k {
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
-            let n = self.step();
+            // The *remaining* allowance rather than the whole budget: on
+            // `Engine::Ir` that is what makes a block leave at the same guest
+            // instruction an interpreted core would have stopped at.
+            let n = self.step_within(budget - used);
             if n == 0 {
                 break;
             }
@@ -1865,7 +2057,7 @@ impl M68k {
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
-            let n = self.step();
+            let n = self.step_within(allowance - used);
             if n == 0 {
                 // Halted, stopped, or no address space. Retrying would spin.
                 self.session.lock().state.debt = 0;
@@ -1934,7 +2126,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "engine",
             kind: ValueKind::Str,
             required: false,
-            summary: "which execution engine; only `interp` exists until phase 5",
+            summary: "which execution engine: `interp`, or `ir` (MC68000 only) for \
+                      guest instructions lifted into IR blocks and run on the portable backend",
         },
         PropertySpec {
             name: "model",
@@ -2395,7 +2588,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS.name)
         .prop(PropSchema::new("requester", ValueKind::Uint))
-        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp", "ir"]))
         .prop(PropSchema::new("model", ValueKind::Str).values(&MODEL_NAMES))
         .prop(PropSchema::new("fpu", ValueKind::Str).values(&FPU_NAMES))
         // Inputs only. `BERR`, `HALT`, `BR`/`BG` and `VPA` are real pins with

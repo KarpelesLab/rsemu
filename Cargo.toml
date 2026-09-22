@@ -2776,6 +2776,36 @@ fw-pcbios = []
 # `no_std + alloc`.
 cpu-m68k = ["float"]
 
+# The m68k IR frontend (src/cpu/m68k/lift.rs, engine.rs): lifting MC68000 guest
+# instructions into `ir::Block`s -- the **fourth** frontend for the translation
+# IR, after RISC-V, x86 and A64, and the first for a core whose interpreter is
+# bus-accurate to the cycle. A documented subset of the 68000 integer core:
+# MOVE/MOVEA/MOVEQ, the arithmetic and logic groups with the full CCR including
+# the X flag that CMP leaves alone, ADDX/SUBX with their sticky Z, CMPM,
+# ADDA/SUBA/CMPA, CLR/NOT/NEG/NEGX/TST, EXT/SWAP/EXG/LEA/UNLK, the bit
+# instructions, the shifts and rotates at a static count, Bcc/BRA/DBcc/Scc/
+# JMP/RTS, MOVEM into registers, MOVE from SR, MOVE to CCR and the
+# immediate-to-CCR trio, across all twelve addressing modes. It reads the same
+# declarative rows in `isa.rs` that decode and the disassembler read --
+# including the instruction *length*, which comes from the disassembler -- so
+# there is still one description of the instruction set and not a second.
+#
+# Deliberately **not** here, each ending the block with a terminator that hands
+# the instruction back to the interpreter, which stays the oracle (CLAUDE.md,
+# "CPU cores"): MULU/MULS/DIVU/DIVS (data-dependent cycle counts), the BCD
+# group, TAS, MOVEP, CHK, a shift by a register count, every privileged or
+# exception-raising encoding, every 68010/68020/68030/68040 addition, and --
+# for a reason written out in `lift.rs` -- every instruction that commits more
+# than one store, which on a 16-bit bus means JSR, BSR, PEA, LINK, MOVEM to
+# memory and every long-sized memory destination.
+#
+# `engine = "ir"` on `cpu.m68k` selects it: blocks cached by 4 KiB window and
+# executed on the **portable** IR backend (`ir::Interp`), which runs anywhere
+# the crate does. No host code generation -- a backend that lowers these blocks
+# lives in `jit/`, above the `std` line. Needs `cpu-m68k` for the core and `ir`
+# for the block types. Adds no dependencies and is `no_std + alloc`.
+cpu-m68k-lift = ["cpu-m68k", "ir"]
+
 # The MIPS core (src/cpu/mips): an LSI/MIPS R3000A-compatible MIPS I
 # interpreter -- the integer instruction set, R3000-style coprocessor 0 with
 # the full exception model and the 64-entry TLB, the fixed kuseg/kseg0/kseg1/
