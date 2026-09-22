@@ -294,6 +294,70 @@ fn a_snapshot_round_trips_to_an_identical_state_hash() {
     assert_eq!(restored.mode(), 0x17);
 }
 
+/// **A disk with writes on it is state**, so a snapshot carries the medium and
+/// a restore puts it back.
+///
+/// An image that has never been written is rebuilt from the machine's own media
+/// slot, which is why the chunk carries one bit a drive before it carries any
+/// bytes — a megabyte and a half of a disk nobody has touched is a megabyte and
+/// a half the machine file already knows.
+#[test]
+fn a_snapshot_carries_a_medium_that_has_been_written() {
+    use crate::dev::mac::disk::Disk;
+    use crate::dev::mac::gcr::{self, DATA_BYTES, Sector, TAG_BYTES};
+
+    let image = |iwm: &Iwm| -> alloc::vec::Vec<u8> {
+        let mut shape = MachineShape::new();
+        shape.add_device("iwm", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("iwm", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(iwm, &mut chunk).unwrap();
+        }
+        w.to_vec().unwrap()
+    };
+
+    let saved = Iwm::with_drives([true, false]);
+    saved.insert(0, Disk::blank(2));
+    spin_up(&saved, 1, false);
+    let sectors: alloc::vec::Vec<Sector> = (0..gcr::sectors_on(1))
+        .map(|s| {
+            let data = alloc::vec![s.wrapping_mul(3).wrapping_add(11); DATA_BYTES];
+            Sector::new(1, false, s, gcr::FORMAT_800K, &[0u8; TAG_BYTES], &data)
+        })
+        .collect();
+    start_writing(&saved);
+    for &(byte, cells) in &gcr::track_stream(&sectors) {
+        write_byte(&saved, byte, cells);
+    }
+    stop_writing(&saved);
+    let wanted = saved.disk(0).expect("a disk");
+    assert!(wanted.written(), "the head reached the medium");
+
+    let first = image(&saved);
+    // The restored chip has a *blank* disk in the drive, which is what a
+    // machine rebuilt from its media slot would have.
+    let restored = Iwm::with_drives([true, false]);
+    restored.insert(0, Disk::blank(2));
+    let reader = StateReader::new(&first).unwrap();
+    let chunk = reader
+        .load("iwm", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+    assert_eq!(image(&restored), first, "the same chip, bit for bit");
+
+    let back = restored.disk(0).expect("a disk");
+    for sector in &sectors {
+        let block = back.block_of(1, false, sector.sector).expect("a block");
+        assert_eq!(
+            back.block(block).expect("the block"),
+            sector.data(),
+            "sector {} did not survive the round trip",
+            sector.sector
+        );
+    }
+}
+
 /// The class registers, takes one property, and names its region and pin.
 #[test]
 fn the_class_is_registrable_and_its_schema_matches() {
@@ -569,4 +633,182 @@ fn an_empty_drive_and_a_single_sided_disk_deliver_nothing() {
     spin_up(&iwm, 0, true);
     iwm.advance_to(iwm.ticks() + 100_000);
     assert_eq!(iwm.latched(), 0, "a single-sided disk has one head");
+}
+
+// ---------------------------------------------------------------------------
+// the write data path
+// ---------------------------------------------------------------------------
+
+/// Hand the chip one byte and let the head lay it down in `cells` of them.
+///
+/// The load is a **store** with `Q7` and `Q6` both set and the drive enabled,
+/// which is page 10's `Write Data` state `[111]`; the head then shifts it out
+/// on its own, so the only thing left for the processor to do is be on time.
+/// Being late by two cells is how a self-sync byte is written — see
+/// [`super::Writer`].
+fn write_byte(iwm: &Iwm, byte: u8, cells: u8) {
+    touch(iwm, 13); // Q6 on
+    touch(iwm, 15); // Q7 on: [111], Write Data
+    iwm.poke(15, byte);
+    iwm.advance_to(iwm.ticks() + u64::from(cells));
+}
+
+/// Put the chip in write mode over the cylinder it is already spun up on.
+fn start_writing(iwm: &Iwm) {
+    touch(iwm, 13); // Q6 on
+    touch(iwm, 15); // Q7 on
+    assert!(iwm.writing(), "L7 and MotorOn both set is Write Data");
+}
+
+/// And out of it, which is what clears the underrun flag.
+fn stop_writing(iwm: &Iwm) {
+    touch(iwm, 14); // Q7 off
+    touch(iwm, 12); // Q6 off: back to Read Data
+    assert!(!iwm.writing());
+}
+
+/// **A cylinder this chip wrote is a cylinder this chip reads.**
+///
+/// The stream is `gcr::track_stream`'s — the *one* description of the layout,
+/// which the encoder uses too, so the test is not a second opinion about the
+/// format but the same opinion driven through the hardware. What it proves is
+/// the write head: a byte handed over at `[111]`, eight cells of it on the
+/// medium, ten for a self-sync byte because the processor was two cells late,
+/// and a whole formatted cylinder coming back out of the image afterwards.
+#[test]
+fn a_cylinder_the_head_writes_is_a_cylinder_the_image_gets_back() {
+    use crate::dev::mac::disk::Disk;
+    use crate::dev::mac::gcr::{self, DATA_BYTES, Sector, TAG_BYTES};
+
+    let iwm = Iwm::with_drives([true, false]);
+    // A blank disk: formatted, and every block zero.
+    iwm.insert(0, Disk::blank(2));
+    spin_up(&iwm, 3, true);
+
+    // What to write: cylinder 3, side 1, every sector saying which it is.
+    let track = 3u8;
+    let side = true;
+    let sectors: alloc::vec::Vec<Sector> = (0..gcr::sectors_on(track))
+        .map(|s| {
+            let mut data = alloc::vec![0u8; DATA_BYTES];
+            for (i, byte) in data.iter_mut().enumerate() {
+                *byte = s.wrapping_mul(13).wrapping_add(i as u8);
+            }
+            let tag = alloc::vec![s ^ 0x5a; TAG_BYTES];
+            Sector::new(track, side, s, gcr::FORMAT_800K, &tag, &data)
+        })
+        .collect();
+    let stream = gcr::track_stream(&sectors);
+
+    // Start at the index, so the cells land where the encoder would have put
+    // them and the whole revolution is covered exactly once.
+    start_writing(&iwm);
+    for &(byte, cells) in &stream {
+        write_byte(&iwm, byte, cells);
+    }
+    stop_writing(&iwm);
+
+    // And read it back **out of the image**, which is the half a cell-level
+    // check cannot do: the sectors have to have gone through the decoder and
+    // landed in the blocks the zone table puts them in.
+    let disk = iwm.disk(0).expect("a disk");
+    for sector in &sectors {
+        let block = disk
+            .block_of(track, side, sector.sector)
+            .expect("a block for every sector");
+        assert_eq!(
+            disk.block(block).expect("the block"),
+            sector.data(),
+            "sector {} of cylinder {track} side {side} did not come back",
+            sector.sector
+        );
+    }
+    // Nothing else moved: a write to one cylinder is a write to one cylinder.
+    let elsewhere = disk.block_of(0, false, 0).expect("cylinder 0 sector 0");
+    assert!(
+        disk.block(elsewhere)
+            .expect("a block")
+            .iter()
+            .all(|&b| b == 0),
+        "a write to cylinder 3 reached cylinder 0"
+    );
+}
+
+/// The handshake register is what a processor watches, and it says the two
+/// things page 11 gives it: room for another byte, and whether the head ever
+/// reached a boundary with nothing to lay down.
+#[test]
+fn the_write_handshake_reports_room_and_underrun() {
+    use crate::dev::mac::disk::Disk;
+    let iwm = Iwm::with_drives([true, false]);
+    iwm.insert(0, Disk::blank(2));
+    spin_up(&iwm, 0, false);
+    start_writing(&iwm);
+
+    // `[10X]` is Read Write-Handshake: Q7 on, Q6 off.
+    let handshake = |iwm: &Iwm| {
+        touch(iwm, 12);
+        touch(iwm, 15);
+        let value = touch(iwm, 15);
+        // Put the chip back in the write-load state the caller was in.
+        touch(iwm, 13);
+        value
+    };
+
+    assert_eq!(
+        handshake(&iwm) & (HANDSHAKE_READY | HANDSHAKE_NO_UNDERRUN),
+        HANDSHAKE_READY | HANDSHAKE_NO_UNDERRUN,
+        "an empty buffer takes a byte and has not underrun"
+    );
+    // Page 11: "These bits are reserved for future expansion and will always
+    // read as '1's."
+    assert_eq!(handshake(&iwm) & 0x3f, 0x3f);
+
+    // Fill it. Two bytes fit; the third is dropped, which page 12 says is
+    // harmless.
+    assert!(iwm.push_write(0xff, WriteKind::Data));
+    assert!(iwm.push_write(0xff, WriteKind::Data));
+    assert!(
+        !iwm.push_write(0xff, WriteKind::Data),
+        "the buffer holds two"
+    );
+    assert_eq!(handshake(&iwm) & HANDSHAKE_READY, 0, "no room");
+
+    // Let the head run past both of them and on into nothing.
+    iwm.advance_to(iwm.ticks() + 64);
+    assert!(iwm.write_underrun(), "the processor was late");
+    assert_eq!(handshake(&iwm) & HANDSHAKE_NO_UNDERRUN, 0);
+    assert_eq!(
+        handshake(&iwm) & HANDSHAKE_READY,
+        HANDSHAKE_READY,
+        "and the buffer is empty again"
+    );
+
+    // Page 11: the flag stays "until either the chip is reset or taken out of
+    // write mode".
+    stop_writing(&iwm);
+    assert!(!iwm.write_underrun());
+}
+
+/// A tab over the hole stops the **medium** changing and nothing else: the
+/// chip shifts, the handshake answers, and the image keeps what it had.
+#[test]
+fn a_write_protected_disk_keeps_its_bytes() {
+    use crate::dev::mac::disk::Disk;
+    let mut disk = Disk::blank(2);
+    disk.set_write_protected(true);
+    let iwm = Iwm::with_drives([true, false]);
+    iwm.insert(0, disk);
+    spin_up(&iwm, 0, false);
+    assert!(!sense(&iwm, 3), "disk locked is low: it is protected");
+
+    touch(&iwm, 13);
+    touch(&iwm, 15);
+    start_writing(&iwm);
+    for _ in 0..200 {
+        write_byte(&iwm, 0x96, 8);
+    }
+    stop_writing(&iwm);
+    let after = iwm.disk(0).expect("a disk");
+    assert!(!after.written(), "nothing reached the medium");
 }

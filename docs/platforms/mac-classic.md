@@ -36,9 +36,10 @@ head-select pin. All three are below, with what was measured.
 
 | Source | Covers |
 | --- | --- |
-| **Apple Computer, *SWIM Chip User's Reference*, revision 1.5 (11 January 1988)**, with the *SWIM Chip Specification* of 29 September 1987 beside it | **The ISM register set**, and the whole of it: the sixteen addresses and A3 as their read/write line, every bit of the mode, setup, phase, error and handshake registers, the parameter RAM and its auto-increment counter, the Trans-Space machine's MFM encoding rule, the correction machine, and the four writes that switch the chip out of IWM mode. `src/dev/mac/swim/ism.rs` quotes the sentence and the page beside every one of them. **Read the page images, not the OCR** — the OCR prints `xOOl` for `x001` and would have made every address in the file a guess |
+| **Apple Computer, *SWIM Chip User's Reference*, revision 1.5 (11 January 1988)**, with the *SWIM Chip Specification* of 29 September 1987 beside it | **Both register sets.** Page 10's `L7`/`L6`/`MotorOn` table is the IWM's six registers and is what says that `Write Data` and `Set Mode` share an address and are told apart by the drive enable. And **the ISM register set**, the whole of it: the sixteen addresses and A3 as their read/write line, every bit of the mode, setup, phase, error and handshake registers, the parameter RAM and its auto-increment counter, the Trans-Space machine's MFM encoding rule, the correction machine, and the four writes that switch the chip out of IWM mode. `src/dev/mac/swim/ism.rs` quotes the sentence and the page beside every one of them. **Read the page images, not the OCR** — the OCR prints `xOOl` for `x001` and would have made every address in the file a guess |
 | *Guide to the Macintosh Family Hardware*, 2nd edition (Apple Computer, Addison-Wesley 1990) | The compact-Macintosh shape this board inherits from `mac-plus`: the address map and the overlay, the VIA's port assignments, the clock chip's three wires, the video raster. **It was not available to this work for the SWIM's ISM registers or for the ADB transceiver's link protocol**, and this file says so wherever a number came from somewhere else instead |
-| Neil Parker, *Controlling the 3.5 Drive Hardware on the Apple IIGS*, version 1.00 (February 1994) | The Sony mechanism's sixteen one-bit status registers and its control registers, addressed by `CA2`, `CA1`, `CA0` and `SEL`, with the polarity of each. It leaves `CA2:CA1:CA0 = 101` unassigned, and a SuperDrive answers at the `SEL`-high half of it — which is a **measurement** against Apple's ROM and not a reading, and `src/dev/mac/iwm.rs` carries the three outcomes that settled it |
+| Neil Parker, *Controlling the 3.5 Drive Hardware on the Apple IIGS*, version 1.00 (February 1994) | The Sony mechanism's sixteen one-bit status registers and its control registers, addressed by `CA2`, `CA1`, `CA0` and `SEL`, with the polarity of each. It leaves `CA2:CA1:CA0 = 101` unassigned, and a SuperDrive answers at the `SEL`-high half of it — which is a **measurement** against Apple's ROM and not a reading, and `src/dev/mac/iwm.rs` carries the three outcomes that settled it. Also the IWM's four registers and the write loop that ends `BVS WLAST ;wait until last data underruns` |
+| **Apple Computer, *Software Control of the Disk II or IWM Controller*, 26 April 1984 (revision 1, 10 May 1984)** | The write path: the `Q6`/`Q7` register table, the load-and-shift sequence — "The STA instruction loads the contents of the accumulator into the controller's data shift register… Shifting out the data serially to the disk drive requires Q6L and Q7H" — and the **forty** clock cycles a self-sync byte gets against a data byte's thirty-two, which is where the extra two cells come from |
 | IBM System 34 / ECMA-147 double-density MFM | The 1.44 MB track layout: `A1A1A1` sync, the ID and data address marks, gap lengths, CRC-16/CCITT. `src/dev/mac/mfm.rs` **derives** the two missing-clock patterns from the encoding rule rather than quoting them, and asserts the derivation in its tests |
 | *Synertek SY6522 / Rockwell R6522 Versatile Interface Adapter* data sheet | The chip, and in particular the eight shift-register modes — which is what identifies the ADB link's clock as the transceiver's |
 | **Black-box register traces of a real Classic ROM** | Everything else. Every one is written down below, with the trace |
@@ -512,43 +513,129 @@ No access faults, the processor never double-faults, the video circuit produces
 **zero**. Two virtual minutes of it cost about twenty seconds of wall time,
 which is faster than the machine being emulated.
 
+## The write path
+
+**A disk can be written now**, and the thing that proves it is not a test this
+project wrote: **Mac OS 6.0.8 writes to its own startup volume while it brings
+the Finder up**, and a block of the image comes back changed.
+
+The protocol, from the trace, is the document's:
+
+```text
+  ISM wMode0  W 18     clear ACTION and the read/write bit
+  ISM wMode1  W 10     set the read/write bit to *write*
+  ISM wMode1  W 01     Clear FIFO high
+  ISM wMode0  W 01     and low: the FIFO is empty and the CRC is seeded
+  ISM wData   W 00 x2  prime it
+  ISM wMode1  W 08     ACTION: the head starts laying cells down
+  ISM rHandshake R da  and from here it is poll, write, poll, write
+  ISM wData   W 00     the sync field
+  ISM wMark   W a1 x3  three marks - a byte with a clock pulse missing
+  ISM wData   W fb     the data address mark, then 512 bytes
+  ISM wCRC    W ff     the *chip's* CRC, two bytes, which nobody computed
+  ISM wData   W 4e x4  the gap, so the splice lands in it
+  ISM wMode0  W 18     and out of write mode
+```
+
+`src/dev/mac/iwm.rs`'s `Writer` is the whole of it: a two-byte buffer, a
+shifter that spends eight cells on a GCR byte and sixteen on an MFM one, and a
+head that lays a cell down every tick where the read path takes one up. The
+cells go into the *same* cached cylinder the read path shifts past the head,
+and the cylinder is decoded back into the image by the *same* decoder the read
+path is tested against — so a write that did not come out as a readable field
+with a good CRC is not absorbed at all, and the image keeps what it had.
+
+Three things in it are worth naming.
+
+* **What the head lays down when the processor is late is an inference**, and
+  it is where a self-sync byte comes from. Apple's *Software Control of the
+  Disk II or IWM Controller* (1984) spends **forty** 6502 cycles on a `$FF`
+  sync byte where a data byte gets **thirty-two**; eight cycles are two bit
+  cells, and what is on the disk is eight ones and two zeros. So a byte
+  boundary with an empty buffer writes a cell with no transition in it. Neil
+  Parker's IIGS note confirms that an underrun is the *ordinary* end of a
+  write — `BIT Q6 / BVS WLAST ;wait until last data underruns` — rather than a
+  fault.
+* **The CRC generator is preset at the first mark byte of a field**, which is
+  also an inference, and it is the one defect that cost real time. A generator
+  running from the Clear FIFO toggle absorbs the sync field of `$00`s the
+  processor writes in front of the marks, so every field on the disk reads back
+  bad — which is exactly what happened: Apple's code wrote, our decoder
+  rejected every field, and **zero** blocks changed while the Finder quietly
+  went wrong. The read side's own rule is the argument: `super::mfm` says the
+  CRC "covers the three sync bytes as data — `$A1 $A1 $A1` — then the address
+  mark, then the field", and on the read side that falls out of where framing
+  begins. On the write side the chip is *told* which bytes are marks, which is
+  what the ISM's Write Mark register is for.
+* **A CRC byte is whatever the generator holds when the head reaches it**, not
+  when the processor asked for it: bytes handed over earlier may still be in
+  the buffer, and the CRC has to cover them. So the buffer holds a *kind* per
+  slot rather than only a value.
+
+**The register decode had to be corrected to get there**, and the correction is
+Apple's own table, *SWIM Chip User's Reference* page 10:
+
+| L7 | L6 | MotorOn | Register (State Name) |
+| --- | --- | --- | --- |
+| 0 | 0 | 0 | Read All Ones |
+| 0 | 0 | 1 | Read Data |
+| 0 | 1 | X | Read Status |
+| 1 | 0 | X | Read Write-Handshake |
+| 1 | 1 | 0 | Set Mode |
+| 1 | 1 | 1 | Write Data |
+
+> Reading from a register must be done from a "0" state (L7=0, L6=0 or
+> MotorOn=0). Writing to a register must be done from a "1" state (L7=1, L6=1
+> or MotorOn=1).
+
+This model used to put `Write Data` at `L7=1, L6=0` — which is the *handshake*
+— and the mode register at `[11X]` whatever `MotorOn` was. `MotorOn` is the
+third address bit, and it is the same latch the sixteen soft switches call
+`ENABLE`. Apple's IIGS note says the same thing from the software side: "the
+write to the mode register will fail unless the drive is fully deactivated".
+
+**The boot is eight virtual seconds longer** than it was, and that is the write
+path being real: a sector takes the time a sector takes. The desktop at the end
+hashes the same.
+
+**Nothing writes to anybody's file.** The medium lives in the `Disk` the media
+slot handed the drive, and `rsemu run` never writes a floppy image back out.
+A disk that *has* been written is carried in the snapshot, because a restore
+cannot rebuild it from the machine file the way an untouched one is rebuilt.
+
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **The eject at 69 seconds.** At the instant the Finder finishes drawing the
-   desktop, the ROM drives the phase lines to `CA2:CA1:CA0 = 111` and strobes
-   `LSTRB`, which with `SEL` low is the drive register file's **eject**, and
-   this model takes it literally — `Swim::has_disk` goes false while the
-   startup volume's icon sits on the desktop and the Finder is plainly still
-   mounted. Nothing has needed the disk since, so nothing has broken yet; the
-   first thing that reads it again will.
-
-   The trace, from `trace_the_controller`:
+1. ~~**The eject at 69 seconds.**~~ **Settled, and it was the mechanism.** The
+   trace now prints `SEL`, the selected drive and the motor beside every phase
+   write, and the two readings the ledger offered are no longer symmetric:
 
    ```text
-     ISM wPhase      W f3      CA0, CA1
-     ISM wPhase      W f7      and CA2: CA2:CA1:CA0 = 111
-     ISM wPhase      W ff      LSTRB rises -> latch address 6|SEL, data CA2 = 1
-     ISM wPhase      W f7      and falls
+     ISM wPhase  W f3  drv1 sel1 tach        motor1 disk1   CA0, CA1
+     ISM wPhase  W f7  drv1 sel0 installed   motor1 disk1   and CA2, and SEL goes low
+     ISM wPhase  W ff  drv1 sel0 installed   motor1 disk0   LSTRB rises: eject
+     ISM wPhase  W f7  drv1 sel0 installed                  and falls
    ```
 
-   Two readings, and the measurement does not settle them. Either **`SEL` is
-   not the VIA's `PA5` on a Classic** — with `SEL` high the address is `0b111`,
-   which Apple's note gives no function, and this is not the first time this
-   board has found `PA4`/`PA5` doing something else (see the latching overlay
-   above, which raised exactly this doubt about `PA4`) — or the **mechanism
-   refuses to eject while its spindle is running**, which is true of the real
-   thing and which no document here states. A third possibility is that the
-   command is genuine and something later puts the disk back.
+   **`SEL` is low**, so the reading that `SEL` is not the VIA's `PA5` on a
+   Classic is refuted twice over: the pin is measurably low at the strobe, and
+   it has to be `PA5` anyway or the head could not be chosen, because `RDDATA0`
+   and `RDDATA1` differ only in that line and this machine reads both sides of
+   its disk. The address really is the drive register file's eject with `CA2`
+   as its one.
 
-   The cheapest next measurement: print `Iwm::sel` alongside the phase writes
-   and see what `PA5` is doing across the whole boot, then wire `SEL` from the
-   SWIM's own `3.5SEL*` pin (Setup register bit 1, *inverted*, page 22) instead
-   of from the VIA and see whether the ROM still reads cylinder 0 head 0.
-2. **Writing to a disk.** The read path is here; the write path is the same
-   machinery backwards, plus the ISM's write handshake meaning something — the
-   Data and Mark registers keep the byte and it goes nowhere today — and a way
-   to get the bytes back into the image. A Macintosh that boots wants to write
-   to its disk almost immediately, and until it can, every session starts over.
+   What settles it is the register write *immediately before*: `wMode1 W 82`,
+   which is `MotorOn` and `ENBL1` — the ROM turns the spindle on and then asks
+   to eject, and nothing stops it first. A Sony mechanism will not throw a disk
+   out from under a turning spindle. So `Mechanism::control` performs the eject
+   only when the motor is stopped, and the guest agrees: the startup volume
+   stays mounted, the Finder goes on reading *and writing* it for another
+   virtual minute, and the desktop is the same picture it was.
+
+   That the interlock exists is an **inference**; what is measured is that the
+   guest does not accept the eject. `tests/mac_classic.rs` asserts the disk is
+   still in the drive at the end of the boot.
+2. ~~**Writing to a disk.**~~ **Built**, and Apple's own code is what proves
+   it. See "The write path", below.
 3. **A host keymap, and the mouse.** `mac.adb` carries a keyboard at address 2
    and a mouse at address 3 and will report a key transition or a movement
    through Talk 0, and `mac.mouse` now drives the pointer — but nothing turns a

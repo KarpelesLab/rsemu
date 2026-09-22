@@ -354,3 +354,99 @@ fn the_separator_reads_an_id_field_and_its_crc_comes_out_zero() {
          zero; the field was {field:02x?}"
     );
 }
+
+/// **A data field the ISM writes is a data field the image gets back**, CRC and
+/// all — and the CRC is the chip's own, not one the test computed.
+///
+/// This is the write path a Macintosh Classic really uses, driven the way Mac
+/// OS 6.0.8 drives it: clear the FIFO with the read/write bit set to write,
+/// set `ACTION`, then a sync field of `$00`s through the Data register, three
+/// `$A1`s through the **Mark** register, the address mark, the 512 bytes, and
+/// the two CRC bytes asked for through the **CRC** register rather than
+/// computed by anybody. The sector then has to come off the medium through
+/// `mfm::decode_track`, which checks the CRC it did not write.
+///
+/// That last part is what makes it worth the length: the generator's preset is
+/// an inference (`iwm::Writer::crc`), and a field whose CRC was seeded a byte
+/// early reads back bad. It did, before the preset moved to the first mark.
+#[test]
+fn a_field_the_chip_writes_reads_back_with_its_crc_clear() {
+    let swim = Swim::with_drives([true, false]);
+    swim.insert(0, Disk::blank_mfm());
+    let iwm = swim.iwm();
+    iwm.set_enables(Some(0), true, Some(false));
+
+    // Read sector 1's ID field to the end of its CRC, which is exactly where a
+    // driver about to write that sector's data leaves the head.
+    iwm.set_mfm_framing(true, ism::CRC_SEED);
+    let mut tick = 0u64;
+    let mut field: Vec<u8> = Vec::new();
+    while tick < mfm::CELLS_PER_REVOLUTION as u64 && field.len() < 10 {
+        tick += 1;
+        swim.advance_to(tick);
+        while let Some((byte, mark)) = iwm.take_mfm() {
+            if field.is_empty() && !mark {
+                continue; // still in the gap
+            }
+            field.push(byte);
+            if field.len() >= 10 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        &field[..5],
+        &[mfm::SYNC_A1, mfm::SYNC_A1, mfm::SYNC_A1, mfm::IDAM, 0],
+        "three sync bytes, the ID address mark and cylinder 0: {field:02x?}"
+    );
+    let sector_number = field[6];
+    iwm.set_mfm_framing(false, ism::CRC_SEED);
+
+    // And write its data field where the format puts it: gap 2, the sync
+    // field, three `$A1` marks, the data address mark, 512 bytes, and the two
+    // CRC bytes the *chip* supplies.
+    let data: Vec<u8> = (0..512u32).map(|i| (i * 7 + 3) as u8).collect();
+    iwm.set_writing(true, true, ism::CRC_SEED);
+    let mut lay = |byte: u8, kind: iwm::WriteKind| {
+        assert!(iwm.push_write(byte, kind), "the buffer had room");
+        tick += 16; // one MFM byte is sixteen cells
+        swim.advance_to(tick);
+    };
+    for _ in 0..mfm::GAP2 {
+        lay(mfm::GAP_BYTE, iwm::WriteKind::Data);
+    }
+    for _ in 0..mfm::SYNC_BYTES {
+        lay(0x00, iwm::WriteKind::Data);
+    }
+    for _ in 0..3 {
+        lay(mfm::SYNC_A1, iwm::WriteKind::Mark);
+    }
+    lay(mfm::DAM, iwm::WriteKind::Data);
+    for &byte in &data {
+        lay(byte, iwm::WriteKind::Data);
+    }
+    lay(0, iwm::WriteKind::CrcHigh);
+    lay(0, iwm::WriteKind::CrcLow);
+    // Gap, so the splice at the end of the write does not land inside the
+    // field that follows.
+    for _ in 0..8 {
+        lay(mfm::GAP_BYTE, iwm::WriteKind::Data);
+    }
+    iwm.set_writing(false, true, ism::CRC_SEED);
+
+    // And read it back **out of the image**, which is where a decoder that
+    // checks the CRC has already had its say.
+    let disk = iwm.disk(0).expect("a disk");
+    let block = mfm::block_of(0, 0, sector_number).expect("sector 1 of cylinder 0 head 0");
+    assert_eq!(
+        disk.block(block).expect("the block"),
+        &data[..],
+        "the data field the chip wrote did not come back out of the image; a CRC seeded \
+         anywhere but at the first mark byte is what that looks like"
+    );
+    // And nothing else on the cylinder moved.
+    let others = (0..disk.blocks())
+        .filter(|&n| n != block && disk.block(n) == Some(&data[..]))
+        .count();
+    assert_eq!(others, 0, "the write reached {others} other blocks");
+}

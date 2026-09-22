@@ -440,6 +440,26 @@ impl Track {
         self.bits[n / 8] & (0x80 >> (n % 8)) != 0
     }
 
+    /// Put `bit` at `n` of the revolution, which wraps exactly as
+    /// [`Track::bit`] does.
+    ///
+    /// This is what a **write** does: the head is a pen as well as a reader,
+    /// and a byte laid down at cell `n` replaces whatever was there. A track
+    /// that is empty takes nothing, because an unformatted cylinder has no
+    /// cells for the head to be over.
+    pub fn set_bit(&mut self, n: usize, bit: bool) {
+        if self.len == 0 {
+            return;
+        }
+        let n = n % self.len;
+        let mask = 0x80u8 >> (n % 8);
+        if bit {
+            self.bits[n / 8] |= mask;
+        } else {
+            self.bits[n / 8] &= !mask;
+        }
+    }
+
     /// Append one bit.
     pub fn push_bit(&mut self, bit: bool) {
         if self.len.is_multiple_of(8) {
@@ -482,38 +502,22 @@ impl Track {
     /// Lay one whole sector down: the gap, the address field, the gap and the
     /// data field.
     pub fn push_sector(&mut self, sector: &Sector) {
-        self.push_sync(SYNC_BEFORE_ADDRESS);
-        for byte in ADDRESS_MARK {
-            self.push_byte(byte);
-        }
-        let side_high = (u8::from(sector.side) << 5) | (sector.track >> 6);
-        let track_low = sector.track & 0x3f;
-        self.push_nibble(track_low);
-        self.push_nibble(sector.sector);
-        self.push_nibble(side_high);
-        self.push_nibble(sector.format);
-        self.push_nibble(track_low ^ sector.sector ^ side_high ^ sector.format);
-        for byte in EPILOGUE {
-            self.push_byte(byte);
-        }
-        self.push_byte(0xff);
+        self.push_stream(&sector_stream(sector));
+    }
 
-        self.push_sync(SYNC_BEFORE_DATA);
-        for byte in DATA_MARK {
+    /// Lay a [`sector_stream`] down, each byte in the cells it is given.
+    ///
+    /// A byte of more than eight cells is written as itself and then that many
+    /// cells of nothing, which is what a self-sync byte is and what a
+    /// controller's write head does when the processor is late with the next
+    /// one (`super::iwm`'s `Writer`).
+    pub fn push_stream(&mut self, stream: &[(u8, u8)]) {
+        for &(byte, cells) in stream {
             self.push_byte(byte);
+            for _ in 8..cells {
+                self.push_bit(false);
+            }
         }
-        self.push_nibble(sector.sector);
-        let (scrambled, sum) = Checksum::scramble(&sector.bytes);
-        for value in nibblize(&scrambled) {
-            self.push_nibble(value);
-        }
-        for value in sum.nibbles() {
-            self.push_nibble(value);
-        }
-        for byte in EPILOGUE {
-            self.push_byte(byte);
-        }
-        self.push_byte(0xff);
     }
 
     /// Pad out to `cells` with the gap a formatter leaves.
@@ -534,6 +538,113 @@ impl Track {
             self.push_bit(false);
         }
     }
+}
+
+/// How many cells a self-sync byte occupies: `$FF` in **ten** rather than
+/// eight, which is the whole trick of the format.
+pub const SYNC_CELLS: u8 = 10;
+
+/// How many a payload byte occupies.
+pub const BYTE_CELLS: u8 = 8;
+
+/// One whole sector as the stream a formatter hands its controller: each byte,
+/// and how many cells it is given.
+///
+/// This is the **one** description of the layout, and both directions use it —
+/// [`Track::push_sector`] turns it into cells directly, and a test that drives
+/// a real controller's write head hands the same bytes over with the same
+/// timing. Writing the format out twice, once for the encoder and once for
+/// whatever exercises the write path, is exactly the duplication that lets the
+/// two agree with each other while both being wrong (`CLAUDE.md`, *CPU cores*,
+/// makes the same argument about instruction tables).
+///
+/// The layout: the gap, the `$D5 $AA $96` address field and its five
+/// six-bit fields with their exclusive-OR check, the `$DE $AA` epilogue, a
+/// shorter gap, the `$D5 $AA $AD` data field with the sector number, the 699
+/// nibbles of the scrambled 524 bytes, the patent's four checksum nibbles, and
+/// the epilogue again.
+#[must_use]
+pub fn sector_stream(sector: &Sector) -> Vec<(u8, u8)> {
+    let mut out: Vec<(u8, u8)> = Vec::with_capacity(SYNC_BEFORE_ADDRESS + SECTOR_NIBBLES + 64);
+    let sync = |out: &mut Vec<(u8, u8)>, n: usize| {
+        for _ in 0..n {
+            out.push((0xff, SYNC_CELLS));
+        }
+    };
+    let byte = |out: &mut Vec<(u8, u8)>, b: u8| out.push((b, BYTE_CELLS));
+    let nibble = |out: &mut Vec<(u8, u8)>, v: u8| {
+        out.push((DISK_BYTES[usize::from(v & 0x3f)], BYTE_CELLS));
+    };
+
+    sync(&mut out, SYNC_BEFORE_ADDRESS);
+    for b in ADDRESS_MARK {
+        byte(&mut out, b);
+    }
+    let side_high = (u8::from(sector.side) << 5) | (sector.track >> 6);
+    let track_low = sector.track & 0x3f;
+    for v in [
+        track_low,
+        sector.sector,
+        side_high,
+        sector.format,
+        track_low ^ sector.sector ^ side_high ^ sector.format,
+    ] {
+        nibble(&mut out, v);
+    }
+    for b in EPILOGUE {
+        byte(&mut out, b);
+    }
+    byte(&mut out, 0xff);
+
+    sync(&mut out, SYNC_BEFORE_DATA);
+    for b in DATA_MARK {
+        byte(&mut out, b);
+    }
+    nibble(&mut out, sector.sector);
+    let (scrambled, sum) = Checksum::scramble(&sector.bytes);
+    for v in nibblize(&scrambled) {
+        nibble(&mut out, v);
+    }
+    for v in sum.nibbles() {
+        nibble(&mut out, v);
+    }
+    for b in EPILOGUE {
+        byte(&mut out, b);
+    }
+    byte(&mut out, 0xff);
+    out
+}
+
+/// One whole cylinder as that stream, gaps and all: every sector's own stream,
+/// each padded out to [`SECTOR_CELLS`] with the self-sync a formatter writes.
+///
+/// The inverse of [`decode_track`] at the level a *controller* works at, which
+/// is what a write test needs: [`encode_track`] produces the same cells.
+#[must_use]
+pub fn track_stream(sectors: &[Sector]) -> Vec<(u8, u8)> {
+    let mut out: Vec<(u8, u8)> = Vec::new();
+    let mut cells = 0usize;
+    for (n, sector) in sectors.iter().enumerate() {
+        let stream = sector_stream(sector);
+        cells += stream.iter().map(|&(_, c)| usize::from(c)).sum::<usize>();
+        out.extend(stream);
+        // Fill the sector's slot with the self-sync a formatter writes.
+        let boundary = (n + 1) * SECTOR_CELLS;
+        while cells + usize::from(SYNC_CELLS) <= boundary {
+            out.push((0xff, SYNC_CELLS));
+            cells += usize::from(SYNC_CELLS);
+        }
+        // The last few cells will not take another sync byte. `Track::pad_to`
+        // leaves them as bare medium with no transition on them; here they go
+        // onto the end of the sync byte before, which is the same cells —
+        // eight ones and then two zeros and more of them — and is what a write
+        // head does when the processor is a little later still.
+        if let (true, Some(last)) = (cells < boundary, out.last_mut()) {
+            last.1 += (boundary - cells) as u8;
+            cells = boundary;
+        }
+    }
+    out
 }
 
 /// One sector, as it goes onto a track or comes off it.
@@ -597,10 +708,7 @@ impl Sector {
 #[must_use]
 pub fn encode_track(sectors: &[Sector]) -> Track {
     let mut track = Track::new();
-    for (n, sector) in sectors.iter().enumerate() {
-        track.push_sector(sector);
-        track.pad_to((n + 1) * SECTOR_CELLS);
-    }
+    track.push_stream(&track_stream(sectors));
     track
 }
 

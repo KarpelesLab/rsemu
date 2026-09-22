@@ -161,7 +161,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.iwm";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 4;
+pub const STATE_VERSION: u32 = 5;
 
 /// How many bytes of address space the sixteen switches occupy: the board puts
 /// the register selects on A9-A12, so `16 * 512`.
@@ -393,6 +393,268 @@ impl Framer {
     }
 }
 
+// -- the write side ----------------------------------------------------------
+
+/// How many bytes the write buffer holds.
+///
+/// Two, which covers both parts. The IWM has one byte of buffer behind its
+/// shift register and its handshake reports it in one bit — *SWIM Chip User's
+/// Reference*, page 11: "The write buffer empty bit will be set to '1'
+/// whenever the chip is ready to accept another byte from the processor" — and
+/// the ISM has the two-byte FIFO its own handshake register counts in two bits
+/// (page 13: "The ISM uses a 2-byte read/write FIFO"). A buffer of two answers
+/// both: the IWM's bit is "at least one slot free", which a buffer of two
+/// answers as well as a buffer of one does.
+pub const WRITE_FIFO: usize = 2;
+
+/// The write side of the head: the bytes the processor has handed over and the
+/// cells they become on the way to the medium.
+///
+/// # The rule, and where it comes from
+///
+/// Apple, *Software Control of the Disk II or IWM Controller* (26 April 1984,
+/// revision 1 of 10 May 1984), page 3, gives the whole of the register decode
+/// the write path hangs off:
+///
+/// ```text
+///   Q6   Q7   FUNCTION
+///   L    L    READ
+///   H    L    SENSE WRITE PROTECT OR PREWRITE STATE
+///   L    H    WRITE
+///   H    H    WRITE LOAD
+/// ```
+///
+/// and page 4 the sequence, which is what says that a *store* is the load and
+/// that the shifting is the chip's own: "The STA instruction loads the contents
+/// of the accumulator into the controller's data shift register. The next
+/// instruction [LDA Q6L, X] causes the data in the register to shift out
+/// serially. Q6H and Q7H are the conditions required for parallel loading the
+/// data into the controller. Shifting out the data serially to the disk drive
+/// requires Q6L and Q7H."
+///
+/// The *SWIM Chip User's Reference*, page 10, gives the same decode for the
+/// part a Macintosh has, with the `MotorOn` latch as its third address bit —
+/// `[110]` is `Set Mode` and `[111]` is `Write Data` — and page 12 says what a
+/// load does: "Writing to either L7=, L6=1 or MotorOn=1 while in this state
+/// will write a byte of data to the write buffer. This byte will in turn be
+/// loaded into the shifting hardware and sent out serially to the disk."
+///
+/// # What happens when the processor is late is an **inference**
+///
+/// Neither document says in so many words what the head lays down at a byte
+/// boundary with nothing loaded. Two things are quotable and they settle it
+/// between them.
+///
+/// * Apple's own self-sync example, page 4 of *Software Control*, spends
+///   **forty** clock cycles on an `$FF` where a data byte spends **thirty-two**
+///   — "SELF SYNC BYTE / 40 CLOCK CYCLES" against "DATA BYTE / 32 CLOCK
+///   CYCLES". Eight 6502 cycles are two bit cells, and what comes off a disk
+///   there is a self-sync byte: eight ones and two zeros. So the two extra
+///   cells carry **no transition**, and there is no other mechanism in the part
+///   for writing one — the sync byte a formatter lays down is made by being
+///   late on purpose.
+/// * Neil Parker, *Controlling the 3.5 Drive Hardware on the Apple IIGS*
+///   (1994), ends its write routine on `BIT Q6 / BVS WLAST  ;wait until last
+///   data underruns`, so an underrun is the *ordinary* end of a write rather
+///   than a fault.
+///
+/// So: a boundary with an empty buffer lays down a zero cell and sets the
+/// underrun flag, and the head keeps writing. That is what
+/// [`Writer::cell`] does and it is commented here rather than presented as a
+/// reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Writer {
+    /// Whether the head is laying cells down at all.
+    on: bool,
+    /// Whether a byte becomes **sixteen MFM cells** rather than its own eight.
+    /// An IWM writes Apple GCR and leaves this clear; an ISM out of GCR mode
+    /// sets it.
+    mfm: bool,
+    /// The bytes the processor has handed over and the head has not reached,
+    /// oldest first.
+    fifo: [u8; WRITE_FIFO],
+    /// What each of them is, which is not always the same as its value: a CRC
+    /// byte is whatever the generator holds when the head **reaches** it, not
+    /// when the processor asked for it.
+    kinds: [WriteKind; WRITE_FIFO],
+    /// How many of `fifo` are live.
+    count: u8,
+    /// The cells of the byte being laid down, the next one in bit `bits - 1`.
+    cells: u16,
+    /// How many of them are left.
+    bits: u8,
+    /// The last data bit laid down, which is what MFM's clock rule needs:
+    /// `super::mfm::cells` states it as `clock = !prev && !bit`.
+    prev: bool,
+    /// The processor was late: the head reached a byte boundary with an empty
+    /// buffer. Sticky, page 11: "this bit will be reset to '0' until either the
+    /// chip is reset or taken out of write mode".
+    underrun: bool,
+    /// The CRC generator, the mirror of [`Framer::crc`].
+    ///
+    /// **It is preset at the first mark byte of a field**, which is the one
+    /// thing about the write side that neither document states and is an
+    /// *inference* — from the read side's own rule, which is the same rule
+    /// seen from the other end. `super::mfm` puts it as: "A field's CRC is
+    /// seeded with `$FFFF` and covers the three sync bytes as data — `$A1 $A1
+    /// $A1` — then the address mark, then the field." On the read side that
+    /// falls out of where framing begins, because the separator locks onto the
+    /// first `$A1` and nothing in front of it is ever framed. On the write
+    /// side the chip is *told* which bytes are marks — that is the whole point
+    /// of the ISM's Write Mark register — so the first of a run of them is the
+    /// same instant. A generator running from the Clear FIFO toggle instead
+    /// would have absorbed the sync field of `$00`s the processor writes in
+    /// front of the marks, and every field on the disk would read as bad.
+    ///
+    /// It is **checkable** rather than assumed, which is the reason to accept
+    /// it: a field written this way and read straight back leaves the read
+    /// side's generator at zero, which is exactly what the ISM's handshake
+    /// register reports in bit 1.
+    crc: u16,
+    /// What `crc` goes back to at the first mark of a field.
+    seed: u16,
+    /// Whether the byte last taken into the shifter was a mark, so that the
+    /// *first* of a field's three is the one that presets the generator.
+    after_mark: bool,
+    /// The generator as it stood when the head reached the first of the two
+    /// CRC bytes, so that the second is the low half of the same value.
+    pending_crc: u16,
+}
+
+/// What a byte in the write buffer is.
+///
+/// A real enum rather than the `#[repr(transparent)]` newtype `CLAUDE.md`
+/// prefers, because these four are the whole of it: the ISM has one register
+/// per kind — Write Data, Write Mark and Write CRC — and an IWM, which has
+/// only the first, never produces the other three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteKind {
+    /// An ordinary byte, from the Data register.
+    #[default]
+    Data,
+    /// A byte "that has a transition missing between two adjacent zero-bits"
+    /// (page 20) — a field's `$A1` sync. The ISM's Write Mark register.
+    Mark,
+    /// The high half of the generator, taken when the head reaches it.
+    CrcHigh,
+    /// And the low half of the same value.
+    CrcLow,
+}
+
+impl WriteKind {
+    /// The one a snapshot byte names; anything else is an ordinary byte,
+    /// because a restore must not be able to invent a fifth.
+    fn from_byte(byte: u8) -> WriteKind {
+        match byte {
+            1 => WriteKind::Mark,
+            2 => WriteKind::CrcHigh,
+            3 => WriteKind::CrcLow,
+            _ => WriteKind::Data,
+        }
+    }
+}
+
+impl Writer {
+    /// Empty the buffer and reseed the generator, leaving the mode alone. What
+    /// the ISM's "clear FIFO" bit and a fresh `ACTION` do.
+    fn restart(&mut self, seed: u16) {
+        let (on, mfm) = (self.on, self.mfm);
+        *self = Writer::default();
+        self.on = on;
+        self.mfm = mfm;
+        self.crc = seed;
+        self.seed = seed;
+    }
+
+    /// How many slots are free.
+    fn space(&self) -> u8 {
+        WRITE_FIFO as u8 - self.count
+    }
+
+    /// Hand a byte over. `false` if there was no room, which page 12 says is
+    /// harmless: "Writing to the chip faster than this won't hurt anything".
+    fn push(&mut self, byte: u8, kind: WriteKind) -> bool {
+        let slot = usize::from(self.count);
+        if slot >= WRITE_FIFO {
+            return false;
+        }
+        self.fifo[slot] = byte;
+        self.kinds[slot] = kind;
+        self.count += 1;
+        true
+    }
+
+    /// Take the next byte into the shifter. `false` when there is none.
+    fn load(&mut self) -> bool {
+        if self.count == 0 {
+            return false;
+        }
+        let (mut byte, kind) = (self.fifo[0], self.kinds[0]);
+        self.count -= 1;
+        self.fifo.rotate_left(1);
+        self.kinds.rotate_left(1);
+        match kind {
+            WriteKind::Data => {}
+            // The first mark of a field presets the generator; the second and
+            // third `$A1` are covered by it. See `Writer::crc`.
+            WriteKind::Mark => {
+                if !self.after_mark {
+                    self.crc = self.seed;
+                }
+            }
+            // The generator's own value, taken **here** rather than where the
+            // processor asked for it: bytes handed over earlier may still have
+            // been in the buffer then, and the CRC has to cover them.
+            WriteKind::CrcHigh => {
+                self.pending_crc = self.crc;
+                byte = (self.pending_crc >> 8) as u8;
+            }
+            WriteKind::CrcLow => byte = self.pending_crc as u8,
+        }
+        self.after_mark = kind == WriteKind::Mark;
+        self.crc = mfm::crc16(self.crc, &[byte]);
+        if self.mfm {
+            self.cells = if kind == WriteKind::Mark {
+                mfm::sync_cells(byte)
+            } else {
+                mfm::cells(byte, self.prev, None)
+            };
+            self.bits = MFM_CELLS_PER_BYTE;
+        } else {
+            // Apple GCR: the byte is the cells, most significant first.
+            self.cells = u16::from(byte);
+            self.bits = 8;
+        }
+        self.prev = byte & 1 != 0;
+        true
+    }
+
+    /// The cell the head lays down now.
+    fn cell(&mut self) -> bool {
+        if self.bits == 0 && !self.load() {
+            // Late. See the module-level inference above: a zero cell, and the
+            // flag stays set until the chip leaves write mode.
+            self.underrun = true;
+            self.prev = false;
+            return false;
+        }
+        self.bits -= 1;
+        self.cells & (1 << self.bits) != 0
+    }
+
+    /// How many cells until the head wants the next byte.
+    ///
+    /// Exact: the shifter owes `bits` more cells of the byte it is on, and a
+    /// shifter with nothing in it wants one now. Naming it is what keeps a
+    /// scheduler round from running past several byte times at once and
+    /// underrunning a guest that was keeping up — the defect
+    /// [`Shared::publish_latch`] records on the read side, in the other
+    /// direction.
+    fn cells_ahead(&self) -> u64 {
+        u64::from(self.bits.max(1))
+    }
+}
+
 /// The byte in sixteen MFM cells, and whether a clock pulse is missing from
 /// them — which is what makes a byte a mark byte.
 ///
@@ -617,8 +879,37 @@ impl Mechanism {
             }
             // The spindle motor: on for a zero, off for a one.
             0b100 => self.motor = !data,
-            // Eject, on the one.
-            0b110 if data && self.disk => {
+            // Eject, on the one — **but not while the spindle is turning**.
+            //
+            // That interlock is a measurement of Apple's own code rather than
+            // a reading, and it is what `docs/platforms/mac-classic.md`'s
+            // ledger item 1 was about. A Macintosh Classic running Mac OS
+            // 6.0.8 drives the phase lines to `CA2:CA1:CA0 = 111` and strobes
+            // `LSTRB` at the instant the Finder finishes with the startup
+            // volume, which by Apple's own table (`Mechanism::sense`'s source)
+            // is this register with `CA2` as a one. The two readings the
+            // ledger offered were that `SEL` is not the VIA's `PA5` on a
+            // Classic, or that the mechanism refuses. The first is **refuted**:
+            // the trace prints `SEL` beside every phase write and it is low
+            // here, and it has to be `PA5` anyway or the head could not be
+            // chosen, since `RDDATA0` and `RDDATA1` differ only in that line
+            // and this machine reads both sides of its disk.
+            //
+            // What is left is the mechanism, and the register write
+            // immediately before the strobe is what points at it: the ROM sets
+            // the ISM's mode register to `$82` — `MotorOn` and `ENBL1` — and
+            // *then* asks to eject. Nothing stops the spindle first. A Sony
+            // mechanism will not throw a disk out from under a turning
+            // spindle, so the command is refused and the guest agrees: the
+            // startup volume's icon stays on the desktop, undimmed, and the
+            // machine goes on reading and writing the disk for another virtual
+            // minute. Modelling the command literally took the disk away while
+            // the Finder still had it mounted.
+            //
+            // **Inferred**, in this sense: no document here states the
+            // interlock. What is measured is that the guest does not accept
+            // the eject, and this is the mechanism that would explain it.
+            0b110 if data && self.disk && !self.motor => {
                 self.disk = false;
                 self.switched = true;
             }
@@ -653,6 +944,8 @@ struct State {
     /// The MFM separator. Off, and therefore invisible, unless a SWIM in ISM
     /// mode turned it on. See [`Framer`].
     mfm: Framer,
+    /// The write side of the head. See [`Writer`].
+    writer: Writer,
     /// How many times the guest has loaded the mode register.
     ///
     /// The count alone, with no opinion about what was written: it is what
@@ -676,6 +969,7 @@ impl State {
             ],
             sel: true,
             mfm: Framer::default(),
+            writer: Writer::default(),
             mode_writes: 0,
         }
     }
@@ -730,14 +1024,35 @@ impl State {
         value
     }
 
+    /// The write handshake register, `[10X]`.
+    ///
+    /// *SWIM Chip User's Reference*, page 11, bit by bit:
+    ///
+    /// > 5 - 0  These bits are reserved for future expansion and will always
+    /// > read as "1"s.
+    /// > 6  This bit will be a "1" while writing data. However if a byte hasn't
+    /// > been loaded into the Write Data register before the IWM hardware goes
+    /// > looking for it (called an underrun), then this bit will be reset to
+    /// > "0" until either the chip is reset or taken out of write mode.
+    /// > 7  The write buffer empty bit will be set to "1" whenever the chip is
+    /// > ready to accept another byte from the processor.
+    fn handshake(&self) -> u8 {
+        let mut value = 0x3f;
+        if !self.writer.underrun {
+            value |= HANDSHAKE_NO_UNDERRUN;
+        }
+        if self.writer.space() > 0 {
+            value |= HANDSHAKE_READY;
+        }
+        value
+    }
+
     /// What a read of any of the sixteen addresses returns now.
     fn read_value(&self) -> u8 {
         match (self.switches & SW_Q7 != 0, self.switches & SW_Q6 != 0) {
             (false, false) => self.data,
             (false, true) => self.status(),
-            // The write handshake: always ready, never underrun, because
-            // nothing here ever takes time over a byte.
-            (true, false) => HANDSHAKE_READY | HANDSHAKE_NO_UNDERRUN,
+            (true, false) => self.handshake(),
             // Reading the mode register is not a thing the chip does.
             (true, true) => 0xff,
         }
@@ -755,6 +1070,23 @@ impl State {
         }
         // `LSTRB` going high is what latches a drive control register; the
         // address and the data are the `CA` lines as they stand at that moment.
+        // `[111]` is Write Data and `[110]` is Set Mode (*SWIM Chip User's
+        // Reference*, page 10), so **the chip is writing exactly while `L7`
+        // and the `MotorOn` latch are both set** — `Q6` moves between Write
+        // Load and Write, and both of those are write states. Recomputed only
+        // when one of those two latches actually moved, because a SWIM in ISM
+        // mode drives the phase lines through `State::switch` as well and owns
+        // the write mode itself ([`Iwm::set_writing`]).
+        if bit == SW_Q7 || bit == SW_ENABLE {
+            let writing = self.switches & (SW_Q7 | SW_ENABLE) == (SW_Q7 | SW_ENABLE);
+            if writing != self.writer.on {
+                // Leaving write mode is what clears the underrun flag, page 11.
+                self.writer.restart(0);
+                self.writer.on = writing;
+                // An IWM writes Apple GCR and nothing else.
+                self.writer.mfm = false;
+            }
+        }
         if bit == SW_LSTRB && on && before & SW_LSTRB == 0 {
             let s = self.switches;
             let addr = (u8::from(s & SW_CA1 != 0) << 2)
@@ -810,6 +1142,35 @@ struct Media {
     /// has been built.
     under: Option<(usize, u8, bool)>,
     bits: Track,
+    /// Whether the head has written to `bits` since it was built.
+    ///
+    /// The cells are the medium and the image is the record of it, so the two
+    /// have to be put back together before the cache is thrown away — which is
+    /// the one place a track's cells can be lost. Doing it *here* rather than
+    /// per byte is what makes a write cost what a read costs: decoding a whole
+    /// cylinder is the expensive half and it happens once per head movement,
+    /// not once per sector.
+    dirty: bool,
+}
+
+impl Media {
+    /// Put whatever the head has written back into the image.
+    ///
+    /// The sectors come off the cells through the *same* decoder the read path
+    /// is tested against ([`Disk::absorb`]), so a write that did not come out
+    /// as a readable field is not absorbed and the image keeps what it had.
+    fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let Some((which, track, side)) = self.under else {
+            return;
+        };
+        if let Some(disk) = self.disks[which].as_mut() {
+            disk.absorb(track, side, &self.bits);
+        }
+    }
 }
 
 /// The chip, as something an address space can dispatch to.
@@ -883,18 +1244,35 @@ impl Shared {
         let (mut bit, mut rsr, mut data) = (drive.bit, drive.rsr, state.data);
         let (mut line, mut tach) = (drive.read_line, drive.tach);
         let mut framer = state.mfm;
+        let mut writer = state.writer;
+        // A head cannot read and write at once. A tab over the hole stops the
+        // *medium* changing and nothing else: the chip has no idea, goes on
+        // shifting, and its handshake reads exactly as it would on a disk it
+        // was allowed to write — which is what the drive's `disk locked` line
+        // is for and why software is expected to check it first.
+        let writing = writer.on;
+        let protect = drive.write_protect;
         for _ in 0..steps {
-            line = media.bits.bit(bit as usize);
-            if framer.on {
-                // ISM mode: the byte boundary is the format's, not the
-                // shifter's, so the GCR rule below is not run at all. The two
-                // are exclusive — a chip cannot be framing both ways at once.
-                framer.cell(line);
+            if writing {
+                line = writer.cell();
+                if !protect {
+                    media.bits.set_bit(bit as usize, line);
+                    media.dirty = true;
+                }
             } else {
-                rsr = (rsr << 1) | u8::from(line);
-                if rsr & 0x80 != 0 {
-                    data = rsr;
-                    rsr = 0;
+                line = media.bits.bit(bit as usize);
+                if framer.on {
+                    // ISM mode: the byte boundary is the format's, not the
+                    // shifter's, so the GCR rule below is not run at all. The
+                    // two are exclusive — a chip cannot be framing both ways at
+                    // once.
+                    framer.cell(line);
+                } else {
+                    rsr = (rsr << 1) | u8::from(line);
+                    if rsr & 0x80 != 0 {
+                        data = rsr;
+                        rsr = 0;
+                    }
                 }
             }
             bit = (bit + 1) % len;
@@ -904,6 +1282,7 @@ impl Shared {
         }
         state.data = data;
         state.mfm = framer;
+        state.writer = writer;
         let drive = &mut state.drives[which];
         drive.bit = bit;
         drive.rsr = rsr;
@@ -917,6 +1296,9 @@ impl Shared {
     fn cylinder(media: &mut Media, which: usize, track: u8, side: bool) -> u64 {
         let want = (which, track, side);
         if media.under != Some(want) {
+            // The cells about to be thrown away may be the only copy of what
+            // the head wrote, so they go back into the image first.
+            media.flush();
             media.bits = match &media.disks[which] {
                 Some(disk) => disk.track(track, side),
                 None => Track::new(),
@@ -950,7 +1332,13 @@ impl Shared {
         }
         let mut media = self.media.lock();
         let len = Shared::cylinder(&mut media, which, drive.track, drive.side);
-        let ahead = if state.mfm.on {
+        let ahead = if state.writer.on {
+            // Writing: the event is the cell the shifter wants the next byte
+            // on, for exactly the reason the read side names its latch — a
+            // round that ran past several byte times at once would underrun a
+            // guest that was keeping up perfectly well.
+            (len != 0).then(|| state.writer.cells_ahead())
+        } else if state.mfm.on {
             // ISM mode frames on the format's boundaries; see
             // `Framer::cells_ahead`.
             (len != 0).then(|| state.mfm.cells_ahead())
@@ -967,7 +1355,15 @@ impl Shared {
     /// Throw the cached cylinder away and say when the next byte lands from
     /// wherever the head now stands.
     fn invalidate(&self) {
-        self.media.lock().under = None;
+        {
+            let mut media = self.media.lock();
+            // Throwing the cylinder away is the one place written cells can be
+            // lost, and `Media::flush` needs `under` to know where they came
+            // from — so it has to happen *before* the forgetting, not inside
+            // the rebuild.
+            media.flush();
+            media.under = None;
+        }
         let state = self.state.lock();
         self.publish_latch(&state);
     }
@@ -1046,15 +1442,31 @@ impl MemOps for Shared {
         self.sync(false);
         let mut state = self.state.lock();
         state.switch(index);
+        // *SWIM Chip User's Reference*, page 10: the three latches `L7`, `L6`
+        // and `MotorOn` name the register, and "Writing to a register must be
+        // done from a '1' state". `[110]` is `Set Mode` and `[111]` is `Write
+        // Data`, so **which of the two a store lands in is the `MotorOn`
+        // latch** — the same bit the sixteen soft switches call `ENABLE`.
+        //
+        // That distinction is why a Macintosh can load its mode register at all
+        // and still write a disk through the same address: Apple's own note
+        // (Neil Parker, 1994) is explicit that "the write to the mode register
+        // will fail unless the drive is fully deactivated".
+        let enabled = state.switches & SW_ENABLE != 0;
         match (state.switches & SW_Q7 != 0, state.switches & SW_Q6 != 0) {
-            // The mode register.
+            (true, true) if enabled => {
+                // Page 12: "Writing to either L7=, L6=1 or MotorOn=1 while in
+                // this state will write a byte of data to the write buffer."
+                // A buffer that is already full drops it, which page 12 says is
+                // harmless: "Writing to the chip faster than this won't hurt
+                // anything, but the last byte written to the chip when the
+                // buffer is emptied is the one that will be used."
+                state.writer.push(*value, WriteKind::Data);
+            }
             (true, true) => {
                 state.mode = *value & 0x7f;
                 state.mode_writes = state.mode_writes.wrapping_add(1);
             }
-            // The data register, which starts a write to the disk. Writing is
-            // not modelled, so the byte is kept and goes nowhere.
-            (true, false) => state.data = *value,
             _ => {}
         }
         // A write moves `LSTRB`, which is how the motor and the stepper are
@@ -1111,6 +1523,7 @@ impl Iwm {
         let mut r = props.reader();
         let drives = r.or("drives", 1u64)?;
         let image = r.optional_media("image")?.map(|m| m.bytes().to_vec());
+        let image2 = r.optional_media("image2")?.map(|m| m.bytes().to_vec());
         r.finish()?;
         if drives == 0 || drives > 2 {
             return Err(Error::Property(alloc::format!(
@@ -1123,6 +1536,14 @@ impl Iwm {
         // picture for.
         if let Some(bytes) = image.filter(|b| !b.is_empty()) {
             iwm.insert(0, Disk::from_image(&bytes)?);
+        }
+        if let Some(bytes) = image2.filter(|b| !b.is_empty()) {
+            if drives < 2 {
+                return Err(Error::Property(alloc::format!(
+                    "property `image2`: there is a disk for the second drive and `drives` is                      {drives}; a cable with one mechanism on it has nowhere to put it"
+                )));
+            }
+            iwm.insert(1, Disk::from_image(&bytes)?);
         }
         Ok(iwm)
     }
@@ -1233,6 +1654,8 @@ impl Iwm {
         }
         {
             let mut media = self.shared.media.lock();
+            // Whatever the head wrote belongs to the disk coming *out*.
+            media.flush();
             media.disks[which] = Some(disk);
             media.under = None;
         }
@@ -1253,6 +1676,8 @@ impl Iwm {
         }
         {
             let mut media = self.shared.media.lock();
+            // The same: a disk leaving the drive takes what was written to it.
+            media.flush();
             media.disks[which] = None;
             media.under = None;
         }
@@ -1272,9 +1697,82 @@ impl Iwm {
     }
 
     /// The disk in drive `which`, if there is one.
+    ///
+    /// Whatever the head has written and not yet put back goes into the image
+    /// first, so what comes out is the medium as it stands rather than as it
+    /// was when the cylinder was last built.
     #[must_use]
     pub fn disk(&self, which: usize) -> Option<Disk> {
-        self.shared.media.lock().disks[which & 1].clone()
+        let mut media = self.shared.media.lock();
+        media.flush();
+        media.disks[which & 1].clone()
+    }
+
+    /// Put whatever the head has written back into the image, without
+    /// disturbing anything else.
+    pub fn flush_writes(&self) {
+        self.shared.media.lock().flush();
+    }
+
+    // -- the write side ------------------------------------------------------
+
+    /// Turn the write head on or off, restarting the buffer either way with
+    /// `seed` in its CRC generator.
+    ///
+    /// `mfm` says whether a byte becomes sixteen MFM cells or its own eight:
+    /// an ISM out of GCR mode writes the first, an IWM and an ISM in GCR mode
+    /// the second. Idempotent, for the reason [`Iwm::set_mfm_framing`] gives —
+    /// an ISM pushes its whole configuration at the mechanism after every
+    /// register write, and a restart on each of those would throw away the byte
+    /// the head is in the middle of.
+    pub fn set_writing(&self, on: bool, mfm: bool, seed: u16) {
+        {
+            let mut state = self.shared.state.lock();
+            if state.writer.on == on && state.writer.mfm == mfm {
+                return;
+            }
+            state.writer.restart(seed);
+            state.writer.on = on;
+            state.writer.mfm = mfm;
+        }
+        self.shared.republish();
+    }
+
+    /// Whether the head is in write mode.
+    #[must_use]
+    pub fn writing(&self) -> bool {
+        self.shared.state.lock().writer.on
+    }
+
+    /// Hand the head a byte. `false` if the buffer was full and it was
+    /// dropped, which page 12 says is harmless.
+    pub fn push_write(&self, byte: u8, kind: WriteKind) -> bool {
+        let took = self.shared.state.lock().writer.push(byte, kind);
+        if took {
+            // A slot filled changes when the shifter next wants one.
+            self.shared.republish();
+        }
+        took
+    }
+
+    /// How many bytes the buffer will take, 0 to [`WRITE_FIFO`].
+    #[must_use]
+    pub fn write_space(&self) -> u8 {
+        self.shared.state.lock().writer.space()
+    }
+
+    /// Whether the head has reached a byte boundary with an empty buffer since
+    /// the last restart.
+    #[must_use]
+    pub fn write_underrun(&self) -> bool {
+        self.shared.state.lock().writer.underrun
+    }
+
+    /// The generator over every byte the head has laid down since the last
+    /// restart.
+    #[must_use]
+    pub fn write_crc(&self) -> u16 {
+        self.shared.state.lock().writer.crc
     }
 
     /// The byte the shifter last latched and the guest has not taken.
@@ -1627,7 +2125,47 @@ impl Device for Iwm {
         w.write_u8(state.mfm.count)?;
         w.write_bool(state.mfm.overrun)?;
         w.write_u16(state.mfm.crc)?;
-        w.write_u32(state.mode_writes)
+        w.write_u32(state.mode_writes)?;
+        // The write side is chip state for the same reason the separator is:
+        // a machine snapshotted in the middle of laying a sector down comes
+        // back in the middle of it, with the same bytes owed and the same
+        // generator behind them.
+        w.write_bool(state.writer.on)?;
+        w.write_bool(state.writer.mfm)?;
+        for byte in state.writer.fifo {
+            w.write_u8(byte)?;
+        }
+        for kind in state.writer.kinds {
+            w.write_u8(kind as u8)?;
+        }
+        w.write_u8(state.writer.count)?;
+        w.write_u16(state.writer.cells)?;
+        w.write_u8(state.writer.bits)?;
+        w.write_bool(state.writer.prev)?;
+        w.write_bool(state.writer.underrun)?;
+        w.write_u16(state.writer.crc)?;
+        w.write_u16(state.writer.seed)?;
+        w.write_bool(state.writer.after_mark)?;
+        w.write_u16(state.writer.pending_crc)?;
+        // And the **medium**, when it has been written to. An image that has
+        // never been written is rebuilt from the machine's own media slot on a
+        // restore, so putting it in every chunk would be a megabyte and a half
+        // of bytes the machine file already carries; one that *has* been
+        // written cannot be rebuilt from anywhere, and dropping it would make
+        // a snapshot silently undo the guest's work.
+        let mut media = self.shared.media.lock();
+        media.flush();
+        for slot in 0..2 {
+            match media.disks[slot].as_ref().filter(|d| d.written()) {
+                Some(disk) => {
+                    w.write_bool(true)?;
+                    w.write_bytes(disk.data())?;
+                    w.write_bytes(disk.tags())?;
+                }
+                None => w.write_bool(false)?,
+            }
+        }
+        Ok(())
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1666,12 +2204,46 @@ impl Device for Iwm {
         next.mfm.overrun = r.read_bool()?;
         next.mfm.crc = r.read_u16()?;
         next.mode_writes = r.read_u32()?;
+        next.writer.on = r.read_bool()?;
+        next.writer.mfm = r.read_bool()?;
+        for slot in 0..WRITE_FIFO {
+            next.writer.fifo[slot] = r.read_u8()?;
+        }
+        for slot in 0..WRITE_FIFO {
+            next.writer.kinds[slot] = WriteKind::from_byte(r.read_u8()?);
+        }
+        next.writer.count = r.read_u8()?.min(WRITE_FIFO as u8);
+        next.writer.cells = r.read_u16()?;
+        next.writer.bits = r.read_u8()?.min(MFM_CELLS_PER_BYTE);
+        next.writer.prev = r.read_bool()?;
+        next.writer.underrun = r.read_bool()?;
+        next.writer.crc = r.read_u16()?;
+        next.writer.seed = r.read_u16()?;
+        next.writer.after_mark = r.read_bool()?;
+        next.writer.pending_crc = r.read_u16()?;
         *state = next;
         // The published tick is not in the chunk and it is what the scheduler
         // reads: a restore that left it at zero would have the head advanced
         // from the wrong cell, or not at all.
         self.shared.ticks.store(next.ticks, Ordering::Relaxed);
         drop(state);
+        {
+            // A written medium comes back out of the chunk; an unwritten one
+            // is whatever the media slot put in the drive, which the restore
+            // has not touched.
+            let mut media = self.shared.media.lock();
+            media.dirty = false;
+            for slot in 0..2 {
+                if !r.read_bool()? {
+                    continue;
+                }
+                let data = r.read_bytes()?.to_vec();
+                let tags = r.read_bytes()?.to_vec();
+                if let Some(disk) = media.disks[slot].as_mut() {
+                    disk.set_contents(&data, &tags)?;
+                }
+            }
+        }
         // The cylinder under the head is derived and is rebuilt from wherever
         // the restored head turns out to be, and the next byte's cell with it.
         self.shared.invalidate();
@@ -1751,6 +2323,12 @@ pub static IWM_CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the media slot holding the disk in the internal drive; empty is no disk",
         },
+        PropertySpec {
+            name: "image2",
+            kind: ValueKind::Media,
+            required: false,
+            summary: "the same for the second mechanism on the cable, which needs `drives = 2`",
+        },
     ],
     construct: |props| Ok(Box::new(Iwm::new(props)?)),
 };
@@ -1779,6 +2357,7 @@ pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("drives", ValueKind::Uint).range(1, 2))
         .prop(PropSchema::new("image", ValueKind::Media))
+        .prop(PropSchema::new("image2", ValueKind::Media))
         .region("")
         .region("regs")
         .port(SEL_PIN, PortDir::In)

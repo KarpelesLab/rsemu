@@ -123,6 +123,10 @@ pub struct Disk {
     tags: Vec<u8>,
     /// Whether the write-protect tab is over the hole.
     write_protect: bool,
+    /// Whether anything has been written to the medium since the image was
+    /// read. A disk that has not been written is rebuilt from the machine's
+    /// own media slot on a restore; one that has been cannot be.
+    written: bool,
     /// What the container called itself, for a message.
     name: String,
 }
@@ -261,6 +265,7 @@ impl Disk {
             data: data.to_vec(),
             tags: Vec::new(),
             write_protect: false,
+            written: false,
             name,
         })
     }
@@ -292,6 +297,7 @@ impl Disk {
             data: data.to_vec(),
             tags: tag_bytes,
             write_protect: false,
+            written: false,
             name,
         })
     }
@@ -312,6 +318,7 @@ impl Disk {
             data: vec![0; blocks * DATA_BYTES],
             tags: vec![0; blocks * TAG_BYTES],
             write_protect: false,
+            written: false,
             name: String::new(),
         }
     }
@@ -326,6 +333,7 @@ impl Disk {
             data: vec![0; mfm::BYTES],
             tags: Vec::new(),
             write_protect: false,
+            written: false,
             name: String::new(),
         }
     }
@@ -359,6 +367,123 @@ impl Disk {
     #[must_use]
     pub fn write_protected(&self) -> bool {
         self.write_protect
+    }
+
+    /// Whether anything has been written to it since it came out of its
+    /// container.
+    ///
+    /// Snapshot state: an image that has never been written is rebuilt from the
+    /// machine's own media slot on a restore, and one that has been written
+    /// cannot be, so this is what says which chunk to produce.
+    #[must_use]
+    pub fn written(&self) -> bool {
+        self.written
+    }
+
+    /// The 512-byte blocks, end to end, in block order — the image as a file
+    /// holds it.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The twelve tag bytes a block, in the same order. Empty on an MFM disk,
+    /// which has nowhere to put them.
+    #[must_use]
+    pub fn tags(&self) -> &[u8] {
+        &self.tags
+    }
+
+    /// Overwrite the blocks and tags, for a snapshot restore.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the lengths are not this disk's.
+    pub fn set_contents(&mut self, data: &[u8], tags: &[u8]) -> Result<()> {
+        if data.len() != self.data.len() || tags.len() != self.tags.len() {
+            return Err(Disk::refuse(
+                &format!(
+                    "a restored image is {} bytes of data and {} of tag",
+                    data.len(),
+                    tags.len()
+                ),
+                &format!(
+                    "the disk in the drive holds {} and {}",
+                    self.data.len(),
+                    self.tags.len()
+                ),
+            ));
+        }
+        self.data.copy_from_slice(data);
+        self.tags.copy_from_slice(tags);
+        self.written = true;
+        Ok(())
+    }
+
+    /// Take a cylinder's cells back off the medium and into the image.
+    ///
+    /// The inverse of [`Disk::track`], and deliberately **the same decoder**
+    /// the read path is tested against: a sector the head laid down is
+    /// recovered by finding its address field and checking its data field's
+    /// checksum, so a write that did not come out right is not silently
+    /// absorbed — it is left out, and the count says so.
+    ///
+    /// A sector whose address field names a different cylinder or side from
+    /// the one the head is over is dropped rather than filed where it says it
+    /// belongs: that disagreement is a bad read of the medium, and trusting it
+    /// would scatter one damaged field across the image.
+    ///
+    /// Returns how many sectors were taken.
+    pub fn absorb(&mut self, cylinder: u8, side: bool, track: &Track) -> usize {
+        if self.write_protect {
+            return 0;
+        }
+        match self.density {
+            Density::Gcr => self.absorb_gcr(cylinder, side, track),
+            Density::Mfm => self.absorb_mfm(cylinder, u8::from(side), track),
+        }
+    }
+
+    fn absorb_gcr(&mut self, cylinder: u8, side: bool, track: &Track) -> usize {
+        let (sectors, _bad) = gcr::decode_track(track);
+        let mut taken = 0;
+        for sector in sectors {
+            if sector.track != cylinder || sector.side != side {
+                continue;
+            }
+            let Some(block) = self.block_of(cylinder, side, sector.sector) else {
+                continue;
+            };
+            self.tags[block * TAG_BYTES..(block + 1) * TAG_BYTES].copy_from_slice(sector.tag());
+            self.data[block * DATA_BYTES..(block + 1) * DATA_BYTES].copy_from_slice(sector.data());
+            taken += 1;
+        }
+        self.written |= taken > 0;
+        taken
+    }
+
+    fn absorb_mfm(&mut self, cylinder: u8, head: u8, track: &Track) -> usize {
+        let (sectors, _bad) = mfm::decode_track(track);
+        let mut taken = 0;
+        for sector in sectors {
+            if sector.cylinder != cylinder || sector.head != head || sector.data.len() != DATA_BYTES
+            {
+                continue;
+            }
+            let Some(block) = mfm::block_of(cylinder, head, sector.sector) else {
+                continue;
+            };
+            let Some(slot) = self
+                .data
+                .get_mut(block * DATA_BYTES..(block + 1) * DATA_BYTES)
+            else {
+                continue;
+            };
+            slot.copy_from_slice(&sector.data);
+            taken += 1;
+        }
+        self.written |= taken > 0;
+        taken
     }
 
     /// Move the tab.

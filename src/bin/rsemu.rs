@@ -55,6 +55,9 @@ RUN OPTIONS:
                         which is why the only one in the repository is ours
     --vgabios <file>    Bind the `vgabios` media slot: a video option ROM
     --floppy <file>     Bind the `floppy` media slot: a raw diskette image
+    --floppy2 <file>    Bind the `floppy2` media slot: the second drive on a
+                        board that has one, which a compact Macintosh needs
+                        `-p drives=2` for. Unbound is an empty drive.
     --hd0 <file>        Bind the `hd0` media slot: a raw hard disk image for
                         the first IDE bay. Unbound is an empty bay.
     --hd1 <file>        Bind the `hd1` media slot: the second IDE bay
@@ -601,8 +604,8 @@ fn run(args: &[String]) -> ExitCode {
     // on a different port: no bytes is an address nobody answers at, which is
     // that machine with its SCSI drive taken out — it still has its IDE one.
     for slot in [
-        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "scsi0", "floppy", "vgabios", "nvme0",
-        "df0", "ext", "cd0", "cdrom",
+        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "scsi0", "floppy", "floppy2",
+        "vgabios", "nvme0", "df0", "ext", "cd0", "cdrom",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
@@ -2890,8 +2893,9 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // list is easier to extend than a match with a line each. They
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
-            "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--flash0"
-            | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--scsi0" | "--cd0" | "--cdrom" => {
+            "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--floppy2"
+            | "--flash0" | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--scsi0" | "--cd0"
+            | "--cdrom" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));

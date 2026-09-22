@@ -89,10 +89,16 @@ const ICON: (u32, u32, u32, u32) = (240, 145, 32, 32);
 /// Measured rather than chosen: on the stock 1 MiB board the memory test runs
 /// to about five seconds, the happy Mac is up at ten, "Welcome to Macintosh"
 /// at fifteen, the Finder's menu bar is drawn by sixty, and the desktop stops
-/// changing at **seventy** — every frame from there to two virtual minutes
-/// hashes the same. Virtual time is exact, so this is not a race; the slack is
-/// for a future change that makes the boot a second or two longer.
-const BOOT_SECONDS: u64 = 75;
+/// changing at **eighty**. Virtual time is exact, so this is not a race.
+///
+/// It was seventy-five until the drive learnt to write. A sector the guest
+/// writes now takes the time a sector takes — ten milliseconds or so of the
+/// medium going past a head that is laying cells down — where a chip that
+/// accepted every byte instantly and put none of them anywhere finished the
+/// same work in no virtual time at all. Mac OS 6.0.8 writes to its startup
+/// volume while it brings the Finder up, so the desktop lands eight virtual
+/// seconds later than it did. The picture at the end is the same one.
+const BOOT_SECONDS: u64 = 80;
 
 /// The Finder desktop at [`BOOT_SECONDS`] on the stock 1 MiB board with the
 /// user's own Mac OS 6.0.8 startup disk.
@@ -478,7 +484,23 @@ impl SwimTap {
         let dir = if write { "W" } else { "R" };
         let iwm = self.swim.iwm();
         let line = if self.swim.ism_selected() {
-            format!("ISM {:<11} {dir} {value:02x}", ISM_REGS[index])
+            // An ISM register write reaches the *same* mechanism an IWM's
+            // soft switches do, so the line it addresses is worth naming here
+            // too: the phase register's four bits are the mechanism's `LSTRB`,
+            // `CA2`, `CA1` and `CA0`, and with the VIA's `SEL` beside them
+            // they are what says which of the drive's sixteen registers a
+            // strobe latches. Without it a trace of ISM mode cannot answer the
+            // one question ledger item 1 asks.
+            let which = iwm.selected_drive();
+            format!(
+                "ISM {:<11} {dir} {value:02x}  drv{} sel{} {:<12} motor{} disk{}",
+                ISM_REGS[index],
+                which + 1,
+                u8::from(iwm.sel()),
+                DRIVE_LINES[usize::from(iwm.drive_address())],
+                u8::from(iwm.motor(which)),
+                u8::from(iwm.has_disk(which)),
+            )
         } else {
             let addr = iwm.drive_address();
             format!(
@@ -866,9 +888,23 @@ fn the_insert_disk_icon_blinks() {
         return;
     };
     let mut b = board(image, &[], synthetic_1440k());
-    advance(&mut b, "mac-classic-blink", 11);
+    // Run until the icon is drawn rather than to a fixed second. What the ROM
+    // does before it gives up on a disk with no system on it is read *and
+    // write* — a writable medium takes the time a medium takes — so the
+    // instant the loop starts is a consequence of how long that took, and
+    // pinning it would be asserting the length of somebody else's retry.
+    // Past the memory test first: the screen buffer comes up all ones, which is
+    // a white screen, and a white screen is not an icon.
+    let mut at = 11;
+    advance(&mut b, "mac-classic-blink", at);
+    while at < 40 && icon_white(&b) <= 700 {
+        advance(&mut b, "mac-classic-blink", 1);
+        at += 1;
+    }
+    assert!(at < 40, "the insert-disk icon never appeared");
+    println!("mac-classic: the insert-disk icon is up at {at}s");
     let mut seen = Vec::new();
-    for s in 12..=17 {
+    for s in at + 1..=at + 6 {
         advance(&mut b, "mac-classic-blink", 1);
         seen.push(icon_white(&b));
         let _ = picture(&b, "mac-classic-blink", s);
@@ -1067,10 +1103,16 @@ const MENU_BAR: (u32, u32, u32, u32) = (0, 0, 512, 20);
 ///
 /// The crop is what makes the assertion mean something. The desktop behind it
 /// is the Macintosh's one-pixel checkerboard, which is **exactly** half ink,
-/// and this box measures 50.0 % on the insert-disk screen, 49.9 % on "Welcome
-/// to Macintosh" and 65.1 % once the Finder has put the volume there — so a
-/// threshold anywhere between them separates a mounted disk from anything
-/// else, and a box with more desktop in it would not.
+/// and this box measures 50.0 % on the insert-disk screen and 49.9 % on
+/// "Welcome to Macintosh" — so anything that is *not* about half is the icon
+/// and nothing else on this machine is.
+///
+/// Which side of half it lands on is the Finder's business rather than ours:
+/// the icon is 65.1 % white sitting there and **21.2 %** while the Finder has
+/// it selected, which it does whenever it has just written to the volume. The
+/// assertion is therefore on the *distance* from half, not on the direction,
+/// because both pictures are a mounted disk and a test that insisted on one of
+/// them would be asserting what the Finder was doing at that instant.
 const DISK_ICON: (u32, u32, u32, u32) = (458, 28, 32, 42);
 
 /// **Mac OS 6.0.8 boots to the Finder desktop.**
@@ -1152,8 +1194,9 @@ fn the_rom_boots_mac_os_to_the_finder() {
     let icon = white_in(&b, DISK_ICON);
     let icon_area = (DISK_ICON.2 * DISK_ICON.3) as usize;
     println!("mac-classic: the disk icon corner is {icon} white pixels of {icon_area}");
+    let off_half = icon.abs_diff(icon_area / 2);
     assert!(
-        icon * 5 > icon_area * 3,
+        off_half * 10 > icon_area,
         "the startup volume's icon is not on the desktop: {icon} of {icon_area} white, and the \
          bare desktop behind it is exactly half"
     );
@@ -1252,4 +1295,101 @@ fn the_clock_chip_reaches_low_memory() {
         "Time is the date the clock chip was given plus the uptime: {time:#010x}"
     );
     assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+}
+
+/// **Apple's own code writes a sector, and the image gets it.**
+///
+/// This is the write path's end-to-end test with nothing of ours in the
+/// middle: Mac OS 6.0.8 updates its startup volume while it brings the Finder
+/// up — the ISM's mode register goes to write, the FIFO is cleared, `ACTION`
+/// starts the head, and the sync field, the three `$A1` marks, the address
+/// mark, 512 bytes and the CRC go out through the Data, Mark and CRC registers
+/// with the handshake register polled between every one of them. What this
+/// asserts is that a block of the image came back different, and *that* can
+/// only happen if the cells the head laid down decode as a whole field whose
+/// CRC — which the chip supplied rather than the driver — checks out
+/// ([`rsemu::dev::mac::disk::Disk::absorb`] drops a field that does not).
+///
+/// Nothing is asserted about *which* block or what is in it: that is Apple's
+/// business and would be encoding somebody's file system into this repository.
+/// The instrument below prints it for a person who wants to look.
+#[test]
+fn the_guest_writes_a_sector_and_the_image_gets_it() {
+    use rsemu::dev::mac::disk::{Disk, Reader};
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let bytes = disk_image("MacOS_6.0.8_System_Startup.img");
+    if bytes.is_empty() {
+        println!("mac-classic: no system disk, so nothing writes to one; skipped");
+        return;
+    }
+    let before = Disk::from_image_for(&bytes, Reader::Swim).expect("an image");
+    let mut b = board(image, &[], bytes);
+    advance(&mut b, "mac-classic-write", BOOT_SECONDS);
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    let after = b.swim.iwm().disk(0).expect("a disk");
+    assert!(
+        after.written(),
+        "the head never reached the medium: Mac OS writes to its startup volume while it \
+         brings the Finder up, so something in the write path stopped before the cells"
+    );
+    let changed = (0..before.blocks())
+        .filter(|&n| before.block(n) != after.block(n))
+        .count();
+    println!(
+        "mac-classic: {changed} of {} blocks changed",
+        before.blocks()
+    );
+    assert!(
+        changed > 0,
+        "the head wrote cells but no field decoded out of them"
+    );
+    // And the disk is still in the drive, which is ledger item 1: the ROM
+    // strobes the drive register file's eject while the spindle is running and
+    // the mechanism does not obey (`src/dev/mac/iwm.rs`).
+    assert!(
+        b.swim.has_disk(0),
+        "the startup volume left the drive while the Finder still had it mounted"
+    );
+}
+
+/// A trace instrument: which blocks of the disk in the drive the guest wrote,
+/// and what it put in the first few of them.
+#[test]
+#[ignore = "a trace instrument, not an assertion: run it with --ignored --nocapture"]
+fn what_the_guest_wrote() {
+    use rsemu::dev::mac::disk::{Disk, Reader};
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let bytes = disk_image("MacOS_6.0.8_System_Startup.img");
+    if bytes.is_empty() {
+        return;
+    }
+    let secs: u64 = std::env::var("RSEMU_MAC_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(BOOT_SECONDS);
+    let before = Disk::from_image_for(&bytes, Reader::Swim).expect("an image");
+    let mut b = board(image, &[], bytes);
+    advance(&mut b, "mac-classic-wrote", secs);
+    let after = b.swim.iwm().disk(0).expect("a disk");
+    let changed: Vec<usize> = (0..before.blocks())
+        .filter(|&n| before.block(n) != after.block(n))
+        .collect();
+    println!(
+        "mac-classic: {} of {} blocks changed",
+        changed.len(),
+        before.blocks()
+    );
+    println!("  first 80: {:?}", &changed[..changed.len().min(80)]);
+    for &n in changed.iter().take(4) {
+        let was = before.block(n).expect("a block");
+        let now = after.block(n).expect("a block");
+        let diff = was.iter().zip(now).filter(|(x, y)| x != y).count();
+        println!("  block {n}: {diff} of 512 bytes differ");
+        println!("    was {:02x?}", &was[..32]);
+        println!("    now {:02x?}", &now[..32]);
+    }
 }

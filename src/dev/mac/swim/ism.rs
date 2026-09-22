@@ -100,7 +100,7 @@
 //! status line — so this module reaches all of them through
 //! [`super::super::iwm::Iwm`], which owns the cable, and keeps no copy.
 
-use super::super::iwm::{self, Iwm};
+use super::super::iwm::{self, Iwm, WriteKind};
 use crate::core::error::Result;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 
@@ -451,6 +451,25 @@ impl Ism {
         self.mode & MODE_ACTION != 0 && self.mode & MODE_WRITE == 0
     }
 
+    /// And a write, which is the same bit the other way. Page 23: "This bit
+    /// determines whether an operation will be a read (0) or write (1)
+    /// operation", and "Setting the ACTION bit to '1' starts a read or write
+    /// operation."
+    fn writing(&self) -> bool {
+        self.mode & MODE_ACTION != 0 && self.mode & MODE_WRITE != 0
+    }
+
+    /// Whether the chip is framing bytes as Apple GCR rather than as MFM.
+    ///
+    /// Page 22, Setup register bit 2: "Setting the bit selects GCR mode;
+    /// clearing it selects the normal operating mode." A Macintosh Classic ROM
+    /// writes `$20` and nothing else, so on this board it is always clear and
+    /// the chip always frames MFM — but an 800K disk in a SuperDrive is GCR,
+    /// and this is the bit that would say so.
+    fn gcr(&self) -> bool {
+        self.setup & SETUP_GCR != 0
+    }
+
     /// Push everything the mode and phase registers say onto the mechanism.
     ///
     /// Called after the lock on this state is **released**, never with it held:
@@ -470,7 +489,8 @@ impl Ism {
         // pulled up, so it stands high.
         let driven = (self.phase & 0x0f) | (!(self.phase >> 4) & 0x0f);
         iwm.set_phases(driven);
-        iwm.set_mfm_framing(self.reading(), CRC_SEED);
+        iwm.set_mfm_framing(self.reading() && !self.gcr(), CRC_SEED);
+        iwm.set_writing(self.writing(), !self.gcr(), CRC_SEED);
     }
 
     /// Read register `reg`, which is the four address lines as they stand.
@@ -615,10 +635,16 @@ impl Ism {
                 value |= HS_ONE_BYTE;
             }
         } else {
-            // Write mode: they count *empty* slots. Writing to a disk is not
-            // modelled, so the buffer is always empty and always will take a
-            // byte — the same answer the IWM's own write handshake gives.
-            value |= HS_TWO_BYTES | HS_ONE_BYTE;
+            // Write mode: page 25 makes the same two bits count *room* —
+            // "In write mode, it indicates that 2 bytes can be written to the
+            // FIFO" and "at least 1 byte can be written to the FIFO".
+            let space = iwm.write_space();
+            if space >= 2 {
+                value |= HS_TWO_BYTES;
+            }
+            if space >= 1 {
+                value |= HS_ONE_BYTE;
+            }
         }
         if let Some((_, true)) = iwm.peek_mfm() {
             value |= HS_MARK;
@@ -663,11 +689,28 @@ impl Ism {
         }
         let before = self.mode;
         match reg & 7 {
-            REG_DATA => self.written = value,
+            // Page 20: "When ACTION is set, this register reads data from and
+            // writes data to the FIFO." A byte handed over while the chip is
+            // not writing has nowhere to go and is only kept, which is what
+            // lets a read of the register be told from a fault.
+            REG_DATA => {
+                self.written = value;
+                if !iwm.push_write(value, WriteKind::Data) {
+                    // Page 24, bit 2: "The processor is ... writing faster than
+                    // the FIFO is requesting bytes."
+                    self.raise(ERROR_OVERRUN);
+                }
+            }
             // Page 20: "Writing to this register will cause a byte to be
             // written that has a transition missing between two adjacent
-            // zero-bits." Writing to a disk is not modelled here.
-            REG_MARK => self.written = value,
+            // zero-bits" — a **mark** byte, which is what a field's `$A1` sync
+            // is and the only way to lay one down.
+            REG_MARK => {
+                self.written = value;
+                if !iwm.push_write(value, WriteKind::Mark) {
+                    self.raise(ERROR_OVERRUN);
+                }
+            }
             REG_CRC => {
                 if self.mode & MODE_ACTION == 0 {
                     // Page 20, the IWM Configuration register: "the uppermost
@@ -675,6 +718,22 @@ impl Ism {
                     // feature is not supported in the standard ISM." So it is
                     // not supported here either, and the write is kept only so
                     // that a read of it can be told from a fault.
+                } else {
+                    // Page 20, the CRC register: a write with `ACTION` set
+                    // hands the *generator's* two bytes to the head, most
+                    // significant first, which is how a field's own CRC gets
+                    // onto the medium without the processor ever computing it.
+                    // **Inferred** from the register's name and position — the
+                    // page gives it no bit description — and checkable, which
+                    // is the reason to accept it: a field written this way
+                    // reads back with the handshake register's bit 1 clear,
+                    // and that is what `the_crc_the_chip_writes_reads_back_as_
+                    // zero` asserts.
+                    if !iwm.push_write(0, WriteKind::CrcHigh)
+                        || !iwm.push_write(0, WriteKind::CrcLow)
+                    {
+                        self.raise(ERROR_OVERRUN);
+                    }
                 }
             }
             REG_PARAM => {
@@ -726,7 +785,11 @@ impl Ism {
     /// Pick up an overrun the separator recorded, before answering anything
     /// that reports it.
     pub fn note_overrun(&mut self, iwm: &Iwm) {
-        if iwm.take_mfm_overrun() {
+        // Page 24, bit 0: "The processor is not reading/writing fast enough to
+        // keep up with the chip." Both directions land on the same bit, and
+        // the write side's flag is the head having reached a byte boundary
+        // with an empty buffer.
+        if iwm.take_mfm_overrun() || (self.writing() && iwm.write_underrun()) {
             self.raise(ERROR_UNDERRUN);
         }
     }

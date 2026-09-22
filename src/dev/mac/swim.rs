@@ -91,7 +91,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.swim";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
 /// How many bytes of address space the register file occupies: the board puts
 /// the register selects on A9-A12, exactly as it does the IWM's.
@@ -291,6 +291,7 @@ impl Swim {
         let mut r = props.reader();
         let drives = r.or("drives", 1u64)?;
         let image = r.optional_media("image")?.map(|m| m.bytes().to_vec());
+        let image2 = r.optional_media("image2")?.map(|m| m.bytes().to_vec());
         r.finish()?;
         if drives == 0 || drives > 2 {
             return Err(Error::Property(alloc::format!(
@@ -303,6 +304,22 @@ impl Swim {
         // picture for.
         if let Some(bytes) = image.filter(|b| !b.is_empty()) {
             swim.insert(0, Disk::from_image_for(&bytes, Reader::Swim)?);
+        }
+        // **No shipped machine file names this slot yet**, and the reason is
+        // `machine::realize`'s rule rather than anything here: a slot a board
+        // names and nothing binds is an error, so adding `image2 = "floppy2"`
+        // to `mac-classic.machine` means every test that assembles the board
+        // has to bind zero bytes for it — and one of them,
+        // `tests/m68k_lift_rate.rs`, belongs to another subsystem. A test that
+        // wants a disk in the external drive puts it there through
+        // [`Swim::insert`], which is what the property does anyway.
+        if let Some(bytes) = image2.filter(|b| !b.is_empty()) {
+            if drives < 2 {
+                return Err(Error::Property(alloc::format!(
+                    "property `image2`: there is a disk for the second drive and `drives` is                      {drives}; a cable with one mechanism on it has nowhere to put it"
+                )));
+            }
+            swim.insert(1, Disk::from_image_for(&bytes, Reader::Swim)?);
         }
         Ok(swim)
     }
@@ -589,6 +606,13 @@ pub static SWIM_CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the media slot holding the disk in the internal drive; empty is no disk",
         },
+        PropertySpec {
+            name: "image2",
+            kind: ValueKind::Media,
+            required: false,
+            summary: "the same for the external drive on the cable, which needs `drives = 2`; \
+                      no shipped board names it (see `Swim::new`)",
+        },
     ],
     construct: |props| Ok(Box::new(Swim::new(props)?)),
 };
@@ -617,6 +641,7 @@ pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("drives", ValueKind::Uint).range(1, 2))
         .prop(PropSchema::new("image", ValueKind::Media))
+        .prop(PropSchema::new("image2", ValueKind::Media))
         .region("")
         .region("regs")
         .port(SEL_PIN, PortDir::In)

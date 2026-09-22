@@ -175,9 +175,9 @@ read/write pin for it and decodes the direction from the address instead.
 | `mac.keyboard` | the Guide's clock/data protocol, its bit timing, the four commands of Table 7-4 and a type-ahead buffer | a host keymap — `Keyboard::key` takes the Guide's own transition code — and the separate keypad's `$79` prefix |
 | `mac.rtc` | the four-byte second counter, twenty bytes of parameter RAM, the write-protect and test registers, the three-wire serial interface and the one-second interrupt | the battery: parameter RAM lives and dies with the machine. The 256-byte chip of later models, and its two-byte extended command |
 | `mac.scc` | the register pointer and all thirty-two registers, `RR0`-`RR3`, the reset commands, `WR9`'s master interrupt enable, the two carrier detects, and the **external/status latches** with the manual's odd/even rule at the acknowledgement, so a transition arriving inside a handler is counted late rather than never | any serial traffic, the baud-rate generator, the DPLL, `/WREQ` |
-| `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and its control registers, and the **read** data path: a disk shifted past the head a bit cell at a time, with each byte the shifter latches named as a scheduler event so a guest polling the data register cannot miss one | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set. The 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it |
+| `mac.iwm` | the sixteen soft switches, the mode and status registers, the drive's sixteen status lines and its control registers, and **both** data paths: a disk shifted past the head a bit cell at a time, with each byte the shifter latches — or each byte the write buffer owes — named as a scheduler event, so a guest polling the data or handshake register cannot miss one. Writing is Apple's page 10 decode, a two-byte buffer, the underrun flag, and cells that go back into the image through the same decoder the read path is tested against | the 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it. And the eject: a Sony mechanism will not throw a disk out while the spindle is turning, which is measured rather than read (`docs/platforms/mac-classic.md`, ledger item 1) |
 | `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum, the five speed zones and the **gap a formatter leaves**, which is what decides how fast the disk turns (`SECTOR_CELLS`) | the 400K drive's PWM speed control, which an 800K mechanism ignores |
-| `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
+| `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, the block-to-cylinder mapping the zones decide, and **taking a written cylinder back** — `Disk::absorb` runs the same decoder the read path is tested against, so a field that did not come out right is left out rather than filed | writing an image back to a **file**, and every other container (`.dart`, `.sit`, a nibble image) |
 | `mac.mouse` | the one-button mouse: two quadrature pulse trains an axis, `X1`/`Y1` on the SCC's carrier detects and `X2`/`Y2` on the VIA's `PB4`/`PB5`, the switch on `PB3`, and the host seam and record/replay door a person moves it through | the second button a later mouse has; and acceleration, which is the *ROM*'s and is worked around rather than modelled (below) |
 | `mac.sound` | the pulse-width circuit: the high byte of each of 370 words in a buffer below the top of memory, one a scan line, the `SNDENB` gate, the three volume bits and `SNDPG2`'s two buffers | the reconstruction filter on the board, whose corner the Guide does not give; and the disk-speed byte beside each sample, which an 800K mechanism ignores |
 | `ncr.5380` | the SCSI chip: all eight registers, a latch per bus signal, arbitration, selection, programmed I/O and pseudo-DMA, and the phase-mismatch interrupt that ends a transfer. Bus-neutral — `src/dev/ncr5380.rs`, beside `wd33c93.rs`, with the board's register spacing as one property | the target role, parity, and `EOP` (this board ties the pin high) |
@@ -1078,9 +1078,29 @@ ledger says what would move it.
    itself: three writes and no reads, with or without a target. A run with
    system software on a floppy would say whether the scan is in the ROM at all
    or comes from the System file.
-4. **Writing to a disk.** The read path is here; the write path is the same
-   machinery backwards, plus the IWM's write handshake meaning something and a
-   way to get the bytes back into the image.
+4. ~~**Writing to a disk.**~~ **Built**, and it is the same `mac.iwm` a Classic
+   drives, so what proves it there proves it here: Mac OS 6.0.8 writes to its
+   own startup volume on `mac-classic` and a block of the image comes back
+   changed (`docs/platforms/mac-classic.md`, "The write path"). On this board
+   the GCR half is what matters, and
+   `iwm::tests::a_cylinder_the_head_writes_is_a_cylinder_the_image_gets_back`
+   lays a whole formatted cylinder down through the chip — the byte stream and
+   its cell budgets coming from `gcr::track_stream`, which is also what the
+   *encoder* uses, so the test is not a second opinion about the format — and
+   reads every sector of it back out of the image.
+
+   Two things about it are worth knowing here. The register decode was wrong
+   and is now Apple's: page 10 of the *SWIM Chip User's Reference* makes `Write
+   Data` and `Set Mode` **the same address**, told apart by the `MotorOn`
+   latch, which is the bit the sixteen soft switches call `ENABLE` — this model
+   used to put `Write Data` where the handshake register is. And what the head
+   lays down when the processor is late is an **inference**: a cell with no
+   transition in it, which is how a self-sync byte gets its extra two cells and
+   is why Apple's own note gives one forty clock cycles where a data byte gets
+   thirty-two.
+
+   What is still missing is a way to get a written image back out to a **file**:
+   `rsemu run` binds a media slot read-only and has no `--floppy-out`.
 5. **A host keymap.** `mac.keyboard` takes the Guide's own transition codes and
    nothing turns a keysym into one. Figure 7-6 has the table; the OCR of it in
    circulation is not reliable enough to transcribe and it wants a clean scan.
