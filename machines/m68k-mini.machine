@@ -46,6 +46,19 @@ machine "m68k-mini" {
   param ram-base = 0x00100000
   param ram      = 1M
 
+  # Which execution engine the core runs on.
+  #
+  # `interp` is the default because it is the oracle (CLAUDE.md, "CPU cores").
+  # `ir` lifts guest instructions into the architecture-neutral translation IR
+  # and runs them on its portable backend, with the interpreter underneath
+  # everything the frontend declines; it needs a build with `cpu-m68k-lift`,
+  # and a build without it refuses the property with a message rather than
+  # quietly interpreting. The two are indistinguishable to the guest — same
+  # registers, same prefetch queue, same cycle counts, same state hash — which
+  # `tests/m68k_mini_board.rs` asserts on this very board rather than leaving
+  # it as a claim.
+  param engine = "interp"
+
   # -- the crystal -----------------------------------------------------------
   #
   # 8 MHz: a plain MC68000P8. One oscillator, so every ratio on this board is
@@ -67,7 +80,7 @@ machine "m68k-mini" {
   object cpu "cpu.m68k" {
     clock  = clk
     space  = mem
-    engine = "interp"
+    engine = engine
   }
 
   # -- memory ----------------------------------------------------------------

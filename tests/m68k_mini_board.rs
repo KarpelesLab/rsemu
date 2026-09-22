@@ -62,13 +62,22 @@ fn firmware() -> Vec<u8> {
 
 /// Build the board out of the catalog with the firmware in its `firmware` slot.
 fn boot() -> Machine {
+    boot_on("interp")
+}
+
+/// The same board with `engine` as the core's execution engine.
+fn boot_on(engine: &str) -> Machine {
     let entry = catalog::machine("m68k-mini").expect("this build ships m68k-mini");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("firmware", firmware());
+    options
+        .resolve
+        .params
+        .push((String::from("engine"), String::from(engine)));
     let registry = catalog::registry().expect("a registry");
     match rsemu::machine::build(entry.name, entry.source, &registry, &options) {
         Ok(m) => m,
-        Err(e) => panic!("the board does not realize: {e}"),
+        Err(e) => panic!("the board does not realize with engine={engine}: {e}"),
     }
 }
 
@@ -135,4 +144,78 @@ fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
         "a save/load round trip changed the machine's state hash"
     );
     assert_eq!(peek_long(&other, RAM), 0x1234_5678);
+}
+
+/// `ROADMAP.md` §0's non-negotiable, on this board: *a bit-identical state hash
+/// across the interpreter and the translated engine for the same guest*.
+///
+/// `cpu::m68k::differential` compares two cores column by column over every
+/// opcode word there is, which is the stronger test of the *frontend*. This is
+/// the stronger test of the **machine**: one hash over every register, every
+/// byte of RAM and every device's state, taken at a checkpoint, with the whole
+/// board in it. A cache hit, a cache miss, a lifted instruction and an
+/// interpreted one all have to come out as the same number.
+#[test]
+#[cfg(feature = "cpu-m68k-lift")]
+fn both_engines_hash_to_the_same_machine_at_every_checkpoint() {
+    let mut interp = boot_on("interp");
+    let mut ir = boot_on("ir");
+    for n in 1..=24 {
+        interp
+            .run_quantum()
+            .expect("the interpreted machine advances");
+        ir.run_quantum().expect("the translated machine advances");
+        let want = interp.state_hash().expect("a deterministic machine hashes");
+        let got = ir.state_hash().expect("a deterministic machine hashes");
+        assert_eq!(
+            want, got,
+            "checkpoint {n}: `engine = \"interp\"` hashes to {want:#018x} and \
+             `engine = \"ir\"` to {got:#018x}"
+        );
+    }
+    // And the program really ran, so this is a comparison of a machine that
+    // did something rather than of two idle boards.
+    assert_eq!(peek_long(&ir, RAM), 0x1234_5678);
+}
+
+/// The `engine` property is *read* rather than accepted and ignored.
+///
+/// The comparison above passes trivially if `engine` reaches nothing, so the
+/// negative is what makes it mean something: an engine no build implements is
+/// refused, with a message.
+#[test]
+fn an_engine_nothing_implements_is_refused_rather_than_ignored() {
+    let entry = catalog::machine("m68k-mini").expect("this build ships m68k-mini");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("firmware", firmware());
+    options
+        .resolve
+        .params
+        .push((String::from("engine"), String::from("jit-host")));
+    let registry = catalog::registry().expect("a registry");
+    rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .expect_err("an engine nothing implements must be refused, not ignored");
+}
+
+/// And a build that *cannot* run the translated engine says so rather than
+/// interpreting quietly.
+///
+/// The other half of the same rule: "an engine that silently is not the one
+/// you asked for is how a JIT stays unmeasured for a year"
+/// (`cpu::riscv::Engine::Jit`, which learned it the hard way).
+#[test]
+#[cfg(not(feature = "cpu-m68k-lift"))]
+fn a_build_without_the_frontend_refuses_the_engine_it_cannot_run() {
+    let entry = catalog::machine("m68k-mini").expect("this build ships m68k-mini");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("firmware", firmware());
+    options
+        .resolve
+        .params
+        .push((String::from("engine"), String::from("ir")));
+    let registry = catalog::registry().expect("a registry");
+    let err = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .expect_err("`ir` needs `cpu-m68k-lift`");
+    let text = format!("{err}");
+    assert!(text.contains("cpu-m68k-lift"), "{text}");
 }
