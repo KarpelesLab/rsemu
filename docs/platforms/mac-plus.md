@@ -1012,6 +1012,23 @@ ledger says what would move it.
    goes nowhere on an 800K mechanism, so this is for the noise rather than for
    the instrument — which is what it turned out to be worth, because the chime
    is the one thing on this board a person can *hear* is right.
+7. **Why mapping anything at `$F00000` stops the boot.** Found while building
+   the SCSI probe, backed out, and not chased — it is written down here because
+   an unchased measurement that nobody records is a measurement thrown away.
+
+   Put **any** region at `$F0 0000`, the phase-read space, and the Plus stops
+   booting: low memory comes up holding ROM content and the machine never gets
+   going. The confusing part is that a *logging* region there records **zero
+   accesses**, so whatever breaks is not the ROM reading the space. That points
+   at the mapping itself — `glue.rs`'s decode, or `AddressSpace` — rather than
+   at anything the guest does, and it means this board currently depends on
+   that megabyte being **unassigned** for a reason nobody has established.
+
+   Worth knowing before someone models the phase-read space and finds the
+   board mysteriously dead. Note also that `AddressSpace::unassigned_log`'s
+   counter only moves when `UnassignedPolicy::log` is set, and this board's is
+   not — so "zero unassigned accesses" read off that counter says nothing, and
+   an earlier claim in this file rested on exactly that mistake.
 
 ## How the ambiguities were settled
 
