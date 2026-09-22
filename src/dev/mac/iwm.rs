@@ -75,7 +75,8 @@
 //!    0   1   1   1   tachometer              60 pulses a revolution
 //!    1   0   0   0   lower head's read line  and selects that head
 //!    1   0   0   1   upper head's read line  and selects that head
-//!    1   0   1   x   (unassigned)
+//!    1   0   1   0   (unassigned)
+//!    1   0   1   1   is a SuperDrive         0 = an FDHD mechanism
 //!    1   1   0   0   number of sides         1 = double sided
 //!    1   1   0   1   disk ready for reading  0 = ready
 //!    1   1   1   x   drive installed         0 = a drive is connected
@@ -143,6 +144,7 @@ use alloc::vec::Vec;
 
 use super::disk::Disk;
 use super::gcr::Track;
+use super::mfm;
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -159,7 +161,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.iwm";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 3;
+pub const STATE_VERSION: u32 = 4;
 
 /// How many bytes of address space the sixteen switches occupy: the board puts
 /// the register selects on A9-A12, so `16 * 512`.
@@ -194,6 +196,226 @@ const STATUS_SENSE: u8 = 1 << 7;
 const HANDSHAKE_NO_UNDERRUN: u8 = 1 << 6;
 /// Its bit 7: the write buffer will take another byte.
 const HANDSHAKE_READY: u8 = 1 << 7;
+
+// -- the MFM byte framer -----------------------------------------------------
+//
+// This is the one thing in this file that an IWM does not have, and it is here
+// rather than in `mac.swim` because *the medium is here*: the head position,
+// the cylinder under it and the motor all live in `Mechanism`, and a second
+// copy of them so that a SWIM could frame its own bytes is exactly the
+// duplication `mac.swim` exists to avoid. It is inert — `Framer::on` is false
+// and nothing below it runs — until a SWIM in ISM mode switches it on, so a
+// Macintosh Plus is byte-identical.
+
+/// How many cells one MFM byte spends: two per data bit (`super::mfm`).
+const MFM_CELLS_PER_BYTE: u8 = 16;
+
+/// How many framed bytes the FIFO holds.
+///
+/// *SWIM Chip User's Reference*, rev. 1.5, page 13: "The ISM uses a 2-byte
+/// read/write FIFO, so the software can 'slip' out a byte from time to time
+/// without causing an overrun (reading too quickly) or underrun (writing too
+/// slowly)."
+pub const MFM_FIFO: usize = 2;
+
+/// The state of the MFM separator: where the byte boundary is and what it has
+/// framed that the guest has not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Framer {
+    /// Whether a SWIM has asked for MFM framing at all. An IWM leaves this
+    /// clear for ever.
+    on: bool,
+    /// The last **thirty-two** cells past the head, oldest in bit 31 — which
+    /// is the order `mfm::cells` packs a byte and `mfm::Writer::push` lays it
+    /// down. The low sixteen are the byte being assembled; the high sixteen
+    /// are the one before it, which is what anchors the mark search to a sync
+    /// field (see [`Framer::cell`]).
+    cells: u32,
+    /// Cells since the last byte boundary, `0..16`. Meaningless until
+    /// `synced`.
+    phase: u8,
+    /// Whether a mark byte has been found, so byte boundaries are known.
+    ///
+    /// Page 23: "after setting ACTION on a read operation, the first byte that
+    /// will be returned will be a mark byte... The search for the mark byte is
+    /// invisible to the software since it is handled entirely by the SWIM
+    /// chip."
+    synced: bool,
+    /// The framed bytes the guest has not taken, oldest first.
+    fifo: [u8; MFM_FIFO],
+    /// One bit per slot of `fifo`: whether that byte was a mark byte.
+    marks: u8,
+    /// How many of `fifo` are live.
+    count: u8,
+    /// A byte was framed while the FIFO was already full, so it was lost.
+    overrun: bool,
+    /// The CRC generator, run over every byte framed off the medium.
+    ///
+    /// It lives here rather than in the ISM's register file because it is fed
+    /// **from the medium**, not from the processor's reads: the ISM's handshake
+    /// register reports the CRC over "the bytes up to and including the byte
+    /// about to be read", which only a generator tapped where the bytes are
+    /// framed can answer. A byte lost to an overrun still goes through it, for
+    /// the same reason — the hardware's generator never saw the FIFO.
+    /// `swim::ism` owns the seed and the meaning.
+    crc: u16,
+}
+
+impl Framer {
+    /// Forget the byte boundary and go back to looking for a mark, emptying
+    /// the FIFO and reseeding the CRC. What the ISM's "clear FIFO" bit and a
+    /// fresh `ACTION` do.
+    fn restart(&mut self, seed: u16) {
+        let on = self.on;
+        *self = Framer::default();
+        self.on = on;
+        self.crc = seed;
+    }
+
+    /// The sixteen cells of the byte the head has just finished.
+    fn byte_cells(&self) -> u16 {
+        self.cells as u16
+    }
+
+    /// And of the one before it.
+    fn previous_cells(&self) -> u16 {
+        (self.cells >> 16) as u16
+    }
+
+    /// Take one cell off the medium and frame a byte if this was the
+    /// sixteenth.
+    fn cell(&mut self, cell: bool) {
+        self.cells = (self.cells << 1) | u32::from(cell);
+        if self.synced {
+            self.phase += 1;
+            if self.phase < MFM_CELLS_PER_BYTE {
+                return;
+            }
+            self.phase = 0;
+            let (byte, mark) = decode_cells(self.byte_cells());
+            self.push(byte, mark);
+            return;
+        }
+        // Searching. A mark byte is one whose clock pulse is deliberately
+        // missing, and `mfm::sync_cells` derives the pattern from the encoding
+        // rule rather than quoting a magic number.
+        //
+        // **Only `$A1`'s.** The format has two marks, but a search that has no
+        // byte boundary to align to can only look for a *bit pattern*, and
+        // `$C2`'s `$5224` is not unique at an arbitrary cell offset:
+        // `swim::tests::only_the_a1_sync_is_unique_at_every_cell_alignment`
+        // walks a formatted track and finds `$4489` **108** times — three per
+        // ID field and three per data field, exactly where the format puts
+        // them and nowhere else — against **192** hits of `$5224` on a track
+        // that carries three. Syncing on the second pattern made this chip
+        // report an index mark eighteen times a revolution, and Apple's own
+        // ROM, which reads a mark and then the address mark behind it, got
+        // `$C2` where a sector's `$A1` should have been and started over. An
+        // ID or data field is prefixed by `$A1` and only by `$A1`, so nothing
+        // is lost: `super::mfm` says the same thing from the other side —
+        // "nothing in the read path here looks for it; a controller finds
+        // sectors by their own marks".
+        //
+        // **And only the first `$A1` of the three**, which is what the
+        // preceding-sync-byte test is for. The format writes three of them in
+        // a row and the CRC covers all three (`super::mfm`), so a separator
+        // that locked onto the second or the third would seed its generator a
+        // byte or two into the field and every CRC on the disk would read as
+        // bad — which is precisely what Apple's ROM was told, over and over,
+        // before this test was here: the handshake register's bit 1 came back
+        // set on every field it read and it put the disk straight back out.
+        //
+        // The chip locks onto the **sync field** rather than onto a bare
+        // pattern, and page 19 says so while describing the correction
+        // machine: "The CSM looks for 32 pairs of minimum cells which
+        // coincidently show up in a run of zero bytes, such as a sync field.
+        // After that it looks to see if the first non-minimum cell belongs to
+        // a mark byte. If not, it starts looking for minimum cells again."
+        // Sixteen cells of `$00` in front of the mark is that rule at the
+        // resolution this model works at: a run of minimum cells, then the
+        // *first* mark after it. The second and third `$A1` have `$4489`
+        // behind them rather than `$AAAA`, so they are framed as the ordinary
+        // marks they are and the generator has already seen the first.
+        let sync_byte = mfm::cells(0x00, false, None);
+        if self.byte_cells() == mfm::sync_cells(mfm::SYNC_A1)
+            && self.previous_cells() == sync_byte
+        {
+            self.synced = true;
+            self.phase = 0;
+            let (byte, _) = decode_cells(self.byte_cells());
+            self.push(byte, true);
+        }
+    }
+
+    /// Put a framed byte in the FIFO, or record that it was lost.
+    fn push(&mut self, byte: u8, mark: bool) {
+        self.crc = mfm::crc16(self.crc, &[byte]);
+        let slot = usize::from(self.count);
+        if slot >= MFM_FIFO {
+            // Page 24, Error register bit 0: "The processor is not
+            // reading/writing fast enough to keep up with the chip."
+            self.overrun = true;
+            return;
+        }
+        self.fifo[slot] = byte;
+        if mark {
+            self.marks |= 1 << slot;
+        } else {
+            self.marks &= !(1 << slot);
+        }
+        self.count += 1;
+    }
+
+    /// The oldest framed byte and whether it is a mark, without taking it.
+    fn peek(&self) -> Option<(u8, bool)> {
+        (self.count > 0).then(|| (self.fifo[0], self.marks & 1 != 0))
+    }
+
+    /// Take it.
+    fn pop(&mut self) -> Option<(u8, bool)> {
+        let head = self.peek()?;
+        self.count -= 1;
+        self.fifo.rotate_left(1);
+        self.marks >>= 1;
+        Some(head)
+    }
+
+    /// How many cells until the next byte could be framed.
+    ///
+    /// Exact while synced: a byte is sixteen cells and `phase` says how far
+    /// into one the head is. While *searching* a mark can complete on any
+    /// cell, so naming the truth would be an event every cell — a million a
+    /// virtual second. Sixteen is named instead, which is the same rate the
+    /// synced path costs and is never *late*: at most one byte can be framed
+    /// in sixteen cells either way, so the FIFO cannot be overrun by the
+    /// scheduler running a round longer than this.
+    fn cells_ahead(&self) -> u64 {
+        u64::from(MFM_CELLS_PER_BYTE - if self.synced { self.phase } else { 0 })
+    }
+}
+
+/// The byte in sixteen MFM cells, and whether a clock pulse is missing from
+/// them — which is what makes a byte a mark byte.
+///
+/// The data bits sit in the odd-numbered cells counting from the bottom: cell
+/// 14 is the most significant data bit, cell 0 the least. The clock cells
+/// between them follow one rule and the whole of it — `mfm::cells` states it
+/// as `clock = !prev && !bit` — so re-encoding the decoded byte and comparing
+/// is what says whether a pulse was left out.
+fn decode_cells(cells: u16) -> (u8, bool) {
+    let mut byte = 0u8;
+    for i in 0..8u32 {
+        let bit = cells >> (14 - 2 * i) & 1;
+        byte = (byte << 1) | bit as u8;
+    }
+    // The data bit before this byte is the previous byte's last, which is the
+    // cell two below the window — not available here. It only decides the one
+    // clock cell at the top, so a byte whose only difference is that cell is
+    // reported as ordinary rather than as a mark: `mfm::cells` is asked for
+    // both possibilities and either match is an ordinary byte.
+    let mark = cells != mfm::cells(byte, false, None) && cells != mfm::cells(byte, true, None);
+    (byte, mark)
+}
 
 /// One 400K/800K mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,12 +531,41 @@ impl Mechanism {
             // *configures the drive* to do its I/O with that head — so
             // addressing one selects the side as well as reading it.
             8 | 9 => self.read_line,
-            // The note leaves `CA2:CA1:CA0 = 101` unassigned. A Macintosh
-            // Plus ROM does read address 10 while it is working out what is on
-            // the cable; an 800K mechanism drives nothing there and it reads
-            // as the pull-up. A **SuperDrive** answers here — asserted low,
-            // like every other line on this cable.
-            10 | 11 => !self.superdrive,
+            // `CA2:CA1:CA0 = 101`, which Apple's note leaves unassigned on the
+            // 800K mechanism. A **SuperDrive** answers at `SEL` *high* —
+            // address 11 — asserted low like every other line on this cable,
+            // and leaves address 10 to the pull-up.
+            //
+            // **Which of the two is measured, not read**, and the measurement
+            // is the sharpest differential this board has produced. A real
+            // Macintosh Classic ROM, on the same board with the same disk:
+            //
+            // ```text
+            //   neither asserted   the ROM drives the mechanism as an IWM,
+            //                      spins it up, steps to track 79 and reads
+            //                      GCR — a plain 800K drive, and the path a
+            //                      Plus uses
+            //   11 asserted        the ROM switches the controller into ISM
+            //                      mode, loads the parameter RAM with Apple's
+            //                      own published MFM table, and reads the
+            //                      1.44 MB disk
+            //   both asserted      the ROM never touches the mechanism at all:
+            //                      279 accesses in twenty virtual seconds, no
+            //                      motor, no step, and the insert-disk icon
+            //                      for ever
+            // ```
+            //
+            // So address 11 is the line that says "this is a SuperDrive", and
+            // address 10 is a *different* line that a SuperDrive does not
+            // assert. **What address 10 is for was not established here** and
+            // nothing in this file guesses: it reads as the cable's pull-up,
+            // which is what the ROM requires and what an unassigned line does.
+            // The previous model answered both halves from one flag, on the
+            // reasoning that "the mechanism has one such line and no way to
+            // make it depend on `SEL`" — true of *drive installed*, and the
+            // thing that kept this board off the Finder.
+            10 => true,
+            11 => !self.superdrive,
             // Number of sides: 1 on a double-sided mechanism. One of the two
             // lines in this table that is *not* inverted.
             12 => self.double_sided,
@@ -400,6 +651,17 @@ struct State {
     /// that came back wrong turns the realize sweep at the end of a restore
     /// into a change.
     sel: bool,
+    /// The MFM separator. Off, and therefore invisible, unless a SWIM in ISM
+    /// mode turned it on. See [`Framer`].
+    mfm: Framer,
+    /// How many times the guest has loaded the mode register.
+    ///
+    /// The count alone, with no opinion about what was written: it is what
+    /// lets `mac.swim` recognise the ISM mode switch — four consecutive mode
+    /// writes with bit 6 going `1, 0, 1, 1` — without this file knowing what
+    /// an ISM is, and without a second copy of the `Q7:Q6` switch state over
+    /// in the SWIM to work out which write was a mode write.
+    mode_writes: u32,
 }
 
 impl State {
@@ -414,6 +676,8 @@ impl State {
                 Mechanism::fresh(installed[1]),
             ],
             sel: true,
+            mfm: Framer::default(),
+            mode_writes: 0,
         }
     }
 
@@ -619,12 +883,20 @@ impl Shared {
         };
         let (mut bit, mut rsr, mut data) = (drive.bit, drive.rsr, state.data);
         let (mut line, mut tach) = (drive.read_line, drive.tach);
+        let mut framer = state.mfm;
         for _ in 0..steps {
             line = media.bits.bit(bit as usize);
-            rsr = (rsr << 1) | u8::from(line);
-            if rsr & 0x80 != 0 {
-                data = rsr;
-                rsr = 0;
+            if framer.on {
+                // ISM mode: the byte boundary is the format's, not the
+                // shifter's, so the GCR rule below is not run at all. The two
+                // are exclusive — a chip cannot be framing both ways at once.
+                framer.cell(line);
+            } else {
+                rsr = (rsr << 1) | u8::from(line);
+                if rsr & 0x80 != 0 {
+                    data = rsr;
+                    rsr = 0;
+                }
             }
             bit = (bit + 1) % len;
             // Sixty tachometer pulses a revolution: a hundred and twenty half
@@ -632,6 +904,7 @@ impl Shared {
             tach = (bit * 120 / len) % 2 == 1;
         }
         state.data = data;
+        state.mfm = framer;
         let drive = &mut state.drives[which];
         drive.bit = bit;
         drive.rsr = rsr;
@@ -678,7 +951,13 @@ impl Shared {
         }
         let mut media = self.media.lock();
         let len = Shared::cylinder(&mut media, which, drive.track, drive.side);
-        let ahead = cells_to_latch(&media.bits, len, drive.bit, drive.rsr);
+        let ahead = if state.mfm.on {
+            // ISM mode frames on the format's boundaries; see
+            // `Framer::cells_ahead`.
+            (len != 0).then(|| state.mfm.cells_ahead())
+        } else {
+            cells_to_latch(&media.bits, len, drive.bit, drive.rsr)
+        };
         drop(media);
         self.next_latch.store(
             ahead.map_or(u64::MAX, |n| state.ticks.saturating_add(n)),
@@ -690,6 +969,22 @@ impl Shared {
     /// wherever the head now stands.
     fn invalidate(&self) {
         self.media.lock().under = None;
+        let state = self.state.lock();
+        self.publish_latch(&state);
+    }
+
+    /// Re-announce the next byte's cell **without** throwing the cylinder
+    /// away.
+    ///
+    /// The distinction is not a micro-optimisation. Rebuilding the cache means
+    /// re-encoding a whole track — two hundred thousand cells for a 1.44 MB
+    /// cylinder — and an ISM pushes its configuration at the mechanism after
+    /// *every* register write, of which Apple's ROM makes thousands a second
+    /// while it reads a disk. Invalidating on each of those re-encoded the
+    /// same cylinder over and over and made a virtual second cost a wall
+    /// minute. Only the three things that change which cells are under the
+    /// head — the cylinder, the side, and the disk itself — may invalidate.
+    fn republish(&self) {
         let state = self.state.lock();
         self.publish_latch(&state);
     }
@@ -754,7 +1049,10 @@ impl MemOps for Shared {
         state.switch(index);
         match (state.switches & SW_Q7 != 0, state.switches & SW_Q6 != 0) {
             // The mode register.
-            (true, true) => state.mode = *value & 0x7f,
+            (true, true) => {
+                state.mode = *value & 0x7f;
+                state.mode_writes = state.mode_writes.wrapping_add(1);
+            }
             // The data register, which starts a write to the disk. Writing is
             // not modelled, so the byte is kept and goes nowhere.
             (true, false) => state.data = *value,
@@ -1008,6 +1306,255 @@ impl Iwm {
     pub fn mode(&self) -> u8 {
         self.shared.state.lock().mode
     }
+
+    /// The level on `SEL`, the drive register file's fourth address bit.
+    #[must_use]
+    pub fn sel(&self) -> bool {
+        self.shared.state.lock().sel
+    }
+
+    /// The drive register address the switches and `SEL` name now:
+    /// `CA2:CA1:CA0:SEL`.
+    ///
+    /// For a trace that wants to know *which* of the mechanism's sixteen
+    /// status lines an access read, which a log of switch numbers alone cannot
+    /// say.
+    #[must_use]
+    pub fn drive_address(&self) -> u8 {
+        self.shared.state.lock().drive_address()
+    }
+
+    /// Which mechanism `SELECT` is pointing at.
+    #[must_use]
+    pub fn selected_drive(&self) -> usize {
+        self.shared.state.lock().selected()
+    }
+
+    /// How many times the guest has loaded the mode register.
+    ///
+    /// For `mac.swim`, which counts the four in a row that ask for ISM mode.
+    #[must_use]
+    pub fn mode_writes(&self) -> u32 {
+        self.shared.state.lock().mode_writes
+    }
+
+    // -- what a SWIM in ISM mode needs of the mechanism ----------------------
+    //
+    // The ISM's register file is a different sixteen registers from the IWM's
+    // sixteen soft switches, but *the drive on the end of the cable is the
+    // same drive*: the same four lines address its register file, the same
+    // enables run its spindle, the same head reads it. So `mac.swim` drives it
+    // through these rather than through a second copy of `Mechanism`.
+
+    /// Bring the head up to the cycle the guest is looking at.
+    ///
+    /// Every access through this chip's own aperture does it already; a SWIM
+    /// answering out of the ISM register set does not go through that aperture
+    /// and has to ask. A debug access advances nothing (`ROADMAP.md` §15,
+    /// invariant 5).
+    pub fn sync(&self, debug: bool) {
+        self.shared.sync(debug);
+    }
+
+    /// Drive the four phase lines and latch a drive control register if
+    /// `PHASE3` rose.
+    ///
+    /// `phases` is `PHASE3:PHASE2:PHASE1:PHASE0` in bits 3-0, which are the
+    /// mechanism's `LSTRB`, `CA2`, `CA1` and `CA0` — the same four lines the
+    /// IWM's soft switches 0-7 drive, so this walks them through
+    /// [`State::switch`] and the control register latches exactly as it does
+    /// for a Plus.
+    pub fn set_phases(&self, phases: u8) {
+        let moved = {
+            let mut state = self.shared.state.lock();
+            let which = state.selected();
+            let before = state.drives[which].track;
+            for line in 0..4u8 {
+                let want = phases & (1 << line) != 0;
+                let index = (line << 1) | u8::from(want);
+                state.switch(index);
+            }
+            // `LSTRB` rising may have stepped the head, which is one of the
+            // three things that change the cells under it.
+            state.drives[which].track != before
+        };
+        if moved {
+            self.shared.invalidate();
+        } else {
+            self.shared.republish();
+        }
+    }
+
+    /// The four phase lines as they stand, in the same bit order.
+    #[must_use]
+    pub fn phases(&self) -> u8 {
+        self.shared.state.lock().switches & 0x0f
+    }
+
+    /// The selected drive's status line at the address the phase lines and
+    /// `SEL` name, as a *pin level*: the cable's lines are asserted low, so
+    /// `true` is "no".
+    ///
+    /// Side-effect free, which is what a debug read and a test want.
+    #[must_use]
+    pub fn sense(&self) -> bool {
+        let state = self.shared.state.lock();
+        state.drives[state.selected()].sense(state.drive_address())
+    }
+
+    /// The same, but **the read picks the head** when the address is one of
+    /// the two instantaneous-read-line registers.
+    ///
+    /// That is the mechanism's rule and not the controller's, so it holds
+    /// however the line is read — through an IWM's status register or through
+    /// an ISM's handshake register. Apple's note is explicit that it is the
+    /// *read* that does it: "Instantaneous data from lower head. Reading this
+    /// bit configures the drive to do I/O with the lower head."
+    ///
+    /// This is what a SWIM in ISM mode needs, because that is the only way the
+    /// head gets chosen there: page 22 makes the chip's own `HDSEL` pin an
+    /// output only when the Setup register's bit 0 says so, and a Macintosh
+    /// Classic ROM never sets it — it writes the phase lines to
+    /// `CA2:CA1:CA0 = 100` and reads the handshake, exactly as it would drive
+    /// an IWM.
+    pub fn sense_and_pick_head(&self) -> bool {
+        let (level, moved) = {
+            let mut state = self.shared.state.lock();
+            let which = state.selected();
+            let addr = state.drive_address();
+            let level = state.drives[which].sense(addr);
+            let before = state.drives[which].side;
+            state.pick_head();
+            (level, state.drives[which].side != before)
+        };
+        if moved {
+            // A different side is a different cylinder of cells under the
+            // head: derived state, thrown away rather than adjusted.
+            self.shared.invalidate();
+        }
+        level
+    }
+
+    /// The cell under the head now — the `RDDATA` line.
+    #[must_use]
+    pub fn read_line(&self) -> bool {
+        let state = self.shared.state.lock();
+        state.drives[state.selected()].read_line
+    }
+
+    /// Pick the drive, run or stop its spindle, and — only if the controller
+    /// is driving the head-select pin at all — choose the head.
+    ///
+    /// `drive` is which cable position the ISM's two enable bits name, or
+    /// `None` when neither does. This is the ISM's own path to the mechanism
+    /// and it does **not** go through the drive's `LSTRB` register file the
+    /// way an IWM's motor does: page 23 makes the enables and `MotorOn` bits
+    /// of the mode register.
+    ///
+    /// `head` is `None` when the chip's `HDSEL` pin is *not* an output, which
+    /// page 23 makes the ordinary case — "Sets the state of the HDSEL pin if
+    /// the Q3*/HDSEL bit in the Setup register is set to '1'" — and a
+    /// Macintosh Classic ROM never sets that bit. Passing `Some(false)` there
+    /// instead of `None` put the head back on side 0 after every single ISM
+    /// register write, so the side the drive had just been told to use through
+    /// its own register file ([`Iwm::sense_and_pick_head`]) never survived to
+    /// the read.
+    pub fn set_enables(&self, drive: Option<usize>, motor: bool, head: Option<bool>) {
+        let moved = {
+            let mut state = self.shared.state.lock();
+            let was = (state.selected(), state.drives[state.selected()].side);
+            // `SELECT` picks which mechanism every other line addresses, so
+            // the ISM's enable bits set it as well.
+            if let Some(which) = drive {
+                if which & 1 == 0 {
+                    state.switches &= !SW_SELECT;
+                } else {
+                    state.switches |= SW_SELECT;
+                }
+            }
+            for (i, mech) in state.drives.iter_mut().enumerate() {
+                let picked = drive == Some(i);
+                mech.motor = picked && motor;
+                if let (true, Some(side)) = (picked, head) {
+                    mech.side = side;
+                }
+            }
+            (state.selected(), state.drives[state.selected()].side) != was
+        };
+        if moved {
+            self.shared.invalidate();
+        } else {
+            // The spindle starting or stopping changes when the next byte
+            // lands but not which cells are under the head.
+            self.shared.republish();
+        }
+    }
+
+    /// Turn the MFM separator on or off, restarting it either way with `seed`
+    /// in its CRC generator.
+    pub fn set_mfm_framing(&self, on: bool, seed: u16) {
+        {
+            let mut state = self.shared.state.lock();
+            if state.mfm.on == on {
+                // Idempotent: the ISM pushes its whole configuration onto the
+                // mechanism after every register write, and a restart on each
+                // of those would throw away the byte boundary the chip is in
+                // the middle of.
+                return;
+            }
+            state.mfm.restart(seed);
+            state.mfm.on = on;
+        }
+        self.shared.republish();
+    }
+
+    /// Forget the byte boundary and empty the FIFO, reseeding the CRC and
+    /// leaving the separator as it is.
+    pub fn restart_mfm(&self, seed: u16) {
+        {
+            let mut state = self.shared.state.lock();
+            state.mfm.restart(seed);
+        }
+        self.shared.republish();
+    }
+
+    /// The separator's CRC over every byte it has framed since the last
+    /// restart.
+    #[must_use]
+    pub fn mfm_crc(&self) -> u16 {
+        self.shared.state.lock().mfm.crc
+    }
+
+    /// The oldest framed byte and whether it is a mark, without taking it —
+    /// which is what a debug read and the handshake register both want.
+    #[must_use]
+    pub fn peek_mfm(&self) -> Option<(u8, bool)> {
+        self.shared.state.lock().mfm.peek()
+    }
+
+    /// Take it.
+    pub fn take_mfm(&self) -> Option<(u8, bool)> {
+        let popped = self.shared.state.lock().mfm.pop();
+        if popped.is_some() {
+            // A slot came free, so the next boundary matters again — but the
+            // cells under the head have not moved.
+            self.shared.republish();
+        }
+        popped
+    }
+
+    /// How many framed bytes are waiting, 0 to [`MFM_FIFO`].
+    #[must_use]
+    pub fn mfm_queued(&self) -> u8 {
+        self.shared.state.lock().mfm.count
+    }
+
+    /// Whether a framed byte has been lost because the FIFO was full, clearing
+    /// the flag.
+    pub fn take_mfm_overrun(&self) -> bool {
+        let mut state = self.shared.state.lock();
+        core::mem::take(&mut state.mfm.overrun)
+    }
 }
 
 impl Device for Iwm {
@@ -1067,7 +1614,21 @@ impl Device for Iwm {
             w.write_u64(drive.bit)?;
             w.write_u8(drive.rsr)?;
         }
-        w.write_bool(state.sel)
+        w.write_bool(state.sel)?;
+        // The separator is chip state, not a cache: the guest can read the
+        // FIFO and the byte boundary is where the last mark left it.
+        w.write_bool(state.mfm.on)?;
+        w.write_u32(state.mfm.cells)?;
+        w.write_u8(state.mfm.phase)?;
+        w.write_bool(state.mfm.synced)?;
+        for byte in state.mfm.fifo {
+            w.write_u8(byte)?;
+        }
+        w.write_u8(state.mfm.marks)?;
+        w.write_u8(state.mfm.count)?;
+        w.write_bool(state.mfm.overrun)?;
+        w.write_u16(state.mfm.crc)?;
+        w.write_u32(state.mode_writes)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1094,6 +1655,18 @@ impl Device for Iwm {
             drive.rsr = r.read_u8()?;
         }
         next.sel = r.read_bool()?;
+        next.mfm.on = r.read_bool()?;
+        next.mfm.cells = r.read_u32()?;
+        next.mfm.phase = r.read_u8()? % MFM_CELLS_PER_BYTE;
+        next.mfm.synced = r.read_bool()?;
+        for slot in 0..MFM_FIFO {
+            next.mfm.fifo[slot] = r.read_u8()?;
+        }
+        next.mfm.marks = r.read_u8()?;
+        next.mfm.count = r.read_u8()?.min(MFM_FIFO as u8);
+        next.mfm.overrun = r.read_bool()?;
+        next.mfm.crc = r.read_u16()?;
+        next.mode_writes = r.read_u32()?;
         *state = next;
         // The published tick is not in the chunk and it is what the scheduler
         // reads: a restore that left it at zero would have the head advanced

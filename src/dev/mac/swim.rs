@@ -67,15 +67,16 @@ use alloc::sync::Arc;
 
 use super::disk::{Density, Disk, Reader};
 use super::iwm::{self, Iwm};
+use self::ism::{Ism, Switch};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
-use crate::core::error::{Error, Result};
+use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::LazyHandle;
 use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionKind, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{AtomicBool, AtomicU64, Ordering};
+use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::wire::WireId;
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
@@ -84,7 +85,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.swim";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 /// How many bytes of address space the register file occupies: the board puts
 /// the register selects on A9-A12, exactly as it does the IWM's.
@@ -97,23 +98,144 @@ pub const SEL_PIN: &str = "sel";
 /// How many of this device's ticks one GCR cell is. See the module docs.
 const GCR_DIVISOR: u64 = 2;
 
-/// The chip's register file forwarded to the IWM it is a superset of.
+/// Where the ISM's register file sits in the lock ladder.
+///
+/// **Below** [`LockRank::DEVICE`], because a register access takes it and then
+/// reaches into the `Iwm` this chip owns, which takes its own `DEVICE`-ranked
+/// lock: the ISM's phase lines, enables and `SENSE` are the mechanism's, and
+/// the mechanism lives there. The reverse edge does not exist — nothing in
+/// `mac.iwm` knows this register file is here — so it is a rank and not a
+/// cycle (`CLAUDE.md`, *Concurrency*).
+pub const ISM_RANK: LockRank = LockRank::new(0x4e00);
+
+/// Which of the two register sets is answering, and the watcher that switches
+/// between them.
+#[derive(Debug, Clone, Copy, Default)]
+struct Selected {
+    /// `Some` while the ISM register set answers; `None` while the chip is
+    /// still pretending to be an IWM.
+    ism: Option<Ism>,
+    /// The four-write sequence that asks for ISM mode.
+    switch: Switch,
+}
+
+/// The chip's register file: the IWM's sixteen soft switches, or the ISM's
+/// sixteen registers once software has asked for them.
 ///
 /// A separate type rather than the `Iwm`'s own region, because the address
 /// space has to dispatch to *this* device — a snapshot names devices by their
-/// path and a machine file maps `swim`, not the IWM inside it.
-#[derive(Debug)]
+/// path and a machine file maps `swim`, not the IWM inside it — and because
+/// this is where the two register sets are told apart.
 struct Ports {
+    /// The IWM's own aperture, which every access in IWM mode goes through
+    /// unchanged.
     ops: Arc<dyn MemOps>,
+    /// The chip the ISM shares its cable, head and medium with.
+    iwm: Arc<Iwm>,
+    selected: Mutex<Selected>,
+}
+
+impl core::fmt::Debug for Ports {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut s = f.debug_struct("Swim.regs");
+        match self.selected.try_lock() {
+            Some(sel) => s.field("selected", &*sel).finish(),
+            None => s.field("selected", &"<in use>").finish(),
+        }
+    }
+}
+
+impl Ports {
+    /// Which of the sixteen registers an offset names. The same decode the
+    /// IWM's switches use, because it is the same decode: the board puts the
+    /// selects on A9-A12.
+    fn index(offset: u64) -> u8 {
+        ((offset / ism::REGISTER_STRIDE) & 0xf) as u8
+    }
+
+    /// Enter ISM mode, carrying the phase lines over.
+    fn enter_ism(&self, sel: &mut Selected) {
+        sel.switch.forget(&self.iwm);
+        let ism = Ism::entered(&self.iwm);
+        sel.ism = Some(ism);
+        ism.apply(&self.iwm);
+    }
+
+    /// Leave it, which is what clearing mode bit 6 does.
+    fn leave_ism(&self, sel: &mut Selected) {
+        sel.ism = None;
+        sel.switch.forget(&self.iwm);
+        // Page 23: "MotorOn should be disabled before switching back to the
+        // IWM register set." The chip does not enforce it and neither does
+        // this, but the separator has no meaning outside ISM mode.
+        self.iwm.set_mfm_framing(false, ism::CRC_SEED);
+    }
 }
 
 impl MemOps for Ports {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-        self.ops.read(offset, dst, attrs)
+        let mut sel = self.selected.lock();
+        if let Some(ism) = sel.ism.as_mut() {
+            let [byte] = dst else {
+                // Anything but a byte is the odd half of a word arriving
+                // here, which the space's own policy answers; a chip on one
+                // lane cannot serve it.
+                return Err(BusError::BadAccess);
+            };
+            // The head has to be where it is at the cycle the guest looks: a
+            // guest polling the handshake register is asking exactly that.
+            self.iwm.sync(attrs.debug);
+            ism.note_overrun(&self.iwm);
+            *byte = ism.read(Ports::index(offset), &self.iwm, attrs.debug);
+            return Ok(());
+        }
+        drop(sel);
+        let result = self.ops.read(offset, dst, attrs);
+        // A *read* of an IWM address moves a soft switch but never loads the
+        // mode register, so it cannot complete the sequence — the watcher is
+        // asked anyway, because what it watches is the chip's own write
+        // counter and asking costs one comparison.
+        if !attrs.debug {
+            let mut sel = self.selected.lock();
+            if sel.switch.observe(&self.iwm) {
+                self.enter_ism(&mut sel);
+            }
+        }
+        result
     }
 
     fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-        self.ops.write(offset, src, attrs)
+        let mut sel = self.selected.lock();
+        if let Some(ism) = sel.ism.as_mut() {
+            let [value] = src else {
+                return Err(BusError::BadAccess);
+            };
+            if attrs.debug {
+                // Every ISM address either loads a register or moves a
+                // counter, so there is no harmless debug write — the same
+                // answer the IWM's own aperture gives.
+                return Err(BusError::BadAccess);
+            }
+            self.iwm.sync(false);
+            ism.note_overrun(&self.iwm);
+            let left = ism.write(Ports::index(offset), *value, &self.iwm, false);
+            let after = *ism;
+            if left {
+                self.leave_ism(&mut sel);
+            } else {
+                after.apply(&self.iwm);
+            }
+            return Ok(());
+        }
+        drop(sel);
+        let result = self.ops.write(offset, src, attrs);
+        if !attrs.debug {
+            let mut sel = self.selected.lock();
+            if sel.switch.observe(&self.iwm) {
+                self.enter_ism(&mut sel);
+            }
+        }
+        result
     }
 
     fn constraints(&self) -> AccessConstraints {
@@ -126,6 +248,9 @@ impl MemOps for Ports {
 pub struct Swim {
     /// The IWM this chip is a superset of, with SuperDrive mechanisms.
     iwm: Arc<Iwm>,
+    /// The register file, kept so that reset, save and load can reach which
+    /// of the two register sets is selected.
+    ports: Arc<Ports>,
     region: RegionRef,
     /// Ticks of this device's clock — MFM cells — simulated.
     ticks: AtomicU64,
@@ -183,16 +308,18 @@ impl Swim {
             RegionKind::Io(ops) => Arc::clone(ops),
             _ => unreachable!("an IWM's register file is MMIO"),
         };
+        let ports = Arc::new(Ports {
+            ops,
+            iwm: Arc::clone(&iwm),
+            selected: Mutex::with_rank(ISM_RANK, Selected::default()),
+        });
         let region = Arc::new(
-            Region::io(
-                CLASS_NAME,
-                REGISTER_SPAN,
-                Arc::new(Ports { ops }) as Arc<dyn MemOps>,
-            )
-            .with_constraints(inner.constraints()),
+            Region::io(CLASS_NAME, REGISTER_SPAN, Arc::clone(&ports) as Arc<dyn MemOps>)
+                .with_constraints(inner.constraints()),
         );
         Swim {
             iwm,
+            ports,
             region,
             ticks: AtomicU64::new(0),
             mfm: AtomicBool::new(false),
@@ -208,6 +335,22 @@ impl Swim {
     #[must_use]
     pub fn iwm(&self) -> &Arc<Iwm> {
         &self.iwm
+    }
+
+    /// Whether the **ISM** register set is the one answering now.
+    ///
+    /// The chip comes up as an IWM and software asks for the ISM set with the
+    /// four mode writes page 12 describes; this says which side of that the
+    /// chip is on, for a test and for a trace.
+    #[must_use]
+    pub fn ism_selected(&self) -> bool {
+        self.ports.selected.lock().ism.is_some()
+    }
+
+    /// The ISM's register file as it stands, or `None` in IWM mode.
+    #[must_use]
+    pub fn ism(&self) -> Option<Ism> {
+        self.ports.selected.lock().ism
     }
 
     /// Read a switch the way the address space would, for a test.
@@ -329,6 +472,15 @@ impl Device for Swim {
 
     fn reset(&self, kind: ResetKind) {
         Device::reset(&*self.iwm, kind);
+        {
+            // `/RESET` "Initializes the registers in the chip" (*SWIM Chip
+            // User's Reference*, page 4), and a chip that has been reset is
+            // answering as an IWM again: page 12 makes the ISM set something
+            // software has to ask for, four writes at a time.
+            let mut sel = self.ports.selected.lock();
+            sel.ism = None;
+            sel.switch.forget(&self.iwm);
+        }
         // A disk stays in the drive across a reset, but the cache is derived
         // state and is rebuilt rather than assumed.
         self.note_density();
@@ -336,12 +488,25 @@ impl Device for Swim {
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         w.write_u64(self.ticks.load(Ordering::Relaxed))?;
+        // Which register set is answering is chip state: a machine snapshotted
+        // in the middle of reading a sector comes back mid-sector.
+        let selected = *self.ports.selected.lock();
+        w.write_bool(selected.ism.is_some())?;
+        selected.ism.unwrap_or_else(Ism::fresh).save(w)?;
+        selected.switch.save(w)?;
         Device::save(&*self.iwm, w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let ticks = r.read_u64()?;
+        let live = r.read_bool()?;
+        let ism = Ism::load(r)?;
+        let switch = Switch::load(r)?;
         Device::load(&*self.iwm, r)?;
+        *self.ports.selected.lock() = Selected {
+            ism: live.then_some(ism),
+            switch,
+        };
         self.ticks.store(ticks, Ordering::Relaxed);
         // Derived state, never serialized (`CLAUDE.md`, *Devices*).
         self.note_density();
@@ -441,6 +606,8 @@ pub fn schema() -> ClassSchema {
         .region("regs")
         .port(SEL_PIN, PortDir::In)
 }
+
+pub mod ism;
 
 #[cfg(test)]
 mod tests;

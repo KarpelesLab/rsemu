@@ -213,3 +213,126 @@ fn the_cached_density_follows_the_medium() {
     );
     assert!(swim.is_mfm(), "and the cache came back with it");
 }
+
+/// **Which of the two sync patterns a separator can actually find**, measured
+/// over a whole track rather than argued.
+///
+/// The ISM's mark search runs cell by cell with no byte boundary to align to —
+/// page 23: "The search for the mark byte is invisible to the software since it
+/// is handled entirely by the SWIM chip" — so it can only look for a *bit
+/// pattern*, and a pattern that also occurs at an odd alignment somewhere in
+/// ordinary data is a false mark.
+///
+/// This walks every cell of a formatted track and counts where each of the two
+/// patterns turns up. The result is the reason `Framer` syncs on `$4489` and
+/// not on `$5224`, and it is printed so the numbers can be read rather than
+/// taken on trust.
+#[test]
+fn only_the_a1_sync_is_unique_at_every_cell_alignment() {
+    // Eighteen sectors of data that is not all one byte: a run of $00 or $FF
+    // would not exercise the question at all.
+    let sectors: Vec<mfm::Sector> = (1..=18u8)
+        .map(|s| {
+            let data: Vec<u8> = (0..512u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 ^ s)
+                .collect();
+            mfm::Sector::new(17, 1, s, &data)
+        })
+        .collect();
+    let track = mfm::encode_track(&sectors);
+    let a1 = mfm::sync_cells(mfm::SYNC_A1);
+    let c2 = mfm::sync_cells(mfm::SYNC_C2);
+
+    let (mut window, mut a1_hits, mut c2_hits) = (0u16, 0usize, 0usize);
+    for cell in 0..track.len() {
+        window = (window << 1) | u16::from(track.bit(cell));
+        if cell < 15 {
+            continue;
+        }
+        if window == a1 {
+            a1_hits += 1;
+        }
+        if window == c2 {
+            c2_hits += 1;
+        }
+    }
+    std::println!("mac.swim: over one formatted track, {a1_hits} matches of $4489 and {c2_hits} of $5224");
+
+    // Three $A1s prefix each of the eighteen ID fields and each of the
+    // eighteen data fields, and nothing else on the track carries the
+    // pattern — at any alignment.
+    assert_eq!(
+        a1_hits,
+        3 * 18 * 2,
+        "the $A1 sync turns up exactly where the format puts it"
+    );
+    // The index mark's $C2 is written three times, once a revolution — and
+    // the pattern turns up more often than that, which is the measurement:
+    // `$5224` is *not* unique at an arbitrary cell alignment, so a separator
+    // that synced on it would report marks that are not there.
+    assert!(
+        c2_hits > 3,
+        "if this ever comes out at 3 the separator could sync on $C2 safely: {c2_hits}"
+    );
+}
+
+/// **The separator hands back a whole ID field and its CRC comes out zero.**
+///
+/// This is the end-to-end check of the MFM read path below the register file:
+/// a 1.44 MB disk goes into the drive, the spindle turns, `ACTION` is set, and
+/// the bytes that come out are `$A1 $A1 $A1 $FE C H R N` followed by the two
+/// CRC bytes — with the chip's own generator reading **zero** once it has
+/// absorbed them, which is what page 25's handshake bit 1 reports:
+///
+/// > The CRC error bit is cleared to zero if the CRC generated on the bytes up
+/// > to and including the byte about to be read is zero (meaning all the bytes
+/// > are correct).
+///
+/// A generator that came out non-zero was the defect that made Apple's ROM put
+/// this disk back out again on every attempt: the separator was locking onto
+/// the second or third `$A1` of the three, so the field it checksummed was not
+/// the field the CRC was written over.
+#[test]
+fn the_separator_reads_an_id_field_and_its_crc_comes_out_zero() {
+    let swim = Swim::with_drives([true, false]);
+    let mut image = alloc::vec![0u8; mfm::BYTES];
+    for (block, chunk) in image.chunks_mut(512).enumerate() {
+        chunk[..4].copy_from_slice(&(block as u32).to_be_bytes());
+    }
+    swim.insert(0, Disk::from_image_for(&image, Reader::Swim).expect("a 1.44 MB image"));
+    let iwm = swim.iwm();
+    // Drive 1, spindle on, head 0 — what the ISM's mode register would say.
+    iwm.set_enables(Some(0), true, Some(false));
+    iwm.set_mfm_framing(true, ism::CRC_SEED);
+
+    // Walk a whole revolution a byte at a time, taking whatever the separator
+    // frames, and stop once a mark has been followed by the ID address mark.
+    let mut field: Vec<u8> = Vec::new();
+    let mut tick = 0u64;
+    for _ in 0..mfm::CELLS_PER_REVOLUTION {
+        tick += 1;
+        swim.advance_to(tick);
+        while let Some((byte, mark)) = iwm.take_mfm() {
+            if field.is_empty() && !mark {
+                // Still in the gap: nothing has been found yet.
+                continue;
+            }
+            field.push(byte);
+        }
+        // $A1 $A1 $A1 $FE and the four ID bytes, then the two CRC bytes.
+        if field.len() >= 10 {
+            break;
+        }
+    }
+    std::println!("mac.swim: the first field off the disk is {field:02x?}");
+    assert_eq!(
+        &field[..4],
+        &[mfm::SYNC_A1, mfm::SYNC_A1, mfm::SYNC_A1, mfm::IDAM],
+        "three sync bytes and the ID address mark, in that order"
+    );
+    assert_eq!(
+        iwm.mfm_crc(),
+        0,
+        "the generator absorbed the field and its own CRC, so it reads zero"
+    );
+}
