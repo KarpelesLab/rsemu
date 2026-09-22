@@ -4,9 +4,14 @@
 //! # Sources
 //!
 //! * *Zilog Z8030/Z8530 SCC Serial Communications Controller* technical
-//!   manual, for the register model: sixteen write registers and sixteen read
-//!   registers per channel reached through **one pointer**, which a control
-//!   write sets and the next control access consumes.
+//!   manual — the *SCC/ESCC User Manual*, UM010902 — for the register model:
+//!   sixteen write registers and sixteen read registers per channel reached
+//!   through **one pointer**, which a control write sets and the next control
+//!   access consumes, and for the external/status latches below.
+//! * *Am8530H/Am85C30 Serial Communications Controller* technical manual
+//!   (AMD's edition of the same part's manual) §3.8, for the one sentence
+//!   Zilog's printing leaves unfinished: what the chip does with a second
+//!   `DCD` transition before the first is acknowledged.
 //! * *Guide to the Macintosh Family Hardware*, 2nd edition, chapter 3, for the
 //!   addresses, and the "Serial" chapter for what a Macintosh hangs off the
 //!   chip.
@@ -67,6 +72,56 @@
 //! `Shared::write` ends at `Shared::refresh` for that reason, and
 //! `src/dev/mac/scc/tests.rs` watches the net rather than the registers.
 //!
+//! # The external/status latches, and why a busy moment costs nothing
+//!
+//! `RR0`'s `DCD` bit is **latched**, and the latch is what makes a transition
+//! that arrives while an earlier one is unacknowledged arrive *late* rather
+//! than never. Zilog's *SCC/ESCC User Manual* (UM010902), "External/Status
+//! Interrupts", has the group:
+//!
+//! > "Individual enable bits control whether or not a latch is present in the
+//! > path from the source of the interrupt to the corresponding status bit in
+//! > RR0. If the individual enable is set to 0, then RR0 reflects the current
+//! > unlatched status, and if the individual enable is set to 1, then RR0
+//! > reflects the latched status. The latches for the external/status
+//! > interrupts are not independent. Rather, they all close at the same time as
+//! > a result of a state change in one of the sources of enabled
+//! > external/status interrupts."
+//!
+//! > "The External/Status IP is set by the closing of the latches and remains
+//! > set as long as they are closed."
+//!
+//! The rule for a *second* transition is in the same manual's `RR0` bit 3, but
+//! that printing loses the sentence half way through — "Any odd number of
+//! transitions on the /DCD pin while another External/Status interrupt
+//! condition." and then nothing. AMD's edition of the same technical manual,
+//! *Am8530H/Am85C30* §3.8.6 ("Data Carrier Detect"), prints it whole, and it
+//! is the sentence this chip is built on:
+//!
+//! > "Any transition on the DCD pin, while no other interrupts are pending,
+//! > latches the state of the DCD pin and generates an External/Status
+//! > interrupt if the DCD IE bit in WR15 is set to '1'. However, only an odd
+//! > number of transitions on the DCD pin while another External/Status is
+//! > pending will cause an External/Status interrupt after the Reset
+//! > External/Status Interrupt command is issued."
+//!
+//! > "Note that after the Reset External/Status Interrupt command is issued, if
+//! > the latches were closed, they will close again if there was an odd number
+//! > of transitions on the DCD pin; they will remain open if there was an even
+//! > number of transitions on the input pin."
+//!
+//! So a channel holds one flag — `Channel::ext_closed`, the latches shut,
+//! which *is* the interrupt-pending bit — plus the level they caught and the
+//! level the pin is at now. An acknowledgement opens them and closes them
+//! again when those two differ, which is exactly "an odd number of
+//! transitions". This chip used to have neither: `RR0` read the live pin and a
+//! transition inside a handler was swallowed by the acknowledgement that
+//! followed it. At a mouse's rates nothing could see the difference — the
+//! numbers are in `tests/mac_plus.rs` — but at sixteen thousand counts a
+//! second the old chip turned 300 transitions into 200 interrupts and this one
+//! turns them into 226, the other 74 being genuine even-numbered pairs the
+//! manual says the chip cannot report.
+//!
 //! **Not modelled**: any actual serial traffic, the baud-rate generator, the
 //! DPLL, SDLC, and `/WREQ` — a Macintosh wires that last to the VIA's `PA7`,
 //! and with no DMA and no transmission in progress it sits where the VIA's
@@ -82,7 +137,7 @@ use crate::core::error::{BusError, Error, Result};
 use crate::core::props::Props;
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::machine::realize::Instance;
@@ -92,7 +147,14 @@ use crate::machine::validate::{ClassSchema, PortDir};
 pub const CLASS_NAME: &str = "mac.scc";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 1;
+///
+/// Two, because the second `bool` a channel writes changed meaning: it was an
+/// interrupt-pending flag that a transition set unconditionally, and it is now
+/// the external/status **latch** — closed or open — which is what the manual
+/// describes and what `dcd_latched` beside it is only meaningful against. The
+/// byte layout is the same; a chunk from a build before that would restore a
+/// chip whose `RR0` lies, so it is refused instead.
+pub const STATE_VERSION: u32 = 2;
 
 /// How many bytes each window decodes before it repeats: `A1` and `A2` only.
 pub const WINDOW_SPAN: u64 = 8;
@@ -142,11 +204,20 @@ struct Channel {
     /// realize sweep that ends a restore re-announces every level, and one
     /// that came back wrong arrives as a transition.
     dcd: bool,
-    /// The `DCD` level the last external/status latch caught, which is what
-    /// `RR0` reports until `Reset Ext/Status Interrupts` releases it.
+    /// The `DCD` level the latches caught when they last closed. `RR0` reports
+    /// *this* rather than the pin for as long as they stay closed.
     dcd_latched: bool,
-    /// An external status change is pending for this channel.
-    ext_ip: bool,
+    /// Whether this channel's external/status latches are closed.
+    ///
+    /// One flag for the whole group, because the manual says they are one
+    /// group: "The latches for the external/status interrupts are not
+    /// independent. Rather, they all close at the same time as a result of a
+    /// state change in one of the sources of enabled external/status
+    /// interrupts" (Zilog *SCC/ESCC User Manual*, "External/Status
+    /// Interrupts"). It doubles as the interrupt-pending bit, for the sentence
+    /// below it: "The External/Status IP is set by the closing of the latches
+    /// and remains set as long as they are closed."
+    ext_closed: bool,
 }
 
 impl Channel {
@@ -157,16 +228,36 @@ impl Channel {
             // active-low `/DCD` means no carrier.
             dcd: true,
             dcd_latched: true,
-            ext_ip: false,
+            ext_closed: false,
         }
+    }
+
+    /// Whether the `DCD` latch is in the signal path at all.
+    ///
+    /// "If the individual enable is set to 0, then RR0 reflects the current
+    /// unlatched status, and if the individual enable is set to 1, then RR0
+    /// reflects the latched status." (Zilog *SCC/ESCC User Manual*.)
+    fn dcd_latching(&self) -> bool {
+        self.wr[15] & WR15_DCD_IE != 0
     }
 
     /// `RR0` as software reads it.
     fn rr0(&self) -> u8 {
         let mut value = RR0_TX_EMPTY | RR0_CTS | RR0_TX_UNDERRUN;
+        // "Thus, a read of RR0 returns the current status for any bits whose
+        // individual enable is 0, and either the current state or the latched
+        // state of the remainder of the bits" (Zilog) — the latched state
+        // while the latches are closed, which is what lets the handler see
+        // *which* condition changed after a second transition has already
+        // moved the pin.
+        let dcd = if self.dcd_latching() && self.ext_closed {
+            self.dcd_latched
+        } else {
+            self.dcd
+        };
         // `/DCD` is active low on the pin and the bit reads the *asserted*
         // sense, so a high pin is a clear bit.
-        if !self.dcd_latched {
+        if !dcd {
             value |= RR0_DCD;
         }
         value
@@ -174,7 +265,25 @@ impl Channel {
 
     /// Whether this channel is asking for an interrupt.
     fn asserting(&self) -> bool {
-        self.ext_ip && self.wr[1] & WR1_EXT_IE != 0
+        self.ext_closed && self.wr[1] & WR1_EXT_IE != 0
+    }
+
+    /// Open the latches, and close them again on an odd number of transitions.
+    ///
+    /// The manual's own rule, in the paragraph on `DCD` (*Am8530H/Am85C30*
+    /// §3.8.6, which prints whole what Zilog's own edition truncates): "Note
+    /// that after the Reset External/Status Interrupt command is issued, if the
+    /// latches were closed, they will close again if there was an odd number
+    /// of transitions on the DCD pin; they will remain open if there was an
+    /// even number of transitions on the input pin." An odd number of
+    /// transitions is exactly the pin no longer matching what the latch
+    /// caught, so the comparison *is* the rule — and it is what makes a
+    /// transition that arrives while an earlier one is unacknowledged arrive
+    /// **late** rather than never.
+    fn open_latches(&mut self) {
+        let reclose = self.ext_closed && self.dcd_latching() && self.dcd != self.dcd_latched;
+        self.dcd_latched = self.dcd;
+        self.ext_closed = reclose;
     }
 }
 
@@ -247,10 +356,64 @@ impl State {
     }
 }
 
+/// What the chip has done since it was built, as plain numbers.
+///
+/// Diagnostics, not state: nothing here is in the snapshot and nothing here
+/// changes what the guest sees. It exists because the interesting claims about
+/// this chip are *counts* — how many transitions arrived, how many raised an
+/// interrupt, how many the guest acknowledged — and a claim about a count is
+/// only worth anything if a test can check it. The ledger in
+/// `docs/platforms/mac-plus.md` once asserted that this chip dropped a
+/// carrier-detect transition in one in two hundred, on nothing but inference;
+/// these four numbers are what settled it (`tests/mac_plus.rs`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Counters {
+    /// Transitions delivered on each carrier-detect input, A then B.
+    pub dcd_edges: [u64; 2],
+    /// Times each channel's external/status latches **closed** — which is one
+    /// interrupt raised, whether by a fresh transition or by the odd-number
+    /// re-close at an acknowledgement.
+    pub ext_latches: [u64; 2],
+    /// Times each channel was written `Reset Ext/Status Interrupts`, which is
+    /// how many the guest's handler serviced.
+    pub ext_resets: [u64; 2],
+    /// Times `/INT` went from released to asserted.
+    pub int_assertions: u64,
+}
+
+/// The same counters as the chip keeps them.
+#[derive(Debug, Default)]
+struct Tally {
+    dcd_edges: [AtomicU64; 2],
+    ext_latches: [AtomicU64; 2],
+    ext_resets: [AtomicU64; 2],
+    int_assertions: AtomicU64,
+    /// Whether `/INT` was asserted at the last refresh, so a *rise* can be
+    /// told from a refresh that changes nothing.
+    asserted: AtomicBool,
+}
+
+impl Tally {
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Counters {
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        Counters {
+            dcd_edges: [load(&self.dcd_edges[0]), load(&self.dcd_edges[1])],
+            ext_latches: [load(&self.ext_latches[0]), load(&self.ext_latches[1])],
+            ext_resets: [load(&self.ext_resets[0]), load(&self.ext_resets[1])],
+            int_assertions: load(&self.int_assertions),
+        }
+    }
+}
+
 /// The chip, as something an address space can dispatch to.
 struct Shared {
     state: Mutex<State>,
     out: Mutex<Option<WireSource>>,
+    tally: Tally,
 }
 
 impl core::fmt::Debug for Shared {
@@ -267,6 +430,9 @@ impl Shared {
     /// Drive `/INT` to whatever the state now says, with no lock held.
     fn refresh(&self) {
         let asserting = self.state.lock().irq();
+        if asserting != self.tally.asserted.swap(asserting, Ordering::Relaxed) && asserting {
+            Tally::bump(&self.tally.int_assertions);
+        }
         let out = self.out.lock().clone();
         if let Some(src) = &out {
             src.set(Level::from(asserting));
@@ -275,6 +441,7 @@ impl Shared {
 
     /// A level arrived on one of the two carrier-detect inputs.
     fn dcd(&self, line: u32, level: bool) {
+        let mut closed = false;
         let changed = {
             let mut state = self.state.lock();
             let ch = &mut state.ch[line as usize];
@@ -282,19 +449,36 @@ impl Shared {
                 return;
             }
             ch.dcd = level;
-            // The manual: an external status change latches `RR0` and raises
-            // the interrupt, and `RR0` keeps reporting the latched value until
-            // `Reset Ext/Status Interrupts` unlatches it.
-            let enabled = ch.wr[15] & WR15_DCD_IE != 0;
-            if enabled {
-                ch.dcd_latched = level;
-                ch.ext_ip = true;
+            Tally::bump(&self.tally.dcd_edges[line as usize]);
+            // *Am8530H/Am85C30* §3.8.6: "Any transition on the DCD pin, while
+            // no other interrupts are pending, latches the state of the DCD
+            // pin and generates an External/Status interrupt if the DCD IE bit
+            // in WR15 is set to '1'. However, only an odd number of
+            // transitions on the DCD pin while another External/Status is
+            // pending will cause an External/Status interrupt after the Reset
+            // External/Status Interrupt command is issued."
+            //
+            // So a transition arriving with the latches already closed does
+            // **not** close them again and does not latch: it is remembered
+            // only as the pin's own level, and `Channel::open_latches` decides
+            // at the acknowledgement whether the count of transitions since
+            // was odd. Nothing is thrown away here.
+            if ch.dcd_latching() {
+                if !ch.ext_closed {
+                    ch.dcd_latched = level;
+                    ch.ext_closed = true;
+                    closed = true;
+                }
             } else {
+                // The latch is out of the path; `RR0` reads the pin.
                 ch.dcd_latched = level;
             }
             state.asserting()
         };
         let _ = changed;
+        if closed {
+            Tally::bump(&self.tally.ext_latches[line as usize]);
+        }
         self.refresh();
     }
 
@@ -391,15 +575,28 @@ impl Shared {
             }
             state.pointer = next;
             match command {
-                // "Reset Ext/Status Interrupts": unlatch `RR0` and drop
-                // the pending bit.
+                // "Reset Ext/Status Interrupts": open the latches, which
+                // re-close on an odd number of transitions since they shut.
+                // See `Channel::open_latches`.
                 2 => {
-                    state.ch[c].dcd_latched = state.ch[c].dcd;
-                    state.ch[c].ext_ip = false;
+                    Tally::bump(&self.tally.ext_resets[c]);
+                    state.ch[c].open_latches();
+                    if state.ch[c].ext_closed {
+                        // The re-close is an interrupt of its own: the
+                        // transition that arrived while the latches were shut,
+                        // counted late.
+                        Tally::bump(&self.tally.ext_latches[c]);
+                    }
                 }
-                // "Reset Highest IUS" — nothing here nests, so it is the
-                // same as clearing this channel's pending bit.
-                5 => state.ch[c].ext_ip = false,
+                // "Reset Highest IUS". **An inference**: this chip has no
+                // interrupt-under-service state here, nothing nests, and the
+                // manual's IUS is not the IP — so it is modelled as dropping
+                // this channel's request without the odd/even re-close, which
+                // is the reading that cannot leave `/INT` stuck.
+                5 => {
+                    state.ch[c].dcd_latched = state.ch[c].dcd;
+                    state.ch[c].ext_closed = false;
+                }
                 _ => {}
             }
             return;
@@ -520,6 +717,7 @@ impl Scc {
         let shared = Arc::new(Shared {
             state: Mutex::with_rank(LockRank::DEVICE, State::fresh()),
             out: Mutex::with_rank(LockRank::LEAF, None),
+            tally: Tally::default(),
         });
         let region = |name: &str| -> RegionRef {
             Arc::new(Region::io(
@@ -550,6 +748,12 @@ impl Scc {
     #[must_use]
     pub fn irq(&self) -> bool {
         self.shared.state.lock().irq()
+    }
+
+    /// What the chip has counted since it was built. See [`Counters`].
+    #[must_use]
+    pub fn counters(&self) -> Counters {
+        self.shared.tally.snapshot()
     }
 
     /// The register pointer, which the whole chip shares.
@@ -618,7 +822,7 @@ impl Device for Scc {
                 w.write_u8(reg)?;
             }
             w.write_bool(ch.dcd_latched)?;
-            w.write_bool(ch.ext_ip)?;
+            w.write_bool(ch.ext_closed)?;
             w.write_bool(ch.dcd)?;
         }
         Ok(())
@@ -634,7 +838,7 @@ impl Device for Scc {
                     *reg = r.read_u8()?;
                 }
                 ch.dcd_latched = r.read_bool()?;
-                ch.ext_ip = r.read_bool()?;
+                ch.ext_closed = r.read_bool()?;
                 ch.dcd = r.read_bool()?;
             }
             *state = next;

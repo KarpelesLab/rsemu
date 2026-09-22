@@ -192,6 +192,131 @@ fn the_interrupt_pin_drops_when_the_reset_command_is_written() {
     );
 }
 
+/// **`RR0` reports what the latches caught, not what the pin is doing now**,
+/// and a transition that arrives while they are shut is counted *late* rather
+/// than never.
+///
+/// *Am8530H/Am85C30* technical manual §3.8.6 ("Data Carrier Detect") — AMD's
+/// edition of this part's manual, which prints whole the sentence Zilog's own
+/// printing breaks off in the middle of:
+///
+/// > "The DCD Status bit reports the state of the DCD input pin the last time
+/// > any of the enabled External/Status bits changed. Any transition on the DCD
+/// > pin, while no other interrupts are pending, latches the state of the DCD
+/// > pin and generates an External/Status interrupt if the DCD IE bit in WR15
+/// > is set to '1'. However, only an odd number of transitions on the DCD pin
+/// > while another External/Status is pending will cause an External/Status
+/// > interrupt after the Reset External/Status Interrupt command is issued."
+///
+/// > "Note that after the Reset External/Status Interrupt command is issued, if
+/// > the latches were closed, they will close again if there was an odd number
+/// > of transitions on the DCD pin; they will remain open if there was an even
+/// > number of transitions on the input pin."
+///
+/// So one extra transition inside a handler is one more interrupt after the
+/// acknowledgement, which is why a fast mouse does not lose counts on this
+/// chip. `tests/mac_plus.rs` counts it on the assembled board.
+#[test]
+fn a_transition_inside_the_handler_is_counted_after_the_reset() {
+    let scc = Scc::build();
+    arm(&scc, A);
+    scc.set_dcd(A, false);
+    assert!(scc.irq());
+    assert_eq!(scc.peek(A, false) & RR0_DCD, RR0_DCD, "the latched level");
+
+    // A second transition, with the first still unacknowledged. The pin is
+    // high again; `RR0` must still read what the latch caught, or the handler
+    // cannot tell which condition changed.
+    scc.set_dcd(A, true);
+    assert_eq!(
+        scc.peek(A, false) & RR0_DCD,
+        RR0_DCD,
+        "the latches are shut, so `RR0` still reports the level they caught"
+    );
+    assert!(scc.irq(), "and the chip is still asking");
+
+    // The handler acknowledges. One transition since the latches closed is an
+    // odd number, so they close again on the new level and the chip asks once
+    // more: the edge arrived late, not never.
+    scc.poke(A, false, 2 << 3);
+    assert!(
+        scc.irq(),
+        "an odd number of transitions re-closes the latches"
+    );
+    assert_eq!(
+        scc.peek(A, false) & RR0_DCD,
+        0,
+        "and `RR0` now reports the level the second transition left"
+    );
+
+    // The second acknowledgement finds pin and latch agreeing, so they stay
+    // open and the chip lets go.
+    scc.poke(A, false, 2 << 3);
+    assert!(!scc.irq());
+    let counters = scc.counters();
+    assert_eq!(counters.dcd_edges[A], 2, "two transitions arrived");
+    assert_eq!(
+        counters.ext_latches[A], 2,
+        "and each one closed the latches once — the second at the reset"
+    );
+    assert_eq!(counters.ext_resets[A], 2, "two acknowledgements");
+    assert_eq!(counters.int_assertions, 1, "`/INT` never let go in between");
+}
+
+/// An **even** number of transitions inside the handler is no further
+/// interrupt, because the pin is back where the latch caught it and the chip
+/// has nothing to report. *Am8530H/Am85C30* §3.8.6, quoted above: "they will
+/// remain open if there was an even number of transitions on the input pin."
+///
+/// This is a real loss of two counts, and it is the chip's — but it needs two
+/// transitions inside one service, which on this board takes a mouse moving
+/// some sixteen thousand counts a second.
+#[test]
+fn an_even_number_of_transitions_inside_the_handler_raises_nothing_more() {
+    let scc = Scc::build();
+    arm(&scc, B);
+    scc.set_dcd(B, false);
+    assert!(scc.irq());
+    scc.set_dcd(B, true);
+    scc.set_dcd(B, false);
+    assert_eq!(
+        scc.peek(B, false) & RR0_DCD,
+        RR0_DCD,
+        "the latched level, which is also where the pin ended up"
+    );
+    scc.poke(B, false, 2 << 3);
+    assert!(!scc.irq(), "an even number leaves the latches open");
+    let counters = scc.counters();
+    assert_eq!(counters.dcd_edges[1], 3);
+    assert_eq!(counters.ext_latches[1], 1, "one interrupt for three edges");
+}
+
+/// With `WR15`'s `DCD IE` clear the latch is out of the signal path, so `RR0`
+/// is the live pin and a transition raises nothing.
+///
+/// Zilog's *SCC/ESCC User Manual*: "If the individual enable is set to 0, then
+/// RR0 reflects the current unlatched status, and if the individual enable is
+/// set to 1, then RR0 reflects the latched status." And *Am8530H/Am85C30*
+/// §3.8: "An interrupt source whose individual enable bit in WR15 is set to
+/// '0' is not a source of External/Status interrupts even though the
+/// External/Status Master Interrupt Enable bit is set to '1' in WR1 (D0)."
+#[test]
+fn with_the_individual_enable_clear_rr0_is_the_live_pin() {
+    let scc = Scc::build();
+    arm(&scc, A);
+    scc.poke(A, false, 0x08 | 7); // point high, 7 -> WR15
+    scc.poke(A, false, 0); // no DCD IE
+    scc.set_dcd(A, false);
+    assert!(
+        !scc.irq(),
+        "not a source of interrupts with its enable clear"
+    );
+    assert_eq!(scc.peek(A, false) & RR0_DCD, RR0_DCD, "the current status");
+    scc.set_dcd(A, true);
+    assert_eq!(scc.peek(A, false) & RR0_DCD, 0, "which follows the pin");
+    assert_eq!(scc.counters().ext_latches[A], 0);
+}
+
 /// `WR9`'s Master Interrupt Enable gates the pin and nothing else: with it
 /// clear the pending bit still sets and `RR3` still shows it, but the chip
 /// does not ask.
