@@ -112,7 +112,11 @@ fn cmp_writes_carry_and_leaves_the_extend_of_an_addx_chain_alone() {
         // CMP.W D1,D0, CMP.L D1,D0, CMPI.W #$8000,D0, CMPA.W D1,A3
         agreed(&Case::seeded(one(&[0xb041])).with_ccr(ccr).with_units(2));
         agreed(&Case::seeded(one(&[0xb081])).with_ccr(ccr).with_units(2));
-        agreed(&Case::seeded(one(&[0x0c40, 0x8000])).with_ccr(ccr).with_units(2));
+        agreed(
+            &Case::seeded(one(&[0x0c40, 0x8000]))
+                .with_ccr(ccr)
+                .with_units(2),
+        );
         agreed(&Case::seeded(one(&[0xb6c1])).with_ccr(ccr).with_units(2));
     }
 }
@@ -204,11 +208,7 @@ fn every_static_shift_count_agrees_in_every_size() {
         let ty = kind >> 1;
         for count in 0..8u16 {
             for size in 0..3u16 {
-                let op = 0xe000
-                    | (count << 9)
-                    | (size << 6)
-                    | ((1 - right) << 8)
-                    | (ty << 3);
+                let op = 0xe000 | (count << 9) | (size << 6) | ((1 - right) << 8) | (ty << 3);
                 for ccr in [0u16, 0x1f, 0x10, 0x04] {
                     agreed(&Case::seeded(one(&[op])).with_ccr(ccr).with_units(2));
                 }
@@ -278,10 +278,26 @@ fn a_shift_by_a_register_count_falls_back_and_still_agrees() {
 fn the_bit_instructions_write_only_z() {
     for ccr in 0..32u16 {
         // BTST #3,D0 / BSET #17,D0 / BCLR #1,D0 / BCHG #31,D0
-        agreed(&Case::seeded(one(&[0x0800, 0x0003])).with_ccr(ccr).with_units(2));
-        agreed(&Case::seeded(one(&[0x08c0, 0x0011])).with_ccr(ccr).with_units(2));
-        agreed(&Case::seeded(one(&[0x0880, 0x0001])).with_ccr(ccr).with_units(2));
-        agreed(&Case::seeded(one(&[0x0840, 0x001f])).with_ccr(ccr).with_units(2));
+        agreed(
+            &Case::seeded(one(&[0x0800, 0x0003]))
+                .with_ccr(ccr)
+                .with_units(2),
+        );
+        agreed(
+            &Case::seeded(one(&[0x08c0, 0x0011]))
+                .with_ccr(ccr)
+                .with_units(2),
+        );
+        agreed(
+            &Case::seeded(one(&[0x0880, 0x0001]))
+                .with_ccr(ccr)
+                .with_units(2),
+        );
+        agreed(
+            &Case::seeded(one(&[0x0840, 0x001f]))
+                .with_ccr(ccr)
+                .with_units(2),
+        );
     }
     // and the memory forms, whose bit number is modulo 8.
     agreed(&Case::seeded(one(&[0x0812, 0x000b])).with_units(2));
@@ -371,7 +387,9 @@ fn an_access_the_space_refuses_faults_in_both_engines() {
     // end: the space has nothing mapped there and refuses.
     let case = Case::seeded(one(&[0xd055])).with_a(5, 0x0010_0000);
     agreed(&case.with_units(3));
-    let case = Case::seeded(one(&[0x3285])).with_a(1, DATA).with_a(5, 0x0010_0000);
+    let case = Case::seeded(one(&[0x3285]))
+        .with_a(1, DATA)
+        .with_a(5, 0x0010_0000);
     agreed(&case.with_units(3));
 }
 
@@ -429,9 +447,7 @@ fn dbcc_agrees_on_all_three_of_its_paths() {
             // DBcc Dn,-4 with the counter at each interesting value: the
             // condition true, the counter expired, and the loop taken.
             let program = vec![0x50c8 | (cc << 8), 0xfffc, STOP[0], STOP[1]];
-            let case = Case::seeded(program)
-                .with_d(0, count)
-                .with_units(6);
+            let case = Case::seeded(program).with_d(0, count).with_units(6);
             agreed(&case);
         }
     }
@@ -441,8 +457,16 @@ fn dbcc_agrees_on_all_three_of_its_paths() {
 fn scc_agrees_for_every_condition_in_both_destinations() {
     for cc in 0..16u16 {
         for ccr in 0..32u16 {
-            agreed(&Case::seeded(one(&[0x50c0 | (cc << 8)])).with_ccr(ccr).with_units(2));
-            agreed(&Case::seeded(one(&[0x50d2 | (cc << 8)])).with_ccr(ccr).with_units(2));
+            agreed(
+                &Case::seeded(one(&[0x50c0 | (cc << 8)]))
+                    .with_ccr(ccr)
+                    .with_units(2),
+            );
+            agreed(
+                &Case::seeded(one(&[0x50d2 | (cc << 8)]))
+                    .with_ccr(ccr)
+                    .with_units(2),
+            );
         }
     }
 }
@@ -544,7 +568,10 @@ fn movem_reads_one_word_past_the_end_and_it_can_fault() {
 #[test]
 fn movem_to_memory_falls_back_and_still_agrees() {
     // One store per register: declined for restartability.
-    assert!(!lifts(&[0x4892, 0x0001]), "MOVEM to memory must not be lifted");
+    assert!(
+        !lifts(&[0x4892, 0x0001]),
+        "MOVEM to memory must not be lifted"
+    );
     for mask in [0x0001u16, 0xffff, 0x00ff] {
         agreed(&Case::seeded(one(&[0x4892, mask])).with_units(2));
         agreed(&Case::seeded(one(&[0x48e2, mask])).with_units(2));
@@ -573,7 +600,7 @@ fn the_small_register_instructions_agree() {
         &[0x40c0],         // MOVE SR,D0
         &[0x40d2],         // MOVE SR,(A2)
         &[0x44c0],         // MOVE D0,CCR
-        &[0x44fc, 0x001f],  // MOVE #$1f,CCR
+        &[0x44fc, 0x001f], // MOVE #$1f,CCR
         &[0x003c, 0x0005], // ORI #5,CCR
         &[0x023c, 0x0010], // ANDI #$10,CCR
         &[0x0a3c, 0x000f], // EORI #$f,CCR
@@ -620,7 +647,10 @@ fn a_block_is_really_lifted_and_really_reused() {
     let program = vec![0x5340, 0xd041, 0x66fa, STOP[0], STOP[1]];
     let stats = stats_for(&Case::seeded(program.clone()).with_d(0, 3).with_units(12))
         .expect("the subject runs the translated engine");
-    assert!(stats.retired >= 6, "instructions must retire in blocks: {stats:?}");
+    assert!(
+        stats.retired >= 6,
+        "instructions must retire in blocks: {stats:?}"
+    );
     assert!(
         stats.executed > stats.lifted,
         "a block must be reused rather than lifted every time: {stats:?}"

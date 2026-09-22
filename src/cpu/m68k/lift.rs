@@ -41,7 +41,7 @@
 //!    silently mis-timing it.
 //! 4. **The core is not in a liftable state** — a pending reset, a pending
 //!    interrupt, `STOP`, a halt, an `RTE` replay in flight, or **T** set in
-//!    `SR`. Those are [`super::engine`]'s to check, not this file's.
+//!    `SR`. Those are `super::engine`'s to check, not this file's.
 //!
 //! # Ticks: what is static here and what the host charges
 //!
@@ -70,7 +70,7 @@
 //!
 //! The other three frontends in this tree — `cpu::riscv::lift`,
 //! `cpu::x86::lift`, `cpu::arm::a64::lift` — charge an instruction fetch and
-//! never make the access. This one makes it: [`Lifter::fetch`] emits an
+//! never make the access. This one makes it: `Lifter::fetch` emits an
 //! [`Opcode::LD`] with [`AccessKind::Fetch`] wherever `exec.rs` slides or
 //! refills the queue. Three reasons, and none of them is tidiness:
 //!
@@ -113,7 +113,7 @@
 //! boundaries cannot be expressed. [`Opcode::GET_SLOT`] says so in as many
 //! words: *"there is no `set_slot`"*.
 //!
-//! The answer here is not to approximate it. [`super::engine`] unwinds the
+//! The answer here is not to approximate it. `super::engine` unwinds the
 //! ticks the partial instruction charged — every one of them, the host's
 //! per-access four included — and hands that **one** guest instruction to the
 //! interpreter, which redoes it from its first word and faults where and how
@@ -143,11 +143,11 @@
 //! Every slot is 32 bits ([`Type::I32`]) — `SR` in its low sixteen — because
 //! every m68k register is, `A7` included, and because a write to an address
 //! register is 32 bits wide whatever the instruction's size says (M68000PRM
-//! §1.2, quoted at [`Lifter::write_a`]).
+//! §1.2, quoted at `Lifter::write_a`).
 //!
 //! **Only the condition codes of `SR` are ever written**, never **S**, **T**
 //! or the interrupt mask: the instructions that change those are outside the
-//! subset. [`super::engine`] merges back `flags::CCR` alone, so the stack
+//! subset. `super::engine` merges back `flags::CCR` alone, so the stack
 //! pointer bank cannot move under a lifted block.
 //!
 //! ## The X flag needs nothing from the IR that is not already there
@@ -203,10 +203,8 @@ use crate::ir::{
 };
 
 use super::disasm;
-use super::isa::{
-    Arg, Cond, Copro, Insn, Mode, Model, Op, Size, decode_with, ea_of,
-};
 use super::flags;
+use super::isa::{Arg, Cond, Copro, Insn, Mode, Model, Op, Size, decode_with, ea_of};
 
 // ---------------------------------------------------------------------------
 // The slot numbering
@@ -338,7 +336,7 @@ pub const MAX_INSNS: usize = 32;
 /// The address window a block is confined to.
 ///
 /// Not an MMU page — a 68000 has no MMU — but the same job in two directions:
-/// it is the unit [`super::engine`] invalidates a translation by when the
+/// it is the unit `super::engine` invalidates a translation by when the
 /// guest writes into it, and it bounds how far ahead of the guest the lifter
 /// reads. Four kilobytes because that is the granularity every other
 /// translation cache in this tree uses.
@@ -532,7 +530,11 @@ enum Plan {
     /// `NOP`.
     Nop,
     /// `Bcc`/`BRA` with an 8-bit or 16-bit displacement.
-    Branch { target: u32, always: bool, word: bool },
+    Branch {
+        target: u32,
+        always: bool,
+        word: bool,
+    },
     /// `DBcc`.
     Dbcc { target: u32 },
     /// `Scc`.
@@ -1257,7 +1259,9 @@ impl Lifter {
         let not_dm = self.b.unary(Opcode::NOT, Type::I1, dm);
         let both_pos = self.b.binary(Opcode::AND, Type::I1, not_sm, not_dm);
         let both_pos_neg = self.b.binary(Opcode::AND, Type::I1, both_pos, rm);
-        let overflow = self.b.binary(Opcode::OR, Type::I1, both_neg_pos, both_pos_neg);
+        let overflow = self
+            .b
+            .binary(Opcode::OR, Type::I1, both_neg_pos, both_pos_neg);
         (carry, overflow)
     }
 
@@ -1372,7 +1376,7 @@ impl Lifter {
     /// The restartability budget is **one store per guest instruction** and
     /// this is where it is spent, so this is where it is checked: an
     /// instruction that commits two of them cannot be handed back to the
-    /// interpreter after the first, and [`classify`] is supposed to have
+    /// interpreter after the first, and `classify` is supposed to have
     /// declined it. A debug build says which encoding got through rather than
     /// leaving `engine`'s host to discover it at run time.
     fn write_bus(&mut self, addr: Temp, value: Temp, size: Size) {
@@ -1776,7 +1780,8 @@ impl Lifter {
                 Flow::Continue
             }
             Plan::Lea => {
-                let Some(Loc::Mem(addr)) = self.resolve_ea(Arg::Ea, opcode, Size::Long, Extra::Control)
+                let Some(Loc::Mem(addr)) =
+                    self.resolve_ea(Arg::Ea, opcode, Size::Long, Extra::Control)
                 else {
                     return Flow::Rejected;
                 };
@@ -1856,8 +1861,7 @@ impl Lifter {
     // -- instruction bodies ---------------------------------------------
 
     fn op_move(&mut self, insn: Insn, opcode: u16, size: Size) -> Flow {
-        self.source_was_memory =
-            ea_of(insn.src, opcode).is_some_and(|(mode, _)| mode.is_memory());
+        self.source_was_memory = ea_of(insn.src, opcode).is_some_and(|(mode, _)| mode.is_memory());
         let Some(src) = self.resolve(insn.src, opcode, size) else {
             return Flow::Rejected;
         };
@@ -2353,9 +2357,7 @@ impl Lifter {
             // immediate: the bit number has to be reduced modulo the operand
             // size either way, and nothing else is happening" (`exec::op_bit`,
             // from MC68000UM Table 8-9).
-            if size == Size::Long
-                || matches!(ea_of(insn.dst, opcode), Some((Mode::Imm, _)))
-            {
+            if size == Size::Long || matches!(ea_of(insn.dst, opcode), Some((Mode::Imm, _))) {
                 self.internal(2);
             }
             self.settle();
@@ -2422,7 +2424,7 @@ impl Lifter {
     /// case cannot arise for a static count of at most eight, so the
     /// interpreter's `exhausted` rule is unreachable here and the shift by a
     /// register count — which is where it *does* arise — is declined by
-    /// [`classify`].
+    /// `classify`.
     fn shift(&mut self, op: Op, value: Temp, count: u32, size: Size) -> Temp {
         let sign = match size {
             Size::Byte => 7u32,
@@ -2573,7 +2575,8 @@ impl Lifter {
         let mut addr = if walking {
             self.read_a(reg)
         } else {
-            let Some(Loc::Mem(addr)) = self.resolve_ea(Arg::Ea, opcode, size, Extra::Operand) else {
+            let Some(Loc::Mem(addr)) = self.resolve_ea(Arg::Ea, opcode, size, Extra::Operand)
+            else {
                 return Flow::Rejected;
             };
             addr
@@ -2857,7 +2860,7 @@ impl Lifter {
         }
         // "Two extra cycles when the byte is set, which is the one place a
         // 68000's timing depends on a condition (MC68000UM Table 8-11)."
-        // [`classify`] only lets `ST` and `SF` reach here with a register
+        // `classify` only lets `ST` and `SF` reach here with a register
         // destination, so the condition is a decode constant and the charge
         // stays an immediate; every other condition into a register falls back
         // rather than guessing which of the two counts to emit.
@@ -2908,9 +2911,7 @@ impl Lifter {
                 let queued = self.words.get(1).copied().unwrap_or(0);
                 self.internal(2);
                 let base = pc.wrapping_add(2);
-                self.konst(
-                    base.wrapping_add(i32::from(queued as i16) as u32),
-                )
+                self.konst(base.wrapping_add(i32::from(queued as i16) as u32))
             }
             Mode::PcIndex8 => {
                 let queued = self.words.get(1).copied().unwrap_or(0);
@@ -3070,10 +3071,7 @@ mod tests {
         verify(&l.block).expect("the frontend produces well-formed blocks");
         assert_eq!(l.insns, 1);
         assert_eq!(l.stop, Stop::Unsupported);
-        assert_eq!(
-            l.block.insts().last().map(|i| i.op),
-            Some(Opcode::EXIT_TB)
-        );
+        assert_eq!(l.block.insts().last().map(|i| i.op), Some(Opcode::EXIT_TB));
     }
 
     #[test]
@@ -3480,4 +3478,3 @@ mod tests {
         assert_eq!(static_ticks(&l.block), static_ticks(&pruned));
     }
 }
-

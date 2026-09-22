@@ -10,7 +10,7 @@
 //!
 //! # The shape, in one paragraph
 //!
-//! One call to [`advance`] runs **one block, or one interpreted instruction**.
+//! One call to `advance` runs **one block, or one interpreted instruction**.
 //! A block is lifted once, cached under its entry PC, and executed by
 //! [`Interp`] — the portable backend, which runs anywhere the crate does,
 //! `no_std` and both wasm targets included. There is no host code generator
@@ -20,7 +20,7 @@
 //!
 //! # Four reasons a block does not run, and the interpreter picks it up
 //!
-//! 1. **The core is not in a liftable state** ([`liftable`]): a pending reset,
+//! 1. **The core is not in a liftable state** (`liftable`): a pending reset,
 //!    a halt, `STOP`, an `RTE` replay in flight, **T** set in `SR` (every
 //!    instruction would take a trace exception), an odd program counter, a
 //!    pending interrupt, or any model but a 68000.
@@ -38,7 +38,7 @@
 //! mid-instruction fault is visible in registers the instruction has already
 //! changed and in a stack frame whose program counter depends on how far the
 //! prefetch got, and the IR cannot publish a write that lands between two
-//! boundaries. So [`advance`] unwinds the partial instruction's charges —
+//! boundaries. So `advance` unwinds the partial instruction's charges —
 //! which is the reconciliation
 //! [`Fault`](crate::ir::Fault) documents for a core that restarts rather than
 //! resumes — and hands that one instruction to `Exec::step`, which redoes it
@@ -50,12 +50,12 @@
 //! measured from [`Interp`]'s own counter, which sees
 //! [`Opcode::CHARGE`](crate::ir::Opcode::CHARGE) immediates and **not** what a
 //! host charges inside an access. On a core where every bus cycle is four
-//! host-charged ticks that is most of the count. [`Finished::retired`] has the
+//! host-charged ticks that is most of the count. `Finished::retired` has the
 //! worked example.
 //!
 //! The lifted subset is chosen so that this is **exact**: no lifted
 //! instruction commits more than one store, and the store is its last memory
-//! access, so a fault can only arrive with nothing committed. [`Host::store`]
+//! access, so a fault can only arrive with nothing committed. `Host::store`
 //! asserts it in a debug build rather than trusting the frontend.
 //!
 //! # Self-modifying code
@@ -63,15 +63,15 @@
 //! A cached block is a translation of bytes, so it is only valid while those
 //! bytes are what they were. Two mechanisms, and neither is a heuristic:
 //!
-//! * **Validation on dispatch.** [`Entry::seen`] is every `(address, word)`
+//! * **Validation on dispatch.** `Entry::seen` is every `(address, word)`
 //!   pair the lifter read, and a cache hit re-reads them. A single mismatch
 //!   drops the entry and lifts again. That is O(the block's length) per
 //!   dispatch and it is the honest price of having no store log in
 //!   `Exec` — a host backend would replace it with one, and
 //!   `cpu::riscv::engine`'s `Host::note_writes` is what that looks like.
 //! * **Leaving the block.** Validation cannot help a store the *running*
-//!   block makes, so [`Host::store`] notices a store into the running block's
-//!   own [`lift::WINDOW`] and [`Host::spent`] then leaves at the next guest
+//!   block makes, so `Host::store` notices a store into the running block's
+//!   own [`lift::WINDOW`] and `Host::spent` then leaves at the next guest
 //!   instruction boundary — the boundary the store's own instruction ends at,
 //!   which is where the effect can first be honoured.
 //!
@@ -80,8 +80,8 @@
 //! prefetch queue* is not seen by the instruction that consumes it, and this
 //! frontend bakes extension words in as constants at lift time. Inside a
 //! block that is unreachable — the guard above ends the block at the store —
-//! so it needs a second bus master writing the code a block is running. See
-//! `docs/cpu/m68k-ir.md`.
+//! so it needs a second bus master writing the code a block is running.
+//! `docs/cpu/m68k.md`'s known-failures ledger is where it is written down.
 //!
 //! # Sources
 //!
@@ -216,7 +216,7 @@ fn liftable(state: &State, cfg: &Config, lines: &Lines) -> bool {
 /// block would be wrong — one interpreted instruction.
 ///
 /// `allowance` is what is left of the caller's tick budget, and it is an
-/// allowance rather than advice: [`Host::spent`] compares it against the ticks
+/// allowance rather than advice: `Host::spent` compares it against the ticks
 /// charged at every guest instruction boundary but a block's first, and a
 /// block that has spent it leaves *there* — at the same instruction an
 /// interpreted core would have stopped at, with the same `State::debt`. Pass
@@ -628,9 +628,7 @@ impl IrHost for Host<'_> {
         // rise, the store guard only latches, and an interrupt only becomes
         // pending. `interrupt_pending` is the non-consuming form on purpose —
         // see `Lines::interrupt_pending`.
-        self.used >= self.allowance
-            || self.smc
-            || self.lines.interrupt_pending(self.ipl_mask)
+        self.used >= self.allowance || self.smc || self.lines.interrupt_pending(self.ipl_mask)
     }
 }
 
@@ -705,7 +703,10 @@ mod tests {
             after.executed, before.executed,
             "no block may run with an interrupt pending: {after:?}"
         );
-        assert!(cpu.regs().sr & super::super::flags::IPL == 0x0500, "vectored");
+        assert!(
+            cpu.regs().sr & super::super::flags::IPL == 0x0500,
+            "vectored"
+        );
     }
 
     #[test]
@@ -759,7 +760,10 @@ mod tests {
         cpu.set_regs(regs);
         cpu.step();
         let after = cpu.ir_stats().expect("it ran").lifted;
-        assert!(after > before, "the cache was not thrown away: {before} {after}");
+        assert!(
+            after > before,
+            "the cache was not thrown away: {before} {after}"
+        );
     }
 
     #[test]

@@ -395,12 +395,18 @@ mod transcend;
 // for is how a translation path stays unmeasured for a year.
 #[cfg(feature = "cpu-m68k-lift")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
-pub mod lift;
+pub mod differential;
 #[cfg(feature = "cpu-m68k-lift")]
 mod engine;
+// The statistics a translated core keeps are reachable through
+// `M68k::ir_stats`, so the type has to be public even though the module is
+// not — the shape `cpu::riscv` uses for `JitStats`.
 #[cfg(feature = "cpu-m68k-lift")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
-pub mod differential;
+pub use engine::Stats as IrStats;
+#[cfg(feature = "cpu-m68k-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+pub mod lift;
 
 #[cfg(test)]
 mod tests;
@@ -1387,7 +1393,7 @@ impl Lines {
 /// Both are **indistinguishable to the guest** — same registers, same `SR`,
 /// same prefetch queue, same memory, same faults, same cycle counts, same
 /// scheduler debt — so this is a speed knob and never a semantic one. See
-/// [`engine`](self::engine) for what that costs to keep true.
+/// `engine` for what that costs to keep true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Engine {
     /// The interpreter, and the oracle everything else is measured against
@@ -1956,7 +1962,7 @@ impl M68k {
     #[cfg(feature = "cpu-m68k-lift")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
     #[must_use]
-    pub fn ir_stats(&self) -> Option<engine::Stats> {
+    pub fn ir_stats(&self) -> Option<IrStats> {
         self.session.lock().runtime.as_ref().map(|rt| rt.stats())
     }
 

@@ -56,7 +56,7 @@
 //! * **the cache**, including a block whose bytes the guest has rewritten.
 //!
 //! The unit of comparison is one call to [`M68k::step`], which on the subject
-//! is one *block*. [`engine::Stats::steps`] is what says how many interpreter
+//! is one *block*. [[`IrStats::steps`](super::IrStats::steps)] is what says how many interpreter
 //! steps that block was worth, so the oracle is stepped exactly that far and
 //! the two are compared with both standing at an instruction boundary.
 //!
@@ -79,7 +79,7 @@
 //!
 //! * **Interrupts and reset pulses**, which arrive from outside the machine
 //!   and are the record/replay seam's business rather than the frontend's. The
-//!   engine refuses to run a block while one is pending ([`engine`]'s
+//!   engine refuses to run a block while one is pending (`engine`'s
 //!   `liftable`), and `tests/` is where a board asserts that.
 //! * **Any model but a 68000**, because [`lift`] refuses one and
 //!   `from_props` refuses the configuration. A 68010 or 68020 with
@@ -96,7 +96,7 @@ use crate::core::space::{AddressSpace, RamStore, Region};
 use crate::core::value::Endian;
 
 use super::isa::Model;
-use super::{Config, Engine, M68k, engine, lift};
+use super::{Config, Engine, IrStats, M68k, lift};
 
 /// Where a case's exception vector table lives: address zero, because a 68000
 /// has no vector base register and cannot move it (MC68000UM §6.1).
@@ -589,18 +589,18 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u16> {
     // An effective-address field, biased towards the modes that reach memory
     // through one of those base registers.
     let ea: u16 = match (fields >> 8) & 15 {
-        0 => dm,                  // Dn
-        1 => 0x08 | dm,           // An
-        2 => 0x10 | base,         // (An)
-        3 => 0x18 | base,         // (An)+
-        4 => 0x20 | base,         // -(An)
-        5 => 0x28 | base,         // (d16,An)
-        6 => 0x30 | base,         // (d8,An,Xn)
-        7 => 0x38,                // (xxx).W
-        8 => 0x39,                // (xxx).L
-        9 => 0x3a,                // (d16,PC)
-        10 => 0x3b,               // (d8,PC,Xn)
-        11 => 0x3c,               // #imm
+        0 => dm,          // Dn
+        1 => 0x08 | dm,   // An
+        2 => 0x10 | base, // (An)
+        3 => 0x18 | base, // (An)+
+        4 => 0x20 | base, // -(An)
+        5 => 0x28 | base, // (d16,An)
+        6 => 0x30 | base, // (d8,An,Xn)
+        7 => 0x38,        // (xxx).W
+        8 => 0x39,        // (xxx).L
+        9 => 0x3a,        // (d16,PC)
+        10 => 0x3b,       // (d8,PC,Xn)
+        11 => 0x3c,       // #imm
         other => (other as u16) & 0x3f,
     };
     let size = ((fields >> 12) & 3) as u16;
@@ -651,9 +651,8 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u16> {
                 1 => 3,
                 _ => 2,
             };
-            let mut v = alloc::vec![
-                (szbits << 12) | ((dst_ea & 7) << 9) | ((dst_ea & 0x38) << 3) | ea
-            ];
+            let mut v =
+                alloc::vec![(szbits << 12) | ((dst_ea & 7) << 9) | ((dst_ea & 0x38) << 3) | ea];
             v.extend(ext(ea, size));
             v.extend(ext(dst_ea, size));
             v
@@ -746,7 +745,10 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u16> {
         42 => alloc::vec![0x6000 | ((((fields >> 16) & 15) as u16) << 8), disp << 1],
         // DBcc, Scc, LEA, JMP, MOVEM and RTS, rotated through by `fields`
         _ => match (fields >> 20) & 7 {
-            0 => alloc::vec![0x50c8 | ((((fields >> 16) & 15) as u16) << 8) | dn, disp << 1],
+            0 => alloc::vec![
+                0x50c8 | ((((fields >> 16) & 15) as u16) << 8) | dn,
+                disp << 1
+            ],
             1 => with_ea(0x50c0 | ((((fields >> 16) & 15) as u16) << 8) | ea, ea, 0),
             2 => with_ea(0x41c0 | (dn << 9) | ea, ea, 2),
             3 => with_ea(0x4ec0 | ea, ea, 2),
@@ -756,8 +758,8 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u16> {
                 v.extend(ext(ea, 1));
                 v
             }
-            5 => one(0x4e75), // RTS
-            6 => one(0x4e71), // NOP
+            5 => one(0x4e75),                 // RTS
+            6 => one(0x4e71),                 // NOP
             _ => with_ea(0x40c0 | ea, ea, 1), // MOVE from SR
         },
     }
@@ -816,7 +818,11 @@ impl Rng {
     /// has a fixed point there).
     #[must_use]
     pub fn new(seed: u64) -> Rng {
-        Rng(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+        Rng(if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        })
     }
 
     /// The next value.
@@ -883,7 +889,7 @@ pub fn lifts(program: &[u16]) -> bool {
 /// What a case's subject engine did, for a test that wants to assert the
 /// *shape* of a run rather than its agreement.
 #[must_use]
-pub fn stats_for(case: &Case) -> Option<engine::Stats> {
+pub fn stats_for(case: &Case) -> Option<IrStats> {
     let (space, _ram) = machine(case);
     let subject = core(case, space, Engine::Ir);
     for _ in 0..case.units {
