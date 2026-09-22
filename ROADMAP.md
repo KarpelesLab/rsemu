@@ -59,13 +59,17 @@ something a person can actually run (§2).
 > 32-bit instructions with no unexpected exception, stopping only where it waits
 > on a timer no machine has supplied yet.
 >
-> **Thirty-four machine files**: nineteen consoles, computers and
-> microcontrollers, and fifteen synthetic boards. `nes-ntsc` and
+> **Forty-six machine files**: thirty consoles, computers and
+> microcontrollers, and sixteen synthetic boards. `nes-ntsc` and
 > `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run
 > headlessly, with an empty known-failures ledger. Also `gameboy`; `apple1` and `beneater-6502`,
-> interactive over a terminal. **Seven boards now boot software this project did
-> not write, on three architectures** — `riscv-virt`, `arm64-virt`, `pc-at`,
-> `q35`, `pc64`, `q35-linux` and `q35-uefi` — and each has a page under
+> interactive over a terminal. **Seventeen boards now run software this project
+> did not write, on four architectures**, counting a board and its `-smp` twin
+> as the one board they are: ten 680x0 — eight Amigas on Kickstart and
+> Workbench, and the two compact Macintoshes on Apple's own ROM — five x86
+> (`pc-at`, `q35`, `pc64`, `q35-linux`, `q35-uefi`), plus `riscv-virt` and
+> `arm64-virt`. `README.md` has the breakdown and
+> `docs/README.md` the comparison table. Each has a page under
 > `docs/platforms/` that is a ledger of what is still in the way rather than a
 > success report. None of those boots is in CI: each needs a kernel or a
 > firmware image §1 forbids shipping, so each is behind an environment variable,

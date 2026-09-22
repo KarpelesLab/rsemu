@@ -131,10 +131,11 @@ FF00: D8 A2 FF 9A A9 7F 8D 12
 
 ### The boards that boot software this project did not write
 
-There are sixteen, on four architectures — counting a board and its
+There are seventeen, on four architectures — counting a board and its
 two-processor twin as one, which is what they are: an `-smp` file is the same
-board with a second `cpu` object and a table told about it. **Nine of the
-sixteen are 680x0** — eight Amigas and a Macintosh Plus — five are x86, and
+board with a second `cpu` object and a table told about it. **Ten of the
+seventeen are 680x0** — eight Amigas, a Macintosh Plus and a Macintosh
+Classic — five are x86, and
 RISC-V and AArch64 have one board each. **Four of those twins exist** —
 `riscv-virt-smp`, `arm64-virt-smp`, `q35-linux-smp` and `pc-at-smp` — and
 **three of them boot a real kernel onto both processors, with no accelerator**;
