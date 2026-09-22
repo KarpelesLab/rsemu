@@ -103,7 +103,8 @@ pub const DEFAULT_MOUSE_PORT: &str = "mouse";
 
 /// Ticks between quadrature transitions by default: 2 400, which at a 1 MHz
 /// clock is one every 2.4 ms and so one **count** every 4.8 ms — 208 counts a
-/// second on one axis, and half that on each of two ([`State::interval`]).
+/// second on one axis, and half that on each of two, because it is the
+/// *distance* that is capped rather than each axis (`State::interval`).
 ///
 /// The number is set by what Apple's ROM does with the counts rather than by
 /// what a hand can do, because the ROM applies **its own mouse scaling** and

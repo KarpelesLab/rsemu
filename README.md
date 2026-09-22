@@ -632,19 +632,24 @@ asking it for a key every quarter second, draws the **grey Macintosh desktop
 with the arrow cursor**, and puts the **blinking insert-disk icon** in the
 middle of it, with the 60.15 Hz tick chain running and nothing faulting — and
 from there it **polls the drive** six to eight times a second, which is the
-loop that notices a disk. Put an 800K image in and it starts the motor, takes
-two runs at reading it and puts it back out with the unreadable-disk cross. The
-drive reads: an image becomes cylinders of 6-and-2 GCR bit cells and the IWM
-shifts them past its head, which `src/dev/mac/iwm/tests.rs` checks through the
-chip. What it does **not** do yet is get a track off a disk with the ROM
-driving: after the motor starts the ROM reads the drive's tachometer in a tight
-loop for six virtual seconds, reads a trickle of data bytes rather than a
-track, and gives up. What that loop wants is ledger item 1.
-`docs/platforms/mac-plus.md` has the ledger and the black-box traces that got
-it this far — including the one that found the ROM drawing that icon through a
+loop that notices a disk. Put an 800K image in and it starts the motor, checks
+the spindle against the drive's tachometer, **reads cylinder 0 and decodes the
+two boot blocks off it** — Apple's own code finding them whole in memory is the
+independent proof that this encoder's 6-and-2 GCR is right — finds no system on
+them and puts the disk back out. `--record-audio` gets the **startup chime**,
+which is a pulse-width byte a scan line out of a buffer in main memory and not a
+sound chip at all, and `--vnc` gets a **mouse** whose pointer goes where it is
+put: two quadrature pulse trains an axis, X1 and Y1 on the SCC's carrier
+detects and X2 and Y2 on the VIA's port B. What it does **not** do is boot,
+and the only thing missing is Apple system software on an 800K image — ledger
+item 1. `docs/platforms/mac-plus.md` has the ledger and the black-box traces
+that got it this far: the one that found the ROM drawing that icon through a
 pointer near the top of the four-megabyte window, which is how it was settled
-that main memory *repeats*, and the clock chip's whole undocumented command
-encoding read off the wire — and why a Plus cannot read a 1.44 MB disk whatever
+that main memory *repeats*; the clock chip's whole undocumented command
+encoding read off the wire; the spindle speed measured by sweeping it until the
+ROM accepted a disk; the word at the level-3 autovector that proves the board
+priority-encodes its two interrupts, which the first mouse to move found by
+livelocking the machine; and why a Plus cannot read a 1.44 MB disk whatever
 else is built.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
