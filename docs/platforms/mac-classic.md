@@ -634,7 +634,33 @@ RSEMU_MAC_FRAME_DIR=/tmp/frames \
 ```
 
 `RSEMU_MAC_TRACE=1` prints the processor's state once a virtual second, which is
-how to find where a ROM stopped. **Three of the nine tests need nothing of
+how to find where a ROM stopped. **Three of the eleven tests need nothing of
 anybody's**: they assemble the board around rsemu's own ten-byte stub and around
 a 1.44 MB image of numbered blocks built on the spot, and they are what `cargo
 test` runs in CI.
+
+### The instrument
+
+`trace_the_controller` is `#[ignore]`d because it asserts nothing; it is the
+tool the three measurements above came out of, and it has four knobs:
+
+```sh
+RSEMU_MAC_DISK_KIND=real|1440k|800k|none   # what is in the drive; 1440k is the default
+RSEMU_MAC_SECONDS=120                      # how long to run; 12 by default
+RSEMU_MAC_DRIVES=2                         # an external drive on the cable as well
+RSEMU_MAC_UNFOLDED=1                       # every access, not runs collapsed with a count
+
+RSEMU_MAC_ROM_DIR=… RSEMU_MAC_DISK_DIR=… RSEMU_MAC_DISK_KIND=real \
+  cargo test --release --all-features --test mac_classic \
+    trace_the_controller -- --ignored --nocapture
+```
+
+It prints the controller's whole conversation with each access **named** —
+which register set answered, which ISM register, and which of the mechanism's
+sixteen status lines the phase lines and `SEL` were addressing — then the
+busiest memory addresses of the last virtual second, which is how to tell a
+processor waiting on something from one that has decided to stop. Swapping
+`RSEMU_MAC_DISK_KIND` between `800k` and `1440k` is the differential that found
+the SuperDrive's status line: the two traces were **identical for 239
+accesses** while the ROM refused to touch the drive, which is what said the
+medium was not what it was deciding on.
