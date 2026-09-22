@@ -214,6 +214,10 @@ fn board_with_disk(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Bo
     // unbound, so a machine with an empty drive binds zero bytes for it —
     // which is what the CLI's own empty-bay pass does.
     options.realize.media.insert("floppy", disk);
+    // And the SCSI cable, the same way: no bytes at `hd0` is an address nobody
+    // answers at, which is a Plus with nothing plugged into the port on the
+    // back. `tests/mac_plus_scsi.rs` is the file that puts a disk there.
+    options.realize.media.insert("hd0", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let source = catalog::machine("mac-plus")
         .expect("this build ships mac-plus")
@@ -670,6 +674,7 @@ fn a_1440k_image_is_refused_when_the_board_is_built() {
     });
     options.realize.media.insert("macrom", image);
     options.realize.media.insert("floppy", vec![0u8; 1_474_560]);
+    options.realize.media.insert("hd0", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let source = catalog::machine("mac-plus")
         .expect("this build ships mac-plus")

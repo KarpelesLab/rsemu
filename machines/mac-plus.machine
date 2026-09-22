@@ -1,10 +1,11 @@
 # mac-plus - a Macintosh Plus (1986): the map, the VIA, the video, the SCC,
-# the clock chip, the keyboard and the disk.
+# the clock chip, the keyboard, the disk and SCSI.
 #
 #   rsemu run mac-plus --media macrom=Mac-Plus.ROM
 #   rsemu run mac-plus -p ram=4M --media macrom=Mac-Plus.ROM
 #   rsemu run mac-plus --media macrom=Mac-Plus.ROM --vnc :5900
 #   rsemu run mac-plus --media macrom=Mac-Plus.ROM --floppy System-Startup.dsk
+#   rsemu run mac-plus --media macrom=Mac-Plus.ROM --media hd0=disk.img
 #
 # The ROM chimes, sizes memory, runs its memory test, initialises the SCC and
 # the IWM, reads the clock chip and writes its parameter RAM back, finishes the
@@ -48,7 +49,7 @@
 #
 #   $00 0000 - $3F FFFF   memory, repeating - or the ROM while the overlay is up
 #   $40 0000 - $4F FFFF   ROM, repeating every 128 KiB
-#   $58 0000 - $5F FFFF   SCSI (an NCR 5380) - not modelled; floats
+#   $58 0000 - $5F FFFF   SCSI: an NCR 5380, register selects on A6-A4
 #   $60 0000 - $7F FFFF   memory while the overlay is up; nothing afterwards
 #   $80 0000 - $9F FFFF   the SCC, read
 #   $A0 0000 - $BF FFFF   the SCC, written
@@ -79,7 +80,6 @@
 # ---------------------------------------------------------------------------
 #
 # $50 0000 - $57 FFFF   nothing
-# $58 0000 - $5F FFFF   the SCSI controller, which this build has no model of
 # $F0 0000 - $FF FFFF   the phase-read space
 #
 # An access to any of them **completes and floats**: the space's `unassigned`
@@ -278,6 +278,52 @@ machine "mac-plus" {
   # pin for the chip and decodes the direction from the address instead.
   object scc "mac.scc" { }
 
+  # -- SCSI ------------------------------------------------------------------
+  #
+  # "The Macintosh Plus and later Macintosh computers include a 5380 or 53C80
+  # Small Computer System Interface (SCSI) controller" - *Guide to the
+  # Macintosh Family Hardware*, chapter 2 - and the Plus was the first, with
+  # one external DB-25 connector and no terminator power on it.
+  #
+  # Two objects, and the **drive is declared first** for the reason
+  # `amiga-a3000.machine` gives: `Machine::reset` runs devices in declaration
+  # order, and the controller's reset lets go of the cable, which the targets
+  # must already be there to hear.
+  #
+  # `image` names a media slot, so `--media hd0=disk.img` fits a disk and an
+  # unbound slot is an empty cable - which is the ordinary case, and is what
+  # `rsemu run mac-plus` alone gets. **Nothing on this board can make a
+  # bootable disk yet**: the tool that writes HFS cannot write a resource fork,
+  # so a volume it produces has no boot blocks (`docs/upstream/
+  # fstool-hfs-resource-fork-write.md`). What a disk here *is* good for is the
+  # SCSI Manager finding it: INQUIRY, TEST UNIT READY, READ CAPACITY and
+  # READ(6)/READ(10) all answer.
+  #
+  # `id = 0` is where Apple's own drives shipped - "the ID of the internal SCSI
+  # device, if one is installed, is always 0" (chapter 11) - and the initiator
+  # is 7: "The main logic board has ID number 7, giving it the highest priority
+  # in case of contention for the bus with another initiator" (chapter 2).
+  object hd0 "scsi.disk" {
+    image    = "hd0"
+    bus      = "scsi0"
+    id       = 0
+    vendor   = "RSEMU"
+    product  = "SCSI HARDDISK"
+    revision = "1.0"
+  }
+
+  # The chip. `stride` is how this board wired the 5380's three register-select
+  # lines, and the number is **measured**: a real ROM writes `$580011` and then
+  # `$580021`, which are the Initiator Command and Mode registers if and only if
+  # the selects are on A6-A4 with a write at an odd address. The Guide has no
+  # table of these addresses - its chapter 11 is connector pinouts and circuit
+  # diagrams, and the earlier claim that chapter 9 carried the disk drive's
+  # register file is exactly the mistake not to repeat
+  # (`docs/platforms/mac-plus.md`). There is no /DACK address for the same
+  # reason: nothing says where one would be, and Apple's own SCSI Manager does
+  # its pseudo-DMA through the data register at `$580000`, which is measured.
+  object scsi "ncr.5380" { bus = "scsi0", id = 7, stride = 16 }
+
   # -- the memory map --------------------------------------------------------
   #
   # RAM is *not* mapped directly. It is reached through `glue.low`, which
@@ -305,6 +351,12 @@ machine "mac-plus" {
   # The same decode for the IWM, over the two megabytes its own select covers.
   # $DFE1FF is switch 0 of the copy at $DFE000.
   map mem 0xC00000 size 0x200000 = mirror(iwm) { endian = "big" }
+
+  # The 5380. Four address lines reach it - A6-A4 for the register select and A0
+  # for the direction the software means - so its window is 128 bytes and
+  # repeats 4,096 times through the half-megabyte its chip select decodes.
+  # $580000 is the bottom copy, which is where a ROM addresses it.
+  map mem 0x580000 size 0x80000 = mirror(scsi) { endian = "big" }
 
   # -- wiring ----------------------------------------------------------------
   #
@@ -334,6 +386,17 @@ machine "mac-plus" {
   wire scc.irq   -> glue.scc_irq
   wire glue.ipl0 -> cpu.ipl0
   wire glue.ipl1 -> cpu.ipl1
+
+  # **The 5380's two interrupt outputs are deliberately not wired**, because on
+  # this board they are not connected to anything: "Although the Macintosh Plus
+  # contains an NCR 5380 SCSI controller IC, the IRQ and DRQ interrupt signals
+  # provided by that IC do not generate MC68000 interrupts in the Macintosh
+  # Plus. Software must poll the SCSI controller's Bus and Status register to
+  # determine whether a SCSI interrupt is pending" - the Guide, chapter 3 - and
+  # Figure 11-4 draws all three of DRQ, IRQ and RDY as `n.c.`. Every later
+  # Macintosh takes the IRQ line to a VIA; this one has nowhere to put it, and
+  # a `wire` here would be an invention. `dev-ncr5380` still has the pin, for
+  # the boards that do.
 
   # The video circuit's two blanking signals. Vertical blanking is the VIA's
   # CA1 and is the 60.15 Hz interrupt the whole Macintosh tick chain hangs off;

@@ -56,6 +56,10 @@ fn build(params: &[(&str, &str)]) -> (Machine, Arc<M68k>) {
     // and unbound, so a machine with nothing in the drive binds zero bytes for
     // it — which is what `rsemu run` does when nobody says `--floppy`.
     options.realize.media.insert("floppy", Vec::new());
+    // And the SCSI cable at address 0, empty for the same reason: no bytes is
+    // an address nobody answers at, which is a Plus with nothing plugged into
+    // the port on the back.
+    options.realize.media.insert("hd0", Vec::new());
     let registry = catalog::registry().expect("a registry");
     let source = catalog::machine("mac-plus")
         .expect("this build ships mac-plus")
