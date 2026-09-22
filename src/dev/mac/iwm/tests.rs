@@ -764,15 +764,22 @@ fn the_write_handshake_reports_room_and_underrun() {
     // read as '1's."
     assert_eq!(handshake(&iwm) & 0x3f, 0x3f);
 
-    // Fill it. Two bytes fit; the third is dropped, which page 12 says is
-    // harmless.
+    // Fill it. **The processor's two**: the handshake stops inviting bytes
+    // after them, which is what a processor paces itself on, and the two slots
+    // behind are the chip's own — they exist so that a write to the ISM's CRC
+    // register, which is one register write and *two* bytes on the medium,
+    // always fits. See `WRITE_DEPTH`.
     assert!(iwm.push_write(0xff, WriteKind::Data));
     assert!(iwm.push_write(0xff, WriteKind::Data));
-    assert!(
-        !iwm.push_write(0xff, WriteKind::Data),
-        "the buffer holds two"
+    assert_eq!(
+        handshake(&iwm) & HANDSHAKE_READY,
+        0,
+        "the processor is told there is no room after two"
     );
-    assert_eq!(handshake(&iwm) & HANDSHAKE_READY, 0, "no room");
+    assert!(
+        iwm.push_write(0, WriteKind::CrcHigh) && iwm.push_write(0, WriteKind::CrcLow),
+        "and the chip's own CRC pair still fits behind them"
+    );
 
     // Let the head run past both of them and on into nothing.
     iwm.advance_to(iwm.ticks() + 64);

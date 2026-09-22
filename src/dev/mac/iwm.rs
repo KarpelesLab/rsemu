@@ -161,7 +161,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.iwm";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 5;
+pub const STATE_VERSION: u32 = 6;
 
 /// How many bytes of address space the sixteen switches occupy: the board puts
 /// the register selects on A9-A12, so `16 * 512`.
@@ -407,6 +407,30 @@ impl Framer {
 /// answers as well as a buffer of one does.
 pub const WRITE_FIFO: usize = 2;
 
+/// How many bytes the buffer actually holds.
+///
+/// **Two more than the processor is told about**, and the two are the chip's
+/// own CRC. A write to the ISM's Write CRC register is *one* register write
+/// that puts **two** bytes on the medium — the generator's halves — and the
+/// processor paces itself off a handshake register that counts a two-byte
+/// FIFO (page 25: "In write mode, it indicates that 2 bytes can be written to
+/// the FIFO"). So a processor that has filled the FIFO exactly as it was
+/// invited to, and then asks for the CRC, is asking for two bytes there is no
+/// room for.
+///
+/// That is not a hypothetical. It is what a Macintosh does on every field of
+/// every sector it formats, and with a two-deep buffer the second CRC byte was
+/// dropped: the field went onto the medium **one byte short**, the decoder
+/// read the first CRC byte and then the gap byte behind it, and every ID field
+/// on the track failed its check with a stored CRC ending in `$4E`. The marks
+/// were all there — 114 of them — and not one sector came back.
+///
+/// So the two halves of the generator are staged behind the FIFO the processor
+/// counts. [`Writer::space`] still reports [`WRITE_FIFO`], which is what the
+/// handshake register must say; these two slots are the chip's, not the
+/// processor's, and nothing the processor does can consume them.
+const WRITE_DEPTH: usize = WRITE_FIFO + 2;
+
 /// The write side of the head: the bytes the processor has handed over and the
 /// cells they become on the way to the medium.
 ///
@@ -472,11 +496,11 @@ struct Writer {
     mfm: bool,
     /// The bytes the processor has handed over and the head has not reached,
     /// oldest first.
-    fifo: [u8; WRITE_FIFO],
+    fifo: [u8; WRITE_DEPTH],
     /// What each of them is, which is not always the same as its value: a CRC
     /// byte is whatever the generator holds when the head **reaches** it, not
     /// when the processor asked for it.
-    kinds: [WriteKind; WRITE_FIFO],
+    kinds: [WriteKind; WRITE_DEPTH],
     /// How many of `fifo` are live.
     count: u8,
     /// The cells of the byte being laid down, the next one in bit `bits - 1`.
@@ -583,16 +607,17 @@ impl Writer {
         self.underruns = underruns;
     }
 
-    /// How many slots are free.
+    /// How many slots the *processor* has free, which is what the handshake
+    /// register reports. The chip's own two are not its to spend.
     fn space(&self) -> u8 {
-        WRITE_FIFO as u8 - self.count
+        (WRITE_FIFO as u8).saturating_sub(self.count)
     }
 
     /// Hand a byte over. `false` if there was no room, which page 12 says is
     /// harmless: "Writing to the chip faster than this won't hurt anything".
     fn push(&mut self, byte: u8, kind: WriteKind) -> bool {
         let slot = usize::from(self.count);
-        if slot >= WRITE_FIFO {
+        if slot >= WRITE_DEPTH {
             return false;
         }
         self.fifo[slot] = byte;
@@ -1179,6 +1204,12 @@ pub struct WriteTally {
 struct Media {
     /// What the write path has done, per cable position. An instrument.
     tally: WriteTally,
+    /// The cells of the last cylinder a flush could make nothing of, and the
+    /// drive, cylinder, side and cell count it came from.
+    unabsorbed: Track,
+    unabsorbed_at: (u8, u8, bool, u64),
+    /// Cells the head has written into `bits` since the last flush.
+    dirty_cells: u64,
     disks: [Option<Disk>; 2],
     /// Which mechanism, cylinder and side `bits` holds, or `None` when nothing
     /// has been built.
@@ -1211,7 +1242,18 @@ impl Media {
         };
         if let Some(disk) = self.disks[which].as_mut() {
             self.tally.flushes[which] += 1;
-            self.tally.taken[which] += disk.absorb(track, side, &self.bits) as u64;
+            let took = disk.absorb(track, side, &self.bits) as u64;
+            self.tally.taken[which] += took;
+            if took == 0 && self.dirty_cells > 0 {
+                // Keep the cells a flush could make nothing of, and only when
+                // the head had actually written some. They are the only
+                // evidence of *what was laid down*: once the cache is rebuilt
+                // they are gone, which is why a write that goes wrong has been
+                // so hard to see.
+                self.unabsorbed = self.bits.clone();
+                self.unabsorbed_at = (which as u8, track, side, self.dirty_cells);
+            }
+            self.dirty_cells = 0;
         }
     }
 }
@@ -1302,6 +1344,7 @@ impl Shared {
                     media.bits.set_bit(bit as usize, line);
                     media.dirty = true;
                     media.tally.cells[which] += 1;
+                    media.dirty_cells += 1;
                 }
             } else {
                 line = media.bits.bit(bit as usize);
@@ -1837,6 +1880,23 @@ impl Iwm {
         self.shared.media.lock().tally
     }
 
+    /// The cells of the last cylinder a flush could make nothing of.
+    ///
+    /// An instrument, and the one that ends an argument: a write that laid the
+    /// right number of cells down and decoded as nothing leaves no other trace,
+    /// because the cache is rebuilt from the image the moment the head moves.
+    #[must_use]
+    pub fn last_unabsorbed(&self) -> Track {
+        self.shared.media.lock().unabsorbed.clone()
+    }
+
+    /// Which mechanism, cylinder and side those cells came from, and how many
+    /// of them the head had written.
+    #[must_use]
+    pub fn last_unabsorbed_at(&self) -> (u8, u8, bool, u64) {
+        self.shared.media.lock().unabsorbed_at
+    }
+
     /// The cells of the cylinder under the head, as they stand.
     ///
     /// Derived state, and an instrument: a test that has just written a track
@@ -2315,13 +2375,13 @@ impl Device for Iwm {
         next.mode_writes = r.read_u32()?;
         next.writer.on = r.read_bool()?;
         next.writer.mfm = r.read_bool()?;
-        for slot in 0..WRITE_FIFO {
+        for slot in 0..WRITE_DEPTH {
             next.writer.fifo[slot] = r.read_u8()?;
         }
-        for slot in 0..WRITE_FIFO {
+        for slot in 0..WRITE_DEPTH {
             next.writer.kinds[slot] = WriteKind::from_byte(r.read_u8()?);
         }
-        next.writer.count = r.read_u8()?.min(WRITE_FIFO as u8);
+        next.writer.count = r.read_u8()?.min(WRITE_DEPTH as u8);
         next.writer.cells = r.read_u16()?;
         next.writer.bits = r.read_u8()?.min(MFM_CELLS_PER_BYTE);
         next.writer.prev = r.read_bool()?;

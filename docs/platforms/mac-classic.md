@@ -684,26 +684,51 @@ than out of a book —
 in the image. It does: 194,400 cells, eighteen sectors, nothing bad. **The
 write path can format a track.**
 
-**And the machine still cannot**, which is where this stops. With the fixes in,
-a real Macintosh initializing a blank in its external drive:
+**A fourth defect was between that and the machine, and the diff is what found
+it.** `Iwm::last_unabsorbed` keeps the cells of a flush that could make nothing
+of them — the only evidence of what the head actually laid down, since the
+cache is rebuilt from the image the moment the head moves — and
+`a_blank_disk_in_the_second_drive` compares them with what this project's own
+encoder makes of the same track. That diff answers in one run whether a
+divergence is a shift, an inversion, a doubling or a different value.
 
-| | |
-| --- | --- |
-| cells the head laid on drive 2's medium | **194,625** of a 200,000-cell track |
-| underruns over the whole format | **0** |
-| the ISM's ERROR register | `$00` throughout |
-| the head's cylinder at the flush | **0**, which is what the ID fields say |
-| cylinders put back into the image | 1 |
-| sectors that came out of it | **0** |
+It was none of them. The cells were **right**: 114 `$A1` marks at every
+alignment, 9,217 `$F6`, 2,329 `$4E`, 5,254 `$00` syncs — a proper IBM track. The
+decoder rejected all nineteen fields it found, every one `Bad::Id`, and every
+stored CRC ended in **`$4E`**. The gap byte. The field was **one byte short**:
+the decoder read the first CRC byte and then the gap behind it.
 
-So the cells reach the medium, the chip reports nothing wrong, the head and the
-guest agree about where they are — and `mfm::decode_track` finds **no field at
-all** in what was laid down, where the same decoder finds all eighteen in the
-hermetic track. The cells on the medium are not the cells the guest handed
-over, and the next step is to say how they differ: `Iwm::cylinder_cells` hands
-a test the cylinder as it stands, so that comparison is now an offline one that
-needs no ROM. A 1.44 MB blank fails identically, which still rules out the
-media-density guess.
+**A write to the ISM's CRC register is one register write and two bytes on the
+medium**, and the processor paces itself off a handshake register that counts a
+*two*-byte FIFO (page 25: "In write mode, it indicates that 2 bytes can be
+written to the FIFO"). So a processor that has filled the FIFO exactly as it
+was invited to, and then asks for the CRC, is asking for two bytes there is no
+room for — and the second was dropped on every field of every sector. The two
+halves of the generator are now staged **behind** the FIFO the processor
+counts; `Writer::space` still reports two, which is what the handshake register
+must say, and nothing the processor does can consume the chip's own pair.
+
+With that, a Macintosh initializing a blank in its external drive goes from one
+track and nothing absorbed to **178 cylinders flushed and 3,126 sectors taken**
+— more than a whole disk's worth — with no underrun and the ERROR register
+`$00` throughout.
+
+**It still says "Initialization failed!"**, now at cylinder 40 rather than
+after one track, and that is where this pass stops. Two things about it are
+worth writing down rather than guessing at.
+
+* The failure is now *late* — after the medium has been written — so it is a
+  different question from the four above, most likely the verify pass or the
+  volume the Macintosh writes after the format.
+* **The route needs more than this even when it succeeds.** A SuperDrive with
+  nothing on the cable to say what medium is in it gets formatted as **1.44 MB
+  MFM**: the ROM never writes the Setup register for drive 2, so bit 2 stays
+  clear ("Setting the bit selects GCR mode; clearing it selects the normal
+  operating mode", page 22) and so does bit 6 ("This bit must be set for GCR
+  operation"). A Macintosh Plus cannot read what comes out. So an 800K disk
+  authored this way wants the density line the drive register file has never
+  had — the unassigned `CA2:CA1:CA0 = 101` with `SEL` low is where it would
+  sit, and that is still not established.
 
 ## The ledger: what to build next, in the order it is likely to matter
 

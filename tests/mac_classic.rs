@@ -1641,6 +1641,47 @@ fn a_blank_disk_in_the_second_drive() {
         "mac-classic: drive 2's disk has {}been written",
         if after.written() { "" } else { "not " }
     );
+
+    // **The diff**, which is the instrument that ended the argument: what the
+    // head actually laid down, against what this project's own encoder makes
+    // of the same logical track. It answers in one run whether a divergence is
+    // a shift, an inversion, a doubling or a different value — and the first
+    // time it was asked it said none of those: the cells were right, the marks
+    // were all there, and every ID field failed its CRC with a stored value
+    // ending in the gap byte, because the field was one byte short.
+    let bad = b.swim.iwm().last_unabsorbed();
+    if !bad.is_empty() {
+        let (found, why) = mfm::decode_track(&bad);
+        let (which, cyl, side, written) = b.swim.iwm().last_unabsorbed_at();
+        println!(
+            "mac-classic: the last cylinder a flush made nothing of: drive {} cylinder {cyl} \
+             side {side}, {written} cells written by the head; the decoder makes {} sectors of \
+             it and rejects {}: {:?}",
+            which + 1,
+            found.len(),
+            why.len(),
+            &why[..why.len().min(4)]
+        );
+        // At **every** alignment, which is how a mark search has to look: it
+        // has no byte boundary to align to.
+        let count = |want: u16| -> usize {
+            let mut w = 0u16;
+            let mut n = 0;
+            for i in 0..bad.len() + 16 {
+                w = (w << 1) | u16::from(bad.bit(i));
+                if i >= 15 && w == want {
+                    n += 1;
+                }
+            }
+            n
+        };
+        println!(
+            "             it carries {} of the $a1 mark, {} of $4e and {} of the $00 sync",
+            count(mfm::sync_cells(0xa1)),
+            count(mfm::cells(0x4e, false, None)),
+            count(mfm::cells(0x00, false, None)),
+        );
+    }
 }
 
 /// A trace instrument: what the VIA's Apple Desktop Bus registers do once the
