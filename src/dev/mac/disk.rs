@@ -59,7 +59,31 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::gcr::{self, DATA_BYTES, MAX_TRACK, Sector, TAG_BYTES, TRACKS, Track};
+use super::mfm;
 use crate::core::error::{Error, Result};
+
+/// How the bits on a disk are written, which decides which controller can read
+/// it and how fast the spindle turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Density {
+    /// Apple's zoned 6-and-2 GCR: a 400K or an 800K disk, five speed zones,
+    /// 500 kHz cells. An IWM and a SWIM can both read one ([`super::gcr`]).
+    Gcr,
+    /// IBM MFM at 500 kbit/s: a 1.44 MB disk, 300 rpm on every cylinder,
+    /// 1 MHz cells. **Only a SWIM** ([`super::mfm`]).
+    Mfm,
+}
+
+/// Which controller is asking for an image, because that is what decides
+/// whether a 1.44 MB one can be read at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// A Macintosh Plus's IWM and its 800K double-density mechanism. A 1.44 MB
+    /// image is refused **by name** — see the module docs.
+    Iwm,
+    /// A Macintosh Classic's SWIM and its SuperDrive, which reads all three.
+    Swim,
+}
 
 /// How long a DiskCopy 4.2 header is.
 pub const DC42_HEADER: usize = 84;
@@ -85,6 +109,8 @@ pub const BYTES_1440K: usize = 1_474_560;
 /// A disk in a drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Disk {
+    /// How its bits are written.
+    density: Density,
     /// One side or two.
     sides: u8,
     /// The address field's format byte: [`gcr::FORMAT_800K`] or
@@ -110,9 +136,23 @@ impl Disk {
     /// a size or a format this drive cannot take — a 1.44 MB image most of all,
     /// for the reason in the module docs.
     pub fn from_image(bytes: &[u8]) -> Result<Disk> {
+        Disk::from_image_for(bytes, Reader::Iwm)
+    }
+
+    /// The same, for a controller that says which it is.
+    ///
+    /// [`Reader::Swim`] is what lets a **1.44 MB** image through, and nothing
+    /// else does: the refusal [`Reader::Iwm`] gets is a fact about a Macintosh
+    /// Plus's hardware rather than a limitation of this model, and turning it
+    /// into a silent success would be worse than the error.
+    ///
+    /// # Errors
+    ///
+    /// As [`Disk::from_image`].
+    pub fn from_image_for(bytes: &[u8], reader: Reader) -> Result<Disk> {
         match Dc42::parse(bytes)? {
-            Some(dc42) => Disk::from_dc42(bytes, &dc42),
-            None => Disk::from_raw(bytes),
+            Some(dc42) => Disk::from_dc42(bytes, &dc42, reader),
+            None => Disk::from_raw(bytes, reader),
         }
     }
 
@@ -132,10 +172,15 @@ impl Disk {
         )
     }
 
-    fn from_dc42(bytes: &[u8], dc42: &Dc42) -> Result<Disk> {
+    fn from_dc42(bytes: &[u8], dc42: &Dc42, reader: Reader) -> Result<Disk> {
         let sides = match dc42.disk_format {
             DISK_FORMAT_400K => 1,
             DISK_FORMAT_800K => 2,
+            DISK_FORMAT_1440K if reader == Reader::Swim => {
+                let start = DC42_HEADER;
+                let data = &bytes[start..start + dc42.data_size as usize];
+                return Disk::build_mfm(data, dc42.name.clone());
+            }
             DISK_FORMAT_1440K => {
                 return Err(Disk::refuse(
                     &format!(
@@ -169,10 +214,13 @@ impl Disk {
         Disk::build(sides, data, tags, dc42.name.clone())
     }
 
-    fn from_raw(bytes: &[u8]) -> Result<Disk> {
+    fn from_raw(bytes: &[u8], reader: Reader) -> Result<Disk> {
         let sides = match bytes.len() {
             BYTES_400K => 1,
             BYTES_800K => 2,
+            BYTES_1440K if reader == Reader::Swim => {
+                return Disk::build_mfm(bytes, String::new());
+            }
             BYTES_1440K => {
                 return Err(Disk::refuse(
                     "this image is 1,474,560 bytes, which is a 1.44 MB disk",
@@ -188,6 +236,33 @@ impl Disk {
             }
         };
         Disk::build(sides, bytes, &[], String::new())
+    }
+
+    /// A 1.44 MB disk: two sides, eighteen sectors a track, MFM.
+    ///
+    /// There are no tags: the twelve bytes an Apple GCR sector carries beside
+    /// its data have nowhere to live in an IBM sector, which is exactly why a
+    /// DiskCopy container of one has `tagSize = 0`.
+    fn build_mfm(data: &[u8], name: String) -> Result<Disk> {
+        if data.len() != mfm::BYTES {
+            return Err(Disk::refuse(
+                &format!(
+                    "the data fork is {} bytes and a 1.44 MB disk holds {}",
+                    data.len(),
+                    mfm::BYTES
+                ),
+                "the header and the file disagree",
+            ));
+        }
+        Ok(Disk {
+            density: Density::Mfm,
+            sides: 2,
+            format: gcr::FORMAT_800K,
+            data: data.to_vec(),
+            tags: Vec::new(),
+            write_protect: false,
+            name,
+        })
     }
 
     fn build(sides: u8, data: &[u8], tags: &[u8], name: String) -> Result<Disk> {
@@ -207,6 +282,7 @@ impl Disk {
         let n = tags.len().min(tag_bytes.len());
         tag_bytes[..n].copy_from_slice(&tags[..n]);
         Ok(Disk {
+            density: Density::Gcr,
             sides,
             format: if sides == 2 {
                 gcr::FORMAT_800K
@@ -226,6 +302,7 @@ impl Disk {
         let sides = sides.clamp(1, 2);
         let blocks = gcr::sectors_per_side() * usize::from(sides);
         Disk {
+            density: Density::Gcr,
             sides,
             format: if sides == 2 {
                 gcr::FORMAT_800K
@@ -237,6 +314,27 @@ impl Disk {
             write_protect: false,
             name: String::new(),
         }
+    }
+
+    /// A blank formatted 1.44 MB disk, for a test or a `format`.
+    #[must_use]
+    pub fn blank_mfm() -> Disk {
+        Disk {
+            density: Density::Mfm,
+            sides: 2,
+            format: gcr::FORMAT_800K,
+            data: vec![0; mfm::BYTES],
+            tags: Vec::new(),
+            write_protect: false,
+            name: String::new(),
+        }
+    }
+
+    /// How its bits are written, which is what decides which controller can
+    /// read it and how long a cylinder is.
+    #[must_use]
+    pub fn density(&self) -> Density {
+        self.density
     }
 
     /// How many 512-byte blocks it holds: 800 a side.
@@ -280,6 +378,9 @@ impl Disk {
     /// only place a sector count is written down.
     #[must_use]
     pub fn block_of(&self, track: u8, side: bool, sector: u8) -> Option<usize> {
+        if self.density == Density::Mfm {
+            return mfm::block_of(track, u8::from(side), sector + 1);
+        }
         if track > MAX_TRACK || (side && self.sides < 2) {
             return None;
         }
@@ -302,6 +403,9 @@ impl Disk {
     /// Derived state: never snapshotted, rebuilt whenever the head moves.
     #[must_use]
     pub fn track(&self, track: u8, side: bool) -> Track {
+        if self.density == Density::Mfm {
+            return self.mfm_track(track, u8::from(side));
+        }
         if track > MAX_TRACK || (side && self.sides < 2) {
             return Track::new();
         }
@@ -319,6 +423,29 @@ impl Disk {
             })
             .collect();
         gcr::encode_track(&sectors)
+    }
+
+    /// Build the MFM bit stream of one cylinder and head of a 1.44 MB disk.
+    ///
+    /// Derived state: never snapshotted, rebuilt whenever the head moves. The
+    /// sector numbers an ID field carries are **one-based**, which is the IBM
+    /// format's and not Apple's.
+    #[must_use]
+    pub fn mfm_track(&self, cylinder: u8, head: u8) -> Track {
+        if self.density != Density::Mfm
+            || usize::from(cylinder) >= mfm::CYLINDERS
+            || usize::from(head) >= mfm::SIDES
+        {
+            return Track::new();
+        }
+        let sectors: Vec<mfm::Sector> = (1..=mfm::SECTORS as u8)
+            .filter_map(|s| {
+                let block = mfm::block_of(cylinder, head, s)?;
+                let data = self.data.get(block * DATA_BYTES..(block + 1) * DATA_BYTES)?;
+                Some(mfm::Sector::new(cylinder, head, s, data))
+            })
+            .collect();
+        mfm::encode_track(&sectors)
     }
 }
 

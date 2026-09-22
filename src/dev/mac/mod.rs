@@ -32,6 +32,7 @@ pub mod disk;
 pub mod gcr;
 pub mod glue;
 pub mod iwm;
+pub mod mfm;
 pub mod keyboard;
 pub mod mouse;
 pub mod rtc;

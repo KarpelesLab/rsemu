@@ -75,6 +75,81 @@ fn a_1440k_image_is_refused_by_name() {
     assert!(e.contains("720K"), "{e}");
 }
 
+/// **A SWIM takes the same image**, raw or in a container, and what it gets is
+/// an MFM disk.
+///
+/// The refusal above is a fact about a Macintosh Plus's hardware and stays
+/// exactly where it is; `Reader::Swim` is a different controller asking.
+#[test]
+fn a_swim_takes_a_1440k_image_and_gets_an_mfm_disk() {
+    let mut image = vec![0u8; BYTES_1440K];
+    for (block, chunk) in image.chunks_mut(512).enumerate() {
+        chunk[..4].copy_from_slice(&(block as u32).to_be_bytes());
+    }
+    for bytes in [image.clone(), dc42("System Startup", DISK_FORMAT_1440K, 0x22, &image, &[])] {
+        let disk = Disk::from_image_for(&bytes, Reader::Swim).expect("a SWIM reads one");
+        assert_eq!(disk.density(), Density::Mfm);
+        assert_eq!(disk.sides(), 2);
+        assert_eq!(disk.blocks(), 2_880, "eighteen sectors on 160 tracks");
+        // The two boot blocks are where an HFS volume puts them.
+        assert_eq!(disk.block(0).unwrap()[..4], 0u32.to_be_bytes());
+        assert_eq!(disk.block(1).unwrap()[..4], 1u32.to_be_bytes());
+    }
+
+    // And a SWIM still refuses an image that is not one of the three sizes.
+    let e = alloc::format!(
+        "{}",
+        Disk::from_image_for(&vec![0u8; 1000], Reader::Swim).unwrap_err()
+    );
+    assert!(e.contains("1000 bytes"), "{e}");
+}
+
+/// **Every block of a 1.44 MB image survives the journey to MFM cells and
+/// back**, through the disk rather than through `mfm` on its own: the block
+/// mapping and the encoder have to agree, and they are the two halves that
+/// could disagree.
+#[test]
+fn every_block_of_a_1440k_image_survives_the_journey_to_cells() {
+    let mut image = vec![0u8; BYTES_1440K];
+    for (block, chunk) in image.chunks_mut(512).enumerate() {
+        chunk[..4].copy_from_slice(&(block as u32).to_be_bytes());
+        for (i, byte) in chunk.iter_mut().enumerate().skip(4) {
+            *byte = (block as u8).wrapping_mul(31).wrapping_add(i as u8);
+        }
+    }
+    let disk = Disk::from_image_for(&image, Reader::Swim).expect("a SWIM reads one");
+    let mut seen = 0usize;
+    for cylinder in [0u8, 1, 40, 79] {
+        for head in [0u8, 1] {
+            let track = disk.mfm_track(cylinder, head);
+            assert_eq!(track.len(), super::mfm::CELLS_PER_REVOLUTION);
+            let (found, bad) = super::mfm::decode_track(&track);
+            assert!(bad.is_empty(), "cylinder {cylinder} head {head}: {bad:?}");
+            assert_eq!(found.len(), super::mfm::SECTORS);
+            for sector in &found {
+                assert_eq!(sector.cylinder, cylinder);
+                assert_eq!(sector.head, head);
+                let block = super::mfm::block_of(cylinder, head, sector.sector)
+                    .expect("a sector on the disk");
+                assert_eq!(
+                    sector.data.as_slice(),
+                    disk.block(block).expect("a block"),
+                    "cylinder {cylinder} head {head} sector {} is block {block}",
+                    sector.sector
+                );
+                seen += 1;
+            }
+        }
+    }
+    assert_eq!(seen, 8 * super::mfm::SECTORS);
+    // A cylinder past the end of the disk is unformatted rather than a panic.
+    assert!(disk.mfm_track(80, 0).is_empty());
+    assert!(disk.mfm_track(0, 2).is_empty());
+    // And a GCR disk has no MFM on it.
+    assert!(Disk::blank(2).mfm_track(0, 0).is_empty());
+    assert_eq!(Disk::blank_mfm().density(), Density::Mfm);
+}
+
 /// A container round-trips: the header is read, the blocks land where they
 /// belong, and the tags come with them.
 #[test]
