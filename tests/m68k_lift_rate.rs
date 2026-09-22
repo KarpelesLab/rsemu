@@ -329,39 +329,55 @@ mod mini {
 #[test]
 #[cfg(feature = "machine-m68k-mini")]
 fn the_mini_board_reports_a_rate_and_the_instrument_closes() {
-    let (mut ir, cpu) = mini::boot("jit");
-    let (mut interp, _) = mini::boot("interp");
-    for ms in 1..=8 {
-        mini::advance(&mut ir, 1);
-        mini::advance(&mut interp, 1);
-        let want = interp.state_hash().expect("a deterministic machine hashes");
-        let got = ir.state_hash().expect("a deterministic machine hashes");
-        assert_eq!(want, got, "ms {ms}: the two engines parted company");
+    for engine in ["jit", "jit-host"] {
+        let (mut jit, cpu) = mini::boot(engine);
+        let (mut interp, _) = mini::boot("interp");
+        for ms in 1..=8 {
+            mini::advance(&mut jit, 1);
+            mini::advance(&mut interp, 1);
+            let want = interp.state_hash().expect("a deterministic machine hashes");
+            let got = jit.state_hash().expect("a deterministic machine hashes");
+            assert_eq!(want, got, "{engine}, ms {ms}: the engines parted company");
+        }
+
+        let stats = cpu.jit_stats().expect("a translated core keeps statistics");
+        let declines = cpu.jit_declines().expect("and a histogram");
+        let rate = report(
+            &format!("m68k-mini (synthetic), engine={engine}"),
+            stats,
+            &declines,
+        );
+
+        assert!(stats.executed > 0, "blocks ran: {stats:?}");
+        assert!(rate > 0, "something was lifted: {stats:?}");
+        // The program has to *work*, or the mix being measured is the mix of
+        // a zeroed vector table. This is the assertion that would have caught
+        // the first version of this firmware, whose `-(A1)` walked off the
+        // bottom of RAM and whose every block therefore faulted.
+        assert!(!cpu.is_halted(), "the processor double-faulted: {stats:?}");
+        assert_eq!(cpu.bus_faults().0, 0, "an access faulted: {stats:?}");
+        assert_eq!(stats.faults, 0, "and no block took one: {stats:?}");
+        // Nothing here rewrites its own code, so nothing may be invalidated.
+        // The firmware's long store used to land on the ROM at address zero —
+        // the page its own blocks were lifted from — because `2482` is
+        // `MOVE.L D2,(A2)` and `A2` is zero out of reset, and every iteration
+        // then threw four translations away and recompiled them. This is what
+        // would catch that coming back.
+        assert_eq!(
+            stats.invalidated, 0,
+            "the firmware wrote into a page a block came from: {stats:?}"
+        );
+        // The `JSR` in the loop is declined, and it is declined for
+        // restartability rather than for want of a lowering. That is the
+        // claim `docs/cpu/m68k.md` makes and the one a later change to
+        // `classify` could silently move.
+        assert!(
+            declines
+                .iter()
+                .any(|r| r.reason == Decline::STORES && r.what == "JSR" && r.count > 0),
+            "the `JSR` in the loop is counted under `stores`: {declines:#?}"
+        );
     }
-
-    let stats = cpu.jit_stats().expect("a translated core keeps statistics");
-    let declines = cpu.jit_declines().expect("and a histogram");
-    let rate = report("m68k-mini (synthetic)", stats, &declines);
-
-    assert!(stats.executed > 0, "blocks ran: {stats:?}");
-    assert!(rate > 0, "something was lifted: {stats:?}");
-    // The program has to *work*, or the mix being measured is the mix of a
-    // zeroed vector table. This is the assertion that would have caught the
-    // first version of this firmware, whose `-(A1)` walked off the bottom of
-    // RAM and whose every block therefore faulted.
-    assert!(!cpu.is_halted(), "the processor double-faulted: {stats:?}");
-    assert_eq!(cpu.bus_faults().0, 0, "an access faulted: {stats:?}");
-    assert_eq!(stats.faults, 0, "and no block took one: {stats:?}");
-    // The `JSR` in the loop is declined, and it is declined for
-    // restartability rather than for want of a lowering. That is the claim
-    // `docs/cpu/m68k.md` makes and the one a later change to `classify` could
-    // silently move.
-    assert!(
-        declines
-            .iter()
-            .any(|r| r.reason == Decline::STORES && r.what == "JSR" && r.count > 0),
-        "the `JSR` in the loop is counted under `stores`: {declines:#?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
