@@ -16,10 +16,11 @@
 # clock chip and writes its parameter RAM back, resets the Apple Desktop Bus
 # and walks all sixteen bus addresses asking each for register 3 - finding the
 # keyboard at 2 and the mouse at 3 - probes the drive, sees that the mechanism
-# is a SuperDrive, asks the SWIM for ISM mode, and then draws the Macintosh's
-# grey desktop with the arrow cursor and the **blinking insert-disk icon**.
-# What it cannot do yet is boot: ISM mode is not modelled, so the controller
-# cannot hand it a sector off the 1.44 MB disk in the slot.
+# is a SuperDrive, switches the SWIM into ISM mode, loads its parameter RAM
+# with Apple's own MFM timing table, and **boots**: the happy Mac at about ten
+# virtual seconds, "Welcome to Macintosh" at fifteen, and the Finder's desktop
+# with the startup volume's icon on it by seventy. With an empty drive it draws
+# the blinking insert-disk icon instead.
 # `docs/platforms/mac-classic.md` has the ledger and every trace behind it.
 #
 # Everything below that is not the Plus's is a **measurement**, and each one

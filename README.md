@@ -661,25 +661,40 @@ an 800K disk for the Plus, which is the only thing that writes HFS resource
 forks correctly. It is the same compact-Macintosh shape with three differences
 that matter: a **512 KiB ROM** whose own checksum only covers the first half of
 it, the **Apple Desktop Bus** where a Plus has its serial keyboard, and a
-**SWIM** where a Plus has an IWM. Apple's own Classic ROM runs it to the
-**insert-disk screen** — the grey desktop, the arrow cursor, the blinking floppy
-with a question mark — having sized memory, initialised the SCC, written its
-parameter RAM back, reset the Apple Desktop Bus and walked all sixteen bus
-addresses asking each for register 3 (finding the keyboard at 2 and the mouse at
-3, which is where a Macintosh leaves them), probed the drive, and seen that the
-mechanism is a **SuperDrive**. A 1.44 MB image goes into that drive, becomes IBM
-MFM cells — `A1A1A1` sync with the missing clock derived from the encoding rule
-rather than quoted, ID and data address marks, CRC-16/CCITT — and turns at 300
-rpm under a head the ROM can step, with all 2,880 blocks making the round trip
-through the encoder. What is left is **one chip**: the ROM asks the SWIM for
-**ISM mode**, and no document available to this project states that register
-file, so there is none here rather than an invented one. Two real defects fell
-out on the way and both are fixed: the ROM re-asserts the overlay 5.4 seconds
-into startup, which on a board that reads the pin as the decode puts the ROM
-back over the machine's own vector table mid-instruction, and it makes one word
-access to the VIA, which has to *complete* on a machine that has no bus-error
-timeout at all. `docs/platforms/mac-classic.md` has every trace, the exact
-sequence the ROM writes asking for ISM mode, and the instruments that found it.
+**SWIM** where a Plus has an IWM. **Apple's own Classic ROM boots Mac OS 6.0.8
+off a 1.44 MB disk to the Finder desktop** — the happy Mac at about ten virtual
+seconds, "Welcome to Macintosh" at fifteen, and by seventy a desktop with the
+menu bar across the top, the startup volume's icon in the top right corner and
+the Trash in the bottom right — having sized memory, initialised the SCC,
+written its parameter RAM back, reset the Apple Desktop Bus and walked all
+sixteen bus addresses asking each for register 3 (finding the keyboard at 2 and
+the mouse at 3, which is where a Macintosh leaves them), probed the drive, seen
+that the mechanism is a **SuperDrive**, and switched the SWIM into **ISM
+mode**. With an empty drive it draws the blinking insert-disk icon instead.
+
+The disk is IBM MFM — `A1A1A1` sync with the missing clock derived from the
+encoding rule rather than quoted, ID and data address marks, CRC-16/CCITT — at
+300 rpm under a head the ROM steps, and the controller behind it is the ISM
+register set out of Apple's *SWIM Chip User's Reference*, revision 1.5, quoted
+register by register. The document also settles the mode switch the previous
+session could only measure: `1, 0, 1, 1` into bit 6 of the GCR mode register,
+four writes in a row, which is exactly the `$57 $17 $57 $57` the ROM writes.
+What the document does **not** say had to be measured, and the sharpest of
+those is a single drive status line: told that a SuperDrive answers at both
+halves of `CA2:CA1:CA0 = 101`, the ROM refuses to touch the mechanism at all
+and sits on the insert-disk screen for ever; told that it answers only at `SEL`
+high, it switches to ISM mode, loads its parameter RAM with Apple's own MFM
+timing table and reads the disk. Four earlier defects fell out along the way
+and all are fixed: the ROM re-asserts the overlay 5.4 seconds into startup,
+which on a board that reads the pin as the decode puts the ROM back over the
+machine's own vector table mid-instruction; it makes one word access to the
+VIA, which has to *complete* on a machine that has no bus-error timeout at all;
+the separator must sync on the `$A1` mark and not the `$C2` one, which is not
+unique at an arbitrary cell offset; and it must take the **first** of a field's
+three sync bytes, or every CRC on the disk reads as bad.
+`docs/platforms/mac-classic.md` has every trace, every quotation with its page,
+the four things inferred rather than quoted, and the instruments that found
+them.
 
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's, Workbench is Commodore's and the Macintosh ROM is

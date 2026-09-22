@@ -41,23 +41,29 @@
 //!   MFM:        1,000,000 cells/s / 200,000 cells a revolution = 300 rpm
 //! ```
 //!
-//! # What is **not** here, and it is the reason this board does not boot yet
+//! # ISM mode, and how software asks for it
 //!
-//! **ISM mode.** The chip's own register file — the one the MFM separator and
-//! the sector-search engine live behind — is not modelled, because no document
-//! available to this project states it and `CLAUDE.md` forbids reading any
-//! emulator's source or disassembling Apple's ROM to find out. What *is*
-//! recorded is the measurement, in `docs/platforms/mac-classic.md`: which
-//! addresses a real Macintosh Classic ROM touches in this window, in what
-//! order, and with what values. An ISM register table invented to fit would be
-//! exactly the mistake that cost this board three sessions the last time
-//! (`docs/platforms/mac-plus.md`, "The drive's register file was invented"), so
-//! there is not one here.
+//! The chip's own register file — the one the MFM separator and the
+//! sector-search engine live behind — is [`ism`], and every register, bit and
+//! rule in it carries the sentence it came from in Apple's *SWIM Chip User's
+//! Reference*, revision 1.5 (11 January 1988), with its page.
 //!
-//! The consequence is honest and narrow: a 1.44 MB disk goes into the drive,
-//! becomes MFM cells, and turns under the head at 300 rpm, and the ROM can see
-//! that the mechanism is a SuperDrive — but the chip cannot yet hand it a
-//! sector, so the machine reaches the insert-disk screen and stays there.
+//! Getting in is four writes, page 12:
+//!
+//! > To select the ISM set, you must write to the GCR mode register **four
+//! > times in a row** with this bit set to "1", "0", "1","1", respectively.
+//!
+//! `1, 0, 1, 1`, and that is exactly what a Macintosh Classic ROM writes:
+//! `$57`, `$17`, `$57`, `$57`. [`ism::Switch`] is the four-entry shift register
+//! that watches for it; clearing bit 6 of the ISM mode register switches back.
+//!
+//! The separator itself is **not** here but in [`super::iwm`], because that is
+//! where the medium is: the head position, the cylinder under it and the motor
+//! all live in the mechanism, and a second copy of them so that this file could
+//! frame its own bytes is the duplication this device exists to avoid. What
+//! this file owns is the register file, and what that register file reaches
+//! for — the phase lines, the enables, `SENSE` — is the same drive an IWM
+//! drives.
 //!
 //! No emulator source was consulted and no ROM was disassembled
 //! (`ROADMAP.md` §1, `CLAUDE.md`).

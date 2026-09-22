@@ -15,14 +15,21 @@ a Macintosh that boots — and once one boots, its own Finder can author an 800K
 disk for the Plus, which is the only thing that writes HFS resource forks and
 Finder info correctly (`docs/upstream/fstool-hfs-resource-fork-write.md`).
 
-**Where it is now.** A real Classic ROM runs to the **insert-disk screen** —
-the grey desktop, the arrow cursor, the blinking floppy with a question mark —
-having reset the Apple Desktop Bus, walked all sixteen bus addresses, found the
-keyboard and the mouse, probed the drive, seen that the mechanism is a
-SuperDrive, and asked the SWIM for **ISM mode**. ISM mode is not modelled, so
-it cannot be handed a sector off the 1.44 MB disk in the slot. **That is the
-next thing in the way and the first**, and it is ledger item 1 — what is behind
-it is not known, because nothing has got past it to find out.
+**Where it is now.** It **boots**. A real Classic ROM with the user's own
+Mac OS 6.0.8 system disk in the drive reaches the **Finder desktop**: the
+memory test to about five virtual seconds, the happy Mac at ten, "Welcome to
+Macintosh" at fifteen, the menu bar by sixty, and by seventy a desktop with the
+startup volume's icon in the top right corner and the Trash in the bottom
+right. With an empty drive it draws the insert-disk screen instead, which is
+the right answer to nothing to boot from.
+
+Getting there took **ISM mode**, which the previous session measured the
+request for and correctly refused to invent a register file behind. The
+register file is Apple's, and it is written down: the *SWIM Chip User's
+Reference*, revision 1.5. Two things then stood between the document and the
+Finder, and both were measurements rather than readings — a drive status line
+whose polarity decides which of two paths the ROM takes at all, and the way the
+separator locks onto a sync field. Both are below.
 
 ## Primary sources
 
@@ -296,19 +303,141 @@ asking its controller for something a Plus's does not have, and it is the ISM
 mode switch. `tests/mac_classic.rs::the_rom_asks_the_swim_for_ism_mode` asserts
 the sequence so it cannot be lost.
 
-### Why there is no ISM register table here
+### ISM mode: the document, and the two things it does not say
 
-Because no document available to this work states one, and `CLAUDE.md` forbids
-the two other ways of finding out: reading a Macintosh emulator's source, and
-disassembling Apple's ROM.
+The register file is Apple's **SWIM Chip User's Reference, revision 1.5
+(11 January 1988)**, with the *SWIM Chip Specification* of 29 September 1987
+beside it. `src/dev/mac/swim/ism.rs` carries the quotation and the page next to
+every register, bit and rule, because the alternative — a chapter reference to
+a chapter that turns out to have no such table — is what
+`docs/platforms/mac-plus.md` records under "The drive's register file was
+invented".
 
-An ISM register file invented to fit the trace would be exactly the mistake that
-cost this board's sibling three sessions — `docs/platforms/mac-plus.md`, "The
-drive's register file was invented", where sixteen addresses were written down
-with a chapter reference and the chapter had no such table, eight of them made
-up and five of them wrong. So there is no guess here. What is here is the trace,
-the arithmetic, and the honest statement that the chip cannot yet hand the ROM a
-sector.
+**The mode switch is `1, 0, 1, 1`.** Page 12:
+
+> The *ISM/IWM* bit selects which register set will be used. To select the ISM
+> set, you must write to the GCR mode register **four times in a row** with this
+> bit set to "1", "0", "1","1", respectively. This somewhat torturous route is
+> set up to prevent unintentional intrusions into the ISM world by existing
+> software. After the switch, all further accesses to the SWIM will then be
+> routed to the ISM register set until you clear bit 6 in the ISM mode register.
+
+So the sequence the previous session measured and could not account for — `$57`,
+`$17`, `$57`, `$57`, four consecutive loads of the mode register, bit 6 going
+1, 0, 1, 1 — **is the document's own, verbatim**. There was never a tension to
+resolve: the fourth write is a "1" and the ROM writes a "1". (A brief that said
+the document reads `1, 0, 1, 0` was quoting it wrong; the OCR on archive.org
+also reads `1, 0, 1, 1`, and the page image settles it.)
+
+The address map is page 26's table, `IWM State/ISM Register Mapping`, with one
+correction its own author made **by hand on the scan**: the printed row for
+address 10 says "Read CRC" with `CRC` struck through, and the register's own
+section on page 24 heads itself `ERROR Register  R  [1010]`. The per-register
+headings are the authority — they are also what says which registers answer at
+*both* halves of the address space, by writing `x` for an address bit they do
+not care about.
+
+```text
+   0/8   DATA        R/W [x000]   (ACTION=1);  8 is CORRECTION when ACTION=0
+   1/9   MARK        R/W [x001]
+   2     CRC         W   [0010]   (ACTION=1);  IWM Config when ACTION=0
+   3/11  PARAMETER RAM  R/W [x011]
+   4/12  PHASE       R/W [x100]   reset 11110000
+   5/13  SETUP       R/W [x101]   reset 00000000
+   6/7   MODE        W   [011x]   6 clears bits, 7 sets them; reset 00000000
+   10    ERROR       R   [1010]   reset 00000000; a read clears it
+   14    STATUS      R   [1110]   the mode register read back
+   15    HANDSHAKE   R   [1111]
+```
+
+**The proof that it was read right is the ROM's own parameter RAM.** Having
+switched, Apple's ROM loads sixteen bytes into register 3, and among them are
+`$41`, `$97` and `$57` — which are MULT = 65, Late/Normal and Early/Normal
+exactly as printed on **page 17** for a 15.6672 MHz FCLK. The ROM is loading
+the document's own table into the register this file put at address 3.
+
+#### What the document does not say, and had to be measured
+
+**1. Where a SuperDrive answers.** Apple's IIGS note leaves
+`CA2:CA1:CA0 = 101` unassigned, and the previous session answered *both* halves
+of it — addresses 10 and 11 — from one flag, reasoning that the mechanism has
+one such line and no way to make it depend on `SEL`. That is true of *drive
+installed*; it is not true here, and it is what kept the board off the Finder.
+The differential, same board, same disk, twenty virtual seconds:
+
+| address 10 | address 11 | what Apple's ROM does |
+| --- | --- | --- |
+| pull-up | pull-up | drives the mechanism as an IWM: spins it up, steps to track 79, reads GCR. A plain 800K drive, and the path a Plus uses |
+| pull-up | **asserted** | switches the controller into ISM mode, loads page 17's parameter table, and reads the 1.44 MB disk |
+| **asserted** | **asserted** | never touches the mechanism at all — 279 accesses in twenty seconds, no motor, no step, the insert-disk icon for ever |
+
+So **address 11 is "this is a SuperDrive"** and address 10 is a different line
+that a SuperDrive does not assert. What address 10 is *for* is not established
+and `src/dev/mac/iwm.rs` does not guess: it reads as the cable's pull-up, which
+is what the ROM requires and what an unassigned line does.
+
+**2. How the separator locks.** Two decisions, both measured:
+
+* **It syncs on `$A1`'s `$4489` and not on `$C2`'s `$5224`.** A mark search has
+  no byte boundary to align to, so it can only look for a bit pattern — and
+  `$5224` is not unique at an arbitrary cell offset.
+  `swim::tests::only_the_a1_sync_is_unique_at_every_cell_alignment` walks a
+  formatted track and finds `$4489` **108** times, which is three per ID field
+  and three per data field and nothing else, against **192** hits of `$5224` on
+  a track that carries three. Syncing on the second made the chip report an
+  index mark eighteen times a revolution, and the ROM — which reads a mark and
+  then the address mark behind it — got `$C2` where a sector's `$A1` should
+  have been and started over, for ever. Nothing is lost by dropping it: an ID
+  or data field is prefixed by `$A1` and only by `$A1`.
+* **It takes the *first* of the three `$A1`s**, by requiring sixteen cells of
+  `$00` behind the mark. The field's CRC covers all three sync bytes, so a
+  separator that locked onto the second or the third seeded its generator a
+  byte into the field and the handshake register's bit 1 came back set on every
+  sector on the disk — and the ROM put the disk straight back out. The document
+  describes the chip locking this way while describing the correction machine,
+  page 19: *"The CSM looks for 32 pairs of minimum cells which coincidently
+  show up in a run of zero bytes, such as a sync field. After that it looks to
+  see if the first non-minimum cell belongs to a mark byte. If not, it starts
+  looking for minimum cells again."*
+
+**3. How the head gets chosen.** Page 23 makes `HDSEL` drive its pin only when
+the Setup register's bit 0 says so, and a Classic ROM **never sets that bit** —
+it writes `$20` to Setup and nothing else. What it does instead is drive the
+phase lines to `CA2:CA1:CA0 = 100` and read the handshake register, because
+selecting the head is the *drive's* rule and not the controller's: Apple's note
+says "Instantaneous data from lower head. Reading this bit configures the drive
+to do I/O with the lower head". So a read of the handshake's `SENSE` bit picks
+the head, exactly as a read of an IWM's status register does. Until it did, the
+ROM read cylinder 0 head 0 for ever and never reached the catalogue.
+
+#### What is inferred rather than quoted
+
+Four, and each is commented as an inference where it is written:
+
+* **"Four times in a row" means four consecutive loads of the mode register**,
+  with reads of other addresses allowed in between. The stricter reading also
+  accepts the ROM's sequence, which has nothing at all between its four, so
+  nothing measured distinguishes them.
+* **The CRC generator's seed is `$FFFF`.** Page 23 says the Clear FIFO bit
+  "initializes the CRC generator with its starting value" and that "this value
+  is different for reading or writing", without giving either. `$FFFF` is the
+  preset the format specifies, and it is *checkable* rather than assumed: a
+  field followed by its own CRC leaves the generator at zero only for the right
+  preset, which is what the handshake register's bit 1 reports and what
+  `the_separator_reads_an_id_field_and_its_crc_comes_out_zero` asserts.
+* **The generator is fed where bytes are framed**, not where the processor
+  reads them. Page 25 says the bit reports the CRC "on the bytes up to and
+  including the byte about to be read" and is "usually checked when the second
+  CRC byte is about to be read from the FIFO" — by then the generator must have
+  absorbed *both* CRC bytes, and only one tapped at the medium has.
+* **A bus write names its register with the low three address bits**, A3 being
+  documented as "the read/write line for the registers" and so saying nothing
+  further about a write. Reads decode all four bits, because three registers —
+  CORRECTION, ERROR, STATUS and HANDSHAKE — exist only in the high half.
+
+Addresses 6 and 7 have no documented read function; this model answers zero and
+**completes the access**, because a compact Macintosh has no bus-error timeout
+and a chip that is fitted may not fault.
 
 ### What *is* here, and is tested
 
@@ -351,64 +480,83 @@ settles:
 | 25 ms – 5 s | the memory test: alternating write and read passes at interrupt level 7, several patterns deep, with the test pattern on screen. Four times as long on a 4 MiB board |
 | ~5 s | the ROM finds 1 MiB, writes `MemTop = $00100000`, `ScrnBase = $000FA700` and `ROMBase = $00400000`, initialises the SCC (32 register writes in both windows), reads the clock chip and writes its own parameter RAM back, and drives `PA4` high again — which is why the overlay has to latch |
 | ~5 s | the Apple Desktop Bus: `DDRB = $F7`, `ACR = $1C`, `SendReset`, then **Talk register 3 of every address 0 to 15**, finding the keyboard at 2 and the mouse at 3, then Talk 0 of the mouse |
-| ~5 s | the disk controller: the chip is reset, the mode register loaded with `$17`, then the `$57`/`$17`/`$57`/`$57`/`$75` sequence that asks for ISM mode, then the drive's status lines, then switch 6 over and over |
-| 6 s onward | the desktop is painted grey, the arrow cursor goes in the top left, and the **insert-disk icon** — the floppy with a question mark — is drawn in the middle. The 60.15 Hz tick chain runs, `Ticks` at `$16A` counts up, and the ROM settles there |
+| ~5 s | the disk controller: the chip is reset, the mode register loaded with `$17`, then `$57`, `$17`, `$57`, `$57` — the four writes that ask for **ISM mode**, bit 6 going 1, 0, 1, 1 — and then, in ISM mode, `$F5`, `$F6`, `$F7` into the phase register with each read back, which is the ROM satisfying itself that this is a SWIM. It then clears mode bit 6 and goes back to being an IWM while it looks at the mechanism |
+| 6 – 9 s | the drive: `installed`, `sides` and the SuperDrive line on both cable positions. Finding a SuperDrive on drive 1 is what sends the ROM down the high-density path; finding an 800K mechanism there instead sends it down the IWM's, and it reads GCR perfectly well that way |
+| 9 – 20 s | ISM mode again, and this time for real: sixteen bytes of parameter RAM — `$1B`, `$41`, … `$97`, `$57`, page 17's own table — `Setup = $20`, `MotorOn` and drive 1, the Clear FIFO toggle, `ACTION`, and the boot blocks come off cylinder 0. The **happy Mac** is on the screen by ten seconds |
+| 15 s | "Welcome to Macintosh", and the System loading behind it: the head steps out across the disk and the ROM reads whole sectors, `$A1 $A1 $A1 $FE C H R N` and the field behind each |
+| 60 s | the Finder's **menu bar** — the Apple, *File*, *Edit*, *View*, *Special* |
+| 69 s | the startup volume's icon lands in the top right corner, and the ROM strobes the drive register file's eject (ledger item 1) |
+| 70 s onward | the desktop is finished and stops changing: every frame from here to two virtual minutes hashes the same |
 
 `Time` at `$20C` holds the date the clock chip was given plus however long the
 machine has been on, which is the check that the counter's byte order is right:
 with `rtcdate = "2026-01-01T00:00:00"` it reads a little above `$E57B6980`.
 
-**What the picture shows**: the Macintosh's 50 % grey desktop — a one-pixel
-checkerboard, 87,337 black pixels of 175,104 — with the arrow cursor about
-fifteen pixels in from the left and fourteen down, and the insert-disk icon in a
-32 × 32 area whose top left corner is pixel (240, 145). 760 of those 1,024
-pixels are white where a bare desktop would be 512.
+**What the picture shows at seventy seconds**: the menu bar across the top of
+the screen, white but for the Apple and the four menu titles — 9,165 of its
+10,240 pixels lit, where the bare desktop below is *exactly* half; the arrow
+cursor in the top left; the startup volume's floppy icon with **System
+Startup** under it in the top right corner, 65.1 % white in a box that measures
+50.0 % on the insert-disk screen and 49.9 % on "Welcome to Macintosh"; the
+Trash in the bottom right; and the Macintosh's one-pixel checkerboard between
+them, 82,909 black pixels of 175,104.
 
-The frame hash is the **same** one `mac-plus` produces for the same phase of the
-same blink, and that is not a coincidence worth explaining away: it is Apple's
-own icon drawn by Apple's own code into the same place on the same 512 × 342
-screen, by two ROMs four years apart.
+**With an empty drive** it is the insert-disk screen instead: the grey desktop,
+the arrow cursor, and the blinking floppy in a 32 × 32 area whose top left
+corner is pixel (240, 145).
 
 No access faults, the processor never double-faults, the video circuit produces
 60 frames a virtual second throughout, and the space's unassigned counter reads
-**zero**.
+**zero**. Two virtual minutes of it cost about twenty seconds of wall time,
+which is faster than the machine being emulated.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **ISM mode.** It is the next thing between this board and a booting
-   Macintosh, and the only one anything has been able to see; what is behind it
-   is unknown, because nothing has got past it. Everything *under* it is here
-   and tested: the disk goes in, it
-   becomes MFM cells, it turns at 300 rpm under a head the ROM can step, and the
-   ROM has already asked for the mode. What is missing is the chip's own register
-   file behind that request — the MFM separator, the sector-search engine, the
-   parameter registers and the handshake — and it needs either a document that
-   states it or a great deal more black-box work than this session had. **Do not
-   invent one**; see "Why there is no ISM register table here".
+1. **The eject at 69 seconds.** At the instant the Finder finishes drawing the
+   desktop, the ROM drives the phase lines to `CA2:CA1:CA0 = 111` and strobes
+   `LSTRB`, which with `SEL` low is the drive register file's **eject**, and
+   this model takes it literally — `Swim::has_disk` goes false while the
+   startup volume's icon sits on the desktop and the Finder is plainly still
+   mounted. Nothing has needed the disk since, so nothing has broken yet; the
+   first thing that reads it again will.
 
-   The measured starting point is exactly this: the ROM writes `$57`, `$17`,
-   `$57`, `$57` to the IWM mode register and then `$75`, and every one of those
-   has bit 6 set where a Plus's `$17` does not. A chip that switched on that
-   sequence and then answered *something* would immediately show, in the same
-   tap, which registers the ROM reads next and what it waits for — which is how
-   the ADB link in this file was worked out.
+   The trace, from `trace_the_controller`:
+
+   ```text
+     ISM wPhase      W f3      CA0, CA1
+     ISM wPhase      W f7      and CA2: CA2:CA1:CA0 = 111
+     ISM wPhase      W ff      LSTRB rises -> latch address 6|SEL, data CA2 = 1
+     ISM wPhase      W f7      and falls
+   ```
+
+   Two readings, and the measurement does not settle them. Either **`SEL` is
+   not the VIA's `PA5` on a Classic** — with `SEL` high the address is `0b111`,
+   which Apple's note gives no function, and this is not the first time this
+   board has found `PA4`/`PA5` doing something else (see the latching overlay
+   above, which raised exactly this doubt about `PA4`) — or the **mechanism
+   refuses to eject while its spindle is running**, which is true of the real
+   thing and which no document here states. A third possibility is that the
+   command is genuine and something later puts the disk back.
+
+   The cheapest next measurement: print `Iwm::sel` alongside the phase writes
+   and see what `PA5` is doing across the whole boot, then wire `SEL` from the
+   SWIM's own `3.5SEL*` pin (Setup register bit 1, *inverted*, page 22) instead
+   of from the VIA and see whether the ROM still reads cylinder 0 head 0.
 2. **Writing to a disk.** The read path is here; the write path is the same
-   machinery backwards, plus the controller's write handshake meaning something
-   and a way to get the bytes back into the image. A Macintosh that boots wants
-   to write to its disk almost immediately.
-3. **The NCR 5380.** The ROM makes **zero** accesses to `$580000` in thirty
-   virtual seconds, so nothing is waiting on it — but a Classic with an internal
-   hard disk is the configuration most of them shipped in, and `src/dev/scsi`
-   has the bus, the `Target` trait and a disk.
-4. **A host keymap, and the mouse.** `mac.adb` carries a keyboard at address 2
+   machinery backwards, plus the ISM's write handshake meaning something — the
+   Data and Mark registers keep the byte and it goes nowhere today — and a way
+   to get the bytes back into the image. A Macintosh that boots wants to write
+   to its disk almost immediately, and until it can, every session starts over.
+3. **A host keymap, and the mouse.** `mac.adb` carries a keyboard at address 2
    and a mouse at address 3 and will report a key transition or a movement
-   through Talk 0, but nothing turns a host keysym into an ADB key code and
-   nothing yet drives the mouse from `host/input`. The Plus's `mac.keyboard`
-   cannot be reused for the codes: it speaks the Guide's Table 7-6 transition
-   codes, which are a different encoding from ADB's, so one queue cannot serve
-   both boards.
-5. **The sound**, which the Classic has in the same place a Plus does and which
-   neither board models.
+   through Talk 0, and `mac.mouse` now drives the pointer — but nothing turns a
+   host keysym into an ADB key code. The Plus's `mac.keyboard` cannot be reused
+   for the codes: it speaks the *Guide*'s Table 7-6 transition codes, which are
+   a different encoding from ADB's.
+4. **The NCR 5380.** `src/dev/ncr5380.rs` exists and the Plus's `$580000`
+   window is modelled; a Classic with an internal hard disk is the
+   configuration most of them shipped in, and it is the way off a floppy.
+5. **The sound**, which a Classic has in the same place a Plus does.
 
 ## How the ambiguities were settled
 

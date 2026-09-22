@@ -7,7 +7,7 @@
 //! from `RSEMU_MAC_ROM_DIR` and a disk image from `RSEMU_MAC_DISK_DIR`, and each
 //! test that wants one skips, saying so, when the variable or the file is not
 //! there. `cargo test` with nothing set passes on a machine that has neither:
-//! **three of these nine tests need no media at all**, because they assemble
+//! **three of these eleven tests need no media at all**, because they assemble
 //! the board around rsemu's own ten-byte stub and around a 1.44 MB image of
 //! numbered blocks built on the spot.
 //!
@@ -25,13 +25,18 @@
 //!
 //! # How far it gets
 //!
-//! To the **insert-disk screen**: the grey desktop with the arrow cursor and
-//! the floppy-with-a-question-mark in the middle, with the 60.15 Hz tick chain
-//! running. On the way it resets the Apple Desktop Bus, walks all sixteen bus
-//! addresses asking each for register 3, finds the keyboard at 2 and the mouse
-//! at 3, probes the drive, sees that the mechanism is a **SuperDrive**, and
-//! asks the SWIM for **ISM mode** — which this build does not have, so it
-//! cannot be handed a sector off the 1.44 MB disk and stays on that screen.
+//! **All the way.** With the user's Mac OS 6.0.8 system disk in the drive it
+//! boots to the **Finder desktop**: the memory test to about five virtual
+//! seconds, the happy Mac at ten, "Welcome to Macintosh" at fifteen, the menu
+//! bar by sixty and a desktop with the startup volume's icon on it by seventy.
+//! On the way it resets the Apple Desktop Bus, walks all sixteen bus addresses
+//! asking each for register 3, finds the keyboard at 2 and the mouse at 3,
+//! probes the drive, sees that the mechanism is a **SuperDrive**, switches the
+//! SWIM into **ISM mode**, loads its parameter RAM with Apple's own MFM timing
+//! table and reads the disk.
+//!
+//! With an **empty** drive it draws the insert-disk screen instead, which is
+//! the right answer to nothing to boot from.
 //! `docs/platforms/mac-classic.md` has the whole ledger and every measurement
 //! behind it.
 //!
@@ -58,8 +63,9 @@ use rsemu::machine::{Machine, catalog};
 /// How long a Macintosh Classic ROM file is. The socket is a 512 KiB part.
 const ROM_LEN: usize = 512 * 1024;
 
-/// The picture at 12 virtual seconds on the stock 1 MiB board, with a disk in
-/// the drive.
+/// The picture at 12 virtual seconds on the stock 1 MiB board with an **empty
+/// drive**: the grey desktop, the arrow cursor in the top left and the
+/// insert-disk icon in the middle.
 ///
 /// The icon **blinks** — the plain floppy and the same floppy with a question
 /// mark on its face, about a second each way — so this is a golden of one
@@ -69,10 +75,10 @@ const ROM_LEN: usize = 512 * 1024;
 /// other phase is what came out. `the_insert_disk_icon_blinks` is the test that
 /// asserts the alternation rather than either picture.
 ///
-/// It is the same hash `mac-plus` produces for the same phase, and that is not
-/// a coincidence: it is Apple's own icon drawn by Apple's own code into the
-/// same place on the same 512 × 342 screen, by two ROMs four years apart.
-const GOLDEN_1M: u64 = 0xfbc9_cfa0_9b09_a5da;
+/// It moved once, deliberately: the test used to run with the user's system
+/// disk in the drive, which now *boots*, so the empty drive is what draws this
+/// screen and the blink lands on the other phase at twelve seconds.
+const GOLDEN_1M: u64 = 0x63dd_d76c_9468_dfa7;
 
 /// Where the insert-disk icon lands: a 32 × 32 box a little above the middle of
 /// the 512 × 342 screen. Left, top, width, height.
@@ -634,114 +640,6 @@ fn swim_tap(b: &Board) -> Arc<SwimTap> {
     tap
 }
 
-/// A transparent tap over one device's aperture: it records every access and
-/// forwards it unchanged.
-///
-/// Transparency is the whole requirement. A counting stub that filled a read
-/// with `$FF` instead of what the device answers changes what the ROM does, and
-/// on this board the value on a floating bus is load-bearing
-/// (`docs/platforms/mac-plus.md`). So does the byte order: a mapping's byte
-/// order is **not** carried by the region it points at, and a tap that took
-/// `AccessConstraints::ANY`'s little-endian default swapped every word the
-/// processor fetched and the board never started.
-#[derive(Debug)]
-struct Tap {
-    ops: Arc<dyn rsemu::core::space::MemOps>,
-    /// `(register, write, value)`, most recent window only.
-    log: std::sync::Mutex<Vec<(u64, bool, u32)>>,
-    stride: u64,
-}
-
-impl rsemu::core::space::MemOps for Tap {
-    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> rsemu::core::space::MemResult {
-        let r = self.ops.read(offset, dst, attrs);
-        if !attrs.debug {
-            self.note(offset, false, dst);
-        }
-        r
-    }
-
-    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> rsemu::core::space::MemResult {
-        if !attrs.debug {
-            self.note(offset, true, src);
-        }
-        self.ops.write(offset, src, attrs)
-    }
-
-    fn constraints(&self) -> rsemu::core::space::AccessConstraints {
-        self.ops.constraints()
-    }
-}
-
-impl Tap {
-    fn note(&self, offset: u64, write: bool, bytes: &[u8]) {
-        let value = bytes.iter().fold(0u32, |v, &b| (v << 8) | u32::from(b));
-        let mut log = self.log.lock().unwrap();
-        log.push(((offset / self.stride) & 15, write, value));
-        if log.len() > 40_000 {
-            log.drain(..20_000);
-        }
-    }
-
-    /// The accesses, collapsed so a run of the identical one is a single line
-    /// with a count — which is the only way half a million of them is a trace
-    /// anybody can read.
-    fn folded(&self) -> Vec<(String, u64)> {
-        let log = self.log.lock().unwrap();
-        let mut out: Vec<(String, u64)> = Vec::new();
-        for &(reg, write, value) in log.iter() {
-            let line = format!(
-                "r{reg:<2} {} {:02x}",
-                if write { "W" } else { "R" },
-                value as u8
-            );
-            match out.last_mut() {
-                Some((prev, n)) if *prev == line => *n += 1,
-                _ => out.push((line, 1)),
-            }
-        }
-        out
-    }
-}
-
-/// Put a [`Tap`] over the mapping at `base`, at a higher priority than the
-/// board's own, and hand back the log it fills.
-fn tap(b: &Board, base: u64, stride: u64, window: u64) -> Arc<Tap> {
-    use rsemu::core::space::{MemOps, Region, RegionKind};
-    use rsemu::core::value::Endian;
-    let span = stride * 16;
-    let space = b.machine.space("mem").expect("mem");
-    let mut guard = space.topology();
-    let ops = {
-        let (_, m) = guard
-            .mappings()
-            .find(|(_, m)| m.base == base)
-            .expect("a mapping at that base");
-        let mut leaf = m.region.clone();
-        while let RegionKind::Alias(a) = leaf.kind() {
-            let next = a.target().clone();
-            leaf = next;
-        }
-        match leaf.kind() {
-            RegionKind::Io(ops) => Arc::clone(ops),
-            other => panic!("not an MMIO aperture: {other:?}"),
-        }
-    };
-    let constraints = ops.constraints();
-    let tap = Arc::new(Tap {
-        ops,
-        log: std::sync::Mutex::new(Vec::new()),
-        stride,
-    });
-    let io = Region::io("tap", span, Arc::clone(&tap) as Arc<dyn MemOps>)
-        .with_constraints(constraints.with_endian(Endian::Big));
-    let mirror = Region::mirror("tap.mirror", Arc::new(io), window).expect("a mirror");
-    guard
-        .map_with_priority(Arc::new(mirror), base, 100)
-        .expect("the tap maps");
-    tap
-}
-
 // ---------------------------------------------------------------------------
 // the board, with nobody's media
 // ---------------------------------------------------------------------------
@@ -865,20 +763,27 @@ fn the_overlay_is_cleared_once_and_stays_cleared() {
 // a real ROM
 // ---------------------------------------------------------------------------
 
-/// **The ROM boots to the insert-disk screen**: the Macintosh's grey desktop
-/// with the arrow cursor in the top left corner and the floppy-with-a-question-
-/// mark in the middle of it, with the 60.15 Hz tick chain running.
+/// **The ROM boots to the insert-disk screen with an empty drive**: the
+/// Macintosh's grey desktop with the arrow cursor in the top left corner and
+/// the floppy-with-a-question-mark in the middle of it, with the 60.15 Hz tick
+/// chain running.
 ///
 /// Twelve virtual seconds is well past the point where it stops changing on the
 /// stock 1 MiB board — the memory test finishes at about five and the picture is
 /// settled by six.
+///
+/// **The drive is empty here, and that is now the point of the test.** It used
+/// to run with the user's system disk in the slot, because the board could not
+/// read one whatever was in it. It can: with that disk in the drive this is the
+/// happy Mac by ten seconds and the Finder by seventy
+/// (`the_rom_boots_mac_os_to_the_finder`). Asking a machine that boots to draw
+/// "insert a disk" means asking it with nothing to boot from.
 #[test]
 fn the_rom_boots_to_the_insert_disk_screen() {
     let Some(image) = rom_image("Classic.ROM") else {
         return;
     };
-    let disk = disk_image("MacOS_6.0.8_System_Startup.img");
-    let mut b = board(image, &[], disk);
+    let mut b = board(image, &[], Vec::new());
     advance(&mut b, "mac-classic", 12);
     let hash = picture(&b, "mac-classic", 12);
 
@@ -1030,56 +935,80 @@ fn the_rom_finds_the_keyboard_and_the_mouse_on_the_bus() {
     assert!(ticks > 50, "the tick chain stopped: Ticks = {ticks}");
 }
 
-/// **The ROM probes the drive, sees a SuperDrive, and asks the SWIM for ISM
-/// mode** — which this build does not have.
+/// **The ROM asks the SWIM for ISM mode, the chip switches, and the ROM's own
+/// read-back says so.**
 ///
-/// This is the measurement, asserted so that it cannot be lost. The sequence
-/// the ROM writes to the IWM-mode register is
+/// The mode switch, from the *SWIM Chip User's Reference* page 12:
+///
+/// > To select the ISM set, you must write to the GCR mode register **four
+/// > times in a row** with this bit set to "1", "0", "1","1", respectively.
+///
+/// and this is Apple's ROM performing it, byte for byte:
 ///
 /// ```text
-///   r15 W 57     Q7 on, so with Q6 already on the write loads the mode: $57
-///   r15 W 17     and again: $17
-///   r15 W 57     and $57, twice
-///   r4  W f5     switch 4, and the write loads the mode: $75
+///   Q7+ W 57     Q7 on, so with Q6 already on the write loads the mode: $57
+///   Q7+ W 17     and again: $17
+///   Q7+ W 57     $57
+///   Q7+ W 57     $57 — the fourth, and the chip is an ISM from here
 /// ```
 ///
-/// `$57` and `$75` both have **bit 6** set, and a Macintosh Plus ROM never
-/// writes that bit at all — it writes `$17` once and nothing else. So this is
-/// the Classic asking for something a Plus's controller does not have, and it
-/// is where the 1.44 MB path stops. `docs/platforms/mac-classic.md` and
-/// `src/dev/mac/swim.rs` say what is missing behind it, and why there is no
-/// invented register table here.
+/// `1, 0, 1, 1`, not `1, 0, 1, 0`. Bit 6 of each is the `ISM/IWM` select, and
+/// a Macintosh Plus ROM never writes that bit at all — it writes `$17` once
+/// and nothing else.
+///
+/// What is asserted past the sequence is the ROM's **own** verification of it,
+/// which is worth more than ours: having switched, it writes `$F5`, `$F6` and
+/// `$F7` to the ISM's phase register and reads each back from the other half
+/// of the address space. An IWM answers a read of address 12 with its data
+/// register, so three matching read-backs are the ROM satisfying itself that
+/// this is a SWIM — and they are the check that the register file was wired up
+/// at the right addresses rather than merely transcribed.
 #[test]
 fn the_rom_asks_the_swim_for_ism_mode() {
     let Some(image) = rom_image("Classic.ROM") else {
         return;
     };
     let mut b = board(image, &[], synthetic_1440k());
-    let swim = tap(&b, 0xC0_0000, 0x200, 0x20_0000);
+    let tap = swim_tap(&b);
     advance(&mut b, "mac-classic-swim", 10);
+    tap.dump("mac-classic: the controller, named");
 
-    let folded = swim.folded();
-    println!("mac-classic: the controller's register trace, folded:");
-    for (line, n) in &folded {
-        if *n == 1 {
-            println!("  {line}");
-        } else {
-            println!("  {line}  x{n}");
-        }
-    }
+    let folded = tap.folded();
     let lines: Vec<&str> = folded.iter().map(|(l, _)| l.as_str()).collect();
-    for want in ["r15 W 17", "r15 W 57", "r4  W f5"] {
-        assert!(
-            lines.contains(&want),
-            "the ROM's mode-register sequence has changed: `{want}` is not in the trace"
-        );
-    }
-    // And it did look at the drive: the status register answered with `SENSE`
-    // both ways, which only happens if the drive's own lines were addressed.
+    let at = |want: &str| lines.iter().position(|l| l.starts_with(want));
+
+    // The mode writes, with bit 6 going 1, then 0, then 1 again. The run is
+    // looked for *after* the first `$57`, because the ROM loads the mode
+    // register with a plain `$17` well before it — the same write a Plus makes
+    // once and never repeats — and that one is not part of the sequence.
+    let one = at("IWM Q7+    W 57").expect("a mode write with bit 6 set");
+    let zero = lines[one..]
+        .iter()
+        .position(|l| l.starts_with("IWM Q7+    W 17"))
+        .map(|i| i + one)
+        .expect("a mode write with bit 6 clear after it");
+    let again = lines[zero..]
+        .iter()
+        .position(|l| l.starts_with("IWM Q7+    W 57"))
+        .map(|i| i + zero)
+        .expect("and bit 6 set again after that");
     assert!(
-        lines.iter().any(|l| l.ends_with("b5")) && lines.iter().any(|l| l.ends_with("35")),
-        "the drive's status lines were never read"
+        one < zero && zero < again,
+        "the mode register's bit 6 did not go 1, 0, 1: {one} {zero} {again}"
     );
+
+    // And then the ROM's own read-back of the ISM's phase register.
+    for (write, read) in [
+        ("ISM wPhase      W f5", "ISM rPhase      R f5"),
+        ("ISM wPhase      W f6", "ISM rPhase      R f6"),
+        ("ISM wPhase      W f7", "ISM rPhase      R f7"),
+    ] {
+        let w = at(write).unwrap_or_else(|| panic!("the ROM never wrote `{write}`"));
+        let r = at(read).unwrap_or_else(|| {
+            panic!("the chip did not answer `{read}`: the ISM register set is not selected")
+        });
+        assert!(r > w, "the read-back of `{write}` came before the write");
+    }
     assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
 }
 
@@ -1114,8 +1043,16 @@ fn white_in(b: &Board, (left, top, w, h): (u32, u32, u32, u32)) -> usize {
 const MENU_BAR: (u32, u32, u32, u32) = (0, 0, 512, 20);
 
 /// Where the Finder puts the startup volume's icon: the top right corner,
-/// below the menu bar.
-const DISK_ICON: (u32, u32, u32, u32) = (440, 24, 64, 48);
+/// below the menu bar, cropped to the icon and its label rather than to the
+/// corner around them.
+///
+/// The crop is what makes the assertion mean something. The desktop behind it
+/// is the Macintosh's one-pixel checkerboard, which is **exactly** half ink,
+/// and this box measures 50.0 % on the insert-disk screen, 49.9 % on "Welcome
+/// to Macintosh" and 65.1 % once the Finder has put the volume there — so a
+/// threshold anywhere between them separates a mounted disk from anything
+/// else, and a box with more desktop in it would not.
+const DISK_ICON: (u32, u32, u32, u32) = (458, 28, 32, 42);
 
 /// **Mac OS 6.0.8 boots to the Finder desktop.**
 ///
@@ -1197,8 +1134,9 @@ fn the_rom_boots_mac_os_to_the_finder() {
     let icon_area = (DISK_ICON.2 * DISK_ICON.3) as usize;
     println!("mac-classic: the disk icon corner is {icon} white pixels of {icon_area}");
     assert!(
-        icon * 3 > icon_area * 2,
-        "the startup volume's icon is not on the desktop: {icon} of {icon_area} white"
+        icon * 5 > icon_area * 3,
+        "the startup volume's icon is not on the desktop: {icon} of {icon_area} white, and the \
+         bare desktop behind it is exactly half"
     );
 
     let hash = picture(&b, "mac-classic-boot", BOOT_SECONDS);
