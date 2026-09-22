@@ -191,7 +191,12 @@ impl MemOps for Ports {
             // The head has to be where it is at the cycle the guest looks: a
             // guest polling the handshake register is asking exactly that.
             self.iwm.sync(attrs.debug);
-            ism.note_overrun(&self.iwm);
+            if !attrs.debug {
+                // `note_overrun` *takes* the separator's flag, so a debugger
+                // looking at the error or handshake register would consume the
+                // one thing the guest was about to be told (invariant 5).
+                ism.note_overrun(&self.iwm);
+            }
             *byte = ism.read(Ports::index(offset), &self.iwm, attrs.debug);
             return Ok(());
         }
