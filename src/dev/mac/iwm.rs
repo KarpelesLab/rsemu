@@ -159,7 +159,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.iwm";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
 /// How many bytes of address space the sixteen switches occupy: the board puts
 /// the register selects on A9-A12, so `16 * 512`.
@@ -207,6 +207,16 @@ struct Mechanism {
     write_protect: bool,
     /// Whether it is a double-sided (800K) mechanism.
     double_sided: bool,
+    /// Whether it is a **SuperDrive** — an FDHD mechanism, which reads
+    /// high-density MFM as well as Apple's GCR.
+    ///
+    /// Apple's note leaves `CA2:CA1:CA0 = 101` unassigned on the 800K
+    /// mechanism and says nothing about later ones; a Macintosh Classic ROM
+    /// reads that address while working out what is on the cable, so this is
+    /// where a SuperDrive answers. A Plus's 800K drive has it clear and the
+    /// address reads as the cable's pull-up, which is exactly what it did
+    /// before this field existed.
+    superdrive: bool,
     /// Which cylinder the head is over, 0 to [`MAX_TRACK`].
     track: u8,
     /// The step direction the last write to register 0 set: `false` steps
@@ -242,6 +252,7 @@ impl Mechanism {
             disk: false,
             write_protect: false,
             double_sided: true,
+            superdrive: false,
             track: 0,
             outward: false,
             motor: false,
@@ -301,8 +312,9 @@ impl Mechanism {
             // The note leaves `CA2:CA1:CA0 = 101` unassigned. A Macintosh
             // Plus ROM does read address 10 while it is working out what is on
             // the cable; an 800K mechanism drives nothing there and it reads
-            // as the pull-up. (Later drives put the SuperDrive line here.)
-            10 | 11 => true,
+            // as the pull-up. A **SuperDrive** answers here — asserted low,
+            // like every other line on this cable.
+            10 | 11 => !self.superdrive,
             // Number of sides: 1 on a double-sided mechanism. One of the two
             // lines in this table that is *not* inverted.
             12 => self.double_sided,
@@ -782,6 +794,8 @@ pub struct Iwm {
     region: RegionRef,
     /// Which of the two cable positions has a drive on it, for reset.
     installed: [bool; 2],
+    /// Whether those mechanisms are SuperDrives, for the same.
+    superdrive: bool,
     /// The pin, kept alive here: a net holds only a `Weak` to its sinks.
     pins: Mutex<Vec<Arc<SelPin>>>,
 }
@@ -819,8 +833,27 @@ impl Iwm {
     /// The same, saying exactly which cable positions are occupied.
     #[must_use]
     pub fn with_drives(installed: [bool; 2]) -> Iwm {
+        Iwm::with_mechanisms(installed, false)
+    }
+
+    /// The same, with **SuperDrive** mechanisms on the cable: they answer the
+    /// drive register at `CA2:CA1:CA0 = 101`, which is how a computer finds out
+    /// it can ask for high-density media.
+    ///
+    /// A `mac.iwm` never builds one — a Plus has 800K drives — but `mac.swim`
+    /// does.
+    #[must_use]
+    pub fn with_superdrives(installed: [bool; 2]) -> Iwm {
+        Iwm::with_mechanisms(installed, true)
+    }
+
+    fn with_mechanisms(installed: [bool; 2], superdrive: bool) -> Iwm {
+        let mut fresh = State::fresh(installed);
+        for drive in &mut fresh.drives {
+            drive.superdrive = superdrive;
+        }
         let shared = Arc::new(Shared {
-            state: Mutex::with_rank(LockRank::DEVICE, State::fresh(installed)),
+            state: Mutex::with_rank(LockRank::DEVICE, fresh),
             media: Mutex::with_rank(LockRank::LEAF, Media::default()),
             ticks: AtomicU64::new(0),
             next_latch: AtomicU64::new(u64::MAX),
@@ -835,6 +868,7 @@ impl Iwm {
             shared,
             region,
             installed,
+            superdrive,
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         }
     }
@@ -1005,6 +1039,7 @@ impl Device for Iwm {
             for (drive, (disk, wp)) in state.drives.iter_mut().zip(disks) {
                 drive.disk = disk;
                 drive.write_protect = wp;
+                drive.superdrive = self.superdrive;
             }
         }
         self.shared.invalidate();
@@ -1021,6 +1056,7 @@ impl Device for Iwm {
             w.write_bool(drive.disk)?;
             w.write_bool(drive.write_protect)?;
             w.write_bool(drive.double_sided)?;
+            w.write_bool(drive.superdrive)?;
             w.write_u8(drive.track)?;
             w.write_bool(drive.outward)?;
             w.write_bool(drive.motor)?;
@@ -1046,6 +1082,7 @@ impl Device for Iwm {
             drive.disk = r.read_bool()?;
             drive.write_protect = r.read_bool()?;
             drive.double_sided = r.read_bool()?;
+            drive.superdrive = r.read_bool()?;
             drive.track = r.read_u8()?.min(MAX_TRACK);
             drive.outward = r.read_bool()?;
             drive.motor = r.read_bool()?;

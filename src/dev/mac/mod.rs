@@ -8,6 +8,8 @@
 //! | [`disk`] | `dev-mac` | the disk in the drive: a 400K or 800K image, raw or in a DiskCopy 4.2 container |
 //! | [`gcr`] | `dev-mac` | Apple's 6-and-2 group-code recording: the bit stream on an 800K disk |
 //! | [`iwm`] | `dev-mac` | an Integrated Woz Machine and the 400K/800K drive on its cable |
+//! | [`swim`] | `dev-mac` | a SWIM: the IWM's superset, and the SuperDrives that read 1.44 MB media |
+//! | [`mfm`] | `dev-mac` | IBM MFM: the bit stream on a 1.44 MB high-density disk |
 //! | [`keyboard`] | `dev-mac` | the keyboard on the VIA's shift register, and the four commands it answers |
 //! | [`mouse`] | `dev-mac` | the one-button mouse: quadrature on the SCC's carrier detects and the VIA's port B |
 //! | [`via`] | `dev-mac` | a 6522 on the board's A9-A12 register select |
@@ -32,12 +34,13 @@ pub mod disk;
 pub mod gcr;
 pub mod glue;
 pub mod iwm;
-pub mod mfm;
 pub mod keyboard;
+pub mod mfm;
 pub mod mouse;
 pub mod rtc;
 pub mod scc;
 pub mod sound;
+pub mod swim;
 pub mod via;
 pub mod video;
 
@@ -58,6 +61,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     rtc::register(registry)?;
     scc::register(registry)?;
     sound::register(registry)?;
+    swim::register(registry)?;
     via::register(registry)?;
     video::register(registry)
 }
@@ -76,6 +80,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     rtc::bind(bindings)?;
     scc::bind(bindings)?;
     sound::bind(bindings)?;
+    swim::bind(bindings)?;
     via::bind(bindings)?;
     video::bind(bindings)
 }
@@ -92,6 +97,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
         rtc::schema(),
         scc::schema(),
         sound::schema(),
+        swim::schema(),
         via::schema(),
         video::schema(),
     ]
