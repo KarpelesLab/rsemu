@@ -56,6 +56,53 @@
 //! exactly the test an alias fails. `tests/mac_plus.rs` asserts both numbers
 //! on 1 MiB and on 4 MiB.
 //!
+//! # The interrupt priority encoder, and how Apple's ROM proves it is there
+//!
+//! The other thing on this chip, and it was found rather than read. A
+//! Macintosh has two interrupt sources — the VIA and the SCC — and a 68000
+//! whose three `IPL` pins carry an *encoded level* rather than three separate
+//! requests. The VIA is level 1 and the SCC is level 2, and both of those are
+//! measurements: which autovector a real ROM takes, 25 for the VIA's
+//! sixty-a-second tick chain and 26 for a carrier-detect change.
+//!
+//! What was wrong here was the sum. Wiring `/IRQ` straight to `IPL0` and
+//! `/INT` straight to `IPL1` makes "both at once" **level 3**, and a level 3
+//! that persists is a livelock on this machine:
+//!
+//! * The ROM's own vector table, which it builds in RAM, puts the level-3
+//!   autovector (vector 27, at `$6C`) at `$401AB4`, and the word there is
+//!   `$4E73` — `RTE`, per the MC68000 user's manual's instruction encodings.
+//!   The whole handler is "return".
+//! * The level-2 handler runs its entire length at `SR = $2200`, mask 2,
+//!   measured by sampling `SR` through it. It never raises the mask.
+//!
+//! So: the SCC asks, the processor enters the level-2 handler at mask 2, the
+//! VIA asks while it is in there, `IPL` becomes 3, the level-3 exception is
+//! taken, `RTE` returns to mask 2 with level 3 still asserted, and it is taken
+//! again — for ever, the stack frame pushed and popped in place. Measured, with
+//! a mouse moving: `PC` pinned at `$401AB4`, `SR = $2300`, `A7` never moving,
+//! the frame at `A7` reading `$2200 / $00401A88`, and the 60 Hz tick chain
+//! stopped. An `RTE` at that vector is only a safe thing for Apple to have
+//! shipped if **level 3 cannot be asserted**, so the board must encode:
+//!
+//! ```text
+//!   SCC   VIA   IPL1  IPL0   level
+//!    -     -     0     0       0
+//!    -     x     0     1       1     the VIA
+//!    x     -     1     0       2     the SCC
+//!    x     x     1     0       2     the SCC, with the VIA still waiting
+//! ```
+//!
+//! which is an ordinary priority encoder with the SCC on the higher input, and
+//! is why `cpu.m68k`'s own documentation says "a board with a priority encoder
+//! wires all three". The VIA's request is not lost: it is still asserted when
+//! the level-2 handler clears the SCC, and the level falls to 1 rather than to
+//! 0.
+//!
+//! It lives on this object because this object *is* the board's glue. Nothing
+//! about the boot changes: with no mouse the SCC never asks, so `IPL0` is the
+//! VIA and `IPL1` is zero, exactly what the two direct wires gave.
+//!
 //! # Why a decoder and not two mappings swapped
 //!
 //! The same reason `amiga.gary` gives: the write that clears the overlay
@@ -70,6 +117,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
@@ -81,7 +129,7 @@ use crate::core::space::{
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
-use crate::core::wire::{FanIn, Level, WireId, WireSink};
+use crate::core::wire::{Drive, FanIn, Level, WireId, WireSink, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -89,10 +137,22 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 pub const CLASS_NAME: &str = "mac.glue";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub const STATE_VERSION: u32 = 1;
+///
+/// 2 added the two interrupt inputs, which are pin levels and are saved for
+/// the reason the overlay's is.
+pub const STATE_VERSION: u32 = 2;
 
 /// The input pin the VIA's `PA4` drives.
 pub const OVERLAY_PIN: &str = "overlay";
+
+/// The input pin the VIA's `/IRQ` drives: the level-1 source.
+pub const VIA_IRQ_PIN: &str = "via_irq";
+
+/// The input pin the SCC's `/INT` drives: the level-2 source.
+pub const SCC_IRQ_PIN: &str = "scc_irq";
+
+/// The output pins carrying the encoded level to the processor, bit 0 first.
+pub const IPL_PINS: [&str; 2] = ["ipl0", "ipl1"];
 
 /// The region a `map` statement places at `$00_0000`.
 pub const LOW_REGION: &str = "low";
@@ -203,6 +263,71 @@ impl WireSink for OverlayPin {
     }
 }
 
+/// The two interrupt inputs and the two `IPL` outputs.
+///
+/// See the module docs: the level is encoded rather than summed, because
+/// Apple's ROM answers level 3 with a bare `RTE`.
+#[derive(Debug, Default)]
+struct Encoder {
+    via: AtomicBool,
+    scc: AtomicBool,
+    out: Mutex<[Option<WireSource>; 2]>,
+}
+
+impl Encoder {
+    /// The level the processor sees: the higher of the two sources.
+    fn level(&self) -> u8 {
+        if self.scc.load(Ordering::Relaxed) {
+            2
+        } else if self.via.load(Ordering::Relaxed) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Drive both pins, holding no lock across the call outward.
+    ///
+    /// `drive` rather than `set`, for the reason `mac.video` gives about its
+    /// blanking pins: a fresh source already rests at `Level::Low`, so
+    /// `set(Low)` is not a change, never reaches the processor, and leaves the
+    /// realize sweep with nothing to announce.
+    fn refresh(&self) {
+        let level = self.level();
+        let out = self.out.lock().clone();
+        for (bit, src) in out.iter().enumerate() {
+            if let Some(src) = src {
+                src.drive(Drive::strong(Level::from(level & (1 << bit) != 0)));
+            }
+        }
+    }
+}
+
+/// One of the two interrupt inputs.
+#[derive(Debug)]
+struct IrqPin {
+    encoder: Arc<Encoder>,
+    /// Which source: `false` the VIA, `true` the SCC.
+    scc: bool,
+    inputs: FanIn,
+}
+
+impl WireSink for IrqPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        let asserting = self.inputs.any_high();
+        let held = if self.scc {
+            &self.encoder.scc
+        } else {
+            &self.encoder.via
+        };
+        held.store(asserting, Ordering::Relaxed);
+        // State first, then outward. Both halves are atomics, so there is no
+        // critical section to leave (`CLAUDE.md`, re-entrancy).
+        self.encoder.refresh();
+    }
+}
+
 /// The Macintosh address decoder.
 #[derive(Debug)]
 pub struct Glue {
@@ -214,9 +339,12 @@ pub struct Glue {
     /// The objects named by `rom` and `ram`, resolved at bind.
     rom_path: String,
     ram_path: String,
-    /// The pin, kept alive here: a net holds only a `Weak` to its sinks
+    /// The interrupt priority encoder.
+    encoder: Arc<Encoder>,
+    /// The pins, kept alive here: a net holds only a `Weak` to its sinks
     /// (`ROADMAP.md` §4.3).
     pin: Mutex<Option<Arc<OverlayPin>>>,
+    irq_pins: Mutex<Vec<Arc<IrqPin>>>,
 }
 
 impl Glue {
@@ -263,8 +391,35 @@ impl Glue {
             high_region,
             rom_path,
             ram_path,
+            encoder: Arc::new(Encoder {
+                via: AtomicBool::new(false),
+                scc: AtomicBool::new(false),
+                out: Mutex::with_rank(LockRank::WIRE, [None, None]),
+            }),
             pin: Mutex::with_rank(LockRank::LEAF, None),
+            irq_pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         })
+    }
+
+    /// The interrupt level the encoder is presenting to the processor, 0 to 2.
+    ///
+    /// For a test with no wire graph; see the module docs for why it is a
+    /// level rather than a sum.
+    #[must_use]
+    pub fn interrupt_level(&self) -> u8 {
+        self.encoder.level()
+    }
+
+    /// Assert or release one of the two interrupt inputs, for a test with no
+    /// wire graph. `scc` picks which.
+    pub fn set_interrupt(&self, scc: bool, asserting: bool) {
+        let held = if scc {
+            &self.encoder.scc
+        } else {
+            &self.encoder.via
+        };
+        held.store(asserting, Ordering::Relaxed);
+        self.encoder.refresh();
     }
 
     /// Whether the ROM is what answers at zero.
@@ -370,15 +525,21 @@ impl Device for Glue {
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        // The pin level, for the reason `amiga.gary` saves its: a restore does
+        // The pin levels, for the reason `amiga.gary` saves its: a restore does
         // not re-run the wire graph, so a decoder that forgot which way it was
         // pointing would come back with the ROM over a running system's vector
-        // table.
-        w.write_bool(self.overlaid())
+        // table — and one that forgot which sources were asking would present
+        // the wrong level until the next edge.
+        w.write_bool(self.overlaid())?;
+        w.write_bool(self.encoder.via.load(Ordering::Relaxed))?;
+        w.write_bool(self.encoder.scc.load(Ordering::Relaxed))
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         self.overlay.store(r.read_bool()?, Ordering::Relaxed);
+        self.encoder.via.store(r.read_bool()?, Ordering::Relaxed);
+        self.encoder.scc.store(r.read_bool()?, Ordering::Relaxed);
+        self.encoder.refresh();
         Ok(())
     }
 
@@ -391,6 +552,18 @@ impl Device for Glue {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        if port == VIA_IRQ_PIN || port == SCC_IRQ_PIN {
+            let pin = Arc::new(IrqPin {
+                encoder: Arc::clone(&self.encoder),
+                scc: port == SCC_IRQ_PIN,
+                inputs: FanIn::new(sources),
+            });
+            self.irq_pins.lock().push(Arc::clone(&pin));
+            return Some(SinkPin {
+                sink: pin,
+                line: u32::from(port == SCC_IRQ_PIN),
+            });
+        }
         if port != OVERLAY_PIN {
             return None;
         }
@@ -400,6 +573,25 @@ impl Device for Glue {
         });
         *self.pin.lock() = Some(Arc::clone(&sink));
         Some(SinkPin { sink, line: 0 })
+    }
+
+    fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        let Some(bit) = IPL_PINS.iter().position(|p| *p == port) else {
+            return Err(Error::Config {
+                at: port.to_string(),
+                message: String::from("the Macintosh glue drives `ipl0` and `ipl1`"),
+            });
+        };
+        self.encoder.out.lock()[bit] = Some(source);
+        // No refresh here, and `mac.video` says why: a net has no sinks yet
+        // when its source is handed out, so a level driven now goes nowhere,
+        // and having driven it the realize sweep's `announce` would see no
+        // change and deliver nothing either.
+        Ok(())
+    }
+
+    fn announce(&self, _port: &str) {
+        self.encoder.refresh();
     }
 }
 
@@ -471,6 +663,10 @@ pub fn schema() -> ClassSchema {
         .region(LOW_REGION)
         .region(HIGH_REGION)
         .port(OVERLAY_PIN, PortDir::In)
+        .port(VIA_IRQ_PIN, PortDir::In)
+        .port(SCC_IRQ_PIN, PortDir::In)
+        .port(IPL_PINS[0], PortDir::Out)
+        .port(IPL_PINS[1], PortDir::Out)
 }
 
 #[cfg(test)]

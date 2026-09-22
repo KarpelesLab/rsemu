@@ -285,15 +285,26 @@ machine "mac-plus" {
   # by making PA4 an output and writing a zero, once it has sized memory.
   wire via.pa4 -> glue.overlay { pull = "up" }
 
-  # Interrupts. A Macintosh has no priority encoder: the VIA's /IRQ goes
-  # straight to IPL0 and the SCC's /INT straight to IPL1, so the VIA alone is
-  # level 1, the SCC alone is level 2, and both at once really is level 3.
-  # Which is why the SCC letting go of /INT is load-bearing rather than
-  # cosmetic: nothing between the chip and the processor can mask it.
-  # That is the hardware, not a simplification. (IPL2 is the programmer's
-  # switch, which is a button this board does not have.)
-  wire via.irq -> cpu.ipl0
-  wire scc.irq -> cpu.ipl1
+  # Interrupts. Two sources - the VIA at level 1 and the SCC at level 2, both
+  # measured from which autovector a real ROM takes - and a 68000 whose three
+  # IPL pins carry an encoded *level* rather than three requests. So they go
+  # through a **priority encoder** in the glue: the SCC wins, the VIA's request
+  # waits, and level 3 is never presented.
+  #
+  # That is not a simplification, it is what Apple's ROM says the hardware
+  # does. This file used to wire /IRQ to IPL0 and /INT to IPL1 directly, on the
+  # claim that "both at once really is level 3". It is: and the ROM's level-3
+  # autovector is a bare RTE, while its level-2 handler runs its whole length
+  # at mask 2 - so a VIA interrupt arriving inside an SCC handler livelocks the
+  # machine for ever. Which it duly did, the first time a mouse moved.
+  # `src/dev/mac/glue.rs` has the measurement.
+  #
+  # (IPL2 is the programmer's switch, which is a button this board does not
+  # have, so the encoder drives two pins and the third rests low.)
+  wire via.irq   -> glue.via_irq
+  wire scc.irq   -> glue.scc_irq
+  wire glue.ipl0 -> cpu.ipl0
+  wire glue.ipl1 -> cpu.ipl1
 
   # The video circuit's two blanking signals. Vertical blanking is the VIA's
   # CA1 and is the 60.15 Hz interrupt the whole Macintosh tick chain hangs off;

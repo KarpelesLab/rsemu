@@ -5,7 +5,9 @@ use super::*;
 use crate::core::props::{Link, Value};
 use crate::core::space::{RamStore, RomStore, RomWrite};
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+use crate::core::sync::Mutex;
 use crate::core::value::{Endian, Width};
+use crate::core::wire::{Level, WireId, WireSink, WireSource};
 use alloc::vec;
 
 const RAM_LEN: u64 = 0x10_0000;
@@ -272,4 +274,93 @@ fn the_class_is_registrable_and_its_schema_matches() {
     assert!(glue.sink(OVERLAY_PIN, &[]).is_some());
     assert!(glue.sink("ovl", &[]).is_none(), "it is called `overlay`");
     assert!(schema().port_named(OVERLAY_PIN).is_some());
+    for pin in [VIA_IRQ_PIN, SCC_IRQ_PIN] {
+        assert!(glue.sink(pin, &[]).is_some(), "{pin}");
+        assert!(schema().port_named(pin).is_some(), "{pin}");
+    }
+    for pin in IPL_PINS {
+        assert!(schema().port_named(pin).is_some(), "{pin}");
+    }
+    let err = Device::connect(&glue, "ipl2", dummy_source())
+        .expect_err("the third IPL pin is the programmer's switch, not ours")
+        .to_string();
+    assert!(err.contains("`ipl1`"), "{err}");
+}
+
+/// A wire source that drives nothing, for the pin-name check above.
+fn dummy_source() -> WireSource {
+    let wire = crate::core::wire::Wire::builder()
+        .source(WireId::new(9))
+        .build_shared();
+    WireSource::new(wire, WireId::new(9))
+}
+
+/// **The two interrupt sources are priority-encoded, not summed.**
+///
+/// Level 3 is what Apple's ROM answers with a bare `RTE`, so a board that
+/// presented it would livelock the first time a mouse moved during a vertical
+/// blanking interrupt. The module docs have the measurement; this is the
+/// arithmetic.
+#[test]
+fn both_interrupt_sources_at_once_is_the_higher_level_and_never_three() {
+    let glue = Glue::new(&props()).unwrap();
+    assert_eq!(glue.interrupt_level(), 0, "nothing is asking");
+    glue.set_interrupt(false, true);
+    assert_eq!(glue.interrupt_level(), 1, "the VIA alone");
+    glue.set_interrupt(true, true);
+    assert_eq!(glue.interrupt_level(), 2, "the SCC wins");
+    glue.set_interrupt(false, false);
+    assert_eq!(glue.interrupt_level(), 2, "the SCC alone");
+    // And the VIA's request is not lost while the SCC has the bus: put it back
+    // and take the SCC away, and the level falls to 1 rather than to 0.
+    glue.set_interrupt(false, true);
+    glue.set_interrupt(true, false);
+    assert_eq!(glue.interrupt_level(), 1);
+    glue.set_interrupt(false, false);
+    assert_eq!(glue.interrupt_level(), 0);
+}
+
+/// The level arrives on the pins as a two-bit number, which is what a 68000's
+/// `IPL` inputs are.
+#[test]
+fn the_level_reaches_the_pins_as_its_own_bits() {
+    use crate::core::wire::{Pull, Wire};
+    let glue = Glue::new(&props()).unwrap();
+    let seen = Arc::new(Mutex::new([false; 2]));
+
+    #[derive(Debug)]
+    struct Bit {
+        seen: Arc<Mutex<[bool; 2]>>,
+        bit: usize,
+    }
+    impl WireSink for Bit {
+        fn set_level(&self, _src: WireId, _line: u32, level: Level) {
+            self.seen.lock()[self.bit] = level.is_high();
+        }
+    }
+
+    for (bit, name) in IPL_PINS.iter().enumerate() {
+        let id = WireId::new(bit as u64 + 1);
+        let wire = Wire::builder()
+            .source(id)
+            .resolved(Pull::Down)
+            .sink(
+                Arc::new(Bit {
+                    seen: Arc::clone(&seen),
+                    bit,
+                }),
+                0,
+            )
+            .build_shared();
+        Device::connect(&glue, name, WireSource::new(wire, id)).expect("an output");
+        Device::announce(&glue, name);
+    }
+    assert_eq!(*seen.lock(), [false, false]);
+    glue.set_interrupt(false, true);
+    assert_eq!(*seen.lock(), [true, false], "level 1");
+    glue.set_interrupt(true, true);
+    assert_eq!(*seen.lock(), [false, true], "level 2, and IPL0 let go");
+    glue.set_interrupt(true, false);
+    glue.set_interrupt(false, false);
+    assert_eq!(*seen.lock(), [false, false]);
 }
