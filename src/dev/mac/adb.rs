@@ -289,6 +289,44 @@ struct State {
     latched: bool,
     /// Whether the attention line is being pulled low.
     int_low: bool,
+    /// Whether the byte going across is an **unsolicited** one: the
+    /// transceiver clocking the idle computer's shift register because a
+    /// device has something to say, rather than a byte of a transaction the
+    /// computer started.
+    ///
+    /// # Why this exists, and it is a measurement
+    ///
+    /// Pulling the attention line is not enough on its own, and the boot does
+    /// not show it because nothing moves a mouse during a boot. Once Mac OS
+    /// 6.0.8 is up, a Macintosh Classic leaves the link like this — read
+    /// through the VIA with a debugger, so nothing here moved a flag:
+    ///
+    /// ```text
+    ///   ORB  $7f    PB5:PB4 = 1:1, which is state 3: idle
+    ///   DDRB $f7    PB3, the attention line, is the only input
+    ///   ACR  $0c    mode 011 — shift *in* under an external clock on CB1
+    ///   IER  $a7    and the shift-register interrupt is enabled
+    /// ```
+    ///
+    /// and then it touches `ORB`, `SR` and `ACR` **not once** for the next
+    /// virtual minute, whatever the attention line does. Holding that line low
+    /// for ten thousand times as long changes nothing. The computer is not
+    /// polling a pin; it is sitting in shift-in mode waiting for a byte.
+    ///
+    /// So the transceiver clocks one at it. With that, the same machine runs
+    /// **seventy-two ADB transactions a virtual second** — `ORB = $4f` with
+    /// `SR = $3c`, Talk 0 of address 3, then states 1, 2 and 3 — and the
+    /// pointer moves. The differential says the byte's *value* is not what
+    /// matters: `$3C` and `$FF` both start it, and the computer issues its own
+    /// `$3C` either way. What matters is that a byte arrives, because that is
+    /// what sets the VIA's shift-register flag.
+    ///
+    /// Two things are therefore **inferred** rather than measured: that a real
+    /// transceiver drives nothing on the data line while it does this (the
+    /// value is not load-bearing, and `$FF` is what this file already answers
+    /// for a bus nobody is driving), and that one byte is what it sends rather
+    /// than two. Neither is distinguishable from outside at the rates tested.
+    unsolicited: bool,
     /// The tick the attention line may go back up on.
     int_until: u64,
     /// The command byte of the transaction in progress.
@@ -332,6 +370,7 @@ impl State {
             line_low: false,
             latched: false,
             int_low: false,
+            unsolicited: false,
             int_until: 0,
             command: 0,
             slot: Slot::Command,
@@ -610,7 +649,15 @@ impl State {
             } else {
                 self.data_low = false;
             }
-            self.phase = Phase::Between;
+            // An unsolicited byte is not part of a transaction, so the link
+            // goes straight back to idle and the *next* thing a device has to
+            // say can be announced the same way. Leaving it `Between` would
+            // wedge the link until the computer happened to start one.
+            self.phase = if core::mem::take(&mut self.unsolicited) {
+                Phase::Idle
+            } else {
+                Phase::Between
+            };
             self.next = NO_EVENT;
         }
     }
@@ -654,6 +701,18 @@ impl State {
     fn ask_for_attention(&mut self) {
         self.int_low = true;
         self.int_until = self.ticks + ATTENTION_TICKS;
+        // **And clock a byte at the computer**, which is the half that makes
+        // the attention line worth anything. See `State::unsolicited`.
+        if self.phase == Phase::Idle && self.lines == 3 {
+            self.unsolicited = true;
+            self.slot = Slot::Even;
+            // Nothing drives the data line: the byte's job is to arrive, not
+            // to say anything, and `to_send` answers `$FF` for a bus nobody is
+            // driving.
+            self.answered = false;
+            self.phase = Phase::Starting { out: true };
+            self.next = self.ticks + START_TICKS;
+        }
     }
 
     /// The tick the device owes itself.

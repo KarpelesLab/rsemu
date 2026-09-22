@@ -58,6 +58,8 @@ use rsemu::dev::mac::mfm;
 use rsemu::dev::mac::swim::Swim;
 use rsemu::host::display::mac::{MacScanout, capture};
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
+use rsemu::host::input::mac::MacAdbSink;
+use rsemu::host::input::{InputEvent, InputSink};
 use rsemu::machine::{Machine, catalog};
 
 /// How long a Macintosh Classic ROM file is. The socket is a 512 KiB part.
@@ -121,6 +123,9 @@ struct Board {
     scanout: MacScanout,
     swim: Arc<Swim>,
     adb: Arc<MacAdb>,
+    /// The host seam a person's pointer arrives on, which on this machine is a
+    /// device on the Apple Desktop Bus.
+    pointer: MacAdbSink,
 }
 
 /// Read the ROM out of `RSEMU_MAC_ROM_DIR`; `None` (having said why) if the
@@ -264,13 +269,79 @@ fn board(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Board {
         .unwrap_or_else(|e| panic!("the board does not realize: {e}"));
     let cpu = cores.last().expect("the binding captured the processor");
     let scanout = capture::take(&options.realize.hosts, &machine).expect("a video circuit");
+    let adb = adbs.last().expect("the binding captured the transceiver");
+    let pointer = MacAdbSink::new(Arc::clone(adb.bus()));
     Board {
         machine,
         cpu,
         scanout,
         swim: swims.last().expect("the binding captured the controller"),
-        adb: adbs.last().expect("the binding captured the transceiver"),
+        adb,
+        pointer,
     }
+}
+
+/// Run the board for `ms` milliseconds of virtual time.
+fn step_ms(b: &mut Board, ms: u64) {
+    b.machine
+        .run_for(GlobalTime::from_nanos(ms * 1_000_000))
+        .expect("it runs");
+}
+
+/// Where the ROM says the pointer is: `Mouse` at `$830`, a QuickDraw `Point`,
+/// which is `{vertical, horizontal}` and therefore *y first*.
+///
+/// A low-memory global the ROM builds, which is data rather than code.
+fn pointer_at(b: &Board) -> (u32, u32) {
+    let m = peek(b, 0x830);
+    ((m & 0xffff) as u32, (m >> 16) as u32)
+}
+
+/// Put the pointer on `(x, y)` and leave it there, with `buttons` held.
+///
+/// A **closed loop**, which is what makes it robust: the sink hands out at most
+/// four counts an axis a report so the ROM's own scaling never doubles one
+/// (`host::input::mac::MAX_COUNTS`), and the guest's `Mouse` global is read
+/// back between reports, so however many counts the cursor task drops on the
+/// way — Apple's, and a real Macintosh drops them too — the loop simply sends
+/// the rest. `tests/mac_plus.rs` pins its pointer on a screen corner instead,
+/// because a Plus's quadrature mouse has no feedback path this cheap.
+///
+/// Returns where the guest ended up.
+fn point_at(b: &mut Board, x: u32, y: u32, buttons: u8) -> (u32, u32) {
+    // **One report establishes where the host's cursor is and moves nothing**,
+    // which is the sink's rule and not an accident: a session that began by
+    // throwing the pointer at wherever the window happened to be would be
+    // worse than one that began by agreeing where it already was. So the first
+    // delivery is the guest's own position, and every one after it is the
+    // target. Without this the loop below posts the target, the sink decides
+    // the cursor was already there, and *nothing at all is sent* — which is
+    // what it did, and it looked exactly like a machine that had stopped
+    // polling its bus.
+    let (at_x, at_y) = pointer_at(b);
+    b.pointer.deliver(InputEvent::Pointer {
+        x: at_x,
+        y: at_y,
+        buttons: 0,
+    });
+    for _ in 0..600 {
+        b.pointer.deliver(InputEvent::Pointer { x, y, buttons });
+        step_ms(b, 20);
+        if pointer_at(b) == (x, y) {
+            break;
+        }
+    }
+    pointer_at(b)
+}
+
+/// Press the button at `(x, y)` and let go: move there, hold for a moment, and
+/// release.
+fn click_at(b: &mut Board, x: u32, y: u32) {
+    point_at(b, x, y, 0);
+    point_at(b, x, y, 1);
+    step_ms(b, 200);
+    point_at(b, x, y, 0);
+    step_ms(b, 200);
 }
 
 /// The whole of the ROM the three hermetic tests use: the two longwords a 68000
@@ -1351,6 +1422,291 @@ fn the_guest_writes_a_sector_and_the_image_gets_it() {
     assert!(
         b.swim.has_disk(0),
         "the startup volume left the drive while the Finder still had it mounted"
+    );
+}
+
+/// An 800K image of nothing at all: 819,200 zero bytes, which is a disk whose
+/// every sector is formatted and empty.
+///
+/// It is **not** an HFS volume — block 2 has no `BD` signature — so a Macintosh
+/// that mounts it offers to initialize it, which is the point. Nothing of
+/// anybody's is in it and nothing of anybody's is committed.
+fn blank_800k() -> Vec<u8> {
+    vec![0u8; 819_200]
+}
+
+/// The middle of the **Initialize** button, in screen pixels.
+///
+/// Measured off the picture: the Macintosh puts "This disk is improperly
+/// formatted for use in this drive. Do you want to initialize it?" in a box
+/// from about (105, 72) to (405, 180), with **Eject** on the left and
+/// **Initialize** on the right, the latter running from about x = 310 to
+/// x = 390 and y = 146 to y = 170.
+const INITIALIZE: (u32, u32) = (350, 158);
+
+/// A trace instrument: what a booted Macintosh does with a **blank 800K disk
+/// in its external drive**.
+///
+/// This is the first step of the route `docs/platforms/mac-classic.md` opens
+/// with — a Macintosh that boots can author an 800K disk for a Plus, because a
+/// Mac's own Finder is the only thing that writes HFS resource forks and Finder
+/// info correctly (`docs/upstream/fstool-hfs-resource-fork-write.md`). It
+/// asserts nothing; it prints what the machine did and leaves a picture.
+#[test]
+#[ignore = "a trace instrument, not an assertion: run it with --ignored --nocapture"]
+fn a_blank_disk_in_the_second_drive() {
+    use rsemu::dev::mac::disk::{Disk, Reader};
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let bytes = disk_image("MacOS_6.0.8_System_Startup.img");
+    if bytes.is_empty() {
+        return;
+    }
+    let secs: u64 = std::env::var("RSEMU_MAC_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(150);
+    let mut b = board(image, &[("drives", "2")], bytes);
+    // Through the handle rather than through a media slot: no shipped machine
+    // file names one for the external drive (`src/dev/mac/swim.rs` says why).
+    b.swim.insert(
+        1,
+        Disk::from_image_for(&blank_800k(), Reader::Swim).expect("an 800K image"),
+    );
+    assert!(b.swim.has_disk(1), "the blank disk went into drive 2");
+
+    let tap = swim_tap(&b);
+    for s in 1..=secs {
+        advance(&mut b, "mac-classic-two", 1);
+        if s % 10 == 0 {
+            let _ = picture(&b, "mac-classic-two", s);
+            println!(
+                "  drive 1: disk {} motor {} track {} | drive 2: disk {} motor {} track {}",
+                b.swim.has_disk(0),
+                b.swim.motor(0),
+                b.swim.track(0),
+                b.swim.has_disk(1),
+                b.swim.motor(1),
+                b.swim.track(1),
+            );
+        }
+    }
+    // The pointer, and then the **Initialize** button of the dialog the Mac
+    // puts up over a disk it cannot mount.
+    println!("mac-classic: the pointer rests at {:?}", pointer_at(&b));
+    println!(
+        "mac-classic: {} ADB transactions, last {:?}, lines {:?}",
+        b.adb.bus().transactions(),
+        b.adb.bus().last_exchange(),
+        b.adb.bus().lines(),
+    );
+    let landed = point_at(&mut b, INITIALIZE.0, INITIALIZE.1, 0);
+    println!("mac-classic: the pointer is at {landed:?}");
+    println!(
+        "mac-classic: {} ADB transactions, last {:?}, MTemp {:#010x} RawMouse {:#010x}",
+        b.adb.bus().transactions(),
+        b.adb.bus().last_exchange(),
+        peek(&b, 0x828),
+        peek(&b, 0x82c),
+    );
+    let _ = picture(&b, "mac-classic-two", 900);
+    click_at(&mut b, INITIALIZE.0, INITIALIZE.1);
+    for s in 1..=60 {
+        advance(&mut b, "mac-classic-two", 1);
+        if s % 5 == 0 {
+            let _ = picture(&b, "mac-classic-two", 1000 + s);
+            println!(
+                "  drive 2: motor {} track {} written {}",
+                b.swim.motor(1),
+                b.swim.track(1),
+                b.swim.iwm().disk(1).is_some_and(|d| d.written()),
+            );
+        }
+    }
+
+    // Only the lines that name drive 2, folded: the rest is the startup volume
+    // and is already written up.
+    println!("mac-classic: the controller, drive 2 only:");
+    for (line, n) in tap.folded() {
+        if line.contains("drv2") {
+            println!("  {line}  x{n}");
+        }
+    }
+    let after = b.swim.iwm().disk(1).expect("a disk");
+    println!(
+        "mac-classic: drive 2's disk has {}been written",
+        if after.written() { "" } else { "not " }
+    );
+}
+
+/// A trace instrument: what the VIA's Apple Desktop Bus registers do once the
+/// Finder is up, which is what says whether the system is polling the bus.
+#[test]
+#[ignore = "a trace instrument, not an assertion: run it with --ignored --nocapture"]
+fn does_the_system_poll_the_bus() {
+    use rsemu::core::space::{MemOps, Region, RegionKind};
+    use rsemu::core::value::Endian;
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let bytes = disk_image("MacOS_6.0.8_System_Startup.img");
+    if bytes.is_empty() {
+        return;
+    }
+    let mut b = board(image, &[], bytes);
+    advance(&mut b, "mac-classic-poll", BOOT_SECONDS + 10);
+
+    /// A tap that counts `(register, write, value)` triples.
+    #[derive(Debug)]
+    struct ViaTap {
+        ops: Arc<dyn MemOps>,
+        counts: std::sync::Mutex<std::collections::BTreeMap<(u8, bool, u8), u64>>,
+    }
+    impl MemOps for ViaTap {
+        fn read(
+            &self,
+            offset: u64,
+            dst: &mut [u8],
+            attrs: MemAttrs,
+        ) -> rsemu::core::space::MemResult {
+            let r = self.ops.read(offset, dst, attrs);
+            if !attrs.debug {
+                let reg = ((offset / 0x200) & 15) as u8;
+                *self
+                    .counts
+                    .lock()
+                    .unwrap()
+                    .entry((reg, false, dst[0]))
+                    .or_insert(0) += 1;
+            }
+            r
+        }
+        fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> rsemu::core::space::MemResult {
+            if !attrs.debug {
+                let reg = ((offset / 0x200) & 15) as u8;
+                *self
+                    .counts
+                    .lock()
+                    .unwrap()
+                    .entry((reg, true, src[0]))
+                    .or_insert(0) += 1;
+            }
+            self.ops.write(offset, src, attrs)
+        }
+        fn constraints(&self) -> rsemu::core::space::AccessConstraints {
+            self.ops.constraints()
+        }
+    }
+
+    let tap = {
+        let space = b.machine.space("mem").expect("mem");
+        let mut guard = space.topology();
+        let ops = {
+            let (_, m) = guard
+                .mappings()
+                .find(|(_, m)| m.base == 0xE8_0000)
+                .expect("the VIA's mapping");
+            let mut leaf = m.region.clone();
+            while let RegionKind::Alias(a) = leaf.kind() {
+                let next = a.target().clone();
+                leaf = next;
+            }
+            match leaf.kind() {
+                RegionKind::Io(ops) => Arc::clone(ops),
+                other => panic!("not an MMIO aperture: {other:?}"),
+            }
+        };
+        let constraints = ops.constraints();
+        let tap = Arc::new(ViaTap {
+            ops,
+            counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        });
+        let io = Region::io("viatap", 0x2000, Arc::clone(&tap) as Arc<dyn MemOps>)
+            .with_constraints(constraints.with_endian(Endian::Big));
+        let mirror = Region::mirror("viatap.mirror", Arc::new(io), 0x8_0000).expect("a mirror");
+        guard
+            .map_with_priority(Arc::new(mirror), 0xE8_0000, 100)
+            .expect("the tap maps");
+        tap
+    };
+
+    // One report at a time, straight at the device, to see which way the
+    // guest moves and by how much.
+    println!(
+        "mac-classic: the bus addresses are {:?}",
+        b.adb.bus().addresses()
+    );
+    for (dx, dy) in [(4i8, 0i8), (4, 0), (0, 4), (-4, 0), (0, -4)] {
+        let before = pointer_at(&b);
+        b.adb.bus().mouse(dx, dy, false);
+        step_ms(&mut b, 100);
+        println!(
+            "mac-classic: mouse({dx}, {dy}) moved the pointer {before:?} -> {:?}",
+            pointer_at(&b)
+        );
+    }
+
+    // One virtual second of a finished desktop, with nothing moving.
+    advance(&mut b, "mac-classic-poll", 1);
+    let quiet: Vec<_> = tap
+        .counts
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&k, &v)| (k, v))
+        .collect();
+    tap.counts.lock().unwrap().clear();
+    // And one with the pointer being pushed.
+    let _ = point_at(&mut b, 300, 200, 0);
+    let moving: Vec<_> = tap
+        .counts
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&k, &v)| (k, v))
+        .collect();
+
+    let names = [
+        "ORB", "ORA(h)", "DDRB", "DDRA", "T1CL", "T1CH", "T1LL", "T1LH", "T2CL", "T2CH", "SR",
+        "ACR", "PCR", "IFR", "IER", "ORA",
+    ];
+    for (label, rows) in [("idle", quiet), ("pointer moving", moving)] {
+        println!("mac-classic: the VIA over one virtual second, {label}:");
+        for ((reg, write, value), n) in rows {
+            if matches!(reg, 0 | 2 | 10 | 11 | 13 | 14) {
+                println!(
+                    "  {:<6} {} {value:02x}  x{n}",
+                    names[usize::from(reg)],
+                    if write { "W" } else { "R" }
+                );
+            }
+        }
+    }
+    println!(
+        "mac-classic: {} ADB transactions, last {:?}, lines {:?}",
+        b.adb.bus().transactions(),
+        b.adb.bus().last_exchange(),
+        b.adb.bus().lines(),
+    );
+    // And the registers as they stand, read the way a debugger reads them —
+    // `mac.via` honours `MemAttrs::debug`, so none of this moves a flag.
+    let space = b.machine.space("mem").expect("mem");
+    let via = |reg: u64| {
+        space
+            .read(0xef_e1fe + reg * 0x200, Width::U8, MemAttrs::DEBUG)
+            .unwrap_or(0) as u8
+    };
+    println!(
+        "mac-classic: ORB {:02x} DDRB {:02x} SR {:02x} ACR {:02x} PCR {:02x} IFR {:02x} \
+         IER {:02x}",
+        via(0),
+        via(2),
+        via(10),
+        via(11),
+        via(12),
+        via(13),
+        via(14),
     );
 }
 

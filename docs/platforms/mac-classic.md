@@ -603,6 +603,32 @@ slot handed the drive, and `rsemu run` never writes a floppy image back out.
 A disk that *has* been written is carried in the snapshot, because a restore
 cannot rebuild it from the machine file the way an untouched one is rebuilt.
 
+## The second drive, and what a Macintosh does with a blank disk in it
+
+The route this file opens with — a Macintosh that boots authors an 800K disk
+for a Plus — needs the machine to have somewhere to write, so `mac.swim` and
+`mac.iwm` take an `image2` property for the second mechanism on the cable.
+**No shipped machine file names it**, and that is `machine::realize`'s rule
+rather than a decision here: a slot a board names and nothing binds is an
+error, so `image2 = "floppy2"` in `mac-classic.machine` would mean every test
+that assembles the board has to bind zero bytes for it, and one of them belongs
+to another subsystem. A test that wants a disk in the external drive puts it
+there through `Swim::insert`, which is what the property does anyway.
+
+With `-p drives=2` and 819,200 zero bytes in the second drive —
+formatted cells with no HFS volume on them — Mac OS 6.0.8 boots, mounts its own
+startup volume, and at about ninety virtual seconds puts up
+
+```text
+  This disk is improperly formatted for use in this drive. Do you want to
+  initialize it?                                   [ Eject ]   [ Initialize ]
+```
+
+which is the machine offering to do exactly what this route needs. Clicking
+**Initialize** needs a pointer, and ledger item 3 is why that does not work
+yet. `tests/mac_classic.rs::a_blank_disk_in_the_second_drive` is the instrument
+and it leaves the picture behind.
+
 ## The ledger: what to build next, in the order it is likely to matter
 
 1. ~~**The eject at 69 seconds.**~~ **Settled, and it was the mechanism.** The
@@ -636,16 +662,62 @@ cannot rebuild it from the machine file the way an untouched one is rebuilt.
    still in the drive at the end of the boot.
 2. ~~**Writing to a disk.**~~ **Built**, and Apple's own code is what proves
    it. See "The write path", below.
-3. **A host keymap, and the mouse.** `mac.adb` carries a keyboard at address 2
+3. **The pointer moves, and it goes the wrong way.** This is the one to pick
+   up next, and most of it is now measured.
+
+   `src/host/input/mac.rs` grew a `MacAdbSink`, the Apple Desktop Bus
+   counterpart of the sink a Plus's quadrature mouse has: an absolute host
+   position in, at most four counts an axis a report out, the rest owed to the
+   next report. That was the easy half.
+
+   **The system does not poll the bus, and pulling the attention line does not
+   make it.** Read through the VIA with a debugger once Mac OS 6.0.8 is up:
+
+   ```text
+     ORB  $7f    PB5:PB4 = 1:1, state 3 — idle
+     DDRB $f7    PB3, the attention line, is the only input
+     ACR  $0c    mode 011 — shift *in* under an external clock on CB1
+     IER  $a7    and the shift-register interrupt is enabled
+   ```
+
+   and then it touches `ORB`, `SR` and `ACR` **not once** for the next virtual
+   minute, whatever the attention line does — holding it low ten thousand times
+   longer changes nothing. The computer is not watching a pin. It is sitting in
+   shift-in mode waiting for a **byte**.
+
+   Clock one at it and the machine wakes up: **seventy-two ADB transactions a
+   virtual second**, `ORB = $4f` with `SR = $3c` — Talk 0 of address 3, the
+   mouse — then states 1, 2 and 3, and `Mouse` at `$830` starts moving.
+   `State::unsolicited` is that, and the differential says the byte's *value*
+   is not what matters: `$3C` and `$FF` both start it and the computer issues
+   its own `$3C` either way.
+
+   **What is still wrong**: every poll delivers `$FF $FF`, which the Macintosh
+   reads as a mouse report of (-1, -1) with the button up, so the pointer
+   creeps to the top left corner and stays there. Posting `mouse(4, 0)`,
+   `mouse(0, 4)`, `mouse(-4, 0)` — any of them, one report each — moves the
+   pointer by exactly (-1, -1), so **the device's data is not reaching the
+   transfer at all**; the bus addresses are still `[2, 3]`, so it is not that
+   the System moved the devices. The transceiver's `answered` flag is the
+   thing to look at: `ask_for_attention` clears it to set the unsolicited byte
+   up, and a poll that arrives while that byte is still going across abandons
+   the transfer with `unsolicited` still set, which then makes the *next*
+   transfer end in the wrong phase. That is a hypothesis, not a measurement,
+   and the next session should instrument the transceiver's own phase across
+   one poll before changing anything.
+
+   None of this is reachable from `rsemu run` yet: nothing wires `MacAdbSink`
+   into the VNC or CLI front ends, so the board behaves exactly as it did.
+4. **A host keymap.** `mac.adb` carries a keyboard at address 2
    and a mouse at address 3 and will report a key transition or a movement
    through Talk 0, and `mac.mouse` now drives the pointer — but nothing turns a
    host keysym into an ADB key code. The Plus's `mac.keyboard` cannot be reused
    for the codes: it speaks the *Guide*'s Table 7-6 transition codes, which are
    a different encoding from ADB's.
-4. **The NCR 5380.** `src/dev/ncr5380.rs` exists and the Plus's `$580000`
+5. **The NCR 5380.** `src/dev/ncr5380.rs` exists and the Plus's `$580000`
    window is modelled; a Classic with an internal hard disk is the
    configuration most of them shipped in, and it is the way off a floppy.
-5. **The sound**, which a Classic has in the same place a Plus does.
+6. **The sound**, which a Classic has in the same place a Plus does.
 
 ## How the ambiguities were settled
 

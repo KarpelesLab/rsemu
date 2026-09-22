@@ -1,18 +1,23 @@
 //! A person's pointer, as a Macintosh's mouse receives it.
 //!
-//! One [`InputSink`], the Macintosh's counterpart of [`MouseSink`]:
+//! Two [`InputSink`]s, the Macintosh's counterpart of [`MouseSink`]:
 //! [`MacMouseSink`] turns absolute pointer positions into counts for a
-//! `mac.mouse`. It delivers straight into the device's host object, downstream
-//! of the frontend's own `input:` channel — the event was recorded when the
-//! frontend posted it, so posting again on the device's channel would record it
-//! twice. `input::amiga` set the shape.
+//! `mac.mouse` — a Plus's quadrature mouse, two pulse trains on the VIA and the
+//! SCC — and [`MacAdbSink`] does the same job for a Classic, where the pointer
+//! is a **device on the Apple Desktop Bus**. Both deliver straight into the
+//! device's host object, downstream of the frontend's own `input:` channel —
+//! the event was recorded when the frontend posted it, so posting again on the
+//! device's channel would record it twice. `input::amiga` set the shape.
 //!
 //! [`MouseSink`]: super::MouseSink
 //!
-//! There is no keyboard half here. `mac.keyboard` takes the *Guide*'s own
-//! transition codes and nothing in this tree turns a keysym into one; Figure
-//! 7-6 has the table and the scans of it in circulation are not clean enough to
-//! transcribe. `docs/platforms/mac-plus.md`'s ledger carries it.
+//! There is no keyboard half here, on either seam. `mac.keyboard` takes the
+//! *Guide*'s own transition codes and `mac.adb` takes ADB key codes, and
+//! nothing in this tree turns a keysym into either: Figure 7-6 has the first
+//! table and the scans of it in circulation are not clean enough to transcribe,
+//! and inventing the second is precisely the failure
+//! `docs/platforms/mac-plus.md` records under "The drive's register file was
+//! invented". Both platform ledgers carry it.
 
 #[cfg(feature = "dev-mac")]
 use alloc::sync::Arc;
@@ -127,6 +132,90 @@ impl InputSink for MacMouseSink {
             dy.clamp(-32_767, 32_767) as i32,
             buttons,
         );
+    }
+}
+
+/// How many counts one report may carry per axis.
+///
+/// **Four**, and the number is the ROM's rather than the bus's. An Apple
+/// Desktop Bus mouse's register 0 packs a seven-bit signed delta an axis, so
+/// the wire would take sixty-three; but the Macintosh's own cursor task
+/// *doubles* a movement of six or more counts in one 60.15 Hz tick
+/// ([`crate::dev::mac::mouse::DEFAULT_STEP_TICKS`] has the table, measured on a
+/// Plus, and a Classic's ROM scales the same way), and a guest that accelerates
+/// cannot be pointed at anything by a host whose cursor is absolute: the
+/// pointer runs ahead, pins at an edge, and the two never agree again.
+///
+/// Four is under the threshold on both axes at once, which matters because the
+/// threshold is on the two together. A far target therefore takes several
+/// reports, and that is what the remainder in [`MacAdbSink`] is for — the
+/// caller posts the same absolute position again and the rest of the distance
+/// follows.
+#[cfg(feature = "dev-mac")]
+pub const MAX_COUNTS: i64 = 4;
+
+/// An [`InputSink`] that moves the mouse on a `mac.adb` bus.
+///
+/// Converts as [`MacMouseSink`] does — it keeps where the host's cursor was and
+/// sends the difference, the first event only establishing a position — and
+/// hands out at most [`MAX_COUNTS`] an axis per report, carrying the rest.
+/// Posting the same position again sends the next instalment, so a caller that
+/// wants the pointer somewhere delivers until it arrives.
+///
+/// A Macintosh mouse has **one** button, so only bit 0 of a report's buttons
+/// crosses; a right-click has nowhere to go.
+#[cfg(feature = "dev-mac")]
+#[derive(Debug)]
+pub struct MacAdbSink {
+    adb: Arc<crate::dev::mac::adb::Adb>,
+    /// Where the pointer has been told to go, and the button then held.
+    at: Mutex<Option<(i64, i64, u8)>>,
+}
+
+#[cfg(feature = "dev-mac")]
+impl MacAdbSink {
+    /// Move the mouse on `adb`.
+    #[must_use]
+    pub fn new(adb: Arc<crate::dev::mac::adb::Adb>) -> MacAdbSink {
+        MacAdbSink {
+            adb,
+            at: Mutex::new(None),
+        }
+    }
+
+    /// Move the mouse on the first Apple Desktop Bus this build opened, if it
+    /// has one.
+    #[must_use]
+    pub fn open(hosts: &crate::core::hosts::HostObjects) -> Option<MacAdbSink> {
+        use crate::dev::mac::adb::bus;
+        let name = bus::names(hosts).into_iter().next()?;
+        let adb = bus::get(hosts, &name).ok().flatten()?;
+        Some(MacAdbSink::new(adb))
+    }
+}
+
+#[cfg(feature = "dev-mac")]
+impl InputSink for MacAdbSink {
+    fn deliver(&self, event: InputEvent) {
+        let InputEvent::Pointer { x, y, buttons } = event else {
+            return;
+        };
+        let (x, y) = (i64::from(x), i64::from(y));
+        let buttons = buttons & 1;
+        let (dx, dy, moved_buttons) = {
+            let mut at = self.at.lock();
+            let (px, py, pb) = at.unwrap_or((x, y, 0));
+            let dx = (x - px).clamp(-MAX_COUNTS, MAX_COUNTS);
+            let dy = (y - py).clamp(-MAX_COUNTS, MAX_COUNTS);
+            // Advance by what is being sent, so the rest is still owed.
+            *at = Some((px + dx, py + dy, buttons));
+            (dx, dy, pb != buttons)
+        };
+        if dx == 0 && dy == 0 && !moved_buttons {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        self.adb.mouse(dx as i8, dy as i8, buttons != 0);
     }
 }
 
