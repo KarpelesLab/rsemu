@@ -290,6 +290,25 @@ impl Swim {
     pub fn new(props: &Props) -> Result<Swim> {
         let mut r = props.reader();
         let drives = r.or("drives", 1u64)?;
+        // What is on the **external** port. A Classic's own drive is always a
+        // SuperDrive; the one on the back is whatever was plugged in, and an
+        // 800K mechanism there is what authors a disk a Macintosh Plus can
+        // read (see `Swim::with_mechanisms`).
+        let external = r.or("external", alloc::string::String::from("superdrive"))?;
+        let external = match external.as_str() {
+            // `hd` and `dd` rather than `1440k` and `800k` because the machine
+            // description's own lexer reads a bare `800k` as a *size* — the
+            // quoted spellings work too, and this one cannot be mistyped into
+            // a number.
+            "superdrive" | "hd" | "1440k" => true,
+            "dd" | "800k" => false,
+            other => {
+                return Err(Error::Property(alloc::format!(
+                    "property `external`: a cable takes a `superdrive` (also `hd`) or a plain \
+                     800K mechanism (`dd`), not `{other}`"
+                )));
+            }
+        };
         let image = r.optional_media("image")?.map(|m| m.bytes().to_vec());
         let image2 = r.optional_media("image2")?.map(|m| m.bytes().to_vec());
         r.finish()?;
@@ -298,7 +317,7 @@ impl Swim {
                 "property `drives`: a SWIM's cable takes one or two mechanisms, not {drives}"
             )));
         }
-        let swim = Swim::with_drives([true, drives == 2]);
+        let swim = Swim::with_mechanisms([true, drives == 2], [true, external]);
         // An empty slot is an empty drive rather than a bad image: a Macintosh
         // with no disk in it is the ordinary case and the one the ROM draws a
         // picture for.
@@ -327,7 +346,22 @@ impl Swim {
     /// The same, saying exactly which cable positions are occupied.
     #[must_use]
     pub fn with_drives(installed: [bool; 2]) -> Swim {
-        let iwm = Arc::new(Iwm::with_superdrives(installed));
+        Swim::with_mechanisms(installed, [true, true])
+    }
+
+    /// The same, saying what is on **each** cable position.
+    ///
+    /// A Classic with a plain **800K** drive on its external port is
+    /// `[true, false]`, and it is what this board needs to author a disk a
+    /// Macintosh Plus can read: a mechanism that cannot do high density gets
+    /// formatted as 800K Apple GCR, which is the only thing a Plus's IWM
+    /// understands. Nothing on this cable tells the computer which *medium* is
+    /// in a drive — that line is still unestablished
+    /// (`docs/platforms/mac-classic.md`) — but which *drive* is on the cable
+    /// it can see, and that is enough.
+    #[must_use]
+    pub fn with_mechanisms(installed: [bool; 2], superdrive: [bool; 2]) -> Swim {
+        let iwm = Arc::new(Iwm::with_mechanisms(installed, superdrive));
         // The IWM's own aperture, forwarded rather than copied. A region's
         // MMIO ops are reachable through its kind, which is what makes this a
         // delegation and not a second implementation of sixteen soft switches.
@@ -607,6 +641,13 @@ pub static SWIM_CLASS: DeviceClass = DeviceClass {
             summary: "the media slot holding the disk in the internal drive; empty is no disk",
         },
         PropertySpec {
+            name: "external",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "what is on the external port: `superdrive` (default) or `dd`, a plain \
+                      800K mechanism",
+        },
+        PropertySpec {
             name: "image2",
             kind: ValueKind::Media,
             required: false,
@@ -640,6 +681,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("drives", ValueKind::Uint).range(1, 2))
+        .prop(PropSchema::new("external", ValueKind::Str))
         .prop(PropSchema::new("image", ValueKind::Media))
         .prop(PropSchema::new("image2", ValueKind::Media))
         .region("")

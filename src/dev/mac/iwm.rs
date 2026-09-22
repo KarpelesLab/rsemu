@@ -1590,8 +1590,15 @@ pub struct Iwm {
     region: RegionRef,
     /// Which of the two cable positions has a drive on it, for reset.
     installed: [bool; 2],
-    /// Whether those mechanisms are SuperDrives, for the same.
-    superdrive: bool,
+    /// Whether each of those mechanisms is a SuperDrive, for the same.
+    ///
+    /// **Per cable position**, because a real compact Macintosh's ports took
+    /// whatever was plugged into them: an 800K drive on the back of a Classic
+    /// beside its internal SuperDrive was an ordinary machine, and it is the
+    /// configuration that lets one author a disk a Plus can read — a drive
+    /// that cannot do high density is formatted GCR 800K, which is exactly
+    /// what a Plus's IWM wants.
+    superdrive: [bool; 2],
     /// The pin, kept alive here: a net holds only a `Weak` to its sinks.
     pins: Mutex<Vec<Arc<SelPin>>>,
 }
@@ -1638,7 +1645,7 @@ impl Iwm {
     /// The same, saying exactly which cable positions are occupied.
     #[must_use]
     pub fn with_drives(installed: [bool; 2]) -> Iwm {
-        Iwm::with_mechanisms(installed, false)
+        Iwm::with_mechanisms(installed, [false, false])
     }
 
     /// The same, with **SuperDrive** mechanisms on the cable: they answer the
@@ -1649,13 +1656,18 @@ impl Iwm {
     /// does.
     #[must_use]
     pub fn with_superdrives(installed: [bool; 2]) -> Iwm {
-        Iwm::with_mechanisms(installed, true)
+        Iwm::with_mechanisms(installed, [true, true])
     }
 
-    fn with_mechanisms(installed: [bool; 2], superdrive: bool) -> Iwm {
+    /// The same, saying what is on **each** cable position: a Macintosh with a
+    /// SuperDrive inside and a plain 800K drive on the back is
+    /// `[true, false]`, and it is the configuration that authors a disk a
+    /// Macintosh Plus can read.
+    #[must_use]
+    pub fn with_mechanisms(installed: [bool; 2], superdrive: [bool; 2]) -> Iwm {
         let mut fresh = State::fresh(installed);
-        for drive in &mut fresh.drives {
-            drive.superdrive = superdrive;
+        for (drive, &sd) in fresh.drives.iter_mut().zip(superdrive.iter()) {
+            drive.superdrive = sd;
         }
         let shared = Arc::new(Shared {
             state: Mutex::with_rank(LockRank::DEVICE, fresh),
@@ -2249,10 +2261,15 @@ impl Device for Iwm {
             *state = State::fresh(self.installed);
             state.sel = sel;
             state.ticks = ticks;
-            for (drive, (disk, wp)) in state.drives.iter_mut().zip(disks) {
+            for ((drive, (disk, wp)), &sd) in state
+                .drives
+                .iter_mut()
+                .zip(disks)
+                .zip(self.superdrive.iter())
+            {
                 drive.disk = disk;
                 drive.write_protect = wp;
-                drive.superdrive = self.superdrive;
+                drive.superdrive = sd;
             }
         }
         self.shared.invalidate();

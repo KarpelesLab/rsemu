@@ -1538,7 +1538,17 @@ fn a_blank_disk_in_the_second_drive() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(150);
-    let mut b = board(image, &[("drives", "2")], bytes);
+    // **A plain 800K mechanism on the external port**, which is what makes
+    // this route work at all: a drive that cannot do high density has its
+    // disks formatted as 800K Apple GCR, and that is the only thing a
+    // Macintosh Plus's IWM can read. `RSEMU_MAC_EXTERNAL=superdrive` puts a
+    // SuperDrive there instead, which is the differential.
+    let external = std::env::var("RSEMU_MAC_EXTERNAL").unwrap_or_else(|_| String::from("dd"));
+    let mut b = board(
+        image,
+        &[("drives", "2"), ("external", external.as_str())],
+        bytes,
+    );
     // Through the handle rather than through a media slot: no shipped machine
     // file names one for the external drive (`src/dev/mac/swim.rs` says why).
     // `RSEMU_MAC_BLANK=1440k` puts a high-density blank in instead, which is
@@ -1548,6 +1558,10 @@ fn a_blank_disk_in_the_second_drive() {
         Ok("1440k") => vec![0u8; mfm::BYTES],
         _ => blank_800k(),
     };
+    println!(
+        "mac-classic: the external drive is a {external}, with a {}-byte blank in it",
+        blank.len()
+    );
     b.swim.insert(
         1,
         Disk::from_image_for(&blank, Reader::Swim).expect("a blank image"),

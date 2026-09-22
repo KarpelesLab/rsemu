@@ -720,15 +720,28 @@ worth writing down rather than guessing at.
 * The failure is now *late* — after the medium has been written — so it is a
   different question from the four above, most likely the verify pass or the
   volume the Macintosh writes after the format.
-* **The route needs more than this even when it succeeds.** A SuperDrive with
-  nothing on the cable to say what medium is in it gets formatted as **1.44 MB
-  MFM**: the ROM never writes the Setup register for drive 2, so bit 2 stays
-  clear ("Setting the bit selects GCR mode; clearing it selects the normal
-  operating mode", page 22) and so does bit 6 ("This bit must be set for GCR
-  operation"). A Macintosh Plus cannot read what comes out. So an 800K disk
-  authored this way wants the density line the drive register file has never
-  had — the unassigned `CA2:CA1:CA0 = 101` with `SEL` low is where it would
-  sit, and that is still not established.
+* **The blank is formatted as 1.44 MB MFM whatever drive it is in**, which a
+  Macintosh Plus cannot read — and **putting a plain 800K mechanism on the
+  external port does not change it**, which is a measured negative result
+  rather than a guess. `mac.swim` takes `external = "dd"` for exactly that
+  configuration, which a real Classic could have and which ought to settle the
+  question without inventing a signal; the mechanism then answers the
+  SuperDrive line with the cable's pull-up, the ROM reads it (`rHandshake R
+  1a`, `SENSE` high — "not a SuperDrive"), and the System **still** drives the
+  disk through the ISM in MFM. It never writes the Setup register **at all**
+  after the boot — zero writes of register 5 in twenty thousand accesses — so
+  bit 2 stays clear ("Setting the bit selects GCR mode; clearing it selects the
+  normal operating mode", page 22) and so does bit 6 ("This bit must be set for
+  GCR operation"), and it never drops to the IWM register set either: **zero**
+  IWM accesses for drive 2 against 20,591 ISM ones.
+
+  With an 800K cylinder under it — 76,140 cells for zone 0 — a 1.44 MB MFM
+  track laps itself: the head laid **215,991** cells into it, nearly three
+  revolutions, each overwriting the last, and nothing decodes.
+
+  So *how a Macintosh is told to format 800K GCR* is the open question, and it
+  is not the drive's own SuperDrive line. The real density line remains
+  unestablished and this sidesteps rather than answers it.
 
 ## The ledger: what to build next, in the order it is likely to matter
 

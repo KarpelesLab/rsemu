@@ -81,6 +81,15 @@ machine "mac-classic" {
   # SuperDrive alone, 2 adds the external one at the back.
   param drives = 1
 
+  # And what that external one is. A Classic's own drive is always a
+  # SuperDrive; the one on the back is whatever was plugged into it, and an
+  # **800K** mechanism there was an ordinary thing to own. It matters because a
+  # drive that cannot do high density gets its disks formatted as 800K Apple
+  # GCR - which is the only thing a Macintosh Plus's IWM can read. Nothing on
+  # this cable says which *medium* is in a drive; which *drive* is on the cable
+  # it can see. `superdrive` (also `hd`) or `dd`, a plain 800K mechanism.
+  param external = "superdrive"
+
   # -- the crystal -----------------------------------------------------------
   #
   # One oscillator: 15.6672 MHz, the dot clock, exactly as a Plus has. The
@@ -147,7 +156,9 @@ machine "mac-classic" {
   # container. An unbound or empty slot is an empty drive.
   param  bitrate = 1000000
   osc    diskbit = bitrate Hz
-  object swim "mac.swim" { drives = drives, clock = diskbit, image = "floppy" }
+  object swim "mac.swim" {
+    drives = drives, external = external, clock = diskbit, image = "floppy"
+  }
 
   param  rtcdate = "2026-01-01T00:00:00"
   osc    rtcxtal = 32768 Hz
