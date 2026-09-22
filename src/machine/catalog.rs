@@ -702,6 +702,26 @@ pub static MAC_PLUS: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/mac-plus.machine"),
 };
 
+/// A Macintosh Classic, when this build has the board classes.
+///
+/// The Plus's shape with the three differences that matter: a **512 KiB** ROM
+/// socket, a **SWIM** in the disk controller's window rather than an IWM, and
+/// **ADB** rather than the Plus's serial keyboard. The SWIM is what makes the
+/// board able to read a **1.44 MB** high-density disk, so this is the compact
+/// Macintosh that boots Mac OS off a system disk people actually have. The
+/// `macrom` slot takes the 512 KiB ROM image and `floppy` takes a 1.44 MB,
+/// 800K or 400K image. `machines/mac-classic.machine` carries the wiring and
+/// `docs/platforms/mac-classic.md` the ledger.
+#[cfg(feature = "machine-mac-classic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-mac-classic")))]
+pub static MAC_CLASSIC: CatalogEntry = CatalogEntry {
+    name: "mac-classic",
+    summary: "a Macintosh Classic: a 7.83 MHz 68000, a 512 KiB ROM, a SWIM that reads 1.44 MB \
+              disks, ADB, and 512x342 one-bit video read out of main memory",
+    media: &["macrom", "floppy"],
+    source: include_str!("../../machines/mac-classic.machine"),
+};
+
 /// A Commodore Amiga 500, when this build has the board classes.
 ///
 /// A 68000, chip RAM at zero behind the `OVL` overlay, both 8520 CIAs, Agnus,
@@ -961,6 +981,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&M68K_MINI);
     #[cfg(feature = "machine-mac-plus")]
     out.push(&MAC_PLUS);
+    #[cfg(feature = "machine-mac-classic")]
+    out.push(&MAC_CLASSIC);
     #[cfg(feature = "machine-amiga-a500")]
     out.push(&AMIGA_A500);
     #[cfg(feature = "machine-amiga-a600")]
@@ -2576,6 +2598,16 @@ mod tests {
                 0x00, 0x00, 0x00, 0x08, // PC  = $00000008
                 0x60, 0xfe, // BRA .
             ],
+            // And the Classic's, whose stack pointer is the top of its default
+            // 1 MiB. `tests/mac_classic.rs` assembles the board around it and
+            // checks that every chip answers where a real ROM was measured to
+            // look for it, then boots the user's own ROM on it.
+            #[cfg(feature = "machine-mac-classic")]
+            ("mac-classic", "macrom") => &[
+                0x00, 0x10, 0x00, 0x00, // SSP = $00100000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             #[cfg(feature = "machine-amiga-a500")]
             ("amiga-a500", "kickstart") => &[
                 0x00, 0x08, 0x00, 0x00, // SSP = $00080000
@@ -2763,6 +2795,9 @@ mod tests {
             // nothing this needs said.
             #[cfg(feature = "machine-mac-plus")]
             ("mac-plus", "floppy") => &[],
+            // And the Classic's, for the same reason.
+            #[cfg(feature = "machine-mac-classic")]
+            ("mac-classic", "floppy") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

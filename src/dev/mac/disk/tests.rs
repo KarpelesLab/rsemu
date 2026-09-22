@@ -86,7 +86,10 @@ fn a_swim_takes_a_1440k_image_and_gets_an_mfm_disk() {
     for (block, chunk) in image.chunks_mut(512).enumerate() {
         chunk[..4].copy_from_slice(&(block as u32).to_be_bytes());
     }
-    for bytes in [image.clone(), dc42("System Startup", DISK_FORMAT_1440K, 0x22, &image, &[])] {
+    for bytes in [
+        image.clone(),
+        dc42("System Startup", DISK_FORMAT_1440K, 0x22, &image, &[]),
+    ] {
         let disk = Disk::from_image_for(&bytes, Reader::Swim).expect("a SWIM reads one");
         assert_eq!(disk.density(), Density::Mfm);
         assert_eq!(disk.sides(), 2);

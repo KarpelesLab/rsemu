@@ -334,7 +334,10 @@ pub fn encode_track(sectors: &[Sector]) -> Track {
             for &b in &sector.data {
                 w.byte(b);
             }
-            let crc = crc16(crc16(0xffff, &[SYNC_A1, SYNC_A1, SYNC_A1, mark]), &sector.data);
+            let crc = crc16(
+                crc16(0xffff, &[SYNC_A1, SYNC_A1, SYNC_A1, mark]),
+                &sector.data,
+            );
             w.byte((crc >> 8) as u8);
             w.byte(crc as u8);
             w.fill(GAP_BYTE, GAP3);
@@ -383,9 +386,7 @@ pub fn decode_track(track: &Track) -> (Vec<Sector>, Vec<Bad>) {
     while i < marks.len() {
         // The third of a run: the two before it are 16 and 32 cells earlier.
         let third = marks[i];
-        let run = i + 2 < marks.len()
-            && marks[i + 1] == third + 16
-            && marks[i + 2] == third + 32;
+        let run = i + 2 < marks.len() && marks[i + 1] == third + 16 && marks[i + 2] == third + 32;
         if !run {
             i += 1;
             continue;
@@ -525,9 +526,7 @@ pub fn block_of(cylinder: u8, head: u8, sector: u8) -> Option<usize> {
     {
         return None;
     }
-    Some(
-        (usize::from(cylinder) * SIDES + usize::from(head)) * SECTORS + usize::from(sector - 1),
-    )
+    Some((usize::from(cylinder) * SIDES + usize::from(head)) * SECTORS + usize::from(sector - 1))
 }
 
 #[cfg(test)]

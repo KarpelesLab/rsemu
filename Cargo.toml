@@ -3235,6 +3235,21 @@ net-pktkit = ["dev-net", "std", "dep:pktkit"]
 # of what has been ruled out and what is left. Adds no dependencies.
 machine-mac-plus = ["cpu-m68k", "dev-mac"]
 
+# The `mac-classic` board (machines/mac-classic.machine plus the classes it
+# names): a Macintosh Classic (1990). The same compact-Macintosh shape as
+# `machine-mac-plus` -- a 7.8336 MHz 68000, the ROM overlay at zero, the VIA at
+# $EFE1FE, the SCC's two windows, 512x342 one-bit video out of the top of main
+# memory -- with the three differences that matter: a **512 KiB** ROM socket, a
+# **SWIM** in the disk controller's window instead of an IWM, and **ADB**
+# instead of the Plus's serial keyboard. What that gets you over
+# `machine-mac-plus` is the ability to read a **1.44 MB** high-density disk,
+# which is what a Plus's IWM and 800K mechanism physically cannot do -- so this
+# is the board that **boots Mac OS** from the system disks people actually have.
+# The `macrom` slot takes the 512 KiB ROM and `floppy` takes a 1.44 MB, 800K or
+# 400K image, raw or in a DiskCopy 4.2 container. `docs/platforms/mac-classic.md`
+# carries the ledger. Adds no dependencies.
+machine-mac-classic = ["cpu-m68k", "dev-mac"]
+
 machine-ne2k-mini = ["cpu-z80", "dev-ne2000"]
 
 [[bench]]

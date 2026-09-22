@@ -441,7 +441,9 @@ impl Disk {
         let sectors: Vec<mfm::Sector> = (1..=mfm::SECTORS as u8)
             .filter_map(|s| {
                 let block = mfm::block_of(cylinder, head, s)?;
-                let data = self.data.get(block * DATA_BYTES..(block + 1) * DATA_BYTES)?;
+                let data = self
+                    .data
+                    .get(block * DATA_BYTES..(block + 1) * DATA_BYTES)?;
                 Some(mfm::Sector::new(cylinder, head, s, data))
             })
             .collect();

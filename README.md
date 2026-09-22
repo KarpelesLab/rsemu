@@ -652,6 +652,34 @@ priority-encodes its two interrupts, which the first mouse to move found by
 livelocking the machine; and why a Plus cannot read a 1.44 MB disk whatever
 else is built.
 
+`mac-classic` is the **Macintosh Classic** (1990), and it is here for one
+reason: a Plus has an IWM and an 800K drive, and the system software people
+actually have is on 1.44 MB disks. A Classic reads those, so it is the shortest
+path to a Macintosh that boots — and once one boots, its own Finder can author
+an 800K disk for the Plus, which is the only thing that writes HFS resource
+forks correctly. It is the same compact-Macintosh shape with three differences
+that matter: a **512 KiB ROM** whose own checksum only covers the first half of
+it, the **Apple Desktop Bus** where a Plus has its serial keyboard, and a
+**SWIM** where a Plus has an IWM. Apple's own Classic ROM runs it to the
+**insert-disk screen** — the grey desktop, the arrow cursor, the blinking floppy
+with a question mark — having sized memory, initialised the SCC, written its
+parameter RAM back, reset the Apple Desktop Bus and walked all sixteen bus
+addresses asking each for register 3 (finding the keyboard at 2 and the mouse at
+3, which is where a Macintosh leaves them), probed the drive, and seen that the
+mechanism is a **SuperDrive**. A 1.44 MB image goes into that drive, becomes IBM
+MFM cells — `A1A1A1` sync with the missing clock derived from the encoding rule
+rather than quoted, ID and data address marks, CRC-16/CCITT — and turns at 300
+rpm under a head the ROM can step, with all 2,880 blocks making the round trip
+through the encoder. What is left is **one chip**: the ROM asks the SWIM for
+**ISM mode**, and no document available to this project states that register
+file, so there is none here rather than an invented one. Two real defects fell
+out on the way and both are fixed: the ROM re-asserts the overlay 5.4 seconds
+into startup, which on a board that reads the pin as the decode puts the ROM
+back over the machine's own vector table mid-instruction, and it makes one word
+access to the VIA, which has to *complete* on a machine that has no bus-error
+timeout at all. `docs/platforms/mac-classic.md` has every trace, the exact
+sequence the ROM writes asking for ISM mode, and the instruments that found it.
+
 **Not one byte of any of that is in this repository, and none ever will be.**
 Kickstart is Cloanto's, Workbench is Commodore's and the Macintosh ROM is
 Apple's; the tests read the user's

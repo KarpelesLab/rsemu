@@ -1,0 +1,166 @@
+# mac-classic - a Macintosh Classic (1990). Work in progress.
+#
+#   rsemu run mac-classic --media macrom=Classic.ROM --floppy disk.img
+#
+# The Classic is a compact Macintosh with a SWIM rather than an IWM, so it
+# reads a 1.44 MB high-density disk where a Plus cannot. Everything else about
+# the board is the Plus's shape: a 68000 at 7.8336 MHz, the ROM overlay at
+# zero, a 6522 VIA, a Z8530 SCC, the clock chip, and 512 x 342 one-bit video
+# read out of the top of main memory.
+#
+# No Macintosh emulator source was consulted and the ROM was not disassembled
+# (ROADMAP.md 1, CLAUDE.md). No byte of any Apple ROM or disk image is in this
+# repository.
+
+machine "mac-classic" {
+  # -- how much memory -------------------------------------------------------
+  #
+  # A Classic shipped with 1 MiB soldered down and took an expansion card to
+  # 2 MiB or 4 MiB. Whatever this is, it repeats through the 4 MiB window and
+  # the video circuit hangs the screen buffer below the top of what is fitted,
+  # so `-p ram=4M` moves the screen as a real expansion does and the ROM finds
+  # the size for itself.
+  param ram = 1M
+
+  # How many mechanisms are on the disk cable: 1 is a Classic with its internal
+  # SuperDrive alone, 2 adds the external one at the back.
+  param drives = 1
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One oscillator: 15.6672 MHz, the dot clock, exactly as a Plus has. The
+  # processor is half of it, 7.8336 MHz, and the VIA is the 68000's E clock, a
+  # tenth of the processor - so every ratio on this board is exact
+  # (ROADMAP.md 4.2).
+  param master = 15667200
+  osc   clk    = master Hz
+
+  space mem { width = 24, endian = "big", unassigned = open-bus }
+
+  object cpu "cpu.m68k" {
+    clock  = clk / 2
+    space  = mem
+    engine = "interp"
+  }
+
+  # A Macintosh Classic ROM is 512 KiB.
+  object dram "ram" { size = ram }
+  object rom  "rom" { size = 512K, image = "macrom" }
+
+  # The address decoder, with a **latching** overlay, which is a measurement.
+  #
+  # The ROM clears the overlay the way a Plus does - it drives the VIA's PA4
+  # low once it has sized memory - and then, 5.4 virtual seconds in, while it
+  # is working through the disk controller, it writes ORA = $D9 and drives PA4
+  # **high again**. On a board that reads the pin as the decode, that puts the
+  # ROM back over the machine's own exception vector table mid-instruction: the
+  # next RTS pops a return address out of the ROM's header, takes an address
+  # error, reads its vector out of the ROM's header too, and the processor
+  # leaves the map for good. So on this board the overlay is cleared once and
+  # cannot be put back until a reset. `src/dev/mac/glue.rs` has the trace.
+  object glue "mac.glue" { rom = rom, ram = dram, overlay = "latching" }
+
+  object via "mac.via" { clock = clk / 20 }
+
+  object video "mac.video" { clock = clk, ram = dram }
+
+  # -- the disk controller ---------------------------------------------------
+  #
+  # See `src/dev/mac/swim.rs`. A SWIM, not an IWM: a superset of it, with
+  # **SuperDrive** mechanisms on the cable that take 400K and 800K Apple GCR
+  # media and 1.44 MB IBM MFM. Its sixteen soft switches are on the same
+  # A9-A12 decode the IWM's are and the block repeats every 8 KiB through the
+  # two megabytes its select covers, so $DFE1FF is switch 0 of the copy at
+  # $DFE000 exactly as on a Plus.
+  #
+  # Its clock is the medium's rather than the board's, and **one tick is one
+  # MFM cell**: MFM spends two cells on a data bit, so the 500 kbit/s data
+  # rate every high-density 3.5-inch drive runs at is a 1 MHz cell rate. An
+  # Apple GCR disk's cells are half that, so the GCR side of the chip gets
+  # every second tick - exact integer arithmetic inside one oscillator rather
+  # than two whose ratio would have to be written down somewhere else
+  # (ROADMAP.md 4.2).
+  #
+  # **How fast the disk turns is not this number.** It is this number divided
+  # by how long a cylinder is, and that is a property of the disk:
+  #
+  #   GCR, zone 0:   500,000 / 76,140  = 394 rpm, and four inner zones above it
+  #   MFM:         1,000,000 / 200,000 = 300 rpm, the same on every cylinder
+  #
+  # `image` names the `floppy` media slot: `--floppy disk.img` or
+  # `--media floppy=disk.img`, a raw 400K/800K/1.44 MB image or a DiskCopy 4.2
+  # container. An unbound or empty slot is an empty drive.
+  param  bitrate = 1000000
+  osc    diskbit = bitrate Hz
+  object swim "mac.swim" { drives = drives, clock = diskbit, image = "floppy" }
+
+  param  rtcdate = "2026-01-01T00:00:00"
+  osc    rtcxtal = 32768 Hz
+  object rtc "mac.rtc" { clock = rtcxtal, time = rtcdate }
+
+  # The Apple Desktop Bus transceiver. One tick of its clock is a microsecond.
+  param  adbrate = 1M
+  osc    adbclk  = adbrate Hz
+  object adb "mac.adb" { clock = adbclk }
+
+  object scc "mac.scc" { }
+
+  map mem 0x000000 size 0x400000 = glue.low  { endian = "big" }
+  map mem 0x600000 size 0x200000 = glue.high { endian = "big" }
+  map mem 0x400000 size 0x100000 = mirror(rom) { endian = "big" }
+
+  map mem 0x800000 size 0x200000 = mirror(scc.read)  { endian = "big" }
+  map mem 0xA00000 size 0x200000 = mirror(scc.write) { endian = "big" }
+
+  map mem 0xE80000 size 0x80000 = mirror(via) { endian = "big" }
+  map mem 0xC00000 size 0x200000 = mirror(swim) { endian = "big" }
+
+  wire via.pa4 -> glue.overlay { pull = "up" }
+
+  wire via.irq -> cpu.ipl0
+  wire scc.irq -> cpu.ipl1
+
+  # Vertical blanking is CA1 and is the 60.15 Hz interrupt the whole Macintosh
+  # tick chain hangs off. The `pull` is load-bearing: the realize sweep
+  # refreshes a *resolved* net so every sink learns its idle level, and a
+  # per-sink net has no level of its own, so a driver whose output already
+  # matches a fresh source's default announces nothing.
+  #
+  # The Plus's `H4` on PB6 is **not** here, and that is a measurement: a real
+  # Classic ROM writes DDRB = $c7 and then $f7, both of which make PB6 an
+  # *output*, where the Plus writes $87 and polls PB6 as an input. A board that
+  # drove a signal onto a pin the computer is driving would be a net with two
+  # drivers and no arbiter.
+  wire video.vblank -> via.ca1 { pull = "down" }
+
+  wire via.pa6 -> video.page2 { pull = "up" }
+
+  wire via.pb2  -> rtc.enb  { pull = "up" }
+  wire via.pb1  -> rtc.clk  { pull = "up" }
+  wire via.pb0  -> rtc.data { pull = "up" }
+  wire rtc.data -> via.pb0
+  wire rtc.irq  -> via.ca2  { pull = "up" }
+
+  # The Apple Desktop Bus. The transceiver owns the clock, exactly as the
+  # Plus's keyboard does, because the computer selected the 6522's shift-out
+  # mode that takes its clock from CB1 as an *input* - so the clock is one
+  # statement and the data line is two, one per driver. Both are open collector
+  # with pull-ups.
+  #
+  # The two state lines and the attention line are the rest of it, and which
+  # VIA pins they are on was measured rather than read: a real Classic ROM
+  # writes DDRB = $f7, leaving PB3 as port B's only input, and then ORB = $4f,
+  # which puts PB4 and PB5 low - so PB3 is what the transceiver drives and
+  # PB4/PB5 are what the computer drives. `src/dev/mac/adb.rs` has the trace.
+  wire adb.clk  -> via.cb1 { pull = "up" }
+  wire adb.data -> via.cb2 { pull = "up" }
+  wire via.cb2  -> adb.data
+  wire via.pb4  -> adb.st0 { pull = "up" }
+  wire via.pb5  -> adb.st1 { pull = "up" }
+  wire adb.int  -> via.pb3 { pull = "up" }
+
+  # "PA5  SEL": the fourth address bit of the disk drive's own register file.
+  # It lives on the VIA rather than on the controller because the chip has only
+  # three `CA` lines to spend on it and the mechanism needs four.
+  wire via.pa5 -> swim.sel { pull = "up" }
+}

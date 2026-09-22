@@ -62,8 +62,7 @@ fn a_track_is_one_revolution_long() {
     // 200,000 cells is 12,500 bytes of MFM; the eighteen sectors and their
     // gaps need 11,990 of them.
     let header = GAP4A + SYNC_BYTES + 3 + 1 + GAP1;
-    let per_sector =
-        SYNC_BYTES + 3 + 1 + 4 + 2 + GAP2 + SYNC_BYTES + 3 + 1 + DATA_BYTES + 2 + GAP3;
+    let per_sector = SYNC_BYTES + 3 + 1 + 4 + 2 + GAP2 + SYNC_BYTES + 3 + 1 + DATA_BYTES + 2 + GAP3;
     let needed = header + SECTORS * per_sector;
     assert_eq!(needed, 11_990);
     assert!(

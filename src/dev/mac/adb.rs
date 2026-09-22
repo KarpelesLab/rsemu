@@ -306,7 +306,7 @@ struct State {
     /// Key transitions waiting to be reported: an ADB key code with bit 7 set
     /// for a release.
     keys: VecDeque<u8>,
-    /// How many transactions have completed, for a test or a monitor.
+    /// How many command bytes the computer has sent — one per transaction.
     transactions: u64,
     /// The last command byte, and the last byte sent each way, for the same.
     last_command: u8,
@@ -358,7 +358,9 @@ impl State {
         // While the clock is low the line carries the bit the computer's shift
         // register presented on the falling edge.
         if let Phase::Xfer {
-            out: false, step: 1, ..
+            out: false,
+            step: 1,
+            ..
         } = self.phase
         {
             self.latched = !low;
@@ -421,7 +423,6 @@ impl State {
 
     /// A transaction ended at the idle state: apply whatever it asked for.
     fn finish(&mut self) {
-        self.transactions = self.transactions.wrapping_add(1);
         if cmd::command(self.command) == cmd::LISTEN && cmd::register(self.command) == 3 {
             // Listen register 3 is how a Macintosh moves a device off a
             // colliding address. The low byte is the handler identifier and the
@@ -446,6 +447,11 @@ impl State {
 
     /// Choose what a Talk answers, or clear `answered` if nothing does.
     fn begin_command(&mut self, byte: u8) {
+        // One per command byte, which is one per transaction. Counting the
+        // *end* of a transaction instead counts almost nothing: a Macintosh
+        // Classic ROM's bus scan goes state 0 -> 1 -> 2 -> 0 for sixteen
+        // addresses running and only reaches the idle state once, at the end.
+        self.transactions = self.transactions.wrapping_add(1);
         self.command = byte;
         self.last_command = byte;
         self.last_received = byte;
@@ -465,8 +471,8 @@ impl State {
         if cmd::command(byte) != cmd::TALK {
             // A Listen is answered by whichever device holds the address; a
             // reserved encoding by nobody.
-            self.answered = cmd::command(byte) == cmd::LISTEN
-                && self.devices.iter().any(|d| d.address == addr);
+            self.answered =
+                cmd::command(byte) == cmd::LISTEN && self.devices.iter().any(|d| d.address == addr);
             return;
         }
         let keys = &mut self.keys;
@@ -733,7 +739,7 @@ impl Adb {
         self.update(|st| st.mouse(dx, dy, down));
     }
 
-    /// How many transactions the computer has completed.
+    /// How many transactions the computer has started: one per command byte.
     #[must_use]
     pub fn transactions(&self) -> u64 {
         self.state.lock().transactions
@@ -750,7 +756,12 @@ impl Adb {
     /// Where each device on the bus answers now, in bus order.
     #[must_use]
     pub fn addresses(&self) -> Vec<u8> {
-        self.state.lock().devices.iter().map(|d| d.address).collect()
+        self.state
+            .lock()
+            .devices
+            .iter()
+            .map(|d| d.address)
+            .collect()
     }
 
     /// Whether the transceiver is pulling `(clock, data, attention)` low.
@@ -971,7 +982,11 @@ impl WireSink for StatePin {
         self.adb.sync();
         let bit = 1u8 << self.which;
         self.adb.update(|st| {
-            let lines = if high { st.lines | bit } else { st.lines & !bit };
+            let lines = if high {
+                st.lines | bit
+            } else {
+                st.lines & !bit
+            };
             st.state_changed(lines);
         });
     }
@@ -1003,7 +1018,9 @@ impl MacAdb {
     /// A device around a bus the caller already holds.
     #[must_use]
     pub fn with(adb: Arc<Adb>) -> MacAdb {
-        let data = Arc::new(DataPin { adb: Arc::clone(&adb) });
+        let data = Arc::new(DataPin {
+            adb: Arc::clone(&adb),
+        });
         MacAdb {
             adb,
             data,
@@ -1061,13 +1078,7 @@ impl Device for MacAdb {
             Phase::Between => w.write_u8(3)?,
         }
         w.write_u8(st.lines)?;
-        for v in [
-            st.clk_low,
-            st.data_low,
-            st.line_low,
-            st.latched,
-            st.int_low,
-        ] {
+        for v in [st.clk_low, st.data_low, st.line_low, st.latched, st.int_low] {
             w.write_bool(v)?;
         }
         w.write_u64(st.int_until)?;
@@ -1101,7 +1112,9 @@ impl Device for MacAdb {
         st.next = r.read_u64()?;
         st.phase = match r.read_u8()? {
             0 => Phase::Idle,
-            1 => Phase::Starting { out: r.read_bool()? },
+            1 => Phase::Starting {
+                out: r.read_bool()?,
+            },
             2 => {
                 let out = r.read_bool()?;
                 let (bits, left, step) = (r.read_u8()?, r.read_u8()?, r.read_u8()?);
@@ -1216,10 +1229,7 @@ impl Device for MacAdb {
         });
         // The pin is kept alive here: a net holds only a `Weak` to its sinks.
         self.st0.lock().push(Arc::clone(&pin));
-        Some(SinkPin {
-            sink: pin,
-            line: 0,
-        })
+        Some(SinkPin { sink: pin, line: 0 })
     }
 
     fn is_lazy(&self) -> bool {
