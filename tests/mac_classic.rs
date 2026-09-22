@@ -294,7 +294,7 @@ fn step_ms(b: &mut Board, ms: u64) {
 /// A low-memory global the ROM builds, which is data rather than code.
 fn pointer_at(b: &Board) -> (u32, u32) {
     let m = peek(b, 0x830);
-    ((m & 0xffff) as u32, (m >> 16) as u32)
+    (m & 0xffff, m >> 16)
 }
 
 /// Put the pointer on `(x, y)` and leave it there, with `buttons` held.
