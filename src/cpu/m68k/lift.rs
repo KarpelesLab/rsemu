@@ -13,7 +13,8 @@
 //! condition codes including **X**, the shifts and rotates at a *static* count,
 //! `Bcc`/`BRA`/`DBcc`/`Scc`/`JMP`/`RTS`, `MOVEM` into registers, `LEA`,
 //! `UNLK`, `EXG`, `EXT`, `SWAP`, `MOVEQ`, `TST`, `CLR`, `NOT`, `NEG`, `NEGX`,
-//! `ADDX`, `SUBX`, `CMPM`, the bit instructions, and `NOP`, across the twelve
+//! `ADDX`, `SUBX`, `CMPM`, the bit instructions, `MOVE from SR`,
+//! `MOVE to CCR`, the immediate-to-`CCR` trio, and `NOP`, across the twelve
 //! addressing modes.
 //!
 //! Everything else ends the block with a terminator that hands the PC back to
@@ -54,7 +55,7 @@
 //! | Site | Count | Static? |
 //! | --- | --- | --- |
 //! | a data read or write | 4 per byte or word bus cycle | **no** — an odd address is an address error and costs nothing |
-//! | an instruction fetch (a prefetch queue *slide*) | 4 | **yes**, from the instruction's own length |
+//! | an instruction fetch (a prefetch queue *slide* or a refill) | 4 | **no** — a fetch from an odd address is an address error too, and a refill's target is a run-time value |
 //! | microcode idle time (`Exec::internal`) | whatever MC68000UM §8 says | **yes** for this subset |
 //!
 //! So this file emits [`Opcode::CHARGE`] for the microcode idle cycles alone,
