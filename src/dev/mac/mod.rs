@@ -3,6 +3,7 @@
 //!
 //! | Module | Feature | What it is |
 //! | --- | --- | --- |
+//! | [`adb`] | `dev-mac` | the Apple Desktop Bus transceiver on the VIA's shift register, and the keyboard and mouse on it |
 //! | [`glue`] | `dev-mac` | the address decoder: the ROM overlay at zero and the RAM window above it |
 //! | [`disk`] | `dev-mac` | the disk in the drive: a 400K or 800K image, raw or in a DiskCopy 4.2 container |
 //! | [`gcr`] | `dev-mac` | Apple's 6-and-2 group-code recording: the bit stream on an 800K disk |
@@ -26,6 +27,7 @@
 //! `docs/platforms/mac-plus.md` has the memory map, the boot ledger and what
 //! is still missing.
 
+pub mod adb;
 pub mod disk;
 pub mod gcr;
 pub mod glue;
@@ -47,6 +49,7 @@ use crate::core::error::Result;
 /// [`Error::Config`](crate::core::Error::Config) if something already claimed
 /// one of the names.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
+    adb::register(registry)?;
     glue::register(registry)?;
     iwm::register(registry)?;
     keyboard::register(registry)?;
@@ -64,6 +67,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// [`Error::Config`](crate::core::Error::Config) if one is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    adb::bind(bindings)?;
     glue::bind(bindings)?;
     iwm::bind(bindings)?;
     keyboard::bind(bindings)?;
@@ -79,6 +83,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     alloc::vec![
+        adb::schema(),
         glue::schema(),
         iwm::schema(),
         keyboard::schema(),
