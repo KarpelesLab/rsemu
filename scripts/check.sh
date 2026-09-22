@@ -641,6 +641,32 @@ stage_long() {
   # A missing AArch64 kernel used to end the stage, which would now silently
   # take the x86 gate with it.
   stage_long_x86
+  stage_long_m68k
+}
+
+# The m68k IR frontend against the m68k interpreter over a random instruction
+# stream, at a size `cargo test` cannot afford.
+#
+# Its own leg because it answers the same question as the rest of this stage --
+# does a translated engine still agree with the oracle -- but needs no fixture
+# and no board, so it always runs. `tests/m68k_lift_differential.rs` runs the
+# same sweep at a cheap default on every commit.
+#
+# The size is the point. The defect that shipped with the frontend was a block
+# whose entry instruction was lifted from memory rather than from the prefetch
+# queue, so a store two bytes ahead of the program counter -- a 68000 fetches
+# two words ahead -- desynchronised the engines. Six thousand cases were green.
+# Sixty thousand were not. A sweep is only evidence at a size that keeps
+# finding things, so this leg runs about four hundred times the committed one
+# and `.github/workflows/long-run.yml` runs it nightly.
+stage_long_m68k() {
+  local seeds programs
+  seeds="${RSEMU_M68K_DIFF_SEEDS:-2000}"
+  programs="${RSEMU_M68K_DIFF_PROGRAMS:-2000}"
+  run "long m68k differential ($((seeds * programs)) cases)" \
+    env RSEMU_M68K_DIFF_SEEDS="$seeds" RSEMU_M68K_DIFF_PROGRAMS="$programs" \
+    cargo test --release --features cpu-m68k-lift \
+      --test m68k_lift_differential -- --nocapture
 }
 
 # The same gate on the x86 core: `pc64`, a stock bzImage, both engines, quantum

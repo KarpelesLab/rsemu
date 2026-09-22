@@ -76,13 +76,36 @@ fn every_opcode_word_agrees_in_user_state_too() {
     println!("{cases} cases, 0 disagreements");
 }
 
+/// How many seeds and how many programs per seed the random sweep runs.
+///
+/// The defaults are what `cargo test` can afford. They are also **smaller than
+/// the size that found the last defect**: the prefetch-queue bug fixed in
+/// `d3d8b1c4` was green over 6,000 cases and failed over 60,000, so a sweep of
+/// this size passing is evidence of very little on its own. The nightly
+/// `long-run` workflow raises both, which is where a sweep long enough to mean
+/// something belongs — not in a gate every commit has to wait for.
+fn sweep_size() -> (u64, usize) {
+    let get = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    };
+    (
+        get("RSEMU_M68K_DIFF_SEEDS", 8),
+        get("RSEMU_M68K_DIFF_PROGRAMS", 750) as usize,
+    )
+}
+
 #[test]
 fn a_long_seeded_random_sweep_agrees_with_the_interpreter() {
-    // Eight seeds so a failure names one, and so "the sweep passed" is not a
-    // claim about one arbitrary sequence.
+    // Several seeds rather than one, so a failure names the seed that found it
+    // and so "the sweep passed" is not a claim about one arbitrary sequence.
+    let (seeds, programs) = sweep_size();
     let mut total = 0usize;
-    for seed in 1..=8u64 {
-        let (cases, found) = sweep(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 750, 6);
+    for seed in 1..=seeds {
+        let (cases, found) = sweep(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), programs, 6);
         total += cases;
         assert!(
             found.is_none(),
@@ -90,5 +113,5 @@ fn a_long_seeded_random_sweep_agrees_with_the_interpreter() {
             found.unwrap()
         );
     }
-    println!("{total} cases over 8 seeds, 0 disagreements");
+    println!("{total} cases over {seeds} seeds, 0 disagreements");
 }

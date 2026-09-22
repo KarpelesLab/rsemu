@@ -44,6 +44,14 @@ on:
         description: 'Guest seconds to compare on pc64 (default 900)'
         required: false
         default: '900'
+      m68k_seeds:
+        description: 'Seeds for the m68k differential sweep (default 200)'
+        required: false
+        default: '200'
+      m68k_programs:
+        description: 'Programs per seed for the m68k sweep (default 1250)'
+        required: false
+        default: '1250'
 
 env:
   CARGO_TERM_COLOR: always
@@ -165,4 +173,62 @@ jobs:
         with:
           name: freedos-log
           path: freedos.log
+          if-no-files-found: warn
+
+  # The m68k IR frontend against the m68k interpreter over a random instruction
+  # stream, at a size `cargo test` cannot afford.
+  #
+  # This job exists because of the defect that shipped the frontend. The engine
+  # lifted a block's entry instruction out of *memory* rather than out of the
+  # prefetch queue, so a store two bytes ahead of the program counter — a 68000
+  # fetches two words ahead — made the interpreter run the word it had already
+  # fetched while the lifted block ran whatever the store had just written. A
+  # committed sweep of **6,000 cases was green**. Sixty thousand was not.
+  #
+  # So the committed sweep's size is not evidence, and raising it until it is
+  # would put minutes on every pull request to re-run a search that only pays
+  # off when it finds something. A nightly at a hundred times the size is the
+  # right shape: `RSEMU_M68K_DIFF_SEEDS` × `RSEMU_M68K_DIFF_PROGRAMS` are the
+  # two knobs, defaulting to the cheap size for `cargo test`.
+  #
+  # `CLAUDE.md`, "CPU cores": *the interpreter is the oracle*, and a frontend is
+  # differentially tested against it **forever** — which means at a budget that
+  # keeps finding things, not once at the size that happened to pass.
+  m68k-differential:
+    name: the m68k IR frontend against the interpreter (long sweep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: long-run-m68k-differential
+      - name: sweep
+        env:
+          RSEMU_M68K_DIFF_SEEDS: ${{ github.event.inputs.m68k_seeds || '200' }}
+          RSEMU_M68K_DIFF_PROGRAMS: ${{ github.event.inputs.m68k_programs || '1250' }}
+        run: |
+          set -uo pipefail
+          rc=0
+          cargo test --release --features cpu-m68k-lift --test m68k_lift_differential \
+            -- --nocapture 2>&1 | tee m68k-differential.log || rc=$?
+          # The rate is the result, so put it in the checks list either way: a
+          # bare pass says nothing about how much was searched (CLAUDE.md, and
+          # the reason this job exists).
+          grep -E '[0-9]+ cases' m68k-differential.log | while IFS= read -r line; do
+            echo "::notice title=m68k-differential::$line"
+          done
+          if [ "$rc" -ne 0 ]; then
+            grep -E 'disagreement' m68k-differential.log | while IFS= read -r line; do
+              echo "::error title=m68k-differential::$line"
+            done
+          fi
+          exit "$rc"
+      - name: keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m68k-differential-log
+          path: m68k-differential.log
           if-no-files-found: warn
