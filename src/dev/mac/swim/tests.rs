@@ -28,12 +28,21 @@ fn the_register_file_is_the_iwms() {
     assert_eq!(status & 0x1f, 0x17, "{status:#04x}");
 }
 
-/// **The mechanism says it is a SuperDrive**, at the drive register address an
-/// 800K one leaves to the cable's pull-up.
+/// **The mechanism says it is a SuperDrive at `SEL` high, and only there.**
+///
+/// `CA2:CA1:CA0 = 101` is two drive registers, not one — address 10 with `SEL`
+/// low and address 11 with it high — and Apple's IIGS note leaves both
+/// unassigned on the 800K mechanism. Which of them a SuperDrive answers is
+/// measured rather than read, and the measurement is a real Macintosh Classic
+/// ROM's own behaviour: answering **both** makes it refuse to touch the
+/// mechanism at all, and it sits on the insert-disk screen with the motor
+/// never turning; answering only address 11 sends it into ISM mode to read the
+/// 1.44 MB disk. `src/dev/mac/iwm.rs` has the table of all three outcomes.
+///
+/// So this asserts both halves: asserted at 11, and the pull-up at 10.
 #[test]
-fn the_drive_reports_itself_as_a_superdrive() {
-    // `CA2:CA1:CA0 = 101` with `SEL` low is drive register 10: set CA0 and
-    // CA2, clear CA1, then read the status register and look at `SENSE`.
+fn the_drive_reports_itself_as_a_superdrive_at_sel_high_only() {
+    // Set CA0 and CA2, clear CA1, then read the status register's `SENSE`.
     let sense = |read: &dyn Fn(u8) -> u8| -> bool {
         let _ = read(1); // CA0 on
         let _ = read(2); // CA1 off
@@ -42,18 +51,25 @@ fn the_drive_reports_itself_as_a_superdrive() {
         read(14) & 0x80 != 0
     };
     let swim = Swim::with_drives([true, false]);
-    swim.set_sel(false);
+    swim.set_sel(true);
     assert!(
         !sense(&|i| swim.peek(i)),
-        "a SuperDrive pulls the line low, like every other line on the cable"
+        "a SuperDrive pulls address 11 low, like every other line on the cable"
+    );
+    swim.set_sel(false);
+    assert!(
+        sense(&|i| swim.peek(i)),
+        "and leaves address 10 to the pull-up, which is what the ROM requires"
     );
 
     let plus = Iwm::with_drives([true, false]);
-    plus.set_sel(false);
-    assert!(
-        sense(&|i| plus.peek(i)),
-        "an 800K mechanism leaves it to the pull-up, which is what a Plus sees"
-    );
+    for sel in [false, true] {
+        plus.set_sel(sel);
+        assert!(
+            sense(&|i| plus.peek(i)),
+            "an 800K mechanism drives neither, which is what a Plus sees"
+        );
+    }
 }
 
 /// A 1.44 MB image goes in, and a GCR one still does.
@@ -256,15 +272,14 @@ fn only_the_a1_sync_is_unique_at_every_cell_alignment() {
             c2_hits += 1;
         }
     }
-    std::println!("mac.swim: over one formatted track, {a1_hits} matches of $4489 and {c2_hits} of $5224");
-
     // Three $A1s prefix each of the eighteen ID fields and each of the
     // eighteen data fields, and nothing else on the track carries the
     // pattern — at any alignment.
     assert_eq!(
         a1_hits,
         3 * 18 * 2,
-        "the $A1 sync turns up exactly where the format puts it"
+        "the $A1 sync turns up somewhere other than where the format puts it: \
+         {a1_hits} matches of $4489 against {c2_hits} of $5224 over one track"
     );
     // The index mark's $C2 is written three times, once a revolution — and
     // the pattern turns up more often than that, which is the measurement:
@@ -324,15 +339,15 @@ fn the_separator_reads_an_id_field_and_its_crc_comes_out_zero() {
             break;
         }
     }
-    std::println!("mac.swim: the first field off the disk is {field:02x?}");
     assert_eq!(
         &field[..4],
         &[mfm::SYNC_A1, mfm::SYNC_A1, mfm::SYNC_A1, mfm::IDAM],
-        "three sync bytes and the ID address mark, in that order"
+        "three sync bytes and the ID address mark, in that order: {field:02x?}"
     );
     assert_eq!(
         iwm.mfm_crc(),
         0,
-        "the generator absorbed the field and its own CRC, so it reads zero"
+        "the generator absorbed the field and its own CRC, so it should read \
+         zero; the field was {field:02x?}"
     );
 }
