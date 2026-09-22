@@ -425,6 +425,10 @@ impl State {
             return;
         }
         self.lines = lines;
+        // The computer has taken the link over, so an unsolicited byte that was
+        // still going across is abandoned — and the flag has to go with it, or
+        // the *transaction's* last transfer would end in the wrong phase.
+        self.unsolicited = false;
         match lines {
             0 => {
                 self.slot = Slot::Command;
