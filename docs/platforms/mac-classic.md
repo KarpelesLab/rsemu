@@ -434,7 +434,7 @@ Four, and each is commented as an inference where it is written:
   absorbed *both* CRC bytes, and only one tapped at the medium has.
 * **A bus write names its register with the low three address bits**, A3 being
   documented as "the read/write line for the registers" and so saying nothing
-  further about a write. Reads decode all four bits, because three registers —
+  further about a write. Reads decode all four bits, because four registers —
   CORRECTION, ERROR, STATUS and HANDSHAKE — exist only in the high half.
 
 Addresses 6 and 7 have no documented read function; this model answers zero and
