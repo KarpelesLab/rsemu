@@ -170,6 +170,44 @@ fn reset_restores_the_overlay() {
     assert!(glue.overlaid());
 }
 
+/// A **latching** overlay is cleared once and cannot be put back, and that is
+/// a measurement rather than a convenience: a Macintosh Classic ROM drives
+/// `PA4` high again five and a half virtual seconds into startup, long after
+/// it has put its own exception vector table at address zero.
+///
+/// A reset still brings the overlay back, because the processor is about to
+/// fetch a reset vector out of whatever answers there.
+#[test]
+fn a_latching_overlay_does_not_come_back_on_a_rising_edge() {
+    let glue = Glue::new(&props().with("overlay", Value::Str("latching".into())))
+        .expect("a mode this class knows");
+    assert_eq!(glue.mode(), Mode::Latching);
+    let rom: RegionRef = Arc::new(Region::rom(
+        "rom",
+        Arc::new(RomStore::zeroed(ROM_LEN)),
+        RomWrite::Ignore,
+    ));
+    let ram: RegionRef = Arc::new(Region::ram("dram", Arc::new(RamStore::new(RAM_LEN))));
+    glue.attach(&rom, &ram, 24).expect("both map");
+
+    let pin = glue.sink(OVERLAY_PIN, &[WireId::new(1)]).expect("the pin");
+    assert!(glue.overlaid(), "asserted at power-on, as the Plus's is");
+    pin.sink.set_level(WireId::new(1), 0, Level::Low);
+    assert!(!glue.overlaid(), "software cleared it");
+    pin.sink.set_level(WireId::new(1), 0, Level::High);
+    assert!(!glue.overlaid(), "and cannot put it back");
+    glue.reset(ResetKind::Cold);
+    assert!(glue.overlaid(), "but a reset can");
+
+    // The default is the Plus's, where the pin *is* the decode.
+    let level = Glue::new(&props()).expect("the default");
+    assert_eq!(level.mode(), Mode::Level);
+    let err = Glue::new(&props().with("overlay", Value::Str("sometimes".into())))
+        .expect_err("a mode this class does not know")
+        .to_string();
+    assert!(err.contains("latching"), "{err}");
+}
+
 /// Invariant 6: the pin level round-trips, because a restore does not re-run
 /// the wire graph.
 #[test]

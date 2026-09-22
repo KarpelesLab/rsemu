@@ -249,6 +249,9 @@ impl MemOps for Window {
 #[derive(Debug)]
 struct OverlayPin {
     overlay: Arc<AtomicBool>,
+    /// Whether the overlay, once cleared, stays cleared until a reset. See
+    /// [`Mode`].
+    latching: bool,
     inputs: FanIn,
 }
 
@@ -258,8 +261,39 @@ impl WireSink for OverlayPin {
         // Active high: the Guide's port table has `ROMOVERLAY` set meaning the
         // ROM answers at zero, and the VIA's port A is all inputs out of reset
         // so the pull-up holds it there before any code has run.
-        self.overlay
-            .store(self.inputs.any_high(), Ordering::Relaxed);
+        let high = self.inputs.any_high();
+        if self.latching && high && !self.overlay.load(Ordering::Relaxed) {
+            // Cleared once is cleared for good — see [`Mode::Latching`].
+            return;
+        }
+        self.overlay.store(high, Ordering::Relaxed);
+    }
+}
+
+/// What a *rising* edge on the overlay pin does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The pin is the decode: raise it and the ROM is back at zero. A
+    /// Macintosh Plus, which never raises it again after startup.
+    Level,
+    /// The pin clears the overlay once and cannot put it back. A Macintosh
+    /// Classic, **measured**: its ROM raises `PA4` again 5.4 virtual seconds
+    /// into startup, while it is working through the disk controller, and on a
+    /// board that took that as "the ROM is back at zero" the machine lost its
+    /// own exception vector table mid-instruction — the next `RTS` popped a
+    /// return address out of the ROM's header and the processor left the map.
+    /// `docs/platforms/mac-classic.md` carries the trace and the argument.
+    Latching,
+}
+
+impl Mode {
+    /// The name a machine file writes.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Level => "level",
+            Mode::Latching => "latching",
+        }
     }
 }
 
@@ -332,6 +366,8 @@ impl WireSink for IrqPin {
 #[derive(Debug)]
 pub struct Glue {
     overlay: Arc<AtomicBool>,
+    /// What a rising edge on the overlay pin does.
+    mode: Mode,
     low: Arc<Window>,
     high: Arc<Window>,
     low_region: RegionRef,
@@ -358,6 +394,16 @@ impl Glue {
         let mut r = props.reader();
         let rom_path = r.require_link("rom")?.as_str().to_string();
         let ram_path = r.require_link("ram")?.as_str().to_string();
+        let mode = match r.or_str("overlay", Mode::Level.name())? {
+            "level" => Mode::Level,
+            "latching" => Mode::Latching,
+            other => {
+                return Err(Error::Property(format!(
+                    "property `overlay`: `level` (the pin is the decode) or `latching` (cleared \
+                     once is cleared for good), not `{other}`"
+                )));
+            }
+        };
         r.finish()?;
         // Asserted out of reset, which is what lets the processor find a reset
         // vector in a machine whose RAM holds nothing.
@@ -385,6 +431,7 @@ impl Glue {
         ));
         Ok(Glue {
             overlay,
+            mode,
             low,
             high,
             low_region,
@@ -420,6 +467,12 @@ impl Glue {
         };
         held.store(asserting, Ordering::Relaxed);
         self.encoder.refresh();
+    }
+
+    /// What a rising edge on the overlay pin does.
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// Whether the ROM is what answers at zero.
@@ -569,6 +622,7 @@ impl Device for Glue {
         }
         let sink = Arc::new(OverlayPin {
             overlay: Arc::clone(&self.overlay),
+            latching: self.mode == Mode::Latching,
             inputs: FanIn::new(sources),
         });
         *self.pin.lock() = Some(Arc::clone(&sink));
@@ -631,6 +685,13 @@ pub static GLUE_CLASS: DeviceClass = DeviceClass {
             required: true,
             summary: "main memory, which answers at zero once the overlay is cleared",
         },
+        PropertySpec {
+            name: "overlay",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "`level` (default): the pin is the decode. `latching`: cleared once is \
+                      cleared until a reset",
+        },
     ],
     construct: |props| Ok(Box::new(Glue::new(props)?)),
 };
@@ -659,6 +720,7 @@ pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("rom", ValueKind::Link).required())
         .prop(PropSchema::new("ram", ValueKind::Link).required())
+        .prop(PropSchema::new("overlay", ValueKind::Str))
         .region("")
         .region(LOW_REGION)
         .region(HIGH_REGION)
