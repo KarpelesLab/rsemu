@@ -418,6 +418,15 @@ pub(super) struct Runtime {
     declines: Vec<DeclineRow>,
     /// Fallbacks by [`STATE_CAUSES`] index.
     states: [u64; STATE_CAUSES.len()],
+    /// The address space generation [`Unlifted`] was filled under.
+    ///
+    /// The block cache has its own answer to staleness — `BlockCache::sync`
+    /// against [`Frontend::epoch`] — and [`Unlifted`] is outside it. A stale
+    /// entry there is never a *wrong* answer, because what it sends the PC to
+    /// is the oracle, but it would pin an instruction to the interpreter for
+    /// the rest of a run after a remap made it liftable. One relaxed atomic
+    /// load per call is the price of not having to reason about that.
+    generation: u64,
 }
 
 /// The counters the dispatcher does not keep.
@@ -460,6 +469,7 @@ impl Runtime {
             local: Local::default(),
             declines: Vec::new(),
             states: [0; STATE_CAUSES.len()],
+            generation: 0,
         }
     }
 
@@ -634,7 +644,18 @@ pub(super) fn advance(
         local,
         declines,
         states,
+        generation,
     } = rt;
+
+    // Derived state, invalidated by the topology generation counter
+    // (CLAUDE.md, "Devices"). The *block* cache does this itself, inside the
+    // dispatcher and at every boundary rather than every call; this is the
+    // half of the derived state that lives outside it.
+    let now = space.generation();
+    if *generation != now {
+        *generation = now;
+        unlifted.clear();
+    }
 
     // The entry work for the *first* block, done here rather than through
     // [`Frontend::enter`], because reaching the interpreter for an instruction
