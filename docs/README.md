@@ -256,6 +256,7 @@ does in the meantime.
 | | |
 | --- | --- |
 | [`upstream/fstool-qcow2-l1-bounds.md`](upstream/fstool-qcow2-l1-bounds.md) | `ensure_mapping` indexes the qcow2 L1 table with no bounds check. Worked around by opening every qcow2 read-only in the `blk_image` fuzz target; nothing in rsemu proper can guard it |
+| [`upstream/fstool-hfs-resource-fork-write.md`](upstream/fstool-hfs-resource-fork-write.md) | classic HFS can be created and read, resource forks read, but **not written**, and Finder info cannot be set. No workaround: it is what stops `mac-plus` booting an operating system, because a Macintosh file's content lives in its resource fork |
 | [`upstream/fstool-std-filesystem-feature.md`](upstream/fstool-std-filesystem-feature.md) | `fstool` 0.4.28's `std` build fails on an unconditional `compile_error!`, which is why the dependency is pinned below it |
 
 ## Deliberately excluded
