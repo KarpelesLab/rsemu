@@ -1209,14 +1209,17 @@ impl StoreLog for Host<'_> {
 /// Nothing is inlined, and that is a measurement rather than an omission.
 ///
 /// [`FastMem`] lets a backend serve an aligned load out of the software TLB
-/// without calling back into the host. A 68000 has no memory management unit,
-/// so the table would be exact — but every access this core makes is also a
-/// *bus cycle*, charged four ticks, and on the Macintosh boards a third of
-/// them land on the glue's rebasable ROM overlay, which `jit::Tlb::fill`
-/// refuses to cache at all. What is left is a table that would have to be
-/// filled, synchronised and probed to serve two thirds of two accesses per
-/// guest instruction. It is the next thing to measure, and it is not this
-/// change.
+/// without calling back into the host, and `ROADMAP.md` §9.1 makes that its
+/// first mechanism. A 68000 has no memory management unit, so the table would
+/// be exact — and `AddressSpace::read` is 41% of what this core's half of a
+/// Macintosh Plus boot costs, so there is something there to take.
+///
+/// What bounds it is the **board**, not the core: 29.9% of that board's guest
+/// accesses are decoded by `mac.glue`, which is a `MemOps` device forwarding
+/// into a private space of its own, and `jit::Tlb::fill` admits plain RAM
+/// leaves and nothing else. So the ceiling is the other 70%, reached by a
+/// table that has to be filled, synchronised at every boundary and probed on
+/// every access. It is the next thing to measure, and it is not this change.
 impl FastMem for Host<'_> {}
 
 #[cfg(test)]
