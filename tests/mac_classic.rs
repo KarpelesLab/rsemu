@@ -1604,10 +1604,26 @@ fn a_blank_disk_in_the_second_drive() {
         if s % 5 == 0 {
             let _ = picture(&b, "mac-classic-two", 1000 + s);
             println!(
-                "  drive 2: motor {} track {} written {}",
+                "  drive 2: motor {} track {} written {} underruns {} error {:02x} mode {:02x} \
+                 setup {:02x}",
                 b.swim.motor(1),
                 b.swim.track(1),
                 b.swim.iwm().disk(1).is_some_and(|d| d.written()),
+                b.swim.iwm().write_underruns(),
+                b.swim.ism().map_or(0, |i| i.error()),
+                b.swim.ism().map_or(0, |i| i.mode()),
+                b.swim.ism().map_or(0, |i| i.setup()),
+            );
+            let tally = b.swim.iwm().write_tally();
+            println!(
+                "            cells {:?} flushes {:?} sectors taken {:?}; written {:?}",
+                tally.cells,
+                tally.flushes,
+                tally.taken,
+                [
+                    b.swim.iwm().disk(0).is_some_and(|d| d.written()),
+                    b.swim.iwm().disk(1).is_some_and(|d| d.written()),
+                ],
             );
         }
     }

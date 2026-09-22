@@ -459,7 +459,21 @@ pub fn decode_track(track: &Track) -> (Vec<Sector>, Vec<Bad>) {
                 }
                 sector.deleted = mark == DDAM;
                 sector.data = data;
-                found.push(sector);
+                // **The first copy of a sector wins**, which is what a
+                // controller does: it reads a track from wherever the head is
+                // and stops when it has the sector it wanted. The scan below
+                // walks a revolution and a bit so a field straddling the index
+                // is seen whole, and that alone can show one twice — but the
+                // case that matters is a **written** track. A head that lays a
+                // field down somewhere other than where the old one was leaves
+                // both on the medium, and taking the later one hands back the
+                // bytes the write was meant to replace. `super::gcr`'s decoder
+                // has had this rule all along; this one had not, and it is why
+                // a sector the chip formatted went onto the medium correctly
+                // and came back out of the image as the zeros it had before.
+                if !found.iter().any(|s: &Sector| s.sector == sector.sector) {
+                    found.push(sector);
+                }
             }
             _ => {}
         }

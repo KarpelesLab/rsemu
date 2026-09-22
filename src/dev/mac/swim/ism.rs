@@ -490,7 +490,7 @@ impl Ism {
         let driven = (self.phase & 0x0f) | (!(self.phase >> 4) & 0x0f);
         iwm.set_phases(driven);
         iwm.set_mfm_framing(self.reading() && !self.gcr(), CRC_SEED);
-        iwm.set_writing(self.writing(), !self.gcr(), CRC_SEED);
+        iwm.set_writing(self.writing(), !self.gcr());
     }
 
     /// Read register `reg`, which is the four address lines as they stand.
@@ -777,6 +777,11 @@ impl Ism {
         if cleared || started {
             iwm.restart_mfm(CRC_SEED);
         }
+        // **Only** the Clear FIFO toggle empties the write buffer, and it
+        // happens before the processor primes it. See `Iwm::set_writing`.
+        if cleared {
+            iwm.restart_write(CRC_SEED);
+        }
         if started || (before & MODE_ACTION != 0 && now & MODE_ACTION == 0) {
             self.error = 0;
         }
@@ -789,7 +794,12 @@ impl Ism {
         // keep up with the chip." Both directions land on the same bit, and
         // the write side's flag is the head having reached a byte boundary
         // with an empty buffer.
-        if iwm.take_mfm_overrun() || (self.writing() && iwm.write_underrun()) {
+        // Both are **edges**: this register is read-to-clear (page 24, "The
+        // register is cleared by either reading it or resetting the chip"), so
+        // a level would put the bit straight back the instant the processor
+        // cleared it.
+        let late = self.writing() && iwm.take_write_underrun();
+        if iwm.take_mfm_overrun() || late {
             self.raise(ERROR_UNDERRUN);
         }
     }

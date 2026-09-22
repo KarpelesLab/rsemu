@@ -355,6 +355,117 @@ fn the_separator_reads_an_id_field_and_its_crc_comes_out_zero() {
     );
 }
 
+/// **A whole sector the ISM formats — ID field and all — is a sector the image
+/// gets back.**
+///
+/// The layout is the one a Macintosh Classic really writes, taken off the wire
+/// rather than out of a book: the trace of Mac OS 6.0.8 initializing a disk in
+/// its external drive hands the write head, per sector,
+///
+/// ```text
+///   101 x $4e   gap
+///    12 x $00   sync
+///     3 x $a1   through the *Mark* register
+///     1 x $fe   the ID address mark
+///       C H R N  the four ID bytes
+///     1 write of the CRC register, which is two bytes
+///    22 x $4e   gap 2
+///    12 x $00   sync
+///     3 x $a1   marks again
+///     1 x $fb   the data address mark
+///   512 x $f6   the format filler
+///     1 write of the CRC register
+/// ```
+///
+/// and nothing else. This is that, once, onto a blank; what it asserts is that
+/// the sector comes back **out of the image**, which means the cells decoded
+/// and both CRCs — which the *chip* supplied — held.
+///
+/// It exists because the real thing does not work yet: the Macintosh lays a
+/// whole revolution down (194,625 cells of a 200,000-cell track), the chip
+/// reports no error at all, and `Disk::absorb` recovers nothing.
+/// `docs/platforms/mac-classic.md` has the measurement. A hermetic
+/// reproduction is worth more to whoever picks this up than another ROM run.
+#[test]
+fn a_sector_the_chip_formats_comes_back_out_of_the_image() {
+    let swim = Swim::with_drives([true, false]);
+    swim.insert(0, Disk::blank_mfm());
+    let iwm = swim.iwm();
+    iwm.set_enables(Some(0), true, Some(false));
+
+    let mut tick = 0u64;
+    iwm.restart_write(ism::CRC_SEED);
+    iwm.set_writing(true, true);
+    let mut lay = |byte: u8, kind: iwm::WriteKind| {
+        assert!(iwm.push_write(byte, kind), "the buffer had room");
+        tick += 16;
+        swim.advance_to(tick);
+    };
+    let (c, h, n) = (0u8, 0u8, mfm::SIZE_CODE);
+    // A whole cylinder, which is what a format writes: eighteen sectors, each
+    // an ID field and a data field, exactly as the trace has it.
+    for r in 1..=mfm::SECTORS as u8 {
+        for _ in 0..101 {
+            lay(mfm::GAP_BYTE, iwm::WriteKind::Data);
+        }
+        for _ in 0..mfm::SYNC_BYTES {
+            lay(0x00, iwm::WriteKind::Data);
+        }
+        for _ in 0..3 {
+            lay(mfm::SYNC_A1, iwm::WriteKind::Mark);
+        }
+        for b in [mfm::IDAM, c, h, r, n] {
+            lay(b, iwm::WriteKind::Data);
+        }
+        lay(0, iwm::WriteKind::CrcHigh);
+        lay(0, iwm::WriteKind::CrcLow);
+        for _ in 0..22 {
+            lay(mfm::GAP_BYTE, iwm::WriteKind::Data);
+        }
+        for _ in 0..mfm::SYNC_BYTES {
+            lay(0x00, iwm::WriteKind::Data);
+        }
+        for _ in 0..3 {
+            lay(mfm::SYNC_A1, iwm::WriteKind::Mark);
+        }
+        lay(mfm::DAM, iwm::WriteKind::Data);
+        for _ in 0..mfm::DATA_BYTES {
+            lay(0xf6, iwm::WriteKind::Data);
+        }
+        lay(0, iwm::WriteKind::CrcHigh);
+        lay(0, iwm::WriteKind::CrcLow);
+    }
+    // Every field the head laid down decodes, with no bad CRC anywhere: the
+    // cells are checked before the image is, so a failure says which half.
+    let cells = iwm.cylinder_cells();
+    iwm.set_writing(false, true);
+    let (found, bad) = mfm::decode_track(&cells);
+    assert!(
+        bad.is_empty(),
+        "a field the head wrote did not check: {bad:?}"
+    );
+    assert_eq!(
+        found.len(),
+        mfm::SECTORS,
+        "the head laid {} sectors down and {} decoded",
+        mfm::SECTORS,
+        found.len()
+    );
+
+    // And every one of them is in the image where the zone table puts it.
+    let disk = iwm.disk(0).expect("a disk");
+    let tally = iwm.write_tally();
+    assert_eq!(tally.taken[0], mfm::SECTORS as u64, "{tally:?}");
+    for r in 1..=mfm::SECTORS as u8 {
+        let block = mfm::block_of(c, h, r).expect("a block for every sector");
+        assert_eq!(
+            disk.block(block).expect("the block"),
+            &[0xf6u8; mfm::DATA_BYTES][..],
+            "sector {r} did not come back out of the image"
+        );
+    }
+}
+
 /// **A data field the ISM writes is a data field the image gets back**, CRC and
 /// all — and the CRC is the chip's own, not one the test computed.
 ///
@@ -406,7 +517,8 @@ fn a_field_the_chip_writes_reads_back_with_its_crc_clear() {
     // field, three `$A1` marks, the data address mark, 512 bytes, and the two
     // CRC bytes the *chip* supplies.
     let data: Vec<u8> = (0..512u32).map(|i| (i * 7 + 3) as u8).collect();
-    iwm.set_writing(true, true, ism::CRC_SEED);
+    iwm.restart_write(ism::CRC_SEED);
+    iwm.set_writing(true, true);
     let mut lay = |byte: u8, kind: iwm::WriteKind| {
         assert!(iwm.push_write(byte, kind), "the buffer had room");
         tick += 16; // one MFM byte is sixteen cells
@@ -432,7 +544,7 @@ fn a_field_the_chip_writes_reads_back_with_its_crc_clear() {
     for _ in 0..8 {
         lay(mfm::GAP_BYTE, iwm::WriteKind::Data);
     }
-    iwm.set_writing(false, true, ism::CRC_SEED);
+    iwm.set_writing(false, true);
 
     // And read it back **out of the image**, which is where a decoder that
     // checks the CRC has already had its say.

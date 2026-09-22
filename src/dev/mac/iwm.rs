@@ -489,7 +489,19 @@ struct Writer {
     /// The processor was late: the head reached a byte boundary with an empty
     /// buffer. Sticky, page 11: "this bit will be reset to '0' until either the
     /// chip is reset or taken out of write mode".
+    ///
+    /// That is the **IWM's** handshake register, and sticky is its rule. The
+    /// **ISM's** ERROR register is a different register on the other half of
+    /// the chip and has the opposite one — page 24: "The register is cleared
+    /// by either reading it or resetting the chip" — so it must be told about
+    /// an underrun *once*, not on every access for ever after. `taken` is what
+    /// keeps the two apart.
     underrun: bool,
+    /// Whether the ISM has already been told about `underrun`.
+    taken: bool,
+    /// How many times the head has reached a boundary with nothing to lay
+    /// down, for an instrument. Never guest-visible.
+    underruns: u32,
     /// The CRC generator, the mirror of [`Framer::crc`].
     ///
     /// **It is preset at the first mark byte of a field**, which is the one
@@ -558,12 +570,17 @@ impl Writer {
     /// Empty the buffer and reseed the generator, leaving the mode alone. What
     /// the ISM's "clear FIFO" bit and a fresh `ACTION` do.
     fn restart(&mut self, seed: u16) {
-        let (on, mfm) = (self.on, self.mfm);
+        let (on, mfm, underruns) = (self.on, self.mfm, self.underruns);
         *self = Writer::default();
         self.on = on;
         self.mfm = mfm;
         self.crc = seed;
         self.seed = seed;
+        // The instrument is cumulative across operations on purpose: the ISM
+        // clears its ERROR register whenever `ACTION` moves, so a count that
+        // restarted with the buffer would read zero at the end of a run that
+        // had underrun thousands of times.
+        self.underruns = underruns;
     }
 
     /// How many slots are free.
@@ -634,6 +651,9 @@ impl Writer {
         if self.bits == 0 && !self.load() {
             // Late. See the module-level inference above: a zero cell, and the
             // flag stays set until the chip leaves write mode.
+            if !self.underrun {
+                self.underruns = self.underruns.wrapping_add(1);
+            }
             self.underrun = true;
             self.prev = false;
             return false;
@@ -1126,6 +1146,26 @@ fn cells_to_latch(bits: &Track, len: u64, bit: u64, rsr: u8) -> Option<u64> {
         .map(|d| d + 8)
 }
 
+/// What the write path has done to each cable position, for an instrument.
+///
+/// Three numbers rather than one, because the question a failing write asks is
+/// always *which stage lost it*: cells that never reached the medium, a
+/// cylinder that was never put back, or fields that were put back and did not
+/// decode. `tests/mac_classic.rs` prints all three, and the last time they
+/// were needed they said the cells reached the medium (194,625 of a
+/// 200,000-cell track), the cylinder was flushed once, and **nothing decoded
+/// out of it** — which is a different bug from any of the ones that had been
+/// guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteTally {
+    /// Cells the head laid on each mechanism's medium.
+    pub cells: [u64; 2],
+    /// Cylinders put back into each image.
+    pub flushes: [u64; 2],
+    /// Sectors those recovered.
+    pub taken: [u64; 2],
+}
+
 /// The disks in the two mechanisms, and the cylinder under the head.
 ///
 /// One lock for both because the second is built out of the first, and because
@@ -1137,6 +1177,8 @@ fn cells_to_latch(bits: &Track, len: u64, bit: u64, rsr: u8) -> Option<u64> {
 /// *Devices*).
 #[derive(Debug, Default)]
 struct Media {
+    /// What the write path has done, per cable position. An instrument.
+    tally: WriteTally,
     disks: [Option<Disk>; 2],
     /// Which mechanism, cylinder and side `bits` holds, or `None` when nothing
     /// has been built.
@@ -1168,7 +1210,8 @@ impl Media {
             return;
         };
         if let Some(disk) = self.disks[which].as_mut() {
-            disk.absorb(track, side, &self.bits);
+            self.tally.flushes[which] += 1;
+            self.tally.taken[which] += disk.absorb(track, side, &self.bits) as u64;
         }
     }
 }
@@ -1258,6 +1301,7 @@ impl Shared {
                 if !protect {
                     media.bits.set_bit(bit as usize, line);
                     media.dirty = true;
+                    media.tally.cells[which] += 1;
                 }
             } else {
                 line = media.bits.bit(bit as usize);
@@ -1716,26 +1760,91 @@ impl Iwm {
 
     // -- the write side ------------------------------------------------------
 
-    /// Turn the write head on or off, restarting the buffer either way with
-    /// `seed` in its CRC generator.
+    /// Turn the write head on or off.
     ///
     /// `mfm` says whether a byte becomes sixteen MFM cells or its own eight:
     /// an ISM out of GCR mode writes the first, an IWM and an ISM in GCR mode
     /// the second. Idempotent, for the reason [`Iwm::set_mfm_framing`] gives —
     /// an ISM pushes its whole configuration at the mechanism after every
-    /// register write, and a restart on each of those would throw away the byte
-    /// the head is in the middle of.
-    pub fn set_writing(&self, on: bool, mfm: bool, seed: u16) {
+    /// register write, and acting on each of those would disturb the byte the
+    /// head is in the middle of.
+    ///
+    /// **This does not empty the buffer.** Emptying it is the Clear FIFO
+    /// toggle's job and nothing else's — *SWIM Chip User's Reference*, page
+    /// 23: "Toggling the clear FIFO bit high then low clears the FIFO to begin
+    /// a read or write operation, and initializes the CRC generator with its
+    /// starting value." A Macintosh toggles Clear FIFO, **then primes the FIFO
+    /// with two bytes**, and only then sets `ACTION`; a chip that emptied the
+    /// buffer when `ACTION` rose would throw those two away and start every
+    /// write with the head already late. That is what it did, and one
+    /// underrun is all it takes — page 24 again: "When any of the bits is set,
+    /// the Error bit in the Handshake register will also be set", and the
+    /// formatter polls that bit nine thousand times a track without ever
+    /// reading the ERROR register that would clear it.
+    pub fn set_writing(&self, on: bool, mfm: bool) {
         {
             let mut state = self.shared.state.lock();
             if state.writer.on == on && state.writer.mfm == mfm {
                 return;
             }
-            state.writer.restart(seed);
             state.writer.on = on;
             state.writer.mfm = mfm;
+            if !on {
+                // Page 11: the handshake's underrun bit is reset "until either
+                // the chip is reset or taken out of write mode".
+                state.writer.underrun = false;
+                state.writer.taken = false;
+            }
         }
         self.shared.republish();
+    }
+
+    /// Empty the write buffer and reseed its generator: the Clear FIFO toggle.
+    pub fn restart_write(&self, seed: u16) {
+        {
+            let mut state = self.shared.state.lock();
+            state.writer.restart(seed);
+        }
+        self.shared.republish();
+    }
+
+    /// Whether the head has underrun since the ISM was last told, clearing the
+    /// edge.
+    ///
+    /// The **level** stays for the IWM's own handshake register, which is
+    /// sticky by its own rule; this is the edge the ISM's read-to-clear ERROR
+    /// register wants. Telling it on every access instead would re-raise the
+    /// bit the instant the processor cleared it.
+    pub fn take_write_underrun(&self) -> bool {
+        let mut state = self.shared.state.lock();
+        if state.writer.underrun && !state.writer.taken {
+            state.writer.taken = true;
+            return true;
+        }
+        false
+    }
+
+    /// How many times the head has reached a byte boundary with nothing to lay
+    /// down, since the buffer was last emptied. An instrument.
+    #[must_use]
+    pub fn write_underruns(&self) -> u32 {
+        self.shared.state.lock().writer.underruns
+    }
+
+    /// What the write path has done, per cable position. An instrument.
+    #[must_use]
+    pub fn write_tally(&self) -> WriteTally {
+        self.shared.media.lock().tally
+    }
+
+    /// The cells of the cylinder under the head, as they stand.
+    ///
+    /// Derived state, and an instrument: a test that has just written a track
+    /// can hand it to the decoder itself and be told *why* a field did not
+    /// come back, which `Disk::absorb` only reports as a count.
+    #[must_use]
+    pub fn cylinder_cells(&self) -> Track {
+        self.shared.media.lock().bits.clone()
     }
 
     /// Whether the head is in write mode.

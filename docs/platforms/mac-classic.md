@@ -639,35 +639,71 @@ dialogue:
 ```
 
 **Three clicks land, the Macintosh steps the head to cylinder 40 and starts
-laying a format down, and then it gives up.** That is the wall this pass ends
-at, and it is a sharp one.
+laying a format down, and then it gives up.** Two defects were found on the way
+to that and both are fixed; a third is where this pass ends.
 
-What is measured about it:
+**The Clear FIFO toggle owns the write buffer, and nothing else does.**
+*SWIM Chip User's Reference*, page 23: "Toggling the clear FIFO bit high then
+low clears the FIFO to begin a read or write operation, and initializes the CRC
+generator with its starting value." A Macintosh toggles Clear FIFO, **then
+primes the FIFO with two bytes**, and only then sets `ACTION`. This model
+emptied the buffer when `ACTION` rose, threw those two bytes away, and started
+every write with the head already late — and one underrun is all it takes,
+because page 24 says "When any of the bits is set, the Error bit in the
+Handshake register will also be set" and the formatter polls that bit **9,837
+times a track without ever reading the ERROR register that would clear it**
+(the trace counts zero reads of address `1010`). With the toggle owning the
+buffer, the underrun count over a whole format is **0** and the error register
+reads `$00` throughout.
 
-* The format goes through the **ISM** register set — 4,376 writes of the Data
-  register, 36 of Mark and 13 of CRC on drive 2, with 9,837 reads of the
-  handshake between them — and the ROM **never writes the Setup register** for
-  it, so the chip stays in whatever mode the 1.44 MB path left it in.
-* It stops about a third of a track in: 4,376 data bytes against the ~12,500 a
-  1.44 MB cylinder holds.
-* `Disk::absorb` recovers **nothing**, so no field the head laid down decoded
-  as a readable sector with a good CRC.
-* **It is not the medium.** A 1.44 MB blank in the same drive fails in exactly
-  the same way, which rules out the obvious first guess — that the Macintosh
-  was formatting a double-density disk as high-density because nothing on the
-  cable tells it which is in there. (That line would be the unassigned drive
-  register at `CA2:CA1:CA0 = 101` with `SEL` low, which this file already
-  records as a line whose purpose was never established. It is still not
-  established, and it is not this.)
+The ERROR register itself was already read-to-clear, which page 24 requires —
+"The register is cleared by either reading it or resetting the chip" — and a
+debug read already left it alone. What was wrong beside it is that the ISM took
+the IWM's underrun flag as a **level**: page 11 makes that flag sticky for the
+*IWM's* handshake register, so a level put the ERROR bit straight back the
+instant the processor cleared it. It is an edge now, and the two registers keep
+their own rules.
 
-The likeliest next question, and it is a question rather than an answer: this
-model raises the ISM's **underrun** bit whenever the write head reaches a byte
-boundary with an empty buffer, and the handshake register's error bit with it.
-Over a single sector — which is what Mac OS writes during a boot, and what
-works — the processor is never late. Over a whole track it will be, and a
-formatter that reads the error bit would abort exactly where this one does.
-Whether a real ISM sets the bit as freely is not something any page here
-settles.
+**The first copy of a sector on a track wins.** `super::gcr`'s decoder has had
+that rule all along; `super::mfm`'s had not. A head that lays a field down
+somewhere other than where the old one was leaves *both* on the medium, and
+taking the later one hands back exactly the bytes the write was meant to
+replace. `swim::tests::a_sector_the_chip_formats_comes_back_out_of_the_image`
+is the hermetic reproduction: it writes a **whole eighteen-sector cylinder**
+through the write head in the Macintosh's own layout, taken off the wire rather
+than out of a book —
+
+```text
+  101 x $4e   gap          12 x $00  sync      3 x $a1  through Write Mark
+    1 x $fe   the ID address mark, then C H R N, then one write of Write CRC
+   22 x $4e   gap 2        12 x $00  sync      3 x $a1  marks again
+    1 x $fb   the data address mark, 512 x $f6, one write of Write CRC
+```
+
+— and asserts that every field decodes with no bad CRC and every sector lands
+in the image. It does: 194,400 cells, eighteen sectors, nothing bad. **The
+write path can format a track.**
+
+**And the machine still cannot**, which is where this stops. With the fixes in,
+a real Macintosh initializing a blank in its external drive:
+
+| | |
+| --- | --- |
+| cells the head laid on drive 2's medium | **194,625** of a 200,000-cell track |
+| underruns over the whole format | **0** |
+| the ISM's ERROR register | `$00` throughout |
+| the head's cylinder at the flush | **0**, which is what the ID fields say |
+| cylinders put back into the image | 1 |
+| sectors that came out of it | **0** |
+
+So the cells reach the medium, the chip reports nothing wrong, the head and the
+guest agree about where they are — and `mfm::decode_track` finds **no field at
+all** in what was laid down, where the same decoder finds all eighteen in the
+hermetic track. The cells on the medium are not the cells the guest handed
+over, and the next step is to say how they differ: `Iwm::cylinder_cells` hands
+a test the cylinder as it stands, so that comparison is now an offline one that
+needs no ROM. A 1.44 MB blank fails identically, which still rules out the
+media-density guess.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
