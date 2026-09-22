@@ -2,13 +2,15 @@
 //! modelled prefetch queue, and every later member of the family as a model
 //! of it.
 //!
-//! There are two execution engines and they are indistinguishable to the guest:
-//! the interpreter, and — on a 68000, behind `cpu-m68k-lift` and selected by
-//! `engine = "ir"` — a translated one that lifts guest instructions into the
-//! architecture-neutral IR and runs them on its portable backend, with the
-//! interpreter underneath everything it declines. [`lift`] has the subset and
-//! [`differential`] is the harness that keeps the two the same. The
-//! interpreter is the oracle (CLAUDE.md, "CPU cores").
+//! There are three execution engines and they are indistinguishable to the
+//! guest: the interpreter, and — on a 68000, behind `cpu-m68k-lift` plus
+//! `jit`, and selected by `engine = "jit"` and `engine = "jit-host"` — two
+//! translated ones that lift guest instructions into the architecture-neutral
+//! IR and run them on `jit`'s dispatcher, on the portable backend and on a
+//! host code generator respectively, with the interpreter underneath
+//! everything they decline. [`lift`] has the subset and [`differential`] is
+//! the harness that keeps them the same. The interpreter is the oracle
+//! (CLAUDE.md, "CPU cores").
 //!
 //! The plain 68000, as fitted to the Amiga, the Atari ST, the Mega Drive and
 //! the first Macintoshes: 32-bit registers, a 16-bit data bus, 24 address
@@ -357,7 +359,7 @@
 //! | `fpu` (private) | the coprocessor's registers, formats and arithmetic |
 //! | `transcend` (private) | its transcendentals, at 128-bit precision |
 //! | [`lift`] | the IR frontend: MC68000 guest instructions into `ir::Block`s (`cpu-m68k-lift`) |
-//! | `engine` (private) | the translated engine `engine = "ir"` selects, and its block cache |
+//! | `engine` (private) | the translated engines `engine = "jit"` and `"jit-host"` select (`cpu-m68k-lift` + `jit`) |
 //! | [`differential`] | the harness that holds the two to the interpreter's answer, forever |
 //!
 //! # Sources
@@ -393,17 +395,17 @@ mod transcend;
 // holds the two to the interpreter's answer. All three are one feature, for the
 // reason `cpu::riscv` gives: an engine that is silently not the one you asked
 // for is how a translation path stays unmeasured for a year.
-#[cfg(feature = "cpu-m68k-lift")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+#[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-m68k-lift", feature = "jit"))))]
 pub mod differential;
-#[cfg(feature = "cpu-m68k-lift")]
+#[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
 mod engine;
 // The statistics a translated core keeps are reachable through
-// `M68k::ir_stats`, so the type has to be public even though the module is
+// `M68k::jit_stats`, so the type has to be public even though the module is
 // not — the shape `cpu::riscv` uses for `JitStats`.
-#[cfg(feature = "cpu-m68k-lift")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
-pub use engine::{DeclineRow as IrDeclineRow, Stats as IrStats};
+#[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-m68k-lift", feature = "jit"))))]
+pub use engine::{DeclineRow as JitDeclineRow, Stats as JitStats};
 #[cfg(feature = "cpu-m68k-lift")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
 pub mod lift;
@@ -1289,7 +1291,7 @@ impl Lines {
     /// A block that consumed the latch and then left without vectoring would
     /// drop the edge, and the interrupt would arrive at some unrelated later
     /// moment when the pins happened to read seven again.
-    #[cfg(feature = "cpu-m68k-lift")]
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
     pub(crate) fn interrupt_pending(&self, mask: u8) -> bool {
         if self.level_seven.load(Ordering::Acquire) {
             return true;
@@ -1400,24 +1402,36 @@ pub enum Engine {
     /// (CLAUDE.md, "CPU cores").
     #[default]
     Interp,
-    /// The translation runtime: guest instructions lifted into `ir::Block`s,
-    /// cached by entry PC, and executed by the **portable** IR backend.
+    /// The translation runtime: guest instructions lifted into `ir::Block`s
+    /// and run on `jit`'s dispatcher — the software TLB's cache, the block
+    /// cache with chaining, and the store filter that notices a guest
+    /// rewriting its own code — with the blocks themselves executed by the
+    /// **portable** IR backend, which runs anywhere the crate does.
     ///
-    /// Named `ir` rather than `jit` because there is no host code generator
-    /// behind it: the blocks are *interpreted* by `ir::Interp`, which is why
-    /// the feature is `cpu-m68k-lift` alone and not `cpu-m68k-lift` plus
-    /// `jit`. `cpu::riscv`'s `Engine::Jit` is the same backend under the name
-    /// the core that also has host backends gave it.
+    /// **The variant only exists in a build with `cpu-m68k-lift` and `jit`**,
+    /// so a build that cannot run this engine cannot be asked to and quietly
+    /// interpret instead — [`from_props`](M68k::from_props) refuses the
+    /// property with a message naming the features, and the Rust API does not
+    /// compile. An engine that silently is not the one you asked for is how a
+    /// translation path stays unmeasured for a year.
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-m68k-lift", feature = "jit"))))]
+    Jit,
+    /// [`Jit`](Engine::Jit), with the **host code generator** attached: a
+    /// block the backend takes runs as native code rather than as interpreted
+    /// IR, and one it refuses runs on the portable backend beside it.
     ///
-    /// **The variant only exists in a build with `cpu-m68k-lift`**, so a build
-    /// that cannot run this engine cannot be asked to and quietly interpret
-    /// instead — [`from_props`](M68k::from_props) refuses the property with a
-    /// message naming the feature, and the Rust API does not compile. An
-    /// engine that silently is not the one you asked for is how a translation
-    /// path stays unmeasured for a year.
-    #[cfg(feature = "cpu-m68k-lift")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
-    Ir,
+    /// This is the engine the translated path exists for. `docs/cpu/m68k.md`
+    /// has what each of the two is worth against the interpreter on a real
+    /// Macintosh ROM, which is the only comparison that decides anything.
+    ///
+    /// A build without `jit-x86` or `jit-arm64`, or a host neither emits for,
+    /// gets [`Jit`](Engine::Jit) instead — the same degradation `ROADMAP.md`
+    /// §9 asks for, and the same one `cpu::riscv` makes, so a machine file is
+    /// portable and a measurement is not silently of something else.
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-m68k-lift", feature = "jit"))))]
+    JitHost,
 }
 
 /// Everything the interpreter needs to mutate, behind one lock.
@@ -1425,13 +1439,13 @@ pub enum Engine {
 struct Session {
     state: State,
     space: Option<Arc<AddressSpace>>,
-    /// The translation cache and the backend that runs it, on a core whose
-    /// engine is [`Engine::Ir`].
+    /// The dispatcher and the backend that runs its blocks, on a core whose
+    /// engine is [`Engine::Jit`] or [`Engine::JitHost`].
     ///
     /// Boxed and lazily built so an interpreted core pays nothing for it, and
     /// **derived state**: never snapshotted, and thrown away by a reset and by
     /// a topology change (CLAUDE.md, "Devices").
-    #[cfg(feature = "cpu-m68k-lift")]
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
     runtime: Option<Box<engine::Runtime>>,
 }
 
@@ -1506,7 +1520,7 @@ impl M68k {
                 Session {
                     state: State::new(cfg.model),
                     space: None,
-                    #[cfg(feature = "cpu-m68k-lift")]
+                    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
                     runtime: None,
                 },
             ),
@@ -1523,7 +1537,7 @@ impl M68k {
     pub fn from_props(props: &Props) -> Result<M68k> {
         let mut r = props.reader();
         let requester = r.or_range("requester", 0u64, 0..=u64::from(u32::MAX))?;
-        let engine = r.or_enum("engine", "interp", &["interp", "ir"])?;
+        let engine = r.or_enum("engine", "interp", &["interp", "jit", "jit-host"])?;
         let model = r.or_enum("model", Model::M68000.name(), &MODEL_NAMES)?;
         // A 68040's floating-point unit is part of the *part*, not of the
         // board: an MC68040 has one and an MC68LC040 does not, and those are
@@ -1538,37 +1552,42 @@ impl M68k {
         r.finish()?;
         let model = Model::from_name(model).unwrap_or_default();
         let fpu = Coprocessor::from_name(fpu).unwrap_or_default();
-        // Refused rather than degraded, for the reason `Engine::Ir` gives: an
+        // Refused rather than degraded, for the reason `Engine::Jit` gives: an
         // engine that is not the one you asked for is worse than an error.
-        #[cfg(not(feature = "cpu-m68k-lift"))]
-        if engine == "ir" {
+        #[cfg(not(all(feature = "cpu-m68k-lift", feature = "jit")))]
+        if engine != "interp" {
             return Err(Error::Config {
                 at: String::from("cpu.m68k"),
-                message: String::from(
-                    "`engine = \"ir\"` needs a build with the `cpu-m68k-lift` feature; \
-                     refused rather than interpreted silently, because an engine that is \
-                     not the one you asked for is how a translation path stays unmeasured",
+                message: alloc::format!(
+                    "`engine = \"{engine}\"` needs a build with the `cpu-m68k-lift` and \
+                     `jit` features; refused rather than interpreted silently, because an \
+                     engine that is not the one you asked for is how a translation path \
+                     stays unmeasured"
                 ),
             });
         }
-        #[cfg(feature = "cpu-m68k-lift")]
-        let engine = if engine == "ir" {
+        #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+        let engine = if engine == "interp" {
+            Engine::Interp
+        } else {
             if model != Model::M68000 {
                 return Err(Error::Config {
                     at: String::from("cpu.m68k"),
                     message: alloc::format!(
-                        "`engine = \"ir\"` is MC68000 only: the IR frontend refuses a \
+                        "`engine = \"{engine}\"` is MC68000 only: the IR frontend refuses a \
                          {model}, whose timing comes from a per-instruction table the \
                          frontend does not read (`cpu::m68k::lift`). Use \
                          `engine = \"interp\"` for it"
                     ),
                 });
             }
-            Engine::Ir
-        } else {
-            Engine::Interp
+            if engine == "jit-host" {
+                Engine::JitHost
+            } else {
+                Engine::Jit
+            }
         };
-        #[cfg(not(feature = "cpu-m68k-lift"))]
+        #[cfg(not(all(feature = "cpu-m68k-lift", feature = "jit")))]
         let engine = Engine::Interp;
         if fpu.is_onchip_040() && !model.has_onchip_fpu() {
             return Err(Error::Config {
@@ -1646,7 +1665,16 @@ impl M68k {
     /// The space must be big-endian, or every word the core reads is
     /// byte-swapped — see the module documentation.
     pub fn attach_space(&self, space: Arc<AddressSpace>) {
-        self.session.lock().space = Some(space);
+        let mut session = self.session.lock();
+        session.space = Some(space);
+        // Every translation was lifted through the *old* space, and the
+        // dispatcher's staleness counters cannot see a space replaced under
+        // it: a topology generation belongs to one space and a store filter
+        // only hears about stores this core made.
+        #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+        if let Some(rt) = session.runtime.as_mut() {
+            rt.flush();
+        }
     }
 
     /// The address space this core executes from, if one is attached.
@@ -1947,7 +1975,7 @@ impl M68k {
     /// The same core, running on `engine`.
     ///
     /// A consuming builder because an engine is chosen when a core is built:
-    /// a machine file reaches the same place through `engine = "ir"`.
+    /// a machine file reaches the same place through `engine = "jit"`.
     #[must_use]
     pub fn with_engine(mut self, engine: Engine) -> M68k {
         self.engine = engine;
@@ -1959,10 +1987,10 @@ impl M68k {
     ///
     /// A statistic and never a behaviour — the engines are indistinguishable
     /// to the guest — so nothing here is in a snapshot.
-    #[cfg(feature = "cpu-m68k-lift")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-m68k-lift", feature = "jit"))))]
     #[must_use]
-    pub fn ir_stats(&self) -> Option<IrStats> {
+    pub fn jit_stats(&self) -> Option<JitStats> {
         self.session.lock().runtime.as_ref().map(|rt| rt.stats())
     }
 
@@ -1970,17 +1998,17 @@ impl M68k {
     /// by why — the five categories of [`lift::Decline`], and within each the
     /// mnemonic or the state cause.
     ///
-    /// The rows sum to [`IrStats::interpreted`], which is what makes this a
+    /// The rows sum to [`JitStats::interpreted`], which is what makes this a
     /// measurement rather than a sample: there is no "other" bucket for a
     /// fallback nobody attributed. Ordered, so two runs of the same guest
     /// print the same table (CLAUDE.md, *Determinism*).
     ///
-    /// `None` on a core that is not running the translated engine or has not
-    /// run yet, exactly as [`ir_stats`](M68k::ir_stats).
-    #[cfg(feature = "cpu-m68k-lift")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+    /// `None` on a core that is not running a translated engine or has not
+    /// run yet, exactly as [`jit_stats`](M68k::jit_stats).
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-m68k-lift", feature = "jit"))))]
     #[must_use]
-    pub fn ir_declines(&self) -> Option<Vec<IrDeclineRow>> {
+    pub fn jit_declines(&self) -> Option<Vec<JitDeclineRow>> {
         self.session.lock().runtime.as_ref().map(|rt| rt.declines())
     }
 
@@ -1989,8 +2017,9 @@ impl M68k {
     /// Returns the cycles charged: zero if the core is halted or has no
     /// address space, which the caller must treat as "stop", not "retry".
     ///
-    /// On [`Engine::Ir`] the unit is **one translation block** rather than one
-    /// instruction — the same reading `cpu::riscv`'s `Hart::step` takes. Where
+    /// On a translated engine the unit is **a chain of translation blocks**
+    /// rather than one instruction — the same reading `cpu::riscv`'s
+    /// `Hart::step` takes. Where
     /// that matters is the *budget*, and it is handled where the budget is:
     /// [`run_budget`](M68k::run_budget) hands the engine what is left of the
     /// allowance, so a block leaves at the same guest instruction an
@@ -2007,12 +2036,12 @@ impl M68k {
         let reset = self.lines.take_reset_request();
         let cfg = self.config();
         let mut session = self.session.lock();
-        #[cfg(feature = "cpu-m68k-lift")]
-        let translates = self.engine == Engine::Ir;
+        #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+        let translates = self.engine != Engine::Interp;
         let Session {
             state,
             space,
-            #[cfg(feature = "cpu-m68k-lift")]
+            #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
             runtime,
         } = &mut *session;
         // The `reset` pin latches outside the lock; this is where the latch
@@ -2022,12 +2051,13 @@ impl M68k {
         let Some(space) = space.clone() else {
             return 0;
         };
-        #[cfg(feature = "cpu-m68k-lift")]
+        #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
         if translates {
             // A reset re-reads vectors 0 and 1 and can remap the world, so the
             // translations it invalidates are thrown away here rather than
             // being re-validated one entry at a time.
-            let rt = runtime.get_or_insert_with(|| Box::new(engine::Runtime::new()));
+            let engine = self.engine;
+            let rt = runtime.get_or_insert_with(|| Box::new(engine::Runtime::new(engine)));
             if state.reset_pending {
                 rt.flush();
             }
@@ -2150,8 +2180,9 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "engine",
             kind: ValueKind::Str,
             required: false,
-            summary: "which execution engine: `interp`, or `ir` (MC68000 only) for \
-                      guest instructions lifted into IR blocks and run on the portable backend",
+            summary: "which execution engine: `interp`, or — MC68000 only — `jit` for \
+                      guest instructions lifted into IR blocks and run on the portable \
+                      backend, or `jit-host` for the same with a host code generator",
         },
         PropertySpec {
             name: "model",
@@ -2270,6 +2301,14 @@ impl Device for M68k {
             session.state.reset_pending = true;
             session.state.halted = false;
             session.state.stopped = false;
+        }
+        // A reset re-reads vectors 0 and 1 and is a topology-free way to
+        // change every byte in RAM (`ROADMAP.md` §4.5). `step_within` flushes
+        // on `reset_pending` too; this is the half that covers a cold reset,
+        // whose `State::new` replaces the flag rather than raising it.
+        #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+        if let Some(rt) = session.runtime.as_mut() {
+            rt.flush();
         }
         drop(session);
         // The sequence the machine just asked for is the one the pin owed.
@@ -2557,7 +2596,21 @@ impl Device for M68k {
                 state.fpu.pending_040 = present.then_some(state040);
             }
         }
-        self.session.lock().state = state;
+        let mut session = self.session.lock();
+        session.state = state;
+        // Translations are derived state and are never restored: they come
+        // back empty, which is always correct (`ROADMAP.md` §4.5) — and here
+        // it is also the only correct answer, because a restore replaces
+        // every byte of guest memory without a store this core made and
+        // without a topology change, so neither mechanism that invalidates a
+        // translation would hear about it. It is half of why a snapshot is
+        // interchangeable between any two engines: there is nothing
+        // engine-specific in one to interchange.
+        #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+        if let Some(rt) = session.runtime.as_mut() {
+            rt.flush();
+        }
+        drop(session);
         self.lines.restore((ipl, vector, level_seven, resets));
         Ok(())
     }
@@ -2612,7 +2665,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS.name)
         .prop(PropSchema::new("requester", ValueKind::Uint))
-        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp", "ir"]))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp", "jit", "jit-host"]))
         .prop(PropSchema::new("model", ValueKind::Str).values(&MODEL_NAMES))
         .prop(PropSchema::new("fpu", ValueKind::Str).values(&FPU_NAMES))
         // Inputs only. `BERR`, `HALT`, `BR`/`BG` and `VPA` are real pins with

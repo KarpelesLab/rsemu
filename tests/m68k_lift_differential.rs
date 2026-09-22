@@ -27,20 +27,35 @@
 //! Every result is reported as a **rate** — "N cases, 0 disagreements" —
 //! because a probabilistic test reported as "green" is not a measurement.
 
-#![cfg(feature = "cpu-m68k-lift")]
+#![cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
 
+use rsemu::cpu::m68k::Engine;
 use rsemu::cpu::m68k::differential::{opcode_sweep, opcode_sweep_in, sweep};
+
+/// The translated engines this file sweeps, every sweep, both of them.
+///
+/// `jit-host` is not a *different* engine from `jit` but a different **mix**:
+/// a block its code generator refuses runs on the portable backend beside it,
+/// so the two share an executor and differ in which instructions reach the
+/// other one. Sweeping only `jit` would leave the generated code unswept, and
+/// sweeping only `jit-host` would leave whatever it refuses unswept on a host
+/// that has a backend at all. On a build or a host with none, the two are the
+/// same run twice, which is what `ROADMAP.md` §9's fallback is supposed to
+/// look like.
+const ENGINES: [Engine; 2] = [Engine::Jit, Engine::JitHost];
 
 #[test]
 fn every_opcode_word_agrees_with_the_interpreter() {
-    let (cases, found) = opcode_sweep(1, &[0x0010, 0x0000, 0x2400]);
-    assert_eq!(cases, 65_536, "the whole decode space must have run");
-    assert!(
-        found.is_none(),
-        "{cases} cases, 1 disagreement:\n{}",
-        found.unwrap()
-    );
-    println!("{cases} cases, 0 disagreements");
+    for engine in ENGINES {
+        let (cases, found) = opcode_sweep(engine, 1, &[0x0010, 0x0000, 0x2400]);
+        assert_eq!(cases, 65_536, "the whole decode space must have run");
+        assert!(
+            found.is_none(),
+            "{engine:?}: {cases} cases, 1 disagreement:\n{}",
+            found.unwrap()
+        );
+        println!("{engine:?}: {cases} cases, 0 disagreements");
+    }
 }
 
 #[test]
@@ -48,14 +63,16 @@ fn every_opcode_word_agrees_with_a_second_set_of_extension_words() {
     // A negative displacement and an index register that is long rather than
     // word, so the modes that compute an address land somewhere else — and
     // often outside the case's RAM, which is the fault path.
-    let (cases, found) = opcode_sweep(1, &[0xf80c, 0xffff, 0xfffe]);
-    assert_eq!(cases, 65_536, "the whole decode space must have run");
-    assert!(
-        found.is_none(),
-        "{cases} cases, 1 disagreement:\n{}",
-        found.unwrap()
-    );
-    println!("{cases} cases, 0 disagreements");
+    for engine in ENGINES {
+        let (cases, found) = opcode_sweep(engine, 1, &[0xf80c, 0xffff, 0xfffe]);
+        assert_eq!(cases, 65_536, "the whole decode space must have run");
+        assert!(
+            found.is_none(),
+            "{engine:?}: {cases} cases, 1 disagreement:\n{}",
+            found.unwrap()
+        );
+        println!("{engine:?}: {cases} cases, 0 disagreements");
+    }
 }
 
 #[test]
@@ -65,15 +82,21 @@ fn every_opcode_word_agrees_in_user_state_too() {
     // encoding is a privilege violation here rather than an instruction, `A7`
     // is the user stack pointer, and an exception switches banks on the way
     // in. Every one of those has to come out the same on both engines.
-    let (cases, found) =
-        opcode_sweep_in(1, &[0x0010, 0x0000, 0x2400], rsemu::cpu::m68k::flags::IPL);
-    assert_eq!(cases, 65_536, "the whole decode space must have run");
-    assert!(
-        found.is_none(),
-        "{cases} cases, 1 disagreement:\n{}",
-        found.unwrap()
-    );
-    println!("{cases} cases, 0 disagreements");
+    for engine in ENGINES {
+        let (cases, found) = opcode_sweep_in(
+            engine,
+            1,
+            &[0x0010, 0x0000, 0x2400],
+            rsemu::cpu::m68k::flags::IPL,
+        );
+        assert_eq!(cases, 65_536, "the whole decode space must have run");
+        assert!(
+            found.is_none(),
+            "{engine:?}: {cases} cases, 1 disagreement:\n{}",
+            found.unwrap()
+        );
+        println!("{engine:?}: {cases} cases, 0 disagreements");
+    }
 }
 
 /// How many seeds and how many programs per seed the random sweep runs.
@@ -103,15 +126,22 @@ fn a_long_seeded_random_sweep_agrees_with_the_interpreter() {
     // Several seeds rather than one, so a failure names the seed that found it
     // and so "the sweep passed" is not a claim about one arbitrary sequence.
     let (seeds, programs) = sweep_size();
-    let mut total = 0usize;
-    for seed in 1..=seeds {
-        let (cases, found) = sweep(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), programs, 6);
-        total += cases;
-        assert!(
-            found.is_none(),
-            "seed {seed}: {cases} cases, 1 disagreement:\n{}",
-            found.unwrap()
-        );
+    for engine in ENGINES {
+        let mut total = 0usize;
+        for seed in 1..=seeds {
+            let (cases, found) = sweep(
+                engine,
+                seed.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                programs,
+                6,
+            );
+            total += cases;
+            assert!(
+                found.is_none(),
+                "{engine:?}, seed {seed}: {cases} cases, 1 disagreement:\n{}",
+                found.unwrap()
+            );
+        }
+        println!("{engine:?}: {total} cases over {seeds} seeds, 0 disagreements");
     }
-    println!("{total} cases over {seeds} seeds, 0 disagreements");
 }

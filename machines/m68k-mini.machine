@@ -49,14 +49,17 @@ machine "m68k-mini" {
   # Which execution engine the core runs on.
   #
   # `interp` is the default because it is the oracle (CLAUDE.md, "CPU cores").
-  # `ir` lifts guest instructions into the architecture-neutral translation IR
-  # and runs them on its portable backend, with the interpreter underneath
-  # everything the frontend declines; it needs a build with `cpu-m68k-lift`,
-  # and a build without it refuses the property with a message rather than
-  # quietly interpreting. The two are indistinguishable to the guest — same
-  # registers, same prefetch queue, same cycle counts, same state hash — which
-  # `tests/m68k_mini_board.rs` asserts on this very board rather than leaving
-  # it as a claim.
+  # `jit` lifts guest instructions into the architecture-neutral translation IR
+  # and runs them on the dispatcher in `jit/` — the block cache, its chaining
+  # and its store filter — with the blocks themselves executed by the portable
+  # IR backend and the interpreter underneath everything the frontend declines.
+  # `jit-host` is the same with a host code generator attached, and falls back
+  # to `jit` on a build or a host that has none. Both need a build with
+  # `cpu-m68k-lift` and `jit`, and a build without them refuses the property
+  # with a message rather than quietly interpreting. All three are
+  # indistinguishable to the guest — same registers, same prefetch queue, same
+  # cycle counts, same state hash — which `tests/m68k_mini_board.rs` asserts on
+  # this very board rather than leaving it as a claim.
   param engine = "interp"
 
   # -- the crystal -----------------------------------------------------------

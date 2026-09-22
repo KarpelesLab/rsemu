@@ -146,6 +146,62 @@ fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
     assert_eq!(peek_long(&other, RAM), 0x1234_5678);
 }
 
+/// A snapshot is **interchangeable between engines**, in both directions, and
+/// a machine restored into is one whose translations were thrown away.
+///
+/// The second half is the one a translated engine can get wrong in silence. A
+/// restore replaces every byte of guest memory without a store this core made
+/// and without a topology change, so neither of the two mechanisms that
+/// invalidate a translation hears about it — and a core that kept its block
+/// cache across one would run the *old* image's code. `M68k::load` flushes for
+/// exactly that reason, and this is what fails if it stops.
+#[test]
+#[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+fn a_snapshot_crosses_between_the_engines_in_both_directions() {
+    for (from, to) in [
+        ("interp", "jit"),
+        ("jit", "interp"),
+        ("jit", "jit-host"),
+        ("jit-host", "jit"),
+    ] {
+        let mut source = boot_on(from);
+        // Long enough that the translated side has lifted, cached and chained
+        // blocks before the snapshot is taken.
+        source
+            .run_for(GlobalTime::from_nanos(1_000_000))
+            .expect("it runs");
+        let bytes = source.save().expect("the machine snapshots");
+
+        // The destination is *not* a fresh board: it has run the same program
+        // and filled its own cache, so the restore has something to throw
+        // away rather than nothing.
+        let mut dest = boot_on(to);
+        dest.run_for(GlobalTime::from_nanos(1_000_000))
+            .expect("it runs");
+        dest.load(&bytes).expect("the snapshot loads");
+        assert_eq!(
+            dest.state_hash().expect("a hash"),
+            source.state_hash().expect("a hash"),
+            "a snapshot taken under `{from}` and restored under `{to}` changed the state hash"
+        );
+
+        // And the two go on agreeing afterwards, which is what says the
+        // restored machine is *runnable* rather than merely equal.
+        for n in 1..=8 {
+            source
+                .run_for(GlobalTime::from_nanos(1_000_000))
+                .expect("it runs");
+            dest.run_for(GlobalTime::from_nanos(1_000_000))
+                .expect("it runs");
+            assert_eq!(
+                dest.state_hash().expect("a hash"),
+                source.state_hash().expect("a hash"),
+                "{from} -> {to}: they parted company {n} ms after the restore"
+            );
+        }
+    }
+}
+
 /// `ROADMAP.md` §0's non-negotiable, on this board: *a bit-identical state hash
 /// across the interpreter and the translated engine for the same guest*.
 ///
@@ -156,26 +212,33 @@ fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
 /// board in it. A cache hit, a cache miss, a lifted instruction and an
 /// interpreted one all have to come out as the same number.
 #[test]
-#[cfg(feature = "cpu-m68k-lift")]
+#[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
 fn both_engines_hash_to_the_same_machine_at_every_checkpoint() {
-    let mut interp = boot_on("interp");
-    let mut ir = boot_on("ir");
-    for n in 1..=24 {
-        interp
-            .run_quantum()
-            .expect("the interpreted machine advances");
-        ir.run_quantum().expect("the translated machine advances");
-        let want = interp.state_hash().expect("a deterministic machine hashes");
-        let got = ir.state_hash().expect("a deterministic machine hashes");
-        assert_eq!(
-            want, got,
-            "checkpoint {n}: `engine = \"interp\"` hashes to {want:#018x} and \
-             `engine = \"ir\"` to {got:#018x}"
-        );
+    // Both translated engines, not one: `jit-host` runs a block as generated
+    // code where a backend takes it and falls back to the portable one where
+    // it does not, so a build with a host backend and a build without it are
+    // two different mixes of the same two executors — and all three columns
+    // have to come out as the same number.
+    for engine in ["jit", "jit-host"] {
+        let mut interp = boot_on("interp");
+        let mut jit = boot_on(engine);
+        for n in 1..=24 {
+            interp
+                .run_quantum()
+                .expect("the interpreted machine advances");
+            jit.run_quantum().expect("the translated machine advances");
+            let want = interp.state_hash().expect("a deterministic machine hashes");
+            let got = jit.state_hash().expect("a deterministic machine hashes");
+            assert_eq!(
+                want, got,
+                "checkpoint {n}: `engine = \"interp\"` hashes to {want:#018x} and \
+                 `engine = \"{engine}\"` to {got:#018x}"
+            );
+        }
+        // And the program really ran, so this is a comparison of a machine
+        // that did something rather than of two idle boards.
+        assert_eq!(peek_long(&jit, RAM), 0x1234_5678);
     }
-    // And the program really ran, so this is a comparison of a machine that
-    // did something rather than of two idle boards.
-    assert_eq!(peek_long(&ir, RAM), 0x1234_5678);
 }
 
 /// The `engine` property is *read* rather than accepted and ignored.
@@ -191,7 +254,7 @@ fn an_engine_nothing_implements_is_refused_rather_than_ignored() {
     options
         .resolve
         .params
-        .push((String::from("engine"), String::from("jit-host")));
+        .push((String::from("engine"), String::from("ir")));
     let registry = catalog::registry().expect("a registry");
     rsemu::machine::build(entry.name, entry.source, &registry, &options)
         .expect_err("an engine nothing implements must be refused, not ignored");
@@ -204,7 +267,7 @@ fn an_engine_nothing_implements_is_refused_rather_than_ignored() {
 /// you asked for is how a JIT stays unmeasured for a year"
 /// (`cpu::riscv::Engine::Jit`, which learned it the hard way).
 #[test]
-#[cfg(not(feature = "cpu-m68k-lift"))]
+#[cfg(not(all(feature = "cpu-m68k-lift", feature = "jit")))]
 fn a_build_without_the_frontend_refuses_the_engine_it_cannot_run() {
     let entry = catalog::machine("m68k-mini").expect("this build ships m68k-mini");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
@@ -212,10 +275,10 @@ fn a_build_without_the_frontend_refuses_the_engine_it_cannot_run() {
     options
         .resolve
         .params
-        .push((String::from("engine"), String::from("ir")));
+        .push((String::from("engine"), String::from("jit")));
     let registry = catalog::registry().expect("a registry");
     let err = rsemu::machine::build(entry.name, entry.source, &registry, &options)
-        .expect_err("`ir` needs `cpu-m68k-lift`");
+        .expect_err("`jit` needs `cpu-m68k-lift` and `jit`");
     let text = format!("{err}");
     assert!(text.contains("cpu-m68k-lift"), "{text}");
 }

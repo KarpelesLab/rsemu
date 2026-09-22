@@ -12,7 +12,7 @@
 //!
 //! | | oracle | subject |
 //! | --- | --- | --- |
-//! | engine | `engine = "interp"` | `engine = "ir"` |
+//! | engine | `engine = "interp"` | `engine = "jit"` |
 //! | registers | `D0`-`D7`, `A0`-`A7`, `USP`, `SSP` | the same |
 //! | `SR` | including the **X** bit that `CMP` leaves alone | the same |
 //! | the program counter | `Regs::pc` | the same |
@@ -45,7 +45,7 @@
 //! thing to get wrong, and a bug in it would look like a frontend bug.
 //!
 //! So the subject here is the **engine**, through the ordinary public API:
-//! [`M68k`] with `engine = "ir"` against [`M68k`] with `engine = "interp"`.
+//! [`M68k`] with `engine = "jit"` against [`M68k`] with `engine = "interp"`.
 //! That costs the ability to compare a single block in isolation and buys
 //! three things the block-level shape cannot reach at all:
 //!
@@ -56,7 +56,7 @@
 //! * **the cache**, including a block whose bytes the guest has rewritten.
 //!
 //! The unit of comparison is one call to [`M68k::step`], which on the subject
-//! is one *block*. [[`IrStats::steps`](super::IrStats::steps)] is what says how many interpreter
+//! is one *block*. [[`JitStats::steps`](super::JitStats::steps)] is what says how many interpreter
 //! steps that block was worth, so the oracle is stepped exactly that far and
 //! the two are compared with both standing at an instruction boundary.
 //!
@@ -83,7 +83,7 @@
 //!   `unliftable`), and `tests/` is where a board asserts that.
 //! * **Any model but a 68000**, because [`lift`] refuses one and
 //!   `from_props` refuses the configuration. A 68010 or 68020 with
-//!   `engine = "ir"` is a configuration error, not a divergence.
+//!   `engine = "jit"` is a configuration error, not a divergence.
 //! * **A second bus master rewriting the code a block is running**, which is
 //!   the one prefetch skew `engine`'s module docs record.
 
@@ -96,7 +96,7 @@ use crate::core::space::{AddressSpace, RamStore, Region};
 use crate::core::value::Endian;
 
 use super::isa::Model;
-use super::{Config, Engine, IrDeclineRow, IrStats, M68k, lift};
+use super::{Config, Engine, JitDeclineRow, JitStats, M68k, lift};
 
 /// Where a case's exception vector table lives: address zero, because a 68000
 /// has no vector base register and cannot move it (MC68000UM §6.1).
@@ -136,8 +136,18 @@ pub struct Case {
     pub sr: u16,
     /// How many units of the subject's engine to run.
     ///
-    /// One call to [`M68k::step`] each, which on the subject is one block.
+    /// One call to [`M68k::step`] each, which on the subject is one **chain**
+    /// of blocks.
     pub units: usize,
+    /// Which translated engine the subject runs on.
+    ///
+    /// [`Engine::Jit`] by default, and the reason it is a field rather than a
+    /// constant is that `jit-host` is not a *different* engine but a different
+    /// **mix**: a block its code generator refuses runs on the portable
+    /// backend beside it, so which instructions are compiled is a property of
+    /// the case. A sweep that only ever ran one of the two would be a sweep of
+    /// half the executor.
+    pub engine: Engine,
 }
 
 impl Case {
@@ -153,6 +163,7 @@ impl Case {
             a,
             sr: super::flags::S | super::flags::IPL,
             units: 4,
+            engine: Engine::Jit,
         }
     }
 
@@ -200,6 +211,13 @@ impl Case {
     #[must_use]
     pub fn with_units(mut self, units: usize) -> Case {
         self.units = units;
+        self
+    }
+
+    /// The same case with `engine` as the subject's.
+    #[must_use]
+    pub fn with_engine(mut self, engine: Engine) -> Case {
+        self.engine = engine;
         self
     }
 
@@ -370,7 +388,7 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     let (oracle_space, oracle_ram) = machine(case);
     let (subject_space, subject_ram) = machine(case);
     let oracle = core(case, oracle_space, Engine::Interp);
-    let subject = core(case, subject_space, Engine::Ir);
+    let subject = core(case, subject_space, case.engine);
 
     // Before anything runs: the two cores must start from the same place, or
     // every column after this compares two different guests.
@@ -379,9 +397,9 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     let mut steps = 0u64;
     let mut lifted = 0u64;
     for unit in 0..case.units {
-        let before = subject.ir_stats().unwrap_or_default();
+        let before = subject.jit_stats().unwrap_or_default();
         let subject_cycles = subject.step();
-        let after = subject.ir_stats().unwrap_or_default();
+        let after = subject.jit_stats().unwrap_or_default();
         let unit_steps = after.steps.wrapping_sub(before.steps);
         lifted += after.retired.wrapping_sub(before.retired);
         steps += unit_steps;
@@ -786,7 +804,12 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u16> {
 /// Never as such: a divergence comes back in the tuple, because a sweep's
 /// value is the count beside it.
 #[must_use]
-pub fn sweep(seed: u64, cases: usize, per_case: usize) -> (usize, Option<Divergence>) {
+pub fn sweep(
+    engine: Engine,
+    seed: u64,
+    cases: usize,
+    per_case: usize,
+) -> (usize, Option<Divergence>) {
     let mut rng = Rng::new(seed);
     let mut found = None;
     for _ in 0..cases {
@@ -801,7 +824,8 @@ pub fn sweep(seed: u64, cases: usize, per_case: usize) -> (usize, Option<Diverge
         program.push(0x2700);
         let case = Case::seeded(program)
             .with_ccr((rng.draw() & 0x1f) as u16)
-            .with_units(per_case + 2);
+            .with_units(per_case + 2)
+            .with_engine(engine);
         if let Err(d) = compare(&case) {
             found = Some(d);
             break;
@@ -854,8 +878,17 @@ impl Rng {
 ///
 /// Returns `(cases, divergences)`, with the first divergence.
 #[must_use]
-pub fn opcode_sweep(stride: u32, extensions: &[u16]) -> (usize, Option<Divergence>) {
-    opcode_sweep_in(stride, extensions, super::flags::S | super::flags::IPL)
+pub fn opcode_sweep(
+    engine: Engine,
+    stride: u32,
+    extensions: &[u16],
+) -> (usize, Option<Divergence>) {
+    opcode_sweep_in(
+        engine,
+        stride,
+        extensions,
+        super::flags::S | super::flags::IPL,
+    )
 }
 
 /// The same, in the privilege state `sr` names.
@@ -868,7 +901,12 @@ pub fn opcode_sweep(stride: u32, extensions: &[u16]) -> (usize, Option<Divergenc
 /// is exactly why it is worth sweeping: the claim is that the *fallback* gets
 /// it right too.
 #[must_use]
-pub fn opcode_sweep_in(stride: u32, extensions: &[u16], sr: u16) -> (usize, Option<Divergence>) {
+pub fn opcode_sweep_in(
+    engine: Engine,
+    stride: u32,
+    extensions: &[u16],
+    sr: u16,
+) -> (usize, Option<Divergence>) {
     let mut cases = 0usize;
     let mut word = 0u32;
     while word < 0x1_0000 {
@@ -876,7 +914,7 @@ pub fn opcode_sweep_in(stride: u32, extensions: &[u16], sr: u16) -> (usize, Opti
         program.extend_from_slice(extensions);
         program.push(0x4e72);
         program.push(0x2700);
-        let mut case = Case::seeded(program).with_units(3);
+        let mut case = Case::seeded(program).with_units(3).with_engine(engine);
         // `X` on top of whatever the caller asked for, because `ADDX`, `SUBX`,
         // `NEGX`, `ROXL` and `ROXR` all read it and a sweep with it clear
         // tests half of each of them.
@@ -911,31 +949,31 @@ pub fn lifts(program: &[u16]) -> bool {
 /// What a case's subject engine did, for a test that wants to assert the
 /// *shape* of a run rather than its agreement.
 #[must_use]
-pub fn stats_for(case: &Case) -> Option<IrStats> {
+pub fn stats_for(case: &Case) -> Option<JitStats> {
     run_subject(case).0
 }
 
-/// The same run's [`IrStats`] and decline histogram together.
+/// The same run's [`JitStats`] and decline histogram together.
 ///
 /// Together because the two only mean anything beside each other: the rows
-/// sum to `IrStats::interpreted`, and a test that read them off two separate
+/// sum to `JitStats::interpreted`, and a test that read them off two separate
 /// runs could not assert that.
 #[must_use]
-pub fn measure(case: &Case) -> (Option<IrStats>, Vec<IrDeclineRow>) {
+pub fn measure(case: &Case) -> (Option<JitStats>, Vec<JitDeclineRow>) {
     let (stats, declines) = run_subject(case);
     (stats, declines.unwrap_or_default())
 }
 
 /// Run `case` on the translated engine and report what it counted.
-fn run_subject(case: &Case) -> (Option<IrStats>, Option<Vec<IrDeclineRow>>) {
+fn run_subject(case: &Case) -> (Option<JitStats>, Option<Vec<JitDeclineRow>>) {
     let (space, _ram) = machine(case);
-    let subject = core(case, space, Engine::Ir);
+    let subject = core(case, space, case.engine);
     for _ in 0..case.units {
         if subject.step() == 0 {
             break;
         }
     }
-    (subject.ir_stats(), subject.ir_declines())
+    (subject.jit_stats(), subject.jit_declines())
 }
 
 #[cfg(test)]

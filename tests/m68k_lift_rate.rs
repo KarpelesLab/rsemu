@@ -13,7 +13,7 @@
 //!
 //! # What is measured, and on what
 //!
-//! Four columns, out of `M68k::ir_stats` and `M68k::ir_declines`:
+//! Four columns, out of `M68k::jit_stats` and `M68k::jit_declines`:
 //!
 //! 1. the fraction of **executed guest instructions** that retired inside a
 //!    lifted block, against the ones the interpreter took;
@@ -24,11 +24,11 @@
 //!    [`Decline`](rsemu::cpu::m68k::lift::Decline) and, within each, by
 //!    mnemonic.
 //!
-//! The histogram sums to `IrStats::interpreted` — there is no "other" bucket —
-//! and `executed` is partitioned by the five `ended_*` rows plus `spent` plus
-//! `faults`. Both closures are asserted here rather than hoped for, because a
-//! histogram that does not account for every fallback reads as a lift rate
-//! better than it is.
+//! The histogram sums to `JitStats::interpreted` — there is no "other" bucket
+//! — and `JitStats::steps`, which is what the differential harness steps the
+//! oracle by, is exactly `retired + interpreted + faults`. Both closures are
+//! asserted here rather than hoped for, because a histogram that does not
+//! account for every fallback reads as a lift rate better than it is.
 //!
 //! # The boards
 //!
@@ -52,14 +52,15 @@
 //!
 //! # And the run is checked against the oracle
 //!
-//! Each ROM measurement runs the **same board on both engines** and compares
-//! the whole machine's state hash at every virtual second. That is the
-//! strongest differential case this core has — millions of instructions of
-//! somebody else's real code rather than a generated program — and it is what
-//! makes the rate beside it worth quoting: a rate measured on a translated
-//! engine that had drifted would be a rate for a different guest.
+//! Each ROM measurement runs the **same board on all three engines** —
+//! `interp`, `jit` and `jit-host` — and compares the whole machine's state
+//! hash at every virtual second. That is the strongest differential case this
+//! core has — millions of instructions of somebody else's real code rather
+//! than a generated program — and it is what makes the rate beside it worth
+//! quoting: a rate measured on a translated engine that had drifted would be a
+//! rate for a different guest.
 
-#![cfg(feature = "cpu-m68k-lift")]
+#![cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
 
 // The instrument's own arithmetic, behind the gate that says there is a board
 // to point it at: a build with `cpu-m68k-lift` and no machine at all — which
@@ -72,7 +73,7 @@
 ))]
 mod instrument {
     pub(crate) use rsemu::cpu::m68k::lift::Decline;
-    use rsemu::cpu::m68k::{IrDeclineRow, IrStats};
+    use rsemu::cpu::m68k::{JitDeclineRow, JitStats};
 
     /// Integer per-mille of `part` in `whole`, or `None` for an empty whole.
     ///
@@ -87,18 +88,12 @@ mod instrument {
     ///
     /// Returns the lift rate in per-mille, so a caller can assert a floor without
     /// re-deriving it.
-    pub(crate) fn report(label: &str, stats: IrStats, declines: &[IrDeclineRow]) -> u64 {
+    pub(crate) fn report(label: &str, stats: JitStats, declines: &[JitDeclineRow]) -> u64 {
         // Every guest instruction the core executed, by who executed it. A fault
         // hands exactly one instruction back, so it is a third column and not part
         // of either of the other two.
         let executed_insns = stats.retired + stats.interpreted + stats.faults;
         let rate = permille(stats.retired, executed_insns).unwrap_or(0);
-
-        let ended = stats.ended_unsupported
-            + stats.ended_transfer
-            + stats.ended_window
-            + stats.ended_limit
-            + stats.ended_unreadable;
 
         println!("\n=== {label} ===");
         println!(
@@ -111,8 +106,18 @@ mod instrument {
              a lifted block"
         );
         println!(
-            "blocks         {:>12}  from {} translations; {} left on the budget, {} faulted",
-            stats.executed, stats.lifted, stats.spent, stats.faults
+            "blocks         {:>12}  from {} translations; {} ran as host code, {} were \
+             reached by a patched exit and {} by a direct link",
+            stats.executed, stats.lifted, stats.compiled, stats.chained, stats.linked
+        );
+        println!(
+            "runs ended     {:>12} on the tick allowance, {} at an encoding no block \
+             carries, {} at a fault",
+            stats.spent, stats.declined, stats.faults
+        );
+        println!(
+            "invalidated    {:>12}  = {} by a block's own store + {} by an interpreted one",
+            stats.invalidated, stats.invalidated_in_block, stats.invalidated_interpreted
         );
         // Hundredths, for the same reason the ratios are per-mille: two decimal
         // places of "instructions per block" without a float in sight.
@@ -124,19 +129,6 @@ mod instrument {
                 .checked_div(stats.executed)
                 .unwrap_or(0)
         );
-        println!("blocks ended at a terminator, by why lifting stopped there:");
-        for (name, count) in [
-            ("declined encoding", stats.ended_unsupported),
-            ("transfer of control", stats.ended_transfer),
-            ("window boundary", stats.ended_window),
-            ("instruction limit", stats.ended_limit),
-            ("unreadable words", stats.ended_unreadable),
-        ] {
-            println!(
-                "  {name:<22}{count:>12}  {:>4} per mille of the {ended} that did",
-                permille(count, ended).unwrap_or(0)
-            );
-        }
         println!(
             "fallbacks, by why no block could run ({} in all):",
             stats.interpreted
@@ -179,12 +171,9 @@ mod instrument {
             stats.interpreted
         );
         assert_eq!(
-            stats.executed,
-            ended + stats.spent + stats.faults,
-            "{label}: {} block executions, {ended} at a terminator + {} on the budget + {} faulted",
-            stats.executed,
-            stats.spent,
-            stats.faults
+            stats.steps, executed_insns,
+            "{label}: {} oracle steps against {executed_insns} executed instructions",
+            stats.steps
         );
         rate
     }
@@ -235,7 +224,7 @@ mod mini {
     ///   000426: 2411             move.l  (a1),d2
     ///   000428: d481             add.l   d1,d2
     ///   00042a: e58a             lsl.l   #2,d2
-    ///   00042c: 2482             move.l  d2,(a1)
+    ///   00042c: 2282             move.l  d2,(a1)
     ///   00042e: 3221             move.w  -(a1),d1
     ///   000430: d269 0002        add.w   2(a1),d1
     ///   000434: 0c41 1234        cmpi.w  #$1234,d1
@@ -275,7 +264,7 @@ mod mini {
             0x2411, // move.l (a1),d2
             0xd481, // add.l d1,d2
             0xe58a, // lsl.l #2,d2
-            0x2482, // move.l d2,(a1)
+            0x2282, // move.l d2,(a1)
             0x3221, // move.w -(a1),d1
             0xd269, 0x0002, // add.w 2(a1),d1
             0x0c41, 0x1234, // cmpi.w #$1234,d1
@@ -340,7 +329,7 @@ mod mini {
 #[test]
 #[cfg(feature = "machine-m68k-mini")]
 fn the_mini_board_reports_a_rate_and_the_instrument_closes() {
-    let (mut ir, cpu) = mini::boot("ir");
+    let (mut ir, cpu) = mini::boot("jit");
     let (mut interp, _) = mini::boot("interp");
     for ms in 1..=8 {
         mini::advance(&mut ir, 1);
@@ -350,8 +339,8 @@ fn the_mini_board_reports_a_rate_and_the_instrument_closes() {
         assert_eq!(want, got, "ms {ms}: the two engines parted company");
     }
 
-    let stats = cpu.ir_stats().expect("a translated core keeps statistics");
-    let declines = cpu.ir_declines().expect("and a histogram");
+    let stats = cpu.jit_stats().expect("a translated core keeps statistics");
+    let declines = cpu.jit_declines().expect("and a histogram");
     let rate = report("m68k-mini (synthetic)", stats, &declines);
 
     assert!(stats.executed > 0, "blocks ran: {stats:?}");
@@ -429,7 +418,7 @@ mod mac {
     ///
     /// The engine is set on the **core**, not in the machine file: `mac-plus`
     /// and `mac-classic` say `engine = "interp"` and belong to somebody else.
-    /// `M68k::with_engine` is the same seam `engine = "ir"` reaches, so this
+    /// `M68k::with_engine` is the same seam `engine = "jit"` reaches, so this
     /// measures the board as shipped with one property moved.
     pub(crate) fn board(
         board: &'static str,
@@ -518,33 +507,41 @@ fn the_macintosh_plus_rom_reports_a_rate() {
     let Some(image) = mac::rom("mac-plus", "Mac-Plus.ROM", 128 * 1024) else {
         return;
     };
-    let mut ir = mac::board("mac-plus", image.clone(), Engine::Ir);
-    let mut interp = mac::board("mac-plus", image, Engine::Interp);
-    mac::lockstep("mac-plus", &mut ir, &mut interp, SECONDS);
-
-    let stats = ir
-        .cpu
-        .ir_stats()
-        .expect("a translated core keeps statistics");
-    let declines = ir.cpu.ir_declines().expect("and a histogram");
-    let rate = report(
-        "mac-plus, a real 128 KiB Macintosh Plus ROM",
-        stats,
-        &declines,
-    );
-    assert!(
-        stats.retired > 1_000_000,
-        "a twelve-second boot retires millions of instructions in blocks: {stats:?}"
-    );
-    // A floor rather than a golden: this is a measurement, and the number it
-    // produces belongs in `docs/cpu/m68k.md` where it can be explained. What
-    // is asserted is that the translated engine is carrying the run at all —
-    // the failure this would catch is a change that quietly sent most of a
-    // real ROM down the fallback.
-    assert!(
-        rate >= 500,
-        "the frontend carried {rate} per mille of a real ROM's instructions: {stats:?}"
-    );
+    // **Both** translated engines against the interpreter, not one. A block
+    // `jit-host`'s backend refuses runs on the portable one beside it, so the
+    // two engines are different *mixes* of the same pair of executors rather
+    // than alternatives, and only running both says the mix is sound. On a
+    // build or a host with no code generator `jit-host` degrades to `jit` and
+    // this is the same measurement twice, which costs ten seconds and is
+    // exactly what `ROADMAP.md` §9's fallback is supposed to look like.
+    for engine in [Engine::Jit, Engine::JitHost] {
+        let mut jit = mac::board("mac-plus", image.clone(), engine);
+        let mut interp = mac::board("mac-plus", image.clone(), Engine::Interp);
+        mac::lockstep("mac-plus", &mut jit, &mut interp, SECONDS);
+        let stats = jit
+            .cpu
+            .jit_stats()
+            .expect("a translated core keeps statistics");
+        let declines = jit.cpu.jit_declines().expect("and a histogram");
+        let rate = report(
+            &format!("mac-plus, a real 128 KiB Macintosh Plus ROM, engine={engine:?}"),
+            stats,
+            &declines,
+        );
+        assert!(
+            stats.retired > 1_000_000,
+            "a twelve-second boot retires millions of instructions in blocks: {stats:?}"
+        );
+        // A floor rather than a golden: this is a measurement, and the number
+        // it produces belongs in `docs/cpu/m68k.md` where it can be
+        // explained. What is asserted is that the translated engine is
+        // carrying the run at all — the failure this would catch is a change
+        // that quietly sent most of a real ROM down the fallback.
+        assert!(
+            rate >= 500,
+            "the frontend carried {rate} per mille of a real ROM's instructions: {stats:?}"
+        );
+    }
 }
 
 /// **The Macintosh Classic ROM**: the same, four years of ROM later.
@@ -556,26 +553,34 @@ fn the_macintosh_classic_rom_reports_a_rate() {
     let Some(image) = mac::rom("mac-classic", "Classic.ROM", 512 * 1024) else {
         return;
     };
-    let mut ir = mac::board("mac-classic", image.clone(), Engine::Ir);
-    let mut interp = mac::board("mac-classic", image, Engine::Interp);
-    mac::lockstep("mac-classic", &mut ir, &mut interp, SECONDS);
-
-    let stats = ir
-        .cpu
-        .ir_stats()
-        .expect("a translated core keeps statistics");
-    let declines = ir.cpu.ir_declines().expect("and a histogram");
-    let rate = report(
-        "mac-classic, a real 512 KiB Macintosh Classic ROM",
-        stats,
-        &declines,
-    );
-    assert!(
-        stats.retired > 1_000_000,
-        "a twelve-second boot retires millions of instructions in blocks: {stats:?}"
-    );
-    assert!(
-        rate >= 500,
-        "the frontend carried {rate} per mille of a real ROM's instructions: {stats:?}"
-    );
+    // **Both** translated engines against the interpreter, not one. A block
+    // `jit-host`'s backend refuses runs on the portable one beside it, so the
+    // two engines are different *mixes* of the same pair of executors rather
+    // than alternatives, and only running both says the mix is sound. On a
+    // build or a host with no code generator `jit-host` degrades to `jit` and
+    // this is the same measurement twice, which costs ten seconds and is
+    // exactly what `ROADMAP.md` §9's fallback is supposed to look like.
+    for engine in [Engine::Jit, Engine::JitHost] {
+        let mut jit = mac::board("mac-classic", image.clone(), engine);
+        let mut interp = mac::board("mac-classic", image.clone(), Engine::Interp);
+        mac::lockstep("mac-classic", &mut jit, &mut interp, SECONDS);
+        let stats = jit
+            .cpu
+            .jit_stats()
+            .expect("a translated core keeps statistics");
+        let declines = jit.cpu.jit_declines().expect("and a histogram");
+        let rate = report(
+            &format!("mac-classic, a real 512 KiB Macintosh Classic ROM, engine={engine:?}"),
+            stats,
+            &declines,
+        );
+        assert!(
+            stats.retired > 1_000_000,
+            "a twelve-second boot retires millions of instructions in blocks: {stats:?}"
+        );
+        assert!(
+            rate >= 500,
+            "the frontend carried {rate} per mille of a real ROM's instructions: {stats:?}"
+        );
+    }
 }

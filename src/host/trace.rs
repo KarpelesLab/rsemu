@@ -411,7 +411,7 @@ fn cpus(machine: &Machine, hosts: &HostObjects, table: &mut Table) {
         }
     }
 
-    #[cfg(feature = "cpu-m68k-lift")]
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
     {
         let paths = paths_of(machine, crate::cpu::m68k::CLASS.name);
         for (index, cpu) in captured::<crate::cpu::m68k::M68k>(hosts, crate::cpu::m68k::CLASS.name)
@@ -423,36 +423,39 @@ fn cpus(machine: &Machine, hosts: &HostObjects, table: &mut Table) {
                 &name,
                 &format!("engine={}", kebab(&format!("{:?}", cpu.engine()))),
             );
-            let Some(stats) = cpu.ir_stats() else {
+            let Some(stats) = cpu.jit_stats() else {
                 continue;
             };
-            // `blocks` and `translated` are spelled the way the other three
-            // cores spell them so one script can ask any board the same
-            // question; `compiled` and `chained` are not here because this
-            // frontend has no host backend and no chaining, and a zero would
-            // read as "the code generator ran and did nothing".
+            // Spelled the way the other three cores spell them, so one script
+            // can ask any board the same question — with the two rows this
+            // core has and they do not: `faults`, because a fault here hands
+            // the instruction back to the interpreter rather than being
+            // delivered from the block, and `declined`, because the subset
+            // has real exclusions and how often a run ends at one is the
+            // question `lift`'s ledger turns on.
             let rows = [
                 ("blocks", stats.executed),
+                ("compiled", stats.compiled),
+                ("chained", stats.chained),
+                ("linked", stats.linked),
                 ("translated", stats.lifted),
+                // Counted apart for the reason the other cores count them
+                // apart: a single total lets one of the two mechanisms stop
+                // working while the other holds the number up.
                 ("invalidated", stats.invalidated),
+                ("invalidated.in-block", stats.invalidated_in_block),
+                ("invalidated.interpreted", stats.invalidated_interpreted),
                 ("retired", stats.retired),
                 ("interpreted", stats.interpreted),
                 ("faults", stats.faults),
                 ("spent", stats.spent),
-                // Where a block that reached its terminator ended. The row
-                // that answers "is the subset what is ending these blocks":
-                // `ended-unsupported` against `ended-transfer`.
-                ("ended-unsupported", stats.ended_unsupported),
-                ("ended-transfer", stats.ended_transfer),
-                ("ended-window", stats.ended_window),
-                ("ended-limit", stats.ended_limit),
-                ("ended-unreadable", stats.ended_unreadable),
+                ("declined", stats.declined),
             ];
             emit(table, &name, &rows);
             // And the histogram: one row per `(category, mnemonic)`, which is
             // the number that says *what* to lift next rather than that there
-            // is something. `M68k::ir_declines` orders it.
-            let Some(declines) = cpu.ir_declines() else {
+            // is something. `M68k::jit_declines` orders it.
+            let Some(declines) = cpu.jit_declines() else {
                 continue;
             };
             let mut by_reason = alloc::collections::BTreeMap::new();

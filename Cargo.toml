@@ -2821,11 +2821,16 @@ cpu-m68k = ["float"]
 # than one store, which on a 16-bit bus means JSR, BSR, PEA, LINK, MOVEM to
 # memory and every long-sized memory destination.
 #
-# `engine = "ir"` on `cpu.m68k` selects it: blocks cached by 4 KiB window and
-# executed on the **portable** IR backend (`ir::Interp`), which runs anywhere
-# the crate does. No host code generation -- a backend that lowers these blocks
-# lives in `jit/`, above the `std` line. Needs `cpu-m68k` for the core and `ir`
-# for the block types. Adds no dependencies and is `no_std + alloc`.
+# `engine = "jit"` and `engine = "jit-host"` on `cpu.m68k` select it, and both
+# want `jit` beside this feature: the blocks run on `jit::Dispatcher` -- the
+# block cache with direct-linked chaining, and the page-granular store filter
+# that notices a guest rewriting its own code -- executed by the portable IR
+# backend under the first name and by a host code generator under the second.
+# The feature split follows `cpu-riscv-lift`: this one is the *frontend*, which
+# is `no_std + alloc` and testable on its own, and `jit` is the runtime that
+# runs what it lifts. A build with this and no `jit` has the lifter and no
+# engine, and `from_props` says so rather than interpreting silently. Needs
+# `cpu-m68k` for the core and `ir` for the block types. Adds no dependencies.
 cpu-m68k-lift = ["cpu-m68k", "ir"]
 
 # The MIPS core (src/cpu/mips): an LSI/MIPS R3000A-compatible MIPS I
@@ -3440,3 +3445,16 @@ required-features = ["machine-riscv-virt", "cpu-riscv-lift", "jit"]
 name             = "x86_linux_boot"
 harness          = false
 required-features = ["machine-pc64", "cpu-x86-lift", "jit"]
+
+[[bench]]
+# The 68000 half of the same measurement: a real Macintosh ROM boot on
+# `mac-plus` or `mac-classic`, timed, with the census a profile has to be
+# divided by. It exists because the m68k frontend's blocks are *short* -- 2.38
+# guest instructions on the Plus against 10.8 on AArch64 -- so every per-block
+# cost is divided by a number four times smaller and no conclusion from another
+# core's profile transfers. Skips loudly without a ROM, which is the user's own
+# file and is never committed. `harness = false` for the reason the others
+# give.
+name             = "m68k_mac_boot"
+harness          = false
+required-features = ["machine-mac-plus", "machine-mac-classic", "machine-m68k-mini", "cpu-m68k-lift", "jit"]

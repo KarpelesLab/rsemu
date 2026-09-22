@@ -754,7 +754,7 @@ fn a_store_onto_a_word_already_in_the_prefetch_queue_is_not_seen_by_it() {
 fn an_engine_switch_is_refused_for_a_model_the_frontend_does_not_lift() {
     use crate::core::props::Props;
     let props = Props::new()
-        .with("engine", crate::core::props::Value::Str("ir".into()))
+        .with("engine", crate::core::props::Value::Str("jit".into()))
         .with("model", crate::core::props::Value::Str("68020".into()));
     let err = M68k::from_props(&props).expect_err("a 68020 has no IR frontend");
     let text = alloc::format!("{err}");
@@ -774,7 +774,7 @@ fn every_opcode_word_agrees() {
     //
     // Strided here and run in full by `tests/m68k_lift_differential.rs`, which
     // is where a long run belongs.
-    let (cases, found) = opcode_sweep(7, &[0x0010, 0x0000, 0x2400]);
+    let (cases, found) = opcode_sweep(Engine::Jit, 7, &[0x0010, 0x0000, 0x2400]);
     assert!(found.is_none(), "{cases} cases: {}", found.unwrap());
     assert!(cases > 9000, "the sweep must really have run: {cases}");
 }
@@ -785,13 +785,18 @@ fn every_opcode_word_agrees_in_user_state_too() {
     // privileged, so this is a claim about the fallback: a privileged encoding
     // is a privilege violation here rather than an instruction, `A7` is the
     // user stack pointer, and an exception switches banks on its way in.
-    let (cases, found) = opcode_sweep_in(11, &[0x0010, 0x0000, 0x2400], super::super::flags::IPL);
+    let (cases, found) = opcode_sweep_in(
+        Engine::Jit,
+        11,
+        &[0x0010, 0x0000, 0x2400],
+        super::super::flags::IPL,
+    );
     assert!(found.is_none(), "{cases} cases: {}", found.unwrap());
     assert!(cases > 5000, "the sweep must really have run: {cases}");
 }
 
 #[test]
 fn a_seeded_random_stream_agrees() {
-    let (cases, found) = sweep(0x6800_0000_0000_0007, 200, 4);
+    let (cases, found) = sweep(Engine::Jit, 0x6800_0000_0000_0007, 200, 4);
     assert!(found.is_none(), "{cases} cases: {}", found.unwrap());
 }

@@ -605,7 +605,43 @@ pub(super) struct Exec<'a> {
     /// pushes. Rather than special-case that in three places, the destination
     /// resolver records the debt and [`Exec::settle`] pays it.
     deferred_slides: u32,
+    /// The guest-physical [`WRITE_PAGE`] pages this step wrote to, deduplicated
+    /// against the ones already here.
+    ///
+    /// **Not architectural, and not a timing column**: it is the other half of
+    /// the translated engine's self-modifying-code answer. A block reports its
+    /// own stores through `jit::StoreLog`, which the dispatcher drains against
+    /// the block cache; every instruction *outside* the lifted subset runs
+    /// here instead, and without this a `MOVEM` that wrote over a cached
+    /// translation would leave it cached. `cpu::riscv::exec` keeps the same
+    /// log for the same reason, and `engine::drain` is what reads it.
+    ///
+    /// Four entries because the widest access a step makes is a `MOVEM` of
+    /// sixteen long registers — sixty-four contiguous bytes, so two pages —
+    /// and an exception frame is narrower still. [`Exec::wrote_all`] is what
+    /// happens if that is ever wrong.
+    ///
+    /// Behind the translated engine's own gate, because a build with no block
+    /// cache has nothing to tell and the interpreter's write path is hot
+    /// enough that it should not carry three dead stores.
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    wrote: [u32; 4],
+    /// How many of [`Exec::wrote`] are live.
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    wrote_n: u8,
+    /// This step wrote to more pages than [`Exec::wrote`] holds, so the reader
+    /// must assume every translation is stale.
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    wrote_all: bool,
 }
+
+/// The granularity [`Exec::wrote`] records a write at.
+///
+/// `lift::WINDOW` and `jit::PAGE_SIZE` are the same four kilobytes and both
+/// live behind features this file does not have, so the number is written here
+/// and `engine`'s tests assert the three agree.
+#[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+pub(super) const WRITE_PAGE: u32 = 4096;
 
 impl<'a> Exec<'a> {
     /// Borrow a core for one step.
@@ -648,6 +684,52 @@ impl<'a> Exec<'a> {
             fault_alternate: false,
             fp_last_address: 0,
             deferred_slides: 0,
+            #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+            wrote: [0; 4],
+            #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+            wrote_n: 0,
+            #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+            wrote_all: false,
+        }
+    }
+
+    /// The pages this step wrote, and whether there were more than fit.
+    ///
+    /// Read by `engine::drain` after an interpreted step, and by nothing else:
+    /// it is derived state for the block cache (CLAUDE.md, "Devices").
+    #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+    pub(super) fn wrote(&self) -> (&[u32], bool) {
+        (&self.wrote[..self.wrote_n as usize], self.wrote_all)
+    }
+
+    /// Record a write at bus address `at`, for the block cache.
+    ///
+    /// On the guest-**physical** address the access actually reached — the one
+    /// already masked to the pins this model drives — because that is the
+    /// address a translation was lifted from and a store has to be matched
+    /// against it there.
+    #[inline]
+    fn note_write(&mut self, at: u64) {
+        // Nothing reads the log in a build with no translated engine, and the
+        // interpreter's write path is hot enough that it should not carry a
+        // dead store.
+        #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+        {
+            let page = (at as u32) & !(WRITE_PAGE - 1);
+            if self.wrote[..self.wrote_n as usize].contains(&page) {
+                return;
+            }
+            match self.wrote.get_mut(self.wrote_n as usize) {
+                Some(slot) => {
+                    *slot = page;
+                    self.wrote_n += 1;
+                }
+                None => self.wrote_all = true,
+            }
+        }
+        #[cfg(not(all(feature = "cpu-m68k-lift", feature = "jit")))]
+        {
+            let _ = at;
         }
     }
     /// Run one reset sequence, exception sequence, or instruction.
@@ -988,7 +1070,10 @@ impl<'a> Exec<'a> {
             u64::from(value),
             attrs,
         ) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.note_write(u64::from(at & self.mask));
+                true
+            }
             Err(_) => {
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = at;
@@ -1115,7 +1200,10 @@ impl<'a> Exec<'a> {
             .space
             .write(at, Width::U8, u64::from(value), self.attrs())
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.note_write(at);
+                Ok(())
+            }
             Err(_) => Err(self.bus_fault(addr, false, fc, 1, u32::from(value))),
         }
     }
@@ -1148,7 +1236,10 @@ impl<'a> Exec<'a> {
             .space
             .write(at, Width::U16, u64::from(value), self.attrs())
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.note_write(at);
+                Ok(())
+            }
             Err(_) => Err(self.bus_fault(addr, false, fc, 2, u32::from(value))),
         }
     }
