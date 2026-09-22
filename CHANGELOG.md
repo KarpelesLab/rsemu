@@ -7,6 +7,399 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/rsemu/compare/v0.0.5...v0.0.6) - 2026-09-22
+
+### Added
+
+- *(dev-mac-swim)* a cable position carries its own mechanism, and an 800K drive on the back does not make the Macintosh format 800K
+- *(dev-mac-adb)* the transceiver clocks a byte at an idle computer, and the system starts polling
+- *(dev-mac-iwm)* a head that writes, and Apple's own code proves it
+- *(cpu-m68k)* [**breaking**] run the translated engine on jit::Dispatcher
+- *(dev-mac-swim)* the ISM register set, and a Macintosh that boots off it
+- *(cpu-m68k)* count what the IR frontend lifts, and why it declines the rest
+- *(machine)* give the Macintosh Plus its SCSI port
+- *(dev-ncr5380)* an NCR 5380 SCSI Interface Device
+- *(machine)* a Macintosh Classic, to the insert-disk screen
+- *(dev-mac-swim)* a SWIM, as the IWM's superset rather than a second copy
+- *(dev-mac-mfm)* the 1.44 MB format, and a disk that carries it
+- *(dev-mac-adb)* the Apple Desktop Bus transceiver, and it is what the ROM waits for
+- *(dev-mac-glue)* an overlay a board can latch, for the Classic
+- *(cpu-m68k)* lift the 68000 integer core into the translation IR
+- *(dev-mac-mouse)* a pointer that goes where a person puts it
+- *(dev-mac-sound)* play the buffer the ROM chimes out of
+- *(machine)* give the mac-plus board a drive bay
+- *(dev-mac-iwm)* [**breaking**] shift a disk past the read head
+- *(dev-mac)* Apple's 6-and-2 GCR, and the disk a drive reads
+- *(machine)* put a keyboard and a clock chip on the mac-plus board
+- *(dev-mac)* the clock chip and its twenty bytes of parameter RAM
+- *(dev-mac)* a Macintosh Plus keyboard on the shift register
+- *(dev-mac-via)* [**breaking**] make the shift register shift
+- *(machine)* a Macintosh Plus, and the five chips a compact Mac is
+- *(cpu-x86)* virtual-8086 mode, as far as a DOS memory manager needs it
+- *(bus-pci)* a base address register says where a window points, not where it is
+- *(machine)* an Amiga 4000T, and Workbench 3.1 off its SCSI cable
+- *(dev-ncr53c710)* an NCR 53C710 SCSI I/O Processor, SCRIPTS and all
+- *(monitor)* media, insert and eject over every drive on the board
+- *(medium)* [**breaking**] a device-level door for changing media while a machine runs
+- *(dev-pc)* a PCI IDE controller in native mode, driven through its I/O BAR
+- *(dev-pc)* the 440FX bridge drains the fabric's owed retopologies
+- *(bus-pci)* [**breaking**] place an I/O base address register, one guard per space
+- *(machine)* the A3000's motherboard fast RAM, and Workbench off its SCSI disk
+- *(machine)* the Amiga 4000, a 68040 with AGA and its own IDE port
+- *(cli)* reach the monitor console, as a subcommand and as a run flag
+- *(monitor)* a console for a stopped machine, and the command engine behind it
+- *(machine)* the Amiga 3000, a 68030 with a 68882 and a SCSI port
+- *(dev-amiga-sdmac)* the A3000's Super DMAC, and the WD33C93A behind it
+- *(dev-amiga-ramsey)* the memory-controller register Kickstart spins on
+- *(dev-wd33c93)* a Western Digital WD33C93A SCSI Bus Interface Controller
+- *(dev-scsi)* a SCSI bus, a target seam and a direct-access disk on it
+- *(cpu-m68k)* the 68040's on-chip floating-point unit, which traps where the 68881 computed
+- *(cpu-m68k)* the 68040's memory management unit and its access faults
+- *(cpu-m68k)* the 68040, 68EC040 and 68LC040, with MOVE16 and the caches
+- *(wasm)* the browser embedder, with a token where the note asked for a pointer
+- *(jit)* a seam a host engine can instantiate generated modules through
+- *(cpu-m68k)* the 68881's transcendentals, computed at twice the precision
+- *(cpu-m68k)* the 68881/68882 coprocessor, its registers and its arithmetic
+- *(cpu-m68k)* the 68030 and 68EC030, with the paged memory management unit
+- *(dev-ahci)* [**breaking**] carry a packet device on a Serial ATA port
+- *(jit)* reach the wasm backend through `engine = "jit-wasm"`
+- *(jit)* a WebAssembly backend that lowers an IR block to a module
+- *(machine)* an amiga-cd32 board that boots to its animated screen
+- *(dev-amiga-cd32pad)* the joypad's shift register, and Paula driving its latch
+- *(dev-amiga-akiko)* Akiko's corner turn, CD registers and EEPROM wires
+- *(dev-amiga-cdrom)* a CD32 CD-ROM drive that reads ISO 9660 and raw frames
+- *(fw-pcbios)* El Torito, so a bootable disc actually boots
+- *(machine)* give pc-at and q35 a CD-ROM on a media slot the CLI can fill
+- *(dev-ata)* [**breaking**] an ATAPI CD-ROM on the same cable as the hard disk
+- *(dev-pc)* a diskette the host can swap under a running guest
+- *(fw-pcbios)* the VGA graphics modes, and VBE 2.0 over our own registers
+- *(dev-pc-video)* a linear framebuffer behind the display adapter's BAR0
+- *(dev-pc-video)* a VGA model with planar memory and a scanout from the registers
+- *(machine)* the A1200, and Kickstart 3.1 booting Workbench 3.1 on it
+- *(dev-amiga-agnus)* Alice, the AA chip set's Agnus
+- *(dev-amiga-denise)* AA sprites, their wide DMA seam, and CLXCON2
+- *(dev-amiga-denise)* HAM8, and HAM6 in every resolution
+- *(dev-amiga-denise)* eight bitplanes, FMODE, the 35 ns scroll and BPLCON4's bitplane mask
+- *(dev-amiga-denise)* Lisa, the AA video chip, and her 256-entry colour table
+- *(machine)* [**breaking**] the A600's chips are the Enhanced Chip Set, because they are
+- *(machine)* the A500+ board, its ECS chips and its battery-backed clock
+- *(dev-amiga-agnus)* the Enhanced Chip Set Agnus, BEAMCON0 and the programmable beam
+- *(dev-amiga-denise)* the 8373 Enhanced Chip Set Denise and a picture laid out by the beam
+- *(machine)* the A600's Kickstart repeats wherever Gayle's ROM select reaches
+- *(machine)* an amiga-a600 board with an IDE hard disk on Gayle
+- *(dev-amiga-gayle)* Gayle, the A600's IDE port and interrupt registers
+- *(cpu-m68k)* the 68020's stack frames, master stack and timing
+- *(cpu-m68k)* the 68020's instructions
+- *(cpu-m68k)* the 68020's addressing modes
+- *(cpu-m68k)* [**breaking**] a model property, and the 68010
+- *(dev-amiga-gary)* [**breaking**] decode bank 6, fit an A501, and give AROS an extended-ROM window
+- *(host)* --record-audio and a browser tab can hear an Amiga
+- *(dev-amiga-paula)* the four audio channels produce stereo frames for a host
+- *(dev-atecc)* the SWI front end, on the same packet layer as I2C
+- *(bus-swi)* a single-wire link whose unit is a UART frame
+- *(machine)* [**breaking**] the A500's ROM socket is a 512 KiB mirror, so a Kickstart 1.x fits
+- *(machine)* DF0 on the A500 takes a disk
+- *(dev-amiga-floppy)* ADF disks, encoded into the MFM tracks trackdisk reads
+- *(machine)* an A500 you can see, type at and point at
+- *(dev-amiga)* the keyboard's protocol and the mouse's quadrature, through the seam
+- *(dev-amiga-paula)* the four pot pins read on POTGOR
+- *(dev-amiga-denise)* the mouse pins clock JOY0DAT and JOY1DAT
+- *(dev-amiga-agnus)* Agnus, and the whole A500 chipset running together
+- *(dev-amiga-denise)* Denise -- colour, playfields, HAM, sprites and collisions
+- *(dev-amiga)* the A500's internal floppy drive on the CIA ports
+- *(dev-amiga)* Paula, and both CIAs interrupting the A500 through it
+- *(machine)* put the two 8520s on the A500, with CIA-A's PA0 driving OVL
+- *(dev-amiga)* the A500 memory map, the OVL overlay and the custom-chip seam
+- *(machine)* reach a named neighbour's region from bind
+- *(dev-cia)* the MOS 8520 CIA
+- *(media)* read an Amiga Kickstart from the media the user already owns
+- *(dev-atecc)* the ATECC508A/608 secure element on I²C, and the crypto it needs
+- *(machine)* put the ST25DV64K on the stm32f407 board
+- *(dev-st25dv)* the ST25DV dynamic NFC tag, with the RF reader as a host door
+- *(gdb)* [**breaking**] `load` into flash, through the door the device opened
+- *(dev-stm32-flash)* describe the array's sectors, so a loader can program it
+- *(space)* a device can publish the erase geometry a loader programs it through
+- *(dev-flash)* enforce PCROP and RDP rather than store them
+- *(dev-stm32)* sixteen peripherals honour their clock gate
+- *(dev-stm32-rcc)* the clock interrupt, so a ready bit can raise IRQ 5
+- *(dev-stm32)* a clock gate a peripheral can receive, and a USART that honours it
+- *(dev-stm32-i2c)* [**breaking**] slave mode on both links, and v2's `SBC`
+- *(bus-i2c)* one pin pair carries both roles, so a controller can be addressed
+- *(dev-psram-qspi)* an APS6404L-class QSPI pseudo-static RAM
+- *(dev-stm32-octospi)* [**breaking**] pass CCR's widths through, and count the chip select low
+- *(bus-spi)* carry the line width of a phase with the word
+- *(dev-st77xx)* the ST7789/ST7735, whose commands are addressed rather than counted
+- *(dev-ssd1306)* the SSD1306/SH1106, and the seam a device-owned framebuffer needs
+- *(dev-dfuse)* DfuSe (.dfu, UM0391) images, each element at its own address
+- *(dev-sdio)* the SDIO answers as a DMA flow controller
+- *(machine)* wire the F407's DMA request matrix from RM0090 Tables 43/44
+- *(dev-dmamux)* the STM32 DMA request multiplexer
+- *(dev-dma)* [**breaking**] CHSEL gates the request, and PFCTRL ends the transfer
+- *(wire)* let a DMA peripheral say which item is its last
+- *(dev-keypad)* a GPIO matrix keypad, and the stm32f407 gets one on PE0-PE7
+- *(wire)* [**breaking**] a third driver state, and a net that resolves itself
+- *(dev-stm32)* the HASH processor, context swap included
+- *(dev-stm32-firewall)* [**breaking**] the interrupt case, and the call gate is three words
+- *(cli)* `--spin-detect`, so a hung board says why
+- *(cpu-riscv)* wire the hart interpreter to the spin detector
+- *(cpu-arm)* wire the ARMv7-M interpreter to the spin detector
+- *(spin)* catch a processor stuck on a load whose value never changes
+- *(dev-stm32-dbgmcu)* st.dbgmcu, with a real output pin per freeze bit
+- *(cpu-arm)* [**breaking**] the external PPB's vendor window belongs to the board
+- *(device)* a debugger's halt reaches a device through `Device::debug_halt`
+- *(dev-stm32-firewall)* the STM32L4 Firewall, and FWDIS becomes load-bearing
+- *(dev-stm32-exti)* [**breaking**] SYSCFG.MEMRMP moves what answers at address zero
+- *(machine)* chain the F407's timers through the internal trigger matrix
+- *(dev-stm32-tim)* [**breaking**] input capture, the slave-mode controller and the DMA burst window
+- *(dev-i2c-v2)* st.i2c-v2, the block every STM32 since the F0 carries
+- *(machine)* the SDIO on the F407, and the first request line anything drives
+- *(dev-sdio)* the F2/F4/F7 SDIO, as a sibling of the H7 SDMMC rather than a variant of it
+- *(dev-stm32)* [**breaking**] the F0/F3/F7/L4/G4/WB SPI, as a variant with its FIFO
+- *(dev-stm32-rng)* the STM32 RNG, from a stream the machine seeds
+- *(dev-rcc)* st.rcc drives sysclk, hclk, pclk1, pclk2 and the timer clocks
+- *(clock)* a device can re-rate a clock domain, at a scheduling boundary
+- *(machine)* the F407 carries its flash interface and its real-time clock
+- *(dev-rtc)* the STM32 real-time clock, its BCD calendar and its backup domain
+- *(dev-stm32)* an `st.flash` that owns the array it programs
+- *(cpu-arm-v7m)* [**breaking**] the DWT cycle counter, and the bit-band alias windows
+- *(gdb)* qXfer:memory-map:read, built from the machine's own address space
+- *(gdb)* [**breaking**] a target description is a list of features, and ARMv7-M has two
+- *(machine)* the F407's nine peripherals, at their Table 62 vectors and behind a bus matrix
+
+### Fixed
+
+- *(dev-mac-iwm)* the chip's own CRC pair is staged behind the FIFO the processor counts
+- *(dev-mac-iwm)* the Clear FIFO toggle owns the write buffer, and the first copy of a sector wins
+- *(dev-mac-adb)* an unsolicited byte is a reply's command, and the pointer lands where it is put
+- *(dev-mac-adb)* a transaction that interrupts an unsolicited byte takes the flag with it
+- *(cpu-m68k)* a remap clears the PCs there was no block at
+- *(dev-mac-swim)* a debug read must not take the separator's overrun flag
+- *(dev-mac-scc)* latch RR0 and re-close on an odd number of DCD transitions
+- *(dev-mac-adb)* satisfy clippy and rustdoc under -D warnings
+- *(dev-mac-via)* let a word access complete, because the board has no /BERR
+- *(cpu-m68k)* lift a block's first two words out of the prefetch queue
+- *(cpu-m68k)* keep the IR frontend's documentation out of its private modules
+- *(dev-mac-glue)* priority-encode the two interrupts, because level 3 is an RTE
+- *(dev-mac-iwm)* name the byte the shifter latches as an event
+- *(dev-mac-gcr)* give a cylinder the gap that sets how fast it turns
+- *(dev-lcdc)* hold the bus the scanout engine masters weakly
+- *(dev-gb)* [**breaking**] hold the bus the PPU masters weakly, not in a cycle
+- *(dev-sms)* [**breaking**] hold the space the mapper slides windows in weakly
+- *(dev-stm32-firewall)* hold the fenced map weakly, not in a cycle
+- *(dev-stm32-sdmmc)* [**breaking**] hold the mastered address space weakly, not in a cycle
+- *(dev-riscv)* hold the space the boot ROM describes weakly, not in a cycle
+- *(dev-arm)* hold the space the boot ROM describes weakly, not in a cycle
+- *(dev-mac-scc)* let go of `/INT` when the reset command says to
+- *(dev-mac-iwm)* the drive's register file, from Apple's own note
+- *(machine)* give the Macintosh's video circuit to the binary
+- *(dev-mac-glue)* fold main memory through its four-megabyte window
+- *(cpu-x86)* [**breaking**] the privilege level lives in the code segment's cache
+- *(dev-virtio)* [**breaking**] hold the mastered address space weakly, not in a cycle
+- *(vnc)* [**breaking**] refuse a pixel format RFC 6143 does not permit
+- *(dev-blk)* bound a capture snapshot by what a host can hold, not by the header
+- *(dev-scsi)* answer MODE SENSE page 00 rather than refusing it
+- *(dev-wd33c93)* three defects between the chip and Commodore's `scsi.device`
+- *(wasm)* a CD32 with an empty tray assembles in the browser too
+- *(cpu-m68k)* MOVE16 keeps its transfers when a table search runs inside it
+- *(cpu-m68k)* a deferred prefetch fault on a 68040 says whether the page was missing
+- *(dev-amiga-akiko)* `drive` names a device a build without one cannot bind
+- *(cpu-x86)* [**breaking**] read the time-stamp counter where the processor stands, on one counter per crystal
+- *(dev-ata)* the data register hands back nothing while a packet is awaited
+- *(cpu-x86)* [**breaking**] give EFLAGS.ID storage wherever CPUID exists
+- *(sched)* [**breaking**] arm a comparator where the writing processor stands
+- *(fw-pcbios)* probe for a diskette adapter before talking to one
+- *(fw-pcbios)* [**breaking**] the three disk services an installation needs
+- *(cpu-x86)* [**breaking**] count the time-stamp counter through a halt
+- *(dev-amiga-agnus)* an 8375 answers $21 on PAL, leaving bit 1 to Alice
+- *(dev-amiga-denise)* LISAID bits 9-8 say the A1200 fetches four times wide
+- *(cpu-x86)* [**breaking**] publish the core's position, and read x86 timers where the reader stands
+- *(sched)* [**breaking**] a declined round ages nobody, not even a passive crystal
+- *(dev-amiga)* [**breaking**] the chip data bus, not a floating-word placeholder
+- *(sched)* [**breaking**] read a free-running counter at the reading runnable's position
+- *(dev-ata)* [**breaking**] no completion interrupt after the last block of a PIO read
+- *(dev-amiga-keyboard)* [**breaking**] a host's burst of keys waits instead of sticking one down
+- *(input)* move the Amiga pointer one count per framebuffer pixel
+- *(sched)* [**breaking**] every runnable on a crystal executes the crystal's whole rate
+- *(dev-amiga-paula)* [**breaking**] poll the host port on catch-up, not as a runnable
+- *(sched)* deliver the lazy event a round ends on, even a tick short of it
+- *(dev-amiga-paula)* write the level pins low-first so they never show seven
+- *(dev-amiga-floppy)* step the head on the trailing edge of STEP*
+- *(cli)* --for bounds a console session rather than the idle guess doing it
+- *(dev-cia)* the start a timer-high write makes raises a toggle output too
+- *(dev-amiga-agnus)* count a high-resolution bitplane fetch in eight-count blocks
+- *(dev-amiga-agnus)* a copper MOVE to a protected register halts the copper
+- *(dev-amiga-agnus)* a blitter line steps its D pointer by BLTCMOD
+- *(dev-amiga)* repeat a 256 KiB Kickstart through Gary's overlay window
+- *(dev-amiga)* a byte access to a custom register is the word access the chips see
+- *(dev-cia)* a write to a one-shot timer's high byte starts it
+- *(dev-amiga-paula)* no disk word is lost between Agnus's slots
+- *(dev-cia)* SP and CNT are open drain, and SP's output latch resets low
+- *(dev-amiga)* route DIWSTRT and DIWSTOP to Denise as well as Agnus
+- *(dev-cia)* release the output table before driving a pin
+- *(machine)* restore the brace a union merge ate
+- *(dev-flash)* an F4 comes back from a reset with its option register locked
+- *(machine)* hand a sink the drivers wired to it, not its whole net
+- *(dev-stm32)* OTYPER and PUPDR decide what a pad presents, and IDR reads the pin
+- *(dev-stm32)* a feature has to compile its own tests, alone
+- *(machine)* the F407's two watchdog resets stop sharing one net
+- *(machine)* register st.tim in a build that enables only dev-stm32-tim
+- *(cpu-x86)* the inlined-path tests need a host that generates code
+- *(cpu-riscv)* gate `has_shadow` on what its callers are gated on
+- *(sched)* a share that rounds to nothing still gets one tick
+- *(sched)* [**breaking**] a budget is a share of the round, not ten thousand ticks
+
+### Other
+
+- two casts clippy does not want
+- *(cpu-m68k)* the nightly sweep was running zero tests and passing
+- what actually bounds a software TLB on a Macintosh, measured
+- *(m68k)* the mini board's rate is measured on both translated engines
+- the m68k rows `rsemu run --trace cpu` now prints
+- where the m68k translated engine's time actually went
+- four registers live only in the ISM's high half, not three
+- how to run the instrument the three measurements came out of
+- three things the SWIM reference does not say, not two
+- name the SWIM Chip User's Reference in the source table
+- rustfmt, and a doc link that named a private item
+- *(dev-mac-swim)* the SuperDrive test encoded the answer that stopped the boot
+- the Macintosh Classic boots Mac OS 6.0.8 to the Finder
+- *(dev-mac-swim)* fuzz both register sets behind the one aperture
+- *(machine)* Mac OS 6.0.8 boots to the Finder desktop
+- *(cpu-m68k)* the lift rate on two real ROMs, and what set_slot would cost
+- *(dev-mac-mouse)* count the whole path, and name the count the ROM loses
+- bring the board counts up to what is on disk
+- *(dev-ncr5380)* record that a region at $F00000 stops the Plus booting
+- what a Plus ROM does with its 5380, and what it does not
+- *(machine)* read the disk out of RSEMU_MAC_DISK_DIR, the slot that exists
+- *(dev-mac-swim)* keep the disk's density off the tick path
+- *(cpu-m68k)* sweep the IR frontend nightly at the size that finds things
+- *(cpu-m68k)* a conditional charge is its own reason for declining an encoding
+- *(cpu-m68k)* the lifter's tick table said a fetch was static, and it is not
+- *(machine)* assert the m68k board's state hash across both engines
+- what the m68k IR frontend lifts, what it declines, and the one thing left
+- the Macintosh reads a disk, chimes and has a mouse
+- *(upstream)* fstool writes no HFS resource fork, which is what stops the Mac booting
+- *(machine)* assert Apple's ROM decodes a sector this encoder wrote
+- bring the status section and the board table up to the tree
+- rewrap a line in the mac-plus ledger
+- the Plus's disk-speed PWM reaches a drive that ignores it
+- the README's mac-plus paragraph reaches the blinking icon
+- say what the drive's rotation rate would need before it is changed
+- the Macintosh Plus reads its drive, and what still stops it booting
+- *(machine)* the Macintosh Plus's disk and mouse paths, end to end
+- the README's mac-plus paragraph reaches the insert-disk icon
+- the index still said main memory must not repeat
+- show `--screenshot` in the mac-plus examples
+- record that every memory size reaches the same boot screen
+- *(dev-mac-scc)* read the chip's write registers directly
+- stop claiming mac-plus reaches the insert-disk screen
+- *(dev-mac)* satisfy rustfmt, clippy and rustdoc
+- record what the mac-plus ROM is not waiting for
+- give the ROM tail's zero count rather than a rounded share
+- *(dev-mac)* put the no_std imports where rustfmt wants them
+- *(dev-mac-via)* drop a binding load no longer needs
+- *(machine)* say where on the screen the cursor actually is
+- *(dev-mac)* name the IWM in the module's own header
+- *(machine)* name the VIA copy $EFE1FE lands in
+- the Macintosh Plus page, its ledger, and why a Plus cannot read 1.44 MB
+- *(machine)* run a real Macintosh Plus ROM in place, as far as it gets
+- *(machine)* assemble the mac-plus board and make every chip answer
+- run the FreeDOS install nightly, because nothing else runs it
+- *(fuzz)* collect every failing target, not the first
+- recover a rotated Debian pin from snapshot.debian.org
+- *(fuzz)* seed blk_image with both qcow2 findings and gate the upstream one
+- *(dev-amiga-floppy)* a Kickstart finds out that its disk has left
+- *(dev-pc)* the ATA split's claim is now load-bearing
+- *(monitor)* a helper follows the board its callers need
+- *(machine)* the A4000's ledger, and the A3000 CHK that does not reproduce
+- *(monitor)* what the console answers, and why noroi is not in it
+- *(monitor)* a session against a headless run, and against MemAttrs::debug
+- name the A3000 and its SCSI port in the document index
+- *(machine)* the A3000's ledger — its register map, and where a boot stops
+- *(cpu-m68k)* CHK.L across the sign boundary, CHK2.L, and the 68030 against the 68020
+- the differential row names all four later 680x0 models
+- *(cpu-m68k)* the 68040 in the ledger, and why it traps where it could compute
+- build the site before the browser harness reads it, as CI does
+- *(jit)* the wasm backend is 1.50x the interpreter in a browser, which §11.4 doubted
+- *(wasm)* run a guest inside V8-compiled modules and hash it against the interpreter
+- *(cpu-m68k)* assert a coprocessor instruction is as long as the disassembler says
+- *(cpu-m68k)* what the coprocessor is, and every way it differs from one
+- *(dev-disc)* [**breaking**] lift the disc out of both drives that hold one
+- *(jit)* measure what the wasm backend costs on a native host
+- *(jit)* say what the local-index arithmetic is for
+- *(jit)* carry the frame offset rather than assuming it is zero
+- say what the wasm backend kept from §11.4 and what it changed
+- build the wasm backend for the wasm targets
+- *(jit)* hash the same guest under the wasm backend, and check its
+- describe the CD32 boot screen from the frames, not from memory
+- *(dev-amiga-akiko)* refuse a snapshot whose derived pointers cannot be true
+- say which of Akiko's registers were measured and which are open
+- *(machine)* boot the CD32's two-part ROM to its animated screen
+- *(machine)* bind the new `cdrom` slot where q35 is built by hand
+- *(dev-ata)* name every import the packet device takes from the disk
+- *(machine)* --cdrom is the short spelling, and an unbound slot is an open tray
+- *(dev-pc-ide)* the adapter cannot tell a hard disk from a CD-ROM
+- *(machine)* the boards name a `cdrom` slot now, and the tests say so
+- *(machine)* pc-at has a CD-ROM and boots off one
+- *(machine)* pc-at installs FreeDOS and boots off the disk it wrote
+- *(machine)* install FreeDOS 1.3 onto a hard disk and boot off it
+- *(dev-pc)* four scan codes, four interrupts, and no firmware
+- *(fw-pcbios)* put AH=0Fh's comment back above AH=0Fh
+- say in the manifest what dev-pc-video and dev-pc-pci now get you
+- *(dev-pc-video)* strike "a graphics mode" from what pc-at is missing
+- *(machine)* build amiga_alice without display-png
+- *(machine)* say that the A1200's trace prints ChipRevBits0
+- *(dev-amiga-agnus)* a section sign a shell mangled on its way in
+- Alice, the A1200, and the one thing the AA board does not yet show
+- record Lisa, the seam Alice needs from her, and what the AA document left open
+- *(dev-amiga-denise)* [**breaking**] eight planes in the seam and a picture eight bits a gun
+- note that the host pointer's scale assumes a high-resolution picture
+- *(dev-amiga-rtc)* say the leap-year rule with is_multiple_of
+- *(machine)* ScreenMode on the A500+ and the A500, and the DENISEID finding it exposes
+- *(dev-amiga-denise)* the scanout follows a programmed raster and its period stays exact
+- record the Enhanced Chip Set, the A500+ and what Kickstart found
+- *(machine)* an A600 section in the Amiga ledger
+- *(machine)* Kickstart boots Workbench off an HDF on the A600
+- the 68010 and 68020 get a row of the core table, and say what stands in for a corpus
+- *(cpu-m68k)* say which processors each row of the table is on
+- *(cpu-m68k)* a machine file may name the processor
+- the A500 belongs in the list of boards that boot foreign software
+- *(amiga)* what using the Workbench proved, and the two input defects it found
+- *(amiga)* a person opens the disk, starts a Shell and types, on 2.04 and 1.3
+- *(amiga)* what the audio handshake guarantees now, and the half-speed 68000
+- *(amiga)* record what the AROS keyboard wedge is and is not
+- drop the Paula test constants nothing reads, and chunk by `as_chunks`
+- say what a recorded Amiga tone actually measures
+- rustfmt the Amiga audio additions and rewrap two paragraphs
+- what the Amiga's audio stream is, and the DMA skew it exposes
+- *(machine)* Kickstart 1.3 boots the Workbench 1.3 disk to its desktop
+- *(machine)* the ADF tests reach the custom bus itself, not a byte-tolerant window
+- *(machine)* Kickstart 1.3, 2.04 and 3.1 draw their insert-disk screens
+- *(machine)* the A500 tests bind DF0 now the board names its slot
+- *(machine)* an A500's empty addresses float, and Kickstart needs them to
+- *(dev-amiga)* gate the CIA-only sink with the test that uses it
+- *(dev-cia)* two 8520s on a 68000 test board
+- name the Amiga emulators and AROS in the provenance exclusion table
+- *(dev-stm32)* the gate link resolves on its own, and one that pointed at a private type
+- *(machine)* a board that wires its clock gates, and the docs for why it is not the F407
+- *(dev-flash)* the link text already resolves
+- *(dev-stm32-hash)* a board for the hash processor, not a part that lacks one
+- *(dev-sdio)* prove PFCTRL against a real card, both ways
+- bound fstool below the release that demands a filesystem feature
+- *(spin)* the detector on a whole board, and what it costs
+- *(machine)* the F407's watchdog reset path, end to end
+- ignore the per-agent CARGO_TARGET_DIR
+- *(dev-sdio)* a guest moves blocks over DMA2 without ever reading the FIFO
+- *(machine)* the F407's flash guarantee is no silent modification, not a fault
+- *(dev-stm32)* the two flash bases, and that nothing writes the array back
+- *(dev-stm32)* link the flash module header at items rustdoc can reach
+- *(dev-stm32)* say which SNB field width the F4 flash decodes
+- declare the `dev-stm32-flash` feature
+- *(gdb-v7m)* the four M-profile behaviours a debugger gets wrong
+- Merge branch 'worktree-agent-a2b16c84daee86067'
+- Merge branch 'worktree-agent-a4af39317f2a25f0b'
+- *(sched)* what the budget change measured, end to end
+
 ## [0.0.5](https://github.com/KarpelesLab/rsemu/compare/v0.0.4...v0.0.5) - 2026-09-11
 
 ### Added
