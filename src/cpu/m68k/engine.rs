@@ -75,13 +75,28 @@
 //!   instruction boundary — the boundary the store's own instruction ends at,
 //!   which is where the effect can first be honoured.
 //!
-//! One skew is left and is written down rather than rounded up: the 68000
-//! fetches two words ahead, so a store that lands on a word *already in the
-//! prefetch queue* is not seen by the instruction that consumes it, and this
-//! frontend bakes extension words in as constants at lift time. Inside a
-//! block that is unreachable — the guard above ends the block at the store —
-//! so it needs a second bus master writing the code a block is running.
-//! `docs/cpu/m68k.md`'s known-failures ledger is where it is written down.
+//! ## And the third mechanism, which is the one that is easy to miss
+//!
+//! A 68000 fetches **two words ahead**, so the instruction at a block's entry
+//! PC is the word already in `prefetch[0]` — not whatever is at that address
+//! now. A store that landed on it since is not seen by the instruction that
+//! consumes it, and there is no way back.
+//!
+//! So `Reader` answers the block's first two words out of `State::prefetch`
+//! and only the words from `pc + 4` on out of memory, and a cached entry
+//! records the queue it was lifted with so a core whose queue has moved on
+//! re-lifts. `docs/cpu/m68k.md` has the generated case that found this; the
+//! short version is `OR.B D7,(A3)+` writing into its own code window two
+//! bytes ahead of itself, where lifting from memory executed the word the
+//! store had just written and the interpreter executed the word it had
+//! already fetched.
+//!
+//! One narrower skew is left and is written down rather than rounded up: an
+//! *extension* word further ahead than the queue reaches is baked in as a
+//! constant at lift time, so a store onto it between the lift and the run is
+//! not seen. Inside a block that cannot happen — the window guard ends the
+//! block at the store, and an instruction's own fetches precede its own store
+//! — so it needs a second bus master writing the code a block is running.
 //!
 //! # Sources
 //!
@@ -118,9 +133,17 @@ struct Entry {
     /// The block, or `None` when the instruction at this PC is outside the
     /// lifted subset — recorded so the next pass does not lift it again.
     block: Option<Block>,
-    /// Every `(address, word)` pair the lifter read, in the order it read
-    /// them. Re-read on every hit; see the module docs.
+    /// Every `(address, word)` pair the lifter read **out of memory**, in the
+    /// order it read them. Re-read on every hit; see the module docs.
     seen: Vec<(u32, u16)>,
+    /// The prefetch queue the lift was made with.
+    ///
+    /// The block's first two words came from here rather than from memory
+    /// (`Reader::word`), so a translation is only valid for a core whose queue
+    /// still holds them. It normally does — the queue's invariant is that they
+    /// *are* the words at `pc` and `pc + 2` — and when it does not, this is
+    /// what notices.
+    queue: [u16; 2],
 }
 
 /// What a translated core has done, and what it holds.
@@ -253,7 +276,7 @@ pub(super) fn advance(
         return Exec::new(state, space, cfg, lines).step();
     }
     let pc = state.pc;
-    ensure(rt, pc, space, cfg);
+    ensure(rt, pc, state.prefetch, space, cfg);
 
     let Runtime {
         entries,
@@ -354,9 +377,9 @@ fn restart(
 }
 
 /// Make sure the cache holds an answer for `pc`, lifting one if it does not.
-fn ensure(rt: &mut Runtime, pc: u32, space: &AddressSpace, cfg: &Config) {
+fn ensure(rt: &mut Runtime, pc: u32, queue: [u16; 2], space: &AddressSpace, cfg: &Config) {
     if let Some(entry) = rt.entries.get(&pc) {
-        if valid(entry, space, cfg) {
+        if entry.queue == queue && valid(entry, space, cfg) {
             return;
         }
         rt.entries.remove(&pc);
@@ -369,6 +392,8 @@ fn ensure(rt: &mut Runtime, pc: u32, space: &AddressSpace, cfg: &Config) {
         space,
         attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
         mask: cfg.model.address_mask(),
+        pc,
+        queue,
         seen: Vec::new(),
     };
     // A read-ahead rather than a fetch: this reads up to `MAX_INSNS`
@@ -389,6 +414,7 @@ fn ensure(rt: &mut Runtime, pc: u32, space: &AddressSpace, cfg: &Config) {
             Entry {
                 block: Some(lifted.block),
                 seen: reader.seen,
+                queue,
             }
         }
         // Nothing lifted, or a model this frontend refuses. Either way the
@@ -397,6 +423,7 @@ fn ensure(rt: &mut Runtime, pc: u32, space: &AddressSpace, cfg: &Config) {
         _ => Entry {
             block: None,
             seen: reader.seen,
+            queue,
         },
     };
     rt.entries.insert(pc, entry);
@@ -419,6 +446,10 @@ struct Reader<'a> {
     space: &'a AddressSpace,
     attrs: MemAttrs,
     mask: u32,
+    /// The block's entry PC, which is where the prefetch queue answers.
+    pc: u32,
+    /// `State::prefetch` as the core holds it.
+    queue: [u16; 2],
     seen: Vec<(u32, u16)>,
 }
 
@@ -429,6 +460,31 @@ impl lift::InsnSource for Reader<'_> {
         // give it bytes the processor never fetches.
         if addr & 1 != 0 {
             return None;
+        }
+        // **The first two words come out of the prefetch queue, not memory.**
+        //
+        // This is not an optimization and it is not belt and braces: it is the
+        // difference between executing the guest's instruction and executing
+        // the bytes that happen to be at its address. `prefetch[0]` is the word
+        // at `pc` *as fetched* and `prefetch[1]` the word at `pc + 2`, and a
+        // store that landed on either of them since is not seen by the
+        // instruction that consumes them — a 68000 fetches two words ahead and
+        // there is no way back.
+        //
+        // A generated case found this: `OR.B D7,(A3)+` writing into its own
+        // code window two bytes ahead of itself, so the interpreter executed
+        // the word it had already fetched and a block lifted from memory
+        // executed the word the store had just written. Two cycles apart, and
+        // an entirely different instruction.
+        //
+        // Everything from `pc + 4` on has *not* been fetched yet, so memory is
+        // the right source for it, and only those reads go in `seen` — the two
+        // queue words are validated against the queue instead (`valid`).
+        if addr == self.pc {
+            return Some(self.queue[0]);
+        }
+        if addr == self.pc.wrapping_add(2) {
+            return Some(self.queue[1]);
         }
         let at = u64::from(addr & self.mask);
         let word = self.space.read(at, Width::U16, self.attrs).ok()? as u16;

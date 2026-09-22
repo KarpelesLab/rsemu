@@ -716,6 +716,41 @@ fn a_store_into_the_running_blocks_own_window_ends_the_block() {
 }
 
 #[test]
+fn a_store_onto_a_word_already_in_the_prefetch_queue_is_not_seen_by_it() {
+    // A 68000 fetches **two words ahead**, so the instruction at a block's
+    // entry PC is the word already in `prefetch[0]` — not whatever is at that
+    // address now. Lifting the entry instruction out of *memory* executes the
+    // store's result where the hardware executes what it had already fetched.
+    //
+    // `MOVE.B D0,(A3)` with `A3` pointing at the very next instruction:
+    //
+    // ```text
+    //   001000: 1680   move.b d0,(a3)      ; a3 = $001002, d0 = $60
+    //   001002: 4e71   nop                 ; already in prefetch[1]
+    //   001004: 4e72 2700  stop #$2700
+    // ```
+    //
+    // The store makes the word at `$1002` `$6071` — a `BRA` — and the `NOP`
+    // that actually runs is the one the queue holds. This is the case a
+    // generated program found (`docs/cpu/m68k.md`), reduced.
+    let program = vec![0x1680, 0x4e71, STOP[0], STOP[1]];
+    for byte in [0x60u32, 0x4e, 0x00, 0xff] {
+        let case = Case::seeded(program.clone())
+            .with_a(3, CODE + 2)
+            .with_d(0, byte)
+            .with_units(6);
+        agreed(&case);
+    }
+    // The case as the sweep produced it, kept verbatim: `SUB.B D4,(A3)+` and
+    // `OR.B D7,(A3)+` walking `A3` through their own code window, two bytes
+    // ahead of themselves.
+    let program = vec![
+        0x55cf, 0x47fb, 0x59f8, 0xe1e4, 0x991b, 0x8f1b, 0x62f6, 0x173c, STOP[0], STOP[1],
+    ];
+    agreed(&Case::seeded(program).with_ccr(0x09).with_units(8));
+}
+
+#[test]
 fn an_engine_switch_is_refused_for_a_model_the_frontend_does_not_lift() {
     use crate::core::props::Props;
     let props = Props::new()
@@ -742,6 +777,17 @@ fn every_opcode_word_agrees() {
     let (cases, found) = opcode_sweep(7, &[0x0010, 0x0000, 0x2400]);
     assert!(found.is_none(), "{cases} cases: {}", found.unwrap());
     assert!(cases > 9000, "the sweep must really have run: {cases}");
+}
+
+#[test]
+fn every_opcode_word_agrees_in_user_state_too() {
+    // The same sweep with **S** clear. Nothing in the lifted subset can be
+    // privileged, so this is a claim about the fallback: a privileged encoding
+    // is a privilege violation here rather than an instruction, `A7` is the
+    // user stack pointer, and an exception switches banks on its way in.
+    let (cases, found) = opcode_sweep_in(11, &[0x0010, 0x0000, 0x2400], super::super::flags::IPL);
+    assert!(found.is_none(), "{cases} cases: {}", found.unwrap());
+    assert!(cases > 5000, "the sweep must really have run: {cases}");
 }
 
 #[test]

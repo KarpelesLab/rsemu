@@ -344,7 +344,11 @@ fn core(case: &Case, space: Arc<AddressSpace>, engine: Engine) -> M68k {
     regs.a = case.a;
     regs.pc = CODE;
     regs.sr = case.sr;
+    // Both banks, because `set_regs` selects one from `SR` and a case may ask
+    // for either privilege state: a user-state case whose `USP` were left at
+    // whatever reset made it would push through address zero.
     regs.ssp = case.a[7];
+    regs.usp = case.a[7];
     // `prefetch` has to hold the words at `pc` and `pc + 2`, which is the
     // queue's whole invariant (`exec.rs`); a pair that does not is a state no
     // hardware can be in and neither engine would know what to do with.
@@ -851,6 +855,20 @@ impl Rng {
 /// Returns `(cases, divergences)`, with the first divergence.
 #[must_use]
 pub fn opcode_sweep(stride: u32, extensions: &[u16]) -> (usize, Option<Divergence>) {
+    opcode_sweep_in(stride, extensions, super::flags::S | super::flags::IPL)
+}
+
+/// The same, in the privilege state `sr` names.
+///
+/// Supervisor state is the interesting one for most of the instruction set and
+/// user state is the interesting one for the rest: a privileged encoding is a
+/// privilege violation there rather than an instruction, `A7` is the *user*
+/// stack pointer, and an exception switches banks on its way in. None of that
+/// is the frontend's business — it declines every privileged encoding — which
+/// is exactly why it is worth sweeping: the claim is that the *fallback* gets
+/// it right too.
+#[must_use]
+pub fn opcode_sweep_in(stride: u32, extensions: &[u16], sr: u16) -> (usize, Option<Divergence>) {
     let mut cases = 0usize;
     let mut word = 0u32;
     while word < 0x1_0000 {
@@ -858,7 +876,11 @@ pub fn opcode_sweep(stride: u32, extensions: &[u16]) -> (usize, Option<Divergenc
         program.extend_from_slice(extensions);
         program.push(0x4e72);
         program.push(0x2700);
-        let case = Case::seeded(program).with_extend().with_units(3);
+        let mut case = Case::seeded(program).with_units(3);
+        // `X` on top of whatever the caller asked for, because `ADDX`, `SUBX`,
+        // `NEGX`, `ROXL` and `ROXR` all read it and a sweep with it clear
+        // tests half of each of them.
+        case.sr = sr | super::flags::X;
         cases += 1;
         if let Err(d) = compare(&case) {
             return (cases, Some(d));
