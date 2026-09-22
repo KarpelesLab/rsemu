@@ -337,8 +337,7 @@ impl Framer {
         // behind them rather than `$AAAA`, so they are framed as the ordinary
         // marks they are and the generator has already seen the first.
         let sync_byte = mfm::cells(0x00, false, None);
-        if self.byte_cells() == mfm::sync_cells(mfm::SYNC_A1)
-            && self.previous_cells() == sync_byte
+        if self.byte_cells() == mfm::sync_cells(mfm::SYNC_A1) && self.previous_cells() == sync_byte
         {
             self.synced = true;
             self.phase = 0;
@@ -1362,7 +1361,7 @@ impl Iwm {
     /// `phases` is `PHASE3:PHASE2:PHASE1:PHASE0` in bits 3-0, which are the
     /// mechanism's `LSTRB`, `CA2`, `CA1` and `CA0` — the same four lines the
     /// IWM's soft switches 0-7 drive, so this walks them through
-    /// [`State::switch`] and the control register latches exactly as it does
+    /// `State::switch` and the control register latches exactly as it does
     /// for a Plus.
     pub fn set_phases(&self, phases: u8) {
         let moved = {

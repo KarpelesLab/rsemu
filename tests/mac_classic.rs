@@ -395,8 +395,22 @@ const SWITCHES: [&str; 16] = [
 /// The ISM's sixteen registers by name, index 0 to 15 — the write halves
 /// first, per the *SWIM Chip User's Reference* page 26.
 const ISM_REGS: [&str; 16] = [
-    "wData", "wMark", "wCRC", "wParam", "wPhase", "wSetup", "wMode0", "wMode1", "rData", "rMark",
-    "rError", "rParam", "rPhase", "rSetup", "rStatus", "rHandshake",
+    "wData",
+    "wMark",
+    "wCRC",
+    "wParam",
+    "wPhase",
+    "wSetup",
+    "wMode0",
+    "wMode1",
+    "rData",
+    "rMark",
+    "rError",
+    "rParam",
+    "rPhase",
+    "rSetup",
+    "rStatus",
+    "rHandshake",
 ];
 
 /// The mechanism's sixteen status lines by name, addressed `CA2:CA1:CA0:SEL`
@@ -548,7 +562,12 @@ impl RamTap {
         if attrs.debug || !self.on.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        *self.counts.lock().unwrap().entry((offset, write)).or_insert(0) += 1;
+        *self
+            .counts
+            .lock()
+            .unwrap()
+            .entry((offset, write))
+            .or_insert(0) += 1;
     }
 
     fn arm(&self, on: bool) {
@@ -1184,14 +1203,20 @@ fn trace_the_controller() {
         advance(&mut b, "mac-classic-trace", 1);
         if b.swim.has_disk(0) != had {
             had = !had;
-            println!("mac-classic: at {s}s the drive {} a disk", if had { "gained" } else { "lost" });
+            println!(
+                "mac-classic: at {s}s the drive {} a disk",
+                if had { "gained" } else { "lost" }
+            );
         }
         if s % 5 == 0 {
             let _ = picture(&b, "mac-classic-trace", s);
         }
     }
     tap.dump("mac-classic: the controller, named");
-    println!("mac-classic: ISM selected at the end: {}", b.swim.ism_selected());
+    println!(
+        "mac-classic: ISM selected at the end: {}",
+        b.swim.ism_selected()
+    );
     println!(
         "mac-classic: motor {} track {} disk {}",
         b.swim.motor(0),

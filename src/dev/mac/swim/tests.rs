@@ -314,7 +314,10 @@ fn the_separator_reads_an_id_field_and_its_crc_comes_out_zero() {
     for (block, chunk) in image.chunks_mut(512).enumerate() {
         chunk[..4].copy_from_slice(&(block as u32).to_be_bytes());
     }
-    swim.insert(0, Disk::from_image_for(&image, Reader::Swim).expect("a 1.44 MB image"));
+    swim.insert(
+        0,
+        Disk::from_image_for(&image, Reader::Swim).expect("a 1.44 MB image"),
+    );
     let iwm = swim.iwm();
     // Drive 1, spindle on, head 0 — what the ISM's mode register would say.
     iwm.set_enables(Some(0), true, Some(false));

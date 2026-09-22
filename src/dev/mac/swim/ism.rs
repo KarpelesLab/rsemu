@@ -101,8 +101,8 @@
 //! [`super::super::iwm::Iwm`], which owns the cable, and keeps no copy.
 
 use super::super::iwm::{self, Iwm};
-use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::error::Result;
+use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 
 // -- the sixteen addresses ---------------------------------------------------
 

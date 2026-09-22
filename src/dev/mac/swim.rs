@@ -71,9 +71,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
+use self::ism::{Ism, Switch};
 use super::disk::{Density, Disk, Reader};
 use super::iwm::{self, Iwm};
-use self::ism::{Ism, Switch};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -320,8 +320,12 @@ impl Swim {
             selected: Mutex::with_rank(ISM_RANK, Selected::default()),
         });
         let region = Arc::new(
-            Region::io(CLASS_NAME, REGISTER_SPAN, Arc::clone(&ports) as Arc<dyn MemOps>)
-                .with_constraints(inner.constraints()),
+            Region::io(
+                CLASS_NAME,
+                REGISTER_SPAN,
+                Arc::clone(&ports) as Arc<dyn MemOps>,
+            )
+            .with_constraints(inner.constraints()),
         );
         Swim {
             iwm,
