@@ -472,11 +472,13 @@ The ROM image must be exactly 512 KiB. The drive takes a raw 400K, 800K or
 `floppy` slot is an empty drive.
 
 The tests read the user's own files in place and skip, printing why, when they
-are not there:
+are not there. `RSEMU_MAC_DISK_DIR` is the variable `mac-plus` already
+established for a directory of Macintosh disk images — `src/dev/mac/disk/tests.rs`
+reads the same one — rather than a second name for the same directory:
 
 ```sh
 RSEMU_MAC_ROM_DIR=~/retro/macintosh_plus/Macintosh-ROMs \
-RSEMU_MAC_IMG_DIR=~/retro/macintosh_plus \
+RSEMU_MAC_DISK_DIR=~/retro/macintosh_plus \
 RSEMU_MAC_FRAME_DIR=/tmp/frames \
   cargo test --features machine-mac-classic,display-png --test mac_classic -- --nocapture
 ```

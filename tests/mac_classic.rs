@@ -4,7 +4,7 @@
 //! # What is in this file, and what is not
 //!
 //! **No byte of any Apple ROM or of anybody's disk.** The ROM is read in place
-//! from `RSEMU_MAC_ROM_DIR` and a disk image from `RSEMU_MAC_IMG_DIR`, and each
+//! from `RSEMU_MAC_ROM_DIR` and a disk image from `RSEMU_MAC_DISK_DIR`, and each
 //! test that wants one skips, saying so, when the variable or the file is not
 //! there. `cargo test` with nothing set passes on a machine that has neither:
 //! **three of these nine tests need no media at all**, because they assemble
@@ -139,13 +139,13 @@ fn rom_image(file: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Read a disk image out of `RSEMU_MAC_IMG_DIR`; an empty vector — an empty
+/// Read a disk image out of `RSEMU_MAC_DISK_DIR`; an empty vector — an empty
 /// drive, which is the ordinary case — when the variable or the file is not
 /// there.
 fn disk_image(file: &str) -> Vec<u8> {
-    let Ok(dir) = std::env::var("RSEMU_MAC_IMG_DIR") else {
+    let Ok(dir) = std::env::var("RSEMU_MAC_DISK_DIR") else {
         println!(
-            "mac-classic: set RSEMU_MAC_IMG_DIR to a directory holding {file} to put a disk in \
+            "mac-classic: set RSEMU_MAC_DISK_DIR to a directory holding {file} to put a disk in \
              the drive; running with an empty one."
         );
         return Vec::new();
