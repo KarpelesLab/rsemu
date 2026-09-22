@@ -192,6 +192,15 @@ by the grid point it never reached.
 | `interpreted` | guest instructions the interpreter executed, one per call |
 | `retired.permille` | `retired` per thousand of `retired + interpreted` — the documents' "99.3%" is this divided by ten. Integer, because the determinism rule has no room for a float in anything a run produces |
 | `fast-loads` / `fast-stores` | (A64) compiled accesses served from an inlined software-TLB probe |
+| `faults` | (m68k) blocks that took a guest access fault, each handing one instruction back |
+| `spent` | (m68k) blocks that left part-way through on the scheduler's budget |
+| `ended-unsupported` / `ended-transfer` / `ended-window` / `ended-limit` / `ended-unreadable` | (m68k) where a block that reached its terminator ended, by why lifting had stopped there. They partition `blocks` less `spent` less `faults`, so `ended-unsupported` against `ended-transfer` is "how often does a block end because the subset ran out, rather than because the guest branched" |
+| `decline.<category>` and `decline.<category>.<what>` | (m68k) **every** guest instruction the interpreter took, by why no block could: the five categories of `cpu::m68k::lift::Decline` — `gap`, `stores`, `charge`, `model`, `state` — and inside each the mnemonic, or a state cause's name (`interrupt`, `stopped`, `odd-pc`, …). The rows sum to `interpreted`: there is no "other" bucket, and `tests/m68k_lift_rate.rs` asserts the closure on a running board |
+
+The m68k rows have no `compiled` and no `chained` because that frontend runs
+its blocks on the portable IR backend — there is no host code generator for it
+and no chaining — and a nought there would read as "the code generator ran and
+did nothing" rather than "there is none".
 
 A board whose processors keep none of these — a 6502, an accelerated core, a
 build with no translation runtime — gets the header line `# cpu  no processor

@@ -149,6 +149,25 @@ pub fn install(options: &mut crate::machine::BuildOptions) -> Result<()> {
                 Ok(cpu)
             });
     }
+    // No `jit` in the gate: the m68k frontend runs its blocks on the portable
+    // IR backend and has no host code generator, so `cpu-m68k-lift` alone is
+    // what makes there be anything to count.
+    #[cfg(feature = "cpu-m68k-lift")]
+    {
+        use crate::cpu::m68k::M68k;
+        let seen: alloc::sync::Arc<Captured<M68k>> =
+            options
+                .realize
+                .hosts
+                .open(KIND, crate::cpu::m68k::CLASS.name, Captured::new)?;
+        options
+            .bindings
+            .replace(crate::cpu::m68k::CLASS.name, move |props| {
+                let cpu = alloc::sync::Arc::new(M68k::from_props(props)?);
+                seen.push(&cpu);
+                Ok(cpu)
+            });
+    }
     #[cfg(all(feature = "cpu-riscv", feature = "cpu-riscv-lift", feature = "jit"))]
     {
         use crate::cpu::riscv::Hart;
@@ -392,6 +411,74 @@ fn cpus(machine: &Machine, hosts: &HostObjects, table: &mut Table) {
         }
     }
 
+    #[cfg(feature = "cpu-m68k-lift")]
+    {
+        let paths = paths_of(machine, crate::cpu::m68k::CLASS.name);
+        for (index, cpu) in captured::<crate::cpu::m68k::M68k>(hosts, crate::cpu::m68k::CLASS.name)
+            .iter()
+            .enumerate()
+        {
+            let name = label(&paths, index);
+            table.note(
+                &name,
+                &format!("engine={}", kebab(&format!("{:?}", cpu.engine()))),
+            );
+            let Some(stats) = cpu.ir_stats() else {
+                continue;
+            };
+            // `blocks` and `translated` are spelled the way the other three
+            // cores spell them so one script can ask any board the same
+            // question; `compiled` and `chained` are not here because this
+            // frontend has no host backend and no chaining, and a zero would
+            // read as "the code generator ran and did nothing".
+            let rows = [
+                ("blocks", stats.executed),
+                ("translated", stats.lifted),
+                ("invalidated", stats.invalidated),
+                ("retired", stats.retired),
+                ("interpreted", stats.interpreted),
+                ("faults", stats.faults),
+                ("spent", stats.spent),
+                // Where a block that reached its terminator ended. The row
+                // that answers "is the subset what is ending these blocks":
+                // `ended-unsupported` against `ended-transfer`.
+                ("ended-unsupported", stats.ended_unsupported),
+                ("ended-transfer", stats.ended_transfer),
+                ("ended-window", stats.ended_window),
+                ("ended-limit", stats.ended_limit),
+                ("ended-unreadable", stats.ended_unreadable),
+            ];
+            emit(table, &name, &rows);
+            // And the histogram: one row per `(category, mnemonic)`, which is
+            // the number that says *what* to lift next rather than that there
+            // is something. `M68k::ir_declines` orders it.
+            let Some(declines) = cpu.ir_declines() else {
+                continue;
+            };
+            let mut by_reason = alloc::collections::BTreeMap::new();
+            for row in &declines {
+                table.set(
+                    &format!(
+                        "cpu.{name}.decline.{}.{}",
+                        row.reason.name(),
+                        // A mnemonic is upper case and has no whitespace in
+                        // it, but `Op::mnemonic` is the ISA's string and not
+                        // this module's, and a row is two whitespace-separated
+                        // fields with no quoting — so the format is defended
+                        // here rather than assumed, exactly as `mmio` defends
+                        // a region's name.
+                        row_name(row.what)
+                    ),
+                    row.count,
+                );
+                *by_reason.entry(row.reason).or_insert(0u64) += row.count;
+            }
+            for (reason, count) in by_reason {
+                table.set(&format!("cpu.{name}.decline.{}", reason.name()), count);
+            }
+        }
+    }
+
     // A board whose processors keep none of these counters — a 6502, an
     // accelerated core, a build with no translation runtime — gets a sentence
     // rather than a column of zeroes. "Zero blocks executed" and "nothing here
@@ -466,6 +553,25 @@ fn sum_over(table: &Table, row: &str) -> Option<u64> {
         total = Some(total.unwrap_or(0) + value);
     }
     total
+}
+
+/// A row-name fragment out of an arbitrary label: lower case, and no
+/// whitespace to break the two-field row format.
+///
+/// Not [`kebab`], which inserts a separator at every capital and would turn
+/// `MOVEM` into `m-o-v-e-m`. A mnemonic is already one word.
+#[allow(dead_code)]
+fn row_name(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() {
+                '_'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
 }
 
 /// A core's `Engine` in the spelling the machine file uses.

@@ -403,7 +403,7 @@ mod engine;
 // not — the shape `cpu::riscv` uses for `JitStats`.
 #[cfg(feature = "cpu-m68k-lift")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
-pub use engine::Stats as IrStats;
+pub use engine::{DeclineRow as IrDeclineRow, Stats as IrStats};
 #[cfg(feature = "cpu-m68k-lift")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
 pub mod lift;
@@ -1964,6 +1964,24 @@ impl M68k {
     #[must_use]
     pub fn ir_stats(&self) -> Option<IrStats> {
         self.session.lock().runtime.as_ref().map(|rt| rt.stats())
+    }
+
+    /// Every guest instruction the interpreter took because a block could not,
+    /// by why — the five categories of [`lift::Decline`], and within each the
+    /// mnemonic or the state cause.
+    ///
+    /// The rows sum to [`IrStats::interpreted`], which is what makes this a
+    /// measurement rather than a sample: there is no "other" bucket for a
+    /// fallback nobody attributed. Ordered, so two runs of the same guest
+    /// print the same table (CLAUDE.md, *Determinism*).
+    ///
+    /// `None` on a core that is not running the translated engine or has not
+    /// run yet, exactly as [`ir_stats`](M68k::ir_stats).
+    #[cfg(feature = "cpu-m68k-lift")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k-lift")))]
+    #[must_use]
+    pub fn ir_declines(&self) -> Option<Vec<IrDeclineRow>> {
+        self.session.lock().runtime.as_ref().map(|rt| rt.declines())
     }
 
     /// Execute one reset sequence, exception sequence, or instruction.

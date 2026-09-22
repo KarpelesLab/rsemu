@@ -80,7 +80,7 @@
 //! * **Interrupts and reset pulses**, which arrive from outside the machine
 //!   and are the record/replay seam's business rather than the frontend's. The
 //!   engine refuses to run a block while one is pending (`engine`'s
-//!   `liftable`), and `tests/` is where a board asserts that.
+//!   `unliftable`), and `tests/` is where a board asserts that.
 //! * **Any model but a 68000**, because [`lift`] refuses one and
 //!   `from_props` refuses the configuration. A 68010 or 68020 with
 //!   `engine = "ir"` is a configuration error, not a divergence.
@@ -96,7 +96,7 @@ use crate::core::space::{AddressSpace, RamStore, Region};
 use crate::core::value::Endian;
 
 use super::isa::Model;
-use super::{Config, Engine, IrStats, M68k, lift};
+use super::{Config, Engine, IrDeclineRow, IrStats, M68k, lift};
 
 /// Where a case's exception vector table lives: address zero, because a 68000
 /// has no vector base register and cannot move it (MC68000UM §6.1).
@@ -912,6 +912,22 @@ pub fn lifts(program: &[u16]) -> bool {
 /// *shape* of a run rather than its agreement.
 #[must_use]
 pub fn stats_for(case: &Case) -> Option<IrStats> {
+    run_subject(case).0
+}
+
+/// The same run's [`IrStats`] and decline histogram together.
+///
+/// Together because the two only mean anything beside each other: the rows
+/// sum to `IrStats::interpreted`, and a test that read them off two separate
+/// runs could not assert that.
+#[must_use]
+pub fn measure(case: &Case) -> (Option<IrStats>, Vec<IrDeclineRow>) {
+    let (stats, declines) = run_subject(case);
+    (stats, declines.unwrap_or_default())
+}
+
+/// Run `case` on the translated engine and report what it counted.
+fn run_subject(case: &Case) -> (Option<IrStats>, Option<Vec<IrDeclineRow>>) {
     let (space, _ram) = machine(case);
     let subject = core(case, space, Engine::Ir);
     for _ in 0..case.units {
@@ -919,7 +935,7 @@ pub fn stats_for(case: &Case) -> Option<IrStats> {
             break;
         }
     }
-    subject.ir_stats()
+    (subject.ir_stats(), subject.ir_declines())
 }
 
 #[cfg(test)]

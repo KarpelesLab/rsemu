@@ -20,7 +20,7 @@
 //!
 //! # Four reasons a block does not run, and the interpreter picks it up
 //!
-//! 1. **The core is not in a liftable state** (`liftable`): a pending reset,
+//! 1. **The core is not in a liftable state** (`unliftable`): a pending reset,
 //!    a halt, `STOP`, an `RTE` replay in flight, **T** set in `SR` (every
 //!    instruction would take a trace exception), an odd program counter, a
 //!    pending interrupt, or any model but a 68000.
@@ -98,6 +98,30 @@
 //! block at the store, and an instruction's own fetches precede its own store
 //! — so it needs a second bus master writing the code a block is running.
 //!
+//! # Counting what the frontend actually carries
+//!
+//! [`Stats`] and [`Runtime::declines`] are the instrument, and the reason it
+//! exists is that the differential sweeps cannot answer the question it
+//! answers: a frontend that lifted *nothing* would pass every one of them,
+//! because a fallback agrees with the interpreter by construction. So the
+//! engine counts, and two closures make the counts a measurement rather than
+//! a sample:
+//!
+//! * **every fallback is attributed to a row.** [`Entry::decline`] is resolved
+//!   to a [`DeclineRow`] index when a PC is lifted, and the dispatch path pays
+//!   one indexed add for it; the rows sum to [`Stats::interpreted`], so there
+//!   is no "other" bucket for the ones nobody counted.
+//! * **every block execution is attributed to an outcome.** The five
+//!   `ended_*` counters plus [`Stats::spent`] plus [`Stats::faults`] partition
+//!   [`Stats::executed`].
+//!
+//! Both are asserted, in this file's tests and in `tests/m68k_lift_rate.rs`
+//! on a running board. What it costs is about **1 %** of the translated
+//! engine's time on a Macintosh Plus ROM boot — 4 121 ms against 4 019 ms
+//! with the three increments removed, best of six, which is at the noise
+//! floor of the measurement. `docs/cpu/m68k.md`, *The lift rate, measured*,
+//! has that number and the rates it bought.
+//!
 //! # Sources
 //!
 //! `exec.rs` is the oracle for every number here; where a cycle count or an
@@ -114,7 +138,7 @@ use crate::ir::{Align, Block, InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot
 
 use super::exec::{Exec, State};
 use super::isa::Model;
-use super::lift::{self, SLOT_COUNT};
+use super::lift::{self, Decline, Declined, SLOT_COUNT, Stop};
 use super::{Config, Lines, flags};
 
 /// How many blocks the cache holds before it is emptied.
@@ -136,6 +160,21 @@ struct Entry {
     /// Every `(address, word)` pair the lifter read **out of memory**, in the
     /// order it read them. Re-read on every hit; see the module docs.
     seen: Vec<(u32, u16)>,
+    /// Why lifting stopped where it did.
+    ///
+    /// Recorded rather than recomputed because it is the answer to "did this
+    /// block end at a decline or at a terminator the guest asked for", and
+    /// the lift it came from happens once while the block runs many times.
+    stop: Stop,
+    /// Which row of [`Runtime::declines`] this PC's fallback belongs to, on an
+    /// entry that lifted nothing.
+    ///
+    /// An index rather than the [`Declined`] itself so the dispatch path pays
+    /// one indexed add: resolving a `(category, mnemonic)` pair to a row is a
+    /// linear scan, and it happens once per lift rather than once per
+    /// fallback. `None` on an entry that holds a block — a block's own
+    /// [`Stop::Unsupported`] is the *next* PC's decline and is counted there.
+    decline: Option<u32>,
     /// The prefetch queue the lift was made with.
     ///
     /// The block's first two words came from here rather than from memory
@@ -166,6 +205,25 @@ pub struct Stats {
     pub invalidated: u64,
     /// Blocks that left part-way through at a guest instruction boundary.
     pub spent: u64,
+    /// Blocks that ran to their terminator having stopped at an encoding
+    /// the frontend declined — so the *next* guest instruction is a fallback.
+    ///
+    /// This and the four rows below it partition the block executions that
+    /// reached a terminator, which is [`executed`](Stats::executed) less
+    /// [`spent`](Stats::spent) and [`faults`](Stats::faults). The question
+    /// they answer is the one a lifted subset with real exclusions has to
+    /// answer: how often does a block end because the subset ran out, rather
+    /// than because the guest transferred control?
+    pub ended_unsupported: u64,
+    /// Blocks that ended at a transfer of control — a branch, `DBcc`, `JMP`
+    /// or `RTS`. The natural terminator.
+    pub ended_transfer: u64,
+    /// Blocks that ended at the [`lift::WINDOW`] boundary.
+    pub ended_window: u64,
+    /// Blocks that ended at [`lift::MAX_INSNS`].
+    pub ended_limit: u64,
+    /// Blocks that ended because the instruction words could not be read.
+    pub ended_unreadable: u64,
     /// Guest instructions retired **in the unit the interpreter counts**:
     /// `Exec::step`s, so an exception sequence is one and an instruction is
     /// one.
@@ -177,6 +235,41 @@ pub struct Stats {
     /// far.
     pub steps: u64,
 }
+
+/// One row of the decline histogram: how many guest instructions the
+/// interpreter took for one `(category, what)` pair.
+///
+/// Execution-weighted, not static: a `JSR` in a loop is counted every time
+/// round it. That is the weighting the question needs — a frontend that
+/// declines one encoding a program executes a million times has worse
+/// coverage than one that declines a thousand it executes once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclineRow {
+    /// Which of the five categories.
+    pub reason: Decline,
+    /// The mnemonic, or a [`Decline::STATE`] cause's label.
+    pub what: &'static str,
+    /// Guest instructions the interpreter executed for it.
+    pub count: u64,
+}
+
+/// The [`Decline::STATE`] causes, in the order [`unliftable`] checks them.
+///
+/// A fixed array rather than a row in [`Runtime::declines`] because this is
+/// checked at *every* dispatch: the index is the whole lookup, where a row
+/// would be a scan. The labels are the report's, and the order is the check's,
+/// so a core that is both stopped and interrupted is counted where the
+/// dispatcher actually refused it.
+const STATE_CAUSES: [&str; 8] = [
+    "not-68000",
+    "reset-pending",
+    "halted",
+    "stopped",
+    "rte-replay",
+    "trace",
+    "odd-pc",
+    "interrupt",
+];
 
 /// The translation cache, and the backend that runs what is in it.
 ///
@@ -192,6 +285,15 @@ pub(super) struct Runtime {
     /// The address-space generation the entries were lifted under.
     generation: u64,
     stats: Stats,
+    /// The decline histogram, one row per `(category, what)` pair seen.
+    ///
+    /// Insertion-ordered and never cleared, so an [`Entry::decline`] index
+    /// stays valid across a cache flush. Bounded by five categories times the
+    /// mnemonics `isa.rs` has, which is a few hundred rows at the very most
+    /// and a handful in practice.
+    declines: Vec<DeclineRow>,
+    /// Fallbacks by [`STATE_CAUSES`] index.
+    states: [u64; STATE_CAUSES.len()],
 }
 
 impl Runtime {
@@ -201,6 +303,8 @@ impl Runtime {
             interp: Interp::new(),
             generation: 0,
             stats: Stats::default(),
+            declines: Vec::new(),
+            states: [0; STATE_CAUSES.len()],
         }
     }
 
@@ -209,30 +313,115 @@ impl Runtime {
         self.stats
     }
 
+    /// Every guest instruction the interpreter took, by why a block could not.
+    ///
+    /// Ordered: the five categories in [`Decline::ALL`] order, and within a
+    /// category the order the pairs were first seen. Deterministic, because a
+    /// report is ordered output (CLAUDE.md, *Determinism*).
+    ///
+    /// The rows sum to [`Stats::interpreted`]. That is the property worth
+    /// having — a histogram that does not account for every fallback is a
+    /// histogram whose largest bucket is "other" — and
+    /// `tests/m68k_mini_board.rs` asserts it on a running board.
+    pub(super) fn declines(&self) -> Vec<DeclineRow> {
+        let mut rows = Vec::with_capacity(self.declines.len() + STATE_CAUSES.len());
+        for &reason in Decline::ALL {
+            rows.extend(self.declines.iter().copied().filter(|r| r.reason == reason));
+            if reason == Decline::STATE {
+                for (i, &count) in self.states.iter().enumerate() {
+                    if count != 0 {
+                        rows.push(DeclineRow {
+                            reason: Decline::STATE,
+                            what: STATE_CAUSES[i],
+                            count,
+                        });
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// The row `what` belongs in, appending one if this is the first time.
+    ///
+    /// A linear scan, and deliberately: it runs once per *lift*, the vector is
+    /// tiny, and the alternative — a map keyed on a pair — would put an
+    /// allocation and a comparison chain on a path the dispatch loop shares.
+    fn row_for(&mut self, declined: Declined) -> u32 {
+        let found = self
+            .declines
+            .iter()
+            .position(|r| r.reason == declined.reason && r.what == declined.what);
+        let at = match found {
+            Some(at) => at,
+            None => {
+                self.declines.push(DeclineRow {
+                    reason: declined.reason,
+                    what: declined.what,
+                    count: 0,
+                });
+                self.declines.len() - 1
+            }
+        };
+        // A row index is `u32` in `Entry`, and a saturating conversion is the
+        // honest failure: the vector cannot reach four billion rows, and a
+        // count landing on row zero would be a wrong number rather than a
+        // panic.
+        u32::try_from(at).unwrap_or(0)
+    }
+
     /// Throw every translation away.
+    ///
+    /// The histogram is not thrown away with it: it is a record of what this
+    /// core *did*, and an [`Entry::decline`] index into it stays valid because
+    /// rows are only ever appended.
     pub(super) fn flush(&mut self) {
         self.entries.clear();
     }
 }
 
-/// Whether the core is in a state a lifted block may run in.
+/// Why the core is in no state for a lifted block to run — as an index into
+/// [`STATE_CAUSES`] — or `None` when it is.
 ///
 /// Each of these is something `Exec::step_inner` does *before* it reaches an
 /// instruction, or something the lifted subset cannot express, and a block
 /// that ran anyway would skip it.
-fn liftable(state: &State, cfg: &Config, lines: &Lines) -> bool {
-    cfg.model == Model::M68000
-        && !state.reset_pending
-        && !state.halted
-        && !state.stopped
-        && state.replay.is_none()
-        // **T** means every instruction ends in a trace exception, which is
-        // exception processing rather than an instruction (MC68000UM §6.2.5).
-        && state.sr & flags::T == 0
-        // An odd program counter is an address error on the fetch, and the
-        // block's entry word could not have been read at lift time either.
-        && state.pc & 1 == 0
-        && !lines.interrupt_pending(state.ipl_mask())
+///
+/// It returns the *cause* rather than a boolean because "the core was not
+/// liftable" is four different facts about a real guest — a `STOP` loop, an
+/// interrupt at every vertical blank, a trace bit, a halt — and a measurement
+/// that could not tell them apart could not say whether the frontend's
+/// coverage was the frontend's fault.
+fn unliftable(state: &State, cfg: &Config, lines: &Lines) -> Option<usize> {
+    if cfg.model != Model::M68000 {
+        return Some(0);
+    }
+    if state.reset_pending {
+        return Some(1);
+    }
+    if state.halted {
+        return Some(2);
+    }
+    if state.stopped {
+        return Some(3);
+    }
+    if state.replay.is_some() {
+        return Some(4);
+    }
+    // **T** means every instruction ends in a trace exception, which is
+    // exception processing rather than an instruction (MC68000UM §6.2.5).
+    if state.sr & flags::T != 0 {
+        return Some(5);
+    }
+    // An odd program counter is an address error on the fetch, and the
+    // block's entry word could not have been read at lift time either.
+    if state.pc & 1 != 0 {
+        return Some(6);
+    }
+    if lines.interrupt_pending(state.ipl_mask()) {
+        return Some(7);
+    }
+    None
 }
 
 /// Advance the core by one *unit of this engine*: one block, or — where a
@@ -270,9 +459,10 @@ pub(super) fn advance(
         rt.generation = generation;
         rt.entries.clear();
     }
-    if !liftable(state, cfg, lines) {
+    if let Some(cause) = unliftable(state, cfg, lines) {
         rt.stats.interpreted += 1;
         rt.stats.steps += 1;
+        rt.states[cause] += 1;
         return Exec::new(state, space, cfg, lines).step();
     }
     let pc = state.pc;
@@ -282,11 +472,20 @@ pub(super) fn advance(
         entries,
         interp,
         stats,
+        declines,
         ..
     } = rt;
-    let Some(block) = entries.get(&pc).and_then(|e| e.block.as_ref()) else {
+    let entry = entries.get(&pc);
+    let Some((block, stop)) = entry.and_then(|e| e.block.as_ref().map(|b| (b, e.stop))) else {
         stats.interpreted += 1;
         stats.steps += 1;
+        // One indexed add, which is what the row index in `Entry` buys: the
+        // pair was resolved to a row when this PC was lifted.
+        if let Some(row) = entry.and_then(|e| e.decline).map(|r| r as usize)
+            && let Some(row) = declines.get_mut(row)
+        {
+            row.count += 1;
+        }
         return Exec::new(state, space, cfg, lines).step();
     };
 
@@ -343,7 +542,16 @@ pub(super) fn advance(
         }
         // `Exit` is the only other outcome this frontend produces: it emits no
         // `goto_tb` and no `lookup_and_goto`, because chaining is `jit/`'s.
+        // This is the one path that reached the block's terminator, so it is
+        // the one that attributes it.
         _ => {
+            match stop {
+                Stop::Unsupported => stats.ended_unsupported += 1,
+                Stop::Transfer => stats.ended_transfer += 1,
+                Stop::Window => stats.ended_window += 1,
+                Stop::Limit => stats.ended_limit += 1,
+                Stop::Unreadable => stats.ended_unreadable += 1,
+            }
             state.pc = slots[PC_INDEX];
             used.max(1)
         }
@@ -413,18 +621,56 @@ fn ensure(rt: &mut Runtime, pc: u32, queue: [u16; 2], space: &AddressSpace, cfg:
             rt.stats.lifted += 1;
             Entry {
                 block: Some(lifted.block),
+                stop: lifted.stop,
+                // A block's own stop is the *next* PC's decline; it is counted
+                // there, against the entry that lifts nothing.
+                decline: None,
                 seen: reader.seen,
                 queue,
             }
         }
         // Nothing lifted, or a model this frontend refuses. Either way the
         // answer is recorded so the next pass costs a map lookup rather than a
-        // decode and an allocation.
-        _ => Entry {
-            block: None,
-            seen: reader.seen,
-            queue,
-        },
+        // decode and an allocation — and so does the reason, which is what
+        // makes the fallback attributable.
+        Ok(lifted) => {
+            let decline = match lifted.declined {
+                Some(declined) => Some(rt.row_for(declined)),
+                // `Stop::Unreadable` on the very first word: the PC points at
+                // memory that answers nothing, so the interpreter's own fetch
+                // is what takes the bus error. Not about the encoding, so it
+                // goes under `STATE` — and it takes a *row* rather than a
+                // fixed slot because the entry is cached, and every later
+                // dispatch at this PC is another fallback to attribute.
+                None => Some(rt.row_for(Declined {
+                    reason: Decline::STATE,
+                    what: "unreadable",
+                })),
+            };
+            Entry {
+                block: None,
+                stop: lifted.stop,
+                decline,
+                seen: reader.seen,
+                queue,
+            }
+        }
+        // A model this frontend refuses outright. `unliftable` has already
+        // caught it at dispatch, so this is unreachable from `advance` and is
+        // attributed rather than left blank in case another caller arrives.
+        Err(_) => {
+            let row = rt.row_for(Declined {
+                reason: Decline::MODEL,
+                what: "not-68000",
+            });
+            Entry {
+                block: None,
+                stop: Stop::Unsupported,
+                decline: Some(row),
+                seen: reader.seen,
+                queue,
+            }
+        }
     };
     rt.entries.insert(pc, entry);
 }
@@ -690,10 +936,12 @@ impl IrHost for Host<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::differential::{CODE, Case, DATA, compare, stats_for};
+    use super::super::differential::{CODE, Case, DATA, compare, measure, stats_for};
+    use super::super::lift::Decline;
     use super::super::{Engine, M68k};
     use crate::core::props::{Props, Value};
     use alloc::vec;
+    use alloc::vec::Vec;
 
     /// `STOP #$2700`.
     const STOP: [u16; 2] = [0x4e72, 0x2700];
@@ -871,5 +1119,149 @@ mod tests {
             .with_a(2, 0xff00_0000 | DATA)
             .with_units(2);
         agreed(&case);
+    }
+
+    // -- the instrument -------------------------------------------------
+    //
+    // A counter whose own arithmetic is untested is a counter that will be
+    // quoted in a document and be wrong. These are the three properties the
+    // measurement rests on, and each one is a *closure* property: every
+    // fallback is attributed to a row, every block execution is attributed to
+    // an outcome, and a category is the category the docs name.
+
+    /// Every guest instruction the interpreter took is in exactly one row.
+    ///
+    /// Without this the histogram's largest bucket is silently "the ones
+    /// nobody counted", and the measurement this instrument exists for reads
+    /// as a lift rate better than it is.
+    #[test]
+    fn the_decline_histogram_accounts_for_every_fallback() {
+        // A program with all five shapes in it: a lifted `MOVE`, a declined
+        // `JSR` (two stores), a declined `MULU` (not written yet), a declined
+        // `ASL D1,D2` (a register count), and `STOP`, which leaves the core in
+        // a state no block may run in.
+        let program = vec![
+            0x3001, // MOVE.W D1,D0        -- lifted
+            0x4eb9, 0x0000, 0x1010, // JSR $00001010    -- stores
+            0xc2c3, // MULU D3,D1          -- gap
+            0xe3a2, // ASL.L D1,D2         -- charge
+            0x4e71, // NOP                 -- lifted
+            STOP[0], STOP[1], // STOP #$2700       -- gap, then state
+            0x4e71,
+        ];
+        let case = Case::seeded(program).with_units(24);
+        agreed(&case);
+        let (stats, rows) = measure(&case);
+        let stats = stats.expect("it ran");
+        let total: u64 = rows.iter().map(|r| r.count).sum();
+        assert_eq!(
+            total, stats.interpreted,
+            "the histogram sums to {total} and {} instructions fell back:\n{rows:#?}",
+            stats.interpreted
+        );
+        assert!(stats.interpreted > 0, "the fallback ran: {stats:?}");
+        assert!(stats.retired > 0, "and so did a block: {stats:?}");
+    }
+
+    /// Every block execution ended in exactly one of the ways counted.
+    ///
+    /// `executed` is the divisor of "mean instructions per block", so a block
+    /// counted as executed and attributed to no outcome would move that mean
+    /// without moving anything that explains it.
+    #[test]
+    fn every_block_execution_is_attributed_to_an_outcome() {
+        // A loop, so blocks are executed many times and the budget cuts one
+        // short: `DBF D0,*` around a `MOVE` and an `ADD`.
+        let program = vec![
+            0x3001, // MOVE.W D1,D0
+            0xd280, // ADD.L D0,D1
+            0x51c8, 0xfffa, // DBF D0,$1000
+            STOP[0], STOP[1],
+        ];
+        let case = Case::seeded(program).with_d(0, 40).with_units(80);
+        agreed(&case);
+        let (stats, _) = measure(&case);
+        let stats = stats.expect("it ran");
+        let ended = stats.ended_unsupported
+            + stats.ended_transfer
+            + stats.ended_window
+            + stats.ended_limit
+            + stats.ended_unreadable;
+        assert_eq!(
+            stats.executed,
+            ended + stats.spent + stats.faults,
+            "{} blocks ran; {ended} reached a terminator, {} left early and {} faulted: {stats:?}",
+            stats.executed,
+            stats.spent,
+            stats.faults
+        );
+        assert!(
+            stats.ended_transfer > 0,
+            "a `DBcc` loop ends its blocks at a transfer: {stats:?}"
+        );
+    }
+
+    /// The category and the mnemonic are the ones `docs/cpu/m68k.md` names.
+    ///
+    /// The one assertion that would catch a decline moved from one bucket to
+    /// another by a later change to `classify` — which is exactly what would
+    /// make a re-measurement incomparable with this one.
+    #[test]
+    fn a_decline_is_reported_under_the_category_the_docs_name() {
+        let want: &[(&[u16], Decline, &str)] = &[
+            // `JSR $00001010` pushes a long: two word stores.
+            (&[0x4eb9, 0x0000, 0x1010], Decline::STORES, "JSR"),
+            // `BSR.W` the same.
+            (&[0x6100, 0x0004], Decline::STORES, "BSR"),
+            // `PEA $00001010` and `LINK A2,#0` likewise.
+            (&[0x4879, 0x0000, 0x1010], Decline::STORES, "PEA"),
+            (&[0x4e52, 0x0000], Decline::STORES, "LINK"),
+            // `MOVE.L D1,(A2)` is a long memory destination.
+            (&[0x2481], Decline::STORES, "MOVE"),
+            // `MOVEM.L D0-D1,(A2)` is one store per register.
+            (&[0x48d2, 0x0003], Decline::STORES, "MOVEM"),
+            // `MULU D3,D1`: a cycle count out of the microcode's loop shape.
+            (&[0xc2c3], Decline::GAP, "MULU"),
+            // `ASL.L D1,D2`: two cycles a bit, at a run-time count.
+            (&[0xe3a2], Decline::CHARGE, "ASL"),
+            // `SNE D0`: two extra cycles when the byte is set.
+            (&[0x56c0], Decline::CHARGE, "S"),
+        ];
+        for &(program, reason, what) in want {
+            let mut words = program.to_vec();
+            words.extend_from_slice(&STOP);
+            let case = Case::seeded(words).with_units(4);
+            agreed(&case);
+            let (_, rows) = measure(&case);
+            let found: Vec<_> = rows
+                .iter()
+                .filter(|r| r.count > 0 && r.reason != Decline::STATE)
+                .collect();
+            assert!(
+                found
+                    .iter()
+                    .any(|r| r.reason == reason && r.what == what && r.count > 0),
+                "{program:04x?} should be declined as {}/{what}, and the rows are {found:#?}",
+                reason.name()
+            );
+        }
+    }
+
+    /// A `STOP` is counted as a *state* cause, by name, rather than as an
+    /// encoding the subset is missing.
+    ///
+    /// The distinction the measurement turns on: the first is a guest waiting
+    /// for an interrupt, which no frontend can lift and no `set_slot` would
+    /// help, and the second is work somebody could do.
+    #[test]
+    fn a_stopped_core_is_counted_as_a_state_cause() {
+        let case = Case::seeded(vec![0x4e71, STOP[0], STOP[1]]).with_units(8);
+        agreed(&case);
+        let (_, rows) = measure(&case);
+        let stopped = rows
+            .iter()
+            .find(|r| r.reason == Decline::STATE && r.what == "stopped")
+            .map_or(0, |r| r.count);
+        assert!(stopped > 0, "a `STOP`ped core is counted: {rows:#?}");
     }
 }

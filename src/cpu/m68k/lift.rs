@@ -19,8 +19,12 @@
 //!
 //! Everything else ends the block with a terminator that hands the PC back to
 //! the interpreter, which then executes that one instruction itself. The
-//! *reasons* an encoding is declined are four, and they are worth separating
-//! because only the first is a gap:
+//! *reasons* an encoding is declined are four here and five in [`Decline`],
+//! which splits the third one out of the first, and they are worth separating
+//! because only the first is a gap — `classify` returns the category and
+//! `super::engine` counts fallbacks by it, so "how much of a real program does
+//! this lift, and what is stopping it" is a number rather than an argument
+//! (`docs/cpu/m68k.md`, *The lift rate, measured*):
 //!
 //! 1. **Not written yet**: `MULU`/`MULS`/`DIVU`/`DIVS` (whose cycle counts are
 //!    data-dependent — `exec::divu_cycles` derives them from the microcode's
@@ -309,6 +313,102 @@ pub enum Stop {
     Unreadable,
 }
 
+/// Which of the five categories an encoding was declined under.
+///
+/// The categories are the ones `docs/cpu/m68k.md` names, and they are
+/// separated because they are not the same kind of fact: [`Decline::GAP`] is
+/// work nobody has done, [`Decline::STORES`] is a design bargain, and
+/// [`Decline::STATE`] is not about the encoding at all. A measurement that
+/// added them together could not say which of the three a low lift rate was.
+///
+/// An extensible enumeration rather than an `enum` (CLAUDE.md, *Type
+/// conventions*): a sixth category is additive, and a reader matching on these
+/// must not break when one arrives.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Decline(pub u16);
+
+impl Decline {
+    /// **Not written yet.** `MULU`/`MULS`/`DIVU`/`DIVS`, the BCD group,
+    /// `TAS`, `MOVEP`, `CHK`, and every privileged or exception-raising
+    /// encoding. The only category that is a gap.
+    pub const GAP: Decline = Decline(0);
+
+    /// **Restartability**: the instruction commits more than one store, and a
+    /// fault after the first cannot be handed back to the interpreter. See
+    /// this module's *A fault is handled by restarting the instruction*.
+    pub const STORES: Decline = Decline(1);
+
+    /// **A charge that would have to be conditional.**
+    /// [`Opcode::CHARGE`] carries an immediate, so a cycle count that turns on
+    /// a run-time value cannot be emitted where the paths rejoin.
+    pub const CHARGE: Decline = Decline(2);
+
+    /// **Another processor.** Only an [`Model::M68000`] is lifted.
+    pub const MODEL: Decline = Decline(3);
+
+    /// **The core is not in a liftable state** — a pending reset, a halt,
+    /// `STOP`, an `RTE` replay, **T** set, an odd program counter, or a
+    /// pending interrupt. Not about the encoding; `super::engine` is what
+    /// checks it.
+    pub const STATE: Decline = Decline(4);
+
+    /// Every category this build knows, in reporting order.
+    pub const ALL: &'static [Decline] = &[
+        Decline::GAP,
+        Decline::STORES,
+        Decline::CHARGE,
+        Decline::MODEL,
+        Decline::STATE,
+    ];
+
+    /// The short name a report spells this category with.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Decline::GAP => "gap",
+            Decline::STORES => "stores",
+            Decline::CHARGE => "charge",
+            Decline::MODEL => "model",
+            Decline::STATE => "state",
+            _ => "unknown",
+        }
+    }
+
+    /// One line saying what the category is, for a report's legend.
+    #[must_use]
+    pub fn summary(self) -> &'static str {
+        match self {
+            Decline::GAP => "an encoding nobody has lifted yet",
+            Decline::STORES => "more than one store, so a fault could not be restarted",
+            Decline::CHARGE => "a cycle count that would have to be conditional",
+            Decline::MODEL => "a processor this frontend does not lift",
+            Decline::STATE => "the core was in no state for a block to run",
+            _ => "",
+        }
+    }
+}
+
+/// What was declined, and under which category.
+///
+/// `what` is [`Op::mnemonic`] for an encoding and a fixed label for a
+/// [`Decline::STATE`] cause, so a histogram keyed on the pair names both the
+/// reason and the thing — which is the difference between "22 % of fallbacks
+/// are restartability" and "22 % of fallbacks are `JSR`".
+///
+/// A mnemonic is coarser than an encoding on purpose: `Op::mnemonic` is the
+/// ISA's own answer and `isa.rs` is the oracle, so this cannot name an
+/// instruction the interpreter does not implement. It also collides where the
+/// ISA collides — `ANDI` is `Op::Andi` and `Op::AndiToCcr` both — and the
+/// category beside it is what separates those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Declined {
+    /// Which category.
+    pub reason: Decline,
+    /// The mnemonic, or a state cause's label.
+    pub what: &'static str,
+}
+
 /// A lifted block, and what is true about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lifted {
@@ -317,6 +417,12 @@ pub struct Lifted {
     pub block: Block,
     /// Why lifting stopped.
     pub stop: Stop,
+    /// The encoding lifting stopped *at*, when it stopped at one
+    /// ([`Stop::Unsupported`]), and why it was declined.
+    ///
+    /// `None` for every other stop: a block that ran out of window, out of
+    /// instructions or into a transfer of control declined nothing.
+    pub declined: Option<Declined>,
     /// How many guest instructions were lifted. Zero is legal and means the
     /// block's first instruction was outside the subset — the block is then
     /// just an exit boundary and a terminator.
@@ -402,13 +508,22 @@ pub fn lift<S: InsnSource>(
     // one fetch fault a 68000 takes before any bus cycle (MC68000UM §6.3.9).
     // The interpreter raises it; this refuses the block so it does.
     if entry_pc & 1 != 0 {
-        return Ok(empty(model, entry_pc, Stop::Unsupported));
+        return Ok(empty(
+            model,
+            entry_pc,
+            Stop::Unsupported,
+            Some(Declined {
+                reason: Decline::STATE,
+                what: "odd-pc",
+            }),
+        ));
     }
 
     let mut lf = Lifter::new(model, entry_pc);
     let window = lf.window;
     let mut pc = entry_pc;
     let mut insns = 0usize;
+    let mut declined = None;
 
     let stop = loop {
         if insns >= max_insns {
@@ -435,10 +550,10 @@ pub fn lift<S: InsnSource>(
             }
             let at = pc.wrapping_add(2 * have as u32);
             if at & !WINDOW_MASK != window {
-                return Ok(lf.close(pc, insns, Stop::Window));
+                return Ok(lf.close(pc, insns, Stop::Window, None));
             }
             let Some(w) = src.word(at) else {
-                return Ok(lf.close(pc, insns, Stop::Unreadable));
+                return Ok(lf.close(pc, insns, Stop::Unreadable, None));
             };
             words[have] = w;
             have += 1;
@@ -454,7 +569,10 @@ pub fn lift<S: InsnSource>(
         }
 
         match lf.insn(&words[..have], pc, next_pc) {
-            Flow::Rejected => break Stop::Unsupported,
+            Flow::Rejected(why) => {
+                declined = Some(why);
+                break Stop::Unsupported;
+            }
             Flow::Continue => {
                 insns += 1;
                 pc = next_pc;
@@ -467,13 +585,13 @@ pub fn lift<S: InsnSource>(
         }
     };
 
-    Ok(lf.close(pc, insns, stop))
+    Ok(lf.close(pc, insns, stop, declined))
 }
 
 /// A well-formed block that lifts nothing.
-fn empty(model: Model, entry_pc: u32, stop: Stop) -> Lifted {
+fn empty(model: Model, entry_pc: u32, stop: Stop, declined: Option<Declined>) -> Lifted {
     let lf = Lifter::new(model, entry_pc);
-    lf.close(entry_pc, 0, stop)
+    lf.close(entry_pc, 0, stop, declined)
 }
 
 // ---------------------------------------------------------------------------
@@ -572,29 +690,40 @@ const fn store_cycles(mode: Mode, size: Size) -> u32 {
     }
 }
 
-/// Decide what an encoding means, or decline it.
+/// Decide what an encoding means, or decline it — saying which of the five
+/// categories the decline falls in.
+///
+/// The category is returned rather than inferred because a bare `None` made
+/// the four kinds of decline indistinguishable, and the whole question "how
+/// much of a real program does this lift" turns on telling them apart.
 #[allow(clippy::too_many_lines)]
-fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Option<Plan> {
+fn classify(
+    insn: Insn,
+    opcode: u16,
+    size: Size,
+    pc: u32,
+    words: &[u16],
+) -> core::result::Result<Plan, Decline> {
     // A privileged encoding raises a privilege violation in user state and
     // executes in supervisor state, so lifting one would need the block keyed
     // on **S**. None of them is in the subset anyway.
     if insn.privileged {
-        return None;
+        return Err(Decline::GAP);
     }
     let src_mode = ea_of(insn.src, opcode).map(|(m, _)| m);
     let dst_mode = ea_of(insn.dst, opcode).map(|(m, _)| m);
 
     match insn.op {
-        Op::Nop => Some(Plan::Nop),
+        Op::Nop => Ok(Plan::Nop),
         Op::Move | Op::Movea => {
             // A `MOVE` to a long memory destination is two stores.
             let stores = dst_mode.map_or(0, |m| store_cycles(m, size));
             if stores > 1 {
-                return None;
+                return Err(Decline::STORES);
             }
-            Some(Plan::Move)
+            Ok(Plan::Move)
         }
-        Op::Moveq => Some(Plan::Moveq),
+        Op::Moveq => Ok(Plan::Moveq),
         Op::Add
         | Op::Addi
         | Op::Addq
@@ -611,9 +740,9 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
             // stores with the destination's own read in front of them, so a
             // fault on the second has already committed the first.
             if dst_mode.map_or(0, |m| store_cycles(m, size)) > 1 {
-                return None;
+                return Err(Decline::STORES);
             }
-            Some(Plan::Binary(match insn.op {
+            Ok(Plan::Binary(match insn.op {
                 Op::Add | Op::Addi | Op::Addq => BinKind::Add,
                 Op::Sub | Op::Subi | Op::Subq => BinKind::Sub,
                 Op::And | Op::Andi => BinKind::And,
@@ -621,38 +750,38 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
                 _ => BinKind::Eor,
             }))
         }
-        Op::Cmp | Op::Cmpi => Some(Plan::Compare),
-        Op::Cmpm => Some(Plan::Cmpm),
-        Op::Adda => Some(Plan::Adda { add: true }),
-        Op::Suba => Some(Plan::Adda { add: false }),
-        Op::Cmpa => Some(Plan::Cmpa),
+        Op::Cmp | Op::Cmpi => Ok(Plan::Compare),
+        Op::Cmpm => Ok(Plan::Cmpm),
+        Op::Adda => Ok(Plan::Adda { add: true }),
+        Op::Suba => Ok(Plan::Adda { add: false }),
+        Op::Cmpa => Ok(Plan::Cmpa),
         Op::Addx | Op::Subx => {
             // The memory form is `-(Ay),-(Ax)`, and a long one writes two
             // words with a prefetch between them.
             if opcode & 0x0008 != 0 && size == Size::Long {
-                return None;
+                return Err(Decline::STORES);
             }
-            Some(Plan::Addx {
+            Ok(Plan::Addx {
                 add: insn.op == Op::Addx,
             })
         }
         Op::Neg | Op::Negx | Op::Not | Op::Clr => {
             if dst_mode.map_or(0, |m| store_cycles(m, size)) > 1 {
-                return None;
+                return Err(Decline::STORES);
             }
-            Some(Plan::Unary)
+            Ok(Plan::Unary)
         }
-        Op::Tst => Some(Plan::Tst),
-        Op::Ext => Some(Plan::Ext),
-        Op::Swap => Some(Plan::Swap),
-        Op::Exg => Some(Plan::Exg),
-        Op::Lea => Some(Plan::Lea),
-        Op::Unlk => Some(Plan::Unlk),
-        Op::MoveFromSr => Some(Plan::MoveCcr { from_sr: true }),
-        Op::MoveToCcr => Some(Plan::MoveCcr { from_sr: false }),
-        Op::AndiToCcr => Some(Plan::CcrImm(BinKind::And)),
-        Op::OriToCcr => Some(Plan::CcrImm(BinKind::Or)),
-        Op::EoriToCcr => Some(Plan::CcrImm(BinKind::Eor)),
+        Op::Tst => Ok(Plan::Tst),
+        Op::Ext => Ok(Plan::Ext),
+        Op::Swap => Ok(Plan::Swap),
+        Op::Exg => Ok(Plan::Exg),
+        Op::Lea => Ok(Plan::Lea),
+        Op::Unlk => Ok(Plan::Unlk),
+        Op::MoveFromSr => Ok(Plan::MoveCcr { from_sr: true }),
+        Op::MoveToCcr => Ok(Plan::MoveCcr { from_sr: false }),
+        Op::AndiToCcr => Ok(Plan::CcrImm(BinKind::And)),
+        Op::OriToCcr => Ok(Plan::CcrImm(BinKind::Or)),
+        Op::EoriToCcr => Ok(Plan::CcrImm(BinKind::Eor)),
         Op::Btst | Op::Bchg | Op::Bclr | Op::Bset => {
             // `BTST` never writes; the other three write a byte to memory or a
             // long to a register, so neither is two stores.
@@ -666,18 +795,18 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
                 && insn.src != Arg::BitNumber
                 && matches!(dst_mode, Some(Mode::DataReg))
             {
-                return None;
+                return Err(Decline::CHARGE);
             }
-            Some(Plan::Bit)
+            Ok(Plan::Bit)
         }
         Op::Asl | Op::Asr | Op::Lsl | Op::Lsr | Op::Rol | Op::Ror | Op::Roxl | Op::Roxr => {
             if insn.dst == Arg::Ea {
                 // "The memory form shifts one bit of one word" (`exec.rs`), so
                 // it is one word store however the operand is addressed.
                 if dst_mode.map_or(0, |m| store_cycles(m, Size::Word)) > 1 {
-                    return None;
+                    return Err(Decline::STORES);
                 }
-                return Some(Plan::Shift {
+                return Ok(Plan::Shift {
                     count: 1,
                     memory: true,
                 });
@@ -687,10 +816,10 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
                 // in six different ways (`exec::shift`), and the interpreter's
                 // per-bit loop makes the cycle count depend on it too. Not
                 // lifted; see the module docs, reason 1.
-                return None;
+                return Err(Decline::CHARGE);
             }
             let q = (opcode >> 9) & 7;
-            Some(Plan::Shift {
+            Ok(Plan::Shift {
                 count: if q == 0 { 8 } else { u32::from(q) },
                 memory: false,
             })
@@ -701,9 +830,9 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
                 // list is never empty in practice; declined wholesale rather
                 // than for a mask of one, because the mask is an extension
                 // word and the *shape* is what is being decided here.
-                return None;
+                return Err(Decline::STORES);
             }
-            Some(Plan::MovemLoad)
+            Ok(Plan::MovemLoad)
         }
         Op::Bra | Op::Bcc => {
             let byte = opcode as i8;
@@ -711,14 +840,14 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
             // (`exec::op_branch`).
             let base = pc.wrapping_add(2);
             if byte == 0 {
-                let word = *words.get(1)?;
-                Some(Plan::Branch {
+                let word = *words.get(1).ok_or(Decline::GAP)?;
+                Ok(Plan::Branch {
                     target: base.wrapping_add(i32::from(word as i16) as u32),
                     always: insn.op == Op::Bra,
                     word: true,
                 })
             } else {
-                Some(Plan::Branch {
+                Ok(Plan::Branch {
                     target: base.wrapping_add(i32::from(byte) as u32),
                     always: insn.op == Op::Bra,
                     word: false,
@@ -727,14 +856,14 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
         }
         Op::Dbcc => {
             let base = pc.wrapping_add(2);
-            let word = *words.get(1)?;
-            Some(Plan::Dbcc {
+            let word = *words.get(1).ok_or(Decline::GAP)?;
+            Ok(Plan::Dbcc {
                 target: base.wrapping_add(i32::from(word as i16) as u32),
             })
         }
         Op::Scc => {
             if dst_mode.map_or(0, |m| store_cycles(m, Size::Byte)) > 1 {
-                return None;
+                return Err(Decline::STORES);
             }
             // "Two extra cycles when the byte is set, which is the one place a
             // 68000's timing depends on a condition (MC68000UM Table 8-11)" —
@@ -744,15 +873,24 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
             // same either way.
             let cc = (opcode >> 8) & 0xf;
             if matches!(dst_mode, Some(Mode::DataReg)) && cc > 1 {
-                return None;
+                return Err(Decline::CHARGE);
             }
-            Some(Plan::Scc)
+            Ok(Plan::Scc)
         }
-        Op::Jmp => Some(Plan::Jmp),
-        Op::Rts => Some(Plan::Rts),
+        Op::Jmp => Ok(Plan::Jmp),
+        Op::Rts => Ok(Plan::Rts),
+        // Each of these pushes a **long**, which on a 16-bit data bus is two
+        // word stores — so a fault on the second has already committed the
+        // first and could not be handed back. They are named here rather than
+        // left to fall through to [`Decline::GAP`] because the category is
+        // the whole point: this is the restartability bargain's bill, and a
+        // measurement that filed `JSR` under "nobody has written it yet"
+        // would say the opposite of the truth about it. Naming them changes
+        // nothing about what is lifted.
+        Op::Jsr | Op::Bsr | Op::Pea | Op::Link => Err(Decline::STORES),
         _ => {
             let _ = src_mode;
-            None
+            Err(Decline::GAP)
         }
     }
 }
@@ -764,8 +902,9 @@ fn classify(insn: Insn, opcode: u16, size: Size, pc: u32, words: &[u16]) -> Opti
 /// What lifting one instruction did, and whether lifting goes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
-    /// Nothing was emitted; the instruction is outside the subset.
-    Rejected,
+    /// Nothing was emitted; the instruction is outside the subset, and this is
+    /// which of the five categories it fell in.
+    Rejected(Declined),
     /// Lifted; carry on at the program-order successor.
     Continue,
     /// Lifted, and it transferred control somewhere this block does not
@@ -841,6 +980,13 @@ struct Lifter {
     closed: bool,
     /// The address of the instruction being lifted — `Exec::pc0`.
     pc0: u32,
+    /// [`Op::mnemonic`] of the instruction being lifted.
+    ///
+    /// Held here so an addressing mode an `op_*` body cannot resolve names
+    /// itself in the decline histogram without the mnemonic being threaded
+    /// through every one of their signatures. It is a report column and
+    /// nothing reads it to decide anything.
+    mnemonic: &'static str,
     /// The modelled `State::pc`: the address of `prefetch[0]`.
     ///
     /// It moves once per slide, which is what makes the program counter a
@@ -870,8 +1016,22 @@ impl Lifter {
             static_exit: None,
             closed: false,
             pc0: entry_pc,
+            mnemonic: "",
             pc_model: entry_pc,
         }
+    }
+
+    /// Decline the instruction being lifted, under `reason`.
+    ///
+    /// Emits nothing. Every site that uses it has failed to resolve an
+    /// effective address, which on a 68000 means a mode that encoding does not
+    /// have — an illegal instruction the interpreter raises, counted with
+    /// [`Decline::GAP`] because that is what runs.
+    fn declined(&self, reason: Decline) -> Flow {
+        Flow::Rejected(Declined {
+            reason,
+            what: self.mnemonic,
+        })
     }
 
     // -- the clock ------------------------------------------------------
@@ -1663,11 +1823,19 @@ impl Lifter {
         // has none, so every F-line word is the line-F exception and is
         // outside the subset anyway.
         let insn = decode_with(self.model, Copro::NONE, opcode);
+        // The mnemonic comes from `isa.rs`, which is the oracle, so a decline
+        // cannot be reported against an instruction the interpreter does not
+        // implement.
+        self.mnemonic = insn.op.mnemonic();
         let Some(size) = insn.size.resolve(opcode) else {
-            return Flow::Rejected;
+            // A size field no encoding of this operation has: an illegal word
+            // rather than a gap in the subset, and counted with the gap
+            // because it is the interpreter's exception that runs.
+            return self.declined(Decline::GAP);
         };
-        let Some(plan) = classify(insn, opcode, size, pc, words) else {
-            return Flow::Rejected;
+        let plan = match classify(insn, opcode, size, pc, words) {
+            Ok(plan) => plan,
+            Err(reason) => return self.declined(reason),
         };
 
         // Everything below this line emits, so the boundary opens here.
@@ -1726,7 +1894,7 @@ impl Lifter {
             Plan::Unary => self.op_unary(insn, opcode, size),
             Plan::Tst => {
                 let Some(src) = self.resolve(Arg::Ea, opcode, size) else {
-                    return Flow::Rejected;
+                    return self.declined(Decline::GAP);
                 };
                 let v = self.read_loc(src, size);
                 self.set_logic_flags(v, size);
@@ -1784,7 +1952,7 @@ impl Lifter {
                 let Some(Loc::Mem(addr)) =
                     self.resolve_ea(Arg::Ea, opcode, Size::Long, Extra::Control)
                 else {
-                    return Flow::Rejected;
+                    return self.declined(Decline::GAP);
                 };
                 self.write_a(hi, addr);
                 self.settle();
@@ -1864,7 +2032,7 @@ impl Lifter {
     fn op_move(&mut self, insn: Insn, opcode: u16, size: Size) -> Flow {
         self.source_was_memory = ea_of(insn.src, opcode).is_some_and(|(mode, _)| mode.is_memory());
         let Some(src) = self.resolve(insn.src, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let value = self.read_loc(src, size);
         if insn.op == Op::Movea {
@@ -1879,7 +2047,7 @@ impl Lifter {
             return Flow::Continue;
         }
         let Some(dst) = self.resolve_ea(insn.dst, opcode, size, Extra::MoveDest) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         self.set_logic_flags(value, size);
         if let Some((Mode::PreDec, reg)) = ea_of(insn.dst, opcode) {
@@ -1907,11 +2075,11 @@ impl Lifter {
 
     fn op_binary(&mut self, insn: Insn, opcode: u16, size: Size, kind: BinKind) -> Flow {
         let Some(src) = self.resolve(insn.src, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let src_value = self.read_loc(src, size);
         let Some(dst) = self.resolve(insn.dst, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         if let Loc::A(n) = dst
             && matches!(insn.op, Op::Addq | Op::Subq)
@@ -2015,11 +2183,11 @@ impl Lifter {
 
     fn op_compare(&mut self, insn: Insn, opcode: u16, size: Size) -> Flow {
         let Some(src) = self.resolve(insn.src, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let src_value = self.read_loc(src, size);
         let Some(dst) = self.resolve(insn.dst, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let dst_value = self.read_loc(dst, size);
         let raw = self.b.binary(Opcode::SUB, Type::I32, dst_value, src_value);
@@ -2061,7 +2229,7 @@ impl Lifter {
 
     fn op_adda(&mut self, opcode: u16, size: Size, add: bool) -> Flow {
         let Some(src) = self.resolve(Arg::Ea, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let raw = self.read_loc(src, size);
         // "A word source is sign-extended to 32 bits before the add; the
@@ -2090,7 +2258,7 @@ impl Lifter {
 
     fn op_cmpa(&mut self, opcode: u16, size: Size) -> Flow {
         let Some(src) = self.resolve(Arg::Ea, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let raw = self.read_loc(src, size);
         let value = if size == Size::Word {
@@ -2195,7 +2363,7 @@ impl Lifter {
 
     fn op_unary(&mut self, insn: Insn, opcode: u16, size: Size) -> Flow {
         let Some(dst) = self.resolve(insn.dst, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         // "CLR still reads its destination on a 68000 — the read is a real bus
         // cycle and a device can see it (MC68000UM Table 8-6, and the reason
@@ -2266,7 +2434,7 @@ impl Lifter {
             // register; `MOVE from CCR` is a 68010 addition and no 68000
             // encoding reaches it.
             let Some(dst) = self.resolve_ea(Arg::Ea, opcode, Size::Word, Extra::Operand) else {
-                return Flow::Rejected;
+                return self.declined(Decline::GAP);
             };
             let sr = self.read_sr();
             let value = self.masked(sr, Size::Word);
@@ -2287,7 +2455,7 @@ impl Lifter {
         }
         // `MOVE to CCR` takes a word source and writes the low five bits.
         let Some(src) = self.resolve(insn.src, opcode, Size::Word) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let value = self.read_loc(src, Size::Word);
         let sr = self.read_sr();
@@ -2326,7 +2494,7 @@ impl Lifter {
             None => self.read_d(u32::from((opcode >> 9) & 7)),
         };
         let Some(dst) = self.resolve(insn.dst, opcode, size) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         // "Long when the destination is a data register, byte otherwise"
         // (`isa::SizeSpec::BitOp`), and the bit number is reduced modulo the
@@ -2393,7 +2561,7 @@ impl Lifter {
         if memory {
             // "The memory form shifts one bit of one word."
             let Some(dst) = self.resolve_ea(Arg::Ea, opcode, Size::Word, Extra::Operand) else {
-                return Flow::Rejected;
+                return self.declined(Decline::GAP);
             };
             let value = self.read_loc(dst, Size::Word);
             let result = self.shift(insn.op, value, 1, Size::Word);
@@ -2568,7 +2736,7 @@ impl Lifter {
     fn op_movem_load(&mut self, opcode: u16, size: Size) -> Flow {
         let mask = self.ext(0);
         let Some((mode, reg)) = ea_of(Arg::Ea, opcode) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let reg = u32::from(reg);
         let long = size == Size::Long;
@@ -2578,7 +2746,7 @@ impl Lifter {
         } else {
             let Some(Loc::Mem(addr)) = self.resolve_ea(Arg::Ea, opcode, size, Extra::Operand)
             else {
-                return Flow::Rejected;
+                return self.declined(Decline::GAP);
             };
             addr
         };
@@ -2845,7 +3013,7 @@ impl Lifter {
     fn op_scc(&mut self, opcode: u16) -> Flow {
         let set = self.test(Cond::from_opcode(opcode));
         let Some(dst) = self.resolve_ea(Arg::Ea, opcode, Size::Byte, Extra::Operand) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let ones = self.konst(0xff);
         let zero = self.konst(0);
@@ -2875,7 +3043,7 @@ impl Lifter {
 
     fn op_jmp(&mut self, opcode: u16, pc: u32) -> Flow {
         let Some((mode, reg)) = ea_of(Arg::Ea, opcode) else {
-            return Flow::Rejected;
+            return self.declined(Decline::GAP);
         };
         let reg = u32::from(reg);
         // `Exec::jump_target`: "The **last extension word is taken straight
@@ -2920,7 +3088,7 @@ impl Lifter {
                 let base = self.konst(pc.wrapping_add(2));
                 self.index_address(base, queued)
             }
-            _ => return Flow::Rejected,
+            _ => return self.declined(Decline::GAP),
         };
         self.refill_at(target, 0);
         self.pc_out = Some(target);
@@ -2935,7 +3103,13 @@ impl Lifter {
     /// register map and the [`PC`] slot, which is the only thing that tells
     /// the engine where to resume; its `pc` field is the exit PC where that is
     /// a constant, and the program-order continuation otherwise.
-    fn close(mut self, program_order_pc: u32, insns: usize, stop: Stop) -> Lifted {
+    fn close(
+        mut self,
+        program_order_pc: u32,
+        insns: usize,
+        stop: Stop,
+        declined: Option<Declined>,
+    ) -> Lifted {
         if self.closed {
             // Every path of the last instruction lifted ended in its own exit
             // boundary and terminator, so the block is already well formed and
@@ -2943,6 +3117,7 @@ impl Lifter {
             return Lifted {
                 block: self.b.finish(),
                 stop,
+                declined,
                 insns,
                 end_pc: program_order_pc,
             };
@@ -2964,6 +3139,7 @@ impl Lifter {
         Lifted {
             block: self.b.finish(),
             stop,
+            declined,
             insns,
             end_pc: at,
         }
