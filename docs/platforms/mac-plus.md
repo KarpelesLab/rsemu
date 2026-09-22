@@ -23,7 +23,9 @@ Apple system software on an 800K image — ledger item 1.
 | Neil Parker, *Controlling the 3.5 Drive Hardware on the Apple IIGS*, version 1.00 (February 1994) | The Sony mechanism's **sixteen one-bit status registers** and its control registers, addressed by `CA2`, `CA1`, `CA0` and `SEL`, with the polarity of each. The same mechanism hangs off a Macintosh Plus, and this is the only published listing of it. Its own summary of the polarities is the thing to remember: "the settings of most of these bits are *backwards*: 0 means yes and 1 means no" |
 | US patent **4,564,941**, "Error detection system", Apple Computer Inc. (filed 1983, granted 1986) | The three-byte interleaved checksum on a 400K/800K disk sector: the rotation, the carry chain, and the scrambling of the data with it |
 | *Synertek SY6522 / Rockwell R6522 Versatile Interface Adapter* data sheet | The chip: sixteen registers, two ports, two timers, the shift register, the interrupt flag/enable pair |
-| *Zilog Z8030/Z8530 SCC* technical manual | The one register pointer, the thirty-two registers per channel, `RR0`-`RR3`, the reset commands |
+| *Zilog Z8030/Z8530 SCC* technical manual — the *SCC/ESCC User Manual*, UM010902 | The one register pointer, the thirty-two registers per channel, `RR0`-`RR3`, the reset commands, and the external/status **latches**: "they all close at the same time as a result of a state change in one of the sources of enabled external/status interrupts" |
+| *Am8530H/Am85C30* technical manual (AMD's edition of the same part's manual), §3.8 | The one sentence Zilog's printing breaks off in the middle of: what the chip does with a second `DCD` transition before the first is acknowledged — "only an odd number of transitions on the DCD pin while another External/Status is pending will cause an External/Status interrupt after the Reset External/Status Interrupt command is issued" |
+| Apple Technical Note **DV 520**, *Device Management Overview Q&As* | What the ROM does with a mouse interrupt: the handler "adds the horizontal and vertical counts to MTemp", and the cursor VBL task compares `MTemp` with `RawMouse`, scales, and "also updates MTemp to reflect the new value" — which is where a count goes missing |
 | Apple, *IWM Specification* (1982) | The sixteen soft switches, the four register pairs `Q7:Q6` selects, the mode register, the write handshake |
 | *NCR 5380 SCSI Interface Chip Design Manual*, NCR Microelectronics (May 1985) | The SCSI chip: §6 the eight registers bit by bit, §7 the on-chip hardware support, §8 the six interrupt conditions, §9 the three resets, §10 the four transfer modes. **The Guide does not carry the 5380's register addresses** — its chapter 11 is connector pinouts and circuit diagrams and has no "SCSI addresses" section where chapter 10 has "SCC addresses", so the decode came from tracing |
 | *Inside Macintosh: Devices*, chapter 3, "SCSI Manager" (Apple Computer) | The software side: `_SCSIDispatch` and every routine's selector, the TIB instruction record, and the result codes. Used to *call* the ROM's own SCSI Manager from a test rather than to model anything |
@@ -172,7 +174,7 @@ read/write pin for it and decodes the direction from the address instead.
 | `mac.video` | 512 × 342 one-bit pixels read out of main memory at capture time, the screen buffer hanging below the top of memory with `PAGE2` picking which of the two, and the vertical and horizontal blanking outputs | the cycles it steals from the processor: this board's 68000 runs at its full rate |
 | `mac.keyboard` | the Guide's clock/data protocol, its bit timing, the four commands of Table 7-4 and a type-ahead buffer | a host keymap — `Keyboard::key` takes the Guide's own transition code — and the separate keypad's `$79` prefix |
 | `mac.rtc` | the four-byte second counter, twenty bytes of parameter RAM, the write-protect and test registers, the three-wire serial interface and the one-second interrupt | the battery: parameter RAM lives and dies with the machine. The 256-byte chip of later models, and its two-byte extended command |
-| `mac.scc` | the register pointer and all thirty-two registers, `RR0`-`RR3`, the reset commands, `WR9`'s master interrupt enable, and the two carrier detects | any serial traffic, the baud-rate generator, the DPLL, `/WREQ` |
+| `mac.scc` | the register pointer and all thirty-two registers, `RR0`-`RR3`, the reset commands, `WR9`'s master interrupt enable, the two carrier detects, and the **external/status latches** with the manual's odd/even rule at the acknowledgement, so a transition arriving inside a handler is counted late rather than never | any serial traffic, the baud-rate generator, the DPLL, `/WREQ` |
 | `mac.iwm` | the sixteen soft switches, the mode and status registers, the write handshake, the drive's sixteen status lines and its control registers, and the **read** data path: a disk shifted past the head a bit cell at a time, with each byte the shifter latches named as a scheduler event so a guest polling the data register cannot miss one | **writing.** A byte written to the data register is kept and goes nowhere, so a disk is read-only however its tab is set. The 400K drive's **PWM speed input** — the mechanism here turns at whatever rate its track length implies and nothing the computer writes changes it |
 | `mac.gcr` | Apple's 6-and-2 encoding: the sixty-four disk bytes, the self-sync run, both field marks, the patent's three-byte checksum, the five speed zones and the **gap a formatter leaves**, which is what decides how fast the disk turns (`SECTOR_CELLS`) | the 400K drive's PWM speed control, which an 800K mechanism ignores |
 | `mac.disk` | a raw 400K/800K image or a DiskCopy 4.2 container, with its tags, and the block-to-cylinder mapping the zones decide | writing back, and every other container (`.dart`, `.sit`, a nibble image) |
@@ -651,14 +653,64 @@ The cost is a pointer that crosses the screen in about two and a half seconds.
 `-p mousestep=200` gives the speed back and takes the acceleration with it,
 which is what a real Macintosh does to a real mouse.
 
-**It is not exact to the count.** 400 counts on one axis move `Mouse` by 398,
-at every rate from 2 400 ticks a step down to 6 000 and not at all at 12 000:
-the guest counts *interrupts*, and an edge arriving while the processor is in
-the level-2 handler with the VIA also waiting is an edge nothing counts. One in
-two hundred, and it does not cancel. A sweep into a screen edge puts the two
-ends back together — the ROM clamps the pointer to the screen and the host's
-cursor stops at the same place — which is what a person does without thinking
-about it and what the test does deliberately before each placement.
+**It is not exact to the count, and the count that goes missing is Apple's.**
+This entry used to say the SCC dropped an edge "arriving while the processor is
+in the level-2 handler with the VIA also waiting", on nothing but inference.
+It does not. Counting the whole path at once — the transitions the mouse
+drives, the external/status latches the chip closes, the `/INT` assertions, and
+the `Reset Ext/Status Interrupts` the ROM's handler writes — gives **400 of 400
+at every one of six step rates**, exactly:
+
+```text
+  step-ticks   transitions   latches   /INT   serviced by the ROM   Mouse moved
+      2 400          400        400     400          400               399
+      3 000          400        400     400          400               399
+      4 000          400        400     400          400               399
+      5 000          400        400     400          400               398
+      6 000          400        400     400          400               400
+     12 000          400        400     400          400               400
+```
+
+`mac.scc`'s `Counters` are those four places and
+`every_count_the_mouse_sends_reaches_the_roms_handler` is the assertion; the
+four numbers are exact, with no tolerance.
+
+What is short is `Mouse`, and Apple documents why. Technical Note **DV 520**,
+*Device Management Overview Q&As*:
+
+> "When the mouse has new information, it interrupts the Macintosh. The
+> interrupt handler adds the horizontal and vertical counts to MTemp (a
+> low-memory location), and sets crsrNew to tell the system that the
+> coordinates are new."
+
+> "Some time later (but before normal VBLs are executed) the cursor VBL task is
+> executed, and it compares MTemp with RawMouse (which has the last value), and
+> figures out the delta ... **It also updates MTemp** to reflect the new value.
+> Then it draws the cursor."
+
+Two pieces of Apple's code share `MTemp` with no interlock, and the cursor task
+runs at interrupt mask **0** — `SR = $2004` where it is sampled — so the
+level-2 handler preempts it and a count added between its read of `MTemp` and
+its write-back is overwritten. Caught in the act, sampling every ten
+microseconds:
+
+```text
+  pc=401b28 sr=2004  MTemp=0085 RawMouse=0082   the cursor task, mask 0
+  pc=401ece sr=2004  MTemp=0085 RawMouse=0085   it has read MTemp
+  pc=401a88 sr=2204  MTemp=0085 RawMouse=0085   a carrier detect moves:
+  pc=401ade sr=2204  MTemp=0085 RawMouse=0085     the level-2 handler runs
+  pc=401bec sr=2200  MTemp=0086 RawMouse=0085     and counts it, 85 -> 86
+  pc=401f34 sr=2009  MTemp=0086 RawMouse=0085   back in the task
+  pc=401eee sr=2004  MTemp=0085 RawMouse=0085   which writes MTemp back
+```
+
+The window is some forty microseconds of a 16.6 ms tick — one count in two to
+four hundred, which is what comes out of the far end. **A real Macintosh Plus
+loses the same count**, so the sweep stays: a sweep into a screen edge puts the
+two ends back together, because the ROM clamps the pointer to the screen and
+the host's cursor stops at the same place. That is what a person does without
+thinking about it and what the test does deliberately before each placement,
+and it is why the placement assertion keeps its one-pixel margin.
 
 **What the picture shows.** The insert-disk screen with the arrow cursor
 wherever it was sent: send the pointer to (470, 100) and the arrow is drawn in
@@ -752,6 +804,32 @@ interrupts at once.
   regression watches the **net** rather than the registers — which is the
   point, because `Scc::irq` used to read the state and so could not see it.
   The old test passed the whole time.
+* **`RR0` was not latched, and a second carrier detect inside a handler was
+  swallowed.** Found by counting the whole path instead of guessing at it —
+  "It is not exact to the count", above, is the measurement that put this
+  entry here and retired the claim that used to stand in its place.
+
+  The chip read the live pin into `RR0` and set its pending bit on every
+  transition, so a transition arriving while an earlier one was unacknowledged
+  left no trace: the `Reset Ext/Status Interrupts` that followed cleared the
+  pending bit and the second edge was gone. The manual says a real 8530 counts
+  it **late** instead — the latches close on the level they caught, `RR0`
+  reports *that* until the acknowledgement, and the acknowledgement closes them
+  again "if there was an odd number of transitions on the DCD pin"
+  (*Am8530H/Am85C30* §3.8.6). `mac.scc` now holds one latch flag per channel,
+  which is also its interrupt-pending bit, exactly as Zilog's manual has it:
+  "The External/Status IP is set by the closing of the latches and remains set
+  as long as they are closed."
+
+  **At a mouse's rates this changes nothing measurable**, which is why an
+  earlier attempt at the same fix was reverted as unmeasurable — and it is the
+  clue that the missing counts were never here. A second transition never
+  arrives inside a handler at 2 400 to 12 000 ticks a step: transitions,
+  latches, `/INT` assertions and acknowledgements are all 400 of 400. It takes
+  a mouse moving sixteen thousand counts a second (30 ticks a step) to see it
+  at all, and there 300 transitions used to become 200 interrupts and now
+  become **226** — the remaining 74 being the even-numbered pairs the manual
+  says the chip genuinely cannot report.
 * **The SCC ignored `WR9`'s master interrupt enable.** Found while fixing the
   above: the chip pulled `/INT` whenever a channel had a pending bit and `WR1`
   enabled the condition, with no reference to MIE. The manual gates the pin on

@@ -128,14 +128,26 @@ pub const DEFAULT_MOUSE_PORT: &str = "mouse";
 /// the speed and live with the acceleration, which is after all what a real
 /// Macintosh does to a real mouse.
 ///
-/// **It is not exact to the count.** 400 counts on one axis move `Mouse` by
-/// 398, at every rate from 2 400 to 6 000 ticks a step and not at all at
-/// 12 000: the guest counts *interrupts*, and an edge that arrives while the
-/// processor is inside the level-2 handler with the VIA also waiting is an
-/// edge nothing counts. One in two hundred, it does not cancel, and a sweep
-/// into a screen edge is what puts the two ends back together — which is what
-/// a person does without thinking about it and what `tests/mac_plus.rs` does
-/// deliberately.
+/// **It is not exact to the count, and the missing one is Apple's.** 400
+/// counts on one axis move `Mouse` by 398, 399 or 400 depending on the rate.
+/// Every stage of the hardware path is exact — counted at four places, the
+/// pin, the SCC's external/status latch, the `/INT` wire and the `Reset
+/// Ext/Status Interrupts` the handler writes, all four are 400 of 400 at every
+/// rate (`tests/mac_plus.rs`) — so nothing here loses an interrupt. What loses
+/// the count is the ROM, in the window Apple's own Technical Note DV 520
+/// describes: "the interrupt handler adds the horizontal and vertical counts
+/// to MTemp", and "some time later ... the cursor VBL task is executed, and it
+/// compares MTemp with RawMouse ... It also updates MTemp to reflect the new
+/// value." That task runs at interrupt mask **0**, so a count added between
+/// its read of `MTemp` and its write-back is overwritten — on this board and
+/// on a real Macintosh Plus alike. It is about forty microseconds of a 16.6 ms
+/// tick, which is the one count in two to four hundred that goes missing, and
+/// it does not cancel.
+///
+/// A sweep into a screen edge is what puts the two ends back together — the
+/// ROM clamps the pointer to the screen and the host's cursor stops at the
+/// same place — which is what a person does without thinking about it and what
+/// `tests/mac_plus.rs` does deliberately before each placement.
 pub const DEFAULT_STEP_TICKS: u64 = 2_400;
 
 /// Quadrature transitions in one mouse count. See *Two wires an axis*.

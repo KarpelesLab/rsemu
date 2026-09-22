@@ -73,6 +73,7 @@ use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
 use rsemu::cpu::m68k::M68k;
 use rsemu::dev::mac::iwm::Iwm;
+use rsemu::dev::mac::mouse::{MacMouse, Mouse};
 use rsemu::dev::mac::scc::Scc;
 use rsemu::host::display::mac::{MacScanout, capture};
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
@@ -107,6 +108,11 @@ struct Board {
     scanout: MacScanout,
     iwm: Arc<Iwm>,
     scc: Arc<Scc>,
+    /// The mouse itself, caught as the board built it: a test that posts an
+    /// exact number of **counts** has to reach past the absolute-pointer sink,
+    /// which speaks pixels and keeps its own idea of where the host's cursor
+    /// is.
+    mouse: Arc<Mouse>,
     /// The pointer, as a person's own frontend reaches it: an `InputSink` that
     /// takes absolute framebuffer positions, over the host object `mac.mouse`
     /// opened for itself.
@@ -202,6 +208,13 @@ fn board_with_disk(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Bo
         keep_scc.push(&scc);
         Ok(scc)
     });
+    let mice: Arc<Captured<MacMouse>> = Arc::new(Captured::new());
+    let keep_mouse = Arc::clone(&mice);
+    options.bindings.replace("mac.mouse", move |props| {
+        let mouse = Arc::new(MacMouse::new(props)?);
+        keep_mouse.push(&mouse);
+        Ok(mouse)
+    });
     capture::install(&mut options).expect("a capture table");
     for &(name, value) in params {
         options
@@ -234,6 +247,7 @@ fn board_with_disk(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Bo
         scanout,
         iwm: iwms.last().expect("the binding captured the controller"),
         scc: sccs.last().expect("the binding captured the SCC"),
+        mouse: Arc::clone(mice.last().expect("the binding captured the mouse").mouse()),
         pointer,
     }
 }
@@ -786,16 +800,19 @@ fn the_pointer_goes_where_it_is_put() {
     // else's — and each one is reached from the corner rather than from the
     // last, which is the part worth explaining.
     //
-    // **The guest counts interrupts, and it misses about one in two hundred.**
-    // Measured: 400 counts on one axis move `Mouse` by 398, at every step rate
-    // from 2 400 up to 6 000 ticks and not at all at 12 000 — an edge arriving
-    // while the processor is inside the level-2 handler with the VIA also
-    // waiting is an edge that never gets counted, here and on a real
-    // Macintosh. That error does not cancel, so a run of placements measured
-    // from each other would drift a pixel every few hundred counts and the
-    // test would be asserting the drift rather than the tracking. Re-pinning
-    // on the corner is what a person does without thinking about it, and it is
-    // what `amiga_a500_workbench.rs` does with the *bottom* right one.
+    // **The ROM loses about one count in three hundred, and it is the ROM's.**
+    // Every transition reaches the chip, latches, pulls `/INT` and is
+    // serviced — 400 of 400 at every step rate, which
+    // `every_count_the_mouse_sends_reaches_the_roms_handler` asserts with no
+    // tolerance at all — but the cursor VBL task reads `MTemp`, scales it and
+    // "also updates MTemp to reflect the new value" (Apple Technical Note
+    // DV 520) at interrupt mask 0, so a count the handler adds inside that
+    // window is overwritten. A real Macintosh loses it too. That error does
+    // not cancel, so a run of placements measured from each other would drift
+    // a pixel every few hundred counts and this test would be asserting the
+    // drift rather than the tracking. Re-pinning on the corner is what a
+    // person does without thinking about it, and it is what
+    // `amiga_a500_workbench.rs` does with the *bottom* right one.
     // One event to establish where the host's cursor is, which moves nothing.
     point_at(&mut b, 400, 300, 0, 100);
     for (x, y) in [(100u32, 80u32), (37, 121), (300, 40), (470, 100)] {
@@ -839,4 +856,137 @@ fn the_pointer_goes_where_it_is_put() {
     assert!(!b.cpu.is_halted(), "the processor double-faulted");
     assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
     let _ = picture(&b, "mac-plus-pointer", 30);
+}
+
+/// **Every count the mouse sends becomes an interrupt the ROM services**, at
+/// every step rate, and the only thing that ever goes missing afterwards is
+/// Apple's own.
+///
+/// This is the test that settled a claim this board carried for a while: that
+/// the SCC dropped about one carrier-detect transition in two hundred, because
+/// "an edge arriving while the processor is in the level-2 handler with the VIA
+/// also waiting is an edge nothing counts". It does not. Counted at four
+/// places along the path — the pin, the chip's external/status latch, the
+/// `/INT` wire, and the `Reset Ext/Status Interrupts` the guest's handler
+/// writes — **all four numbers are the number of counts posted**, exactly, at
+/// every rate. `mac.scc`'s [`Counters`](rsemu::dev::mac::scc::Counters) are
+/// those four places.
+///
+/// What is short is `Mouse`, by one or two in four hundred, and that is the
+/// ROM's own arithmetic rather than a lost interrupt. Apple documents the
+/// mechanism in Technical Note DV 520,
+/// *Device Management Overview Q&As*:
+///
+/// > "When the mouse has new information, it interrupts the Macintosh. The
+/// > interrupt handler adds the horizontal and vertical counts to MTemp (a
+/// > low-memory location), and sets crsrNew to tell the system that the
+/// > coordinates are new."
+///
+/// > "Some time later (but before normal VBLs are executed) the cursor VBL task
+/// > is executed, and it compares MTemp with RawMouse (which has the last
+/// > value), and figures out the delta ... **It also updates MTemp** to reflect
+/// > the new value. Then it draws the cursor."
+///
+/// Those two pieces of code share `MTemp` with no interlock, and the cursor
+/// task runs at interrupt mask **0** — sampling `SR` through it says `$2004`.
+/// So a count the handler adds after the task has read `MTemp` and before it
+/// writes it back is overwritten, and a real Macintosh Plus loses it for the
+/// same reason. Caught in the act on this board, ten microseconds a sample:
+///
+/// ```text
+///   pc=401b28 sr=2004  MTemp=0085 RawMouse=0082   (the cursor task, mask 0)
+///   pc=401ece sr=2004  MTemp=0085 RawMouse=0085   it has read MTemp
+///   pc=401a88 sr=2204  MTemp=0085 RawMouse=0085   a carrier detect moved:
+///   pc=401ade sr=2204  MTemp=0085 RawMouse=0085     the level-2 handler
+///   pc=401bec sr=2200  MTemp=0086 RawMouse=0085     and it counted: 85 -> 86
+///   pc=401f34 sr=2009  MTemp=0086 RawMouse=0085   back in the task
+///   pc=401eee sr=2004  MTemp=0085 RawMouse=0085   which writes MTemp back
+/// ```
+///
+/// The window is some forty microseconds of a 16.6 ms tick, which is the one
+/// in two to four hundred that comes out of the far end. Hence the allowance
+/// here — a *measured* bound on Apple's window, not a tolerance over an
+/// unexplained loss — and hence the sweep into the corner that
+/// `the_pointer_goes_where_it_is_put` still does before each placement.
+#[test]
+fn every_count_the_mouse_sends_reaches_the_roms_handler() {
+    let Some(image) = rom_image("Mac-Plus.ROM") else {
+        return;
+    };
+    // Counts on one axis per rate. 400 from the boot cursor's x = 15 stays
+    // inside the 512-pixel screen, so the ROM's clamp never touches it.
+    const COUNTS: i32 = 400;
+    // Ticks a step for each board. Every one of them keeps the ROM under its
+    // own scaling threshold — six counts in one 60.15 Hz tick is doubled —
+    // which is what makes a count a pixel; 1 200 would not.
+    const RATES: [u64; 6] = [2_400, 3_000, 4_000, 5_000, 6_000, 12_000];
+    let mut exact = 0;
+    for rate in RATES {
+        let mut b = board(image.clone(), &[("mousestep", &rate.to_string())]);
+        advance(&mut b, "mac-plus-counts", 16);
+        let before = b.scc.counters();
+        let at = peek(&b, 0x830);
+        b.mouse.report(COUNTS, 0, 0);
+        // The whole backlog at this rate, and two seconds for the ROM to draw
+        // the last of it.
+        let ms = 2 * u64::from(COUNTS.unsigned_abs()) * rate / 1_000 + 2_000;
+        for _ in 0..ms / 100 {
+            b.machine
+                .run_for(GlobalTime::from_nanos(100_000_000))
+                .expect("it runs");
+        }
+        assert_eq!(b.mouse.backlog(), (0, 0), "the mouse clocked it all out");
+        let now = b.scc.counters();
+        let then = peek(&b, 0x830);
+        let moved = i64::from(then as u16) - i64::from(at as u16);
+        let count = |after: u64, before: u64| i64::try_from(after - before).expect("a count");
+        let edges = count(now.dcd_edges[0], before.dcd_edges[0]);
+        let latches = count(now.ext_latches[0], before.ext_latches[0]);
+        let ints = count(now.int_assertions, before.int_assertions);
+        let serviced = count(now.ext_resets[0], before.ext_resets[0]);
+        println!(
+            "mac-plus: step-ticks {rate}: {COUNTS} counts -> {edges} transitions on DCDA, \
+             {latches} external/status latches, {ints} /INT assertions, {serviced} serviced \
+             by the ROM; Mouse moved {moved}"
+        );
+        assert_eq!(edges, i64::from(COUNTS), "the mouse sent every count");
+        assert_eq!(latches, i64::from(COUNTS), "the chip latched every one");
+        assert_eq!(ints, i64::from(COUNTS), "and asked for every one");
+        assert_eq!(
+            serviced,
+            i64::from(COUNTS),
+            "and the ROM serviced every one"
+        );
+        assert_eq!(
+            count(now.dcd_edges[1], before.dcd_edges[1]),
+            0,
+            "one axis moved, so the other carrier detect stood still"
+        );
+        assert_eq!(
+            (then >> 16) as u16,
+            (at >> 16) as u16,
+            "and the vertical coordinate did not move at all"
+        );
+        assert!(
+            moved <= i64::from(COUNTS),
+            "the ROM moved the pointer further than it was pushed: {moved} of {COUNTS}. \
+             Six counts in one tick is doubled, so this is the scaling threshold."
+        );
+        // Apple's window, above: at most one count per execution of the cursor
+        // VBL task. Measured on this board: one at 2 400, 3 000, 4 000, 5 000
+        // and 6 000 ticks a step, none at 12 000.
+        assert!(
+            i64::from(COUNTS) - moved <= i64::from(COUNTS) / 100,
+            "the ROM is short by {} of {COUNTS}, which is more than its own \
+             MTemp window explains",
+            i64::from(COUNTS) - moved
+        );
+        exact += i64::from(i64::from(COUNTS) == moved);
+    }
+    println!(
+        "mac-plus: {}/{} of the rates land the pointer exactly; every rate delivers, latches, \
+         raises and services {COUNTS} of {COUNTS}",
+        exact,
+        RATES.len()
+    );
 }

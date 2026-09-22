@@ -40,14 +40,19 @@ use crate::core::sync::Mutex;
 ///   rate exists to keep it under that. A board run with `-p mousestep=` below
 ///   the default gets a faster pointer that no longer lands where it was sent,
 ///   which is the Amiga's old defect the other way round.
-/// * The guest loses about **one count in two hundred** — it counts interrupts,
-///   and an edge arriving inside the level-2 handler with the VIA also waiting
-///   is one nothing counts. So the pointer tracks rather than matching, and the
-///   error does not cancel. A sweep into a screen edge pins the two ends back
-///   together, because the ROM clamps the pointer to the screen and the host's
-///   cursor stops at the same place; that is what a person does without
-///   thinking about it, and `tests/mac_plus.rs` does it deliberately before
-///   each placement.
+/// * The guest loses about **one count in three hundred**, and the loss is the
+///   *ROM's* rather than the hardware's: every transition reaches the SCC,
+///   latches, pulls `/INT` and is serviced — 400 of 400 at every step rate,
+///   counted at all four places in `tests/mac_plus.rs` — but the cursor VBL
+///   task reads `MTemp`, scales it and "also updates MTemp to reflect the new
+///   value" (Apple Technical Note DV 520) at interrupt mask 0, so a count the
+///   handler adds inside that window is overwritten. A real Macintosh loses it
+///   too. So the pointer tracks rather than matching, and the error does not
+///   cancel. A sweep into a screen edge pins the two ends back together,
+///   because the ROM clamps the pointer to the screen and the host's cursor
+///   stops at the same place; that is what a person does without thinking
+///   about it, and `tests/mac_plus.rs` does it deliberately before each
+///   placement.
 #[cfg(feature = "dev-mac")]
 pub const PIXELS_PER_COUNT: i64 = 1;
 
