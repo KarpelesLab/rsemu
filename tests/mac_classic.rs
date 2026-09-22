@@ -78,6 +78,30 @@ const GOLDEN_1M: u64 = 0xfbc9_cfa0_9b09_a5da;
 /// the 512 × 342 screen. Left, top, width, height.
 const ICON: (u32, u32, u32, u32) = (240, 145, 32, 32);
 
+/// How long the boot takes, in virtual seconds, with a little slack.
+///
+/// Measured rather than chosen: on the stock 1 MiB board the memory test runs
+/// to about five seconds, the happy Mac is up at ten, "Welcome to Macintosh"
+/// at fifteen, the Finder's menu bar is drawn by sixty, and the desktop stops
+/// changing at **seventy** — every frame from there to two virtual minutes
+/// hashes the same. Virtual time is exact, so this is not a race; the slack is
+/// for a future change that makes the boot a second or two longer.
+const BOOT_SECONDS: u64 = 75;
+
+/// The Finder desktop at [`BOOT_SECONDS`] on the stock 1 MiB board with the
+/// user's own Mac OS 6.0.8 startup disk.
+///
+/// A hash of *our rendering* of Apple's screen, not of anybody's bytes. What
+/// is in the picture: the menu bar across the top with the Apple and **File
+/// Edit View Special**, the arrow cursor at the top left, the startup volume's
+/// floppy icon with **System Startup** under it in the top right corner, the
+/// Trash in the bottom right, and the Macintosh's 50 % grey checkerboard
+/// between them — 82,909 black pixels of 175,104.
+///
+/// If this moves, **look at the PNG** (`RSEMU_MAC_FRAME_DIR`) before accepting
+/// a new value. A hash is not evidence that a desktop is on the screen.
+const GOLDEN_FINDER: u64 = 0x9cef_f423_881c_3348;
+
 /// One running board and the handles a test needs.
 struct Board {
     machine: Machine,
@@ -355,6 +379,260 @@ fn peek(b: &Board, addr: u64) -> u32 {
 // ---------------------------------------------------------------------------
 // a transparent tap
 // ---------------------------------------------------------------------------
+
+/// The sixteen IWM soft switches by name, index 0 to 15.
+const SWITCHES: [&str; 16] = [
+    "CA0-", "CA0+", "CA1-", "CA1+", "CA2-", "CA2+", "LSTRB-", "LSTRB+", "ENBL-", "ENBL+", "DRV1",
+    "DRV2", "Q6-", "Q6+", "Q7-", "Q7+",
+];
+
+/// The ISM's sixteen registers by name, index 0 to 15 — the write halves
+/// first, per the *SWIM Chip User's Reference* page 26.
+const ISM_REGS: [&str; 16] = [
+    "wData", "wMark", "wCRC", "wParam", "wPhase", "wSetup", "wMode0", "wMode1", "rData", "rMark",
+    "rError", "rParam", "rPhase", "rSetup", "rStatus", "rHandshake",
+];
+
+/// The mechanism's sixteen status lines by name, addressed `CA2:CA1:CA0:SEL`
+/// — Neil Parker's table, as `src/dev/mac/iwm.rs` carries it.
+const DRIVE_LINES: [&str; 16] = [
+    "stepdir",
+    "diskin",
+    "stepping",
+    "locked",
+    "motoron",
+    "track0",
+    "switched",
+    "tach",
+    "rddata0",
+    "rddata1",
+    "superdrive",
+    "superdrive'",
+    "sides",
+    "ready",
+    "installed",
+    "installed'",
+];
+
+/// A tap that **names** what it saw instead of numbering it.
+///
+/// A log of switch indices cannot say which of the drive's sixteen status lines
+/// an access read, because that address is `CA2:CA1:CA0` *and* the VIA's `SEL`
+/// — three soft switches and a pin on another chip. So this one asks the
+/// controller itself, during the access, which register set is answering and
+/// which drive line is addressed. That is what turns "the ROM read switch 13
+/// and got `$b7`" into "the ROM read `ready` on drive 1 and was told no".
+#[derive(Debug)]
+struct SwimTap {
+    ops: Arc<dyn rsemu::core::space::MemOps>,
+    swim: Arc<Swim>,
+    log: std::sync::Mutex<Vec<String>>,
+}
+
+impl rsemu::core::space::MemOps for SwimTap {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> rsemu::core::space::MemResult {
+        let r = self.ops.read(offset, dst, attrs);
+        if !attrs.debug {
+            self.note(offset, false, dst);
+        }
+        r
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> rsemu::core::space::MemResult {
+        let r = self.ops.write(offset, src, attrs);
+        if !attrs.debug {
+            self.note(offset, true, src);
+        }
+        r
+    }
+
+    fn constraints(&self) -> rsemu::core::space::AccessConstraints {
+        self.ops.constraints()
+    }
+}
+
+impl SwimTap {
+    fn note(&self, offset: u64, write: bool, bytes: &[u8]) {
+        let index = ((offset / 0x200) & 15) as usize;
+        let value = bytes.iter().fold(0u32, |v, &b| (v << 8) | u32::from(b)) as u8;
+        let dir = if write { "W" } else { "R" };
+        let iwm = self.swim.iwm();
+        let line = if self.swim.ism_selected() {
+            format!("ISM {:<11} {dir} {value:02x}", ISM_REGS[index])
+        } else {
+            let addr = iwm.drive_address();
+            format!(
+                "IWM {:<6} {dir} {value:02x}  drv{} {}",
+                SWITCHES[index],
+                iwm.selected_drive() + 1,
+                DRIVE_LINES[usize::from(addr)],
+            )
+        };
+        let mut log = self.log.lock().unwrap();
+        log.push(line);
+        if log.len() > 40_000 {
+            log.drain(..20_000);
+        }
+    }
+
+    /// The trace, runs of the identical line collapsed to one with a count.
+    fn folded(&self) -> Vec<(String, u64)> {
+        let log = self.log.lock().unwrap();
+        let mut out: Vec<(String, u64)> = Vec::new();
+        for line in log.iter() {
+            match out.last_mut() {
+                Some((prev, n)) if prev == line => *n += 1,
+                _ => out.push((line.clone(), 1)),
+            }
+        }
+        out
+    }
+
+    /// Print it.
+    fn dump(&self, label: &str) {
+        println!("{label}:");
+        if std::env::var_os("RSEMU_MAC_UNFOLDED").is_some() {
+            for line in self.log.lock().unwrap().iter() {
+                println!("  {line}");
+            }
+            return;
+        }
+        for (line, n) in self.folded() {
+            if n == 1 {
+                println!("  {line}");
+            } else {
+                println!("  {line}  x{n}");
+            }
+        }
+    }
+}
+
+/// A tap that counts *addresses* rather than registers.
+///
+/// Over the memory aperture it sees only the processor's **data** accesses,
+/// because the instructions it is running are fetched out of the ROM's own
+/// mapping — which is what turns "the ROM is stuck in a two-instruction loop"
+/// into "the ROM is polling this one location".
+#[derive(Debug)]
+struct RamTap {
+    ops: Arc<dyn rsemu::core::space::MemOps>,
+    counts: std::sync::Mutex<std::collections::BTreeMap<(u64, bool), u64>>,
+    on: std::sync::atomic::AtomicBool,
+}
+
+impl rsemu::core::space::MemOps for RamTap {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> rsemu::core::space::MemResult {
+        let r = self.ops.read(offset, dst, attrs);
+        self.note(offset, false, attrs);
+        r
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> rsemu::core::space::MemResult {
+        self.note(offset, true, attrs);
+        self.ops.write(offset, src, attrs)
+    }
+
+    fn constraints(&self) -> rsemu::core::space::AccessConstraints {
+        self.ops.constraints()
+    }
+}
+
+impl RamTap {
+    fn note(&self, offset: u64, write: bool, attrs: MemAttrs) {
+        if attrs.debug || !self.on.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        *self.counts.lock().unwrap().entry((offset, write)).or_insert(0) += 1;
+    }
+
+    fn arm(&self, on: bool) {
+        self.on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn top(&self, n: usize) -> Vec<((u64, bool), u64)> {
+        let mut v: Vec<_> = self
+            .counts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&k, &c)| (k, c))
+            .collect();
+        v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        v.truncate(n);
+        v
+    }
+}
+
+/// Put a [`RamTap`] over the memory aperture at zero.
+fn ram_tap(b: &Board) -> Arc<RamTap> {
+    use rsemu::core::space::{MemOps, Region, RegionKind};
+    use rsemu::core::value::Endian;
+    let space = b.machine.space("mem").expect("mem");
+    let mut guard = space.topology();
+    let (span, ops) = {
+        let (_, m) = guard
+            .mappings()
+            .find(|(_, m)| m.base == 0)
+            .expect("the memory mapping");
+        let mut leaf = m.region.clone();
+        while let RegionKind::Alias(a) = leaf.kind() {
+            let next = a.target().clone();
+            leaf = next;
+        }
+        match leaf.kind() {
+            RegionKind::Io(ops) => (leaf.len(), Arc::clone(ops)),
+            other => panic!("not an MMIO aperture: {other:?}"),
+        }
+    };
+    let constraints = ops.constraints();
+    let tap = Arc::new(RamTap {
+        ops,
+        counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        on: std::sync::atomic::AtomicBool::new(false),
+    });
+    let io = Region::io("ramtap", span, Arc::clone(&tap) as Arc<dyn MemOps>)
+        .with_constraints(constraints.with_endian(Endian::Big));
+    guard
+        .map_with_priority(Arc::new(io), 0, 100)
+        .expect("the tap maps");
+    tap
+}
+
+/// Put a [`SwimTap`] over the controller's window.
+fn swim_tap(b: &Board) -> Arc<SwimTap> {
+    use rsemu::core::space::{MemOps, Region, RegionKind};
+    use rsemu::core::value::Endian;
+    let space = b.machine.space("mem").expect("mem");
+    let mut guard = space.topology();
+    let ops = {
+        let (_, m) = guard
+            .mappings()
+            .find(|(_, m)| m.base == 0xC0_0000)
+            .expect("the controller's mapping");
+        let mut leaf = m.region.clone();
+        while let RegionKind::Alias(a) = leaf.kind() {
+            let next = a.target().clone();
+            leaf = next;
+        }
+        match leaf.kind() {
+            RegionKind::Io(ops) => Arc::clone(ops),
+            other => panic!("not an MMIO aperture: {other:?}"),
+        }
+    };
+    let constraints = ops.constraints();
+    let tap = Arc::new(SwimTap {
+        ops,
+        swim: Arc::clone(&b.swim),
+        log: std::sync::Mutex::new(Vec::new()),
+    });
+    let io = Region::io("swimtap", 0x2000, Arc::clone(&tap) as Arc<dyn MemOps>)
+        .with_constraints(constraints.with_endian(Endian::Big));
+    let mirror = Region::mirror("swimtap.mirror", Arc::new(io), 0x20_0000).expect("a mirror");
+    guard
+        .map_with_priority(Arc::new(mirror), 0xC0_0000, 100)
+        .expect("the tap maps");
+    tap
+}
 
 /// A transparent tap over one device's aperture: it records every access and
 /// forwards it unchanged.
@@ -811,6 +1089,189 @@ fn the_rom_asks_the_swim_for_ism_mode() {
 ///
 /// That is the check that the counter's byte order is right, and it is a
 /// low-memory global the ROM built rather than code it ran.
+/// How white a rectangle of the screen is, as a count of lit pixels.
+///
+/// Left, top, width, height — the same shape [`ICON`] has.
+fn white_in(b: &Board, (left, top, w, h): (u32, u32, u32, u32)) -> usize {
+    let info = b.scanout.info();
+    let mut surface = Surface::new(PixelFormat::RGB888, info.width, info.height);
+    b.scanout.capture(&mut surface);
+    let pixels = surface.pixels();
+    let mut white = 0;
+    for y in top..(top + h).min(info.height) {
+        for x in left..(left + w).min(info.width) {
+            let at = ((y * info.width + x) * 3) as usize;
+            if pixels.get(at).is_some_and(|&p| p != 0) {
+                white += 1;
+            }
+        }
+    }
+    white
+}
+
+/// The Finder's **menu bar**: the full width of the screen, twenty pixels
+/// deep, and white except for the Apple and the four menu titles.
+const MENU_BAR: (u32, u32, u32, u32) = (0, 0, 512, 20);
+
+/// Where the Finder puts the startup volume's icon: the top right corner,
+/// below the menu bar.
+const DISK_ICON: (u32, u32, u32, u32) = (440, 24, 64, 48);
+
+/// **Mac OS 6.0.8 boots to the Finder desktop.**
+///
+/// This is the test this board exists for. A real Macintosh Classic ROM, the
+/// user's own 1.44 MB system disk read in place, and no help: the ROM sizes
+/// memory, resets the Apple Desktop Bus, finds a SuperDrive on the cable, puts
+/// the SWIM into **ISM mode**, loads the parameter RAM with Apple's own MFM
+/// timing table, reads the boot blocks off the disk and starts the System —
+/// the happy Mac at about ten virtual seconds, "Welcome to Macintosh" at
+/// fifteen, and the desktop with a menu bar and the volume's icon by sixty.
+///
+/// What is asserted is the *picture*, in three ways that fail differently:
+///
+/// * the **menu bar** is there, which no state before the Finder draws;
+/// * the **volume icon** is in the top right corner, which only a mounted
+///   startup disk puts there;
+/// * and a hash of the whole frame, so that a change to any of this shows up
+///   as a moved golden rather than as nothing.
+///
+/// It skips, saying so, when the ROM or the disk is not there.
+/// **Nothing is ever written to the disk image**: the drive takes a copy of
+/// the bytes and this model has no write path at all.
+#[test]
+fn the_rom_boots_mac_os_to_the_finder() {
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let disk = disk_image("MacOS_6.0.8_System_Startup.img");
+    if disk.is_empty() {
+        println!("mac-classic: no system disk, so there is nothing to boot; skipped");
+        return;
+    }
+    let mut b = board(image, &[], disk);
+    assert!(b.swim.has_disk(0), "the image went into the drive");
+    assert_eq!(
+        b.swim.density(0),
+        Some(Density::Mfm),
+        "a 1.44 MB disk is MFM, and that is what makes the ROM want ISM mode"
+    );
+
+    // The Finder is up a little before sixty virtual seconds; the extra is
+    // slack, and the frame that is hashed is at a fixed instant either way.
+    for s in 1..=BOOT_SECONDS {
+        advance(&mut b, "mac-classic-boot", 1);
+        if s % 10 == 0 {
+            let _ = picture(&b, "mac-classic-boot", s);
+        }
+    }
+
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+    assert!(!b.cpu.is_halted(), "the processor double-faulted");
+    // **Not** asserted here: that the disk is still in the drive. At 69
+    // virtual seconds — the instant the Finder finishes drawing the desktop —
+    // the ROM drives the phase lines to `CA2:CA1:CA0 = 111` and strobes
+    // `LSTRB`, which with `SEL` low is the drive register file's *eject*, and
+    // this model takes it literally. The guest plainly does not agree: the
+    // startup volume's icon stays on the desktop and the picture below is the
+    // one a mounted disk produces. `docs/platforms/mac-classic.md`, ledger
+    // item 1, has the trace and the two readings that could explain it; until
+    // one of them is settled, asserting either way here would be encoding a
+    // guess.
+
+    // The menu bar: white across the whole width of the screen, with the Apple
+    // and four menu titles in it. A grey desktop with no Finder is about half
+    // ink, so anything over three quarters white is a menu bar and nothing
+    // else on this machine is.
+    let menu = white_in(&b, MENU_BAR);
+    let menu_area = (MENU_BAR.2 * MENU_BAR.3) as usize;
+    println!("mac-classic: the menu bar is {menu} white pixels of {menu_area}");
+    assert!(
+        menu * 4 > menu_area * 3,
+        "there is no menu bar across the top of the screen: {menu} of {menu_area} white"
+    );
+
+    // And the volume's icon in the top right, which only a *mounted* disk
+    // puts there. The desktop behind it is the 50 % checkerboard, so a box
+    // that is mostly white is an icon sitting on it.
+    let icon = white_in(&b, DISK_ICON);
+    let icon_area = (DISK_ICON.2 * DISK_ICON.3) as usize;
+    println!("mac-classic: the disk icon corner is {icon} white pixels of {icon_area}");
+    assert!(
+        icon * 3 > icon_area * 2,
+        "the startup volume's icon is not on the desktop: {icon} of {icon_area} white"
+    );
+
+    let hash = picture(&b, "mac-classic-boot", BOOT_SECONDS);
+    assert_eq!(
+        hash, GOLDEN_FINDER,
+        "the Finder desktop has moved; look at the PNG (RSEMU_MAC_FRAME_DIR) before \
+         accepting a new hash"
+    );
+}
+
+#[test]
+#[ignore = "a trace instrument, not an assertion: run it with --ignored --nocapture"]
+fn trace_the_controller() {
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let secs: u64 = std::env::var("RSEMU_MAC_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
+    let kind = std::env::var("RSEMU_MAC_DISK_KIND").unwrap_or_else(|_| "1440k".to_string());
+    let disk = match kind.as_str() {
+        "real" => disk_image("MacOS_6.0.8_System_Startup.img"),
+        "800k" => {
+            // 800K of numbered blocks, the same differential the Plus uses:
+            // the GCR path is known to work there, so if the Classic reads
+            // this and not a 1.44 MB disk the difference is the medium.
+            let mut image = vec![0u8; 819_200];
+            for (block, chunk) in image.chunks_mut(512).enumerate() {
+                chunk[..4].copy_from_slice(&(block as u32).to_be_bytes());
+                for (i, byte) in chunk.iter_mut().enumerate().skip(4) {
+                    *byte = (block as u8).wrapping_mul(7).wrapping_add(i as u8);
+                }
+            }
+            image
+        }
+        "none" => Vec::new(),
+        _ => synthetic_1440k(),
+    };
+    let drives = std::env::var("RSEMU_MAC_DRIVES").unwrap_or_else(|_| "1".to_string());
+    let mut b = board(image, &[("drives", drives.as_str())], disk);
+    let tap = swim_tap(&b);
+    let mut had = b.swim.has_disk(0);
+    for s in 1..=secs {
+        advance(&mut b, "mac-classic-trace", 1);
+        if b.swim.has_disk(0) != had {
+            had = !had;
+            println!("mac-classic: at {s}s the drive {} a disk", if had { "gained" } else { "lost" });
+        }
+        if s % 5 == 0 {
+            let _ = picture(&b, "mac-classic-trace", s);
+        }
+    }
+    tap.dump("mac-classic: the controller, named");
+    println!("mac-classic: ISM selected at the end: {}", b.swim.ism_selected());
+    println!(
+        "mac-classic: motor {} track {} disk {}",
+        b.swim.motor(0),
+        b.swim.track(0),
+        b.swim.has_disk(0)
+    );
+    // And what the processor is polling where it stopped: one more virtual
+    // second with the memory aperture counting addresses.
+    let ram = ram_tap(&b);
+    ram.arm(true);
+    advance(&mut b, "mac-classic-trace", 1);
+    ram.arm(false);
+    println!("mac-classic: the busiest memory addresses in the last second:");
+    for ((addr, write), n) in ram.top(24) {
+        println!("  {addr:#08x} {} x{n}", if write { "W" } else { "R" });
+    }
+}
+
 #[test]
 fn the_clock_chip_reaches_low_memory() {
     let Some(image) = rom_image("Classic.ROM") else {
