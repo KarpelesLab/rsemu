@@ -183,3 +183,33 @@ fn the_region_is_the_span_the_board_maps() {
     assert_eq!(region.len(), REGISTER_SPAN);
     assert!(Device::region(&*swim, "nope").is_none());
 }
+
+/// The cached density is what the tick path reads, and it follows the medium
+/// through every door the medium can change by.
+///
+/// It is derived state and is never serialized: `advance_to` runs once a
+/// scheduler round — fifty thousand times a virtual second while a disk is
+/// turning — and asking the drive would mean cloning a megabyte and a half of
+/// disk every round.
+#[test]
+fn the_cached_density_follows_the_medium() {
+    let swim = Swim::with_drives([true, false]);
+    assert!(!swim.is_mfm(), "an empty drive is not MFM");
+    swim.insert(0, Disk::blank_mfm());
+    assert!(swim.is_mfm());
+    swim.insert(0, Disk::blank(2));
+    assert!(!swim.is_mfm(), "a GCR disk went in over it");
+    swim.insert(0, Disk::blank_mfm());
+    swim.eject(0);
+    assert!(!swim.is_mfm(), "and the drive is empty again");
+
+    // A reset leaves the disk in the drive, so the cache has to come back with
+    // it rather than be assumed.
+    swim.insert(0, Disk::blank_mfm());
+    Device::reset(&swim, crate::core::device::ResetKind::Warm);
+    assert!(
+        swim.has_disk(0),
+        "a disk is a thing in a slot, not a register"
+    );
+    assert!(swim.is_mfm(), "and the cache came back with it");
+}

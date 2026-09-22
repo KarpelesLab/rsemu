@@ -1,11 +1,11 @@
-//! The Macintosh board: the address decode, the VIA, the video circuit, the
-//! SCC and the IWM.
+//! The compact Macintosh boards: the address decode, the VIA, the video
+//! circuit, the SCC, the disk controllers and the Apple Desktop Bus.
 //!
 //! | Module | Feature | What it is |
 //! | --- | --- | --- |
 //! | [`adb`] | `dev-mac` | the Apple Desktop Bus transceiver on the VIA's shift register, and the keyboard and mouse on it |
 //! | [`glue`] | `dev-mac` | the address decoder: the ROM overlay at zero and the RAM window above it |
-//! | [`disk`] | `dev-mac` | the disk in the drive: a 400K or 800K image, raw or in a DiskCopy 4.2 container |
+//! | [`disk`] | `dev-mac` | the disk in the drive: a 400K, 800K or 1.44 MB image, raw or in a DiskCopy 4.2 container |
 //! | [`gcr`] | `dev-mac` | Apple's 6-and-2 group-code recording: the bit stream on an 800K disk |
 //! | [`iwm`] | `dev-mac` | an Integrated Woz Machine and the 400K/800K drive on its cable |
 //! | [`swim`] | `dev-mac` | a SWIM: the IWM's superset, and the SuperDrives that read 1.44 MB media |
@@ -22,12 +22,16 @@
 //! (Apple Computer, 2nd edition) and the parts' own data sheets — Synertek's
 //! SY6522, Zilog's Z8530 and Apple's own IWM specification — and from
 //! black-box traces of what a real ROM touches where those left a question
-//! open. **No Macintosh emulator source was read, and the ROM was not
-//! disassembled** (`ROADMAP.md` §1, `CLAUDE.md`). No byte of any Apple ROM is
-//! in this repository.
+//! open. [`adb`] is the extreme case: no document available to this project
+//! states its link protocol at all, and the whole of it came off the wire.
+//! **No Macintosh emulator source was read, and the ROM was not disassembled**
+//! (`ROADMAP.md` §1, `CLAUDE.md`). No byte of any Apple ROM is in this
+//! repository.
 //!
-//! `docs/platforms/mac-plus.md` has the memory map, the boot ledger and what
-//! is still missing.
+//! Two boards use these. `docs/platforms/mac-plus.md` has the Macintosh Plus's
+//! memory map, its boot ledger and what is still missing;
+//! `docs/platforms/mac-classic.md` has the Macintosh Classic's, and every
+//! measurement the two boards differ by.
 
 pub mod adb;
 pub mod disk;

@@ -7,8 +7,8 @@
 //! from `RSEMU_MAC_ROM_DIR` and a disk image from `RSEMU_MAC_IMG_DIR`, and each
 //! test that wants one skips, saying so, when the variable or the file is not
 //! there. `cargo test` with nothing set passes on a machine that has neither:
-//! the first three tests below need no media at all, because they assemble the
-//! board around rsemu's own ten-byte stub and around a 1.44 MB image of
+//! **three of these nine tests need no media at all**, because they assemble
+//! the board around rsemu's own ten-byte stub and around a 1.44 MB image of
 //! numbered blocks built on the spot.
 //!
 //! What is asserted is about *this emulator*: that the board realizes and
@@ -61,12 +61,17 @@ const ROM_LEN: usize = 512 * 1024;
 /// The picture at 12 virtual seconds on the stock 1 MiB board, with a disk in
 /// the drive.
 ///
-/// The icon **blinks**, so this is a golden of one *phase* of that blink at one
-/// fixed virtual instant. Virtual time is exact, so it is stable — but if it
-/// moves, look at the picture (`RSEMU_MAC_FRAME_DIR`) before accepting a new
-/// hash. It is the same hash `mac-plus` produces for the same phase, and that
-/// is not a coincidence: it is Apple's own icon drawn by Apple's own code into
-/// the same place on the same 512 × 342 screen.
+/// The icon **blinks** — the plain floppy and the same floppy with a question
+/// mark on its face, about a second each way — so this is a golden of one
+/// *phase* of that blink at one fixed virtual instant. Virtual time is exact,
+/// so it is stable; but if it moves, look at the picture
+/// (`RSEMU_MAC_FRAME_DIR`) before accepting a new hash, and check whether the
+/// other phase is what came out. `the_insert_disk_icon_blinks` is the test that
+/// asserts the alternation rather than either picture.
+///
+/// It is the same hash `mac-plus` produces for the same phase, and that is not
+/// a coincidence: it is Apple's own icon drawn by Apple's own code into the
+/// same place on the same 512 × 342 screen, by two ROMs four years apart.
 const GOLDEN_1M: u64 = 0xfbc9_cfa0_9b09_a5da;
 
 /// Where the insert-disk icon lands: a 32 × 32 box a little above the middle of
@@ -89,10 +94,10 @@ struct Board {
 /// The first longword of a Macintosh ROM is the sum of every 16-bit word after
 /// it, and on this one that arithmetic comes out over the **first 256 KiB**:
 /// `$A49F9914`, which is the published identifier for a Classic. The upper half
-/// is real ROM — not a disk image, not zeros, and the ROM does execute in it —
-/// but Apple's own checksum does not reach it. The check is printed rather than
-/// enforced for that reason, and it is arithmetic over bytes this test never
-/// keeps.
+/// is not a disk image and not padding, but Apple's own checksum does not reach
+/// it and nothing measured here says what it is for. The check is printed
+/// rather than enforced for that reason, and it is arithmetic over bytes this
+/// test never keeps.
 fn rom_image(file: &str) -> Option<Vec<u8>> {
     let Ok(dir) = std::env::var("RSEMU_MAC_ROM_DIR") else {
         println!(
@@ -232,7 +237,7 @@ fn board(image: Vec<u8>, params: &[(&str, &str)], disk: Vec<u8>) -> Board {
     }
 }
 
-/// The whole of the ROM the first three tests use: the two longwords a 68000
+/// The whole of the ROM the three hermetic tests use: the two longwords a 68000
 /// fetches out of reset — a stack pointer at the top of the default megabyte
 /// and a program counter at `$000008` — and `BRA .`, the two-byte branch to
 /// itself.
@@ -467,8 +472,10 @@ fn tap(b: &Board, base: u64, stride: u64, window: u64) -> Arc<Tap> {
 /// board assembled around rsemu's own ten-byte stub.
 ///
 /// The addresses are not read off a schematic: they are where a real Macintosh
-/// Classic ROM's two hundred thousand register accesses landed, recorded
-/// through the tap above. `docs/platforms/mac-classic.md` has the histogram.
+/// Classic ROM's 204,667 accesses to the VIA, 384 to the SCC and its handful to
+/// the disk controller actually landed, recorded through the tap above, with
+/// **zero** anywhere the board does not claim.
+/// `docs/platforms/mac-classic.md` has the histogram.
 #[test]
 fn every_chip_answers_where_the_rom_looks() {
     let b = stub_board(Vec::new());
@@ -642,6 +649,38 @@ fn the_rom_boots_to_the_insert_disk_screen() {
         hash, GOLDEN_1M,
         "the frame at 12s moved; look at it (RSEMU_MAC_FRAME_DIR) before accepting the new hash"
     );
+}
+
+/// **And the icon blinks**, which is what says the ROM is in a live
+/// insert-disk loop rather than parked in a two-instruction one.
+///
+/// It alternates between the plain floppy and the same floppy with a question
+/// mark on its face, about a second each way. Asserted through the picture
+/// rather than through a count of register accesses, because a count of
+/// accesses is only a count of accesses.
+#[test]
+fn the_insert_disk_icon_blinks() {
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let mut b = board(image, &[], synthetic_1440k());
+    advance(&mut b, "mac-classic-blink", 11);
+    let mut seen = Vec::new();
+    for s in 12..=17 {
+        advance(&mut b, "mac-classic-blink", 1);
+        seen.push(icon_white(&b));
+        let _ = picture(&b, "mac-classic-blink", s);
+    }
+    println!("mac-classic: icon white counts second by second: {seen:?}");
+    assert!(
+        seen.iter().any(|&n| n != seen[0]),
+        "the insert-disk icon does not blink: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|&n| n > 700),
+        "and it is an icon throughout, not a bare desktop: {seen:?}"
+    );
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
 }
 
 /// The same ROM on a 4 MiB board: it sizes the expansion and moves its screen

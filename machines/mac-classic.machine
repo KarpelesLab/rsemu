@@ -1,16 +1,70 @@
-# mac-classic - a Macintosh Classic (1990). Work in progress.
+# mac-classic - a Macintosh Classic (1990): the map, the VIA, the video, the
+# SCC, the clock chip, the Apple Desktop Bus and the SWIM.
 #
-#   rsemu run mac-classic --media macrom=Classic.ROM --floppy disk.img
+#   rsemu run mac-classic --media macrom=Classic.ROM
+#   rsemu run mac-classic --media macrom=Classic.ROM --floppy System-Startup.img
+#   rsemu run mac-classic -p ram=4M --media macrom=Classic.ROM
+#   rsemu run mac-classic --media macrom=Classic.ROM --vnc :5900
 #
-# The Classic is a compact Macintosh with a SWIM rather than an IWM, so it
-# reads a 1.44 MB high-density disk where a Plus cannot. Everything else about
-# the board is the Plus's shape: a 68000 at 7.8336 MHz, the ROM overlay at
-# zero, a 6522 VIA, a Z8530 SCC, the clock chip, and 512 x 342 one-bit video
-# read out of the top of main memory.
+# A compact Macintosh with three differences from a Plus that matter: a
+# **512 KiB** ROM socket, the **Apple Desktop Bus** where a Plus has its serial
+# keyboard, and a **SWIM** where a Plus has an IWM. The SWIM is why this board
+# exists: a Plus's IWM and 800K mechanism physically cannot read a 1.44 MB
+# disk, and that is what the system software people have is on.
+#
+# The ROM sizes memory, runs its memory test, initialises the SCC, reads the
+# clock chip and writes its parameter RAM back, resets the Apple Desktop Bus
+# and walks all sixteen bus addresses asking each for register 3 - finding the
+# keyboard at 2 and the mouse at 3 - probes the drive, sees that the mechanism
+# is a SuperDrive, asks the SWIM for ISM mode, and then draws the Macintosh's
+# grey desktop with the arrow cursor and the **blinking insert-disk icon**.
+# What it cannot do yet is boot: ISM mode is not modelled, so the controller
+# cannot hand it a sector off the 1.44 MB disk in the slot.
+# `docs/platforms/mac-classic.md` has the ledger and every trace behind it.
+#
+# Everything below that is not the Plus's is a **measurement**, and each one
+# says so where it is: the latching overlay, `PB6` being an output here, and
+# which VIA pins the transceiver's three lines are on.
 #
 # No Macintosh emulator source was consulted and the ROM was not disassembled
 # (ROADMAP.md 1, CLAUDE.md). No byte of any Apple ROM or disk image is in this
 # repository.
+#
+# ---------------------------------------------------------------------------
+# The address map, and that it is the Plus's is a measurement
+# ---------------------------------------------------------------------------
+#
+#   $00 0000 - $3F FFFF   memory, repeating - or the ROM while the overlay is up
+#   $40 0000 - $4F FFFF   ROM, repeating every 512 KiB
+#   $58 0000 - $5F FFFF   SCSI (an NCR 5380) - not modelled; floats
+#   $60 0000 - $7F FFFF   memory while the overlay is up; nothing afterwards
+#   $80 0000 - $9F FFFF   the SCC, read
+#   $A0 0000 - $BF FFFF   the SCC, written
+#   $C0 0000 - $DF FFFF   the SWIM
+#   $E8 0000 - $EF FFFF   the VIA
+#
+# Nothing here was read off a schematic. This board first ran with the Plus's
+# decode and a 512 KiB ROM, and in the first four virtual seconds a real
+# Classic ROM made **zero** accesses to anything the board does not claim,
+# 204,667 to the VIA at $EFE1FE, 384 to the SCC across both its windows, and
+# eleven to the disk controller at $DFE1FF. A map that was wrong anywhere would
+# have shown up in the space's unassigned counter.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately not mapped, and what an access to it does
+# ---------------------------------------------------------------------------
+#
+# $50 0000 - $57 FFFF   nothing
+# $58 0000 - $5F FFFF   the SCSI controller, which this build has no model of
+# $F0 0000 - $FF FFFF   the phase-read space
+#
+# An access to any of them **completes and floats**: the space's `unassigned`
+# policy is `open-bus`. A compact Macintosh has no bus-error timeout at all -
+# /DTACK comes from the address decoder for everything the board claims and the
+# MC68000 user's manual (section 5.4) leaves /BERR to external circuitry a
+# board may omit - and on this board that turned out to matter more than on a
+# Plus: the ROM makes one *word* access to the VIA, and refusing it raised a
+# bus error the ROM had nowhere to take. `src/dev/mac/via.rs` has that one.
 
 machine "mac-classic" {
   # -- how much memory -------------------------------------------------------

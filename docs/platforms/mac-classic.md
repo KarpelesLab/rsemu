@@ -21,7 +21,8 @@ having reset the Apple Desktop Bus, walked all sixteen bus addresses, found the
 keyboard and the mouse, probed the drive, seen that the mechanism is a
 SuperDrive, and asked the SWIM for **ISM mode**. ISM mode is not modelled, so
 it cannot be handed a sector off the 1.44 MB disk in the slot. **That is the
-whole of what is left**, and it is ledger item 1.
+next thing in the way and the first**, and it is ledger item 1 — what is behind
+it is not known, because nothing has got past it to find out.
 
 ## Primary sources
 
@@ -49,11 +50,16 @@ there, and the published identifier for a Macintosh Classic. Over the whole
 512 KiB it comes out at `$78A05CEA`, which is nothing.
 
 So the checksum reaches half the part. The upper half is **not** a disk image
-and not padding: it begins with a `00 01 02 … 0F` table, it is only 4 % zero
-against the lower half's 11 %, and a running ROM **executes in it** — the trace
-below catches the processor at `$434xxx` and `$435xxx`, which is ROM offset
-`$34xxx`. `tests/mac_classic.rs` prints the arithmetic and uses the image
-either way, and the check is over bytes it never keeps.
+and not padding: it begins with a `00 01 02 … 0F` table, it carries no HFS boot
+block or master directory block anywhere in it, and it is only 4 % zero against
+the lower half's 11 %.
+
+What it is *for* was **not** established here, and the honest statement is that
+every program counter any trace in this file caught was below ROM offset
+`$40000` — the furthest was `$435A1E`, which is offset `$35A1E` — so nothing
+measured says the ROM executes up there. `tests/mac_classic.rs` prints the
+arithmetic and uses the whole 512 KiB either way, and the check is over bytes it
+never keeps.
 
 ## The memory map
 
@@ -73,10 +79,13 @@ either way, and the check is over bytes it never keeps.
 
 **It is the Plus's map.** That is a measurement, not an assumption: the first
 thing this board did was run with the Plus's decode and a 512 KiB ROM, and in
-eight virtual seconds the ROM made **zero** accesses to anything the board does
-not claim, 205,000 to the VIA at `$EFE1FE`, 384 to the SCC in both its windows,
-and 246 to the disk controller at `$DFE1FF`. A map that was wrong anywhere
-would have shown up in the unassigned counter.
+the first four virtual seconds the ROM made **zero** accesses to anything the
+board does not claim, **204,667** to the VIA at `$EFE1FE`, **384** to the SCC
+across both its windows (352 reads in the read window, 32 writes in the write
+one), and eleven to the disk controller at `$DFE1FF`. Later, past the ADB
+handshake and with a disk in the slot, the controller's count goes to 246. A
+map that was wrong anywhere would have shown up in the unassigned counter, and
+it reads zero at every point that was measured.
 
 Everything the board does not claim **completes and floats**: the space's
 `unassigned` policy is `open-bus`. A compact Macintosh has no bus-error timeout
@@ -185,7 +194,7 @@ the last thing the ROM ever does is
 and then, for ever, nothing but the vertical-blanking handler — `IFR`, `IER`,
 `IFR = $02`, sixty times a second.
 
-Two things follow with no room for doubt.
+Three things follow with no room for doubt.
 
 * **The clock is the transceiver's.** `ACR = $1C` is the 6522's only shift-out
   mode that takes its clock from CB1 as an *input*; the computer cannot be
@@ -366,8 +375,10 @@ No access faults, the processor never double-faults, the video circuit produces
 
 ## The ledger: what to build next, in the order it is likely to matter
 
-1. **ISM mode, and it is the only thing between this board and a booting
-   Macintosh.** Everything under it is here and tested: the disk goes in, it
+1. **ISM mode.** It is the next thing between this board and a booting
+   Macintosh, and the only one anything has been able to see; what is behind it
+   is unknown, because nothing has got past it. Everything *under* it is here
+   and tested: the disk goes in, it
    becomes MFM cells, it turns at 300 rpm under a head the ROM can step, and the
    ROM has already asked for the mode. What is missing is the chip's own register
    file behind that request — the MFM separator, the sector-search engine, the
@@ -415,10 +426,10 @@ available. The instruments, in the order they earned their keep:
   word the processor fetched and the board never started.
 * **Fold the trace before reading it.** Half a million accesses is not a trace
   anybody can read. Collapsing runs of the identical access into one line with a
-  count turned 205,000 VIA accesses into a few hundred lines, and the ADB
+  count turned two hundred thousand VIA accesses into a few hundred lines, and the ADB
   sequence was visible in the last eight of them.
 * **A per-register histogram beats a count of accesses.** "The ROM touched the
-  VIA 205,000 times" says nothing; "it wrote `ACR` seven times with `$00`, `$1C`
+  VIA two hundred thousand times" says nothing; "it wrote `ACR` seven times with `$00`, `$1C`
   and `$0C`, and `SR` once" says the whole protocol.
 * **Verify writes by reading them back.** The overlay defect was invisible in
   the access log — every access looked ordinary — and obvious the moment the tap
@@ -438,10 +449,12 @@ available. The instruments, in the order they earned their keep:
   access address and the instruction register. `$4E75` and an odd address named
   the defect in one line, after two hours of looking at everything else.
 * **Compare against the sibling board.** Every "is this the Classic or is this
-  us?" question was answered by running the same instrument on `mac-plus`: the
-  Plus's ROM writes `DDRB = $87` where the Classic writes `$C7`, `$17` to the
-  mode register where the Classic writes `$57`, and never touches `PA4` twice.
-  Two ROMs on one board is the cheapest differential test there is.
+  us?" question was answered against `mac-plus`, whose own page records what a
+  Plus ROM does: it writes `DDRB = $87` and polls `PB6` where the Classic writes
+  `$C7` and drives it, and `$17` to the mode register where the Classic writes
+  `$57`. It cannot be re-asserting `PA4` either, because `mac-plus` runs on a
+  *level* overlay and its goldens have not moved. Two ROMs over one board is
+  the cheapest differential test there is.
 
 ## Running it
 
@@ -469,7 +482,7 @@ RSEMU_MAC_FRAME_DIR=/tmp/frames \
 ```
 
 `RSEMU_MAC_TRACE=1` prints the processor's state once a virtual second, which is
-how to find where a ROM stopped. Three of the eight tests need nothing of
-anybody's: they assemble the board around rsemu's own ten-byte stub and around a
-1.44 MB image of numbered blocks built on the spot, and they are what `cargo
+how to find where a ROM stopped. **Three of the nine tests need nothing of
+anybody's**: they assemble the board around rsemu's own ten-byte stub and around
+a 1.44 MB image of numbered blocks built on the spot, and they are what `cargo
 test` runs in CI.

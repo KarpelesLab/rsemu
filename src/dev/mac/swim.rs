@@ -75,7 +75,7 @@ use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionKind, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{AtomicU64, Ordering};
+use crate::core::sync::{AtomicBool, AtomicU64, Ordering};
 use crate::core::wire::WireId;
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
@@ -129,6 +129,15 @@ pub struct Swim {
     region: RegionRef,
     /// Ticks of this device's clock — MFM cells — simulated.
     ticks: AtomicU64,
+    /// Whether what is in drive 0 is MFM, cached without a lock.
+    ///
+    /// [`Swim::advance_to`] runs once a scheduler round — fifty thousand times
+    /// a virtual second while a disk is turning — and asking the drive would
+    /// mean taking a lock and **cloning the disk**, which for a 1.44 MB image
+    /// is a megabyte and a half a round. So the one bit that matters is kept
+    /// here and refreshed wherever the medium can change: insert, eject, reset
+    /// and load.
+    mfm: AtomicBool,
 }
 
 impl Swim {
@@ -186,11 +195,16 @@ impl Swim {
             iwm,
             region,
             ticks: AtomicU64::new(0),
+            mfm: AtomicBool::new(false),
         }
     }
 
-    /// The IWM this chip is a superset of, for a test that wants to look at the
-    /// drive or the shifter.
+    /// The IWM this chip is a superset of, for a caller that wants to look at
+    /// the drive or the shifter.
+    ///
+    /// **Look, do not insert.** [`Swim::insert`] and [`Swim::eject`] refresh
+    /// the density this chip's tick path reads; going round them through here
+    /// would leave a 1.44 MB disk being shifted at an 800K disk's rate.
     #[must_use]
     pub fn iwm(&self) -> &Arc<Iwm> {
         &self.iwm
@@ -216,11 +230,23 @@ impl Swim {
     /// Put `disk` in drive `which`, taking out whatever was there.
     pub fn insert(&self, which: usize, disk: Disk) {
         self.iwm.insert(which, disk);
+        self.note_density();
     }
 
     /// Take the disk out of drive `which`.
     pub fn eject(&self, which: usize) {
         self.iwm.eject(which);
+        self.note_density();
+    }
+
+    /// Refresh the cached density of drive 0. Called wherever the medium can
+    /// change, and never on the tick path.
+    fn note_density(&self) {
+        let mfm = self
+            .iwm
+            .disk(0)
+            .is_some_and(|d| d.density() == Density::Mfm);
+        self.mfm.store(mfm, Ordering::Relaxed);
     }
 
     /// Whether drive `which` has a disk in it.
@@ -247,6 +273,13 @@ impl Swim {
         self.iwm.disk(which).map(|d| d.density())
     }
 
+    /// Whether what is in drive 0 is MFM, off the cached bit rather than out of
+    /// the drive. The tick path's question.
+    #[must_use]
+    pub fn is_mfm(&self) -> bool {
+        self.mfm.load(Ordering::Relaxed)
+    }
+
     /// Ticks of this device's clock — MFM cells — simulated.
     #[must_use]
     pub fn ticks(&self) -> u64 {
@@ -266,19 +299,21 @@ impl Swim {
 
     /// This chip's tick count in the units the IWM inside it counts.
     fn inner_tick(&self, tick: u64) -> u64 {
-        match self.density(0) {
-            Some(Density::Mfm) => tick,
+        if self.is_mfm() {
+            tick
+        } else {
             // No disk, or a GCR one: 500 kHz cells.
-            _ => tick / GCR_DIVISOR,
+            tick / GCR_DIVISOR
         }
     }
 
     /// And the other way, so an event the IWM names lands on one of this
     /// chip's ticks.
     fn outer_tick(&self, tick: u64) -> u64 {
-        match self.density(0) {
-            Some(Density::Mfm) => tick,
-            _ => tick.saturating_mul(GCR_DIVISOR),
+        if self.is_mfm() {
+            tick
+        } else {
+            tick.saturating_mul(GCR_DIVISOR)
         }
     }
 }
@@ -294,6 +329,9 @@ impl Device for Swim {
 
     fn reset(&self, kind: ResetKind) {
         Device::reset(&*self.iwm, kind);
+        // A disk stays in the drive across a reset, but the cache is derived
+        // state and is rebuilt rather than assumed.
+        self.note_density();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -305,6 +343,8 @@ impl Device for Swim {
         let ticks = r.read_u64()?;
         Device::load(&*self.iwm, r)?;
         self.ticks.store(ticks, Ordering::Relaxed);
+        // Derived state, never serialized (`CLAUDE.md`, *Devices*).
+        self.note_density();
         Ok(())
     }
 
