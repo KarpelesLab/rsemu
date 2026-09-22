@@ -318,18 +318,18 @@ fn point_at(b: &mut Board, x: u32, y: u32, buttons: u8) -> (u32, u32) {
     // the cursor was already there, and *nothing at all is sent* — which is
     // what it did, and it looked exactly like a machine that had stopped
     // polling its bus.
-    let (at_x, at_y) = pointer_at(b);
-    b.pointer.deliver(InputEvent::Pointer {
-        x: at_x,
-        y: at_y,
-        buttons: 0,
-    });
     for _ in 0..600 {
-        b.pointer.deliver(InputEvent::Pointer { x, y, buttons });
-        step_ms(b, 20);
-        if pointer_at(b) == (x, y) {
+        let at = pointer_at(b);
+        if at == (x, y) {
             break;
         }
+        // Take the guest's own idea of where the pointer is as the truth, then
+        // step toward the target. Without this the sink converges to the
+        // target on *its* books while the guest is still short, because the
+        // ROM's cursor task scales and drops counts of its own.
+        b.pointer.resync(at.0, at.1);
+        b.pointer.deliver(InputEvent::Pointer { x, y, buttons });
+        step_ms(b, 20);
     }
     pointer_at(b)
 }
@@ -338,10 +338,21 @@ fn point_at(b: &mut Board, x: u32, y: u32, buttons: u8) -> (u32, u32) {
 /// release.
 fn click_at(b: &mut Board, x: u32, y: u32) {
     point_at(b, x, y, 0);
-    point_at(b, x, y, 1);
-    step_ms(b, 200);
-    point_at(b, x, y, 0);
-    step_ms(b, 200);
+    // `MBState` at `$172` is `$00` with the button down and `$80` with it up
+    // — a low-memory global the ROM keeps, which is data rather than code, and
+    // the same one `tests/mac_plus.rs` reads.
+    let up = peek(b, 0x172) >> 24;
+    b.pointer.deliver(InputEvent::Pointer { x, y, buttons: 1 });
+    step_ms(b, 300);
+    let down = peek(b, 0x172) >> 24;
+    step_ms(b, 300);
+    b.pointer.deliver(InputEvent::Pointer { x, y, buttons: 0 });
+    step_ms(b, 300);
+    let again = peek(b, 0x172) >> 24;
+    println!(
+        "mac-classic: clicked at ({x}, {y}); MBState {up:#04x} -> {down:#04x} -> {again:#04x}"
+    );
+    step_ms(b, 500);
 }
 
 /// The whole of the ROM the three hermetic tests use: the two longwords a 68000
@@ -1444,6 +1455,66 @@ fn blank_800k() -> Vec<u8> {
 /// x = 390 and y = 146 to y = 170.
 const INITIALIZE: (u32, u32) = (350, 158);
 
+/// And of the **Erase** button of the dialog that follows it — "This process
+/// will erase all information on this disk", with Cancel on the left and Erase
+/// on the right, in the same place.
+const ERASE: (u32, u32) = (350, 158);
+
+/// And of the **OK** button of "Please name this disk:", which is the last one
+/// before the Macintosh starts laying a format down.
+const NAME_OK: (u32, u32) = (252, 158);
+
+/// **The pointer goes where it is put**, under a running Finder.
+///
+/// The acceptance test for the Apple Desktop Bus input path, and it is about
+/// the guest's own arithmetic rather than ours: `Mouse` at `$830` is a
+/// low-memory global the ROM's cursor task maintains, and what this asserts is
+/// that a host position posted through [`MacAdbSink`] ends up there.
+///
+/// Two things had to be true for it and neither was:
+///
+/// * **The transceiver has to speak first.** A Macintosh running Mac OS 6.0.8
+///   sits at state 3 in shift-in mode and starts no transaction at all, so a
+///   device with something to say has to clock a byte at it —
+///   `mac.adb`'s `State::unsolicited` has the measurement.
+/// * **A reply is spent once it has been read**, or the computer's follow-up
+///   Talk reads the same movement again and the pointer travels twice as far.
+///
+/// The margin is two pixels because the ROM loses about one count in three
+/// hundred, which `docs/platforms/mac-plus.md` traces to Apple's own code:
+/// the cursor task reads `MTemp`, scales it and writes it back at interrupt
+/// mask 0, so a count the level-2 handler adds inside that window is lost. A
+/// real Macintosh loses it too.
+#[test]
+fn the_pointer_goes_where_it_is_put() {
+    let Some(image) = rom_image("Classic.ROM") else {
+        return;
+    };
+    let disk = disk_image("MacOS_6.0.8_System_Startup.img");
+    if disk.is_empty() {
+        println!("mac-classic: no system disk, so there is no Finder to point at; skipped");
+        return;
+    }
+    let mut b = board(image, &[], disk);
+    advance(&mut b, "mac-classic-pointer", BOOT_SECONDS);
+    println!("mac-classic: the boot cursor rests at {:?}", pointer_at(&b));
+
+    for (x, y) in [(350u32, 158u32), (100, 40), (470, 300), (12, 300)] {
+        let at = point_at(&mut b, x, y, 0);
+        let counts = b.adb.bus().counters();
+        println!(
+            "mac-classic: the pointer was sent to ({x}, {y}) and the ROM has it at {at:?}; \
+             reports {} polls {} answered {} bytes out {} of which the pull-up {}",
+            counts.reports, counts.polls, counts.answered, counts.sent, counts.sent_empty
+        );
+        assert!(
+            at.0.abs_diff(x) <= 2 && at.1.abs_diff(y) <= 2,
+            "the pointer was sent to ({x}, {y}) and the ROM has it at {at:?}"
+        );
+    }
+    assert_eq!(b.cpu.bus_faults().0, 0, "an access faulted");
+}
+
 /// A trace instrument: what a booted Macintosh does with a **blank 800K disk
 /// in its external drive**.
 ///
@@ -1470,9 +1541,16 @@ fn a_blank_disk_in_the_second_drive() {
     let mut b = board(image, &[("drives", "2")], bytes);
     // Through the handle rather than through a media slot: no shipped machine
     // file names one for the external drive (`src/dev/mac/swim.rs` says why).
+    // `RSEMU_MAC_BLANK=1440k` puts a high-density blank in instead, which is
+    // the differential that says whether the Macintosh is formatting for the
+    // *medium* or for the drive.
+    let blank = match std::env::var("RSEMU_MAC_BLANK").as_deref() {
+        Ok("1440k") => vec![0u8; mfm::BYTES],
+        _ => blank_800k(),
+    };
     b.swim.insert(
         1,
-        Disk::from_image_for(&blank_800k(), Reader::Swim).expect("an 800K image"),
+        Disk::from_image_for(&blank, Reader::Swim).expect("a blank image"),
     );
     assert!(b.swim.has_disk(1), "the blank disk went into drive 2");
 
@@ -1512,7 +1590,16 @@ fn a_blank_disk_in_the_second_drive() {
     );
     let _ = picture(&b, "mac-classic-two", 900);
     click_at(&mut b, INITIALIZE.0, INITIALIZE.1);
-    for s in 1..=60 {
+    let _ = picture(&b, "mac-classic-two", 901);
+    // "This process will erase all information on this disk", with **Erase**
+    // in the same place Initialize was.
+    click_at(&mut b, ERASE.0, ERASE.1);
+    let _ = picture(&b, "mac-classic-two", 902);
+    // "Please name this disk: Untitled", with a lone **OK**. The name is left
+    // as the Mac's own default: this is the machine's disk, not ours.
+    click_at(&mut b, NAME_OK.0, NAME_OK.1);
+    let _ = picture(&b, "mac-classic-two", 903);
+    for s in 1..=120 {
         advance(&mut b, "mac-classic-two", 1);
         if s % 5 == 0 {
             let _ = picture(&b, "mac-classic-two", 1000 + s);
@@ -1637,13 +1724,57 @@ fn does_the_system_poll_the_bus() {
         "mac-classic: the bus addresses are {:?}",
         b.adb.bus().addresses()
     );
+    // One report, traced: the transceiver's own state sampled every five
+    // microseconds and folded, so the order of the state lines, of `answered`
+    // and of the bytes leaving is visible rather than inferred. This is the
+    // instrument that found what an unsolicited byte has to be — the computer
+    // drives states 1 and 2 *five times over* reading the pull-up before it
+    // gives up, which is not what a machine answering a doorbell does.
+    {
+        b.adb.bus().mouse(4, 0, false);
+        let mut seen: Vec<(u8, u8, bool, u8, bool, u64)> = Vec::new();
+        for _ in 0..4000 {
+            b.machine
+                .run_for(GlobalTime::from_nanos(5_000))
+                .expect("it runs");
+            let (lines, slot, answered, command, busy) = b.adb.bus().probe();
+            let p = (
+                lines,
+                slot,
+                answered,
+                command,
+                busy,
+                b.adb.bus().counters().sent,
+            );
+            if seen.last() != Some(&p) {
+                seen.push(p);
+            }
+        }
+        println!("mac-classic: the transceiver across one report:");
+        for (lines, slot, answered, command, busy, sent) in seen.iter().take(32) {
+            println!(
+                "  state {lines}  slot {slot}  answered {answered}  command {command:02x}  \
+                 busy {busy}  sent {sent}"
+            );
+        }
+    }
+
     for (dx, dy) in [(4i8, 0i8), (4, 0), (0, 4), (-4, 0), (0, -4)] {
         let before = pointer_at(&b);
+        let counts = b.adb.bus().counters();
         b.adb.bus().mouse(dx, dy, false);
         step_ms(&mut b, 100);
+        let after = b.adb.bus().counters();
         println!(
-            "mac-classic: mouse({dx}, {dy}) moved the pointer {before:?} -> {:?}",
-            pointer_at(&b)
+            "mac-classic: mouse({dx}, {dy}) moved the pointer {before:?} -> {:?}; \
+             reports {} polls {} answered {} sent {} of which empty {}; last four out {:08x}",
+            pointer_at(&b),
+            after.reports - counts.reports,
+            after.polls - counts.polls,
+            after.answered - counts.answered,
+            after.sent - counts.sent,
+            after.sent_empty - counts.sent_empty,
+            after.last_four,
         );
     }
 

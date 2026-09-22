@@ -183,6 +183,24 @@ impl MacAdbSink {
         }
     }
 
+    /// Take `(x, y)` as where the guest's pointer *actually* is, without
+    /// sending anything.
+    ///
+    /// A relative mouse and an absolute host cursor can only agree if
+    /// something puts them back together, because a guest scales and loses
+    /// counts of its own — Apple's cursor task drops about one in three
+    /// hundred, and `docs/platforms/mac-plus.md` traces that to Apple's own
+    /// code. A Plus has no cheap way to ask, so `tests/mac_plus.rs` sweeps
+    /// into a screen corner, where the ROM's clamp pins both ends together. A
+    /// Macintosh with ADB can simply be asked: `Mouse` at `$830` is a
+    /// low-memory global, and a caller that reads it can hand it back here and
+    /// close the loop. That is what a person's eyes do.
+    pub fn resync(&self, x: u32, y: u32) {
+        let mut at = self.at.lock();
+        let buttons = at.map_or(0, |(_, _, b)| b);
+        *at = Some((i64::from(x), i64::from(y), buttons));
+    }
+
     /// Move the mouse on the first Apple Desktop Bus this build opened, if it
     /// has one.
     #[must_use]
@@ -205,8 +223,21 @@ impl InputSink for MacAdbSink {
         let (dx, dy, moved_buttons) = {
             let mut at = self.at.lock();
             let (px, py, pb) = at.unwrap_or((x, y, 0));
-            let dx = (x - px).clamp(-MAX_COUNTS, MAX_COUNTS);
-            let dy = (y - py).clamp(-MAX_COUNTS, MAX_COUNTS);
+            // **The budget is shared between the axes**, because the ROM's
+            // threshold is on the two together rather than on each: a
+            // diagonal of four and four is over it where four on one axis
+            // alone is not. `mac.mouse` does the same thing for a Plus —
+            // "both axes moving step at half rate each" — and without it a
+            // pointer sent diagonally arrives at twice the distance and pins
+            // in a corner, which is exactly what it did.
+            let want = ((x - px), (y - py));
+            let each = if want.0 != 0 && want.1 != 0 {
+                MAX_COUNTS / 2
+            } else {
+                MAX_COUNTS
+            };
+            let dx = want.0.clamp(-each, each);
+            let dy = want.1.clamp(-each, each);
             // Advance by what is being sent, so the rest is still owed.
             *at = Some((px + dx, py + dy, buttons));
             (dx, dy, pb != buttons)

@@ -112,16 +112,33 @@ fn an_unanswered_talk_reads_as_all_ones() {
     assert_eq!(link.receive(2), 0xff, "and its low one");
 }
 
-/// A key movement makes the transceiver ask for attention, and the next Talk 0
-/// of the keyboard's address hands the transition over.
+/// A key movement makes the transceiver **announce** it — it polls the device
+/// itself and clocks the command it used at the idle computer — and the two
+/// data bytes follow at states 1 and 2.
+///
+/// That is the shape the computer expects, and it is measured rather than
+/// assumed: see `State::unsolicited`. A transceiver that only answered a Talk
+/// the computer started never got one, because a Macintosh running Mac OS
+/// 6.0.8 sits in shift-in mode at state 3 and starts nothing.
 #[test]
-fn a_key_is_reported_through_talk_zero() {
+fn a_key_is_announced_and_then_handed_over() {
     let mut link = Link::new();
     link.adb.press(0x24, true);
     let (_, _, int) = link.adb.lines();
     assert!(int, "the attention line went low");
+
+    // The announcement: the transceiver clocks a byte at the computer without
+    // being asked, and it is the command it polled the keyboard with.
+    link.run(START_TICKS + 8 * BIT_TICKS + BIT_TICKS);
+    let (last, sent, _) = link.adb.last_exchange();
     let command = (cmd::ADDR_KEYBOARD << 4) | (cmd::TALK << 2);
-    link.send(0, command);
+    assert_eq!(
+        sent, command,
+        "the transceiver announced Talk 0 of address 2"
+    );
+    assert_eq!(last, command);
+
+    // And the reply is already waiting behind it.
     let first = link.receive(1);
     let second = link.receive(2);
     assert_eq!(first, 0x24, "the key transition");
@@ -156,8 +173,9 @@ fn send_reset_puts_the_devices_back() {
 fn the_mouse_reports_a_movement() {
     let mut link = Link::new();
     link.adb.mouse(3, -2, true);
-    let command = (cmd::ADDR_MOUSE << 4) | (cmd::TALK << 2);
-    link.send(0, command);
+    // The transceiver announces it, as `a_key_is_announced_and_then_handed_over`
+    // asserts in full; here what matters is the two bytes behind it.
+    link.run(START_TICKS + 8 * BIT_TICKS + BIT_TICKS);
     let first = link.receive(1);
     let second = link.receive(2);
     assert_eq!(first & 0x80, 0, "the button is down, so bit 7 is clear");

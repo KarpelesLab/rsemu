@@ -624,10 +624,50 @@ startup volume, and at about ninety virtual seconds puts up
   initialize it?                                   [ Eject ]   [ Initialize ]
 ```
 
-which is the machine offering to do exactly what this route needs. Clicking
-**Initialize** needs a pointer, and ledger item 3 is why that does not work
-yet. `tests/mac_classic.rs::a_blank_disk_in_the_second_drive` is the instrument
-and it leaves the picture behind.
+which is the machine offering to do exactly what this route needs — and the
+pointer can now click it. `a_blank_disk_in_the_second_drive` drives the whole
+dialogue:
+
+```text
+  This disk is improperly formatted for use in this drive. Do you want to
+  initialize it?                                   [ Eject ]   [ Initialize ]
+      -> This process will erase all information on this disk.
+                                                   [ Cancel ]  [ Erase ]
+      -> Please name this disk:  [ Untitled ]      [ OK ]
+      -> Formatting disk...
+      -> Initialization failed!                    [ OK ]
+```
+
+**Three clicks land, the Macintosh steps the head to cylinder 40 and starts
+laying a format down, and then it gives up.** That is the wall this pass ends
+at, and it is a sharp one.
+
+What is measured about it:
+
+* The format goes through the **ISM** register set — 4,376 writes of the Data
+  register, 36 of Mark and 13 of CRC on drive 2, with 9,837 reads of the
+  handshake between them — and the ROM **never writes the Setup register** for
+  it, so the chip stays in whatever mode the 1.44 MB path left it in.
+* It stops about a third of a track in: 4,376 data bytes against the ~12,500 a
+  1.44 MB cylinder holds.
+* `Disk::absorb` recovers **nothing**, so no field the head laid down decoded
+  as a readable sector with a good CRC.
+* **It is not the medium.** A 1.44 MB blank in the same drive fails in exactly
+  the same way, which rules out the obvious first guess — that the Macintosh
+  was formatting a double-density disk as high-density because nothing on the
+  cable tells it which is in there. (That line would be the unassigned drive
+  register at `CA2:CA1:CA0 = 101` with `SEL` low, which this file already
+  records as a line whose purpose was never established. It is still not
+  established, and it is not this.)
+
+The likeliest next question, and it is a question rather than an answer: this
+model raises the ISM's **underrun** bit whenever the write head reaches a byte
+boundary with an empty buffer, and the handshake register's error bit with it.
+Over a single sector — which is what Mac OS writes during a boot, and what
+works — the processor is never late. Over a whole track it will be, and a
+formatter that reads the error bit would abort exactly where this one does.
+Whether a real ISM sets the bit as freely is not something any page here
+settles.
 
 ## The ledger: what to build next, in the order it is likely to matter
 
@@ -662,13 +702,15 @@ and it leaves the picture behind.
    still in the drive at the end of the boot.
 2. ~~**Writing to a disk.**~~ **Built**, and Apple's own code is what proves
    it. See "The write path", below.
-3. **The pointer moves, and it goes the wrong way.** This is the one to pick
-   up next, and most of it is now measured.
+3. ~~**The pointer.**~~ **Built, and it lands where it is put.**
+   `tests/mac_classic.rs::the_pointer_goes_where_it_is_put` boots to the Finder
+   and drives the pointer to four places on the screen — (350, 158), (100, 40),
+   (470, 300), (12, 300) — and `Mouse` at `$830`, the ROM's own low-memory
+   global, holds **exactly** each of them.
 
-   `src/host/input/mac.rs` grew a `MacAdbSink`, the Apple Desktop Bus
-   counterpart of the sink a Plus's quadrature mouse has: an absolute host
-   position in, at most four counts an axis a report out, the rest owed to the
-   next report. That was the easy half.
+   `src/host/input/mac.rs` grew `MacAdbSink`, the Apple Desktop Bus counterpart
+   of the sink a Plus's quadrature mouse has. Getting a count from it to the
+   guest took four measurements and each is written where it belongs.
 
    **The system does not poll the bus, and pulling the attention line does not
    make it.** Read through the VIA with a debugger once Mac OS 6.0.8 is up:
@@ -685,29 +727,42 @@ and it leaves the picture behind.
    longer changes nothing. The computer is not watching a pin. It is sitting in
    shift-in mode waiting for a **byte**.
 
-   Clock one at it and the machine wakes up: **seventy-two ADB transactions a
-   virtual second**, `ORB = $4f` with `SR = $3c` — Talk 0 of address 3, the
-   mouse — then states 1, 2 and 3, and `Mouse` at `$830` starts moving.
-   `State::unsolicited` is that, and the differential says the byte's *value*
-   is not what matters: `$3C` and `$FF` both start it and the computer issues
-   its own `$3C` either way.
+   **And the byte is the command of a reply, not a doorbell.** The instrument
+   that settled it is the one `tests/mac_plus.rs` earned on the other machine:
+   count the stages rather than the ends — reports in, polls, answers, bytes
+   out — and the one that drops is the answer. Here none of them dropped. One
+   report, one poll, the mouse answering it, **ten bytes out and every one of
+   the ten the pull-up**; and the pointer crept one pixel up and left per
+   report, which is `$FF $FF` read as (−1, −1). A five-microsecond trace of the
+   transceiver's own state showed why: given a byte with nothing behind it the
+   computer drives states 1 and 2 *five times over*, reading `$FF` each time,
+   before giving up. It is not answering a doorbell with a transaction — it is
+   collecting a reply it believes has already been polled. So the transceiver
+   polls the device itself and hands over the command it used.
 
-   **What is still wrong**: every poll delivers `$FF $FF`, which the Macintosh
-   reads as a mouse report of (-1, -1) with the button up, so the pointer
-   creeps to the top left corner and stays there. Posting `mouse(4, 0)`,
-   `mouse(0, 4)`, `mouse(-4, 0)` — any of them, one report each — moves the
-   pointer by exactly (-1, -1), so **the device's data is not reaching the
-   transfer at all**; the bus addresses are still `[2, 3]`, so it is not that
-   the System moved the devices. The transceiver's `answered` flag is the
-   thing to look at: `ask_for_attention` clears it to set the unsolicited byte
-   up, and a poll that arrives while that byte is still going across abandons
-   the transfer with `unsolicited` still set, which then makes the *next*
-   transfer end in the wrong phase. That is a hypothesis, not a measurement,
-   and the next session should instrument the transceiver's own phase across
-   one poll before changing anything.
+   **A reply is spent once it has been read**, or the computer's own follow-up
+   Talk reads the same movement a second time and the pointer travels twice as
+   far.
 
-   None of this is reachable from `rsemu run` yet: nothing wires `MacAdbSink`
-   into the VNC or CLI front ends, so the board behaves exactly as it did.
+   **Movement accumulates until it is read.** A report that arrives while the
+   link is busy used to be dropped: the pointer arrived twenty-seven pixels
+   short and fourteen of a hundred and twenty reports had never been answered.
+   The mouse now counts, and an announcement the link was too busy for is
+   *owed* and goes out when it next falls idle. With both, 531 of 532 reports
+   are answered.
+
+   **The budget is shared between the axes**, because the ROM's threshold is on
+   the two together: a diagonal of four and four is over it where four on one
+   axis alone is not, and a pointer sent diagonally arrived at twice the
+   distance and pinned in a corner.
+
+   What is left over is Apple's own loss — the cursor task reads `MTemp`,
+   scales it and writes it back at interrupt mask 0 — so the seam offers
+   `MacAdbSink::resync`, which takes the guest's `Mouse` global as the truth.
+   A Plus has no cheap way to ask and sweeps into a screen corner instead.
+
+   Nothing wires `MacAdbSink` into the VNC or CLI front ends yet, so
+   `rsemu run mac-classic` behaves exactly as it did.
 4. **A host keymap.** `mac.adb` carries a keyboard at address 2
    and a mouse at address 3 and will report a key transition or a movement
    through Talk 0, and `mac.mouse` now drives the pointer — but nothing turns a

@@ -287,12 +287,16 @@ struct State {
     /// the computer can take CB2 back in no guest time at all once its shift
     /// register's count completes.
     latched: bool,
+    /// Movement the mouse has counted and nobody has read yet, in the seven
+    /// bits two's complement its register 0 carries. See [`State::mouse`].
+    owed_x: i16,
+    owed_y: i16,
     /// Whether the attention line is being pulled low.
     int_low: bool,
-    /// Whether the byte going across is an **unsolicited** one: the
-    /// transceiver clocking the idle computer's shift register because a
-    /// device has something to say, rather than a byte of a transaction the
-    /// computer started.
+    /// The **unsolicited** byte going across, or zero: the transceiver
+    /// clocking the idle computer's shift register because a device has
+    /// something to say, rather than a byte of a transaction the computer
+    /// started.
     ///
     /// # Why this exists, and it is a measurement
     ///
@@ -321,12 +325,28 @@ struct State {
     /// `$3C` either way. What matters is that a byte arrives, because that is
     /// what sets the VIA's shift-register flag.
     ///
-    /// Two things are therefore **inferred** rather than measured: that a real
-    /// transceiver drives nothing on the data line while it does this (the
-    /// value is not load-bearing, and `$FF` is what this file already answers
-    /// for a bus nobody is driving), and that one byte is what it sends rather
-    /// than two. Neither is distinguishable from outside at the rates tested.
-    unsolicited: bool,
+    /// **What the byte is** was settled by the same instrument, one stage at a
+    /// time — count the reports, the polls, the answers and the bytes that
+    /// leave, and the one that drops is the answer. Here none of them dropped:
+    /// one report, one poll, one device answering it, and ten bytes out — and
+    /// **every one of the ten was the pull-up**. A byte with nothing behind it
+    /// wakes the computer and then leaves it retrying: the trace shows it
+    /// driving states 1 and 2 *five times over*, reading `$FF` each time,
+    /// before giving up and starting a transaction of its own that it then
+    /// abandons.
+    ///
+    /// So the computer does not treat an unsolicited byte as a doorbell to
+    /// answer with a transaction. It treats it as the **command byte of a
+    /// reply it must now collect**, and goes straight to states 1 and 2 for
+    /// the two data bytes. The transceiver therefore polls the device itself
+    /// and hands the computer the command it used, with the reply already
+    /// waiting behind it.
+    ///
+    /// One thing is still **inferred**: that the byte is that command rather
+    /// than some status of the transceiver's own. What is measured is that a
+    /// byte with a reply behind it works, a byte without one does not, and
+    /// that the computer's own next act is to read two data bytes.
+    unsolicited: u8,
     /// The tick the attention line may go back up on.
     int_until: u64,
     /// The command byte of the transaction in progress.
@@ -346,10 +366,42 @@ struct State {
     keys: VecDeque<u8>,
     /// How many command bytes the computer has sent — one per transaction.
     transactions: u64,
+    /// Four places one report has to pass, counted separately.
+    ///
+    /// The instrument `tests/mac_plus.rs` used to settle where a mouse's
+    /// counts were going, on the other Macintosh: count the *stages* rather
+    /// than the ends, and the one that drops is the answer. There, all four
+    /// turning out equal was itself the finding.
+    ///
+    /// In order: a report handed to the transceiver, a Talk of a device's
+    /// register 0, one of those a device answered, and a byte the transceiver
+    /// actually shifted out to the computer.
+    counts: Counters,
     /// The last command byte, and the last byte sent each way, for the same.
     last_command: u8,
     last_sent: u8,
     last_received: u8,
+}
+
+/// Where one input report can go missing between the host and the computer.
+///
+/// Four counters, one per stage, so a rate can be quoted rather than a verdict
+/// (`tests/mac_plus.rs` is where this instrument was first earned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Counters {
+    /// Reports the host handed the transceiver: a movement or a key.
+    pub reports: u64,
+    /// Talks of a device's register 0 the computer issued.
+    pub polls: u64,
+    /// How many of those a device answered.
+    pub answered: u64,
+    /// Bytes the transceiver shifted out to the computer, in any transfer.
+    pub sent: u64,
+    /// How many of those were the pulled-up bus rather than a device's:
+    /// `$FF`, which is what a transfer with nobody answering puts on the wire.
+    pub sent_empty: u64,
+    /// The last four bytes shifted out, oldest in the high byte.
+    pub last_four: u32,
 }
 
 /// How many key transitions the keyboard holds while nobody is asking.
@@ -369,8 +421,10 @@ impl State {
             data_low: false,
             line_low: false,
             latched: false,
+            owed_x: 0,
+            owed_y: 0,
             int_low: false,
-            unsolicited: false,
+            unsolicited: 0,
             int_until: 0,
             command: 0,
             slot: Slot::Command,
@@ -380,6 +434,7 @@ impl State {
             devices: [BusDevice::keyboard(), BusDevice::mouse()],
             keys: VecDeque::new(),
             transactions: 0,
+            counts: Counters::default(),
             last_command: 0,
             last_sent: 0,
             last_received: 0,
@@ -428,7 +483,7 @@ impl State {
         // The computer has taken the link over, so an unsolicited byte that was
         // still going across is abandoned — and the flag has to go with it, or
         // the *transaction's* last transfer would end in the wrong phase.
-        self.unsolicited = false;
+        self.unsolicited = 0;
         match lines {
             0 => {
                 self.slot = Slot::Command;
@@ -460,6 +515,7 @@ impl State {
                 }
                 self.phase = Phase::Idle;
                 self.next = NO_EVENT;
+                self.announce_if_owed();
             }
         }
     }
@@ -495,9 +551,21 @@ impl State {
         // Classic ROM's bus scan goes state 0 -> 1 -> 2 -> 0 for sixteen
         // addresses running and only reaches the idle state once, at the end.
         self.transactions = self.transactions.wrapping_add(1);
+        self.last_received = byte;
+        self.apply_command(byte);
+    }
+
+    /// Work out what a command byte means and which device answers it.
+    ///
+    /// Split out of [`State::begin_command`] because the transceiver issues
+    /// one **itself** when a device has something to say: it autopolls the
+    /// device and then hands the computer the command it used
+    /// ([`State::ask_for_attention`]). That is a command nothing received, so
+    /// it must not move `last_received` or the count of bytes the computer
+    /// sent.
+    fn apply_command(&mut self, byte: u8) {
         self.command = byte;
         self.last_command = byte;
-        self.last_received = byte;
         self.heard = [0, 0];
         if byte == cmd::RESET {
             for d in &mut self.devices {
@@ -511,6 +579,9 @@ impl State {
         let addr = cmd::address(byte);
         let register = cmd::register(byte);
         self.answered = false;
+        if cmd::command(byte) == cmd::TALK && register == 0 {
+            self.counts.polls += 1;
+        }
         if cmd::command(byte) != cmd::TALK {
             // A Listen is answered by whichever device holds the address; a
             // reserved encoding by nobody.
@@ -528,6 +599,9 @@ impl State {
                 self.answered = true;
             }
             0 if d.address == cmd::ADDR_KEYBOARD => {
+                // Counted here and at the mouse's arm below rather than at the
+                // top, because `answered` is also what a Talk of register 3
+                // and a Listen set.
                 // An ADB keyboard answers Talk 0 with two key transitions and
                 // says nothing at all when it has none: a device with no data
                 // does not drive the bus, and the transceiver reports that by
@@ -536,6 +610,7 @@ impl State {
                 if let Some(first) = first {
                     self.reply = [first, keys.pop_front().unwrap_or(0xff)];
                     self.answered = true;
+                    self.counts.answered += 1;
                 }
                 d.pending = !keys.is_empty();
             }
@@ -543,6 +618,12 @@ impl State {
                 self.reply = d.data;
                 d.pending = false;
                 self.answered = true;
+                self.counts.answered += 1;
+                if d.default_address == cmd::ADDR_MOUSE {
+                    // What was owed has now been handed over.
+                    self.owed_x = 0;
+                    self.owed_y = 0;
+                }
             }
             _ => {}
         }
@@ -570,6 +651,10 @@ impl State {
     /// computer tells an empty address from an occupied one, because no
     /// device's register 3 reads `$FF $FF`.
     fn to_send(&self) -> u8 {
+        // The transceiver's own command byte, on its way to an idle computer.
+        if self.unsolicited != 0 {
+            return self.unsolicited;
+        }
         if !self.answered {
             return 0xff;
         }
@@ -587,6 +672,10 @@ impl State {
                 let bits = if out { self.to_send() } else { 0 };
                 if out {
                     self.last_sent = bits;
+                    if !self.answered {
+                        self.counts.sent_empty += 1;
+                    }
+                    self.counts.last_four = (self.counts.last_four << 8) | u32::from(bits);
                 }
                 self.phase = Phase::Xfer {
                     out,
@@ -652,22 +741,39 @@ impl State {
                 self.took(bits);
             } else {
                 self.data_low = false;
+                self.counts.sent += 1;
+                // **A reply is spent once it has been read.** The device drove
+                // the bus for one transaction and the transceiver has nothing
+                // further of its own; a computer that comes back for states 1
+                // and 2 again is asking a question nobody is answering, and
+                // must get the pulled-up bus.
+                //
+                // Measured, and it is the difference between a pointer that
+                // lands where it is put and one that goes twice as far: the
+                // computer reads the announced reply at states 1 and 2, then
+                // issues a Talk of its own and reads them *again*, and with
+                // the reply still standing it counted the same movement twice.
+                if self.slot == Slot::Odd {
+                    self.answered = false;
+                }
             }
             // An unsolicited byte is not part of a transaction, so the link
             // goes straight back to idle and the *next* thing a device has to
             // say can be announced the same way. Leaving it `Between` would
             // wedge the link until the computer happened to start one.
-            self.phase = if core::mem::take(&mut self.unsolicited) {
+            self.phase = if core::mem::take(&mut self.unsolicited) != 0 {
                 Phase::Idle
             } else {
                 Phase::Between
             };
             self.next = NO_EVENT;
+            self.announce_if_owed();
         }
     }
 
     /// A key moved: an ADB key code, with bit 7 set for a release.
     fn key(&mut self, transition: u8) {
+        self.counts.reports += 1;
         if self.keys.len() < TYPE_AHEAD {
             self.keys.push_back(transition);
         }
@@ -683,6 +789,19 @@ impl State {
 
     /// The mouse moved, or its button changed.
     fn mouse(&mut self, dx: i8, dy: i8, down: bool) {
+        self.counts.reports += 1;
+        // **Movement accumulates until it is read.** A mouse counts; a report
+        // that arrives while the link is busy has to add to what is owed
+        // rather than replace it, or every report the computer was too busy to
+        // collect is simply lost. Measured: a pointer sent across the screen
+        // arrived twenty-seven pixels short, and fourteen of its hundred and
+        // twenty reports had never been answered.
+        //
+        // Seven bits two's complement, so the total saturates at the most one
+        // report can carry rather than wrapping into the opposite direction.
+        self.owed_x = (self.owed_x + i16::from(dx)).clamp(-64, 63);
+        self.owed_y = (self.owed_y + i16::from(dy)).clamp(-64, 63);
+        let (dx, dy) = (self.owed_x as i8, self.owed_y as i8);
         let pack = |d: i8, bit: bool| -> u8 {
             let v = (d as u8) & 0x7f;
             if bit { v } else { v | 0x80 }
@@ -707,15 +826,43 @@ impl State {
         self.int_until = self.ticks + ATTENTION_TICKS;
         // **And clock a byte at the computer**, which is the half that makes
         // the attention line worth anything. See `State::unsolicited`.
-        if self.phase == Phase::Idle && self.lines == 3 {
-            self.unsolicited = true;
-            self.slot = Slot::Even;
-            // Nothing drives the data line: the byte's job is to arrive, not
-            // to say anything, and `to_send` answers `$FF` for a bus nobody is
-            // driving.
-            self.answered = false;
-            self.phase = Phase::Starting { out: true };
-            self.next = self.ticks + START_TICKS;
+        //
+        // A report that arrives while the link is busy is **owed**, not
+        // dropped: the device keeps its data and the announcement goes out
+        // when the link next falls idle ([`State::announce_if_owed`]). Losing
+        // it instead is what left a pointer short of where it was sent.
+        if self.phase != Phase::Idle || self.lines != 3 {
+            return;
+        }
+        let Some(address) = self
+            .devices
+            .iter()
+            .find(|d| d.pending)
+            .map(|d| d.address)
+            .or_else(|| (!self.keys.is_empty()).then_some(cmd::ADDR_KEYBOARD))
+        else {
+            return;
+        };
+        // The transceiver polls the device **itself** and then hands the
+        // computer the command it used, so the reply is already waiting when
+        // the computer comes to collect it at states 1 and 2.
+        let command = (address << 4) | (cmd::TALK << 2);
+        self.apply_command(command);
+        self.unsolicited = command;
+        self.phase = Phase::Starting { out: true };
+        self.next = self.ticks + START_TICKS;
+    }
+
+    /// Announce a device's data if one has some and the link has fallen idle.
+    ///
+    /// Called wherever the link can become idle: at the end of a transfer and
+    /// when the computer puts the state lines back to 3.
+    fn announce_if_owed(&mut self) {
+        if self.phase == Phase::Idle
+            && self.lines == 3
+            && (self.devices.iter().any(|d| d.pending) || !self.keys.is_empty())
+        {
+            self.ask_for_attention();
         }
     }
 
@@ -823,6 +970,34 @@ impl Adb {
             .iter()
             .map(|d| d.address)
             .collect()
+    }
+
+    /// The transceiver's own state, for a trace: the state lines, which byte
+    /// of a transaction is next, whether the addressed device answered, the
+    /// command byte, and whether a transfer is in flight.
+    #[must_use]
+    pub fn probe(&self) -> (u8, u8, bool, u8, bool) {
+        let st = self.state.lock();
+        let slot = match st.slot {
+            Slot::Command => 0,
+            Slot::Even => 1,
+            Slot::Odd => 2,
+        };
+        (
+            st.lines,
+            slot,
+            st.answered,
+            st.command,
+            st.phase != Phase::Idle,
+        )
+    }
+
+    /// The four stages one input report passes through, counted separately.
+    ///
+    /// See [`Counters`]: the one that drops is where a report is going.
+    #[must_use]
+    pub fn counters(&self) -> Counters {
+        self.state.lock().counts
     }
 
     /// Whether the transceiver is pulling `(clock, data, attention)` low.
