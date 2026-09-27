@@ -659,6 +659,26 @@ instructions past where `Exec::step` would have taken the trap.
 `IrHost::store`'s claim that neither of its two questions can arrive through the
 inlined path is now true of the **topology** half only, and says so.
 
+**What it costs.** A relaxed store and one `Exec::pending_interrupt` per inlined
+access, on the hottest path in the build — which is real, and is not optional:
+the alternative is a `ROADMAP.md` §0 violation a real kernel reaches inside a
+third of a guest second. Priced under callgrind over the whole of
+`benches/jit_dispatch --smoke`, because the host was carrying five other builds
+and the wall-clock spread between two runs of the *unmodified* binary is wider
+than this:
+
+| | host instructions |
+| --- | ---: |
+| `Hart::run_budget`, inclusive, without | 1 973 981 592 |
+| the same, with | 1 977 798 376 (**+0.193%**) |
+| `Hart::advance`, inclusive, without | 1 961 825 264 |
+| the same, with | 1 965 642 048 (**+0.195%**) |
+| the whole program | 21 592 973 890 → 21 596 813 119 (+0.018%) |
+
+`cpu::x86::engine` paid +0.18% for the same pair on `benches/x86_dispatch
+--smoke`, which is the same order and is what says the number is the mechanism
+rather than this core's arrangement of it.
+
 ### The kernel leg, and why this core did not have one
 
 Both of the two above were found *by construction* rather than by a guest, and
