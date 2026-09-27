@@ -122,6 +122,18 @@
 //! block costs. `Stop::Spent` needs no arm of its own in [`advance`] for the
 //! same reason: publishing at `run.pc` is what every other stop already does.
 //!
+//! **`Stop::Declined` and `Stop::Untranslatable` do need one**, and that is the
+//! whole of what an allowance asks of this file. `jit::dispatch` charges a
+//! chained boundary's entry fetch translation through `Frontend::enter` and
+//! *then* asks whether a block may run there, so those two stops arrive with an
+//! instruction's walk paid for and none of the instruction executed — and
+//! `X86::run_budget`'s `used < allowance` test then stands in the middle of one
+//! guest instruction, where the interpreter has it in front of the whole of it.
+//! Both arms therefore retire that instruction in the same call. It was not
+//! there for the first four rounds of this work and a real kernel is what found
+//! it: `docs/platforms/pc64.md`, *"the fourth way in was the same walk, charged
+//! on the wrong side of the budget test"*.
+//!
 //! Same board, same nine hundred seconds, same kernel and initramfs:
 //!
 //! | | guarded | allowance |
@@ -1132,15 +1144,64 @@ pub(super) fn advance(
         Stop::Unsupported { op, at } => panic!(
             "the x86 frontend emitted {op} at index {at}, which the IR backend cannot execute"
         ),
-        // `Budget` ends a full chain, `Declined` a short one, `Untranslatable`
-        // a boundary whose instruction is outside the subset, `Spent` a block
-        // that left part-way through because the caller's ticks ran out, and
-        // all four leave the guest at `run.pc` for the run loop to pick up.
-        // `Spent` needs no arm of its own for exactly that reason: the state
-        // is published from the boundary's live map and `run.pc` is the guest
-        // instruction that has not started, which is what this arm already
-        // does with every other stop. `Exit` cannot happen: no safe-point flag
-        // is given to the dispatcher.
+        // A boundary the dispatcher **charged for and then did not retire**,
+        // and the one place where "a cache hit and a cache miss are
+        // indistinguishable to the guest, including in cycle accounting"
+        // (`ROADMAP.md` §0) needs this file to do something rather than
+        // nothing.
+        //
+        // `Frontend::enter` charges a chained boundary's **entry fetch
+        // translation** — on a buffer miss that is a page-table walk, two to
+        // four descriptor reads at `Variant::bus_clocks` each — and only
+        // *then* asks the frontend whether a block may run there. When the
+        // answer is no, these two stops are how it says so. The interpreter
+        // charges the identical walk, but it charges it *inside*
+        // `Exec::instruction`, after `X86::run_budget` has already decided
+        // there were ticks left to start an instruction with.
+        //
+        // So returning here left the two engines' `Exec::used` in different
+        // places for the same guest work: the translated core had paid a
+        // boundary's walk that the interpreted one had not, and a quantum
+        // whose allowance ran out in that gap ended **one guest instruction
+        // early**, with `State::debt` at zero where the oracle carried the
+        // overshoot. Measured on `pc64` with a 6.12 kernel: the declined
+        // boundary at `0xffffffff81174899` costs six ticks — three IA-32e
+        // descriptor reads to a 2 MiB page, `2 * 3` — and the interpreter
+        // charged 25 for the instruction there against the 19 a translated
+        // core charged after the walk had already been paid for.
+        //
+        // Both arms are reached only with [`IrHost::spent`] **false**:
+        // `jit::dispatch` asks it at every block boundary before it calls
+        // `Frontend::enter`, so a boundary that got as far as being charged is
+        // a boundary an interpreted core would have started an instruction at.
+        // Starting it here is what puts the two engines' tick accounting back
+        // in the same place, and it costs nothing else — the instruction was
+        // going to be interpreted by the next `advance` anyway, which is what
+        // `admit` answers `Admit::Interpret` for.
+        Stop::Declined | Stop::Untranslatable { .. } => {
+            publish(exec.state, &world, &slots, run.pc);
+            close_bus(&mut exec, &world, frame, end, end_access);
+            // The chain's own stores first, so the list `Exec::wrote` holds is
+            // emptied between the block and the instruction exactly as
+            // [`drain`] documents it being emptied after every one.
+            drain(disp, bound, &mut exec);
+            // `Exec::used` rather than `Exec::step`'s answer: a halted or
+            // shut-down core answers zero there, and this call has a whole
+            // chain of charges behind it that `X86::run_budget` must be told
+            // about. It loops until the allowance is spent and asks again, so
+            // a zero is never lost — reporting one here would be.
+            interpret(disp, bound, exec).max(1)
+        }
+        // `Budget` ends a full chain and `Spent` a block that left part-way
+        // through because the caller's ticks ran out; both leave the guest at
+        // `run.pc` for the run loop to pick up, and neither has charged
+        // anything at that boundary — `jit::dispatch` asks the chain budget and
+        // [`IrHost::spent`] *before* `Frontend::enter`, which is what makes the
+        // arm above a different case rather than the same one. `Spent` needs no
+        // arm of its own for that reason: the state is published from the
+        // boundary's live map and `run.pc` is the guest instruction that has
+        // not started, which is what this arm already does. `Exit` cannot
+        // happen: no safe-point flag is given to the dispatcher.
         _ => {
             publish(exec.state, &world, &slots, run.pc);
             close_bus(&mut exec, &world, frame, end, end_access);
@@ -1153,8 +1214,17 @@ pub(super) fn advance(
 
 /// Interpret one instruction, and tell the block cache what it wrote.
 fn interpret(disp: &mut Dispatcher, bound: &mut Boundary, mut exec: Exec<'_>) -> u64 {
-    let used = exec.step();
+    exec.step();
     bound.interpreted = bound.interpreted.wrapping_add(1);
+    // `Exec::used` rather than `Exec::step`'s answer, which differ in exactly
+    // one case and it is reachable from both callers: a halted, shut-down or
+    // `INIT`-held core answers **zero** there, while this `Exec` may already
+    // carry charges nothing else will ever report — `admit`'s entry
+    // translation, or a whole chain of blocks when the boundary that declined
+    // is retired here. `X86::run_budget` reads a zero as *stop*, so the zero
+    // has to survive; it does, because a core in one of those states charges
+    // nothing and `Exec::used` is then zero too.
+    let used = exec.used;
     drain(disp, bound, &mut exec);
     used
 }
@@ -2673,6 +2743,70 @@ mod tests {
         let mut case = Case::seeded(program);
         case.regs[3] = 0;
         agree(&case, 8_000, 6);
+    }
+
+    /// The same claim where the boundary the frontend declines is on a page
+    /// whose fetch translation is **cold**, swept over the budgets that end a
+    /// quantum inside the walk.
+    ///
+    /// This is the shape a real 6.12 kernel boot parted on, at quantum 223 573
+    /// of `pc64`; `docs/platforms/pc64.md` has the measurement. Two linear
+    /// pages, and the order they are reached in is the whole fixture:
+    ///
+    /// * The first page **invalidates the second** — `INVLPG` is outside the
+    ///   lifted subset, so it is also a declined boundary, but on a page whose
+    ///   translation is hot and therefore free.
+    /// * Then it jumps to the second page. A block may not follow a branch off
+    ///   its own page (`lift`: *"a block never leaves the linear page it
+    ///   started on"*), so the successor is a **chained** boundary — and
+    ///   `jit::dispatch` charges that boundary's entry fetch translation
+    ///   through `Frontend::enter` *before* it asks whether a block may run
+    ///   there. The translation is cold, so the charge is a two-level walk.
+    /// * The instruction standing there is `CLI`, also outside the subset, so
+    ///   the answer is no and the boundary is declined with the walk already
+    ///   paid for.
+    ///
+    /// Nothing on the second page is fetched between the invalidation and that
+    /// boundary, which is what keeps the translation cold on every pass — an
+    /// `INVLPG` on its *own* page does not work, because the instruction after
+    /// it re-fills the entry through `admit` before the loop comes round.
+    ///
+    /// The budgets are swept over a **contiguous** range because what has to be
+    /// reached is an allowance that runs out *inside* that walk, which is four
+    /// ticks wide — two descriptor reads at `Variant::bus_clocks`. A pass round
+    /// this loop is about fifty ticks, so eighty-one consecutive budgets over
+    /// twelve quanta each land there many times. Without the `Stop::Declined`
+    /// arm in [`advance`] this fails, naming `debt` 0 against the interpreter's
+    /// overshoot and a program counter one instruction behind it.
+    #[test]
+    fn a_declined_boundary_over_a_cold_page_retires_its_instruction() {
+        let mut program = alloc::vec![
+            0x40, // inc eax
+            0x0f, 0x01, 0x3b, // invlpg [ebx]: cools the *second* page
+            0xe9, 0xf7, 0x0f, 0x00, 0x00, // jmp +0xff7, onto that page
+        ];
+        // Never executed — the jump is over it — and never lifted either, since
+        // the block ends at the branch.
+        program.resize(0x1000, 0x90);
+        program.extend_from_slice(&[
+            0xfa, // cli: outside the subset, on the cold page
+            0xe9, 0xfa, 0xef, 0xff, 0xff, // jmp -0x1006, back to the top
+        ]);
+        let mut case = Case::seeded(program).paged();
+        // `EBX` is an offset in a data segment whose base is the code
+        // segment's, so this names the second code page and nothing else.
+        case.regs[3] = 0x1000;
+        for budget in 200u64..=280 {
+            let jit = agree_on(&case, Engine::Jit, budget, 12);
+            let stats = jit.jit_stats().expect("statistics");
+            assert!(
+                stats.blocks > 0 && stats.interpreted > 0,
+                "budget {budget}: {} blocks and {} interpreted instructions, so                  this guest never reached a declined boundary at all",
+                stats.blocks,
+                stats.interpreted
+            );
+            agree_on(&case, Engine::JitHost, budget, 12);
+        }
     }
 
     #[test]
