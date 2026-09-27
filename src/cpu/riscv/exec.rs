@@ -337,10 +337,30 @@ impl<'a> Exec<'a> {
     /// assert is identical across engines at every instruction boundary — so
     /// the *value* a device reads at a given access is identical too.
     ///
-    /// The inlined RAM accesses that skip this publish nothing, which costs
-    /// nothing: no lazily advanced device sits behind them.
+    /// # And an inlined access publishes too
+    ///
+    /// This used to end *"the inlined RAM accesses that skip this publish
+    /// nothing, which costs nothing: no lazily advanced device sits behind
+    /// them"*. The first clause is true and the second does not follow from it,
+    /// which is where the argument stopped: `TickCursor::set` compares the
+    /// position against `CursorInner::deadline` — *"the first tick at which
+    /// some lazily-advanced device has an event of its own"* — and calls
+    /// `TickCursor::reach`, which syncs **every** such device and lets it drive
+    /// its wires. So what a publication advances is not the device the access
+    /// reached; it is the whole machine, and what advances it is the tick count
+    /// crossing a deadline.
+    ///
+    /// A block whose accesses are all served inline therefore stood still as
+    /// far as the CLINT was concerned, and `mtimecmp`'s edge arrived at the
+    /// next access a plan did not cover instead of at its own tick. Measured
+    /// on `FAR_LOOP` under `jit-host`: over one 4 000-tick round the
+    /// interpreter published 4 001 and the translated hart **14** — and 14
+    /// again after eight rounds, because once the shadow is warm nothing in
+    /// that loop leaves the fast path at all.
+    /// `cpu::x86::engine` found the same hole on a real kernel;
+    /// `engine::FastMem` is where this core's inlined path publishes.
     #[inline]
-    fn publish_position(&self) {
+    pub(super) fn publish_position(&self) {
         if let Some(cursor) = &self.timing.cursor {
             cursor.set(self.st.cycles);
         }
@@ -753,6 +773,10 @@ impl<'a> Exec<'a> {
     ///   separate guest instruction;
     /// * **one tick**, because one bus access is one cycle and the walk was
     ///   charged when the entry was filled;
+    /// * **the live position**, for the whole of the reason
+    ///   [`Exec::publish_position`] gives: a lazily-advanced device's own event
+    ///   is delivered by a publication and by nothing else, so a block that
+    ///   only ever stores inline stands still as far as the CLINT is concerned;
     /// * **the `RamStore`'s dirty bitmap and the guest-physical dirty log**,
     ///   which `jit::Tlb::note_fast_store` marks and reports — the first is the
     ///   only record a framebuffer refresh or a snapshot has, and the second is
@@ -772,6 +796,7 @@ impl<'a> Exec<'a> {
             self.st.reservation = None;
         }
         self.charge();
+        self.publish_position();
         let phys = self
             .tlb
             .shadow_mut()

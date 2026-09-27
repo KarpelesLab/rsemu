@@ -155,8 +155,8 @@
 //! **And a guest store stopped costing a call too.** **1 749 886 of 1 753 140
 //! compiled stores — 99.8%** — are now the same inlined probe a load makes
 //! plus one thunk that pays what moving the bytes did not: the tick, the
-//! `RamStore`'s own dirty bitmap, a broken reservation, and the
-//! guest-physical page the block cache invalidates translations on.
+//! **live position**, the `RamStore`'s own dirty bitmap, a broken reservation,
+//! and the guest-physical page the block cache invalidates translations on.
 //! `jit::fast`'s `FastMem::store_plan` states what a store plan promises and
 //! why it is a stronger promise than a load's; `Exec::refresh_shadow` is
 //! where the store set is filled, and the PTE dirty bit an inlined store never
@@ -1573,9 +1573,17 @@ impl IrHost for Host<'_, '_> {
     ///
     /// Both are asked here rather than at every guest instruction boundary
     /// because this is where the answer can change, and [`Host::hand_back`]
-    /// carries it to the boundary for free. Neither can arrive through
+    /// carries it to the boundary for free.
+    ///
+    /// The **topology** half cannot arrive through
     /// [`FastMem::note_fast_store`]: a plan covers plain little-endian RAM over
     /// a whole page, so an inlined store reaches no device and remaps nothing.
+    /// The **interrupt** half can, and the argument that it could not was
+    /// wrong: an inlined store publishes this hart's position, and a
+    /// publication is what delivers a lazily-advanced device's own event —
+    /// which is every such device on the machine rather than the one the access
+    /// reached. So [`FastMem::note_fast_store`] asks the same question there,
+    /// and `Exec::publish_position` says why.
     ///
     /// * **An interrupt this store raised.** A write to the CLINT's
     ///   `mtimecmp`, to `msip`, or to the PLIC brings a line up between two
@@ -1663,7 +1671,8 @@ impl StoreLog for Host<'_, '_> {
 /// shadow entry exists only where this hart's TLB *also* holds the
 /// translation, and an inlined load that hits one is a load whose walk had
 /// already been performed and charged for — which is why the whole cost it
-/// still owes is the one tick [`FastMem::note_fast_load`] charges.
+/// still owes is the one tick [`FastMem::note_fast_load`] charges, plus the
+/// **live position** it publishes and the pin that publication can raise.
 ///
 /// The three things the compiled path cannot do are therefore done once, at
 /// fill time, rather than never:
@@ -1692,6 +1701,24 @@ impl FastMem for Host<'_, '_> {
         // itself already done: one bus access is one cycle, and the walk was
         // charged when the entry was filled.
         self.exec.charge();
+        // And the live position, which is **not** bookkeeping:
+        // `TickCursor::set` compares it against the first tick at which some
+        // lazily-advanced device has an event of its own and calls
+        // `TickCursor::reach`, which syncs every one of them and lets it drive
+        // its wires. A lazily-advanced device's own event is delivered by a
+        // publication and by nothing else, so a block whose loads are all
+        // served inline stood still as far as the CLINT was concerned and
+        // `mtimecmp`'s edge arrived at the next access a plan did not cover.
+        // `Exec::publish_position` has the measurement.
+        self.exec.publish_position();
+        // The pin that publication can have raised, carried to this block's
+        // next guest instruction boundary exactly as [`IrHost::load`] carries
+        // the one a device answering a read raises. Without it the block runs
+        // on to its natural end, up to `lift::MAX_INSNS` instructions past
+        // where `Exec::step` would have taken the trap.
+        if self.exec.pending_interrupt().is_some() {
+            self.hand_back();
+        }
     }
 
     fn store_plan(&mut self) -> Option<MemPlan> {
@@ -1699,12 +1726,20 @@ impl FastMem for Host<'_, '_> {
     }
 
     fn note_fast_store(&mut self, addr: u64, bytes: u64) {
-        // `Exec::write_once` minus the bytes, and then the same move of
-        // `Exec::wrote` into this host's dirty log that `IrHost::store` makes
-        // — so a page written by a compiled store and one written by an
-        // interpreted store reach `StoreLog` by the same route.
+        // `Exec::write_once` minus the bytes — the tick, the live position and
+        // the global monitor — and then the same move of `Exec::wrote` into
+        // this host's dirty log that `IrHost::store` makes, so a page written
+        // by a compiled store and one written by an interpreted store reach
+        // `StoreLog` by the same route.
         self.exec.note_fast_store(addr, bytes);
         self.note_writes();
+        // As in [`FastMem::note_fast_load`], and for the same reason: the
+        // publication inside `Exec::note_fast_store` can have brought a line
+        // up. `note_writes` may already have handed back for a store into this
+        // block's own page; asking again is one compare.
+        if self.exec.pending_interrupt().is_some() {
+            self.hand_back();
+        }
     }
 }
 
@@ -2262,6 +2297,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Whether this build has a host code generator for this host, and so
+    /// whether anything can be served inline at all.
+    ///
+    /// Written as a `cfg!` expression rather than a `#[cfg]` item so it is
+    /// compiled in every configuration and read by plain `if`s: a `const` whose
+    /// only readers sit inside `#[cfg]` blocks is dead code in the builds that
+    /// gate them out, and `dead_code` is denied.
+    const HOST_COMPILES: bool = cfg!(any(
+        all(
+            feature = "jit-x86",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ),
+        all(
+            feature = "jit-arm64",
+            target_os = "linux",
+            target_arch = "aarch64"
+        )
+    ));
+
+    /// An inlined access publishes this hart's position, and an interpreted one
+    /// publishes the same number.
+    ///
+    /// `TickCursor::set` is not bookkeeping: it compares the position against
+    /// the first tick at which some lazily-advanced device has an event of its
+    /// own and calls `TickCursor::reach`, which syncs every such device and
+    /// lets it drive its wires. **A lazily-advanced device's own event is
+    /// delivered by a publication and by nothing else**, so a block whose
+    /// accesses are all served inline used to stand still as far as the CLINT
+    /// was concerned — and on `riscv-virt` the CLINT is what `mtimecmp` arms
+    /// and what every timer interrupt comes out of.
+    ///
+    /// Measured on [`FAR_LOOP`] before the publication existed: over one
+    /// 4 000-tick round the interpreter published 4 001 and the translated hart
+    /// **14**, and 14 again after eight rounds — once the shadow is warm
+    /// nothing in this loop leaves the fast path, so the cursor froze at the
+    /// last access a plan did not cover. `cpu::x86::engine`'s own numbers were
+    /// 4 010 against 118 on a comparable fixture, and it parted from its
+    /// interpreter on a real kernel because of it.
+    ///
+    /// What is asserted is the publication rather than the delivery, because
+    /// arming a deadline is `core::sched`'s to do and is tested there. Two
+    /// harts, one budget at a time, and the published position compared after
+    /// each: they end every round on the same instruction with the same charge
+    /// count, so the last access of a round is the same access and the number
+    /// it published is the same number.
+    #[test]
+    fn an_inlined_access_publishes_the_position_an_interpreted_one_publishes() {
+        use crate::core::sched::TickCursor;
+
+        let interp = hart(Engine::Interp, &FAR_LOOP);
+        let jit = hart(Engine::JitHost, &FAR_LOOP);
+        let (left, right) = (TickCursor::new(), TickCursor::new());
+        interp.attach_cursor(&left);
+        jit.attach_cursor(&right);
+        for round in 0..8 {
+            interp.run_budget(4_000);
+            jit.run_budget(4_000);
+            assert_eq!(
+                left.get(),
+                right.get(),
+                "round {round}: the interpreter published position {} and the \
+                 translated hart {}. A lazily-advanced device's event is \
+                 delivered by a publication and by nothing else",
+                left.get(),
+                right.get(),
+            );
+        }
+        let s = jit.jit_stats().expect("a jit hart keeps statistics");
+        assert!(
+            !HOST_COMPILES || (s.fast_loads > 0 && s.fast_stores > 0),
+            "nothing was served inline, so this proves nothing"
+        );
     }
 
     /// x5 counts up, storing and reloading through x7, closed by a backward
