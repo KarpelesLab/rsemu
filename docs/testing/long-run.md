@@ -98,7 +98,7 @@ beside one another.
 
 | Variable | Effect |
 | --- | --- |
-| `RSEMU_LONGRUN_MS` | guest **milliseconds** to compare (20 for the A64 and RISC-V synthetics, 300 for either kernel leg, 1 200 in CI). The x86 *synthetic* leg is capped at 1 200 quanta instead when this is unset — see below — and setting this lifts the cap |
+| `RSEMU_LONGRUN_MS` | guest **milliseconds** to compare (20 for the A64 and RISC-V synthetics, 300 for the A64 kernel leg, 1 200 for the RISC-V one, 1 200 in CI for both). The x86 *synthetic* leg is capped at 1 200 quanta instead when this is unset — see below — and setting this lifts the cap |
 | `RSEMU_LONGRUN_SECONDS` | the same knob in whole guest seconds. Still honoured, and `_MS` wins when both are set. Every default above used to be written here — 2, 30 and 120 — and is now a hundredth of that, for the reason under *[A guest second stopped meaning what it meant](#a-guest-second-stopped-meaning-what-it-meant)* |
 | `RSEMU_LONGRUN_ENGINES` | comma-separated; default `jit,jit-host`. `interp` is the control — an interpreter against itself must always agree |
 | `RSEMU_ARM64_KERNEL`, `RSEMU_ARM64_INITRD` | the AArch64 fixture, as in `tests/a64_linux.rs` |
