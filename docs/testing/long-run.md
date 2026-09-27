@@ -286,7 +286,66 @@ it is the measured distance to the first `STI` a Linux kernel executes on a
 board with no firmware, and a gate set below it would have been green on a core
 that enters blocks inside an interrupt shadow.
 
-**On `master` it has found nothing.** Nine hundred guest seconds of that kernel
+#### And then it found something, and the fixture is why it took two hours to reproduce
+
+**2026-09-28: the x86 kernel leg earned itself.** It had been red for ten
+consecutive nights — last green 2026-09-17 — and nobody was watching. What it
+reported was a divergence at quantum 223 573, 112.052734 s of guest time, in six
+columns of `cpu0`; `docs/platforms/pc64.md` has the diagnosis and the fix, which
+is one arm of `cpu::x86::engine`'s stop match. Both translated engines gave the
+same wrong answer, which is the signature this page already names.
+
+The operationally interesting half is **the two hours before the first
+reproduction**, because none of it was spent on the defect:
+
+* The history looked like a Heisenbug and was not. Three nightlies of the *same
+  commit* `79b207eb` went failure, success, failure, which reads as
+  intermittency in the run. It is not: emulation here is deterministic to the
+  block count, and two runs of one configuration produce byte-identical
+  consoles. What changed between those nights was **the fixture**.
+* **Neither x86 fixture is pinned.** `scripts/fetch-testdata.sh` fetches
+  Debian's installer kernel from `…/installer-amd64/current/…`, which a point
+  release replaces — the nightly had moved from `6.12.94+deb13-amd64` to
+  `6.12.107+deb13-amd64` — and it *builds* `initramfs-x86.cpio` locally, so the
+  archive changes whenever the script's `/init` does. A developer's
+  `testdata/x86` from three weeks earlier is a different guest.
+* Both had to be current to reproduce. The 6.12.107 kernel with a stale ramdisk
+  agreed for 200 guest seconds under both engines; 6.12.94 with a *fresh* ramdisk
+  agreed too; 6.12.107 with the fresh ramdisk parted at quantum 223 573 on the
+  first try, on both engines, byte-identically to the nightly. Eighty bytes of
+  difference in a ramdisk moves every address the kernel allocates after it.
+
+Neither fixture can be pinned — a hash would fail the job on every point release,
+which is the reason the fetch script gives for not having one — so the answer is
+the other half of reproducibility: **the log names the inputs**. The kernel leg
+now prints the `bzImage`'s own `kernel_version` string (setup header offset
+`0x20e`) and the ramdisk's length before it runs, and `long-run.yml` lifts both
+into the checks list beside the divergence. That is what turns a red nightly into
+a command somebody else can run.
+
+**The synthetic x86 leg did not catch it, and could not have.** That guest has
+an `INVLPG` on its own code page every sixty-fourth pass, which is the seam, and
+it agreed for its whole run anyway — because what this defect needs is not the
+cold translation but a *quantum whose allowance runs out inside it*, four to
+eight ticks out of a quantum of tens of thousands. On a board the harness drives
+through `Machine::run_quantum` the budget is the scheduler's and there is nothing
+to sweep. The regression test is therefore beside the engine rather than here —
+`cpu::x86::engine`'s
+`a_declined_boundary_over_a_cold_page_retires_its_instruction`, which sweeps
+eighty-one consecutive budgets over a two-page loop and fails on the ones that
+land in the walk. That is the same division of labour the timer-edge defects
+took: the seam is reachable synthetically, the *coincidence* is what a kernel
+supplies for free.
+
+Do not reach for a snapshot to shorten the loop on this board, either: `Machine`
+saved at quantum 223 400 and restored takes a *different* path from the run that
+made it, because `State::tlb` is derived state and is deliberately not
+serialized, so a restored core pays for walks the original had already paid for
+and the quanta end elsewhere. `docs/platforms/pc64.md` lists that under what is
+known to be missing. Both restored machines agree with each other, so the
+divergence simply vanishes — a fast loop that proves nothing.
+
+**Before that it had found nothing.** Nine hundred guest seconds of that kernel
 — 1 946 548 quanta — agree quantum for quantum against `jit-host`, and six
 hundred agree against `jit` and `jit-host` both. The two machines also printed
 byte-identical console output, which the lockstep loop cannot see for itself: a
