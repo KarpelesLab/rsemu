@@ -3122,6 +3122,113 @@ mod tests {
         }
     }
 
+    /// The same claim where **every access the block makes is served inline**.
+    ///
+    /// This is the question `docs/platforms/pc64.md` recorded as open for this
+    /// core: x86's `FastMem::note_fast_load` charged its bus clocks without
+    /// publishing this core's position, and since *"a lazily-advanced device's
+    /// own event is delivered by a publication and by nothing else"* a block
+    /// whose accesses were all inlined stood still as far as every timer on
+    /// that board was concerned. `cpu::riscv::engine` had it too, from the
+    /// CLINT.
+    ///
+    /// **It cannot arise here, for two reasons, and this test is the second
+    /// one measured rather than argued.**
+    ///
+    /// * `Cpu::attach_cursor` takes the safe point's exit flag out of the
+    ///   cursor and nothing else: this core never calls `TickCursor::set`,
+    ///   under any engine. So there is no position to lose and no
+    ///   lazily-advanced device an A64 board can put behind one — none of
+    ///   `a64-mini`, `arm64-virt` or `arm64-virt-smp` implements
+    ///   `Device::attach_lazy` on anything it declares.
+    /// * The event this core does have is its **own generic timer**, and it is
+    ///   delivered by [`IrHost::spent`]'s `self.exec.st.cycles >=
+    ///   self.timer_edge` rather than by a publication — asked at every guest
+    ///   instruction boundary, and reached by an inlined access because
+    ///   [`FastMem::note_fast_load`] and `Exec::note_fast_store` charge
+    ///   `State::cycles` exactly as the calls they replaced did.
+    ///
+    /// The second is a property of two lines in the fast path, so it is worth a
+    /// test: a `note_fast_load` that stopped charging would leave every other
+    /// assertion in this file standing, because `cycles` is compared at the end
+    /// of a quantum and this loop's quanta would simply be longer on both
+    /// engines.
+    #[test]
+    fn the_generic_timer_is_taken_at_the_same_instruction_when_every_access_is_inlined() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = core(Engine::Interp, &LOOP);
+            let jit = core(engine, &LOOP);
+            for cpu in [&interp, &jit] {
+                let mut sys = cpu.sysregs();
+                sys.daif = 0;
+                sys.vbar_el1 = VBAR;
+                cpu.set_sysregs(sys);
+                // Mask the source and stop, so `ELR_EL1` records where the
+                // interrupt was taken rather than converging on the handler.
+                let space = cpu.space().expect("the core has its space");
+                for (n, word) in [0xd503_42dfu64, 0x1400_0000].iter().enumerate() {
+                    space
+                        .write(
+                            VBAR + IRQ_VECTOR + 4 * n as u64,
+                            Width::U32,
+                            *word,
+                            MemAttrs::DEFAULT,
+                        )
+                        .expect("inside RAM");
+                }
+            }
+            // Warm both, so the translated core is running a chain out of a
+            // warm shadow rather than lifting one and filling it.
+            for _ in 0..2 {
+                interp.run_budget(4096);
+                jit.run_budget(4096);
+            }
+            let cfg = Config::cortex_a53();
+            for cpu in [&interp, &jit] {
+                let mut sys = cpu.sysregs();
+                sys.cntp_ctl = 1;
+                sys.cntp_cval = cfg.counter_at(cpu.cycles()) + 37;
+                cpu.set_sysregs(sys);
+            }
+            for n in 0..4 {
+                assert_eq!(
+                    interp.run_budget(4096),
+                    jit.run_budget(4096),
+                    "quantum {n} after the timer was armed, under {engine:?}"
+                );
+            }
+            assert_eq!(
+                interp.sysregs().elr_el1,
+                jit.sysregs().elr_el1,
+                "ELR_EL1 under {engine:?}: the two engines took the generic \
+                 timer's interrupt at different instructions, with every access \
+                 of the block served inline"
+            );
+            assert_ne!(
+                interp.sysregs().elr_el1,
+                0,
+                "the interrupt was never taken, so this proves nothing"
+            );
+            assert_eq!(interp.pc(), jit.pc(), "the pc under {engine:?}");
+            assert_eq!(
+                interp.cycles(),
+                jit.cycles(),
+                "the cycle counter under {engine:?}"
+            );
+            for n in 0..31 {
+                assert_eq!(interp.x(n), jit.x(n), "x{n} under {engine:?}");
+            }
+            let stats = jit.jit_stats().expect("a jit core");
+            assert!(stats.blocks > 0, "no block ran under {engine:?}");
+            if engine == Engine::JitHost && HOST_BACKEND {
+                assert!(
+                    stats.fast_loads > 0 && stats.fast_stores > 0,
+                    "nothing was served inline, so this proves nothing: {stats:?}"
+                );
+            }
+        }
+    }
+
     /// A loop that flushes its own translations, so the entry fetch after the
     /// `TLBI` is a **cold walk** — the window [`Admitted::leave`] closes.
     ///
