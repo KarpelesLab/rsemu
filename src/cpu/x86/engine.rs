@@ -1217,13 +1217,21 @@ fn interpret(disp: &mut Dispatcher, bound: &mut Boundary, mut exec: Exec<'_>) ->
     exec.step();
     bound.interpreted = bound.interpreted.wrapping_add(1);
     // `Exec::used` rather than `Exec::step`'s answer, which differ in exactly
-    // one case and it is reachable from both callers: a halted, shut-down or
-    // `INIT`-held core answers **zero** there, while this `Exec` may already
-    // carry charges nothing else will ever report — `admit`'s entry
-    // translation, or a whole chain of blocks when the boundary that declined
-    // is retired here. `X86::run_budget` reads a zero as *stop*, so the zero
-    // has to survive; it does, because a core in one of those states charges
-    // nothing and `Exec::used` is then zero too.
+    // one case: a halted, shut-down, `INIT`-held or wait-for-Start-Up core
+    // answers **zero** there whatever this `Exec` has already charged. That
+    // matters because an `Exec` reaching here may carry charges nothing else
+    // will ever report — `admit`'s entry translation, or a whole chain of
+    // blocks when the boundary that declined is retired here — and
+    // `X86::run_budget` would lose them.
+    //
+    // The zero itself has to survive, because that loop reads it as *stop*, and
+    // it does, from both callers and for different reasons. From the prologue:
+    // `admit` refuses on every one of those four states *before* it translates
+    // anything, so nothing has charged and `Exec::used` is zero as well. From
+    // the declined-boundary arm: none of the four is reachable there at all —
+    // `HLT`, `MOV` to a control register and every other way into them is
+    // outside the lifted subset, so no block can enter one — and a chain that
+    // ran has charged, so the answer is never zero in the first place.
     let used = exec.used;
     drain(disp, bound, &mut exec);
     used
