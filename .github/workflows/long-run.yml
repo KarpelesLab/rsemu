@@ -40,10 +40,10 @@ on:
         description: 'Guest seconds to compare on arm64-virt (default 120)'
         required: false
         default: '120'
-      x86_seconds:
-        description: 'Guest seconds to compare on pc64 (default 900)'
+      x86_millis:
+        description: 'Guest milliseconds to compare on pc64 (default 200000)'
         required: false
-        default: '900'
+        default: '200000'
       m68k_seeds:
         description: 'Seeds for the m68k differential sweep (default 200)'
         required: false
@@ -96,9 +96,14 @@ jobs:
         env:
           RSEMU_LONGRUN_REQUIRED: 1
           RSEMU_LONGRUN_SECONDS: ${{ github.event.inputs.seconds || '120' }}
-          # `pc64`'s own budget: 120 guest seconds of that board is still
-          # inside the kernel's decompressor. scripts/check.sh says why.
-          RSEMU_X86_LONGRUN_SECONDS: ${{ github.event.inputs.x86_seconds || '900' }}
+          # `pc64`'s own budget, and it is **milliseconds**: that board measures
+          # guest time differently from `arm64-virt` and `scripts/check.sh` says
+          # why at length. This used to read `RSEMU_X86_LONGRUN_SECONDS`, which
+          # `check.sh` stopped reading when the budget moved to `_MS` — so the
+          # `workflow_dispatch` knob quietly did nothing and every run took the
+          # default. Naming the variable the script actually reads is the whole
+          # fix; the default below is the script's own.
+          RSEMU_X86_LONGRUN_MS: ${{ github.event.inputs.x86_millis || '200000' }}
         run: |
           set -uo pipefail
           rc=0
@@ -113,6 +118,17 @@ jobs:
             # checks list rather than three screens up a log.
             grep -E 'left the interpreter at quantum' long-run.log | while IFS= read -r line; do
               echo "::error title=divergence::$line"
+            done
+            # **Which fixture.** Neither kernel is pinned — Debian replaces the
+            # installer image on a point release and the ramdisk is rebuilt by
+            # the fetch script — so a divergence is a property of the commit
+            # *and* of the pair of inputs that night. The last red run took two
+            # hours to reproduce because the log named neither: it parted on a
+            # 6.12.107 kernel and a ramdisk eighty bytes larger than the one on
+            # the machine trying to reproduce it, and both of those are inputs
+            # the checks list can simply carry.
+            grep -E '^pc64: (kernel version|initramfs is)' long-run.log | while IFS= read -r line; do
+              echo "::error title=fixture::$line"
             done
           fi
           exit "$rc"
