@@ -2516,6 +2516,22 @@ mod pc64 {
             kernel.len(),
             initrd.len()
         );
+        // **Which** kernel, and which ramdisk. Neither fixture is pinned and
+        // neither can be: `scripts/fetch-testdata.sh` fetches Debian's
+        // installer kernel from `.../current/...`, where a point release
+        // replaces it, and it builds the initramfs with whatever `/init` the
+        // script says today. So a nightly failure is a failure *of a
+        // particular pair of inputs*, and a log that does not name them cannot
+        // be reproduced — which is what a red `Long run` cost when the leg
+        // parted on a 6.12.107 kernel that the machine trying to reproduce it
+        // did not have. Printed before the run rather than in the failure
+        // message because it is as interesting when the leg passes.
+        eprintln!("pc64: {}", kernel_identity(&kernel));
+        eprintln!(
+            "pc64: initramfs is {} bytes, first eight {:02x?}",
+            initrd.len(),
+            &initrd[..initrd.len().min(8)]
+        );
 
         // Was 30 guest seconds, and `scripts/check.sh` asked for 900. A
         // quantum on this board now carries the whole millisecond of its
@@ -2637,6 +2653,34 @@ mod pc64 {
             },
             tail(&text)
         );
+    }
+
+    /// The `bzImage`'s own version string, so a log says which kernel ran.
+    ///
+    /// The setup header carries a `kernel_version` field at offset `0x20e`: a
+    /// little-endian 16-bit offset, relative to `0x200`, of a NUL-terminated
+    /// string — the same one the guest later prints as `Linux version …`. The
+    /// field is zero on a kernel too old to have it and the offset can point
+    /// anywhere, so every step is checked and the answer is a sentence rather
+    /// than a panic: this is a log line, and a fixture that cannot be
+    /// identified must not fail a run that would otherwise pass.
+    fn kernel_identity(kernel: &[u8]) -> String {
+        let field = 0x20eusize;
+        if kernel.len() < field + 2 || &kernel[0x202..0x206] != b"HdrS" {
+            return "the kernel carries no setup header this can read".to_string();
+        }
+        let at = 0x200 + usize::from(u16::from_le_bytes([kernel[field], kernel[field + 1]]));
+        if at == 0x200 || at >= kernel.len() {
+            return "the kernel carries no version string".to_string();
+        }
+        let end = kernel[at..]
+            .iter()
+            .position(|b| *b == 0)
+            .map_or(kernel.len(), |n| at + n);
+        format!(
+            "kernel version `{}`",
+            String::from_utf8_lossy(&kernel[at..end.min(at + 160)])
+        )
     }
 
     /// What each side printed, for a failure message.
