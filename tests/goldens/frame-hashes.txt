@@ -25,8 +25,8 @@ nes-ntsc        15 0x3a7468c031f3e0c0 0xcee3f9389a95abb2
 nes-ntsc        30 0xefb67cac549a3ac9 0xf83bc0f01230b86f
 nes-ntsc        45 0x0f426357402df3f3 0x6ef68ca967ccc67b
 nes-ntsc        60 0xff3381ade83bdd7d 0x175582212a3444c1
-riscv-virt      30 0x8b558a563eaa74e8 -
-riscv-virt      60 0xaae930a1b85820b7 -
+riscv-virt      30 0x786012052a90304b -
+riscv-virt      60 0x028d8345bd419d96 -
 sms-ntsc        15 0x3f86e7297609d348 0x695fffe4cc030467
 sms-ntsc        30 0x912737b9c68ae977 0x5b3a250f07174c4c
 sms-ntsc        45 0xb0e22a51cb7da2ce 0x297575013e5d5d1b

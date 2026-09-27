@@ -679,6 +679,66 @@ than this:
 --smoke`, which is the same order and is what says the number is the mechanism
 rather than this core's arrangement of it.
 
+### And the third one: the platform-timer cache was read out of the cell
+
+The leg below found this on its **first run against a refreshed fixture**, which
+is the whole argument for not pinning one. `Hart::run_budget` takes one sample
+of the platform timer as it returns, for the snapshot, and its documentation
+argued that the sample was engine-independent because *"all three engines finish
+a budget on the same guest instruction"*. The premise is true and the conclusion
+does not follow.
+
+The sample read `Session::time_src` — the CLINT's **published cell** — and a
+cell is only as fresh as the last catch-up. A catch-up happens where a hart
+publishes a position that crosses the chip's deadline, and `Exec::read_at`
+publishes on every bus cycle **including every instruction fetch** while a
+compiled block makes no fetches at all. So a chain that touched no device left
+the cell where the previous access had put it, and two harts that had retired
+the same instruction cached different numbers:
+
+```text
+riscv-virt: engine=jit left the interpreter at quantum 308, 0.307046 s of guest time.
+    Device `cpu0` (cpu.riscv):
+        mtime          0x00000000002eda06 interpreted   0x00000000002ed830 translated
+```
+
+One field, 470 ticks of the board's 10 MHz timer behind — and `engine=jit`, not
+only `jit-host`, which is what says it is not the inlined memory path. It is not
+reachable through any instruction: a guest that reads `time` gets
+`Exec::refresh_time`'s answer, computed at this hart's own position. The cache's
+only consumer is the snapshot, and the snapshot is in `Machine::state_hash`,
+which `ROADMAP.md` §0 requires to be identical across engines.
+
+`LiveCounter::read_at` is the repair, and it is the same call `refresh_time`
+already makes: the value is a function of `State::cycles`, which every engine
+agrees on at every instruction boundary, so it cannot depend on how many times
+this hart happened to publish. A board that wired only a cell and no counter, or
+a hart nothing scheduled, keeps the old read — there is no position to ask about,
+and nothing on such a board moves `mtime` inside a round either.
+
+**It is pre-existing on `master` and it has no hermetic test, and both halves of
+that are measured rather than assumed.** Built with `master`'s
+`cpu::riscv::{engine,exec}` and this branch's leg, the same fixture parts at the
+same quantum with the same two values, so neither of the two fixes above is
+implicated. And three synthetic shapes were built and *none* of them reaches it:
+
+| what was run | result with the fix reverted |
+| --- | --- |
+| `a_synthetic_riscv_workload_agrees_across_the_engines`, 20 ms and 300 ms, `clint` seam on | passes |
+| the same with the `clint` seam **off**, so the loop's `ld` of `mtime` is a `NOP` | passes |
+| a hand-assembled machine-mode guest: 64 ALU instructions a pass, a comparator re-armed from **inside** the loop two CLINT ticks ahead, 64 rounds | passes |
+
+The reason is `Scheduler::natural_target`: it ends a round on the soonest event a
+lazily-advanced device has of its own, so on a *designed* workload the CLINT's
+deadline **is** a round boundary and nothing crosses it mid-round on either
+engine. A real kernel gets past that by moving `mtimecmp` somewhere a fixture
+author did not think to, and reading the chip from places a fixture author did
+not think to read it from. So the coverage for this one is
+`a_real_riscv_linux_boot_agrees_across_the_engines`, which finds it in 19 s of
+wall clock — and the honest statement is that it is a *fixture-dependent* gate
+rather than a hermetic one. The three rows above are what a fourth attempt
+should start from rather than repeat.
+
 ### The kernel leg, and why this core did not have one
 
 Both of the two above were found *by construction* rather than by a guest, and

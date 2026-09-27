@@ -941,9 +941,13 @@ impl Hart {
     /// reflects `mtime`": it is the value `mtime` holds at the instant this
     /// hart reads it, which is the value a load of `mtime` returns too.
     ///
-    /// The per-step sample of the cell stays exactly as it was, so the
-    /// snapshot's `csrs.mtime` is the same number on every engine
-    /// ([`run_budget`](Hart::run_budget) has why that matters).
+    /// The per-step sample of the cell stays exactly as it was. What does *not*
+    /// stay as it was is the one [`run_budget`](Hart::run_budget) takes as it
+    /// returns: that used to read this counter's cell too, and a cell is only as
+    /// fresh as the last catch-up, so the snapshot's `csrs.mtime` was **not**
+    /// the same number on every engine. It is computed from the hart's own
+    /// position now, through [`LiveCounter::read_at`] and for the same reason
+    /// this method exists; `run_budget` has the measurement.
     pub fn attach_counter(&self, counter: Arc<LiveCounter>) {
         let mut session = self.session.lock();
         session.time_src = Some(counter.cell());
@@ -1121,14 +1125,40 @@ impl Hart {
     /// hold the cell as of the last instruction under `interp` and as of the
     /// start of the last **block** under either JIT — one guest state, two
     /// hashes, which `ROADMAP.md` §0 forbids. So the budget takes one more
-    /// sample as it returns. All three engines finish a budget on the same
-    /// guest instruction, which is what `engine`'s `Host::spent` exists for,
-    /// so that sample is the same number on all three — and it is taken once
-    /// per round rather than once per instruction, which is why it is here
-    /// rather than beside the other one.
+    /// sample as it returns, and it is taken once per round rather than once
+    /// per instruction, which is why it is here rather than beside the other
+    /// one.
+    ///
+    /// **That sample is computed from this hart's own position, not read out of
+    /// the cell**, and the difference is a defect a real kernel found. This
+    /// used to say *"all three engines finish a budget on the same guest
+    /// instruction … so that sample is the same number on all three"*. The
+    /// premise is true and the conclusion does not follow: `Session::time_src`
+    /// is the CLINT's *published* cell, and a cell is only as fresh as the last
+    /// catch-up. A catch-up happens where a hart publishes a position that
+    /// crosses the chip's deadline, and the interpreter publishes on **every
+    /// bus cycle including every instruction fetch** while a translated block
+    /// makes no fetches at all. So a chain that touched no device left the cell
+    /// where the previous round's last access had put it, and two harts that
+    /// had retired the same instruction cached different numbers.
+    ///
+    /// Measured on `riscv-virt` with Debian's installer kernel through
+    /// `tests/engine_longrun.rs`: `engine=jit` parted from the interpreter at
+    /// quantum 308, 0.307 s of guest time, naming this one field — `mtime`
+    /// `0x2eda06` interpreted against `0x2ed830` translated, 470 ticks of the
+    /// board's 10 MHz timer behind. `jit` and not only `jit-host`, which is
+    /// what says it is not the inlined memory path.
+    ///
+    /// [`LiveCounter::read_at`] is the repair and it is the same call
+    /// `Exec::refresh_time` already makes for a guest's own `rdtime`: the value
+    /// is a function of `State::cycles`, which every engine agrees on at every
+    /// instruction boundary, so it cannot depend on how many times this hart
+    /// happened to publish. A board that wired only a cell and no counter, or a
+    /// hart nothing scheduled, keeps the old read — there is no position to ask
+    /// about, and nothing on such a board moves `mtime` inside a round either.
     ///
     /// It is load-bearing on every board with a CLINT: `mtime` moves inside a
-    /// round wherever a hart's own access catches the block up, and the cache
+    /// round wherever a hart's own access catches the chip up, and the cache
     /// would otherwise hold the cell as of a different guest instruction on
     /// each engine. What a guest *reads* from `time` does not come from this
     /// cache any more — [`attach_counter`](Hart::attach_counter) computes that
@@ -1167,11 +1197,22 @@ impl Hart {
             }
         }
         let mut session = self.session.lock();
-        if let Some(timer) = &session.time_src {
-            // The platform-timer cache, brought level one last time — see this
-            // method's documentation for why the per-`advance` sample is not
-            // enough for the snapshot.
-            let now = timer.load(Ordering::Relaxed);
+        // The platform-timer cache, brought level one last time — see this
+        // method's documentation for why the per-`advance` sample is not enough
+        // for the snapshot, and why this one is computed from the hart's own
+        // position instead of read out of the CLINT's cell.
+        let sampled = match (&session.timing.counter, &session.timing.cursor) {
+            (Some(counter), Some(cursor)) => Some(counter.read_at(cursor, session.state.cycles)),
+            // No counter (a board that wired only a cell) or no cursor (a hart
+            // nobody scheduled): there is no position to ask about, so the cell
+            // is all there is — which is what this line was for every board
+            // before `attach_counter` existed.
+            _ => session
+                .time_src
+                .as_ref()
+                .map(|timer| timer.load(Ordering::Relaxed)),
+        };
+        if let Some(now) = sampled {
             session.state.csrs.mtime = now;
         }
         if used >= allowance {
