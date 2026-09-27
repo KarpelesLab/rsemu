@@ -1909,18 +1909,58 @@ impl FastMem for Host<'_, '_> {
     /// * **the open bus goes back to being the block's**, because this access
     ///   latched nothing in `Exec` and the byte is in [`OPEN_BUS`].
     ///
-    /// What is deliberately **not** here is the interrupt-pin check
-    /// [`IrHost::load`] makes. That exists because a read of a lazily-advanced
-    /// device — the local APIC, the HPET — catches the chip up and can bring a
-    /// line up mid-block. An inlined load reaches plain RAM by construction:
-    /// `jit::Tlb::fill` caches only a page that resolves to a direct `RamStore`
-    /// with permissive constraints, so there is no device to advance and no pin
-    /// that can rise.
+    /// * **the published position**, and this is the one that was missing. See
+    ///   below.
+    ///
+    /// # The position, and the pin that follows it
+    ///
+    /// `Exec::phys_read` publishes this core's live position on every bus
+    /// cycle, and `TickCursor::set` is not a bookkeeping call: it compares the
+    /// position against `CursorInner::deadline` — *"the first tick at which some
+    /// lazily-advanced device has an event of its own"* — and calls
+    /// `TickCursor::reach`, which syncs every such device and lets it drive its
+    /// wires. **So a lazily-advanced device's own event is delivered by a
+    /// publication and by nothing else.**
+    ///
+    /// This function used to charge the clocks and not publish them, and the
+    /// paragraph that used to stand here argued that it did not have to: an
+    /// inlined access reaches plain RAM by construction, so there is no device
+    /// to advance and no pin that can rise. The first half is true and the
+    /// second does not follow. The device that is advanced is not the one the
+    /// access reached, it is *every* lazily-advanced device on the machine, and
+    /// what advances it is the tick count crossing a deadline. A block whose
+    /// accesses are all served inline therefore stood still as far as the
+    /// cursor was concerned, and an 8254 whose `OUT0` was due inside it drove
+    /// its edge late — or not at all within the round. Measured on `pc64` with
+    /// a 6.12 kernel: `jit-host` left the interpreter at quantum 275 761,
+    /// 136.03 s of guest time, naming `intr` **1 interpreted against 0
+    /// translated** — the interpreter had taken the timer edge and the
+    /// translated core had not seen it. `jit`, which publishes every access
+    /// because it has no inlined path, agreed for the whole run; only the host
+    /// code generator parted, which is the signature of a defect in the
+    /// inlined path rather than in the frontend.
+    ///
+    /// The pin check follows from the publication rather than from the access:
+    /// once `reach` can run here, `INTR` can rise here, and it has to reach the
+    /// block's next guest instruction boundary the way [`IrHost::load`]'s does
+    /// — through [`Host::hand_back`] — or the block runs up to [`MAX_INSNS`]
+    /// instructions past the instruction an interpreted core would have taken
+    /// it on.
+    ///
+    /// Published *after* the bytes rather than before, which is where
+    /// `Exec::phys_read` has it. It is unobservable for the same reason the
+    /// store's ordering below is: the access reached RAM, `reach` advances
+    /// devices, and nothing a device does to RAM is visible to a load that has
+    /// already happened on a machine with one master.
     fn note_fast_load(&mut self) {
         let clocks = self.exec.variant().bus_clocks();
         self.exec.charge(clocks);
+        self.exec.publish_position();
         self.cur_access = true;
         self.bus_locked = false;
+        if self.pins() {
+            self.hand_back();
+        }
     }
 
     /// One aligned store was served inline; pay what moving the bytes did not.
@@ -1956,6 +1996,12 @@ impl FastMem for Host<'_, '_> {
     fn note_fast_store(&mut self, addr: u64, bytes: u64) {
         let clocks = self.exec.variant().bus_clocks();
         self.exec.charge(clocks);
+        // And the live position, for the whole of the reason
+        // [`FastMem::note_fast_load`] gives: a lazily-advanced device's own
+        // event is delivered by a publication and by nothing else, so a block
+        // that only ever stores inline stands still as far as every timer on
+        // the machine is concerned.
+        self.exec.publish_position();
         self.cur_access = true;
         self.bus_locked = false;
         let phys = self
@@ -1971,6 +2017,13 @@ impl FastMem for Host<'_, '_> {
         self.exec.mem.monitor().note_store(phys, bytes);
         self.exec.note_write(phys);
         self.note_writes();
+        // The pin the publication above can have raised, carried to this
+        // block's next guest instruction boundary exactly as [`IrHost::store`]
+        // carries it. `note_writes` may already have handed back for a store
+        // into this block's own page; asking again is one compare.
+        if self.pins() {
+            self.hand_back();
+        }
     }
 }
 
@@ -2642,6 +2695,63 @@ mod tests {
                 "world {world} has segment bases, so nothing in it may be inlined"
             );
         }
+    }
+
+    /// An inlined access publishes this core's position, and an interpreted one
+    /// publishes the same number.
+    ///
+    /// `TickCursor::set` is not bookkeeping: it compares the position against
+    /// the first tick at which some lazily-advanced device has an event of its
+    /// own and calls `TickCursor::reach`, which syncs every such device and
+    /// lets it drive its wires. **A lazily-advanced device's own event is
+    /// delivered by a publication and by nothing else**, so a block whose
+    /// accesses are all served inline used to stand still as far as every timer
+    /// on the machine was concerned. On `pc64` with a 6.12 kernel that showed
+    /// as `jit-host` leaving the interpreter at quantum 275 761 naming `intr`
+    /// **1 interpreted against 0 translated** — the 8254's edge, taken by one
+    /// core and not the other.
+    ///
+    /// What is asserted is the publication rather than the delivery, because
+    /// arming a deadline is `core::sched`'s to do and is tested there. Two
+    /// cores, one budget at a time, and the published position compared after
+    /// each: they end every round on the same instruction with the same charge
+    /// count, so the last access of a round is the same access and the number
+    /// it published is the same number. Without the publication in
+    /// [`FastMem::note_fast_load`] the translated core's cursor lags by
+    /// however much of the round was inlined.
+    ///
+    /// Long mode, because it is the only world that publishes an inlined path
+    /// at all — the test above is what says so.
+    #[test]
+    fn an_inlined_access_publishes_the_position_an_interpreted_one_publishes() {
+        use crate::core::sched::TickCursor;
+
+        let case = busy(2);
+        let (space_a, _ram_a) = differential::machine(&case);
+        let (space_b, _ram_b) = differential::machine(&case);
+        let interp = core(&case, space_a, Engine::Interp);
+        let jit = core(&case, space_b, Engine::JitHost);
+        let (left, right) = (TickCursor::new(), TickCursor::new());
+        interp.attach_cursor(&left);
+        jit.attach_cursor(&right);
+        for round in 0..8 {
+            interp.run_budget(4_000);
+            jit.run_budget(4_000);
+            assert_eq!(
+                left.get(),
+                right.get(),
+                "round {round}: the interpreter published position {} and the \
+                 translated core {}. A lazily-advanced device's event is \
+                 delivered by a publication and by nothing else",
+                left.get(),
+                right.get()
+            );
+        }
+        let s = jit.jit_stats().expect("statistics");
+        assert!(
+            !HOST_COMPILES || (s.fast_loads > 0 && s.fast_stores > 0),
+            "nothing was served inline, so this proves nothing"
+        );
     }
 
     /// An inlined store marks the dirty bitmap an interpreted one marks.
