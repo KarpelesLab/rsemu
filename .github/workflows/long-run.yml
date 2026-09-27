@@ -1,15 +1,16 @@
 name: Long run
 
 # The interpreter against each translated engine, quantum by quantum: over the
-# three synthetic workloads at thirty guest seconds each, and over **two** real
-# Linux boots — an AArch64 one on `arm64-virt` and an x86-64 one on `pc64`.
+# three synthetic workloads at thirty guest seconds each, and over **three** real
+# Linux boots — an AArch64 one on `arm64-virt`, an x86-64 one on `pc64` and a
+# riscv64 one on `riscv-virt`.
 #
 # # Why this is not in ci.yml
 #
-# It needs two kernels that cannot be committed (both GPL-2.0 — running one as
-# an emulated guest is ordinary use, shipping it here is redistribution), 48 MiB
-# of download between them, and minutes of wall time on each board. None of
-# that belongs on a pull request.
+# It needs three kernels and a firmware that cannot be committed (all GPL-2.0 —
+# running one as an emulated guest is ordinary use, shipping it here is
+# redistribution), about 80 MiB of download between them, and minutes of wall
+# time on each board. None of that belongs on a pull request.
 #
 # # Why it is not merely an opt-in test either
 #
@@ -64,14 +65,16 @@ concurrency:
 
 jobs:
   long-run:
-    name: engine divergence (a64, RISC-V, x86; arm64 and x86-64 Linux)
+    name: engine divergence (a64, RISC-V, x86; arm64, x86-64 and riscv64 Linux)
     runs-on: ubuntu-latest
-    # A boot is minutes, two engines is twice that, there are two boots now,
+    # A boot is minutes, two engines is twice that, there are three boots now,
     # the three synthetic legs are several more, and the runner's default would
     # kill it silently part-way. Measured on a 64-core host: 319 s for the
     # arm64 boot at 120 guest seconds, about 960 s for the x86 one at 900, and
     # the synthetic half beside them — so the budget is roughly twice what it
-    # takes, which is what a nightly wants.
+    # takes, which is what a nightly wants. The riscv64 boot joined them at
+    # 119 s for the two engines together at 1 200 ms, measured, which is inside
+    # the slack rather than a reason to re-size.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -88,6 +91,13 @@ jobs:
       # complete boot without it, so this step does not gate the job.
       - name: fetch the x86-64 kernel and ramdisk
         run: ./scripts/fetch-testdata.sh x86-linux initramfs-x86
+      # The RISC-V half, which wants two fixtures rather than one: OpenSBI's
+      # `fw_jump.bin` and a supervisor-mode `Image` for it to hand control on
+      # to. This leg is newer than the other two — the core had two defects
+      # found by construction with no guest watching it — and
+      # `docs/platforms/riscv-virt.md` has both.
+      - name: fetch the riscv64 firmware, kernel and ramdisk
+        run: ./scripts/fetch-testdata.sh opensbi linux initramfs
       # RSEMU_LONGRUN_REQUIRED turns the stage's "no kernel, skipping" into a
       # failure. On a developer's machine skipping is right; here it would mean
       # a held gate that nothing was holding, which is exactly the shape the
@@ -127,7 +137,8 @@ jobs:
             # 6.12.107 kernel and a ramdisk eighty bytes larger than the one on
             # the machine trying to reproduce it, and both of those are inputs
             # the checks list can simply carry.
-            grep -E '^pc64: (kernel version|initramfs is)' long-run.log | while IFS= read -r line; do
+            grep -E '^(pc64: (kernel version|initramfs is)|riscv-virt: (firmware|kernel|initramfs):)' \
+              long-run.log | while IFS= read -r line; do
               echo "::error title=fixture::$line"
             done
           fi

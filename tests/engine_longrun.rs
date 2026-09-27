@@ -1549,6 +1549,350 @@ mod riscv_tests {
 }
 
 // ---------------------------------------------------------------------------
+// and the same board with a guest nobody designed for it
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "machine-riscv-virt", feature = "cpu-riscv-lift"))]
+mod riscv_virt_linux {
+    use std::sync::Arc;
+
+    use super::longrun::{self, Options};
+    use rsemu::core::Captured;
+    use rsemu::cpu::riscv::Hart;
+    use rsemu::host::chardev::CharPort;
+    use rsemu::machine::{Machine, catalog};
+
+    /// Where OpenSBI's `fw_jump` hands control on, in S-mode.
+    ///
+    /// Not a choice: `fw_jump.bin` is built with that address compiled into it
+    /// and `testdata/riscv/PROVENANCE-linux.txt` records the pairing. A flat
+    /// RISC-V `Image` is loaded there and entered with `a0` holding the hart id
+    /// and `a1` the device tree, which is the RISC-V Linux boot protocol's whole
+    /// loader side.
+    const PAYLOAD_ADDR: u64 = 0x8020_0000;
+
+    /// Splice a `riscv.loader` for the kernel into the board's own source.
+    ///
+    /// The shipped board has exactly one firmware image, because that is what a
+    /// board *is*; a supervisor-mode payload is a property of the experiment.
+    /// `cpu::riscv::tests`'s `with_payload` makes the same splice for the same
+    /// reason and says so at length — this is the integration-test side of it,
+    /// which cannot reach a private helper in the crate.
+    ///
+    /// Appended last, deliberately: `Machine::reset` runs devices in declaration
+    /// order and a cold reset clears RAM, so a loader declared before the region
+    /// it writes into would have its image erased by the reset that ends
+    /// realize.
+    fn with_payload(source: &str, slot: &str, addr: u64) -> String {
+        let end = source
+            .rfind('}')
+            .expect("a machine description ends with a brace");
+        format!(
+            "{}\n  object payload0 \"riscv.loader\" {{\n    space = mem\n    image = \"{slot}\"\n  \
+             \x20 addr  = {addr:#x}\n  }}\n{}",
+            &source[..end],
+            &source[end..],
+        )
+    }
+
+    /// Build `riscv-virt` on `engine` with `firmware` in its firmware slot,
+    /// `kernel` spliced in at [`PAYLOAD_ADDR`] and `initrd` in its ramdisk slot.
+    ///
+    /// `console` and `power` are per-machine, because two of these run in one
+    /// process and must not type at each other or stop each other.
+    fn board(
+        engine: &str,
+        tag: &str,
+        firmware: &[u8],
+        kernel: &[u8],
+        initrd: &[u8],
+    ) -> (Machine, Arc<Hart>, Arc<CharPort>) {
+        let port = format!("longrun.riscv.linux.{tag}");
+        let entry = catalog::machine("riscv-virt").expect("this build ships riscv-virt");
+        // The catalog's own binding, with a hand kept on what it builds: a
+        // translated run has to be able to say how many blocks it executed, and
+        // `Machine` deliberately hands out a `dyn Device`.
+        let harts: Arc<Captured<Hart>> = Arc::new(Captured::new());
+        let kept = Arc::clone(&harts);
+        let mut bindings = catalog::bindings().expect("this build's bindings");
+        bindings.replace("cpu.riscv", move |props| {
+            let hart = Arc::new(Hart::from_props(props)?);
+            kept.push(&hart);
+            Ok(hart)
+        });
+        let mut options = catalog::build_options()
+            .expect("the catalog agrees with itself")
+            .with_bindings(bindings);
+        options.realize.media.insert("firmware", firmware);
+        options.realize.media.insert("initrd", initrd);
+        options.realize.media.insert("payload0", kernel);
+        for slot in ["flash0", "flash1", "disk"] {
+            options.realize.media.insert(slot, &[][..]);
+        }
+        for (name, value) in [
+            (
+                "ram",
+                std::env::var("RSEMU_RISCV_RAM").unwrap_or_else(|_| "512M".to_string()),
+            ),
+            ("engine", engine.to_string()),
+            ("console", port.clone()),
+            ("power", port.clone()),
+            (
+                "cmdline",
+                std::env::var("RSEMU_RISCV_BOOTARGS")
+                    .unwrap_or_else(|_| "console=ttyS0 earlycon=sbi rdinit=/init".to_string()),
+            ),
+        ] {
+            options.resolve.params.push((String::from(name), value));
+        }
+        let source = with_payload(entry.source, "payload0", PAYLOAD_ADDR);
+        let registry = catalog::registry().expect("a registry");
+        let machine = rsemu::machine::build(entry.name, &source, &registry, &options)
+            .unwrap_or_else(|e| panic!("riscv-virt does not build with engine={engine}: {e}"));
+        let console = rsemu::host::chardev::ports::open(&options.realize.hosts, &port)
+            .expect("the 16550 opened this port under the same name");
+        let hart = harts.take().expect("the binding captured the hart");
+        (machine, hart, console)
+    }
+
+    /// The RISC-V half of the kernel gate: OpenSBI, a stock Debian `Image`,
+    /// both engines, quantum by quantum.
+    ///
+    /// # Why this exists rather than the synthetic RISC-V leg alone
+    ///
+    /// The same argument the `pc64` leg makes, and this core is where it was
+    /// proved twice over. `a_synthetic_riscv_workload_agrees_across_the_engines`
+    /// is written seam by seam off `cpu::riscv::engine` — machine-mode PMP, the
+    /// Sv39 tables, the CLINT arming its own comparator — and the honest limit
+    /// of that is that it exercises what its author read off `engine.rs`. Two
+    /// defects were latent underneath it:
+    ///
+    /// * a **declined boundary's Sv39 walk** charged on the wrong side of the
+    ///   budget test, which needs a cold instruction-fetch translation standing
+    ///   in front of an instruction outside the lifted subset — a kernel
+    ///   reaches that on every `SRET` back into a page it has not run from
+    ///   lately, and the synthetic guest reaches it only where its author wrote
+    ///   an `SFENCE.VMA` on purpose;
+    /// * an **inlined access publishing no position**, which stops the CLINT
+    ///   being caught up at all and therefore stops `mtip` arriving. A guest
+    ///   whose hot loops are entirely plain-RAM loads and stores is what makes
+    ///   that visible, and a kernel's are.
+    ///
+    /// Both were found by construction rather than by this leg, and this leg is
+    /// what keeps them found. It also reaches OpenSBI's M-mode trap handler,
+    /// `ecall`s across the SBI boundary, the kernel's own `virtio_mmio` probe,
+    /// the 16550 handover off the SBI earlycon, and an initramfs unpacked out of
+    /// several hundred megabytes of page cache — none of which the synthetic
+    /// guest contains a single instruction of.
+    ///
+    /// # When the fixture is absent
+    ///
+    /// It skips loudly, printing the commands that would make it run, the way
+    /// the other two kernel legs do. `RSEMU_LONGRUN_REQUIRED` in
+    /// `scripts/check.sh` turns that skip into a failure.
+    #[test]
+    #[ignore = "needs a fetched firmware and kernel (scripts/fetch-testdata.sh opensbi linux) and minutes of wall time"]
+    fn a_real_riscv_linux_boot_agrees_across_the_engines() {
+        let (Ok(fw_path), Ok(kernel_path)) = (
+            std::env::var("RSEMU_RISCV_FIRMWARE"),
+            std::env::var("RSEMU_RISCV_KERNEL"),
+        ) else {
+            eprintln!(
+                "\n  SKIPPED: RSEMU_RISCV_FIRMWARE and RSEMU_RISCV_KERNEL are not both set,\n\
+                 so there is no firmware and kernel pair to boot.\n\
+                 \n      scripts/fetch-testdata.sh opensbi linux initramfs\n\
+                 \n      RSEMU_RISCV_FIRMWARE=testdata/riscv/fw_jump.bin \\\n\
+                 \x20     RSEMU_RISCV_KERNEL=testdata/riscv/linux \\\n\
+                 \x20     RSEMU_RISCV_INITRD=testdata/riscv/initramfs.cpio \\\n\
+                 \x20     RSEMU_LONGRUN_MS=1200 \\\n\
+                 \x20         cargo test --release --test engine_longrun -- --ignored --nocapture\n\
+                 \n  The synthetic RISC-V leg exercises the seams its author read off\n\
+                 engine.rs. Two defects lived underneath it until 2026-09-28.\n"
+            );
+            return;
+        };
+        let firmware = std::fs::read(&fw_path).unwrap_or_else(|e| {
+            panic!("RSEMU_RISCV_FIRMWARE names `{fw_path}`, which will not read: {e}")
+        });
+        let kernel = std::fs::read(&kernel_path).unwrap_or_else(|e| {
+            panic!("RSEMU_RISCV_KERNEL names `{kernel_path}`, which will not read: {e}")
+        });
+        // An empty value counts as unset, because `scripts/check.sh` passes one
+        // when it has no ramdisk to offer — `env VAR=` sets the variable rather
+        // than leaving it out.
+        let initrd = match std::env::var("RSEMU_RISCV_INITRD") {
+            Ok(p) if !p.is_empty() => {
+                std::fs::read(&p).unwrap_or_else(|e| panic!("RSEMU_RISCV_INITRD names `{p}`: {e}"))
+            }
+            _ => Vec::new(),
+        };
+        // **Which** firmware, kernel and ramdisk. None of the three is pinned
+        // and none can be: `scripts/fetch-testdata.sh` fetches Debian's
+        // installer kernel from `.../current/...`, where a point release
+        // replaces it. So a failure is a failure *of a particular set of
+        // inputs*, and a log that does not name them cannot be reproduced —
+        // which is what a red `Long run` cost on the x86 leg when it parted on a
+        // 6.12.107 kernel the machine trying to reproduce it did not have.
+        // Printed before the run rather than in the failure message, because it
+        // is as interesting when the leg passes.
+        eprintln!("riscv-virt: {}", identity("firmware", &firmware));
+        eprintln!("riscv-virt: {}", identity("kernel", &kernel));
+        eprintln!("riscv-virt: {}", identity("initramfs", &initrd));
+
+        // A quantum on this board is 1 ms of a 1 GHz hart, and the synthetic
+        // leg's default is 20 ms for the reason it states. A kernel needs three
+        // orders of magnitude more than that to reach its own console, so the
+        // default here is the same 1 200 ms `scripts/check.sh` asks the A64
+        // kernel leg for — the two boards declare the same rate, so the same
+        // budget is the same guest work.
+        let ms: u64 = longrun::budget_millis("RSEMU_LONGRUN", 1_200);
+        let engines: Vec<String> = std::env::var("RSEMU_LONGRUN_ENGINES")
+            .unwrap_or_else(|_| "jit,jit-host".to_string())
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        for engine in engines {
+            let (mut oracle, _, left) = board(
+                "interp",
+                &format!("oracle.{engine}"),
+                &firmware,
+                &kernel,
+                &initrd,
+            );
+            let (mut under_test, hart, right) =
+                board(&engine, &engine, &firmware, &kernel, &initrd);
+            // The full hash walks the board's whole DRAM, so it is taken
+            // rarely; the per-quantum device fingerprint is what finds a
+            // divergence first and costs nothing beside a quantum.
+            let opts = Options::to_guest_millis(ms)
+                .hashing_every(20_000)
+                .reporting_every(10_000);
+            let (mut said, mut heard) = (Vec::new(), Vec::new());
+            let outcome = {
+                let mut pump = || {
+                    left.drain_into(&mut said);
+                    right.drain_into(&mut heard);
+                };
+                longrun::lockstep_pumping(
+                    "riscv-virt",
+                    &mut oracle,
+                    &engine,
+                    &mut under_test,
+                    &opts,
+                    &mut pump,
+                )
+            };
+            match outcome {
+                Ok(summary) => eprintln!("riscv-virt engine={engine}: {summary}"),
+                Err(d) => panic!("{d}\n{}", console_report(&said, &heard)),
+            }
+            assert_the_kernel_ran(&hart, &engine, &said, &heard);
+        }
+    }
+
+    /// A boot that agreed at every checkpoint still says nothing if the guest
+    /// did not run, and on a board driven by a fetched firmware/kernel pair that
+    /// is a real possibility rather than a theoretical one: an `Image` staged at
+    /// the wrong address, a DRAM too small for the ramdisk, or a firmware built
+    /// for a different jump address all end with a hart stopped early — and two
+    /// harts stopped in the same place agree on every hash they are asked for.
+    ///
+    /// Three claims, and none of them is "the boot got as far as X". How far a
+    /// kernel gets is a function of the budget and of which `Image` somebody
+    /// pointed at this, and a test that asserted a milestone would be asserting
+    /// the budget.
+    fn assert_the_kernel_ran(hart: &Hart, engine: &str, said: &[u8], heard: &[u8]) {
+        assert_eq!(
+            said,
+            heard,
+            "engine={engine}: the two machines printed different bytes, which \
+             the per-quantum fingerprint cannot see because a drained console \
+             is a host object rather than device state\n{}",
+            console_report(said, heard)
+        );
+        assert!(
+            !said.is_empty(),
+            "engine={engine}: the guest printed nothing at all, so it never \
+             reached its own console and this run compared two harts stopped in \
+             the same place"
+        );
+        // `RSEMU_LONGRUN_ENGINES=interp` is the control leg — an interpreter
+        // against itself — and an interpreted hart has no statistics.
+        if let Some(stats) = hart.jit_stats() {
+            assert!(
+                stats.blocks > 0,
+                "engine={engine} executed no translated block, so the run \
+                 compared two interpreters"
+            );
+            assert!(
+                stats.retired > stats.interpreted,
+                "engine={engine} retired {} instructions inside blocks against \
+                 {} interpreted, which is not a translated run",
+                stats.retired,
+                stats.interpreted
+            );
+            eprintln!(
+                "riscv-virt engine={engine}: {} blocks, {} instructions retired \
+                 in them against {} interpreted, {} inlined loads and {} \
+                 inlined stores",
+                stats.blocks, stats.retired, stats.interpreted, stats.fast_loads, stats.fast_stores,
+            );
+        }
+        let text = String::from_utf8_lossy(said);
+        eprintln!(
+            "riscv-virt engine={engine}: {} bytes on the console, identical on \
+             both machines{}. The last of it:\n{}",
+            said.len(),
+            if text.contains("Linux version") {
+                ", past `Linux version`"
+            } else {
+                ", still in OpenSBI"
+            },
+            tail(&text)
+        );
+    }
+
+    /// What a fetched image is, in one line, so a log names the fixture it ran.
+    ///
+    /// Length and a leading digest rather than a version string: a flat RISC-V
+    /// `Image` carries no field naming its own version the way a `bzImage`'s
+    /// setup header does, so the honest identity is the bytes. The digest is
+    /// FNV-1a over the whole image — not a cryptographic claim, a fingerprint
+    /// that two logs can be compared on.
+    fn identity(what: &str, bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return format!("{what}: none");
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        format!("{what}: {} bytes, fnv1a {h:#018x}", bytes.len())
+    }
+
+    /// The two consoles side by side, for a failure message.
+    fn console_report(said: &[u8], heard: &[u8]) -> String {
+        format!(
+            "--- the oracle's console ({} bytes) ---\n{}\n--- the engine under \
+             test's console ({} bytes) ---\n{}",
+            said.len(),
+            tail(&String::from_utf8_lossy(said)),
+            heard.len(),
+            tail(&String::from_utf8_lossy(heard)),
+        )
+    }
+
+    /// The last twenty lines of a console log.
+    fn tail(text: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(20)..].join("\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the same shape on a third core, with a workload built for its seams
 // ---------------------------------------------------------------------------
 

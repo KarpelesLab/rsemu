@@ -696,6 +696,45 @@ path, because a memory plan covers plain little-endian RAM over a whole page:
    block. The host now samples `AddressSpace::generation` at entry and again
    after each such store.
 
+#### And a third that x86 had and this core does not
+
+`docs/platforms/pc64.md` recorded a question as **open** for this core, and it is
+now closed as a measured negative rather than a fix. On `pc64`,
+`FastMem::note_fast_load` charged its bus clocks without publishing the core's
+position, and since `TickCursor::set` is what syncs every lazily-advanced device
+on the machine — *"a lazily-advanced device's own event is delivered by a
+publication and by nothing else"* — a block whose accesses were all served
+inline stood still as far as the 8254 was concerned. `cpu::riscv::engine` had it
+too, from the CLINT, and its real-Linux leg finds it in a third of a guest
+second.
+
+**It cannot arise here, for two reasons.**
+
+* `Cpu::attach_cursor` takes the safe point's exit flag out of the cursor and
+  nothing else. This core never calls `TickCursor::set`, under any engine, so
+  there is no position to lose — and none of the devices `a64-mini`,
+  `arm64-virt` or `arm64-virt-smp` declare implements `Device::attach_lazy`, so
+  there is no instance of the mechanism on an A64 board to lose one for. If one
+  ever appears, it will be broken under *both* engines equally, which is a board
+  defect rather than a §0 violation, and this paragraph is where to start.
+* The event this core does have is its **own** generic timer, and it is
+  delivered by `IrHost::spent`'s `st.cycles >= timer_edge` rather than by a
+  publication. That is asked at every guest instruction boundary and is reached
+  by an inlined access, because `FastMem::note_fast_load` and
+  `Exec::note_fast_store` charge `State::cycles` exactly as the calls they
+  replaced did.
+
+The second is a property of two lines in the hottest path in the build, so it is
+asserted rather than argued:
+`the_generic_timer_is_taken_at_the_same_instruction_when_every_access_is_inlined`
+runs the load-and-store loop through both engines out of a warm shadow — with
+`fast_loads` and `fast_stores` checked non-zero, so the test cannot pass
+vacuously — arms `CNTP_CVAL_EL0` thirty-seven ticks into the next quantum's
+chain, and compares `ELR_EL1`. Removing the charge from `note_fast_load` fails
+it. The test beside it,
+`the_generic_timer_is_taken_at_the_same_instruction_by_both_engines`, could not
+have: its `ALU_LOOP` touches no memory, so nothing in it is inlinable at all.
+
 #### What it bought
 
 `benches/a64_linux_boot.rs`, twenty guest seconds of the boot,

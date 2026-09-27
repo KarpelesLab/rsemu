@@ -519,6 +519,178 @@ a number taken from it would have measured nothing. It now has a second table
 in the shape `benches/a64_dispatch` already had: `Hart::run_budget` across six
 quanta, with the `interp` row as a control that shares no code with the change.
 
+### And the same walk, charged on the wrong side of the budget test
+
+The section above is about a walk moving a **pin**. This one is about a walk
+moving the **clock**, and it reached this core as a *prediction* rather than as a
+failure: `cpu::x86::engine` parted from its interpreter 112 s into a Debian boot
+on exactly this shape, and the agent that fixed it wrote down that
+`cpu::riscv::engine` had the same structure — *"its `Stop::Declined` falls into
+the arm that only publishes, and its `admit` charges an Sv39 walk the same
+way"*. `docs/platforms/pc64.md` has the x86 half.
+
+**A predicted defect is still a prediction, so it was measured.**
+`declining_hart` in `src/cpu/riscv/engine.rs` is the fixture: a supervisor-mode
+hart under a **three-level** Sv39 table — three levels rather than a gigapage,
+because what has to be reached is an allowance that runs out *inside* the walk
+and three descriptor reads is a window three times as wide as one. Its loop is
+
+```text
+  virtual 0x0000   addi x5, x5, 1
+                   sfence.vma          ; cools both pages, every pass
+                   addi x6, x6, 1
+                   addi x6, x6, 1
+                   jal  x0, +0xff0     ; off this page, to 0x1000
+  virtual 0x1000   fence               ; outside the lifted subset
+                   addi x7, x7, 1
+                   jal  x0, -0x1004
+```
+
+The `sfence.vma` is on the *first* page, so nothing fetches the second between
+the flush and the chained boundary that reaches it — which is what keeps that
+boundary's translation cold on every pass. `jit::dispatch` charges a boundary's
+entry fetch translation through `Frontend::enter` **before** it asks the
+frontend whether a block may run there, and the instruction standing at
+`0x1000` is a `fence`, so the answer is no with three ticks of walk already
+paid. Instrumented, the declined boundary reports `used = 12` where the
+interpreter standing in front of the same instruction has spent 9.
+
+Over 61 consecutive budgets of 12 quanta each, comparing every column after
+**every** quantum:
+
+| | budgets that part |
+| --- | ---: |
+| before | **33 of 61** |
+| after | **0 of 61** |
+
+and each divergence is the same five columns the x86 report had: `pc` `0x1004`
+interpreted against `0x1000` translated, `cycles` and `debt` each short by two.
+The two is the conservation — the interpreter's `Exec::step` for that `fence`
+costs five, three of walk and two of fetch, and the translated hart had already
+paid the three.
+
+**Comparing per quantum rather than at the end of the run is the half that had
+to be learned**, and it is why this was still latent after the
+walk-raises-a-pin work above went in. The divergence self-corrects within two or
+three quanta, because the translated hart interprets the declined instruction on
+its next `advance` and the debts converge; an `agree_built` over twelve quanta
+that compares only the final state passes with the defect present. The first
+version of this test did exactly that and was green.
+
+The fix is `advance`'s `Stop::Declined | Stop::Untranslatable` arm: both stops
+mean the instruction at `run.pc` is the interpreter's, both are reached only
+with `Host::spent` **false** — `jit::dispatch` asks it before `Frontend::enter`
+at every boundary — and so both retire that instruction in the same call rather
+than after a return to the run loop. `cpu::arm::a64::engine` already did this,
+arrived at independently and for the same reason, and its comment is the one
+this file's now matches.
+
+**What the kernel leg says about it: nothing, and that is worth recording.**
+`a_real_riscv_linux_boot_agrees_across_the_engines` passes at 1 200 ms with the
+arm removed. The window is three ticks wide and a quantum on this board is a
+million ticks of a 1 GHz hart, where `pc64`'s is a hundred thousand of a
+100 MHz one — so the chance of a quantum ending inside the walk is an order of
+magnitude lower here, and 1 200 ms of guest time does not buy it. The 61-budget
+sweep is the coverage this defect has; the kernel leg is not it.
+
+### An inlined access publishes this hart's position
+
+The second thing that round found, and this one the kernel leg does catch.
+
+`Exec::read_at` and `Exec::write_once` publish on every bus cycle.
+`FastMem::note_fast_load` and `Exec::note_fast_store` charged the clocks and did
+not publish them, and `Exec::publish_position`'s own documentation defended
+that: *"the inlined RAM accesses that skip this publish nothing, which costs
+nothing: no lazily advanced device sits behind them."*
+
+The first clause is true. The second does not follow, and `TickCursor::set` is
+where it stops following:
+
+```text
+if ticks >= self.inner.deadline.load(Relaxed) {
+    self.reach(ticks);
+}
+```
+
+`CursorInner::deadline` is *"the first tick at which some lazily-advanced device
+has an event of its own"*, and `reach` syncs every one of them and lets it drive
+its wires. So what a publication advances is not the device the access reached —
+it is **every** lazily-advanced device on the machine, and what advances it is
+the tick count crossing a deadline. On this board that device is the CLINT, and
+the section above is the whole of why it matters: a comparator the guest moves
+into the round that is already running is crossed by a *catch-up*, and a
+catch-up happens where a position is published.
+
+So a block whose accesses were all served inline stood still as far as the
+machine timer was concerned. Measured on `FAR_LOOP` under `jit-host`, with a
+`TickCursor` on each of two harts and one 4 000-tick round at a time:
+
+| round | the interpreter published | the translated hart |
+| ---: | ---: | ---: |
+| 0 | 4 001 | **14** |
+| 7 | 32 001 | **14** |
+
+Fourteen, and fourteen again seven rounds later: once the shadow is warm nothing
+in that loop leaves the fast path at all, so the cursor froze at the last access
+a plan did not cover. `cpu::x86::engine`'s numbers for the same hole were 4 010
+against 118 on a comparable fixture, which is 3% rather than 0.04% — x86 inlines
+a smaller share of its accesses.
+
+**And the kernel leg finds it in a third of a guest second.** With the
+publication removed, `a_real_riscv_linux_boot_agrees_across_the_engines` on
+Debian's installer kernel:
+
+```text
+riscv-virt: engine=jit-host left the interpreter at quantum 306, 0.305912 s of guest time.
+    Device `cpu0` (cpu.riscv):
+        mtime          0x00000000002eadb6 interpreted   0x00000000002e8a10 translated
+```
+
+One column, and it is the CLINT's counter as the hart sees it — 9 126 ticks
+behind. That leg counts **109 435 966 inlined loads and 64 723 158 inlined
+stores** over its 1 200 ms, against 604 189 614 guest instructions retired inside
+blocks, which is the reason a third of a guest second is enough.
+
+The pin check follows from the publication rather than from the access. Once
+`reach` can run inside `note_fast_load`, `mtip` can rise there, and it has to
+reach the block's next guest instruction boundary the way `IrHost::load`'s does
+— through `Host::hand_back` — or the block runs up to `lift::MAX_INSNS`
+instructions past where `Exec::step` would have taken the trap.
+`IrHost::store`'s claim that neither of its two questions can arrive through the
+inlined path is now true of the **topology** half only, and says so.
+
+### The kernel leg, and why this core did not have one
+
+Both of the two above were found *by construction* rather than by a guest, and
+the reason is that until 2026-09-28 this core had no real-Linux leg in
+`tests/engine_longrun.rs` at all. It had
+`a_synthetic_riscv_workload_agrees_across_the_engines`, which is written seam by
+seam off `cpu::riscv::engine` and is a good test — and the honest limit of a
+test like that is that it exercises what its author read off `engine.rs`. The
+declined-boundary defect needs a quantum to end inside a cold fetch
+translation's walk; the publication defect needs a hot loop that never leaves
+the fast path. Neither is a thing the synthetic guest's author was aiming at.
+
+`a_real_riscv_linux_boot_agrees_across_the_engines` is that leg, and it is the
+`pc64` and `arm64-virt` ones' shape with one difference: **two fixtures rather
+than one**, because this board has firmware. OpenSBI's `fw_jump.bin` goes in the
+`firmware` media slot and a flat Debian `Image` is spliced in behind a
+`riscv.loader` at `0x80200000`, which is where `fw_jump` hands control on in
+S-mode. Neither image is pinned and neither can be — `scripts/fetch-testdata.sh`
+fetches from a `.../current/...` path a point release replaces — so the leg
+prints a length and an FNV-1a digest of each of the three inputs before it runs.
+A flat `Image` carries no field naming its own version the way a `bzImage`'s
+setup header does, so the bytes are the identity.
+
+`scripts/check.sh long`'s `stage_long_riscv` is the gate and
+`.github/workflows/long-run.yml` fetches the pair. Measured at 1 200 ms on one
+host: 68 s under `jit` and 49 s under `jit-host`, 119 s for the leg — inside the
+nightly's existing ninety-minute slack rather than a reason to re-size it. At
+that budget the guest reaches `io scheduler mq-deadline registered`, which is
+11 813 bytes of console and 604 189 614 guest instructions retired inside
+blocks; how far it gets is a function of the budget and of which `Image`
+somebody pointed at it, so the leg asserts none of it.
+
 ### `rdtime` and a load of `mtime` return the same number
 
 A suspicion raised while the section above was being written, and settled by

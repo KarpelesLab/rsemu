@@ -640,8 +640,50 @@ stage_long() {
 
   # A missing AArch64 kernel used to end the stage, which would now silently
   # take the x86 gate with it.
+  stage_long_riscv
   stage_long_x86
   stage_long_m68k
+}
+
+# The same gate on the RISC-V core: `riscv-virt`, OpenSBI, a stock Debian
+# `Image`, both engines, quantum by quantum.
+#
+# Its own leg because it wants two fixtures rather than one — a firmware *and* a
+# supervisor-mode payload — and because this is the leg that was missing when
+# two defects were found latent on this core by construction rather than by a
+# guest. Both are `cpu::riscv::engine`'s and both are fixed; what this leg is
+# for is the third one nobody has thought of. `docs/platforms/riscv-virt.md` has
+# them and what each of them showed as.
+#
+# `RSEMU_LONGRUN_MS` drives it, deliberately and unlike the x86 leg: this board
+# and `arm64-virt` both declare a 1 GHz core and a 1 ms quantum, so the same
+# budget is the same guest work on both and one knob for the pair is honest.
+stage_long_riscv() {
+  local fw kernel initrd ms
+  fw="${RSEMU_RISCV_FIRMWARE:-testdata/riscv/fw_jump.bin}"
+  kernel="${RSEMU_RISCV_KERNEL:-testdata/riscv/linux}"
+  initrd="${RSEMU_RISCV_INITRD:-testdata/riscv/initramfs.cpio}"
+  ms="${RSEMU_LONGRUN_MS:-1200}"
+
+  if [ ! -s "$fw" ] || [ ! -s "$kernel" ]; then
+    if [ -n "${RSEMU_LONGRUN_REQUIRED:-}" ]; then
+      record "FAIL  long riscv kernel boot -- RSEMU_LONGRUN_REQUIRED is set, so this had to run"
+      FAILED=$((FAILED + 1))
+    else
+      record "skip  long riscv kernel boot (no $fw or $kernel: scripts/fetch-testdata.sh opensbi linux initramfs)"
+    fi
+    return 0
+  fi
+  # An absent ramdisk is not fatal: the kernel then panics for want of a root,
+  # which is still a complete boot and still hundreds of millions of RV64GC
+  # instructions to compare.
+  [ -s "$initrd" ] || initrd=""
+  run "long riscv kernel boot (${ms}ms of guest time)" \
+    env RSEMU_RISCV_FIRMWARE="$fw" RSEMU_RISCV_KERNEL="$kernel" \
+        RSEMU_RISCV_INITRD="$initrd" RSEMU_LONGRUN_MS="$ms" \
+    cargo test --release --features "$LONGRUN_FEATURES" \
+      --test engine_longrun -- --ignored --nocapture --test-threads=1 \
+      a_real_riscv_linux_boot_agrees_across_the_engines
 }
 
 # The m68k IR frontend against the m68k interpreter over a random instruction

@@ -66,6 +66,7 @@ window closed unseen.
 | `the_guest_carries_the_windows_and_the_addresses_this_file_names` | none | ~0 s | every `cargo test` — the same, for the RISC-V guest |
 | `a_real_arm64_linux_boot_agrees_across_the_engines` | an `Image` | minutes | `--ignored`; nightly in CI |
 | `a_real_x86_linux_boot_agrees_across_the_engines` | a `bzImage` | minutes | `--ignored`; nightly in CI |
+| `a_real_riscv_linux_boot_agrees_across_the_engines` | OpenSBI **and** an `Image` | minutes | `--ignored`; nightly in CI — see below for why it is the newest of the three |
 | `the_clint_advances_while_the_hart_is_running` | none | ~0 s | every `cargo test` — a defect this file found, fixed in two halves; see below |
 
 ```sh
@@ -75,8 +76,9 @@ cargo test --release --test engine_longrun
 # longer, locally
 RSEMU_LONGRUN_MS=300 cargo test --release --test engine_longrun
 
-# the real gate — two kernels now, one per core
-scripts/fetch-testdata.sh arm64-linux arm64-initramfs x86-linux initramfs-x86
+# the real gate — three kernels now, one per core
+scripts/fetch-testdata.sh arm64-linux arm64-initramfs x86-linux initramfs-x86 \
+    opensbi linux initramfs
 scripts/check.sh long
 ```
 
@@ -108,6 +110,9 @@ beside one another.
 | `RSEMU_LONGRUN_REQUIRED` | (`check.sh`) a missing kernel is a failure rather than a skip |
 | `RSEMU_X86_LONGRUN_SEAMS` | the x86 synthetic leg's bisecting knob: a comma-separated subset of `timer,invlpg,smc,shadow,flags,int` to keep. Absent, everything |
 | `RSEMU_RISCV_LONGRUN_SEAMS` | the same for the RISC-V leg: `timer,clint,sfence,csr,amo,ecall` |
+| `RSEMU_RISCV_FIRMWARE`, `RSEMU_RISCV_KERNEL`, `RSEMU_RISCV_INITRD` | the riscv64 fixture: OpenSBI's `fw_jump.bin`, a flat `Image` for `0x80200000`, and a ramdisk. Two images rather than one, because this board has firmware where `arm64-virt` and `pc64` do not |
+| `RSEMU_RISCV_RAM` | that board's DRAM; default 512M |
+| `RSEMU_RISCV_BOOTARGS` | the riscv64 kernel command line, replacing `console=ttyS0 earlycon=sbi rdinit=/init` |
 
 ## When the fixture is absent
 
@@ -173,15 +178,22 @@ went, so each leg covers the same guest work in the same wall clock:
 Read every guest-time figure below as *the guest work that figure bought at the
 time*, and divide by 100 or 4.96 to get the guest time that buys it now.
 
-## Two kernels, two budgets
+## Three kernels, two budgets
 
-`RSEMU_LONGRUN_MS` drives the AArch64 gate and `RSEMU_X86_LONGRUN_MS` drives
-the x86 one, and that is deliberate rather than untidy. A unit of guest time
-does not mean the same thing on the two boards:
+`RSEMU_LONGRUN_MS` drives the AArch64 **and** the RISC-V gate and
+`RSEMU_X86_LONGRUN_MS` drives the x86 one, and that is deliberate rather than
+untidy. A unit of guest time does not mean the same thing on the three boards:
 
 * `arm64-virt` runs a 1 GHz core and reaches a shell inside twenty guest
   seconds *at the rate it ran then* — 200 ms now. 1 200 ms is well past both
   defects the gate exists for.
+* `riscv-virt` declares the same 1 GHz hart and the same 1 ms quantum, so the
+  same budget is the same guest work and one knob for the pair is honest rather
+  than lazy. It has firmware where the other two do not, so its 1 200 ms buys
+  OpenSBI *and* a kernel: measured, that reaches `io scheduler mq-deadline
+  registered` — 11 813 bytes of console, 604 189 614 guest instructions retired
+  inside blocks against 3 413 402 interpreted — in 68 s under `jit` and 49 s
+  under `jit-host`.
 * `pc64` runs a **100 MHz** processor and has no firmware, so the `bzImage`
   decompresses itself from the reset vector, and it needs far more guest work
   than the arm64 leg to reach the same depth. Measured on the Debian installer
