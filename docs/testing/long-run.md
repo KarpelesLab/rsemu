@@ -323,6 +323,20 @@ now prints the `bzImage`'s own `kernel_version` string (setup header offset
 into the checks list beside the divergence. That is what turns a red nightly into
 a command somebody else can run.
 
+**And then it found a second one, which the first was hiding.** With the
+declined boundary fixed, the same leg went a further twenty-four guest seconds
+and parted again — at quantum 275 761, 136.03 s, on `intr` **1 interpreted
+against 0 translated**, and this time under `jit-host` **only**, with `jit`
+agreeing for the whole two hundred guest seconds. Bit-identical with the first
+fix applied and with it reverted, so it is independent of it and was simply out
+of reach while the first defect fired at 112 s. `docs/platforms/pc64.md` has it:
+an inlined memory access charged its bus clocks without publishing this core's
+position, and `TickCursor::set` is what delivers a lazily-advanced device's own
+event, so a block whose accesses were all inlined stood still as far as the 8254
+was concerned. The ledger shrank by two rather than by one, and the second entry
+is the reason a gate that reaches further is worth having: nothing shorter than
+a kernel had ever reached 136 s of this board.
+
 **The synthetic x86 leg did not catch it, and could not have.** That guest has
 an `INVLPG` on its own code page every sixty-fourth pass, which is the seam, and
 it agreed for its whole run anyway — because what this defect needs is not the
