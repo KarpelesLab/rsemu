@@ -1037,15 +1037,57 @@ pub(super) fn advance(
             let trap = entry_trap.expect("just tested");
             deliver(smc, disp, unlifted, exec, trap, run.pc, run.pc)
         }
-        // `Budget` ends a full chain, `Declined` a short one, `Spent` a block
-        // that left part-way through because the hart's ticks ran out, and all
-        // three leave the guest at `run.pc` for the run loop to pick up.
-        // `Spent` needs no arm of its own for exactly that reason: the state
-        // is published from the boundary's live map and `run.pc` is the guest
-        // instruction that has not started, which is what this arm already
-        // does with every other stop. `Exit` cannot happen: no safe-point flag
-        // is given to the dispatcher, because the run loop above checks it
-        // between calls.
+        // A chained boundary the frontend declined, and a block whose lift
+        // produced nothing: both mean the instruction at `run.pc` is one the
+        // **interpreter** has to take, and it is taken here rather than after
+        // a return to the run loop.
+        //
+        // # Why it cannot wait for the next call
+        //
+        // [`Frontend::enter`] has already charged that instruction's entry
+        // fetch translation through [`admit`] — an Sv39 walk, on a TLB miss,
+        // which is three descriptor reads and three ticks. Returning here
+        // leaves those charged with *nothing of that instruction executed*,
+        // and `Hart::run_budget` then tests `used < allowance` in exactly that
+        // window. The interpreter has no such window: `Exec::step` charges the
+        // walk, the fetch and the operation inside one call, so its budget
+        // test stands in front of all three. A quantum whose allowance runs
+        // out in that gap therefore ends on a **different instruction** on the
+        // two engines — the interpreter runs it, the translated hart stops in
+        // front of it — and `State::debt`, which `Machine::state_hash` covers,
+        // parts with them.
+        //
+        // Measured on `declining_hart` before this arm existed: the declined
+        // boundary at virtual `0x1000` costs three ticks of walk, and a sweep
+        // of consecutive budgets reports `pc` `0x1004` interpreted against
+        // `0x1000` translated, `cycles` short by two and `debt` short by two —
+        // the two being what is left of the interpreter's five-tick step once
+        // the walk has already been paid for. The same shape
+        // `cpu::x86::engine` parted on 112 s into a Debian boot, and the
+        // reason `cpu::arm::a64::engine` has this arm too.
+        //
+        // Both arms are reached only with [`Host::spent`] **false**:
+        // `jit::dispatch` asks it at every block boundary before it calls
+        // `Frontend::enter`, so a boundary that got as far as being charged is
+        // a boundary an interpreted hart would have started an instruction at.
+        // It costs nothing else — the instruction was going to be interpreted
+        // by the next `advance` anyway, which is what [`admit`] answers
+        // `Admit::Interpret` for, one dispatcher round trip earlier.
+        Stop::Declined | Stop::Untranslatable { .. } => {
+            exec.st.pc = cfg.xlen.trunc(run.pc);
+            interpret(interpreted, smc, disp, unlifted, exec)
+        }
+        // `Budget` ends a full chain and `Spent` a block that left part-way
+        // through because the hart's ticks ran out; both leave the guest at
+        // `run.pc` for the run loop to pick up, and neither has charged
+        // anything at that boundary — `jit::dispatch` asks the chain budget and
+        // [`Host::spent`] *before* `Frontend::enter`, which is what makes the
+        // arm above a different case rather than the same one. `Spent` needs no
+        // arm of its own for that reason: the state is published from the
+        // boundary's live map and `run.pc` is the guest instruction that has
+        // not started, which is what this arm already does. `Exit` cannot
+        // happen: no safe-point flag is given to the dispatcher, because the
+        // run loop above checks it between calls.
         _ => {
             exec.st.pc = cfg.xlen.trunc(run.pc);
             let used = exec.used;
@@ -2075,6 +2117,150 @@ mod tests {
                 "the fixture never took a machine timer interrupt under \
                  {engine:?}, so it proves nothing"
             );
+        }
+    }
+
+    /// The page a declined boundary stands on, at **physical** `0x4000` and
+    /// virtual zero.
+    ///
+    /// `sfence.vma` is outside the lifted subset, so every pass round this
+    /// loop makes both pages' fetch translations cold again — and it is on
+    /// *this* page, so the second page is not fetched between the flush and
+    /// the chained boundary that reaches it.
+    const DECLINE_LOOP: [u32; 5] = [
+        0x0012_8293, // addi      x5, x5, 1
+        0x1200_0073, // sfence.vma            ; cools both pages
+        0x0013_0313, // addi      x6, x6, 1
+        0x0013_0313, // addi      x6, x6, 1
+        0x7f10_006f, // jal       x0, +0xff0  ; to 0x1000, off this page
+    ];
+
+    /// The other page, at physical `0x5000` and virtual `0x1000`.
+    ///
+    /// `fence` is outside the lifted subset, so the chained boundary the `jal`
+    /// above exits to is **declined** — with its cold entry translation
+    /// already charged.
+    const DECLINE_LOOP_TAIL: [u32; 3] = [
+        0x0ff0_000f, // fence                 ; outside the subset
+        0x0013_8393, // addi      x7, x7, 1
+        0xffdf_e06f, // jal       x0, -0x1004 ; back to virtual zero
+    ];
+
+    /// A supervisor-mode hart running [`DECLINE_LOOP`] under a **three-level**
+    /// Sv39 table.
+    ///
+    /// Three levels rather than [`walking_hart`]'s one gigapage, because what
+    /// has to be reached is an allowance that runs out *inside* the walk: a
+    /// gigapage is one descriptor read and one tick, and three is a window
+    /// three times as wide.
+    fn declining_hart(engine: Engine) -> Hart {
+        use super::super::mmu::pte;
+        let ram = Arc::new(RamStore::new(RAM));
+        write_words(&ram, 0x4000, &DECLINE_LOOP);
+        write_words(&ram, 0x5000, &DECLINE_LOOP_TAIL);
+        let poke = |addr: u64, value: u64| {
+            for i in 0..8 {
+                ram.write_u8(addr + i, (value >> (8 * i)) as u8)
+                    .expect("in range");
+            }
+        };
+        // Virtual `0x0000` to physical `0x4000` and virtual `0x1000` to
+        // physical `0x5000`. Both are inside one 2 MiB region, so they share
+        // the upper two levels and differ only in the last table's index.
+        let leaf = pte::V | pte::R | pte::X | pte::A;
+        poke(0x1000, ((0x2000 >> 12) << 10) | pte::V);
+        poke(0x2000, ((0x3000 >> 12) << 10) | pte::V);
+        poke(0x3000, ((0x4000 >> 12) << 10) | leaf);
+        poke(0x3008, ((0x5000 >> 12) << 10) | leaf);
+        let space = AddressSpace::new("mem", 64);
+        space
+            .topology()
+            .map_with_perms(Region::ram("ram", ram), 0, Perms::RWX)
+            .expect("nothing else is mapped");
+        // No PMP entries, as `mmu`'s own Sv39 fixture does it: with entries
+        // implemented and none configured, an S-mode access is denied and the
+        // walk under test never happens.
+        let cfg = Config {
+            pmp_count: 0,
+            ..Config::rv64gc()
+        }
+        .with_reset_vector(0);
+        let hart = Hart::new(cfg).with_engine(engine);
+        hart.attach_space(Arc::new(space));
+        let mut csrs = hart.csrs();
+        csrs.priv_mode = crate::cpu::riscv::Priv::Supervisor;
+        csrs.satp = (8 << 60) | (0x1000 >> 12);
+        hart.set_csrs(csrs);
+        hart
+    }
+
+    /// A chained boundary the frontend declines, on a page whose fetch
+    /// translation is **cold**, swept over the budgets that end a quantum
+    /// inside the walk.
+    ///
+    /// This is `cpu::x86::engine`'s
+    /// `a_declined_boundary_over_a_cold_page_retires_its_instruction` on this
+    /// core, and it is here because that core's own report said the defect was
+    /// latent here: `jit::dispatch` charges a boundary's entry fetch
+    /// translation through `Frontend::enter` **before** it asks the frontend
+    /// whether a block may run there, so a declined boundary used to leave an
+    /// Sv39 walk charged with none of the instruction executed — and
+    /// `Hart::run_budget`'s `used < allowance` test then stood in exactly that
+    /// window, where the interpreter's stands in front of the whole of
+    /// `Exec::step`.
+    ///
+    /// The budgets are swept over a **contiguous** range because the window is
+    /// only three ticks wide, and every column is compared after **every**
+    /// quantum rather than at the end of the run. That second half is the part
+    /// that had to be learned: the divergence self-corrects within two or three
+    /// quanta — the translated hart interprets the declined instruction on its
+    /// next call and the debts converge — so an `agree_built` over twelve
+    /// quanta that compares only the final state passes with the defect
+    /// present. Measured: 33 of these 61 budgets part on some quantum without
+    /// [`advance`]'s `Stop::Declined` arm, `pc` `0x1004` interpreted against
+    /// `0x1000` translated with `cycles` and `debt` each short by two, and 0 of
+    /// 61 with it.
+    #[test]
+    fn a_declined_boundary_over_a_cold_page_retires_its_instruction() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            for budget in 60u64..=120 {
+                let interp = declining_hart(Engine::Interp);
+                let jit = declining_hart(engine);
+                for n in 0..12 {
+                    let a = interp.run_budget(budget);
+                    let b = jit.run_budget(budget);
+                    let at = || alloc::format!("budget {budget}, quantum {n}, {engine:?}");
+                    assert_eq!(a, b, "{}: different budgets consumed", at());
+                    assert_eq!(
+                        interp.pc(),
+                        jit.pc(),
+                        "{}: the quantum ended on a different instruction — {:#x} \
+                         interpreted against {:#x} translated",
+                        at(),
+                        interp.pc(),
+                        jit.pc(),
+                    );
+                    assert_eq!(interp.cycles(), jit.cycles(), "{}: cycles", at());
+                    assert_eq!(
+                        interp.cycle_debt(),
+                        jit.cycle_debt(),
+                        "{}: the carried overrun",
+                        at(),
+                    );
+                    assert_eq!(interp.instret(), jit.instret(), "{}: instructions", at());
+                    for x in 0..32 {
+                        assert_eq!(interp.x(x), jit.x(x), "{}: x{x}", at());
+                    }
+                }
+                let stats = jit.jit_stats().expect("a jit hart keeps statistics");
+                assert!(
+                    stats.blocks > 0 && stats.interpreted > 0,
+                    "budget {budget} under {engine:?}: {} blocks and {} interpreted \
+                     instructions, so this guest never reached a declined boundary at all",
+                    stats.blocks,
+                    stats.interpreted,
+                );
+            }
         }
     }
 
