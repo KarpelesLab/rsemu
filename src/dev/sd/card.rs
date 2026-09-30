@@ -93,6 +93,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
+use crate::core::wire::{Level, WireSource};
 use crate::dev::medium::{self, Medium};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
@@ -2058,6 +2059,25 @@ struct Socket {
     card: Arc<SdCard>,
     holder: Arc<super::slots::Slot>,
     name: String,
+    /// The socket's card-detect switch, if the board wired it: low while a
+    /// card is in, high while the socket is empty -- the common active-low
+    /// switch, which is what a board pulls up and a GPIO reads.
+    cd: Mutex<Option<WireSource>>,
+}
+
+impl Socket {
+    /// Drive the card-detect switch from the socket. Called with nothing
+    /// else held.
+    fn drive_cd(&self) {
+        let out = self.cd.lock().clone();
+        if let Some(out) = out {
+            out.set(if self.holder.is_occupied() {
+                Level::Low
+            } else {
+                Level::High
+            });
+        }
+    }
 }
 
 impl CardDevice {
@@ -2111,6 +2131,7 @@ impl CardDevice {
                     card,
                     holder,
                     name: slot,
+                    cd: Mutex::with_rank(LockRank::LEAF, None),
                 }),
             });
         }
@@ -2124,6 +2145,7 @@ impl CardDevice {
                 card,
                 holder,
                 name: slot,
+                cd: Mutex::with_rank(LockRank::LEAF, None),
             }),
         })
     }
@@ -2146,6 +2168,9 @@ impl CardDevice {
         medium::MediaPort::new(Arc::clone(&self.socket) as Arc<dyn medium::Removable>)
     }
 }
+
+/// The socket's card-detect output.
+pub const CD_PIN: &str = "cd";
 
 /// The one bay this class has: the socket the card is in.
 const BAY: &str = "card";
@@ -2215,6 +2240,7 @@ impl medium::Removable for Socket {
                 "the socket was filled while this card went in",
             ))
         })?;
+        self.drive_cd();
         Ok(())
     }
 
@@ -2228,6 +2254,7 @@ impl medium::Removable for Socket {
         // does. Cycling the card on its way out is what makes putting it back
         // a power-on rather than a resumption.
         self.card.power_cycle();
+        self.drive_cd();
         Ok(())
     }
 }
@@ -2263,6 +2290,21 @@ impl Device for CardDevice {
         (which == ExportId::REMOVABLE_MEDIA).then(|| self.media().export())
     }
 
+    fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        if port != CD_PIN {
+            return Err(Error::Config {
+                at: port.to_string(),
+                message: String::from("a card socket drives one pin, `cd`: its card-detect switch"),
+            });
+        }
+        *self.socket.cd.lock() = Some(source);
+        Ok(())
+    }
+
+    fn announce(&self, _port: &str) {
+        self.socket.drive_cd();
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         // Whether the card is *in* the socket is machine state now that a
         // host can take it out, and it is written first so a reader knows
@@ -2285,6 +2327,7 @@ impl Device for CardDevice {
                     ))
                 })?;
         }
+        self.socket.drive_cd();
         Ok(())
     }
 }
@@ -2328,6 +2371,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("year", ValueKind::Uint).range(2000, 2255))
         .prop(PropSchema::new("month", ValueKind::Uint).range(1, 12))
         .prop(PropSchema::new("rca", ValueKind::Uint).range(1, 0xffff))
+        .port(CD_PIN, crate::machine::validate::PortDir::Out)
 }
 
 #[cfg(test)]
