@@ -946,3 +946,74 @@ fn a_snapshot_round_trips_with_a_card_in_the_socket_and_without_one() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A card whose array is a supplied medium
+// ---------------------------------------------------------------------------
+
+/// A medium shorter than the high-capacity card that holds it: 512 KiB plus
+/// three blocks, so the CSD rounds the card up to 1 MiB.
+fn drive_card() -> (SdCard, Arc<RamStore>) {
+    let store = Arc::new(RamStore::new(HIGH_CAPACITY_UNIT + 3 * BLOCK));
+    store.write_at(HIGH_CAPACITY_UNIT, b"tail").unwrap();
+    let id = Identity::new(2 * HIGH_CAPACITY_UNIT, true, false, text()).unwrap();
+    let card = SdCard::with_medium(id, BusMode::Sd, 1, Arc::clone(&store) as Arc<dyn Medium>)
+        .expect("the medium fits");
+    (card, store)
+}
+
+#[test]
+fn a_drive_card_reads_its_medium_and_zero_past_the_end() {
+    let (card, _store) = drive_card();
+    bring_up(&card);
+    let block = (HIGH_CAPACITY_UNIT / BLOCK) as u32;
+    assert_eq!(&read_block(&card, block)[..4], b"tail");
+    assert!(
+        read_block(&card, block + 3).iter().all(|&b| b == 0),
+        "the card's rounded-up tail reads as erased"
+    );
+}
+
+#[test]
+fn a_drive_card_writes_through_to_its_medium() {
+    let (card, store) = drive_card();
+    bring_up(&card);
+    short(card.command(cmd::WRITE_BLOCK, 1));
+    let block = [0x5au8; BLOCK as usize];
+    card.write_data(&block);
+    let mut back = [0u8; 4];
+    store.read_at(BLOCK, &mut back).unwrap();
+    assert_eq!(back, [0x5a; 4]);
+}
+
+#[test]
+fn a_medium_larger_than_the_card_is_refused() {
+    let store = Arc::new(RamStore::new(2 * HIGH_CAPACITY_UNIT));
+    let id = Identity::new(HIGH_CAPACITY_UNIT, true, false, text()).unwrap();
+    assert!(SdCard::with_medium(id, BusMode::Sd, 1, store as Arc<dyn Medium>).is_err());
+}
+
+#[test]
+fn a_drive_card_snapshot_refers_to_its_medium_rather_than_copying_it() {
+    let (card, _store) = drive_card();
+    bring_up(&card);
+    let mut shape = MachineShape::new();
+    shape.add_device("card", CLASS_NAME).unwrap();
+    let mut writer = StateWriter::new(shape);
+    {
+        let mut chunk = writer.chunk("card", CLASS_NAME, STATE_VERSION).unwrap();
+        card.save(&mut chunk).unwrap();
+    }
+    let bytes = writer.to_vec().unwrap();
+    assert!(
+        bytes.len() < 4096,
+        "the snapshot holds the protocol state, not the card's megabyte"
+    );
+    let (other, _) = drive_card();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("card", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    other.load(&mut chunk.reader()).unwrap();
+    assert_eq!(other.phase(), Phase::Transfer);
+}

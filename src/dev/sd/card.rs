@@ -516,6 +516,82 @@ impl Identity {
     }
 }
 
+/// Where a card's bytes live.
+///
+/// A flat [`RamStore`] is the `no_std` case and is what every board had before
+/// cards got large: the whole capacity in host memory, and in every snapshot.
+/// A [`Medium`] a *run* supplied (`--drive sd0=card.img`, the same door
+/// `ata.disk` has) is the other: a 32 GB map card is 32 GB of the host's disk,
+/// not of its memory, and a snapshot refers to it rather than copying it
+/// (`dev::medium::Snapshot`).
+#[derive(Clone)]
+enum Backing {
+    Ram(Arc<RamStore>),
+    Drive(Arc<dyn Medium>),
+}
+
+impl fmt::Debug for Backing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Backing::Ram(_) => f.write_str("Ram"),
+            Backing::Drive(m) => f.debug_tuple("Drive").field(m).finish(),
+        }
+    }
+}
+
+impl Backing {
+    /// Read `dst.len()` bytes at `offset`.
+    ///
+    /// A drive may be shorter than the card it backs: a high-capacity card
+    /// counts `C_SIZE` in 512 KiB units, so an image of any other length is
+    /// rounded up to the next one. The tail past the image reads as zero,
+    /// which is what an erased card reads as (SCR `DATA_STAT_AFTER_ERASE`).
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> crate::core::space::MemResult {
+        match self {
+            Backing::Ram(ram) => ram.read_at(offset, dst),
+            Backing::Drive(m) => {
+                let cap = m.capacity();
+                let inside = cap.saturating_sub(offset).min(dst.len() as u64) as usize;
+                if inside > 0 {
+                    m.read_at(offset, &mut dst[..inside])?;
+                }
+                dst[inside..].fill(0);
+                Ok(())
+            }
+        }
+    }
+
+    /// Write `src` at `offset`. Past a drive's end is out of range.
+    fn write_at(&self, offset: u64, src: &[u8]) -> crate::core::space::MemResult {
+        match self {
+            Backing::Ram(ram) => ram.write_at(offset, src),
+            Backing::Drive(m) => m.write_at(offset, src),
+        }
+    }
+
+    /// Set `len` bytes from `offset` to `value`.
+    fn fill(&self, offset: u64, len: u64, value: u8) -> crate::core::space::MemResult {
+        match self {
+            Backing::Ram(ram) => ram.fill(offset, len, value),
+            Backing::Drive(m) => {
+                let chunk = alloc::vec![value; 64 * 1024];
+                let end = (offset + len).min(m.capacity());
+                let mut at = offset;
+                while at < end {
+                    let n = (end - at).min(chunk.len() as u64) as usize;
+                    m.write_at(at, &chunk[..n])?;
+                    at += n as u64;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn is_drive(&self) -> bool {
+        matches!(self, Backing::Drive(_))
+    }
+}
+
 /// An SD memory card.
 ///
 /// Construct it with [`SdCard::new`] from machine-description properties, or
@@ -523,7 +599,7 @@ impl Identity {
 pub struct SdCard {
     id: Identity,
     mode: BusMode,
-    media: Arc<RamStore>,
+    media: Backing,
     state: Mutex<Volatile>,
     /// The first address `CMD3` publishes, so a reset is reproducible.
     first_rca: u16,
@@ -550,7 +626,30 @@ impl SdCard {
     /// bound image does not fit.
     pub fn new(props: &Props) -> Result<SdCard> {
         let mut r = props.reader();
-        let capacity = r.require_size("size")?;
+        // A medium the run installed under the `drive` slot's name wins over
+        // `size` and `image`, exactly as it does for `ata.disk`: a run that
+        // said `--drive sd0=card.img` meant that card.
+        let drive = r.optional_str("drive")?;
+        let supplied = match (drive, props.hosts()) {
+            (Some(name), Some(hosts)) => medium::get(hosts, name)?.and_then(|slot| slot.take()),
+            _ => None,
+        };
+        let capacity = match &supplied {
+            Some(m) => {
+                let raw = m.capacity();
+                if raw > MAX_STANDARD_CAPACITY {
+                    raw.div_ceil(HIGH_CAPACITY_UNIT) * HIGH_CAPACITY_UNIT
+                } else {
+                    raw.div_ceil(BLOCK) * BLOCK
+                }
+            }
+            None => r.require_size("size")?,
+        };
+        if supplied.is_some() {
+            // Read so the reader does not report it unknown; the medium's
+            // length is the card's.
+            let _ = r.or_size("size", 0)?;
+        }
         let high_capacity = r.or("high-capacity", capacity > MAX_STANDARD_CAPACITY)?;
         let read_only = r.or("readonly", false)?;
         let manufacturer = r.or_range("manufacturer", 0x03u64, 0..=0xff)? as u8;
@@ -587,6 +686,9 @@ impl SdCard {
                 month,
             },
         )?;
+        if let Some(medium) = supplied {
+            return SdCard::with_medium(id, mode, rca, medium);
+        }
         let card = SdCard::with_identity(id, mode, rca)?;
         if let Some(image) = image {
             if image.len() as u64 > capacity {
@@ -612,11 +714,42 @@ impl SdCard {
                 id.capacity
             )));
         }
-        let media = Arc::new(RamStore::new(id.capacity));
+        let media = Backing::Ram(Arc::new(RamStore::new(id.capacity)));
         Ok(SdCard {
             id,
             mode,
             media,
+            state: Mutex::with_rank(LockRank::DEVICE, Volatile::power_on(first_rca)),
+            first_rca,
+        })
+    }
+
+    /// A card whose array is a [`Medium`] the run supplied rather than host
+    /// memory: the door a large card image comes in by.
+    ///
+    /// The identity's capacity may exceed the medium's (rounding up to the
+    /// CSD's unit); the difference reads as erased.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the medium is larger than the identity describes.
+    pub fn with_medium(
+        id: Identity,
+        mode: BusMode,
+        first_rca: u16,
+        medium: Arc<dyn Medium>,
+    ) -> Result<SdCard> {
+        if medium.capacity() > id.capacity {
+            return Err(config(format!(
+                "the supplied medium is {} byte(s) and the card holds {}",
+                medium.capacity(),
+                id.capacity
+            )));
+        }
+        Ok(SdCard {
+            id,
+            mode,
+            media: Backing::Drive(medium),
             state: Mutex::with_rank(LockRank::DEVICE, Volatile::power_on(first_rca)),
             first_rca,
         })
@@ -1454,7 +1587,15 @@ impl SdCard {
         // The array, exactly as `dev-flash-cfi` saves its own: a card's
         // contents are guest-visible state, and a snapshot that restored to
         // different bytes would be a snapshot of a different machine.
-        w.write_bytes(&self.contents())?;
+        // A drive-backed card writes an empty array: its bytes are a host
+        // file the snapshot refers to rather than copies, and copying 32 GB
+        // into a snapshot would not be a snapshot anyone could take. No RAM
+        // card is ever empty, so the two cannot be confused on load.
+        if self.media.is_drive() {
+            w.write_bytes(&[])?;
+        } else {
+            w.write_bytes(&self.contents())?;
+        }
         let state = self.state.lock();
         w.write_u8(state.phase as u8)?;
         w.write_u16(state.rca)?;
@@ -1492,16 +1633,19 @@ impl SdCard {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let bytes: &[u8] = r.read_bytes()?;
-        if bytes.len() as u64 != self.id.capacity {
+        let by_reference = bytes.is_empty() && self.media.is_drive();
+        if !by_reference && bytes.len() as u64 != self.id.capacity {
             return Err(Error::State(format!(
                 "the snapshot holds a card of {} byte(s), this one holds {}",
                 bytes.len(),
                 self.id.capacity
             )));
         }
-        self.media
-            .write_at(0, bytes)
-            .map_err(|_| Error::State(String::from("the card refused the snapshot")))?;
+        if !by_reference {
+            self.media
+                .write_at(0, bytes)
+                .map_err(|_| Error::State(String::from("the card refused the snapshot")))?;
+        }
         let phase = Phase::from_code(r.read_u8()?)?;
         let rca = r.read_u16()?;
         let next_rca = r.read_u16()?;
@@ -1800,14 +1944,20 @@ pub static CLASS: DeviceClass = DeviceClass {
         PropertySpec {
             name: "size",
             kind: ValueKind::Size,
-            required: true,
-            summary: "how many bytes the card holds, as in `size = 64M`",
+            required: false,
+            summary: "how many bytes the card holds, as in `size = 64M`; required unless `drive` supplies the card",
         },
         PropertySpec {
             name: "image",
             kind: ValueKind::Media,
             required: false,
             summary: "the media slot holding the initial contents; the rest reads zero",
+        },
+        PropertySpec {
+            name: "drive",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "a media slot a run fills with a host file (`--drive sd0=card.img`); wins over `size` and `image`",
         },
         PropertySpec {
             name: "slot",
@@ -2124,7 +2274,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("size", ValueKind::Size).required())
+        .prop(PropSchema::new("size", ValueKind::Size))
+        .prop(PropSchema::new("drive", ValueKind::Str))
         .prop(PropSchema::new("image", ValueKind::Media))
         .prop(PropSchema::new("slot", ValueKind::Str))
         .prop(PropSchema::new("high-capacity", ValueKind::Bool))
