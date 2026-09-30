@@ -1175,7 +1175,15 @@ fn the_reset_pin_resets_cp15_too() {
     assert_ne!(m.cpu.cp15v7().unwrap().sctlr() & (1 << 13), 0, "V set");
     m.cpu.lines.request_reset();
     m.cpu.step();
-    assert_eq!(m.cpu.cp15v7().unwrap().sctlr() & (1 << 13), 0, "V back to its strap");
-    assert_eq!(m.cpu.pc(), 0, "the reset vector is fetched from the low base");
+    assert_eq!(
+        m.cpu.cp15v7().unwrap().sctlr() & (1 << 13),
+        0,
+        "V back to its strap"
+    );
+    assert_eq!(
+        m.cpu.pc(),
+        0,
+        "the reset vector is fetched from the low base"
+    );
     assert_eq!(m.cpu.mode(), Mode::SUPERVISOR);
 }

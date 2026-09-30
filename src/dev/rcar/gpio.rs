@@ -489,7 +489,9 @@ mod tests {
     use super::*;
 
     fn w(g: &Gpio, off: u64, v: u32) {
-        g.regs.write(off, &v.to_le_bytes(), MemAttrs::DEFAULT).unwrap();
+        g.regs
+            .write(off, &v.to_le_bytes(), MemAttrs::DEFAULT)
+            .unwrap();
     }
 
     fn r(g: &Gpio, off: u64) -> u32 {
