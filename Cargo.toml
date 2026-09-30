@@ -1234,6 +1234,7 @@ machine-arm926 = ["cpu-arm-aprofile"]
 # what does not is in docs/platforms/alphard-navi.md. Adds no dependencies.
 machine-alphard-navi = [
     "cpu-arm-aprofile-vfp",
+    "dev-watchdog-pin",
     "dev-arm-mpcore",
     "dev-arm-l2c310",
     "dev-flash-cfi",
@@ -1280,6 +1281,13 @@ dev-uart-ns16550 = []
 # DU chapters, and a black-box trace of a real DU driver's register writes.
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-rcar = ["dev-sd-card"]
+
+# An external watchdog kicked by a pin (src/dev/watchdog.rs, `watchdog.pin`):
+# the supervisor chip or companion MCU that pulls a SoC's reset when the GPIO
+# it watches stops toggling. Arms on the first edge, fires `timeout` ticks
+# after the last one, lazily advanced so it costs nothing between kicks.
+# `no_std + alloc`, no dependencies.
+dev-watchdog-pin = []
 
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a system
 # controller, virtio-MMIO with block and entropy devices, and a **device tree

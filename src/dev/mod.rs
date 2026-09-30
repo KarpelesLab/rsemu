@@ -224,6 +224,10 @@ pub mod rcar;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-riscv")))]
 pub mod riscv;
 
+#[cfg(feature = "dev-watchdog-pin")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-watchdog-pin")))]
+pub mod watchdog;
+
 #[cfg(feature = "dev-scsi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-scsi")))]
 pub mod scsi;

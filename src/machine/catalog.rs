@@ -1221,6 +1221,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::uart::ns16550::register(&mut reg)?;
     #[cfg(feature = "dev-rcar")]
     crate::dev::rcar::register(&mut reg)?;
+    #[cfg(feature = "dev-watchdog-pin")]
+    crate::dev::watchdog::register(&mut reg)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::register(&mut reg)?;
     #[cfg(feature = "dev-psram-qspi")]
@@ -1377,6 +1379,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::uart::ns16550::bind(&mut b)?;
     #[cfg(feature = "dev-rcar")]
     crate::dev::rcar::bind(&mut b)?;
+    #[cfg(feature = "dev-watchdog-pin")]
+    crate::dev::watchdog::bind(&mut b)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::bind(&mut b)?;
     #[cfg(feature = "dev-psram-qspi")]
@@ -1546,6 +1550,8 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::rcar::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "dev-watchdog-pin")]
+    table.insert(crate::dev::watchdog::schema());
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     for schema in crate::dev::flash::schemas() {
         table.insert(schema);
