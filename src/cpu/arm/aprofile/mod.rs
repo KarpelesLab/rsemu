@@ -77,6 +77,7 @@
 //! Cycle counts from ARM's own instruction-cycle timing summaries. No emulator
 //! source of any licence was consulted (`ROADMAP.md` §1).
 
+pub mod arch;
 pub mod cp;
 pub mod cp15;
 pub mod disasm;
@@ -111,6 +112,7 @@ use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::Endian;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 
+pub use arch::{Arch, Extensions, Version, Vfp};
 use cp::{Coprocessor, FlatMmu, Mmu, Tlb};
 use cp15::Cp15;
 use exec::{Exec, State};
@@ -520,6 +522,12 @@ pub struct Config {
     /// for; [`System::Arm926EjS`] adds CP15 and the VMSAv5 MMU. See [`System`]
     /// for why an MMU is a construction property and not a connection.
     pub system: System,
+    /// Which architecture version and extensions the part implements.
+    ///
+    /// Decode consults this: an instruction the configured part does not have
+    /// takes an Undefined Instruction exception rather than executing, because
+    /// that is how guests probe for features (`ROADMAP.md` §6.1.1).
+    pub arch: Arch,
 }
 
 impl Config {
@@ -544,6 +552,7 @@ impl Config {
         // The macrocell without its CP15, which is what this core was before
         // one existed and what every board that does not ask still gets.
         system: System::None,
+        arch: Arch::V5TE,
     };
 
     /// A whole ARM926EJ-S: the same core with its system control coprocessor,
@@ -869,6 +878,7 @@ impl Arm {
         let alignment_faults = r.or("alignment-faults", false)?;
         let store_pc_offset = r.or_range("store-pc-offset", 8u64, 8..=12)?;
         let system = r.or_enum("cp15", "none", System::NAMES)?;
+        let part = r.or_enum("cpu", "arm926ejs", PARTS)?;
         // Accepted and ignored: there is one engine until phase 5, and a
         // machine file that names it should not have to be edited when the
         // second one lands.
@@ -891,6 +901,7 @@ impl Arm {
             store_pc_offset: store_pc_offset as u8,
             // `or_enum` already rejected anything not in `NAMES`.
             system: System::parse(system).unwrap_or(System::None),
+            arch: part_arch(part),
         }))
     }
 
@@ -1303,6 +1314,19 @@ impl Arm {
     }
 }
 
+/// Every name the `cpu` property accepts: the part whose architecture the
+/// core implements.
+pub const PARTS: &[&str] = &["arm926ejs", "cortex-a9"];
+
+/// The architecture a part name selects. `or_enum` has already rejected
+/// anything not in [`PARTS`].
+fn part_arch(part: &str) -> Arch {
+    match part {
+        "cortex-a9" => Arch::CORTEX_A9,
+        _ => Arch::V5TE,
+    }
+}
+
 /// The `cpu.arm` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.arm",
@@ -1338,6 +1362,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "the system control coprocessor: `none`, or `arm926ejs` for CP15 and the MMU",
+        },
+        PropertySpec {
+            name: "cpu",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which part's architecture: `arm926ejs` (ARMv5TE) or `cortex-a9` (ARMv7-A)",
         },
         PropertySpec {
             name: "store-pc-offset",
@@ -1618,6 +1648,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("alignment-faults", ValueKind::Bool))
         .prop(PropSchema::new("store-pc-offset", ValueKind::Uint).range(8, 12))
         .prop(PropSchema::new("cp15", ValueKind::Str).values(System::NAMES))
+        .prop(PropSchema::new("cpu", ValueKind::Str).values(PARTS))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
         // Inputs only: an ARM926EJ-S drives nothing this core models. The
         // bus-facing outputs a real part has -- `nMREQ`, `nRW`, `nWAIT` -- are
