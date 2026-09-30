@@ -69,6 +69,8 @@
 //! | [`cp15`] | the ARMv5 system control coprocessor and the VMSAv5 table walk |
 //! | [`cp15v7`] | the Cortex-A9 system control coprocessor and the VMSAv7 short-descriptor walk |
 //! | `exec` (private) | the interpreter, and the timing model it implements |
+//! | `vfp` (feature `cpu-arm-aprofile-vfp`) | the VFP register file, `FPSCR`/`FPEXC`/`FPSID`/`MVFR`, and the ARMv7 rules around [`crate::float`] |
+//! | `vfpisa` (same feature) | the VFP A32 decoder and its disassembly |
 //!
 //! # Sources
 //!
@@ -87,9 +89,17 @@ pub mod disasm;
 mod exec;
 pub mod isa;
 pub mod thumb;
+#[cfg(feature = "cpu-arm-aprofile-vfp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile-vfp")))]
+pub mod vfp;
+#[cfg(feature = "cpu-arm-aprofile-vfp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile-vfp")))]
+pub mod vfpisa;
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "cpu-arm-aprofile-vfp"))]
+mod vfptests;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).
@@ -865,8 +875,22 @@ impl Arm {
     /// until [`attach_space`](Arm::attach_space) and [`Device::realize`]. The
     /// first [`step`](Arm::step) runs the reset sequence, which is what puts
     /// the PC on the reset vector.
+    ///
+    /// Infallible, so it cannot refuse a part this build cannot model: a
+    /// [`Config`] whose `arch.ext.vfp` is set, in a build without the
+    /// `cpu-arm-aprofile-vfp` feature, gets a core with **no** VFP — every
+    /// coprocessor 10/11 instruction UNDEFINED, and [`config`](Arm::config)
+    /// saying so rather than claiming a unit that is not there.
+    /// [`try_new`](Arm::try_new) is the constructor that refuses instead, and
+    /// is what a machine file reaches (`ROADMAP.md` §6.1.1).
     #[must_use]
     pub fn new(cfg: Config) -> Arm {
+        #[cfg(not(feature = "cpu-arm-aprofile-vfp"))]
+        let cfg = {
+            let mut cfg = cfg;
+            cfg.arch.ext.vfp = None;
+            cfg
+        };
         let lines = Arc::new(Lines::default());
         let cp15 = match cfg.system {
             System::None => None,
@@ -910,6 +934,54 @@ impl Arm {
                 },
             ),
             pins: sync::Mutex::new(Pins::default()),
+        }
+    }
+
+    /// A core in its power-on state, refusing a part whose extensions this
+    /// build did not compile in.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Property`] naming the missing Cargo feature when the part has
+    /// VFP and `cpu-arm-aprofile-vfp` is off, and when it claims Advanced
+    /// SIMD, which no build of this core implements. A preset that silently
+    /// lost its FPU would boot a hard-float guest into an Undefined
+    /// Instruction exception on its first `VMSR` (`ROADMAP.md` §6.1.1).
+    pub fn try_new(cfg: Config) -> Result<Arm> {
+        if cfg.arch.ext.vfp.is_some() && !cfg!(feature = "cpu-arm-aprofile-vfp") {
+            return Err(Error::Property(
+                "this ARM part has a VFP floating-point unit, which this build does not \
+                 include: enable the `cpu-arm-aprofile-vfp` Cargo feature"
+                    .into(),
+            ));
+        }
+        if cfg.arch.ext.neon {
+            return Err(Error::Property(
+                "this ARM part claims Advanced SIMD (NEON), which the A-profile core \
+                 does not implement"
+                    .into(),
+            ));
+        }
+        Ok(Arm::new(cfg))
+    }
+
+    /// The VFP register file and control registers, or `None` when the part
+    /// has no VFP.
+    #[cfg(feature = "cpu-arm-aprofile-vfp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile-vfp")))]
+    #[must_use]
+    pub fn vfp(&self) -> Option<vfp::VfpRegs> {
+        self.cfg.arch.ext.vfp?;
+        Some(self.session.lock().state.vfp)
+    }
+
+    /// Replace the VFP register file and control registers. Ignored on a
+    /// part with no VFP, which has nowhere to put them.
+    #[cfg(feature = "cpu-arm-aprofile-vfp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile-vfp")))]
+    pub fn set_vfp(&self, regs: vfp::VfpRegs) {
+        if self.cfg.arch.ext.vfp.is_some() {
+            self.session.lock().state.vfp = regs;
         }
     }
 
@@ -1008,7 +1080,7 @@ impl Arm {
             }
             _ => {}
         }
-        Ok(Arm::new(Config {
+        Arm::try_new(Config {
             requester: RequesterId::ANONYMOUS,
             endian: if big_endian {
                 Endian::Big
@@ -1023,7 +1095,7 @@ impl Arm {
             cpu_id: cpu_id as u8,
             cluster_id: cluster_id as u8,
             periphbase,
-        }))
+        })
     }
 
     /// This core's configuration, with the bind-time requester folded in.
@@ -1461,7 +1533,10 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    registers instead. Every configuration that existed at v3 writes the
     //    same bytes it did, which is why the v3 step in `migrations` is the
     //    identity.
-    version: 4,
+    // 5: a core whose part has VFP appends the register file, FPSCR and
+    //    FPEXC after CP15. Same reasoning as 3: a core without writes the v4
+    //    bytes, but the class's chunk is no longer one shape.
+    version: 5,
     summary: "ARMv5TE (ARM926EJ-S class) 32-bit CPU core with Thumb and the DSP extensions",
     properties: &[
         PropertySpec {
@@ -1541,6 +1616,13 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// If a step is already registered for this class.
 pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
     migrations.register(CLASS.name, 3, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        Ok(())
+    })?;
+    // v4 -> v5 is the identity for the same reason: only a VFP part appends
+    // anything, and no configuration that could be saved at v4 had VFP state.
+    migrations.register(CLASS.name, 4, |r, out| {
         let body = r.take(r.remaining())?;
         out.extend_from_slice(body);
         Ok(())
@@ -1670,6 +1752,13 @@ impl Device for Arm {
             Some(SystemCp::V7(cp15)) => cp15.save(w)?,
             None => {}
         }
+        // VFP after CP15, for the same reason CP15 is last: a part without
+        // one writes exactly what it always did. `new` has already cleared
+        // `vfp` in a build without the feature, so this is the one test.
+        #[cfg(feature = "cpu-arm-aprofile-vfp")]
+        if self.cfg.arch.ext.vfp.is_some() {
+            state.vfp.save(w)?;
+        }
         Ok(())
     }
 
@@ -1705,6 +1794,10 @@ impl Device for Arm {
             Some(SystemCp::V5(cp15)) => cp15.load(r)?,
             Some(SystemCp::V7(cp15)) => cp15.load(r)?,
             None => {}
+        }
+        #[cfg(feature = "cpu-arm-aprofile-vfp")]
+        if self.cfg.arch.ext.vfp.is_some() {
+            state.vfp = vfp::VfpRegs::load(r)?;
         }
         {
             let mut session = self.session.lock();

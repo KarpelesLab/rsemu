@@ -73,6 +73,11 @@ use super::isa::{
 use super::thumb::{AluOp, HiOp, ImmOp, MemRegOp, MemSize, SmallOperand, Thumb};
 use super::{Config, Mode, Regs, psr};
 
+/// The VFP executor: a child module, so it can reach this one's load/store
+/// path rather than growing a second one.
+#[cfg(feature = "cpu-arm-aprofile-vfp")]
+mod vfp;
+
 /// The seven ARM exceptions, in the order their vectors appear.
 ///
 /// Ordered by *priority*, highest first, because that is the one property the
@@ -193,6 +198,11 @@ pub(super) struct State {
     /// charged against the next budget instead. Architectural state, because a
     /// restored machine that forgot its debt runs one instruction free.
     pub debt: u64,
+    /// The VFP register file and its control registers. Present in every
+    /// instance of a build with the feature; only a part whose
+    /// `arch.ext.vfp` is set can reach it.
+    #[cfg(feature = "cpu-arm-aprofile-vfp")]
+    pub vfp: super::vfp::VfpRegs,
 }
 
 impl State {
@@ -208,6 +218,8 @@ impl State {
             last_swi: 0,
             last_bkpt: 0,
             debt: 0,
+            #[cfg(feature = "cpu-arm-aprofile-vfp")]
+            vfp: super::vfp::VfpRegs::new(),
         }
     }
 }
@@ -338,6 +350,9 @@ impl<'a> Exec<'a> {
         if self.state.reset_pending {
             self.state.reset_pending = false;
             self.state.halted = false;
+            // Reset disables the FPU (`FPEXC.EN` is 0 out of any reset).
+            #[cfg(feature = "cpu-arm-aprofile-vfp")]
+            self.state.vfp.reset_control();
             self.take_exception(Exception::Reset, 0);
             return self.used;
         }
@@ -1039,6 +1054,16 @@ impl<'a> Exec<'a> {
 
     #[allow(clippy::too_many_lines)] // One arm per encoding; splitting it hides the table.
     fn execute_arm(&mut self, decoded: Decoded) -> Ex {
+        // VFP owns coprocessors 10 and 11 on a part that has it; the
+        // unconditional (`cond == 0b1111`) space there is not VFP and stays
+        // with the ordinary coprocessor path, which leaves it UNDEFINED.
+        #[cfg(feature = "cpu-arm-aprofile-vfp")]
+        if self.cfg.arch.ext.vfp.is_some()
+            && decoded.raw >> 28 != 0xf
+            && super::vfpisa::is_vfp_space(decoded.raw)
+        {
+            return self.execute_vfp(decoded.raw);
+        }
         match decoded.insn {
             Insn::DataProc {
                 op,

@@ -2964,3 +2964,36 @@ fn cp15_is_reachable_as_coprocessor_fifteen_from_guest_code() {
     assert_eq!(h.cpu.reg(0), cp15::Cp15::ARM926EJS_ID);
     assert_ne!(h.cpu.mode(), Mode::UNDEFINED);
 }
+
+// ---------------------------------------------------------------------------
+// A part whose VFP this build did not compile in
+// ---------------------------------------------------------------------------
+
+/// `ROADMAP.md` §6.1.1: a preset whose features are missing fails at
+/// construction, naming the feature — and the infallible `new` builds a part
+/// that honestly has no VFP rather than one that claims it.
+#[cfg(not(feature = "cpu-arm-aprofile-vfp"))]
+#[test]
+fn a_vfp_part_without_the_feature_is_refused_by_name() {
+    let mut props = Props::new();
+    props.insert("cpu", "cortex-a9");
+    let Err(err) = Arm::from_props(&props) else {
+        panic!("no VFP in this build");
+    };
+    assert!(
+        alloc::format!("{err}").contains("cpu-arm-aprofile-vfp"),
+        "{err}"
+    );
+    let cfg = Config {
+        arch: Arch::CORTEX_A9,
+        ..Config::ARM926EJS
+    };
+    assert!(Arm::try_new(cfg).is_err());
+    assert_eq!(Arm::new(cfg).config().arch.ext.vfp, None);
+    // And its cp11 space is the ordinary, empty coprocessor seam.
+    let h = Harness::with_config(cfg);
+    h.program(0x1000, &[0xee31_0b02]); // vadd.f64 d0, d1, d2
+    h.boot(0x1000);
+    h.step();
+    assert_eq!(h.cpu.mode(), Mode::UNDEFINED);
+}

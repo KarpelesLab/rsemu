@@ -166,7 +166,18 @@ impl fmt::Display for Listed {
                         }
                         _ => write!(f, "BLX 0x{target:08x}"),
                     },
-                    None => write!(f, "{insn}"),
+                    None => {
+                        // A VFP word prints as VFP whatever the part: the
+                        // listing has no configuration, and binutils does the
+                        // same. `cond == 0b1111` is not VFP.
+                        #[cfg(feature = "cpu-arm-aprofile-vfp")]
+                        if insn.raw >> 28 != 0xf
+                            && let Some(v) = super::vfpisa::decode(insn.raw)
+                        {
+                            return write!(f, "{}", v.display(insn.cond));
+                        }
+                        write!(f, "{insn}")
+                    }
                 }
             }
             Listed::Thumb { addr, raw, insn } => {

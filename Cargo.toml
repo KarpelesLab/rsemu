@@ -1032,6 +1032,24 @@ cpu-mos6502 = []
 # Adds no dependencies and is `no_std + alloc`.
 cpu-arm-aprofile = []
 
+# VFPv2/VFPv3 floating point for `cpu-arm-aprofile` (src/cpu/arm/aprofile/
+# vfp.rs, vfpisa.rs and exec/vfp.rs): the D0-D31 register file with S0-S31
+# aliasing its lower half, FPSCR, FPEXC, FPSID and MVFR0/1, and every A32
+# coprocessor-10/11 encoding a VFPv3 part executes -- VADD VSUB VMUL VNMUL VDIV
+# VMLA VMLS VNMLA VNMLS (chained, not fused) VABS VNEG VSQRT VMOV (immediate,
+# register, core, core pair, scalar) VCMP(E) VCVT (single/double, integer with
+# and without FPSCR rounding, fixed-point, half-precision VCVTB/VCVTT) VLDR
+# VSTR VLDM VSTM VPUSH VPOP FLDMX/FSTMX VMRS VMSR -- gated by CPACR and
+# FPEXC.EN the way DDI 0406C's CheckVFPEnabled says, with an Undefined Instruction
+# exception where the part would take one. This is what `cpu = "cortex-a9"`
+# (VFPv3-D32) needs: an instance whose part has VFP fails to construct without
+# this feature, naming it, rather than quietly becoming a part without an FPU
+# (ROADMAP.md §6.1.1). The arithmetic is the crate's software IEEE-754
+# (`float`), so a guest FPU is bit-reproducible across hosts (ROADMAP.md §9.1).
+# Advanced SIMD (NEON) is not implemented; MVFR1 says so and its encodings stay
+# UNDEFINED. `no_std + alloc`, no `unsafe`, no dependencies.
+cpu-arm-aprofile-vfp = ["cpu-arm-aprofile", "float"]
+
 # The AArch64 core (src/cpu/arm/a64): an A64 **integer** interpreter -- the 31
 # general registers with the SP/XZR encoding distinction, PC-relative
 # addressing, the bitfield and move-wide families, every branch form, the
