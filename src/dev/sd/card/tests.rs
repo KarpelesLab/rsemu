@@ -517,9 +517,12 @@ fn a_data_command_in_standby_is_illegal_rather_than_obeyed() {
     let rca = bring_up(&card);
     assert_eq!(card.command(cmd::SELECT_CARD, 0), Reply::None);
     assert_eq!(card.phase(), Phase::Standby);
-    let (_, status) = short(card.command(cmd::READ_SINGLE_BLOCK, 0));
-    assert_ne!(status & ILLEGAL_COMMAND, 0);
+    // §4.6.1: an illegal command is not answered on the SD bus...
+    assert_eq!(card.command(cmd::READ_SINGLE_BLOCK, 0), Reply::None);
     assert_eq!(card.phase(), Phase::Standby, "and nothing started");
+    // ...and the error is reported in the next command's R1.
+    let (_, status) = short(card.command(cmd::SEND_STATUS, u32::from(rca) << 16));
+    assert_ne!(status & ILLEGAL_COMMAND, 0);
     // Reselecting puts it back.
     short(card.command(cmd::SELECT_CARD, u32::from(rca) << 16));
     assert_eq!(card.phase(), Phase::Transfer);

@@ -1003,14 +1003,14 @@ impl SdCard {
             }
             cmd::ALL_SEND_CID => {
                 if state.phase != Phase::Ready {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 state.phase = Phase::Identification;
                 Reply::Long(words_of(&self.id.cid))
             }
             cmd::SEND_RELATIVE_ADDR => {
                 if !matches!(state.phase, Phase::Identification | Phase::Standby) {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 let status = Self::take_status(state);
                 state.rca = state.next_rca;
@@ -1024,7 +1024,7 @@ impl SdCard {
             }
             cmd::SWITCH_FUNC => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 let payload = Self::switch_status(state, arg);
                 let status = Self::take_status(state);
@@ -1061,7 +1061,7 @@ impl SdCard {
             }
             cmd::SEND_IF_COND => {
                 if state.phase != Phase::Idle {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 // §4.3.13: the card echoes the check pattern only if it can
                 // work at the supplied voltage. VHS 0001b is 2.7-3.6 V, which
@@ -1094,7 +1094,7 @@ impl SdCard {
                     state.phase,
                     Phase::SendingData | Phase::ReceiveData | Phase::Programming
                 ) {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 let status = Self::take_status(state);
                 // A partial block in the receive buffer is discarded, as it is
@@ -1127,7 +1127,7 @@ impl SdCard {
             }
             cmd::SET_BLOCKLEN => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 // §5.3.3: a high-capacity card's block length is fixed at 512
                 // and CMD16 may only confirm it. A standard-capacity card has
@@ -1155,7 +1155,7 @@ impl SdCard {
             }
             cmd::SET_BLOCK_COUNT => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 state.block_count = Some(arg);
                 Reply::Short {
@@ -1169,7 +1169,7 @@ impl SdCard {
             }
             cmd::ERASE_WR_BLK_START | cmd::ERASE_WR_BLK_END => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 if index == cmd::ERASE_WR_BLK_START {
                     state.erase_start = Some(arg);
@@ -1187,7 +1187,7 @@ impl SdCard {
             }
             cmd::ERASE => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 self.erase(state);
                 Reply::Short {
@@ -1216,7 +1216,7 @@ impl SdCard {
                     busy: false,
                 }
             }
-            _ => Self::illegal(state, index),
+            _ => self.illegal(state, index),
         }
     }
 
@@ -1224,7 +1224,7 @@ impl SdCard {
         match index {
             cmd::A_SD_SEND_OP_COND => {
                 if state.phase != Phase::Idle {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 // §4.2.3. A zero voltage window is an *inquiry*: the host is
                 // asking what the card wants, and the card must not begin
@@ -1262,7 +1262,7 @@ impl SdCard {
             }
             cmd::A_SET_BUS_WIDTH => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 match arg & 0x3 {
                     0b00 => state.bus_width = 1,
@@ -1277,7 +1277,7 @@ impl SdCard {
             }
             cmd::A_SD_STATUS => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 let payload = Self::sd_status(state);
                 let value = Self::take_status(state) | APP_CMD;
@@ -1291,7 +1291,7 @@ impl SdCard {
             }
             cmd::A_SEND_SCR => {
                 if state.phase != Phase::Transfer {
-                    return Self::illegal(state, index);
+                    return self.illegal(state, index);
                 }
                 let value = Self::take_status(state) | APP_CMD;
                 state.transfer = Some(Transfer::payload(self.id.scr.to_vec()));
@@ -1317,7 +1317,7 @@ impl SdCard {
         to_host: bool,
     ) -> Reply {
         if state.phase != Phase::Transfer {
-            return Self::illegal(state, index);
+            return self.illegal(state, index);
         }
         let multiple = index == cmd::READ_MULTIPLE_BLOCK || index == cmd::WRITE_MULTIPLE_BLOCK;
         // The difference the specification spends §4.3.14 on: a high-capacity
@@ -1482,8 +1482,20 @@ impl SdCard {
         }
     }
 
-    fn illegal(state: &mut Volatile, index: u8) -> Reply {
+    /// A command this card does not accept in its state.
+    ///
+    /// On the SD bus the card **does not answer** (Physical Layer Simplified
+    /// Specification §4.6.1, "Command Legality"): the host sees a response
+    /// timeout, and `ILLEGAL_COMMAND` waits in the status for the next
+    /// command's R1. That silence is load-bearing — a host probing for an SDIO
+    /// function sends CMD5 and CMD52 first and decides "not SDIO" from the
+    /// timeout, and an answer would be read as an SDIO OCR. In SPI mode every
+    /// command gets an R1, and this is it, with the bit set.
+    fn illegal(&self, state: &mut Volatile, index: u8) -> Reply {
         state.sticky |= ILLEGAL_COMMAND;
+        if self.mode == BusMode::Sd {
+            return Reply::None;
+        }
         let value = Self::take_status(state);
         Reply::Short {
             index,
@@ -2097,7 +2109,9 @@ impl CardDevice {
         // empty socket: the board has the slot and nobody put a card in it.
         // A small blank card stands behind the socket so the removable-media
         // door still has something to load an image into later.
-        let drive = props.get("drive").and_then(crate::core::props::Value::as_str);
+        let drive = props
+            .get("drive")
+            .and_then(crate::core::props::Value::as_str);
         let supplied = match (drive, props.hosts()) {
             (Some(name), Some(hosts)) => {
                 medium::get(hosts, name)?.is_some_and(|slot| slot.is_occupied())
