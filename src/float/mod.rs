@@ -76,7 +76,8 @@ mod tests;
 
 pub use binary::{
     B16, B32, B64, Category, Format, add, classify, compare, convert, div, eq, fma, from_signed,
-    from_unsigned, le, lt, max, min, mul, round_to_integral, sqrt, sub, to_signed, to_unsigned,
+    from_signed_fixed, from_unsigned, from_unsigned_fixed, le, lt, max, min, mul,
+    round_to_integral, sqrt, sub, to_signed, to_signed_fixed, to_unsigned, to_unsigned_fixed,
 };
 
 /// A rounding-direction attribute.

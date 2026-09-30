@@ -508,7 +508,32 @@ fn sign_extend(v: u64, bits: u32) -> i64 {
 /// saturates and gives a NaN the most positive value, ARM saturates and gives
 /// a NaN zero, x86 delivers the integer indefinite for all three.
 pub fn to_signed<F: Format>(value: u64, bits: u32, env: Env) -> (i64, Flags) {
+    to_signed_fixed::<F>(value, bits, 0, env)
+}
+
+/// Multiply a finite operand by `2^fbits` by moving its exponent — exact, and
+/// unable to overflow or underflow, because nothing is rounded until the
+/// integer conversion that follows.
+fn scaled(mut p: Parts, fbits: u32) -> Parts {
+    if p.class == Class::Finite {
+        p.exp += fbits as i32;
+    }
+    p
+}
+
+/// Convert to a signed **fixed-point** value `bits` wide with `fbits`
+/// fraction bits: `value × 2^fbits`, rounded once to an integer in the
+/// environment's direction (Arm's `FPToFixed`, DDI 0406C's
+/// shared pseudocode).
+///
+/// The scaling is done on the exponent rather than as a floating-point
+/// multiply, so a value near the top of the format cannot overflow to an
+/// infinity on the way and raise an overflow the architecture's
+/// infinite-precision `value * 2^fraction_bits` never raises. With
+/// `fbits == 0` this is [`to_signed`].
+pub fn to_signed_fixed<F: Format>(value: u64, bits: u32, fbits: u32, env: Env) -> (i64, Flags) {
     let (p, fin) = unpack::<F>(value, env);
+    let p = scaled(p, fbits);
     let max: u128 = (1u128 << (bits - 1)) - 1;
     let min_mag: u128 = 1u128 << (bits - 1);
     let most_negative = sign_extend(min_mag as u64, bits);
@@ -566,7 +591,14 @@ pub fn to_signed<F: Format>(value: u64, bits: u32, env: Env) -> (i64, Flags) {
 /// that choice yet, because x87 and pre-AVX-512 SSE have no unsigned
 /// conversion at all.
 pub fn to_unsigned<F: Format>(value: u64, bits: u32, env: Env) -> (u64, Flags) {
+    to_unsigned_fixed::<F>(value, bits, 0, env)
+}
+
+/// The unsigned counterpart of [`to_signed_fixed`]. With `fbits == 0` this is
+/// [`to_unsigned`].
+pub fn to_unsigned_fixed<F: Format>(value: u64, bits: u32, fbits: u32, env: Env) -> (u64, Flags) {
     let (p, fin) = unpack::<F>(value, env);
+    let p = scaled(p, fbits);
     let max: u128 = if bits >= 64 {
         u128::from(u64::MAX)
     } else {
@@ -614,12 +646,38 @@ pub fn from_unsigned<F: Format>(value: u64, bits: u32, env: Env) -> (u64, Flags)
     from_magnitude::<F>(false, u128::from(v), env)
 }
 
+/// Convert from a signed **fixed-point** value `bits` wide with `fbits`
+/// fraction bits: `value × 2^-fbits`, rounded once (Arm's `FixedToFP`).
+///
+/// One rounding, not an integer conversion followed by a scaling multiply:
+/// the scaled value can land in the subnormal range, where a second step
+/// would round again.
+pub fn from_signed_fixed<F: Format>(value: i64, bits: u32, fbits: u32, env: Env) -> (u64, Flags) {
+    let v = sign_extend(value as u64, bits);
+    from_scaled::<F>(v < 0, u128::from(v.unsigned_abs()), fbits, env)
+}
+
+/// The unsigned counterpart of [`from_signed_fixed`].
+pub fn from_unsigned_fixed<F: Format>(value: u64, bits: u32, fbits: u32, env: Env) -> (u64, Flags) {
+    let v = if bits >= 64 {
+        value
+    } else {
+        value & ((1u64 << bits) - 1)
+    };
+    from_scaled::<F>(false, u128::from(v), fbits, env)
+}
+
 /// The shared body of the two integer-to-float conversions. An integer zero
 /// converts to `+0` in every rounding direction (§5.4.1).
 fn from_magnitude<F: Format>(sign: bool, magnitude: u128, env: Env) -> (u64, Flags) {
+    from_scaled::<F>(sign, magnitude, 0, env)
+}
+
+/// `(-1)^sign × magnitude × 2^-fbits`, rounded once.
+fn from_scaled<F: Format>(sign: bool, magnitude: u128, fbits: u32, env: Env) -> (u64, Flags) {
     if magnitude == 0 {
         return (0, Flags::NONE);
     }
-    let (out, f) = kernel::round_exact(sign, 0, magnitude, F::SPEC, env);
+    let (out, f) = kernel::round_exact(sign, -(fbits as i32), magnitude, F::SPEC, env);
     (encode_outcome::<F>(out, env), f)
 }

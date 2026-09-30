@@ -1595,3 +1595,56 @@ fn round_to_integral_honours_flush_to_zero() {
     let up = Env::ARM.round(Round::TowardPositive);
     assert_eq!(round_to_integral::<B64>(MIN_SUB64, up, false).0, d(1.0));
 }
+
+/// Fixed-point conversion scales on the exponent, so it rounds exactly once
+/// and never raises the overflow a real `x * 2^fbits` multiply would at the
+/// top of the format (Arm's `FPToFixed`/`FixedToFP`).
+#[test]
+fn fixed_point_conversions_round_once() {
+    let rtz = Env::ARM.round(Round::TowardZero);
+    // 1.75 with four fraction bits is 28.
+    assert_eq!(
+        to_signed_fixed::<B32>(s(1.75), 32, 4, rtz),
+        (28, Flags::NONE)
+    );
+    // -1.03125 × 16 = -16.5, truncated toward zero, inexact.
+    assert_eq!(
+        to_signed_fixed::<B64>(d(-1.03125), 16, 4, rtz),
+        (-16, Flags::INEXACT)
+    );
+    // Out of a 16-bit container saturates with invalid and nothing else.
+    assert_eq!(
+        to_signed_fixed::<B64>(d(4096.0), 16, 4, rtz),
+        (32767, Flags::INVALID)
+    );
+    // The largest double scaled by 2^32 saturates; a multiply would have
+    // overflowed to infinity and reported OFC/IXC as well.
+    assert_eq!(
+        to_unsigned_fixed::<B64>(0x7fef_ffff_ffff_ffff, 32, 32, rtz),
+        (u64::from(u32::MAX), Flags::INVALID)
+    );
+    // fbits = 0 is the plain integer conversion.
+    assert_eq!(
+        to_signed_fixed::<B64>(d(-2.5), 32, 0, rtz),
+        to_signed::<B64>(d(-2.5), 32, rtz)
+    );
+    // FixedToFP: 28 with four fraction bits is 1.75, exactly.
+    assert_eq!(
+        from_signed_fixed::<B32>(28, 32, 4, Env::ARM),
+        (s(1.75), Flags::NONE)
+    );
+    assert_eq!(
+        from_signed_fixed::<B64>(-1, 16, 16, Env::ARM),
+        (d(-1.0 / 65536.0), Flags::NONE)
+    );
+    // An unsigned 0xffff_ffff with 32 fraction bits rounds to 1.0 in single
+    // precision — once, to nearest.
+    assert_eq!(
+        from_unsigned_fixed::<B32>(0xffff_ffff, 32, 32, Env::ARM),
+        (s(1.0), Flags::INEXACT)
+    );
+    assert_eq!(
+        from_unsigned_fixed::<B64>(0, 32, 8, Env::ARM),
+        (0, Flags::NONE)
+    );
+}
