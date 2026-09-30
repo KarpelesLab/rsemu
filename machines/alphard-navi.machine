@@ -119,7 +119,7 @@ machine "alphard-navi" {
   object scifn  "ram" { size = 20K }   # 0xffe41000: SCIF1-5, the sub-processor links
   object sdhi   "ram" { size = 16K }   # 0xffe4c000: SDHI0-3
   object misc1  "ram" { size = 4K }    # 0xfff12000
-  object pfc    "ram" { size = 36K }   # 0xfffc0000: pin function controller and its neighbours
+  object pfc    "ram" { size = 64K }   # 0xfffc0000: pin function controller, RDS (0xfffc4000), IEBus (0xfffc9000)
 
   # -- the memory map --------------------------------------------------------
   map mem 0x00000000 size 8M     = nor
@@ -151,7 +151,7 @@ machine "alphard-navi" {
   map mem 0xffe4c000 size 16K    = sdhi
   map mem 0xfff12000 size 4K     = misc1
   map mem 0xfff80000 size 0x40000 = du
-  map mem 0xfffc0000 size 36K    = pfc
+  map mem 0xfffc0000 size 64K    = pfc
 
   # -- the wires -------------------------------------------------------------
   wire tmu0.irq0   -> gic.spi32       # ID 64: the scheduler tick
