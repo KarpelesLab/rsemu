@@ -1820,15 +1820,14 @@ impl Device for Arm {
     }
 
     fn reset(&self, kind: ResetKind) {
-        // CP15 is reset by the same signal the core is, so a cold start puts
-        // its registers back too — including the MMU enable, which is what
-        // makes a rebooted machine fetch its reset vector physically.
-        if kind == ResetKind::Cold {
-            match &self.cp15 {
-                Some(SystemCp::V5(cp15)) => cp15.reset(),
-                Some(SystemCp::V7(cp15)) => cp15.reset(),
-                None => {}
-            }
+        // CP15 is reset by the same signal the core is, warm or cold, so a
+        // reset puts its registers back too — including the MMU enable, which
+        // is what makes a rebooted machine fetch its reset vector physically
+        // (DDI 0406C B1.9.10). The reset pin path does the same in `step`.
+        match &self.cp15 {
+            Some(SystemCp::V5(cp15)) => cp15.reset(),
+            Some(SystemCp::V7(cp15)) => cp15.reset(),
+            None => {}
         }
         {
             let mut session = self.session.lock();
