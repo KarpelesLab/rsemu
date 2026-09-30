@@ -1167,6 +1167,17 @@ machine-a64-mini = ["cpu-arm-a64"]
 # and a RISC-V boot ROM, none of which an AArch64 board has any use for.
 dev-arm = ["dev-fdt"]
 
+# The Cortex-A9 MPCore's private memory region (src/dev/arm/mpcore.rs,
+# `arm.a9mpcore`): the Snoop Control Unit's registers, the 64-bit global timer
+# with a banked comparator per processor, and each processor's private timer
+# and watchdog -- counted from the scheduler's PERIPHCLK domain by arithmetic,
+# with only the next expiry scheduled, and banked by requester exactly as the
+# GIC banks its registers. The interrupt controller at +0x100/+0x1000 is
+# `arm.gic` with `version = 1`, not a second copy. Written from DDI 0407.
+# `no_std + alloc`, no dependencies; pulls `dev-arm` because that is the
+# module it lives in and the GIC its interrupts are wired to.
+dev-arm-mpcore = ["dev-arm"]
+
 # The AArch64 `virt` board as a machine (machines/arm64-virt.machine plus the
 # classes it names). The board a real arm64 kernel is pointed at:
 #

@@ -16,6 +16,7 @@
 //! | [`dt`] | the device tree *generator*, which walks the realized machine |
 //! | [`boot`] | the reset vector, and where the generated tree lands |
 //! | [`loader`] | putting a kernel or a ramdisk into guest memory |
+//! | [`mpcore`] | the Cortex-A9 MPCore private region: SCU, global timer, private timers and watchdogs (`dev-arm-mpcore`) |
 //!
 //! PSCI itself is **not** here, and could not be: `SMC` and `HVC` are
 //! instructions, so the handler is in
@@ -133,6 +134,9 @@ pub mod boot;
 pub mod dt;
 pub mod gic;
 pub mod loader;
+#[cfg(feature = "dev-arm-mpcore")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-arm-mpcore")))]
+pub mod mpcore;
 pub mod pl011;
 pub mod power;
 
@@ -144,6 +148,8 @@ mod tests;
 pub use boot::BootRom;
 pub use gic::Gic;
 pub use loader::Loader;
+#[cfg(feature = "dev-arm-mpcore")]
+pub use mpcore::A9MpCore;
 pub use pl011::Pl011;
 pub use power::Power;
 
@@ -157,6 +163,8 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::core::Result<()>
     pl011::register(registry)?;
     power::register(registry)?;
     boot::register(registry)?;
+    #[cfg(feature = "dev-arm-mpcore")]
+    mpcore::register(registry)?;
     loader::register(registry)
 }
 
@@ -170,17 +178,23 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::core::Result<()> 
     pl011::bind(bindings)?;
     power::bind(bindings)?;
     boot::bind(bindings)?;
+    #[cfg(feature = "dev-arm-mpcore")]
+    mpcore::bind(bindings)?;
     loader::bind(bindings)
 }
 
 /// Every board class's validator schema.
 #[must_use]
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
-    alloc::vec![
+    #[allow(unused_mut)]
+    let mut out = alloc::vec![
         gic::schema(),
         pl011::schema(),
         power::schema(),
         boot::schema(),
         loader::schema(),
-    ]
+    ];
+    #[cfg(feature = "dev-arm-mpcore")]
+    out.push(mpcore::schema());
+    out
 }
