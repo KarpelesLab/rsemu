@@ -234,11 +234,15 @@ mod tests {
 
     #[test]
     fn the_presets_say_what_their_parts_have() {
-        assert!(!Arch::V5TE.ext.v6);
-        assert!(!Arch::V5TE.has_unaligned());
-        assert!(Arch::CORTEX_A9.ext.thumb2);
-        assert!(Arch::CORTEX_A9.alu_write_pc_interworks());
-        assert_eq!(Arch::CORTEX_A9.ext.vfp, Some(Vfp::V3_D32));
-        assert!(!Arch::CORTEX_A9.ext.idiv_arm, "Cortex-A9 has no divider");
+        // Read through a binding: asserting on a `const` field directly is a
+        // compile-time fact clippy rightly calls pointless, but the question
+        // here is what the presets *say*, and that is what a test pins.
+        let (v5, a9) = (Arch::V5TE, Arch::CORTEX_A9);
+        assert!(!v5.ext.v6);
+        assert!(!v5.has_unaligned());
+        assert!(a9.ext.thumb2);
+        assert!(a9.alu_write_pc_interworks());
+        assert_eq!(a9.ext.vfp, Some(Vfp::V3_D32));
+        assert!(!a9.ext.idiv_arm, "Cortex-A9 has no divider");
     }
 }
