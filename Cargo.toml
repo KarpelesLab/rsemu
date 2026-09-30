@@ -1023,6 +1023,15 @@ cpu-mos6502 = []
 # Caches, the write buffer and the TCMs are not modelled and remain the SoC's,
 # behind the `cp::Coprocessor` and `cp::Mmu` traits.
 #
+# Configured as a Cortex-A9 (`cpu = "cortex-a9"`) it executes the ARMv7-A **A32
+# (ARM-state) instruction set**: the ARMv6 media instructions with the GE flags,
+# CPS/SRS/RFE/SETEND with big-endian data, LDREX/STREX (all sizes) and CLREX on
+# a local exclusive monitor, WFI/WFE/SEV, MOVW/MOVT and the v6T2 bitfield
+# instructions, the ARMv7 barriers and hints, interworking ALU writes to the
+# PC, true unaligned access, and ARMv6's PSR and exception-entry rules. Decode
+# is gated per part, so an ARM926EJ-S is unchanged. Thumb-2 and VFP/NEON are
+# not part of this yet.
+#
 # Named for the profile, not the version, because ARMv6 and ARMv7-A share this
 # core's whole shape -- A32 plus Thumb, banked modes, CP15, the exception model
 # -- and select their differences with a construction property rather than a

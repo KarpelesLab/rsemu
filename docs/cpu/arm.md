@@ -1,6 +1,7 @@
 # ARM
 
-Consumed by: `cpu/arm/aprofile` (ARMv5TE today, ARMv6/ARMv7-A later),
+Consumed by: `cpu/arm/aprofile` (ARMv5TE, and ARMv7-A's A32 instruction set;
+Thumb-2 and VFP to follow),
 `cpu/arm/v7m` (ARMv7E-M, Cortex-M3/M4/M7), `cpu/arm/a64` (ARMv8-A AArch64).
 
 ## Primary

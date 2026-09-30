@@ -733,6 +733,11 @@ fn run_one_arch_test(
 const LEDGERS: &[(&str, bool)] = &[
     // (file stem, keyed by test name rather than by opcode)
     ("accuracycoin", false),
+    // Same shape as `cpu-arm-v7m-fp` below: there is no permissively licensed
+    // ARMv7-A A32 corpus, so the A-profile core's ARMv6/ARMv7 additions are
+    // measured by `src/cpu/arm/aprofile/tests_v7.rs` and this is the list of
+    // what they deliberately leave out.
+    ("cpu-arm-aprofile-a32", true),
     // No downloadable VFP corpus exists to key this one to a run: the ARMv7E-M
     // floating-point unit is measured by its in-tree ledger table, its
     // differential against the A64 core's wrapper and the `clang`-built corpus,

@@ -1,0 +1,99 @@
+# Known gaps: cpu-arm-aprofile, the ARMv6 / ARMv6K / v6T2 / ARMv7-A additions
+# to the A32 (ARM-state) instruction set and the ARMv6 PSR and exception model
+# (src/cpu/arm/aprofile/isa_v6.rs, media.rs, monitor.rs, exec_v6.rs, and the
+# v6 branches of isa.rs and exec.rs).
+#
+# Like cpu-arm-v7m-fp.txt beside it, this is not keyed by the name of a test
+# in a downloaded suite: there is no permissively licensed ARMv7-A A32
+# single-step corpus to download. What measures this half of the core is
+#
+#   * src/cpu/arm/aprofile/tests_v7.rs -- every new encoding assembled with
+#     GNU `as -march=armv7-a` (plus `sec`, `mp`, `idiv`) and checked through
+#     both the disassembler (UAL text) and the interpreter (results, flags,
+#     GE, Q, faults), with the boundary cases worked from DDI 0406C's
+#     pseudocode by hand;
+#   * src/cpu/arm/aprofile/media.rs's tests, which pin the lane arithmetic
+#     without a core;
+#   * `an_armv5_part_decodes_exactly_as_it_always_did`, a digest of the
+#     ARMv5TE decoder over a million words taken before any of this existed,
+#     so an ARM926EJ-S configuration provably did not move;
+#   * the ARMv4T corpus in conformance.rs, still 2 200 000 of 2 200 000.
+#
+# Everything below is a deliberate and stated non-implementation. The rule is
+# the same as the other ledgers': **this file only ever shrinks**, a defect
+# never goes in it, and every line says which paragraph of the architecture it
+# is declining and what a guest sees instead.
+#
+# ---------------------------------------------------------------------------
+# 2026-09-30: the initial landing.
+# ---------------------------------------------------------------------------
+
+smc.monitor-mode            # `SMC` decodes and disassembles on a part with
+                            # the Security Extensions, and executes as an
+                            # Undefined Instruction exception. Monitor mode,
+                            # `SCR`, the banked Secure/Non-secure CP15 view
+                            # and the Secure Monitor exception are not
+                            # modelled: the core runs everything Secure. A
+                            # guest calling firmware traps rather than
+                            # carrying on as if it had been answered.
+                            # DDI 0406C B1.5 (Security Extensions), B9.3 `SMC`.
+
+global-exclusive-monitor    # One core per machine, so only the local
+                            # monitor exists. `monitor::GlobalMonitor` and
+                            # `Arm::attach_global_monitor` are the seam a
+                            # multi-core machine plugs one into; nothing in
+                            # the crate implements it yet. DDI 0406C A3.4.2.
+
+sev.broadcast               # `SEV` sets this core's own event register.
+                            # `Arm::send_event` is the lock-free entry point a
+                            # sibling's `SEV` will call once there are
+                            # siblings. DDI 0406C B1.8, "Wait For Event and
+                            # Send Event".
+
+cpsr.a.async-aborts         # `CPSR.A` is written, masked on the right
+                            # exception entries, saved and restored, but no
+                            # asynchronous (imprecise) abort is ever raised:
+                            # every external abort this core takes is
+                            # precise. DDI 0406C B1.8 (asynchronous aborts).
+
+sctlr.nmfi                  # Non-maskable FIQ: `MSR` and `CPS` may always
+                            # set and clear `CPSR.F`. `Regime` carries no
+                            # `NMFI` bit; no part this core models sets it.
+                            # DDI 0406C B1.8, "Non-maskable FIQs".
+
+sctlr.sw                    # `SWP`/`SWPB` always execute. On an MP part the
+                            # architecture lets `SCTLR.SW` disable them
+                            # (UNDEFINED); `Regime` does not carry it yet.
+                            # DDI 0406C A8.8 `SWP`, B4.1 `SCTLR`.
+
+unpredictable-as-undefined  # Where DDI 0406C calls an A32 encoding
+                            # UNPREDICTABLE and it is cheap to detect, this
+                            # core takes the Undefined Instruction exception
+                            # rather than computing something: `SBFX`/`UBFX`
+                            # running off bit 31, `BFC`/`BFI` with msb < lsb,
+                            # `CPS` with imod 01 or with nothing to change,
+                            # `SRS` from User or System mode or naming an
+                            # unimplemented mode, `RFE` from User mode, and
+                            # `LDREXD`/`STREXD` with an odd or R14 first
+                            # register. Hardware may do otherwise; no correct
+                            # program can tell.
+
+bad-mode-writes             # An `MSR` or `CPS` naming a mode the part does
+                            # not implement -- including Monitor (0b10110)
+                            # and Hyp (0b11010) -- leaves the mode unchanged
+                            # rather than banking into nothing. The other
+                            # fields of the write still happen.
+                            # DDI 0406C B1.3 (`BadMode`, `CPSRWriteByInstr`).
+
+thumb.v6-and-thumb2         # This landing is the ARM-state half. Thumb state
+                            # still decodes the ARMv5TE 16-bit set: the ARMv6
+                            # 16-bit additions (`REV`, `SXTB`, `CPS`,
+                            # `SETEND`, …), the 32-bit Thumb-2 encodings and
+                            # `IT` belong to the Thumb-2 work. The exception
+                            # model already clears and saves IT state and
+                            # computes Thumb return addresses for it.
+
+virtualization              # `HVC`, `ERET`, banked `MRS`/`MSR` and Hyp mode
+                            # decode as UNDEFINED. Correct for a Cortex-A9,
+                            # which has no Virtualization Extensions; listed
+                            # so nobody mistakes it for an oversight.
