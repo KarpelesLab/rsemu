@@ -1018,6 +1018,9 @@ fn an_arm926_snapshot_is_the_same_bytes_it_always_was_and_a_v3_one_still_loads()
     assert_eq!(restored.cp15().unwrap().ttbr(), 0x4000);
 }
 
+// A Cortex-A9 has VFP, and `from_props` refuses a VFP part in a build that
+// cannot model one; without the feature the refusal is what is tested, below.
+#[cfg(feature = "cpu-arm-aprofile-vfp")]
 #[test]
 fn the_cpu_property_brings_its_cp15_and_the_mp_properties_reach_it() {
     use crate::core::props::Props;
@@ -1065,4 +1068,18 @@ fn join_cluster_links_two_cores_tlbs() {
     let before = b.cp15v7().unwrap().regime().generation;
     a.cp15v7().unwrap().mcr(op(0, 8, 3, 0), 0).unwrap();
     assert_ne!(b.cp15v7().unwrap().regime().generation, before);
+}
+
+#[cfg(not(feature = "cpu-arm-aprofile-vfp"))]
+#[test]
+fn a_cortex_a9_without_the_vfp_feature_is_refused_by_name() {
+    use crate::core::props::Props;
+
+    let mut props = Props::new();
+    props.insert("cpu", "cortex-a9");
+    let err = Arm::from_props(&props).expect_err("VFP is not compiled in");
+    assert!(
+        format!("{err}").contains("cpu-arm-aprofile-vfp"),
+        "the error names the missing feature: {err}"
+    );
 }
