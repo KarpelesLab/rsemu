@@ -1217,6 +1217,21 @@ machine-arm64-virt = ["cpu-arm-a64", "dev-arm", "dev-virtio"]
 # dependencies.
 machine-arm926 = ["cpu-arm-aprofile"]
 
+# The `alphard-navi` board (machines/alphard-navi.machine): the Aisin navigation
+# computer in a Toyota Alphard, a Renesas R-Car Gen1 (Cortex-A9 MPCore) board.
+# Its NOR dump boots U-Boot, Linux 2.6.35 and a CramFS recovery root on the
+# modelled parts -- the ARMv7-A core with VFP, the A9 private region and GICv1,
+# the L2C-310, the AMD-command-set NOR, the TMUs, a SCIF and the Display Unit --
+# with every other register block a labelled storage placeholder. What runs and
+# what does not is in docs/platforms/alphard-navi.md. Adds no dependencies.
+machine-alphard-navi = [
+    "cpu-arm-aprofile-vfp",
+    "dev-arm-mpcore",
+    "dev-arm-l2c310",
+    "dev-flash-cfi",
+    "dev-rcar",
+]
+
 # A National Semiconductor 16550 UART (src/dev/uart/ns16550.rs): the eight
 # registers, the DLAB latch, both sixteen-byte FIFOs, the interrupt
 # identification priorities and modelled back pressure -- a byte the host will

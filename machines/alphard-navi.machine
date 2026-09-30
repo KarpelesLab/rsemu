@@ -1,0 +1,163 @@
+# alphard-navi - the Aisin navigation computer in a Toyota Alphard (GGH30).
+#
+#   rsemu run alphard-navi --media flash=S29JL064J.bin
+#
+# The head unit (Toyota 86100-58182, Panasonic CQ-UT24J0AJ) carries an Aisin AW
+# computer board, 99370-00649, built around a Renesas R-Car Gen1 SoC (marked
+# R8A77791): Cortex-A9 MPCore, 1 GiB of DDR3 on two channels, and an 8 MiB
+# Spansion S29JL064J NOR flash on the local bus at address zero. The flash holds
+# U-Boot 2011.03, a Linux 2.6.35 uImage and a CramFS "recovery" root whose job is
+# to load the full system from the map SD card and warm-reboot into it.
+#
+# Everything below that is not a datasheet fact was learnt by running that
+# flash image and watching what it touched (docs/platforms/alphard-navi.md) --
+# the memory map, the interrupt numbers, the clock rate the kernel assumes. No
+# Linux or U-Boot *source* was read; the SoC's hardware manual is not public.
+#
+# ---------------------------------------------------------------------------
+# What is modelled, and what is a placeholder
+# ---------------------------------------------------------------------------
+#
+# Modelled: the core (ARMv7-A, VFPv3, the A9's CP15 and MMU), the MPCore private
+# region (SCU, timers, GIC), the L2C-310, the NOR flash with the AMD command set,
+# on-chip SRAM, DRAM, the three TMU timer units, the SCIF the kernel names, and
+# the Display Unit.
+#
+# Placeholders: every other register block the firmware touches is a plain
+# `ram` object -- storage that reads back what was written, and nothing else.
+# That is exactly the arm926 skeleton's idiom, and it is labelled at each map
+# line. It is enough for the boot code's write-then-read-back sequences; it is
+# *not* a model, and anything that waits for a status bit to change there waits
+# forever or times out. A placeholder that becomes a device is a one-line map
+# change.
+
+machine "alphard-navi" {
+  # -- clocks ----------------------------------------------------------------
+  #
+  # The core runs at 800 MHz here; the part is rated for 1 GHz and the real
+  # rate is set by the CPG, which is not modelled. What matters to the guest is
+  # the peripheral clock the kernel *believes* in: it programs TMU0 for a 1 ms
+  # tick with TCOR = 0x3ae0 at Pφ/4, which is 60.288 MHz. The dot clock gives
+  # the 1176 x 525 raster rcarfb programs exactly 60 frames a second.
+  param cpu-hz = 800000000
+  osc cpuclk = cpu-hz Hz
+  osc pclk   = 60288000 Hz
+  osc dotclk = 37044000 Hz
+
+  space mem { width = 32 }
+
+  # -- the core --------------------------------------------------------------
+  #
+  # One Cortex-A9. The SoC has more, but the kernel on this flash counts one
+  # ("Brought up 1 CPUs") from the SCU below, and a second core is a change to
+  # `cpus` here and in the SCU and GIC once secondary bring-up is understood.
+  object cpu "cpu.arm" {
+    clock      = cpuclk
+    space      = mem
+    cpu        = "cortex-a9"
+    periphbase = 0xf0000000
+  }
+
+  # -- memory ----------------------------------------------------------------
+
+  # IC400: S29JL064J, 8 MiB, x16 on the local bus, boot sectors at both ends.
+  # The kernel's physmap driver finds it through CFI and splits it into four
+  # partitions.
+  object nor "flash.cfi" {
+    size = 8M, width = 2, interleave = 1, command-set = "amd"
+    blocks = [8, 8K, 126, 64K, 8, 8K]
+    device = 0x227e, device-ext = [0x2202, 0x2201]
+    banks = [23, 48, 48, 23], boot-flag = 1
+    image = "flash"
+  }
+
+  # On-chip SRAM: U-Boot copies its DDR initialisation here and runs it before
+  # DRAM exists, and the kernel keeps its warm-reboot flag at 0xfe794000.
+  object sram "ram" { size = 128K }
+
+  # Two DDR3 channels, contiguous from 0x60000000. The kernel is told
+  # mem=256M at 0x80000000; U-Boot relocates itself to the top of the second
+  # channel.
+  object dram "ram" { size = 1G }
+
+  # -- the Cortex-A9 MPCore private region -----------------------------------
+  object mpcore "arm.a9mpcore" { clock = cpuclk / 2, cpus = 1 }
+  object gic    "arm.gic"      { version = 1, cpus = 1, spis = 128 }
+  object l2     "arm.l2c310"   { size = 1M, ways = 16 }
+
+  # -- SoC peripherals ---------------------------------------------------------
+
+  # TMU0: channel 0 is the kernel's 1 ms tick (GIC ID 64), channel 1 its free-
+  # running clocksource. TMU1 channel 0 is a 20 ms timer on ID 68. TMU2 is
+  # mapped because the kernel's static I/O table maps it.
+  object tmu0 "rcar.tmu" { clock = pclk }
+  object tmu1 "rcar.tmu" { clock = pclk }
+  object tmu2 "rcar.tmu" { clock = pclk }
+
+  # SCIF0, where console=ttyS0 would go if this kernel had a console driver.
+  # It does not: the production kernel's printk is a stub and the only SCIF
+  # user is Aisin's DMA-driven link to the sub-processors. Mapped so that
+  # anything written there is visible on the `console` port.
+  object scif0 "rcar.scif" { clock = pclk / 1024, port = "console" }
+
+  # The Display Unit: rcarfb drives plane 1 as 800x480 RGB565 from 0x9e000000.
+  object du "rcar.du" { clock = dotclk, space = mem }
+
+  # -- placeholders: storage, not models (see the header) ---------------------
+  object extcs  "ram" { size = 4K }    # 0x18100000: a device on an LBSC chip select U-Boot probes
+  object intc   "ram" { size = 4K }    # 0xfe700000: interrupt mask registers
+  object dbsc0  "ram" { size = 4K }    # 0xfe800000: DDR controller, channel 0
+  object dbsc1  "ram" { size = 4K }    # 0xfec00000: DDR controller, channel 1
+  object lbsc   "ram" { size = 4K }    # 0xff800000: local bus state controller
+  object misc0  "ram" { size = 64K }   # 0xffc00000: 0xffc00300/400, and the 0xffc08000/0xffc09000 blocks
+  object gpio   "ram" { size = 32K }   # 0xffc40000: GPIO banks 0-6 (bit 30 of bank 0 requests the hard reset)
+  object darc   "ram" { size = 4K }    # 0xffc55000: the kernel's UIO_DARC block
+  object i2c    "ram" { size = 12K }   # 0xffc70000: I2C 0-2
+  object cpg    "ram" { size = 4K }    # 0xffc80000: clock pulse generator
+  object sysc   "ram" { size = 4K }    # 0xffcc0000: power control (the SGX power-up poll times out here)
+  object dma    "ram" { size = 4K }    # 0xffd85000: DMA controller registers
+  object scifn  "ram" { size = 20K }   # 0xffe41000: SCIF1-5, the sub-processor links
+  object sdhi   "ram" { size = 16K }   # 0xffe4c000: SDHI0-3
+  object misc1  "ram" { size = 4K }    # 0xfff12000
+  object pfc    "ram" { size = 36K }   # 0xfffc0000: pin function controller and its neighbours
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000 size 8M     = nor
+  map mem 0x18100000 size 4K     = extcs
+  map mem 0x60000000 size 1G     = dram
+  map mem 0xf0000000 size 0x100  = mpcore.scu
+  map mem 0xf0000100 size 0x100  = gic.cpu
+  map mem 0xf0000200 size 0x100  = mpcore.global
+  map mem 0xf0000600 size 0x100  = mpcore.private
+  map mem 0xf0001000 size 0x1000 = gic.dist
+  map mem 0xf0100000 size 0x1000 = l2
+  map mem 0xfe700000 size 4K     = intc
+  map mem 0xfe780000 size 128K   = sram
+  map mem 0xfe800000 size 4K     = dbsc0
+  map mem 0xfec00000 size 4K     = dbsc1
+  map mem 0xff800000 size 4K     = lbsc
+  map mem 0xffc00000 size 64K    = misc0
+  map mem 0xffc40000 size 32K    = gpio
+  map mem 0xffc55000 size 4K     = darc
+  map mem 0xffc70000 size 12K    = i2c
+  map mem 0xffc80000 size 4K     = cpg
+  map mem 0xffcc0000 size 4K     = sysc
+  map mem 0xffd80000 size 0x30   = tmu0
+  map mem 0xffd81000 size 0x30   = tmu1
+  map mem 0xffd82000 size 0x30   = tmu2
+  map mem 0xffd85000 size 4K     = dma
+  map mem 0xffe40000 size 0x100  = scif0
+  map mem 0xffe41000 size 20K    = scifn
+  map mem 0xffe4c000 size 16K    = sdhi
+  map mem 0xfff12000 size 4K     = misc1
+  map mem 0xfff80000 size 0x40000 = du
+  map mem 0xfffc0000 size 36K    = pfc
+
+  # -- the wires -------------------------------------------------------------
+  wire tmu0.irq0   -> gic.spi32       # ID 64: the scheduler tick
+  wire tmu1.irq0   -> gic.spi36       # ID 68
+  wire mpcore.gt0  -> gic.cpu0ppi11   # ID 27: global timer
+  wire mpcore.twd0 -> gic.cpu0ppi13   # ID 29: private timer
+  wire mpcore.wdt0 -> gic.cpu0ppi14   # ID 30: private watchdog
+  wire gic.irq0    -> cpu.irq
+}

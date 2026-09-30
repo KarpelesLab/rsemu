@@ -278,6 +278,19 @@ pub static ARM926: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/arm926.machine"),
 };
 
+/// The Aisin navigation computer in a Toyota Alphard: a Renesas R-Car Gen1
+/// (Cortex-A9 MPCore) board whose 8 MiB NOR boots U-Boot, a Linux 2.6.35
+/// kernel and a CramFS recovery root. The `flash` slot takes a dump of that
+/// NOR; `docs/platforms/alphard-navi.md` records what runs and what does not.
+#[cfg(feature = "machine-alphard-navi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-alphard-navi")))]
+pub static ALPHARD_NAVI: CatalogEntry = CatalogEntry {
+    name: "alphard-navi",
+    summary: "Toyota Alphard nav computer: R-Car Gen1 Cortex-A9, U-Boot + Linux 2.6.35 from NOR",
+    media: &["flash"],
+    source: include_str!("../../machines/alphard-navi.machine"),
+};
+
 /// The PC/AT, when this build has an x86 core and the board's chips.
 ///
 /// Held out of the catalog until now for one reason: the x86 core was registered
@@ -973,6 +986,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&ARM64_VIRT);
     #[cfg(feature = "machine-arm64-virt")]
     out.push(&ARM64_VIRT_SMP);
+    #[cfg(feature = "machine-alphard-navi")]
+    out.push(&ALPHARD_NAVI);
     #[cfg(feature = "machine-arm926")]
     out.push(&ARM926);
     #[cfg(feature = "machine-beneater")]
@@ -2491,6 +2506,10 @@ mod tests {
             // `tests/arm926_board.rs` supplies the one that does something.
             #[cfg(feature = "machine-arm926")]
             ("arm926", "firmware") => &[0xfe, 0xff, 0xff, 0xea],
+            // The same `B .` at the reset vector: the real image is a dump of
+            // a proprietary NOR, which nothing in this tree may carry.
+            #[cfg(feature = "machine-alphard-navi")]
+            ("alphard-navi", "flash") => &[0xfe, 0xff, 0xff, 0xea],
             // The smallest thing `arm.loader`'s `format = "arm64"` accepts: a
             // 64-byte AArch64 `Image` header whose `code0` branches over it,
             // and `B .` on the far side. A bare `B .` would be *refused* here
