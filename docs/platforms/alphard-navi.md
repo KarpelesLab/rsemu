@@ -104,7 +104,17 @@ channel 0 is ID 68.
 | Kernel: MMU, GIC, TMU tick and clocksource, calibration, drivers | runs |
 | Kernel: NOR via CFI (4 partitions), framebuffer, I2C, SDHI probe, VFP | runs |
 | Kernel: CramFS root mounted, `init` started | runs |
-| Userspace: `pmng` | faults — it is ARMv7 Thumb-2 |
+| Userspace: `pmng` (Thumb-2) loads `tab_dd.ko`, exports its GPIOs, starts `osloader` | runs |
+| `osloader` draws its splash: 地図ディスクを確認しています / しばらくお待ち下さい ("checking the map disc, please wait") | runs, and waits |
+| Sub-processor link (`cis`, over HSPI) | fails: `cis:trans NG(-512)`, userspace logs `[PSC Debug] Wakeup-NG` |
+| Map SD card (SDHI) | not modelled: placeholder |
 
-The vendor binaries under `/vns` (`pmng`, `osloader`, `smng`) are built for
-ARMv7 **Thumb-2**; glibc and busybox are ARMv6 ARM/Thumb-1 with VFPv2.
+The vendor binaries under `/vns` (`pmng`, `osloader`, `smng`) are ARMv7
+**Thumb-2**; glibc and busybox are ARMv6 ARM/Thumb-1 with VFPv2.
+
+Twenty guest seconds take a little over three minutes of host time on an
+M-series Mac with the interpreter; the splash is up within the first ten.
+
+What would move it further: an SDHI model with a card image, so osloader has a
+map disc to check; and the HSPI controller with a model of the sub-processor at
+its other end, which answers the wake-up handshake.
