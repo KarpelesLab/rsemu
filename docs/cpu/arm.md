@@ -1,7 +1,7 @@
 # ARM
 
-Consumed by: `cpu/arm/aprofile` (ARMv5TE, and ARMv7-A's A32 instruction set;
-Thumb-2 and VFP to follow),
+Consumed by: `cpu/arm/aprofile` (ARMv5TE, and ARMv7-A's A32 and T32 (Thumb-2)
+instruction sets with VFPv3; NEON to follow),
 `cpu/arm/v7m` (ARMv7E-M, Cortex-M3/M4/M7), `cpu/arm/a64` (ARMv8-A AArch64).
 
 ## Primary
@@ -56,6 +56,27 @@ secondary reference for the exception model.
   mode — because only the coprocessor knows that `TPIDRURO` is readable and
   `SCTLR` is not; the ARMv5 CP15 ignores the field, as it always allowed User
   mode through.
+- **Thumb-2 on the A profile is a second encoding of instructions the core
+  already executes.** `aprofile/thumb2.rs` decodes a 32-bit T32 instruction
+  into the same `isa::Insn` an A32 word produces — `ADD.W r0, r1, r2, LSL #3`
+  and A32's `ADD r0, r1, r2, LSL #3` are one value, run by one arm of the
+  interpreter — and adds variants only where T32 genuinely differs: the
+  modified immediate (`Operand::Const`, because an odd rotation or a
+  replicated byte has no A32 spelling), `ORN`, `LDRT` with an offset and no
+  writeback (`Index::Unprivileged`), `LDRD`/`LDREXD` with independent
+  registers, and `TBB`/`TBH`. The coprocessor space is decoded by the A32
+  decoder itself, since T32's bits 27..0 are the A32 encoding there (DDI 0406C
+  A6.3.18), so CP15 and VFP need nothing Thumb-specific. What *is* Thumb's
+  own: `ITSTATE` lives in `CPSR[26:25,15:10]` where the architecture puts it,
+  so exception entry and return carry it for free; a 16-bit data-processing
+  instruction inside an `IT` block sets no flags; an Undefined Instruction
+  in Thumb state links to the instruction plus **two** even when it is 32
+  bits wide (B1.9's offset table — Linux's `__und_usr` relies on it); `SVC`
+  inside a block saves the *advanced* `ITSTATE` while every other exception
+  saves the unadvanced one; and every PC-relative address is taken from
+  `Align(PC, 4)`. The profile-independent rules — which halfwords start a
+  32-bit instruction, `ThumbExpandImm_C`, the `ITSTATE` walk — are in
+  `cpu/arm/t32.rs`, shared with `v7m`.
 - **The M profile is a different architecture, not a subset.** There is no ARM
   state, so no A32 decoder; the exception model is hardware register stacking
   with `EXC_RETURN` rather than banked modes; the interrupt controller is *inside

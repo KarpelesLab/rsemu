@@ -1028,8 +1028,16 @@ cpu-mos6502 = []
 # CPS/SRS/RFE/SETEND with big-endian data, LDREX/STREX (all sizes) and CLREX on
 # a local exclusive monitor, WFI/WFE/SEV, MOVW/MOVT and the v6T2 bitfield
 # instructions, the ARMv7 barriers and hints, interworking ALU writes to the
-# PC, true unaligned access, and ARMv6's PSR and exception-entry rules. Decode
-# is gated per part, so an ARM926EJ-S is unchanged. Thumb-2 and VFP/NEON are
+# PC, true unaligned access, and ARMv6's PSR and exception-entry rules -- and
+# **Thumb-2**: the whole 32-bit T32 encoding space (data processing, the
+# modified immediate, MOVW/MOVT, bitfields and saturation, every load/store
+# addressing form including literals and the T variants, LDRD/STRD, the
+# exclusives, TBB/TBH, LDM/STM/PUSH/POP, SRS/RFE, B/BL/BLX with interworking,
+# MRS/MSR/CPS, the hints and barriers, SUBS PC, LR, the multiplies and the
+# media instructions, and the coprocessor space into CP15 and VFP), IT blocks
+# with ITSTATE in the CPSR, CBZ/CBNZ, and the ARMv6 16-bit additions. T32
+# decodes to the same instruction values A32 does, so the two share one
+# executor. Decode is gated per part, so an ARM926EJ-S is unchanged. NEON is
 # not part of this yet.
 #
 # Named for the profile, not the version, because ARMv6 and ARMv7-A share this

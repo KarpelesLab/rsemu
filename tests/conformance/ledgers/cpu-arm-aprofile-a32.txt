@@ -85,15 +85,50 @@ bad-mode-writes             # An `MSR` or `CPS` naming a mode the part does
                             # fields of the write still happen.
                             # DDI 0406C B1.3 (`BadMode`, `CPSRWriteByInstr`).
 
-thumb.v6-and-thumb2         # This landing is the ARM-state half. Thumb state
-                            # still decodes the ARMv5TE 16-bit set: the ARMv6
-                            # 16-bit additions (`REV`, `SXTB`, `CPS`,
-                            # `SETEND`, …), the 32-bit Thumb-2 encodings and
-                            # `IT` belong to the Thumb-2 work. The exception
-                            # model already clears and saves IT state and
-                            # computes Thumb return addresses for it.
-
 virtualization              # `HVC`, `ERET`, banked `MRS`/`MSR` and Hyp mode
                             # decode as UNDEFINED. Correct for a Cortex-A9,
                             # which has no Virtualization Extensions; listed
                             # so nobody mistakes it for an oversight.
+
+# ---------------------------------------------------------------------------
+# 2026-09-30: Thumb-2. The `thumb.v6-and-thumb2` entry is gone -- T32, `IT`
+# and the ARMv6 16-bit additions are implemented and measured by
+# src/cpu/arm/aprofile/tests_t32.rs (assembled programs, IT-block and
+# exception edge cases, a decode-and-execute sweep, and 689 encodings listed
+# against GNU `objdump`). What T32 still declines:
+# ---------------------------------------------------------------------------
+
+thumbee                     # ThumbEE state (`ENTERX`/`LEAVEX`, the null-check
+                            # and `HB` handler branches, the `TEECR`/`TEEHBR`
+                            # registers) is not modelled: `ENTERX` and
+                            # `LEAVEX` decode as UNDEFINED, and `ID_PFR0`
+                            # already reports no ThumbEE. DDI 0406C A9.
+
+t32.advanced-simd           # The T32 Advanced SIMD spaces (`111U 1111 …` data
+                            # processing and `1111 1001 xxx0 …` element and
+                            # structure loads/stores) are UNDEFINED, as their
+                            # A32 counterparts are: the core has no NEON and
+                            # `MVFR1` says so. DDI 0406C A7.
+
+t32.unpredictable           # The T32 counterpart of
+                            # `unpredictable-as-undefined`. Taken as the
+                            # Undefined Instruction exception: `IT` with
+                            # firstcond 1111, or AL with more than one
+                            # instruction; the 16-bit `CPS` naming no mask;
+                            # `CPS` with imod 01 or nothing to change;
+                            # data processing writing the PC outside the
+                            # compare aliases; `LDM`/`STM` based on the PC,
+                            # with SP in the list, or storing the PC; an empty
+                            # register list; `LDRD`/`STRD` writing back a PC
+                            # base or storing from one; a byte or halfword
+                            # "load" of the PC in a writeback or `T` form;
+                            # `BLX` (immediate) with `H` set; the extract and
+                            # insert forms `SBFX`/`UBFX`/`BFI`/`BFC` out of
+                            # range. Executed as written, because hardware
+                            # does and correct code cannot tell: a branch
+                            # that is not last in its `IT` block, `CBZ` or a
+                            # 16-bit `B<c>` inside one, an `IT` inside an
+                            # `IT` block, and register choices A8.8 calls
+                            # UNPREDICTABLE (SP or PC as a data register,
+                            # `Rt == Rt2` in `LDRD`, a base in its own
+                            # writeback list).
