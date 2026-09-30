@@ -82,7 +82,7 @@ machine "alphard-navi" {
 
   # -- the Cortex-A9 MPCore private region -----------------------------------
   object mpcore "arm.a9mpcore" { clock = cpuclk / 2, cpus = 1 }
-  object gic    "arm.gic"      { version = 1, cpus = 1, spis = 128 }
+  object gic    "arm.gic"      { version = 1, cpus = 1, spis = 160 }
   object l2     "arm.l2c310"   { size = 1M, ways = 16 }
 
   # -- SoC peripherals ---------------------------------------------------------
@@ -100,6 +100,49 @@ machine "alphard-navi" {
   # anything written there is visible on the `console` port.
   object scif0 "rcar.scif" { clock = pclk / 1024, port = "console" }
 
+  # SCIF1-5: the links to the sub-processors, driven by Aisin's scif_iif and
+  # its clients. SCIF5 is the PSC (power supply control) link, which the
+  # kernel runs in clock-synchronous mode; each is a host port of its own.
+  object scif1 "rcar.scif" { clock = pclk / 1024, port = "scif1" }
+  object scif2 "rcar.scif" { clock = pclk / 1024, port = "scif2" }
+  object scif3 "rcar.scif" { clock = pclk / 1024, port = "scif3" }
+  object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
+  object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }
+
+  # GPIO banks 0-6. Their interrupts are GIC IDs 173-179, one per bank, which
+  # the kernel's GPIO driver chains to. Pins nothing drives read high: the
+  # sub-processor handshake lines are active-low with pull-ups, and a line that
+  # read low would be a request nobody made.
+  object gpio0 "rcar.gpio" { inputs = 0xffffffff }
+  object gpio1 "rcar.gpio" { inputs = 0xffffffff }
+  object gpio2 "rcar.gpio" { inputs = 0xffffffff }
+  object gpio3 "rcar.gpio" { inputs = 0xffffffff }
+  object gpio4 "rcar.gpio" { inputs = 0xffffffff }
+  object gpio5 "rcar.gpio" { inputs = 0xffffffff }
+  object gpio6 "rcar.gpio" { inputs = 0xffffffff }
+
+  # The sub-processor's watchdog. The kernel toggles GPIO 4.28 every few tens
+  # of milliseconds (U-Boot does too, in its loops), and its restart path --
+  # after leaving a boot flag in SRAM -- stops toggling and spins. What pulls
+  # the SoC's reset then is the sub-processor, not modelled beyond this:
+  # silence on the pin for `timeout` milliseconds. The real timeout is not
+  # known; two seconds is well clear of the kernel's kick period.
+  osc wdclk = 1000 Hz
+  object subwdt "watchdog.pin" { clock = wdclk, timeout = 2000 }
+
+  # The four SD host interfaces. The kernel's own resource tables give their
+  # interrupts: SDHI0 is GIC ID 136, SDHI3 138, SDHI2 139 (SDHI1 is not used).
+  # Each drives a socket by name; the map card is in the one `map-slot` names.
+  object sdhi0 "rcar.sdhi" { slot = "sd0" }
+  object sdhi1 "rcar.sdhi" { slot = "sd1" }
+  object sdhi2 "rcar.sdhi" { slot = "sd2" }
+  object sdhi3 "rcar.sdhi" { slot = "sd3" }
+
+  # The map card: whatever the run supplies with `--drive sd=card.img`, and an
+  # empty socket when it supplies nothing -- the unit's "no SD" case.
+  param map-slot = "sd0"
+  object mapcard "sd.card" { drive = "sd", slot = map-slot }
+
   # The Display Unit: rcarfb drives plane 1 as 800x480 RGB565 from 0x9e000000.
   object du "rcar.du" { clock = dotclk, space = mem }
 
@@ -110,14 +153,11 @@ machine "alphard-navi" {
   object dbsc1  "ram" { size = 4K }    # 0xfec00000: DDR controller, channel 1
   object lbsc   "ram" { size = 4K }    # 0xff800000: local bus state controller
   object misc0  "ram" { size = 64K }   # 0xffc00000: 0xffc00300/400, and the 0xffc08000/0xffc09000 blocks
-  object gpio   "ram" { size = 32K }   # 0xffc40000: GPIO banks 0-6 (bit 30 of bank 0 requests the hard reset)
   object darc   "ram" { size = 4K }    # 0xffc55000: the kernel's UIO_DARC block
   object i2c    "ram" { size = 12K }   # 0xffc70000: I2C 0-2
   object cpg    "ram" { size = 4K }    # 0xffc80000: clock pulse generator
   object sysc   "ram" { size = 4K }    # 0xffcc0000: power control (the SGX power-up poll times out here)
   object dma    "ram" { size = 4K }    # 0xffd85000: DMA controller registers
-  object scifn  "ram" { size = 20K }   # 0xffe41000: SCIF1-5, the sub-processor links
-  object sdhi   "ram" { size = 16K }   # 0xffe4c000: SDHI0-3
   object misc1  "ram" { size = 4K }    # 0xfff12000
   object pfc    "ram" { size = 64K }   # 0xfffc0000: pin function controller, RDS (0xfffc4000), IEBus (0xfffc9000)
 
@@ -137,7 +177,13 @@ machine "alphard-navi" {
   map mem 0xfec00000 size 4K     = dbsc1
   map mem 0xff800000 size 4K     = lbsc
   map mem 0xffc00000 size 64K    = misc0
-  map mem 0xffc40000 size 32K    = gpio
+  map mem 0xffc40000 size 0x100  = gpio0
+  map mem 0xffc41000 size 0x100  = gpio1
+  map mem 0xffc42000 size 0x100  = gpio2
+  map mem 0xffc43000 size 0x100  = gpio3
+  map mem 0xffc44000 size 0x100  = gpio4
+  map mem 0xffc45000 size 0x100  = gpio5
+  map mem 0xffc46000 size 0x100  = gpio6
   map mem 0xffc55000 size 4K     = darc
   map mem 0xffc70000 size 12K    = i2c
   map mem 0xffc80000 size 4K     = cpg
@@ -147,8 +193,15 @@ machine "alphard-navi" {
   map mem 0xffd82000 size 0x30   = tmu2
   map mem 0xffd85000 size 4K     = dma
   map mem 0xffe40000 size 0x100  = scif0
-  map mem 0xffe41000 size 20K    = scifn
-  map mem 0xffe4c000 size 16K    = sdhi
+  map mem 0xffe41000 size 0x100  = scif1
+  map mem 0xffe42000 size 0x100  = scif2
+  map mem 0xffe43000 size 0x100  = scif3
+  map mem 0xffe44000 size 0x100  = scif4
+  map mem 0xffe45000 size 0x100  = scif5
+  map mem 0xffe4c000 size 0x100  = sdhi0
+  map mem 0xffe4d000 size 0x100  = sdhi1
+  map mem 0xffe4e000 size 0x100  = sdhi2
+  map mem 0xffe4f000 size 0x100  = sdhi3
   map mem 0xfff12000 size 4K     = misc1
   map mem 0xfff80000 size 0x40000 = du
   map mem 0xfffc0000 size 64K    = pfc
@@ -159,5 +212,19 @@ machine "alphard-navi" {
   wire mpcore.gt0  -> gic.cpu0ppi11   # ID 27: global timer
   wire mpcore.twd0 -> gic.cpu0ppi13   # ID 29: private timer
   wire mpcore.wdt0 -> gic.cpu0ppi14   # ID 30: private watchdog
+  wire sdhi0.irq   -> gic.spi104      # ID 136
+  wire sdhi3.irq   -> gic.spi106      # ID 138
+  wire sdhi2.irq   -> gic.spi107      # ID 139
+  wire gpio0.irq   -> gic.spi141      # ID 173
+  wire gpio1.irq   -> gic.spi142      # ID 174
+  wire gpio2.irq   -> gic.spi143      # ID 175
+  wire gpio3.irq   -> gic.spi144      # ID 176
+  wire gpio4.irq   -> gic.spi145      # ID 177
+  wire gpio5.irq   -> gic.spi146      # ID 178
+  wire gpio6.irq   -> gic.spi147      # ID 179
+  wire mapcard.cd  -> gpio3.in20      # GPIO 116: SDHI0's card-detect switch, low when a card is in
+  wire mapcard.cd  -> gpio2.in28      # GPIO 92: the same switch as userspace watches it (falling edge)
+  wire gpio4.out28 -> subwdt.kick     # GPIO 4.28: the watchdog kick
+  wire subwdt.reset -> cpu.reset
   wire gic.irq0    -> cpu.irq
 }
