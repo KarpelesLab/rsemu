@@ -1161,3 +1161,21 @@ fn an_armv5_chunk_has_no_v6_trailer() {
 fn flat_mmu_still_reports_no_vector_base() {
     assert_eq!(FlatMmu::new().regime().vector_base, 0);
 }
+
+#[test]
+fn the_reset_pin_resets_cp15_too() {
+    // SCTLR.V moves the vectors to 0xffff0000; a pulse on the reset input
+    // must put them back, as it puts the MMU enable back, or a guest that
+    // resets itself from a high-vector kernel resets into nowhere.
+    let m = V7::with_config(Config::CORTEX_A9);
+    let sctlr = m.cpu.cp15v7().expect("a Cortex-A9 has its CP15").sctlr();
+    m.run(&[0xee01_0f10]); // mcr p15, 0, r0, c1, c0, 0
+    m.set(0, sctlr | (1 << 13));
+    m.steps(1);
+    assert_ne!(m.cpu.cp15v7().unwrap().sctlr() & (1 << 13), 0, "V set");
+    m.cpu.lines.request_reset();
+    m.cpu.step();
+    assert_eq!(m.cpu.cp15v7().unwrap().sctlr() & (1 << 13), 0, "V back to its strap");
+    assert_eq!(m.cpu.pc(), 0, "the reset vector is fetched from the low base");
+    assert_eq!(m.cpu.mode(), Mode::SUPERVISOR);
+}

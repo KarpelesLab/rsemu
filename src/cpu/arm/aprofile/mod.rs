@@ -1437,6 +1437,18 @@ impl Arm {
         let (irq, fiq) = self.lines.snapshot();
         let reset = self.lines.take_reset_request();
         let event = self.lines.take_event();
+        if reset {
+            // The reset input resets the whole processor, and CP15 is part
+            // of it (DDI 0406C B1.9.10, "Reset"): the MMU comes back off, the
+            // vector base back to its strap. Without this a guest that pulls
+            // its own reset with the MMU on -- Linux's restart path does --
+            // fetches the reset vector through its own page tables.
+            match &self.cp15 {
+                Some(SystemCp::V5(cp15)) => cp15.reset(),
+                Some(SystemCp::V7(cp15)) => cp15.reset(),
+                None => {}
+            }
+        }
         let cfg = self.config();
         let mut session = self.session.lock();
         let Session {
@@ -1452,6 +1464,9 @@ impl Arm {
         // assertion is honoured by the very next instruction boundary. An
         // event from another core's `SEV` is folded in the same way.
         state.reset_pending |= reset;
+        if reset {
+            tlb.flush();
+        }
         state.event |= event;
         let Some(space) = space.clone() else {
             return 0;
