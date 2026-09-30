@@ -60,6 +60,7 @@ Two consequences worth writing down:
 | --- | --- |
 | 16550 UART | National Semiconductor **PC16550D** datasheet — the specification for essentially every emulated serial port; [OSDev: Serial Ports](https://wiki.osdev.org/Serial_Ports) |
 | ARM PL011 | Arm DDI 0183 **[browser]** |
+| Renesas SCIF / HSCIF (`rcar.scif`) | Renesas *SH7780 Hardware Manual* §25 (SCIF) for the registers, the read-1-write-0 status flags and the trigger tables; the R-Car SCIF/HSCIF chapters for the 128-stage HSCIF and `HSSRR`. One combined `irq` (ERI/RXI/BRI/TXI ORed, as R-Car wires it). Instant transmission with back pressure, like the 16550 and PL011; the machine file's `clock =` is the pump rate, and `SCBRR` is reported, not obeyed |
 
 ## Input
 

@@ -1179,6 +1179,19 @@ machine-arm926 = ["cpu-arm-aprofile"]
 # `cfi-flash` node; on its own it is a serial port and nothing else.
 dev-uart-ns16550 = []
 
+# Renesas SH-4A/R-Car on-chip peripherals (src/dev/rcar), the blocks Renesas
+# carried from the SH-4A into R-Car with the same register map: `rcar.scif`, the
+# SCIF serial port with 16-byte FIFOs and, as `variant = "hscif"`, the HSCIF
+# with 128-byte FIFOs, on the character-device seam (`host::chardev`) with real
+# back pressure and the manual's read-1-write-0 status flags; and `rcar.tmu`,
+# one TMU unit of three 32-bit down-counters on the prescaled peripheral clock,
+# lazily advanced on its own clock domain so TCNT is arithmetic and an
+# underflow interrupt lands on the tick it is due on. Reusable classes, not a
+# board: an R-Car H1 (R8A7779) machine file places them. Written from the
+# Renesas SH7780 Hardware Manual (SCIF §25, TMU §22) and the R-Car SCIF/HSCIF
+# chapters. `no_std + alloc`, no `unsafe`, no dependencies.
+dev-rcar = []
+
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a system
 # controller, virtio-MMIO with block and entropy devices, and a **device tree
 # generator** that emits the DTB from the realized machine graph rather than

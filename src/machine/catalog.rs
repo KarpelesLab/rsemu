@@ -1204,6 +1204,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::virtio::register(&mut reg)?;
     #[cfg(feature = "dev-uart-ns16550")]
     crate::dev::uart::ns16550::register(&mut reg)?;
+    #[cfg(feature = "dev-rcar")]
+    crate::dev::rcar::register(&mut reg)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::register(&mut reg)?;
     #[cfg(feature = "dev-psram-qspi")]
@@ -1358,6 +1360,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::virtio::bind(&mut b)?;
     #[cfg(feature = "dev-uart-ns16550")]
     crate::dev::uart::ns16550::bind(&mut b)?;
+    #[cfg(feature = "dev-rcar")]
+    crate::dev::rcar::bind(&mut b)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::bind(&mut b)?;
     #[cfg(feature = "dev-psram-qspi")]
@@ -1523,6 +1527,10 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-uart-ns16550")]
     table.insert(crate::dev::uart::ns16550::schema());
+    #[cfg(feature = "dev-rcar")]
+    for schema in crate::dev::rcar::schemas() {
+        table.insert(schema);
+    }
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     for schema in crate::dev::flash::schemas() {
         table.insert(schema);
