@@ -177,6 +177,12 @@ impl Arch {
     /// A Cortex-A9 MPCore (ARMv7-A) as the R-Car H1 builds it: Thumb-2, the
     /// Security and Multiprocessing Extensions, VFPv3-D32 and NEON, no
     /// hardware divide (Cortex-A9 TRM 1.1 and 1.3).
+    ///
+    /// **NEON is off** until this core implements Advanced SIMD. The part has
+    /// it, but a preset that claims an extension the interpreter cannot
+    /// execute would tell the guest (through `MVFR1`) to use instructions that
+    /// then trap. Absent-and-reported-absent is honest; present-and-broken is
+    /// not.
     pub const CORTEX_A9: Arch = Arch {
         version: Version::V7,
         ext: Extensions {
@@ -191,7 +197,7 @@ impl Arch {
             idiv_thumb: false,
             idiv_arm: false,
             vfp: Some(Vfp::V3_D32),
-            neon: true,
+            neon: false,
         },
     };
 

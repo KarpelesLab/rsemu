@@ -565,6 +565,7 @@ impl Mmu for Cp15 {
             translating: control & control::M != 0 || self.fcse_pid() != 0,
             high_vectors: control & control::V != 0,
             alignment_faults: control & control::A != 0,
+            ..Regime::FLAT
         }
     }
 

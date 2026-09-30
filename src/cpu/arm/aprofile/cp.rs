@@ -352,6 +352,24 @@ pub struct Regime {
     pub high_vectors: bool,
     /// CP15 c1's `A` bit: an unaligned access is a Data Abort, not a rotate.
     pub alignment_faults: bool,
+    /// An unaligned word or halfword access is performed as one, rather than
+    /// rotated (ARMv6 `SCTLR.U`; always on in ARMv7, DDI 0406C A3.2.1).
+    /// `alignment_faults` still wins where both are set.
+    pub unaligned: bool,
+    /// The low exception vector base when `high_vectors` is clear: zero on
+    /// anything before the Security Extensions, `VBAR` on a part that has
+    /// them (DDI 0406C B1.8.1).
+    pub vector_base: u32,
+    /// `SCTLR.TE`: exceptions are taken in Thumb state.
+    pub thumb_exceptions: bool,
+    /// `SCTLR.EE`: exceptions are taken with `CPSR.E` set, so the handler
+    /// starts big-endian.
+    pub big_endian_exceptions: bool,
+    /// The Coprocessor Access Control Register (`CPACR`), which decides
+    /// whether coprocessors 0-13 -- in practice VFP's 10 and 11 -- may be
+    /// reached at all, and from which privilege. All ones on a part without
+    /// one, which is "everything reachable, as before".
+    pub cp_access: u32,
 }
 
 impl Regime {
@@ -362,6 +380,11 @@ impl Regime {
         translating: false,
         high_vectors: false,
         alignment_faults: false,
+        unaligned: false,
+        vector_base: 0,
+        thumb_exceptions: false,
+        big_endian_exceptions: false,
+        cp_access: u32::MAX,
     };
 }
 
