@@ -66,3 +66,8 @@ pub mod aprofile;
 #[cfg(feature = "cpu-arm-v7m")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m")))]
 pub mod v7m;
+
+// The profile-independent T32 rules: both cores that execute Thumb-2 use
+// them, and a build with neither does not compile them.
+#[cfg(any(feature = "cpu-arm-aprofile", feature = "cpu-arm-v7m"))]
+pub mod t32;

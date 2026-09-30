@@ -300,22 +300,12 @@ pub const fn decode_imm_shift(ty: u32, imm5: u32) -> Shift {
 /// byte into one of four patterns and touches no flag, and the rest is an
 /// eight-bit value with its top bit forced set, rotated right, whose bit 31
 /// becomes the carry.
+///
+/// The rule is profile-independent, so it lives in the family's
+/// [`t32`](super::super::t32) module, shared with the A-profile core.
 #[must_use]
 pub const fn thumb_expand_imm(imm12: u32) -> (u32, Option<bool>) {
-    if field(imm12, 11, 10) == 0 {
-        let byte = imm12 & 0xff;
-        let value = match field(imm12, 9, 8) {
-            0b00 => byte,
-            0b01 => (byte << 16) | byte,
-            0b10 => (byte << 24) | (byte << 8),
-            _ => (byte << 24) | (byte << 16) | (byte << 8) | byte,
-        };
-        (value, None)
-    } else {
-        let unrotated = 0x80 | (imm12 & 0x7f);
-        let value = unrotated.rotate_right(field(imm12, 11, 7));
-        (value, Some(value & 0x8000_0000 != 0))
-    }
+    super::super::t32::thumb_expand_imm(imm12)
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,7 +1274,7 @@ impl Insn {
 #[inline]
 #[must_use]
 pub const fn is_32bit(first: u16) -> bool {
-    matches!(first >> 11, 0b11101..=0b11111)
+    super::super::t32::is_32bit(first)
 }
 
 /// Decode a whole instruction.
